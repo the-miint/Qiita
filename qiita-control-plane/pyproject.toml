@@ -10,9 +10,9 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-    "pytest>=8",
+    "pytest>=9",
     "httpx>=0.28",
-    "ruff>=0.9",
+    "ruff>=0.15",
 ]
 
 [tool.uv.sources]
