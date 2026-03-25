@@ -6,23 +6,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint:
+  lint-python:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
+      - run: make lint-python
+
+  lint-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: qiita-data-plane
-      - run: make lint
+      - run: make lint-rust
 
-  test-unit:
-    needs: lint
+  test-python:
+    needs: lint-python
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
+      - run: make test-python
+
+  test-rust:
+    needs: lint-rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -31,19 +44,18 @@ jobs:
         with:
           path: ~/.duckdb/extensions
           key: duckdb-ext-${{ runner.os }}-v1.5.1
-      - run: make test
+      - run: make test-rust
 
   test-integration:
-    needs: lint
+    needs: [test-python, test-rust]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
-      - uses: dtolnay/rust-toolchain@stable
       - run: make test-integration
 
   test-workflows:
-    needs: lint
+    needs: lint-python
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

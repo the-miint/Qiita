@@ -1,4 +1,4 @@
-.PHONY: build test test-integration test-workflows lint deploy migrate clean verify-health dev-setup install-hooks
+.PHONY: build test test-python test-rust test-integration test-workflows lint lint-python lint-rust deploy migrate clean verify-health dev-setup install-hooks
 .PHONY: build-common build-control-plane build-data-plane build-compute-orchestrator build-workflows
 .PHONY: test-common test-control-plane test-data-plane test-compute-orchestrator
 .PHONY: lint-common lint-control-plane lint-data-plane lint-compute-orchestrator
@@ -57,7 +57,11 @@ build-workflows:
 	done
 
 # Run unit tests
-test: test-common test-control-plane test-data-plane test-compute-orchestrator
+test: test-python test-rust
+
+test-python: test-common test-control-plane test-compute-orchestrator
+
+test-rust: test-data-plane
 
 test-common:
 	cd qiita-common && uv run pytest
@@ -88,7 +92,11 @@ test-integration:
 	cd tests/integration && docker compose down
 
 # Lint all components
-lint: lint-common lint-control-plane lint-data-plane lint-compute-orchestrator
+lint: lint-python lint-rust
+
+lint-python: lint-common lint-control-plane lint-compute-orchestrator
+
+lint-rust: lint-data-plane
 
 lint-common:
 	cd qiita-common && uv run ruff check . && uv run ruff format --check .
