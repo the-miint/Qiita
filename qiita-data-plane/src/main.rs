@@ -28,6 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::config::Settings;
+    use duckdb::Connection;
 
     #[test]
     fn config_defaults() {
@@ -36,5 +37,14 @@ mod tests {
         std::env::remove_var("LISTEN_ADDR");
         let cfg = Settings::from_env();
         assert_eq!(cfg.listen_addr, "0.0.0.0:50051");
+    }
+
+    #[test]
+    fn miint_extension_smoke() {
+        let conn = Connection::open_in_memory().expect("open in-memory DuckDB");
+        conn.execute_batch(
+            "INSTALL miint FROM community; LOAD miint; SELECT * FROM miint_versions();",
+        )
+        .expect("INSTALL miint FROM community; LOAD miint; SELECT * FROM miint_versions()");
     }
 }
