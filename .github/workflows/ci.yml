@@ -8,6 +8,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: qiita-data-plane
       - run: make lint
 
   test-unit:
@@ -16,6 +19,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: qiita-data-plane
+      - uses: actions/cache@v4
+        with:
+          path: ~/.duckdb/extensions
+          key: duckdb-ext-${{ runner.os }}-v1.5.1
       - run: make test
 
   test-integration:
@@ -37,3 +47,20 @@ jobs:
       - uses: astral-sh/setup-uv@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: make test-integration
+
+  test-workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/.apptainer/cache
+          key: apptainer-${{ runner.os }}-ubuntu-24.04
+      - name: Install Apptainer
+        run: |
+          APPTAINER_VERSION=1.4.5
+          sudo apt-get install -y fuse2fs uidmap
+          wget -q https://github.com/apptainer/apptainer/releases/download/v${APPTAINER_VERSION}/apptainer_${APPTAINER_VERSION}_amd64.deb
+          sudo dpkg -i apptainer_${APPTAINER_VERSION}_amd64.deb
+          rm apptainer_${APPTAINER_VERSION}_amd64.deb
+      - run: make test-workflows

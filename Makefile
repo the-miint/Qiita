@@ -1,7 +1,34 @@
-.PHONY: build test test-integration lint deploy migrate clean verify-health dev-setup
+.PHONY: build test test-integration test-workflows lint deploy migrate clean verify-health dev-setup
 .PHONY: build-common build-control-plane build-data-plane build-compute-orchestrator build-workflows
 .PHONY: test-common test-control-plane test-data-plane test-compute-orchestrator
 .PHONY: lint-common lint-control-plane lint-data-plane lint-compute-orchestrator
+
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+
+LOCAL_BIN       := $(HOME)/.local/bin
+GRPCURL_VERSION := 1.9.3
+
+ifeq ($(UNAME_S),Linux)
+  ifeq ($(UNAME_M),aarch64)
+    DBMATE_ARCH  := linux-arm64
+    GRPCURL_ARCH := linux_arm64
+  else
+    DBMATE_ARCH  := linux-amd64
+    GRPCURL_ARCH := linux_x86_64
+  endif
+else ifeq ($(UNAME_S),Darwin)
+  ifeq ($(UNAME_M),arm64)
+    DBMATE_ARCH  := darwin-arm64
+    GRPCURL_ARCH := osx_arm64
+  else
+    DBMATE_ARCH  := darwin-amd64
+    GRPCURL_ARCH := osx_x86_64
+  endif
+endif
+
+DBMATE_BIN  := $(LOCAL_BIN)/dbmate
+GRPCURL_BIN := $(LOCAL_BIN)/grpcurl
 
 # Build all components
 build: build-common build-control-plane build-data-plane build-compute-orchestrator build-workflows
@@ -44,6 +71,16 @@ test-data-plane:
 test-compute-orchestrator:
 	cd qiita-compute-orchestrator && uv run pytest
 
+# Smoke-test workflow containers (requires apptainer; skips gracefully if absent)
+test-workflows:
+	@if ! command -v apptainer > /dev/null 2>&1; then \
+		echo "apptainer not found — skipping workflow smoke tests"; \
+		exit 0; \
+	fi
+	apptainer build --force /tmp/qiita-workflow-smoke.sif workflows/amplicon/Apptainer.def
+	apptainer exec /tmp/qiita-workflow-smoke.sif echo "hello world"
+	rm -f /tmp/qiita-workflow-smoke.sif
+
 # Run integration tests (requires Docker for Postgres)
 test-integration:
 	cd tests/integration && docker compose up -d --wait
@@ -65,9 +102,19 @@ lint-data-plane:
 lint-compute-orchestrator:
 	cd qiita-compute-orchestrator && uv run ruff check . && uv run ruff format --check .
 
+$(DBMATE_BIN):
+	mkdir -p $(LOCAL_BIN)
+	curl -fsSL -o $@ https://github.com/amacneil/dbmate/releases/latest/download/dbmate-$(DBMATE_ARCH)
+	chmod +x $@
+
+$(GRPCURL_BIN):
+	mkdir -p $(LOCAL_BIN)
+	curl -fsSL https://github.com/fullstorydev/grpcurl/releases/download/v$(GRPCURL_VERSION)/grpcurl_$(GRPCURL_VERSION)_$(GRPCURL_ARCH).tar.gz \
+	  | tar -xz -C $(LOCAL_BIN) grpcurl
+
 # Run database migrations
-migrate:
-	cd qiita-control-plane && dbmate up
+migrate: $(DBMATE_BIN)
+	cd qiita-control-plane && $(DBMATE_BIN) up
 
 # Build and print deploy instructions (no sudo)
 deploy: build
@@ -86,7 +133,7 @@ deploy: build
 	@echo "Then verify: make verify-health"
 
 # Verify all services are healthy after deploy
-verify-health:
+verify-health: $(GRPCURL_BIN)
 	@echo "Checking control plane..."
 	@curl -sf http://localhost:8080/health || (echo "FAIL: control plane" && exit 1)
 	@echo " OK"
@@ -94,7 +141,7 @@ verify-health:
 	@curl -sf http://localhost:8081/health || (echo "FAIL: compute orchestrator" && exit 1)
 	@echo " OK"
 	@echo "Checking data plane..."
-	@grpcurl -plaintext localhost:50051 grpc.health.v1.Health/Check || (echo "FAIL: data plane" && exit 1)
+	@$(GRPCURL_BIN) -plaintext localhost:50051 grpc.health.v1.Health/Check || (echo "FAIL: data plane" && exit 1)
 	@echo " OK"
 	@echo "All services healthy."
 
@@ -144,23 +191,8 @@ dev-setup:
 	@echo ""
 	@echo "  Verify: apptainer --version"
 	@echo ""
-	@echo "--- dbmate (no sudo — installs to ~/.local/bin) ---"
-	@echo "  mkdir -p ~/.local/bin"
-	@echo "  Linux amd64:"
-	@echo "    curl -fsSL -o ~/.local/bin/dbmate https://github.com/amacneil/dbmate/releases/latest/download/dbmate-linux-amd64"
-	@echo "    chmod +x ~/.local/bin/dbmate"
-	@echo "  macOS ARM:"
-	@echo "    brew install dbmate"
-	@echo "  Ensure ~/.local/bin is on PATH (Linux):  echo 'export PATH=\$$HOME/.local/bin:\$$PATH' >> ~/.bashrc"
-	@echo ""
-	@echo "--- grpcurl, for make verify-health (no sudo — installs to ~/.local/bin) ---"
-	@echo "  GRPCURL_VERSION=1.9.3"
-	@echo "  Linux amd64:"
-	@echo "    mkdir -p ~/.local/bin"
-	@echo "    wget -qO- https://github.com/fullstorydev/grpcurl/releases/download/v\$${GRPCURL_VERSION}/grpcurl_\$${GRPCURL_VERSION}_linux_x86_64.tar.gz \\"
-	@echo "      | tar -xz -C ~/.local/bin grpcurl"
-	@echo "  macOS ARM:"
-	@echo "    brew install grpcurl"
+	@echo "NOTE: dbmate and grpcurl are fetched automatically by 'make migrate' and"
+	@echo "      'make verify-health' — no manual install needed."
 	@echo ""
 	@echo "After setup: make build && make test && make lint"
 
