@@ -104,7 +104,7 @@ graph TB
 
 ## Components
 
-- **qiita-control-plane** — Client-facing REST API (Python 3.14 w/ 3.13 fallback, FastAPI, asyncpg, Postgres, dbmate, OpenAPI, PyTest, ruff, uv, GitHub Actions CI). Handles CRUD for study/sample/preparation, search, work ticket creation/management. Signs Flight tickets (HMAC-SHA256) for client access to data plane. Orchestrates file registration in DuckLake (via data plane) after compute completion.
+- **qiita-control-plane** — Client-facing REST API (Python 3.14, FastAPI, asyncpg, Postgres, dbmate, OpenAPI, PyTest, ruff, uv, GitHub Actions CI). Handles CRUD for study/sample/preparation, search, work ticket creation/management. Signs Flight tickets (HMAC-SHA256) for client access to data plane. Orchestrates file registration in DuckLake (via data plane) after compute completion.
 - **qiita-data-plane** — Data layer (Rust, arrow-flight, DuckDB v1.5.1, duckdb-miint extension, DuckLake w/ Postgres catalog). Arrow Flight protocol (gRPC-based). Intentionally "dumb" — select/insert/delete by exact integer identifiers. Clients connect directly through nginx. Verifies JWTs (AuthRocket JWKS) and Flight ticket signatures (HMAC-SHA256). Registers Parquet files into DuckLake via `ducklake_add_data_files` (metadata-only, no I/O). Calls back to control plane REST endpoint on completion/failure. Runs as dedicated `qiita-data-plane` system user; verifies result file permissions before registration and rejects files that are not `440`. **Horizontally scalable**: each instance holds an independent DuckDB+DuckLake connection to the shared Postgres catalog; DuckLake's snapshot-isolated concurrent read model means multiple instances never block each other. nginx load-balances gRPC traffic across all instances.
 - **qiita-compute-orchestrator** — Separate Python service for compute lifecycle management. Owns the full job lifecycle: submit via slurmrestd, poll for status, detect completion/failure, verify output, collect logs, and report back to control plane. SLURM jobs are truly dumb (read input, process, write output, exit). Abstracts compute backend behind a clean `ComputeBackend` interface (SLURM primary, future offload secondary).
 - **qiita-common** — Shared Python library for control plane and compute orchestrator. Pydantic models (work ticket states, API request/response schemas), config patterns, and REST client utilities. Prevents drift between services' understanding of the API contract.
@@ -290,13 +290,13 @@ sequenceDiagram
 
     Note over CP,CO: 4. Compute submission
     CP->>CO: REST: submit processing for work ticket X
-    CO->>SR: POST /slurm/v0.0.41/job/submit<br/>(container: qiita-workflow-amplicon:v1.2.0,<br/>input/output paths, stdout/stderr log paths)
+    CO->>SR: POST /slurm/{slurmrestd_api_ver}/job/submit<br/>(container: qiita-workflow-amplicon:v1.2.0,<br/>input/output paths, stdout/stderr log paths)
     SR-->>CO: job_id=98765
     CO->>CP: REST callback: SLURM job queued, job_id=98765
     CP->>PG_APP: update work ticket (QUEUED, slurm_job_id=98765)
 
     Note over CO,SR: 5. Job monitoring (orchestrator polls)
-    CO->>SR: GET /slurm/v0.0.41/job/98765
+    CO->>SR: GET /slurm/{slurmrestd_api_ver}/job/98765
     SR-->>CO: state=RUNNING
     CO->>CP: REST callback: job running
     CP->>PG_APP: update work ticket (PROCESSING)
@@ -308,7 +308,7 @@ sequenceDiagram
     SL->>FS: stdout/stderr → /data/logs/study42/prep7/job-98765.{out,err}
 
     Note over CO,CP: 7. Completion detection & file registration
-    CO->>SR: GET /slurm/v0.0.41/job/98765
+    CO->>SR: GET /slurm/{slurmrestd_api_ver}/job/98765
     SR-->>CO: state=COMPLETED, exit_code=0
     CO->>FS: verify /data/results/study42/prep7/output.parquet exists
     CO->>FS: collect log paths
@@ -320,7 +320,7 @@ sequenceDiagram
     CP->>PG_APP: update work ticket (COMPLETED),<br/>record provenance + log paths
 
     Note over CO,CP: 7a. Failure handling (alternative)
-    CO->>SR: GET /slurm/v0.0.41/job/98765
+    CO->>SR: GET /slurm/{slurmrestd_api_ver}/job/98765
     SR-->>CO: state=FAILED, exit_code=1
     CO->>FS: collect log paths
     CO->>CP: REST: job 98765 failed, exit_code=1,<br/>logs=/data/logs/.../job-98765.{out,err},<br/>failure_type=job_error
@@ -480,7 +480,7 @@ Gates 2 or 3 failing after exit code 0 is a permanent failure — the container 
 **Primary backend:** SLURM via slurmrestd REST API (JWT auth).
 - Submits jobs as JSON (no `#SBATCH` directives — slurmrestd ignores them)
 - Environment variables explicitly specified in submission payload
-- Polls job status via `GET /slurm/v0.0.41/job/{job_id}`
+- Polls job status via `GET /slurm/{slurmrestd_api_ver}/job/{job_id}` (version is a config parameter; target SLURM ≥ 25.x.x)
 - Runs output verification gates on completion
 - Reports results back to control plane via REST callback after all steps pass
 - Shared filesystem assumed for all data I/O

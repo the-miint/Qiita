@@ -1,0 +1,14 @@
+[Unit]
+Description=Qiita Data Plane (instance %i)
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=qiita-data-plane
+ExecStart=/opt/qiita/data-plane/qiita-data-plane
+Restart=on-failure
+Environment=LISTEN_ADDR=127.0.0.1:5005%i
+EnvironmentFile=/etc/qiita/data-plane.env
+
+[Install]
+WantedBy=multi-user.target
