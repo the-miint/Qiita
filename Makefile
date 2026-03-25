@@ -1,4 +1,4 @@
-.PHONY: build test test-integration test-workflows lint deploy migrate clean verify-health dev-setup
+.PHONY: build test test-integration test-workflows lint deploy migrate clean verify-health dev-setup install-hooks
 .PHONY: build-common build-control-plane build-data-plane build-compute-orchestrator build-workflows
 .PHONY: test-common test-control-plane test-data-plane test-compute-orchestrator
 .PHONY: lint-common lint-control-plane lint-data-plane lint-compute-orchestrator
@@ -194,7 +194,12 @@ dev-setup:
 	@echo "NOTE: dbmate and grpcurl are fetched automatically by 'make migrate' and"
 	@echo "      'make verify-health' — no manual install needed."
 	@echo ""
-	@echo "After setup: make build && make test && make lint"
+	@echo "After setup: make install-hooks && make build && make test && make lint"
+
+# Install and activate pre-commit hooks (run once after cloning)
+install-hooks:
+	uv tool install pre-commit
+	pre-commit install
 
 clean:
 	cd qiita-common && rm -rf .venv __pycache__ .pytest_cache .ruff_cache
