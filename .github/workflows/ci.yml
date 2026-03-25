@@ -1,6 +1,10 @@
 name: CI
 on: [push, pull_request]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -14,6 +18,7 @@ jobs:
       - run: make lint
 
   test-unit:
+    needs: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,6 +34,7 @@ jobs:
       - run: make test
 
   test-integration:
+    needs: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,6 +43,7 @@ jobs:
       - run: make test-integration
 
   test-workflows:
+    needs: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
