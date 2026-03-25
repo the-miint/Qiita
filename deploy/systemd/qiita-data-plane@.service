@@ -7,7 +7,7 @@ Type=simple
 User=qiita-data-plane
 ExecStart=/opt/qiita/data-plane/qiita-data-plane
 Restart=on-failure
-Environment=LISTEN_ADDR=127.0.0.1:5005%i
+Environment=LISTEN_ADDR=127.0.0.1:%i
 EnvironmentFile=/etc/qiita/data-plane.env
 
 [Install]

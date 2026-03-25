@@ -40,7 +40,7 @@ build-control-plane:
 	cd qiita-control-plane && uv sync
 
 build-data-plane:
-	cd qiita-data-plane && cargo build --release
+	cd qiita-data-plane && cargo build --release --features duckdb/bundled
 
 build-compute-orchestrator:
 	cd qiita-compute-orchestrator && uv sync
@@ -70,7 +70,7 @@ test-control-plane:
 	cd qiita-control-plane && uv run pytest
 
 test-data-plane:
-	cd qiita-data-plane && cargo test
+	cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test
 
 test-compute-orchestrator:
 	cd qiita-compute-orchestrator && uv run pytest
@@ -87,9 +87,8 @@ test-workflows:
 
 # Run integration tests (requires Docker for Postgres)
 test-integration:
-	cd tests/integration && docker compose up -d --wait
-	cd tests/integration && uv run pytest
-	cd tests/integration && docker compose down
+	cd tests/integration && docker compose up -d --wait && \
+	  (uv run pytest; EC=$$?; docker compose down; exit $$EC)
 
 # Lint all components
 lint: lint-python lint-rust
@@ -105,7 +104,7 @@ lint-control-plane:
 	cd qiita-control-plane && uv run ruff check . && uv run ruff format --check .
 
 lint-data-plane:
-	cd qiita-data-plane && cargo clippy -- -D warnings && cargo fmt --check
+	cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo clippy -- -D warnings && cargo fmt --check
 
 lint-compute-orchestrator:
 	cd qiita-compute-orchestrator && uv run ruff check . && uv run ruff format --check .
@@ -134,7 +133,7 @@ deploy: build
 	@echo "  sudo cp deploy/nginx/qiita.conf /etc/nginx/conf.d/"
 	@echo "  sudo systemctl daemon-reload"
 	@echo "  sudo systemctl restart qiita-control-plane"
-	@echo "  sudo systemctl restart 'qiita-data-plane@1'"
+	@echo "  sudo systemctl restart 'qiita-data-plane@50051'"
 	@echo "  sudo systemctl restart qiita-compute-orchestrator"
 	@echo "  sudo systemctl reload nginx"
 	@echo ""
@@ -153,51 +152,56 @@ verify-health: $(GRPCURL_BIN)
 	@echo " OK"
 	@echo "All services healthy."
 
-# Print developer setup instructions for required tools not managed by uv/cargo
+# Check developer tool prerequisites and print install instructions only for missing ones
 dev-setup:
 	@echo "=== Qiita developer setup ==="
 	@echo ""
-	@echo "--- uv (all platforms, no sudo) ---"
-	@echo "  curl -LsSf https://astral.sh/uv/install.sh | sh"
-	@echo ""
-	@echo "--- Rust/cargo (all platforms, no sudo) ---"
-	@echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-	@echo ""
-	@echo "--- PostgreSQL ---"
-	@echo "  NOTE: Postgres serves two roles: the control-plane app DB and the"
-	@echo "        DuckLake catalog for the data plane."
-	@echo "  Debian/Ubuntu:"
-	@echo "    sudo apt-get install -y postgresql"
-	@echo "    sudo systemctl enable --now postgresql"
-	@echo "  RHEL/CentOS/Fedora:"
-	@echo "    sudo dnf install -y postgresql-server postgresql-contrib"
-	@echo "    sudo postgresql-setup --initdb"
-	@echo "    sudo systemctl enable --now postgresql"
-	@echo "  macOS:"
-	@echo "    brew install postgresql@17"
-	@echo "    brew services start postgresql@17"
-	@echo "  Verify: psql --version"
-	@echo ""
-	@echo "--- apptainer ---"
-	@echo "  NOTE: apptainer requires Linux kernel namespaces and cannot run natively on macOS."
-	@echo "  macOS (ARM or Intel): workflow container builds are not supported locally."
-	@echo "    Use Lima for a local Linux VM if needed:  brew install lima"
-	@echo "    Otherwise, container images are built in CI; 'make build' skips gracefully."
-	@echo ""
-	@echo "  Debian/Ubuntu amd64  (sudo required for system package install):"
-	@echo "    APPTAINER_VERSION=1.4.5"
-	@echo "    sudo apt-get install -y fuse2fs uidmap"
-	@echo "    wget https://github.com/apptainer/apptainer/releases/download/v\$${APPTAINER_VERSION}/apptainer_\$${APPTAINER_VERSION}_amd64.deb"
-	@echo "    sudo dpkg -i apptainer_\$${APPTAINER_VERSION}_amd64.deb"
-	@echo "    rm apptainer_\$${APPTAINER_VERSION}_amd64.deb"
-	@echo ""
-	@echo "  RHEL/CentOS/Fedora amd64  (sudo required for system package install):"
-	@echo "    APPTAINER_VERSION=1.4.5"
-	@echo "    wget https://github.com/apptainer/apptainer/releases/download/v\$${APPTAINER_VERSION}/apptainer-\$${APPTAINER_VERSION}-1.x86_64.rpm"
-	@echo "    sudo dnf install -y ./apptainer-\$${APPTAINER_VERSION}-1.x86_64.rpm"
-	@echo "    rm apptainer-\$${APPTAINER_VERSION}-1.x86_64.rpm"
-	@echo ""
-	@echo "  Verify: apptainer --version"
+	@if command -v uv > /dev/null 2>&1; then \
+		echo "  uv         ✓  $$(uv --version)"; \
+	else \
+		echo "--- uv: NOT installed (required) ---"; \
+		echo "  curl -LsSf https://astral.sh/uv/install.sh | sh"; \
+		echo ""; \
+	fi
+	@if command -v cargo > /dev/null 2>&1; then \
+		echo "  Rust/cargo ✓  $$(cargo --version)"; \
+	else \
+		echo "--- Rust/cargo: NOT installed (required) ---"; \
+		echo "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"; \
+		echo ""; \
+	fi
+	@if command -v psql > /dev/null 2>&1; then \
+		echo "  PostgreSQL ✓  $$(psql --version)"; \
+	else \
+		echo "--- PostgreSQL: NOT installed (required) ---"; \
+		echo "  NOTE: Postgres serves two roles: the control-plane app DB and the"; \
+		echo "        DuckLake catalog for the data plane."; \
+		echo "  Debian/Ubuntu:"; \
+		echo "    sudo apt-get install -y postgresql && sudo systemctl enable --now postgresql"; \
+		echo "  RHEL/CentOS/Fedora:"; \
+		echo "    sudo dnf install -y postgresql-server postgresql-contrib"; \
+		echo "    sudo postgresql-setup --initdb && sudo systemctl enable --now postgresql"; \
+		echo "  macOS:"; \
+		echo "    brew install postgresql@17 && brew services start postgresql@17"; \
+		echo ""; \
+	fi
+	@if command -v apptainer > /dev/null 2>&1; then \
+		echo "  apptainer  ✓  $$(apptainer --version)"; \
+	else \
+		echo "--- apptainer: NOT installed (optional; workflow containers are built in CI if absent) ---"; \
+		echo "  macOS: not natively supported — 'make build' and 'make test' skip gracefully."; \
+		echo "    Use Lima for a Linux VM if needed: brew install lima"; \
+		echo "  Debian/Ubuntu amd64:"; \
+		echo "    APPTAINER_VERSION=1.4.5"; \
+		echo "    sudo apt-get install -y fuse2fs uidmap"; \
+		echo "    wget https://github.com/apptainer/apptainer/releases/download/v\$${APPTAINER_VERSION}/apptainer_\$${APPTAINER_VERSION}_amd64.deb"; \
+		echo "    sudo dpkg -i apptainer_\$${APPTAINER_VERSION}_amd64.deb && rm apptainer_\$${APPTAINER_VERSION}_amd64.deb"; \
+		echo "  RHEL/CentOS/Fedora amd64:"; \
+		echo "    APPTAINER_VERSION=1.4.5"; \
+		echo "    wget https://github.com/apptainer/apptainer/releases/download/v\$${APPTAINER_VERSION}/apptainer-\$${APPTAINER_VERSION}-1.x86_64.rpm"; \
+		echo "    sudo dnf install -y ./apptainer-\$${APPTAINER_VERSION}-1.x86_64.rpm && rm apptainer-\$${APPTAINER_VERSION}-1.x86_64.rpm"; \
+		echo ""; \
+	fi
 	@echo ""
 	@echo "NOTE: dbmate and grpcurl are fetched automatically by 'make migrate' and"
 	@echo "      'make verify-health' — no manual install needed."
