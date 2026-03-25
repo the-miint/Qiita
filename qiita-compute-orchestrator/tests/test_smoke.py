@@ -1,3 +1,4 @@
+import qiita_common
 from fastapi.testclient import TestClient
 
 from qiita_compute_orchestrator.main import app
@@ -11,3 +12,7 @@ def test_health():
     body = response.json()
     assert body["status"] == "ok"
     assert body["service"] == "qiita-compute-orchestrator"
+
+
+def test_dependencies_importable():
+    assert qiita_common is not None

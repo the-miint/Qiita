@@ -1,3 +1,5 @@
+import asyncpg
+import qiita_common
 from fastapi.testclient import TestClient
 
 from qiita_control_plane.main import app
@@ -11,3 +13,8 @@ def test_health():
     body = response.json()
     assert body["status"] == "ok"
     assert body["service"] == "qiita-control-plane"
+
+
+def test_dependencies_importable():
+    assert asyncpg is not None
+    assert qiita_common is not None
