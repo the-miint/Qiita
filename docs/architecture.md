@@ -156,6 +156,18 @@ This sort order provides two compounding layers of query optimisation:
 
 The sort is enforced in the reduce step (see Compute Orchestrator), so it is consistent regardless of what the map phase produces.
 
+### Sample Metadata
+
+Sample metadata — descriptive attributes of physical samples (specimen type, collection site, host age, treatment status, environmental parameters, etc.) — lives exclusively in the control plane (Postgres app DB) as attributes on `sample_idx` and related entities. It does not exist in the data plane.
+
+Reasons:
+- Metadata is structured relational data tightly coupled to the identifier model already in the control plane
+- Schema validation against BioSample / MIMARKS compliance requirements is enforced at insert time
+- Metadata and processed measurement data have different update semantics — a metadata correction (e.g., fixing a mislabelled collection site) does not invalidate or require reprocessing of any Parquet files in the data plane
+- Access control decisions are already made in the control plane; metadata-driven filtering is a natural extension of the same authorization layer
+
+**Search pattern:** the control plane exposes search and filter endpoints over metadata. A client submits a query (e.g., "fecal samples from antibiotic-naive subjects in study X"), receives the authorized set of `prep_sample_idx` (or `processed_prep_sample_idx`) identifiers matching the criteria, and uses those IDs directly against the data plane. The control plane search is the access control gate — clients only receive IDs they are authorized to access. The data plane never evaluates metadata; it serves measurements for the requested IDs, relying on the sorted Parquet structure and DuckLake column statistics for efficient lookup.
+
 ### Raw Data Fingerprint
 
 A SHA-256 fingerprint of uploaded raw data is recorded per `prep_sample_idx` at upload time in the control plane. Its purpose is **upload-time duplicate detection only** — it is not the processing deduplication key:
