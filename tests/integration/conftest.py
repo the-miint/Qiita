@@ -4,4 +4,4 @@ import pytest
 
 @pytest.fixture(scope="session")
 def postgres_url() -> str:
-    return "postgresql://qiita:qiita@localhost:5432/qiita_test"
+    return "postgresql://qiita:qiita@localhost:5433/qiita_test"

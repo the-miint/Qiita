@@ -1,8 +1,9 @@
+from pydantic import BaseModel
+
 import qiita_common
 import qiita_common.client
 import qiita_common.config
 import qiita_common.models
-from pydantic import BaseModel
 
 
 def test_import():
