@@ -1,0 +1,16 @@
+[Unit]
+Description=Qiita Control Plane
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=qiita
+ExecStart=/opt/qiita/control-plane/.venv/bin/uvicorn \
+    qiita_control_plane.main:app \
+    --host 127.0.0.1 \
+    --port 8080
+Restart=on-failure
+EnvironmentFile=/etc/qiita/control-plane.env
+
+[Install]
+WantedBy=multi-user.target

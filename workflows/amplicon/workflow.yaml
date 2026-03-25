@@ -1,0 +1,29 @@
+name: amplicon
+version: 2026.3.0
+
+steps:
+  - name: quality_filter
+    type: map
+    container: qiita-workflow-amplicon:2026.3.0
+    entrypoint: scripts/quality_filter.sh
+    resources:
+      cpus: 4
+      memory_gb: 8
+      walltime: "01:00:00"
+
+  - name: denoise
+    type: map
+    container: qiita-workflow-amplicon:2026.3.0
+    entrypoint: scripts/denoise.sh
+    resources:
+      cpus: 32
+      memory_gb: 256
+      walltime: "12:00:00"
+
+  - name: reduce
+    type: reduce
+    reducer: platform/sort-merge
+    resources:
+      cpus: 4
+      memory_gb: 32
+      walltime: "02:00:00"

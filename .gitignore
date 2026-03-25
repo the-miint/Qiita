@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+dist/
+.ruff_cache/
+.pytest_cache/
+.coverage
+
+# Rust
+target/
+
+# OS
+.DS_Store
+
+# Secrets / env
+.env
+*.local
+
+# Build artifacts
+*.sif

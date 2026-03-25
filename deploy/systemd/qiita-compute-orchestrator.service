@@ -1,0 +1,16 @@
+[Unit]
+Description=Qiita Compute Orchestrator
+After=network.target
+
+[Service]
+Type=simple
+User=qiita
+ExecStart=/opt/qiita/compute-orchestrator/.venv/bin/uvicorn \
+    qiita_compute_orchestrator.main:app \
+    --host 127.0.0.1 \
+    --port 8081
+Restart=on-failure
+EnvironmentFile=/etc/qiita/compute-orchestrator.env
+
+[Install]
+WantedBy=multi-user.target

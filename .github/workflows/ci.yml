@@ -1,0 +1,107 @@
+name: CI
+on: [push, pull_request]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      - run: make lint-python
+
+  lint-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: qiita-data-plane
+          prefix-key: "v1"  # bump to invalidate stale bundled-feature cache
+      - name: Cache libduckdb
+        id: cache-libduckdb
+        uses: actions/cache@v5
+        with:
+          path: ~/.duckdb/lib
+          key: libduckdb-${{ runner.os }}-v1.5.1
+      - name: Download libduckdb
+        if: steps.cache-libduckdb.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.duckdb/lib
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.1/libduckdb-linux-amd64.zip \
+            -o /tmp/libduckdb.zip
+          unzip -j /tmp/libduckdb.zip -d ~/.duckdb/lib
+      - name: Set DUCKDB env vars
+        run: echo "DUCKDB_LIB_DIR=$HOME/.duckdb/lib" >> $GITHUB_ENV
+      - run: make lint-rust
+
+  test-python:
+    needs: lint-python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      - run: make test-python
+
+  test-rust:
+    needs: lint-rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: qiita-data-plane
+          prefix-key: "v1"  # bump to invalidate stale bundled-feature cache
+      - name: Cache libduckdb
+        id: cache-libduckdb
+        uses: actions/cache@v5
+        with:
+          path: ~/.duckdb/lib
+          key: libduckdb-${{ runner.os }}-v1.5.1
+      - name: Download libduckdb
+        if: steps.cache-libduckdb.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/.duckdb/lib
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.1/libduckdb-linux-amd64.zip \
+            -o /tmp/libduckdb.zip
+          unzip -j /tmp/libduckdb.zip -d ~/.duckdb/lib
+      - uses: actions/cache@v5
+        with:
+          path: ~/.duckdb/extensions
+          key: duckdb-ext-${{ runner.os }}-v1.5.1
+      - name: Set DUCKDB env vars
+        run: |
+          echo "DUCKDB_LIB_DIR=$HOME/.duckdb/lib" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$HOME/.duckdb/lib" >> $GITHUB_ENV
+      - run: make test-rust
+
+  test-integration:
+    needs: [test-python, test-rust]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      - run: make test-integration
+
+  test-workflows:
+    needs: [lint-python, lint-rust]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/cache@v5
+        with:
+          path: ~/.apptainer/cache
+          key: apptainer-${{ runner.os }}-ubuntu-24.04
+      - name: Install Apptainer
+        run: |
+          APPTAINER_VERSION=1.4.5
+          sudo apt-get install -y fuse2fs uidmap
+          wget -q https://github.com/apptainer/apptainer/releases/download/v${APPTAINER_VERSION}/apptainer_${APPTAINER_VERSION}_amd64.deb
+          sudo dpkg -i apptainer_${APPTAINER_VERSION}_amd64.deb
+          rm apptainer_${APPTAINER_VERSION}_amd64.deb
+      - run: make test-workflows

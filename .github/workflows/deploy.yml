@@ -1,0 +1,60 @@
+name: Deploy
+on:
+  workflow_run:
+    workflows: [CI]
+    branches: [main]
+    types: [completed]
+
+jobs:
+  deploy:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: qiita-data-plane
+      - uses: actions/cache@v5
+        with:
+          path: ~/.duckdb/extensions
+          key: duckdb-ext-${{ runner.os }}-v1.5.1
+
+      - name: Build release binary
+        run: cargo build --release --features duckdb/bundled --manifest-path qiita-data-plane/Cargo.toml
+
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_HOST_KEY: ${{ secrets.DEPLOY_HOST_KEY }}
+        run: |
+          install -m 600 -D /dev/null ~/.ssh/id_ed25519
+          printf '%s' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          printf '%s %s\n' "$DEPLOY_HOST" "$DEPLOY_HOST_KEY" >> ~/.ssh/known_hosts
+
+      - name: Sync artifacts
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" mkdir -p /opt/qiita/incoming
+          rsync -az \
+            qiita-data-plane/target/release/qiita-data-plane \
+            "$DEPLOY_USER@$DEPLOY_HOST:/opt/qiita/incoming/"
+          rsync -az --delete \
+            qiita-common \
+            qiita-control-plane \
+            qiita-compute-orchestrator \
+            deploy \
+            "$DEPLOY_USER@$DEPLOY_HOST:/opt/qiita/incoming/"
+
+      - name: Activate
+        env:
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        run: ssh "$DEPLOY_USER@$DEPLOY_HOST" /opt/qiita/incoming/deploy/activate.sh
