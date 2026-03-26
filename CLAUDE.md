@@ -73,6 +73,18 @@ study_idx → prep_idx → sample_idx → prep_sample_idx → processing_idx →
 
 `processing_idx` deduplicates on `SHA-256(canonical JSON parameters)` — same workflow + version + params always resolves to the same `processing_idx`.
 
+Reference identifiers form a parallel hierarchy:
+
+```
+reference_idx ── reference_membership ── feature_idx ── feature_genome ── genome_idx
+```
+
+- `reference_idx` = (name, version) pair for a reference database; `kind` distinguishes sequence references from taxonomy authorities
+- `genome_idx` = logical entity across references (nullable — not all features are genomes, e.g., 16S records)
+- `feature_idx` = specific sequence, deduplicated by MD5 hash via DuckDB `md5()` (identical bytes = same `feature_idx`; stored as Postgres `uuid`)
+
+`feature_idx` bridges sample processing results (alignment detail, counts) and reference data (sequences, taxonomy, annotations, phylogeny). Alignment output contains `feature_idx` but **not** `reference_idx` — reference scoping is a query-time join against `reference_membership`.
+
 ### Data plane design
 
 The data plane is intentionally "dumb": it only operates on identifiers it receives. Its three Arrow Flight operations map directly to DuckLake:
