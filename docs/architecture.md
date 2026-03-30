@@ -24,9 +24,9 @@ graph TB
     end
 
     subgraph services ["Core Services"]
-        CP["qiita-control-plane<br/>━━━━━━━━━━━━━━━━━━━<br/>FastAPI (Python)<br/>REST API<br/>━━━━━━━━━━━━━━━━━━━<br/>Study/Sample/Prep CRUD<br/>Search<br/>Work ticket management<br/>Flight ticket signing<br/>File registration orchestration"]
+        CP["qiita-control-plane<br/>━━━━━━━━━━━━━━━━━━━<br/>FastAPI (Python)<br/>REST API<br/>━━━━━━━━━━━━━━━━━━━<br/>Study/Sample/Prep CRUD<br/>Search<br/>Reference management<br/>Work ticket management<br/>Flight ticket signing<br/>File registration orchestration"]
         DP["qiita-data-plane (N instances)<br/>━━━━━━━━━━━━━━━━━━━<br/>Arrow Flight (Rust)<br/>gRPC<br/>━━━━━━━━━━━━━━━━━━━<br/>DoGet / DoPut / DoAction<br/>DuckDB + DuckLake<br/>Parquet file registration"]
-        CO["qiita-compute-orchestrator<br/>━━━━━━━━━━━━━━━━━━━<br/>Python service<br/>━━━━━━━━━━━━━━━━━━━<br/>Job lifecycle management<br/>slurmrestd client<br/>Output verification<br/>Log collection"]
+        CO["qiita-compute-orchestrator<br/>━━━━━━━━━━━━━━━━━━━<br/>Python service<br/>━━━━━━━━━━━━━━━━━━━<br/>Job lifecycle management<br/>slurmrestd client<br/>Output verification<br/>Log collection<br/>Reference index building"]
     end
 
     subgraph shared_lib ["Shared Library"]
@@ -39,9 +39,9 @@ graph TB
     end
 
     subgraph storage ["Data Storage"]
-        PG_APP["Postgres (App DB)<br/>━━━━━━━━━━━━━━━━━━━<br/>Users, roles, studies<br/>Samples, preparations<br/>Work tickets, provenance"]
+        PG_APP["Postgres (App DB)<br/>━━━━━━━━━━━━━━━━━━━<br/>Users, roles, studies<br/>Samples, preparations<br/>Work tickets, provenance<br/>References, genomes, features"]
         PG_DL["Postgres (DuckLake Catalog)<br/>━━━━━━━━━━━━━━━━━━━<br/>Snapshots, data files<br/>Schemas, partitions"]
-        FS["Shared Filesystem<br/>━━━━━━━━━━━━━━━━━━━<br/>/data/staging/ (raw uploads)<br/>/data/results/ (Parquet)<br/>/data/logs/ (job logs)"]
+        FS["Shared Filesystem<br/>━━━━━━━━━━━━━━━━━━━<br/>/data/staging/ (raw uploads)<br/>/data/results/ (Parquet)<br/>/data/logs/ (job logs)<br/>/data/references/ (aligner indices)"]
     end
 
     %% Client connections
@@ -104,9 +104,9 @@ graph TB
 
 ## Components
 
-- **qiita-control-plane** — Client-facing REST API (Python 3.14, FastAPI, asyncpg, Postgres, dbmate, OpenAPI, PyTest, ruff, uv, GitHub Actions CI). Handles CRUD for study/sample/preparation, search, work ticket creation/management. Signs Flight tickets (HMAC-SHA256) for client access to data plane. Orchestrates file registration in DuckLake (via data plane) after compute completion.
+- **qiita-control-plane** — Client-facing REST API (Python 3.14, FastAPI, asyncpg, Postgres, dbmate, OpenAPI, PyTest, ruff, uv, GitHub Actions CI). Handles CRUD for study/sample/preparation, search, work ticket creation/management, and reference management (genome/feature/reference ID minting, reference membership, taxonomy authority registration). Signs Flight tickets (HMAC-SHA256) for client access to data plane. Orchestrates file registration in DuckLake (via data plane) after compute completion.
 - **qiita-data-plane** — Data layer (Rust, arrow-flight, DuckDB v1.5.1, duckdb-miint extension, DuckLake w/ Postgres catalog). Arrow Flight protocol (gRPC-based). Intentionally "dumb" — select/insert/delete by exact integer identifiers. Clients connect directly through nginx. Verifies JWTs (AuthRocket JWKS) and Flight ticket signatures (HMAC-SHA256). Registers Parquet files into DuckLake via `ducklake_add_data_files` (metadata-only, no I/O). Calls back to control plane REST endpoint on completion/failure. Runs as dedicated `qiita-data-plane` system user; verifies result file permissions before registration and rejects files that are not `440`. **Horizontally scalable**: each instance holds an independent DuckDB+DuckLake connection to the shared Postgres catalog; DuckLake's snapshot-isolated concurrent read model means multiple instances never block each other. nginx load-balances gRPC traffic across all instances.
-- **qiita-compute-orchestrator** — Separate Python service for compute lifecycle management. Owns the full job lifecycle: submit via slurmrestd, poll for status, detect completion/failure, verify output, collect logs, and report back to control plane. SLURM jobs are truly dumb (read input, process, write output, exit). Abstracts compute backend behind a clean `ComputeBackend` interface (SLURM primary, future offload secondary).
+- **qiita-compute-orchestrator** — Separate Python service for compute lifecycle management. Owns the full job lifecycle: submit via slurmrestd, poll for status, detect completion/failure, verify output, collect logs, and report back to control plane. SLURM jobs are truly dumb (read input, process, write output, exit). Also builds aligner indices for references (minimap2 `.mmi`, bowtie2) as SLURM batch jobs. Abstracts compute backend behind a clean `ComputeBackend` interface (SLURM primary, future offload secondary).
 - **qiita-common** — Shared Python library for control plane and compute orchestrator. Pydantic models (work ticket states, API request/response schemas), config patterns, and REST client utilities. Prevents drift between services' understanding of the API contract.
 - **API gateway** — nginx: REST to qiita-control-plane, Arrow Flight/gRPC (HTTP/2+TLS) load-balanced across N qiita-data-plane instances.
 - **Auth** — OAuth2 via AuthRocket, local user/role tables in Postgres for access control. JWT verified locally at both services via cached JWKS public keys. Dedicated `compute` service account for compute orchestrator callbacks (narrow permissions: update work tickets, request file registration only). Dedicated `data-plane` service account for data plane callbacks.
@@ -124,6 +124,14 @@ All identifiers are uint64, minted exclusively by the control plane. The data pl
 - **`prep_sample_idx`** — unique identifier for an instance of a physical sample on a preparation. A prep can carry the same physical sample multiple times (technical or biological replicates); a sample can appear on multiple preps. `prep_sample_idx` is the finest-grained unit of raw input data.
 - **`processing_idx`** — unique identifier for a processing method: a specific `(workflow_name, workflow_version, parameter_set)` combination. Immutable once created. Reusable across preps and studies. Opaque integer in the data plane; detail lives in the control plane `processing_methods` table.
 - **`processed_prep_sample_idx`** — unique identifier for the result of applying a `processing_idx` to a `prep_sample_idx`. Minted by the control plane before job submission. Processing cannot create new samples — all `processed_prep_sample_idx` values for a job are pre-assigned from the known `prep_sample_idx` set on the prep.
+
+Reference identifiers form a parallel hierarchy for reference databases:
+
+- **`reference_idx`** — unique identifier for a specific `(name, version)` pair of a reference database (e.g., "Greengenes2 2024.09", "WoL3 v1.0"). A reference is a curated, versioned collection of features. The `kind` field distinguishes sequence references from taxonomy authorities. Minted by the control plane.
+- **`genome_idx`** — logical entity that spans references, representing a single genome regardless of which reference collections include it (e.g., "E. coli K-12 GCF_000005845"). Not all features are genomes — `genome_idx` is nullable for features like full-length 16S records or ASVs. Carries provenance: `source` (genbank, refseq, collaborator, qiita) and `source_id` (external accession when applicable, e.g., a GenBank or RefSeq accession). Minted by the control plane.
+- **`feature_idx`** — unique identifier for a specific sequence, deduplicated by MD5 hash: identical bytes always resolve to the same `feature_idx`. One genome has one or more features (contigs, chromosomes). Features are the unit of coordinate space — alignments and annotations use positions relative to a `feature_idx`. Minted by the control plane; sequence data stored in the data plane.
+
+`feature_idx` is the bridge between sample processing results (alignment detail, counts) and reference data (sequences, taxonomy, annotations, phylogeny). Alignment output contains `feature_idx` but not `reference_idx` — reference scoping is a query-time join against `reference_membership`.
 
 ### Processing Methods
 
@@ -155,6 +163,8 @@ This sort order provides two compounding layers of query optimisation:
 - **Parquet row group statistics**: sorted data produces tight, non-overlapping min/max ranges per row group — predicate pushdown skips row groups with zero false positives for point lookups and range scans. Without sorting, row group ranges overlap and pushdown degrades to near-useless for selective queries.
 
 The sort is enforced in the reduce step (see Compute Orchestrator), so it is consistent regardless of what the map phase produces.
+
+Alignment and count result tables extend this base sort with reference columns. Alignment detail Parquet uses the sort order `(study_idx, prep_idx, sample_idx, prep_sample_idx, processing_idx, processed_prep_sample_idx, feature_idx, position)` — the trailing `feature_idx, position` exploits genome locality so that reads hitting the same region of the same feature are physically adjacent. Count/aggregation Parquet uses `(..., feature_idx)` without `position`. Crucially, these tables contain `feature_idx` but **not** `reference_idx` — this means alignment and count data do not need to be recomputed when a feature is added to or removed from a reference version. Scoping results to a specific reference version is a query-time join against the `reference_membership` table.
 
 ### Sample Metadata
 
@@ -190,6 +200,171 @@ The data plane asserts identifier integrity programmatically since DuckLake does
 
 - **At registration**: before `ducklake_add_data_files`, verifies the Parquet file's `processed_prep_sample_idx` values are a subset of the expected set provided by the control plane, and that no value from the file already exists in the catalog for this `(prep_idx, processing_idx)` combination.
 - **At service startup**: scans the DuckLake catalog to verify no `processed_prep_sample_idx` appears in multiple active files for the same `(prep_idx, processing_idx)`. Violations are logged as critical errors and the affected combinations are blocked from serving until reconciled.
+
+### Reference Database Design
+
+Reference databases — curated collections of sequences, taxonomies, annotations, and phylogenies — are central to alignment-based analyses. The reference design uses a three-level identity model to decouple individual sequences from the logical genomes they belong to and the versioned reference collections they appear in.
+
+#### Three-Level Identity Model
+
+```mermaid
+erDiagram
+    REFERENCE ||--o{ REFERENCE_MEMBERSHIP : contains
+    REFERENCE_MEMBERSHIP }o--|| FEATURE : includes
+    FEATURE }o--o| FEATURE_GENOME : "belongs to"
+    FEATURE_GENOME }o--|| GENOME : "is part of"
+
+    REFERENCE {
+        uint64 reference_idx PK
+        text name
+        text version
+        text kind
+        uint64 created_by
+        timestamp created_at
+    }
+
+    GENOME {
+        uint64 genome_idx PK
+        text source
+        text source_id
+        timestamp created_at
+    }
+
+    FEATURE {
+        uint64 feature_idx PK
+        uuid sequence_hash
+        timestamp created_at
+    }
+
+    REFERENCE_MEMBERSHIP {
+        uint64 reference_idx FK
+        uint64 feature_idx FK
+    }
+
+    FEATURE_GENOME {
+        uint64 feature_idx FK
+        uint64 genome_idx FK
+    }
+```
+
+The three levels:
+
+- **`reference_idx`** — a versioned reference collection. Each `(name, version)` pair gets a unique `reference_idx`. The `kind` field distinguishes sequence references (`sequence_reference`) from taxonomy authorities (`taxonomy_authority`). Examples: Greengenes2 2024.09, WoL3 v1.0, RS225, NCBI Taxonomy 2025-03.
+- **`genome_idx`** — a logical genome that persists across references. When the same genome appears in WoL3 and RS225, both link to the same `genome_idx`, enabling cross-reference queries ("is this the same genome in WoL3 and RS225?"). Not all features are genomes — `genome_idx` is nullable for features like full-length 16S records or ASVs that have no corresponding genome. Carries provenance via `source` (genbank, refseq, collaborator, qiita) and `source_id` (external accession when applicable).
+- **`feature_idx`** — a specific sequence, deduplicated by MD5 hash (computed by DuckDB's `md5()` on sequences read via miint). Identical bytes always resolve to the same `feature_idx`. A genome is composed of one or more features (one per contig/chromosome) — there is no genome linearization. Alignments and annotations use coordinates relative to a `feature_idx`.
+
+Junction tables:
+
+| Table | Key | Purpose |
+|---|---|---|
+| `reference_membership` | `(reference_idx, feature_idx)` | Which features belong to which reference version |
+| `feature_genome` | `(feature_idx, genome_idx)` | Which genome a feature belongs to (not all features have a genome) |
+
+A feature may belong to multiple references (e.g., the same contig in WoL3 and RS225). A genome may contain multiple features (e.g., a multi-contig assembly). MD5-based deduplication ensures that if two references include the same sequence bytes, they share one `feature_idx` — no data is duplicated.
+
+#### Control Plane vs. Data Plane Split
+
+All ID minting and membership management lives in the control plane (Postgres OLTP). Bulk sequence data, taxonomy, annotations, phylogeny, and analysis results live in the data plane (DuckLake OLAP).
+
+**Control plane (Postgres App DB):**
+
+| Table | Key columns | Purpose |
+|---|---|---|
+| `references` | `reference_idx` PK | Reference-level metadata: name, version, kind, creator, timestamps |
+| `genomes` | `genome_idx` PK | Genome provenance: source, source_id, timestamps |
+| `features` | `feature_idx` PK | Feature identity: sequence_hash, timestamps |
+| `reference_membership` | `(reference_idx, feature_idx)` | Which features are in each reference version |
+| `feature_genome` | `(feature_idx, genome_idx)` | Feature-to-genome mapping |
+
+**Data plane (DuckLake):**
+
+| Table | Sort / partition key | Contents |
+|---|---|---|
+| Reference sequences | `feature_idx` | `(feature_idx, sequence, sequence_hash, length)` |
+| Reference taxonomy | `(reference_idx, feature_idx)` | Taxonomy assignments — reference-version-specific. Rank columns (domain through species) plus `ncbi_taxon_id` when available |
+| Reference annotations | `(feature_idx, position)` | GFF-like: `(feature_idx, source, type, position, stop_position, score, strand, phase, attributes)` — gene models, CDS, regulatory regions |
+| Reference phylogeny | `(reference_idx, node_index)` | Per-reference tree: `(reference_idx, node_index, name, branch_length, edge_id, parent_index, is_tip)` — Newick trees decomposed into node tables via `read_newick` |
+| Placements | `(reference_idx, fragment)` | jplace data stored as-is via `read_jplace`; reconciled against reference membership and phylogeny at query time |
+| Alignment detail | `(study_idx, ..., feature_idx, position)` | Per-read alignment results sorted for genome locality: `(study_idx, prep_idx, sample_idx, prep_sample_idx, processing_idx, processed_prep_sample_idx, feature_idx, position)` |
+| Count / aggregation | `(prep_sample_idx, ..., feature_idx)` | Sparse COO format: `(study_idx, prep_idx, sample_idx, prep_sample_idx, processing_idx, processed_prep_sample_idx, feature_idx, value)` |
+
+#### Taxonomy as a Reference
+
+NCBI Taxonomy (and similar taxonomy authority systems) are modeled as references with `kind = 'taxonomy_authority'`. This means:
+
+- An NCBI Taxonomy release gets its own `reference_idx`, just like any sequence reference
+- Taxonomy versions are tracked with the same machinery as sequence reference versions
+- If GTDB, Silva, or other taxonomy systems are added, they are additional taxonomy authority references — no special-case code
+
+A genome or feature may have taxonomy assignments from multiple sources (e.g., both a sequence reference's taxonomy and the NCBI taxonomy authority). Both are rows in the taxonomy table keyed on `(reference_idx, feature_idx)` — the `reference_idx` distinguishes the source. The `ncbi_taxon_id` column is stored alongside the rank strings for features that have an NCBI assignment, enabling joins to external NCBI data.
+
+#### Annotations
+
+Functional annotations (gene models, CDS, regulatory features) follow a GFF3-compatible schema in the data plane, parsed via the miint `read_gff` table function. Annotations are keyed on `(feature_idx, position)` — they describe coordinates on a specific sequence.
+
+Non-taxonomic annotation systems (KEGG, COG, Pfam) are normalized under the GFF schema where feasible, using the `source` and `type` columns to distinguish annotation origins and the `attributes` MAP for system-specific metadata.
+
+#### Phylogeny and Placements
+
+Reference phylogenies are stored as node tables decomposed from Newick files via the miint `read_newick` table function. Each tree is keyed on `reference_idx` and contains `(node_index, name, branch_length, edge_id, parent_index, is_tip)` per node. The miint internal phylogeny data model is compatible with this schema.
+
+Phylogenetic placements (jplace format) are stored as raw placement data via `read_jplace` rather than resolved into the tree. Reconciliation of placements against the reference phylogeny happens at processing time or on user queries, keeping the stored data independent of tree topology changes.
+
+#### Aligner Index Storage
+
+Aligner indices (minimap2 `.mmi`, bowtie2 `.bt2`) are built by the compute orchestrator as SLURM batch jobs and stored on the shared filesystem:
+
+```
+/data/references/{reference_idx}/
+├── minimap2/
+│   └── index.mmi
+├── bowtie2/
+│   ├── index.1.bt2
+│   ├── index.2.bt2
+│   └── ...
+└── metadata.json        # build provenance, aligner versions, parameters
+```
+
+The control plane records which aligner indices exist for each reference version. Processing workflows reference aligner indices by `reference_idx` in their `params.json`. When a new reference version is cut, index building is submitted as a follow-up SLURM job through the orchestrator.
+
+#### Bulk Reference Ingestion
+
+Adding a new reference (potentially millions of sequences) is a multi-step pipeline through the compute orchestrator, not the control plane's web process:
+
+1. A user with appropriate role initiates reference creation via the control plane REST API, providing source data paths on the shared filesystem
+2. The control plane creates the `reference_idx` and submits a **hash job** to the compute orchestrator
+3. The SLURM hash job reads sequences using DuckDB + miint (`read_fastx`), computes MD5 hashes via DuckDB's built-in `md5()`, and writes a manifest (hash, sequence identifier, length, metadata) to the output directory
+4. The orchestrator reads the manifest and sends hashes to the control plane in bulk
+5. The control plane does a bulk dedup lookup against the `features` table (`sequence_hash` unique index), reuses existing `feature_idx` for matches, mints new `feature_idx` for novel sequences, writes `reference_membership` and `feature_genome` records, and returns the `{hash → feature_idx}` mapping to the orchestrator
+6. The orchestrator submits a **load job** with the ID mapping; the SLURM job loads sequences, taxonomy, annotations, and phylogeny into DuckLake tables using the assigned `feature_idx` values
+7. On completion, the orchestrator submits an **index build job** to create aligner indices (minimap2 `.mmi`, bowtie2)
+8. The control plane records the reference as active once all jobs complete
+
+This keeps the control plane's API process lean — it handles only lightweight OLTP (ID minting, membership writes, bulk dedup lookups), while the heavy I/O (reading sequences, computing hashes, loading data, building indices) is delegated to SLURM.
+
+#### Scale
+
+| Reference | Approximate size |
+|---|---|
+| Greengenes2 | ~20M records (300K full-length 16S + ASVs) |
+| Web of Life 3 (WoL3) | ~233K genomes |
+| RS225 | ~55K genomes (partial overlap with WoL3; includes some eukaryotes) |
+
+Currently ~5 references, growing. New sequences are added via online update; periodic version cuts create new `reference_idx` values with updated membership sets.
+
+#### Example Query Patterns
+
+These queries demonstrate the join patterns the reference design supports:
+
+1. **Taxon-scoped sample data:** "Give me all sample data where matched reference features belong to taxon X" — join reference taxonomy → reference membership → alignment/count tables. The taxonomy join filters by `reference_idx` and taxon; the membership join maps features to the reference version; the alignment join retrieves sample data by `feature_idx`.
+
+2. **Taxon + gene intersection:** "Give me all reads with alignments to taxon X and gene Y" — join reference taxonomy + GFF annotations (both keyed on `feature_idx`) → alignment detail. All joins stay in the data plane for high-throughput analytical queries.
+
+3. **Reference-only queries:** "Give me all sequences in family Lachnospiraceae from Greengenes2" — pure data plane: filter taxonomy table by rank, join to sequences table via `feature_idx`. High-throughput scan, no sample data involved.
+
+4. **Cross-reference identity:** "Is this the same genome in WoL3 and RS225?" — join `reference_membership` for both references through `feature_idx` to `feature_genome`, comparing `genome_idx`. Shared `genome_idx` confirms cross-reference identity.
+
+5. **Sequences by identifier:** "Give me the sequence for feature_idx 42" — direct lookup in the reference sequences table. Also supports bulk retrieval by identifier set via standard Flight ticket pattern.
 
 ## Client Interfaces (Unresolved)
 
@@ -516,7 +691,7 @@ Postgres-based (`SELECT ... FOR UPDATE SKIP LOCKED`). Work tickets created by qi
 ## Database Topology
 
 Single hardened Postgres instance, two logical databases:
-- **App DB** — control plane tables: users, roles, studies, samples, preparations, work tickets, provenance
+- **App DB** — control plane tables: users, roles, studies, samples, preparations, work tickets, provenance, references, genomes, features, reference membership, feature-genome mapping
 - **DuckLake Catalog DB** — DuckLake metadata tables (snapshots, data files, schemas, etc.)
 
 ## Data Storage
@@ -525,6 +700,7 @@ Shared filesystem accessible by all components:
 - `/data/staging/` — raw uploaded data (FASTQ, etc.). Cleanup policy TBD.
 - `/data/results/` — processed output (Parquet). Ownership transfers to DuckLake after registration; compaction may delete/rewrite files.
 - `/data/logs/` — SLURM job stdout/stderr logs. Retained for diagnosis.
+- `/data/references/` — aligner indices (minimap2 `.mmi`, bowtie2 `.bt2`) built per reference version. Organized as `/data/references/{reference_idx}/{aligner}/`.
 
 ## Ticket Signing
 
@@ -566,12 +742,13 @@ qiita/
 │   │       ├── main.py             # FastAPI app entry point + /health endpoint
 │   │       ├── config.py           # settings (DB URL, HMAC secret, AuthRocket JWKS URL)
 │   │       ├── auth/               # JWT verification, HMAC ticket signing, AuthRocket integration
-│   │       ├── models/             # asyncpg models (studies, samples, preparations, users, roles, work tickets, provenance)
+│   │       ├── models/             # asyncpg models (studies, samples, preparations, users, roles, work tickets, provenance, references, genomes, features)
 │   │       ├── routes/
 │   │       │   ├── studies.py
 │   │       │   ├── samples.py
 │   │       │   ├── preparations.py
 │   │       │   ├── tickets.py      # work ticket CRUD + Flight ticket issuance + manual restart
+│   │       │   ├── references.py   # reference CRUD, membership management, genome/feature minting
 │   │       │   └── callbacks.py    # data plane + compute orchestrator callback endpoints
 │   │       └── db.py               # asyncpg connection pool setup
 │   └── tests/
@@ -596,6 +773,7 @@ qiita/
 │   │       ├── config.py           # settings (slurmrestd URL, slurmrestd JWT, control plane URL, poll interval)
 │   │       ├── backend.py          # ComputeBackend interface
 │   │       ├── slurm.py            # SLURM implementation (slurmrestd REST client, job lifecycle)
+│   │       ├── reference_indexing.py  # reference ingestion + aligner index build job management
 │   │       └── workflows/          # workflow definitions (container image, resources, entrypoint)
 │   └── tests/
 │       ├── conftest.py
@@ -784,3 +962,7 @@ jobs:
 - **qiita-common dependency:** Both Python services depend on `qiita-common` as a path dependency in their `pyproject.toml` (e.g., `qiita-common = {path = "../qiita-common"}`). Shared Pydantic models ensure API contract consistency.
 - **Data plane Unix user and file protection:** The data plane runs as a dedicated `qiita-data-plane` system user (no login shell). SLURM jobs run as a separate `qiita-worker` user and write result files to `/data/results/`. Before exiting, each job sets `chmod 440` on its output files — owner and group read-only, no write, no world access. The data plane checks this permission as a pre-registration gate before calling `ducklake_add_data_files`; a file that is not `440` is rejected as a permanent registration failure. This ensures that once DuckLake takes ownership of a file, no compute job (or other process running as `qiita-worker`) can overwrite or corrupt it. The data plane user must be in the same group as `qiita-worker` (or the results directory must be group-readable) so the service can read files it does not own. Staging files (`/data/staging/`) follow the same pattern: `qiita-worker` writes them, and they are read-only to all other users once the upload is confirmed.
 - **Data plane horizontal scaling:** The data plane is the read/write path for all DuckLake data. At scale, many concurrent SLURM jobs may issue large DoGet reads simultaneously, making a single data plane process a throughput bottleneck. The data plane scales horizontally because each instance is stateless with respect to request handling — it holds only a DuckDB+DuckLake connection to the shared Postgres catalog and reads Parquet files from the shared filesystem. DuckLake's concurrent read model is safe for this: multiple DuckDB instances connecting to the same Postgres catalog never block each other (readers use snapshot isolation with no row-level locking; conflicts only arise on concurrent writes, resolved via optimistic concurrency at commit time). Workers cannot bypass the data plane and read Parquet files directly for several reasons: (1) deletions are recorded as separate delete files in the DuckLake catalog — raw Parquet reads return logically deleted rows; (2) small inserts below the data inlining threshold are stored entirely within the Postgres catalog (`ducklake_inlined_data_tables`), with no Parquet file written at all; (3) snapshot visibility requires a catalog query to determine which files are live for the current consistent state; (4) compaction rewrites and deletes Parquet files under active management, making cached paths unreliable. The data plane remains the correct and only correct read path; the solution to the bottleneck is running more of them.
+- **Reference ID minting flow:** Bulk reference ingestion is a multi-step pipeline: (1) SLURM hash job reads sequences via DuckDB + miint and computes MD5 hashes, writing a manifest; (2) orchestrator feeds hashes to control plane; (3) control plane does bulk dedup lookup (`features.sequence_hash` unique index, stored as Postgres `uuid`), reuses existing `feature_idx` for matches, mints new ones for novel sequences, writes membership records, returns ID mapping; (4) SLURM load job inserts sequences + taxonomy + annotations into DuckLake using assigned IDs; (5) SLURM index job builds aligner indices.
+- **Alignment → reference join:** Alignment Parquet contains `feature_idx` but not `reference_idx`. To scope alignment results to a specific reference version, the query joins `reference_membership(reference_idx, feature_idx)` at query time. This join can happen entirely in the data plane (DuckLake) for analytical queries, or the control plane can provide the authorized feature set for a given reference to narrow a Flight ticket.
+- **Reference filesystem paths:** Aligner indices stored at `/data/references/{reference_idx}/{aligner}/`. Built by SLURM jobs via the compute orchestrator; read by alignment SLURM jobs at processing time. Processing workflow `params.json` includes the `reference_idx` to locate the correct index path.
+- **Feature deduplication:** `feature_idx` is content-addressed via MD5 hash of the sequence bytes. The SLURM ingestion job computes hashes using DuckDB's built-in `md5()` function on sequences read via miint's `read_fastx`. Hashes are fed back to the control plane through the orchestrator for bulk dedup lookup. The control plane stores hashes as Postgres `uuid` type (MD5 is exactly 128 bits = UUID-sized) with a unique B-tree index, and upserts on `sequence_hash` — if a sequence already exists, the existing `feature_idx` is reused and the new reference's membership row simply points to it.
