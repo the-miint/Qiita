@@ -77,6 +77,7 @@ Reference identifiers form a parallel hierarchy:
 
 ```
 reference_idx ── reference_membership ── feature_idx ── feature_genome ── genome_idx
+                                    └── phylogeny_tip_feature (reference_idx, node_index) → feature_idx
 ```
 
 - `reference_idx` = (name, version) pair for a reference database; `kind` distinguishes sequence references from taxonomy authorities
@@ -84,6 +85,8 @@ reference_idx ── reference_membership ── feature_idx ── feature_geno
 - `feature_idx` = specific sequence, deduplicated by MD5 hash via DuckDB `md5()` (identical bytes = same `feature_idx`; stored as Postgres `uuid`)
 
 `feature_idx` bridges sample processing results (alignment detail, counts) and reference data (sequences, taxonomy, annotations, phylogeny). Alignment output contains `feature_idx` but **not** `reference_idx` — reference scoping is a query-time join against `reference_membership`.
+
+Phylogeny internal nodes are addressed by `(reference_idx, node_index)` — scoped to a single tree, not referenced across references. Tip nodes connect to `feature_idx` via the `phylogeny_tip_feature` junction table.
 
 ### Data plane design
 

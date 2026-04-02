@@ -213,6 +213,8 @@ erDiagram
     REFERENCE_MEMBERSHIP }o--|| FEATURE : includes
     FEATURE }o--o| FEATURE_GENOME : "belongs to"
     FEATURE_GENOME }o--|| GENOME : "is part of"
+    REFERENCE ||--o{ PHYLOGENY_TIP_FEATURE : "has tree"
+    PHYLOGENY_TIP_FEATURE }o--|| FEATURE : "tip maps to"
 
     REFERENCE {
         uint64 reference_idx PK
@@ -245,6 +247,12 @@ erDiagram
         uint64 feature_idx FK
         uint64 genome_idx FK
     }
+
+    PHYLOGENY_TIP_FEATURE {
+        uint64 reference_idx FK
+        uint64 node_index FK
+        uint64 feature_idx FK
+    }
 ```
 
 The three levels:
@@ -259,6 +267,7 @@ Junction tables:
 |---|---|---|
 | `reference_membership` | `(reference_idx, feature_idx)` | Which features belong to which reference version |
 | `feature_genome` | `(feature_idx, genome_idx)` | Which genome a feature belongs to (not all features have a genome) |
+| `phylogeny_tip_feature` | `(reference_idx, node_index, feature_idx)` | Maps phylogeny tip nodes to their corresponding feature sequences |
 
 A feature may belong to multiple references (e.g., the same contig in WoL3 and RS225). A genome may contain multiple features (e.g., a multi-contig assembly). MD5-based deduplication ensures that if two references include the same sequence bytes, they share one `feature_idx` — no data is duplicated.
 
@@ -275,6 +284,7 @@ All ID minting and membership management lives in the control plane (Postgres OL
 | `features` | `feature_idx` PK | Feature identity: sequence_hash, timestamps |
 | `reference_membership` | `(reference_idx, feature_idx)` | Which features are in each reference version |
 | `feature_genome` | `(feature_idx, genome_idx)` | Feature-to-genome mapping |
+| `phylogeny_tip_feature` | `(reference_idx, node_index, feature_idx)` | Tip node → feature mapping for phylogeny traversal |
 
 **Data plane (DuckLake):**
 
@@ -308,6 +318,8 @@ Non-taxonomic annotation systems (KEGG, COG, Pfam) are normalized under the GFF 
 
 Reference phylogenies are stored as node tables decomposed from Newick files via the miint `read_newick` table function. Each tree is keyed on `reference_idx` and contains `(node_index, name, branch_length, edge_id, parent_index, is_tip)` per node. The miint internal phylogeny data model is compatible with this schema.
 
+**Tip-to-feature mapping:** The `phylogeny_tip_feature` junction table (control plane, Postgres) maps `(reference_idx, node_index)` → `feature_idx` for tip nodes. This is populated at reference ingestion time (step 6 of bulk ingestion) by matching tip names in the Newick tree to features already registered in `reference_membership`. The mapping enables phylogeny-rooted queries: traverse the tree to collect descendant tips via `parent_index`, then join through `phylogeny_tip_feature` to reach `feature_idx` and from there to alignment/count tables. Internal nodes are addressed by `(reference_idx, node_index)` — they do not have a global identifier and are not referenced across trees.
+
 Phylogenetic placements (jplace format) are stored as raw placement data via `read_jplace` rather than resolved into the tree. Reconciliation of placements against the reference phylogeny happens at processing time or on user queries, keeping the stored data independent of tree topology changes.
 
 #### Aligner Index Storage
@@ -336,7 +348,7 @@ Adding a new reference (potentially millions of sequences) is a multi-step pipel
 3. The SLURM hash job reads sequences using DuckDB + miint (`read_fastx`), computes MD5 hashes via DuckDB's built-in `md5()`, and writes a manifest (hash, sequence identifier, length, metadata) to the output directory
 4. The orchestrator reads the manifest and sends hashes to the control plane in bulk
 5. The control plane does a bulk dedup lookup against the `features` table (`sequence_hash` unique index), reuses existing `feature_idx` for matches, mints new `feature_idx` for novel sequences, writes `reference_membership` and `feature_genome` records, and returns the `{hash → feature_idx}` mapping to the orchestrator
-6. The orchestrator submits a **load job** with the ID mapping; the SLURM job loads sequences, taxonomy, annotations, and phylogeny into DuckLake tables using the assigned `feature_idx` values
+6. The orchestrator submits a **load job** with the ID mapping; the SLURM job loads sequences, taxonomy, annotations, and phylogeny into DuckLake tables using the assigned `feature_idx` values. For references with a phylogeny, the load job also resolves tip names to `feature_idx` and the orchestrator writes `phylogeny_tip_feature` records to the control plane
 7. On completion, the orchestrator submits an **index build job** to create aligner indices (minimap2 `.mmi`, bowtie2)
 8. The control plane records the reference as active once all jobs complete
 
@@ -365,6 +377,8 @@ These queries demonstrate the join patterns the reference design supports:
 4. **Cross-reference identity:** "Is this the same genome in WoL3 and RS225?" — join `reference_membership` for both references through `feature_idx` to `feature_genome`, comparing `genome_idx`. Shared `genome_idx` confirms cross-reference identity.
 
 5. **Sequences by identifier:** "Give me the sequence for feature_idx 42" — direct lookup in the reference sequences table. Also supports bulk retrieval by identifier set via standard Flight ticket pattern.
+
+6. **Clade-scoped sample data:** "Give me all sample counts under this clade in the WoL3 tree" — the control plane resolves the clade to a `feature_idx` set: recursive CTE on the phylogeny node table (DuckLake, via data plane) to collect descendant tip `node_index` values, then join through `phylogeny_tip_feature` (Postgres) to get the `feature_idx` set. The control plane signs a Flight ticket scoped to those `feature_idx` values, and the data plane serves the count/alignment data. Same pattern as reference-scoped queries — the control plane resolves the identifier set, the data plane serves the data.
 
 ## Client Interfaces (Unresolved)
 
@@ -691,7 +705,7 @@ Postgres-based (`SELECT ... FOR UPDATE SKIP LOCKED`). Work tickets created by qi
 ## Database Topology
 
 Single hardened Postgres instance, two logical databases:
-- **App DB** — control plane tables: users, roles, studies, samples, preparations, work tickets, provenance, references, genomes, features, reference membership, feature-genome mapping
+- **App DB** — control plane tables: users, roles, studies, samples, preparations, work tickets, provenance, references, genomes, features, reference membership, feature-genome mapping, phylogeny tip-feature mapping
 - **DuckLake Catalog DB** — DuckLake metadata tables (snapshots, data files, schemas, etc.)
 
 ## Data Storage
@@ -742,7 +756,7 @@ qiita/
 │   │       ├── main.py             # FastAPI app entry point + /health endpoint
 │   │       ├── config.py           # settings (DB URL, HMAC secret, AuthRocket JWKS URL)
 │   │       ├── auth/               # JWT verification, HMAC ticket signing, AuthRocket integration
-│   │       ├── models/             # asyncpg models (studies, samples, preparations, users, roles, work tickets, provenance, references, genomes, features)
+│   │       ├── models/             # asyncpg models (studies, samples, preparations, users, roles, work tickets, provenance, references, genomes, features, phylogeny tip-feature)
 │   │       ├── routes/
 │   │       │   ├── studies.py
 │   │       │   ├── samples.py
@@ -965,4 +979,5 @@ jobs:
 - **Reference ID minting flow:** Bulk reference ingestion is a multi-step pipeline: (1) SLURM hash job reads sequences via DuckDB + miint and computes MD5 hashes, writing a manifest; (2) orchestrator feeds hashes to control plane; (3) control plane does bulk dedup lookup (`features.sequence_hash` unique index, stored as Postgres `uuid`), reuses existing `feature_idx` for matches, mints new ones for novel sequences, writes membership records, returns ID mapping; (4) SLURM load job inserts sequences + taxonomy + annotations into DuckLake using assigned IDs; (5) SLURM index job builds aligner indices.
 - **Alignment → reference join:** Alignment Parquet contains `feature_idx` but not `reference_idx`. To scope alignment results to a specific reference version, the query joins `reference_membership(reference_idx, feature_idx)` at query time. This join can happen entirely in the data plane (DuckLake) for analytical queries, or the control plane can provide the authorized feature set for a given reference to narrow a Flight ticket.
 - **Reference filesystem paths:** Aligner indices stored at `/data/references/{reference_idx}/{aligner}/`. Built by SLURM jobs via the compute orchestrator; read by alignment SLURM jobs at processing time. Processing workflow `params.json` includes the `reference_idx` to locate the correct index path.
+- **Phylogenetic addressing:** Internal nodes are addressed by `(reference_idx, node_index)` — scoped to a single tree, not referenced across references. Tip nodes connect to the sequence identity layer via the `phylogeny_tip_feature` junction table `(reference_idx, node_index) → feature_idx`, populated at ingestion time. Clade-scoped queries use a recursive CTE on `parent_index` to collect descendant tips, then join through `phylogeny_tip_feature` to reach `feature_idx`.
 - **Feature deduplication:** `feature_idx` is content-addressed via MD5 hash of the sequence bytes. The SLURM ingestion job computes hashes using DuckDB's built-in `md5()` function on sequences read via miint's `read_fastx`. Hashes are fed back to the control plane through the orchestrator for bulk dedup lookup. The control plane stores hashes as Postgres `uuid` type (MD5 is exactly 128 bits = UUID-sized) with a unique B-tree index, and upserts on `sequence_hash` — if a sequence already exists, the existing `feature_idx` is reused and the new reference's membership row simply points to it.
