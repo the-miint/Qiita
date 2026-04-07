@@ -135,3 +135,36 @@ def test_reference_response_rejects_zero_idx():
             created_by=UUID("a0000000-0000-0000-0000-000000000001"),
             created_at=datetime.now(UTC),
         )
+
+
+def test_feature_hash_entry_rejects_source_without_id():
+    """genome_source set without genome_source_id must fail validation."""
+    from qiita_common.models import FeatureHashEntry
+
+    with pytest.raises(ValidationError):
+        FeatureHashEntry(
+            sequence_hash=UUID("a0000000-0000-0000-0000-000000000001"),
+            genome_source="genbank",
+        )
+
+
+def test_feature_hash_entry_rejects_id_without_source():
+    """genome_source_id set without genome_source must fail validation."""
+    from qiita_common.models import FeatureHashEntry
+
+    with pytest.raises(ValidationError):
+        FeatureHashEntry(
+            sequence_hash=UUID("a0000000-0000-0000-0000-000000000001"),
+            genome_source_id="GCF_123",
+        )
+
+
+def test_feature_mint_request_rejects_duplicate_hashes():
+    """FeatureMintRequest must reject duplicate sequence_hash values."""
+    from qiita_common.models import FeatureHashEntry, FeatureMintRequest
+
+    h = UUID("a0000000-0000-0000-0000-000000000001")
+    with pytest.raises(ValidationError):
+        FeatureMintRequest(
+            entries=[FeatureHashEntry(sequence_hash=h), FeatureHashEntry(sequence_hash=h)]
+        )

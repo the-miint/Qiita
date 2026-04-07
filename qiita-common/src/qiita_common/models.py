@@ -4,7 +4,7 @@ from enum import StrEnum
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
 
 class HealthResponse(BaseModel):
@@ -38,3 +38,32 @@ class ReferenceResponse(BaseModel):
     status: ReferenceStatus
     created_by: UUID
     created_at: AwareDatetime
+
+
+class FeatureHashEntry(BaseModel):
+    sequence_hash: UUID
+    genome_source: str | None = None
+    genome_source_id: str | None = None
+
+    @model_validator(mode="after")
+    def genome_fields_consistent(self):
+        if (self.genome_source is None) != (self.genome_source_id is None):
+            raise ValueError("genome_source and genome_source_id must both be set or both be null")
+        return self
+
+
+class FeatureMintRequest(BaseModel):
+    entries: list[FeatureHashEntry] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def no_duplicate_hashes(self):
+        hashes = [e.sequence_hash for e in self.entries]
+        if len(hashes) != len(set(hashes)):
+            raise ValueError("entries must not contain duplicate sequence_hash values")
+        return self
+
+
+class FeatureMintResponse(BaseModel):
+    mapping: dict[UUID, int]
+    minted: int
+    reused: int
