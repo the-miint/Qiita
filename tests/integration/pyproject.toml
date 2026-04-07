@@ -10,11 +10,13 @@ dependencies = [
     "pyarrow>=19",
     "qiita-common",
     "qiita-control-plane",
+    "qiita-compute-orchestrator",
 ]
 
 [tool.uv.sources]
 qiita-common = { path = "../../qiita-common" }
 qiita-control-plane = { path = "../../qiita-control-plane" }
+qiita-compute-orchestrator = { path = "../../qiita-compute-orchestrator" }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -79,3 +79,22 @@ def http() -> httpx.Client:
     """Shared HTTP client for the full test session."""
     with httpx.Client(timeout=10) as client:
         yield client
+
+
+TEST_SEQUENCES = {
+    "seq1": "ATCGATCGATCG",
+    "seq2": "GCTAGCTAGCTA",
+    "seq3": "AAATTTTCCCGGG",
+    "seq4": "TTTTAAAACCCC",
+    "seq5": "GGGGCCCCAAAA",
+}
+
+
+@pytest.fixture
+def fasta_file(tmp_path):
+    """Create a 5-sequence FASTA file. Shared across test modules."""
+    path = tmp_path / "test.fasta"
+    with open(path, "w") as f:
+        for name, seq in TEST_SEQUENCES.items():
+            f.write(f">{name}\n{seq}\n")
+    return path, TEST_SEQUENCES

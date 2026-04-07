@@ -7,11 +7,13 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import Field
 from qiita_common.models import (
+    VALID_STATUS_TRANSITIONS,
     FeatureHashEntry,
     FeatureMintRequest,
     FeatureMintResponse,
     ReferenceCreateRequest,
     ReferenceResponse,
+    ReferenceStatusUpdate,
 )
 
 from ..deps import get_current_user, get_db_pool
@@ -63,6 +65,49 @@ async def get_reference(
     if row is None:
         raise HTTPException(status_code=404, detail="Reference not found")
     return ReferenceResponse(**dict(row))
+
+
+@router.patch("/{reference_idx}/status")
+async def update_reference_status(
+    reference_idx: Annotated[int, Field(gt=0)],
+    body: ReferenceStatusUpdate,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+) -> ReferenceResponse:
+    target_status = body.status
+
+    # Build the set of valid source statuses for this target
+    valid_sources = [
+        str(src) for src, targets in VALID_STATUS_TRANSITIONS.items() if target_status in targets
+    ]
+    if not valid_sources:
+        raise HTTPException(
+            status_code=409,
+            detail=f"No valid transition to {target_status!r}",
+        )
+
+    # Atomic conditional UPDATE — avoids TOCTOU race
+    row = await pool.fetchrow(
+        "UPDATE qiita.references SET status = $1"
+        " WHERE reference_idx = $2 AND status = ANY($3::text[])"
+        " RETURNING reference_idx, name, version, kind, status, created_by, created_at",
+        str(target_status),
+        reference_idx,
+        valid_sources,
+    )
+    if row is not None:
+        return ReferenceResponse(**dict(row))
+
+    # Distinguish 404 from 409
+    current = await pool.fetchval(
+        "SELECT status FROM qiita.references WHERE reference_idx = $1",
+        reference_idx,
+    )
+    if current is None:
+        raise HTTPException(status_code=404, detail="Reference not found")
+    raise HTTPException(
+        status_code=409,
+        detail=f"Cannot transition from {current!r} to {target_status!r}",
+    )
 
 
 @router.post("/{reference_idx}/features/mint")

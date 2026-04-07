@@ -67,3 +67,21 @@ class FeatureMintResponse(BaseModel):
     mapping: dict[UUID, int]
     minted: int
     reused: int
+
+
+# Valid status transitions for references.
+VALID_STATUS_TRANSITIONS: dict[ReferenceStatus, set[ReferenceStatus]] = {
+    ReferenceStatus.PENDING: {ReferenceStatus.HASHING, ReferenceStatus.FAILED},
+    ReferenceStatus.HASHING: {ReferenceStatus.MINTING, ReferenceStatus.FAILED},
+    ReferenceStatus.MINTING: {ReferenceStatus.LOADING, ReferenceStatus.FAILED},
+    ReferenceStatus.LOADING: {ReferenceStatus.ACTIVE, ReferenceStatus.FAILED},
+    # ACTIVE is a terminal success state. To remediate a broken active reference,
+    # delete it and re-create. No direct transition to FAILED — that path is only
+    # for in-progress references that encounter errors during ingestion.
+    ReferenceStatus.ACTIVE: set(),
+    ReferenceStatus.FAILED: {ReferenceStatus.PENDING},
+}
+
+
+class ReferenceStatusUpdate(BaseModel):
+    status: ReferenceStatus

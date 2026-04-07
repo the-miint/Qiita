@@ -1,5 +1,6 @@
 """Local compute backend — runs DuckDB+miint in-process for dev/test."""
 
+import asyncio
 import json
 import uuid
 from pathlib import Path
@@ -8,18 +9,22 @@ import duckdb
 
 from ..backend import ComputeBackend, FeatureMap
 
-# miint is installed once at module load to avoid a network call on every hash job.
-# LOAD is idempotent and fast if the extension is already cached.
-_MIINT_INSTALLED = False
+# miint is installed once per process to avoid a network call on every hash job.
+_miint_install_lock = asyncio.Lock()
+_miint_installed = False
 
 
-def _ensure_miint_installed() -> None:
-    """Install miint from the community registry once per process."""
-    global _MIINT_INSTALLED
-    if not _MIINT_INSTALLED:
+async def _ensure_miint_installed() -> None:
+    """Install miint from the community registry once per process, concurrency-safe."""
+    global _miint_installed
+    if _miint_installed:
+        return
+    async with _miint_install_lock:
+        if _miint_installed:
+            return
         with duckdb.connect(":memory:") as conn:
             conn.execute("INSTALL miint FROM community;")
-        _MIINT_INSTALLED = True
+        _miint_installed = True
 
 
 def _md5_hex_to_uuid(hex_str: str) -> str:
@@ -35,7 +40,7 @@ class LocalBackend(ComputeBackend):
             raise FileNotFoundError(f"FASTA file not found: {fasta_path}")
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        _ensure_miint_installed()
+        await _ensure_miint_installed()
 
         with duckdb.connect(":memory:") as conn:
             conn.execute("LOAD miint;")
@@ -56,13 +61,23 @@ class LocalBackend(ComputeBackend):
             # fetchall() with chunked iteration or DuckDB COPY TO JSON to avoid
             # loading the full result set into Python memory.
 
-        # Reject duplicate read_ids — almost always indicates corrupt input
-        read_ids = [row[0] for row in rows]
-        duplicates = {rid for rid in read_ids if read_ids.count(rid) > 1}
-        if duplicates:
-            raise ValueError(
-                f"FASTA contains {len(duplicates)} duplicate read_id(s): {sorted(duplicates)[:10]}"
-            )
+            # Reject duplicate read_ids — use DuckDB for O(n) efficiency.
+            # The read_ids are already in the result set, so we query directly
+            # from the same FASTA file to leverage DuckDB's grouping.
+            if rows:
+                try:
+                    dup_result = conn.execute(
+                        "SELECT read_id, count(*) AS cnt FROM read_fastx(?)"
+                        " GROUP BY read_id HAVING count(*) > 1",
+                        [str(fasta_path)],
+                    ).fetchall()
+                except duckdb.Error:
+                    dup_result = []
+                if dup_result:
+                    dup_ids = sorted(row[0] for row in dup_result)
+                    raise ValueError(
+                        f"FASTA contains {len(dup_ids)} duplicate read_id(s): {dup_ids[:10]}"
+                    )
 
         entries = [
             {
