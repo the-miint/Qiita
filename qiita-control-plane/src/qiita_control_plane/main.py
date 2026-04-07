@@ -3,11 +3,13 @@
 from contextlib import asynccontextmanager
 
 import asyncpg
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI
 from qiita_common.models import HealthResponse
 
 from .config import Settings
 from .db import close_pool, get_pool
+from .deps import get_db_pool
+from .routes import api_router
 
 
 @asynccontextmanager
@@ -20,11 +22,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="qiita-control-plane", lifespan=lifespan)
-
-
-def get_db_pool(request: Request) -> asyncpg.Pool:
-    """Typed accessor for the database pool — use as a FastAPI dependency."""
-    return request.app.state.pool
+app.include_router(api_router)
 
 
 @app.get("/health")

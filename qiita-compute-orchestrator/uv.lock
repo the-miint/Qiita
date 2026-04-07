@@ -294,6 +294,7 @@ requires-dist = [{ name = "pydantic", specifier = ">=2.12" }]
 [package.metadata.requires-dev]
 dev = [
     { name = "pytest", specifier = ">=9" },
+    { name = "pytest-asyncio", specifier = ">=0.25" },
     { name = "ruff", specifier = ">=0.15" },
 ]
 
