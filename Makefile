@@ -121,7 +121,7 @@ $(GRPCURL_BIN):
 
 # Run database migrations
 migrate: $(DBMATE_BIN)
-	cd qiita-control-plane && $(DBMATE_BIN) up
+	cd qiita-control-plane && $(DBMATE_BIN) --migrations-table public.schema_migrations --no-dump-schema up
 
 # Build and print deploy instructions (no sudo)
 deploy: build

@@ -48,6 +48,10 @@ cd qiita-control-plane && uv sync
 cd qiita-compute-orchestrator && uv sync
 ```
 
+## Development ethos
+
+**Fail fast, fail early, fail loudly.** Validate inputs at every boundary. Return structured errors with enough context to diagnose without a debugger. Prefer raising/panicking over silently returning defaults for unexpected states. Silent failures are bugs.
+
 ## Architecture
 
 See `docs/architecture.md` for the full system diagram. What follows is the non-obvious cross-cutting structure.
