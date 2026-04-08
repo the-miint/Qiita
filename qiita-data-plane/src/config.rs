@@ -8,18 +8,14 @@ pub struct Settings {
     /// Address to bind the gRPC server (e.g. "0.0.0.0:50051")
     pub listen_addr: SocketAddr,
     /// HMAC-SHA256 key for Flight ticket verification (decoded from base64 env var).
-    /// Used by the Flight service in Phase 8; currently validated at startup only.
-    #[allow(dead_code)]
     pub hmac_secret_key: Vec<u8>,
     /// JWKS endpoint URL for JWT public key retrieval and verification.
     /// TODO: make required before any authenticated endpoint is added.
     pub jwks_url: Option<String>,
     /// DuckLake catalog connection string (libpq format).
     /// E.g., "dbname=qiita_ducklake host=localhost port=5432 user=qiita password=qiita"
-    #[allow(dead_code)]
     pub ducklake_catalog_connstr: String,
     /// Directory where DuckLake stores Parquet data files.
-    #[allow(dead_code)]
     pub ducklake_data_path: String,
 }
 

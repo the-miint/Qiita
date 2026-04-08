@@ -1,11 +1,12 @@
+use arrow_flight::flight_service_server::FlightServiceServer;
+use duckdb::Connection;
 use tonic::transport::Server;
 use tonic_health::ServingStatus;
 
-#[allow(dead_code)] // Used by Flight service in Phase 8; currently tested only.
 mod auth;
 mod config;
-#[allow(dead_code)] // Used by Flight service in Phase 8; currently tested only.
 mod ducklake;
+mod flight_service;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -17,6 +18,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Warning: JWKS_URL not set — JWT verification is not active");
     }
 
+    // Ensure DuckLake tables exist (one-time setup connection)
+    let setup_conn = Connection::open_in_memory()?;
+    ducklake::connect_ducklake(
+        &setup_conn,
+        &cfg.ducklake_catalog_connstr,
+        &cfg.ducklake_data_path,
+    )?;
+    ducklake::ensure_reference_tables(&setup_conn)?;
+    drop(setup_conn);
+
+    // Build Flight service — each request opens its own DuckDB connection
+    let flight_svc = flight_service::QiitaFlightService::new(
+        cfg.hmac_secret_key,
+        cfg.ducklake_catalog_connstr,
+        cfg.ducklake_data_path,
+    );
+
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
         .set_service_status("", ServingStatus::Serving)
@@ -26,6 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Server::builder()
         .add_service(health_service)
+        .add_service(FlightServiceServer::new(flight_svc))
         .serve(cfg.listen_addr)
         .await?;
 
@@ -69,7 +88,6 @@ mod tests {
 
     #[test]
     fn miint_extension_smoke() {
-        // "miint" is the DuckDB community extension for minimizer index tables.
         let conn = Connection::open_in_memory().expect("open in-memory DuckDB");
         conn.execute_batch("INSTALL miint FROM community; LOAD miint;")
             .expect("failed to install/load miint extension");

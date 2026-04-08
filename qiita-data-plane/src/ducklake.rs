@@ -116,14 +116,18 @@ mod tests {
     fn setup_conn() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory DuckDB");
         let connstr = test_catalog_connstr();
-        let tmp = std::env::temp_dir().join("qiita-test-ducklake");
-        std::fs::create_dir_all(&tmp).unwrap();
-        connect_ducklake(&conn, &connstr, tmp.to_str().unwrap())
+        let data_path = std::env::var("DUCKLAKE_DATA_PATH")
+            .unwrap_or_else(|_| "/tmp/qiita-integration-ducklake-data".to_string());
+        std::fs::create_dir_all(&data_path).unwrap();
+        connect_ducklake(&conn, &connstr, &data_path)
             .expect("failed to connect DuckLake — is Postgres running on :5433?");
         conn
     }
 
     /// Guard that cleans up test rows on drop, even if the test panics.
+    /// Uses format! for SQL — safe because table/column are &'static str from
+    /// compile-time constants in the test code, and id is an integer.
+    /// This pattern is test-only and must not be copied to production code.
     struct Cleanup<'a> {
         conn: &'a Connection,
         table: &'static str,
@@ -142,6 +146,7 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg(feature = "integration")]
     fn connect_and_verify_table_schemas() {
         let conn = setup_conn();
         ensure_reference_tables(&conn).expect("failed to create tables");
@@ -175,6 +180,7 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg(feature = "integration")]
     fn insert_and_read_reference_sequence() {
         let conn = setup_conn();
         ensure_reference_tables(&conn).unwrap();
@@ -208,6 +214,7 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg(feature = "integration")]
     fn insert_and_read_taxonomy() {
         let conn = setup_conn();
         ensure_reference_tables(&conn).unwrap();
@@ -241,6 +248,7 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg(feature = "integration")]
     fn insert_and_read_phylogeny() {
         let conn = setup_conn();
         ensure_reference_tables(&conn).unwrap();

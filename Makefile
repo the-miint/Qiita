@@ -86,9 +86,13 @@ test-workflows:
 	rm -f /tmp/qiita-workflow-smoke.sif
 
 # Run integration tests (requires Docker for Postgres)
+# Runs Python integration tests + Rust DuckLake tests (which need Postgres).
 test-integration:
 	cd tests/integration && docker compose up -d --wait && \
-	  (uv run pytest; EC=$$?; docker compose down; exit $$EC)
+	  (uv run pytest; PY_EC=$$?; \
+	   cd ../../qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test --features integration; RS_EC=$$?; \
+	   cd ../tests/integration && docker compose down; \
+	   exit $$(( PY_EC > RS_EC ? PY_EC : RS_EC )))
 
 # Lint all components
 lint: lint-python lint-rust
