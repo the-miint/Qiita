@@ -1,6 +1,8 @@
 use tonic::transport::Server;
 use tonic_health::ServingStatus;
 
+#[allow(dead_code)] // Used by Flight service in Phase 8; currently tested only.
+mod auth;
 mod config;
 
 #[tokio::main]
@@ -9,9 +11,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Configuration error: {e}");
         e
     })?;
-    if cfg.hmac_secret_key.is_none() {
-        eprintln!("Warning: HMAC_SECRET_KEY not set — Flight ticket signing is not active");
-    }
     if cfg.jwks_url.is_none() {
         eprintln!("Warning: JWKS_URL not set — JWT verification is not active");
     }
@@ -34,15 +33,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::config::Settings;
+    use base64::Engine;
     use duckdb::Connection;
 
     #[test]
-    fn config_defaults() {
-        // Ensure Settings::from_env() produces expected defaults when no env vars are set.
-        // Unset LISTEN_ADDR to guarantee default behaviour.
+    fn config_with_valid_hmac() {
         std::env::remove_var("LISTEN_ADDR");
-        let cfg = Settings::from_env().expect("Settings::from_env() failed with valid defaults");
+        // Provide a valid base64-encoded 32-byte secret
+        let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
+        std::env::set_var("HMAC_SECRET_KEY", &secret);
+        let cfg = Settings::from_env().expect("Settings::from_env() failed with valid config");
         assert_eq!(cfg.listen_addr.to_string(), "0.0.0.0:50051");
+        assert_eq!(cfg.hmac_secret_key.len(), 32);
+        std::env::remove_var("HMAC_SECRET_KEY");
+    }
+
+    #[test]
+    fn config_rejects_missing_hmac() {
+        std::env::remove_var("HMAC_SECRET_KEY");
+        let err = Settings::from_env().unwrap_err();
+        assert!(
+            err.contains("HMAC_SECRET_KEY"),
+            "error should mention HMAC_SECRET_KEY: {err}"
+        );
     }
 
     #[test]
@@ -51,7 +64,6 @@ mod tests {
         let conn = Connection::open_in_memory().expect("open in-memory DuckDB");
         conn.execute_batch("INSTALL miint FROM community; LOAD miint;")
             .expect("failed to install/load miint extension");
-        // Verify the extension is functional: miint_versions() must return at least one row.
         let mut stmt = conn
             .prepare("SELECT count(*) FROM miint_versions()")
             .expect("failed to prepare miint_versions() query");
