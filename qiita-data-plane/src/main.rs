@@ -4,6 +4,8 @@ use tonic_health::ServingStatus;
 #[allow(dead_code)] // Used by Flight service in Phase 8; currently tested only.
 mod auth;
 mod config;
+#[allow(dead_code)] // Used by Flight service in Phase 8; currently tested only.
+mod ducklake;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -35,27 +37,34 @@ mod tests {
     use super::config::Settings;
     use base64::Engine;
     use duckdb::Connection;
+    use serial_test::serial;
 
     #[test]
-    fn config_with_valid_hmac() {
+    #[serial]
+    fn config_with_valid_env() {
         std::env::remove_var("LISTEN_ADDR");
-        // Provide a valid base64-encoded 32-byte secret
         let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
         std::env::set_var("HMAC_SECRET_KEY", &secret);
+        std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test host=localhost");
         let cfg = Settings::from_env().expect("Settings::from_env() failed with valid config");
         assert_eq!(cfg.listen_addr.to_string(), "0.0.0.0:50051");
         assert_eq!(cfg.hmac_secret_key.len(), 32);
+        assert_eq!(cfg.ducklake_catalog_connstr, "dbname=test host=localhost");
         std::env::remove_var("HMAC_SECRET_KEY");
+        std::env::remove_var("DUCKLAKE_CATALOG_CONNSTR");
     }
 
     #[test]
+    #[serial]
     fn config_rejects_missing_hmac() {
         std::env::remove_var("HMAC_SECRET_KEY");
+        std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
         let err = Settings::from_env().unwrap_err();
         assert!(
             err.contains("HMAC_SECRET_KEY"),
             "error should mention HMAC_SECRET_KEY: {err}"
         );
+        std::env::remove_var("DUCKLAKE_CATALOG_CONNSTR");
     }
 
     #[test]

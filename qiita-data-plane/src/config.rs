@@ -14,6 +14,13 @@ pub struct Settings {
     /// JWKS endpoint URL for JWT public key retrieval and verification.
     /// TODO: make required before any authenticated endpoint is added.
     pub jwks_url: Option<String>,
+    /// DuckLake catalog connection string (libpq format).
+    /// E.g., "dbname=qiita_ducklake host=localhost port=5432 user=qiita password=qiita"
+    #[allow(dead_code)]
+    pub ducklake_catalog_connstr: String,
+    /// Directory where DuckLake stores Parquet data files.
+    #[allow(dead_code)]
+    pub ducklake_data_path: String,
 }
 
 impl Settings {
@@ -35,10 +42,19 @@ impl Settings {
             ));
         }
 
+        let ducklake_catalog_connstr = std::env::var("DUCKLAKE_CATALOG_CONNSTR")
+            .map_err(|_| "DUCKLAKE_CATALOG_CONNSTR is required but not set".to_string())?;
+        let ducklake_data_path = std::env::var("DUCKLAKE_DATA_PATH").unwrap_or_else(|_| {
+            let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+            format!("{base}/qiita/ducklake")
+        });
+
         Ok(Self {
             listen_addr,
             hmac_secret_key,
             jwks_url: std::env::var("JWKS_URL").ok(),
+            ducklake_catalog_connstr,
+            ducklake_data_path,
         })
     }
 }
