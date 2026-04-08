@@ -24,6 +24,7 @@ class ComputeBackend(ABC):
     async def run_load_job(
         self,
         manifest_path: Path,
+        fasta_path: Path,
         feature_map: FeatureMap,
         output_dir: Path,
         reference_idx: int,

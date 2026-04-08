@@ -7,23 +7,6 @@ import uuid
 import pytest
 
 
-@pytest.fixture
-def fasta_file(tmp_path):
-    """Create a 5-sequence FASTA file."""
-    seqs = {
-        "seq1": "ATCGATCGATCG",
-        "seq2": "GCTAGCTAGCTA",
-        "seq3": "AAATTTTCCCGGG",
-        "seq4": "TTTTAAAACCCC",
-        "seq5": "GGGGCCCCAAAA",
-    }
-    path = tmp_path / "test.fasta"
-    with open(path, "w") as f:
-        for name, seq in seqs.items():
-            f.write(f">{name}\n{seq}\n")
-    return path, seqs
-
-
 async def test_hash_job_produces_manifest(fasta_file, tmp_path):
     """Hash job must produce a manifest with one entry per sequence."""
     from qiita_compute_orchestrator.backends.local import LocalBackend

@@ -78,6 +78,7 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
             family VARCHAR,
             genus VARCHAR,
             species VARCHAR,
+            strain VARCHAR,
             ncbi_taxon_id BIGINT
         );
 
