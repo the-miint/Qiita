@@ -168,3 +168,39 @@ def test_feature_mint_request_rejects_duplicate_hashes():
         FeatureMintRequest(
             entries=[FeatureHashEntry(sequence_hash=h), FeatureHashEntry(sequence_hash=h)]
         )
+
+
+def test_phylogeny_tip_entry_valid():
+    """PhylogenyTipEntry must accept valid input."""
+    from qiita_common.models import PhylogenyTipEntry
+
+    entry = PhylogenyTipEntry(reference_idx=1, node_index=0, feature_idx=100)
+    assert entry.reference_idx == 1
+    assert entry.node_index == 0
+    assert entry.feature_idx == 100
+
+
+def test_phylogeny_tip_request_rejects_duplicates():
+    """PhylogenyTipRequest must reject duplicate (reference_idx, node_index) pairs."""
+    from qiita_common.models import PhylogenyTipEntry, PhylogenyTipRequest
+
+    with pytest.raises(ValidationError, match="Duplicate"):
+        PhylogenyTipRequest(
+            entries=[
+                PhylogenyTipEntry(reference_idx=1, node_index=0, feature_idx=100),
+                PhylogenyTipEntry(reference_idx=1, node_index=0, feature_idx=200),
+            ]
+        )
+
+
+def test_phylogeny_tip_request_allows_different_nodes():
+    """PhylogenyTipRequest must accept entries with distinct node_index values."""
+    from qiita_common.models import PhylogenyTipEntry, PhylogenyTipRequest
+
+    req = PhylogenyTipRequest(
+        entries=[
+            PhylogenyTipEntry(reference_idx=1, node_index=0, feature_idx=100),
+            PhylogenyTipEntry(reference_idx=1, node_index=1, feature_idx=200),
+        ]
+    )
+    assert len(req.entries) == 2
