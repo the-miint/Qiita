@@ -3,6 +3,7 @@
 import httpx
 
 from .models import (
+    DoGetTicketResponse,
     FeatureHashEntry,
     FeatureMintResponse,
     PhylogenyTipEntry,
@@ -76,3 +77,11 @@ class ControlPlaneClient:
         )
         resp.raise_for_status()
         return PhylogenyTipResponse.model_validate(resp.json())
+
+    async def get_doget_ticket(self, reference_idx: int, table: str) -> DoGetTicketResponse:
+        resp = await self._http.post(
+            f"/api/v1/references/{reference_idx}/tickets/doget",
+            json={"table": table},
+        )
+        resp.raise_for_status()
+        return DoGetTicketResponse.model_validate(resp.json())

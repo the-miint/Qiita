@@ -12,6 +12,7 @@ from .registration import register_staged_parquet
 # Maps Parquet filenames produced by run_load_job to DuckLake table names.
 _REFERENCE_TABLE_MAP = {
     "reference_sequences.parquet": "reference_sequences",
+    "reference_membership.parquet": "reference_membership",
     "reference_taxonomy.parquet": "reference_taxonomy",
     "reference_phylogeny.parquet": "reference_phylogeny",
 }

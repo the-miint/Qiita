@@ -489,6 +489,7 @@ async def test_load_job_no_taxonomy_no_tree(manifest_file, fasta_path, feature_m
         reference_idx=REFERENCE_IDX,
     )
     assert (output_dir / "reference_sequences.parquet").exists()
+    assert (output_dir / "reference_membership.parquet").exists()
     assert not (output_dir / "reference_taxonomy.parquet").exists()
     assert not (output_dir / "reference_phylogeny.parquet").exists()
     assert not (output_dir / "tip_features.json").exists()

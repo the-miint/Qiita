@@ -218,6 +218,12 @@ fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, Stri
         return Ok((format!("SELECT * FROM {full_table}"), full_table));
     }
 
+    // reference_sequences has no reference_idx column. When the filter
+    // includes reference_idx, resolve it via a JOIN with the membership
+    // table instead of a direct WHERE clause.
+    let needs_membership_join =
+        table == "reference_sequences" && filter.contains_key("reference_idx");
+
     let mut where_clauses = Vec::new();
     for (col, values) in filter {
         // Whitelist column names — all SQL is constructed from known-safe identifiers.
@@ -249,13 +255,25 @@ fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, Stri
             .map(|v| v.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        where_clauses.push(format!("{col} IN ({csv})"));
+
+        if needs_membership_join && col == "reference_idx" {
+            // Applied as a WHERE on the joined membership table alias.
+            where_clauses.push(format!("m.reference_idx IN ({csv})"));
+        } else {
+            where_clauses.push(format!("{col} IN ({csv})"));
+        }
     }
 
-    let sql = format!(
-        "SELECT * FROM {full_table} WHERE {}",
-        where_clauses.join(" AND ")
-    );
+    let where_str = where_clauses.join(" AND ");
+    let sql = if needs_membership_join {
+        format!(
+            "SELECT t.* FROM {full_table} t \
+             JOIN qiita_lake.reference_membership m ON t.feature_idx = m.feature_idx \
+             WHERE {where_str}"
+        )
+    } else {
+        format!("SELECT * FROM {full_table} WHERE {where_str}")
+    };
     Ok((sql, full_table))
 }
 
@@ -312,5 +330,39 @@ mod tests {
         filter.insert("feature_idx".to_string(), vec![]);
         let result = build_query("reference_sequences", &filter);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_query_sequences_reference_idx_uses_join() {
+        let mut filter = auth::TicketFilter::new();
+        filter.insert(
+            "reference_idx".to_string(),
+            vec![serde_json::Value::from(42)],
+        );
+        let (sql, _) = build_query("reference_sequences", &filter).unwrap();
+        assert!(
+            sql.contains("JOIN qiita_lake.reference_membership m ON t.feature_idx = m.feature_idx"),
+            "expected JOIN for reference_sequences + reference_idx, got: {sql}"
+        );
+        assert!(sql.contains("m.reference_idx IN (42)"));
+        assert!(sql.starts_with("SELECT t.* FROM"));
+    }
+
+    #[test]
+    fn build_query_taxonomy_reference_idx_direct() {
+        let mut filter = auth::TicketFilter::new();
+        filter.insert(
+            "reference_idx".to_string(),
+            vec![serde_json::Value::from(42)],
+        );
+        let (sql, _) = build_query("reference_taxonomy", &filter).unwrap();
+        assert!(
+            sql.contains("reference_idx IN (42)"),
+            "expected direct filter, got: {sql}"
+        );
+        assert!(
+            !sql.contains("JOIN"),
+            "taxonomy should not use JOIN, got: {sql}"
+        );
     }
 }

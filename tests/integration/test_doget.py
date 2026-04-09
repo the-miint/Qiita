@@ -82,13 +82,17 @@ def data_plane_process():
         "reference_idx BIGINT NOT NULL, feature_idx BIGINT NOT NULL, "
         "domain VARCHAR, phylum VARCHAR, class VARCHAR, "
         '\"order\" VARCHAR, family VARCHAR, genus VARCHAR, '
-        "species VARCHAR, ncbi_taxon_id BIGINT);"
+        "species VARCHAR, strain VARCHAR, ncbi_taxon_id BIGINT);"
     )
     conn.execute(
         "CREATE TABLE IF NOT EXISTS qiita_lake.reference_phylogeny ("
         "reference_idx BIGINT NOT NULL, node_index BIGINT NOT NULL, "
         "name VARCHAR, branch_length DOUBLE, edge_id BIGINT, "
         "parent_index BIGINT, is_tip BOOLEAN NOT NULL);"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS qiita_lake.reference_membership ("
+        "reference_idx BIGINT NOT NULL, feature_idx BIGINT NOT NULL);"
     )
     # Insert test data before starting the data plane — avoids cross-connection
     # DuckLake snapshot conflicts during tests.

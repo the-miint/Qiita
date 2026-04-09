@@ -1,5 +1,6 @@
 """Reference management routes."""
 
+import base64
 from typing import Annotated
 from uuid import UUID
 
@@ -8,6 +9,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import Field
 from qiita_common.models import (
     VALID_STATUS_TRANSITIONS,
+    DoGetTicketRequest,
+    DoGetTicketResponse,
     FeatureHashEntry,
     FeatureMintRequest,
     FeatureMintResponse,
@@ -18,7 +21,8 @@ from qiita_common.models import (
     ReferenceStatusUpdate,
 )
 
-from ..deps import get_current_user, get_db_pool
+from ..auth.tickets import sign_ticket
+from ..deps import get_current_user, get_db_pool, get_hmac_secret
 
 router = APIRouter(prefix="/references", tags=["references"])
 
@@ -181,6 +185,7 @@ async def _mint_chunk(
     # Insert novel
     novel = [h for h in hashes if h not in existing_map]
     new_map: dict[UUID, int] = {}
+    concurrent_reused = 0
     if novel:
         new_rows = await conn.fetch(
             "INSERT INTO qiita.features (sequence_hash)"
@@ -191,7 +196,8 @@ async def _mint_chunk(
         )
         new_map = {row["sequence_hash"]: row["feature_idx"] for row in new_rows}
 
-        # Handle concurrent inserts: ON CONFLICT DO NOTHING means some may not RETURN
+        # Handle concurrent inserts: ON CONFLICT DO NOTHING means some may not RETURN.
+        # These rows were created by another transaction — count them as reused.
         still_missing = [h for h in novel if h not in new_map]
         if still_missing:
             extra = await conn.fetch(
@@ -199,7 +205,9 @@ async def _mint_chunk(
                 " WHERE sequence_hash = ANY($1::uuid[])",
                 still_missing,
             )
-            new_map.update({row["sequence_hash"]: row["feature_idx"] for row in extra})
+            for row in extra:
+                existing_map[row["sequence_hash"]] = row["feature_idx"]
+            concurrent_reused = len(extra)
 
     mapping = {**existing_map, **new_map}
 
@@ -208,7 +216,7 @@ async def _mint_chunk(
     if unmapped:
         raise RuntimeError(f"Failed to resolve feature_idx for {len(unmapped)} hashes")
 
-    return mapping, len(new_map), len(existing_map)
+    return mapping, len(new_map), len(existing_map) + concurrent_reused
 
 
 async def _write_membership(
@@ -305,3 +313,60 @@ async def write_phylogeny_tips(
     # asyncpg returns "INSERT 0 N" where N is the count
     inserted = int(result.split()[-1])
     return PhylogenyTipResponse(inserted=inserted)
+
+
+# Tables that can appear in a DoGet ticket. Must match the data plane's
+# ALLOWED_TABLES whitelist in flight_service.rs.
+_DOGET_ALLOWED_TABLES = frozenset(
+    {
+        "reference_sequences",
+        "reference_taxonomy",
+        "reference_phylogeny",
+    }
+)
+
+
+@router.post("/{reference_idx}/tickets/doget", status_code=201)
+async def create_doget_ticket(
+    reference_idx: Annotated[int, Field(gt=0)],
+    body: DoGetTicketRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    hmac_secret: bytes = Depends(get_hmac_secret),
+    user_id: UUID = Depends(get_current_user),
+) -> DoGetTicketResponse:
+    """Sign a DoGet ticket scoped to a reference.
+
+    Reference must be active. The ticket contains only reference_idx — the
+    data plane resolves feature membership at query time via the DuckLake
+    reference_membership table (JOIN for reference_sequences, direct
+    WHERE for taxonomy/phylogeny).
+
+    TODO: add authorization check — verify user has read access to this
+    reference. Currently any authenticated user can get a ticket for any
+    active reference.
+    """
+    if body.table not in _DOGET_ALLOWED_TABLES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown table {body.table!r}; allowed: {sorted(_DOGET_ALLOWED_TABLES)}",
+        )
+
+    # Reference must be active
+    status = await pool.fetchval(
+        "SELECT status FROM qiita.references WHERE reference_idx = $1",
+        reference_idx,
+    )
+    if status is None:
+        raise HTTPException(status_code=404, detail="Reference not found")
+    if status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Reference status is {status!r}, must be 'active'",
+        )
+
+    ticket_bytes = sign_ticket(
+        table=body.table,
+        filter={"reference_idx": [reference_idx]},
+        secret=hmac_secret,
+    )
+    return DoGetTicketResponse(ticket=base64.b64encode(ticket_bytes).decode())

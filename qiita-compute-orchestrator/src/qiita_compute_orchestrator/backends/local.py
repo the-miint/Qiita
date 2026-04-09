@@ -150,6 +150,7 @@ class LocalBackend(ComputeBackend):
             conn.execute("LOAD miint;")
 
             _write_sequences_parquet(conn, fasta_path, read_id_map, output_dir)
+            _write_membership_parquet(conn, read_id_map, output_dir, reference_idx)
 
             if taxonomy_path is not None:
                 _write_taxonomy_parquet(conn, taxonomy_path, read_id_map, output_dir, reference_idx)
@@ -266,6 +267,29 @@ def _write_sequences_parquet(
         )
 
     conn.execute("DROP TABLE seq_id_map")
+
+
+def _write_membership_parquet(
+    conn: duckdb.DuckDBPyConnection,
+    read_id_map: dict[str, tuple[int, str]],
+    output_dir: Path,
+    reference_idx: int,
+) -> None:
+    """Write reference_membership.parquet — (reference_idx, feature_idx) pairs.
+
+    This mirrors the Postgres reference_membership table in DuckLake so the
+    data plane can resolve reference → feature_idx at query time without
+    embedding the full feature_idx list in every signed ticket.
+    """
+    out_str = _validate_parquet_path(output_dir / "reference_membership.parquet")
+
+    conn.execute("CREATE TEMP TABLE membership_data (reference_idx BIGINT, feature_idx BIGINT)")
+    conn.executemany(
+        "INSERT INTO membership_data VALUES (?, ?)",
+        [(reference_idx, fidx) for fidx, _ in read_id_map.values()],
+    )
+    conn.execute(f"COPY membership_data TO '{out_str}' ({_PARQUET_OPTS})")
+    conn.execute("DROP TABLE membership_data")
 
 
 def _write_taxonomy_parquet(

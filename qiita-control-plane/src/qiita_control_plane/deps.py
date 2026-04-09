@@ -20,3 +20,11 @@ def get_current_user(request: Request) -> UUID:
     Currently returns a mock user ID. Will be replaced with JWT extraction.
     """
     return UUID("a0000000-0000-0000-0000-000000000001")
+
+
+def get_hmac_secret(request: Request) -> bytes:
+    """Return the HMAC secret key from app settings."""
+    settings = getattr(request.app.state, "settings", None)
+    if settings is None:
+        raise RuntimeError("Settings not initialised — lifespan may not have run")
+    return settings.hmac_secret_key

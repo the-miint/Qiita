@@ -1,5 +1,6 @@
 """DuckLake file registration — moves staged Parquet to permanent storage and registers."""
 
+import shutil
 from pathlib import Path
 
 import duckdb
@@ -19,6 +20,15 @@ def register_staged_parquet(
     and registers it via ``ducklake_add_data_files`` (metadata-only — no data
     IO). File ownership transfers to DuckLake after registration.
 
+    The move-then-register pattern is split into two phases so that a
+    registration failure doesn't leave files in a half-moved state:
+
+    1. Move all files from staging to permanent storage
+    2. Register all moved files in DuckLake
+
+    Uses ``shutil.move`` (not ``rename``) to handle cross-filesystem moves
+    (e.g., SLURM local scratch → shared NFS).
+
     Parameters
     ----------
     staging_dir
@@ -36,32 +46,31 @@ def register_staged_parquet(
     list[Path]
         Paths of the registered files in their permanent locations.
     """
-    registered: list[Path] = []
     perm_root = Path(ducklake_data_path)
 
+    # Phase 1: move all files to permanent storage.
+    moved: list[tuple[str, Path]] = []
+    for filename, table in table_file_map.items():
+        src = staging_dir / filename
+        if not src.exists():
+            continue
+        dest_dir = perm_root / table
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / src.name
+        shutil.move(src, dest)
+        moved.append((table, dest))
+
+    # Phase 2: register all moved files in DuckLake.
     with duckdb.connect(":memory:") as conn:
         conn.execute("LOAD ducklake; LOAD postgres;")
         conn.execute(
             f"ATTACH 'ducklake:postgres:{ducklake_connstr}' AS qiita_lake"
             f" (DATA_PATH '{ducklake_data_path}');"
         )
-
-        for filename, table in table_file_map.items():
-            src = staging_dir / filename
-            if not src.exists():
-                continue
-
-            # Move to permanent location grouped by table name.
-            # rename() is atomic on the same filesystem.
-            dest_dir = perm_root / table
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            dest = dest_dir / src.name
-            src.rename(dest)
-
+        for table, dest in moved:
             conn.execute(
                 "CALL ducklake_add_data_files('qiita_lake', ?, ?)",
                 [table, str(dest)],
             )
-            registered.append(dest)
 
-    return registered
+    return [dest for _, dest in moved]

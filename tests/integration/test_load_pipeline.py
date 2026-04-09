@@ -141,6 +141,7 @@ async def test_full_load_pipeline(
 
     # Verify Parquet files exist
     assert (load_dir / "reference_sequences.parquet").exists()
+    assert (load_dir / "reference_membership.parquet").exists()
     assert (load_dir / "reference_taxonomy.parquet").exists()
     assert (load_dir / "reference_phylogeny.parquet").exists()
     assert (load_dir / "tip_features.json").exists()

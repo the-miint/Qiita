@@ -90,6 +90,11 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
             edge_id BIGINT,
             parent_index BIGINT,
             is_tip BOOLEAN NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS qiita_lake.reference_membership (
+            reference_idx BIGINT NOT NULL,
+            feature_idx BIGINT NOT NULL
         );",
     )?;
     Ok(())

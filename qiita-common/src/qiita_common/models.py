@@ -111,3 +111,11 @@ class PhylogenyTipRequest(BaseModel):
 
 class PhylogenyTipResponse(BaseModel):
     inserted: int
+
+
+class DoGetTicketRequest(BaseModel):
+    table: str = Field(min_length=1, max_length=64)
+
+
+class DoGetTicketResponse(BaseModel):
+    ticket: str  # base64-encoded signed ticket bytes
