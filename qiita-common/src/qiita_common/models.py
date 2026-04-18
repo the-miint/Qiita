@@ -87,32 +87,6 @@ class ReferenceStatusUpdate(BaseModel):
     status: ReferenceStatus
 
 
-class PhylogenyTipEntry(BaseModel):
-    reference_idx: Annotated[int, Field(gt=0)]
-    node_index: Annotated[int, Field(ge=0)]
-    feature_idx: Annotated[int, Field(gt=0)]
-
-
-class PhylogenyTipRequest(BaseModel):
-    entries: list[PhylogenyTipEntry] = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def no_duplicate_node_indices(self):
-        seen = set()
-        for e in self.entries:
-            key = (e.reference_idx, e.node_index)
-            if key in seen:
-                raise ValueError(
-                    f"Duplicate (reference_idx, node_index): ({e.reference_idx}, {e.node_index})"
-                )
-            seen.add(key)
-        return self
-
-
-class PhylogenyTipResponse(BaseModel):
-    inserted: int
-
-
 class DoGetTicketRequest(BaseModel):
     table: str = Field(min_length=1, max_length=64)
 

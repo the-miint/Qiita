@@ -6,8 +6,6 @@ from .models import (
     DoGetTicketResponse,
     FeatureHashEntry,
     FeatureMintResponse,
-    PhylogenyTipEntry,
-    PhylogenyTipResponse,
     ReferenceResponse,
     ReferenceStatus,
 )
@@ -67,16 +65,6 @@ class ControlPlaneClient:
         )
         resp.raise_for_status()
         return FeatureMintResponse.model_validate(resp.json())
-
-    async def write_phylogeny_tips(
-        self, reference_idx: int, entries: list[PhylogenyTipEntry]
-    ) -> PhylogenyTipResponse:
-        resp = await self._http.post(
-            f"/api/v1/references/{reference_idx}/phylogeny-tips",
-            json={"entries": [e.model_dump(mode="json") for e in entries]},
-        )
-        resp.raise_for_status()
-        return PhylogenyTipResponse.model_validate(resp.json())
 
     async def get_doget_ticket(self, reference_idx: int, table: str) -> DoGetTicketResponse:
         resp = await self._http.post(

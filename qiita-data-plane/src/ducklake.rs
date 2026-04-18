@@ -58,19 +58,27 @@ pub fn connect_ducklake(
 /// separate configuration pass — see DuckLake configuration docs.
 pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS qiita_lake.reference_sequences (
+        "-- Sequence metadata: one row per feature (hash, length).
+        -- Actual sequence data lives in reference_sequence_chunks.
+        CREATE TABLE IF NOT EXISTS qiita_lake.reference_sequences (
             feature_idx BIGINT NOT NULL,
-            sequence VARCHAR NOT NULL,
             sequence_hash UUID NOT NULL,
             sequence_length_bp BIGINT NOT NULL
+        );
+
+        -- Chunked sequence data: sequences split into fixed-size chunks
+        -- (default 64 KB) for efficient Parquet storage. Short sequences
+        -- (e.g., 16S at 1.5 kb) are a single chunk. Reassemble with:
+        --   string_agg(chunk_data, '' ORDER BY chunk_index)
+        CREATE TABLE IF NOT EXISTS qiita_lake.reference_sequence_chunks (
+            feature_idx BIGINT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            chunk_data VARCHAR NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS qiita_lake.reference_taxonomy (
             reference_idx BIGINT NOT NULL,
             feature_idx BIGINT NOT NULL,
-            -- All rank columns are nullable: partial lineages are common in
-            -- reference databases (e.g., unclassified at lower ranks, or even
-            -- domain-level when the organism is truly uncharacterized).
             domain VARCHAR,
             phylum VARCHAR,
             class VARCHAR,
@@ -82,6 +90,8 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
             ncbi_taxon_id BIGINT
         );
 
+        -- Phylogeny nodes. feature_idx is populated for tip nodes (links
+        -- directly to sequences), NULL for internal nodes.
         CREATE TABLE IF NOT EXISTS qiita_lake.reference_phylogeny (
             reference_idx BIGINT NOT NULL,
             node_index BIGINT NOT NULL,
@@ -89,12 +99,25 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
             branch_length DOUBLE,
             edge_id BIGINT,
             parent_index BIGINT,
-            is_tip BOOLEAN NOT NULL
+            is_tip BOOLEAN NOT NULL,
+            feature_idx BIGINT
         );
 
         CREATE TABLE IF NOT EXISTS qiita_lake.reference_membership (
             reference_idx BIGINT NOT NULL,
             feature_idx BIGINT NOT NULL
+        );
+
+        -- Phylogenetic placements: maps placed sequences (by feature_idx)
+        -- to edges in the backbone tree.
+        CREATE TABLE IF NOT EXISTS qiita_lake.reference_placements (
+            reference_idx BIGINT NOT NULL,
+            feature_idx BIGINT NOT NULL,
+            edge_num INTEGER NOT NULL,
+            likelihood DOUBLE,
+            like_weight_ratio DOUBLE,
+            distal_length DOUBLE,
+            pendant_length DOUBLE
         );",
     )?;
     Ok(())
@@ -200,21 +223,20 @@ mod tests {
 
         conn.execute_batch(&format!(
             "INSERT INTO qiita_lake.reference_sequences VALUES \
-             ({id}, 'ATCG', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID, 4);"
+             ({id}, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID, 4);"
         ))
         .unwrap();
 
         let mut stmt = conn
             .prepare(&format!(
-                "SELECT feature_idx, sequence, sequence_length_bp \
+                "SELECT feature_idx, sequence_length_bp \
                  FROM qiita_lake.reference_sequences WHERE feature_idx = {id}"
             ))
             .unwrap();
-        let (idx, seq, len): (i64, String, i64) = stmt
-            .query_row([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        let (idx, len): (i64, i64) = stmt
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap();
         assert_eq!(idx, id);
-        assert_eq!(seq, "ATCG");
         assert_eq!(len, 4);
     }
 
@@ -267,8 +289,8 @@ mod tests {
         };
 
         conn.execute_batch(&format!(
-            "INSERT INTO qiita_lake.reference_phylogeny VALUES ({id}, 0, 'root', 0.0, NULL, NULL, false);
-             INSERT INTO qiita_lake.reference_phylogeny VALUES ({id}, 1, 'tip1', 0.5, 0, 0, true);"
+            "INSERT INTO qiita_lake.reference_phylogeny VALUES ({id}, 0, 'root', 0.0, NULL, NULL, false, NULL);
+             INSERT INTO qiita_lake.reference_phylogeny VALUES ({id}, 1, 'tip1', 0.5, 0, 0, true, {id});"
         ))
         .unwrap();
 

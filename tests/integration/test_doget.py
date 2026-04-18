@@ -74,8 +74,13 @@ def data_plane_process():
     conn = _ducklake_conn()
     conn.execute(
         "CREATE TABLE IF NOT EXISTS qiita_lake.reference_sequences ("
-        "feature_idx BIGINT NOT NULL, sequence VARCHAR NOT NULL, "
+        "feature_idx BIGINT NOT NULL, "
         "sequence_hash UUID NOT NULL, sequence_length_bp BIGINT NOT NULL);"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS qiita_lake.reference_sequence_chunks ("
+        "feature_idx BIGINT NOT NULL, chunk_index INTEGER NOT NULL, "
+        "chunk_data VARCHAR NOT NULL);"
     )
     conn.execute(
         "CREATE TABLE IF NOT EXISTS qiita_lake.reference_taxonomy ("
@@ -88,18 +93,34 @@ def data_plane_process():
         "CREATE TABLE IF NOT EXISTS qiita_lake.reference_phylogeny ("
         "reference_idx BIGINT NOT NULL, node_index BIGINT NOT NULL, "
         "name VARCHAR, branch_length DOUBLE, edge_id BIGINT, "
-        "parent_index BIGINT, is_tip BOOLEAN NOT NULL);"
+        "parent_index BIGINT, is_tip BOOLEAN NOT NULL, feature_idx BIGINT);"
     )
     conn.execute(
         "CREATE TABLE IF NOT EXISTS qiita_lake.reference_membership ("
         "reference_idx BIGINT NOT NULL, feature_idx BIGINT NOT NULL);"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS qiita_lake.reference_placements ("
+        "reference_idx BIGINT NOT NULL, feature_idx BIGINT NOT NULL, "
+        "edge_num INTEGER NOT NULL, likelihood DOUBLE, "
+        "like_weight_ratio DOUBLE, distal_length DOUBLE, "
+        "pendant_length DOUBLE);"
+    )
     # Insert test data before starting the data plane — avoids cross-connection
     # DuckLake snapshot conflicts during tests.
     conn.execute(
         "INSERT INTO qiita_lake.reference_sequences VALUES "
-        "(700001, 'ATCGATCG', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID, 8), "
-        "(700002, 'GCTAGCTA', 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22'::UUID, 8);"
+        "(700001, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID, 8), "
+        "(700002, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22'::UUID, 8);"
+    )
+    conn.execute(
+        "INSERT INTO qiita_lake.reference_sequence_chunks VALUES "
+        "(700001, 0, 'ATCGATCG'), "
+        "(700002, 0, 'GCTAGCTA');"
+    )
+    conn.execute(
+        "INSERT INTO qiita_lake.reference_membership VALUES "
+        "(1, 700001), (1, 700002);"
     )
     conn.close()
 
@@ -217,7 +238,8 @@ def test_doget_reference_sequences(data_plane_process, flight_client):
 
     assert table.num_rows == 2
     assert "feature_idx" in table.column_names
-    assert "sequence" in table.column_names
+    assert "sequence_hash" in table.column_names
+    assert "sequence_length_bp" in table.column_names
     feature_idxs = sorted(table.column("feature_idx").to_pylist())
     assert feature_idxs == [700001, 700002]
 

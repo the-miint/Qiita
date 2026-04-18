@@ -1,10 +1,9 @@
 """Reference load pipeline — coordinates load job, DuckLake registration, and status updates."""
 
-import json
 from pathlib import Path
 
 from qiita_common.client import ControlPlaneClient
-from qiita_common.models import PhylogenyTipEntry, ReferenceStatus
+from qiita_common.models import ReferenceStatus
 
 from .backend import ComputeBackend, FeatureMap
 from .registration import register_staged_parquet
@@ -12,9 +11,11 @@ from .registration import register_staged_parquet
 # Maps Parquet filenames produced by run_load_job to DuckLake table names.
 _REFERENCE_TABLE_MAP = {
     "reference_sequences.parquet": "reference_sequences",
+    "reference_sequence_chunks.parquet": "reference_sequence_chunks",
     "reference_membership.parquet": "reference_membership",
     "reference_taxonomy.parquet": "reference_taxonomy",
     "reference_phylogeny.parquet": "reference_phylogeny",
+    "reference_placements.parquet": "reference_placements",
 }
 
 
@@ -37,15 +38,14 @@ async def run_reference_load_pipeline(
 
     Steps:
     1. Transition status to LOADING
-    2. Run load job (write Parquet files to staging_dir)
+    2. Run load job (write sorted Parquet files to staging_dir)
     3. Move Parquet to permanent storage and register in DuckLake
-    4. Post phylogeny tip-feature mappings (if tree was loaded)
-    5. Transition status to ACTIVE
+    4. Transition status to ACTIVE
     """
     # 1. Transition to LOADING
     await client.update_reference_status(reference_idx, ReferenceStatus.LOADING)
 
-    # 2. Run load job — produces Parquet files + tip_features.json in staging_dir
+    # 2. Run load job
     await backend.run_load_job(
         manifest_path=manifest_path,
         fasta_path=fasta_path,
@@ -57,7 +57,7 @@ async def run_reference_load_pipeline(
         jplace_path=jplace_path,
     )
 
-    # 3. Move to permanent storage and register in DuckLake (metadata-only)
+    # 3. Move to permanent storage and register in DuckLake
     register_staged_parquet(
         staging_dir=staging_dir,
         ducklake_connstr=ducklake_connstr,
@@ -65,14 +65,5 @@ async def run_reference_load_pipeline(
         table_file_map=_REFERENCE_TABLE_MAP,
     )
 
-    # 4. Post tip-feature mappings (tip_features.json stays in staging — it's
-    #    consumed here and not registered in DuckLake)
-    tip_path = staging_dir / "tip_features.json"
-    if tip_path.exists():
-        tips = json.loads(tip_path.read_text())
-        if tips:
-            entries = [PhylogenyTipEntry(**t) for t in tips]
-            await client.write_phylogeny_tips(reference_idx, entries)
-
-    # 5. Transition to ACTIVE
+    # 4. Transition to ACTIVE
     await client.update_reference_status(reference_idx, ReferenceStatus.ACTIVE)

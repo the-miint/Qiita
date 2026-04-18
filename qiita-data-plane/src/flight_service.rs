@@ -55,8 +55,10 @@ impl QiitaFlightService {
 /// Allowed table names for DoGet queries. Reject anything else.
 const ALLOWED_TABLES: &[&str] = &[
     "reference_sequences",
+    "reference_sequence_chunks",
     "reference_taxonomy",
     "reference_phylogeny",
+    "reference_placements",
 ];
 
 /// Allowed column names for filter clauses. All identifier columns that can
@@ -218,11 +220,12 @@ fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, Stri
         return Ok((format!("SELECT * FROM {full_table}"), full_table));
     }
 
-    // reference_sequences has no reference_idx column. When the filter
-    // includes reference_idx, resolve it via a JOIN with the membership
-    // table instead of a direct WHERE clause.
+    // reference_sequences and reference_sequence_chunks have no reference_idx
+    // column. When the filter includes reference_idx, resolve via a JOIN with
+    // the membership table.
     let needs_membership_join =
-        table == "reference_sequences" && filter.contains_key("reference_idx");
+        (table == "reference_sequences" || table == "reference_sequence_chunks")
+            && filter.contains_key("reference_idx");
 
     let mut where_clauses = Vec::new();
     for (col, values) in filter {

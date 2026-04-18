@@ -109,14 +109,6 @@ class LocalBackend(ComputeBackend):
         tree_path: Path | None = None,
         jplace_path: Path | None = None,
     ) -> Path:
-        """Load sequences, taxonomy, phylogeny into Parquet files.
-
-        jplace_path is not consumed directly by this method, but its presence
-        signals that phylogenetic placement tips exist. When set, unmatched
-        tree tips (not in manifest) are expected and excluded from
-        tip_features.json rather than raising an error. The path is validated
-        for existence to catch typos early.
-        """
         if not manifest_path.exists():
             raise FileNotFoundError(f"Manifest not found: {manifest_path}")
         if not fasta_path.exists():
@@ -145,208 +137,134 @@ class LocalBackend(ComputeBackend):
                 f"{len(unmapped)} unmapped sequence hash(es) in feature_map: {unmapped[:10]}"
             )
 
-        # Single connection for all write operations; miint loaded once.
         with duckdb.connect(":memory:") as conn:
             conn.execute("LOAD miint;")
+            # Required for COPY ... ORDER BY to honour ROW_GROUP_SIZE.
+            conn.execute("SET preserve_insertion_order=false;")
 
-            _write_sequences_parquet(conn, fasta_path, read_id_map, output_dir)
-            _write_membership_parquet(conn, read_id_map, output_dir, reference_idx)
+            _load_id_map(conn, read_id_map)
+            _write_sequence_metadata(conn, fasta_path, output_dir)
+            _write_sequence_chunks(conn, fasta_path, output_dir)
+            _write_membership(conn, output_dir, reference_idx)
 
             if taxonomy_path is not None:
-                _write_taxonomy_parquet(conn, taxonomy_path, read_id_map, output_dir, reference_idx)
+                _write_taxonomy(conn, taxonomy_path, output_dir, reference_idx)
 
             if tree_path is not None:
-                _write_phylogeny_parquet(
-                    conn,
-                    tree_path,
-                    read_id_map,
-                    output_dir,
-                    reference_idx,
-                    has_placements=jplace_path is not None,
-                )
+                _write_phylogeny(conn, tree_path, output_dir, reference_idx)
+
+            if jplace_path is not None:
+                _write_placements(conn, jplace_path, output_dir, reference_idx)
+
+            conn.execute("DROP TABLE id_map")
 
         return output_dir
 
 
-# GG2 rank prefixes in positional order. Includes t__ (strain) used by some
-# references (e.g., genome-resolved databases).
-_RANK_PREFIXES = ("d__", "p__", "c__", "o__", "f__", "g__", "s__", "t__")
+_PARQUET_OPTS = "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd'"
+_CHUNK_SIZE = 65536  # 64 KB
 
 
 def _validate_parquet_path(path: Path) -> str:
-    """Validate a Parquet output path is safe for SQL interpolation.
-
-    DuckDB COPY TO does not support parameterized destination paths,
-    so we must validate before interpolation. Rejects single quotes,
-    backslashes, and control characters (which are legal in Linux
-    filenames but break or confuse SQL string literals).
-    """
+    """Validate a path is safe for SQL string interpolation in COPY TO."""
     path_str = str(path)
     if "'" in path_str or "\\" in path_str or any(ord(c) < 0x20 for c in path_str):
         raise ValueError(f"Output path contains unsafe characters: {path_str}")
     return path_str
 
 
-def _parse_taxonomy(taxon_string: str) -> list[str | None]:
-    """Parse a semicolon-separated taxonomy into 8 rank values (d__ through t__).
+def _load_id_map(conn: duckdb.DuckDBPyConnection, read_id_map: dict[str, tuple[int, str]]) -> None:
+    """Load the read_id → (feature_idx, sequence_hash) mapping into a temp table.
 
-    Empty values after the prefix (e.g., "f__") become None. Fewer than 8
-    fields is acceptable (trailing ranks become None). Raises ValueError on
-    wrong prefix order, blank fields without a prefix, or more than 8 fields.
+    Shared across all write functions — created once, dropped at the end.
     """
-    parts = [p.strip() for p in taxon_string.split(";")]
-    if len(parts) > len(_RANK_PREFIXES):
-        raise ValueError(
-            f"Taxonomy string has {len(parts)} fields, expected at most "
-            f"{len(_RANK_PREFIXES)}: {taxon_string!r}"
-        )
-    result: list[str | None] = []
-    for i, prefix in enumerate(_RANK_PREFIXES):
-        if i < len(parts):
-            val = parts[i]
-            if not val:
-                raise ValueError(
-                    f"Rank {i} is blank (expected prefix {prefix!r}) "
-                    f"in taxonomy string: {taxon_string!r}"
-                )
-            if val.startswith(prefix):
-                val = val[len(prefix) :]
-            else:
-                raise ValueError(
-                    f"Rank {i} expected prefix {prefix!r}, got: {parts[i]!r}"
-                    f" in taxonomy string: {taxon_string!r}"
-                )
-            result.append(val if val else None)
-        else:
-            result.append(None)
-    return result
-
-
-_TAXONOMY_HEADER_PREFIX = "Feature ID"
-_PARQUET_OPTS = "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd'"
-
-
-def _write_sequences_parquet(
-    conn: duckdb.DuckDBPyConnection,
-    fasta_path: Path,
-    read_id_map: dict[str, tuple[int, str]],
-    output_dir: Path,
-) -> None:
-    """Write reference_sequences.parquet from FASTA + feature map."""
-    out_str = _validate_parquet_path(output_dir / "reference_sequences.parquet")
-
     conn.execute(
-        "CREATE TEMP TABLE seq_id_map ("
-        "  read_id VARCHAR, feature_idx BIGINT, sequence_hash VARCHAR"
-        ")"
+        "CREATE TEMP TABLE id_map (  read_id VARCHAR, feature_idx BIGINT, sequence_hash VARCHAR)"
     )
     conn.executemany(
-        "INSERT INTO seq_id_map VALUES (?, ?, ?)",
+        "INSERT INTO id_map VALUES (?, ?, ?)",
         [(rid, fidx, shash) for rid, (fidx, shash) in read_id_map.items()],
     )
+
+
+def _write_sequence_metadata(
+    conn: duckdb.DuckDBPyConnection, fasta_path: Path, output_dir: Path
+) -> None:
+    """Write reference_sequences.parquet — metadata only (hash + length)."""
+    out = _validate_parquet_path(output_dir / "reference_sequences.parquet")
     conn.execute(
         "COPY ("
-        "  SELECT"
-        "    m.feature_idx,"
-        "    f.sequence1 AS sequence,"
+        "  SELECT m.feature_idx,"
         "    CAST(m.sequence_hash AS UUID) AS sequence_hash,"
         "    CAST(length(f.sequence1) AS BIGINT) AS sequence_length_bp"
         "  FROM read_fastx(?) f"
-        "  JOIN seq_id_map m ON f.read_id = m.read_id"
+        "  JOIN id_map m ON f.read_id = m.read_id"
         "  ORDER BY m.feature_idx"
-        f") TO '{out_str}' ({_PARQUET_OPTS})",
+        f") TO '{out}' ({_PARQUET_OPTS})",
         [str(fasta_path)],
     )
 
-    # Verify row count: FASTA must match manifest exactly.
-    written = conn.execute(f"SELECT count(*) FROM '{out_str}'").fetchone()[0]
-    if written != len(read_id_map):
-        raise ValueError(
-            f"Sequences Parquet has {written} rows but manifest has "
-            f"{len(read_id_map)} entries — FASTA may have been modified after hashing"
-        )
 
-    conn.execute("DROP TABLE seq_id_map")
-
-
-def _write_membership_parquet(
-    conn: duckdb.DuckDBPyConnection,
-    read_id_map: dict[str, tuple[int, str]],
-    output_dir: Path,
-    reference_idx: int,
+def _write_sequence_chunks(
+    conn: duckdb.DuckDBPyConnection, fasta_path: Path, output_dir: Path
 ) -> None:
-    """Write reference_membership.parquet — (reference_idx, feature_idx) pairs.
-
-    This mirrors the Postgres reference_membership table in DuckLake so the
-    data plane can resolve reference → feature_idx at query time without
-    embedding the full feature_idx list in every signed ticket.
-    """
-    out_str = _validate_parquet_path(output_dir / "reference_membership.parquet")
-
-    conn.execute("CREATE TEMP TABLE membership_data (reference_idx BIGINT, feature_idx BIGINT)")
-    conn.executemany(
-        "INSERT INTO membership_data VALUES (?, ?)",
-        [(reference_idx, fidx) for fidx, _ in read_id_map.values()],
+    """Write reference_sequence_chunks.parquet — sequences chunked at 64 KB."""
+    out = _validate_parquet_path(output_dir / "reference_sequence_chunks.parquet")
+    conn.execute(
+        "COPY ("
+        "  WITH chunked AS ("
+        "    SELECT m.feature_idx, f.sequence1"
+        "    FROM read_fastx(?) f"
+        "    JOIN id_map m ON f.read_id = m.read_id"
+        "  )"
+        "  SELECT feature_idx,"
+        f"    CAST((idx - 1) / {_CHUNK_SIZE} AS INTEGER) AS chunk_index,"
+        f"    substring(sequence1, CAST(idx AS BIGINT), {_CHUNK_SIZE}) AS chunk_data"
+        "  FROM chunked,"
+        f"    range(1, CAST(length(sequence1) + 1 AS BIGINT), {_CHUNK_SIZE}) AS t(idx)"
+        "  ORDER BY feature_idx, chunk_index"
+        f") TO '{out}' ({_PARQUET_OPTS})",
+        [str(fasta_path)],
     )
-    conn.execute(f"COPY membership_data TO '{out_str}' ({_PARQUET_OPTS})")
-    conn.execute("DROP TABLE membership_data")
 
 
-def _write_taxonomy_parquet(
+def _write_membership(
+    conn: duckdb.DuckDBPyConnection, output_dir: Path, reference_idx: int
+) -> None:
+    """Write reference_membership.parquet from the id_map."""
+    out = _validate_parquet_path(output_dir / "reference_membership.parquet")
+    conn.execute(
+        "COPY ("
+        f"  SELECT CAST({reference_idx} AS BIGINT) AS reference_idx, feature_idx"
+        "  FROM id_map"
+        "  ORDER BY feature_idx"
+        f") TO '{out}' ({_PARQUET_OPTS})"
+    )
+
+
+def _write_taxonomy(
     conn: duckdb.DuckDBPyConnection,
     taxonomy_path: Path,
-    read_id_map: dict[str, tuple[int, str]],
     output_dir: Path,
     reference_idx: int,
 ) -> None:
-    """Write reference_taxonomy.parquet from a GG2-style two-column TSV.
+    """Write reference_taxonomy.parquet from a Parquet input (feature_id, taxonomy).
 
-    All transformation (TSV read, string split, rank extraction) is done in
-    DuckDB. Validates header, unknown IDs, field count, blank fields, and
-    prefix order before writing. Partial coverage is allowed.
+    Rank extraction and validation done entirely in DuckDB.
+    Partial coverage is allowed (not all features need taxonomy).
     """
-    out_str = _validate_parquet_path(output_dir / "reference_taxonomy.parquet")
+    out = _validate_parquet_path(output_dir / "reference_taxonomy.parquet")
 
-    # Validate header — one-line Python check for a clear error message.
-    with open(taxonomy_path) as f:
-        header = next(f).strip()
-        if not header.startswith(_TAXONOMY_HEADER_PREFIX):
-            raise ValueError(
-                f"Unexpected taxonomy header (expected '{_TAXONOMY_HEADER_PREFIX}...'): {header!r}"
-            )
-
-    # Load id_map for joins.
-    conn.execute("CREATE TEMP TABLE tax_id_map (read_id VARCHAR, feature_idx BIGINT)")
-    conn.executemany(
-        "INSERT INTO tax_id_map VALUES (?, ?)",
-        [(rid, fidx) for rid, (fidx, _) in read_id_map.items()],
-    )
-
-    # Read TSV into DuckDB — columns param gives clean names and skips header.
-    conn.execute(
-        "CREATE TEMP TABLE raw_taxonomy AS "
-        "SELECT * FROM read_csv(?, delim='\\t', header=true, "
-        "columns={'read_id': 'VARCHAR', 'taxon': 'VARCHAR'})",
-        [str(taxonomy_path)],
-    )
-
-    # Validate: unknown IDs (taxonomy entries not in manifest).
-    unknown = conn.execute(
-        "SELECT read_id FROM raw_taxonomy WHERE read_id NOT IN (SELECT read_id FROM tax_id_map)"
-    ).fetchall()
-    if unknown:
-        ids = [r[0] for r in unknown[:10]]
-        raise ValueError(f"Taxonomy file contains {len(unknown)} entry(ies) not in manifest: {ids}")
-
-    # Parse: inner join (only known IDs), split ranks in DuckDB.
+    # Read taxonomy Parquet, join with id_map, split ranks.
     conn.execute(
         "CREATE TEMP TABLE parsed_taxonomy AS "
         "SELECT "
-        "  m.feature_idx, "
-        "  string_split_regex(r.taxon, ';\\s*') AS ranks, "
-        "  len(string_split_regex(r.taxon, ';\\s*')) AS nranks "
-        "FROM raw_taxonomy r "
-        "INNER JOIN tax_id_map m ON r.read_id = m.read_id"
+        "  m.feature_idx,"
+        "  string_split_regex(t.taxonomy, ';\\s*') AS ranks,"
+        "  len(string_split_regex(t.taxonomy, ';\\s*')) AS nranks "
+        "FROM read_parquet(?) t "
+        "INNER JOIN id_map m ON t.feature_id = m.read_id",
+        [str(taxonomy_path)],
     )
 
     # Validate: field count ≤ 8.
@@ -356,7 +274,7 @@ def _write_taxonomy_parquet(
     if bad:
         raise ValueError(f"Taxonomy has >8 semicolon-delimited fields: {bad}")
 
-    # Validate: no blank fields (empty string after split = missing prefix).
+    # Validate: no blank fields.
     bad = conn.execute(
         "SELECT feature_idx FROM parsed_taxonomy WHERE list_contains(ranks, '') LIMIT 5"
     ).fetchall()
@@ -364,7 +282,7 @@ def _write_taxonomy_parquet(
         ids = [r[0] for r in bad]
         raise ValueError(f"Taxonomy contains blank fields for feature_idx: {ids}")
 
-    # Validate: prefix order (d__, p__, c__, o__, f__, g__, s__, t__).
+    # Validate: prefix order.
     bad = conn.execute(
         "SELECT feature_idx FROM parsed_taxonomy WHERE "
         "(nranks >= 1 AND NOT starts_with(ranks[1], 'd__')) OR "
@@ -381,8 +299,6 @@ def _write_taxonomy_parquet(
         ids = [r[0] for r in bad]
         raise ValueError(f"Taxonomy has wrong rank prefix order for feature_idx: {ids}")
 
-    # Extract ranks and write — substr(ranks[i], 4) strips the 3-char prefix,
-    # NULLIF converts empty string (e.g., "o__" → "") to NULL.
     conn.execute(
         "COPY ("
         "  SELECT "
@@ -398,73 +314,67 @@ def _write_taxonomy_parquet(
         "    NULLIF(substr(ranks[8], 4), '') AS strain,"
         "    NULL::BIGINT AS ncbi_taxon_id"
         "  FROM parsed_taxonomy"
-        f") TO '{out_str}' ({_PARQUET_OPTS})"
+        "  ORDER BY feature_idx"
+        f") TO '{out}' ({_PARQUET_OPTS})"
     )
 
     conn.execute("DROP TABLE parsed_taxonomy")
-    conn.execute("DROP TABLE raw_taxonomy")
-    conn.execute("DROP TABLE tax_id_map")
 
 
-def _write_phylogeny_parquet(
+def _write_phylogeny(
     conn: duckdb.DuckDBPyConnection,
     tree_path: Path,
-    read_id_map: dict[str, tuple[int, str]],
     output_dir: Path,
     reference_idx: int,
-    *,
-    has_placements: bool = False,
 ) -> None:
-    """Write reference_phylogeny.parquet and tip_features.json from a Newick tree.
+    """Write reference_phylogeny.parquet from Newick with feature_idx on tips.
 
-    If has_placements is False, all tips must match a sequence in read_id_map
-    (mismatches raise ValueError). If True, unmatched tips are expected
-    (placement tips from jplace) and excluded from tip_features.json.
+    Tips with matching sequences get feature_idx populated; tips without
+    sequences (and internal nodes) get NULL. No error on unmatched tips.
     """
-    out_str = _validate_parquet_path(output_dir / "reference_phylogeny.parquet")
-    tip_path = output_dir / "tip_features.json"
+    out = _validate_parquet_path(output_dir / "reference_phylogeny.parquet")
 
-    # Parse tree once into a temp table — avoids double-parsing for the
-    # Parquet write and the tip extraction.
     conn.execute(
         "CREATE TEMP TABLE tree_nodes AS SELECT * FROM read_newick(?)",
         [str(tree_path)],
     )
 
-    # reference_idx is a Python int — int.__format__ always produces a decimal
-    # string, so this interpolation is safe from injection.
     conn.execute(
         "COPY ("
         f"  SELECT CAST({reference_idx} AS BIGINT) AS reference_idx,"
-        "    node_index, name, branch_length, edge_id, parent_index, is_tip"
-        "  FROM tree_nodes"
-        f") TO '{out_str}' ({_PARQUET_OPTS})",
+        "    t.node_index, t.name, t.branch_length, t.edge_id,"
+        "    t.parent_index, t.is_tip, m.feature_idx"
+        "  FROM tree_nodes t"
+        "  LEFT JOIN id_map m ON t.is_tip AND t.name = m.read_id"
+        "  ORDER BY t.node_index"
+        f") TO '{out}' ({_PARQUET_OPTS})",
     )
-
-    tips = conn.execute(
-        "SELECT node_index, name FROM tree_nodes WHERE is_tip = true",
-    ).fetchall()
 
     conn.execute("DROP TABLE tree_nodes")
 
-    tip_features = []
-    unmatched_tips: list[str] = []
-    for node_index, name in tips:
-        if name in read_id_map:
-            tip_features.append(
-                {
-                    "reference_idx": reference_idx,
-                    "node_index": int(node_index),
-                    "feature_idx": read_id_map[name][0],
-                }
-            )
-        else:
-            unmatched_tips.append(name or f"<unnamed node {node_index}>")
 
-    if unmatched_tips and not has_placements:
-        raise ValueError(
-            f"{len(unmatched_tips)} phylogeny tip(s) have no matching sequence "
-            f"in manifest: {unmatched_tips[:10]}"
-        )
+def _write_placements(
+    conn: duckdb.DuckDBPyConnection,
+    jplace_path: Path,
+    output_dir: Path,
+    reference_idx: int,
+) -> None:
+    """Write reference_placements.parquet from jplace.
 
-    tip_path.write_text(json.dumps(tip_features, indent=2))
+    Maps placed fragments to feature_idx via id_map. Fragments not in
+    id_map are skipped (they weren't hashed/minted).
+    """
+    out = _validate_parquet_path(output_dir / "reference_placements.parquet")
+
+    conn.execute(
+        "COPY ("
+        f"  SELECT CAST({reference_idx} AS BIGINT) AS reference_idx,"
+        "    m.feature_idx, j.edge_num,"
+        "    j.likelihood, j.like_weight_ratio,"
+        "    j.distal_length, j.pendant_length"
+        "  FROM read_jplace(?) j"
+        "  INNER JOIN id_map m ON j.fragment = m.read_id"
+        "  ORDER BY m.feature_idx, j.edge_num"
+        f") TO '{out}' ({_PARQUET_OPTS})",
+        [str(jplace_path)],
+    )

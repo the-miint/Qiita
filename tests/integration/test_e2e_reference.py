@@ -64,8 +64,13 @@ def _ensure_ducklake_tables(conn):
     """Create DuckLake tables if they don't exist."""
     conn.execute(
         "CREATE TABLE IF NOT EXISTS qiita_lake.reference_sequences ("
-        "feature_idx BIGINT NOT NULL, sequence VARCHAR NOT NULL, "
+        "feature_idx BIGINT NOT NULL, "
         "sequence_hash UUID NOT NULL, sequence_length_bp BIGINT NOT NULL);"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS qiita_lake.reference_sequence_chunks ("
+        "feature_idx BIGINT NOT NULL, chunk_index INTEGER NOT NULL, "
+        "chunk_data VARCHAR NOT NULL);"
     )
     conn.execute(
         "CREATE TABLE IF NOT EXISTS qiita_lake.reference_taxonomy ("
@@ -78,11 +83,18 @@ def _ensure_ducklake_tables(conn):
         "CREATE TABLE IF NOT EXISTS qiita_lake.reference_phylogeny ("
         "reference_idx BIGINT NOT NULL, node_index BIGINT NOT NULL, "
         "name VARCHAR, branch_length DOUBLE, edge_id BIGINT, "
-        "parent_index BIGINT, is_tip BOOLEAN NOT NULL);"
+        "parent_index BIGINT, is_tip BOOLEAN NOT NULL, feature_idx BIGINT);"
     )
     conn.execute(
         "CREATE TABLE IF NOT EXISTS qiita_lake.reference_membership ("
         "reference_idx BIGINT NOT NULL, feature_idx BIGINT NOT NULL);"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS qiita_lake.reference_placements ("
+        "reference_idx BIGINT NOT NULL, feature_idx BIGINT NOT NULL, "
+        "edge_num INTEGER NOT NULL, likelihood DOUBLE, "
+        "like_weight_ratio DOUBLE, distal_length DOUBLE, "
+        "pendant_length DOUBLE);"
     )
 
 
@@ -235,9 +247,6 @@ async def ref_for_e2e(client, postgres_pool):
     idx = resp.json()["reference_idx"]
     yield idx
     await postgres_pool.execute(
-        "DELETE FROM qiita.phylogeny_tip_feature WHERE reference_idx = $1", idx
-    )
-    await postgres_pool.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
     await postgres_pool.execute(
@@ -263,13 +272,20 @@ def fasta_e2e(tmp_path):
 
 @pytest.fixture
 def taxonomy_e2e(tmp_path):
-    path = tmp_path / "taxonomy.tsv"
-    path.write_text(
-        "Feature ID\tTaxon\n"
-        "seq1\td__Bacteria; p__Bacillota; c__Bacilli; o__; f__; g__; s__\n"
-        "seq2\td__Bacteria; p__Pseudomonadota; c__; o__; f__; g__; s__\n"
-        "seq3\td__Archaea; p__Euryarchaeota; c__; o__; f__; g__; s__\n"
-    )
+    import duckdb as _ddb
+
+    path = tmp_path / "taxonomy.parquet"
+    with _ddb.connect(":memory:") as conn:
+        conn.execute("CREATE TABLE t (feature_id VARCHAR, taxonomy VARCHAR)")
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?)",
+            [
+                ("seq1", "d__Bacteria; p__Bacillota; c__Bacilli; o__; f__; g__; s__"),
+                ("seq2", "d__Bacteria; p__Pseudomonadota; c__; o__; f__; g__; s__"),
+                ("seq3", "d__Archaea; p__Euryarchaeota; c__; o__; f__; g__; s__"),
+            ],
+        )
+        conn.execute(f"COPY t TO '{path}' (FORMAT PARQUET)")
     return path
 
 
@@ -340,19 +356,12 @@ async def test_e2e_create_to_doget(
         ducklake_data_path=DUCKLAKE_DATA_PATH,
         table_file_map={
             "reference_sequences.parquet": "reference_sequences",
+            "reference_sequence_chunks.parquet": "reference_sequence_chunks",
             "reference_membership.parquet": "reference_membership",
             "reference_taxonomy.parquet": "reference_taxonomy",
             "reference_phylogeny.parquet": "reference_phylogeny",
         },
     )
-
-    # --- Post tip features ---
-    tips = json.loads((staging_dir / "tip_features.json").read_text())
-    tip_resp = await client.post(
-        f"/api/v1/references/{ref_idx}/phylogeny-tips",
-        json={"entries": tips},
-    )
-    assert tip_resp.status_code == 201
 
     # --- Transition to active ---
     active_resp = await client.patch(
@@ -360,7 +369,7 @@ async def test_e2e_create_to_doget(
     )
     assert active_resp.status_code == 200
 
-    # --- Sign ticket for reference_sequences ---
+    # --- Sign ticket for reference_sequences (metadata-only: hash + length) ---
     ticket_resp = await client.post(
         f"/api/v1/references/{ref_idx}/tickets/doget",
         json={"table": "reference_sequences"},
@@ -375,12 +384,26 @@ async def test_e2e_create_to_doget(
 
     assert table.num_rows == 3
     assert "feature_idx" in table.column_names
-    assert "sequence" in table.column_names
+    assert "sequence_hash" in table.column_names
+    assert "sequence_length_bp" in table.column_names
     returned_fidxs = set(table.column("feature_idx").to_pylist())
     assert returned_fidxs == set(feature_map.values())
 
-    # Verify actual sequence content
-    sequences = set(table.column("sequence").to_pylist())
+    # --- Verify sequence data via reference_sequence_chunks ---
+    chunks_ticket_resp = await client.post(
+        f"/api/v1/references/{ref_idx}/tickets/doget",
+        json={"table": "reference_sequence_chunks"},
+    )
+    assert chunks_ticket_resp.status_code == 201
+    chunks_ticket_bytes = base64.b64decode(chunks_ticket_resp.json()["ticket"])
+
+    chunks_reader = flight_client.do_get(flight.Ticket(chunks_ticket_bytes))
+    chunks_table = chunks_reader.read_all()
+
+    # 3 short sequences = 3 rows (one chunk each)
+    assert chunks_table.num_rows == 3
+    assert "chunk_data" in chunks_table.column_names
+    sequences = set(chunks_table.column("chunk_data").to_pylist())
     assert sequences == set(TEST_SEQUENCES.values())
 
 
@@ -436,6 +459,8 @@ async def test_e2e_doget_taxonomy(
         ducklake_connstr=DUCKLAKE_CONNSTR,
         ducklake_data_path=DUCKLAKE_DATA_PATH,
         table_file_map={
+            "reference_sequences.parquet": "reference_sequences",
+            "reference_sequence_chunks.parquet": "reference_sequence_chunks",
             "reference_membership.parquet": "reference_membership",
             "reference_taxonomy.parquet": "reference_taxonomy",
         },

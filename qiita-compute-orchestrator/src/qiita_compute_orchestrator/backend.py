@@ -33,7 +33,17 @@ class ComputeBackend(ABC):
         tree_path: Path | None = None,
         jplace_path: Path | None = None,
     ) -> Path:
-        """Load sequences, taxonomy, phylogeny into Parquet files.
+        """Write reference data to sorted Parquet files.
 
-        Returns the path to the output directory containing Parquet files.
+        Always produces:
+          - reference_sequences.parquet (metadata: hash + length)
+          - reference_sequence_chunks.parquet (chunked sequence data)
+          - reference_membership.parquet
+
+        Optional (when paths provided):
+          - reference_taxonomy.parquet (from Parquet input with feature_id + taxonomy)
+          - reference_phylogeny.parquet (from Newick, with feature_idx on tips)
+          - reference_placements.parquet (from jplace)
+
+        Returns the path to the output directory.
         """

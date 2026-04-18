@@ -1,10 +1,9 @@
 """Integration test: full reference load pipeline.
 
-create → hash → mint → load → register DuckLake → phylogeny tips → active.
+create → hash → mint → load → active.
 Requires Docker Postgres on :5433.
 """
 
-import hashlib
 import json
 import uuid
 
@@ -40,9 +39,6 @@ async def ref_for_load(client, postgres_pool):
     yield idx
     # Cleanup in FK dependency order
     await postgres_pool.execute(
-        "DELETE FROM qiita.phylogeny_tip_feature WHERE reference_idx = $1", idx
-    )
-    await postgres_pool.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
     await postgres_pool.execute(
@@ -69,14 +65,21 @@ def fasta_3seq(tmp_path):
 
 @pytest.fixture
 def taxonomy_3seq(tmp_path):
-    """Create a 3-entry taxonomy TSV."""
-    path = tmp_path / "taxonomy.tsv"
-    path.write_text(
-        "Feature ID\tTaxon\n"
-        "seq1\td__Bacteria; p__Bacillota; c__Bacilli; o__; f__; g__; s__\n"
-        "seq2\td__Bacteria; p__Pseudomonadota; c__; o__; f__; g__; s__\n"
-        "seq3\td__Archaea; p__Euryarchaeota; c__; o__; f__; g__; s__\n"
-    )
+    """Create a 3-entry taxonomy Parquet."""
+    import duckdb
+
+    path = tmp_path / "taxonomy.parquet"
+    with duckdb.connect(":memory:") as conn:
+        conn.execute("CREATE TABLE t (feature_id VARCHAR, taxonomy VARCHAR)")
+        conn.executemany(
+            "INSERT INTO t VALUES (?, ?)",
+            [
+                ("seq1", "d__Bacteria; p__Bacillota; c__Bacilli; o__; f__; g__; s__"),
+                ("seq2", "d__Bacteria; p__Pseudomonadota; c__; o__; f__; g__; s__"),
+                ("seq3", "d__Archaea; p__Euryarchaeota; c__; o__; f__; g__; s__"),
+            ],
+        )
+        conn.execute(f"COPY t TO '{path}' (FORMAT PARQUET)")
     return path
 
 
@@ -91,7 +94,7 @@ def tree_3seq(tmp_path):
 async def test_full_load_pipeline(
     client, fasta_3seq, taxonomy_3seq, tree_3seq, ref_for_load, postgres_pool, tmp_path
 ):
-    """Full round-trip: create → hash → mint → load → tips → active → verify."""
+    """Full round-trip: create → hash → mint → load → active → verify."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
     ref_idx = ref_for_load
@@ -121,7 +124,7 @@ async def test_full_load_pipeline(
     mint_body = mint_resp.json()
     feature_map = {uuid.UUID(k): v for k, v in mint_body["mapping"].items()}
 
-    # --- Load phase (status transition + load job + tips) ---
+    # --- Load phase (status transition + load job) ---
     load_resp = await client.patch(
         f"/api/v1/references/{ref_idx}/status",
         json={"status": "loading"},
@@ -141,19 +144,10 @@ async def test_full_load_pipeline(
 
     # Verify Parquet files exist
     assert (load_dir / "reference_sequences.parquet").exists()
+    assert (load_dir / "reference_sequence_chunks.parquet").exists()
     assert (load_dir / "reference_membership.parquet").exists()
     assert (load_dir / "reference_taxonomy.parquet").exists()
     assert (load_dir / "reference_phylogeny.parquet").exists()
-    assert (load_dir / "tip_features.json").exists()
-
-    # --- Post tip features ---
-    tips = json.loads((load_dir / "tip_features.json").read_text())
-    tip_resp = await client.post(
-        f"/api/v1/references/{ref_idx}/phylogeny-tips",
-        json={"entries": tips},
-    )
-    assert tip_resp.status_code == 201
-    assert tip_resp.json()["inserted"] == 3
 
     # --- Transition to active ---
     active_resp = await client.patch(
@@ -176,85 +170,3 @@ async def test_full_load_pipeline(
         ref_idx,
     )
     assert membership_count == 3
-
-    # 3 tip-feature rows
-    tip_count = await postgres_pool.fetchval(
-        "SELECT count(*) FROM qiita.phylogeny_tip_feature WHERE reference_idx = $1",
-        ref_idx,
-    )
-    assert tip_count == 3
-
-    # Tip feature_idx values must be valid features
-    tip_features = await postgres_pool.fetch(
-        "SELECT feature_idx FROM qiita.phylogeny_tip_feature WHERE reference_idx = $1",
-        ref_idx,
-    )
-    tip_fidxs = {r["feature_idx"] for r in tip_features}
-    assert tip_fidxs == set(feature_map.values())
-
-
-async def test_phylogeny_tips_rejects_wrong_status(client, ref_for_load):
-    """POST phylogeny-tips must reject references not in 'loading' status."""
-    ref_idx = ref_for_load
-    # Reference is in 'pending' — should reject
-    resp = await client.post(
-        f"/api/v1/references/{ref_idx}/phylogeny-tips",
-        json={
-            "entries": [
-                {"reference_idx": ref_idx, "node_index": 0, "feature_idx": 1},
-            ]
-        },
-    )
-    assert resp.status_code == 409
-
-
-async def test_phylogeny_tips_idempotent(
-    client, ref_for_load, postgres_pool, fasta_3seq, tree_3seq, tmp_path
-):
-    """Resubmitting the same tips must succeed (ON CONFLICT DO NOTHING)."""
-    from qiita_compute_orchestrator.backends.local import LocalBackend
-
-    ref_idx = ref_for_load
-    backend = LocalBackend()
-
-    # Hash + mint
-    await client.patch(
-        f"/api/v1/references/{ref_idx}/status", json={"status": "hashing"}
-    )
-    manifest_path = await backend.run_hash_job(
-        fasta_path=fasta_3seq, output_dir=tmp_path / "h", reference_idx=ref_idx
-    )
-    manifest = json.loads(manifest_path.read_text())
-    entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
-    mint_resp = await client.post(
-        f"/api/v1/references/{ref_idx}/features/mint", json={"entries": entries}
-    )
-    feature_map = {uuid.UUID(k): v for k, v in mint_resp.json()["mapping"].items()}
-
-    # Load + tips
-    await client.patch(
-        f"/api/v1/references/{ref_idx}/status", json={"status": "loading"}
-    )
-    load_dir = tmp_path / "l"
-    await backend.run_load_job(
-        manifest_path=manifest_path,
-        fasta_path=fasta_3seq,
-        feature_map=feature_map,
-        output_dir=load_dir,
-        reference_idx=ref_idx,
-        tree_path=tree_3seq,
-    )
-    tips = json.loads((load_dir / "tip_features.json").read_text())
-
-    # Post tips twice — second should succeed with 0 inserted
-    resp1 = await client.post(
-        f"/api/v1/references/{ref_idx}/phylogeny-tips", json={"entries": tips}
-    )
-    assert resp1.status_code == 201
-    assert resp1.json()["inserted"] == 3
-
-    resp2 = await client.post(
-        f"/api/v1/references/{ref_idx}/phylogeny-tips", json={"entries": tips}
-    )
-    assert resp2.status_code == 201
-    assert resp2.json()["inserted"] == 0

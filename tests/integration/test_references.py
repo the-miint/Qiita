@@ -27,10 +27,6 @@ async def client(postgres_pool):
     # Cleanup only rows we created, in FK dependency order
     if created_refs:
         await postgres_pool.execute(
-            "DELETE FROM qiita.phylogeny_tip_feature WHERE reference_idx = ANY($1::bigint[])",
-            created_refs,
-        )
-        await postgres_pool.execute(
             "DELETE FROM qiita.reference_membership WHERE reference_idx = ANY($1::bigint[])",
             created_refs,
         )

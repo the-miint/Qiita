@@ -14,8 +14,6 @@ from qiita_common.models import (
     FeatureHashEntry,
     FeatureMintRequest,
     FeatureMintResponse,
-    PhylogenyTipRequest,
-    PhylogenyTipResponse,
     ReferenceCreateRequest,
     ReferenceResponse,
     ReferenceStatusUpdate,
@@ -266,62 +264,15 @@ async def _write_genome_associations(
     )
 
 
-@router.post("/{reference_idx}/phylogeny-tips", status_code=201)
-async def write_phylogeny_tips(
-    reference_idx: Annotated[int, Field(gt=0)],
-    body: PhylogenyTipRequest,
-    pool: asyncpg.Pool = Depends(get_db_pool),
-) -> PhylogenyTipResponse:
-    """Bulk insert phylogeny tip-to-feature mappings.
-
-    Reference must be in 'loading' status. Uses ON CONFLICT DO NOTHING
-    for idempotent resubmission.
-    """
-    # Verify reference is in loading status
-    status = await pool.fetchval(
-        "SELECT status FROM qiita.references WHERE reference_idx = $1",
-        reference_idx,
-    )
-    if status is None:
-        raise HTTPException(status_code=404, detail="Reference not found")
-    if status != "loading":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Reference status is {status!r}, must be 'loading'",
-        )
-
-    # Validate all entries have matching reference_idx
-    bad = [e for e in body.entries if e.reference_idx != reference_idx]
-    if bad:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Entry reference_idx must match path ({reference_idx})",
-        )
-
-    ref_idxs = [e.reference_idx for e in body.entries]
-    node_idxs = [e.node_index for e in body.entries]
-    feat_idxs = [e.feature_idx for e in body.entries]
-
-    result = await pool.execute(
-        "INSERT INTO qiita.phylogeny_tip_feature (reference_idx, node_index, feature_idx)"
-        " SELECT unnest($1::bigint[]), unnest($2::bigint[]), unnest($3::bigint[])"
-        " ON CONFLICT DO NOTHING",
-        ref_idxs,
-        node_idxs,
-        feat_idxs,
-    )
-    # asyncpg returns "INSERT 0 N" where N is the count
-    inserted = int(result.split()[-1])
-    return PhylogenyTipResponse(inserted=inserted)
-
-
 # Tables that can appear in a DoGet ticket. Must match the data plane's
 # ALLOWED_TABLES whitelist in flight_service.rs.
 _DOGET_ALLOWED_TABLES = frozenset(
     {
         "reference_sequences",
+        "reference_sequence_chunks",
         "reference_taxonomy",
         "reference_phylogeny",
+        "reference_placements",
     }
 )
 

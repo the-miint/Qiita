@@ -17,7 +17,6 @@ def _seq_hash(seq: str) -> UUID:
 
 TEST_HASHES = {name: _seq_hash(seq) for name, seq in TEST_SEQUENCES.items()}
 
-# Arbitrary feature_idx assignments (as if minted by control plane).
 TEST_FEATURE_MAP: dict[UUID, int] = {
     hash_val: 100 + i for i, hash_val in enumerate(TEST_HASHES.values())
 }
@@ -25,14 +24,12 @@ TEST_FEATURE_MAP: dict[UUID, int] = {
 
 @pytest.fixture
 def fasta_path(fasta_file):
-    """Extract just the path from the shared fasta_file fixture."""
     path, _ = fasta_file
     return path
 
 
 @pytest.fixture
 def manifest_file(tmp_path):
-    """Create a hash manifest matching the test FASTA."""
     entries = [
         {
             "read_id": name,
@@ -49,60 +46,55 @@ def manifest_file(tmp_path):
 
 @pytest.fixture
 def feature_map():
-    """Feature map as returned by control plane mint endpoint."""
     return dict(TEST_FEATURE_MAP)
 
 
 @pytest.fixture
 def taxonomy_file(tmp_path):
-    """Create a 5-entry taxonomy TSV in GG2 format (with strain on seq4)."""
-    path = tmp_path / "taxonomy.tsv"
-    taxa = {
-        "seq1": (
-            "d__Bacteria; p__Bacillota; c__Bacilli;"
-            " o__Lactobacillales; f__Lactobacillaceae;"
-            " g__Lactobacillus; s__Lactobacillus acidophilus"
-        ),
-        "seq2": (
-            "d__Bacteria; p__Pseudomonadota; c__Gammaproteobacteria;"
-            " o__Enterobacterales; f__Enterobacteriaceae;"
-            " g__Escherichia; s__Escherichia coli"
-        ),
-        "seq3": "d__Bacteria; p__Bacillota; c__Bacilli; o__; f__; g__; s__",
-        "seq4": (
-            "d__Archaea; p__Euryarchaeota; c__Methanobacteria;"
-            " o__Methanobacteriales; f__Methanobacteriaceae;"
-            " g__Methanobacterium; s__Methanobacterium formicicum;"
-            " t__Methanobacterium formicicum DSM 2320"
-        ),
-        "seq5": "d__Bacteria; p__Actinomycetota; c__; o__; f__; g__; s__",
-    }
-    lines = ["Feature ID\tTaxon"]
-    for read_id, taxon in taxa.items():
-        lines.append(f"{read_id}\t{taxon}")
-    path.write_text("\n".join(lines) + "\n")
+    """Taxonomy as Parquet with (feature_id, taxonomy) columns."""
+    path = tmp_path / "taxonomy.parquet"
+    with duckdb.connect(":memory:") as conn:
+        conn.execute("CREATE TABLE tax (feature_id VARCHAR, taxonomy VARCHAR)")
+        conn.executemany(
+            "INSERT INTO tax VALUES (?, ?)",
+            [
+                (
+                    "seq1",
+                    "d__Bacteria; p__Bacillota; c__Bacilli;"
+                    " o__Lactobacillales; f__Lactobacillaceae;"
+                    " g__Lactobacillus; s__Lactobacillus acidophilus",
+                ),
+                (
+                    "seq2",
+                    "d__Bacteria; p__Pseudomonadota; c__Gammaproteobacteria;"
+                    " o__Enterobacterales; f__Enterobacteriaceae;"
+                    " g__Escherichia; s__Escherichia coli",
+                ),
+                ("seq3", "d__Bacteria; p__Bacillota; c__Bacilli; o__; f__; g__; s__"),
+                (
+                    "seq4",
+                    "d__Archaea; p__Euryarchaeota; c__Methanobacteria;"
+                    " o__Methanobacteriales; f__Methanobacteriaceae;"
+                    " g__Methanobacterium; s__Methanobacterium formicicum;"
+                    " t__Methanobacterium formicicum DSM 2320",
+                ),
+                ("seq5", "d__Bacteria; p__Actinomycetota; c__; o__; f__; g__; s__"),
+            ],
+        )
+        conn.execute(f"COPY tax TO '{path}' (FORMAT PARQUET)")
     return path
 
 
 @pytest.fixture
 def tree_file(tmp_path):
-    """Create a newick tree with 5 tips matching test sequences."""
     nwk = "((seq1:0.1,seq2:0.2):0.3,(seq3:0.4,(seq4:0.5,seq5:0.6):0.7):0.8);"
     path = tmp_path / "tree.nwk"
     path.write_text(nwk)
     return path
 
 
-# --- Sequences Parquet ---
-
-
-async def test_load_job_produces_sequences_parquet(
-    manifest_file, fasta_path, feature_map, tmp_path
-):
-    """Load job must produce a reference_sequences.parquet file."""
-    from qiita_compute_orchestrator.backends.local import LocalBackend
-
-    backend = LocalBackend()
+async def _run_load(backend, manifest_file, fasta_path, feature_map, tmp_path, **kwargs):
+    """Helper to run load job with common args."""
     output_dir = tmp_path / "output"
     await backend.run_load_job(
         manifest_path=manifest_file,
@@ -110,628 +102,257 @@ async def test_load_job_produces_sequences_parquet(
         feature_map=feature_map,
         output_dir=output_dir,
         reference_idx=REFERENCE_IDX,
+        **kwargs,
     )
-    assert (output_dir / "reference_sequences.parquet").exists()
+    return output_dir
 
 
-async def test_load_job_sequences_schema_and_data(manifest_file, fasta_path, feature_map, tmp_path):
-    """Sequences Parquet must have correct columns and one row per sequence."""
+# --- Sequence metadata ---
+
+
+async def test_sequence_metadata_schema(manifest_file, fasta_path, feature_map, tmp_path):
+    """reference_sequences.parquet must have feature_idx, sequence_hash, sequence_length_bp."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
-    backend = LocalBackend()
-    output_dir = tmp_path / "output"
-    await backend.run_load_job(
-        manifest_path=manifest_file,
-        fasta_path=fasta_path,
-        feature_map=feature_map,
-        output_dir=output_dir,
-        reference_idx=REFERENCE_IDX,
-    )
+    out = await _run_load(LocalBackend(), manifest_file, fasta_path, feature_map, tmp_path)
+    pq = out / "reference_sequences.parquet"
+    assert pq.exists()
 
-    pq_path = output_dir / "reference_sequences.parquet"
     with duckdb.connect(":memory:") as conn:
-        cols = conn.execute(
-            f"SELECT column_name FROM (DESCRIBE SELECT * FROM '{pq_path}')"
-        ).fetchall()
-        col_names = [c[0] for c in cols]
-        assert col_names == [
-            "feature_idx",
-            "sequence",
-            "sequence_hash",
-            "sequence_length_bp",
+        cols = [
+            r[0]
+            for r in conn.execute(
+                f"SELECT column_name FROM (DESCRIBE SELECT * FROM '{pq}')"
+            ).fetchall()
         ]
+        assert cols == ["feature_idx", "sequence_hash", "sequence_length_bp"]
+        assert conn.execute(f"SELECT count(*) FROM '{pq}'").fetchone()[0] == 5
 
-        rows = conn.execute(f"SELECT * FROM '{pq_path}' ORDER BY feature_idx").fetchall()
-        assert len(rows) == 5
 
-        # Verify a specific row: seq1 hash -> feature_idx 100
-        seq1_hash = TEST_HASHES["seq1"]
-        seq1_fidx = TEST_FEATURE_MAP[seq1_hash]
+# --- Sequence chunks ---
+
+
+async def test_sequence_chunks_schema(manifest_file, fasta_path, feature_map, tmp_path):
+    """reference_sequence_chunks.parquet must have feature_idx, chunk_index, chunk_data."""
+    from qiita_compute_orchestrator.backends.local import LocalBackend
+
+    out = await _run_load(LocalBackend(), manifest_file, fasta_path, feature_map, tmp_path)
+    pq = out / "reference_sequence_chunks.parquet"
+    assert pq.exists()
+
+    with duckdb.connect(":memory:") as conn:
+        cols = [
+            r[0]
+            for r in conn.execute(
+                f"SELECT column_name FROM (DESCRIBE SELECT * FROM '{pq}')"
+            ).fetchall()
+        ]
+        assert cols == ["feature_idx", "chunk_index", "chunk_data"]
+        # Short sequences (≤64KB) should each be 1 chunk
+        assert conn.execute(f"SELECT count(*) FROM '{pq}'").fetchone()[0] == 5
+
+
+async def test_sequence_chunks_reassemble(manifest_file, fasta_path, feature_map, tmp_path):
+    """Chunked sequences must reassemble to the original sequence."""
+    from qiita_compute_orchestrator.backends.local import LocalBackend
+
+    out = await _run_load(LocalBackend(), manifest_file, fasta_path, feature_map, tmp_path)
+    seq1_fidx = TEST_FEATURE_MAP[TEST_HASHES["seq1"]]
+
+    with duckdb.connect(":memory:") as conn:
         row = conn.execute(
-            "SELECT feature_idx, sequence, sequence_length_bp"
-            f" FROM '{pq_path}' WHERE feature_idx = ?",
-            [seq1_fidx],
+            "SELECT string_agg(chunk_data, '' ORDER BY chunk_index) AS seq"
+            f" FROM '{out / 'reference_sequence_chunks.parquet'}'"
+            f" WHERE feature_idx = {seq1_fidx}"
         ).fetchone()
-        assert row[0] == seq1_fidx
-        assert row[1] == TEST_SEQUENCES["seq1"]
-        assert row[2] == len(TEST_SEQUENCES["seq1"])
+        assert row[0] == TEST_SEQUENCES["seq1"]
 
 
-# --- Taxonomy Parquet ---
+# --- Membership ---
 
 
-async def test_load_job_produces_taxonomy_parquet(
-    manifest_file, fasta_path, feature_map, taxonomy_file, tmp_path
-):
-    """Load job must produce reference_taxonomy.parquet when taxonomy_path provided."""
+async def test_membership_parquet(manifest_file, fasta_path, feature_map, tmp_path):
+    """reference_membership.parquet must have one row per feature."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
-    backend = LocalBackend()
-    output_dir = tmp_path / "output"
-    await backend.run_load_job(
-        manifest_path=manifest_file,
-        fasta_path=fasta_path,
-        feature_map=feature_map,
-        output_dir=output_dir,
-        reference_idx=REFERENCE_IDX,
-        taxonomy_path=taxonomy_file,
-    )
-    assert (output_dir / "reference_taxonomy.parquet").exists()
+    out = await _run_load(LocalBackend(), manifest_file, fasta_path, feature_map, tmp_path)
+    pq = out / "reference_membership.parquet"
+    assert pq.exists()
 
-
-async def test_load_job_taxonomy_schema(
-    manifest_file, fasta_path, feature_map, taxonomy_file, tmp_path
-):
-    """Taxonomy Parquet must have all expected columns including strain."""
-    from qiita_compute_orchestrator.backends.local import LocalBackend
-
-    backend = LocalBackend()
-    output_dir = tmp_path / "output"
-    await backend.run_load_job(
-        manifest_path=manifest_file,
-        fasta_path=fasta_path,
-        feature_map=feature_map,
-        output_dir=output_dir,
-        reference_idx=REFERENCE_IDX,
-        taxonomy_path=taxonomy_file,
-    )
-
-    pq_path = output_dir / "reference_taxonomy.parquet"
     with duckdb.connect(":memory:") as conn:
-        cols = conn.execute(
-            f"SELECT column_name FROM (DESCRIBE SELECT * FROM '{pq_path}')"
-        ).fetchall()
-        col_names = [c[0] for c in cols]
-        assert col_names == [
-            "reference_idx",
-            "feature_idx",
-            "domain",
-            "phylum",
-            "class",
-            "order",
-            "family",
-            "genus",
-            "species",
-            "strain",
-            "ncbi_taxon_id",
-        ]
-
-        distinct = conn.execute(f"SELECT DISTINCT reference_idx FROM '{pq_path}'").fetchall()
-        assert distinct == [(REFERENCE_IDX,)]
+        count = conn.execute(f"SELECT count(*) FROM '{pq}'").fetchone()[0]
+        assert count == 5
+        ref = conn.execute(f"SELECT DISTINCT reference_idx FROM '{pq}'").fetchone()[0]
+        assert ref == REFERENCE_IDX
 
 
-async def test_load_job_taxonomy_parses_ranks(
-    manifest_file, fasta_path, feature_map, taxonomy_file, tmp_path
-):
-    """Taxonomy Parquet must correctly parse GG2 rank-prefixed lineages."""
+# --- Taxonomy ---
+
+
+async def test_taxonomy_parquet(manifest_file, fasta_path, feature_map, taxonomy_file, tmp_path):
+    """Taxonomy Parquet must parse GG2 ranks correctly from Parquet input."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
-    backend = LocalBackend()
-    output_dir = tmp_path / "output"
-    await backend.run_load_job(
-        manifest_path=manifest_file,
-        fasta_path=fasta_path,
-        feature_map=feature_map,
-        output_dir=output_dir,
-        reference_idx=REFERENCE_IDX,
+    out = await _run_load(
+        LocalBackend(),
+        manifest_file,
+        fasta_path,
+        feature_map,
+        tmp_path,
         taxonomy_path=taxonomy_file,
     )
+    pq = out / "reference_taxonomy.parquet"
+    assert pq.exists()
 
-    pq_path = output_dir / "reference_taxonomy.parquet"
     with duckdb.connect(":memory:") as conn:
+        assert conn.execute(f"SELECT count(*) FROM '{pq}'").fetchone()[0] == 5
+
         seq1_fidx = TEST_FEATURE_MAP[TEST_HASHES["seq1"]]
         row = conn.execute(
-            f"SELECT domain, phylum, genus, species FROM '{pq_path}' WHERE feature_idx = ?",
+            f"SELECT domain, phylum FROM '{pq}' WHERE feature_idx = ?",
             [seq1_fidx],
         ).fetchone()
         assert row[0] == "Bacteria"
         assert row[1] == "Bacillota"
-        assert row[2] == "Lactobacillus"
-        assert row[3] == "Lactobacillus acidophilus"
 
-
-async def test_load_job_taxonomy_strain_parsed(
-    manifest_file, fasta_path, feature_map, taxonomy_file, tmp_path
-):
-    """Taxonomy Parquet must correctly parse t__ strain field when present."""
-    from qiita_compute_orchestrator.backends.local import LocalBackend
-
-    backend = LocalBackend()
-    output_dir = tmp_path / "output"
-    await backend.run_load_job(
-        manifest_path=manifest_file,
-        fasta_path=fasta_path,
-        feature_map=feature_map,
-        output_dir=output_dir,
-        reference_idx=REFERENCE_IDX,
-        taxonomy_path=taxonomy_file,
-    )
-
-    pq_path = output_dir / "reference_taxonomy.parquet"
-    with duckdb.connect(":memory:") as conn:
-        # seq4 has a t__ strain field
+        # seq4 has strain
         seq4_fidx = TEST_FEATURE_MAP[TEST_HASHES["seq4"]]
-        row = conn.execute(
-            f"SELECT species, strain FROM '{pq_path}' WHERE feature_idx = ?",
+        strain = conn.execute(
+            f"SELECT strain FROM '{pq}' WHERE feature_idx = ?",
             [seq4_fidx],
-        ).fetchone()
-        assert row[0] == "Methanobacterium formicicum"
-        assert row[1] == "Methanobacterium formicicum DSM 2320"
+        ).fetchone()[0]
+        assert strain == "Methanobacterium formicicum DSM 2320"
 
-        # seq1 has no strain — should be NULL
-        seq1_fidx = TEST_FEATURE_MAP[TEST_HASHES["seq1"]]
-        row = conn.execute(
-            f"SELECT strain FROM '{pq_path}' WHERE feature_idx = ?",
-            [seq1_fidx],
-        ).fetchone()
-        assert row[0] is None
-
-
-async def test_load_job_taxonomy_empty_ranks_are_null(
-    manifest_file, fasta_path, feature_map, taxonomy_file, tmp_path
-):
-    """Empty rank prefixes (e.g., 'f__') must become NULL in Parquet."""
-    from qiita_compute_orchestrator.backends.local import LocalBackend
-
-    backend = LocalBackend()
-    output_dir = tmp_path / "output"
-    await backend.run_load_job(
-        manifest_path=manifest_file,
-        fasta_path=fasta_path,
-        feature_map=feature_map,
-        output_dir=output_dir,
-        reference_idx=REFERENCE_IDX,
-        taxonomy_path=taxonomy_file,
-    )
-
-    pq_path = output_dir / "reference_taxonomy.parquet"
-    with duckdb.connect(":memory:") as conn:
+        # seq3 has empty ranks → NULL
         seq3_fidx = TEST_FEATURE_MAP[TEST_HASHES["seq3"]]
         row = conn.execute(
-            'SELECT domain, phylum, class, "order", family, genus, species'
-            f" FROM '{pq_path}' WHERE feature_idx = ?",
+            f"SELECT \"order\", family FROM '{pq}' WHERE feature_idx = ?",
             [seq3_fidx],
         ).fetchone()
-        assert row[0] == "Bacteria"
-        assert row[1] == "Bacillota"
-        assert row[2] == "Bacilli"
-        assert row[3] is None  # "o__" -> NULL
-        assert row[4] is None  # "f__" -> NULL
-        assert row[5] is None  # "g__" -> NULL
-        assert row[6] is None  # "s__" -> NULL
+        assert row[0] is None
+        assert row[1] is None
 
 
-async def test_load_job_taxonomy_partial_coverage(manifest_file, fasta_path, feature_map, tmp_path):
-    """Taxonomy covering a subset of sequences is allowed (not all need taxonomy)."""
-    from qiita_compute_orchestrator.backends.local import LocalBackend
-
-    # Taxonomy for only 2 of 5 sequences
-    tax_path = tmp_path / "partial_taxonomy.tsv"
-    tax_path.write_text(
-        "Feature ID\tTaxon\n"
-        "seq1\td__Bacteria; p__Bacillota; c__; o__; f__; g__; s__\n"
-        "seq2\td__Bacteria; p__Pseudomonadota; c__; o__; f__; g__; s__\n"
-    )
-
-    backend = LocalBackend()
-    output_dir = tmp_path / "output"
-    await backend.run_load_job(
-        manifest_path=manifest_file,
-        fasta_path=fasta_path,
-        feature_map=feature_map,
-        output_dir=output_dir,
-        reference_idx=REFERENCE_IDX,
-        taxonomy_path=tax_path,
-    )
-
-    pq_path = output_dir / "reference_taxonomy.parquet"
-    with duckdb.connect(":memory:") as conn:
-        count = conn.execute(f"SELECT count(*) FROM '{pq_path}'").fetchone()[0]
-        assert count == 2
+# --- Phylogeny ---
 
 
-# --- Phylogeny Parquet ---
-
-
-async def test_load_job_produces_phylogeny_parquet(
+async def test_phylogeny_has_feature_idx_on_tips(
     manifest_file, fasta_path, feature_map, tree_file, tmp_path
 ):
-    """Load job must produce reference_phylogeny.parquet when tree_path provided."""
+    """Phylogeny tips must have feature_idx populated, internal nodes NULL."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
-    backend = LocalBackend()
-    output_dir = tmp_path / "output"
-    await backend.run_load_job(
-        manifest_path=manifest_file,
-        fasta_path=fasta_path,
-        feature_map=feature_map,
-        output_dir=output_dir,
-        reference_idx=REFERENCE_IDX,
+    out = await _run_load(
+        LocalBackend(),
+        manifest_file,
+        fasta_path,
+        feature_map,
+        tmp_path,
         tree_path=tree_file,
     )
-    assert (output_dir / "reference_phylogeny.parquet").exists()
+    pq = out / "reference_phylogeny.parquet"
+    assert pq.exists()
 
-
-async def test_load_job_phylogeny_has_reference_idx_and_tips(
-    manifest_file, fasta_path, feature_map, tree_file, tmp_path
-):
-    """Phylogeny Parquet must include reference_idx and mark tips correctly."""
-    from qiita_compute_orchestrator.backends.local import LocalBackend
-
-    backend = LocalBackend()
-    output_dir = tmp_path / "output"
-    await backend.run_load_job(
-        manifest_path=manifest_file,
-        fasta_path=fasta_path,
-        feature_map=feature_map,
-        output_dir=output_dir,
-        reference_idx=REFERENCE_IDX,
-        tree_path=tree_file,
-    )
-
-    pq_path = output_dir / "reference_phylogeny.parquet"
     with duckdb.connect(":memory:") as conn:
-        distinct = conn.execute(f"SELECT DISTINCT reference_idx FROM '{pq_path}'").fetchall()
-        assert distinct == [(REFERENCE_IDX,)]
-
-        tip_count = conn.execute(
-            f"SELECT count(*) FROM '{pq_path}' WHERE is_tip = true"
+        # All 5 tips should have non-NULL feature_idx
+        tips_with_fidx = conn.execute(
+            f"SELECT count(*) FROM '{pq}' WHERE is_tip AND feature_idx IS NOT NULL"
         ).fetchone()[0]
-        assert tip_count == 5
+        assert tips_with_fidx == 5
 
-        tip_names = sorted(
-            row[0]
-            for row in conn.execute(f"SELECT name FROM '{pq_path}' WHERE is_tip = true").fetchall()
+        # Internal nodes should have NULL feature_idx
+        internal_with_fidx = conn.execute(
+            f"SELECT count(*) FROM '{pq}' WHERE NOT is_tip AND feature_idx IS NOT NULL"
+        ).fetchone()[0]
+        assert internal_with_fidx == 0
+
+        # feature_idx values must match what we minted
+        tip_fidxs = set(
+            r[0] for r in conn.execute(f"SELECT feature_idx FROM '{pq}' WHERE is_tip").fetchall()
         )
-        assert tip_names == ["seq1", "seq2", "seq3", "seq4", "seq5"]
+        assert tip_fidxs == set(TEST_FEATURE_MAP.values())
 
 
-async def test_load_job_phylogeny_schema(
-    manifest_file, fasta_path, feature_map, tree_file, tmp_path
-):
-    """Phylogeny Parquet must have the correct column order."""
+async def test_phylogeny_allows_unmatched_tips(manifest_file, fasta_path, feature_map, tmp_path):
+    """Tips without matching sequences get NULL feature_idx (no error)."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
+    tree_path = tmp_path / "tree_extra.nwk"
+    tree_path.write_text("((seq1:0.1,unknown_tip:0.2):0.3,seq2:0.4);")
+
+    # Manifest with only seq1 and seq2
+    entries = [
+        {"read_id": n, "sequence_hash": str(TEST_HASHES[n]), "length": len(TEST_SEQUENCES[n])}
+        for n in ["seq1", "seq2"]
+    ]
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps({"reference_idx": REFERENCE_IDX, "entries": entries}))
+    partial_map = {TEST_HASHES[n]: 100 + i for i, n in enumerate(["seq1", "seq2"])}
+    fasta = tmp_path / "partial.fasta"
+    fasta.write_text(">seq1\nATCGATCGATCG\n>seq2\nGCTAGCTAGCTA\n")
+
+    out = tmp_path / "output"
     backend = LocalBackend()
-    output_dir = tmp_path / "output"
     await backend.run_load_job(
-        manifest_path=manifest_file,
-        fasta_path=fasta_path,
-        feature_map=feature_map,
-        output_dir=output_dir,
+        manifest_path=manifest_path,
+        fasta_path=fasta,
+        feature_map=partial_map,
+        output_dir=out,
         reference_idx=REFERENCE_IDX,
-        tree_path=tree_file,
+        tree_path=tree_path,
     )
 
-    pq_path = output_dir / "reference_phylogeny.parquet"
+    pq = out / "reference_phylogeny.parquet"
     with duckdb.connect(":memory:") as conn:
-        cols = conn.execute(
-            f"SELECT column_name FROM (DESCRIBE SELECT * FROM '{pq_path}')"
-        ).fetchall()
-        col_names = [c[0] for c in cols]
-        assert col_names == [
-            "reference_idx",
-            "node_index",
-            "name",
-            "branch_length",
-            "edge_id",
-            "parent_index",
-            "is_tip",
-        ]
-
-
-# --- Tip features ---
-
-
-async def test_load_job_produces_tip_features(
-    manifest_file, fasta_path, feature_map, tree_file, tmp_path
-):
-    """Load job must produce tip_features.json mapping tips to feature_idx."""
-    from qiita_compute_orchestrator.backends.local import LocalBackend
-
-    backend = LocalBackend()
-    output_dir = tmp_path / "output"
-    await backend.run_load_job(
-        manifest_path=manifest_file,
-        fasta_path=fasta_path,
-        feature_map=feature_map,
-        output_dir=output_dir,
-        reference_idx=REFERENCE_IDX,
-        tree_path=tree_file,
-    )
-
-    tip_path = output_dir / "tip_features.json"
-    assert tip_path.exists()
-    tips = json.loads(tip_path.read_text())
-    assert len(tips) == 5
-
-    for entry in tips:
-        assert entry["reference_idx"] == REFERENCE_IDX
-        assert isinstance(entry["node_index"], int)
-        assert isinstance(entry["feature_idx"], int)
-        assert entry["feature_idx"] in TEST_FEATURE_MAP.values()
+        # 3 tips total (seq1, unknown_tip, seq2), 2 with feature_idx
+        tips = conn.execute(f"SELECT count(*) FROM '{pq}' WHERE is_tip").fetchone()[0]
+        assert tips == 3
+        matched = conn.execute(
+            f"SELECT count(*) FROM '{pq}' WHERE is_tip AND feature_idx IS NOT NULL"
+        ).fetchone()[0]
+        assert matched == 2
 
 
 # --- Optional files omitted ---
 
 
-async def test_load_job_no_taxonomy_no_tree(manifest_file, fasta_path, feature_map, tmp_path):
-    """Without optional files, only sequences Parquet is produced."""
+async def test_no_optional_files(manifest_file, fasta_path, feature_map, tmp_path):
+    """Without optional files, only sequences + membership are produced."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
-    backend = LocalBackend()
-    output_dir = tmp_path / "output"
-    await backend.run_load_job(
-        manifest_path=manifest_file,
-        fasta_path=fasta_path,
-        feature_map=feature_map,
-        output_dir=output_dir,
-        reference_idx=REFERENCE_IDX,
-    )
-    assert (output_dir / "reference_sequences.parquet").exists()
-    assert (output_dir / "reference_membership.parquet").exists()
-    assert not (output_dir / "reference_taxonomy.parquet").exists()
-    assert not (output_dir / "reference_phylogeny.parquet").exists()
-    assert not (output_dir / "tip_features.json").exists()
+    out = await _run_load(LocalBackend(), manifest_file, fasta_path, feature_map, tmp_path)
+    assert (out / "reference_sequences.parquet").exists()
+    assert (out / "reference_sequence_chunks.parquet").exists()
+    assert (out / "reference_membership.parquet").exists()
+    assert not (out / "reference_taxonomy.parquet").exists()
+    assert not (out / "reference_phylogeny.parquet").exists()
+    assert not (out / "reference_placements.parquet").exists()
 
 
 # --- Error cases ---
 
 
-async def test_load_job_rejects_missing_manifest(fasta_path, feature_map, tmp_path):
-    """Load job must raise FileNotFoundError on missing manifest."""
+async def test_rejects_missing_manifest(fasta_path, feature_map, tmp_path):
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
-    backend = LocalBackend()
     with pytest.raises(FileNotFoundError):
-        await backend.run_load_job(
-            manifest_path=tmp_path / "nonexistent.json",
+        await LocalBackend().run_load_job(
+            manifest_path=tmp_path / "nope.json",
             fasta_path=fasta_path,
             feature_map=feature_map,
-            output_dir=tmp_path / "output",
+            output_dir=tmp_path / "out",
             reference_idx=REFERENCE_IDX,
         )
 
 
-async def test_load_job_rejects_missing_fasta(manifest_file, feature_map, tmp_path):
-    """Load job must raise FileNotFoundError on missing FASTA."""
+async def test_rejects_unmapped_hash(manifest_file, fasta_path, tmp_path):
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
-    backend = LocalBackend()
-    with pytest.raises(FileNotFoundError):
-        await backend.run_load_job(
-            manifest_path=manifest_file,
-            fasta_path=tmp_path / "nonexistent.fasta",
-            feature_map=feature_map,
-            output_dir=tmp_path / "output",
-            reference_idx=REFERENCE_IDX,
-        )
-
-
-async def test_load_job_rejects_missing_jplace(manifest_file, fasta_path, feature_map, tmp_path):
-    """Load job must raise FileNotFoundError on nonexistent jplace_path."""
-    from qiita_compute_orchestrator.backends.local import LocalBackend
-
-    backend = LocalBackend()
-    with pytest.raises(FileNotFoundError):
-        await backend.run_load_job(
-            manifest_path=manifest_file,
-            fasta_path=fasta_path,
-            feature_map=feature_map,
-            output_dir=tmp_path / "output",
-            reference_idx=REFERENCE_IDX,
-            jplace_path=tmp_path / "nonexistent.jplace",
-        )
-
-
-async def test_load_job_rejects_unmapped_hash(manifest_file, fasta_path, tmp_path):
-    """Load job must raise ValueError when feature_map is missing hashes."""
-    from qiita_compute_orchestrator.backends.local import LocalBackend
-
-    backend = LocalBackend()
     with pytest.raises(ValueError, match="unmapped"):
-        await backend.run_load_job(
+        await LocalBackend().run_load_job(
             manifest_path=manifest_file,
             fasta_path=fasta_path,
             feature_map={},
-            output_dir=tmp_path / "output",
+            output_dir=tmp_path / "out",
             reference_idx=REFERENCE_IDX,
         )
-
-
-async def test_load_job_rejects_unmatched_tips_without_jplace(
-    manifest_file, fasta_path, feature_map, tmp_path
-):
-    """Tree tips not in manifest must raise ValueError when jplace_path is None."""
-    from qiita_compute_orchestrator.backends.local import LocalBackend
-
-    tree_path = tmp_path / "bad_tree.nwk"
-    tree_path.write_text("((seq1:0.1,unknown_tip:0.2):0.3,seq2:0.4);")
-
-    entries = [
-        {
-            "read_id": name,
-            "sequence_hash": str(TEST_HASHES[name]),
-            "length": len(TEST_SEQUENCES[name]),
-        }
-        for name in ["seq1", "seq2"]
-    ]
-    manifest = {"reference_idx": REFERENCE_IDX, "entries": entries}
-    manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest))
-
-    partial_map = {TEST_HASHES[name]: 100 + i for i, name in enumerate(["seq1", "seq2"])}
-
-    fasta = tmp_path / "partial.fasta"
-    fasta.write_text(">seq1\nATCGATCGATCG\n>seq2\nGCTAGCTAGCTA\n")
-
-    backend = LocalBackend()
-    with pytest.raises(ValueError, match="no matching sequence"):
-        await backend.run_load_job(
-            manifest_path=manifest_path,
-            fasta_path=fasta,
-            feature_map=partial_map,
-            output_dir=tmp_path / "output",
-            reference_idx=REFERENCE_IDX,
-            tree_path=tree_path,
-        )
-
-
-async def test_load_job_allows_unmatched_tips_with_jplace(
-    manifest_file, fasta_path, feature_map, tmp_path
-):
-    """Unmatched tips are allowed when jplace_path signals placements exist."""
-    from qiita_compute_orchestrator.backends.local import LocalBackend
-
-    tree_path = tmp_path / "tree_with_placed.nwk"
-    tree_path.write_text("((seq1:0.1,placed_seq:0.2):0.3,seq2:0.4);")
-
-    entries = [
-        {
-            "read_id": name,
-            "sequence_hash": str(TEST_HASHES[name]),
-            "length": len(TEST_SEQUENCES[name]),
-        }
-        for name in ["seq1", "seq2"]
-    ]
-    manifest = {"reference_idx": REFERENCE_IDX, "entries": entries}
-    manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest))
-
-    partial_map = {TEST_HASHES[name]: 100 + i for i, name in enumerate(["seq1", "seq2"])}
-
-    fasta = tmp_path / "partial.fasta"
-    fasta.write_text(">seq1\nATCGATCGATCG\n>seq2\nGCTAGCTAGCTA\n")
-
-    jplace = tmp_path / "placements.jplace"
-    jplace.write_text("{}")
-
-    backend = LocalBackend()
-    output_dir = tmp_path / "output"
-    await backend.run_load_job(
-        manifest_path=manifest_path,
-        fasta_path=fasta,
-        feature_map=partial_map,
-        output_dir=output_dir,
-        reference_idx=REFERENCE_IDX,
-        tree_path=tree_path,
-        jplace_path=jplace,
-    )
-
-    tips = json.loads((output_dir / "tip_features.json").read_text())
-    assert len(tips) == 2
-    tip_fidxs = {t["feature_idx"] for t in tips}
-    assert tip_fidxs == {100, 101}
-
-
-async def test_load_job_rejects_taxonomy_with_unknown_sequences(
-    manifest_file, fasta_path, feature_map, tmp_path
-):
-    """Taxonomy entries for sequences not in manifest must raise ValueError."""
-    from qiita_compute_orchestrator.backends.local import LocalBackend
-
-    tax_path = tmp_path / "bad_taxonomy.tsv"
-    tax_path.write_text(
-        "Feature ID\tTaxon\n"
-        "seq1\td__Bacteria; p__; c__; o__; f__; g__; s__\n"
-        "not_in_manifest\td__Bacteria; p__; c__; o__; f__; g__; s__\n"
-    )
-
-    backend = LocalBackend()
-    with pytest.raises(ValueError, match="not in manifest"):
-        await backend.run_load_job(
-            manifest_path=manifest_file,
-            fasta_path=fasta_path,
-            feature_map=feature_map,
-            output_dir=tmp_path / "output",
-            reference_idx=REFERENCE_IDX,
-            taxonomy_path=tax_path,
-        )
-
-
-async def test_load_job_rejects_taxonomy_bad_header(
-    manifest_file, fasta_path, feature_map, tmp_path
-):
-    """Taxonomy file with wrong header must raise ValueError."""
-    from qiita_compute_orchestrator.backends.local import LocalBackend
-
-    tax_path = tmp_path / "bad_header.tsv"
-    tax_path.write_text("wrong_header\ttaxonomy\nseq1\td__Bacteria; p__; c__; o__; f__; g__; s__\n")
-
-    backend = LocalBackend()
-    with pytest.raises(ValueError, match="Unexpected taxonomy header"):
-        await backend.run_load_job(
-            manifest_path=manifest_file,
-            fasta_path=fasta_path,
-            feature_map=feature_map,
-            output_dir=tmp_path / "output",
-            reference_idx=REFERENCE_IDX,
-            taxonomy_path=tax_path,
-        )
-
-
-# --- Taxonomy parser unit tests ---
-
-
-def test_parse_taxonomy_rejects_wrong_prefix():
-    """Taxonomy parser must reject misplaced rank prefixes."""
-    from qiita_compute_orchestrator.backends.local import _parse_taxonomy
-
-    with pytest.raises(ValueError, match="expected prefix"):
-        _parse_taxonomy("p__Bacillota; d__Bacteria; c__; o__; f__; g__; s__")
-
-
-def test_parse_taxonomy_rejects_blank_field():
-    """Taxonomy parser must reject blank fields (no prefix)."""
-    from qiita_compute_orchestrator.backends.local import _parse_taxonomy
-
-    # Middle blank field (tab artifact or malformed data)
-    with pytest.raises(ValueError, match="blank"):
-        _parse_taxonomy("d__Bacteria; ; c__Bacilli; o__; f__; g__; s__")
-
-
-def test_parse_taxonomy_rejects_too_many_fields():
-    """Taxonomy parser must reject >8 semicolon-separated fields."""
-    from qiita_compute_orchestrator.backends.local import _parse_taxonomy
-
-    with pytest.raises(ValueError, match="expected at most 8"):
-        _parse_taxonomy("d__X; p__X; c__X; o__X; f__X; g__X; s__X; t__X; extra")
-
-
-def test_parse_taxonomy_with_strain():
-    """Taxonomy parser must accept t__ strain as the 8th field."""
-    from qiita_compute_orchestrator.backends.local import _parse_taxonomy
-
-    result = _parse_taxonomy("d__Bacteria; p__X; c__X; o__X; f__X; g__X; s__X; t__strain1")
-    assert len(result) == 8
-    assert result[0] == "Bacteria"
-    assert result[7] == "strain1"
-
-
-def test_parse_taxonomy_7_fields_strain_is_none():
-    """With only 7 fields (no t__), strain must be None."""
-    from qiita_compute_orchestrator.backends.local import _parse_taxonomy
-
-    result = _parse_taxonomy("d__Bacteria; p__X; c__X; o__X; f__X; g__X; s__X")
-    assert len(result) == 8
-    assert result[7] is None

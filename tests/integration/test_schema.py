@@ -1,4 +1,4 @@
-"""Tests for reference database schema — six tables with constraints."""
+"""Tests for reference database schema — five tables with constraints."""
 
 import asyncpg
 import pytest
@@ -9,12 +9,11 @@ EXPECTED_TABLES = [
     "features",
     "reference_membership",
     "feature_genome",
-    "phylogeny_tip_feature",
 ]
 
 
 async def test_all_reference_tables_exist(postgres_pool):
-    """All six reference tables must exist in the qiita schema after migrations."""
+    """All five reference tables must exist in the qiita schema after migrations."""
     for table in EXPECTED_TABLES:
         exists = await postgres_pool.fetchval(
             "SELECT EXISTS("
@@ -287,101 +286,6 @@ async def test_feature_genome_unique_feature(postgres_pool):
                 "INSERT INTO qiita.feature_genome (feature_idx, genome_idx) VALUES ($1, $2)",
                 feat_idx,
                 g2,
-            )
-        await tr.rollback()
-    finally:
-        await postgres_pool.release(conn)
-
-
-async def test_phylogeny_tip_feature_fk_on_reference(postgres_pool):
-    """phylogeny_tip_feature must reject non-existent reference_idx."""
-    conn = await postgres_pool.acquire()
-    try:
-        tr = conn.transaction()
-        await tr.start()
-        feat_idx = await conn.fetchval(
-            "INSERT INTO qiita.features (sequence_hash)"
-            " VALUES ($1::uuid) RETURNING feature_idx",
-            "e0000000-0000-0000-0000-000000000001",
-        )
-        with pytest.raises(asyncpg.ForeignKeyViolationError):
-            await conn.execute(
-                "INSERT INTO qiita.phylogeny_tip_feature (reference_idx, node_index, feature_idx)"
-                " VALUES ($1, $2, $3)",
-                999999,
-                0,
-                feat_idx,
-            )
-        await tr.rollback()
-    finally:
-        await postgres_pool.release(conn)
-
-
-async def test_phylogeny_tip_feature_fk_on_feature(postgres_pool):
-    """phylogeny_tip_feature must reject non-existent feature_idx."""
-    conn = await postgres_pool.acquire()
-    try:
-        tr = conn.transaction()
-        await tr.start()
-        ref_idx = await conn.fetchval(
-            "INSERT INTO qiita.references (name, version, kind, created_by)"
-            " VALUES ($1, $2, $3, $4) RETURNING reference_idx",
-            "phylo-fk-test",
-            "1.0",
-            "sequence_reference",
-            "a0000000-0000-0000-0000-000000000001",
-        )
-        with pytest.raises(asyncpg.ForeignKeyViolationError):
-            await conn.execute(
-                "INSERT INTO qiita.phylogeny_tip_feature (reference_idx, node_index, feature_idx)"
-                " VALUES ($1, $2, $3)",
-                ref_idx,
-                0,
-                999999,
-            )
-        await tr.rollback()
-    finally:
-        await postgres_pool.release(conn)
-
-
-async def test_phylogeny_tip_one_feature_per_node(postgres_pool):
-    """A (reference_idx, node_index) pair maps to exactly one feature (PK enforced)."""
-    conn = await postgres_pool.acquire()
-    try:
-        tr = conn.transaction()
-        await tr.start()
-        ref_idx = await conn.fetchval(
-            "INSERT INTO qiita.references (name, version, kind, created_by)"
-            " VALUES ($1, $2, $3, $4) RETURNING reference_idx",
-            "phylo-pk-test",
-            "1.0",
-            "sequence_reference",
-            "a0000000-0000-0000-0000-000000000001",
-        )
-        f1 = await conn.fetchval(
-            "INSERT INTO qiita.features (sequence_hash)"
-            " VALUES ($1::uuid) RETURNING feature_idx",
-            "f0000000-0000-0000-0000-000000000001",
-        )
-        f2 = await conn.fetchval(
-            "INSERT INTO qiita.features (sequence_hash)"
-            " VALUES ($1::uuid) RETURNING feature_idx",
-            "f0000000-0000-0000-0000-000000000002",
-        )
-        await conn.execute(
-            "INSERT INTO qiita.phylogeny_tip_feature (reference_idx, node_index, feature_idx)"
-            " VALUES ($1, $2, $3)",
-            ref_idx,
-            42,
-            f1,
-        )
-        with pytest.raises(asyncpg.UniqueViolationError):
-            await conn.execute(
-                "INSERT INTO qiita.phylogeny_tip_feature (reference_idx, node_index, feature_idx)"
-                " VALUES ($1, $2, $3)",
-                ref_idx,
-                42,
-                f2,
             )
         await tr.rollback()
     finally:
