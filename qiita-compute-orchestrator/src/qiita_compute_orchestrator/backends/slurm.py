@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from ..backend import ComputeBackend, FeatureMap
+from ..backend import ComputeBackend
 
 
 class SlurmBackend(ComputeBackend):
@@ -15,7 +15,7 @@ class SlurmBackend(ComputeBackend):
         self,
         manifest_path: Path,
         fasta_path: Path,
-        feature_map: FeatureMap,
+        feature_map_path: Path,
         output_dir: Path,
         reference_idx: int,
         *,

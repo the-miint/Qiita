@@ -7,7 +7,7 @@ from pathlib import Path
 
 import duckdb
 
-from ..backend import ComputeBackend, FeatureMap
+from ..backend import ComputeBackend
 
 # miint is installed once per process to avoid a network call on every hash job.
 _miint_install_lock = asyncio.Lock()
@@ -101,7 +101,7 @@ class LocalBackend(ComputeBackend):
         self,
         manifest_path: Path,
         fasta_path: Path,
-        feature_map: FeatureMap,
+        feature_map_path: Path,
         output_dir: Path,
         reference_idx: int,
         *,
@@ -113,37 +113,20 @@ class LocalBackend(ComputeBackend):
             raise FileNotFoundError(f"Manifest not found: {manifest_path}")
         if not fasta_path.exists():
             raise FileNotFoundError(f"FASTA file not found: {fasta_path}")
+        if not feature_map_path.exists():
+            raise FileNotFoundError(f"Feature map not found: {feature_map_path}")
         if jplace_path is not None and not jplace_path.exists():
             raise FileNotFoundError(f"jplace file not found: {jplace_path}")
 
         output_dir.mkdir(parents=True, exist_ok=True)
         await _ensure_miint_installed()
 
-        # Build read_id → (feature_idx, sequence_hash) from manifest + feature_map.
-        manifest = json.loads(manifest_path.read_text())
-        unmapped: list[str] = []
-        read_id_map: dict[str, tuple[int, str]] = {}
-        for entry in manifest["entries"]:
-            hash_uuid = uuid.UUID(entry["sequence_hash"])
-            if hash_uuid not in feature_map:
-                unmapped.append(str(hash_uuid))
-            else:
-                read_id_map[entry["read_id"]] = (
-                    feature_map[hash_uuid],
-                    entry["sequence_hash"],
-                )
-        if unmapped:
-            raise ValueError(
-                f"{len(unmapped)} unmapped sequence hash(es) in feature_map: {unmapped[:10]}"
-            )
-
         with duckdb.connect(":memory:") as conn:
             conn.execute("LOAD miint;")
-            # Required for COPY ... ORDER BY to honour ROW_GROUP_SIZE.
             conn.execute("SET preserve_insertion_order=false;")
 
-            _load_id_map(conn, read_id_map)
-            _write_sequence_metadata(conn, fasta_path, output_dir)
+            _build_id_map(conn, manifest_path, feature_map_path)
+            _write_sequence_metadata(conn, output_dir)
             _write_sequence_chunks(conn, fasta_path, output_dir)
             _write_membership(conn, output_dir, reference_idx)
 
@@ -173,56 +156,84 @@ def _validate_parquet_path(path: Path) -> str:
     return path_str
 
 
-def _load_id_map(conn: duckdb.DuckDBPyConnection, read_id_map: dict[str, tuple[int, str]]) -> None:
-    """Load the read_id → (feature_idx, sequence_hash) mapping into a temp table.
-
-    Shared across all write functions — created once, dropped at the end.
-    """
-    conn.execute(
-        "CREATE TEMP TABLE id_map (  read_id VARCHAR, feature_idx BIGINT, sequence_hash VARCHAR)"
-    )
-    conn.executemany(
-        "INSERT INTO id_map VALUES (?, ?, ?)",
-        [(rid, fidx, shash) for rid, (fidx, shash) in read_id_map.items()],
-    )
-
-
-def _write_sequence_metadata(
-    conn: duckdb.DuckDBPyConnection, fasta_path: Path, output_dir: Path
+def _build_id_map(
+    conn: duckdb.DuckDBPyConnection, manifest_path: Path, feature_map_path: Path
 ) -> None:
-    """Write reference_sequences.parquet — metadata only (hash + length)."""
+    """Build the id_map temp table by joining manifest + feature_map in DuckDB.
+
+    Both files are read directly by DuckDB — no Python-side parsing.
+    - manifest_path: JSON with {entries: [{read_id, sequence_hash, length}, ...]}
+    - feature_map_path: NDJSON with {sequence_hash, feature_idx} per line
+
+    Raises ValueError if any manifest entry has no matching feature_idx.
+    """
+    # Read manifest entries count before the join so we can detect unmapped
+    # hashes without re-reading the manifest.
+    manifest_count = conn.execute(
+        "SELECT count(*) FROM (SELECT unnest(entries) FROM read_json(?))",
+        [str(manifest_path)],
+    ).fetchone()[0]
+
+    conn.execute(
+        "CREATE TEMP TABLE id_map AS "
+        "SELECT e.read_id, f.feature_idx,"
+        "  CAST(e.sequence_hash AS VARCHAR) AS sequence_hash,"
+        "  e.length AS sequence_length_bp "
+        "FROM ("
+        "  SELECT unnest(entries) AS e FROM read_json(?)"
+        ") "
+        "JOIN read_json(?, format='newline_delimited',"
+        "  columns={'sequence_hash': 'VARCHAR', 'feature_idx': 'BIGINT'}) f "
+        "  ON e.sequence_hash = f.sequence_hash",
+        [str(manifest_path), str(feature_map_path)],
+    )
+
+    id_map_count = conn.execute("SELECT count(*) FROM id_map").fetchone()[0]
+    if id_map_count != manifest_count:
+        n_unmapped = manifest_count - id_map_count
+        # Get specific hashes for the error message via ANTI JOIN.
+        unmapped = conn.execute(
+            "SELECT e.sequence_hash FROM ("
+            "  SELECT unnest(entries) AS e FROM read_json(?)"
+            ") "
+            "ANTI JOIN id_map m ON e.sequence_hash = m.sequence_hash",
+            [str(manifest_path)],
+        ).fetchall()
+        hashes = [str(r[0]) for r in unmapped[:10]]
+        raise ValueError(f"{n_unmapped} unmapped sequence hash(es) in feature_map: {hashes}")
+
+
+def _write_sequence_metadata(conn: duckdb.DuckDBPyConnection, output_dir: Path) -> None:
+    """Write reference_sequences.parquet — metadata from id_map (no FASTA read)."""
     out = _validate_parquet_path(output_dir / "reference_sequences.parquet")
     conn.execute(
         "COPY ("
-        "  SELECT m.feature_idx,"
-        "    CAST(m.sequence_hash AS UUID) AS sequence_hash,"
-        "    CAST(length(f.sequence1) AS BIGINT) AS sequence_length_bp"
-        "  FROM read_fastx(?) f"
-        "  JOIN id_map m ON f.read_id = m.read_id"
-        "  ORDER BY m.feature_idx"
-        f") TO '{out}' ({_PARQUET_OPTS})",
-        [str(fasta_path)],
+        "  SELECT feature_idx,"
+        "    CAST(sequence_hash AS UUID) AS sequence_hash,"
+        "    CAST(sequence_length_bp AS BIGINT) AS sequence_length_bp"
+        "  FROM id_map"
+        "  ORDER BY feature_idx"
+        f") TO '{out}' ({_PARQUET_OPTS})"
     )
 
 
 def _write_sequence_chunks(
     conn: duckdb.DuckDBPyConnection, fasta_path: Path, output_dir: Path
 ) -> None:
-    """Write reference_sequence_chunks.parquet — sequences chunked at 64 KB."""
+    """Write reference_sequence_chunks.parquet — sequences chunked at 64 KB.
+
+    No ORDER BY — lets DuckDB stream and flush row groups incrementally
+    to avoid OOM on large references (e.g., 11 GB GG2 backbone with genomes).
+    """
     out = _validate_parquet_path(output_dir / "reference_sequence_chunks.parquet")
     conn.execute(
         "COPY ("
-        "  WITH chunked AS ("
-        "    SELECT m.feature_idx, f.sequence1"
-        "    FROM read_fastx(?) f"
-        "    JOIN id_map m ON f.read_id = m.read_id"
-        "  )"
-        "  SELECT feature_idx,"
+        "  SELECT m.feature_idx,"
         f"    CAST((idx - 1) / {_CHUNK_SIZE} AS INTEGER) AS chunk_index,"
-        f"    substring(sequence1, CAST(idx AS BIGINT), {_CHUNK_SIZE}) AS chunk_data"
-        "  FROM chunked,"
-        f"    range(1, CAST(length(sequence1) + 1 AS BIGINT), {_CHUNK_SIZE}) AS t(idx)"
-        "  ORDER BY feature_idx, chunk_index"
+        f"    substring(f.sequence1, CAST(idx AS BIGINT), {_CHUNK_SIZE}) AS chunk_data"
+        "  FROM read_fastx(?) f"
+        "  JOIN id_map m ON f.read_id = m.read_id,"
+        f"    range(1, CAST(length(f.sequence1) + 1 AS BIGINT), {_CHUNK_SIZE}) AS t(idx)"
         f") TO '{out}' ({_PARQUET_OPTS})",
         [str(fasta_path)],
     )
@@ -231,7 +242,7 @@ def _write_sequence_chunks(
 def _write_membership(
     conn: duckdb.DuckDBPyConnection, output_dir: Path, reference_idx: int
 ) -> None:
-    """Write reference_membership.parquet from the id_map."""
+    """Write reference_membership.parquet from id_map."""
     out = _validate_parquet_path(output_dir / "reference_membership.parquet")
     conn.execute(
         "COPY ("

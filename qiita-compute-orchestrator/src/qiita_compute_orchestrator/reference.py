@@ -1,11 +1,12 @@
 """Reference load pipeline — coordinates load job, registration, and status updates."""
 
+import json
 from pathlib import Path
 
 from qiita_common.client import ControlPlaneClient
 from qiita_common.models import ReferenceStatus
 
-from .backend import ComputeBackend, FeatureMap
+from .backend import ComputeBackend
 
 # Maps Parquet filenames produced by run_load_job to DuckLake table names.
 _REFERENCE_TABLE_MAP = {
@@ -18,6 +19,17 @@ _REFERENCE_TABLE_MAP = {
 }
 
 
+def write_feature_map_ndjson(mapping: dict[str, int], path: Path) -> None:
+    """Write the mint response mapping as NDJSON for DuckDB consumption.
+
+    Each line is {"sequence_hash": "uuid-str", "feature_idx": N}.
+    """
+    with open(path, "w") as f:
+        for seq_hash, feature_idx in mapping.items():
+            f.write(json.dumps({"sequence_hash": seq_hash, "feature_idx": feature_idx}))
+            f.write("\n")
+
+
 async def run_reference_load_pipeline(
     *,
     backend: ComputeBackend,
@@ -25,7 +37,7 @@ async def run_reference_load_pipeline(
     reference_idx: int,
     manifest_path: Path,
     fasta_path: Path,
-    feature_map: FeatureMap,
+    feature_map_path: Path,
     staging_dir: Path,
     taxonomy_path: Path | None = None,
     tree_path: Path | None = None,
@@ -46,7 +58,7 @@ async def run_reference_load_pipeline(
     await backend.run_load_job(
         manifest_path=manifest_path,
         fasta_path=fasta_path,
-        feature_map=feature_map,
+        feature_map_path=feature_map_path,
         output_dir=staging_dir,
         reference_idx=reference_idx,
         taxonomy_path=taxonomy_path,
@@ -55,8 +67,6 @@ async def run_reference_load_pipeline(
     )
 
     # 3. Register files via control plane → data plane DoAction.
-    # The data plane moves files to permanent storage and registers
-    # them in DuckLake — the orchestrator never touches DuckLake directly.
     await client.register_files(
         reference_idx=reference_idx,
         staging_dir=str(staging_dir),

@@ -45,8 +45,13 @@ def manifest_file(tmp_path):
 
 
 @pytest.fixture
-def feature_map():
-    return dict(TEST_FEATURE_MAP)
+def feature_map_file(tmp_path):
+    """Feature map as NDJSON (one {sequence_hash, feature_idx} per line)."""
+    path = tmp_path / "feature_map.ndjson"
+    with open(path, "w") as f:
+        for hash_val, fidx in TEST_FEATURE_MAP.items():
+            f.write(json.dumps({"sequence_hash": str(hash_val), "feature_idx": fidx}) + "\n")
+    return path
 
 
 @pytest.fixture
@@ -93,13 +98,13 @@ def tree_file(tmp_path):
     return path
 
 
-async def _run_load(backend, manifest_file, fasta_path, feature_map, tmp_path, **kwargs):
+async def _run_load(backend, manifest_file, fasta_path, feature_map_file, tmp_path, **kwargs):
     """Helper to run load job with common args."""
     output_dir = tmp_path / "output"
     await backend.run_load_job(
         manifest_path=manifest_file,
         fasta_path=fasta_path,
-        feature_map=feature_map,
+        feature_map_path=feature_map_file,
         output_dir=output_dir,
         reference_idx=REFERENCE_IDX,
         **kwargs,
@@ -110,11 +115,11 @@ async def _run_load(backend, manifest_file, fasta_path, feature_map, tmp_path, *
 # --- Sequence metadata ---
 
 
-async def test_sequence_metadata_schema(manifest_file, fasta_path, feature_map, tmp_path):
+async def test_sequence_metadata_schema(manifest_file, fasta_path, feature_map_file, tmp_path):
     """reference_sequences.parquet must have feature_idx, sequence_hash, sequence_length_bp."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
-    out = await _run_load(LocalBackend(), manifest_file, fasta_path, feature_map, tmp_path)
+    out = await _run_load(LocalBackend(), manifest_file, fasta_path, feature_map_file, tmp_path)
     pq = out / "reference_sequences.parquet"
     assert pq.exists()
 
@@ -132,11 +137,11 @@ async def test_sequence_metadata_schema(manifest_file, fasta_path, feature_map, 
 # --- Sequence chunks ---
 
 
-async def test_sequence_chunks_schema(manifest_file, fasta_path, feature_map, tmp_path):
+async def test_sequence_chunks_schema(manifest_file, fasta_path, feature_map_file, tmp_path):
     """reference_sequence_chunks.parquet must have feature_idx, chunk_index, chunk_data."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
-    out = await _run_load(LocalBackend(), manifest_file, fasta_path, feature_map, tmp_path)
+    out = await _run_load(LocalBackend(), manifest_file, fasta_path, feature_map_file, tmp_path)
     pq = out / "reference_sequence_chunks.parquet"
     assert pq.exists()
 
@@ -152,11 +157,11 @@ async def test_sequence_chunks_schema(manifest_file, fasta_path, feature_map, tm
         assert conn.execute(f"SELECT count(*) FROM '{pq}'").fetchone()[0] == 5
 
 
-async def test_sequence_chunks_reassemble(manifest_file, fasta_path, feature_map, tmp_path):
+async def test_sequence_chunks_reassemble(manifest_file, fasta_path, feature_map_file, tmp_path):
     """Chunked sequences must reassemble to the original sequence."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
-    out = await _run_load(LocalBackend(), manifest_file, fasta_path, feature_map, tmp_path)
+    out = await _run_load(LocalBackend(), manifest_file, fasta_path, feature_map_file, tmp_path)
     seq1_fidx = TEST_FEATURE_MAP[TEST_HASHES["seq1"]]
 
     with duckdb.connect(":memory:") as conn:
@@ -171,11 +176,11 @@ async def test_sequence_chunks_reassemble(manifest_file, fasta_path, feature_map
 # --- Membership ---
 
 
-async def test_membership_parquet(manifest_file, fasta_path, feature_map, tmp_path):
+async def test_membership_parquet(manifest_file, fasta_path, feature_map_file, tmp_path):
     """reference_membership.parquet must have one row per feature."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
-    out = await _run_load(LocalBackend(), manifest_file, fasta_path, feature_map, tmp_path)
+    out = await _run_load(LocalBackend(), manifest_file, fasta_path, feature_map_file, tmp_path)
     pq = out / "reference_membership.parquet"
     assert pq.exists()
 
@@ -189,7 +194,9 @@ async def test_membership_parquet(manifest_file, fasta_path, feature_map, tmp_pa
 # --- Taxonomy ---
 
 
-async def test_taxonomy_parquet(manifest_file, fasta_path, feature_map, taxonomy_file, tmp_path):
+async def test_taxonomy_parquet(
+    manifest_file, fasta_path, feature_map_file, taxonomy_file, tmp_path
+):
     """Taxonomy Parquet must parse GG2 ranks correctly from Parquet input."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
@@ -197,7 +204,7 @@ async def test_taxonomy_parquet(manifest_file, fasta_path, feature_map, taxonomy
         LocalBackend(),
         manifest_file,
         fasta_path,
-        feature_map,
+        feature_map_file,
         tmp_path,
         taxonomy_path=taxonomy_file,
     )
@@ -237,7 +244,7 @@ async def test_taxonomy_parquet(manifest_file, fasta_path, feature_map, taxonomy
 
 
 async def test_phylogeny_has_feature_idx_on_tips(
-    manifest_file, fasta_path, feature_map, tree_file, tmp_path
+    manifest_file, fasta_path, feature_map_file, tree_file, tmp_path
 ):
     """Phylogeny tips must have feature_idx populated, internal nodes NULL."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
@@ -246,7 +253,7 @@ async def test_phylogeny_has_feature_idx_on_tips(
         LocalBackend(),
         manifest_file,
         fasta_path,
-        feature_map,
+        feature_map_file,
         tmp_path,
         tree_path=tree_file,
     )
@@ -273,7 +280,9 @@ async def test_phylogeny_has_feature_idx_on_tips(
         assert tip_fidxs == set(TEST_FEATURE_MAP.values())
 
 
-async def test_phylogeny_allows_unmatched_tips(manifest_file, fasta_path, feature_map, tmp_path):
+async def test_phylogeny_allows_unmatched_tips(
+    manifest_file, fasta_path, feature_map_file, tmp_path
+):
     """Tips without matching sequences get NULL feature_idx (no error)."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
@@ -287,16 +296,20 @@ async def test_phylogeny_allows_unmatched_tips(manifest_file, fasta_path, featur
     ]
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps({"reference_idx": REFERENCE_IDX, "entries": entries}))
-    partial_map = {TEST_HASHES[n]: 100 + i for i, n in enumerate(["seq1", "seq2"])}
     fasta = tmp_path / "partial.fasta"
     fasta.write_text(">seq1\nATCGATCGATCG\n>seq2\nGCTAGCTAGCTA\n")
+    partial_fm = tmp_path / "partial_fm.ndjson"
+    with open(partial_fm, "w") as f:
+        for n_idx, n in enumerate(["seq1", "seq2"]):
+            entry = {"sequence_hash": str(TEST_HASHES[n]), "feature_idx": 100 + n_idx}
+            f.write(json.dumps(entry) + "\n")
 
     out = tmp_path / "output"
     backend = LocalBackend()
     await backend.run_load_job(
         manifest_path=manifest_path,
         fasta_path=fasta,
-        feature_map=partial_map,
+        feature_map_path=partial_fm,
         output_dir=out,
         reference_idx=REFERENCE_IDX,
         tree_path=tree_path,
@@ -316,11 +329,11 @@ async def test_phylogeny_allows_unmatched_tips(manifest_file, fasta_path, featur
 # --- Optional files omitted ---
 
 
-async def test_no_optional_files(manifest_file, fasta_path, feature_map, tmp_path):
+async def test_no_optional_files(manifest_file, fasta_path, feature_map_file, tmp_path):
     """Without optional files, only sequences + membership are produced."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
-    out = await _run_load(LocalBackend(), manifest_file, fasta_path, feature_map, tmp_path)
+    out = await _run_load(LocalBackend(), manifest_file, fasta_path, feature_map_file, tmp_path)
     assert (out / "reference_sequences.parquet").exists()
     assert (out / "reference_sequence_chunks.parquet").exists()
     assert (out / "reference_membership.parquet").exists()
@@ -332,14 +345,14 @@ async def test_no_optional_files(manifest_file, fasta_path, feature_map, tmp_pat
 # --- Error cases ---
 
 
-async def test_rejects_missing_manifest(fasta_path, feature_map, tmp_path):
+async def test_rejects_missing_manifest(fasta_path, feature_map_file, tmp_path):
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
     with pytest.raises(FileNotFoundError):
         await LocalBackend().run_load_job(
             manifest_path=tmp_path / "nope.json",
             fasta_path=fasta_path,
-            feature_map=feature_map,
+            feature_map_path=feature_map_file,
             output_dir=tmp_path / "out",
             reference_idx=REFERENCE_IDX,
         )
@@ -348,11 +361,15 @@ async def test_rejects_missing_manifest(fasta_path, feature_map, tmp_path):
 async def test_rejects_unmapped_hash(manifest_file, fasta_path, tmp_path):
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
+    # Empty feature map — no hashes mapped
+    empty_fm = tmp_path / "empty.ndjson"
+    empty_fm.write_text("")
+
     with pytest.raises(ValueError, match="unmapped"):
         await LocalBackend().run_load_job(
             manifest_path=manifest_file,
             fasta_path=fasta_path,
-            feature_map={},
+            feature_map_path=empty_fm,
             output_dir=tmp_path / "out",
             reference_idx=REFERENCE_IDX,
         )

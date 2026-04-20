@@ -122,7 +122,10 @@ async def test_full_load_pipeline(
     )
     assert mint_resp.status_code == 200
     mint_body = mint_resp.json()
-    feature_map = {uuid.UUID(k): v for k, v in mint_body["mapping"].items()}
+    fm_path = tmp_path / "feature_map.ndjson"
+    with open(fm_path, "w") as f:
+        for k, v in mint_body["mapping"].items():
+            f.write(json.dumps({"sequence_hash": k, "feature_idx": v}) + "\n")
 
     # --- Load phase (status transition + load job) ---
     load_resp = await client.patch(
@@ -135,7 +138,7 @@ async def test_full_load_pipeline(
     await backend.run_load_job(
         manifest_path=manifest_path,
         fasta_path=fasta_3seq,
-        feature_map=feature_map,
+        feature_map_path=fm_path,
         output_dir=load_dir,
         reference_idx=ref_idx,
         taxonomy_path=taxonomy_3seq,

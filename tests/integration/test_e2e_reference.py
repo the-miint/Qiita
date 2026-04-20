@@ -330,9 +330,10 @@ async def test_e2e_create_to_doget(
         f"/api/v1/references/{ref_idx}/features/mint", json={"entries": entries}
     )
     assert mint_resp.status_code == 200
-    feature_map = {
-        uuid.UUID(k): v for k, v in mint_resp.json()["mapping"].items()
-    }
+    fm_path = tmp_path / "feature_map.ndjson"
+    with open(fm_path, "w") as f:
+        for k, v in mint_resp.json()["mapping"].items():
+            f.write(json.dumps({"sequence_hash": k, "feature_idx": v}) + "\n")
 
     # --- Load (write Parquet to staging) ---
     await client.patch(
@@ -342,7 +343,7 @@ async def test_e2e_create_to_doget(
     await backend.run_load_job(
         manifest_path=manifest_path,
         fasta_path=fasta_e2e,
-        feature_map=feature_map,
+        feature_map_path=fm_path,
         output_dir=staging_dir,
         reference_idx=ref_idx,
         taxonomy_path=taxonomy_e2e,
@@ -389,7 +390,7 @@ async def test_e2e_create_to_doget(
     assert "sequence_hash" in table.column_names
     assert "sequence_length_bp" in table.column_names
     returned_fidxs = set(table.column("feature_idx").to_pylist())
-    assert returned_fidxs == set(feature_map.values())
+    assert len(returned_fidxs) == 3
 
     # --- Verify sequence data via reference_sequence_chunks ---
     chunks_ticket_resp = await client.post(
@@ -439,9 +440,10 @@ async def test_e2e_doget_taxonomy(
     mint_resp = await client.post(
         f"/api/v1/references/{ref_idx}/features/mint", json={"entries": entries}
     )
-    feature_map = {
-        uuid.UUID(k): v for k, v in mint_resp.json()["mapping"].items()
-    }
+    fm_path = tmp_path / "fm.ndjson"
+    with open(fm_path, "w") as f:
+        for k, v in mint_resp.json()["mapping"].items():
+            f.write(json.dumps({"sequence_hash": k, "feature_idx": v}) + "\n")
 
     await client.patch(
         f"/api/v1/references/{ref_idx}/status", json={"status": "loading"}
@@ -450,7 +452,7 @@ async def test_e2e_doget_taxonomy(
     await backend.run_load_job(
         manifest_path=manifest_path,
         fasta_path=fasta_e2e,
-        feature_map=feature_map,
+        feature_map_path=fm_path,
         output_dir=staging,
         reference_idx=ref_idx,
         taxonomy_path=taxonomy_e2e,

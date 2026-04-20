@@ -38,4 +38,4 @@ async def test_slurm_backend_load_job_raises():
 
     backend = SlurmBackend()
     with pytest.raises(NotImplementedError):
-        await backend.run_load_job(Path("/fake"), Path("/fake"), {}, Path("/fake"), 1)
+        await backend.run_load_job(Path("/fake"), Path("/fake"), Path("/fake"), Path("/fake"), 1)

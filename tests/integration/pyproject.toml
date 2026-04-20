@@ -5,6 +5,7 @@ requires-python = ">=3.14"
 dependencies = [
     "pytest>=9",
     "pytest-asyncio>=0.25",
+    "pytest-timeout>=2",
     "httpx>=0.28",
     "asyncpg>=0.31",
     "pyarrow>=19",

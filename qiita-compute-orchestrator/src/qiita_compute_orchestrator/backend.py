@@ -2,12 +2,6 @@
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from uuid import UUID
-
-# Mapping from sequence_hash (UUID) to feature_idx (int), as returned by
-# the control plane's bulk mint endpoint. Used by load jobs to assign
-# the correct feature_idx to each sequence.
-FeatureMap = dict[UUID, int]
 
 
 class ComputeBackend(ABC):
@@ -25,7 +19,7 @@ class ComputeBackend(ABC):
         self,
         manifest_path: Path,
         fasta_path: Path,
-        feature_map: FeatureMap,
+        feature_map_path: Path,
         output_dir: Path,
         reference_idx: int,
         *,
@@ -34,6 +28,12 @@ class ComputeBackend(ABC):
         jplace_path: Path | None = None,
     ) -> Path:
         """Write reference data to sorted Parquet files.
+
+        manifest_path: JSON manifest from run_hash_job.
+        feature_map_path: NDJSON file with {sequence_hash, feature_idx} rows,
+            produced by the pipeline coordinator from the mint response.
+
+        Both files are read directly by DuckDB — no Python-side parsing.
 
         Always produces:
           - reference_sequences.parquet (metadata: hash + length)
