@@ -170,7 +170,7 @@ def _build_id_map(
     # Read manifest entries count before the join so we can detect unmapped
     # hashes without re-reading the manifest.
     manifest_count = conn.execute(
-        "SELECT count(*) FROM (SELECT unnest(entries) FROM read_json(?))",
+        "SELECT count(*) FROM (SELECT unnest(entries) FROM read_json(?, maximum_object_size=536870912))",
         [str(manifest_path)],
     ).fetchone()[0]
 
@@ -180,7 +180,7 @@ def _build_id_map(
         "  CAST(e.sequence_hash AS VARCHAR) AS sequence_hash,"
         "  e.length AS sequence_length_bp "
         "FROM ("
-        "  SELECT unnest(entries) AS e FROM read_json(?)"
+        "  SELECT unnest(entries) AS e FROM read_json(?, maximum_object_size=536870912)"
         ") "
         "JOIN read_json(?, format='newline_delimited',"
         "  columns={'sequence_hash': 'VARCHAR', 'feature_idx': 'BIGINT'}) f "
@@ -194,7 +194,7 @@ def _build_id_map(
         # Get specific hashes for the error message via ANTI JOIN.
         unmapped = conn.execute(
             "SELECT e.sequence_hash FROM ("
-            "  SELECT unnest(entries) AS e FROM read_json(?)"
+            "  SELECT unnest(entries) AS e FROM read_json(?, maximum_object_size=536870912)"
             ") "
             "ANTI JOIN id_map m ON e.sequence_hash = m.sequence_hash",
             [str(manifest_path)],
