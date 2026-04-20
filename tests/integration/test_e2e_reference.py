@@ -159,7 +159,7 @@ def data_plane_process(hmac_secret):
         "target",
         "duckdb-download",
         "x86_64-unknown-linux-gnu",
-        "1.5.1",
+        "1.5.2",
     )
     ld_path = os.environ.get("LD_LIBRARY_PATH", "")
     if os.path.isdir(duckdb_lib_dir):
@@ -226,6 +226,7 @@ async def client(postgres_pool, hmac_secret):
     app.state.settings = Settings(
         database_url="unused-in-test",
         hmac_secret_key=hmac_secret,
+        data_plane_url=f"grpc://127.0.0.1:{DATA_PLANE_PORT}",
     )
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
@@ -307,9 +308,8 @@ async def test_e2e_create_to_doget(
     tree_e2e,
     tmp_path,
 ):
-    """Full E2E: create → hash → mint → load → register → ticket → DoGet."""
+    """Full E2E: create → hash → mint → load → register (via data plane) → ticket → DoGet."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
-    from qiita_compute_orchestrator.registration import register_staged_parquet
 
     ref_idx = ref_for_e2e
     backend = LocalBackend()
@@ -349,19 +349,21 @@ async def test_e2e_create_to_doget(
         tree_path=tree_e2e,
     )
 
-    # --- Register in DuckLake (move staging → permanent, zero-copy) ---
-    register_staged_parquet(
-        staging_dir=staging_dir,
-        ducklake_connstr=DUCKLAKE_CONNSTR,
-        ducklake_data_path=DUCKLAKE_DATA_PATH,
-        table_file_map={
-            "reference_sequences.parquet": "reference_sequences",
-            "reference_sequence_chunks.parquet": "reference_sequence_chunks",
-            "reference_membership.parquet": "reference_membership",
-            "reference_taxonomy.parquet": "reference_taxonomy",
-            "reference_phylogeny.parquet": "reference_phylogeny",
+    # --- Register via control plane → data plane DoAction ---
+    reg_resp = await client.post(
+        f"/api/v1/references/{ref_idx}/register",
+        json={
+            "staging_dir": str(staging_dir),
+            "files": {
+                "reference_sequences.parquet": "reference_sequences",
+                "reference_sequence_chunks.parquet": "reference_sequence_chunks",
+                "reference_membership.parquet": "reference_membership",
+                "reference_taxonomy.parquet": "reference_taxonomy",
+                "reference_phylogeny.parquet": "reference_phylogeny",
+            },
         },
     )
+    assert reg_resp.status_code == 201
 
     # --- Transition to active ---
     active_resp = await client.patch(
@@ -419,12 +421,11 @@ async def test_e2e_doget_taxonomy(
 ):
     """Verify DoGet for reference_taxonomy returns correct parsed ranks."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
-    from qiita_compute_orchestrator.registration import register_staged_parquet
 
     ref_idx = ref_for_e2e
     backend = LocalBackend()
 
-    # Run pipeline (hash → mint → load → register → active)
+    # Run pipeline (hash → mint → load → register via data plane → active)
     await client.patch(
         f"/api/v1/references/{ref_idx}/status", json={"status": "hashing"}
     )
@@ -454,17 +455,19 @@ async def test_e2e_doget_taxonomy(
         reference_idx=ref_idx,
         taxonomy_path=taxonomy_e2e,
     )
-    register_staged_parquet(
-        staging_dir=staging,
-        ducklake_connstr=DUCKLAKE_CONNSTR,
-        ducklake_data_path=DUCKLAKE_DATA_PATH,
-        table_file_map={
-            "reference_sequences.parquet": "reference_sequences",
-            "reference_sequence_chunks.parquet": "reference_sequence_chunks",
-            "reference_membership.parquet": "reference_membership",
-            "reference_taxonomy.parquet": "reference_taxonomy",
+    reg_resp = await client.post(
+        f"/api/v1/references/{ref_idx}/register",
+        json={
+            "staging_dir": str(staging),
+            "files": {
+                "reference_sequences.parquet": "reference_sequences",
+                "reference_sequence_chunks.parquet": "reference_sequence_chunks",
+                "reference_membership.parquet": "reference_membership",
+                "reference_taxonomy.parquet": "reference_taxonomy",
+            },
         },
     )
+    assert reg_resp.status_code == 201
     await client.patch(
         f"/api/v1/references/{ref_idx}/status", json={"status": "active"}
     )

@@ -15,7 +15,7 @@ tonic-health = "0.14"
 arrow-flight = "58"
 arrow-array = "58"
 arrow-schema = "58"
-duckdb = { version = "1.10501.0" }
+duckdb = { version = "1.10502.0" }
 hmac = "0.12"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }

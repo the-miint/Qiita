@@ -8,6 +8,7 @@ dependencies = [
     "httpx>=0.28",
     "asyncpg>=0.31",
     "pyarrow>=19",
+    "duckdb>=1.5.2",
     "qiita-common",
     "qiita-control-plane",
     "qiita-compute-orchestrator",
@@ -22,3 +23,6 @@ qiita-compute-orchestrator = { path = "../../qiita-compute-orchestrator" }
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
+markers = [
+    "system: system tests with real reference data (deselect with -m 'not system')",
+]

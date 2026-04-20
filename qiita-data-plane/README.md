@@ -2,7 +2,7 @@
 
 Data layer for Qiita. Serves bulk measurement data via the Arrow Flight protocol (gRPC). Intentionally "dumb" — operates on opaque integer identifiers assigned by the control plane; no metadata, no business logic.
 
-**Stack:** Rust, arrow-flight, tonic (gRPC), DuckDB v1.5.1 + duckdb-mint extension, DuckLake with Postgres catalog
+**Stack:** Rust, arrow-flight, tonic (gRPC), DuckDB v1.5.2 + duckdb-miint extension, DuckLake with Postgres catalog
 
 **Responsibilities:**
 - `DoGet` — select by key (table + identifiers from a signed Flight ticket)

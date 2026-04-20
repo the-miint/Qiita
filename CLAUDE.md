@@ -106,7 +106,7 @@ The data plane is intentionally "dumb": it only operates on identifiers it recei
 
 **Horizontal scaling**: each data plane instance holds an independent DuckDB+DuckLake connection to the shared Postgres catalog. DuckLake's snapshot isolation means instances never block each other. Add instances to `upstream qiita_data_plane` in nginx to scale.
 
-**Bundled DuckDB**: `duckdb = { version = "1.10501.0", features = ["bundled"] }` statically links DuckDB v1.5.1. First compile is slow (~2.5 min); subsequent incremental builds are fast. The Rust build cache in CI (`Swatinem/rust-cache`) avoids recompiling it on every push.
+**DuckDB**: `duckdb = { version = "1.10502.0" }` links DuckDB v1.5.2. The Rust build cache in CI (`Swatinem/rust-cache`) avoids recompiling it on every push.
 
 ### Compute orchestrator pattern
 

@@ -69,13 +69,15 @@ impl std::fmt::Display for AuthError {
     }
 }
 
-/// Verify a Flight ticket and return the parsed payload.
+/// Verify a signed ticket's HMAC and expiry, return the raw payload bytes.
 ///
 /// Checks (in order): version, payload length, HMAC signature, expiry, max
-/// lifetime, and JSON structure. HMAC verification is constant-time. The
-/// ordering ensures timing information only leaks for structural issues (not
-/// for HMAC or payload content).
-pub fn verify_ticket(ticket: &[u8], secret: &[u8]) -> Result<TicketPayload, AuthError> {
+/// lifetime. HMAC verification is constant-time. The ordering ensures timing
+/// information only leaks for structural issues (not for HMAC or payload content).
+///
+/// Use `verify_ticket` for DoGet (parses into `TicketPayload`) or deserialize
+/// the returned bytes into an action-specific type for DoAction.
+pub fn verify_ticket_raw(ticket: &[u8], secret: &[u8]) -> Result<Vec<u8>, AuthError> {
     // Minimum size: 1 (version) + 4 (payload_len) + 0 (payload) + 32 (hmac) + 8 (expiry)
     if ticket.len() < 1 + 4 + HMAC_SIZE + EXPIRY_SIZE {
         return Err(AuthError::TooShort);
@@ -147,11 +149,30 @@ pub fn verify_ticket(ticket: &[u8], secret: &[u8]) -> Result<TicketPayload, Auth
         return Err(AuthError::ExpiryTooFar);
     }
 
-    // Parse payload JSON
-    let payload: TicketPayload = serde_json::from_slice(payload_bytes)
-        .map_err(|e| AuthError::MalformedPayload(e.to_string()))?;
+    Ok(payload_bytes.to_vec())
+}
 
-    Ok(payload)
+/// Verify a DoGet ticket and return the parsed payload.
+pub fn verify_ticket(ticket: &[u8], secret: &[u8]) -> Result<TicketPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
+/// Parsed action payload for DoAction requests.
+#[derive(Debug, serde::Deserialize)]
+pub struct ActionPayload {
+    /// Action type, e.g., "register_files".
+    pub action: String,
+    /// Staging directory containing the Parquet files to register.
+    pub staging_dir: String,
+    /// Map of {filename: ducklake_table_name}.
+    pub files: HashMap<String, String>,
+}
+
+/// Verify a DoAction token and return the parsed action payload.
+pub fn verify_action(ticket: &[u8], secret: &[u8]) -> Result<ActionPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
 #[cfg(test)]

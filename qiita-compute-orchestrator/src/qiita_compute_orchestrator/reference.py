@@ -1,4 +1,4 @@
-"""Reference load pipeline — coordinates load job, DuckLake registration, and status updates."""
+"""Reference load pipeline — coordinates load job, registration, and status updates."""
 
 from pathlib import Path
 
@@ -6,7 +6,6 @@ from qiita_common.client import ControlPlaneClient
 from qiita_common.models import ReferenceStatus
 
 from .backend import ComputeBackend, FeatureMap
-from .registration import register_staged_parquet
 
 # Maps Parquet filenames produced by run_load_job to DuckLake table names.
 _REFERENCE_TABLE_MAP = {
@@ -28,8 +27,6 @@ async def run_reference_load_pipeline(
     fasta_path: Path,
     feature_map: FeatureMap,
     staging_dir: Path,
-    ducklake_connstr: str,
-    ducklake_data_path: str,
     taxonomy_path: Path | None = None,
     tree_path: Path | None = None,
     jplace_path: Path | None = None,
@@ -39,7 +36,7 @@ async def run_reference_load_pipeline(
     Steps:
     1. Transition status to LOADING
     2. Run load job (write sorted Parquet files to staging_dir)
-    3. Move Parquet to permanent storage and register in DuckLake
+    3. Request file registration via control plane → data plane DoAction
     4. Transition status to ACTIVE
     """
     # 1. Transition to LOADING
@@ -57,12 +54,13 @@ async def run_reference_load_pipeline(
         jplace_path=jplace_path,
     )
 
-    # 3. Move to permanent storage and register in DuckLake
-    register_staged_parquet(
-        staging_dir=staging_dir,
-        ducklake_connstr=ducklake_connstr,
-        ducklake_data_path=ducklake_data_path,
-        table_file_map=_REFERENCE_TABLE_MAP,
+    # 3. Register files via control plane → data plane DoAction.
+    # The data plane moves files to permanent storage and registers
+    # them in DuckLake — the orchestrator never touches DuckLake directly.
+    await client.register_files(
+        reference_idx=reference_idx,
+        staging_dir=str(staging_dir),
+        files=_REFERENCE_TABLE_MAP,
     )
 
     # 4. Transition to ACTIVE

@@ -189,9 +189,39 @@ impl FlightService for QiitaFlightService {
 
     async fn do_action(
         &self,
-        _request: Request<Action>,
+        request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        Err(Status::unimplemented("do_action not yet implemented"))
+        let action = request.into_inner();
+
+        match action.r#type.as_str() {
+            "register_files" => {
+                let payload = auth::verify_action(&action.body, &self.hmac_secret)
+                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
+
+                if payload.action != "register_files" {
+                    return Err(Status::invalid_argument(format!(
+                        "action type mismatch: header says 'register_files', payload says {:?}",
+                        payload.action
+                    )));
+                }
+
+                let registered = register_files(&self.catalog_connstr, &self.data_path, &payload)?;
+
+                let result_body = serde_json::to_vec(&serde_json::json!({
+                    "registered": registered,
+                }))
+                .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+
+                let result = arrow_flight::Result {
+                    body: result_body.into(),
+                };
+                let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
+            other => Err(Status::invalid_argument(format!(
+                "unknown action type: {other:?}"
+            ))),
+        }
     }
 
     async fn list_actions(
@@ -199,6 +229,125 @@ impl FlightService for QiitaFlightService {
         _request: Request<arrow_flight::Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
         Err(Status::unimplemented("list_actions not supported"))
+    }
+}
+
+/// Move Parquet files from staging to permanent storage and register in DuckLake.
+///
+/// Phase 1: validate all requested files exist in staging.
+/// Phase 2: move all files to permanent locations under `data_path/{table_name}/`.
+/// Phase 3: attach DuckLake and register all moved files.
+///
+/// Uses `std::fs::rename` with a copy+delete fallback for cross-filesystem moves
+/// (e.g., SLURM local scratch → shared NFS).
+///
+/// Note: the action token is scoped to staging_dir + files, not to a specific
+/// reference_idx. The control plane is responsible for issuing tokens only for
+/// valid references in the correct state.
+fn register_files(
+    catalog_connstr: &str,
+    data_path: &str,
+    payload: &auth::ActionPayload,
+) -> Result<Vec<String>, Status> {
+    let staging = std::path::Path::new(&payload.staging_dir);
+    let perm_root = std::path::Path::new(data_path);
+
+    // Phase 1: validate all requested files exist.
+    for filename in payload.files.keys() {
+        let src = staging.join(filename);
+        if !src.exists() {
+            return Err(Status::not_found(format!(
+                "staging file not found: {}",
+                src.display()
+            )));
+        }
+    }
+
+    // Phase 2: move all files to permanent storage.
+    let mut moved: Vec<(String, std::path::PathBuf)> = Vec::new();
+    for (filename, table) in &payload.files {
+        let src = staging.join(filename);
+        let dest_dir = perm_root.join(table);
+        std::fs::create_dir_all(&dest_dir).map_err(|e| {
+            Status::internal(format!(
+                "failed to create directory {}: {e}",
+                dest_dir.display()
+            ))
+        })?;
+        let dest = dest_dir.join(filename);
+        move_file(&src, &dest)?;
+        moved.push((table.clone(), dest));
+    }
+
+    // Phase 3: register in DuckLake. Tables are ensured at startup in main.rs.
+    let conn = duckdb::Connection::open_in_memory()
+        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
+    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
+        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
+
+    let mut registered = Vec::new();
+    for (table, dest) in &moved {
+        let dest_str = dest
+            .to_str()
+            .ok_or_else(|| Status::internal(format!("non-UTF-8 path: {}", dest.display())))?;
+        conn.execute(
+            "CALL ducklake_add_data_files('qiita_lake', ?, ?)",
+            duckdb::params![table, dest_str],
+        )
+        .map_err(|e| {
+            // Log which files were already registered for recovery.
+            let already: Vec<_> = registered.iter().collect();
+            Status::internal(format!(
+                "ducklake_add_data_files failed for {table}/{}: {e}. \
+                 Already registered: {already:?}. \
+                 Already moved: {:?}. \
+                 Manual recovery may be needed.",
+                dest.display(),
+                moved
+                    .iter()
+                    .map(|(_, p)| p.display().to_string())
+                    .collect::<Vec<_>>()
+            ))
+        })?;
+        registered.push(dest_str.to_string());
+    }
+
+    Ok(registered)
+}
+
+/// Move a file, falling back to copy+delete for cross-filesystem moves.
+///
+/// If the copy succeeds but delete fails, the dest file is kept (it's the
+/// correct data) and the error message includes the orphaned source path
+/// for cleanup.
+fn move_file(src: &std::path::Path, dest: &std::path::Path) -> Result<(), Status> {
+    match std::fs::rename(src, dest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(18) => {
+            // EXDEV: cross-device link — fall back to copy + delete
+            std::fs::copy(src, dest).map_err(|e| {
+                Status::internal(format!(
+                    "cross-fs copy failed {} → {}: {e}",
+                    src.display(),
+                    dest.display()
+                ))
+            })?;
+            if let Err(e) = std::fs::remove_file(src) {
+                // Copy succeeded — dest has the data. Log the orphan but
+                // don't fail the operation. The staging file is stale.
+                eprintln!(
+                    "warning: cross-fs cleanup failed for {} (dest {} is valid): {e}",
+                    src.display(),
+                    dest.display()
+                );
+            }
+            Ok(())
+        }
+        Err(e) => Err(Status::internal(format!(
+            "rename failed {} → {}: {e}",
+            src.display(),
+            dest.display()
+        ))),
     }
 }
 
@@ -223,9 +372,9 @@ fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, Stri
     // reference_sequences and reference_sequence_chunks have no reference_idx
     // column. When the filter includes reference_idx, resolve via a JOIN with
     // the membership table.
-    let needs_membership_join =
-        (table == "reference_sequences" || table == "reference_sequence_chunks")
-            && filter.contains_key("reference_idx");
+    let needs_membership_join = (table == "reference_sequences"
+        || table == "reference_sequence_chunks")
+        && filter.contains_key("reference_idx");
 
     let mut where_clauses = Vec::new();
     for (col, values) in filter {

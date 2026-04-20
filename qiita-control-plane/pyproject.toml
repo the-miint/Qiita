@@ -7,6 +7,7 @@ dependencies = [
     "uvicorn[standard]>=0.32",
     "qiita-common",
     "asyncpg>=0.31",
+    "pyarrow>=19",
 ]
 
 [dependency-groups]

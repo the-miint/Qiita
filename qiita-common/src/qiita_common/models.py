@@ -87,6 +87,15 @@ class ReferenceStatusUpdate(BaseModel):
     status: ReferenceStatus
 
 
+class RegisterFilesRequest(BaseModel):
+    staging_dir: str = Field(min_length=1)
+    files: dict[str, str]  # {filename: ducklake_table_name}
+
+
+class RegisterFilesResponse(BaseModel):
+    registered: list[str]  # permanent paths of registered files
+
+
 class DoGetTicketRequest(BaseModel):
     table: str = Field(min_length=1, max_length=64)
 

@@ -8,6 +8,7 @@ from .models import (
     FeatureMintResponse,
     ReferenceResponse,
     ReferenceStatus,
+    RegisterFilesResponse,
 )
 
 
@@ -65,6 +66,19 @@ class ControlPlaneClient:
         )
         resp.raise_for_status()
         return FeatureMintResponse.model_validate(resp.json())
+
+    async def register_files(
+        self,
+        reference_idx: int,
+        staging_dir: str,
+        files: dict[str, str],
+    ) -> RegisterFilesResponse:
+        resp = await self._http.post(
+            f"/api/v1/references/{reference_idx}/register",
+            json={"staging_dir": staging_dir, "files": files},
+        )
+        resp.raise_for_status()
+        return RegisterFilesResponse.model_validate(resp.json())
 
     async def get_doget_ticket(self, reference_idx: int, table: str) -> DoGetTicketResponse:
         resp = await self._http.post(

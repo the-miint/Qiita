@@ -1,10 +1,13 @@
 """Reference management routes."""
 
+import asyncio
 import base64
+import json
 from typing import Annotated
 from uuid import UUID
 
 import asyncpg
+import pyarrow.flight as _flight
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import Field
 from qiita_common.models import (
@@ -17,10 +20,12 @@ from qiita_common.models import (
     ReferenceCreateRequest,
     ReferenceResponse,
     ReferenceStatusUpdate,
+    RegisterFilesRequest,
+    RegisterFilesResponse,
 )
 
-from ..auth.tickets import sign_ticket
-from ..deps import get_current_user, get_db_pool, get_hmac_secret
+from ..auth.tickets import sign_action, sign_ticket
+from ..deps import get_current_user, get_data_plane_url, get_db_pool, get_hmac_secret
 
 router = APIRouter(prefix="/references", tags=["references"])
 
@@ -321,3 +326,64 @@ async def create_doget_ticket(
         secret=hmac_secret,
     )
     return DoGetTicketResponse(ticket=base64.b64encode(ticket_bytes).decode())
+
+
+@router.post("/{reference_idx}/register", status_code=201)
+async def register_files(
+    reference_idx: Annotated[int, Field(gt=0)],
+    body: RegisterFilesRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    hmac_secret: bytes = Depends(get_hmac_secret),
+    data_plane_url: str = Depends(get_data_plane_url),
+    user_id: UUID = Depends(get_current_user),
+) -> RegisterFilesResponse:
+    """Register Parquet files in DuckLake via the data plane's DoAction.
+
+    Reference must be in 'loading' status. Signs an action token and sends
+    it to the data plane, which moves files to permanent storage and calls
+    ducklake_add_data_files. The gRPC call is offloaded to a thread to
+    avoid blocking the async event loop.
+    """
+    status = await pool.fetchval(
+        "SELECT status FROM qiita.references WHERE reference_idx = $1",
+        reference_idx,
+    )
+    if status is None:
+        raise HTTPException(status_code=404, detail="Reference not found")
+    if status != "loading":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Reference status is {status!r}, must be 'loading'",
+        )
+
+    # Sign an action token for the data plane
+    token = sign_action(
+        action="register_files",
+        payload={"staging_dir": body.staging_dir, "files": body.files},
+        secret=hmac_secret,
+    )
+
+    # Call data plane DoAction — offloaded to thread because pyarrow
+    # FlightClient is synchronous and would block the event loop.
+    try:
+        results = await asyncio.get_event_loop().run_in_executor(
+            None, _do_action_register, data_plane_url, token
+        )
+    except _flight.FlightError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Data plane registration failed: {exc}",
+        ) from exc
+
+    if not results:
+        return RegisterFilesResponse(registered=[])
+
+    result_body = json.loads(results[0].body.to_pybytes())
+    return RegisterFilesResponse(registered=result_body.get("registered", []))
+
+
+def _do_action_register(data_plane_url: str, token: bytes) -> list:
+    """Synchronous gRPC call to data plane — runs in thread executor."""
+    with _flight.FlightClient(data_plane_url) as client:
+        action = _flight.Action("register_files", token)
+        return list(client.do_action(action))

@@ -28,3 +28,11 @@ def get_hmac_secret(request: Request) -> bytes:
     if settings is None:
         raise RuntimeError("Settings not initialised — lifespan may not have run")
     return settings.hmac_secret_key
+
+
+def get_data_plane_url(request: Request) -> str:
+    """Return the data plane gRPC URL from app settings."""
+    settings = getattr(request.app.state, "settings", None)
+    if settings is None:
+        raise RuntimeError("Settings not initialised — lifespan may not have run")
+    return settings.data_plane_url

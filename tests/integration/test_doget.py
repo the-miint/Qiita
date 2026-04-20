@@ -149,7 +149,7 @@ def data_plane_process():
     # in test builds). Set LD_LIBRARY_PATH to the download location.
     duckdb_lib_dir = os.path.join(
         os.path.dirname(__file__), "..", "..", "qiita-data-plane",
-        "target", "duckdb-download", "x86_64-unknown-linux-gnu", "1.5.1",
+        "target", "duckdb-download", "x86_64-unknown-linux-gnu", "1.5.2",
     )
     ld_path = os.environ.get("LD_LIBRARY_PATH", "")
     if os.path.isdir(duckdb_lib_dir):

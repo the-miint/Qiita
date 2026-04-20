@@ -6,7 +6,7 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "qiita-common",
-    "duckdb==1.5.1",
+    "duckdb>=1.5.2",
 ]
 
 [dependency-groups]

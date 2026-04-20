@@ -87,12 +87,21 @@ test-workflows:
 
 # Run integration tests (requires Docker for Postgres)
 # Runs Python integration tests + Rust DuckLake tests (which need Postgres).
+# System tests (real GG2 data) are excluded — use make test-system.
 test-integration:
 	cd tests/integration && docker compose up -d --wait && \
-	  (uv run pytest; PY_EC=$$?; \
+	  (uv run pytest -m 'not system'; PY_EC=$$?; \
 	   cd ../../qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test --features integration; RS_EC=$$?; \
 	   cd ../tests/integration && docker compose down; \
 	   exit $$(( PY_EC > RS_EC ? PY_EC : RS_EC )))
+
+# Run system tests with real GG2 backbone data (requires Docker + data in localdocs/scratch/)
+# Slow (~10 min): hashes 331K sequences, mints features, writes chunked Parquet.
+test-system:
+	cd tests/integration && docker compose up -d --wait && \
+	  (uv run pytest -m system -x --timeout=900; PY_EC=$$?; \
+	   docker compose down; \
+	   exit $$PY_EC)
 
 # Lint all components
 lint: lint-python lint-rust
