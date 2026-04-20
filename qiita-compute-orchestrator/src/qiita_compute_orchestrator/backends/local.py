@@ -124,6 +124,7 @@ class LocalBackend(ComputeBackend):
         with duckdb.connect(":memory:") as conn:
             conn.execute("LOAD miint;")
             conn.execute("SET preserve_insertion_order=false;")
+            conn.execute(f"SET temp_directory='{output_dir}/.duckdb_tmp';")
 
             _build_id_map(conn, manifest_path, feature_map_path)
             _write_sequence_metadata(conn, output_dir)
