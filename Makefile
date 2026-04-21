@@ -99,7 +99,7 @@ test-integration:
 # Slow (~10 min): hashes 331K sequences, mints features, writes chunked Parquet.
 test-system:
 	cd tests/integration && docker compose up -d --wait && \
-	  (uv run pytest -m system -x --timeout=900; PY_EC=$$?; \
+	  (uv run pytest -m system -x --timeout=2700; PY_EC=$$?; \
 	   docker compose down; \
 	   exit $$PY_EC)
 

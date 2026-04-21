@@ -38,7 +38,7 @@ TREE = DATA_DIR / "2024.09.backbone.nwk.gz"
 TAXONOMY = DATA_DIR / "2024.09.backbone.taxonomy.parquet"
 GENOME_MAP = DATA_DIR / "2024.09.backbone.feature-to-genome.parquet"
 
-DUCKLAKE_DATA_PATH = "/tmp/qiita-integration-ducklake-data"
+DUCKLAKE_DATA_PATH = "/home/dtmcdonald/.qiita-system-test/ducklake-data"
 DUCKLAKE_CONNSTR = (
     "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita"
 )
@@ -218,9 +218,11 @@ async def test_gg2_backbone_pipeline(
     await client.patch(
         f"/api/v1/references/{ref_idx}/status", json={"status": "hashing"}
     )
+    hash_dir = Path("/home/dtmcdonald/.qiita-system-test/hash")
+    hash_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = await backend.run_hash_job(
         fasta_path=FASTA,
-        output_dir=tmp_path / "hash",
+        output_dir=hash_dir,
         reference_idx=ref_idx,
     )
     manifest = json.loads(manifest_path.read_text())
@@ -267,7 +269,9 @@ async def test_gg2_backbone_pipeline(
     await client.patch(
         f"/api/v1/references/{ref_idx}/status", json={"status": "loading"}
     )
-    staging = tmp_path / "staging"
+    # Use /home for staging — /tmp is too small for chunked genome Parquet.
+    staging = Path("/home/dtmcdonald/.qiita-system-test/staging")
+    staging.mkdir(parents=True, exist_ok=True)
     await backend.run_load_job(
         manifest_path=manifest_path,
         fasta_path=FASTA,
