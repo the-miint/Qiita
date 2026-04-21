@@ -1,5 +1,5 @@
 .PHONY: build test test-python test-rust test-integration test-workflows lint lint-python lint-rust deploy migrate clean verify-health dev-setup install-hooks
-.PHONY: build-common build-control-plane build-data-plane build-compute-orchestrator build-workflows
+.PHONY: build-common build-control-plane build-data-plane build-data-plane-debug build-compute-orchestrator build-workflows
 .PHONY: test-common test-control-plane test-data-plane test-compute-orchestrator
 .PHONY: lint-common lint-control-plane lint-data-plane lint-compute-orchestrator
 
@@ -41,6 +41,11 @@ build-control-plane:
 
 build-data-plane:
 	cd qiita-data-plane && cargo build --release --features duckdb/bundled
+
+# Debug binary used by Python integration tests (fast to build; dynamically
+# links libduckdb from target/duckdb-download via DUCKDB_DOWNLOAD_LIB).
+build-data-plane-debug:
+	cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo build
 
 build-compute-orchestrator:
 	cd qiita-compute-orchestrator && uv sync
@@ -88,7 +93,9 @@ test-workflows:
 # Run integration tests (requires Docker for Postgres)
 # Runs Python integration tests + Rust DuckLake tests (which need Postgres).
 # System tests (real GG2 data) are excluded — use make test-system.
-test-integration:
+# Builds the data plane debug binary first so Python tests can spawn it
+# without shelling out to cargo.
+test-integration: build-data-plane-debug
 	cd tests/integration && docker compose up -d --wait && \
 	  (uv run pytest -m 'not system'; PY_EC=$$?; \
 	   cd ../../qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test --features integration; RS_EC=$$?; \
@@ -97,7 +104,7 @@ test-integration:
 
 # Run system tests with real GG2 backbone data (requires Docker + data in localdocs/scratch/)
 # Slow (~10 min): hashes 331K sequences, mints features, writes chunked Parquet.
-test-system:
+test-system: build-data-plane-debug
 	cd tests/integration && docker compose up -d --wait && \
 	  (uv run pytest -m system -x --timeout=2700; PY_EC=$$?; \
 	   docker compose down; \

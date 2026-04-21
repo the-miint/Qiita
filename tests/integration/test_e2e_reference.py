@@ -2,223 +2,30 @@
 
 Exercises every component: control plane (REST), orchestrator (LocalBackend),
 DuckLake (Parquet registration), data plane (Arrow Flight DoGet).
-Requires Docker Postgres on :5433 and a compiled data plane binary.
+
+Relies on the shared `data_plane`, `hmac_secret`, and `postgres_pool` fixtures
+in conftest.py — no per-module process/secret/schema plumbing lives here.
 """
 
-import asyncio
 import base64
 import json
-import os
-import secrets
-import signal
-import socket
-import subprocess
-import time
 import uuid
 
-import asyncpg
 import pyarrow.flight as flight
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-DUCKLAKE_DATA_PATH = "/tmp/qiita-integration-ducklake-data"
-DUCKLAKE_CONNSTR = (
-    "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita"
-)
-DATA_PLANE_PORT = 50098  # different from test_doget to avoid collision
-
-
-def _reset_ducklake_catalog():
-    """Drop and recreate the DuckLake catalog database."""
-
-    async def _do_reset():
-        conn = await asyncpg.connect(
-            "postgresql://qiita:qiita@localhost:5433/qiita_test"
-        )
-        await conn.execute(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-            "WHERE datname = 'qiita_ducklake' AND pid != pg_backend_pid()"
-        )
-        await conn.execute("DROP DATABASE IF EXISTS qiita_ducklake")
-        await conn.execute("CREATE DATABASE qiita_ducklake OWNER qiita")
-        await conn.close()
-
-    asyncio.run(_do_reset())
-
-
-def _ducklake_conn():
-    """Open a Python DuckDB connection attached to DuckLake."""
-    import duckdb
-
-    os.makedirs(DUCKLAKE_DATA_PATH, exist_ok=True)
-    conn = duckdb.connect(":memory:")
-    conn.execute("LOAD ducklake; LOAD postgres;")
-    conn.execute(
-        f"ATTACH 'ducklake:postgres:{DUCKLAKE_CONNSTR}' AS qiita_lake"
-        f" (DATA_PATH '{DUCKLAKE_DATA_PATH}');"
-    )
-    return conn
-
-
-def _ensure_ducklake_tables(conn):
-    """Create DuckLake tables if they don't exist."""
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS qiita_lake.reference_sequences ("
-        "feature_idx BIGINT NOT NULL, "
-        "sequence_hash UUID NOT NULL, sequence_length_bp BIGINT NOT NULL);"
-    )
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS qiita_lake.reference_sequence_chunks ("
-        "feature_idx BIGINT NOT NULL, chunk_index INTEGER NOT NULL, "
-        "chunk_data VARCHAR NOT NULL);"
-    )
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS qiita_lake.reference_taxonomy ("
-        "reference_idx BIGINT NOT NULL, feature_idx BIGINT NOT NULL, "
-        "domain VARCHAR, phylum VARCHAR, class VARCHAR, "
-        '"order" VARCHAR, family VARCHAR, genus VARCHAR, '
-        "species VARCHAR, strain VARCHAR, ncbi_taxon_id BIGINT);"
-    )
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS qiita_lake.reference_phylogeny ("
-        "reference_idx BIGINT NOT NULL, node_index BIGINT NOT NULL, "
-        "name VARCHAR, branch_length DOUBLE, edge_id BIGINT, "
-        "parent_index BIGINT, is_tip BOOLEAN NOT NULL, feature_idx BIGINT);"
-    )
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS qiita_lake.reference_membership ("
-        "reference_idx BIGINT NOT NULL, feature_idx BIGINT NOT NULL);"
-    )
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS qiita_lake.reference_placements ("
-        "reference_idx BIGINT NOT NULL, feature_idx BIGINT NOT NULL, "
-        "edge_num INTEGER NOT NULL, likelihood DOUBLE, "
-        "like_weight_ratio DOUBLE, distal_length DOUBLE, "
-        "pendant_length DOUBLE);"
-    )
-
-
-def _wait_for_grpc(host: str, port: int, timeout: float = 10.0) -> bool:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            with socket.create_connection((host, port), timeout=1.0):
-                return True
-        except OSError:
-            time.sleep(0.2)
-    return False
-
-
-@pytest.fixture(scope="module")
-def hmac_secret():
-    return secrets.token_bytes(32)
-
-
-@pytest.fixture(scope="module")
-def data_plane_process(hmac_secret):
-    """Start the data plane, pre-create DuckLake tables."""
-    _reset_ducklake_catalog()
-
-    conn = _ducklake_conn()
-    _ensure_ducklake_tables(conn)
-    conn.close()
-
-    # Build binary
-    build_result = subprocess.run(
-        ["cargo", "build"],
-        cwd=os.path.join(
-            os.path.dirname(__file__), "..", "..", "qiita-data-plane"
-        ),
-        capture_output=True,
-        text=True,
-        env={**os.environ, "DUCKDB_DOWNLOAD_LIB": "1"},
-        timeout=300,
-    )
-    if build_result.returncode != 0:
-        pytest.skip(f"cargo build failed: {build_result.stderr[:500]}")
-
-    binary = os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "..",
-        "qiita-data-plane",
-        "target",
-        "debug",
-        "qiita-data-plane",
-    )
-    if not os.path.exists(binary):
-        pytest.skip(f"data plane binary not found at {binary}")
-
-    secret_b64 = base64.b64encode(hmac_secret).decode()
-
-    duckdb_lib_dir = os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "..",
-        "qiita-data-plane",
-        "target",
-        "duckdb-download",
-        "x86_64-unknown-linux-gnu",
-        "1.5.2",
-    )
-    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-    if os.path.isdir(duckdb_lib_dir):
-        ld_path = f"{duckdb_lib_dir}:{ld_path}" if ld_path else duckdb_lib_dir
-
-    env = {
-        **os.environ,
-        "LISTEN_ADDR": f"127.0.0.1:{DATA_PLANE_PORT}",
-        "HMAC_SECRET_KEY": secret_b64,
-        "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CONNSTR,
-        "DUCKLAKE_DATA_PATH": DUCKLAKE_DATA_PATH,
-        "LD_LIBRARY_PATH": ld_path,
-    }
-
-    proc = subprocess.Popen(
-        [binary], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
-
-    time.sleep(1)
-    rc = proc.poll()
-    if rc is not None:
-        stdout, stderr = proc.communicate(timeout=5)
-        pytest.fail(
-            f"data plane exited with code {rc}.\n"
-            f"stdout: {stdout.decode()[:1000]}\nstderr: {stderr.decode()[:1000]}"
-        )
-
-    if not _wait_for_grpc("127.0.0.1", DATA_PLANE_PORT):
-        rc = proc.poll()
-        if rc is not None:
-            stdout, stderr = proc.communicate(timeout=5)
-            pytest.fail(
-                f"data plane exited during startup with code {rc}.\n"
-                f"stdout: {stdout.decode()[:500]}\nstderr: {stderr.decode()[:500]}"
-            )
-        proc.kill()
-        proc.communicate(timeout=5)
-        pytest.fail("data plane did not start within 10s")
-
-    yield proc
-
-    proc.send_signal(signal.SIGTERM)
-    try:
-        proc.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-
 
 @pytest.fixture
-def flight_client(data_plane_process):
-    client = flight.FlightClient(f"grpc://127.0.0.1:{DATA_PLANE_PORT}")
+def flight_client(data_plane):
+    client = flight.FlightClient(f"grpc://127.0.0.1:{data_plane['port']}")
     yield client
     client.close()
 
 
 @pytest.fixture
-async def client(postgres_pool, hmac_secret):
-    """AsyncClient with HMAC secret injected into app state."""
+async def client(postgres_pool, hmac_secret, data_plane):
+    """AsyncClient with HMAC secret and data plane URL injected into app state."""
     from qiita_control_plane.config import Settings
     from qiita_control_plane.main import app
 
@@ -226,7 +33,7 @@ async def client(postgres_pool, hmac_secret):
     app.state.settings = Settings(
         database_url="unused-in-test",
         hmac_secret_key=hmac_secret,
-        data_plane_url=f"grpc://127.0.0.1:{DATA_PLANE_PORT}",
+        data_plane_url=f"grpc://127.0.0.1:{data_plane['port']}",
     )
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
@@ -299,9 +106,8 @@ def tree_e2e(tmp_path):
 
 async def test_e2e_create_to_doget(
     client,
-    data_plane_process,
+    data_plane,
     flight_client,
-    hmac_secret,
     ref_for_e2e,
     fasta_e2e,
     taxonomy_e2e,
@@ -381,8 +187,7 @@ async def test_e2e_create_to_doget(
     ticket_bytes = base64.b64decode(ticket_resp.json()["ticket"])
 
     # --- DoGet via Arrow Flight ---
-    ticket = flight.Ticket(ticket_bytes)
-    reader = flight_client.do_get(ticket)
+    reader = flight_client.do_get(flight.Ticket(ticket_bytes))
     table = reader.read_all()
 
     assert table.num_rows == 3
@@ -412,9 +217,8 @@ async def test_e2e_create_to_doget(
 
 async def test_e2e_doget_taxonomy(
     client,
-    data_plane_process,
+    data_plane,
     flight_client,
-    hmac_secret,
     ref_for_e2e,
     fasta_e2e,
     taxonomy_e2e,
