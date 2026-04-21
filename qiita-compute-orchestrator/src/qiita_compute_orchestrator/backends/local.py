@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import uuid
 from pathlib import Path
 
@@ -13,10 +14,11 @@ from ..backend import ComputeBackend
 _miint_install_lock = asyncio.Lock()
 _miint_installed = False
 
-# Local miint build with streaming read_fastx fix (max_batch_bytes).
-# Remove this once the community extension release includes the fix.
-_MIINT_LOCAL = Path("/home/dtmcdonald/dev/duckdb-miint/miint.duckdb_extension")
-_MIINT_USE_LOCAL = _MIINT_LOCAL.exists()
+# MIINT_EXTENSION_PATH overrides the community extension with a local build.
+# Required until the community release includes max_batch_bytes for read_fastx
+# (streaming fix for large genomes). Unset to use the community extension.
+_MIINT_EXT_PATH = os.environ.get("MIINT_EXTENSION_PATH")
+_MIINT_USE_LOCAL = _MIINT_EXT_PATH is not None
 
 
 async def _ensure_miint_installed() -> None:
@@ -29,7 +31,7 @@ async def _ensure_miint_installed() -> None:
             return
         with _open_conn() as conn:
             if _MIINT_USE_LOCAL:
-                conn.execute(f"FORCE INSTALL '{_MIINT_LOCAL}';")
+                conn.execute(f"FORCE INSTALL '{_MIINT_EXT_PATH}';")
             else:
                 conn.execute("INSTALL miint FROM community;")
         _miint_installed = True
@@ -59,40 +61,35 @@ class LocalBackend(ComputeBackend):
 
         with _open_conn() as conn:
             conn.execute("LOAD miint;")
-            # Parameterized query to avoid SQL injection via fasta_path.
+
+            # Materialize FASTA into a temp table — single read of the file.
             # DuckDB raises on empty files — treat as zero sequences.
             try:
-                rows = conn.execute(
-                    "SELECT read_id, md5(sequence1) AS hash, length(sequence1) AS len"
-                    " FROM read_fastx(?)",
+                conn.execute(
+                    "CREATE TEMP TABLE raw_seqs AS "
+                    "SELECT read_id, md5(sequence1) AS hash, length(sequence1) AS len "
+                    "FROM read_fastx(?)",
                     [str(fasta_path)],
-                ).fetchall()
+                )
             except duckdb.Error as exc:
                 if "Empty file" in str(exc):
-                    rows = []
+                    conn.execute(
+                        "CREATE TEMP TABLE raw_seqs (read_id VARCHAR, hash VARCHAR, len BIGINT)"
+                    )
                 else:
                     raise
-            # TODO(phase-9): for large references (millions of sequences), replace
-            # fetchall() with chunked iteration or DuckDB COPY TO JSON to avoid
-            # loading the full result set into Python memory.
 
-            # Reject duplicate read_ids — use DuckDB for O(n) efficiency.
-            # The read_ids are already in the result set, so we query directly
-            # from the same FASTA file to leverage DuckDB's grouping.
-            if rows:
-                try:
-                    dup_result = conn.execute(
-                        "SELECT read_id, count(*) AS cnt FROM read_fastx(?)"
-                        " GROUP BY read_id HAVING count(*) > 1",
-                        [str(fasta_path)],
-                    ).fetchall()
-                except duckdb.Error:
-                    dup_result = []
-                if dup_result:
-                    dup_ids = sorted(row[0] for row in dup_result)
-                    raise ValueError(
-                        f"FASTA contains {len(dup_ids)} duplicate read_id(s): {dup_ids[:10]}"
-                    )
+            # Reject duplicate read_ids — pure DuckDB, no second FASTA scan.
+            dup_result = conn.execute(
+                "SELECT read_id FROM raw_seqs GROUP BY read_id HAVING count(*) > 1 LIMIT 10"
+            ).fetchall()
+            if dup_result:
+                dup_ids = sorted(row[0] for row in dup_result)
+                raise ValueError(f"FASTA contains duplicate read_id(s): {dup_ids}")
+
+            rows = conn.execute("SELECT read_id, hash, len FROM raw_seqs").fetchall()
+            entry_count = len(rows)
+            conn.execute("DROP TABLE raw_seqs")
 
         entries = [
             {
@@ -105,6 +102,7 @@ class LocalBackend(ComputeBackend):
 
         manifest = {
             "reference_idx": reference_idx,
+            "entry_count": entry_count,
             "entries": entries,
         }
 
@@ -161,7 +159,12 @@ class LocalBackend(ComputeBackend):
 
 
 _PARQUET_OPTS = "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd'"
-_PARQUET_OPTS_CHUNKED = f"{_PARQUET_OPTS}, ROW_GROUP_SIZE 16384"
+# 16384 rows × ~64 KB chunk_data ≈ 1 GB per row group. Smaller values flush
+# more frequently, preventing OOM on genome-heavy references. Empirically
+# tuned against GG2 backbone (21 MB max genome, 11 GB FASTA):
+#   16384 → 4.2 GB peak RSS (OK), 32768 → OOM on 30 GB machine.
+_CHUNK_ROW_GROUP_SIZE = 16384
+_PARQUET_OPTS_CHUNKED = f"{_PARQUET_OPTS}, ROW_GROUP_SIZE {_CHUNK_ROW_GROUP_SIZE}"
 _CHUNK_SIZE = 65536  # 64 KB
 
 
@@ -184,10 +187,9 @@ def _build_id_map(
 
     Raises ValueError if any manifest entry has no matching feature_idx.
     """
-    # Read manifest entries count before the join so we can detect unmapped
-    # hashes without re-reading the manifest.
+    # entry_count is written by run_hash_job — avoids a separate count query.
     manifest_count = conn.execute(
-        "SELECT count(*) FROM (SELECT unnest(entries) FROM read_json(?, maximum_object_size=536870912))",
+        "SELECT entry_count FROM read_json(?, maximum_object_size=536870912)",
         [str(manifest_path)],
     ).fetchone()[0]
 
@@ -208,7 +210,8 @@ def _build_id_map(
     id_map_count = conn.execute("SELECT count(*) FROM id_map").fetchone()[0]
     if id_map_count != manifest_count:
         n_unmapped = manifest_count - id_map_count
-        # Get specific hashes for the error message via ANTI JOIN.
+        # Diagnostic ANTI JOIN only on mismatch — the only case requiring
+        # a second manifest read.
         unmapped = conn.execute(
             "SELECT e.sequence_hash FROM ("
             "  SELECT unnest(entries) AS e FROM read_json(?, maximum_object_size=536870912)"
@@ -242,7 +245,11 @@ def _write_sequence_chunks(
     Uses the list_transform + UNNEST macro pattern with ROW_GROUP_SIZE 16384
     to force row group flushing before memory pressure builds. Without a small
     ROW_GROUP_SIZE, DuckDB buffers too many rows and OOMs on large references.
-    max_batch_bytes limits read_fastx memory per batch.
+
+    max_batch_bytes='512MB' caps read_fastx memory per batch — prevents it
+    from buffering entire genomes (up to 21 MB each) before yielding rows.
+    Without this, a single batch spanning many large sequences exhausts memory
+    before the first row group is written.
     """
     out = _validate_parquet_path(output_dir / "reference_sequence_chunks.parquet")
     conn.execute(
@@ -255,12 +262,16 @@ def _write_sequence_chunks(
         f"  }}"
         f")"
     )
+    # max_batch_bytes caps read_fastx memory per batch — prevents buffering
+    # entire genomes (up to 21 MB) before yielding rows. Only available in
+    # local miint builds with the streaming fix; community release omits it.
+    fastx_opts = ", max_batch_bytes='512MB'" if _MIINT_USE_LOCAL else ""
     conn.execute(
         "COPY ("
         "  WITH unnested AS ("
         "    SELECT m.feature_idx,"
         "      UNNEST(chunk_seq(f.sequence1)) AS chunk"
-        "    FROM read_fastx(?, max_batch_bytes='512MB') f"
+        f"    FROM read_fastx(?{fastx_opts}) f"
         "    JOIN id_map m ON f.read_id = m.read_id"
         "  )"
         "  SELECT feature_idx, chunk.chunk_index, chunk.chunk_data"

@@ -38,7 +38,10 @@ TREE = DATA_DIR / "2024.09.backbone.nwk.gz"
 TAXONOMY = DATA_DIR / "2024.09.backbone.taxonomy.parquet"
 GENOME_MAP = DATA_DIR / "2024.09.backbone.feature-to-genome.parquet"
 
-DUCKLAKE_DATA_PATH = "/home/dtmcdonald/.qiita-system-test/ducklake-data"
+_SYSTEM_TEST_BASE = Path(
+    os.environ.get("QIITA_SYSTEM_TEST_DIR", Path.home() / ".qiita-system-test")
+)
+DUCKLAKE_DATA_PATH = str(_SYSTEM_TEST_BASE / "ducklake-data")
 DUCKLAKE_CONNSTR = (
     "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita"
 )
@@ -48,6 +51,15 @@ pytestmark = [
     pytest.mark.system,
     pytest.mark.skipif(not FASTA.exists(), reason="GG2 data not in localdocs/scratch/"),
 ]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _cleanup_system_test_dir():
+    """Clean up system test artifacts after the module runs."""
+    import shutil
+
+    yield
+    shutil.rmtree(str(_SYSTEM_TEST_BASE), ignore_errors=True)
 
 
 # --- Fixtures ---
@@ -218,7 +230,7 @@ async def test_gg2_backbone_pipeline(
     await client.patch(
         f"/api/v1/references/{ref_idx}/status", json={"status": "hashing"}
     )
-    hash_dir = Path("/home/dtmcdonald/.qiita-system-test/hash")
+    hash_dir = _SYSTEM_TEST_BASE / "hash"
     hash_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = await backend.run_hash_job(
         fasta_path=FASTA,
@@ -241,27 +253,26 @@ async def test_gg2_backbone_pipeline(
             genome_map[fid] = ("gg2", gid)
 
     fm_path = tmp_path / "feature_map.ndjson"
-    fm_file = open(fm_path, "w")
     total_minted = 0
-    for i in range(0, len(entries), _CHUNK):
-        chunk = entries[i : i + _CHUNK]
-        mint_entries = []
-        for e in chunk:
-            kwargs: dict = {"sequence_hash": e["sequence_hash"]}
-            genome = genome_map.get(e["read_id"])
-            if genome:
-                kwargs["genome_source"] = genome[0]
-                kwargs["genome_source_id"] = genome[1]
-            mint_entries.append(kwargs)
-        resp = await client.post(
-            f"/api/v1/references/{ref_idx}/features/mint",
-            json={"entries": mint_entries},
-        )
-        assert resp.status_code == 200, f"mint chunk {i} failed: {resp.text[:200]}"
-        for k, v in resp.json()["mapping"].items():
-            fm_file.write(json.dumps({"sequence_hash": k, "feature_idx": v}) + "\n")
-            total_minted += 1
-    fm_file.close()
+    with open(fm_path, "w") as fm_file:
+        for i in range(0, len(entries), _CHUNK):
+            chunk = entries[i : i + _CHUNK]
+            mint_entries = []
+            for e in chunk:
+                kwargs: dict = {"sequence_hash": e["sequence_hash"]}
+                genome = genome_map.get(e["read_id"])
+                if genome:
+                    kwargs["genome_source"] = genome[0]
+                    kwargs["genome_source_id"] = genome[1]
+                mint_entries.append(kwargs)
+            resp = await client.post(
+                f"/api/v1/references/{ref_idx}/features/mint",
+                json={"entries": mint_entries},
+            )
+            assert resp.status_code == 200, f"mint chunk {i} failed: {resp.text[:200]}"
+            for k, v in resp.json()["mapping"].items():
+                fm_file.write(json.dumps({"sequence_hash": k, "feature_idx": v}) + "\n")
+                total_minted += 1
 
     assert total_minted == 331269
 
@@ -269,8 +280,7 @@ async def test_gg2_backbone_pipeline(
     await client.patch(
         f"/api/v1/references/{ref_idx}/status", json={"status": "loading"}
     )
-    # Use /home for staging — /tmp is too small for chunked genome Parquet.
-    staging = Path("/home/dtmcdonald/.qiita-system-test/staging")
+    staging = _SYSTEM_TEST_BASE / "staging"
     staging.mkdir(parents=True, exist_ok=True)
     await backend.run_load_job(
         manifest_path=manifest_path,

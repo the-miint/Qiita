@@ -38,7 +38,7 @@ def manifest_file(tmp_path):
         }
         for name, seq in TEST_SEQUENCES.items()
     ]
-    manifest = {"reference_idx": REFERENCE_IDX, "entries": entries}
+    manifest = {"reference_idx": REFERENCE_IDX, "entry_count": len(entries), "entries": entries}
     path = tmp_path / "hash_manifest.json"
     path.write_text(json.dumps(manifest, indent=2))
     return path
@@ -295,7 +295,11 @@ async def test_phylogeny_allows_unmatched_tips(
         for n in ["seq1", "seq2"]
     ]
     manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(json.dumps({"reference_idx": REFERENCE_IDX, "entries": entries}))
+    manifest_path.write_text(
+        json.dumps(
+            {"reference_idx": REFERENCE_IDX, "entry_count": len(entries), "entries": entries}
+        )
+    )
     fasta = tmp_path / "partial.fasta"
     fasta.write_text(">seq1\nATCGATCGATCG\n>seq2\nGCTAGCTAGCTA\n")
     partial_fm = tmp_path / "partial_fm.ndjson"

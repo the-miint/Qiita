@@ -23,6 +23,7 @@ def write_feature_map_ndjson(mapping: dict[str, int], path: Path) -> None:
     """Write the mint response mapping as NDJSON for DuckDB consumption.
 
     Each line is {"sequence_hash": "uuid-str", "feature_idx": N}.
+    Callers must produce this file before calling run_reference_load_pipeline.
     """
     with open(path, "w") as f:
         for seq_hash, feature_idx in mapping.items():
