@@ -13,18 +13,33 @@ from ..backend import ComputeBackend
 _miint_install_lock = asyncio.Lock()
 _miint_installed = False
 
+# Local miint build with streaming read_fastx fix (max_batch_bytes).
+# Remove this once the community extension release includes the fix.
+_MIINT_LOCAL = Path("/home/dtmcdonald/dev/duckdb-miint/miint.duckdb_extension")
+_MIINT_USE_LOCAL = _MIINT_LOCAL.exists()
+
 
 async def _ensure_miint_installed() -> None:
-    """Install miint from the community registry once per process, concurrency-safe."""
+    """Install miint once per process, concurrency-safe."""
     global _miint_installed
     if _miint_installed:
         return
     async with _miint_install_lock:
         if _miint_installed:
             return
-        with duckdb.connect(":memory:") as conn:
-            conn.execute("INSTALL miint FROM community;")
+        with _open_conn() as conn:
+            if _MIINT_USE_LOCAL:
+                conn.execute(f"FORCE INSTALL '{_MIINT_LOCAL}';")
+            else:
+                conn.execute("INSTALL miint FROM community;")
         _miint_installed = True
+
+
+def _open_conn() -> duckdb.DuckDBPyConnection:
+    """Open a DuckDB connection with unsigned extensions allowed if needed."""
+    if _MIINT_USE_LOCAL:
+        return duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
+    return duckdb.connect(":memory:")
 
 
 def _md5_hex_to_uuid(hex_str: str) -> str:
@@ -42,7 +57,7 @@ class LocalBackend(ComputeBackend):
         output_dir.mkdir(parents=True, exist_ok=True)
         await _ensure_miint_installed()
 
-        with duckdb.connect(":memory:") as conn:
+        with _open_conn() as conn:
             conn.execute("LOAD miint;")
             # Parameterized query to avoid SQL injection via fasta_path.
             # DuckDB raises on empty files — treat as zero sequences.
@@ -121,7 +136,7 @@ class LocalBackend(ComputeBackend):
         output_dir.mkdir(parents=True, exist_ok=True)
         await _ensure_miint_installed()
 
-        with duckdb.connect(":memory:") as conn:
+        with _open_conn() as conn:
             conn.execute("LOAD miint;")
             conn.execute("SET preserve_insertion_order=false;")
             conn.execute(f"SET temp_directory='{output_dir}/.duckdb_tmp';")
@@ -146,6 +161,7 @@ class LocalBackend(ComputeBackend):
 
 
 _PARQUET_OPTS = "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd'"
+_PARQUET_OPTS_CHUNKED = f"{_PARQUET_OPTS}, ROW_GROUP_SIZE 16384"
 _CHUNK_SIZE = 65536  # 64 KB
 
 
@@ -223,19 +239,33 @@ def _write_sequence_chunks(
 ) -> None:
     """Write reference_sequence_chunks.parquet — sequences chunked at 64 KB.
 
-    No ORDER BY — lets DuckDB stream and flush row groups incrementally
-    to avoid OOM on large references (e.g., 11 GB GG2 backbone with genomes).
+    Uses the list_transform + UNNEST macro pattern with ROW_GROUP_SIZE 16384
+    to force row group flushing before memory pressure builds. Without a small
+    ROW_GROUP_SIZE, DuckDB buffers too many rows and OOMs on large references.
+    max_batch_bytes limits read_fastx memory per batch.
     """
     out = _validate_parquet_path(output_dir / "reference_sequence_chunks.parquet")
     conn.execute(
+        f"CREATE OR REPLACE MACRO chunk_seq(str) AS "
+        f"list_transform("
+        f"  range(1, CAST(length(str) + 1 AS BIGINT), {_CHUNK_SIZE}),"
+        f"  lambda idx : {{"
+        f"    'chunk_index': CAST((idx - 1) / {_CHUNK_SIZE} AS INTEGER),"
+        f"    'chunk_data': substring(str, CAST(idx AS BIGINT), {_CHUNK_SIZE})"
+        f"  }}"
+        f")"
+    )
+    conn.execute(
         "COPY ("
-        "  SELECT m.feature_idx,"
-        f"    CAST((idx - 1) / {_CHUNK_SIZE} AS INTEGER) AS chunk_index,"
-        f"    substring(f.sequence1, CAST(idx AS BIGINT), {_CHUNK_SIZE}) AS chunk_data"
-        "  FROM read_fastx(?) f"
-        "  JOIN id_map m ON f.read_id = m.read_id,"
-        f"    range(1, CAST(length(f.sequence1) + 1 AS BIGINT), {_CHUNK_SIZE}) AS t(idx)"
-        f") TO '{out}' ({_PARQUET_OPTS})",
+        "  WITH unnested AS ("
+        "    SELECT m.feature_idx,"
+        "      UNNEST(chunk_seq(f.sequence1)) AS chunk"
+        "    FROM read_fastx(?, max_batch_bytes='512MB') f"
+        "    JOIN id_map m ON f.read_id = m.read_id"
+        "  )"
+        "  SELECT feature_idx, chunk.chunk_index, chunk.chunk_data"
+        "  FROM unnested"
+        f") TO '{out}' ({_PARQUET_OPTS_CHUNKED})",
         [str(fasta_path)],
     )
 
