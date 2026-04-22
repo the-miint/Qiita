@@ -1,7 +1,12 @@
+use arrow_flight::flight_service_server::FlightServiceServer;
+use duckdb::Connection;
 use tonic::transport::Server;
 use tonic_health::ServingStatus;
 
+mod auth;
 mod config;
+mod ducklake;
+mod flight_service;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -9,12 +14,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Configuration error: {e}");
         e
     })?;
-    if cfg.hmac_secret_key.is_none() {
-        eprintln!("Warning: HMAC_SECRET_KEY not set — Flight ticket signing is not active");
-    }
     if cfg.jwks_url.is_none() {
         eprintln!("Warning: JWKS_URL not set — JWT verification is not active");
     }
+
+    // Ensure DuckLake tables exist (one-time setup connection)
+    let setup_conn = Connection::open_in_memory()?;
+    ducklake::connect_ducklake(
+        &setup_conn,
+        &cfg.ducklake_catalog_connstr,
+        &cfg.ducklake_data_path,
+    )?;
+    ducklake::ensure_reference_tables(&setup_conn)?;
+    drop(setup_conn);
+
+    // Build Flight service — each request opens its own DuckDB connection
+    let flight_svc = flight_service::QiitaFlightService::new(
+        cfg.hmac_secret_key,
+        cfg.ducklake_catalog_connstr,
+        cfg.ducklake_data_path,
+    );
 
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
@@ -25,6 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Server::builder()
         .add_service(health_service)
+        .add_service(FlightServiceServer::new(flight_svc))
         .serve(cfg.listen_addr)
         .await?;
 
@@ -34,24 +54,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::config::Settings;
+    use base64::Engine;
     use duckdb::Connection;
+    use serial_test::serial;
 
     #[test]
-    fn config_defaults() {
-        // Ensure Settings::from_env() produces expected defaults when no env vars are set.
-        // Unset LISTEN_ADDR to guarantee default behaviour.
+    #[serial]
+    fn config_with_valid_env() {
         std::env::remove_var("LISTEN_ADDR");
-        let cfg = Settings::from_env().expect("Settings::from_env() failed with valid defaults");
+        let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
+        std::env::set_var("HMAC_SECRET_KEY", &secret);
+        std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test host=localhost");
+        let cfg = Settings::from_env().expect("Settings::from_env() failed with valid config");
         assert_eq!(cfg.listen_addr.to_string(), "0.0.0.0:50051");
+        assert_eq!(cfg.hmac_secret_key.len(), 32);
+        assert_eq!(cfg.ducklake_catalog_connstr, "dbname=test host=localhost");
+        std::env::remove_var("HMAC_SECRET_KEY");
+        std::env::remove_var("DUCKLAKE_CATALOG_CONNSTR");
+    }
+
+    #[test]
+    #[serial]
+    fn config_rejects_missing_hmac() {
+        std::env::remove_var("HMAC_SECRET_KEY");
+        std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
+        let err = Settings::from_env().unwrap_err();
+        assert!(
+            err.contains("HMAC_SECRET_KEY"),
+            "error should mention HMAC_SECRET_KEY: {err}"
+        );
+        std::env::remove_var("DUCKLAKE_CATALOG_CONNSTR");
     }
 
     #[test]
     fn miint_extension_smoke() {
-        // "miint" is the DuckDB community extension for minimizer index tables.
         let conn = Connection::open_in_memory().expect("open in-memory DuckDB");
         conn.execute_batch("INSTALL miint FROM community; LOAD miint;")
             .expect("failed to install/load miint extension");
-        // Verify the extension is functional: miint_versions() must return at least one row.
         let mut stmt = conn
             .prepare("SELECT count(*) FROM miint_versions()")
             .expect("failed to prepare miint_versions() query");

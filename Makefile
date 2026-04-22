@@ -1,5 +1,5 @@
 .PHONY: build test test-python test-rust test-integration test-workflows lint lint-python lint-rust deploy migrate clean verify-health dev-setup install-hooks
-.PHONY: build-common build-control-plane build-data-plane build-compute-orchestrator build-workflows
+.PHONY: build-common build-control-plane build-data-plane build-data-plane-debug build-compute-orchestrator build-workflows
 .PHONY: test-common test-control-plane test-data-plane test-compute-orchestrator
 .PHONY: lint-common lint-control-plane lint-data-plane lint-compute-orchestrator
 
@@ -41,6 +41,11 @@ build-control-plane:
 
 build-data-plane:
 	cd qiita-data-plane && cargo build --release --features duckdb/bundled
+
+# Debug binary used by Python integration tests (fast to build; dynamically
+# links libduckdb from target/duckdb-download via DUCKDB_DOWNLOAD_LIB).
+build-data-plane-debug:
+	cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo build
 
 build-compute-orchestrator:
 	cd qiita-compute-orchestrator && uv sync
@@ -86,9 +91,34 @@ test-workflows:
 	rm -f /tmp/qiita-workflow-smoke.sif
 
 # Run integration tests (requires Docker for Postgres)
-test-integration:
+# Runs Python integration tests + Rust DuckLake tests (which need Postgres).
+# System tests (real GG2 data) are excluded — use make test-system.
+# Builds the data plane debug binary first so Python tests can spawn it
+# without shelling out to cargo.
+#
+# The qiita_ducklake catalog is dropped/recreated between the Python and Rust
+# phases because DuckLake pins DATA_PATH into the catalog, and the two suites
+# use different DATA_PATH values (Python picks a pytest tmp_path_factory dir,
+# Rust defaults to /tmp/qiita-integration-ducklake-data). Mirrors the Python
+# _reset_ducklake_catalog() helper in tests/integration/conftest.py.
+test-integration: build-data-plane-debug
 	cd tests/integration && docker compose up -d --wait && \
-	  (uv run pytest; EC=$$?; docker compose down; exit $$EC)
+	  (uv run pytest -m 'not system'; PY_EC=$$?; \
+	   docker compose exec -T postgres psql -U qiita -d postgres \
+	     -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'qiita_ducklake' AND pid != pg_backend_pid()" \
+	     -c "DROP DATABASE IF EXISTS qiita_ducklake" \
+	     -c "CREATE DATABASE qiita_ducklake OWNER qiita"; \
+	   cd ../../qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test --features integration; RS_EC=$$?; \
+	   cd ../tests/integration && docker compose down; \
+	   exit $$(( PY_EC > RS_EC ? PY_EC : RS_EC )))
+
+# Run system tests with real GG2 backbone data (requires Docker + data in localdocs/scratch/)
+# Slow (~10 min): hashes 331K sequences, mints features, writes chunked Parquet.
+test-system: build-data-plane-debug
+	cd tests/integration && docker compose up -d --wait && \
+	  (uv run pytest -m system -x --timeout=2700; PY_EC=$$?; \
+	   docker compose down; \
+	   exit $$PY_EC)
 
 # Lint all components
 lint: lint-python lint-rust
@@ -121,7 +151,7 @@ $(GRPCURL_BIN):
 
 # Run database migrations
 migrate: $(DBMATE_BIN)
-	cd qiita-control-plane && $(DBMATE_BIN) up
+	cd qiita-control-plane && $(DBMATE_BIN) --migrations-table public.schema_migrations --no-dump-schema up
 
 # Build and print deploy instructions (no sudo)
 deploy: build

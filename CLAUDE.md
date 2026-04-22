@@ -48,6 +48,10 @@ cd qiita-control-plane && uv sync
 cd qiita-compute-orchestrator && uv sync
 ```
 
+## Development ethos
+
+**Fail fast, fail early, fail loudly.** Validate inputs at every boundary. Return structured errors with enough context to diagnose without a debugger. Prefer raising/panicking over silently returning defaults for unexpected states. Silent failures are bugs.
+
 ## Architecture
 
 See `docs/architecture.md` for the full system diagram. What follows is the non-obvious cross-cutting structure.
@@ -102,7 +106,7 @@ The data plane is intentionally "dumb": it only operates on identifiers it recei
 
 **Horizontal scaling**: each data plane instance holds an independent DuckDB+DuckLake connection to the shared Postgres catalog. DuckLake's snapshot isolation means instances never block each other. Add instances to `upstream qiita_data_plane` in nginx to scale.
 
-**Bundled DuckDB**: `duckdb = { version = "1.10501.0", features = ["bundled"] }` statically links DuckDB v1.5.1. First compile is slow (~2.5 min); subsequent incremental builds are fast. The Rust build cache in CI (`Swatinem/rust-cache`) avoids recompiling it on every push.
+**DuckDB**: `duckdb = { version = "1.10502.0" }` links DuckDB v1.5.2. The Rust build cache in CI (`Swatinem/rust-cache`) avoids recompiling it on every push.
 
 ### Compute orchestrator pattern
 
