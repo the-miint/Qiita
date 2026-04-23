@@ -29,7 +29,20 @@ Run `make dev-setup` for exact install commands. Required tools:
 # Install deps for all components
 make build
 
-# Run database migrations (requires Postgres running)
+
+# Before running migrations or starting services, create a local `.env` from the committed template and source it (`.env` is already gitignored):
+
+cp .env.example .env
+
+# EDIT: ----------------------------------
+# edit .env and fill in DATABASE_URL, HMAC_SECRET_KEY, CONTROL_PLANE_URL, and DUCKLAKE_CATALOG_CONNSTR
+# ----------------------------------------
+
+. .env
+
+
+# create the `qiita` database if it does not already exist, then runs all pending migrations:
+
 make migrate
 ```
 

@@ -19,10 +19,10 @@ ifeq ($(UNAME_S),Linux)
   endif
 else ifeq ($(UNAME_S),Darwin)
   ifeq ($(UNAME_M),arm64)
-    DBMATE_ARCH  := darwin-arm64
+    DBMATE_ARCH  := macos-arm64
     GRPCURL_ARCH := osx_arm64
   else
-    DBMATE_ARCH  := darwin-amd64
+    DBMATE_ARCH  := macos-amd64
     GRPCURL_ARCH := osx_x86_64
   endif
 endif
