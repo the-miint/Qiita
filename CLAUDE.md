@@ -8,12 +8,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # First-time setup (run once after cloning)
 make install-hooks   # installs pre-commit hooks via uv tool
 
-# Build all components
+# Check tool prerequisites; prints install commands only for what's missing
+make dev-setup
+
+# Build all components (release data-plane binary uses bundled DuckDB)
 make build
 
 # Test
 make test                  # unit tests (all components)
-make test-integration      # requires Docker; starts/stops postgres on :5433
+make test-integration      # requires Docker; runs Python + Rust integration suites against postgres on :5433; excludes -m system
+make test-system           # real GG2 backbone data; slow (~10 min); needs localdocs/scratch/
 make test-workflows        # requires apptainer; skips gracefully if absent
 
 # Lint
@@ -25,6 +29,9 @@ make migrate
 # Deploy (prints systemd + nginx instructions; does not sudo)
 make deploy
 make verify-health         # auto-installs grpcurl
+
+# Clean component build artifacts (.venv, target/, caches)
+make clean
 ```
 
 **Running a single test:**
@@ -32,14 +39,16 @@ make verify-health         # auto-installs grpcurl
 # Python
 cd qiita-control-plane && uv run pytest tests/test_smoke.py::test_health
 
-# Rust
-cd qiita-data-plane && cargo test config_defaults
+# Rust — DUCKDB_DOWNLOAD_LIB=1 dynamically links a prebuilt libduckdb from
+# target/duckdb-download instead of rebuilding the bundled DuckDB from source.
+# Without it, every invocation can spend many minutes compiling DuckDB.
+cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test config_defaults
 ```
 
 **Linting a single component:**
 ```bash
 cd qiita-common && uv run ruff check . && uv run ruff format --check .
-cd qiita-data-plane && cargo clippy -- -D warnings && cargo fmt --check
+cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo clippy -- -D warnings && cargo fmt --check
 ```
 
 **After changing `qiita-common`**, re-sync dependents so they pick up the changes:
@@ -54,7 +63,7 @@ cd qiita-compute-orchestrator && uv sync
 
 ## Architecture
 
-See `docs/architecture.md` for the full system diagram. What follows is the non-obvious cross-cutting structure.
+See `docs/architecture.md` for the full system diagram and `docs/reference-data-staging.md` for how reference databases are ingested. What follows is the non-obvious cross-cutting structure.
 
 ### Component map and ports
 
@@ -108,6 +117,8 @@ The data plane is intentionally "dumb": it only operates on identifiers it recei
 
 **DuckDB**: `duckdb = { version = "1.10502.0" }` links DuckDB v1.5.2. The Rust build cache in CI (`Swatinem/rust-cache`) avoids recompiling it on every push.
 
+**Two Rust build flavors**: `make build-data-plane` produces a release binary with `--features duckdb/bundled` (statically linked, slow to build). `make build-data-plane-debug` produces a debug binary that dynamically links libduckdb via `DUCKDB_DOWNLOAD_LIB=1` (fast). `make test-integration` and `make test-system` depend on the debug binary because Python integration tests spawn it directly from its target path instead of shelling out to `cargo run`.
+
 ### Compute orchestrator pattern
 
 The orchestrator owns the full job lifecycle — SLURM jobs themselves are kept dumb (read input, write output, exit). The orchestrator submits via slurmrestd, polls for completion, verifies output (identifier integrity + file mode), collects logs, then calls back to the control plane REST endpoint. It uses a dedicated `compute` service account with narrow permissions (update work tickets + request file registration only).
@@ -130,3 +141,7 @@ Both `uv.lock` (Python) and `Cargo.lock` (Rust) are committed. Do not add them t
 ### Integration tests
 
 Use port `5433` (not `5432`) for the test Postgres container to avoid collision with the system Postgres instance. The `make test-integration` target manages its own `docker compose up/down` — do not add a separate postgres service to the CI job for this.
+
+**DuckLake catalog reset between phases**: `make test-integration` runs the Python suite, then drops and recreates the `qiita_ducklake` Postgres database, then runs the Rust suite. This is required because DuckLake pins `DATA_PATH` into the catalog at creation time, and the two suites use different `DATA_PATH` values (Python picks a pytest `tmp_path_factory` dir; Rust defaults to `/tmp/qiita-integration-ducklake-data`). Reusing the catalog across phases causes confusing "path mismatch" failures. The Python-side analogue is `_reset_ducklake_catalog()` in `tests/integration/conftest.py`; keep the two mechanisms in sync.
+
+**System vs integration marker**: system tests are marked `@pytest.mark.system` and are excluded from `make test-integration` via `-m 'not system'`. Run them with `make test-system`.
