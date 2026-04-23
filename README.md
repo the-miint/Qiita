@@ -38,7 +38,7 @@ cp .env.example .env
 # edit .env and fill in DATABASE_URL, HMAC_SECRET_KEY, CONTROL_PLANE_URL, and DUCKLAKE_CATALOG_CONNSTR
 # ----------------------------------------
 
-source .env
+. .env
 
 
 # create the `qiita` database if it does not already exist, then runs all pending migrations:
