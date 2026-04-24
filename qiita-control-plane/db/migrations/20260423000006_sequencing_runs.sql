@@ -5,7 +5,7 @@
 -- =============================================================================
 
 CREATE TABLE qiita.sequencing_run (
-    idx                  BIGSERIAL PRIMARY KEY,
+    idx                  BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     instrument_run_id    VARCHAR(255) NOT NULL,
     instrument_model     TEXT,
     instrument_serial    TEXT,

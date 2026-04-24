@@ -5,7 +5,7 @@
 -- =============================================================================
 
 CREATE TABLE qiita.prep_protocol (
-    idx             BIGSERIAL PRIMARY KEY,
+    idx             BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     name            TEXT NOT NULL,
     description     TEXT,
     created_by_idx  BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
@@ -59,7 +59,7 @@ CREATE INDEX prep_protocol_active_idx
 -- =============================================================================
 
 CREATE TABLE qiita.sequenced_sample_global_field (
-    idx               BIGSERIAL PRIMARY KEY,
+    idx               BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     internal_name     TEXT NOT NULL,
     display_name      TEXT NOT NULL,
     description       TEXT,
@@ -91,7 +91,7 @@ COMMENT ON COLUMN qiita.sequenced_sample_global_field.internal_name IS
 
 
 CREATE TABLE qiita.sequenced_sample_study_field (
-    idx                                BIGSERIAL PRIMARY KEY,
+    idx                                BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     study_idx                          BIGINT NOT NULL REFERENCES qiita.study(idx) ON DELETE RESTRICT,
     sequenced_sample_global_field_idx  BIGINT REFERENCES qiita.sequenced_sample_global_field(idx) ON DELETE RESTRICT,
     display_name                       TEXT NOT NULL,

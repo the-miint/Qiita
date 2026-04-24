@@ -5,7 +5,7 @@
 -- =============================================================================
 
 CREATE TABLE qiita.biosample_global_field (
-    idx               BIGSERIAL PRIMARY KEY,
+    idx               BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     internal_name     TEXT NOT NULL,
     display_name      TEXT NOT NULL,
     description       TEXT,
@@ -35,7 +35,7 @@ COMMENT ON COLUMN qiita.biosample_global_field.internal_name IS
 
 
 CREATE TABLE qiita.biosample_study_field (
-    idx                         BIGSERIAL PRIMARY KEY,
+    idx                         BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     study_idx                   BIGINT NOT NULL REFERENCES qiita.study(idx) ON DELETE RESTRICT,
     biosample_global_field_idx  BIGINT REFERENCES qiita.biosample_global_field(idx) ON DELETE RESTRICT,
     display_name                TEXT NOT NULL,

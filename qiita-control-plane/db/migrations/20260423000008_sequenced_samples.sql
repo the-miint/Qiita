@@ -5,7 +5,7 @@
 -- =============================================================================
 
 CREATE TABLE qiita.sequenced_sample (
-    idx                             BIGSERIAL PRIMARY KEY,
+    idx                             BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     biosample_idx                   BIGINT NOT NULL REFERENCES qiita.biosample(idx) ON DELETE RESTRICT,
     owner_idx                       BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
     prep_protocol_idx               BIGINT NOT NULL REFERENCES qiita.prep_protocol(idx) ON DELETE RESTRICT,
@@ -170,7 +170,7 @@ CREATE INDEX sequenced_sample_to_study_active_idx
 -- =============================================================================
 
 CREATE TABLE qiita.sequenced_sample_metadata (
-    idx                                BIGSERIAL PRIMARY KEY,
+    idx                                BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     sequenced_sample_idx               BIGINT NOT NULL REFERENCES qiita.sequenced_sample(idx) ON DELETE RESTRICT,
     sequenced_sample_study_field_idx   BIGINT NOT NULL REFERENCES qiita.sequenced_sample_study_field(idx) ON DELETE RESTRICT,
     -- Maintained by trigger; see comment.
@@ -232,7 +232,7 @@ CREATE UNIQUE INDEX sequenced_sample_metadata_one_value_per_global_concept
 -- =============================================================================
 
 CREATE TABLE qiita.sequenced_sample_field_exception (
-    idx                                BIGSERIAL PRIMARY KEY,
+    idx                                BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     sequenced_sample_idx               BIGINT NOT NULL REFERENCES qiita.sequenced_sample(idx) ON DELETE RESTRICT,
     -- Dual-keyed; see table comment.
     sequenced_sample_study_field_idx   BIGINT REFERENCES qiita.sequenced_sample_study_field(idx) ON DELETE RESTRICT,

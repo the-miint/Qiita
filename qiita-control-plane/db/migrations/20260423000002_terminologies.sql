@@ -5,7 +5,7 @@
 -- =============================================================================
 
 CREATE TABLE qiita.terminology (
-    idx          BIGSERIAL PRIMARY KEY,
+    idx          BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     name         VARCHAR(255) NOT NULL,
     version      VARCHAR(50) NOT NULL,
     loaded_at    TIMESTAMPTZ NOT NULL,
@@ -34,7 +34,7 @@ COMMENT ON COLUMN qiita.terminology.loaded_at IS
 
 
 CREATE TABLE qiita.terminology_term (
-    idx              BIGSERIAL PRIMARY KEY,
+    idx              BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     terminology_idx  BIGINT NOT NULL REFERENCES qiita.terminology(idx) ON DELETE RESTRICT,
     term_id          VARCHAR(255) NOT NULL,
     label            VARCHAR(500) NOT NULL,
@@ -49,7 +49,7 @@ CREATE INDEX terminology_term_active_idx ON qiita.terminology_term (terminology_
 
 
 CREATE TABLE qiita.terminology_closure (
-    idx                    BIGSERIAL PRIMARY KEY,
+    idx                    BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     terminology_idx        BIGINT NOT NULL REFERENCES qiita.terminology(idx) ON DELETE RESTRICT,
     ancestor_term_idx      BIGINT NOT NULL REFERENCES qiita.terminology_term(idx) ON DELETE RESTRICT,
     descendant_term_idx    BIGINT NOT NULL REFERENCES qiita.terminology_term(idx) ON DELETE RESTRICT,
@@ -83,7 +83,7 @@ CREATE INDEX terminology_closure_descendant_idx ON qiita.terminology_closure (de
 -- user-authored content.
 
 CREATE TABLE qiita.missing_value_reason (
-    idx          BIGSERIAL PRIMARY KEY,
+    idx          BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     name         VARCHAR(100) NOT NULL,
     description  TEXT,
 
