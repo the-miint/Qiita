@@ -16,7 +16,7 @@ CREATE TABLE qiita.principal (
     idx             BIGSERIAL PRIMARY KEY,
     display_name    VARCHAR(255) NOT NULL,
     system_role     qiita.system_role NOT NULL DEFAULT 'user',
-    created_by_idx  BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
+    created_by_idx  BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     -- Retirement columns; see retired column comment.

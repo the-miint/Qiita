@@ -208,7 +208,7 @@ CREATE TABLE qiita.study_tag_to_study (
 
 COMMENT ON TABLE qiita.study_tag_to_study IS
     'Association between a study_tag and a study. No retirement columns: '
-    'associations are hard-deleted, not retired, because there is no'
+    'associations are hard-deleted, not retired, because there is no '
     'audit value in preserving defunct tag/study links.';
 
 -- Supports "find all studies with this tag" search.
