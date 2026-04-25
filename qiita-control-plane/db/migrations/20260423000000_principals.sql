@@ -13,7 +13,7 @@ CREATE TYPE qiita.system_role AS ENUM (
 
 
 CREATE TABLE qiita.principal (
-    idx             BIGSERIAL PRIMARY KEY,
+    idx             BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     display_name    VARCHAR(255) NOT NULL,
     system_role     qiita.system_role NOT NULL DEFAULT 'user',
     created_by_idx  BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED,

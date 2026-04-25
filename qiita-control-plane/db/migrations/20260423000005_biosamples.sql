@@ -5,7 +5,7 @@
 -- =============================================================================
 
 CREATE TABLE qiita.biosample (
-    idx                      BIGSERIAL PRIMARY KEY,
+    idx                      BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     owner_idx                BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
     metadata_checklist_idx   BIGINT NOT NULL REFERENCES qiita.metadata_checklist(idx) ON DELETE RESTRICT,
     biosample_accession      VARCHAR(50),
@@ -139,7 +139,7 @@ CREATE INDEX biosample_to_study_active_idx
 -- =============================================================================
 
 CREATE TABLE qiita.biosample_metadata (
-    idx                          BIGSERIAL PRIMARY KEY,
+    idx                          BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     biosample_idx                BIGINT NOT NULL REFERENCES qiita.biosample(idx) ON DELETE RESTRICT,
     biosample_study_field_idx    BIGINT NOT NULL REFERENCES qiita.biosample_study_field(idx) ON DELETE RESTRICT,
     -- Maintained by trigger; see comment.
@@ -206,7 +206,7 @@ CREATE UNIQUE INDEX biosample_metadata_one_value_per_global_concept
 -- =============================================================================
 
 CREATE TABLE qiita.biosample_field_exception (
-    idx                          BIGSERIAL PRIMARY KEY,
+    idx                          BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     biosample_idx                BIGINT NOT NULL REFERENCES qiita.biosample(idx) ON DELETE RESTRICT,
     -- Dual-keyed; see table comment.
     biosample_study_field_idx    BIGINT REFERENCES qiita.biosample_study_field(idx) ON DELETE RESTRICT,

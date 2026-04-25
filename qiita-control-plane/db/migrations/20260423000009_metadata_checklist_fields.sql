@@ -5,7 +5,7 @@
 -- =============================================================================
 
 CREATE TABLE qiita.metadata_checklist_field (
-    idx                                BIGSERIAL PRIMARY KEY,
+    idx                                BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     metadata_checklist_idx             BIGINT NOT NULL REFERENCES qiita.metadata_checklist(idx) ON DELETE RESTRICT,
     -- Dual-keyed; see table comment.
     biosample_global_field_idx         BIGINT REFERENCES qiita.biosample_global_field(idx) ON DELETE RESTRICT,

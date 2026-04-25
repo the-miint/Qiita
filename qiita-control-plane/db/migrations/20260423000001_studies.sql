@@ -62,7 +62,7 @@ $$;
 -- =============================================================================
 
 CREATE TABLE qiita.study (
-    idx                          BIGSERIAL PRIMARY KEY,
+    idx                          BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     owner_idx                    BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
     principal_investigator_idx   BIGINT REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
     title                        VARCHAR(500) NOT NULL,
@@ -118,7 +118,7 @@ CREATE TRIGGER study_set_updated_at
 -- =============================================================================
 
 CREATE TABLE qiita.study_access (
-    idx            BIGSERIAL PRIMARY KEY,
+    idx            BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     study_idx      BIGINT NOT NULL REFERENCES qiita.study(idx) ON DELETE RESTRICT,
     principal_idx  BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
     access_tier    qiita.tier NOT NULL,
@@ -167,7 +167,7 @@ CREATE INDEX study_access_principal_idx ON qiita.study_access (principal_idx);
 -- their associations are removed; the registry is not automatically pruned.
 
 CREATE TABLE qiita.study_tag (
-    idx            BIGSERIAL PRIMARY KEY,
+    idx            BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
 
     -- Tag name, canonicalized to lowercase ASCII. The CHECK constraint
     -- enforces the character set; the UNIQUE constraint enforces that

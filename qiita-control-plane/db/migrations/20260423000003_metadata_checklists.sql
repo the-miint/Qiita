@@ -14,7 +14,7 @@
 -- declared until after this one.
 
 CREATE TABLE qiita.metadata_checklist (
-    idx                            BIGSERIAL PRIMARY KEY,
+    idx                            BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     name                           VARCHAR(255) NOT NULL,
     description                    TEXT,
     parent_metadata_checklist_idx  BIGINT REFERENCES qiita.metadata_checklist(idx) ON DELETE SET NULL,
