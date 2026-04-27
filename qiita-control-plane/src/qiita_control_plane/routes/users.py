@@ -1,17 +1,29 @@
 """User management routes — operates on the qiita.user subtype.
 
-Phase B uses the mock get_current_principal_idx; the real auth flip happens
-in Phase H.b. POST /users is the admin-creates-a-user path; in production
-the OIDC resolver creates users on first login and POST /users is rarely
-exercised — but it remains the way an admin onboards someone before they've
-logged in (e.g., a PI imported from another system).
+Phase H.b: every route uses the real Phase E guards.
+
+- POST /users        — admin creates a user (system_admin + admin:users).
+                       In production the OIDC resolver creates users on
+                       first login; this route remains for admins to
+                       onboard PIs imported from external systems.
+- GET /users/me      — humans only, no scope gate (you can always read
+                       your own profile).
+- PATCH /users/me    — humans only + self:profile scope. `email` and
+                       status fields are absent from UserUpdate so
+                       attempts to set them are silently dropped.
 """
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
 from qiita_common.models import UserCreate, UserResponse, UserUpdate
 
-from ..deps import get_current_principal_idx, get_db_pool
+from ..auth.guards import (
+    require_human,
+    require_role_at_least,
+    require_scope,
+)
+from ..auth.principal import HumanUser, Principal
+from ..deps import get_db_pool
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -26,12 +38,13 @@ _USER_RETURNING_COLS = (
 async def create_user(
     body: UserCreate,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    actor_principal_idx: int = Depends(get_current_principal_idx),
+    actor: HumanUser = Depends(require_role_at_least("system_admin")),
+    _scope: Principal = Depends(require_scope("admin:users")),
 ) -> UserResponse:
-    """Create a new principal + user row in one transaction.
+    """Admin creates a new principal + user row in one transaction.
 
-    The new principal's `created_by_idx` points at the requesting principal
-    (the admin who initiated the action). Conflicts on email return 409.
+    The new principal's `created_by_idx` points at the requesting admin's
+    principal_idx. 409 on email conflict (case-insensitive via CITEXT).
     """
     try:
         async with pool.acquire() as conn:
@@ -41,7 +54,7 @@ async def create_user(
                     "  (display_name, system_role, created_by_idx)"
                     " VALUES ($1, 'user', $2) RETURNING idx",
                     body.display_name,
-                    actor_principal_idx,
+                    actor.principal_idx,
                 )
                 user_row = await conn.fetchrow(
                     "INSERT INTO qiita.user"
@@ -70,9 +83,9 @@ async def create_user(
 @router.get("/me")
 async def get_me(
     pool: asyncpg.Pool = Depends(get_db_pool),
-    principal_idx: int = Depends(get_current_principal_idx),
+    user: HumanUser = Depends(require_human),
 ) -> UserResponse:
-    """Return the authenticated principal's user profile."""
+    """Return the authenticated user's profile."""
     row = await pool.fetchrow(
         "SELECT p.idx AS principal_idx, p.display_name,"
         " u.email, u.affiliation, u.address, u.phone, u.orcid,"
@@ -81,7 +94,7 @@ async def get_me(
         " FROM qiita.principal p"
         " JOIN qiita.user u ON u.principal_idx = p.idx"
         " WHERE p.idx = $1",
-        principal_idx,
+        user.principal_idx,
     )
     if row is None:
         raise HTTPException(
@@ -95,12 +108,13 @@ async def get_me(
 async def patch_me(
     body: UserUpdate,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    principal_idx: int = Depends(get_current_principal_idx),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope("self:profile")),
 ) -> UserResponse:
-    """Update the authenticated principal's profile.
+    """Update the authenticated user's profile.
 
     Only profile fields are mutable. `email` and status fields are
-    intentionally excluded from `UserUpdate`; Pydantic drops unknown fields,
+    intentionally absent from `UserUpdate`; Pydantic drops unknown fields
     so the SQL UPDATE never builds a SET clause for them.
     """
     updates = body.model_dump(exclude_unset=True)
@@ -110,14 +124,12 @@ async def patch_me(
         values = [updates[c] for c in cols]
         result = await pool.execute(
             f"UPDATE qiita.user SET {set_clause} WHERE principal_idx = $1",
-            principal_idx,
+            user.principal_idx,
             *values,
         )
-        # asyncpg returns "UPDATE 0" / "UPDATE 1" — verify the row existed.
         if result.endswith("0"):
             raise HTTPException(
                 status_code=404,
                 detail="Authenticated principal has no user profile",
             )
-    # Always return the current state via the same SELECT path as GET /users/me.
-    return await get_me(pool=pool, principal_idx=principal_idx)
+    return await get_me(pool=pool, user=user)

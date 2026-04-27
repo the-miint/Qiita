@@ -5,8 +5,9 @@ from httpx import ASGITransport, AsyncClient
 
 
 @pytest.fixture
-async def client(postgres_pool):
-    """AsyncClient wired to the control plane app with the integration test pool.
+async def client(postgres_pool, human_admin_session):
+    """AsyncClient wired to the control plane app with the integration test pool
+    and a session-scoped admin PAT preset on the Authorization header.
 
     ASGITransport does not trigger FastAPI lifespan, so the pool from conftest
     is injected directly into app.state.
@@ -20,6 +21,7 @@ async def client(postgres_pool):
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://test",
+        headers={"Authorization": f"Bearer {human_admin_session['token']}"},
     ) as ac:
         ac._created_refs = created_refs
         yield ac
@@ -47,7 +49,7 @@ async def _create_ref(client, name, version="1.0", kind="sequence_reference"):
     return resp
 
 
-async def test_create_reference_returns_201(client):
+async def test_create_reference_returns_201(client, human_admin_session):
     """POST /api/v1/references with valid payload returns 201."""
     resp = await _create_ref(client, "test-ref-create")
     assert resp.status_code == 201
@@ -56,6 +58,14 @@ async def test_create_reference_returns_201(client):
     assert body["reference_idx"] > 0
     assert body["status"] == "pending"
     assert body["name"] == "test-ref-create"
+    # Phase H.b dual-write invariant: created_by_idx is the admin's idx,
+    # created_by is the deterministic uuid5 derived from it.
+    from uuid import NAMESPACE_OID, uuid5
+
+    assert body["created_by_idx"] == human_admin_session["principal_idx"]
+    assert body["created_by"] == str(
+        uuid5(NAMESPACE_OID, str(human_admin_session["principal_idx"]))
+    )
 
 
 async def test_create_reference_rejects_invalid_kind(client):

@@ -14,28 +14,25 @@ def get_db_pool(request: Request) -> asyncpg.Pool:
     return pool
 
 
-def get_current_user(request: Request) -> UUID:
-    """Return the authenticated user ID.
+# DEPRECATED: removed in Phase H.c.
+# Both `get_current_user` and `get_current_principal_idx` are mock auth
+# helpers from Phases B and earlier. Phase H.b flipped every route to the
+# real `get_current_principal` resolver from `auth.principal`; nothing
+# imports these any more. They survive this single commit so reverting
+# H.b mid-rollout doesn't strand the legacy callers.
 
-    Currently returns a mock user ID. Will be replaced with JWT extraction
-    in Phase E and removed entirely in Phase H.c.
-    """
+
+def get_current_user(request: Request) -> UUID:
+    """DEPRECATED — removed in Phase H.c. Returns a mock UUID."""
     return UUID("a0000000-0000-0000-0000-000000000001")
 
 
-# Mock principal_idx resolver used by Phase B routes/users.py until real
-# auth lands in Phase E. Looks up a fixture-seeded principal by display_name.
-# In tests the integration conftest seeds it; in dev/prod it must be created
-# out-of-band (or the request fails 503).
 _MOCK_PRINCIPAL_DISPLAY_NAME = "mock-admin"
 
 
 async def get_current_principal_idx(request: Request) -> int:
-    """Return the authenticated principal's idx (mock).
-
-    Resolves a fixture-seeded principal via display_name lookup. Replaced
-    by real OIDC/PAT-driven resolution in Phase E.
-    """
+    """DEPRECATED — removed in Phase H.c. Looks up a mock principal by
+    display_name."""
     pool = get_db_pool(request)
     idx = await pool.fetchval(
         "SELECT idx FROM qiita.principal WHERE display_name = $1",
@@ -46,7 +43,7 @@ async def get_current_principal_idx(request: Request) -> int:
             status_code=503,
             detail=(
                 f"Mock principal '{_MOCK_PRINCIPAL_DISPLAY_NAME}' not seeded — "
-                "create one before calling auth-aware routes (Phase B mock-auth requirement)"
+                "deprecated mock auth path"
             ),
         )
     return idx

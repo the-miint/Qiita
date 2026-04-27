@@ -192,25 +192,153 @@ def jwks_harness():
 
 
 @pytest_asyncio.fixture(scope="session")
+async def human_admin_session(postgres_pool):
+    """A session-scoped system_admin human with a complete profile and a
+    PAT carrying the full admin scope ceiling. Tests use this token to
+    drive routes that require human + admin authority (POST /references,
+    POST /admin/*, PATCH /users/me).
+
+    The principal persists across sessions because qiita.auth_events
+    references it via FK and is append-only — by design. Reusing the same
+    display_name is idempotent: the fixture looks it up and only creates
+    if absent.
+    """
+    from qiita_control_plane.auth.tokens import mint_api_token
+
+    display_name = "test-human-admin"
+    idx = await postgres_pool.fetchval(
+        "SELECT idx FROM qiita.principal WHERE display_name = $1",
+        display_name,
+    )
+    if idx is None:
+        async with postgres_pool.acquire() as conn:
+            async with conn.transaction():
+                idx = await conn.fetchval(
+                    "INSERT INTO qiita.principal"
+                    "  (display_name, system_role, created_by_idx)"
+                    " VALUES ($1, 'system_admin', 1) RETURNING idx",
+                    display_name,
+                )
+                await conn.execute(
+                    "INSERT INTO qiita.user"
+                    "  (principal_idx, email, affiliation, address, phone)"
+                    " VALUES ($1, $2, 'UCSD', '9500 Gilman', '555-0001')",
+                    idx, f"{display_name}@example.com",
+                )
+    # Make sure existing rows have a complete profile (idempotent).
+    await postgres_pool.execute(
+        "UPDATE qiita.user SET affiliation = 'UCSD', address = '9500 Gilman',"
+        " phone = '555-0001'"
+        " WHERE principal_idx = $1",
+        idx,
+    )
+    # Make sure principal isn't disabled / retired from a prior partial run.
+    await postgres_pool.execute(
+        "UPDATE qiita.principal SET"
+        "  disabled = false, disabled_at = NULL, disabled_by_idx = NULL,"
+        "  disable_reason = NULL"
+        " WHERE idx = $1 AND retired = false",
+        idx,
+    )
+    plaintext, _ = await mint_api_token(
+        postgres_pool,
+        principal_idx=idx,
+        label="session-admin",
+        scopes=[
+            "self:profile",
+            "self:tokens",
+            "references:read",
+            "references:write",
+            "admin:users",
+            "admin:service_accounts",
+            "admin:audit_read",
+        ],
+    )
+    return {
+        "principal_idx": idx,
+        "token": plaintext,
+        "email": f"{display_name}@example.com",
+        "display_name": display_name,
+    }
+
+
+@pytest_asyncio.fixture(scope="session")
+async def regular_user_session(postgres_pool):
+    """A session-scoped 'user'-role human with a complete profile and a
+    PAT scoped to the user ceiling. Used for negative-case tests that
+    need a non-admin caller (e.g., 403 on admin endpoints)."""
+    from qiita_control_plane.auth.tokens import mint_api_token
+
+    display_name = "test-regular-user"
+    idx = await postgres_pool.fetchval(
+        "SELECT idx FROM qiita.principal WHERE display_name = $1",
+        display_name,
+    )
+    if idx is None:
+        async with postgres_pool.acquire() as conn:
+            async with conn.transaction():
+                idx = await conn.fetchval(
+                    "INSERT INTO qiita.principal"
+                    "  (display_name, system_role, created_by_idx)"
+                    " VALUES ($1, 'user', 1) RETURNING idx",
+                    display_name,
+                )
+                await conn.execute(
+                    "INSERT INTO qiita.user"
+                    "  (principal_idx, email, affiliation, address, phone)"
+                    " VALUES ($1, $2, 'UCSD', 'X', 'Y')",
+                    idx, f"{display_name}@example.com",
+                )
+    plaintext, _ = await mint_api_token(
+        postgres_pool,
+        principal_idx=idx,
+        label="session-user",
+        scopes=["self:profile", "self:tokens", "references:read"],
+    )
+    return {
+        "principal_idx": idx,
+        "token": plaintext,
+        "email": f"{display_name}@example.com",
+        "display_name": display_name,
+    }
+
+
+@pytest_asyncio.fixture(scope="session")
 async def compute_worker_service_account(postgres_pool, tmp_path_factory):
     """Provision a service-account-kind principal with worker scopes and
     write its token to a tmp file. Reused by the orchestrator-auth tests
     in Phase I; the file path is the canonical drop-in for the production
     `/etc/qiita/orchestrator.token` location.
 
+    Idempotent across pytest sessions: if a previous run created the
+    service_account row (auth_events FK keeps principals around), look it
+    up by name instead of re-creating. Always mints a fresh token so each
+    session starts with a known-good credential.
+
     Returns a dict with `principal_idx`, `token_path` (Path), `token` (str).
     """
     from qiita_control_plane.auth.tokens import mint_api_token
 
+    SVC_NAME = "compute-worker-fixture"
     pidx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-        " VALUES ('compute-worker-fixture', 'user', 1) RETURNING idx"
+        "SELECT principal_idx FROM qiita.service_account WHERE name = $1",
+        SVC_NAME,
     )
-    await postgres_pool.execute(
-        "INSERT INTO qiita.service_account (principal_idx, name, description)"
-        " VALUES ($1, 'compute-worker-fixture', 'orchestrator service-account fixture')",
-        pidx,
-    )
+    if pidx is None:
+        async with postgres_pool.acquire() as conn:
+            async with conn.transaction():
+                pidx = await conn.fetchval(
+                    "INSERT INTO qiita.principal"
+                    "  (display_name, system_role, created_by_idx)"
+                    " VALUES ($1, 'user', 1) RETURNING idx",
+                    SVC_NAME,
+                )
+                await conn.execute(
+                    "INSERT INTO qiita.service_account"
+                    "  (principal_idx, name, description)"
+                    " VALUES ($1, $2, 'orchestrator service-account fixture')",
+                    pidx, SVC_NAME,
+                )
     plaintext, _ = await mint_api_token(
         postgres_pool,
         principal_idx=pidx,

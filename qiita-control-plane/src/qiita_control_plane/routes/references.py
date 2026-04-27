@@ -1,10 +1,21 @@
-"""Reference management routes."""
+"""Reference management routes.
+
+Phase H.b: every route is now wired to the real principal resolver and
+guards from Phase E. POST /references writes both `created_by` (UUID,
+derived as uuid5(NAMESPACE_OID, str(principal_idx)) for forensic
+determinism) and the new `created_by_idx` BIGINT FK to qiita.principal.
+GET /references/{id} stays anonymous-OK (`get_current_principal` directly,
+no guard); other routes pin to scope and kind constraints per the plan.
+
+Phase H.c will drop the legacy `created_by` UUID column and update the
+INSERT to write only `created_by_idx`.
+"""
 
 import asyncio
 import base64
 import json
 from typing import Annotated
-from uuid import UUID
+from uuid import NAMESPACE_OID, UUID, uuid5
 
 import asyncpg
 import pyarrow.flight as _flight
@@ -24,8 +35,19 @@ from qiita_common.models import (
     RegisterFilesResponse,
 )
 
+from ..auth.guards import (
+    require_complete_profile,
+    require_scope,
+    require_service,
+)
+from ..auth.principal import (
+    HumanUser,
+    Principal,
+    ServiceAccount,
+    get_current_principal,
+)
 from ..auth.tickets import sign_action, sign_ticket
-from ..deps import get_current_user, get_data_plane_url, get_db_pool, get_hmac_secret
+from ..deps import get_data_plane_url, get_db_pool, get_hmac_secret
 
 router = APIRouter(prefix="/references", tags=["references"])
 
@@ -35,21 +57,43 @@ router = APIRouter(prefix="/references", tags=["references"])
 _CHUNK_SIZE = 10_000
 
 
+def _legacy_uuid(principal_idx: int) -> UUID:
+    """Deterministic UUID derived from principal_idx — used during the H.b
+    migration window so any forensic query against the dropped legacy
+    column (from a backup or rolled-back H.c) still resolves back to a
+    real principal rather than a dummy all-zeros UUID. H.c removes both
+    the column and this helper."""
+    return uuid5(NAMESPACE_OID, str(principal_idx))
+
+
+_REFERENCE_RETURNING = (
+    "reference_idx, name, version, kind, status,"
+    " created_by, created_by_idx, created_at"
+)
+
+
 @router.post("", status_code=201)
 async def create_reference(
     body: ReferenceCreateRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    user_id: UUID = Depends(get_current_user),
+    user: HumanUser = Depends(require_complete_profile),
+    _scope: Principal = Depends(require_scope("references:write")),
 ) -> ReferenceResponse:
+    """Create a reference. Humans only (service-kind principals can only
+    mint features and register files into existing references). Writes both
+    `created_by` (legacy UUID, derived from principal_idx) and `created_by_idx`."""
+    legacy = _legacy_uuid(user.principal_idx)
     try:
         row = await pool.fetchrow(
-            "INSERT INTO qiita.references (name, version, kind, created_by)"
-            " VALUES ($1, $2, $3, $4)"
-            " RETURNING reference_idx, name, version, kind, status, created_by, created_at",
+            "INSERT INTO qiita.references"
+            "  (name, version, kind, created_by, created_by_idx)"
+            " VALUES ($1, $2, $3, $4, $5)"
+            f" RETURNING {_REFERENCE_RETURNING}",
             body.name,
             body.version,
             body.kind,
-            user_id,
+            legacy,
+            user.principal_idx,
         )
     except asyncpg.UniqueViolationError:
         raise HTTPException(
@@ -65,10 +109,14 @@ async def create_reference(
 async def get_reference(
     reference_idx: Annotated[int, Field(gt=0)],
     pool: asyncpg.Pool = Depends(get_db_pool),
+    _principal: Principal = Depends(get_current_principal),
 ) -> ReferenceResponse:
+    """Anonymous-OK. Returns the full ReferenceResponse including
+    created_by_idx; row-level visibility (e.g., hiding private references'
+    owner) is the follow-up plan, not Phase H."""
     row = await pool.fetchrow(
-        "SELECT reference_idx, name, version, kind, status, created_by, created_at"
-        " FROM qiita.references WHERE reference_idx = $1",
+        f"SELECT {_REFERENCE_RETURNING} FROM qiita.references"
+        " WHERE reference_idx = $1",
         reference_idx,
     )
     if row is None:
@@ -81,6 +129,7 @@ async def update_reference_status(
     reference_idx: Annotated[int, Field(gt=0)],
     body: ReferenceStatusUpdate,
     pool: asyncpg.Pool = Depends(get_db_pool),
+    _scope: Principal = Depends(require_scope("references:write")),
 ) -> ReferenceResponse:
     target_status = body.status
 
@@ -98,7 +147,7 @@ async def update_reference_status(
     row = await pool.fetchrow(
         "UPDATE qiita.references SET status = $1"
         " WHERE reference_idx = $2 AND status = ANY($3::text[])"
-        " RETURNING reference_idx, name, version, kind, status, created_by, created_at",
+        f" RETURNING {_REFERENCE_RETURNING}",
         str(target_status),
         reference_idx,
         valid_sources,
@@ -124,7 +173,8 @@ async def mint_features(
     reference_idx: Annotated[int, Field(gt=0)],
     body: FeatureMintRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    user_id: UUID = Depends(get_current_user),
+    _service: ServiceAccount = Depends(require_service),
+    _scope: Principal = Depends(require_scope("features:mint")),
 ) -> FeatureMintResponse:
     # Atomic status transition: hashing -> minting, or verify already minting.
     # Uses UPDATE ... WHERE to avoid TOCTOU race between concurrent callers.
@@ -288,7 +338,7 @@ async def create_doget_ticket(
     body: DoGetTicketRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
     hmac_secret: bytes = Depends(get_hmac_secret),
-    user_id: UUID = Depends(get_current_user),
+    _scope: Principal = Depends(require_scope("tickets:doget")),
 ) -> DoGetTicketResponse:
     """Sign a DoGet ticket scoped to a reference.
 
@@ -297,9 +347,9 @@ async def create_doget_ticket(
     reference_membership table (JOIN for reference_sequences, direct
     WHERE for taxonomy/phylogeny).
 
-    TODO: add authorization check — verify user has read access to this
-    reference. Currently any authenticated user can get a ticket for any
-    active reference.
+    Authorization is scope-only at this layer: any principal with
+    `tickets:doget` can request a ticket. Row-level visibility (private
+    references) is deferred to the follow-up plan.
     """
     if body.table not in _DOGET_ALLOWED_TABLES:
         raise HTTPException(
@@ -335,14 +385,13 @@ async def register_files(
     pool: asyncpg.Pool = Depends(get_db_pool),
     hmac_secret: bytes = Depends(get_hmac_secret),
     data_plane_url: str = Depends(get_data_plane_url),
-    user_id: UUID = Depends(get_current_user),
+    _service: ServiceAccount = Depends(require_service),
+    _scope: Principal = Depends(require_scope("references:register_files")),
 ) -> RegisterFilesResponse:
     """Register Parquet files in DuckLake via the data plane's DoAction.
 
-    Reference must be in 'loading' status. Signs an action token and sends
-    it to the data plane, which moves files to permanent storage and calls
-    ducklake_add_data_files. The gRPC call is offloaded to a thread to
-    avoid blocking the async event loop.
+    Workers only — the orchestrator is the canonical caller. Reference
+    must be in 'loading' status.
     """
     status = await pool.fetchval(
         "SELECT status FROM qiita.references WHERE reference_idx = $1",

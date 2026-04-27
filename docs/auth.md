@@ -1,6 +1,6 @@
 # Authentication
 
-> **Status:** in development on `feat/auth`. Schema (A), user CRUD with mock auth (B), API token mint/verify (C), OIDC JWT verifier (D), principal resolver + guards + role/scope ceilings (E), auth endpoints (F), admin endpoints + bootstrap CLI (G), and the `references.created_by_idx` FK column (H.a) have landed. Routes still write only the legacy `created_by` UUID and use the mock auth; H.b dual-writes both columns and flips routes to real auth, H.c drops the legacy column and the mock. The OIDC PKCE code-exchange (`POST /auth/login` + matching `qiita-admin login`) is deferred to Phase J — needs an OIDC test harness for code-exchange that isn't built; for now operators get a JWT out-of-band and call `POST /auth/pat`.
+> **Status:** in development on `feat/auth`. Phases A–H.b have landed. Every authenticated route is on the real Phase E resolver + guards (`get_current_principal` + `require_human/service/role/scope`); `routes/references.py` writes both `created_by` (legacy UUID, derived as `uuid5(NAMESPACE_OID, str(principal_idx))`) and `created_by_idx` (new BIGINT FK). The mock helpers `get_current_user` / `get_current_principal_idx` survive in `deps.py` with `# DEPRECATED: removed in Phase H.c` comments — H.c drops the legacy UUID column and deletes the mocks. The OIDC PKCE code-exchange (`POST /auth/login` + matching `qiita-admin login`) is deferred to Phase J.
 
 Qiita authenticates three kinds of principal against the control plane:
 
