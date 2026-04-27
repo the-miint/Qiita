@@ -1,6 +1,6 @@
 # Authentication
 
-> **Status:** in development on `feat/auth`. The auth schema (Phase A), user CRUD routes against mock auth (Phase B), and the API-token mint/verify primitives (Phase C) have landed. Routes still use a mock principal-resolver (`get_current_principal_idx` in `deps.py`); the real OIDC/PAT-driven resolver lands in Phase E and the route flip happens in Phase H.b.
+> **Status:** in development on `feat/auth`. Schema (Phase A), user CRUD with mock auth (Phase B), API token mint/verify (Phase C), and the OIDC JWT verifier (Phase D) have landed. The verifier is built but not yet wired into route guards; Phase E builds the principal resolver on top, and Phase F's `POST /auth/pat` is the first route to consume it. Routes still use the mock `get_current_principal_idx` for now.
 
 Qiita authenticates three kinds of principal against the control plane:
 
@@ -119,7 +119,39 @@ Coalesces to ≤1 write per token per minute via the predicate. Pure observabili
 
 ## OIDC verification
 
-_Populated when Phase D lands._
+Human users authenticate via AuthRocket OIDC. JWTs are RS256-signed; the verifier fetches the public key from `{issuer}/connect/jwks` via PyJWT's `PyJWKClient`, which caches in-memory and refreshes automatically when it encounters an unknown `kid` (so AuthRocket key rotation never needs a redeploy).
+
+The verifier is split into two layers:
+
+- **`auth.oidc.JwtVerifier`** — pure. Takes `jwks_url`, `issuer`, `audience`, `leeway_seconds`. Tests exercise this directly against a local JWKS harness.
+- **`auth.oidc.AuthRocketVerifier`** — config-bound subclass. `from_settings(settings)` raises `RuntimeError` if any of `AUTHROCKET_ISSUER` / `AUTHROCKET_AUDIENCE` / `AUTHROCKET_JWKS_URL` is missing — fail-fast at FastAPI lifespan, no silent run-with-auth-disabled.
+
+### What `verify(token)` checks
+
+| Check | Mechanism |
+|---|---|
+| Signature | PyJWT against the JWKS-fetched key matching the JWT's `kid`, algorithm pinned to RS256 (HS256 / `none` rejected) |
+| `exp` | within `leeway_seconds` (default 30s) |
+| `iss` | exact match to configured issuer |
+| `aud` | configured audience present (string or list — both accepted) |
+| `email_verified` | strict boolean `True` (the string `"true"` is rejected — coerced strings indicate an IdP we don't trust) |
+| `email`, `sub` | present and non-empty strings |
+| `auth_time` | optional; returned in `OIDCIdentity` if present (callers like `POST /auth/pat` enforce freshness) |
+
+On success, returns `OIDCIdentity(issuer, subject, email, auth_time, raw_claims)`. On any failure, raises `auth.oidc.InvalidJwt` with a static error message — token contents and claim values are never embedded in exception messages.
+
+### Configuration
+
+`Settings.from_env()` reads:
+
+- `AUTHROCKET_ISSUER` (required for verifier construction)
+- `AUTHROCKET_AUDIENCE` (required)
+- `AUTHROCKET_JWKS_URL` (defaults to `{issuer}/connect/jwks` if unset)
+- `AUTHROCKET_JWT_LEEWAY_SECONDS` (default 30)
+- `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS` (default 300; consumed by Phase F's PAT-mint freshness check, not by the verifier itself)
+- `QIITA_TOKEN_DEFAULT_TTL_DAYS` (default 90; consumed by PAT mint)
+
+These fields are *optional* on `Settings` so non-auth tests don't have to set every `AUTHROCKET_*` env var. Required-ness is enforced at `AuthRocketVerifier.from_settings` time.
 
 ## Scopes and roles
 

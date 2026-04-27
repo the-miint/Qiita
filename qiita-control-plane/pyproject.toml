@@ -8,6 +8,7 @@ dependencies = [
     "qiita-common",
     "asyncpg>=0.31",
     "pyarrow>=19",
+    "pyjwt[crypto]>=2.9",
 ]
 
 [dependency-groups]
