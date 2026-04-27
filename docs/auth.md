@@ -1,6 +1,6 @@
 # Authentication
 
-> **Status:** in development on `feat/auth`. The auth schema (Phase A) and the user CRUD routes against the mock auth (Phase B) have landed. The route layer still uses a mock principal-resolver (`get_current_principal_idx` in `deps.py`) and will be flipped to real OIDC/PAT auth in Phase E, with all routes swapping over in Phase H.b.
+> **Status:** in development on `feat/auth`. The auth schema (Phase A), user CRUD routes against mock auth (Phase B), and the API-token mint/verify primitives (Phase C) have landed. Routes still use a mock principal-resolver (`get_current_principal_idx` in `deps.py`); the real OIDC/PAT-driven resolver lands in Phase E and the route flip happens in Phase H.b.
 
 Qiita authenticates three kinds of principal against the control plane:
 
@@ -74,7 +74,48 @@ _Populated when Phase E lands._
 
 ## API tokens
 
-_Populated when Phase C lands._
+Opaque bearer tokens used by both human PATs and worker service-account tokens. Format:
+
+```
+qk_<43 url-safe base64 chars without padding>
+```
+
+- Prefix `qk_` ("qiita key") makes leak scanners and grep useful.
+- 43-char body is `secrets.token_urlsafe(32)` — 32 random bytes, 256 bits of entropy.
+- Total length 46 chars.
+- The DB stores `SHA-256(plaintext)` in `qiita.api_tokens.token_hash` (`BYTEA UNIQUE`). Plaintext is shown exactly once at mint time and never logged.
+
+### Mint (`auth.tokens.mint_api_token`)
+
+```python
+plaintext, token_idx = await mint_api_token(
+    pool,
+    principal_idx=...,
+    label="my-laptop",
+    scopes=["self:profile", "self:tokens", "references:read"],
+    expires_at=None,  # or a tz-aware datetime
+)
+```
+
+Validates every requested scope against `auth.scopes.VALID_SCOPES` (raises `ValueError` on unknown). Surfaces a token-hash collision as `RuntimeError` rather than silently shadowing — collision is astronomically unlikely with 256 bits of entropy, but the principle is "fail loudly."
+
+### Verify (`auth.tokens.verify_api_token`)
+
+```python
+verified = await verify_api_token(pool, plaintext)  # → VerifiedToken | None
+```
+
+Returns `None` for any rejection condition: malformed prefix or length, no matching active row (`revoked_at IS NULL`), token expired, or owning principal `disabled`/`retired`. Side effect on success: schedules a fire-and-forget `record_token_use` via `asyncio.create_task` to advance `last_used_at`. Verify never blocks on the `last_used_at` write — the helper catches `asyncpg.PostgresError` and logs a warning.
+
+### Last-used coalescing (`auth.tokens.record_token_use`)
+
+```sql
+UPDATE qiita.api_tokens SET last_used_at = now()
+ WHERE token_idx = $1
+   AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute');
+```
+
+Coalesces to ≤1 write per token per minute via the predicate. Pure observability — `last_used_at` is never used for auth decisions, so failures here are absorbed.
 
 ## OIDC verification
 
