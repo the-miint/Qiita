@@ -1,6 +1,6 @@
 # Authentication
 
-> **Status:** in development on `feat/auth`. Phases A–H.c have landed. The legacy `references.created_by UUID` column is gone; `references.created_by_idx BIGINT NOT NULL REFERENCES qiita.principal(idx)` is the canonical owner reference. The mock auth helpers (`get_current_user` / `get_current_principal_idx`) have been deleted from `deps.py`; the only auth path is `auth.principal.get_current_principal` + the `require_*` guards. The OIDC PKCE code-exchange (`POST /auth/login` + `qiita-admin login`) is the only remaining gap, deferred to Phase J. Phase I wires the orchestrator to use a service-account token via the `compute_worker_service_account` fixture pattern.
+> **Status:** in development on `feat/auth`. Phases A–I have landed. The control plane is fully on the real auth surface; the orchestrator authenticates to the control plane via a service-account `qk_` token loaded from `/etc/qiita/orchestrator.token` (or `CONTROL_PLANE_API_TOKEN` when `QIITA_ALLOW_TOKEN_ENV=true` for dev/CI). The OIDC PKCE code-exchange (`POST /auth/login` + `qiita-admin login`) is the only remaining gap, deferred to Phase J.
 
 Qiita authenticates three kinds of principal against the control plane:
 
@@ -289,11 +289,25 @@ The auth-specific endpoints (`/auth/pat`, `/auth/whoami`, `/auth/tokens`, `/auth
 
 ## Orchestrator integration
 
-_Populated when Phase I lands._
+The orchestrator authenticates to the control plane via a service-account `qk_` token. `qiita_common.client.ControlPlaneClient` accepts:
+
+- `api_token: str | None` — plaintext, used by tests and dev with `QIITA_ALLOW_TOKEN_ENV=true`.
+- `api_token_path: Path | None` — production drop-in (default `/etc/qiita/orchestrator.token`, mode `0400`, owned by the `qiita` user).
+
+Exactly one must be supplied; passing both or neither raises `ValueError`. The plaintext is loaded once at construction time, attached as `Authorization: Bearer <token>` to every request, and never appears in `__repr__` (redacted to `<redacted>`).
+
+`qiita_common.log.AuthorizationScrubFilter` is a `logging.Filter` that rewrites any `Bearer <token>` substring in log messages and args to `Bearer <redacted>`. Install once at application startup so httpx's request logs (or any log line carrying request headers) can't leak the token to disk.
+
+### Resolution order in orchestrator `Settings.from_env`
+
+1. **`CONTROL_PLANE_API_TOKEN_PATH`** (default `/etc/qiita/orchestrator.token`). If the file exists, use it. This is the production path.
+2. **`CONTROL_PLANE_API_TOKEN`** (env var). Only honoured when **`QIITA_ALLOW_TOKEN_ENV=true`** — dev / CI explicitly opt in. Production never sets the flag, so a leaked env var alone can't drive auth.
+
+If neither source yields a token, `Settings.from_env()` raises `RuntimeError` with an actionable message pointing at both paths.
 
 <!-- See "First-deploy bootstrap" subsection within Endpoints. -->
 ## First-deploy bootstrap — see [docs/runbooks/first-deploy.md](runbooks/first-deploy.md)
 
 ## Token rotation
 
-_Populated when Phase I lands._
+See [`docs/runbooks/orchestrator-token-rotation.md`](runbooks/orchestrator-token-rotation.md) for the full zero-downtime rotation procedure: mint replacement → install at `*.token.new` → atomic `mv` → `systemctl reload` → wait for `last_used_at` to advance → revoke old.

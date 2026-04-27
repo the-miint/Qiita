@@ -1,5 +1,9 @@
 """REST client for service-to-service calls to the control plane."""
 
+from __future__ import annotations
+
+from pathlib import Path
+
 import httpx
 
 from .models import (
@@ -15,19 +19,71 @@ from .models import (
 class ControlPlaneClient:
     """Async HTTP client for the control plane REST API.
 
-    Use as an async context manager to ensure the underlying httpx client is closed:
+    Authentication is required: callers must pass either `api_token` (the
+    plaintext qk_... PAT or service-account token) or `api_token_path` (the
+    filesystem path to a file containing the token, mode 0400 in production).
+    The two are mutually exclusive — passing both raises ValueError.
 
-        async with ControlPlaneClient("http://localhost:8080") as client:
+    Use as an async context manager so the underlying httpx client is closed:
+
+        async with ControlPlaneClient(
+            "http://localhost:8080",
+            api_token_path=Path("/etc/qiita/orchestrator.token"),
+        ) as client:
             ref = await client.create_reference(...)
+
+    The plaintext token is loaded once at construction time and stored
+    internally. `__repr__` redacts the token; the logging filter at
+    `qiita_common.log.AuthorizationScrubFilter` scrubs `Authorization`
+    headers from any log record that includes them.
     """
 
-    def __init__(self, base_url: str, *, http_client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        api_token: str | None = None,
+        api_token_path: Path | None = None,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None:
+        if api_token is not None and api_token_path is not None:
+            raise ValueError(
+                "ControlPlaneClient: pass either api_token or api_token_path,"
+                " not both — they are mutually exclusive"
+            )
+        if api_token is None and api_token_path is None:
+            raise ValueError(
+                "ControlPlaneClient: exactly one of api_token or api_token_path"
+                " must be provided (auth is required for every endpoint except"
+                " GET /references/{id})"
+            )
+
+        if api_token_path is not None:
+            token = api_token_path.read_text().strip()
+        else:
+            assert api_token is not None  # type narrowing
+            token = api_token.strip()
+
+        self._token = token
+
         if http_client is not None:
             self._http = http_client
             self._owns_http = False
+            # Caller-supplied client: trust their auth setup; don't override
+            # the Authorization header.
         else:
-            self._http = httpx.AsyncClient(base_url=base_url.rstrip("/"), timeout=30)
+            self._http = httpx.AsyncClient(
+                base_url=base_url.rstrip("/"),
+                timeout=30,
+                headers={"Authorization": f"Bearer {token}"},
+            )
             self._owns_http = True
+
+    def __repr__(self) -> str:
+        return (
+            f"ControlPlaneClient(base_url={self._http.base_url!r},"
+            " api_token=<redacted>)"
+        )
 
     async def __aenter__(self):
         return self
