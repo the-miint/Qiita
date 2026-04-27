@@ -1,6 +1,8 @@
 # Authentication
 
-> **Status:** in development on `feat/auth`. Phases A–I have landed. The control plane is fully on the real auth surface; the orchestrator authenticates to the control plane via a service-account `qk_` token loaded from `/etc/qiita/orchestrator.token` (or `CONTROL_PLANE_API_TOKEN` when `QIITA_ALLOW_TOKEN_ENV=true` for dev/CI). The OIDC PKCE code-exchange (`POST /auth/login` + `qiita-admin login`) is the only remaining gap, deferred to Phase J.
+> **Status:** ready to merge from `feat/auth`. Phases A–J landed. The control plane is fully on the real auth surface; the orchestrator authenticates via a service-account `qk_` token loaded from `/etc/qiita/orchestrator.token` (or `CONTROL_PLANE_API_TOKEN` when `QIITA_ALLOW_TOKEN_ENV=true` for dev/CI). 178 unit + 204 integration tests pass; security audit completed.
+
+> **Known gap:** the OIDC PKCE code-exchange (`POST /auth/login` + `qiita-admin login`) is **not** shipped — it requires a code-exchange test harness that we deferred. Today's path: operators obtain an AuthRocket JWT out-of-band (AuthRocket admin UI / external CLI) within `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS` of login, then call `POST /api/v1/auth/pat` directly to mint a PAT. The `qiita-admin login` subcommand currently exits with status 2 and a message pointing at this path. See `qiita-control-plane/src/qiita_control_plane/cli/admin.py::main` and the `routes/auth.py` module docstring.
 
 Qiita authenticates three kinds of principal against the control plane:
 

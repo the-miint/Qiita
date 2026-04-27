@@ -63,7 +63,7 @@ cd qiita-compute-orchestrator && uv sync
 
 ## Architecture
 
-See `docs/architecture.md` for the full system diagram and `docs/reference-data-staging.md` for how reference databases are ingested. What follows is the non-obvious cross-cutting structure.
+See `docs/architecture.md` for the full system diagram, `docs/reference-data-staging.md` for how reference databases are ingested, and `docs/auth.md` for the authentication / authorization surface (principal subtypes, OIDC + opaque-token paths, role/scope ceilings, admin endpoints, and the `qiita-admin` CLI). Operational runbooks for the auth surface live under `docs/runbooks/`. What follows is the non-obvious cross-cutting structure.
 
 ### Component map and ports
 
