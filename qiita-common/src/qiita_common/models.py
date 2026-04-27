@@ -157,3 +157,46 @@ class UserResponse(BaseModel):
     profile_complete: bool
     created_at: AwareDatetime
     updated_at: AwareDatetime
+
+
+# ============================================================================
+# Auth: API token mint / list models (Phase F)
+# ============================================================================
+
+
+class ApiTokenMintRequest(BaseModel):
+    """Body for POST /api/v1/auth/pat (humans) and POST /api/v1/admin/service-accounts (workers).
+
+    `scopes=None` means "default to the principal's full role ceiling" (humans
+    only — service accounts must always specify scopes explicitly).
+    `ttl_days=None` means "default to QIITA_TOKEN_DEFAULT_TTL_DAYS"; max 365.
+    """
+
+    label: str = Field(min_length=1, max_length=255)
+    scopes: list[str] | None = None
+    ttl_days: Annotated[int, Field(gt=0, le=365)] | None = None
+
+
+class ApiTokenMintResponse(BaseModel):
+    """Returned exactly once at mint time. The `token` field is the plaintext;
+    capture it now and never log it. Subsequent requests retrieve only metadata
+    via ApiTokenSummary."""
+
+    token: str  # plaintext qk_... — shown once, never persisted past this response
+    token_idx: Annotated[int, Field(gt=0)]
+    label: str
+    scopes: list[str]
+    expires_at: AwareDatetime | None
+    created_at: AwareDatetime
+
+
+class ApiTokenSummary(BaseModel):
+    """Returned by GET /api/v1/auth/tokens — metadata only, no plaintext or hash."""
+
+    token_idx: Annotated[int, Field(gt=0)]
+    label: str
+    scopes: list[str]
+    expires_at: AwareDatetime | None
+    revoked_at: AwareDatetime | None
+    last_used_at: AwareDatetime | None
+    created_at: AwareDatetime

@@ -1,6 +1,6 @@
 # Authentication
 
-> **Status:** in development on `feat/auth`. Schema (Phase A), user CRUD with mock auth (Phase B), API token mint/verify (Phase C), OIDC JWT verifier (Phase D), and the principal resolver + guards + role/scope ceilings (Phase E) have landed. `get_current_principal` is the canonical FastAPI dep; existing routes still use the legacy mock and are flipped over in Phase H.b.
+> **Status:** in development on `feat/auth`. Schema (Phase A), user CRUD with mock auth (Phase B), API token mint/verify (Phase C), OIDC JWT verifier (Phase D), principal resolver + guards + role/scope ceilings (Phase E), and the auth endpoints (Phase F) have landed. The `references` and `users` routes still use the legacy mock and are flipped over in Phase H.b. The CLI-driven OIDC code-exchange route (`POST /auth/login`) lands with the qiita-admin CLI in Phase G.
 
 Qiita authenticates three kinds of principal against the control plane:
 
@@ -224,6 +224,23 @@ Guards compose: a route can `Depends(require_role_at_least("system_admin"))` AND
 The token path returns the token's **own** `scopes` frozenset (whatever the mint stored). The OIDC path (no token; bearer is a fresh JWT) hands back the **role's full ceiling** — Phase F's `POST /auth/pat` is the route that narrows this when it mints a PAT. Per-request bearers always carry their own scope set via the token path.
 
 ## Endpoints
+
+### Auth (Phase F — real auth)
+
+| Route | Method | Notes |
+|---|---|---|
+| `/api/v1/auth/whoami` | GET | Public. Returns `{kind: anonymous}` for unauthenticated callers; otherwise the resolved principal's profile / scopes. |
+| `/api/v1/auth/pat` | POST | **Requires a fresh OIDC JWT** — the `auth_time` claim must be present, ≥ now − `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS`, and ≤ now + `AUTHROCKET_JWT_LEEWAY_SECONDS` (the upper bound rejects forward IdP clock skew, the lower bound enforces interactive freshness). PAT-via-PAT (`Bearer qk_...`) is rejected. Body: `{label, scopes?, ttl_days?}`. Returns plaintext + metadata exactly once. |
+| `/api/v1/auth/tokens` | GET | Lists the caller's own tokens. Metadata only — no plaintext, no hash. Requires `self:tokens` scope. |
+| `/api/v1/auth/tokens/{idx}` | DELETE | Revokes the caller's token. Requires `self:tokens`. Returns 404 for both "no such token" and "exists but owned by someone else" so probing `token_idx` values cannot enumerate the table. |
+
+**PAT mint validation:**
+
+- `scopes=None` defaults to the caller's full role ceiling.
+- Explicit `scopes` must be a subset of the role ceiling. Out-of-ceiling scopes return 422 with body `{detail: "scopes not granted by your role", rejected_scopes: [...]}`. The body does **not** echo the ceiling — that would leak structure to a probing attacker.
+- `ttl_days` defaults to `QIITA_TOKEN_DEFAULT_TTL_DAYS` (90). Pydantic enforces `0 < ttl_days <= 365`.
+- Profile must be complete. Otherwise: 422 with flat body `{detail: "profile incomplete", reason: "profile_incomplete", missing_fields: [...]}`.
+- Mint emits a `token_mint` audit event with `token_idx`, `scopes`, `kind` — never plaintext.
 
 ### User CRUD (Phase B — mock auth)
 
