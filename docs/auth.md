@@ -1,6 +1,6 @@
 # Authentication
 
-> **Status:** in development on `feat/auth`. Schema (A), user CRUD with mock auth (B), API token mint/verify (C), OIDC JWT verifier (D), principal resolver + guards + role/scope ceilings (E), auth endpoints (F), and admin endpoints + bootstrap CLI (G) have landed. The `references` and `users` routes still use the legacy mock and are flipped in Phase H.b. The OIDC PKCE code-exchange (`POST /auth/login` + the matching `qiita-admin login` flow) is deferred to Phase J — it requires an OIDC test harness for code-exchange that isn't built yet; for now operators obtain an AuthRocket JWT out-of-band and call `POST /auth/pat`.
+> **Status:** in development on `feat/auth`. Schema (A), user CRUD with mock auth (B), API token mint/verify (C), OIDC JWT verifier (D), principal resolver + guards + role/scope ceilings (E), auth endpoints (F), admin endpoints + bootstrap CLI (G), and the `references.created_by_idx` FK column (H.a) have landed. Routes still write only the legacy `created_by` UUID and use the mock auth; H.b dual-writes both columns and flips routes to real auth, H.c drops the legacy column and the mock. The OIDC PKCE code-exchange (`POST /auth/login` + matching `qiita-admin login`) is deferred to Phase J — needs an OIDC test harness for code-exchange that isn't built; for now operators get a JWT out-of-band and call `POST /auth/pat`.
 
 Qiita authenticates three kinds of principal against the control plane:
 
