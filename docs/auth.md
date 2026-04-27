@@ -1,6 +1,6 @@
 # Authentication
 
-> **Status:** in development on `feat/auth`. The auth schema (Phase A) has landed; the route layer still uses the mock user UUID from `qiita-control-plane/src/qiita_control_plane/deps.py::get_current_user` and will be flipped over progressively in later phases.
+> **Status:** in development on `feat/auth`. The auth schema (Phase A) and the user CRUD routes against the mock auth (Phase B) have landed. The route layer still uses a mock principal-resolver (`get_current_principal_idx` in `deps.py`) and will be flipped to real OIDC/PAT auth in Phase E, with all routes swapping over in Phase H.b.
 
 Qiita authenticates three kinds of principal against the control plane:
 
@@ -86,7 +86,17 @@ _Populated when Phase E lands._
 
 ## Endpoints
 
-_Populated when Phase F lands (user-facing) and Phase G (admin)._
+### User CRUD (Phase B — mock auth)
+
+| Route | Method | Notes |
+|---|---|---|
+| `/api/v1/users` | POST | Admin creates a new principal + user row in one transaction. The new principal's `created_by_idx` points at the requesting principal. Returns `409` on email collision (case-insensitive via CITEXT). |
+| `/api/v1/users/me` | GET | Returns the authenticated principal's user profile. |
+| `/api/v1/users/me` | PATCH | Updates profile fields (`affiliation`, `address`, `phone`, `orcid`, `receive_processing_emails`). `email` and status fields are intentionally absent from `UserUpdate` and are dropped silently if sent. |
+
+Authentication is currently the **mock principal-resolver** in `deps.py::get_current_principal_idx`, which looks up a `principal` by `display_name='mock-admin'`. Integration tests seed this row via `mock_authenticated_principal` in `tests/integration/conftest.py`. The real OIDC/PAT-driven resolver replaces this in Phase E.
+
+The auth-specific endpoints (`/auth/pat`, `/auth/whoami`, `/auth/tokens`, `/auth/login`) and admin endpoints (service accounts, audit log, principal status updates) are populated when Phases F and G land.
 
 ## CLI (`qiita-admin`)
 

@@ -77,6 +77,32 @@ async def postgres_pool(_run_db_migrations, postgres_url):
     await pool.close()
 
 
+@pytest_asyncio.fixture(scope="session")
+async def mock_authenticated_principal(postgres_pool):
+    """Phase B: seed a system_admin principal+user that the mock auth dep
+    (qiita_control_plane.deps.get_current_principal_idx) resolves to.
+
+    Removed when real auth lands in Phase E.
+    """
+    idx = await postgres_pool.fetchval(
+        "SELECT idx FROM qiita.principal WHERE display_name = 'mock-admin'"
+    )
+    if idx is None:
+        async with postgres_pool.acquire() as conn:
+            async with conn.transaction():
+                idx = await conn.fetchval(
+                    "INSERT INTO qiita.principal"
+                    "  (display_name, system_role, created_by_idx)"
+                    " VALUES ('mock-admin', 'system_admin', 1) RETURNING idx"
+                )
+                await conn.execute(
+                    "INSERT INTO qiita.user (principal_idx, email)"
+                    " VALUES ($1, 'mock-admin@example.com')",
+                    idx,
+                )
+    return idx
+
+
 @pytest.fixture(scope="session")
 def control_plane_url() -> str:
     return "http://localhost:8080"
