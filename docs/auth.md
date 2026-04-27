@@ -1,6 +1,6 @@
 # Authentication
 
-> **Status:** in development on `feat/auth`. Schema (Phase A), user CRUD with mock auth (Phase B), API token mint/verify (Phase C), and the OIDC JWT verifier (Phase D) have landed. The verifier is built but not yet wired into route guards; Phase E builds the principal resolver on top, and Phase F's `POST /auth/pat` is the first route to consume it. Routes still use the mock `get_current_principal_idx` for now.
+> **Status:** in development on `feat/auth`. Schema (Phase A), user CRUD with mock auth (Phase B), API token mint/verify (Phase C), OIDC JWT verifier (Phase D), and the principal resolver + guards + role/scope ceilings (Phase E) have landed. `get_current_principal` is the canonical FastAPI dep; existing routes still use the legacy mock and are flipped over in Phase H.b.
 
 Qiita authenticates three kinds of principal against the control plane:
 
@@ -70,7 +70,52 @@ Append-only audit log. BEFORE UPDATE and BEFORE DELETE triggers raise on any mut
 
 ## Principal model
 
-_Populated when Phase E lands._
+Every authenticated request resolves to a typed `Principal`:
+
+```python
+class Principal:           # base; default capability methods return False
+    def has_role(role) -> bool
+    def has_role_at_least(role) -> bool
+    def has_scope(scope) -> bool
+
+@dataclass(frozen=True, slots=True)
+class HumanUser(Principal):       # has a row in qiita.user
+    principal_idx, email, system_role, scopes, profile_complete, disabled, retired
+
+@dataclass(frozen=True, slots=True)
+class ServiceAccount(Principal):  # has a row in qiita.service_account
+    principal_idx, name, scopes, disabled, retired
+
+@dataclass(frozen=True, slots=True)
+class Anonymous(Principal):       # no Authorization header
+```
+
+- `has_role(role)` is exact match; `has_role_at_least(role)` walks the `system_role` ordering (`user < wet_lab_admin < system_admin`). `ServiceAccount` always returns `False` for both — services don't fit the human hierarchy.
+- `has_scope(scope)` is membership in the principal's `scopes` frozenset (token scopes for token-resolved principals, role-implied ceiling for OIDC-resolved principals).
+
+### Resolver dispatch (`auth.principal.get_current_principal`)
+
+| Bearer shape | Path | Behavior |
+|---|---|---|
+| absent / non-Bearer | — | returns `Anonymous()` |
+| `Bearer ` (empty) | — | returns `Anonymous()` |
+| `Bearer qk_...` | token | `verify_api_token` → load principal subtype → `HumanUser` or `ServiceAccount` |
+| `Bearer eyJ...x.y.z` | OIDC | `JwtVerifier.verify` → upsert / load → `HumanUser` |
+| anything else | malformed | 401 |
+
+The resolver returns `503` if a JWT-shaped bearer arrives but the OIDC verifier is not configured (e.g., `AUTHROCKET_*` env vars missing in dev). This is the fail-fast point referenced in the OIDC section above.
+
+### First-login (OIDC), races, and email drift
+
+On a JWT for a previously-unseen `(iss, sub)`, the resolver creates a `principal` row, a `qiita.user` row, and a `qiita.user_identities(iss, sub) → principal_idx` row in one transaction, then writes an `oidc_create_principal` audit event. Two race outcomes are handled:
+
+- **Concurrent first-login for the same `(iss, sub)`** — depending on insert order, either the `user_identities_pkey` or the `user_email_key` UNIQUE constraint trips first under timing. The handler doesn't dispatch on constraint name (fragile); on **any** unique violation in the create path, it re-reads `user_identities` for our `(iss, sub)`. If a row exists, the winner created our identity and we return their `principal_idx`. If no row exists, this is a true email collision (different identity claiming an already-used email) — the handler emits an `oidc_create_principal_email_conflict` audit event with `attempted_email_sha256` (cleartext NOT logged) and returns `409`.
+
+- **Email drift** on a repeat OIDC login (same `(iss, sub)`, JWT email differs from stored): try `UPDATE qiita.user.email`. If it succeeds, emit `email_drift` event with `outcome="updated"` and the from/to cleartext (the principal's own email — they can read it). If it collides with another user's email, no-op and emit `email_drift` with `outcome="collision"` and `attempted_email_sha256` (cleartext NOT logged so cross-user audit reads can't trivially harvest the colliding email).
+
+### Disabled / retired
+
+The resolver refuses to construct a `HumanUser` / `ServiceAccount` for a principal where `disabled=true` OR `retired=true` — both paths (token verify and OIDC upsert) check this. `verify_api_token` already filters tokens by these flags at the SQL level; the OIDC path checks at upsert / re-read time. There is no bypass.
 
 ## API tokens
 
@@ -155,7 +200,28 @@ These fields are *optional* on `Settings` so non-auth tests don't have to set ev
 
 ## Scopes and roles
 
-_Populated when Phase E lands._
+Defined in `auth.scopes`. Two ceilings:
+
+- **`ROLE_IMPLIED_SCOPES`** — hierarchical, per `system_role`. Each entry is the **full** ceiling, not the increment, with `system_admin ⊇ wet_lab_admin ⊇ user`. Future readers don't have to chase inheritance to know what role X can do.
+- **`SERVICE_ACCOUNT_SCOPE_CEILING`** — flat, non-inherited. Workers don't fit the human hierarchy; admin-mint of a service-account token must spell out scopes explicitly within this set.
+
+The hierarchical claim is enforced by a Phase E unit test (`test_role_ceilings_are_hierarchical`) that asserts `user ⊊ wet_lab_admin ⊊ system_admin` strictly. If that test ever fails, the inheritance contract is broken and downstream guards become unsound.
+
+### Guards (`auth.guards`)
+
+| Guard | Behavior |
+|---|---|
+| `require_human(p)` | 401 on Anonymous, 403 on ServiceAccount; returns `HumanUser` |
+| `require_service(p)` | 401 on Anonymous, 403 on HumanUser; returns `ServiceAccount` |
+| `require_role_at_least(role)` | factory; 401 on Anonymous, 403 on insufficient role (always 403 for ServiceAccount because they don't fit the hierarchy) |
+| `require_scope(scope)` | factory; 401 on Anonymous, 403 if `scope` not in the principal's scope set. Works for both kinds. |
+| `require_complete_profile` | depends on `require_human`; 422 with `{reason: "profile_incomplete", missing_fields: [...]}` if `profile_complete=False` |
+
+Guards compose: a route can `Depends(require_role_at_least("system_admin"))` AND `Depends(require_scope("admin:users"))` AND `Depends(require_human)` simultaneously. FastAPI dedupes the underlying `get_current_principal` call across deps in one request.
+
+### Token-vs-OIDC scope source
+
+The token path returns the token's **own** `scopes` frozenset (whatever the mint stored). The OIDC path (no token; bearer is a fresh JWT) hands back the **role's full ceiling** — Phase F's `POST /auth/pat` is the route that narrows this when it mints a PAT. Per-request bearers always carry their own scope set via the token path.
 
 ## Endpoints
 

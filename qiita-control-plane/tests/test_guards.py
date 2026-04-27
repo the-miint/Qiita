@@ -1,0 +1,200 @@
+"""Unit tests for guards. Guards are FastAPI deps; we exercise them by
+synthesising the dep input directly (no FastAPI request needed)."""
+
+import pytest
+from fastapi import HTTPException
+
+
+def _human(*, role="user", scopes=frozenset(), profile_complete=True):
+    from qiita_control_plane.auth.principal import HumanUser
+
+    return HumanUser(
+        principal_idx=2,
+        email="alice@example.com",
+        system_role=role,
+        scopes=scopes,
+        profile_complete=profile_complete,
+        disabled=False,
+        retired=False,
+    )
+
+
+def _service(scopes=frozenset()):
+    from qiita_control_plane.auth.principal import ServiceAccount
+
+    return ServiceAccount(
+        principal_idx=3,
+        name="orchestrator",
+        scopes=scopes,
+        disabled=False,
+        retired=False,
+    )
+
+
+def _anon():
+    from qiita_control_plane.auth.principal import Anonymous
+
+    return Anonymous()
+
+
+# ---------------------------------------------------------------------------
+# require_human / require_service
+# ---------------------------------------------------------------------------
+
+
+def test_require_human_returns_human():
+    from qiita_control_plane.auth.guards import require_human
+
+    h = _human()
+    assert require_human(h) is h
+
+
+def test_require_human_401_on_anonymous():
+    from qiita_control_plane.auth.guards import require_human
+
+    with pytest.raises(HTTPException) as exc:
+        require_human(_anon())
+    assert exc.value.status_code == 401
+
+
+def test_require_human_403_on_service_account():
+    from qiita_control_plane.auth.guards import require_human
+
+    with pytest.raises(HTTPException) as exc:
+        require_human(_service())
+    assert exc.value.status_code == 403
+
+
+def test_require_service_returns_service():
+    from qiita_control_plane.auth.guards import require_service
+
+    s = _service()
+    assert require_service(s) is s
+
+
+def test_require_service_401_on_anonymous():
+    from qiita_control_plane.auth.guards import require_service
+
+    with pytest.raises(HTTPException) as exc:
+        require_service(_anon())
+    assert exc.value.status_code == 401
+
+
+def test_require_service_403_on_human():
+    from qiita_control_plane.auth.guards import require_service
+
+    with pytest.raises(HTTPException) as exc:
+        require_service(_human())
+    assert exc.value.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# require_role_at_least
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "user_role,required,should_pass",
+    [
+        ("user", "user", True),
+        ("user", "wet_lab_admin", False),
+        ("user", "system_admin", False),
+        ("wet_lab_admin", "user", True),
+        ("wet_lab_admin", "wet_lab_admin", True),
+        ("wet_lab_admin", "system_admin", False),
+        ("system_admin", "user", True),
+        ("system_admin", "wet_lab_admin", True),
+        ("system_admin", "system_admin", True),
+    ],
+)
+def test_require_role_at_least_matrix(user_role, required, should_pass):
+    from qiita_control_plane.auth.guards import require_role_at_least
+
+    dep = require_role_at_least(required)
+    if should_pass:
+        assert dep(_human(role=user_role))
+    else:
+        with pytest.raises(HTTPException) as exc:
+            dep(_human(role=user_role))
+        assert exc.value.status_code == 403
+
+
+def test_require_role_at_least_401_on_anonymous():
+    from qiita_control_plane.auth.guards import require_role_at_least
+
+    with pytest.raises(HTTPException) as exc:
+        require_role_at_least("user")(_anon())
+    assert exc.value.status_code == 401
+
+
+def test_require_role_at_least_returns_403_for_service_account():
+    """Service accounts don't fit the human hierarchy — every role check
+    against them is a 403 (not a 401)."""
+    from qiita_control_plane.auth.guards import require_role_at_least
+
+    with pytest.raises(HTTPException) as exc:
+        require_role_at_least("user")(_service())
+    assert exc.value.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# require_scope
+# ---------------------------------------------------------------------------
+
+
+def test_require_scope_pass_when_scope_present():
+    from qiita_control_plane.auth.guards import require_scope
+
+    dep = require_scope("references:read")
+    h = _human(scopes=frozenset({"self:profile", "references:read"}))
+    assert dep(h) is h
+
+
+def test_require_scope_403_when_scope_missing():
+    from qiita_control_plane.auth.guards import require_scope
+
+    dep = require_scope("admin:users")
+    with pytest.raises(HTTPException) as exc:
+        dep(_human(scopes=frozenset({"self:profile"})))
+    assert exc.value.status_code == 403
+
+
+def test_require_scope_401_on_anonymous():
+    from qiita_control_plane.auth.guards import require_scope
+
+    with pytest.raises(HTTPException) as exc:
+        require_scope("self:profile")(_anon())
+    assert exc.value.status_code == 401
+
+
+def test_require_scope_works_for_service_account_with_matching_scope():
+    """Service accounts pass scope checks identically to humans — the only
+    role constraint is from require_role_at_least, not require_scope."""
+    from qiita_control_plane.auth.guards import require_scope
+
+    s = _service(scopes=frozenset({"features:mint"}))
+    dep = require_scope("features:mint")
+    assert dep(s) is s
+
+
+# ---------------------------------------------------------------------------
+# require_complete_profile
+# ---------------------------------------------------------------------------
+
+
+def test_require_complete_profile_passes_when_complete():
+    from qiita_control_plane.auth.guards import require_complete_profile
+
+    h = _human(profile_complete=True)
+    assert require_complete_profile(h) is h
+
+
+def test_require_complete_profile_422_when_incomplete():
+    from qiita_control_plane.auth.guards import require_complete_profile
+
+    h = _human(profile_complete=False)
+    with pytest.raises(HTTPException) as exc:
+        require_complete_profile(h)
+    assert exc.value.status_code == 422
+    assert exc.value.detail["reason"] == "profile_incomplete"
+    assert "missing_fields" in exc.value.detail

@@ -77,6 +77,120 @@ async def postgres_pool(_run_db_migrations, postgres_url):
     await pool.close()
 
 
+class JwksHarness:
+    """Local HTTP server serving a JWKS document and signing JWTs.
+
+    Duplicated from qiita-control-plane/tests/test_oidc.py so integration tests
+    can use it without cross-package imports. Counts JWKS fetches so callers
+    can assert caching/refresh behavior.
+    """
+
+    def __init__(self) -> None:
+        import http.server
+        import json
+        import threading
+
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from jwt.algorithms import RSAAlgorithm
+
+        self._json = json
+        self._RSAAlgorithm = RSAAlgorithm
+        self.fetch_count = 0
+        self._lock = threading.Lock()
+        self._private_key = rsa.generate_private_key(
+            public_exponent=65537, key_size=2048
+        )
+        self._kid = f"kid-{secrets.token_hex(4)}"
+        self._jwks = self._build_jwks(self._private_key, self._kid)
+        self._server = http.server.HTTPServer(
+            ("127.0.0.1", 0), self._make_handler()
+        )
+        self.port = self._server.server_address[1]
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, daemon=True
+        )
+        self._thread.start()
+
+    @property
+    def issuer(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    @property
+    def jwks_url(self) -> str:
+        return f"{self.issuer}/connect/jwks"
+
+    @property
+    def current_kid(self) -> str:
+        return self._kid
+
+    def sign(self, claims: dict, *, kid: str | None = None, key=None) -> str:
+        import jwt as _jwt
+
+        return _jwt.encode(
+            claims,
+            key or self._private_key,
+            algorithm="RS256",
+            headers={"kid": kid or self._kid},
+        )
+
+    def rotate_key(self) -> str:
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        with self._lock:
+            self._private_key = rsa.generate_private_key(
+                public_exponent=65537, key_size=2048
+            )
+            self._kid = f"kid-{secrets.token_hex(4)}"
+            self._jwks = self._build_jwks(self._private_key, self._kid)
+        return self._kid
+
+    def shutdown(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=2)
+
+    def _build_jwks(self, private_key, kid: str) -> dict:
+        public_jwk = self._json.loads(
+            self._RSAAlgorithm.to_jwk(private_key.public_key())
+        )
+        return {
+            "keys": [
+                {**public_jwk, "kid": kid, "alg": "RS256", "use": "sig"}
+            ]
+        }
+
+    def _make_handler(self):
+        from http.server import BaseHTTPRequestHandler
+
+        harness = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/connect/jwks":
+                    with harness._lock:
+                        harness.fetch_count += 1
+                        body = harness._json.dumps(harness._jwks).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                else:
+                    self.send_error(404)
+
+            def log_message(self, *args, **kwargs):
+                pass
+
+        return Handler
+
+
+@pytest.fixture
+def jwks_harness():
+    h = JwksHarness()
+    yield h
+    h.shutdown()
+
+
 @pytest_asyncio.fixture(scope="session")
 async def mock_authenticated_principal(postgres_pool):
     """Phase B: seed a system_admin principal+user that the mock auth dep
