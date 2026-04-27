@@ -19,7 +19,7 @@ from qiita_common.models import UserCreate, UserResponse, UserUpdate
 
 from ..auth.guards import (
     require_human,
-    require_role_at_least,
+    require_human_with_role,
     require_scope,
 )
 from ..auth.principal import HumanUser, Principal
@@ -38,7 +38,7 @@ _USER_RETURNING_COLS = (
 async def create_user(
     body: UserCreate,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    actor: HumanUser = Depends(require_role_at_least("system_admin")),
+    actor: HumanUser = Depends(require_human_with_role("system_admin")),
     _scope: Principal = Depends(require_scope("admin:users")),
 ) -> UserResponse:
     """Admin creates a new principal + user row in one transaction.

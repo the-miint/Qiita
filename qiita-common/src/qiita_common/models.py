@@ -42,11 +42,8 @@ class ReferenceResponse(BaseModel):
     version: str
     kind: ReferenceKind
     status: ReferenceStatus
-    # During Phase H.b both columns are populated. created_by (UUID) is the
-    # legacy column derived as uuid5(NAMESPACE_OID, str(principal_idx)) for
-    # forensic determinism; created_by_idx is the new BIGINT FK to
-    # qiita.principal. Phase H.c drops created_by from this model.
-    created_by: UUID
+    # Phase H.c: the legacy `created_by` UUID column has been dropped.
+    # `created_by_idx` is the canonical owner reference, FK to qiita.principal.
     created_by_idx: Annotated[int, Field(gt=0)]
     created_at: AwareDatetime
 

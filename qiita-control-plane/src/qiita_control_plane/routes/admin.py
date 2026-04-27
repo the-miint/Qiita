@@ -8,7 +8,8 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 from qiita_common.models import (
     AuthEventResponse,
     PrincipalDisabledUpdate,
@@ -20,7 +21,7 @@ from qiita_common.models import (
 )
 
 from ..auth.audit import record_event
-from ..auth.guards import require_role_at_least, require_scope
+from ..auth.guards import require_human_with_role, require_scope
 from ..auth.principal import HumanUser, Principal
 from ..auth.scopes import (
     SERVICE_ACCOUNT_SCOPE_CEILING,
@@ -48,34 +49,35 @@ def _decode_detail(raw) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@router.post("/service-accounts", status_code=201)
+@router.post("/service-accounts", status_code=201, response_model=None)
 async def create_service_account(
     body: ServiceAccountCreate,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    actor: Principal = Depends(require_role_at_least("system_admin")),
+    actor: HumanUser = Depends(require_human_with_role("system_admin")),
     _scope: Principal = Depends(require_scope("admin:service_accounts")),
-) -> ServiceAccountCreateResponse:
+) -> ServiceAccountCreateResponse | JSONResponse:
     """Create a service-account-kind principal and mint its initial token.
 
     Scopes are validated against `SERVICE_ACCOUNT_SCOPE_CEILING` — workers
     don't fit the human role hierarchy, so admins must spell out what the
     worker is allowed to do, bounded by the service ceiling. 409 on
-    duplicate name; 422 on out-of-ceiling scopes.
+    duplicate name; 422 on out-of-ceiling scopes (flat body shape, matches
+    /auth/pat).
     """
     # Scope ceiling check
     unknown = [s for s in body.scopes if s not in VALID_SCOPES]
     if unknown:
-        raise HTTPException(
+        return JSONResponse(
             status_code=422,
-            detail={"detail": "unknown scopes", "rejected_scopes": sorted(unknown)},
+            content={"detail": "unknown scopes", "rejected_scopes": sorted(unknown)},
         )
     rejected = reject_scopes_outside_ceiling(
         body.scopes, SERVICE_ACCOUNT_SCOPE_CEILING
     )
     if rejected:
-        raise HTTPException(
+        return JSONResponse(
             status_code=422,
-            detail={
+            content={
                 "detail": "scopes not granted to service accounts",
                 "rejected_scopes": rejected,
             },
@@ -87,14 +89,6 @@ async def create_service_account(
         else None
     )
 
-    actor_idx = actor.principal_idx if isinstance(actor, HumanUser) else None
-    if actor_idx is None:
-        # Should never happen — guard already required system_admin which is
-        # human-only — but fail closed.
-        raise HTTPException(
-            status_code=403, detail="service-account creation requires a human actor"
-        )
-
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
@@ -103,7 +97,7 @@ async def create_service_account(
                     "  (display_name, system_role, created_by_idx)"
                     " VALUES ($1, 'user', $2) RETURNING idx",
                     body.name,
-                    actor_idx,
+                    actor.principal_idx,
                 )
                 await conn.execute(
                     "INSERT INTO qiita.service_account"
@@ -125,7 +119,7 @@ async def create_service_account(
                     conn,
                     event_type="token_mint",
                     principal_idx=principal_idx,
-                    actor_principal_idx=actor_idx,
+                    actor_principal_idx=actor.principal_idx,
                     detail={
                         "token_idx": token_idx,
                         "scopes": body.scopes,
@@ -161,7 +155,7 @@ async def set_principal_disabled(
     principal_idx: int,
     body: PrincipalDisabledUpdate,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    actor: Principal = Depends(require_role_at_least("system_admin")),
+    actor: HumanUser = Depends(require_human_with_role("system_admin")),
     _scope: Principal = Depends(require_scope("admin:users")),
 ):
     """Toggle disabled state. `disabled=true` sets the audit columns;
@@ -169,9 +163,6 @@ async def set_principal_disabled(
     `principal_disabled_consistent` ensures atomicity."""
     if principal_idx == 1:
         raise HTTPException(status_code=403, detail="cannot disable system principal")
-
-    if not isinstance(actor, HumanUser):
-        raise HTTPException(status_code=403, detail="human actor required")
 
     if body.disabled:
         if not body.reason:
@@ -234,7 +225,7 @@ async def retire_principal(
     principal_idx: int,
     body: PrincipalRetiredUpdate,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    actor: Principal = Depends(require_role_at_least("system_admin")),
+    actor: HumanUser = Depends(require_human_with_role("system_admin")),
     _scope: Principal = Depends(require_scope("admin:users")),
 ):
     """Retirement is terminal. The DB trigger revokes all the principal's
@@ -243,9 +234,6 @@ async def retire_principal(
     here — the DB trigger doesn't know roles)."""
     if principal_idx == 1:
         raise HTTPException(status_code=403, detail="cannot retire system principal")
-
-    if not isinstance(actor, HumanUser):
-        raise HTTPException(status_code=403, detail="human actor required")
 
     if actor.principal_idx == principal_idx:
         raise HTTPException(
@@ -291,7 +279,7 @@ async def set_principal_system_role(
     principal_idx: int,
     body: PrincipalSystemRoleUpdate,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    actor: Principal = Depends(require_role_at_least("system_admin")),
+    actor: HumanUser = Depends(require_human_with_role("system_admin")),
     _scope: Principal = Depends(require_scope("admin:users")),
 ):
     """Set the principal's system_role. The DB enum validates the value;
@@ -300,8 +288,6 @@ async def set_principal_system_role(
         raise HTTPException(
             status_code=403, detail="cannot modify system principal's role"
         )
-    if not isinstance(actor, HumanUser):
-        raise HTTPException(status_code=403, detail="human actor required")
 
     old_role = await pool.fetchval(
         "SELECT system_role FROM qiita.principal WHERE idx = $1", principal_idx
@@ -331,7 +317,7 @@ async def set_principal_system_role(
 @router.get("/audit")
 async def get_audit_log(
     pool: asyncpg.Pool = Depends(get_db_pool),
-    _role: Principal = Depends(require_role_at_least("system_admin")),
+    _role: HumanUser = Depends(require_human_with_role("system_admin")),
     _scope: Principal = Depends(require_scope("admin:audit_read")),
     principal_idx: int | None = Query(default=None),
     event_type: str | None = Query(default=None),
@@ -376,16 +362,13 @@ async def get_audit_log(
 async def revoke_all_principal_tokens(
     principal_idx: int,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    actor: Principal = Depends(require_role_at_least("system_admin")),
+    actor: HumanUser = Depends(require_human_with_role("system_admin")),
     _scope: Principal = Depends(require_scope("admin:users")),
 ) -> RevokeAllTokensResponse:
     """Bulk-revoke every active token belonging to the target principal.
     Idempotent on already-revoked tokens (skipped, counted separately).
     Emits one token_revoke audit event per newly-revoked token so the audit
     trail records the bulk action atomically per token."""
-    if not isinstance(actor, HumanUser):
-        raise HTTPException(status_code=403, detail="human actor required")
-
     rows = await pool.fetch(
         "UPDATE qiita.api_tokens SET revoked_at = now()"
         " WHERE principal_idx = $1 AND revoked_at IS NULL"

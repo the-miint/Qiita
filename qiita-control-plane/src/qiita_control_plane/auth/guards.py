@@ -87,6 +87,28 @@ def require_role_at_least(role: str) -> Callable[..., Principal]:
     return _dep
 
 
+def require_human_with_role(role: str) -> Callable[..., HumanUser]:
+    """Factory: composes `require_human` with a hierarchical role check.
+
+    Returns the resolved `HumanUser` so callers can use `.principal_idx`,
+    `.email`, etc. without runtime narrowing — `require_role_at_least`
+    alone returns `Principal` because it accepts service accounts at the
+    type level (they always 403 at runtime). For routes that need both
+    role authority AND human context (most admin endpoints + admin-side
+    POST /users), this is the cleaner combinator.
+    """
+
+    def _dep(user: HumanUser = Depends(require_human)) -> HumanUser:
+        if not user.has_role_at_least(role):
+            raise HTTPException(
+                status_code=403,
+                detail=f"requires system_role at least {role!r}",
+            )
+        return user
+
+    return _dep
+
+
 def require_scope(scope: str) -> Callable[..., Principal]:
     """Factory: returns a dep that 401s on Anonymous, 403s if the principal's
     token scope set does not include `scope`."""

@@ -1,21 +1,18 @@
 """Reference management routes.
 
-Phase H.b: every route is now wired to the real principal resolver and
-guards from Phase E. POST /references writes both `created_by` (UUID,
-derived as uuid5(NAMESPACE_OID, str(principal_idx)) for forensic
-determinism) and the new `created_by_idx` BIGINT FK to qiita.principal.
-GET /references/{id} stays anonymous-OK (`get_current_principal` directly,
-no guard); other routes pin to scope and kind constraints per the plan.
-
-Phase H.c will drop the legacy `created_by` UUID column and update the
-INSERT to write only `created_by_idx`.
+Every route is wired to the real principal resolver and guards from
+Phase E. POST /references uses created_by_idx (BIGINT FK to qiita.principal)
+as the canonical owner reference; the legacy created_by UUID column was
+dropped in Phase H.c. GET /references/{id} stays anonymous-OK
+(`get_current_principal` directly, no guard); other routes pin to scope
+and kind constraints per the plan.
 """
 
 import asyncio
 import base64
 import json
 from typing import Annotated
-from uuid import NAMESPACE_OID, UUID, uuid5
+from uuid import UUID
 
 import asyncpg
 import pyarrow.flight as _flight
@@ -57,18 +54,9 @@ router = APIRouter(prefix="/references", tags=["references"])
 _CHUNK_SIZE = 10_000
 
 
-def _legacy_uuid(principal_idx: int) -> UUID:
-    """Deterministic UUID derived from principal_idx — used during the H.b
-    migration window so any forensic query against the dropped legacy
-    column (from a backup or rolled-back H.c) still resolves back to a
-    real principal rather than a dummy all-zeros UUID. H.c removes both
-    the column and this helper."""
-    return uuid5(NAMESPACE_OID, str(principal_idx))
-
-
 _REFERENCE_RETURNING = (
     "reference_idx, name, version, kind, status,"
-    " created_by, created_by_idx, created_at"
+    " created_by_idx, created_at"
 )
 
 
@@ -79,20 +67,17 @@ async def create_reference(
     user: HumanUser = Depends(require_complete_profile),
     _scope: Principal = Depends(require_scope("references:write")),
 ) -> ReferenceResponse:
-    """Create a reference. Humans only (service-kind principals can only
-    mint features and register files into existing references). Writes both
-    `created_by` (legacy UUID, derived from principal_idx) and `created_by_idx`."""
-    legacy = _legacy_uuid(user.principal_idx)
+    """Create a reference. Humans only — service-kind principals can only
+    mint features and register files into existing references."""
     try:
         row = await pool.fetchrow(
             "INSERT INTO qiita.references"
-            "  (name, version, kind, created_by, created_by_idx)"
-            " VALUES ($1, $2, $3, $4, $5)"
+            "  (name, version, kind, created_by_idx)"
+            " VALUES ($1, $2, $3, $4)"
             f" RETURNING {_REFERENCE_RETURNING}",
             body.name,
             body.version,
             body.kind,
-            legacy,
             user.principal_idx,
         )
     except asyncpg.UniqueViolationError:

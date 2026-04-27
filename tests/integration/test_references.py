@@ -58,14 +58,10 @@ async def test_create_reference_returns_201(client, human_admin_session):
     assert body["reference_idx"] > 0
     assert body["status"] == "pending"
     assert body["name"] == "test-ref-create"
-    # Phase H.b dual-write invariant: created_by_idx is the admin's idx,
-    # created_by is the deterministic uuid5 derived from it.
-    from uuid import NAMESPACE_OID, uuid5
-
+    # Phase H.c: created_by_idx is the canonical owner (legacy created_by
+    # UUID column was dropped).
     assert body["created_by_idx"] == human_admin_session["principal_idx"]
-    assert body["created_by"] == str(
-        uuid5(NAMESPACE_OID, str(human_admin_session["principal_idx"]))
-    )
+    assert "created_by" not in body
 
 
 async def test_create_reference_rejects_invalid_kind(client):

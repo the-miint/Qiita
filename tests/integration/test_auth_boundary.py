@@ -264,14 +264,13 @@ async def test_post_references_expired_token_401(
 
 
 async def _seed_active_reference(postgres_pool, suffix: str) -> int:
-    from uuid import NAMESPACE_OID, uuid5
     # Random component prevents (name, version) UNIQUE collisions across runs.
     return await postgres_pool.fetchval(
         "INSERT INTO qiita.references"
-        "  (name, version, kind, status, created_by, created_by_idx)"
-        " VALUES ($1, '1.0', 'sequence_reference', 'hashing', $2, 1)"
+        "  (name, version, kind, status, created_by_idx)"
+        " VALUES ($1, '1.0', 'sequence_reference', 'hashing', 1)"
         " RETURNING reference_idx",
-        f"boundary-mint-{_unique_suffix(suffix)}", uuid5(NAMESPACE_OID, "1"),
+        f"boundary-mint-{_unique_suffix(suffix)}",
     )
 
 

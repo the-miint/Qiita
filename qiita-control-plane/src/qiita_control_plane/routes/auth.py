@@ -1,13 +1,12 @@
 """Auth endpoints — /auth/whoami, /auth/pat, /auth/tokens.
 
-Routes use the real `get_current_principal` resolver from Phase E; the
-mock `get_current_user` is never wired in here. POST /auth/pat is the
-single route that requires a *fresh* OIDC JWT (auth_time within
-AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS) and bypasses the resolver because
-freshness is a per-route concern.
+Routes use the real `get_current_principal` resolver from Phase E. POST
+/auth/pat is the single route that requires a *fresh* OIDC JWT (auth_time
+within AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS) and bypasses the resolver
+because freshness is a per-route concern.
 
 POST /auth/login (the OIDC code-exchange callback for the CLI flow) is
-deferred to Phase G when the qiita-admin CLI drives the requirements.
+deferred to Phase J — needs an OIDC test harness for code-exchange.
 """
 
 import time

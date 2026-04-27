@@ -1,6 +1,6 @@
 # Authentication
 
-> **Status:** in development on `feat/auth`. Phases A–H.b have landed. Every authenticated route is on the real Phase E resolver + guards (`get_current_principal` + `require_human/service/role/scope`); `routes/references.py` writes both `created_by` (legacy UUID, derived as `uuid5(NAMESPACE_OID, str(principal_idx))`) and `created_by_idx` (new BIGINT FK). The mock helpers `get_current_user` / `get_current_principal_idx` survive in `deps.py` with `# DEPRECATED: removed in Phase H.c` comments — H.c drops the legacy UUID column and deletes the mocks. The OIDC PKCE code-exchange (`POST /auth/login` + matching `qiita-admin login`) is deferred to Phase J.
+> **Status:** in development on `feat/auth`. Phases A–H.c have landed. The legacy `references.created_by UUID` column is gone; `references.created_by_idx BIGINT NOT NULL REFERENCES qiita.principal(idx)` is the canonical owner reference. The mock auth helpers (`get_current_user` / `get_current_principal_idx`) have been deleted from `deps.py`; the only auth path is `auth.principal.get_current_principal` + the `require_*` guards. The OIDC PKCE code-exchange (`POST /auth/login` + `qiita-admin login`) is the only remaining gap, deferred to Phase J. Phase I wires the orchestrator to use a service-account token via the `compute_worker_service_account` fixture pattern.
 
 Qiita authenticates three kinds of principal against the control plane:
 

@@ -1,8 +1,9 @@
 """Tests for the references.created_by_idx FK migration (Phase H.a → H.c).
 
-H.a (this phase): adds nullable BIGINT FK to qiita.principal, backfills
-existing rows to the system principal. H.b dual-writes; H.c finalises
-with NOT NULL + drop of the legacy created_by UUID column.
+H.a added the nullable BIGINT FK and backfilled. H.b dual-wrote both columns
+from the route layer. H.c (this commit) finalised: NOT NULL on created_by_idx
+and DROP of the legacy created_by UUID column. By the time this test runs,
+both migrations are applied and the assertions reflect the final state.
 """
 
 import asyncpg
@@ -10,11 +11,11 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# Phase H.a — column shape
+# Final column shape (post-H.c)
 # ---------------------------------------------------------------------------
 
 
-async def test_h_a_column_exists(postgres_pool):
+async def test_created_by_idx_is_not_null(postgres_pool):
     row = await postgres_pool.fetchrow(
         "SELECT data_type, is_nullable FROM information_schema.columns"
         " WHERE table_schema = 'qiita' AND table_name = 'references'"
@@ -22,16 +23,24 @@ async def test_h_a_column_exists(postgres_pool):
     )
     assert row is not None, "qiita.references.created_by_idx does not exist"
     assert row["data_type"] == "bigint"
-    # Phase H.a leaves the column nullable; H.c sets it NOT NULL.
-    assert row["is_nullable"] == "YES"
+    assert row["is_nullable"] == "NO"
 
 
-async def test_h_a_column_has_fk_to_principal(postgres_pool):
+async def test_legacy_created_by_column_dropped(postgres_pool):
+    """Phase H.c dropped the legacy created_by UUID column."""
+    row = await postgres_pool.fetchval(
+        "SELECT 1 FROM information_schema.columns"
+        " WHERE table_schema = 'qiita' AND table_name = 'references'"
+        "   AND column_name = 'created_by'"
+    )
+    assert row is None, "qiita.references.created_by should have been dropped in H.c"
+
+
+async def test_column_has_fk_to_principal(postgres_pool):
     """The column must FK to qiita.principal(idx) so worker / human / system
     creators are all valid targets."""
     row = await postgres_pool.fetchrow(
-        "SELECT confrelid::regclass::text AS target_table,"
-        "  pg_get_constraintdef(oid) AS def"
+        "SELECT confrelid::regclass::text AS target_table"
         " FROM pg_constraint"
         " WHERE conrelid = 'qiita.references'::regclass"
         "   AND contype = 'f'"
@@ -43,9 +52,9 @@ async def test_h_a_column_has_fk_to_principal(postgres_pool):
     assert row["target_table"] in ("qiita.principal", "principal")
 
 
-async def test_h_a_no_cascade_on_delete(postgres_pool):
+async def test_no_cascade_on_delete(postgres_pool):
     """Project convention: NO ACTION / RESTRICT on every FK in the qiita
-    schema. The new FK on references.created_by_idx must follow."""
+    schema."""
     rule = await postgres_pool.fetchval(
         "SELECT rc.delete_rule"
         " FROM information_schema.table_constraints tc"
@@ -63,96 +72,34 @@ async def test_h_a_no_cascade_on_delete(postgres_pool):
 
 
 # ---------------------------------------------------------------------------
-# Phase H.a — backfill semantics
+# Behavior post-H.c
 # ---------------------------------------------------------------------------
 
 
-async def test_h_a_backfill_assigns_system_principal_to_null_rows(postgres_pool):
-    """The migration's backfill UPDATE assigns idx=1 to any reference row
-    whose created_by_idx is NULL. Re-running the same SQL is idempotent
-    (no-op the second time) and is what the test simulates here."""
+async def test_insert_with_explicit_principal_idx(postgres_pool):
+    """The route layer INSERTs references with an explicit created_by_idx."""
     async with postgres_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
         try:
-            # Insert a reference row with created_by_idx explicitly NULL
-            # (simulates the pre-H.a state).
-            ref_idx = await conn.fetchval(
-                "INSERT INTO qiita.references"
-                "  (name, version, kind, created_by, created_by_idx)"
-                " VALUES ($1, $2, 'sequence_reference',"
-                "         'a0000000-0000-0000-0000-000000000001'::uuid, NULL)"
-                " RETURNING reference_idx",
-                "h_a-backfill-test", "1.0",
-            )
-            null_before = await conn.fetchval(
-                "SELECT created_by_idx FROM qiita.references"
-                " WHERE reference_idx = $1",
-                ref_idx,
-            )
-            assert null_before is None
-
-            # Apply the same backfill SQL the migration uses.
-            await conn.execute(
-                "UPDATE qiita.references SET created_by_idx = 1"
-                " WHERE created_by_idx IS NULL"
-            )
-
-            backfilled = await conn.fetchval(
-                "SELECT created_by_idx FROM qiita.references"
-                " WHERE reference_idx = $1",
-                ref_idx,
-            )
-            assert backfilled == 1
-        finally:
-            await tr.rollback()
-
-
-async def test_h_a_post_migration_no_null_rows(postgres_pool):
-    """Sanity: after the migration runs at session start, no existing
-    qiita.references row should have a NULL created_by_idx — the backfill
-    handles the pre-H.a population. New rows inserted later may have NULL
-    until Phase H.b flips routes to dual-write; that's covered separately.
-    """
-    n = await postgres_pool.fetchval(
-        "SELECT count(*) FROM qiita.references"
-        " WHERE created_by_idx IS NULL"
-        # Exclude rows we know other tests insert with explicit NULL
-        # (the backfill test above wraps in a transaction and rolls back,
-        # so it shouldn't leak rows; this filter is belt-and-suspenders).
-        "   AND created_at < now() - interval '1 hour'"
-    )
-    assert n == 0
-
-
-async def test_h_a_can_insert_explicit_principal_idx(postgres_pool):
-    """Once H.a lands, the route layer should be able to INSERT references
-    with an explicit created_by_idx pointing at any principal. This is the
-    setup Phase H.b's dual-write depends on."""
-    async with postgres_pool.acquire() as conn:
-        tr = conn.transaction()
-        await tr.start()
-        try:
-            # Seed a principal we'll point at.
             pidx = await conn.fetchval(
                 "INSERT INTO qiita.principal"
                 "  (display_name, system_role, created_by_idx)"
-                " VALUES ('h_a-creator', 'user', 1) RETURNING idx"
+                " VALUES ('h_c-creator', 'user', 1) RETURNING idx"
             )
             row = await conn.fetchrow(
                 "INSERT INTO qiita.references"
-                "  (name, version, kind, created_by, created_by_idx)"
-                " VALUES ($1, $2, 'sequence_reference',"
-                "         'a0000000-0000-0000-0000-000000000001'::uuid, $3)"
+                "  (name, version, kind, created_by_idx)"
+                " VALUES ($1, $2, 'sequence_reference', $3)"
                 " RETURNING reference_idx, created_by_idx",
-                "h_a-explicit-creator", "1.0", pidx,
+                "h_c-explicit-creator", "1.0", pidx,
             )
             assert row["created_by_idx"] == pidx
         finally:
             await tr.rollback()
 
 
-async def test_h_a_rejects_fk_to_nonexistent_principal(postgres_pool):
+async def test_rejects_fk_to_nonexistent_principal(postgres_pool):
     """The FK must be enforced — created_by_idx pointing at a missing
     principal raises ForeignKeyViolation."""
     async with postgres_pool.acquire() as conn:
@@ -162,10 +109,43 @@ async def test_h_a_rejects_fk_to_nonexistent_principal(postgres_pool):
             with pytest.raises(asyncpg.ForeignKeyViolationError):
                 await conn.execute(
                     "INSERT INTO qiita.references"
-                    "  (name, version, kind, created_by, created_by_idx)"
-                    " VALUES ($1, $2, 'sequence_reference',"
-                    "         'a0000000-0000-0000-0000-000000000001'::uuid, $3)",
-                    "h_a-bad-fk", "1.0", 999_999_999,
+                    "  (name, version, kind, created_by_idx)"
+                    " VALUES ($1, $2, 'sequence_reference', $3)",
+                    "h_c-bad-fk", "1.0", 999_999_999,
                 )
         finally:
             await tr.rollback()
+
+
+async def test_insert_without_created_by_idx_rejected(postgres_pool):
+    """Phase H.c made the column NOT NULL — omitting it raises."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            with pytest.raises(asyncpg.NotNullViolationError):
+                await conn.execute(
+                    "INSERT INTO qiita.references (name, version, kind)"
+                    " VALUES ($1, $2, 'sequence_reference')",
+                    "h_c-no-fk", "1.0",
+                )
+        finally:
+            await tr.rollback()
+
+
+# ---------------------------------------------------------------------------
+# get_current_user / get_current_principal_idx removal
+# ---------------------------------------------------------------------------
+
+
+def test_get_current_user_no_longer_importable():
+    """Phase H.c deleted the mock auth helpers from deps.py."""
+    import importlib
+
+    deps = importlib.import_module("qiita_control_plane.deps")
+    assert not hasattr(deps, "get_current_user"), (
+        "get_current_user should be removed from deps.py in Phase H.c"
+    )
+    assert not hasattr(deps, "get_current_principal_idx"), (
+        "get_current_principal_idx should be removed from deps.py in Phase H.c"
+    )

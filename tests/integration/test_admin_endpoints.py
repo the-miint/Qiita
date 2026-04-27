@@ -176,7 +176,8 @@ async def test_post_service_accounts_rejects_scope_outside_service_ceiling(
         json={"name": "evil-svc", "scopes": ["features:mint", "admin:users"]},
     )
     assert resp.status_code == 422
-    assert "admin:users" in resp.json()["detail"]["rejected_scopes"]
+    # Flat 422 body (matches /auth/pat shape) — top-level rejected_scopes.
+    assert "admin:users" in resp.json()["rejected_scopes"]
 
 
 async def test_post_service_accounts_duplicate_name_409(

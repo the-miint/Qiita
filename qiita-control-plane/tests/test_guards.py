@@ -178,6 +178,32 @@ def test_require_scope_works_for_service_account_with_matching_scope():
 
 
 # ---------------------------------------------------------------------------
+# require_human_with_role — composes require_human + role check
+# ---------------------------------------------------------------------------
+# These tests exercise the role-check body of the helper directly.
+# Anonymous/Service rejection is delegated to require_human (tested above)
+# via the FastAPI dep chain; calling the body with a non-human input is
+# not a real production code path.
+
+
+def test_require_human_with_role_returns_human_user_with_sufficient_role():
+    from qiita_control_plane.auth.guards import require_human_with_role
+
+    dep = require_human_with_role("user")
+    h = _human(role="system_admin")
+    assert dep(h) is h
+
+
+def test_require_human_with_role_403_on_insufficient_role():
+    from qiita_control_plane.auth.guards import require_human_with_role
+
+    dep = require_human_with_role("system_admin")
+    with pytest.raises(HTTPException) as exc:
+        dep(_human(role="wet_lab_admin"))
+    assert exc.value.status_code == 403
+
+
+# ---------------------------------------------------------------------------
 # require_complete_profile
 # ---------------------------------------------------------------------------
 
