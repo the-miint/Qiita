@@ -471,6 +471,89 @@ async def test_revoke_all_tokens_admin_only(admin_client, postgres_pool):
     assert resp.status_code == 403
 
 
+async def test_revoke_all_tokens_requires_admin_service_accounts_for_service_target(
+    admin_client, postgres_pool
+):
+    """An admin token with admin:users but NOT admin:service_accounts
+    cannot bulk-revoke tokens for a service-account-kind target."""
+    from qiita_control_plane.auth.tokens import mint_api_token
+
+    # Fresh admin with admin:users but explicitly NOT admin:service_accounts.
+    admin_idx = await _seed_human(
+        postgres_pool,
+        email="narrow-admin@example.com",
+        role="system_admin",
+    )
+    _track(admin_client, admin_idx)
+    narrow_token, _ = await mint_api_token(
+        postgres_pool,
+        principal_idx=admin_idx,
+        label="narrow",
+        scopes=[
+            "self:profile", "self:tokens", "references:read",
+            "references:write", "admin:users",
+            # admin:service_accounts intentionally absent
+            "admin:audit_read",
+        ],
+    )
+
+    # Service-account target.
+    svc_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.principal"
+        "  (display_name, system_role, created_by_idx)"
+        " VALUES ('narrow-svc-target', 'user', 1) RETURNING idx"
+    )
+    _track(admin_client, svc_idx)
+    await postgres_pool.execute(
+        "INSERT INTO qiita.service_account (principal_idx, name)"
+        " VALUES ($1, 'narrow-svc-target')",
+        svc_idx,
+    )
+
+    resp = await admin_client.post(
+        f"/api/v1/admin/principals/{svc_idx}/revoke-all-tokens",
+        headers={"Authorization": f"Bearer {narrow_token}"},
+    )
+    assert resp.status_code == 403
+    assert "admin:service_accounts" in resp.json()["detail"]
+
+
+async def test_revoke_all_tokens_requires_admin_users_for_user_target(
+    admin_client, postgres_pool
+):
+    """Symmetric: admin:service_accounts alone is not enough for a user target."""
+    from qiita_control_plane.auth.tokens import mint_api_token
+
+    admin_idx = await _seed_human(
+        postgres_pool,
+        email="svc-only-admin@example.com",
+        role="system_admin",
+    )
+    _track(admin_client, admin_idx)
+    narrow_token, _ = await mint_api_token(
+        postgres_pool,
+        principal_idx=admin_idx,
+        label="svc-only",
+        scopes=[
+            "self:profile", "self:tokens", "references:read",
+            # admin:users intentionally absent
+            "admin:service_accounts",
+        ],
+    )
+
+    user_target = await _seed_human(
+        postgres_pool, email="narrow-user-target@example.com",
+    )
+    _track(admin_client, user_target)
+
+    resp = await admin_client.post(
+        f"/api/v1/admin/principals/{user_target}/revoke-all-tokens",
+        headers={"Authorization": f"Bearer {narrow_token}"},
+    )
+    assert resp.status_code == 403
+    assert "admin:users" in resp.json()["detail"]
+
+
 async def test_revoke_all_tokens_revokes_all_active_and_skips_revoked(
     admin_client, postgres_pool
 ):

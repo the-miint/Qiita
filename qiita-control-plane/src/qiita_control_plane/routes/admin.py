@@ -363,12 +363,46 @@ async def revoke_all_principal_tokens(
     principal_idx: int,
     pool: asyncpg.Pool = Depends(get_db_pool),
     actor: HumanUser = Depends(require_human_with_role("system_admin")),
-    _scope: Principal = Depends(require_scope("admin:users")),
 ) -> RevokeAllTokensResponse:
     """Bulk-revoke every active token belonging to the target principal.
-    Idempotent on already-revoked tokens (skipped, counted separately).
-    Emits one token_revoke audit event per newly-revoked token so the audit
-    trail records the bulk action atomically per token."""
+
+    Scope policy: targeting a user-kind principal requires `admin:users`;
+    targeting a service-kind principal requires `admin:service_accounts`.
+    The route resolves the target's kind first and demands the matching
+    scope so an admin can be issued a narrower-than-full token (e.g. for
+    a workflow that only manages workers) and have the route layer enforce
+    the boundary.
+
+    Idempotent on already-revoked tokens (counted separately). Emits one
+    token_revoke audit event per newly-revoked token so the audit trail
+    records the bulk action atomically per token.
+    """
+    kind = await pool.fetchval(
+        "SELECT CASE"
+        " WHEN EXISTS (SELECT 1 FROM qiita.user WHERE principal_idx = $1) THEN 'user'"
+        " WHEN EXISTS (SELECT 1 FROM qiita.service_account WHERE principal_idx = $1)"
+        "      THEN 'service'"
+        " ELSE 'bare' END",
+        principal_idx,
+    )
+    required_scope = (
+        "admin:users" if kind == "user" else "admin:service_accounts"
+    )
+    if kind == "bare":
+        # No subtype row, so no tokens either — but still surface 404 instead
+        # of silently succeeding so the caller's intent is verified.
+        principal_exists = await pool.fetchval(
+            "SELECT 1 FROM qiita.principal WHERE idx = $1", principal_idx
+        )
+        if not principal_exists:
+            raise HTTPException(status_code=404, detail="principal not found")
+    if not actor.has_scope(required_scope):
+        raise HTTPException(
+            status_code=403,
+            detail=f"missing required scope {required_scope!r} for"
+            f" {kind}-kind principal",
+        )
+
     rows = await pool.fetch(
         "UPDATE qiita.api_tokens SET revoked_at = now()"
         " WHERE principal_idx = $1 AND revoked_at IS NULL"

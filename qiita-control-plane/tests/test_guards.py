@@ -223,4 +223,7 @@ def test_require_complete_profile_422_when_incomplete():
         require_complete_profile(h)
     assert exc.value.status_code == 422
     assert exc.value.detail["reason"] == "profile_incomplete"
-    assert "missing_fields" in exc.value.detail
+    # The guard does NOT carry per-field missing list — the route layer
+    # (POST /auth/pat) owns that, since it can pull the actual field
+    # values from the DB.
+    assert "missing_fields" not in exc.value.detail

@@ -259,6 +259,14 @@ All routes require `system_role >= system_admin` AND the appropriate `admin:*` s
 
 The system principal (`idx=1`) is rejected by every mutation endpoint above (`disabled`, `retired`, `system-role`) — bare-actor invariant holds at the API layer in addition to the DB CHECK.
 
+### User self-service
+
+| Route | Method | Notes |
+|---|---|---|
+| `/api/v1/users` | POST | Admin-only (`require_human_with_role("system_admin") + require_scope("admin:users")`). Creates a new principal + user row in one transaction; the new principal's `created_by_idx` points at the requesting admin. Returns `409` on email collision (case-insensitive via CITEXT). In production, OIDC first-login is the typical user-creation path; this route exists for admins to onboard PIs imported from external systems. |
+| `/api/v1/users/me` | GET | Returns the authenticated user's profile. `require_human` (rejects service-kind 403). |
+| `/api/v1/users/me` | PATCH | Updates profile fields (`affiliation`, `address`, `phone`, `orcid`, `receive_processing_emails`). Requires `self:profile`. `email` and status fields are absent from `UserUpdate` and are silently dropped — email-change requires re-verification via OIDC, status is admin-only. |
+
 ## CLI (`qiita-admin`)
 
 Installed as the `qiita-admin` console script via `qiita-control-plane`'s pyproject. Subcommands:
@@ -268,26 +276,7 @@ Installed as the `qiita-admin` console script via `qiita-control-plane`'s pyproj
 | `set-system-role --email X --role Y` | direct DB | Bootstrap path — sets `qiita.principal.system_role` by email lookup against `qiita.user`. Refuses to operate on `idx=1`. The user must have logged in via OIDC at least once (which is what creates their `principal+user` rows). |
 | `whoami` | HTTP | Calls `GET /api/v1/auth/whoami`. PAT read from `QIITA_TOKEN` env or `~/.qiita/token` (mode 0600 expected). |
 | `token revoke-all --principal-idx N` | HTTP | Calls `POST /api/v1/admin/principals/{N}/revoke-all-tokens`. |
-| `login` | DEFERRED | The full PKCE + OIDC code-exchange flow lands in Phase J. Today's path: obtain a JWT out-of-band (AuthRocket admin UI / external CLI) and call `POST /api/v1/auth/pat` directly. |
-
-## First-deploy bootstrap
-
-See [`docs/runbooks/first-deploy.md`](runbooks/first-deploy.md) for the full sequence: migrate → set env vars → one-shot JWT verify (`scripts/verify_jwt.py`) → start control plane → first OIDC login → `qiita-admin set-system-role` → mint operator PAT → mint orchestrator service account → install token at `/etc/qiita/orchestrator.token` (mode 0400) → start orchestrator.
-
-### User CRUD (Phase B — mock auth)
-
-| Route | Method | Notes |
-|---|---|---|
-| `/api/v1/users` | POST | Admin creates a new principal + user row in one transaction. The new principal's `created_by_idx` points at the requesting principal. Returns `409` on email collision (case-insensitive via CITEXT). |
-| `/api/v1/users/me` | GET | Returns the authenticated principal's user profile. |
-| `/api/v1/users/me` | PATCH | Updates profile fields (`affiliation`, `address`, `phone`, `orcid`, `receive_processing_emails`). `email` and status fields are intentionally absent from `UserUpdate` and are dropped silently if sent. |
-
-Authentication is currently the **mock principal-resolver** in `deps.py::get_current_principal_idx`, which looks up a `principal` by `display_name='mock-admin'`. Integration tests seed this row via `mock_authenticated_principal` in `tests/integration/conftest.py`. The real OIDC/PAT-driven resolver replaces this in Phase E.
-
-The auth-specific endpoints (`/auth/pat`, `/auth/whoami`, `/auth/tokens`, `/auth/login`) and admin endpoints (service accounts, audit log, principal status updates) are populated when Phases F and G land.
-
-<!-- CLI section now populated above under Phase G admin endpoints. -->
-## CLI (`qiita-admin`) — see admin section above
+| `login` | DEFERRED | The PKCE + OIDC code-exchange flow is **not** shipped (see the Status banner above). Exits 2 with a message pointing at the alternative: obtain a JWT out-of-band and call `POST /api/v1/auth/pat` directly. |
 
 ## Orchestrator integration
 
@@ -308,7 +297,9 @@ Exactly one must be supplied; passing both or neither raises `ValueError`. The p
 If neither source yields a token, `Settings.from_env()` raises `RuntimeError` with an actionable message pointing at both paths.
 
 <!-- See "First-deploy bootstrap" subsection within Endpoints. -->
-## First-deploy bootstrap — see [docs/runbooks/first-deploy.md](runbooks/first-deploy.md)
+## First-deploy bootstrap
+
+See [`docs/runbooks/first-deploy.md`](runbooks/first-deploy.md) for the full sequence: migrate → set env vars → one-shot JWT verify (`scripts/verify_jwt.py`) → start control plane → first OIDC login → `qiita-admin set-system-role` → mint operator PAT → mint orchestrator service account → install token at `/etc/qiita/orchestrator.token` (mode 0400) → start orchestrator.
 
 ## Token rotation
 

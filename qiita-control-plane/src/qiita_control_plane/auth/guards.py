@@ -136,28 +136,22 @@ def require_scope(scope: str) -> Callable[..., Principal]:
 def require_complete_profile(
     user: HumanUser = Depends(require_human),
 ) -> HumanUser:
-    """Chain: must be a HumanUser AND profile_complete is True. Returns 422
-    when incomplete with a body listing the missing fields. The route handler
-    uses the returned user without re-resolution."""
+    """Chain: must be a HumanUser AND profile_complete is True.
+
+    Returns 422 with a flat-detail body. The DB-driven missing-fields list
+    (which fields are actually empty for this user) is not computed here —
+    `HumanUser` only carries the `profile_complete` boolean, not the raw
+    fields. Routes that want to surface the per-field missing list to the
+    user (e.g. `POST /auth/pat`) skip this guard and check `profile_complete`
+    inline so they can issue a single SQL query that pulls both the boolean
+    and the field values.
+    """
     if not user.profile_complete:
         raise HTTPException(
             status_code=422,
             detail={
                 "detail": "profile incomplete",
                 "reason": "profile_incomplete",
-                "missing_fields": _missing_profile_fields(user),
             },
         )
     return user
-
-
-def _missing_profile_fields(user: HumanUser) -> list[str]:
-    """Names of fields whose emptiness causes profile_complete=False.
-
-    The DB's GENERATED column logic is `affiliation <> '' AND address <> ''
-    AND phone <> ''`. We can't see the raw values from a HumanUser (we only
-    carry the boolean), so this returns the canonical list. Phase F's PAT
-    route may upgrade this to a DB-driven list if a more informative error
-    is needed.
-    """
-    return ["affiliation", "address", "phone"]
