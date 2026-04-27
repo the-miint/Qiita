@@ -71,9 +71,7 @@ async def create_service_account(
             status_code=422,
             content={"detail": "unknown scopes", "rejected_scopes": sorted(unknown)},
         )
-    rejected = reject_scopes_outside_ceiling(
-        body.scopes, SERVICE_ACCOUNT_SCOPE_CEILING
-    )
+    rejected = reject_scopes_outside_ceiling(body.scopes, SERVICE_ACCOUNT_SCOPE_CEILING)
     if rejected:
         return JSONResponse(
             status_code=422,
@@ -84,9 +82,7 @@ async def create_service_account(
         )
 
     expires_at = (
-        datetime.now(UTC) + timedelta(days=body.ttl_days)
-        if body.ttl_days is not None
-        else None
+        datetime.now(UTC) + timedelta(days=body.ttl_days) if body.ttl_days is not None else None
     )
 
     try:
@@ -166,16 +162,16 @@ async def set_principal_disabled(
 
     if body.disabled:
         if not body.reason:
-            raise HTTPException(
-                status_code=422, detail="reason is required when disabling"
-            )
+            raise HTTPException(status_code=422, detail="reason is required when disabling")
         try:
             result = await pool.execute(
                 "UPDATE qiita.principal SET"
                 "  disabled = true, disabled_at = now(),"
                 "  disabled_by_idx = $2, disable_reason = $3"
                 " WHERE idx = $1 AND disabled = false AND retired = false",
-                principal_idx, actor.principal_idx, body.reason,
+                principal_idx,
+                actor.principal_idx,
+                body.reason,
             )
         except asyncpg.CheckViolationError as exc:
             # principal_not_both_disabled_and_retired (race with retire) or
@@ -200,9 +196,7 @@ async def set_principal_disabled(
         if row is None:
             raise HTTPException(status_code=404, detail="principal not found")
         if row["retired"]:
-            raise HTTPException(
-                status_code=409, detail="principal is retired (terminal)"
-            )
+            raise HTTPException(status_code=409, detail="principal is retired (terminal)")
         # Already in target state → idempotent success.
         return
 
@@ -236,9 +230,7 @@ async def retire_principal(
         raise HTTPException(status_code=403, detail="cannot retire system principal")
 
     if actor.principal_idx == principal_idx:
-        raise HTTPException(
-            status_code=403, detail="admin cannot retire themselves"
-        )
+        raise HTTPException(status_code=403, detail="admin cannot retire themselves")
 
     try:
         result = await pool.execute(
@@ -246,7 +238,9 @@ async def retire_principal(
             "  retired = true, retired_at = now(),"
             "  retired_by_idx = $2, retire_reason = $3"
             " WHERE idx = $1 AND retired = false",
-            principal_idx, actor.principal_idx, body.reason,
+            principal_idx,
+            actor.principal_idx,
+            body.reason,
         )
     except asyncpg.CheckViolationError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -285,9 +279,7 @@ async def set_principal_system_role(
     """Set the principal's system_role. The DB enum validates the value;
     Pydantic's Literal narrows it before we hit the DB."""
     if principal_idx == 1:
-        raise HTTPException(
-            status_code=403, detail="cannot modify system principal's role"
-        )
+        raise HTTPException(status_code=403, detail="cannot modify system principal's role")
 
     old_role = await pool.fetchval(
         "SELECT system_role FROM qiita.principal WHERE idx = $1", principal_idx
@@ -297,7 +289,8 @@ async def set_principal_system_role(
 
     await pool.execute(
         "UPDATE qiita.principal SET system_role = $1 WHERE idx = $2",
-        body.system_role, principal_idx,
+        body.system_role,
+        principal_idx,
     )
 
     await record_event(
@@ -336,7 +329,7 @@ async def get_audit_log(
     if event_type is not None:
         params.append(event_type)
         sql += f" AND event_type = ${len(params)}"
-    sql += " ORDER BY event_idx DESC LIMIT $%d" % (len(params) + 1)
+    sql += f" ORDER BY event_idx DESC LIMIT ${len(params) + 1}"
     params.append(limit)
 
     rows = await pool.fetch(sql, *params)
@@ -385,9 +378,7 @@ async def revoke_all_principal_tokens(
         " ELSE 'bare' END",
         principal_idx,
     )
-    required_scope = (
-        "admin:users" if kind == "user" else "admin:service_accounts"
-    )
+    required_scope = "admin:users" if kind == "user" else "admin:service_accounts"
     if kind == "bare":
         # No subtype row, so no tokens either — but still surface 404 instead
         # of silently succeeding so the caller's intent is verified.
@@ -399,8 +390,7 @@ async def revoke_all_principal_tokens(
     if not actor.has_scope(required_scope):
         raise HTTPException(
             status_code=403,
-            detail=f"missing required scope {required_scope!r} for"
-            f" {kind}-kind principal",
+            detail=f"missing required scope {required_scope!r} for {kind}-kind principal",
         )
 
     rows = await pool.fetch(
@@ -415,7 +405,8 @@ async def revoke_all_principal_tokens(
         "SELECT count(*) FROM qiita.api_tokens"
         " WHERE principal_idx = $1 AND revoked_at IS NOT NULL"
         "   AND token_idx <> ALL($2::bigint[])",
-        principal_idx, revoked_idxs,
+        principal_idx,
+        revoked_idxs,
     )
 
     for tidx in revoked_idxs:

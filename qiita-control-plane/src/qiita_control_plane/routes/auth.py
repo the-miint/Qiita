@@ -124,7 +124,7 @@ async def mint_pat(
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="OIDC JWT required")
-    bearer = auth[len("Bearer "):].strip()
+    bearer = auth[len("Bearer ") :].strip()
     if bearer.startswith("qk_"):
         raise HTTPException(
             status_code=401,
@@ -181,18 +181,12 @@ async def mint_pat(
             detail="no user matches this OIDC identity",
         )
     if user_row["disabled"] or user_row["retired"]:
-        raise HTTPException(
-            status_code=401, detail="principal disabled or retired"
-        )
+        raise HTTPException(status_code=401, detail="principal disabled or retired")
 
     if not user_row["profile_complete"]:
         # Flat 422 body so the CLI can pluck reason / missing_fields without
         # nested-detail unwrapping.
-        missing = [
-            f
-            for f in ("affiliation", "address", "phone")
-            if not user_row[f]
-        ]
+        missing = [f for f in ("affiliation", "address", "phone") if not user_row[f]]
         return JSONResponse(
             status_code=422,
             content={
@@ -233,11 +227,7 @@ async def mint_pat(
         scopes = list(body.scopes)
 
     # TTL — Pydantic already enforces gt=0 and le=365.
-    ttl_days = (
-        body.ttl_days
-        if body.ttl_days is not None
-        else settings.token_default_ttl_days
-    )
+    ttl_days = body.ttl_days if body.ttl_days is not None else settings.token_default_ttl_days
     expires_at = datetime.now(UTC) + timedelta(days=ttl_days)
 
     plaintext, token_idx = await mint_api_token(
@@ -281,9 +271,7 @@ async def list_own_tokens(
     if isinstance(p, Anonymous):
         raise HTTPException(status_code=401, detail="authentication required")
     if not p.has_scope("self:tokens"):
-        raise HTTPException(
-            status_code=403, detail="missing required scope 'self:tokens'"
-        )
+        raise HTTPException(status_code=403, detail="missing required scope 'self:tokens'")
 
     rows = await pool.fetch(
         "SELECT token_idx, label, scopes, expires_at, revoked_at,"
@@ -314,9 +302,7 @@ async def revoke_own_token(
     if isinstance(p, Anonymous):
         raise HTTPException(status_code=401, detail="authentication required")
     if not p.has_scope("self:tokens"):
-        raise HTTPException(
-            status_code=403, detail="missing required scope 'self:tokens'"
-        )
+        raise HTTPException(status_code=403, detail="missing required scope 'self:tokens'")
 
     # Atomic UPDATE WHERE — only revokes if owner matches and token is not
     # already revoked. Returns 0 rows if either condition fails.

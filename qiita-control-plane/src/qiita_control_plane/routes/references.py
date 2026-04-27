@@ -54,10 +54,7 @@ router = APIRouter(prefix="/references", tags=["references"])
 _CHUNK_SIZE = 10_000
 
 
-_REFERENCE_RETURNING = (
-    "reference_idx, name, version, kind, status,"
-    " created_by_idx, created_at"
-)
+_REFERENCE_RETURNING = "reference_idx, name, version, kind, status, created_by_idx, created_at"
 
 
 @router.post("", status_code=201)
@@ -100,8 +97,7 @@ async def get_reference(
     created_by_idx; row-level visibility (e.g., hiding private references'
     owner) is the follow-up plan, not Phase H."""
     row = await pool.fetchrow(
-        f"SELECT {_REFERENCE_RETURNING} FROM qiita.references"
-        " WHERE reference_idx = $1",
+        f"SELECT {_REFERENCE_RETURNING} FROM qiita.references WHERE reference_idx = $1",
         reference_idx,
     )
     if row is None:

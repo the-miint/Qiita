@@ -59,8 +59,12 @@ def test_human_user_has_role_at_least_hierarchy():
     from qiita_control_plane.auth.principal import HumanUser
 
     args = dict(
-        principal_idx=2, email="x@x.com", scopes=frozenset(),
-        profile_complete=True, disabled=False, retired=False,
+        principal_idx=2,
+        email="x@x.com",
+        scopes=frozenset(),
+        profile_complete=True,
+        disabled=False,
+        retired=False,
     )
     user = HumanUser(system_role="user", **args)
     wla = HumanUser(system_role="wet_lab_admin", **args)
@@ -117,16 +121,26 @@ def test_human_user_has_scope():
 
 def test_principal_subclasses_are_frozen():
     from qiita_control_plane.auth.principal import (
-        Anonymous, HumanUser, ServiceAccount,
+        Anonymous,
+        HumanUser,
+        ServiceAccount,
     )
 
     h = HumanUser(
-        principal_idx=2, email="x@x.com", system_role="user",
-        scopes=frozenset(), profile_complete=False, disabled=False, retired=False,
+        principal_idx=2,
+        email="x@x.com",
+        system_role="user",
+        scopes=frozenset(),
+        profile_complete=False,
+        disabled=False,
+        retired=False,
     )
     s = ServiceAccount(
-        principal_idx=3, name="x", scopes=frozenset(),
-        disabled=False, retired=False,
+        principal_idx=3,
+        name="x",
+        scopes=frozenset(),
+        disabled=False,
+        retired=False,
     )
     a = Anonymous()
 

@@ -6,8 +6,6 @@ first-deploy flow). The HTTP subcommand helpers are tested here against
 a stubbed httpx response.
 """
 
-from pathlib import Path
-
 import httpx
 import pytest
 
@@ -28,9 +26,7 @@ def test_read_token_from_file(monkeypatch, tmp_path):
     assert _read_token(token_file=f) == "qk_from_file"
 
 
-def test_read_token_raises_with_actionable_message(
-    monkeypatch, tmp_path
-):
+def test_read_token_raises_with_actionable_message(monkeypatch, tmp_path):
     from qiita_control_plane.cli.admin import _read_token
 
     monkeypatch.delenv("QIITA_TOKEN", raising=False)
@@ -76,10 +72,7 @@ def test_token_revoke_all_calls_correct_url(monkeypatch):
 
     monkeypatch.setattr(cli.httpx, "post", fake_post)
     body = cli._token_revoke_all("http://localhost:8080", "qk_admin", 42)
-    assert (
-        captured["url"]
-        == "http://localhost:8080/api/v1/admin/principals/42/revoke-all-tokens"
-    )
+    assert captured["url"] == "http://localhost:8080/api/v1/admin/principals/42/revoke-all-tokens"
     assert body["revoked_token_idxs"] == [1, 2]
 
 
@@ -96,8 +89,9 @@ def test_main_login_returns_2_with_actionable_message(capsys):
 
 
 def test_main_set_system_role_validates_role():
-    from qiita_control_plane.cli.admin import _set_system_role
     import asyncio
+
+    from qiita_control_plane.cli.admin import _set_system_role
 
     with pytest.raises(ValueError, match="role must be one of"):
         asyncio.run(_set_system_role("postgres://x", "x@x.com", "super_admin"))

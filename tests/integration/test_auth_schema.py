@@ -547,8 +547,7 @@ async def test_user_identities_pk_uniqueness(postgres_pool):
             p2 = await _insert_principal(conn, display_name="ident-pk-2")
             for p in (p1, p2):
                 await conn.execute(
-                    "INSERT INTO qiita.user (principal_idx, email)"
-                    " VALUES ($1, $2)",
+                    "INSERT INTO qiita.user (principal_idx, email) VALUES ($1, $2)",
                     p,
                     f"u{p}@example.com",
                 )
@@ -642,13 +641,15 @@ async def test_api_tokens_hash_unique(postgres_pool):
             await conn.execute(
                 "INSERT INTO qiita.api_tokens"
                 "  (principal_idx, token_hash, label) VALUES ($1, $2, 'a')",
-                p, h,
+                p,
+                h,
             )
             with pytest.raises(asyncpg.UniqueViolationError):
                 await conn.execute(
                     "INSERT INTO qiita.api_tokens"
                     "  (principal_idx, token_hash, label) VALUES ($1, $2, 'b')",
-                    p, h,
+                    p,
+                    h,
                 )
         finally:
             await tr.rollback()
@@ -709,13 +710,15 @@ async def test_retirement_does_not_touch_other_principals_tokens(postgres_pool):
             await conn.execute(
                 "INSERT INTO qiita.api_tokens"
                 "  (principal_idx, token_hash, label) VALUES ($1, $2, 'survivor')",
-                other, b"\x33" * 32,
+                other,
+                b"\x33" * 32,
             )
             await conn.execute(
                 "UPDATE qiita.principal SET"
                 "  retired = true, retired_at = now(), retired_by_idx = $2"
                 " WHERE idx = $1",
-                target, actor,
+                target,
+                actor,
             )
             other_revoked = await conn.fetchval(
                 "SELECT revoked_at FROM qiita.api_tokens WHERE principal_idx = $1",
@@ -733,22 +736,25 @@ async def test_retirement_preserves_already_revoked_at(postgres_pool):
         await tr.start()
         try:
             actor = await _insert_principal(conn, display_name="retire-preserve-actor")
-            target = await _insert_principal(conn, display_name="retire-preserve-target")
+            target = await _insert_principal(
+                conn, display_name="retire-preserve-target"
+            )
             await conn.execute(
                 "INSERT INTO qiita.api_tokens"
                 "  (principal_idx, token_hash, label, revoked_at)"
                 " VALUES ($1, $2, 'pre-revoked', '2020-01-01T00:00:00Z')",
-                target, b"\x44" * 32,
+                target,
+                b"\x44" * 32,
             )
             await conn.execute(
                 "UPDATE qiita.principal SET"
                 "  retired = true, retired_at = now(), retired_by_idx = $2"
                 " WHERE idx = $1",
-                target, actor,
+                target,
+                actor,
             )
             preserved = await conn.fetchval(
-                "SELECT revoked_at FROM qiita.api_tokens"
-                " WHERE principal_idx = $1",
+                "SELECT revoked_at FROM qiita.api_tokens WHERE principal_idx = $1",
                 target,
             )
             assert preserved.year == 2020

@@ -92,7 +92,9 @@ async def test_insert_with_explicit_principal_idx(postgres_pool):
                 "  (name, version, kind, created_by_idx)"
                 " VALUES ($1, $2, 'sequence_reference', $3)"
                 " RETURNING reference_idx, created_by_idx",
-                "h_c-explicit-creator", "1.0", pidx,
+                "h_c-explicit-creator",
+                "1.0",
+                pidx,
             )
             assert row["created_by_idx"] == pidx
         finally:
@@ -111,7 +113,9 @@ async def test_rejects_fk_to_nonexistent_principal(postgres_pool):
                     "INSERT INTO qiita.references"
                     "  (name, version, kind, created_by_idx)"
                     " VALUES ($1, $2, 'sequence_reference', $3)",
-                    "h_c-bad-fk", "1.0", 999_999_999,
+                    "h_c-bad-fk",
+                    "1.0",
+                    999_999_999,
                 )
         finally:
             await tr.rollback()
@@ -127,7 +131,8 @@ async def test_insert_without_created_by_idx_rejected(postgres_pool):
                 await conn.execute(
                     "INSERT INTO qiita.references (name, version, kind)"
                     " VALUES ($1, $2, 'sequence_reference')",
-                    "h_c-no-fk", "1.0",
+                    "h_c-no-fk",
+                    "1.0",
                 )
         finally:
             await tr.rollback()

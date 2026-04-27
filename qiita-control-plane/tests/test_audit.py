@@ -28,27 +28,21 @@ def test_record_event_rejects_qk_prefix_in_string_value():
     from qiita_control_plane.auth.audit import _check_for_leaks
 
     with pytest.raises(ValueError, match="qk_"):
-        _check_for_leaks(
-            {"reason": "revoking qk_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}
-        )
+        _check_for_leaks({"reason": "revoking qk_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"})
 
 
 def test_record_event_rejects_jwt_shape_in_string_value():
     from qiita_control_plane.auth.audit import _check_for_leaks
 
     with pytest.raises(ValueError, match="JWT"):
-        _check_for_leaks(
-            {"note": "received eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.signaturepart"}
-        )
+        _check_for_leaks({"note": "received eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.signaturepart"})
 
 
 def test_record_event_rejects_in_list_values():
     from qiita_control_plane.auth.audit import _check_for_leaks
 
     with pytest.raises(ValueError, match="qk_"):
-        _check_for_leaks(
-            {"items": ["safe", "qk_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"]}
-        )
+        _check_for_leaks({"items": ["safe", "qk_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"]})
 
 
 def test_record_event_accepts_benign_detail():

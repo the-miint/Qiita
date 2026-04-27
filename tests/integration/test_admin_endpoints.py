@@ -39,7 +39,12 @@ async def admin_client(postgres_pool, jwks_harness):
                     "ALTER TABLE qiita.auth_events DISABLE TRIGGER auth_events_no_delete"
                 )
                 try:
-                    for table in ("api_tokens", "user_identities", "user", "service_account"):
+                    for table in (
+                        "api_tokens",
+                        "user_identities",
+                        "user",
+                        "service_account",
+                    ):
                         await conn.execute(
                             f"DELETE FROM qiita.{table}"
                             " WHERE principal_idx = ANY($1::bigint[])",
@@ -62,17 +67,22 @@ async def admin_client(postgres_pool, jwks_harness):
 
 
 async def _seed_human(
-    postgres_pool, *, email: str, role: str = "user",
+    postgres_pool,
+    *,
+    email: str,
+    role: str = "user",
 ) -> int:
     pidx = await postgres_pool.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
         " VALUES ($1, $2, 1) RETURNING idx",
-        email, role,
+        email,
+        role,
     )
     await postgres_pool.execute(
         "INSERT INTO qiita.user (principal_idx, email, affiliation, address, phone)"
         " VALUES ($1, $2, 'X', 'Y', 'Z')",
-        pidx, email,
+        pidx,
+        email,
     )
     return pidx
 
@@ -82,7 +92,8 @@ async def _admin_token(postgres_pool, admin_client) -> str:
     from qiita_control_plane.auth.tokens import mint_api_token
 
     admin_idx = await _seed_human(
-        postgres_pool, email=f"admin-{id(admin_client)}@example.com",
+        postgres_pool,
+        email=f"admin-{id(admin_client)}@example.com",
         role="system_admin",
     )
     admin_client._created_principals.append(admin_idx)
@@ -124,7 +135,9 @@ async def test_post_service_accounts_admin_only(admin_client, postgres_pool):
     pidx = await _seed_human(postgres_pool, email="non-admin@example.com")
     _track(admin_client, pidx)
     plaintext, _ = await mint_api_token(
-        postgres_pool, principal_idx=pidx, label="non-admin",
+        postgres_pool,
+        principal_idx=pidx,
+        label="non-admin",
         scopes=["self:profile"],
     )
     resp = await admin_client.post(
@@ -135,9 +148,7 @@ async def test_post_service_accounts_admin_only(admin_client, postgres_pool):
     assert resp.status_code == 403
 
 
-async def test_post_service_accounts_returns_token_once(
-    admin_client, postgres_pool
-):
+async def test_post_service_accounts_returns_token_once(admin_client, postgres_pool):
     admin_token, _ = await _admin_token(postgres_pool, admin_client)
     resp = await admin_client.post(
         "/api/v1/admin/service-accounts",
@@ -180,9 +191,7 @@ async def test_post_service_accounts_rejects_scope_outside_service_ceiling(
     assert "admin:users" in resp.json()["rejected_scopes"]
 
 
-async def test_post_service_accounts_duplicate_name_409(
-    admin_client, postgres_pool
-):
+async def test_post_service_accounts_duplicate_name_409(admin_client, postgres_pool):
     admin_token, _ = await _admin_token(postgres_pool, admin_client)
     payload = {"name": "dup-svc", "scopes": ["features:mint"]}
     r1 = await admin_client.post(
@@ -211,7 +220,10 @@ async def test_patch_principal_disabled_admin_only(admin_client, postgres_pool):
     pidx = await _seed_human(postgres_pool, email="not-admin@example.com")
     _track(admin_client, pidx)
     plaintext, _ = await mint_api_token(
-        postgres_pool, principal_idx=pidx, label="x", scopes=["self:profile"],
+        postgres_pool,
+        principal_idx=pidx,
+        label="x",
+        scopes=["self:profile"],
     )
     target = await _seed_human(postgres_pool, email="target@example.com")
     _track(admin_client, target)
@@ -238,7 +250,8 @@ async def test_patch_principal_disabled_then_enabled_round_trip(
     assert r1.status_code == 204
     state = await postgres_pool.fetchrow(
         "SELECT disabled, disabled_at, disable_reason FROM qiita.principal"
-        " WHERE idx = $1", target,
+        " WHERE idx = $1",
+        target,
     )
     assert state["disabled"] is True
     assert state["disable_reason"] == "investigation"
@@ -251,16 +264,15 @@ async def test_patch_principal_disabled_then_enabled_round_trip(
     assert r2.status_code == 204
     state = await postgres_pool.fetchrow(
         "SELECT disabled, disabled_at, disable_reason FROM qiita.principal"
-        " WHERE idx = $1", target,
+        " WHERE idx = $1",
+        target,
     )
     assert state["disabled"] is False
     assert state["disabled_at"] is None
     assert state["disable_reason"] is None
 
 
-async def test_patch_principal_disabled_requires_reason(
-    admin_client, postgres_pool
-):
+async def test_patch_principal_disabled_requires_reason(admin_client, postgres_pool):
     admin_token, _ = await _admin_token(postgres_pool, admin_client)
     target = await _seed_human(postgres_pool, email="no-reason@example.com")
     _track(admin_client, target)
@@ -287,9 +299,7 @@ async def test_cannot_disable_system_principal(admin_client, postgres_pool):
 # ---------------------------------------------------------------------------
 
 
-async def test_patch_principal_retired_revokes_all_tokens(
-    admin_client, postgres_pool
-):
+async def test_patch_principal_retired_revokes_all_tokens(admin_client, postgres_pool):
     from qiita_control_plane.auth.tokens import mint_api_token
 
     admin_token, _ = await _admin_token(postgres_pool, admin_client)
@@ -297,8 +307,10 @@ async def test_patch_principal_retired_revokes_all_tokens(
     _track(admin_client, target)
     for i in range(2):
         await mint_api_token(
-            postgres_pool, principal_idx=target,
-            label=f"t{i}", scopes=["self:profile"],
+            postgres_pool,
+            principal_idx=target,
+            label=f"t{i}",
+            scopes=["self:profile"],
         )
     resp = await admin_client.patch(
         f"/api/v1/admin/principals/{target}/retired",
@@ -314,9 +326,7 @@ async def test_patch_principal_retired_revokes_all_tokens(
     assert n_active == 0
 
 
-async def test_patch_principal_retired_is_terminal(
-    admin_client, postgres_pool
-):
+async def test_patch_principal_retired_is_terminal(admin_client, postgres_pool):
     admin_token, _ = await _admin_token(postgres_pool, admin_client)
     target = await _seed_human(postgres_pool, email="term@example.com")
     _track(admin_client, target)
@@ -382,15 +392,16 @@ async def test_patch_principal_system_role_writes_audit_event(
     assert rows[-1]["actor_principal_idx"] == admin_idx
 
 
-async def test_patch_principal_system_role_admin_only(
-    admin_client, postgres_pool
-):
+async def test_patch_principal_system_role_admin_only(admin_client, postgres_pool):
     from qiita_control_plane.auth.tokens import mint_api_token
 
     pidx = await _seed_human(postgres_pool, email="not-admin-role@example.com")
     _track(admin_client, pidx)
     plaintext, _ = await mint_api_token(
-        postgres_pool, principal_idx=pidx, label="x", scopes=["self:profile"],
+        postgres_pool,
+        principal_idx=pidx,
+        label="x",
+        scopes=["self:profile"],
     )
     target = await _seed_human(postgres_pool, email="rt2@example.com")
     _track(admin_client, target)
@@ -413,7 +424,10 @@ async def test_get_audit_log_admin_only(admin_client, postgres_pool):
     pidx = await _seed_human(postgres_pool, email="audit-blocked@example.com")
     _track(admin_client, pidx)
     plaintext, _ = await mint_api_token(
-        postgres_pool, principal_idx=pidx, label="x", scopes=["self:profile"],
+        postgres_pool,
+        principal_idx=pidx,
+        label="x",
+        scopes=["self:profile"],
     )
     resp = await admin_client.get(
         "/api/v1/admin/audit",
@@ -460,7 +474,10 @@ async def test_revoke_all_tokens_admin_only(admin_client, postgres_pool):
     pidx = await _seed_human(postgres_pool, email="revoke-blocked@example.com")
     _track(admin_client, pidx)
     plaintext, _ = await mint_api_token(
-        postgres_pool, principal_idx=pidx, label="x", scopes=["self:profile"],
+        postgres_pool,
+        principal_idx=pidx,
+        label="x",
+        scopes=["self:profile"],
     )
     target = await _seed_human(postgres_pool, email="rt-target@example.com")
     _track(admin_client, target)
@@ -490,8 +507,11 @@ async def test_revoke_all_tokens_requires_admin_service_accounts_for_service_tar
         principal_idx=admin_idx,
         label="narrow",
         scopes=[
-            "self:profile", "self:tokens", "references:read",
-            "references:write", "admin:users",
+            "self:profile",
+            "self:tokens",
+            "references:read",
+            "references:write",
+            "admin:users",
             # admin:service_accounts intentionally absent
             "admin:audit_read",
         ],
@@ -535,14 +555,17 @@ async def test_revoke_all_tokens_requires_admin_users_for_user_target(
         principal_idx=admin_idx,
         label="svc-only",
         scopes=[
-            "self:profile", "self:tokens", "references:read",
+            "self:profile",
+            "self:tokens",
+            "references:read",
             # admin:users intentionally absent
             "admin:service_accounts",
         ],
     )
 
     user_target = await _seed_human(
-        postgres_pool, email="narrow-user-target@example.com",
+        postgres_pool,
+        email="narrow-user-target@example.com",
     )
     _track(admin_client, user_target)
 
@@ -600,7 +623,8 @@ async def test_revoke_all_tokens_revokes_all_active_and_skips_revoked(
         "SELECT detail FROM qiita.auth_events"
         " WHERE event_type = 'token_revoke' AND principal_idx = $1"
         "   AND actor_principal_idx = $2",
-        target, admin_idx,
+        target,
+        admin_idx,
     )
     revoked_in_audit = [_detail(r)["token_idx"] for r in rows]
     assert set(revoked_in_audit) == {t1, t2}

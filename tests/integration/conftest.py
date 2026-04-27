@@ -45,9 +45,12 @@ def _run_migrations(postgres_url: str) -> None:
     result = subprocess.run(
         [
             dbmate,
-            "--url", dbmate_url,
-            "--migrations-dir", MIGRATIONS_DIR,
-            "--migrations-table", "public.schema_migrations",
+            "--url",
+            dbmate_url,
+            "--migrations-dir",
+            MIGRATIONS_DIR,
+            "--migrations-table",
+            "public.schema_migrations",
             "--no-dump-schema",
             "up",
         ],
@@ -102,13 +105,9 @@ class JwksHarness:
         )
         self._kid = f"kid-{secrets.token_hex(4)}"
         self._jwks = self._build_jwks(self._private_key, self._kid)
-        self._server = http.server.HTTPServer(
-            ("127.0.0.1", 0), self._make_handler()
-        )
+        self._server = http.server.HTTPServer(("127.0.0.1", 0), self._make_handler())
         self.port = self._server.server_address[1]
-        self._thread = threading.Thread(
-            target=self._server.serve_forever, daemon=True
-        )
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
     @property
@@ -153,11 +152,7 @@ class JwksHarness:
         public_jwk = self._json.loads(
             self._RSAAlgorithm.to_jwk(private_key.public_key())
         )
-        return {
-            "keys": [
-                {**public_jwk, "kid": kid, "alg": "RS256", "use": "sig"}
-            ]
-        }
+        return {"keys": [{**public_jwk, "kid": kid, "alg": "RS256", "use": "sig"}]}
 
     def _make_handler(self):
         from http.server import BaseHTTPRequestHandler
@@ -223,7 +218,8 @@ async def human_admin_session(postgres_pool):
                     "INSERT INTO qiita.user"
                     "  (principal_idx, email, affiliation, address, phone)"
                     " VALUES ($1, $2, 'UCSD', '9500 Gilman', '555-0001')",
-                    idx, f"{display_name}@example.com",
+                    idx,
+                    f"{display_name}@example.com",
                 )
     # Make sure existing rows have a complete profile (idempotent).
     await postgres_pool.execute(
@@ -287,7 +283,8 @@ async def regular_user_session(postgres_pool):
                     "INSERT INTO qiita.user"
                     "  (principal_idx, email, affiliation, address, phone)"
                     " VALUES ($1, $2, 'UCSD', 'X', 'Y')",
-                    idx, f"{display_name}@example.com",
+                    idx,
+                    f"{display_name}@example.com",
                 )
     plaintext, _ = await mint_api_token(
         postgres_pool,
@@ -337,7 +334,8 @@ async def compute_worker_service_account(postgres_pool, tmp_path_factory):
                     "INSERT INTO qiita.service_account"
                     "  (principal_idx, name, description)"
                     " VALUES ($1, $2, 'orchestrator service-account fixture')",
-                    pidx, SVC_NAME,
+                    pidx,
+                    SVC_NAME,
                 )
     plaintext, _ = await mint_api_token(
         postgres_pool,

@@ -11,7 +11,6 @@ Exercises the full path:
 
 from __future__ import annotations
 
-from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -48,9 +47,7 @@ async def test_orchestrator_can_call_protected_endpoint_with_service_token(
     custom = AsyncClient(
         transport=transport,
         base_url="http://test",
-        headers={
-            "Authorization": f"Bearer {compute_worker_service_account['token']}"
-        },
+        headers={"Authorization": f"Bearer {compute_worker_service_account['token']}"},
     )
     async with ControlPlaneClient(
         "http://test",
@@ -91,9 +88,7 @@ def _set_min_env(monkeypatch):
     monkeypatch.setenv("CONTROL_PLANE_URL", "http://localhost:8080")
 
 
-def test_orchestrator_token_path_takes_precedence_over_env_var(
-    monkeypatch, tmp_path
-):
+def test_orchestrator_token_path_takes_precedence_over_env_var(monkeypatch, tmp_path):
     """File takes precedence: when both file and env var are set, the
     file is used."""
     from qiita_compute_orchestrator.config import Settings
@@ -126,9 +121,7 @@ def test_orchestrator_uses_env_var_when_file_missing_and_allow_token_env(
     assert settings.api_token == "qk_from_env"
 
 
-def test_orchestrator_refuses_env_var_unless_allow_token_env_set(
-    monkeypatch, tmp_path
-):
+def test_orchestrator_refuses_env_var_unless_allow_token_env_set(monkeypatch, tmp_path):
     """Without QIITA_ALLOW_TOKEN_ENV=true, the env-var path is ignored,
     and orchestrator boot fails with an actionable error."""
     from qiita_compute_orchestrator.config import Settings

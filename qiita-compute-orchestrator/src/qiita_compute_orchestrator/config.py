@@ -55,9 +55,7 @@ def _resolve_api_token() -> tuple[str | None, Path | None]:
     Raises RuntimeError with an actionable message if neither source yields
     a token. Returns (api_token, api_token_path) where exactly one is set.
     """
-    path_str = os.environ.get(
-        "CONTROL_PLANE_API_TOKEN_PATH", "/etc/qiita/orchestrator.token"
-    )
+    path_str = os.environ.get("CONTROL_PLANE_API_TOKEN_PATH", "/etc/qiita/orchestrator.token")
     path = Path(path_str)
     if path.is_file():
         return (None, path)

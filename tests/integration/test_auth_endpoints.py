@@ -10,7 +10,6 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
 
 
@@ -87,7 +86,12 @@ async def auth_client(postgres_pool, jwks_harness):
                     "ALTER TABLE qiita.auth_events DISABLE TRIGGER auth_events_no_delete"
                 )
                 try:
-                    for table in ("api_tokens", "user_identities", "user", "service_account"):
+                    for table in (
+                        "api_tokens",
+                        "user_identities",
+                        "user",
+                        "service_account",
+                    ):
                         await conn.execute(
                             f"DELETE FROM qiita.{table}"
                             " WHERE principal_idx = ANY($1::bigint[])",
@@ -122,25 +126,29 @@ async def _seed_user(
     pidx = await postgres_pool.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
         " VALUES ($1, $2, 1) RETURNING idx",
-        email, role,
+        email,
+        role,
     )
     if profile_complete:
         await postgres_pool.execute(
             "INSERT INTO qiita.user (principal_idx, email, affiliation, address, phone)"
             " VALUES ($1, $2, 'UCSD', '9500 Gilman', '555-0001')",
-            pidx, email,
+            pidx,
+            email,
         )
     else:
         await postgres_pool.execute(
-            "INSERT INTO qiita.user (principal_idx, email)"
-            " VALUES ($1, $2)",
-            pidx, email,
+            "INSERT INTO qiita.user (principal_idx, email) VALUES ($1, $2)",
+            pidx,
+            email,
         )
     if issuer and subject:
         await postgres_pool.execute(
             "INSERT INTO qiita.user_identities (principal_idx, issuer, subject)"
             " VALUES ($1, $2, $3)",
-            pidx, issuer, subject,
+            pidx,
+            issuer,
+            subject,
         )
     return pidx
 
@@ -177,9 +185,7 @@ async def test_auth_whoami_human_returns_profile_and_role_and_scopes(
     )
     _track(auth_client, pidx)
     token = jwks_harness.sign(
-        _claims(
-            jwks_harness, sub="whoami-human", email="whoami-human@example.com"
-        )
+        _claims(jwks_harness, sub="whoami-human", email="whoami-human@example.com")
     )
     resp = await auth_client.get(
         "/api/v1/auth/whoami",
@@ -195,9 +201,7 @@ async def test_auth_whoami_human_returns_profile_and_role_and_scopes(
     assert body["profile_complete"] is True
 
 
-async def test_auth_whoami_service_returns_service_summary(
-    auth_client, postgres_pool
-):
+async def test_auth_whoami_service_returns_service_summary(auth_client, postgres_pool):
     from qiita_control_plane.auth.tokens import mint_api_token
 
     pidx = await postgres_pool.fetchval(
@@ -233,9 +237,7 @@ async def test_auth_whoami_service_returns_service_summary(
 # ---------------------------------------------------------------------------
 
 
-async def test_post_pat_returns_token_once(
-    auth_client, postgres_pool, jwks_harness
-):
+async def test_post_pat_returns_token_once(auth_client, postgres_pool, jwks_harness):
     pidx = await _seed_user(
         postgres_pool,
         email="pat-once@example.com",
@@ -300,7 +302,9 @@ async def test_post_pat_rejects_jwt_with_stale_auth_time(
     stale = int(time.time()) - 600
     jwt = jwks_harness.sign(
         _claims(
-            jwks_harness, sub="pat-stale", email="pat-stale@example.com",
+            jwks_harness,
+            sub="pat-stale",
+            email="pat-stale@example.com",
             auth_time=stale,
         )
     )
@@ -370,7 +374,9 @@ async def test_post_pat_ttl_beyond_365_rejected(
     )
     _track(auth_client, pidx)
     jwt = jwks_harness.sign(
-        _claims(jwks_harness, sub="pat-ttl-too-long", email="pat-ttl-too-long@example.com")
+        _claims(
+            jwks_harness, sub="pat-ttl-too-long", email="pat-ttl-too-long@example.com"
+        )
     )
     resp = await auth_client.post(
         "/api/v1/auth/pat",
@@ -406,9 +412,7 @@ async def test_post_pat_incomplete_profile_rejects_with_422(
     assert set(body["missing_fields"]) == {"affiliation", "address", "phone"}
 
 
-async def test_post_pat_rejects_unknown_scope(
-    auth_client, postgres_pool, jwks_harness
-):
+async def test_post_pat_rejects_unknown_scope(auth_client, postgres_pool, jwks_harness):
     pidx = await _seed_user(
         postgres_pool,
         email="pat-unknown-scope@example.com",
@@ -417,7 +421,9 @@ async def test_post_pat_rejects_unknown_scope(
     )
     _track(auth_client, pidx)
     jwt = jwks_harness.sign(
-        _claims(jwks_harness, sub="pat-unknown-scope", email="pat-unknown-scope@example.com")
+        _claims(
+            jwks_harness, sub="pat-unknown-scope", email="pat-unknown-scope@example.com"
+        )
     )
     resp = await auth_client.post(
         "/api/v1/auth/pat",
@@ -444,7 +450,11 @@ async def test_post_pat_default_scopes_match_role_ceiling(
     )
     _track(auth_client, pidx)
     jwt = jwks_harness.sign(
-        _claims(jwks_harness, sub="pat-default-scopes", email="pat-default-scopes@example.com")
+        _claims(
+            jwks_harness,
+            sub="pat-default-scopes",
+            email="pat-default-scopes@example.com",
+        )
     )
     resp = await auth_client.post(
         "/api/v1/auth/pat",
@@ -453,7 +463,9 @@ async def test_post_pat_default_scopes_match_role_ceiling(
     )
     assert resp.status_code == 201
     assert set(resp.json()["scopes"]) == {
-        "self:profile", "self:tokens", "references:read",
+        "self:profile",
+        "self:tokens",
+        "references:read",
     }
 
 
@@ -486,9 +498,7 @@ async def test_post_pat_system_admin_role_ceiling_includes_lower_role_scopes(
     assert "admin:users" in body["scopes"]
 
 
-async def test_post_pat_rejects_upscoping(
-    auth_client, postgres_pool, jwks_harness
-):
+async def test_post_pat_rejects_upscoping(auth_client, postgres_pool, jwks_harness):
     pidx = await _seed_user(
         postgres_pool,
         email="pat-upscope@example.com",
@@ -540,9 +550,7 @@ async def test_post_pat_upscoping_error_does_not_leak_role_ceiling(
     assert set(body.keys()) == {"detail", "rejected_scopes"}
 
 
-async def test_post_pat_writes_audit_event(
-    auth_client, postgres_pool, jwks_harness
-):
+async def test_post_pat_writes_audit_event(auth_client, postgres_pool, jwks_harness):
     pidx = await _seed_user(
         postgres_pool,
         email="pat-audit@example.com",
@@ -620,20 +628,30 @@ async def test_get_own_tokens_cannot_see_others(
 
     # Two distinct users, each with their own token.
     pa = await _seed_user(
-        postgres_pool, email="own-a@example.com",
-        issuer=jwks_harness.issuer, subject="own-a",
+        postgres_pool,
+        email="own-a@example.com",
+        issuer=jwks_harness.issuer,
+        subject="own-a",
     )
     pb = await _seed_user(
-        postgres_pool, email="own-b@example.com",
-        issuer=jwks_harness.issuer, subject="own-b",
+        postgres_pool,
+        email="own-b@example.com",
+        issuer=jwks_harness.issuer,
+        subject="own-b",
     )
     _track(auth_client, pa)
     _track(auth_client, pb)
     pa_token, pa_idx = await mint_api_token(
-        postgres_pool, principal_idx=pa, label="A", scopes=["self:tokens"],
+        postgres_pool,
+        principal_idx=pa,
+        label="A",
+        scopes=["self:tokens"],
     )
     pb_token, pb_idx = await mint_api_token(
-        postgres_pool, principal_idx=pb, label="B", scopes=["self:tokens"],
+        postgres_pool,
+        principal_idx=pb,
+        label="B",
+        scopes=["self:tokens"],
     )
 
     resp = await auth_client.get(
@@ -657,12 +675,16 @@ async def test_list_tokens_403_without_self_tokens_scope(
     from qiita_control_plane.auth.tokens import mint_api_token
 
     pidx = await _seed_user(
-        postgres_pool, email="list-no-scope@example.com",
-        issuer=jwks_harness.issuer, subject="list-no-scope",
+        postgres_pool,
+        email="list-no-scope@example.com",
+        issuer=jwks_harness.issuer,
+        subject="list-no-scope",
     )
     _track(auth_client, pidx)
     plaintext, _ = await mint_api_token(
-        postgres_pool, principal_idx=pidx, label="no-tokens-scope",
+        postgres_pool,
+        principal_idx=pidx,
+        label="no-tokens-scope",
         scopes=["self:profile"],  # no self:tokens
     )
     resp = await auth_client.get(
@@ -683,16 +705,22 @@ async def test_delete_own_token_revokes_and_writes_audit_event(
     from qiita_control_plane.auth.tokens import mint_api_token
 
     pidx = await _seed_user(
-        postgres_pool, email="delete-own@example.com",
-        issuer=jwks_harness.issuer, subject="delete-own",
+        postgres_pool,
+        email="delete-own@example.com",
+        issuer=jwks_harness.issuer,
+        subject="delete-own",
     )
     _track(auth_client, pidx)
     auth_token, _ = await mint_api_token(
-        postgres_pool, principal_idx=pidx, label="auth-token",
+        postgres_pool,
+        principal_idx=pidx,
+        label="auth-token",
         scopes=["self:tokens"],
     )
     _, target_idx = await mint_api_token(
-        postgres_pool, principal_idx=pidx, label="will-revoke",
+        postgres_pool,
+        principal_idx=pidx,
+        label="will-revoke",
         scopes=[],
     )
 
@@ -726,21 +754,30 @@ async def test_delete_others_token_returns_404_not_403(
     from qiita_control_plane.auth.tokens import mint_api_token
 
     pa = await _seed_user(
-        postgres_pool, email="del-attacker@example.com",
-        issuer=jwks_harness.issuer, subject="del-attacker",
+        postgres_pool,
+        email="del-attacker@example.com",
+        issuer=jwks_harness.issuer,
+        subject="del-attacker",
     )
     pb = await _seed_user(
-        postgres_pool, email="del-victim@example.com",
-        issuer=jwks_harness.issuer, subject="del-victim",
+        postgres_pool,
+        email="del-victim@example.com",
+        issuer=jwks_harness.issuer,
+        subject="del-victim",
     )
     _track(auth_client, pa)
     _track(auth_client, pb)
     attacker_token, _ = await mint_api_token(
-        postgres_pool, principal_idx=pa, label="attacker",
+        postgres_pool,
+        principal_idx=pa,
+        label="attacker",
         scopes=["self:tokens"],
     )
     _, victim_token_idx = await mint_api_token(
-        postgres_pool, principal_idx=pb, label="victim", scopes=[],
+        postgres_pool,
+        principal_idx=pb,
+        label="victim",
+        scopes=[],
     )
 
     resp_other = await auth_client.delete(
@@ -782,7 +819,9 @@ async def test_post_pat_rejects_jwt_with_future_auth_time(
     future = int(time.time()) + 3600
     jwt = jwks_harness.sign(
         _claims(
-            jwks_harness, sub="pat-future", email="pat-future@example.com",
+            jwks_harness,
+            sub="pat-future",
+            email="pat-future@example.com",
             auth_time=future,
         )
     )

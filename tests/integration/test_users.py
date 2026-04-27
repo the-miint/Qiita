@@ -110,24 +110,16 @@ async def test_post_users_with_full_profile_marks_profile_complete(admin_app):
 
 
 async def test_post_users_duplicate_email_409(admin_app):
-    r1 = await _create_user(
-        admin_app, display_name="First", email="dup@example.com"
-    )
+    r1 = await _create_user(admin_app, display_name="First", email="dup@example.com")
     assert r1.status_code == 201
-    r2 = await _create_user(
-        admin_app, display_name="Second", email="dup@example.com"
-    )
+    r2 = await _create_user(admin_app, display_name="Second", email="dup@example.com")
     assert r2.status_code == 409
 
 
 async def test_post_users_duplicate_email_case_insensitive(admin_app):
-    r1 = await _create_user(
-        admin_app, display_name="One", email="Casey@Example.COM"
-    )
+    r1 = await _create_user(admin_app, display_name="One", email="Casey@Example.COM")
     assert r1.status_code == 201
-    r2 = await _create_user(
-        admin_app, display_name="Two", email="casey@example.com"
-    )
+    r2 = await _create_user(admin_app, display_name="Two", email="casey@example.com")
     assert r2.status_code == 409
 
 
@@ -220,9 +212,7 @@ async def test_get_me_service_account_403(
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://test",
-        headers={
-            "Authorization": f"Bearer {compute_worker_service_account['token']}"
-        },
+        headers={"Authorization": f"Bearer {compute_worker_service_account['token']}"},
     ) as ac:
         resp = await ac.get("/api/v1/users/me")
     assert resp.status_code == 403
@@ -264,9 +254,7 @@ async def test_patch_me_does_not_change_email(regular_user_app):
     assert resp.json()["affiliation"] == "X"
 
 
-async def test_patch_me_empty_body_is_no_op(
-    regular_user_app, regular_user_session
-):
+async def test_patch_me_empty_body_is_no_op(regular_user_app, regular_user_session):
     resp = await regular_user_app.patch("/api/v1/users/me", json={})
     assert resp.status_code == 200
     assert resp.json()["display_name"] == regular_user_session["display_name"]

@@ -203,7 +203,9 @@ async def test_mint_rejects_wrong_status(client, postgres_pool):
     )
     assert mint_resp.status_code == 409
 
-    await postgres_pool.execute("DELETE FROM qiita.references WHERE reference_idx = $1", idx)
+    await postgres_pool.execute(
+        "DELETE FROM qiita.references WHERE reference_idx = $1", idx
+    )
 
 
 async def test_mint_rejects_empty_batch(client, reference_idx):
@@ -229,7 +231,11 @@ async def test_mint_rejects_genome_source_without_id(client, reference_idx):
     """genome_source set without genome_source_id should return 422."""
     resp = await client.post(
         f"/api/v1/references/{reference_idx}/features/mint",
-        json={"entries": [{"sequence_hash": _md5_uuid("GS_NO_ID"), "genome_source": "genbank"}]},
+        json={
+            "entries": [
+                {"sequence_hash": _md5_uuid("GS_NO_ID"), "genome_source": "genbank"}
+            ]
+        },
     )
     assert resp.status_code == 422
 
@@ -240,7 +246,10 @@ async def test_mint_rejects_genome_id_without_source(client, reference_idx):
         f"/api/v1/references/{reference_idx}/features/mint",
         json={
             "entries": [
-                {"sequence_hash": _md5_uuid("GID_NO_SRC"), "genome_source_id": "GCF_123"}
+                {
+                    "sequence_hash": _md5_uuid("GID_NO_SRC"),
+                    "genome_source_id": "GCF_123",
+                }
             ]
         },
     )
@@ -262,7 +271,8 @@ async def test_cross_reference_deduplication(client, postgres_pool):
         )
         idx = resp.json()["reference_idx"]
         await postgres_pool.execute(
-            "UPDATE qiita.references SET status = 'hashing' WHERE reference_idx = $1", idx
+            "UPDATE qiita.references SET status = 'hashing' WHERE reference_idx = $1",
+            idx,
         )
         refs.append(idx)
 

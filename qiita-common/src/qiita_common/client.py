@@ -80,10 +80,7 @@ class ControlPlaneClient:
             self._owns_http = True
 
     def __repr__(self) -> str:
-        return (
-            f"ControlPlaneClient(base_url={self._http.base_url!r},"
-            " api_token=<redacted>)"
-        )
+        return f"ControlPlaneClient(base_url={self._http.base_url!r}, api_token=<redacted>)"
 
     async def __aenter__(self):
         return self

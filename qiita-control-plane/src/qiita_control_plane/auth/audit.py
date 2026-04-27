@@ -36,9 +36,7 @@ def _check_for_leaks(value: Any, path: str = "") -> None:
     if isinstance(value, dict):
         for k, v in value.items():
             if isinstance(k, str) and k.lower() in _FORBIDDEN_KEYS:
-                raise ValueError(
-                    f"audit detail contains forbidden key {k!r} at {path or '<root>'}"
-                )
+                raise ValueError(f"audit detail contains forbidden key {k!r} at {path or '<root>'}")
             _check_for_leaks(v, f"{path}.{k}" if path else k)
         return
     if isinstance(value, list | tuple):
@@ -51,9 +49,7 @@ def _check_for_leaks(value: Any, path: str = "") -> None:
                 f"audit detail value at {path or '<root>'} appears to contain a qk_ token"
             )
         if _JWT_SHAPE.search(value):
-            raise ValueError(
-                f"audit detail value at {path or '<root>'} appears to contain a JWT"
-            )
+            raise ValueError(f"audit detail value at {path or '<root>'} appears to contain a JWT")
     # Other scalar types (int, bool, None, float) are fine.
 
 

@@ -25,15 +25,14 @@ upsert refuses to construct a Principal for a (disabled OR retired) row.
 
 from __future__ import annotations
 
-import asyncpg
 from dataclasses import dataclass
 
+import asyncpg
 from fastapi import HTTPException, Request
 
 from .audit import record_event, sha256_hex
 from .oidc import InvalidJwt, JwtVerifier
 from .tokens import verify_api_token
-
 
 _ROLE_ORDER = {"user": 0, "wet_lab_admin": 1, "system_admin": 2}
 
@@ -89,6 +88,7 @@ class ServiceAccount(Principal):
 
     def has_scope(self, scope: str) -> bool:
         return scope in self.scopes
+
     # has_role / has_role_at_least always return False — services don't
     # use the system_role hierarchy. Their authz is scope-only.
 
@@ -127,7 +127,7 @@ async def get_current_principal(request: Request) -> Principal:
     auth = request.headers.get("Authorization", "")
     if not auth.startswith(_BEARER):
         return Anonymous()
-    bearer = auth[len(_BEARER):].strip()
+    bearer = auth[len(_BEARER) :].strip()
     if not bearer:
         return Anonymous()
 
@@ -207,9 +207,7 @@ async def _resolve_token(pool: asyncpg.Pool, plaintext: str) -> Principal:
     # Bare principal holding a token shouldn't happen (sentinel CHECK +
     # subtype creation is the only path that produces a token-bearing
     # principal in practice). Fail closed.
-    raise HTTPException(
-        status_code=401, detail="principal has no auth subtype (bare)"
-    )
+    raise HTTPException(status_code=401, detail="principal has no auth subtype (bare)")
 
 
 # ---------------------------------------------------------------------------
@@ -217,9 +215,7 @@ async def _resolve_token(pool: asyncpg.Pool, plaintext: str) -> Principal:
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_oidc(
-    pool: asyncpg.Pool, verifier: JwtVerifier, bearer: str
-) -> Principal:
+async def _resolve_oidc(pool: asyncpg.Pool, verifier: JwtVerifier, bearer: str) -> Principal:
     try:
         identity = verifier.verify(bearer)
     except InvalidJwt:
@@ -236,18 +232,14 @@ async def _resolve_oidc(
     )
     if existing is not None:
         if existing["disabled"] or existing["retired"]:
-            raise HTTPException(
-                status_code=401, detail="principal disabled or retired"
-            )
+            raise HTTPException(status_code=401, detail="principal disabled or retired")
         await _handle_email_drift(pool, existing["principal_idx"], identity.email)
         return await _build_human_user(pool, existing["principal_idx"], scopes=None)
 
     return await _create_human_from_oidc(pool, identity)
 
 
-async def _create_human_from_oidc(
-    pool: asyncpg.Pool, identity
-) -> Principal:
+async def _create_human_from_oidc(pool: asyncpg.Pool, identity) -> Principal:
     """First-login path: create principal + user + user_identities atomically.
 
     Two known race outcomes:
@@ -267,8 +259,7 @@ async def _create_human_from_oidc(
                     identity.email,
                 )
                 await conn.execute(
-                    "INSERT INTO qiita.user (principal_idx, email)"
-                    " VALUES ($1, $2)",
+                    "INSERT INTO qiita.user (principal_idx, email) VALUES ($1, $2)",
                     principal_idx,
                     identity.email,
                 )
@@ -306,9 +297,7 @@ async def _create_human_from_oidc(
                 identity.subject,
             )
             if row is not None:
-                return await _build_human_user(
-                    pool, row["principal_idx"], scopes=None
-                )
+                return await _build_human_user(pool, row["principal_idx"], scopes=None)
             await record_event(
                 pool,
                 event_type="oidc_create_principal_email_conflict",
@@ -325,9 +314,7 @@ async def _create_human_from_oidc(
     return await _build_human_user(pool, principal_idx, scopes=None)
 
 
-async def _handle_email_drift(
-    pool: asyncpg.Pool, principal_idx: int, jwt_email: str
-) -> None:
+async def _handle_email_drift(pool: asyncpg.Pool, principal_idx: int, jwt_email: str) -> None:
     """On repeat OIDC login, reconcile a possibly-changed email.
 
     On mismatch + no collision: UPDATE succeeds; emit email_drift audit
@@ -385,13 +372,9 @@ async def _build_human_user(
         principal_idx,
     )
     if row is None:
-        raise HTTPException(
-            status_code=401, detail="user record not found for principal"
-        )
+        raise HTTPException(status_code=401, detail="user record not found for principal")
     if row["disabled"] or row["retired"]:
-        raise HTTPException(
-            status_code=401, detail="principal disabled or retired"
-        )
+        raise HTTPException(status_code=401, detail="principal disabled or retired")
     # For OIDC-derived sessions we hand back the role's full ceiling. Phase F
     # narrows this when minting PATs; per-request bearers carry their own
     # scope set via the token path.

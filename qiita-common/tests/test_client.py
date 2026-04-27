@@ -1,7 +1,5 @@
 """Tests for ControlPlaneClient (Phase I auth params + Phase B method surface)."""
 
-from pathlib import Path
-
 import httpx
 import pytest
 
@@ -17,9 +15,7 @@ def test_client_has_required_methods():
     """ControlPlaneClient must expose the reference-management methods."""
     from qiita_common.client import ControlPlaneClient
 
-    client = ControlPlaneClient(
-        base_url="http://localhost:8080", api_token="qk_test"
-    )
+    client = ControlPlaneClient(base_url="http://localhost:8080", api_token="qk_test")
     assert callable(client.create_reference)
     assert callable(client.mint_features)
     assert callable(client.update_reference_status)
@@ -52,9 +48,7 @@ def test_client_reads_token_from_path(tmp_path):
 
     p = tmp_path / "tok"
     p.write_text("qk_from_file\n")  # trailing newline should be stripped
-    client = ControlPlaneClient(
-        "http://localhost:8080", api_token_path=p
-    )
+    client = ControlPlaneClient("http://localhost:8080", api_token_path=p)
     # Internal access for testing the loaded value.
     assert client._token == "qk_from_file"
 

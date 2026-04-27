@@ -20,7 +20,6 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from jwt.algorithms import RSAAlgorithm
 
-
 # ---------------------------------------------------------------------------
 # JWKS harness
 # ---------------------------------------------------------------------------
@@ -41,9 +40,7 @@ class JwksHarness:
         self._jwks = self._build_jwks(self._private_key, self._kid)
         self._server = HTTPServer(("127.0.0.1", 0), self._make_handler())
         self.port = self._server.server_address[1]
-        self._thread = threading.Thread(
-            target=self._server.serve_forever, daemon=True
-        )
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
     @property
@@ -93,11 +90,7 @@ class JwksHarness:
     @staticmethod
     def _build_jwks(private_key, kid: str) -> dict:
         public_jwk = json.loads(RSAAlgorithm.to_jwk(private_key.public_key()))
-        return {
-            "keys": [
-                {**public_jwk, "kid": kid, "alg": "RS256", "use": "sig"}
-            ]
-        }
+        return {"keys": [{**public_jwk, "kid": kid, "alg": "RS256", "use": "sig"}]}
 
     def _make_handler(self):
         harness = self
@@ -329,9 +322,7 @@ def test_verify_accepts_audience_as_string_matching_configured_aud(jwks_harness)
 
 
 def test_verify_accepts_audience_as_list_containing_configured_aud(jwks_harness):
-    token = jwks_harness.sign(
-        _claims(jwks_harness, aud=["other-aud", "test-audience", "third"])
-    )
+    token = jwks_harness.sign(_claims(jwks_harness, aud=["other-aud", "test-audience", "third"]))
     _verifier(jwks_harness).verify(token)
 
 

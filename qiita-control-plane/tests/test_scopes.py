@@ -57,8 +57,13 @@ def test_service_account_ceiling_does_not_include_admin_or_self_scopes():
     """Workers don't get admin or self-service scopes."""
     from qiita_control_plane.auth.scopes import SERVICE_ACCOUNT_SCOPE_CEILING
 
-    forbidden = {"admin:users", "admin:service_accounts", "admin:audit_read",
-                 "self:profile", "self:tokens"}
+    forbidden = {
+        "admin:users",
+        "admin:service_accounts",
+        "admin:audit_read",
+        "self:profile",
+        "self:tokens",
+    }
     assert SERVICE_ACCOUNT_SCOPE_CEILING.isdisjoint(forbidden)
 
 

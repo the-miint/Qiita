@@ -81,9 +81,7 @@ async def mint_api_token(
     return plaintext, token_idx
 
 
-async def verify_api_token(
-    pool: asyncpg.Pool, plaintext: str
-) -> VerifiedToken | None:
+async def verify_api_token(pool: asyncpg.Pool, plaintext: str) -> VerifiedToken | None:
     """Verify a presented opaque token. Returns None on any rejection.
 
     Rejection conditions (all return None):
@@ -142,6 +140,4 @@ async def record_token_use(pool: asyncpg.Pool, token_idx: int) -> None:
             token_idx,
         )
     except asyncpg.PostgresError:
-        log.warning(
-            "last_used_at update failed token_idx=%s", token_idx, exc_info=True
-        )
+        log.warning("last_used_at update failed token_idx=%s", token_idx, exc_info=True)

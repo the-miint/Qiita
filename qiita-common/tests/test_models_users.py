@@ -58,9 +58,7 @@ def test_user_create_rejects_invalid_orcid(orcid):
         UserCreate(display_name="Alice", email="a@b.com", orcid=orcid)
 
 
-@pytest.mark.parametrize(
-    "orcid", ["0000-0002-1825-0097", "0000-0002-1694-233X"]
-)
+@pytest.mark.parametrize("orcid", ["0000-0002-1825-0097", "0000-0002-1694-233X"])
 def test_user_create_accepts_valid_orcid(orcid):
     from qiita_common.models import UserCreate
 
@@ -157,14 +155,18 @@ def test_user_response_profile_complete_reflects_input():
     )
     r1 = UserResponse(
         **args,
-        affiliation="A", address="B", phone="C",
+        affiliation="A",
+        address="B",
+        phone="C",
         profile_complete=True,
     )
     assert r1.profile_complete is True
 
     r2 = UserResponse(
         **args,
-        affiliation="", address="", phone="",
+        affiliation="",
+        address="",
+        phone="",
         profile_complete=False,
     )
     assert r2.profile_complete is False

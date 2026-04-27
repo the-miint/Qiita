@@ -9,7 +9,6 @@ non-inherited ceiling because workers don't fit the human hierarchy.
 
 from collections.abc import Mapping
 
-
 VALID_SCOPES: frozenset[str] = frozenset(
     {
         # Reference data
@@ -85,9 +84,7 @@ def role_ceiling(system_role: str) -> frozenset[str]:
     return ROLE_IMPLIED_SCOPES[system_role]
 
 
-def reject_scopes_outside_ceiling(
-    requested: list[str], ceiling: frozenset[str]
-) -> list[str]:
+def reject_scopes_outside_ceiling(requested: list[str], ceiling: frozenset[str]) -> list[str]:
     """Return the subset of requested scopes that fall outside the ceiling.
     Empty list means the request is fully within the ceiling."""
     return sorted(set(requested) - ceiling)

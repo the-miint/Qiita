@@ -14,7 +14,7 @@ underlying resolution per-request even when many guards compose.
 
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 from fastapi import Depends, HTTPException
 
@@ -25,7 +25,6 @@ from .principal import (
     ServiceAccount,
     get_current_principal,
 )
-
 
 # ---------------------------------------------------------------------------
 # Kind guards
@@ -74,9 +73,7 @@ def require_role_at_least(role: str) -> Callable[..., Principal]:
 
     def _dep(p: Principal = Depends(get_current_principal)) -> Principal:
         if isinstance(p, Anonymous):
-            raise HTTPException(
-                status_code=401, detail="authentication required"
-            )
+            raise HTTPException(status_code=401, detail="authentication required")
         if not p.has_role_at_least(role):
             raise HTTPException(
                 status_code=403,
@@ -115,9 +112,7 @@ def require_scope(scope: str) -> Callable[..., Principal]:
 
     def _dep(p: Principal = Depends(get_current_principal)) -> Principal:
         if isinstance(p, Anonymous):
-            raise HTTPException(
-                status_code=401, detail="authentication required"
-            )
+            raise HTTPException(status_code=401, detail="authentication required")
         if not p.has_scope(scope):
             raise HTTPException(
                 status_code=403,

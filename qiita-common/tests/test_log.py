@@ -47,9 +47,7 @@ def test_filter_scrubs_record_args_tuple(caplog):
     logger = logging.getLogger("test-scrub-args")
     logger.addFilter(AuthorizationScrubFilter())
     with caplog.at_level(logging.INFO, logger="test-scrub-args"):
-        logger.info(
-            "header: %s", "Authorization: Bearer qk_LEAKED" + "A" * 40
-        )
+        logger.info("header: %s", "Authorization: Bearer qk_LEAKED" + "A" * 40)
     rec = caplog.records[0]
     assert "qk_LEAKED" not in rec.getMessage()
 
@@ -60,7 +58,12 @@ def test_filter_passes_records_through():
 
     f = AuthorizationScrubFilter()
     record = logging.LogRecord(
-        name="x", level=logging.INFO, pathname="", lineno=0,
-        msg="benign message", args=None, exc_info=None,
+        name="x",
+        level=logging.INFO,
+        pathname="",
+        lineno=0,
+        msg="benign message",
+        args=None,
+        exc_info=None,
     )
     assert f.filter(record) is True

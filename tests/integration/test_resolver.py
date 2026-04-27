@@ -32,7 +32,6 @@ def _make_resolver_app(postgres_pool, oidc_verifier=None):
     """Build a tiny FastAPI app whose /resolve endpoint returns the resolved
     principal as a JSON shape useful for assertions."""
     from qiita_control_plane.auth.principal import (
-        Anonymous,
         HumanUser,
         Principal,
         ServiceAccount,
@@ -154,8 +153,7 @@ async def resolver_client(postgres_pool, jwks_harness):
                         created,
                     )
                     await conn.execute(
-                        "DELETE FROM qiita.principal"
-                        " WHERE idx = ANY($1::bigint[])",
+                        "DELETE FROM qiita.principal WHERE idx = ANY($1::bigint[])",
                         created,
                     )
                 finally:
@@ -187,9 +185,7 @@ async def test_resolver_returns_anonymous_when_non_bearer(resolver_client):
 
 
 async def test_resolver_returns_anonymous_when_empty_bearer(resolver_client):
-    resp = await resolver_client.get(
-        "/resolve", headers={"Authorization": "Bearer "}
-    )
+    resp = await resolver_client.get("/resolve", headers={"Authorization": "Bearer "})
     assert resp.status_code == 200
     assert resp.json() == {"kind": "anonymous"}
 
@@ -220,9 +216,9 @@ async def test_resolver_dispatches_qk_prefix_to_token_path(
     )
     _track(resolver_client, pidx)
     await postgres_pool.execute(
-        "INSERT INTO qiita.user (principal_idx, email)"
-        " VALUES ($1, $2)",
-        pidx, f"u{pidx}@example.com",
+        "INSERT INTO qiita.user (principal_idx, email) VALUES ($1, $2)",
+        pidx,
+        f"u{pidx}@example.com",
     )
 
     plaintext, _ = await mint_api_token(
@@ -241,9 +237,7 @@ async def test_resolver_dispatches_qk_prefix_to_token_path(
     assert sorted(body["scopes"]) == ["references:read", "self:profile"]
 
 
-async def test_resolver_token_path_for_service_account(
-    resolver_client, postgres_pool
-):
+async def test_resolver_token_path_for_service_account(resolver_client, postgres_pool):
     from qiita_control_plane.auth.tokens import mint_api_token
 
     pidx = await postgres_pool.fetchval(
@@ -252,9 +246,9 @@ async def test_resolver_token_path_for_service_account(
     )
     _track(resolver_client, pidx)
     await postgres_pool.execute(
-        "INSERT INTO qiita.service_account (principal_idx, name)"
-        " VALUES ($1, $2)",
-        pidx, f"svc-{pidx}",
+        "INSERT INTO qiita.service_account (principal_idx, name) VALUES ($1, $2)",
+        pidx,
+        f"svc-{pidx}",
     )
     plaintext, _ = await mint_api_token(
         postgres_pool,
@@ -281,9 +275,9 @@ async def test_resolver_rejects_revoked_token(resolver_client, postgres_pool):
     )
     _track(resolver_client, pidx)
     await postgres_pool.execute(
-        "INSERT INTO qiita.user (principal_idx, email)"
-        " VALUES ($1, $2)",
-        pidx, f"u{pidx}@example.com",
+        "INSERT INTO qiita.user (principal_idx, email) VALUES ($1, $2)",
+        pidx,
+        f"u{pidx}@example.com",
     )
     plaintext, token_idx = await mint_api_token(
         postgres_pool,
@@ -341,9 +335,7 @@ async def test_resolver_dispatches_jwt_header_shape_to_oidc_path(
 async def test_resolver_creates_audit_event_on_first_login(
     resolver_client, postgres_pool, jwks_harness
 ):
-    claims = _claims(
-        jwks_harness, sub="first-login-audit", email="audit@example.com"
-    )
+    claims = _claims(jwks_harness, sub="first-login-audit", email="audit@example.com")
     token = jwks_harness.sign(claims)
     resp = await resolver_client.get(
         "/resolve", headers={"Authorization": f"Bearer {token}"}
@@ -397,9 +389,7 @@ async def test_resolver_409s_on_email_collision_with_different_iss_sub(
 async def test_resolver_rejects_jwt_with_email_verified_false(
     resolver_client, jwks_harness
 ):
-    claims = _claims(
-        jwks_harness, email_verified=False, sub="ev-false"
-    )
+    claims = _claims(jwks_harness, email_verified=False, sub="ev-false")
     token = jwks_harness.sign(claims)
     resp = await resolver_client.get(
         "/resolve", headers={"Authorization": f"Bearer {token}"}
@@ -610,16 +600,14 @@ async def test_resolver_handles_concurrent_same_iss_sub_race(
 
     # Exactly one user_identities row for this (iss, sub).
     n = await postgres_pool.fetchval(
-        "SELECT count(*) FROM qiita.user_identities"
-        " WHERE issuer = $1 AND subject = $2",
-        jwks_harness.issuer, sub,
+        "SELECT count(*) FROM qiita.user_identities WHERE issuer = $1 AND subject = $2",
+        jwks_harness.issuer,
+        sub,
     )
     assert n == 1
 
 
-async def test_resolver_oidc_with_no_verifier_returns_503(
-    postgres_pool, jwks_harness
-):
+async def test_resolver_oidc_with_no_verifier_returns_503(postgres_pool, jwks_harness):
     """If the app starts without an OIDC verifier configured, JWT-shaped
     bearers get a clear 503 (not a 500 or silent ignore)."""
     app = _make_resolver_app(postgres_pool, oidc_verifier=None)
@@ -628,7 +616,5 @@ async def test_resolver_oidc_with_no_verifier_returns_503(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as ac:
         token = jwks_harness.sign(_claims(jwks_harness, sub="no-verifier"))
-        resp = await ac.get(
-            "/resolve", headers={"Authorization": f"Bearer {token}"}
-        )
+        resp = await ac.get("/resolve", headers={"Authorization": f"Bearer {token}"})
         assert resp.status_code == 503

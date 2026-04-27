@@ -52,7 +52,5 @@ class Settings:
             authrocket_pat_max_auth_age_seconds=int(
                 os.environ.get("AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS", "300")
             ),
-            token_default_ttl_days=int(
-                os.environ.get("QIITA_TOKEN_DEFAULT_TTL_DAYS", "90")
-            ),
+            token_default_ttl_days=int(os.environ.get("QIITA_TOKEN_DEFAULT_TTL_DAYS", "90")),
         )

@@ -127,7 +127,7 @@ class AuthRocketVerifier(JwtVerifier):
     """JwtVerifier bound to a Settings instance. Constructed at lifespan."""
 
     @classmethod
-    def from_settings(cls, settings: "Settings") -> AuthRocketVerifier:  # noqa: F821
+    def from_settings(cls, settings: Settings) -> AuthRocketVerifier:  # noqa: F821
         """Build from Settings, raising if any AUTHROCKET_* env is missing.
 
         This is the fail-fast point: lifespan calls from_settings, and a
@@ -142,9 +142,7 @@ class AuthRocketVerifier(JwtVerifier):
         if not settings.authrocket_jwks_url:
             missing.append("AUTHROCKET_JWKS_URL")
         if missing:
-            raise RuntimeError(
-                f"AuthRocketVerifier cannot be constructed: missing env: {missing}"
-            )
+            raise RuntimeError(f"AuthRocketVerifier cannot be constructed: missing env: {missing}")
         return cls(
             jwks_url=settings.authrocket_jwks_url,
             issuer=settings.authrocket_issuer,

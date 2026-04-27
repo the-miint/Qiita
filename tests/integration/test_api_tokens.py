@@ -29,9 +29,7 @@ async def principal_idx(postgres_pool):
     await postgres_pool.execute(
         "DELETE FROM qiita.api_tokens WHERE principal_idx = $1", idx
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.principal WHERE idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", idx)
 
 
 # ---------------------------------------------------------------------------
@@ -53,9 +51,7 @@ async def test_mint_returns_plaintext_and_token_idx(postgres_pool, principal_idx
     assert token_idx > 0
 
 
-async def test_mint_validates_scopes_against_valid_set(
-    postgres_pool, principal_idx
-):
+async def test_mint_validates_scopes_against_valid_set(postgres_pool, principal_idx):
     from qiita_control_plane.auth.tokens import mint_api_token
 
     with pytest.raises(ValueError, match="Unknown scopes"):
@@ -107,17 +103,13 @@ async def test_mint_persists_expires_at(postgres_pool, principal_idx):
     assert abs((stored - expires).total_seconds()) < 1
 
 
-async def test_mint_raises_on_hash_collision(
-    postgres_pool, principal_idx, monkeypatch
-):
+async def test_mint_raises_on_hash_collision(postgres_pool, principal_idx, monkeypatch):
     """If the random body collides with an existing token_hash, mint raises."""
     from qiita_control_plane.auth import tokens
 
     # Fixed hash so we can pre-insert a matching row.
     fixed_plaintext = "qk_" + "A" * 43
-    fixed_hash = __import__("hashlib").sha256(
-        fixed_plaintext.encode("ascii")
-    ).digest()
+    fixed_hash = __import__("hashlib").sha256(fixed_plaintext.encode("ascii")).digest()
 
     # Pre-insert a row with this hash.
     await postgres_pool.execute(
@@ -145,9 +137,7 @@ async def test_mint_raises_on_hash_collision(
 # ---------------------------------------------------------------------------
 
 
-async def test_verify_valid_token_returns_principal_idx(
-    postgres_pool, principal_idx
-):
+async def test_verify_valid_token_returns_principal_idx(postgres_pool, principal_idx):
     from qiita_control_plane.auth.tokens import mint_api_token, verify_api_token
 
     plaintext, token_idx = await mint_api_token(
@@ -219,9 +209,7 @@ async def test_verify_rejects_token_for_disabled_principal(
     assert await verify_api_token(postgres_pool, plaintext) is None
 
 
-async def test_verify_rejects_token_for_retired_principal(
-    postgres_pool, principal_idx
-):
+async def test_verify_rejects_token_for_retired_principal(postgres_pool, principal_idx):
     from qiita_control_plane.auth.tokens import mint_api_token, verify_api_token
 
     plaintext, _ = await mint_api_token(
@@ -265,9 +253,7 @@ async def test_verify_rejects_malformed(postgres_pool, malformed):
 # ---------------------------------------------------------------------------
 
 
-async def test_record_token_use_advances_last_used_at(
-    postgres_pool, principal_idx
-):
+async def test_record_token_use_advances_last_used_at(postgres_pool, principal_idx):
     from qiita_control_plane.auth.tokens import mint_api_token, record_token_use
 
     _, token_idx = await mint_api_token(

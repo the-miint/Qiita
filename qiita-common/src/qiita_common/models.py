@@ -6,7 +6,6 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, EmailStr, Field, model_validator
 
-
 # ORCID iD format: four groups of four digits separated by hyphens, with the
 # final character optionally being 'X' (the ISO 7064 mod-11-2 checksum).
 # See https://orcid.org/.

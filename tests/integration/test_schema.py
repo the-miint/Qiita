@@ -145,7 +145,8 @@ async def test_features_rejects_duplicate_hash(postgres_pool):
         )
         with pytest.raises(asyncpg.UniqueViolationError):
             await conn.execute(
-                "INSERT INTO qiita.features (sequence_hash) VALUES ($1::uuid)", test_hash
+                "INSERT INTO qiita.features (sequence_hash) VALUES ($1::uuid)",
+                test_hash,
             )
         await tr.rollback()
     finally:

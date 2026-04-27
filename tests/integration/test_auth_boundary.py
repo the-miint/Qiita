@@ -57,8 +57,12 @@ async def boundary_client(postgres_pool):
 
 
 async def _seed_human_with_token(
-    postgres_pool, *, system_role: str, scopes: list[str],
-    profile_complete: bool = True, suffix: str | None = None,
+    postgres_pool,
+    *,
+    system_role: str,
+    scopes: list[str],
+    profile_complete: bool = True,
+    suffix: str | None = None,
     expires_at: datetime | None = None,
     disabled: bool = False,
     revoked: bool = False,
@@ -82,20 +86,22 @@ async def _seed_human_with_token(
                 "INSERT INTO qiita.principal"
                 "  (display_name, system_role, created_by_idx)"
                 " VALUES ($1, $2, 1) RETURNING idx",
-                display_name, system_role,
+                display_name,
+                system_role,
             )
             if profile_complete:
                 await conn.execute(
                     "INSERT INTO qiita.user"
                     "  (principal_idx, email, affiliation, address, phone)"
                     " VALUES ($1, $2, 'X', 'Y', 'Z')",
-                    pidx, email,
+                    pidx,
+                    email,
                 )
             else:
                 await conn.execute(
-                    "INSERT INTO qiita.user (principal_idx, email)"
-                    " VALUES ($1, $2)",
-                    pidx, email,
+                    "INSERT INTO qiita.user (principal_idx, email) VALUES ($1, $2)",
+                    pidx,
+                    email,
                 )
     plaintext, token_idx = await mint_api_token(
         postgres_pool,
@@ -120,7 +126,10 @@ async def _seed_human_with_token(
 
 
 async def _seed_service_with_token(
-    postgres_pool, *, scopes: list[str], suffix: str | None = None,
+    postgres_pool,
+    *,
+    scopes: list[str],
+    suffix: str | None = None,
 ):
     from qiita_control_plane.auth.tokens import mint_api_token
 
@@ -138,10 +147,13 @@ async def _seed_service_with_token(
             await conn.execute(
                 "INSERT INTO qiita.service_account (principal_idx, name)"
                 " VALUES ($1, $2)",
-                pidx, name,
+                pidx,
+                name,
             )
     plaintext, _ = await mint_api_token(
-        postgres_pool, principal_idx=pidx, label="boundary-svc",
+        postgres_pool,
+        principal_idx=pidx,
+        label="boundary-svc",
         scopes=scopes,
     )
     return plaintext, pidx
@@ -164,96 +176,103 @@ async def test_post_references_no_auth_401(boundary_client):
     assert resp.status_code == 401
 
 
-async def test_post_references_service_account_403(
-    boundary_client, postgres_pool
-):
+async def test_post_references_service_account_403(boundary_client, postgres_pool):
     """Service kind cannot create references — require_human rejects."""
     token, _ = await _seed_service_with_token(
         postgres_pool,
-        scopes=["features:mint", "references:read", "references:register_files",
-                "tickets:doget"],
+        scopes=[
+            "features:mint",
+            "references:read",
+            "references:register_files",
+            "tickets:doget",
+        ],
         suffix="ref-svc",
     )
     resp = await boundary_client.post(
-        "/api/v1/references", json=_BODY_REF, headers=_h(token),
+        "/api/v1/references",
+        json=_BODY_REF,
+        headers=_h(token),
     )
     assert resp.status_code == 403
 
 
-async def test_post_references_missing_scope_403(
-    boundary_client, postgres_pool
-):
+async def test_post_references_missing_scope_403(boundary_client, postgres_pool):
     """Human + complete profile but no references:write scope."""
     token, _ = await _seed_human_with_token(
-        postgres_pool, system_role="user",
+        postgres_pool,
+        system_role="user",
         scopes=["self:profile", "references:read"],
         suffix="ref-no-scope",
     )
     resp = await boundary_client.post(
-        "/api/v1/references", json=_BODY_REF, headers=_h(token),
+        "/api/v1/references",
+        json=_BODY_REF,
+        headers=_h(token),
     )
     assert resp.status_code == 403
 
 
-async def test_post_references_incomplete_profile_422(
-    boundary_client, postgres_pool
-):
+async def test_post_references_incomplete_profile_422(boundary_client, postgres_pool):
     """require_complete_profile gives 422 when profile is incomplete."""
     token, _ = await _seed_human_with_token(
-        postgres_pool, system_role="wet_lab_admin",
-        scopes=["self:profile", "self:tokens", "references:read",
-                "references:write"],
+        postgres_pool,
+        system_role="wet_lab_admin",
+        scopes=["self:profile", "self:tokens", "references:read", "references:write"],
         profile_complete=False,
         suffix="ref-incomplete",
     )
     resp = await boundary_client.post(
-        "/api/v1/references", json=_BODY_REF, headers=_h(token),
+        "/api/v1/references",
+        json=_BODY_REF,
+        headers=_h(token),
     )
     assert resp.status_code == 422
 
 
-async def test_post_references_disabled_principal_401(
-    boundary_client, postgres_pool
-):
+async def test_post_references_disabled_principal_401(boundary_client, postgres_pool):
     token, _ = await _seed_human_with_token(
-        postgres_pool, system_role="wet_lab_admin",
-        scopes=["self:profile", "self:tokens", "references:read",
-                "references:write"],
-        disabled=True, suffix="ref-disabled",
+        postgres_pool,
+        system_role="wet_lab_admin",
+        scopes=["self:profile", "self:tokens", "references:read", "references:write"],
+        disabled=True,
+        suffix="ref-disabled",
     )
     resp = await boundary_client.post(
-        "/api/v1/references", json=_BODY_REF, headers=_h(token),
+        "/api/v1/references",
+        json=_BODY_REF,
+        headers=_h(token),
     )
     assert resp.status_code == 401
 
 
-async def test_post_references_revoked_token_401(
-    boundary_client, postgres_pool
-):
+async def test_post_references_revoked_token_401(boundary_client, postgres_pool):
     token, _ = await _seed_human_with_token(
-        postgres_pool, system_role="wet_lab_admin",
-        scopes=["self:profile", "self:tokens", "references:read",
-                "references:write"],
-        revoked=True, suffix="ref-revoked",
+        postgres_pool,
+        system_role="wet_lab_admin",
+        scopes=["self:profile", "self:tokens", "references:read", "references:write"],
+        revoked=True,
+        suffix="ref-revoked",
     )
     resp = await boundary_client.post(
-        "/api/v1/references", json=_BODY_REF, headers=_h(token),
+        "/api/v1/references",
+        json=_BODY_REF,
+        headers=_h(token),
     )
     assert resp.status_code == 401
 
 
-async def test_post_references_expired_token_401(
-    boundary_client, postgres_pool
-):
+async def test_post_references_expired_token_401(boundary_client, postgres_pool):
     token, _ = await _seed_human_with_token(
-        postgres_pool, system_role="wet_lab_admin",
-        scopes=["self:profile", "self:tokens", "references:read",
-                "references:write"],
+        postgres_pool,
+        system_role="wet_lab_admin",
+        scopes=["self:profile", "self:tokens", "references:read", "references:write"],
         expires_at=datetime.now(UTC) - timedelta(seconds=1),
         suffix="ref-expired",
     )
     resp = await boundary_client.post(
-        "/api/v1/references", json=_BODY_REF, headers=_h(token),
+        "/api/v1/references",
+        json=_BODY_REF,
+        headers=_h(token),
     )
     assert resp.status_code == 401
 
@@ -287,10 +306,17 @@ async def test_mint_features_human_403(boundary_client, postgres_pool):
     """Human cannot mint — workers only."""
     ref_idx = await _seed_active_reference(postgres_pool, "human-blocked")
     token, _ = await _seed_human_with_token(
-        postgres_pool, system_role="system_admin",
-        scopes=["self:profile", "self:tokens", "references:read",
-                "references:write", "admin:users", "admin:service_accounts",
-                "admin:audit_read"],
+        postgres_pool,
+        system_role="system_admin",
+        scopes=[
+            "self:profile",
+            "self:tokens",
+            "references:read",
+            "references:write",
+            "admin:users",
+            "admin:service_accounts",
+            "admin:audit_read",
+        ],
         suffix="mint-human",
     )
     resp = await boundary_client.post(
@@ -301,13 +327,12 @@ async def test_mint_features_human_403(boundary_client, postgres_pool):
     assert resp.status_code == 403
 
 
-async def test_mint_features_service_missing_scope_403(
-    boundary_client, postgres_pool
-):
+async def test_mint_features_service_missing_scope_403(boundary_client, postgres_pool):
     """Service token without features:mint."""
     ref_idx = await _seed_active_reference(postgres_pool, "svc-no-scope")
     token, _ = await _seed_service_with_token(
-        postgres_pool, scopes=["references:read"],
+        postgres_pool,
+        scopes=["references:read"],
         suffix="mint-svc-no-scope",
     )
     resp = await boundary_client.post(
@@ -326,10 +351,17 @@ async def test_mint_features_service_missing_scope_403(
 async def test_register_files_human_403(boundary_client, postgres_pool):
     ref_idx = await _seed_active_reference(postgres_pool, "register-human")
     token, _ = await _seed_human_with_token(
-        postgres_pool, system_role="system_admin",
-        scopes=["self:profile", "self:tokens", "references:read",
-                "references:write", "admin:users", "admin:service_accounts",
-                "admin:audit_read"],
+        postgres_pool,
+        system_role="system_admin",
+        scopes=[
+            "self:profile",
+            "self:tokens",
+            "references:read",
+            "references:write",
+            "admin:users",
+            "admin:service_accounts",
+            "admin:audit_read",
+        ],
         suffix="reg-human",
     )
     resp = await boundary_client.post(
@@ -340,12 +372,11 @@ async def test_register_files_human_403(boundary_client, postgres_pool):
     assert resp.status_code == 403
 
 
-async def test_register_files_service_missing_scope_403(
-    boundary_client, postgres_pool
-):
+async def test_register_files_service_missing_scope_403(boundary_client, postgres_pool):
     ref_idx = await _seed_active_reference(postgres_pool, "register-no-scope")
     token, _ = await _seed_service_with_token(
-        postgres_pool, scopes=["references:read", "features:mint"],
+        postgres_pool,
+        scopes=["references:read", "features:mint"],
         suffix="reg-no-scope",
     )
     resp = await boundary_client.post(
@@ -373,7 +404,8 @@ async def test_doget_no_auth_401(boundary_client, postgres_pool):
 async def test_doget_missing_scope_403(boundary_client, postgres_pool):
     ref_idx = await _seed_active_reference(postgres_pool, "doget-no-scope")
     token, _ = await _seed_human_with_token(
-        postgres_pool, system_role="user",
+        postgres_pool,
+        system_role="user",
         scopes=["self:profile", "references:read"],
         suffix="doget-no-scope",
     )
@@ -397,11 +429,11 @@ async def test_get_me_anonymous_401(boundary_client):
 
 async def test_get_me_service_403(boundary_client, postgres_pool):
     token, _ = await _seed_service_with_token(
-        postgres_pool, scopes=["features:mint"], suffix="me-svc",
+        postgres_pool,
+        scopes=["features:mint"],
+        suffix="me-svc",
     )
-    resp = await boundary_client.get(
-        "/api/v1/users/me", headers=_h(token)
-    )
+    resp = await boundary_client.get("/api/v1/users/me", headers=_h(token))
     assert resp.status_code == 403
 
 
@@ -413,12 +445,15 @@ async def test_get_me_service_403(boundary_client, postgres_pool):
 async def test_patch_me_missing_scope_403(boundary_client, postgres_pool):
     """Human, but token doesn't carry self:profile."""
     token, _ = await _seed_human_with_token(
-        postgres_pool, system_role="user",
+        postgres_pool,
+        system_role="user",
         scopes=["references:read"],  # no self:profile
         suffix="patch-no-scope",
     )
     resp = await boundary_client.patch(
-        "/api/v1/users/me", json={"affiliation": "X"}, headers=_h(token),
+        "/api/v1/users/me",
+        json={"affiliation": "X"},
+        headers=_h(token),
     )
     assert resp.status_code == 403
 
@@ -428,9 +463,7 @@ async def test_patch_me_missing_scope_403(boundary_client, postgres_pool):
 # ---------------------------------------------------------------------------
 
 
-async def test_get_reference_anonymous_returns_200(
-    boundary_client, postgres_pool
-):
+async def test_get_reference_anonymous_returns_200(boundary_client, postgres_pool):
     ref_idx = await _seed_active_reference(postgres_pool, "get-anon")
     resp = await boundary_client.get(f"/api/v1/references/{ref_idx}")
     assert resp.status_code == 200
@@ -439,18 +472,15 @@ async def test_get_reference_anonymous_returns_200(
     assert body["created_by_idx"] is not None  # H.b dual-write invariant
 
 
-async def test_get_reference_authenticated_returns_200(
-    boundary_client, postgres_pool
-):
+async def test_get_reference_authenticated_returns_200(boundary_client, postgres_pool):
     """Authenticated reads also work — same payload as anonymous."""
     ref_idx = await _seed_active_reference(postgres_pool, "get-auth")
     token, _ = await _seed_human_with_token(
-        postgres_pool, system_role="user",
+        postgres_pool,
+        system_role="user",
         scopes=["references:read"],
         suffix="get-auth",
     )
-    resp = await boundary_client.get(
-        f"/api/v1/references/{ref_idx}", headers=_h(token)
-    )
+    resp = await boundary_client.get(f"/api/v1/references/{ref_idx}", headers=_h(token))
     assert resp.status_code == 200
     assert resp.json()["reference_idx"] == ref_idx

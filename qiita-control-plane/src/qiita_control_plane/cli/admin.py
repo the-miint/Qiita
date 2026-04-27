@@ -27,7 +27,6 @@ from pathlib import Path
 import asyncpg
 import httpx
 
-
 _TOKEN_FILE_DEFAULT = Path.home() / ".qiita" / "token"
 
 
@@ -45,9 +44,7 @@ async def _set_system_role(database_url: str, email: str, role: str) -> int:
     yet, which is what creates the principal+user pair).
     """
     if role not in {"user", "wet_lab_admin", "system_admin"}:
-        raise ValueError(
-            f"role must be one of user / wet_lab_admin / system_admin (got {role!r})"
-        )
+        raise ValueError(f"role must be one of user / wet_lab_admin / system_admin (got {role!r})")
     try:
         conn = await asyncpg.connect(database_url, timeout=5)
     except Exception as exc:  # noqa: BLE001 — show full reason, including OS errors
@@ -66,12 +63,11 @@ async def _set_system_role(database_url: str, email: str, role: str) -> int:
                 " rows; only then can their role be set."
             )
         if idx == 1:
-            raise RuntimeError(
-                "refusing to modify the system principal (idx=1)"
-            )
+            raise RuntimeError("refusing to modify the system principal (idx=1)")
         await conn.execute(
             "UPDATE qiita.principal SET system_role = $1 WHERE idx = $2",
-            role, idx,
+            role,
+            idx,
         )
         return idx
     finally:
@@ -147,9 +143,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_token = sub.add_parser("token", help="Token operations")
     p_token_sub = p_token.add_subparsers(dest="token_cmd", required=True)
-    p_revoke = p_token_sub.add_parser(
-        "revoke-all", help="Bulk-revoke all of a principal's tokens"
-    )
+    p_revoke = p_token_sub.add_parser("revoke-all", help="Bulk-revoke all of a principal's tokens")
     p_revoke.add_argument("--principal-idx", required=True, type=int)
 
     p_login = sub.add_parser(
@@ -176,9 +170,7 @@ def main(argv: list[str] | None = None) -> int:
             print("DATABASE_URL not set", file=sys.stderr)
             return 2
         try:
-            idx = asyncio.run(
-                _set_system_role(database_url, args.email, args.role)
-            )
+            idx = asyncio.run(_set_system_role(database_url, args.email, args.role))
         except (RuntimeError, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 1
