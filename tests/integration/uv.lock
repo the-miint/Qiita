@@ -557,6 +557,7 @@ source = { directory = "../../qiita-control-plane" }
 dependencies = [
     { name = "asyncpg" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "pyarrow" },
     { name = "pyjwt", extra = ["crypto"] },
     { name = "qiita-common" },
@@ -567,6 +568,7 @@ dependencies = [
 requires-dist = [
     { name = "asyncpg", specifier = ">=0.31" },
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "httpx", specifier = ">=0.28" },
     { name = "pyarrow", specifier = ">=19" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.9" },
     { name = "qiita-common", directory = "../../qiita-common" },

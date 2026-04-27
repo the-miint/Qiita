@@ -1,6 +1,6 @@
 # Authentication
 
-> **Status:** in development on `feat/auth`. Schema (Phase A), user CRUD with mock auth (Phase B), API token mint/verify (Phase C), OIDC JWT verifier (Phase D), principal resolver + guards + role/scope ceilings (Phase E), and the auth endpoints (Phase F) have landed. The `references` and `users` routes still use the legacy mock and are flipped over in Phase H.b. The CLI-driven OIDC code-exchange route (`POST /auth/login`) lands with the qiita-admin CLI in Phase G.
+> **Status:** in development on `feat/auth`. Schema (A), user CRUD with mock auth (B), API token mint/verify (C), OIDC JWT verifier (D), principal resolver + guards + role/scope ceilings (E), auth endpoints (F), and admin endpoints + bootstrap CLI (G) have landed. The `references` and `users` routes still use the legacy mock and are flipped in Phase H.b. The OIDC PKCE code-exchange (`POST /auth/login` + the matching `qiita-admin login` flow) is deferred to Phase J — it requires an OIDC test harness for code-exchange that isn't built yet; for now operators obtain an AuthRocket JWT out-of-band and call `POST /auth/pat`.
 
 Qiita authenticates three kinds of principal against the control plane:
 
@@ -242,6 +242,36 @@ The token path returns the token's **own** `scopes` frozenset (whatever the mint
 - Profile must be complete. Otherwise: 422 with flat body `{detail: "profile incomplete", reason: "profile_incomplete", missing_fields: [...]}`.
 - Mint emits a `token_mint` audit event with `token_idx`, `scopes`, `kind` — never plaintext.
 
+### Admin (Phase G — system_admin only)
+
+All routes require `system_role >= system_admin` AND the appropriate `admin:*` scope, so a system_admin token minted with narrow scopes can't exfiltrate data outside its grant.
+
+| Route | Method | Notes |
+|---|---|---|
+| `/api/v1/admin/service-accounts` | POST | Creates a service-account-kind principal and mints its initial token. Scopes are required (no implicit ceiling — workers don't fit the human hierarchy) and validated against `SERVICE_ACCOUNT_SCOPE_CEILING`. 409 on duplicate `name`. Requires `admin:service_accounts`. |
+| `/api/v1/admin/principals/{idx}/disabled` | PATCH | Toggle disabled. `disabled=true` requires `reason`; `false` is the round-trip back to active. Cannot transition retired→disabled (DB CHECK). Requires `admin:users`. |
+| `/api/v1/admin/principals/{idx}/retired` | PATCH | Retire (terminal). DB trigger auto-revokes all the principal's active tokens. Refuses if the actor is the target (no zero-active-admins). Requires `admin:users`. |
+| `/api/v1/admin/principals/{idx}/system-role` | PATCH | Set `system_role`. Audit event records `from`/`to`/`reason`. Requires `admin:users`. |
+| `/api/v1/admin/audit` | GET | List audit events (newest first). Optional filters `principal_idx` and `event_type`; `limit ∈ [1, 1000]`. Requires `admin:audit_read`. |
+| `/api/v1/admin/principals/{idx}/revoke-all-tokens` | POST | Bulk-revoke all the principal's active tokens. Idempotent on already-revoked tokens (counted separately). Emits one `token_revoke` audit event per newly-revoked token. Requires `admin:users`. |
+
+The system principal (`idx=1`) is rejected by every mutation endpoint above (`disabled`, `retired`, `system-role`) — bare-actor invariant holds at the API layer in addition to the DB CHECK.
+
+## CLI (`qiita-admin`)
+
+Installed as the `qiita-admin` console script via `qiita-control-plane`'s pyproject. Subcommands:
+
+| Subcommand | Path | Notes |
+|---|---|---|
+| `set-system-role --email X --role Y` | direct DB | Bootstrap path — sets `qiita.principal.system_role` by email lookup against `qiita.user`. Refuses to operate on `idx=1`. The user must have logged in via OIDC at least once (which is what creates their `principal+user` rows). |
+| `whoami` | HTTP | Calls `GET /api/v1/auth/whoami`. PAT read from `QIITA_TOKEN` env or `~/.qiita/token` (mode 0600 expected). |
+| `token revoke-all --principal-idx N` | HTTP | Calls `POST /api/v1/admin/principals/{N}/revoke-all-tokens`. |
+| `login` | DEFERRED | The full PKCE + OIDC code-exchange flow lands in Phase J. Today's path: obtain a JWT out-of-band (AuthRocket admin UI / external CLI) and call `POST /api/v1/auth/pat` directly. |
+
+## First-deploy bootstrap
+
+See [`docs/runbooks/first-deploy.md`](runbooks/first-deploy.md) for the full sequence: migrate → set env vars → one-shot JWT verify (`scripts/verify_jwt.py`) → start control plane → first OIDC login → `qiita-admin set-system-role` → mint operator PAT → mint orchestrator service account → install token at `/etc/qiita/orchestrator.token` (mode 0400) → start orchestrator.
+
 ### User CRUD (Phase B — mock auth)
 
 | Route | Method | Notes |
@@ -254,17 +284,15 @@ Authentication is currently the **mock principal-resolver** in `deps.py::get_cur
 
 The auth-specific endpoints (`/auth/pat`, `/auth/whoami`, `/auth/tokens`, `/auth/login`) and admin endpoints (service accounts, audit log, principal status updates) are populated when Phases F and G land.
 
-## CLI (`qiita-admin`)
-
-_Populated when Phase G lands._
+<!-- CLI section now populated above under Phase G admin endpoints. -->
+## CLI (`qiita-admin`) — see admin section above
 
 ## Orchestrator integration
 
 _Populated when Phase I lands._
 
-## First-deploy bootstrap
-
-_Populated when Phase G lands._
+<!-- See "First-deploy bootstrap" subsection within Endpoints. -->
+## First-deploy bootstrap — see [docs/runbooks/first-deploy.md](runbooks/first-deploy.md)
 
 ## Token rotation
 

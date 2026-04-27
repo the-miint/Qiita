@@ -9,7 +9,11 @@ dependencies = [
     "asyncpg>=0.31",
     "pyarrow>=19",
     "pyjwt[crypto]>=2.9",
+    "httpx>=0.28",
 ]
+
+[project.scripts]
+qiita-admin = "qiita_control_plane.cli.admin:main"
 
 [dependency-groups]
 dev = [

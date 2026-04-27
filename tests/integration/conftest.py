@@ -192,6 +192,43 @@ def jwks_harness():
 
 
 @pytest_asyncio.fixture(scope="session")
+async def compute_worker_service_account(postgres_pool, tmp_path_factory):
+    """Provision a service-account-kind principal with worker scopes and
+    write its token to a tmp file. Reused by the orchestrator-auth tests
+    in Phase I; the file path is the canonical drop-in for the production
+    `/etc/qiita/orchestrator.token` location.
+
+    Returns a dict with `principal_idx`, `token_path` (Path), `token` (str).
+    """
+    from qiita_control_plane.auth.tokens import mint_api_token
+
+    pidx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
+        " VALUES ('compute-worker-fixture', 'user', 1) RETURNING idx"
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.service_account (principal_idx, name, description)"
+        " VALUES ($1, 'compute-worker-fixture', 'orchestrator service-account fixture')",
+        pidx,
+    )
+    plaintext, _ = await mint_api_token(
+        postgres_pool,
+        principal_idx=pidx,
+        label="orchestrator-fixture",
+        scopes=[
+            "features:mint",
+            "references:register_files",
+            "references:read",
+            "tickets:doget",
+        ],
+    )
+    token_path = tmp_path_factory.mktemp("orchestrator-token") / "token"
+    token_path.write_text(plaintext)
+    token_path.chmod(0o400)
+    return {"principal_idx": pidx, "token_path": token_path, "token": plaintext}
+
+
+@pytest_asyncio.fixture(scope="session")
 async def mock_authenticated_principal(postgres_pool):
     """Phase B: seed a system_admin principal+user that the mock auth dep
     (qiita_control_plane.deps.get_current_principal_idx) resolves to.

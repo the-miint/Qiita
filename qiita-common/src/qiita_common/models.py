@@ -200,3 +200,88 @@ class ApiTokenSummary(BaseModel):
     revoked_at: AwareDatetime | None
     last_used_at: AwareDatetime | None
     created_at: AwareDatetime
+
+
+# ============================================================================
+# Auth: admin-surface models (Phase G)
+# ============================================================================
+
+
+SystemRole = Literal["user", "wet_lab_admin", "system_admin"]
+
+
+class ServiceAccountCreate(BaseModel):
+    """Body for POST /api/v1/admin/service-accounts.
+
+    Scopes are required (no implicit ceiling for service kind) — admins
+    must explicitly state what the worker is allowed to do. ttl_days=None
+    means no expiry; service tokens are typically long-lived and rotated
+    by an out-of-band runbook.
+    """
+
+    name: str = Field(min_length=1, max_length=255)
+    description: str | None = None
+    scopes: list[str] = Field(min_length=1)
+    ttl_days: Annotated[int, Field(gt=0, le=3650)] | None = None
+    label: str = Field(min_length=1, max_length=255, default="initial")
+
+
+class ServiceAccountCreateResponse(BaseModel):
+    """Returned exactly once at service-account creation. Captures both the
+    new principal/service identity and the freshly-minted token."""
+
+    principal_idx: Annotated[int, Field(gt=0)]
+    name: str
+    description: str | None
+    token: str  # plaintext qk_... — shown once
+    token_idx: Annotated[int, Field(gt=0)]
+    scopes: list[str]
+    expires_at: AwareDatetime | None
+    created_at: AwareDatetime
+
+
+class PrincipalDisabledUpdate(BaseModel):
+    """Body for PATCH /api/v1/admin/principals/{idx}/disabled.
+
+    `disabled=true` requires `reason` (audit-trail). `disabled=false` is
+    the round-trip back to active and leaves the audit columns NULL via
+    the principal_disabled_consistent CHECK.
+    """
+
+    disabled: bool
+    reason: str | None = None
+
+
+class PrincipalRetiredUpdate(BaseModel):
+    """Body for PATCH /api/v1/admin/principals/{idx}/retired.
+
+    Retirement is terminal (CHECK forbids active → retired → active);
+    `reason` is required for the audit trail.
+    """
+
+    reason: str = Field(min_length=1)
+
+
+class PrincipalSystemRoleUpdate(BaseModel):
+    """Body for PATCH /api/v1/admin/principals/{idx}/system-role."""
+
+    system_role: SystemRole
+    reason: str | None = None
+
+
+class AuthEventResponse(BaseModel):
+    """One row from GET /api/v1/admin/audit."""
+
+    event_idx: Annotated[int, Field(gt=0)]
+    event_type: str
+    principal_idx: int | None
+    actor_principal_idx: int | None
+    detail: dict
+    occurred_at: AwareDatetime
+
+
+class RevokeAllTokensResponse(BaseModel):
+    """Returned by POST /api/v1/admin/principals/{idx}/revoke-all-tokens."""
+
+    revoked_token_idxs: list[int]
+    already_revoked_count: int
