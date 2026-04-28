@@ -42,8 +42,10 @@ class AuthorizationScrubFilter(logging.Filter):
     """
 
     def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
-        if isinstance(record.msg, str):
-            record.msg = scrub_authorization(record.msg)
+        # `_scrub_value` is the same str-or-passthrough check that used to
+        # live inline here; routing record.msg through it keeps the two
+        # branches in sync.
+        record.msg = self._scrub_value(record.msg)
         if record.args:
             record.args = self._scrub_args(record.args)
         return True

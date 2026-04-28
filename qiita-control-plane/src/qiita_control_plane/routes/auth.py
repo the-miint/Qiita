@@ -28,13 +28,15 @@ from qiita_common.models import (
 
 from ..auth import TOKEN_PREFIX
 from ..auth.audit import record_event
-from ..auth.oidc import InvalidJwt, JwtVerifier
+from ..auth.db import rows_affected
+from ..auth.oidc import InvalidJwt
 from ..auth.principal import (
     Anonymous,
     HumanUser,
     Principal,
     ServiceAccount,
     get_current_principal,
+    get_oidc_verifier,
 )
 from ..auth.scopes import (
     VALID_SCOPES,
@@ -58,16 +60,6 @@ def _get_settings(request: Request) -> Settings:
     if settings is None:
         raise RuntimeError("Settings not initialised — lifespan may not have run")
     return settings
-
-
-def _get_oidc_verifier(request: Request) -> JwtVerifier:
-    verifier = getattr(request.app.state, "oidc_verifier", None)
-    if verifier is None:
-        raise HTTPException(
-            status_code=503,
-            detail="OIDC verifier is not configured (set AUTHROCKET_* env vars)",
-        )
-    return verifier
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +117,7 @@ async def mint_pat(
     error instead of silently failing.
     """
     settings = _get_settings(request)
-    verifier = _get_oidc_verifier(request)
+    verifier = get_oidc_verifier(request)
 
     auth = request.headers.get("Authorization", "")
     if not auth.startswith(BEARER_PREFIX):
@@ -318,7 +310,7 @@ async def revoke_own_token(
         token_idx,
         p.principal_idx,
     )
-    if result.endswith("0"):
+    if rows_affected(result) == 0:
         # Either the token doesn't exist, is owned by another principal, or
         # is owned by us but already revoked. To avoid leaking existence to
         # an attacker walking token_idx values, conflate the first two as

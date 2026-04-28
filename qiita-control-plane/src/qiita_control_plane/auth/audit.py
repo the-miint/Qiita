@@ -18,6 +18,7 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 from qiita_common.auth_constants import AuthEventType
@@ -64,6 +65,16 @@ def sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+@dataclass(frozen=True, slots=True)
+class AuthEvent:
+    """One event row, ready for bulk insertion via `record_event_bulk`."""
+
+    event_type: AuthEventType | str
+    principal_idx: int | None = None
+    actor_principal_idx: int | None = None
+    detail: dict[str, Any] | None = None
+
+
 async def record_event(
     pool_or_conn,
     *,
@@ -101,4 +112,38 @@ async def record_event(
     )
 
 
-__all__: Iterable[str] = ("record_event", "sha256_hex")
+async def record_event_bulk(pool_or_conn, *, events: list[AuthEvent]) -> list[int]:
+    """Insert many auth_events in one round-trip. Returns the new event_idxs.
+
+    Runs the leak guard against every event's `detail` before any rows are
+    written; if any event fails the check, no rows are inserted (the guard
+    raises before the INSERT). The INSERT itself is one statement so it
+    rolls back atomically on a DB error.
+
+    Empty `events` is a no-op returning `[]`.
+    """
+    if not events:
+        return []
+    for event in events:
+        _check_for_leaks(event.detail or {})
+
+    event_types = [str(e.event_type) for e in events]
+    principal_idxs = [e.principal_idx for e in events]
+    actor_idxs = [e.actor_principal_idx for e in events]
+    payloads = [json.dumps(e.detail or {}, separators=(",", ":")) for e in events]
+
+    rows = await pool_or_conn.fetch(
+        "INSERT INTO qiita.auth_events"
+        "  (event_type, principal_idx, actor_principal_idx, detail)"
+        " SELECT * FROM unnest("
+        "   $1::text[], $2::bigint[], $3::bigint[], $4::jsonb[]"
+        " ) RETURNING event_idx",
+        event_types,
+        principal_idxs,
+        actor_idxs,
+        payloads,
+    )
+    return [r["event_idx"] for r in rows]
+
+
+__all__: Iterable[str] = ("AuthEvent", "record_event", "record_event_bulk", "sha256_hex")

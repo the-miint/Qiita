@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import UserCreate, UserResponse, UserUpdate
 
+from ..auth.db import rows_affected
 from ..auth.guards import (
     require_human,
     require_human_with_role,
@@ -129,7 +130,7 @@ async def patch_me(
             user.principal_idx,
             *values,
         )
-        if result.endswith("0"):
+        if rows_affected(result) == 0:
             raise HTTPException(
                 status_code=404,
                 detail="Authenticated principal has no user profile",

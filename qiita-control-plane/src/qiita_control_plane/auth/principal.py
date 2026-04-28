@@ -36,6 +36,7 @@ from qiita_common.auth_constants import (
     SystemRole,
 )
 
+from ..deps import get_db_pool
 from . import TOKEN_PREFIX
 from .audit import record_event, sha256_hex
 from .oidc import InvalidJwt, JwtVerifier
@@ -137,25 +138,24 @@ async def get_current_principal(request: Request) -> Principal:
     if not bearer:
         return Anonymous()
 
-    pool = _get_pool(request)
+    pool = get_db_pool(request)
 
     if bearer.startswith(TOKEN_PREFIX):
         return await _resolve_token(pool, bearer)
     if _looks_like_jwt(bearer):
-        verifier = _get_oidc_verifier(request)
+        verifier = get_oidc_verifier(request)
         return await _resolve_oidc(pool, verifier, bearer)
 
     raise HTTPException(status_code=401, detail="malformed bearer token")
 
 
-def _get_pool(request: Request) -> asyncpg.Pool:
-    pool = getattr(request.app.state, "pool", None)
-    if pool is None:
-        raise RuntimeError("Database pool not initialised")
-    return pool
+def get_oidc_verifier(request: Request) -> JwtVerifier:
+    """Return the configured JWKS-backed JWT verifier from app state.
 
-
-def _get_oidc_verifier(request: Request) -> JwtVerifier:
+    503s rather than 500s because a missing verifier reflects a deployment
+    config gap (AUTHROCKET_* env vars), not a bug — callers downstream are
+    correct, the service is not ready to authenticate JWT bearers.
+    """
     verifier = getattr(request.app.state, "oidc_verifier", None)
     if verifier is None:
         raise HTTPException(

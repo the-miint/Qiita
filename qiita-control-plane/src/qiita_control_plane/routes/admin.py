@@ -28,7 +28,8 @@ from qiita_common.models import (
     ServiceAccountCreateResponse,
 )
 
-from ..auth.audit import record_event
+from ..auth.audit import AuthEvent, record_event, record_event_bulk
+from ..auth.db import rows_affected
 from ..auth.guards import require_human_with_role, require_scope
 from ..auth.principal import HumanUser, Principal
 from ..auth.scopes import (
@@ -197,7 +198,7 @@ async def set_principal_disabled(
             principal_idx,
         )
 
-    if result.endswith("0"):
+    if rows_affected(result) == 0:
         # Either principal doesn't exist, or already in target state, or
         # retired (terminal). Distinguish via a follow-up read.
         row = await pool.fetchrow(
@@ -258,7 +259,7 @@ async def retire_principal(
     except asyncpg.CheckViolationError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    if result.endswith("0"):
+    if rows_affected(result) == 0:
         row = await pool.fetchrow(
             "SELECT retired FROM qiita.principal WHERE idx = $1", principal_idx
         )
@@ -422,14 +423,18 @@ async def revoke_all_principal_tokens(
         revoked_idxs,
     )
 
-    for tidx in revoked_idxs:
-        await record_event(
-            pool,
-            event_type=AuthEventType.TOKEN_REVOKE,
-            principal_idx=principal_idx,
-            actor_principal_idx=actor.principal_idx,
-            detail={"token_idx": tidx, "reason": "admin_bulk"},
-        )
+    await record_event_bulk(
+        pool,
+        events=[
+            AuthEvent(
+                event_type=AuthEventType.TOKEN_REVOKE,
+                principal_idx=principal_idx,
+                actor_principal_idx=actor.principal_idx,
+                detail={"token_idx": tidx, "reason": "admin_bulk"},
+            )
+            for tidx in revoked_idxs
+        ],
+    )
 
     return RevokeAllTokensResponse(
         revoked_token_idxs=revoked_idxs,
