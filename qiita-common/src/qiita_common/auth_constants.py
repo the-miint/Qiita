@@ -120,3 +120,10 @@ AUDIT_QUERY_MAX_LIMIT = 1000
 # contention on a frequently-validated token. Embedded in a SQL fragment, so
 # the value must be a valid `interval` literal.
 LAST_USED_AT_COALESCE_INTERVAL = "1 minute"
+
+
+# Shared HTTPException detail strings. Kept here so the resolver, route
+# handlers, and admin paths emit byte-identical messages — a drift between
+# them would force tests / clients to special-case wording per call site.
+MSG_PRINCIPAL_DISABLED_OR_RETIRED = "principal disabled or retired"
+MSG_PRINCIPAL_NOT_FOUND = "principal not found"

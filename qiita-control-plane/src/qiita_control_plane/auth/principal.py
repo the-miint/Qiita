@@ -29,6 +29,8 @@ import asyncpg
 from fastapi import HTTPException, Request
 from qiita_common.auth_constants import (
     BEARER_PREFIX,
+    MSG_PRINCIPAL_DISABLED_OR_RETIRED,
+    MSG_PRINCIPAL_NOT_FOUND,
     SYSTEM_PRINCIPAL_IDX,
     AuthEventType,
     SystemRole,
@@ -42,8 +44,6 @@ from .oidc import InvalidJwt, JwtVerifier
 from .tokens import verify_api_token
 
 _ROLE_ORDER = {SystemRole.USER: 0, SystemRole.WET_LAB_ADMIN: 1, SystemRole.SYSTEM_ADMIN: 2}
-
-_MSG_PRINCIPAL_DISABLED_OR_RETIRED = "principal disabled or retired"
 
 
 def _human_user_from_row(row, *, scopes: frozenset[str]) -> HumanUser:
@@ -224,7 +224,7 @@ async def _resolve_token(pool: asyncpg.Pool, plaintext: str) -> Principal:
     if row is None:
         # Token references missing principal — schema FK would normally
         # prevent this, but fail closed.
-        raise HTTPException(status_code=401, detail="principal not found")
+        raise HTTPException(status_code=401, detail=MSG_PRINCIPAL_NOT_FOUND)
 
     if row["email"] is not None:
         return _human_user_from_row(row, scopes=verified.scopes)
@@ -258,7 +258,7 @@ async def _resolve_oidc(pool: asyncpg.Pool, verifier: JwtVerifier, bearer: str) 
     )
     if existing is not None:
         if existing["disabled"] or existing["retired"]:
-            raise HTTPException(status_code=401, detail=_MSG_PRINCIPAL_DISABLED_OR_RETIRED)
+            raise HTTPException(status_code=401, detail=MSG_PRINCIPAL_DISABLED_OR_RETIRED)
         await _handle_email_drift(pool, existing["principal_idx"], identity.email)
         return await _build_human_user(pool, existing["principal_idx"], scopes=None)
 
@@ -399,7 +399,7 @@ async def _build_human_user(
     if row is None:
         raise HTTPException(status_code=401, detail="user record not found for principal")
     if row["disabled"] or row["retired"]:
-        raise HTTPException(status_code=401, detail=_MSG_PRINCIPAL_DISABLED_OR_RETIRED)
+        raise HTTPException(status_code=401, detail=MSG_PRINCIPAL_DISABLED_OR_RETIRED)
     # For OIDC-derived sessions we hand back the role's full ceiling. Phase F
     # narrows this when minting PATs; per-request bearers carry their own
     # scope set via the token path.

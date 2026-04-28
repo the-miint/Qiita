@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from qiita_common.auth_constants import (
     AUDIT_QUERY_DEFAULT_LIMIT,
     AUDIT_QUERY_MAX_LIMIT,
+    MSG_PRINCIPAL_NOT_FOUND,
     SYSTEM_PRINCIPAL_IDX,
     AuthEventType,
     Scope,
@@ -34,15 +35,12 @@ from ..auth.guards import require_human_with_role, require_scope
 from ..auth.principal import HumanUser, Principal
 from ..auth.scopes import (
     SERVICE_ACCOUNT_SCOPE_CEILING,
-    VALID_SCOPES,
-    reject_scopes_outside_ceiling,
+    validate_scopes_against_ceiling,
 )
 from ..auth.tokens import mint_api_token
 from ..deps import get_db_pool
 
 router = APIRouter(prefix="/admin", tags=["admin"])
-
-_MSG_PRINCIPAL_NOT_FOUND = "principal not found"
 
 
 # ---------------------------------------------------------------------------
@@ -76,21 +74,13 @@ async def create_service_account(
     /auth/pat).
     """
     # Scope ceiling check
-    unknown = [s for s in body.scopes if s not in VALID_SCOPES]
-    if unknown:
-        return JSONResponse(
-            status_code=422,
-            content={"detail": "unknown scopes", "rejected_scopes": sorted(unknown)},
-        )
-    rejected = reject_scopes_outside_ceiling(body.scopes, SERVICE_ACCOUNT_SCOPE_CEILING)
-    if rejected:
-        return JSONResponse(
-            status_code=422,
-            content={
-                "detail": "scopes not granted to service accounts",
-                "rejected_scopes": rejected,
-            },
-        )
+    rejection = validate_scopes_against_ceiling(
+        body.scopes,
+        SERVICE_ACCOUNT_SCOPE_CEILING,
+        ceiling_violation_detail="scopes not granted to service accounts",
+    )
+    if rejection is not None:
+        return rejection
 
     expires_at = (
         datetime.now(UTC) + timedelta(days=body.ttl_days) if body.ttl_days is not None else None
@@ -203,7 +193,7 @@ async def set_principal_disabled(
             principal_idx,
         )
         if row is None:
-            raise HTTPException(status_code=404, detail=_MSG_PRINCIPAL_NOT_FOUND)
+            raise HTTPException(status_code=404, detail=MSG_PRINCIPAL_NOT_FOUND)
         if row["retired"]:
             raise HTTPException(status_code=409, detail="principal is retired (terminal)")
         # Already in target state → idempotent success.
@@ -261,7 +251,7 @@ async def retire_principal(
             "SELECT retired FROM qiita.principal WHERE idx = $1", principal_idx
         )
         if row is None:
-            raise HTTPException(status_code=404, detail=_MSG_PRINCIPAL_NOT_FOUND)
+            raise HTTPException(status_code=404, detail=MSG_PRINCIPAL_NOT_FOUND)
         # Already retired → idempotent success.
         return
 
@@ -296,7 +286,7 @@ async def set_principal_system_role(
         "SELECT system_role FROM qiita.principal WHERE idx = $1", principal_idx
     )
     if old_role is None:
-        raise HTTPException(status_code=404, detail=_MSG_PRINCIPAL_NOT_FOUND)
+        raise HTTPException(status_code=404, detail=MSG_PRINCIPAL_NOT_FOUND)
 
     await pool.execute(
         "UPDATE qiita.principal SET system_role = $1 WHERE idx = $2",
@@ -397,7 +387,7 @@ async def revoke_all_principal_tokens(
             "SELECT 1 FROM qiita.principal WHERE idx = $1", principal_idx
         )
         if not principal_exists:
-            raise HTTPException(status_code=404, detail=_MSG_PRINCIPAL_NOT_FOUND)
+            raise HTTPException(status_code=404, detail=MSG_PRINCIPAL_NOT_FOUND)
     if not actor.has_scope(required_scope):
         raise HTTPException(
             status_code=403,

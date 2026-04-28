@@ -9,6 +9,7 @@ non-inherited ceiling because workers don't fit the human hierarchy.
 
 from collections.abc import Mapping
 
+from fastapi.responses import JSONResponse
 from qiita_common.auth_constants import Scope, SystemRole
 
 VALID_SCOPES: frozenset[Scope] = frozenset(Scope)
@@ -75,3 +76,32 @@ def reject_scopes_outside_ceiling(requested: list[str], ceiling: frozenset[Scope
     """Return the subset of requested scopes that fall outside the ceiling.
     Empty list means the request is fully within the ceiling."""
     return sorted(set(requested) - ceiling)
+
+
+def validate_scopes_against_ceiling(
+    requested: list[str],
+    ceiling: frozenset[Scope],
+    *,
+    ceiling_violation_detail: str,
+) -> JSONResponse | None:
+    """Validate `requested` against `VALID_SCOPES` and the supplied ceiling.
+
+    Returns `None` when the request passes both checks. Otherwise returns the
+    422 JSONResponse the route should hand back — body shape is the same on
+    both rejection paths (`{"detail": ..., "rejected_scopes": [...]}`); only
+    the ceiling-violation detail varies between callers (PAT mint vs.
+    service-account create), which is why it's a required keyword argument.
+    """
+    unknown = [s for s in requested if s not in VALID_SCOPES]
+    if unknown:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "unknown scopes", "rejected_scopes": sorted(unknown)},
+        )
+    rejected = reject_scopes_outside_ceiling(requested, ceiling)
+    if rejected:
+        return JSONResponse(
+            status_code=422,
+            content={"detail": ceiling_violation_detail, "rejected_scopes": rejected},
+        )
+    return None

@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from qiita_common.auth_constants import (
     BEARER_PREFIX,
+    MSG_PRINCIPAL_DISABLED_OR_RETIRED,
     AuthEventType,
     Scope,
 )
@@ -40,9 +41,8 @@ from ..auth.principal import (
     get_oidc_verifier,
 )
 from ..auth.scopes import (
-    VALID_SCOPES,
-    reject_scopes_outside_ceiling,
     role_ceiling,
+    validate_scopes_against_ceiling,
 )
 from ..auth.tokens import mint_api_token
 from ..config import Settings
@@ -180,7 +180,7 @@ async def mint_pat(
             detail="no user matches this OIDC identity",
         )
     if user_row["disabled"] or user_row["retired"]:
-        raise HTTPException(status_code=401, detail="principal disabled or retired")
+        raise HTTPException(status_code=401, detail=MSG_PRINCIPAL_DISABLED_OR_RETIRED)
 
     if not user_row["profile_complete"]:
         # Flat 422 body so the CLI can pluck reason / missing_fields without
@@ -195,34 +195,22 @@ async def mint_pat(
             },
         )
 
-    # Scope validation against the role ceiling.
+    # Scope validation against the role ceiling. Per the plan's design note,
+    # the rejection response does NOT echo the caller's full ceiling — the
+    # caller already knows it via /auth/whoami; echoing it per-request would
+    # leak ceiling structure to a probing attacker.
     role = user_row["system_role"]
     ceiling = role_ceiling(role)
     if body.scopes is None:
         scopes = sorted(ceiling)
     else:
-        unknown = [s for s in body.scopes if s not in VALID_SCOPES]
-        if unknown:
-            return JSONResponse(
-                status_code=422,
-                content={
-                    "detail": "unknown scopes",
-                    "rejected_scopes": sorted(unknown),
-                },
-            )
-        rejected = reject_scopes_outside_ceiling(body.scopes, ceiling)
-        if rejected:
-            # Per the plan's design note, do NOT echo the caller's full
-            # ceiling — the caller already knows it via /auth/whoami; echoing
-            # it per-request would leak ceiling structure to a probing
-            # attacker.
-            return JSONResponse(
-                status_code=422,
-                content={
-                    "detail": "scopes not granted by your role",
-                    "rejected_scopes": rejected,
-                },
-            )
+        rejection = validate_scopes_against_ceiling(
+            body.scopes,
+            ceiling,
+            ceiling_violation_detail="scopes not granted by your role",
+        )
+        if rejection is not None:
+            return rejection
         scopes = list(body.scopes)
 
     # TTL — Pydantic already enforces gt=0 and le=365.
