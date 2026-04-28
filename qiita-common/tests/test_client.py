@@ -1,4 +1,4 @@
-"""Tests for ControlPlaneClient (Phase I auth params + Phase B method surface)."""
+"""Tests for ControlPlaneClient (auth params + user-management method surface)."""
 
 import httpx
 import pytest

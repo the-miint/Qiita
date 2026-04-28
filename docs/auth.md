@@ -1,8 +1,6 @@
 # Authentication
 
-> **Status:** ready to merge from `feat/auth`. Phases A–J landed. The control plane is fully on the real auth surface; the orchestrator authenticates via a service-account `qk_` token loaded from `/etc/qiita/orchestrator.token` (or `CONTROL_PLANE_API_TOKEN` when `QIITA_ALLOW_TOKEN_ENV=true` for dev/CI). 178 unit + 204 integration tests pass; security audit completed.
-
-> **Known gap:** the OIDC PKCE code-exchange (`POST /auth/login` + `qiita-admin login`) is **not** shipped — it requires a code-exchange test harness that we deferred. Today's path: operators obtain an AuthRocket JWT out-of-band (AuthRocket admin UI / external CLI) within `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS` of login, then call `POST /api/v1/auth/pat` directly to mint a PAT. The `qiita-admin login` subcommand currently exits with status 2 and a message pointing at this path. See `qiita-control-plane/src/qiita_control_plane/cli/admin.py::main` and the `routes/auth.py` module docstring.
+> **Known gap:** the OIDC PKCE code-exchange (`POST /auth/login` + `qiita-admin login`) is **not** shipped — building it requires a code-exchange test harness that does not yet exist. Today's path: operators obtain an AuthRocket JWT out-of-band (AuthRocket admin UI / external CLI) within `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS` of login, then call `POST /api/v1/auth/pat` directly to mint a PAT. The `qiita-admin login` subcommand currently exits with status 2 and a message pointing at this path. See `qiita-control-plane/src/qiita_control_plane/cli/admin.py::main` and the `routes/auth.py` module docstring.
 
 Qiita authenticates three kinds of principal against the control plane:
 
@@ -46,7 +44,7 @@ Both subtypes contain `CHECK (principal_idx <> 1)` to keep the system principal 
 
 `idx=1` is seeded by the auth migration with `display_name='system'`, `system_role='system_admin'`, `created_by_idx=1` (self-reference via the deferred FK). It cannot have a `user` or `service_account` row, cannot hold tokens, cannot be `disabled` or `retired` (`principal_system_principal_always_active` CHECK), and cannot authenticate. It exists to:
 
-- Backfill pre-auth historical FKs in Phase H (when `references.created_by` migrates from UUID to `principal(idx)`).
+- Backfill pre-auth historical FKs (`references.created_by_idx` was migrated from a UUID column to `principal(idx)`).
 - Serve as the audit-log "actor" for system-generated events (e.g., automatic token revocation on retirement).
 
 ### Status: `disabled` / `retired`
@@ -64,7 +62,7 @@ Single FK to `principal(idx)` — there's no separate user/service token table. 
 
 ### `auth_events`
 
-Append-only audit log. BEFORE UPDATE and BEFORE DELETE triggers raise on any mutation attempt — the only legal write is INSERT. `event_type` is a discriminator string (no ENUM, so values can be added per phase without a migration). `principal_idx` and `actor_principal_idx` (admin-on-behalf-of) both FK to `principal(idx)`; `detail JSONB` carries event-specific context.
+Append-only audit log. BEFORE UPDATE and BEFORE DELETE triggers raise on any mutation attempt — the only legal write is INSERT. `event_type` is a discriminator string (no ENUM, so new values can be added without a migration). `principal_idx` and `actor_principal_idx` (admin-on-behalf-of) both FK to `principal(idx)`; `detail JSONB` carries event-specific context.
 
 ### Reuse of `qiita.set_updated_at()`
 
@@ -195,7 +193,7 @@ On success, returns `OIDCIdentity(issuer, subject, email, auth_time, raw_claims)
 - `AUTHROCKET_AUDIENCE` (required)
 - `AUTHROCKET_JWKS_URL` (defaults to `{issuer}/connect/jwks` if unset)
 - `AUTHROCKET_JWT_LEEWAY_SECONDS` (default 30)
-- `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS` (default 300; consumed by Phase F's PAT-mint freshness check, not by the verifier itself)
+- `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS` (default 300; consumed by the PAT-mint freshness check, not by the verifier itself)
 - `QIITA_TOKEN_DEFAULT_TTL_DAYS` (default 90; consumed by PAT mint)
 
 These fields are *optional* on `Settings` so non-auth tests don't have to set every `AUTHROCKET_*` env var. Required-ness is enforced at `AuthRocketVerifier.from_settings` time.
@@ -207,7 +205,7 @@ Defined in `auth.scopes`. Two ceilings:
 - **`ROLE_IMPLIED_SCOPES`** — hierarchical, per `system_role`. Each entry is the **full** ceiling, not the increment, with `system_admin ⊇ wet_lab_admin ⊇ user`. Future readers don't have to chase inheritance to know what role X can do.
 - **`SERVICE_ACCOUNT_SCOPE_CEILING`** — flat, non-inherited. Workers don't fit the human hierarchy; admin-mint of a service-account token must spell out scopes explicitly within this set.
 
-The hierarchical claim is enforced by a Phase E unit test (`test_role_ceilings_are_hierarchical`) that asserts `user ⊊ wet_lab_admin ⊊ system_admin` strictly. If that test ever fails, the inheritance contract is broken and downstream guards become unsound.
+The hierarchical claim is enforced by a unit test (`test_role_ceilings_are_hierarchical`) that asserts `user ⊊ wet_lab_admin ⊊ system_admin` strictly. If that test ever fails, the inheritance contract is broken and downstream guards become unsound.
 
 ### Guards (`auth.guards`)
 
@@ -223,11 +221,11 @@ Guards compose: a route can `Depends(require_role_at_least("system_admin"))` AND
 
 ### Token-vs-OIDC scope source
 
-The token path returns the token's **own** `scopes` frozenset (whatever the mint stored). The OIDC path (no token; bearer is a fresh JWT) hands back the **role's full ceiling** — Phase F's `POST /auth/pat` is the route that narrows this when it mints a PAT. Per-request bearers always carry their own scope set via the token path.
+The token path returns the token's **own** `scopes` frozenset (whatever the mint stored). The OIDC path (no token; bearer is a fresh JWT) hands back the **role's full ceiling** — `POST /auth/pat` is the route that narrows this when it mints a PAT. Per-request bearers always carry their own scope set via the token path.
 
 ## Endpoints
 
-### Auth (Phase F — real auth)
+### Auth
 
 | Route | Method | Notes |
 |---|---|---|
@@ -244,7 +242,7 @@ The token path returns the token's **own** `scopes` frozenset (whatever the mint
 - Profile must be complete. Otherwise: 422 with flat body `{detail: "profile incomplete", reason: "profile_incomplete", missing_fields: [...]}`.
 - Mint emits a `token_mint` audit event with `token_idx`, `scopes`, `kind` — never plaintext.
 
-### Admin (Phase G — system_admin only)
+### Admin (system_admin only)
 
 All routes require `system_role >= system_admin` AND the appropriate `admin:*` scope, so a system_admin token minted with narrow scopes can't exfiltrate data outside its grant.
 
@@ -276,7 +274,7 @@ Installed as the `qiita-admin` console script via `qiita-control-plane`'s pyproj
 | `set-system-role --email X --role Y` | direct DB | Bootstrap path — sets `qiita.principal.system_role` by email lookup against `qiita.user`. Refuses to operate on `idx=1`. The user must have logged in via OIDC at least once (which is what creates their `principal+user` rows). |
 | `whoami` | HTTP | Calls `GET /api/v1/auth/whoami`. PAT read from `QIITA_TOKEN` env or `~/.qiita/token` (mode 0600 expected). |
 | `token revoke-all --principal-idx N` | HTTP | Calls `POST /api/v1/admin/principals/{N}/revoke-all-tokens`. |
-| `login` | DEFERRED | The PKCE + OIDC code-exchange flow is **not** shipped (see the Status banner above). Exits 2 with a message pointing at the alternative: obtain a JWT out-of-band and call `POST /api/v1/auth/pat` directly. |
+| `login` | not yet shipped | The PKCE + OIDC code-exchange flow is **not** wired up (see the Known gap banner above). Exits 2 with a message pointing at the alternative: obtain a JWT out-of-band and call `POST /api/v1/auth/pat` directly. |
 
 ## Orchestrator integration
 

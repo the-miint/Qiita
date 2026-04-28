@@ -1,12 +1,13 @@
 """Auth endpoints — /auth/whoami, /auth/pat, /auth/tokens.
 
-Routes use the real `get_current_principal` resolver from Phase E. POST
-/auth/pat is the single route that requires a *fresh* OIDC JWT (auth_time
-within AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS) and bypasses the resolver
-because freshness is a per-route concern.
+Routes use the `get_current_principal` resolver. POST /auth/pat is the
+single route that requires a *fresh* OIDC JWT (auth_time within
+AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS) and bypasses the resolver because
+freshness is a per-route concern.
 
 POST /auth/login (the OIDC code-exchange callback for the CLI flow) is
-deferred to Phase J — needs an OIDC test harness for code-exchange.
+not yet implemented — building it requires an OIDC code-exchange test
+harness that does not yet exist.
 """
 
 import time
@@ -195,10 +196,10 @@ async def mint_pat(
             },
         )
 
-    # Scope validation against the role ceiling. Per the plan's design note,
-    # the rejection response does NOT echo the caller's full ceiling — the
-    # caller already knows it via /auth/whoami; echoing it per-request would
-    # leak ceiling structure to a probing attacker.
+    # Scope validation against the role ceiling. The rejection response
+    # deliberately does NOT echo the caller's full ceiling — the caller
+    # already knows it via /auth/whoami; echoing it per-request would leak
+    # ceiling structure to a probing attacker.
     role = user_row["system_role"]
     ceiling = role_ceiling(role)
     if body.scopes is None:

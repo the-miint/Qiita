@@ -1,10 +1,9 @@
 """Integration tests for `auth.principal.get_current_principal`.
 
 Each test mounts a small ad-hoc FastAPI app with a single /resolve endpoint
-that calls the resolver dep and returns a JSON view of the result. The
-production routes don't yet use get_current_principal (Phase H.b flips
-references; Phase F adds /auth/*) — testing it through a dedicated test
-endpoint isolates resolver behavior from route logic.
+that calls the resolver dep and returns a JSON view of the result. Testing
+the resolver through a dedicated test endpoint isolates its behaviour from
+route logic.
 """
 
 import asyncio

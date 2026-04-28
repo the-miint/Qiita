@@ -40,7 +40,8 @@ ALTER TABLE qiita.principal
 -- SYSTEM PRINCIPAL (seeded at idx=1)
 -- =============================================================================
 -- The system principal acts as:
---   * Backfill target for pre-auth historical FKs (Phase H.a).
+--   * Backfill target for pre-auth historical FKs (e.g.
+--     `qiita.references.created_by_idx`).
 --   * Audit-event "actor" for system-generated events (e.g., automatic
 --     token revocation on retirement, fired by a DB trigger).
 -- It is neither a user nor a service_account (no subtype row exists for it,
@@ -233,12 +234,12 @@ CREATE TRIGGER principal_retire_revoke_tokens
 
 -- migrate:down
 -- The system principal seed is removed here so that 'down then up' cycles
--- back to a clean state during development. Once Phase H.a lands and adds
--- qiita.references.created_by_idx as an FK to idx=1, this DELETE will fail
--- with a foreign-key error until Phase H.a is also down — which is the
--- standard sequential-down expectation. The dependency is therefore
--- captured implicitly by FK enforcement rather than by a leave-it-in-place
--- comment that breaks the down/up loop.
+-- back to a clean state during development. Later migrations FK other rows
+-- to idx=1 (e.g. `qiita.references.created_by_idx`); when those exist this
+-- DELETE will fail with a foreign-key error until they are taken down too,
+-- which is the standard sequential-down expectation. The dependency is
+-- therefore captured implicitly by FK enforcement rather than by a
+-- leave-it-in-place comment that breaks the down/up loop.
 
 DROP TRIGGER IF EXISTS principal_retire_revoke_tokens ON qiita.principal;
 DROP FUNCTION IF EXISTS qiita.tg_revoke_tokens_on_retire();

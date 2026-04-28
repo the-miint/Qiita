@@ -218,9 +218,9 @@ async def test_verify_rejects_token_for_retired_principal(postgres_pool, princip
         label="for-retired",
         scopes=[],
     )
-    # Retiring also auto-revokes via the trigger from Phase A — verify still
-    # rejects, but the rejection reason is "revoked", not "retired". Either
-    # way, verify returns None.
+    # Retiring also auto-revokes via the `tg_revoke_tokens_on_retire`
+    # trigger — verify still rejects, but the rejection reason is "revoked",
+    # not "retired". Either way, verify returns None.
     await postgres_pool.execute(
         "UPDATE qiita.principal SET"
         "  retired = true, retired_at = now(), retired_by_idx = 1"

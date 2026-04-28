@@ -1,9 +1,8 @@
-"""Integration tests for /api/v1/users (Phase H.b — real auth).
+"""Integration tests for /api/v1/users.
 
-Phase B used the mock get_current_principal_idx; Phase H.b flipped POST
-/users to system_admin + admin:users and GET/PATCH /users/me to require_human
-+ self:profile. Tests now use the session admin PAT for admin-flow calls
-and the regular-user PAT for self-management calls.
+POST /users is gated by system_admin + admin:users; GET/PATCH /users/me
+require require_human + self:profile. Tests use the session admin PAT
+for admin-flow calls and the regular-user PAT for self-management calls.
 """
 
 import pytest
@@ -63,7 +62,7 @@ async def _create_user(client, *, display_name, email, **extra):
 
 
 # ---------------------------------------------------------------------------
-# POST /users (admin-only after Phase H.b)
+# POST /users (admin-only)
 # ---------------------------------------------------------------------------
 
 

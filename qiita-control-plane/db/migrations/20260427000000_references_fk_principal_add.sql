@@ -1,13 +1,12 @@
 -- migrate:up
--- Phase H.a: add a nullable created_by_idx FK to qiita.principal alongside
--- the existing created_by UUID column. The new column is populated for
--- pre-existing rows by a single UPDATE backfill to the system principal
--- (idx=1, seeded by 20260426000000_auth.sql); new INSERTs from route
--- handlers will use real principal_idx values once Phase H.b flips the
--- routes to dual-write.
+-- Add a nullable created_by_idx FK to qiita.principal alongside the legacy
+-- created_by UUID column. Pre-existing rows are populated by a single
+-- UPDATE backfill to the system principal (idx=1, seeded by
+-- 20260426000000_auth.sql); new INSERTs from route handlers carry real
+-- principal_idx values via the dual-write path.
 --
--- This step is fully reversible: H.a's migrate:down drops the column.
--- Phase H.b dual-writes both columns; Phase H.c finalises by setting
+-- This step is fully reversible: migrate:down drops the column. The
+-- companion migration 20260427000001 finalises by setting
 -- created_by_idx NOT NULL and dropping the legacy created_by UUID column.
 ALTER TABLE qiita.references
     ADD COLUMN created_by_idx BIGINT REFERENCES qiita.principal(idx);

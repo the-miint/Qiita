@@ -58,8 +58,7 @@ async def test_create_reference_returns_201(client, human_admin_session):
     assert body["reference_idx"] > 0
     assert body["status"] == "pending"
     assert body["name"] == "test-ref-create"
-    # Phase H.c: created_by_idx is the canonical owner (legacy created_by
-    # UUID column was dropped).
+    # created_by_idx is the canonical owner reference.
     assert body["created_by_idx"] == human_admin_session["principal_idx"]
     assert "created_by" not in body
 

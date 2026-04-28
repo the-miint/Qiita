@@ -1,8 +1,8 @@
 """Scope catalog and role-implied ceilings.
 
 `VALID_SCOPES` is the closed set of scope strings the mint path validates
-against (Phase C). `ROLE_IMPLIED_SCOPES` is the *hierarchical* per-role
-ceiling: each entry is the **full** set, not the increment, with
+against. `ROLE_IMPLIED_SCOPES` is the *hierarchical* per-role ceiling:
+each entry is the **full** set, not the increment, with
 system_admin ⊇ wet_lab_admin ⊇ user. Service accounts have a separate
 non-inherited ceiling because workers don't fit the human hierarchy.
 """

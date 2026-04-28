@@ -1,4 +1,4 @@
-"""Tests for the user-management Pydantic models (Phase B)."""
+"""Tests for the user-management Pydantic models."""
 
 from datetime import UTC, datetime
 

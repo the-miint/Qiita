@@ -19,10 +19,10 @@ class Settings:
     database_url: str
     hmac_secret_key: bytes
     data_plane_url: str
-    # AuthRocket OIDC fields (Phase D). Optional in Settings — required only
-    # at AuthRocketVerifier construction time, which is wired into lifespan
-    # in Phase F. Letting them default to None here keeps tests that don't
-    # exercise the auth path from having to set every AUTHROCKET_* env var.
+    # AuthRocket OIDC fields. Optional in Settings — required only at
+    # AuthRocketVerifier construction time, which is wired into lifespan.
+    # Letting them default to None here keeps tests that don't exercise
+    # the auth path from having to set every AUTHROCKET_* env var.
     authrocket_issuer: str | None = None
     authrocket_audience: str | None = None
     authrocket_jwks_url: str | None = None

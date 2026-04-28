@@ -1,4 +1,4 @@
-"""Integration tests for /api/v1/admin/* (Phase G)."""
+"""Integration tests for /api/v1/admin/*."""
 
 import json
 

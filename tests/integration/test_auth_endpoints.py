@@ -1,4 +1,4 @@
-"""Integration tests for /api/v1/auth/* (Phase F).
+"""Integration tests for /api/v1/auth/*.
 
 The control-plane app is mounted with a real OIDC verifier (backed by the
 JwksHarness fixture from conftest) and the test postgres pool. Each test

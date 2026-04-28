@@ -1,11 +1,9 @@
 """Reference management routes.
 
-Every route is wired to the real principal resolver and guards from
-Phase E. POST /references uses created_by_idx (BIGINT FK to qiita.principal)
-as the canonical owner reference; the legacy created_by UUID column was
-dropped in Phase H.c. GET /references/{id} stays anonymous-OK
-(`get_current_principal` directly, no guard); other routes pin to scope
-and kind constraints per the plan.
+Every route is wired to the principal resolver and guards. POST /references
+uses created_by_idx (BIGINT FK to qiita.principal) as the canonical owner
+reference. GET /references/{id} stays anonymous-OK (`get_current_principal`
+directly, no guard); other routes pin to scope and kind constraints.
 """
 
 import asyncio
@@ -98,7 +96,7 @@ async def get_reference(
 ) -> ReferenceResponse:
     """Anonymous-OK. Returns the full ReferenceResponse including
     created_by_idx; row-level visibility (e.g., hiding private references'
-    owner) is the follow-up plan, not Phase H."""
+    owner) is not yet implemented."""
     row = await pool.fetchrow(
         f"SELECT {_REFERENCE_RETURNING} FROM qiita.references WHERE reference_idx = $1",
         reference_idx,
@@ -333,7 +331,7 @@ async def create_doget_ticket(
 
     Authorization is scope-only at this layer: any principal with
     `tickets:doget` can request a ticket. Row-level visibility (private
-    references) is deferred to the follow-up plan.
+    references) is not yet implemented.
     """
     if body.table not in _DOGET_ALLOWED_TABLES:
         raise HTTPException(

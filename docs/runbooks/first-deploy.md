@@ -118,5 +118,4 @@ install -m 0400 -o qiita -g qiita /dev/stdin /etc/qiita/orchestrator.token <<<"$
 ## 9. Start the orchestrator
 
 The orchestrator reads `/etc/qiita/orchestrator.token` at startup. See
-`docs/runbooks/orchestrator-token-rotation.md` (Phase I) for the rotation
-flow.
+`docs/runbooks/orchestrator-token-rotation.md` for the rotation flow.

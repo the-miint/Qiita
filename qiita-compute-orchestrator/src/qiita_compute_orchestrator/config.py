@@ -12,8 +12,8 @@ class Settings:
     control_plane_url: str
     backend_type: str
     shared_filesystem_root: str
-    # Phase I auth: exactly one of these is populated. api_token_path is the
-    # default / production path (file mode 0400 owned by the qiita user).
+    # Exactly one of these is populated. api_token_path is the default /
+    # production path (file mode 0400 owned by the qiita user).
     # api_token (env var) is the dev/CI escape hatch, only honoured when
     # QIITA_ALLOW_TOKEN_ENV=true.
     api_token_path: Path | None

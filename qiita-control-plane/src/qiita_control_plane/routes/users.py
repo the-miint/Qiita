@@ -1,7 +1,5 @@
 """User management routes — operates on the qiita.user subtype.
 
-Phase H.b: every route uses the real Phase E guards.
-
 - POST /users        — admin creates a user (system_admin + admin:users).
                        In production the OIDC resolver creates users on
                        first login; this route remains for admins to

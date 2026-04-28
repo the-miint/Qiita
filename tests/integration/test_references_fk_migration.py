@@ -1,9 +1,10 @@
-"""Tests for the references.created_by_idx FK migration (Phase H.a → H.c).
+"""Tests for the references.created_by_idx FK migration.
 
-H.a added the nullable BIGINT FK and backfilled. H.b dual-wrote both columns
-from the route layer. H.c (this commit) finalised: NOT NULL on created_by_idx
-and DROP of the legacy created_by UUID column. By the time this test runs,
-both migrations are applied and the assertions reflect the final state.
+The first migration added the nullable BIGINT FK and backfilled rows to
+the system principal; the route layer then dual-wrote both columns; the
+final migration set NOT NULL on created_by_idx and dropped the legacy
+created_by UUID column. By the time this test runs, both migrations are
+applied and the assertions reflect the final state.
 """
 
 import asyncpg
@@ -11,7 +12,7 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# Final column shape (post-H.c)
+# Final column shape
 # ---------------------------------------------------------------------------
 
 
@@ -27,13 +28,13 @@ async def test_created_by_idx_is_not_null(postgres_pool):
 
 
 async def test_legacy_created_by_column_dropped(postgres_pool):
-    """Phase H.c dropped the legacy created_by UUID column."""
+    """The finalize migration dropped the legacy created_by UUID column."""
     row = await postgres_pool.fetchval(
         "SELECT 1 FROM information_schema.columns"
         " WHERE table_schema = 'qiita' AND table_name = 'references'"
         "   AND column_name = 'created_by'"
     )
-    assert row is None, "qiita.references.created_by should have been dropped in H.c"
+    assert row is None, "qiita.references.created_by should have been dropped"
 
 
 async def test_column_has_fk_to_principal(postgres_pool):
@@ -72,7 +73,7 @@ async def test_no_cascade_on_delete(postgres_pool):
 
 
 # ---------------------------------------------------------------------------
-# Behavior post-H.c
+# Behavior post-migration
 # ---------------------------------------------------------------------------
 
 
@@ -122,7 +123,7 @@ async def test_rejects_fk_to_nonexistent_principal(postgres_pool):
 
 
 async def test_insert_without_created_by_idx_rejected(postgres_pool):
-    """Phase H.c made the column NOT NULL — omitting it raises."""
+    """The finalize migration made the column NOT NULL — omitting it raises."""
     async with postgres_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
@@ -144,13 +145,14 @@ async def test_insert_without_created_by_idx_rejected(postgres_pool):
 
 
 def test_get_current_user_no_longer_importable():
-    """Phase H.c deleted the mock auth helpers from deps.py."""
+    """The mock auth helpers were deleted from deps.py once the real
+    resolver landed."""
     import importlib
 
     deps = importlib.import_module("qiita_control_plane.deps")
     assert not hasattr(deps, "get_current_user"), (
-        "get_current_user should be removed from deps.py in Phase H.c"
+        "get_current_user should be removed from deps.py"
     )
     assert not hasattr(deps, "get_current_principal_idx"), (
-        "get_current_principal_idx should be removed from deps.py in Phase H.c"
+        "get_current_principal_idx should be removed from deps.py"
     )

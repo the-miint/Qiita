@@ -77,14 +77,14 @@ def test_token_revoke_all_calls_correct_url(monkeypatch):
 
 
 def test_main_login_returns_2_with_actionable_message(capsys):
-    """Login is deferred — must exit nonzero with a clear message rather
-    than appearing to succeed."""
+    """Login is not implemented — must exit nonzero with a clear message
+    rather than appearing to succeed."""
     from qiita_control_plane.cli.admin import main
 
     rc = main(["login"])
     assert rc == 2
     err = capsys.readouterr().err
-    assert "deferred" in err.lower()
+    assert "not yet implemented" in err.lower()
     assert "/auth/pat" in err
 
 

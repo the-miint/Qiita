@@ -66,7 +66,7 @@ def test_valid_scopes_is_frozen():
     from qiita_control_plane.auth.scopes import VALID_SCOPES
 
     assert isinstance(VALID_SCOPES, frozenset)
-    # Spot-check a few — full coverage is in the role/scope tests in Phase E.
+    # Spot-check a few — full coverage lives in the role/scope tests.
     assert "references:read" in VALID_SCOPES
     assert "admin:users" in VALID_SCOPES
     assert "self:profile" in VALID_SCOPES
@@ -81,7 +81,7 @@ def test_verified_token_dataclass_is_frozen():
 
 
 def test_module_exports():
-    """Phase C public surface must be importable from auth.tokens."""
+    """Public surface must be importable from auth.tokens."""
     from qiita_control_plane.auth.tokens import (
         VerifiedToken,
         mint_api_token,

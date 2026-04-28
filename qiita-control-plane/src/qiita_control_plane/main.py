@@ -25,7 +25,7 @@ async def lifespan(app: FastAPI):
     settings = Settings.from_env()
     app.state.pool = await get_pool(settings.database_url)
     app.state.settings = settings
-    # Phase E: build the OIDC verifier eagerly when AUTHROCKET_* is set.
+    # Build the OIDC verifier eagerly when AUTHROCKET_* is set.
     # AuthRocketVerifier.from_settings raises on missing env, which makes
     # a misconfigured prod boot fail fast. Tests inject their own verifier
     # into app.state.oidc_verifier directly via the JWKS harness.

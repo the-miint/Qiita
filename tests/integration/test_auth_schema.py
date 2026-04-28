@@ -1,7 +1,7 @@
 """Tests for auth schema — user / service_account subtypes of principal,
 api_tokens, auth_events, plus the disabled flag added to principal.
 
-The Phase A migration adds:
+The auth migration adds:
 - ALTER TABLE qiita.principal: disabled flag + audit cols + CHECK constraints
 - Seed: system principal at idx=1
 - New tables: qiita.user, qiita.user_identities, qiita.service_account,

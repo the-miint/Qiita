@@ -7,8 +7,8 @@ kinds:
   - Anonymous   — no Authorization header
 
 The resolver dispatches by Authorization-header shape:
-  - "Bearer qk_..."         → token path (Phase C verifier)
-  - "Bearer eyJ...x.y.z"    → OIDC path (Phase D verifier + first-login UPSERT)
+  - "Bearer qk_..."         → token path (opaque-token verifier)
+  - "Bearer eyJ...x.y.z"    → OIDC path (JWT verifier + first-login UPSERT)
   - "Bearer <other>"        → 401 malformed
   - missing / non-Bearer    → Anonymous
 
@@ -384,8 +384,8 @@ async def _build_human_user(
     pool: asyncpg.Pool, principal_idx: int, *, scopes: frozenset[str] | None
 ) -> HumanUser:
     """Load a HumanUser from the DB. `scopes` is None for OIDC-resolved users
-    (they get the full role-implied ceiling at this layer; Phase F's PAT
-    mint validates per-token scopes), or a token's scope set when arriving
+    (they get the full role-implied ceiling at this layer; the PAT mint
+    route validates per-token scopes), or a token's scope set when arriving
     via the token path.
     """
     row = await pool.fetchrow(
@@ -400,9 +400,9 @@ async def _build_human_user(
         raise HTTPException(status_code=401, detail="user record not found for principal")
     if row["disabled"] or row["retired"]:
         raise HTTPException(status_code=401, detail=MSG_PRINCIPAL_DISABLED_OR_RETIRED)
-    # For OIDC-derived sessions we hand back the role's full ceiling. Phase F
-    # narrows this when minting PATs; per-request bearers carry their own
-    # scope set via the token path.
+    # For OIDC-derived sessions we hand back the role's full ceiling. The
+    # PAT mint route narrows this when minting PATs; per-request bearers
+    # carry their own scope set via the token path.
     if scopes is None:
         from .scopes import role_ceiling
 

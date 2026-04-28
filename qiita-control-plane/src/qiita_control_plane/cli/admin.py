@@ -7,9 +7,9 @@ Subcommands:
                      to operate on the system principal (idx=1).
   whoami           — calls GET /api/v1/auth/whoami via the configured PAT.
   token revoke-all — calls POST /api/v1/admin/principals/{idx}/revoke-all-tokens.
-  login            — DEFERRED to Phase J. The full PKCE + code-exchange
-                     flow needs an OIDC test harness for code-exchange that
-                     isn't built yet. For now, obtain an AuthRocket JWT
+  login            — not yet implemented. The full PKCE + code-exchange
+                     flow needs an OIDC code-exchange test harness that
+                     does not yet exist. For now, obtain an AuthRocket JWT
                      out-of-band and call POST /api/v1/auth/pat directly.
 
 Authentication for HTTP subcommands: read PAT from QIITA_TOKEN env var or
@@ -182,7 +182,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_login = sub.add_parser(
         "login",
-        help="OIDC PKCE login (DEFERRED — see Phase J)",
+        help="OIDC PKCE login (not yet implemented — see module docstring)",
     )
     p_login.add_argument(
         "--token-file",
@@ -222,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "login":
         print(
-            "qiita-admin login is deferred to Phase J. For now: obtain an"
+            "qiita-admin login is not yet implemented. For now: obtain an"
             f" AuthRocket JWT out-of-band and call POST {API_PREFIX}/auth/pat to"
             f" mint a PAT, then write it to {args.token_file} (mode 0600).",
             file=sys.stderr,

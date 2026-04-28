@@ -1,8 +1,9 @@
 -- migrate:up
--- Phase H.c: finalise the FK migration. By this point Phase H.b's dual-write
--- has been running long enough that every row has a non-NULL created_by_idx
--- (or was backfilled by H.a). We can therefore commit to created_by_idx as
--- the canonical creator reference and drop the legacy UUID column.
+-- Finalise the FK migration. By this point the dual-write path has been
+-- running long enough that every row has a non-NULL created_by_idx (or
+-- was backfilled by 20260427000000). We can therefore commit to
+-- created_by_idx as the canonical creator reference and drop the legacy
+-- UUID column.
 --
 -- This is the irreversible end of the migration window — recovering the
 -- legacy column from a backup means joining against the principal table to

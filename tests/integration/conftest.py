@@ -303,8 +303,8 @@ async def regular_user_session(postgres_pool):
 @pytest_asyncio.fixture(scope="session")
 async def compute_worker_service_account(postgres_pool, tmp_path_factory):
     """Provision a service-account-kind principal with worker scopes and
-    write its token to a tmp file. Reused by the orchestrator-auth tests
-    in Phase I; the file path is the canonical drop-in for the production
+    write its token to a tmp file. Reused by the orchestrator-auth tests;
+    the file path is the canonical drop-in for the production
     `/etc/qiita/orchestrator.token` location.
 
     Idempotent across pytest sessions: if a previous run created the

@@ -52,7 +52,6 @@ class ReferenceResponse(BaseModel):
     version: str
     kind: ReferenceKind
     status: ReferenceStatus
-    # Phase H.c: the legacy `created_by` UUID column has been dropped.
     # `created_by_idx` is the canonical owner reference, FK to qiita.principal.
     created_by_idx: Annotated[int, Field(gt=0)]
     created_at: AwareDatetime
@@ -123,16 +122,12 @@ class DoGetTicketResponse(BaseModel):
 
 
 # ============================================================================
-# Auth: user-management models (Phase B)
+# Auth: user-management models
 # ============================================================================
 
 
 class UserCreate(BaseModel):
-    """Body for POST /api/v1/users — admin creates a user.
-
-    Phase B uses the existing mock auth dep; the route flips to real auth
-    in Phase H.b.
-    """
+    """Body for POST /api/v1/users — admin creates a user."""
 
     display_name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     email: EmailStr
@@ -172,7 +167,7 @@ class UserResponse(BaseModel):
 
 
 # ============================================================================
-# Auth: API token mint / list models (Phase F)
+# Auth: API token mint / list models
 # ============================================================================
 
 
@@ -215,7 +210,7 @@ class ApiTokenSummary(BaseModel):
 
 
 # ============================================================================
-# Auth: admin-surface models (Phase G)
+# Auth: admin-surface models
 # ============================================================================
 
 

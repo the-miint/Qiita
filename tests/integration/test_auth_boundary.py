@@ -1,7 +1,6 @@
-"""Auth boundary matrix for Phase H.b-flipped routes.
+"""Auth boundary matrix for guarded routes.
 
-Each route flipped from the legacy mock to real guards in Phase H.b is
-exercised against the standard negative-case set:
+Every guarded route is exercised against the standard negative-case set:
     (no_auth, 401) — no Authorization header
     (wrong_role / wrong_kind, 403) — authenticated but wrong role/kind
     (wrong_scope, 403) — authenticated but token lacks required scope
