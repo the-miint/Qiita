@@ -13,8 +13,6 @@ Install once at application startup:
     logging.getLogger().addFilter(AuthorizationScrubFilter())
 """
 
-from __future__ import annotations
-
 import logging
 import re
 

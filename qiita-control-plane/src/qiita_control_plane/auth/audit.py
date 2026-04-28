@@ -12,8 +12,6 @@ Forbidden behaviors caught at write time:
 - String values shaped like a JWT: starting with `ey` and containing two dots
 """
 
-from __future__ import annotations
-
 import hashlib
 import json
 import re

@@ -23,8 +23,6 @@ paths — verify_api_token already filters by these flags, and the OIDC
 upsert refuses to construct a Principal for a (disabled OR retired) row.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 import asyncpg

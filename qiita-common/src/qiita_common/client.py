@@ -1,7 +1,5 @@
 """REST client for service-to-service calls to the control plane."""
 
-from __future__ import annotations
-
 from pathlib import Path
 
 import httpx

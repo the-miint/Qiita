@@ -7,8 +7,6 @@ system_admin ⊇ wet_lab_admin ⊇ user. Service accounts have a separate
 non-inherited ceiling because workers don't fit the human hierarchy.
 """
 
-from __future__ import annotations
-
 from collections.abc import Mapping
 
 from qiita_common.auth_constants import Scope, SystemRole

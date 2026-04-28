@@ -19,8 +19,6 @@ the OIDCIdentity (or None if absent). Callers that need freshness
 (POST /auth/pat) check `now - auth_time` against their own threshold.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any
 

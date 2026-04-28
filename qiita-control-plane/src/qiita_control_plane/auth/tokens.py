@@ -7,8 +7,6 @@ disabled/retired status. last_used_at writes are fire-and-forget and
 coalesced to ≤1/min/token at the predicate level.
 """
 
-from __future__ import annotations
-
 import asyncio
 import hashlib
 import logging

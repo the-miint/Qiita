@@ -16,8 +16,6 @@ Authentication for HTTP subcommands: read PAT from QIITA_TOKEN env var or
 from ~/.qiita/token (mode 0600 expected).
 """
 
-from __future__ import annotations
-
 import argparse
 import asyncio
 import json

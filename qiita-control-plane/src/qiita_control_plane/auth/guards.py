@@ -12,8 +12,6 @@ Each guard depends on `get_current_principal`, so FastAPI dedupes the
 underlying resolution per-request even when many guards compose.
 """
 
-from __future__ import annotations
-
 from collections.abc import Callable
 
 from fastapi import Depends, HTTPException
