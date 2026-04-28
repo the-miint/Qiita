@@ -35,6 +35,8 @@ _USER_RETURNING_COLS = (
     " receive_processing_emails, profile_complete, created_at, updated_at"
 )
 
+_MSG_NO_USER_PROFILE = "Authenticated principal has no user profile"
+
 
 @router.post("", status_code=201)
 async def create_user(
@@ -102,7 +104,7 @@ async def get_me(
     if row is None:
         raise HTTPException(
             status_code=404,
-            detail="Authenticated principal has no user profile",
+            detail=_MSG_NO_USER_PROFILE,
         )
     return UserResponse.model_validate(dict(row))
 
@@ -133,6 +135,6 @@ async def patch_me(
         if rows_affected(result) == 0:
             raise HTTPException(
                 status_code=404,
-                detail="Authenticated principal has no user profile",
+                detail=_MSG_NO_USER_PROFILE,
             )
     return await get_me(pool=pool, user=user)

@@ -57,6 +57,8 @@ _CHUNK_SIZE = 10_000
 
 _REFERENCE_RETURNING = "reference_idx, name, version, kind, status, created_by_idx, created_at"
 
+_MSG_REFERENCE_NOT_FOUND = "Reference not found"
+
 
 @router.post("", status_code=201)
 async def create_reference(
@@ -102,7 +104,7 @@ async def get_reference(
         reference_idx,
     )
     if row is None:
-        raise HTTPException(status_code=404, detail="Reference not found")
+        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
     return ReferenceResponse(**dict(row))
 
 
@@ -143,7 +145,7 @@ async def update_reference_status(
         reference_idx,
     )
     if current is None:
-        raise HTTPException(status_code=404, detail="Reference not found")
+        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
     raise HTTPException(
         status_code=409,
         detail=f"Cannot transition from {current!r} to {target_status!r}",
@@ -173,7 +175,7 @@ async def mint_features(
             reference_idx,
         )
         if ref is None:
-            raise HTTPException(status_code=404, detail="Reference not found")
+            raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
         raise HTTPException(
             status_code=409,
             detail=f"Reference status is {ref['status']!r}, must be 'hashing' or 'minting'",
@@ -345,7 +347,7 @@ async def create_doget_ticket(
         reference_idx,
     )
     if status is None:
-        raise HTTPException(status_code=404, detail="Reference not found")
+        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
     if status != "active":
         raise HTTPException(
             status_code=409,
@@ -380,7 +382,7 @@ async def register_files(
         reference_idx,
     )
     if status is None:
-        raise HTTPException(status_code=404, detail="Reference not found")
+        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
     if status != "loading":
         raise HTTPException(
             status_code=409,

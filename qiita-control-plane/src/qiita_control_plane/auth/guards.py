@@ -28,6 +28,11 @@ from .principal import (
 
 _MSG_AUTH_REQUIRED = "authentication required"
 
+
+def _msg_requires_role(role: str) -> str:
+    return f"requires system_role at least {role!r}"
+
+
 # ---------------------------------------------------------------------------
 # Kind guards
 # ---------------------------------------------------------------------------
@@ -85,7 +90,7 @@ def require_role_at_least(role: str) -> Callable[..., Principal]:
         if not p.has_role_at_least(role_str):
             raise HTTPException(
                 status_code=403,
-                detail=f"requires system_role at least {role_str!r}",
+                detail=_msg_requires_role(role_str),
             )
         return p
 
@@ -108,7 +113,7 @@ def require_human_with_role(role: str) -> Callable[..., HumanUser]:
         if not user.has_role_at_least(role_str):
             raise HTTPException(
                 status_code=403,
-                detail=f"requires system_role at least {role_str!r}",
+                detail=_msg_requires_role(role_str),
             )
         return user
 
