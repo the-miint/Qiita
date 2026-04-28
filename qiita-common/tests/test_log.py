@@ -67,3 +67,78 @@ def test_filter_passes_records_through():
         exc_info=None,
     )
     assert f.filter(record) is True
+
+
+def test_install_authorization_scrub_catches_propagated_records():
+    """Records emitted at a named logger propagate to root handlers and
+    must be scrubbed there. Regression for the prior install pattern,
+    which attached the filter to the root logger directly and only
+    caught records originating at root — Python's logging module skips
+    ancestor-logger filters on propagation.
+    """
+    from qiita_common.log import install_authorization_scrub
+
+    root = logging.getLogger()
+    captured: list[str] = []
+
+    class CaptureHandler(logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    handler = CaptureHandler()
+    saved_handlers = root.handlers[:]
+    saved_level = root.level
+    root.handlers = [handler]
+    root.setLevel(logging.DEBUG)
+    try:
+        install_authorization_scrub()
+        logging.getLogger("propagation-fixture").info(
+            "Authorization: Bearer qk_PROPAGATED" + "X" * 40
+        )
+    finally:
+        root.handlers = saved_handlers
+        root.setLevel(saved_level)
+
+    assert len(captured) == 1
+    assert "qk_PROPAGATED" not in captured[0]
+    assert "<redacted>" in captured[0]
+
+
+def test_install_authorization_scrub_is_idempotent():
+    """Calling install twice on the same handler doesn't add a duplicate
+    filter — handlers that already carry the filter are skipped."""
+    from qiita_common.log import (
+        AuthorizationScrubFilter,
+        install_authorization_scrub,
+    )
+
+    root = logging.getLogger()
+    handler = logging.Handler()
+    saved_handlers = root.handlers[:]
+    root.handlers = [handler]
+    try:
+        install_authorization_scrub()
+        install_authorization_scrub()
+        scrub_filters = [f for f in handler.filters if isinstance(f, AuthorizationScrubFilter)]
+        assert len(scrub_filters) == 1
+    finally:
+        root.handlers = saved_handlers
+
+
+def test_install_authorization_scrub_targets_passed_logger():
+    """When called with an explicit logger, install attaches to that
+    logger's handlers rather than root."""
+    from qiita_common.log import (
+        AuthorizationScrubFilter,
+        install_authorization_scrub,
+    )
+
+    target = logging.getLogger("install-target-fixture")
+    handler = logging.Handler()
+    saved = target.handlers[:]
+    target.handlers = [handler]
+    try:
+        install_authorization_scrub(target)
+        assert any(isinstance(f, AuthorizationScrubFilter) for f in handler.filters)
+    finally:
+        target.handlers = saved
