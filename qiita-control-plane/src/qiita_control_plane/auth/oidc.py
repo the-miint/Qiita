@@ -56,7 +56,7 @@ class JwtVerifier:
         jwks_url: str,
         issuer: str,
         audience: str,
-        leeway_seconds: int = 30,
+        leeway_seconds: int,
     ) -> None:
         if not jwks_url:
             raise ValueError("jwks_url is required")

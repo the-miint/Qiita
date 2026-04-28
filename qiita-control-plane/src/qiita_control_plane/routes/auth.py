@@ -15,12 +15,18 @@ from datetime import UTC, datetime, timedelta
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
+from qiita_common.auth_constants import (
+    BEARER_PREFIX,
+    AuthEventType,
+    Scope,
+)
 from qiita_common.models import (
     ApiTokenMintRequest,
     ApiTokenMintResponse,
     ApiTokenSummary,
 )
 
+from ..auth import TOKEN_PREFIX
 from ..auth.audit import record_event
 from ..auth.oidc import InvalidJwt, JwtVerifier
 from ..auth.principal import (
@@ -122,10 +128,10 @@ async def mint_pat(
     verifier = _get_oidc_verifier(request)
 
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
+    if not auth.startswith(BEARER_PREFIX):
         raise HTTPException(status_code=401, detail="OIDC JWT required")
-    bearer = auth[len("Bearer ") :].strip()
-    if bearer.startswith("qk_"):
+    bearer = auth[len(BEARER_PREFIX) :].strip()
+    if bearer.startswith(TOKEN_PREFIX):
         raise HTTPException(
             status_code=401,
             detail="PAT mint requires an OIDC JWT, not an existing API token",
@@ -240,7 +246,7 @@ async def mint_pat(
 
     await record_event(
         pool,
-        event_type="token_mint",
+        event_type=AuthEventType.TOKEN_MINT,
         principal_idx=user_row["principal_idx"],
         actor_principal_idx=user_row["principal_idx"],  # self-mint
         detail={"token_idx": token_idx, "scopes": scopes, "kind": "pat"},
@@ -270,7 +276,7 @@ async def list_own_tokens(
     Anonymous: 401. Both HumanUser and ServiceAccount can list their own."""
     if isinstance(p, Anonymous):
         raise HTTPException(status_code=401, detail="authentication required")
-    if not p.has_scope("self:tokens"):
+    if not p.has_scope(Scope.SELF_TOKENS):
         raise HTTPException(status_code=403, detail="missing required scope 'self:tokens'")
 
     rows = await pool.fetch(
@@ -301,7 +307,7 @@ async def revoke_own_token(
     """
     if isinstance(p, Anonymous):
         raise HTTPException(status_code=401, detail="authentication required")
-    if not p.has_scope("self:tokens"):
+    if not p.has_scope(Scope.SELF_TOKENS):
         raise HTTPException(status_code=403, detail="missing required scope 'self:tokens'")
 
     # Atomic UPDATE WHERE — only revokes if owner matches and token is not
@@ -329,7 +335,7 @@ async def revoke_own_token(
 
     await record_event(
         pool,
-        event_type="token_revoke",
+        event_type=AuthEventType.TOKEN_REVOKE,
         principal_idx=p.principal_idx,
         actor_principal_idx=p.principal_idx,
         detail={"token_idx": token_idx, "reason": "self_revoke"},

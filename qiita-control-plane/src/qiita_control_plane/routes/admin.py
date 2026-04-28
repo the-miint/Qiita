@@ -10,6 +10,14 @@ from datetime import UTC, datetime, timedelta
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
+from qiita_common.auth_constants import (
+    AUDIT_QUERY_DEFAULT_LIMIT,
+    AUDIT_QUERY_MAX_LIMIT,
+    SYSTEM_PRINCIPAL_IDX,
+    AuthEventType,
+    Scope,
+    SystemRole,
+)
 from qiita_common.models import (
     AuthEventResponse,
     PrincipalDisabledUpdate,
@@ -33,6 +41,8 @@ from ..deps import get_db_pool
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
+_MSG_PRINCIPAL_NOT_FOUND = "principal not found"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -53,8 +63,8 @@ def _decode_detail(raw) -> dict:
 async def create_service_account(
     body: ServiceAccountCreate,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    actor: HumanUser = Depends(require_human_with_role("system_admin")),
-    _scope: Principal = Depends(require_scope("admin:service_accounts")),
+    actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_SERVICE_ACCOUNTS)),
 ) -> ServiceAccountCreateResponse | JSONResponse:
     """Create a service-account-kind principal and mint its initial token.
 
@@ -91,8 +101,9 @@ async def create_service_account(
                 principal_idx = await conn.fetchval(
                     "INSERT INTO qiita.principal"
                     "  (display_name, system_role, created_by_idx)"
-                    " VALUES ($1, 'user', $2) RETURNING idx",
+                    " VALUES ($1, $2, $3) RETURNING idx",
                     body.name,
+                    SystemRole.USER,
                     actor.principal_idx,
                 )
                 await conn.execute(
@@ -113,7 +124,7 @@ async def create_service_account(
                 )
                 await record_event(
                     conn,
-                    event_type="token_mint",
+                    event_type=AuthEventType.TOKEN_MINT,
                     principal_idx=principal_idx,
                     actor_principal_idx=actor.principal_idx,
                     detail={
@@ -151,13 +162,13 @@ async def set_principal_disabled(
     principal_idx: int,
     body: PrincipalDisabledUpdate,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    actor: HumanUser = Depends(require_human_with_role("system_admin")),
-    _scope: Principal = Depends(require_scope("admin:users")),
+    actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_USERS)),
 ):
     """Toggle disabled state. `disabled=true` sets the audit columns;
     `disabled=false` clears them (round-trip back to active). The DB CHECK
     `principal_disabled_consistent` ensures atomicity."""
-    if principal_idx == 1:
+    if principal_idx == SYSTEM_PRINCIPAL_IDX:
         raise HTTPException(status_code=403, detail="cannot disable system principal")
 
     if body.disabled:
@@ -194,7 +205,7 @@ async def set_principal_disabled(
             principal_idx,
         )
         if row is None:
-            raise HTTPException(status_code=404, detail="principal not found")
+            raise HTTPException(status_code=404, detail=_MSG_PRINCIPAL_NOT_FOUND)
         if row["retired"]:
             raise HTTPException(status_code=409, detail="principal is retired (terminal)")
         # Already in target state → idempotent success.
@@ -202,7 +213,9 @@ async def set_principal_disabled(
 
     await record_event(
         pool,
-        event_type="principal_disabled" if body.disabled else "principal_enabled",
+        event_type=(
+            AuthEventType.PRINCIPAL_DISABLED if body.disabled else AuthEventType.PRINCIPAL_ENABLED
+        ),
         principal_idx=principal_idx,
         actor_principal_idx=actor.principal_idx,
         detail={"reason": body.reason} if body.disabled else {},
@@ -219,14 +232,14 @@ async def retire_principal(
     principal_idx: int,
     body: PrincipalRetiredUpdate,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    actor: HumanUser = Depends(require_human_with_role("system_admin")),
-    _scope: Principal = Depends(require_scope("admin:users")),
+    actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_USERS)),
 ):
     """Retirement is terminal. The DB trigger revokes all the principal's
     active tokens automatically. An admin cannot retire themselves (refuses
     to leave zero active system_admins is enforced by application logic
     here — the DB trigger doesn't know roles)."""
-    if principal_idx == 1:
+    if principal_idx == SYSTEM_PRINCIPAL_IDX:
         raise HTTPException(status_code=403, detail="cannot retire system principal")
 
     if actor.principal_idx == principal_idx:
@@ -250,13 +263,13 @@ async def retire_principal(
             "SELECT retired FROM qiita.principal WHERE idx = $1", principal_idx
         )
         if row is None:
-            raise HTTPException(status_code=404, detail="principal not found")
+            raise HTTPException(status_code=404, detail=_MSG_PRINCIPAL_NOT_FOUND)
         # Already retired → idempotent success.
         return
 
     await record_event(
         pool,
-        event_type="principal_retired",
+        event_type=AuthEventType.PRINCIPAL_RETIRED,
         principal_idx=principal_idx,
         actor_principal_idx=actor.principal_idx,
         detail={"reason": body.reason},
@@ -273,19 +286,19 @@ async def set_principal_system_role(
     principal_idx: int,
     body: PrincipalSystemRoleUpdate,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    actor: HumanUser = Depends(require_human_with_role("system_admin")),
-    _scope: Principal = Depends(require_scope("admin:users")),
+    actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_USERS)),
 ):
     """Set the principal's system_role. The DB enum validates the value;
-    Pydantic's Literal narrows it before we hit the DB."""
-    if principal_idx == 1:
+    Pydantic's SystemRole StrEnum narrows it before we hit the DB."""
+    if principal_idx == SYSTEM_PRINCIPAL_IDX:
         raise HTTPException(status_code=403, detail="cannot modify system principal's role")
 
     old_role = await pool.fetchval(
         "SELECT system_role FROM qiita.principal WHERE idx = $1", principal_idx
     )
     if old_role is None:
-        raise HTTPException(status_code=404, detail="principal not found")
+        raise HTTPException(status_code=404, detail=_MSG_PRINCIPAL_NOT_FOUND)
 
     await pool.execute(
         "UPDATE qiita.principal SET system_role = $1 WHERE idx = $2",
@@ -295,7 +308,7 @@ async def set_principal_system_role(
 
     await record_event(
         pool,
-        event_type="system_role_change",
+        event_type=AuthEventType.SYSTEM_ROLE_CHANGE,
         principal_idx=principal_idx,
         actor_principal_idx=actor.principal_idx,
         detail={"from": old_role, "to": body.system_role, "reason": body.reason},
@@ -310,11 +323,11 @@ async def set_principal_system_role(
 @router.get("/audit")
 async def get_audit_log(
     pool: asyncpg.Pool = Depends(get_db_pool),
-    _role: HumanUser = Depends(require_human_with_role("system_admin")),
-    _scope: Principal = Depends(require_scope("admin:audit_read")),
+    _role: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_AUDIT_READ)),
     principal_idx: int | None = Query(default=None),
     event_type: str | None = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=1000),
+    limit: int = Query(default=AUDIT_QUERY_DEFAULT_LIMIT, ge=1, le=AUDIT_QUERY_MAX_LIMIT),
 ) -> list[AuthEventResponse]:
     """List audit events, newest first. Optional filters by principal_idx
     and event_type."""
@@ -355,7 +368,7 @@ async def get_audit_log(
 async def revoke_all_principal_tokens(
     principal_idx: int,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    actor: HumanUser = Depends(require_human_with_role("system_admin")),
+    actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
 ) -> RevokeAllTokensResponse:
     """Bulk-revoke every active token belonging to the target principal.
 
@@ -378,7 +391,7 @@ async def revoke_all_principal_tokens(
         " ELSE 'bare' END",
         principal_idx,
     )
-    required_scope = "admin:users" if kind == "user" else "admin:service_accounts"
+    required_scope = Scope.ADMIN_USERS if kind == "user" else Scope.ADMIN_SERVICE_ACCOUNTS
     if kind == "bare":
         # No subtype row, so no tokens either — but still surface 404 instead
         # of silently succeeding so the caller's intent is verified.
@@ -386,11 +399,11 @@ async def revoke_all_principal_tokens(
             "SELECT 1 FROM qiita.principal WHERE idx = $1", principal_idx
         )
         if not principal_exists:
-            raise HTTPException(status_code=404, detail="principal not found")
+            raise HTTPException(status_code=404, detail=_MSG_PRINCIPAL_NOT_FOUND)
     if not actor.has_scope(required_scope):
         raise HTTPException(
             status_code=403,
-            detail=f"missing required scope {required_scope!r} for {kind}-kind principal",
+            detail=f"missing required scope {str(required_scope)!r} for {kind}-kind principal",
         )
 
     rows = await pool.fetch(
@@ -412,7 +425,7 @@ async def revoke_all_principal_tokens(
     for tidx in revoked_idxs:
         await record_event(
             pool,
-            event_type="token_revoke",
+            event_type=AuthEventType.TOKEN_REVOKE,
             principal_idx=principal_idx,
             actor_principal_idx=actor.principal_idx,
             detail={"token_idx": tidx, "reason": "admin_bulk"},

@@ -20,13 +20,18 @@ import re
 from collections.abc import Iterable
 from typing import Any
 
+from qiita_common.auth_constants import AuthEventType
+
+from . import TOKEN_PREFIX
+
 # Forbidden top-level keys in detail. Case-insensitive match.
 _FORBIDDEN_KEYS = frozenset({"token", "plaintext", "bearer", "jwt"})
 
 # Substring patterns: we want to catch tokens embedded inside larger strings
 # (e.g. a misguided log message like "revoking qk_..."), not just strings that
-# ARE the token. Bias toward false-positives, not false-negatives.
-_QK_TOKEN_SHAPE = re.compile(r"qk_[A-Za-z0-9_\-]{30,}")
+# ARE the token. Bias toward false-positives, not false-negatives — the lower
+# bound is well below TOKEN_BODY_LEN deliberately.
+_QK_TOKEN_SHAPE = re.compile(rf"{re.escape(TOKEN_PREFIX)}[A-Za-z0-9_\-]{{30,}}")
 # JWT-shape: "ey" (base64url of "{") followed by header.payload.signature.
 _JWT_SHAPE = re.compile(r"\bey[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\b")
 
@@ -62,7 +67,7 @@ def sha256_hex(s: str) -> str:
 async def record_event(
     pool_or_conn,
     *,
-    event_type: str,
+    event_type: AuthEventType | str,
     principal_idx: int | None = None,
     actor_principal_idx: int | None = None,
     detail: dict[str, Any] | None = None,
@@ -76,6 +81,11 @@ async def record_event(
     `pool_or_conn` accepts either an asyncpg.Pool or a Connection — the same
     `.fetchval(...)` API works for both, so callers can write inside an
     existing transaction by passing the connection.
+
+    `event_type` accepts `AuthEventType | str`: the StrEnum is preferred for
+    new emit sites; bare strings are kept on the API surface for read-side
+    paths that pass through the value from the DB row (where the column is
+    TEXT and may contain an event type added in a future schema revision).
     """
     detail = detail or {}
     _check_for_leaks(detail)
@@ -84,7 +94,7 @@ async def record_event(
         "INSERT INTO qiita.auth_events"
         "  (event_type, principal_idx, actor_principal_idx, detail)"
         " VALUES ($1, $2, $3, $4::jsonb) RETURNING event_idx",
-        event_type,
+        str(event_type),
         principal_idx,
         actor_principal_idx,
         payload,

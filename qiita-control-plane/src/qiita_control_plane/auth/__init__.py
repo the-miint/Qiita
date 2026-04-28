@@ -8,7 +8,13 @@ Total length 46. The body is `secrets.token_urlsafe(32)` (32 random bytes
 encoded as 43 url-safe base64 chars without padding). Plaintext is shown
 exactly once at mint time and never logged. The DB stores SHA-256(plaintext)
 in qiita.api_tokens.token_hash (BYTEA, 32 bytes, UNIQUE).
+
+`BEARER_PREFIX` is re-exported from `qiita_common.auth_constants` so token
+verification and JWT bearer parsing use the same canonical literal across the
+two packages.
 """
+
+from qiita_common.auth_constants import BEARER_PREFIX  # noqa: F401 — re-export
 
 # Prefix is grep-friendly for leak scanners.
 TOKEN_PREFIX = "qk_"

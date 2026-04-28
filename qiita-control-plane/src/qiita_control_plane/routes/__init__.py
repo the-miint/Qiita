@@ -1,13 +1,14 @@
 """Control plane API routes."""
 
 from fastapi import APIRouter
+from qiita_common.auth_constants import API_PREFIX
 
 from .admin import router as admin_router
 from .auth import router as auth_router
 from .references import router as references_router
 from .users import router as users_router
 
-api_router = APIRouter(prefix="/api/v1")
+api_router = APIRouter(prefix=API_PREFIX)
 api_router.include_router(references_router)
 api_router.include_router(users_router)
 api_router.include_router(auth_router)

@@ -15,6 +15,7 @@ Phase H.b: every route uses the real Phase E guards.
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
+from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import UserCreate, UserResponse, UserUpdate
 
 from ..auth.guards import (
@@ -38,8 +39,8 @@ _USER_RETURNING_COLS = (
 async def create_user(
     body: UserCreate,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    actor: HumanUser = Depends(require_human_with_role("system_admin")),
-    _scope: Principal = Depends(require_scope("admin:users")),
+    actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_USERS)),
 ) -> UserResponse:
     """Admin creates a new principal + user row in one transaction.
 
@@ -52,8 +53,9 @@ async def create_user(
                 principal_idx = await conn.fetchval(
                     "INSERT INTO qiita.principal"
                     "  (display_name, system_role, created_by_idx)"
-                    " VALUES ($1, 'user', $2) RETURNING idx",
+                    " VALUES ($1, $2, $3) RETURNING idx",
                     body.display_name,
+                    SystemRole.USER,
                     actor.principal_idx,
                 )
                 user_row = await conn.fetchrow(
@@ -109,7 +111,7 @@ async def patch_me(
     body: UserUpdate,
     pool: asyncpg.Pool = Depends(get_db_pool),
     user: HumanUser = Depends(require_human),
-    _scope: Principal = Depends(require_scope("self:profile")),
+    _scope: Principal = Depends(require_scope(Scope.SELF_PROFILE)),
 ) -> UserResponse:
     """Update the authenticated user's profile.
 

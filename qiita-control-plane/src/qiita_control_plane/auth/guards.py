@@ -26,6 +26,8 @@ from .principal import (
     get_current_principal,
 )
 
+_MSG_AUTH_REQUIRED = "authentication required"
+
 # ---------------------------------------------------------------------------
 # Kind guards
 # ---------------------------------------------------------------------------
@@ -37,7 +39,7 @@ def require_human(
     """Returns the principal if it's a HumanUser; 401 if Anonymous,
     403 if a ServiceAccount tried to use a humans-only route."""
     if isinstance(p, Anonymous):
-        raise HTTPException(status_code=401, detail="authentication required")
+        raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
     if not isinstance(p, HumanUser):
         raise HTTPException(
             status_code=403,
@@ -52,7 +54,7 @@ def require_service(
     """Returns the principal if it's a ServiceAccount; 401 if Anonymous,
     403 if a HumanUser tried to use a workers-only route."""
     if isinstance(p, Anonymous):
-        raise HTTPException(status_code=401, detail="authentication required")
+        raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
     if not isinstance(p, ServiceAccount):
         raise HTTPException(
             status_code=403,
@@ -69,15 +71,21 @@ def require_service(
 def require_role_at_least(role: str) -> Callable[..., Principal]:
     """Factory: returns a dep that 401s on Anonymous, 403s on insufficient
     role (including ServiceAccounts, which always fail role checks because
-    they don't fit the human hierarchy)."""
+    they don't fit the human hierarchy).
+
+    `role` accepts either a SystemRole member or its bare string value.
+    Normalised to `str(role)` at factory time so the 403 detail renders
+    `'system_admin'` not `<SystemRole.SYSTEM_ADMIN: 'system_admin'>`.
+    """
+    role_str = str(role)
 
     def _dep(p: Principal = Depends(get_current_principal)) -> Principal:
         if isinstance(p, Anonymous):
-            raise HTTPException(status_code=401, detail="authentication required")
-        if not p.has_role_at_least(role):
+            raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
+        if not p.has_role_at_least(role_str):
             raise HTTPException(
                 status_code=403,
-                detail=f"requires system_role at least {role!r}",
+                detail=f"requires system_role at least {role_str!r}",
             )
         return p
 
@@ -94,12 +102,13 @@ def require_human_with_role(role: str) -> Callable[..., HumanUser]:
     role authority AND human context (most admin endpoints + admin-side
     POST /users), this is the cleaner combinator.
     """
+    role_str = str(role)
 
     def _dep(user: HumanUser = Depends(require_human)) -> HumanUser:
-        if not user.has_role_at_least(role):
+        if not user.has_role_at_least(role_str):
             raise HTTPException(
                 status_code=403,
-                detail=f"requires system_role at least {role!r}",
+                detail=f"requires system_role at least {role_str!r}",
             )
         return user
 
@@ -108,15 +117,20 @@ def require_human_with_role(role: str) -> Callable[..., HumanUser]:
 
 def require_scope(scope: str) -> Callable[..., Principal]:
     """Factory: returns a dep that 401s on Anonymous, 403s if the principal's
-    token scope set does not include `scope`."""
+    token scope set does not include `scope`.
+
+    Accepts a Scope member or bare string; normalised so the 403 detail
+    renders `'self:tokens'` not `<Scope.SELF_TOKENS: 'self:tokens'>`.
+    """
+    scope_str = str(scope)
 
     def _dep(p: Principal = Depends(get_current_principal)) -> Principal:
         if isinstance(p, Anonymous):
-            raise HTTPException(status_code=401, detail="authentication required")
-        if not p.has_scope(scope):
+            raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
+        if not p.has_scope(scope_str):
             raise HTTPException(
                 status_code=403,
-                detail=f"missing required scope {scope!r}",
+                detail=f"missing required scope {scope_str!r}",
             )
         return p
 

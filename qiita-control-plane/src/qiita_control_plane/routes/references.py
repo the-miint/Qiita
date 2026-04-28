@@ -18,6 +18,7 @@ import asyncpg
 import pyarrow.flight as _flight
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import Field
+from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     VALID_STATUS_TRANSITIONS,
     DoGetTicketRequest,
@@ -62,7 +63,7 @@ async def create_reference(
     body: ReferenceCreateRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
     user: HumanUser = Depends(require_complete_profile),
-    _scope: Principal = Depends(require_scope("references:write")),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCES_WRITE)),
 ) -> ReferenceResponse:
     """Create a reference. Humans only — service-kind principals can only
     mint features and register files into existing references."""
@@ -110,7 +111,7 @@ async def update_reference_status(
     reference_idx: Annotated[int, Field(gt=0)],
     body: ReferenceStatusUpdate,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    _scope: Principal = Depends(require_scope("references:write")),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCES_WRITE)),
 ) -> ReferenceResponse:
     target_status = body.status
 
@@ -155,7 +156,7 @@ async def mint_features(
     body: FeatureMintRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
     _service: ServiceAccount = Depends(require_service),
-    _scope: Principal = Depends(require_scope("features:mint")),
+    _scope: Principal = Depends(require_scope(Scope.FEATURES_MINT)),
 ) -> FeatureMintResponse:
     # Atomic status transition: hashing -> minting, or verify already minting.
     # Uses UPDATE ... WHERE to avoid TOCTOU race between concurrent callers.
@@ -319,7 +320,7 @@ async def create_doget_ticket(
     body: DoGetTicketRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
     hmac_secret: bytes = Depends(get_hmac_secret),
-    _scope: Principal = Depends(require_scope("tickets:doget")),
+    _scope: Principal = Depends(require_scope(Scope.TICKETS_DOGET)),
 ) -> DoGetTicketResponse:
     """Sign a DoGet ticket scoped to a reference.
 
@@ -367,7 +368,7 @@ async def register_files(
     hmac_secret: bytes = Depends(get_hmac_secret),
     data_plane_url: str = Depends(get_data_plane_url),
     _service: ServiceAccount = Depends(require_service),
-    _scope: Principal = Depends(require_scope("references:register_files")),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCES_REGISTER_FILES)),
 ) -> RegisterFilesResponse:
     """Register Parquet files in DuckLake via the data plane's DoAction.
 

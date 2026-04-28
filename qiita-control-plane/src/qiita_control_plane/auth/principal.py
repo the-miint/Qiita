@@ -29,12 +29,21 @@ from dataclasses import dataclass
 
 import asyncpg
 from fastapi import HTTPException, Request
+from qiita_common.auth_constants import (
+    BEARER_PREFIX,
+    SYSTEM_PRINCIPAL_IDX,
+    AuthEventType,
+    SystemRole,
+)
 
+from . import TOKEN_PREFIX
 from .audit import record_event, sha256_hex
 from .oidc import InvalidJwt, JwtVerifier
 from .tokens import verify_api_token
 
-_ROLE_ORDER = {"user": 0, "wet_lab_admin": 1, "system_admin": 2}
+_ROLE_ORDER = {SystemRole.USER: 0, SystemRole.WET_LAB_ADMIN: 1, SystemRole.SYSTEM_ADMIN: 2}
+
+_MSG_PRINCIPAL_DISABLED_OR_RETIRED = "principal disabled or retired"
 
 
 class Principal:
@@ -103,9 +112,6 @@ class Anonymous(Principal):
 # ---------------------------------------------------------------------------
 
 
-_BEARER = "Bearer "
-
-
 def _looks_like_jwt(s: str) -> bool:
     """Cheap structural check: a JWT has exactly two dots separating
     header.payload.signature segments. We delegate the actual signature
@@ -125,15 +131,15 @@ async def get_current_principal(request: Request) -> Principal:
     arrives but the OIDC verifier is not configured.
     """
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith(_BEARER):
+    if not auth.startswith(BEARER_PREFIX):
         return Anonymous()
-    bearer = auth[len(_BEARER) :].strip()
+    bearer = auth[len(BEARER_PREFIX) :].strip()
     if not bearer:
         return Anonymous()
 
     pool = _get_pool(request)
 
-    if bearer.startswith("qk_"):
+    if bearer.startswith(TOKEN_PREFIX):
         return await _resolve_token(pool, bearer)
     if _looks_like_jwt(bearer):
         verifier = _get_oidc_verifier(request)
@@ -232,7 +238,7 @@ async def _resolve_oidc(pool: asyncpg.Pool, verifier: JwtVerifier, bearer: str) 
     )
     if existing is not None:
         if existing["disabled"] or existing["retired"]:
-            raise HTTPException(status_code=401, detail="principal disabled or retired")
+            raise HTTPException(status_code=401, detail=_MSG_PRINCIPAL_DISABLED_OR_RETIRED)
         await _handle_email_drift(pool, existing["principal_idx"], identity.email)
         return await _build_human_user(pool, existing["principal_idx"], scopes=None)
 
@@ -255,8 +261,10 @@ async def _create_human_from_oidc(pool: asyncpg.Pool, identity) -> Principal:
                 principal_idx = await conn.fetchval(
                     "INSERT INTO qiita.principal"
                     "  (display_name, system_role, created_by_idx)"
-                    " VALUES ($1, 'user', 1) RETURNING idx",
+                    " VALUES ($1, $2, $3) RETURNING idx",
                     identity.email,
+                    SystemRole.USER,
+                    SYSTEM_PRINCIPAL_IDX,
                 )
                 await conn.execute(
                     "INSERT INTO qiita.user (principal_idx, email) VALUES ($1, $2)",
@@ -273,7 +281,7 @@ async def _create_human_from_oidc(pool: asyncpg.Pool, identity) -> Principal:
                 )
                 await record_event(
                     conn,
-                    event_type="oidc_create_principal",
+                    event_type=AuthEventType.OIDC_CREATE_PRINCIPAL,
                     principal_idx=principal_idx,
                     detail={"issuer": identity.issuer},
                 )
@@ -300,7 +308,7 @@ async def _create_human_from_oidc(pool: asyncpg.Pool, identity) -> Principal:
                 return await _build_human_user(pool, row["principal_idx"], scopes=None)
             await record_event(
                 pool,
-                event_type="oidc_create_principal_email_conflict",
+                event_type=AuthEventType.OIDC_CREATE_PRINCIPAL_EMAIL_CONFLICT,
                 detail={
                     "issuer": identity.issuer,
                     "attempted_email_sha256": sha256_hex(identity.email),
@@ -336,7 +344,7 @@ async def _handle_email_drift(pool: asyncpg.Pool, principal_idx: int, jwt_email:
         )
         await record_event(
             pool,
-            event_type="email_drift",
+            event_type=AuthEventType.EMAIL_DRIFT,
             principal_idx=principal_idx,
             detail={"outcome": "updated", "from": current, "to": jwt_email},
         )
@@ -346,7 +354,7 @@ async def _handle_email_drift(pool: asyncpg.Pool, principal_idx: int, jwt_email:
         # cleartext attempted email by reading their own audit.
         await record_event(
             pool,
-            event_type="email_drift",
+            event_type=AuthEventType.EMAIL_DRIFT,
             principal_idx=principal_idx,
             detail={
                 "outcome": "collision",
@@ -374,7 +382,7 @@ async def _build_human_user(
     if row is None:
         raise HTTPException(status_code=401, detail="user record not found for principal")
     if row["disabled"] or row["retired"]:
-        raise HTTPException(status_code=401, detail="principal disabled or retired")
+        raise HTTPException(status_code=401, detail=_MSG_PRINCIPAL_DISABLED_OR_RETIRED)
     # For OIDC-derived sessions we hand back the role's full ceiling. Phase F
     # narrows this when minting PATs; per-request bearers carry their own
     # scope set via the token path.

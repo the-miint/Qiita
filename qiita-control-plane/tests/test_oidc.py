@@ -218,6 +218,7 @@ def test_verify_rejects_wrong_issuer(jwks_harness):
         jwks_url=jwks_harness.jwks_url,
         issuer="http://different-issuer.example",
         audience="test-audience",
+        leeway_seconds=30,
     )
     with pytest.raises(InvalidJwt):
         v.verify(token)
@@ -375,21 +376,21 @@ def test_verifier_rejects_construction_with_empty_url():
     from qiita_control_plane.auth.oidc import JwtVerifier
 
     with pytest.raises(ValueError, match="jwks_url"):
-        JwtVerifier(jwks_url="", issuer="x", audience="y")
+        JwtVerifier(jwks_url="", issuer="x", audience="y", leeway_seconds=30)
 
 
 def test_verifier_rejects_construction_with_empty_issuer():
     from qiita_control_plane.auth.oidc import JwtVerifier
 
     with pytest.raises(ValueError, match="issuer"):
-        JwtVerifier(jwks_url="http://x", issuer="", audience="y")
+        JwtVerifier(jwks_url="http://x", issuer="", audience="y", leeway_seconds=30)
 
 
 def test_verifier_rejects_construction_with_empty_audience():
     from qiita_control_plane.auth.oidc import JwtVerifier
 
     with pytest.raises(ValueError, match="audience"):
-        JwtVerifier(jwks_url="http://x", issuer="y", audience="")
+        JwtVerifier(jwks_url="http://x", issuer="y", audience="", leeway_seconds=30)
 
 
 def test_authrocket_verifier_fails_fast_on_missing_settings(monkeypatch):

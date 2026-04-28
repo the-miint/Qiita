@@ -26,8 +26,19 @@ from pathlib import Path
 
 import asyncpg
 import httpx
+from qiita_common.auth_constants import API_PREFIX, SYSTEM_PRINCIPAL_IDX, SystemRole
 
 _TOKEN_FILE_DEFAULT = Path.home() / ".qiita" / "token"
+
+# Direct-DB connection timeout for the bootstrap subcommand. Short because the
+# DB is expected to be reachable on the operator's network; a multi-second
+# stall here masks misconfiguration.
+_DB_CONNECT_TIMEOUT_SECONDS = 5
+# HTTP timeout for CLI-driven control-plane calls. Generous enough to tolerate
+# transient network blips without papering over a hung server.
+_CLI_HTTP_TIMEOUT_SECONDS = 10
+
+_VALID_ROLE_VALUES = tuple(r.value for r in SystemRole)
 
 
 # ---------------------------------------------------------------------------
@@ -43,10 +54,10 @@ async def _set_system_role(database_url: str, email: str, role: str) -> int:
     email is not found (the operator probably hasn't logged in via OIDC
     yet, which is what creates the principal+user pair).
     """
-    if role not in {"user", "wet_lab_admin", "system_admin"}:
-        raise ValueError(f"role must be one of user / wet_lab_admin / system_admin (got {role!r})")
+    if role not in _VALID_ROLE_VALUES:
+        raise ValueError(f"role must be one of {' / '.join(_VALID_ROLE_VALUES)} (got {role!r})")
     try:
-        conn = await asyncpg.connect(database_url, timeout=5)
+        conn = await asyncpg.connect(database_url, timeout=_DB_CONNECT_TIMEOUT_SECONDS)
     except Exception as exc:  # noqa: BLE001 — show full reason, including OS errors
         raise RuntimeError(
             f"could not connect to DATABASE_URL: {type(exc).__name__}: {exc}"
@@ -62,8 +73,10 @@ async def _set_system_role(database_url: str, email: str, role: str) -> int:
                 " via OIDC at least once? First login creates the principal+user"
                 " rows; only then can their role be set."
             )
-        if idx == 1:
-            raise RuntimeError("refusing to modify the system principal (idx=1)")
+        if idx == SYSTEM_PRINCIPAL_IDX:
+            raise RuntimeError(
+                f"refusing to modify the system principal (idx={SYSTEM_PRINCIPAL_IDX})"
+            )
         await conn.execute(
             "UPDATE qiita.principal SET system_role = $1 WHERE idx = $2",
             role,
@@ -90,15 +103,15 @@ def _read_token(token_file: Path | None = None) -> str:
         return path.read_text().strip()
     raise RuntimeError(
         f"no PAT found — set QIITA_TOKEN or write a token to {path}"
-        " (use POST /api/v1/auth/pat to mint one)"
+        f" (use POST {API_PREFIX}/auth/pat to mint one)"
     )
 
 
 def _whoami(base_url: str, token: str) -> dict:
     resp = httpx.get(
-        f"{base_url.rstrip('/')}/api/v1/auth/whoami",
+        f"{base_url.rstrip('/')}{API_PREFIX}/auth/whoami",
         headers={"Authorization": f"Bearer {token}"},
-        timeout=10,
+        timeout=_CLI_HTTP_TIMEOUT_SECONDS,
     )
     resp.raise_for_status()
     return resp.json()
@@ -106,9 +119,9 @@ def _whoami(base_url: str, token: str) -> dict:
 
 def _token_revoke_all(base_url: str, token: str, principal_idx: int) -> dict:
     resp = httpx.post(
-        f"{base_url.rstrip('/')}/api/v1/admin/principals/{principal_idx}/revoke-all-tokens",
+        f"{base_url.rstrip('/')}{API_PREFIX}/admin/principals/{principal_idx}/revoke-all-tokens",
         headers={"Authorization": f"Bearer {token}"},
-        timeout=10,
+        timeout=_CLI_HTTP_TIMEOUT_SECONDS,
     )
     resp.raise_for_status()
     return resp.json()
@@ -136,7 +149,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_role.add_argument(
         "--role",
         required=True,
-        choices=["user", "wet_lab_admin", "system_admin"],
+        choices=list(_VALID_ROLE_VALUES),
     )
 
     sub.add_parser("whoami", help="Print the authenticated principal")
@@ -216,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "login":
         print(
             "qiita-admin login is deferred to Phase J. For now: obtain an"
-            " AuthRocket JWT out-of-band and call POST /api/v1/auth/pat to"
+            f" AuthRocket JWT out-of-band and call POST {API_PREFIX}/auth/pat to"
             f" mint a PAT, then write it to {args.token_file} (mode 0600).",
             file=sys.stderr,
         )

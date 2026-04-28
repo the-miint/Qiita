@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import asyncpg
+from qiita_common.auth_constants import LAST_USED_AT_COALESCE_INTERVAL
 
 from . import TOKEN_BODY_BYTES, TOKEN_HASH_BYTES, TOKEN_PREFIX, TOKEN_TOTAL_LEN
 from .scopes import VALID_SCOPES
@@ -136,7 +137,7 @@ async def record_token_use(pool: asyncpg.Pool, token_idx: int) -> None:
             "UPDATE qiita.api_tokens SET last_used_at = now()"
             " WHERE token_idx = $1"
             "   AND (last_used_at IS NULL"
-            "        OR last_used_at < now() - interval '1 minute')",
+            f"        OR last_used_at < now() - interval '{LAST_USED_AT_COALESCE_INTERVAL}')",
             token_idx,
         )
     except asyncpg.PostgresError:

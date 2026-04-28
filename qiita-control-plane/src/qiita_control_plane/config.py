@@ -6,6 +6,13 @@ from dataclasses import dataclass
 
 from qiita_common.config import require_env
 
+# Field defaults for the auth-related Settings knobs. Defined once at module
+# scope so the dataclass declaration and the from_env() env-var fallback
+# can't drift independently.
+_DEFAULT_JWT_LEEWAY_SECONDS = 30
+_DEFAULT_PAT_MAX_AUTH_AGE_SECONDS = 300
+_DEFAULT_TOKEN_TTL_DAYS = 90
+
 
 @dataclass(frozen=True, slots=True)
 class Settings:
@@ -19,9 +26,9 @@ class Settings:
     authrocket_issuer: str | None = None
     authrocket_audience: str | None = None
     authrocket_jwks_url: str | None = None
-    authrocket_jwt_leeway_seconds: int = 30
-    authrocket_pat_max_auth_age_seconds: int = 300
-    token_default_ttl_days: int = 90
+    authrocket_jwt_leeway_seconds: int = _DEFAULT_JWT_LEEWAY_SECONDS
+    authrocket_pat_max_auth_age_seconds: int = _DEFAULT_PAT_MAX_AUTH_AGE_SECONDS
+    token_default_ttl_days: int = _DEFAULT_TOKEN_TTL_DAYS
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -47,10 +54,15 @@ class Settings:
             authrocket_audience=os.environ.get("AUTHROCKET_AUDIENCE") or None,
             authrocket_jwks_url=jwks_url,
             authrocket_jwt_leeway_seconds=int(
-                os.environ.get("AUTHROCKET_JWT_LEEWAY_SECONDS", "30")
+                os.environ.get("AUTHROCKET_JWT_LEEWAY_SECONDS", str(_DEFAULT_JWT_LEEWAY_SECONDS))
             ),
             authrocket_pat_max_auth_age_seconds=int(
-                os.environ.get("AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS", "300")
+                os.environ.get(
+                    "AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS",
+                    str(_DEFAULT_PAT_MAX_AUTH_AGE_SECONDS),
+                )
             ),
-            token_default_ttl_days=int(os.environ.get("QIITA_TOKEN_DEFAULT_TTL_DAYS", "90")),
+            token_default_ttl_days=int(
+                os.environ.get("QIITA_TOKEN_DEFAULT_TTL_DAYS", str(_DEFAULT_TOKEN_TTL_DAYS))
+            ),
         )

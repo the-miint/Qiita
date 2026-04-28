@@ -80,7 +80,9 @@ def test_role_ceiling_helper_returns_correct_set():
 def test_role_ceiling_helper_raises_on_unknown_role():
     from qiita_control_plane.auth.scopes import role_ceiling
 
-    with pytest.raises(KeyError):
+    # ValueError comes from the SystemRole StrEnum constructor when the
+    # input doesn't match any enum value.
+    with pytest.raises(ValueError, match="super-duper-admin"):
         role_ceiling("super-duper-admin")
 
 

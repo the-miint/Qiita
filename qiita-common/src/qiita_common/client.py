@@ -6,6 +6,7 @@ from pathlib import Path
 
 import httpx
 
+from .auth_constants import API_PREFIX
 from .models import (
     DoGetTicketResponse,
     FeatureHashEntry,
@@ -14,6 +15,11 @@ from .models import (
     ReferenceStatus,
     RegisterFilesResponse,
 )
+
+# Default per-request HTTP timeout. Generous so a slow control-plane reply
+# doesn't get prematurely cancelled, but bounded so a hung server doesn't
+# block the orchestrator indefinitely.
+_CLIENT_HTTP_TIMEOUT_SECONDS = 30
 
 
 class ControlPlaneClient:
@@ -74,7 +80,7 @@ class ControlPlaneClient:
         else:
             self._http = httpx.AsyncClient(
                 base_url=base_url.rstrip("/"),
-                timeout=30,
+                timeout=_CLIENT_HTTP_TIMEOUT_SECONDS,
                 headers={"Authorization": f"Bearer {token}"},
             )
             self._owns_http = True
@@ -94,7 +100,7 @@ class ControlPlaneClient:
 
     async def create_reference(self, name: str, version: str, kind: str) -> ReferenceResponse:
         resp = await self._http.post(
-            "/api/v1/references",
+            f"{API_PREFIX}/references",
             json={"name": name, "version": version, "kind": kind},
         )
         resp.raise_for_status()
@@ -104,7 +110,7 @@ class ControlPlaneClient:
         self, reference_idx: int, status: ReferenceStatus
     ) -> ReferenceResponse:
         resp = await self._http.patch(
-            f"/api/v1/references/{reference_idx}/status",
+            f"{API_PREFIX}/references/{reference_idx}/status",
             json={"status": str(status)},
         )
         resp.raise_for_status()
@@ -114,7 +120,7 @@ class ControlPlaneClient:
         self, reference_idx: int, entries: list[FeatureHashEntry]
     ) -> FeatureMintResponse:
         resp = await self._http.post(
-            f"/api/v1/references/{reference_idx}/features/mint",
+            f"{API_PREFIX}/references/{reference_idx}/features/mint",
             json={"entries": [e.model_dump(mode="json") for e in entries]},
         )
         resp.raise_for_status()
@@ -127,7 +133,7 @@ class ControlPlaneClient:
         files: dict[str, str],
     ) -> RegisterFilesResponse:
         resp = await self._http.post(
-            f"/api/v1/references/{reference_idx}/register",
+            f"{API_PREFIX}/references/{reference_idx}/register",
             json={"staging_dir": staging_dir, "files": files},
         )
         resp.raise_for_status()
@@ -135,7 +141,7 @@ class ControlPlaneClient:
 
     async def get_doget_ticket(self, reference_idx: int, table: str) -> DoGetTicketResponse:
         resp = await self._http.post(
-            f"/api/v1/references/{reference_idx}/tickets/doget",
+            f"{API_PREFIX}/references/{reference_idx}/tickets/doget",
             json={"table": table},
         )
         resp.raise_for_status()

@@ -42,6 +42,7 @@ def _verifier(jwks_harness):
         jwks_url=jwks_harness.jwks_url,
         issuer=jwks_harness.issuer,
         audience="test-audience",
+        leeway_seconds=30,
     )
 
 
