@@ -4,7 +4,18 @@ from enum import StrEnum
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, EmailStr, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, EmailStr, Field, model_validator
+
+# `SystemRole` is re-exported so existing `from qiita_common.models import SystemRole`
+# imports keep working after the move to qiita_common.auth_constants.
+from qiita_common.auth_constants import (  # noqa: F401
+    MAX_NAME_LENGTH,
+    MAX_TABLE_NAME_LENGTH,
+    MAX_VERSION_LENGTH,
+    PAT_MAX_TTL_DAYS,
+    SERVICE_TOKEN_MAX_TTL_DAYS,
+    SystemRole,
+)
 
 # ORCID iD format: four groups of four digits separated by hyphens, with the
 # final character optionally being 'X' (the ISO 7064 mod-11-2 checksum).
@@ -30,8 +41,8 @@ ReferenceKind = Literal["sequence_reference", "taxonomy_authority"]
 
 
 class ReferenceCreateRequest(BaseModel):
-    name: str = Field(min_length=1, max_length=255)
-    version: str = Field(min_length=1, max_length=100)
+    name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
+    version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
     kind: ReferenceKind
 
 
@@ -104,7 +115,7 @@ class RegisterFilesResponse(BaseModel):
 
 
 class DoGetTicketRequest(BaseModel):
-    table: str = Field(min_length=1, max_length=64)
+    table: str = Field(min_length=1, max_length=MAX_TABLE_NAME_LENGTH)
 
 
 class DoGetTicketResponse(BaseModel):
@@ -123,7 +134,7 @@ class UserCreate(BaseModel):
     in Phase H.b.
     """
 
-    display_name: str = Field(min_length=1, max_length=255)
+    display_name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     email: EmailStr
     affiliation: str = ""
     address: str = ""
@@ -173,9 +184,9 @@ class ApiTokenMintRequest(BaseModel):
     `ttl_days=None` means "default to QIITA_TOKEN_DEFAULT_TTL_DAYS"; max 365.
     """
 
-    label: str = Field(min_length=1, max_length=255)
+    label: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     scopes: list[str] | None = None
-    ttl_days: Annotated[int, Field(gt=0, le=365)] | None = None
+    ttl_days: Annotated[int, Field(gt=0, le=PAT_MAX_TTL_DAYS)] | None = None
 
 
 class ApiTokenMintResponse(BaseModel):
@@ -208,9 +219,6 @@ class ApiTokenSummary(BaseModel):
 # ============================================================================
 
 
-SystemRole = Literal["user", "wet_lab_admin", "system_admin"]
-
-
 class ServiceAccountCreate(BaseModel):
     """Body for POST /api/v1/admin/service-accounts.
 
@@ -220,11 +228,11 @@ class ServiceAccountCreate(BaseModel):
     by an out-of-band runbook.
     """
 
-    name: str = Field(min_length=1, max_length=255)
+    name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     description: str | None = None
     scopes: list[str] = Field(min_length=1)
-    ttl_days: Annotated[int, Field(gt=0, le=3650)] | None = None
-    label: str = Field(min_length=1, max_length=255, default="initial")
+    ttl_days: Annotated[int, Field(gt=0, le=SERVICE_TOKEN_MAX_TTL_DAYS)] | None = None
+    label: str = Field(min_length=1, max_length=MAX_NAME_LENGTH, default="initial")
 
 
 class ServiceAccountCreateResponse(BaseModel):
@@ -264,7 +272,14 @@ class PrincipalRetiredUpdate(BaseModel):
 
 
 class PrincipalSystemRoleUpdate(BaseModel):
-    """Body for PATCH /api/v1/admin/principals/{idx}/system-role."""
+    """Body for PATCH /api/v1/admin/principals/{idx}/system-role.
+
+    `use_enum_values=True` so `model_dump()` returns the lowercase string
+    (e.g. `"user"`) rather than the `SystemRole` member — preserves the
+    JSON-serialised contract that pre-dated the StrEnum migration.
+    """
+
+    model_config = ConfigDict(use_enum_values=True)
 
     system_role: SystemRole
     reason: str | None = None
