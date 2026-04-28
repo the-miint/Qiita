@@ -1,8 +1,15 @@
 # First-deploy bootstrap
 
-This runbook covers bringing up a fresh deployment of the auth surface,
-from a clean database to a working orchestrator service account. Each step
-is independent — re-running it should be safe (idempotent) unless noted.
+**Purpose.** Operator runbook for bringing up the auth surface on a fresh
+deployment: from a clean database through migrations, env-var configuration,
+the first OIDC login, operator promotion to `system_admin`, and minting the
+orchestrator's service-account token. End state: control plane and
+orchestrator both authenticated and ready to serve traffic. Each step is
+independent — re-running it should be safe (idempotent) unless noted.
+
+For the conceptual reference (principal model, scopes, endpoints), see
+[`docs/auth.md`](../auth.md). For ongoing rotation of the token minted in
+step 8, see [`orchestrator-token-rotation.md`](orchestrator-token-rotation.md).
 
 ## 1. Apply migrations
 
@@ -112,8 +119,13 @@ curl -X POST https://localhost/api/v1/admin/service-accounts \
 Capture the plaintext token, then on the orchestrator host:
 
 ```bash
-install -m 0400 -o qiita -g qiita /dev/stdin /etc/qiita/orchestrator.token <<<"$TOKEN"
+./scripts/install-orchestrator-token.sh /etc/qiita/orchestrator.token <<<"$TOKEN"
 ```
+
+The script writes to `<target>.new` with mode `0400` / owner `qiita:qiita`
+and atomically renames over the target. See
+[`scripts/install-orchestrator-token.sh`](../../scripts/install-orchestrator-token.sh)
+for the exact behavior.
 
 ## 9. Start the orchestrator
 

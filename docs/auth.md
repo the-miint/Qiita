@@ -1,5 +1,7 @@
 # Authentication
 
+**Purpose.** This document is the reference for the Qiita authentication and authorization surface: the principal model and its DB schema, OIDC and opaque-token verification, scopes and roles, the auth/admin/user endpoints, and the `qiita-admin` CLI. Operational procedures (first deploy, token rotation) live under [`docs/runbooks/`](runbooks/) and are linked at the bottom.
+
 > **Known gap:** the OIDC PKCE code-exchange (`POST /auth/login` + `qiita-admin login`) is **not** shipped — building it requires a code-exchange test harness that does not yet exist. Today's path: operators obtain an AuthRocket JWT out-of-band (AuthRocket admin UI / external CLI) within `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS` of login, then call `POST /api/v1/auth/pat` directly to mint a PAT. The `qiita-admin login` subcommand currently exits with status 2 and a message pointing at this path. See `qiita-control-plane/src/qiita_control_plane/cli/admin.py::main` and the `routes/auth.py` module docstring.
 
 Qiita authenticates three kinds of principal against the control plane:
@@ -301,4 +303,4 @@ See [`docs/runbooks/first-deploy.md`](runbooks/first-deploy.md) for the full seq
 
 ## Token rotation
 
-See [`docs/runbooks/orchestrator-token-rotation.md`](runbooks/orchestrator-token-rotation.md) for the full zero-downtime rotation procedure: mint replacement → install at `*.token.new` → atomic `mv` → `systemctl reload` → wait for `last_used_at` to advance → revoke old.
+See [`docs/runbooks/orchestrator-token-rotation.md`](runbooks/orchestrator-token-rotation.md) for the full zero-downtime rotation procedure: mint replacement → `install-orchestrator-token.sh` (atomic write + `.previous` save) → `systemctl reload` → `wait-for-token-use.sh` (polls `last_used_at`) → revoke old.

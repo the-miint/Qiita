@@ -1,9 +1,15 @@
 # Orchestrator token rotation
 
-Service-account tokens for the orchestrator (and any cron job using
-`ControlPlaneClient`) rotate via the same path. The procedure is
-zero-downtime: in-flight requests complete with the old token; new
-requests use the new token.
+**Purpose.** Operator runbook for zero-downtime rotation of the
+orchestrator's service-account token (and any cron job using
+`ControlPlaneClient`, which follows the same path). In-flight requests
+complete with the old token; new requests use the new one. Use this for
+scheduled rotation, suspected compromise, or scope changes.
+
+For the initial mint of the orchestrator token, see
+[`first-deploy.md`](first-deploy.md). For the conceptual reference
+(token format, audit events, `ControlPlaneClient` resolution order), see
+[`docs/auth.md`](../auth.md).
 
 ## Prerequisites
 
@@ -39,21 +45,20 @@ requests use the new token.
    that subcommand lands. (Today, mint a fresh service account; the old one
    gets retired below.)
 
-2. **Stage the new token** on the orchestrator host:
+2. **Install the new token** atomically on the orchestrator host:
 
    ```bash
-   install -m 0400 -o qiita -g qiita /dev/stdin \
-       /etc/qiita/orchestrator.token.new <<<"$NEW_TOKEN"
+   ./scripts/install-orchestrator-token.sh \
+       /etc/qiita/orchestrator.token <<<"$NEW_TOKEN"
    ```
 
-3. **Atomically replace** the active file (same-filesystem `mv` is
-   atomic on POSIX):
+   The script stages at `<target>.new` (mode `0400`, owner `qiita:qiita`),
+   saves the prior contents at `<target>.previous` for the rollback path
+   below, and atomically renames over the target. POSIX same-filesystem
+   rename is atomic — readers see either the old or the new file, never
+   a partial one.
 
-   ```bash
-   mv /etc/qiita/orchestrator.token.new /etc/qiita/orchestrator.token
-   ```
-
-4. **Reload the orchestrator** so it re-reads the file:
+3. **Reload the orchestrator** so it re-reads the file:
 
    ```bash
    systemctl reload qiita-orchestrator
@@ -62,15 +67,21 @@ requests use the new token.
    The SIGHUP handler re-loads the file. In-flight HTTP calls finish
    with the old token; new calls use the new one.
 
-5. **Wait for new-token use** — the new token's `last_used_at` advances
-   within ~2 minutes (per the `record_token_use` coalescing window):
+4. **Wait for new-token use** — confirm the orchestrator has actually
+   exercised the new token before revoking the old one:
 
    ```bash
-   curl $CONTROL_PLANE_URL/api/v1/admin/audit?event_type=token_use \
-       -H "Authorization: Bearer qk_<ADMIN_PAT>" | jq '.[0]'
+   DATABASE_URL=postgresql://... \
+       ./scripts/wait-for-token-use.sh "$NEW_PRINCIPAL_IDX"
    ```
 
-6. **Revoke the old token**:
+   The script polls `qiita.api_tokens.last_used_at` for the new
+   principal until it advances (default timeout 3 minutes). DB-direct
+   rather than HTTP because `last_used_at` is intentionally not surfaced
+   as an audit event and `GET /auth/tokens` is caller-scoped only — see
+   the script header for the full rationale.
+
+5. **Revoke the old token**:
 
    ```bash
    qiita-admin token revoke-all --principal-idx <OLD_PRINCIPAL_IDX>
@@ -84,12 +95,14 @@ The orchestrator will hit 401 on every control-plane call. Roll back by:
 
 ```bash
 mv /etc/qiita/orchestrator.token /etc/qiita/orchestrator.token.bad
-mv /etc/qiita/orchestrator.token.previous /etc/qiita/orchestrator.token  # if you saved it
+mv /etc/qiita/orchestrator.token.previous /etc/qiita/orchestrator.token
 systemctl reload qiita-orchestrator
 ```
 
-(You should keep the previous token around for at least one rotation
-cycle for exactly this reason.)
+`install-orchestrator-token.sh` writes `<target>.previous` on every
+install, so the previous token is always present for one rotation cycle.
+After a successful rotation (step 5 complete), the `.previous` file is
+no longer needed and can be removed.
 
 ## Cron jobs
 
