@@ -1,9 +1,11 @@
 """Control plane FastAPI application."""
 
+import logging
 from contextlib import asynccontextmanager
 
 import asyncpg
 from fastapi import Depends, FastAPI
+from qiita_common.log import AuthorizationScrubFilter
 from qiita_common.models import HealthResponse
 
 from .auth.oidc import AuthRocketVerifier
@@ -15,6 +17,11 @@ from .routes import api_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Scrub `Authorization: Bearer ...` from every log record before any
+    # request handlers run. Idempotent on already-scrubbed text, so adding
+    # the filter once per lifespan is safe across test app reinstantiations.
+    logging.getLogger().addFilter(AuthorizationScrubFilter())
+
     settings = Settings.from_env()
     app.state.pool = await get_pool(settings.database_url)
     app.state.settings = settings
