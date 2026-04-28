@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import UserCreate, UserResponse, UserUpdate
 
-from ..auth.db import rows_affected
+from ..auth.db import insert_principal, rows_affected
 from ..auth.guards import (
     require_human,
     require_human_with_role,
@@ -53,13 +53,10 @@ async def create_user(
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
-                principal_idx = await conn.fetchval(
-                    "INSERT INTO qiita.principal"
-                    "  (display_name, system_role, created_by_idx)"
-                    " VALUES ($1, $2, $3) RETURNING idx",
-                    body.display_name,
-                    SystemRole.USER,
-                    actor.principal_idx,
+                principal_idx = await insert_principal(
+                    conn,
+                    display_name=body.display_name,
+                    created_by_idx=actor.principal_idx,
                 )
                 user_row = await conn.fetchrow(
                     "INSERT INTO qiita.user"

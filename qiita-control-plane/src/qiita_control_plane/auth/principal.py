@@ -39,12 +39,48 @@ from qiita_common.auth_constants import (
 from ..deps import get_db_pool
 from . import TOKEN_PREFIX
 from .audit import record_event, sha256_hex
+from .db import insert_principal
 from .oidc import InvalidJwt, JwtVerifier
 from .tokens import verify_api_token
 
 _ROLE_ORDER = {SystemRole.USER: 0, SystemRole.WET_LAB_ADMIN: 1, SystemRole.SYSTEM_ADMIN: 2}
 
 _MSG_PRINCIPAL_DISABLED_OR_RETIRED = "principal disabled or retired"
+
+
+def _human_user_from_row(row, *, scopes: frozenset[str]) -> HumanUser:
+    """Construct a HumanUser from a row exposing
+    `idx, email, system_role, profile_complete, disabled, retired`.
+
+    Both call sites (`_resolve_token` and `_build_human_user`) select these
+    columns; only the surrounding query and scopes-source differ.
+    """
+    return HumanUser(
+        principal_idx=row["idx"],
+        email=row["email"],
+        system_role=row["system_role"],
+        scopes=scopes,
+        profile_complete=row["profile_complete"],
+        disabled=row["disabled"],
+        retired=row["retired"],
+    )
+
+
+def _service_account_from_row(row, *, scopes: frozenset[str]) -> ServiceAccount:
+    """Construct a ServiceAccount from a row exposing
+    `idx, service_name, disabled, retired`.
+
+    `service_name` is the LEFT JOIN alias used by `_resolve_token`'s SELECT;
+    future loaders reading from `qiita.service_account` directly should
+    alias their `name` column the same way.
+    """
+    return ServiceAccount(
+        principal_idx=row["idx"],
+        name=row["service_name"],
+        scopes=scopes,
+        disabled=row["disabled"],
+        retired=row["retired"],
+    )
 
 
 class Principal:
@@ -193,23 +229,9 @@ async def _resolve_token(pool: asyncpg.Pool, plaintext: str) -> Principal:
         raise HTTPException(status_code=401, detail="principal not found")
 
     if row["email"] is not None:
-        return HumanUser(
-            principal_idx=row["idx"],
-            email=row["email"],
-            system_role=row["system_role"],
-            scopes=verified.scopes,
-            profile_complete=row["profile_complete"],
-            disabled=row["disabled"],
-            retired=row["retired"],
-        )
+        return _human_user_from_row(row, scopes=verified.scopes)
     if row["service_name"] is not None:
-        return ServiceAccount(
-            principal_idx=row["idx"],
-            name=row["service_name"],
-            scopes=verified.scopes,
-            disabled=row["disabled"],
-            retired=row["retired"],
-        )
+        return _service_account_from_row(row, scopes=verified.scopes)
     # Bare principal holding a token shouldn't happen (sentinel CHECK +
     # subtype creation is the only path that produces a token-bearing
     # principal in practice). Fail closed.
@@ -258,13 +280,10 @@ async def _create_human_from_oidc(pool: asyncpg.Pool, identity) -> Principal:
     async with pool.acquire() as conn:
         try:
             async with conn.transaction():
-                principal_idx = await conn.fetchval(
-                    "INSERT INTO qiita.principal"
-                    "  (display_name, system_role, created_by_idx)"
-                    " VALUES ($1, $2, $3) RETURNING idx",
-                    identity.email,
-                    SystemRole.USER,
-                    SYSTEM_PRINCIPAL_IDX,
+                principal_idx = await insert_principal(
+                    conn,
+                    display_name=identity.email,
+                    created_by_idx=SYSTEM_PRINCIPAL_IDX,
                 )
                 await conn.execute(
                     "INSERT INTO qiita.user (principal_idx, email) VALUES ($1, $2)",
@@ -390,12 +409,4 @@ async def _build_human_user(
         from .scopes import role_ceiling
 
         scopes = role_ceiling(row["system_role"])
-    return HumanUser(
-        principal_idx=row["idx"],
-        email=row["email"],
-        system_role=row["system_role"],
-        scopes=scopes,
-        profile_complete=row["profile_complete"],
-        disabled=row["disabled"],
-        retired=row["retired"],
-    )
+    return _human_user_from_row(row, scopes=scopes)

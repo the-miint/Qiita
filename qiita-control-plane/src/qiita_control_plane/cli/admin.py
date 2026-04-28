@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import asyncpg
@@ -127,6 +129,27 @@ def _token_revoke_all(base_url: str, token: str, principal_idx: int) -> dict:
     return resp.json()
 
 
+def _run_http_subcommand(call: Callable[[str], dict]) -> int:
+    """Token-read + httpx invoke + json print, common to every HTTP subcommand.
+
+    `call` accepts a PAT string and returns the parsed JSON body. Any
+    RuntimeError from token-read or HTTPStatusError from the request is
+    converted to a stderr message + exit code 1.
+    """
+    try:
+        token = _read_token()
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        body = call(token)
+    except httpx.HTTPStatusError as exc:
+        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        return 1
+    print(json.dumps(body, indent=2))
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # argparse entry point
 # ---------------------------------------------------------------------------
@@ -191,40 +214,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "whoami":
-        try:
-            token = _read_token()
-        except RuntimeError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 1
-        try:
-            body = _whoami(args.base_url, token)
-        except httpx.HTTPStatusError as exc:
-            print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
-            return 1
-        import json as _json
-
-        print(_json.dumps(body, indent=2))
-        return 0
+        return _run_http_subcommand(lambda t: _whoami(args.base_url, t))
 
     if args.cmd == "token":
         if args.token_cmd == "revoke-all":
-            try:
-                token = _read_token()
-            except RuntimeError as exc:
-                print(f"error: {exc}", file=sys.stderr)
-                return 1
-            try:
-                body = _token_revoke_all(args.base_url, token, args.principal_idx)
-            except httpx.HTTPStatusError as exc:
-                print(
-                    f"http error {exc.response.status_code}: {exc.response.text}",
-                    file=sys.stderr,
-                )
-                return 1
-            import json as _json
-
-            print(_json.dumps(body, indent=2))
-            return 0
+            return _run_http_subcommand(
+                lambda t: _token_revoke_all(args.base_url, t, args.principal_idx)
+            )
 
     if args.cmd == "login":
         print(

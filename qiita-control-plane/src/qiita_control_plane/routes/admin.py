@@ -29,7 +29,7 @@ from qiita_common.models import (
 )
 
 from ..auth.audit import AuthEvent, record_event, record_event_bulk
-from ..auth.db import rows_affected
+from ..auth.db import insert_principal, rows_affected
 from ..auth.guards import require_human_with_role, require_scope
 from ..auth.principal import HumanUser, Principal
 from ..auth.scopes import (
@@ -99,13 +99,10 @@ async def create_service_account(
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
-                principal_idx = await conn.fetchval(
-                    "INSERT INTO qiita.principal"
-                    "  (display_name, system_role, created_by_idx)"
-                    " VALUES ($1, $2, $3) RETURNING idx",
-                    body.name,
-                    SystemRole.USER,
-                    actor.principal_idx,
+                principal_idx = await insert_principal(
+                    conn,
+                    display_name=body.name,
+                    created_by_idx=actor.principal_idx,
                 )
                 await conn.execute(
                     "INSERT INTO qiita.service_account"

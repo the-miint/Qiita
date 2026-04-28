@@ -29,6 +29,7 @@ from qiita_common.models import (
 from ..auth import TOKEN_PREFIX
 from ..auth.audit import record_event
 from ..auth.db import rows_affected
+from ..auth.guards import require_scope
 from ..auth.oidc import InvalidJwt
 from ..auth.principal import (
     Anonymous,
@@ -261,16 +262,11 @@ async def mint_pat(
 
 @router.get("/tokens")
 async def list_own_tokens(
-    p: Principal = Depends(get_current_principal),
+    p: Principal = Depends(require_scope(Scope.SELF_TOKENS)),
     pool: asyncpg.Pool = Depends(get_db_pool),
 ) -> list[ApiTokenSummary]:
     """List the caller's own tokens. Metadata only — no plaintext, no hash.
     Anonymous: 401. Both HumanUser and ServiceAccount can list their own."""
-    if isinstance(p, Anonymous):
-        raise HTTPException(status_code=401, detail="authentication required")
-    if not p.has_scope(Scope.SELF_TOKENS):
-        raise HTTPException(status_code=403, detail="missing required scope 'self:tokens'")
-
     rows = await pool.fetch(
         "SELECT token_idx, label, scopes, expires_at, revoked_at,"
         "  last_used_at, created_at"
@@ -289,7 +285,7 @@ async def list_own_tokens(
 @router.delete("/tokens/{token_idx}", status_code=204)
 async def revoke_own_token(
     token_idx: int,
-    p: Principal = Depends(get_current_principal),
+    p: Principal = Depends(require_scope(Scope.SELF_TOKENS)),
     pool: asyncpg.Pool = Depends(get_db_pool),
 ):
     """Revoke a token belonging to the caller. 401 if Anonymous, 403 if the
@@ -297,11 +293,6 @@ async def revoke_own_token(
     or "exists but owned by someone else" — same response so probing
     token_idx values does not enumerate the table.
     """
-    if isinstance(p, Anonymous):
-        raise HTTPException(status_code=401, detail="authentication required")
-    if not p.has_scope(Scope.SELF_TOKENS):
-        raise HTTPException(status_code=403, detail="missing required scope 'self:tokens'")
-
     # Atomic UPDATE WHERE — only revokes if owner matches and token is not
     # already revoked. Returns 0 rows if either condition fails.
     result = await pool.execute(
