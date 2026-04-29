@@ -64,6 +64,11 @@ class AuthEventType(StrEnum):
 
     OIDC_CREATE_PRINCIPAL = "oidc_create_principal"
     OIDC_CREATE_PRINCIPAL_EMAIL_CONFLICT = "oidc_create_principal_email_conflict"
+    # Recorded when a returning OIDC user's JWT email differs from the
+    # email stored on qiita.user — i.e., they changed it at the IdP. Detail
+    # carries `outcome=updated` (we synced the new value) or
+    # `outcome=collision` (another user already has that email; we logged
+    # sha256 of the attempted value and left the existing email in place).
     EMAIL_DRIFT = "email_drift"
     TOKEN_MINT = "token_mint"
     TOKEN_REVOKE = "token_revoke"

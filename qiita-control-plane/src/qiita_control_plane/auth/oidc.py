@@ -17,13 +17,25 @@ We accept only RS256 (the algorithm AuthRocket uses) and require:
 `auth_time` is optional at the verifier level — returned as a property of
 the OIDCIdentity (or None if absent). Callers that need freshness
 (POST /auth/pat) check `now - auth_time` against their own threshold.
+
+Note on `fastapi.security.OpenIdConnect`: that helper is a header-reader
+plus an OpenAPI metadata hook, not a verifier — it parses `Bearer <token>`
+off the request and stores the well-known URL for Swagger UI but does
+not fetch JWKS or check signatures/claims. The two stack rather than
+substitute; this module is the verifier.
 """
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jwt
 from jwt import InvalidTokenError, PyJWKClient
+
+if TYPE_CHECKING:
+    # `Settings` is qiita_control_plane.config.Settings — the Pydantic-shaped
+    # config object that reads AUTHROCKET_* env vars at app startup. Imported
+    # under TYPE_CHECKING to keep this module free of runtime config coupling.
+    from qiita_control_plane.config import Settings
 
 
 class InvalidJwt(Exception):
@@ -125,7 +137,7 @@ class AuthRocketVerifier(JwtVerifier):
     """JwtVerifier bound to a Settings instance. Constructed at lifespan."""
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> AuthRocketVerifier:  # noqa: F821
+    def from_settings(cls, settings: Settings) -> AuthRocketVerifier:
         """Build from Settings, raising if any AUTHROCKET_* env is missing.
 
         This is the fail-fast point: lifespan calls from_settings, and a

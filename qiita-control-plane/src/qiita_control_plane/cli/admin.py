@@ -38,6 +38,9 @@ _DB_CONNECT_TIMEOUT_SECONDS = 5
 # transient network blips without papering over a hung server.
 _CLI_HTTP_TIMEOUT_SECONDS = 10
 
+# Derived from SystemRole so the role list isn't repeated anywhere in this
+# file — adding `SystemRole.X` widens validation, error message, and `--help`
+# automatically.
 _VALID_ROLE_VALUES = tuple(r.value for r in SystemRole)
 
 

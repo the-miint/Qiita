@@ -17,8 +17,11 @@ VALID_SCOPES: frozenset[Scope] = frozenset(Scope)
 
 # Hierarchical scope ceiling for the `qiita.system_role` enum on principal.
 # Each entry is the full ceiling (not the increment) — explicit, no hidden
-# unions; future readers don't have to chase inheritance to know what role X
-# can do.
+# unions: `grep WET_LAB_ADMIN` (or any role) returns the complete answer
+# inline, so neither human readers nor AI tools have to chase inheritance
+# to know what role X can do. `test_role_ceilings_are_hierarchical` locks
+# in `USER ⊊ WET_LAB_ADMIN ⊊ SYSTEM_ADMIN` so any drift in either entry
+# trips.
 ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
     SystemRole.USER: frozenset(
         {

@@ -11,7 +11,13 @@ async def get_pool(
     command_timeout: float = 10.0,
     connect_timeout: float = 5.0,
 ) -> asyncpg.Pool:
-    """Create and return an asyncpg connection pool.
+    """Create a fresh asyncpg connection pool.
+
+    Lifecycle: call this once at app startup (typically inside FastAPI's
+    `lifespan`) and store the result on `app.state.pool`. Routes do NOT
+    call this — they retrieve the already-created pool via
+    `qiita_control_plane.deps.get_db_pool`, which is the request-scoped
+    FastAPI dependency accessor. Pair with `close_pool` at shutdown.
 
     Raises on connection failure — fail fast, fail loud.
     """
