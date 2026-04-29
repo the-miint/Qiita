@@ -12,7 +12,7 @@ import hashlib
 import logging
 import secrets
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 
 import asyncpg
 from qiita_common.auth_constants import LAST_USED_AT_COALESCE_INTERVAL
@@ -21,6 +21,16 @@ from . import TOKEN_BODY_BYTES, TOKEN_HASH_BYTES, TOKEN_PREFIX, TOKEN_TOTAL_LEN
 from .scopes import VALID_SCOPES
 
 log = logging.getLogger(__name__)
+
+
+class TokenHashCollision(RuntimeError):
+    """SHA-256 collision on `qiita.api_tokens.token_hash`. Effectively
+    impossible with 256 bits of entropy from `secrets.token_urlsafe(32)`
+    plus a cryptographic digest; surfaced loudly rather than silently
+    shadowing the colliding token. Inherits from RuntimeError so blanket
+    handlers still catch it; named so tests / audit-replay tools can
+    target it specifically.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,9 +59,10 @@ async def mint_api_token(
     """Mint a new opaque API token.
 
     Returns (plaintext, token_idx). Plaintext must be returned to the caller
-    exactly once and never logged. Raises ValueError on unknown scopes; raises
-    RuntimeError on token_hash collision (extraordinarily unlikely with 256
-    bits of entropy — surfaced rather than silently shadowing another token).
+    exactly once and never logged. Raises ValueError on unknown scopes;
+    raises TokenHashCollision (a RuntimeError subclass) on the
+    extraordinarily unlikely event of a token_hash collision — surfaced
+    rather than silently shadowing another token.
     """
     unknown = set(scopes) - VALID_SCOPES
     if unknown:
@@ -75,7 +86,7 @@ async def mint_api_token(
         # 256 bits of entropy + cryptographic hash → effectively impossible.
         # Surfacing rather than silently overwriting protects against an
         # attacker-engineered collision (also impossible, but: principle).
-        raise RuntimeError("Token hash collision — refusing to shadow") from exc
+        raise TokenHashCollision("token_hash collision — refusing to shadow") from exc
 
     return plaintext, token_idx
 
@@ -99,19 +110,23 @@ async def verify_api_token(pool: asyncpg.Pool, plaintext: str) -> VerifiedToken 
 
     token_hash = hashlib.sha256(plaintext.encode("ascii")).digest()
 
+    # Every rejection condition lives in the WHERE clause so we get a
+    # single row-or-None answer with one DB clock reading. Splitting
+    # `revoked_at IS NULL` from `expires_at < now()` between SQL and
+    # Python would make verification depend on whether the DB and Python
+    # process clocks agree.
     row = await pool.fetchrow(
-        "SELECT t.token_idx, t.principal_idx, t.scopes, t.expires_at,"
-        "  p.disabled, p.retired"
+        "SELECT t.token_idx, t.principal_idx, t.scopes"
         " FROM qiita.api_tokens t"
         " JOIN qiita.principal p ON p.idx = t.principal_idx"
-        " WHERE t.token_hash = $1 AND t.revoked_at IS NULL",
+        " WHERE t.token_hash = $1"
+        "   AND t.revoked_at IS NULL"
+        "   AND (t.expires_at IS NULL OR t.expires_at > now())"
+        "   AND NOT p.disabled"
+        "   AND NOT p.retired",
         token_hash,
     )
     if row is None:
-        return None
-    if row["expires_at"] is not None and row["expires_at"] < datetime.now(UTC):
-        return None
-    if row["disabled"] or row["retired"]:
         return None
 
     asyncio.create_task(record_token_use(pool, row["token_idx"]))
@@ -139,4 +154,8 @@ async def record_token_use(pool: asyncpg.Pool, token_idx: int) -> None:
             token_idx,
         )
     except asyncpg.PostgresError:
+        # Swallowed because we're invoked via asyncio.create_task — no caller
+        # to receive a raise. `warning` (not `error`) because last_used_at is
+        # observability-only and the auth flow already succeeded; if Prometheus
+        # lands, a counter on this branch is the right escalation path.
         log.warning("last_used_at update failed token_idx=%s", token_idx, exc_info=True)
