@@ -178,16 +178,19 @@ async def test_resolver_returns_anonymous_when_no_header(resolver_client):
     assert resp.json() == {"kind": "anonymous"}
 
 
-async def test_resolver_returns_anonymous_when_non_bearer(resolver_client):
+async def test_resolver_rejects_non_bearer_scheme(resolver_client):
+    """Authorization: Basic ... is a malformed auth *attempt*, not absence
+    of auth. Surface as 401 rather than silently downgrading to Anonymous,
+    so client misconfiguration is visible on public routes too."""
     resp = await resolver_client.get("/resolve", headers={"Authorization": "Basic xyz"})
-    assert resp.status_code == 200
-    assert resp.json() == {"kind": "anonymous"}
+    assert resp.status_code == 401
 
 
-async def test_resolver_returns_anonymous_when_empty_bearer(resolver_client):
+async def test_resolver_rejects_empty_bearer(resolver_client):
+    """`Authorization: Bearer ` with empty credential is unambiguously
+    a malformed attempt — same 401 treatment as a non-Bearer scheme."""
     resp = await resolver_client.get("/resolve", headers={"Authorization": "Bearer "})
-    assert resp.status_code == 200
-    assert resp.json() == {"kind": "anonymous"}
+    assert resp.status_code == 401
 
 
 async def test_resolver_rejects_malformed_bearer(resolver_client):

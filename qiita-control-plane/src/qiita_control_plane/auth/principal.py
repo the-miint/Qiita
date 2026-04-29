@@ -41,6 +41,7 @@ from . import TOKEN_PREFIX
 from .audit import record_event, sha256_hex
 from .db import insert_principal
 from .oidc import InvalidJwt, JwtVerifier
+from .scopes import role_ceiling
 from .tokens import verify_api_token
 
 _ROLE_ORDER = {SystemRole.USER: 0, SystemRole.WET_LAB_ADMIN: 1, SystemRole.SYSTEM_ADMIN: 2}
@@ -158,19 +159,34 @@ async def get_current_principal(request: Request) -> Principal:
     """FastAPI dependency: resolve the current principal from the request.
 
     Returns:
-      - Anonymous() when no Authorization header is present (or it's not Bearer).
+      - Anonymous() when no Authorization header is present at all.
       - HumanUser / ServiceAccount on successful auth.
 
-    Raises HTTPException 401 on invalid token / JWT, malformed bearer,
-    or disabled/retired principal. Raises 503 if a JWT-shaped bearer
-    arrives but the OIDC verifier is not configured.
+    Raises HTTPException 401 on any malformed authentication attempt:
+      - non-Bearer scheme (e.g., `Authorization: Basic xxx`),
+      - `Authorization: Bearer ` with empty credential,
+      - bearer payload that is neither a `qk_` token nor JWT-shaped,
+      - invalid token / JWT, or disabled/retired principal.
+
+    Raises 503 if a JWT-shaped bearer arrives but the OIDC verifier is
+    not configured.
+
+    Policy: an `Authorization` header is read as an authentication
+    *attempt*. Treating malformed attempts as Anonymous would silently
+    hide client misconfiguration on public routes; a 401 surfaces the
+    failure so the client can fix the request.
     """
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith(BEARER_PREFIX):
+    if not auth:
         return Anonymous()
+    if not auth.startswith(BEARER_PREFIX):
+        raise HTTPException(
+            status_code=401,
+            detail="unsupported authentication scheme; only Bearer is accepted",
+        )
     bearer = auth[len(BEARER_PREFIX) :].strip()
     if not bearer:
-        return Anonymous()
+        raise HTTPException(status_code=401, detail="empty bearer credential")
 
     pool = get_db_pool(request)
 
@@ -210,11 +226,18 @@ async def _resolve_token(pool: asyncpg.Pool, plaintext: str) -> Principal:
         raise HTTPException(status_code=401, detail="invalid or revoked token")
 
     # verify_api_token already filters disabled/retired. Re-fetch principal
-    # info to populate the typed Principal.
+    # info to populate the typed Principal. The CASE expression makes the
+    # kind dispatch explicit rather than inferring it from "which LEFT-JOIN
+    # column is non-null"; matches the convention used in routes/admin.py.
     row = await pool.fetchrow(
         "SELECT p.idx, p.system_role, p.disabled, p.retired,"
         "  u.email, u.profile_complete,"
-        "  sa.name AS service_name"
+        "  sa.name AS service_name,"
+        "  CASE"
+        "    WHEN u.principal_idx IS NOT NULL THEN 'user'"
+        "    WHEN sa.principal_idx IS NOT NULL THEN 'service'"
+        "    ELSE 'bare'"
+        "  END AS kind"
         " FROM qiita.principal p"
         " LEFT JOIN qiita.user u ON u.principal_idx = p.idx"
         " LEFT JOIN qiita.service_account sa ON sa.principal_idx = p.idx"
@@ -226,13 +249,14 @@ async def _resolve_token(pool: asyncpg.Pool, plaintext: str) -> Principal:
         # prevent this, but fail closed.
         raise HTTPException(status_code=401, detail=MSG_PRINCIPAL_NOT_FOUND)
 
-    if row["email"] is not None:
+    kind = row["kind"]
+    if kind == "user":
         return _human_user_from_row(row, scopes=verified.scopes)
-    if row["service_name"] is not None:
+    if kind == "service":
         return _service_account_from_row(row, scopes=verified.scopes)
-    # Bare principal holding a token shouldn't happen (sentinel CHECK +
-    # subtype creation is the only path that produces a token-bearing
-    # principal in practice). Fail closed.
+    # `kind == "bare"` — a bare principal holding a token shouldn't happen
+    # (sentinel CHECK + subtype creation is the only path that produces a
+    # token-bearing principal in practice). Fail closed.
     raise HTTPException(status_code=401, detail="principal has no auth subtype (bare)")
 
 
@@ -260,7 +284,7 @@ async def _resolve_oidc(pool: asyncpg.Pool, verifier: JwtVerifier, bearer: str) 
         if existing["disabled"] or existing["retired"]:
             raise HTTPException(status_code=401, detail=MSG_PRINCIPAL_DISABLED_OR_RETIRED)
         await _handle_email_drift(pool, existing["principal_idx"], identity.email)
-        return await _build_human_user(pool, existing["principal_idx"], scopes=None)
+        return await _build_human_user(pool, existing["principal_idx"])
 
     return await _create_human_from_oidc(pool, identity)
 
@@ -322,7 +346,7 @@ async def _create_human_from_oidc(pool: asyncpg.Pool, identity) -> Principal:
                 identity.subject,
             )
             if row is not None:
-                return await _build_human_user(pool, row["principal_idx"], scopes=None)
+                return await _build_human_user(pool, row["principal_idx"])
             await record_event(
                 pool,
                 event_type=AuthEventType.OIDC_CREATE_PRINCIPAL_EMAIL_CONFLICT,
@@ -336,11 +360,17 @@ async def _create_human_from_oidc(pool: asyncpg.Pool, identity) -> Principal:
                 detail="email already linked to a different identity",
             )
 
-    return await _build_human_user(pool, principal_idx, scopes=None)
+    return await _build_human_user(pool, principal_idx)
 
 
 async def _handle_email_drift(pool: asyncpg.Pool, principal_idx: int, jwt_email: str) -> None:
     """On repeat OIDC login, reconcile a possibly-changed email.
+
+    "Email drift" = the email claim on the incoming JWT differs from the
+    email stored on qiita.user when the principal first logged in. Users
+    can change their email at the IdP at any time, and we want our local
+    copy to track theirs — unless the new value collides with another
+    user, in which case we don't overwrite and we record the attempt.
 
     On mismatch + no collision: UPDATE succeeds; emit email_drift audit
     event with outcome=updated.
@@ -380,13 +410,13 @@ async def _handle_email_drift(pool: asyncpg.Pool, principal_idx: int, jwt_email:
         )
 
 
-async def _build_human_user(
-    pool: asyncpg.Pool, principal_idx: int, *, scopes: frozenset[str] | None
-) -> HumanUser:
-    """Load a HumanUser from the DB. `scopes` is None for OIDC-resolved users
-    (they get the full role-implied ceiling at this layer; the PAT mint
-    route validates per-token scopes), or a token's scope set when arriving
-    via the token path.
+async def _build_human_user(pool: asyncpg.Pool, principal_idx: int) -> HumanUser:
+    """Load a HumanUser from the DB for an OIDC-resolved session.
+
+    Hands back the role's full implied scope ceiling — the PAT mint route
+    narrows this when minting PATs, and per-request token bearers carry
+    their own scope set via the token path (`_resolve_token`), so this
+    function is only used for OIDC-arrived users.
     """
     row = await pool.fetchrow(
         "SELECT p.idx, p.system_role, p.disabled, p.retired,"
@@ -400,11 +430,4 @@ async def _build_human_user(
         raise HTTPException(status_code=401, detail="user record not found for principal")
     if row["disabled"] or row["retired"]:
         raise HTTPException(status_code=401, detail=MSG_PRINCIPAL_DISABLED_OR_RETIRED)
-    # For OIDC-derived sessions we hand back the role's full ceiling. The
-    # PAT mint route narrows this when minting PATs; per-request bearers
-    # carry their own scope set via the token path.
-    if scopes is None:
-        from .scopes import role_ceiling
-
-        scopes = role_ceiling(row["system_role"])
-    return _human_user_from_row(row, scopes=scopes)
+    return _human_user_from_row(row, scopes=role_ceiling(row["system_role"]))
