@@ -27,12 +27,12 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.duckdb/lib
-          key: libduckdb-${{ runner.os }}-v1.5.1
+          key: libduckdb-${{ runner.os }}-v1.5.2
       - name: Download libduckdb
         if: steps.cache-libduckdb.outputs.cache-hit != 'true'
         run: |
           mkdir -p ~/.duckdb/lib
-          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.1/libduckdb-linux-amd64.zip \
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.2/libduckdb-linux-amd64.zip \
             -o /tmp/libduckdb.zip
           unzip -j /tmp/libduckdb.zip -d ~/.duckdb/lib
       - name: Set DUCKDB env vars
@@ -62,18 +62,18 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ~/.duckdb/lib
-          key: libduckdb-${{ runner.os }}-v1.5.1
+          key: libduckdb-${{ runner.os }}-v1.5.2
       - name: Download libduckdb
         if: steps.cache-libduckdb.outputs.cache-hit != 'true'
         run: |
           mkdir -p ~/.duckdb/lib
-          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.1/libduckdb-linux-amd64.zip \
+          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.2/libduckdb-linux-amd64.zip \
             -o /tmp/libduckdb.zip
           unzip -j /tmp/libduckdb.zip -d ~/.duckdb/lib
       - uses: actions/cache@v5
         with:
           path: ~/.duckdb/extensions
-          key: duckdb-ext-${{ runner.os }}-v1.5.1
+          key: duckdb-ext-${{ runner.os }}-v1.5.2
       - name: Set DUCKDB env vars
         run: |
           echo "DUCKDB_LIB_DIR=$HOME/.duckdb/lib" >> $GITHUB_ENV
