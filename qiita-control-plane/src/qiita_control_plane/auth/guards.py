@@ -31,44 +31,54 @@ def _msg_requires_role(role: str) -> str:
     return f"requires system_role at least {role!r}"
 
 
+def _kind_guard_failure(p: Principal, allowed_kind_label: str) -> HTTPException:
+    """Build the HTTPException for a rejected kind guard: 401 if anonymous,
+    403 with a kind-specific detail otherwise."""
+    if isinstance(p, Anonymous):
+        return HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
+    return HTTPException(
+        status_code=403,
+        detail=f"this route is restricted to {allowed_kind_label}",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Kind guards
 # ---------------------------------------------------------------------------
+# Positive-assertion style: each guard's only return-branch is the explicit
+# isinstance check; every other case funnels through `_kind_guard_failure`.
+# Deny-by-default is structural — a future Principal subclass is denied
+# automatically without any change to these guards.
 
 
 def require_human(
     p: Principal = Depends(get_current_principal),
 ) -> HumanUser:
     """Returns the principal if it's a HumanUser; 401 if Anonymous,
-    403 if a ServiceAccount tried to use a humans-only route."""
-    if isinstance(p, Anonymous):
-        raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
-    if not isinstance(p, HumanUser):
-        raise HTTPException(
-            status_code=403,
-            detail="this route is restricted to human users",
-        )
-    return p
+    403 otherwise (e.g., a ServiceAccount tried to use a humans-only route)."""
+    if isinstance(p, HumanUser):
+        return p
+    raise _kind_guard_failure(p, "human users")
 
 
 def require_service(
     p: Principal = Depends(get_current_principal),
 ) -> ServiceAccount:
     """Returns the principal if it's a ServiceAccount; 401 if Anonymous,
-    403 if a HumanUser tried to use a workers-only route."""
-    if isinstance(p, Anonymous):
-        raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
-    if not isinstance(p, ServiceAccount):
-        raise HTTPException(
-            status_code=403,
-            detail="this route is restricted to service accounts",
-        )
-    return p
+    403 otherwise (e.g., a HumanUser tried to use a workers-only route)."""
+    if isinstance(p, ServiceAccount):
+        return p
+    raise _kind_guard_failure(p, "service accounts")
 
 
 # ---------------------------------------------------------------------------
 # Role / scope guards (factory style — return a FastAPI dep)
 # ---------------------------------------------------------------------------
+# Negative-logic style here on purpose: the positive case is a capability
+# check (not an isinstance), so the kind-guard inversion would be less
+# readable for the same defense. The `Principal` base class returns False
+# from both `has_role_at_least` and `has_scope`, which gives the same
+# deny-by-default property without inverting.
 
 
 def require_role_at_least(role: str) -> Callable[..., Principal]:
