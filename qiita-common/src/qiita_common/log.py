@@ -1,29 +1,31 @@
-"""Logging utilities — primarily the Authorization-header scrubber.
+"""Logging utilities — the Authorization-header scrubber for log records.
 
-httpx's `INFO`-level request logs sometimes include request headers
-verbatim. If a log line carries a `Bearer qk_...` value, the leak ends
-up on disk forever. `AuthorizationScrubFilter` walks every log record
-and rewrites any `Authorization` value to `Bearer <redacted>` before
-the formatter sees it.
+httpx's `INFO`-level request logs sometimes include headers verbatim;
+without scrubbing, any `Bearer qk_...` value ends up on disk forever.
+`AuthorizationScrubFilter` rewrites the token portion of every
+`Bearer <token>` substring it finds to `Bearer <redacted>` before the
+formatter sees it.
 
-**Where to install.** Python applies a `Logger`'s filters only to
-records originating at that logger — propagation up the tree skips
-ancestor filters and goes straight to ancestor handlers. To scrub
-records emitted by named loggers like `httpx`, `urllib3`, or
-`uvicorn`, the filter must be attached to **handlers**, not loggers.
-Call `install_authorization_scrub()`, which adds the filter to every
-handler on the root logger. Run it after the application's logging
-configuration is complete (e.g. inside FastAPI's `lifespan`, once
-uvicorn has installed its handlers) and before any request handlers
-run. Handlers added after this call won't be covered — call again if
-you reconfigure logging at runtime.
+**Why a visible placeholder, not a strip.** Keeping `<redacted>` rather
+than dropping the token outright preserves a per-line audit signal that
+auth happened, keeps the message's structural shape intact for
+downstream log parsers, and turns the placeholder into a leak detector
+— grepping for `<redacted>` confirms the filter is in the path, while
+any raw `Bearer qk_...` or `Bearer eyJ...` in logs is an immediate red
+flag.
 
-**Who installs it.** Every long-running service that may log a
-`Bearer ...` header. Today that's both the control plane and the
-orchestrator, because both wrap httpx via
-`qiita_common.client.ControlPlaneClient`. Any new process that uses
-`ControlPlaneClient` (or otherwise forwards bearer tokens) should
-install the filter the same way.
+**Where to install.** A `Logger`'s filters run only for records
+originating at that logger; propagation up the tree skips ancestor
+filters. Records from named loggers (`httpx`, `uvicorn`) therefore need
+the filter attached to **handlers**, not loggers.
+`install_authorization_scrub()` attaches to every handler on the root
+logger. Call it after logging configuration is complete (e.g. inside
+FastAPI's `lifespan`, once uvicorn's handlers are in place) and before
+any request handlers run. Handlers added afterward are not covered.
+
+**Who installs it.** Every long-running service that wraps httpx via
+`qiita_common.client.ControlPlaneClient` (or otherwise forwards bearer
+tokens). Today: the control plane and the orchestrator.
 
 Example:
 
