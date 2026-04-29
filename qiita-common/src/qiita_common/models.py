@@ -244,6 +244,44 @@ class ServiceAccountCreateResponse(BaseModel):
     created_at: AwareDatetime
 
 
+# ---------------------------------------------------------------------------
+# /auth/whoami — discriminated union over principal kind
+# ---------------------------------------------------------------------------
+
+
+class WhoAmIHumanResponse(BaseModel):
+    """`/auth/whoami` response when a HumanUser is authenticated."""
+
+    kind: Literal["human"]
+    principal_idx: Annotated[int, Field(gt=0)]
+    email: str
+    system_role: str
+    scopes: list[str]
+    profile_complete: bool
+
+
+class WhoAmIServiceResponse(BaseModel):
+    """`/auth/whoami` response when a ServiceAccount is authenticated."""
+
+    kind: Literal["service"]
+    principal_idx: Annotated[int, Field(gt=0)]
+    name: str
+    scopes: list[str]
+
+
+class WhoAmIAnonymousResponse(BaseModel):
+    """`/auth/whoami` response for an unauthenticated caller."""
+
+    kind: Literal["anonymous"]
+
+
+# Discriminated union — Pydantic / OpenAPI dispatch on the `kind` field.
+WhoAmIResponse = Annotated[
+    WhoAmIHumanResponse | WhoAmIServiceResponse | WhoAmIAnonymousResponse,
+    Field(discriminator="kind"),
+]
+
+
 class PrincipalDisabledUpdate(BaseModel):
     """Body for PATCH /api/v1/admin/principals/{idx}/disabled.
 

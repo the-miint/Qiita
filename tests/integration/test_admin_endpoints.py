@@ -192,6 +192,11 @@ async def test_post_service_accounts_rejects_scope_outside_service_ceiling(
 
 
 async def test_post_service_accounts_duplicate_name_409(admin_client, postgres_pool):
+    """A second create with the same name returns 409 with a name-specific
+    detail. The detail body is asserted (not just the status) because the
+    route's UniqueViolation handler dispatches on the constraint name; if
+    that dispatch ever falls through (e.g., the constraint gets renamed in
+    a migration), the response would become a 500 and this test catches it."""
     admin_token, _ = await _admin_token(postgres_pool, admin_client)
     payload = {"name": "dup-svc", "scopes": ["features:mint"]}
     r1 = await admin_client.post(
@@ -207,6 +212,7 @@ async def test_post_service_accounts_duplicate_name_409(admin_client, postgres_p
         json=payload,
     )
     assert r2.status_code == 409
+    assert r2.json()["detail"] == "service account named 'dup-svc' already exists"
 
 
 # ---------------------------------------------------------------------------

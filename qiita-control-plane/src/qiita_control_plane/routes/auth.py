@@ -26,6 +26,10 @@ from qiita_common.models import (
     ApiTokenMintRequest,
     ApiTokenMintResponse,
     ApiTokenSummary,
+    WhoAmIAnonymousResponse,
+    WhoAmIHumanResponse,
+    WhoAmIResponse,
+    WhoAmIServiceResponse,
 )
 
 from ..auth import TOKEN_PREFIX
@@ -69,31 +73,31 @@ def _get_settings(request: Request) -> Settings:
 # ---------------------------------------------------------------------------
 
 
-@router.get("/whoami")
-async def whoami(p: Principal = Depends(get_current_principal)):
+@router.get("/whoami", response_model=WhoAmIResponse)
+async def whoami(p: Principal = Depends(get_current_principal)) -> WhoAmIResponse:
     """Return a serializable view of the authenticated principal.
 
     Public route: anonymous callers get `{"kind": "anonymous"}`. Allows clients
     to probe their own auth state without tripping a 401.
     """
     if isinstance(p, HumanUser):
-        return {
-            "kind": "human",
-            "principal_idx": p.principal_idx,
-            "email": p.email,
-            "system_role": p.system_role,
-            "scopes": sorted(p.scopes),
-            "profile_complete": p.profile_complete,
-        }
+        return WhoAmIHumanResponse(
+            kind="human",
+            principal_idx=p.principal_idx,
+            email=p.email,
+            system_role=p.system_role,
+            scopes=sorted(p.scopes),
+            profile_complete=p.profile_complete,
+        )
     if isinstance(p, ServiceAccount):
-        return {
-            "kind": "service",
-            "principal_idx": p.principal_idx,
-            "name": p.name,
-            "scopes": sorted(p.scopes),
-        }
+        return WhoAmIServiceResponse(
+            kind="service",
+            principal_idx=p.principal_idx,
+            name=p.name,
+            scopes=sorted(p.scopes),
+        )
     if isinstance(p, Anonymous):
-        return {"kind": "anonymous"}
+        return WhoAmIAnonymousResponse(kind="anonymous")
     # Defensive: shouldn't happen.
     raise HTTPException(status_code=500, detail="unknown principal kind")
 
@@ -103,7 +107,7 @@ async def whoami(p: Principal = Depends(get_current_principal)):
 # ---------------------------------------------------------------------------
 
 
-@router.post("/pat", status_code=201, response_model=None)
+@router.post("/pat", status_code=201, response_model=ApiTokenMintResponse)
 async def mint_pat(
     body: ApiTokenMintRequest,
     request: Request,
@@ -164,10 +168,15 @@ async def mint_pat(
             ),
         )
 
-    # Resolve the user from the verified identity.
+    # Resolve the user from the verified identity. The missing-fields list is
+    # computed in SQL via qiita.user_profile_missing_fields so the field set
+    # tracks the `profile_complete` generated column's definition (both live in
+    # the auth migration; see 20260429000001_user_profile_missing_fields.sql).
     user_row = await pool.fetchrow(
         "SELECT u.principal_idx, p.system_role, p.disabled, p.retired,"
-        " u.profile_complete, u.affiliation, u.address, u.phone"
+        " u.profile_complete,"
+        " qiita.user_profile_missing_fields(u.affiliation, u.address, u.phone)"
+        "   AS missing_fields"
         " FROM qiita.user_identities ui"
         " JOIN qiita.user u ON u.principal_idx = ui.principal_idx"
         " JOIN qiita.principal p ON p.idx = u.principal_idx"
@@ -186,13 +195,12 @@ async def mint_pat(
     if not user_row["profile_complete"]:
         # Flat 422 body so the CLI can pluck reason / missing_fields without
         # nested-detail unwrapping.
-        missing = [f for f in ("affiliation", "address", "phone") if not user_row[f]]
         return JSONResponse(
             status_code=422,
             content={
                 "detail": "profile incomplete",
                 "reason": "profile_incomplete",
-                "missing_fields": missing,
+                "missing_fields": user_row["missing_fields"],
             },
         )
 
@@ -276,7 +284,7 @@ async def revoke_own_token(
     token_idx: int,
     p: Principal = Depends(require_scope(Scope.SELF_TOKENS)),
     pool: asyncpg.Pool = Depends(get_db_pool),
-):
+) -> None:
     """Revoke a token belonging to the caller. 401 if Anonymous, 403 if the
     caller's bearer lacks `self:tokens`, 404 for **either** "no such token"
     or "exists but owned by someone else" — same response so probing

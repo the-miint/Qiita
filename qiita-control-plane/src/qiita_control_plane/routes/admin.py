@@ -58,7 +58,7 @@ def _decode_detail(raw) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@router.post("/service-accounts", status_code=201, response_model=None)
+@router.post("/service-accounts", status_code=201, response_model=ServiceAccountCreateResponse)
 async def create_service_account(
     body: ServiceAccountCreate,
     pool: asyncpg.Pool = Depends(get_db_pool),
@@ -121,12 +121,16 @@ async def create_service_account(
                         "kind": "service_account_initial",
                     },
                 )
-    except asyncpg.UniqueViolationError:
-        # service_account.name UNIQUE
-        raise HTTPException(
-            status_code=409,
-            detail=f"service account named {body.name!r} already exists",
-        )
+    except asyncpg.UniqueViolationError as exc:
+        # Dispatch on the constraint name so a future second UNIQUE column
+        # on qiita.service_account doesn't get misattributed to the name.
+        # PostgreSQL auto-names inline UNIQUE constraints `<table>_<col>_key`.
+        if exc.constraint_name == "service_account_name_key":
+            raise HTTPException(
+                status_code=409,
+                detail=f"service account named {body.name!r} already exists",
+            ) from exc
+        raise  # unknown UNIQUE — let FastAPI surface as 500
 
     return ServiceAccountCreateResponse(
         principal_idx=principal_idx,
@@ -152,7 +156,7 @@ async def set_principal_disabled(
     pool: asyncpg.Pool = Depends(get_db_pool),
     actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.ADMIN_USERS)),
-):
+) -> None:
     """Toggle disabled state. `disabled=true` sets the audit columns;
     `disabled=false` clears them (round-trip back to active). The DB CHECK
     `principal_disabled_consistent` ensures atomicity."""
@@ -222,7 +226,7 @@ async def retire_principal(
     pool: asyncpg.Pool = Depends(get_db_pool),
     actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.ADMIN_USERS)),
-):
+) -> None:
     """Retirement is terminal. The DB trigger revokes all the principal's
     active tokens automatically. An admin cannot retire themselves (refuses
     to leave zero active system_admins is enforced by application logic
@@ -276,7 +280,7 @@ async def set_principal_system_role(
     pool: asyncpg.Pool = Depends(get_db_pool),
     actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.ADMIN_USERS)),
-):
+) -> None:
     """Set the principal's system_role. The DB enum validates the value;
     Pydantic's SystemRole StrEnum narrows it before we hit the DB."""
     if principal_idx == SYSTEM_PRINCIPAL_IDX:
