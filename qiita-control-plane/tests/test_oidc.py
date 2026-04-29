@@ -7,8 +7,6 @@ verifier fetches the JWKS over the loopback HTTP path, exercising the same
 code path that runs in production.
 """
 
-from __future__ import annotations
-
 import json
 import secrets
 import threading

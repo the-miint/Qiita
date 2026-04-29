@@ -15,8 +15,6 @@ Usage:
         uv run python scripts/verify_jwt.py "$JWT"
 """
 
-from __future__ import annotations
-
 import sys
 
 

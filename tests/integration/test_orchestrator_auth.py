@@ -9,9 +9,6 @@ Exercises the full path:
     expected sources and refuses to start when neither source is populated.
 """
 
-from __future__ import annotations
-
-
 import pytest
 from httpx import ASGITransport, AsyncClient
 
