@@ -1,25 +1,23 @@
 """Shared FastAPI dependencies."""
 
-from uuid import UUID
-
 import asyncpg
 from fastapi import Request
 
 
 def get_db_pool(request: Request) -> asyncpg.Pool:
-    """Typed accessor for the database pool — use as a FastAPI dependency."""
+    """FastAPI dependency: return the pool that `lifespan` created via
+    `qiita_control_plane.db.get_pool` and stashed on `app.state.pool`.
+
+    Use this from route handlers and request-scoped deps:
+        async def my_route(pool: asyncpg.Pool = Depends(get_db_pool)): ...
+
+    This accessor only retrieves the pool — it never creates one. Raises
+    RuntimeError if called before lifespan has run (e.g. from a unit test
+    that builds the app without lifespan)."""
     pool = getattr(request.app.state, "pool", None)
     if pool is None:
         raise RuntimeError("Database pool not initialised — lifespan may not have run")
     return pool
-
-
-def get_current_user(request: Request) -> UUID:
-    """Return the authenticated user ID.
-
-    Currently returns a mock user ID. Will be replaced with JWT extraction.
-    """
-    return UUID("a0000000-0000-0000-0000-000000000001")
 
 
 def get_hmac_secret(request: Request) -> bytes:

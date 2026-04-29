@@ -69,7 +69,9 @@ def _reset_ducklake_catalog():
     import asyncio
 
     async def _do():
-        conn = await asyncpg.connect("postgresql://qiita:qiita@localhost:5433/qiita_test")
+        conn = await asyncpg.connect(
+            "postgresql://qiita:qiita@localhost:5433/qiita_test"
+        )
         await conn.execute(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
             "WHERE datname = 'qiita_ducklake' AND pid != pg_backend_pid()"
