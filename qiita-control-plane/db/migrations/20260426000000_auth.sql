@@ -61,6 +61,12 @@ SELECT setval(pg_get_serial_sequence('qiita.principal', 'idx'), 1);
 -- =============================================================================
 -- USER SUBTYPE (humans authenticating via OIDC)
 -- =============================================================================
+-- `user` is SQL-reserved — PostgreSQL parses bare `user` as the `USER`
+-- function (equivalent to `CURRENT_USER`). The schema-qualified form
+-- `qiita.user` is unambiguous in DDL/DML positions and needs no double
+-- quoting, which is why DDL like `CREATE TABLE qiita.user (...)`, queries
+-- like `SELECT ... FROM qiita.user`, and FK references compile cleanly.
+-- Always use the qualified form; never bare `user`.
 
 CREATE TABLE qiita.user (
     principal_idx              BIGINT PRIMARY KEY
@@ -68,10 +74,18 @@ CREATE TABLE qiita.user (
     -- The system principal must remain bare. Sentinel containment.
     CHECK (principal_idx <> 1),
     email                      CITEXT NOT NULL UNIQUE,
+    -- Free-form profile fields use NOT NULL DEFAULT '' so the
+    -- `profile_complete` generated column below can rely on simple
+    -- `<> ''` comparisons under two-valued logic. If these were nullable,
+    -- the generated expression would need `IS NOT NULL AND <> ''` per
+    -- field to dodge SQL's three-valued NULL semantics.
     affiliation                TEXT NOT NULL DEFAULT '',
     address                    TEXT NOT NULL DEFAULT '',
     phone                      TEXT NOT NULL DEFAULT '',
     receive_processing_emails  BOOLEAN NOT NULL DEFAULT TRUE,
+    -- orcid uses NULL (not '') because the format has no meaningful empty
+    -- value — an ORCID is either present and matches the pattern, or it's
+    -- absent. Nullable + CHECK-on-not-null is the natural shape here.
     orcid                      VARCHAR(19)
         CHECK (orcid IS NULL OR orcid ~ '^\d{4}-\d{4}-\d{4}-\d{3}[\dX]$'),
     profile_complete           BOOLEAN GENERATED ALWAYS AS
@@ -87,6 +101,19 @@ CREATE TRIGGER user_set_updated_at
     FOR EACH ROW EXECUTE FUNCTION qiita.set_updated_at();
 
 
+-- Links an external OIDC identity to one of our principals. The auth
+-- resolver creates a row here on first login — mapping the JWT's
+-- `iss` + `sub` claims to the new qiita.user — and looks it up on every
+-- subsequent login. Email changes at the IdP therefore don't break the
+-- link, because we look up by (iss, sub), not by email.
+--
+-- issuer  — the OIDC `iss` claim (the IdP / realm URL).
+-- subject — the OIDC `sub` claim: an opaque, stable per-user identifier
+--           issued by the IdP. NOT an email; deliberately opaque so it
+--           survives upstream profile changes.
+--
+-- (issuer, subject) is the PK so the same upstream identity can never
+-- link to two principals.
 CREATE TABLE qiita.user_identities (
     principal_idx  BIGINT NOT NULL REFERENCES qiita.user(principal_idx) ON DELETE RESTRICT,
     issuer         TEXT NOT NULL,
@@ -170,6 +197,14 @@ CREATE TABLE qiita.api_tokens (
     CHECK (principal_idx <> 1),
     token_hash     BYTEA NOT NULL UNIQUE,
     label          TEXT NOT NULL,
+    -- A token's scopes are checked by `require_scope(...)` guards on every
+    -- protected route. An empty array means the bearer authenticates (proves
+    -- identity to `get_current_principal`) but every scoped guard returns
+    -- 403 — i.e., an identity-only token with no operational permissions.
+    -- The `DEFAULT '{}'` is a safety net: if a future mint path ever omits
+    -- scopes, the resulting token is inert rather than failing the INSERT
+    -- or defaulting to something permissive. Today's mint paths always pass
+    -- scopes explicitly, so the default does not fire in practice.
     scopes         TEXT[] NOT NULL DEFAULT '{}',
     expires_at     TIMESTAMPTZ,
     revoked_at     TIMESTAMPTZ,
@@ -185,13 +220,41 @@ CREATE INDEX api_tokens_principal_idx ON qiita.api_tokens(principal_idx);
 -- =============================================================================
 -- AUTH EVENTS (immutable audit log)
 -- =============================================================================
+-- Exhaustive within scope — every credential-affecting action gets a row.
+-- Forensic gaps surface during incidents; the append-only trigger makes
+-- retroactive backfill unsound; SOC 2 / ISO 27001 require it for credential
+-- and privilege changes. The same standard does not extend to domain
+-- tables — their mutations are high-volume and routine, so universal CDC
+-- there would be expensive noise.
 
 CREATE TABLE qiita.auth_events (
     event_idx           BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    -- TEXT — not ENUM, not a controlled-vocab lookup table — for forward
+    -- compatibility of this append-only audit log. Adding a new event type
+    -- is a one-line edit to the AuthEventType StrEnum in
+    -- qiita_common.auth_constants; the StrEnum already catches typos at
+    -- every emit site, so DB-level enforcement adds friction without much
+    -- additional safety. ENUM would cost `ALTER TYPE ... ADD VALUE` per
+    -- new value (forward-only, awkward to revert); a controlled-vocab
+    -- lookup table would cost a row-per-value migration plus drift risk
+    -- if a writer ever emitted a value the lookup hadn't got yet. Either
+    -- becomes the right shape if event types start needing per-type
+    -- metadata (severity, pii_class), DB-queryable introspection by an
+    -- auditor, or an operator-managed vocabulary — the project already
+    -- uses controlled-vocab tables where those hold (qiita.study_tag,
+    -- qiita.terminologies, qiita.metadata_checklists).
     event_type          TEXT NOT NULL,
         -- oidc_login | oidc_create_principal | oidc_create_principal_email_conflict | email_drift
         -- token_mint | token_use | token_revoke | token_verify_failure
         -- system_role_change | principal_disabled | principal_enabled | principal_retired
+    -- principal_idx is the *subject* of the event — whose state is being
+    -- changed or what the event is about. actor_principal_idx is *who
+    -- performed the action* that produced this row. They're equal for
+    -- self-service actions (e.g. self-PAT mint); they diverge for
+    -- admin-on-behalf-of actions (admin disables a user → subject = the
+    -- user, actor = the admin); actor_principal_idx is NULL for
+    -- system-originated events with no human actor (OIDC first-login,
+    -- automatic token revocation on principal retire).
     principal_idx       BIGINT REFERENCES qiita.principal(idx),
     actor_principal_idx BIGINT REFERENCES qiita.principal(idx),
     detail              JSONB NOT NULL DEFAULT '{}',

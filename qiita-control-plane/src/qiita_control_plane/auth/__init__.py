@@ -24,7 +24,8 @@ TOKEN_PREFIX = "qk_"
 TOKEN_BODY_BYTES = 32
 
 # Length of the base64url-without-padding encoding of TOKEN_BODY_BYTES.
-# 32 bytes -> ceil(32 * 8 / 6) = 43 chars.
+# base64 packs 6 bits per char (its alphabet is 2**6 = 64), and the no-pad
+# variant omits the trailing `=`. 32 bytes × 8 = 256 bits → ceil(256/6) = 43.
 TOKEN_BODY_LEN = 43
 
 # Total token length: prefix + body.
