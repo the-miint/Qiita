@@ -7,14 +7,22 @@ concurrency:
 
 jobs:
   lint-python:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
       - run: make lint-python
 
   lint-rust:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -32,8 +40,11 @@ jobs:
         if: steps.cache-libduckdb.outputs.cache-hit != 'true'
         run: |
           mkdir -p ~/.duckdb/lib
-          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.2/libduckdb-linux-amd64.zip \
-            -o /tmp/libduckdb.zip
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.2/libduckdb-osx-universal.zip -o /tmp/libduckdb.zip
+          else
+            curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.2/libduckdb-linux-amd64.zip -o /tmp/libduckdb.zip
+          fi
           unzip -j /tmp/libduckdb.zip -d ~/.duckdb/lib
       - name: Set DUCKDB env vars
         run: echo "DUCKDB_LIB_DIR=$HOME/.duckdb/lib" >> $GITHUB_ENV
@@ -41,7 +52,11 @@ jobs:
 
   test-python:
     needs: lint-python
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
@@ -49,7 +64,11 @@ jobs:
 
   test-rust:
     needs: lint-rust
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -67,8 +86,11 @@ jobs:
         if: steps.cache-libduckdb.outputs.cache-hit != 'true'
         run: |
           mkdir -p ~/.duckdb/lib
-          curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.2/libduckdb-linux-amd64.zip \
-            -o /tmp/libduckdb.zip
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.2/libduckdb-osx-universal.zip -o /tmp/libduckdb.zip
+          else
+            curl -fsSL https://github.com/duckdb/duckdb/releases/download/v1.5.2/libduckdb-linux-amd64.zip -o /tmp/libduckdb.zip
+          fi
           unzip -j /tmp/libduckdb.zip -d ~/.duckdb/lib
       - uses: actions/cache@v5
         with:
@@ -77,7 +99,11 @@ jobs:
       - name: Set DUCKDB env vars
         run: |
           echo "DUCKDB_LIB_DIR=$HOME/.duckdb/lib" >> $GITHUB_ENV
-          echo "LD_LIBRARY_PATH=$HOME/.duckdb/lib" >> $GITHUB_ENV
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            echo "DYLD_LIBRARY_PATH=$HOME/.duckdb/lib" >> $GITHUB_ENV
+          else
+            echo "LD_LIBRARY_PATH=$HOME/.duckdb/lib" >> $GITHUB_ENV
+          fi
       - run: make test-rust
 
   test-integration:
