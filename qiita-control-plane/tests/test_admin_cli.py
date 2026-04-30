@@ -76,16 +76,29 @@ def test_token_revoke_all_calls_correct_url(monkeypatch):
     assert body["revoked_token_idxs"] == [1, 2]
 
 
-def test_main_login_returns_2_with_actionable_message(capsys):
-    """Login is not implemented — must exit nonzero with a clear message
-    rather than appearing to succeed."""
-    from qiita_control_plane.cli.admin import main
+def test_main_login_dispatches_to_do_login(monkeypatch):
+    """Wiring test: `qiita-admin login` calls `_do_login` with the parsed
+    --base-url and --token-file. The actual flow logic is exercised by
+    test_cli_login.py (helpers) and tests/integration (end-to-end)."""
+    from pathlib import Path
 
-    rc = main(["login"])
-    assert rc == 2
-    err = capsys.readouterr().err
-    assert "not yet implemented" in err.lower()
-    assert "/auth/pat" in err
+    from qiita_control_plane.cli import admin as cli
+
+    captured: dict = {}
+
+    def fake_do_login(*, base_url: str, token_file: Path) -> int:
+        captured["base_url"] = base_url
+        captured["token_file"] = token_file
+        return 0
+
+    monkeypatch.setattr(cli, "_do_login", fake_do_login)
+
+    rc = cli.main(
+        ["--base-url", "https://qiita.example.test", "login", "--token-file", "/tmp/qiita-cli-test"]
+    )
+    assert rc == 0
+    assert captured["base_url"] == "https://qiita.example.test"
+    assert captured["token_file"] == Path("/tmp/qiita-cli-test")
 
 
 def test_main_set_system_role_validates_role():

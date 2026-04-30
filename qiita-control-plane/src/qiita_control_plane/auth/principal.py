@@ -194,7 +194,7 @@ async def get_current_principal(request: Request) -> Principal:
         return await _resolve_token(pool, bearer)
     if _looks_like_jwt(bearer):
         verifier = get_oidc_verifier(request)
-        return await _resolve_oidc(pool, verifier, bearer)
+        return await resolve_oidc(pool, verifier, bearer)
 
     raise HTTPException(status_code=401, detail="malformed bearer token")
 
@@ -265,7 +265,7 @@ async def _resolve_token(pool: asyncpg.Pool, plaintext: str) -> Principal:
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_oidc(pool: asyncpg.Pool, verifier: JwtVerifier, bearer: str) -> Principal:
+async def resolve_oidc(pool: asyncpg.Pool, verifier: JwtVerifier, bearer: str) -> Principal:
     try:
         identity = verifier.verify(bearer)
     except InvalidJwt:

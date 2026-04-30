@@ -26,22 +26,31 @@ human or service-account principals exist yet.
 ```bash
 export DATABASE_URL=postgresql://qiita:...@host/qiita
 export HMAC_SECRET_KEY=$(openssl rand -base64 32)
-export AUTHROCKET_ISSUER=https://merry-lion-7652.e2.loginrocket.com
-export AUTHROCKET_AUDIENCE=<dev-realm client id from AuthRocket admin panel>
-# Optional — defaults computed:
-# export AUTHROCKET_JWKS_URL=$AUTHROCKET_ISSUER/connect/jwks
+# AuthRocket SaaS issuer — the canonical URL, NOT the loginrocket subdomain.
+export AUTHROCKET_ISSUER=https://authrocket.com
+# Realm's loginrocket subdomain — both the JWKS endpoint and the LoginRocket
+# Web hosted login URL live here. Substitute your realm's subdomain; for the
+# qiita-dev realm specifically this is `merry-lion-7652.e2.loginrocket.com`.
+export AUTHROCKET_LOGINROCKET_URL=https://<realm>.loginrocket.com
+export AUTHROCKET_JWKS_URL=$AUTHROCKET_LOGINROCKET_URL/connect/jwks
+# Externally-resolvable URL of the control plane itself; used to construct
+# the redirect_uri AuthRocket bounces back to.
+export QIITA_ENDPOINT_URL=https://qiita.example.org
+# Optional (defaults shown):
+# export AUTHROCKET_AUDIENCE=          # leave unset — LoginRocket Web JWTs lack `aud`
 # export AUTHROCKET_JWT_LEEWAY_SECONDS=30
-# export AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS=300
+# export AUTH_HANDOFF_FRESHNESS_SECONDS=60
+# export CLI_LOGIN_CODE_TTL_SECONDS=30
 # export QIITA_TOKEN_DEFAULT_TTL_DAYS=90
 ```
 
-Configure the AuthRocket realm itself for short JWT TTLs (≤60 minutes
-recommended) so retire / disable actions take effect promptly. This is
-realm-side config in the AuthRocket admin panel, not controlled by our env.
+See [`authrocket-realm-setup.md`](authrocket-realm-setup.md) for the
+realm-side configuration (test users, email-verification policy, the
+`iss=https://authrocket.com` footgun).
 
 ## 3. One-shot JWT shape verify
 
-Log into the AuthRocket dev realm via the hosted UI and capture the raw JWT,
+Log into the AuthRocket realm via the hosted UI and capture the raw JWT,
 then:
 
 ```bash
@@ -49,55 +58,60 @@ uv run python scripts/verify_jwt.py "$JWT"
 ```
 
 The script runs the same `AuthRocketVerifier` the control plane uses; on
-success it prints the parsed claims. If anything fails — bad audience,
-missing claim, signature mismatch — file an issue before proceeding.
+success it prints the parsed claims. If anything fails — bad signature,
+wrong issuer, missing required claim — file an issue before proceeding.
 
 ## 4. Start the control plane
 
 `AuthRocketVerifier.from_settings` runs at FastAPI lifespan; if any
 required env var is missing the boot fails fast.
 
-## 5. First human login
+## 5. First human login (operator promotion + PAT mint)
 
-The first operator logs into the AuthRocket dev realm via the hosted UI,
-captures a fresh JWT (or uses a CLI flow once the deferred `qiita-admin
-login` lands), and calls any authenticated endpoint to trigger first-login
-upsert:
+`qiita-admin login` drives the LoginRocket Web flow end-to-end: it spawns
+a localhost loopback HTTP server, opens the browser to qiita's `/auth/login`,
+captures the AuthRocket round-trip, exchanges the resulting one-time code
+for a PAT, and saves it to `~/.qiita/token` (mode 0600).
 
 ```bash
-curl https://localhost/api/v1/auth/whoami \
-    -H "Authorization: Bearer $JWT"
+qiita-admin --base-url https://qiita.example.org login
 ```
 
-The resolver creates a `principal` row (`system_role='user'`), a `user` row
-keyed on that principal, and a `user_identities(iss, sub)` link in one
-transaction. An `oidc_create_principal` audit event is recorded.
+On the *first* login, the resolver creates a `principal` row
+(`system_role='user'`), a `user` row keyed on that principal, and a
+`user_identities(iss, sub)` link in one transaction. An
+`oidc_create_principal` audit event is recorded. The freshly-minted PAT is
+written to `~/.qiita/token`.
 
-## 6. Promote the operator to system_admin
-
-On the DB host (no HTTP auth required — `qiita-admin set-system-role` talks
-directly to Postgres):
+Then promote yourself to `system_admin` (direct DB; no HTTP auth needed):
 
 ```bash
 qiita-admin set-system-role --email operator@example.org --role system_admin
 ```
 
-The CLI refuses to operate on `idx=1`. After this, the operator can mint
-admin-scoped PATs.
+After the role change takes effect, the existing PAT carries `user`-level
+scopes. Re-run `qiita-admin login` to mint a fresh PAT scoped to the
+`system_admin` ceiling.
 
-## 7. Mint the operator's PAT
+### Headless / no-browser fallback
+
+For environments without a browser (SSH'd remote, CI, container without DISPLAY),
+`qiita-admin login` will print the URL it tried to open. Open it on a machine
+with a browser, complete the AuthRocket login, and the redirect will land at
+`http://127.0.0.1:<port>/?ot_code=<value>`. If that loopback isn't reachable
+on the same host, capture the JWT manually via the AuthRocket admin UI and use
+the legacy direct PAT mint:
 
 ```bash
-curl -X POST https://localhost/api/v1/auth/pat \
+curl -X POST https://qiita.example.org/api/v1/auth/pat \
     -H "Authorization: Bearer $JWT" \
     -H "Content-Type: application/json" \
     -d '{"label":"my-laptop","ttl_days":90}'
 ```
 
-Capture the plaintext `qk_...` token from the response — it is shown
-exactly once and is never logged or persisted in cleartext. Save it to
-`~/.qiita/token` (mode 0600) or export `QIITA_TOKEN` so the
-`qiita-admin` HTTP subcommands can use it.
+`POST /api/v1/auth/pat` continues to accept fresh OIDC JWTs in the
+`Authorization` header for this purpose. Save the plaintext `qk_...` to
+`~/.qiita/token` (mode 0600).
 
 ## 8. Mint the orchestrator service account
 

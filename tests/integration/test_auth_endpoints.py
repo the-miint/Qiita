@@ -18,12 +18,19 @@ from httpx import ASGITransport, AsyncClient
 # ---------------------------------------------------------------------------
 
 
+# Bound the JWT `aud` claim, the verifier's `audience` arg, and the Settings
+# `authrocket_audience` together. If these drift, audience-binding tests pass
+# for the wrong reason — the verifier silently mismatches what the signer put
+# in the token.
+_TEST_AUDIENCE = "test-audience"
+
+
 def _claims(jwks_harness, **overrides) -> dict:
     """Default claim set; override per test."""
     now = int(time.time())
     base = {
         "iss": jwks_harness.issuer,
-        "aud": "test-audience",
+        "aud": _TEST_AUDIENCE,
         "sub": f"sub-{int(time.time() * 1000)}",
         "email": f"u-{int(time.time() * 1000)}@example.com",
         "email_verified": True,
@@ -41,7 +48,7 @@ def _verifier(jwks_harness):
     return JwtVerifier(
         jwks_url=jwks_harness.jwks_url,
         issuer=jwks_harness.issuer,
-        audience="test-audience",
+        audience=_TEST_AUDIENCE,
         leeway_seconds=30,
     )
 
@@ -64,11 +71,15 @@ async def auth_client(postgres_pool, jwks_harness):
         hmac_secret_key=b"\x00" * 32,
         data_plane_url="unused",
         authrocket_issuer=jwks_harness.issuer,
-        authrocket_audience="test-audience",
+        authrocket_audience=_TEST_AUDIENCE,
         authrocket_jwks_url=jwks_harness.jwks_url,
+        authrocket_loginrocket_url="https://test-realm.example/lr",
         authrocket_jwt_leeway_seconds=30,
         authrocket_pat_max_auth_age_seconds=300,
         token_default_ttl_days=90,
+        qiita_endpoint_url="https://test-qiita.example",
+        auth_handoff_freshness_seconds=60,
+        cli_login_code_ttl_seconds=30,
     )
 
     created: list[int] = []
@@ -88,6 +99,7 @@ async def auth_client(postgres_pool, jwks_harness):
                 )
                 try:
                     for table in (
+                        "cli_login_codes",
                         "api_tokens",
                         "user_identities",
                         "user",
@@ -832,3 +844,324 @@ async def test_post_pat_rejects_jwt_with_future_auth_time(
         json={"label": "future-attempt"},
     )
     assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# GET /auth/login + GET /auth/handoff + POST /auth/cli-exchange
+# ---------------------------------------------------------------------------
+
+
+def _lr_claims(jwks_harness, **overrides) -> dict:
+    """Default claim set in the LoginRocket Web shape — no aud, no
+    email_verified, no auth_time. Used by handoff tests."""
+    now = int(time.time())
+    base = {
+        "iss": jwks_harness.issuer,
+        "sub": f"lr-{int(time.time() * 1000)}",
+        "email": f"lr-{int(time.time() * 1000)}@example.com",
+        "iat": now,
+        "exp": now + 3600,
+    }
+    base.update(overrides)
+    return base
+
+
+def _lr_verifier(jwks_harness):
+    """A verifier configured for the LoginRocket Web shape (no audience).
+
+    The handoff route reads this from app.state.oidc_verifier; the
+    fixture-default verifier is OIDC-strict, so tests that drive /auth/handoff
+    swap in this softened one for the duration of the call.
+    """
+    from qiita_control_plane.auth.oidc import JwtVerifier
+
+    return JwtVerifier(
+        jwks_url=jwks_harness.jwks_url,
+        issuer=jwks_harness.issuer,
+        audience=None,
+        leeway_seconds=30,
+    )
+
+
+def _make_login_cookie(*, cli: bool = False, port: int | None = None, age_ms: int = 0) -> str:
+    """Sign a login cookie using the same secret the auth_client fixture uses
+    (b'\\x00' * 32). `age_ms` shifts the timestamp into the past so tests can
+    exercise the freshness window."""
+    from qiita_control_plane.auth.handoff import sign_login_cookie
+
+    payload = {"timestamp_ms": int(time.time() * 1000) - age_ms, "cli": cli}
+    if cli and port is not None:
+        payload["port"] = port
+    return sign_login_cookie(payload, b"\x00" * 32)
+
+
+def _cookie_jar(cookie: str) -> dict[str, str]:
+    """Build the cookies dict for an httpx GET, keyed by the canonical name.
+
+    Avoids re-typing the cookie name on every test — the name is part of
+    qiita's public client contract (route layer + nginx log filters)."""
+    from qiita_control_plane.auth.handoff import LOGIN_COOKIE_NAME
+
+    return {LOGIN_COOKIE_NAME: cookie}
+
+
+async def test_auth_login_redirects_to_authrocket_with_prompt_login(auth_client):
+    """GET /auth/login should 302 to AuthRocket's /login endpoint with
+    prompt=login appended and the redirect_uri pointing back at /auth/handoff."""
+    from qiita_control_plane.auth.handoff import LOGIN_COOKIE_NAME
+
+    resp = await auth_client.get("/api/v1/auth/login", follow_redirects=False)
+    assert resp.status_code == 302
+    location = resp.headers["location"]
+    assert location.startswith("https://test-realm.example/lr/login?")
+    assert "prompt=login" in location
+    assert "%2Fapi%2Fv1%2Fauth%2Fhandoff" in location  # encoded path
+    # Cookie set so the handoff can verify freshness later.
+    assert f"{LOGIN_COOKIE_NAME}=" in resp.headers.get("set-cookie", "")
+
+
+async def test_auth_login_cli_mode_requires_port(auth_client):
+    """cli=1 without a port is rejected — without it the handoff has nowhere
+    to redirect the browser back to the CLI."""
+    resp = await auth_client.get(
+        "/api/v1/auth/login?cli=1",
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+
+
+async def test_auth_login_cli_mode_redirects_with_cookie(auth_client):
+    """cli=1&port=N sets a cookie that includes the port; handoff reads it
+    later to construct the loopback URL."""
+    resp = await auth_client.get(
+        "/api/v1/auth/login?cli=1&port=12345",
+        follow_redirects=False,
+    )
+    assert resp.status_code == 302
+
+
+async def test_handoff_browser_flow_mints_pat_and_renders_html(
+    auth_client, postgres_pool, jwks_harness
+):
+    """Browser flow: cookie set by /auth/login, JWT delivered by AuthRocket,
+    handoff verifies, mints PAT, returns HTML page with the PAT plaintext."""
+    from qiita_control_plane.auth.handoff import LOGIN_COOKIE_NAME
+    from qiita_control_plane.main import app
+
+    saved_verifier = app.state.oidc_verifier
+    app.state.oidc_verifier = _lr_verifier(jwks_harness)
+    try:
+        # First-login path: no pre-seeded user. The handoff resolver upserts.
+        token = jwks_harness.sign(
+            _lr_claims(
+                jwks_harness, sub="handoff-browser", email="handoff-browser@example.com"
+            )
+        )
+        cookie = _make_login_cookie(cli=False)
+        resp = await auth_client.get(
+            f"/api/v1/auth/handoff?token={token}",
+            cookies=_cookie_jar(cookie),
+            follow_redirects=False,
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.headers["content-type"].startswith("text/html")
+        body = resp.text
+        assert "handoff-browser@example.com" in body
+        # The PAT is rendered inside <pre>...</pre>; just check the prefix
+        # appears somewhere in the response.
+        assert "qk_" in body
+        # Cookie is scrubbed on success (max-age=0 in the Set-Cookie response).
+        scrubbed = resp.headers.get("set-cookie", "")
+        assert f"{LOGIN_COOKIE_NAME}=" in scrubbed
+        assert "Max-Age=0" in scrubbed or "max-age=0" in scrubbed.lower()
+
+        # Track the freshly-created principal for cleanup.
+        pidx = await postgres_pool.fetchval(
+            "SELECT principal_idx FROM qiita.user_identities"
+            " WHERE issuer = $1 AND subject = $2",
+            jwks_harness.issuer,
+            "handoff-browser",
+        )
+        assert pidx is not None
+        _track(auth_client, pidx)
+    finally:
+        app.state.oidc_verifier = saved_verifier
+
+
+async def test_handoff_cli_flow_redirects_to_loopback_with_ot_code(
+    auth_client, postgres_pool, jwks_harness
+):
+    """CLI flow: cookie carries cli=true and port; handoff redirects to
+    http://127.0.0.1:<port>/?ot_code=<plaintext>, and a row is written
+    to qiita.cli_login_codes."""
+    from qiita_control_plane.main import app
+
+    saved_verifier = app.state.oidc_verifier
+    app.state.oidc_verifier = _lr_verifier(jwks_harness)
+    try:
+        token = jwks_harness.sign(
+            _lr_claims(jwks_harness, sub="handoff-cli", email="handoff-cli@example.com")
+        )
+        cookie = _make_login_cookie(cli=True, port=14077)
+        resp = await auth_client.get(
+            f"/api/v1/auth/handoff?token={token}",
+            cookies=_cookie_jar(cookie),
+            follow_redirects=False,
+        )
+        assert resp.status_code == 302, resp.text
+        location = resp.headers["location"]
+        assert location.startswith("http://127.0.0.1:14077/?ot_code=")
+        # Exactly one row in cli_login_codes; consumed_at NULL until /cli-exchange.
+        rows = await postgres_pool.fetch(
+            "SELECT principal_idx, consumed_at FROM qiita.cli_login_codes"
+        )
+        assert len(rows) == 1
+        assert rows[0]["consumed_at"] is None
+
+        pidx = await postgres_pool.fetchval(
+            "SELECT principal_idx FROM qiita.user_identities"
+            " WHERE issuer = $1 AND subject = $2",
+            jwks_harness.issuer,
+            "handoff-cli",
+        )
+        _track(auth_client, pidx)
+    finally:
+        app.state.oidc_verifier = saved_verifier
+
+
+async def test_handoff_rejects_missing_cookie(auth_client, jwks_harness):
+    """No cookie → 401. The cookie is set by /auth/login; without it the
+    user hasn't gone through the documented flow."""
+    token = jwks_harness.sign(_lr_claims(jwks_harness))
+    resp = await auth_client.get(
+        f"/api/v1/auth/handoff?token={token}",
+        follow_redirects=False,
+    )
+    assert resp.status_code == 401
+
+
+async def test_handoff_rejects_expired_cookie(auth_client, jwks_harness):
+    """Cookie older than auth_handoff_freshness_seconds (60s default) → 401."""
+    from qiita_control_plane.main import app
+
+    saved_verifier = app.state.oidc_verifier
+    app.state.oidc_verifier = _lr_verifier(jwks_harness)
+    try:
+        token = jwks_harness.sign(_lr_claims(jwks_harness))
+        # Cookie timestamp 5 minutes in the past — well outside the 60s window.
+        cookie = _make_login_cookie(cli=False, age_ms=5 * 60 * 1000)
+        resp = await auth_client.get(
+            f"/api/v1/auth/handoff?token={token}",
+            cookies=_cookie_jar(cookie),
+            follow_redirects=False,
+        )
+        assert resp.status_code == 401
+    finally:
+        app.state.oidc_verifier = saved_verifier
+
+
+async def test_handoff_rejects_missing_token_param(auth_client):
+    """Cookie present but no ?token= → 400. Cookie validation happens first
+    so this is an *authenticated* missing-param error."""
+    cookie = _make_login_cookie(cli=False)
+    resp = await auth_client.get(
+        "/api/v1/auth/handoff",
+        cookies=_cookie_jar(cookie),
+        follow_redirects=False,
+    )
+    assert resp.status_code == 400
+
+
+async def test_handoff_rejects_invalid_jwt(auth_client, jwks_harness):
+    """A well-formed JWT signed with a different key → 401."""
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from qiita_control_plane.main import app
+
+    saved_verifier = app.state.oidc_verifier
+    app.state.oidc_verifier = _lr_verifier(jwks_harness)
+    try:
+        rogue_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        bad_token = jwks_harness.sign(_lr_claims(jwks_harness), key=rogue_key)
+        cookie = _make_login_cookie(cli=False)
+        resp = await auth_client.get(
+            f"/api/v1/auth/handoff?token={bad_token}",
+            cookies=_cookie_jar(cookie),
+            follow_redirects=False,
+        )
+        assert resp.status_code == 401
+    finally:
+        app.state.oidc_verifier = saved_verifier
+
+
+async def test_cli_exchange_returns_pat_once(
+    auth_client, postgres_pool, jwks_harness
+):
+    """First exchange returns the PAT; second is a 404 because consumed_at
+    is set atomically by the UPDATE."""
+    from qiita_control_plane.main import app
+
+    saved_verifier = app.state.oidc_verifier
+    app.state.oidc_verifier = _lr_verifier(jwks_harness)
+    try:
+        token = jwks_harness.sign(
+            _lr_claims(jwks_harness, sub="cli-exchange", email="cli-exchange@example.com")
+        )
+        cookie = _make_login_cookie(cli=True, port=15000)
+        handoff_resp = await auth_client.get(
+            f"/api/v1/auth/handoff?token={token}",
+            cookies=_cookie_jar(cookie),
+            follow_redirects=False,
+        )
+        assert handoff_resp.status_code == 302
+
+        location = handoff_resp.headers["location"]
+        # Extract ot_code from the redirect URL.
+        from urllib.parse import parse_qs, urlparse
+
+        ot_code = parse_qs(urlparse(location).query)["ot_code"][0]
+
+        # First exchange: should succeed with a PAT.
+        resp = await auth_client.post(
+            "/api/v1/auth/cli-exchange",
+            json={"ot_code": ot_code},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["token"].startswith("qk_")
+        assert body["token_idx"] > 0
+        assert isinstance(body["scopes"], list)
+        # Confirm the PAT actually works against /auth/whoami.
+        whoami = await auth_client.get(
+            "/api/v1/auth/whoami",
+            headers={"Authorization": f"Bearer {body['token']}"},
+        )
+        assert whoami.status_code == 200
+        assert whoami.json()["email"] == "cli-exchange@example.com"
+
+        # Second exchange: 404 (consumed).
+        resp2 = await auth_client.post(
+            "/api/v1/auth/cli-exchange",
+            json={"ot_code": ot_code},
+        )
+        assert resp2.status_code == 404
+
+        pidx = await postgres_pool.fetchval(
+            "SELECT principal_idx FROM qiita.user_identities"
+            " WHERE issuer = $1 AND subject = $2",
+            jwks_harness.issuer,
+            "cli-exchange",
+        )
+        _track(auth_client, pidx)
+    finally:
+        app.state.oidc_verifier = saved_verifier
+
+
+async def test_cli_exchange_unknown_code_returns_404(auth_client):
+    """An ot_code that doesn't match any row → 404. Same response shape as
+    'consumed' so an attacker can't distinguish unused-but-wrong from
+    correct-but-already-redeemed."""
+    resp = await auth_client.post(
+        "/api/v1/auth/cli-exchange",
+        json={"ot_code": "definitely-not-a-real-code-just-padding-bytes"},
+    )
+    assert resp.status_code == 404

@@ -127,12 +127,25 @@ def jwks_harness():
 # ---------------------------------------------------------------------------
 
 
+# Bound the JWT `aud` claim and the verifier's `audience` arg together — if the
+# two drift, audience-binding tests pass for the wrong reason. Centralizing
+# also lets the LoginRocket Web tests deliberately leave the claim absent
+# without confusing this constant for "not configured."
+_TEST_AUDIENCE = "test-audience"
+
+
 def _claims(jwks_harness, **overrides) -> dict:
-    """Default claim set; override per test."""
+    """Default claim set; override per test.
+
+    Includes the historical OIDC-strict shape (`aud`, `email_verified`,
+    `auth_time`-eligible) so legacy-strict tests keep working. Tests that
+    exercise the LoginRocket Web shape pop these via `_pop` or pass
+    overrides like `aud=None` and then strip the key before signing.
+    """
     now = int(time.time())
     base = {
         "iss": jwks_harness.issuer,
-        "aud": "test-audience",
+        "aud": _TEST_AUDIENCE,
         "sub": "test-subject-123",
         "email": "alice@example.com",
         "email_verified": True,
@@ -143,7 +156,23 @@ def _claims(jwks_harness, **overrides) -> dict:
     return base
 
 
-def _verifier(jwks_harness, *, audience: str = "test-audience", leeway: int = 30):
+def _loginrocket_claims(jwks_harness, **overrides) -> dict:
+    """Default claim set in the LoginRocket Web shape — no `aud`, no
+    `email_verified`, no `auth_time`. Used by tests that exercise the
+    softened verifier path."""
+    now = int(time.time())
+    base = {
+        "iss": jwks_harness.issuer,
+        "sub": "lr-subject-123",
+        "email": "lr-test@example.com",
+        "iat": now,
+        "exp": now + 3600,
+    }
+    base.update(overrides)
+    return base
+
+
+def _verifier(jwks_harness, *, audience: str | None = _TEST_AUDIENCE, leeway: int = 30):
     from qiita_control_plane.auth.oidc import JwtVerifier
 
     return JwtVerifier(
@@ -215,7 +244,7 @@ def test_verify_rejects_wrong_issuer(jwks_harness):
     v = JwtVerifier(
         jwks_url=jwks_harness.jwks_url,
         issuer="http://different-issuer.example",
-        audience="test-audience",
+        audience=_TEST_AUDIENCE,
         leeway_seconds=30,
     )
     with pytest.raises(InvalidJwt):
@@ -232,31 +261,24 @@ def test_verify_rejects_missing_email(jwks_harness):
         _verifier(jwks_harness).verify(token)
 
 
-def test_verify_rejects_email_verified_false(jwks_harness):
-    from qiita_control_plane.auth.oidc import InvalidJwt
-
-    token = jwks_harness.sign(_claims(jwks_harness, email_verified=False))
-    with pytest.raises(InvalidJwt, match="email_verified"):
-        _verifier(jwks_harness).verify(token)
-
-
-def test_verify_rejects_missing_email_verified_claim(jwks_harness):
-    from qiita_control_plane.auth.oidc import InvalidJwt
-
+def test_verify_accepts_token_without_email_verified(jwks_harness):
+    """LoginRocket Web tokens omit `email_verified`. The verifier no longer
+    requires it — the realm is responsible for enforcing email verification
+    at signup, and we trust the issuer rather than re-checking the claim."""
     claims = _claims(jwks_harness)
     del claims["email_verified"]
     token = jwks_harness.sign(claims)
-    with pytest.raises(InvalidJwt, match="email_verified"):
-        _verifier(jwks_harness).verify(token)
+    identity = _verifier(jwks_harness).verify(token)
+    assert identity.email == "alice@example.com"
 
 
-def test_verify_rejects_email_verified_as_string_true(jwks_harness):
-    """Strict boolean check — coerced "true" string is from an IdP we don't trust."""
-    from qiita_control_plane.auth.oidc import InvalidJwt
-
-    token = jwks_harness.sign(_claims(jwks_harness, email_verified="true"))
-    with pytest.raises(InvalidJwt, match="email_verified"):
-        _verifier(jwks_harness).verify(token)
+def test_verify_accepts_token_with_email_verified_false(jwks_harness):
+    """No longer rejected at verifier level. The realm-side policy is the
+    gate; if the IdP issues a token with `email_verified=false`, that's an
+    operator-policy issue (the realm should refuse to issue at all)."""
+    token = jwks_harness.sign(_claims(jwks_harness, email_verified=False))
+    identity = _verifier(jwks_harness).verify(token)
+    assert identity.email == "alice@example.com"
 
 
 def test_verify_rejects_missing_sub(jwks_harness):
@@ -316,12 +338,12 @@ def test_verify_rejects_beyond_leeway(jwks_harness):
 
 
 def test_verify_accepts_audience_as_string_matching_configured_aud(jwks_harness):
-    token = jwks_harness.sign(_claims(jwks_harness, aud="test-audience"))
+    token = jwks_harness.sign(_claims(jwks_harness, aud=_TEST_AUDIENCE))
     _verifier(jwks_harness).verify(token)
 
 
 def test_verify_accepts_audience_as_list_containing_configured_aud(jwks_harness):
-    token = jwks_harness.sign(_claims(jwks_harness, aud=["other-aud", "test-audience", "third"]))
+    token = jwks_harness.sign(_claims(jwks_harness, aud=["other-aud", _TEST_AUDIENCE, "third"]))
     _verifier(jwks_harness).verify(token)
 
 
@@ -384,15 +406,30 @@ def test_verifier_rejects_construction_with_empty_issuer():
         JwtVerifier(jwks_url="http://x", issuer="", audience="y", leeway_seconds=30)
 
 
-def test_verifier_rejects_construction_with_empty_audience():
+def test_verifier_normalizes_empty_audience_to_none():
+    """An empty-string audience is treated as None (audience-skipped) rather
+    than verify-against-empty-string. Matches Settings.from_env's `or None`
+    pattern; otherwise an empty AUTHROCKET_AUDIENCE env var would silently
+    misconfigure the verifier.
+    """
     from qiita_control_plane.auth.oidc import JwtVerifier
 
-    with pytest.raises(ValueError, match="audience"):
-        JwtVerifier(jwks_url="http://x", issuer="y", audience="", leeway_seconds=30)
+    v = JwtVerifier(jwks_url="http://x", issuer="y", audience="", leeway_seconds=30)
+    assert v.audience is None
+
+
+def test_verifier_constructs_with_audience_none():
+    """LoginRocket Web realms have no `aud` claim; constructing with
+    audience=None is the supported way to skip audience binding."""
+    from qiita_control_plane.auth.oidc import JwtVerifier
+
+    v = JwtVerifier(jwks_url="http://x", issuer="y", audience=None, leeway_seconds=30)
+    assert v.audience is None
 
 
 def test_authrocket_verifier_fails_fast_on_missing_settings(monkeypatch):
-    """from_settings raises when AuthRocket env vars aren't populated."""
+    """from_settings raises when required AUTHROCKET_* env vars aren't populated.
+    AUTHROCKET_AUDIENCE is no longer required (LoginRocket Web emits no `aud`)."""
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
     import base64
     import secrets as _secrets
@@ -414,7 +451,9 @@ def test_authrocket_verifier_fails_fast_on_missing_settings(monkeypatch):
 
 
 def test_authrocket_verifier_constructs_when_all_env_set(monkeypatch, jwks_harness):
-    """Sanity: with valid env, from_settings returns a working verifier."""
+    """Sanity: with valid env, from_settings returns a working verifier.
+    Includes AUTHROCKET_AUDIENCE for the OIDC-with-aud case (e.g. an OAuth2
+    Server integration on a higher AuthRocket plan tier)."""
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
     import base64
     import secrets as _secrets
@@ -424,7 +463,7 @@ def test_authrocket_verifier_constructs_when_all_env_set(monkeypatch, jwks_harne
         base64.b64encode(_secrets.token_bytes(32)).decode(),
     )
     monkeypatch.setenv("AUTHROCKET_ISSUER", jwks_harness.issuer)
-    monkeypatch.setenv("AUTHROCKET_AUDIENCE", "test-audience")
+    monkeypatch.setenv("AUTHROCKET_AUDIENCE", _TEST_AUDIENCE)
     monkeypatch.setenv("AUTHROCKET_JWKS_URL", jwks_harness.jwks_url)
 
     from qiita_control_plane.auth.oidc import AuthRocketVerifier
@@ -436,3 +475,72 @@ def test_authrocket_verifier_constructs_when_all_env_set(monkeypatch, jwks_harne
     token = jwks_harness.sign(_claims(jwks_harness))
     identity = v.verify(token)
     assert identity.email == "alice@example.com"
+
+
+def test_authrocket_verifier_constructs_when_audience_unset(monkeypatch, jwks_harness):
+    """LoginRocket Web realm: AUTHROCKET_AUDIENCE unset, verifier still
+    constructs and accepts tokens that lack the `aud` claim."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    import base64
+    import secrets as _secrets
+
+    monkeypatch.setenv(
+        "HMAC_SECRET_KEY",
+        base64.b64encode(_secrets.token_bytes(32)).decode(),
+    )
+    monkeypatch.setenv("AUTHROCKET_ISSUER", jwks_harness.issuer)
+    monkeypatch.delenv("AUTHROCKET_AUDIENCE", raising=False)
+    monkeypatch.setenv("AUTHROCKET_JWKS_URL", jwks_harness.jwks_url)
+
+    from qiita_control_plane.auth.oidc import AuthRocketVerifier
+    from qiita_control_plane.config import Settings
+
+    settings = Settings.from_env()
+    v = AuthRocketVerifier.from_settings(settings)
+    assert v.audience is None
+
+    token = jwks_harness.sign(_loginrocket_claims(jwks_harness))
+    identity = v.verify(token)
+    assert identity.email == "lr-test@example.com"
+    assert identity.auth_time is None
+
+
+# ---------------------------------------------------------------------------
+# LoginRocket Web token shape (no aud, no email_verified, no auth_time)
+# ---------------------------------------------------------------------------
+
+
+def test_verify_accepts_token_without_aud_when_audience_is_none(jwks_harness):
+    """The headline LoginRocket Web case: token has no `aud`, verifier
+    constructed with audience=None accepts it."""
+    token = jwks_harness.sign(_loginrocket_claims(jwks_harness))
+    identity = _verifier(jwks_harness, audience=None).verify(token)
+    assert identity.email == "lr-test@example.com"
+    assert identity.auth_time is None
+
+
+def test_verify_rejects_token_without_aud_when_audience_is_set(jwks_harness):
+    """Conversely: when audience IS configured, a token without `aud` is
+    still rejected. The softening is opt-in, not always-on."""
+    from qiita_control_plane.auth.oidc import InvalidJwt
+
+    token = jwks_harness.sign(_loginrocket_claims(jwks_harness))
+    with pytest.raises(InvalidJwt):
+        _verifier(jwks_harness, audience=_TEST_AUDIENCE).verify(token)
+
+
+def test_verify_accepts_token_without_auth_time(jwks_harness):
+    """auth_time is no longer used as a freshness anchor; absence is fine.
+    OIDCIdentity.auth_time should be None."""
+    token = jwks_harness.sign(_loginrocket_claims(jwks_harness))
+    identity = _verifier(jwks_harness, audience=None).verify(token)
+    assert identity.auth_time is None
+
+
+def test_verify_propagates_auth_time_when_present(jwks_harness):
+    """If a realm does emit auth_time (OAuth2 Server integration), it's
+    surfaced unchanged for callers that want it."""
+    auth_time = int(time.time()) - 30
+    token = jwks_harness.sign(_loginrocket_claims(jwks_harness, auth_time=auth_time))
+    identity = _verifier(jwks_harness, audience=None).verify(token)
+    assert identity.auth_time == auth_time
