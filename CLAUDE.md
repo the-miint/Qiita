@@ -16,7 +16,7 @@ make build
 
 # Test
 make test                  # unit tests (all components)
-make test-integration      # requires Docker (or use a host postgres, which is what CI does on macOS — see docs/runbooks/integration-tests-host-postgres.md); runs Python + Rust integration suites against postgres on :5433; excludes -m system
+make test-integration      # requires Docker (or use a host postgres, which is what CI does on macOS — see docs/runbooks/integration-tests-host-postgres.md); runs Python + Rust integration suites against postgres on :5433 in Docker mode (default) or :5432 in host mode; excludes -m system
 make test-system           # real GG2 backbone data; slow (~10 min); needs localdocs/scratch/
 make test-workflows        # requires apptainer (Linux-only — macOS skips gracefully); CI runs this on ubuntu only
 
