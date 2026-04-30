@@ -231,12 +231,19 @@ def _loopback_handler_factory(result: _LoopbackResult):
                 self.send_error(404, "missing ot_code")
                 return
             result.ot_code = ot_code_values[0]
+            # Signal the main thread *before* writing the response: the event
+            # means "ot_code is captured," not "browser has the done-page."
+            # If we set it after wfile.write the test client (or a fast user)
+            # can return from .read() and check the event before this line
+            # runs — a race CI exposes reliably. server.shutdown() in the
+            # caller still waits for this handler to finish, so the browser
+            # gets the full response either way.
+            result.event.set()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(_LOOPBACK_DONE_HTML)))
             self.end_headers()
             self.wfile.write(_LOOPBACK_DONE_HTML)
-            result.event.set()
 
         def log_message(self, *args, **kwargs):
             # Stay quiet; the CLI prints its own status.
