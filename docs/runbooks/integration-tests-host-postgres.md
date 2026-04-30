@@ -63,10 +63,10 @@ psql -d postgres -c "CREATE DATABASE qiita_test OWNER qiita;"
 psql -d postgres -c "CREATE DATABASE qiita_ducklake OWNER qiita;"
 ```
 
-# Test Run
+## Test Run
 
 Run this to export the seven
-environment variables `make test-integration` reads in host mode. 
+environment variables `make test-integration` reads in host mode.
 Must be run once in every shell where testing is being done.
 
 ```bash
