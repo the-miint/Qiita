@@ -1,0 +1,65 @@
+name: Setup libduckdb
+description: |
+  Cache and download libduckdb for the host OS so the Rust crate can link
+  against it instead of compiling DuckDB from source. Optionally cache
+  DuckDB extensions and set the runtime dynamic-linker path env var
+  (DYLD_LIBRARY_PATH on macOS, LD_LIBRARY_PATH elsewhere).
+
+inputs:
+  version:
+    description: libduckdb version (without the leading 'v').
+    required: false
+    default: "1.5.2"
+  runtime-libpath:
+    description: |
+      Set DYLD_LIBRARY_PATH (macOS) or LD_LIBRARY_PATH (Linux) so test
+      binaries can dlopen libduckdb. Needed by `cargo test`, not by clippy/fmt.
+    required: false
+    default: "false"
+  cache-extensions:
+    description: Also cache ~/.duckdb/extensions across runs (test-only).
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Cache libduckdb
+      id: cache-libduckdb
+      uses: actions/cache@v5
+      with:
+        path: ~/.duckdb/lib
+        key: libduckdb-${{ runner.os }}-v${{ inputs.version }}
+
+    - name: Download libduckdb
+      if: steps.cache-libduckdb.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        mkdir -p ~/.duckdb/lib
+        if [ "$RUNNER_OS" = "macOS" ]; then
+          asset="libduckdb-osx-universal.zip"
+        else
+          asset="libduckdb-linux-amd64.zip"
+        fi
+        curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${{ inputs.version }}/$asset" \
+          -o /tmp/libduckdb.zip
+        unzip -j /tmp/libduckdb.zip -d ~/.duckdb/lib
+
+    - name: Cache duckdb extensions
+      if: inputs.cache-extensions == 'true'
+      uses: actions/cache@v5
+      with:
+        path: ~/.duckdb/extensions
+        key: duckdb-ext-${{ runner.os }}-v${{ inputs.version }}
+
+    - name: Set DUCKDB env vars
+      shell: bash
+      run: |
+        echo "DUCKDB_LIB_DIR=$HOME/.duckdb/lib" >> "$GITHUB_ENV"
+        if [ "${{ inputs.runtime-libpath }}" = "true" ]; then
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            echo "DYLD_LIBRARY_PATH=$HOME/.duckdb/lib" >> "$GITHUB_ENV"
+          else
+            echo "LD_LIBRARY_PATH=$HOME/.duckdb/lib" >> "$GITHUB_ENV"
+          fi
+        fi

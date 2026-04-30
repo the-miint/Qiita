@@ -30,6 +30,12 @@ import asyncpg
 import duckdb
 import pyarrow.flight as flight
 import pytest
+from _pg_env import (
+    LIB_PATH_ENV,
+    ducklake_catalog_connstr,
+    find_duckdb_lib_dir,
+    postgres_url,
+)
 from httpx import ASGITransport, AsyncClient
 
 DATA_DIR = Path(__file__).parent.parent.parent / "localdocs" / "scratch"
@@ -42,9 +48,8 @@ _SYSTEM_TEST_BASE = Path(
     os.environ.get("QIITA_SYSTEM_TEST_DIR", Path.home() / ".qiita-system-test")
 )
 DUCKLAKE_DATA_PATH = str(_SYSTEM_TEST_BASE / "ducklake-data")
-DUCKLAKE_CONNSTR = (
-    "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita"
-)
+POSTGRES_URL = postgres_url()
+DUCKLAKE_CATALOG_CONNSTR = ducklake_catalog_connstr()
 DATA_PLANE_PORT = 50097
 
 pytestmark = [
@@ -69,9 +74,7 @@ def _reset_ducklake_catalog():
     import asyncio
 
     async def _do():
-        conn = await asyncpg.connect(
-            "postgresql://qiita:qiita@localhost:5433/qiita_test"
-        )
+        conn = await asyncpg.connect(POSTGRES_URL)
         await conn.execute(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
             "WHERE datname = 'qiita_ducklake' AND pid != pg_backend_pid()"
@@ -98,7 +101,7 @@ def data_plane_process(hmac_secret):
     conn = duckdb.connect(":memory:")
     conn.execute("LOAD ducklake; LOAD postgres;")
     conn.execute(
-        f"ATTACH 'ducklake:postgres:{DUCKLAKE_CONNSTR}' AS qiita_lake"
+        f"ATTACH 'ducklake:postgres:{DUCKLAKE_CATALOG_CONNSTR}' AS qiita_lake"
         f" (DATA_PATH '{DUCKLAKE_DATA_PATH}');"
     )
     # Tables are created by the data plane binary at startup; we just need the
@@ -122,20 +125,18 @@ def data_plane_process(hmac_secret):
     if not os.path.exists(binary):
         pytest.skip(f"binary not found at {binary}")
 
-    duckdb_lib_dir = os.path.join(
-        dp_dir, "target", "duckdb-download", "x86_64-unknown-linux-gnu", "1.5.2"
-    )
-    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-    if os.path.isdir(duckdb_lib_dir):
-        ld_path = f"{duckdb_lib_dir}:{ld_path}" if ld_path else duckdb_lib_dir
+    duckdb_lib_dir = find_duckdb_lib_dir(Path(dp_dir))
+    lib_path = os.environ.get(LIB_PATH_ENV, "")
+    if duckdb_lib_dir is not None:
+        lib_path = f"{duckdb_lib_dir}:{lib_path}" if lib_path else str(duckdb_lib_dir)
 
     env = {
         **os.environ,
         "LISTEN_ADDR": f"127.0.0.1:{DATA_PLANE_PORT}",
         "HMAC_SECRET_KEY": base64.b64encode(hmac_secret).decode(),
-        "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CONNSTR,
+        "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CATALOG_CONNSTR,
         "DUCKLAKE_DATA_PATH": DUCKLAKE_DATA_PATH,
-        "LD_LIBRARY_PATH": ld_path,
+        LIB_PATH_ENV: lib_path,
     }
 
     proc = subprocess.Popen(

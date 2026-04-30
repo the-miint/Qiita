@@ -90,7 +90,9 @@ test-workflows:
 	apptainer exec /tmp/qiita-workflow-smoke.sif echo "hello world"
 	rm -f /tmp/qiita-workflow-smoke.sif
 
-# Run integration tests (requires Docker for Postgres)
+# Run integration tests (requires Docker for Postgres, OR set
+# QIITA_USE_HOST_POSTGRES=1 to use a Postgres provisioned outside this Makefile
+# — useful on macOS where Docker isn't available; CI uses this on macos-latest).
 # Runs Python integration tests + Rust DuckLake tests (which need Postgres).
 # System tests (real GG2 data) are excluded — use make test-system.
 # Builds the data plane debug binary first so Python tests can spawn it
@@ -101,23 +103,35 @@ test-workflows:
 # use different DATA_PATH values (Python picks a pytest tmp_path_factory dir,
 # Rust defaults to /tmp/qiita-integration-ducklake-data). Mirrors the Python
 # _reset_ducklake_catalog() helper in tests/integration/conftest.py.
+ifeq ($(QIITA_USE_HOST_POSTGRES),1)
+PG_BRINGUP  := true
+PG_TEARDOWN := true
+# Host mode reads PGHOST/PGPORT/PGUSER/PGPASSWORD from the environment.
+PG_PSQL     := psql
+else
+PG_BRINGUP  := docker compose up -d --wait
+PG_TEARDOWN := docker compose down
+PG_PSQL     := docker compose exec -T postgres psql -U qiita
+endif
+
 test-integration: build-data-plane-debug $(DBMATE_BIN)
-	cd tests/integration && docker compose up -d --wait && \
+	cd tests/integration && $(PG_BRINGUP) && \
 	  (uv run pytest -m 'not system'; PY_EC=$$?; \
-	   docker compose exec -T postgres psql -U qiita -d postgres \
+	   $(PG_PSQL) -d postgres \
 	     -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'qiita_ducklake' AND pid != pg_backend_pid()" \
 	     -c "DROP DATABASE IF EXISTS qiita_ducklake" \
 	     -c "CREATE DATABASE qiita_ducklake OWNER qiita"; \
 	   cd ../../qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test --features integration; RS_EC=$$?; \
-	   cd ../tests/integration && docker compose down; \
+	   cd ../tests/integration && $(PG_TEARDOWN); \
 	   exit $$(( PY_EC > RS_EC ? PY_EC : RS_EC )))
 
-# Run system tests with real GG2 backbone data (requires Docker + data in localdocs/scratch/)
+# Run system tests with real GG2 backbone data (requires Docker + data in localdocs/scratch/,
+# or QIITA_USE_HOST_POSTGRES=1 with a host-provisioned Postgres).
 # Slow (~10 min): hashes 331K sequences, mints features, writes chunked Parquet.
 test-system: build-data-plane-debug
-	cd tests/integration && docker compose up -d --wait && \
+	cd tests/integration && $(PG_BRINGUP) && \
 	  (uv run pytest -m system -x --timeout=2700; PY_EC=$$?; \
-	   docker compose down; \
+	   $(PG_TEARDOWN); \
 	   exit $$PY_EC)
 
 # Lint all components

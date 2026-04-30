@@ -20,23 +20,20 @@ import asyncpg
 import httpx
 import pytest
 import pytest_asyncio
+from _pg_env import (
+    LIB_PATH_ENV,
+    ducklake_catalog_connstr,
+    find_duckdb_lib_dir,
+    postgres_url,
+)
 
-# Pin sslmode=disable on every connection: the test postgres container
-# has SSL off, and on environments that inherit `PGSSLMODE=require` from
-# the surrounding shell (e.g. GitHub Actions ubuntu-latest's pre-installed
-# PostgreSQL setup) the dbmate, asyncpg, and DuckLake postgres clients
-# would otherwise fail with "SSL is not enabled on the server".
-POSTGRES_URL = "postgresql://qiita:qiita@localhost:5433/qiita_test?sslmode=disable"
+POSTGRES_URL = postgres_url()
 REPO_ROOT = Path(__file__).parent.parent.parent
 MIGRATIONS_DIR = str(REPO_ROOT / "qiita-control-plane" / "db" / "migrations")
 DATA_PLANE_DIR = REPO_ROOT / "qiita-data-plane"
 DATA_PLANE_BINARY = DATA_PLANE_DIR / "target" / "debug" / "qiita-data-plane"
-DUCKDB_LIB_DIR = (
-    DATA_PLANE_DIR / "target" / "duckdb-download" / "x86_64-unknown-linux-gnu" / "1.5.2"
-)
-DUCKLAKE_CATALOG_CONNSTR = (
-    "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita sslmode=disable"
-)
+DUCKDB_LIB_DIR = find_duckdb_lib_dir(DATA_PLANE_DIR)
+DUCKLAKE_CATALOG_CONNSTR = ducklake_catalog_connstr()
 
 
 def _run_migrations(postgres_url: str) -> None:
@@ -481,9 +478,9 @@ def data_plane(hmac_secret, tmp_path_factory):
     data_path = str(tmp_path_factory.mktemp("ducklake-data"))
     port = _alloc_free_port()
 
-    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-    if DUCKDB_LIB_DIR.is_dir():
-        ld_path = f"{DUCKDB_LIB_DIR}:{ld_path}" if ld_path else str(DUCKDB_LIB_DIR)
+    lib_path = os.environ.get(LIB_PATH_ENV, "")
+    if DUCKDB_LIB_DIR is not None and DUCKDB_LIB_DIR.is_dir():
+        lib_path = f"{DUCKDB_LIB_DIR}:{lib_path}" if lib_path else str(DUCKDB_LIB_DIR)
 
     env = {
         **os.environ,
@@ -491,7 +488,7 @@ def data_plane(hmac_secret, tmp_path_factory):
         "HMAC_SECRET_KEY": base64.b64encode(hmac_secret).decode(),
         "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CATALOG_CONNSTR,
         "DUCKLAKE_DATA_PATH": data_path,
-        "LD_LIBRARY_PATH": ld_path,
+        LIB_PATH_ENV: lib_path,
     }
 
     proc = subprocess.Popen(
