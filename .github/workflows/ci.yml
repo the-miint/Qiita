@@ -8,6 +8,7 @@ concurrency:
 jobs:
   lint-python:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -18,6 +19,7 @@ jobs:
 
   lint-rust:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -34,6 +36,7 @@ jobs:
   test-python:
     needs: lint-python
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -45,6 +48,7 @@ jobs:
   test-rust:
     needs: lint-rust
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -64,6 +68,7 @@ jobs:
   test-integration:
     needs: [test-python, test-rust]
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
