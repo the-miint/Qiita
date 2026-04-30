@@ -209,6 +209,17 @@ class ApiTokenSummary(BaseModel):
     created_at: AwareDatetime
 
 
+class CliLoginExchangeRequest(BaseModel):
+    """Body for POST /api/v1/auth/cli-exchange.
+
+    The CLI redeems a one-time `ot_code` it captured from the AuthRocket
+    handoff redirect. Server consumes the row atomically and returns the
+    PAT plaintext exactly once via ApiTokenMintResponse.
+    """
+
+    ot_code: str = Field(min_length=16, max_length=128)
+
+
 # ============================================================================
 # Auth: admin-surface models
 # ============================================================================

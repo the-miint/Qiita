@@ -389,15 +389,34 @@ async def test_resolver_409s_on_email_collision_with_different_iss_sub(
         assert "attempted_email_sha256" in d
 
 
-async def test_resolver_rejects_jwt_with_email_verified_false(
+async def test_resolver_accepts_jwt_with_email_verified_false(
     resolver_client, jwks_harness
 ):
-    claims = _claims(jwks_harness, email_verified=False, sub="ev-false")
+    """The verifier no longer strict-checks email_verified — LoginRocket Web
+    JWTs omit the claim entirely, and the realm enforces verification at
+    signup as policy. See docs/auth.md and the realm runbook.
+
+    The resolver therefore accepts tokens with `email_verified=false` (or
+    missing) and creates the principal as usual. If a realm operator
+    misconfigures and allows unverified emails through, that's a realm-side
+    policy issue, not something the verifier should re-check.
+    """
+    # Use a unique email so this test doesn't collide with stale state from
+    # an earlier run that minted a principal under the same default email.
+    claims = _claims(
+        jwks_harness,
+        email_verified=False,
+        sub="ev-false",
+        email=f"ev-false-{int(time.time() * 1000)}@example.com",
+    )
     token = jwks_harness.sign(claims)
     resp = await resolver_client.get(
         "/resolve", headers={"Authorization": f"Bearer {token}"}
     )
-    assert resp.status_code == 401
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    _track(resolver_client, body["principal_idx"])
+    assert body["kind"] == "human"
 
 
 # ---------------------------------------------------------------------------

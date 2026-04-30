@@ -1,8 +1,8 @@
 # Authentication
 
-**Purpose.** This document is the reference for the Qiita authentication and authorization surface: the principal model and its DB schema, OIDC and opaque-token verification, scopes and roles, the auth/admin/user endpoints, and the `qiita-admin` CLI. Operational procedures (first deploy, token rotation) live under [`docs/runbooks/`](runbooks/) and are linked at the bottom.
+**Purpose.** This document is the reference for the Qiita authentication and authorization surface: the principal model and its DB schema, OIDC and opaque-token verification, scopes and roles, the auth/admin/user endpoints, and the `qiita-admin` CLI. Operational procedures (first deploy, token rotation, AuthRocket realm setup) live under [`docs/runbooks/`](runbooks/) and are linked at the bottom.
 
-> **Known gap:** the OIDC PKCE code-exchange (`POST /auth/login` + `qiita-admin login`) is **not** shipped — building it requires a code-exchange test harness that does not yet exist. Today's path: operators obtain an AuthRocket JWT out-of-band (AuthRocket admin UI / external CLI) within `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS` of login, then call `POST /api/v1/auth/pat` directly to mint a PAT. The `qiita-admin login` subcommand currently exits with status 2 and a message pointing at this path. See `qiita-control-plane/src/qiita_control_plane/cli/admin.py::main` and the `routes/auth.py` module docstring.
+> **Integration: AuthRocket LoginRocket Web.** Qiita uses AuthRocket's *LoginRocket Web* hosted-redirect flow (not OIDC PKCE). The OAuth2 Server integration is plan-gated; LoginRocket Web is the available alternative on the current realm tier. JWTs are RS256, JWKS-verified, and consumed by qiita's existing `JwtVerifier` — only the routes around the JWT change. Trade-off accepted: AuthRocket lock-in for the login flow itself; the verifier and resolver code stays portable. See [`runbooks/authrocket-realm-setup.md`](runbooks/authrocket-realm-setup.md).
 
 Qiita authenticates three kinds of principal against the control plane:
 
@@ -166,12 +166,12 @@ Coalesces to ≤1 write per token per minute via the predicate. Pure observabili
 
 ## OIDC verification
 
-Human users authenticate via AuthRocket OIDC. JWTs are RS256-signed; the verifier fetches the public key from `{issuer}/connect/jwks` via PyJWT's `PyJWKClient`, which caches in-memory and refreshes automatically when it encounters an unknown `kid` (so AuthRocket key rotation never needs a redeploy).
+Human users authenticate via AuthRocket. JWTs are RS256-signed; the verifier fetches the public key from the realm's JWKS endpoint via PyJWT's `PyJWKClient`, which caches in-memory and refreshes automatically when it encounters an unknown `kid` (so AuthRocket key rotation never needs a redeploy).
 
 The verifier is split into two layers:
 
-- **`auth.oidc.JwtVerifier`** — pure. Takes `jwks_url`, `issuer`, `audience`, `leeway_seconds`. Tests exercise this directly against a local JWKS harness.
-- **`auth.oidc.AuthRocketVerifier`** — config-bound subclass. `from_settings(settings)` raises `RuntimeError` if any of `AUTHROCKET_ISSUER` / `AUTHROCKET_AUDIENCE` / `AUTHROCKET_JWKS_URL` is missing — fail-fast at FastAPI lifespan, no silent run-with-auth-disabled.
+- **`auth.oidc.JwtVerifier`** — pure. Takes `jwks_url`, `issuer`, `audience` (optional), `leeway_seconds`. Tests exercise this directly against a local JWKS harness.
+- **`auth.oidc.AuthRocketVerifier`** — config-bound subclass. `from_settings(settings)` raises `RuntimeError` if any of `AUTHROCKET_ISSUER` / `AUTHROCKET_JWKS_URL` is missing — fail-fast at FastAPI lifespan, no silent run-with-auth-disabled. `AUTHROCKET_AUDIENCE` is *optional*: LoginRocket Web realms emit tokens without an `aud` claim, and the verifier skips audience binding when it's unset.
 
 ### What `verify(token)` checks
 
@@ -180,10 +180,11 @@ The verifier is split into two layers:
 | Signature | PyJWT against the JWKS-fetched key matching the JWT's `kid`, algorithm pinned to RS256 (HS256 / `none` rejected) |
 | `exp` | within `leeway_seconds` (default 30s) |
 | `iss` | exact match to configured issuer |
-| `aud` | configured audience present (string or list — both accepted) |
-| `email_verified` | strict boolean `True` (the string `"true"` is rejected — coerced strings indicate an IdP we don't trust) |
+| `aud` | when `AUTHROCKET_AUDIENCE` is set, must contain the configured audience (string or list — both accepted). Skipped on LoginRocket Web realms (no `aud` claim emitted; the realm's JWKS is the trust boundary). |
 | `email`, `sub` | present and non-empty strings |
-| `auth_time` | optional; returned in `OIDCIdentity` if present (callers like `POST /auth/pat` enforce freshness) |
+| `auth_time` | optional; surfaced on `OIDCIdentity` if present, else `None`. Not used as a freshness anchor — see "Login flow" below. |
+
+`email_verified` is **not** strict-checked. AuthRocket realms enforce email verification at signup as policy (see [`runbooks/authrocket-realm-setup.md`](runbooks/authrocket-realm-setup.md)); the verifier trusts that policy rather than re-checking the claim, since LoginRocket Web tokens omit it entirely.
 
 On success, returns `OIDCIdentity(issuer, subject, email, auth_time, raw_claims)`. On any failure, raises `auth.oidc.InvalidJwt` with a static error message — token contents and claim values are never embedded in exception messages.
 
@@ -191,14 +192,48 @@ On success, returns `OIDCIdentity(issuer, subject, email, auth_time, raw_claims)
 
 `Settings.from_env()` reads:
 
-- `AUTHROCKET_ISSUER` (required for verifier construction)
-- `AUTHROCKET_AUDIENCE` (required)
-- `AUTHROCKET_JWKS_URL` (defaults to `{issuer}/connect/jwks` if unset)
+- `AUTHROCKET_ISSUER` (required for verifier construction; for AuthRocket SaaS realms this is the canonical `https://authrocket.com`, **not** the loginrocket subdomain — the subdomain is the *endpoint*, not the issuer)
+- `AUTHROCKET_JWKS_URL` (defaults to `{issuer}/connect/jwks` if unset; for LoginRocket Web set to the realm's `https://<realm>.loginrocket.com/connect/jwks`)
+- `AUTHROCKET_AUDIENCE` (optional; leave unset for LoginRocket Web)
+- `AUTHROCKET_LOGINROCKET_URL` (required for `/auth/login`; the realm's `https://<realm>.loginrocket.com` base URL)
 - `AUTHROCKET_JWT_LEEWAY_SECONDS` (default 30)
-- `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS` (default 300; consumed by the PAT-mint freshness check, not by the verifier itself)
+- `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS` (default 300; consumed by the legacy `POST /auth/pat` freshness check; the new `/auth/handoff` flow uses the cookie-anchored window below)
 - `QIITA_TOKEN_DEFAULT_TTL_DAYS` (default 90; consumed by PAT mint)
+- `QIITA_ENDPOINT_URL` (required for `/auth/login`; qiita's externally-resolvable URL, used to build the `redirect_uri` AuthRocket bounces back to)
+- `AUTH_HANDOFF_FRESHNESS_SECONDS` (default 60; cookie window for `/auth/login` → `/auth/handoff`)
+- `CLI_LOGIN_CODE_TTL_SECONDS` (default 30; one-time code TTL for the CLI loopback exchange)
 
-These fields are *optional* on `Settings` so non-auth tests don't have to set every `AUTHROCKET_*` env var. Required-ness is enforced at `AuthRocketVerifier.from_settings` time.
+These fields are *optional* on `Settings` so non-auth tests don't have to set every `AUTHROCKET_*` env var. Required-ness is enforced at `AuthRocketVerifier.from_settings` time and at request time on the routes that consume them.
+
+## Login flow
+
+Qiita's login flow uses AuthRocket's LoginRocket Web hosted-redirect path. The user-facing entry point is `GET /auth/login`, which sets a signed login cookie and redirects to the realm's hosted login UI. After successful authentication, AuthRocket bounces back to `GET /auth/handoff?token=<JWT>`. The handoff route verifies cookie freshness, verifies the JWT, runs the standard OIDC resolver upsert, and mints a PAT.
+
+```
+                  GET /auth/login (sets signed cookie)
+   user ─────────────────────────────► qiita ─────► 302 to AuthRocket
+   user ──── login UI on AuthRocket ───────────► (interactive auth)
+                                                      │
+                  GET /auth/handoff?token=<JWT>       │
+   user ◄────────────────────────────── AuthRocket  ◄─┘
+                       │
+   user ──────────────►│ qiita: verify cookie (freshness),
+                       │        verify JWT (sig/iss/exp),
+                       │        upsert principal/user/identity,
+                       │        mint PAT
+                       ▼
+   browser flow:  HTML page renders the PAT for the user to copy
+   CLI flow:      302 to http://127.0.0.1:<port>/?ot_code=<plaintext>
+                  (CLI's loopback captures it; POSTs to /auth/cli-exchange)
+```
+
+**Why a server-side cookie for freshness, not `auth_time`.** AuthRocket's LoginRocket Web emits the same JWT across cached browser sessions — the JWT's `iat`/`auth_time` reflect the *first* interactive login on that session, not the most recent. To make sure each `/auth/handoff` is anchored to a fresh interactive event, qiita sets a signed cookie carrying a millisecond timestamp at `/auth/login`, then enforces `now - cookie.timestamp < AUTH_HANDOFF_FRESHNESS_SECONDS` at `/auth/handoff`. The cookie is HMAC-signed with `HMAC_SECRET_KEY`, `HttpOnly; Secure; SameSite=Lax; Path=/`, and consumed (set with `Max-Age=0`) on first read so a replayed redirect URL doesn't re-trigger the flow. See `auth.handoff` for the helpers.
+
+`/auth/login` always appends `&prompt=login` to the AuthRocket URL. AuthRocket honors it (shows the login form) even when a session is cached — this is independent of the JWT-reuse behavior above and is what blocks "logged-in browser walked away → attacker pivots."
+
+**CLI flow.** When `qiita-admin login` invokes `/auth/login?cli=1&port=N`, the cookie carries `cli=true` and the loopback port. The handoff branches on `cli`: it generates a one-time code, inserts the freshly-minted PAT plaintext into `qiita.cli_login_codes` keyed by `SHA-256(ot_code)`, and redirects the browser to `http://127.0.0.1:<port>/?ot_code=<plaintext>`. The CLI's loopback HTTP server captures the code and POSTs it to `/auth/cli-exchange`, which atomically consumes the row (`UPDATE … SET consumed_at = now() WHERE consumed_at IS NULL RETURNING …`) and returns the PAT plaintext exactly once. TTL on `cli_login_codes` is `CLI_LOGIN_CODE_TTL_SECONDS` (30s by default) — short enough that an intercepted code dies almost immediately.
+
+`/auth/cli-exchange` returns `404` for any of: unknown code, expired code, already-consumed code. Conflating these prevents an attacker walking ot-code values from distinguishing "wrong" from "right but redeemed."
 
 ## Scopes and roles
 
@@ -273,10 +308,10 @@ Installed as the `qiita-admin` console script via `qiita-control-plane`'s pyproj
 
 | Subcommand | Path | Notes |
 |---|---|---|
-| `set-system-role --email X --role Y` | direct DB | Bootstrap path — sets `qiita.principal.system_role` by email lookup against `qiita.user`. Refuses to operate on `idx=1`. The user must have logged in via OIDC at least once (which is what creates their `principal+user` rows). |
+| `set-system-role --email X --role Y` | direct DB | Bootstrap path — sets `qiita.principal.system_role` by email lookup against `qiita.user`. Refuses to operate on `idx=1`. The user must have logged in via AuthRocket at least once (which is what creates their `principal+user` rows). |
 | `whoami` | HTTP | Calls `GET /api/v1/auth/whoami`. PAT read from `QIITA_TOKEN` env or `~/.qiita/token` (mode 0600 expected). |
 | `token revoke-all --principal-idx N` | HTTP | Calls `POST /api/v1/admin/principals/{N}/revoke-all-tokens`. |
-| `login` | not yet shipped | The PKCE + OIDC code-exchange flow is **not** wired up (see the Known gap banner above). Exits 2 with a message pointing at the alternative: obtain a JWT out-of-band and call `POST /api/v1/auth/pat` directly. |
+| `login` | HTTP | Drives the LoginRocket Web flow end-to-end. Spawns a localhost loopback HTTP server, opens the browser to `/api/v1/auth/login?cli=1&port=N`, captures the one-time code from the redirect, exchanges it at `/api/v1/auth/cli-exchange`, and writes the PAT to `--token-file` (default `~/.qiita/token`, mode 0600). On timeout or error, prints an actionable message and exits non-zero. |
 
 ## Orchestrator integration
 

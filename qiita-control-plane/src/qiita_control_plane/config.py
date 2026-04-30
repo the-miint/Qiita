@@ -12,6 +12,13 @@ from qiita_common.config import require_env
 _DEFAULT_JWT_LEEWAY_SECONDS = 30
 _DEFAULT_PAT_MAX_AUTH_AGE_SECONDS = 300
 _DEFAULT_TOKEN_TTL_DAYS = 90
+# Cookie holding {state, timestamp_ms, cli, port} is set on /auth/login and
+# read on /auth/handoff. The window bounds how long a user may take to
+# complete the AuthRocket round-trip; longer windows expand replay risk.
+_DEFAULT_AUTH_HANDOFF_FRESHNESS_SECONDS = 60
+# Single-use code handed back to the CLI's loopback; redeemed at /auth/cli-exchange.
+# Short TTL so an intercepted code dies within seconds.
+_DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS = 30
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,16 +26,31 @@ class Settings:
     database_url: str
     hmac_secret_key: bytes
     data_plane_url: str
-    # AuthRocket OIDC fields. Optional in Settings — required only at
+    # AuthRocket fields. Optional in Settings — required only at
     # AuthRocketVerifier construction time, which is wired into lifespan.
     # Letting them default to None here keeps tests that don't exercise
     # the auth path from having to set every AUTHROCKET_* env var.
+    #
+    # `authrocket_audience` stays optional in two senses: (a) tests don't have
+    # to set it, and (b) on LoginRocket Web realms the JWTs lack the `aud`
+    # claim entirely — the verifier skips audience checking when this is None.
+    # See `auth.oidc.JwtVerifier` for the rationale.
     authrocket_issuer: str | None = None
     authrocket_audience: str | None = None
     authrocket_jwks_url: str | None = None
+    # Realm's loginrocket subdomain base URL (e.g.
+    # https://merry-lion-7652.e2.loginrocket.com). Required for the /auth/login
+    # → AuthRocket redirect to construct.
+    authrocket_loginrocket_url: str | None = None
     authrocket_jwt_leeway_seconds: int = _DEFAULT_JWT_LEEWAY_SECONDS
     authrocket_pat_max_auth_age_seconds: int = _DEFAULT_PAT_MAX_AUTH_AGE_SECONDS
     token_default_ttl_days: int = _DEFAULT_TOKEN_TTL_DAYS
+    # Externally-resolvable URL of the control plane itself (e.g.
+    # https://qiita.example.com). Used to build the redirect_uri AuthRocket
+    # bounces back to. Required for /auth/login.
+    qiita_endpoint_url: str | None = None
+    auth_handoff_freshness_seconds: int = _DEFAULT_AUTH_HANDOFF_FRESHNESS_SECONDS
+    cli_login_code_ttl_seconds: int = _DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -53,6 +75,7 @@ class Settings:
             authrocket_issuer=issuer,
             authrocket_audience=os.environ.get("AUTHROCKET_AUDIENCE") or None,
             authrocket_jwks_url=jwks_url,
+            authrocket_loginrocket_url=os.environ.get("AUTHROCKET_LOGINROCKET_URL") or None,
             authrocket_jwt_leeway_seconds=int(
                 os.environ.get("AUTHROCKET_JWT_LEEWAY_SECONDS", str(_DEFAULT_JWT_LEEWAY_SECONDS))
             ),
@@ -64,5 +87,18 @@ class Settings:
             ),
             token_default_ttl_days=int(
                 os.environ.get("QIITA_TOKEN_DEFAULT_TTL_DAYS", str(_DEFAULT_TOKEN_TTL_DAYS))
+            ),
+            qiita_endpoint_url=os.environ.get("QIITA_ENDPOINT_URL") or None,
+            auth_handoff_freshness_seconds=int(
+                os.environ.get(
+                    "AUTH_HANDOFF_FRESHNESS_SECONDS",
+                    str(_DEFAULT_AUTH_HANDOFF_FRESHNESS_SECONDS),
+                )
+            ),
+            cli_login_code_ttl_seconds=int(
+                os.environ.get(
+                    "CLI_LOGIN_CODE_TTL_SECONDS",
+                    str(_DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS),
+                )
             ),
         )

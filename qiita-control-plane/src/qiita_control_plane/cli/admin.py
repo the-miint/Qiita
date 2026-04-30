@@ -7,10 +7,12 @@ Subcommands:
                      to operate on the system principal (idx=1).
   whoami           — calls GET /api/v1/auth/whoami via the configured PAT.
   token revoke-all — calls POST /api/v1/admin/principals/{idx}/revoke-all-tokens.
-  login            — not yet implemented. The full PKCE + code-exchange
-                     flow needs an OIDC code-exchange test harness that
-                     does not yet exist. For now, obtain an AuthRocket JWT
-                     out-of-band and call POST /api/v1/auth/pat directly.
+  login            — drives the AuthRocket LoginRocket Web flow end-to-end.
+                     Spawns a localhost loopback HTTP server, opens a
+                     browser to /api/v1/auth/login?cli=1&port=N, waits for
+                     the handoff to redirect back with a one-time code,
+                     exchanges the code at /api/v1/auth/cli-exchange for
+                     a PAT, and writes the PAT to ~/.qiita/token (0600).
 
 Authentication for HTTP subcommands: read PAT from QIITA_TOKEN env var or
 from ~/.qiita/token (mode 0600 expected).
@@ -18,9 +20,13 @@ from ~/.qiita/token (mode 0600 expected).
 
 import argparse
 import asyncio
+import http.server
 import json
 import os
 import sys
+import threading
+import urllib.parse
+import webbrowser
 from collections.abc import Callable
 from pathlib import Path
 
@@ -29,6 +35,38 @@ import httpx
 from qiita_common.auth_constants import API_PREFIX, SYSTEM_PRINCIPAL_IDX, SystemRole
 
 _TOKEN_FILE_DEFAULT = Path.home() / ".qiita" / "token"
+
+# How long to wait for the AuthRocket round-trip + browser bounce. 5 minutes
+# is generous; longer values mostly hide bugs (browser crashed, user gave up).
+_LOGIN_WAIT_TIMEOUT_SECONDS = 300
+
+# HTML rendered to the browser at the loopback after the handoff redirect
+# delivers the ot_code. Friendly "you can close this tab now" message. The
+# page must NOT include any script that touches the URL — we don't want
+# accidental cross-site reads of the ot_code from extensions etc. The
+# server consumes the code immediately upon receipt, so even if the URL
+# leaks the code is dead within the cli_login_code_ttl window.
+_LOOPBACK_DONE_HTML = b"""\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>qiita login complete</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+       max-width: 540px; margin: 4em auto; padding: 0 1em; color: #1a1a1a;
+       text-align: center; }
+h1   { margin-bottom: 0.4em; }
+.muted { color: #555; font-size: 0.95em; }
+</style>
+</head>
+<body>
+<h1>You are logged in.</h1>
+<p>Return to your terminal &mdash; the CLI has captured your token.</p>
+<p class="muted">You can close this tab.</p>
+</body>
+</html>
+"""
 
 # Direct-DB connection timeout for the bootstrap subcommand. Short because the
 # DB is expected to be reachable on the operator's network; a multi-second
@@ -152,6 +190,198 @@ def _run_http_subcommand(call: Callable[[str], dict]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# login — AuthRocket LoginRocket Web flow with localhost loopback
+# ---------------------------------------------------------------------------
+
+
+class _LoopbackResult:
+    """Mailbox for the loopback HTTP handler to deposit the captured ot_code
+    or an error. The main thread blocks on `event` until the handler fires."""
+
+    # __slots__ strings stay as literals: they're a metaprogramming declaration
+    # that must match the bare-identifier attribute accesses below (`self.event`,
+    # `result.ot_code`, …). Promoting them to constants would force `getattr`
+    # everywhere, which is strictly worse than dot access.
+    __slots__ = ("event", "ot_code", "error")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.ot_code: str | None = None
+        self.error: str | None = None
+
+
+def _loopback_handler_factory(result: _LoopbackResult):
+    """Build a one-shot http.server handler that captures `?ot_code=<value>`.
+
+    Anything that's not exactly `GET /` (with the right query) is met with a
+    short 404 — favicon probes etc. shouldn't end the loop. Once we capture
+    a code, we set the event so the main thread can move on.
+    """
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler convention)
+            url = urllib.parse.urlparse(self.path)
+            if url.path != "/":
+                self.send_error(404, "not found")
+                return
+            params = urllib.parse.parse_qs(url.query)
+            ot_code_values = params.get("ot_code")
+            if not ot_code_values:
+                # Probably a stray probe (favicon, etc.) — ignore quietly.
+                self.send_error(404, "missing ot_code")
+                return
+            result.ot_code = ot_code_values[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(_LOOPBACK_DONE_HTML)))
+            self.end_headers()
+            self.wfile.write(_LOOPBACK_DONE_HTML)
+            result.event.set()
+
+        def log_message(self, *args, **kwargs):
+            # Stay quiet; the CLI prints its own status.
+            pass
+
+    return Handler
+
+
+def _bind_loopback(*, preferred_ports: tuple[int, ...] = ()) -> tuple[http.server.HTTPServer, int]:
+    """Bind a loopback HTTP server.
+
+    Tries each preferred port first (useful for AuthRocket realms that
+    require pre-registered redirect URIs); falls back to OS-picked when
+    none is preferred or all are taken. Returns (server, bound_port).
+    """
+    for port in preferred_ports:
+        try:
+            srv = http.server.HTTPServer(("127.0.0.1", port), http.server.BaseHTTPRequestHandler)
+            return srv, port
+        except OSError:
+            continue
+    # OS-picked free port. AuthRocket's documented LoginRocket Web flow accepts
+    # arbitrary `?redirect_uri=`; if the realm later requires fixed ports,
+    # operators can populate `preferred_ports`.
+    srv = http.server.HTTPServer(("127.0.0.1", 0), http.server.BaseHTTPRequestHandler)
+    return srv, srv.server_address[1]
+
+
+def _write_token(path: Path, plaintext: str) -> None:
+    """Write the PAT plaintext to `path` with mode 0600.
+
+    Creates the parent directory if missing (with mode 0700). Overwrites
+    any existing token; the caller chose to log in, so a stale token at the
+    target is being deliberately replaced.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Write to a temp file then atomic-rename so an interrupted write doesn't
+    # leave a half-token on disk.
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(plaintext)
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+
+
+def _do_login(*, base_url: str, token_file: Path) -> int:
+    """Drive the LoginRocket Web flow end-to-end.
+
+    Steps:
+      1. Bind localhost loopback HTTP server.
+      2. Open browser to {base_url}/api/v1/auth/login?cli=1&port=N.
+      3. Wait for the handoff to redirect back with `?ot_code=<value>`.
+      4. POST the ot_code to /api/v1/auth/cli-exchange, receive the PAT.
+      5. Write PAT to `token_file`, print whoami summary.
+    """
+    base = base_url.rstrip("/")
+    result = _LoopbackResult()
+    server, port = _bind_loopback()
+    server.RequestHandlerClass = _loopback_handler_factory(result)
+
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    login_url = f"{base}{API_PREFIX}/auth/login?cli=1&port={port}"
+    print("Opening browser for AuthRocket login...", file=sys.stderr)
+    print(f"  If the browser doesn't open, visit: {login_url}", file=sys.stderr)
+    opened = False
+    try:
+        opened = webbrowser.open(login_url)
+    except Exception:
+        opened = False
+    if not opened:
+        print(
+            "  webbrowser.open() returned False — paste the URL above into a browser manually.",
+            file=sys.stderr,
+        )
+
+    try:
+        if not result.event.wait(timeout=_LOGIN_WAIT_TIMEOUT_SECONDS):
+            print(
+                f"error: timed out after {_LOGIN_WAIT_TIMEOUT_SECONDS}s waiting for the"
+                " browser callback. Re-run `qiita-admin login`. If the browser"
+                " never reached the qiita server, check your QIITA_CONTROL_PLANE_URL.",
+                file=sys.stderr,
+            )
+            return 1
+    finally:
+        # Stop the loopback server promptly; we don't need it after the
+        # event fires (or after timeout — either way we're done).
+        server.shutdown()
+        server.server_close()
+
+    if result.ot_code is None:
+        print(
+            f"error: loopback received no ot_code (handler error: {result.error})",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Exchange the code for the PAT plaintext.
+    try:
+        resp = httpx.post(
+            f"{base}{API_PREFIX}/auth/cli-exchange",
+            json={"ot_code": result.ot_code},
+            timeout=_CLI_HTTP_TIMEOUT_SECONDS,
+        )
+    except httpx.HTTPError as exc:
+        print(f"error: failed to reach control plane at {base}: {exc}", file=sys.stderr)
+        return 1
+    if resp.status_code == 404:
+        print(
+            "error: the one-time code was not recognized. It may have"
+            " expired or been used already. Re-run `qiita-admin login`.",
+            file=sys.stderr,
+        )
+        return 1
+    if resp.status_code != 200:
+        print(
+            f"error: cli-exchange returned http {resp.status_code}: {resp.text}",
+            file=sys.stderr,
+        )
+        return 1
+
+    body = resp.json()
+    pat = body.get("token")
+    if not isinstance(pat, str) or not pat:
+        print("error: cli-exchange response missing 'token' field", file=sys.stderr)
+        return 1
+
+    _write_token(token_file, pat)
+
+    # Report identity via /auth/whoami so the operator sees who they're
+    # logged in as without having to chase a separate command.
+    try:
+        me = _whoami(base, pat)
+    except httpx.HTTPError as exc:
+        # Token mint succeeded; whoami failure is not fatal.
+        print(f"warning: token saved to {token_file} but whoami failed: {exc}", file=sys.stderr)
+        return 0
+
+    print(f"Logged in. Token saved to {token_file} (mode 0600).", file=sys.stderr)
+    print(json.dumps(me, indent=2))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # argparse entry point
 # ---------------------------------------------------------------------------
 
@@ -185,7 +415,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_login = sub.add_parser(
         "login",
-        help="OIDC PKCE login (not yet implemented — see module docstring)",
+        help="AuthRocket LoginRocket Web flow with localhost loopback",
     )
     p_login.add_argument(
         "--token-file",
@@ -204,7 +434,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "set-system-role":
         database_url = os.environ.get("DATABASE_URL")
         if not database_url:
-            print("DATABASE_URL not set", file=sys.stderr)
+            print("error: DATABASE_URL not set", file=sys.stderr)
             return 2
         try:
             idx = asyncio.run(_set_system_role(database_url, args.email, args.role))
@@ -224,13 +454,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     if args.cmd == "login":
-        print(
-            "qiita-admin login is not yet implemented. For now: obtain an"
-            f" AuthRocket JWT out-of-band and call POST {API_PREFIX}/auth/pat to"
-            f" mint a PAT, then write it to {args.token_file} (mode 0600).",
-            file=sys.stderr,
-        )
-        return 2
+        return _do_login(base_url=args.base_url, token_file=args.token_file)
 
     parser.error(f"unknown command: {args.cmd}")
     return 2
