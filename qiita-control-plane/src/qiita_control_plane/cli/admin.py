@@ -1,4 +1,8 @@
-"""qiita-admin — operator CLI for principal/role/token management.
+"""qiita-admin — operator (admin-only) CLI for principal/role/token management.
+
+Scope: operator/admin tasks only. End-user interactions with qiita (data-plane
+operations, study/sample management, etc.) will live in a separate `qiita`
+CLI; this module deliberately does not grow user-facing subcommands.
 
 Subcommands:
   set-system-role  — direct DB UPDATE of qiita.principal.system_role.
@@ -255,9 +259,13 @@ def _loopback_handler_factory(result: _LoopbackResult):
 def _bind_loopback(*, preferred_ports: tuple[int, ...] = ()) -> tuple[http.server.HTTPServer, int]:
     """Bind a loopback HTTP server.
 
-    Tries each preferred port first (useful for AuthRocket realms that
-    require pre-registered redirect URIs); falls back to OS-picked when
-    none is preferred or all are taken. Returns (server, bound_port).
+    AuthRocket realms vary in how strictly they validate `redirect_uri`:
+    qiita-dev accepts arbitrary `http://127.0.0.1:<port>` callbacks (so an
+    OS-picked free port works), but a stricter realm (e.g. RC/prod) may
+    pre-register a fixed set. In the latter case operators populate
+    `preferred_ports` with the registered ports; this function tries each
+    in turn and falls back to OS-picked when none is preferred or all are
+    taken. Returns (server, bound_port).
     """
     for port in preferred_ports:
         try:
@@ -265,9 +273,6 @@ def _bind_loopback(*, preferred_ports: tuple[int, ...] = ()) -> tuple[http.serve
             return srv, port
         except OSError:
             continue
-    # OS-picked free port. AuthRocket's documented LoginRocket Web flow accepts
-    # arbitrary `?redirect_uri=`; if the realm later requires fixed ports,
-    # operators can populate `preferred_ports`.
     srv = http.server.HTTPServer(("127.0.0.1", 0), http.server.BaseHTTPRequestHandler)
     return srv, srv.server_address[1]
 

@@ -522,6 +522,8 @@ async def handoff(
     is_cli = bool(cookie_payload.get("cli"))
     scopes = sorted(role_ceiling(principal.system_role))
     expires_at = datetime.now(UTC) + timedelta(days=settings.token_default_ttl_days)
+    # Label names the CLI that minted the PAT. `qiita-admin` is the operator
+    # CLI; a future end-user `qiita` CLI would mint with its own label.
     label = "qiita-admin login" if is_cli else "browser login"
     plaintext_pat, token_idx = await mint_api_token(
         pool,

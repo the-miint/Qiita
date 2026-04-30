@@ -29,8 +29,9 @@ export HMAC_SECRET_KEY=$(openssl rand -base64 32)
 # AuthRocket SaaS issuer — the canonical URL, NOT the loginrocket subdomain.
 export AUTHROCKET_ISSUER=https://authrocket.com
 # Realm's loginrocket subdomain — both the JWKS endpoint and the LoginRocket
-# Web hosted login URL live here.
-export AUTHROCKET_LOGINROCKET_URL=https://merry-lion-7652.e2.loginrocket.com
+# Web hosted login URL live here. Substitute your realm's subdomain; for the
+# qiita-dev realm specifically this is `merry-lion-7652.e2.loginrocket.com`.
+export AUTHROCKET_LOGINROCKET_URL=https://<realm>.loginrocket.com
 export AUTHROCKET_JWKS_URL=$AUTHROCKET_LOGINROCKET_URL/connect/jwks
 # Externally-resolvable URL of the control plane itself; used to construct
 # the redirect_uri AuthRocket bounces back to.
