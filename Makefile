@@ -101,7 +101,7 @@ test-workflows:
 # use different DATA_PATH values (Python picks a pytest tmp_path_factory dir,
 # Rust defaults to /tmp/qiita-integration-ducklake-data). Mirrors the Python
 # _reset_ducklake_catalog() helper in tests/integration/conftest.py.
-test-integration: build-data-plane-debug
+test-integration: build-data-plane-debug $(DBMATE_BIN)
 	cd tests/integration && docker compose up -d --wait && \
 	  (uv run pytest -m 'not system'; PY_EC=$$?; \
 	   docker compose exec -T postgres psql -U qiita -d postgres \

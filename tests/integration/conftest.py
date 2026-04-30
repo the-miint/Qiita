@@ -21,7 +21,12 @@ import httpx
 import pytest
 import pytest_asyncio
 
-POSTGRES_URL = "postgresql://qiita:qiita@localhost:5433/qiita_test"
+# Pin sslmode=disable on every connection: the test postgres container
+# has SSL off, and on environments that inherit `PGSSLMODE=require` from
+# the surrounding shell (e.g. GitHub Actions ubuntu-latest's pre-installed
+# PostgreSQL setup) the dbmate, asyncpg, and DuckLake postgres clients
+# would otherwise fail with "SSL is not enabled on the server".
+POSTGRES_URL = "postgresql://qiita:qiita@localhost:5433/qiita_test?sslmode=disable"
 REPO_ROOT = Path(__file__).parent.parent.parent
 MIGRATIONS_DIR = str(REPO_ROOT / "qiita-control-plane" / "db" / "migrations")
 DATA_PLANE_DIR = REPO_ROOT / "qiita-data-plane"
@@ -30,7 +35,7 @@ DUCKDB_LIB_DIR = (
     DATA_PLANE_DIR / "target" / "duckdb-download" / "x86_64-unknown-linux-gnu" / "1.5.2"
 )
 DUCKLAKE_CATALOG_CONNSTR = (
-    "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita"
+    "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita sslmode=disable"
 )
 
 
@@ -38,9 +43,12 @@ def _run_migrations(postgres_url: str) -> None:
     """Run dbmate migrations against the test database."""
     dbmate = shutil.which("dbmate")
     if dbmate is None:
-        pytest.skip("dbmate not installed — run 'make migrate' to auto-install")
+        raise RuntimeError(
+            "dbmate not on PATH — run 'make test-integration' or 'make migrate' to auto-install"
+        )
 
-    # dbmate expects the URL with the scheme prefix
+    # dbmate expects the URL with the scheme prefix. The sslmode=disable
+    # query param comes from POSTGRES_URL (see comment there).
     dbmate_url = postgres_url.replace("postgresql://", "postgres://")
     result = subprocess.run(
         [
@@ -100,9 +108,7 @@ class JwksHarness:
         self._RSAAlgorithm = RSAAlgorithm
         self.fetch_count = 0
         self._lock = threading.Lock()
-        self._private_key = rsa.generate_private_key(
-            public_exponent=65537, key_size=2048
-        )
+        self._private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         self._kid = f"kid-{secrets.token_hex(4)}"
         self._jwks = self._build_jwks(self._private_key, self._kid)
         self._server = http.server.HTTPServer(("127.0.0.1", 0), self._make_handler())
@@ -136,9 +142,7 @@ class JwksHarness:
         from cryptography.hazmat.primitives.asymmetric import rsa
 
         with self._lock:
-            self._private_key = rsa.generate_private_key(
-                public_exponent=65537, key_size=2048
-            )
+            self._private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
             self._kid = f"kid-{secrets.token_hex(4)}"
             self._jwks = self._build_jwks(self._private_key, self._kid)
         return self._kid
@@ -149,9 +153,7 @@ class JwksHarness:
         self._thread.join(timeout=2)
 
     def _build_jwks(self, private_key, kid: str) -> dict:
-        public_jwk = self._json.loads(
-            self._RSAAlgorithm.to_jwk(private_key.public_key())
-        )
+        public_jwk = self._json.loads(self._RSAAlgorithm.to_jwk(private_key.public_key()))
         return {"keys": [{**public_jwk, "kid": kid, "alg": "RS256", "use": "sig"}]}
 
     def _make_handler(self):
