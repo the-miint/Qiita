@@ -13,6 +13,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -21,17 +22,39 @@ import httpx
 import pytest
 import pytest_asyncio
 
-POSTGRES_URL = "postgresql://qiita:qiita@localhost:5433/qiita_test"
+POSTGRES_URL = os.environ.get(
+    "QIITA_TEST_POSTGRES_URL",
+    "postgresql://qiita:qiita@localhost:5433/qiita_test",
+)
 REPO_ROOT = Path(__file__).parent.parent.parent
 MIGRATIONS_DIR = str(REPO_ROOT / "qiita-control-plane" / "db" / "migrations")
 DATA_PLANE_DIR = REPO_ROOT / "qiita-data-plane"
 DATA_PLANE_BINARY = DATA_PLANE_DIR / "target" / "debug" / "qiita-data-plane"
-DUCKDB_LIB_DIR = (
-    DATA_PLANE_DIR / "target" / "duckdb-download" / "x86_64-unknown-linux-gnu" / "1.5.2"
+
+
+def _find_duckdb_lib_dir() -> Path | None:
+    """Locate libduckdb downloaded by the Rust build (DUCKDB_DOWNLOAD_LIB=1).
+
+    Path is target/duckdb-download/<rust-triple>/<duckdb-version>/. Both vary
+    per host and per dependency bump, so glob and match the libduckdb file
+    name for the current OS so a cross-built directory can't shadow it.
+    """
+    base = DATA_PLANE_DIR / "target" / "duckdb-download"
+    if not base.exists():
+        return None
+    libname = "libduckdb.dylib" if sys.platform == "darwin" else "libduckdb.so"
+    for candidate in sorted(base.glob("*/*"), reverse=True):
+        if (candidate / libname).is_file():
+            return candidate
+    return None
+
+
+DUCKDB_LIB_DIR = _find_duckdb_lib_dir()
+DUCKLAKE_CATALOG_CONNSTR = os.environ.get(
+    "DUCKLAKE_CATALOG_CONNSTR",
+    "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita",
 )
-DUCKLAKE_CATALOG_CONNSTR = (
-    "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita"
-)
+LIB_PATH_ENV = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
 
 
 def _run_migrations(postgres_url: str) -> None:
@@ -479,9 +502,9 @@ def data_plane(hmac_secret, tmp_path_factory):
     data_path = str(tmp_path_factory.mktemp("ducklake-data"))
     port = _alloc_free_port()
 
-    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-    if DUCKDB_LIB_DIR.is_dir():
-        ld_path = f"{DUCKDB_LIB_DIR}:{ld_path}" if ld_path else str(DUCKDB_LIB_DIR)
+    lib_path = os.environ.get(LIB_PATH_ENV, "")
+    if DUCKDB_LIB_DIR is not None and DUCKDB_LIB_DIR.is_dir():
+        lib_path = f"{DUCKDB_LIB_DIR}:{lib_path}" if lib_path else str(DUCKDB_LIB_DIR)
 
     env = {
         **os.environ,
@@ -489,7 +512,7 @@ def data_plane(hmac_secret, tmp_path_factory):
         "HMAC_SECRET_KEY": base64.b64encode(hmac_secret).decode(),
         "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CATALOG_CONNSTR,
         "DUCKLAKE_DATA_PATH": data_path,
-        "LD_LIBRARY_PATH": ld_path,
+        LIB_PATH_ENV: lib_path,
     }
 
     proc = subprocess.Popen(

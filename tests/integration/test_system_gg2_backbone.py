@@ -22,6 +22,7 @@ import secrets
 import signal
 import socket
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -42,9 +43,15 @@ _SYSTEM_TEST_BASE = Path(
     os.environ.get("QIITA_SYSTEM_TEST_DIR", Path.home() / ".qiita-system-test")
 )
 DUCKLAKE_DATA_PATH = str(_SYSTEM_TEST_BASE / "ducklake-data")
-DUCKLAKE_CONNSTR = (
-    "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita"
+POSTGRES_URL = os.environ.get(
+    "QIITA_TEST_POSTGRES_URL",
+    "postgresql://qiita:qiita@localhost:5433/qiita_test",
 )
+DUCKLAKE_CONNSTR = os.environ.get(
+    "DUCKLAKE_CATALOG_CONNSTR",
+    "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita",
+)
+LIB_PATH_ENV = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
 DATA_PLANE_PORT = 50097
 
 pytestmark = [
@@ -69,9 +76,7 @@ def _reset_ducklake_catalog():
     import asyncio
 
     async def _do():
-        conn = await asyncpg.connect(
-            "postgresql://qiita:qiita@localhost:5433/qiita_test"
-        )
+        conn = await asyncpg.connect(POSTGRES_URL)
         await conn.execute(
             "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
             "WHERE datname = 'qiita_ducklake' AND pid != pg_backend_pid()"
@@ -122,12 +127,17 @@ def data_plane_process(hmac_secret):
     if not os.path.exists(binary):
         pytest.skip(f"binary not found at {binary}")
 
-    duckdb_lib_dir = os.path.join(
-        dp_dir, "target", "duckdb-download", "x86_64-unknown-linux-gnu", "1.5.2"
-    )
-    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-    if os.path.isdir(duckdb_lib_dir):
-        ld_path = f"{duckdb_lib_dir}:{ld_path}" if ld_path else duckdb_lib_dir
+    libname = "libduckdb.dylib" if sys.platform == "darwin" else "libduckdb.so"
+    duckdb_download = Path(dp_dir) / "target" / "duckdb-download"
+    duckdb_lib_dir: str | None = None
+    if duckdb_download.exists():
+        for candidate in sorted(duckdb_download.glob("*/*"), reverse=True):
+            if (candidate / libname).is_file():
+                duckdb_lib_dir = str(candidate)
+                break
+    lib_path = os.environ.get(LIB_PATH_ENV, "")
+    if duckdb_lib_dir:
+        lib_path = f"{duckdb_lib_dir}:{lib_path}" if lib_path else duckdb_lib_dir
 
     env = {
         **os.environ,
@@ -135,7 +145,7 @@ def data_plane_process(hmac_secret):
         "HMAC_SECRET_KEY": base64.b64encode(hmac_secret).decode(),
         "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CONNSTR,
         "DUCKLAKE_DATA_PATH": DUCKLAKE_DATA_PATH,
-        "LD_LIBRARY_PATH": ld_path,
+        LIB_PATH_ENV: lib_path,
     }
 
     proc = subprocess.Popen(
