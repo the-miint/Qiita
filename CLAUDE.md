@@ -16,9 +16,9 @@ make build
 
 # Test
 make test                  # unit tests (all components)
-make test-integration      # requires Docker; runs Python + Rust integration suites against postgres on :5433; excludes -m system
+make test-integration      # requires Docker (or QIITA_USE_HOST_POSTGRES=1 with libpq env vars to use a host postgres — what CI does on macOS); runs Python + Rust integration suites against postgres on :5433; excludes -m system
 make test-system           # real GG2 backbone data; slow (~10 min); needs localdocs/scratch/
-make test-workflows        # requires apptainer; skips gracefully if absent
+make test-workflows        # requires apptainer (Linux-only — macOS skips gracefully); CI runs this on ubuntu only
 
 # Lint
 make lint
