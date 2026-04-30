@@ -38,7 +38,9 @@ def _run_migrations(postgres_url: str) -> None:
     """Run dbmate migrations against the test database."""
     dbmate = shutil.which("dbmate")
     if dbmate is None:
-        pytest.skip("dbmate not installed — run 'make migrate' to auto-install")
+        raise RuntimeError(
+            "dbmate not on PATH — run 'make test-integration' or 'make migrate' to auto-install"
+        )
 
     # dbmate expects the URL with the scheme prefix
     dbmate_url = postgres_url.replace("postgresql://", "postgres://")
