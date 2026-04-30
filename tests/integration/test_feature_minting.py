@@ -15,16 +15,26 @@ def _md5_uuid(seq: str) -> str:
 
 
 @pytest.fixture
-async def client(postgres_pool):
-    """AsyncClient with the integration test pool."""
+async def client(postgres_pool, human_admin_session):
+    """AsyncClient authenticated as the session admin. Service-only endpoints
+    (mint, register, doget tickets) are exercised by passing `worker_headers`
+    per-request to override the default Authorization."""
     from qiita_control_plane.main import app
 
     app.state.pool = postgres_pool
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://test",
+        headers={"Authorization": f"Bearer {human_admin_session['token']}"},
     ) as ac:
         yield ac
+
+
+@pytest.fixture
+def worker_headers(compute_worker_service_account):
+    """Authorization header for the compute worker service account — required
+    by service-only routes (POST /references/{id}/features/mint)."""
+    return {"Authorization": f"Bearer {compute_worker_service_account['token']}"}
 
 
 @pytest.fixture
@@ -57,12 +67,13 @@ async def reference_idx(client, postgres_pool):
     )
 
 
-async def test_mint_five_new_features(client, reference_idx):
+async def test_mint_five_new_features(client, reference_idx, worker_headers):
     """Minting 5 novel hashes should return 5 feature_idx values."""
     hashes = [_md5_uuid(f"ATCG{i}") for i in range(5)]
     resp = await client.post(
         f"/api/v1/references/{reference_idx}/features/mint",
         json={"entries": [{"sequence_hash": h} for h in hashes]},
+        headers=worker_headers,
     )
     assert resp.status_code == 200
     body = resp.json()
@@ -74,7 +85,7 @@ async def test_mint_five_new_features(client, reference_idx):
         assert feature_idx > 0
 
 
-async def test_mint_deduplicates(client, reference_idx):
+async def test_mint_deduplicates(client, reference_idx, worker_headers):
     """Minting the same hashes twice should reuse all feature_idx values."""
     hashes = [_md5_uuid(f"DEDUP{i}") for i in range(3)]
     entries = [{"sequence_hash": h} for h in hashes]
@@ -82,6 +93,7 @@ async def test_mint_deduplicates(client, reference_idx):
     resp1 = await client.post(
         f"/api/v1/references/{reference_idx}/features/mint",
         json={"entries": entries},
+        headers=worker_headers,
     )
     assert resp1.status_code == 200
     mapping1 = resp1.json()["mapping"]
@@ -89,6 +101,7 @@ async def test_mint_deduplicates(client, reference_idx):
     resp2 = await client.post(
         f"/api/v1/references/{reference_idx}/features/mint",
         json={"entries": entries},
+        headers=worker_headers,
     )
     assert resp2.status_code == 200
     body2 = resp2.json()
@@ -97,12 +110,13 @@ async def test_mint_deduplicates(client, reference_idx):
     assert body2["mapping"] == mapping1
 
 
-async def test_mint_mixed_new_and_existing(client, reference_idx):
+async def test_mint_mixed_new_and_existing(client, reference_idx, worker_headers):
     """Minting a mix of existing and new hashes should reuse and mint correctly."""
     existing = [_md5_uuid(f"EXIST{i}") for i in range(3)]
     resp1 = await client.post(
         f"/api/v1/references/{reference_idx}/features/mint",
         json={"entries": [{"sequence_hash": h} for h in existing]},
+        headers=worker_headers,
     )
     assert resp1.status_code == 200
 
@@ -111,6 +125,7 @@ async def test_mint_mixed_new_and_existing(client, reference_idx):
     resp2 = await client.post(
         f"/api/v1/references/{reference_idx}/features/mint",
         json={"entries": [{"sequence_hash": h} for h in all_hashes]},
+        headers=worker_headers,
     )
     assert resp2.status_code == 200
     body = resp2.json()
@@ -119,7 +134,9 @@ async def test_mint_mixed_new_and_existing(client, reference_idx):
     assert len(body["mapping"]) == 5
 
 
-async def test_mint_with_genome_association(client, reference_idx, postgres_pool):
+async def test_mint_with_genome_association(
+    client, reference_idx, postgres_pool, worker_headers
+):
     """Entries with genome_source/genome_source_id should create genome + junction rows."""
     source_id = f"GCF_ASSOC_{uuid.uuid4().hex[:8]}"
     h = _md5_uuid("GENOME_SEQ")
@@ -134,6 +151,7 @@ async def test_mint_with_genome_association(client, reference_idx, postgres_pool
                 }
             ]
         },
+        headers=worker_headers,
     )
     assert resp.status_code == 200
     assert resp.json()["minted"] == 1
@@ -152,7 +170,9 @@ async def test_mint_with_genome_association(client, reference_idx, postgres_pool
     assert junction["genome_idx"] == genome["genome_idx"]
 
 
-async def test_mint_reuses_existing_genome(client, reference_idx, postgres_pool):
+async def test_mint_reuses_existing_genome(
+    client, reference_idx, postgres_pool, worker_headers
+):
     """If a genome already exists (same source+source_id), reuse it."""
     source_id = f"GCF_REUSE_{uuid.uuid4().hex[:8]}"
     genome_idx = await postgres_pool.fetchval(
@@ -175,6 +195,7 @@ async def test_mint_reuses_existing_genome(client, reference_idx, postgres_pool)
                 }
             ]
         },
+        headers=worker_headers,
     )
     assert resp.status_code == 200
     feature_idx = resp.json()["mapping"][h]
@@ -185,7 +206,7 @@ async def test_mint_reuses_existing_genome(client, reference_idx, postgres_pool)
     assert junction["genome_idx"] == genome_idx
 
 
-async def test_mint_rejects_wrong_status(client, postgres_pool):
+async def test_mint_rejects_wrong_status(client, postgres_pool, worker_headers):
     """Minting against a reference in 'pending' status should fail."""
     resp = await client.post(
         "/api/v1/references",
@@ -200,6 +221,7 @@ async def test_mint_rejects_wrong_status(client, postgres_pool):
     mint_resp = await client.post(
         f"/api/v1/references/{idx}/features/mint",
         json={"entries": [{"sequence_hash": _md5_uuid("X")}]},
+        headers=worker_headers,
     )
     assert mint_resp.status_code == 409
 
@@ -208,26 +230,32 @@ async def test_mint_rejects_wrong_status(client, postgres_pool):
     )
 
 
-async def test_mint_rejects_empty_batch(client, reference_idx):
+async def test_mint_rejects_empty_batch(client, reference_idx, worker_headers):
     """Minting with an empty entries list should return 422."""
     resp = await client.post(
         f"/api/v1/references/{reference_idx}/features/mint",
         json={"entries": []},
+        headers=worker_headers,
     )
     assert resp.status_code == 422
 
 
-async def test_mint_rejects_duplicate_hashes_in_request(client, reference_idx):
+async def test_mint_rejects_duplicate_hashes_in_request(
+    client, reference_idx, worker_headers
+):
     """Submitting duplicate sequence_hash values in one request should return 422."""
     h = _md5_uuid("DUP_IN_REQ")
     resp = await client.post(
         f"/api/v1/references/{reference_idx}/features/mint",
         json={"entries": [{"sequence_hash": h}, {"sequence_hash": h}]},
+        headers=worker_headers,
     )
     assert resp.status_code == 422
 
 
-async def test_mint_rejects_genome_source_without_id(client, reference_idx):
+async def test_mint_rejects_genome_source_without_id(
+    client, reference_idx, worker_headers
+):
     """genome_source set without genome_source_id should return 422."""
     resp = await client.post(
         f"/api/v1/references/{reference_idx}/features/mint",
@@ -236,11 +264,14 @@ async def test_mint_rejects_genome_source_without_id(client, reference_idx):
                 {"sequence_hash": _md5_uuid("GS_NO_ID"), "genome_source": "genbank"}
             ]
         },
+        headers=worker_headers,
     )
     assert resp.status_code == 422
 
 
-async def test_mint_rejects_genome_id_without_source(client, reference_idx):
+async def test_mint_rejects_genome_id_without_source(
+    client, reference_idx, worker_headers
+):
     """genome_source_id set without genome_source should return 422."""
     resp = await client.post(
         f"/api/v1/references/{reference_idx}/features/mint",
@@ -252,11 +283,12 @@ async def test_mint_rejects_genome_id_without_source(client, reference_idx):
                 }
             ]
         },
+        headers=worker_headers,
     )
     assert resp.status_code == 422
 
 
-async def test_cross_reference_deduplication(client, postgres_pool):
+async def test_cross_reference_deduplication(client, postgres_pool, worker_headers):
     """Same hash minted against two references should get the same feature_idx."""
     # Create two references in hashing status
     refs = []
@@ -282,10 +314,12 @@ async def test_cross_reference_deduplication(client, postgres_pool):
     resp1 = await client.post(
         f"/api/v1/references/{refs[0]}/features/mint",
         json={"entries": entries},
+        headers=worker_headers,
     )
     resp2 = await client.post(
         f"/api/v1/references/{refs[1]}/features/mint",
         json={"entries": entries},
+        headers=worker_headers,
     )
     assert resp1.status_code == 200
     assert resp2.status_code == 200
@@ -311,7 +345,7 @@ async def test_cross_reference_deduplication(client, postgres_pool):
         )
 
 
-async def test_mint_10k_batch_performance(client, reference_idx):
+async def test_mint_10k_batch_performance(client, reference_idx, worker_headers):
     """Minting 10,000 features should complete in < 10 seconds."""
     import time
 
@@ -322,6 +356,7 @@ async def test_mint_10k_batch_performance(client, reference_idx):
     resp = await client.post(
         f"/api/v1/references/{reference_idx}/features/mint",
         json={"entries": entries},
+        headers=worker_headers,
     )
     elapsed = time.monotonic() - start
 

@@ -8,16 +8,24 @@ from httpx import ASGITransport, AsyncClient
 
 
 @pytest.fixture
-async def client(postgres_pool):
-    """AsyncClient with the integration test pool."""
+async def client(postgres_pool, human_admin_session):
+    """AsyncClient authenticated as the session admin. Service-only routes
+    (mint) take a worker token via per-request `headers=worker_headers`."""
     from qiita_control_plane.main import app
 
     app.state.pool = postgres_pool
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://test",
+        headers={"Authorization": f"Bearer {human_admin_session['token']}"},
     ) as ac:
         yield ac
+
+
+@pytest.fixture
+def worker_headers(compute_worker_service_account):
+    """Authorization header for the compute worker service account."""
+    return {"Authorization": f"Bearer {compute_worker_service_account['token']}"}
 
 
 @pytest.fixture
@@ -42,7 +50,9 @@ async def ref_for_pipeline(client, postgres_pool):
     )
 
 
-async def test_hash_then_mint_pipeline(client, fasta_file, ref_for_pipeline, tmp_path):
+async def test_hash_then_mint_pipeline(
+    client, fasta_file, ref_for_pipeline, tmp_path, worker_headers
+):
     """Full round-trip: create reference → transition → hash → mint → verify."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
@@ -72,6 +82,7 @@ async def test_hash_then_mint_pipeline(client, fasta_file, ref_for_pipeline, tmp
     mint_resp = await client.post(
         f"/api/v1/references/{ref_idx}/features/mint",
         json={"entries": entries},
+        headers=worker_headers,
     )
     assert mint_resp.status_code == 200
     mint_body = mint_resp.json()

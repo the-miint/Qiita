@@ -24,8 +24,13 @@ def flight_client(data_plane):
 
 
 @pytest.fixture
-async def client(postgres_pool, hmac_secret, data_plane):
-    """AsyncClient with HMAC secret and data plane URL injected into app state."""
+async def client(postgres_pool, hmac_secret, data_plane, human_admin_session):
+    """AsyncClient with HMAC secret and data plane URL injected into app state.
+
+    Default Authorization is the session admin (so POST /references and
+    PATCH /references/{id}/status work). Service-only routes (mint, register,
+    doget tickets) override per-request via `headers=worker_headers`.
+    """
     from qiita_control_plane.config import Settings
     from qiita_control_plane.main import app
 
@@ -36,9 +41,18 @@ async def client(postgres_pool, hmac_secret, data_plane):
         data_plane_url=f"grpc://127.0.0.1:{data_plane['port']}",
     )
     async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {human_admin_session['token']}"},
     ) as ac:
         yield ac
+
+
+@pytest.fixture
+def worker_headers(compute_worker_service_account):
+    """Authorization header for the compute worker service account — required
+    by mint, register_files, and tickets:doget endpoints."""
+    return {"Authorization": f"Bearer {compute_worker_service_account['token']}"}
 
 
 @pytest.fixture
@@ -113,6 +127,7 @@ async def test_e2e_create_to_doget(
     taxonomy_e2e,
     tree_e2e,
     tmp_path,
+    worker_headers,
 ):
     """Full E2E: create → hash → mint → load → register (via data plane) → ticket → DoGet."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
@@ -133,7 +148,9 @@ async def test_e2e_create_to_doget(
     # --- Mint ---
     entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
     mint_resp = await client.post(
-        f"/api/v1/references/{ref_idx}/features/mint", json={"entries": entries}
+        f"/api/v1/references/{ref_idx}/features/mint",
+        json={"entries": entries},
+        headers=worker_headers,
     )
     assert mint_resp.status_code == 200
     fm_path = tmp_path / "feature_map.ndjson"
@@ -169,6 +186,7 @@ async def test_e2e_create_to_doget(
                 "reference_phylogeny.parquet": "reference_phylogeny",
             },
         },
+        headers=worker_headers,
     )
     assert reg_resp.status_code == 201
 
@@ -182,6 +200,7 @@ async def test_e2e_create_to_doget(
     ticket_resp = await client.post(
         f"/api/v1/references/{ref_idx}/tickets/doget",
         json={"table": "reference_sequences"},
+        headers=worker_headers,
     )
     assert ticket_resp.status_code == 201
     ticket_bytes = base64.b64decode(ticket_resp.json()["ticket"])
@@ -201,6 +220,7 @@ async def test_e2e_create_to_doget(
     chunks_ticket_resp = await client.post(
         f"/api/v1/references/{ref_idx}/tickets/doget",
         json={"table": "reference_sequence_chunks"},
+        headers=worker_headers,
     )
     assert chunks_ticket_resp.status_code == 201
     chunks_ticket_bytes = base64.b64decode(chunks_ticket_resp.json()["ticket"])
@@ -223,6 +243,7 @@ async def test_e2e_doget_taxonomy(
     fasta_e2e,
     taxonomy_e2e,
     tmp_path,
+    worker_headers,
 ):
     """Verify DoGet for reference_taxonomy returns correct parsed ranks."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
@@ -242,7 +263,9 @@ async def test_e2e_doget_taxonomy(
     manifest = json.loads(manifest_path.read_text())
     entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
     mint_resp = await client.post(
-        f"/api/v1/references/{ref_idx}/features/mint", json={"entries": entries}
+        f"/api/v1/references/{ref_idx}/features/mint",
+        json={"entries": entries},
+        headers=worker_headers,
     )
     fm_path = tmp_path / "fm.ndjson"
     with open(fm_path, "w") as f:
@@ -272,6 +295,7 @@ async def test_e2e_doget_taxonomy(
                 "reference_taxonomy.parquet": "reference_taxonomy",
             },
         },
+        headers=worker_headers,
     )
     assert reg_resp.status_code == 201
     await client.patch(
@@ -282,6 +306,7 @@ async def test_e2e_doget_taxonomy(
     ticket_resp = await client.post(
         f"/api/v1/references/{ref_idx}/tickets/doget",
         json={"table": "reference_taxonomy"},
+        headers=worker_headers,
     )
     assert ticket_resp.status_code == 201
     ticket_bytes = base64.b64decode(ticket_resp.json()["ticket"])
@@ -296,19 +321,21 @@ async def test_e2e_doget_taxonomy(
     assert domains == {"Bacteria", "Archaea"}
 
 
-async def test_ticket_rejects_non_active_reference(client, ref_for_e2e):
+async def test_ticket_rejects_non_active_reference(client, ref_for_e2e, worker_headers):
     """Ticket endpoint must reject references not in 'active' status."""
     resp = await client.post(
         f"/api/v1/references/{ref_for_e2e}/tickets/doget",
         json={"table": "reference_sequences"},
+        headers=worker_headers,
     )
     assert resp.status_code == 409
 
 
-async def test_ticket_rejects_unknown_table(client, ref_for_e2e):
+async def test_ticket_rejects_unknown_table(client, ref_for_e2e, worker_headers):
     """Ticket endpoint must reject unknown table names."""
     resp = await client.post(
         f"/api/v1/references/{ref_for_e2e}/tickets/doget",
         json={"table": "nonexistent_table"},
+        headers=worker_headers,
     )
     assert resp.status_code == 422
