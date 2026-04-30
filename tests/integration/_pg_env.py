@@ -10,9 +10,15 @@ import os
 import sys
 from pathlib import Path
 
-POSTGRES_URL_DEFAULT = "postgresql://qiita:qiita@localhost:5433/qiita_test"
+# Pin sslmode=disable on every connection: the test postgres container has
+# SSL off, and on environments that inherit `PGSSLMODE=require` from the
+# surrounding shell (e.g. GitHub Actions ubuntu-latest's pre-installed
+# PostgreSQL setup) the dbmate, asyncpg, and DuckLake postgres clients would
+# otherwise fail with "SSL is not enabled on the server". CI override values
+# (QIITA_TEST_POSTGRES_URL / DUCKLAKE_CATALOG_CONNSTR) must include it too.
+POSTGRES_URL_DEFAULT = "postgresql://qiita:qiita@localhost:5433/qiita_test?sslmode=disable"
 DUCKLAKE_CONNSTR_DEFAULT = (
-    "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita"
+    "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita sslmode=disable"
 )
 LIB_PATH_ENV = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
 

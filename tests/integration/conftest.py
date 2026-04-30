@@ -40,9 +40,12 @@ def _run_migrations(postgres_url: str) -> None:
     """Run dbmate migrations against the test database."""
     dbmate = shutil.which("dbmate")
     if dbmate is None:
-        pytest.skip("dbmate not installed — run 'make migrate' to auto-install")
+        raise RuntimeError(
+            "dbmate not on PATH — run 'make test-integration' or 'make migrate' to auto-install"
+        )
 
-    # dbmate expects the URL with the scheme prefix
+    # dbmate expects the URL with the scheme prefix. The sslmode=disable
+    # query param comes from POSTGRES_URL (see comment there).
     dbmate_url = postgres_url.replace("postgresql://", "postgres://")
     result = subprocess.run(
         [
@@ -102,9 +105,7 @@ class JwksHarness:
         self._RSAAlgorithm = RSAAlgorithm
         self.fetch_count = 0
         self._lock = threading.Lock()
-        self._private_key = rsa.generate_private_key(
-            public_exponent=65537, key_size=2048
-        )
+        self._private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         self._kid = f"kid-{secrets.token_hex(4)}"
         self._jwks = self._build_jwks(self._private_key, self._kid)
         self._server = http.server.HTTPServer(("127.0.0.1", 0), self._make_handler())
@@ -138,9 +139,7 @@ class JwksHarness:
         from cryptography.hazmat.primitives.asymmetric import rsa
 
         with self._lock:
-            self._private_key = rsa.generate_private_key(
-                public_exponent=65537, key_size=2048
-            )
+            self._private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
             self._kid = f"kid-{secrets.token_hex(4)}"
             self._jwks = self._build_jwks(self._private_key, self._kid)
         return self._kid
@@ -151,9 +150,7 @@ class JwksHarness:
         self._thread.join(timeout=2)
 
     def _build_jwks(self, private_key, kid: str) -> dict:
-        public_jwk = self._json.loads(
-            self._RSAAlgorithm.to_jwk(private_key.public_key())
-        )
+        public_jwk = self._json.loads(self._RSAAlgorithm.to_jwk(private_key.public_key()))
         return {"keys": [{**public_jwk, "kid": kid, "alg": "RS256", "use": "sig"}]}
 
     def _make_handler(self):

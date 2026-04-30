@@ -114,7 +114,7 @@ PG_TEARDOWN := docker compose down
 PG_PSQL     := docker compose exec -T postgres psql -U qiita
 endif
 
-test-integration: build-data-plane-debug
+test-integration: build-data-plane-debug $(DBMATE_BIN)
 	cd tests/integration && $(PG_BRINGUP) && \
 	  (uv run pytest -m 'not system'; PY_EC=$$?; \
 	   $(PG_PSQL) -d postgres \

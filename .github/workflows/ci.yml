@@ -91,8 +91,8 @@ jobs:
         run: |
           {
             echo "QIITA_USE_HOST_POSTGRES=1"
-            echo "QIITA_TEST_POSTGRES_URL=postgresql://qiita:qiita@localhost:5432/qiita_test"
-            echo "DUCKLAKE_CATALOG_CONNSTR=dbname=qiita_ducklake host=localhost port=5432 user=qiita password=qiita"
+            echo "QIITA_TEST_POSTGRES_URL=postgresql://qiita:qiita@localhost:5432/qiita_test?sslmode=disable"
+            echo "DUCKLAKE_CATALOG_CONNSTR=dbname=qiita_ducklake host=localhost port=5432 user=qiita password=qiita sslmode=disable"
             echo "PGHOST=localhost"
             echo "PGPORT=5432"
             echo "PGUSER=qiita"
