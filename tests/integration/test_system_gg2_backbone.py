@@ -22,7 +22,6 @@ import secrets
 import signal
 import socket
 import subprocess
-import sys
 import time
 import uuid
 from pathlib import Path
@@ -31,6 +30,12 @@ import asyncpg
 import duckdb
 import pyarrow.flight as flight
 import pytest
+from _pg_env import (
+    LIB_PATH_ENV,
+    ducklake_catalog_connstr,
+    find_duckdb_lib_dir,
+    postgres_url,
+)
 from httpx import ASGITransport, AsyncClient
 
 DATA_DIR = Path(__file__).parent.parent.parent / "localdocs" / "scratch"
@@ -43,15 +48,8 @@ _SYSTEM_TEST_BASE = Path(
     os.environ.get("QIITA_SYSTEM_TEST_DIR", Path.home() / ".qiita-system-test")
 )
 DUCKLAKE_DATA_PATH = str(_SYSTEM_TEST_BASE / "ducklake-data")
-POSTGRES_URL = os.environ.get(
-    "QIITA_TEST_POSTGRES_URL",
-    "postgresql://qiita:qiita@localhost:5433/qiita_test",
-)
-DUCKLAKE_CONNSTR = os.environ.get(
-    "DUCKLAKE_CATALOG_CONNSTR",
-    "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita",
-)
-LIB_PATH_ENV = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+POSTGRES_URL = postgres_url()
+DUCKLAKE_CATALOG_CONNSTR = ducklake_catalog_connstr()
 DATA_PLANE_PORT = 50097
 
 pytestmark = [
@@ -103,7 +101,7 @@ def data_plane_process(hmac_secret):
     conn = duckdb.connect(":memory:")
     conn.execute("LOAD ducklake; LOAD postgres;")
     conn.execute(
-        f"ATTACH 'ducklake:postgres:{DUCKLAKE_CONNSTR}' AS qiita_lake"
+        f"ATTACH 'ducklake:postgres:{DUCKLAKE_CATALOG_CONNSTR}' AS qiita_lake"
         f" (DATA_PATH '{DUCKLAKE_DATA_PATH}');"
     )
     # Tables are created by the data plane binary at startup; we just need the
@@ -127,23 +125,16 @@ def data_plane_process(hmac_secret):
     if not os.path.exists(binary):
         pytest.skip(f"binary not found at {binary}")
 
-    libname = "libduckdb.dylib" if sys.platform == "darwin" else "libduckdb.so"
-    duckdb_download = Path(dp_dir) / "target" / "duckdb-download"
-    duckdb_lib_dir: str | None = None
-    if duckdb_download.exists():
-        for candidate in sorted(duckdb_download.glob("*/*"), reverse=True):
-            if (candidate / libname).is_file():
-                duckdb_lib_dir = str(candidate)
-                break
+    duckdb_lib_dir = find_duckdb_lib_dir(Path(dp_dir))
     lib_path = os.environ.get(LIB_PATH_ENV, "")
-    if duckdb_lib_dir:
-        lib_path = f"{duckdb_lib_dir}:{lib_path}" if lib_path else duckdb_lib_dir
+    if duckdb_lib_dir is not None:
+        lib_path = f"{duckdb_lib_dir}:{lib_path}" if lib_path else str(duckdb_lib_dir)
 
     env = {
         **os.environ,
         "LISTEN_ADDR": f"127.0.0.1:{DATA_PLANE_PORT}",
         "HMAC_SECRET_KEY": base64.b64encode(hmac_secret).decode(),
-        "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CONNSTR,
+        "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CATALOG_CONNSTR,
         "DUCKLAKE_DATA_PATH": DUCKLAKE_DATA_PATH,
         LIB_PATH_ENV: lib_path,
     }

@@ -13,7 +13,6 @@ import shutil
 import signal
 import socket
 import subprocess
-import sys
 import time
 from pathlib import Path
 
@@ -21,40 +20,20 @@ import asyncpg
 import httpx
 import pytest
 import pytest_asyncio
-
-POSTGRES_URL = os.environ.get(
-    "QIITA_TEST_POSTGRES_URL",
-    "postgresql://qiita:qiita@localhost:5433/qiita_test",
+from _pg_env import (
+    LIB_PATH_ENV,
+    ducklake_catalog_connstr,
+    find_duckdb_lib_dir,
+    postgres_url,
 )
+
+POSTGRES_URL = postgres_url()
 REPO_ROOT = Path(__file__).parent.parent.parent
 MIGRATIONS_DIR = str(REPO_ROOT / "qiita-control-plane" / "db" / "migrations")
 DATA_PLANE_DIR = REPO_ROOT / "qiita-data-plane"
 DATA_PLANE_BINARY = DATA_PLANE_DIR / "target" / "debug" / "qiita-data-plane"
-
-
-def _find_duckdb_lib_dir() -> Path | None:
-    """Locate libduckdb downloaded by the Rust build (DUCKDB_DOWNLOAD_LIB=1).
-
-    Path is target/duckdb-download/<rust-triple>/<duckdb-version>/. Both vary
-    per host and per dependency bump, so glob and match the libduckdb file
-    name for the current OS so a cross-built directory can't shadow it.
-    """
-    base = DATA_PLANE_DIR / "target" / "duckdb-download"
-    if not base.exists():
-        return None
-    libname = "libduckdb.dylib" if sys.platform == "darwin" else "libduckdb.so"
-    for candidate in sorted(base.glob("*/*"), reverse=True):
-        if (candidate / libname).is_file():
-            return candidate
-    return None
-
-
-DUCKDB_LIB_DIR = _find_duckdb_lib_dir()
-DUCKLAKE_CATALOG_CONNSTR = os.environ.get(
-    "DUCKLAKE_CATALOG_CONNSTR",
-    "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita",
-)
-LIB_PATH_ENV = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+DUCKDB_LIB_DIR = find_duckdb_lib_dir(DATA_PLANE_DIR)
+DUCKLAKE_CATALOG_CONNSTR = ducklake_catalog_connstr()
 
 
 def _run_migrations(postgres_url: str) -> None:
