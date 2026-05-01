@@ -16,7 +16,7 @@ make build
 
 # Test
 make test                  # unit tests (all components)
-make test-integration      # requires Docker (or QIITA_USE_HOST_POSTGRES=1 with libpq env vars to use a host postgres — what CI does on macOS); runs Python + Rust integration suites against postgres on :5433; excludes -m system
+make test-integration      # requires Docker (or use a host postgres, which is what CI does on macOS — see docs/runbooks/integration-tests-host-postgres.md); runs Python + Rust integration suites against postgres on :5433 in Docker mode (default) or :5432 in host mode; excludes -m system
 make test-system           # real GG2 backbone data; slow (~10 min); needs localdocs/scratch/
 make test-workflows        # requires apptainer (Linux-only — macOS skips gracefully); CI runs this on ubuntu only
 
@@ -51,10 +51,16 @@ cd qiita-common && uv run ruff check . && uv run ruff format --check .
 cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo clippy -- -D warnings && cargo fmt --check
 ```
 
-**After changing `qiita-common`**, re-sync dependents so they pick up the changes:
+**After changing `qiita-common`, `qiita-control-plane`, or `qiita-compute-orchestrator`** (or after pulling/merging changes to any of them), re-sync dependents so they pick up the changes. Use `--reinstall-package` — plain `uv sync` skips the rebuild when the version string is unchanged, leaving stale sources in `.venv/.../site-packages/<pkg>/` and producing confusing `ImportError`s for newly-added symbols or `TypeError: __init__() got an unexpected keyword argument` for newly-added fields:
 ```bash
-cd qiita-control-plane && uv sync
-cd qiita-compute-orchestrator && uv sync
+cd qiita-control-plane && uv sync --reinstall-package qiita-common
+cd qiita-compute-orchestrator && uv sync --reinstall-package qiita-common
+# tests/integration has its own venv that path-installs all three packages —
+# reinstall all three after any cross-package merge:
+cd tests/integration && uv sync \
+  --reinstall-package qiita-common \
+  --reinstall-package qiita-control-plane \
+  --reinstall-package qiita-compute-orchestrator
 ```
 
 ## Development ethos

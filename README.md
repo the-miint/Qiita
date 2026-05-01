@@ -55,7 +55,8 @@ make test
 # Lint
 make lint
 
-# Integration tests (requires Docker)
+# Integration tests (requires Docker; on macOS without Docker,
+# see docs/runbooks/integration-tests-host-postgres.md first!)
 make test-integration
 
 # Clean build artifacts
