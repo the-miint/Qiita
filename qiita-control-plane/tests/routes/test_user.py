@@ -8,6 +8,8 @@ for admin-flow calls and the regular-user PAT for self-management calls.
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+pytestmark = pytest.mark.db
+
 
 @pytest.fixture
 async def admin_app(postgres_pool, human_admin_session):

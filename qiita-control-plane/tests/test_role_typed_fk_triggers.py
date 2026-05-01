@@ -19,6 +19,8 @@ import secrets
 import asyncpg
 import pytest
 
+pytestmark = pytest.mark.db
+
 
 SYSTEM_PRINCIPAL_IDX = 1
 

@@ -10,6 +10,8 @@ from datetime import UTC, datetime, timedelta
 import asyncpg
 import pytest
 
+pytestmark = pytest.mark.db
+
 
 # ---------------------------------------------------------------------------
 # Per-test principal fixture

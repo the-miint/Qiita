@@ -10,6 +10,8 @@ applied and the assertions reflect the final state.
 import asyncpg
 import pytest
 
+pytestmark = pytest.mark.db
+
 
 # ---------------------------------------------------------------------------
 # Final column shape

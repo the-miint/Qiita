@@ -6,6 +6,8 @@ import uuid
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+pytestmark = pytest.mark.db
+
 _TEST_SALT = uuid.uuid4().hex  # unique per test session to avoid cross-run collisions
 
 

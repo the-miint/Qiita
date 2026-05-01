@@ -19,6 +19,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+pytestmark = pytest.mark.db
+
 
 def _unique_suffix(human_label: str) -> str:
     """Combine a readable label with a random component so reruns of the

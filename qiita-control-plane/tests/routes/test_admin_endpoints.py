@@ -5,6 +5,8 @@ import json
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+pytestmark = pytest.mark.db
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -26,9 +28,7 @@ async def admin_client(postgres_pool, jwks_harness):
         data_plane_url="unused",
     )
     created: list[int] = []
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as ac:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         ac._created_principals = created
         yield ac
 
@@ -46,8 +46,7 @@ async def admin_client(postgres_pool, jwks_harness):
                         "service_account",
                     ):
                         await conn.execute(
-                            f"DELETE FROM qiita.{table}"
-                            " WHERE principal_idx = ANY($1::bigint[])",
+                            f"DELETE FROM qiita.{table} WHERE principal_idx = ANY($1::bigint[])",
                             created,
                         )
                     await conn.execute(
@@ -165,9 +164,7 @@ async def test_post_service_accounts_returns_token_once(admin_client, postgres_p
     _track(admin_client, body["principal_idx"])
 
 
-async def test_post_service_accounts_requires_explicit_scopes(
-    admin_client, postgres_pool
-):
+async def test_post_service_accounts_requires_explicit_scopes(admin_client, postgres_pool):
     admin_token, _ = await _admin_token(postgres_pool, admin_client)
     resp = await admin_client.post(
         "/api/v1/admin/service-account",
@@ -241,9 +238,7 @@ async def test_patch_principal_disabled_admin_only(admin_client, postgres_pool):
     assert resp.status_code == 403
 
 
-async def test_patch_principal_disabled_then_enabled_round_trip(
-    admin_client, postgres_pool
-):
+async def test_patch_principal_disabled_then_enabled_round_trip(admin_client, postgres_pool):
     admin_token, _ = await _admin_token(postgres_pool, admin_client)
     target = await _seed_human(postgres_pool, email="rt-target@example.com")
     _track(admin_client, target)
@@ -255,8 +250,7 @@ async def test_patch_principal_disabled_then_enabled_round_trip(
     )
     assert r1.status_code == 204
     state = await postgres_pool.fetchrow(
-        "SELECT disabled, disabled_at, disable_reason FROM qiita.principal"
-        " WHERE idx = $1",
+        "SELECT disabled, disabled_at, disable_reason FROM qiita.principal WHERE idx = $1",
         target,
     )
     assert state["disabled"] is True
@@ -269,8 +263,7 @@ async def test_patch_principal_disabled_then_enabled_round_trip(
     )
     assert r2.status_code == 204
     state = await postgres_pool.fetchrow(
-        "SELECT disabled, disabled_at, disable_reason FROM qiita.principal"
-        " WHERE idx = $1",
+        "SELECT disabled, disabled_at, disable_reason FROM qiita.principal WHERE idx = $1",
         target,
     )
     assert state["disabled"] is False
@@ -368,9 +361,7 @@ async def test_admin_cannot_retire_themselves(admin_client, postgres_pool):
 # ---------------------------------------------------------------------------
 
 
-async def test_patch_principal_system_role_writes_audit_event(
-    admin_client, postgres_pool
-):
+async def test_patch_principal_system_role_writes_audit_event(admin_client, postgres_pool):
     admin_token, admin_idx = await _admin_token(postgres_pool, admin_client)
     target = await _seed_human(postgres_pool, email="role-target@example.com")
     _track(admin_client, target)
@@ -531,8 +522,7 @@ async def test_revoke_all_tokens_requires_admin_service_accounts_for_service_tar
     )
     _track(admin_client, svc_idx)
     await postgres_pool.execute(
-        "INSERT INTO qiita.service_account (principal_idx, name)"
-        " VALUES ($1, 'narrow-svc-target')",
+        "INSERT INTO qiita.service_account (principal_idx, name) VALUES ($1, 'narrow-svc-target')",
         svc_idx,
     )
 
@@ -544,9 +534,7 @@ async def test_revoke_all_tokens_requires_admin_service_accounts_for_service_tar
     assert "admin:service_account" in resp.json()["detail"]
 
 
-async def test_revoke_all_tokens_requires_admin_users_for_user_target(
-    admin_client, postgres_pool
-):
+async def test_revoke_all_tokens_requires_admin_users_for_user_target(admin_client, postgres_pool):
     """Symmetric: admin:service_accounts alone is not enough for a user target."""
     from qiita_control_plane.auth.token import mint_api_token
 
@@ -592,16 +580,10 @@ async def test_revoke_all_tokens_revokes_all_active_and_skips_revoked(
     target = await _seed_human(postgres_pool, email="bulk-revoke@example.com")
     _track(admin_client, target)
     # Two active tokens.
-    _, t1 = await mint_api_token(
-        postgres_pool, principal_idx=target, label="a", scopes=[]
-    )
-    _, t2 = await mint_api_token(
-        postgres_pool, principal_idx=target, label="b", scopes=[]
-    )
+    _, t1 = await mint_api_token(postgres_pool, principal_idx=target, label="a", scopes=[])
+    _, t2 = await mint_api_token(postgres_pool, principal_idx=target, label="b", scopes=[])
     # One pre-revoked token.
-    _, t3 = await mint_api_token(
-        postgres_pool, principal_idx=target, label="pre", scopes=[]
-    )
+    _, t3 = await mint_api_token(postgres_pool, principal_idx=target, label="pre", scopes=[])
     await postgres_pool.execute(
         "UPDATE qiita.api_token SET revoked_at = now() WHERE token_idx = $1",
         t3,

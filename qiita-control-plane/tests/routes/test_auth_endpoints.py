@@ -12,6 +12,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+pytestmark = pytest.mark.db
+
 
 # ---------------------------------------------------------------------------
 # Helpers / fixture
@@ -84,9 +86,7 @@ async def auth_client(postgres_pool, jwks_harness):
 
     created: list[int] = []
 
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as ac:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         ac._created_principals = created
         yield ac
 
@@ -106,8 +106,7 @@ async def auth_client(postgres_pool, jwks_harness):
                         "service_account",
                     ):
                         await conn.execute(
-                            f"DELETE FROM qiita.{table}"
-                            " WHERE principal_idx = ANY($1::bigint[])",
+                            f"DELETE FROM qiita.{table} WHERE principal_idx = ANY($1::bigint[])",
                             created,
                         )
                     await conn.execute(
@@ -223,8 +222,7 @@ async def test_auth_whoami_service_returns_service_summary(auth_client, postgres
     )
     _track(auth_client, pidx)
     await postgres_pool.execute(
-        "INSERT INTO qiita.service_account (principal_idx, name)"
-        " VALUES ($1, 'whoami-svc-name')",
+        "INSERT INTO qiita.service_account (principal_idx, name) VALUES ($1, 'whoami-svc-name')",
         pidx,
     )
     plaintext, _ = await mint_api_token(
@@ -258,9 +256,7 @@ async def test_post_pat_returns_token_once(auth_client, postgres_pool, jwks_harn
         subject="pat-once",
     )
     _track(auth_client, pidx)
-    jwt = jwks_harness.sign(
-        _claims(jwks_harness, sub="pat-once", email="pat-once@example.com")
-    )
+    jwt = jwks_harness.sign(_claims(jwks_harness, sub="pat-once", email="pat-once@example.com"))
     resp = await auth_client.post(
         "/api/v1/auth/pat",
         headers={"Authorization": f"Bearer {jwt}"},
@@ -274,9 +270,7 @@ async def test_post_pat_returns_token_once(auth_client, postgres_pool, jwks_harn
     assert body["token_idx"] > 0
 
 
-async def test_post_pat_requires_oidc_jwt_not_pat(
-    auth_client, postgres_pool, jwks_harness
-):
+async def test_post_pat_requires_oidc_jwt_not_pat(auth_client, postgres_pool, jwks_harness):
     """A PAT token in the Authorization header is rejected — humans-only via OIDC."""
     from qiita_control_plane.auth.token import mint_api_token
 
@@ -301,9 +295,7 @@ async def test_post_pat_requires_oidc_jwt_not_pat(
     assert resp.status_code == 401
 
 
-async def test_post_pat_rejects_jwt_with_stale_auth_time(
-    auth_client, postgres_pool, jwks_harness
-):
+async def test_post_pat_rejects_jwt_with_stale_auth_time(auth_client, postgres_pool, jwks_harness):
     pidx = await _seed_user(
         postgres_pool,
         email="pat-stale@example.com",
@@ -350,9 +342,7 @@ async def test_post_pat_rejects_jwt_with_missing_auth_time(
     assert resp.status_code == 401
 
 
-async def test_post_pat_ttl_defaults_to_90_days(
-    auth_client, postgres_pool, jwks_harness
-):
+async def test_post_pat_ttl_defaults_to_90_days(auth_client, postgres_pool, jwks_harness):
     pidx = await _seed_user(
         postgres_pool,
         email="pat-ttl@example.com",
@@ -360,9 +350,7 @@ async def test_post_pat_ttl_defaults_to_90_days(
         subject="pat-ttl",
     )
     _track(auth_client, pidx)
-    jwt = jwks_harness.sign(
-        _claims(jwks_harness, sub="pat-ttl", email="pat-ttl@example.com")
-    )
+    jwt = jwks_harness.sign(_claims(jwks_harness, sub="pat-ttl", email="pat-ttl@example.com"))
     before = datetime.now(UTC)
     resp = await auth_client.post(
         "/api/v1/auth/pat",
@@ -376,9 +364,7 @@ async def test_post_pat_ttl_defaults_to_90_days(
     assert delta < 60, f"expires_at not ~90d from now: {expires} vs {expected}"
 
 
-async def test_post_pat_ttl_beyond_365_rejected(
-    auth_client, postgres_pool, jwks_harness
-):
+async def test_post_pat_ttl_beyond_365_rejected(auth_client, postgres_pool, jwks_harness):
     pidx = await _seed_user(
         postgres_pool,
         email="pat-ttl-too-long@example.com",
@@ -387,9 +373,7 @@ async def test_post_pat_ttl_beyond_365_rejected(
     )
     _track(auth_client, pidx)
     jwt = jwks_harness.sign(
-        _claims(
-            jwks_harness, sub="pat-ttl-too-long", email="pat-ttl-too-long@example.com"
-        )
+        _claims(jwks_harness, sub="pat-ttl-too-long", email="pat-ttl-too-long@example.com")
     )
     resp = await auth_client.post(
         "/api/v1/auth/pat",
@@ -434,9 +418,7 @@ async def test_post_pat_rejects_unknown_scope(auth_client, postgres_pool, jwks_h
     )
     _track(auth_client, pidx)
     jwt = jwks_harness.sign(
-        _claims(
-            jwks_harness, sub="pat-unknown-scope", email="pat-unknown-scope@example.com"
-        )
+        _claims(jwks_harness, sub="pat-unknown-scope", email="pat-unknown-scope@example.com")
     )
     resp = await auth_client.post(
         "/api/v1/auth/pat",
@@ -451,9 +433,7 @@ async def test_post_pat_rejects_unknown_scope(auth_client, postgres_pool, jwks_h
     assert "this:is:bogus" in body["rejected_scopes"]
 
 
-async def test_post_pat_default_scopes_match_role_ceiling(
-    auth_client, postgres_pool, jwks_harness
-):
+async def test_post_pat_default_scopes_match_role_ceiling(auth_client, postgres_pool, jwks_harness):
     pidx = await _seed_user(
         postgres_pool,
         email="pat-default-scopes@example.com",
@@ -493,9 +473,7 @@ async def test_post_pat_system_admin_role_ceiling_includes_lower_role_scopes(
         subject="pat-admin",
     )
     _track(auth_client, pidx)
-    jwt = jwks_harness.sign(
-        _claims(jwks_harness, sub="pat-admin", email="pat-admin@example.com")
-    )
+    jwt = jwks_harness.sign(_claims(jwks_harness, sub="pat-admin", email="pat-admin@example.com"))
     resp = await auth_client.post(
         "/api/v1/auth/pat",
         headers={"Authorization": f"Bearer {jwt}"},
@@ -547,9 +525,7 @@ async def test_post_pat_upscoping_error_does_not_leak_role_ceiling(
         subject="pat-noleak",
     )
     _track(auth_client, pidx)
-    jwt = jwks_harness.sign(
-        _claims(jwks_harness, sub="pat-noleak", email="pat-noleak@example.com")
-    )
+    jwt = jwks_harness.sign(_claims(jwks_harness, sub="pat-noleak", email="pat-noleak@example.com"))
     resp = await auth_client.post(
         "/api/v1/auth/pat",
         headers={"Authorization": f"Bearer {jwt}"},
@@ -571,9 +547,7 @@ async def test_post_pat_writes_audit_event(auth_client, postgres_pool, jwks_harn
         subject="pat-audit",
     )
     _track(auth_client, pidx)
-    jwt = jwks_harness.sign(
-        _claims(jwks_harness, sub="pat-audit", email="pat-audit@example.com")
-    )
+    jwt = jwks_harness.sign(_claims(jwks_harness, sub="pat-audit", email="pat-audit@example.com"))
     resp = await auth_client.post(
         "/api/v1/auth/pat",
         headers={"Authorization": f"Bearer {jwt}"},
@@ -759,9 +733,7 @@ async def test_delete_own_token_revokes_and_writes_audit_event(
     assert detail["token_idx"] == target_idx
 
 
-async def test_delete_others_token_returns_404_not_403(
-    auth_client, postgres_pool, jwks_harness
-):
+async def test_delete_others_token_returns_404_not_403(auth_client, postgres_pool, jwks_harness):
     """Existence-hiding: trying to revoke another user's token returns the
     same 404 as a truly-nonexistent token_idx, so probing doesn't enumerate."""
     from qiita_control_plane.auth.token import mint_api_token
@@ -815,9 +787,7 @@ async def test_delete_others_token_returns_404_not_403(
     assert revoked is None
 
 
-async def test_post_pat_rejects_jwt_with_future_auth_time(
-    auth_client, postgres_pool, jwks_harness
-):
+async def test_post_pat_rejects_jwt_with_future_auth_time(auth_client, postgres_pool, jwks_harness):
     """auth_time more than `authrocket_jwt_leeway_seconds` in the future
     must be rejected — otherwise an IdP with severe forward clock skew
     would let a forged-future-auth_time JWT bypass the freshness gate."""
@@ -953,9 +923,7 @@ async def test_handoff_browser_flow_mints_pat_and_renders_html(
     try:
         # First-login path: no pre-seeded user. The handoff resolver upserts.
         token = jwks_harness.sign(
-            _lr_claims(
-                jwks_harness, sub="handoff-browser", email="handoff-browser@example.com"
-            )
+            _lr_claims(jwks_harness, sub="handoff-browser", email="handoff-browser@example.com")
         )
         cookie = _make_login_cookie(cli=False)
         resp = await auth_client.get(
@@ -1075,6 +1043,7 @@ async def test_handoff_rejects_missing_token_param(auth_client):
 async def test_handoff_rejects_invalid_jwt(auth_client, jwks_harness):
     """A well-formed JWT signed with a different key → 401."""
     from cryptography.hazmat.primitives.asymmetric import rsa
+
     from qiita_control_plane.main import app
 
     saved_verifier = app.state.oidc_verifier
@@ -1093,9 +1062,7 @@ async def test_handoff_rejects_invalid_jwt(auth_client, jwks_harness):
         app.state.oidc_verifier = saved_verifier
 
 
-async def test_cli_exchange_returns_pat_once(
-    auth_client, postgres_pool, jwks_harness
-):
+async def test_cli_exchange_returns_pat_once(auth_client, postgres_pool, jwks_harness):
     """First exchange returns the PAT; second is a 404 because consumed_at
     is set atomically by the UPDATE."""
     from qiita_control_plane.main import app

@@ -1,6 +1,6 @@
 """Pure unit tests for opaque API token format / hashing / scope validation.
 
-DB-required tests live in tests/integration/test_api_token.py.
+DB-required tests live in qiita-control-plane/tests/auth/test_api_token_db.py.
 """
 
 import hashlib

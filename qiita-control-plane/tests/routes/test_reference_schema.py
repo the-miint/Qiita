@@ -3,6 +3,8 @@
 import asyncpg
 import pytest
 
+pytestmark = pytest.mark.db
+
 EXPECTED_TABLES = [
     "reference",
     "genome",

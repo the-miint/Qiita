@@ -36,6 +36,11 @@ packages = ["src/qiita_control_plane"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+markers = [
+    "db: tests that require a Postgres database (deselect with -m 'not db')",
+]
 
 [tool.ruff]
 line-length = 100
