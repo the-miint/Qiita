@@ -175,10 +175,11 @@ COMMENT ON COLUMN qiita.biosample_metadata.global_field_idx IS
     'biosample''s link to the source field''s owning study has been retired '
     '(set to true on biosample_to_study.retired): retirement of the contributing '
     'link demotes the row from globally-linked to study-local and releases the '
-    'cross-study uniqueness slot so another study may later claim it. Powers the '
-    'partial unique index that enforces one value per (biosample, global concept) '
-    'pair across all studies, so cross-study reads through the global field '
-    'always return a single canonical value.';
+    'cross-study uniqueness slot (biosample_idx, global_field_idx) so another '
+    'study may subsequently write a different globally-linked value on the same '
+    '(biosample, global concept) pair. Powers the partial unique index that enforces '
+    'one value per (biosample, global concept) pair across all studies, so cross-study '
+    'reads through the global field always return a single canonical value.';
 
 CREATE INDEX biosample_metadata_field_idx
     ON qiita.biosample_metadata (biosample_study_field_idx);

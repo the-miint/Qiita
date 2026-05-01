@@ -1,14 +1,22 @@
 -- migrate:up
 
+-- =============================================================================
+-- REFERENCE DATABASES (sequence references and taxonomy authorities)
+-- =============================================================================
+-- A reference is a (name, version) pair. `kind` distinguishes sequence
+-- references from taxonomy authorities. Tip-to-feature mapping for
+-- phylogenies lives in DuckLake (the reference_phylogeny table stores
+-- feature_idx directly on tip nodes), not in Postgres.
+
 CREATE TABLE qiita.references (
-    reference_idx BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
-    name          TEXT        NOT NULL,
-    version       TEXT        NOT NULL,
-    kind          TEXT        NOT NULL CHECK (kind IN ('sequence_reference', 'taxonomy_authority')),
-    status        TEXT        NOT NULL DEFAULT 'pending'
-                              CHECK (status IN ('pending', 'hashing', 'minting', 'loading', 'active', 'failed')),
-    created_by    UUID        NOT NULL,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    reference_idx   BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    name            TEXT        NOT NULL,
+    version         TEXT        NOT NULL,
+    kind            TEXT        NOT NULL CHECK (kind IN ('sequence_reference', 'taxonomy_authority')),
+    status          TEXT        NOT NULL DEFAULT 'pending'
+                                CHECK (status IN ('pending', 'hashing', 'minting', 'loading', 'active', 'failed')),
+    created_by_idx  BIGINT      NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (name, version)
 );
 
@@ -42,16 +50,9 @@ CREATE TABLE qiita.feature_genome (
 
 CREATE INDEX ON qiita.feature_genome (genome_idx);
 
-CREATE TABLE qiita.phylogeny_tip_feature (
-    reference_idx BIGINT NOT NULL REFERENCES qiita.references (reference_idx),
-    node_index    BIGINT NOT NULL,
-    feature_idx   BIGINT NOT NULL REFERENCES qiita.features (feature_idx),
-    PRIMARY KEY (reference_idx, node_index)
-);
 
 -- migrate:down
 
-DROP TABLE IF EXISTS qiita.phylogeny_tip_feature;
 DROP TABLE IF EXISTS qiita.feature_genome;
 DROP TABLE IF EXISTS qiita.reference_membership;
 DROP TABLE IF EXISTS qiita.features;

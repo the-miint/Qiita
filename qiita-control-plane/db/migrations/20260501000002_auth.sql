@@ -1,63 +1,5 @@
 -- migrate:up
 
-CREATE EXTENSION IF NOT EXISTS citext;
-
-
--- =============================================================================
--- DISABLED STATE on existing principal table
--- =============================================================================
--- Adds the temporary-block primitive alongside the existing retired BOOLEAN.
--- The auth layer rejects login / token-use when either is true; only retired
--- is terminal. Disabling does NOT auto-revoke tokens; admin can bulk-revoke
--- separately if desired. principal_not_both_disabled_and_retired forbids
--- the simultaneous-true case at the schema level.
-
-ALTER TABLE qiita.principal
-    ADD COLUMN disabled         BOOLEAN NOT NULL DEFAULT false,
-    ADD COLUMN disabled_at      TIMESTAMPTZ,
-    ADD COLUMN disabled_by_idx  BIGINT REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
-    ADD COLUMN disable_reason   TEXT,
-    ADD CONSTRAINT principal_disabled_consistent CHECK (
-        (disabled = false
-            AND disabled_at IS NULL
-            AND disabled_by_idx IS NULL
-            AND disable_reason IS NULL)
-        OR
-        (disabled = true
-            AND disabled_at IS NOT NULL
-            AND disabled_by_idx IS NOT NULL)
-    ),
-    ADD CONSTRAINT principal_not_both_disabled_and_retired
-        CHECK (NOT (disabled AND retired)),
-    -- The system principal (idx=1) must remain in the active state.
-    -- Disabling or retiring it would block automatic system-generated audit
-    -- events that record it as the actor.
-    ADD CONSTRAINT principal_system_principal_always_active
-        CHECK (idx <> 1 OR (NOT disabled AND NOT retired));
-
-
--- =============================================================================
--- SYSTEM PRINCIPAL (seeded at idx=1)
--- =============================================================================
--- The system principal acts as:
---   * Backfill target for pre-auth historical FKs (e.g.
---     `qiita.references.created_by_idx`).
---   * Audit-event "actor" for system-generated events (e.g., automatic
---     token revocation on retirement, fired by a DB trigger).
--- It is neither a user nor a service_account (no subtype row exists for it,
--- enforced by CHECK (principal_idx <> 1) on each subtype). It cannot
--- authenticate. The deferred self-FK on principal.created_by_idx lets
--- created_by_idx=1 reference itself within this transaction (dbmate wraps
--- each migration in a transaction).
--- system_role='system_admin' is for audit-log self-documentation; it grants
--- no capability since the principal has no credentials.
-
-INSERT INTO qiita.principal (idx, display_name, system_role, created_by_idx)
-    OVERRIDING SYSTEM VALUE
-    VALUES (1, 'system', 'system_admin', 1);
-SELECT setval(pg_get_serial_sequence('qiita.principal', 'idx'), 1);
-
-
 -- =============================================================================
 -- USER SUBTYPE (humans authenticating via OIDC)
 -- =============================================================================
@@ -94,11 +36,36 @@ CREATE TABLE qiita.user (
     updated_at                 TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Reuse the shared updated_at trigger function defined in
--- 20260423000001_studies.sql; do not redefine.
 CREATE TRIGGER user_set_updated_at
     BEFORE UPDATE ON qiita.user
     FOR EACH ROW EXECUTE FUNCTION qiita.set_updated_at();
+
+
+-- The `profile_complete` generated column on qiita.user returns TRUE iff
+-- affiliation, address, and phone are all non-empty. Routes that need to
+-- surface *which* fields are empty (currently `POST /auth/pat`'s 422 body)
+-- used to duplicate the field list in Python, which would silently rot if a
+-- 4th required field were added to the generated column. Calling this
+-- function from SQL keeps the field list in exactly one place — this
+-- migration — alongside the generated column expression.
+--
+-- Add a new required field by:
+--   1. Adding it to the `profile_complete` GENERATED expression on
+--      qiita.user (would be a column ADD + a generated-column update via
+--      a follow-up migration).
+--   2. Adding the matching `CASE WHEN <new> = '' THEN '<new>' END` line
+--      to the ARRAY below.
+
+CREATE FUNCTION qiita.user_profile_missing_fields(
+    affiliation TEXT, address TEXT, phone TEXT
+) RETURNS TEXT[]
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
+    SELECT array_remove(ARRAY[
+        CASE WHEN affiliation = '' THEN 'affiliation' END,
+        CASE WHEN address     = '' THEN 'address'     END,
+        CASE WHEN phone       = '' THEN 'phone'       END
+    ], NULL)
+$$;
 
 
 -- Links an external OIDC identity to one of our principals. The auth
@@ -295,15 +262,60 @@ CREATE TRIGGER principal_retire_revoke_tokens
     FOR EACH ROW EXECUTE FUNCTION qiita.tg_revoke_tokens_on_retire();
 
 
--- migrate:down
--- The system principal seed is removed here so that 'down then up' cycles
--- back to a clean state during development. Later migrations FK other rows
--- to idx=1 (e.g. `qiita.references.created_by_idx`); when those exist this
--- DELETE will fail with a foreign-key error until they are taken down too,
--- which is the standard sequential-down expectation. The dependency is
--- therefore captured implicitly by FK enforcement rather than by a
--- leave-it-in-place comment that breaks the down/up loop.
+-- =============================================================================
+-- CLI LOGIN ONE-TIME CODES
+-- =============================================================================
+-- Single-use exchange codes that bridge the AuthRocket → /auth/handoff →
+-- localhost-loopback → CLI flow. The handoff route mints a PAT, stores its
+-- plaintext here under a freshly-generated `ot_code`, then redirects the
+-- browser to the CLI's loopback with the plaintext ot_code in the query
+-- string. The CLI POSTs the ot_code back to /auth/cli-exchange, which atomically
+-- consumes the row and returns the PAT plaintext.
+--
+-- Plaintext PAT lives here briefly; the table is the only place qiita stores
+-- a plaintext token at rest. The TTL is short (default 30s, capped via
+-- CLI_LOGIN_CODE_TTL_SECONDS) so an intercepted ot_code expires almost
+-- immediately. Single-use is enforced atomically via
+-- `UPDATE … WHERE consumed_at IS NULL RETURNING …`.
+--
+-- ot_code is BYTEA holding SHA-256 of the plaintext code (32 bytes), matching
+-- the api_tokens.token_hash convention — the wire-format ot_code is a
+-- secrets.token_urlsafe(32) string, never stored in cleartext.
 
+-- token_idx pins the row to the exact api_tokens row whose plaintext lives
+-- here; without it /auth/cli-exchange would have to guess "the most recent
+-- token for this principal," which races a parallel mint into the wrong
+-- metadata payload. ON DELETE CASCADE so token revocation/expiry GC also
+-- sweeps any matching unredeemed code.
+CREATE TABLE qiita.cli_login_codes (
+    ot_code         BYTEA PRIMARY KEY,
+    principal_idx   BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE CASCADE,
+    token_idx       BIGINT NOT NULL REFERENCES qiita.api_tokens(token_idx) ON DELETE CASCADE,
+    plaintext_pat   TEXT NOT NULL,
+    expires_at      TIMESTAMPTZ NOT NULL,
+    consumed_at     TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT cli_login_codes_consumed_after_created
+        CHECK (consumed_at IS NULL OR consumed_at >= created_at),
+    CONSTRAINT cli_login_codes_expires_after_created
+        CHECK (expires_at > created_at)
+);
+
+-- Partial index: hot path is "find unconsumed codes near expiry" for
+-- garbage-collection. Active rows are the only ones queried for redemption,
+-- so excluding consumed rows keeps the index small.
+CREATE INDEX cli_login_codes_expires_at
+    ON qiita.cli_login_codes (expires_at)
+    WHERE consumed_at IS NULL;
+
+COMMENT ON TABLE qiita.cli_login_codes IS
+    'Short-lived single-use codes for the qiita-admin login → CLI loopback handoff. '
+    'Stores plaintext PAT briefly between handoff and CLI exchange. See docs/auth.md.';
+
+
+-- migrate:down
+
+DROP TABLE IF EXISTS qiita.cli_login_codes;
 DROP TRIGGER IF EXISTS principal_retire_revoke_tokens ON qiita.principal;
 DROP FUNCTION IF EXISTS qiita.tg_revoke_tokens_on_retire();
 DROP TRIGGER IF EXISTS auth_events_no_delete ON qiita.auth_events;
@@ -313,18 +325,9 @@ DROP TRIGGER IF EXISTS service_account_subtype_exclusion ON qiita.service_accoun
 DROP TRIGGER IF EXISTS user_subtype_exclusion ON qiita.user;
 DROP FUNCTION IF EXISTS qiita.tg_principal_subtype_exclusion();
 DROP TRIGGER IF EXISTS user_set_updated_at ON qiita.user;
+DROP FUNCTION IF EXISTS qiita.user_profile_missing_fields(TEXT, TEXT, TEXT);
 DROP TABLE IF EXISTS qiita.auth_events;
 DROP TABLE IF EXISTS qiita.api_tokens;
 DROP TABLE IF EXISTS qiita.service_account;
 DROP TABLE IF EXISTS qiita.user_identities;
 DROP TABLE IF EXISTS qiita.user;
-DELETE FROM qiita.principal WHERE idx = 1;
-ALTER TABLE qiita.principal
-    DROP CONSTRAINT IF EXISTS principal_system_principal_always_active,
-    DROP CONSTRAINT IF EXISTS principal_not_both_disabled_and_retired,
-    DROP CONSTRAINT IF EXISTS principal_disabled_consistent,
-    DROP COLUMN IF EXISTS disable_reason,
-    DROP COLUMN IF EXISTS disabled_by_idx,
-    DROP COLUMN IF EXISTS disabled_at,
-    DROP COLUMN IF EXISTS disabled;
--- citext extension intentionally not dropped: may be used elsewhere.
