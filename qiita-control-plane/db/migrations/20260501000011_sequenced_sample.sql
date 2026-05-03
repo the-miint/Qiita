@@ -545,9 +545,9 @@ CREATE TRIGGER sequenced_sample_to_study_reject_without_biosample_link_update
 -- migrate:down
 
 -- Drop the trigger that lives on a previous migration's table
--- (sequenced_sample_study_field in 000007). Dropping the tables below takes
--- their own triggers with them, but this one would otherwise orphan against
--- an empty target.
+-- (sequenced_sample_study_field). Dropping the tables below takes their own
+-- triggers with them, but this one would otherwise orphan against an empty
+-- target.
 DROP TRIGGER IF EXISTS sequenced_sample_study_field_propagate_global_link ON qiita.sequenced_sample_study_field;
 
 DROP TABLE IF EXISTS qiita.sequenced_sample_field_exception;
