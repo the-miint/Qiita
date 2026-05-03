@@ -104,7 +104,7 @@ CREATE INDEX principal_retired_idx
 -- =============================================================================
 -- The system principal acts as:
 --   * Backfill target for FKs that need a non-null actor when no human is
---     responsible (e.g. `qiita.references.created_by_idx` for system imports).
+--     responsible (e.g. `qiita.reference.created_by_idx` for system imports).
 --   * Audit-event "actor" for system-generated events (e.g., automatic
 --     token revocation on retirement, fired by a DB trigger).
 -- It is neither a user nor a service_account (no subtype row exists for it,
