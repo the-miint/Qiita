@@ -7,7 +7,7 @@
 -- (action_id, version) is the YAML's address and this table's primary key —
 -- multiple versions of the same action_id can coexist, each its own row.
 --
--- Two column tiers (B7):
+-- Two column tiers:
 --   * YAML-authoritative — overwritten on every sync. Never hand-edited;
 --     a divergence between YAML and DB is treated as the YAML being correct.
 --   * DB-authoritative — never touched by sync. Operational state (enabled
@@ -27,18 +27,19 @@ CREATE TABLE qiita.action (
     -- ===== YAML-AUTHORITATIVE COLUMNS =====
     -- The kind of resource a work_ticket invoking this action targets. Must
     -- match the ticket's scope_target.kind at submission (route handler
-    -- 422s on mismatch).
-    target_kind        TEXT NOT NULL CHECK (target_kind IN ('study_prep', 'reference')),
+    -- 422s on mismatch). Same ENUM as work_ticket.scope_target_kind so the
+    -- value sets are kept in lockstep by construction.
+    target_kind        qiita.scope_target_kind NOT NULL,
 
     description        TEXT,
 
-    -- Required scopes, AND-composed (B7/B8). Validated at sync time against
+    -- Required scopes, AND-composed. Validated at sync time against
     -- qiita_common.auth_constants.Scope; an unknown scope string makes the
     -- deploy fail before the upsert lands.
     scopes             TEXT[] NOT NULL,
 
-    -- { service: bool, human_roles: ["user"|"wet_lab_admin"|"system_admin"] }
-    -- (A4). Answers "may invoke," not "may execute."
+    -- { service: bool, human_roles: ["user"|"wet_lab_admin"|"system_admin"] }.
+    -- Answers "may invoke," not "may execute."
     audience           JSONB NOT NULL,
 
     -- Per-action JSON Schema fragment validated against work_ticket.action_context
@@ -48,12 +49,12 @@ CREATE TABLE qiita.action (
 
     -- Step list as JSONB. Each entry is one of:
     --   { kind: "step",   name, step_type, container, baseline_resources }
-    --   { kind: "action", name, ... }   -- control-plane primitive (B16)
+    --   { kind: "action", name, ... }   -- control-plane primitive
     -- step_type ∈ {map, reduce, singleton}. The orchestrator interprets this
     -- column; the DB does not introspect step shape beyond storing JSON.
     steps              JSONB NOT NULL,
 
-    -- Action-wide resource ceilings (B12). Resolution at submit-time clamps
+    -- Action-wide resource ceilings. Resolution at submit-time clamps
     -- yaml.<dim> × profile.<dim>_mult against profile.<dim>_max AND these
     -- ceilings; the lower wins. Ceilings are mandatory so every action has
     -- a hard upper bound regardless of profile.
@@ -116,11 +117,10 @@ CREATE TRIGGER action_set_updated_at
 -- =============================================================================
 -- WORK_TICKET → ACTION FK
 -- =============================================================================
--- The work_ticket table (Step 1) carries plain TEXT action_id / action_version
--- columns; now that qiita.action exists, add the FK so a ticket can only
+-- Now that qiita.action exists, add the FK so a work_ticket can only
 -- reference an action that has been synced. RESTRICT on delete: the route
--- handler should refuse to delete an action with outstanding tickets, but the
--- DB-level guard catches anything that bypasses that check.
+-- handler should refuse to delete an action with outstanding tickets, but
+-- the DB-level guard catches anything that bypasses that check.
 
 ALTER TABLE qiita.work_ticket
     ADD CONSTRAINT work_ticket_action_fkey

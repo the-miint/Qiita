@@ -359,8 +359,7 @@ class RevokeAllTokensResponse(BaseModel):
 # completion back via state transitions.
 #
 # `originator_principal_idx` is the submitter; resource profile and SLURM
-# priority resolve from the originator, not the executor (see A6 of the
-# orchestrator design pass).
+# priority resolve from the originator, not the executor.
 
 
 class StepType(StrEnum):
@@ -381,8 +380,17 @@ class StepType(StrEnum):
     SINGLETON = "singleton"
 
 
+class ScopeTargetKind(StrEnum):
+    """Closed set of work-ticket scope-target kinds. Mirrored DB-side by
+    the qiita.scope_target_kind ENUM; both work_ticket.scope_target_kind
+    and action.target_kind reference it."""
+
+    STUDY_PREP = "study_prep"
+    REFERENCE = "reference"
+
+
 class WorkTicketState(StrEnum):
-    """Work-ticket lifecycle.
+    """Work-ticket lifecycle. Mirrored DB-side by qiita.work_ticket_state.
 
     Submission gates: PENDING / QUEUED / PROCESSING block resubmission of
     the same `(scope_target, action_id, action_version)` triple entirely.
@@ -401,7 +409,7 @@ class StudyPrepScopeTarget(BaseModel):
     """Work ticket targets a (study, prep) tuple — used for sample-processing
     actions (e.g. deblur, woltka)."""
 
-    kind: Literal["study_prep"]
+    kind: Literal[ScopeTargetKind.STUDY_PREP]
     study_idx: Annotated[int, Field(gt=0)]
     prep_idx: Annotated[int, Field(gt=0)]
 
@@ -410,7 +418,7 @@ class ReferenceScopeTarget(BaseModel):
     """Work ticket targets a single reference — used for reference-add and
     any future reference-mutation action."""
 
-    kind: Literal["reference"]
+    kind: Literal[ScopeTargetKind.REFERENCE]
     reference_idx: Annotated[int, Field(gt=0)]
 
 
@@ -428,15 +436,13 @@ ScopeTarget = Annotated[
 class WorkTicket(BaseModel):
     """Control-plane record of an action invocation.
 
-    `(action_id, action_version)` pins the exact action definition this ticket
-    was submitted against. Once Step 2 (action registry) lands, both columns
-    FK into `qiita.action`; until then they're plain strings validated only
-    by the YAML-sync layer at deploy time.
+    `(action_id, action_version)` FK into `qiita.action` and pin the exact
+    action definition this ticket was submitted against.
 
     `scope_target` answers "which resource is this work about?" — the
     resource-ACL gate keys off it. `action_context` carries action-defined
     free-form state, validated at submission against the action's declared
-    `context_schema` (Step 2).
+    `context_schema`.
     """
 
     work_ticket_idx: Annotated[int, Field(gt=0)]

@@ -2,7 +2,7 @@
 `action_id` key into an ActionDefinition.
 
 Every YAML found is loaded, but only those with an `action_id` top-level
-key are treated as B7 action definitions. Other YAML files in the tree
+key are treated as action definitions. Other YAML files in the tree
 (container build manifests, smoke-test workflows, scaffolding) are
 silently skipped — the loader does not attempt to validate them as
 action definitions. Operators can therefore put unrelated YAML alongside
@@ -24,7 +24,7 @@ class DuplicateActionError(ValueError):
 
 
 def load_actions(workflows_dir: Path) -> list[ActionDefinition]:
-    """Load every B7 action YAML under `workflows_dir`.
+    """Load every action YAML under `workflows_dir`.
 
     Returns the list sorted deterministically by (action_id, version) so the
     upsert order is stable across runs (helps with integration-test diffs

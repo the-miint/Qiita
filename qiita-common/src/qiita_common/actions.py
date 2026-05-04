@@ -1,15 +1,14 @@
 """Action-registry Pydantic models — YAML format and DB-row reconstruction.
 
 Source of truth for an action definition is `workflows/<action_id>/<version>.yaml`.
-The control-plane sync routine (Step 2c) loads each YAML, validates it via
+The control-plane sync routine loads each YAML, validates it via
 `ActionDefinition`, and upserts the YAML-authoritative columns into
 `qiita.action`. Both control-plane and compute-orchestrator reconstruct
 `ActionDefinition` from DB rows for runtime use; YAML parsing itself lives
 only in the control plane.
 
-The YAML entry shape for the `steps` list mirrors the design's B6 / B16
-examples — each entry uses either a singular `step:` or `action:` key
-whose value is the entry's name:
+The YAML entry shape for the `steps` list uses a singular `step:` or
+`action:` key whose value is the entry's name:
 
     steps:
       - step: hash
@@ -35,18 +34,18 @@ from qiita_common.auth_constants import (
     Scope,
     SystemRole,
 )
-from qiita_common.models import StepType
+from qiita_common.models import ScopeTargetKind, StepType
 
 
 class Audience(BaseModel):
-    """Who may invoke this action (A4 of the orchestrator design).
+    """Who may invoke this action — answers "may invoke", not "may execute".
 
     `service=true` means service-account principals may invoke.
     `human_roles` is the set of SystemRole values whose humans may invoke;
     leaving it empty means no human can.
 
-    Audience answers "may invoke," not "may execute." Execution-side
-    privileges are a separate concern handled by the SLURM dispatch profile.
+    Execution-side privileges (queue, account, priority) are a separate
+    concern handled by the SLURM dispatch profile.
     """
 
     service: bool
@@ -54,9 +53,10 @@ class Audience(BaseModel):
 
 
 class BaselineResources(BaseModel):
-    """Per-step resource declaration the orchestrator multiplies by the
-    originator's profile and clamps by the action ceiling at submit time
-    (B12 resolution math)."""
+    """Per-step resource declaration. At submit time the orchestrator
+    multiplies these by the originator's profile and clamps the result by
+    the action ceiling.
+    """
 
     cpu: Annotated[int, Field(gt=0)]
     mem_gb: Annotated[int, Field(gt=0)]
@@ -72,9 +72,10 @@ class BaselineResources(BaseModel):
 
 
 class ActionCeiling(BaselineResources):
-    """Action-wide resource caps (B12). Same shape as BaselineResources; the
+    """Action-wide resource caps. Same shape as BaselineResources; the
     distinct type makes call-site intent obvious — `step.baseline_resources`
-    is the per-step ask, `action.action_ceiling` is the action-wide hard cap."""
+    is the per-step ask, `action.action_ceiling` is the action-wide hard cap.
+    """
 
 
 class WorkflowStep(BaseModel):
@@ -82,7 +83,7 @@ class WorkflowStep(BaseModel):
 
     `step_type` ∈ {map, reduce, singleton}: map runs once per sample, reduce
     runs once over the union of map outputs, singleton runs once per workflow
-    invocation (B6).
+    invocation.
     """
 
     kind: Literal["step"]
@@ -96,7 +97,7 @@ class WorkflowStep(BaseModel):
 
 
 class WorkflowAction(BaseModel):
-    """Control-plane primitive referenced by name from a workflow (B16).
+    """Control-plane primitive referenced by name from a workflow.
 
     Library primitives are not user-invokable; they execute in-process in
     the control plane during workflow orchestration. A user-invokable
@@ -120,7 +121,7 @@ WorkflowEntry = Annotated[
 
 class ActionDefinition(BaseModel):
     """Top-level action definition. YAML is source-of-truth; the sync routine
-    (control-plane) upserts the YAML-authoritative columns into qiita.action.
+    upserts the YAML-authoritative columns into qiita.action.
 
     `target_kind` constrains what scope_target.kind a work_ticket invoking
     this action may carry — the route handler 422s on mismatch.
@@ -133,7 +134,7 @@ class ActionDefinition(BaseModel):
 
     action_id: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
-    target_kind: Literal["study_prep", "reference"]
+    target_kind: ScopeTargetKind
     description: str | None = None
 
     scopes: list[str] = Field(default_factory=list)
@@ -154,8 +155,9 @@ class ActionDefinition(BaseModel):
     def _normalize_step_entries(cls, data: Any) -> Any:
         """Rewrite `{step: <name>, ...}` and `{action: <name>, ...}` shorthand
         into the discriminator form `{kind: step|action, name: <name>, ...}`
-        before the WorkflowEntry union dispatches. Per-entry rejected if it
-        sets neither or both keys.
+        before the WorkflowEntry union dispatches. An entry that sets both
+        keys is rejected; one that sets neither falls through to Pydantic's
+        discriminator-missing error.
         """
         if not isinstance(data, dict):
             return data
@@ -177,9 +179,6 @@ class ActionDefinition(BaseModel):
                 entry = {"kind": "step", "name": entry.pop("step"), **entry}
             elif has_action:
                 entry = {"kind": "action", "name": entry.pop("action"), **entry}
-            # If neither key is present, leave the entry untouched — Pydantic
-            # will reject it via the discriminator-missing path with a clear
-            # error message.
             rewritten.append(entry)
         data = {**data, "steps": rewritten}
         return data

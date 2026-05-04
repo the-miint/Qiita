@@ -1,6 +1,32 @@
 -- migrate:up
 
 -- =============================================================================
+-- ENUM TYPES used by qiita.work_ticket and qiita.action
+-- =============================================================================
+-- scope_target_kind is shared between work_ticket.scope_target_kind (which
+-- arm of the tagged union the ticket carries) and action.target_kind (what
+-- arm a ticket invoking that action must use). Living in one CREATE TYPE
+-- means the value set is defined exactly once across the schema; matches
+-- the qiita.system_role / qiita.tier convention used elsewhere.
+CREATE TYPE qiita.scope_target_kind AS ENUM (
+    'study_prep',
+    'reference'
+);
+
+-- work_ticket_state is the closed lifecycle set mirrored by
+-- qiita_common.models.WorkTicketState. PENDING / QUEUED / PROCESSING are
+-- the non-terminal states the orchestrator actively manages. COMPLETED /
+-- FAILED are terminal.
+CREATE TYPE qiita.work_ticket_state AS ENUM (
+    'pending',
+    'queued',
+    'processing',
+    'completed',
+    'failed'
+);
+
+
+-- =============================================================================
 -- WORK TICKET (compute-orchestrator action invocations)
 -- =============================================================================
 -- A work_ticket is the control-plane's record of an action invocation: who
@@ -13,26 +39,25 @@
 -- existing ticket for the same (scope_target, action_id, action_version) is
 -- in PENDING / QUEUED / PROCESSING; COMPLETED requires explicit DELETE
 -- before re-submission. That check is enforced in the route handler, not
--- here — the DB carries no partial-unique index for it yet because the
--- exact triple to key on (and whether to include action_context fields)
--- depends on action-registry semantics that arrive in Step 2 (B7).
+-- here — the DB carries no partial-unique index for it because the exact
+-- triple to key on (and whether to include action_context fields) depends
+-- on per-action semantics that live in the registry.
 
 CREATE TABLE qiita.work_ticket (
     work_ticket_idx          BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
 
-    -- Action invoked by this ticket. (action_id, action_version) will FK
-    -- into qiita.action once the action registry lands in Step 2 (B7);
-    -- until then they're plain text columns validated only by length.
+    -- Action invoked by this ticket. (action_id, action_version) FK into
+    -- qiita.action; the constraint is added when that table is created.
     action_id                TEXT NOT NULL CHECK (length(action_id) BETWEEN 1 AND 255),
     action_version           TEXT NOT NULL CHECK (length(action_version) BETWEEN 1 AND 100),
 
     -- Submitter. Priority and resource profile resolve from the originator,
-    -- not the executor (A6 of the orchestrator design). RESTRICT so a
-    -- principal with outstanding tickets can't be hard-deleted.
+    -- not the executor. RESTRICT so a principal with outstanding tickets
+    -- can't be hard-deleted.
     originator_principal_idx BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
 
-    -- Tagged-union scope target (B13). Exactly one of (study_idx, prep_idx)
-    -- or reference_idx is non-null, governed by scope_target_kind via the
+    -- Tagged-union scope target. Exactly one of (study_idx, prep_idx) or
+    -- reference_idx is non-null, governed by scope_target_kind via the
     -- work_ticket_scope_target_consistent CHECK below. This is the column
     -- the resource-ACL gate keys off; matches the discriminated-union shape
     -- of qiita_common.models.ScopeTarget.
@@ -41,7 +66,7 @@ CREATE TABLE qiita.work_ticket (
     -- plain BIGINT until the prep schema lands. study_idx and reference_idx
     -- both RESTRICT so a referenced row can't disappear from under an
     -- in-flight ticket.
-    scope_target_kind        TEXT NOT NULL CHECK (scope_target_kind IN ('study_prep', 'reference')),
+    scope_target_kind        qiita.scope_target_kind NOT NULL,
     study_idx                BIGINT REFERENCES qiita.study(idx) ON DELETE RESTRICT,
     prep_idx                 BIGINT,
     reference_idx            BIGINT REFERENCES qiita.reference(reference_idx) ON DELETE RESTRICT,
@@ -60,12 +85,11 @@ CREATE TABLE qiita.work_ticket (
 
     -- Action-defined free-form context. Per-action JSON-Schema validation
     -- (against the action's declared `context_schema`) happens at submission
-    -- once Step 2 lands; today this column accepts any object.
+    -- in the route handler; this column accepts any object.
     action_context           JSONB NOT NULL DEFAULT '{}'::jsonb,
 
     -- Lifecycle. Mirrors qiita_common.models.WorkTicketState.
-    state                    TEXT NOT NULL DEFAULT 'pending'
-                             CHECK (state IN ('pending', 'queued', 'processing', 'completed', 'failed')),
+    state                    qiita.work_ticket_state NOT NULL DEFAULT 'pending',
 
     created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
 
@@ -76,7 +100,7 @@ CREATE TABLE qiita.work_ticket (
 COMMENT ON TABLE qiita.work_ticket IS
     'Compute-orchestrator action invocations: who requested, which resource, '
     'what action-defined context, and lifecycle state. (action_id, '
-    'action_version) FK into qiita.action lands with Step 2 (B7).';
+    'action_version) FK into qiita.action.';
 
 -- The orchestrator polls for PENDING / QUEUED / PROCESSING tickets to
 -- dispatch and watch; COMPLETED / FAILED are terminal and seldom queried
@@ -107,3 +131,5 @@ CREATE TRIGGER work_ticket_set_updated_at
 
 DROP TRIGGER IF EXISTS work_ticket_set_updated_at ON qiita.work_ticket;
 DROP TABLE IF EXISTS qiita.work_ticket;
+DROP TYPE IF EXISTS qiita.work_ticket_state;
+DROP TYPE IF EXISTS qiita.scope_target_kind;

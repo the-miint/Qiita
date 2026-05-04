@@ -82,7 +82,7 @@ async def test_sync_updates_yaml_authoritative_columns_only(
     postgres_pool, workflows_dir, clean_action_table
 ):
     """Re-sync after a YAML edit overwrites YAML-authoritative columns and
-    leaves DB-authoritative state alone — the load-bearing invariant of B7."""
+    leaves DB-authoritative state alone — the load-bearing registry invariant."""
     from qiita_control_plane.actions import load_actions, sync_actions
 
     # First sync — establish the row.

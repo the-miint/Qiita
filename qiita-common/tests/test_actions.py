@@ -101,7 +101,7 @@ def test_step_entry_rejects_neither_key():
 
 def test_unknown_scope_rejected():
     """A scope string outside the Scope enum must be rejected at load time —
-    YAML typos become deploy errors per B7."""
+    YAML typos become deploy errors instead of runtime auth bypasses."""
     from qiita_common.actions import ActionDefinition
 
     kwargs = _minimal_action_kwargs()

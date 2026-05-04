@@ -44,7 +44,7 @@ steps:
 action_ceiling: {cpu: 32, mem_gb: 128, walltime: PT8H}
 """
 
-# Resembles workflows/amplicon/workflow.yaml — pre-B7 scaffolding without
+# Resembles workflows/amplicon/workflow.yaml — scaffolding without an
 # action_id at the top level. The loader must skip these silently so the
 # scaffolding doesn't block sync.
 _PRE_B7_SCAFFOLDING_YAML = """
@@ -90,7 +90,7 @@ def test_load_actions_skips_non_action_yaml(tmp_path):
 
 def test_load_actions_propagates_validation_errors(tmp_path):
     """Malformed action YAML (e.g., unknown scope) bubbles ValidationError —
-    loader does not silently swallow validation failures from B7 files."""
+    loader does not silently swallow validation failures."""
     from qiita_control_plane.actions import load_actions
 
     bad = yaml.safe_load(_REFERENCE_ADD_YAML)
