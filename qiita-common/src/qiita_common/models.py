@@ -127,7 +127,7 @@ class DoGetTicketResponse(BaseModel):
 
 
 class UserCreate(BaseModel):
-    """Body for POST /api/v1/users — admin creates a user."""
+    """Body for POST /api/v1/user — admin creates a user."""
 
     display_name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     email: EmailStr
@@ -139,7 +139,7 @@ class UserCreate(BaseModel):
 
 
 class UserUpdate(BaseModel):
-    """Body for PATCH /api/v1/users/me. Excludes email and status — those are
+    """Body for PATCH /api/v1/user/me. Excludes email and status — those are
     immutable through the self-service path. Email-change requires a separate
     flow (re-verify via OIDC); status changes are admin-only."""
 
@@ -172,7 +172,7 @@ class UserResponse(BaseModel):
 
 
 class ApiTokenMintRequest(BaseModel):
-    """Body for POST /api/v1/auth/pat (humans) and POST /api/v1/admin/service-accounts (workers).
+    """Body for POST /api/v1/auth/pat (humans) and POST /api/v1/admin/service-account (workers).
 
     `scopes=None` means "default to the principal's full role ceiling" (humans
     only — service accounts must always specify scopes explicitly).
@@ -198,7 +198,7 @@ class ApiTokenMintResponse(BaseModel):
 
 
 class ApiTokenSummary(BaseModel):
-    """Returned by GET /api/v1/auth/tokens — metadata only, no plaintext or hash."""
+    """Returned by GET /api/v1/auth/token — metadata only, no plaintext or hash."""
 
     token_idx: Annotated[int, Field(gt=0)]
     label: str
@@ -226,7 +226,7 @@ class CliLoginExchangeRequest(BaseModel):
 
 
 class ServiceAccountCreate(BaseModel):
-    """Body for POST /api/v1/admin/service-accounts.
+    """Body for POST /api/v1/admin/service-account.
 
     Scopes are required (no implicit ceiling for service kind) — admins
     must explicitly state what the worker is allowed to do. ttl_days=None
@@ -294,7 +294,7 @@ WhoAmIResponse = Annotated[
 
 
 class PrincipalDisabledUpdate(BaseModel):
-    """Body for PATCH /api/v1/admin/principals/{idx}/disabled.
+    """Body for PATCH /api/v1/admin/principal/{idx}/disabled.
 
     `disabled=true` requires `reason` (audit-trail). `disabled=false` is
     the round-trip back to active and leaves the audit columns NULL via
@@ -306,7 +306,7 @@ class PrincipalDisabledUpdate(BaseModel):
 
 
 class PrincipalRetiredUpdate(BaseModel):
-    """Body for PATCH /api/v1/admin/principals/{idx}/retired.
+    """Body for PATCH /api/v1/admin/principal/{idx}/retired.
 
     Retirement is terminal (CHECK forbids active → retired → active);
     `reason` is required for the audit trail.
@@ -316,7 +316,7 @@ class PrincipalRetiredUpdate(BaseModel):
 
 
 class PrincipalSystemRoleUpdate(BaseModel):
-    """Body for PATCH /api/v1/admin/principals/{idx}/system-role.
+    """Body for PATCH /api/v1/admin/principal/{idx}/system-role.
 
     `use_enum_values=True` so `model_dump()` returns the lowercase string
     (e.g. `"user"`) rather than the `SystemRole` member — preserves the
@@ -341,7 +341,7 @@ class AuthEventResponse(BaseModel):
 
 
 class RevokeAllTokensResponse(BaseModel):
-    """Returned by POST /api/v1/admin/principals/{idx}/revoke-all-tokens."""
+    """Returned by POST /api/v1/admin/principal/{idx}/revoke-all-tokens."""
 
     revoked_token_idxs: list[int]
     already_revoked_count: int
