@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from qiita_common.auth_constants import Scope, SystemRole
 
 pytestmark = pytest.mark.db
 
@@ -129,7 +130,7 @@ async def _seed_user(
     postgres_pool,
     *,
     email: str,
-    role: str = "user",
+    role: str = SystemRole.USER,
     profile_complete: bool = True,
     issuer: str | None = None,
     subject: str | None = None,
@@ -190,7 +191,7 @@ async def test_auth_whoami_human_returns_profile_and_role_and_scopes(
     pidx = await _seed_user(
         postgres_pool,
         email="whoami-human@example.com",
-        role="wet_lab_admin",
+        role=SystemRole.WET_LAB_ADMIN,
         issuer=jwks_harness.issuer,
         subject="whoami-human",
     )
@@ -207,8 +208,8 @@ async def test_auth_whoami_human_returns_profile_and_role_and_scopes(
     assert body["kind"] == "human"
     assert body["principal_idx"] == pidx
     assert body["email"] == "whoami-human@example.com"
-    assert body["system_role"] == "wet_lab_admin"
-    assert "reference:write" in body["scopes"]  # wet_lab_admin ceiling
+    assert body["system_role"] == SystemRole.WET_LAB_ADMIN
+    assert Scope.REFERENCE_WRITE in body["scopes"]  # wet_lab_admin ceiling
     assert body["profile_complete"] is True
 
 
@@ -217,7 +218,8 @@ async def test_auth_whoami_service_returns_service_summary(auth_client, postgres
 
     pidx = await postgres_pool.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-        " VALUES ('whoami-svc', 'user', 1) RETURNING idx"
+        " VALUES ('whoami-svc', $1, 1) RETURNING idx",
+        SystemRole.USER,
     )
     _track(auth_client, pidx)
     await postgres_pool.execute(
@@ -228,7 +230,7 @@ async def test_auth_whoami_service_returns_service_summary(auth_client, postgres
         postgres_pool,
         principal_idx=pidx,
         label="whoami-svc",
-        scopes=["feature:mint"],
+        scopes=[Scope.FEATURE_MINT],
     )
     resp = await auth_client.get(
         "/api/v1/auth/whoami",
@@ -239,7 +241,7 @@ async def test_auth_whoami_service_returns_service_summary(auth_client, postgres
     assert body["kind"] == "service"
     assert body["principal_idx"] == pidx
     assert body["name"] == "whoami-svc-name"
-    assert body["scopes"] == ["feature:mint"]
+    assert body["scopes"] == [Scope.FEATURE_MINT]
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +286,7 @@ async def test_post_pat_requires_oidc_jwt_not_pat(auth_client, postgres_pool, jw
         postgres_pool,
         principal_idx=pidx,
         label="existing",
-        scopes=["self:token"],
+        scopes=[Scope.SELF_TOKEN],
     )
     resp = await auth_client.post(
         "/api/v1/auth/pat",
@@ -424,7 +426,7 @@ async def test_post_pat_rejects_unknown_scope(auth_client, postgres_pool, jwks_h
         headers={"Authorization": f"Bearer {jwt}"},
         json={
             "label": "weird-scope",
-            "scopes": ["self:profile", "this:is:bogus"],
+            "scopes": [Scope.SELF_PROFILE, "this:is:bogus"],
         },
     )
     assert resp.status_code == 422
@@ -436,7 +438,7 @@ async def test_post_pat_default_scopes_match_role_ceiling(auth_client, postgres_
     pidx = await _seed_user(
         postgres_pool,
         email="pat-default-scopes@example.com",
-        role="user",
+        role=SystemRole.USER,
         issuer=jwks_harness.issuer,
         subject="pat-default-scopes",
     )
@@ -455,9 +457,9 @@ async def test_post_pat_default_scopes_match_role_ceiling(auth_client, postgres_
     )
     assert resp.status_code == 201
     assert set(resp.json()["scopes"]) == {
-        "self:profile",
-        "self:token",
-        "reference:read",
+        Scope.SELF_PROFILE,
+        Scope.SELF_TOKEN,
+        Scope.REFERENCE_READ,
     }
 
 
@@ -467,7 +469,7 @@ async def test_post_pat_system_admin_role_ceiling_includes_lower_role_scopes(
     pidx = await _seed_user(
         postgres_pool,
         email="pat-admin@example.com",
-        role="system_admin",
+        role=SystemRole.SYSTEM_ADMIN,
         issuer=jwks_harness.issuer,
         subject="pat-admin",
     )
@@ -481,18 +483,18 @@ async def test_post_pat_system_admin_role_ceiling_includes_lower_role_scopes(
     assert resp.status_code == 201
     body = resp.json()
     # Inheriting: system_admin includes lower-tier scopes.
-    assert "self:profile" in body["scopes"]
-    assert "self:token" in body["scopes"]
-    assert "reference:read" in body["scopes"]
-    assert "reference:write" in body["scopes"]
-    assert "admin:user" in body["scopes"]
+    assert Scope.SELF_PROFILE in body["scopes"]
+    assert Scope.SELF_TOKEN in body["scopes"]
+    assert Scope.REFERENCE_READ in body["scopes"]
+    assert Scope.REFERENCE_WRITE in body["scopes"]
+    assert Scope.ADMIN_USER in body["scopes"]
 
 
 async def test_post_pat_rejects_upscoping(auth_client, postgres_pool, jwks_harness):
     pidx = await _seed_user(
         postgres_pool,
         email="pat-upscope@example.com",
-        role="user",
+        role=SystemRole.USER,
         issuer=jwks_harness.issuer,
         subject="pat-upscope",
     )
@@ -503,12 +505,12 @@ async def test_post_pat_rejects_upscoping(auth_client, postgres_pool, jwks_harne
     resp = await auth_client.post(
         "/api/v1/auth/pat",
         headers={"Authorization": f"Bearer {jwt}"},
-        json={"label": "up", "scopes": ["self:profile", "admin:user"]},
+        json={"label": "up", "scopes": [Scope.SELF_PROFILE, Scope.ADMIN_USER]},
     )
     assert resp.status_code == 422
     body = resp.json()
     assert body["detail"] == "scopes not granted by your role"
-    assert body["rejected_scopes"] == ["admin:user"]
+    assert body["rejected_scopes"] == [Scope.ADMIN_USER]
 
 
 async def test_post_pat_upscoping_error_does_not_leak_role_ceiling(
@@ -519,7 +521,7 @@ async def test_post_pat_upscoping_error_does_not_leak_role_ceiling(
     pidx = await _seed_user(
         postgres_pool,
         email="pat-noleak@example.com",
-        role="user",
+        role=SystemRole.USER,
         issuer=jwks_harness.issuer,
         subject="pat-noleak",
     )
@@ -528,7 +530,7 @@ async def test_post_pat_upscoping_error_does_not_leak_role_ceiling(
     resp = await auth_client.post(
         "/api/v1/auth/pat",
         headers={"Authorization": f"Bearer {jwt}"},
-        json={"label": "noleak", "scopes": ["admin:user"]},
+        json={"label": "noleak", "scopes": [Scope.ADMIN_USER]},
     )
     assert resp.status_code == 422
     body = resp.json()
@@ -587,7 +589,7 @@ async def test_get_own_tokens_lists_metadata_only(auth_client, postgres_pool, jw
         postgres_pool,
         principal_idx=pidx,
         label="for-listing",
-        scopes=["self:token"],
+        scopes=[Scope.SELF_TOKEN],
     )
 
     resp = await auth_client.get(
@@ -627,13 +629,13 @@ async def test_get_own_tokens_cannot_see_others(auth_client, postgres_pool, jwks
         postgres_pool,
         principal_idx=pa,
         label="A",
-        scopes=["self:token"],
+        scopes=[Scope.SELF_TOKEN],
     )
     pb_token, pb_idx = await mint_api_token(
         postgres_pool,
         principal_idx=pb,
         label="B",
-        scopes=["self:token"],
+        scopes=[Scope.SELF_TOKEN],
     )
 
     resp = await auth_client.get(
@@ -665,7 +667,7 @@ async def test_list_tokens_403_without_self_tokens_scope(auth_client, postgres_p
         postgres_pool,
         principal_idx=pidx,
         label="no-tokens-scope",
-        scopes=["self:profile"],  # no self:tokens
+        scopes=[Scope.SELF_PROFILE],  # no self:tokens
     )
     resp = await auth_client.get(
         "/api/v1/auth/token",
@@ -695,7 +697,7 @@ async def test_delete_own_token_revokes_and_writes_audit_event(
         postgres_pool,
         principal_idx=pidx,
         label="auth-token",
-        scopes=["self:token"],
+        scopes=[Scope.SELF_TOKEN],
     )
     _, target_idx = await mint_api_token(
         postgres_pool,
@@ -749,7 +751,7 @@ async def test_delete_others_token_returns_404_not_403(auth_client, postgres_poo
         postgres_pool,
         principal_idx=pa,
         label="attacker",
-        scopes=["self:token"],
+        scopes=[Scope.SELF_TOKEN],
     )
     _, victim_token_idx = await mint_api_token(
         postgres_pool,

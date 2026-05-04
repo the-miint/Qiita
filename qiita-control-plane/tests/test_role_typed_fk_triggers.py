@@ -18,6 +18,7 @@ import secrets
 
 import asyncpg
 import pytest
+from qiita_common.auth_constants import SystemRole
 
 pytestmark = pytest.mark.db
 
@@ -34,8 +35,9 @@ async def _create_user(conn) -> int:
     name = _suffix("user")
     pidx = await conn.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-        " VALUES ($1, 'user', $2) RETURNING idx",
+        " VALUES ($1, $2, $3) RETURNING idx",
         name,
+        SystemRole.USER,
         SYSTEM_PRINCIPAL_IDX,
     )
     await conn.execute(
@@ -50,8 +52,9 @@ async def _create_service_account(conn) -> int:
     name = _suffix("svc")
     pidx = await conn.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-        " VALUES ($1, 'user', $2) RETURNING idx",
+        " VALUES ($1, $2, $3) RETURNING idx",
         name,
+        SystemRole.USER,
         SYSTEM_PRINCIPAL_IDX,
     )
     await conn.execute(
@@ -68,8 +71,9 @@ async def _create_bare_principal(conn) -> int:
     they've logged in)."""
     return await conn.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-        " VALUES ($1, 'user', $2) RETURNING idx",
+        " VALUES ($1, $2, $3) RETURNING idx",
         _suffix("bare"),
+        SystemRole.USER,
         SYSTEM_PRINCIPAL_IDX,
     )
 

@@ -1,6 +1,7 @@
 """Unit tests for the audit-event leak-guard (no DB)."""
 
 import pytest
+from qiita_common.auth_constants import Scope
 
 
 def test_record_event_rejects_forbidden_key_at_top_level():
@@ -53,7 +54,7 @@ def test_record_event_accepts_benign_detail():
         {
             "ip": "10.0.0.1",
             "user_agent": "curl/8.0",
-            "scopes": ["self:profile", "reference:read"],
+            "scopes": [Scope.SELF_PROFILE, Scope.REFERENCE_READ],
             "outcome": "updated",
             "from": "old@example.com",
             "to": "new@example.com",

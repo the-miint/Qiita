@@ -14,6 +14,7 @@ row when absent.
 """
 
 import pytest_asyncio
+from qiita_common.auth_constants import Scope, SystemRole
 
 
 @pytest_asyncio.fixture(scope="session")
@@ -38,8 +39,9 @@ async def human_admin_session(postgres_pool):
                 idx = await conn.fetchval(
                     "INSERT INTO qiita.principal"
                     "  (display_name, system_role, created_by_idx)"
-                    " VALUES ($1, 'system_admin', 1) RETURNING idx",
+                    " VALUES ($1, $2, 1) RETURNING idx",
                     display_name,
+                    SystemRole.SYSTEM_ADMIN,
                 )
                 await conn.execute(
                     "INSERT INTO qiita.user"
@@ -68,13 +70,13 @@ async def human_admin_session(postgres_pool):
         principal_idx=idx,
         label="session-admin",
         scopes=[
-            "self:profile",
-            "self:token",
-            "reference:read",
-            "reference:write",
-            "admin:user",
-            "admin:service_account",
-            "admin:audit_read",
+            Scope.SELF_PROFILE,
+            Scope.SELF_TOKEN,
+            Scope.REFERENCE_READ,
+            Scope.REFERENCE_WRITE,
+            Scope.ADMIN_USER,
+            Scope.ADMIN_SERVICE_ACCOUNT,
+            Scope.ADMIN_AUDIT_READ,
         ],
     )
     return {
@@ -103,8 +105,9 @@ async def regular_user_session(postgres_pool):
                 idx = await conn.fetchval(
                     "INSERT INTO qiita.principal"
                     "  (display_name, system_role, created_by_idx)"
-                    " VALUES ($1, 'user', 1) RETURNING idx",
+                    " VALUES ($1, $2, 1) RETURNING idx",
                     display_name,
+                    SystemRole.USER,
                 )
                 await conn.execute(
                     "INSERT INTO qiita.user"
@@ -117,7 +120,7 @@ async def regular_user_session(postgres_pool):
         postgres_pool,
         principal_idx=idx,
         label="session-user",
-        scopes=["self:profile", "self:token", "reference:read"],
+        scopes=[Scope.SELF_PROFILE, Scope.SELF_TOKEN, Scope.REFERENCE_READ],
     )
     return {
         "principal_idx": idx,
@@ -154,8 +157,9 @@ async def compute_worker_service_account(postgres_pool, tmp_path_factory):
                 pidx = await conn.fetchval(
                     "INSERT INTO qiita.principal"
                     "  (display_name, system_role, created_by_idx)"
-                    " VALUES ($1, 'user', 1) RETURNING idx",
+                    " VALUES ($1, $2, 1) RETURNING idx",
                     SVC_NAME,
+                    SystemRole.USER,
                 )
                 await conn.execute(
                     "INSERT INTO qiita.service_account"
@@ -169,10 +173,10 @@ async def compute_worker_service_account(postgres_pool, tmp_path_factory):
         principal_idx=pidx,
         label="orchestrator-fixture",
         scopes=[
-            "feature:mint",
-            "reference:register_files",
-            "reference:read",
-            "ticket:doget",
+            Scope.FEATURE_MINT,
+            Scope.REFERENCE_REGISTER_FILES,
+            Scope.REFERENCE_READ,
+            Scope.TICKET_DOGET,
         ],
     )
     token_path = tmp_path_factory.mktemp("orchestrator-token") / "token"

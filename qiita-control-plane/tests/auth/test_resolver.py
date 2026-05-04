@@ -13,6 +13,7 @@ import time
 import pytest
 from fastapi import Depends, FastAPI
 from httpx import ASGITransport, AsyncClient
+from qiita_common.auth_constants import Scope, SystemRole
 
 pytestmark = pytest.mark.db
 
@@ -211,7 +212,8 @@ async def test_resolver_dispatches_qk_prefix_to_token_path(resolver_client, post
     # Seed: principal + user
     pidx = await postgres_pool.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-        " VALUES ('token-resolve', 'user', 1) RETURNING idx"
+        " VALUES ('token-resolve', $1, 1) RETURNING idx",
+        SystemRole.USER,
     )
     _track(resolver_client, pidx)
     await postgres_pool.execute(
@@ -224,14 +226,14 @@ async def test_resolver_dispatches_qk_prefix_to_token_path(resolver_client, post
         postgres_pool,
         principal_idx=pidx,
         label="resolver-test",
-        scopes=["self:profile", "reference:read"],
+        scopes=[Scope.SELF_PROFILE, Scope.REFERENCE_READ],
     )
     resp = await resolver_client.get("/resolve", headers={"Authorization": f"Bearer {plaintext}"})
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["kind"] == "human"
     assert body["principal_idx"] == pidx
-    assert sorted(body["scopes"]) == ["reference:read", "self:profile"]
+    assert sorted(body["scopes"]) == [Scope.REFERENCE_READ, Scope.SELF_PROFILE]
 
 
 async def test_resolver_token_path_for_service_account(resolver_client, postgres_pool):
@@ -239,7 +241,8 @@ async def test_resolver_token_path_for_service_account(resolver_client, postgres
 
     pidx = await postgres_pool.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-        " VALUES ('svc-resolve', 'user', 1) RETURNING idx"
+        " VALUES ('svc-resolve', $1, 1) RETURNING idx",
+        SystemRole.USER,
     )
     _track(resolver_client, pidx)
     await postgres_pool.execute(
@@ -251,14 +254,14 @@ async def test_resolver_token_path_for_service_account(resolver_client, postgres
         postgres_pool,
         principal_idx=pidx,
         label="svc-resolver",
-        scopes=["feature:mint"],
+        scopes=[Scope.FEATURE_MINT],
     )
     resp = await resolver_client.get("/resolve", headers={"Authorization": f"Bearer {plaintext}"})
     assert resp.status_code == 200
     body = resp.json()
     assert body["kind"] == "service"
     assert body["principal_idx"] == pidx
-    assert body["scopes"] == ["feature:mint"]
+    assert body["scopes"] == [Scope.FEATURE_MINT]
 
 
 async def test_resolver_rejects_revoked_token(resolver_client, postgres_pool):
@@ -266,7 +269,8 @@ async def test_resolver_rejects_revoked_token(resolver_client, postgres_pool):
 
     pidx = await postgres_pool.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-        " VALUES ('rev-resolve', 'user', 1) RETURNING idx"
+        " VALUES ('rev-resolve', $1, 1) RETURNING idx",
+        SystemRole.USER,
     )
     _track(resolver_client, pidx)
     await postgres_pool.execute(
