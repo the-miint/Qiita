@@ -1,0 +1,65 @@
+action_id: reference-add
+version: 1.0.0
+target_kind: reference
+
+description: >
+  Hash sequences from a FASTA, mint feature_idx values, link them to the
+  reference, write reference data to sorted Parquet, and register the
+  Parquet files in DuckLake.
+
+scopes:
+  - feature:mint
+  - reference:write
+  - reference:register_files
+
+audience:
+  service: false
+  human_roles: [wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  required: [fasta_path]
+  properties:
+    fasta_path: {type: string}
+
+success_status: active
+failure_status: failed
+
+steps:
+  - step: hash
+    step_type: singleton
+    container: qiita/reference-hash:1.0.0
+    target_status: hashing
+    inputs: [fasta_path]
+    outputs: [manifest]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 8
+      walltime: PT1H
+
+  - action: mint-features
+    target_status: minting
+    inputs: [manifest]
+    outputs: [feature_map]
+
+  - action: write-membership
+    inputs: [feature_map]
+
+  - step: load
+    step_type: singleton
+    container: qiita/reference-load:1.0.0
+    target_status: loading
+    inputs: [fasta_path, manifest, feature_map]
+    outputs: [staging_dir]
+    baseline_resources:
+      cpu: 8
+      mem_gb: 32
+      walltime: PT2H
+
+  - action: register-files
+    inputs: [staging_dir]
+
+action_ceiling:
+  cpu: 16
+  mem_gb: 64
+  walltime: PT4H
