@@ -4,11 +4,14 @@ Every route is wired to the principal resolver and guards. POST /reference
 uses created_by_idx (BIGINT FK to qiita.principal) as the canonical owner
 reference. GET /reference/{id} stays anonymous-OK (`get_current_principal`
 directly, no guard); other routes pin to scope and kind constraints.
+
+Mint and register routes are thin shells over the action library
+(qiita_control_plane.actions.library); the library is the canonical
+implementation so workflow-runner invocations and HTTP callers can't
+diverge.
 """
 
-import asyncio
 import base64
-import json
 from typing import Annotated
 from uuid import UUID
 
@@ -32,6 +35,17 @@ from qiita_common.models import (
     RegisterFilesResponse,
 )
 
+from ..actions.library import (
+    _mint_chunk,
+    _write_genome_associations,
+    _write_membership_rows,
+)
+from ..actions.library import (
+    register_files as _register_files,
+)
+from ..actions.library import (
+    write_membership as _write_membership,
+)
 from ..auth.guards import (
     require_complete_profile,
     require_scope,
@@ -43,15 +57,13 @@ from ..auth.principal import (
     ServiceAccount,
     get_current_principal,
 )
-from ..auth.tickets import sign_action, sign_ticket
+from ..auth.tickets import sign_ticket
 from ..deps import get_data_plane_url, get_db_pool, get_hmac_secret
-from .feature import _mint_chunk, _write_genome_associations
 
 router = APIRouter(prefix="/reference", tags=["reference"])
 
-# Chunk size for batch processing. Array params avoid the Postgres $65535 scalar
-# parameter limit, but large arrays increase memory pressure and transaction
-# duration. 10K is a pragmatic default for the expected feature batch sizes.
+# Per-chunk transactions in the deprecated mint route below; matches the
+# library's chunk size so behaviour is identical to the new split routes.
 _CHUNK_SIZE = 10_000
 
 
@@ -174,6 +186,12 @@ async def mint_features(
         POST  /feature/mint               (mint feature_idx values)
         POST  /reference/{idx}/membership (link those features)
 
+    Per-chunk transactions write mint+membership+genome together so a
+    partial failure rolls back to a consistent per-chunk state. That
+    combined transactional shape doesn't fit any single library
+    primitive, so this route reaches into the library's per-chunk
+    helpers directly.
+
     Kept until reference-add migrates to the new flow; removed in a
     follow-up.
     """
@@ -207,13 +225,12 @@ async def mint_features(
     # and subsequent calls will succeed for the remaining entries.
     for i in range(0, len(body.entries), _CHUNK_SIZE):
         chunk = body.entries[i : i + _CHUNK_SIZE]
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                chunk_mapping, minted, reused = await _mint_chunk(conn, chunk)
-                await _write_membership(conn, reference_idx, list(chunk_mapping.values()))
-                genome_entries = [e for e in chunk if e.genome_source is not None]
-                if genome_entries:
-                    await _write_genome_associations(conn, genome_entries, chunk_mapping)
+        async with pool.acquire() as conn, conn.transaction():
+            chunk_mapping, minted, reused = await _mint_chunk(conn, chunk)
+            await _write_membership_rows(conn, reference_idx, list(chunk_mapping.values()))
+            genome_entries = [e for e in chunk if e.genome_source is not None]
+            if genome_entries:
+                await _write_genome_associations(conn, genome_entries, chunk_mapping)
         full_mapping.update(chunk_mapping)
         total_minted += minted
         total_reused += reused
@@ -237,8 +254,8 @@ async def write_reference_membership(
     ON CONFLICT DO NOTHING and counted in `already_linked`.
 
     Unknown feature_idx values are rejected with 422 — the FK violation
-    surfaces as a structured error rather than a 500; callers are expected
-    to mint via /feature/mint immediately before.
+    is caught by the library and re-raised as ValueError, which the
+    handler maps to a structured response.
     """
     status = await pool.fetchval(
         "SELECT status FROM qiita.reference WHERE reference_idx = $1",
@@ -253,45 +270,10 @@ async def write_reference_membership(
         )
 
     try:
-        rows = await pool.fetch(
-            "INSERT INTO qiita.reference_membership (reference_idx, feature_idx)"
-            " SELECT $1, unnest($2::bigint[])"
-            " ON CONFLICT DO NOTHING"
-            " RETURNING feature_idx",
-            reference_idx,
-            body.feature_idxs,
-        )
-    except asyncpg.ForeignKeyViolationError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail="One or more feature_idx values do not exist in qiita.feature",
-        ) from exc
-    linked = len(rows)
-    return ReferenceMembershipResponse(
-        linked=linked,
-        already_linked=len(body.feature_idxs) - linked,
-    )
-
-
-async def _write_membership(
-    conn: asyncpg.Connection, reference_idx: int, feature_idxs: list[int]
-) -> None:
-    """Write reference_membership rows, ignoring duplicates.
-
-    Used by the deprecated POST /reference/{idx}/feature/mint route, which
-    writes membership inline alongside minting; the new
-    POST /reference/{idx}/membership route does its own INSERT...RETURNING
-    so it can report linked vs already_linked counts.
-    """
-    if not feature_idxs:
-        return
-    await conn.execute(
-        "INSERT INTO qiita.reference_membership (reference_idx, feature_idx)"
-        " SELECT $1, unnest($2::bigint[])"
-        " ON CONFLICT DO NOTHING",
-        reference_idx,
-        feature_idxs,
-    )
+        linked, already_linked = await _write_membership(pool, reference_idx, body.feature_idxs)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return ReferenceMembershipResponse(linked=linked, already_linked=already_linked)
 
 
 # Tables that can appear in a DoGet ticket. Must match the data plane's
@@ -380,34 +362,16 @@ async def register_files(
             detail=f"Reference status is {status!r}, must be 'loading'",
         )
 
-    # Sign an action token for the data plane
-    token = sign_action(
-        action="register_files",
-        payload={"staging_dir": body.staging_dir, "files": body.files},
-        secret=hmac_secret,
-    )
-
-    # Call data plane DoAction — offloaded to thread because pyarrow
-    # FlightClient is synchronous and would block the event loop.
     try:
-        results = await asyncio.get_event_loop().run_in_executor(
-            None, _do_action_register, data_plane_url, token
+        registered = await _register_files(
+            staging_dir=body.staging_dir,
+            files=body.files,
+            hmac_secret=hmac_secret,
+            data_plane_url=data_plane_url,
         )
     except _flight.FlightError as exc:
         raise HTTPException(
             status_code=502,
             detail=f"Data plane registration failed: {exc}",
         ) from exc
-
-    if not results:
-        return RegisterFilesResponse(registered=[])
-
-    result_body = json.loads(results[0].body.to_pybytes())
-    return RegisterFilesResponse(registered=result_body.get("registered", []))
-
-
-def _do_action_register(data_plane_url: str, token: bytes) -> list:
-    """Synchronous gRPC call to data plane — runs in thread executor."""
-    with _flight.FlightClient(data_plane_url) as client:
-        action = _flight.Action("register_files", token)
-        return list(client.do_action(action))
+    return RegisterFilesResponse(registered=registered)
