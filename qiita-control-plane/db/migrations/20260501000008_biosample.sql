@@ -7,7 +7,7 @@
 CREATE TABLE qiita.biosample (
     idx                      BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     owner_idx                BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
-    metadata_checklist_idx   BIGINT NOT NULL REFERENCES qiita.metadata_checklist(idx) ON DELETE RESTRICT,
+    metadata_checklist_idx   BIGINT REFERENCES qiita.metadata_checklist(idx) ON DELETE RESTRICT,
     biosample_accession      VARCHAR(50),
     ena_sample_accession     VARCHAR(50),
     -- Submission tracking for NCBI BioSample deposit. last_submission_at is NULL
@@ -150,6 +150,7 @@ CREATE TABLE qiita.biosample_metadata (
     value_date                   DATE,
     value_terminology_term_idx   BIGINT REFERENCES qiita.terminology_term(idx) ON DELETE RESTRICT,
     value_missing_reason_idx     BIGINT REFERENCES qiita.missing_value_reason(idx) ON DELETE RESTRICT,
+    is_owner_biosample_id        BOOLEAN NOT NULL DEFAULT false,
     created_by_idx               BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
     created_at                   TIMESTAMPTZ NOT NULL DEFAULT now(),
 
@@ -181,6 +182,12 @@ COMMENT ON COLUMN qiita.biosample_metadata.global_field_idx IS
     'one value per (biosample, global concept) pair across all studies, so cross-study '
     'reads through the global field always return a single canonical value.';
 
+COMMENT ON COLUMN qiita.biosample_metadata.is_owner_biosample_id IS
+    'True iff this metadata row holds the owner''s identifier for this biosample. '
+    'The biosample_metadata_one_owner_id_per_biosample partial unique index '
+    'enforces at most one true row per biosample_idx; rows with this flag false '
+    'are unrestricted.';
+
 CREATE INDEX biosample_metadata_field_idx
     ON qiita.biosample_metadata (biosample_study_field_idx);
 CREATE INDEX biosample_metadata_terminology_value_idx
@@ -200,6 +207,15 @@ CREATE INDEX biosample_metadata_terminology_value_idx
 CREATE UNIQUE INDEX biosample_metadata_one_value_per_global_concept
     ON qiita.biosample_metadata (biosample_idx, global_field_idx)
     WHERE global_field_idx IS NOT NULL;
+
+-- Each biosample has at most one metadata row flagged as the owner's
+-- identifier-for-this-biosample. The flag is application-maintained;
+-- the partial UNIQUE index makes a second 'true' row for the same
+-- biosample fail at the schema layer rather than relying on caller
+-- discipline. Rows with is_owner_biosample_id = false are unrestricted.
+CREATE UNIQUE INDEX biosample_metadata_one_owner_id_per_biosample
+    ON qiita.biosample_metadata (biosample_idx)
+    WHERE is_owner_biosample_id = true;
 
 
 -- =============================================================================
