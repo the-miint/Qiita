@@ -99,16 +99,16 @@ def tree_file(tmp_path):
 
 
 async def _run_load(backend, manifest_file, fasta_path, feature_map_file, tmp_path, **kwargs):
-    """Helper to run load job with common args."""
+    """Helper to run the load step with common args. Optional taxonomy_path /
+    tree_path / jplace_path kwargs flow into the step's `inputs` dict."""
     output_dir = tmp_path / "output"
-    await backend.run_load_job(
-        manifest_path=manifest_file,
-        fasta_path=fasta_path,
-        feature_map_path=feature_map_file,
-        output_dir=output_dir,
-        reference_idx=REFERENCE_IDX,
-        **kwargs,
-    )
+    inputs = {
+        "manifest": manifest_file,
+        "fasta_path": fasta_path,
+        "feature_map": feature_map_file,
+    }
+    inputs.update(kwargs)
+    await backend.run_step("load", inputs, output_dir, reference_idx=REFERENCE_IDX)
     return output_dir
 
 
@@ -310,13 +310,16 @@ async def test_phylogeny_allows_unmatched_tips(
 
     out = tmp_path / "output"
     backend = LocalBackend()
-    await backend.run_load_job(
-        manifest_path=manifest_path,
-        fasta_path=fasta,
-        feature_map_path=partial_fm,
-        output_dir=out,
+    await backend.run_step(
+        "load",
+        {
+            "manifest": manifest_path,
+            "fasta_path": fasta,
+            "feature_map": partial_fm,
+            "tree_path": tree_path,
+        },
+        out,
         reference_idx=REFERENCE_IDX,
-        tree_path=tree_path,
     )
 
     pq = out / "reference_phylogeny.parquet"
@@ -353,11 +356,14 @@ async def test_rejects_missing_manifest(fasta_path, feature_map_file, tmp_path):
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
     with pytest.raises(FileNotFoundError):
-        await LocalBackend().run_load_job(
-            manifest_path=tmp_path / "nope.json",
-            fasta_path=fasta_path,
-            feature_map_path=feature_map_file,
-            output_dir=tmp_path / "out",
+        await LocalBackend().run_step(
+            "load",
+            {
+                "manifest": tmp_path / "nope.json",
+                "fasta_path": fasta_path,
+                "feature_map": feature_map_file,
+            },
+            tmp_path / "out",
             reference_idx=REFERENCE_IDX,
         )
 
@@ -370,10 +376,13 @@ async def test_rejects_unmapped_hash(manifest_file, fasta_path, tmp_path):
     empty_fm.write_text("")
 
     with pytest.raises(ValueError, match="unmapped"):
-        await LocalBackend().run_load_job(
-            manifest_path=manifest_file,
-            fasta_path=fasta_path,
-            feature_map_path=empty_fm,
-            output_dir=tmp_path / "out",
+        await LocalBackend().run_step(
+            "load",
+            {
+                "manifest": manifest_file,
+                "fasta_path": fasta_path,
+                "feature_map": empty_fm,
+            },
+            tmp_path / "out",
             reference_idx=REFERENCE_IDX,
         )

@@ -23,19 +23,25 @@ def test_local_backend_is_concrete():
     assert issubclass(LocalBackend, ComputeBackend)
 
 
-async def test_slurm_backend_hash_job_raises():
-    """SlurmBackend.run_hash_job must raise NotImplementedError."""
+async def test_slurm_backend_run_step_raises():
+    """SlurmBackend.run_step must raise NotImplementedError until production
+    SLURM dispatch lands. Asserted regardless of step name — the backend
+    is unbuilt across the board, not on a per-step basis."""
     from qiita_compute_orchestrator.backends.slurm import SlurmBackend
 
     backend = SlurmBackend()
     with pytest.raises(NotImplementedError):
-        await backend.run_hash_job(Path("/fake"), Path("/fake"), 1)
-
-
-async def test_slurm_backend_load_job_raises():
-    """SlurmBackend.run_load_job must raise NotImplementedError."""
-    from qiita_compute_orchestrator.backends.slurm import SlurmBackend
-
-    backend = SlurmBackend()
+        await backend.run_step("hash", {}, Path("/fake"), reference_idx=1)
     with pytest.raises(NotImplementedError):
-        await backend.run_load_job(Path("/fake"), Path("/fake"), Path("/fake"), Path("/fake"), 1)
+        await backend.run_step("load", {}, Path("/fake"), reference_idx=1)
+
+
+async def test_local_backend_rejects_unknown_step():
+    """LocalBackend.run_step raises ValueError for a step it doesn't
+    implement — better than a silent no-op when the runner asks for an
+    unknown name."""
+    from qiita_compute_orchestrator.backends.local import LocalBackend
+
+    backend = LocalBackend()
+    with pytest.raises(ValueError, match="does not implement step"):
+        await backend.run_step("nonexistent", {}, Path("/fake"), reference_idx=1)

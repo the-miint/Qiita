@@ -8,19 +8,12 @@ from ..backend import ComputeBackend
 class SlurmBackend(ComputeBackend):
     """Submits compute jobs to SLURM via slurmrestd."""
 
-    async def run_hash_job(self, fasta_path: Path, output_dir: Path, reference_idx: int) -> Path:
-        raise NotImplementedError("SlurmBackend is not yet implemented")
-
-    async def run_load_job(
+    async def run_step(
         self,
-        manifest_path: Path,
-        fasta_path: Path,
-        feature_map_path: Path,
-        output_dir: Path,
-        reference_idx: int,
+        name: str,
+        inputs: dict[str, Path],
+        workspace: Path,
         *,
-        taxonomy_path: Path | None = None,
-        tree_path: Path | None = None,
-        jplace_path: Path | None = None,
-    ) -> Path:
+        reference_idx: int,
+    ) -> dict[str, Path]:
         raise NotImplementedError("SlurmBackend is not yet implemented")

@@ -235,11 +235,10 @@ async def test_gg2_backbone_pipeline(
     )
     hash_dir = _SYSTEM_TEST_BASE / "hash"
     hash_dir.mkdir(parents=True, exist_ok=True)
-    manifest_path = await backend.run_hash_job(
-        fasta_path=FASTA,
-        output_dir=hash_dir,
-        reference_idx=ref_idx,
+    hash_result = await backend.run_step(
+        "hash", {"fasta_path": FASTA}, hash_dir, reference_idx=ref_idx
     )
+    manifest_path = hash_result["manifest"]
     manifest = json.loads(manifest_path.read_text())
     entries = manifest["entries"]
     assert len(entries) == 331269
@@ -285,14 +284,17 @@ async def test_gg2_backbone_pipeline(
     )
     staging = _SYSTEM_TEST_BASE / "staging"
     staging.mkdir(parents=True, exist_ok=True)
-    await backend.run_load_job(
-        manifest_path=manifest_path,
-        fasta_path=FASTA,
-        feature_map_path=fm_path,
-        output_dir=staging,
+    await backend.run_step(
+        "load",
+        {
+            "manifest": manifest_path,
+            "fasta_path": FASTA,
+            "feature_map": fm_path,
+            "taxonomy_path": TAXONOMY,
+            "tree_path": TREE,
+        },
+        staging,
         reference_idx=ref_idx,
-        taxonomy_path=TAXONOMY,
-        tree_path=TREE,
     )
 
     # Verify staging outputs exist

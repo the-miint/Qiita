@@ -15,11 +15,8 @@ async def test_hash_job_produces_manifest(fasta_file, tmp_path):
     output_dir = tmp_path / "output"
 
     backend = LocalBackend()
-    manifest_path = await backend.run_hash_job(
-        fasta_path=fasta_path,
-        output_dir=output_dir,
-        reference_idx=1,
-    )
+    result = await backend.run_step("hash", {"fasta_path": fasta_path}, output_dir, reference_idx=1)
+    manifest_path = result["manifest"]
 
     assert manifest_path.exists()
     manifest = json.loads(manifest_path.read_text())
@@ -34,11 +31,8 @@ async def test_hash_job_md5_matches_python(fasta_file, tmp_path):
     output_dir = tmp_path / "output"
 
     backend = LocalBackend()
-    manifest_path = await backend.run_hash_job(
-        fasta_path=fasta_path,
-        output_dir=output_dir,
-        reference_idx=1,
-    )
+    result = await backend.run_step("hash", {"fasta_path": fasta_path}, output_dir, reference_idx=1)
+    manifest_path = result["manifest"]
 
     manifest = json.loads(manifest_path.read_text())
     for entry in manifest["entries"]:
@@ -59,11 +53,8 @@ async def test_hash_job_manifest_has_required_fields(fasta_file, tmp_path):
     output_dir = tmp_path / "output"
 
     backend = LocalBackend()
-    manifest_path = await backend.run_hash_job(
-        fasta_path=fasta_path,
-        output_dir=output_dir,
-        reference_idx=1,
-    )
+    result = await backend.run_step("hash", {"fasta_path": fasta_path}, output_dir, reference_idx=1)
+    manifest_path = result["manifest"]
 
     manifest = json.loads(manifest_path.read_text())
     for entry in manifest["entries"]:
@@ -82,11 +73,10 @@ async def test_hash_job_manifest_includes_reference_idx(fasta_file, tmp_path):
     output_dir = tmp_path / "output"
 
     backend = LocalBackend()
-    manifest_path = await backend.run_hash_job(
-        fasta_path=fasta_path,
-        output_dir=output_dir,
-        reference_idx=42,
+    result = await backend.run_step(
+        "hash", {"fasta_path": fasta_path}, output_dir, reference_idx=42
     )
+    manifest_path = result["manifest"]
 
     manifest = json.loads(manifest_path.read_text())
     assert manifest["reference_idx"] == 42
@@ -98,9 +88,10 @@ async def test_hash_job_rejects_missing_fasta(tmp_path):
 
     backend = LocalBackend()
     with pytest.raises(FileNotFoundError):
-        await backend.run_hash_job(
-            fasta_path=tmp_path / "nonexistent.fasta",
-            output_dir=tmp_path / "output",
+        await backend.run_step(
+            "hash",
+            {"fasta_path": tmp_path / "nonexistent.fasta"},
+            tmp_path / "output",
             reference_idx=1,
         )
 
@@ -114,10 +105,8 @@ async def test_hash_job_rejects_duplicate_read_ids(tmp_path):
 
     backend = LocalBackend()
     with pytest.raises(ValueError, match="duplicate read_id"):
-        await backend.run_hash_job(
-            fasta_path=fasta_path,
-            output_dir=tmp_path / "output",
-            reference_idx=1,
+        await backend.run_step(
+            "hash", {"fasta_path": fasta_path}, tmp_path / "output", reference_idx=1
         )
 
 
@@ -129,11 +118,10 @@ async def test_hash_job_empty_fasta(tmp_path):
     fasta_path.write_text("")
 
     backend = LocalBackend()
-    manifest_path = await backend.run_hash_job(
-        fasta_path=fasta_path,
-        output_dir=tmp_path / "output",
-        reference_idx=1,
+    result = await backend.run_step(
+        "hash", {"fasta_path": fasta_path}, tmp_path / "output", reference_idx=1
     )
+    manifest_path = result["manifest"]
 
     manifest = json.loads(manifest_path.read_text())
     assert manifest["entries"] == []

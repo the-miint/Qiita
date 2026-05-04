@@ -69,11 +69,10 @@ async def test_hash_then_mint_pipeline(
     # Run hash job
     backend = LocalBackend()
     output_dir = tmp_path / "hash_output"
-    manifest_path = await backend.run_hash_job(
-        fasta_path=fasta_path,
-        output_dir=output_dir,
-        reference_idx=ref_idx,
+    result = await backend.run_step(
+        "hash", {"fasta_path": fasta_path}, output_dir, reference_idx=ref_idx
     )
+    manifest_path = result["manifest"]
     manifest = json.loads(manifest_path.read_text())
     assert len(manifest["entries"]) == 5
 

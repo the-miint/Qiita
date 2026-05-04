@@ -50,9 +50,41 @@ def _md5_hex_to_uuid(hex_str: str) -> str:
 
 
 class LocalBackend(ComputeBackend):
-    """Runs compute jobs in-process using DuckDB+miint. For dev/test only."""
+    """Runs compute jobs in-process using DuckDB+miint. For dev/test only.
 
-    async def run_hash_job(self, fasta_path: Path, output_dir: Path, reference_idx: int) -> Path:
+    `run_step` dispatches on the step name to an internal Python
+    implementation. The SLURM backend is the production analogue; it
+    submits the step's container instead and the container does the
+    work. The set of step names this backend handles is the union of
+    container behaviours every workflow needs in dev/test mode.
+    """
+
+    async def run_step(
+        self,
+        name: str,
+        inputs: dict[str, Path],
+        workspace: Path,
+        *,
+        reference_idx: int,
+    ) -> dict[str, Path]:
+        if name == "hash":
+            manifest = await self._run_hash(inputs["fasta_path"], workspace, reference_idx)
+            return {"manifest": manifest}
+        if name == "load":
+            staging_dir = await self._run_load(
+                manifest_path=inputs["manifest"],
+                fasta_path=inputs["fasta_path"],
+                feature_map_path=inputs["feature_map"],
+                output_dir=workspace,
+                reference_idx=reference_idx,
+                taxonomy_path=inputs.get("taxonomy_path"),
+                tree_path=inputs.get("tree_path"),
+                jplace_path=inputs.get("jplace_path"),
+            )
+            return {"staging_dir": staging_dir}
+        raise ValueError(f"LocalBackend does not implement step {name!r}")
+
+    async def _run_hash(self, fasta_path: Path, output_dir: Path, reference_idx: int) -> Path:
         if not fasta_path.exists():
             raise FileNotFoundError(f"FASTA file not found: {fasta_path}")
 
@@ -110,14 +142,14 @@ class LocalBackend(ComputeBackend):
         manifest_path.write_text(json.dumps(manifest, indent=2))
         return manifest_path
 
-    async def run_load_job(
+    async def _run_load(
         self,
+        *,
         manifest_path: Path,
         fasta_path: Path,
         feature_map_path: Path,
         output_dir: Path,
         reference_idx: int,
-        *,
         taxonomy_path: Path | None = None,
         tree_path: Path | None = None,
         jplace_path: Path | None = None,
@@ -187,7 +219,7 @@ def _build_id_map(
 
     Raises ValueError if any manifest entry has no matching feature_idx.
     """
-    # entry_count is written by run_hash_job — avoids a separate count query.
+    # entry_count is written by the hash step — avoids a separate count query.
     manifest_count = conn.execute(
         "SELECT entry_count FROM read_json(?, maximum_object_size=536870912)",
         [str(manifest_path)],

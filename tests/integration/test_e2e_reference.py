@@ -140,9 +140,10 @@ async def test_e2e_create_to_doget(
         f"/api/v1/reference/{ref_idx}/status", json={"status": "hashing"}
     )
     hash_dir = tmp_path / "hash"
-    manifest_path = await backend.run_hash_job(
-        fasta_path=fasta_e2e, output_dir=hash_dir, reference_idx=ref_idx
+    hash_result = await backend.run_step(
+        "hash", {"fasta_path": fasta_e2e}, hash_dir, reference_idx=ref_idx
     )
+    manifest_path = hash_result["manifest"]
     manifest = json.loads(manifest_path.read_text())
 
     # --- Mint ---
@@ -163,14 +164,17 @@ async def test_e2e_create_to_doget(
         f"/api/v1/reference/{ref_idx}/status", json={"status": "loading"}
     )
     staging_dir = tmp_path / "staging"
-    await backend.run_load_job(
-        manifest_path=manifest_path,
-        fasta_path=fasta_e2e,
-        feature_map_path=fm_path,
-        output_dir=staging_dir,
+    await backend.run_step(
+        "load",
+        {
+            "manifest": manifest_path,
+            "fasta_path": fasta_e2e,
+            "feature_map": fm_path,
+            "taxonomy_path": taxonomy_e2e,
+            "tree_path": tree_e2e,
+        },
+        staging_dir,
         reference_idx=ref_idx,
-        taxonomy_path=taxonomy_e2e,
-        tree_path=tree_e2e,
     )
 
     # --- Register via control plane → data plane DoAction ---
@@ -255,11 +259,10 @@ async def test_e2e_doget_taxonomy(
     await client.patch(
         f"/api/v1/reference/{ref_idx}/status", json={"status": "hashing"}
     )
-    manifest_path = await backend.run_hash_job(
-        fasta_path=fasta_e2e,
-        output_dir=tmp_path / "h",
-        reference_idx=ref_idx,
+    hash_result = await backend.run_step(
+        "hash", {"fasta_path": fasta_e2e}, tmp_path / "h", reference_idx=ref_idx
     )
+    manifest_path = hash_result["manifest"]
     manifest = json.loads(manifest_path.read_text())
     entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
     mint_resp = await client.post(
@@ -276,13 +279,16 @@ async def test_e2e_doget_taxonomy(
         f"/api/v1/reference/{ref_idx}/status", json={"status": "loading"}
     )
     staging = tmp_path / "s"
-    await backend.run_load_job(
-        manifest_path=manifest_path,
-        fasta_path=fasta_e2e,
-        feature_map_path=fm_path,
-        output_dir=staging,
+    await backend.run_step(
+        "load",
+        {
+            "manifest": manifest_path,
+            "fasta_path": fasta_e2e,
+            "feature_map": fm_path,
+            "taxonomy_path": taxonomy_e2e,
+        },
+        staging,
         reference_idx=ref_idx,
-        taxonomy_path=taxonomy_e2e,
     )
     reg_resp = await client.post(
         f"/api/v1/reference/{ref_idx}/register",

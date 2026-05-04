@@ -8,7 +8,7 @@ from qiita_common.models import ReferenceStatus
 
 from .backend import ComputeBackend
 
-# Maps Parquet filenames produced by run_load_job to DuckLake table names.
+# Maps Parquet filenames produced by the load step to DuckLake table names.
 _REFERENCE_TABLE_MAP = {
     "reference_sequences.parquet": "reference_sequences",
     "reference_sequence_chunks.parquet": "reference_sequence_chunks",
@@ -55,17 +55,19 @@ async def run_reference_load_pipeline(
     # 1. Transition to LOADING
     await client.update_reference_status(reference_idx, ReferenceStatus.LOADING)
 
-    # 2. Run load job
-    await backend.run_load_job(
-        manifest_path=manifest_path,
-        fasta_path=fasta_path,
-        feature_map_path=feature_map_path,
-        output_dir=staging_dir,
-        reference_idx=reference_idx,
-        taxonomy_path=taxonomy_path,
-        tree_path=tree_path,
-        jplace_path=jplace_path,
-    )
+    # 2. Run load step
+    inputs: dict[str, Path] = {
+        "manifest": manifest_path,
+        "fasta_path": fasta_path,
+        "feature_map": feature_map_path,
+    }
+    if taxonomy_path is not None:
+        inputs["taxonomy_path"] = taxonomy_path
+    if tree_path is not None:
+        inputs["tree_path"] = tree_path
+    if jplace_path is not None:
+        inputs["jplace_path"] = jplace_path
+    await backend.run_step("load", inputs, staging_dir, reference_idx=reference_idx)
 
     # 3. Register files via control plane → data plane DoAction.
     await client.register_files(

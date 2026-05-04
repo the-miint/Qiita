@@ -1,4 +1,18 @@
-"""Compute backend abstraction."""
+"""Compute backend abstraction.
+
+A backend executes one workflow step at a time. The runner translates
+each ``step:`` entry in an ActionDefinition into a ``run_step`` call;
+``action:`` entries do not go through the backend (they're HTTP calls
+to the control-plane library dispatch endpoint).
+
+`name` selects the step implementation (e.g. "hash", "load"). For the
+local backend this drives an internal Python implementation; for the
+SLURM backend it would inform the container's entrypoint or arguments.
+`inputs` is a name → path map matching the names declared by the YAML
+step's `inputs:` list. `workspace` is a per-step scratch directory the
+backend may write outputs into. The return value is a name → path map
+matching the step's `outputs:` list.
+"""
 
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -8,42 +22,18 @@ class ComputeBackend(ABC):
     """Abstract base for compute backends (local, SLURM, etc.)."""
 
     @abstractmethod
-    async def run_hash_job(self, fasta_path: Path, output_dir: Path, reference_idx: int) -> Path:
-        """Read sequences, compute MD5 hashes, write manifest.
-
-        Returns the path to the manifest JSON file.
-        """
-
-    @abstractmethod
-    async def run_load_job(
+    async def run_step(
         self,
-        manifest_path: Path,
-        fasta_path: Path,
-        feature_map_path: Path,
-        output_dir: Path,
-        reference_idx: int,
+        name: str,
+        inputs: dict[str, Path],
+        workspace: Path,
         *,
-        taxonomy_path: Path | None = None,
-        tree_path: Path | None = None,
-        jplace_path: Path | None = None,
-    ) -> Path:
-        """Write reference data to sorted Parquet files.
+        reference_idx: int,
+    ) -> dict[str, Path]:
+        """Execute the step identified by `name`. Returns a name → path
+        map of outputs the runner can plumb into subsequent steps.
 
-        manifest_path: JSON manifest from run_hash_job.
-        feature_map_path: NDJSON file with {sequence_hash, feature_idx} rows,
-            produced by the pipeline coordinator from the mint response.
-
-        Both files are read directly by DuckDB — no Python-side parsing.
-
-        Always produces:
-          - reference_sequences.parquet (metadata: hash + length)
-          - reference_sequence_chunks.parquet (chunked sequence data)
-          - reference_membership.parquet
-
-        Optional (when paths provided):
-          - reference_taxonomy.parquet (from Parquet input with feature_id + taxonomy)
-          - reference_phylogeny.parquet (from Newick, with feature_idx on tips)
-          - reference_placements.parquet (from jplace)
-
-        Returns the path to the output directory.
+        Raises:
+            ValueError: if `name` is not implemented by this backend.
+            FileNotFoundError: if a required input path is missing.
         """

@@ -121,11 +121,10 @@ async def test_full_load_pipeline(
         json={"status": "hashing"},
     )
     hash_dir = tmp_path / "hash_output"
-    manifest_path = await backend.run_hash_job(
-        fasta_path=fasta_3seq,
-        output_dir=hash_dir,
-        reference_idx=ref_idx,
+    hash_result = await backend.run_step(
+        "hash", {"fasta_path": fasta_3seq}, hash_dir, reference_idx=ref_idx
     )
+    manifest_path = hash_result["manifest"]
     manifest = json.loads(manifest_path.read_text())
     assert len(manifest["entries"]) == 3
 
@@ -151,14 +150,17 @@ async def test_full_load_pipeline(
     assert load_resp.status_code == 200
 
     load_dir = tmp_path / "load_output"
-    await backend.run_load_job(
-        manifest_path=manifest_path,
-        fasta_path=fasta_3seq,
-        feature_map_path=fm_path,
-        output_dir=load_dir,
+    await backend.run_step(
+        "load",
+        {
+            "manifest": manifest_path,
+            "fasta_path": fasta_3seq,
+            "feature_map": fm_path,
+            "taxonomy_path": taxonomy_3seq,
+            "tree_path": tree_3seq,
+        },
+        load_dir,
         reference_idx=ref_idx,
-        taxonomy_path=taxonomy_3seq,
-        tree_path=tree_3seq,
     )
 
     # Verify Parquet files exist
