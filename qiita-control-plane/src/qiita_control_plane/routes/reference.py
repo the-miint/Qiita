@@ -19,6 +19,16 @@ import asyncpg
 import pyarrow.flight as _flight
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import Field
+from qiita_common.api_paths import (
+    PATH_REFERENCE_BY_IDX,
+    PATH_REFERENCE_DEPRECATED_FEATURE_MINT,
+    PATH_REFERENCE_DOGET,
+    PATH_REFERENCE_MEMBERSHIP,
+    PATH_REFERENCE_PREFIX,
+    PATH_REFERENCE_REGISTER,
+    PATH_REFERENCE_ROOT,
+    PATH_REFERENCE_STATUS,
+)
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     VALID_STATUS_TRANSITIONS,
@@ -60,7 +70,7 @@ from ..auth.principal import (
 from ..auth.tickets import sign_ticket
 from ..deps import get_data_plane_url, get_db_pool, get_hmac_secret
 
-router = APIRouter(prefix="/reference", tags=["reference"])
+router = APIRouter(prefix=PATH_REFERENCE_PREFIX, tags=["reference"])
 
 # Per-chunk transactions in the deprecated mint route below; matches the
 # library's chunk size so behaviour is identical to the new split routes.
@@ -72,7 +82,7 @@ _REFERENCE_RETURNING = "reference_idx, name, version, kind, status, created_by_i
 _MSG_REFERENCE_NOT_FOUND = "Reference not found"
 
 
-@router.post("", status_code=201)
+@router.post(PATH_REFERENCE_ROOT, status_code=201)
 async def create_reference(
     body: ReferenceCreateRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
@@ -102,7 +112,7 @@ async def create_reference(
     return ReferenceResponse(**dict(row))
 
 
-@router.get("/{reference_idx}")
+@router.get(PATH_REFERENCE_BY_IDX)
 async def get_reference(
     reference_idx: Annotated[int, Field(gt=0)],
     pool: asyncpg.Pool = Depends(get_db_pool),
@@ -120,7 +130,7 @@ async def get_reference(
     return ReferenceResponse(**dict(row))
 
 
-@router.patch("/{reference_idx}/status")
+@router.patch(PATH_REFERENCE_STATUS)
 async def update_reference_status(
     reference_idx: Annotated[int, Field(gt=0)],
     body: ReferenceStatusUpdate,
@@ -165,7 +175,7 @@ async def update_reference_status(
 
 
 @router.post(
-    "/{reference_idx}/feature/mint",
+    PATH_REFERENCE_DEPRECATED_FEATURE_MINT,
     deprecated=True,
     summary="Deprecated — use POST /feature/mint + POST /reference/{idx}/membership",
 )
@@ -238,7 +248,7 @@ async def mint_features(
     return FeatureMintResponse(mapping=full_mapping, minted=total_minted, reused=total_reused)
 
 
-@router.post("/{reference_idx}/membership", status_code=201)
+@router.post(PATH_REFERENCE_MEMBERSHIP, status_code=201)
 async def write_reference_membership(
     reference_idx: Annotated[int, Field(gt=0)],
     body: ReferenceMembershipRequest,
@@ -289,7 +299,7 @@ _DOGET_ALLOWED_TABLES = frozenset(
 )
 
 
-@router.post("/{reference_idx}/ticket/doget", status_code=201)
+@router.post(PATH_REFERENCE_DOGET, status_code=201)
 async def create_doget_ticket(
     reference_idx: Annotated[int, Field(gt=0)],
     body: DoGetTicketRequest,
@@ -335,7 +345,7 @@ async def create_doget_ticket(
     return DoGetTicketResponse(ticket=base64.b64encode(ticket_bytes).decode())
 
 
-@router.post("/{reference_idx}/register", status_code=201)
+@router.post(PATH_REFERENCE_REGISTER, status_code=201)
 async def register_files(
     reference_idx: Annotated[int, Field(gt=0)],
     body: RegisterFilesRequest,

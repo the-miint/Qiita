@@ -18,6 +18,7 @@ diverge.
 
 import asyncpg
 from fastapi import APIRouter, Depends
+from qiita_common.api_paths import PATH_FEATURE_MINT, PATH_FEATURE_PREFIX
 from qiita_common.auth_constants import Scope
 from qiita_common.models import FeatureMintRequest, FeatureMintResponse
 
@@ -26,10 +27,10 @@ from ..auth.guards import require_scope, require_service
 from ..auth.principal import Principal, ServiceAccount
 from ..deps import get_db_pool
 
-router = APIRouter(prefix="/feature", tags=["feature"])
+router = APIRouter(prefix=PATH_FEATURE_PREFIX, tags=["feature"])
 
 
-@router.post("/mint")
+@router.post(PATH_FEATURE_MINT)
 async def mint_features(
     body: FeatureMintRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),

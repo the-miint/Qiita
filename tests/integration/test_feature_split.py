@@ -13,6 +13,11 @@ import uuid
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from qiita_common.api_paths import (
+    URL_FEATURE_MINT,
+    URL_REFERENCE_MEMBERSHIP,
+    URL_REFERENCE_PREFIX,
+)
 
 _TEST_SALT = uuid.uuid4().hex
 
@@ -50,7 +55,7 @@ async def admin_headers(human_admin_session):
 async def minting_reference(client, postgres_pool):
     """Create a reference and walk it to status='minting' via PATCH."""
     resp = await client.post(
-        "/api/v1/reference",
+        URL_REFERENCE_PREFIX,
         json={
             "name": f"split-test-{uuid.uuid4()}",
             "version": "1.0",
@@ -79,7 +84,7 @@ async def test_feature_mint_returns_mapping_no_reference_context(client, worker_
     and writes nothing to qiita.reference_membership."""
     hashes = [_md5_uuid(f"SPLIT{i}") for i in range(4)]
     resp = await client.post(
-        "/api/v1/feature/mint",
+        URL_FEATURE_MINT,
         json={"entries": [{"sequence_hash": h} for h in hashes]},
         headers=worker_headers,
     )
@@ -97,8 +102,8 @@ async def test_feature_mint_dedupes_across_calls(client, worker_headers):
     hashes = [_md5_uuid(f"DEDUP-SPLIT{i}") for i in range(3)]
     body = {"entries": [{"sequence_hash": h} for h in hashes]}
 
-    first = (await client.post("/api/v1/feature/mint", json=body, headers=worker_headers)).json()
-    second = (await client.post("/api/v1/feature/mint", json=body, headers=worker_headers)).json()
+    first = (await client.post(URL_FEATURE_MINT, json=body, headers=worker_headers)).json()
+    second = (await client.post(URL_FEATURE_MINT, json=body, headers=worker_headers)).json()
 
     assert second["minted"] == 0
     assert second["reused"] == 3
@@ -110,7 +115,7 @@ async def test_feature_mint_writes_genome_associations(client, postgres_pool, wo
     rows. Reference-agnostic — feature_genome is not reference-scoped."""
     h = _md5_uuid("GENOME-SPLIT-1")
     resp = await client.post(
-        "/api/v1/feature/mint",
+        URL_FEATURE_MINT,
         json={
             "entries": [
                 {
@@ -139,7 +144,7 @@ async def test_feature_mint_writes_genome_associations(client, postgres_pool, wo
 async def test_feature_mint_rejects_human_caller(client, admin_headers):
     """Service-only — a human PAT is rejected with 403."""
     resp = await client.post(
-        "/api/v1/feature/mint",
+        URL_FEATURE_MINT,
         json={"entries": [{"sequence_hash": _md5_uuid("HUMAN")}]},
         headers=admin_headers,
     )
@@ -152,14 +157,14 @@ async def test_membership_links_minted_features(
     """End-to-end orchestrator-shaped flow: mint then link."""
     hashes = [_md5_uuid(f"E2E{i}") for i in range(3)]
     mint = await client.post(
-        "/api/v1/feature/mint",
+        URL_FEATURE_MINT,
         json={"entries": [{"sequence_hash": h} for h in hashes]},
         headers=worker_headers,
     )
     feature_idxs = list(mint.json()["mapping"].values())
 
     link = await client.post(
-        f"/api/v1/reference/{minting_reference}/membership",
+        URL_REFERENCE_MEMBERSHIP.format(reference_idx=minting_reference),
         json={"feature_idxs": feature_idxs},
         headers=worker_headers,
     )
@@ -180,19 +185,19 @@ async def test_membership_is_idempotent(client, minting_reference, worker_header
     nothing new — pre-existing rows are skipped via ON CONFLICT DO NOTHING."""
     hashes = [_md5_uuid(f"IDEM{i}") for i in range(3)]
     mint = await client.post(
-        "/api/v1/feature/mint",
+        URL_FEATURE_MINT,
         json={"entries": [{"sequence_hash": h} for h in hashes]},
         headers=worker_headers,
     )
     feature_idxs = list(mint.json()["mapping"].values())
 
     first = await client.post(
-        f"/api/v1/reference/{minting_reference}/membership",
+        URL_REFERENCE_MEMBERSHIP.format(reference_idx=minting_reference),
         json={"feature_idxs": feature_idxs},
         headers=worker_headers,
     )
     second = await client.post(
-        f"/api/v1/reference/{minting_reference}/membership",
+        URL_REFERENCE_MEMBERSHIP.format(reference_idx=minting_reference),
         json={"feature_idxs": feature_idxs},
         headers=worker_headers,
     )
@@ -203,7 +208,7 @@ async def test_membership_is_idempotent(client, minting_reference, worker_header
 async def test_membership_rejects_wrong_status(client, postgres_pool, worker_headers):
     """A reference not in 'minting' status must reject /membership with 409."""
     resp = await client.post(
-        "/api/v1/reference",
+        URL_REFERENCE_PREFIX,
         json={
             "name": f"split-bad-status-{uuid.uuid4()}",
             "version": "1.0",
@@ -214,7 +219,7 @@ async def test_membership_rejects_wrong_status(client, postgres_pool, worker_hea
     try:
         # status='pending' (default for fresh reference)
         link = await client.post(
-            f"/api/v1/reference/{idx}/membership",
+            URL_REFERENCE_MEMBERSHIP.format(reference_idx=idx),
             json={"feature_idxs": [1]},
             headers=worker_headers,
         )
@@ -227,7 +232,7 @@ async def test_membership_rejects_wrong_status(client, postgres_pool, worker_hea
 async def test_membership_404_on_unknown_reference(client, worker_headers):
     """A reference_idx with no matching row returns 404."""
     resp = await client.post(
-        "/api/v1/reference/999999999/membership",
+        URL_REFERENCE_MEMBERSHIP.format(reference_idx=999999999),
         json={"feature_idxs": [1]},
         headers=worker_headers,
     )
@@ -237,7 +242,7 @@ async def test_membership_404_on_unknown_reference(client, worker_headers):
 async def test_membership_rejects_human_caller(client, minting_reference, admin_headers):
     """Service-only — a human PAT is rejected with 403."""
     resp = await client.post(
-        f"/api/v1/reference/{minting_reference}/membership",
+        URL_REFERENCE_MEMBERSHIP.format(reference_idx=minting_reference),
         json={"feature_idxs": [1]},
         headers=admin_headers,
     )
@@ -250,7 +255,7 @@ async def test_membership_rejects_unknown_feature_idx(
     """A feature_idx that doesn't exist in qiita.feature returns 422 —
     callers are expected to mint via /feature/mint first."""
     resp = await client.post(
-        f"/api/v1/reference/{minting_reference}/membership",
+        URL_REFERENCE_MEMBERSHIP.format(reference_idx=minting_reference),
         json={"feature_idxs": [9999999999]},
         headers=worker_headers,
     )
