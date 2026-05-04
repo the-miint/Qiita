@@ -32,6 +32,7 @@ from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     LibraryInvocation,
     LibraryResponse,
+    ReferenceStatus,
     ScopeTargetKind,
 )
 
@@ -147,10 +148,10 @@ async def _dispatch_write_membership(
     )
     if status is None:
         raise HTTPException(status_code=404, detail="Reference not found")
-    if status != "minting":
+    if status != ReferenceStatus.MINTING.value:
         raise HTTPException(
             status_code=409,
-            detail=f"Reference status is {status!r}, must be 'minting'",
+            detail=f"Reference status is {status!r}, must be {ReferenceStatus.MINTING.value!r}",
         )
 
     try:
@@ -194,10 +195,10 @@ async def _dispatch_register_files(
     )
     if status is None:
         raise HTTPException(status_code=404, detail="Reference not found")
-    if status != "loading":
+    if status != ReferenceStatus.LOADING.value:
         raise HTTPException(
             status_code=409,
-            detail=f"Reference status is {status!r}, must be 'loading'",
+            detail=f"Reference status is {status!r}, must be {ReferenceStatus.LOADING.value!r}",
         )
 
     try:

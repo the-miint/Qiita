@@ -30,6 +30,7 @@ import duckdb
 import pyarrow.flight as _flight
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.models import FeatureHashEntry
+from qiita_common.parquet import validate_parquet_path
 
 from ..auth.tickets import sign_action
 
@@ -182,9 +183,7 @@ async def mint_features(
     partial-batch failure converges.
 
     Reference-agnostic — the mint operation does not touch any reference
-    table. Genome associations are not written here; a future
-    `genome_map_path` parameter will support reference-add workflows that
-    carry genome metadata.
+    table.
     """
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
@@ -222,7 +221,7 @@ async def mint_features(
     with duckdb.connect(":memory:") as duck:
         duck.execute("CREATE TEMP TABLE feature_map (sequence_hash UUID, feature_idx BIGINT)")
         duck.executemany("INSERT INTO feature_map VALUES (?, ?)", pairs)
-        out = _validate_parquet_path(feature_map_path)
+        out = validate_parquet_path(feature_map_path)
         duck.execute(
             "COPY (SELECT sequence_hash, feature_idx FROM feature_map "
             "      ORDER BY feature_idx) "
@@ -270,16 +269,6 @@ async def write_membership(
                 total_linked += chunk_linked
                 total_seen += len(feature_idxs)
     return total_linked, total_seen - total_linked
-
-
-def _validate_parquet_path(path: Path) -> str:
-    """Reject paths with characters that can't be safely string-interpolated
-    into a DuckDB COPY statement. The COPY target is a SQL string literal
-    so we can't bind it as a parameter; sanitise instead."""
-    text = str(path)
-    if "'" in text or "\\" in text or any(ord(c) < 0x20 for c in text):
-        raise ValueError(f"Output path contains unsafe characters: {text}")
-    return text
 
 
 async def register_files(

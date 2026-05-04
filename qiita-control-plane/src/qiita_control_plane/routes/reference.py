@@ -33,6 +33,7 @@ from qiita_common.models import (
     DoGetTicketResponse,
     ReferenceCreateRequest,
     ReferenceResponse,
+    ReferenceStatus,
     ReferenceStatusUpdate,
 )
 
@@ -193,10 +194,10 @@ async def create_doget_ticket(
     )
     if status is None:
         raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
-    if status != "active":
+    if status != ReferenceStatus.ACTIVE.value:
         raise HTTPException(
             status_code=409,
-            detail=f"Reference status is {status!r}, must be 'active'",
+            detail=f"Reference status is {status!r}, must be {ReferenceStatus.ACTIVE.value!r}",
         )
 
     ticket_bytes = sign_ticket(

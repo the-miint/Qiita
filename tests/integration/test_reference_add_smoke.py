@@ -20,7 +20,6 @@ ran: reference reaches `active`, feature/membership rows exist,
 work_ticket reaches COMPLETED, status PATCHes hit in declared order.
 """
 
-import secrets
 import uuid
 from pathlib import Path
 
@@ -234,9 +233,3 @@ async def test_reference_add_workflow_end_to_end(
     # from LocalBackend._run_load — actually the load step writes into
     # the workspace itself. The runner records the path under the
     # output name 'staging_dir'.
-
-
-# Avoid unused-import lint without losing the side-effect of having
-# secrets.token_bytes available — keeps the imports stable for follow-up
-# tests that may need it.
-_ = secrets

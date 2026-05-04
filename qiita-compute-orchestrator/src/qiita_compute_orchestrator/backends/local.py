@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 import duckdb
+from qiita_common.parquet import validate_parquet_path
 
 from ..backend import ComputeBackend
 
@@ -84,7 +85,7 @@ class LocalBackend(ComputeBackend):
         output_dir.mkdir(parents=True, exist_ok=True)
         await _ensure_miint_installed()
         manifest_path = output_dir / "manifest.parquet"
-        out = _validate_parquet_path(manifest_path)
+        out = validate_parquet_path(manifest_path)
 
         with _open_conn() as conn:
             conn.execute("LOAD miint;")
@@ -190,14 +191,6 @@ _PARQUET_OPTS_CHUNKED = f"{_PARQUET_OPTS}, ROW_GROUP_SIZE {_CHUNK_ROW_GROUP_SIZE
 _CHUNK_SIZE = 65536  # 64 KB
 
 
-def _validate_parquet_path(path: Path) -> str:
-    """Validate a path is safe for SQL string interpolation in COPY TO."""
-    path_str = str(path)
-    if "'" in path_str or "\\" in path_str or any(ord(c) < 0x20 for c in path_str):
-        raise ValueError(f"Output path contains unsafe characters: {path_str}")
-    return path_str
-
-
 def _build_id_map(
     conn: duckdb.DuckDBPyConnection, manifest_path: Path, feature_map_path: Path
 ) -> None:
@@ -241,7 +234,7 @@ def _build_id_map(
 
 def _write_sequence_metadata(conn: duckdb.DuckDBPyConnection, output_dir: Path) -> None:
     """Write reference_sequences.parquet — metadata from id_map (no FASTA read)."""
-    out = _validate_parquet_path(output_dir / "reference_sequences.parquet")
+    out = validate_parquet_path(output_dir / "reference_sequences.parquet")
     conn.execute(
         "COPY ("
         "  SELECT feature_idx,"
@@ -267,7 +260,7 @@ def _write_sequence_chunks(
     Without this, a single batch spanning many large sequences exhausts memory
     before the first row group is written.
     """
-    out = _validate_parquet_path(output_dir / "reference_sequence_chunks.parquet")
+    out = validate_parquet_path(output_dir / "reference_sequence_chunks.parquet")
     conn.execute(
         f"CREATE OR REPLACE MACRO chunk_seq(str) AS "
         f"list_transform("
@@ -301,7 +294,7 @@ def _write_membership(
     conn: duckdb.DuckDBPyConnection, output_dir: Path, reference_idx: int
 ) -> None:
     """Write reference_membership.parquet from id_map."""
-    out = _validate_parquet_path(output_dir / "reference_membership.parquet")
+    out = validate_parquet_path(output_dir / "reference_membership.parquet")
     conn.execute(
         "COPY ("
         f"  SELECT CAST({reference_idx} AS BIGINT) AS reference_idx, feature_idx"
@@ -322,7 +315,7 @@ def _write_taxonomy(
     Rank extraction and validation done entirely in DuckDB.
     Partial coverage is allowed (not all features need taxonomy).
     """
-    out = _validate_parquet_path(output_dir / "reference_taxonomy.parquet")
+    out = validate_parquet_path(output_dir / "reference_taxonomy.parquet")
 
     # Read taxonomy Parquet, join with id_map, split ranks.
     conn.execute(
@@ -401,7 +394,7 @@ def _write_phylogeny(
     Tips with matching sequences get feature_idx populated; tips without
     sequences (and internal nodes) get NULL. No error on unmatched tips.
     """
-    out = _validate_parquet_path(output_dir / "reference_phylogeny.parquet")
+    out = validate_parquet_path(output_dir / "reference_phylogeny.parquet")
 
     conn.execute(
         "CREATE TEMP TABLE tree_nodes AS SELECT * FROM read_newick(?)",
@@ -433,7 +426,7 @@ def _write_placements(
     Maps placed fragments to feature_idx via id_map. Fragments not in
     id_map are skipped (they weren't hashed/minted).
     """
-    out = _validate_parquet_path(output_dir / "reference_placements.parquet")
+    out = validate_parquet_path(output_dir / "reference_placements.parquet")
 
     conn.execute(
         "COPY ("

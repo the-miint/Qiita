@@ -1,18 +1,8 @@
 -- migrate:up
 
 -- =============================================================================
--- ENUM TYPES used by qiita.work_ticket and qiita.action
+-- ENUM TYPE used only by qiita.work_ticket
 -- =============================================================================
--- scope_target_kind is shared between work_ticket.scope_target_kind (which
--- arm of the tagged union the ticket carries) and action.target_kind (what
--- arm a ticket invoking that action must use). Living in one CREATE TYPE
--- means the value set is defined exactly once across the schema; matches
--- the qiita.system_role / qiita.tier convention used elsewhere.
-CREATE TYPE qiita.scope_target_kind AS ENUM (
-    'study_prep',
-    'reference'
-);
-
 -- work_ticket_state is the closed lifecycle set mirrored by
 -- qiita_common.models.WorkTicketState. PENDING / QUEUED / PROCESSING are
 -- the non-terminal states the orchestrator actively manages. COMPLETED /
@@ -47,9 +37,13 @@ CREATE TABLE qiita.work_ticket (
     work_ticket_idx          BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
 
     -- Action invoked by this ticket. (action_id, action_version) FK into
-    -- qiita.action; the constraint is added when that table is created.
+    -- qiita.action; RESTRICT on delete so an action with outstanding
+    -- tickets can't be hard-deleted out from under them.
     action_id                TEXT NOT NULL CHECK (length(action_id) BETWEEN 1 AND 255),
     action_version           TEXT NOT NULL CHECK (length(action_version) BETWEEN 1 AND 100),
+    FOREIGN KEY (action_id, action_version)
+        REFERENCES qiita.action (action_id, version)
+        ON DELETE RESTRICT,
 
     -- Submitter. Priority and resource profile resolve from the originator,
     -- not the executor. RESTRICT so a principal with outstanding tickets
@@ -63,9 +57,8 @@ CREATE TABLE qiita.work_ticket (
     -- of qiita_common.models.ScopeTarget.
     --
     -- prep_idx carries no FK because there is no prep table yet; it's a
-    -- plain BIGINT until the prep schema lands. study_idx and reference_idx
-    -- both RESTRICT so a referenced row can't disappear from under an
-    -- in-flight ticket.
+    -- plain BIGINT. study_idx and reference_idx both RESTRICT so a
+    -- referenced row can't disappear from under an in-flight ticket.
     scope_target_kind        qiita.scope_target_kind NOT NULL,
     study_idx                BIGINT REFERENCES qiita.study(idx) ON DELETE RESTRICT,
     prep_idx                 BIGINT,
@@ -132,4 +125,3 @@ CREATE TRIGGER work_ticket_set_updated_at
 DROP TRIGGER IF EXISTS work_ticket_set_updated_at ON qiita.work_ticket;
 DROP TABLE IF EXISTS qiita.work_ticket;
 DROP TYPE IF EXISTS qiita.work_ticket_state;
-DROP TYPE IF EXISTS qiita.scope_target_kind;

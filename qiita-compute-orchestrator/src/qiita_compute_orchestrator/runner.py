@@ -6,8 +6,7 @@ declared per-entry in the YAML and PATCHed before each entry that
 declares one. Workflow-level success/failure transitions wrap the run.
 
 Trigger surface for v1 is a plain async function. Tests invoke it
-directly; a future Step 6+ commit can wrap it in a REST endpoint or a
-polling loop without touching this module.
+directly.
 
 Workspace contract: every entry that needs a file consumes a path in
 `<workspace_root>/<work_ticket_idx>/`. Action library functions write
@@ -15,8 +14,7 @@ their outputs (e.g. `feature_map.parquet`) into the same workspace, so
 later entries see them via the runner's binding map.
 
 DB access: direct asyncpg pool. The orchestrator and control-plane
-share the qiita database in dev / current production layouts; B15 will
-push this through REST-only access in a follow-up.
+share the qiita database in dev / current production layouts.
 """
 
 import json
@@ -28,6 +26,7 @@ import asyncpg
 from qiita_common.actions import ActionDefinition, WorkflowAction, WorkflowStep
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.client import ControlPlaneClient
+from qiita_common.models import ScopeTargetKind, WorkTicketState
 
 from .backend import ComputeBackend
 
@@ -60,10 +59,10 @@ async def run_workflow(
           with ``enabled=true``.
     """
     work_ticket = await _fetch_work_ticket(pool, work_ticket_idx)
-    if work_ticket["state"] != "pending":
+    if work_ticket["state"] != WorkTicketState.PENDING.value:
         raise RuntimeError(
             f"work_ticket {work_ticket_idx} is in state {work_ticket['state']!r}, "
-            f"must be 'pending'; manual recovery required"
+            f"must be {WorkTicketState.PENDING.value!r}; manual recovery required"
         )
 
     action = await _fetch_action(pool, work_ticket["action_id"], work_ticket["action_version"])
@@ -73,7 +72,12 @@ async def run_workflow(
             f"{work_ticket['action_version']!r}) not found or disabled"
         )
 
-    await _atomic_transition(pool, work_ticket_idx, expected="pending", new="processing")
+    await _atomic_transition(
+        pool,
+        work_ticket_idx,
+        expected=WorkTicketState.PENDING.value,
+        new=WorkTicketState.PROCESSING.value,
+    )
 
     workspace = workspace_root / str(work_ticket_idx)
     workspace.mkdir(parents=True, exist_ok=True)
@@ -107,7 +111,12 @@ async def run_workflow(
 
         if action.success_status:
             await _patch_resource_status(client, scope_target, action.success_status)
-        await _atomic_transition(pool, work_ticket_idx, expected="processing", new="completed")
+        await _atomic_transition(
+            pool,
+            work_ticket_idx,
+            expected=WorkTicketState.PROCESSING.value,
+            new=WorkTicketState.COMPLETED.value,
+        )
         _log.info("workflow %d completed", work_ticket_idx)
     except Exception as exc:
         _log.exception("workflow %d failed", work_ticket_idx)
@@ -119,7 +128,12 @@ async def run_workflow(
                     "best-effort failure_status PATCH for work_ticket %d failed",
                     work_ticket_idx,
                 )
-        await _atomic_transition(pool, work_ticket_idx, expected="processing", new="failed")
+        await _atomic_transition(
+            pool,
+            work_ticket_idx,
+            expected=WorkTicketState.PROCESSING.value,
+            new=WorkTicketState.FAILED.value,
+        )
         raise exc
 
 
@@ -231,11 +245,14 @@ def _build_scope_target(work_ticket: dict[str, Any]) -> dict[str, Any]:
     """Reconstruct a {kind, ...idx fields} dict matching qiita_common's
     ScopeTarget tagged-union shape from the work_ticket row."""
     kind = work_ticket["scope_target_kind"]
-    if kind == "reference":
-        return {"kind": "reference", "reference_idx": work_ticket["reference_idx"]}
-    if kind == "study_prep":
+    if kind == ScopeTargetKind.REFERENCE.value:
         return {
-            "kind": "study_prep",
+            "kind": ScopeTargetKind.REFERENCE.value,
+            "reference_idx": work_ticket["reference_idx"],
+        }
+    if kind == ScopeTargetKind.STUDY_PREP.value:
+        return {
+            "kind": ScopeTargetKind.STUDY_PREP.value,
             "study_idx": work_ticket["study_idx"],
             "prep_idx": work_ticket["prep_idx"],
         }
@@ -246,9 +263,8 @@ async def _patch_resource_status(
     client: ControlPlaneClient, scope_target: dict[str, Any], target_status: str
 ) -> None:
     """Drive the appropriate resource-status PATCH for the scope_target.
-    Today only `reference` is wired; study_prep targets will need their
-    own status route when B10 lands."""
-    if scope_target["kind"] == "reference":
+    Today only `reference` is wired."""
+    if scope_target["kind"] == ScopeTargetKind.REFERENCE.value:
         await client.update_reference_status(scope_target["reference_idx"], target_status)
         return
     raise NotImplementedError(

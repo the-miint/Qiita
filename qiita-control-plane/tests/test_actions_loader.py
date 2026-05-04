@@ -44,10 +44,10 @@ steps:
 action_ceiling: {cpu: 32, mem_gb: 128, walltime: PT8H}
 """
 
-# Resembles workflows/amplicon/workflow.yaml — scaffolding without an
-# action_id at the top level. The loader must skip these silently so the
-# scaffolding doesn't block sync.
-_PRE_B7_SCAFFOLDING_YAML = """
+# A YAML without a top-level `action_id` (workflow scaffolding, container
+# build manifest, anything else). The loader must skip these silently so
+# they don't block sync.
+_NON_ACTION_YAML = """
 name: amplicon
 version: 2026.3.0
 steps:
@@ -62,7 +62,7 @@ def _write(dir_path, rel_path: str, content: str) -> None:
     p.write_text(content)
 
 
-def test_load_actions_returns_each_b7_yaml(tmp_path):
+def test_load_actions_returns_each_yaml(tmp_path):
     """A directory with two valid action YAMLs returns both, sorted."""
     from qiita_control_plane.actions import load_actions
 
@@ -82,7 +82,7 @@ def test_load_actions_skips_non_action_yaml(tmp_path):
     from qiita_control_plane.actions import load_actions
 
     _write(tmp_path, "reference-add/1.0.0.yaml", _REFERENCE_ADD_YAML)
-    _write(tmp_path, "amplicon/workflow.yaml", _PRE_B7_SCAFFOLDING_YAML)
+    _write(tmp_path, "amplicon/workflow.yaml", _NON_ACTION_YAML)
 
     actions = load_actions(tmp_path)
     assert [a.action_id for a in actions] == ["reference-add"]

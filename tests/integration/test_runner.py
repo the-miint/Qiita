@@ -11,7 +11,6 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import asyncpg
 import pytest
 from qiita_common.models import (
     FeatureMintResponse,
@@ -622,11 +621,4 @@ async def test_run_workflow_uses_action_failure_status_when_set(
 
     # The reference-add fixture sets failure_status='failed' (matching
     # the qiita.reference status enum).
-    assert "reference_idx" not in {}  # noqa  — placeholder for clarity
     assert client.status_patches[-1][1] == "failed"
-
-
-# Ensure asyncpg.Pool is referenced so the import is grouped at the top
-# (ruff's I001 catches drift). In normal usage the pool is provided by
-# the postgres_pool fixture.
-_ = asyncpg.Pool

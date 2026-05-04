@@ -14,6 +14,7 @@ from .models import (
     ReferenceResponse,
     ReferenceStatus,
     RegisterFilesResponse,
+    ScopeTargetKind,
 )
 
 # Default per-request HTTP timeout. Generous so a slow control-plane reply
@@ -197,7 +198,10 @@ class ControlPlaneClient:
         resp = await self._http.post(
             URL_LIBRARY_NAME.format(name=name),
             json={
-                "scope_target": {"kind": "reference", "reference_idx": reference_idx},
+                "scope_target": {
+                    "kind": ScopeTargetKind.REFERENCE.value,
+                    "reference_idx": reference_idx,
+                },
                 "inputs": inputs,
             },
         )

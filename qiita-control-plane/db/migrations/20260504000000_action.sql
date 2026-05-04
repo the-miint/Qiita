@@ -1,6 +1,20 @@
 -- migrate:up
 
 -- =============================================================================
+-- ENUM TYPES shared by qiita.action and qiita.work_ticket
+-- =============================================================================
+-- scope_target_kind is shared between action.target_kind (what arm of the
+-- tagged union an action expects) and work_ticket.scope_target_kind (what
+-- arm a given ticket carries). Living in one CREATE TYPE means the value
+-- set is defined exactly once across the schema; matches the
+-- qiita.system_role / qiita.tier convention used elsewhere.
+CREATE TYPE qiita.scope_target_kind AS ENUM (
+    'study_prep',
+    'reference'
+);
+
+
+-- =============================================================================
 -- ACTION (compute-orchestrator action registry)
 -- =============================================================================
 -- Each row is an action definition synced from a YAML file under workflows/.
@@ -27,8 +41,7 @@ CREATE TABLE qiita.action (
     -- ===== YAML-AUTHORITATIVE COLUMNS =====
     -- The kind of resource a work_ticket invoking this action targets. Must
     -- match the ticket's scope_target.kind at submission (route handler
-    -- 422s on mismatch). Same ENUM as work_ticket.scope_target_kind so the
-    -- value sets are kept in lockstep by construction.
+    -- 422s on mismatch).
     target_kind        qiita.scope_target_kind NOT NULL,
 
     description        TEXT,
@@ -123,23 +136,8 @@ CREATE TRIGGER action_set_updated_at
     FOR EACH ROW EXECUTE FUNCTION qiita.set_updated_at();
 
 
--- =============================================================================
--- WORK_TICKET → ACTION FK
--- =============================================================================
--- Now that qiita.action exists, add the FK so a work_ticket can only
--- reference an action that has been synced. RESTRICT on delete: the route
--- handler should refuse to delete an action with outstanding tickets, but
--- the DB-level guard catches anything that bypasses that check.
-
-ALTER TABLE qiita.work_ticket
-    ADD CONSTRAINT work_ticket_action_fkey
-    FOREIGN KEY (action_id, action_version)
-    REFERENCES qiita.action (action_id, version)
-    ON DELETE RESTRICT;
-
-
 -- migrate:down
 
-ALTER TABLE qiita.work_ticket DROP CONSTRAINT IF EXISTS work_ticket_action_fkey;
 DROP TRIGGER IF EXISTS action_set_updated_at ON qiita.action;
 DROP TABLE IF EXISTS qiita.action;
+DROP TYPE IF EXISTS qiita.scope_target_kind;
