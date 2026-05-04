@@ -116,16 +116,16 @@ curl -X POST https://qiita.example.org/api/v1/auth/pat \
 ## 8. Mint the orchestrator service account
 
 ```bash
-curl -X POST https://localhost/api/v1/admin/service-accounts \
+curl -X POST https://localhost/api/v1/admin/service-account \
     -H "Authorization: Bearer qk_<ADMIN_PAT>" \
     -H "Content-Type: application/json" \
     -d '{
       "name":"orchestrator",
       "scopes":[
-        "features:mint",
-        "references:register_files",
-        "references:read",
-        "tickets:doget"
+        "feature:mint",
+        "reference:register_files",
+        "reference:read",
+        "ticket:doget"
       ]
     }'
 ```

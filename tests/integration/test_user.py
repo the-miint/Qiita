@@ -1,4 +1,4 @@
-"""Integration tests for /api/v1/users.
+"""Integration tests for /api/v1/user.
 
 POST /users is gated by system_admin + admin:users; GET/PATCH /users/me
 require require_human + self:profile. Tests use the session admin PAT
@@ -55,7 +55,7 @@ async def regular_user_app(postgres_pool, regular_user_session):
 
 async def _create_user(client, *, display_name, email, **extra):
     body = {"display_name": display_name, "email": email, **extra}
-    resp = await client.post("/api/v1/users", json=body)
+    resp = await client.post("/api/v1/user", json=body)
     if resp.status_code == 201:
         client._created_principals.append(resp.json()["principal_idx"])
     return resp
@@ -153,7 +153,7 @@ async def test_post_users_rejects_empty_display_name(admin_app):
 async def test_post_users_non_admin_403(regular_user_app):
     """A regular user (system_role='user') cannot create other users."""
     resp = await regular_user_app.post(
-        "/api/v1/users",
+        "/api/v1/user",
         json={"display_name": "Should Fail", "email": "x@x.com"},
     )
     assert resp.status_code == 403
@@ -168,7 +168,7 @@ async def test_post_users_anonymous_401(postgres_pool):
         transport=ASGITransport(app=app), base_url="http://test"
     ) as ac:
         resp = await ac.post(
-            "/api/v1/users",
+            "/api/v1/user",
             json={"display_name": "X", "email": "anon@x.com"},
         )
     assert resp.status_code == 401
@@ -182,7 +182,7 @@ async def test_post_users_anonymous_401(postgres_pool):
 async def test_get_me_returns_authenticated_user_profile(
     admin_app, human_admin_session
 ):
-    resp = await admin_app.get("/api/v1/users/me")
+    resp = await admin_app.get("/api/v1/user/me")
     assert resp.status_code == 200
     body = resp.json()
     assert body["principal_idx"] == human_admin_session["principal_idx"]
@@ -197,7 +197,7 @@ async def test_get_me_anonymous_401(postgres_pool):
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as ac:
-        resp = await ac.get("/api/v1/users/me")
+        resp = await ac.get("/api/v1/user/me")
     assert resp.status_code == 401
 
 
@@ -213,7 +213,7 @@ async def test_get_me_service_account_403(
         base_url="http://test",
         headers={"Authorization": f"Bearer {compute_worker_service_account['token']}"},
     ) as ac:
-        resp = await ac.get("/api/v1/users/me")
+        resp = await ac.get("/api/v1/user/me")
     assert resp.status_code == 403
 
 
@@ -224,7 +224,7 @@ async def test_get_me_service_account_403(
 
 async def test_patch_me_updates_profile_fields(regular_user_app):
     resp = await regular_user_app.patch(
-        "/api/v1/users/me",
+        "/api/v1/user/me",
         json={
             "affiliation": "UCSD",
             "address": "9500 Gilman Dr",
@@ -241,11 +241,11 @@ async def test_patch_me_updates_profile_fields(regular_user_app):
 
 async def test_patch_me_does_not_change_email(regular_user_app):
     """Even if a client sends email, it's silently dropped (not in UserUpdate)."""
-    before = await regular_user_app.get("/api/v1/users/me")
+    before = await regular_user_app.get("/api/v1/user/me")
     original_email = before.json()["email"]
 
     resp = await regular_user_app.patch(
-        "/api/v1/users/me",
+        "/api/v1/user/me",
         json={"email": "evil-changer@example.com", "affiliation": "X"},
     )
     assert resp.status_code == 200
@@ -254,14 +254,14 @@ async def test_patch_me_does_not_change_email(regular_user_app):
 
 
 async def test_patch_me_empty_body_is_no_op(regular_user_app, regular_user_session):
-    resp = await regular_user_app.patch("/api/v1/users/me", json={})
+    resp = await regular_user_app.patch("/api/v1/user/me", json={})
     assert resp.status_code == 200
     assert resp.json()["display_name"] == regular_user_session["display_name"]
 
 
 async def test_patch_me_rejects_invalid_orcid(regular_user_app):
     resp = await regular_user_app.patch(
-        "/api/v1/users/me",
+        "/api/v1/user/me",
         json={"orcid": "obviously-wrong"},
     )
     assert resp.status_code == 422
@@ -274,5 +274,5 @@ async def test_patch_me_anonymous_401(postgres_pool):
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
     ) as ac:
-        resp = await ac.patch("/api/v1/users/me", json={"affiliation": "X"})
+        resp = await ac.patch("/api/v1/user/me", json={"affiliation": "X"})
     assert resp.status_code == 401

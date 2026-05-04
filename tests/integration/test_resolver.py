@@ -17,7 +17,7 @@ from httpx import ASGITransport, AsyncClient
 
 def _detail(row) -> dict:
     """asyncpg returns JSONB columns as raw JSON strings without an explicit
-    codec. Tests that inspect auth_events.detail need to parse it."""
+    codec. Tests that inspect auth_event.detail need to parse it."""
     raw = row["detail"]
     return json.loads(raw) if isinstance(raw, str) else raw
 
@@ -116,23 +116,23 @@ async def resolver_client(postgres_pool, jwks_harness):
 
     if created:
         # Cleanup must fully reset state so reruns don't see stale email/sub
-        # collisions. qiita.auth_events is append-only by design — UPDATE/DELETE
+        # collisions. qiita.auth_event is append-only by design — UPDATE/DELETE
         # are blocked by triggers — so we temporarily disable those triggers
         # for the cleanup transaction. Production never does this; it's
         # test-only infrastructure.
         async with postgres_pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
-                    "ALTER TABLE qiita.auth_events DISABLE TRIGGER auth_events_no_delete"
+                    "ALTER TABLE qiita.auth_event DISABLE TRIGGER auth_events_no_delete"
                 )
                 try:
                     await conn.execute(
-                        "DELETE FROM qiita.api_tokens"
+                        "DELETE FROM qiita.api_token"
                         " WHERE principal_idx = ANY($1::bigint[])",
                         created,
                     )
                     await conn.execute(
-                        "DELETE FROM qiita.user_identities"
+                        "DELETE FROM qiita.user_identity"
                         " WHERE principal_idx = ANY($1::bigint[])",
                         created,
                     )
@@ -147,7 +147,7 @@ async def resolver_client(postgres_pool, jwks_harness):
                         created,
                     )
                     await conn.execute(
-                        "DELETE FROM qiita.auth_events"
+                        "DELETE FROM qiita.auth_event"
                         " WHERE principal_idx = ANY($1::bigint[])"
                         "    OR actor_principal_idx = ANY($1::bigint[])",
                         created,
@@ -158,7 +158,7 @@ async def resolver_client(postgres_pool, jwks_harness):
                     )
                 finally:
                     await conn.execute(
-                        "ALTER TABLE qiita.auth_events ENABLE TRIGGER auth_events_no_delete"
+                        "ALTER TABLE qiita.auth_event ENABLE TRIGGER auth_events_no_delete"
                     )
 
 
@@ -210,7 +210,7 @@ async def test_resolver_dispatches_qk_prefix_to_token_path(
     resolver_client, postgres_pool
 ):
     """A qk_ token resolves to the owning principal's HumanUser/ServiceAccount."""
-    from qiita_control_plane.auth.tokens import mint_api_token
+    from qiita_control_plane.auth.token import mint_api_token
 
     # Seed: principal + user
     pidx = await postgres_pool.fetchval(
@@ -241,7 +241,7 @@ async def test_resolver_dispatches_qk_prefix_to_token_path(
 
 
 async def test_resolver_token_path_for_service_account(resolver_client, postgres_pool):
-    from qiita_control_plane.auth.tokens import mint_api_token
+    from qiita_control_plane.auth.token import mint_api_token
 
     pidx = await postgres_pool.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
@@ -270,7 +270,7 @@ async def test_resolver_token_path_for_service_account(resolver_client, postgres
 
 
 async def test_resolver_rejects_revoked_token(resolver_client, postgres_pool):
-    from qiita_control_plane.auth.tokens import mint_api_token
+    from qiita_control_plane.auth.token import mint_api_token
 
     pidx = await postgres_pool.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
@@ -289,7 +289,7 @@ async def test_resolver_rejects_revoked_token(resolver_client, postgres_pool):
         scopes=[],
     )
     await postgres_pool.execute(
-        "UPDATE qiita.api_tokens SET revoked_at = now() WHERE token_idx = $1",
+        "UPDATE qiita.api_token SET revoked_at = now() WHERE token_idx = $1",
         token_idx,
     )
     resp = await resolver_client.get(
@@ -329,7 +329,7 @@ async def test_resolver_dispatches_jwt_header_shape_to_oidc_path(
         "SELECT count(*) FROM qiita.user WHERE principal_idx = $1", pidx
     )
     ui = await postgres_pool.fetchval(
-        "SELECT count(*) FROM qiita.user_identities WHERE principal_idx = $1",
+        "SELECT count(*) FROM qiita.user_identity WHERE principal_idx = $1",
         pidx,
     )
     assert (p, u, ui) == (1, 1, 1)
@@ -348,7 +348,7 @@ async def test_resolver_creates_audit_event_on_first_login(
     _track(resolver_client, pidx)
 
     events = await postgres_pool.fetch(
-        "SELECT event_type, detail FROM qiita.auth_events"
+        "SELECT event_type, detail FROM qiita.auth_event"
         " WHERE principal_idx = $1 ORDER BY event_idx",
         pidx,
     )
@@ -376,7 +376,7 @@ async def test_resolver_409s_on_email_collision_with_different_iss_sub(
 
     # Audit event recorded.
     rows = await postgres_pool.fetch(
-        "SELECT detail FROM qiita.auth_events"
+        "SELECT detail FROM qiita.auth_event"
         " WHERE event_type = 'oidc_create_principal_email_conflict'"
         "   AND detail->>'issuer' = $1",
         jwks_harness.issuer,
@@ -464,7 +464,7 @@ async def test_resolver_updates_email_on_drift_when_no_collision(
     assert r2.json()["email"] == "drift2@example.com"
 
     events = await postgres_pool.fetch(
-        "SELECT detail FROM qiita.auth_events"
+        "SELECT detail FROM qiita.auth_event"
         " WHERE event_type = 'email_drift' AND principal_idx = $1",
         pidx,
     )
@@ -499,7 +499,7 @@ async def test_resolver_noops_and_audits_email_drift_on_collision(
     assert r3.json()["email"] == "dr-a@example.com"
 
     events = await postgres_pool.fetch(
-        "SELECT detail FROM qiita.auth_events"
+        "SELECT detail FROM qiita.auth_event"
         " WHERE event_type = 'email_drift' AND principal_idx = $1",
         pa,
     )
@@ -538,7 +538,7 @@ async def test_resolver_email_drift_uses_sha256_hash_for_collision_attempt(
     )
 
     rows = await postgres_pool.fetch(
-        "SELECT detail FROM qiita.auth_events"
+        "SELECT detail FROM qiita.auth_event"
         " WHERE event_type = 'email_drift' AND principal_idx = $1"
         "   AND detail->>'outcome' = 'collision'",
         pa,
@@ -620,9 +620,9 @@ async def test_resolver_handles_concurrent_same_iss_sub_race(
     assert p1 == p2  # same principal even though both raced first-login
     _track(resolver_client, p1)
 
-    # Exactly one user_identities row for this (iss, sub).
+    # Exactly one user_identity row for this (iss, sub).
     n = await postgres_pool.fetchval(
-        "SELECT count(*) FROM qiita.user_identities WHERE issuer = $1 AND subject = $2",
+        "SELECT count(*) FROM qiita.user_identity WHERE issuer = $1 AND subject = $2",
         jwks_harness.issuer,
         sub,
     )

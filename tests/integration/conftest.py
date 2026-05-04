@@ -192,12 +192,12 @@ async def human_admin_session(postgres_pool):
     drive routes that require human + admin authority (POST /references,
     POST /admin/*, PATCH /users/me).
 
-    The principal persists across sessions because qiita.auth_events
+    The principal persists across sessions because qiita.auth_event
     references it via FK and is append-only — by design. Reusing the same
     display_name is idempotent: the fixture looks it up and only creates
     if absent.
     """
-    from qiita_control_plane.auth.tokens import mint_api_token
+    from qiita_control_plane.auth.token import mint_api_token
 
     display_name = "test-human-admin"
     idx = await postgres_pool.fetchval(
@@ -262,7 +262,7 @@ async def regular_user_session(postgres_pool):
     """A session-scoped 'user'-role human with a complete profile and a
     PAT scoped to the user ceiling. Used for negative-case tests that
     need a non-admin caller (e.g., 403 on admin endpoints)."""
-    from qiita_control_plane.auth.tokens import mint_api_token
+    from qiita_control_plane.auth.token import mint_api_token
 
     display_name = "test-regular-user"
     idx = await postgres_pool.fetchval(
@@ -307,13 +307,13 @@ async def compute_worker_service_account(postgres_pool, tmp_path_factory):
     `/etc/qiita/orchestrator.token` location.
 
     Idempotent across pytest sessions: if a previous run created the
-    service_account row (auth_events FK keeps principals around), look it
+    service_account row (auth_event FK keeps principals around), look it
     up by name instead of re-creating. Always mints a fresh token so each
     session starts with a known-good credential.
 
     Returns a dict with `principal_idx`, `token_path` (Path), `token` (str).
     """
-    from qiita_control_plane.auth.tokens import mint_api_token
+    from qiita_control_plane.auth.token import mint_api_token
 
     SVC_NAME = "compute-worker-fixture"
     pidx = await postgres_pool.fetchval(

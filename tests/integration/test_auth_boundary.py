@@ -8,7 +8,7 @@ Every guarded route is exercised against the standard negative-case set:
     (revoked_token, 401) — token revoked after issue
     (expired_token, 401) — token expires_at in the past
 
-GET /api/v1/references/{id} is anonymous-OK by design and is excluded
+GET /api/v1/reference/{id} is anonymous-OK by design and is excluded
 from the matrix; its dedicated coverage (anonymous=200, authenticated=200)
 lives at the bottom of this file.
 """
@@ -72,7 +72,7 @@ async def _seed_human_with_token(
     don't collide on email uniqueness across the session. Returns the token
     plaintext and the principal_idx.
     """
-    from qiita_control_plane.auth.tokens import mint_api_token
+    from qiita_control_plane.auth.token import mint_api_token
 
     # Always append a random component so reruns of the same test don't
     # collide on user.email (UNIQUE).
@@ -118,7 +118,7 @@ async def _seed_human_with_token(
         )
     if revoked:
         await postgres_pool.execute(
-            "UPDATE qiita.api_tokens SET revoked_at = now() WHERE token_idx = $1",
+            "UPDATE qiita.api_token SET revoked_at = now() WHERE token_idx = $1",
             token_idx,
         )
     return plaintext, pidx
@@ -130,7 +130,7 @@ async def _seed_service_with_token(
     scopes: list[str],
     suffix: str | None = None,
 ):
-    from qiita_control_plane.auth.tokens import mint_api_token
+    from qiita_control_plane.auth.token import mint_api_token
 
     base = suffix or f"{datetime.now(UTC).timestamp() * 1e6:.0f}"
     # Random component to avoid service_account.name UNIQUE collisions across runs.
@@ -163,7 +163,7 @@ def _h(token: str | None) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# POST /api/v1/references — require_complete_profile + scope references:write
+# POST /api/v1/reference — require_complete_profile + scope references:write
 # ---------------------------------------------------------------------------
 
 
@@ -171,7 +171,7 @@ _BODY_REF = {"name": "boundary-ref", "version": "1.0", "kind": "sequence_referen
 
 
 async def test_post_references_no_auth_401(boundary_client):
-    resp = await boundary_client.post("/api/v1/references", json=_BODY_REF)
+    resp = await boundary_client.post("/api/v1/reference", json=_BODY_REF)
     assert resp.status_code == 401
 
 
@@ -188,7 +188,7 @@ async def test_post_references_service_account_403(boundary_client, postgres_poo
         suffix="ref-svc",
     )
     resp = await boundary_client.post(
-        "/api/v1/references",
+        "/api/v1/reference",
         json=_BODY_REF,
         headers=_h(token),
     )
@@ -204,7 +204,7 @@ async def test_post_references_missing_scope_403(boundary_client, postgres_pool)
         suffix="ref-no-scope",
     )
     resp = await boundary_client.post(
-        "/api/v1/references",
+        "/api/v1/reference",
         json=_BODY_REF,
         headers=_h(token),
     )
@@ -221,7 +221,7 @@ async def test_post_references_incomplete_profile_422(boundary_client, postgres_
         suffix="ref-incomplete",
     )
     resp = await boundary_client.post(
-        "/api/v1/references",
+        "/api/v1/reference",
         json=_BODY_REF,
         headers=_h(token),
     )
@@ -237,7 +237,7 @@ async def test_post_references_disabled_principal_401(boundary_client, postgres_
         suffix="ref-disabled",
     )
     resp = await boundary_client.post(
-        "/api/v1/references",
+        "/api/v1/reference",
         json=_BODY_REF,
         headers=_h(token),
     )
@@ -253,7 +253,7 @@ async def test_post_references_revoked_token_401(boundary_client, postgres_pool)
         suffix="ref-revoked",
     )
     resp = await boundary_client.post(
-        "/api/v1/references",
+        "/api/v1/reference",
         json=_BODY_REF,
         headers=_h(token),
     )
@@ -269,7 +269,7 @@ async def test_post_references_expired_token_401(boundary_client, postgres_pool)
         suffix="ref-expired",
     )
     resp = await boundary_client.post(
-        "/api/v1/references",
+        "/api/v1/reference",
         json=_BODY_REF,
         headers=_h(token),
     )
@@ -277,14 +277,14 @@ async def test_post_references_expired_token_401(boundary_client, postgres_pool)
 
 
 # ---------------------------------------------------------------------------
-# POST /references/{id}/features/mint — require_service + features:mint
+# POST /references/{id}/feature/mint — require_service + features:mint
 # ---------------------------------------------------------------------------
 
 
 async def _seed_active_reference(postgres_pool, suffix: str) -> int:
     # Random component prevents (name, version) UNIQUE collisions across runs.
     return await postgres_pool.fetchval(
-        "INSERT INTO qiita.references"
+        "INSERT INTO qiita.reference"
         "  (name, version, kind, status, created_by_idx)"
         " VALUES ($1, '1.0', 'sequence_reference', 'hashing', 1)"
         " RETURNING reference_idx",
@@ -295,7 +295,7 @@ async def _seed_active_reference(postgres_pool, suffix: str) -> int:
 async def test_mint_features_no_auth_401(boundary_client, postgres_pool):
     ref_idx = await _seed_active_reference(postgres_pool, "no-auth")
     resp = await boundary_client.post(
-        f"/api/v1/references/{ref_idx}/features/mint",
+        f"/api/v1/reference/{ref_idx}/feature/mint",
         json={"entries": [{"sequence_hash": "00000000-0000-0000-0000-000000000001"}]},
     )
     assert resp.status_code == 401
@@ -319,7 +319,7 @@ async def test_mint_features_human_403(boundary_client, postgres_pool):
         suffix="mint-human",
     )
     resp = await boundary_client.post(
-        f"/api/v1/references/{ref_idx}/features/mint",
+        f"/api/v1/reference/{ref_idx}/feature/mint",
         json={"entries": [{"sequence_hash": "00000000-0000-0000-0000-000000000002"}]},
         headers=_h(token),
     )
@@ -335,7 +335,7 @@ async def test_mint_features_service_missing_scope_403(boundary_client, postgres
         suffix="mint-svc-no-scope",
     )
     resp = await boundary_client.post(
-        f"/api/v1/references/{ref_idx}/features/mint",
+        f"/api/v1/reference/{ref_idx}/feature/mint",
         json={"entries": [{"sequence_hash": "00000000-0000-0000-0000-000000000003"}]},
         headers=_h(token),
     )
@@ -364,7 +364,7 @@ async def test_register_files_human_403(boundary_client, postgres_pool):
         suffix="reg-human",
     )
     resp = await boundary_client.post(
-        f"/api/v1/references/{ref_idx}/register",
+        f"/api/v1/reference/{ref_idx}/register",
         json={"staging_dir": "/tmp/x", "files": {}},
         headers=_h(token),
     )
@@ -379,7 +379,7 @@ async def test_register_files_service_missing_scope_403(boundary_client, postgre
         suffix="reg-no-scope",
     )
     resp = await boundary_client.post(
-        f"/api/v1/references/{ref_idx}/register",
+        f"/api/v1/reference/{ref_idx}/register",
         json={"staging_dir": "/tmp/x", "files": {}},
         headers=_h(token),
     )
@@ -387,14 +387,14 @@ async def test_register_files_service_missing_scope_403(boundary_client, postgre
 
 
 # ---------------------------------------------------------------------------
-# POST /references/{id}/tickets/doget — scope tickets:doget
+# POST /references/{id}/ticket/doget — scope tickets:doget
 # ---------------------------------------------------------------------------
 
 
 async def test_doget_no_auth_401(boundary_client, postgres_pool):
     ref_idx = await _seed_active_reference(postgres_pool, "doget-no-auth")
     resp = await boundary_client.post(
-        f"/api/v1/references/{ref_idx}/tickets/doget",
+        f"/api/v1/reference/{ref_idx}/ticket/doget",
         json={"table": "reference_sequences"},
     )
     assert resp.status_code == 401
@@ -409,7 +409,7 @@ async def test_doget_missing_scope_403(boundary_client, postgres_pool):
         suffix="doget-no-scope",
     )
     resp = await boundary_client.post(
-        f"/api/v1/references/{ref_idx}/tickets/doget",
+        f"/api/v1/reference/{ref_idx}/ticket/doget",
         json={"table": "reference_sequences"},
         headers=_h(token),
     )
@@ -417,12 +417,12 @@ async def test_doget_missing_scope_403(boundary_client, postgres_pool):
 
 
 # ---------------------------------------------------------------------------
-# GET /api/v1/users/me — require_human
+# GET /api/v1/user/me — require_human
 # ---------------------------------------------------------------------------
 
 
 async def test_get_me_anonymous_401(boundary_client):
-    resp = await boundary_client.get("/api/v1/users/me")
+    resp = await boundary_client.get("/api/v1/user/me")
     assert resp.status_code == 401
 
 
@@ -432,12 +432,12 @@ async def test_get_me_service_403(boundary_client, postgres_pool):
         scopes=["feature:mint"],
         suffix="me-svc",
     )
-    resp = await boundary_client.get("/api/v1/users/me", headers=_h(token))
+    resp = await boundary_client.get("/api/v1/user/me", headers=_h(token))
     assert resp.status_code == 403
 
 
 # ---------------------------------------------------------------------------
-# PATCH /api/v1/users/me — require_human + self:profile
+# PATCH /api/v1/user/me — require_human + self:profile
 # ---------------------------------------------------------------------------
 
 
@@ -450,7 +450,7 @@ async def test_patch_me_missing_scope_403(boundary_client, postgres_pool):
         suffix="patch-no-scope",
     )
     resp = await boundary_client.patch(
-        "/api/v1/users/me",
+        "/api/v1/user/me",
         json={"affiliation": "X"},
         headers=_h(token),
     )
@@ -464,7 +464,7 @@ async def test_patch_me_missing_scope_403(boundary_client, postgres_pool):
 
 async def test_get_reference_anonymous_returns_200(boundary_client, postgres_pool):
     ref_idx = await _seed_active_reference(postgres_pool, "get-anon")
-    resp = await boundary_client.get(f"/api/v1/references/{ref_idx}")
+    resp = await boundary_client.get(f"/api/v1/reference/{ref_idx}")
     assert resp.status_code == 200
     body = resp.json()
     assert body["reference_idx"] == ref_idx
@@ -480,6 +480,6 @@ async def test_get_reference_authenticated_returns_200(boundary_client, postgres
         scopes=["reference:read"],
         suffix="get-auth",
     )
-    resp = await boundary_client.get(f"/api/v1/references/{ref_idx}", headers=_h(token))
+    resp = await boundary_client.get(f"/api/v1/reference/{ref_idx}", headers=_h(token))
     assert resp.status_code == 200
     assert resp.json()["reference_idx"] == ref_idx

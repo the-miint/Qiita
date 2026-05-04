@@ -65,12 +65,12 @@ async def test_orchestrator_rejected_without_token(control_plane):
     auth-required endpoints."""
     transport = ASGITransport(app=control_plane)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        resp = await ac.get("/api/v1/auth/tokens")
+        resp = await ac.get("/api/v1/auth/token")
     assert resp.status_code == 401
 
 
 # Wrong-kind / wrong-scope rejection paths for the worker-only routes
-# (POST /references/{id}/features/mint and /register) are exercised in
+# (POST /references/{id}/feature/mint and /register) are exercised in
 # test_auth_boundary.py via require_service + require_scope guards. The
 # orchestrator-side tests focus on the credential resolution path here.
 

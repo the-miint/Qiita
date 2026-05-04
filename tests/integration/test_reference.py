@@ -33,7 +33,7 @@ async def client(postgres_pool, human_admin_session):
             created_refs,
         )
         await postgres_pool.execute(
-            "DELETE FROM qiita.references WHERE reference_idx = ANY($1::bigint[])",
+            "DELETE FROM qiita.reference WHERE reference_idx = ANY($1::bigint[])",
             created_refs,
         )
 
@@ -41,7 +41,7 @@ async def client(postgres_pool, human_admin_session):
 async def _create_ref(client, name, version="1.0", kind="sequence_reference"):
     """Helper: create a reference and track its idx for cleanup."""
     resp = await client.post(
-        "/api/v1/references",
+        "/api/v1/reference",
         json={"name": name, "version": version, "kind": kind},
     )
     if resp.status_code == 201:
@@ -50,7 +50,7 @@ async def _create_ref(client, name, version="1.0", kind="sequence_reference"):
 
 
 async def test_create_reference_returns_201(client, human_admin_session):
-    """POST /api/v1/references with valid payload returns 201."""
+    """POST /api/v1/reference with valid payload returns 201."""
     resp = await _create_ref(client, "test-ref-create")
     assert resp.status_code == 201
     body = resp.json()
@@ -64,29 +64,29 @@ async def test_create_reference_returns_201(client, human_admin_session):
 
 
 async def test_create_reference_rejects_invalid_kind(client):
-    """POST /api/v1/references with invalid kind returns 422."""
+    """POST /api/v1/reference with invalid kind returns 422."""
     resp = await client.post(
-        "/api/v1/references",
+        "/api/v1/reference",
         json={"name": "bad", "version": "1.0", "kind": "bogus"},
     )
     assert resp.status_code == 422
 
 
 async def test_create_reference_rejects_empty_name(client):
-    """POST /api/v1/references with empty name returns 422."""
+    """POST /api/v1/reference with empty name returns 422."""
     resp = await client.post(
-        "/api/v1/references",
+        "/api/v1/reference",
         json={"name": "", "version": "1.0", "kind": "sequence_reference"},
     )
     assert resp.status_code == 422
 
 
 async def test_get_reference_by_idx(client):
-    """GET /api/v1/references/{idx} returns the created reference."""
+    """GET /api/v1/reference/{idx} returns the created reference."""
     create_resp = await _create_ref(client, "test-ref-get")
     idx = create_resp.json()["reference_idx"]
 
-    get_resp = await client.get(f"/api/v1/references/{idx}")
+    get_resp = await client.get(f"/api/v1/reference/{idx}")
     assert get_resp.status_code == 200
     body = get_resp.json()
     assert body["reference_idx"] == idx
@@ -96,21 +96,21 @@ async def test_get_reference_by_idx(client):
 async def test_get_reference_not_found(client, postgres_pool):
     """GET for a reference_idx beyond any existing row returns 404."""
     max_idx = await postgres_pool.fetchval(
-        "SELECT COALESCE(MAX(reference_idx), 0) FROM qiita.references"
+        "SELECT COALESCE(MAX(reference_idx), 0) FROM qiita.reference"
     )
-    resp = await client.get(f"/api/v1/references/{max_idx + 1}")
+    resp = await client.get(f"/api/v1/reference/{max_idx + 1}")
     assert resp.status_code == 404
 
 
 async def test_get_reference_rejects_zero(client):
-    """GET /api/v1/references/0 returns 422 (gt=0 constraint)."""
-    resp = await client.get("/api/v1/references/0")
+    """GET /api/v1/reference/0 returns 422 (gt=0 constraint)."""
+    resp = await client.get("/api/v1/reference/0")
     assert resp.status_code == 422
 
 
 async def test_get_reference_rejects_negative(client):
-    """GET /api/v1/references/-1 returns 422 (gt=0 constraint)."""
-    resp = await client.get("/api/v1/references/-1")
+    """GET /api/v1/reference/-1 returns 422 (gt=0 constraint)."""
+    resp = await client.get("/api/v1/reference/-1")
     assert resp.status_code == 422
 
 

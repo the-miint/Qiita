@@ -19,10 +19,10 @@ import pytest
 async def test_created_by_idx_is_not_null(postgres_pool):
     row = await postgres_pool.fetchrow(
         "SELECT data_type, is_nullable FROM information_schema.columns"
-        " WHERE table_schema = 'qiita' AND table_name = 'references'"
+        " WHERE table_schema = 'qiita' AND table_name = 'reference'"
         "   AND column_name = 'created_by_idx'"
     )
-    assert row is not None, "qiita.references.created_by_idx does not exist"
+    assert row is not None, "qiita.reference.created_by_idx does not exist"
     assert row["data_type"] == "bigint"
     assert row["is_nullable"] == "NO"
 
@@ -31,10 +31,10 @@ async def test_legacy_created_by_column_dropped(postgres_pool):
     """The finalize migration dropped the legacy created_by UUID column."""
     row = await postgres_pool.fetchval(
         "SELECT 1 FROM information_schema.columns"
-        " WHERE table_schema = 'qiita' AND table_name = 'references'"
+        " WHERE table_schema = 'qiita' AND table_name = 'reference'"
         "   AND column_name = 'created_by'"
     )
-    assert row is None, "qiita.references.created_by should have been dropped"
+    assert row is None, "qiita.reference.created_by should have been dropped"
 
 
 async def test_column_has_fk_to_principal(postgres_pool):
@@ -43,7 +43,7 @@ async def test_column_has_fk_to_principal(postgres_pool):
     row = await postgres_pool.fetchrow(
         "SELECT confrelid::regclass::text AS target_table"
         " FROM pg_constraint"
-        " WHERE conrelid = 'qiita.references'::regclass"
+        " WHERE conrelid = 'qiita.reference'::regclass"
         "   AND contype = 'f'"
         "   AND conname LIKE '%created_by_idx%'"
     )
@@ -66,7 +66,7 @@ async def test_no_cascade_on_delete(postgres_pool):
         "   ON kcu.constraint_name = tc.constraint_name"
         "   AND kcu.table_schema = tc.table_schema"
         " WHERE tc.table_schema = 'qiita'"
-        "   AND tc.table_name = 'references'"
+        "   AND tc.table_name = 'reference'"
         "   AND kcu.column_name = 'created_by_idx'"
     )
     assert rule in ("NO ACTION", "RESTRICT"), f"unexpected delete_rule: {rule!r}"
@@ -89,7 +89,7 @@ async def test_insert_with_explicit_principal_idx(postgres_pool):
                 " VALUES ('h_c-creator', 'user', 1) RETURNING idx"
             )
             row = await conn.fetchrow(
-                "INSERT INTO qiita.references"
+                "INSERT INTO qiita.reference"
                 "  (name, version, kind, created_by_idx)"
                 " VALUES ($1, $2, 'sequence_reference', $3)"
                 " RETURNING reference_idx, created_by_idx",
@@ -111,7 +111,7 @@ async def test_rejects_fk_to_nonexistent_principal(postgres_pool):
         try:
             with pytest.raises(asyncpg.ForeignKeyViolationError):
                 await conn.execute(
-                    "INSERT INTO qiita.references"
+                    "INSERT INTO qiita.reference"
                     "  (name, version, kind, created_by_idx)"
                     " VALUES ($1, $2, 'sequence_reference', $3)",
                     "h_c-bad-fk",
@@ -130,7 +130,7 @@ async def test_insert_without_created_by_idx_rejected(postgres_pool):
         try:
             with pytest.raises(asyncpg.NotNullViolationError):
                 await conn.execute(
-                    "INSERT INTO qiita.references (name, version, kind)"
+                    "INSERT INTO qiita.reference (name, version, kind)"
                     " VALUES ($1, $2, 'sequence_reference')",
                     "h_c-no-fk",
                     "1.0",
