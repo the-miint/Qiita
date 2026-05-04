@@ -103,11 +103,11 @@ async def _admin_token(postgres_pool, admin_client) -> str:
         label="admin-test",
         scopes=[
             "self:profile",
-            "self:tokens",
-            "references:read",
-            "references:write",
-            "admin:users",
-            "admin:service_accounts",
+            "self:token",
+            "reference:read",
+            "reference:write",
+            "admin:user",
+            "admin:service_account",
             "admin:audit_read",
         ],
     )
@@ -143,7 +143,7 @@ async def test_post_service_accounts_admin_only(admin_client, postgres_pool):
     resp = await admin_client.post(
         "/api/v1/admin/service-accounts",
         headers={"Authorization": f"Bearer {plaintext}"},
-        json={"name": "blocked-svc", "scopes": ["features:mint"]},
+        json={"name": "blocked-svc", "scopes": ["feature:mint"]},
     )
     assert resp.status_code == 403
 
@@ -155,7 +155,7 @@ async def test_post_service_accounts_returns_token_once(admin_client, postgres_p
         headers={"Authorization": f"Bearer {admin_token}"},
         json={
             "name": "ok-svc",
-            "scopes": ["features:mint", "references:read"],
+            "scopes": ["feature:mint", "reference:read"],
         },
     )
     assert resp.status_code == 201, resp.text
@@ -184,11 +184,11 @@ async def test_post_service_accounts_rejects_scope_outside_service_ceiling(
     resp = await admin_client.post(
         "/api/v1/admin/service-accounts",
         headers={"Authorization": f"Bearer {admin_token}"},
-        json={"name": "evil-svc", "scopes": ["features:mint", "admin:users"]},
+        json={"name": "evil-svc", "scopes": ["feature:mint", "admin:user"]},
     )
     assert resp.status_code == 422
     # Flat 422 body (matches /auth/pat shape) — top-level rejected_scopes.
-    assert "admin:users" in resp.json()["rejected_scopes"]
+    assert "admin:user" in resp.json()["rejected_scopes"]
 
 
 async def test_post_service_accounts_duplicate_name_409(admin_client, postgres_pool):
@@ -198,7 +198,7 @@ async def test_post_service_accounts_duplicate_name_409(admin_client, postgres_p
     that dispatch ever falls through (e.g., the constraint gets renamed in
     a migration), the response would become a 500 and this test catches it."""
     admin_token, _ = await _admin_token(postgres_pool, admin_client)
-    payload = {"name": "dup-svc", "scopes": ["features:mint"]}
+    payload = {"name": "dup-svc", "scopes": ["feature:mint"]}
     r1 = await admin_client.post(
         "/api/v1/admin/service-accounts",
         headers={"Authorization": f"Bearer {admin_token}"},
@@ -514,10 +514,10 @@ async def test_revoke_all_tokens_requires_admin_service_accounts_for_service_tar
         label="narrow",
         scopes=[
             "self:profile",
-            "self:tokens",
-            "references:read",
-            "references:write",
-            "admin:users",
+            "self:token",
+            "reference:read",
+            "reference:write",
+            "admin:user",
             # admin:service_accounts intentionally absent
             "admin:audit_read",
         ],
@@ -541,7 +541,7 @@ async def test_revoke_all_tokens_requires_admin_service_accounts_for_service_tar
         headers={"Authorization": f"Bearer {narrow_token}"},
     )
     assert resp.status_code == 403
-    assert "admin:service_accounts" in resp.json()["detail"]
+    assert "admin:service_account" in resp.json()["detail"]
 
 
 async def test_revoke_all_tokens_requires_admin_users_for_user_target(
@@ -562,10 +562,10 @@ async def test_revoke_all_tokens_requires_admin_users_for_user_target(
         label="svc-only",
         scopes=[
             "self:profile",
-            "self:tokens",
-            "references:read",
+            "self:token",
+            "reference:read",
             # admin:users intentionally absent
-            "admin:service_accounts",
+            "admin:service_account",
         ],
     )
 
@@ -580,7 +580,7 @@ async def test_revoke_all_tokens_requires_admin_users_for_user_target(
         headers={"Authorization": f"Bearer {narrow_token}"},
     )
     assert resp.status_code == 403
-    assert "admin:users" in resp.json()["detail"]
+    assert "admin:user" in resp.json()["detail"]
 
 
 async def test_revoke_all_tokens_revokes_all_active_and_skips_revoked(

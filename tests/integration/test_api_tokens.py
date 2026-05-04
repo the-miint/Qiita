@@ -44,7 +44,7 @@ async def test_mint_returns_plaintext_and_token_idx(postgres_pool, principal_idx
         postgres_pool,
         principal_idx=principal_idx,
         label="test-token",
-        scopes=["references:read"],
+        scopes=["reference:read"],
     )
     assert plaintext.startswith("qk_")
     assert len(plaintext) == 46
@@ -59,7 +59,7 @@ async def test_mint_validates_scopes_against_valid_set(postgres_pool, principal_
             postgres_pool,
             principal_idx=principal_idx,
             label="bad-scope",
-            scopes=["references:read", "this:does:not:exist"],
+            scopes=["reference:read", "this:does:not:exist"],
         )
 
 
@@ -71,7 +71,7 @@ async def test_mint_persists_to_db(postgres_pool, principal_idx):
         postgres_pool,
         principal_idx=principal_idx,
         label="persist-check",
-        scopes=["references:read", "self:profile"],
+        scopes=["reference:read", "self:profile"],
     )
     row = await postgres_pool.fetchrow(
         "SELECT principal_idx, label, scopes, revoked_at, expires_at"
@@ -80,7 +80,7 @@ async def test_mint_persists_to_db(postgres_pool, principal_idx):
     )
     assert row["principal_idx"] == principal_idx
     assert row["label"] == "persist-check"
-    assert set(row["scopes"]) == {"references:read", "self:profile"}
+    assert set(row["scopes"]) == {"reference:read", "self:profile"}
     assert row["revoked_at"] is None
 
 
@@ -144,13 +144,13 @@ async def test_verify_valid_token_returns_principal_idx(postgres_pool, principal
         postgres_pool,
         principal_idx=principal_idx,
         label="verify-success",
-        scopes=["references:read", "self:profile"],
+        scopes=["reference:read", "self:profile"],
     )
     verified = await verify_api_token(postgres_pool, plaintext)
     assert verified is not None
     assert verified.principal_idx == principal_idx
     assert verified.token_idx == token_idx
-    assert verified.scopes == frozenset({"references:read", "self:profile"})
+    assert verified.scopes == frozenset({"reference:read", "self:profile"})
 
 
 async def test_verify_rejects_unknown_token(postgres_pool):

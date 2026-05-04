@@ -67,8 +67,8 @@ def test_valid_scopes_is_frozen():
 
     assert isinstance(VALID_SCOPES, frozenset)
     # Spot-check a few — full coverage lives in the role/scope tests.
-    assert "references:read" in VALID_SCOPES
-    assert "admin:users" in VALID_SCOPES
+    assert "reference:read" in VALID_SCOPES
+    assert "admin:user" in VALID_SCOPES
     assert "self:profile" in VALID_SCOPES
 
 

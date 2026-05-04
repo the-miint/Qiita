@@ -180,10 +180,10 @@ async def test_post_references_service_account_403(boundary_client, postgres_poo
     token, _ = await _seed_service_with_token(
         postgres_pool,
         scopes=[
-            "features:mint",
-            "references:read",
-            "references:register_files",
-            "tickets:doget",
+            "feature:mint",
+            "reference:read",
+            "reference:register_files",
+            "ticket:doget",
         ],
         suffix="ref-svc",
     )
@@ -200,7 +200,7 @@ async def test_post_references_missing_scope_403(boundary_client, postgres_pool)
     token, _ = await _seed_human_with_token(
         postgres_pool,
         system_role="user",
-        scopes=["self:profile", "references:read"],
+        scopes=["self:profile", "reference:read"],
         suffix="ref-no-scope",
     )
     resp = await boundary_client.post(
@@ -216,7 +216,7 @@ async def test_post_references_incomplete_profile_422(boundary_client, postgres_
     token, _ = await _seed_human_with_token(
         postgres_pool,
         system_role="wet_lab_admin",
-        scopes=["self:profile", "self:tokens", "references:read", "references:write"],
+        scopes=["self:profile", "self:token", "reference:read", "reference:write"],
         profile_complete=False,
         suffix="ref-incomplete",
     )
@@ -232,7 +232,7 @@ async def test_post_references_disabled_principal_401(boundary_client, postgres_
     token, _ = await _seed_human_with_token(
         postgres_pool,
         system_role="wet_lab_admin",
-        scopes=["self:profile", "self:tokens", "references:read", "references:write"],
+        scopes=["self:profile", "self:token", "reference:read", "reference:write"],
         disabled=True,
         suffix="ref-disabled",
     )
@@ -248,7 +248,7 @@ async def test_post_references_revoked_token_401(boundary_client, postgres_pool)
     token, _ = await _seed_human_with_token(
         postgres_pool,
         system_role="wet_lab_admin",
-        scopes=["self:profile", "self:tokens", "references:read", "references:write"],
+        scopes=["self:profile", "self:token", "reference:read", "reference:write"],
         revoked=True,
         suffix="ref-revoked",
     )
@@ -264,7 +264,7 @@ async def test_post_references_expired_token_401(boundary_client, postgres_pool)
     token, _ = await _seed_human_with_token(
         postgres_pool,
         system_role="wet_lab_admin",
-        scopes=["self:profile", "self:tokens", "references:read", "references:write"],
+        scopes=["self:profile", "self:token", "reference:read", "reference:write"],
         expires_at=datetime.now(UTC) - timedelta(seconds=1),
         suffix="ref-expired",
     )
@@ -309,11 +309,11 @@ async def test_mint_features_human_403(boundary_client, postgres_pool):
         system_role="system_admin",
         scopes=[
             "self:profile",
-            "self:tokens",
-            "references:read",
-            "references:write",
-            "admin:users",
-            "admin:service_accounts",
+            "self:token",
+            "reference:read",
+            "reference:write",
+            "admin:user",
+            "admin:service_account",
             "admin:audit_read",
         ],
         suffix="mint-human",
@@ -331,7 +331,7 @@ async def test_mint_features_service_missing_scope_403(boundary_client, postgres
     ref_idx = await _seed_active_reference(postgres_pool, "svc-no-scope")
     token, _ = await _seed_service_with_token(
         postgres_pool,
-        scopes=["references:read"],
+        scopes=["reference:read"],
         suffix="mint-svc-no-scope",
     )
     resp = await boundary_client.post(
@@ -354,11 +354,11 @@ async def test_register_files_human_403(boundary_client, postgres_pool):
         system_role="system_admin",
         scopes=[
             "self:profile",
-            "self:tokens",
-            "references:read",
-            "references:write",
-            "admin:users",
-            "admin:service_accounts",
+            "self:token",
+            "reference:read",
+            "reference:write",
+            "admin:user",
+            "admin:service_account",
             "admin:audit_read",
         ],
         suffix="reg-human",
@@ -375,7 +375,7 @@ async def test_register_files_service_missing_scope_403(boundary_client, postgre
     ref_idx = await _seed_active_reference(postgres_pool, "register-no-scope")
     token, _ = await _seed_service_with_token(
         postgres_pool,
-        scopes=["references:read", "features:mint"],
+        scopes=["reference:read", "feature:mint"],
         suffix="reg-no-scope",
     )
     resp = await boundary_client.post(
@@ -405,7 +405,7 @@ async def test_doget_missing_scope_403(boundary_client, postgres_pool):
     token, _ = await _seed_human_with_token(
         postgres_pool,
         system_role="user",
-        scopes=["self:profile", "references:read"],
+        scopes=["self:profile", "reference:read"],
         suffix="doget-no-scope",
     )
     resp = await boundary_client.post(
@@ -429,7 +429,7 @@ async def test_get_me_anonymous_401(boundary_client):
 async def test_get_me_service_403(boundary_client, postgres_pool):
     token, _ = await _seed_service_with_token(
         postgres_pool,
-        scopes=["features:mint"],
+        scopes=["feature:mint"],
         suffix="me-svc",
     )
     resp = await boundary_client.get("/api/v1/users/me", headers=_h(token))
@@ -446,7 +446,7 @@ async def test_patch_me_missing_scope_403(boundary_client, postgres_pool):
     token, _ = await _seed_human_with_token(
         postgres_pool,
         system_role="user",
-        scopes=["references:read"],  # no self:profile
+        scopes=["reference:read"],  # no self:profile
         suffix="patch-no-scope",
     )
     resp = await boundary_client.patch(
@@ -477,7 +477,7 @@ async def test_get_reference_authenticated_returns_200(boundary_client, postgres
     token, _ = await _seed_human_with_token(
         postgres_pool,
         system_role="user",
-        scopes=["references:read"],
+        scopes=["reference:read"],
         suffix="get-auth",
     )
     resp = await boundary_client.get(f"/api/v1/references/{ref_idx}", headers=_h(token))

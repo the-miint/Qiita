@@ -241,11 +241,11 @@ async def human_admin_session(postgres_pool):
         label="session-admin",
         scopes=[
             "self:profile",
-            "self:tokens",
-            "references:read",
-            "references:write",
-            "admin:users",
-            "admin:service_accounts",
+            "self:token",
+            "reference:read",
+            "reference:write",
+            "admin:user",
+            "admin:service_account",
             "admin:audit_read",
         ],
     )
@@ -289,7 +289,7 @@ async def regular_user_session(postgres_pool):
         postgres_pool,
         principal_idx=idx,
         label="session-user",
-        scopes=["self:profile", "self:tokens", "references:read"],
+        scopes=["self:profile", "self:token", "reference:read"],
     )
     return {
         "principal_idx": idx,
@@ -341,10 +341,10 @@ async def compute_worker_service_account(postgres_pool, tmp_path_factory):
         principal_idx=pidx,
         label="orchestrator-fixture",
         scopes=[
-            "features:mint",
-            "references:register_files",
-            "references:read",
-            "tickets:doget",
+            "feature:mint",
+            "reference:register_files",
+            "reference:read",
+            "ticket:doget",
         ],
     )
     token_path = tmp_path_factory.mktemp("orchestrator-token") / "token"

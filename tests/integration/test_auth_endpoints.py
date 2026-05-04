@@ -210,7 +210,7 @@ async def test_auth_whoami_human_returns_profile_and_role_and_scopes(
     assert body["principal_idx"] == pidx
     assert body["email"] == "whoami-human@example.com"
     assert body["system_role"] == "wet_lab_admin"
-    assert "references:write" in body["scopes"]  # wet_lab_admin ceiling
+    assert "reference:write" in body["scopes"]  # wet_lab_admin ceiling
     assert body["profile_complete"] is True
 
 
@@ -231,7 +231,7 @@ async def test_auth_whoami_service_returns_service_summary(auth_client, postgres
         postgres_pool,
         principal_idx=pidx,
         label="whoami-svc",
-        scopes=["features:mint"],
+        scopes=["feature:mint"],
     )
     resp = await auth_client.get(
         "/api/v1/auth/whoami",
@@ -242,7 +242,7 @@ async def test_auth_whoami_service_returns_service_summary(auth_client, postgres
     assert body["kind"] == "service"
     assert body["principal_idx"] == pidx
     assert body["name"] == "whoami-svc-name"
-    assert body["scopes"] == ["features:mint"]
+    assert body["scopes"] == ["feature:mint"]
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +291,7 @@ async def test_post_pat_requires_oidc_jwt_not_pat(
         postgres_pool,
         principal_idx=pidx,
         label="existing",
-        scopes=["self:tokens"],
+        scopes=["self:token"],
     )
     resp = await auth_client.post(
         "/api/v1/auth/pat",
@@ -477,8 +477,8 @@ async def test_post_pat_default_scopes_match_role_ceiling(
     assert resp.status_code == 201
     assert set(resp.json()["scopes"]) == {
         "self:profile",
-        "self:tokens",
-        "references:read",
+        "self:token",
+        "reference:read",
     }
 
 
@@ -505,10 +505,10 @@ async def test_post_pat_system_admin_role_ceiling_includes_lower_role_scopes(
     body = resp.json()
     # Inheriting: system_admin includes lower-tier scopes.
     assert "self:profile" in body["scopes"]
-    assert "self:tokens" in body["scopes"]
-    assert "references:read" in body["scopes"]
-    assert "references:write" in body["scopes"]
-    assert "admin:users" in body["scopes"]
+    assert "self:token" in body["scopes"]
+    assert "reference:read" in body["scopes"]
+    assert "reference:write" in body["scopes"]
+    assert "admin:user" in body["scopes"]
 
 
 async def test_post_pat_rejects_upscoping(auth_client, postgres_pool, jwks_harness):
@@ -526,12 +526,12 @@ async def test_post_pat_rejects_upscoping(auth_client, postgres_pool, jwks_harne
     resp = await auth_client.post(
         "/api/v1/auth/pat",
         headers={"Authorization": f"Bearer {jwt}"},
-        json={"label": "up", "scopes": ["self:profile", "admin:users"]},
+        json={"label": "up", "scopes": ["self:profile", "admin:user"]},
     )
     assert resp.status_code == 422
     body = resp.json()
     assert body["detail"] == "scopes not granted by your role"
-    assert body["rejected_scopes"] == ["admin:users"]
+    assert body["rejected_scopes"] == ["admin:user"]
 
 
 async def test_post_pat_upscoping_error_does_not_leak_role_ceiling(
@@ -553,7 +553,7 @@ async def test_post_pat_upscoping_error_does_not_leak_role_ceiling(
     resp = await auth_client.post(
         "/api/v1/auth/pat",
         headers={"Authorization": f"Bearer {jwt}"},
-        json={"label": "noleak", "scopes": ["admin:users"]},
+        json={"label": "noleak", "scopes": ["admin:user"]},
     )
     assert resp.status_code == 422
     body = resp.json()
@@ -616,7 +616,7 @@ async def test_get_own_tokens_lists_metadata_only(
         postgres_pool,
         principal_idx=pidx,
         label="for-listing",
-        scopes=["self:tokens"],
+        scopes=["self:token"],
     )
 
     resp = await auth_client.get(
@@ -658,13 +658,13 @@ async def test_get_own_tokens_cannot_see_others(
         postgres_pool,
         principal_idx=pa,
         label="A",
-        scopes=["self:tokens"],
+        scopes=["self:token"],
     )
     pb_token, pb_idx = await mint_api_token(
         postgres_pool,
         principal_idx=pb,
         label="B",
-        scopes=["self:tokens"],
+        scopes=["self:token"],
     )
 
     resp = await auth_client.get(
@@ -728,7 +728,7 @@ async def test_delete_own_token_revokes_and_writes_audit_event(
         postgres_pool,
         principal_idx=pidx,
         label="auth-token",
-        scopes=["self:tokens"],
+        scopes=["self:token"],
     )
     _, target_idx = await mint_api_token(
         postgres_pool,
@@ -784,7 +784,7 @@ async def test_delete_others_token_returns_404_not_403(
         postgres_pool,
         principal_idx=pa,
         label="attacker",
-        scopes=["self:tokens"],
+        scopes=["self:token"],
     )
     _, victim_token_idx = await mint_api_token(
         postgres_pool,

@@ -58,11 +58,11 @@ def test_service_account_ceiling_does_not_include_admin_or_self_scopes():
     from qiita_control_plane.auth.scopes import SERVICE_ACCOUNT_SCOPE_CEILING
 
     forbidden = {
-        "admin:users",
-        "admin:service_accounts",
+        "admin:user",
+        "admin:service_account",
         "admin:audit_read",
         "self:profile",
-        "self:tokens",
+        "self:token",
     }
     assert SERVICE_ACCOUNT_SCOPE_CEILING.isdisjoint(forbidden)
 
@@ -97,8 +97,8 @@ def test_reject_scopes_outside_ceiling():
     assert reject_scopes_outside_ceiling(["self:profile"], user_ceiling) == []
     # Superset → rejections include the over-scope.
     rejected = reject_scopes_outside_ceiling(
-        ["self:profile", "admin:users", "references:write"], user_ceiling
+        ["self:profile", "admin:user", "reference:write"], user_ceiling
     )
-    assert set(rejected) == {"admin:users", "references:write"}
+    assert set(rejected) == {"admin:user", "reference:write"}
     # Sorted, so the API can echo them deterministically.
     assert rejected == sorted(rejected)

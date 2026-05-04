@@ -63,7 +63,7 @@ async def create_service_account(
     body: ServiceAccountCreate,
     pool: asyncpg.Pool = Depends(get_db_pool),
     actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
-    _scope: Principal = Depends(require_scope(Scope.ADMIN_SERVICE_ACCOUNTS)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_SERVICE_ACCOUNT)),
 ) -> ServiceAccountCreateResponse | JSONResponse:
     """Create a service-account-kind principal and mint its initial token.
 
@@ -155,7 +155,7 @@ async def set_principal_disabled(
     body: PrincipalDisabledUpdate,
     pool: asyncpg.Pool = Depends(get_db_pool),
     actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
-    _scope: Principal = Depends(require_scope(Scope.ADMIN_USERS)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_USER)),
 ) -> None:
     """Toggle disabled state. `disabled=true` sets the audit columns;
     `disabled=false` clears them (round-trip back to active). The DB CHECK
@@ -225,7 +225,7 @@ async def retire_principal(
     body: PrincipalRetiredUpdate,
     pool: asyncpg.Pool = Depends(get_db_pool),
     actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
-    _scope: Principal = Depends(require_scope(Scope.ADMIN_USERS)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_USER)),
 ) -> None:
     """Retirement is terminal. The DB trigger revokes all the principal's
     active tokens automatically. An admin cannot retire themselves (refuses
@@ -279,7 +279,7 @@ async def set_principal_system_role(
     body: PrincipalSystemRoleUpdate,
     pool: asyncpg.Pool = Depends(get_db_pool),
     actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
-    _scope: Principal = Depends(require_scope(Scope.ADMIN_USERS)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_USER)),
 ) -> None:
     """Set the principal's system_role. The DB enum validates the value;
     Pydantic's SystemRole StrEnum narrows it before we hit the DB."""
@@ -383,7 +383,7 @@ async def revoke_all_principal_tokens(
         " ELSE 'bare' END",
         principal_idx,
     )
-    required_scope = Scope.ADMIN_USERS if kind == "user" else Scope.ADMIN_SERVICE_ACCOUNTS
+    required_scope = Scope.ADMIN_USER if kind == "user" else Scope.ADMIN_SERVICE_ACCOUNT
     if kind == "bare":
         # No subtype row, so no tokens either — but still surface 404 instead
         # of silently succeeding so the caller's intent is verified.

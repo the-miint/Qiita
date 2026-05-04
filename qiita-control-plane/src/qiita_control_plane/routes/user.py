@@ -41,7 +41,7 @@ async def create_user(
     body: UserCreate,
     pool: asyncpg.Pool = Depends(get_db_pool),
     actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
-    _scope: Principal = Depends(require_scope(Scope.ADMIN_USERS)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_USER)),
 ) -> UserResponse:
     """Admin creates a new principal + user row in one transaction.
 

@@ -228,7 +228,7 @@ async def test_resolver_dispatches_qk_prefix_to_token_path(
         postgres_pool,
         principal_idx=pidx,
         label="resolver-test",
-        scopes=["self:profile", "references:read"],
+        scopes=["self:profile", "reference:read"],
     )
     resp = await resolver_client.get(
         "/resolve", headers={"Authorization": f"Bearer {plaintext}"}
@@ -237,7 +237,7 @@ async def test_resolver_dispatches_qk_prefix_to_token_path(
     body = resp.json()
     assert body["kind"] == "human"
     assert body["principal_idx"] == pidx
-    assert sorted(body["scopes"]) == ["references:read", "self:profile"]
+    assert sorted(body["scopes"]) == ["reference:read", "self:profile"]
 
 
 async def test_resolver_token_path_for_service_account(resolver_client, postgres_pool):
@@ -257,7 +257,7 @@ async def test_resolver_token_path_for_service_account(resolver_client, postgres
         postgres_pool,
         principal_idx=pidx,
         label="svc-resolver",
-        scopes=["features:mint"],
+        scopes=["feature:mint"],
     )
     resp = await resolver_client.get(
         "/resolve", headers={"Authorization": f"Bearer {plaintext}"}
@@ -266,7 +266,7 @@ async def test_resolver_token_path_for_service_account(resolver_client, postgres
     body = resp.json()
     assert body["kind"] == "service"
     assert body["principal_idx"] == pidx
-    assert body["scopes"] == ["features:mint"]
+    assert body["scopes"] == ["feature:mint"]
 
 
 async def test_resolver_rejects_revoked_token(resolver_client, postgres_pool):

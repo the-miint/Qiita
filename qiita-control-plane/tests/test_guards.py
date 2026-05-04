@@ -145,15 +145,15 @@ def test_require_role_at_least_returns_403_for_service_account():
 def test_require_scope_pass_when_scope_present():
     from qiita_control_plane.auth.guards import require_scope
 
-    dep = require_scope("references:read")
-    h = _human(scopes=frozenset({"self:profile", "references:read"}))
+    dep = require_scope("reference:read")
+    h = _human(scopes=frozenset({"self:profile", "reference:read"}))
     assert dep(h) is h
 
 
 def test_require_scope_403_when_scope_missing():
     from qiita_control_plane.auth.guards import require_scope
 
-    dep = require_scope("admin:users")
+    dep = require_scope("admin:user")
     with pytest.raises(HTTPException) as exc:
         dep(_human(scopes=frozenset({"self:profile"})))
     assert exc.value.status_code == 403
@@ -172,8 +172,8 @@ def test_require_scope_works_for_service_account_with_matching_scope():
     role constraint is from require_role_at_least, not require_scope."""
     from qiita_control_plane.auth.guards import require_scope
 
-    s = _service(scopes=frozenset({"features:mint"}))
-    dep = require_scope("features:mint")
+    s = _service(scopes=frozenset({"feature:mint"}))
+    dep = require_scope("feature:mint")
     assert dep(s) is s
 
 

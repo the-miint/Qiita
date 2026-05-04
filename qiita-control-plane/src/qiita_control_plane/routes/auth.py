@@ -283,7 +283,7 @@ async def mint_pat(
 
 @router.get("/token")
 async def list_own_tokens(
-    p: Principal = Depends(require_scope(Scope.SELF_TOKENS)),
+    p: Principal = Depends(require_scope(Scope.SELF_TOKEN)),
     pool: asyncpg.Pool = Depends(get_db_pool),
 ) -> list[ApiTokenSummary]:
     """List the caller's own tokens. Metadata only — no plaintext, no hash.
@@ -306,7 +306,7 @@ async def list_own_tokens(
 @router.delete("/token/{token_idx}", status_code=204)
 async def revoke_own_token(
     token_idx: int,
-    p: Principal = Depends(require_scope(Scope.SELF_TOKENS)),
+    p: Principal = Depends(require_scope(Scope.SELF_TOKEN)),
     pool: asyncpg.Pool = Depends(get_db_pool),
 ) -> None:
     """Revoke a token belonging to the caller. 401 if Anonymous, 403 if the

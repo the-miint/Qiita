@@ -53,7 +53,7 @@ def test_record_event_accepts_benign_detail():
         {
             "ip": "10.0.0.1",
             "user_agent": "curl/8.0",
-            "scopes": ["self:profile", "references:read"],
+            "scopes": ["self:profile", "reference:read"],
             "outcome": "updated",
             "from": "old@example.com",
             "to": "new@example.com",
