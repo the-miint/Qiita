@@ -12,9 +12,9 @@ The resolver dispatches by Authorization-header shape:
   - "Bearer <other>"        → 401 malformed
   - missing / non-Bearer    → Anonymous
 
-For OIDC, first-login creates principal + user + user_identities atomically.
+For OIDC, first-login creates principal + user + user_identity atomically.
 Email-collision-with-different-(iss,sub) returns 409 + audit event. Concurrent
-first-logins for the same (iss, sub) race on the user_identities PK; the
+first-logins for the same (iss, sub) race on the user_identity PK; the
 loser catches the unique violation, re-reads, and returns the winner's
 principal_idx.
 
@@ -42,7 +42,7 @@ from .audit import record_event, sha256_hex
 from .db import insert_principal
 from .oidc import InvalidJwt, JwtVerifier
 from .scopes import role_ceiling
-from .tokens import verify_api_token
+from .token import verify_api_token
 
 _ROLE_ORDER = {SystemRole.USER: 0, SystemRole.WET_LAB_ADMIN: 1, SystemRole.SYSTEM_ADMIN: 2}
 
@@ -274,7 +274,7 @@ async def resolve_oidc(pool: asyncpg.Pool, verifier: JwtVerifier, bearer: str) -
     # Look up existing identity link.
     existing = await pool.fetchrow(
         "SELECT ui.principal_idx, p.disabled, p.retired"
-        " FROM qiita.user_identities ui"
+        " FROM qiita.user_identity ui"
         " JOIN qiita.principal p ON p.idx = ui.principal_idx"
         " WHERE ui.issuer = $1 AND ui.subject = $2",
         identity.issuer,
@@ -290,13 +290,13 @@ async def resolve_oidc(pool: asyncpg.Pool, verifier: JwtVerifier, bearer: str) -
 
 
 async def _create_human_from_oidc(pool: asyncpg.Pool, identity) -> Principal:
-    """First-login path: create principal + user + user_identities atomically.
+    """First-login path: create principal + user + user_identity atomically.
 
     Two known race outcomes:
       - Email collision with another user (different (iss, sub), same email):
         409, audit event with sha256 of attempted email.
       - Concurrent first-login for same (iss, sub): one INSERT wins on the
-        user_identities PK, the loser catches the unique violation, re-reads,
+        user_identity PK, the loser catches the unique violation, re-reads,
         returns the winner's principal_idx.
     """
     async with pool.acquire() as conn:
@@ -313,7 +313,7 @@ async def _create_human_from_oidc(pool: asyncpg.Pool, identity) -> Principal:
                     identity.email,
                 )
                 await conn.execute(
-                    "INSERT INTO qiita.user_identities"
+                    "INSERT INTO qiita.user_identity"
                     "  (principal_idx, issuer, subject)"
                     " VALUES ($1, $2, $3)",
                     principal_idx,
@@ -330,17 +330,17 @@ async def _create_human_from_oidc(pool: asyncpg.Pool, identity) -> Principal:
             # Two scenarios produce a UniqueViolationError on this transaction:
             #   a) Concurrent first-login race for the same (iss, sub) — the
             #      first transaction to commit owns the (iss, sub); the loser
-            #      may surface either user_identities_pkey OR user_email_key
+            #      may surface either user_identity_pkey OR user_email_key
             #      depending on which constraint trips first under timing.
             #   b) A true email collision: a different (iss, sub) tries to
             #      land an already-claimed email.
             # Distinguishing on constraint name is fragile under (a) because
             # the same race can trip either constraint. Disambiguate by
-            # re-reading user_identities for our (iss, sub) instead: if it
+            # re-reading user_identity for our (iss, sub) instead: if it
             # exists, the winner created our identity and we return them;
             # if not, this is a real email collision.
             row = await pool.fetchrow(
-                "SELECT principal_idx FROM qiita.user_identities"
+                "SELECT principal_idx FROM qiita.user_identity"
                 " WHERE issuer = $1 AND subject = $2",
                 identity.issuer,
                 identity.subject,

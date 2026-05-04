@@ -37,7 +37,7 @@ from ..auth.scopes import (
     SERVICE_ACCOUNT_SCOPE_CEILING,
     validate_scopes_against_ceiling,
 )
-from ..auth.tokens import mint_api_token
+from ..auth.token import mint_api_token
 from ..deps import get_db_pool
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -54,11 +54,11 @@ def _decode_detail(raw) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# POST /admin/service-accounts
+# POST /admin/service-account
 # ---------------------------------------------------------------------------
 
 
-@router.post("/service-accounts", status_code=201, response_model=ServiceAccountCreateResponse)
+@router.post("/service-account", status_code=201, response_model=ServiceAccountCreateResponse)
 async def create_service_account(
     body: ServiceAccountCreate,
     pool: asyncpg.Pool = Depends(get_db_pool),
@@ -145,11 +145,11 @@ async def create_service_account(
 
 
 # ---------------------------------------------------------------------------
-# PATCH /admin/principals/{idx}/disabled
+# PATCH /admin/principal/{idx}/disabled
 # ---------------------------------------------------------------------------
 
 
-@router.patch("/principals/{principal_idx}/disabled", status_code=204)
+@router.patch("/principal/{principal_idx}/disabled", status_code=204)
 async def set_principal_disabled(
     principal_idx: int,
     body: PrincipalDisabledUpdate,
@@ -215,11 +215,11 @@ async def set_principal_disabled(
 
 
 # ---------------------------------------------------------------------------
-# PATCH /admin/principals/{idx}/retired
+# PATCH /admin/principal/{idx}/retired
 # ---------------------------------------------------------------------------
 
 
-@router.patch("/principals/{principal_idx}/retired", status_code=204)
+@router.patch("/principal/{principal_idx}/retired", status_code=204)
 async def retire_principal(
     principal_idx: int,
     body: PrincipalRetiredUpdate,
@@ -269,11 +269,11 @@ async def retire_principal(
 
 
 # ---------------------------------------------------------------------------
-# PATCH /admin/principals/{idx}/system-role
+# PATCH /admin/principal/{idx}/system-role
 # ---------------------------------------------------------------------------
 
 
-@router.patch("/principals/{principal_idx}/system-role", status_code=204)
+@router.patch("/principal/{principal_idx}/system-role", status_code=204)
 async def set_principal_system_role(
     principal_idx: int,
     body: PrincipalSystemRoleUpdate,
@@ -325,7 +325,7 @@ async def get_audit_log(
     and event_type."""
     sql = (
         "SELECT event_idx, event_type, principal_idx, actor_principal_idx,"
-        " detail, occurred_at FROM qiita.auth_events WHERE 1=1"
+        " detail, occurred_at FROM qiita.auth_event WHERE 1=1"
     )
     params: list = []
     if principal_idx is not None:
@@ -352,11 +352,11 @@ async def get_audit_log(
 
 
 # ---------------------------------------------------------------------------
-# POST /admin/principals/{idx}/revoke-all-tokens
+# POST /admin/principal/{idx}/revoke-all-tokens
 # ---------------------------------------------------------------------------
 
 
-@router.post("/principals/{principal_idx}/revoke-all-tokens")
+@router.post("/principal/{principal_idx}/revoke-all-tokens")
 async def revoke_all_principal_tokens(
     principal_idx: int,
     pool: asyncpg.Pool = Depends(get_db_pool),
@@ -399,7 +399,7 @@ async def revoke_all_principal_tokens(
         )
 
     rows = await pool.fetch(
-        "UPDATE qiita.api_tokens SET revoked_at = now()"
+        "UPDATE qiita.api_token SET revoked_at = now()"
         " WHERE principal_idx = $1 AND revoked_at IS NULL"
         " RETURNING token_idx",
         principal_idx,
@@ -407,7 +407,7 @@ async def revoke_all_principal_tokens(
     revoked_idxs = [r["token_idx"] for r in rows]
 
     already_revoked = await pool.fetchval(
-        "SELECT count(*) FROM qiita.api_tokens"
+        "SELECT count(*) FROM qiita.api_token"
         " WHERE principal_idx = $1 AND revoked_at IS NOT NULL"
         "   AND token_idx <> ALL($2::bigint[])",
         principal_idx,

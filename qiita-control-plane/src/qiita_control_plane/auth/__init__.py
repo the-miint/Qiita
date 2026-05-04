@@ -7,7 +7,7 @@ Token format for opaque API tokens (PATs and service-account tokens):
 Total length 46. The body is `secrets.token_urlsafe(32)` (32 random bytes
 encoded as 43 url-safe base64 chars without padding). Plaintext is shown
 exactly once at mint time and never logged. The DB stores SHA-256(plaintext)
-in qiita.api_tokens.token_hash (BYTEA, 32 bytes, UNIQUE).
+in qiita.api_token.token_hash (BYTEA, 32 bytes, UNIQUE).
 
 `BEARER_PREFIX` is re-exported from `qiita_common.auth_constants` so token
 verification and JWT bearer parsing use the same canonical literal across the

@@ -13,7 +13,7 @@ The flow has two pieces of crypto:
   2. **One-time code** — minted by /auth/handoff in the CLI branch, redeemed
      once by POST /auth/cli-exchange. The plaintext code travels through
      the browser's URL bar to the CLI's loopback server; the SHA-256 hash
-     is what's stored in qiita.cli_login_codes (matching the api_tokens
+     is what's stored in qiita.cli_login_code (matching the api_token
      hash-on-disk convention). Plaintext PAT lives in the same row briefly
      between handoff and exchange.
 
@@ -121,7 +121,7 @@ def verify_login_cookie(
 # ---------------------------------------------------------------------------
 
 
-# 32 bytes of entropy → 43 url-safe base64 chars. Same shape as the api_tokens
+# 32 bytes of entropy → 43 url-safe base64 chars. Same shape as the api_token
 # body; deliberate so monitoring/leak-scanners can apply similar rules.
 _OT_CODE_BYTES = 32
 
@@ -131,7 +131,7 @@ def generate_ot_code() -> tuple[str, bytes]:
 
     Returns `(plaintext, hash)` — plaintext is the url-safe base64 string
     that goes through the browser URL bar to the CLI's loopback; hash is
-    the 32-byte SHA-256 stored in qiita.cli_login_codes.ot_code.
+    the 32-byte SHA-256 stored in qiita.cli_login_code.ot_code.
     """
     plaintext = secrets.token_urlsafe(_OT_CODE_BYTES)
     return plaintext, hash_ot_code(plaintext)

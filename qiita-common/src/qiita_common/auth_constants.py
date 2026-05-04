@@ -53,7 +53,7 @@ class Scope(StrEnum):
 
 
 class AuthEventType(StrEnum):
-    """Closed set of event_type values written to qiita.auth_events.
+    """Closed set of event_type values written to qiita.auth_event.
 
     Mirrors the comment block at `db/migrations/20260426000000_auth.sql:191–193`
     but lists only the values currently emitted from Python. The DB column is

@@ -1,14 +1,14 @@
 """User management routes — operates on the qiita.user subtype.
 
-- POST /users        — admin creates a user (system_admin + admin:users).
-                       In production the OIDC resolver creates users on
-                       first login; this route remains for admins to
-                       onboard PIs imported from external systems.
-- GET /users/me      — humans only, no scope gate (you can always read
-                       your own profile).
-- PATCH /users/me    — humans only + self:profile scope. `email` and
-                       status fields are absent from UserUpdate so
-                       attempts to set them are silently dropped.
+- POST /user        — admin creates a user (system_admin + admin:user).
+                      In production the OIDC resolver creates users on
+                      first login; this route remains for admins to
+                      onboard PIs imported from external systems.
+- GET /user/me      — humans only, no scope gate (you can always read
+                      your own profile).
+- PATCH /user/me    — humans only + self:profile scope. `email` and
+                      status fields are absent from UserUpdate so
+                      attempts to set them are silently dropped.
 """
 
 import asyncpg
@@ -25,7 +25,7 @@ from ..auth.guards import (
 from ..auth.principal import HumanUser, Principal
 from ..deps import get_db_pool
 
-router = APIRouter(prefix="/users", tags=["users"])
+router = APIRouter(prefix="/user", tags=["user"])
 
 
 _USER_RETURNING_COLS = (

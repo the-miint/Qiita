@@ -1,8 +1,8 @@
 """Reference management routes.
 
-Every route is wired to the principal resolver and guards. POST /references
+Every route is wired to the principal resolver and guards. POST /reference
 uses created_by_idx (BIGINT FK to qiita.principal) as the canonical owner
-reference. GET /references/{id} stays anonymous-OK (`get_current_principal`
+reference. GET /reference/{id} stays anonymous-OK (`get_current_principal`
 directly, no guard); other routes pin to scope and kind constraints.
 """
 
@@ -45,7 +45,7 @@ from ..auth.principal import (
 from ..auth.tickets import sign_action, sign_ticket
 from ..deps import get_data_plane_url, get_db_pool, get_hmac_secret
 
-router = APIRouter(prefix="/references", tags=["references"])
+router = APIRouter(prefix="/reference", tags=["reference"])
 
 # Chunk size for batch processing. Array params avoid the Postgres $65535 scalar
 # parameter limit, but large arrays increase memory pressure and transaction
@@ -69,7 +69,7 @@ async def create_reference(
     mint features and register files into existing references."""
     try:
         row = await pool.fetchrow(
-            "INSERT INTO qiita.references"
+            "INSERT INTO qiita.reference"
             "  (name, version, kind, created_by_idx)"
             " VALUES ($1, $2, $3, $4)"
             f" RETURNING {_REFERENCE_RETURNING}",
@@ -98,7 +98,7 @@ async def get_reference(
     created_by_idx; row-level visibility (e.g., hiding private references'
     owner) is not yet implemented."""
     row = await pool.fetchrow(
-        f"SELECT {_REFERENCE_RETURNING} FROM qiita.references WHERE reference_idx = $1",
+        f"SELECT {_REFERENCE_RETURNING} FROM qiita.reference WHERE reference_idx = $1",
         reference_idx,
     )
     if row is None:
@@ -127,7 +127,7 @@ async def update_reference_status(
 
     # Atomic conditional UPDATE — avoids TOCTOU race
     row = await pool.fetchrow(
-        "UPDATE qiita.references SET status = $1"
+        "UPDATE qiita.reference SET status = $1"
         " WHERE reference_idx = $2 AND status = ANY($3::text[])"
         f" RETURNING {_REFERENCE_RETURNING}",
         str(target_status),
@@ -139,7 +139,7 @@ async def update_reference_status(
 
     # Distinguish 404 from 409
     current = await pool.fetchval(
-        "SELECT status FROM qiita.references WHERE reference_idx = $1",
+        "SELECT status FROM qiita.reference WHERE reference_idx = $1",
         reference_idx,
     )
     if current is None:
@@ -150,7 +150,7 @@ async def update_reference_status(
     )
 
 
-@router.post("/{reference_idx}/features/mint")
+@router.post("/{reference_idx}/feature/mint")
 async def mint_features(
     reference_idx: Annotated[int, Field(gt=0)],
     body: FeatureMintRequest,
@@ -161,7 +161,7 @@ async def mint_features(
     # Atomic status transition: hashing -> minting, or verify already minting.
     # Uses UPDATE ... WHERE to avoid TOCTOU race between concurrent callers.
     updated = await pool.fetchval(
-        "UPDATE qiita.references SET status = 'minting'"
+        "UPDATE qiita.reference SET status = 'minting'"
         " WHERE reference_idx = $1 AND status IN ('hashing', 'minting')"
         " RETURNING reference_idx",
         reference_idx,
@@ -169,7 +169,7 @@ async def mint_features(
     if updated is None:
         # Distinguish "not found" from "wrong status"
         ref = await pool.fetchrow(
-            "SELECT status FROM qiita.references WHERE reference_idx = $1",
+            "SELECT status FROM qiita.reference WHERE reference_idx = $1",
             reference_idx,
         )
         if ref is None:
@@ -211,7 +211,7 @@ async def _mint_chunk(
 
     # Find pre-existing
     existing = await conn.fetch(
-        "SELECT feature_idx, sequence_hash FROM qiita.features"
+        "SELECT feature_idx, sequence_hash FROM qiita.feature"
         " WHERE sequence_hash = ANY($1::uuid[])",
         hashes,
     )
@@ -223,7 +223,7 @@ async def _mint_chunk(
     concurrent_reused = 0
     if novel:
         new_rows = await conn.fetch(
-            "INSERT INTO qiita.features (sequence_hash)"
+            "INSERT INTO qiita.feature (sequence_hash)"
             " SELECT unnest($1::uuid[])"
             " ON CONFLICT (sequence_hash) DO NOTHING"
             " RETURNING feature_idx, sequence_hash",
@@ -236,7 +236,7 @@ async def _mint_chunk(
         still_missing = [h for h in novel if h not in new_map]
         if still_missing:
             extra = await conn.fetch(
-                "SELECT feature_idx, sequence_hash FROM qiita.features"
+                "SELECT feature_idx, sequence_hash FROM qiita.feature"
                 " WHERE sequence_hash = ANY($1::uuid[])",
                 still_missing,
             )
@@ -280,7 +280,7 @@ async def _write_genome_associations(
 
     # Batch upsert genomes — DO UPDATE to guarantee RETURNING for every row
     genome_rows = await conn.fetch(
-        "INSERT INTO qiita.genomes (source, source_id)"
+        "INSERT INTO qiita.genome (source, source_id)"
         " SELECT unnest($1::text[]), unnest($2::text[])"
         " ON CONFLICT (source, source_id) DO UPDATE SET source = EXCLUDED.source"
         " RETURNING genome_idx, source, source_id",
@@ -314,7 +314,7 @@ _DOGET_ALLOWED_TABLES = frozenset(
 )
 
 
-@router.post("/{reference_idx}/tickets/doget", status_code=201)
+@router.post("/{reference_idx}/ticket/doget", status_code=201)
 async def create_doget_ticket(
     reference_idx: Annotated[int, Field(gt=0)],
     body: DoGetTicketRequest,
@@ -341,7 +341,7 @@ async def create_doget_ticket(
 
     # Reference must be active
     status = await pool.fetchval(
-        "SELECT status FROM qiita.references WHERE reference_idx = $1",
+        "SELECT status FROM qiita.reference WHERE reference_idx = $1",
         reference_idx,
     )
     if status is None:
@@ -376,7 +376,7 @@ async def register_files(
     must be in 'loading' status.
     """
     status = await pool.fetchval(
-        "SELECT status FROM qiita.references WHERE reference_idx = $1",
+        "SELECT status FROM qiita.reference WHERE reference_idx = $1",
         reference_idx,
     )
     if status is None:

@@ -113,7 +113,7 @@ def require_human_with_role(role: str) -> Callable[..., HumanUser]:
     alone returns `Principal` because it accepts service accounts at the
     type level (they always 403 at runtime). For routes that need both
     role authority AND human context (most admin endpoints + admin-side
-    POST /users), this is the cleaner combinator.
+    POST /user), this is the cleaner combinator.
     """
     role_str = str(role)
 
