@@ -67,6 +67,14 @@ cd tests/integration && uv sync \
 
 **Fail fast, fail early, fail loudly.** Validate inputs at every boundary. Return structured errors with enough context to diagnose without a debugger. Prefer raising/panicking over silently returning defaults for unexpected states. Silent failures are bugs.
 
+## Naming conventions
+
+**DB tables, REST resource segments, scope strings, OpenAPI tags, and the source files that own them are always singular**, never plural — `reference` not `references`, `auth_event` not `auth_events`, `/user` not `/users`, `reference:read` not `references:read`, `routes/reference.py` not `routes/references.py`, `tests/test_user.py` not `tests/test_users.py`. This applies to junction tables (`user_identity`, not `user_identities`); use `_to_` for many-to-many junctions when both sides need to be named (e.g. `biosample_to_study`). Column names follow the same rule unless the column genuinely holds a list/array.
+
+**Carve-outs:** verb / action path segments stay plural where natural (`/admin/principal/{idx}/revoke-all-tokens` — `revoke-all-tokens` is a verb, not a resource). On-disk directory names (`/data/references/`, `references/staging/`) are not REST resources and are not constrained by this rule. `/user/me` reads awkwardly but is the correct form — the alternative is a permanent carve-out for `/me`-suffixed paths.
+
+Fixed in #11 after the initial schema mixed both forms.
+
 ## Architecture
 
 See `docs/architecture.md` for the full system diagram, `docs/reference-data-staging.md` for how reference databases are ingested, and `docs/auth.md` for the authentication / authorization surface (principal subtypes, OIDC + opaque-token paths, role/scope ceilings, admin endpoints, and the `qiita-admin` CLI). Operational runbooks for the auth surface live under `docs/runbooks/`. What follows is the non-obvious cross-cutting structure.
