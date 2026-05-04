@@ -3,9 +3,10 @@ synthesising the dep input directly (no FastAPI request needed)."""
 
 import pytest
 from fastapi import HTTPException
+from qiita_common.auth_constants import Scope, SystemRole
 
 
-def _human(*, role="user", scopes=frozenset(), profile_complete=True):
+def _human(*, role=SystemRole.USER, scopes=frozenset(), profile_complete=True):
     from qiita_control_plane.auth.principal import HumanUser
 
     return HumanUser(
@@ -96,15 +97,15 @@ def test_require_service_403_on_human():
 @pytest.mark.parametrize(
     "user_role,required,should_pass",
     [
-        ("user", "user", True),
-        ("user", "wet_lab_admin", False),
-        ("user", "system_admin", False),
-        ("wet_lab_admin", "user", True),
-        ("wet_lab_admin", "wet_lab_admin", True),
-        ("wet_lab_admin", "system_admin", False),
-        ("system_admin", "user", True),
-        ("system_admin", "wet_lab_admin", True),
-        ("system_admin", "system_admin", True),
+        (SystemRole.USER, SystemRole.USER, True),
+        (SystemRole.USER, SystemRole.WET_LAB_ADMIN, False),
+        (SystemRole.USER, SystemRole.SYSTEM_ADMIN, False),
+        (SystemRole.WET_LAB_ADMIN, SystemRole.USER, True),
+        (SystemRole.WET_LAB_ADMIN, SystemRole.WET_LAB_ADMIN, True),
+        (SystemRole.WET_LAB_ADMIN, SystemRole.SYSTEM_ADMIN, False),
+        (SystemRole.SYSTEM_ADMIN, SystemRole.USER, True),
+        (SystemRole.SYSTEM_ADMIN, SystemRole.WET_LAB_ADMIN, True),
+        (SystemRole.SYSTEM_ADMIN, SystemRole.SYSTEM_ADMIN, True),
     ],
 )
 def test_require_role_at_least_matrix(user_role, required, should_pass):
@@ -123,7 +124,7 @@ def test_require_role_at_least_401_on_anonymous():
     from qiita_control_plane.auth.guards import require_role_at_least
 
     with pytest.raises(HTTPException) as exc:
-        require_role_at_least("user")(_anon())
+        require_role_at_least(SystemRole.USER)(_anon())
     assert exc.value.status_code == 401
 
 
@@ -133,7 +134,7 @@ def test_require_role_at_least_returns_403_for_service_account():
     from qiita_control_plane.auth.guards import require_role_at_least
 
     with pytest.raises(HTTPException) as exc:
-        require_role_at_least("user")(_service())
+        require_role_at_least(SystemRole.USER)(_service())
     assert exc.value.status_code == 403
 
 
@@ -145,17 +146,17 @@ def test_require_role_at_least_returns_403_for_service_account():
 def test_require_scope_pass_when_scope_present():
     from qiita_control_plane.auth.guards import require_scope
 
-    dep = require_scope("reference:read")
-    h = _human(scopes=frozenset({"self:profile", "reference:read"}))
+    dep = require_scope(Scope.REFERENCE_READ)
+    h = _human(scopes=frozenset({Scope.SELF_PROFILE, Scope.REFERENCE_READ}))
     assert dep(h) is h
 
 
 def test_require_scope_403_when_scope_missing():
     from qiita_control_plane.auth.guards import require_scope
 
-    dep = require_scope("admin:user")
+    dep = require_scope(Scope.ADMIN_USER)
     with pytest.raises(HTTPException) as exc:
-        dep(_human(scopes=frozenset({"self:profile"})))
+        dep(_human(scopes=frozenset({Scope.SELF_PROFILE})))
     assert exc.value.status_code == 403
 
 
@@ -163,7 +164,7 @@ def test_require_scope_401_on_anonymous():
     from qiita_control_plane.auth.guards import require_scope
 
     with pytest.raises(HTTPException) as exc:
-        require_scope("self:profile")(_anon())
+        require_scope(Scope.SELF_PROFILE)(_anon())
     assert exc.value.status_code == 401
 
 
@@ -172,8 +173,8 @@ def test_require_scope_works_for_service_account_with_matching_scope():
     role constraint is from require_role_at_least, not require_scope."""
     from qiita_control_plane.auth.guards import require_scope
 
-    s = _service(scopes=frozenset({"feature:mint"}))
-    dep = require_scope("feature:mint")
+    s = _service(scopes=frozenset({Scope.FEATURE_MINT}))
+    dep = require_scope(Scope.FEATURE_MINT)
     assert dep(s) is s
 
 
@@ -189,17 +190,17 @@ def test_require_scope_works_for_service_account_with_matching_scope():
 def test_require_human_with_role_returns_human_user_with_sufficient_role():
     from qiita_control_plane.auth.guards import require_human_with_role
 
-    dep = require_human_with_role("user")
-    h = _human(role="system_admin")
+    dep = require_human_with_role(SystemRole.USER)
+    h = _human(role=SystemRole.SYSTEM_ADMIN)
     assert dep(h) is h
 
 
 def test_require_human_with_role_403_on_insufficient_role():
     from qiita_control_plane.auth.guards import require_human_with_role
 
-    dep = require_human_with_role("system_admin")
+    dep = require_human_with_role(SystemRole.SYSTEM_ADMIN)
     with pytest.raises(HTTPException) as exc:
-        dep(_human(role="wet_lab_admin"))
+        dep(_human(role=SystemRole.WET_LAB_ADMIN))
     assert exc.value.status_code == 403
 
 

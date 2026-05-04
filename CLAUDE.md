@@ -15,10 +15,11 @@ make dev-setup
 make build
 
 # Test
-make test                  # unit tests (all components)
-make test-integration      # requires Docker (or use a host postgres, which is what CI does on macOS — see docs/runbooks/integration-tests-host-postgres.md); runs Python + Rust integration suites against postgres on :5433 in Docker mode (default) or :5432 in host mode; excludes -m system
-make test-system           # real GG2 backbone data; slow (~10 min); needs localdocs/scratch/
-make test-workflows        # requires apptainer (Linux-only — macOS skips gracefully); CI runs this on ubuntu only
+make test                          # pure-unit tests (all components, no infrastructure required)
+make test-control-plane-with-db    # full control-plane suite incl. DB-bound (-m db) tests; brings up Postgres + applies dbmate migrations
+make test-integration              # cross-component tests; requires Docker (or QIITA_USE_HOST_POSTGRES=1 with libpq env vars to use a host postgres — what CI does on macOS, see docs/runbooks/integration-tests-host-postgres.md); runs Python + Rust integration suites against postgres on :5433; excludes -m system
+make test-system                   # real GG2 backbone data; slow (~10 min); needs localdocs/scratch/
+make test-workflows                # requires apptainer (Linux-only — macOS skips gracefully); CI runs this on ubuntu only
 
 # Lint
 make lint
@@ -152,9 +153,17 @@ This is the contract layer between the two Python services. Pydantic models for 
 
 Both `uv.lock` (Python) and `Cargo.lock` (Rust) are committed. Do not add them to `.gitignore`.
 
-### Integration tests
+### Test layout and tiers
 
-Use port `5433` (not `5432`) for the test Postgres container to avoid collision with the system Postgres instance. The `make test-integration` target manages its own `docker compose up/down` — do not add a separate postgres service to the CI job for this.
+The test suite is split into three tiers by the infrastructure each one needs:
+
+- **Pure-unit** (no infrastructure): `make test` invokes `make test-python` which runs `test-control-plane-without-db` (control-plane tests not carrying the `db` marker), `test-common`, and `test-compute-orchestrator`. No Docker, no Postgres.
+- **Control-plane with DB**: `make test-control-plane-with-db` brings up Postgres on :5433 (or uses host Postgres via `QIITA_USE_HOST_POSTGRES=1`), applies dbmate migrations, and runs the full control-plane suite — including `tests/auth/test_resolver.py`, `tests/auth/test_api_token_db.py`, and the route tests under `tests/routes/`. These files carry the `db` marker via `pytestmark = pytest.mark.db` at module level (applies to every test in the file).
+- **Cross-component integration**: `make test-integration` brings up the same Postgres and additionally builds and spawns the data plane debug binary, runs the Python integration suite under `tests/integration/`, then resets the `qiita_ducklake` catalog and runs the Rust DuckLake tests.
+
+**Shared fixture surface**: postgres / sessions / OIDC-JWKS fixtures live in `qiita-control-plane/src/qiita_control_plane/testing/` and are imported into both `qiita-control-plane/tests/conftest.py` and `tests/integration/conftest.py` so they cannot drift. Both suites consume the same `postgres_pool`, `human_admin_session`, `regular_user_session`, `compute_worker_service_account`, `jwks_harness`. The `fasta_file` fixture is integration-only — it lives in `tests/integration/conftest.py` because no control-plane test consumes it.
+
+**Postgres harness location**: `docker-compose.yml` and `initdb/` live under `qiita-control-plane/tests/_postgres/` and are used by both `test-control-plane-with-db` and `test-integration`. Port `5433` (not `5432`) avoids collision with a system Postgres.
 
 **DuckLake catalog reset between phases**: `make test-integration` runs the Python suite, then drops and recreates the `qiita_ducklake` Postgres database, then runs the Rust suite. This is required because DuckLake pins `DATA_PATH` into the catalog at creation time, and the two suites use different `DATA_PATH` values (Python picks a pytest `tmp_path_factory` dir; Rust defaults to `/tmp/qiita-integration-ducklake-data`). Reusing the catalog across phases causes confusing "path mismatch" failures. The Python-side analogue is `_reset_ducklake_catalog()` in `tests/integration/conftest.py`; keep the two mechanisms in sync.
 

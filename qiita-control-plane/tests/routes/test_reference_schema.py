@@ -3,6 +3,8 @@
 import asyncpg
 import pytest
 
+pytestmark = pytest.mark.db
+
 EXPECTED_TABLES = [
     "reference",
     "genome",
@@ -140,9 +142,7 @@ async def test_feature_rejects_duplicate_hash(postgres_pool):
     try:
         tr = conn.transaction()
         await tr.start()
-        await conn.execute(
-            "INSERT INTO qiita.feature (sequence_hash) VALUES ($1::uuid)", test_hash
-        )
+        await conn.execute("INSERT INTO qiita.feature (sequence_hash) VALUES ($1::uuid)", test_hash)
         with pytest.raises(asyncpg.UniqueViolationError):
             await conn.execute(
                 "INSERT INTO qiita.feature (sequence_hash) VALUES ($1::uuid)",
@@ -157,8 +157,7 @@ async def test_reference_membership_fk_enforcement(postgres_pool):
     """reference_membership must reject non-existent reference_idx."""
     with pytest.raises(asyncpg.ForeignKeyViolationError):
         await postgres_pool.execute(
-            "INSERT INTO qiita.reference_membership (reference_idx, feature_idx)"
-            " VALUES ($1, $2)",
+            "INSERT INTO qiita.reference_membership (reference_idx, feature_idx) VALUES ($1, $2)",
             999999,
             999999,
         )
@@ -178,13 +177,11 @@ async def test_reference_membership_rejects_duplicate(postgres_pool):
             "sequence_reference",
         )
         feat_idx = await conn.fetchval(
-            "INSERT INTO qiita.feature (sequence_hash)"
-            " VALUES ($1::uuid) RETURNING feature_idx",
+            "INSERT INTO qiita.feature (sequence_hash) VALUES ($1::uuid) RETURNING feature_idx",
             "b0000000-0000-0000-0000-000000000001",
         )
         await conn.execute(
-            "INSERT INTO qiita.reference_membership (reference_idx, feature_idx)"
-            " VALUES ($1, $2)",
+            "INSERT INTO qiita.reference_membership (reference_idx, feature_idx) VALUES ($1, $2)",
             ref_idx,
             feat_idx,
         )
@@ -207,15 +204,13 @@ async def test_feature_genome_fk_on_feature(postgres_pool):
         tr = conn.transaction()
         await tr.start()
         genome_idx = await conn.fetchval(
-            "INSERT INTO qiita.genome (source, source_id)"
-            " VALUES ($1, $2) RETURNING genome_idx",
+            "INSERT INTO qiita.genome (source, source_id) VALUES ($1, $2) RETURNING genome_idx",
             "genbank",
             "GCF_fk_test_feat",
         )
         with pytest.raises(asyncpg.ForeignKeyViolationError):
             await conn.execute(
-                "INSERT INTO qiita.feature_genome (feature_idx, genome_idx)"
-                " VALUES ($1, $2)",
+                "INSERT INTO qiita.feature_genome (feature_idx, genome_idx) VALUES ($1, $2)",
                 999999,
                 genome_idx,
             )
@@ -231,14 +226,12 @@ async def test_feature_genome_fk_on_genome(postgres_pool):
         tr = conn.transaction()
         await tr.start()
         feat_idx = await conn.fetchval(
-            "INSERT INTO qiita.feature (sequence_hash)"
-            " VALUES ($1::uuid) RETURNING feature_idx",
+            "INSERT INTO qiita.feature (sequence_hash) VALUES ($1::uuid) RETURNING feature_idx",
             "c0000000-0000-0000-0000-000000000001",
         )
         with pytest.raises(asyncpg.ForeignKeyViolationError):
             await conn.execute(
-                "INSERT INTO qiita.feature_genome (feature_idx, genome_idx)"
-                " VALUES ($1, $2)",
+                "INSERT INTO qiita.feature_genome (feature_idx, genome_idx) VALUES ($1, $2)",
                 feat_idx,
                 999999,
             )
@@ -254,19 +247,16 @@ async def test_feature_genome_unique_feature(postgres_pool):
         tr = conn.transaction()
         await tr.start()
         feat_idx = await conn.fetchval(
-            "INSERT INTO qiita.feature (sequence_hash)"
-            " VALUES ($1::uuid) RETURNING feature_idx",
+            "INSERT INTO qiita.feature (sequence_hash) VALUES ($1::uuid) RETURNING feature_idx",
             "d0000000-0000-0000-0000-000000000001",
         )
         g1 = await conn.fetchval(
-            "INSERT INTO qiita.genome (source, source_id)"
-            " VALUES ($1, $2) RETURNING genome_idx",
+            "INSERT INTO qiita.genome (source, source_id) VALUES ($1, $2) RETURNING genome_idx",
             "genbank",
             "GCF_unique_test_1",
         )
         g2 = await conn.fetchval(
-            "INSERT INTO qiita.genome (source, source_id)"
-            " VALUES ($1, $2) RETURNING genome_idx",
+            "INSERT INTO qiita.genome (source, source_id) VALUES ($1, $2) RETURNING genome_idx",
             "genbank",
             "GCF_unique_test_2",
         )

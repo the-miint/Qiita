@@ -1,6 +1,6 @@
 .PHONY: build test test-python test-rust test-integration test-workflows lint lint-python lint-rust deploy migrate clean verify-health dev-setup install-hooks
 .PHONY: build-common build-control-plane build-data-plane build-data-plane-debug build-compute-orchestrator build-workflows
-.PHONY: test-common test-control-plane test-data-plane test-compute-orchestrator
+.PHONY: test-common test-control-plane-without-db test-control-plane-with-db test-data-plane test-compute-orchestrator
 .PHONY: lint-common lint-control-plane lint-data-plane lint-compute-orchestrator
 
 UNAME_S := $(shell uname -s)
@@ -61,18 +61,48 @@ build-workflows:
 		fi \
 	done
 
-# Run unit tests
+# Postgres bring-up / tear-down macros (shared by test-control-plane-with-db
+# and test-integration). On macOS CI, set QIITA_USE_HOST_POSTGRES=1 to use a
+# host-provisioned Postgres instead of Docker (Docker is not available on
+# macos-latest).
+ifeq ($(QIITA_USE_HOST_POSTGRES),1)
+PG_BRINGUP  := true
+PG_TEARDOWN := true
+# Host mode reads PGHOST/PGPORT/PGUSER/PGPASSWORD from the environment.
+PG_PSQL     := psql
+else
+PG_BRINGUP  := docker compose up -d --wait
+PG_TEARDOWN := docker compose down
+PG_PSQL     := docker compose exec -T postgres psql -U qiita
+endif
+
+PG_COMPOSE_DIR := qiita-control-plane/tests/_postgres
+
+# Run unit tests (no infrastructure required)
 test: test-python test-rust
 
-test-python: test-common test-control-plane test-compute-orchestrator
+test-python: test-common test-control-plane-without-db test-compute-orchestrator
 
 test-rust: test-data-plane
 
 test-common:
 	cd qiita-common && uv run pytest
 
-test-control-plane:
-	cd qiita-control-plane && uv run pytest
+# Run only the control-plane tests that do not need a database. The DB-bound
+# tests carry the `db` marker (set at module level via
+# `pytestmark = pytest.mark.db`) and are excluded here; run them via
+# `make test-control-plane-with-db`.
+test-control-plane-without-db:
+	cd qiita-control-plane && uv run pytest -m 'not db'
+
+# Run the full control-plane suite, including DB-bound tests. Brings up
+# Postgres + applies dbmate migrations; tears down on exit. Set
+# QIITA_USE_HOST_POSTGRES=1 to skip Docker bring-up and use a host Postgres.
+test-control-plane-with-db: $(DBMATE_BIN)
+	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
+	  ((cd qiita-control-plane && uv run pytest); PY_EC=$$?; \
+	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
+	   exit $$PY_EC)
 
 test-data-plane:
 	cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test
@@ -103,35 +133,24 @@ test-workflows:
 # use different DATA_PATH values (Python picks a pytest tmp_path_factory dir,
 # Rust defaults to /tmp/qiita-integration-ducklake-data). Mirrors the Python
 # _reset_ducklake_catalog() helper in tests/integration/conftest.py.
-ifeq ($(QIITA_USE_HOST_POSTGRES),1)
-PG_BRINGUP  := true
-PG_TEARDOWN := true
-# Host mode reads PGHOST/PGPORT/PGUSER/PGPASSWORD from the environment.
-PG_PSQL     := psql
-else
-PG_BRINGUP  := docker compose up -d --wait
-PG_TEARDOWN := docker compose down
-PG_PSQL     := docker compose exec -T postgres psql -U qiita
-endif
-
 test-integration: build-data-plane-debug $(DBMATE_BIN)
-	cd tests/integration && $(PG_BRINGUP) && \
-	  (uv run pytest -m 'not system'; PY_EC=$$?; \
-	   $(PG_PSQL) -d postgres \
+	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
+	  ((cd tests/integration && uv run pytest -m 'not system'); PY_EC=$$?; \
+	   (cd $(PG_COMPOSE_DIR) && $(PG_PSQL) -d postgres \
 	     -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'qiita_ducklake' AND pid != pg_backend_pid()" \
 	     -c "DROP DATABASE IF EXISTS qiita_ducklake" \
-	     -c "CREATE DATABASE qiita_ducklake OWNER qiita"; \
-	   cd ../../qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test --features integration; RS_EC=$$?; \
-	   cd ../tests/integration && $(PG_TEARDOWN); \
+	     -c "CREATE DATABASE qiita_ducklake OWNER qiita"); \
+	   (cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test --features integration); RS_EC=$$?; \
+	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
 	   exit $$(( PY_EC > RS_EC ? PY_EC : RS_EC )))
 
 # Run system tests with real GG2 backbone data (requires Docker + data in localdocs/scratch/,
 # or QIITA_USE_HOST_POSTGRES=1 with a host-provisioned Postgres).
 # Slow (~10 min): hashes 331K sequences, mints features, writes chunked Parquet.
 test-system: build-data-plane-debug
-	cd tests/integration && $(PG_BRINGUP) && \
-	  (uv run pytest -m system -x --timeout=2700; PY_EC=$$?; \
-	   $(PG_TEARDOWN); \
+	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
+	  ((cd tests/integration && uv run pytest -m system -x --timeout=2700); PY_EC=$$?; \
+	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
 	   exit $$PY_EC)
 
 # Lint all components

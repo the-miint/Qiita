@@ -9,6 +9,9 @@ from datetime import UTC, datetime, timedelta
 
 import asyncpg
 import pytest
+from qiita_common.auth_constants import Scope, SystemRole
+
+pytestmark = pytest.mark.db
 
 
 # ---------------------------------------------------------------------------
@@ -22,13 +25,12 @@ async def principal_idx(postgres_pool):
     idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.principal"
         "  (display_name, system_role, created_by_idx)"
-        " VALUES ('token-test', 'user', 1) RETURNING idx"
+        " VALUES ('token-test', $1, 1) RETURNING idx",
+        SystemRole.USER,
     )
     yield idx
     # Tokens FK to principal; delete tokens before principal.
-    await postgres_pool.execute(
-        "DELETE FROM qiita.api_token WHERE principal_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.api_token WHERE principal_idx = $1", idx)
     await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", idx)
 
 
@@ -44,7 +46,7 @@ async def test_mint_returns_plaintext_and_token_idx(postgres_pool, principal_idx
         postgres_pool,
         principal_idx=principal_idx,
         label="test-token",
-        scopes=["reference:read"],
+        scopes=[Scope.REFERENCE_READ],
     )
     assert plaintext.startswith("qk_")
     assert len(plaintext) == 46
@@ -59,7 +61,7 @@ async def test_mint_validates_scopes_against_valid_set(postgres_pool, principal_
             postgres_pool,
             principal_idx=principal_idx,
             label="bad-scope",
-            scopes=["reference:read", "this:does:not:exist"],
+            scopes=[Scope.REFERENCE_READ, "this:does:not:exist"],
         )
 
 
@@ -71,7 +73,7 @@ async def test_mint_persists_to_db(postgres_pool, principal_idx):
         postgres_pool,
         principal_idx=principal_idx,
         label="persist-check",
-        scopes=["reference:read", "self:profile"],
+        scopes=[Scope.REFERENCE_READ, Scope.SELF_PROFILE],
     )
     row = await postgres_pool.fetchrow(
         "SELECT principal_idx, label, scopes, revoked_at, expires_at"
@@ -80,7 +82,7 @@ async def test_mint_persists_to_db(postgres_pool, principal_idx):
     )
     assert row["principal_idx"] == principal_idx
     assert row["label"] == "persist-check"
-    assert set(row["scopes"]) == {"reference:read", "self:profile"}
+    assert set(row["scopes"]) == {Scope.REFERENCE_READ, Scope.SELF_PROFILE}
     assert row["revoked_at"] is None
 
 
@@ -120,9 +122,7 @@ async def test_mint_raises_on_hash_collision(postgres_pool, principal_idx, monke
         fixed_hash,
     )
 
-    monkeypatch.setattr(
-        tokens, "_generate_token", lambda: (fixed_plaintext, fixed_hash)
-    )
+    monkeypatch.setattr(tokens, "_generate_token", lambda: (fixed_plaintext, fixed_hash))
     with pytest.raises(RuntimeError, match="collision"):
         await tokens.mint_api_token(
             postgres_pool,
@@ -144,13 +144,13 @@ async def test_verify_valid_token_returns_principal_idx(postgres_pool, principal
         postgres_pool,
         principal_idx=principal_idx,
         label="verify-success",
-        scopes=["reference:read", "self:profile"],
+        scopes=[Scope.REFERENCE_READ, Scope.SELF_PROFILE],
     )
     verified = await verify_api_token(postgres_pool, plaintext)
     assert verified is not None
     assert verified.principal_idx == principal_idx
     assert verified.token_idx == token_idx
-    assert verified.scopes == frozenset({"reference:read", "self:profile"})
+    assert verified.scopes == frozenset({Scope.REFERENCE_READ, Scope.SELF_PROFILE})
 
 
 async def test_verify_rejects_unknown_token(postgres_pool):
@@ -189,9 +189,7 @@ async def test_verify_rejects_expired_token(postgres_pool, principal_idx):
     assert await verify_api_token(postgres_pool, plaintext) is None
 
 
-async def test_verify_rejects_token_for_disabled_principal(
-    postgres_pool, principal_idx
-):
+async def test_verify_rejects_token_for_disabled_principal(postgres_pool, principal_idx):
     from qiita_control_plane.auth.token import mint_api_token, verify_api_token
 
     plaintext, _ = await mint_api_token(
@@ -275,9 +273,7 @@ async def test_record_token_use_advances_last_used_at(postgres_pool, principal_i
     assert after is not None
 
 
-async def test_record_token_use_coalesces_within_one_minute(
-    postgres_pool, principal_idx
-):
+async def test_record_token_use_coalesces_within_one_minute(postgres_pool, principal_idx):
     """Two consecutive calls within 60s should advance last_used_at only once."""
     from qiita_control_plane.auth.token import mint_api_token, record_token_use
 
@@ -312,9 +308,7 @@ async def test_record_token_use_swallows_db_error(monkeypatch, principal_idx):
     await record_token_use(_BoomPool(), token_idx=1)
 
 
-async def test_verify_does_not_block_on_last_used_at(
-    postgres_pool, principal_idx, monkeypatch
-):
+async def test_verify_does_not_block_on_last_used_at(postgres_pool, principal_idx, monkeypatch):
     """If record_token_use raises, verify still returns success."""
     from qiita_control_plane.auth import token as tokens
 

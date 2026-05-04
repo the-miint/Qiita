@@ -9,6 +9,9 @@ applied and the assertions reflect the final state.
 
 import asyncpg
 import pytest
+from qiita_common.auth_constants import SystemRole
+
+pytestmark = pytest.mark.db
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +89,8 @@ async def test_insert_with_explicit_principal_idx(postgres_pool):
             pidx = await conn.fetchval(
                 "INSERT INTO qiita.principal"
                 "  (display_name, system_role, created_by_idx)"
-                " VALUES ('h_c-creator', 'user', 1) RETURNING idx"
+                " VALUES ('h_c-creator', $1, 1) RETURNING idx",
+                SystemRole.USER,
             )
             row = await conn.fetchrow(
                 "INSERT INTO qiita.reference"
@@ -150,9 +154,7 @@ def test_get_current_user_no_longer_importable():
     import importlib
 
     deps = importlib.import_module("qiita_control_plane.deps")
-    assert not hasattr(deps, "get_current_user"), (
-        "get_current_user should be removed from deps.py"
-    )
+    assert not hasattr(deps, "get_current_user"), "get_current_user should be removed from deps.py"
     assert not hasattr(deps, "get_current_principal_idx"), (
         "get_current_principal_idx should be removed from deps.py"
     )

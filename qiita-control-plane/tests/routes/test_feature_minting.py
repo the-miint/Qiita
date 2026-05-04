@@ -6,6 +6,8 @@ import uuid
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+pytestmark = pytest.mark.db
+
 _TEST_SALT = uuid.uuid4().hex  # unique per test session to avoid cross-run collisions
 
 
@@ -33,7 +35,7 @@ async def client(postgres_pool, human_admin_session):
 @pytest.fixture
 def worker_headers(compute_worker_service_account):
     """Authorization header for the compute worker service account — required
-    by service-only routes (POST /references/{id}/feature/mint)."""
+    by service-only routes (POST /reference/{id}/feature/mint)."""
     return {"Authorization": f"Bearer {compute_worker_service_account['token']}"}
 
 
@@ -62,9 +64,7 @@ async def reference_idx(client, postgres_pool):
     await postgres_pool.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
 
 
 async def test_mint_five_new_features(client, reference_idx, worker_headers):
@@ -134,9 +134,7 @@ async def test_mint_mixed_new_and_existing(client, reference_idx, worker_headers
     assert len(body["mapping"]) == 5
 
 
-async def test_mint_with_genome_association(
-    client, reference_idx, postgres_pool, worker_headers
-):
+async def test_mint_with_genome_association(client, reference_idx, postgres_pool, worker_headers):
     """Entries with genome_source/genome_source_id should create genome + junction rows."""
     source_id = f"GCF_ASSOC_{uuid.uuid4().hex[:8]}"
     h = _md5_uuid("GENOME_SEQ")
@@ -170,9 +168,7 @@ async def test_mint_with_genome_association(
     assert junction["genome_idx"] == genome["genome_idx"]
 
 
-async def test_mint_reuses_existing_genome(
-    client, reference_idx, postgres_pool, worker_headers
-):
+async def test_mint_reuses_existing_genome(client, reference_idx, postgres_pool, worker_headers):
     """If a genome already exists (same source+source_id), reuse it."""
     source_id = f"GCF_REUSE_{uuid.uuid4().hex[:8]}"
     genome_idx = await postgres_pool.fetchval(
@@ -225,9 +221,7 @@ async def test_mint_rejects_wrong_status(client, postgres_pool, worker_headers):
     )
     assert mint_resp.status_code == 409
 
-    await postgres_pool.execute(
-        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
 
 
 async def test_mint_rejects_empty_batch(client, reference_idx, worker_headers):
@@ -240,9 +234,7 @@ async def test_mint_rejects_empty_batch(client, reference_idx, worker_headers):
     assert resp.status_code == 422
 
 
-async def test_mint_rejects_duplicate_hashes_in_request(
-    client, reference_idx, worker_headers
-):
+async def test_mint_rejects_duplicate_hashes_in_request(client, reference_idx, worker_headers):
     """Submitting duplicate sequence_hash values in one request should return 422."""
     h = _md5_uuid("DUP_IN_REQ")
     resp = await client.post(
@@ -253,25 +245,17 @@ async def test_mint_rejects_duplicate_hashes_in_request(
     assert resp.status_code == 422
 
 
-async def test_mint_rejects_genome_source_without_id(
-    client, reference_idx, worker_headers
-):
+async def test_mint_rejects_genome_source_without_id(client, reference_idx, worker_headers):
     """genome_source set without genome_source_id should return 422."""
     resp = await client.post(
         f"/api/v1/reference/{reference_idx}/feature/mint",
-        json={
-            "entries": [
-                {"sequence_hash": _md5_uuid("GS_NO_ID"), "genome_source": "genbank"}
-            ]
-        },
+        json={"entries": [{"sequence_hash": _md5_uuid("GS_NO_ID"), "genome_source": "genbank"}]},
         headers=worker_headers,
     )
     assert resp.status_code == 422
 
 
-async def test_mint_rejects_genome_id_without_source(
-    client, reference_idx, worker_headers
-):
+async def test_mint_rejects_genome_id_without_source(client, reference_idx, worker_headers):
     """genome_source_id set without genome_source should return 422."""
     resp = await client.post(
         f"/api/v1/reference/{reference_idx}/feature/mint",
@@ -340,9 +324,7 @@ async def test_cross_reference_deduplication(client, postgres_pool, worker_heade
         await postgres_pool.execute(
             "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", ref_idx
         )
-        await postgres_pool.execute(
-            "DELETE FROM qiita.reference WHERE reference_idx = $1", ref_idx
-        )
+        await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", ref_idx)
 
 
 async def test_mint_10k_batch_performance(client, reference_idx, worker_headers):

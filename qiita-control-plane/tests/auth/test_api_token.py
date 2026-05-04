@@ -1,11 +1,12 @@
 """Pure unit tests for opaque API token format / hashing / scope validation.
 
-DB-required tests live in tests/integration/test_api_token.py.
+DB-required tests live in qiita-control-plane/tests/auth/test_api_token_db.py.
 """
 
 import hashlib
 
 import pytest
+from qiita_common.auth_constants import Scope
 
 
 def test_token_constants_match_spec():
@@ -67,9 +68,9 @@ def test_valid_scopes_is_frozen():
 
     assert isinstance(VALID_SCOPES, frozenset)
     # Spot-check a few — full coverage lives in the role/scope tests.
-    assert "reference:read" in VALID_SCOPES
-    assert "admin:user" in VALID_SCOPES
-    assert "self:profile" in VALID_SCOPES
+    assert Scope.REFERENCE_READ in VALID_SCOPES
+    assert Scope.ADMIN_USER in VALID_SCOPES
+    assert Scope.SELF_PROFILE in VALID_SCOPES
 
 
 def test_verified_token_dataclass_is_frozen():
