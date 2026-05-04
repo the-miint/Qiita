@@ -71,10 +71,14 @@ class FakeControlPlaneClient:
         return None
 
     async def mint_features(
-        self, reference_idx: int, manifest_path: Path, output_dir: Path
+        self,
+        reference_idx: int,
+        manifest_path: Path,
+        output_dir: Path,
+        genome_map_path: Path | None = None,
     ) -> FeatureMintResponse:
         self.action_calls.append(
-            ("mint-features", reference_idx, manifest_path, output_dir)
+            ("mint-features", reference_idx, manifest_path, output_dir, genome_map_path)
         )
         if self.fail_on == "mint-features":
             raise RuntimeError("simulated mint-features failure")

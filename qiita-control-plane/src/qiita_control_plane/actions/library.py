@@ -267,7 +267,11 @@ async def mint_features(
     pairs = [(str(h), idx) for h, idx in full_mapping.items()]
     with duckdb.connect(":memory:") as duck:
         duck.execute("CREATE TEMP TABLE feature_map (sequence_hash UUID, feature_idx BIGINT)")
-        duck.executemany("INSERT INTO feature_map VALUES (?, ?)", pairs)
+        # Empty manifest is a valid degenerate state (FASTA had no sequences);
+        # DuckDB's executemany rejects an empty parameter list, so guard
+        # before the call. The COPY below still produces a valid empty Parquet.
+        if pairs:
+            duck.executemany("INSERT INTO feature_map VALUES (?, ?)", pairs)
         out = validate_parquet_path(feature_map_path)
         duck.execute(
             "COPY (SELECT sequence_hash, feature_idx FROM feature_map "
