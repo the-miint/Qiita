@@ -35,7 +35,7 @@ async def client(postgres_pool, human_admin_session):
 @pytest.fixture
 def worker_headers(compute_worker_service_account):
     """Authorization header for the compute worker service account — required
-    by service-only routes (POST /references/{id}/feature/mint)."""
+    by service-only routes (POST /reference/{id}/feature/mint)."""
     return {"Authorization": f"Bearer {compute_worker_service_account['token']}"}
 
 

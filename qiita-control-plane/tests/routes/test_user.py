@@ -1,6 +1,6 @@
 """Integration tests for /api/v1/user.
 
-POST /users is gated by system_admin + admin:users; GET/PATCH /users/me
+POST /user is gated by system_admin + admin:user; GET/PATCH /user/me
 require require_human + self:profile. Tests use the session admin PAT
 for admin-flow calls and the regular-user PAT for self-management calls.
 """
@@ -14,7 +14,7 @@ pytestmark = pytest.mark.db
 @pytest.fixture
 async def admin_app(postgres_pool, human_admin_session):
     """Client wired with the session admin PAT default-set on Authorization.
-    Used for POST /users (admin-creates-a-user) and GET /users/me-as-admin."""
+    Used for POST /user (admin-creates-a-user) and GET /user/me-as-admin."""
     from qiita_control_plane.main import app
 
     app.state.pool = postgres_pool
@@ -64,7 +64,7 @@ async def _create_user(client, *, display_name, email, **extra):
 
 
 # ---------------------------------------------------------------------------
-# POST /users (admin-only)
+# POST /user (admin-only)
 # ---------------------------------------------------------------------------
 
 
@@ -177,7 +177,7 @@ async def test_post_users_anonymous_401(postgres_pool):
 
 
 # ---------------------------------------------------------------------------
-# GET /users/me
+# GET /user/me
 # ---------------------------------------------------------------------------
 
 
@@ -220,7 +220,7 @@ async def test_get_me_service_account_403(
 
 
 # ---------------------------------------------------------------------------
-# PATCH /users/me
+# PATCH /user/me
 # ---------------------------------------------------------------------------
 
 

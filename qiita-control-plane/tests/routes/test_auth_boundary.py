@@ -38,7 +38,7 @@ def _unique_suffix(human_label: str) -> str:
 async def boundary_client(postgres_pool):
     """Bare client — tests pass their own Authorization header per case.
 
-    Settings is initialised because routes/references.py routes pull
+    Settings is initialised because routes/reference.py routes pull
     `get_hmac_secret` (and one pulls `get_data_plane_url`) before the auth
     guard runs; without it those routes 500 instead of 401/403.
     """
@@ -165,7 +165,7 @@ def _h(token: str | None) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# POST /api/v1/reference — require_complete_profile + scope references:write
+# POST /api/v1/reference — require_complete_profile + scope reference:write
 # ---------------------------------------------------------------------------
 
 
@@ -198,7 +198,7 @@ async def test_post_references_service_account_403(boundary_client, postgres_poo
 
 
 async def test_post_references_missing_scope_403(boundary_client, postgres_pool):
-    """Human + complete profile but no references:write scope."""
+    """Human + complete profile but no reference:write scope."""
     token, _ = await _seed_human_with_token(
         postgres_pool,
         system_role="user",
@@ -279,7 +279,7 @@ async def test_post_references_expired_token_401(boundary_client, postgres_pool)
 
 
 # ---------------------------------------------------------------------------
-# POST /references/{id}/feature/mint — require_service + features:mint
+# POST /reference/{id}/feature/mint — require_service + feature:mint
 # ---------------------------------------------------------------------------
 
 
@@ -329,7 +329,7 @@ async def test_mint_features_human_403(boundary_client, postgres_pool):
 
 
 async def test_mint_features_service_missing_scope_403(boundary_client, postgres_pool):
-    """Service token without features:mint."""
+    """Service token without feature:mint."""
     ref_idx = await _seed_active_reference(postgres_pool, "svc-no-scope")
     token, _ = await _seed_service_with_token(
         postgres_pool,
@@ -345,7 +345,7 @@ async def test_mint_features_service_missing_scope_403(boundary_client, postgres
 
 
 # ---------------------------------------------------------------------------
-# POST /references/{id}/register — require_service + references:register_files
+# POST /reference/{id}/register — require_service + reference:register_files
 # ---------------------------------------------------------------------------
 
 
@@ -389,7 +389,7 @@ async def test_register_files_service_missing_scope_403(boundary_client, postgre
 
 
 # ---------------------------------------------------------------------------
-# POST /references/{id}/ticket/doget — scope tickets:doget
+# POST /reference/{id}/ticket/doget — scope ticket:doget
 # ---------------------------------------------------------------------------
 
 
@@ -460,7 +460,7 @@ async def test_patch_me_missing_scope_403(boundary_client, postgres_pool):
 
 
 # ---------------------------------------------------------------------------
-# GET /references/{id} — anonymous-OK by design
+# GET /reference/{id} — anonymous-OK by design
 # ---------------------------------------------------------------------------
 
 
