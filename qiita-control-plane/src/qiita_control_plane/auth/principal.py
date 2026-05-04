@@ -340,8 +340,7 @@ async def _create_human_from_oidc(pool: asyncpg.Pool, identity) -> Principal:
             # exists, the winner created our identity and we return them;
             # if not, this is a real email collision.
             row = await pool.fetchrow(
-                "SELECT principal_idx FROM qiita.user_identity"
-                " WHERE issuer = $1 AND subject = $2",
+                "SELECT principal_idx FROM qiita.user_identity WHERE issuer = $1 AND subject = $2",
                 identity.issuer,
                 identity.subject,
             )
