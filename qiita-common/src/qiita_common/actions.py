@@ -84,6 +84,11 @@ class WorkflowStep(BaseModel):
     `step_type` ∈ {map, reduce, singleton}: map runs once per sample, reduce
     runs once over the union of map outputs, singleton runs once per workflow
     invocation.
+
+    `target_status` (optional) is the status the runner ensures the work
+    ticket's scope_target carries before this entry runs. Status values are
+    target-kind-specific strings (e.g. 'hashing' / 'minting' / 'loading' for
+    a reference); the runner PATCHes only when a transition is needed.
     """
 
     kind: Literal["step"]
@@ -94,6 +99,7 @@ class WorkflowStep(BaseModel):
     inputs: list[str] = Field(default_factory=list)
     outputs: list[str] = Field(default_factory=list)
     baseline_resources: BaselineResources
+    target_status: str | None = Field(default=None, min_length=1, max_length=MAX_NAME_LENGTH)
 
 
 class WorkflowAction(BaseModel):
@@ -102,12 +108,17 @@ class WorkflowAction(BaseModel):
     Library primitives are not user-invokable; they execute in-process in
     the control plane during workflow orchestration. A user-invokable
     action's `scopes` list covers the primitives its workflow composes.
+
+    `target_status` mirrors the same field on WorkflowStep — the runner
+    drives status transitions, primitives still defend their pre-conditions
+    inside the dispatch handler.
     """
 
     kind: Literal["action"]
     name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     inputs: list[str] = Field(default_factory=list)
     outputs: list[str] = Field(default_factory=list)
+    target_status: str | None = Field(default=None, min_length=1, max_length=MAX_NAME_LENGTH)
 
 
 # Discriminated union — the model_validator on ActionDefinition rewrites
@@ -149,6 +160,15 @@ class ActionDefinition(BaseModel):
     steps: list[WorkflowEntry] = Field(min_length=1)
 
     action_ceiling: ActionCeiling
+
+    # Workflow-level status terminals. The runner PATCHes the work ticket's
+    # scope_target to `success_status` after every entry has succeeded, and
+    # best-effort PATCHes to `failure_status` if any entry raises. Both are
+    # optional — a workflow that doesn't track a resource lifecycle (e.g.
+    # one that targets study_prep with no per-prep status column) leaves
+    # them unset and the runner skips the terminal PATCHes.
+    success_status: str | None = Field(default=None, min_length=1, max_length=MAX_NAME_LENGTH)
+    failure_status: str | None = Field(default=None, min_length=1, max_length=MAX_NAME_LENGTH)
 
     @model_validator(mode="before")
     @classmethod

@@ -258,3 +258,58 @@ async def test_sync_handles_empty_action_list(postgres_pool, clean_action_table)
     async with postgres_pool.acquire() as conn:
         result = await sync_actions(conn, [])
         assert result == {"inserted": 0, "updated": 0}
+
+
+async def test_sync_round_trips_status_fields(
+    postgres_pool, tmp_path, clean_action_table
+):
+    """Workflow-level success_status / failure_status and per-entry
+    target_status survive sync into qiita.action.{success_status,
+    failure_status} columns and the steps JSONB respectively. Absence
+    stays NULL / unset."""
+    from qiita_control_plane.actions import load_actions, sync_actions
+
+    yaml_with_status = """\
+action_id: reference-add
+version: 2.0.0
+target_kind: reference
+scopes: [feature:mint, reference:write]
+audience:
+  service: false
+  human_roles: [wet_lab_admin]
+success_status: active
+failure_status: failed
+steps:
+  - step: hash
+    step_type: singleton
+    container: qiita/reference-hash:2.0.0
+    target_status: hashing
+    baseline_resources: {cpu: 4, mem_gb: 8, walltime: PT1H}
+  - action: mint-features
+    target_status: minting
+  - action: write-membership
+action_ceiling: {cpu: 16, mem_gb: 64, walltime: PT4H, gpu: 0}
+"""
+    workflows = tmp_path / "workflows"
+    (workflows / "reference-add").mkdir(parents=True)
+    (workflows / "reference-add" / "2.0.0.yaml").write_text(yaml_with_status)
+
+    async with postgres_pool.acquire() as conn:
+        await sync_actions(conn, load_actions(workflows))
+
+        row = await conn.fetchrow(
+            "SELECT success_status, failure_status, steps "
+            " FROM qiita.action WHERE action_id=$1 AND version=$2",
+            "reference-add",
+            "2.0.0",
+        )
+    assert row["success_status"] == "active"
+    assert row["failure_status"] == "failed"
+
+    import json
+
+    steps = json.loads(row["steps"])
+    assert steps[0]["target_status"] == "hashing"
+    assert steps[1]["target_status"] == "minting"
+    # Third entry omitted target_status; serialization preserves None.
+    assert steps[2].get("target_status") is None

@@ -48,11 +48,20 @@ CREATE TABLE qiita.action (
     context_schema     JSONB NOT NULL DEFAULT '{}'::jsonb,
 
     -- Step list as JSONB. Each entry is one of:
-    --   { kind: "step",   name, step_type, container, baseline_resources }
-    --   { kind: "action", name, ... }   -- control-plane primitive
+    --   { kind: "step",   name, step_type, container, baseline_resources, target_status }
+    --   { kind: "action", name, target_status, ... }  -- control-plane primitive
     -- step_type ∈ {map, reduce, singleton}. The orchestrator interprets this
     -- column; the DB does not introspect step shape beyond storing JSON.
+    -- target_status (per-entry, optional) tells the runner what status to
+    -- PATCH the scope_target to before the entry runs.
     steps              JSONB NOT NULL,
+
+    -- Workflow-level status terminals. The runner PATCHes the scope_target
+    -- to success_status when every entry has succeeded, and best-effort to
+    -- failure_status if any entry raises. Both optional: a workflow that
+    -- targets a resource without a status lifecycle leaves them NULL.
+    success_status     TEXT,
+    failure_status     TEXT,
 
     -- Action-wide resource ceilings. Resolution at submit-time clamps
     -- yaml.<dim> × profile.<dim>_mult against profile.<dim>_max AND these

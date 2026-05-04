@@ -22,12 +22,14 @@ _UPSERT_SQL = """
 INSERT INTO qiita.action (
     action_id, version, target_kind, description,
     scopes, audience, context_schema, steps,
-    cpu_ceiling, mem_ceiling_gb, walltime_ceiling, gpu_ceiling
+    cpu_ceiling, mem_ceiling_gb, walltime_ceiling, gpu_ceiling,
+    success_status, failure_status
 )
 VALUES (
     $1, $2, $3, $4,
     $5, $6::jsonb, $7::jsonb, $8::jsonb,
-    $9, $10, $11, $12
+    $9, $10, $11, $12,
+    $13, $14
 )
 ON CONFLICT (action_id, version) DO UPDATE SET
     target_kind      = EXCLUDED.target_kind,
@@ -39,7 +41,9 @@ ON CONFLICT (action_id, version) DO UPDATE SET
     cpu_ceiling      = EXCLUDED.cpu_ceiling,
     mem_ceiling_gb   = EXCLUDED.mem_ceiling_gb,
     walltime_ceiling = EXCLUDED.walltime_ceiling,
-    gpu_ceiling      = EXCLUDED.gpu_ceiling
+    gpu_ceiling      = EXCLUDED.gpu_ceiling,
+    success_status   = EXCLUDED.success_status,
+    failure_status   = EXCLUDED.failure_status
 RETURNING xmax = 0 AS inserted
 """
 
@@ -76,6 +80,8 @@ async def sync_actions(
                 a.action_ceiling.mem_gb,
                 a.action_ceiling.walltime,
                 a.action_ceiling.gpu,
+                a.success_status,
+                a.failure_status,
             )
             if row["inserted"]:
                 inserted += 1

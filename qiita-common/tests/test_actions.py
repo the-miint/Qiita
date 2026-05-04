@@ -219,3 +219,62 @@ def test_action_ceiling_uses_iso8601_walltime():
     a = ActionDefinition(**kwargs)
     assert a.action_ceiling.walltime == timedelta(hours=2, minutes=30)
     assert a.action_ceiling.gpu == 1
+
+
+def test_status_fields_default_to_none():
+    """success_status / failure_status / target_status are all optional —
+    a workflow that doesn't track a resource lifecycle leaves them unset
+    and the runner skips status PATCHes."""
+    from qiita_common.actions import ActionDefinition
+
+    a = ActionDefinition(**_minimal_action_kwargs())
+    assert a.success_status is None
+    assert a.failure_status is None
+    assert a.steps[0].target_status is None
+
+
+def test_workflow_status_round_trip():
+    """ActionDefinition round-trips success_status / failure_status and
+    per-entry target_status through model_dump / model_validate."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["success_status"] = "active"
+    kwargs["failure_status"] = "failed"
+    kwargs["steps"][0]["target_status"] = "hashing"
+    kwargs["steps"].append(
+        {
+            "action": "mint-features",
+            "target_status": "minting",
+            "inputs": ["manifest"],
+            "outputs": ["feature_map"],
+        }
+    )
+
+    a = ActionDefinition(**kwargs)
+    assert a.success_status == "active"
+    assert a.failure_status == "failed"
+    assert a.steps[0].target_status == "hashing"
+    assert a.steps[1].target_status == "minting"
+
+    rehydrated = ActionDefinition.model_validate(a.model_dump(mode="json"))
+    assert rehydrated.success_status == "active"
+    assert rehydrated.failure_status == "failed"
+    assert rehydrated.steps[0].target_status == "hashing"
+    assert rehydrated.steps[1].target_status == "minting"
+
+
+def test_status_fields_reject_blank_strings():
+    """min_length=1 — passing an empty string for any status field is a
+    sentinel-versus-empty smell, rejected so YAML authors notice."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["success_status"] = ""
+    with pytest.raises(ValidationError):
+        ActionDefinition(**kwargs)
+
+    kwargs2 = _minimal_action_kwargs()
+    kwargs2["steps"][0]["target_status"] = ""
+    with pytest.raises(ValidationError):
+        ActionDefinition(**kwargs2)
