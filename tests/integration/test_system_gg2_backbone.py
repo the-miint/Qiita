@@ -153,14 +153,18 @@ async def test_gg2_backbone_full_pipeline(
     scope_target = {"kind": "reference", "reference_idx": ref_idx}
 
     # --- Hash (reads 11 GB FASTA, ~7 min) ---
-    await client.patch(f"/api/v1/reference/{ref_idx}/status", json={"status": "hashing"})
+    await client.patch(
+        f"/api/v1/reference/{ref_idx}/status", json={"status": "hashing"}
+    )
     hash_result = await backend.run_step(
         "hash", {"fasta_path": FASTA}, workspace, reference_idx=ref_idx
     )
     manifest_path = hash_result["manifest"]
 
     # --- Mint with genome_map_path ---
-    await client.patch(f"/api/v1/reference/{ref_idx}/status", json={"status": "minting"})
+    await client.patch(
+        f"/api/v1/reference/{ref_idx}/status", json={"status": "minting"}
+    )
     mint_resp = await client.post(
         URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
         json={
@@ -208,7 +212,9 @@ async def test_gg2_backbone_full_pipeline(
     assert actual_genome_count == expected_genome_count
 
     # --- Load (writes sequences + chunks + membership + taxonomy + phylogeny) ---
-    await client.patch(f"/api/v1/reference/{ref_idx}/status", json={"status": "loading"})
+    await client.patch(
+        f"/api/v1/reference/{ref_idx}/status", json={"status": "loading"}
+    )
     staging = tmp_path / "staging"
     await backend.run_step(
         "load",
@@ -247,12 +253,18 @@ async def test_gg2_backbone_full_pipeline(
     await client.patch(f"/api/v1/reference/{ref_idx}/status", json={"status": "active"})
 
     # --- DoGet: sequence metadata ---
-    seq_table = await _doget(client, flight_client, ref_idx, "reference_sequences", worker_headers)
+    seq_table = await _doget(
+        client, flight_client, ref_idx, "reference_sequences", worker_headers
+    )
     assert seq_table.num_rows == _EXPECTED_FEATURES
-    assert {"feature_idx", "sequence_hash", "sequence_length_bp"} <= set(seq_table.column_names)
+    assert {"feature_idx", "sequence_hash", "sequence_length_bp"} <= set(
+        seq_table.column_names
+    )
 
     # --- DoGet: taxonomy ---
-    tax_table = await _doget(client, flight_client, ref_idx, "reference_taxonomy", worker_headers)
+    tax_table = await _doget(
+        client, flight_client, ref_idx, "reference_taxonomy", worker_headers
+    )
     assert tax_table.num_rows == _EXPECTED_TAXONOMY
     assert "domain" in tax_table.column_names
 

@@ -36,7 +36,9 @@ _REFERENCE_ADD_YAML_PATH = (
 
 
 # A tiny FASTA the hash step can chew through in milliseconds.
-_TINY_FASTA = b">seq1\nACGTACGTACGTACGT\n>seq2\nTTTTAAAACCCCGGGG\n>seq3\nGCATGCATGCATGCAT\n"
+_TINY_FASTA = (
+    b">seq1\nACGTACGTACGTACGT\n>seq2\nTTTTAAAACCCCGGGG\n>seq3\nGCATGCATGCATGCAT\n"
+)
 
 
 class _StubbedRegisterClient(ControlPlaneClient):
@@ -177,9 +179,7 @@ async def test_reference_add_workflow_end_to_end(
     async with AsyncClient(
         transport=transport,
         base_url="http://test",
-        headers={
-            "Authorization": f"Bearer {compute_worker_service_account['token']}"
-        },
+        headers={"Authorization": f"Bearer {compute_worker_service_account['token']}"},
     ) as http:
         client = _StubbedRegisterClient(
             "http://test",
