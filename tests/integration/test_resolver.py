@@ -123,7 +123,7 @@ async def resolver_client(postgres_pool, jwks_harness):
         async with postgres_pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
-                    "ALTER TABLE qiita.auth_event DISABLE TRIGGER auth_events_no_delete"
+                    "ALTER TABLE qiita.auth_event DISABLE TRIGGER auth_event_no_delete"
                 )
                 try:
                     await conn.execute(
@@ -158,7 +158,7 @@ async def resolver_client(postgres_pool, jwks_harness):
                     )
                 finally:
                     await conn.execute(
-                        "ALTER TABLE qiita.auth_event ENABLE TRIGGER auth_events_no_delete"
+                        "ALTER TABLE qiita.auth_event ENABLE TRIGGER auth_event_no_delete"
                     )
 
 

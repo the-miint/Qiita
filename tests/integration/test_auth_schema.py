@@ -622,12 +622,12 @@ async def test_api_token_check_no_sentinel_principal(postgres_pool):
 
 
 async def test_api_token_hash_active_index_partial(postgres_pool):
-    """The api_tokens_hash_active index must be partial on revoked_at IS NULL."""
+    """The api_token_hash_active index must be partial on revoked_at IS NULL."""
     pred = await postgres_pool.fetchval(
         "SELECT indexdef FROM pg_indexes"
-        " WHERE schemaname = 'qiita' AND indexname = 'api_tokens_hash_active'"
+        " WHERE schemaname = 'qiita' AND indexname = 'api_token_hash_active'"
     )
-    assert pred is not None, "api_tokens_hash_active index missing"
+    assert pred is not None, "api_token_hash_active index missing"
     assert "WHERE" in pred and "revoked_at IS NULL" in pred
 
 
@@ -802,7 +802,7 @@ async def test_auth_event_insert_succeeds(postgres_pool):
     """Append-only means INSERT works; only UPDATE/DELETE are blocked.
 
     Without this positive test, a regression that broke
-    tg_auth_events_immutable to fire on INSERT would slip past the suite.
+    tg_auth_event_immutable to fire on INSERT would slip past the suite.
     """
     async with postgres_pool.acquire() as conn:
         tr = conn.transaction()

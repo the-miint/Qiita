@@ -105,7 +105,7 @@ async def test_mint_persists_expires_at(postgres_pool, principal_idx):
 
 async def test_mint_raises_on_hash_collision(postgres_pool, principal_idx, monkeypatch):
     """If the random body collides with an existing token_hash, mint raises."""
-    from qiita_control_plane.auth import tokens
+    from qiita_control_plane.auth import token as tokens
 
     # Fixed hash so we can pre-insert a matching row.
     fixed_plaintext = "qk_" + "A" * 43
@@ -316,7 +316,7 @@ async def test_verify_does_not_block_on_last_used_at(
     postgres_pool, principal_idx, monkeypatch
 ):
     """If record_token_use raises, verify still returns success."""
-    from qiita_control_plane.auth import tokens
+    from qiita_control_plane.auth import token as tokens
 
     plaintext, _ = await tokens.mint_api_token(
         postgres_pool,

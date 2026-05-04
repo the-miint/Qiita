@@ -5,8 +5,8 @@ import pytest
 
 EXPECTED_TABLES = [
     "reference",
-    "genomes",
-    "features",
+    "genome",
+    "feature",
     "reference_membership",
     "feature_genome",
 ]
