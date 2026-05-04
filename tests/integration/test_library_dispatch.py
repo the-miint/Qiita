@@ -5,7 +5,11 @@ import uuid
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_LIBRARY_NAME, URL_REFERENCE_PREFIX, URL_REFERENCE_STATUS
+from qiita_common.api_paths import (
+    URL_LIBRARY_NAME,
+    URL_REFERENCE_PREFIX,
+    LibraryPrimitive,
+)
 
 _TEST_SALT = uuid.uuid4().hex
 
@@ -66,7 +70,9 @@ async def minting_reference(client, postgres_pool):
     await postgres_pool.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
-    await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
+    await postgres_pool.execute(
+        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
+    )
 
 
 def _ref_target(reference_idx: int) -> dict:
@@ -87,7 +93,7 @@ async def test_unknown_primitive_returns_404(client, worker_headers):
 async def test_dispatch_rejects_human_caller(client, minting_reference, admin_headers):
     """All primitives are service-only; a human PAT is rejected with 403."""
     resp = await client.post(
-        URL_LIBRARY_NAME.format(name="mint-features"),
+        URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
         json={
             "scope_target": _ref_target(minting_reference),
             "inputs": {"entries": [{"sequence_hash": _md5_uuid("X")}]},
@@ -97,12 +103,14 @@ async def test_dispatch_rejects_human_caller(client, minting_reference, admin_he
     assert resp.status_code == 403
 
 
-async def test_dispatch_mint_features_round_trip(client, minting_reference, worker_headers):
+async def test_dispatch_mint_features_round_trip(
+    client, minting_reference, worker_headers
+):
     """mint-features dispatch returns the same shape as the underlying
     library function — mapping + minted + reused under `outputs`."""
     hashes = [_md5_uuid(f"DISPATCH{i}") for i in range(3)]
     resp = await client.post(
-        URL_LIBRARY_NAME.format(name="mint-features"),
+        URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
         json={
             "scope_target": _ref_target(minting_reference),
             "inputs": {"entries": [{"sequence_hash": h} for h in hashes]},
@@ -124,7 +132,7 @@ async def test_dispatch_write_membership_then_again_is_idempotent(
     underlying library function."""
     hashes = [_md5_uuid(f"IDEM-DISPATCH{i}") for i in range(3)]
     mint = await client.post(
-        URL_LIBRARY_NAME.format(name="mint-features"),
+        URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
         json={
             "scope_target": _ref_target(minting_reference),
             "inputs": {"entries": [{"sequence_hash": h} for h in hashes]},
@@ -134,7 +142,7 @@ async def test_dispatch_write_membership_then_again_is_idempotent(
     feature_idxs = list(mint.json()["outputs"]["mapping"].values())
 
     first = await client.post(
-        URL_LIBRARY_NAME.format(name="write-membership"),
+        URL_LIBRARY_NAME.format(name=LibraryPrimitive.WRITE_MEMBERSHIP),
         json={
             "scope_target": _ref_target(minting_reference),
             "inputs": {"feature_idxs": feature_idxs},
@@ -142,7 +150,7 @@ async def test_dispatch_write_membership_then_again_is_idempotent(
         headers=worker_headers,
     )
     second = await client.post(
-        URL_LIBRARY_NAME.format(name="write-membership"),
+        URL_LIBRARY_NAME.format(name=LibraryPrimitive.WRITE_MEMBERSHIP),
         json={
             "scope_target": _ref_target(minting_reference),
             "inputs": {"feature_idxs": feature_idxs},
@@ -153,7 +161,9 @@ async def test_dispatch_write_membership_then_again_is_idempotent(
     assert second.json()["outputs"] == {"linked": 0, "already_linked": 3}
 
 
-async def test_dispatch_write_membership_status_check(client, postgres_pool, worker_headers):
+async def test_dispatch_write_membership_status_check(
+    client, postgres_pool, worker_headers
+):
     """write-membership rejects with 409 when the reference isn't in
     'minting' status — the dispatch handler enforces this so workflow
     runners surface a useful error rather than silently FK-failing."""
@@ -169,7 +179,7 @@ async def test_dispatch_write_membership_status_check(client, postgres_pool, wor
     try:
         # status='pending' (fresh reference)
         membership = await client.post(
-            URL_LIBRARY_NAME.format(name="write-membership"),
+            URL_LIBRARY_NAME.format(name=LibraryPrimitive.WRITE_MEMBERSHIP),
             json={
                 "scope_target": _ref_target(idx),
                 "inputs": {"feature_idxs": [1]},
@@ -179,15 +189,19 @@ async def test_dispatch_write_membership_status_check(client, postgres_pool, wor
         assert membership.status_code == 409
         assert "must be 'minting'" in membership.json()["detail"]
     finally:
-        await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
+        )
 
 
-async def test_dispatch_validates_input_shape(client, minting_reference, worker_headers):
+async def test_dispatch_validates_input_shape(
+    client, minting_reference, worker_headers
+):
     """mint-features without inputs.entries is 422 — the dispatch handler
     parses per-primitive input shape inside the route since the generic
     envelope doesn't constrain it."""
     resp = await client.post(
-        URL_LIBRARY_NAME.format(name="mint-features"),
+        URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
         json={
             "scope_target": _ref_target(minting_reference),
             "inputs": {},  # missing entries

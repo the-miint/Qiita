@@ -35,17 +35,22 @@ async def fresh_reference(postgres_pool, human_admin_session):
     await postgres_pool.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
-    await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
+    await postgres_pool.execute(
+        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
+    )
 
 
 async def test_library_mint_features_dispatch(postgres_pool):
     """LIBRARY['mint-features'](pool, entries) writes qiita.feature rows
     and returns a (mapping, minted, reused) tuple covering every input."""
+    from qiita_common.api_paths import LibraryPrimitive
     from qiita_common.models import FeatureHashEntry
     from qiita_control_plane.actions import LIBRARY
 
     entries = [FeatureHashEntry(sequence_hash=_md5_uuid(f"LIB{i}")) for i in range(5)]
-    mapping, minted, reused = await LIBRARY["mint-features"](postgres_pool, entries)
+    mapping, minted, reused = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
+        postgres_pool, entries
+    )
 
     assert len(mapping) == 5
     assert minted == 5
@@ -53,7 +58,9 @@ async def test_library_mint_features_dispatch(postgres_pool):
     assert set(mapping.keys()) == {e.sequence_hash for e in entries}
 
     # Idempotent re-dispatch: same hashes return reused=5.
-    _, minted2, reused2 = await LIBRARY["mint-features"](postgres_pool, entries)
+    _, minted2, reused2 = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
+        postgres_pool, entries
+    )
     assert minted2 == 0
     assert reused2 == 5
 
@@ -61,14 +68,17 @@ async def test_library_mint_features_dispatch(postgres_pool):
 async def test_library_write_membership_dispatch(postgres_pool, fresh_reference):
     """LIBRARY['write-membership'](pool, idx, feature_idxs) inserts
     qiita.reference_membership rows and returns (linked, already_linked)."""
+    from qiita_common.api_paths import LibraryPrimitive
     from qiita_common.models import FeatureHashEntry
     from qiita_control_plane.actions import LIBRARY
 
     entries = [FeatureHashEntry(sequence_hash=_md5_uuid(f"MEM{i}")) for i in range(3)]
-    mapping, _, _ = await LIBRARY["mint-features"](postgres_pool, entries)
+    mapping, _, _ = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
+        postgres_pool, entries
+    )
     feature_idxs = list(mapping.values())
 
-    linked, already_linked = await LIBRARY["write-membership"](
+    linked, already_linked = await LIBRARY[LibraryPrimitive.WRITE_MEMBERSHIP](
         postgres_pool, fresh_reference, feature_idxs
     )
     assert linked == 3
@@ -81,7 +91,7 @@ async def test_library_write_membership_dispatch(postgres_pool, fresh_reference)
     assert sorted(r["feature_idx"] for r in rows) == sorted(feature_idxs)
 
     # Re-dispatch reports already_linked=3.
-    linked2, already_linked2 = await LIBRARY["write-membership"](
+    linked2, already_linked2 = await LIBRARY[LibraryPrimitive.WRITE_MEMBERSHIP](
         postgres_pool, fresh_reference, feature_idxs
     )
     assert linked2 == 0
@@ -95,7 +105,10 @@ async def test_library_write_membership_raises_on_unknown_feature_idx(
     caught and re-raised as a structured error). Routes catch this and
     map to HTTP 422; runners can map it to a workflow failure with a
     useful detail."""
+    from qiita_common.api_paths import LibraryPrimitive
     from qiita_control_plane.actions import LIBRARY
 
     with pytest.raises(ValueError, match="feature_idx"):
-        await LIBRARY["write-membership"](postgres_pool, fresh_reference, [9999999999])
+        await LIBRARY[LibraryPrimitive.WRITE_MEMBERSHIP](
+            postgres_pool, fresh_reference, [9999999999]
+        )

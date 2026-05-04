@@ -1,5 +1,7 @@
-"""Centralized REST path constants — API contract shared by routes, tests,
-and clients.
+"""Centralized REST API constants — paths, primitive names, network hosts.
+
+Shared by routes, tests, and clients so a deploy-time URL change or a
+new library primitive lands in one place.
 
 Two flavours per path:
 
@@ -21,6 +23,8 @@ Currently covers /feature/* and /reference/*; other tags
 (/auth, /admin, /user) still hardcode their paths and will migrate as
 they're touched.
 """
+
+from enum import StrEnum
 
 from qiita_common.auth_constants import API_PREFIX
 
@@ -52,3 +56,18 @@ PATH_LIBRARY_NAME = "/{name}"
 
 URL_LIBRARY_PREFIX = f"{API_PREFIX}{PATH_LIBRARY_PREFIX}"
 URL_LIBRARY_NAME = f"{URL_LIBRARY_PREFIX}{PATH_LIBRARY_NAME}"
+
+
+class LibraryPrimitive(StrEnum):
+    """Closed set of library-primitive names exposed by /api/v1/library/{name}.
+
+    Adding a primitive is a contract change visible to every workflow YAML
+    and every caller; this enum is the single declaration point. StrEnum
+    members compare equal to their string value, so dict keys built around
+    bare strings (e.g. JSONB-decoded `WorkflowAction.name`) keep working
+    while new code gets the typo-catching benefit of an enum.
+    """
+
+    MINT_FEATURES = "mint-features"
+    WRITE_MEMBERSHIP = "write-membership"
+    REGISTER_FILES = "register-files"

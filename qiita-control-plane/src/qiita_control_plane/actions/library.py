@@ -31,6 +31,7 @@ from uuid import UUID
 
 import asyncpg
 import pyarrow.flight as _flight
+from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.models import FeatureHashEntry
 
 from ..auth.tickets import sign_action
@@ -257,7 +258,7 @@ async def register_files(
 # to every workflow YAML; do it deliberately.
 
 LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
-    "mint-features": mint_features,
-    "write-membership": write_membership,
-    "register-files": register_files,
+    LibraryPrimitive.MINT_FEATURES: mint_features,
+    LibraryPrimitive.WRITE_MEMBERSHIP: write_membership,
+    LibraryPrimitive.REGISTER_FILES: register_files,
 }

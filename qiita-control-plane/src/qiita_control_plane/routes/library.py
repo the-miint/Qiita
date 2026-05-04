@@ -21,7 +21,11 @@ has already established the right state.
 import asyncpg
 import pyarrow.flight as _flight
 from fastapi import APIRouter, Depends, HTTPException
-from qiita_common.api_paths import PATH_LIBRARY_NAME, PATH_LIBRARY_PREFIX
+from qiita_common.api_paths import (
+    PATH_LIBRARY_NAME,
+    PATH_LIBRARY_PREFIX,
+    LibraryPrimitive,
+)
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     FeatureHashEntry,
@@ -42,9 +46,9 @@ router = APIRouter(prefix=PATH_LIBRARY_PREFIX, tags=["library"])
 # here will fail the auth check below with a clear "no required scope"
 # message — better than silently bypassing scope enforcement.
 _PRIMITIVE_SCOPES: dict[str, Scope] = {
-    "mint-features": Scope.FEATURE_MINT,
-    "write-membership": Scope.REFERENCE_WRITE,
-    "register-files": Scope.REFERENCE_REGISTER_FILES,
+    LibraryPrimitive.MINT_FEATURES: Scope.FEATURE_MINT,
+    LibraryPrimitive.WRITE_MEMBERSHIP: Scope.REFERENCE_WRITE,
+    LibraryPrimitive.REGISTER_FILES: Scope.REFERENCE_REGISTER_FILES,
 }
 
 
@@ -78,11 +82,11 @@ async def invoke_library(
             detail=f"Missing required scope: {required.value!r}",
         )
 
-    if name == "mint-features":
+    if name == LibraryPrimitive.MINT_FEATURES:
         return await _dispatch_mint_features(body, pool)
-    if name == "write-membership":
+    if name == LibraryPrimitive.WRITE_MEMBERSHIP:
         return await _dispatch_write_membership(body, pool)
-    if name == "register-files":
+    if name == LibraryPrimitive.REGISTER_FILES:
         return await _dispatch_register_files(body, pool, hmac_secret, data_plane_url)
 
     # Unreachable while LIBRARY and the dispatch ladder stay in sync.

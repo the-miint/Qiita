@@ -4,17 +4,15 @@ import inspect
 
 
 def test_library_exposes_three_named_primitives():
-    """LIBRARY contains exactly the three primitives listed in the design —
-    mint-features, write-membership, register-files. Adding or removing
-    entries is a contract change visible to every workflow YAML, so this
-    assertion guards against accidental drift."""
+    """LIBRARY contains exactly the LibraryPrimitive members. Adding or
+    removing entries is a contract change visible to every workflow YAML,
+    so this assertion guards against accidental drift between the enum
+    and the dict."""
+    from qiita_common.api_paths import LibraryPrimitive
+
     from qiita_control_plane.actions import LIBRARY
 
-    assert set(LIBRARY.keys()) == {
-        "mint-features",
-        "write-membership",
-        "register-files",
-    }
+    assert set(LIBRARY.keys()) == set(LibraryPrimitive)
 
 
 def test_library_primitives_are_async_callables():
@@ -31,9 +29,11 @@ def test_library_re_exports_match_module_callables():
     """The names in LIBRARY map to the module-level functions of the same
     role — adding a named primitive without a same-named module function
     (or vice-versa) is a smell."""
+    from qiita_common.api_paths import LibraryPrimitive
+
     from qiita_control_plane.actions import LIBRARY
     from qiita_control_plane.actions import library as lib
 
-    assert LIBRARY["mint-features"] is lib.mint_features
-    assert LIBRARY["write-membership"] is lib.write_membership
-    assert LIBRARY["register-files"] is lib.register_files
+    assert LIBRARY[LibraryPrimitive.MINT_FEATURES] is lib.mint_features
+    assert LIBRARY[LibraryPrimitive.WRITE_MEMBERSHIP] is lib.write_membership
+    assert LIBRARY[LibraryPrimitive.REGISTER_FILES] is lib.register_files

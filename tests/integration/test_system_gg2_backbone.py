@@ -37,7 +37,7 @@ from _pg_env import (
     postgres_url,
 )
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_LIBRARY_NAME
+from qiita_common.api_paths import URL_LIBRARY_NAME, LibraryPrimitive
 
 DATA_DIR = Path(__file__).parent.parent.parent / "localdocs" / "scratch"
 FASTA = DATA_DIR / "2024.09.backbone.sequence.fna.gz"
@@ -258,7 +258,9 @@ async def test_gg2_backbone_pipeline(
     fm_path = tmp_path / "feature_map.ndjson"
     # Move to 'minting' once for the whole run; the new mint path doesn't
     # toggle status itself.
-    await client.patch(f"/api/v1/reference/{ref_idx}/status", json={"status": "minting"})
+    await client.patch(
+        f"/api/v1/reference/{ref_idx}/status", json={"status": "minting"}
+    )
     scope_target = {"kind": "reference", "reference_idx": ref_idx}
 
     total_minted = 0
@@ -275,8 +277,11 @@ async def test_gg2_backbone_pipeline(
                     kwargs["genome_source_id"] = genome[1]
                 mint_entries.append(kwargs)
             resp = await client.post(
-                URL_LIBRARY_NAME.format(name="mint-features"),
-                json={"scope_target": scope_target, "inputs": {"entries": mint_entries}},
+                URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
+                json={
+                    "scope_target": scope_target,
+                    "inputs": {"entries": mint_entries},
+                },
             )
             assert resp.status_code == 200, f"mint chunk {i} failed: {resp.text[:200]}"
             mint_outputs = resp.json()["outputs"]
@@ -292,10 +297,15 @@ async def test_gg2_backbone_pipeline(
     for i in range(0, len(all_feature_idxs), _CHUNK):
         feature_idxs = all_feature_idxs[i : i + _CHUNK]
         resp = await client.post(
-            URL_LIBRARY_NAME.format(name="write-membership"),
-            json={"scope_target": scope_target, "inputs": {"feature_idxs": feature_idxs}},
+            URL_LIBRARY_NAME.format(name=LibraryPrimitive.WRITE_MEMBERSHIP),
+            json={
+                "scope_target": scope_target,
+                "inputs": {"feature_idxs": feature_idxs},
+            },
         )
-        assert resp.status_code == 200, f"membership chunk {i} failed: {resp.text[:200]}"
+        assert resp.status_code == 200, (
+            f"membership chunk {i} failed: {resp.text[:200]}"
+        )
 
     # --- Load (write Parquet to staging) ---
     await client.patch(
@@ -325,7 +335,7 @@ async def test_gg2_backbone_pipeline(
 
     # --- Register via /library/register-files (data-plane DoAction) ---
     reg_resp = await client.post(
-        URL_LIBRARY_NAME.format(name="register-files"),
+        URL_LIBRARY_NAME.format(name=LibraryPrimitive.REGISTER_FILES),
         json={
             "scope_target": scope_target,
             "inputs": {

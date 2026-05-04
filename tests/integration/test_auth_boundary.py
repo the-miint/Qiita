@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_LIBRARY_NAME
+from qiita_common.api_paths import URL_LIBRARY_NAME, LibraryPrimitive
 
 
 def _unique_suffix(human_label: str) -> str:
@@ -302,10 +302,12 @@ async def test_library_dispatch_no_auth_401(boundary_client, postgres_pool):
     from the require_service guard before any per-primitive logic runs."""
     ref_idx = await _seed_active_reference(postgres_pool, "no-auth")
     resp = await boundary_client.post(
-        URL_LIBRARY_NAME.format(name="mint-features"),
+        URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
         json={
             "scope_target": _ref_target(ref_idx),
-            "inputs": {"entries": [{"sequence_hash": "00000000-0000-0000-0000-000000000001"}]},
+            "inputs": {
+                "entries": [{"sequence_hash": "00000000-0000-0000-0000-000000000001"}]
+            },
         },
     )
     assert resp.status_code == 401
@@ -332,10 +334,12 @@ async def test_library_dispatch_human_403(boundary_client, postgres_pool):
         suffix="library-human",
     )
     resp = await boundary_client.post(
-        URL_LIBRARY_NAME.format(name="mint-features"),
+        URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
         json={
             "scope_target": _ref_target(ref_idx),
-            "inputs": {"entries": [{"sequence_hash": "00000000-0000-0000-0000-000000000002"}]},
+            "inputs": {
+                "entries": [{"sequence_hash": "00000000-0000-0000-0000-000000000002"}]
+            },
         },
         headers=_h(token),
     )
@@ -353,17 +357,21 @@ async def test_library_dispatch_mint_missing_scope_403(boundary_client, postgres
         suffix="mint-svc-no-scope",
     )
     resp = await boundary_client.post(
-        URL_LIBRARY_NAME.format(name="mint-features"),
+        URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
         json={
             "scope_target": _ref_target(ref_idx),
-            "inputs": {"entries": [{"sequence_hash": "00000000-0000-0000-0000-000000000003"}]},
+            "inputs": {
+                "entries": [{"sequence_hash": "00000000-0000-0000-0000-000000000003"}]
+            },
         },
         headers=_h(token),
     )
     assert resp.status_code == 403
 
 
-async def test_library_dispatch_register_missing_scope_403(boundary_client, postgres_pool):
+async def test_library_dispatch_register_missing_scope_403(
+    boundary_client, postgres_pool
+):
     """Service principal without reference:register_files scope — 403."""
     ref_idx = await _seed_active_reference(postgres_pool, "register-no-scope")
     token, _ = await _seed_service_with_token(
@@ -372,7 +380,7 @@ async def test_library_dispatch_register_missing_scope_403(boundary_client, post
         suffix="reg-no-scope",
     )
     resp = await boundary_client.post(
-        URL_LIBRARY_NAME.format(name="register-files"),
+        URL_LIBRARY_NAME.format(name=LibraryPrimitive.REGISTER_FILES),
         json={
             "scope_target": _ref_target(ref_idx),
             "inputs": {"staging_dir": "/tmp/x", "files": {}},

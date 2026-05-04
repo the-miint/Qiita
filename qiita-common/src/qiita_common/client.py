@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 
-from .api_paths import URL_LIBRARY_NAME
+from .api_paths import URL_LIBRARY_NAME, LibraryPrimitive
 from .auth_constants import API_PREFIX
 from .models import (
     DoGetTicketResponse,
@@ -128,7 +128,7 @@ class ControlPlaneClient:
         control plane can attribute the call.
         """
         outputs = await self._invoke_library(
-            name="mint-features",
+            name=LibraryPrimitive.MINT_FEATURES,
             reference_idx=reference_idx,
             inputs={"entries": [e.model_dump(mode="json") for e in entries]},
         )
@@ -140,7 +140,7 @@ class ControlPlaneClient:
         """Invoke the write-membership library primitive — link
         already-minted feature_idx values to a reference. Idempotent."""
         outputs = await self._invoke_library(
-            name="write-membership",
+            name=LibraryPrimitive.WRITE_MEMBERSHIP,
             reference_idx=reference_idx,
             inputs={"feature_idxs": feature_idxs},
         )
@@ -155,7 +155,7 @@ class ControlPlaneClient:
         """Invoke the register-files library primitive — register staged
         Parquet files into DuckLake via the data plane's DoAction."""
         outputs = await self._invoke_library(
-            name="register-files",
+            name=LibraryPrimitive.REGISTER_FILES,
             reference_idx=reference_idx,
             inputs={"staging_dir": staging_dir, "files": files},
         )

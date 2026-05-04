@@ -14,7 +14,7 @@ import uuid
 import pyarrow.flight as flight
 import pytest
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_LIBRARY_NAME
+from qiita_common.api_paths import URL_LIBRARY_NAME, LibraryPrimitive
 
 
 @pytest.fixture
@@ -148,11 +148,13 @@ async def test_e2e_create_to_doget(
     manifest = json.loads(manifest_path.read_text())
 
     # --- Mint via /library/mint-features ---
-    await client.patch(f"/api/v1/reference/{ref_idx}/status", json={"status": "minting"})
+    await client.patch(
+        f"/api/v1/reference/{ref_idx}/status", json={"status": "minting"}
+    )
     entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
     scope_target = {"kind": "reference", "reference_idx": ref_idx}
     mint_resp = await client.post(
-        URL_LIBRARY_NAME.format(name="mint-features"),
+        URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
         json={"scope_target": scope_target, "inputs": {"entries": entries}},
         headers=worker_headers,
     )
@@ -166,14 +168,16 @@ async def test_e2e_create_to_doget(
     # --- Membership via /library/write-membership ---
     feature_idxs = list(mint_outputs["mapping"].values())
     membership_resp = await client.post(
-        URL_LIBRARY_NAME.format(name="write-membership"),
+        URL_LIBRARY_NAME.format(name=LibraryPrimitive.WRITE_MEMBERSHIP),
         json={"scope_target": scope_target, "inputs": {"feature_idxs": feature_idxs}},
         headers=worker_headers,
     )
     assert membership_resp.status_code == 200, membership_resp.text
 
     # --- Load (write Parquet to staging) ---
-    await client.patch(f"/api/v1/reference/{ref_idx}/status", json={"status": "loading"})
+    await client.patch(
+        f"/api/v1/reference/{ref_idx}/status", json={"status": "loading"}
+    )
     staging_dir = tmp_path / "staging"
     await backend.run_step(
         "load",
@@ -190,7 +194,7 @@ async def test_e2e_create_to_doget(
 
     # --- Register via /library/register-files (control-plane → data-plane DoAction) ---
     reg_resp = await client.post(
-        URL_LIBRARY_NAME.format(name="register-files"),
+        URL_LIBRARY_NAME.format(name=LibraryPrimitive.REGISTER_FILES),
         json={
             "scope_target": scope_target,
             "inputs": {
@@ -278,11 +282,13 @@ async def test_e2e_doget_taxonomy(
     )
     manifest_path = hash_result["manifest"]
     manifest = json.loads(manifest_path.read_text())
-    await client.patch(f"/api/v1/reference/{ref_idx}/status", json={"status": "minting"})
+    await client.patch(
+        f"/api/v1/reference/{ref_idx}/status", json={"status": "minting"}
+    )
     entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
     scope_target = {"kind": "reference", "reference_idx": ref_idx}
     mint_resp = await client.post(
-        URL_LIBRARY_NAME.format(name="mint-features"),
+        URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
         json={"scope_target": scope_target, "inputs": {"entries": entries}},
         headers=worker_headers,
     )
@@ -294,12 +300,14 @@ async def test_e2e_doget_taxonomy(
 
     feature_idxs = list(mint_outputs["mapping"].values())
     await client.post(
-        URL_LIBRARY_NAME.format(name="write-membership"),
+        URL_LIBRARY_NAME.format(name=LibraryPrimitive.WRITE_MEMBERSHIP),
         json={"scope_target": scope_target, "inputs": {"feature_idxs": feature_idxs}},
         headers=worker_headers,
     )
 
-    await client.patch(f"/api/v1/reference/{ref_idx}/status", json={"status": "loading"})
+    await client.patch(
+        f"/api/v1/reference/{ref_idx}/status", json={"status": "loading"}
+    )
     staging = tmp_path / "s"
     await backend.run_step(
         "load",
@@ -313,7 +321,7 @@ async def test_e2e_doget_taxonomy(
         reference_idx=ref_idx,
     )
     reg_resp = await client.post(
-        URL_LIBRARY_NAME.format(name="register-files"),
+        URL_LIBRARY_NAME.format(name=LibraryPrimitive.REGISTER_FILES),
         json={
             "scope_target": scope_target,
             "inputs": {
@@ -329,9 +337,7 @@ async def test_e2e_doget_taxonomy(
         headers=worker_headers,
     )
     assert reg_resp.status_code == 200, reg_resp.text
-    await client.patch(
-        f"/api/v1/reference/{ref_idx}/status", json={"status": "active"}
-    )
+    await client.patch(f"/api/v1/reference/{ref_idx}/status", json={"status": "active"})
 
     # Sign ticket for taxonomy, scoped by feature_idx
     ticket_resp = await client.post(

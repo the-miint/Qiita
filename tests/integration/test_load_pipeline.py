@@ -9,7 +9,12 @@ import uuid
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_LIBRARY_NAME, URL_REFERENCE_PREFIX, URL_REFERENCE_STATUS
+from qiita_common.api_paths import (
+    URL_LIBRARY_NAME,
+    URL_REFERENCE_PREFIX,
+    URL_REFERENCE_STATUS,
+    LibraryPrimitive,
+)
 
 
 @pytest.fixture
@@ -59,7 +64,9 @@ async def ref_for_load(client, postgres_pool):
     await postgres_pool.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
-    await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
+    await postgres_pool.execute(
+        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
+    )
 
 
 TEST_SEQUENCES = {
@@ -141,7 +148,7 @@ async def test_full_load_pipeline(
     await client.patch(status_url, json={"status": "minting"})
     entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
     mint_resp = await client.post(
-        URL_LIBRARY_NAME.format(name="mint-features"),
+        URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
         json={
             "scope_target": {"kind": "reference", "reference_idx": ref_idx},
             "inputs": {"entries": entries},
@@ -154,7 +161,7 @@ async def test_full_load_pipeline(
     # --- Membership phase ---
     feature_idxs = list(mint_outputs["mapping"].values())
     membership_resp = await client.post(
-        URL_LIBRARY_NAME.format(name="write-membership"),
+        URL_LIBRARY_NAME.format(name=LibraryPrimitive.WRITE_MEMBERSHIP),
         json={
             "scope_target": {"kind": "reference", "reference_idx": ref_idx},
             "inputs": {"feature_idxs": feature_idxs},
