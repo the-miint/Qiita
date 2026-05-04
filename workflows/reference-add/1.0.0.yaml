@@ -21,6 +21,10 @@ context_schema:
   required: [fasta_path]
   properties:
     fasta_path: {type: string}
+    # Optional Parquet with (read_id, genome_source, genome_source_id).
+    # When present, mint-features additionally writes qiita.feature_genome
+    # rows JOINed against the manifest's read_id.
+    genome_map_path: {type: string}
 
 success_status: active
 failure_status: failed
@@ -44,6 +48,7 @@ steps:
 
   - action: write-membership
     inputs: [feature_map]
+    outputs: []
 
   - step: load
     step_type: singleton
@@ -58,6 +63,7 @@ steps:
 
   - action: register-files
     inputs: [staging_dir]
+    outputs: []
 
 action_ceiling:
   cpu: 16

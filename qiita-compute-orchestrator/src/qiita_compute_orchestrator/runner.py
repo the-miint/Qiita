@@ -283,7 +283,16 @@ async def _dispatch_step(
     call backend.run_step; record outputs under the YAML's declared
     names so subsequent entries can reference them."""
     inputs = {name: Path(bound[name]) for name in entry.inputs}
-    reference_idx = scope_target.get("reference_idx", 0)
+    # Backend steps that need a reference_idx (today: hash, load) only run
+    # under reference-scoped tickets. Refuse to silently substitute a 0
+    # for non-reference scope_targets — fail-fast tells the operator the
+    # workflow YAML and the ticket scope are mismatched.
+    if scope_target["kind"] != ScopeTargetKind.REFERENCE.value:
+        raise RuntimeError(
+            f"backend step {entry.name!r} requires a reference scope_target; "
+            f"got kind={scope_target['kind']!r}"
+        )
+    reference_idx = scope_target["reference_idx"]
     raw_outputs = await backend.run_step(entry.name, inputs, workspace, reference_idx=reference_idx)
     # Convention: the backend's output dict keys match the YAML's
     # `outputs:` names exactly. A mismatch is a workflow authoring
@@ -304,10 +313,16 @@ async def _dispatch_action(
     would just push the same `if name == ...` ladder somewhere else."""
     if entry.name == LibraryPrimitive.MINT_FEATURES:
         manifest_path = Path(bound[entry.inputs[0]])
+        # `genome_map_path` is a workflow-context optional, not an entry
+        # input — the YAML's mint-features `inputs:` stays single-valued.
+        # Pulled directly from `bound` so a ticket whose action_context
+        # carries it picks up genome-association writes for free.
+        genome_map = bound.get("genome_map_path")
         resp = await client.mint_features(
             reference_idx=scope_target["reference_idx"],
             manifest_path=manifest_path,
             output_dir=workspace,
+            genome_map_path=Path(genome_map) if genome_map else None,
         )
         # YAML declares one output (typically "feature_map"); bind it.
         return {entry.outputs[0]: Path(resp.feature_map_path)}

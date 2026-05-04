@@ -122,6 +122,7 @@ class ControlPlaneClient:
         reference_idx: int,
         manifest_path: Path,
         output_dir: Path,
+        genome_map_path: Path | None = None,
     ) -> FeatureMintResponse:
         """Invoke the mint-features library primitive.
 
@@ -130,18 +131,25 @@ class ControlPlaneClient:
         `output_dir` is where the primitive will write feature_map.parquet.
         Both must live on a workspace shared with the control plane.
 
+        `genome_map_path`, if supplied, is a Parquet file with columns
+        `(read_id, genome_source, genome_source_id)`. When set, the
+        primitive also writes qiita.feature_genome rows for each entry.
+
         Returns FeatureMintResponse(feature_map_path, minted, reused).
         Reference-agnostic at the library level; reference_idx flows into
         the dispatch envelope's scope_target only so the control plane
         can attribute the call.
         """
+        inputs: dict[str, Any] = {
+            "manifest_path": str(manifest_path),
+            "output_dir": str(output_dir),
+        }
+        if genome_map_path is not None:
+            inputs["genome_map_path"] = str(genome_map_path)
         outputs = await self._invoke_library(
             name=LibraryPrimitive.MINT_FEATURES,
             reference_idx=reference_idx,
-            inputs={
-                "manifest_path": str(manifest_path),
-                "output_dir": str(output_dir),
-            },
+            inputs=inputs,
         )
         return FeatureMintResponse.model_validate(outputs)
 

@@ -97,14 +97,20 @@ async def _mint_chunk(
 
 async def _write_genome_associations(
     conn: asyncpg.Connection,
-    entries: list[FeatureHashEntry],
-    mapping: dict[UUID, int],
+    feat_idxs: list[int],
+    sources: list[str],
+    source_ids: list[str],
 ) -> None:
-    """Batch upsert genomes and write feature_genome junction rows."""
-    sources = [e.genome_source for e in entries]
-    source_ids = [e.genome_source_id for e in entries]
+    """Batch upsert genomes and write feature_genome junction rows.
 
-    # Batch upsert genomes — DO UPDATE to guarantee RETURNING for every row.
+    All three lists are positionally aligned: row i links
+    feat_idxs[i] to (sources[i], source_ids[i]). DO UPDATE on the genome
+    upsert guarantees RETURNING fires for every row even when the genome
+    already exists.
+    """
+    if not feat_idxs:
+        return
+
     genome_rows = await conn.fetch(
         "INSERT INTO qiita.genome (source, source_id)"
         " SELECT unnest($1::text[]), unnest($2::text[])"
@@ -115,8 +121,7 @@ async def _write_genome_associations(
     )
     genome_map = {(row["source"], row["source_id"]): row["genome_idx"] for row in genome_rows}
 
-    feat_idxs = [mapping[e.sequence_hash] for e in entries]
-    genome_idxs = [genome_map[(e.genome_source, e.genome_source_id)] for e in entries]
+    genome_idxs = [genome_map[(s, sid)] for s, sid in zip(sources, source_ids, strict=True)]
     await conn.execute(
         "INSERT INTO qiita.feature_genome (feature_idx, genome_idx)"
         " SELECT unnest($1::bigint[]), unnest($2::bigint[])"
@@ -124,6 +129,37 @@ async def _write_genome_associations(
         feat_idxs,
         genome_idxs,
     )
+
+
+async def _associate_genomes(
+    pool: asyncpg.Pool,
+    manifest_path: Path,
+    genome_map_path: Path,
+    feature_mapping: dict[UUID, int],
+) -> None:
+    """Write qiita.feature_genome rows for the entries in `genome_map_path`.
+
+    DuckDB JOINs manifest (read_id → sequence_hash) against genome_map
+    (read_id → genome_source, genome_source_id) on read_id. Rows whose
+    read_id isn't in the manifest are dropped by the INNER JOIN — the
+    genome map may legitimately cover only a subset of FASTA reads.
+    """
+    with duckdb.connect(":memory:") as duck:
+        rows = duck.execute(
+            "SELECT m.sequence_hash, g.genome_source, g.genome_source_id"
+            " FROM read_parquet(?) AS m"
+            " JOIN read_parquet(?) AS g USING (read_id)"
+            " ORDER BY m.sequence_hash",
+            [str(manifest_path), str(genome_map_path)],
+        ).fetchall()
+
+    for i in range(0, len(rows), _CHUNK_SIZE):
+        chunk = rows[i : i + _CHUNK_SIZE]
+        feat_idxs = [feature_mapping[h] for h, _, _ in chunk]
+        sources = [s for _, s, _ in chunk]
+        source_ids = [sid for _, _, sid in chunk]
+        async with pool.acquire() as conn, conn.transaction():
+            await _write_genome_associations(conn, feat_idxs, sources, source_ids)
 
 
 async def _write_membership_rows(
@@ -169,6 +205,7 @@ async def mint_features(
     pool: asyncpg.Pool,
     manifest_path: Path,
     output_dir: Path,
+    genome_map_path: Path | None = None,
 ) -> tuple[Path, int, int]:
     """Mint feature_idx values for sequence hashes in a manifest Parquet file.
 
@@ -184,9 +221,19 @@ async def mint_features(
 
     Reference-agnostic — the mint operation does not touch any reference
     table.
+
+    If `genome_map_path` is supplied, qiita.feature_genome rows are also
+    written for each entry in that Parquet. Schema:
+    `(read_id TEXT, genome_source TEXT, genome_source_id TEXT)`. The
+    read_id key is JOINed against the manifest's read_id; rows whose
+    read_id isn't in the manifest are dropped (a genome map may cover
+    only a subset of the FASTA's reads, e.g. amplicon mixed with full
+    genomes).
     """
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+    if genome_map_path is not None and not genome_map_path.exists():
+        raise FileNotFoundError(f"Genome map not found: {genome_map_path}")
     output_dir.mkdir(parents=True, exist_ok=True)
     feature_map_path = output_dir / "feature_map.parquet"
 
@@ -227,6 +274,9 @@ async def mint_features(
             "      ORDER BY feature_idx) "
             f"TO '{out}' (FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd')"
         )
+
+    if genome_map_path is not None:
+        await _associate_genomes(pool, manifest_path, genome_map_path, full_mapping)
 
     return feature_map_path, total_minted, total_reused
 

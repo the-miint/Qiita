@@ -101,6 +101,7 @@ async def invoke_library(
 async def _dispatch_mint_features(body: LibraryInvocation, pool: asyncpg.Pool) -> LibraryResponse:
     manifest_path = body.inputs.get("manifest_path")
     output_dir = body.inputs.get("output_dir")
+    genome_map_path = body.inputs.get("genome_map_path")
     if not isinstance(manifest_path, str):
         raise HTTPException(
             status_code=422,
@@ -111,9 +112,17 @@ async def _dispatch_mint_features(body: LibraryInvocation, pool: asyncpg.Pool) -
             status_code=422,
             detail="mint-features requires inputs.output_dir (string)",
         )
+    if genome_map_path is not None and not isinstance(genome_map_path, str):
+        raise HTTPException(
+            status_code=422,
+            detail="mint-features inputs.genome_map_path must be a string when present",
+        )
     try:
         feature_map_path, minted, reused = await _library.mint_features(
-            pool, Path(manifest_path), Path(output_dir)
+            pool,
+            Path(manifest_path),
+            Path(output_dir),
+            genome_map_path=Path(genome_map_path) if genome_map_path else None,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

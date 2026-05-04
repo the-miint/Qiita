@@ -123,6 +123,65 @@ async def test_library_write_membership_dispatch(postgres_pool, tmp_path, fresh_
     assert already_linked2 == 3
 
 
+async def test_library_mint_features_writes_genome_associations(postgres_pool, tmp_path):
+    """When `genome_map_path` is supplied, mint-features additionally
+    populates qiita.genome and qiita.feature_genome.
+
+    Schema: genome_map Parquet has (read_id, genome_source, genome_source_id)
+    keyed by the FASTA-level read_id. The library JOINs against the
+    manifest's read_id to resolve sequence_hash → feature_idx. Reads not
+    present in the genome map are silently dropped (an INNER JOIN).
+    """
+    from qiita_common.api_paths import LibraryPrimitive
+    from qiita_control_plane.actions import LIBRARY
+
+    # Three reads; the genome map covers the first two only — exercises
+    # the "subset of FASTA" case (mixed amplicon + full genome references).
+    hashes = [_md5_uuid(f"GEN{i}") for i in range(3)]
+    manifest = tmp_path / "manifest.parquet"
+    _write_manifest(manifest, hashes)
+
+    genome_source = f"src-{uuid.uuid4()}"
+    source_ids = [f"GENOME_{uuid.uuid4()}" for _ in range(2)]
+    genome_map = tmp_path / "genome_map.parquet"
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(
+            "CREATE TEMP TABLE gm "
+            "(read_id VARCHAR, genome_source VARCHAR, genome_source_id VARCHAR)"
+        )
+        conn.executemany(
+            "INSERT INTO gm VALUES (?, ?, ?)",
+            [(f"seq{i}", genome_source, source_ids[i]) for i in range(2)],
+        )
+        conn.execute(f"COPY gm TO '{genome_map}' (FORMAT PARQUET)")
+
+    feature_map_path, minted, _ = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
+        postgres_pool, manifest, tmp_path, genome_map
+    )
+    assert minted == 3
+
+    mapping = _read_feature_map(feature_map_path)
+    expected_feat_idxs = sorted(mapping[str(hashes[i])] for i in range(2))
+    rows = await postgres_pool.fetch(
+        "SELECT fg.feature_idx, g.source, g.source_id"
+        " FROM qiita.feature_genome fg"
+        " JOIN qiita.genome g USING (genome_idx)"
+        " WHERE fg.feature_idx = ANY($1::bigint[])"
+        " ORDER BY fg.feature_idx",
+        expected_feat_idxs,
+    )
+    assert [r["feature_idx"] for r in rows] == expected_feat_idxs
+    assert {r["source"] for r in rows} == {genome_source}
+    assert sorted(r["source_id"] for r in rows) == sorted(source_ids)
+
+    # The third read (seq2) has no genome row.
+    no_genome = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.feature_genome WHERE feature_idx = $1",
+        mapping[str(hashes[2])],
+    )
+    assert no_genome == 0
+
+
 async def test_library_write_membership_raises_on_unknown_feature_idx(
     postgres_pool, tmp_path, fresh_reference
 ):
