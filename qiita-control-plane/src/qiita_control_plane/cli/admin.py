@@ -17,6 +17,11 @@ Subcommands:
                      the handoff to redirect back with a one-time code,
                      exchanges the code at /api/v1/auth/cli-exchange for
                      a PAT, and writes the PAT to ~/.qiita/token (0600).
+  actions sync     — read every action YAML under --workflows-dir and upsert
+                     YAML-authoritative columns into qiita.action. Direct DB
+                     write; reads DATABASE_URL from env. Idempotent: re-runs
+                     converge to the YAML state without touching operational
+                     columns (enabled / first_seen_at / disabled_*).
 
 Authentication for HTTP subcommands: read PAT from QIITA_TOKEN env var or
 from ~/.qiita/token (mode 0600 expected).
@@ -36,7 +41,14 @@ from pathlib import Path
 
 import asyncpg
 import httpx
+from pydantic import ValidationError
 from qiita_common.auth_constants import API_PREFIX, SYSTEM_PRINCIPAL_IDX, SystemRole
+
+from qiita_control_plane.actions import (
+    DuplicateActionError,
+    load_actions,
+    sync_actions,
+)
 
 _TOKEN_FILE_DEFAULT = Path.home() / ".qiita" / "token"
 
@@ -130,6 +142,31 @@ async def _set_system_role(database_url: str, email: str, role: str) -> int:
         return idx
     finally:
         await conn.close()
+
+
+# ---------------------------------------------------------------------------
+# actions sync — direct-DB upsert of YAML-authoritative columns
+# ---------------------------------------------------------------------------
+
+
+async def _sync_actions(database_url: str, workflows_dir: Path) -> dict:
+    """Load every action YAML under workflows_dir, then upsert into
+    qiita.action inside one transaction. Returns a dict with counts of
+    inserted, updated, and total actions found."""
+    actions = load_actions(workflows_dir)
+    if not actions:
+        return {"found": 0, "inserted": 0, "updated": 0}
+    try:
+        conn = await asyncpg.connect(database_url, timeout=_DB_CONNECT_TIMEOUT_SECONDS)
+    except Exception as exc:  # noqa: BLE001 — show full reason, including OS errors
+        raise RuntimeError(
+            f"could not connect to DATABASE_URL: {type(exc).__name__}: {exc}"
+        ) from exc
+    try:
+        result = await sync_actions(conn, actions)
+    finally:
+        await conn.close()
+    return {"found": len(actions), **result}
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +473,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Where to write the PAT (default {_TOKEN_FILE_DEFAULT})",
     )
 
+    p_actions = sub.add_parser("actions", help="Action registry operations")
+    p_actions_sub = p_actions.add_subparsers(dest="actions_cmd", required=True)
+    p_actions_sync = p_actions_sub.add_parser(
+        "sync",
+        help="Upsert workflows YAMLs into qiita.action (YAML-authoritative columns only)",
+    )
+    p_actions_sync.add_argument(
+        "--workflows-dir",
+        type=Path,
+        default=Path("workflows"),
+        help="Directory to scan for action YAMLs (default: ./workflows)",
+    )
+
     return parser
 
 
@@ -467,6 +517,23 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "login":
         return _do_login(base_url=args.base_url, token_file=args.token_file)
+
+    if args.cmd == "actions":
+        if args.actions_cmd == "sync":
+            database_url = os.environ.get("DATABASE_URL")
+            if not database_url:
+                print("error: DATABASE_URL not set", file=sys.stderr)
+                return 2
+            try:
+                result = asyncio.run(_sync_actions(database_url, args.workflows_dir))
+            except (FileNotFoundError, DuplicateActionError, ValidationError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            except RuntimeError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            print(json.dumps(result, indent=2))
+            return 0
 
     parser.error(f"unknown command: {args.cmd}")
     return 2

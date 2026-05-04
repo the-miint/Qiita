@@ -1,4 +1,4 @@
-.PHONY: build test test-python test-rust test-integration test-workflows lint lint-python lint-rust deploy migrate clean verify-health dev-setup install-hooks
+.PHONY: build test test-python test-rust test-integration test-workflows lint lint-python lint-rust deploy migrate sync-actions clean verify-health dev-setup install-hooks
 .PHONY: build-common build-control-plane build-data-plane build-data-plane-debug build-compute-orchestrator build-workflows
 .PHONY: test-common test-control-plane test-data-plane test-compute-orchestrator
 .PHONY: lint-common lint-control-plane lint-data-plane lint-compute-orchestrator
@@ -166,6 +166,15 @@ $(GRPCURL_BIN):
 # Run database migrations
 migrate: $(DBMATE_BIN)
 	cd qiita-control-plane && $(DBMATE_BIN) --migrations-table public.schema_migrations --no-dump-schema up
+
+# Sync action YAMLs from workflows/ into qiita.action.
+# Idempotent: only writes YAML-authoritative columns; operational columns
+# (enabled, first_seen_at, disabled_*) are preserved across runs. CI runs
+# this on deploy after `make migrate`; operators can re-run by hand for
+# manual recovery (e.g., to push a hotfixed YAML without redeploying).
+# Reads DATABASE_URL from env, same as `make migrate`.
+sync-actions:
+	cd qiita-control-plane && uv run qiita-admin actions sync --workflows-dir ../workflows
 
 # Build and print deploy instructions (no sudo)
 deploy: build

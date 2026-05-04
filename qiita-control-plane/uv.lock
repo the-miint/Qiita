@@ -506,6 +506,7 @@ dependencies = [
     { name = "httpx" },
     { name = "pyarrow" },
     { name = "pyjwt", extra = ["crypto"] },
+    { name = "pyyaml" },
     { name = "qiita-common" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -525,6 +526,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "pyarrow", specifier = ">=19" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.9" },
+    { name = "pyyaml", specifier = ">=6" },
     { name = "qiita-common", directory = "../qiita-common" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
 ]
