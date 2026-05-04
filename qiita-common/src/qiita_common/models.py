@@ -57,6 +57,14 @@ class ReferenceResponse(BaseModel):
     created_at: AwareDatetime
 
 
+# `genome_source` / `genome_source_id` and the `genome_fields_consistent`
+# validator predate the Parquet refactor (commit 3cac813); under the
+# path-based contract genome metadata flows through `genome_map.parquet`
+# and the half-set check is enforced at the qiita.genome NOT NULL
+# constraint instead (covered by
+# test_library_mint_features_genome_map_with_null_source_id_fails). The
+# fields and validator are kept so any caller that builds the model with
+# genome data still gets the validator's protection.
 class FeatureHashEntry(BaseModel):
     sequence_hash: UUID
     genome_source: str | None = None
@@ -84,13 +92,16 @@ class FeatureMintResponse(BaseModel):
     reused: int
 
 
+# Wire-format definition kept for reference; the per-resource route this
+# model serviced (POST /reference/{idx}/membership) was folded into the
+# generic /api/v1/library/{name} dispatcher in commit 3cac813. The new
+# wire shape is LibraryInvocation.inputs = {"feature_map_path": str}.
 class ReferenceMembershipRequest(BaseModel):
-    """Body for POST /reference/{reference_idx}/membership.
+    """Body for the legacy POST /reference/{reference_idx}/membership.
 
-    Links already-minted feature_idx values to a reference. Mint and
-    membership-write are split so that actions which produce features
-    (e.g. amplicon denoising) can call /feature/mint without a reference,
-    and reference-add wires the two together via the orchestrator.
+    Links already-minted feature_idx values to a reference via an inline
+    list. Replaced by Parquet-path input on /api/v1/library/write-membership
+    — see qiita_control_plane.actions.library.write_membership.
     """
 
     feature_idxs: list[Annotated[int, Field(gt=0)]] = Field(min_length=1)
@@ -159,6 +170,10 @@ class ReferenceStatusUpdate(BaseModel):
     status: ReferenceStatus
 
 
+# Wire-format definition kept for reference; the per-resource route this
+# model serviced (POST /reference/{idx}/register) was folded into the
+# generic /api/v1/library/{name} dispatcher in commit 3cac813. The new
+# wire shape is LibraryInvocation.inputs = {"staging_dir": str, "files": dict}.
 class RegisterFilesRequest(BaseModel):
     staging_dir: str = Field(min_length=1)
     files: dict[str, str]  # {filename: ducklake_table_name}

@@ -465,7 +465,7 @@ async def test_get_reference_anonymous_returns_200(boundary_client, postgres_poo
     assert resp.status_code == 200
     body = resp.json()
     assert body["reference_idx"] == ref_idx
-    assert body["created_by_idx"] is not None  # H.b dual-write invariant
+    assert body["created_by_idx"] is not None
 
 
 async def test_get_reference_authenticated_returns_200(boundary_client, postgres_pool):

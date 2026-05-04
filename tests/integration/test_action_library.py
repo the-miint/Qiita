@@ -270,9 +270,9 @@ async def test_library_mint_features_mixed_novel_and_reused(postgres_pool, tmp_p
 async def test_library_mint_features_cross_call_dedup(postgres_pool, tmp_path):
     """Mint is reference-agnostic and globally deduplicating: minting the
     same hash twice in unrelated calls (whatever the caller's intent)
-    returns the same feature_idx on the second call. This is the new
-    home of the pre-branch `cross_reference_deduplication` contract —
-    qiita.feature is the global scope."""
+    returns the same feature_idx on the second call. qiita.feature is
+    the global scope, so callers targeting different references still
+    converge on a shared feature_idx for identical sequence content."""
     from qiita_common.api_paths import LibraryPrimitive
     from qiita_control_plane.actions import LIBRARY
 
@@ -344,10 +344,9 @@ async def test_library_mint_features_genome_writes_are_idempotent(
 
 
 async def test_library_mint_features_handles_empty_manifest(postgres_pool, tmp_path):
-    """Empty manifest is accepted under the path-based contract — pre-branch
-    the route returned HTTP 422 ("empty entries list"), but a manifest is
-    the FASTA-derived ground truth, and an empty manifest validly means
-    "this FASTA had no sequences." Output: minted=0, reused=0, an empty
+    """Empty manifest is a valid degenerate state ("this FASTA had no
+    sequences"). The manifest is the FASTA-derived ground truth, so an
+    empty Parquet flows through cleanly: minted=0, reused=0, an empty
     feature_map.parquet on disk."""
     from qiita_common.api_paths import LibraryPrimitive
     from qiita_control_plane.actions import LIBRARY
@@ -368,11 +367,11 @@ async def test_library_mint_features_dedupes_within_batch_duplicates(
     postgres_pool, tmp_path
 ):
     """A manifest with the same sequence_hash on two distinct read_ids
-    silently dedupes to one feature row — pre-branch this returned HTTP
-    422 ("duplicate hashes in request"), but under the path-based
-    contract identical sequences validly share a sequence_hash (two
-    reads with identical content). Net effect: minted=1, reused=0, one
-    feature_map entry, regardless of how many reads pointed to the hash."""
+    silently dedupes to one feature row. Identical sequences validly
+    share a sequence_hash (two reads with identical content), so the
+    manifest doesn't need to enforce uniqueness on that column. Net
+    effect: minted=1, reused=0, one feature_map entry, regardless of
+    how many reads point to the hash."""
     from qiita_common.api_paths import LibraryPrimitive
     from qiita_control_plane.actions import LIBRARY
 
@@ -394,10 +393,10 @@ async def test_library_mint_features_genome_map_with_null_source_id_fails(
     postgres_pool, tmp_path
 ):
     """A genome_map row with NULL in either genome_source or
-    genome_source_id fails at the qiita.genome NOT NULL constraint.
-    The path-based contract relies on the genome map being well-formed
-    upstream; pre-branch the FeatureHashEntry validator caught this at
-    the route layer with HTTP 422."""
+    genome_source_id fails at the qiita.genome NOT NULL constraint
+    (surfaced as asyncpg.NotNullViolationError). The contract is that
+    the genome map is well-formed upstream — the DB constraint is the
+    backstop, not the primary validation."""
     from qiita_common.api_paths import LibraryPrimitive
     from qiita_control_plane.actions import LIBRARY
 
