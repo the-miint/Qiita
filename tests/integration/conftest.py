@@ -20,6 +20,8 @@ import asyncpg
 import httpx
 import pytest
 import pytest_asyncio
+from qiita_common.api_paths import LOOPBACK_HOST
+
 from _pg_env import (
     LIB_PATH_ENV,
     ducklake_catalog_connstr,
@@ -108,14 +110,14 @@ class JwksHarness:
         self._private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         self._kid = f"kid-{secrets.token_hex(4)}"
         self._jwks = self._build_jwks(self._private_key, self._kid)
-        self._server = http.server.HTTPServer(("127.0.0.1", 0), self._make_handler())
+        self._server = http.server.HTTPServer((LOOPBACK_HOST, 0), self._make_handler())
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
     @property
     def issuer(self) -> str:
-        return f"http://127.0.0.1:{self.port}"
+        return f"http://{LOOPBACK_HOST}:{self.port}"
 
     @property
     def jwks_url(self) -> str:
@@ -429,7 +431,7 @@ def _wait_for_grpc(host: str, port: int, timeout: float = 10.0) -> bool:
 
 def _alloc_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
+        s.bind((LOOPBACK_HOST, 0))
         return s.getsockname()[1]
 
 
@@ -485,7 +487,7 @@ def data_plane(hmac_secret, tmp_path_factory):
 
     env = {
         **os.environ,
-        "LISTEN_ADDR": f"127.0.0.1:{port}",
+        "LISTEN_ADDR": f"{LOOPBACK_HOST}:{port}",
         "HMAC_SECRET_KEY": base64.b64encode(hmac_secret).decode(),
         "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CATALOG_CONNSTR,
         "DUCKLAKE_DATA_PATH": data_path,
@@ -508,7 +510,7 @@ def data_plane(hmac_secret, tmp_path_factory):
             f"stdout: {stdout.decode()[:1000]}\nstderr: {stderr.decode()[:1000]}"
         )
 
-    if not _wait_for_grpc("127.0.0.1", port):
+    if not _wait_for_grpc(LOOPBACK_HOST, port):
         rc = proc.poll()
         if rc is not None:
             stdout, stderr = proc.communicate(timeout=5)

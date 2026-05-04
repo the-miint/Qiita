@@ -6,6 +6,7 @@ import uuid
 import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
+    LOOPBACK_HOST,
     URL_LIBRARY_NAME,
     URL_REFERENCE_PREFIX,
     LibraryPrimitive,
@@ -29,7 +30,7 @@ async def client(postgres_pool, hmac_secret, human_admin_session):
     app.state.settings = Settings(
         database_url="unused-in-test",
         hmac_secret_key=hmac_secret,
-        data_plane_url="grpc://127.0.0.1:0",
+        data_plane_url=f"grpc://{LOOPBACK_HOST}:0",
     )
     async with AsyncClient(
         transport=ASGITransport(app=app),

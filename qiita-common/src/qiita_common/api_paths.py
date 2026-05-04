@@ -29,6 +29,16 @@ from enum import StrEnum
 from qiita_common.auth_constants import API_PREFIX
 
 # =============================================================================
+# Network constants
+# =============================================================================
+
+# IPv4 loopback. Used for test-fixture binds, CLI loopback servers (OAuth
+# return URLs), and dev-mode service URLs. A future "switch to ::1" or
+# "bind to 0.0.0.0 in container" change becomes a one-line edit here
+# rather than a cross-cutting find/replace.
+LOOPBACK_HOST = "127.0.0.1"
+
+# =============================================================================
 # /reference/*
 # =============================================================================
 

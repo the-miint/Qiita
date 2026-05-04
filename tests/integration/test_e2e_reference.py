@@ -14,12 +14,12 @@ import uuid
 import pyarrow.flight as flight
 import pytest
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_LIBRARY_NAME, LibraryPrimitive
+from qiita_common.api_paths import LOOPBACK_HOST, URL_LIBRARY_NAME, LibraryPrimitive
 
 
 @pytest.fixture
 def flight_client(data_plane):
-    client = flight.FlightClient(f"grpc://127.0.0.1:{data_plane['port']}")
+    client = flight.FlightClient(f"grpc://{LOOPBACK_HOST}:{data_plane['port']}")
     yield client
     client.close()
 
@@ -39,7 +39,7 @@ async def client(postgres_pool, hmac_secret, data_plane, human_admin_session):
     app.state.settings = Settings(
         database_url="unused-in-test",
         hmac_secret_key=hmac_secret,
-        data_plane_url=f"grpc://127.0.0.1:{data_plane['port']}",
+        data_plane_url=f"grpc://{LOOPBACK_HOST}:{data_plane['port']}",
     )
     async with AsyncClient(
         transport=ASGITransport(app=app),

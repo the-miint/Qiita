@@ -42,6 +42,7 @@ from pathlib import Path
 import asyncpg
 import httpx
 from pydantic import ValidationError
+from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.auth_constants import API_PREFIX, SYSTEM_PRINCIPAL_IDX, SystemRole
 
 from qiita_control_plane.actions import (
@@ -306,11 +307,11 @@ def _bind_loopback(*, preferred_ports: tuple[int, ...] = ()) -> tuple[http.serve
     """
     for port in preferred_ports:
         try:
-            srv = http.server.HTTPServer(("127.0.0.1", port), http.server.BaseHTTPRequestHandler)
+            srv = http.server.HTTPServer((LOOPBACK_HOST, port), http.server.BaseHTTPRequestHandler)
             return srv, port
         except OSError:
             continue
-    srv = http.server.HTTPServer(("127.0.0.1", 0), http.server.BaseHTTPRequestHandler)
+    srv = http.server.HTTPServer((LOOPBACK_HOST, 0), http.server.BaseHTTPRequestHandler)
     return srv, srv.server_address[1]
 
 

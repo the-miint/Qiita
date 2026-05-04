@@ -14,6 +14,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from qiita_common.api_paths import LOOPBACK_HOST
 
 from qiita_control_plane.cli.admin import (
     _bind_loopback,
@@ -46,7 +47,7 @@ def loopback_server():
 def test_loopback_captures_ot_code_and_signals_main_thread(loopback_server):
     server, port, result = loopback_server
 
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+    conn = http.client.HTTPConnection(LOOPBACK_HOST, port, timeout=2)
     conn.request("GET", "/?ot_code=hello-world-123")
     resp = conn.getresponse()
     body = resp.read()
@@ -64,7 +65,7 @@ def test_loopback_ignores_favicon_and_other_probes(loopback_server):
     server, port, result = loopback_server
 
     for path in ("/favicon.ico", "/robots.txt", "/some-random-path"):
-        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+        conn = http.client.HTTPConnection(LOOPBACK_HOST, port, timeout=2)
         conn.request("GET", path)
         resp = conn.getresponse()
         resp.read()
@@ -79,7 +80,7 @@ def test_loopback_ignores_root_get_without_ot_code(loopback_server):
     the ?ot_code= query param to set the event."""
     server, port, result = loopback_server
 
-    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+    conn = http.client.HTTPConnection(LOOPBACK_HOST, port, timeout=2)
     conn.request("GET", "/")
     resp = conn.getresponse()
     resp.read()

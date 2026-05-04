@@ -7,6 +7,7 @@ a short-lived DuckDB connection after the data plane is live.
 
 import pyarrow.flight as flight
 import pytest
+from qiita_common.api_paths import LOOPBACK_HOST
 
 from conftest import ducklake_connect
 
@@ -38,7 +39,7 @@ def _seed_reference_rows(data_plane):
 
 @pytest.fixture
 def flight_client(data_plane):
-    client = flight.FlightClient(f"grpc://127.0.0.1:{data_plane['port']}")
+    client = flight.FlightClient(f"grpc://{LOOPBACK_HOST}:{data_plane['port']}")
     yield client
     client.close()
 

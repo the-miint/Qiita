@@ -37,7 +37,7 @@ from _pg_env import (
     postgres_url,
 )
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_LIBRARY_NAME, LibraryPrimitive
+from qiita_common.api_paths import LOOPBACK_HOST, URL_LIBRARY_NAME, LibraryPrimitive
 
 DATA_DIR = Path(__file__).parent.parent.parent / "localdocs" / "scratch"
 FASTA = DATA_DIR / "2024.09.backbone.sequence.fna.gz"
@@ -133,7 +133,7 @@ def data_plane_process(hmac_secret):
 
     env = {
         **os.environ,
-        "LISTEN_ADDR": f"127.0.0.1:{DATA_PLANE_PORT}",
+        "LISTEN_ADDR": f"{LOOPBACK_HOST}:{DATA_PLANE_PORT}",
         "HMAC_SECRET_KEY": base64.b64encode(hmac_secret).decode(),
         "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CATALOG_CONNSTR,
         "DUCKLAKE_DATA_PATH": DUCKLAKE_DATA_PATH,
@@ -155,7 +155,7 @@ def data_plane_process(hmac_secret):
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         try:
-            with socket.create_connection(("127.0.0.1", DATA_PLANE_PORT), timeout=1.0):
+            with socket.create_connection((LOOPBACK_HOST, DATA_PLANE_PORT), timeout=1.0):
                 break
         except OSError:
             time.sleep(0.2)
@@ -176,7 +176,7 @@ def data_plane_process(hmac_secret):
 
 @pytest.fixture
 def flight_client(data_plane_process):
-    client = flight.FlightClient(f"grpc://127.0.0.1:{DATA_PLANE_PORT}")
+    client = flight.FlightClient(f"grpc://{LOOPBACK_HOST}:{DATA_PLANE_PORT}")
     yield client
     client.close()
 
@@ -190,7 +190,7 @@ async def client(postgres_pool, hmac_secret):
     app.state.settings = Settings(
         database_url="unused-in-test",
         hmac_secret_key=hmac_secret,
-        data_plane_url=f"grpc://127.0.0.1:{DATA_PLANE_PORT}",
+        data_plane_url=f"grpc://{LOOPBACK_HOST}:{DATA_PLANE_PORT}",
     )
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"

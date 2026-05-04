@@ -27,6 +27,7 @@ from datetime import UTC, datetime, timedelta
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.auth_constants import (
     API_PREFIX,
     BEARER_PREFIX,
@@ -562,7 +563,7 @@ async def handoff(
             ot_expires,
         )
         port = cookie_payload["port"]
-        loopback_url = f"http://127.0.0.1:{port}/?ot_code={ot_plaintext}"
+        loopback_url = f"http://{LOOPBACK_HOST}:{port}/?ot_code={ot_plaintext}"
         response = RedirectResponse(loopback_url, status_code=302)
         _scrub_login_cookie(response)
         return response
