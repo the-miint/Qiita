@@ -1,6 +1,7 @@
 """Unit tests for the scope catalog and role ceilings."""
 
 import pytest
+from qiita_common.auth_constants import Scope, SystemRole
 
 
 def test_role_implied_scopes_keys_match_system_role_enum():
@@ -11,9 +12,9 @@ def test_role_implied_scopes_keys_match_system_role_enum():
     from qiita_control_plane.auth.scopes import ROLE_IMPLIED_SCOPES
 
     assert set(ROLE_IMPLIED_SCOPES.keys()) == {
-        "user",
-        "wet_lab_admin",
-        "system_admin",
+        SystemRole.USER,
+        SystemRole.WET_LAB_ADMIN,
+        SystemRole.SYSTEM_ADMIN,
     }
 
 
@@ -21,9 +22,9 @@ def test_role_ceilings_are_hierarchical():
     """system_admin ⊇ wet_lab_admin ⊇ user (strictly inclusive)."""
     from qiita_control_plane.auth.scopes import ROLE_IMPLIED_SCOPES
 
-    user = ROLE_IMPLIED_SCOPES["user"]
-    wla = ROLE_IMPLIED_SCOPES["wet_lab_admin"]
-    sa = ROLE_IMPLIED_SCOPES["system_admin"]
+    user = ROLE_IMPLIED_SCOPES[SystemRole.USER]
+    wla = ROLE_IMPLIED_SCOPES[SystemRole.WET_LAB_ADMIN]
+    sa = ROLE_IMPLIED_SCOPES[SystemRole.SYSTEM_ADMIN]
 
     assert user.issubset(wla)
     assert wla.issubset(sa)
@@ -58,11 +59,11 @@ def test_service_account_ceiling_does_not_include_admin_or_self_scopes():
     from qiita_control_plane.auth.scopes import SERVICE_ACCOUNT_SCOPE_CEILING
 
     forbidden = {
-        "admin:user",
-        "admin:service_account",
-        "admin:audit_read",
-        "self:profile",
-        "self:token",
+        Scope.ADMIN_USER,
+        Scope.ADMIN_SERVICE_ACCOUNT,
+        Scope.ADMIN_AUDIT_READ,
+        Scope.SELF_PROFILE,
+        Scope.SELF_TOKEN,
     }
     assert SERVICE_ACCOUNT_SCOPE_CEILING.isdisjoint(forbidden)
 
@@ -92,13 +93,13 @@ def test_reject_scopes_outside_ceiling():
         reject_scopes_outside_ceiling,
     )
 
-    user_ceiling = ROLE_IMPLIED_SCOPES["user"]
+    user_ceiling = ROLE_IMPLIED_SCOPES[SystemRole.USER]
     # Subset → no rejections.
-    assert reject_scopes_outside_ceiling(["self:profile"], user_ceiling) == []
+    assert reject_scopes_outside_ceiling([Scope.SELF_PROFILE], user_ceiling) == []
     # Superset → rejections include the over-scope.
     rejected = reject_scopes_outside_ceiling(
-        ["self:profile", "admin:user", "reference:write"], user_ceiling
+        [Scope.SELF_PROFILE, Scope.ADMIN_USER, Scope.REFERENCE_WRITE], user_ceiling
     )
-    assert set(rejected) == {"admin:user", "reference:write"}
+    assert set(rejected) == {Scope.ADMIN_USER, Scope.REFERENCE_WRITE}
     # Sorted, so the API can echo them deterministically.
     assert rejected == sorted(rejected)

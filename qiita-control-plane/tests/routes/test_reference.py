@@ -3,6 +3,8 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+pytestmark = pytest.mark.db
+
 
 @pytest.fixture
 async def client(postgres_pool, human_admin_session):

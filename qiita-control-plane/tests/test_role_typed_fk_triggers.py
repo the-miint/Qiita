@@ -18,6 +18,9 @@ import secrets
 
 import asyncpg
 import pytest
+from qiita_common.auth_constants import SystemRole
+
+pytestmark = pytest.mark.db
 
 
 SYSTEM_PRINCIPAL_IDX = 1
@@ -32,8 +35,9 @@ async def _create_user(conn) -> int:
     name = _suffix("user")
     pidx = await conn.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-        " VALUES ($1, 'user', $2) RETURNING idx",
+        " VALUES ($1, $2, $3) RETURNING idx",
         name,
+        SystemRole.USER,
         SYSTEM_PRINCIPAL_IDX,
     )
     await conn.execute(
@@ -48,8 +52,9 @@ async def _create_service_account(conn) -> int:
     name = _suffix("svc")
     pidx = await conn.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-        " VALUES ($1, 'user', $2) RETURNING idx",
+        " VALUES ($1, $2, $3) RETURNING idx",
         name,
+        SystemRole.USER,
         SYSTEM_PRINCIPAL_IDX,
     )
     await conn.execute(
@@ -66,8 +71,9 @@ async def _create_bare_principal(conn) -> int:
     they've logged in)."""
     return await conn.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-        " VALUES ($1, 'user', $2) RETURNING idx",
+        " VALUES ($1, $2, $3) RETURNING idx",
         _suffix("bare"),
+        SystemRole.USER,
         SYSTEM_PRINCIPAL_IDX,
     )
 
@@ -132,9 +138,7 @@ async def test_study_insert_with_service_account_owner_raises(postgres_pool):
         await tr.start()
         try:
             svc = await _create_service_account(conn)
-            with pytest.raises(
-                asyncpg.RaiseError, match="must reference a user-kind principal"
-            ):
+            with pytest.raises(asyncpg.RaiseError, match="must reference a user-kind principal"):
                 await _insert_study(conn, owner_idx=svc)
         finally:
             await tr.rollback()
@@ -146,9 +150,7 @@ async def test_study_insert_with_bare_principal_owner_raises(postgres_pool):
         await tr.start()
         try:
             bare = await _create_bare_principal(conn)
-            with pytest.raises(
-                asyncpg.RaiseError, match="must reference a user-kind principal"
-            ):
+            with pytest.raises(asyncpg.RaiseError, match="must reference a user-kind principal"):
                 await _insert_study(conn, owner_idx=bare)
         finally:
             await tr.rollback()
@@ -161,9 +163,7 @@ async def test_study_insert_with_service_account_pi_raises(postgres_pool):
         try:
             owner = await _create_user(conn)
             svc = await _create_service_account(conn)
-            with pytest.raises(
-                asyncpg.RaiseError, match="must reference a user-kind principal"
-            ):
+            with pytest.raises(asyncpg.RaiseError, match="must reference a user-kind principal"):
                 await _insert_study(conn, owner_idx=owner, pi_idx=svc)
         finally:
             await tr.rollback()
@@ -177,9 +177,7 @@ async def test_study_update_owner_to_service_account_raises(postgres_pool):
             owner = await _create_user(conn)
             svc = await _create_service_account(conn)
             study_idx = await _insert_study(conn, owner_idx=owner)
-            with pytest.raises(
-                asyncpg.RaiseError, match="must reference a user-kind principal"
-            ):
+            with pytest.raises(asyncpg.RaiseError, match="must reference a user-kind principal"):
                 await conn.execute(
                     "UPDATE qiita.study SET owner_idx = $1 WHERE idx = $2",
                     svc,
@@ -202,9 +200,7 @@ async def test_user_delete_blocked_when_referenced_as_owner(postgres_pool):
             owner = await _create_user(conn)
             await _insert_study(conn, owner_idx=owner)
             with pytest.raises(asyncpg.RaiseError, match="cannot delete qiita.user"):
-                await conn.execute(
-                    "DELETE FROM qiita.user WHERE principal_idx = $1", owner
-                )
+                await conn.execute("DELETE FROM qiita.user WHERE principal_idx = $1", owner)
         finally:
             await tr.rollback()
 
@@ -218,9 +214,7 @@ async def test_user_delete_blocked_when_referenced_as_pi(postgres_pool):
             pi = await _create_user(conn)
             await _insert_study(conn, owner_idx=owner, pi_idx=pi)
             with pytest.raises(asyncpg.RaiseError, match="cannot delete qiita.user"):
-                await conn.execute(
-                    "DELETE FROM qiita.user WHERE principal_idx = $1", pi
-                )
+                await conn.execute("DELETE FROM qiita.user WHERE principal_idx = $1", pi)
         finally:
             await tr.rollback()
 
@@ -231,9 +225,7 @@ async def test_user_delete_succeeds_when_no_inbound_refs(postgres_pool):
         await tr.start()
         try:
             unused = await _create_user(conn)
-            await conn.execute(
-                "DELETE FROM qiita.user WHERE principal_idx = $1", unused
-            )
+            await conn.execute("DELETE FROM qiita.user WHERE principal_idx = $1", unused)
             still_there = await conn.fetchval(
                 "SELECT 1 FROM qiita.user WHERE principal_idx = $1", unused
             )
