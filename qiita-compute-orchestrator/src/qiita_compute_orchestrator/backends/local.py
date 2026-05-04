@@ -1,9 +1,7 @@
 """Local compute backend — runs DuckDB+miint in-process for dev/test."""
 
 import asyncio
-import json
 import os
-import uuid
 from pathlib import Path
 
 import duckdb
@@ -42,11 +40,6 @@ def _open_conn() -> duckdb.DuckDBPyConnection:
     if _MIINT_USE_LOCAL:
         return duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
     return duckdb.connect(":memory:")
-
-
-def _md5_hex_to_uuid(hex_str: str) -> str:
-    """Convert a 32-char hex MD5 to UUID string format."""
-    return str(uuid.UUID(hex_str))
 
 
 class LocalBackend(ComputeBackend):
@@ -90,6 +83,8 @@ class LocalBackend(ComputeBackend):
 
         output_dir.mkdir(parents=True, exist_ok=True)
         await _ensure_miint_installed()
+        manifest_path = output_dir / "manifest.parquet"
+        out = _validate_parquet_path(manifest_path)
 
         with _open_conn() as conn:
             conn.execute("LOAD miint;")
@@ -119,27 +114,22 @@ class LocalBackend(ComputeBackend):
                 dup_ids = sorted(row[0] for row in dup_result)
                 raise ValueError(f"FASTA contains duplicate read_id(s): {dup_ids}")
 
-            rows = conn.execute("SELECT read_id, hash, len FROM raw_seqs").fetchall()
-            entry_count = len(rows)
+            # Write manifest as Parquet — columns (read_id, sequence_hash, length).
+            # The hash column is converted to UUID on the way out so downstream
+            # consumers (mint-features, load step) read it as UUID natively.
+            # reference_idx isn't embedded in the file; the caller's
+            # work_ticket.scope_target.reference_idx is the source of truth.
+            conn.execute(
+                "COPY ("
+                "  SELECT read_id,"
+                "    CAST(hash AS UUID) AS sequence_hash,"
+                "    len AS length"
+                "  FROM raw_seqs"
+                "  ORDER BY read_id"
+                f") TO '{out}' (FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd')"
+            )
             conn.execute("DROP TABLE raw_seqs")
 
-        entries = [
-            {
-                "read_id": row[0],
-                "sequence_hash": _md5_hex_to_uuid(row[1]),
-                "length": row[2],
-            }
-            for row in rows
-        ]
-
-        manifest = {
-            "reference_idx": reference_idx,
-            "entry_count": entry_count,
-            "entries": entries,
-        }
-
-        manifest_path = output_dir / "hash_manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2))
         return manifest_path
 
     async def _run_load(
@@ -214,41 +204,35 @@ def _build_id_map(
     """Build the id_map temp table by joining manifest + feature_map in DuckDB.
 
     Both files are read directly by DuckDB — no Python-side parsing.
-    - manifest_path: JSON with {entries: [{read_id, sequence_hash, length}, ...]}
-    - feature_map_path: NDJSON with {sequence_hash, feature_idx} per line
+    - manifest_path: Parquet with columns (read_id, sequence_hash, length).
+    - feature_map_path: Parquet with columns (sequence_hash, feature_idx).
 
     Raises ValueError if any manifest entry has no matching feature_idx.
     """
-    # entry_count is written by the hash step — avoids a separate count query.
     manifest_count = conn.execute(
-        "SELECT entry_count FROM read_json(?, maximum_object_size=536870912)",
+        "SELECT count(*) FROM read_parquet(?)",
         [str(manifest_path)],
     ).fetchone()[0]
 
     conn.execute(
         "CREATE TEMP TABLE id_map AS "
-        "SELECT e.read_id, f.feature_idx,"
-        "  CAST(e.sequence_hash AS VARCHAR) AS sequence_hash,"
-        "  e.length AS sequence_length_bp "
-        "FROM ("
-        "  SELECT unnest(entries) AS e FROM read_json(?, maximum_object_size=536870912)"
-        ") "
-        "JOIN read_json(?, format='newline_delimited',"
-        "  columns={'sequence_hash': 'VARCHAR', 'feature_idx': 'BIGINT'}) f "
-        "  ON e.sequence_hash = f.sequence_hash",
+        "SELECT m.read_id, f.feature_idx,"
+        "  CAST(m.sequence_hash AS VARCHAR) AS sequence_hash,"
+        "  m.length AS sequence_length_bp "
+        "FROM read_parquet(?) m "
+        "JOIN read_parquet(?) f "
+        "  ON m.sequence_hash = f.sequence_hash",
         [str(manifest_path), str(feature_map_path)],
     )
 
     id_map_count = conn.execute("SELECT count(*) FROM id_map").fetchone()[0]
     if id_map_count != manifest_count:
         n_unmapped = manifest_count - id_map_count
-        # Diagnostic ANTI JOIN only on mismatch — the only case requiring
-        # a second manifest read.
+        # Diagnostic ANTI JOIN only on mismatch — second read of the
+        # manifest just to surface a useful error message.
         unmapped = conn.execute(
-            "SELECT e.sequence_hash FROM ("
-            "  SELECT unnest(entries) AS e FROM read_json(?, maximum_object_size=536870912)"
-            ") "
-            "ANTI JOIN id_map m ON e.sequence_hash = m.sequence_hash",
+            "SELECT m.sequence_hash FROM read_parquet(?) m "
+            "ANTI JOIN id_map x ON m.sequence_hash = x.sequence_hash",
             [str(manifest_path)],
         ).fetchall()
         hashes = [str(r[0]) for r in unmapped[:10]]

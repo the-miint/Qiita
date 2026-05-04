@@ -18,6 +18,8 @@ functions themselves are state-agnostic on the assumption their caller
 has already established the right state.
 """
 
+from pathlib import Path
+
 import asyncpg
 import pyarrow.flight as _flight
 from fastapi import APIRouter, Depends, HTTPException
@@ -28,7 +30,6 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
-    FeatureHashEntry,
     LibraryInvocation,
     LibraryResponse,
     ScopeTargetKind,
@@ -97,20 +98,27 @@ async def invoke_library(
 
 
 async def _dispatch_mint_features(body: LibraryInvocation, pool: asyncpg.Pool) -> LibraryResponse:
-    raw = body.inputs.get("entries")
-    if not isinstance(raw, list):
+    manifest_path = body.inputs.get("manifest_path")
+    output_dir = body.inputs.get("output_dir")
+    if not isinstance(manifest_path, str):
         raise HTTPException(
             status_code=422,
-            detail="mint-features requires inputs.entries to be a list",
+            detail="mint-features requires inputs.manifest_path (string)",
+        )
+    if not isinstance(output_dir, str):
+        raise HTTPException(
+            status_code=422,
+            detail="mint-features requires inputs.output_dir (string)",
         )
     try:
-        entries = [FeatureHashEntry.model_validate(e) for e in raw]
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"invalid entries: {exc}") from exc
-    mapping, minted, reused = await _library.mint_features(pool, entries)
+        feature_map_path, minted, reused = await _library.mint_features(
+            pool, Path(manifest_path), Path(output_dir)
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return LibraryResponse(
         outputs={
-            "mapping": {str(k): v for k, v in mapping.items()},
+            "feature_map_path": str(feature_map_path),
             "minted": minted,
             "reused": reused,
         }
@@ -126,11 +134,11 @@ async def _dispatch_write_membership(
             detail="write-membership requires scope_target.kind='reference'",
         )
     reference_idx = body.scope_target.reference_idx
-    feature_idxs = body.inputs.get("feature_idxs")
-    if not isinstance(feature_idxs, list) or not feature_idxs:
+    feature_map_path = body.inputs.get("feature_map_path")
+    if not isinstance(feature_map_path, str):
         raise HTTPException(
             status_code=422,
-            detail="write-membership requires inputs.feature_idxs (non-empty list)",
+            detail="write-membership requires inputs.feature_map_path (string)",
         )
 
     status = await pool.fetchval(
@@ -146,7 +154,11 @@ async def _dispatch_write_membership(
         )
 
     try:
-        linked, already_linked = await _library.write_membership(pool, reference_idx, feature_idxs)
+        linked, already_linked = await _library.write_membership(
+            pool, reference_idx, Path(feature_map_path)
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return LibraryResponse(outputs={"linked": linked, "already_linked": already_linked})

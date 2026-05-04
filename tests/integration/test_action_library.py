@@ -1,22 +1,43 @@
 """Integration tests for the action-library primitives via the LIBRARY
 name lookup — the same dispatch path a workflow runner will use.
 
-Library functions are exercised indirectly by the route-level integration
-tests (test_feature_split.py, test_feature_minting.py); this file
-exercises them directly through the LIBRARY dict so the named-primitive
-contract is verified independently of the HTTP layer.
+Library functions take Parquet paths under the new on-disk contract; tests
+write small fixture Parquet files to tmp_path and pass those in.
 """
 
 import hashlib
 import uuid
 
+import duckdb
 import pytest
 
 _TEST_SALT = uuid.uuid4().hex
 
 
-def _md5_uuid(seq: str) -> str:
+def _md5_uuid(seq: str) -> uuid.UUID:
     return uuid.UUID(hashlib.md5(f"{_TEST_SALT}{seq}".encode()).hexdigest())
+
+
+def _write_manifest(path, hashes: list[uuid.UUID]) -> None:
+    """Materialize a manifest.parquet with (read_id, sequence_hash, length).
+    The read_id is synthesised; only sequence_hash matters for mint-features."""
+    rows = [(f"seq{i}", str(h), 32 + i) for i, h in enumerate(hashes)]
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(
+            "CREATE TEMP TABLE m (read_id VARCHAR, sequence_hash UUID, length BIGINT)"
+        )
+        conn.executemany("INSERT INTO m VALUES (?, ?::uuid, ?)", rows)
+        conn.execute(f"COPY m TO '{path}' (FORMAT PARQUET)")
+
+
+def _read_feature_map(path) -> dict[str, int]:
+    """Read a feature_map.parquet into a {sequence_hash → feature_idx} dict."""
+    with duckdb.connect(":memory:") as conn:
+        rows = conn.execute(
+            "SELECT CAST(sequence_hash AS VARCHAR), feature_idx FROM read_parquet(?)",
+            [str(path)],
+        ).fetchall()
+    return {r[0]: r[1] for r in rows}
 
 
 @pytest.fixture
@@ -35,80 +56,93 @@ async def fresh_reference(postgres_pool, human_admin_session):
     await postgres_pool.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
 
 
-async def test_library_mint_features_dispatch(postgres_pool):
-    """LIBRARY['mint-features'](pool, entries) writes qiita.feature rows
-    and returns a (mapping, minted, reused) tuple covering every input."""
+async def test_library_mint_features_dispatch(postgres_pool, tmp_path):
+    """LIBRARY['mint-features'](pool, manifest, output_dir) writes
+    qiita.feature rows and produces a feature_map.parquet."""
     from qiita_common.api_paths import LibraryPrimitive
-    from qiita_common.models import FeatureHashEntry
     from qiita_control_plane.actions import LIBRARY
 
-    entries = [FeatureHashEntry(sequence_hash=_md5_uuid(f"LIB{i}")) for i in range(5)]
-    mapping, minted, reused = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
-        postgres_pool, entries
-    )
+    hashes = [_md5_uuid(f"LIB{i}") for i in range(5)]
+    manifest = tmp_path / "manifest.parquet"
+    _write_manifest(manifest, hashes)
 
-    assert len(mapping) == 5
+    feature_map_path, minted, reused = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
+        postgres_pool, manifest, tmp_path
+    )
     assert minted == 5
     assert reused == 0
-    assert set(mapping.keys()) == {e.sequence_hash for e in entries}
+    assert feature_map_path == tmp_path / "feature_map.parquet"
+
+    mapping = _read_feature_map(feature_map_path)
+    assert set(mapping.keys()) == {str(h) for h in hashes}
 
     # Idempotent re-dispatch: same hashes return reused=5.
-    _, minted2, reused2 = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
-        postgres_pool, entries
+    feature_map_path2, minted2, reused2 = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
+        postgres_pool, manifest, tmp_path
     )
     assert minted2 == 0
     assert reused2 == 5
+    # Same feature_idx values on the second call.
+    assert _read_feature_map(feature_map_path2) == mapping
 
 
-async def test_library_write_membership_dispatch(postgres_pool, fresh_reference):
-    """LIBRARY['write-membership'](pool, idx, feature_idxs) inserts
+async def test_library_write_membership_dispatch(postgres_pool, tmp_path, fresh_reference):
+    """LIBRARY['write-membership'](pool, idx, feature_map_path) inserts
     qiita.reference_membership rows and returns (linked, already_linked)."""
     from qiita_common.api_paths import LibraryPrimitive
-    from qiita_common.models import FeatureHashEntry
     from qiita_control_plane.actions import LIBRARY
 
-    entries = [FeatureHashEntry(sequence_hash=_md5_uuid(f"MEM{i}")) for i in range(3)]
-    mapping, _, _ = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
-        postgres_pool, entries
+    hashes = [_md5_uuid(f"MEM{i}") for i in range(3)]
+    manifest = tmp_path / "manifest.parquet"
+    _write_manifest(manifest, hashes)
+    feature_map_path, _, _ = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
+        postgres_pool, manifest, tmp_path
     )
-    feature_idxs = list(mapping.values())
 
     linked, already_linked = await LIBRARY[LibraryPrimitive.WRITE_MEMBERSHIP](
-        postgres_pool, fresh_reference, feature_idxs
+        postgres_pool, fresh_reference, feature_map_path
     )
     assert linked == 3
     assert already_linked == 0
 
+    expected_idxs = sorted(_read_feature_map(feature_map_path).values())
     rows = await postgres_pool.fetch(
         "SELECT feature_idx FROM qiita.reference_membership WHERE reference_idx = $1",
         fresh_reference,
     )
-    assert sorted(r["feature_idx"] for r in rows) == sorted(feature_idxs)
+    assert sorted(r["feature_idx"] for r in rows) == expected_idxs
 
     # Re-dispatch reports already_linked=3.
     linked2, already_linked2 = await LIBRARY[LibraryPrimitive.WRITE_MEMBERSHIP](
-        postgres_pool, fresh_reference, feature_idxs
+        postgres_pool, fresh_reference, feature_map_path
     )
     assert linked2 == 0
     assert already_linked2 == 3
 
 
 async def test_library_write_membership_raises_on_unknown_feature_idx(
-    postgres_pool, fresh_reference
+    postgres_pool, tmp_path, fresh_reference
 ):
-    """An unknown feature_idx surfaces as ValueError (the FK violation is
-    caught and re-raised as a structured error). Routes catch this and
-    map to HTTP 422; runners can map it to a workflow failure with a
-    useful detail."""
+    """An unknown feature_idx in the feature_map Parquet surfaces as
+    ValueError (the FK violation is caught and re-raised as a structured
+    error). Routes catch this and map to HTTP 422."""
     from qiita_common.api_paths import LibraryPrimitive
     from qiita_control_plane.actions import LIBRARY
 
+    bogus_map = tmp_path / "bogus.parquet"
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(
+            "CREATE TEMP TABLE fm (sequence_hash UUID, feature_idx BIGINT)"
+        )
+        conn.execute(
+            "INSERT INTO fm VALUES ('00000000-0000-0000-0000-000000000001'::uuid, 9999999999)"
+        )
+        conn.execute(f"COPY fm TO '{bogus_map}' (FORMAT PARQUET)")
+
     with pytest.raises(ValueError, match="feature_idx"):
         await LIBRARY[LibraryPrimitive.WRITE_MEMBERSHIP](
-            postgres_pool, fresh_reference, [9999999999]
+            postgres_pool, fresh_reference, bogus_map
         )

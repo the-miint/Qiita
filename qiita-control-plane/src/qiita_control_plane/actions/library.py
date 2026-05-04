@@ -3,33 +3,30 @@
 A workflow YAML entry like
 
     - action: mint-features
-      inputs: [hash.manifest]
-      outputs: [feature_map.ndjson]
+      inputs: [manifest]
+      outputs: [feature_map]
 
 resolves through the LIBRARY dict at the bottom of this module. The
-runner looks up the name and invokes the callable with the inputs the
-entry declares. The same primitive backs the corresponding REST route
-(POST /feature/mint, POST /reference/{idx}/membership,
-POST /reference/{idx}/register), so HTTP callers and workflow
-invocations share one implementation — divergence here would silently
-mis-mint features or skip registration steps.
+runner looks up the name and invokes the callable with paths into the
+shared workspace; the runner and the dispatch handler agree on a
+Parquet-everywhere on-disk format so DuckDB reads stream chunked and
+Python never holds a full mapping in memory.
 
-Library callables take the asyncpg pool plus the inputs they need;
+Library callables take the asyncpg pool plus the input paths they need;
 status-state guards are the caller's responsibility because routes
 return HTTPException on bad state and workflow runners want to handle
-it differently. Internal per-chunk helpers (`_mint_chunk` and friends)
-are exported for the deprecated POST /reference/{idx}/feature/mint
-route, which writes mint+membership+genome inside one transaction and
-doesn't fit any single public primitive.
+it differently.
 """
 
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import asyncpg
+import duckdb
 import pyarrow.flight as _flight
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.models import FeatureHashEntry
@@ -169,53 +166,120 @@ def _do_action_register(data_plane_url: str, token: bytes) -> list:
 
 async def mint_features(
     pool: asyncpg.Pool,
-    entries: list[FeatureHashEntry],
-) -> tuple[dict[UUID, int], int, int]:
-    """Mint feature_idx values for a sequence-hash batch; reference-agnostic.
+    manifest_path: Path,
+    output_dir: Path,
+) -> tuple[Path, int, int]:
+    """Mint feature_idx values for sequence hashes in a manifest Parquet file.
 
-    Returns (mapping, minted, reused) where `mapping` covers every input
-    hash, `minted` counts novel rows inserted in qiita.feature, and
-    `reused` counts pre-existing rows. Genome associations are written
-    when entries carry genome_source / genome_source_id.
+    `manifest_path` points to a Parquet file with a `sequence_hash` column
+    (UUIDs). The function reads it via DuckDB, upserts qiita.feature in
+    chunks of `_CHUNK_SIZE`, and writes a `feature_map.parquet` into
+    `output_dir` with columns (sequence_hash UUID, feature_idx BIGINT).
 
-    Chunks the batch into transactions of `_CHUNK_SIZE` so a partial
-    failure on a large batch doesn't lose progress on prior chunks; the
-    feature INSERT uses ON CONFLICT DO NOTHING and feature_genome too,
-    so resubmitting the full batch after a chunk failure converges.
+    Returns (feature_map_path, minted, reused). `minted` counts novel
+    rows inserted; `reused` counts pre-existing rows. Idempotent:
+    qiita.feature uses ON CONFLICT DO NOTHING, so resubmitting after a
+    partial-batch failure converges.
+
+    Reference-agnostic — the mint operation does not touch any reference
+    table. Genome associations are not written here; a future
+    `genome_map_path` parameter will support reference-add workflows that
+    carry genome metadata.
     """
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Manifest not found: {manifest_path}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    feature_map_path = output_dir / "feature_map.parquet"
+
+    # Read all sequence_hash values from the manifest into Python. For
+    # the reference-add flow this is bounded (~300K UUIDs ≈ 25 MB), and
+    # the per-chunk Postgres transactions below are the actual memory
+    # bottleneck. Larger workflows can switch to streaming via
+    # fetch_arrow_reader once we have one that needs it.
+    with duckdb.connect(":memory:") as duck:
+        rows = duck.execute(
+            "SELECT sequence_hash FROM read_parquet(?) ORDER BY sequence_hash",
+            [str(manifest_path)],
+        ).fetchall()
+    hashes: list[UUID] = [row[0] for row in rows]
+
     full_mapping: dict[UUID, int] = {}
     total_minted = 0
     total_reused = 0
-    for i in range(0, len(entries), _CHUNK_SIZE):
-        chunk = entries[i : i + _CHUNK_SIZE]
+    for i in range(0, len(hashes), _CHUNK_SIZE):
+        chunk_hashes = hashes[i : i + _CHUNK_SIZE]
+        chunk_entries = [FeatureHashEntry(sequence_hash=h) for h in chunk_hashes]
         async with pool.acquire() as conn, conn.transaction():
-            chunk_mapping, minted, reused = await _mint_chunk(conn, chunk)
-            genome_entries = [e for e in chunk if e.genome_source is not None]
-            if genome_entries:
-                await _write_genome_associations(conn, genome_entries, chunk_mapping)
+            chunk_mapping, minted, reused = await _mint_chunk(conn, chunk_entries)
         full_mapping.update(chunk_mapping)
         total_minted += minted
         total_reused += reused
-    return full_mapping, total_minted, total_reused
+
+    # Write feature_map.parquet via DuckDB. The temp table is the
+    # cleanest way to ferry a Python dict into Parquet without going
+    # through pyarrow directly.
+    pairs = [(str(h), idx) for h, idx in full_mapping.items()]
+    with duckdb.connect(":memory:") as duck:
+        duck.execute("CREATE TEMP TABLE feature_map (sequence_hash UUID, feature_idx BIGINT)")
+        duck.executemany("INSERT INTO feature_map VALUES (?, ?)", pairs)
+        out = _validate_parquet_path(feature_map_path)
+        duck.execute(
+            "COPY (SELECT sequence_hash, feature_idx FROM feature_map "
+            "      ORDER BY feature_idx) "
+            f"TO '{out}' (FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd')"
+        )
+
+    return feature_map_path, total_minted, total_reused
 
 
 async def write_membership(
     pool: asyncpg.Pool,
     reference_idx: int,
-    feature_idxs: list[int],
+    feature_map_path: Path,
 ) -> tuple[int, int]:
-    """Link already-minted feature_idx values to a reference.
+    """Link already-minted feature_idx values from a feature_map Parquet
+    file to a reference.
 
-    Returns (linked, already_linked). Idempotent — repeat calls converge.
-    Status-state guards live in the calling route handler / runner; this
-    primitive does not check the reference's status.
+    `feature_map_path` is a Parquet file with a `feature_idx` column
+    (typically the output of `mint_features`). Reads it chunked via
+    DuckDB and bulk-inserts qiita.reference_membership.
 
-    Raises ValueError if any feature_idx does not exist in qiita.feature
-    (FK violation surfaced as a structured error).
+    Returns (linked, already_linked). Idempotent. Raises ValueError if
+    any feature_idx is missing from qiita.feature (FK violation surfaced
+    as a structured error).
     """
+    if not feature_map_path.exists():
+        raise FileNotFoundError(f"Feature map not found: {feature_map_path}")
+
+    total_linked = 0
+    total_seen = 0
     async with pool.acquire() as conn:
-        linked = await _write_membership_rows(conn, reference_idx, feature_idxs)
-    return linked, len(feature_idxs) - linked
+        # Stream feature_idx in batches via DuckDB's Arrow reader so we
+        # never materialise the full list in Python.
+        with duckdb.connect(":memory:") as duck:
+            reader = duck.execute(
+                "SELECT feature_idx FROM read_parquet(?)",
+                [str(feature_map_path)],
+            ).to_arrow_reader(_CHUNK_SIZE)
+            for batch in reader:
+                feature_idxs = batch.column("feature_idx").to_pylist()
+                if not feature_idxs:
+                    continue
+                async with conn.transaction():
+                    chunk_linked = await _write_membership_rows(conn, reference_idx, feature_idxs)
+                total_linked += chunk_linked
+                total_seen += len(feature_idxs)
+    return total_linked, total_seen - total_linked
+
+
+def _validate_parquet_path(path: Path) -> str:
+    """Reject paths with characters that can't be safely string-interpolated
+    into a DuckDB COPY statement. The COPY target is a SQL string literal
+    so we can't bind it as a parameter; sanitise instead."""
+    text = str(path)
+    if "'" in text or "\\" in text or any(ord(c) < 0x20 for c in text):
+        raise ValueError(f"Output path contains unsafe characters: {text}")
+    return text
 
 
 async def register_files(

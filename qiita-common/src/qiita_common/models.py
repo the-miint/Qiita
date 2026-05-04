@@ -69,19 +69,17 @@ class FeatureHashEntry(BaseModel):
         return self
 
 
-class FeatureMintRequest(BaseModel):
-    entries: list[FeatureHashEntry] = Field(min_length=1)
-
-    @model_validator(mode="after")
-    def no_duplicate_hashes(self):
-        hashes = [e.sequence_hash for e in self.entries]
-        if len(hashes) != len(set(hashes)):
-            raise ValueError("entries must not contain duplicate sequence_hash values")
-        return self
-
-
 class FeatureMintResponse(BaseModel):
-    mapping: dict[UUID, int]
+    """Returned by the mint-features library primitive.
+
+    `feature_map_path` points to a Parquet file the primitive wrote with
+    columns (sequence_hash UUID, feature_idx BIGINT). Downstream entries
+    consume this file directly via DuckDB read_parquet — no Python-side
+    materialisation of the mapping. `minted` / `reused` are tracking
+    counts: novel rows inserted into qiita.feature versus pre-existing.
+    """
+
+    feature_map_path: str
     minted: int
     reused: int
 
@@ -119,9 +117,12 @@ class LibraryInvocation(BaseModel):
 
     `inputs` is the per-primitive input dict, validated inside the
     dispatch handler since each primitive has different requirements:
-      mint-features    → {"entries": [FeatureHashEntry-shaped]}
-      write-membership → {"feature_idxs": [int]}
+      mint-features    → {"manifest_path": str, "output_dir": str}
+      write-membership → {"feature_map_path": str}
       register-files   → {"staging_dir": str, "files": {filename: table}}
+
+    Path values point at Parquet files on the workspace shared between
+    runner (orchestrator) and dispatch handler (control plane).
     """
 
     scope_target: ScopeTarget
@@ -132,7 +133,7 @@ class LibraryResponse(BaseModel):
     """Returned by POST /api/v1/library/{name}.
 
     `outputs` is the primitive's return shape, varying by primitive:
-      mint-features    → {"mapping": {hash: idx}, "minted": int, "reused": int}
+      mint-features    → {"feature_map_path": str, "minted": int, "reused": int}
       write-membership → {"linked": int, "already_linked": int}
       register-files   → {"registered": [path]}
     """

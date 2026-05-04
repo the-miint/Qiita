@@ -9,7 +9,6 @@ from .api_paths import URL_LIBRARY_NAME, LibraryPrimitive
 from .auth_constants import API_PREFIX
 from .models import (
     DoGetTicketResponse,
-    FeatureHashEntry,
     FeatureMintResponse,
     ReferenceMembershipResponse,
     ReferenceResponse,
@@ -118,31 +117,43 @@ class ControlPlaneClient:
         return ReferenceResponse.model_validate(resp.json())
 
     async def mint_features(
-        self, reference_idx: int, entries: list[FeatureHashEntry]
+        self,
+        reference_idx: int,
+        manifest_path: Path,
+        output_dir: Path,
     ) -> FeatureMintResponse:
         """Invoke the mint-features library primitive.
 
-        Returns the hash → feature_idx mapping plus minted/reused counts.
-        Reference-agnostic at the library level; the reference_idx here
-        only flows into the dispatch envelope's scope_target so the
-        control plane can attribute the call.
+        `manifest_path` points to a Parquet manifest with a sequence_hash
+        column (typically produced by the workflow's hash step).
+        `output_dir` is where the primitive will write feature_map.parquet.
+        Both must live on a workspace shared with the control plane.
+
+        Returns FeatureMintResponse(feature_map_path, minted, reused).
+        Reference-agnostic at the library level; reference_idx flows into
+        the dispatch envelope's scope_target only so the control plane
+        can attribute the call.
         """
         outputs = await self._invoke_library(
             name=LibraryPrimitive.MINT_FEATURES,
             reference_idx=reference_idx,
-            inputs={"entries": [e.model_dump(mode="json") for e in entries]},
+            inputs={
+                "manifest_path": str(manifest_path),
+                "output_dir": str(output_dir),
+            },
         )
         return FeatureMintResponse.model_validate(outputs)
 
     async def write_membership(
-        self, reference_idx: int, feature_idxs: list[int]
+        self, reference_idx: int, feature_map_path: Path
     ) -> ReferenceMembershipResponse:
-        """Invoke the write-membership library primitive — link
-        already-minted feature_idx values to a reference. Idempotent."""
+        """Invoke the write-membership library primitive — link the
+        feature_idx values from a feature_map Parquet file to a reference.
+        Idempotent."""
         outputs = await self._invoke_library(
             name=LibraryPrimitive.WRITE_MEMBERSHIP,
             reference_idx=reference_idx,
-            inputs={"feature_idxs": feature_idxs},
+            inputs={"feature_map_path": str(feature_map_path)},
         )
         return ReferenceMembershipResponse.model_validate(outputs)
 

@@ -121,18 +121,20 @@ def _capture_transport(captured: list, response_outputs: dict):
     return httpx.MockTransport(handler)
 
 
-async def test_mint_features_posts_to_library_dispatch():
+async def test_mint_features_posts_to_library_dispatch(tmp_path):
     """client.mint_features must POST /api/v1/library/mint-features with
-    the {scope_target, inputs} envelope and unwrap `outputs` for the
-    caller — catches URL drift at unit-test time."""
+    the {scope_target, inputs:{manifest_path, output_dir}} envelope and
+    unwrap `outputs` for the caller — catches URL/shape drift at
+    unit-test time."""
+    from pathlib import Path
+
     from qiita_common.client import ControlPlaneClient
-    from qiita_common.models import FeatureHashEntry
 
     captured: list[httpx.Request] = []
     transport = _capture_transport(
         captured,
         {
-            "mapping": {"00000000-0000-0000-0000-000000000001": 42},
+            "feature_map_path": "/workspace/feature_map.parquet",
             "minted": 1,
             "reused": 0,
         },
@@ -148,8 +150,13 @@ async def test_mint_features_posts_to_library_dispatch():
         http_client=custom,
     )
 
-    entry = FeatureHashEntry(sequence_hash="00000000-0000-0000-0000-000000000001")
-    resp = await client.mint_features(reference_idx=42, entries=[entry])
+    manifest = tmp_path / "manifest.parquet"
+    manifest.write_bytes(b"")  # content irrelevant — captured by mock
+    resp = await client.mint_features(
+        reference_idx=42,
+        manifest_path=manifest,
+        output_dir=Path("/workspace"),
+    )
 
     assert len(captured) == 1
     req = captured[0]
@@ -157,14 +164,19 @@ async def test_mint_features_posts_to_library_dispatch():
     assert req.url.path == "/api/v1/library/mint-features"
     body = json.loads(req.content)
     assert body["scope_target"] == {"kind": "reference", "reference_idx": 42}
-    assert body["inputs"]["entries"][0]["sequence_hash"] == ("00000000-0000-0000-0000-000000000001")
+    assert body["inputs"]["manifest_path"] == str(manifest)
+    assert body["inputs"]["output_dir"] == "/workspace"
     # Returned model is built from the unwrapped `outputs` field.
+    assert resp.feature_map_path == "/workspace/feature_map.parquet"
     assert resp.minted == 1
     assert resp.reused == 0
 
 
 async def test_write_membership_posts_to_library_dispatch():
-    """client.write_membership must POST /api/v1/library/write-membership."""
+    """client.write_membership must POST /api/v1/library/write-membership
+    with inputs.feature_map_path."""
+    from pathlib import Path
+
     from qiita_common.client import ControlPlaneClient
 
     captured: list[httpx.Request] = []
@@ -180,12 +192,14 @@ async def test_write_membership_posts_to_library_dispatch():
         http_client=custom,
     )
 
-    resp = await client.write_membership(reference_idx=7, feature_idxs=[1, 2, 3])
+    resp = await client.write_membership(
+        reference_idx=7, feature_map_path=Path("/workspace/feature_map.parquet")
+    )
 
     assert captured[0].url.path == "/api/v1/library/write-membership"
     body = json.loads(captured[0].content)
     assert body["scope_target"] == {"kind": "reference", "reference_idx": 7}
-    assert body["inputs"]["feature_idxs"] == [1, 2, 3]
+    assert body["inputs"]["feature_map_path"] == "/workspace/feature_map.parquet"
     assert resp.linked == 3
     assert resp.already_linked == 0
 

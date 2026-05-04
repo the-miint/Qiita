@@ -11,6 +11,7 @@ dependencies = [
     "pyjwt[crypto]>=2.9",
     "httpx>=0.28",
     "pyyaml>=6",
+    "duckdb>=1.5",
 ]
 
 [project.scripts]

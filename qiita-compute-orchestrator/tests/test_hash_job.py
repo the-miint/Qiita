@@ -1,17 +1,29 @@
-"""Tests for LocalBackend hash job."""
+"""Tests for LocalBackend hash step (Parquet manifest output)."""
 
 import hashlib
-import json
 import uuid
 
+import duckdb
 import pytest
 
 
+def _read_manifest(manifest_path) -> list[dict]:
+    """Materialize manifest.parquet into a list of {read_id, sequence_hash,
+    length} dicts. Tests use small fixtures so a full read is fine."""
+    with duckdb.connect(":memory:") as conn:
+        rows = conn.execute(
+            "SELECT read_id, CAST(sequence_hash AS VARCHAR) AS sequence_hash, length "
+            "FROM read_parquet(?) ORDER BY read_id",
+            [str(manifest_path)],
+        ).fetchall()
+    return [{"read_id": r[0], "sequence_hash": r[1], "length": r[2]} for r in rows]
+
+
 async def test_hash_job_produces_manifest(fasta_file, tmp_path):
-    """Hash job must produce a manifest with one entry per sequence."""
+    """Hash step writes manifest.parquet with one row per sequence."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
-    fasta_path, seqs = fasta_file
+    fasta_path, _ = fasta_file
     output_dir = tmp_path / "output"
 
     backend = LocalBackend()
@@ -19,12 +31,14 @@ async def test_hash_job_produces_manifest(fasta_file, tmp_path):
     manifest_path = result["manifest"]
 
     assert manifest_path.exists()
-    manifest = json.loads(manifest_path.read_text())
-    assert len(manifest["entries"]) == 5
+    assert manifest_path.name == "manifest.parquet"
+    entries = _read_manifest(manifest_path)
+    assert len(entries) == 5
 
 
 async def test_hash_job_md5_matches_python(fasta_file, tmp_path):
-    """DuckDB md5() output must match Python hashlib.md5()."""
+    """DuckDB md5() output (cast to UUID in the manifest) must match
+    Python hashlib.md5()."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
     fasta_path, seqs = fasta_file
@@ -34,19 +48,18 @@ async def test_hash_job_md5_matches_python(fasta_file, tmp_path):
     result = await backend.run_step("hash", {"fasta_path": fasta_path}, output_dir, reference_idx=1)
     manifest_path = result["manifest"]
 
-    manifest = json.loads(manifest_path.read_text())
-    for entry in manifest["entries"]:
+    for entry in _read_manifest(manifest_path):
         seq = seqs[entry["read_id"]]
-        expected_hash = hashlib.md5(seq.encode()).hexdigest()
-        expected_uuid = str(uuid.UUID(expected_hash))
+        expected_uuid = str(uuid.UUID(hashlib.md5(seq.encode()).hexdigest()))
         assert entry["sequence_hash"] == expected_uuid, (
             f"MD5 mismatch for {entry['read_id']}: "
             f"DuckDB={entry['sequence_hash']}, Python={expected_uuid}"
         )
 
 
-async def test_hash_job_manifest_has_required_fields(fasta_file, tmp_path):
-    """Each manifest entry must have read_id, sequence_hash, and length."""
+async def test_hash_job_manifest_has_required_columns(fasta_file, tmp_path):
+    """Every row carries read_id (string), sequence_hash (UUID-cast), and a
+    positive integer length."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
     fasta_path, _ = fasta_file
@@ -56,34 +69,15 @@ async def test_hash_job_manifest_has_required_fields(fasta_file, tmp_path):
     result = await backend.run_step("hash", {"fasta_path": fasta_path}, output_dir, reference_idx=1)
     manifest_path = result["manifest"]
 
-    manifest = json.loads(manifest_path.read_text())
-    for entry in manifest["entries"]:
-        assert "read_id" in entry
-        assert "sequence_hash" in entry
-        assert "length" in entry
+    for entry in _read_manifest(manifest_path):
+        assert isinstance(entry["read_id"], str) and entry["read_id"]
+        assert isinstance(entry["sequence_hash"], str) and len(entry["sequence_hash"]) == 36
         assert isinstance(entry["length"], int)
         assert entry["length"] > 0
 
 
-async def test_hash_job_manifest_includes_reference_idx(fasta_file, tmp_path):
-    """Manifest must include the reference_idx it was created for."""
-    from qiita_compute_orchestrator.backends.local import LocalBackend
-
-    fasta_path, _ = fasta_file
-    output_dir = tmp_path / "output"
-
-    backend = LocalBackend()
-    result = await backend.run_step(
-        "hash", {"fasta_path": fasta_path}, output_dir, reference_idx=42
-    )
-    manifest_path = result["manifest"]
-
-    manifest = json.loads(manifest_path.read_text())
-    assert manifest["reference_idx"] == 42
-
-
 async def test_hash_job_rejects_missing_fasta(tmp_path):
-    """Hash job must raise if FASTA file does not exist."""
+    """Hash step must raise if FASTA file does not exist."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
     backend = LocalBackend()
@@ -97,7 +91,7 @@ async def test_hash_job_rejects_missing_fasta(tmp_path):
 
 
 async def test_hash_job_rejects_duplicate_read_ids(tmp_path):
-    """Hash job must raise ValueError on duplicate read_ids in FASTA."""
+    """Hash step must raise ValueError on duplicate read_ids in FASTA."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
     fasta_path = tmp_path / "dup.fasta"
@@ -111,7 +105,8 @@ async def test_hash_job_rejects_duplicate_read_ids(tmp_path):
 
 
 async def test_hash_job_empty_fasta(tmp_path):
-    """Hash job on an empty FASTA must produce a manifest with zero entries."""
+    """Hash step on an empty FASTA produces an empty manifest.parquet
+    (zero rows, schema preserved)."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
     fasta_path = tmp_path / "empty.fasta"
@@ -123,5 +118,5 @@ async def test_hash_job_empty_fasta(tmp_path):
     )
     manifest_path = result["manifest"]
 
-    manifest = json.loads(manifest_path.read_text())
-    assert manifest["entries"] == []
+    assert manifest_path.exists()
+    assert _read_manifest(manifest_path) == []

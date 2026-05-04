@@ -3,6 +3,7 @@
 import hashlib
 import uuid
 
+import duckdb
 import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
@@ -17,6 +18,26 @@ _TEST_SALT = uuid.uuid4().hex
 
 def _md5_uuid(seq: str) -> str:
     return str(uuid.UUID(hashlib.md5(f"{_TEST_SALT}{seq}".encode()).hexdigest()))
+
+
+def _write_manifest(path, hashes: list[str]) -> None:
+    """Materialize a manifest.parquet — sequence_hash column drives mint-features."""
+    rows = [(f"seq{i}", h, 32 + i) for i, h in enumerate(hashes)]
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(
+            "CREATE TEMP TABLE m (read_id VARCHAR, sequence_hash UUID, length BIGINT)"
+        )
+        conn.executemany("INSERT INTO m VALUES (?, ?::uuid, ?)", rows)
+        conn.execute(f"COPY m TO '{path}' (FORMAT PARQUET)")
+
+
+def _read_outputs_mapping(feature_map_path: str) -> dict[str, int]:
+    with duckdb.connect(":memory:") as conn:
+        rows = conn.execute(
+            "SELECT CAST(sequence_hash AS VARCHAR), feature_idx FROM read_parquet(?)",
+            [feature_map_path],
+        ).fetchall()
+    return {r[0]: r[1] for r in rows}
 
 
 @pytest.fixture
@@ -71,9 +92,7 @@ async def minting_reference(client, postgres_pool):
     await postgres_pool.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
 
 
 def _ref_target(reference_idx: int) -> dict:
@@ -91,13 +110,17 @@ async def test_unknown_primitive_returns_404(client, worker_headers):
     assert "Unknown library primitive" in resp.json()["detail"]
 
 
-async def test_dispatch_rejects_human_caller(client, minting_reference, admin_headers):
+async def test_dispatch_rejects_human_caller(
+    client, minting_reference, admin_headers, tmp_path
+):
     """All primitives are service-only; a human PAT is rejected with 403."""
+    manifest = tmp_path / "manifest.parquet"
+    _write_manifest(manifest, [_md5_uuid("X")])
     resp = await client.post(
         URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
         json={
             "scope_target": _ref_target(minting_reference),
-            "inputs": {"entries": [{"sequence_hash": _md5_uuid("X")}]},
+            "inputs": {"manifest_path": str(manifest), "output_dir": str(tmp_path)},
         },
         headers=admin_headers,
     )
@@ -105,16 +128,19 @@ async def test_dispatch_rejects_human_caller(client, minting_reference, admin_he
 
 
 async def test_dispatch_mint_features_round_trip(
-    client, minting_reference, worker_headers
+    client, minting_reference, worker_headers, tmp_path
 ):
-    """mint-features dispatch returns the same shape as the underlying
-    library function — mapping + minted + reused under `outputs`."""
+    """mint-features dispatch returns the file path of feature_map.parquet
+    plus minted/reused counts under `outputs`. The Parquet file contains
+    one row per input hash."""
     hashes = [_md5_uuid(f"DISPATCH{i}") for i in range(3)]
+    manifest = tmp_path / "manifest.parquet"
+    _write_manifest(manifest, hashes)
     resp = await client.post(
         URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
         json={
             "scope_target": _ref_target(minting_reference),
-            "inputs": {"entries": [{"sequence_hash": h} for h in hashes]},
+            "inputs": {"manifest_path": str(manifest), "output_dir": str(tmp_path)},
         },
         headers=worker_headers,
     )
@@ -122,31 +148,35 @@ async def test_dispatch_mint_features_round_trip(
     outputs = resp.json()["outputs"]
     assert outputs["minted"] == 3
     assert outputs["reused"] == 0
-    assert set(outputs["mapping"].keys()) == set(hashes)
+    feature_map_path = outputs["feature_map_path"]
+    assert feature_map_path == str(tmp_path / "feature_map.parquet")
+    mapping = _read_outputs_mapping(feature_map_path)
+    assert set(mapping.keys()) == set(hashes)
 
 
 async def test_dispatch_write_membership_then_again_is_idempotent(
-    client, minting_reference, worker_headers
+    client, minting_reference, worker_headers, tmp_path
 ):
-    """Two calls of write-membership for the same feature_idxs report
-    linked=N then linked=0 / already_linked=N — idempotent like the
-    underlying library function."""
+    """Two calls of write-membership for the same feature_map report
+    linked=N then linked=0 / already_linked=N."""
     hashes = [_md5_uuid(f"IDEM-DISPATCH{i}") for i in range(3)]
+    manifest = tmp_path / "manifest.parquet"
+    _write_manifest(manifest, hashes)
     mint = await client.post(
         URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
         json={
             "scope_target": _ref_target(minting_reference),
-            "inputs": {"entries": [{"sequence_hash": h} for h in hashes]},
+            "inputs": {"manifest_path": str(manifest), "output_dir": str(tmp_path)},
         },
         headers=worker_headers,
     )
-    feature_idxs = list(mint.json()["outputs"]["mapping"].values())
+    feature_map_path = mint.json()["outputs"]["feature_map_path"]
 
     first = await client.post(
         URL_LIBRARY_NAME.format(name=LibraryPrimitive.WRITE_MEMBERSHIP),
         json={
             "scope_target": _ref_target(minting_reference),
-            "inputs": {"feature_idxs": feature_idxs},
+            "inputs": {"feature_map_path": feature_map_path},
         },
         headers=worker_headers,
     )
@@ -154,7 +184,7 @@ async def test_dispatch_write_membership_then_again_is_idempotent(
         URL_LIBRARY_NAME.format(name=LibraryPrimitive.WRITE_MEMBERSHIP),
         json={
             "scope_target": _ref_target(minting_reference),
-            "inputs": {"feature_idxs": feature_idxs},
+            "inputs": {"feature_map_path": feature_map_path},
         },
         headers=worker_headers,
     )
@@ -163,11 +193,22 @@ async def test_dispatch_write_membership_then_again_is_idempotent(
 
 
 async def test_dispatch_write_membership_status_check(
-    client, postgres_pool, worker_headers
+    client, postgres_pool, worker_headers, tmp_path
 ):
     """write-membership rejects with 409 when the reference isn't in
     'minting' status — the dispatch handler enforces this so workflow
-    runners surface a useful error rather than silently FK-failing."""
+    runners surface a useful error rather than silently FK-failing.
+    The Parquet body never matters because the status check fails first."""
+    feature_map = tmp_path / "fm.parquet"
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(
+            "CREATE TEMP TABLE fm (sequence_hash UUID, feature_idx BIGINT)"
+        )
+        conn.execute(
+            "INSERT INTO fm VALUES ('00000000-0000-0000-0000-000000000001'::uuid, 1)"
+        )
+        conn.execute(f"COPY fm TO '{feature_map}' (FORMAT PARQUET)")
+
     resp = await client.post(
         URL_REFERENCE_PREFIX,
         json={
@@ -183,7 +224,7 @@ async def test_dispatch_write_membership_status_check(
             URL_LIBRARY_NAME.format(name=LibraryPrimitive.WRITE_MEMBERSHIP),
             json={
                 "scope_target": _ref_target(idx),
-                "inputs": {"feature_idxs": [1]},
+                "inputs": {"feature_map_path": str(feature_map)},
             },
             headers=worker_headers,
         )
@@ -198,16 +239,16 @@ async def test_dispatch_write_membership_status_check(
 async def test_dispatch_validates_input_shape(
     client, minting_reference, worker_headers
 ):
-    """mint-features without inputs.entries is 422 — the dispatch handler
-    parses per-primitive input shape inside the route since the generic
-    envelope doesn't constrain it."""
+    """mint-features without inputs.manifest_path is 422 — the dispatch
+    handler parses per-primitive input shape inside the route since the
+    generic envelope doesn't constrain it."""
     resp = await client.post(
         URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
         json={
             "scope_target": _ref_target(minting_reference),
-            "inputs": {},  # missing entries
+            "inputs": {},  # missing manifest_path / output_dir
         },
         headers=worker_headers,
     )
     assert resp.status_code == 422
-    assert "entries" in resp.json()["detail"]
+    assert "manifest_path" in resp.json()["detail"]

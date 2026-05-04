@@ -157,14 +157,3 @@ def test_feature_hash_entry_rejects_id_without_source():
             sequence_hash=UUID("a0000000-0000-0000-0000-000000000001"),
             genome_source_id="GCF_123",
         )
-
-
-def test_feature_mint_request_rejects_duplicate_hashes():
-    """FeatureMintRequest must reject duplicate sequence_hash values."""
-    from qiita_common.models import FeatureHashEntry, FeatureMintRequest
-
-    h = UUID("a0000000-0000-0000-0000-000000000001")
-    with pytest.raises(ValidationError):
-        FeatureMintRequest(
-            entries=[FeatureHashEntry(sequence_hash=h), FeatureHashEntry(sequence_hash=h)]
-        )

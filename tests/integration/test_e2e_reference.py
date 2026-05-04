@@ -8,8 +8,8 @@ in conftest.py — no per-module process/secret/schema plumbing lives here.
 """
 
 import base64
-import json
 import uuid
+from pathlib import Path
 
 import pyarrow.flight as flight
 import pytest
@@ -136,40 +136,44 @@ async def test_e2e_create_to_doget(
     ref_idx = ref_for_e2e
     backend = LocalBackend()
 
+    workspace = tmp_path / "workspace"
+    scope_target = {"kind": "reference", "reference_idx": ref_idx}
+
     # --- Hash ---
     await client.patch(
         f"/api/v1/reference/{ref_idx}/status", json={"status": "hashing"}
     )
-    hash_dir = tmp_path / "hash"
     hash_result = await backend.run_step(
-        "hash", {"fasta_path": fasta_e2e}, hash_dir, reference_idx=ref_idx
+        "hash", {"fasta_path": fasta_e2e}, workspace, reference_idx=ref_idx
     )
     manifest_path = hash_result["manifest"]
-    manifest = json.loads(manifest_path.read_text())
 
     # --- Mint via /library/mint-features ---
     await client.patch(
         f"/api/v1/reference/{ref_idx}/status", json={"status": "minting"}
     )
-    entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
-    scope_target = {"kind": "reference", "reference_idx": ref_idx}
     mint_resp = await client.post(
         URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
-        json={"scope_target": scope_target, "inputs": {"entries": entries}},
+        json={
+            "scope_target": scope_target,
+            "inputs": {
+                "manifest_path": str(manifest_path),
+                "output_dir": str(workspace),
+            },
+        },
         headers=worker_headers,
     )
     assert mint_resp.status_code == 200, mint_resp.text
     mint_outputs = mint_resp.json()["outputs"]
-    fm_path = tmp_path / "feature_map.ndjson"
-    with open(fm_path, "w") as f:
-        for k, v in mint_outputs["mapping"].items():
-            f.write(json.dumps({"sequence_hash": k, "feature_idx": v}) + "\n")
+    feature_map_path = mint_outputs["feature_map_path"]
 
     # --- Membership via /library/write-membership ---
-    feature_idxs = list(mint_outputs["mapping"].values())
     membership_resp = await client.post(
         URL_LIBRARY_NAME.format(name=LibraryPrimitive.WRITE_MEMBERSHIP),
-        json={"scope_target": scope_target, "inputs": {"feature_idxs": feature_idxs}},
+        json={
+            "scope_target": scope_target,
+            "inputs": {"feature_map_path": feature_map_path},
+        },
         headers=worker_headers,
     )
     assert membership_resp.status_code == 200, membership_resp.text
@@ -184,7 +188,7 @@ async def test_e2e_create_to_doget(
         {
             "manifest": manifest_path,
             "fasta_path": fasta_e2e,
-            "feature_map": fm_path,
+            "feature_map": Path(feature_map_path),
             "taxonomy_path": taxonomy_e2e,
             "tree_path": tree_e2e,
         },
@@ -273,35 +277,40 @@ async def test_e2e_doget_taxonomy(
     ref_idx = ref_for_e2e
     backend = LocalBackend()
 
-    # Run pipeline (hash → mint → load → register via data plane → active)
+    workspace = tmp_path / "workspace"
+    scope_target = {"kind": "reference", "reference_idx": ref_idx}
+
+    # Run pipeline (hash → mint → membership → load → register → active)
     await client.patch(
         f"/api/v1/reference/{ref_idx}/status", json={"status": "hashing"}
     )
     hash_result = await backend.run_step(
-        "hash", {"fasta_path": fasta_e2e}, tmp_path / "h", reference_idx=ref_idx
+        "hash", {"fasta_path": fasta_e2e}, workspace, reference_idx=ref_idx
     )
     manifest_path = hash_result["manifest"]
-    manifest = json.loads(manifest_path.read_text())
+
     await client.patch(
         f"/api/v1/reference/{ref_idx}/status", json={"status": "minting"}
     )
-    entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
-    scope_target = {"kind": "reference", "reference_idx": ref_idx}
     mint_resp = await client.post(
         URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
-        json={"scope_target": scope_target, "inputs": {"entries": entries}},
+        json={
+            "scope_target": scope_target,
+            "inputs": {
+                "manifest_path": str(manifest_path),
+                "output_dir": str(workspace),
+            },
+        },
         headers=worker_headers,
     )
-    mint_outputs = mint_resp.json()["outputs"]
-    fm_path = tmp_path / "fm.ndjson"
-    with open(fm_path, "w") as f:
-        for k, v in mint_outputs["mapping"].items():
-            f.write(json.dumps({"sequence_hash": k, "feature_idx": v}) + "\n")
+    feature_map_path = mint_resp.json()["outputs"]["feature_map_path"]
 
-    feature_idxs = list(mint_outputs["mapping"].values())
     await client.post(
         URL_LIBRARY_NAME.format(name=LibraryPrimitive.WRITE_MEMBERSHIP),
-        json={"scope_target": scope_target, "inputs": {"feature_idxs": feature_idxs}},
+        json={
+            "scope_target": scope_target,
+            "inputs": {"feature_map_path": feature_map_path},
+        },
         headers=worker_headers,
     )
 
@@ -314,7 +323,7 @@ async def test_e2e_doget_taxonomy(
         {
             "manifest": manifest_path,
             "fasta_path": fasta_e2e,
-            "feature_map": fm_path,
+            "feature_map": Path(feature_map_path),
             "taxonomy_path": taxonomy_e2e,
         },
         staging,

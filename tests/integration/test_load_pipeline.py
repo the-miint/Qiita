@@ -4,8 +4,8 @@ create → hash → mint → membership → load → active.
 Requires Docker Postgres on :5433.
 """
 
-import json
 import uuid
+from pathlib import Path
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -135,48 +135,46 @@ async def test_full_load_pipeline(
     backend = LocalBackend()
     status_url = URL_REFERENCE_STATUS.format(reference_idx=ref_idx)
 
+    workspace = tmp_path / "workspace"
+    scope_target = {"kind": "reference", "reference_idx": ref_idx}
+
     # --- Hash phase ---
     await client.patch(status_url, json={"status": "hashing"})
-    hash_dir = tmp_path / "hash_output"
     hash_result = await backend.run_step(
-        "hash", {"fasta_path": fasta_3seq}, hash_dir, reference_idx=ref_idx
+        "hash", {"fasta_path": fasta_3seq}, workspace, reference_idx=ref_idx
     )
     manifest_path = hash_result["manifest"]
-    manifest = json.loads(manifest_path.read_text())
-    assert len(manifest["entries"]) == 3
+    assert manifest_path.exists() and manifest_path.suffix == ".parquet"
 
     # --- Mint phase ---
     await client.patch(status_url, json={"status": "minting"})
-    entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
     mint_resp = await client.post(
         URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
         json={
-            "scope_target": {"kind": "reference", "reference_idx": ref_idx},
-            "inputs": {"entries": entries},
+            "scope_target": scope_target,
+            "inputs": {
+                "manifest_path": str(manifest_path),
+                "output_dir": str(workspace),
+            },
         },
         headers=worker_headers,
     )
     assert mint_resp.status_code == 200, mint_resp.text
     mint_outputs = mint_resp.json()["outputs"]
+    feature_map_path = mint_outputs["feature_map_path"]
 
     # --- Membership phase ---
-    feature_idxs = list(mint_outputs["mapping"].values())
     membership_resp = await client.post(
         URL_LIBRARY_NAME.format(name=LibraryPrimitive.WRITE_MEMBERSHIP),
         json={
-            "scope_target": {"kind": "reference", "reference_idx": ref_idx},
-            "inputs": {"feature_idxs": feature_idxs},
+            "scope_target": scope_target,
+            "inputs": {"feature_map_path": feature_map_path},
         },
         headers=worker_headers,
     )
     assert membership_resp.status_code == 200, membership_resp.text
 
     # --- Load phase (status transition + load step) ---
-    fm_path = tmp_path / "feature_map.ndjson"
-    with open(fm_path, "w") as f:
-        for k, v in mint_outputs["mapping"].items():
-            f.write(json.dumps({"sequence_hash": k, "feature_idx": v}) + "\n")
-
     load_resp = await client.patch(status_url, json={"status": "loading"})
     assert load_resp.status_code == 200
 
@@ -186,7 +184,7 @@ async def test_full_load_pipeline(
         {
             "manifest": manifest_path,
             "fasta_path": fasta_3seq,
-            "feature_map": fm_path,
+            "feature_map": Path(feature_map_path),
             "taxonomy_path": taxonomy_3seq,
             "tree_path": tree_3seq,
         },

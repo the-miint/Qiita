@@ -1,6 +1,5 @@
 """Integration test: orchestrator hash job → control plane mint — first cross-service test."""
 
-import json
 import uuid
 
 import pytest
@@ -82,41 +81,40 @@ async def test_hash_then_mint_pipeline(
     status_resp = await client.patch(status_url, json={"status": "hashing"})
     assert status_resp.status_code == 200
 
-    # Hash step
+    # Hash step — writes manifest.parquet
     backend = LocalBackend()
-    output_dir = tmp_path / "hash_output"
+    workspace = tmp_path / "workspace"
     result = await backend.run_step(
-        "hash", {"fasta_path": fasta_path}, output_dir, reference_idx=ref_idx
+        "hash", {"fasta_path": fasta_path}, workspace, reference_idx=ref_idx
     )
     manifest_path = result["manifest"]
-    manifest = json.loads(manifest_path.read_text())
-    assert len(manifest["entries"]) == 5
+    assert manifest_path.exists() and manifest_path.suffix == ".parquet"
 
     # hashing → minting (orchestrator-driven; no longer implicit in the mint call)
     await client.patch(status_url, json={"status": "minting"})
 
     # mint-features primitive via /library/{name}
-    entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
     mint_resp = await client.post(
         URL_LIBRARY_NAME.format(name=LibraryPrimitive.MINT_FEATURES),
         json={
             "scope_target": {"kind": "reference", "reference_idx": ref_idx},
-            "inputs": {"entries": entries},
+            "inputs": {
+                "manifest_path": str(manifest_path),
+                "output_dir": str(workspace),
+            },
         },
         headers=worker_headers,
     )
     assert mint_resp.status_code == 200, mint_resp.text
     mint_outputs = mint_resp.json()["outputs"]
     assert mint_outputs["minted"] + mint_outputs["reused"] == 5
-    assert len(mint_outputs["mapping"]) == 5
 
-    # write-membership primitive — links the minted feature_idxs
-    feature_idxs = list(mint_outputs["mapping"].values())
+    # write-membership primitive — reads feature_map.parquet from disk.
     membership_resp = await client.post(
         URL_LIBRARY_NAME.format(name=LibraryPrimitive.WRITE_MEMBERSHIP),
         json={
             "scope_target": {"kind": "reference", "reference_idx": ref_idx},
-            "inputs": {"feature_idxs": feature_idxs},
+            "inputs": {"feature_map_path": mint_outputs["feature_map_path"]},
         },
         headers=worker_headers,
     )
