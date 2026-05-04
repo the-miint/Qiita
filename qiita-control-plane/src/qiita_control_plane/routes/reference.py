@@ -152,7 +152,11 @@ async def update_reference_status(
     )
 
 
-@router.post("/{reference_idx}/feature/mint")
+@router.post(
+    "/{reference_idx}/feature/mint",
+    deprecated=True,
+    summary="Deprecated — use POST /feature/mint + POST /reference/{idx}/membership",
+)
 async def mint_features(
     reference_idx: Annotated[int, Field(gt=0)],
     body: FeatureMintRequest,
@@ -160,6 +164,19 @@ async def mint_features(
     _service: ServiceAccount = Depends(require_service),
     _scope: Principal = Depends(require_scope(Scope.FEATURE_MINT)),
 ) -> FeatureMintResponse:
+    """Deprecated: prefer the split endpoints.
+
+    This route conflates three concerns — feature minting, reference
+    membership, and an atomic 'hashing → minting' status transition.
+    New callers should drive them separately:
+
+        PATCH /reference/{idx}/status     (orchestrator → 'minting')
+        POST  /feature/mint               (mint feature_idx values)
+        POST  /reference/{idx}/membership (link those features)
+
+    Kept until reference-add migrates to the new flow; removed in a
+    follow-up.
+    """
     # Atomic status transition: hashing -> minting, or verify already minting.
     # Uses UPDATE ... WHERE to avoid TOCTOU race between concurrent callers.
     updated = await pool.fetchval(
