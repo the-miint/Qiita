@@ -1,31 +1,28 @@
 """Reference management routes.
 
-Every route is wired to the principal resolver and guards. POST /reference
-uses created_by_idx (BIGINT FK to qiita.principal) as the canonical owner
-reference. GET /reference/{id} stays anonymous-OK (`get_current_principal`
-directly, no guard); other routes pin to scope and kind constraints.
+POST /reference creates a reference and is the only mutation endpoint
+on this router that humans drive. GET /reference/{id} stays anonymous-OK
+(`get_current_principal` directly, no guard). PATCH /reference/{id}/status
+moves the reference through its lifecycle and is driven by the workflow
+runner. POST /reference/{id}/ticket/doget signs a Flight ticket so a
+client can pull active reference rows from the data plane.
 
-Mint and register routes are thin shells over the action library
-(qiita_control_plane.actions.library); the library is the canonical
-implementation so workflow-runner invocations and HTTP callers can't
-diverge.
+Feature minting, membership writes, and DuckLake registration used to
+live here as per-primitive routes; they're now reached through the
+generic POST /api/v1/library/{name} dispatch (routes/library.py) so
+workflow runners and HTTP callers share one transport.
 """
 
 import base64
 from typing import Annotated
-from uuid import UUID
 
 import asyncpg
-import pyarrow.flight as _flight
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_REFERENCE_BY_IDX,
-    PATH_REFERENCE_DEPRECATED_FEATURE_MINT,
     PATH_REFERENCE_DOGET,
-    PATH_REFERENCE_MEMBERSHIP,
     PATH_REFERENCE_PREFIX,
-    PATH_REFERENCE_REGISTER,
     PATH_REFERENCE_ROOT,
     PATH_REFERENCE_STATUS,
 )
@@ -34,47 +31,24 @@ from qiita_common.models import (
     VALID_STATUS_TRANSITIONS,
     DoGetTicketRequest,
     DoGetTicketResponse,
-    FeatureMintRequest,
-    FeatureMintResponse,
     ReferenceCreateRequest,
-    ReferenceMembershipRequest,
-    ReferenceMembershipResponse,
     ReferenceResponse,
     ReferenceStatusUpdate,
-    RegisterFilesRequest,
-    RegisterFilesResponse,
 )
 
-from ..actions.library import (
-    _mint_chunk,
-    _write_genome_associations,
-    _write_membership_rows,
-)
-from ..actions.library import (
-    register_files as _register_files,
-)
-from ..actions.library import (
-    write_membership as _write_membership,
-)
 from ..auth.guards import (
     require_complete_profile,
     require_scope,
-    require_service,
 )
 from ..auth.principal import (
     HumanUser,
     Principal,
-    ServiceAccount,
     get_current_principal,
 )
 from ..auth.tickets import sign_ticket
-from ..deps import get_data_plane_url, get_db_pool, get_hmac_secret
+from ..deps import get_db_pool, get_hmac_secret
 
 router = APIRouter(prefix=PATH_REFERENCE_PREFIX, tags=["reference"])
-
-# Per-chunk transactions in the deprecated mint route below; matches the
-# library's chunk size so behaviour is identical to the new split routes.
-_CHUNK_SIZE = 10_000
 
 
 _REFERENCE_RETURNING = "reference_idx, name, version, kind, status, created_by_idx, created_at"
@@ -174,118 +148,6 @@ async def update_reference_status(
     )
 
 
-@router.post(
-    PATH_REFERENCE_DEPRECATED_FEATURE_MINT,
-    deprecated=True,
-    summary="Deprecated — use POST /feature/mint + POST /reference/{idx}/membership",
-)
-async def mint_features(
-    reference_idx: Annotated[int, Field(gt=0)],
-    body: FeatureMintRequest,
-    pool: asyncpg.Pool = Depends(get_db_pool),
-    _service: ServiceAccount = Depends(require_service),
-    _scope: Principal = Depends(require_scope(Scope.FEATURE_MINT)),
-) -> FeatureMintResponse:
-    """Deprecated: prefer the split endpoints.
-
-    This route conflates three concerns — feature minting, reference
-    membership, and an atomic 'hashing → minting' status transition.
-    New callers should drive them separately:
-
-        PATCH /reference/{idx}/status     (orchestrator → 'minting')
-        POST  /feature/mint               (mint feature_idx values)
-        POST  /reference/{idx}/membership (link those features)
-
-    Per-chunk transactions write mint+membership+genome together so a
-    partial failure rolls back to a consistent per-chunk state. That
-    combined transactional shape doesn't fit any single library
-    primitive, so this route reaches into the library's per-chunk
-    helpers directly.
-
-    Kept until reference-add migrates to the new flow; removed in a
-    follow-up.
-    """
-    # Atomic status transition: hashing -> minting, or verify already minting.
-    # Uses UPDATE ... WHERE to avoid TOCTOU race between concurrent callers.
-    updated = await pool.fetchval(
-        "UPDATE qiita.reference SET status = 'minting'"
-        " WHERE reference_idx = $1 AND status IN ('hashing', 'minting')"
-        " RETURNING reference_idx",
-        reference_idx,
-    )
-    if updated is None:
-        # Distinguish "not found" from "wrong status"
-        ref = await pool.fetchrow(
-            "SELECT status FROM qiita.reference WHERE reference_idx = $1",
-            reference_idx,
-        )
-        if ref is None:
-            raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
-        raise HTTPException(
-            status_code=409,
-            detail=f"Reference status is {ref['status']!r}, must be 'hashing' or 'minting'",
-        )
-
-    full_mapping: dict[UUID, int] = {}
-    total_minted = 0
-    total_reused = 0
-
-    # Partial failure is recoverable: resubmitting the full batch is safe because
-    # features and membership use ON CONFLICT DO NOTHING. Status remains 'minting'
-    # and subsequent calls will succeed for the remaining entries.
-    for i in range(0, len(body.entries), _CHUNK_SIZE):
-        chunk = body.entries[i : i + _CHUNK_SIZE]
-        async with pool.acquire() as conn, conn.transaction():
-            chunk_mapping, minted, reused = await _mint_chunk(conn, chunk)
-            await _write_membership_rows(conn, reference_idx, list(chunk_mapping.values()))
-            genome_entries = [e for e in chunk if e.genome_source is not None]
-            if genome_entries:
-                await _write_genome_associations(conn, genome_entries, chunk_mapping)
-        full_mapping.update(chunk_mapping)
-        total_minted += minted
-        total_reused += reused
-
-    return FeatureMintResponse(mapping=full_mapping, minted=total_minted, reused=total_reused)
-
-
-@router.post(PATH_REFERENCE_MEMBERSHIP, status_code=201)
-async def write_reference_membership(
-    reference_idx: Annotated[int, Field(gt=0)],
-    body: ReferenceMembershipRequest,
-    pool: asyncpg.Pool = Depends(get_db_pool),
-    _service: ServiceAccount = Depends(require_service),
-    _scope: Principal = Depends(require_scope(Scope.REFERENCE_WRITE)),
-) -> ReferenceMembershipResponse:
-    """Link already-minted feature_idx values to a reference.
-
-    The reference must be in 'minting' status — the orchestrator transitions
-    via PATCH /reference/{idx}/status before calling. Idempotent:
-    pre-existing (reference_idx, feature_idx) rows are skipped via
-    ON CONFLICT DO NOTHING and counted in `already_linked`.
-
-    Unknown feature_idx values are rejected with 422 — the FK violation
-    is caught by the library and re-raised as ValueError, which the
-    handler maps to a structured response.
-    """
-    status = await pool.fetchval(
-        "SELECT status FROM qiita.reference WHERE reference_idx = $1",
-        reference_idx,
-    )
-    if status is None:
-        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
-    if status != "minting":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Reference status is {status!r}, must be 'minting'",
-        )
-
-    try:
-        linked, already_linked = await _write_membership(pool, reference_idx, body.feature_idxs)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return ReferenceMembershipResponse(linked=linked, already_linked=already_linked)
-
-
 # Tables that can appear in a DoGet ticket. Must match the data plane's
 # ALLOWED_TABLES whitelist in flight_service.rs.
 _DOGET_ALLOWED_TABLES = frozenset(
@@ -343,45 +205,3 @@ async def create_doget_ticket(
         secret=hmac_secret,
     )
     return DoGetTicketResponse(ticket=base64.b64encode(ticket_bytes).decode())
-
-
-@router.post(PATH_REFERENCE_REGISTER, status_code=201)
-async def register_files(
-    reference_idx: Annotated[int, Field(gt=0)],
-    body: RegisterFilesRequest,
-    pool: asyncpg.Pool = Depends(get_db_pool),
-    hmac_secret: bytes = Depends(get_hmac_secret),
-    data_plane_url: str = Depends(get_data_plane_url),
-    _service: ServiceAccount = Depends(require_service),
-    _scope: Principal = Depends(require_scope(Scope.REFERENCE_REGISTER_FILES)),
-) -> RegisterFilesResponse:
-    """Register Parquet files in DuckLake via the data plane's DoAction.
-
-    Workers only — the orchestrator is the canonical caller. Reference
-    must be in 'loading' status.
-    """
-    status = await pool.fetchval(
-        "SELECT status FROM qiita.reference WHERE reference_idx = $1",
-        reference_idx,
-    )
-    if status is None:
-        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
-    if status != "loading":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Reference status is {status!r}, must be 'loading'",
-        )
-
-    try:
-        registered = await _register_files(
-            staging_dir=body.staging_dir,
-            files=body.files,
-            hmac_secret=hmac_secret,
-            data_plane_url=data_plane_url,
-        )
-    except _flight.FlightError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Data plane registration failed: {exc}",
-        ) from exc
-    return RegisterFilesResponse(registered=registered)

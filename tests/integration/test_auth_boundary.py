@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from qiita_common.api_paths import URL_LIBRARY_NAME
 
 
 def _unique_suffix(human_label: str) -> str:
@@ -292,17 +293,28 @@ async def _seed_active_reference(postgres_pool, suffix: str) -> int:
     )
 
 
-async def test_mint_features_no_auth_401(boundary_client, postgres_pool):
+def _ref_target(reference_idx: int) -> dict:
+    return {"kind": "reference", "reference_idx": reference_idx}
+
+
+async def test_library_dispatch_no_auth_401(boundary_client, postgres_pool):
+    """POST /library/mint-features without an Authorization header — 401
+    from the require_service guard before any per-primitive logic runs."""
     ref_idx = await _seed_active_reference(postgres_pool, "no-auth")
     resp = await boundary_client.post(
-        f"/api/v1/reference/{ref_idx}/feature/mint",
-        json={"entries": [{"sequence_hash": "00000000-0000-0000-0000-000000000001"}]},
+        URL_LIBRARY_NAME.format(name="mint-features"),
+        json={
+            "scope_target": _ref_target(ref_idx),
+            "inputs": {"entries": [{"sequence_hash": "00000000-0000-0000-0000-000000000001"}]},
+        },
     )
     assert resp.status_code == 401
 
 
-async def test_mint_features_human_403(boundary_client, postgres_pool):
-    """Human cannot mint — workers only."""
+async def test_library_dispatch_human_403(boundary_client, postgres_pool):
+    """Human PAT against any library primitive — 403 from require_service.
+    The auth boundary is name-agnostic, so one primitive is sufficient
+    coverage."""
     ref_idx = await _seed_active_reference(postgres_pool, "human-blocked")
     token, _ = await _seed_human_with_token(
         postgres_pool,
@@ -312,66 +324,47 @@ async def test_mint_features_human_403(boundary_client, postgres_pool):
             "self:token",
             "reference:read",
             "reference:write",
+            "feature:mint",
             "admin:user",
             "admin:service_account",
             "admin:audit_read",
         ],
-        suffix="mint-human",
+        suffix="library-human",
     )
     resp = await boundary_client.post(
-        f"/api/v1/reference/{ref_idx}/feature/mint",
-        json={"entries": [{"sequence_hash": "00000000-0000-0000-0000-000000000002"}]},
+        URL_LIBRARY_NAME.format(name="mint-features"),
+        json={
+            "scope_target": _ref_target(ref_idx),
+            "inputs": {"entries": [{"sequence_hash": "00000000-0000-0000-0000-000000000002"}]},
+        },
         headers=_h(token),
     )
     assert resp.status_code == 403
 
 
-async def test_mint_features_service_missing_scope_403(boundary_client, postgres_pool):
-    """Service token without features:mint."""
-    ref_idx = await _seed_active_reference(postgres_pool, "svc-no-scope")
+async def test_library_dispatch_mint_missing_scope_403(boundary_client, postgres_pool):
+    """Service principal without feature:mint scope — 403 from the per-name
+    scope check inside the dispatch handler (FastAPI's require_scope can't
+    see the path parameter at dependency-resolution time)."""
+    ref_idx = await _seed_active_reference(postgres_pool, "mint-no-scope")
     token, _ = await _seed_service_with_token(
         postgres_pool,
         scopes=["reference:read"],
         suffix="mint-svc-no-scope",
     )
     resp = await boundary_client.post(
-        f"/api/v1/reference/{ref_idx}/feature/mint",
-        json={"entries": [{"sequence_hash": "00000000-0000-0000-0000-000000000003"}]},
+        URL_LIBRARY_NAME.format(name="mint-features"),
+        json={
+            "scope_target": _ref_target(ref_idx),
+            "inputs": {"entries": [{"sequence_hash": "00000000-0000-0000-0000-000000000003"}]},
+        },
         headers=_h(token),
     )
     assert resp.status_code == 403
 
 
-# ---------------------------------------------------------------------------
-# POST /references/{id}/register — require_service + references:register_files
-# ---------------------------------------------------------------------------
-
-
-async def test_register_files_human_403(boundary_client, postgres_pool):
-    ref_idx = await _seed_active_reference(postgres_pool, "register-human")
-    token, _ = await _seed_human_with_token(
-        postgres_pool,
-        system_role="system_admin",
-        scopes=[
-            "self:profile",
-            "self:token",
-            "reference:read",
-            "reference:write",
-            "admin:user",
-            "admin:service_account",
-            "admin:audit_read",
-        ],
-        suffix="reg-human",
-    )
-    resp = await boundary_client.post(
-        f"/api/v1/reference/{ref_idx}/register",
-        json={"staging_dir": "/tmp/x", "files": {}},
-        headers=_h(token),
-    )
-    assert resp.status_code == 403
-
-
-async def test_register_files_service_missing_scope_403(boundary_client, postgres_pool):
+async def test_library_dispatch_register_missing_scope_403(boundary_client, postgres_pool):
+    """Service principal without reference:register_files scope — 403."""
     ref_idx = await _seed_active_reference(postgres_pool, "register-no-scope")
     token, _ = await _seed_service_with_token(
         postgres_pool,
@@ -379,8 +372,11 @@ async def test_register_files_service_missing_scope_403(boundary_client, postgre
         suffix="reg-no-scope",
     )
     resp = await boundary_client.post(
-        f"/api/v1/reference/{ref_idx}/register",
-        json={"staging_dir": "/tmp/x", "files": {}},
+        URL_LIBRARY_NAME.format(name="register-files"),
+        json={
+            "scope_target": _ref_target(ref_idx),
+            "inputs": {"staging_dir": "/tmp/x", "files": {}},
+        },
         headers=_h(token),
     )
     assert resp.status_code == 403

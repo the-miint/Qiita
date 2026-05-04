@@ -99,15 +99,45 @@ class ReferenceMembershipRequest(BaseModel):
 
 
 class ReferenceMembershipResponse(BaseModel):
-    """Returned by POST /reference/{reference_idx}/membership.
+    """Returned by the write-membership library primitive.
 
     `linked` counts newly-inserted (reference_idx, feature_idx) rows;
     `already_linked` counts rows the table already had (ON CONFLICT DO
-    NOTHING). Total = linked + already_linked = len(request.feature_idxs).
+    NOTHING). Total = linked + already_linked = len(input.feature_idxs).
     """
 
     linked: int
     already_linked: int
+
+
+class LibraryInvocation(BaseModel):
+    """Body for POST /api/v1/library/{name}.
+
+    `scope_target` carries the work-ticket's resource — the dispatch
+    handler validates that the chosen primitive is compatible (e.g.
+    write-membership requires kind=reference).
+
+    `inputs` is the per-primitive input dict, validated inside the
+    dispatch handler since each primitive has different requirements:
+      mint-features    → {"entries": [FeatureHashEntry-shaped]}
+      write-membership → {"feature_idxs": [int]}
+      register-files   → {"staging_dir": str, "files": {filename: table}}
+    """
+
+    scope_target: ScopeTarget
+    inputs: dict[str, Any] = Field(default_factory=dict)
+
+
+class LibraryResponse(BaseModel):
+    """Returned by POST /api/v1/library/{name}.
+
+    `outputs` is the primitive's return shape, varying by primitive:
+      mint-features    → {"mapping": {hash: idx}, "minted": int, "reused": int}
+      write-membership → {"linked": int, "already_linked": int}
+      register-files   → {"registered": [path]}
+    """
+
+    outputs: dict[str, Any]
 
 
 # Valid status transitions for references.

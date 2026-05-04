@@ -1,6 +1,6 @@
 """Integration test: full reference load pipeline.
 
-create → hash → mint → load → active.
+create → hash → mint → membership → load → active.
 Requires Docker Postgres on :5433.
 """
 
@@ -9,15 +9,25 @@ import uuid
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from qiita_common.api_paths import URL_LIBRARY_NAME, URL_REFERENCE_PREFIX, URL_REFERENCE_STATUS
 
 
 @pytest.fixture
-async def client(postgres_pool, human_admin_session):
+async def client(postgres_pool, hmac_secret, human_admin_session):
     """AsyncClient authenticated as the session admin. Service-only routes
-    (mint) take a worker token via per-request `headers=worker_headers`."""
+    take a worker token via per-request `headers=worker_headers`. Settings
+    are initialised so the library dispatch endpoint resolves; the
+    data_plane_url is a stub since this module never dispatches
+    register-files."""
+    from qiita_control_plane.config import Settings
     from qiita_control_plane.main import app
 
     app.state.pool = postgres_pool
+    app.state.settings = Settings(
+        database_url="unused-in-test",
+        hmac_secret_key=hmac_secret,
+        data_plane_url="grpc://127.0.0.1:0",
+    )
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://test",
@@ -36,7 +46,7 @@ def worker_headers(compute_worker_service_account):
 async def ref_for_load(client, postgres_pool):
     """Create a reference in pending status and clean up after."""
     resp = await client.post(
-        "/api/v1/reference",
+        URL_REFERENCE_PREFIX,
         json={
             "name": f"load-pipeline-{uuid.uuid4()}",
             "version": "1.0",
@@ -49,9 +59,7 @@ async def ref_for_load(client, postgres_pool):
     await postgres_pool.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
 
 
 TEST_SEQUENCES = {
@@ -109,17 +117,18 @@ async def test_full_load_pipeline(
     tmp_path,
     worker_headers,
 ):
-    """Full round-trip: create → hash → mint → load → active → verify."""
+    """Full round-trip: hash → minting → mint-features → write-membership →
+    loading → load step → active. Status transitions are explicit (the
+    orchestrator drives them between primitives — there is no implicit
+    transition baked into any single primitive any more)."""
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
     ref_idx = ref_for_load
     backend = LocalBackend()
+    status_url = URL_REFERENCE_STATUS.format(reference_idx=ref_idx)
 
     # --- Hash phase ---
-    await client.patch(
-        f"/api/v1/reference/{ref_idx}/status",
-        json={"status": "hashing"},
-    )
+    await client.patch(status_url, json={"status": "hashing"})
     hash_dir = tmp_path / "hash_output"
     hash_result = await backend.run_step(
         "hash", {"fasta_path": fasta_3seq}, hash_dir, reference_idx=ref_idx
@@ -129,24 +138,38 @@ async def test_full_load_pipeline(
     assert len(manifest["entries"]) == 3
 
     # --- Mint phase ---
+    await client.patch(status_url, json={"status": "minting"})
     entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
     mint_resp = await client.post(
-        f"/api/v1/reference/{ref_idx}/feature/mint",
-        json={"entries": entries},
+        URL_LIBRARY_NAME.format(name="mint-features"),
+        json={
+            "scope_target": {"kind": "reference", "reference_idx": ref_idx},
+            "inputs": {"entries": entries},
+        },
         headers=worker_headers,
     )
-    assert mint_resp.status_code == 200
-    mint_body = mint_resp.json()
+    assert mint_resp.status_code == 200, mint_resp.text
+    mint_outputs = mint_resp.json()["outputs"]
+
+    # --- Membership phase ---
+    feature_idxs = list(mint_outputs["mapping"].values())
+    membership_resp = await client.post(
+        URL_LIBRARY_NAME.format(name="write-membership"),
+        json={
+            "scope_target": {"kind": "reference", "reference_idx": ref_idx},
+            "inputs": {"feature_idxs": feature_idxs},
+        },
+        headers=worker_headers,
+    )
+    assert membership_resp.status_code == 200, membership_resp.text
+
+    # --- Load phase (status transition + load step) ---
     fm_path = tmp_path / "feature_map.ndjson"
     with open(fm_path, "w") as f:
-        for k, v in mint_body["mapping"].items():
+        for k, v in mint_outputs["mapping"].items():
             f.write(json.dumps({"sequence_hash": k, "feature_idx": v}) + "\n")
 
-    # --- Load phase (status transition + load job) ---
-    load_resp = await client.patch(
-        f"/api/v1/reference/{ref_idx}/status",
-        json={"status": "loading"},
-    )
+    load_resp = await client.patch(status_url, json={"status": "loading"})
     assert load_resp.status_code == 200
 
     load_dir = tmp_path / "load_output"
@@ -171,21 +194,15 @@ async def test_full_load_pipeline(
     assert (load_dir / "reference_phylogeny.parquet").exists()
 
     # --- Transition to active ---
-    active_resp = await client.patch(
-        f"/api/v1/reference/{ref_idx}/status",
-        json={"status": "active"},
-    )
+    active_resp = await client.patch(status_url, json={"status": "active"})
     assert active_resp.status_code == 200
     assert active_resp.json()["status"] == "active"
 
     # --- Verify DB state ---
-    # Reference is active
     status = await postgres_pool.fetchval(
         "SELECT status FROM qiita.reference WHERE reference_idx = $1", ref_idx
     )
     assert status == "active"
-
-    # 3 membership rows
     membership_count = await postgres_pool.fetchval(
         "SELECT count(*) FROM qiita.reference_membership WHERE reference_idx = $1",
         ref_idx,

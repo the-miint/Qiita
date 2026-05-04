@@ -37,6 +37,7 @@ from _pg_env import (
     postgres_url,
 )
 from httpx import ASGITransport, AsyncClient
+from qiita_common.api_paths import URL_LIBRARY_NAME
 
 DATA_DIR = Path(__file__).parent.parent.parent / "localdocs" / "scratch"
 FASTA = DATA_DIR / "2024.09.backbone.sequence.fna.gz"
@@ -255,7 +256,13 @@ async def test_gg2_backbone_pipeline(
             genome_map[fid] = ("gg2", gid)
 
     fm_path = tmp_path / "feature_map.ndjson"
+    # Move to 'minting' once for the whole run; the new mint path doesn't
+    # toggle status itself.
+    await client.patch(f"/api/v1/reference/{ref_idx}/status", json={"status": "minting"})
+    scope_target = {"kind": "reference", "reference_idx": ref_idx}
+
     total_minted = 0
+    all_feature_idxs: list[int] = []
     with open(fm_path, "w") as fm_file:
         for i in range(0, len(entries), _CHUNK):
             chunk = entries[i : i + _CHUNK]
@@ -268,15 +275,27 @@ async def test_gg2_backbone_pipeline(
                     kwargs["genome_source_id"] = genome[1]
                 mint_entries.append(kwargs)
             resp = await client.post(
-                f"/api/v1/reference/{ref_idx}/feature/mint",
-                json={"entries": mint_entries},
+                URL_LIBRARY_NAME.format(name="mint-features"),
+                json={"scope_target": scope_target, "inputs": {"entries": mint_entries}},
             )
             assert resp.status_code == 200, f"mint chunk {i} failed: {resp.text[:200]}"
-            for k, v in resp.json()["mapping"].items():
+            mint_outputs = resp.json()["outputs"]
+            for k, v in mint_outputs["mapping"].items():
                 fm_file.write(json.dumps({"sequence_hash": k, "feature_idx": v}) + "\n")
+                all_feature_idxs.append(v)
                 total_minted += 1
 
     assert total_minted == 331269
+
+    # Link all feature_idxs to the reference (chunked to avoid a single
+    # 300K-element JSON body).
+    for i in range(0, len(all_feature_idxs), _CHUNK):
+        feature_idxs = all_feature_idxs[i : i + _CHUNK]
+        resp = await client.post(
+            URL_LIBRARY_NAME.format(name="write-membership"),
+            json={"scope_target": scope_target, "inputs": {"feature_idxs": feature_idxs}},
+        )
+        assert resp.status_code == 200, f"membership chunk {i} failed: {resp.text[:200]}"
 
     # --- Load (write Parquet to staging) ---
     await client.patch(
@@ -304,22 +323,25 @@ async def test_gg2_backbone_pipeline(
     assert (staging / "reference_taxonomy.parquet").exists()
     assert (staging / "reference_phylogeny.parquet").exists()
 
-    # --- Register via control plane → data plane DoAction ---
+    # --- Register via /library/register-files (data-plane DoAction) ---
     reg_resp = await client.post(
-        f"/api/v1/reference/{ref_idx}/register",
+        URL_LIBRARY_NAME.format(name="register-files"),
         json={
-            "staging_dir": str(staging),
-            "files": {
-                "reference_sequences.parquet": "reference_sequences",
-                "reference_sequence_chunks.parquet": "reference_sequence_chunks",
-                "reference_membership.parquet": "reference_membership",
-                "reference_taxonomy.parquet": "reference_taxonomy",
-                "reference_phylogeny.parquet": "reference_phylogeny",
+            "scope_target": scope_target,
+            "inputs": {
+                "staging_dir": str(staging),
+                "files": {
+                    "reference_sequences.parquet": "reference_sequences",
+                    "reference_sequence_chunks.parquet": "reference_sequence_chunks",
+                    "reference_membership.parquet": "reference_membership",
+                    "reference_taxonomy.parquet": "reference_taxonomy",
+                    "reference_phylogeny.parquet": "reference_phylogeny",
+                },
             },
         },
     )
-    assert reg_resp.status_code == 201, f"registration failed: {reg_resp.text[:500]}"
-    assert len(reg_resp.json()["registered"]) == 5
+    assert reg_resp.status_code == 200, f"registration failed: {reg_resp.text[:500]}"
+    assert len(reg_resp.json()["outputs"]["registered"]) == 5
 
     # --- Transition to active ---
     resp = await client.patch(

@@ -14,6 +14,7 @@ import uuid
 import pyarrow.flight as flight
 import pytest
 from httpx import ASGITransport, AsyncClient
+from qiita_common.api_paths import URL_LIBRARY_NAME
 
 
 @pytest.fixture
@@ -146,23 +147,33 @@ async def test_e2e_create_to_doget(
     manifest_path = hash_result["manifest"]
     manifest = json.loads(manifest_path.read_text())
 
-    # --- Mint ---
+    # --- Mint via /library/mint-features ---
+    await client.patch(f"/api/v1/reference/{ref_idx}/status", json={"status": "minting"})
     entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
+    scope_target = {"kind": "reference", "reference_idx": ref_idx}
     mint_resp = await client.post(
-        f"/api/v1/reference/{ref_idx}/feature/mint",
-        json={"entries": entries},
+        URL_LIBRARY_NAME.format(name="mint-features"),
+        json={"scope_target": scope_target, "inputs": {"entries": entries}},
         headers=worker_headers,
     )
-    assert mint_resp.status_code == 200
+    assert mint_resp.status_code == 200, mint_resp.text
+    mint_outputs = mint_resp.json()["outputs"]
     fm_path = tmp_path / "feature_map.ndjson"
     with open(fm_path, "w") as f:
-        for k, v in mint_resp.json()["mapping"].items():
+        for k, v in mint_outputs["mapping"].items():
             f.write(json.dumps({"sequence_hash": k, "feature_idx": v}) + "\n")
 
-    # --- Load (write Parquet to staging) ---
-    await client.patch(
-        f"/api/v1/reference/{ref_idx}/status", json={"status": "loading"}
+    # --- Membership via /library/write-membership ---
+    feature_idxs = list(mint_outputs["mapping"].values())
+    membership_resp = await client.post(
+        URL_LIBRARY_NAME.format(name="write-membership"),
+        json={"scope_target": scope_target, "inputs": {"feature_idxs": feature_idxs}},
+        headers=worker_headers,
     )
+    assert membership_resp.status_code == 200, membership_resp.text
+
+    # --- Load (write Parquet to staging) ---
+    await client.patch(f"/api/v1/reference/{ref_idx}/status", json={"status": "loading"})
     staging_dir = tmp_path / "staging"
     await backend.run_step(
         "load",
@@ -177,22 +188,25 @@ async def test_e2e_create_to_doget(
         reference_idx=ref_idx,
     )
 
-    # --- Register via control plane → data plane DoAction ---
+    # --- Register via /library/register-files (control-plane → data-plane DoAction) ---
     reg_resp = await client.post(
-        f"/api/v1/reference/{ref_idx}/register",
+        URL_LIBRARY_NAME.format(name="register-files"),
         json={
-            "staging_dir": str(staging_dir),
-            "files": {
-                "reference_sequences.parquet": "reference_sequences",
-                "reference_sequence_chunks.parquet": "reference_sequence_chunks",
-                "reference_membership.parquet": "reference_membership",
-                "reference_taxonomy.parquet": "reference_taxonomy",
-                "reference_phylogeny.parquet": "reference_phylogeny",
+            "scope_target": scope_target,
+            "inputs": {
+                "staging_dir": str(staging_dir),
+                "files": {
+                    "reference_sequences.parquet": "reference_sequences",
+                    "reference_sequence_chunks.parquet": "reference_sequence_chunks",
+                    "reference_membership.parquet": "reference_membership",
+                    "reference_taxonomy.parquet": "reference_taxonomy",
+                    "reference_phylogeny.parquet": "reference_phylogeny",
+                },
             },
         },
         headers=worker_headers,
     )
-    assert reg_resp.status_code == 201
+    assert reg_resp.status_code == 200, reg_resp.text
 
     # --- Transition to active ---
     active_resp = await client.patch(
@@ -264,20 +278,28 @@ async def test_e2e_doget_taxonomy(
     )
     manifest_path = hash_result["manifest"]
     manifest = json.loads(manifest_path.read_text())
+    await client.patch(f"/api/v1/reference/{ref_idx}/status", json={"status": "minting"})
     entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
+    scope_target = {"kind": "reference", "reference_idx": ref_idx}
     mint_resp = await client.post(
-        f"/api/v1/reference/{ref_idx}/feature/mint",
-        json={"entries": entries},
+        URL_LIBRARY_NAME.format(name="mint-features"),
+        json={"scope_target": scope_target, "inputs": {"entries": entries}},
         headers=worker_headers,
     )
+    mint_outputs = mint_resp.json()["outputs"]
     fm_path = tmp_path / "fm.ndjson"
     with open(fm_path, "w") as f:
-        for k, v in mint_resp.json()["mapping"].items():
+        for k, v in mint_outputs["mapping"].items():
             f.write(json.dumps({"sequence_hash": k, "feature_idx": v}) + "\n")
 
-    await client.patch(
-        f"/api/v1/reference/{ref_idx}/status", json={"status": "loading"}
+    feature_idxs = list(mint_outputs["mapping"].values())
+    await client.post(
+        URL_LIBRARY_NAME.format(name="write-membership"),
+        json={"scope_target": scope_target, "inputs": {"feature_idxs": feature_idxs}},
+        headers=worker_headers,
     )
+
+    await client.patch(f"/api/v1/reference/{ref_idx}/status", json={"status": "loading"})
     staging = tmp_path / "s"
     await backend.run_step(
         "load",
@@ -291,19 +313,22 @@ async def test_e2e_doget_taxonomy(
         reference_idx=ref_idx,
     )
     reg_resp = await client.post(
-        f"/api/v1/reference/{ref_idx}/register",
+        URL_LIBRARY_NAME.format(name="register-files"),
         json={
-            "staging_dir": str(staging),
-            "files": {
-                "reference_sequences.parquet": "reference_sequences",
-                "reference_sequence_chunks.parquet": "reference_sequence_chunks",
-                "reference_membership.parquet": "reference_membership",
-                "reference_taxonomy.parquet": "reference_taxonomy",
+            "scope_target": scope_target,
+            "inputs": {
+                "staging_dir": str(staging),
+                "files": {
+                    "reference_sequences.parquet": "reference_sequences",
+                    "reference_sequence_chunks.parquet": "reference_sequence_chunks",
+                    "reference_membership.parquet": "reference_membership",
+                    "reference_taxonomy.parquet": "reference_taxonomy",
+                },
             },
         },
         headers=worker_headers,
     )
-    assert reg_resp.status_code == 201
+    assert reg_resp.status_code == 200, reg_resp.text
     await client.patch(
         f"/api/v1/reference/{ref_idx}/status", json={"status": "active"}
     )

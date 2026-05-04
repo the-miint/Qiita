@@ -25,17 +25,6 @@ they're touched.
 from qiita_common.auth_constants import API_PREFIX
 
 # =============================================================================
-# /feature/*
-# =============================================================================
-
-PATH_FEATURE_PREFIX = "/feature"
-PATH_FEATURE_MINT = "/mint"
-
-URL_FEATURE_PREFIX = f"{API_PREFIX}{PATH_FEATURE_PREFIX}"
-URL_FEATURE_MINT = f"{URL_FEATURE_PREFIX}{PATH_FEATURE_MINT}"
-
-
-# =============================================================================
 # /reference/*
 # =============================================================================
 
@@ -43,18 +32,23 @@ PATH_REFERENCE_PREFIX = "/reference"
 PATH_REFERENCE_ROOT = ""  # POST/list against the prefix itself
 PATH_REFERENCE_BY_IDX = "/{reference_idx}"
 PATH_REFERENCE_STATUS = "/{reference_idx}/status"
-PATH_REFERENCE_MEMBERSHIP = "/{reference_idx}/membership"
-PATH_REFERENCE_REGISTER = "/{reference_idx}/register"
 PATH_REFERENCE_DOGET = "/{reference_idx}/ticket/doget"
-# Deprecated: kept until reference-add migrates to the split routes.
-PATH_REFERENCE_DEPRECATED_FEATURE_MINT = "/{reference_idx}/feature/mint"
 
 URL_REFERENCE_PREFIX = f"{API_PREFIX}{PATH_REFERENCE_PREFIX}"
 URL_REFERENCE_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_BY_IDX}"
 URL_REFERENCE_STATUS = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_STATUS}"
-URL_REFERENCE_MEMBERSHIP = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_MEMBERSHIP}"
-URL_REFERENCE_REGISTER = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_REGISTER}"
 URL_REFERENCE_DOGET = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_DOGET}"
-URL_REFERENCE_DEPRECATED_FEATURE_MINT = (
-    f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_DEPRECATED_FEATURE_MINT}"
-)
+
+
+# =============================================================================
+# /library/*
+# =============================================================================
+# The single transport between workflow runners (orchestrator) and the
+# control-plane library primitives. Per-primitive request shape is
+# validated inside the dispatch handler; URLs do not vary by primitive.
+
+PATH_LIBRARY_PREFIX = "/library"
+PATH_LIBRARY_NAME = "/{name}"
+
+URL_LIBRARY_PREFIX = f"{API_PREFIX}{PATH_LIBRARY_PREFIX}"
+URL_LIBRARY_NAME = f"{URL_LIBRARY_PREFIX}{PATH_LIBRARY_NAME}"
