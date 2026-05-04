@@ -1,14 +1,17 @@
 """REST client for service-to-service calls to the control plane."""
 
 from pathlib import Path
+from typing import Any
 
 import httpx
 
+from .api_paths import URL_LIBRARY_NAME
 from .auth_constants import API_PREFIX
 from .models import (
     DoGetTicketResponse,
     FeatureHashEntry,
     FeatureMintResponse,
+    ReferenceMembershipResponse,
     ReferenceResponse,
     ReferenceStatus,
     RegisterFilesResponse,
@@ -117,12 +120,31 @@ class ControlPlaneClient:
     async def mint_features(
         self, reference_idx: int, entries: list[FeatureHashEntry]
     ) -> FeatureMintResponse:
-        resp = await self._http.post(
-            f"{API_PREFIX}/reference/{reference_idx}/feature/mint",
-            json={"entries": [e.model_dump(mode="json") for e in entries]},
+        """Invoke the mint-features library primitive.
+
+        Returns the hash → feature_idx mapping plus minted/reused counts.
+        Reference-agnostic at the library level; the reference_idx here
+        only flows into the dispatch envelope's scope_target so the
+        control plane can attribute the call.
+        """
+        outputs = await self._invoke_library(
+            name="mint-features",
+            reference_idx=reference_idx,
+            inputs={"entries": [e.model_dump(mode="json") for e in entries]},
         )
-        resp.raise_for_status()
-        return FeatureMintResponse.model_validate(resp.json())
+        return FeatureMintResponse.model_validate(outputs)
+
+    async def write_membership(
+        self, reference_idx: int, feature_idxs: list[int]
+    ) -> ReferenceMembershipResponse:
+        """Invoke the write-membership library primitive — link
+        already-minted feature_idx values to a reference. Idempotent."""
+        outputs = await self._invoke_library(
+            name="write-membership",
+            reference_idx=reference_idx,
+            inputs={"feature_idxs": feature_idxs},
+        )
+        return ReferenceMembershipResponse.model_validate(outputs)
 
     async def register_files(
         self,
@@ -130,12 +152,14 @@ class ControlPlaneClient:
         staging_dir: str,
         files: dict[str, str],
     ) -> RegisterFilesResponse:
-        resp = await self._http.post(
-            f"{API_PREFIX}/reference/{reference_idx}/register",
-            json={"staging_dir": staging_dir, "files": files},
+        """Invoke the register-files library primitive — register staged
+        Parquet files into DuckLake via the data plane's DoAction."""
+        outputs = await self._invoke_library(
+            name="register-files",
+            reference_idx=reference_idx,
+            inputs={"staging_dir": staging_dir, "files": files},
         )
-        resp.raise_for_status()
-        return RegisterFilesResponse.model_validate(resp.json())
+        return RegisterFilesResponse.model_validate(outputs)
 
     async def get_doget_ticket(self, reference_idx: int, table: str) -> DoGetTicketResponse:
         resp = await self._http.post(
@@ -144,3 +168,27 @@ class ControlPlaneClient:
         )
         resp.raise_for_status()
         return DoGetTicketResponse.model_validate(resp.json())
+
+    async def _invoke_library(
+        self,
+        *,
+        name: str,
+        reference_idx: int,
+        inputs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """POST /api/v1/library/{name} with the standard envelope; return
+        the unwrapped `outputs` dict for the caller's per-primitive parser.
+
+        Today every library primitive targets a reference; if/when a
+        primitive needs a different scope_target.kind this helper grows
+        a `scope_target: ScopeTarget` parameter.
+        """
+        resp = await self._http.post(
+            URL_LIBRARY_NAME.format(name=name),
+            json={
+                "scope_target": {"kind": "reference", "reference_idx": reference_idx},
+                "inputs": inputs,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["outputs"]

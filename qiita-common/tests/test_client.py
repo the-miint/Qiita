@@ -1,5 +1,7 @@
 """Tests for ControlPlaneClient (auth params + user-management method surface)."""
 
+import json
+
 import httpx
 import pytest
 
@@ -12,12 +14,18 @@ def test_client_importable():
 
 
 def test_client_has_required_methods():
-    """ControlPlaneClient must expose the reference-management methods."""
+    """ControlPlaneClient must expose the reference-management methods.
+
+    The mint/membership/register methods are thin wrappers over the
+    /api/v1/library/{name} dispatch endpoint; verifying they're callable
+    catches the construction surface, the dispatch shape itself is
+    covered by the integration suite (test_library_dispatch.py)."""
     from qiita_common.client import ControlPlaneClient
 
     client = ControlPlaneClient(base_url="http://localhost:8080", api_token="qk_test")
     assert callable(client.create_reference)
     assert callable(client.mint_features)
+    assert callable(client.write_membership)
     assert callable(client.update_reference_status)
     assert callable(client.register_files)
     assert callable(client.get_doget_ticket)
@@ -91,3 +99,125 @@ def test_client_with_explicit_http_client_skips_header_setup():
     )
     assert client._http is custom
     assert client._http.headers["Authorization"] == "Bearer caller-supplied"
+
+
+# ---------------------------------------------------------------------------
+# Library-dispatch wrappers — verify URL + envelope without a live server
+# ---------------------------------------------------------------------------
+
+
+def _capture_transport(captured: list, response_outputs: dict):
+    """An httpx MockTransport that records every request and returns a
+    canned `{"outputs": ...}` body."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            content=json.dumps({"outputs": response_outputs}).encode(),
+            headers={"content-type": "application/json"},
+        )
+
+    return httpx.MockTransport(handler)
+
+
+async def test_mint_features_posts_to_library_dispatch():
+    """client.mint_features must POST /api/v1/library/mint-features with
+    the {scope_target, inputs} envelope and unwrap `outputs` for the
+    caller — catches URL drift at unit-test time."""
+    from qiita_common.client import ControlPlaneClient
+    from qiita_common.models import FeatureHashEntry
+
+    captured: list[httpx.Request] = []
+    transport = _capture_transport(
+        captured,
+        {
+            "mapping": {"00000000-0000-0000-0000-000000000001": 42},
+            "minted": 1,
+            "reused": 0,
+        },
+    )
+    custom = httpx.AsyncClient(
+        base_url="http://localhost:8080",
+        transport=transport,
+        headers={"Authorization": "Bearer qk_x"},
+    )
+    client = ControlPlaneClient(
+        "http://localhost:8080",
+        api_token="qk_unused",
+        http_client=custom,
+    )
+
+    entry = FeatureHashEntry(sequence_hash="00000000-0000-0000-0000-000000000001")
+    resp = await client.mint_features(reference_idx=42, entries=[entry])
+
+    assert len(captured) == 1
+    req = captured[0]
+    assert req.method == "POST"
+    assert req.url.path == "/api/v1/library/mint-features"
+    body = json.loads(req.content)
+    assert body["scope_target"] == {"kind": "reference", "reference_idx": 42}
+    assert body["inputs"]["entries"][0]["sequence_hash"] == ("00000000-0000-0000-0000-000000000001")
+    # Returned model is built from the unwrapped `outputs` field.
+    assert resp.minted == 1
+    assert resp.reused == 0
+
+
+async def test_write_membership_posts_to_library_dispatch():
+    """client.write_membership must POST /api/v1/library/write-membership."""
+    from qiita_common.client import ControlPlaneClient
+
+    captured: list[httpx.Request] = []
+    transport = _capture_transport(captured, {"linked": 3, "already_linked": 0})
+    custom = httpx.AsyncClient(
+        base_url="http://localhost:8080",
+        transport=transport,
+        headers={"Authorization": "Bearer qk_x"},
+    )
+    client = ControlPlaneClient(
+        "http://localhost:8080",
+        api_token="qk_unused",
+        http_client=custom,
+    )
+
+    resp = await client.write_membership(reference_idx=7, feature_idxs=[1, 2, 3])
+
+    assert captured[0].url.path == "/api/v1/library/write-membership"
+    body = json.loads(captured[0].content)
+    assert body["scope_target"] == {"kind": "reference", "reference_idx": 7}
+    assert body["inputs"]["feature_idxs"] == [1, 2, 3]
+    assert resp.linked == 3
+    assert resp.already_linked == 0
+
+
+async def test_register_files_posts_to_library_dispatch():
+    """client.register_files must POST /api/v1/library/register-files."""
+    from qiita_common.client import ControlPlaneClient
+
+    captured: list[httpx.Request] = []
+    transport = _capture_transport(captured, {"registered": ["/data/x.parquet"]})
+    custom = httpx.AsyncClient(
+        base_url="http://localhost:8080",
+        transport=transport,
+        headers={"Authorization": "Bearer qk_x"},
+    )
+    client = ControlPlaneClient(
+        "http://localhost:8080",
+        api_token="qk_unused",
+        http_client=custom,
+    )
+
+    resp = await client.register_files(
+        reference_idx=11,
+        staging_dir="/data/staging",
+        files={"x.parquet": "reference_sequences"},
+    )
+
+    assert captured[0].url.path == "/api/v1/library/register-files"
+    body = json.loads(captured[0].content)
+    assert body["scope_target"] == {"kind": "reference", "reference_idx": 11}
+    assert body["inputs"] == {
+        "staging_dir": "/data/staging",
+        "files": {"x.parquet": "reference_sequences"},
+    }
+    assert resp.registered == ["/data/x.parquet"]
