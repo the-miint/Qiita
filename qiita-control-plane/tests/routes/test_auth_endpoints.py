@@ -156,8 +156,7 @@ async def _seed_user(
         )
     if issuer and subject:
         await postgres_pool.execute(
-            "INSERT INTO qiita.user_identity (principal_idx, issuer, subject)"
-            " VALUES ($1, $2, $3)",
+            "INSERT INTO qiita.user_identity (principal_idx, issuer, subject) VALUES ($1, $2, $3)",
             pidx,
             issuer,
             subject,
@@ -574,9 +573,7 @@ async def test_post_pat_writes_audit_event(auth_client, postgres_pool, jwks_harn
 # ---------------------------------------------------------------------------
 
 
-async def test_get_own_tokens_lists_metadata_only(
-    auth_client, postgres_pool, jwks_harness
-):
+async def test_get_own_tokens_lists_metadata_only(auth_client, postgres_pool, jwks_harness):
     from qiita_control_plane.auth.token import mint_api_token
 
     pidx = await _seed_user(
@@ -608,9 +605,7 @@ async def test_get_own_tokens_lists_metadata_only(
         assert "token" not in t  # only metadata keys
 
 
-async def test_get_own_tokens_cannot_see_others(
-    auth_client, postgres_pool, jwks_harness
-):
+async def test_get_own_tokens_cannot_see_others(auth_client, postgres_pool, jwks_harness):
     from qiita_control_plane.auth.token import mint_api_token
 
     # Two distinct users, each with their own token.
@@ -656,9 +651,7 @@ async def test_list_tokens_anonymous_401(auth_client):
     assert resp.status_code == 401
 
 
-async def test_list_tokens_403_without_self_tokens_scope(
-    auth_client, postgres_pool, jwks_harness
-):
+async def test_list_tokens_403_without_self_tokens_scope(auth_client, postgres_pool, jwks_harness):
     from qiita_control_plane.auth.token import mint_api_token
 
     pidx = await _seed_user(
@@ -945,8 +938,7 @@ async def test_handoff_browser_flow_mints_pat_and_renders_html(
 
         # Track the freshly-created principal for cleanup.
         pidx = await postgres_pool.fetchval(
-            "SELECT principal_idx FROM qiita.user_identity"
-            " WHERE issuer = $1 AND subject = $2",
+            "SELECT principal_idx FROM qiita.user_identity WHERE issuer = $1 AND subject = $2",
             jwks_harness.issuer,
             "handoff-browser",
         )
@@ -987,8 +979,7 @@ async def test_handoff_cli_flow_redirects_to_loopback_with_ot_code(
         assert rows[0]["consumed_at"] is None
 
         pidx = await postgres_pool.fetchval(
-            "SELECT principal_idx FROM qiita.user_identity"
-            " WHERE issuer = $1 AND subject = $2",
+            "SELECT principal_idx FROM qiita.user_identity WHERE issuer = $1 AND subject = $2",
             jwks_harness.issuer,
             "handoff-cli",
         )
@@ -1113,8 +1104,7 @@ async def test_cli_exchange_returns_pat_once(auth_client, postgres_pool, jwks_ha
         assert resp2.status_code == 404
 
         pidx = await postgres_pool.fetchval(
-            "SELECT principal_idx FROM qiita.user_identity"
-            " WHERE issuer = $1 AND subject = $2",
+            "SELECT principal_idx FROM qiita.user_identity WHERE issuer = $1 AND subject = $2",
             jwks_harness.issuer,
             "cli-exchange",
         )

@@ -51,9 +51,7 @@ async def boundary_client(postgres_pool):
         hmac_secret_key=b"\x00" * 32,
         data_plane_url="grpc://localhost:50051",
     )
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as ac:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
 
 
@@ -146,8 +144,7 @@ async def _seed_service_with_token(
                 name,
             )
             await conn.execute(
-                "INSERT INTO qiita.service_account (principal_idx, name)"
-                " VALUES ($1, $2)",
+                "INSERT INTO qiita.service_account (principal_idx, name) VALUES ($1, $2)",
                 pidx,
                 name,
             )

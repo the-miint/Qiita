@@ -318,8 +318,7 @@ async def test_patch_principal_retired_revokes_all_tokens(admin_client, postgres
     )
     assert resp.status_code == 204
     n_active = await postgres_pool.fetchval(
-        "SELECT count(*) FROM qiita.api_token"
-        " WHERE principal_idx = $1 AND revoked_at IS NULL",
+        "SELECT count(*) FROM qiita.api_token WHERE principal_idx = $1 AND revoked_at IS NULL",
         target,
     )
     assert n_active == 0
@@ -571,9 +570,7 @@ async def test_revoke_all_tokens_requires_admin_users_for_user_target(admin_clie
     assert "admin:user" in resp.json()["detail"]
 
 
-async def test_revoke_all_tokens_revokes_all_active_and_skips_revoked(
-    admin_client, postgres_pool
-):
+async def test_revoke_all_tokens_revokes_all_active_and_skips_revoked(admin_client, postgres_pool):
     from qiita_control_plane.auth.token import mint_api_token
 
     admin_token, admin_idx = await _admin_token(postgres_pool, admin_client)
@@ -600,8 +597,7 @@ async def test_revoke_all_tokens_revokes_all_active_and_skips_revoked(
 
     # All three are now revoked.
     n_active = await postgres_pool.fetchval(
-        "SELECT count(*) FROM qiita.api_token"
-        " WHERE principal_idx = $1 AND revoked_at IS NULL",
+        "SELECT count(*) FROM qiita.api_token WHERE principal_idx = $1 AND revoked_at IS NULL",
         target,
     )
     assert n_active == 0

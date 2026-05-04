@@ -69,9 +69,7 @@ async def test_auth_table_exists(postgres_pool, table):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "column", ["disabled", "disabled_at", "disabled_by_idx", "disable_reason"]
-)
+@pytest.mark.parametrize("column", ["disabled", "disabled_at", "disabled_by_idx", "disable_reason"])
 async def test_principal_disabled_columns_added(postgres_pool, column):
     exists = await postgres_pool.fetchval(
         "SELECT EXISTS("
@@ -157,8 +155,7 @@ async def test_principal_disabled_round_trip(postgres_pool):
 
 async def test_system_principal_seeded_at_idx_1(postgres_pool):
     row = await postgres_pool.fetchrow(
-        "SELECT display_name, system_role, created_by_idx"
-        " FROM qiita.principal WHERE idx = 1"
+        "SELECT display_name, system_role, created_by_idx FROM qiita.principal WHERE idx = 1"
     )
     assert row is not None, "System principal not seeded at idx=1"
     assert row["display_name"] == "system"
@@ -167,9 +164,7 @@ async def test_system_principal_seeded_at_idx_1(postgres_pool):
 
 
 async def test_system_principal_has_no_subtype_rows(postgres_pool):
-    user_row = await postgres_pool.fetchval(
-        "SELECT 1 FROM qiita.user WHERE principal_idx = 1"
-    )
+    user_row = await postgres_pool.fetchval("SELECT 1 FROM qiita.user WHERE principal_idx = 1")
     service_row = await postgres_pool.fetchval(
         "SELECT 1 FROM qiita.service_account WHERE principal_idx = 1"
     )
@@ -239,8 +234,7 @@ async def test_user_subtype_rejects_sentinel_principal(postgres_pool):
         try:
             with pytest.raises(asyncpg.CheckViolationError):
                 await conn.execute(
-                    "INSERT INTO qiita.user (principal_idx, email)"
-                    " VALUES (1, 'system@example.com')"
+                    "INSERT INTO qiita.user (principal_idx, email) VALUES (1, 'system@example.com')"
                 )
         finally:
             await tr.rollback()
@@ -255,8 +249,7 @@ async def test_email_uniqueness_is_case_insensitive(postgres_pool):
             p1 = await _insert_principal(conn, display_name="alice")
             p2 = await _insert_principal(conn, display_name="alice2")
             await conn.execute(
-                "INSERT INTO qiita.user (principal_idx, email)"
-                " VALUES ($1, 'Alice@Example.com')",
+                "INSERT INTO qiita.user (principal_idx, email) VALUES ($1, 'Alice@Example.com')",
                 p1,
             )
             with pytest.raises(asyncpg.UniqueViolationError):
@@ -284,8 +277,7 @@ async def test_orcid_check_accepts_valid(postgres_pool, orcid):
         try:
             idx = await _insert_principal(conn, display_name=f"orcid-{orcid}")
             await conn.execute(
-                "INSERT INTO qiita.user (principal_idx, email, orcid)"
-                " VALUES ($1, $2, $3)",
+                "INSERT INTO qiita.user (principal_idx, email, orcid) VALUES ($1, $2, $3)",
                 idx,
                 f"u{idx}@example.com",
                 orcid,
@@ -313,8 +305,7 @@ async def test_orcid_check_rejects_invalid(postgres_pool, orcid):
             idx = await _insert_principal(conn, display_name=f"badorcid-{orcid}")
             with pytest.raises(asyncpg.CheckViolationError):
                 await conn.execute(
-                    "INSERT INTO qiita.user (principal_idx, email, orcid)"
-                    " VALUES ($1, $2, $3)",
+                    "INSERT INTO qiita.user (principal_idx, email, orcid) VALUES ($1, $2, $3)",
                     idx,
                     f"u{idx}@example.com",
                     orcid,
@@ -739,9 +730,7 @@ async def test_retirement_preserves_already_revoked_at(postgres_pool):
         await tr.start()
         try:
             actor = await _insert_principal(conn, display_name="retire-preserve-actor")
-            target = await _insert_principal(
-                conn, display_name="retire-preserve-target"
-            )
+            target = await _insert_principal(conn, display_name="retire-preserve-target")
             await conn.execute(
                 "INSERT INTO qiita.api_token"
                 "  (principal_idx, token_hash, label, revoked_at)"
@@ -839,8 +828,7 @@ async def test_auth_event_immutable_update_raises(postgres_pool):
             )
             with pytest.raises(asyncpg.RaiseError):
                 await conn.execute(
-                    "UPDATE qiita.auth_event SET event_type = 'tampered'"
-                    " WHERE event_idx = $1",
+                    "UPDATE qiita.auth_event SET event_type = 'tampered' WHERE event_idx = $1",
                     event_idx,
                 )
         finally:

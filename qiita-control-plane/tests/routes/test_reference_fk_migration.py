@@ -152,9 +152,7 @@ def test_get_current_user_no_longer_importable():
     import importlib
 
     deps = importlib.import_module("qiita_control_plane.deps")
-    assert not hasattr(deps, "get_current_user"), (
-        "get_current_user should be removed from deps.py"
-    )
+    assert not hasattr(deps, "get_current_user"), "get_current_user should be removed from deps.py"
     assert not hasattr(deps, "get_current_principal_idx"), (
         "get_current_principal_idx should be removed from deps.py"
     )

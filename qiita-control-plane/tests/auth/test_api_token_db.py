@@ -28,9 +28,7 @@ async def principal_idx(postgres_pool):
     )
     yield idx
     # Tokens FK to principal; delete tokens before principal.
-    await postgres_pool.execute(
-        "DELETE FROM qiita.api_token WHERE principal_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.api_token WHERE principal_idx = $1", idx)
     await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", idx)
 
 
@@ -122,9 +120,7 @@ async def test_mint_raises_on_hash_collision(postgres_pool, principal_idx, monke
         fixed_hash,
     )
 
-    monkeypatch.setattr(
-        tokens, "_generate_token", lambda: (fixed_plaintext, fixed_hash)
-    )
+    monkeypatch.setattr(tokens, "_generate_token", lambda: (fixed_plaintext, fixed_hash))
     with pytest.raises(RuntimeError, match="collision"):
         await tokens.mint_api_token(
             postgres_pool,
@@ -191,9 +187,7 @@ async def test_verify_rejects_expired_token(postgres_pool, principal_idx):
     assert await verify_api_token(postgres_pool, plaintext) is None
 
 
-async def test_verify_rejects_token_for_disabled_principal(
-    postgres_pool, principal_idx
-):
+async def test_verify_rejects_token_for_disabled_principal(postgres_pool, principal_idx):
     from qiita_control_plane.auth.token import mint_api_token, verify_api_token
 
     plaintext, _ = await mint_api_token(
@@ -277,9 +271,7 @@ async def test_record_token_use_advances_last_used_at(postgres_pool, principal_i
     assert after is not None
 
 
-async def test_record_token_use_coalesces_within_one_minute(
-    postgres_pool, principal_idx
-):
+async def test_record_token_use_coalesces_within_one_minute(postgres_pool, principal_idx):
     """Two consecutive calls within 60s should advance last_used_at only once."""
     from qiita_control_plane.auth.token import mint_api_token, record_token_use
 
@@ -314,9 +306,7 @@ async def test_record_token_use_swallows_db_error(monkeypatch, principal_idx):
     await record_token_use(_BoomPool(), token_idx=1)
 
 
-async def test_verify_does_not_block_on_last_used_at(
-    postgres_pool, principal_idx, monkeypatch
-):
+async def test_verify_does_not_block_on_last_used_at(postgres_pool, principal_idx, monkeypatch):
     """If record_token_use raises, verify still returns success."""
     from qiita_control_plane.auth import token as tokens
 

@@ -129,13 +129,11 @@ async def resolver_client(postgres_pool, jwks_harness):
                 )
                 try:
                     await conn.execute(
-                        "DELETE FROM qiita.api_token"
-                        " WHERE principal_idx = ANY($1::bigint[])",
+                        "DELETE FROM qiita.api_token WHERE principal_idx = ANY($1::bigint[])",
                         created,
                     )
                     await conn.execute(
-                        "DELETE FROM qiita.user_identity"
-                        " WHERE principal_idx = ANY($1::bigint[])",
+                        "DELETE FROM qiita.user_identity WHERE principal_idx = ANY($1::bigint[])",
                         created,
                     )
                     await conn.execute(
