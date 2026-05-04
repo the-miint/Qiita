@@ -21,10 +21,11 @@ from qiita_common.models import (
     VALID_STATUS_TRANSITIONS,
     DoGetTicketRequest,
     DoGetTicketResponse,
-    FeatureHashEntry,
     FeatureMintRequest,
     FeatureMintResponse,
     ReferenceCreateRequest,
+    ReferenceMembershipRequest,
+    ReferenceMembershipResponse,
     ReferenceResponse,
     ReferenceStatusUpdate,
     RegisterFilesRequest,
@@ -44,6 +45,7 @@ from ..auth.principal import (
 )
 from ..auth.tickets import sign_action, sign_ticket
 from ..deps import get_data_plane_url, get_db_pool, get_hmac_secret
+from .feature import _mint_chunk, _write_genome_associations
 
 router = APIRouter(prefix="/reference", tags=["reference"])
 
@@ -202,62 +204,68 @@ async def mint_features(
     return FeatureMintResponse(mapping=full_mapping, minted=total_minted, reused=total_reused)
 
 
-async def _mint_chunk(
-    conn: asyncpg.Connection,
-    entries: list[FeatureHashEntry],
-) -> tuple[dict[UUID, int], int, int]:
-    """Upsert features, return (mapping, minted_count, reused_count)."""
-    hashes = [e.sequence_hash for e in entries]
+@router.post("/{reference_idx}/membership", status_code=201)
+async def write_reference_membership(
+    reference_idx: Annotated[int, Field(gt=0)],
+    body: ReferenceMembershipRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _service: ServiceAccount = Depends(require_service),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCE_WRITE)),
+) -> ReferenceMembershipResponse:
+    """Link already-minted feature_idx values to a reference.
 
-    # Find pre-existing
-    existing = await conn.fetch(
-        "SELECT feature_idx, sequence_hash FROM qiita.feature"
-        " WHERE sequence_hash = ANY($1::uuid[])",
-        hashes,
+    The reference must be in 'minting' status — the orchestrator transitions
+    via PATCH /reference/{idx}/status before calling. Idempotent:
+    pre-existing (reference_idx, feature_idx) rows are skipped via
+    ON CONFLICT DO NOTHING and counted in `already_linked`.
+
+    Unknown feature_idx values are rejected with 422 — the FK violation
+    surfaces as a structured error rather than a 500; callers are expected
+    to mint via /feature/mint immediately before.
+    """
+    status = await pool.fetchval(
+        "SELECT status FROM qiita.reference WHERE reference_idx = $1",
+        reference_idx,
     )
-    existing_map = {row["sequence_hash"]: row["feature_idx"] for row in existing}
-
-    # Insert novel
-    novel = [h for h in hashes if h not in existing_map]
-    new_map: dict[UUID, int] = {}
-    concurrent_reused = 0
-    if novel:
-        new_rows = await conn.fetch(
-            "INSERT INTO qiita.feature (sequence_hash)"
-            " SELECT unnest($1::uuid[])"
-            " ON CONFLICT (sequence_hash) DO NOTHING"
-            " RETURNING feature_idx, sequence_hash",
-            novel,
+    if status is None:
+        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+    if status != "minting":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Reference status is {status!r}, must be 'minting'",
         )
-        new_map = {row["sequence_hash"]: row["feature_idx"] for row in new_rows}
 
-        # Handle concurrent inserts: ON CONFLICT DO NOTHING means some may not RETURN.
-        # These rows were created by another transaction — count them as reused.
-        still_missing = [h for h in novel if h not in new_map]
-        if still_missing:
-            extra = await conn.fetch(
-                "SELECT feature_idx, sequence_hash FROM qiita.feature"
-                " WHERE sequence_hash = ANY($1::uuid[])",
-                still_missing,
-            )
-            for row in extra:
-                existing_map[row["sequence_hash"]] = row["feature_idx"]
-            concurrent_reused = len(extra)
-
-    mapping = {**existing_map, **new_map}
-
-    # Every input hash must have a mapping — anything missing is a data integrity failure
-    unmapped = set(hashes) - set(mapping.keys())
-    if unmapped:
-        raise RuntimeError(f"Failed to resolve feature_idx for {len(unmapped)} hashes")
-
-    return mapping, len(new_map), len(existing_map) + concurrent_reused
+    try:
+        rows = await pool.fetch(
+            "INSERT INTO qiita.reference_membership (reference_idx, feature_idx)"
+            " SELECT $1, unnest($2::bigint[])"
+            " ON CONFLICT DO NOTHING"
+            " RETURNING feature_idx",
+            reference_idx,
+            body.feature_idxs,
+        )
+    except asyncpg.ForeignKeyViolationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="One or more feature_idx values do not exist in qiita.feature",
+        ) from exc
+    linked = len(rows)
+    return ReferenceMembershipResponse(
+        linked=linked,
+        already_linked=len(body.feature_idxs) - linked,
+    )
 
 
 async def _write_membership(
     conn: asyncpg.Connection, reference_idx: int, feature_idxs: list[int]
 ) -> None:
-    """Write reference_membership rows, ignoring duplicates."""
+    """Write reference_membership rows, ignoring duplicates.
+
+    Used by the deprecated POST /reference/{idx}/feature/mint route, which
+    writes membership inline alongside minting; the new
+    POST /reference/{idx}/membership route does its own INSERT...RETURNING
+    so it can report linked vs already_linked counts.
+    """
     if not feature_idxs:
         return
     await conn.execute(
@@ -266,38 +274,6 @@ async def _write_membership(
         " ON CONFLICT DO NOTHING",
         reference_idx,
         feature_idxs,
-    )
-
-
-async def _write_genome_associations(
-    conn: asyncpg.Connection,
-    entries: list[FeatureHashEntry],
-    mapping: dict[UUID, int],
-) -> None:
-    """Batch upsert genomes and write feature_genome junction rows."""
-    sources = [e.genome_source for e in entries]
-    source_ids = [e.genome_source_id for e in entries]
-
-    # Batch upsert genomes — DO UPDATE to guarantee RETURNING for every row
-    genome_rows = await conn.fetch(
-        "INSERT INTO qiita.genome (source, source_id)"
-        " SELECT unnest($1::text[]), unnest($2::text[])"
-        " ON CONFLICT (source, source_id) DO UPDATE SET source = EXCLUDED.source"
-        " RETURNING genome_idx, source, source_id",
-        sources,
-        source_ids,
-    )
-    genome_map = {(row["source"], row["source_id"]): row["genome_idx"] for row in genome_rows}
-
-    # Batch insert feature_genome junctions
-    feat_idxs = [mapping[e.sequence_hash] for e in entries]
-    genome_idxs = [genome_map[(e.genome_source, e.genome_source_id)] for e in entries]
-    await conn.execute(
-        "INSERT INTO qiita.feature_genome (feature_idx, genome_idx)"
-        " SELECT unnest($1::bigint[]), unnest($2::bigint[])"
-        " ON CONFLICT DO NOTHING",
-        feat_idxs,
-        genome_idxs,
     )
 
 

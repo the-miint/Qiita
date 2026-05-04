@@ -86,6 +86,30 @@ class FeatureMintResponse(BaseModel):
     reused: int
 
 
+class ReferenceMembershipRequest(BaseModel):
+    """Body for POST /reference/{reference_idx}/membership.
+
+    Links already-minted feature_idx values to a reference. Mint and
+    membership-write are split so that actions which produce features
+    (e.g. amplicon denoising) can call /feature/mint without a reference,
+    and reference-add wires the two together via the orchestrator.
+    """
+
+    feature_idxs: list[Annotated[int, Field(gt=0)]] = Field(min_length=1)
+
+
+class ReferenceMembershipResponse(BaseModel):
+    """Returned by POST /reference/{reference_idx}/membership.
+
+    `linked` counts newly-inserted (reference_idx, feature_idx) rows;
+    `already_linked` counts rows the table already had (ON CONFLICT DO
+    NOTHING). Total = linked + already_linked = len(request.feature_idxs).
+    """
+
+    linked: int
+    already_linked: int
+
+
 # Valid status transitions for references.
 VALID_STATUS_TRANSITIONS: dict[ReferenceStatus, set[ReferenceStatus]] = {
     ReferenceStatus.PENDING: {ReferenceStatus.HASHING, ReferenceStatus.FAILED},
