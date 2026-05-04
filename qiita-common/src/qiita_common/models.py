@@ -1,7 +1,7 @@
 """Shared Pydantic models: work ticket states, API schemas, identifier types."""
 
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, EmailStr, Field, model_validator
@@ -345,3 +345,106 @@ class RevokeAllTokensResponse(BaseModel):
 
     revoked_token_idxs: list[int]
     already_revoked_count: int
+
+
+# ============================================================================
+# Work tickets / actions
+# ============================================================================
+#
+# A WorkTicket is the control-plane's record of an action invocation: who
+# requested it, which resource it targets, what action-specific context it
+# carries, and what lifecycle state it's in. The orchestrator pulls tickets
+# off the queue, dispatches the action's step pipeline (one or more `step`
+# entries plus zero or more control-plane `action` entries), and reports
+# completion back via state transitions.
+#
+# `originator_principal_idx` is the submitter; resource profile and SLURM
+# priority resolve from the originator, not the executor (see A6 of the
+# orchestrator design pass).
+
+
+class StepType(StrEnum):
+    """Workflow step types.
+
+    `map` runs per-sample (N independent jobs across N samples).
+    `reduce` runs once over the union of map outputs.
+    `singleton` runs once per workflow invocation — used for system-internal
+    one-shots like reference loading.
+
+    `action` (control-plane Postgres-transaction primitive) is *not* a step
+    type; it appears as a peer entry in workflow YAML and runs in-process
+    in the control plane.
+    """
+
+    MAP = "map"
+    REDUCE = "reduce"
+    SINGLETON = "singleton"
+
+
+class WorkTicketState(StrEnum):
+    """Work-ticket lifecycle.
+
+    Submission gates: PENDING / QUEUED / PROCESSING block resubmission of
+    the same `(scope_target, action_id, action_version)` triple entirely.
+    COMPLETED requires explicit DELETE before resubmission. FAILED is the
+    permanent-failure terminal state; recovery is operator-driven.
+    """
+
+    PENDING = "pending"
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class StudyPrepScopeTarget(BaseModel):
+    """Work ticket targets a (study, prep) tuple — used for sample-processing
+    actions (e.g. deblur, woltka)."""
+
+    kind: Literal["study_prep"]
+    study_idx: Annotated[int, Field(gt=0)]
+    prep_idx: Annotated[int, Field(gt=0)]
+
+
+class ReferenceScopeTarget(BaseModel):
+    """Work ticket targets a single reference — used for reference-add and
+    any future reference-mutation action."""
+
+    kind: Literal["reference"]
+    reference_idx: Annotated[int, Field(gt=0)]
+
+
+# Discriminated union — Pydantic and OpenAPI dispatch on the `kind` field.
+# DB-side, the same shape is encoded as a tagged union of typed columns
+# (`scope_target_kind` plus the subset-relevant `study_idx` / `prep_idx` /
+# `reference_idx`) guarded by a CHECK constraint; the `kind` here is the
+# discriminator that maps to that column.
+ScopeTarget = Annotated[
+    StudyPrepScopeTarget | ReferenceScopeTarget,
+    Field(discriminator="kind"),
+]
+
+
+class WorkTicket(BaseModel):
+    """Control-plane record of an action invocation.
+
+    `(action_id, action_version)` pins the exact action definition this ticket
+    was submitted against. Once Step 2 (action registry) lands, both columns
+    FK into `qiita.action`; until then they're plain strings validated only
+    by the YAML-sync layer at deploy time.
+
+    `scope_target` answers "which resource is this work about?" — the
+    resource-ACL gate keys off it. `action_context` carries action-defined
+    free-form state, validated at submission against the action's declared
+    `context_schema` (Step 2).
+    """
+
+    work_ticket_idx: Annotated[int, Field(gt=0)]
+    action_id: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
+    action_version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
+    originator_principal_idx: Annotated[int, Field(gt=0)]
+    scope_target: ScopeTarget
+    action_context: dict[str, Any] = Field(default_factory=dict)
+    state: WorkTicketState
+    created_at: AwareDatetime
+    updated_at: AwareDatetime

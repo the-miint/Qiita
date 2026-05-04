@@ -1,0 +1,177 @@
+"""Tests for WorkTicket-family Pydantic models."""
+
+from datetime import UTC, datetime
+
+import pytest
+from pydantic import TypeAdapter, ValidationError
+
+
+def test_step_type_enum():
+    """StepType must expose the locked map / reduce / singleton triple."""
+    from qiita_common.models import StepType
+
+    assert StepType.MAP == "map"
+    assert StepType.REDUCE == "reduce"
+    assert StepType.SINGLETON == "singleton"
+
+
+def test_work_ticket_state_enum():
+    """WorkTicketState covers the lifecycle from PENDING through COMPLETED/FAILED."""
+    from qiita_common.models import WorkTicketState
+
+    assert WorkTicketState.PENDING == "pending"
+    assert WorkTicketState.QUEUED == "queued"
+    assert WorkTicketState.PROCESSING == "processing"
+    assert WorkTicketState.COMPLETED == "completed"
+    assert WorkTicketState.FAILED == "failed"
+
+
+def test_scope_target_dispatches_on_kind():
+    """The discriminated union must select StudyPrepScopeTarget for kind='study_prep'
+    and ReferenceScopeTarget for kind='reference'."""
+    from qiita_common.models import (
+        ReferenceScopeTarget,
+        ScopeTarget,
+        StudyPrepScopeTarget,
+    )
+
+    adapter = TypeAdapter(ScopeTarget)
+
+    sp = adapter.validate_python({"kind": "study_prep", "study_idx": 7, "prep_idx": 3})
+    assert isinstance(sp, StudyPrepScopeTarget)
+    assert sp.study_idx == 7
+    assert sp.prep_idx == 3
+
+    ref = adapter.validate_python({"kind": "reference", "reference_idx": 11})
+    assert isinstance(ref, ReferenceScopeTarget)
+    assert ref.reference_idx == 11
+
+
+def test_scope_target_rejects_unknown_kind():
+    """An unknown discriminator must raise ValidationError."""
+    from qiita_common.models import ScopeTarget
+
+    with pytest.raises(ValidationError):
+        TypeAdapter(ScopeTarget).validate_python(
+            {"kind": "bogus", "reference_idx": 1},
+        )
+
+
+def test_scope_target_rejects_cross_kind_fields():
+    """A study_prep target must not carry reference_idx (extra field rejected
+    by the discriminated arm) — and vice versa."""
+    from qiita_common.models import ScopeTarget
+
+    adapter = TypeAdapter(ScopeTarget)
+
+    # study_prep arm has no `reference_idx` field; Pydantic permits extras by
+    # default, so the assertion is on the missing required field — supplying
+    # only reference_idx with kind=study_prep must fail.
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"kind": "study_prep", "reference_idx": 1})
+
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"kind": "reference", "study_idx": 1, "prep_idx": 1})
+
+
+def test_scope_target_rejects_non_positive_idx():
+    """All idx fields are gt=0; zero or negative must be rejected."""
+    from qiita_common.models import ScopeTarget
+
+    adapter = TypeAdapter(ScopeTarget)
+
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"kind": "reference", "reference_idx": 0})
+    with pytest.raises(ValidationError):
+        adapter.validate_python(
+            {"kind": "study_prep", "study_idx": 1, "prep_idx": -2},
+        )
+
+
+def test_work_ticket_round_trips():
+    """WorkTicket round-trips through model_dump for both scope-target arms."""
+    from qiita_common.models import (
+        ReferenceScopeTarget,
+        StudyPrepScopeTarget,
+        WorkTicket,
+        WorkTicketState,
+    )
+
+    now = datetime.now(UTC)
+    wt = WorkTicket(
+        work_ticket_idx=42,
+        action_id="reference-add",
+        action_version="1.0.0",
+        originator_principal_idx=5,
+        scope_target=ReferenceScopeTarget(kind="reference", reference_idx=11),
+        action_context={"source_uri": "s3://refs/gg2.fa"},
+        state=WorkTicketState.PENDING,
+        created_at=now,
+        updated_at=now,
+    )
+    dumped = wt.model_dump()
+    assert dumped["scope_target"]["kind"] == "reference"
+    assert dumped["scope_target"]["reference_idx"] == 11
+    assert dumped["action_context"] == {"source_uri": "s3://refs/gg2.fa"}
+    assert dumped["state"] == "pending"
+
+    wt2 = WorkTicket.model_validate(dumped)
+    assert wt2 == wt
+
+    wt_sp = WorkTicket(
+        work_ticket_idx=43,
+        action_id="deblur",
+        action_version="1.1.0",
+        originator_principal_idx=5,
+        scope_target=StudyPrepScopeTarget(kind="study_prep", study_idx=2, prep_idx=9),
+        state=WorkTicketState.QUEUED,
+        created_at=now,
+        updated_at=now,
+    )
+    assert wt_sp.action_context == {}  # default factory
+    assert wt_sp.scope_target.kind == "study_prep"
+
+
+def test_work_ticket_rejects_blank_action_id_or_version():
+    """action_id and action_version both have min_length=1."""
+    from qiita_common.models import (
+        ReferenceScopeTarget,
+        WorkTicket,
+        WorkTicketState,
+    )
+
+    now = datetime.now(UTC)
+    common = dict(
+        work_ticket_idx=1,
+        originator_principal_idx=1,
+        scope_target=ReferenceScopeTarget(kind="reference", reference_idx=1),
+        state=WorkTicketState.PENDING,
+        created_at=now,
+        updated_at=now,
+    )
+    with pytest.raises(ValidationError):
+        WorkTicket(action_id="", action_version="1.0", **common)
+    with pytest.raises(ValidationError):
+        WorkTicket(action_id="x", action_version="", **common)
+
+
+def test_work_ticket_rejects_non_positive_originator():
+    """originator_principal_idx is gt=0."""
+    from qiita_common.models import (
+        ReferenceScopeTarget,
+        WorkTicket,
+        WorkTicketState,
+    )
+
+    now = datetime.now(UTC)
+    with pytest.raises(ValidationError):
+        WorkTicket(
+            work_ticket_idx=1,
+            action_id="x",
+            action_version="1",
+            originator_principal_idx=0,
+            scope_target=ReferenceScopeTarget(kind="reference", reference_idx=1),
+            state=WorkTicketState.PENDING,
+            created_at=now,
+            updated_at=now,
+        )
