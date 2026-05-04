@@ -59,7 +59,7 @@ def worker_headers(compute_worker_service_account):
 async def ref_for_e2e(client, postgres_pool):
     """Create a reference and clean up after."""
     resp = await client.post(
-        "/api/v1/references",
+        "/api/v1/reference",
         json={
             "name": f"e2e-{uuid.uuid4()}",
             "version": "1.0",
@@ -72,7 +72,7 @@ async def ref_for_e2e(client, postgres_pool):
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
     await postgres_pool.execute(
-        "DELETE FROM qiita.references WHERE reference_idx = $1", idx
+        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
     )
 
 
@@ -137,7 +137,7 @@ async def test_e2e_create_to_doget(
 
     # --- Hash ---
     await client.patch(
-        f"/api/v1/references/{ref_idx}/status", json={"status": "hashing"}
+        f"/api/v1/reference/{ref_idx}/status", json={"status": "hashing"}
     )
     hash_dir = tmp_path / "hash"
     manifest_path = await backend.run_hash_job(
@@ -148,7 +148,7 @@ async def test_e2e_create_to_doget(
     # --- Mint ---
     entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
     mint_resp = await client.post(
-        f"/api/v1/references/{ref_idx}/features/mint",
+        f"/api/v1/reference/{ref_idx}/feature/mint",
         json={"entries": entries},
         headers=worker_headers,
     )
@@ -160,7 +160,7 @@ async def test_e2e_create_to_doget(
 
     # --- Load (write Parquet to staging) ---
     await client.patch(
-        f"/api/v1/references/{ref_idx}/status", json={"status": "loading"}
+        f"/api/v1/reference/{ref_idx}/status", json={"status": "loading"}
     )
     staging_dir = tmp_path / "staging"
     await backend.run_load_job(
@@ -175,7 +175,7 @@ async def test_e2e_create_to_doget(
 
     # --- Register via control plane → data plane DoAction ---
     reg_resp = await client.post(
-        f"/api/v1/references/{ref_idx}/register",
+        f"/api/v1/reference/{ref_idx}/register",
         json={
             "staging_dir": str(staging_dir),
             "files": {
@@ -192,13 +192,13 @@ async def test_e2e_create_to_doget(
 
     # --- Transition to active ---
     active_resp = await client.patch(
-        f"/api/v1/references/{ref_idx}/status", json={"status": "active"}
+        f"/api/v1/reference/{ref_idx}/status", json={"status": "active"}
     )
     assert active_resp.status_code == 200
 
     # --- Sign ticket for reference_sequences (metadata-only: hash + length) ---
     ticket_resp = await client.post(
-        f"/api/v1/references/{ref_idx}/tickets/doget",
+        f"/api/v1/reference/{ref_idx}/ticket/doget",
         json={"table": "reference_sequences"},
         headers=worker_headers,
     )
@@ -218,7 +218,7 @@ async def test_e2e_create_to_doget(
 
     # --- Verify sequence data via reference_sequence_chunks ---
     chunks_ticket_resp = await client.post(
-        f"/api/v1/references/{ref_idx}/tickets/doget",
+        f"/api/v1/reference/{ref_idx}/ticket/doget",
         json={"table": "reference_sequence_chunks"},
         headers=worker_headers,
     )
@@ -253,7 +253,7 @@ async def test_e2e_doget_taxonomy(
 
     # Run pipeline (hash → mint → load → register via data plane → active)
     await client.patch(
-        f"/api/v1/references/{ref_idx}/status", json={"status": "hashing"}
+        f"/api/v1/reference/{ref_idx}/status", json={"status": "hashing"}
     )
     manifest_path = await backend.run_hash_job(
         fasta_path=fasta_e2e,
@@ -263,7 +263,7 @@ async def test_e2e_doget_taxonomy(
     manifest = json.loads(manifest_path.read_text())
     entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
     mint_resp = await client.post(
-        f"/api/v1/references/{ref_idx}/features/mint",
+        f"/api/v1/reference/{ref_idx}/feature/mint",
         json={"entries": entries},
         headers=worker_headers,
     )
@@ -273,7 +273,7 @@ async def test_e2e_doget_taxonomy(
             f.write(json.dumps({"sequence_hash": k, "feature_idx": v}) + "\n")
 
     await client.patch(
-        f"/api/v1/references/{ref_idx}/status", json={"status": "loading"}
+        f"/api/v1/reference/{ref_idx}/status", json={"status": "loading"}
     )
     staging = tmp_path / "s"
     await backend.run_load_job(
@@ -285,7 +285,7 @@ async def test_e2e_doget_taxonomy(
         taxonomy_path=taxonomy_e2e,
     )
     reg_resp = await client.post(
-        f"/api/v1/references/{ref_idx}/register",
+        f"/api/v1/reference/{ref_idx}/register",
         json={
             "staging_dir": str(staging),
             "files": {
@@ -299,12 +299,12 @@ async def test_e2e_doget_taxonomy(
     )
     assert reg_resp.status_code == 201
     await client.patch(
-        f"/api/v1/references/{ref_idx}/status", json={"status": "active"}
+        f"/api/v1/reference/{ref_idx}/status", json={"status": "active"}
     )
 
     # Sign ticket for taxonomy, scoped by feature_idx
     ticket_resp = await client.post(
-        f"/api/v1/references/{ref_idx}/tickets/doget",
+        f"/api/v1/reference/{ref_idx}/ticket/doget",
         json={"table": "reference_taxonomy"},
         headers=worker_headers,
     )
@@ -324,7 +324,7 @@ async def test_e2e_doget_taxonomy(
 async def test_ticket_rejects_non_active_reference(client, ref_for_e2e, worker_headers):
     """Ticket endpoint must reject references not in 'active' status."""
     resp = await client.post(
-        f"/api/v1/references/{ref_for_e2e}/tickets/doget",
+        f"/api/v1/reference/{ref_for_e2e}/ticket/doget",
         json={"table": "reference_sequences"},
         headers=worker_headers,
     )
@@ -334,7 +334,7 @@ async def test_ticket_rejects_non_active_reference(client, ref_for_e2e, worker_h
 async def test_ticket_rejects_unknown_table(client, ref_for_e2e, worker_headers):
     """Ticket endpoint must reject unknown table names."""
     resp = await client.post(
-        f"/api/v1/references/{ref_for_e2e}/tickets/doget",
+        f"/api/v1/reference/{ref_for_e2e}/ticket/doget",
         json={"table": "nonexistent_table"},
         headers=worker_headers,
     )

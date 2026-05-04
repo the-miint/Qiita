@@ -19,7 +19,7 @@ def test_anonymous_inherits_default_falses():
     assert isinstance(a, Principal)
     assert a.has_role("user") is False
     assert a.has_role_at_least("user") is False
-    assert a.has_scope("references:read") is False
+    assert a.has_scope("reference:read") is False
 
 
 def test_human_user_isinstance_principal():
@@ -30,7 +30,7 @@ def test_human_user_isinstance_principal():
         principal_idx=2,
         email="x@x.com",
         system_role="user",
-        scopes=frozenset({"references:read"}),
+        scopes=frozenset({"reference:read"}),
         profile_complete=False,
         disabled=False,
         retired=False,
@@ -91,7 +91,7 @@ def test_service_account_role_checks_always_false():
     s = ServiceAccount(
         principal_idx=3,
         name="orchestrator",
-        scopes=frozenset({"features:mint"}),
+        scopes=frozenset({"feature:mint"}),
         disabled=False,
         retired=False,
     )
@@ -99,8 +99,8 @@ def test_service_account_role_checks_always_false():
     assert s.has_role_at_least("user") is False
     assert s.has_role_at_least("system_admin") is False
     # But scopes work.
-    assert s.has_scope("features:mint") is True
-    assert s.has_scope("admin:users") is False
+    assert s.has_scope("feature:mint") is True
+    assert s.has_scope("admin:user") is False
 
 
 def test_human_user_has_scope():
@@ -110,13 +110,13 @@ def test_human_user_has_scope():
         principal_idx=2,
         email="x@x.com",
         system_role="user",
-        scopes=frozenset({"self:profile", "references:read"}),
+        scopes=frozenset({"self:profile", "reference:read"}),
         profile_complete=True,
         disabled=False,
         retired=False,
     )
     assert h.has_scope("self:profile")
-    assert not h.has_scope("admin:users")
+    assert not h.has_scope("admin:user")
 
 
 def test_principal_subclasses_are_frozen():

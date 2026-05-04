@@ -32,7 +32,7 @@ def worker_headers(compute_worker_service_account):
 async def ref_for_pipeline(client, postgres_pool):
     """Create a reference in pending status and clean up after."""
     resp = await client.post(
-        "/api/v1/references",
+        "/api/v1/reference",
         json={
             "name": f"pipeline-test-{uuid.uuid4()}",
             "version": "1.0",
@@ -46,7 +46,7 @@ async def ref_for_pipeline(client, postgres_pool):
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
     await postgres_pool.execute(
-        "DELETE FROM qiita.references WHERE reference_idx = $1", idx
+        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
     )
 
 
@@ -61,7 +61,7 @@ async def test_hash_then_mint_pipeline(
 
     # Transition to hashing
     status_resp = await client.patch(
-        f"/api/v1/references/{ref_idx}/status",
+        f"/api/v1/reference/{ref_idx}/status",
         json={"status": "hashing"},
     )
     assert status_resp.status_code == 200
@@ -80,7 +80,7 @@ async def test_hash_then_mint_pipeline(
     # Mint features
     entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
     mint_resp = await client.post(
-        f"/api/v1/references/{ref_idx}/features/mint",
+        f"/api/v1/reference/{ref_idx}/feature/mint",
         json={"entries": entries},
         headers=worker_headers,
     )
@@ -101,9 +101,9 @@ async def test_hash_then_mint_pipeline(
 
 
 async def test_status_transition_pending_to_hashing(client, ref_for_pipeline):
-    """PATCH /api/v1/references/{id}/status: pending → hashing must succeed."""
+    """PATCH /api/v1/reference/{id}/status: pending → hashing must succeed."""
     resp = await client.patch(
-        f"/api/v1/references/{ref_for_pipeline}/status",
+        f"/api/v1/reference/{ref_for_pipeline}/status",
         json={"status": "hashing"},
     )
     assert resp.status_code == 200
@@ -111,9 +111,9 @@ async def test_status_transition_pending_to_hashing(client, ref_for_pipeline):
 
 
 async def test_status_transition_rejects_invalid(client, ref_for_pipeline):
-    """PATCH /api/v1/references/{id}/status: pending → active must fail."""
+    """PATCH /api/v1/reference/{id}/status: pending → active must fail."""
     resp = await client.patch(
-        f"/api/v1/references/{ref_for_pipeline}/status",
+        f"/api/v1/reference/{ref_for_pipeline}/status",
         json={"status": "active"},
     )
     assert resp.status_code == 409

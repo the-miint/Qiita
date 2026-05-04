@@ -37,7 +37,7 @@ from ..auth.scopes import (
     SERVICE_ACCOUNT_SCOPE_CEILING,
     validate_scopes_against_ceiling,
 )
-from ..auth.tokens import mint_api_token
+from ..auth.token import mint_api_token
 from ..deps import get_db_pool
 
 router = APIRouter(prefix="/admin", tags=["admin"])
@@ -54,16 +54,16 @@ def _decode_detail(raw) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# POST /admin/service-accounts
+# POST /admin/service-account
 # ---------------------------------------------------------------------------
 
 
-@router.post("/service-accounts", status_code=201, response_model=ServiceAccountCreateResponse)
+@router.post("/service-account", status_code=201, response_model=ServiceAccountCreateResponse)
 async def create_service_account(
     body: ServiceAccountCreate,
     pool: asyncpg.Pool = Depends(get_db_pool),
     actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
-    _scope: Principal = Depends(require_scope(Scope.ADMIN_SERVICE_ACCOUNTS)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_SERVICE_ACCOUNT)),
 ) -> ServiceAccountCreateResponse | JSONResponse:
     """Create a service-account-kind principal and mint its initial token.
 
@@ -145,17 +145,17 @@ async def create_service_account(
 
 
 # ---------------------------------------------------------------------------
-# PATCH /admin/principals/{idx}/disabled
+# PATCH /admin/principal/{idx}/disabled
 # ---------------------------------------------------------------------------
 
 
-@router.patch("/principals/{principal_idx}/disabled", status_code=204)
+@router.patch("/principal/{principal_idx}/disabled", status_code=204)
 async def set_principal_disabled(
     principal_idx: int,
     body: PrincipalDisabledUpdate,
     pool: asyncpg.Pool = Depends(get_db_pool),
     actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
-    _scope: Principal = Depends(require_scope(Scope.ADMIN_USERS)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_USER)),
 ) -> None:
     """Toggle disabled state. `disabled=true` sets the audit columns;
     `disabled=false` clears them (round-trip back to active). The DB CHECK
@@ -215,17 +215,17 @@ async def set_principal_disabled(
 
 
 # ---------------------------------------------------------------------------
-# PATCH /admin/principals/{idx}/retired
+# PATCH /admin/principal/{idx}/retired
 # ---------------------------------------------------------------------------
 
 
-@router.patch("/principals/{principal_idx}/retired", status_code=204)
+@router.patch("/principal/{principal_idx}/retired", status_code=204)
 async def retire_principal(
     principal_idx: int,
     body: PrincipalRetiredUpdate,
     pool: asyncpg.Pool = Depends(get_db_pool),
     actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
-    _scope: Principal = Depends(require_scope(Scope.ADMIN_USERS)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_USER)),
 ) -> None:
     """Retirement is terminal. The DB trigger revokes all the principal's
     active tokens automatically. An admin cannot retire themselves (refuses
@@ -269,17 +269,17 @@ async def retire_principal(
 
 
 # ---------------------------------------------------------------------------
-# PATCH /admin/principals/{idx}/system-role
+# PATCH /admin/principal/{idx}/system-role
 # ---------------------------------------------------------------------------
 
 
-@router.patch("/principals/{principal_idx}/system-role", status_code=204)
+@router.patch("/principal/{principal_idx}/system-role", status_code=204)
 async def set_principal_system_role(
     principal_idx: int,
     body: PrincipalSystemRoleUpdate,
     pool: asyncpg.Pool = Depends(get_db_pool),
     actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
-    _scope: Principal = Depends(require_scope(Scope.ADMIN_USERS)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_USER)),
 ) -> None:
     """Set the principal's system_role. The DB enum validates the value;
     Pydantic's SystemRole StrEnum narrows it before we hit the DB."""
@@ -325,7 +325,7 @@ async def get_audit_log(
     and event_type."""
     sql = (
         "SELECT event_idx, event_type, principal_idx, actor_principal_idx,"
-        " detail, occurred_at FROM qiita.auth_events WHERE 1=1"
+        " detail, occurred_at FROM qiita.auth_event WHERE 1=1"
     )
     params: list = []
     if principal_idx is not None:
@@ -352,11 +352,11 @@ async def get_audit_log(
 
 
 # ---------------------------------------------------------------------------
-# POST /admin/principals/{idx}/revoke-all-tokens
+# POST /admin/principal/{idx}/revoke-all-tokens
 # ---------------------------------------------------------------------------
 
 
-@router.post("/principals/{principal_idx}/revoke-all-tokens")
+@router.post("/principal/{principal_idx}/revoke-all-tokens")
 async def revoke_all_principal_tokens(
     principal_idx: int,
     pool: asyncpg.Pool = Depends(get_db_pool),
@@ -383,7 +383,7 @@ async def revoke_all_principal_tokens(
         " ELSE 'bare' END",
         principal_idx,
     )
-    required_scope = Scope.ADMIN_USERS if kind == "user" else Scope.ADMIN_SERVICE_ACCOUNTS
+    required_scope = Scope.ADMIN_USER if kind == "user" else Scope.ADMIN_SERVICE_ACCOUNT
     if kind == "bare":
         # No subtype row, so no tokens either — but still surface 404 instead
         # of silently succeeding so the caller's intent is verified.
@@ -399,7 +399,7 @@ async def revoke_all_principal_tokens(
         )
 
     rows = await pool.fetch(
-        "UPDATE qiita.api_tokens SET revoked_at = now()"
+        "UPDATE qiita.api_token SET revoked_at = now()"
         " WHERE principal_idx = $1 AND revoked_at IS NULL"
         " RETURNING token_idx",
         principal_idx,
@@ -407,7 +407,7 @@ async def revoke_all_principal_tokens(
     revoked_idxs = [r["token_idx"] for r in rows]
 
     already_revoked = await pool.fetchval(
-        "SELECT count(*) FROM qiita.api_tokens"
+        "SELECT count(*) FROM qiita.api_token"
         " WHERE principal_idx = $1 AND revoked_at IS NOT NULL"
         "   AND token_idx <> ALL($2::bigint[])",
         principal_idx,

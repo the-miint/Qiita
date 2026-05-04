@@ -56,13 +56,13 @@ Both subtypes contain `CHECK (principal_idx <> 1)` to keep the system principal 
 - `principal_disabled_consistent` — `disabled=true` requires the audit columns; `disabled=false` requires them all NULL.
 - `principal_not_both_disabled_and_retired` — they are mutually exclusive.
 
-Auth-layer behavior: login and token-use are rejected when **either** flag is true. Retiring a principal triggers automatic revocation of all their active `api_tokens` (`tg_revoke_tokens_on_retire`). Disabling does **not** revoke tokens — admins can bulk-revoke separately if needed.
+Auth-layer behavior: login and token-use are rejected when **either** flag is true. Retiring a principal triggers automatic revocation of all their active `api_token` (`tg_revoke_tokens_on_retire`). Disabling does **not** revoke tokens — admins can bulk-revoke separately if needed.
 
-### `api_tokens`
+### `api_token`
 
 Single FK to `principal(idx)` — there's no separate user/service token table. The principal's subtype determines the token kind. `token_hash BYTEA UNIQUE` stores SHA-256 of the plaintext; the partial index `api_tokens_hash_active` (where `revoked_at IS NULL`) keeps the active-token lookup hot. `scopes TEXT[]` carries per-token capability.
 
-### `auth_events`
+### `auth_event`
 
 Append-only audit log. BEFORE UPDATE and BEFORE DELETE triggers raise on any mutation attempt — the only legal write is INSERT. `event_type` is a discriminator string (no ENUM, so new values can be added without a migration). `principal_idx` and `actor_principal_idx` (admin-on-behalf-of) both FK to `principal(idx)`; `detail JSONB` carries event-specific context.
 
@@ -109,9 +109,9 @@ The resolver returns `503` if a JWT-shaped bearer arrives but the OIDC verifier 
 
 ### First-login (OIDC), races, and email drift
 
-On a JWT for a previously-unseen `(iss, sub)`, the resolver creates a `principal` row, a `qiita.user` row, and a `qiita.user_identities(iss, sub) → principal_idx` row in one transaction, then writes an `oidc_create_principal` audit event. Two race outcomes are handled:
+On a JWT for a previously-unseen `(iss, sub)`, the resolver creates a `principal` row, a `qiita.user` row, and a `qiita.user_identity(iss, sub) → principal_idx` row in one transaction, then writes an `oidc_create_principal` audit event. Two race outcomes are handled:
 
-- **Concurrent first-login for the same `(iss, sub)`** — depending on insert order, either the `user_identities_pkey` or the `user_email_key` UNIQUE constraint trips first under timing. The handler doesn't dispatch on constraint name (fragile); on **any** unique violation in the create path, it re-reads `user_identities` for our `(iss, sub)`. If a row exists, the winner created our identity and we return their `principal_idx`. If no row exists, this is a true email collision (different identity claiming an already-used email) — the handler emits an `oidc_create_principal_email_conflict` audit event with `attempted_email_sha256` (cleartext NOT logged) and returns `409`.
+- **Concurrent first-login for the same `(iss, sub)`** — depending on insert order, either the `user_identity_pkey` or the `user_email_key` UNIQUE constraint trips first under timing. The handler doesn't dispatch on constraint name (fragile); on **any** unique violation in the create path, it re-reads `user_identity` for our `(iss, sub)`. If a row exists, the winner created our identity and we return their `principal_idx`. If no row exists, this is a true email collision (different identity claiming an already-used email) — the handler emits an `oidc_create_principal_email_conflict` audit event with `attempted_email_sha256` (cleartext NOT logged) and returns `409`.
 
 - **Email drift** on a repeat OIDC login (same `(iss, sub)`, JWT email differs from stored): try `UPDATE qiita.user.email`. If it succeeds, emit `email_drift` event with `outcome="updated"` and the from/to cleartext (the principal's own email — they can read it). If it collides with another user's email, no-op and emit `email_drift` with `outcome="collision"` and `attempted_email_sha256` (cleartext NOT logged so cross-user audit reads can't trivially harvest the colliding email).
 
@@ -130,7 +130,7 @@ qk_<43 url-safe base64 chars without padding>
 - Prefix `qk_` ("qiita key") makes leak scanners and grep useful.
 - 43-char body is `secrets.token_urlsafe(32)` — 32 random bytes, 256 bits of entropy.
 - Total length 46 chars.
-- The DB stores `SHA-256(plaintext)` in `qiita.api_tokens.token_hash` (`BYTEA UNIQUE`). Plaintext is shown exactly once at mint time and never logged.
+- The DB stores `SHA-256(plaintext)` in `qiita.api_token.token_hash` (`BYTEA UNIQUE`). Plaintext is shown exactly once at mint time and never logged.
 
 ### Mint (`auth.tokens.mint_api_token`)
 
@@ -139,7 +139,7 @@ plaintext, token_idx = await mint_api_token(
     pool,
     principal_idx=...,
     label="my-laptop",
-    scopes=["self:profile", "self:tokens", "references:read"],
+    scopes=["self:profile", "self:token", "reference:read"],
     expires_at=None,  # or a tz-aware datetime
 )
 ```
@@ -157,7 +157,7 @@ Returns `None` for any rejection condition: malformed prefix or length, no match
 ### Last-used coalescing (`auth.tokens.record_token_use`)
 
 ```sql
-UPDATE qiita.api_tokens SET last_used_at = now()
+UPDATE qiita.api_token SET last_used_at = now()
  WHERE token_idx = $1
    AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute');
 ```
@@ -231,7 +231,7 @@ Qiita's login flow uses AuthRocket's LoginRocket Web hosted-redirect path. The u
 
 `/auth/login` always appends `&prompt=login` to the AuthRocket URL. AuthRocket honors it (shows the login form) even when a session is cached — this is independent of the JWT-reuse behavior above and is what blocks "logged-in browser walked away → attacker pivots."
 
-**CLI flow.** This is the same browser-handoff pattern used by `gh auth login` and the `claude` CLI — the CLI opens a browser, the user authenticates, and the credential lands back in the CLI's hands. When `qiita-admin login` invokes `/auth/login?cli=1&port=N`, the cookie carries `cli=true` and the loopback port. The handoff branches on `cli`: it generates a one-time code, inserts the freshly-minted PAT plaintext into `qiita.cli_login_codes` keyed by `SHA-256(ot_code)`, and redirects the browser to `http://127.0.0.1:<port>/?ot_code=<plaintext>`. The CLI's loopback HTTP server captures the code and POSTs it to `/auth/cli-exchange`, which atomically consumes the row (`UPDATE … SET consumed_at = now() WHERE consumed_at IS NULL RETURNING …`) and returns the PAT plaintext exactly once. TTL on `cli_login_codes` is `CLI_LOGIN_CODE_TTL_SECONDS` (30s by default) — short enough that an intercepted code dies almost immediately.
+**CLI flow.** This is the same browser-handoff pattern used by `gh auth login` and the `claude` CLI — the CLI opens a browser, the user authenticates, and the credential lands back in the CLI's hands. When `qiita-admin login` invokes `/auth/login?cli=1&port=N`, the cookie carries `cli=true` and the loopback port. The handoff branches on `cli`: it generates a one-time code, inserts the freshly-minted PAT plaintext into `qiita.cli_login_code` keyed by `SHA-256(ot_code)`, and redirects the browser to `http://127.0.0.1:<port>/?ot_code=<plaintext>`. The CLI's loopback HTTP server captures the code and POSTs it to `/auth/cli-exchange`, which atomically consumes the row (`UPDATE … SET consumed_at = now() WHERE consumed_at IS NULL RETURNING …`) and returns the PAT plaintext exactly once. TTL on `cli_login_code` is `CLI_LOGIN_CODE_TTL_SECONDS` (30s by default) — short enough that an intercepted code dies almost immediately.
 
 `/auth/cli-exchange` returns `404` for any of: unknown code, expired code, already-consumed code. Conflating these prevents an attacker walking ot-code values from distinguishing "wrong" from "right but redeemed."
 
@@ -254,7 +254,7 @@ The hierarchical claim is enforced by a unit test (`test_role_ceilings_are_hiera
 | `require_scope(scope)` | factory; 401 on Anonymous, 403 if `scope` not in the principal's scope set. Works for both kinds. |
 | `require_complete_profile` | depends on `require_human`; 422 with `{reason: "profile_incomplete", missing_fields: [...]}` if `profile_complete=False` |
 
-Guards compose: a route can `Depends(require_role_at_least("system_admin"))` AND `Depends(require_scope("admin:users"))` AND `Depends(require_human)` simultaneously. FastAPI dedupes the underlying `get_current_principal` call across deps in one request.
+Guards compose: a route can `Depends(require_role_at_least("system_admin"))` AND `Depends(require_scope("admin:user"))` AND `Depends(require_human)` simultaneously. FastAPI dedupes the underlying `get_current_principal` call across deps in one request.
 
 ### Token-vs-OIDC scope source
 
@@ -268,8 +268,8 @@ The token path returns the token's **own** `scopes` frozenset (whatever the mint
 |---|---|---|
 | `/api/v1/auth/whoami` | GET | Public. Returns `{kind: anonymous}` for unauthenticated callers; otherwise the resolved principal's profile / scopes. |
 | `/api/v1/auth/pat` | POST | **Requires a fresh OIDC JWT** — the `auth_time` claim must be present, ≥ now − `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS`, and ≤ now + `AUTHROCKET_JWT_LEEWAY_SECONDS` (the upper bound rejects forward IdP clock skew, the lower bound enforces interactive freshness). PAT-via-PAT (`Bearer qk_...`) is rejected. Body: `{label, scopes?, ttl_days?}`. Returns plaintext + metadata exactly once. |
-| `/api/v1/auth/tokens` | GET | Lists the caller's own tokens. Metadata only — no plaintext, no hash. Requires `self:tokens` scope. |
-| `/api/v1/auth/tokens/{idx}` | DELETE | Revokes the caller's token. Requires `self:tokens`. Returns 404 for both "no such token" and "exists but owned by someone else" so probing `token_idx` values cannot enumerate the table. |
+| `/api/v1/auth/token` | GET | Lists the caller's own tokens. Metadata only — no plaintext, no hash. Requires `self:token` scope. |
+| `/api/v1/auth/token/{idx}` | DELETE | Revokes the caller's token. Requires `self:token`. Returns 404 for both "no such token" and "exists but owned by someone else" so probing `token_idx` values cannot enumerate the table. |
 
 **PAT mint validation:**
 
@@ -285,12 +285,12 @@ All routes require `system_role >= system_admin` AND the appropriate `admin:*` s
 
 | Route | Method | Notes |
 |---|---|---|
-| `/api/v1/admin/service-accounts` | POST | Creates a service-account-kind principal and mints its initial token. Scopes are required (no implicit ceiling — workers don't fit the human hierarchy) and validated against `SERVICE_ACCOUNT_SCOPE_CEILING`. 409 on duplicate `name`. Requires `admin:service_accounts`. |
-| `/api/v1/admin/principals/{idx}/disabled` | PATCH | Toggle disabled. `disabled=true` requires `reason`; `false` is the round-trip back to active. Cannot transition retired→disabled (DB CHECK). Requires `admin:users`. |
-| `/api/v1/admin/principals/{idx}/retired` | PATCH | Retire (terminal). DB trigger auto-revokes all the principal's active tokens. Refuses if the actor is the target (no zero-active-admins). Requires `admin:users`. |
-| `/api/v1/admin/principals/{idx}/system-role` | PATCH | Set `system_role`. Audit event records `from`/`to`/`reason`. Requires `admin:users`. |
+| `/api/v1/admin/service-account` | POST | Creates a service-account-kind principal and mints its initial token. Scopes are required (no implicit ceiling — workers don't fit the human hierarchy) and validated against `SERVICE_ACCOUNT_SCOPE_CEILING`. 409 on duplicate `name`. Requires `admin:service_account`. |
+| `/api/v1/admin/principal/{idx}/disabled` | PATCH | Toggle disabled. `disabled=true` requires `reason`; `false` is the round-trip back to active. Cannot transition retired→disabled (DB CHECK). Requires `admin:user`. |
+| `/api/v1/admin/principal/{idx}/retired` | PATCH | Retire (terminal). DB trigger auto-revokes all the principal's active tokens. Refuses if the actor is the target (no zero-active-admins). Requires `admin:user`. |
+| `/api/v1/admin/principal/{idx}/system-role` | PATCH | Set `system_role`. Audit event records `from`/`to`/`reason`. Requires `admin:user`. |
 | `/api/v1/admin/audit` | GET | List audit events (newest first). Optional filters `principal_idx` and `event_type`; `limit ∈ [1, 1000]`. Requires `admin:audit_read`. |
-| `/api/v1/admin/principals/{idx}/revoke-all-tokens` | POST | Bulk-revoke all the principal's active tokens. Idempotent on already-revoked tokens (counted separately). Emits one `token_revoke` audit event per newly-revoked token. Requires `admin:users`. |
+| `/api/v1/admin/principal/{idx}/revoke-all-tokens` | POST | Bulk-revoke all the principal's active tokens. Idempotent on already-revoked tokens (counted separately). Emits one `token_revoke` audit event per newly-revoked token. Requires `admin:user`. |
 
 The system principal (`idx=1`) is rejected by every mutation endpoint above (`disabled`, `retired`, `system-role`) — bare-actor invariant holds at the API layer in addition to the DB CHECK.
 
@@ -298,9 +298,9 @@ The system principal (`idx=1`) is rejected by every mutation endpoint above (`di
 
 | Route | Method | Notes |
 |---|---|---|
-| `/api/v1/users` | POST | Admin-only (`require_human_with_role("system_admin") + require_scope("admin:users")`). Creates a new principal + user row in one transaction; the new principal's `created_by_idx` points at the requesting admin. Returns `409` on email collision (case-insensitive via CITEXT). In production, OIDC first-login is the typical user-creation path; this route exists for admins to onboard PIs imported from external systems. |
-| `/api/v1/users/me` | GET | Returns the authenticated user's profile. `require_human` (rejects service-kind 403). |
-| `/api/v1/users/me` | PATCH | Updates profile fields (`affiliation`, `address`, `phone`, `orcid`, `receive_processing_emails`). Requires `self:profile`. `email` and status fields are absent from `UserUpdate` and are silently dropped — email-change requires re-verification via OIDC, status is admin-only. |
+| `/api/v1/user` | POST | Admin-only (`require_human_with_role("system_admin") + require_scope("admin:user")`). Creates a new principal + user row in one transaction; the new principal's `created_by_idx` points at the requesting admin. Returns `409` on email collision (case-insensitive via CITEXT). In production, OIDC first-login is the typical user-creation path; this route exists for admins to onboard PIs imported from external systems. |
+| `/api/v1/user/me` | GET | Returns the authenticated user's profile. `require_human` (rejects service-kind 403). |
+| `/api/v1/user/me` | PATCH | Updates profile fields (`affiliation`, `address`, `phone`, `orcid`, `receive_processing_emails`). Requires `self:profile`. `email` and status fields are absent from `UserUpdate` and are silently dropped — email-change requires re-verification via OIDC, status is admin-only. |
 
 ## CLI (`qiita-admin`)
 
@@ -310,7 +310,7 @@ Installed as the `qiita-admin` console script via `qiita-control-plane`'s pyproj
 |---|---|---|
 | `set-system-role --email X --role Y` | direct DB | Bootstrap path — sets `qiita.principal.system_role` by email lookup against `qiita.user`. Refuses to operate on `idx=1`. The user must have logged in via AuthRocket at least once (which is what creates their `principal+user` rows). |
 | `whoami` | HTTP | Calls `GET /api/v1/auth/whoami`. PAT read from `QIITA_TOKEN` env or `~/.qiita/token` (mode 0600 expected). |
-| `token revoke-all --principal-idx N` | HTTP | Calls `POST /api/v1/admin/principals/{N}/revoke-all-tokens`. |
+| `token revoke-all --principal-idx N` | HTTP | Calls `POST /api/v1/admin/principal/{N}/revoke-all-tokens`. |
 | `login` | HTTP | Drives the LoginRocket Web flow end-to-end. Spawns a localhost loopback HTTP server, opens the browser to `/api/v1/auth/login?cli=1&port=N`, captures the one-time code from the redirect, exchanges it at `/api/v1/auth/cli-exchange`, and writes the PAT to `--token-file` (default `~/.qiita/token`, mode 0600). On timeout or error, prints an actionable message and exits non-zero. |
 
 ## Orchestrator integration

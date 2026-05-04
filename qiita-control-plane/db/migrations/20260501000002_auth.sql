@@ -81,14 +81,14 @@ $$;
 --
 -- (issuer, subject) is the PK so the same upstream identity can never
 -- link to two principals.
-CREATE TABLE qiita.user_identities (
+CREATE TABLE qiita.user_identity (
     principal_idx  BIGINT NOT NULL REFERENCES qiita.user(principal_idx) ON DELETE RESTRICT,
     issuer         TEXT NOT NULL,
     subject        TEXT NOT NULL,
     linked_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (issuer, subject)
 );
-CREATE INDEX user_identities_principal_idx ON qiita.user_identities(principal_idx);
+CREATE INDEX user_identity_principal_idx ON qiita.user_identity(principal_idx);
 
 
 -- =============================================================================
@@ -157,7 +157,7 @@ CREATE TRIGGER service_account_subtype_exclusion
 -- API TOKENS (opaque qk_ tokens; PATs for humans, service tokens for workers)
 -- =============================================================================
 
-CREATE TABLE qiita.api_tokens (
+CREATE TABLE qiita.api_token (
     token_idx      BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     principal_idx  BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
     -- The system principal cannot hold tokens.
@@ -178,8 +178,8 @@ CREATE TABLE qiita.api_tokens (
     last_used_at   TIMESTAMPTZ,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX api_tokens_hash_active   ON qiita.api_tokens(token_hash) WHERE revoked_at IS NULL;
-CREATE INDEX api_tokens_principal_idx ON qiita.api_tokens(principal_idx);
+CREATE INDEX api_token_hash_active   ON qiita.api_token(token_hash) WHERE revoked_at IS NULL;
+CREATE INDEX api_token_principal_idx ON qiita.api_token(principal_idx);
 -- Cannot prune by expiry in the partial-index predicate (now() is non-IMMUTABLE);
 -- expiry is checked at verify time. Do not "improve" this.
 
@@ -194,7 +194,7 @@ CREATE INDEX api_tokens_principal_idx ON qiita.api_tokens(principal_idx);
 -- tables — their mutations are high-volume and routine, so universal CDC
 -- there would be expensive noise.
 
-CREATE TABLE qiita.auth_events (
+CREATE TABLE qiita.auth_event (
     event_idx           BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     -- TEXT — not ENUM, not a controlled-vocab lookup table — for forward
     -- compatibility of this append-only audit log. Adding a new event type
@@ -209,7 +209,7 @@ CREATE TABLE qiita.auth_events (
     -- metadata (severity, pii_class), DB-queryable introspection by an
     -- auditor, or an operator-managed vocabulary — the project already
     -- uses controlled-vocab tables where those hold (qiita.study_tag,
-    -- qiita.terminologies, qiita.metadata_checklists).
+    -- qiita.terminology, qiita.metadata_checklist).
     event_type          TEXT NOT NULL,
         -- oidc_login | oidc_create_principal | oidc_create_principal_email_conflict | email_drift
         -- token_mint | token_use | token_revoke | token_verify_failure
@@ -227,20 +227,20 @@ CREATE TABLE qiita.auth_events (
     detail              JSONB NOT NULL DEFAULT '{}',
     occurred_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX auth_events_principal_idx_time ON qiita.auth_events(principal_idx, occurred_at);
-CREATE INDEX auth_events_type_time          ON qiita.auth_events(event_type, occurred_at);
+CREATE INDEX auth_event_principal_idx_time ON qiita.auth_event(principal_idx, occurred_at);
+CREATE INDEX auth_event_type_time          ON qiita.auth_event(event_type, occurred_at);
 
--- Trigger: auth_events is append-only. The whole point is forensic integrity;
+-- Trigger: auth_event is append-only. The whole point is forensic integrity;
 -- a route handler that "just needs to fix one detail" defeats it.
-CREATE FUNCTION qiita.tg_auth_events_immutable() RETURNS trigger AS $$
+CREATE FUNCTION qiita.tg_auth_event_immutable() RETURNS trigger AS $$
 BEGIN
-    RAISE EXCEPTION 'qiita.auth_events is append-only';
+    RAISE EXCEPTION 'qiita.auth_event is append-only';
 END;
 $$ LANGUAGE plpgsql;
-CREATE TRIGGER auth_events_no_update BEFORE UPDATE ON qiita.auth_events
-    FOR EACH ROW EXECUTE FUNCTION qiita.tg_auth_events_immutable();
-CREATE TRIGGER auth_events_no_delete BEFORE DELETE ON qiita.auth_events
-    FOR EACH ROW EXECUTE FUNCTION qiita.tg_auth_events_immutable();
+CREATE TRIGGER auth_event_no_update BEFORE UPDATE ON qiita.auth_event
+    FOR EACH ROW EXECUTE FUNCTION qiita.tg_auth_event_immutable();
+CREATE TRIGGER auth_event_no_delete BEFORE DELETE ON qiita.auth_event
+    FOR EACH ROW EXECUTE FUNCTION qiita.tg_auth_event_immutable();
 
 
 -- =============================================================================
@@ -251,7 +251,7 @@ CREATE TRIGGER auth_events_no_delete BEFORE DELETE ON qiita.auth_events
 CREATE FUNCTION qiita.tg_revoke_tokens_on_retire() RETURNS trigger AS $$
 BEGIN
     IF NEW.retired = true AND OLD.retired = false THEN
-        UPDATE qiita.api_tokens SET revoked_at = now()
+        UPDATE qiita.api_token SET revoked_at = now()
           WHERE principal_idx = NEW.idx AND revoked_at IS NULL;
     END IF;
     RETURN NEW;
@@ -279,55 +279,55 @@ CREATE TRIGGER principal_retire_revoke_tokens
 -- `UPDATE … WHERE consumed_at IS NULL RETURNING …`.
 --
 -- ot_code is BYTEA holding SHA-256 of the plaintext code (32 bytes), matching
--- the api_tokens.token_hash convention — the wire-format ot_code is a
+-- the api_token.token_hash convention — the wire-format ot_code is a
 -- secrets.token_urlsafe(32) string, never stored in cleartext.
 
--- token_idx pins the row to the exact api_tokens row whose plaintext lives
+-- token_idx pins the row to the exact api_token row whose plaintext lives
 -- here; without it /auth/cli-exchange would have to guess "the most recent
 -- token for this principal," which races a parallel mint into the wrong
 -- metadata payload. ON DELETE CASCADE so token revocation/expiry GC also
 -- sweeps any matching unredeemed code.
-CREATE TABLE qiita.cli_login_codes (
+CREATE TABLE qiita.cli_login_code (
     ot_code         BYTEA PRIMARY KEY,
     principal_idx   BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE CASCADE,
-    token_idx       BIGINT NOT NULL REFERENCES qiita.api_tokens(token_idx) ON DELETE CASCADE,
+    token_idx       BIGINT NOT NULL REFERENCES qiita.api_token(token_idx) ON DELETE CASCADE,
     plaintext_pat   TEXT NOT NULL,
     expires_at      TIMESTAMPTZ NOT NULL,
     consumed_at     TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT cli_login_codes_consumed_after_created
+    CONSTRAINT cli_login_code_consumed_after_created
         CHECK (consumed_at IS NULL OR consumed_at >= created_at),
-    CONSTRAINT cli_login_codes_expires_after_created
+    CONSTRAINT cli_login_code_expires_after_created
         CHECK (expires_at > created_at)
 );
 
 -- Partial index: hot path is "find unconsumed codes near expiry" for
 -- garbage-collection. Active rows are the only ones queried for redemption,
 -- so excluding consumed rows keeps the index small.
-CREATE INDEX cli_login_codes_expires_at
-    ON qiita.cli_login_codes (expires_at)
+CREATE INDEX cli_login_code_expires_at
+    ON qiita.cli_login_code (expires_at)
     WHERE consumed_at IS NULL;
 
-COMMENT ON TABLE qiita.cli_login_codes IS
+COMMENT ON TABLE qiita.cli_login_code IS
     'Short-lived single-use codes for the qiita-admin login → CLI loopback handoff. '
     'Stores plaintext PAT briefly between handoff and CLI exchange. See docs/auth.md.';
 
 
 -- migrate:down
 
-DROP TABLE IF EXISTS qiita.cli_login_codes;
+DROP TABLE IF EXISTS qiita.cli_login_code;
 DROP TRIGGER IF EXISTS principal_retire_revoke_tokens ON qiita.principal;
 DROP FUNCTION IF EXISTS qiita.tg_revoke_tokens_on_retire();
-DROP TRIGGER IF EXISTS auth_events_no_delete ON qiita.auth_events;
-DROP TRIGGER IF EXISTS auth_events_no_update ON qiita.auth_events;
-DROP FUNCTION IF EXISTS qiita.tg_auth_events_immutable();
+DROP TRIGGER IF EXISTS auth_event_no_delete ON qiita.auth_event;
+DROP TRIGGER IF EXISTS auth_event_no_update ON qiita.auth_event;
+DROP FUNCTION IF EXISTS qiita.tg_auth_event_immutable();
 DROP TRIGGER IF EXISTS service_account_subtype_exclusion ON qiita.service_account;
 DROP TRIGGER IF EXISTS user_subtype_exclusion ON qiita.user;
 DROP FUNCTION IF EXISTS qiita.tg_principal_subtype_exclusion();
 DROP TRIGGER IF EXISTS user_set_updated_at ON qiita.user;
 DROP FUNCTION IF EXISTS qiita.user_profile_missing_fields(TEXT, TEXT, TEXT);
-DROP TABLE IF EXISTS qiita.auth_events;
-DROP TABLE IF EXISTS qiita.api_tokens;
+DROP TABLE IF EXISTS qiita.auth_event;
+DROP TABLE IF EXISTS qiita.api_token;
 DROP TABLE IF EXISTS qiita.service_account;
-DROP TABLE IF EXISTS qiita.user_identities;
+DROP TABLE IF EXISTS qiita.user_identity;
 DROP TABLE IF EXISTS qiita.user;

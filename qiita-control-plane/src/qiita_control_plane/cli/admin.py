@@ -10,7 +10,7 @@ Subcommands:
                      when the operator has DB access but no PAT yet. Refuses
                      to operate on the system principal (idx=1).
   whoami           — calls GET /api/v1/auth/whoami via the configured PAT.
-  token revoke-all — calls POST /api/v1/admin/principals/{idx}/revoke-all-tokens.
+  token revoke-all — calls POST /api/v1/admin/principal/{idx}/revoke-all-tokens.
   login            — drives the AuthRocket LoginRocket Web flow end-to-end.
                      Spawns a localhost loopback HTTP server, opens a
                      browser to /api/v1/auth/login?cli=1&port=N, waits for
@@ -164,7 +164,7 @@ def _whoami(base_url: str, token: str) -> dict:
 
 def _token_revoke_all(base_url: str, token: str, principal_idx: int) -> dict:
     resp = httpx.post(
-        f"{base_url.rstrip('/')}{API_PREFIX}/admin/principals/{principal_idx}/revoke-all-tokens",
+        f"{base_url.rstrip('/')}{API_PREFIX}/admin/principal/{principal_idx}/revoke-all-tokens",
         headers={"Authorization": f"Bearer {token}"},
         timeout=_CLI_HTTP_TIMEOUT_SECONDS,
     )

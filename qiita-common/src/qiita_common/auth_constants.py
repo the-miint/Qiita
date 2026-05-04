@@ -36,24 +36,24 @@ class Scope(StrEnum):
     """
 
     # Reference data
-    REFERENCES_READ = "references:read"
-    REFERENCES_WRITE = "references:write"
-    REFERENCES_REGISTER_FILES = "references:register_files"
-    FEATURES_MINT = "features:mint"
-    TICKETS_DOGET = "tickets:doget"
+    REFERENCE_READ = "reference:read"
+    REFERENCE_WRITE = "reference:write"
+    REFERENCE_REGISTER_FILES = "reference:register_files"
+    FEATURE_MINT = "feature:mint"
+    TICKET_DOGET = "ticket:doget"
 
     # Admin operations
-    ADMIN_USERS = "admin:users"
-    ADMIN_SERVICE_ACCOUNTS = "admin:service_accounts"
+    ADMIN_USER = "admin:user"
+    ADMIN_SERVICE_ACCOUNT = "admin:service_account"
     ADMIN_AUDIT_READ = "admin:audit_read"
 
     # Self-service (humans only)
     SELF_PROFILE = "self:profile"
-    SELF_TOKENS = "self:tokens"
+    SELF_TOKEN = "self:token"
 
 
 class AuthEventType(StrEnum):
-    """Closed set of event_type values written to qiita.auth_events.
+    """Closed set of event_type values written to qiita.auth_event.
 
     Mirrors the comment block at `db/migrations/20260426000000_auth.sql:191–193`
     but lists only the values currently emitted from Python. The DB column is

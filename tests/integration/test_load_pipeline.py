@@ -36,7 +36,7 @@ def worker_headers(compute_worker_service_account):
 async def ref_for_load(client, postgres_pool):
     """Create a reference in pending status and clean up after."""
     resp = await client.post(
-        "/api/v1/references",
+        "/api/v1/reference",
         json={
             "name": f"load-pipeline-{uuid.uuid4()}",
             "version": "1.0",
@@ -50,7 +50,7 @@ async def ref_for_load(client, postgres_pool):
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
     await postgres_pool.execute(
-        "DELETE FROM qiita.references WHERE reference_idx = $1", idx
+        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
     )
 
 
@@ -117,7 +117,7 @@ async def test_full_load_pipeline(
 
     # --- Hash phase ---
     await client.patch(
-        f"/api/v1/references/{ref_idx}/status",
+        f"/api/v1/reference/{ref_idx}/status",
         json={"status": "hashing"},
     )
     hash_dir = tmp_path / "hash_output"
@@ -132,7 +132,7 @@ async def test_full_load_pipeline(
     # --- Mint phase ---
     entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
     mint_resp = await client.post(
-        f"/api/v1/references/{ref_idx}/features/mint",
+        f"/api/v1/reference/{ref_idx}/feature/mint",
         json={"entries": entries},
         headers=worker_headers,
     )
@@ -145,7 +145,7 @@ async def test_full_load_pipeline(
 
     # --- Load phase (status transition + load job) ---
     load_resp = await client.patch(
-        f"/api/v1/references/{ref_idx}/status",
+        f"/api/v1/reference/{ref_idx}/status",
         json={"status": "loading"},
     )
     assert load_resp.status_code == 200
@@ -170,7 +170,7 @@ async def test_full_load_pipeline(
 
     # --- Transition to active ---
     active_resp = await client.patch(
-        f"/api/v1/references/{ref_idx}/status",
+        f"/api/v1/reference/{ref_idx}/status",
         json={"status": "active"},
     )
     assert active_resp.status_code == 200
@@ -179,7 +179,7 @@ async def test_full_load_pipeline(
     # --- Verify DB state ---
     # Reference is active
     status = await postgres_pool.fetchval(
-        "SELECT status FROM qiita.references WHERE reference_idx = $1", ref_idx
+        "SELECT status FROM qiita.reference WHERE reference_idx = $1", ref_idx
     )
     assert status == "active"
 

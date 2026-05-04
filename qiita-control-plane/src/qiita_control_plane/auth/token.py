@@ -1,6 +1,6 @@
 """Opaque API token mint / verify / last-used coalescing.
 
-The DB stores SHA-256(plaintext) in qiita.api_tokens.token_hash (BYTEA UNIQUE).
+The DB stores SHA-256(plaintext) in qiita.api_token.token_hash (BYTEA UNIQUE).
 Plaintext is shown exactly once at mint time and never logged. Verification
 is a hash lookup with side checks for revocation, expiry, and principal
 disabled/retired status. last_used_at writes are fire-and-forget and
@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 
 
 class TokenHashCollision(RuntimeError):
-    """SHA-256 collision on `qiita.api_tokens.token_hash`. Effectively
+    """SHA-256 collision on `qiita.api_token.token_hash`. Effectively
     impossible with 256 bits of entropy from `secrets.token_urlsafe(32)`
     plus a cryptographic digest; surfaced loudly rather than silently
     shadowing the colliding token. Inherits from RuntimeError so blanket
@@ -72,7 +72,7 @@ async def mint_api_token(
 
     try:
         token_idx = await pool.fetchval(
-            "INSERT INTO qiita.api_tokens"
+            "INSERT INTO qiita.api_token"
             "  (principal_idx, token_hash, label, scopes, expires_at)"
             " VALUES ($1, $2, $3, $4, $5)"
             " RETURNING token_idx",
@@ -117,7 +117,7 @@ async def verify_api_token(pool: asyncpg.Pool, plaintext: str) -> VerifiedToken 
     # process clocks agree.
     row = await pool.fetchrow(
         "SELECT t.token_idx, t.principal_idx, t.scopes"
-        " FROM qiita.api_tokens t"
+        " FROM qiita.api_token t"
         " JOIN qiita.principal p ON p.idx = t.principal_idx"
         " WHERE t.token_hash = $1"
         "   AND t.revoked_at IS NULL"
@@ -147,7 +147,7 @@ async def record_token_use(pool: asyncpg.Pool, token_idx: int) -> None:
     """
     try:
         await pool.execute(
-            "UPDATE qiita.api_tokens SET last_used_at = now()"
+            "UPDATE qiita.api_token SET last_used_at = now()"
             " WHERE token_idx = $1"
             "   AND (last_used_at IS NULL"
             f"        OR last_used_at < now() - interval '{LAST_USED_AT_COALESCE_INTERVAL}')",

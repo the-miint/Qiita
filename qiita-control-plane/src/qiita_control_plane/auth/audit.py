@@ -1,6 +1,6 @@
 """Append-only audit-event writer with a runtime leak-guard.
 
-`record_event` writes to qiita.auth_events. The leak-guard recursively walks
+`record_event` writes to qiita.auth_event. The leak-guard recursively walks
 the `detail` dict and raises ValueError at the call site if any key is in a
 forbidden set or any string value matches a token-shape pattern. Fails
 closed: a malformed audit attempt aborts the surrounding operation rather
@@ -100,7 +100,7 @@ async def record_event(
     _check_for_leaks(detail)
     payload = json.dumps(detail, separators=(",", ":"))
     return await pool_or_conn.fetchval(
-        "INSERT INTO qiita.auth_events"
+        "INSERT INTO qiita.auth_event"
         "  (event_type, principal_idx, actor_principal_idx, detail)"
         " VALUES ($1, $2, $3, $4::jsonb) RETURNING event_idx",
         str(event_type),
@@ -131,7 +131,7 @@ async def record_event_bulk(pool_or_conn, *, events: list[AuthEvent]) -> list[in
     payloads = [json.dumps(e.detail or {}, separators=(",", ":")) for e in events]
 
     rows = await pool_or_conn.fetch(
-        "INSERT INTO qiita.auth_events"
+        "INSERT INTO qiita.auth_event"
         "  (event_type, principal_idx, actor_principal_idx, detail)"
         " SELECT * FROM unnest("
         "   $1::text[], $2::bigint[], $3::bigint[], $4::jsonb[]"

@@ -279,9 +279,9 @@ All ID minting and membership management lives in the control plane (Postgres OL
 
 | Table | Key columns | Purpose |
 |---|---|---|
-| `references` | `reference_idx` PK | Reference-level metadata: name, version, kind, creator, timestamps |
-| `genomes` | `genome_idx` PK | Genome provenance: source, source_id, timestamps |
-| `features` | `feature_idx` PK | Feature identity: sequence_hash, timestamps |
+| `reference` | `reference_idx` PK | Reference-level metadata: name, version, kind, creator, timestamps |
+| `genome` | `genome_idx` PK | Genome provenance: source, source_id, timestamps |
+| `feature` | `feature_idx` PK | Feature identity: sequence_hash, timestamps |
 | `reference_membership` | `(reference_idx, feature_idx)` | Which features are in each reference version |
 | `feature_genome` | `(feature_idx, genome_idx)` | Feature-to-genome mapping |
 | `phylogeny_tip_feature` | `(reference_idx, node_index, feature_idx)` | Tip node → feature mapping for phylogeny traversal |
@@ -347,7 +347,7 @@ Adding a new reference (potentially millions of sequences) is a multi-step pipel
 2. The control plane creates the `reference_idx` and submits a **hash job** to the compute orchestrator
 3. The SLURM hash job reads sequences using DuckDB + miint (`read_fastx`), computes MD5 hashes via DuckDB's built-in `md5()`, and writes a manifest (hash, sequence identifier, length, metadata) to the output directory
 4. The orchestrator reads the manifest and sends hashes to the control plane in bulk
-5. The control plane does a bulk dedup lookup against the `features` table (`sequence_hash` unique index), reuses existing `feature_idx` for matches, mints new `feature_idx` for novel sequences, writes `reference_membership` and `feature_genome` records, and returns the `{hash → feature_idx}` mapping to the orchestrator
+5. The control plane does a bulk dedup lookup against the `feature` table (`sequence_hash` unique index), reuses existing `feature_idx` for matches, mints new `feature_idx` for novel sequences, writes `reference_membership` and `feature_genome` records, and returns the `{hash → feature_idx}` mapping to the orchestrator
 6. The orchestrator submits a **load job** with the ID mapping; the SLURM job loads sequences, taxonomy, annotations, and phylogeny into DuckLake tables using the assigned `feature_idx` values. For references with a phylogeny, the load job also resolves tip names to `feature_idx` and the orchestrator writes `phylogeny_tip_feature` records to the control plane
 7. On completion, the orchestrator submits an **index build job** to create aligner indices (minimap2 `.mmi`, bowtie2)
 8. The control plane records the reference as active once all jobs complete

@@ -26,26 +26,26 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
     SystemRole.USER: frozenset(
         {
             Scope.SELF_PROFILE,
-            Scope.SELF_TOKENS,
-            Scope.REFERENCES_READ,
+            Scope.SELF_TOKEN,
+            Scope.REFERENCE_READ,
         }
     ),
     SystemRole.WET_LAB_ADMIN: frozenset(
         {
             Scope.SELF_PROFILE,
-            Scope.SELF_TOKENS,
-            Scope.REFERENCES_READ,
-            Scope.REFERENCES_WRITE,
+            Scope.SELF_TOKEN,
+            Scope.REFERENCE_READ,
+            Scope.REFERENCE_WRITE,
         }
     ),
     SystemRole.SYSTEM_ADMIN: frozenset(
         {
             Scope.SELF_PROFILE,
-            Scope.SELF_TOKENS,
-            Scope.REFERENCES_READ,
-            Scope.REFERENCES_WRITE,
-            Scope.ADMIN_USERS,
-            Scope.ADMIN_SERVICE_ACCOUNTS,
+            Scope.SELF_TOKEN,
+            Scope.REFERENCE_READ,
+            Scope.REFERENCE_WRITE,
+            Scope.ADMIN_USER,
+            Scope.ADMIN_SERVICE_ACCOUNT,
             Scope.ADMIN_AUDIT_READ,
         }
     ),
@@ -57,10 +57,10 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
 # explicitly; requested scopes must fall within this set.
 SERVICE_ACCOUNT_SCOPE_CEILING: frozenset[Scope] = frozenset(
     {
-        Scope.FEATURES_MINT,
-        Scope.REFERENCES_REGISTER_FILES,
-        Scope.REFERENCES_READ,
-        Scope.TICKETS_DOGET,
+        Scope.FEATURE_MINT,
+        Scope.REFERENCE_REGISTER_FILES,
+        Scope.REFERENCE_READ,
+        Scope.TICKET_DOGET,
     }
 )
 

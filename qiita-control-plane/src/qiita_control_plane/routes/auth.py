@@ -1,4 +1,4 @@
-"""Auth endpoints — /auth/whoami, /auth/pat, /auth/tokens, /auth/login,
+"""Auth endpoints — /auth/whoami, /auth/pat, /auth/token, /auth/login,
 /auth/handoff, /auth/cli-exchange.
 
 Routes use the `get_current_principal` resolver where they consume a
@@ -73,7 +73,7 @@ from ..auth.scopes import (
     role_ceiling,
     validate_scopes_against_ceiling,
 )
-from ..auth.tokens import mint_api_token
+from ..auth.token import mint_api_token
 from ..config import Settings
 from ..deps import get_db_pool
 
@@ -201,7 +201,7 @@ async def mint_pat(
         " u.profile_complete,"
         " qiita.user_profile_missing_fields(u.affiliation, u.address, u.phone)"
         "   AS missing_fields"
-        " FROM qiita.user_identities ui"
+        " FROM qiita.user_identity ui"
         " JOIN qiita.user u ON u.principal_idx = ui.principal_idx"
         " JOIN qiita.principal p ON p.idx = u.principal_idx"
         " WHERE ui.issuer = $1 AND ui.subject = $2",
@@ -277,13 +277,13 @@ async def mint_pat(
 
 
 # ---------------------------------------------------------------------------
-# GET /auth/tokens — list own tokens (metadata only)
+# GET /auth/token — list own tokens (metadata only)
 # ---------------------------------------------------------------------------
 
 
-@router.get("/tokens")
+@router.get("/token")
 async def list_own_tokens(
-    p: Principal = Depends(require_scope(Scope.SELF_TOKENS)),
+    p: Principal = Depends(require_scope(Scope.SELF_TOKEN)),
     pool: asyncpg.Pool = Depends(get_db_pool),
 ) -> list[ApiTokenSummary]:
     """List the caller's own tokens. Metadata only — no plaintext, no hash.
@@ -291,7 +291,7 @@ async def list_own_tokens(
     rows = await pool.fetch(
         "SELECT token_idx, label, scopes, expires_at, revoked_at,"
         "  last_used_at, created_at"
-        " FROM qiita.api_tokens WHERE principal_idx = $1"
+        " FROM qiita.api_token WHERE principal_idx = $1"
         " ORDER BY token_idx",
         p.principal_idx,
     )
@@ -299,14 +299,14 @@ async def list_own_tokens(
 
 
 # ---------------------------------------------------------------------------
-# DELETE /auth/tokens/{token_idx} — revoke own token
+# DELETE /auth/token/{token_idx} — revoke own token
 # ---------------------------------------------------------------------------
 
 
-@router.delete("/tokens/{token_idx}", status_code=204)
+@router.delete("/token/{token_idx}", status_code=204)
 async def revoke_own_token(
     token_idx: int,
-    p: Principal = Depends(require_scope(Scope.SELF_TOKENS)),
+    p: Principal = Depends(require_scope(Scope.SELF_TOKEN)),
     pool: asyncpg.Pool = Depends(get_db_pool),
 ) -> None:
     """Revoke a token belonging to the caller. 401 if Anonymous, 403 if the
@@ -317,7 +317,7 @@ async def revoke_own_token(
     # Atomic UPDATE WHERE — only revokes if owner matches and token is not
     # already revoked. Returns 0 rows if either condition fails.
     result = await pool.execute(
-        "UPDATE qiita.api_tokens SET revoked_at = now()"
+        "UPDATE qiita.api_token SET revoked_at = now()"
         " WHERE token_idx = $1 AND principal_idx = $2 AND revoked_at IS NULL",
         token_idx,
         p.principal_idx,
@@ -329,7 +329,7 @@ async def revoke_own_token(
         # 404. The "already revoked" case is idempotent success, so we let
         # it return 204 silently.
         owner_idx = await pool.fetchval(
-            "SELECT principal_idx FROM qiita.api_tokens WHERE token_idx = $1",
+            "SELECT principal_idx FROM qiita.api_token WHERE token_idx = $1",
             token_idx,
         )
         if owner_idx is None or owner_idx != p.principal_idx:
@@ -473,7 +473,7 @@ async def handoff(
     handling), then mints a PAT scoped to the user's role ceiling.
 
     - **CLI flow** (`cli=true` in cookie): store PAT under a one-time code
-      in `qiita.cli_login_codes`, redirect browser to
+      in `qiita.cli_login_code`, redirect browser to
       `http://127.0.0.1:<port>/?ot_code=<plaintext>` with the cookie
       scrubbed. The CLI's loopback HTTP server captures the code and POSTs
       it back to /auth/cli-exchange.
@@ -552,7 +552,7 @@ async def handoff(
         ot_plaintext, ot_hash = generate_ot_code()
         ot_expires = datetime.now(UTC) + timedelta(seconds=settings.cli_login_code_ttl_seconds)
         await pool.execute(
-            "INSERT INTO qiita.cli_login_codes"
+            "INSERT INTO qiita.cli_login_code"
             "  (ot_code, principal_idx, token_idx, plaintext_pat, expires_at)"
             " VALUES ($1, $2, $3, $4, $5)",
             ot_hash,
@@ -621,7 +621,7 @@ async def cli_exchange(
     # atomic against concurrent revoke/expire.
     row = await pool.fetchrow(
         "WITH consumed AS ("
-        "  UPDATE qiita.cli_login_codes"
+        "  UPDATE qiita.cli_login_code"
         "     SET consumed_at = now()"
         "   WHERE ot_code = $1"
         "     AND consumed_at IS NULL"
@@ -631,7 +631,7 @@ async def cli_exchange(
         " SELECT c.plaintext_pat, t.token_idx, t.label, t.scopes,"
         "        t.expires_at, t.created_at"
         "   FROM consumed c"
-        "   JOIN qiita.api_tokens t ON t.token_idx = c.token_idx",
+        "   JOIN qiita.api_token t ON t.token_idx = c.token_idx",
         ot_hash,
     )
     if row is None:

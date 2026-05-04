@@ -16,12 +16,12 @@ For the initial mint of the orchestrator token, see
 A *service account* is a non-human principal — a row in `qiita.principal`
 with a matching row in `qiita.service_account` keyed by `principal_idx`.
 It carries the identity (name, scopes) and is the owner of one or more
-rows in `qiita.api_tokens`. The orchestrator and each cron job is its
+rows in `qiita.api_token`. The orchestrator and each cron job is its
 own service account; they are independent.
 
 Conceptually rotation is a *token* operation: mint a new token under the
 same principal, swap the file, revoke the old token, leave the principal
-intact. The schema supports this — `qiita.api_tokens.principal_idx` is a
+intact. The schema supports this — `qiita.api_token.principal_idx` is a
 plain FK and a principal can hold multiple non-revoked tokens.
 
 In practice today the only mint endpoint is
@@ -42,7 +42,7 @@ token file.
 
 ## Prerequisites
 
-- An admin PAT with `admin:service_accounts` scope (see
+- An admin PAT with `admin:service_account` scope (see
   `docs/runbooks/first-deploy.md`).
 - Shell access to the orchestrator host as the user that owns the token
   file (`qiita` by default).
@@ -52,16 +52,16 @@ token file.
 1. **Mint the replacement token** from any host with the admin PAT:
 
    ```bash
-   curl -X POST $CONTROL_PLANE_URL/api/v1/admin/service-accounts \
+   curl -X POST $CONTROL_PLANE_URL/api/v1/admin/service-account \
        -H "Authorization: Bearer qk_<ADMIN_PAT>" \
        -H "Content-Type: application/json" \
        -d '{
          "name": "orchestrator-rot-2026-04-27",
          "scopes": [
-           "features:mint",
-           "references:register_files",
-           "references:read",
-           "tickets:doget"
+           "feature:mint",
+           "reference:register_files",
+           "reference:read",
+           "ticket:doget"
          ]
        }'
    ```
@@ -104,7 +104,7 @@ token file.
        ./scripts/wait-for-token-use.sh "$NEW_PRINCIPAL_IDX"
    ```
 
-   The script polls `qiita.api_tokens.last_used_at` for the new
+   The script polls `qiita.api_token.last_used_at` for the new
    principal until it advances (default timeout 3 minutes). DB-direct
    rather than HTTP because `last_used_at` is intentionally not surfaced
    as an audit event and `GET /auth/tokens` is caller-scoped only — see

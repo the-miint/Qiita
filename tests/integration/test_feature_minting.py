@@ -33,7 +33,7 @@ async def client(postgres_pool, human_admin_session):
 @pytest.fixture
 def worker_headers(compute_worker_service_account):
     """Authorization header for the compute worker service account — required
-    by service-only routes (POST /references/{id}/features/mint)."""
+    by service-only routes (POST /references/{id}/feature/mint)."""
     return {"Authorization": f"Bearer {compute_worker_service_account['token']}"}
 
 
@@ -41,7 +41,7 @@ def worker_headers(compute_worker_service_account):
 async def reference_idx(client, postgres_pool):
     """Create a reference in 'hashing' status and return its idx."""
     resp = await client.post(
-        "/api/v1/references",
+        "/api/v1/reference",
         json={
             "name": f"mint-test-{uuid.uuid4()}",
             "version": "1.0",
@@ -50,7 +50,7 @@ async def reference_idx(client, postgres_pool):
     )
     idx = resp.json()["reference_idx"]
     await postgres_pool.execute(
-        "UPDATE qiita.references SET status = 'hashing' WHERE reference_idx = $1", idx
+        "UPDATE qiita.reference SET status = 'hashing' WHERE reference_idx = $1", idx
     )
     yield idx
     # Cleanup in FK dependency order
@@ -63,7 +63,7 @@ async def reference_idx(client, postgres_pool):
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
     await postgres_pool.execute(
-        "DELETE FROM qiita.references WHERE reference_idx = $1", idx
+        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
     )
 
 
@@ -71,7 +71,7 @@ async def test_mint_five_new_features(client, reference_idx, worker_headers):
     """Minting 5 novel hashes should return 5 feature_idx values."""
     hashes = [_md5_uuid(f"ATCG{i}") for i in range(5)]
     resp = await client.post(
-        f"/api/v1/references/{reference_idx}/features/mint",
+        f"/api/v1/reference/{reference_idx}/feature/mint",
         json={"entries": [{"sequence_hash": h} for h in hashes]},
         headers=worker_headers,
     )
@@ -91,7 +91,7 @@ async def test_mint_deduplicates(client, reference_idx, worker_headers):
     entries = [{"sequence_hash": h} for h in hashes]
 
     resp1 = await client.post(
-        f"/api/v1/references/{reference_idx}/features/mint",
+        f"/api/v1/reference/{reference_idx}/feature/mint",
         json={"entries": entries},
         headers=worker_headers,
     )
@@ -99,7 +99,7 @@ async def test_mint_deduplicates(client, reference_idx, worker_headers):
     mapping1 = resp1.json()["mapping"]
 
     resp2 = await client.post(
-        f"/api/v1/references/{reference_idx}/features/mint",
+        f"/api/v1/reference/{reference_idx}/feature/mint",
         json={"entries": entries},
         headers=worker_headers,
     )
@@ -114,7 +114,7 @@ async def test_mint_mixed_new_and_existing(client, reference_idx, worker_headers
     """Minting a mix of existing and new hashes should reuse and mint correctly."""
     existing = [_md5_uuid(f"EXIST{i}") for i in range(3)]
     resp1 = await client.post(
-        f"/api/v1/references/{reference_idx}/features/mint",
+        f"/api/v1/reference/{reference_idx}/feature/mint",
         json={"entries": [{"sequence_hash": h} for h in existing]},
         headers=worker_headers,
     )
@@ -123,7 +123,7 @@ async def test_mint_mixed_new_and_existing(client, reference_idx, worker_headers
     new = [_md5_uuid(f"NEW{i}") for i in range(2)]
     all_hashes = existing + new
     resp2 = await client.post(
-        f"/api/v1/references/{reference_idx}/features/mint",
+        f"/api/v1/reference/{reference_idx}/feature/mint",
         json={"entries": [{"sequence_hash": h} for h in all_hashes]},
         headers=worker_headers,
     )
@@ -141,7 +141,7 @@ async def test_mint_with_genome_association(
     source_id = f"GCF_ASSOC_{uuid.uuid4().hex[:8]}"
     h = _md5_uuid("GENOME_SEQ")
     resp = await client.post(
-        f"/api/v1/references/{reference_idx}/features/mint",
+        f"/api/v1/reference/{reference_idx}/feature/mint",
         json={
             "entries": [
                 {
@@ -158,7 +158,7 @@ async def test_mint_with_genome_association(
     feature_idx = resp.json()["mapping"][h]
 
     genome = await postgres_pool.fetchrow(
-        "SELECT * FROM qiita.genomes WHERE source = 'genbank' AND source_id = $1",
+        "SELECT * FROM qiita.genome WHERE source = 'genbank' AND source_id = $1",
         source_id,
     )
     assert genome is not None
@@ -176,7 +176,7 @@ async def test_mint_reuses_existing_genome(
     """If a genome already exists (same source+source_id), reuse it."""
     source_id = f"GCF_REUSE_{uuid.uuid4().hex[:8]}"
     genome_idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.genomes (source, source_id) VALUES ($1, $2)"
+        "INSERT INTO qiita.genome (source, source_id) VALUES ($1, $2)"
         " ON CONFLICT (source, source_id) DO UPDATE SET source = EXCLUDED.source"
         " RETURNING genome_idx",
         "genbank",
@@ -185,7 +185,7 @@ async def test_mint_reuses_existing_genome(
 
     h = _md5_uuid("GENOME_REUSE_SEQ")
     resp = await client.post(
-        f"/api/v1/references/{reference_idx}/features/mint",
+        f"/api/v1/reference/{reference_idx}/feature/mint",
         json={
             "entries": [
                 {
@@ -209,7 +209,7 @@ async def test_mint_reuses_existing_genome(
 async def test_mint_rejects_wrong_status(client, postgres_pool, worker_headers):
     """Minting against a reference in 'pending' status should fail."""
     resp = await client.post(
-        "/api/v1/references",
+        "/api/v1/reference",
         json={
             "name": f"wrong-status-{uuid.uuid4()}",
             "version": "1.0",
@@ -219,21 +219,21 @@ async def test_mint_rejects_wrong_status(client, postgres_pool, worker_headers):
     idx = resp.json()["reference_idx"]
 
     mint_resp = await client.post(
-        f"/api/v1/references/{idx}/features/mint",
+        f"/api/v1/reference/{idx}/feature/mint",
         json={"entries": [{"sequence_hash": _md5_uuid("X")}]},
         headers=worker_headers,
     )
     assert mint_resp.status_code == 409
 
     await postgres_pool.execute(
-        "DELETE FROM qiita.references WHERE reference_idx = $1", idx
+        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
     )
 
 
 async def test_mint_rejects_empty_batch(client, reference_idx, worker_headers):
     """Minting with an empty entries list should return 422."""
     resp = await client.post(
-        f"/api/v1/references/{reference_idx}/features/mint",
+        f"/api/v1/reference/{reference_idx}/feature/mint",
         json={"entries": []},
         headers=worker_headers,
     )
@@ -246,7 +246,7 @@ async def test_mint_rejects_duplicate_hashes_in_request(
     """Submitting duplicate sequence_hash values in one request should return 422."""
     h = _md5_uuid("DUP_IN_REQ")
     resp = await client.post(
-        f"/api/v1/references/{reference_idx}/features/mint",
+        f"/api/v1/reference/{reference_idx}/feature/mint",
         json={"entries": [{"sequence_hash": h}, {"sequence_hash": h}]},
         headers=worker_headers,
     )
@@ -258,7 +258,7 @@ async def test_mint_rejects_genome_source_without_id(
 ):
     """genome_source set without genome_source_id should return 422."""
     resp = await client.post(
-        f"/api/v1/references/{reference_idx}/features/mint",
+        f"/api/v1/reference/{reference_idx}/feature/mint",
         json={
             "entries": [
                 {"sequence_hash": _md5_uuid("GS_NO_ID"), "genome_source": "genbank"}
@@ -274,7 +274,7 @@ async def test_mint_rejects_genome_id_without_source(
 ):
     """genome_source_id set without genome_source should return 422."""
     resp = await client.post(
-        f"/api/v1/references/{reference_idx}/features/mint",
+        f"/api/v1/reference/{reference_idx}/feature/mint",
         json={
             "entries": [
                 {
@@ -294,7 +294,7 @@ async def test_cross_reference_deduplication(client, postgres_pool, worker_heade
     refs = []
     for i in range(2):
         resp = await client.post(
-            "/api/v1/references",
+            "/api/v1/reference",
             json={
                 "name": f"xref-dedup-{uuid.uuid4()}",
                 "version": "1.0",
@@ -303,7 +303,7 @@ async def test_cross_reference_deduplication(client, postgres_pool, worker_heade
         )
         idx = resp.json()["reference_idx"]
         await postgres_pool.execute(
-            "UPDATE qiita.references SET status = 'hashing' WHERE reference_idx = $1",
+            "UPDATE qiita.reference SET status = 'hashing' WHERE reference_idx = $1",
             idx,
         )
         refs.append(idx)
@@ -312,12 +312,12 @@ async def test_cross_reference_deduplication(client, postgres_pool, worker_heade
     entries = [{"sequence_hash": h}]
 
     resp1 = await client.post(
-        f"/api/v1/references/{refs[0]}/features/mint",
+        f"/api/v1/reference/{refs[0]}/feature/mint",
         json={"entries": entries},
         headers=worker_headers,
     )
     resp2 = await client.post(
-        f"/api/v1/references/{refs[1]}/features/mint",
+        f"/api/v1/reference/{refs[1]}/feature/mint",
         json={"entries": entries},
         headers=worker_headers,
     )
@@ -341,7 +341,7 @@ async def test_cross_reference_deduplication(client, postgres_pool, worker_heade
             "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", ref_idx
         )
         await postgres_pool.execute(
-            "DELETE FROM qiita.references WHERE reference_idx = $1", ref_idx
+            "DELETE FROM qiita.reference WHERE reference_idx = $1", ref_idx
         )
 
 
@@ -354,7 +354,7 @@ async def test_mint_10k_batch_performance(client, reference_idx, worker_headers)
 
     start = time.monotonic()
     resp = await client.post(
-        f"/api/v1/references/{reference_idx}/features/mint",
+        f"/api/v1/reference/{reference_idx}/feature/mint",
         json={"entries": entries},
         headers=worker_headers,
     )

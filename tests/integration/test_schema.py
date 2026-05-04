@@ -4,9 +4,9 @@ import asyncpg
 import pytest
 
 EXPECTED_TABLES = [
-    "references",
-    "genomes",
-    "features",
+    "reference",
+    "genome",
+    "feature",
     "reference_membership",
     "feature_genome",
 ]
@@ -25,14 +25,14 @@ async def test_all_reference_tables_exist(postgres_pool):
         assert exists, f"Table qiita.{table} does not exist"
 
 
-async def test_references_auto_generates_idx(postgres_pool):
+async def test_reference_auto_generates_idx(postgres_pool):
     """Inserting without reference_idx should auto-generate an identity value."""
     conn = await postgres_pool.acquire()
     try:
         tr = conn.transaction()
         await tr.start()
         row = await conn.fetchrow(
-            "INSERT INTO qiita.references (name, version, kind, status, created_by_idx)"
+            "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
             " VALUES ($1, $2, $3, $4, 1) RETURNING reference_idx",
             "test-ref",
             "1.0",
@@ -46,14 +46,14 @@ async def test_references_auto_generates_idx(postgres_pool):
         await postgres_pool.release(conn)
 
 
-async def test_references_status_defaults_to_pending(postgres_pool):
+async def test_reference_status_defaults_to_pending(postgres_pool):
     """Omitting status from INSERT should default to 'pending'."""
     conn = await postgres_pool.acquire()
     try:
         tr = conn.transaction()
         await tr.start()
         row = await conn.fetchrow(
-            "INSERT INTO qiita.references (name, version, kind, created_by_idx)"
+            "INSERT INTO qiita.reference (name, version, kind, created_by_idx)"
             " VALUES ($1, $2, $3, 1) RETURNING status",
             "default-status-test",
             "1.0",
@@ -65,14 +65,14 @@ async def test_references_status_defaults_to_pending(postgres_pool):
         await postgres_pool.release(conn)
 
 
-async def test_references_rejects_duplicate_name_version(postgres_pool):
+async def test_reference_rejects_duplicate_name_version(postgres_pool):
     """Duplicate (name, version) must raise a unique violation."""
     conn = await postgres_pool.acquire()
     try:
         tr = conn.transaction()
         await tr.start()
         await conn.execute(
-            "INSERT INTO qiita.references (name, version, kind, status, created_by_idx)"
+            "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
             " VALUES ($1, $2, $3, $4, 1)",
             "dup-ref",
             "1.0",
@@ -81,7 +81,7 @@ async def test_references_rejects_duplicate_name_version(postgres_pool):
         )
         with pytest.raises(asyncpg.UniqueViolationError):
             await conn.execute(
-                "INSERT INTO qiita.references (name, version, kind, status, created_by_idx)"
+                "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
                 " VALUES ($1, $2, $3, $4, 1)",
                 "dup-ref",
                 "1.0",
@@ -93,7 +93,7 @@ async def test_references_rejects_duplicate_name_version(postgres_pool):
         await postgres_pool.release(conn)
 
 
-async def test_references_rejects_invalid_kind(postgres_pool):
+async def test_reference_rejects_invalid_kind(postgres_pool):
     """kind must be one of the allowed values."""
     conn = await postgres_pool.acquire()
     try:
@@ -101,7 +101,7 @@ async def test_references_rejects_invalid_kind(postgres_pool):
         await tr.start()
         with pytest.raises(asyncpg.CheckViolationError):
             await conn.execute(
-                "INSERT INTO qiita.references (name, version, kind, status, created_by_idx)"
+                "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
                 " VALUES ($1, $2, $3, $4, 1)",
                 "bad-kind",
                 "1.0",
@@ -113,7 +113,7 @@ async def test_references_rejects_invalid_kind(postgres_pool):
         await postgres_pool.release(conn)
 
 
-async def test_references_rejects_invalid_status(postgres_pool):
+async def test_reference_rejects_invalid_status(postgres_pool):
     """status must be one of the allowed values."""
     conn = await postgres_pool.acquire()
     try:
@@ -121,7 +121,7 @@ async def test_references_rejects_invalid_status(postgres_pool):
         await tr.start()
         with pytest.raises(asyncpg.CheckViolationError):
             await conn.execute(
-                "INSERT INTO qiita.references (name, version, kind, status, created_by_idx)"
+                "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
                 " VALUES ($1, $2, $3, $4, 1)",
                 "bad-status",
                 "1.0",
@@ -133,7 +133,7 @@ async def test_references_rejects_invalid_status(postgres_pool):
         await postgres_pool.release(conn)
 
 
-async def test_features_rejects_duplicate_hash(postgres_pool):
+async def test_feature_rejects_duplicate_hash(postgres_pool):
     """Duplicate sequence_hash must raise a unique violation."""
     test_hash = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
     conn = await postgres_pool.acquire()
@@ -141,11 +141,11 @@ async def test_features_rejects_duplicate_hash(postgres_pool):
         tr = conn.transaction()
         await tr.start()
         await conn.execute(
-            "INSERT INTO qiita.features (sequence_hash) VALUES ($1::uuid)", test_hash
+            "INSERT INTO qiita.feature (sequence_hash) VALUES ($1::uuid)", test_hash
         )
         with pytest.raises(asyncpg.UniqueViolationError):
             await conn.execute(
-                "INSERT INTO qiita.features (sequence_hash) VALUES ($1::uuid)",
+                "INSERT INTO qiita.feature (sequence_hash) VALUES ($1::uuid)",
                 test_hash,
             )
         await tr.rollback()
@@ -171,14 +171,14 @@ async def test_reference_membership_rejects_duplicate(postgres_pool):
         tr = conn.transaction()
         await tr.start()
         ref_idx = await conn.fetchval(
-            "INSERT INTO qiita.references (name, version, kind, created_by_idx)"
+            "INSERT INTO qiita.reference (name, version, kind, created_by_idx)"
             " VALUES ($1, $2, $3, 1) RETURNING reference_idx",
             "membership-dup-test",
             "1.0",
             "sequence_reference",
         )
         feat_idx = await conn.fetchval(
-            "INSERT INTO qiita.features (sequence_hash)"
+            "INSERT INTO qiita.feature (sequence_hash)"
             " VALUES ($1::uuid) RETURNING feature_idx",
             "b0000000-0000-0000-0000-000000000001",
         )
@@ -207,7 +207,7 @@ async def test_feature_genome_fk_on_feature(postgres_pool):
         tr = conn.transaction()
         await tr.start()
         genome_idx = await conn.fetchval(
-            "INSERT INTO qiita.genomes (source, source_id)"
+            "INSERT INTO qiita.genome (source, source_id)"
             " VALUES ($1, $2) RETURNING genome_idx",
             "genbank",
             "GCF_fk_test_feat",
@@ -231,7 +231,7 @@ async def test_feature_genome_fk_on_genome(postgres_pool):
         tr = conn.transaction()
         await tr.start()
         feat_idx = await conn.fetchval(
-            "INSERT INTO qiita.features (sequence_hash)"
+            "INSERT INTO qiita.feature (sequence_hash)"
             " VALUES ($1::uuid) RETURNING feature_idx",
             "c0000000-0000-0000-0000-000000000001",
         )
@@ -254,18 +254,18 @@ async def test_feature_genome_unique_feature(postgres_pool):
         tr = conn.transaction()
         await tr.start()
         feat_idx = await conn.fetchval(
-            "INSERT INTO qiita.features (sequence_hash)"
+            "INSERT INTO qiita.feature (sequence_hash)"
             " VALUES ($1::uuid) RETURNING feature_idx",
             "d0000000-0000-0000-0000-000000000001",
         )
         g1 = await conn.fetchval(
-            "INSERT INTO qiita.genomes (source, source_id)"
+            "INSERT INTO qiita.genome (source, source_id)"
             " VALUES ($1, $2) RETURNING genome_idx",
             "genbank",
             "GCF_unique_test_1",
         )
         g2 = await conn.fetchval(
-            "INSERT INTO qiita.genomes (source, source_id)"
+            "INSERT INTO qiita.genome (source, source_id)"
             " VALUES ($1, $2) RETURNING genome_idx",
             "genbank",
             "GCF_unique_test_2",
@@ -286,20 +286,20 @@ async def test_feature_genome_unique_feature(postgres_pool):
         await postgres_pool.release(conn)
 
 
-async def test_genomes_rejects_duplicate_source(postgres_pool):
+async def test_genome_rejects_duplicate_source(postgres_pool):
     """Duplicate (source, source_id) must raise a unique violation."""
     conn = await postgres_pool.acquire()
     try:
         tr = conn.transaction()
         await tr.start()
         await conn.execute(
-            "INSERT INTO qiita.genomes (source, source_id) VALUES ($1, $2)",
+            "INSERT INTO qiita.genome (source, source_id) VALUES ($1, $2)",
             "genbank",
             "GCF_000123456.1",
         )
         with pytest.raises(asyncpg.UniqueViolationError):
             await conn.execute(
-                "INSERT INTO qiita.genomes (source, source_id) VALUES ($1, $2)",
+                "INSERT INTO qiita.genome (source, source_id) VALUES ($1, $2)",
                 "genbank",
                 "GCF_000123456.1",
             )

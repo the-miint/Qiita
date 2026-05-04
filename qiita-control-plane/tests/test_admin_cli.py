@@ -72,7 +72,7 @@ def test_token_revoke_all_calls_correct_url(monkeypatch):
 
     monkeypatch.setattr(cli.httpx, "post", fake_post)
     body = cli._token_revoke_all("http://localhost:8080", "qk_admin", 42)
-    assert captured["url"] == "http://localhost:8080/api/v1/admin/principals/42/revoke-all-tokens"
+    assert captured["url"] == "http://localhost:8080/api/v1/admin/principal/42/revoke-all-tokens"
     assert body["revoked_token_idxs"] == [1, 2]
 
 

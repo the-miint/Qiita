@@ -59,7 +59,7 @@ class ControlPlaneClient:
             raise ValueError(
                 "ControlPlaneClient: exactly one of api_token or api_token_path"
                 " must be provided (auth is required for every endpoint except"
-                " GET /references/{id})"
+                " GET /reference/{id})"
             )
 
         if api_token_path is not None:
@@ -98,7 +98,7 @@ class ControlPlaneClient:
 
     async def create_reference(self, name: str, version: str, kind: str) -> ReferenceResponse:
         resp = await self._http.post(
-            f"{API_PREFIX}/references",
+            f"{API_PREFIX}/reference",
             json={"name": name, "version": version, "kind": kind},
         )
         resp.raise_for_status()
@@ -108,7 +108,7 @@ class ControlPlaneClient:
         self, reference_idx: int, status: ReferenceStatus
     ) -> ReferenceResponse:
         resp = await self._http.patch(
-            f"{API_PREFIX}/references/{reference_idx}/status",
+            f"{API_PREFIX}/reference/{reference_idx}/status",
             json={"status": str(status)},
         )
         resp.raise_for_status()
@@ -118,7 +118,7 @@ class ControlPlaneClient:
         self, reference_idx: int, entries: list[FeatureHashEntry]
     ) -> FeatureMintResponse:
         resp = await self._http.post(
-            f"{API_PREFIX}/references/{reference_idx}/features/mint",
+            f"{API_PREFIX}/reference/{reference_idx}/feature/mint",
             json={"entries": [e.model_dump(mode="json") for e in entries]},
         )
         resp.raise_for_status()
@@ -131,7 +131,7 @@ class ControlPlaneClient:
         files: dict[str, str],
     ) -> RegisterFilesResponse:
         resp = await self._http.post(
-            f"{API_PREFIX}/references/{reference_idx}/register",
+            f"{API_PREFIX}/reference/{reference_idx}/register",
             json={"staging_dir": staging_dir, "files": files},
         )
         resp.raise_for_status()
@@ -139,7 +139,7 @@ class ControlPlaneClient:
 
     async def get_doget_ticket(self, reference_idx: int, table: str) -> DoGetTicketResponse:
         resp = await self._http.post(
-            f"{API_PREFIX}/references/{reference_idx}/tickets/doget",
+            f"{API_PREFIX}/reference/{reference_idx}/ticket/doget",
             json={"table": table},
         )
         resp.raise_for_status()

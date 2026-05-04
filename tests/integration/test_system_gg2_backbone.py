@@ -200,7 +200,7 @@ async def client(postgres_pool, hmac_secret):
 @pytest.fixture
 async def ref_idx(client, postgres_pool):
     resp = await client.post(
-        "/api/v1/references",
+        "/api/v1/reference",
         json={
             "name": f"gg2-backbone-{uuid.uuid4()}",
             "version": "2024.09",
@@ -213,7 +213,7 @@ async def ref_idx(client, postgres_pool):
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
     await postgres_pool.execute(
-        "DELETE FROM qiita.references WHERE reference_idx = $1", idx
+        "DELETE FROM qiita.reference WHERE reference_idx = $1", idx
     )
 
 
@@ -231,7 +231,7 @@ async def test_gg2_backbone_pipeline(
 
     # --- Hash (reads 11 GB FASTA twice — ~7 min) ---
     await client.patch(
-        f"/api/v1/references/{ref_idx}/status", json={"status": "hashing"}
+        f"/api/v1/reference/{ref_idx}/status", json={"status": "hashing"}
     )
     hash_dir = _SYSTEM_TEST_BASE / "hash"
     hash_dir.mkdir(parents=True, exist_ok=True)
@@ -269,7 +269,7 @@ async def test_gg2_backbone_pipeline(
                     kwargs["genome_source_id"] = genome[1]
                 mint_entries.append(kwargs)
             resp = await client.post(
-                f"/api/v1/references/{ref_idx}/features/mint",
+                f"/api/v1/reference/{ref_idx}/feature/mint",
                 json={"entries": mint_entries},
             )
             assert resp.status_code == 200, f"mint chunk {i} failed: {resp.text[:200]}"
@@ -281,7 +281,7 @@ async def test_gg2_backbone_pipeline(
 
     # --- Load (write Parquet to staging) ---
     await client.patch(
-        f"/api/v1/references/{ref_idx}/status", json={"status": "loading"}
+        f"/api/v1/reference/{ref_idx}/status", json={"status": "loading"}
     )
     staging = _SYSTEM_TEST_BASE / "staging"
     staging.mkdir(parents=True, exist_ok=True)
@@ -304,7 +304,7 @@ async def test_gg2_backbone_pipeline(
 
     # --- Register via control plane → data plane DoAction ---
     reg_resp = await client.post(
-        f"/api/v1/references/{ref_idx}/register",
+        f"/api/v1/reference/{ref_idx}/register",
         json={
             "staging_dir": str(staging),
             "files": {
@@ -321,13 +321,13 @@ async def test_gg2_backbone_pipeline(
 
     # --- Transition to active ---
     resp = await client.patch(
-        f"/api/v1/references/{ref_idx}/status", json={"status": "active"}
+        f"/api/v1/reference/{ref_idx}/status", json={"status": "active"}
     )
     assert resp.status_code == 200
 
     # --- Verify via DoGet: sequence metadata ---
     ticket_resp = await client.post(
-        f"/api/v1/references/{ref_idx}/tickets/doget",
+        f"/api/v1/reference/{ref_idx}/ticket/doget",
         json={"table": "reference_sequences"},
     )
     assert ticket_resp.status_code == 201
@@ -342,7 +342,7 @@ async def test_gg2_backbone_pipeline(
 
     # --- Verify via DoGet: taxonomy ---
     tax_ticket_resp = await client.post(
-        f"/api/v1/references/{ref_idx}/tickets/doget",
+        f"/api/v1/reference/{ref_idx}/ticket/doget",
         json={"table": "reference_taxonomy"},
     )
     tax_bytes = base64.b64decode(tax_ticket_resp.json()["ticket"])
@@ -352,7 +352,7 @@ async def test_gg2_backbone_pipeline(
 
     # --- Verify via DoGet: phylogeny ---
     phylo_ticket_resp = await client.post(
-        f"/api/v1/references/{ref_idx}/tickets/doget",
+        f"/api/v1/reference/{ref_idx}/ticket/doget",
         json={"table": "reference_phylogeny"},
     )
     phylo_bytes = base64.b64decode(phylo_ticket_resp.json()["ticket"])

@@ -5,7 +5,7 @@ Compose freely:
     def handler(
         user: HumanUser = Depends(require_complete_profile),
         _=Depends(require_role_at_least("system_admin")),
-        _=Depends(require_scope("admin:users")),
+        _=Depends(require_scope("admin:user")),
     ): ...
 
 Each guard depends on `get_current_principal`, so FastAPI dedupes the
@@ -113,7 +113,7 @@ def require_human_with_role(role: str) -> Callable[..., HumanUser]:
     alone returns `Principal` because it accepts service accounts at the
     type level (they always 403 at runtime). For routes that need both
     role authority AND human context (most admin endpoints + admin-side
-    POST /users), this is the cleaner combinator.
+    POST /user), this is the cleaner combinator.
     """
     role_str = str(role)
 
@@ -133,7 +133,7 @@ def require_scope(scope: str) -> Callable[..., Principal]:
     token scope set does not include `scope`.
 
     Accepts a Scope member or bare string; normalised so the 403 detail
-    renders `'self:tokens'` not `<Scope.SELF_TOKENS: 'self:tokens'>`.
+    renders `'self:token'` not `<Scope.SELF_TOKEN: 'self:token'>`.
     """
     scope_str = str(scope)
 

@@ -1,6 +1,6 @@
 """Pure unit tests for opaque API token format / hashing / scope validation.
 
-DB-required tests live in tests/integration/test_api_tokens.py.
+DB-required tests live in tests/integration/test_api_token.py.
 """
 
 import hashlib
@@ -25,21 +25,21 @@ def test_token_constants_match_spec():
 
 
 def test_generate_token_starts_with_qk_prefix():
-    from qiita_control_plane.auth.tokens import _generate_token
+    from qiita_control_plane.auth.token import _generate_token
 
     plaintext, _ = _generate_token()
     assert plaintext.startswith("qk_")
 
 
 def test_generate_token_total_length():
-    from qiita_control_plane.auth.tokens import _generate_token
+    from qiita_control_plane.auth.token import _generate_token
 
     plaintext, _ = _generate_token()
     assert len(plaintext) == 46
 
 
 def test_generate_token_returns_plaintext_and_hash_pair():
-    from qiita_control_plane.auth.tokens import _generate_token
+    from qiita_control_plane.auth.token import _generate_token
 
     plaintext, digest = _generate_token()
     assert isinstance(plaintext, str)
@@ -48,14 +48,14 @@ def test_generate_token_returns_plaintext_and_hash_pair():
 
 
 def test_generate_token_hash_is_sha256_of_plaintext():
-    from qiita_control_plane.auth.tokens import _generate_token
+    from qiita_control_plane.auth.token import _generate_token
 
     plaintext, digest = _generate_token()
     assert digest == hashlib.sha256(plaintext.encode("ascii")).digest()
 
 
 def test_generate_token_is_random():
-    from qiita_control_plane.auth.tokens import _generate_token
+    from qiita_control_plane.auth.token import _generate_token
 
     a, _ = _generate_token()
     b, _ = _generate_token()
@@ -67,13 +67,13 @@ def test_valid_scopes_is_frozen():
 
     assert isinstance(VALID_SCOPES, frozenset)
     # Spot-check a few — full coverage lives in the role/scope tests.
-    assert "references:read" in VALID_SCOPES
-    assert "admin:users" in VALID_SCOPES
+    assert "reference:read" in VALID_SCOPES
+    assert "admin:user" in VALID_SCOPES
     assert "self:profile" in VALID_SCOPES
 
 
 def test_verified_token_dataclass_is_frozen():
-    from qiita_control_plane.auth.tokens import VerifiedToken
+    from qiita_control_plane.auth.token import VerifiedToken
 
     vt = VerifiedToken(principal_idx=42, token_idx=7, scopes=frozenset({"a"}))
     with pytest.raises((AttributeError, Exception)):
@@ -82,7 +82,7 @@ def test_verified_token_dataclass_is_frozen():
 
 def test_module_exports():
     """Public surface must be importable from auth.tokens."""
-    from qiita_control_plane.auth.tokens import (
+    from qiita_control_plane.auth.token import (
         VerifiedToken,
         mint_api_token,
         record_token_use,

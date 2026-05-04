@@ -1,12 +1,12 @@
 """Tests for auth schema — user / service_account subtypes of principal,
-api_tokens, auth_events, plus the disabled flag added to principal.
+api_token, auth_event, plus the disabled flag added to principal.
 
 The auth migration adds:
 - ALTER TABLE qiita.principal: disabled flag + audit cols + CHECK constraints
 - Seed: system principal at idx=1
-- New tables: qiita.user, qiita.user_identities, qiita.service_account,
-  qiita.api_tokens, qiita.auth_events
-- Triggers: subtype mutual exclusion, auth_events immutability,
+- New tables: qiita.user, qiita.user_identity, qiita.service_account,
+  qiita.api_token, qiita.auth_event
+- Triggers: subtype mutual exclusion, auth_event immutability,
   token revocation on retirement
 """
 
@@ -42,10 +42,10 @@ async def _insert_principal(
 
 EXPECTED_AUTH_TABLES = [
     "user",
-    "user_identities",
+    "user_identity",
     "service_account",
-    "api_tokens",
-    "auth_events",
+    "api_token",
+    "auth_event",
 ]
 
 
@@ -533,11 +533,11 @@ async def test_subtype_independent_principals_ok(postgres_pool):
 
 
 # ---------------------------------------------------------------------------
-# user_identities
+# user_identity
 # ---------------------------------------------------------------------------
 
 
-async def test_user_identities_pk_uniqueness(postgres_pool):
+async def test_user_identity_pk_uniqueness(postgres_pool):
     """(issuer, subject) is the PK; same pair cannot be inserted twice."""
     async with postgres_pool.acquire() as conn:
         tr = conn.transaction()
@@ -552,13 +552,13 @@ async def test_user_identities_pk_uniqueness(postgres_pool):
                     f"u{p}@example.com",
                 )
             await conn.execute(
-                "INSERT INTO qiita.user_identities (principal_idx, issuer, subject)"
+                "INSERT INTO qiita.user_identity (principal_idx, issuer, subject)"
                 " VALUES ($1, 'iss-A', 'sub-A')",
                 p1,
             )
             with pytest.raises(asyncpg.UniqueViolationError):
                 await conn.execute(
-                    "INSERT INTO qiita.user_identities"
+                    "INSERT INTO qiita.user_identity"
                     "  (principal_idx, issuer, subject)"
                     " VALUES ($1, 'iss-A', 'sub-A')",
                     p2,
@@ -567,8 +567,8 @@ async def test_user_identities_pk_uniqueness(postgres_pool):
             await tr.rollback()
 
 
-async def test_user_identities_fk_to_user_subtype(postgres_pool):
-    """A user_identities row must reference an existing user (not just a principal)."""
+async def test_user_identity_fk_to_user_subtype(postgres_pool):
+    """A user_identity row must reference an existing user (not just a principal)."""
     async with postgres_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
@@ -577,7 +577,7 @@ async def test_user_identities_fk_to_user_subtype(postgres_pool):
             bare = await _insert_principal(conn, display_name="ident-fk-bare")
             with pytest.raises(asyncpg.ForeignKeyViolationError):
                 await conn.execute(
-                    "INSERT INTO qiita.user_identities"
+                    "INSERT INTO qiita.user_identity"
                     "  (principal_idx, issuer, subject)"
                     " VALUES ($1, 'iss', 'sub')",
                     bare,
@@ -586,8 +586,8 @@ async def test_user_identities_fk_to_user_subtype(postgres_pool):
             await tr.rollback()
 
 
-async def test_user_identities_on_delete_restrict(postgres_pool):
-    """user_identities -> user uses ON DELETE RESTRICT (no CASCADE)."""
+async def test_user_identity_on_delete_restrict(postgres_pool):
+    """user_identity -> user uses ON DELETE RESTRICT (no CASCADE)."""
     rule = await postgres_pool.fetchval(
         "SELECT rc.delete_rule"
         " FROM information_schema.table_constraints tc"
@@ -595,25 +595,25 @@ async def test_user_identities_on_delete_restrict(postgres_pool):
         "   ON tc.constraint_name = rc.constraint_name"
         "   AND tc.table_schema = rc.constraint_schema"
         " WHERE tc.table_schema = 'qiita'"
-        "   AND tc.table_name = 'user_identities'"
+        "   AND tc.table_name = 'user_identity'"
         "   AND tc.constraint_type = 'FOREIGN KEY'"
     )
     assert rule in ("NO ACTION", "RESTRICT"), f"got {rule!r}"
 
 
 # ---------------------------------------------------------------------------
-# api_tokens
+# api_token
 # ---------------------------------------------------------------------------
 
 
-async def test_api_tokens_check_no_sentinel_principal(postgres_pool):
+async def test_api_token_check_no_sentinel_principal(postgres_pool):
     async with postgres_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
         try:
             with pytest.raises(asyncpg.CheckViolationError):
                 await conn.execute(
-                    "INSERT INTO qiita.api_tokens"
+                    "INSERT INTO qiita.api_token"
                     "  (principal_idx, token_hash, label) VALUES (1, $1, 'x')",
                     b"\x00" * 32,
                 )
@@ -621,17 +621,17 @@ async def test_api_tokens_check_no_sentinel_principal(postgres_pool):
             await tr.rollback()
 
 
-async def test_api_tokens_hash_active_index_partial(postgres_pool):
-    """The api_tokens_hash_active index must be partial on revoked_at IS NULL."""
+async def test_api_token_hash_active_index_partial(postgres_pool):
+    """The api_token_hash_active index must be partial on revoked_at IS NULL."""
     pred = await postgres_pool.fetchval(
         "SELECT indexdef FROM pg_indexes"
-        " WHERE schemaname = 'qiita' AND indexname = 'api_tokens_hash_active'"
+        " WHERE schemaname = 'qiita' AND indexname = 'api_token_hash_active'"
     )
-    assert pred is not None, "api_tokens_hash_active index missing"
+    assert pred is not None, "api_token_hash_active index missing"
     assert "WHERE" in pred and "revoked_at IS NULL" in pred
 
 
-async def test_api_tokens_hash_unique(postgres_pool):
+async def test_api_token_hash_unique(postgres_pool):
     async with postgres_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
@@ -639,14 +639,14 @@ async def test_api_tokens_hash_unique(postgres_pool):
             p = await _insert_principal(conn, display_name="token-hash-test")
             h = b"\x42" * 32
             await conn.execute(
-                "INSERT INTO qiita.api_tokens"
+                "INSERT INTO qiita.api_token"
                 "  (principal_idx, token_hash, label) VALUES ($1, $2, 'a')",
                 p,
                 h,
             )
             with pytest.raises(asyncpg.UniqueViolationError):
                 await conn.execute(
-                    "INSERT INTO qiita.api_tokens"
+                    "INSERT INTO qiita.api_token"
                     "  (principal_idx, token_hash, label) VALUES ($1, $2, 'b')",
                     p,
                     h,
@@ -670,7 +670,7 @@ async def test_retirement_revokes_tokens_trigger(postgres_pool):
             target = await _insert_principal(conn, display_name="retire-target")
             for i in range(2):
                 await conn.execute(
-                    "INSERT INTO qiita.api_tokens"
+                    "INSERT INTO qiita.api_token"
                     "  (principal_idx, token_hash, label) VALUES ($1, $2, $3)",
                     target,
                     bytes([i + 1]) * 32,
@@ -684,12 +684,12 @@ async def test_retirement_revokes_tokens_trigger(postgres_pool):
                 actor,
             )
             n_active = await conn.fetchval(
-                "SELECT count(*) FROM qiita.api_tokens"
+                "SELECT count(*) FROM qiita.api_token"
                 " WHERE principal_idx = $1 AND revoked_at IS NULL",
                 target,
             )
             n_total = await conn.fetchval(
-                "SELECT count(*) FROM qiita.api_tokens WHERE principal_idx = $1",
+                "SELECT count(*) FROM qiita.api_token WHERE principal_idx = $1",
                 target,
             )
             assert n_active == 0
@@ -708,7 +708,7 @@ async def test_retirement_does_not_touch_other_principals_tokens(postgres_pool):
             target = await _insert_principal(conn, display_name="retire-cross-target")
             other = await _insert_principal(conn, display_name="retire-cross-bystander")
             await conn.execute(
-                "INSERT INTO qiita.api_tokens"
+                "INSERT INTO qiita.api_token"
                 "  (principal_idx, token_hash, label) VALUES ($1, $2, 'survivor')",
                 other,
                 b"\x33" * 32,
@@ -721,7 +721,7 @@ async def test_retirement_does_not_touch_other_principals_tokens(postgres_pool):
                 actor,
             )
             other_revoked = await conn.fetchval(
-                "SELECT revoked_at FROM qiita.api_tokens WHERE principal_idx = $1",
+                "SELECT revoked_at FROM qiita.api_token WHERE principal_idx = $1",
                 other,
             )
             assert other_revoked is None
@@ -740,7 +740,7 @@ async def test_retirement_preserves_already_revoked_at(postgres_pool):
                 conn, display_name="retire-preserve-target"
             )
             await conn.execute(
-                "INSERT INTO qiita.api_tokens"
+                "INSERT INTO qiita.api_token"
                 "  (principal_idx, token_hash, label, revoked_at)"
                 " VALUES ($1, $2, 'pre-revoked', '2020-01-01T00:00:00Z')",
                 target,
@@ -754,7 +754,7 @@ async def test_retirement_preserves_already_revoked_at(postgres_pool):
                 actor,
             )
             preserved = await conn.fetchval(
-                "SELECT revoked_at FROM qiita.api_tokens WHERE principal_idx = $1",
+                "SELECT revoked_at FROM qiita.api_token WHERE principal_idx = $1",
                 target,
             )
             assert preserved.year == 2020
@@ -771,7 +771,7 @@ async def test_disabling_does_not_revoke_tokens(postgres_pool):
             actor = await _insert_principal(conn, display_name="disable-actor")
             target = await _insert_principal(conn, display_name="disable-target")
             await conn.execute(
-                "INSERT INTO qiita.api_tokens"
+                "INSERT INTO qiita.api_token"
                 "  (principal_idx, token_hash, label) VALUES ($1, $2, 'live')",
                 target,
                 b"\x09" * 32,
@@ -784,7 +784,7 @@ async def test_disabling_does_not_revoke_tokens(postgres_pool):
                 actor,
             )
             n_active = await conn.fetchval(
-                "SELECT count(*) FROM qiita.api_tokens"
+                "SELECT count(*) FROM qiita.api_token"
                 " WHERE principal_idx = $1 AND revoked_at IS NULL",
                 target,
             )
@@ -794,15 +794,15 @@ async def test_disabling_does_not_revoke_tokens(postgres_pool):
 
 
 # ---------------------------------------------------------------------------
-# auth_events immutability
+# auth_event immutability
 # ---------------------------------------------------------------------------
 
 
-async def test_auth_events_insert_succeeds(postgres_pool):
+async def test_auth_event_insert_succeeds(postgres_pool):
     """Append-only means INSERT works; only UPDATE/DELETE are blocked.
 
     Without this positive test, a regression that broke
-    tg_auth_events_immutable to fire on INSERT would slip past the suite.
+    tg_auth_event_immutable to fire on INSERT would slip past the suite.
     """
     async with postgres_pool.acquire() as conn:
         tr = conn.transaction()
@@ -810,7 +810,7 @@ async def test_auth_events_insert_succeeds(postgres_pool):
         try:
             actor = await _insert_principal(conn, display_name="evt-insert-actor")
             event_idx = await conn.fetchval(
-                "INSERT INTO qiita.auth_events"
+                "INSERT INTO qiita.auth_event"
                 "  (event_type, principal_idx, actor_principal_idx, detail)"
                 "  VALUES ('token_mint', $1, $1, '{\"ip\":\"127.0.0.1\"}'::jsonb)"
                 " RETURNING event_idx",
@@ -821,14 +821,14 @@ async def test_auth_events_insert_succeeds(postgres_pool):
             await tr.rollback()
 
 
-async def test_auth_events_immutable_update_raises(postgres_pool):
+async def test_auth_event_immutable_update_raises(postgres_pool):
     async with postgres_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
         try:
             actor = await _insert_principal(conn, display_name="evt-actor")
             event_idx = await conn.fetchval(
-                "INSERT INTO qiita.auth_events"
+                "INSERT INTO qiita.auth_event"
                 "  (event_type, principal_idx, actor_principal_idx, detail)"
                 "  VALUES ('token_mint', $1, $1, '{}'::jsonb)"
                 " RETURNING event_idx",
@@ -836,7 +836,7 @@ async def test_auth_events_immutable_update_raises(postgres_pool):
             )
             with pytest.raises(asyncpg.RaiseError):
                 await conn.execute(
-                    "UPDATE qiita.auth_events SET event_type = 'tampered'"
+                    "UPDATE qiita.auth_event SET event_type = 'tampered'"
                     " WHERE event_idx = $1",
                     event_idx,
                 )
@@ -844,14 +844,14 @@ async def test_auth_events_immutable_update_raises(postgres_pool):
             await tr.rollback()
 
 
-async def test_auth_events_immutable_delete_raises(postgres_pool):
+async def test_auth_event_immutable_delete_raises(postgres_pool):
     async with postgres_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
         try:
             actor = await _insert_principal(conn, display_name="evt-del-actor")
             event_idx = await conn.fetchval(
-                "INSERT INTO qiita.auth_events"
+                "INSERT INTO qiita.auth_event"
                 "  (event_type, principal_idx, actor_principal_idx, detail)"
                 "  VALUES ('token_use', $1, $1, '{}'::jsonb)"
                 " RETURNING event_idx",
@@ -859,7 +859,7 @@ async def test_auth_events_immutable_delete_raises(postgres_pool):
             )
             with pytest.raises(asyncpg.RaiseError):
                 await conn.execute(
-                    "DELETE FROM qiita.auth_events WHERE event_idx = $1",
+                    "DELETE FROM qiita.auth_event WHERE event_idx = $1",
                     event_idx,
                 )
         finally:
@@ -873,10 +873,10 @@ async def test_auth_events_immutable_delete_raises(postgres_pool):
 
 AUTH_TABLES_SET = {
     "user",
-    "user_identities",
+    "user_identity",
     "service_account",
-    "api_tokens",
-    "auth_events",
+    "api_token",
+    "auth_event",
 }
 
 
