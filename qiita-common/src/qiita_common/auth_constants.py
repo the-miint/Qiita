@@ -55,11 +55,11 @@ class Scope(StrEnum):
 class AuthEventType(StrEnum):
     """Closed set of event_type values written to qiita.auth_event.
 
-    Mirrors the comment block at `db/migrations/20260426000000_auth.sql:191–193`
-    but lists only the values currently emitted from Python. The DB column is
-    TEXT, so adding members here is a no-op at the schema layer; future event
-    types (e.g. `oidc_login`, `token_use`, `token_verify_failure` from the
-    migration comment) can be added when their emit sites are introduced.
+    Mirrors the column comment on `qiita.auth_event.event_type` but lists
+    only the values currently emitted from Python. The DB column is TEXT, so
+    adding members here is a no-op at the schema layer; future event types
+    named in the column comment (e.g. `oidc_login`, `token_use`,
+    `token_verify_failure`) can be added when their emit sites are introduced.
     """
 
     OIDC_CREATE_PRINCIPAL = "oidc_create_principal"
@@ -78,11 +78,11 @@ class AuthEventType(StrEnum):
     SYSTEM_ROLE_CHANGE = "system_role_change"
 
 
-# The system principal is seeded at idx=1 by
-# `db/migrations/20260426000000_auth.sql:54–57` with OVERRIDING SYSTEM VALUE.
-# It is the `created_by_idx` for any principal minted by an OIDC first-login
-# (where there's no human actor yet) and is forbidden from being disabled,
-# retired, or having its role changed (CHECK and route guards).
+# The system principal occupies idx=1 in `qiita.principal`, seeded with
+# OVERRIDING SYSTEM VALUE. It is the `created_by_idx` for any principal
+# minted by an OIDC first-login (where there's no human actor yet) and is
+# forbidden from being disabled, retired, or having its role changed (CHECK
+# and route guards).
 SYSTEM_PRINCIPAL_IDX = 1
 
 

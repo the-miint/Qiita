@@ -63,7 +63,7 @@ CREATE TABLE qiita.sequenced_sample_global_field (
     internal_name     TEXT NOT NULL,
     display_name      TEXT NOT NULL,
     description       TEXT,
-    data_type         TEXT NOT NULL,
+    data_type         qiita.field_data_type NOT NULL,
     default_tier      qiita.tier NOT NULL DEFAULT 'public',
     required          BOOLEAN NOT NULL DEFAULT false,
     terminology_idx   BIGINT REFERENCES qiita.terminology(idx) ON DELETE RESTRICT,
@@ -72,7 +72,12 @@ CREATE TABLE qiita.sequenced_sample_global_field (
 
     CONSTRAINT sequenced_sample_global_field_internal_name_unique UNIQUE (internal_name),
     CONSTRAINT sequenced_sample_global_field_internal_name_format
-        CHECK (internal_name ~ '^[a-z][a-z0-9_]*$')
+        CHECK (internal_name ~ '^[a-z][a-z0-9_]*$'),
+
+    -- terminology_idx is set iff data_type = 'terminology'. Mirrors the
+    -- biosample_global_field constraint.
+    CONSTRAINT sequenced_sample_global_field_terminology_data_type_consistent
+        CHECK ((data_type = 'terminology') = (terminology_idx IS NOT NULL))
 );
 
 COMMENT ON TABLE qiita.sequenced_sample_global_field IS
@@ -96,7 +101,7 @@ CREATE TABLE qiita.sequenced_sample_study_field (
     sequenced_sample_global_field_idx  BIGINT REFERENCES qiita.sequenced_sample_global_field(idx) ON DELETE RESTRICT,
     display_name                       TEXT NOT NULL,
     description                        TEXT,
-    data_type                          TEXT,
+    data_type                          qiita.field_data_type,
     required                           BOOLEAN,
     terminology_idx                    BIGINT REFERENCES qiita.terminology(idx) ON DELETE RESTRICT,
     tier_override                      qiita.tier,
@@ -109,11 +114,14 @@ CREATE TABLE qiita.sequenced_sample_study_field (
         UNIQUE (study_idx, display_name),
 
     -- Inheritance rules for linked vs unlinked fields; see table comment.
+    -- The unlinked branch additionally enforces the same
+    -- terminology_idx ↔ data_type='terminology' coupling as the global table.
     CONSTRAINT sequenced_sample_study_field_inheritance_consistent
         CHECK (
             (sequenced_sample_global_field_idx IS NULL
                 AND data_type IS NOT NULL
-                AND required IS NOT NULL)
+                AND required IS NOT NULL
+                AND (data_type = 'terminology') = (terminology_idx IS NOT NULL))
             OR
             (sequenced_sample_global_field_idx IS NOT NULL
                 AND data_type IS NULL
