@@ -9,7 +9,7 @@ from qiita_common.models import FieldDataType
 
 from qiita_control_plane.repositories.biosample import (
     get_or_create_local_biosample_study_field,
-    import_biosample_from_owner_id,
+    import_biosample_from_owner_biosample_id,
     insert_biosample,
     insert_biosample_metadata_text,
     insert_biosample_to_study,
@@ -70,7 +70,7 @@ async def _seed_metadata_checklist(pool, name):
     )
 
 
-def _unique_field_name(prefix: str = "owner_id") -> str:
+def _unique_field_name(prefix: str = "owner_biosample_id") -> str:
     """Return prefix + '_' + 8 hex chars; collision-resistant across re-runs."""
     return f"{prefix}_{secrets.token_hex(4)}"
 
@@ -675,7 +675,7 @@ async def test_biosample_metadata_rejects_value_text_when_data_type_terminology(
 # ---------------------------------------------------------------------------
 
 
-async def test_insert_biosample_metadata_text_inserts_owner_id_row(ctx):
+async def test_insert_biosample_metadata_text_inserts_owner_biosample_id_row(ctx):
     bs_idx = await _create_biosample_with_link(ctx)
     field_idx = await _create_local_field(ctx)
 
@@ -708,12 +708,12 @@ async def test_insert_biosample_metadata_text_inserts_owner_id_row(ctx):
     assert dict(row) == expected
 
 
-async def test_insert_biosample_metadata_text_rejects_second_owner_id(ctx):
+async def test_insert_biosample_metadata_text_rejects_second_owner_biosample_id(ctx):
     bs_idx = await _create_biosample_with_link(ctx)
     field1_idx = await _create_local_field(ctx, "a")
     field2_idx = await _create_local_field(ctx, "b")
 
-    # First owner-id row succeeds.
+    # First owner-biosample-id row succeeds.
     async with ctx["pool"].acquire() as conn:
         meta_idx = await insert_biosample_metadata_text(
             conn,
@@ -725,8 +725,8 @@ async def test_insert_biosample_metadata_text_rejects_second_owner_id(ctx):
         )
     ctx["created"]["biosample_metadata"].append(meta_idx)
 
-    # Second owner-id row for the same biosample (different field) must fail
-    # the biosample_metadata_one_owner_id_per_biosample partial unique index.
+    # Second owner-biosample-id row for the same biosample (different field) must fail
+    # the biosample_metadata_unique_owner_biosample_id partial unique index.
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(asyncpg.UniqueViolationError):
             await insert_biosample_metadata_text(
@@ -744,7 +744,7 @@ async def test_insert_biosample_metadata_text_allows_many_non_owner_rows(ctx):
     field1_idx = await _create_local_field(ctx, "a")
     field2_idx = await _create_local_field(ctx, "b")
 
-    # Two non-owner-id rows for the same biosample succeed; the partial
+    # Two non-owner-biosample-id rows for the same biosample succeed; the partial
     # unique index must not over-restrict when is_owner_biosample_id is false.
     async with ctx["pool"].acquire() as conn:
         m1 = await insert_biosample_metadata_text(
@@ -777,7 +777,7 @@ async def test_insert_biosample_metadata_text_allows_many_non_owner_rows(ctx):
 
 
 # ---------------------------------------------------------------------------
-# import_biosample_from_owner_id (composer)
+# import_biosample_from_owner_biosample_id (composer)
 # ---------------------------------------------------------------------------
 
 
@@ -785,7 +785,7 @@ async def _track_composer_outputs(ctx, bs_idx, study_idx, field_name):
     """Look up the rows the composer created on top of bs_idx and track them.
 
     The composer returns only the new biosample idx; the dependent link,
-    field, and owner-id metadata rows are looked up by their natural keys
+    field, and owner-biosample-id metadata rows are looked up by their natural keys
     so the cleanup fixture can sweep them in FK-reverse order.
     """
     # Biosample and link are addressable from the composer's inputs.
@@ -802,7 +802,7 @@ async def _track_composer_outputs(ctx, bs_idx, study_idx, field_name):
     if field_idx is not None and field_idx not in ctx["created"]["biosample_study_field"]:
         ctx["created"]["biosample_study_field"].append(field_idx)
 
-    # Find the owner-id metadata row for this biosample.
+    # Find the owner-biosample-id metadata row for this biosample.
     meta_idx = await ctx["pool"].fetchval(
         "SELECT idx FROM qiita.biosample_metadata"
         " WHERE biosample_idx = $1 AND is_owner_biosample_id = true",
@@ -812,7 +812,7 @@ async def _track_composer_outputs(ctx, bs_idx, study_idx, field_name):
         ctx["created"]["biosample_metadata"].append(meta_idx)
 
 
-async def test_import_biosample_from_owner_id_creates_full_chain(ctx):
+async def test_import_biosample_from_owner_biosample_id_creates_full_chain(ctx):
     field_name = _unique_field_name()
 
     # Compose the import inside a transaction (route layer's responsibility
@@ -821,12 +821,12 @@ async def test_import_biosample_from_owner_id_creates_full_chain(ctx):
     # admin-imports-on-behalf-of-owner case.
     async with ctx["pool"].acquire() as conn:
         async with conn.transaction():
-            bs_idx = await import_biosample_from_owner_id(
+            bs_idx = await import_biosample_from_owner_biosample_id(
                 conn,
                 study_idx=ctx["study_idx"],
                 owner_idx=ctx["biosample_owner_idx"],
-                owner_id_field_name=field_name,
-                owner_id_value="OWNER-XYZ-1",
+                owner_biosample_id_field_name=field_name,
+                owner_biosample_id_value="OWNER-XYZ-1",
                 caller_idx=ctx["principal_idx"],
             )
     await _track_composer_outputs(ctx, bs_idx, ctx["study_idx"], field_name)
@@ -895,19 +895,19 @@ async def test_import_biosample_from_owner_id_creates_full_chain(ctx):
     assert actual == expected
 
 
-async def test_import_biosample_from_owner_id_with_explicit_checklist(ctx):
+async def test_import_biosample_from_owner_biosample_id_with_explicit_checklist(ctx):
     field_name = _unique_field_name()
     bs_acc = _unique_accession("BS")
 
     # Pass through metadata_checklist_idx and biosample_accession on the composer.
     async with ctx["pool"].acquire() as conn:
         async with conn.transaction():
-            bs_idx = await import_biosample_from_owner_id(
+            bs_idx = await import_biosample_from_owner_biosample_id(
                 conn,
                 study_idx=ctx["study_idx"],
                 owner_idx=ctx["biosample_owner_idx"],
-                owner_id_field_name=field_name,
-                owner_id_value="OWNER-CL-1",
+                owner_biosample_id_field_name=field_name,
+                owner_biosample_id_value="OWNER-CL-1",
                 caller_idx=ctx["principal_idx"],
                 metadata_checklist_idx=ctx["checklist_idx"],
                 biosample_accession=bs_acc,
@@ -926,27 +926,27 @@ async def test_import_biosample_from_owner_id_with_explicit_checklist(ctx):
     assert dict(row) == expected
 
 
-async def test_import_biosample_from_owner_id_reuses_local_field_for_same_name(ctx):
+async def test_import_biosample_from_owner_biosample_id_reuses_local_field_for_same_name(ctx):
     field_name = _unique_field_name()
 
-    # Two imports against the same study with the same owner-id field name —
+    # Two imports against the same study with the same owner-biosample-id field name —
     # the second must reuse the field row rather than creating a new one.
     async with ctx["pool"].acquire() as conn:
         async with conn.transaction():
-            bs1 = await import_biosample_from_owner_id(
+            bs1 = await import_biosample_from_owner_biosample_id(
                 conn,
                 study_idx=ctx["study_idx"],
                 owner_idx=ctx["biosample_owner_idx"],
-                owner_id_field_name=field_name,
-                owner_id_value="A",
+                owner_biosample_id_field_name=field_name,
+                owner_biosample_id_value="A",
                 caller_idx=ctx["principal_idx"],
             )
-            bs2 = await import_biosample_from_owner_id(
+            bs2 = await import_biosample_from_owner_biosample_id(
                 conn,
                 study_idx=ctx["study_idx"],
                 owner_idx=ctx["biosample_owner_idx"],
-                owner_id_field_name=field_name,
-                owner_id_value="B",
+                owner_biosample_id_field_name=field_name,
+                owner_biosample_id_value="B",
                 caller_idx=ctx["principal_idx"],
             )
     await _track_composer_outputs(ctx, bs1, ctx["study_idx"], field_name)
@@ -974,30 +974,30 @@ async def test_import_biosample_from_owner_id_reuses_local_field_for_same_name(c
     ]
 
 
-async def test_import_biosample_from_owner_id_creates_distinct_local_fields_for_distinct_names(
+async def test_import_biosample_from_owner_biosample_id_creates_distinct_fields_for_distinct_names(
     ctx,
 ):
-    name_a = _unique_field_name("owner_id_a")
-    name_b = _unique_field_name("owner_id_b")
+    name_a = _unique_field_name("owner_biosample_id_a")
+    name_b = _unique_field_name("owner_biosample_id_b")
 
     # Two imports against the same study with different field names produce
     # two separate field rows.
     async with ctx["pool"].acquire() as conn:
         async with conn.transaction():
-            bs1 = await import_biosample_from_owner_id(
+            bs1 = await import_biosample_from_owner_biosample_id(
                 conn,
                 study_idx=ctx["study_idx"],
                 owner_idx=ctx["biosample_owner_idx"],
-                owner_id_field_name=name_a,
-                owner_id_value="A",
+                owner_biosample_id_field_name=name_a,
+                owner_biosample_id_value="A",
                 caller_idx=ctx["principal_idx"],
             )
-            bs2 = await import_biosample_from_owner_id(
+            bs2 = await import_biosample_from_owner_biosample_id(
                 conn,
                 study_idx=ctx["study_idx"],
                 owner_idx=ctx["biosample_owner_idx"],
-                owner_id_field_name=name_b,
-                owner_id_value="B",
+                owner_biosample_id_field_name=name_b,
+                owner_biosample_id_value="B",
                 caller_idx=ctx["principal_idx"],
             )
     await _track_composer_outputs(ctx, bs1, ctx["study_idx"], name_a)
@@ -1015,7 +1015,7 @@ async def test_import_biosample_from_owner_id_creates_distinct_local_fields_for_
     assert [dict(r) for r in rows] == expected
 
 
-async def test_import_biosample_from_owner_id_rolls_back_on_failed_step(ctx):
+async def test_import_biosample_from_owner_biosample_id_rolls_back_on_failed_step(ctx):
     bs_acc = _unique_accession("BS-rollback")
     bad_study_idx = -1  # nonexistent; the link insert FK will reject it
 
@@ -1024,12 +1024,12 @@ async def test_import_biosample_from_owner_id_rolls_back_on_failed_step(ctx):
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(asyncpg.ForeignKeyViolationError):
             async with conn.transaction():
-                await import_biosample_from_owner_id(
+                await import_biosample_from_owner_biosample_id(
                     conn,
                     study_idx=bad_study_idx,
                     owner_idx=ctx["biosample_owner_idx"],
-                    owner_id_field_name=_unique_field_name(),
-                    owner_id_value="DOOMED",
+                    owner_biosample_id_field_name=_unique_field_name(),
+                    owner_biosample_id_value="DOOMED",
                     caller_idx=ctx["principal_idx"],
                     biosample_accession=bs_acc,
                 )
@@ -1042,7 +1042,7 @@ async def test_import_biosample_from_owner_id_rolls_back_on_failed_step(ctx):
     assert found is None
 
 
-async def test_import_biosample_from_owner_id_uses_independent_field_per_study(ctx):
+async def test_import_biosample_from_owner_biosample_id_uses_independent_field_per_study(ctx):
     field_name = _unique_field_name()
 
     # Seed a second study owned by the same principal so the same display_name
@@ -1055,20 +1055,20 @@ async def test_import_biosample_from_owner_id_uses_independent_field_per_study(c
 
     async with ctx["pool"].acquire() as conn:
         async with conn.transaction():
-            bs1 = await import_biosample_from_owner_id(
+            bs1 = await import_biosample_from_owner_biosample_id(
                 conn,
                 study_idx=ctx["study_idx"],
                 owner_idx=ctx["biosample_owner_idx"],
-                owner_id_field_name=field_name,
-                owner_id_value="STUDY1-1",
+                owner_biosample_id_field_name=field_name,
+                owner_biosample_id_value="STUDY1-1",
                 caller_idx=ctx["principal_idx"],
             )
-            bs2 = await import_biosample_from_owner_id(
+            bs2 = await import_biosample_from_owner_biosample_id(
                 conn,
                 study_idx=second_study_idx,
                 owner_idx=ctx["biosample_owner_idx"],
-                owner_id_field_name=field_name,
-                owner_id_value="STUDY2-1",
+                owner_biosample_id_field_name=field_name,
+                owner_biosample_id_value="STUDY2-1",
                 caller_idx=ctx["principal_idx"],
             )
     await _track_composer_outputs(ctx, bs1, ctx["study_idx"], field_name)
@@ -1089,17 +1089,17 @@ async def test_import_biosample_from_owner_id_uses_independent_field_per_study(c
     assert [dict(r) for r in rows] == expected
 
 
-async def test_import_biosample_from_owner_id_rejects_non_transactional_connection(ctx):
+async def test_import_biosample_from_owner_biosample_id_rejects_non_transactional_connection(ctx):
     # The composer's writes must roll back atomically on partial failure;
     # without a transaction wrapper, a mid-flight failure leaves orphan rows.
     # The fail-fast guard rejects the call before any write happens.
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(RuntimeError, match="transaction"):
-            await import_biosample_from_owner_id(
+            await import_biosample_from_owner_biosample_id(
                 conn,
                 study_idx=ctx["study_idx"],
                 owner_idx=ctx["biosample_owner_idx"],
-                owner_id_field_name=_unique_field_name(),
-                owner_id_value="GUARD-CHECK",
+                owner_biosample_id_field_name=_unique_field_name(),
+                owner_biosample_id_value="GUARD-CHECK",
                 caller_idx=ctx["principal_idx"],
             )

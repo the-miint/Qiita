@@ -153,7 +153,7 @@ async def insert_biosample_metadata_text(
 ) -> int:
     """Insert a text-valued biosample_metadata row and return its idx.
 
-    The biosample_metadata_one_owner_id_per_biosample partial unique index
+    The biosample_metadata_unique_owner_biosample_id partial unique index
     rejects a second is_owner_biosample_id=true row for the same biosample.
     The biosample_metadata_reject_if_link_retired trigger rejects writes
     against retired biosample_to_study links. Both surface as
@@ -179,13 +179,13 @@ async def insert_biosample_metadata_text(
     )
 
 
-async def import_biosample_from_owner_id(
+async def import_biosample_from_owner_biosample_id(
     conn: asyncpg.Connection,
     *,
     study_idx: int,
     owner_idx: int,
-    owner_id_field_name: str,
-    owner_id_value: str,
+    owner_biosample_id_field_name: str,
+    owner_biosample_id_value: str,
     caller_idx: int,
     metadata_checklist_idx: int | None = None,
     biosample_accession: str | None = None,
@@ -195,9 +195,9 @@ async def import_biosample_from_owner_id(
 
     Creates the biosample, links it to the study, finds or creates a local
     biosample_study_field with the supplied display_name (data_type='text',
-    required=True on auto-create), and writes the owner-id metadata value
+    required=True on auto-create), and writes the owner-biosample-id metadata value
     flagged with is_owner_biosample_id=True. The
-    biosample_metadata_one_owner_id_per_biosample partial unique index
+    biosample_metadata_unique_owner_biosample_id partial unique index
     enforces at most one such row per biosample.
 
     The caller must wrap the call in `async with conn.transaction():`; the
@@ -225,21 +225,21 @@ async def import_biosample_from_owner_id(
         created_by_idx=caller_idx,
     )
 
-    # Step c: find or create the local owner-id field on this study.
+    # Step c: find or create the local owner-biosample-id field on this study.
     field_idx = await get_or_create_local_biosample_study_field(
         conn,
         study_idx=study_idx,
-        display_name=owner_id_field_name,
+        display_name=owner_biosample_id_field_name,
         created_by_idx=caller_idx,
         required=True,
     )
 
-    # Step d: write the owner-id metadata row, flagged.
+    # Step d: write the owner-biosample-id metadata row, flagged.
     await insert_biosample_metadata_text(
         conn,
         biosample_idx=bs_idx,
         biosample_study_field_idx=field_idx,
-        value_text=owner_id_value,
+        value_text=owner_biosample_id_value,
         created_by_idx=caller_idx,
         is_owner_biosample_id=True,
     )
