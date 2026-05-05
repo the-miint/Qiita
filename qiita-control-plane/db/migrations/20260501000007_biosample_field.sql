@@ -1,6 +1,25 @@
 -- migrate:up
 
 -- =============================================================================
+-- FIELD DATA TYPE ENUM
+-- =============================================================================
+--
+-- Closed set of value kinds a field may carry. The members map 1:1 to the
+-- value_* columns on the EAV metadata tables (biosample_metadata,
+-- sequenced_sample_metadata): a field declared as a given data_type must have
+-- its value written into the matching value_* column. Adding a new member is
+-- a coordinated schema change (new value_* column on every metadata table,
+-- new arm in the trigger that checks the match), not a per-row decision.
+CREATE TYPE qiita.field_data_type AS ENUM (
+    'text',
+    'numeric',
+    'boolean',
+    'date',
+    'terminology'
+);
+
+
+-- =============================================================================
 -- BIOSAMPLE FIELDS (the field registry, split global vs. study-scoped)
 -- =============================================================================
 
@@ -9,7 +28,7 @@ CREATE TABLE qiita.biosample_global_field (
     internal_name     TEXT NOT NULL,
     display_name      TEXT NOT NULL,
     description       TEXT,
-    data_type         TEXT NOT NULL,
+    data_type         qiita.field_data_type NOT NULL,
     default_tier      qiita.tier NOT NULL DEFAULT 'public',
     required          BOOLEAN NOT NULL DEFAULT false,
     terminology_idx   BIGINT REFERENCES qiita.terminology(idx) ON DELETE RESTRICT,
@@ -18,7 +37,14 @@ CREATE TABLE qiita.biosample_global_field (
 
     CONSTRAINT biosample_global_field_internal_name_unique UNIQUE (internal_name),
     CONSTRAINT biosample_global_field_internal_name_format
-        CHECK (internal_name ~ '^[a-z][a-z0-9_]*$')
+        CHECK (internal_name ~ '^[a-z][a-z0-9_]*$'),
+
+    -- terminology_idx is set iff data_type = 'terminology'. A terminology
+    -- field stores controlled-vocabulary references in
+    -- biosample_metadata.value_terminology_term_idx; non-terminology fields
+    -- never carry a terminology source.
+    CONSTRAINT biosample_global_field_terminology_data_type_consistent
+        CHECK ((data_type = 'terminology') = (terminology_idx IS NOT NULL))
 );
 
 COMMENT ON TABLE qiita.biosample_global_field IS
@@ -40,7 +66,7 @@ CREATE TABLE qiita.biosample_study_field (
     biosample_global_field_idx  BIGINT REFERENCES qiita.biosample_global_field(idx) ON DELETE RESTRICT,
     display_name                TEXT NOT NULL,
     description                 TEXT,
-    data_type                   TEXT,
+    data_type                   qiita.field_data_type,
     required                    BOOLEAN,
     terminology_idx             BIGINT REFERENCES qiita.terminology(idx) ON DELETE RESTRICT,
     tier_override               qiita.tier,
@@ -53,11 +79,14 @@ CREATE TABLE qiita.biosample_study_field (
         UNIQUE (study_idx, display_name),
 
     -- Inheritance rules for linked vs unlinked fields; see table comment.
+    -- The unlinked branch additionally enforces the same
+    -- terminology_idx ↔ data_type='terminology' coupling as the global table.
     CONSTRAINT biosample_study_field_inheritance_consistent
         CHECK (
             (biosample_global_field_idx IS NULL
                 AND data_type IS NOT NULL
-                AND required IS NOT NULL)
+                AND required IS NOT NULL
+                AND (data_type = 'terminology') = (terminology_idx IS NOT NULL))
             OR
             (biosample_global_field_idx IS NOT NULL
                 AND data_type IS NULL
@@ -85,3 +114,4 @@ CREATE INDEX biosample_study_field_global_link_idx
 
 DROP TABLE IF EXISTS qiita.biosample_study_field;
 DROP TABLE IF EXISTS qiita.biosample_global_field;
+DROP TYPE IF EXISTS qiita.field_data_type;

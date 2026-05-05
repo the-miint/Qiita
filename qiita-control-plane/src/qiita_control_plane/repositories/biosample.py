@@ -9,6 +9,7 @@ wrap the call in a transaction.
 """
 
 import asyncpg
+from qiita_common.models import FieldDataType
 
 from . import require_transaction
 
@@ -81,7 +82,7 @@ async def get_or_create_local_biosample_study_field(
     display_name: str,
     created_by_idx: int,
     description: str | None = None,
-    data_type: str = "text",
+    data_type: FieldDataType = FieldDataType.TEXT,
     required: bool = False,
     terminology_idx: int | None = None,
     tier_override: str | None = None,
@@ -91,7 +92,7 @@ async def get_or_create_local_biosample_study_field(
     The lookup branch returns the existing row's idx whether the row is
     currently linked to a biosample_global_field or purely local — a
     downstream metadata write against either kind is well-defined because
-    the biosample_metadata_set_global_field_idx trigger reads from
+    the biosample_metadata_apply_field_contract trigger reads from
     biosample_study_field.biosample_global_field_idx either way.
 
     The create branch produces a purely-local row (biosample_global_field_idx

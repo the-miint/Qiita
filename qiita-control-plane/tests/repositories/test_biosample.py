@@ -5,6 +5,7 @@ import secrets
 import asyncpg
 import pytest
 import pytest_asyncio
+from qiita_common.models import FieldDataType
 
 from qiita_control_plane.repositories.biosample import (
     get_or_create_local_biosample_study_field,
@@ -107,8 +108,13 @@ async def _cleanup_tracked(pool, created):
 
     The order encodes FK dependencies; do not reorder. biosample_to_study
     is composite-keyed so it is handled separately from the idx-keyed sweep.
+    Empty lists for tables a given test does not seed are no-ops via
+    `_delete_idxs`, so the sweep is free for tests that only touch the
+    common biosample surface.
     """
+    # Sweep the EAV value rows first; they reference everything else.
     await _delete_idxs(pool, "biosample_metadata", created["biosample_metadata"])
+    # Field rows reference biosample_global_field and terminology.
     await _delete_idxs(pool, "biosample_study_field", created["biosample_study_field"])
     for bs, st in created["biosample_to_study"]:
         await pool.execute(
@@ -117,6 +123,12 @@ async def _cleanup_tracked(pool, created):
             st,
         )
     await _delete_idxs(pool, "biosample", created["biosample"])
+    # biosample_global_field and terminology_term both reference terminology;
+    # missing_value_reason has no inbound refs left after biosample_metadata.
+    await _delete_idxs(pool, "biosample_global_field", created["biosample_global_field"])
+    await _delete_idxs(pool, "terminology_term", created["terminology_term"])
+    await _delete_idxs(pool, "missing_value_reason", created["missing_value_reason"])
+    await _delete_idxs(pool, "terminology", created["terminology"])
     await _delete_idxs(pool, "study", created["studies"])
 
 
@@ -161,6 +173,10 @@ async def ctx(postgres_pool):
         "biosample_study_field": [],
         "biosample_to_study": [],
         "biosample": [],
+        "biosample_global_field": [],
+        "terminology_term": [],
+        "missing_value_reason": [],
+        "terminology": [],
         "studies": [],
     }
 
@@ -433,6 +449,225 @@ async def test_get_or_create_local_biosample_study_field_returns_existing(ctx):
         field_name,
     )
     assert count == 1
+
+
+# ---------------------------------------------------------------------------
+# biosample_metadata_check_data_type_and_set_global_field_idx trigger
+# ---------------------------------------------------------------------------
+
+
+async def test_biosample_metadata_rejects_value_text_when_data_type_numeric(ctx):
+    bs_idx = await _create_biosample_with_link(ctx)
+
+    # Create a purely-local numeric-typed field. Mismatching the field's
+    # data_type with the populated value_* column must be rejected by the
+    # check_data_type half of the trigger.
+    async with ctx["pool"].acquire() as conn:
+        field_idx = await get_or_create_local_biosample_study_field(
+            conn,
+            study_idx=ctx["study_idx"],
+            display_name=_unique_field_name("num"),
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.NUMERIC,
+            required=True,
+        )
+    ctx["created"]["biosample_study_field"].append(field_idx)
+
+    # Numeric field, value_text populated — trigger raises.
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(asyncpg.RaiseError):
+            await conn.execute(
+                "INSERT INTO qiita.biosample_metadata"
+                " (biosample_idx, biosample_study_field_idx, value_text, created_by_idx)"
+                " VALUES ($1, $2, $3, $4)",
+                bs_idx,
+                field_idx,
+                "should-not-fit",
+                ctx["principal_idx"],
+            )
+
+
+async def test_biosample_metadata_accepts_value_missing_reason_for_any_data_type(ctx):
+    bs_idx = await _create_biosample_with_link(ctx)
+
+    # Create a numeric field, but write a missing-reason row instead of a
+    # value_numeric row. Missing-reason rows are exempt from the data_type match.
+    async with ctx["pool"].acquire() as conn:
+        field_idx = await get_or_create_local_biosample_study_field(
+            conn,
+            study_idx=ctx["study_idx"],
+            display_name=_unique_field_name("num"),
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.NUMERIC,
+            required=True,
+        )
+    ctx["created"]["biosample_study_field"].append(field_idx)
+
+    # Seed a missing-value reason so the metadata row has something to point at.
+    reason_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.missing_value_reason (name) VALUES ($1) RETURNING idx",
+        f"reason_{secrets.token_hex(4)}",
+    )
+    ctx["created"]["missing_value_reason"].append(reason_idx)
+
+    # Insert the missing-reason metadata row; trigger must permit it.
+    async with ctx["pool"].acquire() as conn:
+        meta_idx = await conn.fetchval(
+            "INSERT INTO qiita.biosample_metadata"
+            " (biosample_idx, biosample_study_field_idx, value_missing_reason_idx,"
+            "  created_by_idx)"
+            " VALUES ($1, $2, $3, $4) RETURNING idx",
+            bs_idx,
+            field_idx,
+            reason_idx,
+            ctx["principal_idx"],
+        )
+    ctx["created"]["biosample_metadata"].append(meta_idx)
+
+    # Verify the row landed and points at the reason.
+    row = await ctx["pool"].fetchrow(
+        "SELECT value_numeric, value_missing_reason_idx"
+        " FROM qiita.biosample_metadata WHERE idx = $1",
+        meta_idx,
+    )
+    assert dict(row) == {"value_numeric": None, "value_missing_reason_idx": reason_idx}
+
+
+async def test_biosample_metadata_resolves_data_type_via_global_link(ctx):
+    bs_idx = await _create_biosample_with_link(ctx)
+
+    # Seed a global field with data_type=text, then a study field linked to it.
+    # The linked study field's own data_type is NULL per the inheritance CHECK;
+    # the trigger must resolve data_type via COALESCE to the global side.
+    global_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.biosample_global_field"
+        "  (internal_name, display_name, data_type, created_by_idx)"
+        " VALUES ($1, $2, 'text', $3) RETURNING idx",
+        f"gf_{secrets.token_hex(4)}",
+        "Linked Text Field",
+        ctx["principal_idx"],
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+
+    field_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.biosample_study_field"
+        "  (study_idx, biosample_global_field_idx, display_name, created_by_idx)"
+        " VALUES ($1, $2, $3, $4) RETURNING idx",
+        ctx["study_idx"],
+        global_idx,
+        _unique_field_name("linked"),
+        ctx["principal_idx"],
+    )
+    ctx["created"]["biosample_study_field"].append(field_idx)
+
+    # value_numeric on a text-typed (linked) field — trigger raises.
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(asyncpg.RaiseError):
+            await conn.execute(
+                "INSERT INTO qiita.biosample_metadata"
+                " (biosample_idx, biosample_study_field_idx, value_numeric,"
+                "  created_by_idx)"
+                " VALUES ($1, $2, $3, $4)",
+                bs_idx,
+                field_idx,
+                42,
+                ctx["principal_idx"],
+            )
+
+    # value_text on the same field — trigger permits it; round-trip the
+    # denormalized global_field_idx the trigger sets in the same step.
+    async with ctx["pool"].acquire() as conn:
+        meta_idx = await conn.fetchval(
+            "INSERT INTO qiita.biosample_metadata"
+            " (biosample_idx, biosample_study_field_idx, value_text,"
+            "  created_by_idx)"
+            " VALUES ($1, $2, $3, $4) RETURNING idx",
+            bs_idx,
+            field_idx,
+            "ok",
+            ctx["principal_idx"],
+        )
+    ctx["created"]["biosample_metadata"].append(meta_idx)
+
+    row = await ctx["pool"].fetchrow(
+        "SELECT value_text, global_field_idx FROM qiita.biosample_metadata WHERE idx = $1",
+        meta_idx,
+    )
+    assert dict(row) == {"value_text": "ok", "global_field_idx": global_idx}
+
+
+async def test_biosample_metadata_rejects_value_text_when_data_type_terminology(ctx):
+    bs_idx = await _create_biosample_with_link(ctx)
+
+    # Seed a terminology + one term so the field has a valid terminology_idx
+    # and there is a term_idx available for the success-path insert. This is
+    # the only data_type whose match arm has an FK to a separate vocabulary,
+    # so it is the only one that requires this much auxiliary seeding.
+    terminology_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.terminology (name, version, loaded_at)"
+        " VALUES ($1, $2, now()) RETURNING idx",
+        f"term_{secrets.token_hex(4)}",
+        "v1",
+    )
+    ctx["created"]["terminology"].append(terminology_idx)
+
+    term_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.terminology_term (terminology_idx, term_id, label)"
+        " VALUES ($1, $2, $3) RETURNING idx",
+        terminology_idx,
+        f"TERM:{secrets.token_hex(4)}",
+        "label",
+    )
+    ctx["created"]["terminology_term"].append(term_idx)
+
+    # Create the field via the repository function so the field-table CHECK
+    # `(data_type = 'terminology') = (terminology_idx IS NOT NULL)` is exercised
+    # alongside the trigger.
+    async with ctx["pool"].acquire() as conn:
+        field_idx = await get_or_create_local_biosample_study_field(
+            conn,
+            study_idx=ctx["study_idx"],
+            display_name=_unique_field_name("term"),
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.TERMINOLOGY,
+            terminology_idx=terminology_idx,
+            required=True,
+        )
+    ctx["created"]["biosample_study_field"].append(field_idx)
+
+    # value_text on a terminology-typed field — trigger raises.
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(asyncpg.RaiseError):
+            await conn.execute(
+                "INSERT INTO qiita.biosample_metadata"
+                " (biosample_idx, biosample_study_field_idx, value_text,"
+                "  created_by_idx)"
+                " VALUES ($1, $2, $3, $4)",
+                bs_idx,
+                field_idx,
+                "should-not-fit",
+                ctx["principal_idx"],
+            )
+
+    # value_terminology_term_idx on the same field — trigger permits it.
+    async with ctx["pool"].acquire() as conn:
+        meta_idx = await conn.fetchval(
+            "INSERT INTO qiita.biosample_metadata"
+            " (biosample_idx, biosample_study_field_idx,"
+            "  value_terminology_term_idx, created_by_idx)"
+            " VALUES ($1, $2, $3, $4) RETURNING idx",
+            bs_idx,
+            field_idx,
+            term_idx,
+            ctx["principal_idx"],
+        )
+    ctx["created"]["biosample_metadata"].append(meta_idx)
+
+    row = await ctx["pool"].fetchrow(
+        "SELECT value_terminology_term_idx FROM qiita.biosample_metadata WHERE idx = $1",
+        meta_idx,
+    )
+    assert dict(row) == {"value_terminology_term_idx": term_idx}
 
 
 # ---------------------------------------------------------------------------

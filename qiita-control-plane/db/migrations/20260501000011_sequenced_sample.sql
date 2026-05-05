@@ -288,32 +288,74 @@ CREATE TRIGGER sequenced_sample_field_exception_set_updated_at
 
 
 -- =============================================================================
--- TRIGGER: maintain sequenced_sample_metadata.global_field_idx
+-- TRIGGER: sequenced_sample_metadata_apply_field_contract
 --
--- Denormalization of sequenced_sample_study_field.sequenced_sample_global_field_idx
--- onto sequenced_sample_metadata.global_field_idx. Populated on insert/update
--- of metadata rows, and propagated on updates to the source study_field's
--- global link. Parallel to the biosample-side pair.
+-- Parallel to biosample_metadata_apply_field_contract; see that trigger's
+-- comment for the full responsibilities. One SELECT against the source
+-- sequenced_sample_study_field row drives both:
+--
+--   1. CHECK that the populated value_* column matches the field's data_type
+--      (resolved via COALESCE across study- and global-field rows).
+--   2. SET NEW.global_field_idx from the source study_field's
+--      sequenced_sample_global_field_idx.
+--
+-- Missing-reason rows are exempt from the data_type match.
 -- =============================================================================
 
-CREATE OR REPLACE FUNCTION qiita.sequenced_sample_metadata_set_global_field_idx()
+CREATE OR REPLACE FUNCTION qiita.sequenced_sample_metadata_apply_field_contract()
 RETURNS TRIGGER AS $$
+DECLARE
+    expected_data_type qiita.field_data_type;
+    populated_ok      BOOLEAN;
 BEGIN
-    SELECT sequenced_sample_global_field_idx
-      INTO NEW.global_field_idx
-      FROM qiita.sequenced_sample_study_field
-     WHERE idx = NEW.sequenced_sample_study_field_idx;
+    -- Single SELECT covers both responsibilities.
+    SELECT ssf.sequenced_sample_global_field_idx,
+           COALESCE(ssf.data_type, sgf.data_type)
+      INTO NEW.global_field_idx, expected_data_type
+      FROM qiita.sequenced_sample_study_field ssf
+      LEFT JOIN qiita.sequenced_sample_global_field sgf
+        ON sgf.idx = ssf.sequenced_sample_global_field_idx
+     WHERE ssf.idx = NEW.sequenced_sample_study_field_idx;
+
+    -- Missing-reason rows are exempt from the value/data_type match.
+    IF NEW.value_missing_reason_idx IS NOT NULL THEN
+        RETURN NEW;
+    END IF;
+
+    -- Verify the populated value column matches the field's data_type.
+    -- ELSE NULL + IS NOT TRUE so an unrecognized or NULL data_type fails
+    -- loudly rather than passing through (which a bare CASE + IF NOT
+    -- populated_ok would do, since NOT NULL is NULL is not TRUE).
+    populated_ok := CASE expected_data_type
+        WHEN 'text'        THEN NEW.value_text IS NOT NULL
+        WHEN 'numeric'     THEN NEW.value_numeric IS NOT NULL
+        WHEN 'boolean'     THEN NEW.value_boolean IS NOT NULL
+        WHEN 'date'        THEN NEW.value_date IS NOT NULL
+        WHEN 'terminology' THEN NEW.value_terminology_term_idx IS NOT NULL
+        ELSE NULL
+    END;
+    IF populated_ok IS NOT TRUE THEN
+        RAISE EXCEPTION
+            'sequenced_sample_metadata value column does not match field data_type % for sequenced_sample_study_field_idx %',
+            expected_data_type, NEW.sequenced_sample_study_field_idx;
+    END IF;
+
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER sequenced_sample_metadata_set_global_field_idx_insert
+CREATE TRIGGER sequenced_sample_metadata_apply_field_contract_insert
     BEFORE INSERT ON qiita.sequenced_sample_metadata
-    FOR EACH ROW EXECUTE FUNCTION qiita.sequenced_sample_metadata_set_global_field_idx();
+    FOR EACH ROW EXECUTE FUNCTION qiita.sequenced_sample_metadata_apply_field_contract();
 
-CREATE TRIGGER sequenced_sample_metadata_set_global_field_idx_update
-    BEFORE UPDATE OF sequenced_sample_study_field_idx ON qiita.sequenced_sample_metadata
-    FOR EACH ROW EXECUTE FUNCTION qiita.sequenced_sample_metadata_set_global_field_idx();
+-- The UPDATE trigger fires when any value_* column or the source field
+-- changes — both are inputs to the data_type check.
+CREATE TRIGGER sequenced_sample_metadata_apply_field_contract_update
+    BEFORE UPDATE OF sequenced_sample_study_field_idx, value_text, value_numeric,
+                     value_boolean, value_date, value_terminology_term_idx,
+                     value_missing_reason_idx
+        ON qiita.sequenced_sample_metadata
+    FOR EACH ROW EXECUTE FUNCTION qiita.sequenced_sample_metadata_apply_field_contract();
 
 
 CREATE OR REPLACE FUNCTION qiita.propagate_global_field_link_to_sequenced_sample_metadata()
@@ -560,6 +602,6 @@ DROP FUNCTION IF EXISTS qiita.sequenced_sample_metadata_reject_key_update();
 DROP FUNCTION IF EXISTS qiita.sequenced_sample_metadata_reject_if_link_retired();
 DROP FUNCTION IF EXISTS qiita.sequenced_sample_to_study_retirement_demote_globals();
 DROP FUNCTION IF EXISTS qiita.propagate_global_field_link_to_sequenced_sample_metadata();
-DROP FUNCTION IF EXISTS qiita.sequenced_sample_metadata_set_global_field_idx();
+DROP FUNCTION IF EXISTS qiita.sequenced_sample_metadata_apply_field_contract();
 DROP FUNCTION IF EXISTS qiita.sequenced_sample_clear_submission_error_on_new_attempt();
 DROP FUNCTION IF EXISTS qiita.sequenced_sample_metadata_touch_sequenced_sample();
