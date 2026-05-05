@@ -27,8 +27,8 @@ async def _seed_principal(pool, display_name, *, created_by_idx):
     """Insert a qiita.principal row with the given parent, return its idx.
 
     The parent is required so callers cannot accidentally seed a root
-    principal; the system principal seeded at idx=1 by
-    20260426000000_auth.sql is the standard root for test fixtures.
+    principal; the system principal at idx=1 is the standard root for
+    test fixtures.
     """
     return await pool.fetchval(
         "INSERT INTO qiita.principal (display_name, created_by_idx) VALUES ($1, $2) RETURNING idx",
