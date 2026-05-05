@@ -98,23 +98,27 @@ async def get_or_create_local_biosample_study_field(
     NULL); creating a globally-linked row is a separate operation because
     its non-null inputs are the inverse set per the
     biosample_study_field_inheritance_consistent CHECK.
-    """
-    # Lookup branch — natural key is (study_idx, display_name).
-    existing = await conn.fetchval(
-        "SELECT idx FROM qiita.biosample_study_field WHERE study_idx = $1 AND display_name = $2",
-        study_idx,
-        display_name,
-    )
-    if existing is not None:
-        return existing
 
+    Concurrency: the natural-key UNIQUE constraint
+    biosample_study_field_display_name_unique can race two concurrent callers
+    for the same (study_idx, display_name). Implemented as
+    INSERT ... ON CONFLICT DO NOTHING RETURNING idx with a fallback SELECT on
+    miss so concurrent callers converge on the same idx without surfacing
+    UniqueViolationError. Race-free under READ COMMITTED (the project default,
+    set in qiita_control_plane.db); under REPEATABLE READ / SERIALIZABLE the
+    fallback SELECT could miss a row committed after the transaction snapshot
+    and a different pattern would be required.
+    """
     # Create branch — purely-local row, biosample_global_field_idx left NULL.
-    return await conn.fetchval(
+    # ON CONFLICT DO NOTHING absorbs the unique-constraint hit so the
+    # concurrent loser of the race does not raise.
+    idx = await conn.fetchval(
         "INSERT INTO qiita.biosample_study_field ("
         "    study_idx, display_name, description,"
         "    data_type, required, terminology_idx, tier_override,"
         "    created_by_idx"
         ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        " ON CONFLICT (study_idx, display_name) DO NOTHING"
         " RETURNING idx",
         study_idx,
         display_name,
@@ -124,6 +128,16 @@ async def get_or_create_local_biosample_study_field(
         terminology_idx,
         tier_override,
         created_by_idx,
+    )
+    if idx is not None:
+        return idx
+
+    # Lookup branch — fallback fires only on conflict; takes a fresh snapshot
+    # under READ COMMITTED so it sees the row the concurrent winner committed.
+    return await conn.fetchval(
+        "SELECT idx FROM qiita.biosample_study_field WHERE study_idx = $1 AND display_name = $2",
+        study_idx,
+        display_name,
     )
 
 
