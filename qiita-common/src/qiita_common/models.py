@@ -37,6 +37,23 @@ class ReferenceStatus(StrEnum):
     FAILED = "failed"
 
 
+class FieldDataType(StrEnum):
+    """Closed set of value kinds a biosample/sequenced_sample field may carry.
+
+    Mirrors the Postgres `qiita.field_data_type` enum. Members map 1:1 to the
+    value_* columns on the EAV metadata tables: a field with this data_type
+    must have its value written into the matching value_* column. The match
+    is enforced at write time by the biosample_metadata_apply_field_contract
+    trigger (and its sequenced-sample twin).
+    """
+
+    TEXT = "text"
+    NUMERIC = "numeric"
+    BOOLEAN = "boolean"
+    DATE = "date"
+    TERMINOLOGY = "terminology"
+
+
 ReferenceKind = Literal["sequence_reference", "taxonomy_authority"]
 
 

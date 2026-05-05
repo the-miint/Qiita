@@ -7,7 +7,7 @@
 CREATE TABLE qiita.biosample (
     idx                      BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     owner_idx                BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
-    metadata_checklist_idx   BIGINT NOT NULL REFERENCES qiita.metadata_checklist(idx) ON DELETE RESTRICT,
+    metadata_checklist_idx   BIGINT REFERENCES qiita.metadata_checklist(idx) ON DELETE RESTRICT,
     biosample_accession      VARCHAR(50),
     ena_sample_accession     VARCHAR(50),
     -- Submission tracking for NCBI BioSample deposit. last_submission_at is NULL
@@ -150,6 +150,7 @@ CREATE TABLE qiita.biosample_metadata (
     value_date                   DATE,
     value_terminology_term_idx   BIGINT REFERENCES qiita.terminology_term(idx) ON DELETE RESTRICT,
     value_missing_reason_idx     BIGINT REFERENCES qiita.missing_value_reason(idx) ON DELETE RESTRICT,
+    is_owner_biosample_id        BOOLEAN NOT NULL DEFAULT false,
     created_by_idx               BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
     created_at                   TIMESTAMPTZ NOT NULL DEFAULT now(),
 
@@ -181,6 +182,12 @@ COMMENT ON COLUMN qiita.biosample_metadata.global_field_idx IS
     'one value per (biosample, global concept) pair across all studies, so cross-study '
     'reads through the global field always return a single canonical value.';
 
+COMMENT ON COLUMN qiita.biosample_metadata.is_owner_biosample_id IS
+    'True iff this metadata row holds the owner''s identifier for this biosample. '
+    'The biosample_metadata_one_owner_id_per_biosample partial unique index '
+    'enforces at most one true row per biosample_idx; rows with this flag false '
+    'are unrestricted.';
+
 CREATE INDEX biosample_metadata_field_idx
     ON qiita.biosample_metadata (biosample_study_field_idx);
 CREATE INDEX biosample_metadata_terminology_value_idx
@@ -200,6 +207,15 @@ CREATE INDEX biosample_metadata_terminology_value_idx
 CREATE UNIQUE INDEX biosample_metadata_one_value_per_global_concept
     ON qiita.biosample_metadata (biosample_idx, global_field_idx)
     WHERE global_field_idx IS NOT NULL;
+
+-- Each biosample has at most one metadata row flagged as the owner's
+-- identifier-for-this-biosample. The flag is application-maintained;
+-- the partial UNIQUE index makes a second 'true' row for the same
+-- biosample fail at the schema layer rather than relying on caller
+-- discipline. Rows with is_owner_biosample_id = false are unrestricted.
+CREATE UNIQUE INDEX biosample_metadata_one_owner_id_per_biosample
+    ON qiita.biosample_metadata (biosample_idx)
+    WHERE is_owner_biosample_id = true;
 
 
 -- =============================================================================
@@ -271,39 +287,88 @@ CREATE TRIGGER biosample_field_exception_set_updated_at
 
 
 -- =============================================================================
--- TRIGGER: maintain biosample_metadata.global_field_idx
+-- TRIGGER: biosample_metadata_apply_field_contract
 --
--- The global_field_idx column on biosample_metadata is a denormalization of
--- biosample_study_field.biosample_global_field_idx, copied at insert/update
--- time. It cannot be a true GENERATED column because PostgreSQL generated
--- columns cannot reference values from other tables. The trigger below
--- populates it from the source study field row whenever a metadata row is
--- inserted or its source field changes.
+-- "Field contract" = the constraints the source biosample_study_field row
+-- (and any linked biosample_global_field) imposes on every metadata row that
+-- references it. Two responsibilities, both keyed off the source field row
+-- (the FK target of biosample_metadata.biosample_study_field_idx) so they
+-- share a single SELECT:
 --
--- A second trigger on biosample_study_field propagates changes to dependent
--- metadata rows in the (rare) case that a study field's global link is
--- updated after metadata has already been written. This keeps the
--- denormalization consistent with the source of truth.
+--   1. CHECK: the populated value_* column matches the field's data_type.
+--      data_type is resolved via COALESCE(study_field.data_type,
+--      global_field.data_type) so the same trigger covers both purely-local
+--      study fields (which own data_type) and globally-linked ones (which
+--      inherit it from the linked global concept; see the
+--      biosample_study_field_inheritance_consistent CHECK). Rows with
+--      value_missing_reason_idx populated are exempt — a missing reason
+--      applies to any data_type and does not occupy a typed value column.
+--
+--   2. SET: NEW.global_field_idx is denormalized from the source study
+--      field's biosample_global_field_idx. Cannot be a GENERATED column
+--      because PostgreSQL generated columns cannot reference other tables.
+--
+-- A separate trigger on biosample_study_field
+-- (propagate_global_field_link_to_biosample_metadata) keeps the
+-- denormalization consistent if a study field's global link is updated
+-- after metadata has already been written.
 -- =============================================================================
 
-CREATE OR REPLACE FUNCTION qiita.biosample_metadata_set_global_field_idx()
+CREATE OR REPLACE FUNCTION qiita.biosample_metadata_apply_field_contract()
 RETURNS TRIGGER AS $$
+DECLARE
+    expected_data_type qiita.field_data_type;
+    populated_ok      BOOLEAN;
 BEGIN
-    SELECT biosample_global_field_idx
-      INTO NEW.global_field_idx
-      FROM qiita.biosample_study_field
-     WHERE idx = NEW.biosample_study_field_idx;
+    -- Single SELECT covers both responsibilities: the global link and the
+    -- resolved data_type for the source field row.
+    SELECT bsf.biosample_global_field_idx,
+           COALESCE(bsf.data_type, bgf.data_type)
+      INTO NEW.global_field_idx, expected_data_type
+      FROM qiita.biosample_study_field bsf
+      LEFT JOIN qiita.biosample_global_field bgf
+        ON bgf.idx = bsf.biosample_global_field_idx
+     WHERE bsf.idx = NEW.biosample_study_field_idx;
+
+    -- Missing-reason rows are exempt from the value/data_type match.
+    IF NEW.value_missing_reason_idx IS NOT NULL THEN
+        RETURN NEW;
+    END IF;
+
+    -- Verify the populated value column matches the field's data_type.
+    -- ELSE NULL + IS NOT TRUE so an unrecognized or NULL data_type fails
+    -- loudly rather than passing through (which a bare CASE + IF NOT
+    -- populated_ok would do, since NOT NULL is NULL is not TRUE).
+    populated_ok := CASE expected_data_type
+        WHEN 'text'        THEN NEW.value_text IS NOT NULL
+        WHEN 'numeric'     THEN NEW.value_numeric IS NOT NULL
+        WHEN 'boolean'     THEN NEW.value_boolean IS NOT NULL
+        WHEN 'date'        THEN NEW.value_date IS NOT NULL
+        WHEN 'terminology' THEN NEW.value_terminology_term_idx IS NOT NULL
+        ELSE NULL
+    END;
+    IF populated_ok IS NOT TRUE THEN
+        RAISE EXCEPTION
+            'biosample_metadata value column does not match field data_type % for biosample_study_field_idx %',
+            expected_data_type, NEW.biosample_study_field_idx;
+    END IF;
+
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE TRIGGER biosample_metadata_set_global_field_idx_insert
+CREATE TRIGGER biosample_metadata_apply_field_contract_insert
     BEFORE INSERT ON qiita.biosample_metadata
-    FOR EACH ROW EXECUTE FUNCTION qiita.biosample_metadata_set_global_field_idx();
+    FOR EACH ROW EXECUTE FUNCTION qiita.biosample_metadata_apply_field_contract();
 
-CREATE TRIGGER biosample_metadata_set_global_field_idx_update
-    BEFORE UPDATE OF biosample_study_field_idx ON qiita.biosample_metadata
-    FOR EACH ROW EXECUTE FUNCTION qiita.biosample_metadata_set_global_field_idx();
+-- The UPDATE trigger fires when any value_* column or the source field
+-- changes — both are inputs to the data_type check.
+CREATE TRIGGER biosample_metadata_apply_field_contract_update
+    BEFORE UPDATE OF biosample_study_field_idx, value_text, value_numeric,
+                     value_boolean, value_date, value_terminology_term_idx,
+                     value_missing_reason_idx
+        ON qiita.biosample_metadata
+    FOR EACH ROW EXECUTE FUNCTION qiita.biosample_metadata_apply_field_contract();
 
 
 CREATE OR REPLACE FUNCTION qiita.propagate_global_field_link_to_biosample_metadata()
@@ -522,7 +587,7 @@ DROP TABLE IF EXISTS qiita.biosample;
 DROP FUNCTION IF EXISTS qiita.biosample_metadata_reject_if_link_retired();
 DROP FUNCTION IF EXISTS qiita.biosample_to_study_retirement_demote_globals();
 DROP FUNCTION IF EXISTS qiita.propagate_global_field_link_to_biosample_metadata();
-DROP FUNCTION IF EXISTS qiita.biosample_metadata_set_global_field_idx();
+DROP FUNCTION IF EXISTS qiita.biosample_metadata_apply_field_contract();
 DROP FUNCTION IF EXISTS qiita.biosample_clear_submission_error_on_new_attempt();
 DROP FUNCTION IF EXISTS qiita.biosample_metadata_reject_key_update();
 DROP FUNCTION IF EXISTS qiita.biosample_metadata_touch_biosample();
