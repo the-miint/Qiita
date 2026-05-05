@@ -5,6 +5,7 @@ import secrets
 import asyncpg
 import pytest
 import pytest_asyncio
+from qiita_common.auth_constants import SystemRole
 from qiita_common.models import FieldDataType
 
 from qiita_control_plane.repositories.biosample import (
@@ -145,10 +146,10 @@ async def ctx(postgres_pool):
     across re-runs) plus an empty `created` dict the test populates with idxs
     of any rows it inserts. Cleanup runs in FK-reverse order after the test.
 
-    principal_idx is promoted to user-kind via a qiita.user row so it can
-    serve as study.owner_idx (the role-typed FK trigger on that column
-    rejects bare principals). biosample_owner_idx stays bare;
-    biosample.owner_idx is not in the role-typed-FK registry.
+    Both principals are promoted to user-kind via qiita.user rows so
+    they can serve as study.owner_idx and biosample.owner_idx; the
+    role-typed FK triggers on those columns reject non-user-kind
+    principals.
     """
     # Token-suffixed names avoid UNIQUE collisions if a prior run leaked rows.
     # Two principals are seeded so composer tests can exercise the case where
@@ -161,6 +162,7 @@ async def ctx(postgres_pool):
     biosample_owner_idx = await _seed_principal(
         postgres_pool, f"bs-owner-{token}", created_by_idx=principal_idx
     )
+    await _seed_user(postgres_pool, biosample_owner_idx, f"bs-owner-{token}@test.local")
     study_idx = await _seed_study(postgres_pool, principal_idx, f"bs-{token}")
     checklist_idx = await _seed_metadata_checklist(postgres_pool, f"bs-{token}")
 
@@ -193,11 +195,15 @@ async def ctx(postgres_pool):
     await _cleanup_tracked(postgres_pool, created)
     await _delete_idxs(postgres_pool, "metadata_checklist", checklist_idx)
     await _delete_idxs(postgres_pool, "study", study_idx)
-    # qiita.user → qiita.principal is ON DELETE RESTRICT, so the user row
-    # must go before the principal it references. The role-typed
-    # user_no_delete_if_study_owner trigger already passes because the
-    # study row above has been removed.
-    await postgres_pool.execute("DELETE FROM qiita.user WHERE principal_idx = $1", principal_idx)
+    # qiita.user → qiita.principal is ON DELETE RESTRICT, so the user rows
+    # must go before the principals they reference. The role-typed
+    # user_no_delete_if_study_owner and user_no_delete_if_biosample_owner
+    # triggers pass because the study and biosample rows above have already
+    # been removed.
+    await postgres_pool.execute(
+        "DELETE FROM qiita.user WHERE principal_idx = ANY($1::bigint[])",
+        [principal_idx, biosample_owner_idx],
+    )
     # principal FK is DEFERRABLE INITIALLY DEFERRED, so deleting both rows in
     # one statement is fine — the biosample_owner_idx → principal_idx
     # reference is checked at commit, after both rows are gone.
@@ -1103,3 +1109,191 @@ async def test_import_biosample_from_owner_biosample_id_rejects_non_transactiona
                 owner_biosample_id_value="GUARD-CHECK",
                 caller_idx=ctx["principal_idx"],
             )
+
+
+# ===========================================================================
+# Role-typed FK triggers — qiita.biosample.owner_idx
+# ===========================================================================
+#
+# Tests below use Pattern 1 (transaction-rollback per test): all seed and
+# assertions happen inside a single transaction that is rolled back at the
+# end, with no shared fixture and no FK-reverse cleanup. The rest of this
+# file uses Pattern 2 (committed `ctx` fixture + FK-reverse cleanup).
+# Pattern 1 fits trigger tests because triggers fire per-statement and the
+# test does not need to commit; Pattern 2 is needed elsewhere — notably
+# `test_import_biosample_from_owner_biosample_id_rejects_non_transactional_connection`,
+# which calls the composer outside a transaction (impossible in Pattern 1).
+# Helpers below are conn-style and prefixed `_create_*` / `_insert_*`,
+# distinct from the pool-style `_seed_*` helpers used by Pattern-2 tests.
+
+
+_SYSTEM_PRINCIPAL_IDX = 1
+
+
+def _trigger_test_suffix(label: str) -> str:
+    return f"{label}-{secrets.token_hex(4)}"
+
+
+async def _create_user(conn) -> int:
+    """Pattern-1 helper: create a user-kind principal via one connection."""
+    name = _trigger_test_suffix("user")
+    pidx = await conn.fetchval(
+        "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
+        " VALUES ($1, $2, $3) RETURNING idx",
+        name,
+        SystemRole.USER,
+        _SYSTEM_PRINCIPAL_IDX,
+    )
+    await conn.execute(
+        "INSERT INTO qiita.user (principal_idx, email) VALUES ($1, $2)",
+        pidx,
+        f"{name}@example.com",
+    )
+    return pidx
+
+
+async def _create_service_account(conn) -> int:
+    name = _trigger_test_suffix("svc")
+    pidx = await conn.fetchval(
+        "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
+        " VALUES ($1, $2, $3) RETURNING idx",
+        name,
+        SystemRole.USER,
+        _SYSTEM_PRINCIPAL_IDX,
+    )
+    await conn.execute(
+        "INSERT INTO qiita.service_account (principal_idx, name) VALUES ($1, $2)",
+        pidx,
+        name,
+    )
+    return pidx
+
+
+async def _create_bare_principal(conn) -> int:
+    """Pattern-1 helper: principal with no subtype row."""
+    return await conn.fetchval(
+        "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
+        " VALUES ($1, $2, $3) RETURNING idx",
+        _trigger_test_suffix("bare"),
+        SystemRole.USER,
+        _SYSTEM_PRINCIPAL_IDX,
+    )
+
+
+async def _insert_biosample_row(
+    conn,
+    *,
+    owner_idx: int,
+    created_by_idx: int = _SYSTEM_PRINCIPAL_IDX,
+) -> int:
+    """Pattern-1 helper: raw INSERT into qiita.biosample bypassing the
+    repository function. The local name avoids collision with the
+    imported `insert_biosample` repository function used elsewhere."""
+    return await conn.fetchval(
+        "INSERT INTO qiita.biosample (owner_idx, created_by_idx) VALUES ($1, $2) RETURNING idx",
+        owner_idx,
+        created_by_idx,
+    )
+
+
+async def test_biosample_owner_must_be_user_accepts_user(postgres_pool):
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            bs_idx = await _insert_biosample_row(conn, owner_idx=owner)
+            assert bs_idx is not None
+        finally:
+            await tr.rollback()
+
+
+async def test_biosample_owner_must_be_user_rejects_service_account(postgres_pool):
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            svc = await _create_service_account(conn)
+            with pytest.raises(asyncpg.RaiseError, match="must reference a user-kind principal"):
+                await _insert_biosample_row(conn, owner_idx=svc)
+        finally:
+            await tr.rollback()
+
+
+async def test_biosample_owner_must_be_user_rejects_bare_principal(postgres_pool):
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            bare = await _create_bare_principal(conn)
+            with pytest.raises(asyncpg.RaiseError, match="must reference a user-kind principal"):
+                await _insert_biosample_row(conn, owner_idx=bare)
+        finally:
+            await tr.rollback()
+
+
+async def test_biosample_update_owner_to_service_account_raises(postgres_pool):
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            svc = await _create_service_account(conn)
+            bs_idx = await _insert_biosample_row(conn, owner_idx=owner)
+            with pytest.raises(asyncpg.RaiseError, match="must reference a user-kind principal"):
+                await conn.execute(
+                    "UPDATE qiita.biosample SET owner_idx = $1 WHERE idx = $2",
+                    svc,
+                    bs_idx,
+                )
+        finally:
+            await tr.rollback()
+
+
+async def test_user_delete_blocked_when_referenced_as_biosample_owner(postgres_pool):
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            await _insert_biosample_row(conn, owner_idx=owner)
+            with pytest.raises(asyncpg.RaiseError, match="cannot delete qiita.user"):
+                await conn.execute("DELETE FROM qiita.user WHERE principal_idx = $1", owner)
+        finally:
+            await tr.rollback()
+
+
+async def test_user_delete_succeeds_after_biosample_gone(postgres_pool):
+    # Once the biosample referencing the user has been removed, the trigger
+    # has nothing to block on and the user delete proceeds.
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            bs_idx = await _insert_biosample_row(conn, owner_idx=owner)
+            await conn.execute("DELETE FROM qiita.biosample WHERE idx = $1", bs_idx)
+            await conn.execute("DELETE FROM qiita.user WHERE principal_idx = $1", owner)
+            still_there = await conn.fetchval(
+                "SELECT 1 FROM qiita.user WHERE principal_idx = $1", owner
+            )
+            assert still_there is None
+        finally:
+            await tr.rollback()
+
+
+async def test_biosample_created_by_idx_accepts_service_account(postgres_pool):
+    # created_by_idx is intentionally NOT registered in the role-typed FK
+    # trigger system: bulk imports and admin tools legitimately set it to
+    # a service account or the system principal. Asserts the carve-out so
+    # an accidental future registration would fail the suite.
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            svc = await _create_service_account(conn)
+            bs_idx = await _insert_biosample_row(conn, owner_idx=owner, created_by_idx=svc)
+            assert bs_idx is not None
+        finally:
+            await tr.rollback()

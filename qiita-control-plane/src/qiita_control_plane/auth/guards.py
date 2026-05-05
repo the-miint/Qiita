@@ -14,8 +14,13 @@ underlying resolution per-request even when many guards compose.
 
 from collections.abc import Callable
 
+import asyncpg
 from fastapi import Depends, HTTPException
+from qiita_common.auth_constants import SystemRole
+from qiita_common.models import Tier
 
+from ..deps import get_db_pool
+from ..repositories.study_access import fetch_caller_study_access
 from .principal import (
     Anonymous,
     HumanUser,
@@ -177,3 +182,74 @@ def require_complete_profile(
             },
         )
     return user
+
+
+# ---------------------------------------------------------------------------
+# Resource-access guards
+# ---------------------------------------------------------------------------
+# Unlike the kind/role/scope guards above, resource-access guards consult
+# the DB to evaluate the caller's relationship to a specific resource
+# named in the path. system_admin bypasses the resource check entirely;
+# the resource owner bypasses the tier comparison; otherwise the caller's
+# tier (or 'public' by absence of a row) is compared against min_tier.
+
+
+# Strict ordering by privilege; mirrors the qiita.tier enum order. The
+# integer ranks let the guard compare tiers with a plain >= rather than
+# relying on enum-string ordering.
+_TIER_ORDER = {
+    Tier.PUBLIC: 0,
+    Tier.VIEWER: 1,
+    Tier.MEMBER: 2,
+    Tier.ADMIN: 3,
+}
+
+
+def require_study_access(min_tier: Tier) -> Callable[..., None]:
+    """Factory: returns a dep that gates the route on the caller's tier
+    of access to the path's `study_idx`.
+
+    Behavior, in order: 401 on Anonymous; system_admin bypass (skips the
+    DB lookup); 404 if the study does not exist; owner bypass (caller is
+    the study's owner); 403 if the caller's effective tier is below
+    `min_tier`. A caller with no qiita.study_access row has effective
+    tier `Tier.PUBLIC` by absence — meets `min_tier=Tier.PUBLIC`, fails
+    everything higher.
+    """
+
+    async def _dep(
+        study_idx: int,
+        p: Principal = Depends(get_current_principal),
+        pool: asyncpg.Pool = Depends(get_db_pool),
+    ) -> None:
+        # 401 on Anonymous.
+        if isinstance(p, Anonymous):
+            raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
+
+        # System-admin bypass — no DB lookup needed.
+        if p.has_role_at_least(SystemRole.SYSTEM_ADMIN):
+            return
+
+        # Fetch the study + caller's access row in one round trip.
+        row = await fetch_caller_study_access(
+            pool, principal_idx=p.principal_idx, study_idx=study_idx
+        )
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"study {study_idx} not found",
+            )
+
+        # Owner bypass — study owner authorized at every tier.
+        if row.owner_idx == p.principal_idx:
+            return
+
+        # Tier comparison — public-by-absence when no study_access row.
+        effective_tier = row.access_tier if row.access_tier is not None else Tier.PUBLIC
+        if _TIER_ORDER[effective_tier] < _TIER_ORDER[min_tier]:
+            raise HTTPException(
+                status_code=403,
+                detail=f"requires study access at tier {str(min_tier)!r} or higher",
+            )
+
+    return _dep

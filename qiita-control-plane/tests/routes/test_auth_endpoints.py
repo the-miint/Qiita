@@ -435,6 +435,12 @@ async def test_post_pat_rejects_unknown_scope(auth_client, postgres_pool, jwks_h
 
 
 async def test_post_pat_default_scopes_match_role_ceiling(auth_client, postgres_pool, jwks_harness):
+    # Compare against role_ceiling(...) rather than a hand-enumerated set
+    # so adding a scope to the USER ceiling does not require updating this
+    # test. The contract under test is "default-mint == caller's full
+    # ceiling", whatever that ceiling currently is.
+    from qiita_control_plane.auth.scopes import role_ceiling
+
     pidx = await _seed_user(
         postgres_pool,
         email="pat-default-scopes@example.com",
@@ -456,11 +462,7 @@ async def test_post_pat_default_scopes_match_role_ceiling(auth_client, postgres_
         json={"label": "default-scopes"},
     )
     assert resp.status_code == 201
-    assert set(resp.json()["scopes"]) == {
-        Scope.SELF_PROFILE,
-        Scope.SELF_TOKEN,
-        Scope.REFERENCE_READ,
-    }
+    assert set(resp.json()["scopes"]) == set(role_ceiling(SystemRole.USER))
 
 
 async def test_post_pat_system_admin_role_ceiling_includes_lower_role_scopes(

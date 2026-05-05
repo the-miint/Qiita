@@ -1,17 +1,17 @@
-"""Tests for the role-typed FK triggers introduced by 20260429000000.
+"""DB-bound trigger tests for qiita.study.
 
-Two triggers are exercised together:
+Exercises the role-typed FK triggers attached to qiita.study(owner_idx)
+and qiita.study(principal_investigator_idx), plus the
+qiita.user-delete-blocking trigger that fires when a study still
+references a user.
 
-- `tg_principal_must_be_user`: attached to qiita.study(owner_idx) and
-  qiita.study(principal_investigator_idx). Raises if either column is
-  set to a principal that has no qiita.user row.
-
-- `tg_user_role_ref_blocks_delete`: attached to qiita.user. Raises if a
-  qiita.user row is deleted while any registered consumer column still
-  references its principal_idx.
-
-Each test runs in its own transaction and rolls back, so seeded
-principals and studies don't leak across cases.
+Tests use Pattern 1 (transaction-rollback per test): all seed and
+assertions happen inside a single transaction that is rolled back at
+the end. No shared fixture, no FK-reverse cleanup. This pattern fits
+trigger tests because triggers fire per-statement and the test does not
+need to commit. Tests that exercise commit-time behavior or
+cross-transaction scenarios use Pattern 2 (committed fixture +
+FK-reverse cleanup) — see tests/repositories/test_biosample.py.
 """
 
 import secrets

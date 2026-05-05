@@ -42,6 +42,10 @@ class Scope(StrEnum):
     FEATURE_MINT = "feature:mint"
     TICKET_DOGET = "ticket:doget"
 
+    # Biosample data
+    BIOSAMPLE_READ = "biosample:read"
+    BIOSAMPLE_WRITE = "biosample:write"
+
     # Admin operations
     ADMIN_USER = "admin:user"
     ADMIN_SERVICE_ACCOUNT = "admin:service_account"

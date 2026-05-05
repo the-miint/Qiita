@@ -54,6 +54,22 @@ class FieldDataType(StrEnum):
     TERMINOLOGY = "terminology"
 
 
+class Tier(StrEnum):
+    """Closed set of access-tier values used for user-to-study access levels
+    and for data-visibility requirements.
+
+    Mirrors the Postgres `qiita.tier` enum. Members are listed in ascending
+    privilege order; a higher tier implies all lower tiers' privileges.
+    `study_access` rows cannot carry `'public'` — a principal with no
+    `study_access` row has effective tier `'public'` by absence.
+    """
+
+    PUBLIC = "public"
+    VIEWER = "viewer"
+    MEMBER = "member"
+    ADMIN = "admin"
+
+
 ReferenceKind = Literal["sequence_reference", "taxonomy_authority"]
 
 
