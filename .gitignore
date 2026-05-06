@@ -7,12 +7,18 @@ dist/
 .ruff_cache/
 .pytest_cache/
 .coverage
+coverage.xml
+htmlcov/
 
 # Rust
 target/
 
 # OS
 .DS_Store
+
+# Editors / IDEs
+.idea/
+.vscode/
 
 # Secrets / env
 .env
@@ -21,5 +27,5 @@ target/
 # Build artifacts
 *.sif
 
-# Claude Code
-.claude/settings.json
+# Claude Code (workspace-local config and agent definitions)
+.claude/
