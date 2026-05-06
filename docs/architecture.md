@@ -41,7 +41,7 @@ graph TB
     subgraph storage ["Data Storage"]
         PG_APP["Postgres qiita_miint<br/>━━━━━━━━━━━━━━━━━━━<br/>Users, roles, studies<br/>Samples, preparations<br/>Work tickets, provenance<br/>References, genomes, features"]
         PG_DL["Postgres qiita_miint_lake<br/>━━━━━━━━━━━━━━━━━━━<br/>Snapshots, data files<br/>Schemas, partitions<br/>Inlined small inserts"]
-        FS["Shared Filesystem<br/>━━━━━━━━━━━━━━━━━━━<br/>/data — durable, backed up<br/>(parquet/, logs/)<br/>/scratch — working, two-tier<br/>(persistent-local/, ephemeral/)"]
+        FS["Shared Filesystem<br/>━━━━━━━━━━━━━━━━━━━<br/>/data — durable, backed up<br/>(parquet/, logs/)<br/>/scratch — working, three-tier<br/>(persistent/, persistent-local/, ephemeral/)"]
     end
 
     %% Client connections
@@ -737,7 +737,9 @@ Layout:
   logs/<ticket_id>/step_n-<job>.{out,err}   archived SLURM stdout/stderr after job terminal state
 
 /scratch/
-  persistent-local/                         never auto-deleted; cluster purge exemption requested
+  persistent/                               shared FS, never auto-deleted; cluster purge exemption requested
+                                            (reserved for future shared-but-durable content; currently no occupants)
+  persistent-local/                         local SSD, never auto-deleted; cluster purge exemption requested
     references/<reference_idx>/<aligner>/   built aligner indices (rebuild-on-miss is the safety net)
   ephemeral/                                auto-deleted 45 days after ticket terminal state
     workspace/<ticket_id>/                  control-plane runner workspace + live SLURM logs
@@ -745,12 +747,15 @@ Layout:
     references/incoming/<name>/<version>/   source FASTA staging during reference ingest
 ```
 
-`persistent-local` is a **placeholder name** for the local-SSD mount that holds random-access indexed databases (aligner indices today; other things later). The name is provisional — we expect to rename or repurpose it as the deploy grows. Treat it as "the local-SSD path for things we keep around."
+Two persistent tiers under `/scratch/`:
+
+- `/scratch/persistent/` — the shared-FS persistent tier. Visible to every node, durable, but no random-access guarantees. Currently has no fixed occupants; reserved for future content that must be shared across nodes and never auto-purged.
+- `/scratch/persistent-local/` — **placeholder name** for the local-SSD mount that holds random-access indexed databases (aligner indices today; other things later). The name is provisional — we expect to rename or repurpose it as the deploy grows. Treat it as "the local-SSD path for things we keep around."
 
 Retention:
 
 - `/data/` — never auto-deleted. Backed up by cluster policy.
-- `/scratch/persistent-local/` — never auto-deleted by us; cluster purge exemption requested. If an index is missing for any reason, the orchestrator rebuilds it on demand at job dispatch.
+- `/scratch/persistent/` and `/scratch/persistent-local/` — never auto-deleted by us; cluster purge exemption requested for both. For aligner indices specifically, if the local-SSD copy is missing for any reason, the orchestrator rebuilds it on demand at job dispatch.
 - `/scratch/ephemeral/` — per-ticket directories are deleted 45 days after the ticket reaches a terminal state. The 45-day grace exists for post-mortem debugging.
 
 Same-FS constraint: the SLURM job's final-step output directory and DuckLake `DATA_PATH` must live on the same filesystem — the data plane moves files via atomic rename, falling back to copy+delete only on cross-filesystem moves (a slow path that bypasses the rename's atomicity guarantee). The final-step output therefore lives on `/data/` even when intermediate map/reduce outputs use `/scratch/ephemeral/staging/`.
