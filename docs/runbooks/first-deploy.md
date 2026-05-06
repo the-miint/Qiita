@@ -24,7 +24,10 @@ human or service-account principals exist yet.
 ## 2. Set required env vars
 
 ```bash
-export DATABASE_URL=postgresql://qiita:...@host/qiita
+# Control plane DSN — qiita_miint_rw owns and connects to qiita_miint.
+# (The data plane uses its own DSN to qiita_miint_lake set in
+# /etc/qiita/data-plane.env, not in this shell session.)
+export DATABASE_URL=postgresql://qiita_miint_rw:...@host/qiita_miint
 export HMAC_SECRET_KEY=$(openssl rand -base64 32)
 # AuthRocket SaaS issuer — the canonical URL, NOT the loginrocket subdomain.
 export AUTHROCKET_ISSUER=https://authrocket.com
@@ -136,8 +139,8 @@ Capture the plaintext token, then on the orchestrator host:
 ./scripts/install-orchestrator-token.sh /etc/qiita/orchestrator.token <<<"$TOKEN"
 ```
 
-The script writes to `<target>.new` with mode `0400` / owner `qiita:qiita`
-and atomically renames over the target. See
+The script writes to `<target>.new` with mode `0400` / owner
+`qiita-orch:qiita-orch` and atomically renames over the target. See
 [`scripts/install-orchestrator-token.sh`](../../scripts/install-orchestrator-token.sh)
 for the exact behavior.
 
@@ -145,3 +148,61 @@ for the exact behavior.
 
 The orchestrator reads `/etc/qiita/orchestrator.token` at startup. See
 `docs/runbooks/orchestrator-token-rotation.md` for the rotation flow.
+
+## 10. Smoke test
+
+Confirm every layer is wired up before declaring the deploy complete.
+
+The smoke uses the `reference-add` workflow with a 3–5 sequence FASTA.
+A single ticket touches every layer:
+
+- **Control plane** — validates the action, mints `feature_idx`, writes
+  `reference_membership`.
+- **Orchestrator** — dispatches the four-step pipeline to SLURM (jobs
+  run as `qiita-job`).
+- **Data plane** — registers Parquet via `ducklake_add_data_files`
+  (writes to `qiita_miint_lake`, lands files in `/data/parquet/<table>/`).
+- **Both filesystems** — intermediates on `/scratch/ephemeral/staging/`,
+  final output on `/data/parquet/`.
+
+### Recipe
+
+1. **Versioned smoke tag.** Each deploy uses a unique reference name so
+   the smoke is idempotently re-runnable and leaves an audit trail:
+
+   ```bash
+   SMOKE_TAG="smoke-$(git -C /opt/qiita/control-plane rev-parse --short HEAD)"
+   ```
+
+2. **Stage a tiny FASTA** at
+   `/scratch/ephemeral/references/incoming/$SMOKE_TAG/1.0.0/seqs.fasta`
+   (3–5 short sequences are enough; owner `qiita-job`, group readable
+   so the SLURM hash job can read it).
+
+3. **Submit `reference-add`** against `(name=$SMOKE_TAG, version=1.0.0)`
+   using the operator's `system_admin` PAT. The promoted operator role
+   covers `feature:mint`, `reference:write`, and
+   `reference:register_files` — the full scope set the workflow declares.
+
+4. **Verify the four layers:**
+
+   - Work ticket reaches `COMPLETED` (`qiita-admin tickets get <id>`).
+   - `qiita_miint` has a new `reference` row plus features and
+     membership rows for the smoke tag.
+   - `qiita_miint_lake` has new `ducklake_data_file` rows from the last
+     few minutes.
+   - `/data/parquet/<table>/` contains recent Parquet files, mode 440.
+
+   A failure on any single check pinpoints which layer is broken.
+
+### Post-smoke
+
+The smoke leaves one tagged reference plus a handful of features and
+catalog files per deploy — by design. They are cheap (kilobytes) and
+the audit trail proves which deploys passed smoke. No cleanup needed.
+
+> **TODO:** Full reference deletion (delete `reference_membership`
+> rows, delete features exclusive to the reference, unregister the
+> catalog files, remove the Parquet) is not yet implemented. Track
+> as a follow-up. Not on the critical path while versioned smoke
+> names keep accumulation harmless.
