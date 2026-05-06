@@ -41,7 +41,7 @@ graph TB
     subgraph storage ["Data Storage"]
         PG_APP["Postgres qiita_miint<br/>━━━━━━━━━━━━━━━━━━━<br/>Users, roles, studies<br/>Samples, preparations<br/>Work tickets, provenance<br/>References, genomes, features"]
         PG_DL["Postgres qiita_miint_lake<br/>━━━━━━━━━━━━━━━━━━━<br/>Snapshots, data files<br/>Schemas, partitions<br/>Inlined small inserts"]
-        FS["Shared Filesystem<br/>━━━━━━━━━━━━━━━━━━━<br/>/data — durable, backed up<br/>(parquet/, logs/)<br/>/scratch — working, two-tier<br/>(persistent/, ephemeral/)"]
+        FS["Shared Filesystem<br/>━━━━━━━━━━━━━━━━━━━<br/>/data — durable, backed up<br/>(parquet/, logs/)<br/>/scratch — working, two-tier<br/>(persistent-local/, ephemeral/)"]
     end
 
     %% Client connections
@@ -327,7 +327,7 @@ Phylogenetic placements (jplace format) are stored as raw placement data via `re
 Aligner indices (minimap2 `.mmi`, bowtie2 `.bt2`) are built by the compute orchestrator as SLURM batch jobs and stored on the shared filesystem:
 
 ```
-/scratch/persistent/references/{reference_idx}/
+/scratch/persistent-local/references/{reference_idx}/
 ├── minimap2/
 │   └── index.mmi
 ├── bowtie2/
@@ -737,7 +737,7 @@ Layout:
   logs/<ticket_id>/step_n-<job>.{out,err}   archived SLURM stdout/stderr after job terminal state
 
 /scratch/
-  persistent/                               never auto-deleted; cluster purge exemption requested
+  persistent-local/                         never auto-deleted; cluster purge exemption requested
     references/<reference_idx>/<aligner>/   built aligner indices (rebuild-on-miss is the safety net)
   ephemeral/                                auto-deleted 45 days after ticket terminal state
     workspace/<ticket_id>/                  control-plane runner workspace + live SLURM logs
@@ -745,10 +745,12 @@ Layout:
     references/incoming/<name>/<version>/   source FASTA staging during reference ingest
 ```
 
+`persistent-local` is a **placeholder name** for the local-SSD mount that holds random-access indexed databases (aligner indices today; other things later). The name is provisional — we expect to rename or repurpose it as the deploy grows. Treat it as "the local-SSD path for things we keep around."
+
 Retention:
 
 - `/data/` — never auto-deleted. Backed up by cluster policy.
-- `/scratch/persistent/` — never auto-deleted by us; cluster purge exemption requested. If an index is missing for any reason, the orchestrator rebuilds it on demand at job dispatch.
+- `/scratch/persistent-local/` — never auto-deleted by us; cluster purge exemption requested. If an index is missing for any reason, the orchestrator rebuilds it on demand at job dispatch.
 - `/scratch/ephemeral/` — per-ticket directories are deleted 45 days after the ticket reaches a terminal state. The 45-day grace exists for post-mortem debugging.
 
 Same-FS constraint: the SLURM job's final-step output directory and DuckLake `DATA_PATH` must live on the same filesystem — the data plane moves files via atomic rename, falling back to copy+delete only on cross-filesystem moves (a slow path that bypasses the rename's atomicity guarantee). The final-step output therefore lives on `/data/` even when intermediate map/reduce outputs use `/scratch/ephemeral/staging/`.
@@ -1017,6 +1019,6 @@ jobs:
 - **Data plane horizontal scaling:** The data plane is the read/write path for all DuckLake data. At scale, many concurrent SLURM jobs may issue large DoGet reads simultaneously, making a single data plane process a throughput bottleneck. The data plane scales horizontally because each instance is stateless with respect to request handling — it holds only a DuckDB+DuckLake connection to the shared Postgres catalog and reads Parquet files from the shared filesystem. DuckLake's concurrent read model is safe for this: multiple DuckDB instances connecting to the same Postgres catalog never block each other (readers use snapshot isolation with no row-level locking; conflicts only arise on concurrent writes, resolved via optimistic concurrency at commit time). Workers cannot bypass the data plane and read Parquet files directly for several reasons: (1) deletions are recorded as separate delete files in the DuckLake catalog — raw Parquet reads return logically deleted rows; (2) small inserts below the data inlining threshold are stored entirely within the Postgres catalog (`ducklake_inlined_data_tables`), with no Parquet file written at all; (3) snapshot visibility requires a catalog query to determine which files are live for the current consistent state; (4) compaction rewrites and deletes Parquet files under active management, making cached paths unreliable. The data plane remains the correct and only correct read path; the solution to the bottleneck is running more of them.
 - **Reference ID minting flow:** Bulk reference ingestion is a multi-step pipeline: (1) SLURM hash job reads sequences via DuckDB + miint and computes MD5 hashes, writing a manifest; (2) orchestrator feeds hashes to control plane; (3) control plane does bulk dedup lookup (`features.sequence_hash` unique index, stored as Postgres `uuid`), reuses existing `feature_idx` for matches, mints new ones for novel sequences, writes membership records, returns ID mapping; (4) SLURM load job inserts sequences + taxonomy + annotations into DuckLake using assigned IDs; (5) SLURM index job builds aligner indices.
 - **Alignment → reference join:** Alignment Parquet contains `feature_idx` but not `reference_idx`. To scope alignment results to a specific reference version, the query joins `reference_membership(reference_idx, feature_idx)` at query time. This join can happen entirely in the data plane (DuckLake) for analytical queries, or the control plane can provide the authorized feature set for a given reference to narrow a Flight ticket.
-- **Reference filesystem paths:** Aligner indices stored at `/scratch/persistent/references/{reference_idx}/{aligner}/`. Built by SLURM jobs and read by alignment SLURM jobs at processing time. Processing workflow `params.json` includes the `reference_idx` to locate the correct index path. If the index is missing (cluster purge), the orchestrator rebuilds it at dispatch time before the alignment job runs.
+- **Reference filesystem paths:** Aligner indices stored at `/scratch/persistent-local/references/{reference_idx}/{aligner}/`. Built by SLURM jobs and read by alignment SLURM jobs at processing time. Processing workflow `params.json` includes the `reference_idx` to locate the correct index path. If the index is missing (cluster purge), the orchestrator rebuilds it at dispatch time before the alignment job runs.
 - **Phylogenetic addressing:** Internal nodes are addressed by `(reference_idx, node_index)` — scoped to a single tree, not referenced across references. Tip nodes connect to the sequence identity layer via the `phylogeny_tip_feature` junction table `(reference_idx, node_index) → feature_idx`, populated at ingestion time. Clade-scoped queries use a recursive CTE on `parent_index` to collect descendant tips, then join through `phylogeny_tip_feature` to reach `feature_idx`.
 - **Feature deduplication:** `feature_idx` is content-addressed via MD5 hash of the sequence bytes. The SLURM ingestion job computes hashes using DuckDB's built-in `md5()` function on sequences read via miint's `read_fastx`. Hashes are fed back to the control plane through the orchestrator for bulk dedup lookup. The control plane stores hashes as Postgres `uuid` type (MD5 is exactly 128 bits = UUID-sized) with a unique B-tree index, and upserts on `sequence_hash` — if a sequence already exists, the existing `feature_idx` is reused and the new reference's membership row simply points to it.
