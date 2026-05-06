@@ -51,13 +51,15 @@ def _write_genome_map(path, entries: list[tuple[str, str | None, str | None]]) -
 
 
 def _read_feature_map(path) -> dict[str, int]:
-    """Read a feature_map.parquet into a {sequence_hash → feature_idx} dict."""
+    """Read a feature_map.parquet into a {sequence_hash → feature_idx} dict.
+    Test assertions key on string-form UUIDs (`str(uuid.UUID(...))`), so the
+    UUID → str conversion happens in Python."""
     with duckdb.connect(":memory:") as conn:
         rows = conn.execute(
-            "SELECT CAST(sequence_hash AS VARCHAR), feature_idx FROM read_parquet(?)",
+            "SELECT sequence_hash, feature_idx FROM read_parquet(?)",
             [str(path)],
         ).fetchall()
-    return {r[0]: r[1] for r in rows}
+    return {str(r[0]): r[1] for r in rows}
 
 
 @pytest.fixture

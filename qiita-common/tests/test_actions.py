@@ -1,9 +1,17 @@
-"""Tests for ActionDefinition and the action-registry Pydantic shape."""
+"""Tests for ActionDefinition and the action-registry Pydantic shape.
+
+`walltime` values are ISO 8601 duration strings (`PT1H` = 1 hour,
+`PT1M` = 1 minute, `PT4H` = 4 hours). Pydantic parses these into
+`datetime.timedelta` automatically.
+"""
 
 from datetime import timedelta
 
 import pytest
 from pydantic import ValidationError
+
+from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.models import ScopeTargetKind, StepType
 
 
 def _minimal_action_kwargs() -> dict:
@@ -13,13 +21,13 @@ def _minimal_action_kwargs() -> dict:
     return dict(
         action_id="reference-add",
         version="1.0.0",
-        target_kind="reference",
-        scopes=["feature:mint", "reference:write"],
-        audience={"service": False, "human_roles": ["wet_lab_admin"]},
+        target_kind=ScopeTargetKind.REFERENCE,
+        scopes=[Scope.FEATURE_MINT, Scope.REFERENCE_WRITE],
+        audience={"service": False, "human_roles": [SystemRole.WET_LAB_ADMIN]},
         steps=[
             {
                 "step": "hash",
-                "step_type": "singleton",
+                "step_type": StepType.SINGLETON,
                 "container": "qiita/reference-hash:1.0.0",
                 "baseline_resources": {
                     "cpu": 4,
@@ -44,8 +52,8 @@ def test_minimal_action_definition_loads():
     a = ActionDefinition(**_minimal_action_kwargs())
     assert a.action_id == "reference-add"
     assert a.version == "1.0.0"
-    assert a.target_kind == "reference"
-    assert a.scopes == ["feature:mint", "reference:write"]
+    assert a.target_kind == ScopeTargetKind.REFERENCE
+    assert a.scopes == [Scope.FEATURE_MINT, Scope.REFERENCE_WRITE]
     assert len(a.steps) == 1
     assert isinstance(a.steps[0], WorkflowStep)
     assert a.steps[0].name == "hash"
@@ -63,7 +71,7 @@ def test_step_and_action_shorthand_normalize():
     kwargs["steps"] = [
         {
             "step": "hash",
-            "step_type": "singleton",
+            "step_type": StepType.SINGLETON,
             "container": "img:1",
             "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
         },
@@ -105,7 +113,10 @@ def test_unknown_scope_rejected():
     from qiita_common.actions import ActionDefinition
 
     kwargs = _minimal_action_kwargs()
-    kwargs["scopes"] = ["feature:mint", "references:write"]  # plural typo
+    # First entry is a real scope; second is the deliberate typo this test
+    # exercises — keep the typo as a bare string so it doesn't have to
+    # exist in the enum.
+    kwargs["scopes"] = [Scope.FEATURE_MINT, "references:write"]
     with pytest.raises(ValidationError) as exc_info:
         ActionDefinition(**kwargs)
     assert "unknown scope" in str(exc_info.value)
@@ -117,7 +128,7 @@ def test_duplicate_scopes_rejected():
     from qiita_common.actions import ActionDefinition
 
     kwargs = _minimal_action_kwargs()
-    kwargs["scopes"] = ["feature:mint", "feature:mint"]
+    kwargs["scopes"] = [Scope.FEATURE_MINT, Scope.FEATURE_MINT]
     with pytest.raises(ValidationError) as exc_info:
         ActionDefinition(**kwargs)
     assert "duplicate" in str(exc_info.value)

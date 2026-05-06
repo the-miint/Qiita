@@ -528,7 +528,6 @@ name = "qiita-compute-orchestrator"
 version = "2026.3.0"
 source = { directory = "../../qiita-compute-orchestrator" }
 dependencies = [
-    { name = "asyncpg" },
     { name = "duckdb" },
     { name = "fastapi" },
     { name = "qiita-common" },
@@ -537,7 +536,6 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "asyncpg", specifier = ">=0.31" },
     { name = "duckdb", specifier = ">=1.5.2" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "qiita-common", directory = "../../qiita-common" },

@@ -6,8 +6,10 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "qiita-common",
+    # LocalBackend uses DuckDB+miint in-process to stand in for SLURM in
+    # dev/test. SlurmBackend won't need it, but the orchestrator runs both
+    # backends from the same image, so the dep stays.
     "duckdb>=1.5.2",
-    "asyncpg>=0.31",
 ]
 
 [dependency-groups]

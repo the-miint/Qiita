@@ -1,39 +1,32 @@
 """End-to-end smoke test: drive workflows/reference-add/1.0.0.yaml
-through the runner against a real control-plane (in-process via
-ASGITransport) and a real LocalBackend.
+through the control-plane runner with a real LocalBackend.
 
 What's exercised end-to-end:
   - YAML loader → sync into qiita.action
   - Runner reads the action row, walks every entry
   - Real LocalBackend hashes a tiny FASTA into manifest.parquet
-  - HTTP /api/v1/library/mint-features dispatch → real
-    library.mint_features → qiita.feature rows + feature_map.parquet
-  - HTTP /api/v1/library/write-membership → real library.write_membership
-    → qiita.reference_membership rows
+  - In-process LIBRARY[mint-features] → qiita.feature rows + feature_map.parquet
+  - In-process LIBRARY[write-membership] → qiita.reference_membership rows
   - Real LocalBackend load step writes reference_*.parquet
-  - register-files stubbed: data-plane Flight needs cargo, which isn't
-    on this host. The stub returns a canned RegisterFilesResponse so
-    the runner can complete the workflow.
+  - register-files monkeypatched at the LIBRARY entry: data-plane Flight
+    needs cargo / a running data plane, which this test deliberately
+    avoids — covered by test_e2e_reference instead.
 
 The assertion surface is the post-conditions that prove every entry
 ran: reference reaches `active`, feature/membership rows exist,
-work_ticket reaches COMPLETED, status PATCHes hit in declared order.
+work_ticket reaches COMPLETED.
 """
 
 import uuid
 from pathlib import Path
 
 import pytest
-from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import LOOPBACK_HOST
-from qiita_common.client import ControlPlaneClient
-from qiita_common.models import RegisterFilesResponse
 
+from _runner_helpers import LocalComputeBackendClient
 
 _REFERENCE_ADD_YAML_PATH = (
     Path(__file__).parent.parent.parent / "workflows" / "reference-add" / "1.0.0.yaml"
 )
-
 
 # A tiny FASTA the hash step can chew through in milliseconds.
 _TINY_FASTA = (
@@ -41,37 +34,11 @@ _TINY_FASTA = (
 )
 
 
-class _StubbedRegisterClient(ControlPlaneClient):
-    """ControlPlaneClient subclass with register_files short-circuited.
-
-    The real register_files goes through HTTP → control-plane dispatch →
-    library.register_files → pyarrow.flight.FlightClient → data plane.
-    The data plane needs the qiita-data-plane Rust binary, and cargo
-    isn't on this host. Stub the register at the client level so the
-    smoke test can complete the workflow without Flight.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.register_calls: list[tuple[int, str, dict[str, str]]] = []
-
-    async def register_files(
-        self, reference_idx: int, staging_dir: str, files: dict[str, str]
-    ) -> RegisterFilesResponse:
-        self.register_calls.append((reference_idx, staging_dir, dict(files)))
-        return RegisterFilesResponse(
-            registered=[f"{staging_dir}/{name}" for name in files]
-        )
-
-
 @pytest.fixture
 async def synced_reference_add_action(postgres_pool, tmp_path):
     """Materialize workflows/reference-add/1.0.0.yaml under tmp_path/workflows/
     so the loader's directory walk picks it up, sync it into qiita.action,
-    and clean the row up after.
-
-    A unique action version is derived per test invocation so the test
-    doesn't collide with other workflows in the table."""
+    and clean the row up after."""
     from qiita_control_plane.actions import load_actions, sync_actions
 
     workflows_dir = tmp_path / "workflows" / "reference-add"
@@ -113,9 +80,6 @@ async def smoke_reference(postgres_pool, human_admin_session):
         human_admin_session["principal_idx"],
     )
     yield idx
-    # Order matters: work_ticket → reference is RESTRICT, so drop tickets
-    # before the reference. reference_membership cascade-FKs on the
-    # reference itself but no point waiting for cascade.
     await postgres_pool.execute(
         "DELETE FROM qiita.work_ticket WHERE reference_idx = $1", idx
     )
@@ -128,21 +92,20 @@ async def smoke_reference(postgres_pool, human_admin_session):
 
 
 async def test_reference_add_workflow_end_to_end(
+    monkeypatch,
     postgres_pool,
-    hmac_secret,
     synced_reference_add_action,
     smoke_reference,
-    compute_worker_service_account,
+    human_admin_session,
     tmp_path,
 ):
-    """Drive the full reference-add workflow via the runner against the
-    in-process control-plane app. After the run: ticket COMPLETED,
-    reference 'active', feature/membership rows present, register-files
-    invoked exactly once with a sensible filename → table mapping."""
-    from qiita_compute_orchestrator.backends.local import LocalBackend
-    from qiita_compute_orchestrator.runner import run_workflow
-    from qiita_control_plane.config import Settings
-    from qiita_control_plane.main import app
+    """Drive the full reference-add workflow via the in-process runner +
+    LocalBackend. After the run: ticket COMPLETED, reference 'active',
+    feature/membership rows present, register-files invoked exactly once
+    with a sensible filename → table mapping."""
+    from qiita_common.api_paths import LibraryPrimitive
+    from qiita_control_plane.actions import library as _lib
+    from qiita_control_plane.runner import run_workflow
 
     action_id, action_version = synced_reference_add_action
     reference_idx = smoke_reference
@@ -158,41 +121,32 @@ async def test_reference_add_workflow_end_to_end(
         " RETURNING work_ticket_idx",
         action_id,
         action_version,
-        compute_worker_service_account["principal_idx"],
+        human_admin_session["principal_idx"],
         reference_idx,
         f'{{"fasta_path": "{fasta}"}}',
     )
 
-    # Configure the in-process control-plane app — same pattern as the
-    # other integration test suites that route through ASGITransport.
-    app.state.pool = postgres_pool
-    app.state.settings = Settings(
-        database_url="unused-in-test",
-        hmac_secret_key=hmac_secret,
-        data_plane_url=f"grpc://{LOOPBACK_HOST}:0",
-    )
+    # Stub register-files: the real path requires a running data plane
+    # (Arrow Flight DoAction), which test_e2e_reference covers separately.
+    register_calls: list[tuple] = []
+
+    async def _stub_register_files(*, staging_dir, files, hmac_secret, data_plane_url):
+        register_calls.append((staging_dir, dict(files)))
+        return [f"{staging_dir}/{name}" for name in files]
+
+    monkeypatch.setitem(_lib.LIBRARY, LibraryPrimitive.REGISTER_FILES, _stub_register_files)
 
     workspace_root = tmp_path / "workspace"
-    backend = LocalBackend()
+    backend_client = LocalComputeBackendClient()
 
-    transport = ASGITransport(app=app)
-    async with AsyncClient(
-        transport=transport,
-        base_url="http://test",
-        headers={"Authorization": f"Bearer {compute_worker_service_account['token']}"},
-    ) as http:
-        client = _StubbedRegisterClient(
-            "http://test",
-            api_token=compute_worker_service_account["token"],
-            http_client=http,
-        )
-        await run_workflow(
-            work_ticket_idx,
-            backend,
-            client,
-            postgres_pool,
-            workspace_root=workspace_root,
-        )
+    await run_workflow(
+        work_ticket_idx,
+        postgres_pool,
+        backend_client,  # type: ignore[arg-type]  # protocol-shaped duck
+        hmac_secret=b"unused-in-smoke",
+        data_plane_url="grpc://unused:0",
+        workspace_root=workspace_root,
+    )
 
     # work_ticket transitioned to COMPLETED.
     state = await postgres_pool.fetchval(
@@ -207,8 +161,7 @@ async def test_reference_add_workflow_end_to_end(
     )
     assert ref_status == "active"
 
-    # mint-features inserted three feature rows (the FASTA has 3 sequences,
-    # all distinct hashes).
+    # mint-features inserted three feature rows (the FASTA has 3 sequences).
     feature_count = await postgres_pool.fetchval(
         "SELECT count(*) FROM qiita.feature f"
         " JOIN qiita.reference_membership m ON m.feature_idx = f.feature_idx"
@@ -217,10 +170,10 @@ async def test_reference_add_workflow_end_to_end(
     )
     assert feature_count == 3
 
-    # register-files was called exactly once with the staging-dir Parquet
-    # files mapped by the runner's filename → stem convention.
-    assert len(client.register_calls) == 1
-    _, staging_dir, files = client.register_calls[0]
+    # register-files invoked once with the staging-dir Parquet files
+    # mapped by the runner's filename → stem convention.
+    assert len(register_calls) == 1
+    staging_dir, files = register_calls[0]
     assert "reference_sequences.parquet" in files
     assert files["reference_sequences.parquet"] == "reference_sequences"
     assert "reference_membership.parquet" in files
@@ -229,7 +182,3 @@ async def test_reference_add_workflow_end_to_end(
     workspace = workspace_root / str(work_ticket_idx)
     assert (workspace / "manifest.parquet").exists()
     assert (workspace / "feature_map.parquet").exists()
-    # Load step writes its outputs into a `staging_dir` whose name comes
-    # from LocalBackend._run_load — actually the load step writes into
-    # the workspace itself. The runner records the path under the
-    # output name 'staging_dir'.

@@ -1,0 +1,60 @@
+"""POST /api/v1/step/run — the only client of this service.
+
+Issued by the control-plane runner for every workflow `step:` entry.
+Dispatches synchronously to the configured ComputeBackend and returns
+the backend's named output paths.
+
+Auth is a shared bearer token (`QIITA_CP_TO_CO_TOKEN` / file at
+`/etc/qiita/cp-to-co.token`) — a private path between two services on
+the same network. Constant-time compare.
+"""
+
+from __future__ import annotations
+
+import hmac
+from pathlib import Path
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from qiita_common.api_paths import PATH_STEP_PREFIX, PATH_STEP_RUN
+from qiita_common.models import StepRunRequest, StepRunResponse
+
+from .backend import ComputeBackend
+
+router = APIRouter(prefix=PATH_STEP_PREFIX, tags=["step"])
+
+_bearer = HTTPBearer(auto_error=False)
+
+
+def _require_cp_to_co_token(
+    request: Request,
+    creds: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
+) -> None:
+    expected: str = request.app.state.cp_to_co_token
+    if creds is None or not hmac.compare_digest(creds.credentials, expected):
+        raise HTTPException(status_code=401, detail="invalid CP↔CO token")
+
+
+def _get_backend(request: Request) -> ComputeBackend:
+    return request.app.state.backend
+
+
+@router.post(PATH_STEP_RUN)
+async def run_step(
+    body: StepRunRequest,
+    backend: Annotated[ComputeBackend, Depends(_get_backend)],
+    _: Annotated[None, Depends(_require_cp_to_co_token)],
+) -> StepRunResponse:
+    try:
+        outputs = await backend.run_step(
+            body.step_name,
+            {k: Path(v) for k, v in body.inputs.items()},
+            Path(body.workspace),
+            reference_idx=body.reference_idx,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return StepRunResponse(outputs={k: str(v) for k, v in outputs.items()})

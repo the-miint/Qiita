@@ -25,6 +25,15 @@ context_schema:
     # When present, mint-features additionally writes qiita.feature_genome
     # rows JOINed against the manifest's read_id.
     genome_map_path: {type: string}
+    # Optional Parquet with (feature_id, taxonomy). When present, the load
+    # step parses semicolon-delimited ranks and writes reference_taxonomy.parquet.
+    taxonomy_path: {type: string}
+    # Optional Newick tree. When present, the load step writes
+    # reference_phylogeny.parquet with feature_idx populated on tip nodes.
+    tree_path: {type: string}
+    # Optional jplace placements. When present, the load step writes
+    # reference_placements.parquet keyed by feature_idx.
+    jplace_path: {type: string}
 
 success_status: active
 failure_status: failed
@@ -55,6 +64,7 @@ steps:
     container: qiita/reference-load:1.0.0
     target_status: loading
     inputs: [fasta_path, manifest, feature_map]
+    optional_inputs: [taxonomy_path, tree_path, jplace_path]
     outputs: [staging_dir]
     baseline_resources:
       cpu: 8

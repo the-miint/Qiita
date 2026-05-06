@@ -1,20 +1,14 @@
 """REST client for service-to-service calls to the control plane."""
 
 from pathlib import Path
-from typing import Any
 
 import httpx
 
-from .api_paths import URL_LIBRARY_NAME, LibraryPrimitive
 from .auth_constants import API_PREFIX
 from .models import (
     DoGetTicketResponse,
-    FeatureMintResponse,
-    ReferenceMembershipResponse,
     ReferenceResponse,
     ReferenceStatus,
-    RegisterFilesResponse,
-    ScopeTargetKind,
 )
 
 # Default per-request HTTP timeout. Generous so a slow control-plane reply
@@ -117,70 +111,6 @@ class ControlPlaneClient:
         resp.raise_for_status()
         return ReferenceResponse.model_validate(resp.json())
 
-    async def mint_features(
-        self,
-        reference_idx: int,
-        manifest_path: Path,
-        output_dir: Path,
-        genome_map_path: Path | None = None,
-    ) -> FeatureMintResponse:
-        """Invoke the mint-features library primitive.
-
-        `manifest_path` points to a Parquet manifest with a sequence_hash
-        column (typically produced by the workflow's hash step).
-        `output_dir` is where the primitive will write feature_map.parquet.
-        Both must live on a workspace shared with the control plane.
-
-        `genome_map_path`, if supplied, is a Parquet file with columns
-        `(read_id, genome_source, genome_source_id)`. When set, the
-        primitive also writes qiita.feature_genome rows for each entry.
-
-        Returns FeatureMintResponse(feature_map_path, minted, reused).
-        Reference-agnostic at the library level; reference_idx flows into
-        the dispatch envelope's scope_target only so the control plane
-        can attribute the call.
-        """
-        inputs: dict[str, Any] = {
-            "manifest_path": str(manifest_path),
-            "output_dir": str(output_dir),
-        }
-        if genome_map_path is not None:
-            inputs["genome_map_path"] = str(genome_map_path)
-        outputs = await self._invoke_library(
-            name=LibraryPrimitive.MINT_FEATURES,
-            reference_idx=reference_idx,
-            inputs=inputs,
-        )
-        return FeatureMintResponse.model_validate(outputs)
-
-    async def write_membership(
-        self, reference_idx: int, feature_map_path: Path
-    ) -> ReferenceMembershipResponse:
-        """Invoke the write-membership library primitive — link the
-        feature_idx values from a feature_map Parquet file to a reference.
-        Idempotent."""
-        outputs = await self._invoke_library(
-            name=LibraryPrimitive.WRITE_MEMBERSHIP,
-            reference_idx=reference_idx,
-            inputs={"feature_map_path": str(feature_map_path)},
-        )
-        return ReferenceMembershipResponse.model_validate(outputs)
-
-    async def register_files(
-        self,
-        reference_idx: int,
-        staging_dir: str,
-        files: dict[str, str],
-    ) -> RegisterFilesResponse:
-        """Invoke the register-files library primitive — register staged
-        Parquet files into DuckLake via the data plane's DoAction."""
-        outputs = await self._invoke_library(
-            name=LibraryPrimitive.REGISTER_FILES,
-            reference_idx=reference_idx,
-            inputs={"staging_dir": staging_dir, "files": files},
-        )
-        return RegisterFilesResponse.model_validate(outputs)
-
     async def get_doget_ticket(self, reference_idx: int, table: str) -> DoGetTicketResponse:
         resp = await self._http.post(
             f"{API_PREFIX}/reference/{reference_idx}/ticket/doget",
@@ -188,30 +118,3 @@ class ControlPlaneClient:
         )
         resp.raise_for_status()
         return DoGetTicketResponse.model_validate(resp.json())
-
-    async def _invoke_library(
-        self,
-        *,
-        name: str,
-        reference_idx: int,
-        inputs: dict[str, Any],
-    ) -> dict[str, Any]:
-        """POST /api/v1/library/{name} with the standard envelope; return
-        the unwrapped `outputs` dict for the caller's per-primitive parser.
-
-        Today every library primitive targets a reference; if/when a
-        primitive needs a different scope_target.kind this helper grows
-        a `scope_target: ScopeTarget` parameter.
-        """
-        resp = await self._http.post(
-            URL_LIBRARY_NAME.format(name=name),
-            json={
-                "scope_target": {
-                    "kind": ScopeTargetKind.REFERENCE.value,
-                    "reference_idx": reference_idx,
-                },
-                "inputs": inputs,
-            },
-        )
-        resp.raise_for_status()
-        return resp.json()["outputs"]

@@ -91,9 +91,13 @@ CREATE TABLE qiita.work_ticket (
 );
 
 COMMENT ON TABLE qiita.work_ticket IS
-    'Compute-orchestrator action invocations: who requested, which resource, '
-    'what action-defined context, and lifecycle state. (action_id, '
-    'action_version) FK into qiita.action.';
+    'Action invocations: who requested, which resource, what action-defined '
+    'context, and lifecycle state. (action_id, action_version) FK into '
+    'qiita.action. Granularity is one row per action invocation, scoped at '
+    'reference / study_prep level — not per sample. Sample-level fan-out '
+    'happens inside the workflow''s `step:` entries (e.g. map steps that '
+    'submit one SLURM job per prep_sample_idx); all such jobs share the '
+    'same work_ticket_idx.';
 
 -- The orchestrator polls for PENDING / QUEUED / PROCESSING tickets to
 -- dispatch and watch; COMPLETED / FAILED are terminal and seldom queried

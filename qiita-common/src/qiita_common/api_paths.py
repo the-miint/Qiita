@@ -55,29 +55,38 @@ URL_REFERENCE_DOGET = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_DOGET}"
 
 
 # =============================================================================
-# /library/*
+# Library primitive names
 # =============================================================================
-# The single transport between workflow runners (orchestrator) and the
-# control-plane library primitives. Per-primitive request shape is
-# validated inside the dispatch handler; URLs do not vary by primitive.
-
-PATH_LIBRARY_PREFIX = "/library"
-PATH_LIBRARY_NAME = "/{name}"
-
-URL_LIBRARY_PREFIX = f"{API_PREFIX}{PATH_LIBRARY_PREFIX}"
-URL_LIBRARY_NAME = f"{URL_LIBRARY_PREFIX}{PATH_LIBRARY_NAME}"
+# The runner dispatches workflow `action:` entries to LIBRARY[name] in
+# qiita_control_plane.actions.library — direct in-process call, no HTTP.
+# This enum is the single declaration point so YAML and dispatch stay in
+# lockstep.
 
 
 class LibraryPrimitive(StrEnum):
-    """Closed set of library-primitive names exposed by /api/v1/library/{name}.
+    """Closed set of library-primitive names referenced by workflow YAML.
 
-    Adding a primitive is a contract change visible to every workflow YAML
-    and every caller; this enum is the single declaration point. StrEnum
-    members compare equal to their string value, so dict keys built around
-    bare strings (e.g. JSONB-decoded `WorkflowAction.name`) keep working
-    while new code gets the typo-catching benefit of an enum.
+    StrEnum members compare equal to their string value, so dict keys built
+    around bare strings (e.g. JSONB-decoded `WorkflowAction.name`) keep
+    working while new code gets the typo-catching benefit of an enum.
     """
 
     MINT_FEATURES = "mint-features"
     WRITE_MEMBERSHIP = "write-membership"
     REGISTER_FILES = "register-files"
+
+
+# =============================================================================
+# /step/* — orchestrator HTTP API
+# =============================================================================
+# Single endpoint the control-plane runner uses to dispatch a workflow
+# `step:` entry to the orchestrator's ComputeBackend. Synchronous for now:
+# the request blocks for the duration of `backend.run_step`. Async +
+# callback model is deferred to when SlurmBackend is wired (see
+# docs/architecture.md "Compute Orchestrator").
+
+PATH_STEP_PREFIX = "/step"
+PATH_STEP_RUN = "/run"
+
+URL_STEP_PREFIX = f"{API_PREFIX}{PATH_STEP_PREFIX}"
+URL_STEP_RUN = f"{URL_STEP_PREFIX}{PATH_STEP_RUN}"

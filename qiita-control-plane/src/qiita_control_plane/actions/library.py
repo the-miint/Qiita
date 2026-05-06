@@ -261,9 +261,13 @@ async def mint_features(
         total_minted += minted
         total_reused += reused
 
-    # Write feature_map.parquet via DuckDB. The temp table is the
-    # cleanest way to ferry a Python dict into Parquet without going
-    # through pyarrow directly.
+    # Write feature_map.parquet via DuckDB. We have a small Python dict
+    # already in hand, and DuckDB's `executemany` + `COPY` ferries it to
+    # Parquet without us having to construct an Arrow Table manually.
+    # `write_membership` below uses `to_arrow_reader` for the *opposite*
+    # direction (streaming a large Parquet back into Python in batches);
+    # both are pyarrow under the hood, but the API surface chosen here
+    # matches the data-movement direction.
     pairs = [(str(h), idx) for h, idx in full_mapping.items()]
     with duckdb.connect(":memory:") as duck:
         duck.execute("CREATE TEMP TABLE feature_map (sequence_hash UUID, feature_idx BIGINT)")

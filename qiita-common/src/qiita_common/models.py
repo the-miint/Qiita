@@ -94,79 +94,29 @@ class FeatureHashEntry(BaseModel):
         return self
 
 
-class FeatureMintResponse(BaseModel):
-    """Returned by the mint-features library primitive.
+class StepRunRequest(BaseModel):
+    """Body for POST /api/v1/step/run on the orchestrator.
 
-    `feature_map_path` points to a Parquet file the primitive wrote with
-    columns (sequence_hash UUID, feature_idx BIGINT). Downstream entries
-    consume this file directly via DuckDB read_parquet — no Python-side
-    materialisation of the mapping. `minted` / `reused` are tracking
-    counts: novel rows inserted into qiita.feature versus pre-existing.
+    Issued by the control-plane runner for every workflow `step:` entry.
+    The orchestrator dispatches to its configured ComputeBackend's
+    `run_step`. Paths are absolute and live on the workspace shared
+    between control plane and orchestrator.
     """
 
-    feature_map_path: str
-    minted: int
-    reused: int
+    step_name: str = Field(min_length=1)
+    inputs: dict[str, str] = Field(default_factory=dict)
+    workspace: str = Field(min_length=1)
+    reference_idx: Annotated[int, Field(gt=0)]
 
 
-# Wire-format definition kept for reference; the per-resource route this
-# model serviced (POST /reference/{idx}/membership) was folded into the
-# generic /api/v1/library/{name} dispatcher in commit 3cac813. The new
-# wire shape is LibraryInvocation.inputs = {"feature_map_path": str}.
-class ReferenceMembershipRequest(BaseModel):
-    """Body for the legacy POST /reference/{reference_idx}/membership.
+class StepRunResponse(BaseModel):
+    """Returned by POST /api/v1/step/run.
 
-    Links already-minted feature_idx values to a reference via an inline
-    list. Replaced by Parquet-path input on /api/v1/library/write-membership
-    — see qiita_control_plane.actions.library.write_membership.
+    `outputs` is the backend's name → path mapping, matching the YAML's
+    declared step `outputs:`.
     """
 
-    feature_idxs: list[Annotated[int, Field(gt=0)]] = Field(min_length=1)
-
-
-class ReferenceMembershipResponse(BaseModel):
-    """Returned by the write-membership library primitive.
-
-    `linked` counts newly-inserted (reference_idx, feature_idx) rows;
-    `already_linked` counts rows the table already had (ON CONFLICT DO
-    NOTHING). Total = linked + already_linked = len(input.feature_idxs).
-    """
-
-    linked: int
-    already_linked: int
-
-
-class LibraryInvocation(BaseModel):
-    """Body for POST /api/v1/library/{name}.
-
-    `scope_target` carries the work-ticket's resource — the dispatch
-    handler validates that the chosen primitive is compatible (e.g.
-    write-membership requires kind=reference).
-
-    `inputs` is the per-primitive input dict, validated inside the
-    dispatch handler since each primitive has different requirements:
-      mint-features    → {"manifest_path": str, "output_dir": str}
-      write-membership → {"feature_map_path": str}
-      register-files   → {"staging_dir": str, "files": {filename: table}}
-
-    Path values point at Parquet files on the workspace shared between
-    runner (orchestrator) and dispatch handler (control plane).
-    """
-
-    scope_target: ScopeTarget
-    inputs: dict[str, Any] = Field(default_factory=dict)
-
-
-class LibraryResponse(BaseModel):
-    """Returned by POST /api/v1/library/{name}.
-
-    `outputs` is the primitive's return shape, varying by primitive:
-      mint-features    → {"feature_map_path": str, "minted": int, "reused": int}
-      write-membership → {"linked": int, "already_linked": int}
-      register-files   → {"registered": [path]}
-    """
-
-    outputs: dict[str, Any]
+    outputs: dict[str, str]
 
 
 # Valid status transitions for references.
@@ -185,19 +135,6 @@ VALID_STATUS_TRANSITIONS: dict[ReferenceStatus, set[ReferenceStatus]] = {
 
 class ReferenceStatusUpdate(BaseModel):
     status: ReferenceStatus
-
-
-# Wire-format definition kept for reference; the per-resource route this
-# model serviced (POST /reference/{idx}/register) was folded into the
-# generic /api/v1/library/{name} dispatcher in commit 3cac813. The new
-# wire shape is LibraryInvocation.inputs = {"staging_dir": str, "files": dict}.
-class RegisterFilesRequest(BaseModel):
-    staging_dir: str = Field(min_length=1)
-    files: dict[str, str]  # {filename: ducklake_table_name}
-
-
-class RegisterFilesResponse(BaseModel):
-    registered: list[str]  # permanent paths of registered files
 
 
 class DoGetTicketRequest(BaseModel):

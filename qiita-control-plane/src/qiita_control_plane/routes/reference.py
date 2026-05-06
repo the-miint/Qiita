@@ -28,7 +28,6 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
-    VALID_STATUS_TRANSITIONS,
     DoGetTicketRequest,
     DoGetTicketResponse,
     ReferenceCreateRequest,
@@ -37,6 +36,11 @@ from qiita_common.models import (
     ReferenceStatusUpdate,
 )
 
+from ..actions.reference import (
+    IllegalStatusTransition,
+    ReferenceNotFound,
+    transition_reference_status,
+)
 from ..auth.guards import (
     require_complete_profile,
     require_scope,
@@ -112,41 +116,12 @@ async def update_reference_status(
     pool: asyncpg.Pool = Depends(get_db_pool),
     _scope: Principal = Depends(require_scope(Scope.REFERENCE_WRITE)),
 ) -> ReferenceResponse:
-    target_status = body.status
-
-    # Build the set of valid source statuses for this target
-    valid_sources = [
-        str(src) for src, targets in VALID_STATUS_TRANSITIONS.items() if target_status in targets
-    ]
-    if not valid_sources:
-        raise HTTPException(
-            status_code=409,
-            detail=f"No valid transition to {target_status!r}",
-        )
-
-    # Atomic conditional UPDATE — avoids TOCTOU race
-    row = await pool.fetchrow(
-        "UPDATE qiita.reference SET status = $1"
-        " WHERE reference_idx = $2 AND status = ANY($3::text[])"
-        f" RETURNING {_REFERENCE_RETURNING}",
-        str(target_status),
-        reference_idx,
-        valid_sources,
-    )
-    if row is not None:
-        return ReferenceResponse(**dict(row))
-
-    # Distinguish 404 from 409
-    current = await pool.fetchval(
-        "SELECT status FROM qiita.reference WHERE reference_idx = $1",
-        reference_idx,
-    )
-    if current is None:
+    try:
+        return await transition_reference_status(pool, reference_idx, body.status)
+    except ReferenceNotFound:
         raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
-    raise HTTPException(
-        status_code=409,
-        detail=f"Cannot transition from {current!r} to {target_status!r}",
-    )
+    except IllegalStatusTransition as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 # Tables that can appear in a DoGet ticket. Must match the data plane's

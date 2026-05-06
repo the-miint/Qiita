@@ -99,7 +99,8 @@ def tree_file(tmp_path):
 
 async def _run_load(backend, manifest_file, fasta_path, feature_map_file, tmp_path, **kwargs):
     """Helper to run the load step with common args. Optional taxonomy_path /
-    tree_path / jplace_path kwargs flow into the step's `inputs` dict."""
+    tree_path / jplace_path kwargs flow into the step's `inputs` dict.
+    Returns the backend's `staging_dir` output (a sub-dir of the workspace)."""
     output_dir = tmp_path / "output"
     inputs = {
         "manifest": manifest_file,
@@ -107,8 +108,8 @@ async def _run_load(backend, manifest_file, fasta_path, feature_map_file, tmp_pa
         "feature_map": feature_map_file,
     }
     inputs.update(kwargs)
-    await backend.run_step("load", inputs, output_dir, reference_idx=REFERENCE_IDX)
-    return output_dir
+    result = await backend.run_step("load", inputs, output_dir, reference_idx=REFERENCE_IDX)
+    return result["staging_dir"]
 
 
 # --- Sequence metadata ---
@@ -309,7 +310,7 @@ async def test_phylogeny_allows_unmatched_tips(
 
     out = tmp_path / "output"
     backend = LocalBackend()
-    await backend.run_step(
+    result = await backend.run_step(
         "load",
         {
             "manifest": manifest_path,
@@ -321,7 +322,7 @@ async def test_phylogeny_allows_unmatched_tips(
         reference_idx=REFERENCE_IDX,
     )
 
-    pq = out / "reference_phylogeny.parquet"
+    pq = result["staging_dir"] / "reference_phylogeny.parquet"
     with duckdb.connect(":memory:") as conn:
         # 3 tips total (seq1, unknown_tip, seq2), 2 with feature_idx
         tips = conn.execute(f"SELECT count(*) FROM '{pq}' WHERE is_tip").fetchone()[0]

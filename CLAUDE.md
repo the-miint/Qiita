@@ -136,9 +136,20 @@ The data plane is intentionally "dumb": it only operates on identifiers it recei
 
 ### Compute orchestrator pattern
 
-The orchestrator owns the full job lifecycle — SLURM jobs themselves are kept dumb (read input, write output, exit). The orchestrator submits via slurmrestd, polls for completion, verifies output (identifier integrity + file mode), collects logs, then calls back to the control plane REST endpoint. It uses a dedicated `compute` service account with narrow permissions (update work tickets + request file registration only).
+The orchestrator is a passive HTTP service: it accepts `POST /api/v1/step/run` from the control-plane runner, dispatches to its configured `ComputeBackend`, and returns the step's output paths. SLURM jobs themselves remain dumb (read input, write output, exit). The orchestrator owns slurmrestd polling and output verification (identifier integrity + file mode) inside its backend implementation.
+
+**The orchestrator has no DB access and no service-account PAT to the control plane** in v1 — workflow lifecycle and DB writes happen entirely on the control plane side. Async-step + CO → CP callbacks (and the `compute` service-account credential) come back when `SlurmBackend` lands.
 
 The control plane enforces **disallow-without-delete**: before submitting any job it checks `(prep_sample_idx, processing_idx)` pairs — COMPLETED results require explicit DELETE before resubmission; PENDING/QUEUED/PROCESSING states block new submission entirely.
+
+### Workflow runner
+
+`qiita_control_plane.runner.run_workflow` walks an action's `steps:` list for a single `qiita.work_ticket`. Lives in the control plane (direct DB access for work_ticket / action / reference rows is legitimate here). For each entry:
+
+- `step:` — calls the orchestrator over HTTP via `qiita_common.compute_backend_client.ComputeBackendClient` (`POST /api/v1/step/run`). Synchronous in v1: blocks for the duration of the backend step.
+- `action:` — calls the matching primitive in `qiita_control_plane.actions.library.LIBRARY` directly, no HTTP hop.
+
+Status PATCHes declared in YAML (`target_status`) call `qiita_control_plane.actions.reference.transition_reference_status` in-process. Same atomic, transition-validated UPDATE the public `PATCH /reference/{idx}/status` route uses.
 
 ### qiita-common as a path dependency
 

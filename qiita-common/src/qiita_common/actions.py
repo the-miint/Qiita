@@ -97,6 +97,10 @@ class WorkflowStep(BaseModel):
     container: str = Field(min_length=1, max_length=512)
     entrypoint: str | None = None
     inputs: list[str] = Field(default_factory=list)
+    # Names that flow through from action_context if present, but do not
+    # error when missing. Used for inputs whose presence is workflow-time
+    # data (e.g. a taxonomy file accompanies some references but not all).
+    optional_inputs: list[str] = Field(default_factory=list)
     outputs: list[str] = Field(default_factory=list)
     baseline_resources: BaselineResources
     target_status: str | None = Field(default=None, min_length=1, max_length=MAX_NAME_LENGTH)

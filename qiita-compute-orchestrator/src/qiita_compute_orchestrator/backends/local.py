@@ -51,6 +51,17 @@ class LocalBackend(ComputeBackend):
     submits the step's container instead and the container does the
     work. The set of step names this backend handles is the union of
     container behaviours every workflow needs in dev/test mode.
+
+    **Canonical-implementation contract:** the per-step helpers below
+    (`_run_hash`, `_run_load`, plus the module-level `_write_*` builders)
+    are the source of truth for what each step does. When `SlurmBackend`
+    is wired, the corresponding container's entrypoint will execute the
+    same DuckDB+miint logic — either by importing this module and
+    invoking the helper with paths read from `params.json`, or by
+    extracting the SQL into a shared `qiita_compute_orchestrator.jobs`
+    module that both backends consume. Either way, `LocalBackend` and
+    the SLURM container must not drift apart. See docs/architecture.md
+    "Backend code-sharing" for the design intent.
     """
 
     async def run_step(
@@ -65,11 +76,15 @@ class LocalBackend(ComputeBackend):
             manifest = await self._run_hash(inputs["fasta_path"], workspace, reference_idx)
             return {"manifest": manifest}
         if name == "load":
+            # Sub-dir so load's reference_*.parquet outputs don't mingle
+            # with earlier-step artifacts (manifest, feature_map) in the
+            # workspace — register-files globs whatever lives in the dir
+            # it's pointed at, so isolation matters.
             staging_dir = await self._run_load(
                 manifest_path=inputs["manifest"],
                 fasta_path=inputs["fasta_path"],
                 feature_map_path=inputs["feature_map"],
-                output_dir=workspace,
+                output_dir=workspace / "staging",
                 reference_idx=reference_idx,
                 taxonomy_path=inputs.get("taxonomy_path"),
                 tree_path=inputs.get("tree_path"),
@@ -118,6 +133,8 @@ class LocalBackend(ComputeBackend):
             # Write manifest as Parquet — columns (read_id, sequence_hash, length).
             # The hash column is converted to UUID on the way out so downstream
             # consumers (mint-features, load step) read it as UUID natively.
+            # Sorted by sequence_hash because every downstream consumer keys
+            # off it: mint-features dedups on it; the load step JOINs on it.
             # reference_idx isn't embedded in the file; the caller's
             # work_ticket.scope_target.reference_idx is the source of truth.
             conn.execute(
@@ -126,7 +143,7 @@ class LocalBackend(ComputeBackend):
                 "    CAST(hash AS UUID) AS sequence_hash,"
                 "    len AS length"
                 "  FROM raw_seqs"
-                "  ORDER BY read_id"
+                "  ORDER BY sequence_hash"
                 f") TO '{out}' (FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd')"
             )
             conn.execute("DROP TABLE raw_seqs")
@@ -210,7 +227,7 @@ def _build_id_map(
     conn.execute(
         "CREATE TEMP TABLE id_map AS "
         "SELECT m.read_id, f.feature_idx,"
-        "  CAST(m.sequence_hash AS VARCHAR) AS sequence_hash,"
+        "  m.sequence_hash,"
         "  m.length AS sequence_length_bp "
         "FROM read_parquet(?) m "
         "JOIN read_parquet(?) f "
@@ -238,7 +255,7 @@ def _write_sequence_metadata(conn: duckdb.DuckDBPyConnection, output_dir: Path) 
     conn.execute(
         "COPY ("
         "  SELECT feature_idx,"
-        "    CAST(sequence_hash AS UUID) AS sequence_hash,"
+        "    sequence_hash,"
         "    CAST(sequence_length_bp AS BIGINT) AS sequence_length_bp"
         "  FROM id_map"
         "  ORDER BY feature_idx"

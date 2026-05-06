@@ -1,21 +1,21 @@
 """Workflow runner — walks an action's `steps` list for one work ticket.
 
-Step entries dispatch to the local compute backend; action entries
-dispatch via the ControlPlaneClient (HTTP). Status transitions are
-declared per-entry in the YAML and PATCHed before each entry that
+`step:` entries dispatch to the orchestrator via ComputeBackendClient
+(HTTP). `action:` entries dispatch to LIBRARY in-process — no HTTP hop.
+Status transitions declared in YAML are PATCHed before each entry that
 declares one. Workflow-level success/failure transitions wrap the run.
 
-Trigger surface for v1 is a plain async function. Tests invoke it
-directly.
+Lives in the control plane: direct DB access for work_ticket / action /
+reference rows is legitimate here. The orchestrator is reduced to its
+SLURM-driver role behind `POST /step/run`.
 
 Workspace contract: every entry that needs a file consumes a path in
-`<workspace_root>/<work_ticket_idx>/`. Action library functions write
-their outputs (e.g. `feature_map.parquet`) into the same workspace, so
-later entries see them via the runner's binding map.
-
-DB access: direct asyncpg pool. The orchestrator and control-plane
-share the qiita database in dev / current production layouts.
+`<workspace_root>/<work_ticket_idx>/`. LIBRARY primitives write their
+outputs (e.g. `feature_map.parquet`) into the same workspace, so later
+entries see them via the runner's binding map.
 """
+
+from __future__ import annotations
 
 import json
 import logging
@@ -25,10 +25,11 @@ from typing import Any
 import asyncpg
 from qiita_common.actions import ActionDefinition, WorkflowAction, WorkflowStep
 from qiita_common.api_paths import LibraryPrimitive
-from qiita_common.client import ControlPlaneClient
-from qiita_common.models import ScopeTargetKind, WorkTicketState
+from qiita_common.compute_backend_client import ComputeBackendClient
+from qiita_common.models import ReferenceStatus, ScopeTargetKind, WorkTicketState
 
-from .backend import ComputeBackend
+from .actions.library import LIBRARY
+from .actions.reference import transition_reference_status
 
 _log = logging.getLogger(__name__)
 
@@ -37,10 +38,11 @@ DEFAULT_WORKSPACE_ROOT = Path("/data/workspace")
 
 async def run_workflow(
     work_ticket_idx: int,
-    backend: ComputeBackend,
-    client: ControlPlaneClient,
     pool: asyncpg.Pool,
+    backend_client: ComputeBackendClient,
     *,
+    hmac_secret: bytes,
+    data_plane_url: str,
     workspace_root: Path = DEFAULT_WORKSPACE_ROOT,
 ) -> None:
     """Execute the workflow attached to one work ticket.
@@ -53,8 +55,8 @@ async def run_workflow(
 
     Pre-conditions:
         * Ticket must be in 'pending' state. A leftover PROCESSING
-          (orchestrator crashed mid-run) requires operator recovery —
-          the runner refuses to silently re-run.
+          (runner crashed mid-run) requires operator recovery — the
+          runner refuses to silently re-run.
         * Action ``(action_id, version)`` must exist in qiita.action
           with ``enabled=true``.
     """
@@ -75,8 +77,8 @@ async def run_workflow(
     await _atomic_transition(
         pool,
         work_ticket_idx,
-        expected=WorkTicketState.PENDING.value,
-        new=WorkTicketState.PROCESSING.value,
+        expected=WorkTicketState.PENDING,
+        new=WorkTicketState.PROCESSING,
     )
 
     workspace = workspace_root / str(work_ticket_idx)
@@ -96,13 +98,23 @@ async def run_workflow(
     try:
         for index, entry in enumerate(action.steps):
             if entry.target_status and entry.target_status != current_status:
-                await _patch_resource_status(client, scope_target, entry.target_status)
+                await _patch_resource_status(pool, scope_target, entry.target_status)
                 current_status = entry.target_status
 
             if isinstance(entry, WorkflowStep):
-                outputs = await _dispatch_step(backend, entry, bound, workspace, scope_target)
+                outputs = await _dispatch_step(
+                    backend_client, entry, bound, workspace, scope_target
+                )
             elif isinstance(entry, WorkflowAction):
-                outputs = await _dispatch_action(client, entry, bound, workspace, scope_target)
+                outputs = await _dispatch_action(
+                    pool,
+                    entry,
+                    bound,
+                    workspace,
+                    scope_target,
+                    hmac_secret=hmac_secret,
+                    data_plane_url=data_plane_url,
+                )
             else:
                 # WorkflowEntry is a closed union; the discriminator on
                 # ActionDefinition guarantees one of the two arms above.
@@ -110,19 +122,19 @@ async def run_workflow(
             bound.update(outputs)
 
         if action.success_status:
-            await _patch_resource_status(client, scope_target, action.success_status)
+            await _patch_resource_status(pool, scope_target, action.success_status)
         await _atomic_transition(
             pool,
             work_ticket_idx,
-            expected=WorkTicketState.PROCESSING.value,
-            new=WorkTicketState.COMPLETED.value,
+            expected=WorkTicketState.PROCESSING,
+            new=WorkTicketState.COMPLETED,
         )
         _log.info("workflow %d completed", work_ticket_idx)
-    except Exception as exc:
+    except Exception:
         _log.exception("workflow %d failed", work_ticket_idx)
         if action.failure_status:
             try:
-                await _patch_resource_status(client, scope_target, action.failure_status)
+                await _patch_resource_status(pool, scope_target, action.failure_status)
             except Exception:
                 _log.exception(
                     "best-effort failure_status PATCH for work_ticket %d failed",
@@ -131,10 +143,10 @@ async def run_workflow(
         await _atomic_transition(
             pool,
             work_ticket_idx,
-            expected=WorkTicketState.PROCESSING.value,
-            new=WorkTicketState.FAILED.value,
+            expected=WorkTicketState.PROCESSING,
+            new=WorkTicketState.FAILED,
         )
-        raise exc
+        raise
 
 
 # =============================================================================
@@ -211,8 +223,8 @@ async def _atomic_transition(
     pool: asyncpg.Pool,
     work_ticket_idx: int,
     *,
-    expected: str,
-    new: str,
+    expected: WorkTicketState,
+    new: WorkTicketState,
 ) -> None:
     """UPDATE state with a TOCTOU-safe WHERE clause. Raises if the row
     isn't in the expected state — surfacing a stuck PROCESSING ticket
@@ -221,9 +233,9 @@ async def _atomic_transition(
         "UPDATE qiita.work_ticket SET state = $1::qiita.work_ticket_state "
         "WHERE work_ticket_idx = $2 AND state = $3::qiita.work_ticket_state "
         "RETURNING work_ticket_idx",
-        new,
+        new.value,
         work_ticket_idx,
-        expected,
+        expected.value,
     )
     if updated is None:
         actual = await pool.fetchval(
@@ -232,7 +244,7 @@ async def _atomic_transition(
         )
         raise RuntimeError(
             f"could not transition work_ticket {work_ticket_idx} "
-            f"from {expected!r} to {new!r}; actual state {actual!r}"
+            f"from {expected.value!r} to {new.value!r}; actual state {actual!r}"
         )
 
 
@@ -260,57 +272,71 @@ def _build_scope_target(work_ticket: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _patch_resource_status(
-    client: ControlPlaneClient, scope_target: dict[str, Any], target_status: str
+    pool: asyncpg.Pool, scope_target: dict[str, Any], target_status: str
 ) -> None:
-    """Drive the appropriate resource-status PATCH for the scope_target.
+    """Drive the appropriate resource-status transition for the scope_target.
     Today only `reference` is wired."""
     if scope_target["kind"] == ScopeTargetKind.REFERENCE.value:
-        await client.update_reference_status(scope_target["reference_idx"], target_status)
+        await transition_reference_status(
+            pool, scope_target["reference_idx"], ReferenceStatus(target_status)
+        )
         return
     raise NotImplementedError(
-        f"status PATCH for scope_target.kind={scope_target['kind']!r} not yet wired"
+        f"status transition for scope_target.kind={scope_target['kind']!r} not yet wired"
     )
 
 
 async def _dispatch_step(
-    backend: ComputeBackend,
+    backend_client: ComputeBackendClient,
     entry: WorkflowStep,
     bound: dict[str, Any],
     workspace: Path,
     scope_target: dict[str, Any],
 ) -> dict[str, Any]:
     """Translate the YAML-declared input names into Path arguments and
-    call backend.run_step; record outputs under the YAML's declared
-    names so subsequent entries can reference them."""
+    call the orchestrator's /step/run endpoint; record outputs under the
+    YAML's declared names so subsequent entries can reference them.
+
+    `optional_inputs` flow through if present in the binding map; missing
+    ones are simply omitted from the dispatch payload (the backend's
+    step handler decides what to do without them)."""
     inputs = {name: Path(bound[name]) for name in entry.inputs}
-    # Backend steps that need a reference_idx (today: hash, load) only run
-    # under reference-scoped tickets. Refuse to silently substitute a 0
-    # for non-reference scope_targets — fail-fast tells the operator the
+    inputs.update({name: Path(bound[name]) for name in entry.optional_inputs if name in bound})
+    # Steps that need a reference_idx (today: hash, load) only run under
+    # reference-scoped tickets. Refuse to silently substitute a 0 for
+    # non-reference scope_targets — fail-fast tells the operator the
     # workflow YAML and the ticket scope are mismatched.
     if scope_target["kind"] != ScopeTargetKind.REFERENCE.value:
         raise RuntimeError(
             f"backend step {entry.name!r} requires a reference scope_target; "
             f"got kind={scope_target['kind']!r}"
         )
-    reference_idx = scope_target["reference_idx"]
-    raw_outputs = await backend.run_step(entry.name, inputs, workspace, reference_idx=reference_idx)
-    # Convention: the backend's output dict keys match the YAML's
+    raw_outputs = await backend_client.run_step(
+        step_name=entry.name,
+        inputs=inputs,
+        workspace=workspace,
+        reference_idx=scope_target["reference_idx"],
+    )
+    # Convention: the orchestrator's output dict keys match the YAML's
     # `outputs:` names exactly. A mismatch is a workflow authoring
     # error and surfaces here as a KeyError.
     return {name: raw_outputs[name] for name in entry.outputs}
 
 
 async def _dispatch_action(
-    client: ControlPlaneClient,
+    pool: asyncpg.Pool,
     entry: WorkflowAction,
     bound: dict[str, Any],
     workspace: Path,
     scope_target: dict[str, Any],
+    *,
+    hmac_secret: bytes,
+    data_plane_url: str,
 ) -> dict[str, Any]:
-    """Translate a workflow `action:` entry into the matching
-    ControlPlaneClient call. Per-primitive logic lives here because each
-    primitive has its own input/output shape — a generic dispatcher
-    would just push the same `if name == ...` ladder somewhere else."""
+    """Translate a workflow `action:` entry into the matching LIBRARY call.
+    Per-primitive logic lives here because each primitive has its own
+    input/output shape — a generic dispatcher would just push the same
+    `if name == ...` ladder somewhere else."""
     if entry.name == LibraryPrimitive.MINT_FEATURES:
         manifest_path = Path(bound[entry.inputs[0]])
         # `genome_map_path` is a workflow-context optional, not an entry
@@ -318,20 +344,19 @@ async def _dispatch_action(
         # Pulled directly from `bound` so a ticket whose action_context
         # carries it picks up genome-association writes for free.
         genome_map = bound.get("genome_map_path")
-        resp = await client.mint_features(
-            reference_idx=scope_target["reference_idx"],
-            manifest_path=manifest_path,
-            output_dir=workspace,
+        feature_map_path, _, _ = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
+            pool,
+            manifest_path,
+            workspace,
             genome_map_path=Path(genome_map) if genome_map else None,
         )
         # YAML declares one output (typically "feature_map"); bind it.
-        return {entry.outputs[0]: Path(resp.feature_map_path)}
+        return {entry.outputs[0]: feature_map_path}
 
     if entry.name == LibraryPrimitive.WRITE_MEMBERSHIP:
         feature_map_path = Path(bound[entry.inputs[0]])
-        await client.write_membership(
-            reference_idx=scope_target["reference_idx"],
-            feature_map_path=feature_map_path,
+        await LIBRARY[LibraryPrimitive.WRITE_MEMBERSHIP](
+            pool, scope_target["reference_idx"], feature_map_path
         )
         return {}
 
@@ -347,10 +372,11 @@ async def _dispatch_action(
             raise RuntimeError(
                 f"register-files: staging_dir {staging_dir} contains no Parquet files"
             )
-        await client.register_files(
-            reference_idx=scope_target["reference_idx"],
+        await LIBRARY[LibraryPrimitive.REGISTER_FILES](
             staging_dir=str(staging_dir),
             files=files,
+            hmac_secret=hmac_secret,
+            data_plane_url=data_plane_url,
         )
         return {}
 
