@@ -313,23 +313,20 @@ Installed as the `qiita-admin` console script via `qiita-control-plane`'s pyproj
 | `token revoke-all --principal-idx N` | HTTP | Calls `POST /api/v1/admin/principal/{N}/revoke-all-tokens`. |
 | `login` | HTTP | Drives the LoginRocket Web flow end-to-end. Spawns a localhost loopback HTTP server, opens the browser to `/api/v1/auth/login?cli=1&port=N`, captures the one-time code from the redirect, exchanges it at `/api/v1/auth/cli-exchange`, and writes the PAT to `--token-file` (default `~/.qiita/token`, mode 0600). On timeout or error, prints an actionable message and exits non-zero. |
 
-## Orchestrator integration
+## CP ↔ CO service-to-service auth
 
-The orchestrator authenticates to the control plane via a service-account `qk_` token. `qiita_common.client.ControlPlaneClient` accepts:
+The control-plane runner dispatches workflow `step:` entries to the orchestrator via `POST /api/v1/step/run`. The reverse direction (CO → CP callbacks) is unused in v1 — workflow lifecycle and DB writes happen entirely on the control plane.
 
-- `api_token: str | None` — plaintext, used by tests and dev with `QIITA_ALLOW_TOKEN_ENV=true`.
-- `api_token_path: Path | None` — production drop-in (default `/etc/qiita/orchestrator.token`, mode `0400`, owned by the `qiita` user).
+A single shared bearer token authenticates this private path. Both services read it from the same conventional locations:
 
-Exactly one must be supplied; passing both or neither raises `ValueError`. The plaintext is loaded once at construction time, attached as `Authorization: Bearer <token>` to every request, and never appears in `__repr__` (redacted to `<redacted>`).
+- **`CP_TO_CO_TOKEN_PATH`** (default `/etc/qiita/cp-to-co.token`, mode `0400`). Production drop-in.
+- **`CP_TO_CO_TOKEN`** (env var). Only honoured when `QIITA_ALLOW_TOKEN_ENV=true` — dev / CI explicitly opt in.
 
-`qiita_common.log.AuthorizationScrubFilter` is a `logging.Filter` that rewrites any `Bearer <token>` substring in log messages and args to `Bearer <redacted>`. Install once at application startup so httpx's request logs (or any log line carrying request headers) can't leak the token to disk.
+The orchestrator's `step.py` validates incoming requests with a constant-time compare against the configured token. The control plane (when wiring `ComputeBackendClient`) reads from the same config.
 
-### Resolution order in orchestrator `Settings.from_env`
+`qiita_common.log.AuthorizationScrubFilter` is a `logging.Filter` that rewrites any `Bearer <token>` substring in log messages and args to `Bearer <redacted>`. Install once at application startup so httpx's request logs can't leak the token to disk.
 
-1. **`CONTROL_PLANE_API_TOKEN_PATH`** (default `/etc/qiita/orchestrator.token`). If the file exists, use it. This is the production path.
-2. **`CONTROL_PLANE_API_TOKEN`** (env var). Only honoured when **`QIITA_ALLOW_TOKEN_ENV=true`** — dev / CI explicitly opt in. Production never sets the flag, so a leaked env var alone can't drive auth.
-
-If neither source yields a token, `Settings.from_env()` raises `RuntimeError` with an actionable message pointing at both paths.
+When async-step + CO → CP callbacks land alongside `SlurmBackend` (deferred to a follow-up PR), the orchestrator will additionally need its own service-account PAT to call back into `/work-ticket/{idx}/transition`. The historical `/etc/qiita/orchestrator.token` runbook + `orchestrator-token-rotation.md` documentation will apply at that point. Today the file is unused.
 
 <!-- See "First-deploy bootstrap" subsection within Endpoints. -->
 ## First-deploy bootstrap

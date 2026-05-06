@@ -174,6 +174,7 @@ async def compute_worker_service_account(postgres_pool, tmp_path_factory):
         label="orchestrator-fixture",
         scopes=[
             Scope.FEATURE_MINT,
+            Scope.REFERENCE_WRITE,
             Scope.REFERENCE_REGISTER_FILES,
             Scope.REFERENCE_READ,
             Scope.TICKET_DOGET,

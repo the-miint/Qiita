@@ -1,73 +1,85 @@
-"""End-to-end integration test: create → hash → mint → load → register → DoGet.
+"""End-to-end integration test: drive workflows/reference-add via the
+runner with real LocalBackend + real LIBRARY + real data plane Flight,
+then DoGet the registered Parquet rows back via Arrow Flight.
 
-Exercises every component: control plane (REST), orchestrator (LocalBackend),
-DuckLake (Parquet registration), data plane (Arrow Flight DoGet).
+Exercises every component:
+  * control plane (runner, LIBRARY primitives, status transitions)
+  * orchestrator-equivalent (LocalBackend in-process)
+  * data plane (Arrow Flight DoAction for register, DoGet for read)
+  * DuckLake (Parquet registration via the data plane)
 
-Relies on the shared `data_plane`, `hmac_secret`, and `postgres_pool` fixtures
-in conftest.py — no per-module process/secret/schema plumbing lives here.
+Relies on the shared `data_plane`, `hmac_secret`, and `postgres_pool`
+fixtures in conftest.py — no per-module process/secret/schema plumbing
+lives here.
 """
 
-import base64
-import json
 import uuid
+from pathlib import Path
 
 import pyarrow.flight as flight
 import pytest
-from httpx import ASGITransport, AsyncClient
+
+from _runner_helpers import LocalComputeBackendClient
+
+_REFERENCE_ADD_YAML_PATH = (
+    Path(__file__).parent.parent.parent / "workflows" / "reference-add" / "1.0.0.yaml"
+)
 
 
 @pytest.fixture
 def flight_client(data_plane):
-    client = flight.FlightClient(f"grpc://127.0.0.1:{data_plane['port']}")
+    from qiita_common.api_paths import LOOPBACK_HOST
+
+    client = flight.FlightClient(f"grpc://{LOOPBACK_HOST}:{data_plane['port']}")
     yield client
     client.close()
 
 
 @pytest.fixture
-async def client(postgres_pool, hmac_secret, data_plane, human_admin_session):
-    """AsyncClient with HMAC secret and data plane URL injected into app state.
+async def synced_reference_add_action(postgres_pool, tmp_path):
+    """Materialize workflows/reference-add/1.0.0.yaml under tmp_path/workflows/
+    so the loader's directory walk picks it up, sync it into qiita.action,
+    and clean the row up after."""
+    from qiita_control_plane.actions import load_actions, sync_actions
 
-    Default Authorization is the session admin (so POST /references and
-    PATCH /references/{id}/status work). Service-only routes (mint, register,
-    doget tickets) override per-request via `headers=worker_headers`.
-    """
-    from qiita_control_plane.config import Settings
-    from qiita_control_plane.main import app
+    workflows_dir = tmp_path / "workflows" / "reference-add"
+    workflows_dir.mkdir(parents=True)
+    yaml_text = _REFERENCE_ADD_YAML_PATH.read_text()
+    test_version = f"e2e-{uuid.uuid4()}"
+    yaml_text = yaml_text.replace("version: 1.0.0", f"version: {test_version}")
+    (workflows_dir / "1.0.0.yaml").write_text(yaml_text)
 
-    app.state.pool = postgres_pool
-    app.state.settings = Settings(
-        database_url="unused-in-test",
-        hmac_secret_key=hmac_secret,
-        data_plane_url=f"grpc://127.0.0.1:{data_plane['port']}",
+    actions = load_actions(tmp_path / "workflows")
+    async with postgres_pool.acquire() as conn:
+        await sync_actions(conn, actions)
+
+    yield ("reference-add", test_version)
+
+    await postgres_pool.execute(
+        "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
+        "reference-add",
+        test_version,
     )
-    async with AsyncClient(
-        transport=ASGITransport(app=app),
-        base_url="http://test",
-        headers={"Authorization": f"Bearer {human_admin_session['token']}"},
-    ) as ac:
-        yield ac
+    await postgres_pool.execute(
+        "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
+        "reference-add",
+        test_version,
+    )
 
 
 @pytest.fixture
-def worker_headers(compute_worker_service_account):
-    """Authorization header for the compute worker service account — required
-    by mint, register_files, and tickets:doget endpoints."""
-    return {"Authorization": f"Bearer {compute_worker_service_account['token']}"}
-
-
-@pytest.fixture
-async def ref_for_e2e(client, postgres_pool):
-    """Create a reference and clean up after."""
-    resp = await client.post(
-        "/api/v1/reference",
-        json={
-            "name": f"e2e-{uuid.uuid4()}",
-            "version": "1.0",
-            "kind": "sequence_reference",
-        },
+async def fresh_reference(postgres_pool, human_admin_session):
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
+        " VALUES ($1, '1.0', 'sequence_reference', 'pending', $2)"
+        " RETURNING reference_idx",
+        f"e2e-{uuid.uuid4()}",
+        human_admin_session["principal_idx"],
     )
-    idx = resp.json()["reference_idx"]
     yield idx
+    await postgres_pool.execute(
+        "DELETE FROM qiita.work_ticket WHERE reference_idx = $1", idx
+    )
     await postgres_pool.execute(
         "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", idx
     )
@@ -76,7 +88,7 @@ async def ref_for_e2e(client, postgres_pool):
     )
 
 
-TEST_SEQUENCES = {
+_TEST_SEQUENCES = {
     "seq1": "ATCGATCGATCG",
     "seq2": "GCTAGCTAGCTA",
     "seq3": "AAATTTTCCCGGG",
@@ -87,13 +99,14 @@ TEST_SEQUENCES = {
 def fasta_e2e(tmp_path):
     path = tmp_path / "test.fasta"
     with open(path, "w") as f:
-        for name, seq in TEST_SEQUENCES.items():
+        for name, seq in _TEST_SEQUENCES.items():
             f.write(f">{name}\n{seq}\n")
     return path
 
 
 @pytest.fixture
 def taxonomy_e2e(tmp_path):
+    """Parquet with (feature_id, taxonomy) — feature_id matches FASTA read_ids."""
     import duckdb as _ddb
 
     path = tmp_path / "taxonomy.parquet"
@@ -113,229 +126,134 @@ def taxonomy_e2e(tmp_path):
 
 @pytest.fixture
 def tree_e2e(tmp_path):
+    """Newick tree whose tip names match the FASTA read_ids — load step
+    populates feature_idx on tip nodes via the read_id → feature_idx join."""
     path = tmp_path / "tree.nwk"
     path.write_text("((seq1:0.1,seq2:0.2):0.3,seq3:0.4);")
     return path
 
 
 async def test_e2e_create_to_doget(
-    client,
+    postgres_pool,
     data_plane,
+    hmac_secret,
     flight_client,
-    ref_for_e2e,
+    synced_reference_add_action,
+    fresh_reference,
     fasta_e2e,
     taxonomy_e2e,
     tree_e2e,
+    human_admin_session,
     tmp_path,
-    worker_headers,
 ):
-    """Full E2E: create → hash → mint → load → register (via data plane) → ticket → DoGet."""
-    from qiita_compute_orchestrator.backends.local import LocalBackend
+    """Full E2E: runner walks reference-add (driving optional taxonomy +
+    tree inputs through action_context) → register Parquet via Flight →
+    DoGet round-trips sequences, chunks, taxonomy, and phylogeny.
+    """
+    import json as _json
 
-    ref_idx = ref_for_e2e
-    backend = LocalBackend()
+    from qiita_common.api_paths import LOOPBACK_HOST
+    from qiita_control_plane.auth.tickets import sign_ticket
+    from qiita_control_plane.runner import run_workflow
 
-    # --- Hash ---
-    await client.patch(
-        f"/api/v1/reference/{ref_idx}/status", json={"status": "hashing"}
+    action_id, action_version = synced_reference_add_action
+    action_context = _json.dumps(
+        {
+            "fasta_path": str(fasta_e2e),
+            "taxonomy_path": str(taxonomy_e2e),
+            "tree_path": str(tree_e2e),
+        }
     )
-    hash_dir = tmp_path / "hash"
-    manifest_path = await backend.run_hash_job(
-        fasta_path=fasta_e2e, output_dir=hash_dir, reference_idx=ref_idx
-    )
-    manifest = json.loads(manifest_path.read_text())
-
-    # --- Mint ---
-    entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
-    mint_resp = await client.post(
-        f"/api/v1/reference/{ref_idx}/feature/mint",
-        json={"entries": entries},
-        headers=worker_headers,
-    )
-    assert mint_resp.status_code == 200
-    fm_path = tmp_path / "feature_map.ndjson"
-    with open(fm_path, "w") as f:
-        for k, v in mint_resp.json()["mapping"].items():
-            f.write(json.dumps({"sequence_hash": k, "feature_idx": v}) + "\n")
-
-    # --- Load (write Parquet to staging) ---
-    await client.patch(
-        f"/api/v1/reference/{ref_idx}/status", json={"status": "loading"}
-    )
-    staging_dir = tmp_path / "staging"
-    await backend.run_load_job(
-        manifest_path=manifest_path,
-        fasta_path=fasta_e2e,
-        feature_map_path=fm_path,
-        output_dir=staging_dir,
-        reference_idx=ref_idx,
-        taxonomy_path=taxonomy_e2e,
-        tree_path=tree_e2e,
+    work_ticket_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, action_context"
+        ") VALUES ($1, $2, $3, 'reference', $4, $5::jsonb)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        action_version,
+        human_admin_session["principal_idx"],
+        fresh_reference,
+        action_context,
     )
 
-    # --- Register via control plane → data plane DoAction ---
-    reg_resp = await client.post(
-        f"/api/v1/reference/{ref_idx}/register",
-        json={
-            "staging_dir": str(staging_dir),
-            "files": {
-                "reference_sequences.parquet": "reference_sequences",
-                "reference_sequence_chunks.parquet": "reference_sequence_chunks",
-                "reference_membership.parquet": "reference_membership",
-                "reference_taxonomy.parquet": "reference_taxonomy",
-                "reference_phylogeny.parquet": "reference_phylogeny",
-            },
-        },
-        headers=worker_headers,
+    await run_workflow(
+        work_ticket_idx,
+        postgres_pool,
+        LocalComputeBackendClient(),  # type: ignore[arg-type]
+        hmac_secret=hmac_secret,
+        data_plane_url=f"grpc://{LOOPBACK_HOST}:{data_plane['port']}",
+        workspace_root=tmp_path / "workspace",
     )
-    assert reg_resp.status_code == 201
 
-    # --- Transition to active ---
-    active_resp = await client.patch(
-        f"/api/v1/reference/{ref_idx}/status", json={"status": "active"}
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
     )
-    assert active_resp.status_code == 200
+    assert state == "completed"
 
-    # --- Sign ticket for reference_sequences (metadata-only: hash + length) ---
-    ticket_resp = await client.post(
-        f"/api/v1/reference/{ref_idx}/ticket/doget",
-        json={"table": "reference_sequences"},
-        headers=worker_headers,
+    ref_status = await postgres_pool.fetchval(
+        "SELECT status FROM qiita.reference WHERE reference_idx = $1",
+        fresh_reference,
     )
-    assert ticket_resp.status_code == 201
-    ticket_bytes = base64.b64decode(ticket_resp.json()["ticket"])
+    assert ref_status == "active"
 
-    # --- DoGet via Arrow Flight ---
-    reader = flight_client.do_get(flight.Ticket(ticket_bytes))
-    table = reader.read_all()
+    def _doget(table_name: str):
+        ticket_bytes = sign_ticket(
+            table=table_name,
+            filter={"reference_idx": [fresh_reference]},
+            secret=hmac_secret,
+        )
+        return flight_client.do_get(flight.Ticket(ticket_bytes)).read_all()
 
+    # reference_sequences round-trip via Flight.
+    table = _doget("reference_sequences")
     assert table.num_rows == 3
-    assert "feature_idx" in table.column_names
-    assert "sequence_hash" in table.column_names
-    assert "sequence_length_bp" in table.column_names
-    returned_fidxs = set(table.column("feature_idx").to_pylist())
-    assert len(returned_fidxs) == 3
-
-    # --- Verify sequence data via reference_sequence_chunks ---
-    chunks_ticket_resp = await client.post(
-        f"/api/v1/reference/{ref_idx}/ticket/doget",
-        json={"table": "reference_sequence_chunks"},
-        headers=worker_headers,
+    assert {"feature_idx", "sequence_hash", "sequence_length_bp"}.issubset(
+        set(table.column_names)
     )
-    assert chunks_ticket_resp.status_code == 201
-    chunks_ticket_bytes = base64.b64decode(chunks_ticket_resp.json()["ticket"])
 
-    chunks_reader = flight_client.do_get(flight.Ticket(chunks_ticket_bytes))
-    chunks_table = chunks_reader.read_all()
+    # reference_sequence_chunks — sequences come back intact.
+    chunks = _doget("reference_sequence_chunks")
+    assert chunks.num_rows == 3
+    assert set(chunks.column("chunk_data").to_pylist()) == set(_TEST_SEQUENCES.values())
 
-    # 3 short sequences = 3 rows (one chunk each)
-    assert chunks_table.num_rows == 3
-    assert "chunk_data" in chunks_table.column_names
-    sequences = set(chunks_table.column("chunk_data").to_pylist())
-    assert sequences == set(TEST_SEQUENCES.values())
+    # reference_taxonomy — domains parsed correctly from the optional input.
+    tax = _doget("reference_taxonomy")
+    assert tax.num_rows == 3
+    assert set(tax.column("domain").to_pylist()) == {"Bacteria", "Archaea"}
+
+    # reference_phylogeny — Newick decomposed into nodes; the 3 tips carry
+    # the feature_idx values minted from the matching FASTA read_ids.
+    phylo = _doget("reference_phylogeny")
+    tip_rows = [r for r in phylo.to_pylist() if r["is_tip"]]
+    assert len(tip_rows) == 3
+    assert all(r["feature_idx"] is not None for r in tip_rows)
 
 
-async def test_e2e_doget_taxonomy(
-    client,
-    data_plane,
-    flight_client,
-    ref_for_e2e,
-    fasta_e2e,
-    taxonomy_e2e,
-    tmp_path,
-    worker_headers,
+async def test_ticket_endpoint_rejects_non_active_reference(
+    postgres_pool, hmac_secret, fresh_reference, compute_worker_service_account
 ):
-    """Verify DoGet for reference_taxonomy returns correct parsed ranks."""
-    from qiita_compute_orchestrator.backends.local import LocalBackend
+    """Ticket route guard still works — reference at status='pending' refuses."""
+    from httpx import ASGITransport, AsyncClient
+    from qiita_common.api_paths import LOOPBACK_HOST, URL_REFERENCE_DOGET
+    from qiita_control_plane.config import Settings
+    from qiita_control_plane.main import app
 
-    ref_idx = ref_for_e2e
-    backend = LocalBackend()
-
-    # Run pipeline (hash → mint → load → register via data plane → active)
-    await client.patch(
-        f"/api/v1/reference/{ref_idx}/status", json={"status": "hashing"}
-    )
-    manifest_path = await backend.run_hash_job(
-        fasta_path=fasta_e2e,
-        output_dir=tmp_path / "h",
-        reference_idx=ref_idx,
-    )
-    manifest = json.loads(manifest_path.read_text())
-    entries = [{"sequence_hash": e["sequence_hash"]} for e in manifest["entries"]]
-    mint_resp = await client.post(
-        f"/api/v1/reference/{ref_idx}/feature/mint",
-        json={"entries": entries},
-        headers=worker_headers,
-    )
-    fm_path = tmp_path / "fm.ndjson"
-    with open(fm_path, "w") as f:
-        for k, v in mint_resp.json()["mapping"].items():
-            f.write(json.dumps({"sequence_hash": k, "feature_idx": v}) + "\n")
-
-    await client.patch(
-        f"/api/v1/reference/{ref_idx}/status", json={"status": "loading"}
-    )
-    staging = tmp_path / "s"
-    await backend.run_load_job(
-        manifest_path=manifest_path,
-        fasta_path=fasta_e2e,
-        feature_map_path=fm_path,
-        output_dir=staging,
-        reference_idx=ref_idx,
-        taxonomy_path=taxonomy_e2e,
-    )
-    reg_resp = await client.post(
-        f"/api/v1/reference/{ref_idx}/register",
-        json={
-            "staging_dir": str(staging),
-            "files": {
-                "reference_sequences.parquet": "reference_sequences",
-                "reference_sequence_chunks.parquet": "reference_sequence_chunks",
-                "reference_membership.parquet": "reference_membership",
-                "reference_taxonomy.parquet": "reference_taxonomy",
-            },
-        },
-        headers=worker_headers,
-    )
-    assert reg_resp.status_code == 201
-    await client.patch(
-        f"/api/v1/reference/{ref_idx}/status", json={"status": "active"}
+    app.state.pool = postgres_pool
+    app.state.settings = Settings(
+        database_url="unused-in-test",
+        hmac_secret_key=hmac_secret,
+        data_plane_url=f"grpc://{LOOPBACK_HOST}:0",
     )
 
-    # Sign ticket for taxonomy, scoped by feature_idx
-    ticket_resp = await client.post(
-        f"/api/v1/reference/{ref_idx}/ticket/doget",
-        json={"table": "reference_taxonomy"},
-        headers=worker_headers,
-    )
-    assert ticket_resp.status_code == 201
-    ticket_bytes = base64.b64decode(ticket_resp.json()["ticket"])
-
-    reader = flight_client.do_get(flight.Ticket(ticket_bytes))
-    table = reader.read_all()
-
-    assert table.num_rows == 3
-    assert "domain" in table.column_names
-    assert "phylum" in table.column_names
-    domains = set(table.column("domain").to_pylist())
-    assert domains == {"Bacteria", "Archaea"}
-
-
-async def test_ticket_rejects_non_active_reference(client, ref_for_e2e, worker_headers):
-    """Ticket endpoint must reject references not in 'active' status."""
-    resp = await client.post(
-        f"/api/v1/reference/{ref_for_e2e}/ticket/doget",
-        json={"table": "reference_sequences"},
-        headers=worker_headers,
-    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {compute_worker_service_account['token']}"},
+    ) as ac:
+        resp = await ac.post(
+            URL_REFERENCE_DOGET.format(reference_idx=fresh_reference),
+            json={"table": "reference_sequences"},
+        )
     assert resp.status_code == 409
-
-
-async def test_ticket_rejects_unknown_table(client, ref_for_e2e, worker_headers):
-    """Ticket endpoint must reject unknown table names."""
-    resp = await client.post(
-        f"/api/v1/reference/{ref_for_e2e}/ticket/doget",
-        json={"table": "nonexistent_table"},
-        headers=worker_headers,
-    )
-    assert resp.status_code == 422

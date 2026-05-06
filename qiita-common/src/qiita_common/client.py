@@ -7,11 +7,8 @@ import httpx
 from .auth_constants import API_PREFIX
 from .models import (
     DoGetTicketResponse,
-    FeatureHashEntry,
-    FeatureMintResponse,
     ReferenceResponse,
     ReferenceStatus,
-    RegisterFilesResponse,
 )
 
 # Default per-request HTTP timeout. Generous so a slow control-plane reply
@@ -113,29 +110,6 @@ class ControlPlaneClient:
         )
         resp.raise_for_status()
         return ReferenceResponse.model_validate(resp.json())
-
-    async def mint_features(
-        self, reference_idx: int, entries: list[FeatureHashEntry]
-    ) -> FeatureMintResponse:
-        resp = await self._http.post(
-            f"{API_PREFIX}/reference/{reference_idx}/feature/mint",
-            json={"entries": [e.model_dump(mode="json") for e in entries]},
-        )
-        resp.raise_for_status()
-        return FeatureMintResponse.model_validate(resp.json())
-
-    async def register_files(
-        self,
-        reference_idx: int,
-        staging_dir: str,
-        files: dict[str, str],
-    ) -> RegisterFilesResponse:
-        resp = await self._http.post(
-            f"{API_PREFIX}/reference/{reference_idx}/register",
-            json={"staging_dir": staging_dir, "files": files},
-        )
-        resp.raise_for_status()
-        return RegisterFilesResponse.model_validate(resp.json())
 
     async def get_doget_ticket(self, reference_idx: int, table: str) -> DoGetTicketResponse:
         resp = await self._http.post(

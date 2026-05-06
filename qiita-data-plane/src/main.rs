@@ -58,9 +58,43 @@ mod tests {
     use duckdb::Connection;
     use serial_test::serial;
 
+    /// RAII guard that snapshots the current values of named env vars on
+    /// construction and restores them on drop. Tests that mutate global
+    /// process env (Settings::from_env() reads `std::env`) MUST use this
+    /// — otherwise an `env::remove_var` in one test races against
+    /// `std::env::var` reads in another `#[serial]` test that runs in the
+    /// same cargo-test process. Concretely, the host-Postgres CI leg
+    /// flaked before this guard existed: the ducklake tests share
+    /// `#[serial]` with these config tests and saw a stale absence of
+    /// `DUCKLAKE_CATALOG_CONNSTR` left behind by a config test that
+    /// scheduled earlier in the same run.
+    struct EnvSnapshot {
+        original: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl EnvSnapshot {
+        fn capture(names: &[&'static str]) -> Self {
+            let original = names.iter().map(|&n| (n, std::env::var(n).ok())).collect();
+            Self { original }
+        }
+    }
+
+    impl Drop for EnvSnapshot {
+        fn drop(&mut self) {
+            for (name, value) in &self.original {
+                match value {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
     #[test]
     #[serial]
     fn config_with_valid_env() {
+        let _snapshot =
+            EnvSnapshot::capture(&["LISTEN_ADDR", "HMAC_SECRET_KEY", "DUCKLAKE_CATALOG_CONNSTR"]);
         std::env::remove_var("LISTEN_ADDR");
         let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
         std::env::set_var("HMAC_SECRET_KEY", &secret);
@@ -69,13 +103,12 @@ mod tests {
         assert_eq!(cfg.listen_addr.to_string(), "0.0.0.0:50051");
         assert_eq!(cfg.hmac_secret_key.len(), 32);
         assert_eq!(cfg.ducklake_catalog_connstr, "dbname=test host=localhost");
-        std::env::remove_var("HMAC_SECRET_KEY");
-        std::env::remove_var("DUCKLAKE_CATALOG_CONNSTR");
     }
 
     #[test]
     #[serial]
     fn config_rejects_missing_hmac() {
+        let _snapshot = EnvSnapshot::capture(&["HMAC_SECRET_KEY", "DUCKLAKE_CATALOG_CONNSTR"]);
         std::env::remove_var("HMAC_SECRET_KEY");
         std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
         let err = Settings::from_env().unwrap_err();
@@ -83,7 +116,6 @@ mod tests {
             err.contains("HMAC_SECRET_KEY"),
             "error should mention HMAC_SECRET_KEY: {err}"
         );
-        std::env::remove_var("DUCKLAKE_CATALOG_CONNSTR");
     }
 
     #[test]

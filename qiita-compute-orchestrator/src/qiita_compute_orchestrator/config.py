@@ -1,70 +1,69 @@
-"""Compute orchestrator configuration."""
+"""Compute orchestrator configuration.
+
+The orchestrator is a passive HTTP service: it accepts `POST /step/run`
+from the control-plane runner, dispatches to its ComputeBackend, and
+returns the outputs. It has no outbound calls in v1, so there is no
+credential for talking _to_ the control plane — only the inbound bearer
+token used to authenticate CP-originated requests.
+"""
+
+from __future__ import annotations
 
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from qiita_common.config import require_env
+# Default install location for the shared CP↔CO bearer token in
+# production (file mode 0400, owned by the orchestrator user). Mirrors
+# the pattern at /etc/qiita/orchestrator.token used elsewhere.
+DEFAULT_CP_TO_CO_TOKEN_PATH = "/etc/qiita/cp-to-co.token"
+
+BACKEND_LOCAL = "local"
+BACKEND_SLURM = "slurm"
 
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    control_plane_url: str
     backend_type: str
     shared_filesystem_root: str
-    # Exactly one of these is populated. api_token_path is the default /
-    # production path (file mode 0400 owned by the qiita user).
-    # api_token (env var) is the dev/CI escape hatch, only honoured when
-    # QIITA_ALLOW_TOKEN_ENV=true.
-    api_token_path: Path | None
-    api_token: str | None
+    # The shared bearer token CP-to-CO calls present. Loaded from a file
+    # in production; env-var fallback only when QIITA_ALLOW_TOKEN_ENV=true.
+    cp_to_co_token: str
 
     @classmethod
     def from_env(cls) -> Settings:
-        control_plane_url = require_env("CONTROL_PLANE_URL")
-        backend_type = os.environ.get("COMPUTE_BACKEND", "local")
-        shared_filesystem_root = os.environ.get(
-            "SHARED_FILESYSTEM_ROOT",
-            os.environ.get("TMPDIR", "/tmp") + "/qiita",
-        )
-
-        api_token, api_token_path = _resolve_api_token()
-
         return cls(
-            control_plane_url=control_plane_url,
-            backend_type=backend_type,
-            shared_filesystem_root=shared_filesystem_root,
-            api_token_path=api_token_path,
-            api_token=api_token,
+            backend_type=os.environ.get("COMPUTE_BACKEND", BACKEND_LOCAL),
+            shared_filesystem_root=os.environ.get(
+                "SHARED_FILESYSTEM_ROOT",
+                os.environ.get("TMPDIR", "/tmp") + "/qiita",
+            ),
+            cp_to_co_token=_resolve_cp_to_co_token(),
         )
 
 
-def _resolve_api_token() -> tuple[str | None, Path | None]:
-    """Resolve the orchestrator's control-plane PAT.
+def _resolve_cp_to_co_token() -> str:
+    """Resolve the inbound bearer token shared with the control plane.
 
     Order of precedence:
-      1. CONTROL_PLANE_API_TOKEN_PATH (default /etc/qiita/orchestrator.token).
+      1. CP_TO_CO_TOKEN_PATH (default /etc/qiita/cp-to-co.token).
          If the file exists, use it. The env-var path is the production
          drop-in.
-      2. CONTROL_PLANE_API_TOKEN (env var). Only honoured when
+      2. CP_TO_CO_TOKEN (env var). Only honoured when
          QIITA_ALLOW_TOKEN_ENV=true — dev / CI explicitly opt in; prod
          never sets the flag, so a leaked env var alone can't drive auth.
-
-    Raises RuntimeError with an actionable message if neither source yields
-    a token. Returns (api_token, api_token_path) where exactly one is set.
     """
-    path_str = os.environ.get("CONTROL_PLANE_API_TOKEN_PATH", "/etc/qiita/orchestrator.token")
-    path = Path(path_str)
+    path = Path(os.environ.get("CP_TO_CO_TOKEN_PATH", DEFAULT_CP_TO_CO_TOKEN_PATH))
     if path.is_file():
-        return (None, path)
+        return path.read_text().strip()
 
     if os.environ.get("QIITA_ALLOW_TOKEN_ENV", "false").lower() == "true":
-        token = os.environ.get("CONTROL_PLANE_API_TOKEN")
+        token = os.environ.get("CP_TO_CO_TOKEN")
         if token:
-            return (token.strip(), None)
+            return token.strip()
 
     raise RuntimeError(
-        f"orchestrator: no API token available. Either install the token at"
-        f" {path_str} (mode 0400) or set QIITA_ALLOW_TOKEN_ENV=true and"
-        f" CONTROL_PLANE_API_TOKEN for dev/CI."
+        f"orchestrator: no CP↔CO token available. Either install the token at"
+        f" {path} (mode 0400) or set QIITA_ALLOW_TOKEN_ENV=true and"
+        f" CP_TO_CO_TOKEN for dev/CI."
     )

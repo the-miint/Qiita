@@ -17,6 +17,7 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from jwt.algorithms import RSAAlgorithm
+from qiita_common.api_paths import LOOPBACK_HOST
 
 # ---------------------------------------------------------------------------
 # JWKS harness
@@ -36,14 +37,14 @@ class JwksHarness:
         self._private_key = self._gen_key()
         self._kid = f"kid-{secrets.token_hex(4)}"
         self._jwks = self._build_jwks(self._private_key, self._kid)
-        self._server = HTTPServer(("127.0.0.1", 0), self._make_handler())
+        self._server = HTTPServer((LOOPBACK_HOST, 0), self._make_handler())
         self.port = self._server.server_address[1]
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
 
     @property
     def issuer(self) -> str:
-        return f"http://127.0.0.1:{self.port}"
+        return f"http://{LOOPBACK_HOST}:{self.port}"
 
     @property
     def jwks_url(self) -> str:

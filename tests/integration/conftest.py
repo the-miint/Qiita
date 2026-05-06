@@ -21,6 +21,8 @@ from pathlib import Path
 
 import asyncpg
 import pytest
+from qiita_common.api_paths import LOOPBACK_HOST
+
 from _pg_env import (
     LIB_PATH_ENV,
     ducklake_catalog_connstr,
@@ -124,7 +126,7 @@ def _wait_for_grpc(host: str, port: int, timeout: float = 10.0) -> bool:
 
 def _alloc_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
+        s.bind((LOOPBACK_HOST, 0))
         return s.getsockname()[1]
 
 
@@ -180,7 +182,7 @@ def data_plane(hmac_secret, tmp_path_factory):
 
     env = {
         **os.environ,
-        "LISTEN_ADDR": f"127.0.0.1:{port}",
+        "LISTEN_ADDR": f"{LOOPBACK_HOST}:{port}",
         "HMAC_SECRET_KEY": base64.b64encode(hmac_secret).decode(),
         "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CATALOG_CONNSTR,
         "DUCKLAKE_DATA_PATH": data_path,
@@ -203,7 +205,7 @@ def data_plane(hmac_secret, tmp_path_factory):
             f"stdout: {stdout.decode()[:1000]}\nstderr: {stderr.decode()[:1000]}"
         )
 
-    if not _wait_for_grpc("127.0.0.1", port):
+    if not _wait_for_grpc(LOOPBACK_HOST, port):
         rc = proc.poll()
         if rc is not None:
             stdout, stderr = proc.communicate(timeout=5)

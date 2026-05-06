@@ -293,100 +293,6 @@ async def _seed_active_reference(postgres_pool, suffix: str) -> int:
     )
 
 
-async def test_mint_features_no_auth_401(boundary_client, postgres_pool):
-    ref_idx = await _seed_active_reference(postgres_pool, "no-auth")
-    resp = await boundary_client.post(
-        f"/api/v1/reference/{ref_idx}/feature/mint",
-        json={"entries": [{"sequence_hash": "00000000-0000-0000-0000-000000000001"}]},
-    )
-    assert resp.status_code == 401
-
-
-async def test_mint_features_human_403(boundary_client, postgres_pool):
-    """Human cannot mint — workers only."""
-    ref_idx = await _seed_active_reference(postgres_pool, "human-blocked")
-    token, _ = await _seed_human_with_token(
-        postgres_pool,
-        system_role=SystemRole.SYSTEM_ADMIN,
-        scopes=[
-            Scope.SELF_PROFILE,
-            Scope.SELF_TOKEN,
-            Scope.REFERENCE_READ,
-            Scope.REFERENCE_WRITE,
-            Scope.ADMIN_USER,
-            Scope.ADMIN_SERVICE_ACCOUNT,
-            Scope.ADMIN_AUDIT_READ,
-        ],
-        suffix="mint-human",
-    )
-    resp = await boundary_client.post(
-        f"/api/v1/reference/{ref_idx}/feature/mint",
-        json={"entries": [{"sequence_hash": "00000000-0000-0000-0000-000000000002"}]},
-        headers=_h(token),
-    )
-    assert resp.status_code == 403
-
-
-async def test_mint_features_service_missing_scope_403(boundary_client, postgres_pool):
-    """Service token without feature:mint."""
-    ref_idx = await _seed_active_reference(postgres_pool, "svc-no-scope")
-    token, _ = await _seed_service_with_token(
-        postgres_pool,
-        scopes=[Scope.REFERENCE_READ],
-        suffix="mint-svc-no-scope",
-    )
-    resp = await boundary_client.post(
-        f"/api/v1/reference/{ref_idx}/feature/mint",
-        json={"entries": [{"sequence_hash": "00000000-0000-0000-0000-000000000003"}]},
-        headers=_h(token),
-    )
-    assert resp.status_code == 403
-
-
-# ---------------------------------------------------------------------------
-# POST /reference/{id}/register — require_service + reference:register_files
-# ---------------------------------------------------------------------------
-
-
-async def test_register_files_human_403(boundary_client, postgres_pool):
-    ref_idx = await _seed_active_reference(postgres_pool, "register-human")
-    token, _ = await _seed_human_with_token(
-        postgres_pool,
-        system_role=SystemRole.SYSTEM_ADMIN,
-        scopes=[
-            Scope.SELF_PROFILE,
-            Scope.SELF_TOKEN,
-            Scope.REFERENCE_READ,
-            Scope.REFERENCE_WRITE,
-            Scope.ADMIN_USER,
-            Scope.ADMIN_SERVICE_ACCOUNT,
-            Scope.ADMIN_AUDIT_READ,
-        ],
-        suffix="reg-human",
-    )
-    resp = await boundary_client.post(
-        f"/api/v1/reference/{ref_idx}/register",
-        json={"staging_dir": "/tmp/x", "files": {}},
-        headers=_h(token),
-    )
-    assert resp.status_code == 403
-
-
-async def test_register_files_service_missing_scope_403(boundary_client, postgres_pool):
-    ref_idx = await _seed_active_reference(postgres_pool, "register-no-scope")
-    token, _ = await _seed_service_with_token(
-        postgres_pool,
-        scopes=[Scope.REFERENCE_READ, Scope.FEATURE_MINT],
-        suffix="reg-no-scope",
-    )
-    resp = await boundary_client.post(
-        f"/api/v1/reference/{ref_idx}/register",
-        json={"staging_dir": "/tmp/x", "files": {}},
-        headers=_h(token),
-    )
-    assert resp.status_code == 403
-
-
 # ---------------------------------------------------------------------------
 # POST /reference/{id}/ticket/doget — scope ticket:doget
 # ---------------------------------------------------------------------------
@@ -469,7 +375,7 @@ async def test_get_reference_anonymous_returns_200(boundary_client, postgres_poo
     assert resp.status_code == 200
     body = resp.json()
     assert body["reference_idx"] == ref_idx
-    assert body["created_by_idx"] is not None  # H.b dual-write invariant
+    assert body["created_by_idx"] is not None
 
 
 async def test_get_reference_authenticated_returns_200(boundary_client, postgres_pool):

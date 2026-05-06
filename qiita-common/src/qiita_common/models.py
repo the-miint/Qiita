@@ -1,7 +1,7 @@
 """Shared Pydantic models: work ticket states, API schemas, identifier types."""
 
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, EmailStr, Field, model_validator
@@ -74,6 +74,14 @@ class ReferenceResponse(BaseModel):
     created_at: AwareDatetime
 
 
+# `genome_source` / `genome_source_id` and the `genome_fields_consistent`
+# validator predate the Parquet refactor (commit 3cac813); under the
+# path-based contract genome metadata flows through `genome_map.parquet`
+# and the half-set check is enforced at the qiita.genome NOT NULL
+# constraint instead (covered by
+# test_library_mint_features_genome_map_with_null_source_id_fails). The
+# fields and validator are kept so any caller that builds the model with
+# genome data still gets the validator's protection.
 class FeatureHashEntry(BaseModel):
     sequence_hash: UUID
     genome_source: str | None = None
@@ -86,21 +94,29 @@ class FeatureHashEntry(BaseModel):
         return self
 
 
-class FeatureMintRequest(BaseModel):
-    entries: list[FeatureHashEntry] = Field(min_length=1)
+class StepRunRequest(BaseModel):
+    """Body for POST /api/v1/step/run on the orchestrator.
 
-    @model_validator(mode="after")
-    def no_duplicate_hashes(self):
-        hashes = [e.sequence_hash for e in self.entries]
-        if len(hashes) != len(set(hashes)):
-            raise ValueError("entries must not contain duplicate sequence_hash values")
-        return self
+    Issued by the control-plane runner for every workflow `step:` entry.
+    The orchestrator dispatches to its configured ComputeBackend's
+    `run_step`. Paths are absolute and live on the workspace shared
+    between control plane and orchestrator.
+    """
+
+    step_name: str = Field(min_length=1)
+    inputs: dict[str, str] = Field(default_factory=dict)
+    workspace: str = Field(min_length=1)
+    reference_idx: Annotated[int, Field(gt=0)]
 
 
-class FeatureMintResponse(BaseModel):
-    mapping: dict[UUID, int]
-    minted: int
-    reused: int
+class StepRunResponse(BaseModel):
+    """Returned by POST /api/v1/step/run.
+
+    `outputs` is the backend's name → path mapping, matching the YAML's
+    declared step `outputs:`.
+    """
+
+    outputs: dict[str, str]
 
 
 # Valid status transitions for references.
@@ -119,15 +135,6 @@ VALID_STATUS_TRANSITIONS: dict[ReferenceStatus, set[ReferenceStatus]] = {
 
 class ReferenceStatusUpdate(BaseModel):
     status: ReferenceStatus
-
-
-class RegisterFilesRequest(BaseModel):
-    staging_dir: str = Field(min_length=1)
-    files: dict[str, str]  # {filename: ducklake_table_name}
-
-
-class RegisterFilesResponse(BaseModel):
-    registered: list[str]  # permanent paths of registered files
 
 
 class DoGetTicketRequest(BaseModel):
@@ -362,3 +369,112 @@ class RevokeAllTokensResponse(BaseModel):
 
     revoked_token_idxs: list[int]
     already_revoked_count: int
+
+
+# ============================================================================
+# Work tickets / actions
+# ============================================================================
+#
+# A WorkTicket is the control-plane's record of an action invocation: who
+# requested it, which resource it targets, what action-specific context it
+# carries, and what lifecycle state it's in. The orchestrator pulls tickets
+# off the queue, dispatches the action's step pipeline (one or more `step`
+# entries plus zero or more control-plane `action` entries), and reports
+# completion back via state transitions.
+#
+# `originator_principal_idx` is the submitter; resource profile and SLURM
+# priority resolve from the originator, not the executor.
+
+
+class StepType(StrEnum):
+    """Workflow step types.
+
+    `map` runs per-sample (N independent jobs across N samples).
+    `reduce` runs once over the union of map outputs.
+    `singleton` runs once per workflow invocation — used for system-internal
+    one-shots like reference loading.
+
+    `action` (control-plane Postgres-transaction primitive) is *not* a step
+    type; it appears as a peer entry in workflow YAML and runs in-process
+    in the control plane.
+    """
+
+    MAP = "map"
+    REDUCE = "reduce"
+    SINGLETON = "singleton"
+
+
+class ScopeTargetKind(StrEnum):
+    """Closed set of work-ticket scope-target kinds. Mirrored DB-side by
+    the qiita.scope_target_kind ENUM; both work_ticket.scope_target_kind
+    and action.target_kind reference it."""
+
+    STUDY_PREP = "study_prep"
+    REFERENCE = "reference"
+
+
+class WorkTicketState(StrEnum):
+    """Work-ticket lifecycle. Mirrored DB-side by qiita.work_ticket_state.
+
+    Submission gates: PENDING / QUEUED / PROCESSING block resubmission of
+    the same `(scope_target, action_id, action_version)` triple entirely.
+    COMPLETED requires explicit DELETE before resubmission. FAILED is the
+    permanent-failure terminal state; recovery is operator-driven.
+    """
+
+    PENDING = "pending"
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class StudyPrepScopeTarget(BaseModel):
+    """Work ticket targets a (study, prep) tuple — used for sample-processing
+    actions (e.g. deblur, woltka)."""
+
+    kind: Literal[ScopeTargetKind.STUDY_PREP]
+    study_idx: Annotated[int, Field(gt=0)]
+    prep_idx: Annotated[int, Field(gt=0)]
+
+
+class ReferenceScopeTarget(BaseModel):
+    """Work ticket targets a single reference — used for reference-add and
+    any future reference-mutation action."""
+
+    kind: Literal[ScopeTargetKind.REFERENCE]
+    reference_idx: Annotated[int, Field(gt=0)]
+
+
+# Discriminated union — Pydantic and OpenAPI dispatch on the `kind` field.
+# DB-side, the same shape is encoded as a tagged union of typed columns
+# (`scope_target_kind` plus the subset-relevant `study_idx` / `prep_idx` /
+# `reference_idx`) guarded by a CHECK constraint; the `kind` here is the
+# discriminator that maps to that column.
+ScopeTarget = Annotated[
+    StudyPrepScopeTarget | ReferenceScopeTarget,
+    Field(discriminator="kind"),
+]
+
+
+class WorkTicket(BaseModel):
+    """Control-plane record of an action invocation.
+
+    `(action_id, action_version)` FK into `qiita.action` and pin the exact
+    action definition this ticket was submitted against.
+
+    `scope_target` answers "which resource is this work about?" — the
+    resource-ACL gate keys off it. `action_context` carries action-defined
+    free-form state, validated at submission against the action's declared
+    `context_schema`.
+    """
+
+    work_ticket_idx: Annotated[int, Field(gt=0)]
+    action_id: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
+    action_version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
+    originator_principal_idx: Annotated[int, Field(gt=0)]
+    scope_target: ScopeTarget
+    action_context: dict[str, Any] = Field(default_factory=dict)
+    state: WorkTicketState
+    created_at: AwareDatetime
+    updated_at: AwareDatetime

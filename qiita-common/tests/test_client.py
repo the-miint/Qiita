@@ -1,4 +1,4 @@
-"""Tests for ControlPlaneClient (auth params + user-management method surface)."""
+"""Tests for ControlPlaneClient (auth params + reference-management surface)."""
 
 import httpx
 import pytest
@@ -12,14 +12,17 @@ def test_client_importable():
 
 
 def test_client_has_required_methods():
-    """ControlPlaneClient must expose the reference-management methods."""
+    """ControlPlaneClient must expose the public reference-management methods.
+
+    Library primitives (mint-features, write-membership, register-files)
+    are no longer exposed over REST — the runner calls them in-process
+    on the control plane. See qiita_control_plane.runner.
+    """
     from qiita_common.client import ControlPlaneClient
 
     client = ControlPlaneClient(base_url="http://localhost:8080", api_token="qk_test")
     assert callable(client.create_reference)
-    assert callable(client.mint_features)
     assert callable(client.update_reference_status)
-    assert callable(client.register_files)
     assert callable(client.get_doget_ticket)
 
 

@@ -1,7 +1,6 @@
 """Tests for LocalBackend load job."""
 
 import hashlib
-import json
 from uuid import UUID
 
 import duckdb
@@ -30,27 +29,27 @@ def fasta_path(fasta_file):
 
 @pytest.fixture
 def manifest_file(tmp_path):
-    entries = [
-        {
-            "read_id": name,
-            "sequence_hash": str(TEST_HASHES[name]),
-            "length": len(seq),
-        }
-        for name, seq in TEST_SEQUENCES.items()
-    ]
-    manifest = {"reference_idx": REFERENCE_IDX, "entry_count": len(entries), "entries": entries}
-    path = tmp_path / "hash_manifest.json"
-    path.write_text(json.dumps(manifest, indent=2))
+    """Manifest as Parquet — columns (read_id, sequence_hash UUID, length).
+    Mirrors what LocalBackend._run_hash now writes."""
+    rows = [(name, str(TEST_HASHES[name]), len(seq)) for name, seq in TEST_SEQUENCES.items()]
+    path = tmp_path / "manifest.parquet"
+    with duckdb.connect(":memory:") as conn:
+        conn.execute("CREATE TEMP TABLE m (read_id VARCHAR, sequence_hash UUID, length BIGINT)")
+        conn.executemany("INSERT INTO m VALUES (?, ?::uuid, ?)", rows)
+        conn.execute(f"COPY m TO '{path}' (FORMAT PARQUET)")
     return path
 
 
 @pytest.fixture
 def feature_map_file(tmp_path):
-    """Feature map as NDJSON (one {sequence_hash, feature_idx} per line)."""
-    path = tmp_path / "feature_map.ndjson"
-    with open(path, "w") as f:
-        for hash_val, fidx in TEST_FEATURE_MAP.items():
-            f.write(json.dumps({"sequence_hash": str(hash_val), "feature_idx": fidx}) + "\n")
+    """Feature map as Parquet — columns (sequence_hash UUID, feature_idx BIGINT).
+    Mirrors what library.mint_features now writes."""
+    rows = [(str(h), fidx) for h, fidx in TEST_FEATURE_MAP.items()]
+    path = tmp_path / "feature_map.parquet"
+    with duckdb.connect(":memory:") as conn:
+        conn.execute("CREATE TEMP TABLE fm (sequence_hash UUID, feature_idx BIGINT)")
+        conn.executemany("INSERT INTO fm VALUES (?::uuid, ?)", rows)
+        conn.execute(f"COPY fm TO '{path}' (FORMAT PARQUET)")
     return path
 
 
@@ -99,17 +98,18 @@ def tree_file(tmp_path):
 
 
 async def _run_load(backend, manifest_file, fasta_path, feature_map_file, tmp_path, **kwargs):
-    """Helper to run load job with common args."""
+    """Helper to run the load step with common args. Optional taxonomy_path /
+    tree_path / jplace_path kwargs flow into the step's `inputs` dict.
+    Returns the backend's `staging_dir` output (a sub-dir of the workspace)."""
     output_dir = tmp_path / "output"
-    await backend.run_load_job(
-        manifest_path=manifest_file,
-        fasta_path=fasta_path,
-        feature_map_path=feature_map_file,
-        output_dir=output_dir,
-        reference_idx=REFERENCE_IDX,
-        **kwargs,
-    )
-    return output_dir
+    inputs = {
+        "manifest": manifest_file,
+        "fasta_path": fasta_path,
+        "feature_map": feature_map_file,
+    }
+    inputs.update(kwargs)
+    result = await backend.run_step("load", inputs, output_dir, reference_idx=REFERENCE_IDX)
+    return result["staging_dir"]
 
 
 # --- Sequence metadata ---
@@ -289,37 +289,40 @@ async def test_phylogeny_allows_unmatched_tips(
     tree_path = tmp_path / "tree_extra.nwk"
     tree_path.write_text("((seq1:0.1,unknown_tip:0.2):0.3,seq2:0.4);")
 
-    # Manifest with only seq1 and seq2
-    entries = [
-        {"read_id": n, "sequence_hash": str(TEST_HASHES[n]), "length": len(TEST_SEQUENCES[n])}
-        for n in ["seq1", "seq2"]
-    ]
-    manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(
-            {"reference_idx": REFERENCE_IDX, "entry_count": len(entries), "entries": entries}
-        )
-    )
+    # Manifest with only seq1 and seq2 — written as Parquet to match the
+    # production format the load step expects.
+    manifest_rows = [(n, str(TEST_HASHES[n]), len(TEST_SEQUENCES[n])) for n in ["seq1", "seq2"]]
+    manifest_path = tmp_path / "partial_manifest.parquet"
+    with duckdb.connect(":memory:") as conn:
+        conn.execute("CREATE TEMP TABLE m (read_id VARCHAR, sequence_hash UUID, length BIGINT)")
+        conn.executemany("INSERT INTO m VALUES (?, ?::uuid, ?)", manifest_rows)
+        conn.execute(f"COPY m TO '{manifest_path}' (FORMAT PARQUET)")
+
     fasta = tmp_path / "partial.fasta"
     fasta.write_text(">seq1\nATCGATCGATCG\n>seq2\nGCTAGCTAGCTA\n")
-    partial_fm = tmp_path / "partial_fm.ndjson"
-    with open(partial_fm, "w") as f:
-        for n_idx, n in enumerate(["seq1", "seq2"]):
-            entry = {"sequence_hash": str(TEST_HASHES[n]), "feature_idx": 100 + n_idx}
-            f.write(json.dumps(entry) + "\n")
+
+    partial_fm = tmp_path / "partial_fm.parquet"
+    fm_rows = [(str(TEST_HASHES[n]), 100 + idx) for idx, n in enumerate(["seq1", "seq2"])]
+    with duckdb.connect(":memory:") as conn:
+        conn.execute("CREATE TEMP TABLE fm (sequence_hash UUID, feature_idx BIGINT)")
+        conn.executemany("INSERT INTO fm VALUES (?::uuid, ?)", fm_rows)
+        conn.execute(f"COPY fm TO '{partial_fm}' (FORMAT PARQUET)")
 
     out = tmp_path / "output"
     backend = LocalBackend()
-    await backend.run_load_job(
-        manifest_path=manifest_path,
-        fasta_path=fasta,
-        feature_map_path=partial_fm,
-        output_dir=out,
+    result = await backend.run_step(
+        "load",
+        {
+            "manifest": manifest_path,
+            "fasta_path": fasta,
+            "feature_map": partial_fm,
+            "tree_path": tree_path,
+        },
+        out,
         reference_idx=REFERENCE_IDX,
-        tree_path=tree_path,
     )
 
-    pq = out / "reference_phylogeny.parquet"
+    pq = result["staging_dir"] / "reference_phylogeny.parquet"
     with duckdb.connect(":memory:") as conn:
         # 3 tips total (seq1, unknown_tip, seq2), 2 with feature_idx
         tips = conn.execute(f"SELECT count(*) FROM '{pq}' WHERE is_tip").fetchone()[0]
@@ -353,11 +356,14 @@ async def test_rejects_missing_manifest(fasta_path, feature_map_file, tmp_path):
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
     with pytest.raises(FileNotFoundError):
-        await LocalBackend().run_load_job(
-            manifest_path=tmp_path / "nope.json",
-            fasta_path=fasta_path,
-            feature_map_path=feature_map_file,
-            output_dir=tmp_path / "out",
+        await LocalBackend().run_step(
+            "load",
+            {
+                "manifest": tmp_path / "nope.parquet",
+                "fasta_path": fasta_path,
+                "feature_map": feature_map_file,
+            },
+            tmp_path / "out",
             reference_idx=REFERENCE_IDX,
         )
 
@@ -365,15 +371,20 @@ async def test_rejects_missing_manifest(fasta_path, feature_map_file, tmp_path):
 async def test_rejects_unmapped_hash(manifest_file, fasta_path, tmp_path):
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
-    # Empty feature map — no hashes mapped
-    empty_fm = tmp_path / "empty.ndjson"
-    empty_fm.write_text("")
+    # Empty feature map — Parquet with the right schema but zero rows.
+    empty_fm = tmp_path / "empty.parquet"
+    with duckdb.connect(":memory:") as conn:
+        conn.execute("CREATE TEMP TABLE fm (sequence_hash UUID, feature_idx BIGINT)")
+        conn.execute(f"COPY fm TO '{empty_fm}' (FORMAT PARQUET)")
 
     with pytest.raises(ValueError, match="unmapped"):
-        await LocalBackend().run_load_job(
-            manifest_path=manifest_file,
-            fasta_path=fasta_path,
-            feature_map_path=empty_fm,
-            output_dir=tmp_path / "out",
+        await LocalBackend().run_step(
+            "load",
+            {
+                "manifest": manifest_file,
+                "fasta_path": fasta_path,
+                "feature_map": empty_fm,
+            },
+            tmp_path / "out",
             reference_idx=REFERENCE_IDX,
         )

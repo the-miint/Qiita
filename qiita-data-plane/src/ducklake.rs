@@ -137,6 +137,13 @@ mod tests {
     }
 
     fn test_catalog_connstr() -> String {
+        // Fallback matches the Docker-compose Postgres at `:5433` so
+        // local Docker-mode runs work without setting the env var. The
+        // Makefile's test-integration recipe in host-Postgres mode (CI
+        // macOS, dev macOS without Docker) sets the env var explicitly
+        // to `:5432`. Tests that mutate this env var must use
+        // `EnvSnapshot` (see main.rs::tests) so they don't leak the
+        // default-only state into other `#[serial]` tests.
         std::env::var("DUCKLAKE_CATALOG_CONNSTR").unwrap_or_else(|_| {
             "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita".to_string()
         })
@@ -149,7 +156,7 @@ mod tests {
             .unwrap_or_else(|_| "/tmp/qiita-integration-ducklake-data".to_string());
         std::fs::create_dir_all(&data_path).unwrap();
         connect_ducklake(&conn, &connstr, &data_path)
-            .expect("failed to connect DuckLake — is Postgres running on :5433?");
+            .expect("failed to connect DuckLake — check DUCKLAKE_CATALOG_CONNSTR");
         conn
     }
 

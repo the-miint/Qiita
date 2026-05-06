@@ -1,12 +1,11 @@
 """Local compute backend — runs DuckDB+miint in-process for dev/test."""
 
 import asyncio
-import json
 import os
-import uuid
 from pathlib import Path
 
 import duckdb
+from qiita_common.parquet import validate_parquet_path
 
 from ..backend import ComputeBackend
 
@@ -44,20 +43,64 @@ def _open_conn() -> duckdb.DuckDBPyConnection:
     return duckdb.connect(":memory:")
 
 
-def _md5_hex_to_uuid(hex_str: str) -> str:
-    """Convert a 32-char hex MD5 to UUID string format."""
-    return str(uuid.UUID(hex_str))
-
-
 class LocalBackend(ComputeBackend):
-    """Runs compute jobs in-process using DuckDB+miint. For dev/test only."""
+    """Runs compute jobs in-process using DuckDB+miint. For dev/test only.
 
-    async def run_hash_job(self, fasta_path: Path, output_dir: Path, reference_idx: int) -> Path:
+    `run_step` dispatches on the step name to an internal Python
+    implementation. The SLURM backend is the production analogue; it
+    submits the step's container instead and the container does the
+    work. The set of step names this backend handles is the union of
+    container behaviours every workflow needs in dev/test mode.
+
+    **Canonical-implementation contract:** the per-step helpers below
+    (`_run_hash`, `_run_load`, plus the module-level `_write_*` builders)
+    are the source of truth for what each step does. When `SlurmBackend`
+    is wired, the corresponding container's entrypoint will execute the
+    same DuckDB+miint logic — either by importing this module and
+    invoking the helper with paths read from `params.json`, or by
+    extracting the SQL into a shared `qiita_compute_orchestrator.jobs`
+    module that both backends consume. Either way, `LocalBackend` and
+    the SLURM container must not drift apart. See docs/architecture.md
+    "Backend code-sharing" for the design intent.
+    """
+
+    async def run_step(
+        self,
+        name: str,
+        inputs: dict[str, Path],
+        workspace: Path,
+        *,
+        reference_idx: int,
+    ) -> dict[str, Path]:
+        if name == "hash":
+            manifest = await self._run_hash(inputs["fasta_path"], workspace, reference_idx)
+            return {"manifest": manifest}
+        if name == "load":
+            # Sub-dir so load's reference_*.parquet outputs don't mingle
+            # with earlier-step artifacts (manifest, feature_map) in the
+            # workspace — register-files globs whatever lives in the dir
+            # it's pointed at, so isolation matters.
+            staging_dir = await self._run_load(
+                manifest_path=inputs["manifest"],
+                fasta_path=inputs["fasta_path"],
+                feature_map_path=inputs["feature_map"],
+                output_dir=workspace / "staging",
+                reference_idx=reference_idx,
+                taxonomy_path=inputs.get("taxonomy_path"),
+                tree_path=inputs.get("tree_path"),
+                jplace_path=inputs.get("jplace_path"),
+            )
+            return {"staging_dir": staging_dir}
+        raise ValueError(f"LocalBackend does not implement step {name!r}")
+
+    async def _run_hash(self, fasta_path: Path, output_dir: Path, reference_idx: int) -> Path:
         if not fasta_path.exists():
             raise FileNotFoundError(f"FASTA file not found: {fasta_path}")
 
         output_dir.mkdir(parents=True, exist_ok=True)
         await _ensure_miint_installed()
+        manifest_path = output_dir / "manifest.parquet"
+        out = validate_parquet_path(manifest_path)
 
         with _open_conn() as conn:
             conn.execute("LOAD miint;")
@@ -87,37 +130,34 @@ class LocalBackend(ComputeBackend):
                 dup_ids = sorted(row[0] for row in dup_result)
                 raise ValueError(f"FASTA contains duplicate read_id(s): {dup_ids}")
 
-            rows = conn.execute("SELECT read_id, hash, len FROM raw_seqs").fetchall()
-            entry_count = len(rows)
+            # Write manifest as Parquet — columns (read_id, sequence_hash, length).
+            # The hash column is converted to UUID on the way out so downstream
+            # consumers (mint-features, load step) read it as UUID natively.
+            # Sorted by sequence_hash because every downstream consumer keys
+            # off it: mint-features dedups on it; the load step JOINs on it.
+            # reference_idx isn't embedded in the file; the caller's
+            # work_ticket.scope_target.reference_idx is the source of truth.
+            conn.execute(
+                "COPY ("
+                "  SELECT read_id,"
+                "    CAST(hash AS UUID) AS sequence_hash,"
+                "    len AS length"
+                "  FROM raw_seqs"
+                "  ORDER BY sequence_hash"
+                f") TO '{out}' (FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd')"
+            )
             conn.execute("DROP TABLE raw_seqs")
 
-        entries = [
-            {
-                "read_id": row[0],
-                "sequence_hash": _md5_hex_to_uuid(row[1]),
-                "length": row[2],
-            }
-            for row in rows
-        ]
-
-        manifest = {
-            "reference_idx": reference_idx,
-            "entry_count": entry_count,
-            "entries": entries,
-        }
-
-        manifest_path = output_dir / "hash_manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2))
         return manifest_path
 
-    async def run_load_job(
+    async def _run_load(
         self,
+        *,
         manifest_path: Path,
         fasta_path: Path,
         feature_map_path: Path,
         output_dir: Path,
         reference_idx: int,
-        *,
         taxonomy_path: Path | None = None,
         tree_path: Path | None = None,
         jplace_path: Path | None = None,
@@ -168,55 +208,41 @@ _PARQUET_OPTS_CHUNKED = f"{_PARQUET_OPTS}, ROW_GROUP_SIZE {_CHUNK_ROW_GROUP_SIZE
 _CHUNK_SIZE = 65536  # 64 KB
 
 
-def _validate_parquet_path(path: Path) -> str:
-    """Validate a path is safe for SQL string interpolation in COPY TO."""
-    path_str = str(path)
-    if "'" in path_str or "\\" in path_str or any(ord(c) < 0x20 for c in path_str):
-        raise ValueError(f"Output path contains unsafe characters: {path_str}")
-    return path_str
-
-
 def _build_id_map(
     conn: duckdb.DuckDBPyConnection, manifest_path: Path, feature_map_path: Path
 ) -> None:
     """Build the id_map temp table by joining manifest + feature_map in DuckDB.
 
     Both files are read directly by DuckDB — no Python-side parsing.
-    - manifest_path: JSON with {entries: [{read_id, sequence_hash, length}, ...]}
-    - feature_map_path: NDJSON with {sequence_hash, feature_idx} per line
+    - manifest_path: Parquet with columns (read_id, sequence_hash, length).
+    - feature_map_path: Parquet with columns (sequence_hash, feature_idx).
 
     Raises ValueError if any manifest entry has no matching feature_idx.
     """
-    # entry_count is written by run_hash_job — avoids a separate count query.
     manifest_count = conn.execute(
-        "SELECT entry_count FROM read_json(?, maximum_object_size=536870912)",
+        "SELECT count(*) FROM read_parquet(?)",
         [str(manifest_path)],
     ).fetchone()[0]
 
     conn.execute(
         "CREATE TEMP TABLE id_map AS "
-        "SELECT e.read_id, f.feature_idx,"
-        "  CAST(e.sequence_hash AS VARCHAR) AS sequence_hash,"
-        "  e.length AS sequence_length_bp "
-        "FROM ("
-        "  SELECT unnest(entries) AS e FROM read_json(?, maximum_object_size=536870912)"
-        ") "
-        "JOIN read_json(?, format='newline_delimited',"
-        "  columns={'sequence_hash': 'VARCHAR', 'feature_idx': 'BIGINT'}) f "
-        "  ON e.sequence_hash = f.sequence_hash",
+        "SELECT m.read_id, f.feature_idx,"
+        "  m.sequence_hash,"
+        "  m.length AS sequence_length_bp "
+        "FROM read_parquet(?) m "
+        "JOIN read_parquet(?) f "
+        "  ON m.sequence_hash = f.sequence_hash",
         [str(manifest_path), str(feature_map_path)],
     )
 
     id_map_count = conn.execute("SELECT count(*) FROM id_map").fetchone()[0]
     if id_map_count != manifest_count:
         n_unmapped = manifest_count - id_map_count
-        # Diagnostic ANTI JOIN only on mismatch — the only case requiring
-        # a second manifest read.
+        # Diagnostic ANTI JOIN only on mismatch — second read of the
+        # manifest just to surface a useful error message.
         unmapped = conn.execute(
-            "SELECT e.sequence_hash FROM ("
-            "  SELECT unnest(entries) AS e FROM read_json(?, maximum_object_size=536870912)"
-            ") "
-            "ANTI JOIN id_map m ON e.sequence_hash = m.sequence_hash",
+            "SELECT m.sequence_hash FROM read_parquet(?) m "
+            "ANTI JOIN id_map x ON m.sequence_hash = x.sequence_hash",
             [str(manifest_path)],
         ).fetchall()
         hashes = [str(r[0]) for r in unmapped[:10]]
@@ -225,11 +251,11 @@ def _build_id_map(
 
 def _write_sequence_metadata(conn: duckdb.DuckDBPyConnection, output_dir: Path) -> None:
     """Write reference_sequences.parquet — metadata from id_map (no FASTA read)."""
-    out = _validate_parquet_path(output_dir / "reference_sequences.parquet")
+    out = validate_parquet_path(output_dir / "reference_sequences.parquet")
     conn.execute(
         "COPY ("
         "  SELECT feature_idx,"
-        "    CAST(sequence_hash AS UUID) AS sequence_hash,"
+        "    sequence_hash,"
         "    CAST(sequence_length_bp AS BIGINT) AS sequence_length_bp"
         "  FROM id_map"
         "  ORDER BY feature_idx"
@@ -251,7 +277,7 @@ def _write_sequence_chunks(
     Without this, a single batch spanning many large sequences exhausts memory
     before the first row group is written.
     """
-    out = _validate_parquet_path(output_dir / "reference_sequence_chunks.parquet")
+    out = validate_parquet_path(output_dir / "reference_sequence_chunks.parquet")
     conn.execute(
         f"CREATE OR REPLACE MACRO chunk_seq(str) AS "
         f"list_transform("
@@ -285,7 +311,7 @@ def _write_membership(
     conn: duckdb.DuckDBPyConnection, output_dir: Path, reference_idx: int
 ) -> None:
     """Write reference_membership.parquet from id_map."""
-    out = _validate_parquet_path(output_dir / "reference_membership.parquet")
+    out = validate_parquet_path(output_dir / "reference_membership.parquet")
     conn.execute(
         "COPY ("
         f"  SELECT CAST({reference_idx} AS BIGINT) AS reference_idx, feature_idx"
@@ -306,7 +332,7 @@ def _write_taxonomy(
     Rank extraction and validation done entirely in DuckDB.
     Partial coverage is allowed (not all features need taxonomy).
     """
-    out = _validate_parquet_path(output_dir / "reference_taxonomy.parquet")
+    out = validate_parquet_path(output_dir / "reference_taxonomy.parquet")
 
     # Read taxonomy Parquet, join with id_map, split ranks.
     conn.execute(
@@ -385,7 +411,7 @@ def _write_phylogeny(
     Tips with matching sequences get feature_idx populated; tips without
     sequences (and internal nodes) get NULL. No error on unmatched tips.
     """
-    out = _validate_parquet_path(output_dir / "reference_phylogeny.parquet")
+    out = validate_parquet_path(output_dir / "reference_phylogeny.parquet")
 
     conn.execute(
         "CREATE TEMP TABLE tree_nodes AS SELECT * FROM read_newick(?)",
@@ -417,7 +443,7 @@ def _write_placements(
     Maps placed fragments to feature_idx via id_map. Fragments not in
     id_map are skipped (they weren't hashed/minted).
     """
-    out = _validate_parquet_path(output_dir / "reference_placements.parquet")
+    out = validate_parquet_path(output_dir / "reference_placements.parquet")
 
     conn.execute(
         "COPY ("
