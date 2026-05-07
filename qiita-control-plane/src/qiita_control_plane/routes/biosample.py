@@ -3,22 +3,25 @@
 Two routers live here. The study-scoped router (prefix=/study) carries the
 single-biosample import (POST) and the study-scoped bulk-id read
 (GET .../list-idxs). The biosample-scoped router (prefix=/biosample)
-carries the single-resource read (GET /{biosample_idx}). Bulk-import,
-PATCH, retirement, search, and admin metadata-schema endpoints are
-deferred. The write handler gates on caller scope, role, and study
-existence and delegates the multi-table write to the
-repositories.biosample composer inside one connection-scoped
-transaction; the study-scoped read gates on caller scope and study
-access (with admin role bypass); the single-biosample read gates on
-caller scope, then 404s on missing or retired biosamples and gates
-non-admin callers on owner-or-linked-study-access via the repository
-predicate.
+carries the single-resource read (GET /{biosample_idx}) and the
+single-resource PATCH (PATCH /{biosample_idx}). Bulk-import,
+retirement, search, and admin metadata-schema endpoints are deferred.
+The write handler gates on caller scope, role, and study existence and
+delegates the multi-table write to the repositories.biosample composer
+inside one connection-scoped transaction; the study-scoped read gates
+on caller scope and study access (with admin role bypass); the
+single-biosample read gates on caller scope, then 404s on missing or
+retired biosamples and gates non-admin callers on
+owner-or-linked-study-access via the repository predicate; the PATCH
+gates on caller scope and wet_lab_admin (or higher) role and applies
+its mutation inside one connection-scoped transaction with required
+If-Match optimistic-concurrency control.
 """
 
 from typing import Annotated
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import Field
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
@@ -26,6 +29,7 @@ from qiita_common.models import (
     BiosampleIdxsListResponse,
     BiosampleImportRequest,
     BiosampleImportResponse,
+    BiosamplePatchRequest,
     BiosampleResponse,
     Tier,
 )
@@ -46,6 +50,7 @@ from ..repositories.biosample import (
     fetch_biosample_idxs_for_study,
     fetch_caller_has_biosample_access,
     import_biosample_from_owner_biosample_id,
+    update_biosample,
 )
 from ..repositories.biosample_metadata import (
     BiosampleMetadataParseError,
@@ -337,4 +342,133 @@ async def get_biosample_route(
         row,
         global_metadata=global_metadata,
         caller_system_role=user.system_role,
+    )
+
+
+# Substring of the asyncpg.RaiseError message thrown by the role-typed FK
+# trigger on biosample.owner_idx. The trigger fires before the underlying
+# FK constraint, so a non-user owner_idx surfaces as RaiseError; the route
+# maps it to the same eligibility-422 the preflight emits.
+_OWNER_TRIGGER_RAISE_MARKER = "user-kind principal"
+
+
+@biosample_router.patch("/{biosample_idx}")
+async def patch_biosample_route(
+    biosample_idx: Annotated[int, Field(gt=0)],
+    body: BiosamplePatchRequest,
+    response: Response,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    caller: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
+) -> BiosampleResponse:
+    """Edit a biosample's core record.
+
+    Auth bar: caller holds Scope.BIOSAMPLE_WRITE and is a HumanUser at
+    system_role >= wet_lab_admin. require_role_at_least always rejects
+    ServiceAccount callers (the auth model treats service-account
+    authz as scope-only and ServiceAccount carries no system_role
+    field), so the NCBI / ENA submission subsystem cannot reach this
+    PATCH on its current credentials. A separate scope-gated surface
+    (or a wider auth-model change so ServiceAccount carries a role)
+    will be needed when the submission subsystem starts writing back
+    accessions through the API; tracked in
+    test_patch_biosample_service_account_403_pending_restructure.
+
+    Per Decision 3, If-Match is required: missing -> 428, mismatch ->
+    412. The body's editable fields are validated by
+    BiosamplePatchRequest (extra=forbid rejects immutable / retirement
+    columns with 422; an empty body is also 422). Inside one
+    connection-scoped transaction the route preflights the row for
+    existence (404), retirement (409), and ETag match (412); validates
+    the candidate owner via require_eligible_owner when owner_idx is
+    in the body (422 on ineligibility); applies the UPDATE; re-reads
+    global metadata for the response. Uniqueness violations on
+    biosample_accession / ena_sample_accession map to 409, FK
+    violations on metadata_checklist_idx to 422, and the role-typed
+    FK trigger on owner_idx (a backstop the preflight should preempt
+    in practice) to the same eligibility-422.
+
+    The response carries an `ETag` header derived from the new row's
+    `updated_at` column; format mirrors the GET endpoint's contract
+    and is opaque to clients.
+    """
+    # Decision 3: missing If-Match is 428 before any DB work runs.
+    if if_match is None:
+        raise HTTPException(status_code=428, detail="If-Match header required")
+
+    # Build the column-keyed write set from the model's set fields so the
+    # repository sees only what the caller explicitly included; explicit
+    # null vs. absent is distinguished by model_fields_set.
+    fields = {name: getattr(body, name) for name in body.model_fields_set}
+
+    try:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                # Preflight: existence -> 404, retirement -> 409, ETag -> 412.
+                row = await fetch_biosample(conn, biosample_idx)
+                if row is None:
+                    raise HTTPException(
+                        status_code=404, detail=f"biosample {biosample_idx} not found"
+                    )
+                if row["retired"]:
+                    raise HTTPException(
+                        status_code=409, detail=f"biosample {biosample_idx} is retired"
+                    )
+                if if_match != _etag_for_updated_at(row["updated_at"]):
+                    raise HTTPException(status_code=412, detail="If-Match did not match")
+
+                # Eligibility preflight runs only when ownership is being
+                # transferred; collapses every ineligibility case to 422.
+                if "owner_idx" in fields:
+                    await require_eligible_owner(
+                        conn,
+                        candidate_idx=fields["owner_idx"],
+                        caller_idx=caller.principal_idx,
+                        detail=_MSG_OWNER_NOT_ELIGIBLE,
+                    )
+
+                # Apply the UPDATE; the repo function returns the post-UPDATE
+                # row in the same shape fetch_biosample selects, so no
+                # follow-up SELECT is needed.
+                updated_row = await update_biosample(conn, biosample_idx, fields=fields)
+
+                # Re-read global metadata in the same transaction so the
+                # response and the UPDATE see one consistent snapshot.
+                metadata_rows = await fetch_global_metadata_for_biosample(
+                    conn, biosample_idx
+                )
+    except asyncpg.UniqueViolationError as exc:
+        detail = _UNIQUE_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_UNIQUE_VIOLATION)
+        raise HTTPException(status_code=409, detail=detail)
+    except asyncpg.ForeignKeyViolationError as exc:
+        detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_FK_VIOLATION)
+        raise HTTPException(status_code=422, detail=detail)
+    except asyncpg.RaiseError as exc:
+        # Role-typed FK trigger on biosample.owner_idx: candidate is
+        # non-user. The preflight should have caught this; the trigger is
+        # the schema-level backstop and the caller-facing surface is the
+        # same 422 the preflight emits.
+        if _OWNER_TRIGGER_RAISE_MARKER in str(exc):
+            raise HTTPException(status_code=422, detail=_MSG_OWNER_NOT_ELIGIBLE)
+        raise
+
+    # Set the new ETag from the updated row's bumped updated_at.
+    response.headers["ETag"] = _etag_for_updated_at(updated_row["updated_at"])
+
+    # Reuse the GET route's row -> response shaper so the PATCH and GET
+    # surfaces share one source of truth for the response shape.
+    global_metadata = {
+        internal_name: BiosampleGlobalMetadataEntry(
+            display_name=entry.display_name,
+            description=entry.description,
+            data_type=entry.data_type,
+            value=entry.value,
+        )
+        for internal_name, entry in metadata_rows.items()
+    }
+    return _biosample_response_from_row(
+        updated_row,
+        global_metadata=global_metadata,
+        caller_system_role=caller.system_role,
     )

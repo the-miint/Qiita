@@ -290,6 +290,45 @@ class BiosampleResponse(BaseModel):
     caller_system_role: SystemRole
 
 
+class BiosamplePatchRequest(BaseModel):
+    """Body for PATCH /api/v1/biosample/{biosample_idx}.
+
+    Every editable field is optional; the route distinguishes "absent"
+    (do not write) from "explicit null" (set the column to NULL) by
+    inspecting `model_fields_set`. extra="forbid" rejects bodies that
+    name immutable or retirement-managed columns (idx, retired,
+    retired_at, retired_by_idx, retire_reason, created_by_idx,
+    created_at, updated_at, last_metadata_change_at) with 422. The
+    model-level validator enforces the "at least one field" rule and
+    the NOT-NULL invariant on owner_idx.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    metadata_checklist_idx: Annotated[int, Field(gt=0)] | None = None
+    owner_idx: Annotated[int, Field(gt=0)] | None = None
+    biosample_accession: str | None = None
+    ena_sample_accession: str | None = None
+    last_submission_at: AwareDatetime | None = None
+    submission_error: str | None = None
+
+    @model_validator(mode="after")
+    def at_least_one_field_and_owner_not_null(self):
+        # Empty bodies are rejected here so the route does not have to
+        # special-case the "no-op PATCH" path.
+        if not self.model_fields_set:
+            raise ValueError("at least one editable field is required")
+
+        # owner_idx maps to a NOT NULL column; explicit null is invalid
+        # input even though the field is typed Optional for the
+        # "absent vs null" distinguishing pattern shared with the
+        # other fields.
+        if "owner_idx" in self.model_fields_set and self.owner_idx is None:
+            raise ValueError("owner_idx may not be null")
+
+        return self
+
+
 class BiosampleIdxsListResponse(BaseModel):
     """Returned by GET /api/v1/study/{study_idx}/biosample/list-idxs.
 

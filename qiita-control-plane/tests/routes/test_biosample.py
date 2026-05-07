@@ -15,7 +15,7 @@ from decimal import Decimal
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from qiita_common.auth_constants import Scope
+from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import FieldDataType
 
 from qiita_control_plane.testing.db_seeds import (
@@ -105,6 +105,17 @@ async def _cleanup_tracked(pool, created: dict) -> None:
         )
     await delete_idxs(pool, "study", created["study"])
     await delete_idxs(pool, "metadata_checklist", created["metadata_checklist"])
+    # api_token has an ON DELETE RESTRICT FK to qiita.principal, so any
+    # tokens minted against per-test principals (currently only the
+    # service-account PATCH test does so) must go before the principal
+    # sweep. Tokens for the session-scoped fixtures never appear here
+    # because their principals are never tracked in `created`.
+    all_principals = created["user_principals"] + created["service_account_principals"]
+    if all_principals:
+        await pool.execute(
+            "DELETE FROM qiita.api_token WHERE principal_idx = ANY($1::bigint[])",
+            all_principals,
+        )
     if created["user_principals"]:
         await pool.execute(
             "DELETE FROM qiita.user WHERE principal_idx = ANY($1::bigint[])",
@@ -115,7 +126,6 @@ async def _cleanup_tracked(pool, created: dict) -> None:
             "DELETE FROM qiita.service_account WHERE principal_idx = ANY($1::bigint[])",
             created["service_account_principals"],
         )
-    all_principals = created["user_principals"] + created["service_account_principals"]
     await delete_idxs(pool, "principal", all_principals)
 
 
@@ -1421,3 +1431,379 @@ async def test_get_biosample_returns_only_global_metadata(ctx):
         }
     }
     assert rj["global_metadata"] == expected_metadata
+
+
+# ===========================================================================
+# PATCH /api/v1/biosample/{biosample_idx}
+# ===========================================================================
+
+
+@pytest_asyncio.fixture
+async def no_biosample_write_patch_client(make_pat_client):
+    """A regular_user PAT with a scope set that EXCLUDES Scope.BIOSAMPLE_WRITE
+    — drives the require_scope guard's missing-scope 403 on the PATCH route."""
+    return await make_pat_client(label="bs-patch-no-write", scopes=[Scope.SELF_PROFILE])
+
+
+async def _etag_for(pool, bs_idx: int) -> str:
+    """Build the quoted ISO-8601 ETag the route emits for a biosample row.
+
+    Reads updated_at directly so the helper does not depend on the GET
+    route's behavior; matches `_etag_for_updated_at` in routes/biosample.py.
+    """
+    updated_at = await pool.fetchval(
+        "SELECT updated_at FROM qiita.biosample WHERE idx = $1", bs_idx
+    )
+    return f'"{updated_at.isoformat()}"'
+
+
+async def _seed_biosample_for_patch(ctx) -> int:
+    """Seed a wet_lab_admin-owned biosample with a known accession; track for cleanup.
+
+    Returns the biosample idx. Caller pre-loads any field they want to test
+    PATCHing later; the seed gives the row enough columns to round-trip.
+    """
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    bs_idx = await seed_biosample(
+        ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx
+    )
+    ctx["created"]["biosample"].append(bs_idx)
+    return bs_idx
+
+
+async def test_patch_biosample_wet_lab_admin_happy_path(ctx):
+    # Wet_lab_admin patches a single column; response shape mirrors the
+    # GET route's BiosampleResponse, ETag header is set, and the
+    # full-object equality confirms only the targeted column changed.
+    bs_idx = await _seed_biosample_for_patch(ctx)
+    if_match = await _etag_for(ctx["pool"], bs_idx)
+    new_acc = _unique_accession("PATCH-OK")
+
+    resp = await ctx["wet"].patch(
+        f"/api/v1/biosample/{bs_idx}",
+        json={"biosample_accession": new_acc},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 200, resp.text
+    _assert_etag_quoted(resp)
+
+    rj = resp.json()
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    expected = {
+        "biosample_idx": bs_idx,
+        "owner_idx": owner_idx,
+        "metadata_checklist_idx": None,
+        "biosample_accession": new_acc,
+        "ena_sample_accession": None,
+        "last_submission_at": None,
+        "submission_error": None,
+        "last_metadata_change_at": None,
+        "created_by_idx": owner_idx,
+        # Auto-generated; copy actual into expected so equality confirms
+        # field presence without pinning timestamps.
+        "created_at": rj["created_at"],
+        "updated_at": rj["updated_at"],
+        "retired": False,
+        "retired_by_idx": None,
+        "retired_at": None,
+        "retire_reason": None,
+        "global_metadata": {},
+        "caller_system_role": "wet_lab_admin",
+    }
+    assert rj == expected
+
+
+async def test_patch_biosample_explicit_null_clears_field(ctx):
+    # Seed a biosample with metadata_checklist_idx set, then PATCH it to
+    # explicit null. The model_fields_set distinction (absent vs. null)
+    # is what makes this clear-the-column path work.
+    checklist_idx = await _seed_metadata_checklist(ctx["pool"], suffix="patch-clear")
+    ctx["created"]["metadata_checklist"].append(checklist_idx)
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    bs_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.biosample (owner_idx, created_by_idx, metadata_checklist_idx)"
+        " VALUES ($1, $1, $2) RETURNING idx",
+        owner_idx,
+        checklist_idx,
+    )
+    ctx["created"]["biosample"].append(bs_idx)
+    if_match = await _etag_for(ctx["pool"], bs_idx)
+
+    resp = await ctx["wet"].patch(
+        f"/api/v1/biosample/{bs_idx}",
+        json={"metadata_checklist_idx": None},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["metadata_checklist_idx"] is None
+
+
+async def test_patch_biosample_etag_advances(ctx):
+    # The response's ETag header must differ from the request's If-Match
+    # value: the schema's biosample_set_updated_at trigger bumps
+    # updated_at, and the route surfaces that bump in the new ETag.
+    bs_idx = await _seed_biosample_for_patch(ctx)
+    if_match = await _etag_for(ctx["pool"], bs_idx)
+
+    resp = await ctx["wet"].patch(
+        f"/api/v1/biosample/{bs_idx}",
+        json={"submission_error": "transient"},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 200, resp.text
+    new_etag = resp.headers["ETag"]
+    assert new_etag != if_match
+    assert new_etag.startswith('"') and new_etag.endswith('"')
+
+
+async def test_patch_biosample_service_account_403_pending_restructure(ctx):
+    # Pin the deferred-behavior contract: a service-account caller, even
+    # one whose qiita.principal.system_role is wet_lab_admin and whose
+    # PAT carries Scope.BIOSAMPLE_WRITE, currently 403s here.
+    # require_role_at_least's ServiceAccount-always-fails rule (auth
+    # model treats service-account authz as scope-only;
+    # auth/principal.py ServiceAccount carries no system_role field) is
+    # what produces the 403. The NCBI / ENA submission subsystem will
+    # need a separate scope-gated surface, OR the auth model will need
+    # to widen so ServiceAccount carries a role, before this PATCH can
+    # accept service-account writes. When that work lands, this test
+    # should flip to assert 200 (or be replaced by a happy-path test
+    # against the new surface).
+    suffix = secrets.token_hex(4)
+    svc_name = f"bs-patch-svc-{suffix}"
+    async with ctx["pool"].acquire() as conn:
+        async with conn.transaction():
+            svc_principal_idx = await conn.fetchval(
+                "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
+                " VALUES ($1, $2, 1) RETURNING idx",
+                svc_name,
+                SystemRole.WET_LAB_ADMIN,
+            )
+            await conn.execute(
+                "INSERT INTO qiita.service_account (principal_idx, name) VALUES ($1, $2)",
+                svc_principal_idx,
+                svc_name,
+            )
+    ctx["created"]["service_account_principals"].append(svc_principal_idx)
+
+    from qiita_control_plane.auth.token import mint_api_token
+    from qiita_control_plane.main import app
+
+    plaintext, _ = await mint_api_token(
+        ctx["pool"],
+        principal_idx=svc_principal_idx,
+        label=f"svc-{suffix}",
+        scopes=[Scope.BIOSAMPLE_WRITE],
+    )
+
+    bs_idx = await _seed_biosample_for_patch(ctx)
+    if_match = await _etag_for(ctx["pool"], bs_idx)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {plaintext}"},
+    ) as svc:
+        resp = await svc.patch(
+            f"/api/v1/biosample/{bs_idx}",
+            json={"submission_error": "subsystem-recorded"},
+            headers={"If-Match": if_match},
+        )
+    assert resp.status_code == 403, resp.text
+    assert "wet_lab_admin" in resp.json()["detail"]
+
+
+async def test_patch_biosample_anonymous_401(ctx):
+    # No Authorization header → require_role_at_least chain raises 401.
+    bs_idx = await _seed_biosample_for_patch(ctx)
+    if_match = await _etag_for(ctx["pool"], bs_idx)
+
+    from qiita_control_plane.main import app
+
+    app.state.pool = ctx["pool"]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
+        resp = await anon.patch(
+            f"/api/v1/biosample/{bs_idx}",
+            json={"submission_error": "x"},
+            headers={"If-Match": if_match},
+        )
+    assert resp.status_code == 401
+
+
+async def test_patch_biosample_regular_user_403(ctx):
+    # Regular user (system_role=user) holds BIOSAMPLE_WRITE but is below
+    # the wet_lab_admin role bar; require_role_at_least returns 403.
+    bs_idx = await _seed_biosample_for_patch(ctx)
+    if_match = await _etag_for(ctx["pool"], bs_idx)
+
+    resp = await ctx["user"].patch(
+        f"/api/v1/biosample/{bs_idx}",
+        json={"submission_error": "x"},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 403
+
+
+async def test_patch_biosample_missing_scope_403(ctx, no_biosample_write_patch_client):
+    # Regular user with a PAT lacking Scope.BIOSAMPLE_WRITE: the role
+    # guard runs first and rejects on role; that is still a 403, just
+    # for the role reason rather than the scope reason. This pins that
+    # callers without the write scope can never reach the route.
+    bs_idx = await _seed_biosample_for_patch(ctx)
+    if_match = await _etag_for(ctx["pool"], bs_idx)
+
+    resp = await no_biosample_write_patch_client.patch(
+        f"/api/v1/biosample/{bs_idx}",
+        json={"submission_error": "x"},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 403
+
+
+async def test_patch_biosample_missing_if_match_428(ctx):
+    # No If-Match header → 428 before any DB read runs.
+    bs_idx = await _seed_biosample_for_patch(ctx)
+
+    resp = await ctx["wet"].patch(
+        f"/api/v1/biosample/{bs_idx}",
+        json={"submission_error": "x"},
+    )
+    assert resp.status_code == 428
+    assert "If-Match" in resp.json()["detail"]
+
+
+async def test_patch_biosample_mismatched_if_match_412(ctx):
+    # If-Match supplied but does not match the current ETag → 412.
+    bs_idx = await _seed_biosample_for_patch(ctx)
+
+    resp = await ctx["wet"].patch(
+        f"/api/v1/biosample/{bs_idx}",
+        json={"submission_error": "x"},
+        headers={"If-Match": '"2000-01-01T00:00:00+00:00"'},
+    )
+    assert resp.status_code == 412
+
+
+async def test_patch_biosample_nonexistent_404(ctx):
+    # Nonexistent idx → 404. The dummy If-Match value never gets compared
+    # because existence trips first.
+    max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.biosample")
+    resp = await ctx["wet"].patch(
+        f"/api/v1/biosample/{max_idx + 100_000}",
+        json={"submission_error": "x"},
+        headers={"If-Match": '"2000-01-01T00:00:00+00:00"'},
+    )
+    assert resp.status_code == 404
+
+
+async def test_patch_biosample_retired_409(ctx):
+    # Retired biosamples cannot be PATCHed; 409 distinguishes "row is in
+    # a state that blocks the operation" from the missing-row 404.
+    bs_idx = await _seed_biosample_for_patch(ctx)
+    await retire_biosample(
+        ctx["pool"],
+        biosample_idx=bs_idx,
+        retired_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    if_match = await _etag_for(ctx["pool"], bs_idx)
+
+    resp = await ctx["wet"].patch(
+        f"/api/v1/biosample/{bs_idx}",
+        json={"submission_error": "x"},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 409
+    assert "retired" in resp.json()["detail"]
+
+
+async def test_patch_biosample_empty_body_422(ctx):
+    # Empty JSON body trips BiosamplePatchRequest's "at least one field"
+    # validator before the route runs.
+    bs_idx = await _seed_biosample_for_patch(ctx)
+    if_match = await _etag_for(ctx["pool"], bs_idx)
+
+    resp = await ctx["wet"].patch(
+        f"/api/v1/biosample/{bs_idx}",
+        json={},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 422
+
+
+async def test_patch_biosample_immutable_field_422(ctx):
+    # `retired` is managed by retirement endpoints, not the PATCH
+    # surface; extra="forbid" on BiosamplePatchRequest rejects it.
+    bs_idx = await _seed_biosample_for_patch(ctx)
+    if_match = await _etag_for(ctx["pool"], bs_idx)
+
+    resp = await ctx["wet"].patch(
+        f"/api/v1/biosample/{bs_idx}",
+        json={"retired": True},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize("kind", OWNER_INELIGIBILITY_KINDS)
+async def test_patch_biosample_owner_ineligibility_422(ctx, kind: IneligibilityKind):
+    # Same eligibility surface as the import endpoint; one parametrised
+    # pass over every ineligibility shape pins that the PATCH route
+    # collapses each to the shared 422 detail.
+    bs_idx = await _seed_biosample_for_patch(ctx)
+    if_match = await _etag_for(ctx["pool"], bs_idx)
+    bad_owner = await resolve_ineligible_owner_idx(
+        ctx["pool"],
+        kind=kind,
+        prefix=f"{_SEED_PREFIX}-patch-elig",
+        created=ctx["created"],
+    )
+
+    resp = await ctx["wet"].patch(
+        f"/api/v1/biosample/{bs_idx}",
+        json={"owner_idx": bad_owner},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"] == _ELIGIBILITY_DETAIL
+
+
+async def test_patch_biosample_duplicate_accession_409(ctx):
+    # Two biosamples; PATCH B's accession to A's value triggers
+    # biosample_accession_unique → asyncpg.UniqueViolationError → 409.
+    a_acc = _unique_accession("PATCH-A")
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    bs_a = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.biosample (owner_idx, created_by_idx, biosample_accession)"
+        " VALUES ($1, $1, $2) RETURNING idx",
+        owner_idx,
+        a_acc,
+    )
+    ctx["created"]["biosample"].append(bs_a)
+    bs_b = await _seed_biosample_for_patch(ctx)
+    if_match = await _etag_for(ctx["pool"], bs_b)
+
+    resp = await ctx["wet"].patch(
+        f"/api/v1/biosample/{bs_b}",
+        json={"biosample_accession": a_acc},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 409
+    assert "biosample_accession" in resp.json()["detail"]
+
+
+async def test_patch_biosample_bad_metadata_checklist_idx_422(ctx):
+    # Nonexistent metadata_checklist_idx trips the FK constraint →
+    # asyncpg.ForeignKeyViolationError → 422 with the FK-specific detail.
+    bs_idx = await _seed_biosample_for_patch(ctx)
+    if_match = await _etag_for(ctx["pool"], bs_idx)
+    bad_checklist = (
+        await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.metadata_checklist")
+    ) + 100_000
+
+    resp = await ctx["wet"].patch(
+        f"/api/v1/biosample/{bs_idx}",
+        json={"metadata_checklist_idx": bad_checklist},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 422
+    assert "metadata_checklist_idx" in resp.json()["detail"]

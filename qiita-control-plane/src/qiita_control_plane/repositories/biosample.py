@@ -103,6 +103,78 @@ async def fetch_biosample(
     )
 
 
+# Columns the PATCH composer is allowed to write. Held as a frozenset so
+# the route's allowlist and the repo's validation share one source of
+# truth and so unknown column names are rejected at the repo boundary
+# rather than reaching the SQL builder.
+BIOSAMPLE_PATCHABLE_COLUMNS: frozenset[str] = frozenset(
+    {
+        "metadata_checklist_idx",
+        "owner_idx",
+        "biosample_accession",
+        "ena_sample_accession",
+        "last_submission_at",
+        "submission_error",
+    }
+)
+
+
+async def update_biosample(
+    conn: asyncpg.Connection,
+    biosample_idx: int,
+    *,
+    fields: dict[str, object],
+) -> asyncpg.Record:
+    """Update the named columns on the biosample row, return the post-UPDATE row.
+
+    `fields` maps column name -> new value; only the listed keys are
+    written, and explicit None sets the column to NULL. Unknown keys
+    and an empty dict raise ValueError so that misuse fails at the
+    repo boundary rather than reaching SQL. Returns the same column
+    set as fetch_biosample (so the caller does not need a follow-up
+    SELECT) using a single UPDATE ... RETURNING. Raises
+    asyncpg.UniqueViolationError on accession collisions and
+    asyncpg.ForeignKeyViolationError on a bad metadata_checklist_idx
+    or owner_idx; the role-typed FK trigger on owner_idx surfaces as
+    asyncpg.RaiseError when the candidate is non-user. The schema
+    trigger biosample_set_updated_at refreshes updated_at; this
+    function does not write it explicitly.
+    """
+    # Reject misuse at the repo boundary so the SQL builder never sees
+    # an empty SET clause or an unknown column name.
+    if not fields:
+        raise ValueError("update_biosample requires at least one field")
+    unknown = set(fields) - BIOSAMPLE_PATCHABLE_COLUMNS
+    if unknown:
+        raise ValueError(
+            f"update_biosample rejects non-patchable column(s): {sorted(unknown)}"
+        )
+
+    # Build the parameterized SET clause. Column names come from the
+    # allowlist above so f-string interpolation is safe; the per-column
+    # values are passed as positional asyncpg parameters. Sort keys so
+    # the generated SQL is deterministic across calls (helps logs and
+    # plan-cache stability).
+    columns = sorted(fields.keys())
+    set_clause = ", ".join(f"{col} = ${i + 1}" for i, col in enumerate(columns))
+    values = [fields[col] for col in columns]
+    biosample_param = f"${len(columns) + 1}"
+
+    # Single round trip: UPDATE ... RETURNING with the same column list
+    # fetch_biosample selects, so the route does not need a follow-up read.
+    return await conn.fetchrow(
+        f"UPDATE qiita.biosample SET {set_clause}"
+        f" WHERE idx = {biosample_param}"
+        " RETURNING idx, owner_idx, metadata_checklist_idx,"
+        " biosample_accession, ena_sample_accession,"
+        " last_submission_at, submission_error, last_metadata_change_at,"
+        " created_by_idx, created_at, updated_at,"
+        " retired, retired_by_idx, retired_at, retire_reason",
+        *values,
+        biosample_idx,
+    )
+
+
 async def fetch_caller_has_biosample_access(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
