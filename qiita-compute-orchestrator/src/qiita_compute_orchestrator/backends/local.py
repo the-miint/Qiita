@@ -13,11 +13,9 @@ from ..backend import ComputeBackend
 _miint_install_lock = asyncio.Lock()
 _miint_installed = False
 
-# MIINT_EXTENSION_PATH overrides the community extension with a local build.
-# Required until the community release includes max_batch_bytes for read_fastx
-# (streaming fix for large genomes). Unset to use the community extension.
-_MIINT_EXT_PATH = os.environ.get("MIINT_EXTENSION_PATH")
-_MIINT_USE_LOCAL = _MIINT_EXT_PATH is not None
+# MIINT_EXTENSION_REPO points install at a custom extension repo (e.g. the team
+# mirror at https://ftp.microbio.me/pub/miint) instead of community-extensions.
+_MIINT_EXT_REPO = os.environ.get("MIINT_EXTENSION_REPO")
 
 
 async def _ensure_miint_installed() -> None:
@@ -29,8 +27,8 @@ async def _ensure_miint_installed() -> None:
         if _miint_installed:
             return
         with _open_conn() as conn:
-            if _MIINT_USE_LOCAL:
-                conn.execute(f"FORCE INSTALL '{_MIINT_EXT_PATH}';")
+            if _MIINT_EXT_REPO is not None:
+                conn.execute(f"FORCE INSTALL miint FROM '{_MIINT_EXT_REPO}';")
             else:
                 conn.execute("INSTALL miint FROM community;")
         _miint_installed = True
@@ -38,7 +36,7 @@ async def _ensure_miint_installed() -> None:
 
 def _open_conn() -> duckdb.DuckDBPyConnection:
     """Open a DuckDB connection with unsigned extensions allowed if needed."""
-    if _MIINT_USE_LOCAL:
+    if _MIINT_EXT_REPO is not None:
         return duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
     return duckdb.connect(":memory:")
 
@@ -288,16 +286,12 @@ def _write_sequence_chunks(
         f"  }}"
         f")"
     )
-    # max_batch_bytes caps read_fastx memory per batch — prevents buffering
-    # entire genomes (up to 21 MB) before yielding rows. Only available in
-    # local miint builds with the streaming fix; community release omits it.
-    fastx_opts = ", max_batch_bytes='512MB'" if _MIINT_USE_LOCAL else ""
     conn.execute(
         "COPY ("
         "  WITH unnested AS ("
         "    SELECT m.feature_idx,"
         "      UNNEST(chunk_seq(f.sequence1)) AS chunk"
-        f"    FROM read_fastx(?{fastx_opts}) f"
+        "    FROM read_fastx(?) f"
         "    JOIN id_map m ON f.read_id = m.read_id"
         "  )"
         "  SELECT feature_idx, chunk.chunk_index, chunk.chunk_data"
