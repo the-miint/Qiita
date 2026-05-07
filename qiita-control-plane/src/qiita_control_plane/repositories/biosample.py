@@ -1,17 +1,48 @@
-"""Repository functions and composers for biosample-related tables.
+"""Repository functions and the import composer for the qiita.biosample tables.
 
-Functions take an asyncpg.Connection as their first positional argument,
-never acquire their own connection, and never open their own top-level
-transaction; the caller controls transaction scope so multiple calls compose
-atomically on one connection. Composers that perform more than one write
-guard on conn.is_in_transaction() at entry and raise if the caller did not
-wrap the call in a transaction.
+Direct functions cover the core biosample row, its study link
+(qiita.biosample, qiita.biosample_to_study), and the bulk-id read over
+the link table. Metadata-shaped tables (biosample_global_field,
+biosample_study_field, biosample_metadata) live in the sibling
+biosample_metadata module; the composer here imports the helpers it
+needs from there.
+
+Write functions take an asyncpg.Connection as their first positional
+argument, never acquire their own connection, and never open their own
+top-level transaction; the caller controls transaction scope so multiple
+calls compose atomically on one connection. Composers that perform more
+than one write guard on conn.is_in_transaction() at entry and raise if
+the caller did not wrap the call in a transaction. Read functions accept
+either a pool or a connection so they compose inside an open transaction
+or stand alone.
 """
 
+from dataclasses import dataclass
+from datetime import date
+from decimal import Decimal
+
 import asyncpg
-from qiita_common.models import FieldDataType
+from qiita_common.models import FieldDataType, Tier
 
 from . import require_transaction
+from .biosample_metadata import (
+    BiosampleGlobalFieldRow,
+    BiosampleMetadataUnknownFieldsError,
+    BiosampleOwnerIdFieldCollisionError,
+    _parse_text_for_data_type,
+    fetch_biosample_global_fields_by_display_names,
+    get_or_create_globally_linked_biosample_study_field,
+    get_or_create_local_biosample_study_field,
+    insert_biosample_metadata_date,
+    insert_biosample_metadata_numeric,
+    insert_biosample_metadata_text,
+)
+
+# Owner display values often contain real names (PII), so the owner-biosample-id
+# field is pinned above the study's default tier: even on a public study, only
+# study members may read the owner-id metadata. Held as a constant so a future
+# policy change (e.g., to Tier.VIEWER) is a one-line edit.
+OWNER_BIOSAMPLE_ID_TIER_OVERRIDE: Tier = Tier.MEMBER
 
 
 async def insert_biosample(
@@ -48,6 +79,40 @@ async def insert_biosample(
     )
 
 
+async def fetch_biosample_idxs_for_study(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    study_idx: int,
+    limit: int,
+) -> list[int]:
+    """Return up to `limit` biosample idxs linked to study_idx, newest-linked first.
+
+    Excludes retired links (biosample_to_study.retired = true) and
+    retired biosamples (biosample.retired = true). Sort:
+    (biosample_to_study.created_at DESC, biosample_idx DESC). Callers
+    that need to detect truncation pass `limit = cap + 1`; if the
+    returned list has length > cap, the underlying set exceeded the
+    cap. Accepts either a pool or a connection so the helper composes
+    inside an open transaction or stands alone (mirrors fetch_study).
+    """
+    # Single round trip; the partial index biosample_to_study_active_idx
+    # covers the bts.retired = false predicate and the join to biosample
+    # filters out separately-retired biosamples.
+    rows = await pool_or_conn.fetch(
+        "SELECT bts.biosample_idx"
+        " FROM qiita.biosample_to_study bts"
+        " JOIN qiita.biosample b ON b.idx = bts.biosample_idx"
+        " WHERE bts.study_idx = $1"
+        "   AND bts.retired = false"
+        "   AND b.retired = false"
+        " ORDER BY bts.created_at DESC, bts.biosample_idx DESC"
+        " LIMIT $2",
+        study_idx,
+        limit,
+    )
+    return [r["biosample_idx"] for r in rows]
+
+
 async def insert_biosample_to_study(
     conn: asyncpg.Connection,
     *,
@@ -75,108 +140,13 @@ async def insert_biosample_to_study(
     )
 
 
-async def get_or_create_local_biosample_study_field(
-    conn: asyncpg.Connection,
-    *,
-    study_idx: int,
-    display_name: str,
-    created_by_idx: int,
-    description: str | None = None,
-    data_type: FieldDataType = FieldDataType.TEXT,
-    required: bool = False,
-    terminology_idx: int | None = None,
-    tier_override: str | None = None,
-) -> int:
-    """Find a biosample_study_field by (study_idx, display_name); create local on miss.
+@dataclass(frozen=True)
+class BiosampleImportResult:
+    """Composite return shape for import_biosample_from_owner_biosample_id."""
 
-    The lookup branch returns the existing row's idx whether the row is
-    currently linked to a biosample_global_field or purely local — a
-    downstream metadata write against either kind is well-defined because
-    the biosample_metadata_apply_field_contract trigger reads from
-    biosample_study_field.biosample_global_field_idx either way.
-
-    The create branch produces a purely-local row (biosample_global_field_idx
-    NULL); creating a globally-linked row is a separate operation because
-    its non-null inputs are the inverse set per the
-    biosample_study_field_inheritance_consistent CHECK.
-
-    Concurrency: the natural-key UNIQUE constraint
-    biosample_study_field_display_name_unique can race two concurrent callers
-    for the same (study_idx, display_name). Implemented as
-    INSERT ... ON CONFLICT DO NOTHING RETURNING idx with a fallback SELECT on
-    miss so concurrent callers converge on the same idx without surfacing
-    UniqueViolationError. Race-free under READ COMMITTED (the project default,
-    set in qiita_control_plane.db); under REPEATABLE READ / SERIALIZABLE the
-    fallback SELECT could miss a row committed after the transaction snapshot
-    and a different pattern would be required.
-    """
-    # Create branch — purely-local row, biosample_global_field_idx left NULL.
-    # ON CONFLICT DO NOTHING absorbs the unique-constraint hit so the
-    # concurrent loser of the race does not raise.
-    idx = await conn.fetchval(
-        "INSERT INTO qiita.biosample_study_field ("
-        "    study_idx, display_name, description,"
-        "    data_type, required, terminology_idx, tier_override,"
-        "    created_by_idx"
-        ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
-        " ON CONFLICT (study_idx, display_name) DO NOTHING"
-        " RETURNING idx",
-        study_idx,
-        display_name,
-        description,
-        data_type,
-        required,
-        terminology_idx,
-        tier_override,
-        created_by_idx,
-    )
-    if idx is not None:
-        return idx
-
-    # Lookup branch — fallback fires only on conflict; takes a fresh snapshot
-    # under READ COMMITTED so it sees the row the concurrent winner committed.
-    return await conn.fetchval(
-        "SELECT idx FROM qiita.biosample_study_field WHERE study_idx = $1 AND display_name = $2",
-        study_idx,
-        display_name,
-    )
-
-
-async def insert_biosample_metadata_text(
-    conn: asyncpg.Connection,
-    *,
-    biosample_idx: int,
-    biosample_study_field_idx: int,
-    value_text: str,
-    created_by_idx: int,
-    is_owner_biosample_id: bool = False,
-) -> int:
-    """Insert a text-valued biosample_metadata row and return its idx.
-
-    The biosample_metadata_unique_owner_biosample_id partial unique index
-    rejects a second is_owner_biosample_id=true row for the same biosample.
-    The biosample_metadata_reject_if_link_retired trigger rejects writes
-    against retired biosample_to_study links. Both surface as
-    asyncpg.PostgresError subclasses.
-
-    global_field_idx is populated by trigger from the source field row;
-    the other five value columns belong to sibling functions for those
-    value types and are left NULL here so that
-    biosample_metadata_exactly_one_value is satisfied.
-    """
-    # Single INSERT; value_text is the only value column populated.
-    return await conn.fetchval(
-        "INSERT INTO qiita.biosample_metadata ("
-        "    biosample_idx, biosample_study_field_idx,"
-        "    value_text, is_owner_biosample_id, created_by_idx"
-        ") VALUES ($1, $2, $3, $4, $5)"
-        " RETURNING idx",
-        biosample_idx,
-        biosample_study_field_idx,
-        value_text,
-        is_owner_biosample_id,
-        created_by_idx,
-    )
+    biosample_idx: int
+    biosample_study_field_idx: int
+    biosample_study_field_created: bool
 
 
 async def import_biosample_from_owner_biosample_id(
@@ -187,18 +157,34 @@ async def import_biosample_from_owner_biosample_id(
     owner_biosample_id_field_name: str,
     owner_biosample_id_value: str,
     caller_idx: int,
+    metadata: dict[str, str],
     metadata_checklist_idx: int | None = None,
     biosample_accession: str | None = None,
     ena_sample_accession: str | None = None,
-) -> int:
-    """Import one biosample from its owner's identifier-for-it; return its idx.
+) -> BiosampleImportResult:
+    """Import one biosample with its owner-id and any globally-linked metadata.
 
-    Creates the biosample, links it to the study, finds or creates a local
-    biosample_study_field with the supplied display_name (data_type='text',
-    required=True on auto-create), and writes the owner-biosample-id metadata value
-    flagged with is_owner_biosample_id=True. The
-    biosample_metadata_unique_owner_biosample_id partial unique index
-    enforces at most one such row per biosample.
+    Creates the biosample, links it to the study, writes any supplied metadata
+    against globally-linked biosample_study_field rows (auto-creating each
+    linked field on first use), and writes the owner-biosample-id metadata
+    value against a purely-local biosample_study_field flagged
+    is_owner_biosample_id=True. Returns a BiosampleImportResult naming the
+    new biosample plus the owner-biosample-id field row.
+
+    The metadata dict maps biosample_global_field.display_name to a text
+    value; values are parsed into the Python type matching the global
+    field's data_type before insert. Pre-flight validation runs before any
+    writes:
+
+        - BiosampleOwnerIdFieldCollisionError when metadata carries an
+          entry whose key equals owner_biosample_id_field_name (the
+          owner-biosample-id row must remain purely-local; the same
+          display_name cannot also be a globally-linked metadata entry).
+        - BiosampleMetadataUnknownFieldsError when any metadata key has
+          no matching biosample_global_field row; all unknown names are
+          collected in one error.
+        - BiosampleMetadataParseError on first failure to coerce a text
+          value into the type its global field declares.
 
     The caller must wrap the call in `async with conn.transaction():`; the
     guard at entry raises RuntimeError otherwise so partial failure cannot
@@ -206,6 +192,30 @@ async def import_biosample_from_owner_biosample_id(
     """
     # Fail-fast guard against caller forgetting to wrap in a transaction.
     require_transaction(conn)
+
+    # Pre-flight: pure-logic collision check between the owner-id field
+    # name and the metadata dict's keys. The owner-id row is purely-local;
+    # a globally-linked entry at the same display_name would violate that.
+    if owner_biosample_id_field_name in metadata:
+        raise BiosampleOwnerIdFieldCollisionError(owner_biosample_id_field_name)
+
+    # Pre-flight: resolve every metadata key against biosample_global_field
+    # in one query. Unknown names are collected (not first-only) so the
+    # caller surfaces every bad name in a single 422.
+    global_field_rows = await fetch_biosample_global_fields_by_display_names(conn, metadata.keys())
+    unknown = [name for name in metadata if name not in global_field_rows]
+    if unknown:
+        raise BiosampleMetadataUnknownFieldsError(unknown)
+
+    # Pre-flight: parse every text value into its typed Python value.
+    # Failing here keeps the writes below from running for partial inputs;
+    # the surrounding transaction would still roll back, but pre-flight
+    # avoids the wasted writes.
+    parsed_metadata: list[tuple[BiosampleGlobalFieldRow, str | Decimal | date]] = []
+    for display_name, text_value in metadata.items():
+        global_row = global_field_rows[display_name]
+        parsed_value = _parse_text_for_data_type(display_name, global_row.data_type, text_value)
+        parsed_metadata.append((global_row, parsed_value))
 
     # Step a: create the biosample.
     bs_idx = await insert_biosample(
@@ -225,16 +235,65 @@ async def import_biosample_from_owner_biosample_id(
         created_by_idx=caller_idx,
     )
 
-    # Step c: find or create the local owner-biosample-id field on this study.
-    field_idx = await get_or_create_local_biosample_study_field(
+    # Step c: write each globally-linked metadata entry. The study field row
+    # is upserted on first use; subsequent entries on the same study reuse it.
+    for global_row, parsed_value in parsed_metadata:
+        linked_field_idx, _ = await get_or_create_globally_linked_biosample_study_field(
+            conn,
+            study_idx=study_idx,
+            biosample_global_field_idx=global_row.idx,
+            display_name=global_row.display_name,
+            created_by_idx=caller_idx,
+        )
+        # Dispatch on the global field's data_type. The else branch covers
+        # FieldDataType members the if/elif chain does not name (BOOLEAN,
+        # TERMINOLOGY today); it is unreachable in practice because
+        # _parse_text_for_data_type raises NotImplementedError for those
+        # types in the pre-flight parse pass. A future maintainer adding
+        # BOOLEAN/TERMINOLOGY support must extend both the parser and this
+        # dispatch.
+        if global_row.data_type is FieldDataType.TEXT:
+            await insert_biosample_metadata_text(
+                conn,
+                biosample_idx=bs_idx,
+                biosample_study_field_idx=linked_field_idx,
+                value_text=parsed_value,
+                created_by_idx=caller_idx,
+            )
+        elif global_row.data_type is FieldDataType.NUMERIC:
+            await insert_biosample_metadata_numeric(
+                conn,
+                biosample_idx=bs_idx,
+                biosample_study_field_idx=linked_field_idx,
+                value_numeric=parsed_value,
+                created_by_idx=caller_idx,
+            )
+        elif global_row.data_type is FieldDataType.DATE:
+            await insert_biosample_metadata_date(
+                conn,
+                biosample_idx=bs_idx,
+                biosample_study_field_idx=linked_field_idx,
+                value_date=parsed_value,
+                created_by_idx=caller_idx,
+            )
+        else:
+            raise NotImplementedError(
+                f"metadata insert for data_type={global_row.data_type} is not yet implemented"
+            )
+
+    # Step d: find or create the local owner-biosample-id field on this study.
+    # The tier_override pins the field above any study-level default so the
+    # owner display value never surfaces to non-members (PII concern).
+    field_idx, field_created = await get_or_create_local_biosample_study_field(
         conn,
         study_idx=study_idx,
         display_name=owner_biosample_id_field_name,
         created_by_idx=caller_idx,
         required=True,
+        tier_override=OWNER_BIOSAMPLE_ID_TIER_OVERRIDE,
     )
 
-    # Step d: write the owner-biosample-id metadata row, flagged.
+    # Step e: write the owner-biosample-id metadata row, flagged.
     await insert_biosample_metadata_text(
         conn,
         biosample_idx=bs_idx,
@@ -244,4 +303,8 @@ async def import_biosample_from_owner_biosample_id(
         is_owner_biosample_id=True,
     )
 
-    return bs_idx
+    return BiosampleImportResult(
+        biosample_idx=bs_idx,
+        biosample_study_field_idx=field_idx,
+        biosample_study_field_created=field_created,
+    )

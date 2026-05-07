@@ -74,9 +74,83 @@ async def human_admin_session(postgres_pool):
             Scope.SELF_TOKEN,
             Scope.REFERENCE_READ,
             Scope.REFERENCE_WRITE,
+            Scope.BIOSAMPLE_READ,
+            Scope.BIOSAMPLE_WRITE,
+            Scope.STUDY_READ,
+            Scope.STUDY_WRITE,
             Scope.ADMIN_USER,
             Scope.ADMIN_SERVICE_ACCOUNT,
             Scope.ADMIN_AUDIT_READ,
+        ],
+    )
+    return {
+        "principal_idx": idx,
+        "token": plaintext,
+        "email": f"{display_name}@example.com",
+        "display_name": display_name,
+    }
+
+
+@pytest_asyncio.fixture(scope="session")
+async def wet_lab_admin_session(postgres_pool):
+    """A session-scoped wet_lab_admin human with a complete profile and a
+    PAT carrying the wet_lab_admin scope ceiling. Used for tests that need
+    a caller authorized to act on behalf of another user (e.g., importing
+    a biosample where body.owner_idx names a different principal)."""
+    from qiita_control_plane.auth.token import mint_api_token
+
+    display_name = "test-wet-lab-admin"
+    # Look up an existing principal first; auth_events FK keeps rows around
+    # across pytest sessions, so re-creation would fail.
+    idx = await postgres_pool.fetchval(
+        "SELECT idx FROM qiita.principal WHERE display_name = $1",
+        display_name,
+    )
+    if idx is None:
+        async with postgres_pool.acquire() as conn:
+            async with conn.transaction():
+                idx = await conn.fetchval(
+                    "INSERT INTO qiita.principal"
+                    "  (display_name, system_role, created_by_idx)"
+                    " VALUES ($1, $2, 1) RETURNING idx",
+                    display_name,
+                    SystemRole.WET_LAB_ADMIN,
+                )
+                await conn.execute(
+                    "INSERT INTO qiita.user"
+                    "  (principal_idx, email, affiliation, address, phone)"
+                    " VALUES ($1, $2, 'UCSD', '9500 Gilman', '555-0002')",
+                    idx,
+                    f"{display_name}@example.com",
+                )
+    # Make sure existing rows have a complete profile (idempotent).
+    await postgres_pool.execute(
+        "UPDATE qiita.user SET affiliation = 'UCSD', address = '9500 Gilman',"
+        " phone = '555-0002'"
+        " WHERE principal_idx = $1",
+        idx,
+    )
+    # Make sure principal isn't disabled / retired from a prior partial run.
+    await postgres_pool.execute(
+        "UPDATE qiita.principal SET"
+        "  disabled = false, disabled_at = NULL, disabled_by_idx = NULL,"
+        "  disable_reason = NULL"
+        " WHERE idx = $1 AND retired = false",
+        idx,
+    )
+    plaintext, _ = await mint_api_token(
+        postgres_pool,
+        principal_idx=idx,
+        label="session-wet-lab-admin",
+        scopes=[
+            Scope.SELF_PROFILE,
+            Scope.SELF_TOKEN,
+            Scope.REFERENCE_READ,
+            Scope.REFERENCE_WRITE,
+            Scope.BIOSAMPLE_READ,
+            Scope.BIOSAMPLE_WRITE,
+            Scope.STUDY_READ,
+            Scope.STUDY_WRITE,
         ],
     )
     return {
@@ -120,7 +194,15 @@ async def regular_user_session(postgres_pool):
         postgres_pool,
         principal_idx=idx,
         label="session-user",
-        scopes=[Scope.SELF_PROFILE, Scope.SELF_TOKEN, Scope.REFERENCE_READ],
+        scopes=[
+            Scope.SELF_PROFILE,
+            Scope.SELF_TOKEN,
+            Scope.REFERENCE_READ,
+            Scope.BIOSAMPLE_READ,
+            Scope.BIOSAMPLE_WRITE,
+            Scope.STUDY_READ,
+            Scope.STUDY_WRITE,
+        ],
     )
     return {
         "principal_idx": idx,

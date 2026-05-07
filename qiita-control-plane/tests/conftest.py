@@ -21,6 +21,7 @@ from qiita_control_plane.testing.sessions import (  # noqa: F401
     compute_worker_service_account,
     human_admin_session,
     regular_user_session,
+    wet_lab_admin_session,
 )
 
 

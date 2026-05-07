@@ -14,6 +14,10 @@ from qiita_control_plane.repositories.user_eligibility import (
     UserEligibility,
     fetch_user_eligibility,
 )
+from qiita_control_plane.testing.db_seeds import (
+    disable_principal,
+    retire_principal,
+)
 
 pytestmark = pytest.mark.db
 
@@ -66,33 +70,6 @@ async def _attach_service_account(pool, principal_idx: int) -> None:
         "INSERT INTO qiita.service_account (principal_idx, name) VALUES ($1, $2)",
         principal_idx,
         f"ue-svc-{principal_idx}",
-    )
-
-
-async def _disable_principal(pool, principal_idx: int) -> None:
-    # disabled, disabled_at, disabled_by_idx, disable_reason are all
-    # required together by the principal_disabled_consistent CHECK; mirror
-    # the SET shape used by routes/admin.py.
-    await pool.execute(
-        "UPDATE qiita.principal SET"
-        "  disabled = true, disabled_at = now(),"
-        "  disabled_by_idx = $2, disable_reason = $3"
-        " WHERE idx = $1",
-        principal_idx,
-        SYSTEM_PRINCIPAL_IDX,
-        "test-disabled",
-    )
-
-
-async def _retire_principal(pool, principal_idx: int) -> None:
-    await pool.execute(
-        "UPDATE qiita.principal SET"
-        "  retired = true, retired_at = now(),"
-        "  retired_by_idx = $2, retire_reason = $3"
-        " WHERE idx = $1",
-        principal_idx,
-        SYSTEM_PRINCIPAL_IDX,
-        "test-retired",
     )
 
 
@@ -158,7 +135,7 @@ async def test_fetch_user_eligibility_returns_disabled_true_for_disabled_user(
 ):
     pidx = await _seed_principal(postgres_pool, suffix="disabled")
     await _attach_user_complete(postgres_pool, pidx)
-    await _disable_principal(postgres_pool, pidx)
+    await disable_principal(postgres_pool, pidx)
     try:
         row = await fetch_user_eligibility(postgres_pool, principal_idx=pidx)
         assert row == UserEligibility(
@@ -173,7 +150,7 @@ async def test_fetch_user_eligibility_returns_retired_true_for_retired_user(
 ):
     pidx = await _seed_principal(postgres_pool, suffix="retired")
     await _attach_user_complete(postgres_pool, pidx)
-    await _retire_principal(postgres_pool, pidx)
+    await retire_principal(postgres_pool, pidx)
     try:
         row = await fetch_user_eligibility(postgres_pool, principal_idx=pidx)
         assert row == UserEligibility(

@@ -207,6 +207,118 @@ class UserResponse(BaseModel):
 
 
 # ============================================================================
+# Biosample import models
+# ============================================================================
+
+
+class BiosampleImportRequest(BaseModel):
+    """Body for POST /api/v1/study/{study_idx}/biosample.
+
+    The route gates on wet_lab_admin or higher; owner_idx names the user the
+    biosample is being created for and must be supplied explicitly. The
+    metadata dict carries text values keyed on biosample_global_field
+    display_name; the route parses each value into the global field's data
+    type before insert. An empty dict is allowed.
+    """
+
+    owner_idx: Annotated[int, Field(gt=0)]
+    owner_biosample_id_field_name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
+    owner_biosample_id_value: str = Field(min_length=1)
+    metadata: dict[str, str] = Field(default_factory=dict)
+    metadata_checklist_idx: Annotated[int, Field(gt=0)] | None = None
+    biosample_accession: str | None = None
+    ena_sample_accession: str | None = None
+
+
+class BiosampleImportResponse(BaseModel):
+    """Returned by POST /api/v1/study/{study_idx}/biosample on success."""
+
+    biosample_idx: Annotated[int, Field(gt=0)]
+    biosample_study_field_idx: Annotated[int, Field(gt=0)]
+    biosample_study_field_created: bool
+
+
+class BiosampleIdxsListResponse(BaseModel):
+    """Returned by GET /api/v1/study/{study_idx}/biosample/list-idxs.
+
+    Single-shot bulk-id envelope: every biosample_idx linked to the
+    study, subject to retirement filtering, up to a hard cap.
+    `truncated` is true when the underlying set exceeded the cap;
+    clients seeing it should narrow their scope.
+    `caller_system_role` carries the caller's principal.system_role
+    verbatim from the database.
+    """
+
+    biosample_idxs: list[int]
+    count: Annotated[int, Field(ge=0)]
+    truncated: bool
+    caller_system_role: SystemRole
+
+
+# ============================================================================
+# Study create models
+# ============================================================================
+
+
+# Column-length budgets mirror the qiita.study schema; keeping the limits
+# here lets Pydantic reject oversized inputs before they hit Postgres.
+_STUDY_TITLE_MAX = 500
+_STUDY_ALIAS_MAX = 255
+_STUDY_FUNDING_MAX = 500
+_STUDY_ACCESSION_MAX = 50
+
+
+class StudyCreate(BaseModel):
+    """Body for POST /api/v1/study — create a study.
+
+    `owner_idx=None` means "default to the calling principal_idx" (caller-
+    creates-own-study). When supplied as a different principal, the route
+    enforces wet_lab_admin or higher (the lab-tech-on-behalf rule). The
+    study row's `created_by_idx` is always the caller; only `owner_idx` is
+    transferred. `default_tier=None` lets the DB default ('member') apply.
+    """
+
+    title: str = Field(min_length=1, max_length=_STUDY_TITLE_MAX)
+    owner_idx: Annotated[int, Field(gt=0)] | None = None
+    principal_investigator_idx: Annotated[int, Field(gt=0)] | None = None
+    alias: str | None = Field(default=None, max_length=_STUDY_ALIAS_MAX)
+    description: str | None = None
+    abstract: str | None = None
+    funding: str | None = Field(default=None, max_length=_STUDY_FUNDING_MAX)
+    ebi_study_accession: str | None = Field(default=None, max_length=_STUDY_ACCESSION_MAX)
+    vamps_id: str | None = Field(default=None, max_length=_STUDY_ACCESSION_MAX)
+    notes: str | None = None
+    extra_metadata: dict[str, object] | None = None
+    default_tier: Tier | None = None
+
+
+class StudyResponse(BaseModel):
+    """Returned by POST /api/v1/study on success.
+
+    Mirrors the qiita.study row's caller-visible columns, with the
+    generated search_vector and parent_study_idx (not exposed in v1)
+    omitted.
+    """
+
+    study_idx: Annotated[int, Field(gt=0)]
+    owner_idx: Annotated[int, Field(gt=0)]
+    principal_investigator_idx: int | None
+    title: str
+    alias: str | None
+    description: str | None
+    abstract: str | None
+    funding: str | None
+    ebi_study_accession: str | None
+    vamps_id: str | None
+    notes: str | None
+    extra_metadata: dict[str, object] | None
+    default_tier: Tier
+    created_by_idx: Annotated[int, Field(gt=0)]
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+
+
+# ============================================================================
 # Auth: API token mint / list models
 # ============================================================================
 

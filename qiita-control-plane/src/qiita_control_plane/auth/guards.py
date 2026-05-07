@@ -20,7 +20,9 @@ from qiita_common.auth_constants import SystemRole
 from qiita_common.models import Tier
 
 from ..deps import get_db_pool
+from ..repositories.study import fetch_study_exists
 from ..repositories.study_access import fetch_caller_study_access
+from ..repositories.user_eligibility import fetch_user_eligibility
 from .principal import (
     Anonymous,
     HumanUser,
@@ -205,16 +207,81 @@ _TIER_ORDER = {
 }
 
 
-def require_study_access(min_tier: Tier) -> Callable[..., None]:
+async def require_eligible_owner(
+    pool: asyncpg.Pool,
+    *,
+    candidate_idx: int,
+    caller_idx: int,
+    detail: str,
+) -> None:
+    """Body-time helper (not a Depends() dep): enforce that a body-supplied
+    owner_idx names a profile-complete, non-disabled, non-retired user.
+
+    Skips the DB roundtrip when candidate_idx == caller_idx — the caller's
+    own eligibility is already guaranteed by require_complete_profile (and
+    its require_human ancestor) at request entry. All ineligibility cases
+    (no principal, non-user-kind, disabled, retired, profile incomplete)
+    collapse to one 422 with the caller-supplied detail to avoid leaking
+    principal-state to callers probing arbitrary owner_idx values.
+    """
+    # Self-target short-circuit; the caller has already passed the entry guards.
+    if candidate_idx == caller_idx:
+        return
+
+    # One round trip; the policy combination is checked here.
+    eligibility = await fetch_user_eligibility(pool, principal_idx=candidate_idx)
+    if eligibility is None or not (
+        eligibility.is_user
+        and not eligibility.disabled
+        and not eligibility.retired
+        and eligibility.profile_complete
+    ):
+        raise HTTPException(status_code=422, detail=detail)
+
+
+async def require_study_exists(
+    study_idx: int,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+) -> None:
+    """Existence-only guard: 404 if no qiita.study row matches the path's
+    study_idx. No access-tier check, no role gate. Use on routes that gate
+    write access via require_role_at_least (e.g., the biosample import
+    route, where wet_lab_admin replaces the tier comparison) but still
+    need to surface a 404 on a nonexistent study rather than letting an
+    FK violation surface as a 422 from the composer.
+    """
+    if not await fetch_study_exists(pool, study_idx):
+        raise HTTPException(
+            status_code=404,
+            detail=f"study {study_idx} not found",
+        )
+
+
+def require_study_access(
+    min_tier: Tier | None = None,
+    *,
+    bypass_role: SystemRole = SystemRole.SYSTEM_ADMIN,
+) -> Callable[..., None]:
     """Factory: returns a dep that gates the route on the caller's tier
     of access to the path's `study_idx`.
 
-    Behavior, in order: 401 on Anonymous; system_admin bypass (skips the
-    DB lookup); 404 if the study does not exist; owner bypass (caller is
-    the study's owner); 403 if the caller's effective tier is below
-    `min_tier`. A caller with no qiita.study_access row has effective
-    tier `Tier.PUBLIC` by absence — meets `min_tier=Tier.PUBLIC`, fails
-    everything higher.
+    Behavior, in order: 401 on Anonymous; role-bypass for callers at or
+    above `bypass_role` (skips the DB lookup); 404 if the study does
+    not exist; owner bypass (caller is the study's owner); 403 if the
+    caller's effective tier is below the resolved minimum tier.
+
+    `min_tier=None` resolves the minimum to the study's own
+    `default_tier` at request time (per-study policy). Pass an
+    explicit `Tier` member to lock the minimum at factory call time
+    (per-route policy).
+
+    `bypass_role` defaults to `SYSTEM_ADMIN` (existing behavior). Pass
+    `WET_LAB_ADMIN` for routes whose policy admits any wet_lab_admin
+    or higher regardless of tier.
+
+    A caller with no qiita.study_access row has effective tier
+    `Tier.PUBLIC` by absence — meets a resolved minimum of
+    `Tier.PUBLIC`, fails everything higher.
     """
 
     async def _dep(
@@ -226,8 +293,8 @@ def require_study_access(min_tier: Tier) -> Callable[..., None]:
         if isinstance(p, Anonymous):
             raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
 
-        # System-admin bypass — no DB lookup needed.
-        if p.has_role_at_least(SystemRole.SYSTEM_ADMIN):
+        # Role bypass — no DB lookup needed.
+        if p.has_role_at_least(bypass_role):
             return
 
         # Fetch the study + caller's access row in one round trip.
@@ -244,12 +311,16 @@ def require_study_access(min_tier: Tier) -> Callable[..., None]:
         if row.owner_idx == p.principal_idx:
             return
 
+        # Resolve the minimum tier per call: explicit factory arg wins,
+        # otherwise fall back to the study's own default_tier.
+        resolved_min_tier = min_tier if min_tier is not None else row.default_tier
+
         # Tier comparison — public-by-absence when no study_access row.
         effective_tier = row.access_tier if row.access_tier is not None else Tier.PUBLIC
-        if _TIER_ORDER[effective_tier] < _TIER_ORDER[min_tier]:
+        if _TIER_ORDER[effective_tier] < _TIER_ORDER[resolved_min_tier]:
             raise HTTPException(
                 status_code=403,
-                detail=f"requires study access at tier {str(min_tier)!r} or higher",
+                detail=f"requires study access at tier {str(resolved_min_tier)!r} or higher",
             )
 
     return _dep

@@ -90,11 +90,16 @@ async def test_fetch_caller_study_access_returns_owner_with_null_tier_when_calle
     ctx,
 ):
     # Caller has no study_access row; LEFT JOIN yields a row with
-    # access_tier as NULL → mapped to None.
+    # access_tier as NULL → mapped to None. Schema-default default_tier
+    # ('member') applies because the seed insert omits the column.
     row = await fetch_caller_study_access(
         ctx["pool"], principal_idx=ctx["caller_idx"], study_idx=ctx["study_idx"]
     )
-    assert row == CallerStudyAccessRow(owner_idx=ctx["owner_idx"], access_tier=None)
+    assert row == CallerStudyAccessRow(
+        owner_idx=ctx["owner_idx"],
+        access_tier=None,
+        default_tier=Tier.MEMBER,
+    )
 
 
 async def test_fetch_caller_study_access_returns_caller_tier_when_access_row_exists(ctx):
@@ -112,7 +117,11 @@ async def test_fetch_caller_study_access_returns_caller_tier_when_access_row_exi
     row = await fetch_caller_study_access(
         ctx["pool"], principal_idx=ctx["caller_idx"], study_idx=ctx["study_idx"]
     )
-    assert row == CallerStudyAccessRow(owner_idx=ctx["owner_idx"], access_tier=Tier.MEMBER)
+    assert row == CallerStudyAccessRow(
+        owner_idx=ctx["owner_idx"],
+        access_tier=Tier.MEMBER,
+        default_tier=Tier.MEMBER,
+    )
 
 
 async def test_fetch_caller_study_access_returns_owner_idx_for_owner_caller(ctx):
@@ -123,4 +132,27 @@ async def test_fetch_caller_study_access_returns_owner_idx_for_owner_caller(ctx)
     row = await fetch_caller_study_access(
         ctx["pool"], principal_idx=ctx["owner_idx"], study_idx=ctx["study_idx"]
     )
-    assert row == CallerStudyAccessRow(owner_idx=ctx["owner_idx"], access_tier=None)
+    assert row == CallerStudyAccessRow(
+        owner_idx=ctx["owner_idx"],
+        access_tier=None,
+        default_tier=Tier.MEMBER,
+    )
+
+
+async def test_fetch_caller_study_access_surfaces_non_default_default_tier(ctx):
+    # Set the study's default_tier to a non-default value and verify
+    # the JOIN returns it on the row alongside the caller's access_tier.
+    await ctx["pool"].execute(
+        "UPDATE qiita.study SET default_tier = $1 WHERE idx = $2",
+        Tier.VIEWER,
+        ctx["study_idx"],
+    )
+
+    row = await fetch_caller_study_access(
+        ctx["pool"], principal_idx=ctx["caller_idx"], study_idx=ctx["study_idx"]
+    )
+    assert row == CallerStudyAccessRow(
+        owner_idx=ctx["owner_idx"],
+        access_tier=None,
+        default_tier=Tier.VIEWER,
+    )
