@@ -27,5 +27,9 @@ target/
 # Build artifacts
 *.sif
 
+# Local-only scratch space — large datasets the system tests consume
+# (e.g. GG2 backbone FASTA + taxonomy + tree at ~11 GB). Never committed.
+localdocs/
+
 # Claude Code (workspace-local config and agent definitions)
 .claude/
