@@ -100,13 +100,11 @@ async def import_biosample(
     biosample:write scope, must be wet_lab_admin or higher, and the path's
     study_idx must exist.
     """
-    # Owner eligibility pre-flight. The helper skips the lookup when
-    # candidate == caller (already validated by require_complete_profile)
-    # and collapses every ineligibility case to one 422.
+    # Owner eligibility pre-flight; collapses every ineligibility case to
+    # one 422.
     await require_eligible_owner(
         pool,
         candidate_idx=body.owner_idx,
-        caller_idx=user.principal_idx,
         detail=_MSG_OWNER_NOT_ELIGIBLE,
     )
 
@@ -424,7 +422,6 @@ async def patch_biosample_route(
                     await require_eligible_owner(
                         conn,
                         candidate_idx=fields["owner_idx"],
-                        caller_idx=caller.principal_idx,
                         detail=_MSG_OWNER_NOT_ELIGIBLE,
                     )
 

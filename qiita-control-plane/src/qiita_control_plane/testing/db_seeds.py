@@ -27,6 +27,7 @@ async def seed_user_principal(
     prefix: str,
     suffix: str,
     profile_complete: bool = True,
+    system_role: SystemRole = SystemRole.USER,
 ) -> int:
     """Insert a principal + qiita.user row; return the principal_idx.
 
@@ -35,7 +36,10 @@ async def seed_user_principal(
     profile_complete=True the user row carries email + affiliation + address
     + phone, which the schema's profile_complete computed column treats as a
     complete profile. With profile_complete=False only email is populated, so
-    the flag stays false.
+    the flag stays false. `system_role` defaults to USER; pass an elevated
+    role for tests that need a wet_lab_admin / system_admin caller (the
+    qiita.user row makes this a user-kind, not service-account, principal
+    regardless of role).
     """
     name = f"{prefix}-{suffix}-{secrets.token_hex(4)}"
     async with pool.acquire() as conn:
@@ -44,7 +48,7 @@ async def seed_user_principal(
                 "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
                 " VALUES ($1, $2, $3) RETURNING idx",
                 name,
-                SystemRole.USER,
+                system_role,
                 SYSTEM_PRINCIPAL_IDX,
             )
             if profile_complete:

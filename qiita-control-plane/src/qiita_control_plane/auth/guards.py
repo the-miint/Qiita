@@ -211,7 +211,6 @@ async def require_eligible_owner(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
     candidate_idx: int,
-    caller_idx: int,
     detail: str,
 ) -> None:
     """Body-time helper (not a Depends() dep): enforce that a body-supplied
@@ -219,23 +218,18 @@ async def require_eligible_owner(
 
     Accepts either a pool or a connection so the helper composes inside an
     open transaction or stands alone (mirrors fetch_user_eligibility, which
-    is what does the work). The self-target short-circuit applies only when
-    candidate_idx == caller_idx AND the caller is a human whose own
-    eligibility was already validated by require_complete_profile; for
-    callers reaching this helper without that guarantee (e.g. service
-    accounts on the PATCH path) the candidate cannot equal the caller in
-    the first place — the role-typed FK trigger blocks non-user owners —
-    so the short-circuit never fires for them.
+    is what does the work). The full eligibility lookup runs on every call
+    — there is no caller-state short-circuit. Routes whose caller is
+    role-gated only (no require_complete_profile) would otherwise be able
+    to set owner_idx to a profile-incomplete caller's own principal_idx
+    and pass; running the lookup unconditionally closes that path without
+    requiring each call site to assert its own caller has been validated.
 
     All ineligibility cases (no principal, non-user-kind, disabled,
     retired, profile incomplete) collapse to one 422 with the
     caller-supplied detail to avoid leaking principal-state to callers
     probing arbitrary owner_idx values.
     """
-    # Self-target short-circuit; the caller has already passed the entry guards.
-    if candidate_idx == caller_idx:
-        return
-
     # One round trip; the policy combination is checked here.
     eligibility = await fetch_user_eligibility(pool_or_conn, principal_idx=candidate_idx)
     if eligibility is None or not (

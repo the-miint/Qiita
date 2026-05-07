@@ -235,9 +235,10 @@ async def _track_global_metadata_outputs(ctx, bs_idx, study_idx, global_idxs):
 
 
 async def test_post_biosample_wet_lab_admin_self_owner(ctx):
-    # Wet_lab_admin caller names themselves as the owner — the
-    # eligibility pre-flight is skipped (caller's own profile already
-    # validated by require_complete_profile) and the create succeeds.
+    # Wet_lab_admin caller names themselves as the owner — eligibility
+    # pre-flight runs against the caller's own principal_idx (caller is
+    # profile-complete via require_complete_profile, so the lookup
+    # passes) and the create succeeds.
     study_idx = await _seed_study(
         ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="wet-self"
     )
@@ -1763,6 +1764,53 @@ async def test_patch_biosample_owner_ineligibility_422(ctx, kind: IneligibilityK
         json={"owner_idx": bad_owner},
         headers={"If-Match": if_match},
     )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"] == _ELIGIBILITY_DETAIL
+
+
+async def test_patch_biosample_owner_self_incomplete_profile_422(ctx):
+    # Pin the self-target eligibility check: a wet_lab_admin caller whose
+    # own profile is incomplete must not be able to PATCH owner_idx to
+    # their own principal_idx. The PATCH route is role-gated only (no
+    # require_complete_profile), so the eligibility helper is the only
+    # line of defense and must run on every call -- no caller-state
+    # short-circuit.
+    suffix = secrets.token_hex(4)
+    caller_idx = await seed_user_principal(
+        ctx["pool"],
+        prefix=_SEED_PREFIX,
+        suffix=f"patch-incomplete-wet-{suffix}",
+        profile_complete=False,
+        system_role=SystemRole.WET_LAB_ADMIN,
+    )
+    ctx["created"]["user_principals"].append(caller_idx)
+
+    from qiita_control_plane.auth.token import mint_api_token
+    from qiita_control_plane.main import app
+
+    plaintext, _ = await mint_api_token(
+        ctx["pool"],
+        principal_idx=caller_idx,
+        label=f"incomplete-wet-{suffix}",
+        scopes=[Scope.BIOSAMPLE_WRITE],
+    )
+
+    # Seed a biosample owned by the session-scoped wet_lab_admin so the
+    # candidate (the test caller's own idx) differs from the current
+    # owner; the PATCH attempts an ownership transfer to self.
+    bs_idx = await _seed_biosample_for_patch(ctx)
+    if_match = await _etag_for(ctx["pool"], bs_idx)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {plaintext}"},
+    ) as caller:
+        resp = await caller.patch(
+            f"/api/v1/biosample/{bs_idx}",
+            json={"owner_idx": caller_idx},
+            headers={"If-Match": if_match},
+        )
     assert resp.status_code == 422, resp.text
     assert resp.json()["detail"] == _ELIGIBILITY_DETAIL
 

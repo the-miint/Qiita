@@ -105,13 +105,11 @@ async def create_study_route(
     ):
         raise HTTPException(status_code=403, detail=_MSG_ON_BEHALF_REQUIRES_WET_LAB_ADMIN)
 
-    # Owner eligibility pre-flight. The helper skips the lookup when
-    # candidate == caller (already validated by require_complete_profile)
-    # and collapses every ineligibility case to one 422.
+    # Owner eligibility pre-flight; collapses every ineligibility case to
+    # one 422.
     await require_eligible_owner(
         pool,
         candidate_idx=effective_owner_idx,
-        caller_idx=user.principal_idx,
         detail=_MSG_OWNER_NOT_ELIGIBLE,
     )
 
