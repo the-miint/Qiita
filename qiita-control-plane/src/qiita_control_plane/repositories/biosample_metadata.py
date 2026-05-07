@@ -19,6 +19,16 @@ from typing import NamedTuple
 import asyncpg
 from qiita_common.models import FieldDataType
 
+# Closed set of data_types fetch_global_metadata_for_biosample currently
+# decodes from biosample_metadata. Boolean and terminology are intentionally
+# absent so a future addition is a coordinated extension (read + write paths
+# need to learn the new value_* column at the same time).
+_GLOBAL_METADATA_VALUE_COLUMN: dict[FieldDataType, str] = {
+    FieldDataType.TEXT: "value_text",
+    FieldDataType.NUMERIC: "value_numeric",
+    FieldDataType.DATE: "value_date",
+}
+
 # ---------------------------------------------------------------------------
 # Structured exceptions raised by the import path
 # ---------------------------------------------------------------------------
@@ -113,6 +123,24 @@ class BiosampleGlobalFieldRow(NamedTuple):
     data_type: FieldDataType
 
 
+class BiosampleGlobalMetadataRow(NamedTuple):
+    """One row from fetch_global_metadata_for_biosample.
+
+    Carries the global field's stable internal_name (which doubles as the
+    dict key in the function's return mapping), the cosmetic display_name
+    and description (taken from biosample_global_field, not from any
+    per-study biosample_study_field override, because biosample reads
+    are not study-scoped), the field's data_type, and the typed Python
+    value extracted from the matching biosample_metadata.value_* column.
+    """
+
+    internal_name: str
+    display_name: str
+    description: str | None
+    data_type: FieldDataType
+    value: str | Decimal | date
+
+
 async def fetch_biosample_global_fields_by_display_names(
     conn: asyncpg.Connection,
     display_names: Iterable[str],
@@ -146,6 +174,61 @@ async def fetch_biosample_global_fields_by_display_names(
         )
         for r in rows
     }
+
+
+async def fetch_global_metadata_for_biosample(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    biosample_idx: int,
+) -> dict[str, BiosampleGlobalMetadataRow]:
+    """Return a dict of internal_name -> BiosampleGlobalMetadataRow for every
+    globally-linked metadata value the biosample carries.
+
+    Filters on biosample_metadata.global_field_idx IS NOT NULL: purely-local
+    rows (including the owner-biosample-id row) and rows whose
+    biosample_to_study link has been retired (the
+    biosample_to_study_retirement_demote_globals trigger nulls out
+    global_field_idx) are both excluded by the same predicate.
+    Missing-reason rows (value_missing_reason_idx populated) are also
+    excluded -- they have no typed value to surface and the import path
+    does not currently write them.
+
+    Currently supports data_type in {TEXT, NUMERIC, DATE} (matching the
+    import path's closed set); rows of other data_types raise
+    NotImplementedError so a future addition is a coordinated extension
+    of read + write paths.
+    """
+    # Pull every globally-linked, non-missing-reason row for the biosample
+    # in one round trip; carry every typed value column the closed set covers.
+    rows = await pool_or_conn.fetch(
+        "SELECT bgf.internal_name, bgf.display_name, bgf.description, bgf.data_type,"
+        " bm.value_text, bm.value_numeric, bm.value_date"
+        " FROM qiita.biosample_metadata bm"
+        " JOIN qiita.biosample_global_field bgf ON bgf.idx = bm.global_field_idx"
+        " WHERE bm.biosample_idx = $1"
+        "   AND bm.global_field_idx IS NOT NULL"
+        "   AND bm.value_missing_reason_idx IS NULL",
+        biosample_idx,
+    )
+
+    # Walk rows, dispatch each to the value column the data_type names.
+    # The unsupported branch raises so an out-of-set data_type cannot
+    # silently surface a NULL value.
+    result: dict[str, BiosampleGlobalMetadataRow] = {}
+    for r in rows:
+        data_type = FieldDataType(r["data_type"])
+        column = _GLOBAL_METADATA_VALUE_COLUMN.get(data_type)
+        if column is None:
+            raise NotImplementedError(
+                f"global metadata read for data_type={data_type} is not yet implemented"
+            )
+        result[r["internal_name"]] = BiosampleGlobalMetadataRow(
+            internal_name=r["internal_name"],
+            display_name=r["display_name"],
+            description=r["description"],
+            data_type=data_type,
+            value=r[column],
+        )
+    return result
 
 
 async def get_or_create_globally_linked_biosample_study_field(

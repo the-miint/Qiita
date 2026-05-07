@@ -77,32 +77,6 @@ async def _seed_metadata_checklist(pool, name):
     )
 
 
-async def _seed_biosample_global_field(
-    pool,
-    *,
-    internal_name,
-    display_name,
-    data_type,
-    created_by_idx,
-):
-    """Insert a qiita.biosample_global_field row and return its idx.
-
-    All seven seeded global rows in the migration use the column defaults
-    for required and default_tier; tests do the same so the helper's
-    surface stays small. data_type is passed through; asyncpg coerces
-    the StrEnum value to text for the qiita.field_data_type cast.
-    """
-    return await pool.fetchval(
-        "INSERT INTO qiita.biosample_global_field"
-        " (internal_name, display_name, data_type, created_by_idx)"
-        " VALUES ($1, $2, $3, $4) RETURNING idx",
-        internal_name,
-        display_name,
-        data_type,
-        created_by_idx,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Unique-name helpers
 # ---------------------------------------------------------------------------
@@ -161,6 +135,10 @@ async def _cleanup_tracked(pool, created):
             st,
         )
     await _delete_idxs(pool, "biosample", created["biosample"])
+    # study_access references study with ON DELETE RESTRICT, so any
+    # study_access rows seeded by tests must go before the auto-seeded
+    # study row deletion at the end of the fixture.
+    await _delete_idxs(pool, "study_access", created["study_access"])
     # biosample_global_field and terminology_term both reference terminology;
     # missing_value_reason has no inbound refs left after biosample_metadata.
     await _delete_idxs(pool, "biosample_global_field", created["biosample_global_field"])
@@ -216,6 +194,7 @@ async def ctx(postgres_pool):
         "terminology_term": [],
         "missing_value_reason": [],
         "terminology": [],
+        "study_access": [],
         "studies": [],
     }
 

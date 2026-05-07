@@ -23,6 +23,7 @@ from qiita_control_plane.testing.db_seeds import (
     retire_biosample,
     retire_biosample_to_study_link,
     seed_biosample,
+    seed_biosample_global_field,
     seed_biosample_to_study_link,
     seed_user_principal,
 )
@@ -68,22 +69,6 @@ async def _seed_metadata_checklist(pool, *, suffix: str) -> int:
     return await pool.fetchval(
         "INSERT INTO qiita.metadata_checklist (name) VALUES ($1) RETURNING idx",
         f"bs-route-cl-{suffix}-{secrets.token_hex(4)}",
-    )
-
-
-async def _seed_biosample_global_field(
-    pool, *, internal_name: str, display_name: str, data_type: FieldDataType
-) -> int:
-    """Insert a qiita.biosample_global_field row (system principal as creator,
-    column defaults for required / default_tier) and return its idx."""
-    return await pool.fetchval(
-        "INSERT INTO qiita.biosample_global_field"
-        "  (internal_name, display_name, data_type, created_by_idx)"
-        " VALUES ($1, $2, $3, $4) RETURNING idx",
-        internal_name,
-        display_name,
-        data_type,
-        SYSTEM_PRINCIPAL_IDX,
     )
 
 
@@ -258,9 +243,16 @@ async def test_post_biosample_wet_lab_admin_self_owner(ctx):
     )
     assert resp.status_code == 201, resp.text
     rj = resp.json()
-    assert rj["biosample_idx"] > 0
-    assert rj["biosample_study_field_idx"] > 0
-    assert rj["biosample_study_field_created"] is True
+    expected = {
+        # Auto-generated; copy actual into expected so the equality
+        # confirms field presence without pinning the idx value.
+        # The Field(gt=0) constraint on BiosampleImportResponse already
+        # rejects a zero idx at the route boundary.
+        "biosample_idx": rj["biosample_idx"],
+        "biosample_study_field_idx": rj["biosample_study_field_idx"],
+        "biosample_study_field_created": True,
+    }
+    assert rj == expected
 
     owner_idx = await ctx["pool"].fetchval(
         "SELECT owner_idx FROM qiita.biosample WHERE idx = $1", rj["biosample_idx"]
@@ -601,17 +593,19 @@ async def test_post_biosample_metadata_writes_global_fields(ctx):
     # parsed values into the matching value_* columns and creates one
     # globally-linked study field per concept.
     suffix = secrets.token_hex(4)
-    date_global = await _seed_biosample_global_field(
+    date_global = await seed_biosample_global_field(
         ctx["pool"],
         internal_name=f"r_date_{suffix}",
         display_name=f"Collection Date {suffix}",
         data_type=FieldDataType.DATE,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
     )
-    num_global = await _seed_biosample_global_field(
+    num_global = await seed_biosample_global_field(
         ctx["pool"],
         internal_name=f"r_num_{suffix}",
         display_name=f"Latitude {suffix}",
         data_type=FieldDataType.NUMERIC,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
     )
     ctx["created"]["biosample_global_field"].extend([date_global, num_global])
 
@@ -704,11 +698,12 @@ async def test_post_biosample_metadata_unparseable_value_422(ctx, data_type, bad
     # must return 422 with the failing field name in the detail.
     suffix = secrets.token_hex(4)
     display_name = f"Field {data_type} {suffix}"
-    global_idx = await _seed_biosample_global_field(
+    global_idx = await seed_biosample_global_field(
         ctx["pool"],
         internal_name=f"r_unp_{suffix}",
         display_name=display_name,
         data_type=data_type,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
     )
     ctx["created"]["biosample_global_field"].append(global_idx)
 
@@ -1058,9 +1053,13 @@ async def test_list_biosample_idxs_system_admin_bypasses_access(ctx):
 
     resp = await ctx["admin"].get(f"/api/v1/study/{study_idx}/biosample/list-idxs")
     assert resp.status_code == 200, resp.text
-    rj = resp.json()
-    assert rj["caller_system_role"] == "system_admin"
-    assert rj["biosample_idxs"] == []
+    expected = {
+        "biosample_idxs": [],
+        "count": 0,
+        "truncated": False,
+        "caller_system_role": "system_admin",
+    }
+    assert resp.json() == expected
 
 
 async def test_list_biosample_idxs_excludes_retired_link_and_retired_biosample(ctx):
@@ -1093,7 +1092,332 @@ async def test_list_biosample_idxs_excludes_retired_link_and_retired_biosample(c
 
     resp = await ctx["user"].get(f"/api/v1/study/{study_idx}/biosample/list-idxs")
     assert resp.status_code == 200, resp.text
+    expected = {
+        "biosample_idxs": [active_idx],
+        "count": 1,
+        "truncated": False,
+        "caller_system_role": "user",
+    }
+    assert resp.json() == expected
+
+
+# ===========================================================================
+# Single-biosample GET — /api/v1/biosample/{biosample_idx}
+# ===========================================================================
+#
+# Access policy: wet_lab_admin and system_admin bypass; otherwise the caller
+# must be the biosample's owner OR have a qiita.study_access row on a
+# non-retired biosample_to_study link. Retired biosamples 404 unconditionally
+# until the planned wet_lab_admin retired-retrieval surface lands.
+
+
+@pytest_asyncio.fixture
+async def no_biosample_read_client(make_pat_client):
+    """A regular_user PAT with a scope set that EXCLUDES Scope.BIOSAMPLE_READ —
+    drives the require_scope guard's missing-scope 403 on the GET route."""
+    return await make_pat_client(label="bs-no-read", scopes=[Scope.SELF_PROFILE])
+
+
+def _assert_etag_quoted(resp) -> None:
+    """Confirm the ETag header is present and wrapped in double quotes
+    per Decision 3. Format inside the quotes is opaque-by-contract."""
+    etag = resp.headers.get("ETag")
+    assert etag is not None and etag.startswith('"') and etag.endswith('"')
+
+
+async def test_get_biosample_owner_returns_response(ctx):
+    # The regular-user client (system_role=user) reads a biosample whose
+    # owner_idx matches its own principal_idx. Caller's role is below
+    # the wet_lab_admin bypass threshold, so access must be granted by
+    # fetch_caller_has_biosample_access; no biosample_to_study link or
+    # study_access row is seeded, so the predicate's only path to True
+    # is the owner branch (caller.principal_idx == biosample.owner_idx).
+    owner_idx = ctx["user_session"]["principal_idx"]
+    bs_idx = await seed_biosample(
+        ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx
+    )
+    ctx["created"]["biosample"].append(bs_idx)
+
+    resp = await ctx["user"].get(f"/api/v1/biosample/{bs_idx}")
+    assert resp.status_code == 200, resp.text
+    _assert_etag_quoted(resp)
+
     rj = resp.json()
-    assert rj["biosample_idxs"] == [active_idx]
-    assert rj["count"] == 1
-    assert rj["truncated"] is False
+    expected = {
+        "biosample_idx": bs_idx,
+        "owner_idx": owner_idx,
+        "metadata_checklist_idx": None,
+        "biosample_accession": None,
+        "ena_sample_accession": None,
+        "last_submission_at": None,
+        "submission_error": None,
+        "last_metadata_change_at": None,
+        "created_by_idx": owner_idx,
+        # Auto-generated by the DB; copy actual values into expected so
+        # the equality confirms field presence without pinning timestamps.
+        "created_at": rj["created_at"],
+        "updated_at": rj["updated_at"],
+        "retired": False,
+        "retired_by_idx": None,
+        "retired_at": None,
+        "retire_reason": None,
+        "global_metadata": {},
+        "caller_system_role": "user",
+    }
+    assert rj == expected
+
+
+async def test_get_biosample_via_study_access_returns_response(ctx):
+    # The caller is not the owner; access comes through a study_access row
+    # on the (active) biosample_to_study link. Grant viewer tier so the
+    # repo predicate's "any study_access row" check is satisfied.
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="get-via-access"
+    )
+    ctx["created"]["study"].append(study_idx)
+    bs_idx = await _seed_link_to_study(
+        ctx, study_idx=study_idx, owner_idx=ctx["wet_session"]["principal_idx"]
+    )
+    await _grant_study_access(
+        ctx,
+        study_idx=study_idx,
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier="viewer",
+        granted_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+
+    resp = await ctx["user"].get(f"/api/v1/biosample/{bs_idx}")
+    assert resp.status_code == 200, resp.text
+    _assert_etag_quoted(resp)
+
+    rj = resp.json()
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    expected = {
+        "biosample_idx": bs_idx,
+        "owner_idx": wet_idx,
+        "metadata_checklist_idx": None,
+        "biosample_accession": None,
+        "ena_sample_accession": None,
+        "last_submission_at": None,
+        "submission_error": None,
+        "last_metadata_change_at": None,
+        "created_by_idx": wet_idx,
+        # Auto-generated; copy actual into expected so the equality
+        # confirms field presence without pinning timestamps.
+        "created_at": rj["created_at"],
+        "updated_at": rj["updated_at"],
+        "retired": False,
+        "retired_by_idx": None,
+        "retired_at": None,
+        "retire_reason": None,
+        "global_metadata": {},
+        "caller_system_role": "user",
+    }
+    assert rj == expected
+
+
+async def test_get_biosample_wet_lab_admin_bypasses_access(ctx):
+    # wet_lab_admin reads a biosample they have no owner relationship to
+    # and no study_access row on. Role bypass alone authorizes the read,
+    # and caller_system_role reflects the actual database value.
+    owner_idx = ctx["user_session"]["principal_idx"]
+    bs_idx = await seed_biosample(
+        ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx
+    )
+    ctx["created"]["biosample"].append(bs_idx)
+
+    resp = await ctx["wet"].get(f"/api/v1/biosample/{bs_idx}")
+    assert resp.status_code == 200, resp.text
+    _assert_etag_quoted(resp)
+
+    rj = resp.json()
+    expected = {
+        "biosample_idx": bs_idx,
+        "owner_idx": owner_idx,
+        "metadata_checklist_idx": None,
+        "biosample_accession": None,
+        "ena_sample_accession": None,
+        "last_submission_at": None,
+        "submission_error": None,
+        "last_metadata_change_at": None,
+        "created_by_idx": owner_idx,
+        # Auto-generated; copy actual into expected so the equality
+        # confirms field presence without pinning timestamps.
+        "created_at": rj["created_at"],
+        "updated_at": rj["updated_at"],
+        "retired": False,
+        "retired_by_idx": None,
+        "retired_at": None,
+        "retire_reason": None,
+        "global_metadata": {},
+        "caller_system_role": "wet_lab_admin",
+    }
+    assert rj == expected
+
+
+async def test_get_biosample_system_admin_bypasses_access(ctx):
+    # system_admin reads a biosample with no owner / access path.
+    owner_idx = ctx["user_session"]["principal_idx"]
+    bs_idx = await seed_biosample(
+        ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx
+    )
+    ctx["created"]["biosample"].append(bs_idx)
+
+    resp = await ctx["admin"].get(f"/api/v1/biosample/{bs_idx}")
+    assert resp.status_code == 200, resp.text
+    _assert_etag_quoted(resp)
+
+    rj = resp.json()
+    expected = {
+        "biosample_idx": bs_idx,
+        "owner_idx": owner_idx,
+        "metadata_checklist_idx": None,
+        "biosample_accession": None,
+        "ena_sample_accession": None,
+        "last_submission_at": None,
+        "submission_error": None,
+        "last_metadata_change_at": None,
+        "created_by_idx": owner_idx,
+        # Auto-generated; copy actual into expected so the equality
+        # confirms field presence without pinning timestamps.
+        "created_at": rj["created_at"],
+        "updated_at": rj["updated_at"],
+        "retired": False,
+        "retired_by_idx": None,
+        "retired_at": None,
+        "retire_reason": None,
+        "global_metadata": {},
+        "caller_system_role": "system_admin",
+    }
+    assert rj == expected
+
+
+async def test_get_biosample_anonymous_401(ctx):
+    # No Authorization header → require_human raises 401.
+    owner_idx = ctx["user_session"]["principal_idx"]
+    bs_idx = await seed_biosample(
+        ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx
+    )
+    ctx["created"]["biosample"].append(bs_idx)
+
+    from qiita_control_plane.main import app
+
+    app.state.pool = ctx["pool"]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
+        resp = await anon.get(f"/api/v1/biosample/{bs_idx}")
+    assert resp.status_code == 401
+
+
+async def test_get_biosample_missing_scope_403(ctx, no_biosample_read_client):
+    # Regular user holds a PAT that omits Scope.BIOSAMPLE_READ; require_scope
+    # rejects with 403 before any DB read runs.
+    owner_idx = ctx["user_session"]["principal_idx"]
+    bs_idx = await seed_biosample(
+        ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx
+    )
+    ctx["created"]["biosample"].append(bs_idx)
+
+    resp = await no_biosample_read_client.get(f"/api/v1/biosample/{bs_idx}")
+    assert resp.status_code == 403
+    assert "biosample:read" in resp.json()["detail"]
+
+
+async def test_get_biosample_no_access_403(ctx):
+    # The regular user is not the biosample's owner and has no study_access
+    # row on any non-retired link. The repo predicate returns False, the
+    # route surfaces 403 (existence is already revealed by the prior 404
+    # path being skipped — admin-bypass and tier-mismatch share the 403
+    # spelling per project conventions).
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    bs_idx = await seed_biosample(
+        ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx
+    )
+    ctx["created"]["biosample"].append(bs_idx)
+
+    resp = await ctx["user"].get(f"/api/v1/biosample/{bs_idx}")
+    assert resp.status_code == 403
+    assert "no read path" in resp.json()["detail"]
+
+
+async def test_get_biosample_nonexistent_404(ctx):
+    # An idx well past MAX → fetch_biosample returns None → 404 before the
+    # access predicate runs.
+    max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.biosample")
+    resp = await ctx["wet"].get(f"/api/v1/biosample/{max_idx + 100_000}")
+    assert resp.status_code == 404
+    assert "not found" in resp.json()["detail"]
+
+
+async def test_get_biosample_retired_404_even_for_wet_lab_admin(ctx):
+    # Retired biosamples 404 unconditionally for now, even for wet_lab_admin.
+    # This pins the carve-out documented in the route docstring; once the
+    # planned retired-retrieval surface lands, this test will be relaxed
+    # for wet_lab_admin and a parallel test pinned for the non-admin path.
+    owner_idx = ctx["user_session"]["principal_idx"]
+    bs_idx = await seed_biosample(
+        ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx
+    )
+    ctx["created"]["biosample"].append(bs_idx)
+    await retire_biosample(ctx["pool"], biosample_idx=bs_idx, retired_by_idx=owner_idx)
+
+    resp = await ctx["wet"].get(f"/api/v1/biosample/{bs_idx}")
+    assert resp.status_code == 404
+    assert "not found" in resp.json()["detail"]
+
+
+async def test_get_biosample_returns_only_global_metadata(ctx):
+    # Round-trip the import POST through the GET to verify the GET surfaces
+    # the globally-linked entry but not the purely-local owner-biosample-id
+    # row. The POST writes one global metadata row + one owner-id row;
+    # the GET response's global_metadata dict must contain only the global
+    # entry, keyed on the field's internal_name.
+    suffix = secrets.token_hex(4)
+    internal_name = f"host_subject_id_{suffix}"
+    display_name = f"Host Subject ID {suffix}"
+
+    global_idx = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=internal_name,
+        display_name=display_name,
+        data_type=FieldDataType.TEXT,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+    # Patch the description column directly; the seed helper carries only
+    # the columns the import surface needs.
+    await ctx["pool"].execute(
+        "UPDATE qiita.biosample_global_field SET description = $2 WHERE idx = $1",
+        global_idx,
+        "Host's stable identifier",
+    )
+
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="get-md"
+    )
+    ctx["created"]["study"].append(study_idx)
+
+    post_resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_value="GET-MD-1",
+        metadata={display_name: "HOST-99"},
+    )
+    assert post_resp.status_code == 201, post_resp.text
+    bs_idx = post_resp.json()["biosample_idx"]
+    await _track_global_metadata_outputs(ctx, bs_idx, study_idx, [global_idx])
+
+    resp = await ctx["wet"].get(f"/api/v1/biosample/{bs_idx}")
+    assert resp.status_code == 200, resp.text
+    rj = resp.json()
+    expected_metadata = {
+        internal_name: {
+            "display_name": display_name,
+            "description": "Host's stable identifier",
+            "data_type": "text",
+            "value": "HOST-99",
+        }
+    }
+    assert rj["global_metadata"] == expected_metadata

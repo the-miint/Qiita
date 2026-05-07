@@ -1,5 +1,7 @@
 """Shared Pydantic models: work ticket states, API schemas, identifier types."""
 
+from datetime import date
+from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 from uuid import UUID
@@ -236,6 +238,56 @@ class BiosampleImportResponse(BaseModel):
     biosample_idx: Annotated[int, Field(gt=0)]
     biosample_study_field_idx: Annotated[int, Field(gt=0)]
     biosample_study_field_created: bool
+
+
+class BiosampleGlobalMetadataEntry(BaseModel):
+    """One globally-linked metadata value for a biosample, with cosmetic context.
+
+    Returned as a value inside BiosampleResponse.global_metadata, keyed on
+    the field's `internal_name`. display_name and description are taken
+    from biosample_global_field (the canonical labels), not from any
+    per-study biosample_study_field override, because biosample reads
+    are not study-scoped. data_type identifies which Python type carries
+    the value: TEXT -> str, NUMERIC -> Decimal, DATE -> date.
+    """
+
+    display_name: str
+    description: str | None
+    data_type: FieldDataType
+    value: str | Decimal | date
+
+
+class BiosampleResponse(BaseModel):
+    """Returned by GET /api/v1/biosample/{biosample_idx}.
+
+    Mirrors qiita.biosample's caller-visible columns and embeds a dict
+    of every globally-linked metadata value the biosample carries,
+    keyed on biosample_global_field.internal_name. Purely-local
+    metadata (including the owner-biosample-id row) and metadata whose
+    biosample_to_study link has been retired are excluded -- both
+    surface as biosample_metadata.global_field_idx IS NULL via the
+    existing schema triggers and are filtered out by the read.
+    `caller_system_role` carries the caller's principal.system_role
+    verbatim from the database.
+    """
+
+    biosample_idx: Annotated[int, Field(gt=0)]
+    owner_idx: Annotated[int, Field(gt=0)]
+    metadata_checklist_idx: int | None
+    biosample_accession: str | None
+    ena_sample_accession: str | None
+    last_submission_at: AwareDatetime | None
+    submission_error: str | None
+    last_metadata_change_at: AwareDatetime | None
+    created_by_idx: Annotated[int, Field(gt=0)]
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
+    retired: bool
+    retired_by_idx: int | None
+    retired_at: AwareDatetime | None
+    retire_reason: str | None
+    global_metadata: dict[str, BiosampleGlobalMetadataEntry]
+    caller_system_role: SystemRole
 
 
 class BiosampleIdxsListResponse(BaseModel):

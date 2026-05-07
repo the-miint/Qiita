@@ -17,21 +17,26 @@ from qiita_common.models import FieldDataType
 
 from qiita_control_plane.repositories.biosample_metadata import (
     BiosampleGlobalFieldRow,
+    BiosampleGlobalMetadataRow,
     BiosampleMetadataParseError,
     BiosampleStudyFieldConflictError,
     _parse_text_for_data_type,
     fetch_biosample_global_fields_by_display_names,
+    fetch_global_metadata_for_biosample,
     get_or_create_globally_linked_biosample_study_field,
     get_or_create_local_biosample_study_field,
     insert_biosample_metadata_date,
     insert_biosample_metadata_numeric,
     insert_biosample_metadata_text,
 )
+from qiita_control_plane.testing.db_seeds import (
+    retire_biosample_to_study_link,
+    seed_biosample_global_field,
+)
 
 from .conftest import (
     _create_biosample_with_link,
     _create_local_field,
-    _seed_biosample_global_field,
     _unique_field_name,
 )
 
@@ -127,14 +132,14 @@ async def test_fetch_biosample_global_fields_by_display_names_returns_matching(c
     suffix = secrets.token_hex(4)
     name_a = f"Test Field A {suffix}"
     name_b = f"Test Field B {suffix}"
-    idx_a = await _seed_biosample_global_field(
+    idx_a = await seed_biosample_global_field(
         ctx["pool"],
         internal_name=f"tfa_{suffix}",
         display_name=name_a,
         data_type=FieldDataType.TEXT,
         created_by_idx=1,
     )
-    idx_b = await _seed_biosample_global_field(
+    idx_b = await seed_biosample_global_field(
         ctx["pool"],
         internal_name=f"tfb_{suffix}",
         display_name=name_b,
@@ -163,7 +168,7 @@ async def test_fetch_biosample_global_fields_by_display_names_omits_unknown(ctx)
     suffix = secrets.token_hex(4)
     known_name = f"Known Field {suffix}"
     unknown_name = f"Unknown Field {suffix}"
-    idx = await _seed_biosample_global_field(
+    idx = await seed_biosample_global_field(
         ctx["pool"],
         internal_name=f"kf_{suffix}",
         display_name=known_name,
@@ -195,7 +200,7 @@ async def test_get_or_create_globally_linked_biosample_study_field_creates_new_r
     # Seed a global concept the new field will be linked to.
     suffix = secrets.token_hex(4)
     display_name = f"Linked Field {suffix}"
-    global_idx = await _seed_biosample_global_field(
+    global_idx = await seed_biosample_global_field(
         ctx["pool"],
         internal_name=f"link_{suffix}",
         display_name=display_name,
@@ -244,7 +249,7 @@ async def test_get_or_create_globally_linked_biosample_study_field_returns_exist
     # Seed a global concept and call the upsert twice with the same args.
     suffix = secrets.token_hex(4)
     display_name = f"Linked Field {suffix}"
-    global_idx = await _seed_biosample_global_field(
+    global_idx = await seed_biosample_global_field(
         ctx["pool"],
         internal_name=f"link_{suffix}",
         display_name=display_name,
@@ -292,7 +297,7 @@ async def test_get_or_create_globally_linked_biosample_study_field_raises_on_loc
     ctx["created"]["biosample_study_field"].append(local_idx)
 
     # Seed a global concept the caller wants to link to.
-    global_idx = await _seed_biosample_global_field(
+    global_idx = await seed_biosample_global_field(
         ctx["pool"],
         internal_name=f"col_{suffix}",
         display_name=f"Global {suffix}",
@@ -319,14 +324,14 @@ async def test_get_or_create_globally_linked_biosample_study_field_raises_on_loc
 async def test_get_or_create_globally_linked_biosample_study_field_raises_on_global_mismatch(ctx):
     # Two distinct global concepts; pre-seed a study field bound to the first.
     suffix = secrets.token_hex(4)
-    global_a = await _seed_biosample_global_field(
+    global_a = await seed_biosample_global_field(
         ctx["pool"],
         internal_name=f"ma_{suffix}",
         display_name=f"Global A {suffix}",
         data_type=FieldDataType.TEXT,
         created_by_idx=1,
     )
-    global_b = await _seed_biosample_global_field(
+    global_b = await seed_biosample_global_field(
         ctx["pool"],
         internal_name=f"mb_{suffix}",
         display_name=f"Global B {suffix}",
@@ -785,6 +790,240 @@ async def test_insert_biosample_metadata_date_inserts_value_date(ctx):
         "created_by_idx": ctx["principal_idx"],
     }
     assert dict(row) == expected
+
+
+# ---------------------------------------------------------------------------
+# fetch_global_metadata_for_biosample
+# ---------------------------------------------------------------------------
+
+
+async def _seed_globally_linked_metadata(
+    ctx,
+    *,
+    biosample_idx: int,
+    internal_name: str,
+    display_name: str,
+    description: str | None,
+    data_type: FieldDataType,
+    value,
+):
+    """Test helper: seed a global field, link a study field to it, write
+    one metadata row of the right typed-column flavor, and track the
+    biosample_global_field / biosample_study_field / biosample_metadata
+    idxs for fixture cleanup. Returns the global field idx for callers
+    that want to inspect or further extend the row.
+    """
+    # Seed the global concept; biosample_global_field rows persist beyond
+    # the test so they go on the cleanup tracker.
+    global_idx = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=internal_name,
+        display_name=display_name,
+        data_type=data_type,
+        created_by_idx=ctx["principal_idx"],
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+    # Patch description if the seed helper does not support it directly;
+    # the seeded row always carries display_name and data_type, but the
+    # description column is set via UPDATE so the helper surface stays small.
+    if description is not None:
+        await ctx["pool"].execute(
+            "UPDATE qiita.biosample_global_field SET description = $2 WHERE idx = $1",
+            global_idx,
+            description,
+        )
+
+    # Link a per-study field to the global concept and dispatch the value
+    # write to the matching typed insert; the field-contract trigger
+    # rejects mismatches so the dispatch must agree with data_type.
+    async with ctx["pool"].acquire() as conn:
+        field_idx, _ = await get_or_create_globally_linked_biosample_study_field(
+            conn,
+            study_idx=ctx["study_idx"],
+            biosample_global_field_idx=global_idx,
+            display_name=display_name,
+            created_by_idx=ctx["principal_idx"],
+        )
+        if data_type is FieldDataType.TEXT:
+            meta_idx = await insert_biosample_metadata_text(
+                conn,
+                biosample_idx=biosample_idx,
+                biosample_study_field_idx=field_idx,
+                value_text=value,
+                created_by_idx=ctx["principal_idx"],
+            )
+        elif data_type is FieldDataType.NUMERIC:
+            meta_idx = await insert_biosample_metadata_numeric(
+                conn,
+                biosample_idx=biosample_idx,
+                biosample_study_field_idx=field_idx,
+                value_numeric=value,
+                created_by_idx=ctx["principal_idx"],
+            )
+        else:
+            meta_idx = await insert_biosample_metadata_date(
+                conn,
+                biosample_idx=biosample_idx,
+                biosample_study_field_idx=field_idx,
+                value_date=value,
+                created_by_idx=ctx["principal_idx"],
+            )
+    ctx["created"]["biosample_study_field"].append(field_idx)
+    ctx["created"]["biosample_metadata"].append(meta_idx)
+    return global_idx
+
+
+async def test_fetch_global_metadata_for_biosample_text_numeric_date(ctx):
+    bs_idx = await _create_biosample_with_link(ctx)
+    suffix = secrets.token_hex(4)
+
+    # Three globally-linked rows, one per supported data_type, on the same
+    # biosample. Names are tagged with a suffix to dodge UNIQUE collisions.
+    await _seed_globally_linked_metadata(
+        ctx,
+        biosample_idx=bs_idx,
+        internal_name=f"host_subject_id_{suffix}",
+        display_name=f"Host Subject ID {suffix}",
+        description="Host's stable identifier",
+        data_type=FieldDataType.TEXT,
+        value="HOST-7",
+    )
+    await _seed_globally_linked_metadata(
+        ctx,
+        biosample_idx=bs_idx,
+        internal_name=f"latitude_{suffix}",
+        display_name=f"Latitude {suffix}",
+        description=None,
+        data_type=FieldDataType.NUMERIC,
+        value=Decimal("32.7"),
+    )
+    await _seed_globally_linked_metadata(
+        ctx,
+        biosample_idx=bs_idx,
+        internal_name=f"collection_date_{suffix}",
+        display_name=f"Collection Date {suffix}",
+        description="Date the sample was collected",
+        data_type=FieldDataType.DATE,
+        value=date(2026, 5, 6),
+    )
+
+    result = await fetch_global_metadata_for_biosample(ctx["pool"], bs_idx)
+
+    expected = {
+        f"host_subject_id_{suffix}": BiosampleGlobalMetadataRow(
+            internal_name=f"host_subject_id_{suffix}",
+            display_name=f"Host Subject ID {suffix}",
+            description="Host's stable identifier",
+            data_type=FieldDataType.TEXT,
+            value="HOST-7",
+        ),
+        f"latitude_{suffix}": BiosampleGlobalMetadataRow(
+            internal_name=f"latitude_{suffix}",
+            display_name=f"Latitude {suffix}",
+            description=None,
+            data_type=FieldDataType.NUMERIC,
+            value=Decimal("32.7"),
+        ),
+        f"collection_date_{suffix}": BiosampleGlobalMetadataRow(
+            internal_name=f"collection_date_{suffix}",
+            display_name=f"Collection Date {suffix}",
+            description="Date the sample was collected",
+            data_type=FieldDataType.DATE,
+            value=date(2026, 5, 6),
+        ),
+    }
+    assert result == expected
+
+
+async def test_fetch_global_metadata_for_biosample_excludes_purely_local_rows(ctx):
+    bs_idx = await _create_biosample_with_link(ctx)
+    suffix = secrets.token_hex(4)
+
+    # One globally-linked row to confirm appears in the result.
+    await _seed_globally_linked_metadata(
+        ctx,
+        biosample_idx=bs_idx,
+        internal_name=f"global_only_{suffix}",
+        display_name=f"Global Only {suffix}",
+        description=None,
+        data_type=FieldDataType.TEXT,
+        value="KEEP",
+    )
+
+    # One purely-local field plus a metadata row (not flagged as
+    # owner-id) and one purely-local field flagged as owner-id. Both
+    # are biosample_metadata rows with global_field_idx IS NULL via the
+    # field-contract trigger; both must be filtered out by the read.
+    local_field_idx = await _create_local_field(ctx, suffix=f"plain_{suffix}")
+    owner_id_field_idx = await _create_local_field(ctx, suffix=f"owner_{suffix}")
+    async with ctx["pool"].acquire() as conn:
+        local_meta = await insert_biosample_metadata_text(
+            conn,
+            biosample_idx=bs_idx,
+            biosample_study_field_idx=local_field_idx,
+            value_text="LOCAL-VAL",
+            created_by_idx=ctx["principal_idx"],
+        )
+        owner_meta = await insert_biosample_metadata_text(
+            conn,
+            biosample_idx=bs_idx,
+            biosample_study_field_idx=owner_id_field_idx,
+            value_text="OWNER-ID-VAL",
+            created_by_idx=ctx["principal_idx"],
+            is_owner_biosample_id=True,
+        )
+    ctx["created"]["biosample_metadata"].extend([local_meta, owner_meta])
+
+    result = await fetch_global_metadata_for_biosample(ctx["pool"], bs_idx)
+
+    # Only the globally-linked row appears; both purely-local rows are filtered.
+    expected = {
+        f"global_only_{suffix}": BiosampleGlobalMetadataRow(
+            internal_name=f"global_only_{suffix}",
+            display_name=f"Global Only {suffix}",
+            description=None,
+            data_type=FieldDataType.TEXT,
+            value="KEEP",
+        ),
+    }
+    assert result == expected
+
+
+async def test_fetch_global_metadata_for_biosample_excludes_link_retired_rows(ctx):
+    bs_idx = await _create_biosample_with_link(ctx)
+    suffix = secrets.token_hex(4)
+
+    # Seed one globally-linked metadata row, then retire the underlying
+    # biosample_to_study link. The biosample_to_study_retirement_demote_globals
+    # trigger nulls global_field_idx on the row, demoting it to study-local.
+    await _seed_globally_linked_metadata(
+        ctx,
+        biosample_idx=bs_idx,
+        internal_name=f"will_demote_{suffix}",
+        display_name=f"Will Demote {suffix}",
+        description=None,
+        data_type=FieldDataType.TEXT,
+        value="ABOUT-TO-DEMOTE",
+    )
+    await retire_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        retired_by_idx=ctx["principal_idx"],
+    )
+
+    result = await fetch_global_metadata_for_biosample(ctx["pool"], bs_idx)
+
+    # The retired-link row no longer satisfies global_field_idx IS NOT NULL.
+    assert result == {}
+
+
+async def test_fetch_global_metadata_for_biosample_empty_when_none_exist(ctx):
+    # A biosample with no metadata rows of any kind returns an empty dict.
+    bs_idx = await _create_biosample_with_link(ctx)
+
+    result = await fetch_global_metadata_for_biosample(ctx["pool"], bs_idx)
+    assert result == {}
 
 
 # ---------------------------------------------------------------------------

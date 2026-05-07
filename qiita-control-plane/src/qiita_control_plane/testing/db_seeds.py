@@ -14,6 +14,7 @@ import secrets
 
 import asyncpg
 from qiita_common.auth_constants import SystemRole
+from qiita_common.models import FieldDataType
 
 # Bare-principal idx the schema's first migration installs as the root
 # created_by parent. Centralised here so route tests do not redefine it.
@@ -134,6 +135,35 @@ async def seed_biosample(
         "INSERT INTO qiita.biosample (owner_idx, created_by_idx)"
         " VALUES ($1, $2) RETURNING idx",
         owner_idx,
+        created_by_idx,
+    )
+
+
+async def seed_biosample_global_field(
+    pool: asyncpg.Pool,
+    *,
+    internal_name: str,
+    display_name: str,
+    data_type: FieldDataType,
+    created_by_idx: int,
+) -> int:
+    """Insert a qiita.biosample_global_field row and return its idx.
+
+    Mirrors the column subset the seven-row migration seed populates:
+    internal_name, display_name, data_type, plus the principal that
+    created the row. required and default_tier rely on schema defaults.
+    description is intentionally omitted -- callers that need a non-null
+    description set it via UPDATE so the helper surface stays small.
+    asyncpg coerces the StrEnum value to text for the
+    qiita.field_data_type cast.
+    """
+    return await pool.fetchval(
+        "INSERT INTO qiita.biosample_global_field"
+        "  (internal_name, display_name, data_type, created_by_idx)"
+        " VALUES ($1, $2, $3, $4) RETURNING idx",
+        internal_name,
+        display_name,
+        data_type,
         created_by_idx,
     )
 

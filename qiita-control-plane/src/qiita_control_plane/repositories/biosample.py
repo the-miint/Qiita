@@ -79,6 +79,63 @@ async def insert_biosample(
     )
 
 
+async def fetch_biosample(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    biosample_idx: int,
+) -> asyncpg.Record | None:
+    """Return the qiita.biosample row for the given idx, or None on miss.
+
+    Selects every caller-visible column on the row so the route's
+    row -> response shaping has a single source of truth (mirrors
+    fetch_study). Accepts either a pool or a connection so the helper
+    composes inside an open transaction or stands alone.
+    """
+    # Single-row fetch by idx; column list mirrors BiosampleResponse one-for-one
+    # (with idx -> biosample_idx renamed at the route boundary).
+    return await pool_or_conn.fetchrow(
+        "SELECT idx, owner_idx, metadata_checklist_idx,"
+        " biosample_accession, ena_sample_accession,"
+        " last_submission_at, submission_error, last_metadata_change_at,"
+        " created_by_idx, created_at, updated_at,"
+        " retired, retired_by_idx, retired_at, retire_reason"
+        " FROM qiita.biosample WHERE idx = $1",
+        biosample_idx,
+    )
+
+
+async def fetch_caller_has_biosample_access(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    principal_idx: int,
+    biosample_idx: int,
+) -> bool:
+    """Return True iff the caller has a non-admin read path to the biosample.
+
+    A read path exists when the caller is the biosample's owner OR has
+    any qiita.study_access row on a non-retired biosample_to_study link.
+    The "any qiita.study_access row" check captures viewer-or-higher
+    tier because public-by-absence callers have no row at all (the
+    study_access_no_public_tier CHECK rejects 'public' as an
+    access_tier value). admin / wet_lab_admin role-bypass is handled
+    at the route layer; this helper does not consider system_role.
+    """
+    # One round trip: short-circuit OR of the owner check and the
+    # link-plus-study_access EXISTS subquery.
+    return await pool_or_conn.fetchval(
+        "SELECT EXISTS ("
+        "    SELECT 1 FROM qiita.biosample b"
+        "     WHERE b.idx = $2 AND b.owner_idx = $1"
+        ") OR EXISTS ("
+        "    SELECT 1 FROM qiita.biosample_to_study bts"
+        "      JOIN qiita.study_access sa"
+        "        ON sa.study_idx = bts.study_idx AND sa.principal_idx = $1"
+        "     WHERE bts.biosample_idx = $2 AND bts.retired = false"
+        ")",
+        principal_idx,
+        biosample_idx,
+    )
+
+
 async def fetch_biosample_idxs_for_study(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
