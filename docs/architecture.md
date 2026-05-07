@@ -39,9 +39,9 @@ graph TB
     end
 
     subgraph storage ["Data Storage"]
-        PG_APP["Postgres (App DB)<br/>━━━━━━━━━━━━━━━━━━━<br/>Users, roles, studies<br/>Samples, preparations<br/>Work tickets, provenance<br/>References, genomes, features"]
-        PG_DL["Postgres (DuckLake Catalog)<br/>━━━━━━━━━━━━━━━━━━━<br/>Snapshots, data files<br/>Schemas, partitions"]
-        FS["Shared Filesystem<br/>━━━━━━━━━━━━━━━━━━━<br/>/data/staging/ (raw uploads)<br/>/data/results/ (Parquet)<br/>/data/logs/ (job logs)<br/>/data/references/ (aligner indices)"]
+        PG_APP["Postgres qiita_miint<br/>━━━━━━━━━━━━━━━━━━━<br/>Users, roles, studies<br/>Samples, preparations<br/>Work tickets, provenance<br/>References, genomes, features"]
+        PG_DL["Postgres qiita_miint_lake<br/>━━━━━━━━━━━━━━━━━━━<br/>Snapshots, data files<br/>Schemas, partitions<br/>Inlined small inserts"]
+        FS["Shared Filesystem<br/>━━━━━━━━━━━━━━━━━━━<br/>/data — durable, backed up<br/>(parquet/, logs/)<br/>/scratch — working, three-tier<br/>(persistent/, persistent-local/, ephemeral/)"]
     end
 
     %% Client connections
@@ -105,7 +105,7 @@ graph TB
 ## Components
 
 - **qiita-control-plane** — Client-facing REST API (Python 3.14, FastAPI, asyncpg, Postgres, dbmate, OpenAPI, PyTest, ruff, uv, GitHub Actions CI). Handles CRUD for study/sample/preparation, search, work ticket creation/management, and reference management (genome/feature/reference ID minting, reference membership, taxonomy authority registration). Signs Flight tickets (HMAC-SHA256) for client access to data plane. Orchestrates file registration in DuckLake (via data plane) after compute completion. Hosts the **workflow runner** (`qiita_control_plane.runner`) — for each work ticket, walks the action's `steps:` list, dispatching `action:` entries to in-process LIBRARY primitives and `step:` entries to the orchestrator's `POST /api/v1/step/run` endpoint over HTTP.
-- **qiita-data-plane** — Data layer (Rust, arrow-flight, DuckDB v1.5.2, duckdb-miint extension, DuckLake w/ Postgres catalog). Arrow Flight protocol (gRPC-based). Intentionally "dumb" — select/insert/delete by exact integer identifiers. Clients connect directly through nginx. Verifies JWTs (AuthRocket JWKS) and Flight ticket signatures (HMAC-SHA256). Registers Parquet files into DuckLake via `ducklake_add_data_files` (metadata-only, no I/O). Calls back to control plane REST endpoint on completion/failure. Runs as dedicated `qiita-data-plane` system user; verifies result file permissions before registration and rejects files that are not `440`. **Horizontally scalable**: each instance holds an independent DuckDB+DuckLake connection to the shared Postgres catalog; DuckLake's snapshot-isolated concurrent read model means multiple instances never block each other. nginx load-balances gRPC traffic across all instances.
+- **qiita-data-plane** — Data layer (Rust, arrow-flight, DuckDB v1.5.2, duckdb-miint extension, DuckLake w/ Postgres catalog). Arrow Flight protocol (gRPC-based). Intentionally "dumb" — select/insert/delete by exact integer identifiers. Clients connect directly through nginx. Verifies JWTs (AuthRocket JWKS) and Flight ticket signatures (HMAC-SHA256). Registers Parquet files into DuckLake via `ducklake_add_data_files` (metadata-only, no I/O). Calls back to control plane REST endpoint on completion/failure. Runs as the dedicated `qiita-data` system user; verifies result file permissions before registration and rejects files that are not `440`. **Horizontally scalable**: each instance holds an independent DuckDB+DuckLake connection to the shared Postgres catalog; DuckLake's snapshot-isolated concurrent read model means multiple instances never block each other. nginx load-balances gRPC traffic across all instances.
 - **qiita-compute-orchestrator** — Separate Python service for compute lifecycle management. Exposes `POST /api/v1/step/run` which the control-plane runner calls to dispatch a workflow `step:` entry; internally the orchestrator owns the SLURM lifecycle (submit via slurmrestd, poll for status, detect completion/failure, verify output, collect logs). SLURM jobs are truly dumb (read input, process, write output, exit). Also builds aligner indices for references (minimap2 `.mmi`, bowtie2) as SLURM batch jobs. Abstracts compute backend behind a clean `ComputeBackend` interface (`LocalBackend` for dev/test runs DuckDB+miint in-process; `SlurmBackend` is the production target). Has no direct DB access — the architectural intent is that the orchestrator only knows about identifiers it receives in `/step/run` requests.
 - **qiita-common** — Shared Python library for control plane and compute orchestrator. Pydantic models (work ticket states, API request/response schemas), config patterns, and REST client utilities. Prevents drift between services' understanding of the API contract.
 - **API gateway** — nginx: REST to qiita-control-plane, Arrow Flight/gRPC (HTTP/2+TLS) load-balanced across N qiita-data-plane instances.
@@ -275,7 +275,7 @@ A feature may belong to multiple references (e.g., the same contig in WoL3 and R
 
 All ID minting and membership management lives in the control plane (Postgres OLTP). Bulk sequence data, taxonomy, annotations, phylogeny, and analysis results live in the data plane (DuckLake OLAP).
 
-**Control plane (Postgres App DB):**
+**Control plane (`qiita_miint`):**
 
 | Table | Key columns | Purpose |
 |---|---|---|
@@ -327,7 +327,7 @@ Phylogenetic placements (jplace format) are stored as raw placement data via `re
 Aligner indices (minimap2 `.mmi`, bowtie2 `.bt2`) are built by the compute orchestrator as SLURM batch jobs and stored on the shared filesystem:
 
 ```
-/data/references/{reference_idx}/
+/scratch/persistent-local/references/{reference_idx}/
 ├── minimap2/
 │   └── index.mmi
 ├── bowtie2/
@@ -405,8 +405,8 @@ sequenceDiagram
     participant NX as nginx
     participant CP as Control Plane<br/>(FastAPI)
     participant DP as Data Plane<br/>(Arrow Flight)
-    participant PG_APP as Postgres<br/>(App DB)
-    participant PG_DL as Postgres<br/>(DuckLake Catalog)
+    participant PG_APP as Postgres<br/>(qiita_miint)
+    participant PG_DL as Postgres<br/>(qiita_miint_lake)
     participant DL as DuckLake<br/>(Parquet on disk)
 
     Note over C,AR: 1. Authentication
@@ -457,7 +457,7 @@ sequenceDiagram
     participant SR as slurmrestd
     participant SL as SLURM Job<br/>(Container)
     participant DP as Data Plane<br/>(Arrow Flight)
-    participant PG_APP as Postgres<br/>(App DB)
+    participant PG_APP as Postgres<br/>(qiita_miint)
     participant FS as Shared<br/>Filesystem
 
     Note over C,CP: 1. Upload request
@@ -470,11 +470,11 @@ sequenceDiagram
     C->>NX: DoPut(signed_ticket) + JWT + FASTQ stream
     NX->>DP: route gRPC
     DP->>DP: verify JWT + ticket signature
-    DP->>FS: write FASTQ to /data/staging/study42/prep7/
+    DP->>FS: write FASTQ to /scratch/ephemeral/staging/ticket_001/
     DP-->>C: upload confirmed
 
     Note over DP,CP: 3. Upload complete callback
-    DP->>CP: REST callback: upload complete, path=/data/staging/study42/prep7/
+    DP->>CP: REST callback: upload complete, path=/scratch/ephemeral/staging/ticket_001/
     CP->>PG_APP: update work ticket (UPLOADED)
 
     Note over CP,CO: 4. Compute submission
@@ -491,17 +491,17 @@ sequenceDiagram
     CP->>PG_APP: update work ticket (PROCESSING)
 
     Note over SL,FS: 6. SLURM execution
-    SL->>FS: read /data/staging/study42/prep7/
+    SL->>FS: read /scratch/ephemeral/staging/ticket_001/
     SL->>SL: run amplicon processing workflow
-    SL->>FS: write /data/results/study42/prep7/output.parquet
-    SL->>FS: stdout/stderr → /data/logs/study42/prep7/job-98765.{out,err}
+    SL->>FS: write /data/parquet/<table>/output.parquet
+    SL->>FS: stdout/stderr → /data/logs/ticket_001/step_n-98765.{out,err}
 
     Note over CO,CP: 7. Completion detection & file registration
     CO->>SR: GET /slurm/{slurmrestd_api_ver}/job/98765
     SR-->>CO: state=COMPLETED, exit_code=0
-    CO->>FS: verify /data/results/study42/prep7/output.parquet exists
+    CO->>FS: verify /data/parquet/<table>/output.parquet exists
     CO->>FS: collect log paths
-    CO->>CP: REST (as compute user): job 98765 succeeded,<br/>output=/data/results/.../output.parquet,<br/>logs=/data/logs/.../job-98765.{out,err}
+    CO->>CP: REST (as compute user): job 98765 succeeded,<br/>output=/data/parquet/<table>/output.parquet,<br/>logs=/data/logs/ticket_001/step_n-98765.{out,err}
     CP->>PG_APP: validate work ticket state
     CP->>DP: register file into DuckLake
     DP->>DP: CALL ducklake_add_data_files(catalog, T, path)<br/>(metadata only — no I/O, schema validated)
@@ -512,7 +512,7 @@ sequenceDiagram
     CO->>SR: GET /slurm/{slurmrestd_api_ver}/job/98765
     SR-->>CO: state=FAILED, exit_code=1
     CO->>FS: collect log paths
-    CO->>CP: REST: job 98765 failed, exit_code=1,<br/>logs=/data/logs/.../job-98765.{out,err},<br/>failure_type=job_error
+    CO->>CP: REST: job 98765 failed, exit_code=1,<br/>logs=/data/logs/ticket_001/step_n-98765.{out,err},<br/>failure_type=job_error
     CP->>PG_APP: increment retry_count,<br/>requeue if retries < max_retries,<br/>else mark FAILED
 ```
 
@@ -617,7 +617,7 @@ The orchestrator drives execution:
 4. Advance `current_step` on the work ticket and continue
 5. After the final step, call back to the control plane to trigger data plane registration
 
-Intermediate outputs: `/data/staging/{study_idx}/{prep_idx}/{ticket_id}/step_{n}/{prep_sample_idx}/` (map), `/data/staging/{study_idx}/{prep_idx}/{ticket_id}/step_{n}/` (reduce). Final results: `/data/results/{study_idx}/{prep_idx}/{ticket_id}/`.
+Intermediate outputs: `/scratch/ephemeral/staging/{ticket_id}/step_{n}/{prep_sample_idx}/` (map), `/scratch/ephemeral/staging/{ticket_id}/step_{n}/` (reduce). Final-step outputs land directly in `/data/parquet/{table}/` so the data plane can register them via in-place `ducklake_add_data_files` without a cross-filesystem move.
 
 Failure records which step failed (`failed_stage=processing_step_{n}`). Manual restart resets to step 0.
 
@@ -706,17 +706,61 @@ Postgres-based (`SELECT ... FOR UPDATE SKIP LOCKED`). Work tickets created by qi
 
 ## Database Topology
 
-Single hardened Postgres instance, two logical databases:
-- **App DB** — control plane tables: users, roles, studies, samples, preparations, work tickets, provenance, references, genomes, features, reference membership, feature-genome mapping, phylogeny tip-feature mapping
-- **DuckLake Catalog DB** — DuckLake metadata tables (snapshots, data files, schemas, etc.)
+Two logical Postgres databases on a single hardened instance, one per data domain:
+
+- **`qiita_miint`** — control-plane schema: principals, studies, samples, preparations, work tickets, provenance, references, genomes, features, reference membership, feature-genome mapping, phylogeny tip-feature mapping.
+- **`qiita_miint_lake`** — DuckLake catalog (snapshots, data files, schemas) plus inlined small inserts (`ducklake_inlined_data_tables`).
+
+Each database has a dedicated owner role and a read-only role:
+
+| Role | Database | Purpose |
+|---|---|---|
+| `qiita_miint_rw` | `qiita_miint` | Owns DB, runs migrations, control-plane runtime connection |
+| `qiita_miint_ro` | `qiita_miint` | Read-only consumers (analytics, debugging) |
+| `qiita_miint_lake_rw` | `qiita_miint_lake` | Owns DB, data-plane runtime connection |
+| `qiita_miint_lake_ro` | `qiita_miint_lake` | Read-only consumers (catalog inspection, audits) |
+
+The control-plane user (`qiita-api`) connects to `qiita_miint` only; the data-plane user (`qiita-data`) connects to `qiita_miint_lake` only. The two domains communicate via the data plane's REST callbacks to the control plane, never via shared DB access.
 
 ## Data Storage
 
-Shared filesystem accessible by all components:
-- `/data/staging/` — raw uploaded data (FASTQ, etc.). Cleanup policy TBD.
-- `/data/results/` — processed output (Parquet). Ownership transfers to DuckLake after registration; compaction may delete/rewrite files.
-- `/data/logs/` — SLURM job stdout/stderr logs. Retained for diagnosis.
-- `/data/references/` — aligner indices (minimap2 `.mmi`, bowtie2 `.bt2`) built per reference version. Organized as `/data/references/{reference_idx}/{aligner}/`.
+Two shared filesystems, mounted on every host that runs Qiita components or SLURM workers:
+
+- **`/data/`** — durable, backed up. System-of-record state.
+- **`/scratch/`** — fast, working. Two-tier retention.
+
+Layout:
+
+```
+/data/                                      durable, backed up
+  parquet/<table>/<filename>                DuckLake DATA_PATH (flat per logical table; CRC sharding only if file count pressures the FS)
+  logs/<ticket_id>/step_n-<job>.{out,err}   archived SLURM stdout/stderr after job terminal state
+
+/scratch/
+  persistent/                               shared FS, never auto-deleted; cluster purge exemption requested
+                                            (reserved for future shared-but-durable content; currently no occupants)
+  persistent-local/                         local SSD, never auto-deleted; cluster purge exemption requested
+    references/<reference_idx>/<aligner>/   built aligner indices (rebuild-on-miss is the safety net)
+  ephemeral/                                auto-deleted 45 days after ticket terminal state
+    workspace/<ticket_id>/                  control-plane runner workspace + live SLURM logs
+    staging/<ticket_id>/                    per-ticket SLURM step outputs
+    references/incoming/<name>/<version>/   source FASTA staging during reference ingest
+```
+
+Two persistent tiers under `/scratch/`:
+
+- `/scratch/persistent/` — the shared-FS persistent tier. Visible to every node, durable, but no random-access guarantees. Currently has no fixed occupants; reserved for future content that must be shared across nodes and never auto-purged.
+- `/scratch/persistent-local/` — **placeholder name** for the local-SSD mount that holds random-access indexed databases (aligner indices today; other things later). The name is provisional — we expect to rename or repurpose it as the deploy grows. Treat it as "the local-SSD path for things we keep around."
+
+Retention:
+
+- `/data/` — never auto-deleted. Backed up by cluster policy.
+- `/scratch/persistent/` and `/scratch/persistent-local/` — never auto-deleted by us; cluster purge exemption requested for both. For aligner indices specifically, if the local-SSD copy is missing for any reason, the orchestrator rebuilds it on demand at job dispatch.
+- `/scratch/ephemeral/` — per-ticket directories are deleted 45 days after the ticket reaches a terminal state. The 45-day grace exists for post-mortem debugging.
+
+Same-FS constraint: the SLURM job's final-step output directory and DuckLake `DATA_PATH` must live on the same filesystem — the data plane moves files via atomic rename, falling back to copy+delete only on cross-filesystem moves (a slow path that bypasses the rename's atomicity guarantee). The final-step output therefore lives on `/data/` even when intermediate map/reduce outputs use `/scratch/ephemeral/staging/`.
+
+No hive partitioning: a sequenced sample can be associated with multiple studies, so the on-disk layout is keyed by logical table only — never by `study_idx`. DuckLake's catalog is the sole index over file contents.
 
 ## Ticket Signing
 
@@ -949,7 +993,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        image: postgres:17
         env:
           POSTGRES_PASSWORD: test
         ports:
@@ -974,12 +1018,12 @@ jobs:
 - **slurmrestd:** Compute orchestrator authenticates to slurmrestd via SLURM JWT. All job parameters specified in JSON body (not `#SBATCH` directives). Environment variables must be explicitly listed.
 - **DuckLake file registration:** `ducklake_add_data_files` registers a Parquet file by path — no data copying. Ownership transfers to DuckLake (compaction may later delete/rewrite). Schema and type validation performed at registration time. Registration failure (schema mismatch, corrupt Parquet) is an explicit FAILED state with `failed_stage=registration` and `failure_type=permanent`.
 - **Service-to-service auth:** Data plane and compute orchestrator authenticate to control plane via pre-shared API keys for their respective service accounts (`data-plane`, `compute`).
-- **Shared filesystem paths:** All components (control plane, data plane, SLURM jobs) access the same filesystem. Staging path: `/data/staging/{study_id}/{prep_id}/`. Results path: `/data/results/{study_id}/{prep_id}/`. Logs path: `/data/logs/{study_id}/{prep_id}/`.
+- **Shared filesystem paths:** Two mounts — `/data/` (durable) and `/scratch/` (working, two-tier). Canonical layout and retention policy in [Data Storage](#data-storage). All components — control plane, data plane, SLURM jobs — access both mounts.
 - **qiita-common dependency:** Both Python services depend on `qiita-common` as a path dependency in their `pyproject.toml` (e.g., `qiita-common = {path = "../qiita-common"}`). Shared Pydantic models ensure API contract consistency.
-- **Data plane Unix user and file protection:** The data plane runs as a dedicated `qiita-data-plane` system user (no login shell). SLURM jobs run as a separate `qiita-worker` user and write result files to `/data/results/`. Before exiting, each job sets `chmod 440` on its output files — owner and group read-only, no write, no world access. The data plane checks this permission as a pre-registration gate before calling `ducklake_add_data_files`; a file that is not `440` is rejected as a permanent registration failure. This ensures that once DuckLake takes ownership of a file, no compute job (or other process running as `qiita-worker`) can overwrite or corrupt it. The data plane user must be in the same group as `qiita-worker` (or the results directory must be group-readable) so the service can read files it does not own. Staging files (`/data/staging/`) follow the same pattern: `qiita-worker` writes them, and they are read-only to all other users once the upload is confirmed.
+- **Data plane Unix user and file protection:** The data plane runs as the dedicated `qiita-data` system user (no login shell). SLURM jobs run as `qiita-job` and write step outputs into `/scratch/ephemeral/staging/<ticket_id>/` (intermediates) or directly into `/data/parquet/<table>/` (final-step outputs). Before exiting, each job sets `chmod 440` on its output files — owner and group read-only, no write, no world access. The data plane checks this permission as a pre-registration gate before calling `ducklake_add_data_files`; a file that is not `440` is rejected as a permanent registration failure. This ensures that once DuckLake takes ownership of a file, no compute job (or other process running as `qiita-job`) can overwrite or corrupt it. The data plane user must be in the same group as `qiita-job` (or the relevant directories must be group-readable) so the service can read files it does not own.
 - **Data plane horizontal scaling:** The data plane is the read/write path for all DuckLake data. At scale, many concurrent SLURM jobs may issue large DoGet reads simultaneously, making a single data plane process a throughput bottleneck. The data plane scales horizontally because each instance is stateless with respect to request handling — it holds only a DuckDB+DuckLake connection to the shared Postgres catalog and reads Parquet files from the shared filesystem. DuckLake's concurrent read model is safe for this: multiple DuckDB instances connecting to the same Postgres catalog never block each other (readers use snapshot isolation with no row-level locking; conflicts only arise on concurrent writes, resolved via optimistic concurrency at commit time). Workers cannot bypass the data plane and read Parquet files directly for several reasons: (1) deletions are recorded as separate delete files in the DuckLake catalog — raw Parquet reads return logically deleted rows; (2) small inserts below the data inlining threshold are stored entirely within the Postgres catalog (`ducklake_inlined_data_tables`), with no Parquet file written at all; (3) snapshot visibility requires a catalog query to determine which files are live for the current consistent state; (4) compaction rewrites and deletes Parquet files under active management, making cached paths unreliable. The data plane remains the correct and only correct read path; the solution to the bottleneck is running more of them.
 - **Reference ID minting flow:** Bulk reference ingestion is a multi-step pipeline: (1) SLURM hash job reads sequences via DuckDB + miint and computes MD5 hashes, writing a manifest; (2) orchestrator feeds hashes to control plane; (3) control plane does bulk dedup lookup (`features.sequence_hash` unique index, stored as Postgres `uuid`), reuses existing `feature_idx` for matches, mints new ones for novel sequences, writes membership records, returns ID mapping; (4) SLURM load job inserts sequences + taxonomy + annotations into DuckLake using assigned IDs; (5) SLURM index job builds aligner indices.
 - **Alignment → reference join:** Alignment Parquet contains `feature_idx` but not `reference_idx`. To scope alignment results to a specific reference version, the query joins `reference_membership(reference_idx, feature_idx)` at query time. This join can happen entirely in the data plane (DuckLake) for analytical queries, or the control plane can provide the authorized feature set for a given reference to narrow a Flight ticket.
-- **Reference filesystem paths:** Aligner indices stored at `/data/references/{reference_idx}/{aligner}/`. Built by SLURM jobs via the compute orchestrator; read by alignment SLURM jobs at processing time. Processing workflow `params.json` includes the `reference_idx` to locate the correct index path.
+- **Reference filesystem paths:** Aligner indices stored at `/scratch/persistent-local/references/{reference_idx}/{aligner}/`. Built by SLURM jobs and read by alignment SLURM jobs at processing time. Processing workflow `params.json` includes the `reference_idx` to locate the correct index path. If the index is missing (cluster purge), the orchestrator rebuilds it at dispatch time before the alignment job runs.
 - **Phylogenetic addressing:** Internal nodes are addressed by `(reference_idx, node_index)` — scoped to a single tree, not referenced across references. Tip nodes connect to the sequence identity layer via the `phylogeny_tip_feature` junction table `(reference_idx, node_index) → feature_idx`, populated at ingestion time. Clade-scoped queries use a recursive CTE on `parent_index` to collect descendant tips, then join through `phylogeny_tip_feature` to reach `feature_idx`.
 - **Feature deduplication:** `feature_idx` is content-addressed via MD5 hash of the sequence bytes. The SLURM ingestion job computes hashes using DuckDB's built-in `md5()` function on sequences read via miint's `read_fastx`. Hashes are fed back to the control plane through the orchestrator for bulk dedup lookup. The control plane stores hashes as Postgres `uuid` type (MD5 is exactly 128 bits = UUID-sized) with a unique B-tree index, and upserts on `sequence_hash` — if a sequence already exists, the existing `feature_idx` is reused and the new reference's membership row simply points to it.

@@ -11,7 +11,7 @@ Data layer for Qiita. Serves bulk measurement data via the Arrow Flight protocol
 - Verifies JWTs (AuthRocket JWKS) and Flight ticket signatures (HMAC-SHA256)
 - Validates `processed_prep_sample_idx` integrity before registration (subset check + duplicate check)
 - Calls back to the control plane on upload completion or failure
-- Runs as the `qiita-data-plane` system user; rejects result files that are not mode `440`
+- Runs as the `qiita-data` system user; rejects result files that are not mode `440`
 
 **Horizontally scalable:** each instance holds an independent DuckDB+DuckLake connection to the shared Postgres catalog. DuckLake's snapshot-isolated read model means instances never block each other. nginx load-balances gRPC traffic across all instances.
 

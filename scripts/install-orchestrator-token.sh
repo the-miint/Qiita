@@ -2,9 +2,9 @@
 # Atomically install a service-account token at the given path.
 #
 # Reads plaintext from stdin (avoids process args / shell history). Writes
-# to <target>.new with mode 0400, owner qiita:qiita, then renames over the
-# target — POSIX same-filesystem rename is atomic, so readers see either
-# the old file or the new one, never a truncated one.
+# to <target>.new with mode 0400, owner qiita-orch:qiita-orch, then renames
+# over the target — POSIX same-filesystem rename is atomic, so readers see
+# either the old file or the new one, never a truncated one.
 #
 # If the target already exists, its prior contents are saved at
 # <target>.previous before replacement so the rollback procedure in
@@ -18,8 +18,8 @@
 # Usage:
 #   ./scripts/install-orchestrator-token.sh /etc/qiita/orchestrator.token <<<"$TOKEN"
 #
-# Override owner/group via env if needed:
-#   QIITA_TOKEN_OWNER=qiita QIITA_TOKEN_GROUP=qiita ./scripts/...
+# Override owner/group via QIITA_TOKEN_OWNER / QIITA_TOKEN_GROUP env vars
+# if needed (e.g. during a re-shaped deploy).
 
 set -euo pipefail
 
@@ -29,8 +29,8 @@ if [[ $# -ne 1 ]]; then
 fi
 
 target="$1"
-owner="${QIITA_TOKEN_OWNER:-qiita}"
-group="${QIITA_TOKEN_GROUP:-qiita}"
+owner="${QIITA_TOKEN_OWNER:-qiita-orch}"
+group="${QIITA_TOKEN_GROUP:-qiita-orch}"
 
 if [[ -t 0 ]]; then
     echo "refusing to read token from a tty — pipe stdin" >&2

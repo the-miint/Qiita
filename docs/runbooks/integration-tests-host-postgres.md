@@ -29,8 +29,8 @@ container on `:5433` and tears it down at the end.
 
 The Docker fixture ([`tests/integration/docker-compose.yml`](../../tests/integration/docker-compose.yml))
 and CI's macOS leg ([`.github/workflows/ci.yml`](../../.github/workflows/ci.yml))
-both run Postgres 16. Nothing in the codebase enforces a major version for
-host-mode local runs, but if the goal is to match CI, install `postgresql@16`
+both run Postgres 17. Nothing in the codebase enforces a major version for
+host-mode local runs, but if the goal is to match CI, install `postgresql@17`
 — version drift can surface in DuckLake's Postgres-extension behavior even
 when plain SQL works fine. (`make dev-setup` separately recommends
 `postgresql@17` for production-style local development.)
@@ -39,16 +39,15 @@ when plain SQL works fine. (`make dev-setup` separately recommends
 
 Run this once after cloning the repo (or after dropping the test objects to
 reprovision — see the cleanup block at the end of this section). It installs
-Postgres 16 (17 can also be used locally), starts the service, and
-creates the `qiita` test-fixture role and
-the two databases the integration tests need.
+Postgres 17, starts the service, and creates the `qiita` test-fixture role
+and the two databases the integration tests need.
 
 ```bash
 # --- One-time install ---
-brew install postgresql@16
-brew services start postgresql@16
+brew install postgresql@17
+brew services start postgresql@17
 
-export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
 
 # Wait for the server to actually be ready before the role/db CREATEs:
 for i in {1..30}; do pg_isready -h localhost -p 5432 && break; sleep 1; done
@@ -73,7 +72,7 @@ Must be run once in every shell where testing is being done.
 # --- Persistent: env vars the test harness reads. Must be set in every
 # shell that runs `make test-integration` in host mode. Missing any one
 # produces a confusing failure (see Troubleshooting and the table below). ---
-export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
 export QIITA_USE_HOST_POSTGRES=1
 export QIITA_TEST_POSTGRES_URL='postgresql://qiita:qiita@localhost:5432/qiita_test?sslmode=disable'
 export DUCKLAKE_CATALOG_CONNSTR='dbname=qiita_ducklake host=localhost port=5432 user=qiita password=qiita sslmode=disable'
@@ -126,7 +125,7 @@ psql -d postgres -c "DROP USER IF EXISTS qiita;"
   Either skip the role/db creation, or use the cleanup block to drop the
   existing objects first.
 - **Tests pass locally but the macOS CI leg fails** — verify your local
-  Postgres major version matches CI's `postgresql@16`. The catalog reset SQL
+  Postgres major version matches CI's `postgresql@17`. The catalog reset SQL
   and DuckLake's Postgres extension are version-sensitive.
 - **`make test-integration` invokes `docker compose` even though
   `QIITA_USE_HOST_POSTGRES=1` is set** — confirm the variable is exported

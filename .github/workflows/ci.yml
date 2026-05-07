@@ -58,10 +58,10 @@ jobs:
       - name: Provision host Postgres (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install postgresql@16
-          echo "$(brew --prefix postgresql@16)/bin" >> "$GITHUB_PATH"
-          export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
-          brew services start postgresql@16
+          brew install postgresql@17
+          echo "$(brew --prefix postgresql@17)/bin" >> "$GITHUB_PATH"
+          export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
+          brew services start postgresql@17
           for i in {1..30}; do pg_isready -h localhost -p 5432 && break; sleep 1; done
           psql -d postgres -c "CREATE USER qiita WITH SUPERUSER PASSWORD 'qiita';"
           psql -d postgres -c "CREATE DATABASE qiita_test OWNER qiita;"
@@ -111,10 +111,10 @@ jobs:
       - name: Provision host Postgres (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install postgresql@16
-          echo "$(brew --prefix postgresql@16)/bin" >> "$GITHUB_PATH"
-          export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
-          brew services start postgresql@16
+          brew install postgresql@17
+          echo "$(brew --prefix postgresql@17)/bin" >> "$GITHUB_PATH"
+          export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
+          brew services start postgresql@17
           for i in {1..30}; do pg_isready -h localhost -p 5432 && break; sleep 1; done
           psql -d postgres -c "CREATE USER qiita WITH SUPERUSER PASSWORD 'qiita';"
           psql -d postgres -c "CREATE DATABASE qiita_test OWNER qiita;"
