@@ -144,8 +144,17 @@ test-integration: build-data-plane-debug $(DBMATE_BIN)
 	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
 	   exit $$(( PY_EC > RS_EC ? PY_EC : RS_EC )))
 
-# Run system tests with real GG2 backbone data (requires Docker + data in localdocs/scratch/,
-# or QIITA_USE_HOST_POSTGRES=1 with a host-provisioned Postgres).
+# Run system tests with real GG2 backbone data. Intended to be invoked
+# manually before cutting a release candidate — not part of the default
+# CI matrix. Requires Docker + data in localdocs/scratch/, or
+# QIITA_USE_HOST_POSTGRES=1 with a host-provisioned Postgres.
+#
+# Auto-skips when the GG2 dataset is absent: the test's
+# pytest.mark.skipif gate yields a "1 skipped" pytest summary and exit 0
+# rather than an error, so running this target on a machine without the
+# data is harmless. See tests/integration/test_system_gg2_backbone.py
+# for the expected file paths under localdocs/scratch/.
+#
 # Slow (~10 min): hashes 331K sequences, mints features, writes chunked Parquet.
 test-system: build-data-plane-debug
 	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
