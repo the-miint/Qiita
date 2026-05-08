@@ -29,7 +29,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from qiita_common.compute_backend_client import ComputeBackendClient
-from qiita_common.models import WorkTicketState
+from qiita_common.models import FailureType, WorkTicketFailureStage, WorkTicketState
 
 from .runner import run_workflow
 
@@ -127,12 +127,28 @@ async def recover_orphaned_tickets(pool: asyncpg.Pool) -> int:
 
     Returns the number of tickets transitioned, for logging.
     """
+    # Populate failure_* together with state — DB CHECK
+    # `work_ticket_failure_consistent` requires all-or-nothing on FAILED.
+    # Classify as PROCESS_RESTARTED (mirrored as failure_type=retriable
+    # because a restart is by definition a transient cause); the
+    # operator hitting /run will reset retry_count to 0 and clear these.
     rows = await pool.fetch(
         "UPDATE qiita.work_ticket"
-        " SET state = $1::qiita.work_ticket_state"
-        " WHERE state = ANY($2::qiita.work_ticket_state[])"
+        " SET state = $1::qiita.work_ticket_state,"
+        "     failure_type = $2::qiita.failure_type,"
+        "     failure_stage = $3::qiita.work_ticket_failure_stage,"
+        "     failure_step_name = NULL,"
+        "     failure_reason = $4"
+        " WHERE state = ANY($5::qiita.work_ticket_state[])"
         " RETURNING work_ticket_idx",
         WorkTicketState.FAILED.value,
+        FailureType.RETRIABLE.value,
+        # SUBMISSION rather than STEP_RUN because we don't know which
+        # step (or any step) was running; the failure is process-level,
+        # not step-level. The CHECK requires step_name=NULL for
+        # SUBMISSION/FINALIZE which suits "we have no step context".
+        WorkTicketFailureStage.SUBMISSION.value,
+        "cp restarted mid-dispatch; orphaned ticket recovered at startup",
         list(NON_TERMINAL_WORK_TICKET_STATES),
     )
     if rows:

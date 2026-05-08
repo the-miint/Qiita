@@ -25,8 +25,15 @@ from typing import Any
 import asyncpg
 from qiita_common.actions import ActionDefinition, WorkflowAction, WorkflowStep
 from qiita_common.api_paths import LibraryPrimitive
+from qiita_common.backend_failure import BackendFailure
 from qiita_common.compute_backend_client import ComputeBackendClient
-from qiita_common.models import ReferenceStatus, ScopeTargetKind, WorkTicketState
+from qiita_common.models import (
+    FailureType,
+    ReferenceStatus,
+    ScopeTargetKind,
+    WorkTicketFailureStage,
+    WorkTicketState,
+)
 
 from .actions.library import LIBRARY
 from .actions.reference import transition_reference_status
@@ -87,12 +94,14 @@ async def run_workflow(
     bound: dict[str, Any] = dict(work_ticket["action_context"] or {})
     scope_target = _build_scope_target(work_ticket)
     current_status: str | None = None
+    max_retries: int = work_ticket["max_retries"]
 
     _log.info(
-        "running workflow %s/%s for work_ticket %d",
+        "running workflow %s/%s for work_ticket %d (max_retries=%d)",
         action.action_id,
         action.version,
         work_ticket_idx,
+        max_retries,
     )
 
     try:
@@ -101,24 +110,19 @@ async def run_workflow(
                 await _patch_resource_status(pool, scope_target, entry.target_status)
                 current_status = entry.target_status
 
-            if isinstance(entry, WorkflowStep):
-                outputs = await _dispatch_step(
-                    backend_client, entry, bound, workspace, scope_target
-                )
-            elif isinstance(entry, WorkflowAction):
-                outputs = await _dispatch_action(
-                    pool,
-                    entry,
-                    bound,
-                    workspace,
-                    scope_target,
-                    hmac_secret=hmac_secret,
-                    data_plane_url=data_plane_url,
-                )
-            else:
-                # WorkflowEntry is a closed union; the discriminator on
-                # ActionDefinition guarantees one of the two arms above.
-                raise TypeError(f"unexpected entry type at index {index}: {type(entry)!r}")
+            outputs = await _run_entry_with_retry(
+                pool=pool,
+                work_ticket_idx=work_ticket_idx,
+                index=index,
+                entry=entry,
+                bound=bound,
+                workspace=workspace,
+                scope_target=scope_target,
+                backend_client=backend_client,
+                hmac_secret=hmac_secret,
+                data_plane_url=data_plane_url,
+                max_retries=max_retries,
+            )
             bound.update(outputs)
 
         if action.success_status:
@@ -130,8 +134,12 @@ async def run_workflow(
             new=WorkTicketState.COMPLETED,
         )
         _log.info("workflow %d completed", work_ticket_idx)
-    except Exception:
-        _log.exception("workflow %d failed", work_ticket_idx)
+    except BackendFailure as exc:
+        # Retry-loop already exhausted retries (transient) or this was a
+        # permanent failure. The retry loop has not yet transitioned the
+        # ticket — we own that transition here so failure_status PATCH
+        # and the FAILED row insert happen together.
+        _log.warning("workflow %d failed: %s", work_ticket_idx, exc)
         if action.failure_status:
             try:
                 await _patch_resource_status(pool, scope_target, action.failure_status)
@@ -140,13 +148,120 @@ async def run_workflow(
                     "best-effort failure_status PATCH for work_ticket %d failed",
                     work_ticket_idx,
                 )
-        await _atomic_transition(
+        await _transition_to_failed(
             pool,
             work_ticket_idx,
-            expected=WorkTicketState.PROCESSING,
-            new=WorkTicketState.FAILED,
+            failure_type=(FailureType.RETRIABLE if exc.transient else FailureType.PERMANENT),
+            failure_stage=exc.stage,
+            failure_step_name=exc.step_name,
+            failure_reason=exc.reason,
         )
         raise
+    except Exception as exc:
+        # Anything not a BackendFailure is either a programming bug or
+        # an in-process LIBRARY primitive raising plain Python. We treat
+        # both as permanent UNKNOWN_PERMANENT — there's no classification
+        # to retry against, and re-running an in-process Python failure
+        # produces the same error.
+        _log.exception("workflow %d failed (unwrapped exception)", work_ticket_idx)
+        if action.failure_status:
+            try:
+                await _patch_resource_status(pool, scope_target, action.failure_status)
+            except Exception:
+                _log.exception(
+                    "best-effort failure_status PATCH for work_ticket %d failed",
+                    work_ticket_idx,
+                )
+        await _transition_to_failed(
+            pool,
+            work_ticket_idx,
+            failure_type=FailureType.PERMANENT,
+            failure_stage=WorkTicketFailureStage.STEP_RUN,
+            # Best-effort: if the exception fires before the loop body,
+            # 'index' isn't defined; guard by name lookup.
+            failure_step_name=_safe_entry_name(action, locals().get("index")),
+            failure_reason=f"{type(exc).__name__}: {exc!s}"[:2000],
+        )
+        raise
+
+
+async def _run_entry_with_retry(
+    *,
+    pool: asyncpg.Pool,
+    work_ticket_idx: int,
+    index: int,
+    entry: WorkflowStep | WorkflowAction,
+    bound: dict[str, Any],
+    workspace: Path,
+    scope_target: dict[str, Any],
+    backend_client: ComputeBackendClient,
+    hmac_secret: bytes,
+    data_plane_url: str,
+    max_retries: int,
+) -> dict[str, Any]:
+    """Dispatch one workflow entry, with auto-retry on transient
+    `BackendFailure`. Returns the entry's output map on success; raises
+    `BackendFailure` on permanent failure or once retry budget is
+    exhausted.
+
+    Retry semantics:
+      * On `BackendFailure(transient=True)` and retry_count < max_retries:
+        increment retry_count, transition PROCESSING → QUEUED → PROCESSING
+        atomically, retry the same step. Earlier successful entries are
+        not re-run — `bound` carries their outputs forward.
+      * On permanent failure or retry_count >= max_retries: re-raise so
+        the outer handler in `run_workflow` writes the failure_* columns
+        and transitions to FAILED.
+
+    The state churn (PROCESSING → QUEUED → PROCESSING) is observable to
+    monitoring queries: a ticket bouncing through QUEUED indicates a
+    retry attempt.
+    """
+    while True:
+        try:
+            if isinstance(entry, WorkflowStep):
+                return await _dispatch_step(backend_client, entry, bound, workspace, scope_target)
+            if isinstance(entry, WorkflowAction):
+                return await _dispatch_action(
+                    pool,
+                    entry,
+                    bound,
+                    workspace,
+                    scope_target,
+                    hmac_secret=hmac_secret,
+                    data_plane_url=data_plane_url,
+                )
+            # WorkflowEntry is a closed union; the discriminator on
+            # ActionDefinition guarantees one of the two arms above.
+            raise TypeError(f"unexpected entry type at index {index}: {type(entry)!r}")
+        except BackendFailure as exc:
+            if not exc.transient:
+                raise
+            current_retry = await _retry_count(pool, work_ticket_idx)
+            if current_retry >= max_retries:
+                _log.warning(
+                    "work_ticket %d step %r exhausted retries (%d/%d); failing",
+                    work_ticket_idx,
+                    entry.name,
+                    current_retry,
+                    max_retries,
+                )
+                raise
+            _log.warning(
+                "work_ticket %d step %r transient failure (%s); retrying %d/%d",
+                work_ticket_idx,
+                entry.name,
+                exc.kind.value,
+                current_retry + 1,
+                max_retries,
+            )
+            await _bump_retry_and_requeue(pool, work_ticket_idx)
+            await _atomic_transition(
+                pool,
+                work_ticket_idx,
+                expected=WorkTicketState.QUEUED,
+                new=WorkTicketState.PROCESSING,
+            )
 
 
 # =============================================================================
@@ -157,7 +272,7 @@ async def run_workflow(
 _WORK_TICKET_COLS = (
     "work_ticket_idx, action_id, action_version, originator_principal_idx, "
     "scope_target_kind, study_idx, prep_idx, reference_idx, "
-    "action_context, state"
+    "action_context, state, retry_count, max_retries"
 )
 
 _ACTION_COLS = (
@@ -246,6 +361,107 @@ async def _atomic_transition(
             f"could not transition work_ticket {work_ticket_idx} "
             f"from {expected.value!r} to {new.value!r}; actual state {actual!r}"
         )
+
+
+async def _retry_count(pool: asyncpg.Pool, work_ticket_idx: int) -> int:
+    """Read the current retry_count. Used by the retry loop to compare
+    against max_retries before requeuing."""
+    return await pool.fetchval(
+        "SELECT retry_count FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+
+
+async def _bump_retry_and_requeue(pool: asyncpg.Pool, work_ticket_idx: int) -> None:
+    """Atomic PROCESSING → QUEUED transition with retry_count + 1. Single
+    UPDATE so monitoring queries always see a coherent (state, count)
+    pair; an observer that reads after this commit sees QUEUED with the
+    bumped count, never PROCESSING with the bumped count or QUEUED with
+    the old count."""
+    updated = await pool.fetchval(
+        "UPDATE qiita.work_ticket"
+        " SET state = $1::qiita.work_ticket_state,"
+        "     retry_count = retry_count + 1"
+        " WHERE work_ticket_idx = $2"
+        "   AND state = $3::qiita.work_ticket_state"
+        " RETURNING work_ticket_idx",
+        WorkTicketState.QUEUED.value,
+        work_ticket_idx,
+        WorkTicketState.PROCESSING.value,
+    )
+    if updated is None:
+        actual = await pool.fetchval(
+            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+        raise RuntimeError(
+            f"could not bump retry on work_ticket {work_ticket_idx}: "
+            f"expected processing, got {actual!r}"
+        )
+
+
+async def _transition_to_failed(
+    pool: asyncpg.Pool,
+    work_ticket_idx: int,
+    *,
+    failure_type: FailureType,
+    failure_stage: WorkTicketFailureStage,
+    failure_step_name: str | None,
+    failure_reason: str,
+) -> None:
+    """Atomic transition into FAILED with all four failure_* columns
+    populated in one UPDATE. The DB's `work_ticket_failure_consistent`
+    CHECK enforces all-or-nothing; doing it in one statement keeps that
+    invariant honoured.
+
+    Accepts transition from any non-terminal state — the runner may be
+    in PROCESSING (most common) or QUEUED (if a retry's QUEUED → PROCESSING
+    transition raced with shutdown). Refuses already-terminal tickets so
+    a buggy second call doesn't overwrite a COMPLETED state."""
+    updated = await pool.fetchval(
+        "UPDATE qiita.work_ticket"
+        " SET state = $1::qiita.work_ticket_state,"
+        "     failure_type = $2::qiita.failure_type,"
+        "     failure_stage = $3::qiita.work_ticket_failure_stage,"
+        "     failure_step_name = $4,"
+        "     failure_reason = $5"
+        " WHERE work_ticket_idx = $6"
+        "   AND state = ANY($7::qiita.work_ticket_state[])"
+        " RETURNING work_ticket_idx",
+        WorkTicketState.FAILED.value,
+        failure_type.value,
+        failure_stage.value,
+        failure_step_name,
+        failure_reason,
+        work_ticket_idx,
+        [
+            WorkTicketState.PENDING.value,
+            WorkTicketState.QUEUED.value,
+            WorkTicketState.PROCESSING.value,
+        ],
+    )
+    if updated is None:
+        actual = await pool.fetchval(
+            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+        raise RuntimeError(
+            f"could not mark work_ticket {work_ticket_idx} FAILED: "
+            f"expected non-terminal, got {actual!r}"
+        )
+
+
+def _safe_entry_name(action: ActionDefinition, index: int | None) -> str | None:
+    """Best-effort lookup of the entry name at `index`. Returns None if
+    the index is out of range (e.g. an exception fired before the loop
+    body started). The DB CHECK requires step_name to be NULL when
+    failure_stage is not STEP_RUN, but we always pass STEP_RUN here —
+    keep the column populated when we can."""
+    if index is None:
+        return None
+    if 0 <= index < len(action.steps):
+        return action.steps[index].name
+    return None
 
 
 # =============================================================================

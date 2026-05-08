@@ -549,20 +549,31 @@ async def test_run_on_completed_returns_409(
 async def test_run_on_failed_resets_to_pending(
     wt_client, postgres_pool, admin_token, reference_action, reference_idx
 ):
-    """FAILED → /run flips state back to PENDING and fires dispatch."""
+    """FAILED → /run flips state back to PENDING, resets retry_count,
+    and clears failure_* (DB CHECK requires failure_* all-NULL when
+    state != failed)."""
     token, admin_idx = admin_token
     action_id, version = reference_action
+    # Seed a FAILED ticket directly. DB CHECK requires failure_type,
+    # failure_stage, and failure_reason all set when state=failed; the
+    # step_name/stage coupling forces step_name=NULL for stage=submission.
     idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.work_ticket"
         " (action_id, action_version, originator_principal_idx,"
-        "  scope_target_kind, reference_idx, state)"
-        " VALUES ($1, $2, $3, 'reference', $4, $5::qiita.work_ticket_state)"
+        "  scope_target_kind, reference_idx, state, retry_count,"
+        "  failure_type, failure_stage, failure_reason)"
+        " VALUES ($1, $2, $3, 'reference', $4,"
+        "  $5::qiita.work_ticket_state, 2,"
+        "  $6::qiita.failure_type, $7::qiita.work_ticket_failure_stage, $8)"
         " RETURNING work_ticket_idx",
         action_id,
         version,
         admin_idx,
         reference_idx,
         WorkTicketState.FAILED.value,
+        "permanent",
+        "submission",
+        "test seed: simulated failure",
     )
     wt_client._created_tickets.append(idx)
 
@@ -572,10 +583,21 @@ async def test_run_on_failed_resets_to_pending(
     )
     assert resp.status_code == 202, resp.text
 
-    state = await postgres_pool.fetchval(
-        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
+    row = await postgres_pool.fetchrow(
+        "SELECT state, retry_count,"
+        "       failure_type, failure_stage, failure_step_name, failure_reason"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        idx,
     )
-    assert state == WorkTicketState.PENDING.value
+    assert row["state"] == WorkTicketState.PENDING.value
+    # /run resets retry_count and clears failure_*: an operator-driven
+    # restart gets a clean budget and the post-mortem column lineage
+    # cleared so a successful retry doesn't carry stale failure data.
+    assert row["retry_count"] == 0
+    assert row["failure_type"] is None
+    assert row["failure_stage"] is None
+    assert row["failure_step_name"] is None
+    assert row["failure_reason"] is None
 
 
 async def test_run_on_pending_dispatches_without_state_change(
@@ -665,19 +687,33 @@ async def test_recover_orphaned_tickets_marks_non_terminal_failed(
         # so use >= rather than ==).
         assert recovered_count >= 3
 
-        states_after = []
+        rows_after = []
         for idx in created_idxs:
-            state = await postgres_pool.fetchval(
-                "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
+            row = await postgres_pool.fetchrow(
+                "SELECT state, failure_type, failure_stage, failure_step_name, failure_reason"
+                " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+                idx,
             )
-            states_after.append(state)
+            rows_after.append(dict(row))
         # pending, queued, processing → failed; completed untouched.
-        assert states_after == [
+        assert [r["state"] for r in rows_after] == [
             WorkTicketState.FAILED.value,
             WorkTicketState.FAILED.value,
             WorkTicketState.FAILED.value,
             WorkTicketState.COMPLETED.value,
         ]
+        # The three recovered tickets carry the orphan-recovery diagnostic
+        # populated by recover_orphaned_tickets — failure_type=retriable,
+        # stage=submission (no per-step context), step_name=NULL,
+        # reason explaining the cp-restart provenance.
+        for r in rows_after[:3]:
+            assert r["failure_type"] == "retriable"
+            assert r["failure_stage"] == "submission"
+            assert r["failure_step_name"] is None
+            assert "cp restarted" in r["failure_reason"]
+        # The COMPLETED ticket was untouched: failure_* all NULL.
+        assert rows_after[3]["failure_type"] is None
+        assert rows_after[3]["failure_reason"] is None
     finally:
         if created_idxs:
             await postgres_pool.execute(
