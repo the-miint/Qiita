@@ -12,10 +12,9 @@ from enum import StrEnum
 
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from qiita_common.auth_constants import Scope
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope
 
 from qiita_control_plane.testing.db_seeds import (
-    SYSTEM_PRINCIPAL_IDX,
     disable_principal,
     retire_principal,
     seed_service_principal,

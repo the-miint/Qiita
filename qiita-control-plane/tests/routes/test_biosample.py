@@ -15,11 +15,10 @@ from decimal import Decimal
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import FieldDataType
 
 from qiita_control_plane.testing.db_seeds import (
-    SYSTEM_PRINCIPAL_IDX,
     retire_biosample,
     retire_biosample_to_study_link,
     seed_biosample,
@@ -1576,9 +1575,10 @@ async def test_patch_biosample_service_account_403_pending_restructure(ctx):
         async with conn.transaction():
             svc_principal_idx = await conn.fetchval(
                 "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-                " VALUES ($1, $2, 1) RETURNING idx",
+                " VALUES ($1, $2, $3) RETURNING idx",
                 svc_name,
                 SystemRole.WET_LAB_ADMIN,
+                SYSTEM_PRINCIPAL_IDX,
             )
             await conn.execute(
                 "INSERT INTO qiita.service_account (principal_idx, name) VALUES ($1, $2)",

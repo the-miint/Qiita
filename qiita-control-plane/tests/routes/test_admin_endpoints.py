@@ -4,7 +4,7 @@ import json
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 
 pytestmark = pytest.mark.db
 
@@ -74,9 +74,10 @@ async def _seed_human(
 ) -> int:
     pidx = await postgres_pool.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-        " VALUES ($1, $2, 1) RETURNING idx",
+        " VALUES ($1, $2, $3) RETURNING idx",
         email,
         role,
+        SYSTEM_PRINCIPAL_IDX,
     )
     await postgres_pool.execute(
         "INSERT INTO qiita.user (principal_idx, email, affiliation, address, phone)"
@@ -518,8 +519,9 @@ async def test_revoke_all_tokens_requires_admin_service_accounts_for_service_tar
     svc_idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.principal"
         "  (display_name, system_role, created_by_idx)"
-        " VALUES ('narrow-svc-target', $1, 1) RETURNING idx",
+        " VALUES ('narrow-svc-target', $1, $2) RETURNING idx",
         SystemRole.USER,
+        SYSTEM_PRINCIPAL_IDX,
     )
     _track(admin_client, svc_idx)
     await postgres_pool.execute(

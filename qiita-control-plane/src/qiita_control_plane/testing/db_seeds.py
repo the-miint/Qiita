@@ -13,12 +13,8 @@ that roll back, build the SQL inline against the open connection instead.
 import secrets
 
 import asyncpg
-from qiita_common.auth_constants import SystemRole
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 from qiita_common.models import FieldDataType
-
-# Bare-principal idx the schema's first migration installs as the root
-# created_by parent. Centralised here so route tests do not redefine it.
-SYSTEM_PRINCIPAL_IDX = 1
 
 
 async def seed_user_principal(

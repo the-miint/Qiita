@@ -6,11 +6,11 @@
 --
 -- Bootstraps the cross-study biosample concept registry with the minimum set
 -- of fields every biosample needs in order to be submittable to BioSample.
--- created_by_idx = 1 is the seeded system principal. ON CONFLICT DO NOTHING
--- keeps the seed re-runnable: if dbmate's tracking row is ever lost (manual
--- rollback, restored snapshot) and this migration is reapplied while the
--- seed rows still exist, both unique constraints (internal_name and
--- display_name) absorb the conflict instead of erroring.
+-- created_by_idx = 1 names the seeded system principal (SYSTEM_PRINCIPAL_IDX).
+-- ON CONFLICT DO NOTHING keeps the seed re-runnable: if dbmate's tracking row
+-- is ever lost (manual rollback, restored snapshot) and this migration is
+-- reapplied while the seed rows still exist, both unique constraints
+-- (internal_name and display_name) absorb the conflict instead of erroring.
 INSERT INTO qiita.biosample_global_field
     (internal_name, display_name, data_type, required, created_by_idx)
 VALUES

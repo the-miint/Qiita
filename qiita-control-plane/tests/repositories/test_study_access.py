@@ -10,7 +10,7 @@ import secrets
 
 import pytest
 import pytest_asyncio
-from qiita_common.auth_constants import SystemRole
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 from qiita_common.models import Tier
 
 from qiita_control_plane.repositories.study_access import (
@@ -19,9 +19,6 @@ from qiita_control_plane.repositories.study_access import (
 )
 
 pytestmark = pytest.mark.db
-
-
-SYSTEM_PRINCIPAL_IDX = 1
 
 
 async def _seed_user(pool, *, suffix: str) -> int:

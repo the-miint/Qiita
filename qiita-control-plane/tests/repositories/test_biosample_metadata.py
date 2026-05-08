@@ -13,6 +13,7 @@ from decimal import Decimal
 
 import asyncpg
 import pytest
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
 from qiita_common.models import FieldDataType
 
 from qiita_control_plane.repositories.biosample_metadata import (
@@ -137,14 +138,14 @@ async def test_fetch_biosample_global_fields_by_display_names_returns_matching(c
         internal_name=f"tfa_{suffix}",
         display_name=name_a,
         data_type=FieldDataType.TEXT,
-        created_by_idx=1,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
     )
     idx_b = await seed_biosample_global_field(
         ctx["pool"],
         internal_name=f"tfb_{suffix}",
         display_name=name_b,
         data_type=FieldDataType.NUMERIC,
-        created_by_idx=1,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
     )
     ctx["created"]["biosample_global_field"].extend([idx_a, idx_b])
 
@@ -173,7 +174,7 @@ async def test_fetch_biosample_global_fields_by_display_names_omits_unknown(ctx)
         internal_name=f"kf_{suffix}",
         display_name=known_name,
         data_type=FieldDataType.TEXT,
-        created_by_idx=1,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
     )
     ctx["created"]["biosample_global_field"].append(idx)
 
@@ -205,7 +206,7 @@ async def test_get_or_create_globally_linked_biosample_study_field_creates_new_r
         internal_name=f"link_{suffix}",
         display_name=display_name,
         data_type=FieldDataType.NUMERIC,
-        created_by_idx=1,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
     )
     ctx["created"]["biosample_global_field"].append(global_idx)
 
@@ -254,7 +255,7 @@ async def test_get_or_create_globally_linked_biosample_study_field_returns_exist
         internal_name=f"link_{suffix}",
         display_name=display_name,
         data_type=FieldDataType.TEXT,
-        created_by_idx=1,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
     )
     ctx["created"]["biosample_global_field"].append(global_idx)
 
@@ -302,7 +303,7 @@ async def test_get_or_create_globally_linked_biosample_study_field_raises_on_loc
         internal_name=f"col_{suffix}",
         display_name=f"Global {suffix}",
         data_type=FieldDataType.TEXT,
-        created_by_idx=1,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
     )
     ctx["created"]["biosample_global_field"].append(global_idx)
 
@@ -329,14 +330,14 @@ async def test_get_or_create_globally_linked_biosample_study_field_raises_on_glo
         internal_name=f"ma_{suffix}",
         display_name=f"Global A {suffix}",
         data_type=FieldDataType.TEXT,
-        created_by_idx=1,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
     )
     global_b = await seed_biosample_global_field(
         ctx["pool"],
         internal_name=f"mb_{suffix}",
         display_name=f"Global B {suffix}",
         data_type=FieldDataType.TEXT,
-        created_by_idx=1,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
     )
     ctx["created"]["biosample_global_field"].extend([global_a, global_b])
 

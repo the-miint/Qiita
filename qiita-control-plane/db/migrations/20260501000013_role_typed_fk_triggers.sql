@@ -65,6 +65,10 @@ BEGIN
     PERFORM pg_advisory_xact_lock(new_value);
 
     IF NOT EXISTS (SELECT 1 FROM qiita.user WHERE principal_idx = new_value) THEN
+        -- The substring 'user-kind principal' is matched by the route layer
+        -- (qiita_control_plane.routes.biosample._OWNER_TRIGGER_RAISE_MARKER)
+        -- to map this trigger error to a 422; if the format string changes,
+        -- update the route constant in lockstep.
         RAISE EXCEPTION
             '%.% must reference a user-kind principal; principal_idx=% has no qiita.user row',
             TG_TABLE_NAME, column_name, new_value;

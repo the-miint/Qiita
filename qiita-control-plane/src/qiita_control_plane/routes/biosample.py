@@ -332,8 +332,8 @@ async def get_biosample_route(
         for internal_name, entry in metadata_rows.items()
     }
 
-    # Set the ETag header. Decision 3 says single-resource GETs that back a
-    # PATCH endpoint must include an ETag; the value is opaque-by-contract.
+    # Set the ETag header so callers can use it as the If-Match value on a
+    # subsequent PATCH; the value is opaque-by-contract.
     response.headers["ETag"] = _etag_for_updated_at(row["updated_at"])
 
     return _biosample_response_from_row(
@@ -346,7 +346,10 @@ async def get_biosample_route(
 # Substring of the asyncpg.RaiseError message thrown by the role-typed FK
 # trigger on biosample.owner_idx. The trigger fires before the underlying
 # FK constraint, so a non-user owner_idx surfaces as RaiseError; the route
-# maps it to the same eligibility-422 the preflight emits.
+# maps it to the same eligibility-422 the preflight emits. The marker text
+# is pinned to the RAISE EXCEPTION format string in
+# db/migrations/20260501000013_role_typed_fk_triggers.sql -- if either
+# side changes, update both in lockstep.
 _OWNER_TRIGGER_RAISE_MARKER = "user-kind principal"
 
 
@@ -370,32 +373,30 @@ async def patch_biosample_route(
     PATCH on its current credentials. A separate scope-gated surface
     (or a wider auth-model change so ServiceAccount carries a role)
     will be needed when the submission subsystem starts writing back
-    accessions through the API; tracked in
-    test_patch_biosample_service_account_403_pending_restructure.
+    accessions through the API.
 
-    Per Decision 3, If-Match is required: missing -> 428, mismatch ->
-    412. The body's editable fields are validated by
-    BiosamplePatchRequest (extra=forbid rejects immutable / retirement
-    columns with 422; an empty body is also 422). Inside one
-    connection-scoped transaction the route preflights the row for
-    existence (404), retirement (409), and ETag match (412); validates
-    the candidate owner via require_eligible_owner when owner_idx is
-    in the body (422 on ineligibility); applies the UPDATE; re-reads
-    global metadata for the response. The UPDATE is also checked for a
-    None return — the row can vanish between the preflight and the
-    UPDATE under READ COMMITTED isolation if a concurrent transaction
-    commits a delete in that window — and surfaces as the same 404 the
-    preflight emits. Uniqueness violations on biosample_accession /
-    ena_sample_accession map to 409, FK violations on
-    metadata_checklist_idx to 422, and the role-typed FK trigger on
-    owner_idx (a backstop the preflight should preempt in practice) to
-    the same eligibility-422.
+    If-Match is required: missing -> 428, mismatch -> 412. The body's
+    editable fields are validated by BiosamplePatchRequest (extra=forbid
+    rejects immutable / retirement columns with 422; an empty body is
+    also 422). Inside one connection-scoped transaction the route
+    preflights the row for existence (404), retirement (409), and ETag
+    match (412); validates the candidate owner via
+    require_eligible_owner when owner_idx is in the body (422 on
+    ineligibility); applies the UPDATE; re-reads global metadata for
+    the response. The UPDATE is also checked for a None return — the
+    row can vanish between the preflight and the UPDATE under READ
+    COMMITTED isolation if a concurrent transaction commits a delete
+    in that window — and surfaces as the same 404 the preflight emits.
+    Uniqueness violations on biosample_accession / ena_sample_accession
+    map to 409, FK violations on metadata_checklist_idx to 422, and the
+    role-typed FK trigger on owner_idx (a backstop the preflight should
+    preempt in practice) to the same eligibility-422.
 
     The response carries an `ETag` header derived from the new row's
     `updated_at` column; format mirrors the GET endpoint's contract
     and is opaque to clients.
     """
-    # Decision 3: missing If-Match is 428 before any DB work runs.
+    # Missing If-Match is 428 before any DB work runs.
     if if_match is None:
         raise HTTPException(status_code=428, detail="If-Match header required")
 

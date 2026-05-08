@@ -17,7 +17,7 @@ from decimal import Decimal
 
 import asyncpg
 import pytest
-from qiita_common.auth_constants import SystemRole
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 from qiita_common.models import FieldDataType
 
 from qiita_control_plane.repositories.biosample import (
@@ -604,14 +604,14 @@ async def test_import_biosample_from_owner_biosample_id_writes_global_metadata(c
         internal_name=f"date_{suffix}",
         display_name=f"Collection Date {suffix}",
         data_type=FieldDataType.DATE,
-        created_by_idx=1,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
     )
     num_global = await seed_biosample_global_field(
         ctx["pool"],
         internal_name=f"num_{suffix}",
         display_name=f"Latitude {suffix}",
         data_type=FieldDataType.NUMERIC,
-        created_by_idx=1,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
     )
     ctx["created"]["biosample_global_field"].extend([date_global, num_global])
 
@@ -748,7 +748,7 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_metadata_parse
         internal_name=f"item_{suffix}",
         display_name=numeric_field_name,
         data_type=FieldDataType.NUMERIC,
-        created_by_idx=1,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
     )
     ctx["created"]["biosample_global_field"].append(global_idx)
 
@@ -1309,9 +1309,6 @@ async def test_update_biosample_advances_updated_at(ctx):
 # distinct from the pool-style `_seed_*` helpers used by Pattern-2 tests.
 
 
-_SYSTEM_PRINCIPAL_IDX = 1
-
-
 def _trigger_test_suffix(label: str) -> str:
     return f"{label}-{secrets.token_hex(4)}"
 
@@ -1324,7 +1321,7 @@ async def _create_user(conn) -> int:
         " VALUES ($1, $2, $3) RETURNING idx",
         name,
         SystemRole.USER,
-        _SYSTEM_PRINCIPAL_IDX,
+        SYSTEM_PRINCIPAL_IDX,
     )
     await conn.execute(
         "INSERT INTO qiita.user (principal_idx, email) VALUES ($1, $2)",
@@ -1341,7 +1338,7 @@ async def _create_service_account(conn) -> int:
         " VALUES ($1, $2, $3) RETURNING idx",
         name,
         SystemRole.USER,
-        _SYSTEM_PRINCIPAL_IDX,
+        SYSTEM_PRINCIPAL_IDX,
     )
     await conn.execute(
         "INSERT INTO qiita.service_account (principal_idx, name) VALUES ($1, $2)",
@@ -1358,7 +1355,7 @@ async def _create_bare_principal(conn) -> int:
         " VALUES ($1, $2, $3) RETURNING idx",
         _trigger_test_suffix("bare"),
         SystemRole.USER,
-        _SYSTEM_PRINCIPAL_IDX,
+        SYSTEM_PRINCIPAL_IDX,
     )
 
 
@@ -1366,7 +1363,7 @@ async def _insert_biosample_row(
     conn,
     *,
     owner_idx: int,
-    created_by_idx: int = _SYSTEM_PRINCIPAL_IDX,
+    created_by_idx: int = SYSTEM_PRINCIPAL_IDX,
 ) -> int:
     """Pattern-1 helper: raw INSERT into qiita.biosample bypassing the
     repository function. The local name avoids collision with the

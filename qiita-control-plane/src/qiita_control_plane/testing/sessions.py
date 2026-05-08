@@ -14,7 +14,7 @@ row when absent.
 """
 
 import pytest_asyncio
-from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 
 
 @pytest_asyncio.fixture(scope="session")
@@ -39,9 +39,10 @@ async def human_admin_session(postgres_pool):
                 idx = await conn.fetchval(
                     "INSERT INTO qiita.principal"
                     "  (display_name, system_role, created_by_idx)"
-                    " VALUES ($1, $2, 1) RETURNING idx",
+                    " VALUES ($1, $2, $3) RETURNING idx",
                     display_name,
                     SystemRole.SYSTEM_ADMIN,
+                    SYSTEM_PRINCIPAL_IDX,
                 )
                 await conn.execute(
                     "INSERT INTO qiita.user"
@@ -112,9 +113,10 @@ async def wet_lab_admin_session(postgres_pool):
                 idx = await conn.fetchval(
                     "INSERT INTO qiita.principal"
                     "  (display_name, system_role, created_by_idx)"
-                    " VALUES ($1, $2, 1) RETURNING idx",
+                    " VALUES ($1, $2, $3) RETURNING idx",
                     display_name,
                     SystemRole.WET_LAB_ADMIN,
+                    SYSTEM_PRINCIPAL_IDX,
                 )
                 await conn.execute(
                     "INSERT INTO qiita.user"
@@ -179,9 +181,10 @@ async def regular_user_session(postgres_pool):
                 idx = await conn.fetchval(
                     "INSERT INTO qiita.principal"
                     "  (display_name, system_role, created_by_idx)"
-                    " VALUES ($1, $2, 1) RETURNING idx",
+                    " VALUES ($1, $2, $3) RETURNING idx",
                     display_name,
                     SystemRole.USER,
+                    SYSTEM_PRINCIPAL_IDX,
                 )
                 await conn.execute(
                     "INSERT INTO qiita.user"
@@ -239,9 +242,10 @@ async def compute_worker_service_account(postgres_pool, tmp_path_factory):
                 pidx = await conn.fetchval(
                     "INSERT INTO qiita.principal"
                     "  (display_name, system_role, created_by_idx)"
-                    " VALUES ($1, $2, 1) RETURNING idx",
+                    " VALUES ($1, $2, $3) RETURNING idx",
                     SVC_NAME,
                     SystemRole.USER,
+                    SYSTEM_PRINCIPAL_IDX,
                 )
                 await conn.execute(
                     "INSERT INTO qiita.service_account"

@@ -13,7 +13,7 @@ import secrets
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
-from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import Tier
 
 
@@ -249,9 +249,6 @@ def test_require_complete_profile_422_when_incomplete():
 # postgres_pool fixture instead of going through a FastAPI request.
 
 
-_SYSTEM_PRINCIPAL_IDX = 1
-
-
 async def _seed_user_for_study(pool, *, suffix: str, role: SystemRole = SystemRole.USER) -> int:
     name = f"req-sa-{suffix}-{secrets.token_hex(4)}"
     pidx = await pool.fetchval(
@@ -259,7 +256,7 @@ async def _seed_user_for_study(pool, *, suffix: str, role: SystemRole = SystemRo
         " VALUES ($1, $2, $3) RETURNING idx",
         name,
         role,
-        _SYSTEM_PRINCIPAL_IDX,
+        SYSTEM_PRINCIPAL_IDX,
     )
     await pool.execute(
         "INSERT INTO qiita.user (principal_idx, email) VALUES ($1, $2)",

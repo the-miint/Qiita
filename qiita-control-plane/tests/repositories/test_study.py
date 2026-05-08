@@ -19,7 +19,7 @@ import secrets
 
 import asyncpg
 import pytest
-from qiita_common.auth_constants import SystemRole
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 from qiita_common.models import Tier
 
 from qiita_control_plane.repositories.study import (
@@ -29,9 +29,6 @@ from qiita_control_plane.repositories.study import (
 )
 
 pytestmark = pytest.mark.db
-
-
-SYSTEM_PRINCIPAL_IDX = 1
 
 
 def _suffix(label: str) -> str:

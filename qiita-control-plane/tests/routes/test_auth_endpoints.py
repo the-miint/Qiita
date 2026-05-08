@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 
 pytestmark = pytest.mark.db
 
@@ -138,9 +138,10 @@ async def _seed_user(
     """Seed principal + user (+ optional user_identity). Returns principal_idx."""
     pidx = await postgres_pool.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-        " VALUES ($1, $2, 1) RETURNING idx",
+        " VALUES ($1, $2, $3) RETURNING idx",
         email,
         role,
+        SYSTEM_PRINCIPAL_IDX,
     )
     if profile_complete:
         await postgres_pool.execute(
@@ -218,8 +219,9 @@ async def test_auth_whoami_service_returns_service_summary(auth_client, postgres
 
     pidx = await postgres_pool.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-        " VALUES ('whoami-svc', $1, 1) RETURNING idx",
+        " VALUES ('whoami-svc', $1, $2) RETURNING idx",
         SystemRole.USER,
+        SYSTEM_PRINCIPAL_IDX,
     )
     _track(auth_client, pidx)
     await postgres_pool.execute(

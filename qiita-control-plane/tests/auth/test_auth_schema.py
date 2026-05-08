@@ -12,7 +12,7 @@ The auth migration adds:
 
 import asyncpg
 import pytest
-from qiita_common.auth_constants import SystemRole
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 
 pytestmark = pytest.mark.db
 
@@ -27,7 +27,7 @@ async def _insert_principal(
     *,
     display_name: str,
     system_role: str = SystemRole.USER,
-    created_by_idx: int = 1,  # system principal
+    created_by_idx: int = SYSTEM_PRINCIPAL_IDX,
 ) -> int:
     """Insert a fresh principal scoped to the caller's transaction."""
     return await conn.fetchval(
@@ -156,12 +156,13 @@ async def test_principal_disabled_round_trip(postgres_pool):
 
 async def test_system_principal_seeded_at_idx_1(postgres_pool):
     row = await postgres_pool.fetchrow(
-        "SELECT display_name, system_role, created_by_idx FROM qiita.principal WHERE idx = 1"
+        "SELECT display_name, system_role, created_by_idx FROM qiita.principal WHERE idx = $1",
+        SYSTEM_PRINCIPAL_IDX,
     )
     assert row is not None, "System principal not seeded at idx=1"
     assert row["display_name"] == "system"
     assert row["system_role"] == SystemRole.SYSTEM_ADMIN
-    assert row["created_by_idx"] == 1, "System principal must self-reference"
+    assert row["created_by_idx"] == SYSTEM_PRINCIPAL_IDX, "System principal must self-reference"
 
 
 async def test_system_principal_has_no_subtype_rows(postgres_pool):

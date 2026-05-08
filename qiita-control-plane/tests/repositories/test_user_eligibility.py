@@ -8,7 +8,7 @@ state-modifier branches (disabled, retired, incomplete profile).
 import secrets
 
 import pytest
-from qiita_common.auth_constants import SystemRole
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 
 from qiita_control_plane.repositories.user_eligibility import (
     UserEligibility,
@@ -20,9 +20,6 @@ from qiita_control_plane.testing.db_seeds import (
 )
 
 pytestmark = pytest.mark.db
-
-
-SYSTEM_PRINCIPAL_IDX = 1
 
 
 async def _seed_principal(pool, *, suffix: str) -> int:

@@ -16,6 +16,7 @@ real second consumer surfaces.
 import secrets
 
 import pytest_asyncio
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
 
 from qiita_control_plane.repositories.biosample import (
     insert_biosample,
@@ -172,7 +173,9 @@ async def ctx(postgres_pool):
     # call (e.g., an admin importing on behalf of an owner). principal_idx
     # is the caller / study owner; biosample_owner_idx is a peer principal.
     token = secrets.token_hex(4)
-    principal_idx = await _seed_principal(postgres_pool, f"bs-{token}", created_by_idx=1)
+    principal_idx = await _seed_principal(
+        postgres_pool, f"bs-{token}", created_by_idx=SYSTEM_PRINCIPAL_IDX
+    )
     await _seed_user(postgres_pool, principal_idx, f"bs-{token}@test.local")
     biosample_owner_idx = await _seed_principal(
         postgres_pool, f"bs-owner-{token}", created_by_idx=principal_idx
