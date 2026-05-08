@@ -11,7 +11,18 @@ from .auth.oidc import AuthRocketVerifier
 from .config import Settings
 from .db import close_pool, get_pool
 from .deps import get_db_pool
+from .dispatch import (
+    build_compute_backend_client,
+    drain_running_dispatches,
+    recover_orphaned_tickets,
+)
 from .routes import api_router
+
+# Bound on how long we wait for in-flight dispatches at shutdown. systemd's
+# default TimeoutStopSec is 90s; staying under that lets us cancel cleanly
+# before SIGKILL. Unfinished tasks are picked up by recover_orphaned_tickets
+# on the next startup as a safety net.
+_DISPATCH_DRAIN_TIMEOUT_SECONDS = 60.0
 
 
 @asynccontextmanager
@@ -29,8 +40,31 @@ async def lifespan(app: FastAPI):
         app.state.oidc_verifier = AuthRocketVerifier.from_settings(settings)
     else:
         app.state.oidc_verifier = None
-    yield
-    await close_pool(app.state.pool)
+
+    # Compute-orchestrator dispatch wiring. The CP itself dispatches
+    # workflows in-process via asyncio tasks (no polling worker). When
+    # COMPUTE_ORCHESTRATOR_URL is unset, dispatch routes return 503;
+    # everything else still works (auth, references, admin, etc.).
+    app.state.compute_backend_client = build_compute_backend_client(
+        base_url=settings.compute_orchestrator_url,
+        token_path=settings.cp_to_co_token_path,
+    )
+    app.state.running_dispatches = set()
+    # Recover any tickets left in non-terminal state by a previous CP
+    # process — they have no live owner. Marked FAILED with a 'cp
+    # restarted' reason; operators redrive via /work-ticket/{idx}/run.
+    await recover_orphaned_tickets(app.state.pool)
+
+    try:
+        yield
+    finally:
+        await drain_running_dispatches(
+            app.state.running_dispatches,
+            timeout_seconds=_DISPATCH_DRAIN_TIMEOUT_SECONDS,
+        )
+        if app.state.compute_backend_client is not None:
+            await app.state.compute_backend_client.close()
+        await close_pool(app.state.pool)
 
 
 app = FastAPI(title="qiita-control-plane", lifespan=lifespan)

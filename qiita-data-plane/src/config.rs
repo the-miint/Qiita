@@ -9,9 +9,6 @@ pub struct Settings {
     pub listen_addr: SocketAddr,
     /// HMAC-SHA256 key for Flight ticket verification (decoded from base64 env var).
     pub hmac_secret_key: Vec<u8>,
-    /// JWKS endpoint URL for JWT public key retrieval and verification.
-    /// TODO: make required before any authenticated endpoint is added.
-    pub jwks_url: Option<String>,
     /// DuckLake catalog connection string (libpq format).
     /// E.g., "dbname=qiita_ducklake host=localhost port=5432 user=qiita password=qiita"
     pub ducklake_catalog_connstr: String,
@@ -48,7 +45,6 @@ impl Settings {
         Ok(Self {
             listen_addr,
             hmac_secret_key,
-            jwks_url: std::env::var("JWKS_URL").ok(),
             ducklake_catalog_connstr,
             ducklake_data_path,
         })

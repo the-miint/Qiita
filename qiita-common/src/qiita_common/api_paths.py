@@ -90,3 +90,22 @@ PATH_STEP_RUN = "/run"
 
 URL_STEP_PREFIX = f"{API_PREFIX}{PATH_STEP_PREFIX}"
 URL_STEP_RUN = f"{URL_STEP_PREFIX}{PATH_STEP_RUN}"
+
+
+# =============================================================================
+# /work-ticket/* — control-plane work-ticket lifecycle
+# =============================================================================
+# Submission (POST root) creates a ticket and fires an in-process
+# `asyncio.Task` calling `runner.run_workflow` (option C, in-process
+# dispatch — no polling worker). The /run endpoint is the human-override
+# path that resets a FAILED ticket and re-dispatches; auto-retry is not
+# implemented, so /run is the only retry mechanism.
+
+PATH_WORK_TICKET_PREFIX = "/work-ticket"
+PATH_WORK_TICKET_ROOT = ""  # POST against the prefix itself
+PATH_WORK_TICKET_BY_IDX = "/{work_ticket_idx}"
+PATH_WORK_TICKET_RUN = "/{work_ticket_idx}/run"
+
+URL_WORK_TICKET_PREFIX = f"{API_PREFIX}{PATH_WORK_TICKET_PREFIX}"
+URL_WORK_TICKET_BY_IDX = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_BY_IDX}"
+URL_WORK_TICKET_RUN = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_RUN}"

@@ -4,7 +4,7 @@ After=network.target postgresql.service
 
 [Service]
 Type=simple
-User=qiita-data-plane
+User=qiita-data
 ExecStart=/opt/qiita/data-plane/qiita-data-plane
 Restart=on-failure
 Environment=LISTEN_ADDR=127.0.0.1:%i
