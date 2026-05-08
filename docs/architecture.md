@@ -522,7 +522,7 @@ Work ticket fields (per `qiita.work_ticket` migration `20260504000001_work_ticke
 - `failure_reason` — human-readable explanation
 - `created_at`, `updated_at` — timestamps
 
-Several "v1-aspirational" fields appear in earlier draft text (slurm_job_id, log paths, current_step / total_steps, provenance JSONB, completed_at) but are not in the schema today. They land alongside the SLURM async-callback work and per-step provenance write-back, both of which post-date this version.
+The schema does not carry per-step provenance fields (slurm_job_id, log paths, current_step / total_steps, provenance JSONB, completed_at). The runner is synchronous and waits inline for each step; SLURM-side log retrieval is on the orchestrator and not surfaced on the work_ticket row.
 
 Failure classification is finer-grained at the backend layer: `BackendFailure.kind` is one of the values in `qiita_common.backend_failure.FailureKind` (NODE_FAIL, OOM_KILLED, PREEMPTED, TIMEOUT_BEFORE_START, TRANSIENT_FS_ERROR, SLURMRESTD_UNREACHABLE, PROCESS_RESTARTED for retriable; BAD_INPUT, EXIT_NONZERO, CONTRACT_VIOLATION, UNKNOWN_PERMANENT for permanent). The runner collapses these to the two-valued `failure_type` for storage; `failure_reason` carries the kind name + per-failure detail for triage.
 

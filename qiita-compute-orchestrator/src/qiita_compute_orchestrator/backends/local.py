@@ -71,6 +71,7 @@ class LocalBackend(ComputeBackend):
         workspace: Path,
         *,
         reference_idx: int,
+        work_ticket_idx: int,  # noqa: ARG002 — accepted for protocol parity
         container: str | None = None,
         entrypoint: str | None = None,
         baseline_resources=None,  # noqa: ARG002 — accepted for protocol parity

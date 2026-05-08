@@ -119,6 +119,7 @@ async def test_run_step_requires_container(jwt_path, baseline, tmp_path):
             {},
             tmp_path,
             reference_idx=1,
+            work_ticket_idx=99,
             container=None,
             entrypoint=None,
             baseline_resources=baseline,
@@ -137,6 +138,7 @@ async def test_run_step_requires_baseline_resources(jwt_path, tmp_path):
             {},
             tmp_path,
             reference_idx=1,
+            work_ticket_idx=99,
             container="qiita/hash:1.0.0",
             entrypoint=None,
             baseline_resources=None,
@@ -163,6 +165,7 @@ async def test_run_step_completed_returns_outputs(jwt_path, baseline, tmp_path):
         {"fasta_path": tmp_path / "x.fa"},
         tmp_path,
         reference_idx=42,
+        work_ticket_idx=99,
         container="qiita/hash:1.0.0",
         entrypoint="/usr/local/bin/hash",
         baseline_resources=baseline,
@@ -185,6 +188,7 @@ async def test_run_step_writes_params_json(jwt_path, baseline, tmp_path):
         {"fasta_path": tmp_path / "input.fa"},
         tmp_path,
         reference_idx=42,
+        work_ticket_idx=99,
         container="qiita/hash:1.0.0",
         entrypoint=None,
         baseline_resources=baseline,
@@ -192,6 +196,7 @@ async def test_run_step_writes_params_json(jwt_path, baseline, tmp_path):
     params = json.loads((tmp_path / "input" / "params.json").read_text())
     assert params["step_name"] == "hash"
     assert params["reference_idx"] == 42
+    assert params["work_ticket_idx"] == 99
     assert params["inputs"]["fasta_path"].endswith("input.fa")
 
 
@@ -228,6 +233,7 @@ async def test_run_step_terminal_states_map_to_kinds(
             {},
             tmp_path,
             reference_idx=1,
+            work_ticket_idx=99,
             container="qiita/hash:1.0.0",
             entrypoint=None,
             baseline_resources=baseline,
@@ -265,6 +271,7 @@ async def test_run_step_completed_but_missing_manifest_is_contract_violation(
             {},
             tmp_path,
             reference_idx=1,
+            work_ticket_idx=99,
             container="qiita/hash:1.0.0",
             entrypoint=None,
             baseline_resources=baseline,
@@ -290,6 +297,7 @@ async def test_run_step_submit_5xx_is_unreachable(jwt_path, baseline, tmp_path):
             {},
             tmp_path,
             reference_idx=1,
+            work_ticket_idx=99,
             container="qiita/hash:1.0.0",
             entrypoint=None,
             baseline_resources=baseline,
@@ -310,12 +318,36 @@ async def test_run_step_submit_4xx_is_contract_violation(jwt_path, baseline, tmp
             {},
             tmp_path,
             reference_idx=1,
+            work_ticket_idx=99,
             container="qiita/hash:1.0.0",
             entrypoint=None,
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
     assert ei.value.transient is False
+
+
+@pytest.mark.asyncio
+async def test_run_step_submit_persistent_401_is_unreachable(jwt_path, baseline, tmp_path):
+    """slurmrestd 401 that survives the client's JWT-refresh retry must
+    classify as SLURMRESTD_UNREACHABLE (retriable). The user's rotation
+    pipeline is broken (token unreadable / wrong principal / not
+    refreshed) — operator-fixable, not a workflow contract violation."""
+    handler = httpx.MockTransport(lambda req: httpx.Response(401, text="bad token"))
+    backend = _make_backend(handler, jwt_path)
+    with pytest.raises(BackendFailure) as ei:
+        await backend.run_step(
+            "hash",
+            {},
+            tmp_path,
+            reference_idx=1,
+            work_ticket_idx=99,
+            container="qiita/hash:1.0.0",
+            entrypoint=None,
+            baseline_resources=baseline,
+        )
+    assert ei.value.kind == FailureKind.SLURMRESTD_UNREACHABLE
+    assert ei.value.transient is True
 
 
 @pytest.mark.asyncio
@@ -332,6 +364,7 @@ async def test_run_step_submit_transport_error_is_unreachable(jwt_path, baseline
             {},
             tmp_path,
             reference_idx=1,
+            work_ticket_idx=99,
             container="qiita/hash:1.0.0",
             entrypoint=None,
             baseline_resources=baseline,
@@ -359,6 +392,7 @@ async def test_run_step_polling_4xx_bails_permanent(jwt_path, baseline, tmp_path
             {},
             tmp_path,
             reference_idx=1,
+            work_ticket_idx=99,
             container="qiita/hash:1.0.0",
             entrypoint=None,
             baseline_resources=baseline,

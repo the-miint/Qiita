@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -43,9 +44,9 @@ from ..slurm import (
 # (FAILED with non-zero exit, CANCELLED, DEADLINE) maps to permanent.
 #
 # TIMEOUT is treated as retriable: SLURM marks a job TIMEOUT when it
-# exceeds walltime, which v1 commonly indicates a too-tight allocation
-# (no profile multiplier yet, baseline_resources used as-is). When per-
-# ticket walltime overrides land, TIMEOUT may need re-classification.
+# exceeds walltime, which usually indicates a too-tight allocation —
+# a retry on a less-loaded node may finish in time, and operators can
+# raise the action's walltime ceiling if the pattern persists.
 _STATE_TO_FAILURE_KIND: dict[str, FailureKind] = {
     "FAILED": FailureKind.EXIT_NONZERO,
     "CANCELLED": FailureKind.EXIT_NONZERO,
@@ -60,9 +61,15 @@ _STATE_TO_FAILURE_KIND: dict[str, FailureKind] = {
 
 
 class SlurmBackend(ComputeBackend):
-    """Submits compute jobs to SLURM via slurmrestd. v1 supports
-    singleton steps (one SLURM job per step); map / reduce fan-out
-    is deferred until sample-processing workflows land.
+    """Submits compute jobs to SLURM via slurmrestd. Each call to
+    `run_step` submits one SLURM job and waits for it to terminate;
+    map / reduce fan-out (one SLURM job per `prep_sample_idx`) is not
+    supported yet — the backend handles a single SLURM job per step.
+
+    See docs/architecture.md "Backend code-sharing" for the
+    canonical-implementation contract: the SLURM container's entrypoint
+    must execute the same DuckDB+miint logic that `LocalBackend`'s
+    in-process helpers run, so dev / CI and production stay in sync.
     """
 
     def __init__(
@@ -87,6 +94,7 @@ class SlurmBackend(ComputeBackend):
         workspace: Path,
         *,
         reference_idx: int,
+        work_ticket_idx: int,
         container: str | None = None,
         entrypoint: str | None = None,
         baseline_resources: StepBaselineResources | None = None,
@@ -121,6 +129,7 @@ class SlurmBackend(ComputeBackend):
                 {
                     "step_name": name,
                     "reference_idx": reference_idx,
+                    "work_ticket_idx": work_ticket_idx,
                     "inputs": {k: str(v) for k, v in inputs.items()},
                     "output_path": str(output_path),
                 }
@@ -134,15 +143,9 @@ class SlurmBackend(ComputeBackend):
             gpu=baseline_resources.gpu,
         )
 
-        # We don't know work_ticket_idx here — the orchestrator route
-        # doesn't propagate it (StepRunRequest only carries reference_idx).
-        # Use reference_idx as a job-name suffix instead so SLURM dumps
-        # are still cross-referenceable. When work_ticket_idx flows
-        # through (likely with the async-callback CO=>CP design),
-        # switch the suffix.
         payload = build_job_submit_payload(
             step_name=name,
-            work_ticket_idx=reference_idx,
+            work_ticket_idx=work_ticket_idx,
             container=container,
             entrypoint=entrypoint,
             baseline_resources=baseline,
@@ -218,7 +221,10 @@ class SlurmBackend(ComputeBackend):
 
         slurmrestd 5xx / transport errors during polling don't bail the
         whole step — they retry on the next interval. A 4xx (e.g. 404
-        because the job was purged) does bail."""
+        because the job was purged) does bail.
+
+        Each tick's sleep is jittered by ±50% so N orchestrator
+        instances don't all hit slurmrestd in lockstep."""
         deadline = time.monotonic() + self._job_timeout
         while True:
             try:
@@ -249,14 +255,24 @@ class SlurmBackend(ComputeBackend):
                         f"within {self._job_timeout}s; orchestrator gave up watching"
                     ),
                 )
-            await asyncio.sleep(self._poll_interval)
+            await asyncio.sleep(self._poll_interval * random.uniform(0.5, 1.5))
 
     def _classify_submit_error(self, exc: SlurmrestdError, step_name: str) -> BackendFailure:
         """Map a slurmrestd error from job/submit to a BackendFailure.
-        4xx == client error (bad payload / unauthorized) == permanent;
-        5xx / transport (status_code is None) == retriable
-        SLURMRESTD_UNREACHABLE."""
-        if exc.status_code is None or exc.status_code >= 500:
+
+        - 5xx / transport (status_code is None) == SLURMRESTD_UNREACHABLE
+          (retriable — slurmctld restart, transient network).
+        - 401 == SLURMRESTD_UNREACHABLE (retriable — operator-fixable).
+          The slurmrestd client already retried after refreshing the JWT
+          before raising, so a 401 here means the rotation pipeline is
+          broken (token unreadable, wrong principal, expired and the
+          rotation script hasn't run). That's an ops issue, not a
+          workflow contract violation; classify retriable so the runner
+          gives ops a window to fix the token before the ticket fails.
+        - Other 4xx == CONTRACT_VIOLATION (permanent — bad payload won't
+          be fixed by retry).
+        """
+        if exc.status_code is None or exc.status_code >= 500 or exc.status_code == 401:
             kind = FailureKind.SLURMRESTD_UNREACHABLE
         else:
             kind = FailureKind.CONTRACT_VIOLATION

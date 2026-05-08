@@ -101,6 +101,7 @@ async def test_run_step_posts_to_step_run_endpoint(tmp_path):
         inputs={"fasta_path": Path("/data/in.fa")},
         workspace=Path("/workspace"),
         reference_idx=42,
+        work_ticket_idx=99,
     )
 
     assert len(captured) == 1
@@ -108,11 +109,10 @@ async def test_run_step_posts_to_step_run_endpoint(tmp_path):
     assert req.method == "POST"
     assert req.url.path == URL_STEP_RUN
     body = json.loads(req.content)
-    assert body == {
-        "step_name": "hash",
-        "inputs": {"fasta_path": "/data/in.fa"},
-        "workspace": "/workspace",
-        "reference_idx": 42,
-    }
+    assert body["step_name"] == "hash"
+    assert body["inputs"] == {"fasta_path": "/data/in.fa"}
+    assert body["workspace"] == "/workspace"
+    assert body["reference_idx"] == 42
+    assert body["work_ticket_idx"] == 99
     # Outputs come back as Paths the runner can plumb into downstream entries.
     assert outputs == {"manifest": Path("/workspace/manifest.parquet")}

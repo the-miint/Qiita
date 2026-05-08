@@ -78,6 +78,9 @@ def verify_container_output(output_path: Path) -> list[VerificationFailure]:
                 detail=str(output_path),
             )
         ]
+    # Resolve once so per-iteration path-traversal checks don't re-stat
+    # the directory (and chase symlinks) on every entry.
+    output_path_resolved = output_path.resolve()
 
     manifest_path = output_path / "manifest.json"
     if not manifest_path.exists():
@@ -161,7 +164,7 @@ def verify_container_output(output_path: Path) -> list[VerificationFailure]:
         # Resolve relative to output_path; reject path traversal.
         full = (output_path / value).resolve()
         try:
-            full.relative_to(output_path.resolve())
+            full.relative_to(output_path_resolved)
         except ValueError:
             failures.append(
                 VerificationFailure(
@@ -210,7 +213,7 @@ def verify_container_output(output_path: Path) -> list[VerificationFailure]:
         # would let the container declare a file outside its scope.
         full = (output_path / relative).resolve()
         try:
-            full.relative_to(output_path.resolve())
+            full.relative_to(output_path_resolved)
         except ValueError:
             failures.append(
                 VerificationFailure(

@@ -34,6 +34,7 @@ class ComputeBackend(ABC):
         workspace: Path,
         *,
         reference_idx: int,
+        work_ticket_idx: int,
         container: str | None = None,
         entrypoint: str | None = None,
         baseline_resources: StepBaselineResources | None = None,

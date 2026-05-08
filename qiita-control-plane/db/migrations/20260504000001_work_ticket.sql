@@ -113,10 +113,15 @@ CREATE TABLE qiita.work_ticket (
     -- runner on each PROCESSING → QUEUED retry transition. When a step
     -- raises a retriable BackendFailure and retry_count < max_retries, the
     -- ticket bounces back to QUEUED for another attempt; otherwise it
-    -- transitions to FAILED with the captured failure_*. Per-ticket
-    -- max_retries override at submission time is a future feature; for
-    -- now every ticket inherits the default of 3 (see
-    -- docs/architecture.md "Compute Orchestrator").
+    -- transitions to FAILED with the captured failure_*. Tickets inherit
+    -- the DB default (3) on submission; admins can override per-row to
+    -- nudge a specific stuck ticket without a redeploy.
+    --
+    -- max_retries upper bound 100: a ticket retrying 100 times has either
+    -- hit a genuinely transient pattern (unlikely past ~5 attempts) or
+    -- the failure is being mis-classified as transient. The cap forces
+    -- ops to investigate rather than letting a misclassification eat
+    -- compute indefinitely.
     retry_count              INT NOT NULL DEFAULT 0
         CHECK (retry_count >= 0),
     max_retries              INT NOT NULL DEFAULT 3
@@ -177,6 +182,20 @@ COMMENT ON TABLE qiita.work_ticket IS
     'happens inside the workflow''s `step:` entries (e.g. map steps that '
     'submit one SLURM job per prep_sample_idx); all such jobs share the '
     'same work_ticket_idx.';
+
+COMMENT ON COLUMN qiita.work_ticket.failure_step_name IS
+    'Free-text step name copied from action.steps[i].name when a STEP_RUN '
+    'failure occurs. Free-text rather than FK because the set of valid '
+    'names is per-action — but the value is always a snapshot of an entry '
+    'from the action this ticket was submitted against. Ops dashboards '
+    'join back to action metadata via (action_id, action_version, '
+    'failure_step_name).';
+
+COMMENT ON COLUMN qiita.work_ticket.max_retries IS
+    'Upper bound on retry attempts for retriable BackendFailure. Default 3. '
+    'Admins can raise per-row to nudge a stuck ticket; the 100 ceiling '
+    'forces ops investigation rather than letting a mis-classified-transient '
+    'failure eat compute indefinitely.';
 
 -- The orchestrator polls for PENDING / QUEUED / PROCESSING tickets to
 -- dispatch and watch; COMPLETED / FAILED are terminal and seldom queried

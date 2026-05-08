@@ -426,12 +426,10 @@ refuse to boot if the file is missing or unreadable by `qiita-orch`.
 With `COMPUTE_BACKEND=slurm`, it also reads `SLURMRESTD_JWT_PATH` —
 boot fails fast if that file is missing.
 
-> **v1: no orchestrator PAT.** The orchestrator does not load a PAT in
-> v1 (`Settings` has no token field; only the CP↔CO shared bearer is
-> read). When the orchestrator gains CO→CP callbacks for async-step
-> lifecycle, that PR adds the PAT-mint step here and
-> [`orchestrator-token-rotation.md`](orchestrator-token-rotation.md)
-> becomes the rotation procedure for it.
+The orchestrator authenticates only with the CP↔CO shared bearer
+installed in step 7 — it does not load a PAT.
+[`orchestrator-token-rotation.md`](orchestrator-token-rotation.md) is
+the rotation procedure once a PAT is wired in for CO→CP callbacks.
 
 ## 10. Verify the deploy
 

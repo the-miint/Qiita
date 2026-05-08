@@ -25,7 +25,7 @@ from typing import Any
 import asyncpg
 from qiita_common.actions import ActionDefinition, WorkflowAction, WorkflowStep
 from qiita_common.api_paths import LibraryPrimitive
-from qiita_common.backend_failure import BackendFailure
+from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.compute_backend_client import ComputeBackendClient
 from qiita_common.models import (
     FailureType,
@@ -125,14 +125,29 @@ async def run_workflow(
             )
             bound.update(outputs)
 
-        if action.success_status:
-            await _patch_resource_status(pool, scope_target, action.success_status)
-        await _atomic_transition(
-            pool,
-            work_ticket_idx,
-            expected=WorkTicketState.PROCESSING,
-            new=WorkTicketState.COMPLETED,
-        )
+        # Anything below this line is "finalize" stage — failures here
+        # must classify as FINALIZE (with NULL step_name) to honour the
+        # `work_ticket_failure_step_name_consistent` DB CHECK. The inner
+        # try wraps the success path so a BackendFailure raised by
+        # `_atomic_transition` (e.g. PROCESSING → COMPLETED couldn't fire
+        # because state changed under us) carries the right stage.
+        try:
+            if action.success_status:
+                await _patch_resource_status(pool, scope_target, action.success_status)
+            await _atomic_transition(
+                pool,
+                work_ticket_idx,
+                expected=WorkTicketState.PROCESSING,
+                new=WorkTicketState.COMPLETED,
+            )
+        except Exception as exc:
+            raise BackendFailure(
+                kind=FailureKind.UNKNOWN_PERMANENT,
+                stage=WorkTicketFailureStage.FINALIZE,
+                step_name=None,
+                reason=f"{type(exc).__name__}: {exc!s}"[:2000],
+            ) from exc
+
         _log.info("workflow %d completed", work_ticket_idx)
     except BackendFailure as exc:
         # Retry-loop already exhausted retries (transient) or this was a
@@ -158,11 +173,13 @@ async def run_workflow(
         )
         raise
     except Exception as exc:
-        # Anything not a BackendFailure is either a programming bug or
-        # an in-process LIBRARY primitive raising plain Python. We treat
-        # both as permanent UNKNOWN_PERMANENT — there's no classification
-        # to retry against, and re-running an in-process Python failure
-        # produces the same error.
+        # Plain Python from inside the step loop — LIBRARY primitive
+        # raising untyped, or a programming bug. Treat as
+        # UNKNOWN_PERMANENT (re-running won't change a deterministic
+        # Python failure) and tag with the most recent step's name so
+        # ops dashboards can join back to action metadata. Re-raise the
+        # original exception unchanged so callers that asserted on its
+        # type keep working.
         _log.exception("workflow %d failed (unwrapped exception)", work_ticket_idx)
         if action.failure_status:
             try:
@@ -177,8 +194,6 @@ async def run_workflow(
             work_ticket_idx,
             failure_type=FailureType.PERMANENT,
             failure_stage=WorkTicketFailureStage.STEP_RUN,
-            # Best-effort: if the exception fires before the loop body,
-            # 'index' isn't defined; guard by name lookup.
             failure_step_name=_safe_entry_name(action, locals().get("index")),
             failure_reason=f"{type(exc).__name__}: {exc!s}"[:2000],
         )
@@ -220,7 +235,14 @@ async def _run_entry_with_retry(
     while True:
         try:
             if isinstance(entry, WorkflowStep):
-                return await _dispatch_step(backend_client, entry, bound, workspace, scope_target)
+                return await _dispatch_step(
+                    backend_client,
+                    entry,
+                    bound,
+                    workspace,
+                    scope_target,
+                    work_ticket_idx=work_ticket_idx,
+                )
             if isinstance(entry, WorkflowAction):
                 return await _dispatch_action(
                     pool,
@@ -453,10 +475,10 @@ async def _transition_to_failed(
 
 def _safe_entry_name(action: ActionDefinition, index: int | None) -> str | None:
     """Best-effort lookup of the entry name at `index`. Returns None if
-    the index is out of range (e.g. an exception fired before the loop
-    body started). The DB CHECK requires step_name to be NULL when
-    failure_stage is not STEP_RUN, but we always pass STEP_RUN here —
-    keep the column populated when we can."""
+    the index is out of range (e.g. action.steps is empty so the loop
+    never iterated). When the loop body has executed at least once,
+    `index` is the most recent entry — the natural name to record on
+    failure."""
     if index is None:
         return None
     if 0 <= index < len(action.steps):
@@ -508,6 +530,8 @@ async def _dispatch_step(
     bound: dict[str, Any],
     workspace: Path,
     scope_target: dict[str, Any],
+    *,
+    work_ticket_idx: int,
 ) -> dict[str, Any]:
     """Translate the YAML-declared input names into Path arguments and
     call the orchestrator's /step/run endpoint; record outputs under the
@@ -543,6 +567,7 @@ async def _dispatch_step(
         inputs=inputs,
         workspace=workspace,
         reference_idx=scope_target["reference_idx"],
+        work_ticket_idx=work_ticket_idx,
         container=entry.container,
         entrypoint=entry.entrypoint,
         baseline_resources=baseline,

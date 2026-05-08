@@ -46,6 +46,7 @@ class FakeBackendClient:
         inputs: dict[str, Path],
         workspace: Path,
         reference_idx: int,
+        work_ticket_idx: int,
         container: str | None = None,
         entrypoint: str | None = None,
         baseline_resources=None,
@@ -53,7 +54,7 @@ class FakeBackendClient:
         # Accepted for protocol parity (the runner now forwards container
         # metadata for SlurmBackend); the LocalBackend-shaped fake here
         # ignores them.
-        del container, entrypoint, baseline_resources
+        del work_ticket_idx, container, entrypoint, baseline_resources
         self.calls.append((step_name, dict(inputs), workspace, reference_idx))
         outputs = self.outputs_for.get(step_name, {})
         for path in outputs.values():
@@ -511,6 +512,7 @@ class _RetryingBackendClient:
         inputs: dict[str, Path],
         workspace: Path,
         reference_idx: int,
+        work_ticket_idx: int,
         container: str | None = None,
         entrypoint: str | None = None,
         baseline_resources=None,
@@ -518,7 +520,7 @@ class _RetryingBackendClient:
         from qiita_common.backend_failure import BackendFailure
         from qiita_common.models import WorkTicketFailureStage
 
-        del container, entrypoint, baseline_resources
+        del work_ticket_idx, container, entrypoint, baseline_resources
         self.attempts[step_name] = self.attempts.get(step_name, 0) + 1
         if step_name == self.fail_step and self.attempts[step_name] <= self.fail_n_times:
             raise BackendFailure(
@@ -548,7 +550,9 @@ async def test_retry_succeeds_after_transient_failure(
     # Backend fails the FIRST hash attempt with NODE_FAIL (retriable),
     # succeeds on the second. Load step has its own success output.
     class _Backend(_RetryingBackendClient):
-        async def run_step(self, *, step_name, inputs, workspace, reference_idx, **kw):
+        async def run_step(
+            self, *, step_name, inputs, workspace, reference_idx, work_ticket_idx, **kw
+        ):
             self.attempts[step_name] = self.attempts.get(step_name, 0) + 1
             if step_name == "load":
                 workspace.mkdir(parents=True, exist_ok=True)
@@ -563,6 +567,7 @@ async def test_retry_succeeds_after_transient_failure(
                 inputs=inputs,
                 workspace=workspace,
                 reference_idx=reference_idx,
+                work_ticket_idx=work_ticket_idx,
                 **kw,
             )
 
@@ -710,7 +715,9 @@ async def test_retry_observable_via_state_transitions(
     observed_states: list[str] = []
 
     class _Backend(_RetryingBackendClient):
-        async def run_step(self, *, step_name, inputs, workspace, reference_idx, **kw):
+        async def run_step(
+            self, *, step_name, inputs, workspace, reference_idx, work_ticket_idx, **kw
+        ):
             state = await postgres_pool.fetchval(
                 "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
                 work_ticket_idx,
@@ -728,6 +735,7 @@ async def test_retry_observable_via_state_transitions(
                 inputs=inputs,
                 workspace=workspace,
                 reference_idx=reference_idx,
+                work_ticket_idx=work_ticket_idx,
                 **kw,
             )
 

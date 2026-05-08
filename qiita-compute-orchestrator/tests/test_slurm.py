@@ -9,8 +9,8 @@ Covers the two pure pieces of the SLURM backend:
   reports every container-contract violation. Each gate has its own
   test so a regression in one doesn't mask another.
 
-The HTTP client (slurm/client.py — landing in the next commit) and
-SlurmBackend.run_step (the wiring) are tested separately.
+The HTTP client (slurm/client.py) and SlurmBackend.run_step (the wiring)
+are tested separately in test_slurm_client.py and test_slurm_backend.py.
 """
 
 from __future__ import annotations

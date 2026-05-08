@@ -54,6 +54,7 @@ async def run_step(
             {k: Path(v) for k, v in body.inputs.items()},
             Path(body.workspace),
             reference_idx=body.reference_idx,
+            work_ticket_idx=body.work_ticket_idx,
             container=body.container,
             entrypoint=body.entrypoint,
             baseline_resources=body.baseline_resources,

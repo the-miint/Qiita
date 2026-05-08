@@ -27,19 +27,21 @@ class _RecordingBackend(ComputeBackend):
         workspace: Path,
         *,
         reference_idx: int,
+        work_ticket_idx: int,
         container: str | None = None,
         entrypoint: str | None = None,
         baseline_resources=None,
     ) -> dict[str, Path]:
-        # Existing tests don't exercise the new fields; they get
-        # captured into the calls log as a tuple suffix so future tests
-        # that DO exercise them can assert on the values.
+        # Existing tests don't exercise every field; they get captured
+        # into the calls log as a tuple so future tests that DO
+        # exercise them can assert on the values.
         self.calls.append(
             (
                 name,
                 dict(inputs),
                 workspace,
                 reference_idx,
+                work_ticket_idx,
                 container,
                 entrypoint,
                 baseline_resources,
@@ -67,6 +69,7 @@ def test_step_run_requires_bearer_token(http_client):
             "inputs": {"fasta_path": "/tmp/x.fa"},
             "workspace": "/tmp/ws",
             "reference_idx": 1,
+            "work_ticket_idx": 1,
         },
     )
     assert resp.status_code == 401
@@ -82,6 +85,7 @@ def test_step_run_rejects_wrong_token(http_client, cp_to_co_token):
             "inputs": {"fasta_path": "/tmp/x.fa"},
             "workspace": "/tmp/ws",
             "reference_idx": 1,
+            "work_ticket_idx": 1,
         },
     )
     assert resp.status_code == 401
@@ -100,6 +104,7 @@ def test_step_run_dispatches_to_backend(http_client, cp_to_co_token, tmp_path):
             "inputs": {"fasta_path": str(fasta)},
             "workspace": str(tmp_path),
             "reference_idx": 7,
+            "work_ticket_idx": 99,
         },
     )
     assert resp.status_code == 200, resp.text
@@ -108,11 +113,21 @@ def test_step_run_dispatches_to_backend(http_client, cp_to_co_token, tmp_path):
     assert body["outputs"]["manifest"].endswith("manifest.parquet")
 
     assert len(backend.calls) == 1
-    name, inputs, workspace, reference_idx, container, entrypoint, baseline = backend.calls[0]
+    (
+        name,
+        inputs,
+        workspace,
+        reference_idx,
+        work_ticket_idx,
+        container,
+        entrypoint,
+        baseline,
+    ) = backend.calls[0]
     assert name == "hash"
     assert inputs == {"fasta_path": fasta}
     assert workspace == tmp_path
     assert reference_idx == 7
+    assert work_ticket_idx == 99
     # Old call sites omit container metadata; protocol defaults to None.
     assert container is None
     assert entrypoint is None
@@ -135,6 +150,7 @@ def test_step_run_translates_backend_value_error(http_client, cp_to_co_token, tm
             "inputs": {},
             "workspace": str(tmp_path),
             "reference_idx": 1,
+            "work_ticket_idx": 1,
         },
     )
     assert resp.status_code == 422

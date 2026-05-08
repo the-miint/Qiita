@@ -32,11 +32,11 @@ from typing import Any
 
 from qiita_common.actions import BaselineResources
 
-# v1 ships with a single hardcoded SLURM API version so payload shape
-# tests are deterministic. Operators override via env at the
-# SlurmrestdClient layer; the shape below stays valid across v0.0.39 →
-# v0.0.41 by holding to the lowest-common-denominator schema. If a
-# breaking schema bump lands in slurmrestd, branch on api_version here.
+# Single default SLURM API version so payload-shape tests are
+# deterministic. Operators override via env at the SlurmrestdClient
+# layer; the shape below stays valid across v0.0.39 → v0.0.41 by holding
+# to the lowest-common-denominator schema. Branch on api_version here
+# if a breaking schema bump lands in slurmrestd.
 DEFAULT_SLURM_API_VERSION = "v0.0.40"
 
 
@@ -112,9 +112,9 @@ def build_job_submit_payload(
         entrypoint: optional binary inside the container. None means the
             container's own ENTRYPOINT runs.
         baseline_resources: CPU / memory / walltime from the YAML step.
-            v1 uses these values directly; profile multiplication and
-            ceiling clamping are deferred (no originator profile
-            concept exists yet).
+            Used as-is — there is no originator-profile multiplier
+            applied here. Caller is responsible for clamping against
+            the action's ceiling before passing in.
         input_path: Bind-mounted as `$QIITA_INPUT_PATH` inside the
             container. Caller writes `params.json` here before submit.
         output_path: Bind-mounted as `$QIITA_OUTPUT_PATH`. Container

@@ -27,7 +27,13 @@ async def test_hash_job_produces_manifest(fasta_file, tmp_path):
     output_dir = tmp_path / "output"
 
     backend = LocalBackend()
-    result = await backend.run_step("hash", {"fasta_path": fasta_path}, output_dir, reference_idx=1)
+    result = await backend.run_step(
+        "hash",
+        {"fasta_path": fasta_path},
+        output_dir,
+        reference_idx=1,
+        work_ticket_idx=1,
+    )
     manifest_path = result["manifest"]
 
     assert manifest_path.exists()
@@ -45,7 +51,13 @@ async def test_hash_job_md5_matches_python(fasta_file, tmp_path):
     output_dir = tmp_path / "output"
 
     backend = LocalBackend()
-    result = await backend.run_step("hash", {"fasta_path": fasta_path}, output_dir, reference_idx=1)
+    result = await backend.run_step(
+        "hash",
+        {"fasta_path": fasta_path},
+        output_dir,
+        reference_idx=1,
+        work_ticket_idx=1,
+    )
     manifest_path = result["manifest"]
 
     for entry in _read_manifest(manifest_path):
@@ -66,7 +78,13 @@ async def test_hash_job_manifest_has_required_columns(fasta_file, tmp_path):
     output_dir = tmp_path / "output"
 
     backend = LocalBackend()
-    result = await backend.run_step("hash", {"fasta_path": fasta_path}, output_dir, reference_idx=1)
+    result = await backend.run_step(
+        "hash",
+        {"fasta_path": fasta_path},
+        output_dir,
+        reference_idx=1,
+        work_ticket_idx=1,
+    )
     manifest_path = result["manifest"]
 
     for entry in _read_manifest(manifest_path):
@@ -91,6 +109,7 @@ async def test_hash_job_rejects_missing_fasta(tmp_path):
             {"fasta_path": tmp_path / "nonexistent.fasta"},
             tmp_path / "output",
             reference_idx=1,
+            work_ticket_idx=1,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
     assert ei.value.step_name == "hash"
@@ -109,7 +128,11 @@ async def test_hash_job_rejects_duplicate_read_ids(tmp_path):
     backend = LocalBackend()
     with pytest.raises(BackendFailure) as ei:
         await backend.run_step(
-            "hash", {"fasta_path": fasta_path}, tmp_path / "output", reference_idx=1
+            "hash",
+            {"fasta_path": fasta_path},
+            tmp_path / "output",
+            reference_idx=1,
+            work_ticket_idx=1,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
     assert "duplicate read_id" in ei.value.reason
@@ -125,7 +148,11 @@ async def test_hash_job_empty_fasta(tmp_path):
 
     backend = LocalBackend()
     result = await backend.run_step(
-        "hash", {"fasta_path": fasta_path}, tmp_path / "output", reference_idx=1
+        "hash",
+        {"fasta_path": fasta_path},
+        tmp_path / "output",
+        reference_idx=1,
+        work_ticket_idx=1,
     )
     manifest_path = result["manifest"]
 

@@ -136,12 +136,17 @@ class StepRunRequest(BaseModel):
     LocalBackend (which dispatches on step_name and uses internal
     helpers) can be invoked without populating them; SlurmBackend
     requires them and refuses the request when they're absent.
+
+    `work_ticket_idx` flows through so SlurmBackend can stamp the SLURM
+    job name with the originating ticket id — making scheduler dumps
+    cross-referenceable back to the work_ticket row.
     """
 
     step_name: str = Field(min_length=1)
     inputs: dict[str, str] = Field(default_factory=dict)
     workspace: str = Field(min_length=1)
     reference_idx: Annotated[int, Field(gt=0)]
+    work_ticket_idx: Annotated[int, Field(gt=0)]
     container: str | None = Field(default=None, max_length=512)
     entrypoint: str | None = None
     baseline_resources: StepBaselineResources | None = None
@@ -749,8 +754,9 @@ class WorkTicket(BaseModel):
     # retriable failure (PROCESSING → QUEUED transition). When a step
     # raises a retriable BackendFailure and retry_count >= max_retries,
     # the runner transitions the ticket to FAILED with the captured
-    # failure_*. Per-ticket max_retries override at submission is a
-    # future feature; today every ticket inherits the default.
+    # failure_*. Tickets inherit the DB default (3) on submission; the
+    # column is per-row so an admin can bump max_retries on a specific
+    # stuck ticket without redeploying.
     retry_count: Annotated[int, Field(ge=0)] = 0
     max_retries: Annotated[int, Field(ge=0, le=100)] = 3
     # Failure surface. All fields are NULL on non-FAILED tickets and all
