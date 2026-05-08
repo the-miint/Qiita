@@ -549,7 +549,6 @@ A single ticket touches every layer:
 
 The smoke leaves one tagged reference plus a handful of features and
 catalog files per deploy — by design. They are cheap (kilobytes) and
-the audit trail proves which deploys passed smoke. No cleanup needed:
-versioned smoke names keep accumulation harmless until full reference
-deletion (membership rows, exclusive features, catalog files, Parquet)
-is wired.
+the audit trail proves which deploys passed smoke. Versioned smoke
+names mean re-runs don't collide with prior smokes; no per-run
+cleanup is necessary.
