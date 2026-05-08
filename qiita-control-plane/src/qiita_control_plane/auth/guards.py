@@ -234,13 +234,14 @@ async def require_eligible_owner(
     """
     # One round trip; the policy combination is checked here.
     eligibility = await fetch_user_eligibility(pool_or_conn, principal_idx=candidate_idx)
-    if eligibility is None or not (
+    if eligibility is not None and (
         eligibility.is_user
         and not eligibility.disabled
         and not eligibility.retired
         and eligibility.profile_complete
     ):
-        raise HTTPException(status_code=422, detail=detail)
+        return
+    raise HTTPException(status_code=422, detail=detail)
 
 
 async def require_study_exists(
@@ -326,10 +327,11 @@ def require_study_access(
 
         # Tier comparison — public-by-absence when no study_access row.
         effective_tier = row.access_tier if row.access_tier is not None else Tier.PUBLIC
-        if _TIER_ORDER[effective_tier] < _TIER_ORDER[resolved_min_tier]:
-            raise HTTPException(
-                status_code=403,
-                detail=f"requires study access at tier {str(resolved_min_tier)!r} or higher",
-            )
+        if _TIER_ORDER[effective_tier] >= _TIER_ORDER[resolved_min_tier]:
+            return
+        raise HTTPException(
+            status_code=403,
+            detail=f"requires study access at tier {str(resolved_min_tier)!r} or higher",
+        )
 
     return _dep

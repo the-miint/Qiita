@@ -171,7 +171,7 @@ async def import_biosample(
 
 # Hard cap on the bulk-id read. Sized to comfortably cover any single
 # study's biosample roster while bounding per-response payload size.
-_BIOSAMPLE_IDXS_HARD_CAP = 100_000
+_BIOSAMPLE_IDXS_HARD_CAP = 500_000
 
 
 @router.get("/{study_idx}/biosample/list-idxs")
@@ -258,9 +258,10 @@ def _biosample_response_from_row(
 def _etag_for_updated_at(updated_at) -> str:
     """Build the quoted ETag header value from biosample.updated_at.
 
-    Per project conventions the ETag is a quoted ISO 8601 representation of
-    the row's updated_at column; clients treat the value as opaque and never
-    parse it, so the timestamp's exact spelling is not part of the contract.
+    The surrounding double-quotes are required by RFC 7232's entity-tag
+    grammar — the on-the-wire value is `"<iso8601>"`, not `<iso8601>`. The
+    inner ISO 8601 timestamp is opaque to clients; only its byte-for-byte
+    equality with a subsequent If-Match header matters.
     """
     return f'"{updated_at.isoformat()}"'
 
@@ -306,17 +307,18 @@ async def get_biosample_route(
 
     # Role bypass for wet_lab_admin and higher; everyone else must satisfy
     # the owner-or-linked-study-access predicate.
-    if not user.has_role_at_least(_BIOSAMPLE_GET_BYPASS_ROLE):
-        has_access = await fetch_caller_has_biosample_access(
-            pool,
-            principal_idx=user.principal_idx,
-            biosample_idx=biosample_idx,
+    authorized = user.has_role_at_least(
+        _BIOSAMPLE_GET_BYPASS_ROLE
+    ) or await fetch_caller_has_biosample_access(
+        pool,
+        principal_idx=user.principal_idx,
+        biosample_idx=biosample_idx,
+    )
+    if not authorized:
+        raise HTTPException(
+            status_code=403,
+            detail=f"caller has no read path to biosample {biosample_idx}",
         )
-        if not has_access:
-            raise HTTPException(
-                status_code=403,
-                detail=f"caller has no read path to biosample {biosample_idx}",
-            )
 
     # Pull the globally-linked metadata once access has been resolved; the
     # repo function handles the global_field_idx IS NOT NULL filter and the
