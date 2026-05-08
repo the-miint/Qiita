@@ -1,15 +1,22 @@
 # Orchestrator token rotation
 
-**Purpose.** Operator runbook for zero-downtime rotation of the
-orchestrator's service-account token (and any cron job using
-`ControlPlaneClient`, which follows the same path). In-flight requests
-complete with the old token; new requests use the new one. Use this for
-scheduled rotation, suspected compromise, or scope changes.
+> **v1 status: not yet applicable.** The orchestrator does not hold a
+> service-account PAT in v1 — it authenticates to the control plane via
+> the shared bearer at `/etc/qiita/cp-to-co.token` (installed by step 7
+> of [`first-deploy.md`](first-deploy.md)). This runbook describes the
+> *future* rotation procedure for an orchestrator-owned PAT, which becomes
+> relevant once `SlurmBackend` lands and the orchestrator gains CO→CP
+> callbacks. Cron jobs that already use `ControlPlaneClient` with their
+> own service-account PATs do follow this rotation flow today.
 
-For the initial mint of the orchestrator token, see
-[`first-deploy.md`](first-deploy.md). For the conceptual reference
-(token format, audit events, `ControlPlaneClient` resolution order), see
-[`docs/auth.md`](../auth.md).
+**Purpose.** Operator runbook for zero-downtime rotation of a
+service-account token used by `ControlPlaneClient` (cron jobs today;
+orchestrator in the future). In-flight requests complete with the old
+token; new requests use the new one. Use this for scheduled rotation,
+suspected compromise, or scope changes.
+
+For the conceptual reference (token format, audit events,
+`ControlPlaneClient` resolution order), see [`docs/auth.md`](../auth.md).
 
 ## Service accounts vs. tokens
 

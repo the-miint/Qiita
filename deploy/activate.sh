@@ -32,8 +32,12 @@ rsync -a --delete "$INCOMING/qiita-compute-orchestrator/" /opt/qiita/compute-orc
 # Install Rust binary atomically (install(1) does an atomic rename)
 install -m 755 "$INCOMING/qiita-data-plane" /opt/qiita/data-plane/qiita-data-plane
 
-# Install system config
+# Install system config. The nginx conf carries a __QIITA_HOSTNAME__ placeholder
+# that is substituted at deploy time from the QIITA_HOSTNAME env var (e.g.
+# qiita-miint.ucsd.edu) so the same template works across deployments.
+: "${QIITA_HOSTNAME:?QIITA_HOSTNAME must be set (e.g. qiita-miint.ucsd.edu)}"
 sudo cp "$INCOMING/deploy/nginx/qiita.conf" /etc/nginx/conf.d/qiita.conf
+sudo sed -i "s/__QIITA_HOSTNAME__/${QIITA_HOSTNAME}/g" /etc/nginx/conf.d/qiita.conf
 sudo cp "$INCOMING/deploy/systemd/"*.service /etc/systemd/system/
 sudo systemctl daemon-reload
 

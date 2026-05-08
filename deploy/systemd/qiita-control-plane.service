@@ -4,7 +4,7 @@ After=network.target postgresql.service
 
 [Service]
 Type=simple
-User=qiita
+User=qiita-api
 ExecStart=/opt/qiita/control-plane/.venv/bin/uvicorn \
     qiita_control_plane.main:app \
     --host 127.0.0.1 \
