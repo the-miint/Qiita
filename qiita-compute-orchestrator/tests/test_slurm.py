@@ -210,7 +210,10 @@ def test_payload_log_paths_round_trip(common_kwargs):
 def _make_output(tmp_path: Path, files: dict[str, bytes], manifest: dict | None) -> Path:
     """Build an output dir with the given file contents and manifest.
     Sets every file mode to 0o440 by default — tests that want a
-    different mode override afterwards."""
+    different mode override afterwards. The manifest gets a default
+    `outputs: {}` if not provided so well-formed-shape tests don't have
+    to repeat it; tests exercising the `outputs` contract pass it
+    explicitly."""
     out = tmp_path / "out"
     out.mkdir()
     for relative, content in files.items():
@@ -219,6 +222,8 @@ def _make_output(tmp_path: Path, files: dict[str, bytes], manifest: dict | None)
         full.write_bytes(content)
         full.chmod(0o440)
     if manifest is not None:
+        if "outputs" not in manifest:
+            manifest = {**manifest, "outputs": {}}
         manifest_path = out / "manifest.json"
         manifest_path.write_text(json.dumps(manifest))
         manifest_path.chmod(0o440)
@@ -334,7 +339,12 @@ def test_verify_path_traversal_rejected(tmp_path):
     # missing-file).
     (tmp_path / "escape").write_bytes(b"x")
     (out / "manifest.json").write_text(
-        json.dumps({"files": [{"path": "../escape", "size_bytes": 1}]})
+        json.dumps(
+            {
+                "files": [{"path": "../escape", "size_bytes": 1}],
+                "outputs": {},
+            }
+        )
     )
     (out / "manifest.json").chmod(0o440)
     failures = verify_container_output(out)
@@ -370,3 +380,106 @@ def test_verification_failure_is_frozen():
     f = VerificationFailure(reason="x", detail="y")
     with pytest.raises(Exception):  # noqa: BLE001 — FrozenInstanceError
         f.reason = "z"  # type: ignore[misc]
+
+
+# ============================================================================
+# manifest.json `outputs` contract
+# ============================================================================
+
+
+def test_verify_outputs_missing_is_a_failure(tmp_path):
+    """No `outputs` key in manifest.json => fail-fast contract violation."""
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "manifest.json").write_text(json.dumps({"files": []}))
+    (out / "manifest.json").chmod(0o440)
+    failures = verify_container_output(out)
+    assert any("outputs`" in f.reason for f in failures)
+
+
+def test_verify_outputs_must_be_object(tmp_path):
+    out = _make_output(
+        tmp_path,
+        {},
+        manifest={"files": [], "outputs": [1, 2, 3]},  # array, not object
+    )
+    failures = verify_container_output(out)
+    assert any("outputs` must be an object" in f.reason for f in failures)
+
+
+def test_verify_outputs_value_must_be_string(tmp_path):
+    out = _make_output(
+        tmp_path,
+        {"hash.parquet": b"abc"},
+        manifest={
+            "files": [{"path": "hash.parquet", "size_bytes": 3}],
+            "outputs": {"manifest": 12345},  # int instead of string
+        },
+    )
+    failures = verify_container_output(out)
+    assert any("must be a string path" in f.reason for f in failures)
+
+
+def test_verify_outputs_path_traversal_rejected(tmp_path):
+    out = _make_output(
+        tmp_path,
+        {},
+        manifest={"files": [], "outputs": {"manifest": "../escape"}},
+    )
+    failures = verify_container_output(out)
+    assert any("outputs.manifest` escapes" in f.reason for f in failures), [
+        f.reason for f in failures
+    ]
+
+
+def test_verify_outputs_must_point_at_existing_path(tmp_path):
+    out = _make_output(
+        tmp_path,
+        {},
+        manifest={"files": [], "outputs": {"manifest": "missing.parquet"}},
+    )
+    failures = verify_container_output(out)
+    assert any("points at missing path" in f.reason for f in failures)
+
+
+def test_verify_outputs_dot_means_output_dir(tmp_path):
+    """A step whose output IS the directory uses `.` for the path."""
+    out = _make_output(
+        tmp_path,
+        {},
+        manifest={"files": [], "outputs": {"staging_dir": "."}},
+    )
+    assert verify_container_output(out) == []
+
+
+# ============================================================================
+# parse_outputs_map
+# ============================================================================
+
+
+def test_parse_outputs_map_resolves_paths(tmp_path):
+    from qiita_compute_orchestrator.slurm import parse_outputs_map
+
+    out = _make_output(
+        tmp_path,
+        {"manifest.parquet": b"abc"},
+        manifest={
+            "files": [{"path": "manifest.parquet", "size_bytes": 3}],
+            "outputs": {"manifest": "manifest.parquet"},
+        },
+    )
+    outputs = parse_outputs_map(out)
+    assert set(outputs.keys()) == {"manifest"}
+    assert outputs["manifest"] == (out / "manifest.parquet").resolve()
+
+
+def test_parse_outputs_map_dot_resolves_to_output_dir(tmp_path):
+    from qiita_compute_orchestrator.slurm import parse_outputs_map
+
+    out = _make_output(
+        tmp_path,
+        {},
+        manifest={"files": [], "outputs": {"staging_dir": "."}},
+    )
+    outputs = parse_outputs_map(out)
+    assert outputs["staging_dir"] == out.resolve()

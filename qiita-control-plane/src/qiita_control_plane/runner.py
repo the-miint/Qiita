@@ -527,11 +527,25 @@ async def _dispatch_step(
             f"backend step {entry.name!r} requires a reference scope_target; "
             f"got kind={scope_target['kind']!r}"
         )
+    # Forward static step metadata so the orchestrator's backend can run
+    # the right container with the right resource ask. SlurmBackend
+    # requires these; LocalBackend ignores them.
+    from qiita_common.models import StepBaselineResources
+
+    baseline = StepBaselineResources(
+        cpu=entry.baseline_resources.cpu,
+        mem_gb=entry.baseline_resources.mem_gb,
+        walltime_seconds=int(entry.baseline_resources.walltime.total_seconds()),
+        gpu=entry.baseline_resources.gpu,
+    )
     raw_outputs = await backend_client.run_step(
         step_name=entry.name,
         inputs=inputs,
         workspace=workspace,
         reference_idx=scope_target["reference_idx"],
+        container=entry.container,
+        entrypoint=entry.entrypoint,
+        baseline_resources=baseline,
     )
     # Convention: the orchestrator's output dict keys match the YAML's
     # `outputs:` names exactly. A mismatch is a workflow authoring

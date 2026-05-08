@@ -54,6 +54,9 @@ async def run_step(
             {k: Path(v) for k, v in body.inputs.items()},
             Path(body.workspace),
             reference_idx=body.reference_idx,
+            container=body.container,
+            entrypoint=body.entrypoint,
+            baseline_resources=body.baseline_resources,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

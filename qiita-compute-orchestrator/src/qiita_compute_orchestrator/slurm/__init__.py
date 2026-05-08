@@ -24,7 +24,7 @@ from .client import (
     SlurmrestdError,
 )
 from .payload import build_job_submit_payload
-from .verify import VerificationFailure, verify_container_output
+from .verify import VerificationFailure, parse_outputs_map, verify_container_output
 
 __all__ = [
     "DEFAULT_SLURMRESTD_API_VERSION",
@@ -34,5 +34,6 @@ __all__ = [
     "SlurmrestdError",
     "VerificationFailure",
     "build_job_submit_payload",
+    "parse_outputs_map",
     "verify_container_output",
 ]

@@ -27,8 +27,24 @@ class _RecordingBackend(ComputeBackend):
         workspace: Path,
         *,
         reference_idx: int,
+        container: str | None = None,
+        entrypoint: str | None = None,
+        baseline_resources=None,
     ) -> dict[str, Path]:
-        self.calls.append((name, dict(inputs), workspace, reference_idx))
+        # Existing tests don't exercise the new fields; they get
+        # captured into the calls log as a tuple suffix so future tests
+        # that DO exercise them can assert on the values.
+        self.calls.append(
+            (
+                name,
+                dict(inputs),
+                workspace,
+                reference_idx,
+                container,
+                entrypoint,
+                baseline_resources,
+            )
+        )
         return {"manifest": workspace / "manifest.parquet"}
 
 
@@ -92,11 +108,15 @@ def test_step_run_dispatches_to_backend(http_client, cp_to_co_token, tmp_path):
     assert body["outputs"]["manifest"].endswith("manifest.parquet")
 
     assert len(backend.calls) == 1
-    name, inputs, workspace, reference_idx = backend.calls[0]
+    name, inputs, workspace, reference_idx, container, entrypoint, baseline = backend.calls[0]
     assert name == "hash"
     assert inputs == {"fasta_path": fasta}
     assert workspace == tmp_path
     assert reference_idx == 7
+    # Old call sites omit container metadata; protocol defaults to None.
+    assert container is None
+    assert entrypoint is None
+    assert baseline is None
 
 
 def test_step_run_translates_backend_value_error(http_client, cp_to_co_token, tmp_path):

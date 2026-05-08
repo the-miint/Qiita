@@ -4,9 +4,16 @@ Per docs/architecture.md "Container contract", every workflow container
 must produce on success:
 
   1. exit code 0 (caller's responsibility — checked before this runs).
-  2. `$QIITA_OUTPUT_PATH/manifest.json` listing every output file with
-     its size in bytes:
-         {"files": [{"path": "output.parquet", "size_bytes": 12345}, ...]}
+  2. `$QIITA_OUTPUT_PATH/manifest.json`:
+         {
+           "files": [{"path": "output.parquet", "size_bytes": 12345}, ...],
+           "outputs": {"manifest": "output.parquet", ...}
+         }
+     `files` lists every output file with its size in bytes.
+     `outputs` maps the YAML step's declared `outputs:` names to
+     relative paths under $QIITA_OUTPUT_PATH (use "." for the
+     directory itself when an output IS the directory, e.g. a step
+     whose YAML output is `staging_dir`).
   3. Every listed file exists with the declared size_bytes.
   4. All files under `$QIITA_OUTPUT_PATH` are mode `0o440`
      (owner-and-group read-only).
@@ -126,6 +133,50 @@ def verify_container_output(output_path: Path) -> list[VerificationFailure]:
                 detail=f"got {type(files).__name__}",
             )
         ]
+    outputs = manifest_data.get("outputs")
+    if not isinstance(outputs, dict):
+        return [
+            VerificationFailure(
+                reason="manifest.json `outputs` must be an object {output_name: relative path}",
+                detail=f"got {type(outputs).__name__}",
+            )
+        ]
+    for name, value in outputs.items():
+        if not isinstance(name, str) or not name:
+            failures.append(
+                VerificationFailure(
+                    reason="manifest.json `outputs` has an empty or non-string key",
+                    detail=repr(name),
+                )
+            )
+            continue
+        if not isinstance(value, str):
+            failures.append(
+                VerificationFailure(
+                    reason=f"manifest.json `outputs.{name}` must be a string path",
+                    detail=f"got {type(value).__name__}",
+                )
+            )
+            continue
+        # Resolve relative to output_path; reject path traversal.
+        full = (output_path / value).resolve()
+        try:
+            full.relative_to(output_path.resolve())
+        except ValueError:
+            failures.append(
+                VerificationFailure(
+                    reason=f"manifest.json `outputs.{name}` escapes $QIITA_OUTPUT_PATH",
+                    detail=value,
+                )
+            )
+            continue
+        if not full.exists():
+            failures.append(
+                VerificationFailure(
+                    reason=f"manifest.json `outputs.{name}` points at missing path",
+                    detail=value,
+                )
+            )
 
     # Gate 3: every listed file exists with declared size.
     for i, entry in enumerate(files):
@@ -217,3 +268,17 @@ def verify_container_output(output_path: Path) -> list[VerificationFailure]:
             )
 
     return failures
+
+
+def parse_outputs_map(output_path: Path) -> dict[str, Path]:
+    """Read the `outputs` map from `output_path/manifest.json` and
+    return it as `{output_name: absolute_path}`. Caller must have run
+    `verify_container_output` first and confirmed an empty failure
+    list — this helper assumes the contract holds.
+
+    Raises FileNotFoundError if manifest.json is missing or unreadable.
+    Caller is the orchestrator's run_step, which catches and wraps as
+    CONTRACT_VIOLATION (the verifier should already have caught this,
+    but defense in depth)."""
+    manifest = json.loads((output_path / "manifest.json").read_text())
+    return {name: (output_path / value).resolve() for name, value in manifest["outputs"].items()}

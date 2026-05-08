@@ -112,6 +112,17 @@ class FeatureHashEntry(BaseModel):
         return self
 
 
+class StepBaselineResources(BaseModel):
+    """Resource ask for one workflow step. Mirrors qiita_common.actions.
+    BaselineResources but lives here so the over-the-wire StepRunRequest
+    can include it without a circular import (actions.py imports models)."""
+
+    cpu: Annotated[int, Field(gt=0)]
+    mem_gb: Annotated[int, Field(gt=0)]
+    walltime_seconds: Annotated[int, Field(gt=0)]
+    gpu: Annotated[int, Field(ge=0)] = 0
+
+
 class StepRunRequest(BaseModel):
     """Body for POST /api/v1/step/run on the orchestrator.
 
@@ -119,12 +130,21 @@ class StepRunRequest(BaseModel):
     The orchestrator dispatches to its configured ComputeBackend's
     `run_step`. Paths are absolute and live on the workspace shared
     between control plane and orchestrator.
+
+    `container`, `entrypoint`, and `baseline_resources` come from the
+    YAML step's static metadata. They are optional on the wire so
+    LocalBackend (which dispatches on step_name and uses internal
+    helpers) can be invoked without populating them; SlurmBackend
+    requires them and refuses the request when they're absent.
     """
 
     step_name: str = Field(min_length=1)
     inputs: dict[str, str] = Field(default_factory=dict)
     workspace: str = Field(min_length=1)
     reference_idx: Annotated[int, Field(gt=0)]
+    container: str | None = Field(default=None, max_length=512)
+    entrypoint: str | None = None
+    baseline_resources: StepBaselineResources | None = None
 
 
 class StepRunResponse(BaseModel):

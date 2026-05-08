@@ -71,6 +71,9 @@ class LocalBackend(ComputeBackend):
         workspace: Path,
         *,
         reference_idx: int,
+        container: str | None = None,
+        entrypoint: str | None = None,
+        baseline_resources=None,  # noqa: ARG002 — accepted for protocol parity
     ) -> dict[str, Path]:
         """Public backend interface. Translates known internal exceptions
         into typed `BackendFailure` so the runner can classify retriable
