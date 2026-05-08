@@ -49,6 +49,7 @@ from qiita_common.models import (
     WorkTicketState,
 )
 
+from ..actions.context_validator import validate_context
 from ..auth.principal import HumanUser, Principal, ServiceAccount, get_current_principal
 from ..deps import get_db_pool
 from ..dispatch import schedule_dispatch
@@ -76,7 +77,7 @@ async def _fetch_action_for_submission(
     """Read just the columns the submission gate needs. Returns None if
     the action does not exist or is disabled."""
     row = await pool.fetchrow(
-        "SELECT target_kind, scopes, audience"
+        "SELECT target_kind, scopes, audience, context_schema"
         " FROM qiita.action"
         " WHERE action_id = $1 AND version = $2 AND enabled = true",
         action_id,
@@ -87,8 +88,10 @@ async def _fetch_action_for_submission(
     return {
         "target_kind": row["target_kind"],
         "scopes": list(row["scopes"]),
-        # `audience` is JSONB; asyncpg returns a string by default.
+        # `audience` and `context_schema` are JSONB; asyncpg returns each
+        # as a string by default.
         "audience": json.loads(row["audience"]),
+        "context_schema": json.loads(row["context_schema"]),
     }
 
 
@@ -244,6 +247,16 @@ async def submit_work_ticket(
                 "reason": "scope_target.kind does not match action.target_kind",
                 "scope_target_kind": scope_target["kind"],
                 "action_target_kind": action["target_kind"],
+            },
+        )
+
+    context_errors = validate_context(action["context_schema"], body.action_context)
+    if context_errors:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "reason": "action_context does not match action.context_schema",
+                "errors": context_errors,
             },
         )
 

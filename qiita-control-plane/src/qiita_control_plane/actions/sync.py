@@ -14,6 +14,8 @@ import json
 import asyncpg
 from qiita_common.actions import ActionDefinition
 
+from .context_validator import check_schema
+
 # `xmax = 0 AS inserted` is the canonical PostgreSQL upsert-discrimination
 # trick: a freshly-inserted row has xmax=0 (no deletion txn), an
 # UPDATE-on-conflict row gets xmax set to the current txn id. Lets us
@@ -63,6 +65,12 @@ async def sync_actions(
     updated = 0
     async with conn.transaction():
         for a in actions:
+            # Refuse to persist a malformed schema. Letting it through
+            # would surface as a runtime 500 on the first submission;
+            # catching it here makes it a deploy-time error the operator
+            # sees while syncing YAML.
+            check_schema(a.context_schema)
+
             audience_json = json.dumps(a.audience.model_dump(mode="json"))
             context_schema_json = json.dumps(a.context_schema)
             steps_json = json.dumps([s.model_dump(mode="json") for s in a.steps])

@@ -12,6 +12,7 @@ dependencies = [
     "httpx>=0.28",
     "pyyaml>=6",
     "duckdb>=1.5",
+    "jsonschema>=4.20",
 ]
 
 [project.scripts]

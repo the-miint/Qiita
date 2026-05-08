@@ -206,10 +206,12 @@ _TEST_STEPS = [
 ]
 
 
-@pytest.fixture
-async def reference_action(postgres_pool):
-    """An enabled, reference-targeting action requiring system_admin and
-    reference:write — matches the admin_token fixture's grant."""
+async def _seed_action(
+    postgres_pool, *, context_schema: dict
+) -> tuple[str, str]:
+    """Insert an enabled, reference-targeting action with the given
+    context_schema. Returns (action_id, version). Caller is responsible
+    for cleanup — fixtures wrap this with teardown."""
     action_id = "wt-test-action"
     version = f"v-{uuid.uuid4()}"
     await postgres_pool.execute(
@@ -224,14 +226,16 @@ async def reference_action(postgres_pool):
         version,
         [Scope.REFERENCE_WRITE.value],
         json.dumps({"service": False, "human_roles": [SystemRole.SYSTEM_ADMIN.value]}),
-        json.dumps({}),
+        json.dumps(context_schema),
         json.dumps(_TEST_STEPS),
         "active",
         "failed",
     )
-    yield action_id, version
-    # work_ticket has FK RESTRICT on (action_id, action_version) — drop
-    # dependents first.
+    return action_id, version
+
+
+async def _drop_action(postgres_pool, action_id: str, version: str) -> None:
+    """Delete dependent work_tickets first (FK RESTRICT), then the action."""
     await postgres_pool.execute(
         "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
         action_id,
@@ -242,6 +246,30 @@ async def reference_action(postgres_pool):
         action_id,
         version,
     )
+
+
+@pytest.fixture
+async def reference_action(postgres_pool):
+    """An enabled, reference-targeting action requiring system_admin and
+    reference:write, with an empty context_schema (accepts any object)
+    — matches the admin_token fixture's grant."""
+    action_id, version = await _seed_action(postgres_pool, context_schema={})
+    yield action_id, version
+    await _drop_action(postgres_pool, action_id, version)
+
+
+@pytest.fixture
+async def reference_action_with_schema(postgres_pool):
+    """Same shape as `reference_action` but the context_schema requires a
+    `sample_count: integer` — drives the 422-on-invalid-context tests."""
+    schema = {
+        "type": "object",
+        "properties": {"sample_count": {"type": "integer"}},
+        "required": ["sample_count"],
+    }
+    action_id, version = await _seed_action(postgres_pool, context_schema=schema)
+    yield action_id, version
+    await _drop_action(postgres_pool, action_id, version)
 
 
 # Helper: the standard request body shape.
@@ -353,6 +381,82 @@ async def test_submit_in_flight_blocks_with_409(
     assert second.status_code == 409
     detail = second.json()["detail"]
     assert detail["blocking_work_ticket_idx"] == first_idx
+
+
+async def test_submit_valid_context_against_schema(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    reference_action_with_schema,
+    reference_idx,
+):
+    """Submission whose action_context satisfies the action's
+    context_schema lands in PENDING (no 422)."""
+    token, _ = admin_token
+    action_id, version = reference_action_with_schema
+    body = _body(
+        action_id, version, reference_idx, action_context={"sample_count": 12}
+    )
+    resp = await wt_client.post(
+        "/api/v1/work-ticket",
+        json=body,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
+
+
+async def test_submit_invalid_context_returns_422_with_errors_list(
+    wt_client, admin_token, reference_action_with_schema, reference_idx
+):
+    """Submission whose action_context fails the schema returns 422
+    with a structured `errors` list — every violation reported, not
+    just the first."""
+    token, _ = admin_token
+    action_id, version = reference_action_with_schema
+    # `sample_count` is required and must be an integer; provide neither.
+    body = _body(
+        action_id, version, reference_idx, action_context={"unrelated": "value"}
+    )
+    resp = await wt_client.post(
+        "/api/v1/work-ticket",
+        json=body,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "action_context does not match action.context_schema"
+    assert isinstance(detail["errors"], list)
+    assert len(detail["errors"]) >= 1
+    # Each error has the documented shape.
+    err = detail["errors"][0]
+    assert "path" in err
+    assert "message" in err
+    assert "schema_path" in err
+
+
+async def test_submit_invalid_context_type_returns_422(
+    wt_client, admin_token, reference_action_with_schema, reference_idx
+):
+    """`sample_count: "twelve"` (string instead of integer) → 422 with a
+    type-mismatch error pointing at /sample_count."""
+    token, _ = admin_token
+    action_id, version = reference_action_with_schema
+    body = _body(
+        action_id,
+        version,
+        reference_idx,
+        action_context={"sample_count": "twelve"},
+    )
+    resp = await wt_client.post(
+        "/api/v1/work-ticket",
+        json=body,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422
+    errs = resp.json()["detail"]["errors"]
+    paths = {e["path"] for e in errs}
+    assert "/sample_count" in paths
 
 
 async def test_submit_503_when_compute_backend_unconfigured(
