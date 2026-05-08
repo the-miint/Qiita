@@ -3,6 +3,7 @@
 import base64
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from qiita_common.config import require_env
 
@@ -21,11 +22,20 @@ _DEFAULT_AUTH_HANDOFF_FRESHNESS_SECONDS = 60
 _DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS = 30
 
 
+_DEFAULT_CP_TO_CO_TOKEN_PATH = Path("/etc/qiita/cp-to-co.token")
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     database_url: str
     hmac_secret_key: bytes
     data_plane_url: str
+    # Compute-orchestrator dispatch. Both fields optional: when
+    # `compute_orchestrator_url` is None, the CP boots without an HTTP client
+    # and any work-ticket dispatch route returns 503 — useful for tests and
+    # for environments without an orchestrator (e.g. CP-only smoke).
+    compute_orchestrator_url: str | None = None
+    cp_to_co_token_path: Path = _DEFAULT_CP_TO_CO_TOKEN_PATH
     # AuthRocket fields. Optional in Settings — required only at
     # AuthRocketVerifier construction time, which is wired into lifespan.
     # Letting them default to None here keeps tests that don't exercise
@@ -68,10 +78,17 @@ class Settings:
         if not jwks_url and issuer:
             jwks_url = f"{issuer.rstrip('/')}/connect/jwks"
 
+        compute_orchestrator_url = os.environ.get("COMPUTE_ORCHESTRATOR_URL") or None
+        cp_to_co_token_path = Path(
+            os.environ.get("CP_TO_CO_TOKEN_PATH", str(_DEFAULT_CP_TO_CO_TOKEN_PATH))
+        )
+
         return cls(
             database_url=require_env("DATABASE_URL"),
             hmac_secret_key=secret,
             data_plane_url=os.environ.get("DATA_PLANE_URL", "grpc://localhost:50051"),
+            compute_orchestrator_url=compute_orchestrator_url,
+            cp_to_co_token_path=cp_to_co_token_path,
             authrocket_issuer=issuer,
             authrocket_audience=os.environ.get("AUTHROCKET_AUDIENCE") or None,
             authrocket_jwks_url=jwks_url,

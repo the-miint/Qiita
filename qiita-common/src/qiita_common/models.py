@@ -478,3 +478,26 @@ class WorkTicket(BaseModel):
     state: WorkTicketState
     created_at: AwareDatetime
     updated_at: AwareDatetime
+
+
+class WorkTicketCreateRequest(BaseModel):
+    """Body for `POST /api/v1/work-ticket`.
+
+    `originator_principal_idx` is set server-side from the authenticated
+    caller — clients cannot submit on behalf of another principal."""
+
+    action_id: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
+    action_version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
+    scope_target: ScopeTarget
+    action_context: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkTicketResponse(BaseModel):
+    """Returned by `POST /api/v1/work-ticket` (with HTTP 202) and by
+    `POST /api/v1/work-ticket/{idx}/run`. Carries the ticket id and its
+    *post-call* state — typically PENDING for a freshly-created ticket
+    or after a FAILED→PENDING reset, but check the field for what the
+    server saw rather than assuming."""
+
+    work_ticket_idx: Annotated[int, Field(gt=0)]
+    state: WorkTicketState
