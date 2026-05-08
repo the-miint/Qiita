@@ -21,6 +21,7 @@ from ..auth.guards import (
     require_eligible_owner,
     require_scope,
     require_study_access,
+    require_study_exists,
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import get_db_pool
@@ -157,6 +158,7 @@ async def get_study_route(
     study_idx: Annotated[int, Field(gt=0)],
     pool: asyncpg.Pool = Depends(get_db_pool),
     _scope: Principal = Depends(require_scope(Scope.STUDY_READ)),
+    _exists: None = Depends(require_study_exists),
     _access: None = Depends(require_study_access(bypass_role=SystemRole.WET_LAB_ADMIN)),
 ) -> StudyResponse:
     """Return the qiita.study row for the path's idx as a StudyResponse.
@@ -164,9 +166,12 @@ async def get_study_route(
     Access policy: any wet_lab_admin or higher passes; otherwise the
     caller's effective tier on this study (public-by-absence when no
     qiita.study_access row) must be at or above the study's
-    `default_tier`. The require_study_access guard enforces both halves
-    and emits the 401 / 403 / 404 responses; this handler only runs
-    once access is granted.
+    `default_tier`. require_study_exists composes alongside
+    require_study_access so admin-bypass callers still get 404 on a
+    non-existent study_idx (the access guard's bypass path returns
+    without any DB lookup, so it cannot surface that 404 on its own);
+    the access guard then emits the 401 / 403 responses for callers
+    that fail the tier policy.
     """
     # The guard chain has already validated existence + access; the
     # fetch is therefore expected to find the row, but a None defends

@@ -268,9 +268,14 @@ def require_study_access(
     of access to the path's `study_idx`.
 
     Behavior, in order: 401 on Anonymous; role-bypass for callers at or
-    above `bypass_role` (skips the DB lookup); 404 if the study does
-    not exist; owner bypass (caller is the study's owner); 403 if the
-    caller's effective tier is below the resolved minimum tier.
+    above `bypass_role` (returns without any DB lookup — the bypass
+    path runs neither the existence check nor the tier comparison);
+    otherwise 404 if the study does not exist, owner bypass (caller is
+    the study's owner), or 403 if the caller's effective tier is below
+    the resolved minimum tier. Routes that must surface 404 on a
+    missing study for bypass-role callers should compose
+    `require_study_exists` alongside this guard (see
+    `list_biosample_idxs_in_study` and `get_study_route`).
 
     `min_tier=None` resolves the minimum to the study's own
     `default_tier` at request time (per-study policy). Pass an

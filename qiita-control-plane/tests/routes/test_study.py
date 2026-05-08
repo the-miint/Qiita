@@ -481,14 +481,12 @@ async def test_get_study_user_without_study_read_scope_403(ctx, no_study_read_cl
 
 
 async def test_get_study_nonexistent_404(ctx):
-    """An idx past the highest existing study yields 404 from the access
-    guard's existence check (the wet_lab_admin caller would otherwise
-    bypass the tier check, so this confirms the existence path runs)."""
+    """An idx past the highest existing study yields 404 for a
+    wet_lab_admin caller. The require_study_access bypass path returns
+    without a DB lookup, so this 404 is sourced from the
+    require_study_exists guard composed alongside it."""
     max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
     resp = await ctx["wet"].get(f"/api/v1/study/{max_idx + 100_000}")
-    # bypass_role=WET_LAB_ADMIN short-circuits before the existence
-    # fetch, so wet_lab_admin sees 404 only via the inner fetch_study
-    # in the handler, not the guard.
     assert resp.status_code == 404
 
 
