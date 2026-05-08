@@ -14,9 +14,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Configuration error: {e}");
         e
     })?;
-    if cfg.jwks_url.is_none() {
-        eprintln!("Warning: JWKS_URL not set — JWT verification is not active");
-    }
 
     // Ensure DuckLake tables exist (one-time setup connection)
     let setup_conn = Connection::open_in_memory()?;

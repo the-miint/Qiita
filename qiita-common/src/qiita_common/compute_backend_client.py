@@ -1,9 +1,12 @@
 """HTTP client used by the control-plane runner to dispatch a workflow
 `step:` entry to the orchestrator's ComputeBackend.
 
-Auth is a shared bearer token configured on both ends (env var
-`QIITA_CP_TO_CO_TOKEN` in production). This is a private path between two
-services on the same network — full PAT/JWT machinery is overkill.
+Auth is a shared bearer token configured on both ends. The orchestrator
+reads it from `/etc/qiita/cp-to-co.token` (default; override with
+`CP_TO_CO_TOKEN_PATH`); the control plane reads from the path in
+`Settings.cp_to_co_token_path` (same default). This is a private path
+between two services on the same network — full PAT/JWT machinery is
+overkill.
 
 Synchronous in v1: the request blocks for the duration of the backend
 step. LocalBackend completes in milliseconds; SlurmBackend will need an

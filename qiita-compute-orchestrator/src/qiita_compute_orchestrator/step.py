@@ -4,9 +4,11 @@ Issued by the control-plane runner for every workflow `step:` entry.
 Dispatches synchronously to the configured ComputeBackend and returns
 the backend's named output paths.
 
-Auth is a shared bearer token (`QIITA_CP_TO_CO_TOKEN` / file at
-`/etc/qiita/cp-to-co.token`) — a private path between two services on
-the same network. Constant-time compare.
+Auth is a shared bearer token loaded by `config.py` from
+`/etc/qiita/cp-to-co.token` (path overridable via `CP_TO_CO_TOKEN_PATH`;
+or, for dev/CI only, value via `CP_TO_CO_TOKEN` when
+`QIITA_ALLOW_TOKEN_ENV=true`). Private path between two services on the
+same network. Constant-time compare.
 """
 
 from __future__ import annotations
