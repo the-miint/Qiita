@@ -124,7 +124,7 @@ async def update_biosample(
     biosample_idx: int,
     *,
     fields: dict[str, object],
-) -> asyncpg.Record:
+) -> asyncpg.Record | None:
     """Update the named columns on the biosample row, return the post-UPDATE row.
 
     `fields` maps column name -> new value; only the listed keys are
@@ -132,13 +132,18 @@ async def update_biosample(
     and an empty dict raise ValueError so that misuse fails at the
     repo boundary rather than reaching SQL. Returns the same column
     set as fetch_biosample (so the caller does not need a follow-up
-    SELECT) using a single UPDATE ... RETURNING. Raises
-    asyncpg.UniqueViolationError on accession collisions and
-    asyncpg.ForeignKeyViolationError on a bad metadata_checklist_idx
-    or owner_idx; the role-typed FK trigger on owner_idx surfaces as
-    asyncpg.RaiseError when the candidate is non-user. The schema
-    trigger biosample_set_updated_at refreshes updated_at; this
-    function does not write it explicitly.
+    SELECT) using a single UPDATE ... RETURNING. Returns None when no
+    row matches `biosample_idx` — the caller's preflight SELECT
+    typically rules this out, but READ COMMITTED snapshots are
+    per-statement so a row visible to the preflight can be deleted by
+    another committed transaction before this UPDATE runs; routes must
+    translate the None to a 404 (or equivalent) rather than indexing
+    into the result. Raises asyncpg.UniqueViolationError on accession
+    collisions and asyncpg.ForeignKeyViolationError on a bad
+    metadata_checklist_idx or owner_idx; the role-typed FK trigger on
+    owner_idx surfaces as asyncpg.RaiseError when the candidate is
+    non-user. The schema trigger biosample_set_updated_at refreshes
+    updated_at; this function does not write it explicitly.
     """
     # Reject misuse at the repo boundary so the SQL builder never sees
     # an empty SET clause or an unknown column name.

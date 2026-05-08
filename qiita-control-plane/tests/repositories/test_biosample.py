@@ -1187,6 +1187,25 @@ async def test_update_biosample_unknown_key_raises_value_error(ctx):
             await update_biosample(conn, bs_idx, fields={"retired": True})
 
 
+async def test_update_biosample_missing_row_returns_none(ctx):
+    # An idx past the highest existing biosample matches zero rows;
+    # UPDATE ... RETURNING then yields no row and fetchrow returns None.
+    # Pins the contract that callers (the PATCH route) must surface this
+    # as 404 rather than dereferencing a None Record. The route's
+    # static missing-row case is caught earlier by the preflight; this
+    # function only sees None when the row is deleted between preflight
+    # and UPDATE (READ COMMITTED snapshots are per-statement).
+    missing_idx = (
+        await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.biosample")
+    ) + 100_000
+
+    async with ctx["pool"].acquire() as conn:
+        result = await update_biosample(
+            conn, missing_idx, fields={"submission_error": "should not land"}
+        )
+    assert result is None
+
+
 async def test_update_biosample_bad_metadata_checklist_idx_raises_fk_error(ctx):
     # FK violation on metadata_checklist_idx surfaces as
     # asyncpg.ForeignKeyViolationError; the route maps this to 422.

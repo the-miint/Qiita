@@ -381,11 +381,15 @@ async def patch_biosample_route(
     existence (404), retirement (409), and ETag match (412); validates
     the candidate owner via require_eligible_owner when owner_idx is
     in the body (422 on ineligibility); applies the UPDATE; re-reads
-    global metadata for the response. Uniqueness violations on
-    biosample_accession / ena_sample_accession map to 409, FK
-    violations on metadata_checklist_idx to 422, and the role-typed
-    FK trigger on owner_idx (a backstop the preflight should preempt
-    in practice) to the same eligibility-422.
+    global metadata for the response. The UPDATE is also checked for a
+    None return — the row can vanish between the preflight and the
+    UPDATE under READ COMMITTED isolation if a concurrent transaction
+    commits a delete in that window — and surfaces as the same 404 the
+    preflight emits. Uniqueness violations on biosample_accession /
+    ena_sample_accession map to 409, FK violations on
+    metadata_checklist_idx to 422, and the role-typed FK trigger on
+    owner_idx (a backstop the preflight should preempt in practice) to
+    the same eligibility-422.
 
     The response carries an `ETag` header derived from the new row's
     `updated_at` column; format mirrors the GET endpoint's contract
@@ -429,6 +433,15 @@ async def patch_biosample_route(
                 # row in the same shape fetch_biosample selects, so no
                 # follow-up SELECT is needed.
                 updated_row = await update_biosample(conn, biosample_idx, fields=fields)
+
+                # The repo returns None when the row vanished between the
+                # preflight SELECT and this UPDATE; surface that as the
+                # same 404 the preflight emits for the static missing-row
+                # case.
+                if updated_row is None:
+                    raise HTTPException(
+                        status_code=404, detail=f"biosample {biosample_idx} not found"
+                    )
 
                 # Re-read global metadata in the same transaction so the
                 # response and the UPDATE see one consistent snapshot.
