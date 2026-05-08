@@ -28,6 +28,10 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.SELF_PROFILE,
             Scope.SELF_TOKEN,
             Scope.REFERENCE_READ,
+            Scope.BIOSAMPLE_READ,
+            Scope.BIOSAMPLE_WRITE,
+            Scope.STUDY_READ,
+            Scope.STUDY_WRITE,
         }
     ),
     SystemRole.WET_LAB_ADMIN: frozenset(
@@ -36,6 +40,10 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.SELF_TOKEN,
             Scope.REFERENCE_READ,
             Scope.REFERENCE_WRITE,
+            Scope.BIOSAMPLE_READ,
+            Scope.BIOSAMPLE_WRITE,
+            Scope.STUDY_READ,
+            Scope.STUDY_WRITE,
         }
     ),
     SystemRole.SYSTEM_ADMIN: frozenset(
@@ -44,6 +52,10 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.SELF_TOKEN,
             Scope.REFERENCE_READ,
             Scope.REFERENCE_WRITE,
+            Scope.BIOSAMPLE_READ,
+            Scope.BIOSAMPLE_WRITE,
+            Scope.STUDY_READ,
+            Scope.STUDY_WRITE,
             Scope.ADMIN_USER,
             Scope.ADMIN_SERVICE_ACCOUNT,
             Scope.ADMIN_AUDIT_READ,

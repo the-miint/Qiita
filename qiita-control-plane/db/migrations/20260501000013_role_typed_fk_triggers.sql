@@ -65,6 +65,10 @@ BEGIN
     PERFORM pg_advisory_xact_lock(new_value);
 
     IF NOT EXISTS (SELECT 1 FROM qiita.user WHERE principal_idx = new_value) THEN
+        -- The substring 'user-kind principal' is matched by the route layer
+        -- (qiita_control_plane.routes.biosample._OWNER_TRIGGER_RAISE_MARKER)
+        -- to map this trigger error to a 422; if the format string changes,
+        -- update the route constant in lockstep.
         RAISE EXCEPTION
             '%.% must reference a user-kind principal; principal_idx=% has no qiita.user row',
             TG_TABLE_NAME, column_name, new_value;
@@ -140,11 +144,37 @@ COMMENT ON COLUMN qiita.study.principal_investigator_idx IS
     'study still references this column (user_no_delete_if_study_pi trigger).';
 
 
+-- =============================================================================
+-- REGISTRATIONS — qiita.biosample
+-- =============================================================================
+-- owner_idx is user-only (humans). created_by_idx and retired_by_idx are
+-- intentionally NOT registered: bulk imports and admin tools legitimately
+-- set them to a service account or the system principal.
+
+CREATE TRIGGER biosample_owner_must_be_user
+    BEFORE INSERT OR UPDATE OF owner_idx ON qiita.biosample
+    FOR EACH ROW EXECUTE FUNCTION qiita.tg_principal_must_be_user('owner_idx');
+
+CREATE TRIGGER user_no_delete_if_biosample_owner
+    BEFORE DELETE ON qiita.user
+    FOR EACH ROW
+    EXECUTE FUNCTION qiita.tg_user_role_ref_blocks_delete('qiita', 'biosample', 'owner_idx');
+
+
+COMMENT ON COLUMN qiita.biosample.owner_idx IS
+    'Principal that owns the biosample. Must be a user-kind principal (enforced by '
+    'biosample_owner_must_be_user trigger). qiita.user DELETE is blocked while a '
+    'biosample still references this column (user_no_delete_if_biosample_owner trigger).';
+
+
 -- migrate:down
 
+COMMENT ON COLUMN qiita.biosample.owner_idx IS NULL;
 COMMENT ON COLUMN qiita.study.principal_investigator_idx IS NULL;
 COMMENT ON COLUMN qiita.study.owner_idx IS NULL;
 
+DROP TRIGGER IF EXISTS user_no_delete_if_biosample_owner ON qiita.user;
+DROP TRIGGER IF EXISTS biosample_owner_must_be_user ON qiita.biosample;
 DROP TRIGGER IF EXISTS user_no_delete_if_study_pi ON qiita.user;
 DROP TRIGGER IF EXISTS user_no_delete_if_study_owner ON qiita.user;
 DROP TRIGGER IF EXISTS study_pi_must_be_user ON qiita.study;

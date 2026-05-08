@@ -2,6 +2,7 @@
 
 import asyncpg
 import pytest
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
 
 pytestmark = pytest.mark.db
 
@@ -35,11 +36,12 @@ async def test_reference_auto_generates_idx(postgres_pool):
         await tr.start()
         row = await conn.fetchrow(
             "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
-            " VALUES ($1, $2, $3, $4, 1) RETURNING reference_idx",
+            " VALUES ($1, $2, $3, $4, $5) RETURNING reference_idx",
             "test-ref",
             "1.0",
             "sequence_reference",
             "pending",
+            SYSTEM_PRINCIPAL_IDX,
         )
         assert row["reference_idx"] is not None
         assert isinstance(row["reference_idx"], int)
@@ -56,10 +58,11 @@ async def test_reference_status_defaults_to_pending(postgres_pool):
         await tr.start()
         row = await conn.fetchrow(
             "INSERT INTO qiita.reference (name, version, kind, created_by_idx)"
-            " VALUES ($1, $2, $3, 1) RETURNING status",
+            " VALUES ($1, $2, $3, $4) RETURNING status",
             "default-status-test",
             "1.0",
             "sequence_reference",
+            SYSTEM_PRINCIPAL_IDX,
         )
         assert row["status"] == "pending"
         await tr.rollback()
@@ -75,20 +78,22 @@ async def test_reference_rejects_duplicate_name_version(postgres_pool):
         await tr.start()
         await conn.execute(
             "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
-            " VALUES ($1, $2, $3, $4, 1)",
+            " VALUES ($1, $2, $3, $4, $5)",
             "dup-ref",
             "1.0",
             "sequence_reference",
             "pending",
+            SYSTEM_PRINCIPAL_IDX,
         )
         with pytest.raises(asyncpg.UniqueViolationError):
             await conn.execute(
                 "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
-                " VALUES ($1, $2, $3, $4, 1)",
+                " VALUES ($1, $2, $3, $4, $5)",
                 "dup-ref",
                 "1.0",
                 "sequence_reference",
                 "pending",
+                SYSTEM_PRINCIPAL_IDX,
             )
         await tr.rollback()
     finally:
@@ -104,11 +109,12 @@ async def test_reference_rejects_invalid_kind(postgres_pool):
         with pytest.raises(asyncpg.CheckViolationError):
             await conn.execute(
                 "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
-                " VALUES ($1, $2, $3, $4, 1)",
+                " VALUES ($1, $2, $3, $4, $5)",
                 "bad-kind",
                 "1.0",
                 "invalid_kind",
                 "pending",
+                SYSTEM_PRINCIPAL_IDX,
             )
         await tr.rollback()
     finally:
@@ -124,11 +130,12 @@ async def test_reference_rejects_invalid_status(postgres_pool):
         with pytest.raises(asyncpg.CheckViolationError):
             await conn.execute(
                 "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
-                " VALUES ($1, $2, $3, $4, 1)",
+                " VALUES ($1, $2, $3, $4, $5)",
                 "bad-status",
                 "1.0",
                 "sequence_reference",
                 "bogus",
+                SYSTEM_PRINCIPAL_IDX,
             )
         await tr.rollback()
     finally:
@@ -171,10 +178,11 @@ async def test_reference_membership_rejects_duplicate(postgres_pool):
         await tr.start()
         ref_idx = await conn.fetchval(
             "INSERT INTO qiita.reference (name, version, kind, created_by_idx)"
-            " VALUES ($1, $2, $3, 1) RETURNING reference_idx",
+            " VALUES ($1, $2, $3, $4) RETURNING reference_idx",
             "membership-dup-test",
             "1.0",
             "sequence_reference",
+            SYSTEM_PRINCIPAL_IDX,
         )
         feat_idx = await conn.fetchval(
             "INSERT INTO qiita.feature (sequence_hash) VALUES ($1::uuid) RETURNING feature_idx",

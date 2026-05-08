@@ -13,7 +13,7 @@ import time
 import pytest
 from fastapi import Depends, FastAPI
 from httpx import ASGITransport, AsyncClient
-from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 
 pytestmark = pytest.mark.db
 
@@ -212,8 +212,9 @@ async def test_resolver_dispatches_qk_prefix_to_token_path(resolver_client, post
     # Seed: principal + user
     pidx = await postgres_pool.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-        " VALUES ('token-resolve', $1, 1) RETURNING idx",
+        " VALUES ('token-resolve', $1, $2) RETURNING idx",
         SystemRole.USER,
+        SYSTEM_PRINCIPAL_IDX,
     )
     _track(resolver_client, pidx)
     await postgres_pool.execute(
@@ -241,8 +242,9 @@ async def test_resolver_token_path_for_service_account(resolver_client, postgres
 
     pidx = await postgres_pool.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-        " VALUES ('svc-resolve', $1, 1) RETURNING idx",
+        " VALUES ('svc-resolve', $1, $2) RETURNING idx",
         SystemRole.USER,
+        SYSTEM_PRINCIPAL_IDX,
     )
     _track(resolver_client, pidx)
     await postgres_pool.execute(
@@ -269,8 +271,9 @@ async def test_resolver_rejects_revoked_token(resolver_client, postgres_pool):
 
     pidx = await postgres_pool.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-        " VALUES ('rev-resolve', $1, 1) RETURNING idx",
+        " VALUES ('rev-resolve', $1, $2) RETURNING idx",
         SystemRole.USER,
+        SYSTEM_PRINCIPAL_IDX,
     )
     _track(resolver_client, pidx)
     await postgres_pool.execute(

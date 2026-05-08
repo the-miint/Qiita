@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 
 import asyncpg
 import pytest
-from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 
 pytestmark = pytest.mark.db
 
@@ -25,8 +25,9 @@ async def principal_idx(postgres_pool):
     idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.principal"
         "  (display_name, system_role, created_by_idx)"
-        " VALUES ('token-test', $1, 1) RETURNING idx",
+        " VALUES ('token-test', $1, $2) RETURNING idx",
         SystemRole.USER,
+        SYSTEM_PRINCIPAL_IDX,
     )
     yield idx
     # Tokens FK to principal; delete tokens before principal.

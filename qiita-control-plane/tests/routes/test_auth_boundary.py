@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 
 pytestmark = pytest.mark.db
 
@@ -85,9 +85,10 @@ async def _seed_human_with_token(
             pidx = await conn.fetchval(
                 "INSERT INTO qiita.principal"
                 "  (display_name, system_role, created_by_idx)"
-                " VALUES ($1, $2, 1) RETURNING idx",
+                " VALUES ($1, $2, $3) RETURNING idx",
                 display_name,
                 system_role,
+                SYSTEM_PRINCIPAL_IDX,
             )
             if profile_complete:
                 await conn.execute(
@@ -113,8 +114,9 @@ async def _seed_human_with_token(
     if disabled:
         await postgres_pool.execute(
             "UPDATE qiita.principal SET disabled = true,"
-            " disabled_at = now(), disabled_by_idx = 1, disable_reason = 'test'"
-            " WHERE idx = $1",
+            " disabled_at = now(), disabled_by_idx = $1, disable_reason = 'test'"
+            " WHERE idx = $2",
+            SYSTEM_PRINCIPAL_IDX,
             pidx,
         )
     if revoked:
@@ -141,9 +143,10 @@ async def _seed_service_with_token(
             pidx = await conn.fetchval(
                 "INSERT INTO qiita.principal"
                 "  (display_name, system_role, created_by_idx)"
-                " VALUES ($1, $2, 1) RETURNING idx",
+                " VALUES ($1, $2, $3) RETURNING idx",
                 name,
                 SystemRole.USER,
+                SYSTEM_PRINCIPAL_IDX,
             )
             await conn.execute(
                 "INSERT INTO qiita.service_account (principal_idx, name) VALUES ($1, $2)",
@@ -287,9 +290,10 @@ async def _seed_active_reference(postgres_pool, suffix: str) -> int:
     return await postgres_pool.fetchval(
         "INSERT INTO qiita.reference"
         "  (name, version, kind, status, created_by_idx)"
-        " VALUES ($1, '1.0', 'sequence_reference', 'hashing', 1)"
+        " VALUES ($1, '1.0', 'sequence_reference', 'hashing', $2)"
         " RETURNING reference_idx",
         f"boundary-mint-{_unique_suffix(suffix)}",
+        SYSTEM_PRINCIPAL_IDX,
     )
 
 

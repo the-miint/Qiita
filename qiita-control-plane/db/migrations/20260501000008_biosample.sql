@@ -184,7 +184,7 @@ COMMENT ON COLUMN qiita.biosample_metadata.global_field_idx IS
 
 COMMENT ON COLUMN qiita.biosample_metadata.is_owner_biosample_id IS
     'True iff this metadata row holds the owner''s identifier for this biosample. '
-    'The biosample_metadata_one_owner_id_per_biosample partial unique index '
+    'The biosample_metadata_unique_owner_biosample_id partial unique index '
     'enforces at most one true row per biosample_idx; rows with this flag false '
     'are unrestricted.';
 
@@ -213,7 +213,7 @@ CREATE UNIQUE INDEX biosample_metadata_one_value_per_global_concept
 -- the partial UNIQUE index makes a second 'true' row for the same
 -- biosample fail at the schema layer rather than relying on caller
 -- discipline. Rows with is_owner_biosample_id = false are unrestricted.
-CREATE UNIQUE INDEX biosample_metadata_one_owner_id_per_biosample
+CREATE UNIQUE INDEX biosample_metadata_unique_owner_biosample_id
     ON qiita.biosample_metadata (biosample_idx)
     WHERE is_owner_biosample_id = true;
 

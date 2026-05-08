@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 
 pytestmark = pytest.mark.db
 
@@ -138,9 +138,10 @@ async def _seed_user(
     """Seed principal + user (+ optional user_identity). Returns principal_idx."""
     pidx = await postgres_pool.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-        " VALUES ($1, $2, 1) RETURNING idx",
+        " VALUES ($1, $2, $3) RETURNING idx",
         email,
         role,
+        SYSTEM_PRINCIPAL_IDX,
     )
     if profile_complete:
         await postgres_pool.execute(
@@ -218,8 +219,9 @@ async def test_auth_whoami_service_returns_service_summary(auth_client, postgres
 
     pidx = await postgres_pool.fetchval(
         "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
-        " VALUES ('whoami-svc', $1, 1) RETURNING idx",
+        " VALUES ('whoami-svc', $1, $2) RETURNING idx",
         SystemRole.USER,
+        SYSTEM_PRINCIPAL_IDX,
     )
     _track(auth_client, pidx)
     await postgres_pool.execute(
@@ -435,6 +437,12 @@ async def test_post_pat_rejects_unknown_scope(auth_client, postgres_pool, jwks_h
 
 
 async def test_post_pat_default_scopes_match_role_ceiling(auth_client, postgres_pool, jwks_harness):
+    # Compare against role_ceiling(...) rather than a hand-enumerated set
+    # so adding a scope to the USER ceiling does not require updating this
+    # test. The contract under test is "default-mint == caller's full
+    # ceiling", whatever that ceiling currently is.
+    from qiita_control_plane.auth.scopes import role_ceiling
+
     pidx = await _seed_user(
         postgres_pool,
         email="pat-default-scopes@example.com",
@@ -456,11 +464,7 @@ async def test_post_pat_default_scopes_match_role_ceiling(auth_client, postgres_
         json={"label": "default-scopes"},
     )
     assert resp.status_code == 201
-    assert set(resp.json()["scopes"]) == {
-        Scope.SELF_PROFILE,
-        Scope.SELF_TOKEN,
-        Scope.REFERENCE_READ,
-    }
+    assert set(resp.json()["scopes"]) == set(role_ceiling(SystemRole.USER))
 
 
 async def test_post_pat_system_admin_role_ceiling_includes_lower_role_scopes(

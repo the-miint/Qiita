@@ -80,7 +80,7 @@ def test_reference_response_round_trips():
         version="2024.09",
         kind="sequence_reference",
         status="pending",
-        created_by_idx=1,
+        created_by_idx=42,
         created_at=now,
     )
     d = resp.model_dump()
@@ -100,7 +100,7 @@ def test_reference_response_rejects_invalid_status():
             version="1.0",
             kind="sequence_reference",
             status="bogus",
-            created_by_idx=1,
+            created_by_idx=42,
             created_at=datetime.now(UTC),
         )
 
@@ -116,7 +116,7 @@ def test_reference_response_rejects_naive_datetime():
             version="1.0",
             kind="sequence_reference",
             status="pending",
-            created_by_idx=1,
+            created_by_idx=42,
             created_at=datetime.now(),  # naive — no timezone
         )
 
@@ -132,7 +132,7 @@ def test_reference_response_rejects_zero_idx():
             version="1.0",
             kind="sequence_reference",
             status="pending",
-            created_by_idx=1,
+            created_by_idx=42,
             created_at=datetime.now(UTC),
         )
 

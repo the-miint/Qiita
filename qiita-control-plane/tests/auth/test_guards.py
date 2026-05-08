@@ -1,9 +1,20 @@
 """Unit tests for guards. Guards are FastAPI deps; we exercise them by
-synthesising the dep input directly (no FastAPI request needed)."""
+synthesising the dep input directly (no FastAPI request needed).
+
+Most guards in this module operate purely on a passed-in Principal and
+require no DB. `require_study_access` is the exception — it takes the
+study_idx from the path, looks up the caller's access row, and applies
+the tier policy. Its tests carry `pytest.mark.db` and seed real rows
+via `postgres_pool`.
+"""
+
+import secrets
 
 import pytest
+import pytest_asyncio
 from fastapi import HTTPException
-from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
+from qiita_common.models import Tier
 
 
 def _human(*, role=SystemRole.USER, scopes=frozenset(), profile_complete=True):
@@ -228,3 +239,397 @@ def test_require_complete_profile_422_when_incomplete():
     # (POST /auth/pat) owns that, since it can pull the actual field
     # values from the DB.
     assert "missing_fields" not in exc.value.detail
+
+
+# ---------------------------------------------------------------------------
+# require_study_access (DB-bound)
+# ---------------------------------------------------------------------------
+# Resource-access guards consult the DB; tests below seed real rows. Each
+# test calls the dep directly with a synthesised Principal and the
+# postgres_pool fixture instead of going through a FastAPI request.
+
+
+async def _seed_user_for_study(pool, *, suffix: str, role: SystemRole = SystemRole.USER) -> int:
+    name = f"req-sa-{suffix}-{secrets.token_hex(4)}"
+    pidx = await pool.fetchval(
+        "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
+        " VALUES ($1, $2, $3) RETURNING idx",
+        name,
+        role,
+        SYSTEM_PRINCIPAL_IDX,
+    )
+    await pool.execute(
+        "INSERT INTO qiita.user (principal_idx, email) VALUES ($1, $2)",
+        pidx,
+        f"{name}@test.local",
+    )
+    return pidx
+
+
+async def _seed_study_for_test(pool, *, owner_idx: int) -> int:
+    return await pool.fetchval(
+        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
+        " VALUES ($1, $2, $1) RETURNING idx",
+        owner_idx,
+        f"req-sa-{secrets.token_hex(4)}",
+    )
+
+
+def _human_with_idx(principal_idx: int, role: SystemRole = SystemRole.USER):
+    """HumanUser pinned to a given principal_idx. Required for DB tests
+    where the synthesised principal must match a real seeded user."""
+    from qiita_control_plane.auth.principal import HumanUser
+
+    return HumanUser(
+        principal_idx=principal_idx,
+        email=f"u{principal_idx}@test.local",
+        system_role=role,
+        scopes=frozenset(),
+        profile_complete=True,
+        disabled=False,
+        retired=False,
+    )
+
+
+@pytest_asyncio.fixture
+async def study_access_ctx(postgres_pool):
+    """Seed a caller-user, an owner-user, and a study owned by the owner."""
+    caller_idx = await _seed_user_for_study(postgres_pool, suffix="caller")
+    owner_idx = await _seed_user_for_study(postgres_pool, suffix="owner")
+    study_idx = await _seed_study_for_test(postgres_pool, owner_idx=owner_idx)
+
+    yield {
+        "pool": postgres_pool,
+        "caller_idx": caller_idx,
+        "owner_idx": owner_idx,
+        "study_idx": study_idx,
+    }
+
+    # FK-reverse cleanup.
+    await postgres_pool.execute("DELETE FROM qiita.study_access WHERE study_idx = $1", study_idx)
+    await postgres_pool.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
+    await postgres_pool.execute(
+        "DELETE FROM qiita.user WHERE principal_idx = ANY($1::bigint[])",
+        [caller_idx, owner_idx],
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.principal WHERE idx = ANY($1::bigint[])",
+        [caller_idx, owner_idx],
+    )
+
+
+@pytest.mark.db
+async def test_require_study_access_anonymous_raises_401(study_access_ctx):
+    from qiita_control_plane.auth.guards import require_study_access
+
+    dep = require_study_access(Tier.MEMBER)
+    with pytest.raises(HTTPException) as exc:
+        await dep(
+            study_idx=study_access_ctx["study_idx"],
+            p=_anon(),
+            pool=study_access_ctx["pool"],
+        )
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.db
+async def test_require_study_access_system_admin_bypasses(study_access_ctx):
+    # System admin bypasses without needing a study_access row.
+    from qiita_control_plane.auth.guards import require_study_access
+
+    dep = require_study_access(Tier.ADMIN)
+    admin = _human_with_idx(study_access_ctx["caller_idx"], role=SystemRole.SYSTEM_ADMIN)
+    result = await dep(
+        study_idx=study_access_ctx["study_idx"],
+        p=admin,
+        pool=study_access_ctx["pool"],
+    )
+    assert result is None
+
+
+@pytest.mark.db
+async def test_require_study_access_owner_bypasses(study_access_ctx):
+    # Study owner authorized at every tier without needing a study_access row.
+    from qiita_control_plane.auth.guards import require_study_access
+
+    dep = require_study_access(Tier.ADMIN)
+    owner = _human_with_idx(study_access_ctx["owner_idx"])
+    result = await dep(
+        study_idx=study_access_ctx["study_idx"],
+        p=owner,
+        pool=study_access_ctx["pool"],
+    )
+    assert result is None
+
+
+@pytest.mark.db
+async def test_require_study_access_admin_tier_meets_member_min(study_access_ctx):
+    from qiita_control_plane.auth.guards import require_study_access
+
+    await study_access_ctx["pool"].execute(
+        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier)"
+        " VALUES ($1, $2, $3)",
+        study_access_ctx["study_idx"],
+        study_access_ctx["caller_idx"],
+        Tier.ADMIN,
+    )
+    dep = require_study_access(Tier.MEMBER)
+    caller = _human_with_idx(study_access_ctx["caller_idx"])
+    result = await dep(
+        study_idx=study_access_ctx["study_idx"],
+        p=caller,
+        pool=study_access_ctx["pool"],
+    )
+    assert result is None
+
+
+@pytest.mark.db
+async def test_require_study_access_viewer_tier_below_member_min_raises_403(
+    study_access_ctx,
+):
+    from qiita_control_plane.auth.guards import require_study_access
+
+    await study_access_ctx["pool"].execute(
+        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier)"
+        " VALUES ($1, $2, $3)",
+        study_access_ctx["study_idx"],
+        study_access_ctx["caller_idx"],
+        Tier.VIEWER,
+    )
+    dep = require_study_access(Tier.MEMBER)
+    caller = _human_with_idx(study_access_ctx["caller_idx"])
+    with pytest.raises(HTTPException) as exc:
+        await dep(
+            study_idx=study_access_ctx["study_idx"],
+            p=caller,
+            pool=study_access_ctx["pool"],
+        )
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.db
+async def test_require_study_access_no_access_row_below_min_raises_403(
+    study_access_ctx,
+):
+    # Caller has no study_access row → effective tier PUBLIC, fails MEMBER.
+    from qiita_control_plane.auth.guards import require_study_access
+
+    dep = require_study_access(Tier.MEMBER)
+    caller = _human_with_idx(study_access_ctx["caller_idx"])
+    with pytest.raises(HTTPException) as exc:
+        await dep(
+            study_idx=study_access_ctx["study_idx"],
+            p=caller,
+            pool=study_access_ctx["pool"],
+        )
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.db
+async def test_require_study_access_no_access_row_with_public_min_passes(
+    study_access_ctx,
+):
+    # Caller has no study_access row → effective tier PUBLIC, meets PUBLIC.
+    from qiita_control_plane.auth.guards import require_study_access
+
+    dep = require_study_access(Tier.PUBLIC)
+    caller = _human_with_idx(study_access_ctx["caller_idx"])
+    result = await dep(
+        study_idx=study_access_ctx["study_idx"],
+        p=caller,
+        pool=study_access_ctx["pool"],
+    )
+    assert result is None
+
+
+@pytest.mark.db
+async def test_require_study_access_nonexistent_study_raises_404(study_access_ctx):
+    from qiita_control_plane.auth.guards import require_study_access
+
+    dep = require_study_access(Tier.PUBLIC)
+    caller = _human_with_idx(study_access_ctx["caller_idx"])
+    with pytest.raises(HTTPException) as exc:
+        await dep(
+            study_idx=-1,
+            p=caller,
+            pool=study_access_ctx["pool"],
+        )
+    assert exc.value.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# require_study_access — min_tier=None resolves to study.default_tier
+# ---------------------------------------------------------------------------
+# When the factory is called without an explicit min_tier, the inner _dep
+# uses the study's own default_tier as the per-request floor.
+
+
+@pytest.mark.db
+async def test_require_study_access_min_tier_none_passes_caller_at_default_tier(
+    study_access_ctx,
+):
+    # Study's default_tier is the schema-default 'member'; granting the
+    # caller a member access row meets that floor.
+    from qiita_control_plane.auth.guards import require_study_access
+
+    await study_access_ctx["pool"].execute(
+        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier)"
+        " VALUES ($1, $2, $3)",
+        study_access_ctx["study_idx"],
+        study_access_ctx["caller_idx"],
+        Tier.MEMBER,
+    )
+    dep = require_study_access()
+    caller = _human_with_idx(study_access_ctx["caller_idx"])
+    result = await dep(
+        study_idx=study_access_ctx["study_idx"],
+        p=caller,
+        pool=study_access_ctx["pool"],
+    )
+    assert result is None
+
+
+@pytest.mark.db
+async def test_require_study_access_min_tier_none_403_when_below_default_tier(
+    study_access_ctx,
+):
+    # Study default_tier=member; caller has only viewer → 403.
+    from qiita_control_plane.auth.guards import require_study_access
+
+    await study_access_ctx["pool"].execute(
+        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier)"
+        " VALUES ($1, $2, $3)",
+        study_access_ctx["study_idx"],
+        study_access_ctx["caller_idx"],
+        Tier.VIEWER,
+    )
+    dep = require_study_access()
+    caller = _human_with_idx(study_access_ctx["caller_idx"])
+    with pytest.raises(HTTPException) as exc:
+        await dep(
+            study_idx=study_access_ctx["study_idx"],
+            p=caller,
+            pool=study_access_ctx["pool"],
+        )
+    assert exc.value.status_code == 403
+    # The 403 detail names the resolved minimum, not the literal None.
+    assert "'member'" in exc.value.detail
+
+
+@pytest.mark.db
+async def test_require_study_access_min_tier_none_passes_when_default_is_public(
+    study_access_ctx,
+):
+    # Study default_tier=public; caller with no access row has effective
+    # tier public-by-absence which meets the floor.
+    from qiita_control_plane.auth.guards import require_study_access
+
+    await study_access_ctx["pool"].execute(
+        "UPDATE qiita.study SET default_tier = $1 WHERE idx = $2",
+        Tier.PUBLIC,
+        study_access_ctx["study_idx"],
+    )
+    dep = require_study_access()
+    caller = _human_with_idx(study_access_ctx["caller_idx"])
+    result = await dep(
+        study_idx=study_access_ctx["study_idx"],
+        p=caller,
+        pool=study_access_ctx["pool"],
+    )
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# require_study_access — bypass_role parameterization
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.db
+async def test_require_study_access_bypass_role_wet_lab_admin_bypasses(
+    study_access_ctx,
+):
+    # bypass_role=WET_LAB_ADMIN lets a wet_lab_admin caller through
+    # without a study_access row, even when the study's default_tier
+    # would otherwise require member.
+    from qiita_control_plane.auth.guards import require_study_access
+
+    dep = require_study_access(bypass_role=SystemRole.WET_LAB_ADMIN)
+    caller = _human_with_idx(study_access_ctx["caller_idx"], role=SystemRole.WET_LAB_ADMIN)
+    result = await dep(
+        study_idx=study_access_ctx["study_idx"],
+        p=caller,
+        pool=study_access_ctx["pool"],
+    )
+    assert result is None
+
+
+@pytest.mark.db
+async def test_require_study_access_bypass_role_wet_lab_admin_does_not_bypass_regular_user(
+    study_access_ctx,
+):
+    # Regular user is below WET_LAB_ADMIN threshold → falls through to
+    # the tier comparison; no access row → public-by-absence vs the
+    # study's default_tier=member yields 403.
+    from qiita_control_plane.auth.guards import require_study_access
+
+    dep = require_study_access(bypass_role=SystemRole.WET_LAB_ADMIN)
+    caller = _human_with_idx(study_access_ctx["caller_idx"])
+    with pytest.raises(HTTPException) as exc:
+        await dep(
+            study_idx=study_access_ctx["study_idx"],
+            p=caller,
+            pool=study_access_ctx["pool"],
+        )
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.db
+async def test_require_study_access_bypass_role_wet_lab_admin_admits_system_admin(
+    study_access_ctx,
+):
+    # has_role_at_least is monotonic, so a system_admin caller passes
+    # a WET_LAB_ADMIN bypass threshold trivially.
+    from qiita_control_plane.auth.guards import require_study_access
+
+    dep = require_study_access(bypass_role=SystemRole.WET_LAB_ADMIN)
+    caller = _human_with_idx(study_access_ctx["caller_idx"], role=SystemRole.SYSTEM_ADMIN)
+    result = await dep(
+        study_idx=study_access_ctx["study_idx"],
+        p=caller,
+        pool=study_access_ctx["pool"],
+    )
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# require_study_exists (DB-bound)
+# ---------------------------------------------------------------------------
+# Existence-only sibling of require_study_access; no Principal in scope, so
+# tests synthesize the call with just study_idx and pool.
+
+
+@pytest.mark.db
+async def test_require_study_exists_passes_for_existing_study(study_access_ctx):
+    from qiita_control_plane.auth.guards import require_study_exists
+
+    # The seeded study's idx must pass the guard with no return value.
+    result = await require_study_exists(
+        study_idx=study_access_ctx["study_idx"],
+        pool=study_access_ctx["pool"],
+    )
+    assert result is None
+
+
+@pytest.mark.db
+async def test_require_study_exists_raises_404_for_missing_study(study_access_ctx):
+    from qiita_control_plane.auth.guards import require_study_exists
+
+    # A negative idx never matches because the IDENTITY column only
+    # issues positive values.
+    with pytest.raises(HTTPException) as exc:
+        await require_study_exists(
+            study_idx=-1,
+            pool=study_access_ctx["pool"],
+        )
+    assert exc.value.status_code == 404
+    assert "study -1 not found" in exc.value.detail

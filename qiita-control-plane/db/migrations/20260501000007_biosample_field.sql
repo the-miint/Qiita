@@ -59,6 +59,12 @@ COMMENT ON COLUMN qiita.biosample_global_field.internal_name IS
     'Globally unique snake_case identifier used in cross-study queries. Stable; '
     'never displayed to end users in normal workflows.';
 
+COMMENT ON COLUMN qiita.biosample_global_field.display_name IS
+    'Human-readable label for UI and downloads. May contain spaces, punctuation, '
+    'and parentheses. Intentionally not derived from internal_name: the label '
+    'can evolve (typo fixes, terminology updates) without breaking queries that '
+    'pin against internal_name.';
+
 
 CREATE TABLE qiita.biosample_study_field (
     idx                         BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
@@ -108,6 +114,31 @@ CREATE INDEX biosample_study_field_study_idx ON qiita.biosample_study_field (stu
 CREATE INDEX biosample_study_field_global_link_idx
     ON qiita.biosample_study_field (biosample_global_field_idx)
     WHERE biosample_global_field_idx IS NOT NULL;
+
+
+-- =============================================================================
+-- BIOSAMPLE GLOBAL FIELD SEED
+-- =============================================================================
+--
+-- Bootstraps the cross-study biosample concept registry with the minimum set
+-- of fields every biosample needs in order to be submittable to BioSample.
+-- created_by_idx = 1 names the seeded system principal (SYSTEM_PRINCIPAL_IDX).
+-- ON CONFLICT DO NOTHING keeps the seed re-runnable: if dbmate's tracking row
+-- is ever lost (manual rollback, restored snapshot) and this migration is
+-- reapplied while the seed rows still exist, both unique constraints
+-- (internal_name and display_name) absorb the conflict instead of erroring.
+INSERT INTO qiita.biosample_global_field
+    (internal_name, display_name, data_type, required, created_by_idx)
+VALUES
+    ('collection_date', 'collection date', 'date', true, 1),
+    ('geographic_location_country_or_sea', 'geographic location (country and/or sea)', 'text', true, 1),
+    ('geographic_location_latitude', 'geographic location (latitude)', 'numeric', true, 1),
+    ('geographic_location_longitude', 'geographic location (longitude)', 'numeric', true, 1),
+    ('broad_scale_environmental_context', 'broad-scale environmental context', 'text', true, 1),
+    ('local_environmental_context', 'local environmental context', 'text', true, 1),
+    ('environmental_medium', 'environmental medium', 'text', true, 1),
+    ('taxon_id', 'taxon id', 'text', true, 1)
+ON CONFLICT DO NOTHING;
 
 
 -- migrate:down
