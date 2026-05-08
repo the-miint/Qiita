@@ -198,7 +198,9 @@ def require_complete_profile(
 
 # Strict ordering by privilege; mirrors the qiita.tier enum order. The
 # integer ranks let the guard compare tiers with a plain >= rather than
-# relying on enum-string ordering.
+# relying on enum-string ordering. Lives next to its sole consumer
+# (require_study_access). Unlike Roles, Tiers are not a property of
+# principals.
 _TIER_ORDER = {
     Tier.PUBLIC: 0,
     Tier.VIEWER: 1,

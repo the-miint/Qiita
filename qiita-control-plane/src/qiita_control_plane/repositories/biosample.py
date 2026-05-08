@@ -82,6 +82,8 @@ async def insert_biosample(
 async def fetch_biosample(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     biosample_idx: int,
+    *,
+    for_update: bool = False,
 ) -> asyncpg.Record | None:
     """Return the qiita.biosample row for the given idx, or None on miss.
 
@@ -89,18 +91,30 @@ async def fetch_biosample(
     row -> response shaping has a single source of truth (mirrors
     fetch_study). Accepts either a pool or a connection so the helper
     composes inside an open transaction or stands alone.
+
+    `for_update=True` appends `FOR UPDATE` to the SELECT so the row is
+    locked for the duration of the surrounding transaction; concurrent
+    callers serialize on this lock until the holder commits or rolls
+    back. Used by PATCH-style routes to close the lost-update window
+    between the preflight ETag check and the UPDATE: a second caller's
+    preflight blocks until the first commits, then sees the post-commit
+    `updated_at` and 412s on its stale `If-Match` header. Pass only
+    inside an open transaction — with a pool the implicit single-stmt
+    transaction releases the lock immediately and the flag is a no-op.
     """
     # Single-row fetch by idx; column list mirrors BiosampleResponse one-for-one
     # (with idx -> biosample_idx renamed at the route boundary).
-    return await pool_or_conn.fetchrow(
+    sql = (
         "SELECT idx, owner_idx, metadata_checklist_idx,"
         " biosample_accession, ena_sample_accession,"
         " last_submission_at, submission_error, last_metadata_change_at,"
         " created_by_idx, created_at, updated_at,"
         " retired, retired_by_idx, retired_at, retire_reason"
-        " FROM qiita.biosample WHERE idx = $1",
-        biosample_idx,
+        " FROM qiita.biosample WHERE idx = $1"
     )
+    if for_update:
+        sql += " FOR UPDATE"
+    return await pool_or_conn.fetchrow(sql, biosample_idx)
 
 
 # Columns the PATCH composer is allowed to write. Held as a frozenset so

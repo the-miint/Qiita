@@ -17,7 +17,7 @@ from decimal import Decimal, InvalidOperation
 from typing import NamedTuple
 
 import asyncpg
-from qiita_common.models import FieldDataType
+from qiita_common.models import FieldDataType, Tier
 
 # Closed set of data_types fetch_global_metadata_for_biosample currently
 # decodes from biosample_metadata. Boolean and terminology are intentionally
@@ -310,7 +310,7 @@ async def get_or_create_local_biosample_study_field(
     data_type: FieldDataType = FieldDataType.TEXT,
     required: bool = False,
     terminology_idx: int | None = None,
-    tier_override: str | None = None,
+    tier_override: Tier | None = None,
 ) -> tuple[int, bool]:
     """Find a biosample_study_field by (study_idx, display_name); create local on miss.
 

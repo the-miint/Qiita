@@ -128,6 +128,13 @@ CREATE TABLE qiita.study_access (
 
 CREATE INDEX study_access_principal_idx ON qiita.study_access (principal_idx);
 
+COMMENT ON TABLE qiita.study_access IS
+    'Per-(study, principal) access grants. A principal with no row here has '
+    'effective tier ''public'' on the study by absence; presence of a row '
+    'means a non-public grant at access_tier. The study_access_no_public_tier '
+    'CHECK enforces the data side: ''public'' is not a valid access_tier '
+    'because writing the by-absence default explicitly would be meaningless.';
+
 
 -- =============================================================================
 -- STUDY TAGS (controlled shared namespace of tags applied to studies)

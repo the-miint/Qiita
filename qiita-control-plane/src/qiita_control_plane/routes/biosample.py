@@ -365,32 +365,35 @@ async def patch_biosample_route(
 ) -> BiosampleResponse:
     """Edit a biosample's core record.
 
-    Auth bar: caller holds Scope.BIOSAMPLE_WRITE and is a HumanUser at
-    system_role >= wet_lab_admin. require_role_at_least always rejects
-    ServiceAccount callers (the auth model treats service-account
-    authz as scope-only and ServiceAccount carries no system_role
-    field), so the NCBI / ENA submission subsystem cannot reach this
-    PATCH on its current credentials. A separate scope-gated surface
-    (or a wider auth-model change so ServiceAccount carries a role)
-    will be needed when the submission subsystem starts writing back
-    accessions through the API.
+    Auth bar: caller holds Scope.BIOSAMPLE_WRITE and is a Principal at
+    system_role >= wet_lab_admin. The route's intended audience includes
+    the NCBI / ENA submission subsystem (a service account writing back
+    accessions), but require_role_at_least currently rejects every
+    ServiceAccount because the auth model treats service-account authz
+    as scope-only and ServiceAccount carries no system_role field. A
+    wider auth-model change (so ServiceAccount carries a role) is
+    required before that path opens; until then the runtime caller set
+    is humans-only despite the Principal type.
 
     If-Match is required: missing -> 428, mismatch -> 412. The body's
     editable fields are validated by BiosamplePatchRequest (extra=forbid
     rejects immutable / retirement columns with 422; an empty body is
-    also 422). Inside one connection-scoped transaction the route
-    preflights the row for existence (404), retirement (409), and ETag
-    match (412); validates the candidate owner via
+    also 422). Inside one connection-scoped transaction the route runs
+    a `SELECT ... FOR UPDATE` preflight on the row (existence -> 404,
+    retirement -> 409, ETag -> 412); validates the candidate owner via
     require_eligible_owner when owner_idx is in the body (422 on
     ineligibility); applies the UPDATE; re-reads global metadata for
-    the response. The UPDATE is also checked for a None return — the
-    row can vanish between the preflight and the UPDATE under READ
-    COMMITTED isolation if a concurrent transaction commits a delete
-    in that window — and surfaces as the same 404 the preflight emits.
-    Uniqueness violations on biosample_accession / ena_sample_accession
-    map to 409, FK violations on metadata_checklist_idx to 422, and the
-    role-typed FK trigger on owner_idx (a backstop the preflight should
-    preempt in practice) to the same eligibility-422.
+    the response. The FOR UPDATE lock is held from preflight through
+    commit, so concurrent PATCHes on the same row serialize at the
+    preflight: the second caller blocks until the first commits, then
+    sees the post-commit `updated_at` and 412s on its now-stale
+    If-Match header. This closes the lost-update window between the
+    ETag check and the UPDATE that an unlocked preflight would leave
+    open. Uniqueness violations on biosample_accession /
+    ena_sample_accession map to 409, FK violations on
+    metadata_checklist_idx to 422, and the role-typed FK trigger on
+    owner_idx (a backstop the preflight should preempt in practice) to
+    the same eligibility-422.
 
     The response carries an `ETag` header derived from the new row's
     `updated_at` column; format mirrors the GET endpoint's contract
@@ -409,7 +412,11 @@ async def patch_biosample_route(
         async with pool.acquire() as conn:
             async with conn.transaction():
                 # Preflight: existence -> 404, retirement -> 409, ETag -> 412.
-                row = await fetch_biosample(conn, biosample_idx)
+                # for_update=True acquires a row-level lock for the rest of
+                # the transaction so a concurrent PATCH on the same row
+                # serializes here instead of racing through the ETag check
+                # and silently overwriting the first writer's update.
+                row = await fetch_biosample(conn, biosample_idx, for_update=True)
                 if row is None:
                     raise HTTPException(
                         status_code=404, detail=f"biosample {biosample_idx} not found"
@@ -432,13 +439,15 @@ async def patch_biosample_route(
 
                 # Apply the UPDATE; the repo function returns the post-UPDATE
                 # row in the same shape fetch_biosample selects, so no
-                # follow-up SELECT is needed.
+                # follow-up SELECT is needed. The FOR UPDATE preflight
+                # holds a row lock for the rest of this transaction, so
+                # update_biosample cannot return None here — the row is
+                # guaranteed to exist under our lock. The defensive None
+                # check is kept as a backstop and surfaces as the same
+                # 404 the preflight emits, so an invariant violation
+                # (someone removing the lock without rethinking) fails
+                # loudly rather than indexing into None.
                 updated_row = await update_biosample(conn, biosample_idx, fields=fields)
-
-                # The repo returns None when the row vanished between the
-                # preflight SELECT and this UPDATE; surface that as the
-                # same 404 the preflight emits for the static missing-row
-                # case.
                 if updated_row is None:
                     raise HTTPException(
                         status_code=404, detail=f"biosample {biosample_idx} not found"
