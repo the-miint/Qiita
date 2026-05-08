@@ -507,45 +507,34 @@ States:
 - **COMPLETED** — results registered in DuckLake, provenance recorded
 - **FAILED** — failure at any stage, retries exhausted or permanent failure
 
-Work ticket fields:
-- `id` — unique identifier
-- `study_id`, `preparation_id` — references to control plane entities
-- `state` — current lifecycle state
-- `current_step` — index of the step currently executing or last attempted (0-based)
-- `total_steps` — total number of steps in the workflow
-- `failed_stage` — which stage failed (if FAILED): `upload`, `submission`, `processing_step_{n}`, `registration`
-- `failure_reason` — human-readable failure description
-- `failure_type` — `retriable` or `permanent`
-- `retry_count` — number of retries attempted
-- `max_retries` — configurable maximum (default: 3)
-- `slurm_job_id` — SLURM job identifier for the current step (updated each step; for map steps, the most recently failed or active job ID)
-- `failed_samples` — list of `prep_sample_idx` values that did not survive the map phase (retries exhausted); recorded before the reduce step runs
-- `staging_path` — path to uploaded raw data
-- `result_path` — path to processed output
-- `log_stdout_path` — path to SLURM job stdout
-- `log_stderr_path` — path to SLURM job stderr
-- `workflow_name`, `workflow_version` — which workflow was executed
-- `created_at`, `updated_at`, `completed_at` — timestamps
-- `created_by` — user who initiated the work ticket
-- `provenance` — JSON blob with full audit trail (set at COMPLETED)
+Work ticket fields (per `qiita.work_ticket` migration `20260504000001_work_ticket.sql`):
+- `work_ticket_idx` — primary key
+- `action_id`, `action_version` — FK into `qiita.action`; pin the exact action definition this ticket was submitted against
+- `originator_principal_idx` — submitter; FK into `qiita.principal`
+- `scope_target_kind` plus one of `(study_idx, prep_idx)` or `reference_idx` — tagged-union scope target, governed by the `work_ticket_scope_target_consistent` CHECK
+- `action_context` — JSONB validated at submission against `action.context_schema`
+- `state` — `pending` / `queued` / `processing` / `completed` / `failed`
+- `retry_count` — number of retry attempts so far (incremented on each PROCESSING → QUEUED retry)
+- `max_retries` — per-ticket retry budget (default 3, max 100)
+- `failure_type` — `retriable` or `permanent`; non-NULL on FAILED, NULL otherwise (CHECK enforced)
+- `failure_stage` — coarse stage enum: `submission` / `step_run` / `finalize`
+- `failure_step_name` — YAML step name when `failure_stage = step_run`; NULL otherwise (CHECK enforced)
+- `failure_reason` — human-readable explanation
+- `created_at`, `updated_at` — timestamps
 
-Retriable failure types:
-- SLURM node failure / preemption
-- OOM kill (may succeed with different resource allocation)
-- Transient filesystem errors
-- slurmrestd communication failures
+Several "v1-aspirational" fields appear in earlier draft text (slurm_job_id, log paths, current_step / total_steps, provenance JSONB, completed_at) but are not in the schema today. They land alongside the SLURM async-callback work and per-step provenance write-back, both of which post-date this version.
 
-Permanent failure types:
-- Invalid input data (corrupt FASTQ, wrong format)
-- Schema mismatch at DuckLake registration
-- Workflow container image not found
-- Workflow exit with known permanent error code
-- Container contract violation (manifest missing or identifier set mismatch after exit code 0)
+Failure classification is finer-grained at the backend layer: `BackendFailure.kind` is one of the values in `qiita_common.backend_failure.FailureKind` (NODE_FAIL, OOM_KILLED, PREEMPTED, TIMEOUT_BEFORE_START, TRANSIENT_FS_ERROR, SLURMRESTD_UNREACHABLE, PROCESS_RESTARTED for retriable; BAD_INPUT, EXIT_NONZERO, CONTRACT_VIOLATION, UNKNOWN_PERMANENT for permanent). The runner collapses these to the two-valued `failure_type` for storage; `failure_reason` carries the kind name + per-failure detail for triage.
 
-Manual restart:
-- An authorized user can restart a FAILED work ticket via the control plane REST API
-- This resets `retry_count` to 0 and transitions the ticket to QUEUED
-- The original failure information is preserved in the provenance log
+Retry semantics (implemented in `qiita_control_plane.runner._run_entry_with_retry`):
+- On `BackendFailure(transient=True)` and `retry_count < max_retries`: bump `retry_count`, atomically transition `PROCESSING → QUEUED → PROCESSING`, retry the same entry. Earlier successful entries are not re-run — `bound` outputs carry forward.
+- On `BackendFailure(transient=True)` with retries exhausted: transition to `FAILED` with `failure_type=retriable` (so post-mortems can distinguish "exhausted retries on a transient kind" from "permanent on first attempt").
+- On `BackendFailure(transient=False)`: skip the retry loop, transition straight to `FAILED` with `failure_type=permanent`.
+- On any other unwrapped `Exception` (LIBRARY primitive raising plain Python, programming bug): treat as `permanent`, `failure_type=permanent`, `failure_reason="<ExceptionType>: <message>"` truncated to 2000 chars.
+
+Manual restart (`POST /api/v1/work-ticket/{idx}/run` on a `FAILED` ticket):
+- Atomic UPDATE: state ← PENDING, `retry_count = 0`, all `failure_*` columns ← NULL (the DB CHECK requires `failure_*` all-NULL when state ≠ failed; the route clears them in one statement).
+- Triggers a fresh in-process dispatch via `schedule_dispatch`. The original FAILED-row state is not preserved on the row itself; ops dashboards that want post-mortem retention should snapshot the `failure_*` fields before triggering /run.
 
 **Single-CP-process contract.** The control plane runs as a single
 `qiita-control-plane.service` instance. Dispatch tasks are bound to the
@@ -614,21 +603,27 @@ For `reduce` steps, `params.json` contains the prep-level identifiers, the survi
 
 Outputs (container must produce):
 - All output files written to `$QIITA_OUTPUT_PATH`
-- `$QIITA_OUTPUT_PATH/manifest.json` written as the final act before chmod, listing every output file with its size in bytes:
+- `$QIITA_OUTPUT_PATH/manifest.json` written as the final act before chmod, with two fields:
   ```json
-  {"files": [{"path": "output.parquet", "size_bytes": 12345678}]}
+  {
+    "files": [{"path": "output.parquet", "size_bytes": 12345678}],
+    "outputs": {"manifest": "output.parquet"}
+  }
   ```
+  `files` is the audit list — every file the container wrote, with declared sizes for the verifier to check. `outputs` maps the YAML step's declared `outputs:` names to relative paths under `$QIITA_OUTPUT_PATH`; use `"."` for an output that IS the directory (e.g. a step whose output is `staging_dir`).
 - All files in `$QIITA_OUTPUT_PATH` set to `chmod 440` (including the manifest)
 - Exit code 0 on success, non-zero on any failure
 
 The container must not read from anywhere other than `$QIITA_INPUT_PATH`, must not write to anywhere other than `$QIITA_OUTPUT_PATH`, and must have no knowledge of Qiita, the control plane, or any service credentials.
 
-Orchestrator verification gates (all three must pass before a step is accepted):
-1. SLURM exit code 0
-2. `$QIITA_OUTPUT_PATH/manifest.json` exists
-3. Every file listed in the manifest exists and matches the declared `size_bytes`
+Orchestrator verification gates (all must pass before a step is accepted):
+1. Exit code 0
+2. `$QIITA_OUTPUT_PATH/manifest.json` exists, parses as JSON, has both `files` and `outputs` keys
+3. Every file listed in `files` exists at its declared `size_bytes`
+4. The `outputs` map's relative paths resolve under `$QIITA_OUTPUT_PATH` (no traversal) and exist
+5. Every file under `$QIITA_OUTPUT_PATH` is mode `0o440` and is listed in `files` (no extras)
 
-Gates 2 or 3 failing after exit code 0 is a permanent failure — the container violated the contract.
+A gate failure after exit code 0 is a permanent failure — the container returned 0 but didn't honor the contract, so retry won't help. SlurmBackend wraps the resulting failures as `BackendFailure(kind=CONTRACT_VIOLATION, transient=False)`.
 
 **Primary backend:** SLURM via slurmrestd REST API (JWT auth).
 - Submits jobs as JSON (no `#SBATCH` directives — slurmrestd ignores them)
