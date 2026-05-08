@@ -16,10 +16,22 @@ write `params.json` => submit via client => poll until terminal =>
 verify output => return name => path map.
 """
 
+from .client import (
+    DEFAULT_SLURMRESTD_API_VERSION,
+    TERMINAL_SLURM_STATES,
+    SlurmJobInfo,
+    SlurmrestdClient,
+    SlurmrestdError,
+)
 from .payload import build_job_submit_payload
 from .verify import VerificationFailure, verify_container_output
 
 __all__ = [
+    "DEFAULT_SLURMRESTD_API_VERSION",
+    "TERMINAL_SLURM_STATES",
+    "SlurmJobInfo",
+    "SlurmrestdClient",
+    "SlurmrestdError",
     "VerificationFailure",
     "build_job_submit_payload",
     "verify_container_output",
