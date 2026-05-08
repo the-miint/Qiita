@@ -77,31 +77,42 @@ async def test_hash_job_manifest_has_required_columns(fasta_file, tmp_path):
 
 
 async def test_hash_job_rejects_missing_fasta(tmp_path):
-    """Hash step must raise if FASTA file does not exist."""
+    """Hash step over a missing FASTA must surface as
+    BackendFailure(BAD_INPUT) at the run_step boundary — typed +
+    permanent so the runner won't retry."""
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
     backend = LocalBackend()
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(BackendFailure) as ei:
         await backend.run_step(
             "hash",
             {"fasta_path": tmp_path / "nonexistent.fasta"},
             tmp_path / "output",
             reference_idx=1,
         )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert ei.value.step_name == "hash"
+    assert not ei.value.transient
 
 
 async def test_hash_job_rejects_duplicate_read_ids(tmp_path):
-    """Hash step must raise ValueError on duplicate read_ids in FASTA."""
+    """Duplicate read_ids in the FASTA surface as BackendFailure(BAD_INPUT)."""
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
     fasta_path = tmp_path / "dup.fasta"
     fasta_path.write_text(">seq1\nATCG\n>seq1\nGCTA\n")
 
     backend = LocalBackend()
-    with pytest.raises(ValueError, match="duplicate read_id"):
+    with pytest.raises(BackendFailure) as ei:
         await backend.run_step(
             "hash", {"fasta_path": fasta_path}, tmp_path / "output", reference_idx=1
         )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert "duplicate read_id" in ei.value.reason
 
 
 async def test_hash_job_empty_fasta(tmp_path):
