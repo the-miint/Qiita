@@ -36,8 +36,8 @@ from typing import Any
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from qiita_common.actions import Audience
 from qiita_common.api_paths import (
-    PATH_WORK_TICKET_BY_IDX,
     PATH_WORK_TICKET_PREFIX,
     PATH_WORK_TICKET_ROOT,
     PATH_WORK_TICKET_RUN,
@@ -52,17 +52,22 @@ from qiita_common.models import (
 from ..actions.context_validator import validate_context
 from ..auth.principal import HumanUser, Principal, ServiceAccount, get_current_principal
 from ..deps import get_db_pool
-from ..dispatch import schedule_dispatch
+from ..dispatch import NON_TERMINAL_WORK_TICKET_STATES, schedule_dispatch
 
 _log = logging.getLogger(__name__)
 
 router = APIRouter(prefix=PATH_WORK_TICKET_PREFIX, tags=["work-ticket"])
 
 
-_NON_TERMINAL_STATES = (
-    WorkTicketState.PENDING.value,
-    WorkTicketState.QUEUED.value,
-    WorkTicketState.PROCESSING.value,
+# Names of the unique partial indexes that enforce
+# disallow-without-delete atomically. Defined in migration
+# 20260508000000_work_ticket_disallow_without_delete_indexes.sql; renaming
+# either there must light up the catch site below at type-check time.
+_DISALLOW_WITHOUT_DELETE_INDEXES = frozenset(
+    {
+        "work_ticket_one_in_flight_per_reference",
+        "work_ticket_one_in_flight_per_study_prep",
+    }
 )
 
 
@@ -75,7 +80,11 @@ async def _fetch_action_for_submission(
     pool: asyncpg.Pool, action_id: str, action_version: str
 ) -> dict[str, Any] | None:
     """Read just the columns the submission gate needs. Returns None if
-    the action does not exist or is disabled."""
+    the action does not exist or is disabled.
+
+    `audience` is parsed via the `Audience` Pydantic model — JSONB drift
+    (renamed/removed field) becomes a loud ValidationError at submission
+    rather than a silent default in the audience check below."""
     row = await pool.fetchrow(
         "SELECT target_kind, scopes, audience, context_schema"
         " FROM qiita.action"
@@ -90,12 +99,12 @@ async def _fetch_action_for_submission(
         "scopes": list(row["scopes"]),
         # `audience` and `context_schema` are JSONB; asyncpg returns each
         # as a string by default.
-        "audience": json.loads(row["audience"]),
+        "audience": Audience.model_validate_json(row["audience"]),
         "context_schema": json.loads(row["context_schema"]),
     }
 
 
-def _check_audience(principal: Principal, audience: dict[str, Any]) -> None:
+def _check_audience(principal: Principal, audience: Audience) -> None:
     """403 unless the caller is in the action's audience.
 
     `audience.service=True` permits service-account principals.
@@ -104,14 +113,14 @@ def _check_audience(principal: Principal, audience: dict[str, Any]) -> None:
     is unsubmittable by anyone — by design (e.g. a workflow that only
     the runner itself invokes via an internal call path)."""
     if isinstance(principal, ServiceAccount):
-        if not audience.get("service", False):
+        if not audience.service:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="this action is not in your audience (service accounts not permitted)",
             )
         return
     if isinstance(principal, HumanUser):
-        if principal.system_role not in audience.get("human_roles", []):
+        if principal.system_role not in audience.human_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="this action is not in your audience (system_role not permitted)",
@@ -142,7 +151,9 @@ def _check_scopes(principal: Principal, required_scopes: list[str]) -> None:
         )
 
 
-def _scope_target_columns(scope_target: dict[str, Any]) -> tuple[int | None, int | None, int | None]:
+def _scope_target_columns(
+    scope_target: dict[str, Any],
+) -> tuple[int | None, int | None, int | None]:
     """Map a ScopeTarget union member to the (study_idx, prep_idx,
     reference_idx) tuple the work_ticket table expects."""
     kind = scope_target["kind"]
@@ -164,8 +175,14 @@ async def _check_disallow_without_delete(
 ) -> None:
     """409 if any existing ticket for this `(scope_target, action_id,
     action_version)` triple is in a non-terminal state. COMPLETED tickets
-    are tolerated — they don't block resubmission until DELETE is wired
-    (task #10)."""
+    are tolerated; resubmission is gated until DELETE lands.
+
+    Best-effort fast path. The atomic gate is the unique partial indexes
+    `work_ticket_one_in_flight_per_{reference,study_prep}`; we still
+    SELECT first so the common (non-racing) case returns a 409 carrying
+    the blocking ticket idx, which is more useful to clients than the
+    bare unique-violation that fires when two submissions race past
+    this check."""
     study_idx, prep_idx, reference_idx = _scope_target_columns(scope_target)
     if scope_target["kind"] == ScopeTargetKind.REFERENCE.value:
         existing = await pool.fetchval(
@@ -177,7 +194,7 @@ async def _check_disallow_without_delete(
             action_id,
             action_version,
             reference_idx,
-            list(_NON_TERMINAL_STATES),
+            list(NON_TERMINAL_WORK_TICKET_STATES),
         )
     else:
         existing = await pool.fetchval(
@@ -190,7 +207,7 @@ async def _check_disallow_without_delete(
             action_version,
             study_idx,
             prep_idx,
-            list(_NON_TERMINAL_STATES),
+            list(NON_TERMINAL_WORK_TICKET_STATES),
         )
     if existing is not None:
         raise HTTPException(
@@ -260,27 +277,41 @@ async def submit_work_ticket(
             },
         )
 
-    await _check_disallow_without_delete(
-        pool, body.action_id, body.action_version, scope_target
-    )
+    await _check_disallow_without_delete(pool, body.action_id, body.action_version, scope_target)
 
     study_idx, prep_idx, reference_idx = _scope_target_columns(scope_target)
-    work_ticket_idx = await pool.fetchval(
-        "INSERT INTO qiita.work_ticket ("
-        "  action_id, action_version, originator_principal_idx,"
-        "  scope_target_kind, study_idx, prep_idx, reference_idx,"
-        "  action_context"
-        ") VALUES ($1, $2, $3, $4::qiita.scope_target_kind, $5, $6, $7, $8::jsonb)"
-        " RETURNING work_ticket_idx",
-        body.action_id,
-        body.action_version,
-        principal.principal_idx,
-        scope_target["kind"],
-        study_idx,
-        prep_idx,
-        reference_idx,
-        json.dumps(body.action_context),
-    )
+    try:
+        work_ticket_idx = await pool.fetchval(
+            "INSERT INTO qiita.work_ticket ("
+            "  action_id, action_version, originator_principal_idx,"
+            "  scope_target_kind, study_idx, prep_idx, reference_idx,"
+            "  action_context"
+            ") VALUES ($1, $2, $3, $4::qiita.scope_target_kind, $5, $6, $7, $8::jsonb)"
+            " RETURNING work_ticket_idx",
+            body.action_id,
+            body.action_version,
+            principal.principal_idx,
+            scope_target["kind"],
+            study_idx,
+            prep_idx,
+            reference_idx,
+            json.dumps(body.action_context),
+        )
+    except asyncpg.exceptions.UniqueViolationError as exc:
+        # Unique partial index fired — a concurrent submission won the
+        # race past `_check_disallow_without_delete`. Map to the same
+        # 409 shape the SELECT-side check returns; the blocking idx is
+        # not cheap to recover here (would require a second query) and
+        # the client only needs to know to retry against the in-flight
+        # ticket they will discover via /work-ticket listing.
+        if exc.constraint_name in _DISALLOW_WITHOUT_DELETE_INDEXES:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "reason": "another ticket for this (scope_target, action) is in flight",
+                },
+            ) from exc
+        raise
 
     # Fire-and-forget dispatch in the background. The route returns 202
     # immediately; the workflow runs in-process via asyncio.
@@ -312,8 +343,7 @@ async def run_work_ticket(
     one whose original create-time dispatch was lost. State-aware (see
     table at module top)."""
     row = await pool.fetchrow(
-        "SELECT action_id, action_version, state"
-        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        "SELECT action_id, action_version, state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
         work_ticket_idx,
     )
     if row is None:
@@ -328,7 +358,10 @@ async def run_work_ticket(
     if action is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"action {row['action_id']!r}/{row['action_version']!r} no longer enabled — cannot redrive",
+            detail=(
+                f"action {row['action_id']!r}/{row['action_version']!r} "
+                "no longer enabled — cannot redrive"
+            ),
         )
     _check_audience(principal, action["audience"])
     _check_scopes(principal, action["scopes"])

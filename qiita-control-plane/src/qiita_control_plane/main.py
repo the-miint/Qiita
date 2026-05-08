@@ -1,6 +1,5 @@
 """Control plane FastAPI application."""
 
-import asyncio
 from contextlib import asynccontextmanager
 
 import asyncpg

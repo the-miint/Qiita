@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -77,24 +76,22 @@ async def test_schedule_dispatch_registers_and_removes_task(monkeypatch):
 @pytest.mark.asyncio
 async def test_schedule_dispatch_swallows_runner_exceptions(monkeypatch, caplog):
     """`_run_and_log` is supposed to log and swallow runner exceptions
-    so the asyncio Task completes cleanly. Verifies via the patched
-    helper that an exception inside it doesn't bubble out to the task
-    runner."""
+    so the asyncio Task completes cleanly. Patch `run_workflow` (the
+    symbol `_run_and_log` calls) so the swallow wrapper actually runs;
+    awaiting the task must not raise."""
 
-    async def _raising_run(_app, _ticket_idx):
+    async def _raising_workflow(*args, **kwargs):
         raise RuntimeError("workflow blew up")
 
-    monkeypatch.setattr("qiita_control_plane.dispatch._run_and_log", _raising_run)
+    monkeypatch.setattr("qiita_control_plane.dispatch.run_workflow", _raising_workflow)
 
     app = _fake_app()
     task = schedule_dispatch(app, work_ticket_idx=99)
-    # The wrapper raises, but we don't await its body via _run_and_log
-    # here — schedule_dispatch wraps `_run_and_log` directly. So
-    # awaiting the task should propagate. Verify the contract: the test
-    # patches the *named symbol* the helper imports; an unhandled
-    # exception surfaces.
-    with pytest.raises(RuntimeError):
-        await task
+    # _run_and_log catches the RuntimeError and logs it; the asyncio
+    # task completes cleanly with no exception escaping.
+    await task
+    assert task.done() and not task.cancelled()
+    assert task.exception() is None
 
 
 @pytest.mark.asyncio

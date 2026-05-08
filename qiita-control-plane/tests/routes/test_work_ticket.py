@@ -1,10 +1,10 @@
 """DB-bound integration tests for /api/v1/work-ticket/*.
 
-Covers the routes that landed in task #8: submission (4a, with implicit
-dispatch fired by the route), the state-aware /run override (4b), and
-the dispatch-side recovery helper. The asyncio task lifecycle itself is
-covered by tests/test_dispatch.py — here we patch `_run_and_log` to a
-no-op so the route returns 202 without actually executing a workflow.
+Covers submission (with the implicit dispatch fired by the route), the
+state-aware /run override, and the dispatch-side recovery helper. The
+asyncio task lifecycle itself is covered by tests/test_dispatch.py —
+here we patch `_run_and_log` to a no-op so the route returns 202
+without actually executing a workflow.
 """
 
 from __future__ import annotations
@@ -14,8 +14,9 @@ import uuid
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from qiita_common.api_paths import URL_WORK_TICKET_PREFIX, URL_WORK_TICKET_RUN
 from qiita_common.auth_constants import Scope, SystemRole
-from qiita_common.models import ScopeTargetKind, WorkTicketState
+from qiita_common.models import WorkTicketState
 
 pytestmark = pytest.mark.db
 
@@ -176,7 +177,9 @@ async def regular_token(postgres_pool, wt_client):
 @pytest.fixture
 async def reference_idx(postgres_pool, admin_token):
     """A 'pending' reference owned by the admin principal — the
-    scope_target our submission tests aim at."""
+    scope_target our submission tests aim at. (`pending` here is a
+    qiita.reference_status value, distinct from the work_ticket_state
+    enum tracked elsewhere in this file.)"""
     _, admin_idx = admin_token
     idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
@@ -187,9 +190,7 @@ async def reference_idx(postgres_pool, admin_token):
     )
     yield idx
     # work_ticket has FK RESTRICT on reference_idx — drop dependents first.
-    await postgres_pool.execute(
-        "DELETE FROM qiita.work_ticket WHERE reference_idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE reference_idx = $1", idx)
     await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
 
 
@@ -206,9 +207,7 @@ _TEST_STEPS = [
 ]
 
 
-async def _seed_action(
-    postgres_pool, *, context_schema: dict
-) -> tuple[str, str]:
+async def _seed_action(postgres_pool, *, context_schema: dict) -> tuple[str, str]:
     """Insert an enabled, reference-targeting action with the given
     context_schema. Returns (action_id, version). Caller is responsible
     for cleanup — fixtures wrap this with teardown."""
@@ -297,7 +296,7 @@ async def test_submit_happy_path(
     token, _ = admin_token
     action_id, version = reference_action
     resp = await wt_client.post(
-        "/api/v1/work-ticket",
+        URL_WORK_TICKET_PREFIX,
         json=_body(action_id, version, reference_idx),
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -310,15 +309,13 @@ async def test_submit_happy_path(
     state = await postgres_pool.fetchval(
         "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
     )
-    assert state == "pending"
+    assert state == WorkTicketState.PENDING.value
 
 
-async def test_submit_unknown_action_returns_404(
-    wt_client, admin_token, reference_idx
-):
+async def test_submit_unknown_action_returns_404(wt_client, admin_token, reference_idx):
     token, _ = admin_token
     resp = await wt_client.post(
-        "/api/v1/work-ticket",
+        URL_WORK_TICKET_PREFIX,
         json=_body("does-not-exist", "v0", reference_idx),
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -332,7 +329,7 @@ async def test_submit_wrong_role_returns_403(
     token, _ = regular_token
     action_id, version = reference_action
     resp = await wt_client.post(
-        "/api/v1/work-ticket",
+        URL_WORK_TICKET_PREFIX,
         json=_body(action_id, version, reference_idx),
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -347,7 +344,7 @@ async def test_submit_scope_target_kind_mismatch_returns_422(
     token, _ = admin_token
     action_id, version = reference_action
     resp = await wt_client.post(
-        "/api/v1/work-ticket",
+        URL_WORK_TICKET_PREFIX,
         json={
             "action_id": action_id,
             "action_version": version,
@@ -372,15 +369,45 @@ async def test_submit_in_flight_blocks_with_409(
     body = _body(action_id, version, reference_idx)
     headers = {"Authorization": f"Bearer {token}"}
 
-    first = await wt_client.post("/api/v1/work-ticket", json=body, headers=headers)
+    first = await wt_client.post(URL_WORK_TICKET_PREFIX, json=body, headers=headers)
     assert first.status_code == 202
     first_idx = first.json()["work_ticket_idx"]
     wt_client._created_tickets.append(first_idx)
 
-    second = await wt_client.post("/api/v1/work-ticket", json=body, headers=headers)
+    second = await wt_client.post(URL_WORK_TICKET_PREFIX, json=body, headers=headers)
     assert second.status_code == 409
     detail = second.json()["detail"]
     assert detail["blocking_work_ticket_idx"] == first_idx
+
+
+async def test_submit_unique_index_catches_select_race(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx, monkeypatch
+):
+    """If two submissions race past the SELECT-LIMIT-1 fast path, the
+    unique partial index `work_ticket_one_in_flight_per_reference` is
+    the atomic gate. Simulate the race by short-circuiting the SELECT
+    check to a no-op so both submissions reach INSERT; the second one
+    must hit the constraint and surface as 409."""
+    token, _ = admin_token
+    action_id, version = reference_action
+    body = _body(action_id, version, reference_idx)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    first = await wt_client.post(URL_WORK_TICKET_PREFIX, json=body, headers=headers)
+    assert first.status_code == 202
+    wt_client._created_tickets.append(first.json()["work_ticket_idx"])
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "qiita_control_plane.routes.work_ticket._check_disallow_without_delete",
+        _noop,
+    )
+
+    second = await wt_client.post(URL_WORK_TICKET_PREFIX, json=body, headers=headers)
+    assert second.status_code == 409
+    assert "in flight" in second.json()["detail"]["reason"]
 
 
 async def test_submit_valid_context_against_schema(
@@ -394,11 +421,9 @@ async def test_submit_valid_context_against_schema(
     context_schema lands in PENDING (no 422)."""
     token, _ = admin_token
     action_id, version = reference_action_with_schema
-    body = _body(
-        action_id, version, reference_idx, action_context={"sample_count": 12}
-    )
+    body = _body(action_id, version, reference_idx, action_context={"sample_count": 12})
     resp = await wt_client.post(
-        "/api/v1/work-ticket",
+        URL_WORK_TICKET_PREFIX,
         json=body,
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -415,11 +440,9 @@ async def test_submit_invalid_context_returns_422_with_errors_list(
     token, _ = admin_token
     action_id, version = reference_action_with_schema
     # `sample_count` is required and must be an integer; provide neither.
-    body = _body(
-        action_id, version, reference_idx, action_context={"unrelated": "value"}
-    )
+    body = _body(action_id, version, reference_idx, action_context={"unrelated": "value"})
     resp = await wt_client.post(
-        "/api/v1/work-ticket",
+        URL_WORK_TICKET_PREFIX,
         json=body,
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -449,7 +472,7 @@ async def test_submit_invalid_context_type_returns_422(
         action_context={"sample_count": "twelve"},
     )
     resp = await wt_client.post(
-        "/api/v1/work-ticket",
+        URL_WORK_TICKET_PREFIX,
         json=body,
         headers={"Authorization": f"Bearer {token}"},
     )
@@ -472,7 +495,7 @@ async def test_submit_503_when_compute_backend_unconfigured(
         token, _ = admin_token
         action_id, version = reference_action
         resp = await wt_client.post(
-            "/api/v1/work-ticket",
+            URL_WORK_TICKET_PREFIX,
             json=_body(action_id, version, reference_idx),
             headers={"Authorization": f"Bearer {token}"},
         )
@@ -489,7 +512,7 @@ async def test_submit_503_when_compute_backend_unconfigured(
 async def test_run_unknown_idx_returns_404(wt_client, admin_token):
     token, _ = admin_token
     resp = await wt_client.post(
-        "/api/v1/work-ticket/999999999/run",
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=999999999),
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 404
@@ -505,21 +528,22 @@ async def test_run_on_completed_returns_409(
         "INSERT INTO qiita.work_ticket"
         " (action_id, action_version, originator_principal_idx,"
         "  scope_target_kind, reference_idx, state)"
-        " VALUES ($1, $2, $3, 'reference', $4, 'completed')"
+        " VALUES ($1, $2, $3, 'reference', $4, $5::qiita.work_ticket_state)"
         " RETURNING work_ticket_idx",
         action_id,
         version,
         admin_idx,
         reference_idx,
+        WorkTicketState.COMPLETED.value,
     )
     wt_client._created_tickets.append(idx)
 
     resp = await wt_client.post(
-        f"/api/v1/work-ticket/{idx}/run",
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 409
-    assert resp.json()["detail"]["current_state"] == "completed"
+    assert resp.json()["detail"]["current_state"] == WorkTicketState.COMPLETED.value
 
 
 async def test_run_on_failed_resets_to_pending(
@@ -532,17 +556,18 @@ async def test_run_on_failed_resets_to_pending(
         "INSERT INTO qiita.work_ticket"
         " (action_id, action_version, originator_principal_idx,"
         "  scope_target_kind, reference_idx, state)"
-        " VALUES ($1, $2, $3, 'reference', $4, 'failed')"
+        " VALUES ($1, $2, $3, 'reference', $4, $5::qiita.work_ticket_state)"
         " RETURNING work_ticket_idx",
         action_id,
         version,
         admin_idx,
         reference_idx,
+        WorkTicketState.FAILED.value,
     )
     wt_client._created_tickets.append(idx)
 
     resp = await wt_client.post(
-        f"/api/v1/work-ticket/{idx}/run",
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 202, resp.text
@@ -550,7 +575,7 @@ async def test_run_on_failed_resets_to_pending(
     state = await postgres_pool.fetchval(
         "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
     )
-    assert state == "pending"
+    assert state == WorkTicketState.PENDING.value
 
 
 async def test_run_on_pending_dispatches_without_state_change(
@@ -564,17 +589,18 @@ async def test_run_on_pending_dispatches_without_state_change(
         "INSERT INTO qiita.work_ticket"
         " (action_id, action_version, originator_principal_idx,"
         "  scope_target_kind, reference_idx, state)"
-        " VALUES ($1, $2, $3, 'reference', $4, 'pending')"
+        " VALUES ($1, $2, $3, 'reference', $4, $5::qiita.work_ticket_state)"
         " RETURNING work_ticket_idx",
         action_id,
         version,
         admin_idx,
         reference_idx,
+        WorkTicketState.PENDING.value,
     )
     wt_client._created_tickets.append(idx)
 
     resp = await wt_client.post(
-        f"/api/v1/work-ticket/{idx}/run",
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 202
@@ -582,7 +608,7 @@ async def test_run_on_pending_dispatches_without_state_change(
     state = await postgres_pool.fetchval(
         "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
     )
-    assert state == "pending"
+    assert state == WorkTicketState.PENDING.value
 
 
 # ---------------------------------------------------------------------------
@@ -591,32 +617,48 @@ async def test_run_on_pending_dispatches_without_state_change(
 
 
 async def test_recover_orphaned_tickets_marks_non_terminal_failed(
-    postgres_pool, admin_token, reference_action, reference_idx
+    postgres_pool, admin_token, reference_action
 ):
     """All non-terminal tickets become FAILED; terminal ones are
-    untouched."""
+    untouched. Each ticket targets its own reference so the
+    one-in-flight-per-reference unique index doesn't fire on insert."""
     from qiita_control_plane.dispatch import recover_orphaned_tickets
 
     _, admin_idx = admin_token
     action_id, version = reference_action
-    created_idxs = []
-    states_before = ["pending", "queued", "processing", "completed"]
-    for s in states_before:
-        idx = await postgres_pool.fetchval(
-            "INSERT INTO qiita.work_ticket"
-            " (action_id, action_version, originator_principal_idx,"
-            "  scope_target_kind, reference_idx, state)"
-            " VALUES ($1, $2, $3, 'reference', $4, $5::qiita.work_ticket_state)"
-            " RETURNING work_ticket_idx",
-            action_id,
-            version,
-            admin_idx,
-            reference_idx,
-            s,
-        )
-        created_idxs.append(idx)
+    states_before = [
+        WorkTicketState.PENDING.value,
+        WorkTicketState.QUEUED.value,
+        WorkTicketState.PROCESSING.value,
+        WorkTicketState.COMPLETED.value,
+    ]
 
+    created_refs: list[int] = []
+    created_idxs: list[int] = []
     try:
+        for s in states_before:
+            ref_idx = await postgres_pool.fetchval(
+                "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
+                " VALUES ($1, '1.0', 'sequence_reference', 'pending', $2)"
+                " RETURNING reference_idx",
+                f"wt-recover-{uuid.uuid4()}",
+                admin_idx,
+            )
+            created_refs.append(ref_idx)
+            idx = await postgres_pool.fetchval(
+                "INSERT INTO qiita.work_ticket"
+                " (action_id, action_version, originator_principal_idx,"
+                "  scope_target_kind, reference_idx, state)"
+                " VALUES ($1, $2, $3, 'reference', $4, $5::qiita.work_ticket_state)"
+                " RETURNING work_ticket_idx",
+                action_id,
+                version,
+                admin_idx,
+                ref_idx,
+                s,
+            )
+            created_idxs.append(idx)
+
         recovered_count = await recover_orphaned_tickets(postgres_pool)
         # Three non-terminal tickets we just inserted should be picked up
         # (plus possibly orphans from earlier tests in the same session,
@@ -630,9 +672,20 @@ async def test_recover_orphaned_tickets_marks_non_terminal_failed(
             )
             states_after.append(state)
         # pending, queued, processing → failed; completed untouched.
-        assert states_after == ["failed", "failed", "failed", "completed"]
+        assert states_after == [
+            WorkTicketState.FAILED.value,
+            WorkTicketState.FAILED.value,
+            WorkTicketState.FAILED.value,
+            WorkTicketState.COMPLETED.value,
+        ]
     finally:
-        await postgres_pool.execute(
-            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
-            created_idxs,
-        )
+        if created_idxs:
+            await postgres_pool.execute(
+                "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
+                created_idxs,
+            )
+        if created_refs:
+            await postgres_pool.execute(
+                "DELETE FROM qiita.reference WHERE reference_idx = ANY($1::bigint[])",
+                created_refs,
+            )

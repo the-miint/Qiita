@@ -15,7 +15,6 @@ from qiita_control_plane.actions.context_validator import (
     validate_context,
 )
 
-
 # ---------------------------------------------------------------------------
 # validate_context
 # ---------------------------------------------------------------------------

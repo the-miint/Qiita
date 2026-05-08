@@ -12,5 +12,11 @@ ExecStart=/opt/qiita/control-plane/.venv/bin/uvicorn \
 Restart=on-failure
 EnvironmentFile=/etc/qiita/control-plane.env
 
+# Give the lifespan-shutdown hook room to drain in-flight dispatch
+# tasks. The CP itself bounds drain at 60s (see _DISPATCH_DRAIN_TIMEOUT_SECONDS
+# in main.py); 90s here leaves headroom for uvicorn's own shutdown path
+# before systemd escalates to SIGKILL.
+TimeoutStopSec=90s
+
 [Install]
 WantedBy=multi-user.target

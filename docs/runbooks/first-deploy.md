@@ -282,12 +282,10 @@ The orchestrator will refuse to start if the file is missing or unreadable.
 Dev / CI can opt into env-var fallback by setting `QIITA_ALLOW_TOKEN_ENV=true`
 and providing `CP_TO_CO_TOKEN`; production must use the file.
 
-> **v1 limitation.** The CP→CO call path is implemented but **not yet wired
-> into the running control plane** — `Settings` has no
-> `compute_orchestrator_url` field and `main.py` does not construct a
-> `ComputeBackendClient`. The runner is exercised by tests only. The
-> orchestrator still requires this file to boot, so install it now; once
-> CP-side wiring lands, the same file unlocks step dispatch in production.
+The shared bearer is what the CP attaches to its `POST /api/v1/step/run`
+calls into the orchestrator and what the orchestrator's auth dependency
+constant-time-compares against. Both services refuse to boot without it
+on a path they can read, so install it before either service starts.
 
 ## 8. Bootstrap the data plane
 
@@ -395,8 +393,9 @@ will refuse to boot if the file is missing or unreadable by `qiita-orch`.
 
 Per-service liveness plus auth probes — confirms every layer the previous
 steps wired up is actually responding. This is the gate that says "the
-deploy worked"; the end-to-end pipeline smoke (step 11) is deferred until
-the v2 work in that section lands.
+deploy worked." Step 11 is the end-to-end pipeline smoke that submits a
+real workflow and follows it through to DuckLake; run it after step 10
+passes.
 
 ### 10a. All three services healthy
 
@@ -452,27 +451,12 @@ equivalent — exact wording is set by the route handler). Other outcomes:
 ### What is *not* verified by step 10
 
 - The CP↔DP HMAC handshake (no Flight call is made by a 404 lookup).
-- Orchestrator dispatch end-to-end — exercised by step 11. The
-  CP-side wiring (lifespan + `POST /work-ticket` route) is in place;
-  `SlurmBackend.run_step` is the remaining blocker for SLURM-backed
-  runs. `LocalBackend` runs end-to-end today.
+- Orchestrator dispatch end-to-end.
 - Parquet registration into DuckLake — depends on the orchestrator path.
 
 These are exercised by step 11.
 
 ## 11. End-to-end smoke
-
-> **v1: partially runnable.** The CP-side dispatch wiring (`Settings`
-> fields, lifespan-managed `ComputeBackendClient`, `POST /work-ticket`
-> route, in-process `asyncio` dispatcher) is in place. The remaining
-> blocker is **`SlurmBackend.run_step`**
-> (`qiita-compute-orchestrator/src/qiita_compute_orchestrator/backends/slurm.py:19`)
-> which raises `NotImplementedError`. With `COMPUTE_BACKEND=local` on
-> the orchestrator, the recipe below should run end-to-end against a
-> deploy that has the test FASTA staged correctly. The PR that lands
-> SlurmBackend should validate this recipe against a SLURM-backed
-> deploy, fix any drifted paths or CLI subcommands, and remove this
-> banner.
 
 The smoke uses the `reference-add` workflow with a 3–5 sequence FASTA.
 A single ticket touches every layer:
@@ -508,10 +492,9 @@ A single ticket touches every layer:
 
 4. **Verify the four layers:**
 
-   - Work ticket reaches `COMPLETED` (CLI subcommand to query a ticket
-     by id; verify the exact name when the implementing PR lands —
-     `qiita-admin tickets get <id>` was the placeholder in earlier drafts
-     but may not match the final CLI surface).
+   - Work ticket reaches `COMPLETED` — query it via the `qiita-admin`
+     work-ticket subcommand (or directly against `qiita.work_ticket`
+     if the CLI surface isn't installed on this host).
    - `qiita_miint` has a new `reference` row plus features and
      membership rows for the smoke tag.
    - `qiita_miint_lake` has new `ducklake_data_file` rows from the last
@@ -524,10 +507,7 @@ A single ticket touches every layer:
 
 The smoke leaves one tagged reference plus a handful of features and
 catalog files per deploy — by design. They are cheap (kilobytes) and
-the audit trail proves which deploys passed smoke. No cleanup needed.
-
-> **TODO:** Full reference deletion (delete `reference_membership`
-> rows, delete features exclusive to the reference, unregister the
-> catalog files, remove the Parquet) is not yet implemented. Track
-> as a follow-up. Not on the critical path while versioned smoke
-> names keep accumulation harmless.
+the audit trail proves which deploys passed smoke. No cleanup needed:
+versioned smoke names keep accumulation harmless until full reference
+deletion (membership rows, exclusive features, catalog files, Parquet)
+is wired.

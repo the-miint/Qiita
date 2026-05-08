@@ -547,6 +547,17 @@ Manual restart:
 - This resets `retry_count` to 0 and transitions the ticket to QUEUED
 - The original failure information is preserved in the provenance log
 
+**Single-CP-process contract.** The control plane runs as a single
+`qiita-control-plane.service` instance. Dispatch tasks are bound to the
+asyncio loop of the process that submitted them; a CP restart loses
+those tasks. To recover, the lifespan startup hook unconditionally marks
+every PENDING / QUEUED / PROCESSING ticket FAILED via
+`recover_orphaned_tickets`, on the assumption that no other CP process
+is concurrently dispatching. Running multiple CP processes against the
+same database would have one process fail tickets the other is actively
+running. Adding a CP HA topology requires fencing the sweep (per-process
+owner column or advisory lock) before lifting that restriction.
+
 ## Compute Orchestrator
 
 Separate Python service responsible for the full compute job lifecycle.

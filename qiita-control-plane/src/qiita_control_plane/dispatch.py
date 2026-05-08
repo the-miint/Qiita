@@ -16,10 +16,10 @@ Failure modes:
   FAILED. The done-callback installed here only handles task-level errors
   (asyncio cancellation, lost-pool, etc.) and logs them.
 
-Auto-retry is not implemented in v1 — see task #11. Today every failure
-ends up FAILED and requires a human `/run` to reset. State machine guard
-(atomic conditional UPDATE in `runner._atomic_transition`) prevents
-double-dispatch even if /run races with the implicit on-create dispatch.
+Auto-retry is not implemented: every failure ends up FAILED and requires
+a human `/run` to reset. State machine guard (atomic conditional UPDATE
+in `runner._atomic_transition`) prevents double-dispatch even if /run
+races with the implicit on-create dispatch.
 """
 
 from __future__ import annotations
@@ -38,6 +38,17 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
 
 _log = logging.getLogger(__name__)
+
+
+# The orchestrator-managed lifecycle states. A ticket in any of these
+# is "in flight" — it has not reached a terminal outcome (COMPLETED /
+# FAILED). Used by `recover_orphaned_tickets` to scope the startup sweep
+# and by the work-ticket route's disallow-without-delete check.
+NON_TERMINAL_WORK_TICKET_STATES: tuple[str, ...] = (
+    WorkTicketState.PENDING.value,
+    WorkTicketState.QUEUED.value,
+    WorkTicketState.PROCESSING.value,
+)
 
 
 async def _run_and_log(app: FastAPI, work_ticket_idx: int) -> None:
@@ -59,7 +70,10 @@ async def _run_and_log(app: FastAPI, work_ticket_idx: int) -> None:
     except Exception:
         # run_workflow has already transitioned to FAILED. Log and swallow
         # so the asyncio task completes cleanly.
-        _log.exception("dispatch_ticket %d failed (ticket marked FAILED by runner)", work_ticket_idx)
+        _log.exception(
+            "dispatch_ticket %d failed (ticket marked FAILED by runner)",
+            work_ticket_idx,
+        )
 
 
 def schedule_dispatch(app: FastAPI, work_ticket_idx: int) -> asyncio.Task:
@@ -99,24 +113,27 @@ async def recover_orphaned_tickets(pool: asyncpg.Pool) -> int:
 
     Call from the lifespan startup hook *before* opening listeners. Any
     ticket in PENDING / QUEUED / PROCESSING is by definition orphaned —
-    we just started; nothing else holds it. v1's recovery policy is
+    we just started; nothing else holds it. Recovery policy is
     fail-and-let-operator-decide rather than auto-resume, because the
-    workflow library hasn't been audited for idempotency across the full
-    step graph.
+    workflow library has not been audited for idempotency across the
+    full step graph.
+
+    Single-CP-process contract: this sweep assumes no other CP process
+    is concurrently dispatching against the same database. With multiple
+    CP processes, one's startup would fail tickets another is actively
+    running. CP HA needs fencing (owner column or advisory lock) before
+    that assumption can be lifted; see docs/architecture.md "Work Ticket
+    Lifecycle".
 
     Returns the number of tickets transitioned, for logging.
     """
     rows = await pool.fetch(
         "UPDATE qiita.work_ticket"
         " SET state = $1::qiita.work_ticket_state"
-        " WHERE state IN ($2::qiita.work_ticket_state,"
-        "                 $3::qiita.work_ticket_state,"
-        "                 $4::qiita.work_ticket_state)"
+        " WHERE state = ANY($2::qiita.work_ticket_state[])"
         " RETURNING work_ticket_idx",
         WorkTicketState.FAILED.value,
-        WorkTicketState.PENDING.value,
-        WorkTicketState.QUEUED.value,
-        WorkTicketState.PROCESSING.value,
+        list(NON_TERMINAL_WORK_TICKET_STATES),
     )
     if rows:
         _log.warning(
@@ -127,21 +144,28 @@ async def recover_orphaned_tickets(pool: asyncpg.Pool) -> int:
     return len(rows)
 
 
-async def drain_running_dispatches(
-    running: set[asyncio.Task], *, timeout_seconds: float
-) -> None:
+async def drain_running_dispatches(running: set[asyncio.Task], *, timeout_seconds: float) -> None:
     """Wait for in-flight dispatches at shutdown.
 
     Bounded by `timeout_seconds` so a stuck workflow can't block service
     restart. Anything still running after the deadline is cancelled; the
     runner's exception handler then transitions the ticket to FAILED. The
     next CP startup will catch any leftover via `recover_orphaned_tickets`
-    as a safety net."""
+    as a safety net.
+
+    Snapshots `running` at call time. Relies on FastAPI lifespan
+    ordering — uvicorn closes the listener and finishes outstanding
+    requests before yielding to the lifespan-exit block where this runs,
+    so no new dispatches register after the snapshot."""
     if not running:
         return
     pending = list(running)
-    _log.info("draining %d in-flight dispatch task(s) (timeout=%.0fs)", len(pending), timeout_seconds)
-    done, still_pending = await asyncio.wait(pending, timeout=timeout_seconds)
+    _log.info(
+        "draining %d in-flight dispatch task(s) (timeout=%.0fs)",
+        len(pending),
+        timeout_seconds,
+    )
+    _, still_pending = await asyncio.wait(pending, timeout=timeout_seconds)
     for task in still_pending:
         task.cancel()
     if still_pending:

@@ -99,7 +99,7 @@ URL_STEP_RUN = f"{URL_STEP_PREFIX}{PATH_STEP_RUN}"
 # `asyncio.Task` calling `runner.run_workflow` (option C, in-process
 # dispatch — no polling worker). The /run endpoint is the human-override
 # path that resets a FAILED ticket and re-dispatches; auto-retry is not
-# in v1 (task #11), so /run is currently the only retry mechanism.
+# implemented, so /run is the only retry mechanism.
 
 PATH_WORK_TICKET_PREFIX = "/work-ticket"
 PATH_WORK_TICKET_ROOT = ""  # POST against the prefix itself

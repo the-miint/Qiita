@@ -36,9 +36,7 @@ def check_schema(schema: dict[str, Any]) -> None:
     Draft202012Validator.check_schema(schema)
 
 
-def validate_context(
-    schema: dict[str, Any], context: dict[str, Any]
-) -> list[dict[str, Any]]:
+def validate_context(schema: dict[str, Any], context: dict[str, Any]) -> list[dict[str, Any]]:
     """Validate `context` against `schema`. Returns a list of error
     dicts; empty list means valid.
 

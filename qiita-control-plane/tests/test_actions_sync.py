@@ -47,9 +47,7 @@ def _build_action(*, context_schema: dict) -> ActionDefinition:
                 },
             }
         ],
-        action_ceiling=ActionCeiling(
-            cpu=1, mem_gb=1, walltime=timedelta(minutes=1), gpu=0
-        ),
+        action_ceiling=ActionCeiling(cpu=1, mem_gb=1, walltime=timedelta(minutes=1), gpu=0),
     )
 
 
@@ -71,9 +69,7 @@ class _FakeConn:
 async def test_sync_actions_rejects_malformed_schema_before_any_write():
     """A bad context_schema raises SchemaError before fetchrow runs;
     the transaction body unwinds without committing anything."""
-    bad_action = _build_action(
-        context_schema={"type": "this-is-not-a-real-type"}
-    )
+    bad_action = _build_action(context_schema={"type": "this-is-not-a-real-type"})
     conn = _FakeConn()
 
     with pytest.raises(SchemaError):
