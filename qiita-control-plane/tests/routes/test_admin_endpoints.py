@@ -616,3 +616,149 @@ async def test_revoke_all_tokens_revokes_all_active_and_skips_revoked(admin_clie
     )
     revoked_in_audit = [_detail(r)["token_idx"] for r in rows]
     assert set(revoked_in_audit) == {t1, t2}
+
+
+# ---------------------------------------------------------------------------
+# Atomicity: primary write rolls back if audit insert fails
+# ---------------------------------------------------------------------------
+
+
+async def test_patch_principal_disabled_rolls_back_when_audit_fails(
+    admin_client, postgres_pool, monkeypatch
+):
+    """If the audit insert fails, the UPDATE that disabled the principal
+    must roll back so disabled=true and audit-missing never both hold."""
+    from qiita_control_plane.main import app
+
+    admin_token, _ = await _admin_token(postgres_pool, admin_client)
+    target = await _seed_human(postgres_pool, email="rollback-disabled@example.com")
+    _track(admin_client, target)
+
+    # Inject the audit failure at the symbol routes/admin.py imports.
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("intentional audit failure")
+
+    monkeypatch.setattr("qiita_control_plane.routes.admin.record_event", _boom)
+
+    # raise_app_exceptions=False so the 500 surfaces to the test instead of
+    # the injected exception propagating into the test process.
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.patch(
+            f"/api/v1/admin/principal/{target}/disabled",
+            headers={"Authorization": f"Bearer {admin_token}"},
+            json={"disabled": True, "reason": "test"},
+        )
+
+    state = await postgres_pool.fetchrow(
+        "SELECT disabled, disabled_at, disable_reason FROM qiita.principal WHERE idx = $1",
+        target,
+    )
+    actual = (resp.status_code, dict(state))
+    expected = (500, {"disabled": False, "disabled_at": None, "disable_reason": None})
+    assert actual == expected
+
+
+async def test_patch_principal_retired_rolls_back_when_audit_fails(
+    admin_client, postgres_pool, monkeypatch
+):
+    """If the audit insert fails, the UPDATE that retired the principal
+    must roll back."""
+    from qiita_control_plane.main import app
+
+    admin_token, _ = await _admin_token(postgres_pool, admin_client)
+    target = await _seed_human(postgres_pool, email="rollback-retired@example.com")
+    _track(admin_client, target)
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("intentional audit failure")
+
+    monkeypatch.setattr("qiita_control_plane.routes.admin.record_event", _boom)
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.patch(
+            f"/api/v1/admin/principal/{target}/retired",
+            headers={"Authorization": f"Bearer {admin_token}"},
+            json={"reason": "test rollback"},
+        )
+
+    state = await postgres_pool.fetchrow(
+        "SELECT retired, retired_at, retire_reason FROM qiita.principal WHERE idx = $1",
+        target,
+    )
+    actual = (resp.status_code, dict(state))
+    expected = (500, {"retired": False, "retired_at": None, "retire_reason": None})
+    assert actual == expected
+
+
+async def test_patch_principal_system_role_rolls_back_when_audit_fails(
+    admin_client, postgres_pool, monkeypatch
+):
+    """If the audit insert fails, the UPDATE that changed system_role must
+    roll back so the recorded role and the audit detail never disagree."""
+    from qiita_control_plane.main import app
+
+    admin_token, _ = await _admin_token(postgres_pool, admin_client)
+    target = await _seed_human(postgres_pool, email="rollback-role@example.com")
+    _track(admin_client, target)
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("intentional audit failure")
+
+    monkeypatch.setattr("qiita_control_plane.routes.admin.record_event", _boom)
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.patch(
+            f"/api/v1/admin/principal/{target}/system-role",
+            headers={"Authorization": f"Bearer {admin_token}"},
+            json={"system_role": SystemRole.WET_LAB_ADMIN, "reason": "promo"},
+        )
+
+    role = await postgres_pool.fetchval(
+        "SELECT system_role FROM qiita.principal WHERE idx = $1",
+        target,
+    )
+    actual = (resp.status_code, role)
+    expected = (500, SystemRole.USER)
+    assert actual == expected
+
+
+async def test_revoke_all_tokens_rolls_back_when_audit_fails(
+    admin_client, postgres_pool, monkeypatch
+):
+    """If the bulk audit insert fails, the token revocations must roll back."""
+    from qiita_control_plane.auth.token import mint_api_token
+    from qiita_control_plane.main import app
+
+    admin_token, _ = await _admin_token(postgres_pool, admin_client)
+    target = await _seed_human(postgres_pool, email="rollback-bulk@example.com")
+    _track(admin_client, target)
+    for i in range(2):
+        await mint_api_token(
+            postgres_pool,
+            principal_idx=target,
+            label=f"t{i}",
+            scopes=[Scope.SELF_PROFILE],
+        )
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("intentional audit failure")
+
+    monkeypatch.setattr("qiita_control_plane.routes.admin.record_event_bulk", _boom)
+
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.post(
+            f"/api/v1/admin/principal/{target}/revoke-all-tokens",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+
+    n_active = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.api_token WHERE principal_idx = $1 AND revoked_at IS NULL",
+        target,
+    )
+    actual = (resp.status_code, n_active)
+    expected = (500, 2)
+    assert actual == expected

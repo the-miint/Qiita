@@ -76,7 +76,7 @@ from ..auth.scopes import (
 )
 from ..auth.token import mint_api_token
 from ..config import Settings
-from ..deps import get_db_pool
+from ..deps import get_db_pool, get_tx_conn
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -136,7 +136,7 @@ async def whoami(p: Principal = Depends(get_current_principal)) -> WhoAmIRespons
 async def mint_pat(
     body: ApiTokenMintRequest,
     request: Request,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    conn: asyncpg.Connection = Depends(get_tx_conn),
 ) -> ApiTokenMintResponse | JSONResponse:
     """Mint a personal access token. Requires a *fresh* OIDC JWT — the
     auth_time claim must be within AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS,
@@ -197,7 +197,7 @@ async def mint_pat(
     # computed in SQL via qiita.user_profile_missing_fields so the field set
     # tracks the `profile_complete` generated column's definition (both live in
     # the auth migration; see 20260429000001_user_profile_missing_fields.sql).
-    user_row = await pool.fetchrow(
+    user_row = await conn.fetchrow(
         "SELECT u.principal_idx, p.system_role, p.disabled, p.retired,"
         " u.profile_complete,"
         " qiita.user_profile_missing_fields(u.affiliation, u.address, u.phone)"
@@ -252,7 +252,7 @@ async def mint_pat(
     expires_at = datetime.now(UTC) + timedelta(days=ttl_days)
 
     plaintext, token_idx = await mint_api_token(
-        pool,
+        conn,
         principal_idx=user_row["principal_idx"],
         label=body.label,
         scopes=scopes,
@@ -260,7 +260,7 @@ async def mint_pat(
     )
 
     await record_event(
-        pool,
+        conn,
         event_type=AuthEventType.TOKEN_MINT,
         principal_idx=user_row["principal_idx"],
         actor_principal_idx=user_row["principal_idx"],  # self-mint
@@ -308,7 +308,7 @@ async def list_own_tokens(
 async def revoke_own_token(
     token_idx: int,
     p: Principal = Depends(require_scope(Scope.SELF_TOKEN)),
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    conn: asyncpg.Connection = Depends(get_tx_conn),
 ) -> None:
     """Revoke a token belonging to the caller. 401 if Anonymous, 403 if the
     caller's bearer lacks `self:tokens`, 404 for **either** "no such token"
@@ -317,7 +317,7 @@ async def revoke_own_token(
     """
     # Atomic UPDATE WHERE — only revokes if owner matches and token is not
     # already revoked. Returns 0 rows if either condition fails.
-    result = await pool.execute(
+    result = await conn.execute(
         "UPDATE qiita.api_token SET revoked_at = now()"
         " WHERE token_idx = $1 AND principal_idx = $2 AND revoked_at IS NULL",
         token_idx,
@@ -329,7 +329,7 @@ async def revoke_own_token(
         # an attacker walking token_idx values, conflate the first two as
         # 404. The "already revoked" case is idempotent success, so we let
         # it return 204 silently.
-        owner_idx = await pool.fetchval(
+        owner_idx = await conn.fetchval(
             "SELECT principal_idx FROM qiita.api_token WHERE token_idx = $1",
             token_idx,
         )
@@ -339,7 +339,7 @@ async def revoke_own_token(
         return
 
     await record_event(
-        pool,
+        conn,
         event_type=AuthEventType.TOKEN_REVOKE,
         principal_idx=p.principal_idx,
         actor_principal_idx=p.principal_idx,
