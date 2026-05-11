@@ -9,8 +9,9 @@ CREATE TABLE qiita.sequenced_sample (
     biosample_idx                   BIGINT NOT NULL REFERENCES qiita.biosample(idx) ON DELETE RESTRICT,
     owner_idx                       BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
     prep_protocol_idx               BIGINT NOT NULL REFERENCES qiita.prep_protocol(idx) ON DELETE RESTRICT,
-    metadata_checklist_idx          BIGINT NOT NULL REFERENCES qiita.metadata_checklist(idx) ON DELETE RESTRICT,
-    sequencing_run_idx              BIGINT REFERENCES qiita.sequencing_run(idx) ON DELETE RESTRICT,
+    metadata_checklist_idx          BIGINT REFERENCES qiita.metadata_checklist(idx) ON DELETE RESTRICT,
+    sequenced_pool_idx              BIGINT REFERENCES qiita.sequenced_pool(idx) ON DELETE RESTRICT,
+    sequenced_pool_item_id          TEXT,
 
     ena_experiment_accession        VARCHAR(50),
     ena_run_accession               VARCHAR(50),
@@ -39,8 +40,20 @@ CREATE TABLE qiita.sequenced_sample (
     CONSTRAINT sequenced_sample_ena_run_accession_unique UNIQUE (ena_run_accession),
 
     CONSTRAINT sequenced_sample_run_accession_requires_run CHECK (
-        ena_run_accession IS NULL OR sequencing_run_idx IS NOT NULL
+        ena_run_accession IS NULL OR sequenced_pool_idx IS NOT NULL
     ),
+
+    -- The pool reference and the pool's per-item id are co-populated: either
+    -- the sample is attached to a pool (both set) or it is not (both null).
+    -- A half-populated pair would mean either an item id without a pool
+    -- (orphan) or a pool reference without the samplesheet's Sample_ID
+    -- (which is required to locate the row inside the samplesheet).
+    CONSTRAINT sequenced_sample_pool_pair_consistent CHECK (
+        (sequenced_pool_idx IS NULL) = (sequenced_pool_item_id IS NULL)
+    ),
+
+    CONSTRAINT sequenced_sample_pool_item_id_unique
+        UNIQUE (sequenced_pool_idx, sequenced_pool_item_id),
 
     CONSTRAINT sequenced_sample_retirement_consistent CHECK (
         (retired = false
@@ -75,7 +88,7 @@ COMMENT ON COLUMN qiita.sequenced_sample.ena_experiment_accession IS
 COMMENT ON COLUMN qiita.sequenced_sample.ena_run_accession IS
     'ENA-assigned run accession. NULL until a sequencing run has been '
     'assigned and its submission has succeeded. The schema enforces that a '
-    'run accession can only exist when sequencing_run_idx is also populated.';
+    'run accession can only exist when sequenced_pool_idx is also populated.';
 
 COMMENT ON COLUMN qiita.sequenced_sample.owner_idx IS
     'The principal who owns this sequenced sample. Parallel to '
@@ -85,9 +98,9 @@ CREATE INDEX sequenced_sample_biosample_idx ON qiita.sequenced_sample (biosample
 CREATE INDEX sequenced_sample_owner_idx ON qiita.sequenced_sample (owner_idx);
 CREATE INDEX sequenced_sample_prep_protocol_idx
     ON qiita.sequenced_sample (prep_protocol_idx);
-CREATE INDEX sequenced_sample_sequencing_run_idx
-    ON qiita.sequenced_sample (sequencing_run_idx)
-    WHERE sequencing_run_idx IS NOT NULL;
+CREATE INDEX sequenced_sample_sequenced_pool_idx
+    ON qiita.sequenced_sample (sequenced_pool_idx)
+    WHERE sequenced_pool_idx IS NOT NULL;
 CREATE INDEX sequenced_sample_active_idx
     ON qiita.sequenced_sample (idx)
     WHERE retired = false;

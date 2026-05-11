@@ -176,6 +176,29 @@ CREATE INDEX prep_protocol_field_field_idx
     ON qiita.prep_protocol_field (sequenced_sample_global_field_idx);
 
 
+-- =============================================================================
+-- SEQUENCED-SAMPLE SUBMISSION GLOBAL FIELDS (seed)
+-- =============================================================================
+
+-- Globally-known sequenced-sample fields required for ENA Experiment
+-- submission. Seeded here so the orchestration can write per-study local
+-- field rows linked to these globals from the start.
+-- created_by_idx=1 references the system principal seeded earlier.
+
+INSERT INTO qiita.sequenced_sample_global_field (
+    internal_name, display_name, data_type, default_tier, required, created_by_idx
+) VALUES
+    ('alias',                         'Alias',                         'text', 'public', true, 1),
+    ('title',                         'Title',                         'text', 'public', true, 1),
+    ('design_description',            'Design description',            'text', 'public', true, 1),
+    ('library_name',                  'Library name',                  'text', 'public', true, 1),
+    ('library_strategy',              'Library strategy',              'text', 'public', true, 1),
+    ('library_source',                'Library source',                'text', 'public', true, 1),
+    ('library_selection',             'Library selection',             'text', 'public', true, 1),
+    ('library_layout',                'Library layout',                'text', 'public', true, 1),
+    ('library_construction_protocol', 'Library construction protocol', 'text', 'public', true, 1);
+
+
 -- migrate:down
 
 DROP TABLE IF EXISTS qiita.prep_protocol_field;

@@ -1,12 +1,24 @@
 -- migrate:up
 
 -- =============================================================================
+-- PLATFORM ENUM
+-- =============================================================================
+
+-- Sequencing platforms supported by the system. Add new values when a new
+-- platform comes online; values cannot be removed once any row references them.
+CREATE TYPE qiita.platform AS ENUM (
+    'illumina',
+    'pacbio'
+);
+
+-- =============================================================================
 -- SEQUENCING RUNS
 -- =============================================================================
 
 CREATE TABLE qiita.sequencing_run (
     idx                  BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     instrument_run_id    VARCHAR(255) NOT NULL,
+    platform             qiita.platform NOT NULL,
     instrument_model     TEXT,
     instrument_serial    TEXT,
     run_performed_at     TIMESTAMPTZ,
@@ -56,6 +68,54 @@ CREATE INDEX sequencing_run_instrument_model_idx
     WHERE instrument_model IS NOT NULL;
 
 
+-- =============================================================================
+-- SEQUENCED POOLS
+-- =============================================================================
+
+CREATE TABLE qiita.sequenced_pool (
+    idx                    BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    sequencing_run_idx     BIGINT NOT NULL REFERENCES qiita.sequencing_run(idx) ON DELETE RESTRICT,
+    samplesheet_blob       BYTEA NOT NULL,
+    samplesheet_filename   TEXT NOT NULL,
+    extra_metadata         JSONB,
+    created_by_idx         BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    retired                BOOLEAN NOT NULL DEFAULT false,
+    retired_by_idx         BIGINT REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
+    retired_at             TIMESTAMPTZ,
+    retire_reason          TEXT,
+
+    CONSTRAINT sequenced_pool_retirement_consistent CHECK (
+        (retired = false
+            AND retired_at IS NULL
+            AND retired_by_idx IS NULL
+            AND retire_reason IS NULL)
+        OR
+        (retired = true
+            AND retired_at IS NOT NULL
+            AND retired_by_idx IS NOT NULL)
+    )
+);
+
+COMMENT ON TABLE qiita.sequenced_pool IS
+    'A single post-sequencing samplesheet attached to a sequencing run. For '
+    'platforms with lanes (e.g., illumina), one sequenced_pool row exists per '
+    '(run, lane); the lane assignment lives inside the post-sequencing '
+    'samplesheet blob, not as a separate column, so there is a single source '
+    'of truth.';
+
+COMMENT ON COLUMN qiita.sequenced_pool.samplesheet_blob IS
+    'Post-sequencing samplesheet, typically stored as a SQLite database file. '
+    'BYTEA holds arbitrary binary; TOAST handles values larger than the inline '
+    'threshold.';
+
+CREATE INDEX sequenced_pool_active_idx
+    ON qiita.sequenced_pool (sequencing_run_idx)
+    WHERE retired = false;
+
 -- migrate:down
 
+DROP TABLE IF EXISTS qiita.sequenced_pool;
 DROP TABLE IF EXISTS qiita.sequencing_run;
+DROP TYPE IF EXISTS qiita.platform;
