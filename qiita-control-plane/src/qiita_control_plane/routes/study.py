@@ -24,7 +24,7 @@ from ..auth.guards import (
     require_study_exists,
 )
 from ..auth.principal import HumanUser, Principal
-from ..deps import get_db_pool, get_tx_conn
+from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
 from ..repositories.study import create_study, fetch_study
 
 router = APIRouter(prefix="/study", tags=["study"])
@@ -81,7 +81,7 @@ def _study_response_from_row(row: asyncpg.Record) -> StudyResponse:
 @router.post("", status_code=201)
 async def create_study_route(
     body: StudyCreate,
-    conn: asyncpg.Connection = Depends(get_tx_conn),
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
     user: HumanUser = Depends(require_complete_profile),
     _scope: Principal = Depends(require_scope(Scope.STUDY_WRITE)),
 ) -> StudyResponse:
@@ -105,44 +105,45 @@ async def create_study_route(
     ):
         raise HTTPException(status_code=403, detail=_MSG_ON_BEHALF_REQUIRES_WET_LAB_ADMIN)
 
-    # Owner eligibility pre-flight; collapses every ineligibility case to
-    # one 422.
-    await require_eligible_owner(
-        conn,
-        candidate_idx=effective_owner_idx,
-        detail=_MSG_OWNER_NOT_ELIGIBLE,
-    )
-
-    # Map known FK / trigger violations to user-friendly 422 responses.
-    try:
-        row = await create_study(
+    async with tx() as conn:
+        # Owner eligibility pre-flight; collapses every ineligibility case to
+        # one 422.
+        await require_eligible_owner(
             conn,
-            owner_idx=effective_owner_idx,
-            created_by_idx=user.principal_idx,
-            title=body.title,
-            principal_investigator_idx=body.principal_investigator_idx,
-            alias=body.alias,
-            description=body.description,
-            abstract=body.abstract,
-            funding=body.funding,
-            ebi_study_accession=body.ebi_study_accession,
-            vamps_id=body.vamps_id,
-            notes=body.notes,
-            extra_metadata=body.extra_metadata,
-            default_tier=body.default_tier,
+            candidate_idx=effective_owner_idx,
+            detail=_MSG_OWNER_NOT_ELIGIBLE,
         )
-    except asyncpg.ForeignKeyViolationError:
-        raise HTTPException(status_code=422, detail=_GENERIC_FK_VIOLATION)
-    except asyncpg.RaiseError as exc:
-        # tg_principal_must_be_user fires for owner_idx or PI idx pointing
-        # at a non-user-kind principal (service account or bare principal).
-        # Disambiguate by message text since both columns share one trigger.
-        msg = str(exc)
-        if "must reference a user-kind principal" in msg:
-            if "principal_investigator_idx" in msg:
-                raise HTTPException(status_code=422, detail=_MSG_BAD_PI_NOT_USER)
-            raise HTTPException(status_code=422, detail=_MSG_BAD_OWNER_NOT_USER)
-        raise
+
+        # Map known FK / trigger violations to user-friendly 422 responses.
+        try:
+            row = await create_study(
+                conn,
+                owner_idx=effective_owner_idx,
+                created_by_idx=user.principal_idx,
+                title=body.title,
+                principal_investigator_idx=body.principal_investigator_idx,
+                alias=body.alias,
+                description=body.description,
+                abstract=body.abstract,
+                funding=body.funding,
+                ebi_study_accession=body.ebi_study_accession,
+                vamps_id=body.vamps_id,
+                notes=body.notes,
+                extra_metadata=body.extra_metadata,
+                default_tier=body.default_tier,
+            )
+        except asyncpg.ForeignKeyViolationError:
+            raise HTTPException(status_code=422, detail=_GENERIC_FK_VIOLATION)
+        except asyncpg.RaiseError as exc:
+            # tg_principal_must_be_user fires for owner_idx or PI idx pointing
+            # at a non-user-kind principal (service account or bare principal).
+            # Disambiguate by message text since both columns share one trigger.
+            msg = str(exc)
+            if "must reference a user-kind principal" in msg:
+                if "principal_investigator_idx" in msg:
+                    raise HTTPException(status_code=422, detail=_MSG_BAD_PI_NOT_USER)
+                raise HTTPException(status_code=422, detail=_MSG_BAD_OWNER_NOT_USER)
+            raise
 
     # Shape the inserted row into the response model (shared with the GET
     # handler so column → field mapping has a single source of truth).

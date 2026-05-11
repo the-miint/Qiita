@@ -1,9 +1,17 @@
 """Shared FastAPI dependencies."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
 import asyncpg
 from fastapi import Request
+
+# Type alias for the lazy-transaction factory returned by
+# get_tx_conn_factory. A handler that takes
+# `tx: TxConnFactory = Depends(get_tx_conn_factory)` opens the
+# transaction explicitly with `async with tx() as conn:` instead of
+# at dependency-resolution time.
+TxConnFactory = Callable[[], AbstractAsyncContextManager[asyncpg.Connection]]
 
 
 def get_db_pool(request: Request) -> asyncpg.Pool:
@@ -49,3 +57,31 @@ async def get_tx_conn(request: Request) -> AsyncIterator[asyncpg.Connection]:
     async with pool.acquire() as conn:
         async with conn.transaction():
             yield conn
+
+
+def get_tx_conn_factory(request: Request) -> TxConnFactory:
+    """Return a callable that, when invoked, yields a transactional
+    connection context manager.
+
+    Use on write endpoints whose handlers perform non-trivial work
+    (JWT verification, freshness checks, in-handler validation) before
+    any DB writes. The handler opens the transaction explicitly:
+
+        async def my_handler(tx: TxConnFactory = Depends(get_tx_conn_factory)):
+            # ... pure validation that may 4xx ...
+            async with tx() as conn:
+                # ... atomic DB work ...
+
+    Prefer get_tx_conn for handlers that go to the DB immediately;
+    this dep only earns its keep when there is meaningful pre-DB
+    work whose connection cost matters under high 4xx rates.
+    """
+    pool = get_db_pool(request)
+
+    @asynccontextmanager
+    async def _factory() -> AsyncIterator[asyncpg.Connection]:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                yield conn
+
+    return _factory

@@ -44,7 +44,7 @@ from ..auth.guards import (
     require_study_exists,
 )
 from ..auth.principal import HumanUser, Principal
-from ..deps import get_db_pool, get_tx_conn
+from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
 from ..repositories.biosample import (
     fetch_biosample,
     fetch_biosample_idxs_for_study,
@@ -87,7 +87,7 @@ _GENERIC_FK_VIOLATION = "references a row that does not exist"
 async def import_biosample(
     study_idx: Annotated[int, Field(gt=0)],
     body: BiosampleImportRequest,
-    conn: asyncpg.Connection = Depends(get_tx_conn),
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
     user: HumanUser = Depends(require_complete_profile),
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
     _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
@@ -99,64 +99,65 @@ async def import_biosample(
     the biosample:write scope, must be wet_lab_admin or higher, and the
     path's study_idx must exist.
     """
-    # Owner eligibility pre-flight; collapses every ineligibility case to
-    # one 422.
-    await require_eligible_owner(
-        conn,
-        candidate_idx=body.owner_idx,
-        detail=_MSG_OWNER_NOT_ELIGIBLE,
-    )
-
-    # Map known composer-side validation errors and DB-level violations to
-    # user-friendly 422 / 409 responses. Composer-specific exceptions are
-    # caught first so their detail wins over the generic asyncpg fallbacks.
-    try:
-        result = await import_biosample_from_owner_biosample_id(
+    async with tx() as conn:
+        # Owner eligibility pre-flight; collapses every ineligibility case to
+        # one 422.
+        await require_eligible_owner(
             conn,
-            study_idx=study_idx,
-            owner_idx=body.owner_idx,
-            owner_biosample_id_field_name=body.owner_biosample_id_field_name,
-            owner_biosample_id_value=body.owner_biosample_id_value,
-            caller_idx=user.principal_idx,
-            metadata=body.metadata,
-            metadata_checklist_idx=body.metadata_checklist_idx,
-            biosample_accession=body.biosample_accession,
-            ena_sample_accession=body.ena_sample_accession,
+            candidate_idx=body.owner_idx,
+            detail=_MSG_OWNER_NOT_ELIGIBLE,
         )
-    except BiosampleOwnerIdFieldCollisionError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"metadata key {exc.display_name!r} collides with owner_biosample_id_field_name"
-            ),
-        )
-    except BiosampleMetadataUnknownFieldsError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=f"unknown metadata fields: {', '.join(exc.unknown_display_names)}",
-        )
-    except BiosampleMetadataParseError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"could not parse metadata field {exc.display_name!r}"
-                f" value {exc.text_value!r} as {exc.data_type}: {exc.reason}"
-            ),
-        )
-    except BiosampleStudyFieldConflictError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"study has an existing field at display_name {exc.display_name!r}"
-                " bound to a different global concept"
-            ),
-        )
-    except asyncpg.UniqueViolationError as exc:
-        detail = _UNIQUE_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_UNIQUE_VIOLATION)
-        raise HTTPException(status_code=409, detail=detail)
-    except asyncpg.ForeignKeyViolationError as exc:
-        detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_FK_VIOLATION)
-        raise HTTPException(status_code=422, detail=detail)
+
+        # Map known composer-side validation errors and DB-level violations to
+        # user-friendly 422 / 409 responses. Composer-specific exceptions are
+        # caught first so their detail wins over the generic asyncpg fallbacks.
+        try:
+            result = await import_biosample_from_owner_biosample_id(
+                conn,
+                study_idx=study_idx,
+                owner_idx=body.owner_idx,
+                owner_biosample_id_field_name=body.owner_biosample_id_field_name,
+                owner_biosample_id_value=body.owner_biosample_id_value,
+                caller_idx=user.principal_idx,
+                metadata=body.metadata,
+                metadata_checklist_idx=body.metadata_checklist_idx,
+                biosample_accession=body.biosample_accession,
+                ena_sample_accession=body.ena_sample_accession,
+            )
+        except BiosampleOwnerIdFieldCollisionError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"metadata key {exc.display_name!r} collides with owner_biosample_id_field_name"
+                ),
+            )
+        except BiosampleMetadataUnknownFieldsError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"unknown metadata fields: {', '.join(exc.unknown_display_names)}",
+            )
+        except BiosampleMetadataParseError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"could not parse metadata field {exc.display_name!r}"
+                    f" value {exc.text_value!r} as {exc.data_type}: {exc.reason}"
+                ),
+            )
+        except BiosampleStudyFieldConflictError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"study has an existing field at display_name {exc.display_name!r}"
+                    " bound to a different global concept"
+                ),
+            )
+        except asyncpg.UniqueViolationError as exc:
+            detail = _UNIQUE_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_UNIQUE_VIOLATION)
+            raise HTTPException(status_code=409, detail=detail)
+        except asyncpg.ForeignKeyViolationError as exc:
+            detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_FK_VIOLATION)
+            raise HTTPException(status_code=422, detail=detail)
 
     return BiosampleImportResponse(
         biosample_idx=result.biosample_idx,
@@ -357,7 +358,7 @@ async def patch_biosample_route(
     body: BiosamplePatchRequest,
     response: Response,
     if_match: Annotated[str | None, Header(alias="If-Match")] = None,
-    conn: asyncpg.Connection = Depends(get_tx_conn),
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
     caller: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
 ) -> BiosampleResponse:
@@ -406,59 +407,60 @@ async def patch_biosample_route(
     # null vs. absent is distinguished by model_fields_set.
     fields = {name: getattr(body, name) for name in body.model_fields_set}
 
-    try:
-        # Preflight: existence -> 404, retirement -> 409, ETag -> 412.
-        # for_update=True acquires a row-level lock for the rest of
-        # the transaction so a concurrent PATCH on the same row
-        # serializes here instead of racing through the ETag check
-        # and silently overwriting the first writer's update.
-        row = await fetch_biosample(conn, biosample_idx, for_update=True)
-        if row is None:
-            raise HTTPException(status_code=404, detail=f"biosample {biosample_idx} not found")
-        if row["retired"]:
-            raise HTTPException(status_code=409, detail=f"biosample {biosample_idx} is retired")
-        if if_match != _etag_for_updated_at(row["updated_at"]):
-            raise HTTPException(status_code=412, detail="If-Match did not match")
+    async with tx() as conn:
+        try:
+            # Preflight: existence -> 404, retirement -> 409, ETag -> 412.
+            # for_update=True acquires a row-level lock for the rest of
+            # the transaction so a concurrent PATCH on the same row
+            # serializes here instead of racing through the ETag check
+            # and silently overwriting the first writer's update.
+            row = await fetch_biosample(conn, biosample_idx, for_update=True)
+            if row is None:
+                raise HTTPException(status_code=404, detail=f"biosample {biosample_idx} not found")
+            if row["retired"]:
+                raise HTTPException(status_code=409, detail=f"biosample {biosample_idx} is retired")
+            if if_match != _etag_for_updated_at(row["updated_at"]):
+                raise HTTPException(status_code=412, detail="If-Match did not match")
 
-        # Eligibility preflight runs only when ownership is being
-        # transferred; collapses every ineligibility case to 422.
-        if "owner_idx" in fields:
-            await require_eligible_owner(
-                conn,
-                candidate_idx=fields["owner_idx"],
-                detail=_MSG_OWNER_NOT_ELIGIBLE,
-            )
+            # Eligibility preflight runs only when ownership is being
+            # transferred; collapses every ineligibility case to 422.
+            if "owner_idx" in fields:
+                await require_eligible_owner(
+                    conn,
+                    candidate_idx=fields["owner_idx"],
+                    detail=_MSG_OWNER_NOT_ELIGIBLE,
+                )
 
-        # Apply the UPDATE; the repo function returns the post-UPDATE row
-        # in the same shape fetch_biosample selects, so no follow-up SELECT
-        # is needed. The FOR UPDATE preflight holds a row lock for the rest
-        # of this transaction, so update_biosample cannot return None here —
-        # the row is guaranteed to exist under our lock. The defensive None
-        # check is kept as a backstop and surfaces as the same 404 the
-        # preflight emits, so an invariant violation (someone removing the
-        # lock without rethinking) fails loudly rather than indexing into
-        # None.
-        updated_row = await update_biosample(conn, biosample_idx, fields=fields)
-        if updated_row is None:
-            raise HTTPException(status_code=404, detail=f"biosample {biosample_idx} not found")
+            # Apply the UPDATE; the repo function returns the post-UPDATE
+            # row in the same shape fetch_biosample selects, so no follow-up
+            # SELECT is needed. The FOR UPDATE preflight holds a row lock
+            # for the rest of this transaction, so update_biosample cannot
+            # return None here — the row is guaranteed to exist under our
+            # lock. The defensive None check is kept as a backstop and
+            # surfaces as the same 404 the preflight emits, so an invariant
+            # violation (someone removing the lock without rethinking) fails
+            # loudly rather than indexing into None.
+            updated_row = await update_biosample(conn, biosample_idx, fields=fields)
+            if updated_row is None:
+                raise HTTPException(status_code=404, detail=f"biosample {biosample_idx} not found")
 
-        # Re-read global metadata in the same transaction so the response
-        # and the UPDATE see one consistent snapshot.
-        metadata_rows = await fetch_global_metadata_for_biosample(conn, biosample_idx)
-    except asyncpg.UniqueViolationError as exc:
-        detail = _UNIQUE_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_UNIQUE_VIOLATION)
-        raise HTTPException(status_code=409, detail=detail)
-    except asyncpg.ForeignKeyViolationError as exc:
-        detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_FK_VIOLATION)
-        raise HTTPException(status_code=422, detail=detail)
-    except asyncpg.RaiseError as exc:
-        # Role-typed FK trigger on biosample.owner_idx: candidate is
-        # non-user. The preflight should have caught this; the trigger is
-        # the schema-level backstop and the caller-facing surface is the
-        # same 422 the preflight emits.
-        if _OWNER_TRIGGER_RAISE_MARKER in str(exc):
-            raise HTTPException(status_code=422, detail=_MSG_OWNER_NOT_ELIGIBLE)
-        raise
+            # Re-read global metadata in the same transaction so the response
+            # and the UPDATE see one consistent snapshot.
+            metadata_rows = await fetch_global_metadata_for_biosample(conn, biosample_idx)
+        except asyncpg.UniqueViolationError as exc:
+            detail = _UNIQUE_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_UNIQUE_VIOLATION)
+            raise HTTPException(status_code=409, detail=detail)
+        except asyncpg.ForeignKeyViolationError as exc:
+            detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_FK_VIOLATION)
+            raise HTTPException(status_code=422, detail=detail)
+        except asyncpg.RaiseError as exc:
+            # Role-typed FK trigger on biosample.owner_idx: candidate is
+            # non-user. The preflight should have caught this; the trigger
+            # is the schema-level backstop and the caller-facing surface is
+            # the same 422 the preflight emits.
+            if _OWNER_TRIGGER_RAISE_MARKER in str(exc):
+                raise HTTPException(status_code=422, detail=_MSG_OWNER_NOT_ELIGIBLE)
+            raise
 
     # Set the new ETag from the updated row's bumped updated_at.
     response.headers["ETag"] = _etag_for_updated_at(updated_row["updated_at"])
