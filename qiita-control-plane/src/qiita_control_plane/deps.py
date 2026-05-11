@@ -1,5 +1,7 @@
 """Shared FastAPI dependencies."""
 
+from collections.abc import AsyncIterator
+
 import asyncpg
 from fastapi import Request
 
@@ -34,3 +36,16 @@ def get_data_plane_url(request: Request) -> str:
     if settings is None:
         raise RuntimeError("Settings not initialised — lifespan may not have run")
     return settings.data_plane_url
+
+
+async def get_tx_conn(request: Request) -> AsyncIterator[asyncpg.Connection]:
+    """Acquire an asyncpg.Connection from the pool wrapped in a transaction.
+
+    Use as a FastAPI dependency on write endpoints (POST/PUT/PATCH/DELETE).
+    The transaction commits on normal handler return and rolls back on any
+    raised exception, including HTTPException.
+    """
+    pool = get_db_pool(request)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            yield conn
