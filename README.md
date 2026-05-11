@@ -22,45 +22,58 @@ Run `make dev-setup` for exact install commands. Required tools:
 
 - **uv** — Python dependency management (all Python components)
 - **Rust / cargo** — data plane build
-- **dbmate** — database migrations (`make migrate`)
+- **PostgreSQL** — local dev DB and DuckLake catalog (must be running before `make migrate`)
 - **apptainer** — workflow container builds (Linux only; skipped gracefully on macOS)
-- **grpcurl** — `make verify-health` only
+- **dbmate** — database migrations (`make migrate`); auto-installed by the target
+- **grpcurl** — `make verify-health` only; auto-installed by the target
 
 ## Installation
 
 ```sh
-# Install deps for all components
+# 1. Check tool prerequisites. Prints install commands only for what's missing.
+make dev-setup
+
+# 2. Install pre-commit hooks (one-time, per clone).
+make install-hooks
+
+# 3. Install deps for all components.
 make build
 
-
-# Before running migrations or starting services, create a local `.env` from the committed template and source it (`.env` is already gitignored):
-
+# 4. Create a local `.env` from the committed template (`.env` is gitignored).
 cp .env.example .env
 
-# EDIT: ----------------------------------
-# edit .env and fill in DATABASE_URL, HMAC_SECRET_KEY, CONTROL_PLANE_URL, and DUCKLAKE_CATALOG_CONNSTR
-# ----------------------------------------
-
+# 5. Edit .env: fill in DATABASE_URL, HMAC_SECRET_KEY, CONTROL_PLANE_URL,
+#    and DUCKLAKE_CATALOG_CONNSTR. Then source it:
 . .env
 
+# 6. Make sure Postgres is running and DATABASE_URL points at a reachable host
+#    before `make migrate` (which does not start Postgres or create roles):
+#      macOS:   brew services start postgresql@17
+#      Linux:   sudo systemctl start postgresql
+#    On Linux, a fresh apt/dnf install ships only a peer-auth `postgres` role,
+#    so first-time setup also needs a superuser role for your OS user:
+#      sudo -u postgres createuser -s $USER
 
-# create the `qiita` database if it does not already exist, then runs all pending migrations:
-
+# 7. Create the `qiita` database if absent, then run all pending migrations.
 make migrate
 ```
 
 ## Development
 
 ```sh
-# Unit tests
+# Pure-unit tests (no infrastructure)
 make test
+
+# Full control-plane suite including DB-bound tests. Brings up Docker Postgres
+# (or set QIITA_USE_HOST_POSTGRES=1 to use a host Postgres — see
+# docs/runbooks/integration-tests-host-postgres.md, which also covers test-integration).
+make test-control-plane-with-db
+
+# Cross-component integration tests (same Postgres requirement as above)
+make test-integration
 
 # Lint
 make lint
-
-# Integration tests (requires Docker; on macOS without Docker,
-# see docs/runbooks/integration-tests-host-postgres.md first!)
-make test-integration
 
 # Clean build artifacts
 make clean

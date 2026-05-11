@@ -1,11 +1,13 @@
-# Integration tests on host Postgres (no Docker)
+# Tests on host Postgres (no Docker)
 
-**Purpose.** Run `make test-integration` against a Homebrew-installed Postgres
-on the host instead of the default Docker Compose stack. This is the path
-GitHub Actions takes on `macos-latest`, where Docker isn't available on the
-runner. On Linux and on macOS setups that do have Docker, the default Docker
-mode works without any of this — `make test-integration` brings up its own
-container on `:5433` and tears it down at the end.
+**Purpose.** Run `make test-integration` or `make test-control-plane-with-db`
+against a Homebrew-installed Postgres on the host instead of the default
+Docker Compose stack. This is the path GitHub Actions takes on `macos-latest`,
+where Docker isn't available on the runner. Both targets share the same
+`QIITA_USE_HOST_POSTGRES=1` switch and the same host-mode env vars below.
+On Linux and on macOS setups that do have Docker, the default Docker mode
+works without any of this — both targets bring up their own container on
+`:5433` and tear it down at the end.
 
 > ⚠ This setup currently requires editing several config values that are
 > duplicated across the codebase. The exact list below was assembled by
@@ -64,14 +66,14 @@ psql -d postgres -c "CREATE DATABASE qiita_ducklake OWNER qiita;"
 
 ## Test Run
 
-Run this to export the seven
-environment variables `make test-integration` reads in host mode.
-Must be run once in every shell where testing is being done.
+Run this to export the seven environment variables that both
+`make test-integration` and `make test-control-plane-with-db` read in
+host mode. Must be run once in every shell where testing is being done.
 
 ```bash
 # --- Persistent: env vars the test harness reads. Must be set in every
-# shell that runs `make test-integration` in host mode. Missing any one
-# produces a confusing failure (see Troubleshooting and the table below). ---
+# shell that runs either target in host mode. Missing any one produces a
+# confusing failure (see Troubleshooting and the table below). ---
 export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
 export QIITA_USE_HOST_POSTGRES=1
 export QIITA_TEST_POSTGRES_URL='postgresql://qiita:qiita@localhost:5432/qiita_test?sslmode=disable'
@@ -84,8 +86,12 @@ export PGPASSWORD=qiita
 
 ## Run the tests
 
+Either target works once the env vars above are set:
+
 ```bash
 make test-integration
+# or:
+make test-control-plane-with-db
 ```
 
 ### Reprovisioning
