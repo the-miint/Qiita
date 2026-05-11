@@ -799,9 +799,7 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_owner_id_field
 
 async def test_fetch_biosample_idxs_for_study_returns_empty_for_no_links(ctx):
     # The fixture's study has no biosample links yet; the read returns [].
-    result = await fetch_biosample_idxs_for_study(
-        ctx["pool"], study_idx=ctx["study_idx"], limit=10
-    )
+    result = await fetch_biosample_idxs_for_study(ctx["pool"], study_idx=ctx["study_idx"], limit=10)
     assert result == []
 
 
@@ -827,9 +825,7 @@ async def test_fetch_biosample_idxs_for_study_orders_newest_link_first(ctx):
         ctx["created"]["biosample_to_study"].append((bs_idx, ctx["study_idx"]))
         bs_idxs.append(bs_idx)
 
-    result = await fetch_biosample_idxs_for_study(
-        ctx["pool"], study_idx=ctx["study_idx"], limit=10
-    )
+    result = await fetch_biosample_idxs_for_study(ctx["pool"], study_idx=ctx["study_idx"], limit=10)
     # Newest-linked first: the third insert is the head of the list.
     assert result == list(reversed(bs_idxs))
 
@@ -846,9 +842,7 @@ async def test_fetch_biosample_idxs_for_study_excludes_retired_link(ctx):
         retired_by_idx=ctx["principal_idx"],
     )
 
-    result = await fetch_biosample_idxs_for_study(
-        ctx["pool"], study_idx=ctx["study_idx"], limit=10
-    )
+    result = await fetch_biosample_idxs_for_study(ctx["pool"], study_idx=ctx["study_idx"], limit=10)
     assert result == [active_idx]
 
 
@@ -864,9 +858,7 @@ async def test_fetch_biosample_idxs_for_study_excludes_retired_biosample(ctx):
         retired_by_idx=ctx["principal_idx"],
     )
 
-    result = await fetch_biosample_idxs_for_study(
-        ctx["pool"], study_idx=ctx["study_idx"], limit=10
-    )
+    result = await fetch_biosample_idxs_for_study(ctx["pool"], study_idx=ctx["study_idx"], limit=10)
     assert result == [active_idx]
 
 
@@ -877,9 +869,7 @@ async def test_fetch_biosample_idxs_for_study_respects_limit(ctx):
     for _ in range(3):
         bs_idxs.append(await _create_biosample_with_link(ctx))
 
-    result = await fetch_biosample_idxs_for_study(
-        ctx["pool"], study_idx=ctx["study_idx"], limit=2
-    )
+    result = await fetch_biosample_idxs_for_study(ctx["pool"], study_idx=ctx["study_idx"], limit=2)
     # The two newest are the last two appended; reversed to put newest first.
     assert result == [bs_idxs[2], bs_idxs[1]]
 
@@ -1064,9 +1054,7 @@ async def test_update_biosample_writes_single_field(ctx):
     )
 
     async with ctx["pool"].acquire() as conn:
-        row = await update_biosample(
-            conn, bs_idx, fields={"biosample_accession": new_acc}
-        )
+        row = await update_biosample(conn, bs_idx, fields={"biosample_accession": new_acc})
     actual = dict(row)
 
     expected = {
@@ -1151,9 +1139,7 @@ async def test_update_biosample_explicit_null_clears_nullable_column(ctx):
     )
 
     async with ctx["pool"].acquire() as conn:
-        row = await update_biosample(
-            conn, bs_idx, fields={"metadata_checklist_idx": None}
-        )
+        row = await update_biosample(conn, bs_idx, fields={"metadata_checklist_idx": None})
     assert row["metadata_checklist_idx"] is None
     # The non-targeted accession must survive untouched so we know the
     # NULL write didn't widen into a blanket clear.
@@ -1221,9 +1207,7 @@ async def test_update_biosample_bad_metadata_checklist_idx_raises_fk_error(ctx):
 
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(asyncpg.ForeignKeyViolationError):
-            await update_biosample(
-                conn, bs_idx, fields={"metadata_checklist_idx": bad_checklist}
-            )
+            await update_biosample(conn, bs_idx, fields={"metadata_checklist_idx": bad_checklist})
 
 
 async def test_update_biosample_bad_owner_idx_raises_role_typed_error(ctx):
@@ -1287,9 +1271,7 @@ async def test_update_biosample_advances_updated_at(ctx):
     )
 
     async with ctx["pool"].acquire() as conn:
-        row = await update_biosample(
-            conn, bs_idx, fields={"submission_error": "transient retry"}
-        )
+        row = await update_biosample(conn, bs_idx, fields={"submission_error": "transient retry"})
     assert row["updated_at"] > initial_updated_at
 
 
