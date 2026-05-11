@@ -1136,12 +1136,10 @@ async def test_cli_exchange_unknown_code_returns_404(auth_client):
 
 
 async def test_post_pat_rolls_back_when_audit_fails(
-    auth_client, postgres_pool, jwks_harness, monkeypatch
+    auth_client, postgres_pool, jwks_harness, monkeypatch, audit_failure, fail_safe_client
 ):
     """If the audit insert fails, the token mint must roll back so a token
     never lands in the DB without a corresponding audit row."""
-    from qiita_control_plane.main import app
-
     pidx = await _seed_user(
         postgres_pool,
         email="rollback-pat@example.com",
@@ -1150,24 +1148,16 @@ async def test_post_pat_rolls_back_when_audit_fails(
     )
     _track(auth_client, pidx)
 
-    # Inject the audit failure at the symbol routes/auth.py imports.
-    async def _boom(*args, **kwargs):
-        raise RuntimeError("intentional audit failure")
-
-    monkeypatch.setattr("qiita_control_plane.routes.auth.record_event", _boom)
+    monkeypatch.setattr("qiita_control_plane.routes.auth.record_event", audit_failure)
 
     jwt = jwks_harness.sign(
         _claims(jwks_harness, sub="rollback-pat", email="rollback-pat@example.com")
     )
-    # raise_app_exceptions=False so the 500 surfaces to the test instead of
-    # the injected exception propagating into the test process.
-    transport = ASGITransport(app=app, raise_app_exceptions=False)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.post(
-            "/api/v1/auth/pat",
-            headers={"Authorization": f"Bearer {jwt}"},
-            json={"label": "rollback-attempt"},
-        )
+    resp = await fail_safe_client.post(
+        "/api/v1/auth/pat",
+        headers={"Authorization": f"Bearer {jwt}"},
+        json={"label": "rollback-attempt"},
+    )
 
     token_count = await postgres_pool.fetchval(
         "SELECT count(*) FROM qiita.api_token WHERE principal_idx = $1",
@@ -1179,12 +1169,11 @@ async def test_post_pat_rolls_back_when_audit_fails(
 
 
 async def test_delete_token_rolls_back_when_audit_fails(
-    auth_client, postgres_pool, jwks_harness, monkeypatch
+    auth_client, postgres_pool, jwks_harness, monkeypatch, audit_failure, fail_safe_client
 ):
     """If the audit insert fails, the token revocation must roll back so
     the token stays active and matches the audit-row-missing state."""
     from qiita_control_plane.auth.token import mint_api_token
-    from qiita_control_plane.main import app
 
     pidx = await _seed_user(
         postgres_pool,
@@ -1200,17 +1189,12 @@ async def test_delete_token_rolls_back_when_audit_fails(
         scopes=[Scope.SELF_TOKEN],
     )
 
-    async def _boom(*args, **kwargs):
-        raise RuntimeError("intentional audit failure")
+    monkeypatch.setattr("qiita_control_plane.routes.auth.record_event", audit_failure)
 
-    monkeypatch.setattr("qiita_control_plane.routes.auth.record_event", _boom)
-
-    transport = ASGITransport(app=app, raise_app_exceptions=False)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.delete(
-            f"/api/v1/auth/token/{token_idx}",
-            headers={"Authorization": f"Bearer {plaintext}"},
-        )
+    resp = await fail_safe_client.delete(
+        f"/api/v1/auth/token/{token_idx}",
+        headers={"Authorization": f"Bearer {plaintext}"},
+    )
 
     revoked_at = await postgres_pool.fetchval(
         "SELECT revoked_at FROM qiita.api_token WHERE token_idx = $1",

@@ -10,6 +10,7 @@ tracked table set differs per route.
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
 
+import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope
@@ -233,3 +234,37 @@ async def assert_owner_ineligibility_422(
     resp = await post_with_owner_idx(owner_idx)
     assert resp.status_code == 422, resp.text
     assert resp.json()["detail"] == expected_detail
+
+
+# ---------------------------------------------------------------------------
+# Atomicity-test fixtures
+# ---------------------------------------------------------------------------
+# Used by tests that monkeypatch a helper (e.g., record_event) to raise, then
+# assert the route's primary write rolled back when the route returned 500.
+
+
+@pytest.fixture
+def audit_failure():
+    """Return an async coroutine that always raises. Pass it to
+    monkeypatch.setattr(..., audit_failure) to simulate a failing audit
+    insert during an atomicity test."""
+
+    async def _failing(*args, **kwargs):
+        raise RuntimeError("intentional audit failure")
+
+    return _failing
+
+
+@pytest_asyncio.fixture
+async def fail_safe_client(postgres_pool):
+    """Yield an AsyncClient whose transport surfaces 5xx responses to the
+    test instead of re-raising the underlying exception. Use when the test
+    deliberately drives a route to a 500 (e.g., atomicity tests injecting
+    an audit failure). Depends on postgres_pool so the app's pool state is
+    initialised before the request runs."""
+    from qiita_control_plane.main import app
+
+    app.state.pool = postgres_pool
+    transport = ASGITransport(app=app, raise_app_exceptions=False)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client
