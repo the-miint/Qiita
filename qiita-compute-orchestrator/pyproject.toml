@@ -6,6 +6,9 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "qiita-common",
+    # SlurmBackend talks to slurmrestd over HTTP; declared directly
+    # rather than relying on the transitive dep through qiita-common.
+    "httpx>=0.28",
     # LocalBackend uses DuckDB+miint in-process to stand in for SLURM in
     # dev/test. SlurmBackend won't need it, but the orchestrator runs both
     # backends from the same image, so the dep stays.

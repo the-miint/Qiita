@@ -1,5 +1,8 @@
 # Qiita
 
+> [!WARNING]
+> **This project is under active development. Do not use.**
+
 Scalable multi-omic study management, processing, and analysis platform for microbiome data (amplicon, metagenomic, metatranscriptomic, metabolomic, proteomic). Designed for millions of samples and hundreds of TB of data.
 
 See [`docs/architecture.md`](docs/architecture.md) for a full system overview.

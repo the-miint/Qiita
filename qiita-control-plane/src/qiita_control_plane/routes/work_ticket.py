@@ -381,11 +381,20 @@ async def run_work_ticket(
         )
 
     if current_state == WorkTicketState.FAILED.value:
-        # Manual restart: FAILED → PENDING (atomic; refuse if state
-        # changed under us between the SELECT and now).
+        # Manual restart: FAILED → PENDING. Per arch.md spec, resets
+        # retry_count to 0 (operator override of the auto-retry budget)
+        # and clears the failure_* columns so the
+        # work_ticket_failure_consistent DB CHECK is honoured (failure_*
+        # all NULL when state != failed). Atomic; refuses if state
+        # changed under us between the SELECT and now.
         updated = await pool.fetchval(
             "UPDATE qiita.work_ticket"
-            " SET state = $1::qiita.work_ticket_state"
+            " SET state = $1::qiita.work_ticket_state,"
+            "     retry_count = 0,"
+            "     failure_type = NULL,"
+            "     failure_stage = NULL,"
+            "     failure_step_name = NULL,"
+            "     failure_reason = NULL"
             " WHERE work_ticket_idx = $2"
             "   AND state = $3::qiita.work_ticket_state"
             " RETURNING work_ticket_idx",
@@ -398,7 +407,10 @@ async def run_work_ticket(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="work_ticket state changed under /run; retry",
             )
-        _log.info("manual restart of work_ticket %d (FAILED → PENDING)", work_ticket_idx)
+        _log.info(
+            "manual restart of work_ticket %d (FAILED → PENDING; retry_count reset)",
+            work_ticket_idx,
+        )
     # PENDING: no state change needed, just dispatch.
 
     schedule_dispatch(request.app, work_ticket_idx)

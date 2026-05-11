@@ -63,6 +63,7 @@ async def test_step_dispatch_hash_end_to_end(orchestrator_app, tmp_path):
             inputs={"fasta_path": fasta},
             workspace=workspace,
             reference_idx=1,
+            work_ticket_idx=1,
         )
 
     manifest = outputs["manifest"]
@@ -100,5 +101,6 @@ async def test_step_dispatch_rejects_wrong_token(orchestrator_app, tmp_path):
                 inputs={"fasta_path": tmp_path / "x.fa"},
                 workspace=tmp_path,
                 reference_idx=1,
+                work_ticket_idx=1,
             )
         assert exc_info.value.response.status_code == 401

@@ -108,7 +108,13 @@ async def _run_load(backend, manifest_file, fasta_path, feature_map_file, tmp_pa
         "feature_map": feature_map_file,
     }
     inputs.update(kwargs)
-    result = await backend.run_step("load", inputs, output_dir, reference_idx=REFERENCE_IDX)
+    result = await backend.run_step(
+        "load",
+        inputs,
+        output_dir,
+        reference_idx=REFERENCE_IDX,
+        work_ticket_idx=1,
+    )
     return result["staging_dir"]
 
 
@@ -320,6 +326,7 @@ async def test_phylogeny_allows_unmatched_tips(
         },
         out,
         reference_idx=REFERENCE_IDX,
+        work_ticket_idx=1,
     )
 
     pq = result["staging_dir"] / "reference_phylogeny.parquet"
@@ -353,9 +360,12 @@ async def test_no_optional_files(manifest_file, fasta_path, feature_map_file, tm
 
 
 async def test_rejects_missing_manifest(fasta_path, feature_map_file, tmp_path):
+    """Missing manifest input surfaces as BackendFailure(BAD_INPUT)."""
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(BackendFailure) as ei:
         await LocalBackend().run_step(
             "load",
             {
@@ -365,10 +375,19 @@ async def test_rejects_missing_manifest(fasta_path, feature_map_file, tmp_path):
             },
             tmp_path / "out",
             reference_idx=REFERENCE_IDX,
+            work_ticket_idx=1,
         )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert ei.value.step_name == "load"
+    assert not ei.value.transient
 
 
 async def test_rejects_unmapped_hash(manifest_file, fasta_path, tmp_path):
+    """Sequence hash with no matching feature_idx surfaces as
+    BackendFailure(BAD_INPUT) — the bad-input data is the empty
+    feature_map, not the FASTA."""
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+
     from qiita_compute_orchestrator.backends.local import LocalBackend
 
     # Empty feature map — Parquet with the right schema but zero rows.
@@ -377,7 +396,7 @@ async def test_rejects_unmapped_hash(manifest_file, fasta_path, tmp_path):
         conn.execute("CREATE TEMP TABLE fm (sequence_hash UUID, feature_idx BIGINT)")
         conn.execute(f"COPY fm TO '{empty_fm}' (FORMAT PARQUET)")
 
-    with pytest.raises(ValueError, match="unmapped"):
+    with pytest.raises(BackendFailure) as ei:
         await LocalBackend().run_step(
             "load",
             {
@@ -387,4 +406,7 @@ async def test_rejects_unmapped_hash(manifest_file, fasta_path, tmp_path):
             },
             tmp_path / "out",
             reference_idx=REFERENCE_IDX,
+            work_ticket_idx=1,
         )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert "unmapped" in ei.value.reason

@@ -112,6 +112,17 @@ class FeatureHashEntry(BaseModel):
         return self
 
 
+class StepBaselineResources(BaseModel):
+    """Resource ask for one workflow step. Mirrors qiita_common.actions.
+    BaselineResources but lives here so the over-the-wire StepRunRequest
+    can include it without a circular import (actions.py imports models)."""
+
+    cpu: Annotated[int, Field(gt=0)]
+    mem_gb: Annotated[int, Field(gt=0)]
+    walltime_seconds: Annotated[int, Field(gt=0)]
+    gpu: Annotated[int, Field(ge=0)] = 0
+
+
 class StepRunRequest(BaseModel):
     """Body for POST /api/v1/step/run on the orchestrator.
 
@@ -119,12 +130,26 @@ class StepRunRequest(BaseModel):
     The orchestrator dispatches to its configured ComputeBackend's
     `run_step`. Paths are absolute and live on the workspace shared
     between control plane and orchestrator.
+
+    `container`, `entrypoint`, and `baseline_resources` come from the
+    YAML step's static metadata. They are optional on the wire so
+    LocalBackend (which dispatches on step_name and uses internal
+    helpers) can be invoked without populating them; SlurmBackend
+    requires them and refuses the request when they're absent.
+
+    `work_ticket_idx` flows through so SlurmBackend can stamp the SLURM
+    job name with the originating ticket id — making scheduler dumps
+    cross-referenceable back to the work_ticket row.
     """
 
     step_name: str = Field(min_length=1)
     inputs: dict[str, str] = Field(default_factory=dict)
     workspace: str = Field(min_length=1)
     reference_idx: Annotated[int, Field(gt=0)]
+    work_ticket_idx: Annotated[int, Field(gt=0)]
+    container: str | None = Field(default=None, max_length=512)
+    entrypoint: str | None = None
+    baseline_resources: StepBaselineResources | None = None
 
 
 class StepRunResponse(BaseModel):
@@ -648,6 +673,36 @@ class WorkTicketState(StrEnum):
     FAILED = "failed"
 
 
+class FailureType(StrEnum):
+    """Discriminates retriable from permanent work-ticket failures.
+    Mirrored DB-side by qiita.failure_type.
+
+    `retriable` failures are transient infra issues — NODE_FAIL, OOM,
+    transient FS errors, slurmrestd unreachability — that the runner
+    bounces back to QUEUED for another attempt while retry_count is
+    below max_retries. `permanent` failures (bad input, container
+    contract violations, exit codes from a known-terminal workflow) skip
+    the retry loop and go straight to FAILED.
+    """
+
+    RETRIABLE = "retriable"
+    PERMANENT = "permanent"
+
+
+class WorkTicketFailureStage(StrEnum):
+    """Coarse "where in the lifecycle did it fail" enum, mirrored DB-side
+    by qiita.work_ticket_failure_stage.
+
+    `STEP_RUN` is paired with a non-NULL `failure_step_name` carrying the
+    YAML entry's `.name`; `SUBMISSION` and `FINALIZE` cover everything
+    outside the step loop.
+    """
+
+    SUBMISSION = "submission"
+    STEP_RUN = "step_run"
+    FINALIZE = "finalize"
+
+
 class StudyPrepScopeTarget(BaseModel):
     """Work ticket targets a (study, prep) tuple — used for sample-processing
     actions (e.g. deblur, woltka)."""
@@ -695,6 +750,22 @@ class WorkTicket(BaseModel):
     scope_target: ScopeTarget
     action_context: dict[str, Any] = Field(default_factory=dict)
     state: WorkTicketState
+    # Retry accounting. retry_count starts at 0 and increments on each
+    # retriable failure (PROCESSING → QUEUED transition). When a step
+    # raises a retriable BackendFailure and retry_count >= max_retries,
+    # the runner transitions the ticket to FAILED with the captured
+    # failure_*. Tickets inherit the DB default (3) on submission; the
+    # column is per-row so an admin can bump max_retries on a specific
+    # stuck ticket without redeploying.
+    retry_count: Annotated[int, Field(ge=0)] = 0
+    max_retries: Annotated[int, Field(ge=0, le=100)] = 3
+    # Failure surface. All fields are NULL on non-FAILED tickets and all
+    # non-NULL on FAILED tickets (DB CHECK enforces). failure_step_name
+    # is non-NULL only when failure_stage is STEP_RUN.
+    failure_type: FailureType | None = None
+    failure_stage: WorkTicketFailureStage | None = None
+    failure_step_name: str | None = Field(default=None, min_length=1, max_length=255)
+    failure_reason: str | None = None
     created_at: AwareDatetime
     updated_at: AwareDatetime
 
