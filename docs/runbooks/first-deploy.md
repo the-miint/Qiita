@@ -1,11 +1,11 @@
 # First-deploy bootstrap
 
-**Purpose.** Operator runbook for bringing up a fresh deployment: from a
-clean database through migrations, env-var configuration, the first OIDC
-login, operator promotion to `system_admin`, data-plane bootstrap, and
-orchestrator startup. End state: all three services authenticated and
-ready to serve traffic. Each step is independent — re-running it should
-be safe (idempotent) unless noted.
+**Purpose.** Operator runbook for bringing up a fresh deployment: from
+env-var configuration through migrations against a clean database, the
+first OIDC login, operator promotion to `system_admin`, data-plane
+bootstrap, and orchestrator startup. End state: all three services
+authenticated and ready to serve traffic. Each step is independent —
+re-running it should be safe (idempotent) unless noted.
 
 For the conceptual reference (principal model, scopes, endpoints), see
 [`docs/auth.md`](../auth.md). [`orchestrator-token-rotation.md`](orchestrator-token-rotation.md)
@@ -43,7 +43,7 @@ These are independent identities from the Postgres roles (`qiita_miint_rw`,
 in different layers does not imply a connection.
 
 **Postgres databases and roles exist** (provided by your DBA /
-infrastructure team): see step 2 (`qiita_miint`) and step 8
+infrastructure team): see step 1 (`qiita_miint`) and step 8
 (`qiita_miint_lake`).
 
 **Code is installed** at `/opt/qiita/` via `deploy/activate.sh` (rsync from
@@ -83,21 +83,15 @@ export QIITA_DATA_ROOT=/your/shared/mount
 reads it directly. Switching mount paths later is a one-line export
 change rather than a multi-file search-and-replace.
 
-## 1. Apply migrations
-
-```bash
-make migrate
-```
-
-Seeds the system principal at `idx=1` and creates the auth tables. After
-this, `qiita.principal` has exactly one row (the `system` principal); no
-human or service-account principals exist yet.
-
-## 2. Write the control plane env file
+## 1. Write the control plane env file
 
 systemd loads `/etc/qiita/control-plane.env` for the CP. This step generates
 the shared HMAC secret and writes that env file. Keep the secret in your
 shell — the data-plane bootstrap (step 8) needs the same value.
+
+The env file is also the source of `DATABASE_URL` for step 2 (`make
+migrate`) — `dbmate` reads it from the operator's shell, so step 2
+sources this file before invoking `make`.
 
 Prerequisites obtained from your DBA / infrastructure team:
 
@@ -165,11 +159,26 @@ See [`authrocket-realm-setup.md`](authrocket-realm-setup.md) for the
 realm-side configuration (test users, email-verification policy, the
 `iss=https://authrocket.com` footgun).
 
+## 2. Apply migrations
+
+`make migrate` runs `dbmate up` against `DATABASE_URL`, which it reads
+from the operator's shell. Source the env file you just wrote so the
+migration runs against the right database:
+
+```bash
+set -a && source /etc/qiita/control-plane.env && set +a
+make migrate
+```
+
+Seeds the system principal at `idx=1` and creates the auth tables. After
+this, `qiita.principal` has exactly one row (the `system` principal); no
+human or service-account principals exist yet.
+
 ## 3. One-shot JWT shape verify
 
 Log into the AuthRocket realm via the hosted UI and capture the raw JWT.
 The script reads the same env vars the CP does — source them from the env
-file you wrote in step 2 before running it:
+file you wrote in step 1 before running it:
 
 ```bash
 set -a && source /etc/qiita/control-plane.env && set +a
@@ -345,7 +354,7 @@ and the data plane could not read them. With it, every file inherits
 
 ### 8b. Write the data plane env file
 
-Use the *same* `HMAC_SECRET_KEY` value you generated in step 2 — the CP
+Use the *same* `HMAC_SECRET_KEY` value you generated in step 1 — the CP
 and DP must agree exactly. Substitute the lake DB credentials your DBA
 team provided:
 
@@ -390,7 +399,7 @@ make verify-health
 
 Expected: `status: SERVING`. If you see `Unauthenticated: invalid HMAC
 signature` later from any Flight call, the most common cause is that
-`HMAC_SECRET_KEY` differs between the CP and DP env files (see step 2).
+`HMAC_SECRET_KEY` differs between the CP and DP env files (see step 1).
 
 ## 9. Start the orchestrator
 
