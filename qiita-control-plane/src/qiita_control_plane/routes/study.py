@@ -24,7 +24,7 @@ from ..auth.guards import (
     require_study_exists,
 )
 from ..auth.principal import HumanUser, Principal
-from ..deps import get_db_pool
+from ..deps import get_db_pool, get_tx_conn
 from ..repositories.study import create_study, fetch_study
 
 router = APIRouter(prefix="/study", tags=["study"])
@@ -81,19 +81,18 @@ def _study_response_from_row(row: asyncpg.Record) -> StudyResponse:
 @router.post("", status_code=201)
 async def create_study_route(
     body: StudyCreate,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    conn: asyncpg.Connection = Depends(get_tx_conn),
     user: HumanUser = Depends(require_complete_profile),
     _scope: Principal = Depends(require_scope(Scope.STUDY_WRITE)),
 ) -> StudyResponse:
     """Create a study atomically with the owner's ADMIN study_access row.
 
-    Wraps the repositories.study composer in a single transaction. The
-    caller must be a HumanUser with profile_complete=True and must hold
-    the study:write scope. `body.owner_idx=None` defaults the owner to
-    the caller (caller-creates-own-study); supplying a different owner
-    requires wet_lab_admin or higher (lab-tech-on-behalf rule). The
-    caller is always recorded as `created_by_idx`; only the owner is
-    transferred when on-behalf creation is in play.
+    The caller must be a HumanUser with profile_complete=True and must hold
+    the study:write scope. `body.owner_idx=None` defaults the owner to the
+    caller (caller-creates-own-study); supplying a different owner requires
+    wet_lab_admin or higher (lab-tech-on-behalf rule). The caller is always
+    recorded as `created_by_idx`; only the owner is transferred when
+    on-behalf creation is in play.
     """
     # Resolve the effective owner: caller's principal_idx when the body
     # leaves it null, otherwise the body value.
@@ -109,32 +108,29 @@ async def create_study_route(
     # Owner eligibility pre-flight; collapses every ineligibility case to
     # one 422.
     await require_eligible_owner(
-        pool,
+        conn,
         candidate_idx=effective_owner_idx,
         detail=_MSG_OWNER_NOT_ELIGIBLE,
     )
 
-    # Open the connection-scoped transaction the composer requires; map known
-    # FK / trigger violations to user-friendly 422 responses.
+    # Map known FK / trigger violations to user-friendly 422 responses.
     try:
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                row = await create_study(
-                    conn,
-                    owner_idx=effective_owner_idx,
-                    created_by_idx=user.principal_idx,
-                    title=body.title,
-                    principal_investigator_idx=body.principal_investigator_idx,
-                    alias=body.alias,
-                    description=body.description,
-                    abstract=body.abstract,
-                    funding=body.funding,
-                    ebi_study_accession=body.ebi_study_accession,
-                    vamps_id=body.vamps_id,
-                    notes=body.notes,
-                    extra_metadata=body.extra_metadata,
-                    default_tier=body.default_tier,
-                )
+        row = await create_study(
+            conn,
+            owner_idx=effective_owner_idx,
+            created_by_idx=user.principal_idx,
+            title=body.title,
+            principal_investigator_idx=body.principal_investigator_idx,
+            alias=body.alias,
+            description=body.description,
+            abstract=body.abstract,
+            funding=body.funding,
+            ebi_study_accession=body.ebi_study_accession,
+            vamps_id=body.vamps_id,
+            notes=body.notes,
+            extra_metadata=body.extra_metadata,
+            default_tier=body.default_tier,
+        )
     except asyncpg.ForeignKeyViolationError:
         raise HTTPException(status_code=422, detail=_GENERIC_FK_VIOLATION)
     except asyncpg.RaiseError as exc:

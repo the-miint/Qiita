@@ -61,7 +61,7 @@ def _decode_detail(raw) -> dict:
 @router.post("/service-account", status_code=201, response_model=ServiceAccountCreateResponse)
 async def create_service_account(
     body: ServiceAccountCreate,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    conn: asyncpg.Connection = Depends(get_tx_conn),
     actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.ADMIN_SERVICE_ACCOUNT)),
 ) -> ServiceAccountCreateResponse | JSONResponse:
@@ -87,40 +87,38 @@ async def create_service_account(
     )
 
     try:
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                principal_idx = await insert_principal(
-                    conn,
-                    display_name=body.name,
-                    created_by_idx=actor.principal_idx,
-                )
-                await conn.execute(
-                    "INSERT INTO qiita.service_account"
-                    "  (principal_idx, name, description)"
-                    " VALUES ($1, $2, $3)",
-                    principal_idx,
-                    body.name,
-                    body.description,
-                )
-                # mint inside the same transaction for atomicity
-                plaintext, token_idx = await mint_api_token(
-                    conn,
-                    principal_idx=principal_idx,
-                    label=body.label,
-                    scopes=body.scopes,
-                    expires_at=expires_at,
-                )
-                await record_event(
-                    conn,
-                    event_type=AuthEventType.TOKEN_MINT,
-                    principal_idx=principal_idx,
-                    actor_principal_idx=actor.principal_idx,
-                    detail={
-                        "token_idx": token_idx,
-                        "scopes": body.scopes,
-                        "kind": "service_account_initial",
-                    },
-                )
+        principal_idx = await insert_principal(
+            conn,
+            display_name=body.name,
+            created_by_idx=actor.principal_idx,
+        )
+        await conn.execute(
+            "INSERT INTO qiita.service_account"
+            "  (principal_idx, name, description)"
+            " VALUES ($1, $2, $3)",
+            principal_idx,
+            body.name,
+            body.description,
+        )
+        # mint inside the same transaction for atomicity
+        plaintext, token_idx = await mint_api_token(
+            conn,
+            principal_idx=principal_idx,
+            label=body.label,
+            scopes=body.scopes,
+            expires_at=expires_at,
+        )
+        await record_event(
+            conn,
+            event_type=AuthEventType.TOKEN_MINT,
+            principal_idx=principal_idx,
+            actor_principal_idx=actor.principal_idx,
+            detail={
+                "token_idx": token_idx,
+                "scopes": body.scopes,
+                "kind": "service_account_initial",
+            },
+        )
     except asyncpg.UniqueViolationError as exc:
         # Dispatch on the constraint name so a future second UNIQUE column
         # on qiita.service_account doesn't get misattributed to the name.
