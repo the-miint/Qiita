@@ -134,7 +134,9 @@ async def test_reference_add_workflow_end_to_end(
         register_calls.append((staging_dir, dict(files)))
         return [f"{staging_dir}/{name}" for name in files]
 
-    monkeypatch.setitem(_lib.LIBRARY, LibraryPrimitive.REGISTER_FILES, _stub_register_files)
+    monkeypatch.setitem(
+        _lib.LIBRARY, LibraryPrimitive.REGISTER_FILES, _stub_register_files
+    )
 
     workspace_root = tmp_path / "workspace"
     backend_client = LocalComputeBackendClient()
@@ -178,7 +180,9 @@ async def test_reference_add_workflow_end_to_end(
     assert files["reference_sequences.parquet"] == "reference_sequences"
     assert "reference_membership.parquet" in files
 
-    # Workspace materialised the expected files.
+    # Per-entry / per-attempt workspaces materialised the expected files.
+    # Layout is `<workspace_root>/<work_ticket_idx>/<entry-name>/attempt-<N>/`
+    # (see qiita_control_plane/runner.py:251). Happy-path smoke = attempt-0.
     workspace = workspace_root / str(work_ticket_idx)
-    assert (workspace / "manifest.parquet").exists()
-    assert (workspace / "feature_map.parquet").exists()
+    assert (workspace / "hash" / "attempt-0" / "manifest.parquet").exists()
+    assert (workspace / "mint-features" / "attempt-0" / "feature_map.parquet").exists()
