@@ -399,10 +399,18 @@ async def test_threads_inputs_through_workspace(
     assert hash_call[1]["fasta_path"] == pending_work_ticket["fasta_path"]
 
     # load got fasta_path + manifest (hash output) + feature_map (mint output).
+    # `manifest` comes from FakeBackendClient.outputs_for, which the test
+    # scripted at `<workspace>/manifest.parquet`. `feature_map` is written
+    # by the mint-features library spy into the entry's per-attempt
+    # workspace (workspace/<entry-name>/attempt-<N>/ — runner.py owns this
+    # layout so retries don't leak stale artifacts at the verifier).
     load_call = next(c for c in backend.calls if c[0] == "load")
     assert load_call[1]["fasta_path"] == pending_work_ticket["fasta_path"]
     assert load_call[1]["manifest"] == workspace / "manifest.parquet"
-    assert load_call[1]["feature_map"] == workspace / "feature_map.parquet"
+    assert (
+        load_call[1]["feature_map"]
+        == workspace / "mint-features" / "attempt-0" / "feature_map.parquet"
+    )
 
 
 async def test_creates_workspace_directory(
@@ -594,6 +602,70 @@ async def test_retry_succeeds_after_transient_failure(
     assert row["failure_reason"] is None
     # Hash step ran twice (one fail + one success); load ran once.
     assert backend.attempts == {"hash": 2, "load": 1}
+
+
+async def test_retry_uses_isolated_per_attempt_workspace(
+    postgres_pool, pending_work_ticket, library_spy, tmp_path
+):
+    """Each attempt of a retried entry gets its own workspace dir, and
+    failed-attempt dirs persist on disk (postmortem-friendly). Prevents
+    stale outputs from a failed attempt #0 from leaking into the
+    verifier's "every file under output_path must be in manifest" check
+    on attempt #1."""
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+    from qiita_common.models import WorkTicketFailureStage
+
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = pending_work_ticket["work_ticket_idx"]
+
+    class _RecordingBackend:
+        """Records the workspace path the runner hands the backend on each
+        call. Hash fails once (drops a stale file in its given workspace
+        first to simulate a partial container write), then succeeds."""
+
+        def __init__(self) -> None:
+            self.workspaces: list[tuple[str, Path]] = []
+            self.attempts: dict[str, int] = {}
+
+        async def run_step(
+            self, *, step_name, inputs, workspace, reference_idx, work_ticket_idx, **_kw
+        ):
+            self.workspaces.append((step_name, workspace))
+            self.attempts[step_name] = self.attempts.get(step_name, 0) + 1
+            if step_name == "hash" and self.attempts["hash"] == 1:
+                workspace.mkdir(parents=True, exist_ok=True)
+                (workspace / "partial.parquet").write_bytes(b"stale junk")
+                raise BackendFailure(
+                    kind=FailureKind.NODE_FAIL,
+                    stage=WorkTicketFailureStage.STEP_RUN,
+                    step_name=step_name,
+                    reason="simulated transient failure",
+                )
+            if step_name == "load":
+                workspace.mkdir(parents=True, exist_ok=True)
+                staging = workspace / "staging"
+                staging.mkdir(parents=True, exist_ok=True)
+                (staging / "reference_sequences.parquet").touch()
+                return {"staging_dir": staging}
+            manifest = workspace / "manifest.parquet"
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.touch()
+            return {"manifest": manifest}
+
+    backend = _RecordingBackend()
+    await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    hash_calls = [ws for (name, ws) in backend.workspaces if name == "hash"]
+    workspace = workspace_root / str(work_ticket_idx)
+    assert hash_calls == [
+        workspace / "hash" / "attempt-0",
+        workspace / "hash" / "attempt-1",
+    ]
+    # Failed attempt's artifacts are preserved on disk for postmortem.
+    assert (workspace / "hash" / "attempt-0" / "partial.parquet").exists()
+    # Successful attempt has its own clean dir — no `partial.parquet` from #0.
+    assert (workspace / "hash" / "attempt-1").exists()
+    assert not (workspace / "hash" / "attempt-1" / "partial.parquet").exists()
 
 
 async def test_retry_exhausted_marks_failed_with_retriable_type(

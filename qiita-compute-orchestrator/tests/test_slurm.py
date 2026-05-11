@@ -92,6 +92,7 @@ def test_payload_environment_includes_qiita_paths(common_kwargs):
     env = dict(item.split("=", 1) for item in payload["job"]["environment"])
     assert env["QIITA_INPUT_PATH"] == str(common_kwargs["input_path"])
     assert env["QIITA_OUTPUT_PATH"] == str(common_kwargs["output_path"])
+    assert env["QIITA_WORK_TICKET_IDX"] == str(common_kwargs["work_ticket_idx"])
 
 
 def test_payload_environment_extra_env_merged(common_kwargs):

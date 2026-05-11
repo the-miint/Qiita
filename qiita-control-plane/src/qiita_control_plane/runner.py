@@ -9,10 +9,14 @@ Lives in the control plane: direct DB access for work_ticket / action /
 reference rows is legitimate here. The orchestrator is reduced to its
 SLURM-driver role behind `POST /step/run`.
 
-Workspace contract: every entry that needs a file consumes a path in
-`<workspace_root>/<work_ticket_idx>/`. LIBRARY primitives write their
-outputs (e.g. `feature_map.parquet`) into the same workspace, so later
-entries see them via the runner's binding map.
+Workspace contract: each entry runs against a per-attempt subdir
+`<workspace_root>/<work_ticket_idx>/<entry-name>/attempt-<N>/` minted by
+`_run_entry_with_retry`. The nesting gives two properties at once —
+retries land in fresh dirs (the verifier's "every file in $output_path
+must be in manifest" gate stays clean), and prior attempts persist on
+disk for postmortem. Entries see each other's outputs via the runner's
+binding map, which carries absolute paths forward so consumers don't
+need to know the producer's attempt number.
 """
 
 from __future__ import annotations
@@ -232,14 +236,27 @@ async def _run_entry_with_retry(
     monitoring queries: a ticket bouncing through QUEUED indicates a
     retry attempt.
     """
+    # Per-attempt workspace isolates retry artifacts from each other so a
+    # failed attempt's stale outputs don't leak into the verifier (gate 5:
+    # "every file under $QIITA_OUTPUT_PATH must be in manifest") on the
+    # retry, and prior-attempt artifacts stay on disk for postmortem. The
+    # entry-name segment also isolates concurrent steps in the same
+    # workflow from each other. `attempt` is local to this invocation
+    # rather than the work-ticket-wide retry_count: that counter skips
+    # numbers between entries that retry, which would produce confusing
+    # gaps like attempt-0 → attempt-3 for an entry that itself only
+    # retried once.
+    attempt = 0
     while True:
+        attempt_workspace = workspace / entry.name / f"attempt-{attempt}"
+        attempt_workspace.mkdir(parents=True, exist_ok=True)
         try:
             if isinstance(entry, WorkflowStep):
                 return await _dispatch_step(
                     backend_client,
                     entry,
                     bound,
-                    workspace,
+                    attempt_workspace,
                     scope_target,
                     work_ticket_idx=work_ticket_idx,
                 )
@@ -248,7 +265,7 @@ async def _run_entry_with_retry(
                     pool,
                     entry,
                     bound,
-                    workspace,
+                    attempt_workspace,
                     scope_target,
                     hmac_secret=hmac_secret,
                     data_plane_url=data_plane_url,
@@ -277,6 +294,7 @@ async def _run_entry_with_retry(
                 current_retry + 1,
                 max_retries,
             )
+            attempt += 1
             await _bump_retry_and_requeue(pool, work_ticket_idx)
             await _atomic_transition(
                 pool,

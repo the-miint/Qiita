@@ -32,13 +32,6 @@ from typing import Any
 
 from qiita_common.actions import BaselineResources
 
-# Single default SLURM API version so payload-shape tests are
-# deterministic. Operators override via env at the SlurmrestdClient
-# layer; the shape below stays valid across v0.0.39 → v0.0.41 by holding
-# to the lowest-common-denominator schema. Branch on api_version here
-# if a breaking schema bump lands in slurmrestd.
-DEFAULT_SLURM_API_VERSION = "v0.0.40"
-
 
 def _number_envelope(value: int) -> dict[str, Any]:
     """slurmrestd's typed-numeric envelope. Used for memory / cpus /
@@ -144,9 +137,15 @@ def build_job_submit_payload(
     if not account:
         raise ValueError("account must be set on the orchestrator config")
 
+    # QIITA_WORK_TICKET_IDX is mirrored from params.json so containers
+    # that want to stamp output filenames or logs with the originating
+    # ticket don't have to JSON-parse params just to read one scalar.
+    # params.json remains the contract source of truth for everything
+    # else (step_name, reference_idx, inputs, etc.).
     env: dict[str, str] = {
         "QIITA_INPUT_PATH": str(input_path),
         "QIITA_OUTPUT_PATH": str(output_path),
+        "QIITA_WORK_TICKET_IDX": str(work_ticket_idx),
     }
     if extra_env:
         env.update(extra_env)

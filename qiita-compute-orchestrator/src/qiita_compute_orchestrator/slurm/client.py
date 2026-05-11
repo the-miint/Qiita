@@ -30,6 +30,7 @@ API version pinning:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -82,26 +83,28 @@ class SlurmJobInfo:
 
     @property
     def is_terminal(self) -> bool:
-        return self.state in TERMINAL_SLURM_STATES
+        return self.state in TerminalSlurmState
 
 
-# SLURM job-state values observed when a job is no longer in flight.
-# Mirrors the upstream SLURM docs (v0.0.40); add states here if a future
-# slurmrestd version introduces a new terminal value (e.g. NEW_STATE).
-TERMINAL_SLURM_STATES: frozenset[str] = frozenset(
-    {
-        "COMPLETED",
-        "FAILED",
-        "CANCELLED",
-        "TIMEOUT",
-        "NODE_FAIL",
-        "OUT_OF_MEMORY",
-        "PREEMPTED",
-        "BOOT_FAIL",
-        "DEADLINE",
-        "SPECIAL_EXIT",
-    }
-)
+# SLURM job-state names that mean the job is no longer in flight. These
+# are wire values, not symbols we coined — spellings must match SLURM's
+# own. StrEnum so members compare equal to the raw strings parsed out of
+# slurmrestd JSON (no conversion at the boundary). Non-terminal states
+# (PENDING / RUNNING / COMPLETING / ...) intentionally aren't enumerated
+# — nothing branches on them, the poll loop just waits for is_terminal.
+# Add members here if a future slurmrestd version introduces a new
+# terminal state.
+class TerminalSlurmState(StrEnum):
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    TIMEOUT = "TIMEOUT"
+    NODE_FAIL = "NODE_FAIL"
+    OUT_OF_MEMORY = "OUT_OF_MEMORY"
+    PREEMPTED = "PREEMPTED"
+    BOOT_FAIL = "BOOT_FAIL"
+    DEADLINE = "DEADLINE"
+    SPECIAL_EXIT = "SPECIAL_EXIT"
 
 
 class SlurmrestdClient:

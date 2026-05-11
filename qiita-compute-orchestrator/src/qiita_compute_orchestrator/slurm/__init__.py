@@ -18,20 +18,20 @@ verify output => return name => path map.
 
 from .client import (
     DEFAULT_SLURMRESTD_API_VERSION,
-    TERMINAL_SLURM_STATES,
     SlurmJobInfo,
     SlurmrestdClient,
     SlurmrestdError,
+    TerminalSlurmState,
 )
 from .payload import build_job_submit_payload
 from .verify import VerificationFailure, parse_outputs_map, verify_container_output
 
 __all__ = [
     "DEFAULT_SLURMRESTD_API_VERSION",
-    "TERMINAL_SLURM_STATES",
     "SlurmJobInfo",
     "SlurmrestdClient",
     "SlurmrestdError",
+    "TerminalSlurmState",
     "VerificationFailure",
     "build_job_submit_payload",
     "parse_outputs_map",

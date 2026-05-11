@@ -30,6 +30,7 @@ from ..slurm import (
     SlurmJobInfo,
     SlurmrestdClient,
     SlurmrestdError,
+    TerminalSlurmState,
     build_job_submit_payload,
     parse_outputs_map,
     verify_container_output,
@@ -47,16 +48,16 @@ from ..slurm import (
 # exceeds walltime, which usually indicates a too-tight allocation —
 # a retry on a less-loaded node may finish in time, and operators can
 # raise the action's walltime ceiling if the pattern persists.
-_STATE_TO_FAILURE_KIND: dict[str, FailureKind] = {
-    "FAILED": FailureKind.EXIT_NONZERO,
-    "CANCELLED": FailureKind.EXIT_NONZERO,
-    "DEADLINE": FailureKind.EXIT_NONZERO,
-    "SPECIAL_EXIT": FailureKind.EXIT_NONZERO,
-    "NODE_FAIL": FailureKind.NODE_FAIL,
-    "BOOT_FAIL": FailureKind.NODE_FAIL,
-    "OUT_OF_MEMORY": FailureKind.OOM_KILLED,
-    "PREEMPTED": FailureKind.PREEMPTED,
-    "TIMEOUT": FailureKind.TIMEOUT_BEFORE_START,
+_STATE_TO_FAILURE_KIND: dict[TerminalSlurmState, FailureKind] = {
+    TerminalSlurmState.FAILED: FailureKind.EXIT_NONZERO,
+    TerminalSlurmState.CANCELLED: FailureKind.EXIT_NONZERO,
+    TerminalSlurmState.DEADLINE: FailureKind.EXIT_NONZERO,
+    TerminalSlurmState.SPECIAL_EXIT: FailureKind.EXIT_NONZERO,
+    TerminalSlurmState.NODE_FAIL: FailureKind.NODE_FAIL,
+    TerminalSlurmState.BOOT_FAIL: FailureKind.NODE_FAIL,
+    TerminalSlurmState.OUT_OF_MEMORY: FailureKind.OOM_KILLED,
+    TerminalSlurmState.PREEMPTED: FailureKind.PREEMPTED,
+    TerminalSlurmState.TIMEOUT: FailureKind.TIMEOUT_BEFORE_START,
 }
 
 
@@ -123,6 +124,14 @@ class SlurmBackend(ComputeBackend):
         logs_path = workspace / "logs"
         for d in (input_path, output_path, logs_path):
             d.mkdir(parents=True, exist_ok=True)
+        # params.json is the channel for workflow-specific data — never the
+        # slurmrestd submit body, which is visible in `scontrol show job`
+        # and SLURM accounting (no place for signed Flight tickets or
+        # per-step parameters). The container reads it from
+        # $QIITA_INPUT_PATH. Extend this dict when new step types land:
+        # per-sample steps add a prep_sample_idx list; tunable steps add
+        # an action-parameters block; data-plane-reading steps add a
+        # control-plane-minted Flight ticket.
         params_path = input_path / "params.json"
         params_path.write_text(
             json.dumps(
@@ -165,7 +174,9 @@ class SlurmBackend(ComputeBackend):
 
         info = await self._poll_until_terminal(job_id, name)
 
-        if info.state == "COMPLETED" and (info.exit_code is None or info.exit_code == 0):
+        if info.state == TerminalSlurmState.COMPLETED and (
+            info.exit_code is None or info.exit_code == 0
+        ):
             failures = verify_container_output(output_path)
             if failures:
                 # Container exited 0 but didn't honor the contract — gate

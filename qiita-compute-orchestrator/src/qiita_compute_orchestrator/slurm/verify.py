@@ -1,10 +1,14 @@
 """Container-output verification gates.
 
-Per docs/architecture.md "Container contract", every workflow container
-must produce on success:
+Precondition (checked by the caller, not here): the SLURM job exited 0.
+A non-zero exit jumps straight to a different failure path and never
+reaches the verifier.
 
-  1. exit code 0 (caller's responsibility — checked before this runs).
-  2. `$QIITA_OUTPUT_PATH/manifest.json`:
+Per docs/architecture.md "Container contract", every workflow container
+must also produce on success:
+
+  1. `$QIITA_OUTPUT_PATH/manifest.json`, written as the container's
+     final act before chmod (its presence is the completion marker):
          {
            "files": [{"path": "output.parquet", "size_bytes": 12345}, ...],
            "outputs": {"manifest": "output.parquet", ...}
@@ -14,12 +18,16 @@ must produce on success:
      relative paths under $QIITA_OUTPUT_PATH (use "." for the
      directory itself when an output IS the directory, e.g. a step
      whose YAML output is `staging_dir`).
-  3. Every listed file exists with the declared size_bytes.
-  4. All files under `$QIITA_OUTPUT_PATH` are mode `0o440`
+  2. Every listed file exists with the declared size_bytes.
+  3. All files under `$QIITA_OUTPUT_PATH` are mode `0o440`
      (owner-and-group read-only).
 
 Gate failures are CONTRACT_VIOLATION (permanent) — the container
 returned exit 0 but didn't honor the contract, so retry won't help.
+
+`size_bytes` is a format-agnostic stat() check. Parquet self-validates
+truncation via its trailing PAR1 magic, but non-parquet outputs
+(.nwk, .jplace, .tsv, future HTML/JSON/logs) have no equivalent.
 """
 
 from __future__ import annotations
@@ -181,7 +189,7 @@ def verify_container_output(output_path: Path) -> list[VerificationFailure]:
                 )
             )
 
-    # Gate 3: every listed file exists with declared size.
+    # Gate 2: every listed file exists with declared size.
     for i, entry in enumerate(files):
         if not isinstance(entry, dict):
             failures.append(
@@ -239,7 +247,7 @@ def verify_container_output(output_path: Path) -> list[VerificationFailure]:
                 )
             )
 
-    # Gate 4: every file under output_path is mode 0o440. We walk the
+    # Gate 3: every file under output_path is mode 0o440. We walk the
     # directory rather than only the manifest list — a container that
     # writes extra files (debug logs, partial outputs) is also a
     # contract violation; the manifest must list everything.
