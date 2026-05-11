@@ -132,8 +132,7 @@ async def seed_biosample(
     checklists, or the import composer.
     """
     return await pool.fetchval(
-        "INSERT INTO qiita.biosample (owner_idx, created_by_idx)"
-        " VALUES ($1, $2) RETURNING idx",
+        "INSERT INTO qiita.biosample (owner_idx, created_by_idx) VALUES ($1, $2) RETURNING idx",
         owner_idx,
         created_by_idx,
     )

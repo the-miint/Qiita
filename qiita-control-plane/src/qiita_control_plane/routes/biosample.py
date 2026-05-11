@@ -457,9 +457,7 @@ async def patch_biosample_route(
 
                 # Re-read global metadata in the same transaction so the
                 # response and the UPDATE see one consistent snapshot.
-                metadata_rows = await fetch_global_metadata_for_biosample(
-                    conn, biosample_idx
-                )
+                metadata_rows = await fetch_global_metadata_for_biosample(conn, biosample_idx)
     except asyncpg.UniqueViolationError as exc:
         detail = _UNIQUE_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_UNIQUE_VIOLATION)
         raise HTTPException(status_code=409, detail=detail)

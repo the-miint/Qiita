@@ -202,9 +202,7 @@ async def test_post_study_wet_lab_admin_on_behalf_of_other_user(ctx):
     """A wet_lab_admin can name a different user as owner; the admin is
     `created_by_idx`, the named user is `owner_idx`, and the auto-grant
     ADMIN row targets the named user (not the admin)."""
-    target_idx = await seed_user_principal(
-        ctx["pool"], prefix=_SEED_PREFIX, suffix="wet-target"
-    )
+    target_idx = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix="wet-target")
     ctx["created"]["user_principals"].append(target_idx)
 
     resp = await _post_study(
@@ -240,9 +238,7 @@ async def test_post_study_wet_lab_admin_on_behalf_of_other_user(ctx):
 async def test_post_study_system_admin_on_behalf_of_other_user(ctx):
     """A system_admin is also above the wet_lab_admin threshold so the
     on-behalf path is open to them too."""
-    target_idx = await seed_user_principal(
-        ctx["pool"], prefix=_SEED_PREFIX, suffix="adm-target"
-    )
+    target_idx = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix="adm-target")
     ctx["created"]["user_principals"].append(target_idx)
 
     resp = await _post_study(
@@ -279,9 +275,7 @@ async def test_post_study_with_principal_investigator(ctx):
 async def test_post_study_regular_user_setting_other_owner_idx_403(ctx):
     """A regular USER caller cannot set owner_idx to a different
     principal — only wet_lab_admin or higher passes the on-behalf rule."""
-    target_idx = await seed_user_principal(
-        ctx["pool"], prefix=_SEED_PREFIX, suffix="reg-target"
-    )
+    target_idx = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix="reg-target")
     ctx["created"]["user_principals"].append(target_idx)
 
     resp = await _post_study(
@@ -388,7 +382,9 @@ async def test_post_study_unknown_pi_idx_422(ctx):
         principal_investigator_idx=max_idx + 100_000,
     )
     assert resp.status_code == 422
-    assert resp.json()["detail"] == "principal_investigator_idx must reference a user-kind principal"  # noqa: E501
+    assert (
+        resp.json()["detail"] == "principal_investigator_idx must reference a user-kind principal"
+    )  # noqa: E501
 
 
 async def test_post_study_pi_idx_is_service_account_422(ctx):
@@ -404,7 +400,9 @@ async def test_post_study_pi_idx_is_service_account_422(ctx):
         principal_investigator_idx=svc_idx,
     )
     assert resp.status_code == 422
-    assert resp.json()["detail"] == "principal_investigator_idx must reference a user-kind principal"  # noqa: E501
+    assert (
+        resp.json()["detail"] == "principal_investigator_idx must reference a user-kind principal"
+    )  # noqa: E501
 
 
 # ===========================================================================

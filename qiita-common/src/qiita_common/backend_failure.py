@@ -166,7 +166,7 @@ class BackendFailureBody(BaseModel):
     step_name: str | None = None
 
     @classmethod
-    def from_exception(cls, exc: BackendFailure) -> "BackendFailureBody":
+    def from_exception(cls, exc: BackendFailure) -> BackendFailureBody:
         return cls(
             kind=exc.kind,
             stage=exc.stage,

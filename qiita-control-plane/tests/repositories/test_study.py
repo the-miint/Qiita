@@ -373,8 +373,7 @@ async def test_create_study_admin_on_behalf_grants_owner_not_caller(postgres_poo
 
             # Caller has no auto-granted row.
             caller_grant = await conn.fetchval(
-                "SELECT 1 FROM qiita.study_access"
-                " WHERE study_idx = $1 AND principal_idx = $2",
+                "SELECT 1 FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2",
                 row["idx"],
                 caller,
             )

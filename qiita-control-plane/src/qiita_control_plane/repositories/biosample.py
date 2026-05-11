@@ -165,9 +165,7 @@ async def update_biosample(
         raise ValueError("update_biosample requires at least one field")
     unknown = set(fields) - BIOSAMPLE_PATCHABLE_COLUMNS
     if unknown:
-        raise ValueError(
-            f"update_biosample rejects non-patchable column(s): {sorted(unknown)}"
-        )
+        raise ValueError(f"update_biosample rejects non-patchable column(s): {sorted(unknown)}")
 
     # Build the parameterized SET clause. Column names come from the
     # allowlist above so f-string interpolation is safe; the per-column

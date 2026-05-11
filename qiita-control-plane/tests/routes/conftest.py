@@ -233,5 +233,3 @@ async def assert_owner_ineligibility_422(
     resp = await post_with_owner_idx(owner_idx)
     assert resp.status_code == 422, resp.text
     assert resp.json()["detail"] == expected_detail
-
-
