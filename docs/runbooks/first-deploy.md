@@ -65,6 +65,24 @@ substitutes at deploy time using the `QIITA_HOSTNAME` env var
 `systemctl enable --now`. Service processes themselves run as the system
 users above (systemd drops to `User=` from each unit), not as you.
 
+**Pick a data root.** The data plane writes Parquet under the deploy's
+durable shared mount; the runbook below threads that path through env
+files and `install -d` commands by heredoc-expanding `$QIITA_DATA_ROOT`
+from the operator's shell. The default `/data` works on the dev VM
+defined in this repo's compose file; production deploys whose shared
+filesystem is mounted elsewhere override:
+
+```bash
+# Stays in the operator's shell across the next several env-file writes
+# and `install -d` commands. Substitute the actual mount path your
+# infrastructure team provisioned.
+export QIITA_DATA_ROOT=/your/shared/mount
+```
+
+`QIITA_DATA_ROOT` is purely a runbook-template variable: no Qiita process
+reads it directly. Switching mount paths later is a one-line export
+change rather than a multi-file search-and-replace.
+
 ## 1. Apply migrations
 
 ```bash
@@ -305,18 +323,20 @@ and an env file.
 ```bash
 # Final Parquet location — owned by the DP, not group-writable. The DP
 # atomic-renames into here from staging; nothing else writes here.
-sudo install -d -o qiita-data -g qiita-data -m 0750 /data/parquet
+sudo install -d -o qiita-data -g qiita-data -m 0750 "$QIITA_DATA_ROOT/parquet"
 
 # SLURM job staging — group-writable + setgid so files written by qiita-job
 # inherit the qiita-pipeline group, and the DP (also in qiita-pipeline) can
-# read the 440-mode outputs before renaming them into /data/parquet.
+# read the 440-mode outputs before renaming them into $QIITA_DATA_ROOT/parquet.
 sudo install -d -o qiita-data -g qiita-pipeline -m 2770 /scratch/ephemeral/staging
 ```
 
-If `/scratch` and `/data` are on different filesystems, the atomic rename
-falls back to copy+delete (slower; see
+If `$QIITA_DATA_ROOT` and `/scratch` are on different filesystems, the
+atomic rename falls back to copy+delete (slower; see
 `qiita-data-plane/src/flight_service.rs::move_file`). Provision them on
-the same filesystem when possible.
+the same filesystem when possible. (Some HPC environments expose the
+staging tier under a different mount than `$QIITA_DATA_ROOT`; coordinate
+with your infrastructure team to keep them on one volume if you can.)
 
 The setgid bit (`2770`) on the staging directory is load-bearing: without
 it, files created by `qiita-job` would inherit `qiita-job`'s primary group
@@ -333,7 +353,7 @@ team provided:
 sudo tee /etc/qiita/data-plane.env > /dev/null <<EOF
 HMAC_SECRET_KEY=$HMAC_SECRET_KEY
 DUCKLAKE_CATALOG_CONNSTR=dbname=qiita_miint_lake host=<pg-host> user=qiita_miint_lake_rw password=<password>
-DUCKLAKE_DATA_PATH=/data/parquet
+DUCKLAKE_DATA_PATH=$QIITA_DATA_ROOT/parquet
 EOF
 sudo chown root:qiita-data /etc/qiita/data-plane.env
 sudo chmod 0440 /etc/qiita/data-plane.env
@@ -388,7 +408,7 @@ COMPUTE_BACKEND=slurm
 
 # Where the orchestrator stages workspace dirs (params.json + outputs).
 # Must be on the shared filesystem so SLURM compute nodes see it too.
-SHARED_FILESYSTEM_ROOT=/data
+SHARED_FILESYSTEM_ROOT=$QIITA_DATA_ROOT
 
 # CP↔CO shared bearer (default path; matches step 7's install).
 # CP_TO_CO_TOKEN_PATH=/etc/qiita/cp-to-co.token
@@ -509,9 +529,10 @@ A single ticket touches every layer:
   backend (`SlurmBackend` runs containerized jobs as `qiita-job` on the
   cluster; `LocalBackend` runs in-process for development).
 - **Data plane** — registers Parquet via `ducklake_add_data_files`
-  (writes to `qiita_miint_lake`, lands files in `/data/parquet/<table>/`).
+  (writes to `qiita_miint_lake`, lands files in
+  `$QIITA_DATA_ROOT/parquet/<table>/`).
 - **Both filesystems** — intermediates on `/scratch/ephemeral/staging/`,
-  final output on `/data/parquet/`.
+  final output on `$QIITA_DATA_ROOT/parquet/`.
 
 ### Recipe
 
@@ -541,7 +562,8 @@ A single ticket touches every layer:
      membership rows for the smoke tag.
    - `qiita_miint_lake` has new `ducklake_data_file` rows from the last
      few minutes.
-   - `/data/parquet/<table>/` contains recent Parquet files, mode 440.
+   - `$QIITA_DATA_ROOT/parquet/<table>/` contains recent Parquet files,
+     mode 440.
 
    A failure on any single check pinpoints which layer is broken.
 

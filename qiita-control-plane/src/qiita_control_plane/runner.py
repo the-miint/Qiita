@@ -40,7 +40,7 @@ from .actions.reference import transition_reference_status
 
 _log = logging.getLogger(__name__)
 
-DEFAULT_WORKSPACE_ROOT = Path("/data/workspace")
+DEFAULT_WORKSPACE_ROOT = Path("/scratch/ephemeral/workspace")
 
 
 async def run_workflow(
