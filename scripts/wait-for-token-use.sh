@@ -58,5 +58,5 @@ while [[ $(date +%s) -lt $deadline ]]; do
 done
 
 echo "timed out after ${timeout}s — last_used_at did not advance" >&2
-echo "do NOT revoke the old token; investigate journalctl -u qiita-orchestrator" >&2
+echo "do NOT revoke the old token; investigate journalctl -u qiita-compute-orchestrator" >&2
 exit 1

@@ -335,4 +335,4 @@ See [`docs/runbooks/first-deploy.md`](runbooks/first-deploy.md) for the full seq
 
 ## Token rotation
 
-See [`docs/runbooks/orchestrator-token-rotation.md`](runbooks/orchestrator-token-rotation.md) for the full zero-downtime rotation procedure: mint replacement → `install-orchestrator-token.sh` (atomic write + `.previous` save) → `systemctl reload` → `wait-for-token-use.sh` (polls `last_used_at`) → revoke old.
+See [`docs/runbooks/orchestrator-token-rotation.md`](runbooks/orchestrator-token-rotation.md) for the full rotation procedure: mint replacement → `install-orchestrator-token.sh` (atomic write + `.previous` save) → pick-up step (cron: next invocation reads the new file; long-running daemons: `systemctl reload`, gated on the not-yet-implemented orchestrator reload handler) → `wait-for-token-use.sh` (polls `last_used_at`) → revoke old.

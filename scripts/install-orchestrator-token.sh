@@ -11,9 +11,11 @@
 # docs/runbooks/orchestrator-token-rotation.md can recover it.
 #
 # Used by docs/runbooks/first-deploy.md (initial install) and
-# docs/runbooks/orchestrator-token-rotation.md (rotation install). Trigger
-# the orchestrator's SIGHUP handler with `systemctl reload qiita-orchestrator`
-# separately — this script only manages the file.
+# docs/runbooks/orchestrator-token-rotation.md (rotation install). For
+# long-running daemons, trigger the SIGHUP handler with `systemctl reload
+# qiita-compute-orchestrator` separately — this script only manages the
+# file. (Note: the orchestrator's reload handler is not yet implemented in
+# v1; see the rotation runbook's status banner.)
 #
 # Usage:
 #   ./scripts/install-orchestrator-token.sh /etc/qiita/orchestrator.token <<<"$TOKEN"
