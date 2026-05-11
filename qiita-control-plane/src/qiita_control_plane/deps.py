@@ -46,35 +46,20 @@ def get_data_plane_url(request: Request) -> str:
     return settings.data_plane_url
 
 
-async def get_tx_conn(request: Request) -> AsyncIterator[asyncpg.Connection]:
-    """Acquire an asyncpg.Connection from the pool wrapped in a transaction.
-
-    Use as a FastAPI dependency on write endpoints (POST/PUT/PATCH/DELETE).
-    The transaction commits on normal handler return and rolls back on any
-    raised exception, including HTTPException.
-    """
-    pool = get_db_pool(request)
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            yield conn
-
-
 def get_tx_conn_factory(request: Request) -> TxConnFactory:
     """Return a callable that, when invoked, yields a transactional
-    connection context manager.
+    connection context manager. The dep itself acquires nothing — the
+    pool connection and `conn.transaction()` are deferred to the handler's
+    explicit `async with tx() as conn:` block, so any pre-DB validation
+    (JWT verification, freshness checks, scope guards) runs without
+    holding a pool slot.
 
-    Use on write endpoints whose handlers perform non-trivial work
-    (JWT verification, freshness checks, in-handler validation) before
-    any DB writes. The handler opens the transaction explicitly:
+    Use as the standard write-endpoint dep:
 
         async def my_handler(tx: TxConnFactory = Depends(get_tx_conn_factory)):
             # ... pure validation that may 4xx ...
             async with tx() as conn:
                 # ... atomic DB work ...
-
-    Prefer get_tx_conn for handlers that go to the DB immediately;
-    this dep only earns its keep when there is meaningful pre-DB
-    work whose connection cost matters under high 4xx rates.
     """
     pool = get_db_pool(request)
 

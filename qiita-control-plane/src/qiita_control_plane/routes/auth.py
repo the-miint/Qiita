@@ -147,10 +147,9 @@ async def mint_pat(
     missing fields — the CLI surfaces this to the user as an actionable
     error instead of silently failing.
 
-    Uses the lazy `TxConnFactory` rather than `get_tx_conn` so JWT
-    verification and the freshness/leeway checks run without holding a
-    pool connection — the transaction only opens once the route is
-    ready to query the DB.
+    JWT verification and the freshness/leeway checks run without
+    holding a pool connection — the transaction opens lazily via the
+    `TxConnFactory` once the route is ready to query the DB.
     """
     settings = _get_settings(request)
     verifier = get_oidc_verifier(request)
