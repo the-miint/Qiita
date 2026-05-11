@@ -154,6 +154,56 @@ def test_step_run_translates_backend_value_error(http_client, cp_to_co_token, tm
         },
     )
     assert resp.status_code == 422
+    # ValueError → FastAPI's HTTPException shape, no discriminator header.
+    # The header is reserved for BackendFailure (see test below).
+    from qiita_common.backend_failure import BACKEND_FAILURE_HEADER
+
+    assert BACKEND_FAILURE_HEADER not in resp.headers
+    assert resp.json() == {"detail": "unknown step"}
+
+
+def test_step_run_serializes_backend_failure(http_client, cp_to_co_token, tmp_path):
+    """BackendFailure from the backend → structured response the
+    runner can reconstruct into a typed BackendFailure for retry
+    classification."""
+    from qiita_common.backend_failure import (
+        BACKEND_FAILURE_HEADER,
+        BACKEND_FAILURE_HTTP_STATUS,
+        BackendFailure,
+        FailureKind,
+    )
+    from qiita_common.models import WorkTicketFailureStage
+
+    client, backend = http_client
+
+    async def boom(*args, **kwargs):
+        raise BackendFailure(
+            kind=FailureKind.NODE_FAIL,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name="hash",
+            reason="slurm reported node n01 lost mid-step",
+        )
+
+    backend.run_step = boom  # type: ignore[method-assign]
+    resp = client.post(
+        URL_STEP_RUN,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "hash",
+            "inputs": {},
+            "workspace": str(tmp_path),
+            "reference_idx": 1,
+            "work_ticket_idx": 1,
+        },
+    )
+    assert resp.status_code == BACKEND_FAILURE_HTTP_STATUS
+    assert resp.headers[BACKEND_FAILURE_HEADER] == "1"
+    assert resp.json() == {
+        "kind": "node_fail",
+        "stage": "step_run",
+        "step_name": "hash",
+        "reason": "slurm reported node n01 lost mid-step",
+    }
 
 
 def test_settings_resolves_token_from_env():

@@ -29,7 +29,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from pydantic import BaseModel
+
 from .models import WorkTicketFailureStage
+
+# Wire-format discriminator for BackendFailure round-tripping through the
+# orchestrator's /step/run HTTP boundary. The orchestrator sets this
+# header on responses that carry a BackendFailureBody so the client can
+# reconstruct a typed BackendFailure (and the runner sees the same
+# transient/permanent classification it would in-process). Without the
+# header, the response is treated as a generic HTTP error and falls
+# through to raise_for_status.
+BACKEND_FAILURE_HEADER = "X-Qiita-Backend-Failure"
+
+# 422 is shared with the ValueError → HTTPException path in step.py
+# (route argument validation). The header above is the disambiguator;
+# bodies are shaped differently (BackendFailureBody fields vs FastAPI's
+# {"detail": ...}).
+BACKEND_FAILURE_HTTP_STATUS = 422
 
 
 class FailureKind(StrEnum):
@@ -126,3 +143,41 @@ class BackendFailure(Exception):
         if self.step_name is not None:
             return f"[{self.kind.value}] {self.stage.value}/{self.step_name}: {self.reason}"
         return f"[{self.kind.value}] {self.stage.value}: {self.reason}"
+
+
+class BackendFailureBody(BaseModel):
+    """Wire format for BackendFailure crossing the orchestrator's HTTP
+    boundary.
+
+    The orchestrator emits this in `/step/run`'s response body (with
+    `BACKEND_FAILURE_HEADER` set) when a backend raises BackendFailure;
+    ComputeBackendClient reconstructs and re-raises so the runner's
+    retry classification sees the same typed surface it would for an
+    in-process backend. Without this round-trip, a transient
+    `BackendFailure(kind=NODE_FAIL, ...)` raised inside SlurmBackend
+    would degrade into an HTTPStatusError at the client and be
+    classified UNKNOWN_PERMANENT by the runner — auto-retry would
+    never fire for SLURM-side failures.
+    """
+
+    kind: FailureKind
+    stage: WorkTicketFailureStage
+    reason: str
+    step_name: str | None = None
+
+    @classmethod
+    def from_exception(cls, exc: BackendFailure) -> "BackendFailureBody":
+        return cls(
+            kind=exc.kind,
+            stage=exc.stage,
+            reason=exc.reason,
+            step_name=exc.step_name,
+        )
+
+    def to_exception(self) -> BackendFailure:
+        return BackendFailure(
+            kind=self.kind,
+            stage=self.stage,
+            reason=self.reason,
+            step_name=self.step_name,
+        )

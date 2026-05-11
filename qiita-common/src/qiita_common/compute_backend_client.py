@@ -19,6 +19,7 @@ from pathlib import Path
 import httpx
 
 from .api_paths import URL_STEP_RUN
+from .backend_failure import BACKEND_FAILURE_HEADER, BackendFailureBody
 from .models import StepBaselineResources, StepRunRequest, StepRunResponse
 
 # Generous so a slow step doesn't get prematurely cancelled, but bounded
@@ -117,6 +118,13 @@ class ComputeBackendClient:
             baseline_resources=baseline_resources,
         )
         resp = await self._http.post(URL_STEP_RUN, json=body.model_dump())
+        if resp.headers.get(BACKEND_FAILURE_HEADER):
+            # Orchestrator deliberately structured the failure so the
+            # runner sees the same typed surface (and retry
+            # classification) it would for an in-process backend.
+            # Validation errors here are real bugs — the orchestrator
+            # promised a BackendFailureBody and shipped something else.
+            raise BackendFailureBody.model_validate(resp.json()).to_exception()
         resp.raise_for_status()
         parsed = StepRunResponse.model_validate(resp.json())
         return {k: Path(v) for k, v in parsed.outputs.items()}

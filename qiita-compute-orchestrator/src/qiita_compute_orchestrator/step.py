@@ -18,8 +18,15 @@ from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from qiita_common.api_paths import PATH_STEP_PREFIX, PATH_STEP_RUN
+from qiita_common.backend_failure import (
+    BACKEND_FAILURE_HEADER,
+    BACKEND_FAILURE_HTTP_STATUS,
+    BackendFailure,
+    BackendFailureBody,
+)
 from qiita_common.models import StepRunRequest, StepRunResponse
 
 from .backend import ComputeBackend
@@ -58,6 +65,17 @@ async def run_step(
             container=body.container,
             entrypoint=body.entrypoint,
             baseline_resources=body.baseline_resources,
+        )
+    except BackendFailure as exc:
+        # Structured workflow-step failure. Serialize so the runner can
+        # reconstruct the typed BackendFailure and apply retry
+        # classification — without this, transient kinds (NODE_FAIL,
+        # OOM_KILLED, SLURMRESTD_UNREACHABLE, ...) would surface as a
+        # generic HTTPStatusError and be misclassified UNKNOWN_PERMANENT.
+        return JSONResponse(
+            status_code=BACKEND_FAILURE_HTTP_STATUS,
+            content=BackendFailureBody.from_exception(exc).model_dump(mode="json"),
+            headers={BACKEND_FAILURE_HEADER: "1"},
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

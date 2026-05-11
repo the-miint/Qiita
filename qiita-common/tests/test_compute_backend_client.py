@@ -116,3 +116,93 @@ async def test_run_step_posts_to_step_run_endpoint(tmp_path):
     assert body["work_ticket_idx"] == 99
     # Outputs come back as Paths the runner can plumb into downstream entries.
     assert outputs == {"manifest": Path("/workspace/manifest.parquet")}
+
+
+async def test_run_step_reconstructs_backend_failure(tmp_path):
+    """When the orchestrator returns a structured BackendFailureBody
+    (header set), the client must re-raise BackendFailure so the
+    runner's retry classification sees the typed surface — not a
+    generic HTTPStatusError."""
+    from qiita_common.backend_failure import (
+        BACKEND_FAILURE_HEADER,
+        BACKEND_FAILURE_HTTP_STATUS,
+        BackendFailure,
+        FailureKind,
+    )
+    from qiita_common.compute_backend_client import ComputeBackendClient
+    from qiita_common.models import WorkTicketFailureStage
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            BACKEND_FAILURE_HTTP_STATUS,
+            content=json.dumps(
+                {
+                    "kind": "oom_killed",
+                    "stage": "step_run",
+                    "step_name": "load",
+                    "reason": "step exceeded 32GB mem cap",
+                }
+            ).encode(),
+            headers={
+                "content-type": "application/json",
+                BACKEND_FAILURE_HEADER: "1",
+            },
+        )
+
+    custom = httpx.AsyncClient(
+        base_url="http://localhost:8081",
+        transport=httpx.MockTransport(handler),
+        headers={"Authorization": "Bearer xx"},
+    )
+    client = ComputeBackendClient(
+        "http://localhost:8081",
+        api_token="unused",
+        http_client=custom,
+    )
+
+    with pytest.raises(BackendFailure) as ei:
+        await client.run_step(
+            step_name="load",
+            inputs={},
+            workspace=Path("/workspace"),
+            reference_idx=1,
+            work_ticket_idx=1,
+        )
+    exc = ei.value
+    assert exc.kind is FailureKind.OOM_KILLED
+    assert exc.stage is WorkTicketFailureStage.STEP_RUN
+    assert exc.step_name == "load"
+    assert exc.reason == "step exceeded 32GB mem cap"
+    # Retry classification round-trips: OOM_KILLED is transient.
+    assert exc.transient is True
+
+
+async def test_run_step_without_header_falls_through_to_raise_for_status(tmp_path):
+    """A non-2xx response *without* the discriminator header is a real
+    HTTP error (auth failure, 5xx infra) and must surface as
+    HTTPStatusError so the runner classifies it generically — not as a
+    typed BackendFailure."""
+    from qiita_common.compute_backend_client import ComputeBackendClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, content=b"internal error")
+
+    custom = httpx.AsyncClient(
+        base_url="http://localhost:8081",
+        transport=httpx.MockTransport(handler),
+        headers={"Authorization": "Bearer xx"},
+    )
+    client = ComputeBackendClient(
+        "http://localhost:8081",
+        api_token="unused",
+        http_client=custom,
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.run_step(
+            step_name="x",
+            inputs={},
+            workspace=Path("/workspace"),
+            reference_idx=1,
+            work_ticket_idx=1,
+        )
