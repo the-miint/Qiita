@@ -10,8 +10,8 @@ container on `:5433` and tears it down at the end.
 > ⚠ This setup currently requires editing several config values that are
 > duplicated across the codebase. The exact list below was assembled by
 > reading the Makefile, `tests/integration/_pg_env.py`,
-> `tests/integration/docker-compose.yml`, and `.github/workflows/ci.yml`.
-> A future refactor should consolidate these.
+> `qiita-control-plane/tests/_postgres/docker-compose.yml`, and
+> `.github/workflows/ci.yml`. A future refactor should consolidate these.
 
 ## When to use this runbook
 
@@ -27,7 +27,7 @@ container on `:5433` and tears it down at the end.
 
 ### Note re Postgres version
 
-The Docker fixture ([`tests/integration/docker-compose.yml`](../../tests/integration/docker-compose.yml))
+The Docker fixture ([`qiita-control-plane/tests/_postgres/docker-compose.yml`](../../qiita-control-plane/tests/_postgres/docker-compose.yml))
 and CI's macOS leg ([`.github/workflows/ci.yml`](../../.github/workflows/ci.yml))
 both run Postgres 17. Nothing in the codebase enforces a major version for
 host-mode local runs, but if the goal is to match CI, install `postgresql@17`
@@ -139,7 +139,7 @@ sync until the broader cleanup happens:
 
 - [`tests/integration/_pg_env.py`](../../tests/integration/_pg_env.py)
   — Python test defaults
-- [`tests/integration/docker-compose.yml`](../../tests/integration/docker-compose.yml)
+- [`qiita-control-plane/tests/_postgres/docker-compose.yml`](../../qiita-control-plane/tests/_postgres/docker-compose.yml)
   — Docker-mode Postgres user/password/db/port/major version
 - [`tests/integration/conftest.py`](../../tests/integration/conftest.py)
   — DB-name literals in the catalog-reset SQL
