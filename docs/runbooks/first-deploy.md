@@ -86,8 +86,10 @@ change rather than a multi-file search-and-replace.
 ## 1. Write the control plane env file
 
 systemd loads `/etc/qiita/control-plane.env` for the CP. This step generates
-the shared HMAC secret and writes that env file. Keep the secret in your
-shell — the data-plane bootstrap (step 8) needs the same value.
+the shared HMAC secret and installs a rendered copy of the committed
+template at `.env.control-plane.example` (repo root — same template the
+README's local-dev path uses). Keep the secret in your shell — the
+data-plane bootstrap (step 8) needs the same value.
 
 The env file is also the source of `DATABASE_URL` for step 2 (`make
 migrate`) — `dbmate` reads it from the operator's shell, so step 2
@@ -99,48 +101,49 @@ Prerequisites obtained from your DBA / infrastructure team:
 - `qiita_miint_rw` role with login password
 - Network reachability from the CP host to the Postgres host
 
+**How the env-file rendering works (read once, applies to steps 1, 8b, 9a).**
+Each step starts by `cp`'ing the committed `.env.<svc>.example` template
+to `/tmp/<svc>.env`, then `sed`-substituting the prod form for every var
+the runbook can determine *without* operator-supplied secrets: values
+fixed in shell state (`$HMAC_SECRET_KEY`, `$QIITA_DATA_ROOT`), constants
+(`COMPUTE_BACKEND=slurm`), and uncomment-toggles for vars whose template
+default is the prod-shape with placeholders. After the sed, the operator's
+editor pass only has to fill in remaining `<password>` / `<pg-host>` /
+`<realm>` / hostname chunks — no comment-toggling, no swapping dev/prod
+alternatives. The install is `sudo install -m 0440 -o root -g qiita-<grp>`
+and the working file is shredded after.
+
 ```bash
 # Generate the shared HMAC secret. Both the CP and DP must see the same
 # value — they sign and verify Flight tickets against it.
-HMAC_SECRET_KEY=$(openssl rand -base64 32)
+export HMAC_SECRET_KEY=$(openssl rand -base64 32)
+
+# Render the committed template into a working file with the prod form
+# substituted for every var the runbook can pre-fill.
+cp .env.control-plane.example /tmp/control-plane.env
+
+sed -i.bak \
+    -e "s|^HMAC_SECRET_KEY=.*|HMAC_SECRET_KEY=$HMAC_SECRET_KEY|" \
+    -e "s|^DATABASE_URL=.*|DATABASE_URL='postgresql://qiita_miint_rw:<password>@<pg-host>/qiita_miint'|" \
+    -e "s|^# AUTHROCKET_ISSUER=|AUTHROCKET_ISSUER=|" \
+    -e "s|^# AUTHROCKET_LOGINROCKET_URL=|AUTHROCKET_LOGINROCKET_URL=|" \
+    -e "s|^# AUTHROCKET_JWKS_URL=|AUTHROCKET_JWKS_URL=|" \
+    -e "s|^# QIITA_ENDPOINT_URL=|QIITA_ENDPOINT_URL=|" \
+    -e "s|^# COMPUTE_ORCHESTRATOR_URL=|COMPUTE_ORCHESTRATOR_URL=|" \
+    /tmp/control-plane.env
+rm /tmp/control-plane.env.bak
+
+# Edit /tmp/control-plane.env: fill in the remaining placeholders —
+#   DATABASE_URL          <password>, <pg-host>
+#   AUTHROCKET_LOGINROCKET_URL / AUTHROCKET_JWKS_URL
+#                         <realm> (qiita-dev realm: merry-lion-7652.e2.loginrocket.com)
+#   QIITA_ENDPOINT_URL    change qiita.example.org to your externally-resolvable URL
+${EDITOR:-vi} /tmp/control-plane.env
 
 sudo install -d -m 0755 /etc/qiita
-sudo tee /etc/qiita/control-plane.env > /dev/null <<EOF
-# Control plane DSN — qiita_miint_rw owns and connects to qiita_miint.
-DATABASE_URL=postgresql://qiita_miint_rw:<password>@<pg-host>/qiita_miint
-
-HMAC_SECRET_KEY=$HMAC_SECRET_KEY
-
-# AuthRocket SaaS issuer — the canonical URL, NOT the loginrocket subdomain.
-AUTHROCKET_ISSUER=https://authrocket.com
-
-# Realm's loginrocket subdomain — both the JWKS endpoint and the LoginRocket
-# Web hosted login URL live here. Substitute your realm's subdomain; for the
-# qiita-dev realm specifically this is merry-lion-7652.e2.loginrocket.com.
-AUTHROCKET_LOGINROCKET_URL=https://<realm>.loginrocket.com
-AUTHROCKET_JWKS_URL=https://<realm>.loginrocket.com/connect/jwks
-
-# Externally-resolvable URL of the control plane itself; used to construct
-# the redirect_uri AuthRocket bounces back to.
-QIITA_ENDPOINT_URL=https://qiita.example.org
-
-# Compute orchestrator dispatch. When set, the CP fires an in-process
-# asyncio task to call the orchestrator's /step/run on every work-ticket
-# submission (no polling worker). Leave unset to run the CP without
-# dispatch — every work-ticket creation route returns 503.
-COMPUTE_ORCHESTRATOR_URL=http://127.0.0.1:8081
-
-# Optional (defaults shown):
-# CP_TO_CO_TOKEN_PATH=/etc/qiita/cp-to-co.token   # see step 7
-# AUTHROCKET_AUDIENCE=                  # leave unset — LoginRocket Web JWTs lack `aud`
-# AUTHROCKET_JWT_LEEWAY_SECONDS=30
-# AUTH_HANDOFF_FRESHNESS_SECONDS=60
-# CLI_LOGIN_CODE_TTL_SECONDS=30
-# QIITA_TOKEN_DEFAULT_TTL_DAYS=90
-EOF
-
-sudo chown root:qiita-api /etc/qiita/control-plane.env
-sudo chmod 0440 /etc/qiita/control-plane.env
+sudo install -m 0440 -o root -g qiita-api \
+    /tmp/control-plane.env /etc/qiita/control-plane.env
+shred -u /tmp/control-plane.env  # holds the DB password — wipe the working copy
 
 # Keep $HMAC_SECRET_KEY in your shell for step 8 (data-plane bootstrap).
 # If you lose it, regenerate and update both env files — services restart
@@ -354,18 +357,27 @@ and the data plane could not read them. With it, every file inherits
 
 ### 8b. Write the data plane env file
 
-Use the *same* `HMAC_SECRET_KEY` value you generated in step 1 — the CP
-and DP must agree exactly. Substitute the lake DB credentials your DBA
-team provided:
+Render the committed template at `.env.data-plane.example` (same template
+the README's local-dev path uses), substituting the HMAC secret from
+step 1's shell — the CP and DP must agree exactly.
 
 ```bash
-sudo tee /etc/qiita/data-plane.env > /dev/null <<EOF
-HMAC_SECRET_KEY=$HMAC_SECRET_KEY
-DUCKLAKE_CATALOG_CONNSTR=dbname=qiita_miint_lake host=<pg-host> user=qiita_miint_lake_rw password=<password>
-DUCKLAKE_DATA_PATH=$QIITA_DATA_ROOT/parquet
-EOF
-sudo chown root:qiita-data /etc/qiita/data-plane.env
-sudo chmod 0440 /etc/qiita/data-plane.env
+cp .env.data-plane.example /tmp/data-plane.env
+
+sed -i.bak \
+    -e "s|^HMAC_SECRET_KEY=.*|HMAC_SECRET_KEY=$HMAC_SECRET_KEY|" \
+    -e "s|^DUCKLAKE_CATALOG_CONNSTR=.*|DUCKLAKE_CATALOG_CONNSTR='dbname=qiita_miint_lake host=<pg-host> user=qiita_miint_lake_rw password=<password>'|" \
+    -e "s|^# DUCKLAKE_DATA_PATH=.*|DUCKLAKE_DATA_PATH=$QIITA_DATA_ROOT/parquet|" \
+    /tmp/data-plane.env
+rm /tmp/data-plane.env.bak
+
+# Edit /tmp/data-plane.env: fill in the remaining placeholders —
+#   DUCKLAKE_CATALOG_CONNSTR    <pg-host>, <password>
+${EDITOR:-vi} /tmp/data-plane.env
+
+sudo install -m 0440 -o root -g qiita-data \
+    /tmp/data-plane.env /etc/qiita/data-plane.env
+shred -u /tmp/data-plane.env  # holds the lake DB password — wipe the working copy
 ```
 
 `DUCKLAKE_CATALOG_CONNSTR` is libpq format — space-separated `key=value`
@@ -405,37 +417,34 @@ signature` later from any Flight call, the most common cause is that
 
 ### 9a. Write the orchestrator env file
 
-Pick the backend the orchestrator dispatches with. `local` runs DuckDB+miint
-in-process (used for development hosts and the smoke test); `slurm`
-submits jobs to a SLURM cluster via slurmrestd. Production deploys use
-`slurm`; switch by changing `COMPUTE_BACKEND` and restarting.
+Render the committed template at `.env.compute-orchestrator.example` (same
+template the README's local-dev path uses). The template ships with
+`COMPUTE_BACKEND=local` (development); production deploys flip it to
+`slurm` and fill in the SLURM block.
 
 ```bash
-sudo tee /etc/qiita/compute-orchestrator.env > /dev/null <<EOF
-# Backend selection: 'local' for development, 'slurm' for production.
-COMPUTE_BACKEND=slurm
+cp .env.compute-orchestrator.example /tmp/compute-orchestrator.env
 
-# Where the orchestrator stages workspace dirs (params.json + outputs).
-# Must be on the shared filesystem so SLURM compute nodes see it too.
-SHARED_FILESYSTEM_ROOT=$QIITA_DATA_ROOT
+sed -i.bak \
+    -e "s|^COMPUTE_BACKEND=.*|COMPUTE_BACKEND=slurm|" \
+    -e "s|^# SHARED_FILESYSTEM_ROOT=.*|SHARED_FILESYSTEM_ROOT=$QIITA_DATA_ROOT|" \
+    -e "s|^# SLURMRESTD_URL=|SLURMRESTD_URL=|" \
+    -e "s|^# SLURMRESTD_JWT_PATH=|SLURMRESTD_JWT_PATH=|" \
+    -e "s|^# SLURMRESTD_USER_NAME=|SLURMRESTD_USER_NAME=|" \
+    -e "s|^# SLURM_PARTITION=|SLURM_PARTITION=|" \
+    -e "s|^# SLURM_ACCOUNT=|SLURM_ACCOUNT=|" \
+    /tmp/compute-orchestrator.env
+rm /tmp/compute-orchestrator.env.bak
 
-# CP↔CO shared bearer (default path; matches step 7's install).
-# CP_TO_CO_TOKEN_PATH=/etc/qiita/cp-to-co.token
+# Edit /tmp/compute-orchestrator.env: fill in the remaining placeholders —
+#   SLURMRESTD_URL              <slurmctld-host>
+#   SLURM_PARTITION / _ACCOUNT  override the qiita / qiita-prod defaults
+#                               if your cluster uses different names
+${EDITOR:-vi} /tmp/compute-orchestrator.env
 
-# --- SLURM backend config (required when COMPUTE_BACKEND=slurm) ---
-SLURMRESTD_URL=http://<slurmctld-host>:6820
-SLURMRESTD_JWT_PATH=/etc/qiita/slurmrestd.jwt
-SLURMRESTD_USER_NAME=qiita-orch
-SLURM_PARTITION=qiita
-SLURM_ACCOUNT=qiita-prod
-
-# Optional (defaults shown):
-# SLURMRESTD_API_VERSION=v0.0.40
-# SLURM_POLL_INTERVAL_SECONDS=10
-# SLURM_JOB_TIMEOUT_SECONDS=86400
-EOF
-sudo chown root:qiita-orch /etc/qiita/compute-orchestrator.env
-sudo chmod 0440 /etc/qiita/compute-orchestrator.env
+sudo install -m 0440 -o root -g qiita-orch \
+    /tmp/compute-orchestrator.env /etc/qiita/compute-orchestrator.env
+shred -u /tmp/compute-orchestrator.env
 ```
 
 The SLURM JWT file at `SLURMRESTD_JWT_PATH` is generated by SLURM
