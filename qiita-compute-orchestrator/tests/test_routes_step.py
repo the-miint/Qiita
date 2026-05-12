@@ -27,8 +27,26 @@ class _RecordingBackend(ComputeBackend):
         workspace: Path,
         *,
         reference_idx: int,
+        work_ticket_idx: int,
+        container: str | None = None,
+        entrypoint: str | None = None,
+        baseline_resources=None,
     ) -> dict[str, Path]:
-        self.calls.append((name, dict(inputs), workspace, reference_idx))
+        # Existing tests don't exercise every field; they get captured
+        # into the calls log as a tuple so future tests that DO
+        # exercise them can assert on the values.
+        self.calls.append(
+            (
+                name,
+                dict(inputs),
+                workspace,
+                reference_idx,
+                work_ticket_idx,
+                container,
+                entrypoint,
+                baseline_resources,
+            )
+        )
         return {"manifest": workspace / "manifest.parquet"}
 
 
@@ -51,6 +69,7 @@ def test_step_run_requires_bearer_token(http_client):
             "inputs": {"fasta_path": "/tmp/x.fa"},
             "workspace": "/tmp/ws",
             "reference_idx": 1,
+            "work_ticket_idx": 1,
         },
     )
     assert resp.status_code == 401
@@ -66,6 +85,7 @@ def test_step_run_rejects_wrong_token(http_client, cp_to_co_token):
             "inputs": {"fasta_path": "/tmp/x.fa"},
             "workspace": "/tmp/ws",
             "reference_idx": 1,
+            "work_ticket_idx": 1,
         },
     )
     assert resp.status_code == 401
@@ -84,6 +104,7 @@ def test_step_run_dispatches_to_backend(http_client, cp_to_co_token, tmp_path):
             "inputs": {"fasta_path": str(fasta)},
             "workspace": str(tmp_path),
             "reference_idx": 7,
+            "work_ticket_idx": 99,
         },
     )
     assert resp.status_code == 200, resp.text
@@ -92,11 +113,25 @@ def test_step_run_dispatches_to_backend(http_client, cp_to_co_token, tmp_path):
     assert body["outputs"]["manifest"].endswith("manifest.parquet")
 
     assert len(backend.calls) == 1
-    name, inputs, workspace, reference_idx = backend.calls[0]
+    (
+        name,
+        inputs,
+        workspace,
+        reference_idx,
+        work_ticket_idx,
+        container,
+        entrypoint,
+        baseline,
+    ) = backend.calls[0]
     assert name == "hash"
     assert inputs == {"fasta_path": fasta}
     assert workspace == tmp_path
     assert reference_idx == 7
+    assert work_ticket_idx == 99
+    # Old call sites omit container metadata; protocol defaults to None.
+    assert container is None
+    assert entrypoint is None
+    assert baseline is None
 
 
 def test_step_run_translates_backend_value_error(http_client, cp_to_co_token, tmp_path):
@@ -115,9 +150,60 @@ def test_step_run_translates_backend_value_error(http_client, cp_to_co_token, tm
             "inputs": {},
             "workspace": str(tmp_path),
             "reference_idx": 1,
+            "work_ticket_idx": 1,
         },
     )
     assert resp.status_code == 422
+    # ValueError → FastAPI's HTTPException shape, no discriminator header.
+    # The header is reserved for BackendFailure (see test below).
+    from qiita_common.backend_failure import BACKEND_FAILURE_HEADER
+
+    assert BACKEND_FAILURE_HEADER not in resp.headers
+    assert resp.json() == {"detail": "unknown step"}
+
+
+def test_step_run_serializes_backend_failure(http_client, cp_to_co_token, tmp_path):
+    """BackendFailure from the backend → structured response the
+    runner can reconstruct into a typed BackendFailure for retry
+    classification."""
+    from qiita_common.backend_failure import (
+        BACKEND_FAILURE_HEADER,
+        BACKEND_FAILURE_HTTP_STATUS,
+        BackendFailure,
+        FailureKind,
+    )
+    from qiita_common.models import WorkTicketFailureStage
+
+    client, backend = http_client
+
+    async def boom(*args, **kwargs):
+        raise BackendFailure(
+            kind=FailureKind.NODE_FAIL,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name="hash",
+            reason="slurm reported node n01 lost mid-step",
+        )
+
+    backend.run_step = boom  # type: ignore[method-assign]
+    resp = client.post(
+        URL_STEP_RUN,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "hash",
+            "inputs": {},
+            "workspace": str(tmp_path),
+            "reference_idx": 1,
+            "work_ticket_idx": 1,
+        },
+    )
+    assert resp.status_code == BACKEND_FAILURE_HTTP_STATUS
+    assert resp.headers[BACKEND_FAILURE_HEADER] == "1"
+    assert resp.json() == {
+        "kind": "node_fail",
+        "stage": "step_run",
+        "step_name": "hash",
+        "reason": "slurm reported node n01 lost mid-step",
+    }
 
 
 def test_settings_resolves_token_from_env():

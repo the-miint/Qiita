@@ -363,6 +363,7 @@ source = { editable = "." }
 dependencies = [
     { name = "duckdb" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "qiita-common" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -379,6 +380,7 @@ dev = [
 requires-dist = [
     { name = "duckdb", specifier = ">=1.5.2" },
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "httpx", specifier = ">=0.28" },
     { name = "qiita-common", directory = "../qiita-common" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
 ]

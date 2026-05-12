@@ -1,11 +1,11 @@
 # First-deploy bootstrap
 
-**Purpose.** Operator runbook for bringing up a fresh deployment: from a
-clean database through migrations, env-var configuration, the first OIDC
-login, operator promotion to `system_admin`, data-plane bootstrap, and
-orchestrator startup. End state: all three services authenticated and
-ready to serve traffic. Each step is independent — re-running it should
-be safe (idempotent) unless noted.
+**Purpose.** Operator runbook for bringing up a fresh deployment: from
+env-var configuration through migrations against a clean database, the
+first OIDC login, operator promotion to `system_admin`, data-plane
+bootstrap, and orchestrator startup. End state: all three services
+authenticated and ready to serve traffic. Each step is independent —
+re-running it should be safe (idempotent) unless noted.
 
 For the conceptual reference (principal model, scopes, endpoints), see
 [`docs/auth.md`](../auth.md). [`orchestrator-token-rotation.md`](orchestrator-token-rotation.md)
@@ -43,7 +43,7 @@ These are independent identities from the Postgres roles (`qiita_miint_rw`,
 in different layers does not imply a connection.
 
 **Postgres databases and roles exist** (provided by your DBA /
-infrastructure team): see step 2 (`qiita_miint`) and step 8
+infrastructure team): see step 1 (`qiita_miint`) and step 8
 (`qiita_miint_lake`).
 
 **Code is installed** at `/opt/qiita/` via `deploy/activate.sh` (rsync from
@@ -65,21 +65,35 @@ substitutes at deploy time using the `QIITA_HOSTNAME` env var
 `systemctl enable --now`. Service processes themselves run as the system
 users above (systemd drops to `User=` from each unit), not as you.
 
-## 1. Apply migrations
+**Pick a data root.** The data plane writes Parquet under the deploy's
+durable shared mount; the runbook below threads that path through env
+files and `install -d` commands by heredoc-expanding `$QIITA_DATA_ROOT`
+from the operator's shell. The default `/data` works on the dev VM
+defined in this repo's compose file; production deploys whose shared
+filesystem is mounted elsewhere override:
 
 ```bash
-make migrate
+# Stays in the operator's shell across the next several env-file writes
+# and `install -d` commands. Substitute the actual mount path your
+# infrastructure team provisioned.
+export QIITA_DATA_ROOT=/your/shared/mount
 ```
 
-Seeds the system principal at `idx=1` and creates the auth tables. After
-this, `qiita.principal` has exactly one row (the `system` principal); no
-human or service-account principals exist yet.
+`QIITA_DATA_ROOT` is purely a runbook-template variable: no Qiita process
+reads it directly. Switching mount paths later is a one-line export
+change rather than a multi-file search-and-replace.
 
-## 2. Write the control plane env file
+## 1. Write the control plane env file
 
 systemd loads `/etc/qiita/control-plane.env` for the CP. This step generates
-the shared HMAC secret and writes that env file. Keep the secret in your
-shell — the data-plane bootstrap (step 8) needs the same value.
+the shared HMAC secret and installs a rendered copy of the committed
+template at `.env.control-plane.example` (repo root — same template the
+README's local-dev path uses). Keep the secret in your shell — the
+data-plane bootstrap (step 8) needs the same value.
+
+The env file is also the source of `DATABASE_URL` for step 2 (`make
+migrate`) — `dbmate` reads it from the operator's shell, so step 2
+sources this file before invoking `make`.
 
 Prerequisites obtained from your DBA / infrastructure team:
 
@@ -87,48 +101,49 @@ Prerequisites obtained from your DBA / infrastructure team:
 - `qiita_miint_rw` role with login password
 - Network reachability from the CP host to the Postgres host
 
+**How the env-file rendering works (read once, applies to steps 1, 8b, 9a).**
+Each step starts by `cp`'ing the committed `.env.<svc>.example` template
+to `/tmp/<svc>.env`, then `sed`-substituting the prod form for every var
+the runbook can determine *without* operator-supplied secrets: values
+fixed in shell state (`$HMAC_SECRET_KEY`, `$QIITA_DATA_ROOT`), constants
+(`COMPUTE_BACKEND=slurm`), and uncomment-toggles for vars whose template
+default is the prod-shape with placeholders. After the sed, the operator's
+editor pass only has to fill in remaining `<password>` / `<pg-host>` /
+`<realm>` / hostname chunks — no comment-toggling, no swapping dev/prod
+alternatives. The install is `sudo install -m 0440 -o root -g qiita-<grp>`
+and the working file is shredded after.
+
 ```bash
 # Generate the shared HMAC secret. Both the CP and DP must see the same
 # value — they sign and verify Flight tickets against it.
-HMAC_SECRET_KEY=$(openssl rand -base64 32)
+export HMAC_SECRET_KEY=$(openssl rand -base64 32)
+
+# Render the committed template into a working file with the prod form
+# substituted for every var the runbook can pre-fill.
+cp .env.control-plane.example /tmp/control-plane.env
+
+sed -i.bak \
+    -e "s|^HMAC_SECRET_KEY=.*|HMAC_SECRET_KEY=$HMAC_SECRET_KEY|" \
+    -e "s|^DATABASE_URL=.*|DATABASE_URL='postgresql://qiita_miint_rw:<password>@<pg-host>/qiita_miint'|" \
+    -e "s|^# AUTHROCKET_ISSUER=|AUTHROCKET_ISSUER=|" \
+    -e "s|^# AUTHROCKET_LOGINROCKET_URL=|AUTHROCKET_LOGINROCKET_URL=|" \
+    -e "s|^# AUTHROCKET_JWKS_URL=|AUTHROCKET_JWKS_URL=|" \
+    -e "s|^# QIITA_ENDPOINT_URL=|QIITA_ENDPOINT_URL=|" \
+    -e "s|^# COMPUTE_ORCHESTRATOR_URL=|COMPUTE_ORCHESTRATOR_URL=|" \
+    /tmp/control-plane.env
+rm /tmp/control-plane.env.bak
+
+# Edit /tmp/control-plane.env: fill in the remaining placeholders —
+#   DATABASE_URL          <password>, <pg-host>
+#   AUTHROCKET_LOGINROCKET_URL / AUTHROCKET_JWKS_URL
+#                         <realm> (qiita-dev realm: merry-lion-7652.e2.loginrocket.com)
+#   QIITA_ENDPOINT_URL    change qiita.example.org to your externally-resolvable URL
+${EDITOR:-vi} /tmp/control-plane.env
 
 sudo install -d -m 0755 /etc/qiita
-sudo tee /etc/qiita/control-plane.env > /dev/null <<EOF
-# Control plane DSN — qiita_miint_rw owns and connects to qiita_miint.
-DATABASE_URL=postgresql://qiita_miint_rw:<password>@<pg-host>/qiita_miint
-
-HMAC_SECRET_KEY=$HMAC_SECRET_KEY
-
-# AuthRocket SaaS issuer — the canonical URL, NOT the loginrocket subdomain.
-AUTHROCKET_ISSUER=https://authrocket.com
-
-# Realm's loginrocket subdomain — both the JWKS endpoint and the LoginRocket
-# Web hosted login URL live here. Substitute your realm's subdomain; for the
-# qiita-dev realm specifically this is merry-lion-7652.e2.loginrocket.com.
-AUTHROCKET_LOGINROCKET_URL=https://<realm>.loginrocket.com
-AUTHROCKET_JWKS_URL=https://<realm>.loginrocket.com/connect/jwks
-
-# Externally-resolvable URL of the control plane itself; used to construct
-# the redirect_uri AuthRocket bounces back to.
-QIITA_ENDPOINT_URL=https://qiita.example.org
-
-# Compute orchestrator dispatch. When set, the CP fires an in-process
-# asyncio task to call the orchestrator's /step/run on every work-ticket
-# submission (no polling worker). Leave unset to run the CP without
-# dispatch — every work-ticket creation route returns 503.
-COMPUTE_ORCHESTRATOR_URL=http://127.0.0.1:8081
-
-# Optional (defaults shown):
-# CP_TO_CO_TOKEN_PATH=/etc/qiita/cp-to-co.token   # see step 7
-# AUTHROCKET_AUDIENCE=                  # leave unset — LoginRocket Web JWTs lack `aud`
-# AUTHROCKET_JWT_LEEWAY_SECONDS=30
-# AUTH_HANDOFF_FRESHNESS_SECONDS=60
-# CLI_LOGIN_CODE_TTL_SECONDS=30
-# QIITA_TOKEN_DEFAULT_TTL_DAYS=90
-EOF
-
-sudo chown root:qiita-api /etc/qiita/control-plane.env
-sudo chmod 0440 /etc/qiita/control-plane.env
+sudo install -m 0440 -o root -g qiita-api \
+    /tmp/control-plane.env /etc/qiita/control-plane.env
+shred -u /tmp/control-plane.env  # holds the DB password — wipe the working copy
 
 # Keep $HMAC_SECRET_KEY in your shell for step 8 (data-plane bootstrap).
 # If you lose it, regenerate and update both env files — services restart
@@ -147,11 +162,26 @@ See [`authrocket-realm-setup.md`](authrocket-realm-setup.md) for the
 realm-side configuration (test users, email-verification policy, the
 `iss=https://authrocket.com` footgun).
 
+## 2. Apply migrations
+
+`make migrate` runs `dbmate up` against `DATABASE_URL`, which it reads
+from the operator's shell. Source the env file you just wrote so the
+migration runs against the right database:
+
+```bash
+set -a && source /etc/qiita/control-plane.env && set +a
+make migrate
+```
+
+Seeds the system principal at `idx=1` and creates the auth tables. After
+this, `qiita.principal` has exactly one row (the `system` principal); no
+human or service-account principals exist yet.
+
 ## 3. One-shot JWT shape verify
 
 Log into the AuthRocket realm via the hosted UI and capture the raw JWT.
 The script reads the same env vars the CP does — source them from the env
-file you wrote in step 2 before running it:
+file you wrote in step 1 before running it:
 
 ```bash
 set -a && source /etc/qiita/control-plane.env && set +a
@@ -305,18 +335,20 @@ and an env file.
 ```bash
 # Final Parquet location — owned by the DP, not group-writable. The DP
 # atomic-renames into here from staging; nothing else writes here.
-sudo install -d -o qiita-data -g qiita-data -m 0750 /data/parquet
+sudo install -d -o qiita-data -g qiita-data -m 0750 "$QIITA_DATA_ROOT/parquet"
 
 # SLURM job staging — group-writable + setgid so files written by qiita-job
 # inherit the qiita-pipeline group, and the DP (also in qiita-pipeline) can
-# read the 440-mode outputs before renaming them into /data/parquet.
+# read the 440-mode outputs before renaming them into $QIITA_DATA_ROOT/parquet.
 sudo install -d -o qiita-data -g qiita-pipeline -m 2770 /scratch/ephemeral/staging
 ```
 
-If `/scratch` and `/data` are on different filesystems, the atomic rename
-falls back to copy+delete (slower; see
+If `$QIITA_DATA_ROOT` and `/scratch` are on different filesystems, the
+atomic rename falls back to copy+delete (slower; see
 `qiita-data-plane/src/flight_service.rs::move_file`). Provision them on
-the same filesystem when possible.
+the same filesystem when possible. (Some HPC environments expose the
+staging tier under a different mount than `$QIITA_DATA_ROOT`; coordinate
+with your infrastructure team to keep them on one volume if you can.)
 
 The setgid bit (`2770`) on the staging directory is load-bearing: without
 it, files created by `qiita-job` would inherit `qiita-job`'s primary group
@@ -325,18 +357,27 @@ and the data plane could not read them. With it, every file inherits
 
 ### 8b. Write the data plane env file
 
-Use the *same* `HMAC_SECRET_KEY` value you generated in step 2 — the CP
-and DP must agree exactly. Substitute the lake DB credentials your DBA
-team provided:
+Render the committed template at `.env.data-plane.example` (same template
+the README's local-dev path uses), substituting the HMAC secret from
+step 1's shell — the CP and DP must agree exactly.
 
 ```bash
-sudo tee /etc/qiita/data-plane.env > /dev/null <<EOF
-HMAC_SECRET_KEY=$HMAC_SECRET_KEY
-DUCKLAKE_CATALOG_CONNSTR=dbname=qiita_miint_lake host=<pg-host> user=qiita_miint_lake_rw password=<password>
-DUCKLAKE_DATA_PATH=/data/parquet
-EOF
-sudo chown root:qiita-data /etc/qiita/data-plane.env
-sudo chmod 0440 /etc/qiita/data-plane.env
+cp .env.data-plane.example /tmp/data-plane.env
+
+sed -i.bak \
+    -e "s|^HMAC_SECRET_KEY=.*|HMAC_SECRET_KEY=$HMAC_SECRET_KEY|" \
+    -e "s|^DUCKLAKE_CATALOG_CONNSTR=.*|DUCKLAKE_CATALOG_CONNSTR='dbname=qiita_miint_lake host=<pg-host> user=qiita_miint_lake_rw password=<password>'|" \
+    -e "s|^# DUCKLAKE_DATA_PATH=.*|DUCKLAKE_DATA_PATH=$QIITA_DATA_ROOT/parquet|" \
+    /tmp/data-plane.env
+rm /tmp/data-plane.env.bak
+
+# Edit /tmp/data-plane.env: fill in the remaining placeholders —
+#   DUCKLAKE_CATALOG_CONNSTR    <pg-host>, <password>
+${EDITOR:-vi} /tmp/data-plane.env
+
+sudo install -m 0440 -o root -g qiita-data \
+    /tmp/data-plane.env /etc/qiita/data-plane.env
+shred -u /tmp/data-plane.env  # holds the lake DB password — wipe the working copy
 ```
 
 `DUCKLAKE_CATALOG_CONNSTR` is libpq format — space-separated `key=value`
@@ -370,24 +411,63 @@ make verify-health
 
 Expected: `status: SERVING`. If you see `Unauthenticated: invalid HMAC
 signature` later from any Flight call, the most common cause is that
-`HMAC_SECRET_KEY` differs between the CP and DP env files (see step 2).
+`HMAC_SECRET_KEY` differs between the CP and DP env files (see step 1).
 
 ## 9. Start the orchestrator
+
+### 9a. Write the orchestrator env file
+
+Render the committed template at `.env.compute-orchestrator.example` (same
+template the README's local-dev path uses). The template ships with
+`COMPUTE_BACKEND=local` (development); production deploys flip it to
+`slurm` and fill in the SLURM block.
+
+```bash
+cp .env.compute-orchestrator.example /tmp/compute-orchestrator.env
+
+sed -i.bak \
+    -e "s|^COMPUTE_BACKEND=.*|COMPUTE_BACKEND=slurm|" \
+    -e "s|^# SHARED_FILESYSTEM_ROOT=.*|SHARED_FILESYSTEM_ROOT=$QIITA_DATA_ROOT|" \
+    -e "s|^# SLURMRESTD_URL=|SLURMRESTD_URL=|" \
+    -e "s|^# SLURMRESTD_JWT_PATH=|SLURMRESTD_JWT_PATH=|" \
+    -e "s|^# SLURMRESTD_USER_NAME=|SLURMRESTD_USER_NAME=|" \
+    -e "s|^# SLURM_PARTITION=|SLURM_PARTITION=|" \
+    -e "s|^# SLURM_ACCOUNT=|SLURM_ACCOUNT=|" \
+    /tmp/compute-orchestrator.env
+rm /tmp/compute-orchestrator.env.bak
+
+# Edit /tmp/compute-orchestrator.env: fill in the remaining placeholders —
+#   SLURMRESTD_URL              <slurmctld-host>
+#   SLURM_PARTITION / _ACCOUNT  override the qiita / qiita-prod defaults
+#                               if your cluster uses different names
+${EDITOR:-vi} /tmp/compute-orchestrator.env
+
+sudo install -m 0440 -o root -g qiita-orch \
+    /tmp/compute-orchestrator.env /etc/qiita/compute-orchestrator.env
+shred -u /tmp/compute-orchestrator.env
+```
+
+The SLURM JWT file at `SLURMRESTD_JWT_PATH` is generated by SLURM
+(`scontrol token`) and rotated periodically. Install it once now;
+the orchestrator reloads on 401 automatically. Coordinate with your
+HPC team for the rotation schedule.
+
+### 9b. Start the orchestrator service
 
 ```bash
 sudo systemctl enable --now qiita-compute-orchestrator
 ```
 
-systemd loads `/etc/qiita/compute-orchestrator.env`. The orchestrator
-reads `/etc/qiita/cp-to-co.token` (installed in step 7) at startup and
-will refuse to boot if the file is missing or unreadable by `qiita-orch`.
+systemd loads the env file you just wrote. The orchestrator reads
+`/etc/qiita/cp-to-co.token` (installed in step 7) at startup and will
+refuse to boot if the file is missing or unreadable by `qiita-orch`.
+With `COMPUTE_BACKEND=slurm`, it also reads `SLURMRESTD_JWT_PATH` —
+boot fails fast if that file is missing.
 
-> **v1: no orchestrator PAT.** The orchestrator does not load a PAT in v1
-> (`Settings` has no token field; only the CP↔CO shared bearer is read).
-> When `SlurmBackend` lands and the orchestrator gains CO→CP callbacks
-> for async-step lifecycle, that PR adds the PAT-mint step here and
-> [`orchestrator-token-rotation.md`](orchestrator-token-rotation.md)
-> becomes the rotation procedure for it.
+The orchestrator authenticates only with the CP↔CO shared bearer
+installed in step 7 — it does not load a PAT.
+[`orchestrator-token-rotation.md`](orchestrator-token-rotation.md) is
+the rotation procedure once a PAT is wired in for CO→CP callbacks.
 
 ## 10. Verify the deploy
 
@@ -467,9 +547,10 @@ A single ticket touches every layer:
   backend (`SlurmBackend` runs containerized jobs as `qiita-job` on the
   cluster; `LocalBackend` runs in-process for development).
 - **Data plane** — registers Parquet via `ducklake_add_data_files`
-  (writes to `qiita_miint_lake`, lands files in `/data/parquet/<table>/`).
+  (writes to `qiita_miint_lake`, lands files in
+  `$QIITA_DATA_ROOT/parquet/<table>/`).
 - **Both filesystems** — intermediates on `/scratch/ephemeral/staging/`,
-  final output on `/data/parquet/`.
+  final output on `$QIITA_DATA_ROOT/parquet/`.
 
 ### Recipe
 
@@ -499,7 +580,8 @@ A single ticket touches every layer:
      membership rows for the smoke tag.
    - `qiita_miint_lake` has new `ducklake_data_file` rows from the last
      few minutes.
-   - `/data/parquet/<table>/` contains recent Parquet files, mode 440.
+   - `$QIITA_DATA_ROOT/parquet/<table>/` contains recent Parquet files,
+     mode 440.
 
    A failure on any single check pinpoints which layer is broken.
 
@@ -507,7 +589,6 @@ A single ticket touches every layer:
 
 The smoke leaves one tagged reference plus a handful of features and
 catalog files per deploy — by design. They are cheap (kilobytes) and
-the audit trail proves which deploys passed smoke. No cleanup needed:
-versioned smoke names keep accumulation harmless until full reference
-deletion (membership rows, exclusive features, catalog files, Parquet)
-is wired.
+the audit trail proves which deploys passed smoke. Versioned smoke
+names mean re-runs don't collide with prior smokes; no per-run
+cleanup is necessary.

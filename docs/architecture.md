@@ -323,10 +323,10 @@ Phylogenetic placements (jplace format) are stored as raw placement data via `re
 
 #### Aligner Index Storage
 
-Aligner indices (minimap2 `.mmi`, bowtie2 `.bt2`) are built by the compute orchestrator as SLURM batch jobs and stored on the shared filesystem:
+Aligner indices (minimap2 `.mmi`, bowtie2 `.bt2`) are built by the compute orchestrator as SLURM batch jobs and stored on the shared filesystem. The tier root is `/scratch/persistent-local/` for random-access aligner indices, or `/scratch/persistent/` for built reference data whose access pattern doesn't justify the local-SSD copy; the subtree below is identical either way:
 
 ```
-/scratch/persistent-local/references/{reference_idx}/
+<persistent-tier-root>/references/{reference_idx}/
 ├── minimap2/
 │   └── index.mmi
 ├── bowtie2/
@@ -507,45 +507,34 @@ States:
 - **COMPLETED** — results registered in DuckLake, provenance recorded
 - **FAILED** — failure at any stage, retries exhausted or permanent failure
 
-Work ticket fields:
-- `id` — unique identifier
-- `study_id`, `preparation_id` — references to control plane entities
-- `state` — current lifecycle state
-- `current_step` — index of the step currently executing or last attempted (0-based)
-- `total_steps` — total number of steps in the workflow
-- `failed_stage` — which stage failed (if FAILED): `upload`, `submission`, `processing_step_{n}`, `registration`
-- `failure_reason` — human-readable failure description
-- `failure_type` — `retriable` or `permanent`
-- `retry_count` — number of retries attempted
-- `max_retries` — configurable maximum (default: 3)
-- `slurm_job_id` — SLURM job identifier for the current step (updated each step; for map steps, the most recently failed or active job ID)
-- `failed_samples` — list of `prep_sample_idx` values that did not survive the map phase (retries exhausted); recorded before the reduce step runs
-- `staging_path` — path to uploaded raw data
-- `result_path` — path to processed output
-- `log_stdout_path` — path to SLURM job stdout
-- `log_stderr_path` — path to SLURM job stderr
-- `workflow_name`, `workflow_version` — which workflow was executed
-- `created_at`, `updated_at`, `completed_at` — timestamps
-- `created_by` — user who initiated the work ticket
-- `provenance` — JSON blob with full audit trail (set at COMPLETED)
+Work ticket fields (per `qiita.work_ticket` migration `20260504000001_work_ticket.sql`):
+- `work_ticket_idx` — primary key
+- `action_id`, `action_version` — FK into `qiita.action`; pin the exact action definition this ticket was submitted against
+- `originator_principal_idx` — submitter; FK into `qiita.principal`
+- `scope_target_kind` plus one of `(study_idx, prep_idx)` or `reference_idx` — tagged-union scope target, governed by the `work_ticket_scope_target_consistent` CHECK
+- `action_context` — JSONB validated at submission against `action.context_schema`
+- `state` — `pending` / `queued` / `processing` / `completed` / `failed`
+- `retry_count` — number of retry attempts so far (incremented on each PROCESSING → QUEUED retry)
+- `max_retries` — per-ticket retry budget (default 3, max 100)
+- `failure_type` — `retriable` or `permanent`; non-NULL on FAILED, NULL otherwise (CHECK enforced)
+- `failure_stage` — coarse stage enum: `submission` / `step_run` / `finalize`
+- `failure_step_name` — YAML step name when `failure_stage = step_run`; NULL otherwise (CHECK enforced)
+- `failure_reason` — human-readable explanation
+- `created_at`, `updated_at` — timestamps
 
-Retriable failure types:
-- SLURM node failure / preemption
-- OOM kill (may succeed with different resource allocation)
-- Transient filesystem errors
-- slurmrestd communication failures
+The schema does not carry per-step provenance fields (slurm_job_id, log paths, current_step / total_steps, provenance JSONB, completed_at). The runner is synchronous and waits inline for each step; SLURM-side log retrieval is on the orchestrator and not surfaced on the work_ticket row.
 
-Permanent failure types:
-- Invalid input data (corrupt FASTQ, wrong format)
-- Schema mismatch at DuckLake registration
-- Workflow container image not found
-- Workflow exit with known permanent error code
-- Container contract violation (manifest missing or identifier set mismatch after exit code 0)
+Failure classification is finer-grained at the backend layer: `BackendFailure.kind` is one of the values in `qiita_common.backend_failure.FailureKind` (NODE_FAIL, OOM_KILLED, PREEMPTED, TIMEOUT_BEFORE_START, TRANSIENT_FS_ERROR, SLURMRESTD_UNREACHABLE, PROCESS_RESTARTED for retriable; BAD_INPUT, EXIT_NONZERO, CONTRACT_VIOLATION, UNKNOWN_PERMANENT for permanent). The runner collapses these to the two-valued `failure_type` for storage; `failure_reason` carries the kind name + per-failure detail for triage.
 
-Manual restart:
-- An authorized user can restart a FAILED work ticket via the control plane REST API
-- This resets `retry_count` to 0 and transitions the ticket to QUEUED
-- The original failure information is preserved in the provenance log
+Retry semantics (implemented in `qiita_control_plane.runner._run_entry_with_retry`):
+- On `BackendFailure(transient=True)` and `retry_count < max_retries`: bump `retry_count`, atomically transition `PROCESSING → QUEUED → PROCESSING`, retry the same entry. Earlier successful entries are not re-run — `bound` outputs carry forward.
+- On `BackendFailure(transient=True)` with retries exhausted: transition to `FAILED` with `failure_type=retriable` (so post-mortems can distinguish "exhausted retries on a transient kind" from "permanent on first attempt").
+- On `BackendFailure(transient=False)`: skip the retry loop, transition straight to `FAILED` with `failure_type=permanent`.
+- On any other unwrapped `Exception` (LIBRARY primitive raising plain Python, programming bug): treat as `permanent`, `failure_type=permanent`, `failure_reason="<ExceptionType>: <message>"` truncated to 2000 chars.
+
+Manual restart (`POST /api/v1/work-ticket/{idx}/run` on a `FAILED` ticket):
+- Atomic UPDATE: state ← PENDING, `retry_count = 0`, all `failure_*` columns ← NULL (the DB CHECK requires `failure_*` all-NULL when state ≠ failed; the route clears them in one statement).
+- Triggers a fresh in-process dispatch via `schedule_dispatch`. The original FAILED-row state is not preserved on the row itself; ops dashboards that want post-mortem retention should snapshot the `failure_*` fields before triggering /run.
 
 **Single-CP-process contract.** The control plane runs as a single
 `qiita-control-plane.service` instance. Dispatch tasks are bound to the
@@ -614,21 +603,27 @@ For `reduce` steps, `params.json` contains the prep-level identifiers, the survi
 
 Outputs (container must produce):
 - All output files written to `$QIITA_OUTPUT_PATH`
-- `$QIITA_OUTPUT_PATH/manifest.json` written as the final act before chmod, listing every output file with its size in bytes:
+- `$QIITA_OUTPUT_PATH/manifest.json` written as the final act before chmod, with two fields:
   ```json
-  {"files": [{"path": "output.parquet", "size_bytes": 12345678}]}
+  {
+    "files": [{"path": "output.parquet", "size_bytes": 12345678}],
+    "outputs": {"manifest": "output.parquet"}
+  }
   ```
+  `files` is the audit list — every file the container wrote, with declared sizes for the verifier to check. `outputs` maps the YAML step's declared `outputs:` names to relative paths under `$QIITA_OUTPUT_PATH`; use `"."` for an output that IS the directory (e.g. a step whose output is `staging_dir`).
 - All files in `$QIITA_OUTPUT_PATH` set to `chmod 440` (including the manifest)
 - Exit code 0 on success, non-zero on any failure
 
 The container must not read from anywhere other than `$QIITA_INPUT_PATH`, must not write to anywhere other than `$QIITA_OUTPUT_PATH`, and must have no knowledge of Qiita, the control plane, or any service credentials.
 
-Orchestrator verification gates (all three must pass before a step is accepted):
-1. SLURM exit code 0
-2. `$QIITA_OUTPUT_PATH/manifest.json` exists
-3. Every file listed in the manifest exists and matches the declared `size_bytes`
+Orchestrator verification gates (all must pass before a step is accepted):
+1. Exit code 0
+2. `$QIITA_OUTPUT_PATH/manifest.json` exists, parses as JSON, has both `files` and `outputs` keys
+3. Every file listed in `files` exists at its declared `size_bytes`
+4. The `outputs` map's relative paths resolve under `$QIITA_OUTPUT_PATH` (no traversal) and exist
+5. Every file under `$QIITA_OUTPUT_PATH` is mode `0o440` and is listed in `files` (no extras)
 
-Gates 2 or 3 failing after exit code 0 is a permanent failure — the container violated the contract.
+A gate failure after exit code 0 is a permanent failure — the container returned 0 but didn't honor the contract, so retry won't help. SlurmBackend wraps the resulting failures as `BackendFailure(kind=CONTRACT_VIOLATION, transient=False)`.
 
 **Primary backend:** SLURM via slurmrestd REST API (JWT auth).
 - Submits jobs as JSON (no `#SBATCH` directives — slurmrestd ignores them)
@@ -646,7 +641,7 @@ Gates 2 or 3 failing after exit code 0 is a permanent failure — the container 
 - No root required (runs unprivileged)
 - SLURM submits via `srun apptainer exec` or native integration
 
-**Backend code-sharing:** Today only `LocalBackend` (DuckDB+miint in-process) is implemented; its per-step helpers (`_run_hash`, `_run_load`, the module-level `_write_*` builders) are the source of truth for what each step does. When `SlurmBackend` is wired, the corresponding container's entrypoint must execute the *same* DuckDB+miint logic — not a parallel implementation. The cleanest path is to extract the SQL/script bodies into a shared `qiita_compute_orchestrator.jobs` module that both backends consume: LocalBackend imports it directly; SLURM containers ship a CLI wrapper that reads `params.json` and dispatches into the same module. Either way, the dev/test path and the production SLURM path must not diverge. (Open follow-up — `SlurmBackend.run_step` is `NotImplementedError` today.)
+**Backend code-sharing:** Both `LocalBackend` (DuckDB+miint in-process) and `SlurmBackend` (submits jobs via slurmrestd) are wired. SlurmBackend owns submit / poll / verify / classify; the work each step actually performs still lives in LocalBackend's per-step helpers (`_run_hash`, `_run_load`, the module-level `_write_*` builders) — the source of truth for what each step does. When SLURM container images ship, their entrypoint must execute the *same* DuckDB+miint logic — not a parallel implementation. The cleanest path is to extract the SQL/script bodies into a shared `qiita_compute_orchestrator.jobs` module that both backends consume: LocalBackend imports it directly; SLURM containers ship a CLI wrapper that reads `params.json` and dispatches into the same module. The dev/test path and the production SLURM path must not diverge. (Open follow-ups — the shared `jobs` module and the per-step container images don't exist yet; SlurmBackend is plumbed but has no container to run.)
 
 **Future:** Clean `ComputeBackend` interface allows adding alternative backends (cloud, Kubernetes) without changing the control plane.
 
@@ -685,39 +680,41 @@ The control-plane user (`qiita-api`) connects to `qiita_miint` only; the data-pl
 
 Two shared filesystems, mounted on every host that runs Qiita components or SLURM workers:
 
-- **`/data/`** — durable, backed up. System-of-record state.
-- **`/scratch/`** — fast, working. Two-tier retention.
+- **`$QIITA_DATA_ROOT/`** — durable, backed up. System-of-record state. `QIITA_DATA_ROOT` is a runbook-template variable read only by the operator's shell — no Qiita process reads it directly. The operator exports it once and the deploy env-files expand it into `DUCKLAKE_DATA_PATH` (which the data plane *does* read). The recommended runbook value is `/data` (see `docs/runbooks/first-deploy.md`); production deploys whose shared filesystem is mounted elsewhere override at deploy time. The data plane's own fallback when `DUCKLAKE_DATA_PATH` is unset is `$TMPDIR/qiita/ducklake`, further falling back to `/tmp/qiita/ducklake` if `TMPDIR` itself is unset — a tmp-rooted default, never a production-looking path.
+- **`/scratch/`** — fast, working. Three-tier retention; path is hardcoded.
 
-Layout:
+Layout (showing the recommended runbook value `/data/` for brevity; substitute `$QIITA_DATA_ROOT` in non-default deploys):
 
 ```
-/data/                                      durable, backed up
+$QIITA_DATA_ROOT/                           durable, backed up
   parquet/<table>/<filename>                DuckLake DATA_PATH (flat per logical table; CRC sharding only if file count pressures the FS)
   logs/<ticket_id>/step_n-<job>.{out,err}   archived SLURM stdout/stderr after job terminal state
 
 /scratch/
   persistent/                               shared FS, never auto-deleted; cluster purge exemption requested
-                                            (reserved for future shared-but-durable content; currently no occupants)
+    references/<reference_idx>/<aligner>/   built reference data that doesn't need local-SSD random access
   persistent-local/                         local SSD, never auto-deleted; cluster purge exemption requested
-    references/<reference_idx>/<aligner>/   built aligner indices (rebuild-on-miss is the safety net)
+    references/<reference_idx>/<aligner>/   built reference data that needs local-SSD random access (e.g. aligner indices); rebuild-on-miss is the safety net
   ephemeral/                                auto-deleted 45 days after ticket terminal state
-    workspace/<ticket_id>/                  control-plane runner workspace + live SLURM logs
+    workspace/<work_ticket_idx>/            control-plane runner workspace + SLURM-side params.json + per-step outputs
     staging/<ticket_id>/                    per-ticket SLURM step outputs
     references/incoming/<name>/<version>/   source FASTA staging during reference ingest
 ```
 
 Two persistent tiers under `/scratch/`:
 
-- `/scratch/persistent/` — the shared-FS persistent tier. Visible to every node, durable, but no random-access guarantees. Currently has no fixed occupants; reserved for future content that must be shared across nodes and never auto-purged.
+- `/scratch/persistent/` — the shared-FS persistent tier. Visible to every node, durable, but no random-access guarantees. Hosts built reference data whose access pattern doesn't justify the local-SSD copy (large databases, sequentially read inputs, anything streamed once per job).
 - `/scratch/persistent-local/` — **placeholder name** for the local-SSD mount that holds random-access indexed databases (aligner indices today; other things later). The name is provisional — we expect to rename or repurpose it as the deploy grows. Treat it as "the local-SSD path for things we keep around."
+
+Built reference data therefore lives under exactly one of `/scratch/persistent/references/<reference_idx>/<aligner>/` or `/scratch/persistent-local/references/<reference_idx>/<aligner>/`, picked per-reference at ingest time based on the database's access pattern. The path structure is the same; only the tier root differs.
 
 Retention:
 
-- `/data/` — never auto-deleted. Backed up by cluster policy.
+- `$QIITA_DATA_ROOT/` — never auto-deleted. Backed up by cluster policy.
 - `/scratch/persistent/` and `/scratch/persistent-local/` — never auto-deleted by us; cluster purge exemption requested for both. For aligner indices specifically, if the local-SSD copy is missing for any reason, the orchestrator rebuilds it on demand at job dispatch.
 - `/scratch/ephemeral/` — per-ticket directories are deleted 45 days after the ticket reaches a terminal state. The 45-day grace exists for post-mortem debugging.
 
-Same-FS constraint: the SLURM job's final-step output directory and DuckLake `DATA_PATH` must live on the same filesystem — the data plane moves files via atomic rename, falling back to copy+delete only on cross-filesystem moves (a slow path that bypasses the rename's atomicity guarantee). The final-step output therefore lives on `/data/` even when intermediate map/reduce outputs use `/scratch/ephemeral/staging/`.
+Same-FS constraint: the SLURM job's final-step output directory and DuckLake `DATA_PATH` must live on the same filesystem — the data plane moves files via atomic rename, falling back to copy+delete only on cross-filesystem moves (a slow path that bypasses the rename's atomicity guarantee). The final-step output therefore lives on `$QIITA_DATA_ROOT/` even when intermediate map/reduce outputs use `/scratch/ephemeral/staging/`.
 
 No hive partitioning: a sequenced sample can be associated with multiple studies, so the on-disk layout is keyed by logical table only — never by `study_idx`. DuckLake's catalog is the sole index over file contents.
 
@@ -747,9 +744,16 @@ qiita/
 │   └── src/
 │       └── qiita_common/
 │           ├── __init__.py
-│           ├── models.py           # work ticket states, API schemas, shared types
-│           ├── config.py           # shared config patterns (env var loading, etc.)
-│           └── client.py           # REST client utilities for service-to-service calls
+│           ├── models.py                   # work-ticket / API schemas, principal + action types
+│           ├── api_paths.py                # canonical REST path constants (shared CP↔CO)
+│           ├── auth_constants.py           # scope names, token prefixes
+│           ├── config.py                   # env-var loading helpers
+│           ├── log.py                      # structured-logging setup
+│           ├── client.py                   # base async REST client for service-to-service
+│           ├── compute_backend_client.py   # CP → orchestrator /step/run client
+│           ├── backend_failure.py          # typed BackendFailure model + JSON round-trip
+│           ├── actions.py                  # action YAML schema + loader
+│           └── parquet.py                  # parquet column/sort helpers
 ├── qiita-control-plane/
 │   ├── pyproject.toml              # uv-managed, depends on qiita-common
 │   ├── uv.lock
@@ -760,61 +764,81 @@ qiita/
 │   │       ├── __init__.py
 │   │       ├── main.py             # FastAPI app entry point + /health endpoint
 │   │       ├── config.py           # settings (DB URL, HMAC secret, AuthRocket JWKS URL)
+│   │       ├── db.py               # asyncpg connection pool setup
+│   │       ├── deps.py             # FastAPI dependency-injection helpers (sessions, scopes)
+│   │       ├── dispatch.py         # compute-orchestrator dispatch (async fire-and-forget)
+│   │       ├── runner.py           # per-ticket workflow runner (walks action steps)
 │   │       ├── auth/               # JWT verification, HMAC ticket signing, AuthRocket integration
-│   │       ├── models/             # asyncpg models (studies, samples, preparations, users, roles, work tickets, provenance, references, genomes, features, phylogeny tip-feature)
-│   │       ├── routes/
-│   │       │   ├── studies.py
-│   │       │   ├── samples.py
-│   │       │   ├── preparations.py
-│   │       │   ├── tickets.py      # work ticket CRUD + Flight ticket issuance + manual restart
-│   │       │   ├── references.py   # reference CRUD, membership management, genome/feature minting
-│   │       │   └── callbacks.py    # data plane + compute orchestrator callback endpoints
-│   │       └── db.py               # asyncpg connection pool setup
+│   │       ├── actions/            # action library + sync from workflows/
+│   │       ├── cli/                # qiita-admin CLI surface
+│   │       ├── repositories/       # asyncpg query layer per resource (biosample, study, user, ...)
+│   │       ├── testing/            # shared test fixtures (postgres, sessions, JWKS harness)
+│   │       └── routes/
+│   │           ├── admin.py        # admin endpoints (service-account mint, role grants, ...)
+│   │           ├── auth.py         # login flow + PAT mint + handoff
+│   │           ├── biosample.py
+│   │           ├── reference.py    # reference CRUD, membership, genome/feature minting
+│   │           ├── study.py
+│   │           ├── user.py
+│   │           └── work_ticket.py  # work-ticket CRUD + Flight ticket issuance
 │   └── tests/
 │       ├── conftest.py
-│       └── ...
+│       ├── _postgres/              # docker-compose.yml + initdb for Postgres harness (shared with tests/integration)
+│       ├── auth/
+│       ├── cli/
+│       ├── repositories/
+│       └── routes/
 ├── qiita-data-plane/
 │   ├── Cargo.toml                  # deps: arrow-flight, tonic, duckdb, hmac, sha2, jsonwebtoken
 │   └── src/
 │       ├── main.rs                 # tonic server entry, Flight service + gRPC health check registration
-│       ├── config.rs               # settings (DuckLake catalog DB URL, HMAC secret, JWKS URL, control plane callback URL)
+│       ├── config.rs               # settings (DuckLake catalog DB URL, HMAC secret, JWKS URL)
 │       ├── flight_service.rs       # impl FlightService trait (do_get, do_put, do_action)
 │       ├── auth.rs                 # JWT verification (cached JWKS), HMAC ticket verification
-│       ├── ducklake.rs             # DuckDB/DuckLake connection management, ducklake_add_data_files
-│       └── callback.rs             # REST client to call back control plane
+│       └── ducklake.rs             # DuckDB/DuckLake connection management, ducklake_add_data_files
 ├── qiita-compute-orchestrator/
 │   ├── pyproject.toml              # uv-managed, depends on qiita-common
 │   ├── uv.lock
 │   ├── src/
 │   │   └── qiita_compute_orchestrator/
 │   │       ├── __init__.py
-│   │       ├── main.py             # service entry point + /health endpoint
-│   │       ├── config.py           # settings (slurmrestd URL, slurmrestd JWT, control plane URL, poll interval)
-│   │       ├── backend.py          # ComputeBackend interface
-│   │       ├── slurm.py            # SLURM implementation (slurmrestd REST client, job lifecycle)
-│   │       ├── reference_indexing.py  # reference ingestion + aligner index build job management
-│   │       └── workflows/          # workflow definitions (container image, resources, entrypoint)
+│   │       ├── main.py             # service entry point + /health + /step/run route
+│   │       ├── config.py           # settings (compute backend, shared FS root, CP↔CO token, SLURM creds)
+│   │       ├── backend.py          # ComputeBackend interface (run_step + verify_outputs contract)
+│   │       ├── step.py             # per-step verification helpers (output paths, file modes)
+│   │       ├── backends/
+│   │       │   ├── local.py        # LocalBackend (DuckDB + miint in-process; dev / test)
+│   │       │   └── slurm.py        # SlurmBackend (slurmrestd dispatch + polling)
+│   │       └── slurm/
+│   │           ├── client.py       # slurmrestd REST client
+│   │           ├── payload.py      # JSON job-submit payload builder
+│   │           └── verify.py       # post-job output verification (mode 440, identifier sort)
 │   └── tests/
-│       ├── conftest.py
-│       └── ...
+│       └── conftest.py
 ├── tests/
 │   └── integration/
-│       ├── conftest.py             # test fixtures: Postgres, services, test data
-│       ├── docker-compose.yml      # Postgres for integration tests
-│       ├── test_upload_workflow.py  # end-to-end upload → process → register
-│       └── test_auth_flow.py       # end-to-end auth → ticket → data access
+│       ├── conftest.py             # cross-component fixtures: postgres, services, dataplane binary
+│       ├── _pg_env.py              # postgres connection helpers (Docker vs host mode)
+│       ├── _runner_helpers.py      # workflow-runner test helpers
+│       ├── test_smoke.py
+│       ├── test_doget.py           # CP-signed ticket → DP DoGet round-trip
+│       ├── test_step_dispatch.py   # CP → orchestrator /step/run flow
+│       ├── test_action_library.py
+│       ├── test_action_sync.py
+│       ├── test_reference_add_smoke.py
+│       ├── test_e2e_reference.py
+│       └── test_system_gg2_backbone.py  # @pytest.mark.system; real GG2 backbone
 ├── workflows/
 │   ├── amplicon/
 │   │   ├── Apptainer.def           # container definition (single image for all steps)
 │   │   ├── workflow.yaml           # ordered steps: name, type (map|reduce), entrypoint, resources
 │   │   └── scripts/                # per-step entrypoints and helpers
-│   ├── metagenomic/
-│   │   └── ...
-│   └── ...
+│   └── reference-add/
+│       └── 1.0.0.yaml              # versioned reference-ingest workflow
 ├── deploy/
 │   ├── systemd/
 │   │   ├── qiita-control-plane.service
-│   │   ├── qiita-data-plane.service
+│   │   ├── qiita-data-plane@.service       # template unit; instance = listen port (e.g. @50051)
 │   │   └── qiita-compute-orchestrator.service
 │   └── nginx/
 │       └── qiita.conf              # REST and gRPC routing, TLS termination, HTTP/2
@@ -823,54 +847,102 @@ qiita/
 
 ## Build System (Makefile)
 
-```makefile
-.PHONY: build test test-integration lint deploy migrate clean verify-health
+The unified build entry point lives in [`Makefile`](../Makefile). The recipes below mirror the public-API targets verbatim; the test in [`qiita-common/tests/test_makefile_doc_sync.py`](../qiita-common/tests/test_makefile_doc_sync.py) asserts they stay in sync and is part of `make test`. Internal helpers (`$(DBMATE_BIN)` / `$(GRPCURL_BIN)` auto-fetch, the `UNAME_S/UNAME_M` arch detection, the verbose `dev-setup` install hints) live in `Makefile` only.
 
-# Build all components
-build: build-common build-control-plane build-data-plane build-compute-orchestrator build-workflows
+<!-- KEEP IN SYNC WITH ../Makefile; qiita-common/tests/test_makefile_doc_sync.py enforces this -->
+```makefile
+# Build
+build: build-common build-control-plane build-data-plane build-compute-orchestrator build-integration build-workflows
 
 build-common:
 	cd qiita-common && uv sync
 
 build-control-plane:
-	cd qiita-control-plane && uv sync
+	cd qiita-control-plane && uv sync --reinstall-package qiita-common
 
 build-data-plane:
-	cd qiita-data-plane && cargo build --release
+	cd qiita-data-plane && cargo build --release --features duckdb/bundled
+
+build-data-plane-debug:
+	cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo build
 
 build-compute-orchestrator:
-	cd qiita-compute-orchestrator && uv sync
+	cd qiita-compute-orchestrator && uv sync --reinstall-package qiita-common
+
+build-integration:
+	cd tests/integration && uv sync \
+	  --reinstall-package qiita-common \
+	  --reinstall-package qiita-control-plane \
+	  --reinstall-package qiita-compute-orchestrator
 
 build-workflows:
-	@for dir in workflows/*/; do \
+	@if ! command -v apptainer > /dev/null 2>&1; then \
+		echo "apptainer not found — skipping workflow container builds"; \
+		exit 0; \
+	fi; \
+	for dir in workflows/*/; do \
 		if [ -f "$$dir/Apptainer.def" ]; then \
 			apptainer build "$$dir/$$(basename $$dir).sif" "$$dir/Apptainer.def"; \
 		fi \
 	done
 
-# Run unit tests
-test: test-common test-control-plane test-data-plane test-compute-orchestrator
+# Test (layered by infrastructure cost)
+test: test-python test-rust
 
-test-common:
+test-python: test-common test-control-plane-without-db test-compute-orchestrator
+
+test-rust: test-data-plane
+
+test-common: build-common
 	cd qiita-common && uv run pytest
 
-test-control-plane:
-	cd qiita-control-plane && uv run pytest
+test-control-plane-without-db: build-control-plane
+	cd qiita-control-plane && uv run pytest -m 'not db'
+
+test-control-plane-with-db: build-control-plane $(DBMATE_BIN)
+	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
+	  ((cd qiita-control-plane && uv run pytest); PY_EC=$$?; \
+	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
+	   exit $$PY_EC)
 
 test-data-plane:
-	cd qiita-data-plane && cargo test
+	cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test
 
-test-compute-orchestrator:
+test-compute-orchestrator: build-compute-orchestrator
 	cd qiita-compute-orchestrator && uv run pytest
 
-# Run integration tests (requires Docker for Postgres)
-test-integration:
-	cd tests/integration && docker compose up -d --wait
-	cd tests/integration && uv run pytest
-	cd tests/integration && docker compose down
+test-workflows:
+	@if ! command -v apptainer > /dev/null 2>&1; then \
+		echo "apptainer not found — skipping workflow smoke tests"; \
+		exit 0; \
+	fi
+	apptainer build --force /tmp/qiita-workflow-smoke.sif workflows/amplicon/Apptainer.def
+	apptainer exec /tmp/qiita-workflow-smoke.sif echo "hello world"
+	rm -f /tmp/qiita-workflow-smoke.sif
 
-# Lint all components
-lint: lint-common lint-control-plane lint-data-plane lint-compute-orchestrator
+test-integration: build-data-plane-debug build-integration $(DBMATE_BIN)
+	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
+	  ((cd tests/integration && uv run pytest -m 'not system'); PY_EC=$$?; \
+	   (cd $(PG_COMPOSE_DIR) && $(PG_PSQL) -d postgres \
+	     -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'qiita_ducklake' AND pid != pg_backend_pid()" \
+	     -c "DROP DATABASE IF EXISTS qiita_ducklake" \
+	     -c "CREATE DATABASE qiita_ducklake OWNER qiita"); \
+	   (cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test --features integration); RS_EC=$$?; \
+	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
+	   exit $$(( PY_EC > RS_EC ? PY_EC : RS_EC )))
+
+test-system: build-data-plane-debug build-integration
+	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
+	  ((cd tests/integration && uv run pytest -m system -x --timeout=2700); PY_EC=$$?; \
+	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
+	   exit $$PY_EC)
+
+# Lint
+lint: lint-python lint-rust
+
+lint-python: lint-common lint-control-plane lint-compute-orchestrator
+
+lint-rust: lint-data-plane
 
 lint-common:
 	cd qiita-common && uv run ruff check . && uv run ruff format --check .
@@ -879,33 +951,35 @@ lint-control-plane:
 	cd qiita-control-plane && uv run ruff check . && uv run ruff format --check .
 
 lint-data-plane:
-	cd qiita-data-plane && cargo clippy -- -D warnings && cargo fmt --check
+	cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo clippy -- -D warnings && cargo fmt --check
 
 lint-compute-orchestrator:
 	cd qiita-compute-orchestrator && uv run ruff check . && uv run ruff format --check .
 
-# Run database migrations
-migrate:
-	cd qiita-control-plane && dbmate up
+# DB / actions
+migrate: $(DBMATE_BIN)
+	cd qiita-control-plane && $(DBMATE_BIN) --migrations-table public.schema_migrations --no-dump-schema up
 
-# Build and print deploy instructions (no sudo)
+sync-actions:
+	cd qiita-control-plane && uv run qiita-admin actions sync --workflows-dir ../workflows
+
+# Deploy / health
 deploy: build
 	@echo "=== Build complete. Run the following commands as admin: ==="
 	@echo ""
 	@echo "  sudo cp deploy/systemd/qiita-control-plane.service /etc/systemd/system/"
-	@echo "  sudo cp deploy/systemd/qiita-data-plane.service /etc/systemd/system/"
+	@echo "  sudo cp deploy/systemd/qiita-data-plane@.service /etc/systemd/system/"
 	@echo "  sudo cp deploy/systemd/qiita-compute-orchestrator.service /etc/systemd/system/"
 	@echo "  sudo cp deploy/nginx/qiita.conf /etc/nginx/conf.d/"
 	@echo "  sudo systemctl daemon-reload"
 	@echo "  sudo systemctl restart qiita-control-plane"
-	@echo "  sudo systemctl restart qiita-data-plane"
+	@echo "  sudo systemctl restart 'qiita-data-plane@50051'"
 	@echo "  sudo systemctl restart qiita-compute-orchestrator"
 	@echo "  sudo systemctl reload nginx"
 	@echo ""
 	@echo "Then verify: make verify-health"
 
-# Verify all services are healthy after deploy
-verify-health:
+verify-health: $(GRPCURL_BIN)
 	@echo "Checking control plane..."
 	@curl -sf http://localhost:8080/health || (echo "FAIL: control plane" && exit 1)
 	@echo " OK"
@@ -913,15 +987,21 @@ verify-health:
 	@curl -sf http://localhost:8081/health || (echo "FAIL: compute orchestrator" && exit 1)
 	@echo " OK"
 	@echo "Checking data plane..."
-	@grpcurl -plaintext localhost:50051 grpc.health.v1.Health/Check || (echo "FAIL: data plane" && exit 1)
+	@$(GRPCURL_BIN) -plaintext localhost:50051 grpc.health.v1.Health/Check || (echo "FAIL: data plane" && exit 1)
 	@echo " OK"
 	@echo "All services healthy."
 
+# Setup / hooks
+install-hooks:
+	uv tool install pre-commit
+	pre-commit install
+
+# Cleanup
 clean:
-	cd qiita-common && rm -rf .venv __pycache__
-	cd qiita-control-plane && rm -rf .venv __pycache__
+	cd qiita-common && rm -rf .venv __pycache__ .pytest_cache .ruff_cache
+	cd qiita-control-plane && rm -rf .venv __pycache__ .pytest_cache .ruff_cache
 	cd qiita-data-plane && cargo clean
-	cd qiita-compute-orchestrator && rm -rf .venv __pycache__
+	cd qiita-compute-orchestrator && rm -rf .venv __pycache__ .pytest_cache .ruff_cache
 ```
 
 ## CI (GitHub Actions)
@@ -977,12 +1057,12 @@ jobs:
 - **slurmrestd:** Compute orchestrator authenticates to slurmrestd via SLURM JWT. All job parameters specified in JSON body (not `#SBATCH` directives). Environment variables must be explicitly listed.
 - **DuckLake file registration:** `ducklake_add_data_files` registers a Parquet file by path — no data copying. Ownership transfers to DuckLake (compaction may later delete/rewrite). Schema and type validation performed at registration time. Registration failure (schema mismatch, corrupt Parquet) is an explicit FAILED state with `failed_stage=registration` and `failure_type=permanent`.
 - **Service-to-service auth:** Data plane and compute orchestrator authenticate to control plane via pre-shared API keys for their respective service accounts (`data-plane`, `compute`).
-- **Shared filesystem paths:** Two mounts — `/data/` (durable) and `/scratch/` (working, two-tier). Canonical layout and retention policy in [Data Storage](#data-storage). All components — control plane, data plane, SLURM jobs — access both mounts.
+- **Shared filesystem paths:** Two mounts — `/data/` (durable) and `/scratch/` (working, three-tier). Canonical layout and retention policy in [Data Storage](#data-storage). All components — control plane, data plane, SLURM jobs — access both mounts.
 - **qiita-common dependency:** Both Python services depend on `qiita-common` as a path dependency in their `pyproject.toml` (e.g., `qiita-common = {path = "../qiita-common"}`). Shared Pydantic models ensure API contract consistency.
 - **Data plane Unix user and file protection:** The data plane runs as the dedicated `qiita-data` system user (no login shell). SLURM jobs run as `qiita-job` and write step outputs into `/scratch/ephemeral/staging/<ticket_id>/` (intermediates) or directly into `/data/parquet/<table>/` (final-step outputs). Before exiting, each job sets `chmod 440` on its output files — owner and group read-only, no write, no world access. The data plane checks this permission as a pre-registration gate before calling `ducklake_add_data_files`; a file that is not `440` is rejected as a permanent registration failure. This ensures that once DuckLake takes ownership of a file, no compute job (or other process running as `qiita-job`) can overwrite or corrupt it. The data plane user must be in the same group as `qiita-job` (or the relevant directories must be group-readable) so the service can read files it does not own.
 - **Data plane horizontal scaling:** The data plane is the read/write path for all DuckLake data. At scale, many concurrent SLURM jobs may issue large DoGet reads simultaneously, making a single data plane process a throughput bottleneck. The data plane scales horizontally because each instance is stateless with respect to request handling — it holds only a DuckDB+DuckLake connection to the shared Postgres catalog and reads Parquet files from the shared filesystem. DuckLake's concurrent read model is safe for this: multiple DuckDB instances connecting to the same Postgres catalog never block each other (readers use snapshot isolation with no row-level locking; conflicts only arise on concurrent writes, resolved via optimistic concurrency at commit time). Workers cannot bypass the data plane and read Parquet files directly for several reasons: (1) deletions are recorded as separate delete files in the DuckLake catalog — raw Parquet reads return logically deleted rows; (2) small inserts below the data inlining threshold are stored entirely within the Postgres catalog (`ducklake_inlined_data_tables`), with no Parquet file written at all; (3) snapshot visibility requires a catalog query to determine which files are live for the current consistent state; (4) compaction rewrites and deletes Parquet files under active management, making cached paths unreliable. The data plane remains the correct and only correct read path; the solution to the bottleneck is running more of them.
 - **Reference ID minting flow:** Bulk reference ingestion is a multi-step pipeline: (1) SLURM hash job reads sequences via DuckDB + miint and computes MD5 hashes, writing a manifest; (2) orchestrator feeds hashes to control plane; (3) control plane does bulk dedup lookup (`features.sequence_hash` unique index, stored as Postgres `uuid`), reuses existing `feature_idx` for matches, mints new ones for novel sequences, writes membership records, returns ID mapping; (4) SLURM load job inserts sequences + taxonomy + annotations into DuckLake using assigned IDs; (5) SLURM index job builds aligner indices.
 - **Alignment → reference join:** Alignment Parquet contains `feature_idx` but not `reference_idx`. To scope alignment results to a specific reference version, the query joins `reference_membership(reference_idx, feature_idx)` at query time. This join can happen entirely in the data plane (DuckLake) for analytical queries, or the control plane can provide the authorized feature set for a given reference to narrow a Flight ticket.
-- **Reference filesystem paths:** Aligner indices stored at `/scratch/persistent-local/references/{reference_idx}/{aligner}/`. Built by SLURM jobs and read by alignment SLURM jobs at processing time. Processing workflow `params.json` includes the `reference_idx` to locate the correct index path. If the index is missing (cluster purge), the orchestrator rebuilds it at dispatch time before the alignment job runs.
+- **Reference filesystem paths:** Built reference data lives under `/scratch/persistent-local/references/{reference_idx}/{aligner}/` (local SSD, random-access aligner indices) or `/scratch/persistent/references/{reference_idx}/{aligner}/` (shared FS, references that don't need local-SSD random access). Built by SLURM jobs and read by alignment SLURM jobs at processing time. Processing workflow `params.json` includes the `reference_idx` to locate the correct path. If the local-SSD copy of an aligner index is missing (cluster purge), the orchestrator rebuilds it at dispatch time before the alignment job runs.
 - **Phylogenetic addressing:** Internal nodes are addressed by `(reference_idx, node_index)` — scoped to a single tree, not referenced across references. Tip nodes connect to the sequence identity layer via the `phylogeny_tip_feature` junction table `(reference_idx, node_index) → feature_idx`, populated at ingestion time. Clade-scoped queries use a recursive CTE on `parent_index` to collect descendant tips, then join through `phylogeny_tip_feature` to reach `feature_idx`.
 - **Feature deduplication:** `feature_idx` is content-addressed via MD5 hash of the sequence bytes. The SLURM ingestion job computes hashes using DuckDB's built-in `md5()` function on sequences read via miint's `read_fastx`. Hashes are fed back to the control plane through the orchestrator for bulk dedup lookup. The control plane stores hashes as Postgres `uuid` type (MD5 is exactly 128 bits = UUID-sized) with a unique B-tree index, and upserts on `sequence_hash` — if a sequence already exists, the existing `feature_idx` is reused and the new reference's membership row simply points to it.

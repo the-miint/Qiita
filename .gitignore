@@ -20,8 +20,11 @@ target/
 .idea/
 .vscode/
 
-# Secrets / env
-.env
+# Secrets / env — the per-component templates are committed (`*.example`);
+# the stripped-suffix copies local dev / prod operators edit are not.
+.env.control-plane
+.env.data-plane
+.env.compute-orchestrator
 *.local
 
 # Build artifacts

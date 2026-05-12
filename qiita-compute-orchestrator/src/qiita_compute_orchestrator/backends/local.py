@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 
 import duckdb
+from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.models import WorkTicketFailureStage
 from qiita_common.parquet import validate_parquet_path
 
 from ..backend import ComputeBackend
@@ -69,27 +71,83 @@ class LocalBackend(ComputeBackend):
         workspace: Path,
         *,
         reference_idx: int,
+        work_ticket_idx: int,  # noqa: ARG002 — accepted for protocol parity
+        container: str | None = None,
+        entrypoint: str | None = None,
+        baseline_resources=None,  # noqa: ARG002 — accepted for protocol parity
     ) -> dict[str, Path]:
-        if name == "hash":
-            manifest = await self._run_hash(inputs["fasta_path"], workspace, reference_idx)
-            return {"manifest": manifest}
-        if name == "load":
-            # Sub-dir so load's reference_*.parquet outputs don't mingle
-            # with earlier-step artifacts (manifest, feature_map) in the
-            # workspace — register-files globs whatever lives in the dir
-            # it's pointed at, so isolation matters.
-            staging_dir = await self._run_load(
-                manifest_path=inputs["manifest"],
-                fasta_path=inputs["fasta_path"],
-                feature_map_path=inputs["feature_map"],
-                output_dir=workspace / "staging",
-                reference_idx=reference_idx,
-                taxonomy_path=inputs.get("taxonomy_path"),
-                tree_path=inputs.get("tree_path"),
-                jplace_path=inputs.get("jplace_path"),
+        """Public backend interface. Translates known internal exceptions
+        into typed `BackendFailure` so the runner can classify retriable
+        vs permanent. The internal helpers (`_run_hash`, `_run_load`,
+        `_write_*`) keep raising plain Python exceptions — they're
+        unit-testable in isolation that way; only the run_step boundary
+        wraps."""
+        try:
+            if name == "hash":
+                manifest = await self._run_hash(inputs["fasta_path"], workspace, reference_idx)
+                return {"manifest": manifest}
+            if name == "load":
+                # Sub-dir so load's reference_*.parquet outputs don't mingle
+                # with earlier-step artifacts (manifest, feature_map) in the
+                # workspace — register-files globs whatever lives in the dir
+                # it's pointed at, so isolation matters.
+                staging_dir = await self._run_load(
+                    manifest_path=inputs["manifest"],
+                    fasta_path=inputs["fasta_path"],
+                    feature_map_path=inputs["feature_map"],
+                    output_dir=workspace / "staging",
+                    reference_idx=reference_idx,
+                    taxonomy_path=inputs.get("taxonomy_path"),
+                    tree_path=inputs.get("tree_path"),
+                    jplace_path=inputs.get("jplace_path"),
+                )
+                return {"staging_dir": staging_dir}
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=name,
+                reason=f"LocalBackend does not implement step {name!r}",
             )
-            return {"staging_dir": staging_dir}
-        raise ValueError(f"LocalBackend does not implement step {name!r}")
+        except BackendFailure:
+            # Already classified — propagate without rewrapping.
+            raise
+        except KeyError as exc:
+            # The runner declared an input the YAML expected, but the
+            # binding map is missing it. Action-runner contract bug; bad
+            # YAML or stale runner. Retry won't help.
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=name,
+                reason=f"missing required input binding: {exc!s}",
+            ) from exc
+        except FileNotFoundError as exc:
+            raise BackendFailure(
+                kind=FailureKind.BAD_INPUT,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=name,
+                reason=str(exc),
+            ) from exc
+        except ValueError as exc:
+            # FASTA dup-read_id, taxonomy-malformed, unmapped sequence
+            # hashes — all data-quality issues. Permanent because the
+            # same input always fails the same way.
+            raise BackendFailure(
+                kind=FailureKind.BAD_INPUT,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=name,
+                reason=str(exc),
+            ) from exc
+        except duckdb.Error as exc:
+            # Catch-all for SQL-level failures (schema mismatch, missing
+            # table, type errors). Likely permanent (workflow code or
+            # input shape is wrong); a retry would do the same thing.
+            raise BackendFailure(
+                kind=FailureKind.UNKNOWN_PERMANENT,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=name,
+                reason=f"duckdb error: {exc!s}",
+            ) from exc
 
     async def _run_hash(self, fasta_path: Path, output_dir: Path, reference_idx: int) -> Path:
         if not fasta_path.exists():

@@ -331,8 +331,8 @@ When async-step + CO → CP callbacks land alongside `SlurmBackend` (deferred to
 <!-- See "First-deploy bootstrap" subsection within Endpoints. -->
 ## First-deploy bootstrap
 
-See [`docs/runbooks/first-deploy.md`](runbooks/first-deploy.md) for the full sequence: migrate → write CP env file → one-shot JWT verify (`scripts/verify_jwt.py`) → start control plane → verify reverse proxy → first OIDC login → `qiita-admin set-system-role` → install CP↔CO shared bearer → bootstrap data plane → start orchestrator → smoke test. The orchestrator does not hold a service-account PAT in v1; it authenticates to the CP via the shared bearer at `/etc/qiita/cp-to-co.token`.
+See [`docs/runbooks/first-deploy.md`](runbooks/first-deploy.md) for the full sequence: write CP env file → migrate → one-shot JWT verify (`scripts/verify_jwt.py`) → start control plane → verify reverse proxy → first OIDC login → `qiita-admin set-system-role` → install CP↔CO shared bearer → bootstrap data plane → start orchestrator → smoke test. The orchestrator does not hold a service-account PAT in v1; it authenticates to the CP via the shared bearer at `/etc/qiita/cp-to-co.token`.
 
 ## Token rotation
 
-See [`docs/runbooks/orchestrator-token-rotation.md`](runbooks/orchestrator-token-rotation.md) for the full zero-downtime rotation procedure: mint replacement → `install-orchestrator-token.sh` (atomic write + `.previous` save) → `systemctl reload` → `wait-for-token-use.sh` (polls `last_used_at`) → revoke old.
+See [`docs/runbooks/orchestrator-token-rotation.md`](runbooks/orchestrator-token-rotation.md) for the full rotation procedure: mint replacement → `install-orchestrator-token.sh` (atomic write + `.previous` save) → pick-up step (cron: next invocation reads the new file; long-running daemons: `systemctl reload`, gated on the not-yet-implemented orchestrator reload handler) → `wait-for-token-use.sh` (polls `last_used_at`) → revoke old.

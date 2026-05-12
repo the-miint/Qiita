@@ -46,7 +46,15 @@ class FakeBackendClient:
         inputs: dict[str, Path],
         workspace: Path,
         reference_idx: int,
+        work_ticket_idx: int,
+        container: str | None = None,
+        entrypoint: str | None = None,
+        baseline_resources=None,
     ) -> dict[str, Path]:
+        # Accepted for protocol parity (the runner now forwards container
+        # metadata for SlurmBackend); the LocalBackend-shaped fake here
+        # ignores them.
+        del work_ticket_idx, container, entrypoint, baseline_resources
         self.calls.append((step_name, dict(inputs), workspace, reference_idx))
         outputs = self.outputs_for.get(step_name, {})
         for path in outputs.values():
@@ -391,10 +399,18 @@ async def test_threads_inputs_through_workspace(
     assert hash_call[1]["fasta_path"] == pending_work_ticket["fasta_path"]
 
     # load got fasta_path + manifest (hash output) + feature_map (mint output).
+    # `manifest` comes from FakeBackendClient.outputs_for, which the test
+    # scripted at `<workspace>/manifest.parquet`. `feature_map` is written
+    # by the mint-features library spy into the entry's per-attempt
+    # workspace (workspace/<entry-name>/attempt-<N>/ — runner.py owns this
+    # layout so retries don't leak stale artifacts at the verifier).
     load_call = next(c for c in backend.calls if c[0] == "load")
     assert load_call[1]["fasta_path"] == pending_work_ticket["fasta_path"]
     assert load_call[1]["manifest"] == workspace / "manifest.parquet"
-    assert load_call[1]["feature_map"] == workspace / "feature_map.parquet"
+    assert (
+        load_call[1]["feature_map"]
+        == workspace / "mint-features" / "attempt-0" / "feature_map.parquet"
+    )
 
 
 async def test_creates_workspace_directory(
@@ -469,3 +485,348 @@ async def test_swallows_failure_status_patch_error(
         work_ticket_idx,
     )
     assert state == "failed"
+
+
+# =============================================================================
+# Retry-loop tests
+# =============================================================================
+
+
+class _RetryingBackendClient:
+    """Backend stub that raises BackendFailure on the first N attempts of
+    a named step, then succeeds. Used to drive the retry loop without
+    needing a real orchestrator. Each call increments the per-step
+    counter so an instance can fail one step transiently while another
+    succeeds first try."""
+
+    def __init__(
+        self,
+        *,
+        fail_step: str,
+        fail_n_times: int,
+        kind,  # FailureKind
+        outputs_on_success: dict[str, Path] | None = None,
+    ) -> None:
+        self.fail_step = fail_step
+        self.fail_n_times = fail_n_times
+        self.kind = kind
+        self.outputs_on_success = outputs_on_success or {}
+        self.attempts: dict[str, int] = {}
+
+    async def run_step(
+        self,
+        *,
+        step_name: str,
+        inputs: dict[str, Path],
+        workspace: Path,
+        reference_idx: int,
+        work_ticket_idx: int,
+        container: str | None = None,
+        entrypoint: str | None = None,
+        baseline_resources=None,
+    ) -> dict[str, Path]:
+        from qiita_common.backend_failure import BackendFailure
+        from qiita_common.models import WorkTicketFailureStage
+
+        del work_ticket_idx, container, entrypoint, baseline_resources
+        self.attempts[step_name] = self.attempts.get(step_name, 0) + 1
+        if step_name == self.fail_step and self.attempts[step_name] <= self.fail_n_times:
+            raise BackendFailure(
+                kind=self.kind,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=step_name,
+                reason=f"simulated {self.kind.value} attempt {self.attempts[step_name]}",
+            )
+        for path in self.outputs_on_success.values():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch(exist_ok=True)
+        return self.outputs_on_success
+
+
+async def test_retry_succeeds_after_transient_failure(
+    postgres_pool, pending_work_ticket, library_spy, tmp_path
+):
+    """A transient BackendFailure on the hash step is retried; the
+    second attempt succeeds and the workflow completes. retry_count is
+    bumped to 1 in the process."""
+    from qiita_common.backend_failure import FailureKind
+
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = pending_work_ticket["work_ticket_idx"]
+    workspace = workspace_root / str(work_ticket_idx)
+
+    # Backend fails the FIRST hash attempt with NODE_FAIL (retriable),
+    # succeeds on the second. Load step has its own success output.
+    class _Backend(_RetryingBackendClient):
+        async def run_step(
+            self, *, step_name, inputs, workspace, reference_idx, work_ticket_idx, **kw
+        ):
+            self.attempts[step_name] = self.attempts.get(step_name, 0) + 1
+            if step_name == "load":
+                workspace.mkdir(parents=True, exist_ok=True)
+                (workspace / "staging").mkdir(parents=True, exist_ok=True)
+                (workspace / "staging" / "reference_sequences.parquet").touch()
+                return {"staging_dir": workspace / "staging"}
+            # Reset the counter increment super does (we already counted)
+            # then delegate so the fail-N-times logic keeps working.
+            self.attempts[step_name] -= 1
+            return await super().run_step(
+                step_name=step_name,
+                inputs=inputs,
+                workspace=workspace,
+                reference_idx=reference_idx,
+                work_ticket_idx=work_ticket_idx,
+                **kw,
+            )
+
+    backend = _Backend(
+        fail_step="hash",
+        fail_n_times=1,
+        kind=FailureKind.NODE_FAIL,
+        outputs_on_success={"manifest": workspace / "manifest.parquet"},
+    )
+
+    await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    # Workflow completed despite the retry.
+    row = await postgres_pool.fetchrow(
+        "SELECT state, retry_count, failure_type, failure_stage, failure_reason"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    assert row["state"] == "completed"
+    assert row["retry_count"] == 1
+    # COMPLETED tickets carry no failure_* (DB CHECK enforces).
+    assert row["failure_type"] is None
+    assert row["failure_stage"] is None
+    assert row["failure_reason"] is None
+    # Hash step ran twice (one fail + one success); load ran once.
+    assert backend.attempts == {"hash": 2, "load": 1}
+
+
+async def test_retry_uses_isolated_per_attempt_workspace(
+    postgres_pool, pending_work_ticket, library_spy, tmp_path
+):
+    """Each attempt of a retried entry gets its own workspace dir, and
+    failed-attempt dirs persist on disk (postmortem-friendly). Prevents
+    stale outputs from a failed attempt #0 from leaking into the
+    verifier's "every file under output_path must be in manifest" check
+    on attempt #1."""
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+    from qiita_common.models import WorkTicketFailureStage
+
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = pending_work_ticket["work_ticket_idx"]
+
+    class _RecordingBackend:
+        """Records the workspace path the runner hands the backend on each
+        call. Hash fails once (drops a stale file in its given workspace
+        first to simulate a partial container write), then succeeds."""
+
+        def __init__(self) -> None:
+            self.workspaces: list[tuple[str, Path]] = []
+            self.attempts: dict[str, int] = {}
+
+        async def run_step(
+            self, *, step_name, inputs, workspace, reference_idx, work_ticket_idx, **_kw
+        ):
+            self.workspaces.append((step_name, workspace))
+            self.attempts[step_name] = self.attempts.get(step_name, 0) + 1
+            if step_name == "hash" and self.attempts["hash"] == 1:
+                workspace.mkdir(parents=True, exist_ok=True)
+                (workspace / "partial.parquet").write_bytes(b"stale junk")
+                raise BackendFailure(
+                    kind=FailureKind.NODE_FAIL,
+                    stage=WorkTicketFailureStage.STEP_RUN,
+                    step_name=step_name,
+                    reason="simulated transient failure",
+                )
+            if step_name == "load":
+                workspace.mkdir(parents=True, exist_ok=True)
+                staging = workspace / "staging"
+                staging.mkdir(parents=True, exist_ok=True)
+                (staging / "reference_sequences.parquet").touch()
+                return {"staging_dir": staging}
+            manifest = workspace / "manifest.parquet"
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            manifest.touch()
+            return {"manifest": manifest}
+
+    backend = _RecordingBackend()
+    await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    hash_calls = [ws for (name, ws) in backend.workspaces if name == "hash"]
+    workspace = workspace_root / str(work_ticket_idx)
+    assert hash_calls == [
+        workspace / "hash" / "attempt-0",
+        workspace / "hash" / "attempt-1",
+    ]
+    # Failed attempt's artifacts are preserved on disk for postmortem.
+    assert (workspace / "hash" / "attempt-0" / "partial.parquet").exists()
+    # Successful attempt has its own clean dir — no `partial.parquet` from #0.
+    assert (workspace / "hash" / "attempt-1").exists()
+    assert not (workspace / "hash" / "attempt-1" / "partial.parquet").exists()
+
+
+async def test_retry_exhausted_marks_failed_with_retriable_type(
+    postgres_pool, pending_work_ticket, library_spy, tmp_path
+):
+    """Transient failures keep retrying until retry_count == max_retries,
+    then transition to FAILED with failure_type='retriable' (the
+    distinguishing post-mortem signal: retries-exhausted vs
+    permanent-on-first-attempt)."""
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = pending_work_ticket["work_ticket_idx"]
+
+    # max_retries default is 3 → 4 total attempts (1 initial + 3 retries).
+    # Backend always fails the hash step transiently.
+    backend = _RetryingBackendClient(
+        fail_step="hash",
+        fail_n_times=999,  # never succeed
+        kind=FailureKind.NODE_FAIL,
+    )
+
+    with pytest.raises(BackendFailure):
+        await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, retry_count, max_retries,"
+        "       failure_type, failure_stage, failure_step_name, failure_reason"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    assert row["state"] == "failed"
+    assert row["retry_count"] == row["max_retries"] == 3
+    assert row["failure_type"] == "retriable"
+    assert row["failure_stage"] == "step_run"
+    assert row["failure_step_name"] == "hash"
+    assert "node_fail" in row["failure_reason"]
+    # 4 total attempts: 1 initial + 3 retries.
+    assert backend.attempts["hash"] == 4
+
+
+async def test_permanent_failure_skips_retry_loop(
+    postgres_pool, pending_work_ticket, library_spy, tmp_path
+):
+    """A permanent BackendFailure (BAD_INPUT) does NOT retry — straight
+    to FAILED with failure_type='permanent', retry_count=0."""
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = pending_work_ticket["work_ticket_idx"]
+
+    backend = _RetryingBackendClient(
+        fail_step="hash",
+        fail_n_times=999,
+        kind=FailureKind.BAD_INPUT,
+    )
+
+    with pytest.raises(BackendFailure):
+        await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, retry_count, failure_type, failure_step_name"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    assert row["state"] == "failed"
+    assert row["retry_count"] == 0  # no retries attempted
+    assert row["failure_type"] == "permanent"
+    assert row["failure_step_name"] == "hash"
+    # Exactly one attempt — permanent failures don't loop.
+    assert backend.attempts["hash"] == 1
+
+
+async def test_unwrapped_exception_marks_failed_as_permanent(
+    postgres_pool, pending_work_ticket, library_spy, tmp_path
+):
+    """A LIBRARY primitive raising plain Python (not BackendFailure)
+    becomes failure_type='permanent' with kind UNKNOWN_PERMANENT in the
+    reason. The retry loop only fires on BackendFailure; plain
+    exceptions skip it because there's no classification to dispatch on."""
+    from qiita_common.api_paths import LibraryPrimitive
+
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = pending_work_ticket["work_ticket_idx"]
+    backend = FakeBackendClient()
+    _populate_step_outputs(backend, workspace_root / str(work_ticket_idx))
+
+    library_spy.state["fail_on"] = LibraryPrimitive.MINT_FEATURES
+
+    with pytest.raises(RuntimeError, match="simulated mint-features failure"):
+        await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, retry_count, failure_type, failure_stage, failure_reason"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    assert row["state"] == "failed"
+    assert row["retry_count"] == 0
+    assert row["failure_type"] == "permanent"
+    assert row["failure_stage"] == "step_run"
+    assert "RuntimeError" in row["failure_reason"]
+
+
+async def test_retry_observable_via_state_transitions(
+    postgres_pool, pending_work_ticket, library_spy, tmp_path
+):
+    """Each transient retry transitions PROCESSING → QUEUED → PROCESSING.
+    Verified by observing the work_ticket state through a `before_each`
+    hook installed on the backend stub: when run_step is invoked, the
+    ticket must be in PROCESSING (not QUEUED — the runner re-transitions
+    before each attempt)."""
+    from qiita_common.backend_failure import FailureKind
+
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = pending_work_ticket["work_ticket_idx"]
+    workspace = workspace_root / str(work_ticket_idx)
+
+    observed_states: list[str] = []
+
+    class _Backend(_RetryingBackendClient):
+        async def run_step(
+            self, *, step_name, inputs, workspace, reference_idx, work_ticket_idx, **kw
+        ):
+            state = await postgres_pool.fetchval(
+                "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+                work_ticket_idx,
+            )
+            observed_states.append(state)
+            self.attempts[step_name] = self.attempts.get(step_name, 0) + 1
+            if step_name == "load":
+                workspace.mkdir(parents=True, exist_ok=True)
+                (workspace / "staging").mkdir(parents=True, exist_ok=True)
+                (workspace / "staging" / "reference_sequences.parquet").touch()
+                return {"staging_dir": workspace / "staging"}
+            self.attempts[step_name] -= 1
+            return await super().run_step(
+                step_name=step_name,
+                inputs=inputs,
+                workspace=workspace,
+                reference_idx=reference_idx,
+                work_ticket_idx=work_ticket_idx,
+                **kw,
+            )
+
+    backend = _Backend(
+        fail_step="hash",
+        fail_n_times=2,  # two transient failures, then succeeds
+        kind=FailureKind.OOM_KILLED,
+        outputs_on_success={"manifest": workspace / "manifest.parquet"},
+    )
+
+    await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    # Three hash attempts + one load attempt.
+    # Every attempt observed PROCESSING (the runner transitions to
+    # PROCESSING before invoking the backend, even when retrying).
+    assert observed_states == ["processing", "processing", "processing", "processing"]
+    final = await postgres_pool.fetchrow(
+        "SELECT state, retry_count FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    assert final["state"] == "completed"
+    assert final["retry_count"] == 2

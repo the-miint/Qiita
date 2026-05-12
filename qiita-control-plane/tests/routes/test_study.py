@@ -384,7 +384,7 @@ async def test_post_study_unknown_pi_idx_422(ctx):
     assert resp.status_code == 422
     assert (
         resp.json()["detail"] == "principal_investigator_idx must reference a user-kind principal"
-    )  # noqa: E501
+    )
 
 
 async def test_post_study_pi_idx_is_service_account_422(ctx):
@@ -402,7 +402,7 @@ async def test_post_study_pi_idx_is_service_account_422(ctx):
     assert resp.status_code == 422
     assert (
         resp.json()["detail"] == "principal_investigator_idx must reference a user-kind principal"
-    )  # noqa: E501
+    )
 
 
 # ===========================================================================

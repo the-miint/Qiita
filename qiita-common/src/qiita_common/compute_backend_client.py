@@ -19,7 +19,8 @@ from pathlib import Path
 import httpx
 
 from .api_paths import URL_STEP_RUN
-from .models import StepRunRequest, StepRunResponse
+from .backend_failure import BACKEND_FAILURE_HEADER, BackendFailureBody
+from .models import StepBaselineResources, StepRunRequest, StepRunResponse
 
 # Generous so a slow step doesn't get prematurely cancelled, but bounded
 # so a hung orchestrator doesn't block the runner indefinitely. Larger
@@ -93,16 +94,37 @@ class ComputeBackendClient:
         inputs: dict[str, Path],
         workspace: Path,
         reference_idx: int,
+        work_ticket_idx: int,
+        container: str | None = None,
+        entrypoint: str | None = None,
+        baseline_resources: StepBaselineResources | None = None,
     ) -> dict[str, Path]:
         """Dispatch one step to the orchestrator. Blocks until the
-        backend returns. Returns the step's named output paths."""
+        backend returns. Returns the step's named output paths.
+
+        `container`, `entrypoint`, and `baseline_resources` are required
+        by SlurmBackend but ignored by LocalBackend; the runner
+        populates them from the YAML's WorkflowStep entry. They're
+        optional on the wire so older callers (and tests using the
+        in-process LocalComputeBackendClient shim) keep working."""
         body = StepRunRequest(
             step_name=step_name,
             inputs={k: str(v) for k, v in inputs.items()},
             workspace=str(workspace),
             reference_idx=reference_idx,
+            work_ticket_idx=work_ticket_idx,
+            container=container,
+            entrypoint=entrypoint,
+            baseline_resources=baseline_resources,
         )
         resp = await self._http.post(URL_STEP_RUN, json=body.model_dump())
+        if resp.headers.get(BACKEND_FAILURE_HEADER):
+            # Orchestrator deliberately structured the failure so the
+            # runner sees the same typed surface (and retry
+            # classification) it would for an in-process backend.
+            # Validation errors here are real bugs — the orchestrator
+            # promised a BackendFailureBody and shipped something else.
+            raise BackendFailureBody.model_validate(resp.json()).to_exception()
         resp.raise_for_status()
         parsed = StepRunResponse.model_validate(resp.json())
         return {k: Path(v) for k, v in parsed.outputs.items()}
