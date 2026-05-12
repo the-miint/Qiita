@@ -732,3 +732,42 @@ async def test_revoke_all_tokens_rolls_back_when_audit_fails(
     actual = (resp.status_code, n_active)
     expected = (500, 2)
     assert actual == expected
+
+
+async def test_post_service_account_rolls_back_when_audit_fails(
+    admin_client, postgres_pool, monkeypatch, audit_failure, fail_safe_client
+):
+    """If the audit insert fails, the principal + service_account + api_token
+    writes must all roll back so no orphaned row outlives the failed audit."""
+    admin_token, _ = await _admin_token(postgres_pool, admin_client)
+
+    monkeypatch.setattr("qiita_control_plane.routes.admin.record_event", audit_failure)
+
+    # Attempt create with a unique name so the post-state query can isolate
+    # any row that would survive a broken rollback.
+    resp = await fail_safe_client.post(
+        "/api/v1/admin/service-account",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"name": "rollback-svc", "scopes": [Scope.FEATURE_MINT]},
+    )
+
+    # Count rows across all three tables the route writes into; service_account
+    # and principal are queried by the attempted name, api_token by FK join
+    # back to that principal. All three must be zero if the tx rolled back.
+    state = await postgres_pool.fetchrow(
+        "SELECT"
+        " (SELECT count(*) FROM qiita.principal"
+        "    WHERE display_name = $1) AS principal_count,"
+        " (SELECT count(*) FROM qiita.service_account"
+        "    WHERE name = $1) AS service_account_count,"
+        " (SELECT count(*) FROM qiita.api_token at"
+        "    JOIN qiita.principal p ON p.idx = at.principal_idx"
+        "    WHERE p.display_name = $1) AS api_token_count",
+        "rollback-svc",
+    )
+    actual = (resp.status_code, dict(state))
+    expected = (
+        500,
+        {"principal_count": 0, "service_account_count": 0, "api_token_count": 0},
+    )
+    assert actual == expected

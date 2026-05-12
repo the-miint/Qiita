@@ -136,7 +136,7 @@ async def whoami(p: Principal = Depends(get_current_principal)) -> WhoAmIRespons
 async def mint_pat(
     body: ApiTokenMintRequest,
     request: Request,
-    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    pool: asyncpg.Pool = Depends(get_db_pool),
 ) -> ApiTokenMintResponse | JSONResponse:
     """Mint a personal access token. Requires a *fresh* OIDC JWT — the
     auth_time claim must be within AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS,
@@ -148,8 +148,9 @@ async def mint_pat(
     error instead of silently failing.
 
     JWT verification and the freshness/leeway checks run without
-    holding a pool connection — the transaction opens lazily via the
-    `TxConnFactory` once the route is ready to query the DB.
+    holding a pool connection. The user lookup acquires a pooled
+    connection briefly; a transaction opens only around the mint +
+    audit pair so 4xx paths return without an empty commit.
     """
     settings = _get_settings(request)
     verifier = get_oidc_verifier(request)
@@ -197,84 +198,87 @@ async def mint_pat(
             ),
         )
 
-    # Open the transaction here — everything below queries or writes the DB
-    # and the mint + audit pair must roll back together. JWT verification
-    # and the freshness/leeway checks above ran without holding a connection.
-    async with tx() as conn:
-        # Resolve the user from the verified identity. The missing-fields list
-        # is computed in SQL via qiita.user_profile_missing_fields so the field
-        # set tracks the `profile_complete` generated column's definition (both
-        # live in the auth migration; see
-        # 20260429000001_user_profile_missing_fields.sql).
-        user_row = await conn.fetchrow(
-            "SELECT u.principal_idx, p.system_role, p.disabled, p.retired,"
-            " u.profile_complete,"
-            " qiita.user_profile_missing_fields(u.affiliation, u.address, u.phone)"
-            "   AS missing_fields"
-            " FROM qiita.user_identity ui"
-            " JOIN qiita.user u ON u.principal_idx = ui.principal_idx"
-            " JOIN qiita.principal p ON p.idx = u.principal_idx"
-            " WHERE ui.issuer = $1 AND ui.subject = $2",
-            identity.issuer,
-            identity.subject,
+    # Resolve the user from the verified identity on a pooled (non-tx)
+    # connection — the lookup is read-only and the 4xx paths below must
+    # not hold a transactional slot for an empty commit. The missing-fields
+    # list is computed in SQL via qiita.user_profile_missing_fields so the
+    # field set tracks the `profile_complete` generated column's definition
+    # (both live in the auth migration; see
+    # 20260429000001_user_profile_missing_fields.sql).
+    user_row = await pool.fetchrow(
+        "SELECT u.principal_idx, p.system_role, p.disabled, p.retired,"
+        " u.profile_complete,"
+        " qiita.user_profile_missing_fields(u.affiliation, u.address, u.phone)"
+        "   AS missing_fields"
+        " FROM qiita.user_identity ui"
+        " JOIN qiita.user u ON u.principal_idx = ui.principal_idx"
+        " JOIN qiita.principal p ON p.idx = u.principal_idx"
+        " WHERE ui.issuer = $1 AND ui.subject = $2",
+        identity.issuer,
+        identity.subject,
+    )
+    if user_row is None:
+        raise HTTPException(
+            status_code=401,
+            detail="no user matches this OIDC identity",
         )
-        if user_row is None:
-            raise HTTPException(
-                status_code=401,
-                detail="no user matches this OIDC identity",
-            )
-        if user_row["disabled"] or user_row["retired"]:
-            raise HTTPException(status_code=401, detail=MSG_PRINCIPAL_DISABLED_OR_RETIRED)
+    if user_row["disabled"] or user_row["retired"]:
+        raise HTTPException(status_code=401, detail=MSG_PRINCIPAL_DISABLED_OR_RETIRED)
 
-        if not user_row["profile_complete"]:
-            # Flat 422 body so the CLI can pluck reason / missing_fields without
-            # nested-detail unwrapping.
-            return JSONResponse(
-                status_code=422,
-                content={
-                    "detail": "profile incomplete",
-                    "reason": "profile_incomplete",
-                    "missing_fields": user_row["missing_fields"],
-                },
-            )
-
-        # Scope validation against the role ceiling. The rejection response
-        # deliberately does NOT echo the caller's full ceiling — the caller
-        # already knows it via /auth/whoami; echoing it per-request would leak
-        # ceiling structure to a probing attacker.
-        role = user_row["system_role"]
-        ceiling = role_ceiling(role)
-        if body.scopes is None:
-            scopes = sorted(ceiling)
-        else:
-            rejection = validate_scopes_against_ceiling(
-                body.scopes,
-                ceiling,
-                ceiling_violation_detail="scopes not granted by your role",
-            )
-            if rejection is not None:
-                return rejection
-            scopes = list(body.scopes)
-
-        # TTL — Pydantic already enforces gt=0 and le=365.
-        ttl_days = body.ttl_days if body.ttl_days is not None else settings.token_default_ttl_days
-        expires_at = datetime.now(UTC) + timedelta(days=ttl_days)
-
-        plaintext, token_idx = await mint_api_token(
-            conn,
-            principal_idx=user_row["principal_idx"],
-            label=body.label,
-            scopes=scopes,
-            expires_at=expires_at,
+    if not user_row["profile_complete"]:
+        # Flat 422 body so the CLI can pluck reason / missing_fields without
+        # nested-detail unwrapping.
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": "profile incomplete",
+                "reason": "profile_incomplete",
+                "missing_fields": user_row["missing_fields"],
+            },
         )
 
-        await record_event(
-            conn,
-            event_type=AuthEventType.TOKEN_MINT,
-            principal_idx=user_row["principal_idx"],
-            actor_principal_idx=user_row["principal_idx"],  # self-mint
-            detail={"token_idx": token_idx, "scopes": scopes, "kind": "pat"},
+    # Scope validation against the role ceiling. The rejection response
+    # deliberately does NOT echo the caller's full ceiling — the caller
+    # already knows it via /auth/whoami; echoing it per-request would leak
+    # ceiling structure to a probing attacker.
+    role = user_row["system_role"]
+    ceiling = role_ceiling(role)
+    if body.scopes is None:
+        scopes = sorted(ceiling)
+    else:
+        rejection = validate_scopes_against_ceiling(
+            body.scopes,
+            ceiling,
+            ceiling_violation_detail="scopes not granted by your role",
         )
+        if rejection is not None:
+            return rejection
+        scopes = list(body.scopes)
+
+    # TTL — Pydantic already enforces gt=0 and le=365.
+    ttl_days = body.ttl_days if body.ttl_days is not None else settings.token_default_ttl_days
+    expires_at = datetime.now(UTC) + timedelta(days=ttl_days)
+
+    # Mint + audit share a tx so an audit failure rolls back the token row.
+    # Inline rather than the TxConnFactory dep — the body-wide-tx shape that
+    # dep wraps is a poor fit when most of this handler is non-transactional.
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            plaintext, token_idx = await mint_api_token(
+                conn,
+                principal_idx=user_row["principal_idx"],
+                label=body.label,
+                scopes=scopes,
+                expires_at=expires_at,
+            )
+
+            await record_event(
+                conn,
+                event_type=AuthEventType.TOKEN_MINT,
+                principal_idx=user_row["principal_idx"],
+                actor_principal_idx=user_row["principal_idx"],  # self-mint
+                detail={"token_idx": token_idx, "scopes": scopes, "kind": "pat"},
+            )
 
     return ApiTokenMintResponse(
         token=plaintext,
