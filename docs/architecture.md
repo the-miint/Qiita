@@ -852,13 +852,13 @@ The unified build entry point lives in [`Makefile`](../Makefile). The recipes be
 <!-- KEEP IN SYNC WITH ../Makefile; qiita-common/tests/test_makefile_doc_sync.py enforces this -->
 ```makefile
 # Build
-build: build-common build-control-plane build-data-plane build-compute-orchestrator build-workflows
+build: build-common build-control-plane build-data-plane build-compute-orchestrator build-integration build-workflows
 
 build-common:
 	cd qiita-common && uv sync
 
 build-control-plane:
-	cd qiita-control-plane && uv sync
+	cd qiita-control-plane && uv sync --reinstall-package qiita-common
 
 build-data-plane:
 	cd qiita-data-plane && cargo build --release --features duckdb/bundled
@@ -867,7 +867,13 @@ build-data-plane-debug:
 	cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo build
 
 build-compute-orchestrator:
-	cd qiita-compute-orchestrator && uv sync
+	cd qiita-compute-orchestrator && uv sync --reinstall-package qiita-common
+
+build-integration:
+	cd tests/integration && uv sync \
+	  --reinstall-package qiita-common \
+	  --reinstall-package qiita-control-plane \
+	  --reinstall-package qiita-compute-orchestrator
 
 build-workflows:
 	@if ! command -v apptainer > /dev/null 2>&1; then \
@@ -887,13 +893,13 @@ test-python: test-common test-control-plane-without-db test-compute-orchestrator
 
 test-rust: test-data-plane
 
-test-common:
+test-common: build-common
 	cd qiita-common && uv run pytest
 
-test-control-plane-without-db:
+test-control-plane-without-db: build-control-plane
 	cd qiita-control-plane && uv run pytest -m 'not db'
 
-test-control-plane-with-db: $(DBMATE_BIN)
+test-control-plane-with-db: build-control-plane $(DBMATE_BIN)
 	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
 	  ((cd qiita-control-plane && uv run pytest); PY_EC=$$?; \
 	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
@@ -902,7 +908,7 @@ test-control-plane-with-db: $(DBMATE_BIN)
 test-data-plane:
 	cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test
 
-test-compute-orchestrator:
+test-compute-orchestrator: build-compute-orchestrator
 	cd qiita-compute-orchestrator && uv run pytest
 
 test-workflows:
@@ -914,7 +920,7 @@ test-workflows:
 	apptainer exec /tmp/qiita-workflow-smoke.sif echo "hello world"
 	rm -f /tmp/qiita-workflow-smoke.sif
 
-test-integration: build-data-plane-debug $(DBMATE_BIN)
+test-integration: build-data-plane-debug build-integration $(DBMATE_BIN)
 	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
 	  ((cd tests/integration && uv run pytest -m 'not system'); PY_EC=$$?; \
 	   (cd $(PG_COMPOSE_DIR) && $(PG_PSQL) -d postgres \
@@ -925,7 +931,7 @@ test-integration: build-data-plane-debug $(DBMATE_BIN)
 	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
 	   exit $$(( PY_EC > RS_EC ? PY_EC : RS_EC )))
 
-test-system: build-data-plane-debug
+test-system: build-data-plane-debug build-integration
 	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
 	  ((cd tests/integration && uv run pytest -m system -x --timeout=2700); PY_EC=$$?; \
 	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
