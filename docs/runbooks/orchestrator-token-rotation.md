@@ -52,9 +52,15 @@ token file.
 - An admin PAT with `admin:service_account` scope (see
   `docs/runbooks/first-deploy.md`).
 - Shell access to the orchestrator host as the user that owns the token
-  file (`qiita` by default).
+  file (`qiita-orch` by default; see `scripts/install-orchestrator-token.sh`).
 
 ## Steps
+
+> **v1 reminder.** The steps below describe the full rotation procedure
+> for any `ControlPlaneClient` consumer. In v1 that's cron jobs only;
+> the orchestrator's PAT and reload handler land later. Where the two
+> paths diverge — notably step 3 — the cron path is the only one that
+> works today.
 
 1. **Mint the replacement token** from any host with the admin PAT:
 
@@ -88,22 +94,34 @@ token file.
        /etc/qiita/orchestrator.token <<<"$NEW_TOKEN"
    ```
 
-   The script stages at `<target>.new` (mode `0400`, owner `qiita:qiita`),
+   The script stages at `<target>.new` (mode `0400`, owner `qiita-orch:qiita-orch`),
    saves the prior contents at `<target>.previous` for the rollback path
    below, and atomically renames over the target. POSIX same-filesystem
    rename is atomic — readers see either the old or the new file, never
    a partial one.
 
-3. **Reload the orchestrator** so it re-reads the file:
+3. **Pick up the new token** in the running service:
+
+   For a short-lived process (cron jobs today): no action needed — the
+   next scheduled invocation reads the new file on startup. Any
+   invocation already in flight finishes with the old token, which is
+   fine: the old token stays valid until step 5.
+
+   For a long-running daemon (orchestrator, future):
 
    ```bash
-   systemctl reload qiita-orchestrator
+   systemctl reload qiita-compute-orchestrator
    ```
 
-   The SIGHUP handler re-loads the file. In-flight HTTP calls finish
-   with the old token; new calls use the new one.
+   The reload is meant to trigger a SIGHUP handler that re-reads the
+   token file; in-flight HTTP calls finish with the old token while new
+   calls use the new one. The orchestrator does not implement this
+   handler in v1 (see the status banner at the top of this runbook) and
+   the shipped systemd unit declares no `ExecReload=`, so `systemctl
+   reload` will currently fail with "Job type reload is not applicable".
+   Wiring both pieces in is part of the future orchestrator-PAT work.
 
-4. **Wait for new-token use** — confirm the orchestrator has actually
+4. **Wait for new-token use** — confirm the service has actually
    exercised the new token before revoking the old one:
 
    ```bash
@@ -127,12 +145,17 @@ token file.
 
 ## If the new token doesn't work
 
-The orchestrator will hit 401 on every control-plane call. Roll back by:
+The orchestrator will hit 401 on every control-plane call. Roll back
+the file swap first; how the running service picks up the rollback
+follows the same case-split as step 3 (v1: cron jobs only — the
+orchestrator's reload handler lands with the future PAT work, so
+`systemctl reload` will fail today):
 
 ```bash
 mv /etc/qiita/orchestrator.token /etc/qiita/orchestrator.token.bad
 mv /etc/qiita/orchestrator.token.previous /etc/qiita/orchestrator.token
-systemctl reload qiita-orchestrator
+# Cron job: wait for the next scheduled invocation.
+# Long-running daemon (future): systemctl reload qiita-compute-orchestrator
 ```
 
 `install-orchestrator-token.sh` writes `<target>.previous` on every

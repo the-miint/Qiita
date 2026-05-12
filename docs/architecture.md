@@ -680,10 +680,10 @@ The control-plane user (`qiita-api`) connects to `qiita_miint` only; the data-pl
 
 Two shared filesystems, mounted on every host that runs Qiita components or SLURM workers:
 
-- **`$QIITA_DATA_ROOT/`** — durable, backed up. System-of-record state. `QIITA_DATA_ROOT` is a runbook-template variable: the operator exports it once and the deploy env-files expand it into `DUCKLAKE_DATA_PATH` (default `/data`); production deploys whose shared filesystem is mounted elsewhere override at deploy time.
+- **`$QIITA_DATA_ROOT/`** — durable, backed up. System-of-record state. `QIITA_DATA_ROOT` is a runbook-template variable read only by the operator's shell — no Qiita process reads it directly. The operator exports it once and the deploy env-files expand it into `DUCKLAKE_DATA_PATH` (which the data plane *does* read). The recommended runbook value is `/data` (see `docs/runbooks/first-deploy.md`); production deploys whose shared filesystem is mounted elsewhere override at deploy time. The data plane's own fallback when `DUCKLAKE_DATA_PATH` is unset is `$TMPDIR/qiita/ducklake`, further falling back to `/tmp/qiita/ducklake` if `TMPDIR` itself is unset — a tmp-rooted default, never a production-looking path.
 - **`/scratch/`** — fast, working. Three-tier retention; path is hardcoded.
 
-Layout (showing the default `/data/` for brevity; substitute `$QIITA_DATA_ROOT` in non-default deploys):
+Layout (showing the recommended runbook value `/data/` for brevity; substitute `$QIITA_DATA_ROOT` in non-default deploys):
 
 ```
 $QIITA_DATA_ROOT/                           durable, backed up
@@ -744,9 +744,16 @@ qiita/
 │   └── src/
 │       └── qiita_common/
 │           ├── __init__.py
-│           ├── models.py           # work ticket states, API schemas, shared types
-│           ├── config.py           # shared config patterns (env var loading, etc.)
-│           └── client.py           # REST client utilities for service-to-service calls
+│           ├── models.py                   # work-ticket / API schemas, principal + action types
+│           ├── api_paths.py                # canonical REST path constants (shared CP↔CO)
+│           ├── auth_constants.py           # scope names, token prefixes
+│           ├── config.py                   # env-var loading helpers
+│           ├── log.py                      # structured-logging setup
+│           ├── client.py                   # base async REST client for service-to-service
+│           ├── compute_backend_client.py   # CP → orchestrator /step/run client
+│           ├── backend_failure.py          # typed BackendFailure model + JSON round-trip
+│           ├── actions.py                  # action YAML schema + loader
+│           └── parquet.py                  # parquet column/sort helpers
 ├── qiita-control-plane/
 │   ├── pyproject.toml              # uv-managed, depends on qiita-common
 │   ├── uv.lock
@@ -757,61 +764,81 @@ qiita/
 │   │       ├── __init__.py
 │   │       ├── main.py             # FastAPI app entry point + /health endpoint
 │   │       ├── config.py           # settings (DB URL, HMAC secret, AuthRocket JWKS URL)
+│   │       ├── db.py               # asyncpg connection pool setup
+│   │       ├── deps.py             # FastAPI dependency-injection helpers (sessions, scopes)
+│   │       ├── dispatch.py         # compute-orchestrator dispatch (async fire-and-forget)
+│   │       ├── runner.py           # per-ticket workflow runner (walks action steps)
 │   │       ├── auth/               # JWT verification, HMAC ticket signing, AuthRocket integration
-│   │       ├── models/             # asyncpg models (studies, samples, preparations, users, roles, work tickets, provenance, references, genomes, features, phylogeny tip-feature)
-│   │       ├── routes/
-│   │       │   ├── studies.py
-│   │       │   ├── samples.py
-│   │       │   ├── preparations.py
-│   │       │   ├── tickets.py      # work ticket CRUD + Flight ticket issuance + manual restart
-│   │       │   ├── references.py   # reference CRUD, membership management, genome/feature minting
-│   │       │   └── callbacks.py    # data plane + compute orchestrator callback endpoints
-│   │       └── db.py               # asyncpg connection pool setup
+│   │       ├── actions/            # action library + sync from workflows/
+│   │       ├── cli/                # qiita-admin CLI surface
+│   │       ├── repositories/       # asyncpg query layer per resource (biosample, study, user, ...)
+│   │       ├── testing/            # shared test fixtures (postgres, sessions, JWKS harness)
+│   │       └── routes/
+│   │           ├── admin.py        # admin endpoints (service-account mint, role grants, ...)
+│   │           ├── auth.py         # login flow + PAT mint + handoff
+│   │           ├── biosample.py
+│   │           ├── reference.py    # reference CRUD, membership, genome/feature minting
+│   │           ├── study.py
+│   │           ├── user.py
+│   │           └── work_ticket.py  # work-ticket CRUD + Flight ticket issuance
 │   └── tests/
 │       ├── conftest.py
-│       └── ...
+│       ├── _postgres/              # docker-compose.yml + initdb for Postgres harness (shared with tests/integration)
+│       ├── auth/
+│       ├── cli/
+│       ├── repositories/
+│       └── routes/
 ├── qiita-data-plane/
 │   ├── Cargo.toml                  # deps: arrow-flight, tonic, duckdb, hmac, sha2, jsonwebtoken
 │   └── src/
 │       ├── main.rs                 # tonic server entry, Flight service + gRPC health check registration
-│       ├── config.rs               # settings (DuckLake catalog DB URL, HMAC secret, JWKS URL, control plane callback URL)
+│       ├── config.rs               # settings (DuckLake catalog DB URL, HMAC secret, JWKS URL)
 │       ├── flight_service.rs       # impl FlightService trait (do_get, do_put, do_action)
 │       ├── auth.rs                 # JWT verification (cached JWKS), HMAC ticket verification
-│       ├── ducklake.rs             # DuckDB/DuckLake connection management, ducklake_add_data_files
-│       └── callback.rs             # REST client to call back control plane
+│       └── ducklake.rs             # DuckDB/DuckLake connection management, ducklake_add_data_files
 ├── qiita-compute-orchestrator/
 │   ├── pyproject.toml              # uv-managed, depends on qiita-common
 │   ├── uv.lock
 │   ├── src/
 │   │   └── qiita_compute_orchestrator/
 │   │       ├── __init__.py
-│   │       ├── main.py             # service entry point + /health endpoint
-│   │       ├── config.py           # settings (slurmrestd URL, slurmrestd JWT, control plane URL, poll interval)
-│   │       ├── backend.py          # ComputeBackend interface
-│   │       ├── slurm.py            # SLURM implementation (slurmrestd REST client, job lifecycle)
-│   │       ├── reference_indexing.py  # reference ingestion + aligner index build job management
-│   │       └── workflows/          # workflow definitions (container image, resources, entrypoint)
+│   │       ├── main.py             # service entry point + /health + /step/run route
+│   │       ├── config.py           # settings (compute backend, shared FS root, CP↔CO token, SLURM creds)
+│   │       ├── backend.py          # ComputeBackend interface (run_step + verify_outputs contract)
+│   │       ├── step.py             # per-step verification helpers (output paths, file modes)
+│   │       ├── backends/
+│   │       │   ├── local.py        # LocalBackend (DuckDB + miint in-process; dev / test)
+│   │       │   └── slurm.py        # SlurmBackend (slurmrestd dispatch + polling)
+│   │       └── slurm/
+│   │           ├── client.py       # slurmrestd REST client
+│   │           ├── payload.py      # JSON job-submit payload builder
+│   │           └── verify.py       # post-job output verification (mode 440, identifier sort)
 │   └── tests/
-│       ├── conftest.py
-│       └── ...
+│       └── conftest.py
 ├── tests/
 │   └── integration/
-│       ├── conftest.py             # test fixtures: Postgres, services, test data
-│       ├── docker-compose.yml      # Postgres for integration tests
-│       ├── test_upload_workflow.py  # end-to-end upload → process → register
-│       └── test_auth_flow.py       # end-to-end auth → ticket → data access
+│       ├── conftest.py             # cross-component fixtures: postgres, services, dataplane binary
+│       ├── _pg_env.py              # postgres connection helpers (Docker vs host mode)
+│       ├── _runner_helpers.py      # workflow-runner test helpers
+│       ├── test_smoke.py
+│       ├── test_doget.py           # CP-signed ticket → DP DoGet round-trip
+│       ├── test_step_dispatch.py   # CP → orchestrator /step/run flow
+│       ├── test_action_library.py
+│       ├── test_action_sync.py
+│       ├── test_reference_add_smoke.py
+│       ├── test_e2e_reference.py
+│       └── test_system_gg2_backbone.py  # @pytest.mark.system; real GG2 backbone
 ├── workflows/
 │   ├── amplicon/
 │   │   ├── Apptainer.def           # container definition (single image for all steps)
 │   │   ├── workflow.yaml           # ordered steps: name, type (map|reduce), entrypoint, resources
 │   │   └── scripts/                # per-step entrypoints and helpers
-│   ├── metagenomic/
-│   │   └── ...
-│   └── ...
+│   └── reference-add/
+│       └── 1.0.0.yaml              # versioned reference-ingest workflow
 ├── deploy/
 │   ├── systemd/
 │   │   ├── qiita-control-plane.service
-│   │   ├── qiita-data-plane.service
+│   │   ├── qiita-data-plane@.service       # template unit; instance = listen port (e.g. @50051)
 │   │   └── qiita-compute-orchestrator.service
 │   └── nginx/
 │       └── qiita.conf              # REST and gRPC routing, TLS termination, HTTP/2
@@ -820,10 +847,11 @@ qiita/
 
 ## Build System (Makefile)
 
-```makefile
-.PHONY: build test test-integration lint deploy migrate clean verify-health
+The unified build entry point lives in [`Makefile`](../Makefile). The recipes below mirror the public-API targets verbatim; the test in [`qiita-common/tests/test_makefile_doc_sync.py`](../qiita-common/tests/test_makefile_doc_sync.py) asserts they stay in sync and is part of `make test`. Internal helpers (`$(DBMATE_BIN)` / `$(GRPCURL_BIN)` auto-fetch, the `UNAME_S/UNAME_M` arch detection, the verbose `dev-setup` install hints) live in `Makefile` only.
 
-# Build all components
+<!-- KEEP IN SYNC WITH ../Makefile; qiita-common/tests/test_makefile_doc_sync.py enforces this -->
+```makefile
+# Build
 build: build-common build-control-plane build-data-plane build-compute-orchestrator build-workflows
 
 build-common:
@@ -833,41 +861,82 @@ build-control-plane:
 	cd qiita-control-plane && uv sync
 
 build-data-plane:
-	cd qiita-data-plane && cargo build --release
+	cd qiita-data-plane && cargo build --release --features duckdb/bundled
+
+build-data-plane-debug:
+	cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo build
 
 build-compute-orchestrator:
 	cd qiita-compute-orchestrator && uv sync
 
 build-workflows:
-	@for dir in workflows/*/; do \
+	@if ! command -v apptainer > /dev/null 2>&1; then \
+		echo "apptainer not found — skipping workflow container builds"; \
+		exit 0; \
+	fi; \
+	for dir in workflows/*/; do \
 		if [ -f "$$dir/Apptainer.def" ]; then \
 			apptainer build "$$dir/$$(basename $$dir).sif" "$$dir/Apptainer.def"; \
 		fi \
 	done
 
-# Run unit tests
-test: test-common test-control-plane test-data-plane test-compute-orchestrator
+# Test (layered by infrastructure cost)
+test: test-python test-rust
+
+test-python: test-common test-control-plane-without-db test-compute-orchestrator
+
+test-rust: test-data-plane
 
 test-common:
 	cd qiita-common && uv run pytest
 
-test-control-plane:
-	cd qiita-control-plane && uv run pytest
+test-control-plane-without-db:
+	cd qiita-control-plane && uv run pytest -m 'not db'
+
+test-control-plane-with-db: $(DBMATE_BIN)
+	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
+	  ((cd qiita-control-plane && uv run pytest); PY_EC=$$?; \
+	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
+	   exit $$PY_EC)
 
 test-data-plane:
-	cd qiita-data-plane && cargo test
+	cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test
 
 test-compute-orchestrator:
 	cd qiita-compute-orchestrator && uv run pytest
 
-# Run integration tests (requires Docker for Postgres)
-test-integration:
-	cd tests/integration && docker compose up -d --wait
-	cd tests/integration && uv run pytest
-	cd tests/integration && docker compose down
+test-workflows:
+	@if ! command -v apptainer > /dev/null 2>&1; then \
+		echo "apptainer not found — skipping workflow smoke tests"; \
+		exit 0; \
+	fi
+	apptainer build --force /tmp/qiita-workflow-smoke.sif workflows/amplicon/Apptainer.def
+	apptainer exec /tmp/qiita-workflow-smoke.sif echo "hello world"
+	rm -f /tmp/qiita-workflow-smoke.sif
 
-# Lint all components
-lint: lint-common lint-control-plane lint-data-plane lint-compute-orchestrator
+test-integration: build-data-plane-debug $(DBMATE_BIN)
+	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
+	  ((cd tests/integration && uv run pytest -m 'not system'); PY_EC=$$?; \
+	   (cd $(PG_COMPOSE_DIR) && $(PG_PSQL) -d postgres \
+	     -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'qiita_ducklake' AND pid != pg_backend_pid()" \
+	     -c "DROP DATABASE IF EXISTS qiita_ducklake" \
+	     -c "CREATE DATABASE qiita_ducklake OWNER qiita"); \
+	   (cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test --features integration); RS_EC=$$?; \
+	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
+	   exit $$(( PY_EC > RS_EC ? PY_EC : RS_EC )))
+
+test-system: build-data-plane-debug
+	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
+	  ((cd tests/integration && uv run pytest -m system -x --timeout=2700); PY_EC=$$?; \
+	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
+	   exit $$PY_EC)
+
+# Lint
+lint: lint-python lint-rust
+
+lint-python: lint-common lint-control-plane lint-compute-orchestrator
+
+lint-rust: lint-data-plane
 
 lint-common:
 	cd qiita-common && uv run ruff check . && uv run ruff format --check .
@@ -876,33 +945,35 @@ lint-control-plane:
 	cd qiita-control-plane && uv run ruff check . && uv run ruff format --check .
 
 lint-data-plane:
-	cd qiita-data-plane && cargo clippy -- -D warnings && cargo fmt --check
+	cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo clippy -- -D warnings && cargo fmt --check
 
 lint-compute-orchestrator:
 	cd qiita-compute-orchestrator && uv run ruff check . && uv run ruff format --check .
 
-# Run database migrations
-migrate:
-	cd qiita-control-plane && dbmate up
+# DB / actions
+migrate: $(DBMATE_BIN)
+	cd qiita-control-plane && $(DBMATE_BIN) --migrations-table public.schema_migrations --no-dump-schema up
 
-# Build and print deploy instructions (no sudo)
+sync-actions:
+	cd qiita-control-plane && uv run qiita-admin actions sync --workflows-dir ../workflows
+
+# Deploy / health
 deploy: build
 	@echo "=== Build complete. Run the following commands as admin: ==="
 	@echo ""
 	@echo "  sudo cp deploy/systemd/qiita-control-plane.service /etc/systemd/system/"
-	@echo "  sudo cp deploy/systemd/qiita-data-plane.service /etc/systemd/system/"
+	@echo "  sudo cp deploy/systemd/qiita-data-plane@.service /etc/systemd/system/"
 	@echo "  sudo cp deploy/systemd/qiita-compute-orchestrator.service /etc/systemd/system/"
 	@echo "  sudo cp deploy/nginx/qiita.conf /etc/nginx/conf.d/"
 	@echo "  sudo systemctl daemon-reload"
 	@echo "  sudo systemctl restart qiita-control-plane"
-	@echo "  sudo systemctl restart qiita-data-plane"
+	@echo "  sudo systemctl restart 'qiita-data-plane@50051'"
 	@echo "  sudo systemctl restart qiita-compute-orchestrator"
 	@echo "  sudo systemctl reload nginx"
 	@echo ""
 	@echo "Then verify: make verify-health"
 
-# Verify all services are healthy after deploy
-verify-health:
+verify-health: $(GRPCURL_BIN)
 	@echo "Checking control plane..."
 	@curl -sf http://localhost:8080/health || (echo "FAIL: control plane" && exit 1)
 	@echo " OK"
@@ -910,15 +981,21 @@ verify-health:
 	@curl -sf http://localhost:8081/health || (echo "FAIL: compute orchestrator" && exit 1)
 	@echo " OK"
 	@echo "Checking data plane..."
-	@grpcurl -plaintext localhost:50051 grpc.health.v1.Health/Check || (echo "FAIL: data plane" && exit 1)
+	@$(GRPCURL_BIN) -plaintext localhost:50051 grpc.health.v1.Health/Check || (echo "FAIL: data plane" && exit 1)
 	@echo " OK"
 	@echo "All services healthy."
 
+# Setup / hooks
+install-hooks:
+	uv tool install pre-commit
+	pre-commit install
+
+# Cleanup
 clean:
-	cd qiita-common && rm -rf .venv __pycache__
-	cd qiita-control-plane && rm -rf .venv __pycache__
+	cd qiita-common && rm -rf .venv __pycache__ .pytest_cache .ruff_cache
+	cd qiita-control-plane && rm -rf .venv __pycache__ .pytest_cache .ruff_cache
 	cd qiita-data-plane && cargo clean
-	cd qiita-compute-orchestrator && rm -rf .venv __pycache__
+	cd qiita-compute-orchestrator && rm -rf .venv __pycache__ .pytest_cache .ruff_cache
 ```
 
 ## CI (GitHub Actions)

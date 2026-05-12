@@ -273,5 +273,3 @@ async def _create_local_field(ctx, suffix=""):
         )
     ctx["created"]["biosample_study_field"].append(idx)
     return idx
-
-

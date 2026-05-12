@@ -274,9 +274,7 @@ async def test_post_biosample_wet_lab_admin_on_behalf_of_other_user(ctx):
     # Wet_lab_admin owns a study and creates a biosample for a separate user.
     # Lab-tech rule passes (caller is wet_lab_admin); eligibility passes
     # (target is profile-complete user).
-    target_idx = await seed_user_principal(
-        ctx["pool"], prefix=_SEED_PREFIX, suffix="wet-target"
-    )
+    target_idx = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix="wet-target")
     ctx["created"]["user_principals"].append(target_idx)
     study_idx = await _seed_study(
         ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="wet"
@@ -303,9 +301,7 @@ async def test_post_biosample_system_admin_on_behalf_of_other_user(ctx):
     # System admin creates a biosample on behalf of a fresh user, on a
     # study they do own. Distinct from the bypass test below — here the
     # focus is the on-behalf rule satisfaction by system_admin role.
-    target_idx = await seed_user_principal(
-        ctx["pool"], prefix=_SEED_PREFIX, suffix="adm-target"
-    )
+    target_idx = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix="adm-target")
     ctx["created"]["user_principals"].append(target_idx)
     study_idx = await _seed_study(
         ctx["pool"], owner_idx=ctx["admin_session"]["principal_idx"], suffix="adm"
@@ -812,9 +808,7 @@ async def test_post_biosample_metadata_uses_seeded_globals(ctx):
     # biosample_global_field rows are intentionally NOT tracked here so the
     # cross-study seed survives this test.
     bs_idx = resp.json()["biosample_idx"]
-    await _track_global_metadata_outputs(
-        ctx, bs_idx, study_idx, list(display_to_idx.values())
-    )
+    await _track_global_metadata_outputs(ctx, bs_idx, study_idx, list(display_to_idx.values()))
 
     # Verify every metadata row landed in the correct typed value_* column.
     rows = await ctx["pool"].fetch(
@@ -833,9 +827,7 @@ async def test_post_biosample_metadata_uses_seeded_globals(ctx):
                 "value_date": date(2026, 4, 1),
             },
             {
-                "global_field_idx": display_to_idx[
-                    "geographic location (country and/or sea)"
-                ],
+                "global_field_idx": display_to_idx["geographic location (country and/or sea)"],
                 "value_text": "USA",
                 "value_numeric": None,
                 "value_date": None,
@@ -892,9 +884,7 @@ async def _seed_link_to_study(ctx, *, study_idx, owner_idx):
     """Seed a biosample owned by `owner_idx`, link it to `study_idx`, and
     track both rows in `ctx['created']` for FK-reverse cleanup. Wraps the
     db_seeds primitives so the per-test setup stays a single line."""
-    bs_idx = await seed_biosample(
-        ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx
-    )
+    bs_idx = await seed_biosample(ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx)
     ctx["created"]["biosample"].append(bs_idx)
     await seed_biosample_to_study_link(
         ctx["pool"],
@@ -1082,12 +1072,8 @@ async def test_list_biosample_idxs_excludes_retired_link_and_retired_biosample(c
     ctx["created"]["study"].append(study_idx)
     owner_idx = ctx["user_session"]["principal_idx"]
     active_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=owner_idx)
-    retired_link_idx = await _seed_link_to_study(
-        ctx, study_idx=study_idx, owner_idx=owner_idx
-    )
-    retired_bs_idx = await _seed_link_to_study(
-        ctx, study_idx=study_idx, owner_idx=owner_idx
-    )
+    retired_link_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=owner_idx)
+    retired_bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=owner_idx)
     await retire_biosample_to_study_link(
         ctx["pool"],
         biosample_idx=retired_link_idx,
@@ -1143,9 +1129,7 @@ async def test_get_biosample_owner_returns_response(ctx):
     # study_access row is seeded, so the predicate's only path to True
     # is the owner branch (caller.principal_idx == biosample.owner_idx).
     owner_idx = ctx["user_session"]["principal_idx"]
-    bs_idx = await seed_biosample(
-        ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx
-    )
+    bs_idx = await seed_biosample(ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx)
     ctx["created"]["biosample"].append(bs_idx)
 
     resp = await ctx["user"].get(f"/api/v1/biosample/{bs_idx}")
@@ -1231,9 +1215,7 @@ async def test_get_biosample_wet_lab_admin_bypasses_access(ctx):
     # and no study_access row on. Role bypass alone authorizes the read,
     # and caller_system_role reflects the actual database value.
     owner_idx = ctx["user_session"]["principal_idx"]
-    bs_idx = await seed_biosample(
-        ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx
-    )
+    bs_idx = await seed_biosample(ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx)
     ctx["created"]["biosample"].append(bs_idx)
 
     resp = await ctx["wet"].get(f"/api/v1/biosample/{bs_idx}")
@@ -1268,9 +1250,7 @@ async def test_get_biosample_wet_lab_admin_bypasses_access(ctx):
 async def test_get_biosample_system_admin_bypasses_access(ctx):
     # system_admin reads a biosample with no owner / access path.
     owner_idx = ctx["user_session"]["principal_idx"]
-    bs_idx = await seed_biosample(
-        ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx
-    )
+    bs_idx = await seed_biosample(ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx)
     ctx["created"]["biosample"].append(bs_idx)
 
     resp = await ctx["admin"].get(f"/api/v1/biosample/{bs_idx}")
@@ -1305,9 +1285,7 @@ async def test_get_biosample_system_admin_bypasses_access(ctx):
 async def test_get_biosample_anonymous_401(ctx):
     # No Authorization header → require_human raises 401.
     owner_idx = ctx["user_session"]["principal_idx"]
-    bs_idx = await seed_biosample(
-        ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx
-    )
+    bs_idx = await seed_biosample(ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx)
     ctx["created"]["biosample"].append(bs_idx)
 
     from qiita_control_plane.main import app
@@ -1322,9 +1300,7 @@ async def test_get_biosample_missing_scope_403(ctx, no_biosample_read_client):
     # Regular user holds a PAT that omits Scope.BIOSAMPLE_READ; require_scope
     # rejects with 403 before any DB read runs.
     owner_idx = ctx["user_session"]["principal_idx"]
-    bs_idx = await seed_biosample(
-        ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx
-    )
+    bs_idx = await seed_biosample(ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx)
     ctx["created"]["biosample"].append(bs_idx)
 
     resp = await no_biosample_read_client.get(f"/api/v1/biosample/{bs_idx}")
@@ -1339,9 +1315,7 @@ async def test_get_biosample_no_access_403(ctx):
     # path being skipped — admin-bypass and tier-mismatch share the 403
     # spelling per project conventions).
     owner_idx = ctx["wet_session"]["principal_idx"]
-    bs_idx = await seed_biosample(
-        ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx
-    )
+    bs_idx = await seed_biosample(ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx)
     ctx["created"]["biosample"].append(bs_idx)
 
     resp = await ctx["user"].get(f"/api/v1/biosample/{bs_idx}")
@@ -1364,9 +1338,7 @@ async def test_get_biosample_retired_404_even_for_wet_lab_admin(ctx):
     # planned retired-retrieval surface lands, this test will be relaxed
     # for wet_lab_admin and a parallel test pinned for the non-admin path.
     owner_idx = ctx["user_session"]["principal_idx"]
-    bs_idx = await seed_biosample(
-        ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx
-    )
+    bs_idx = await seed_biosample(ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx)
     ctx["created"]["biosample"].append(bs_idx)
     await retire_biosample(ctx["pool"], biosample_idx=bs_idx, retired_by_idx=owner_idx)
 
@@ -1464,9 +1436,7 @@ async def _seed_biosample_for_patch(ctx) -> int:
     PATCHing later; the seed gives the row enough columns to round-trip.
     """
     owner_idx = ctx["wet_session"]["principal_idx"]
-    bs_idx = await seed_biosample(
-        ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx
-    )
+    bs_idx = await seed_biosample(ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx)
     ctx["created"]["biosample"].append(bs_idx)
     return bs_idx
 
