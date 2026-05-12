@@ -52,16 +52,11 @@ cd qiita-common && uv run ruff check . && uv run ruff format --check .
 cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo clippy -- -D warnings && cargo fmt --check
 ```
 
-**After changing `qiita-common`, `qiita-control-plane`, or `qiita-compute-orchestrator`** (or after pulling/merging changes to any of them), re-sync dependents so they pick up the changes. Use `--reinstall-package` — plain `uv sync` skips the rebuild when the version string is unchanged, leaving stale sources in `.venv/.../site-packages/<pkg>/` and producing confusing `ImportError`s for newly-added symbols or `TypeError: __init__() got an unexpected keyword argument` for newly-added fields:
+**Cross-package staleness — handled by `make build` / `make test*`.** When `qiita-common`, `qiita-control-plane`, or `qiita-compute-orchestrator` change, plain `uv sync` in a dependent skips the rebuild because the version string is unchanged, leaving stale sources in `.venv/.../site-packages/<pkg>/` and producing confusing `ImportError`s for newly-added symbols or `TypeError: __init__() got an unexpected keyword argument` for newly-added fields. The `build-*` and `test-*` Makefile targets pass `--reinstall-package` to force a rebuild of the affected path deps in every consuming venv (the three project venvs plus `tests/integration/.venv`).
+
+If you bypass `make` and run `uv` directly after a cross-package change, replicate the flag yourself, e.g.:
 ```bash
 cd qiita-control-plane && uv sync --reinstall-package qiita-common
-cd qiita-compute-orchestrator && uv sync --reinstall-package qiita-common
-# tests/integration has its own venv that path-installs all three packages —
-# reinstall all three after any cross-package merge:
-cd tests/integration && uv sync \
-  --reinstall-package qiita-common \
-  --reinstall-package qiita-control-plane \
-  --reinstall-package qiita-compute-orchestrator
 ```
 
 ## Development ethos

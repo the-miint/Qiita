@@ -1,5 +1,5 @@
 .PHONY: build test test-python test-rust test-integration test-workflows lint lint-python lint-rust deploy migrate sync-actions clean verify-health dev-setup install-hooks
-.PHONY: build-common build-control-plane build-data-plane build-data-plane-debug build-compute-orchestrator build-workflows
+.PHONY: build-common build-control-plane build-data-plane build-data-plane-debug build-compute-orchestrator build-integration build-workflows
 .PHONY: test-common test-control-plane-without-db test-control-plane-with-db test-data-plane test-compute-orchestrator
 .PHONY: lint-common lint-control-plane lint-data-plane lint-compute-orchestrator
 
@@ -31,13 +31,17 @@ DBMATE_BIN  := $(LOCAL_BIN)/dbmate
 GRPCURL_BIN := $(LOCAL_BIN)/grpcurl
 
 # Build all components
-build: build-common build-control-plane build-data-plane build-compute-orchestrator build-workflows
+build: build-common build-control-plane build-data-plane build-compute-orchestrator build-integration build-workflows
 
 build-common:
 	cd qiita-common && uv sync
 
+# --reinstall-package qiita-common forces uv to rebuild the path-installed
+# copy of qiita-common. Plain `uv sync` short-circuits when the dep's version
+# string is unchanged, leaving a stale copy in .venv/.../site-packages/ that
+# produces confusing ImportErrors for newly-added symbols.
 build-control-plane:
-	cd qiita-control-plane && uv sync
+	cd qiita-control-plane && uv sync --reinstall-package qiita-common
 
 build-data-plane:
 	cd qiita-data-plane && cargo build --release --features duckdb/bundled
@@ -48,7 +52,16 @@ build-data-plane-debug:
 	cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo build
 
 build-compute-orchestrator:
-	cd qiita-compute-orchestrator && uv sync
+	cd qiita-compute-orchestrator && uv sync --reinstall-package qiita-common
+
+# tests/integration has its own venv that path-installs all three Python
+# packages, so all three need --reinstall-package to avoid the same stale-
+# source short-circuit described above.
+build-integration:
+	cd tests/integration && uv sync \
+	  --reinstall-package qiita-common \
+	  --reinstall-package qiita-control-plane \
+	  --reinstall-package qiita-compute-orchestrator
 
 build-workflows:
 	@if ! command -v apptainer > /dev/null 2>&1; then \
@@ -85,20 +98,20 @@ test-python: test-common test-control-plane-without-db test-compute-orchestrator
 
 test-rust: test-data-plane
 
-test-common:
+test-common: build-common
 	cd qiita-common && uv run pytest
 
 # Run only the control-plane tests that do not need a database. The DB-bound
 # tests carry the `db` marker (set at module level via
 # `pytestmark = pytest.mark.db`) and are excluded here; run them via
 # `make test-control-plane-with-db`.
-test-control-plane-without-db:
+test-control-plane-without-db: build-control-plane
 	cd qiita-control-plane && uv run pytest -m 'not db'
 
 # Run the full control-plane suite, including DB-bound tests. Brings up
 # Postgres + applies dbmate migrations; tears down on exit. Set
 # QIITA_USE_HOST_POSTGRES=1 to skip Docker bring-up and use a host Postgres.
-test-control-plane-with-db: $(DBMATE_BIN)
+test-control-plane-with-db: build-control-plane $(DBMATE_BIN)
 	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
 	  ((cd qiita-control-plane && uv run pytest); PY_EC=$$?; \
 	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
@@ -107,7 +120,7 @@ test-control-plane-with-db: $(DBMATE_BIN)
 test-data-plane:
 	cd qiita-data-plane && DUCKDB_DOWNLOAD_LIB=1 cargo test
 
-test-compute-orchestrator:
+test-compute-orchestrator: build-compute-orchestrator
 	cd qiita-compute-orchestrator && uv run pytest
 
 # Smoke-test workflow containers (requires apptainer; skips gracefully if absent)
@@ -133,7 +146,7 @@ test-workflows:
 # use different DATA_PATH values (Python picks a pytest tmp_path_factory dir,
 # Rust defaults to /tmp/qiita-integration-ducklake-data). Mirrors the Python
 # _reset_ducklake_catalog() helper in tests/integration/conftest.py.
-test-integration: build-data-plane-debug $(DBMATE_BIN)
+test-integration: build-data-plane-debug build-integration $(DBMATE_BIN)
 	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
 	  ((cd tests/integration && uv run pytest -m 'not system'); PY_EC=$$?; \
 	   (cd $(PG_COMPOSE_DIR) && $(PG_PSQL) -d postgres \
@@ -156,7 +169,7 @@ test-integration: build-data-plane-debug $(DBMATE_BIN)
 # for the expected file paths under localdocs/scratch/.
 #
 # Slow (~10 min): hashes 331K sequences, mints features, writes chunked Parquet.
-test-system: build-data-plane-debug
+test-system: build-data-plane-debug build-integration
 	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
 	  ((cd tests/integration && uv run pytest -m system -x --timeout=2700); PY_EC=$$?; \
 	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
