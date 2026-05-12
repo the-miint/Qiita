@@ -6,7 +6,7 @@
 --
 -- Closed set of value kinds a field may carry. The members map 1:1 to the
 -- value_* columns on the EAV metadata tables (biosample_metadata,
--- sequenced_sample_metadata): a field declared as a given data_type must have
+-- prep_sample_metadata): a field declared as a given data_type must have
 -- its value written into the matching value_* column. Adding a new member is
 -- a coordinated schema change (new value_* column on every metadata table,
 -- new arm in the trigger that checks the match), not a per-row decision.

@@ -40,13 +40,13 @@ class ReferenceStatus(StrEnum):
 
 
 class FieldDataType(StrEnum):
-    """Closed set of value kinds a biosample/sequenced_sample field may carry.
+    """Closed set of value kinds a biosample/prep_sample field may carry.
 
     Mirrors the Postgres `qiita.field_data_type` enum. Members map 1:1 to the
     value_* columns on the EAV metadata tables: a field with this data_type
     must have its value written into the matching value_* column. The match
     is enforced at write time by the biosample_metadata_apply_field_contract
-    trigger (and its sequenced-sample twin).
+    trigger (and its prep-sample twin).
     """
 
     TEXT = "text"

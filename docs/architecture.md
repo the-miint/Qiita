@@ -716,7 +716,7 @@ Retention:
 
 Same-FS constraint: the SLURM job's final-step output directory and DuckLake `DATA_PATH` must live on the same filesystem — the data plane moves files via atomic rename, falling back to copy+delete only on cross-filesystem moves (a slow path that bypasses the rename's atomicity guarantee). The final-step output therefore lives on `$QIITA_DATA_ROOT/` even when intermediate map/reduce outputs use `/scratch/ephemeral/staging/`.
 
-No hive partitioning: a sequenced sample can be associated with multiple studies, so the on-disk layout is keyed by logical table only — never by `study_idx`. DuckLake's catalog is the sole index over file contents.
+No hive partitioning: a prep sample can be associated with multiple studies, so the on-disk layout is keyed by logical table only — never by `study_idx`. DuckLake's catalog is the sole index over file contents.
 
 ## Ticket Signing
 
