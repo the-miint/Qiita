@@ -34,6 +34,17 @@ from qiita_common.models import StepBaselineResources
 class ComputeBackend(ABC):
     """Abstract base for compute backends (local, SLURM, etc.)."""
 
+    async def aclose(self) -> None:
+        """Release any resources the backend holds (HTTP clients,
+        connection pools, etc.). Called by the FastAPI lifespan
+        teardown.
+
+        Default implementation is a no-op so backends without
+        long-lived resources (LocalBackend) inherit the right
+        behavior without writing an empty override. Backends with
+        resources (SlurmBackend's httpx client) override this.
+        """
+
     @abstractmethod
     async def run_step(
         self,

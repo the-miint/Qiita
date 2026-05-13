@@ -88,6 +88,11 @@ class SlurmBackend(ComputeBackend):
         self._poll_interval = poll_interval_seconds
         self._job_timeout = job_timeout_seconds
 
+    async def aclose(self) -> None:
+        """Close the underlying httpx client so asyncio doesn't warn
+        about an unclosed transport on shutdown."""
+        await self._client.close()
+
     async def run_step(
         self,
         name: str,

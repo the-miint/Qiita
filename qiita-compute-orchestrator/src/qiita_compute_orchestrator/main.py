@@ -53,11 +53,9 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        # SlurmBackend owns an httpx client; close it on shutdown so
-        # asyncio doesn't warn about an unclosed transport.
-        backend = app.state.backend
-        if isinstance(backend, SlurmBackend):
-            await backend._client.close()  # noqa: SLF001 — module-private close
+        # Backends own their own resources; aclose() is a no-op for
+        # LocalBackend and closes the httpx client for SlurmBackend.
+        await app.state.backend.aclose()
 
 
 app = FastAPI(title="qiita-compute-orchestrator", lifespan=lifespan)
