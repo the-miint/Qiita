@@ -165,6 +165,24 @@ def test_scan_native_jobs_rejects_module_with_missing_execute(fake_jobs_pkg):
     assert "missing `Inputs`" not in msg  # Inputs is present
 
 
+def test_scan_native_jobs_reports_non_importerror_at_import_time(fake_jobs_pkg):
+    """A job whose module body raises something other than ImportError
+    at import time (RuntimeError, Pydantic model-construction failure,
+    a SyntaxError before parsing — anything) is reported as a contract
+    violation just like a missing-symbol case. Boot scan refuses to
+    start with any broken module, not just ones that fail with the
+    narrowest exception type."""
+    pkg_path, prefix, add_module = fake_jobs_pkg
+    add_module("explodes_at_import", "raise RuntimeError('exploded during import')\n")
+
+    with pytest.raises(RuntimeError) as ei:
+        scan_native_jobs(package_path=pkg_path, prefix=prefix)
+    msg = str(ei.value)
+    assert "explodes_at_import" in msg
+    assert "RuntimeError" in msg
+    assert "exploded during import" in msg
+
+
 def test_scan_native_jobs_succeeds_on_synthetic_well_formed_module(fake_jobs_pkg):
     """Positive control for the synthetic-package path: a well-formed
     stub passes the scan via the same kwargs the negative tests use."""

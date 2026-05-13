@@ -10,6 +10,7 @@ from qiita_common.models import WorkTicketFailureStage
 from qiita_common.parquet import validate_parquet_path
 
 from ..backend import ComputeBackend
+from ..jobs import run_native_job
 
 # miint is installed once per process to avoid a network call on every hash job.
 _miint_install_lock = asyncio.Lock()
@@ -92,8 +93,6 @@ class LocalBackend(ComputeBackend):
             # shape matches what the SLURM launcher hands to the same
             # dispatcher — a job module sees identical raw_inputs
             # regardless of runtime.
-            from ..jobs import run_native_job
-
             raw_inputs: dict[str, object] = {
                 **{k: str(v) for k, v in inputs.items()},
                 "reference_idx": reference_idx,

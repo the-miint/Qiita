@@ -76,10 +76,14 @@ async def run_native_job(
 
     try:
         mod = importlib.import_module(module_name)
-    except ImportError as exc:
+    except Exception as exc:
+        # Anything raised during import (SyntaxError, NameError,
+        # Pydantic model-construction failure, ...) is a job-tree
+        # contract violation. Catch broadly here; the scope is the
+        # import call only so dispatcher bugs below still surface.
         raise _contract_violation(
             module_name=module_name,
-            reason=f"failed to import native job module: {exc}",
+            reason=f"failed to import native job module: {type(exc).__name__}: {exc}",
         ) from exc
 
     Inputs = getattr(mod, "Inputs", None)
@@ -200,8 +204,11 @@ def scan_native_jobs(
             continue
         try:
             mod = importlib.import_module(modname)
-        except ImportError as exc:
-            errors.append(f"  {modname}: failed to import — {exc}")
+        except Exception as exc:
+            # Same widening rationale as run_native_job's import catch:
+            # any exception during a job-module import is a contract
+            # violation, not just ImportError.
+            errors.append(f"  {modname}: failed to import — {type(exc).__name__}: {exc}")
             continue
         mod_errors = _validate_native_job_module(mod)
         if mod_errors:

@@ -106,12 +106,17 @@ class SlurmBackend(ComputeBackend):
         entrypoint: str | None = None,
         baseline_resources: StepBaselineResources | None = None,
     ) -> dict[str, Path]:
-        if container is None and module is None:
+        if (container is None) == (module is None):
+            # Both None (neither runtime declared) and both set (ambiguous
+            # runtime) are contract violations. The wire validator on
+            # StepRunRequest catches this upstream; this guard protects
+            # direct callers (tests, programmatic submission) and keeps
+            # the failure shape identical for either flavor.
             raise BackendFailure(
                 kind=FailureKind.CONTRACT_VIOLATION,
                 stage=WorkTicketFailureStage.STEP_RUN,
                 step_name=name,
-                reason="SlurmBackend requires `container` or `module` on the step",
+                reason="SlurmBackend requires exactly one of `container` or `module` on the step",
             )
         if baseline_resources is None:
             raise BackendFailure(

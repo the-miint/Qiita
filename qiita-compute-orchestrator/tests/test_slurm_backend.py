@@ -129,7 +129,31 @@ async def test_run_step_requires_container_or_module(jwt_path, baseline, tmp_pat
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
-    assert "container" in ei.value.reason and "module" in ei.value.reason
+    assert "exactly one" in ei.value.reason
+
+
+@pytest.mark.asyncio
+async def test_run_step_rejects_both_container_and_module(jwt_path, baseline, tmp_path):
+    """Both set is a contract violation too — must surface as a typed
+    BackendFailure, not as a raw ValueError leaking out of the payload
+    builder. Both this case and the "neither set" case above ride the
+    same `exactly-one` guard."""
+    handler = httpx.MockTransport(lambda req: httpx.Response(500))
+    backend = _make_backend(handler, jwt_path)
+    with pytest.raises(BackendFailure) as ei:
+        await backend.run_step(
+            "hash",
+            {},
+            tmp_path,
+            reference_idx=1,
+            work_ticket_idx=99,
+            container="qiita/hash:1.0.0",
+            module="qiita_compute_orchestrator.jobs.fastq_to_parquet",
+            entrypoint=None,
+            baseline_resources=baseline,
+        )
+    assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
+    assert "exactly one" in ei.value.reason
 
 
 @pytest.mark.asyncio

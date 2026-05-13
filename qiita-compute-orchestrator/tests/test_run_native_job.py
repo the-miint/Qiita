@@ -85,6 +85,29 @@ async def test_unimportable_module_raises_contract_violation():
     assert "failed to import" in ei.value.reason
 
 
+async def test_non_importerror_at_import_time_maps_to_contract_violation(monkeypatch):
+    """A job module that raises something other than ImportError at
+    import time (SyntaxError, NameError, Pydantic model-construction
+    failures, etc.) must still surface as CONTRACT_VIOLATION rather
+    than leaking a raw traceback past the runner's classifier."""
+    import importlib as _importlib
+
+    def explode(name):
+        raise SyntaxError("simulated module-body parse error")
+
+    monkeypatch.setattr(_importlib, "import_module", explode)
+
+    with pytest.raises(BackendFailure) as ei:
+        await run_native_job(
+            "qiita_compute_orchestrator.jobs.broken",
+            {},
+            Path("/"),
+        )
+    assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
+    assert "SyntaxError" in ei.value.reason
+    assert "simulated module-body parse error" in ei.value.reason
+
+
 async def test_missing_execute_raises_contract_violation(monkeypatch):
     name = _install_stub(monkeypatch, short_name="no_execute", inputs_cls=_Inputs, execute_fn=None)
     with pytest.raises(BackendFailure) as ei:
