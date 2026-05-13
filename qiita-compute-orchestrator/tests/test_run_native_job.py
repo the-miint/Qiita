@@ -109,11 +109,16 @@ async def test_non_importerror_at_import_time_maps_to_contract_violation(monkeyp
 
 
 async def test_missing_execute_raises_contract_violation(monkeypatch):
+    """Dispatcher reports specifically WHICH export is missing (not a
+    generic 'must export Inputs and execute'). Matches the boot scan's
+    granularity — both layers go through _validate_native_job_module."""
     name = _install_stub(monkeypatch, short_name="no_execute", inputs_cls=_Inputs, execute_fn=None)
     with pytest.raises(BackendFailure) as ei:
         await run_native_job(name, {"x": 1}, Path("/"))
     assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
-    assert "must export" in ei.value.reason
+    assert "missing `execute`" in ei.value.reason
+    # Should NOT mention the export that's present.
+    assert "missing `Inputs`" not in ei.value.reason
 
 
 async def test_missing_inputs_raises_contract_violation(monkeypatch):
@@ -124,7 +129,8 @@ async def test_missing_inputs_raises_contract_violation(monkeypatch):
     with pytest.raises(BackendFailure) as ei:
         await run_native_job(name, {}, Path("/"))
     assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
-    assert "must export" in ei.value.reason
+    assert "missing `Inputs`" in ei.value.reason
+    assert "missing `execute`" not in ei.value.reason
 
 
 async def test_inputs_not_basemodel_raises_contract_violation(monkeypatch):

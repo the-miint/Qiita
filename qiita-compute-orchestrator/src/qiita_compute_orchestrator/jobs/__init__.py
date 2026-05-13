@@ -117,20 +117,19 @@ async def run_native_job(
             reason=f"failed to import native job module: {type(exc).__name__}: {exc}",
         ) from exc
 
-    Inputs = getattr(mod, "Inputs", None)
-    execute = getattr(mod, "execute", None)
-    if Inputs is None or execute is None:
+    mod_errors = _validate_native_job_module(mod)
+    if mod_errors:
+        # Delegate to the same validator the boot scan uses so the
+        # dispatcher and the lifespan scan disagree on nothing — the
+        # operator sees the exact same message no matter which layer
+        # surfaces the violation.
         raise _contract_violation(
             module_name=module_name,
-            reason=(
-                f"native job {module_name!r} must export `Inputs` (BaseModel) and `execute` (async)"
-            ),
+            reason=f"native job {module_name!r}: {'; '.join(mod_errors)}",
         )
-    if not (isinstance(Inputs, type) and issubclass(Inputs, BaseModel)):
-        raise _contract_violation(
-            module_name=module_name,
-            reason=f"native job {module_name!r}: `Inputs` must be a BaseModel subclass",
-        )
+    # Validator guarantees both exports exist with the right shapes.
+    Inputs = mod.Inputs
+    execute = mod.execute
 
     try:
         inputs = Inputs.model_validate(raw_inputs)
