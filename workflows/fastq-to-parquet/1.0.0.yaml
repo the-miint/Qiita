@@ -1,0 +1,40 @@
+action_id: fastq-to-parquet
+version: 1.0.0
+target_kind: reference
+
+description: >
+  Skeleton workflow that exercises the native-step dispatch path.
+  The step's job module
+  (qiita_compute_orchestrator.jobs.fastq_to_parquet) currently raises
+  NotImplementedError; this YAML wires the native runtime into the
+  action registry so submissions can be tested end-to-end. When the
+  conversion is implemented, this workflow's step list and
+  context_schema will expand to match.
+
+scopes: []
+
+audience:
+  service: false
+  human_roles: [user, wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  required: [fastq_path]
+  properties:
+    fastq_path: {type: string}
+
+steps:
+  - step: fastq
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.fastq_to_parquet
+    inputs: [fastq_path]
+    outputs: []
+    baseline_resources:
+      cpu: 2
+      mem_gb: 4
+      walltime: PT30M
+
+action_ceiling:
+  cpu: 8
+  mem_gb: 16
+  walltime: PT2H
