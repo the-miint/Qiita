@@ -26,10 +26,20 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Defensive: lint needs both. dtolnay defaults already include
+          # them, but pinning the request makes the intent explicit so a
+          # future default change can't silently drop one.
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: qiita-data-plane
           prefix-key: "v1"  # bump to invalidate stale bundled-feature cache
+          # macOS preinstalls a `cargo` shim that is actually rustup-init,
+          # and ~/.cargo/bin/ isn't first on PATH. Caching that directory
+          # can shadow the toolchain dtolnay just installed and break
+          # `cargo clippy` on cache restore. Disable bin caching here.
+          cache-bin: false
       - uses: ./.github/actions/setup-libduckdb
       - run: make lint-rust
 
@@ -88,10 +98,13 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: qiita-data-plane
           prefix-key: "v1"  # bump to invalidate stale bundled-feature cache
+          cache-bin: false  # see lint-rust for rationale
       - uses: ./.github/actions/setup-libduckdb
         with:
           runtime-libpath: "true"
