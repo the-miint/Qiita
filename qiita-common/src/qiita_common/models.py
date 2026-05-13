@@ -131,11 +131,11 @@ class StepRunRequest(BaseModel):
     `run_step`. Paths are absolute and live on the workspace shared
     between control plane and orchestrator.
 
-    `container`, `entrypoint`, and `baseline_resources` come from the
-    YAML step's static metadata. They are optional on the wire so
-    LocalBackend (which dispatches on step_name and uses internal
-    helpers) can be invoked without populating them; SlurmBackend
-    requires them and refuses the request when they're absent.
+    Runtime is selected by which of `container` or `module` is set —
+    exactly one must be present, enforced by the @model_validator below.
+    The container form drives both backends' container path; the module
+    form drives both backends' native-job path
+    (`qiita_compute_orchestrator.jobs.<name>` exporting `Inputs` + `execute`).
 
     `work_ticket_idx` flows through so SlurmBackend can stamp the SLURM
     job name with the originating ticket id — making scheduler dumps
@@ -148,8 +148,23 @@ class StepRunRequest(BaseModel):
     reference_idx: Annotated[int, Field(gt=0)]
     work_ticket_idx: Annotated[int, Field(gt=0)]
     container: str | None = Field(default=None, max_length=512)
+    module: str | None = Field(default=None, max_length=512)
     entrypoint: str | None = None
     baseline_resources: StepBaselineResources | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_runtime(self) -> StepRunRequest:
+        # Mirrors WorkflowStep's exactly-one rule at the wire boundary.
+        # Pydantic raises a 422 at FastAPI deserialization, before any
+        # backend code runs — single enforcement point, no per-backend
+        # drift risk.
+        has_container = self.container is not None
+        has_module = self.module is not None
+        if has_container == has_module:
+            raise ValueError("StepRunRequest must declare exactly one of 'container' or 'module'")
+        if self.entrypoint is not None and not has_container:
+            raise ValueError("'entrypoint' requires 'container'")
+        return self
 
 
 class StepRunResponse(BaseModel):

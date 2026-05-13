@@ -102,6 +102,9 @@ async def test_run_step_posts_to_step_run_endpoint(tmp_path):
         workspace=Path("/workspace"),
         reference_idx=42,
         work_ticket_idx=99,
+        # container is required by the StepRunRequest exactly-one(container, module)
+        # validator. The test exercises the wire shape; either runtime works.
+        container="qiita/reference-hash:1.0.0",
     )
 
     assert len(captured) == 1
@@ -167,6 +170,7 @@ async def test_run_step_reconstructs_backend_failure(tmp_path):
             workspace=Path("/workspace"),
             reference_idx=1,
             work_ticket_idx=1,
+            container="qiita/reference-load:1.0.0",
         )
     exc = ei.value
     assert exc.kind is FailureKind.OOM_KILLED
@@ -205,4 +209,5 @@ async def test_run_step_without_header_falls_through_to_raise_for_status(tmp_pat
             workspace=Path("/workspace"),
             reference_idx=1,
             work_ticket_idx=1,
+            container="qiita/test:1.0.0",
         )

@@ -587,6 +587,7 @@ async def _dispatch_step(
         reference_idx=scope_target["reference_idx"],
         work_ticket_idx=work_ticket_idx,
         container=entry.container,
+        module=entry.module,
         entrypoint=entry.entrypoint,
         baseline_resources=baseline,
     )

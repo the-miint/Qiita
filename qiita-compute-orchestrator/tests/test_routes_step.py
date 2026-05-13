@@ -105,6 +105,10 @@ def test_step_run_dispatches_to_backend(http_client, cp_to_co_token, tmp_path):
             "workspace": str(tmp_path),
             "reference_idx": 7,
             "work_ticket_idx": 99,
+            # Required by StepRunRequest's exactly-one(container, module)
+            # validator. The route test doesn't care which runtime drives
+            # the recording backend; container is the simpler choice.
+            "container": "qiita/reference-hash:1.0.0",
         },
     )
     assert resp.status_code == 200, resp.text
@@ -128,8 +132,7 @@ def test_step_run_dispatches_to_backend(http_client, cp_to_co_token, tmp_path):
     assert workspace == tmp_path
     assert reference_idx == 7
     assert work_ticket_idx == 99
-    # Old call sites omit container metadata; protocol defaults to None.
-    assert container is None
+    assert container == "qiita/reference-hash:1.0.0"
     assert entrypoint is None
     assert baseline is None
 
@@ -151,6 +154,7 @@ def test_step_run_translates_backend_value_error(http_client, cp_to_co_token, tm
             "workspace": str(tmp_path),
             "reference_idx": 1,
             "work_ticket_idx": 1,
+            "container": "qiita/test:1.0.0",
         },
     )
     assert resp.status_code == 422
@@ -194,6 +198,7 @@ def test_step_run_serializes_backend_failure(http_client, cp_to_co_token, tmp_pa
             "workspace": str(tmp_path),
             "reference_idx": 1,
             "work_ticket_idx": 1,
+            "container": "qiita/reference-hash:1.0.0",
         },
     )
     assert resp.status_code == BACKEND_FAILURE_HTTP_STATUS

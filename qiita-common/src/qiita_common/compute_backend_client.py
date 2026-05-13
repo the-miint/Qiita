@@ -96,17 +96,17 @@ class ComputeBackendClient:
         reference_idx: int,
         work_ticket_idx: int,
         container: str | None = None,
+        module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources: StepBaselineResources | None = None,
     ) -> dict[str, Path]:
         """Dispatch one step to the orchestrator. Blocks until the
         backend returns. Returns the step's named output paths.
 
-        `container`, `entrypoint`, and `baseline_resources` are required
-        by SlurmBackend but ignored by LocalBackend; the runner
-        populates them from the YAML's WorkflowStep entry. They're
-        optional on the wire so older callers (and tests using the
-        in-process LocalComputeBackendClient shim) keep working."""
+        Callers must pass exactly one of `container` or `module` — the
+        StepRunRequest validator rejects both/neither at construction
+        time, so any caller misuse surfaces as a Pydantic ValidationError
+        here rather than as a confusing 422 at the orchestrator."""
         body = StepRunRequest(
             step_name=step_name,
             inputs={k: str(v) for k, v in inputs.items()},
@@ -114,6 +114,7 @@ class ComputeBackendClient:
             reference_idx=reference_idx,
             work_ticket_idx=work_ticket_idx,
             container=container,
+            module=module,
             entrypoint=entrypoint,
             baseline_resources=baseline_resources,
         )

@@ -157,3 +157,81 @@ def test_feature_hash_entry_rejects_id_without_source():
             sequence_hash=UUID("a0000000-0000-0000-0000-000000000001"),
             genome_source_id="GCF_123",
         )
+
+
+# --- StepRunRequest runtime-selection validator ---------------------------
+# Mirrors WorkflowStep's exactly-one(container, module) rule at the wire
+# boundary. Pydantic raises a 422 at FastAPI deserialization, before any
+# backend code runs — single enforcement point, no per-backend drift risk.
+
+
+def _minimal_step_run_kwargs() -> dict:
+    """Smallest valid kwargs for StepRunRequest — container form."""
+    return dict(
+        step_name="hash",
+        inputs={"fasta_path": "/data/in.fa"},
+        workspace="/workspace",
+        reference_idx=1,
+        work_ticket_idx=1,
+        container="qiita/reference-hash:1.0.0",
+    )
+
+
+def test_step_run_request_container_form_validates():
+    from qiita_common.models import StepRunRequest
+
+    req = StepRunRequest(**_minimal_step_run_kwargs())
+    assert req.container == "qiita/reference-hash:1.0.0"
+    assert req.module is None
+
+
+def test_step_run_request_module_form_validates():
+    from qiita_common.models import StepRunRequest
+
+    kwargs = _minimal_step_run_kwargs()
+    del kwargs["container"]
+    kwargs["module"] = "qiita_compute_orchestrator.jobs.fastq_to_parquet"
+    req = StepRunRequest(**kwargs)
+    assert req.module == "qiita_compute_orchestrator.jobs.fastq_to_parquet"
+    assert req.container is None
+
+
+def test_step_run_request_rejects_both_container_and_module():
+    from qiita_common.models import StepRunRequest
+
+    kwargs = _minimal_step_run_kwargs()
+    kwargs["module"] = "qiita_compute_orchestrator.jobs.x"
+    with pytest.raises(ValidationError) as exc_info:
+        StepRunRequest(**kwargs)
+    assert "exactly one" in str(exc_info.value)
+
+
+def test_step_run_request_rejects_neither_container_nor_module():
+    from qiita_common.models import StepRunRequest
+
+    kwargs = _minimal_step_run_kwargs()
+    del kwargs["container"]
+    with pytest.raises(ValidationError) as exc_info:
+        StepRunRequest(**kwargs)
+    assert "exactly one" in str(exc_info.value)
+
+
+def test_step_run_request_rejects_entrypoint_without_container():
+    from qiita_common.models import StepRunRequest
+
+    kwargs = _minimal_step_run_kwargs()
+    del kwargs["container"]
+    kwargs["module"] = "qiita_compute_orchestrator.jobs.x"
+    kwargs["entrypoint"] = "/bin/sh"
+    with pytest.raises(ValidationError) as exc_info:
+        StepRunRequest(**kwargs)
+    assert "entrypoint" in str(exc_info.value).lower()
+
+
+def test_step_run_request_entrypoint_with_container_ok():
+    from qiita_common.models import StepRunRequest
+
+    kwargs = _minimal_step_run_kwargs()
+    kwargs["entrypoint"] = "/usr/local/bin/qiita-hash"
+    req = StepRunRequest(**kwargs)
+    assert req.entrypoint == "/usr/local/bin/qiita-hash"

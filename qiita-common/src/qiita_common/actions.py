@@ -36,6 +36,11 @@ from qiita_common.auth_constants import (
 )
 from qiita_common.models import ScopeTargetKind, StepType
 
+# Native job modules must live under qiita_compute_orchestrator.jobs.
+# Sync (CP), boot scan (CO), wire (StepRunRequest), and submit (CO route)
+# all check this prefix. Defined here so every layer imports the same value.
+NATIVE_MODULE_PREFIX = "qiita_compute_orchestrator.jobs."
+
 
 class Audience(BaseModel):
     """Who may invoke this action — answers "may invoke", not "may execute".
@@ -79,7 +84,20 @@ class ActionCeiling(BaselineResources):
 
 
 class WorkflowStep(BaseModel):
-    """SLURM-dispatched containerized step.
+    """SLURM-dispatched workflow step. Runs in one of two runtimes, selected
+    by which field is set — exactly one of `container` or `module` must be
+    populated.
+
+    - `container` form: the step's image is executed via apptainer (or
+      in-process via LocalBackend in dev/test). `entrypoint` may override
+      the container's default ENTRYPOINT.
+    - `module` form (native step): the named Python module lives under
+      `qiita_compute_orchestrator.jobs.*` and runs in the orchestrator's
+      Python environment — either in-process via LocalBackend or under
+      SLURM via `srun python -m qiita_compute_orchestrator.jobs --job <name>`.
+      Use this only when the job's dependencies are already in
+      `qiita-compute-orchestrator`'s `pyproject.toml`; anything heavier
+      (extra bioinformatics deps, system packages) belongs in a container.
 
     `step_type` ∈ {map, reduce, singleton}: map runs once per sample, reduce
     runs once over the union of map outputs, singleton runs once per workflow
@@ -94,7 +112,8 @@ class WorkflowStep(BaseModel):
     kind: Literal["step"]
     name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     step_type: StepType
-    container: str = Field(min_length=1, max_length=512)
+    container: str | None = Field(default=None, min_length=1, max_length=512)
+    module: str | None = Field(default=None, min_length=1, max_length=512)
     entrypoint: str | None = None
     inputs: list[str] = Field(default_factory=list)
     # Names that flow through from action_context if present, but do not
@@ -104,6 +123,20 @@ class WorkflowStep(BaseModel):
     outputs: list[str] = Field(default_factory=list)
     baseline_resources: BaselineResources
     target_status: str | None = Field(default=None, min_length=1, max_length=MAX_NAME_LENGTH)
+
+    @model_validator(mode="after")
+    def _exactly_one_runtime(self) -> WorkflowStep:
+        # Exactly-one(container, module). The prefix check on `module`
+        # lives at the use sites (CP sync, CO boot scan, CO route handler)
+        # so this validator stays shape-only and doesn't couple the schema
+        # to the orchestrator package path.
+        has_container = self.container is not None
+        has_module = self.module is not None
+        if has_container == has_module:
+            raise ValueError("WorkflowStep must declare exactly one of 'container' or 'module'")
+        if self.entrypoint is not None and not has_container:
+            raise ValueError("'entrypoint' requires 'container'")
+        return self
 
 
 class WorkflowAction(BaseModel):
