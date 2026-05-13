@@ -45,6 +45,37 @@ def _contract_violation(*, module_name: str, reason: str) -> BackendFailure:
     )
 
 
+# Framework scalars that get merged into raw_inputs before
+# `Inputs.model_validate`. A step `inputs:` entry sharing one of these
+# names would silently shadow the work-ticket value; `_flatten_native_inputs`
+# rejects the collision so LocalBackend and the SLURM launcher behave
+# the same way.
+_RESERVED_KEYS = frozenset({"reference_idx", "work_ticket_idx"})
+
+
+def _flatten_native_inputs(
+    module_name: str,
+    inputs: dict[str, Any],
+    *,
+    reference_idx: int,
+    work_ticket_idx: int,
+) -> dict[str, Any]:
+    """Build the `raw_inputs` dict `Inputs.model_validate` consumes.
+
+    Both LocalBackend and the SLURM launcher route through this helper
+    so the reserved-key check fires symmetrically. Raises a typed
+    BackendFailure(CONTRACT_VIOLATION) on collision — the runner sees
+    the same shape regardless of which backend produced the violation.
+    """
+    overlap = sorted(_RESERVED_KEYS & inputs.keys())
+    if overlap:
+        raise _contract_violation(
+            module_name=module_name,
+            reason=f"step `inputs:` cannot use framework-reserved names: {overlap}",
+        )
+    return {**inputs, "reference_idx": reference_idx, "work_ticket_idx": work_ticket_idx}
+
+
 async def run_native_job(
     module_name: str,
     raw_inputs: dict[str, Any],

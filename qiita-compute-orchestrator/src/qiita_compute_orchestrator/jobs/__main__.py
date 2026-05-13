@@ -40,17 +40,10 @@ from qiita_common.actions import NATIVE_MODULE_PREFIX
 from qiita_common.backend_failure import BackendFailure
 
 from ..slurm.contract import EXPECTED_FILE_MODE, MANIFEST_FILENAME
-from . import run_native_job
-
-# Reserved keys in the flattened raw_inputs dict — the framework owns
-# these scalars; a job module's `Inputs` declares them by these names
-# too, so an inputs-map key with the same name would silently shadow
-# the work-ticket value. `_flatten_params` rejects the collision rather
-# than picking a winner.
-_RESERVED_KEYS = frozenset({"reference_idx", "work_ticket_idx"})
+from . import _flatten_native_inputs, run_native_job
 
 
-def _flatten_params(params: dict) -> dict:
+def _flatten_params(module_name: str, params: dict) -> dict:
     """Combine the work-ticket scalars and the step's inputs map into a
     single dict ready for `Inputs.model_validate`.
 
@@ -66,18 +59,17 @@ def _flatten_params(params: dict) -> dict:
     This reader pulls `reference_idx` and `work_ticket_idx` plus every
     entry of `inputs`. Other keys in params.json are ignored.
 
-    Raises ValueError if the `inputs` map uses any reserved key
-    (would otherwise silently override the framework scalar).
+    Delegates the merge + reserved-key check to `_flatten_native_inputs`
+    so the launcher and LocalBackend share one code path. A collision
+    surfaces as BackendFailure(CONTRACT_VIOLATION), which `main()`
+    catches and renders to structured stderr.
     """
-    inputs_map = params.get("inputs", {})
-    overlap = sorted(_RESERVED_KEYS & inputs_map.keys())
-    if overlap:
-        raise ValueError(f"params.json `inputs` cannot use framework-reserved names: {overlap}")
-    return {
-        **inputs_map,
-        "reference_idx": params["reference_idx"],
-        "work_ticket_idx": params["work_ticket_idx"],
-    }
+    return _flatten_native_inputs(
+        module_name,
+        params.get("inputs", {}),
+        reference_idx=params["reference_idx"],
+        work_ticket_idx=params["work_ticket_idx"],
+    )
 
 
 def _collect_files(output_path: Path) -> list[Path]:
@@ -132,12 +124,11 @@ def main(argv: list[str] | None = None) -> int:
 
     input_path = Path(os.environ["QIITA_INPUT_PATH"])
     output_path = Path(os.environ["QIITA_OUTPUT_PATH"])
-
-    params = json.loads((input_path / "params.json").read_text())
-    raw_inputs = _flatten_params(params)
     module_name = f"{NATIVE_MODULE_PREFIX}{args.job}"
 
+    params = json.loads((input_path / "params.json").read_text())
     try:
+        raw_inputs = _flatten_params(module_name, params)
         outputs = asyncio.run(run_native_job(module_name, raw_inputs, output_path))
     except BackendFailure as exc:
         # Structured error line on stderr — the orchestrator-side

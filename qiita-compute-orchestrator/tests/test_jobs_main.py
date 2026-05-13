@@ -131,22 +131,62 @@ def test_flatten_params_merges_scalars_and_inputs():
         "inputs": {"fastq_path": "/data/in.fa"},
         "output_path": "/scratch/out",  # ignored
     }
-    flat = _flatten_params(params)
+    flat = _flatten_params("qiita_compute_orchestrator.jobs.fastq", params)
     assert flat == {"fastq_path": "/data/in.fa", "reference_idx": 7, "work_ticket_idx": 99}
 
 
 def test_flatten_params_rejects_reserved_key_collision():
     """If the workflow YAML's `inputs:` list happens to declare a name
     that matches a framework scalar (e.g. `reference_idx`), the
-    launcher refuses rather than silently shadowing the work-ticket
-    value."""
+    launcher refuses with a typed BackendFailure(CONTRACT_VIOLATION)
+    rather than silently shadowing the work-ticket value.
+
+    Symmetric with LocalBackend's path — both go through the shared
+    `_flatten_native_inputs` helper in jobs/__init__.py."""
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+
     params = {
         "reference_idx": 7,
         "work_ticket_idx": 99,
         "inputs": {"reference_idx": "/data/in.fa"},  # accidental collision
     }
-    with pytest.raises(ValueError, match="reference_idx"):
-        _flatten_params(params)
+    with pytest.raises(BackendFailure) as ei:
+        _flatten_params("qiita_compute_orchestrator.jobs.fastq", params)
+    assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
+    assert "reference_idx" in ei.value.reason
+
+
+def test_main_returns_1_on_reserved_key_collision(monkeypatch, io_dirs, capsys):
+    """End-to-end: a params.json whose `inputs:` map collides with a
+    framework-reserved scalar makes main() exit 1 with a structured
+    CONTRACT_VIOLATION JSON line on stderr. The check fires in
+    `_flatten_params` (delegating to `_flatten_native_inputs`) before
+    run_native_job is reached."""
+    input_path, _ = io_dirs
+
+    async def execute(inputs, workspace):
+        raise RuntimeError("should not reach execute()")
+
+    _install_stub(monkeypatch, short_name="collision", execute_fn=execute)
+    # The inputs map shadows the framework scalar — the helper rejects.
+    (input_path / "params.json").write_text(
+        json.dumps(
+            {
+                "step_name": "fastq",
+                "reference_idx": 1,
+                "work_ticket_idx": 1,
+                "inputs": {"work_ticket_idx": "evil-string"},
+            }
+        )
+    )
+
+    rc = main(["--job", "collision"])
+    assert rc == 1
+
+    captured = capsys.readouterr()
+    err = json.loads(captured.err)
+    assert err["kind"] == "contract_violation"
+    assert "work_ticket_idx" in err["reason"]
 
 
 def test_main_returns_1_and_prints_structured_error_on_backend_failure(

@@ -156,6 +156,34 @@ async def test_rejects_neither_container_nor_module(tmp_path):
     assert "exactly one" in ei.value.reason
 
 
+async def test_rejects_inputs_overlap_with_framework_scalars(monkeypatch, tmp_path):
+    """If the workflow's `inputs:` list collides with a framework
+    scalar (`reference_idx` or `work_ticket_idx`), LocalBackend
+    surfaces it as BackendFailure(CONTRACT_VIOLATION) — symmetric
+    with the SLURM launcher's path through the same
+    `_flatten_native_inputs` helper."""
+
+    async def execute(inputs, workspace):
+        raise RuntimeError("should not reach execute()")
+
+    full = _install_stub(monkeypatch, short_name="collision", execute_fn=execute)
+    backend = LocalBackend()
+
+    with pytest.raises(BackendFailure) as ei:
+        await backend.run_step(
+            "fastq",
+            # The step's input map happens to declare a name that
+            # shadows the framework scalar — the helper rejects.
+            {"reference_idx": tmp_path / "evil.fa"},
+            tmp_path,
+            reference_idx=1,
+            work_ticket_idx=1,
+            module=full,
+        )
+    assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
+    assert "reference_idx" in ei.value.reason
+
+
 async def test_dispatcher_failures_propagate_through_local_backend(monkeypatch, tmp_path):
     """A BackendFailure raised inside run_native_job flows through
     LocalBackend unchanged — LocalBackend doesn't intercept or
