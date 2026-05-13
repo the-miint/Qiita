@@ -25,7 +25,7 @@ from qiita_common.actions import BaselineResources
 from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.models import StepBaselineResources, WorkTicketFailureStage
 
-from ..backend import ComputeBackend
+from ..backend import ComputeBackend, native_dispatch_not_implemented
 from ..slurm import (
     SlurmJobInfo,
     SlurmrestdClient,
@@ -102,17 +102,12 @@ class SlurmBackend(ComputeBackend):
         baseline_resources: StepBaselineResources | None = None,
     ) -> dict[str, Path]:
         if module is not None:
-            # Native-step SLURM payload (srun python -m ...) lands in a
-            # subsequent commit. Fail loudly so a half-wired contract
-            # doesn't silently produce a malformed slurmrestd submission.
-            raise BackendFailure(
-                kind=FailureKind.CONTRACT_VIOLATION,
-                stage=WorkTicketFailureStage.STEP_RUN,
-                step_name=name,
-                reason=(
-                    f"SlurmBackend received module={module!r}; native dispatch "
-                    "is not wired in this commit"
-                ),
+            # SlurmBackend's payload builder is container-only; native
+            # `module:` steps are routed to the shared
+            # `native_dispatch_not_implemented` helper so the reason
+            # string stays in lock-step with LocalBackend.
+            raise native_dispatch_not_implemented(
+                backend_name="SlurmBackend", step_name=name, module=module
             )
         if container is None:
             raise BackendFailure(

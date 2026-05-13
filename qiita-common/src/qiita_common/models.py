@@ -149,10 +149,11 @@ class StepRunRequest(BaseModel):
 
     Runtime is selected by which of `container` or `module` is set —
     exactly one must be present, enforced by the @model_validator below.
-    The container form drives both backends' container path; the module
-    form is for native steps (Python modules under
-    `qiita_compute_orchestrator.jobs.*`); orchestrator-side dispatch
-    lands in subsequent commits.
+    The container form drives the apptainer-exec path on either backend;
+    the module form names a Python module under
+    `qiita_compute_orchestrator.jobs.*`. Whether a particular backend
+    implements native dispatch is a per-backend concern; the wire shape
+    is the same regardless.
 
     `work_ticket_idx` flows through so SlurmBackend can stamp the SLURM
     job name with the originating ticket id — making scheduler dumps

@@ -18,7 +18,11 @@ from qiita_compute_orchestrator.main import app
 
 class _RecordingBackend(ComputeBackend):
     def __init__(self) -> None:
-        self.calls: list[tuple[str, dict, Path, int]] = []
+        # 9-tuple per call: (name, inputs, workspace, reference_idx,
+        # work_ticket_idx, container, module, entrypoint, baseline_resources).
+        # Untyped tuple — keeping the recording shape loose lets new
+        # protocol kwargs land without retyping the annotation.
+        self.calls: list[tuple] = []
 
     async def run_step(
         self,

@@ -37,14 +37,11 @@ from qiita_common.auth_constants import (
 from qiita_common.models import ScopeTargetKind, StepType, check_exactly_one_runtime
 
 # Native job modules must live under qiita_compute_orchestrator.jobs.
-# The string is defined here so every layer can import the same value;
-# enforcement is layered and lands in subsequent commits:
-#   - sync time (CP, actions/sync.py)              [next commit]
-#   - boot time (CO, lifespan jobs/ scan)          [later commit]
-#   - submit time (CO, /step/run route handler)    [later commit]
-#   - dispatch time (run_native_job, framework)    [later commit]
-# The wire validator on StepRunRequest deliberately stays shape-only —
-# the prefix check belongs at the layers that actually import / dispatch.
+# Defined here so every layer that checks the prefix (CP sync, CO boot
+# scan, CO /step/run route, the framework dispatcher) imports a single
+# value rather than re-typing the string. The wire validator on
+# StepRunRequest deliberately stays shape-only — the prefix check
+# belongs at the layers that actually import / dispatch.
 NATIVE_MODULE_PREFIX = "qiita_compute_orchestrator.jobs."
 
 

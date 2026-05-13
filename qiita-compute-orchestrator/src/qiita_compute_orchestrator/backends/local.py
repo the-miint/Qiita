@@ -9,7 +9,7 @@ from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.models import WorkTicketFailureStage
 from qiita_common.parquet import validate_parquet_path
 
-from ..backend import ComputeBackend
+from ..backend import ComputeBackend, native_dispatch_not_implemented
 
 # miint is installed once per process to avoid a network call on every hash job.
 _miint_install_lock = asyncio.Lock()
@@ -73,7 +73,7 @@ class LocalBackend(ComputeBackend):
         reference_idx: int,
         work_ticket_idx: int,  # noqa: ARG002 — accepted for protocol parity
         container: str | None = None,  # noqa: ARG002 — LocalBackend ignores container in dev/test
-        module: str | None = None,
+        module: str | None = None,  # inspected by the native-dispatch guard below
         entrypoint: str | None = None,  # noqa: ARG002 — LocalBackend ignores entrypoint
         baseline_resources=None,  # noqa: ARG002 — accepted for protocol parity
     ) -> dict[str, Path]:
@@ -84,18 +84,12 @@ class LocalBackend(ComputeBackend):
         unit-testable in isolation that way; only the run_step boundary
         wraps."""
         if module is not None:
-            # Native-step dispatch lands in a subsequent commit (will
-            # delegate to qiita_compute_orchestrator.jobs.run_native_job).
-            # Fail loudly until then so a half-wired contract doesn't
-            # masquerade as a different error.
-            raise BackendFailure(
-                kind=FailureKind.CONTRACT_VIOLATION,
-                stage=WorkTicketFailureStage.STEP_RUN,
-                step_name=name,
-                reason=(
-                    f"LocalBackend received module={module!r}; native dispatch "
-                    "is not wired in this commit"
-                ),
+            # LocalBackend's name-dispatch is for container steps; native
+            # `module:` steps are routed to the shared
+            # `native_dispatch_not_implemented` helper so the reason
+            # string stays in lock-step with SlurmBackend.
+            raise native_dispatch_not_implemented(
+                backend_name="LocalBackend", step_name=name, module=module
             )
         try:
             if name == "hash":
