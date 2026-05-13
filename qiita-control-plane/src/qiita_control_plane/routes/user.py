@@ -23,7 +23,7 @@ from ..auth.guards import (
     require_scope,
 )
 from ..auth.principal import HumanUser, Principal
-from ..deps import get_db_pool
+from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
 
 router = APIRouter(prefix="/user", tags=["user"])
 
@@ -39,7 +39,7 @@ _MSG_NO_USER_PROFILE = "Authenticated principal has no user profile"
 @router.post("", status_code=201)
 async def create_user(
     body: UserCreate,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
     actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.ADMIN_USER)),
 ) -> UserResponse:
@@ -48,33 +48,32 @@ async def create_user(
     The new principal's `created_by_idx` points at the requesting admin's
     principal_idx. 409 on email conflict (case-insensitive via CITEXT).
     """
-    try:
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                principal_idx = await insert_principal(
-                    conn,
-                    display_name=body.display_name,
-                    created_by_idx=actor.principal_idx,
-                )
-                user_row = await conn.fetchrow(
-                    "INSERT INTO qiita.user"
-                    "  (principal_idx, email, affiliation, address, phone,"
-                    "   orcid, receive_processing_emails)"
-                    " VALUES ($1, $2, $3, $4, $5, $6, $7)"
-                    f" RETURNING {_USER_RETURNING_COLS}",
-                    principal_idx,
-                    body.email,
-                    body.affiliation,
-                    body.address,
-                    body.phone,
-                    body.orcid,
-                    body.receive_processing_emails,
-                )
-    except asyncpg.UniqueViolationError:
-        raise HTTPException(
-            status_code=409,
-            detail=f"User with email {body.email!r} already exists",
-        )
+    async with tx() as conn:
+        try:
+            principal_idx = await insert_principal(
+                conn,
+                display_name=body.display_name,
+                created_by_idx=actor.principal_idx,
+            )
+            user_row = await conn.fetchrow(
+                "INSERT INTO qiita.user"
+                "  (principal_idx, email, affiliation, address, phone,"
+                "   orcid, receive_processing_emails)"
+                " VALUES ($1, $2, $3, $4, $5, $6, $7)"
+                f" RETURNING {_USER_RETURNING_COLS}",
+                principal_idx,
+                body.email,
+                body.affiliation,
+                body.address,
+                body.phone,
+                body.orcid,
+                body.receive_processing_emails,
+            )
+        except asyncpg.UniqueViolationError:
+            raise HTTPException(
+                status_code=409,
+                detail=f"User with email {body.email!r} already exists",
+            )
     return UserResponse.model_validate(
         {"principal_idx": principal_idx, "display_name": body.display_name, **dict(user_row)}
     )

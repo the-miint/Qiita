@@ -616,3 +616,158 @@ async def test_revoke_all_tokens_revokes_all_active_and_skips_revoked(admin_clie
     )
     revoked_in_audit = [_detail(r)["token_idx"] for r in rows]
     assert set(revoked_in_audit) == {t1, t2}
+
+
+# ---------------------------------------------------------------------------
+# Atomicity: primary write rolls back if audit insert fails
+# ---------------------------------------------------------------------------
+
+
+async def test_patch_principal_disabled_rolls_back_when_audit_fails(
+    admin_client, postgres_pool, monkeypatch, audit_failure, fail_safe_client
+):
+    """If the audit insert fails, the UPDATE that disabled the principal
+    must roll back so disabled=true and audit-missing never both hold."""
+    admin_token, _ = await _admin_token(postgres_pool, admin_client)
+    target = await _seed_human(postgres_pool, email="rollback-disabled@example.com")
+    _track(admin_client, target)
+
+    monkeypatch.setattr("qiita_control_plane.routes.admin.record_event", audit_failure)
+
+    resp = await fail_safe_client.patch(
+        f"/api/v1/admin/principal/{target}/disabled",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"disabled": True, "reason": "test"},
+    )
+
+    state = await postgres_pool.fetchrow(
+        "SELECT disabled, disabled_at, disable_reason FROM qiita.principal WHERE idx = $1",
+        target,
+    )
+    actual = (resp.status_code, dict(state))
+    expected = (500, {"disabled": False, "disabled_at": None, "disable_reason": None})
+    assert actual == expected
+
+
+async def test_patch_principal_retired_rolls_back_when_audit_fails(
+    admin_client, postgres_pool, monkeypatch, audit_failure, fail_safe_client
+):
+    """If the audit insert fails, the UPDATE that retired the principal
+    must roll back."""
+    admin_token, _ = await _admin_token(postgres_pool, admin_client)
+    target = await _seed_human(postgres_pool, email="rollback-retired@example.com")
+    _track(admin_client, target)
+
+    monkeypatch.setattr("qiita_control_plane.routes.admin.record_event", audit_failure)
+
+    resp = await fail_safe_client.patch(
+        f"/api/v1/admin/principal/{target}/retired",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"reason": "test rollback"},
+    )
+
+    state = await postgres_pool.fetchrow(
+        "SELECT retired, retired_at, retire_reason FROM qiita.principal WHERE idx = $1",
+        target,
+    )
+    actual = (resp.status_code, dict(state))
+    expected = (500, {"retired": False, "retired_at": None, "retire_reason": None})
+    assert actual == expected
+
+
+async def test_patch_principal_system_role_rolls_back_when_audit_fails(
+    admin_client, postgres_pool, monkeypatch, audit_failure, fail_safe_client
+):
+    """If the audit insert fails, the UPDATE that changed system_role must
+    roll back so the recorded role and the audit detail never disagree."""
+    admin_token, _ = await _admin_token(postgres_pool, admin_client)
+    target = await _seed_human(postgres_pool, email="rollback-role@example.com")
+    _track(admin_client, target)
+
+    monkeypatch.setattr("qiita_control_plane.routes.admin.record_event", audit_failure)
+
+    resp = await fail_safe_client.patch(
+        f"/api/v1/admin/principal/{target}/system-role",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"system_role": SystemRole.WET_LAB_ADMIN, "reason": "promo"},
+    )
+
+    role = await postgres_pool.fetchval(
+        "SELECT system_role FROM qiita.principal WHERE idx = $1",
+        target,
+    )
+    actual = (resp.status_code, role)
+    expected = (500, SystemRole.USER)
+    assert actual == expected
+
+
+async def test_revoke_all_tokens_rolls_back_when_audit_fails(
+    admin_client, postgres_pool, monkeypatch, audit_failure, fail_safe_client
+):
+    """If the bulk audit insert fails, the token revocations must roll back."""
+    from qiita_control_plane.auth.token import mint_api_token
+
+    admin_token, _ = await _admin_token(postgres_pool, admin_client)
+    target = await _seed_human(postgres_pool, email="rollback-bulk@example.com")
+    _track(admin_client, target)
+    for i in range(2):
+        await mint_api_token(
+            postgres_pool,
+            principal_idx=target,
+            label=f"t{i}",
+            scopes=[Scope.SELF_PROFILE],
+        )
+
+    monkeypatch.setattr("qiita_control_plane.routes.admin.record_event_bulk", audit_failure)
+
+    resp = await fail_safe_client.post(
+        f"/api/v1/admin/principal/{target}/revoke-all-tokens",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+
+    n_active = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.api_token WHERE principal_idx = $1 AND revoked_at IS NULL",
+        target,
+    )
+    actual = (resp.status_code, n_active)
+    expected = (500, 2)
+    assert actual == expected
+
+
+async def test_post_service_account_rolls_back_when_audit_fails(
+    admin_client, postgres_pool, monkeypatch, audit_failure, fail_safe_client
+):
+    """If the audit insert fails, the principal + service_account + api_token
+    writes must all roll back so no orphaned row outlives the failed audit."""
+    admin_token, _ = await _admin_token(postgres_pool, admin_client)
+
+    monkeypatch.setattr("qiita_control_plane.routes.admin.record_event", audit_failure)
+
+    # Attempt create with a unique name so the post-state query can isolate
+    # any row that would survive a broken rollback.
+    resp = await fail_safe_client.post(
+        "/api/v1/admin/service-account",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"name": "rollback-svc", "scopes": [Scope.FEATURE_MINT]},
+    )
+
+    # Count rows across all three tables the route writes into; service_account
+    # and principal are queried by the attempted name, api_token by FK join
+    # back to that principal. All three must be zero if the tx rolled back.
+    state = await postgres_pool.fetchrow(
+        "SELECT"
+        " (SELECT count(*) FROM qiita.principal"
+        "    WHERE display_name = $1) AS principal_count,"
+        " (SELECT count(*) FROM qiita.service_account"
+        "    WHERE name = $1) AS service_account_count,"
+        " (SELECT count(*) FROM qiita.api_token at"
+        "    JOIN qiita.principal p ON p.idx = at.principal_idx"
+        "    WHERE p.display_name = $1) AS api_token_count",
+        "rollback-svc",
+    )
+    actual = (resp.status_code, dict(state))
+    expected = (
+        500,
+        {"principal_count": 0, "service_account_count": 0, "api_token_count": 0},
+    )
+    assert actual == expected

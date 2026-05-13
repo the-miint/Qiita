@@ -1,7 +1,17 @@
 """Shared FastAPI dependencies."""
 
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+
 import asyncpg
 from fastapi import Request
+
+# Type alias for the lazy-transaction factory returned by
+# get_tx_conn_factory. A handler that takes
+# `tx: TxConnFactory = Depends(get_tx_conn_factory)` opens the
+# transaction explicitly with `async with tx() as conn:` instead of
+# at dependency-resolution time.
+TxConnFactory = Callable[[], AbstractAsyncContextManager[asyncpg.Connection]]
 
 
 def get_db_pool(request: Request) -> asyncpg.Pool:
@@ -34,3 +44,29 @@ def get_data_plane_url(request: Request) -> str:
     if settings is None:
         raise RuntimeError("Settings not initialised — lifespan may not have run")
     return settings.data_plane_url
+
+
+def get_tx_conn_factory(request: Request) -> TxConnFactory:
+    """Return a callable that, when invoked, yields a transactional
+    connection context manager. The dep itself acquires nothing — the
+    pool connection and `conn.transaction()` are deferred to the handler's
+    explicit `async with tx() as conn:` block, so any pre-DB validation
+    (JWT verification, freshness checks, scope guards) runs without
+    holding a pool slot.
+
+    Use as the standard write-endpoint dep:
+
+        async def my_handler(tx: TxConnFactory = Depends(get_tx_conn_factory)):
+            # ... pure validation that may 4xx ...
+            async with tx() as conn:
+                # ... atomic DB work ...
+    """
+    pool = get_db_pool(request)
+
+    @asynccontextmanager
+    async def _factory() -> AsyncIterator[asyncpg.Connection]:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                yield conn
+
+    return _factory

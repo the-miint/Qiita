@@ -49,7 +49,7 @@ def _generate_token() -> tuple[str, bytes]:
 
 
 async def mint_api_token(
-    pool: asyncpg.Pool,
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
     principal_idx: int,
     label: str,
@@ -63,6 +63,10 @@ async def mint_api_token(
     raises TokenHashCollision (a RuntimeError subclass) on the
     extraordinarily unlikely event of a token_hash collision — surfaced
     rather than silently shadowing another token.
+
+    `pool_or_conn` accepts either an asyncpg.Pool or a Connection — the
+    same `.fetchval(...)` API works for both, so callers can write inside
+    an existing transaction by passing the connection.
     """
     unknown = set(scopes) - VALID_SCOPES
     if unknown:
@@ -71,7 +75,7 @@ async def mint_api_token(
     plaintext, token_hash = _generate_token()
 
     try:
-        token_idx = await pool.fetchval(
+        token_idx = await pool_or_conn.fetchval(
             "INSERT INTO qiita.api_token"
             "  (principal_idx, token_hash, label, scopes, expires_at)"
             " VALUES ($1, $2, $3, $4, $5)"

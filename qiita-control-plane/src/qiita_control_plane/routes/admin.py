@@ -38,7 +38,7 @@ from ..auth.scopes import (
     validate_scopes_against_ceiling,
 )
 from ..auth.token import mint_api_token
-from ..deps import get_db_pool
+from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -61,7 +61,7 @@ def _decode_detail(raw) -> dict:
 @router.post("/service-account", status_code=201, response_model=ServiceAccountCreateResponse)
 async def create_service_account(
     body: ServiceAccountCreate,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
     actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.ADMIN_SERVICE_ACCOUNT)),
 ) -> ServiceAccountCreateResponse | JSONResponse:
@@ -86,51 +86,51 @@ async def create_service_account(
         datetime.now(UTC) + timedelta(days=body.ttl_days) if body.ttl_days is not None else None
     )
 
-    try:
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                principal_idx = await insert_principal(
-                    conn,
-                    display_name=body.name,
-                    created_by_idx=actor.principal_idx,
-                )
-                await conn.execute(
-                    "INSERT INTO qiita.service_account"
-                    "  (principal_idx, name, description)"
-                    " VALUES ($1, $2, $3)",
-                    principal_idx,
-                    body.name,
-                    body.description,
-                )
-                # mint inside the same transaction for atomicity
-                plaintext, token_idx = await mint_api_token(
-                    conn,
-                    principal_idx=principal_idx,
-                    label=body.label,
-                    scopes=body.scopes,
-                    expires_at=expires_at,
-                )
-                await record_event(
-                    conn,
-                    event_type=AuthEventType.TOKEN_MINT,
-                    principal_idx=principal_idx,
-                    actor_principal_idx=actor.principal_idx,
-                    detail={
-                        "token_idx": token_idx,
-                        "scopes": body.scopes,
-                        "kind": "service_account_initial",
-                    },
-                )
-    except asyncpg.UniqueViolationError as exc:
-        # Dispatch on the constraint name so a future second UNIQUE column
-        # on qiita.service_account doesn't get misattributed to the name.
-        # PostgreSQL auto-names inline UNIQUE constraints `<table>_<col>_key`.
-        if exc.constraint_name == "service_account_name_key":
-            raise HTTPException(
-                status_code=409,
-                detail=f"service account named {body.name!r} already exists",
-            ) from exc
-        raise  # unknown UNIQUE — let FastAPI surface as 500
+    async with tx() as conn:
+        try:
+            principal_idx = await insert_principal(
+                conn,
+                display_name=body.name,
+                created_by_idx=actor.principal_idx,
+            )
+            await conn.execute(
+                "INSERT INTO qiita.service_account"
+                "  (principal_idx, name, description)"
+                " VALUES ($1, $2, $3)",
+                principal_idx,
+                body.name,
+                body.description,
+            )
+            # mint inside the same transaction for atomicity
+            plaintext, token_idx = await mint_api_token(
+                conn,
+                principal_idx=principal_idx,
+                label=body.label,
+                scopes=body.scopes,
+                expires_at=expires_at,
+            )
+            await record_event(
+                conn,
+                event_type=AuthEventType.TOKEN_MINT,
+                principal_idx=principal_idx,
+                actor_principal_idx=actor.principal_idx,
+                detail={
+                    "token_idx": token_idx,
+                    "scopes": body.scopes,
+                    "kind": "service_account_initial",
+                },
+            )
+        except asyncpg.UniqueViolationError as exc:
+            # Dispatch on the constraint name so a future second UNIQUE
+            # column on qiita.service_account doesn't get misattributed to
+            # the name. PostgreSQL auto-names inline UNIQUE constraints
+            # `<table>_<col>_key`.
+            if exc.constraint_name == "service_account_name_key":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"service account named {body.name!r} already exists",
+                ) from exc
+            raise  # unknown UNIQUE — let FastAPI surface as 500
 
     return ServiceAccountCreateResponse(
         principal_idx=principal_idx,
@@ -153,7 +153,7 @@ async def create_service_account(
 async def set_principal_disabled(
     principal_idx: int,
     body: PrincipalDisabledUpdate,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
     actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.ADMIN_USER)),
 ) -> None:
@@ -163,55 +163,59 @@ async def set_principal_disabled(
     if principal_idx == SYSTEM_PRINCIPAL_IDX:
         raise HTTPException(status_code=403, detail="cannot disable system principal")
 
-    if body.disabled:
-        if not body.reason:
-            raise HTTPException(status_code=422, detail="reason is required when disabling")
-        try:
-            result = await pool.execute(
+    if body.disabled and not body.reason:
+        raise HTTPException(status_code=422, detail="reason is required when disabling")
+
+    async with tx() as conn:
+        if body.disabled:
+            try:
+                result = await conn.execute(
+                    "UPDATE qiita.principal SET"
+                    "  disabled = true, disabled_at = now(),"
+                    "  disabled_by_idx = $2, disable_reason = $3"
+                    " WHERE idx = $1 AND disabled = false AND retired = false",
+                    principal_idx,
+                    actor.principal_idx,
+                    body.reason,
+                )
+            except asyncpg.CheckViolationError as exc:
+                # principal_not_both_disabled_and_retired (race with retire) or
+                # principal_system_principal_always_active.
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        else:
+            result = await conn.execute(
                 "UPDATE qiita.principal SET"
-                "  disabled = true, disabled_at = now(),"
-                "  disabled_by_idx = $2, disable_reason = $3"
-                " WHERE idx = $1 AND disabled = false AND retired = false",
+                "  disabled = false, disabled_at = NULL,"
+                "  disabled_by_idx = NULL, disable_reason = NULL"
+                " WHERE idx = $1 AND disabled = true",
                 principal_idx,
-                actor.principal_idx,
-                body.reason,
             )
-        except asyncpg.CheckViolationError as exc:
-            # principal_not_both_disabled_and_retired (race with retire) or
-            # principal_system_principal_always_active.
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-    else:
-        result = await pool.execute(
-            "UPDATE qiita.principal SET"
-            "  disabled = false, disabled_at = NULL,"
-            "  disabled_by_idx = NULL, disable_reason = NULL"
-            " WHERE idx = $1 AND disabled = true",
-            principal_idx,
-        )
 
-    if rows_affected(result) == 0:
-        # Either principal doesn't exist, or already in target state, or
-        # retired (terminal). Distinguish via a follow-up read.
-        row = await pool.fetchrow(
-            "SELECT disabled, retired FROM qiita.principal WHERE idx = $1",
-            principal_idx,
-        )
-        if row is None:
-            raise HTTPException(status_code=404, detail=MSG_PRINCIPAL_NOT_FOUND)
-        if row["retired"]:
-            raise HTTPException(status_code=409, detail="principal is retired (terminal)")
-        # Already in target state → idempotent success.
-        return
+        if rows_affected(result) == 0:
+            # Either principal doesn't exist, or already in target state, or
+            # retired (terminal). Distinguish via a follow-up read.
+            row = await conn.fetchrow(
+                "SELECT disabled, retired FROM qiita.principal WHERE idx = $1",
+                principal_idx,
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail=MSG_PRINCIPAL_NOT_FOUND)
+            if row["retired"]:
+                raise HTTPException(status_code=409, detail="principal is retired (terminal)")
+            # Already in target state → idempotent success.
+            return
 
-    await record_event(
-        pool,
-        event_type=(
-            AuthEventType.PRINCIPAL_DISABLED if body.disabled else AuthEventType.PRINCIPAL_ENABLED
-        ),
-        principal_idx=principal_idx,
-        actor_principal_idx=actor.principal_idx,
-        detail={"reason": body.reason} if body.disabled else {},
-    )
+        await record_event(
+            conn,
+            event_type=(
+                AuthEventType.PRINCIPAL_DISABLED
+                if body.disabled
+                else AuthEventType.PRINCIPAL_ENABLED
+            ),
+            principal_idx=principal_idx,
+            actor_principal_idx=actor.principal_idx,
+            detail={"reason": body.reason} if body.disabled else {},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +227,7 @@ async def set_principal_disabled(
 async def retire_principal(
     principal_idx: int,
     body: PrincipalRetiredUpdate,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
     actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.ADMIN_USER)),
 ) -> None:
@@ -237,35 +241,36 @@ async def retire_principal(
     if actor.principal_idx == principal_idx:
         raise HTTPException(status_code=403, detail="admin cannot retire themselves")
 
-    try:
-        result = await pool.execute(
-            "UPDATE qiita.principal SET"
-            "  retired = true, retired_at = now(),"
-            "  retired_by_idx = $2, retire_reason = $3"
-            " WHERE idx = $1 AND retired = false",
-            principal_idx,
-            actor.principal_idx,
-            body.reason,
-        )
-    except asyncpg.CheckViolationError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    async with tx() as conn:
+        try:
+            result = await conn.execute(
+                "UPDATE qiita.principal SET"
+                "  retired = true, retired_at = now(),"
+                "  retired_by_idx = $2, retire_reason = $3"
+                " WHERE idx = $1 AND retired = false",
+                principal_idx,
+                actor.principal_idx,
+                body.reason,
+            )
+        except asyncpg.CheckViolationError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    if rows_affected(result) == 0:
-        row = await pool.fetchrow(
-            "SELECT retired FROM qiita.principal WHERE idx = $1", principal_idx
-        )
-        if row is None:
-            raise HTTPException(status_code=404, detail=MSG_PRINCIPAL_NOT_FOUND)
-        # Already retired → idempotent success.
-        return
+        if rows_affected(result) == 0:
+            row = await conn.fetchrow(
+                "SELECT retired FROM qiita.principal WHERE idx = $1", principal_idx
+            )
+            if row is None:
+                raise HTTPException(status_code=404, detail=MSG_PRINCIPAL_NOT_FOUND)
+            # Already retired → idempotent success.
+            return
 
-    await record_event(
-        pool,
-        event_type=AuthEventType.PRINCIPAL_RETIRED,
-        principal_idx=principal_idx,
-        actor_principal_idx=actor.principal_idx,
-        detail={"reason": body.reason},
-    )
+        await record_event(
+            conn,
+            event_type=AuthEventType.PRINCIPAL_RETIRED,
+            principal_idx=principal_idx,
+            actor_principal_idx=actor.principal_idx,
+            detail={"reason": body.reason},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +282,7 @@ async def retire_principal(
 async def set_principal_system_role(
     principal_idx: int,
     body: PrincipalSystemRoleUpdate,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
     actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.ADMIN_USER)),
 ) -> None:
@@ -286,25 +291,26 @@ async def set_principal_system_role(
     if principal_idx == SYSTEM_PRINCIPAL_IDX:
         raise HTTPException(status_code=403, detail="cannot modify system principal's role")
 
-    old_role = await pool.fetchval(
-        "SELECT system_role FROM qiita.principal WHERE idx = $1", principal_idx
-    )
-    if old_role is None:
-        raise HTTPException(status_code=404, detail=MSG_PRINCIPAL_NOT_FOUND)
+    async with tx() as conn:
+        old_role = await conn.fetchval(
+            "SELECT system_role FROM qiita.principal WHERE idx = $1", principal_idx
+        )
+        if old_role is None:
+            raise HTTPException(status_code=404, detail=MSG_PRINCIPAL_NOT_FOUND)
 
-    await pool.execute(
-        "UPDATE qiita.principal SET system_role = $1 WHERE idx = $2",
-        body.system_role,
-        principal_idx,
-    )
+        await conn.execute(
+            "UPDATE qiita.principal SET system_role = $1 WHERE idx = $2",
+            body.system_role,
+            principal_idx,
+        )
 
-    await record_event(
-        pool,
-        event_type=AuthEventType.SYSTEM_ROLE_CHANGE,
-        principal_idx=principal_idx,
-        actor_principal_idx=actor.principal_idx,
-        detail={"from": old_role, "to": body.system_role, "reason": body.reason},
-    )
+        await record_event(
+            conn,
+            event_type=AuthEventType.SYSTEM_ROLE_CHANGE,
+            principal_idx=principal_idx,
+            actor_principal_idx=actor.principal_idx,
+            detail={"from": old_role, "to": body.system_role, "reason": body.reason},
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +365,7 @@ async def get_audit_log(
 @router.post("/principal/{principal_idx}/revoke-all-tokens")
 async def revoke_all_principal_tokens(
     principal_idx: int,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
     actor: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
 ) -> RevokeAllTokensResponse:
     """Bulk-revoke every active token belonging to the target principal.
@@ -375,57 +381,60 @@ async def revoke_all_principal_tokens(
     token_revoke audit event per newly-revoked token so the audit trail
     records the bulk action atomically per token.
     """
-    kind = await pool.fetchval(
-        "SELECT CASE"
-        " WHEN EXISTS (SELECT 1 FROM qiita.user WHERE principal_idx = $1) THEN 'user'"
-        " WHEN EXISTS (SELECT 1 FROM qiita.service_account WHERE principal_idx = $1)"
-        "      THEN 'service'"
-        " ELSE 'bare' END",
-        principal_idx,
-    )
-    required_scope = Scope.ADMIN_USER if kind == "user" else Scope.ADMIN_SERVICE_ACCOUNT
-    if kind == "bare":
-        # No subtype row, so no tokens either — but still surface 404 instead
-        # of silently succeeding so the caller's intent is verified.
-        principal_exists = await pool.fetchval(
-            "SELECT 1 FROM qiita.principal WHERE idx = $1", principal_idx
+    async with tx() as conn:
+        kind = await conn.fetchval(
+            "SELECT CASE"
+            " WHEN EXISTS (SELECT 1 FROM qiita.user WHERE principal_idx = $1) THEN 'user'"
+            " WHEN EXISTS (SELECT 1 FROM qiita.service_account WHERE principal_idx = $1)"
+            "      THEN 'service'"
+            " ELSE 'bare' END",
+            principal_idx,
         )
-        if not principal_exists:
-            raise HTTPException(status_code=404, detail=MSG_PRINCIPAL_NOT_FOUND)
-    if not actor.has_scope(required_scope):
-        raise HTTPException(
-            status_code=403,
-            detail=f"missing required scope {str(required_scope)!r} for {kind}-kind principal",
-        )
-
-    rows = await pool.fetch(
-        "UPDATE qiita.api_token SET revoked_at = now()"
-        " WHERE principal_idx = $1 AND revoked_at IS NULL"
-        " RETURNING token_idx",
-        principal_idx,
-    )
-    revoked_idxs = [r["token_idx"] for r in rows]
-
-    already_revoked = await pool.fetchval(
-        "SELECT count(*) FROM qiita.api_token"
-        " WHERE principal_idx = $1 AND revoked_at IS NOT NULL"
-        "   AND token_idx <> ALL($2::bigint[])",
-        principal_idx,
-        revoked_idxs,
-    )
-
-    await record_event_bulk(
-        pool,
-        events=[
-            AuthEvent(
-                event_type=AuthEventType.TOKEN_REVOKE,
-                principal_idx=principal_idx,
-                actor_principal_idx=actor.principal_idx,
-                detail={"token_idx": tidx, "reason": "admin_bulk"},
+        required_scope = Scope.ADMIN_USER if kind == "user" else Scope.ADMIN_SERVICE_ACCOUNT
+        if kind == "bare":
+            # No subtype row, so no tokens either — but still surface 404 instead
+            # of silently succeeding so the caller's intent is verified.
+            principal_exists = await conn.fetchval(
+                "SELECT 1 FROM qiita.principal WHERE idx = $1", principal_idx
             )
-            for tidx in revoked_idxs
-        ],
-    )
+            if not principal_exists:
+                raise HTTPException(status_code=404, detail=MSG_PRINCIPAL_NOT_FOUND)
+        if not actor.has_scope(required_scope):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"missing required scope {str(required_scope)!r} for {kind}-kind principal"
+                ),
+            )
+
+        rows = await conn.fetch(
+            "UPDATE qiita.api_token SET revoked_at = now()"
+            " WHERE principal_idx = $1 AND revoked_at IS NULL"
+            " RETURNING token_idx",
+            principal_idx,
+        )
+        revoked_idxs = [r["token_idx"] for r in rows]
+
+        already_revoked = await conn.fetchval(
+            "SELECT count(*) FROM qiita.api_token"
+            " WHERE principal_idx = $1 AND revoked_at IS NOT NULL"
+            "   AND token_idx <> ALL($2::bigint[])",
+            principal_idx,
+            revoked_idxs,
+        )
+
+        await record_event_bulk(
+            conn,
+            events=[
+                AuthEvent(
+                    event_type=AuthEventType.TOKEN_REVOKE,
+                    principal_idx=principal_idx,
+                    actor_principal_idx=actor.principal_idx,
+                    detail={"token_idx": tidx, "reason": "admin_bulk"},
+                )
+                for tidx in revoked_idxs
+            ],
+        )
 
     return RevokeAllTokensResponse(
         revoked_token_idxs=revoked_idxs,

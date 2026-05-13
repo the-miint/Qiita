@@ -76,7 +76,7 @@ from ..auth.scopes import (
 )
 from ..auth.token import mint_api_token
 from ..config import Settings
-from ..deps import get_db_pool
+from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -146,6 +146,11 @@ async def mint_pat(
     On profile-incomplete, returns 422 with a flat body listing the
     missing fields — the CLI surfaces this to the user as an actionable
     error instead of silently failing.
+
+    JWT verification and the freshness/leeway checks run without
+    holding a pool connection. The user lookup acquires a pooled
+    connection briefly; a transaction opens only around the mint +
+    audit pair so 4xx paths return without an empty commit.
     """
     settings = _get_settings(request)
     verifier = get_oidc_verifier(request)
@@ -193,10 +198,13 @@ async def mint_pat(
             ),
         )
 
-    # Resolve the user from the verified identity. The missing-fields list is
-    # computed in SQL via qiita.user_profile_missing_fields so the field set
-    # tracks the `profile_complete` generated column's definition (both live in
-    # the auth migration; see 20260429000001_user_profile_missing_fields.sql).
+    # Resolve the user from the verified identity on a pooled (non-tx)
+    # connection — the lookup is read-only and the 4xx paths below must
+    # not hold a transactional slot for an empty commit. The missing-fields
+    # list is computed in SQL via qiita.user_profile_missing_fields so the
+    # field set tracks the `profile_complete` generated column's definition
+    # (both live in the auth migration; see
+    # 20260429000001_user_profile_missing_fields.sql).
     user_row = await pool.fetchrow(
         "SELECT u.principal_idx, p.system_role, p.disabled, p.retired,"
         " u.profile_complete,"
@@ -251,21 +259,26 @@ async def mint_pat(
     ttl_days = body.ttl_days if body.ttl_days is not None else settings.token_default_ttl_days
     expires_at = datetime.now(UTC) + timedelta(days=ttl_days)
 
-    plaintext, token_idx = await mint_api_token(
-        pool,
-        principal_idx=user_row["principal_idx"],
-        label=body.label,
-        scopes=scopes,
-        expires_at=expires_at,
-    )
+    # Mint + audit share a tx so an audit failure rolls back the token row.
+    # Inline rather than the TxConnFactory dep — the body-wide-tx shape that
+    # dep wraps is a poor fit when most of this handler is non-transactional.
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            plaintext, token_idx = await mint_api_token(
+                conn,
+                principal_idx=user_row["principal_idx"],
+                label=body.label,
+                scopes=scopes,
+                expires_at=expires_at,
+            )
 
-    await record_event(
-        pool,
-        event_type=AuthEventType.TOKEN_MINT,
-        principal_idx=user_row["principal_idx"],
-        actor_principal_idx=user_row["principal_idx"],  # self-mint
-        detail={"token_idx": token_idx, "scopes": scopes, "kind": "pat"},
-    )
+            await record_event(
+                conn,
+                event_type=AuthEventType.TOKEN_MINT,
+                principal_idx=user_row["principal_idx"],
+                actor_principal_idx=user_row["principal_idx"],  # self-mint
+                detail={"token_idx": token_idx, "scopes": scopes, "kind": "pat"},
+            )
 
     return ApiTokenMintResponse(
         token=plaintext,
@@ -308,43 +321,44 @@ async def list_own_tokens(
 async def revoke_own_token(
     token_idx: int,
     p: Principal = Depends(require_scope(Scope.SELF_TOKEN)),
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
 ) -> None:
     """Revoke a token belonging to the caller. 401 if Anonymous, 403 if the
     caller's bearer lacks `self:tokens`, 404 for **either** "no such token"
     or "exists but owned by someone else" — same response so probing
     token_idx values does not enumerate the table.
     """
-    # Atomic UPDATE WHERE — only revokes if owner matches and token is not
-    # already revoked. Returns 0 rows if either condition fails.
-    result = await pool.execute(
-        "UPDATE qiita.api_token SET revoked_at = now()"
-        " WHERE token_idx = $1 AND principal_idx = $2 AND revoked_at IS NULL",
-        token_idx,
-        p.principal_idx,
-    )
-    if rows_affected(result) == 0:
-        # Either the token doesn't exist, is owned by another principal, or
-        # is owned by us but already revoked. To avoid leaking existence to
-        # an attacker walking token_idx values, conflate the first two as
-        # 404. The "already revoked" case is idempotent success, so we let
-        # it return 204 silently.
-        owner_idx = await pool.fetchval(
-            "SELECT principal_idx FROM qiita.api_token WHERE token_idx = $1",
+    async with tx() as conn:
+        # Atomic UPDATE WHERE — only revokes if owner matches and token is not
+        # already revoked. Returns 0 rows if either condition fails.
+        result = await conn.execute(
+            "UPDATE qiita.api_token SET revoked_at = now()"
+            " WHERE token_idx = $1 AND principal_idx = $2 AND revoked_at IS NULL",
             token_idx,
+            p.principal_idx,
         )
-        if owner_idx is None or owner_idx != p.principal_idx:
-            raise HTTPException(status_code=404, detail="token not found")
-        # Owned by us but already revoked — idempotent success, no audit.
-        return
+        if rows_affected(result) == 0:
+            # Either the token doesn't exist, is owned by another principal, or
+            # is owned by us but already revoked. To avoid leaking existence to
+            # an attacker walking token_idx values, conflate the first two as
+            # 404. The "already revoked" case is idempotent success, so we let
+            # it return 204 silently.
+            owner_idx = await conn.fetchval(
+                "SELECT principal_idx FROM qiita.api_token WHERE token_idx = $1",
+                token_idx,
+            )
+            if owner_idx is None or owner_idx != p.principal_idx:
+                raise HTTPException(status_code=404, detail="token not found")
+            # Owned by us but already revoked — idempotent success, no audit.
+            return
 
-    await record_event(
-        pool,
-        event_type=AuthEventType.TOKEN_REVOKE,
-        principal_idx=p.principal_idx,
-        actor_principal_idx=p.principal_idx,
-        detail={"token_idx": token_idx, "reason": "self_revoke"},
-    )
+        await record_event(
+            conn,
+            event_type=AuthEventType.TOKEN_REVOKE,
+            principal_idx=p.principal_idx,
+            actor_principal_idx=p.principal_idx,
+            detail={"token_idx": token_idx, "reason": "self_revoke"},
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@ async def get_pool(
     database_url: str,
     *,
     min_size: int = 2,
-    max_size: int = 10,
+    max_size: int = 25,
     command_timeout: float = 10.0,
     connect_timeout: float = 5.0,
 ) -> asyncpg.Pool:
