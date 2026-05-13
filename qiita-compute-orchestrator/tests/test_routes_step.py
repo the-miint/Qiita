@@ -29,6 +29,7 @@ class _RecordingBackend(ComputeBackend):
         reference_idx: int,
         work_ticket_idx: int,
         container: str | None = None,
+        module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources=None,
     ) -> dict[str, Path]:
@@ -43,6 +44,7 @@ class _RecordingBackend(ComputeBackend):
                 reference_idx,
                 work_ticket_idx,
                 container,
+                module,
                 entrypoint,
                 baseline_resources,
             )
@@ -124,6 +126,7 @@ def test_step_run_dispatches_to_backend(http_client, cp_to_co_token, tmp_path):
         reference_idx,
         work_ticket_idx,
         container,
+        module,
         entrypoint,
         baseline,
     ) = backend.calls[0]
@@ -133,8 +136,33 @@ def test_step_run_dispatches_to_backend(http_client, cp_to_co_token, tmp_path):
     assert reference_idx == 7
     assert work_ticket_idx == 99
     assert container == "qiita/reference-hash:1.0.0"
+    assert module is None
     assert entrypoint is None
     assert baseline is None
+
+
+def test_step_run_forwards_module_to_backend(http_client, cp_to_co_token, tmp_path):
+    """The module form on the wire must reach backend.run_step verbatim.
+    Catches dropped-on-the-floor regressions where the route accepts module
+    in the payload but doesn't forward it through."""
+    client, backend = http_client
+    resp = client.post(
+        URL_STEP_RUN,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "fastq",
+            "inputs": {},
+            "workspace": str(tmp_path),
+            "reference_idx": 1,
+            "work_ticket_idx": 1,
+            "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(backend.calls) == 1
+    (_, _, _, _, _, container, module, _, _) = backend.calls[0]
+    assert container is None
+    assert module == "qiita_compute_orchestrator.jobs.fastq_to_parquet"
 
 
 def test_step_run_translates_backend_value_error(http_client, cp_to_co_token, tmp_path):
@@ -209,6 +237,49 @@ def test_step_run_serializes_backend_failure(http_client, cp_to_co_token, tmp_pa
         "step_name": "hash",
         "reason": "slurm reported node n01 lost mid-step",
     }
+
+
+def test_step_run_rejects_payload_without_runtime(http_client, cp_to_co_token, tmp_path):
+    """A request body with neither `container` nor `module` is rejected at
+    the wire boundary by the StepRunRequest validator; the route never
+    reaches the backend dispatch."""
+    client, backend = http_client
+    resp = client.post(
+        URL_STEP_RUN,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "hash",
+            "inputs": {"fasta_path": "/tmp/x.fa"},
+            "workspace": str(tmp_path),
+            "reference_idx": 1,
+            "work_ticket_idx": 1,
+        },
+    )
+    assert resp.status_code == 422
+    assert "exactly one" in resp.text
+    assert backend.calls == []
+
+
+def test_step_run_rejects_payload_with_both_runtimes(http_client, cp_to_co_token, tmp_path):
+    """A request body with both `container` AND `module` is rejected at
+    the wire boundary — runtime must be unambiguous."""
+    client, backend = http_client
+    resp = client.post(
+        URL_STEP_RUN,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "hash",
+            "inputs": {"fasta_path": "/tmp/x.fa"},
+            "workspace": str(tmp_path),
+            "reference_idx": 1,
+            "work_ticket_idx": 1,
+            "container": "qiita/reference-hash:1.0.0",
+            "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
+        },
+    )
+    assert resp.status_code == 422
+    assert "exactly one" in resp.text
+    assert backend.calls == []
 
 
 def test_settings_resolves_token_from_env():

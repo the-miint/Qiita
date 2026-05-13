@@ -34,11 +34,17 @@ from qiita_common.auth_constants import (
     Scope,
     SystemRole,
 )
-from qiita_common.models import ScopeTargetKind, StepType
+from qiita_common.models import ScopeTargetKind, StepType, check_exactly_one_runtime
 
 # Native job modules must live under qiita_compute_orchestrator.jobs.
-# Sync (CP), boot scan (CO), wire (StepRunRequest), and submit (CO route)
-# all check this prefix. Defined here so every layer imports the same value.
+# The string is defined here so every layer can import the same value;
+# enforcement is layered and lands in subsequent commits:
+#   - sync time (CP, actions/sync.py)              [next commit]
+#   - boot time (CO, lifespan jobs/ scan)          [later commit]
+#   - submit time (CO, /step/run route handler)    [later commit]
+#   - dispatch time (run_native_job, framework)    [later commit]
+# The wire validator on StepRunRequest deliberately stays shape-only —
+# the prefix check belongs at the layers that actually import / dispatch.
 NATIVE_MODULE_PREFIX = "qiita_compute_orchestrator.jobs."
 
 
@@ -126,16 +132,15 @@ class WorkflowStep(BaseModel):
 
     @model_validator(mode="after")
     def _exactly_one_runtime(self) -> WorkflowStep:
-        # Exactly-one(container, module). The prefix check on `module`
-        # lives at the use sites (CP sync, CO boot scan, CO route handler)
-        # so this validator stays shape-only and doesn't couple the schema
-        # to the orchestrator package path.
-        has_container = self.container is not None
-        has_module = self.module is not None
-        if has_container == has_module:
-            raise ValueError("WorkflowStep must declare exactly one of 'container' or 'module'")
-        if self.entrypoint is not None and not has_container:
-            raise ValueError("'entrypoint' requires 'container'")
+        # Shape-only validator. Prefix validation on `module` is enforced
+        # separately (see the NATIVE_MODULE_PREFIX comment above) — keeps
+        # the schema decoupled from the orchestrator package path.
+        check_exactly_one_runtime(
+            container=self.container,
+            module=self.module,
+            entrypoint=self.entrypoint,
+            owner="WorkflowStep",
+        )
         return self
 
 

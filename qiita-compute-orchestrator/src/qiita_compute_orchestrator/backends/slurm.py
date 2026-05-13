@@ -97,9 +97,23 @@ class SlurmBackend(ComputeBackend):
         reference_idx: int,
         work_ticket_idx: int,
         container: str | None = None,
+        module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources: StepBaselineResources | None = None,
     ) -> dict[str, Path]:
+        if module is not None:
+            # Native-step SLURM payload (srun python -m ...) lands in a
+            # subsequent commit. Fail loudly so a half-wired contract
+            # doesn't silently produce a malformed slurmrestd submission.
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=name,
+                reason=(
+                    f"SlurmBackend received module={module!r}; native dispatch "
+                    "is not wired in this commit"
+                ),
+            )
         if container is None:
             raise BackendFailure(
                 kind=FailureKind.CONTRACT_VIOLATION,

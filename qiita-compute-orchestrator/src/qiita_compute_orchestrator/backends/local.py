@@ -72,8 +72,9 @@ class LocalBackend(ComputeBackend):
         *,
         reference_idx: int,
         work_ticket_idx: int,  # noqa: ARG002 — accepted for protocol parity
-        container: str | None = None,
-        entrypoint: str | None = None,
+        container: str | None = None,  # noqa: ARG002 — LocalBackend ignores container in dev/test
+        module: str | None = None,
+        entrypoint: str | None = None,  # noqa: ARG002 — LocalBackend ignores entrypoint
         baseline_resources=None,  # noqa: ARG002 — accepted for protocol parity
     ) -> dict[str, Path]:
         """Public backend interface. Translates known internal exceptions
@@ -82,6 +83,20 @@ class LocalBackend(ComputeBackend):
         `_write_*`) keep raising plain Python exceptions — they're
         unit-testable in isolation that way; only the run_step boundary
         wraps."""
+        if module is not None:
+            # Native-step dispatch lands in a subsequent commit (will
+            # delegate to qiita_compute_orchestrator.jobs.run_native_job).
+            # Fail loudly until then so a half-wired contract doesn't
+            # masquerade as a different error.
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=name,
+                reason=(
+                    f"LocalBackend received module={module!r}; native dispatch "
+                    "is not wired in this commit"
+                ),
+            )
         try:
             if name == "hash":
                 manifest = await self._run_hash(inputs["fasta_path"], workspace, reference_idx)

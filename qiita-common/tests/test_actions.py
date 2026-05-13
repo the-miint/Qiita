@@ -292,10 +292,9 @@ def test_status_fields_reject_blank_strings():
 
 
 # --- WorkflowStep runtime-selection validator -----------------------------
-# Every step must declare exactly one of `container:` or `module:`.
-# `module:` is the native-step form; the prefix check lives at the use
-# sites (CP sync, CO boot scan, CO route handler) so this validator
-# stays shape-only.
+# Shape-only: every step must declare exactly one of `container:` or
+# `module:`. Prefix validation on `module` is enforced separately (not
+# in this validator).
 
 
 def test_workflow_step_native_module_form_validates():

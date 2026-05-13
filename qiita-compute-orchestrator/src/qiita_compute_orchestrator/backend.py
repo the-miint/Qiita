@@ -36,16 +36,25 @@ class ComputeBackend(ABC):
         reference_idx: int,
         work_ticket_idx: int,
         container: str | None = None,
+        module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources: StepBaselineResources | None = None,
     ) -> dict[str, Path]:
         """Execute the step identified by `name`. Returns a name => path
         map of outputs the runner can plumb into subsequent steps.
 
-        `container`, `entrypoint`, `baseline_resources` are optional on
-        the protocol so LocalBackend (which dispatches on `name` and
-        uses internal helpers) can be invoked without them. SlurmBackend
-        requires them and refuses the call when they're absent.
+        Exactly one of `container` or `module` must be set — the wire
+        validator on StepRunRequest enforces this before the route
+        hands off to a backend. `container` drives the apptainer-exec
+        path; `module` selects the native-step path (Python modules
+        under `qiita_compute_orchestrator.jobs.*`). Native dispatch
+        wiring lands in a subsequent commit; backends that receive
+        `module` today should fail with a typed BackendFailure.
+
+        `entrypoint` overrides a container's default ENTRYPOINT and is
+        meaningful only when `container` is set. `baseline_resources`
+        is required by SlurmBackend (CPU/mem/walltime) and ignored by
+        LocalBackend.
 
         Raises:
             ValueError: if `name` is not implemented by this backend.

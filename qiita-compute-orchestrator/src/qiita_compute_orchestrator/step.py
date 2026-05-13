@@ -63,6 +63,7 @@ async def run_step(
             reference_idx=body.reference_idx,
             work_ticket_idx=body.work_ticket_idx,
             container=body.container,
+            module=body.module,
             entrypoint=body.entrypoint,
             baseline_resources=body.baseline_resources,
         )
