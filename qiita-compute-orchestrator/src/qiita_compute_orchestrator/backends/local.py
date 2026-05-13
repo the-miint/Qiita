@@ -9,7 +9,7 @@ from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.models import WorkTicketFailureStage
 from qiita_common.parquet import validate_parquet_path
 
-from ..backend import ComputeBackend, native_dispatch_not_implemented
+from ..backend import ComputeBackend
 
 # miint is installed once per process to avoid a network call on every hash job.
 _miint_install_lock = asyncio.Lock()
@@ -84,19 +84,22 @@ class LocalBackend(ComputeBackend):
         unit-testable in isolation that way; only the run_step boundary
         wraps."""
         if module is not None:
-            # LocalBackend's `run_step` body dispatches by step name
-            # ("hash", "load"); it does NOT yet route to the native
-            # dispatcher `qiita_compute_orchestrator.jobs.run_native_job`.
-            # The two helpers (`_run_hash`, `_run_load`) predate the
-            # `jobs/` package and live here in canonical form — they're
-            # the source of truth that SLURM containers will eventually
-            # share via `run_native_job`. Until that fold-in is wired
-            # below, a `module:` step is declined via the shared
-            # `native_dispatch_not_implemented` helper so the failure
-            # is typed and the reason string matches SlurmBackend's.
-            raise native_dispatch_not_implemented(
-                backend_name="LocalBackend", step_name=name, module=module
-            )
+            # Native step: delegate to the framework dispatcher. It
+            # validates the module prefix, imports the module,
+            # validates raw_inputs via mod.Inputs, invokes
+            # mod.execute(inputs, workspace), and maps known exceptions
+            # to typed BackendFailure. Inputs are str-coerced so the
+            # shape matches what the SLURM launcher hands to the same
+            # dispatcher — a job module sees identical raw_inputs
+            # regardless of runtime.
+            from ..jobs import run_native_job
+
+            raw_inputs: dict[str, object] = {
+                **{k: str(v) for k, v in inputs.items()},
+                "reference_idx": reference_idx,
+                "work_ticket_idx": work_ticket_idx,
+            }
+            return await run_native_job(module, raw_inputs, workspace)
         try:
             if name == "hash":
                 manifest = await self._run_hash(inputs["fasta_path"], workspace, reference_idx)
