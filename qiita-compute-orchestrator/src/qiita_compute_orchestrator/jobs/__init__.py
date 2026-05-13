@@ -36,27 +36,27 @@ from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.models import WorkTicketFailureStage
 
 
-def _contract_violation(*, module_name: str, reason: str) -> BackendFailure:
+def _contract_violation(*, step_name: str, reason: str) -> BackendFailure:
     return BackendFailure(
         kind=FailureKind.CONTRACT_VIOLATION,
         stage=WorkTicketFailureStage.STEP_RUN,
-        step_name=module_name,
+        step_name=step_name,
         reason=reason,
     )
 
 
 # Framework scalars that get merged into raw_inputs before
 # `Inputs.model_validate`. A step `inputs:` entry sharing one of these
-# names would silently shadow the work-ticket value; `_flatten_native_inputs`
+# names would silently shadow the work-ticket value; `flatten_native_inputs`
 # rejects the collision so LocalBackend and the SLURM launcher behave
 # the same way.
 _RESERVED_KEYS = frozenset({"reference_idx", "work_ticket_idx"})
 
 
-def _flatten_native_inputs(
-    module_name: str,
+def flatten_native_inputs(
     inputs: dict[str, Any],
     *,
+    step_name: str,
     reference_idx: int,
     work_ticket_idx: int,
 ) -> dict[str, Any]:
@@ -66,11 +66,14 @@ def _flatten_native_inputs(
     so the reserved-key check fires symmetrically. Raises a typed
     BackendFailure(CONTRACT_VIOLATION) on collision — the runner sees
     the same shape regardless of which backend produced the violation.
+    `step_name` is the YAML step name (e.g. "fastq"); failures carry it
+    on BackendFailure.step_name to match the work_ticket failure-attribution
+    contract.
     """
     overlap = sorted(_RESERVED_KEYS & inputs.keys())
     if overlap:
         raise _contract_violation(
-            module_name=module_name,
+            step_name=step_name,
             reason=f"step `inputs:` cannot use framework-reserved names: {overlap}",
         )
     return {**inputs, "reference_idx": reference_idx, "work_ticket_idx": work_ticket_idx}
@@ -80,8 +83,15 @@ async def run_native_job(
     module_name: str,
     raw_inputs: dict[str, Any],
     workspace: Path,
+    *,
+    step_name: str,
 ) -> dict[str, Path]:
     """Dispatch a native job. Returns the job's output map.
+
+    `step_name` is the YAML step name (e.g. "fastq") — the same value
+    `qiita.work_ticket.failure_step_name` records on failure. All
+    `BackendFailure` raises below carry it; the `module_name` stays in
+    the reason text for operator-side debugging.
 
     Maps known internal failures to typed `BackendFailure`:
     - Module path outside `NATIVE_MODULE_PREFIX`, or module missing the
@@ -99,7 +109,7 @@ async def run_native_job(
     """
     if not module_name.startswith(NATIVE_MODULE_PREFIX):
         raise _contract_violation(
-            module_name=module_name,
+            step_name=step_name,
             reason=(
                 f"native module path must start with {NATIVE_MODULE_PREFIX!r}; got {module_name!r}"
             ),
@@ -113,18 +123,20 @@ async def run_native_job(
         # contract violation. Catch broadly here; the scope is the
         # import call only so dispatcher bugs below still surface.
         raise _contract_violation(
-            module_name=module_name,
-            reason=f"failed to import native job module: {type(exc).__name__}: {exc}",
+            step_name=step_name,
+            reason=(
+                f"failed to import native job module {module_name!r}: {type(exc).__name__}: {exc}"
+            ),
         ) from exc
 
-    mod_errors = _validate_native_job_module(mod)
+    mod_errors = validate_native_job_module(mod)
     if mod_errors:
         # Delegate to the same validator the boot scan uses so the
         # dispatcher and the lifespan scan disagree on nothing — the
         # operator sees the exact same message no matter which layer
         # surfaces the violation.
         raise _contract_violation(
-            module_name=module_name,
+            step_name=step_name,
             reason=f"native job {module_name!r}: {'; '.join(mod_errors)}",
         )
     # Validator guarantees both exports exist with the right shapes.
@@ -137,8 +149,8 @@ async def run_native_job(
         raise BackendFailure(
             kind=FailureKind.BAD_INPUT,
             stage=WorkTicketFailureStage.STEP_RUN,
-            step_name=module_name,
-            reason=f"native job input validation failed: {exc}",
+            step_name=step_name,
+            reason=f"native job {module_name!r} input validation failed: {exc}",
         ) from exc
 
     try:
@@ -149,14 +161,14 @@ async def run_native_job(
         raise BackendFailure(
             kind=FailureKind.UNKNOWN_PERMANENT,
             stage=WorkTicketFailureStage.STEP_RUN,
-            step_name=module_name,
-            reason=f"native job not implemented: {exc}",
+            step_name=step_name,
+            reason=f"native job {module_name!r} not implemented: {exc}",
         ) from exc
     except FileNotFoundError as exc:
         raise BackendFailure(
             kind=FailureKind.BAD_INPUT,
             stage=WorkTicketFailureStage.STEP_RUN,
-            step_name=module_name,
+            step_name=step_name,
             reason=str(exc),
         ) from exc
     except ValueError as exc:
@@ -166,7 +178,7 @@ async def run_native_job(
         raise BackendFailure(
             kind=FailureKind.BAD_INPUT,
             stage=WorkTicketFailureStage.STEP_RUN,
-            step_name=module_name,
+            step_name=step_name,
             reason=str(exc),
         ) from exc
 
@@ -176,7 +188,7 @@ async def run_native_job(
 # =============================================================================
 
 
-def _validate_native_job_module(mod: types.ModuleType) -> list[str]:
+def validate_native_job_module(mod: types.ModuleType) -> list[str]:
     """Return a list of contract violations for one candidate job module.
     Empty list means the module is a valid native job. Pure function:
     no importing, no filesystem access — the scan does that and hands a
@@ -240,7 +252,7 @@ def scan_native_jobs(
             # violation, not just ImportError.
             errors.append(f"  {modname}: failed to import — {type(exc).__name__}: {exc}")
             continue
-        mod_errors = _validate_native_job_module(mod)
+        mod_errors = validate_native_job_module(mod)
         if mod_errors:
             errors.append(f"  {modname}: {'; '.join(mod_errors)}")
             continue

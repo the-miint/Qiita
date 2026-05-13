@@ -200,9 +200,10 @@ async def test_native_step_skeleton_fails_through_runner(
     assert row["state"] == WorkTicketState.FAILED.value
     assert row["failure_type"] == FailureType.PERMANENT.value
     assert row["failure_stage"] == WorkTicketFailureStage.STEP_RUN.value
-    # `failure_step_name` carries whatever step_name the BackendFailure
-    # was constructed with. run_native_job uses the module path; assert
-    # loosely so a future refactor that switches to the YAML step name
-    # ("fastq") doesn't break this test.
-    assert "fastq_to_parquet" in row["failure_step_name"]
+    # `failure_step_name` carries the YAML step name (per the migration's
+    # documented contract). run_native_job plumbs it through; container
+    # and native dispatch are uniform on this column.
+    assert row["failure_step_name"] == "fastq"
+    # The module path stays in the reason text for operator-side debugging.
+    assert "fastq_to_parquet" in row["failure_reason"]
     assert "not implemented" in row["failure_reason"].lower()

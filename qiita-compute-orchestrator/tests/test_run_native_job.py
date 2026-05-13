@@ -57,7 +57,7 @@ async def test_happy_path_returns_outputs(monkeypatch, tmp_path):
 
     name = _install_stub(monkeypatch, short_name="happy", inputs_cls=_Inputs, execute_fn=execute)
 
-    result = await run_native_job(name, {"x": 42}, tmp_path)
+    result = await run_native_job(name, {"x": 42}, tmp_path, step_name="step")
     assert result == {"out": tmp_path / "out.txt"}
     assert received[0][0].x == 42
     assert received[0][1] == tmp_path
@@ -65,7 +65,7 @@ async def test_happy_path_returns_outputs(monkeypatch, tmp_path):
 
 async def test_bad_prefix_raises_contract_violation():
     with pytest.raises(BackendFailure) as ei:
-        await run_native_job("os.system", {}, Path("/"))
+        await run_native_job("os.system", {}, Path("/"), step_name="step")
     assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
     assert ei.value.stage is WorkTicketFailureStage.STEP_RUN
     assert "qiita_compute_orchestrator.jobs." in ei.value.reason
@@ -80,6 +80,7 @@ async def test_unimportable_module_raises_contract_violation():
             "qiita_compute_orchestrator.jobs.definitely_not_a_real_job",
             {},
             Path("/"),
+            step_name="step",
         )
     assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
     assert "failed to import" in ei.value.reason
@@ -102,6 +103,7 @@ async def test_non_importerror_at_import_time_maps_to_contract_violation(monkeyp
             "qiita_compute_orchestrator.jobs.broken",
             {},
             Path("/"),
+            step_name="step",
         )
     assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
     assert "SyntaxError" in ei.value.reason
@@ -114,7 +116,7 @@ async def test_missing_execute_raises_contract_violation(monkeypatch):
     granularity — both layers go through _validate_native_job_module."""
     name = _install_stub(monkeypatch, short_name="no_execute", inputs_cls=_Inputs, execute_fn=None)
     with pytest.raises(BackendFailure) as ei:
-        await run_native_job(name, {"x": 1}, Path("/"))
+        await run_native_job(name, {"x": 1}, Path("/"), step_name="step")
     assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
     assert "missing `execute`" in ei.value.reason
     # Should NOT mention the export that's present.
@@ -127,7 +129,7 @@ async def test_missing_inputs_raises_contract_violation(monkeypatch):
 
     name = _install_stub(monkeypatch, short_name="no_inputs", inputs_cls=None, execute_fn=execute)
     with pytest.raises(BackendFailure) as ei:
-        await run_native_job(name, {}, Path("/"))
+        await run_native_job(name, {}, Path("/"), step_name="step")
     assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
     assert "missing `Inputs`" in ei.value.reason
     assert "missing `execute`" not in ei.value.reason
@@ -151,7 +153,7 @@ async def test_inputs_not_basemodel_raises_contract_violation(monkeypatch):
         execute_fn=execute,
     )
     with pytest.raises(BackendFailure) as ei:
-        await run_native_job(name, {}, Path("/"))
+        await run_native_job(name, {}, Path("/"), step_name="step")
     assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
     assert "BaseModel" in ei.value.reason
 
@@ -164,7 +166,7 @@ async def test_input_validation_failure_raises_bad_input(monkeypatch):
         monkeypatch, short_name="validates", inputs_cls=_Inputs, execute_fn=execute
     )
     with pytest.raises(BackendFailure) as ei:
-        await run_native_job(name, {"x": "not-an-int"}, Path("/"))
+        await run_native_job(name, {"x": "not-an-int"}, Path("/"), step_name="step")
     assert ei.value.kind is FailureKind.BAD_INPUT
     assert "input validation" in ei.value.reason
 
@@ -180,7 +182,7 @@ async def test_not_implemented_maps_to_unknown_permanent(monkeypatch, tmp_path):
 
     name = _install_stub(monkeypatch, short_name="skeleton", inputs_cls=_Inputs, execute_fn=execute)
     with pytest.raises(BackendFailure) as ei:
-        await run_native_job(name, {"x": 1}, tmp_path)
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
     assert "not implemented" in ei.value.reason
 
@@ -191,7 +193,7 @@ async def test_filenotfound_in_execute_maps_to_bad_input(monkeypatch, tmp_path):
 
     name = _install_stub(monkeypatch, short_name="fnf", inputs_cls=_Inputs, execute_fn=execute)
     with pytest.raises(BackendFailure) as ei:
-        await run_native_job(name, {"x": 1}, tmp_path)
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
     assert ei.value.kind is FailureKind.BAD_INPUT
     assert "/missing/input.fastq" in ei.value.reason
 
@@ -202,9 +204,29 @@ async def test_value_error_in_execute_maps_to_bad_input(monkeypatch, tmp_path):
 
     name = _install_stub(monkeypatch, short_name="bad_data", inputs_cls=_Inputs, execute_fn=execute)
     with pytest.raises(BackendFailure) as ei:
-        await run_native_job(name, {"x": 1}, tmp_path)
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
     assert ei.value.kind is FailureKind.BAD_INPUT
     assert "duplicate read_id" in ei.value.reason
+
+
+async def test_step_name_carries_yaml_name_not_module_path(monkeypatch, tmp_path):
+    """The BackendFailure raised inside run_native_job uses the YAML
+    step name (the kwarg), NOT the module path. This matches the
+    work_ticket.failure_step_name DB column's documented contract
+    (the YAML step name, e.g. "fastq"). The module path stays in the
+    reason text for debugging context."""
+
+    async def execute(inputs, workspace):
+        raise NotImplementedError("placeholder")
+
+    name = _install_stub(
+        monkeypatch, short_name="skeleton2", inputs_cls=_Inputs, execute_fn=execute
+    )
+    with pytest.raises(BackendFailure) as ei:
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="fastq")
+    assert ei.value.step_name == "fastq"
+    # Module path still in reason for the operator to find the offending file.
+    assert "qiita_compute_orchestrator.jobs.skeleton2" in ei.value.reason
 
 
 async def test_unknown_exception_propagates(monkeypatch, tmp_path):
@@ -221,4 +243,4 @@ async def test_unknown_exception_propagates(monkeypatch, tmp_path):
 
     name = _install_stub(monkeypatch, short_name="weird", inputs_cls=_Inputs, execute_fn=execute)
     with pytest.raises(CustomError):
-        await run_native_job(name, {"x": 1}, tmp_path)
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="step")

@@ -81,12 +81,14 @@ async def test_dispatches_to_native_module(monkeypatch, tmp_path):
 async def test_skeleton_not_implemented_maps_to_unknown_permanent(tmp_path):
     """The real fastq_to_parquet skeleton raises NotImplementedError;
     run_native_job translates it to BackendFailure(UNKNOWN_PERMANENT)
-    and LocalBackend propagates without re-wrapping."""
+    and LocalBackend propagates without re-wrapping. The failure
+    carries the YAML step name (not the module path) so it lines up
+    with the work_ticket.failure_step_name DB column."""
     backend = LocalBackend()
 
     with pytest.raises(BackendFailure) as ei:
         await backend.run_step(
-            "fastq",
+            "fastq",  # YAML step name
             {"fastq_path": tmp_path / "in.fa"},
             tmp_path,
             reference_idx=1,
@@ -94,6 +96,7 @@ async def test_skeleton_not_implemented_maps_to_unknown_permanent(tmp_path):
             module="qiita_compute_orchestrator.jobs.fastq_to_parquet",
         )
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
+    assert ei.value.step_name == "fastq"
     assert "fastq_to_parquet" in ei.value.reason
 
 

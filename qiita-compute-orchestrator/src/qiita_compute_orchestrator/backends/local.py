@@ -10,7 +10,7 @@ from qiita_common.models import WorkTicketFailureStage
 from qiita_common.parquet import validate_parquet_path
 
 from ..backend import ComputeBackend
-from ..jobs import _flatten_native_inputs, run_native_job
+from ..jobs import flatten_native_inputs, run_native_job
 
 # miint is installed once per process to avoid a network call on every hash job.
 _miint_install_lock = asyncio.Lock()
@@ -102,17 +102,20 @@ class LocalBackend(ComputeBackend):
             # validates the module prefix, imports the module,
             # validates raw_inputs via mod.Inputs, invokes
             # mod.execute(inputs, workspace), and maps known exceptions
-            # to typed BackendFailure. `_flatten_native_inputs` merges
+            # to typed BackendFailure. `flatten_native_inputs` merges
             # the work-ticket scalars and rejects reserved-key
             # collisions the same way the SLURM launcher does — a job
             # module sees identical raw_inputs regardless of runtime.
-            raw_inputs = _flatten_native_inputs(
-                module,
+            # `step_name=name` plumbs the YAML step name (e.g. "fastq")
+            # to all BackendFailures so they match the work_ticket
+            # `failure_step_name` contract.
+            raw_inputs = flatten_native_inputs(
                 {k: str(v) for k, v in inputs.items()},
+                step_name=name,
                 reference_idx=reference_idx,
                 work_ticket_idx=work_ticket_idx,
             )
-            return await run_native_job(module, raw_inputs, workspace)
+            return await run_native_job(module, raw_inputs, workspace, step_name=name)
         try:
             if name == "hash":
                 manifest = await self._run_hash(inputs["fasta_path"], workspace, reference_idx)

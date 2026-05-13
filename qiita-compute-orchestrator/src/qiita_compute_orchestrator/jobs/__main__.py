@@ -40,10 +40,10 @@ from qiita_common.actions import NATIVE_MODULE_PREFIX
 from qiita_common.backend_failure import BackendFailure
 
 from ..slurm.contract import EXPECTED_FILE_MODE, MANIFEST_FILENAME
-from . import _flatten_native_inputs, run_native_job
+from . import flatten_native_inputs, run_native_job
 
 
-def _flatten_params(module_name: str, params: dict) -> dict:
+def _flatten_params(params: dict) -> dict:
     """Combine the work-ticket scalars and the step's inputs map into a
     single dict ready for `Inputs.model_validate`.
 
@@ -56,17 +56,18 @@ def _flatten_params(module_name: str, params: dict) -> dict:
           "inputs": {<input_name>: <path>, ...},
           "output_path": <str>,  # written but ignored here; env var wins
         }
-    This reader pulls `reference_idx` and `work_ticket_idx` plus every
-    entry of `inputs`. Other keys in params.json are ignored.
+    This reader pulls `step_name`, `reference_idx`, `work_ticket_idx`,
+    and every entry of `inputs`. Other keys in params.json are ignored.
 
-    Delegates the merge + reserved-key check to `_flatten_native_inputs`
+    Delegates the merge + reserved-key check to `flatten_native_inputs`
     so the launcher and LocalBackend share one code path. A collision
-    surfaces as BackendFailure(CONTRACT_VIOLATION), which `main()`
-    catches and renders to structured stderr.
+    surfaces as BackendFailure(CONTRACT_VIOLATION) — carrying the
+    YAML step name from params — which `main()` catches and renders
+    to structured stderr.
     """
-    return _flatten_native_inputs(
-        module_name,
+    return flatten_native_inputs(
         params.get("inputs", {}),
+        step_name=params["step_name"],
         reference_idx=params["reference_idx"],
         work_ticket_idx=params["work_ticket_idx"],
     )
@@ -127,9 +128,12 @@ def main(argv: list[str] | None = None) -> int:
     module_name = f"{NATIVE_MODULE_PREFIX}{args.job}"
 
     params = json.loads((input_path / "params.json").read_text())
+    step_name = params["step_name"]
     try:
-        raw_inputs = _flatten_params(module_name, params)
-        outputs = asyncio.run(run_native_job(module_name, raw_inputs, output_path))
+        raw_inputs = _flatten_params(params)
+        outputs = asyncio.run(
+            run_native_job(module_name, raw_inputs, output_path, step_name=step_name)
+        )
     except BackendFailure as exc:
         # Structured error line on stderr — the orchestrator-side
         # slurmrestd polling will see exit=1 and classify based on
@@ -153,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(
                 {
                     "kind": "contract_violation",
-                    "step_name": module_name,
+                    "step_name": step_name,
                     "reason": (f"post-success manifest write failed: {type(exc).__name__}: {exc}"),
                 }
             ),

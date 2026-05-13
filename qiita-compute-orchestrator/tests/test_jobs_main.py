@@ -131,7 +131,7 @@ def test_flatten_params_merges_scalars_and_inputs():
         "inputs": {"fastq_path": "/data/in.fa"},
         "output_path": "/scratch/out",  # ignored
     }
-    flat = _flatten_params("qiita_compute_orchestrator.jobs.fastq", params)
+    flat = _flatten_params(params)
     assert flat == {"fastq_path": "/data/in.fa", "reference_idx": 7, "work_ticket_idx": 99}
 
 
@@ -142,17 +142,20 @@ def test_flatten_params_rejects_reserved_key_collision():
     rather than silently shadowing the work-ticket value.
 
     Symmetric with LocalBackend's path — both go through the shared
-    `_flatten_native_inputs` helper in jobs/__init__.py."""
+    `flatten_native_inputs` helper in jobs/__init__.py."""
     from qiita_common.backend_failure import BackendFailure, FailureKind
 
     params = {
+        "step_name": "fastq",
         "reference_idx": 7,
         "work_ticket_idx": 99,
         "inputs": {"reference_idx": "/data/in.fa"},  # accidental collision
     }
     with pytest.raises(BackendFailure) as ei:
-        _flatten_params("qiita_compute_orchestrator.jobs.fastq", params)
+        _flatten_params(params)
     assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
+    # The failure carries the YAML step name, not the module path.
+    assert ei.value.step_name == "fastq"
     assert "reference_idx" in ei.value.reason
 
 
@@ -186,6 +189,8 @@ def test_main_returns_1_on_reserved_key_collision(monkeypatch, io_dirs, capsys):
     captured = capsys.readouterr()
     err = json.loads(captured.err)
     assert err["kind"] == "contract_violation"
+    # Stderr carries the YAML step name from params.json, not the module path.
+    assert err["step_name"] == "fastq"
     assert "work_ticket_idx" in err["reason"]
 
 
@@ -221,7 +226,8 @@ def test_main_returns_1_on_post_success_manifest_failure(monkeypatch, io_dirs, c
     assert rc == 1
     err = json.loads(capsys.readouterr().err)
     assert err["kind"] == "contract_violation"
-    assert err["step_name"] == "qiita_compute_orchestrator.jobs.post_fail"
+    # YAML step name from params.json, not the module path.
+    assert err["step_name"] == "fastq"
     assert "post-success manifest write failed" in err["reason"]
     assert "OSError" in err["reason"]
     assert "simulated disk full" in err["reason"]
@@ -249,5 +255,8 @@ def test_main_returns_1_and_prints_structured_error_on_backend_failure(
     captured = capsys.readouterr()
     err = json.loads(captured.err)
     assert err["kind"] == "unknown_permanent"
-    assert err["step_name"] == "qiita_compute_orchestrator.jobs.skeleton"
+    # YAML step name from params.json, not the module path; module path
+    # stays in the reason text for operator-side debugging.
+    assert err["step_name"] == "fastq"
+    assert "qiita_compute_orchestrator.jobs.skeleton" in err["reason"]
     assert "not implemented" in err["reason"]

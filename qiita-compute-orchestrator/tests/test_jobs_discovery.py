@@ -2,7 +2,7 @@
 
 Two layers:
 
-- `_validate_native_job_module(mod)`: pure function over a single
+- `validate_native_job_module(mod)`: pure function over a single
   module object. Each test below constructs a synthetic
   `types.ModuleType` and asserts the right errors come back.
 - `scan_native_jobs()`: walks a package's __path__ via
@@ -24,8 +24,8 @@ import pytest
 from pydantic import BaseModel
 
 from qiita_compute_orchestrator.jobs import (
-    _validate_native_job_module,
     scan_native_jobs,
+    validate_native_job_module,
 )
 
 
@@ -75,18 +75,18 @@ def fake_jobs_pkg(monkeypatch, tmp_path):
 
 def test_validate_accepts_well_formed_module():
     mod = _mod(Inputs=_Inputs, execute=_good_execute)
-    assert _validate_native_job_module(mod) == []
+    assert validate_native_job_module(mod) == []
 
 
 def test_validate_flags_missing_inputs():
     mod = _mod(execute=_good_execute)
-    errors = _validate_native_job_module(mod)
+    errors = validate_native_job_module(mod)
     assert errors == ["missing `Inputs`"]
 
 
 def test_validate_flags_missing_execute():
     mod = _mod(Inputs=_Inputs)
-    errors = _validate_native_job_module(mod)
+    errors = validate_native_job_module(mod)
     assert errors == ["missing `execute`"]
 
 
@@ -94,7 +94,7 @@ def test_validate_flags_missing_both_simultaneously():
     """When both exports are missing, both errors fire so the operator
     sees the full picture in one shot."""
     mod = _mod()
-    errors = _validate_native_job_module(mod)
+    errors = validate_native_job_module(mod)
     assert errors == ["missing `Inputs`", "missing `execute`"]
 
 
@@ -103,7 +103,7 @@ def test_validate_flags_inputs_not_basemodel():
         pass
 
     mod = _mod(Inputs=NotABaseModel, execute=_good_execute)
-    errors = _validate_native_job_module(mod)
+    errors = validate_native_job_module(mod)
     assert errors == ["`Inputs` must be a BaseModel subclass"]
 
 
@@ -115,7 +115,7 @@ def test_validate_flags_execute_not_async():
         return {}
 
     mod = _mod(Inputs=_Inputs, execute=sync_execute)
-    errors = _validate_native_job_module(mod)
+    errors = validate_native_job_module(mod)
     assert errors == ["`execute` must be an async function"]
 
 
