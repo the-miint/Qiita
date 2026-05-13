@@ -58,8 +58,8 @@ CREATE TABLE qiita.sequenced_sample (
     -- The pool reference and the pool's per-item id are co-populated: either
     -- the sample is attached to a pool (both set) or it is not (both null).
     -- A half-populated pair would mean either an item id without a pool
-    -- (orphan) or a pool reference without the samplesheet's Sample_ID
-    -- (which is required to locate the row inside the samplesheet).
+    -- (orphan) or a pool reference without the run preflight's Sample_ID
+    -- (which is required to locate the row inside the run preflight).
     CONSTRAINT sequenced_sample_pool_pair_consistent CHECK (
         (sequenced_pool_idx IS NULL) = (sequenced_pool_item_id IS NULL)
     ),

@@ -75,8 +75,8 @@ CREATE INDEX sequencing_run_instrument_model_idx
 CREATE TABLE qiita.sequenced_pool (
     idx                    BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     sequencing_run_idx     BIGINT NOT NULL REFERENCES qiita.sequencing_run(idx) ON DELETE RESTRICT,
-    samplesheet_blob       BYTEA NOT NULL,
-    samplesheet_filename   TEXT NOT NULL,
+    run_preflight_blob     BYTEA NOT NULL,
+    run_preflight_filename TEXT NOT NULL,
     extra_metadata         JSONB,
     created_by_idx         BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
     created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -99,14 +99,14 @@ CREATE TABLE qiita.sequenced_pool (
 );
 
 COMMENT ON TABLE qiita.sequenced_pool IS
-    'A single post-sequencing samplesheet attached to a sequencing run. For '
+    'A single post-sequencing run preflight attached to a sequencing run. For '
     'platforms with lanes (e.g., illumina), one sequenced_pool row exists per '
     '(run, lane); the lane assignment lives inside the post-sequencing '
-    'samplesheet blob, not as a separate column, so there is a single source '
+    'run preflight blob, not as a separate column, so there is a single source '
     'of truth.';
 
-COMMENT ON COLUMN qiita.sequenced_pool.samplesheet_blob IS
-    'Post-sequencing samplesheet, typically stored as a SQLite database file. '
+COMMENT ON COLUMN qiita.sequenced_pool.run_preflight_blob IS
+    'Post-sequencing run preflight, typically stored as a SQLite database file. '
     'BYTEA holds arbitrary binary; TOAST handles values larger than the inline '
     'threshold.';
 
