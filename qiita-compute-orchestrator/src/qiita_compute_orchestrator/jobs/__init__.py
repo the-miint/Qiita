@@ -24,6 +24,9 @@ package and update the orchestrator to depend on it.
 from __future__ import annotations
 
 import importlib
+import inspect
+import pkgutil
+import types
 from pathlib import Path
 from typing import Any
 
@@ -132,3 +135,77 @@ async def run_native_job(
             step_name=module_name,
             reason=str(exc),
         ) from exc
+
+
+# =============================================================================
+# Boot-time discovery scan
+# =============================================================================
+
+
+def _validate_native_job_module(mod: types.ModuleType) -> list[str]:
+    """Return a list of contract violations for one candidate job module.
+    Empty list means the module is a valid native job. Pure function:
+    no importing, no filesystem access — the scan does that and hands a
+    module object here.
+    """
+    errors: list[str] = []
+    Inputs = getattr(mod, "Inputs", None)
+    execute = getattr(mod, "execute", None)
+    if Inputs is None:
+        errors.append("missing `Inputs`")
+    if execute is None:
+        errors.append("missing `execute`")
+    if errors:
+        # Don't drill deeper — the missing-export errors are the
+        # primary signal; type-checks on a missing attribute would be
+        # noise.
+        return errors
+    if not (isinstance(Inputs, type) and issubclass(Inputs, BaseModel)):
+        errors.append("`Inputs` must be a BaseModel subclass")
+    if not inspect.iscoroutinefunction(execute):
+        errors.append("`execute` must be an async function")
+    return errors
+
+
+def scan_native_jobs() -> list[str]:
+    """Walk the jobs package and validate every non-dunder submodule.
+    Returns the list of validated module names.
+
+    Raises RuntimeError on any contract violation, naming each offending
+    module and what's wrong. Boot scan is the orchestrator's earliest
+    opportunity to catch broken job code; failing fast prevents a job
+    that imports cleanly but is malformed from surprising the runner
+    at submit time.
+
+    The scan does NOT skip underscore-prefixed modules — every
+    non-dunder file under jobs/ must be a valid native job. Shared
+    helpers go in a sibling module outside jobs/ (e.g.
+    qiita_compute_orchestrator/job_helpers.py).
+    """
+    validated: list[str] = []
+    errors: list[str] = []
+    for _finder, modname, _ispkg in pkgutil.walk_packages(__path__, prefix=NATIVE_MODULE_PREFIX):
+        leaf = modname.rsplit(".", 1)[-1]
+        if leaf in ("__init__", "__main__"):
+            continue
+        try:
+            mod = importlib.import_module(modname)
+        except ImportError as exc:
+            errors.append(f"  {modname}: failed to import — {exc}")
+            continue
+        mod_errors = _validate_native_job_module(mod)
+        if mod_errors:
+            errors.append(f"  {modname}: {'; '.join(mod_errors)}")
+            continue
+        validated.append(modname)
+
+    if errors:
+        raise RuntimeError(
+            "native job tree is malformed; refusing to start orchestrator:\n"
+            + "\n".join(errors)
+            + "\n\nShared helpers go in a sibling module outside `jobs/` "
+            "(e.g. `qiita_compute_orchestrator/job_helpers.py`); every "
+            "non-dunder file in `jobs/` must export `Inputs` (BaseModel) "
+            "and `execute` (async)."
+        )
+    return validated
