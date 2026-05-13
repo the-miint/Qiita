@@ -87,9 +87,10 @@ class ActionCeiling(BaselineResources):
 
 
 class WorkflowStep(BaseModel):
-    """SLURM-dispatched workflow step. Runs in one of two runtimes, selected
-    by which field is set — exactly one of `container` or `module` must be
-    populated.
+    """Workflow step. Runs in one of two runtimes, selected by which
+    field is set — exactly one of `container` or `module` must be
+    populated. Whether a particular backend implements each runtime is
+    a backend concern; the schema describes what's expressible.
 
     - `container` form: the step's image is executed via apptainer (or
       in-process via LocalBackend in dev/test). `entrypoint` may override

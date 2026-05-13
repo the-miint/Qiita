@@ -28,6 +28,14 @@ from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
 
 from .context_validator import check_schema
 
+# Sentinel that distinguishes sync-driven disables from out-of-band
+# manual disables. Re-enable and auto-deprecate UPDATEs filter on this
+# exact value: a row whose `disabled_reason` is anything else (a free
+# text reason from a future admin-disable CLI, or NULL) is treated as
+# manually disabled and left alone. Tests import this symbol so a
+# rename here doesn't silently break the manual-disable guarantee.
+AUTO_DEPRECATE_REASON: str = "auto-deprecate-sync"
+
 # `xmax = 0 AS inserted` is the canonical PostgreSQL upsert-discrimination
 # trick: a freshly-inserted row has xmax=0 (no deletion txn), an
 # UPDATE-on-conflict row gets xmax set to the current txn id. Lets us
@@ -63,10 +71,11 @@ RETURNING xmax = 0 AS inserted
 
 
 # Re-enable a row that was previously disabled by a prior sync. The
-# `disabled_reason = 'auto-deprecate-sync'` filter guarantees we only
-# clear rows we set ourselves — manual disables (different reason or
-# NULL) are left alone. Idempotent: a no-op on a row that's already
-# enabled (the `enabled = false` predicate excludes it).
+# `disabled_reason = $3` filter (bound to AUTO_DEPRECATE_REASON)
+# guarantees we only clear rows we set ourselves — manual disables
+# (different reason or NULL) are left alone. Idempotent: a no-op on a
+# row that's already enabled (the `enabled = false` predicate excludes
+# it).
 _RE_ENABLE_SQL = """
 UPDATE qiita.action
    SET enabled         = true,
@@ -76,7 +85,7 @@ UPDATE qiita.action
  WHERE action_id = $1
    AND version = $2
    AND enabled = false
-   AND disabled_reason = 'auto-deprecate-sync'
+   AND disabled_reason = $3
 """
 
 # Auto-deprecate every other version of this action_id. The
@@ -88,7 +97,7 @@ _AUTO_DEPRECATE_OTHERS_SQL = """
 UPDATE qiita.action
    SET enabled         = false,
        disabled_at     = NOW(),
-       disabled_reason = 'auto-deprecate-sync',
+       disabled_reason = $4,
        disabled_by_idx = $3
  WHERE action_id = $1
    AND version != $2
@@ -174,7 +183,7 @@ async def sync_actions(
             # Re-enable this row if a prior sync auto-deprecated it (the
             # git-revert → re-sync path). No-op for freshly-inserted rows
             # and for rows currently in any other disabled state.
-            await conn.execute(_RE_ENABLE_SQL, a.action_id, a.version)
+            await conn.execute(_RE_ENABLE_SQL, a.action_id, a.version, AUTO_DEPRECATE_REASON)
 
             # Auto-deprecate every other version of this action_id.
             await conn.execute(
@@ -182,5 +191,6 @@ async def sync_actions(
                 a.action_id,
                 a.version,
                 SYSTEM_PRINCIPAL_IDX,
+                AUTO_DEPRECATE_REASON,
             )
     return {"inserted": inserted, "updated": updated}

@@ -84,10 +84,16 @@ class LocalBackend(ComputeBackend):
         unit-testable in isolation that way; only the run_step boundary
         wraps."""
         if module is not None:
-            # LocalBackend's name-dispatch is for container steps; native
-            # `module:` steps are routed to the shared
-            # `native_dispatch_not_implemented` helper so the reason
-            # string stays in lock-step with SlurmBackend.
+            # LocalBackend's `run_step` body dispatches by step name
+            # ("hash", "load"); it does NOT yet route to the native
+            # dispatcher `qiita_compute_orchestrator.jobs.run_native_job`.
+            # The two helpers (`_run_hash`, `_run_load`) predate the
+            # `jobs/` package and live here in canonical form — they're
+            # the source of truth that SLURM containers will eventually
+            # share via `run_native_job`. Until that fold-in is wired
+            # below, a `module:` step is declined via the shared
+            # `native_dispatch_not_implemented` helper so the failure
+            # is typed and the reason string matches SlurmBackend's.
             raise native_dispatch_not_implemented(
                 backend_name="LocalBackend", step_name=name, module=module
             )

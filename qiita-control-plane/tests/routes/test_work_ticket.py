@@ -332,6 +332,8 @@ async def test_submit_deprecated_action_returns_410(
     stop trying a permanently-deprecated version."""
     from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
 
+    from qiita_control_plane.actions.sync import AUTO_DEPRECATE_REASON
+
     token, _ = admin_token
     action_id, version = reference_action
 
@@ -339,12 +341,13 @@ async def test_submit_deprecated_action_returns_410(
         "UPDATE qiita.action"
         "   SET enabled = false,"
         "       disabled_at = NOW(),"
-        "       disabled_reason = 'auto-deprecate-sync',"
+        "       disabled_reason = $4,"
         "       disabled_by_idx = $3"
         " WHERE action_id = $1 AND version = $2",
         action_id,
         version,
         SYSTEM_PRINCIPAL_IDX,
+        AUTO_DEPRECATE_REASON,
     )
 
     resp = await wt_client.post(

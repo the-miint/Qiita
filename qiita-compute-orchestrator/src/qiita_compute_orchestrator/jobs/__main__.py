@@ -39,46 +39,63 @@ from pathlib import Path
 from qiita_common.actions import NATIVE_MODULE_PREFIX
 from qiita_common.backend_failure import BackendFailure
 
+from ..slurm.contract import EXPECTED_FILE_MODE, MANIFEST_FILENAME
 from . import run_native_job
 
-# Mode bit set on every file the launcher writes — matches what the
-# data plane and orchestrator's verifier require (qiita-data-plane
-# refuses to register Parquet that isn't 0o440).
-_OUTPUT_FILE_MODE = 0o440
+# Reserved keys in the flattened raw_inputs dict — the framework owns
+# these scalars; a job module's `Inputs` declares them by these names
+# too, so an inputs-map key with the same name would silently shadow
+# the work-ticket value. `_flatten_params` rejects the collision rather
+# than picking a winner.
+_RESERVED_KEYS = frozenset({"reference_idx", "work_ticket_idx"})
 
 
 def _flatten_params(params: dict) -> dict:
-    """Combine the work-ticket scalars and the step's inputs map into
-    a single dict ready for `Inputs.model_validate`.
+    """Combine the work-ticket scalars and the step's inputs map into a
+    single dict ready for `Inputs.model_validate`.
 
-    `params.json` is written by SlurmBackend with the same shape today;
-    keep this helper consistent with it."""
+    Producer side of the contract is `SlurmBackend.run_step`, which
+    writes `params.json` with the shape
+        {
+          "step_name": <str>,
+          "reference_idx": <int>,
+          "work_ticket_idx": <int>,
+          "inputs": {<input_name>: <path>, ...},
+          "output_path": <str>,  # written but ignored here; env var wins
+        }
+    This reader pulls `reference_idx` and `work_ticket_idx` plus every
+    entry of `inputs`. Other keys in params.json are ignored.
+
+    Raises ValueError if the `inputs` map uses any reserved key
+    (would otherwise silently override the framework scalar).
+    """
+    inputs_map = params.get("inputs", {})
+    overlap = sorted(_RESERVED_KEYS & inputs_map.keys())
+    if overlap:
+        raise ValueError(f"params.json `inputs` cannot use framework-reserved names: {overlap}")
     return {
+        **inputs_map,
         "reference_idx": params["reference_idx"],
         "work_ticket_idx": params["work_ticket_idx"],
-        **params.get("inputs", {}),
     }
 
 
 def _collect_files(output_path: Path) -> list[Path]:
-    """Every file under output_path that's NOT manifest.json. Used to
+    """Every file under output_path that's NOT the manifest. Used to
     build the manifest's `files` array — a job may emit directory
     outputs (e.g. `staging_dir`) and the verifier wants each constituent
     file listed."""
-    return [
-        p
-        for p in output_path.rglob("*")
-        if p.is_file() and p.resolve() != (output_path / "manifest.json").resolve()
-    ]
+    manifest_resolved = (output_path / MANIFEST_FILENAME).resolve()
+    return [p for p in output_path.rglob("*") if p.is_file() and p.resolve() != manifest_resolved]
 
 
-def _chmod_440(paths) -> None:
+def _chmod(paths) -> None:
     for p in paths:
-        p.chmod(_OUTPUT_FILE_MODE)
+        p.chmod(EXPECTED_FILE_MODE)
 
 
 def _write_manifest(output_path: Path, outputs: dict[str, Path]) -> None:
-    """Produce manifest.json. Outputs map values are stored as paths
+    """Produce the manifest. Outputs map values are stored as paths
     relative to `output_path` so the verifier can rebuild them with
     `output_path / value`."""
     output_path_resolved = output_path.resolve()
@@ -99,9 +116,9 @@ def _write_manifest(output_path: Path, outputs: dict[str, Path]) -> None:
         else:
             outputs_map[name] = str(resolved.relative_to(output_path_resolved))
     manifest = {"files": files_listing, "outputs": outputs_map}
-    manifest_path = output_path / "manifest.json"
+    manifest_path = output_path / MANIFEST_FILENAME
     manifest_path.write_text(json.dumps(manifest))
-    manifest_path.chmod(_OUTPUT_FILE_MODE)
+    manifest_path.chmod(EXPECTED_FILE_MODE)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -133,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    _chmod_440(_collect_files(output_path))
+    _chmod(_collect_files(output_path))
     _write_manifest(output_path, outputs)
     return 0
 

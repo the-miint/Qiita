@@ -167,9 +167,17 @@ def _validate_native_job_module(mod: types.ModuleType) -> list[str]:
     return errors
 
 
-def scan_native_jobs() -> list[str]:
+def scan_native_jobs(
+    *,
+    package_path: list[str] | None = None,
+    prefix: str = NATIVE_MODULE_PREFIX,
+) -> list[str]:
     """Walk the jobs package and validate every non-dunder submodule.
     Returns the list of validated module names.
+
+    `package_path` and `prefix` default to the real jobs package; tests
+    override them to scan a synthetic tree without touching the real
+    `jobs/` directory.
 
     Raises RuntimeError on any contract violation, naming each offending
     module and what's wrong. Boot scan is the orchestrator's earliest
@@ -182,9 +190,11 @@ def scan_native_jobs() -> list[str]:
     helpers go in a sibling module outside jobs/ (e.g.
     qiita_compute_orchestrator/job_helpers.py).
     """
+    if package_path is None:
+        package_path = __path__
     validated: list[str] = []
     errors: list[str] = []
-    for _finder, modname, _ispkg in pkgutil.walk_packages(__path__, prefix=NATIVE_MODULE_PREFIX):
+    for _finder, modname, _ispkg in pkgutil.walk_packages(package_path, prefix=prefix):
         leaf = modname.rsplit(".", 1)[-1]
         if leaf in ("__init__", "__main__"):
             continue

@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-from qiita_compute_orchestrator.jobs.__main__ import main
+from qiita_compute_orchestrator.jobs.__main__ import _flatten_params, main
 
 
 class _Inputs(BaseModel):
@@ -119,6 +119,34 @@ def test_main_handles_directory_output(monkeypatch, io_dirs):
     assert manifest["outputs"] == {"staging_dir": "."}
     paths = sorted(entry["path"] for entry in manifest["files"])
     assert paths == ["a.parquet", "b.parquet"]
+
+
+def test_flatten_params_merges_scalars_and_inputs():
+    """Happy path: framework scalars and step inputs land in one flat
+    dict ready for Inputs.model_validate."""
+    params = {
+        "step_name": "fastq",
+        "reference_idx": 7,
+        "work_ticket_idx": 99,
+        "inputs": {"fastq_path": "/data/in.fa"},
+        "output_path": "/scratch/out",  # ignored
+    }
+    flat = _flatten_params(params)
+    assert flat == {"fastq_path": "/data/in.fa", "reference_idx": 7, "work_ticket_idx": 99}
+
+
+def test_flatten_params_rejects_reserved_key_collision():
+    """If the workflow YAML's `inputs:` list happens to declare a name
+    that matches a framework scalar (e.g. `reference_idx`), the
+    launcher refuses rather than silently shadowing the work-ticket
+    value."""
+    params = {
+        "reference_idx": 7,
+        "work_ticket_idx": 99,
+        "inputs": {"reference_idx": "/data/in.fa"},  # accidental collision
+    }
+    with pytest.raises(ValueError, match="reference_idx"):
+        _flatten_params(params)
 
 
 def test_main_returns_1_and_prints_structured_error_on_backend_failure(

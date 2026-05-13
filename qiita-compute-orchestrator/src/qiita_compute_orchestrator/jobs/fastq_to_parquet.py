@@ -1,9 +1,7 @@
-"""Native job: fastq → parquet conversion. Skeleton.
-
-`execute` raises NotImplementedError today; the real conversion lands
-in a follow-up PR. The skeleton's role is to exercise the native-step
-dispatch path in tests (and to validate the job-module convention:
-`Inputs` Pydantic model + async `execute`).
+"""Native job: fastq → parquet conversion. Skeleton — `execute` raises
+NotImplementedError so the dispatch path can be exercised in tests
+without a working conversion. The two-symbol convention (`Inputs`
+Pydantic model + async `execute`) is also under test here.
 """
 
 from __future__ import annotations

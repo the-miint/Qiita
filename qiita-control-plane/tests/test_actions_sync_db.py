@@ -10,7 +10,7 @@ UPDATEs are exercised:
 - Bump path (1.0.0 → 1.1.0) → 1.0.0 auto-deprecated, 1.1.0 enabled.
 - Revert path (1.1.0 gone, only 1.0.0 on disk) → 1.0.0 re-enabled,
   1.1.0 auto-deprecated.
-- Manual disable (any disabled_reason ≠ 'auto-deprecate-sync') is not
+- Manual disable (any disabled_reason ≠ AUTO_DEPRECATE_REASON) is not
   clobbered by re-sync — attribution stays intact.
 """
 
@@ -29,7 +29,7 @@ from qiita_common.actions import (
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
 from qiita_common.models import ScopeTargetKind, StepType
 
-from qiita_control_plane.actions.sync import sync_actions
+from qiita_control_plane.actions.sync import AUTO_DEPRECATE_REASON, sync_actions
 
 pytestmark = pytest.mark.db
 
@@ -113,7 +113,7 @@ async def test_sync_auto_deprecates_other_versions(postgres_pool, fresh_action_i
     old = await _action_row(postgres_pool, fresh_action_id, "1.0.0")
     assert old["enabled"] is False
     assert old["disabled_at"] is not None
-    assert old["disabled_reason"] == "auto-deprecate-sync"
+    assert old["disabled_reason"] == AUTO_DEPRECATE_REASON
     assert old["disabled_by_idx"] == SYSTEM_PRINCIPAL_IDX
 
     new = await _action_row(postgres_pool, fresh_action_id, "1.1.0")
@@ -146,7 +146,7 @@ async def test_sync_re_enables_previously_auto_deprecated(postgres_pool, fresh_a
 
     now_disabled = await _action_row(postgres_pool, fresh_action_id, "1.1.0")
     assert now_disabled["enabled"] is False
-    assert now_disabled["disabled_reason"] == "auto-deprecate-sync"
+    assert now_disabled["disabled_reason"] == AUTO_DEPRECATE_REASON
     assert now_disabled["disabled_by_idx"] == SYSTEM_PRINCIPAL_IDX
 
 

@@ -102,10 +102,14 @@ class SlurmBackend(ComputeBackend):
         baseline_resources: StepBaselineResources | None = None,
     ) -> dict[str, Path]:
         if module is not None:
-            # SlurmBackend's payload builder is container-only; native
-            # `module:` steps are routed to the shared
-            # `native_dispatch_not_implemented` helper so the reason
-            # string stays in lock-step with LocalBackend.
+            # SlurmBackend currently emits an `apptainer exec` SBATCH
+            # script via `build_job_submit_payload`. The native-step
+            # form (`srun python -m qiita_compute_orchestrator.jobs
+            # --job <name>`) is built by `jobs/__main__.py` but isn't
+            # wired into the payload builder here. Until that branch
+            # lands, a `module:` step is declined via the shared
+            # `native_dispatch_not_implemented` helper so the failure
+            # is typed and the reason string matches LocalBackend's.
             raise native_dispatch_not_implemented(
                 backend_name="SlurmBackend", step_name=name, module=module
             )
