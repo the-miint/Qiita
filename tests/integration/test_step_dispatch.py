@@ -64,6 +64,10 @@ async def test_step_dispatch_hash_end_to_end(orchestrator_app, tmp_path):
             workspace=workspace,
             reference_idx=1,
             work_ticket_idx=1,
+            # Required by StepRunRequest's exactly-one(container, module)
+            # validator. LocalBackend ignores the value for the hash step
+            # (name-dispatch into _run_hash); the field declares the runtime.
+            container="qiita/reference-hash:1.0.0",
         )
 
     manifest = outputs["manifest"]
@@ -102,5 +106,6 @@ async def test_step_dispatch_rejects_wrong_token(orchestrator_app, tmp_path):
                 workspace=tmp_path,
                 reference_idx=1,
                 work_ticket_idx=1,
+                container="qiita/reference-hash:1.0.0",
             )
         assert exc_info.value.response.status_code == 401
