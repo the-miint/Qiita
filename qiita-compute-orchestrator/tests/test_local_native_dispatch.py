@@ -116,6 +116,46 @@ async def test_bad_prefix_maps_to_contract_violation(tmp_path):
     assert "os.system" in ei.value.reason
 
 
+async def test_rejects_both_container_and_module(tmp_path):
+    """Mirror of SlurmBackend's S3 guard: both runtime fields set is a
+    contract violation. The wire validator catches this upstream; this
+    guard protects direct callers so LocalBackend can't silently pick
+    one runtime over the other."""
+    backend = LocalBackend()
+
+    with pytest.raises(BackendFailure) as ei:
+        await backend.run_step(
+            "x",
+            {},
+            tmp_path,
+            reference_idx=1,
+            work_ticket_idx=1,
+            container="qiita/test:1.0.0",
+            module="qiita_compute_orchestrator.jobs.fastq_to_parquet",
+        )
+    assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
+    assert "exactly one" in ei.value.reason
+
+
+async def test_rejects_neither_container_nor_module(tmp_path):
+    """Mirror of SlurmBackend's S3 guard: neither runtime field is also
+    a contract violation. With both runtime fields default-None, calls
+    that forgot to declare a runtime fail fast with a typed failure
+    rather than falling through to the legacy name-dispatch."""
+    backend = LocalBackend()
+
+    with pytest.raises(BackendFailure) as ei:
+        await backend.run_step(
+            "hash",
+            {},
+            tmp_path,
+            reference_idx=1,
+            work_ticket_idx=1,
+        )
+    assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
+    assert "exactly one" in ei.value.reason
+
+
 async def test_dispatcher_failures_propagate_through_local_backend(monkeypatch, tmp_path):
     """A BackendFailure raised inside run_native_job flows through
     LocalBackend unchanged — LocalBackend doesn't intercept or

@@ -73,7 +73,7 @@ class LocalBackend(ComputeBackend):
         *,
         reference_idx: int,
         work_ticket_idx: int,  # noqa: ARG002 — accepted for protocol parity
-        container: str | None = None,  # noqa: ARG002 — LocalBackend ignores container in dev/test
+        container: str | None = None,  # inspected by the runtime guard below; otherwise ignored
         module: str | None = None,  # inspected by the native-dispatch guard below
         entrypoint: str | None = None,  # noqa: ARG002 — LocalBackend ignores entrypoint
         baseline_resources=None,  # noqa: ARG002 — accepted for protocol parity
@@ -84,6 +84,19 @@ class LocalBackend(ComputeBackend):
         `_write_*`) keep raising plain Python exceptions — they're
         unit-testable in isolation that way; only the run_step boundary
         wraps."""
+        if (container is None) == (module is None):
+            # Symmetric with SlurmBackend's guard: both None (neither
+            # runtime declared) and both set (ambiguous runtime) are
+            # contract violations. The wire validator on StepRunRequest
+            # catches this upstream; this guard protects direct callers
+            # (tests, programmatic submission) so silently preferring
+            # one runtime over the other can't happen.
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=name,
+                reason="LocalBackend requires exactly one of `container` or `module` on the step",
+            )
         if module is not None:
             # Native step: delegate to the framework dispatcher. It
             # validates the module prefix, imports the module,

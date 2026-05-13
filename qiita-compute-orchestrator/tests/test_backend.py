@@ -66,7 +66,14 @@ async def test_local_backend_rejects_unknown_step():
 
     backend = LocalBackend()
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step("nonexistent", {}, Path("/fake"), reference_idx=1, work_ticket_idx=1)
+        await backend.run_step(
+            "nonexistent",
+            {},
+            Path("/fake"),
+            reference_idx=1,
+            work_ticket_idx=1,
+            container="qiita/test:1.0.0",
+        )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
     assert ei.value.stage == WorkTicketFailureStage.STEP_RUN
     assert ei.value.step_name == "nonexistent"

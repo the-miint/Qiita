@@ -114,6 +114,7 @@ async def _run_load(backend, manifest_file, fasta_path, feature_map_file, tmp_pa
         output_dir,
         reference_idx=REFERENCE_IDX,
         work_ticket_idx=1,
+        container="qiita/reference-load:1.0.0",
     )
     return result["staging_dir"]
 
@@ -327,6 +328,7 @@ async def test_phylogeny_allows_unmatched_tips(
         out,
         reference_idx=REFERENCE_IDX,
         work_ticket_idx=1,
+        container="qiita/reference-load:1.0.0",
     )
 
     pq = result["staging_dir"] / "reference_phylogeny.parquet"
@@ -376,6 +378,7 @@ async def test_rejects_missing_manifest(fasta_path, feature_map_file, tmp_path):
             tmp_path / "out",
             reference_idx=REFERENCE_IDX,
             work_ticket_idx=1,
+            container="qiita/reference-load:1.0.0",
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
     assert ei.value.step_name == "load"
@@ -407,6 +410,7 @@ async def test_rejects_unmapped_hash(manifest_file, fasta_path, tmp_path):
             tmp_path / "out",
             reference_idx=REFERENCE_IDX,
             work_ticket_idx=1,
+            container="qiita/reference-load:1.0.0",
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
     assert "unmapped" in ei.value.reason

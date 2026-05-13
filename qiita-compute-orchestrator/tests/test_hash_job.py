@@ -33,6 +33,7 @@ async def test_hash_job_produces_manifest(fasta_file, tmp_path):
         output_dir,
         reference_idx=1,
         work_ticket_idx=1,
+        container="qiita/reference-hash:1.0.0",
     )
     manifest_path = result["manifest"]
 
@@ -57,6 +58,7 @@ async def test_hash_job_md5_matches_python(fasta_file, tmp_path):
         output_dir,
         reference_idx=1,
         work_ticket_idx=1,
+        container="qiita/reference-hash:1.0.0",
     )
     manifest_path = result["manifest"]
 
@@ -84,6 +86,7 @@ async def test_hash_job_manifest_has_required_columns(fasta_file, tmp_path):
         output_dir,
         reference_idx=1,
         work_ticket_idx=1,
+        container="qiita/reference-hash:1.0.0",
     )
     manifest_path = result["manifest"]
 
@@ -110,6 +113,7 @@ async def test_hash_job_rejects_missing_fasta(tmp_path):
             tmp_path / "output",
             reference_idx=1,
             work_ticket_idx=1,
+            container="qiita/reference-hash:1.0.0",
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
     assert ei.value.step_name == "hash"
@@ -133,6 +137,7 @@ async def test_hash_job_rejects_duplicate_read_ids(tmp_path):
             tmp_path / "output",
             reference_idx=1,
             work_ticket_idx=1,
+            container="qiita/reference-hash:1.0.0",
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
     assert "duplicate read_id" in ei.value.reason
@@ -153,6 +158,7 @@ async def test_hash_job_empty_fasta(tmp_path):
         tmp_path / "output",
         reference_idx=1,
         work_ticket_idx=1,
+        container="qiita/reference-hash:1.0.0",
     )
     manifest_path = result["manifest"]
 
