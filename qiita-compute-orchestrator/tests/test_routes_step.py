@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 from qiita_common.api_paths import URL_STEP_RUN
+from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER
 
 from qiita_compute_orchestrator.backend import ComputeBackend
 from qiita_compute_orchestrator.main import app
@@ -126,7 +127,7 @@ def test_step_run_dispatches_to_backend(http_client, cp_to_co_token, tmp_path):
             # Required by StepRunRequest's exactly-one(container, module)
             # validator. The route test doesn't care which runtime drives
             # the recording backend; container is the simpler choice.
-            "container": "qiita/reference-hash:1.0.0",
+            "container": REFERENCE_HASH_CONTAINER,
         },
     )
     assert resp.status_code == 200, resp.text
@@ -141,7 +142,7 @@ def test_step_run_dispatches_to_backend(http_client, cp_to_co_token, tmp_path):
     assert call.workspace == tmp_path
     assert call.reference_idx == 7
     assert call.work_ticket_idx == 99
-    assert call.container == "qiita/reference-hash:1.0.0"
+    assert call.container == REFERENCE_HASH_CONTAINER
     assert call.module is None
     assert call.entrypoint is None
     assert call.baseline_resources is None
@@ -232,7 +233,7 @@ def test_step_run_serializes_backend_failure(http_client, cp_to_co_token, tmp_pa
             "workspace": str(tmp_path),
             "reference_idx": 1,
             "work_ticket_idx": 1,
-            "container": "qiita/reference-hash:1.0.0",
+            "container": REFERENCE_HASH_CONTAINER,
         },
     )
     assert resp.status_code == BACKEND_FAILURE_HTTP_STATUS
@@ -302,7 +303,7 @@ def test_step_run_rejects_payload_with_both_runtimes(http_client, cp_to_co_token
             "workspace": str(tmp_path),
             "reference_idx": 1,
             "work_ticket_idx": 1,
-            "container": "qiita/reference-hash:1.0.0",
+            "container": REFERENCE_HASH_CONTAINER,
             "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
         },
     )

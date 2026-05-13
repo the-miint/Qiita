@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import ScopeTargetKind, StepType
+from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER
 
 
 def _minimal_action_kwargs() -> dict:
@@ -28,7 +29,7 @@ def _minimal_action_kwargs() -> dict:
             {
                 "step": "hash",
                 "step_type": StepType.SINGLETON,
-                "container": "qiita/reference-hash:1.0.0",
+                "container": REFERENCE_HASH_CONTAINER,
                 "baseline_resources": {
                     "cpu": 4,
                     "mem_gb": 8,

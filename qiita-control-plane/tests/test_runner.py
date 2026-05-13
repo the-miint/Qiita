@@ -21,6 +21,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER, REFERENCE_LOAD_CONTAINER
 
 pytestmark = pytest.mark.db
 
@@ -117,7 +118,7 @@ _REFERENCE_ADD_STEPS = [
         "kind": "step",
         "name": "hash",
         "step_type": "singleton",
-        "container": "qiita/reference-hash:1.0.0",
+        "container": REFERENCE_HASH_CONTAINER,
         "target_status": "hashing",
         "inputs": ["fasta_path"],
         "outputs": ["manifest"],
@@ -140,7 +141,7 @@ _REFERENCE_ADD_STEPS = [
         "kind": "step",
         "name": "load",
         "step_type": "singleton",
-        "container": "qiita/reference-load:1.0.0",
+        "container": REFERENCE_LOAD_CONTAINER,
         "target_status": "loading",
         "inputs": ["fasta_path", "manifest", "feature_map"],
         "outputs": ["staging_dir"],

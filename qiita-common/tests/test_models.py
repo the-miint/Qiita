@@ -6,6 +6,8 @@ from uuid import UUID
 import pytest
 from pydantic import ValidationError
 
+from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER
+
 
 def test_reference_status_enum():
     """ReferenceStatus must have the expected values."""
@@ -173,7 +175,7 @@ def _minimal_step_run_kwargs() -> dict:
         workspace="/workspace",
         reference_idx=1,
         work_ticket_idx=1,
-        container="qiita/reference-hash:1.0.0",
+        container=REFERENCE_HASH_CONTAINER,
     )
 
 
@@ -181,7 +183,7 @@ def test_step_run_request_container_form_validates():
     from qiita_common.models import StepRunRequest
 
     req = StepRunRequest(**_minimal_step_run_kwargs())
-    assert req.container == "qiita/reference-hash:1.0.0"
+    assert req.container == REFERENCE_HASH_CONTAINER
     assert req.module is None
 
 
