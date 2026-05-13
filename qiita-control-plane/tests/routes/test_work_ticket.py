@@ -320,6 +320,40 @@ async def test_submit_unknown_action_returns_404(wt_client, admin_token, referen
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 404
+    assert "not found" in resp.text
+
+
+async def test_submit_deprecated_action_returns_410(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """An action whose row exists but is `enabled=false` returns HTTP
+    410 Gone — distinct from the 404 returned for an unknown
+    action_id+version. The distinction lets clients that retry on 404
+    stop trying a permanently-deprecated version."""
+    from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
+
+    token, _ = admin_token
+    action_id, version = reference_action
+
+    await postgres_pool.execute(
+        "UPDATE qiita.action"
+        "   SET enabled = false,"
+        "       disabled_at = NOW(),"
+        "       disabled_reason = 'auto-deprecate-sync',"
+        "       disabled_by_idx = $3"
+        " WHERE action_id = $1 AND version = $2",
+        action_id,
+        version,
+        SYSTEM_PRINCIPAL_IDX,
+    )
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json=_body(action_id, version, reference_idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 410
+    assert "deprecated" in resp.text
 
 
 async def test_submit_wrong_role_returns_403(

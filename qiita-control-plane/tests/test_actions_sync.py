@@ -53,11 +53,16 @@ def _build_action(*, context_schema: dict) -> ActionDefinition:
 
 class _FakeConn:
     """asyncpg.Connection-shaped stub. `transaction()` returns an async
-    context manager; `fetchrow` records calls so the test can assert
-    they did NOT happen when validation rejects the action."""
+    context manager; `fetchrow` and `execute` record calls so tests can
+    assert what SQL did or did not run.
+
+    Note: real behavior of the re-enable and auto-deprecate UPDATE
+    statements is exercised by the DB-marked integration tests under
+    tests/test_actions_sync_db.py."""
 
     def __init__(self):
         self.fetchrow = AsyncMock(return_value={"inserted": True})
+        self.execute = AsyncMock(return_value="UPDATE 0")
         self._transaction = MagicMock()
         self._transaction.__aenter__ = AsyncMock(return_value=None)
         self._transaction.__aexit__ = AsyncMock(return_value=None)
@@ -75,8 +80,9 @@ async def test_sync_actions_rejects_malformed_schema_before_any_write():
     with pytest.raises(SchemaError):
         await sync_actions(conn, [bad_action])
 
-    # No upsert SQL was issued.
+    # No upsert or reconciliation SQL was issued.
     assert conn.fetchrow.await_count == 0
+    assert conn.execute.await_count == 0
 
 
 async def test_sync_actions_accepts_valid_schema():
@@ -91,4 +97,42 @@ async def test_sync_actions_accepts_valid_schema():
 
     result = await sync_actions(conn, [good_action])
     assert result == {"inserted": 1, "updated": 0}
+    # One upsert (fetchrow) + two reconciliation UPDATEs (execute):
+    # one re-enable, one auto-deprecate-others.
     assert conn.fetchrow.await_count == 1
+    assert conn.execute.await_count == 2
+
+
+async def test_sync_actions_rejects_bad_module_prefix_before_any_write():
+    """A step with a module path outside NATIVE_MODULE_PREFIX is rejected
+    before the transaction opens — fail-fast before any DB write."""
+    bad_action = ActionDefinition(
+        action_id="test-action",
+        version="1.0",
+        target_kind=ScopeTargetKind.REFERENCE,
+        scopes=["reference:write"],
+        audience=Audience(service=False, human_roles=["system_admin"]),
+        context_schema={},
+        steps=[
+            {
+                "kind": "step",
+                "name": "native",
+                "step_type": StepType.SINGLETON,
+                # Wrong prefix — should be qiita_compute_orchestrator.jobs.*.
+                "module": "os.system",
+                "baseline_resources": {
+                    "cpu": 1,
+                    "mem_gb": 1,
+                    "walltime": timedelta(minutes=1),
+                },
+            }
+        ],
+        action_ceiling=ActionCeiling(cpu=1, mem_gb=1, walltime=timedelta(minutes=1), gpu=0),
+    )
+    conn = _FakeConn()
+
+    with pytest.raises(ValueError, match="qiita_compute_orchestrator.jobs"):
+        await sync_actions(conn, [bad_action])
+
+    assert conn.fetchrow.await_count == 0
+    assert conn.execute.await_count == 0

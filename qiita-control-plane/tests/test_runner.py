@@ -48,13 +48,14 @@ class FakeBackendClient:
         reference_idx: int,
         work_ticket_idx: int,
         container: str | None = None,
+        module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources=None,
     ) -> dict[str, Path]:
         # Accepted for protocol parity (the runner now forwards container
         # metadata for SlurmBackend); the LocalBackend-shaped fake here
         # ignores them.
-        del work_ticket_idx, container, entrypoint, baseline_resources
+        del work_ticket_idx, container, module, entrypoint, baseline_resources
         self.calls.append((step_name, dict(inputs), workspace, reference_idx))
         outputs = self.outputs_for.get(step_name, {})
         for path in outputs.values():
@@ -522,13 +523,14 @@ class _RetryingBackendClient:
         reference_idx: int,
         work_ticket_idx: int,
         container: str | None = None,
+        module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources=None,
     ) -> dict[str, Path]:
         from qiita_common.backend_failure import BackendFailure
         from qiita_common.models import WorkTicketFailureStage
 
-        del work_ticket_idx, container, entrypoint, baseline_resources
+        del work_ticket_idx, container, module, entrypoint, baseline_resources
         self.attempts[step_name] = self.attempts.get(step_name, 0) + 1
         if step_name == self.fail_step and self.attempts[step_name] <= self.fail_n_times:
             raise BackendFailure(

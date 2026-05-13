@@ -80,15 +80,17 @@ async def _fetch_action_for_submission(
     pool: asyncpg.Pool, action_id: str, action_version: str
 ) -> dict[str, Any] | None:
     """Read just the columns the submission gate needs. Returns None if
-    the action does not exist or is disabled.
+    the action does not exist; returns a dict including `enabled` if it
+    does (so the caller can distinguish "not found" from "deprecated"
+    and respond with the right HTTP status — 404 vs 410).
 
     `audience` is parsed via the `Audience` Pydantic model — JSONB drift
     (renamed/removed field) becomes a loud ValidationError at submission
     rather than a silent default in the audience check below."""
     row = await pool.fetchrow(
-        "SELECT target_kind, scopes, audience, context_schema"
+        "SELECT target_kind, scopes, audience, context_schema, enabled"
         " FROM qiita.action"
-        " WHERE action_id = $1 AND version = $2 AND enabled = true",
+        " WHERE action_id = $1 AND version = $2",
         action_id,
         action_version,
     )
@@ -101,6 +103,7 @@ async def _fetch_action_for_submission(
         # as a string by default.
         "audience": Audience.model_validate_json(row["audience"]),
         "context_schema": json.loads(row["context_schema"]),
+        "enabled": row["enabled"],
     }
 
 
@@ -250,7 +253,16 @@ async def submit_work_ticket(
     if action is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"action ({body.action_id!r}, {body.action_version!r}) not found or disabled",
+            detail=f"action ({body.action_id!r}, {body.action_version!r}) not found",
+        )
+    if not action["enabled"]:
+        # 410 Gone — the action_id/version pair exists in the catalog
+        # but has been deprecated (sync replaced it with a newer version,
+        # or an operator disabled it). Distinct from 404 so clients that
+        # auto-retry on 404 don't keep trying a permanently-gone version.
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail=f"action ({body.action_id!r}, {body.action_version!r}) is deprecated",
         )
 
     _check_audience(principal, action["audience"])
@@ -353,9 +365,12 @@ async def run_work_ticket(
         )
 
     # Re-apply the action's audience+scopes gate. Without this, anyone
-    # who guesses a ticket idx could redrive arbitrary work.
+    # who guesses a ticket idx could redrive arbitrary work. Treat
+    # "row missing" and "row exists but disabled" the same for redrive:
+    # both mean the action is unreachable from this ticket. Submission
+    # cares about the distinction (404 vs 410); redrive doesn't.
     action = await _fetch_action_for_submission(pool, row["action_id"], row["action_version"])
-    if action is None:
+    if action is None or not action["enabled"]:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(

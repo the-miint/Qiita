@@ -1,18 +1,30 @@
 """Upsert ActionDefinition rows into qiita.action.
 
-Only YAML-authoritative columns are written. DB-authoritative state
-(`enabled`, `first_seen_at`, `disabled_*`) is preserved across syncs;
-re-adding a YAML for an action an operator manually disabled does NOT
-re-enable it.
+Only YAML-authoritative columns are written via the upsert. DB-authoritative
+state (`enabled`, `first_seen_at`, `disabled_*`) is preserved across syncs
+except for the two reconciliation passes below:
 
-The whole batch runs in one transaction so a partial failure leaves the
-catalog at its previous state — better than half-applied YAML.
+- **Re-enable** any version of a synced action_id whose row is currently
+  disabled with `disabled_reason='auto-deprecate-sync'`. This is the
+  `git revert` → re-sync path: a previously auto-deprecated row reappears
+  on disk and becomes enabled again. Operator manual disables (any other
+  `disabled_reason`) are NOT touched.
+- **Auto-deprecate** any *other* version of the same action_id that is
+  currently enabled. This is the bump path: adding `1.1.0` to a directory
+  that already has `1.0.0` in the DB leaves only `1.1.0` enabled. The
+  `enabled = true` WHERE filter keeps re-syncs idempotent and out-of-band
+  manual disables untouched.
+
+The whole batch (including reconciliation) runs in one transaction so a
+partial failure leaves the catalog at its previous state — better than
+half-applied YAML.
 """
 
 import json
 
 import asyncpg
-from qiita_common.actions import ActionDefinition
+from qiita_common.actions import NATIVE_MODULE_PREFIX, ActionDefinition
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
 
 from .context_validator import check_schema
 
@@ -50,17 +62,80 @@ RETURNING xmax = 0 AS inserted
 """
 
 
+# Re-enable a row that was previously disabled by a prior sync. The
+# `disabled_reason = 'auto-deprecate-sync'` filter guarantees we only
+# clear rows we set ourselves — manual disables (different reason or
+# NULL) are left alone. Idempotent: a no-op on a row that's already
+# enabled (the `enabled = false` predicate excludes it).
+_RE_ENABLE_SQL = """
+UPDATE qiita.action
+   SET enabled         = true,
+       disabled_at     = NULL,
+       disabled_reason = NULL,
+       disabled_by_idx = NULL
+ WHERE action_id = $1
+   AND version = $2
+   AND enabled = false
+   AND disabled_reason = 'auto-deprecate-sync'
+"""
+
+# Auto-deprecate every other version of this action_id. The
+# `enabled = true` filter keeps re-syncs idempotent and out-of-band
+# manual disables untouched (they're already disabled; this UPDATE
+# skips them so their `disabled_by_idx` attribution stays on the human
+# who turned them off).
+_AUTO_DEPRECATE_OTHERS_SQL = """
+UPDATE qiita.action
+   SET enabled         = false,
+       disabled_at     = NOW(),
+       disabled_reason = 'auto-deprecate-sync',
+       disabled_by_idx = $3
+ WHERE action_id = $1
+   AND version != $2
+   AND enabled = true
+"""
+
+
+def _validate_native_module_prefixes(actions: list[ActionDefinition]) -> None:
+    """Refuse to sync if any step declares a `module:` path outside
+    `NATIVE_MODULE_PREFIX`. Pure string check — the control plane does
+    not have the orchestrator's deps and cannot import the module to
+    verify it exists; that's the orchestrator's boot scan's job.
+
+    Runs before the transaction opens so a typo'd YAML can't half-apply.
+    """
+    errors = []
+    for a in actions:
+        for entry in a.steps:
+            module = getattr(entry, "module", None)
+            if module is not None and not module.startswith(NATIVE_MODULE_PREFIX):
+                errors.append(
+                    f"  action {a.action_id!r}/{a.version!r} step {entry.name!r}:"
+                    f" module={module!r} must start with {NATIVE_MODULE_PREFIX!r}"
+                )
+    if errors:
+        raise ValueError(
+            f"native step modules must live under {NATIVE_MODULE_PREFIX!r}:\n" + "\n".join(errors)
+        )
+
+
 async def sync_actions(
     conn: asyncpg.Connection,
     actions: list[ActionDefinition],
 ) -> dict[str, int]:
-    """Upsert each ActionDefinition. Returns {"inserted": N, "updated": M}.
+    """Upsert each ActionDefinition; reconcile `enabled` per the module
+    docstring. Returns {"inserted": N, "updated": M} for the upsert
+    counts only — the reconciliation passes don't contribute.
 
     asyncpg auto-converts datetime.timedelta to INTERVAL, so walltime fields
     pass through without manual encoding. JSONB columns get pre-encoded as
     JSON strings and cast `::jsonb` in the SQL — avoids needing a per-conn
     type codec registration just for sync.
     """
+    # Fail-fast outside the transaction: a typo'd module path should not
+    # open and roll back a Postgres transaction.
+    _validate_native_module_prefixes(actions)
+
     inserted = 0
     updated = 0
     async with conn.transaction():
@@ -95,4 +170,17 @@ async def sync_actions(
                 inserted += 1
             else:
                 updated += 1
+
+            # Re-enable this row if a prior sync auto-deprecated it (the
+            # git-revert → re-sync path). No-op for freshly-inserted rows
+            # and for rows currently in any other disabled state.
+            await conn.execute(_RE_ENABLE_SQL, a.action_id, a.version)
+
+            # Auto-deprecate every other version of this action_id.
+            await conn.execute(
+                _AUTO_DEPRECATE_OTHERS_SQL,
+                a.action_id,
+                a.version,
+                SYSTEM_PRINCIPAL_IDX,
+            )
     return {"inserted": inserted, "updated": updated}
