@@ -29,6 +29,7 @@ from pydantic import BaseModel
 from qiita_common.backend_failure import BackendFailure, FailureKind
 
 from qiita_compute_orchestrator.backends.local import LocalBackend
+from qiita_compute_orchestrator.jobs import RESERVED_INPUT_KEYS
 
 
 class _Inputs(BaseModel):
@@ -159,12 +160,14 @@ async def test_rejects_neither_container_nor_module(tmp_path):
     assert "exactly one" in ei.value.reason
 
 
-async def test_rejects_inputs_overlap_with_framework_scalars(monkeypatch, tmp_path):
+@pytest.mark.parametrize("reserved_key", sorted(RESERVED_INPUT_KEYS))
+async def test_rejects_inputs_overlap_with_framework_scalars(reserved_key, monkeypatch, tmp_path):
     """If the workflow's `inputs:` list collides with a framework
-    scalar (`reference_idx` or `work_ticket_idx`), LocalBackend
-    surfaces it as BackendFailure(CONTRACT_VIOLATION) — symmetric
-    with the SLURM launcher's path through the same
-    `_flatten_native_inputs` helper."""
+    scalar (any name in RESERVED_INPUT_KEYS), LocalBackend surfaces
+    it as BackendFailure(CONTRACT_VIOLATION) — symmetric with the
+    SLURM launcher's path through the same `flatten_native_inputs`
+    helper. Parameterized so adding a fourth reserved name doesn't
+    need a hardcoded-string test update."""
 
     async def execute(inputs, workspace):
         raise RuntimeError("should not reach execute()")
@@ -177,14 +180,14 @@ async def test_rejects_inputs_overlap_with_framework_scalars(monkeypatch, tmp_pa
             "fastq",
             # The step's input map happens to declare a name that
             # shadows the framework scalar — the helper rejects.
-            {"reference_idx": tmp_path / "evil.fa"},
+            {reserved_key: tmp_path / "evil.fa"},
             tmp_path,
             reference_idx=1,
             work_ticket_idx=1,
             module=full,
         )
     assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
-    assert "reference_idx" in ei.value.reason
+    assert reserved_key in ei.value.reason
 
 
 async def test_dispatcher_failures_propagate_through_local_backend(monkeypatch, tmp_path):

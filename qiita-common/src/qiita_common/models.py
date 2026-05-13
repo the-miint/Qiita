@@ -147,13 +147,10 @@ class StepRunRequest(BaseModel):
     `run_step`. Paths are absolute and live on the workspace shared
     between control plane and orchestrator.
 
-    Runtime is selected by which of `container` or `module` is set —
-    exactly one must be present, enforced by the @model_validator below.
-    The container form drives the apptainer-exec path on either backend;
-    the module form names a Python module under
-    `qiita_compute_orchestrator.jobs.*`. Whether a particular backend
-    implements native dispatch is a per-backend concern; the wire shape
-    is the same regardless.
+    Runtime selection (`container` vs `module`) follows the same rules
+    as `qiita_common.actions.WorkflowStep` — exactly one must be set,
+    enforced by the same `check_exactly_one_runtime` helper. See that
+    class's docstring for the container-vs-native semantics.
 
     `work_ticket_idx` flows through so SlurmBackend can stamp the SLURM
     job name with the originating ticket id — making scheduler dumps

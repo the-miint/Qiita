@@ -87,13 +87,20 @@ def _chmod(paths) -> None:
         p.chmod(EXPECTED_FILE_MODE)
 
 
-def _write_manifest(output_path: Path, outputs: dict[str, Path]) -> None:
+def _write_manifest(
+    output_path: Path,
+    outputs: dict[str, Path],
+    files: list[Path],
+) -> None:
     """Produce the manifest. Outputs map values are stored as paths
     relative to `output_path` so the verifier can rebuild them with
-    `output_path / value`."""
+    `output_path / value`.
+
+    `files` is the pre-computed output-file walk; the caller already
+    needs it for `_chmod`, so passing it in avoids a second `rglob`."""
     output_path_resolved = output_path.resolve()
     files_listing = []
-    for p in _collect_files(output_path):
+    for p in files:
         files_listing.append(
             {
                 "path": str(p.resolve().relative_to(output_path_resolved)),
@@ -146,8 +153,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        _chmod(_collect_files(output_path))
-        _write_manifest(output_path, outputs)
+        files = _collect_files(output_path)
+        _chmod(files)
+        _write_manifest(output_path, outputs, files)
     except Exception as exc:
         # execute() succeeded but the launcher couldn't honor the
         # output contract (chmod failed, manifest write failed, ...).

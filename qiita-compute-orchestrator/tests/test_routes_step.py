@@ -6,7 +6,9 @@ miint to test the route surface.
 """
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,13 +18,26 @@ from qiita_compute_orchestrator.backend import ComputeBackend
 from qiita_compute_orchestrator.main import app
 
 
+@dataclass(frozen=True)
+class _RecordedCall:
+    """One recorded call into `_RecordingBackend.run_step`. Per-attribute
+    access keeps test assertions readable; adding a new protocol kwarg
+    means adding one field here rather than re-counting tuple slots."""
+
+    name: str
+    inputs: dict[str, Path]
+    workspace: Path
+    reference_idx: int
+    work_ticket_idx: int
+    container: str | None
+    module: str | None
+    entrypoint: str | None
+    baseline_resources: Any
+
+
 class _RecordingBackend(ComputeBackend):
     def __init__(self) -> None:
-        # 9-tuple per call: (name, inputs, workspace, reference_idx,
-        # work_ticket_idx, container, module, entrypoint, baseline_resources).
-        # Untyped tuple — keeping the recording shape loose lets new
-        # protocol kwargs land without retyping the annotation.
-        self.calls: list[tuple] = []
+        self.calls: list[_RecordedCall] = []
 
     async def run_step(
         self,
@@ -37,20 +52,17 @@ class _RecordingBackend(ComputeBackend):
         entrypoint: str | None = None,
         baseline_resources=None,
     ) -> dict[str, Path]:
-        # Existing tests don't exercise every field; they get captured
-        # into the calls log as a tuple so future tests that DO
-        # exercise them can assert on the values.
         self.calls.append(
-            (
-                name,
-                dict(inputs),
-                workspace,
-                reference_idx,
-                work_ticket_idx,
-                container,
-                module,
-                entrypoint,
-                baseline_resources,
+            _RecordedCall(
+                name=name,
+                inputs=dict(inputs),
+                workspace=workspace,
+                reference_idx=reference_idx,
+                work_ticket_idx=work_ticket_idx,
+                container=container,
+                module=module,
+                entrypoint=entrypoint,
+                baseline_resources=baseline_resources,
             )
         )
         return {"manifest": workspace / "manifest.parquet"}
@@ -123,26 +135,16 @@ def test_step_run_dispatches_to_backend(http_client, cp_to_co_token, tmp_path):
     assert body["outputs"]["manifest"].endswith("manifest.parquet")
 
     assert len(backend.calls) == 1
-    (
-        name,
-        inputs,
-        workspace,
-        reference_idx,
-        work_ticket_idx,
-        container,
-        module,
-        entrypoint,
-        baseline,
-    ) = backend.calls[0]
-    assert name == "hash"
-    assert inputs == {"fasta_path": fasta}
-    assert workspace == tmp_path
-    assert reference_idx == 7
-    assert work_ticket_idx == 99
-    assert container == "qiita/reference-hash:1.0.0"
-    assert module is None
-    assert entrypoint is None
-    assert baseline is None
+    call = backend.calls[0]
+    assert call.name == "hash"
+    assert call.inputs == {"fasta_path": fasta}
+    assert call.workspace == tmp_path
+    assert call.reference_idx == 7
+    assert call.work_ticket_idx == 99
+    assert call.container == "qiita/reference-hash:1.0.0"
+    assert call.module is None
+    assert call.entrypoint is None
+    assert call.baseline_resources is None
 
 
 def test_step_run_forwards_module_to_backend(http_client, cp_to_co_token, tmp_path):
@@ -164,9 +166,9 @@ def test_step_run_forwards_module_to_backend(http_client, cp_to_co_token, tmp_pa
     )
     assert resp.status_code == 200, resp.text
     assert len(backend.calls) == 1
-    (_, _, _, _, _, container, module, _, _) = backend.calls[0]
-    assert container is None
-    assert module == "qiita_compute_orchestrator.jobs.fastq_to_parquet"
+    call = backend.calls[0]
+    assert call.container is None
+    assert call.module == "qiita_compute_orchestrator.jobs.fastq_to_parquet"
 
 
 def test_step_run_translates_backend_value_error(http_client, cp_to_co_token, tmp_path):

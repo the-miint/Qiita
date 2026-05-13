@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
+from qiita_compute_orchestrator.jobs import RESERVED_INPUT_KEYS
 from qiita_compute_orchestrator.jobs.__main__ import _flatten_params, main
 
 
@@ -135,12 +136,15 @@ def test_flatten_params_merges_scalars_and_inputs():
     assert flat == {"fastq_path": "/data/in.fa", "reference_idx": 7, "work_ticket_idx": 99}
 
 
-def test_flatten_params_rejects_reserved_key_collision():
+@pytest.mark.parametrize("reserved_key", sorted(RESERVED_INPUT_KEYS))
+def test_flatten_params_rejects_reserved_key_collision(reserved_key):
     """If the workflow YAML's `inputs:` list happens to declare a name
-    that matches a framework scalar (e.g. `reference_idx`), the
-    launcher refuses with a typed BackendFailure(CONTRACT_VIOLATION)
+    that matches a framework scalar (any name in RESERVED_INPUT_KEYS),
+    the launcher refuses with a typed BackendFailure(CONTRACT_VIOLATION)
     rather than silently shadowing the work-ticket value.
 
+    Parameterized over RESERVED_INPUT_KEYS so adding a fourth scalar
+    doesn't need a corresponding hardcoded-string test update.
     Symmetric with LocalBackend's path — both go through the shared
     `flatten_native_inputs` helper in jobs/__init__.py."""
     from qiita_common.backend_failure import BackendFailure, FailureKind
@@ -149,22 +153,25 @@ def test_flatten_params_rejects_reserved_key_collision():
         "step_name": "fastq",
         "reference_idx": 7,
         "work_ticket_idx": 99,
-        "inputs": {"reference_idx": "/data/in.fa"},  # accidental collision
+        "inputs": {reserved_key: "/data/in.fa"},  # accidental collision
     }
     with pytest.raises(BackendFailure) as ei:
         _flatten_params(params)
     assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
     # The failure carries the YAML step name, not the module path.
     assert ei.value.step_name == "fastq"
-    assert "reference_idx" in ei.value.reason
+    assert reserved_key in ei.value.reason
 
 
-def test_main_returns_1_on_reserved_key_collision(monkeypatch, io_dirs, capsys):
+@pytest.mark.parametrize("reserved_key", sorted(RESERVED_INPUT_KEYS))
+def test_main_returns_1_on_reserved_key_collision(reserved_key, monkeypatch, io_dirs, capsys):
     """End-to-end: a params.json whose `inputs:` map collides with a
     framework-reserved scalar makes main() exit 1 with a structured
     CONTRACT_VIOLATION JSON line on stderr. The check fires in
-    `_flatten_params` (delegating to `_flatten_native_inputs`) before
-    run_native_job is reached."""
+    `_flatten_params` (delegating to `flatten_native_inputs`) before
+    run_native_job is reached.
+
+    Parameterized over RESERVED_INPUT_KEYS — the set drives coverage."""
     input_path, _ = io_dirs
 
     async def execute(inputs, workspace):
@@ -178,7 +185,7 @@ def test_main_returns_1_on_reserved_key_collision(monkeypatch, io_dirs, capsys):
                 "step_name": "fastq",
                 "reference_idx": 1,
                 "work_ticket_idx": 1,
-                "inputs": {"work_ticket_idx": "evil-string"},
+                "inputs": {reserved_key: "evil-string"},
             }
         )
     )
@@ -191,7 +198,7 @@ def test_main_returns_1_on_reserved_key_collision(monkeypatch, io_dirs, capsys):
     assert err["kind"] == "contract_violation"
     # Stderr carries the YAML step name from params.json, not the module path.
     assert err["step_name"] == "fastq"
-    assert "work_ticket_idx" in err["reason"]
+    assert reserved_key in err["reason"]
 
 
 def test_main_returns_1_on_post_success_manifest_failure(monkeypatch, io_dirs, capsys):

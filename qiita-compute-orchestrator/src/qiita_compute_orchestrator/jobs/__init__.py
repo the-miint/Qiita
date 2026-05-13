@@ -49,8 +49,9 @@ def _contract_violation(*, step_name: str, reason: str) -> BackendFailure:
 # `Inputs.model_validate`. A step `inputs:` entry sharing one of these
 # names would silently shadow the work-ticket value; `flatten_native_inputs`
 # rejects the collision so LocalBackend and the SLURM launcher behave
-# the same way.
-_RESERVED_KEYS = frozenset({"reference_idx", "work_ticket_idx"})
+# the same way. Public-ish — tests parameterize over it so adding a
+# fourth reserved name doesn't need a sweep of hardcoded string assertions.
+RESERVED_INPUT_KEYS: frozenset[str] = frozenset({"reference_idx", "work_ticket_idx"})
 
 
 def flatten_native_inputs(
@@ -70,7 +71,7 @@ def flatten_native_inputs(
     on BackendFailure.step_name to match the work_ticket failure-attribution
     contract.
     """
-    overlap = sorted(_RESERVED_KEYS & inputs.keys())
+    overlap = sorted(RESERVED_INPUT_KEYS & inputs.keys())
     if overlap:
         raise _contract_violation(
             step_name=step_name,
