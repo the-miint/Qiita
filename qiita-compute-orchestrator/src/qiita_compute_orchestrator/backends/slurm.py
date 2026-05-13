@@ -25,7 +25,7 @@ from qiita_common.actions import BaselineResources
 from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.models import StepBaselineResources, WorkTicketFailureStage
 
-from ..backend import ComputeBackend, native_dispatch_not_implemented
+from ..backend import ComputeBackend
 from ..slurm import (
     SlurmJobInfo,
     SlurmrestdClient,
@@ -101,24 +101,12 @@ class SlurmBackend(ComputeBackend):
         entrypoint: str | None = None,
         baseline_resources: StepBaselineResources | None = None,
     ) -> dict[str, Path]:
-        if module is not None:
-            # SlurmBackend currently emits an `apptainer exec` SBATCH
-            # script via `build_job_submit_payload`. The native-step
-            # form (`srun python -m qiita_compute_orchestrator.jobs
-            # --job <name>`) is built by `jobs/__main__.py` but isn't
-            # wired into the payload builder here. Until that branch
-            # lands, a `module:` step is declined via the shared
-            # `native_dispatch_not_implemented` helper so the failure
-            # is typed and the reason string matches LocalBackend's.
-            raise native_dispatch_not_implemented(
-                backend_name="SlurmBackend", step_name=name, module=module
-            )
-        if container is None:
+        if container is None and module is None:
             raise BackendFailure(
                 kind=FailureKind.CONTRACT_VIOLATION,
                 stage=WorkTicketFailureStage.STEP_RUN,
                 step_name=name,
-                reason="SlurmBackend requires `container` from the YAML step",
+                reason="SlurmBackend requires `container` or `module` on the step",
             )
         if baseline_resources is None:
             raise BackendFailure(
@@ -169,6 +157,7 @@ class SlurmBackend(ComputeBackend):
             step_name=name,
             work_ticket_idx=work_ticket_idx,
             container=container,
+            module=module,
             entrypoint=entrypoint,
             baseline_resources=baseline,
             input_path=input_path,

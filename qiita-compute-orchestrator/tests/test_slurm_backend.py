@@ -110,7 +110,10 @@ def _write_completed_output(workspace: Path, *, manifest_extra: dict | None = No
 
 
 @pytest.mark.asyncio
-async def test_run_step_requires_container(jwt_path, baseline, tmp_path):
+async def test_run_step_requires_container_or_module(jwt_path, baseline, tmp_path):
+    """Neither runtime field set → CONTRACT_VIOLATION. The wire validator
+    on StepRunRequest catches this upstream, but direct callers (and
+    this test) bypass the wire, so SlurmBackend re-checks."""
     handler = httpx.MockTransport(lambda req: httpx.Response(500))
     backend = _make_backend(handler, jwt_path)
     with pytest.raises(BackendFailure) as ei:
@@ -121,11 +124,12 @@ async def test_run_step_requires_container(jwt_path, baseline, tmp_path):
             reference_idx=1,
             work_ticket_idx=99,
             container=None,
+            module=None,
             entrypoint=None,
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
-    assert "container" in ei.value.reason
+    assert "container" in ei.value.reason and "module" in ei.value.reason
 
 
 @pytest.mark.asyncio

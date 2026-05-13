@@ -20,6 +20,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from qiita_common.actions import NATIVE_MODULE_PREFIX
 from qiita_common.api_paths import PATH_STEP_PREFIX, PATH_STEP_RUN
 from qiita_common.backend_failure import (
     BACKEND_FAILURE_HEADER,
@@ -55,6 +56,17 @@ async def run_step(
     backend: Annotated[ComputeBackend, Depends(_get_backend)],
     _: Annotated[None, Depends(_require_cp_to_co_token)],
 ) -> StepRunResponse:
+    # Defense in depth: the CP sync gate refuses to persist an action
+    # whose module path is outside NATIVE_MODULE_PREFIX, and the
+    # wire-level StepRunRequest validator already enforces shape. This
+    # third checkpoint catches any payload that bypassed sync — e.g.
+    # a service-account directly POSTing a hand-crafted ticket — and
+    # rejects it before the backend tries to import the module.
+    if body.module is not None and not body.module.startswith(NATIVE_MODULE_PREFIX):
+        raise HTTPException(
+            status_code=422,
+            detail=f"module must start with {NATIVE_MODULE_PREFIX!r}; got {body.module!r}",
+        )
     try:
         outputs = await backend.run_step(
             body.step_name,

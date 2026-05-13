@@ -243,6 +243,29 @@ def test_step_run_serializes_backend_failure(http_client, cp_to_co_token, tmp_pa
     }
 
 
+def test_step_run_rejects_wrong_prefix_module(http_client, cp_to_co_token, tmp_path):
+    """Defense in depth: a module path outside NATIVE_MODULE_PREFIX is
+    rejected at the route boundary before the backend tries to import
+    it. The wire validator only checks shape (exactly-one runtime); the
+    prefix check lives in the handler."""
+    client, backend = http_client
+    resp = client.post(
+        URL_STEP_RUN,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "x",
+            "inputs": {},
+            "workspace": str(tmp_path),
+            "reference_idx": 1,
+            "work_ticket_idx": 1,
+            "module": "os.system",  # bad prefix
+        },
+    )
+    assert resp.status_code == 422
+    assert "qiita_compute_orchestrator.jobs." in resp.text
+    assert backend.calls == []
+
+
 def test_step_run_rejects_payload_without_runtime(http_client, cp_to_co_token, tmp_path):
     """A request body with neither `container` nor `module` is rejected at
     the wire boundary by the StepRunRequest validator; the route never

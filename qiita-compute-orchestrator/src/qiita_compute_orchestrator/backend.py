@@ -12,10 +12,12 @@ SlurmBackend the container metadata is required — SLURM submission
 needs to know what image to run and how to size the allocation.
 
 `module` is the peer field to `container`: exactly one of the two is
-populated per step. Backends that support native dispatch read the
-module path and execute the Python entry point in their environment;
-backends that don't fail with a typed BackendFailure via
-``native_dispatch_not_implemented``.
+populated per step. Native (`module`) and container steps share the
+output contract (manifest + 0o440 file mode) but diverge in how the
+SBATCH script is built — `apptainer exec` vs `python -m
+qiita_compute_orchestrator.jobs --job <name>`. Both backends today
+dispatch both forms through the shared `run_native_job` framework
+dispatcher.
 
 `inputs` is a name => path map matching the names declared by the YAML
 step's `inputs:` list. `workspace` is a per-step scratch directory the
@@ -26,23 +28,7 @@ matching the step's `outputs:` list.
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from qiita_common.backend_failure import BackendFailure, FailureKind
-from qiita_common.models import StepBaselineResources, WorkTicketFailureStage
-
-
-def native_dispatch_not_implemented(
-    *, backend_name: str, step_name: str, module: str
-) -> BackendFailure:
-    """Standard typed failure for backends that don't implement the
-    `module:` runtime. Both LocalBackend and SlurmBackend route through
-    here so the reason string can't drift between them.
-    """
-    return BackendFailure(
-        kind=FailureKind.CONTRACT_VIOLATION,
-        stage=WorkTicketFailureStage.STEP_RUN,
-        step_name=step_name,
-        reason=f"{backend_name} does not implement native dispatch (got module={module!r})",
-    )
+from qiita_common.models import StepBaselineResources
 
 
 class ComputeBackend(ABC):
@@ -69,11 +55,7 @@ class ComputeBackend(ABC):
         validator on StepRunRequest enforces this before the route
         hands off to a backend. `container` drives the apptainer-exec
         path; `module` selects the native-step path (Python modules
-        under `qiita_compute_orchestrator.jobs.*`). Backends that do
-        not implement native dispatch must fail via
-        ``native_dispatch_not_implemented`` when `module` is set so the
-        runner sees a typed BackendFailure rather than a confusing
-        "step not found".
+        under `qiita_compute_orchestrator.jobs.*`).
 
         `entrypoint` overrides a container's default ENTRYPOINT and is
         meaningful only when `container` is set. `baseline_resources`
