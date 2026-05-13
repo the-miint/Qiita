@@ -23,17 +23,20 @@ from .client import (
     SlurmrestdError,
     TerminalSlurmState,
 )
+from .launcher_failure import LauncherFailure, parse_launcher_failure
 from .payload import build_job_submit_payload
 from .verify import VerificationFailure, parse_outputs_map, verify_container_output
 
 __all__ = [
     "DEFAULT_SLURMRESTD_API_VERSION",
+    "LauncherFailure",
     "SlurmJobInfo",
     "SlurmrestdClient",
     "SlurmrestdError",
     "TerminalSlurmState",
     "VerificationFailure",
     "build_job_submit_payload",
+    "parse_launcher_failure",
     "parse_outputs_map",
     "verify_container_output",
 ]

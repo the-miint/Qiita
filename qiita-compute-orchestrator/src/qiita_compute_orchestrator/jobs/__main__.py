@@ -16,8 +16,13 @@ stripped (e.g. `fastq_to_parquet`). The launcher:
    writes `manifest.json` to `$QIITA_OUTPUT_PATH` matching the
    verifier's contract (see `slurm/verify.py`), and exits 0.
 5. On `BackendFailure` (raised by `run_native_job`), prints a
-   structured error line to stderr and exits 1 — `slurmrestd` reports
-   the non-zero exit and the orchestrator-side polling classifies it.
+   structured error line to stderr and exits 1. `SlurmBackend` reads
+   that line via `slurm/launcher_failure.py:parse_launcher_failure`
+   after a non-zero SLURM exit and uses it to enrich the
+   `BackendFailure` it propagates to the runner — so the launcher's
+   real `kind` / `step_name` / `reason` end up on the work_ticket
+   row's `failure_*` columns instead of a generic state-based
+   classification ("job FAILED with exit_code=1").
 
 The manifest format mirrors what container steps produce so the
 verifier walks both uniformly:

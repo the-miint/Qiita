@@ -32,6 +32,7 @@ from ..slurm import (
     SlurmrestdError,
     TerminalSlurmState,
     build_job_submit_payload,
+    parse_launcher_failure,
     parse_outputs_map,
     verify_container_output,
 )
@@ -224,11 +225,32 @@ class SlurmBackend(ComputeBackend):
             reason_parts.append(f"exit_code={info.exit_code}")
         if info.reason:
             reason_parts.append(f"slurm_reason={info.reason}")
+        state_reason = ", ".join(reason_parts)
+
+        # Native-step jobs write a structured failure line to stderr
+        # before exit (jobs/__main__.py). If we find one, prefer the
+        # launcher's classification + message — it carries the actual
+        # FailureKind / reason from the Python side, which is strictly
+        # more useful than the slurmrestd-state inference. Container
+        # steps and infra-killed jobs (NODE_FAIL, OOM, ...) won't have
+        # the line; in those cases parse_launcher_failure returns None
+        # and the state-based classification stands.
+        launcher_failure = parse_launcher_failure(logs_path / "stderr")
+        if launcher_failure is not None:
+            raise BackendFailure(
+                kind=launcher_failure.kind,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=launcher_failure.step_name,
+                # Combine the launcher's reason with the SLURM-side
+                # detail: the operator gets the application-level
+                # message AND the SLURM job context (job id, exit code).
+                reason=f"{launcher_failure.reason} [{state_reason}]",
+            )
         raise BackendFailure(
             kind=kind,
             stage=WorkTicketFailureStage.STEP_RUN,
             step_name=name,
-            reason=", ".join(reason_parts),
+            reason=state_reason,
         )
 
     async def _poll_until_terminal(self, job_id: int, step_name: str) -> SlurmJobInfo:
