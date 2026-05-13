@@ -189,6 +189,44 @@ def test_main_returns_1_on_reserved_key_collision(monkeypatch, io_dirs, capsys):
     assert "work_ticket_idx" in err["reason"]
 
 
+def test_main_returns_1_on_post_success_manifest_failure(monkeypatch, io_dirs, capsys):
+    """If execute() succeeds but the launcher can't honor the output
+    contract (chmod fails, manifest write fails, filesystem race,
+    etc.), the launcher must emit the structured CONTRACT_VIOLATION
+    stderr line — same shape the verifier uses for container-side
+    manifest failures — instead of letting the OSError leak as a
+    raw traceback."""
+    from qiita_compute_orchestrator.jobs import __main__ as launcher
+
+    input_path, _ = io_dirs
+
+    async def execute(inputs, workspace):
+        # Produce a real output so the chmod/manifest path is reached.
+        out = workspace / "result.parquet"
+        out.write_bytes(b"DATA")
+        return {"result": out}
+
+    _install_stub(monkeypatch, short_name="post_fail", execute_fn=execute)
+    _write_params(input_path, fastq_path="/tmp/x.fa", reference_idx=1, work_ticket_idx=1)
+
+    # Force the post-success manifest write to fail. The exception
+    # type doesn't matter — the launcher's broad except is what's
+    # under test.
+    def boom(*args, **kwargs):
+        raise OSError("simulated disk full")
+
+    monkeypatch.setattr(launcher, "_write_manifest", boom)
+
+    rc = main(["--job", "post_fail"])
+    assert rc == 1
+    err = json.loads(capsys.readouterr().err)
+    assert err["kind"] == "contract_violation"
+    assert err["step_name"] == "qiita_compute_orchestrator.jobs.post_fail"
+    assert "post-success manifest write failed" in err["reason"]
+    assert "OSError" in err["reason"]
+    assert "simulated disk full" in err["reason"]
+
+
 def test_main_returns_1_and_prints_structured_error_on_backend_failure(
     monkeypatch, io_dirs, capsys
 ):

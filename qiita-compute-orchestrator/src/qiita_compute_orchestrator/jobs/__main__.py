@@ -141,8 +141,25 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    _chmod(_collect_files(output_path))
-    _write_manifest(output_path, outputs)
+    try:
+        _chmod(_collect_files(output_path))
+        _write_manifest(output_path, outputs)
+    except Exception as exc:
+        # execute() succeeded but the launcher couldn't honor the
+        # output contract (chmod failed, manifest write failed, ...).
+        # Same shape the verifier uses for container-side manifest
+        # failures — typed permanent failure, not a raw traceback.
+        print(
+            json.dumps(
+                {
+                    "kind": "contract_violation",
+                    "step_name": module_name,
+                    "reason": (f"post-success manifest write failed: {type(exc).__name__}: {exc}"),
+                }
+            ),
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
