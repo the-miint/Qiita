@@ -8,10 +8,13 @@ where `<short_name>` is the module path with `NATIVE_MODULE_PREFIX`
 stripped (e.g. `fastq_to_parquet`). The launcher:
 
 1. Parses `--job`.
-2. Reads `params.json` from `$QIITA_INPUT_PATH`.
-3. Flattens the work-ticket scalars (`reference_idx`, `work_ticket_idx`)
-   and the per-step `inputs` map into a single raw-inputs dict and
-   calls `run_native_job(...)`.
+2. Reads `params.json` from `$QIITA_INPUT_PATH` and validates it
+   against the `JobParams` Pydantic model in `slurm/contract.py`.
+3. Flattens the work-ticket scalars (the scope_target's kind-specific
+   idx fields plus `work_ticket_idx`) and the per-step `inputs` map
+   into a single raw-inputs dict — see `jobs/__init__.py`'s
+   `SCOPE_SCALARS_BY_KIND` for the per-scope rules — and calls
+   `run_native_job(...)`.
 4. On success, walks the output map, chmods every file to 0o440,
    writes `manifest.json` to `$QIITA_OUTPUT_PATH` matching the
    verifier's contract (see `slurm/verify.py`), and exits 0.

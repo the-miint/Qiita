@@ -818,10 +818,13 @@ qiita/
 │   │       ├── jobs/
 │   │       │   ├── __init__.py     # run_native_job framework dispatcher + boot-time scan
 │   │       │   ├── __main__.py     # `python -m` SLURM launcher (params.json → run_native_job)
-│   │       │   └── fastq_to_parquet.py  # native skeleton (Inputs + execute = NotImplementedError)
+│   │       │   └── fastq_to_parquet.py  # native job: FASTQ → Parquet via DuckDB + miint
+│   │       │                            # (per-sample, sequenced_sample-scoped)
+│   │       ├── miint.py            # shared miint install + DuckDB-conn helpers, PARQUET_OPTS
 │   │       └── slurm/
 │   │           ├── client.py       # slurmrestd REST client
-│   │           ├── contract.py     # shared constants: EXPECTED_FILE_MODE, MANIFEST_FILENAME
+│   │           ├── contract.py     # shared constants + JobParams: EXPECTED_FILE_MODE,
+│   │           │                   # MANIFEST_FILENAME, JOB_PARAMS_FILENAME, JobParams (params.json shape)
 │   │           ├── payload.py      # JSON job-submit payload builder (container + native scripts)
 │   │           └── verify.py       # post-job output verification (mode 440, identifier sort)
 │   └── tests/

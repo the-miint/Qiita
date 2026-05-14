@@ -182,8 +182,9 @@ def build_job_submit_payload(
     # QIITA_WORK_TICKET_IDX is mirrored from params.json so producers
     # that want to stamp output filenames or logs with the originating
     # ticket don't have to JSON-parse params just to read one scalar.
-    # params.json remains the contract source of truth for everything
-    # else (step_name, reference_idx, inputs, etc.).
+    # params.json (typed as JobParams in slurm/contract.py) remains the
+    # contract source of truth for everything else — step_name,
+    # scope_target, inputs, output_path.
     env: dict[str, str] = {
         "QIITA_INPUT_PATH": str(input_path),
         "QIITA_OUTPUT_PATH": str(output_path),
