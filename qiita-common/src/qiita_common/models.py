@@ -685,6 +685,7 @@ class ScopeTargetKind(StrEnum):
 
     STUDY_PREP = "study_prep"
     REFERENCE = "reference"
+    SEQUENCED_SAMPLE = "sequenced_sample"
 
 
 class WorkTicketState(StrEnum):
@@ -750,13 +751,24 @@ class ReferenceScopeTarget(BaseModel):
     reference_idx: Annotated[int, Field(gt=0)]
 
 
+class SequencedSampleScopeTarget(BaseModel):
+    """Work ticket targets one sequenced sample — used for actions that
+    naturally operate on a single sample (e.g. fastq-to-parquet, one
+    FASTQ → one Parquet). Distinct from a study_prep-scoped ticket
+    that fans out per sample inside a map step: this form is the
+    singleton path, one ticket per sample."""
+
+    kind: Literal[ScopeTargetKind.SEQUENCED_SAMPLE]
+    sequenced_sample_idx: Annotated[int, Field(gt=0)]
+
+
 # Discriminated union — Pydantic and OpenAPI dispatch on the `kind` field.
 # DB-side, the same shape is encoded as a tagged union of typed columns
 # (`scope_target_kind` plus the subset-relevant `study_idx` / `prep_idx` /
-# `reference_idx`) guarded by a CHECK constraint; the `kind` here is the
-# discriminator that maps to that column.
+# `reference_idx` / `sequenced_sample_idx`) guarded by a CHECK constraint;
+# the `kind` here is the discriminator that maps to that column.
 ScopeTarget = Annotated[
-    StudyPrepScopeTarget | ReferenceScopeTarget,
+    StudyPrepScopeTarget | ReferenceScopeTarget | SequencedSampleScopeTarget,
     Field(discriminator="kind"),
 ]
 

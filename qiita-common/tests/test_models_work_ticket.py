@@ -27,11 +27,13 @@ def test_work_ticket_state_enum():
 
 
 def test_scope_target_dispatches_on_kind():
-    """The discriminated union must select StudyPrepScopeTarget for kind='study_prep'
-    and ReferenceScopeTarget for kind='reference'."""
+    """The discriminated union must select StudyPrepScopeTarget for kind='study_prep',
+    ReferenceScopeTarget for kind='reference', and SequencedSampleScopeTarget for
+    kind='sequenced_sample'."""
     from qiita_common.models import (
         ReferenceScopeTarget,
         ScopeTarget,
+        SequencedSampleScopeTarget,
         StudyPrepScopeTarget,
     )
 
@@ -45,6 +47,10 @@ def test_scope_target_dispatches_on_kind():
     ref = adapter.validate_python({"kind": "reference", "reference_idx": 11})
     assert isinstance(ref, ReferenceScopeTarget)
     assert ref.reference_idx == 11
+
+    ss = adapter.validate_python({"kind": "sequenced_sample", "sequenced_sample_idx": 23})
+    assert isinstance(ss, SequencedSampleScopeTarget)
+    assert ss.sequenced_sample_idx == 23
 
 
 def test_scope_target_rejects_unknown_kind():
@@ -85,6 +91,10 @@ def test_scope_target_rejects_non_positive_idx():
     with pytest.raises(ValidationError):
         adapter.validate_python(
             {"kind": "study_prep", "study_idx": 1, "prep_idx": -2},
+        )
+    with pytest.raises(ValidationError):
+        adapter.validate_python(
+            {"kind": "sequenced_sample", "sequenced_sample_idx": 0},
         )
 
 

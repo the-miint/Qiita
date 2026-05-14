@@ -67,6 +67,7 @@ _DISALLOW_WITHOUT_DELETE_INDEXES = frozenset(
     {
         "work_ticket_one_in_flight_per_reference",
         "work_ticket_one_in_flight_per_study_prep",
+        "work_ticket_one_in_flight_per_sequenced_sample",
     }
 )
 
@@ -156,14 +157,17 @@ def _check_scopes(principal: Principal, required_scopes: list[str]) -> None:
 
 def _scope_target_columns(
     scope_target: dict[str, Any],
-) -> tuple[int | None, int | None, int | None]:
+) -> tuple[int | None, int | None, int | None, int | None]:
     """Map a ScopeTarget union member to the (study_idx, prep_idx,
-    reference_idx) tuple the work_ticket table expects."""
+    reference_idx, sequenced_sample_idx) tuple the work_ticket table
+    expects."""
     kind = scope_target["kind"]
     if kind == ScopeTargetKind.REFERENCE.value:
-        return (None, None, scope_target["reference_idx"])
+        return (None, None, scope_target["reference_idx"], None)
     if kind == ScopeTargetKind.STUDY_PREP.value:
-        return (scope_target["study_idx"], scope_target["prep_idx"], None)
+        return (scope_target["study_idx"], scope_target["prep_idx"], None, None)
+    if kind == ScopeTargetKind.SEQUENCED_SAMPLE.value:
+        return (None, None, None, scope_target["sequenced_sample_idx"])
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=f"unknown scope_target.kind={kind!r}",
@@ -181,12 +185,12 @@ async def _check_disallow_without_delete(
     are tolerated; resubmission is gated until DELETE lands.
 
     Best-effort fast path. The atomic gate is the unique partial indexes
-    `work_ticket_one_in_flight_per_{reference,study_prep}`; we still
-    SELECT first so the common (non-racing) case returns a 409 carrying
-    the blocking ticket idx, which is more useful to clients than the
-    bare unique-violation that fires when two submissions race past
-    this check."""
-    study_idx, prep_idx, reference_idx = _scope_target_columns(scope_target)
+    `work_ticket_one_in_flight_per_{reference,study_prep,sequenced_sample}`;
+    we still SELECT first so the common (non-racing) case returns a 409
+    carrying the blocking ticket idx, which is more useful to clients
+    than the bare unique-violation that fires when two submissions race
+    past this check."""
+    study_idx, prep_idx, reference_idx, sequenced_sample_idx = _scope_target_columns(scope_target)
     if scope_target["kind"] == ScopeTargetKind.REFERENCE.value:
         existing = await pool.fetchval(
             "SELECT work_ticket_idx FROM qiita.work_ticket"
@@ -197,6 +201,18 @@ async def _check_disallow_without_delete(
             action_id,
             action_version,
             reference_idx,
+            list(NON_TERMINAL_WORK_TICKET_STATES),
+        )
+    elif scope_target["kind"] == ScopeTargetKind.SEQUENCED_SAMPLE.value:
+        existing = await pool.fetchval(
+            "SELECT work_ticket_idx FROM qiita.work_ticket"
+            " WHERE action_id = $1 AND action_version = $2"
+            "   AND sequenced_sample_idx = $3"
+            "   AND state = ANY($4::qiita.work_ticket_state[])"
+            " LIMIT 1",
+            action_id,
+            action_version,
+            sequenced_sample_idx,
             list(NON_TERMINAL_WORK_TICKET_STATES),
         )
     else:
@@ -291,14 +307,15 @@ async def submit_work_ticket(
 
     await _check_disallow_without_delete(pool, body.action_id, body.action_version, scope_target)
 
-    study_idx, prep_idx, reference_idx = _scope_target_columns(scope_target)
+    study_idx, prep_idx, reference_idx, sequenced_sample_idx = _scope_target_columns(scope_target)
     try:
         work_ticket_idx = await pool.fetchval(
             "INSERT INTO qiita.work_ticket ("
             "  action_id, action_version, originator_principal_idx,"
             "  scope_target_kind, study_idx, prep_idx, reference_idx,"
-            "  action_context"
-            ") VALUES ($1, $2, $3, $4::qiita.scope_target_kind, $5, $6, $7, $8::jsonb)"
+            "  sequenced_sample_idx, action_context"
+            ") VALUES ($1, $2, $3, $4::qiita.scope_target_kind,"
+            "          $5, $6, $7, $8, $9::jsonb)"
             " RETURNING work_ticket_idx",
             body.action_id,
             body.action_version,
@@ -307,6 +324,7 @@ async def submit_work_ticket(
             study_idx,
             prep_idx,
             reference_idx,
+            sequenced_sample_idx,
             json.dumps(body.action_context),
         )
     except asyncpg.exceptions.UniqueViolationError as exc:

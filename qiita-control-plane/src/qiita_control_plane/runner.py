@@ -312,7 +312,7 @@ async def _run_entry_with_retry(
 
 _WORK_TICKET_COLS = (
     "work_ticket_idx, action_id, action_version, originator_principal_idx, "
-    "scope_target_kind, study_idx, prep_idx, reference_idx, "
+    "scope_target_kind, study_idx, prep_idx, reference_idx, sequenced_sample_idx, "
     "action_context, state, retry_count, max_retries"
 )
 
@@ -524,6 +524,11 @@ def _build_scope_target(work_ticket: dict[str, Any]) -> dict[str, Any]:
             "kind": ScopeTargetKind.STUDY_PREP.value,
             "study_idx": work_ticket["study_idx"],
             "prep_idx": work_ticket["prep_idx"],
+        }
+    if kind == ScopeTargetKind.SEQUENCED_SAMPLE.value:
+        return {
+            "kind": ScopeTargetKind.SEQUENCED_SAMPLE.value,
+            "sequenced_sample_idx": work_ticket["sequenced_sample_idx"],
         }
     raise RuntimeError(f"unknown scope_target_kind: {kind!r}")
 
