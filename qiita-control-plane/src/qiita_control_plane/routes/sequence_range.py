@@ -56,12 +56,17 @@ async def mint_sequence_range_route(
 
     Maps repository-layer exceptions to HTTP status:
       - asyncpg.UniqueViolationError → 409 (prep_sample already has a range)
-      - asyncpg.ForeignKeyViolationError → 404 (unknown / non-sequenced
-        prep_sample_idx; the composite FK tightens both cases into one
-        observable failure mode)
-      - asyncpg.InvalidParameterValueError (SQLSTATE 22023) → 400 (the
-        SQL function's `RAISE ... USING ERRCODE = '22023'` — shouldn't
-        be reachable post-Pydantic, but defended for completeness)
+      - asyncpg.ForeignKeyViolationError → 404 (unknown prep_sample_idx
+        OR prep_sample exists but is not eligible for a sequence_range;
+        both cases collapse to one observable surface so the route
+        doesn't leak the kind discriminator to clients probing idxs).
+      - asyncpg.InvalidParameterValueError (SQLSTATE 22023) → 400.
+        Unreachable post-Pydantic in normal flow; kept as defence in
+        depth, with a static detail so an unexpected SQLSTATE path
+        cannot leak Postgres internals.
+      - Any other asyncpg.PostgresError → 500 with a generic detail.
+        Catches the long tail (connection drop, deadlock, disk full)
+        without bleeding constraint names or stack frames.
     """
     settings = request.app.state.settings
     if body.count > settings.max_sequence_mint_count:
@@ -86,20 +91,17 @@ async def mint_sequence_range_route(
                 detail=f"prep_sample_idx {body.prep_sample_idx} already has a sequence_range",
             )
         except asyncpg.ForeignKeyViolationError:
-            # Either the prep_sample_idx is unknown, or it exists but
-            # carries a processing_kind other than 'sequenced'. Both
-            # collapse to the same observable surface — 404 — because
-            # the composite FK cannot distinguish them at the catch site
-            # and the route shouldn't leak the distinction either.
             raise HTTPException(
                 status_code=404,
                 detail=(
                     f"prep_sample_idx {body.prep_sample_idx} not found "
-                    "or not eligible (processing_kind must be 'sequenced')"
+                    "or not eligible for sequence-range allocation"
                 ),
             )
-        except asyncpg.InvalidParameterValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
+        except asyncpg.InvalidParameterValueError:
+            raise HTTPException(status_code=400, detail="invalid sequence-range parameters")
+        except asyncpg.PostgresError:
+            raise HTTPException(status_code=500, detail="database error")
 
     return _record_to_response(row)
 

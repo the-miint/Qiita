@@ -44,8 +44,15 @@ async def mint_sequence_range(
     section regardless of whether the caller opened an asyncpg
     transaction.
     """
+    # Explicit column projection matching fetch_sequence_range_by_prep_sample_idx
+    # so the route layer's name-based field access is symmetric across the two
+    # paths and resistant to drift between the plpgsql function's return type
+    # and the live qiita.sequence_range schema.
     return await conn.fetchrow(
-        "SELECT * FROM qiita.mint_sequence_range($1, $2, $3)",
+        "SELECT idx, prep_sample_idx, processing_kind,"
+        "       sequence_idx_start, sequence_idx_stop,"
+        "       created_by_idx, created_at"
+        "  FROM qiita.mint_sequence_range($1, $2, $3)",
         prep_sample_idx,
         count,
         principal_idx,

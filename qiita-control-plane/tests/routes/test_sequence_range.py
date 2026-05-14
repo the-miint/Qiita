@@ -163,7 +163,12 @@ async def sa_no_mint_client(postgres_pool, compute_worker_service_account):
         postgres_pool,
         principal_idx=compute_worker_service_account["principal_idx"],
         label=f"sa-no-mint-{secrets.token_hex(4)}",
-        scopes=[Scope.FEATURE_MINT],  # any scope on the SA ceiling that is NOT sequence_range:mint
+        # Any scope on SERVICE_ACCOUNT_SCOPE_CEILING that is NOT
+        # SEQUENCE_RANGE_MINT works here — FEATURE_MINT is the picked
+        # representative. The intent of this fixture is "SA token
+        # missing the specific scope," so a future retirement of
+        # FEATURE_MINT just means swapping in another worker scope.
+        scopes=[Scope.FEATURE_MINT],
     )
     transport = ASGITransport(app=app)
     async with AsyncClient(
@@ -189,7 +194,11 @@ async def test_post_anonymous_401(ctx):
 
 async def test_post_human_user_403_even_with_scope(ctx, postgres_pool, regular_user_session):
     """A human can't mint even if their token somehow carries the scope —
-    require_service rejects HumanUser before require_scope runs."""
+    require_service rejects HumanUser before require_scope runs. The
+    detail-string assertion locks in the ordering: if require_scope
+    ever ran first, the user (who carries the scope here) would pass
+    that guard and the 403 detail would change — that drift surfaces
+    here as a test failure rather than as a silently misleading 403."""
     from qiita_control_plane.main import app
 
     app.state.pool = postgres_pool
@@ -209,6 +218,9 @@ async def test_post_human_user_403_even_with_scope(ctx, postgres_pool, regular_u
             json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 10},
         )
     assert resp.status_code == 403, resp.text
+    # Detail comes from require_service, NOT require_scope — proves the
+    # kind guard fires first.
+    assert "service accounts" in resp.json()["detail"]
 
 
 async def test_post_sa_without_scope_403(ctx, sa_no_mint_client):
@@ -330,9 +342,17 @@ async def test_post_rejects_extra_fields_422(ctx):
 
 
 async def test_post_concurrent_mints_disjoint(ctx):
-    """Two concurrent POSTs against two different prep_samples produce
-    non-overlapping ranges — exercises the underlying advisory lock
-    through the full HTTP stack."""
+    """Two POSTs against two different prep_samples, driven by
+    asyncio.gather over the ASGI transport, return disjoint ranges.
+
+    Caveat: asyncio.gather over an in-process ASGI transport is not
+    truly concurrent at the OS-thread level — the requests interleave
+    at asyncio await boundaries within one event loop. The Postgres
+    sequence guarantees disjoint ranges unconditionally, so this test
+    asserts the end-to-end response contract holds under interleaved
+    calls through the full HTTP stack rather than proving the advisory
+    lock under real parallelism (that requires the OS-thread-driven
+    test reserved for the perf-suite to-do)."""
     _bs2, ps2 = await _seed_prep_sample(ctx["pool"], owner_idx=ctx["principal_idx"])
     ctx["created"]["biosample"].append(_bs2)
     ctx["created"]["prep_sample"].append(ps2)

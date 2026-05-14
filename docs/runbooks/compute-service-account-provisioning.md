@@ -74,11 +74,18 @@ from every role ceiling, so:
    ```
 
    The response should show
-   `{"kind": "service_account", "name": "compute", "scopes": ["sequence_range:mint"]}`.
+   `{"kind": "service", "name": "compute", "scopes": ["sequence_range:mint"]}`.
 
 4. **Confirm the route works** end-to-end against a known
-   prep_sample_idx (use one your operator workflow has admin-side
-   visibility into; the example uses `42`):
+   prep_sample_idx.
+
+   > ⚠️ **Substitute a real `prep_sample_idx` your operator workflow
+   > controls before running this.** The example uses `42` as a
+   > placeholder; minting against an arbitrary idx will either fail
+   > (404 if absent) or permanently commit a range for a prep_sample
+   > you may not own. The underlying `sequence_idx` allocation is
+   > **not reversible** — even a `DELETE FROM qiita.sequence_range`
+   > doesn't return the consumed bigints to the pool.
 
    ```bash
    curl -X POST $CONTROL_PLANE_URL/api/v1/sequence-range \
@@ -89,14 +96,6 @@ from every role ceiling, so:
 
    Expect 201 with a body of shape
    `{"prep_sample_idx": 42, "sequence_idx_start": N, "sequence_idx_stop": N, "created_at": "..."}`.
-   The `count=1` smoke-mint reserves a single bigint from
-   `qiita.sequence_idx_seq` for that prep_sample; **it is not free**.
-   Pick a test prep_sample you don't mind having a pre-minted range
-   on, or revert the test row directly with
-   `DELETE FROM qiita.sequence_range WHERE prep_sample_idx = 42`
-   (the underlying sequence_idx is consumed regardless — the cap on
-   total allocation is `Settings.max_sequence_mint_count` per call,
-   not lifetime).
 
 ## Rotation
 
