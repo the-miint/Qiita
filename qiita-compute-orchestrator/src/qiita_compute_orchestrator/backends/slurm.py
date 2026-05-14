@@ -36,6 +36,7 @@ from ..slurm import (
     parse_outputs_map,
     verify_container_output,
 )
+from ..slurm.contract import JOB_PARAMS_FILENAME, JobParams
 
 # SLURM's job_state strings => FailureKind.
 #
@@ -145,17 +146,18 @@ class SlurmBackend(ComputeBackend):
         # the native-step launcher reads scope_target["kind"] to pick
         # the right idx scalars to merge into the job's Inputs model,
         # and container entrypoints inspect it for the same purpose.
-        params_path = input_path / "params.json"
+        # The Pydantic shape lives in slurm/contract.py so the producer
+        # here and the consumer (jobs/__main__.py) validate against the
+        # same schema.
+        params_path = input_path / JOB_PARAMS_FILENAME
         params_path.write_text(
-            json.dumps(
-                {
-                    "step_name": name,
-                    "scope_target": scope_target,
-                    "work_ticket_idx": work_ticket_idx,
-                    "inputs": {k: str(v) for k, v in inputs.items()},
-                    "output_path": str(output_path),
-                }
-            )
+            JobParams(
+                step_name=name,
+                scope_target=scope_target,
+                work_ticket_idx=work_ticket_idx,
+                inputs={k: str(v) for k, v in inputs.items()},
+                output_path=str(output_path),
+            ).model_dump_json()
         )
 
         baseline = BaselineResources(

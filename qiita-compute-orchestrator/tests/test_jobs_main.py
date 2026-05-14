@@ -54,15 +54,16 @@ def io_dirs(tmp_path, monkeypatch):
 
 
 def _write_params(input_path: Path, *, fastq_path: str, reference_idx: int, work_ticket_idx: int):
-    (input_path / "params.json").write_text(
-        json.dumps(
-            {
-                "step_name": "fastq",
-                "scope_target": {"kind": "reference", "reference_idx": reference_idx},
-                "work_ticket_idx": work_ticket_idx,
-                "inputs": {"fastq_path": fastq_path},
-            }
-        )
+    from qiita_compute_orchestrator.slurm.contract import JOB_PARAMS_FILENAME, JobParams
+
+    (input_path / JOB_PARAMS_FILENAME).write_text(
+        JobParams(
+            step_name="fastq",
+            scope_target={"kind": "reference", "reference_idx": reference_idx},
+            work_ticket_idx=work_ticket_idx,
+            inputs={"fastq_path": fastq_path},
+            output_path=str(input_path.parent / "output"),
+        ).model_dump_json()
     )
 
 
@@ -125,13 +126,15 @@ def test_main_handles_directory_output(monkeypatch, io_dirs):
 def test_flatten_params_merges_scalars_and_inputs():
     """Happy path: framework scalars and step inputs land in one flat
     dict ready for Inputs.model_validate."""
-    params = {
-        "step_name": "fastq",
-        "scope_target": {"kind": "reference", "reference_idx": 7},
-        "work_ticket_idx": 99,
-        "inputs": {"fastq_path": "/data/in.fa"},
-        "output_path": "/scratch/out",  # ignored
-    }
+    from qiita_compute_orchestrator.slurm.contract import JobParams
+
+    params = JobParams(
+        step_name="fastq",
+        scope_target={"kind": "reference", "reference_idx": 7},
+        work_ticket_idx=99,
+        inputs={"fastq_path": "/data/in.fa"},
+        output_path="/scratch/out",  # ignored
+    )
     flat = _flatten_params(params)
     assert flat == {"fastq_path": "/data/in.fa", "reference_idx": 7, "work_ticket_idx": 99}
 
@@ -149,12 +152,15 @@ def test_flatten_params_rejects_reserved_key_collision(reserved_key):
     `flatten_native_inputs` helper in jobs/__init__.py."""
     from qiita_common.backend_failure import BackendFailure, FailureKind
 
-    params = {
-        "step_name": "fastq",
-        "scope_target": {"kind": "reference", "reference_idx": 7},
-        "work_ticket_idx": 99,
-        "inputs": {reserved_key: "/data/in.fa"},  # accidental collision
-    }
+    from qiita_compute_orchestrator.slurm.contract import JobParams
+
+    params = JobParams(
+        step_name="fastq",
+        scope_target={"kind": "reference", "reference_idx": 7},
+        work_ticket_idx=99,
+        inputs={reserved_key: "/data/in.fa"},  # accidental collision
+        output_path="/scratch/out",
+    )
     with pytest.raises(BackendFailure) as ei:
         _flatten_params(params)
     assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
@@ -178,16 +184,17 @@ def test_main_returns_1_on_reserved_key_collision(reserved_key, monkeypatch, io_
         raise RuntimeError("should not reach execute()")
 
     _install_stub(monkeypatch, short_name="collision", execute_fn=execute)
+    from qiita_compute_orchestrator.slurm.contract import JOB_PARAMS_FILENAME, JobParams
+
     # The inputs map shadows the framework scalar — the helper rejects.
-    (input_path / "params.json").write_text(
-        json.dumps(
-            {
-                "step_name": "fastq",
-                "scope_target": {"kind": "reference", "reference_idx": 1},
-                "work_ticket_idx": 1,
-                "inputs": {reserved_key: "evil-string"},
-            }
-        )
+    (input_path / JOB_PARAMS_FILENAME).write_text(
+        JobParams(
+            step_name="fastq",
+            scope_target={"kind": "reference", "reference_idx": 1},
+            work_ticket_idx=1,
+            inputs={reserved_key: "evil-string"},
+            output_path=str(input_path.parent / "output"),
+        ).model_dump_json()
     )
 
     rc = main(["--job", "collision"])

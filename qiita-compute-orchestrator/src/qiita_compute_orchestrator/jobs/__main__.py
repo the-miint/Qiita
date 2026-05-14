@@ -44,25 +44,24 @@ from pathlib import Path
 from qiita_common.actions import NATIVE_MODULE_PREFIX
 from qiita_common.backend_failure import BackendFailure
 
-from ..slurm.contract import EXPECTED_FILE_MODE, MANIFEST_FILENAME
+from ..slurm.contract import (
+    EXPECTED_FILE_MODE,
+    JOB_PARAMS_FILENAME,
+    MANIFEST_FILENAME,
+    JobParams,
+)
 from . import flatten_native_inputs, run_native_job
 
 
-def _flatten_params(params: dict) -> dict:
+def _flatten_params(params: JobParams) -> dict:
     """Combine the work-ticket scalars and the step's inputs map into a
     single dict ready for `Inputs.model_validate`.
 
     Producer side of the contract is `SlurmBackend.run_step`, which
-    writes `params.json` with the shape
-        {
-          "step_name": <str>,
-          "scope_target": {<discriminated-union dict>},
-          "work_ticket_idx": <int>,
-          "inputs": {<input_name>: <path>, ...},
-          "output_path": <str>,  # written but ignored here; env var wins
-        }
-    This reader pulls `step_name`, `scope_target`, `work_ticket_idx`,
-    and every entry of `inputs`. Other keys in params.json are ignored.
+    constructs a `JobParams` (slurm/contract.py) and writes its
+    `model_dump_json()` to `params.json`. `output_path` rides along on
+    the model but is ignored here — the env var ($QIITA_OUTPUT_PATH)
+    wins.
 
     Delegates the merge + reserved-key check to `flatten_native_inputs`
     so the launcher and LocalBackend share one code path. A collision
@@ -71,10 +70,10 @@ def _flatten_params(params: dict) -> dict:
     and renders to structured stderr.
     """
     return flatten_native_inputs(
-        params.get("inputs", {}),
-        step_name=params["step_name"],
-        scope_target=params["scope_target"],
-        work_ticket_idx=params["work_ticket_idx"],
+        params.inputs,
+        step_name=params.step_name,
+        scope_target=params.scope_target,
+        work_ticket_idx=params.work_ticket_idx,
     )
 
 
@@ -139,8 +138,8 @@ def main(argv: list[str] | None = None) -> int:
     output_path = Path(os.environ["QIITA_OUTPUT_PATH"])
     module_name = f"{NATIVE_MODULE_PREFIX}{args.job}"
 
-    params = json.loads((input_path / "params.json").read_text())
-    step_name = params["step_name"]
+    params = JobParams.model_validate_json((input_path / JOB_PARAMS_FILENAME).read_text())
+    step_name = params.step_name
     try:
         raw_inputs = _flatten_params(params)
         outputs = asyncio.run(
