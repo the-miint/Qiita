@@ -14,71 +14,26 @@ import secrets
 import asyncpg
 import pytest
 import pytest_asyncio
-from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
 
-from qiita_control_plane.repositories.biosample import insert_biosample
-from qiita_control_plane.repositories.prep_sample import insert_prep_sample
 from qiita_control_plane.repositories.sequence_range import (
     fetch_sequence_range_by_prep_sample_idx,
     mint_sequence_range,
+)
+from qiita_control_plane.testing.db_seeds import (
+    seed_biosample,
+    seed_sequenced_prep_sample,
+    seed_user_principal,
 )
 
 pytestmark = pytest.mark.db
 
 
-# ---------------------------------------------------------------------------
-# Parent-chain seeding
-# ---------------------------------------------------------------------------
-
-
-async def _seed_user_principal(pool, *, suffix: str) -> int:
-    """Seed a principal + user row, return the principal_idx.
-
-    The owner_idx columns on biosample / prep_sample carry a role-typed
-    FK trigger that rejects non-user-kind principals; this helper
-    promotes the fresh principal to user-kind so it can serve as
-    owner_idx.
-    """
-    principal_idx = await pool.fetchval(
-        "INSERT INTO qiita.principal (display_name, created_by_idx) VALUES ($1, $2) RETURNING idx",
-        f"sr-test-{suffix}",
-        SYSTEM_PRINCIPAL_IDX,
-    )
-    await pool.execute(
-        "INSERT INTO qiita.user (principal_idx, email) VALUES ($1, $2)",
-        principal_idx,
-        f"sr-test-{suffix}@test.local",
-    )
-    return principal_idx
-
-
 async def _seed_prep_sample(pool, *, owner_idx: int) -> tuple[int, int]:
-    """Seed a biosample + sequenced prep_sample, return (bs_idx, ps_idx).
-
-    Uses the migration-seeded `short_read_metagenomics` prep_protocol so
-    no extra protocol row needs to land. processing_kind='sequenced' is
-    required for the composite FK on sequence_range to succeed.
-    """
-    protocol_idx = await pool.fetchval(
-        "SELECT idx FROM qiita.prep_protocol WHERE name = $1",
-        "short_read_metagenomics",
-    )
-    assert protocol_idx is not None, "short_read_metagenomics protocol not seeded"
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            bs_idx = await insert_biosample(
-                conn,
-                owner_idx=owner_idx,
-                created_by_idx=owner_idx,
-            )
-            ps_idx = await insert_prep_sample(
-                conn,
-                biosample_idx=bs_idx,
-                owner_idx=owner_idx,
-                prep_protocol_idx=protocol_idx,
-                processing_kind="sequenced",
-                created_by_idx=owner_idx,
-            )
+    """Seed a biosample + sequenced prep_sample owned by `owner_idx`;
+    return (biosample_idx, prep_sample_idx). Composer over the two
+    db_seeds helpers."""
+    bs_idx = await seed_biosample(pool, owner_idx=owner_idx, created_by_idx=owner_idx)
+    ps_idx = await seed_sequenced_prep_sample(pool, biosample_idx=bs_idx, owner_idx=owner_idx)
     return bs_idx, ps_idx
 
 
@@ -91,7 +46,7 @@ async def parent_chain(postgres_pool):
     `principal_idx` and append to `created["prep_sample"]`.
     """
     suffix = secrets.token_hex(4)
-    principal_idx = await _seed_user_principal(postgres_pool, suffix=suffix)
+    principal_idx = await seed_user_principal(postgres_pool, prefix="sr-test", suffix=suffix)
     bs_idx, ps_idx = await _seed_prep_sample(postgres_pool, owner_idx=principal_idx)
     created: dict[str, list[int]] = {
         "biosample": [bs_idx],

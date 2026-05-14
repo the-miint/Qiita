@@ -138,6 +138,36 @@ async def seed_biosample(
     )
 
 
+async def seed_sequenced_prep_sample(
+    pool: asyncpg.Pool,
+    *,
+    biosample_idx: int,
+    owner_idx: int,
+    protocol_name: str = "short_read_metagenomics",
+) -> int:
+    """Insert a minimal qiita.prep_sample row with processing_kind='sequenced';
+    return its idx. The prep_protocol is resolved by name (seeded by
+    migration 20260501000010); callers that need a different protocol
+    pass `protocol_name`. Sufficient for tests that need a sequenced
+    prep_sample idx without exercising the sequencing-run / pool surface.
+    """
+    protocol_idx = await pool.fetchval(
+        "SELECT idx FROM qiita.prep_protocol WHERE name = $1",
+        protocol_name,
+    )
+    if protocol_idx is None:
+        raise RuntimeError(f"prep_protocol {protocol_name!r} not seeded")
+    return await pool.fetchval(
+        "INSERT INTO qiita.prep_sample"
+        " (biosample_idx, owner_idx, prep_protocol_idx, processing_kind, created_by_idx)"
+        " VALUES ($1, $2, $3, 'sequenced'::qiita.processing_kind, $2)"
+        " RETURNING idx",
+        biosample_idx,
+        owner_idx,
+        protocol_idx,
+    )
+
+
 async def seed_biosample_global_field(
     pool: asyncpg.Pool,
     *,
