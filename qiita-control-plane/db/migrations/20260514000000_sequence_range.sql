@@ -19,7 +19,12 @@ CREATE SEQUENCE qiita.sequence_idx_seq AS bigint MINVALUE 1 NO CYCLE;
 COMMENT ON SEQUENCE qiita.sequence_idx_seq IS
     'Free-standing bigint sequence allocated by qiita.mint_sequence_range. '
     'Not OWNED BY any column — a dropped sequence_range row does not '
-    'return its allocation to the pool.';
+    'return its allocation to the pool. CRITICAL: never call nextval() '
+    'or setval() on this sequence directly. All allocation must go '
+    'through qiita.mint_sequence_range so the advisory lock '
+    '(pg_advisory_xact_lock on hashtext(''qiita.sequence_idx_seq'')) is '
+    'held for the critical section. Direct nextval calls bypass the '
+    'lock and can tear holes in the contiguous range guarantee.';
 
 
 CREATE TABLE qiita.sequence_range (

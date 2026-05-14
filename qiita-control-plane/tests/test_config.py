@@ -75,3 +75,57 @@ def test_settings_requires_hmac_secret_key(monkeypatch):
 
     with pytest.raises(RuntimeError, match="HMAC_SECRET_KEY"):
         Settings.from_env()
+
+
+def test_settings_max_sequence_mint_count_has_default(monkeypatch):
+    """max_sequence_mint_count must default to a large but finite cap so
+    a buggy compute step cannot burn an unbounded slice of the
+    sequence_idx space on a single POST."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.delenv("QIITA_MAX_SEQUENCE_MINT_COUNT", raising=False)
+
+    from qiita_control_plane.config import Settings
+
+    settings = Settings.from_env()
+    assert isinstance(settings.max_sequence_mint_count, int)
+    assert settings.max_sequence_mint_count > 0
+
+
+def test_settings_max_sequence_mint_count_from_env(monkeypatch):
+    """QIITA_MAX_SEQUENCE_MINT_COUNT overrides the default."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.setenv("QIITA_MAX_SEQUENCE_MINT_COUNT", "12345")
+
+    from qiita_control_plane.config import Settings
+
+    settings = Settings.from_env()
+    assert settings.max_sequence_mint_count == 12345
+
+
+@pytest.mark.parametrize("bad_value", ["0", "-1", "-10000"])
+def test_settings_rejects_nonpositive_max_sequence_mint_count(monkeypatch, bad_value):
+    """A non-positive cap would make the route reject every mint silently;
+    reject it at startup instead."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.setenv("QIITA_MAX_SEQUENCE_MINT_COUNT", bad_value)
+
+    from qiita_control_plane.config import Settings
+
+    with pytest.raises(RuntimeError, match="QIITA_MAX_SEQUENCE_MINT_COUNT"):
+        Settings.from_env()
+
+
+def test_settings_rejects_non_integer_max_sequence_mint_count(monkeypatch):
+    """An un-parseable env var should name itself in the failure, not
+    surface a bare int() ValueError with no context."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.setenv("QIITA_MAX_SEQUENCE_MINT_COUNT", "not-an-int")
+
+    from qiita_control_plane.config import Settings
+
+    with pytest.raises(RuntimeError, match="QIITA_MAX_SEQUENCE_MINT_COUNT"):
+        Settings.from_env()

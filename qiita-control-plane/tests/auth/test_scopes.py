@@ -87,6 +87,22 @@ def test_role_ceiling_helper_raises_on_unknown_role():
         role_ceiling("super-duper-admin")
 
 
+def test_sequence_range_mint_is_workers_only():
+    """sequence-range:mint is allocated only to compute service accounts
+    — humans never mint sequence ranges, so the scope must be on the
+    service-account ceiling and absent from every role ceiling."""
+    from qiita_control_plane.auth.scopes import (
+        ROLE_IMPLIED_SCOPES,
+        SERVICE_ACCOUNT_SCOPE_CEILING,
+    )
+
+    assert Scope.SEQUENCE_RANGE_MINT in SERVICE_ACCOUNT_SCOPE_CEILING
+    for role, ceiling in ROLE_IMPLIED_SCOPES.items():
+        assert Scope.SEQUENCE_RANGE_MINT not in ceiling, (
+            f"sequence-range:mint must not be on role {role!r}'s ceiling — compute workers only"
+        )
+
+
 def test_reject_scopes_outside_ceiling():
     from qiita_control_plane.auth.scopes import (
         ROLE_IMPLIED_SCOPES,
