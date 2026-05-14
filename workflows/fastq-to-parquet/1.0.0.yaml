@@ -25,7 +25,15 @@ context_schema:
   type: object
   required: [fastq_path]
   properties:
-    fastq_path: {type: string}
+    # Absolute path on the shared filesystem the orchestrator can
+    # read. minLength rejects an empty string; the "^/" pattern
+    # rejects relative paths, which would silently resolve against
+    # whatever CWD the launcher happens to start in — a SLURM-side
+    # surprise we'd rather catch at submission time.
+    fastq_path:
+      type: string
+      minLength: 1
+      pattern: "^/"
 
 steps:
   - step: fastq
