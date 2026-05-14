@@ -10,7 +10,8 @@
 -- qiita.system_role / qiita.tier convention used elsewhere.
 CREATE TYPE qiita.scope_target_kind AS ENUM (
     'study_prep',
-    'reference'
+    'reference',
+    'sequenced_sample'
 );
 
 
