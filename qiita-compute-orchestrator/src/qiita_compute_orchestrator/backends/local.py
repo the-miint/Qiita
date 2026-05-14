@@ -4,7 +4,7 @@ from pathlib import Path
 
 import duckdb
 from qiita_common.backend_failure import BackendFailure, FailureKind
-from qiita_common.models import WorkTicketFailureStage
+from qiita_common.models import ScopeTargetKind, WorkTicketFailureStage
 from qiita_common.parquet import validate_parquet_path
 
 from ..backend import ComputeBackend
@@ -89,7 +89,7 @@ class LocalBackend(ComputeBackend):
         # branch only runs under that scope today. Refuse anything else
         # with a typed contract violation instead of silently picking up
         # the wrong scalar.
-        if scope_target.get("kind") != "reference":
+        if scope_target.get("kind") != ScopeTargetKind.REFERENCE.value:
             raise BackendFailure(
                 kind=FailureKind.CONTRACT_VIOLATION,
                 stage=WorkTicketFailureStage.STEP_RUN,
