@@ -11,8 +11,8 @@ import json
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-
 from qiita_common.auth_constants import API_PREFIX
+
 from qiita_control_plane.main import app
 
 from .conftest import delete_idxs, unique_instrument_id
