@@ -51,6 +51,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import duckdb
 from pydantic import BaseModel
 from qiita_common.parquet import validate_parquet_path
 
@@ -89,21 +90,38 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     await ensure_miint_installed()
     with open_conn() as conn:
         conn.execute("LOAD miint;")
+        # Materialize read_fastx output into a temp table first so the
+        # empty-file branch can substitute a header-only fallback table
+        # with the same schema. DuckDB raises on a zero-byte input from
+        # read_fastx (miint quirk); the reference-side _run_hash uses
+        # the same pattern.
+        try:
+            conn.execute(
+                "CREATE TEMP TABLE reads AS "
+                "SELECT read_id,"
+                "  sequence1 AS sequence,"
+                "  qual1 AS quality,"
+                "  CAST(length(sequence1) AS BIGINT) AS sequence_length "
+                "FROM read_fastx(?)",
+                [str(inputs.fastq_path)],
+            )
+        except duckdb.Error as exc:
+            if "Empty file" in str(exc):
+                conn.execute(
+                    "CREATE TEMP TABLE reads ("
+                    "  read_id VARCHAR, sequence VARCHAR,"
+                    "  quality UTINYINT[], sequence_length BIGINT"
+                    ")"
+                )
+            else:
+                raise
+
         # ORDER BY read_id matches the FASTQ's natural ingestion order
         # — consumers iterating in submission order get it for free.
         # When DuckLake registration lands and the schema gains the
         # CP-minted identifier columns, the sort changes to the
         # CLAUDE.md "Result file requirements" convention.
-        conn.execute(
-            "COPY ("
-            "  SELECT read_id,"
-            "    sequence1 AS sequence,"
-            "    qual1 AS quality,"
-            "    CAST(length(sequence1) AS BIGINT) AS sequence_length"
-            "  FROM read_fastx(?)"
-            "  ORDER BY read_id"
-            f") TO '{out}' ({PARQUET_OPTS})",
-            [str(inputs.fastq_path)],
-        )
+        conn.execute(f"COPY (SELECT * FROM reads ORDER BY read_id) TO '{out}' ({PARQUET_OPTS})")
+        conn.execute("DROP TABLE reads")
 
     return {"reads": out_path}
