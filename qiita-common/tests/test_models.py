@@ -7,6 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER
+from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
 
 
 def test_reference_status_enum():
@@ -192,9 +193,9 @@ def test_step_run_request_module_form_validates():
 
     kwargs = _minimal_step_run_kwargs()
     del kwargs["container"]
-    kwargs["module"] = "qiita_compute_orchestrator.jobs.fastq_to_parquet"
+    kwargs["module"] = FASTQ_TO_PARQUET_MODULE
     req = StepRunRequest(**kwargs)
-    assert req.module == "qiita_compute_orchestrator.jobs.fastq_to_parquet"
+    assert req.module == FASTQ_TO_PARQUET_MODULE
     assert req.container is None
 
 

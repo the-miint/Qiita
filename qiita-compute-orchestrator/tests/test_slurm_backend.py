@@ -15,6 +15,7 @@ import httpx
 import pytest
 from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.models import StepBaselineResources, WorkTicketFailureStage
+from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
 
 from qiita_compute_orchestrator.backends.slurm import SlurmBackend
 from qiita_compute_orchestrator.slurm import SlurmrestdClient
@@ -148,7 +149,7 @@ async def test_run_step_rejects_both_container_and_module(jwt_path, baseline, tm
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="qiita/hash:1.0.0",
-            module="qiita_compute_orchestrator.jobs.fastq_to_parquet",
+            module=FASTQ_TO_PARQUET_MODULE,
             entrypoint=None,
             baseline_resources=baseline,
         )
@@ -300,9 +301,7 @@ async def test_run_step_native_failure_enriched_from_launcher_stderr(jwt_path, b
     # is in place when SlurmBackend looks for it post-poll.
     logs_dir = tmp_path / "logs"
     logs_dir.mkdir()
-    launcher_reason = (
-        "native job 'qiita_compute_orchestrator.jobs.fastq_to_parquet' not implemented: skeleton"
-    )
+    launcher_reason = f"native job {FASTQ_TO_PARQUET_MODULE!r} not implemented: skeleton"
     (logs_dir / "stderr").write_text(
         json.dumps(
             {
@@ -321,7 +320,7 @@ async def test_run_step_native_failure_enriched_from_launcher_stderr(jwt_path, b
             tmp_path,
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
-            module="qiita_compute_orchestrator.jobs.fastq_to_parquet",
+            module=FASTQ_TO_PARQUET_MODULE,
             baseline_resources=baseline,
         )
 

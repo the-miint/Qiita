@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
 
 from qiita_compute_orchestrator.backends.local import LocalBackend
 from qiita_compute_orchestrator.jobs import RESERVED_INPUT_KEYS
@@ -113,7 +114,7 @@ async def test_rejects_both_container_and_module(tmp_path):
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=1,
             container="qiita/test:1.0.0",
-            module="qiita_compute_orchestrator.jobs.fastq_to_parquet",
+            module=FASTQ_TO_PARQUET_MODULE,
         )
     assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
     assert "exactly one" in ei.value.reason

@@ -14,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 from qiita_common.api_paths import URL_STEP_RUN
 from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER
+from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
 
 from qiita_compute_orchestrator.backend import ComputeBackend
 from qiita_compute_orchestrator.main import app
@@ -162,14 +163,14 @@ def test_step_run_forwards_module_to_backend(http_client, cp_to_co_token, tmp_pa
             "workspace": str(tmp_path),
             "scope_target": {"kind": "reference", "reference_idx": 1},
             "work_ticket_idx": 1,
-            "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
+            "module": FASTQ_TO_PARQUET_MODULE,
         },
     )
     assert resp.status_code == 200, resp.text
     assert len(backend.calls) == 1
     call = backend.calls[0]
     assert call.container is None
-    assert call.module == "qiita_compute_orchestrator.jobs.fastq_to_parquet"
+    assert call.module == FASTQ_TO_PARQUET_MODULE
 
 
 def test_step_run_translates_backend_value_error(http_client, cp_to_co_token, tmp_path):
@@ -304,7 +305,7 @@ def test_step_run_rejects_payload_with_both_runtimes(http_client, cp_to_co_token
             "scope_target": {"kind": "reference", "reference_idx": 1},
             "work_ticket_idx": 1,
             "container": REFERENCE_HASH_CONTAINER,
-            "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
+            "module": FASTQ_TO_PARQUET_MODULE,
         },
     )
     assert resp.status_code == 422
