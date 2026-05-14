@@ -1,0 +1,44 @@
+action_id: fastq-to-parquet
+version: 1.0.0
+target_kind: sequenced_sample
+
+description: >
+  Convert a single sample's FASTQ (or FASTA) file into a Parquet of
+  reads. Schema: (read_id, sequence, quality, sequence_length,
+  sequence_hash), sorted by sequence_hash. The sequence_hash column
+  is `CAST(md5(sequence) AS UUID)`, matching the reference-side
+  convention so a future join between a sample's reads and a
+  reference's sequences can use the column natively.
+
+  Per-sample scope (target_kind: sequenced_sample) — one ticket per
+  sample, one Parquet artifact under the work_ticket's workspace. The
+  artifact is not registered into DuckLake at this stage (no
+  sample_reads table exists yet); registration is a follow-up.
+
+scopes: []
+
+audience:
+  service: false
+  human_roles: [system_admin]
+
+context_schema:
+  type: object
+  required: [fastq_path]
+  properties:
+    fastq_path: {type: string}
+
+steps:
+  - step: fastq
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.fastq_to_parquet
+    inputs: [fastq_path]
+    outputs: [reads]
+    baseline_resources:
+      cpu: 2
+      mem_gb: 4
+      walltime: PT30M
+
+action_ceiling:
+  cpu: 8
+  mem_gb: 16
+  walltime: PT2H

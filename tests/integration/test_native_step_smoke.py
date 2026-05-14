@@ -2,9 +2,10 @@
 through the control-plane runner end-to-end.
 
 What's exercised:
-  - Inline ActionDefinition for `fastq-to-parquet`, target_kind
-    `sequenced_sample`, single step `module:` set to the real native
-    job → synced into qiita.action.
+  - Deployable YAML at workflows/fastq-to-parquet/1.0.0.yaml is
+    materialized under a tmp dir with a unique version stamp, loaded
+    via qiita_control_plane.actions.load_actions, and synced into
+    qiita.action — the same path `make sync-actions` uses in prod.
   - Submission of a sequenced_sample-scoped work_ticket.
   - Runner reads the action row, walks the single step entry.
   - Runner forwards module= and scope_target= to LocalComputeBackendClient.
@@ -24,10 +25,6 @@ and contains four 20-bp reads, with read_001 and read_003 carrying the
 same sequence (ACGTACGTACGTACGTACGT). The expected sequence_hash is
 computed via Python's hashlib so a future miint version that returns a
 different md5 implementation surfaces as a mismatch.
-
-When commit 7 lands the deployable workflows/fastq-to-parquet/1.0.0.yaml,
-this test switches off the inline ActionDefinition and loads from disk
-via sync_actions.
 """
 
 from __future__ import annotations
@@ -35,92 +32,55 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from datetime import timedelta
 from pathlib import Path
 from uuid import UUID
 
 import duckdb
 import pytest
-from qiita_common.actions import (
-    ActionCeiling,
-    ActionDefinition,
-    Audience,
-)
-from qiita_common.models import (
-    ScopeTargetKind,
-    StepType,
-    WorkTicketState,
-)
-from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
+from qiita_common.models import WorkTicketState
 
 from _runner_helpers import LocalComputeBackendClient
 
 FIXTURE_FASTQ = Path(__file__).resolve().parent / "fixtures" / "sample.fastq"
-
-
-def _build_fastq_to_parquet_action(*, action_id: str, version: str) -> ActionDefinition:
-    """Construct an ActionDefinition matching the deployable YAML that
-    commit 7 lands. Single step, native module, sequenced_sample-scoped.
-    The action_ceiling matches the YAML's; the step's baseline_resources
-    are intentionally small so the test doesn't depend on real
-    scheduler limits."""
-    return ActionDefinition(
-        action_id=action_id,
-        version=version,
-        target_kind=ScopeTargetKind.SEQUENCED_SAMPLE,
-        scopes=[],
-        audience=Audience(service=False, human_roles=["system_admin"]),
-        context_schema={
-            "type": "object",
-            "required": ["fastq_path"],
-            "properties": {"fastq_path": {"type": "string"}},
-        },
-        steps=[
-            {
-                "kind": "step",
-                "name": "fastq",
-                "step_type": StepType.SINGLETON,
-                "module": FASTQ_TO_PARQUET_MODULE,
-                "inputs": ["fastq_path"],
-                "outputs": ["reads"],
-                "baseline_resources": {
-                    "cpu": 2,
-                    "mem_gb": 4,
-                    "walltime": timedelta(minutes=30),
-                },
-            }
-        ],
-        action_ceiling=ActionCeiling(
-            cpu=8, mem_gb=16, walltime=timedelta(hours=2), gpu=0
-        ),
-    )
+_FASTQ_TO_PARQUET_YAML_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "workflows"
+    / "fastq-to-parquet"
+    / "1.0.0.yaml"
+)
 
 
 @pytest.fixture
-async def fastq_to_parquet_action(postgres_pool):
-    """Sync the action for this smoke run. Each test gets a unique
-    version suffix so parallel pytest-xdist workers don't collide on
-    the (action_id, version) primary key."""
-    from qiita_control_plane.actions import sync_actions
+async def fastq_to_parquet_action(postgres_pool, tmp_path):
+    """Materialize workflows/fastq-to-parquet/1.0.0.yaml under
+    tmp_path/workflows/ with a unique version stamp so parallel
+    pytest-xdist workers don't collide on (action_id, version), then
+    load it via the same loader prod's `make sync-actions` uses and
+    sync into qiita.action."""
+    from qiita_control_plane.actions import load_actions, sync_actions
 
-    action_id = "fastq-to-parquet"
-    version = f"smoke-{uuid.uuid4()}"
-    action = _build_fastq_to_parquet_action(action_id=action_id, version=version)
+    workflows_dir = tmp_path / "workflows" / "fastq-to-parquet"
+    workflows_dir.mkdir(parents=True)
+    yaml_text = _FASTQ_TO_PARQUET_YAML_PATH.read_text()
+    test_version = f"smoke-{uuid.uuid4()}"
+    yaml_text = yaml_text.replace("version: 1.0.0", f"version: {test_version}")
+    (workflows_dir / "1.0.0.yaml").write_text(yaml_text)
 
+    actions = load_actions(tmp_path / "workflows")
     async with postgres_pool.acquire() as conn:
-        await sync_actions(conn, [action])
+        await sync_actions(conn, actions)
 
-    yield (action_id, version)
+    yield ("fastq-to-parquet", test_version)
 
     await postgres_pool.execute(
         "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
-        action_id,
-        version,
+        "fastq-to-parquet",
+        test_version,
     )
     await postgres_pool.execute(
         "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
-        action_id,
-        version,
+        "fastq-to-parquet",
+        test_version,
     )
 
 
