@@ -1,7 +1,5 @@
 """Local compute backend — runs DuckDB+miint in-process for dev/test."""
 
-import asyncio
-import os
 from pathlib import Path
 
 import duckdb
@@ -11,37 +9,7 @@ from qiita_common.parquet import validate_parquet_path
 
 from ..backend import ComputeBackend
 from ..jobs import flatten_native_inputs, run_native_job
-
-# miint is installed once per process to avoid a network call on every hash job.
-_miint_install_lock = asyncio.Lock()
-_miint_installed = False
-
-# MIINT_EXTENSION_REPO points install at a custom extension repo (e.g. the team
-# mirror at https://ftp.microbio.me/pub/miint) instead of community-extensions.
-_MIINT_EXT_REPO = os.environ.get("MIINT_EXTENSION_REPO")
-
-
-async def _ensure_miint_installed() -> None:
-    """Install miint once per process, concurrency-safe."""
-    global _miint_installed
-    if _miint_installed:
-        return
-    async with _miint_install_lock:
-        if _miint_installed:
-            return
-        with _open_conn() as conn:
-            if _MIINT_EXT_REPO is not None:
-                conn.execute(f"FORCE INSTALL miint FROM '{_MIINT_EXT_REPO}';")
-            else:
-                conn.execute("INSTALL miint FROM community;")
-        _miint_installed = True
-
-
-def _open_conn() -> duckdb.DuckDBPyConnection:
-    """Open a DuckDB connection with unsigned extensions allowed if needed."""
-    if _MIINT_EXT_REPO is not None:
-        return duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
-    return duckdb.connect(":memory:")
+from ..miint import _ensure_miint_installed, _open_conn
 
 
 class LocalBackend(ComputeBackend):
