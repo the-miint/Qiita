@@ -9,22 +9,34 @@ can't burn an unbounded slice of the sequence_idx space).
 GET /sequence-range/{prep_sample_idx} reads the row back. Gated on the
 existing `prep_sample:read` scope so any caller who can see the
 prep_sample can see its allocated range.
+
+Why a dedicated REST router (not a `LibraryPrimitive` dispatch like
+`MINT_FEATURES` in `actions/library.py`): sequence-range allocation is
+a per-prep_sample synchronous int-shaped operation invoked directly by
+a compute step over HTTP. The library-primitive pattern targets bulk,
+parquet-path-based work driven by workflow YAML through the in-process
+runner — a different invocation model and a different payload shape.
 """
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request
+from qiita_common.api_paths import (
+    PATH_SEQUENCE_RANGE_BY_PREP_SAMPLE,
+    PATH_SEQUENCE_RANGE_PREFIX,
+    PATH_SEQUENCE_RANGE_ROOT,
+)
 from qiita_common.auth_constants import Scope
 from qiita_common.models import SequenceRange, SequenceRangeMintRequest
 
-from ..auth.guards import require_scope, require_service
+from ..auth.guards import require_scope, require_service_with_scope
 from ..auth.principal import Principal, ServiceAccount
-from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
+from ..deps import TxConnFactory, get_db_pool, get_settings, get_tx_conn_factory
 from ..repositories.sequence_range import (
     fetch_sequence_range_by_prep_sample_idx,
     mint_sequence_range,
 )
 
-router = APIRouter(prefix="/sequence-range", tags=["sequence-range"])
+router = APIRouter(prefix=PATH_SEQUENCE_RANGE_PREFIX, tags=["sequence-range"])
 
 
 def _record_to_response(row: asyncpg.Record) -> SequenceRange:
@@ -39,13 +51,12 @@ def _record_to_response(row: asyncpg.Record) -> SequenceRange:
     )
 
 
-@router.post("", status_code=201)
+@router.post(PATH_SEQUENCE_RANGE_ROOT, status_code=201)
 async def mint_sequence_range_route(
     body: SequenceRangeMintRequest,
     request: Request,
     tx: TxConnFactory = Depends(get_tx_conn_factory),
-    sa: ServiceAccount = Depends(require_service),
-    _scope: Principal = Depends(require_scope(Scope.SEQUENCE_RANGE_MINT)),
+    sa: ServiceAccount = Depends(require_service_with_scope(Scope.SEQUENCE_RANGE_MINT)),
 ) -> SequenceRange:
     """Mint a contiguous sequence_idx range for `body.prep_sample_idx`.
 
@@ -68,7 +79,7 @@ async def mint_sequence_range_route(
         Catches the long tail (connection drop, deadlock, disk full)
         without bleeding constraint names or stack frames.
     """
-    settings = request.app.state.settings
+    settings = get_settings(request)
     if body.count > settings.max_sequence_mint_count:
         raise HTTPException(
             status_code=400,
@@ -106,7 +117,7 @@ async def mint_sequence_range_route(
     return _record_to_response(row)
 
 
-@router.get("/{prep_sample_idx}")
+@router.get(PATH_SEQUENCE_RANGE_BY_PREP_SAMPLE)
 async def get_sequence_range_route(
     prep_sample_idx: int,
     pool: asyncpg.Pool = Depends(get_db_pool),

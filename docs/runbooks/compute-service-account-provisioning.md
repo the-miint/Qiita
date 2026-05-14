@@ -1,12 +1,10 @@
 # Compute service-account provisioning
 
-> **v1 status: feature wired, not yet in use.** `POST /api/v1/sequence-range`
-> is shipped and tested against the `compute_worker_service_account` test
-> fixture, but no production caller exists yet — the compute orchestrator
-> step that POSTs to this endpoint lands in a follow-up. This runbook
-> documents how the operator provisions the `compute` service account and
-> its initial token when that follow-up arrives. Until then no production
-> SA exists for this role; the endpoint will 401 / 403 every real request.
+**Audience.** Operator deploying the compute orchestrator's raw-read
+ingestion step. Run this once per environment that has the orchestrator
+enabled, **before** that orchestrator first tries to POST to
+`/api/v1/sequence-range`. Skip on installs that do not run raw-read
+ingestion.
 
 **Purpose.** Provision the dedicated `compute` service-account principal
 that the compute orchestrator's raw-read ingestion step uses to call

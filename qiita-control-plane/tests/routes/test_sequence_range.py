@@ -12,6 +12,10 @@ import secrets
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from qiita_common.api_paths import (
+    URL_SEQUENCE_RANGE_BY_PREP_SAMPLE,
+    URL_SEQUENCE_RANGE_PREFIX,
+)
 from qiita_common.auth_constants import Scope
 
 from qiita_control_plane.auth.token import mint_api_token
@@ -155,7 +159,7 @@ async def sa_no_mint_client(postgres_pool, compute_worker_service_account):
 
 async def test_post_anonymous_401(ctx):
     resp = await ctx["anon"].post(
-        "/api/v1/sequence-range",
+        URL_SEQUENCE_RANGE_PREFIX,
         json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 10},
     )
     assert resp.status_code == 401, resp.text
@@ -183,7 +187,7 @@ async def test_post_human_user_403_even_with_scope(ctx, postgres_pool, regular_u
         headers={"Authorization": f"Bearer {plaintext}"},
     ) as user_with_mint:
         resp = await user_with_mint.post(
-            "/api/v1/sequence-range",
+            URL_SEQUENCE_RANGE_PREFIX,
             json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 10},
         )
     assert resp.status_code == 403, resp.text
@@ -194,7 +198,7 @@ async def test_post_human_user_403_even_with_scope(ctx, postgres_pool, regular_u
 
 async def test_post_sa_without_scope_403(ctx, sa_no_mint_client):
     resp = await sa_no_mint_client.post(
-        "/api/v1/sequence-range",
+        URL_SEQUENCE_RANGE_PREFIX,
         json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 10},
     )
     assert resp.status_code == 403, resp.text
@@ -208,7 +212,7 @@ async def test_post_sa_without_scope_403(ctx, sa_no_mint_client):
 
 async def test_post_sa_happy_path_returns_range(ctx):
     resp = await ctx["sa"].post(
-        "/api/v1/sequence-range",
+        URL_SEQUENCE_RANGE_PREFIX,
         json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 10},
     )
     assert resp.status_code == 201, resp.text
@@ -237,11 +241,11 @@ async def test_post_sa_happy_path_returns_range(ctx):
 
 async def test_post_duplicate_prep_sample_idx_409(ctx):
     await ctx["sa"].post(
-        "/api/v1/sequence-range",
+        URL_SEQUENCE_RANGE_PREFIX,
         json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 10},
     )
     resp = await ctx["sa"].post(
-        "/api/v1/sequence-range",
+        URL_SEQUENCE_RANGE_PREFIX,
         json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 10},
     )
     assert resp.status_code == 409, resp.text
@@ -252,7 +256,7 @@ async def test_post_nonpositive_count_422(ctx, bad_count):
     """Pydantic Field(ge=1) catches non-positive counts before the route
     handler runs, surfacing as 422."""
     resp = await ctx["sa"].post(
-        "/api/v1/sequence-range",
+        URL_SEQUENCE_RANGE_PREFIX,
         json={"prep_sample_idx": ctx["prep_sample_idx"], "count": bad_count},
     )
     assert resp.status_code == 422, resp.text
@@ -272,7 +276,7 @@ async def test_post_count_above_cap_400(ctx, monkeypatch):
         app.state, "settings", replace(app.state.settings, max_sequence_mint_count=5)
     )
     resp = await ctx["sa"].post(
-        "/api/v1/sequence-range",
+        URL_SEQUENCE_RANGE_PREFIX,
         json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 6},
     )
     assert resp.status_code == 400, resp.text
@@ -285,7 +289,7 @@ async def test_post_unknown_prep_sample_idx_404(ctx):
         + 1_000_000
     )
     resp = await ctx["sa"].post(
-        "/api/v1/sequence-range",
+        URL_SEQUENCE_RANGE_PREFIX,
         json={"prep_sample_idx": bogus_idx, "count": 10},
     )
     assert resp.status_code == 404, resp.text
@@ -295,7 +299,7 @@ async def test_post_rejects_extra_fields_422(ctx):
     """SequenceRangeMintRequest must reject unknown fields
     (model_config extra='forbid')."""
     resp = await ctx["sa"].post(
-        "/api/v1/sequence-range",
+        URL_SEQUENCE_RANGE_PREFIX,
         json={
             "prep_sample_idx": ctx["prep_sample_idx"],
             "count": 10,
@@ -328,11 +332,11 @@ async def test_post_concurrent_mints_disjoint(ctx):
 
     r_a, r_b = await asyncio.gather(
         ctx["sa"].post(
-            "/api/v1/sequence-range",
+            URL_SEQUENCE_RANGE_PREFIX,
             json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 100},
         ),
         ctx["sa"].post(
-            "/api/v1/sequence-range",
+            URL_SEQUENCE_RANGE_PREFIX,
             json={"prep_sample_idx": ps2, "count": 100},
         ),
     )
@@ -353,7 +357,9 @@ async def test_post_concurrent_mints_disjoint(ctx):
 
 
 async def test_get_anonymous_401(ctx):
-    resp = await ctx["anon"].get(f"/api/v1/sequence-range/{ctx['prep_sample_idx']}")
+    resp = await ctx["anon"].get(
+        URL_SEQUENCE_RANGE_BY_PREP_SAMPLE.format(prep_sample_idx=ctx["prep_sample_idx"])
+    )
     assert resp.status_code == 401, resp.text
 
 
@@ -362,13 +368,15 @@ async def test_get_user_with_prep_sample_read_returns_row(ctx):
     should be able to read the range for any prep_sample."""
     # Mint a range first via the SA.
     post_resp = await ctx["sa"].post(
-        "/api/v1/sequence-range",
+        URL_SEQUENCE_RANGE_PREFIX,
         json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 5},
     )
     assert post_resp.status_code == 201, post_resp.text
     minted = post_resp.json()
 
-    resp = await ctx["user"].get(f"/api/v1/sequence-range/{ctx['prep_sample_idx']}")
+    resp = await ctx["user"].get(
+        URL_SEQUENCE_RANGE_BY_PREP_SAMPLE.format(prep_sample_idx=ctx["prep_sample_idx"])
+    )
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["sequence_idx_start"] == minted["sequence_idx_start"]
@@ -377,7 +385,9 @@ async def test_get_user_with_prep_sample_read_returns_row(ctx):
 
 
 async def test_get_404_when_unminted(ctx):
-    resp = await ctx["user"].get(f"/api/v1/sequence-range/{ctx['prep_sample_idx']}")
+    resp = await ctx["user"].get(
+        URL_SEQUENCE_RANGE_BY_PREP_SAMPLE.format(prep_sample_idx=ctx["prep_sample_idx"])
+    )
     assert resp.status_code == 404, resp.text
 
 
@@ -385,7 +395,9 @@ async def test_get_404_for_unknown_prep_sample(ctx):
     bogus_idx = (
         await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.prep_sample") + 999
     )
-    resp = await ctx["user"].get(f"/api/v1/sequence-range/{bogus_idx}")
+    resp = await ctx["user"].get(
+        URL_SEQUENCE_RANGE_BY_PREP_SAMPLE.format(prep_sample_idx=bogus_idx)
+    )
     assert resp.status_code == 404, resp.text
 
 
@@ -398,7 +410,7 @@ async def test_cascade_then_remint_yields_advanced_start(ctx):
     """Delete the parent prep_sample; the GET 404s; a fresh mint against
     a new prep_sample lands above the deleted range's stop (no recycle)."""
     first_resp = await ctx["sa"].post(
-        "/api/v1/sequence-range",
+        URL_SEQUENCE_RANGE_PREFIX,
         json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 10},
     )
     first = first_resp.json()
@@ -410,7 +422,9 @@ async def test_cascade_then_remint_yields_advanced_start(ctx):
     ctx["created"]["prep_sample"].remove(ctx["prep_sample_idx"])
 
     # GET against the cascaded prep_sample → 404.
-    resp = await ctx["user"].get(f"/api/v1/sequence-range/{ctx['prep_sample_idx']}")
+    resp = await ctx["user"].get(
+        URL_SEQUENCE_RANGE_BY_PREP_SAMPLE.format(prep_sample_idx=ctx["prep_sample_idx"])
+    )
     assert resp.status_code == 404, resp.text
 
     # Mint against a fresh prep_sample.
@@ -418,7 +432,7 @@ async def test_cascade_then_remint_yields_advanced_start(ctx):
     ctx["created"]["biosample"].append(_bs2)
     ctx["created"]["prep_sample"].append(ps2)
     second_resp = await ctx["sa"].post(
-        "/api/v1/sequence-range",
+        URL_SEQUENCE_RANGE_PREFIX,
         json={"prep_sample_idx": ps2, "count": 5},
     )
     assert second_resp.status_code == 201, second_resp.text

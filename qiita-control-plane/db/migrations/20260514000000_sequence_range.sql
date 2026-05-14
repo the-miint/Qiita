@@ -14,6 +14,14 @@
 -- via ON DELETE CASCADE; once consumed by the sequence, an idx range is
 -- never returned to the free pool, even if its row was removed.
 
+-- NO CYCLE + no MAXVALUE: the bigint domain ceiling (~9.2×10^18) is
+-- the implicit MAXVALUE. Settings.max_sequence_mint_count caps a single
+-- POST at 10^10 by default; even at that ceiling, 10^8 calls fit in the
+-- bigint domain. A REVOKE-on-sequence story is deferred until the
+-- deployment grows a privilege boundary worth enforcing — today the
+-- migration role and the application connection role are the same
+-- qiita user, so REVOKE would lock nothing out without simultaneously
+-- making mint_sequence_range SECURITY DEFINER.
 CREATE SEQUENCE qiita.sequence_idx_seq AS bigint MINVALUE 1 NO CYCLE;
 
 COMMENT ON SEQUENCE qiita.sequence_idx_seq IS
@@ -56,6 +64,11 @@ CREATE TABLE qiita.sequence_range (
         REFERENCES qiita.prep_sample (idx, processing_kind)
         ON DELETE CASCADE,
 
+    -- Defence in depth: mint_sequence_range already enforces count > 0
+    -- (so stop = start + count - 1 is always >= start), but the CHECK
+    -- holds even if a future migration or hand-INSERT bypasses the
+    -- function. Likewise sequence_range_positive defends against a
+    -- migration that ever resets sequence_idx_seq to 0 or below.
     CONSTRAINT sequence_range_start_lte_stop
         CHECK (sequence_idx_start <= sequence_idx_stop),
     CONSTRAINT sequence_range_positive
