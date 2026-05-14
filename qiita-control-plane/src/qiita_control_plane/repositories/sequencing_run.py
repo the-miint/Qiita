@@ -43,8 +43,9 @@ async def insert_sequencing_run(
     Raises asyncpg.UniqueViolationError if instrument_run_id collides with
     an existing row, asyncpg.PostgresError on other constraint failures.
     """
-    # extra_metadata is serialised to JSONB; asyncpg's default jsonb codec
-    # encodes None / dict directly, so no manual json.dumps is needed.
+    # extra_metadata is serialised to JSONB; asyncpg has no default jsonb
+    # codec, so the dict is JSON-encoded here and cast on the SQL side
+    # via $6::jsonb (see _encode_jsonb).
     return await conn.fetchval(
         "INSERT INTO qiita.sequencing_run ("
         "    instrument_run_id, platform, instrument_model, instrument_serial,"

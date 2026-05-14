@@ -4,11 +4,19 @@
 -- PLATFORM ENUM
 -- =============================================================================
 
--- Sequencing platforms supported by the system. Add new values when a new
--- platform comes online; values cannot be removed once any row references them.
+-- Sequencing platforms supported by the system. Values mirror the canonical
+-- platform names in ENA's SRA XSD (lowercased for Postgres convention) so
+-- downstream submission paths can map 1:1 without a translation table. Add
+-- new values when a new platform comes online; values cannot be removed
+-- once any row references them.
 CREATE TYPE qiita.platform AS ENUM (
     'illumina',
-    'pacbio'
+    'pacbio_smrt',
+    'oxford_nanopore',
+    'dnbseq',
+    'ls454',
+    'ion_torrent',
+    'complete_genomics'
 );
 
 -- =============================================================================

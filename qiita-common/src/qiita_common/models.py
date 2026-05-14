@@ -60,13 +60,20 @@ class FieldDataType(StrEnum):
 class Platform(StrEnum):
     """Closed set of sequencing platforms recognized by the system.
 
-    Mirrors the Postgres `qiita.platform` enum. New values may be added
-    as additional platforms come online; existing values cannot be
-    removed once any row references them.
+    Mirrors the Postgres `qiita.platform` enum. Values are the canonical
+    platform names from ENA's SRA XSD, lowercased for Postgres convention,
+    so downstream submission paths can map 1:1 without a translation
+    table. New values may be added as additional platforms come online;
+    existing values cannot be removed once any row references them.
     """
 
     ILLUMINA = "illumina"
-    PACBIO = "pacbio"
+    PACBIO_SMRT = "pacbio_smrt"
+    OXFORD_NANOPORE = "oxford_nanopore"
+    DNBSEQ = "dnbseq"
+    LS454 = "ls454"
+    ION_TORRENT = "ion_torrent"
+    COMPLETE_GENOMICS = "complete_genomics"
 
 
 class Tier(StrEnum):

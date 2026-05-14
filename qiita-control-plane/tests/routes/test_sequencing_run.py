@@ -12,6 +12,7 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
+from qiita_common.auth_constants import API_PREFIX
 from qiita_control_plane.main import app
 
 from .conftest import delete_idxs, unique_instrument_id
@@ -19,7 +20,7 @@ from .conftest import delete_idxs, unique_instrument_id
 pytestmark = pytest.mark.db
 
 
-_ROUTE = "/api/v1/sequencing-run"
+_ROUTE = f"{API_PREFIX}/sequencing-run"
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +115,7 @@ async def test_create_sequencing_run_system_admin_all_fields(ctx):
         ctx["admin"],
         ctx,
         instrument_run_id=instrument_run_id,
-        platform="pacbio",
+        platform="pacbio_smrt",
         instrument_model="NovaSeq X+",
         instrument_serial="LH00123",
         run_performed_at="2026-04-01T12:00:00Z",
@@ -134,7 +135,7 @@ async def test_create_sequencing_run_system_admin_all_fields(ctx):
     actual["extra_metadata"] = json.loads(actual["extra_metadata"])
     expected = {
         "instrument_run_id": instrument_run_id,
-        "platform": "pacbio",
+        "platform": "pacbio_smrt",
         "instrument_model": "NovaSeq X+",
         "instrument_serial": "LH00123",
         # TIMESTAMPTZ comes back as a tz-aware datetime; copy actual since

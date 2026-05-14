@@ -157,7 +157,11 @@ async def update_sequenced_sample(
     # allowlist above so f-string interpolation is safe; per-column
     # values are passed as positional asyncpg parameters. Sort keys so
     # the generated SQL is deterministic across calls (helps logs and
-    # plan-cache stability).
+    # plan-cache stability). The assert is defense-in-depth: it pins the
+    # allowlist precondition at the SET-clause construction site so a
+    # future refactor of validate_patch_fields cannot silently open an
+    # injection hole here.
+    assert set(fields) <= SEQUENCED_SAMPLE_PATCHABLE_COLUMNS
     columns = sorted(fields.keys())
     set_clause = ", ".join(f"{col} = ${i + 1}" for i, col in enumerate(columns))
     values = [fields[col] for col in columns]
