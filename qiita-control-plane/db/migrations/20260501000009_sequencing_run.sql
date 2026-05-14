@@ -17,7 +17,7 @@ CREATE TYPE qiita.platform AS ENUM (
 
 CREATE TABLE qiita.sequencing_run (
     idx                  BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
-    instrument_run_id    VARCHAR(255) NOT NULL,
+    instrument_run_id    VARCHAR(255) NOT NULL CHECK (length(instrument_run_id) >= 1),
     platform             qiita.platform NOT NULL,
     instrument_model     TEXT,
     instrument_serial    TEXT,
@@ -76,26 +76,10 @@ CREATE TABLE qiita.sequenced_pool (
     idx                    BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     sequencing_run_idx     BIGINT NOT NULL REFERENCES qiita.sequencing_run(idx) ON DELETE RESTRICT,
     run_preflight_blob     BYTEA NOT NULL,
-    run_preflight_filename TEXT NOT NULL,
+    run_preflight_filename TEXT NOT NULL CHECK (length(run_preflight_filename) >= 1),
     extra_metadata         JSONB,
     created_by_idx         BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
-    created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
-
-    retired                BOOLEAN NOT NULL DEFAULT false,
-    retired_by_idx         BIGINT REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
-    retired_at             TIMESTAMPTZ,
-    retire_reason          TEXT,
-
-    CONSTRAINT sequenced_pool_retirement_consistent CHECK (
-        (retired = false
-            AND retired_at IS NULL
-            AND retired_by_idx IS NULL
-            AND retire_reason IS NULL)
-        OR
-        (retired = true
-            AND retired_at IS NOT NULL
-            AND retired_by_idx IS NOT NULL)
-    )
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 COMMENT ON TABLE qiita.sequenced_pool IS
@@ -103,16 +87,17 @@ COMMENT ON TABLE qiita.sequenced_pool IS
     'platforms with lanes (e.g., illumina), one sequenced_pool row exists per '
     '(run, lane); the lane assignment lives inside the post-sequencing '
     'run preflight blob, not as a separate column, so there is a single source '
-    'of truth.';
+    'of truth. Withdrawal of a pool decomposes onto the prep_sample / '
+    'prep_sample_to_study retirement surface; this table carries no '
+    'retirement columns of its own.';
 
 COMMENT ON COLUMN qiita.sequenced_pool.run_preflight_blob IS
     'Post-sequencing run preflight, typically stored as a SQLite database file. '
     'BYTEA holds arbitrary binary; TOAST handles values larger than the inline '
     'threshold.';
 
-CREATE INDEX sequenced_pool_active_idx
-    ON qiita.sequenced_pool (sequencing_run_idx)
-    WHERE retired = false;
+CREATE INDEX sequenced_pool_sequencing_run_idx
+    ON qiita.sequenced_pool (sequencing_run_idx);
 
 -- migrate:down
 

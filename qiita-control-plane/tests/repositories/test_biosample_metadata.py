@@ -16,12 +16,14 @@ import pytest
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
 from qiita_common.models import FieldDataType
 
+from qiita_control_plane.repositories import (
+    GlobalFieldRow,
+    GlobalMetadataRow,
+    MetadataParseError,
+    StudyFieldConflictError,
+    parse_text_for_data_type,
+)
 from qiita_control_plane.repositories.biosample_metadata import (
-    BiosampleGlobalFieldRow,
-    BiosampleGlobalMetadataRow,
-    BiosampleMetadataParseError,
-    BiosampleStudyFieldConflictError,
-    _parse_text_for_data_type,
     fetch_biosample_global_fields_by_display_names,
     fetch_global_metadata_for_biosample,
     get_or_create_globally_linked_biosample_study_field,
@@ -154,12 +156,8 @@ async def test_fetch_biosample_global_fields_by_display_names_returns_matching(c
         result = await fetch_biosample_global_fields_by_display_names(conn, [name_a, name_b])
 
     expected = {
-        name_a: BiosampleGlobalFieldRow(
-            idx=idx_a, display_name=name_a, data_type=FieldDataType.TEXT
-        ),
-        name_b: BiosampleGlobalFieldRow(
-            idx=idx_b, display_name=name_b, data_type=FieldDataType.NUMERIC
-        ),
+        name_a: GlobalFieldRow(idx=idx_a, display_name=name_a, data_type=FieldDataType.TEXT),
+        name_b: GlobalFieldRow(idx=idx_b, display_name=name_b, data_type=FieldDataType.NUMERIC),
     }
     assert result == expected
 
@@ -185,9 +183,7 @@ async def test_fetch_biosample_global_fields_by_display_names_omits_unknown(ctx)
 
     # Only the known name appears; unknown is silently absent.
     expected = {
-        known_name: BiosampleGlobalFieldRow(
-            idx=idx, display_name=known_name, data_type=FieldDataType.TEXT
-        ),
+        known_name: GlobalFieldRow(idx=idx, display_name=known_name, data_type=FieldDataType.TEXT),
     }
     assert result == expected
 
@@ -211,7 +207,7 @@ async def test_get_or_create_globally_linked_biosample_study_field_creates_new_r
     ctx["created"]["biosample_global_field"].append(global_idx)
 
     # Upsert a globally-linked study field at the same display_name.
-    async with ctx["pool"].acquire() as conn:
+    async with ctx["pool"].acquire() as conn, conn.transaction():
         idx, created = await get_or_create_globally_linked_biosample_study_field(
             conn,
             study_idx=ctx["study_idx"],
@@ -259,7 +255,7 @@ async def test_get_or_create_globally_linked_biosample_study_field_returns_exist
     )
     ctx["created"]["biosample_global_field"].append(global_idx)
 
-    async with ctx["pool"].acquire() as conn:
+    async with ctx["pool"].acquire() as conn, conn.transaction():
         first_idx, first_created = await get_or_create_globally_linked_biosample_study_field(
             conn,
             study_idx=ctx["study_idx"],
@@ -308,8 +304,8 @@ async def test_get_or_create_globally_linked_biosample_study_field_raises_on_loc
     ctx["created"]["biosample_global_field"].append(global_idx)
 
     # The upsert must detect the existing row is purely-local and raise.
-    async with ctx["pool"].acquire() as conn:
-        with pytest.raises(BiosampleStudyFieldConflictError) as excinfo:
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        with pytest.raises(StudyFieldConflictError) as excinfo:
             await get_or_create_globally_linked_biosample_study_field(
                 conn,
                 study_idx=ctx["study_idx"],
@@ -343,7 +339,7 @@ async def test_get_or_create_globally_linked_biosample_study_field_raises_on_glo
 
     # Shared study-local display_name pointing at global_a.
     display_name = f"Field {suffix}"
-    async with ctx["pool"].acquire() as conn:
+    async with ctx["pool"].acquire() as conn, conn.transaction():
         existing_idx, _ = await get_or_create_globally_linked_biosample_study_field(
             conn,
             study_idx=ctx["study_idx"],
@@ -355,8 +351,8 @@ async def test_get_or_create_globally_linked_biosample_study_field_raises_on_glo
 
     # Asking for the same display_name with global_b must raise; the row
     # already binds to global_a.
-    async with ctx["pool"].acquire() as conn:
-        with pytest.raises(BiosampleStudyFieldConflictError) as excinfo:
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        with pytest.raises(StudyFieldConflictError) as excinfo:
             await get_or_create_globally_linked_biosample_study_field(
                 conn,
                 study_idx=ctx["study_idx"],
@@ -837,7 +833,7 @@ async def _seed_globally_linked_metadata(
     # Link a per-study field to the global concept and dispatch the value
     # write to the matching typed insert; the field-contract trigger
     # rejects mismatches so the dispatch must agree with data_type.
-    async with ctx["pool"].acquire() as conn:
+    async with ctx["pool"].acquire() as conn, conn.transaction():
         field_idx, _ = await get_or_create_globally_linked_biosample_study_field(
             conn,
             study_idx=ctx["study_idx"],
@@ -911,21 +907,21 @@ async def test_fetch_global_metadata_for_biosample_text_numeric_date(ctx):
     result = await fetch_global_metadata_for_biosample(ctx["pool"], bs_idx)
 
     expected = {
-        f"host_subject_id_{suffix}": BiosampleGlobalMetadataRow(
+        f"host_subject_id_{suffix}": GlobalMetadataRow(
             internal_name=f"host_subject_id_{suffix}",
             display_name=f"Host Subject ID {suffix}",
             description="Host's stable identifier",
             data_type=FieldDataType.TEXT,
             value="HOST-7",
         ),
-        f"latitude_{suffix}": BiosampleGlobalMetadataRow(
+        f"latitude_{suffix}": GlobalMetadataRow(
             internal_name=f"latitude_{suffix}",
             display_name=f"Latitude {suffix}",
             description=None,
             data_type=FieldDataType.NUMERIC,
             value=Decimal("32.7"),
         ),
-        f"collection_date_{suffix}": BiosampleGlobalMetadataRow(
+        f"collection_date_{suffix}": GlobalMetadataRow(
             internal_name=f"collection_date_{suffix}",
             display_name=f"Collection Date {suffix}",
             description="Date the sample was collected",
@@ -979,7 +975,7 @@ async def test_fetch_global_metadata_for_biosample_excludes_purely_local_rows(ct
 
     # Only the globally-linked row appears; both purely-local rows are filtered.
     expected = {
-        f"global_only_{suffix}": BiosampleGlobalMetadataRow(
+        f"global_only_{suffix}": GlobalMetadataRow(
             internal_name=f"global_only_{suffix}",
             display_name=f"Global Only {suffix}",
             description=None,
@@ -1028,7 +1024,8 @@ async def test_fetch_global_metadata_for_biosample_empty_when_none_exist(ctx):
 
 
 # ---------------------------------------------------------------------------
-# _parse_text_for_data_type
+# parse_text_for_data_type (shared with prep_sample_metadata; lives in
+# repositories.__init__)
 # ---------------------------------------------------------------------------
 
 
@@ -1043,8 +1040,8 @@ async def test_fetch_global_metadata_for_biosample_empty_when_none_exist(ctx):
         (FieldDataType.DATE, " 2026-01-01 ", date(2026, 1, 1)),
     ],
 )
-def test__parse_text_for_data_type_returns_expected(data_type, text_value, expected):
-    assert _parse_text_for_data_type("field_x", data_type, text_value) == expected
+def test_parse_text_for_data_type_returns_expected(data_type, text_value, expected):
+    assert parse_text_for_data_type("field_x", data_type, text_value) == expected
 
 
 @pytest.mark.parametrize(
@@ -1056,9 +1053,9 @@ def test__parse_text_for_data_type_returns_expected(data_type, text_value, expec
         (FieldDataType.DATE, "2026/05/06"),
     ],
 )
-def test__parse_text_for_data_type_raises_parse_error(data_type, text_value):
-    with pytest.raises(BiosampleMetadataParseError) as excinfo:
-        _parse_text_for_data_type("field_x", data_type, text_value)
+def test_parse_text_for_data_type_raises_parse_error(data_type, text_value):
+    with pytest.raises(MetadataParseError) as excinfo:
+        parse_text_for_data_type("field_x", data_type, text_value)
     assert excinfo.value.display_name == "field_x"
     assert excinfo.value.data_type == data_type
     assert excinfo.value.text_value == text_value
@@ -1068,6 +1065,6 @@ def test__parse_text_for_data_type_raises_parse_error(data_type, text_value):
     "data_type",
     [FieldDataType.BOOLEAN, FieldDataType.TERMINOLOGY],
 )
-def test__parse_text_for_data_type_raises_not_implemented(data_type):
+def test_parse_text_for_data_type_raises_not_implemented(data_type):
     with pytest.raises(NotImplementedError):
-        _parse_text_for_data_type("field_x", data_type, "x")
+        parse_text_for_data_type("field_x", data_type, "x")

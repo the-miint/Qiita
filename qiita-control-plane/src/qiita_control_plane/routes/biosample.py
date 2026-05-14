@@ -25,12 +25,12 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import Field
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
-    BiosampleGlobalMetadataEntry,
-    BiosampleIdxsListResponse,
     BiosampleImportRequest,
     BiosampleImportResponse,
     BiosamplePatchRequest,
     BiosampleResponse,
+    GlobalMetadataEntry,
+    IdxsListResponse,
     Tier,
 )
 
@@ -45,6 +45,11 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
+from ..repositories import (
+    MetadataParseError,
+    MetadataUnknownFieldsError,
+    StudyFieldConflictError,
+)
 from ..repositories.biosample import (
     fetch_biosample,
     fetch_biosample_idxs_for_study,
@@ -53,12 +58,10 @@ from ..repositories.biosample import (
     update_biosample,
 )
 from ..repositories.biosample_metadata import (
-    BiosampleMetadataParseError,
-    BiosampleMetadataUnknownFieldsError,
     BiosampleOwnerIdFieldCollisionError,
-    BiosampleStudyFieldConflictError,
     fetch_global_metadata_for_biosample,
 )
+from ._helpers import etag_for_updated_at
 
 router = APIRouter(prefix="/study", tags=["biosample"])
 biosample_router = APIRouter(prefix="/biosample", tags=["biosample"])
@@ -131,12 +134,12 @@ async def import_biosample(
                     f"metadata key {exc.display_name!r} collides with owner_biosample_id_field_name"
                 ),
             )
-        except BiosampleMetadataUnknownFieldsError as exc:
+        except MetadataUnknownFieldsError as exc:
             raise HTTPException(
                 status_code=422,
                 detail=f"unknown metadata fields: {', '.join(exc.unknown_display_names)}",
             )
-        except BiosampleMetadataParseError as exc:
+        except MetadataParseError as exc:
             raise HTTPException(
                 status_code=422,
                 detail=(
@@ -144,7 +147,7 @@ async def import_biosample(
                     f" value {exc.text_value!r} as {exc.data_type}: {exc.reason}"
                 ),
             )
-        except BiosampleStudyFieldConflictError as exc:
+        except StudyFieldConflictError as exc:
             raise HTTPException(
                 status_code=422,
                 detail=(
@@ -181,7 +184,7 @@ async def list_biosample_idxs_in_study(
     _access: None = Depends(
         require_study_access(min_tier=Tier.VIEWER, bypass_role=SystemRole.WET_LAB_ADMIN)
     ),
-) -> BiosampleIdxsListResponse:
+) -> IdxsListResponse:
     """List biosample idxs linked to the path's study, newest-linked first.
 
     Caller must be a HumanUser with Scope.STUDY_READ; access to the
@@ -202,8 +205,8 @@ async def list_biosample_idxs_in_study(
     truncated = len(rows) > _BIOSAMPLE_IDXS_HARD_CAP
     if truncated:
         rows = rows[:_BIOSAMPLE_IDXS_HARD_CAP]
-    return BiosampleIdxsListResponse(
-        biosample_idxs=rows,
+    return IdxsListResponse(
+        idxs=rows,
         count=len(rows),
         truncated=truncated,
         caller_system_role=user.system_role,
@@ -220,7 +223,7 @@ _BIOSAMPLE_GET_BYPASS_ROLE: SystemRole = SystemRole.WET_LAB_ADMIN
 def _biosample_response_from_row(
     row: asyncpg.Record,
     *,
-    global_metadata: dict[str, BiosampleGlobalMetadataEntry],
+    global_metadata: dict[str, GlobalMetadataEntry],
     caller_system_role: SystemRole,
 ) -> BiosampleResponse:
     """Shape a qiita.biosample row + decoded global metadata into BiosampleResponse.
@@ -250,17 +253,6 @@ def _biosample_response_from_row(
             "caller_system_role": caller_system_role,
         }
     )
-
-
-def _etag_for_updated_at(updated_at) -> str:
-    """Build the quoted ETag header value from biosample.updated_at.
-
-    The surrounding double-quotes are required by RFC 7232's entity-tag
-    grammar — the on-the-wire value is `"<iso8601>"`, not `<iso8601>`. The
-    inner ISO 8601 timestamp is opaque to clients; only its byte-for-byte
-    equality with a subsequent If-Match header matters.
-    """
-    return f'"{updated_at.isoformat()}"'
 
 
 @biosample_router.get("/{biosample_idx}")
@@ -322,7 +314,7 @@ async def get_biosample_route(
     # data_type-driven value column dispatch.
     metadata_rows = await fetch_global_metadata_for_biosample(pool, biosample_idx)
     global_metadata = {
-        internal_name: BiosampleGlobalMetadataEntry(
+        internal_name: GlobalMetadataEntry(
             display_name=entry.display_name,
             description=entry.description,
             data_type=entry.data_type,
@@ -333,7 +325,7 @@ async def get_biosample_route(
 
     # Set the ETag header so callers can use it as the If-Match value on a
     # subsequent PATCH; the value is opaque-by-contract.
-    response.headers["ETag"] = _etag_for_updated_at(row["updated_at"])
+    response.headers["ETag"] = etag_for_updated_at(row["updated_at"])
 
     return _biosample_response_from_row(
         row,
@@ -419,7 +411,7 @@ async def patch_biosample_route(
                 raise HTTPException(status_code=404, detail=f"biosample {biosample_idx} not found")
             if row["retired"]:
                 raise HTTPException(status_code=409, detail=f"biosample {biosample_idx} is retired")
-            if if_match != _etag_for_updated_at(row["updated_at"]):
+            if if_match != etag_for_updated_at(row["updated_at"]):
                 raise HTTPException(status_code=412, detail="If-Match did not match")
 
             # Eligibility preflight runs only when ownership is being
@@ -463,12 +455,12 @@ async def patch_biosample_route(
             raise
 
     # Set the new ETag from the updated row's bumped updated_at.
-    response.headers["ETag"] = _etag_for_updated_at(updated_row["updated_at"])
+    response.headers["ETag"] = etag_for_updated_at(updated_row["updated_at"])
 
     # Reuse the GET route's row -> response shaper so the PATCH and GET
     # surfaces share one source of truth for the response shape.
     global_metadata = {
-        internal_name: BiosampleGlobalMetadataEntry(
+        internal_name: GlobalMetadataEntry(
             display_name=entry.display_name,
             description=entry.description,
             data_type=entry.data_type,

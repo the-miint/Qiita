@@ -98,7 +98,7 @@ COMMENT ON COLUMN qiita.prep_sample_global_field.internal_name IS
 CREATE TABLE qiita.prep_sample_study_field (
     idx                                BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     study_idx                          BIGINT NOT NULL REFERENCES qiita.study(idx) ON DELETE RESTRICT,
-    prep_sample_global_field_idx  BIGINT REFERENCES qiita.prep_sample_global_field(idx) ON DELETE RESTRICT,
+    prep_sample_global_field_idx       BIGINT REFERENCES qiita.prep_sample_global_field(idx) ON DELETE RESTRICT,
     display_name                       TEXT NOT NULL,
     description                        TEXT,
     data_type                          qiita.field_data_type,

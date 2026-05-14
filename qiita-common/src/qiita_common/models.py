@@ -7,6 +7,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic.types import Base64Bytes
 
 # `SystemRole` is re-exported so existing `from qiita_common.models import SystemRole`
 # imports keep working after the move to qiita_common.auth_constants.
@@ -54,6 +55,18 @@ class FieldDataType(StrEnum):
     BOOLEAN = "boolean"
     DATE = "date"
     TERMINOLOGY = "terminology"
+
+
+class Platform(StrEnum):
+    """Closed set of sequencing platforms recognized by the system.
+
+    Mirrors the Postgres `qiita.platform` enum. New values may be added
+    as additional platforms come online; existing values cannot be
+    removed once any row references them.
+    """
+
+    ILLUMINA = "illumina"
+    PACBIO = "pacbio"
 
 
 class Tier(StrEnum):
@@ -265,15 +278,16 @@ class BiosampleImportResponse(BaseModel):
     biosample_study_field_created: bool
 
 
-class BiosampleGlobalMetadataEntry(BaseModel):
-    """One globally-linked metadata value for a biosample, with cosmetic context.
+class GlobalMetadataEntry(BaseModel):
+    """One globally-linked metadata value for a biosample or prep_sample,
+    with cosmetic context.
 
-    Returned as a value inside BiosampleResponse.global_metadata, keyed on
-    the field's `internal_name`. display_name and description are taken
-    from biosample_global_field (the canonical labels), not from any
-    per-study biosample_study_field override, because biosample reads
-    are not study-scoped. data_type identifies which Python type carries
-    the value: TEXT -> str, NUMERIC -> Decimal, DATE -> date.
+    Returned as a value inside *Response.global_metadata, keyed on the
+    field's `internal_name`. display_name and description are taken from
+    the canonical *_global_field row, not from any per-study *_study_field
+    override, because these reads are not study-scoped. data_type
+    identifies which Python type carries the value: TEXT -> str,
+    NUMERIC -> Decimal, DATE -> date.
     """
 
     display_name: str
@@ -311,24 +325,40 @@ class BiosampleResponse(BaseModel):
     retired_by_idx: int | None
     retired_at: AwareDatetime | None
     retire_reason: str | None
-    global_metadata: dict[str, BiosampleGlobalMetadataEntry]
+    global_metadata: dict[str, GlobalMetadataEntry]
     caller_system_role: SystemRole
 
 
-class BiosamplePatchRequest(BaseModel):
-    """Body for PATCH /api/v1/biosample/{biosample_idx}.
+class PatchRequestModel(BaseModel):
+    """Base class for every PATCH-body Pydantic model in the API.
 
-    Every editable field is optional; the route distinguishes "absent"
-    (do not write) from "explicit null" (set the column to NULL) by
-    inspecting `model_fields_set`. extra="forbid" rejects bodies that
-    name immutable or retirement-managed columns (idx, retired,
-    retired_at, retired_by_idx, retire_reason, created_by_idx,
-    created_at, updated_at, last_metadata_change_at) with 422. The
-    model-level validator enforces the "at least one field" rule and
-    the NOT-NULL invariant on owner_idx.
+    Pins extra="forbid" so requests that name immutable or retirement-
+    managed columns trip the model-level rejection rather than reaching
+    the repo, and enforces the "at least one editable field" rule that
+    every PATCH surface shares — derived classes inherit the validator
+    automatically. Each subtype declares its own column-typed Optional
+    fields; the route layer distinguishes "absent" (do not write) from
+    "explicit null" (set the column to NULL) by inspecting
+    `model_fields_set`.
     """
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def at_least_one_field(self):
+        # Empty bodies are rejected here so every PATCH route gets the
+        # 422 shape for free without per-route special-casing.
+        if not self.model_fields_set:
+            raise ValueError("at least one editable field is required")
+        return self
+
+
+class BiosamplePatchRequest(PatchRequestModel):
+    """Body for PATCH /api/v1/biosample/{biosample_idx}.
+
+    Inherits extra="forbid" and the at_least_one_field rule from
+    PatchRequestModel; adds the NOT-NULL invariant on owner_idx.
+    """
 
     metadata_checklist_idx: Annotated[int, Field(gt=0)] | None = None
     owner_idx: Annotated[int, Field(gt=0)] | None = None
@@ -338,34 +368,30 @@ class BiosamplePatchRequest(BaseModel):
     submission_error: str | None = None
 
     @model_validator(mode="after")
-    def at_least_one_field_and_owner_not_null(self):
-        # Empty bodies are rejected here so the route does not have to
-        # special-case the "no-op PATCH" path.
-        if not self.model_fields_set:
-            raise ValueError("at least one editable field is required")
-
+    def owner_not_null(self):
         # owner_idx maps to a NOT NULL column; explicit null is invalid
         # input even though the field is typed Optional for the
         # "absent vs null" distinguishing pattern shared with the
         # other fields.
         if "owner_idx" in self.model_fields_set and self.owner_idx is None:
             raise ValueError("owner_idx may not be null")
-
         return self
 
 
-class BiosampleIdxsListResponse(BaseModel):
-    """Returned by GET /api/v1/study/{study_idx}/biosample/list-idxs.
+class IdxsListResponse(BaseModel):
+    """Returned by every bulk-id GET that emits a hard-capped list of idxs.
 
-    Single-shot bulk-id envelope: every biosample_idx linked to the
-    study, subject to retirement filtering, up to a hard cap.
-    `truncated` is true when the underlying set exceeded the cap;
-    clients seeing it should narrow their scope.
-    `caller_system_role` carries the caller's principal.system_role
-    verbatim from the database.
+    Used today by GET /api/v1/study/{study_idx}/biosample/list-idxs and
+    GET /api/v1/sequencing-run/{sequencing_run_idx}/sequenced-sample/list-idxs;
+    every list-idxs endpoint that follows shares the same envelope.
+    `truncated` is true when the underlying set exceeded the route's cap;
+    clients seeing it should narrow their scope. `caller_system_role`
+    carries the caller's principal.system_role verbatim from the database.
+    The generic `idxs` field name lets the same envelope serve every
+    resource family without a per-resource class.
     """
 
-    biosample_idxs: list[int]
+    idxs: list[int]
     count: Annotated[int, Field(ge=0)]
     truncated: bool
     caller_system_role: SystemRole
@@ -791,3 +817,170 @@ class WorkTicketResponse(BaseModel):
 
     work_ticket_idx: Annotated[int, Field(gt=0)]
     state: WorkTicketState
+
+
+# ============================================================================
+# Sequencing-run / sequenced-pool / sequenced-sample import models
+# ============================================================================
+#
+# Bodies and responses for the sequencing-ingestion surface: a sequencing_run
+# row, one sequenced_pool per lane, and one sequenced_sample (atomically with
+# its parent prep_sample, prep_sample_to_study links, and prep_sample_metadata
+# rows) per pool item.
+
+
+class SequencingRunCreateRequest(BaseModel):
+    """Body for POST /api/v1/sequencing-run.
+
+    `instrument_run_id` is the instrument-assigned identifier and must be
+    unique across the system; collision surfaces as 409. `extra_metadata`
+    is a free-form JSON object (stored as JSONB).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    instrument_run_id: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
+    platform: Platform
+    instrument_model: str | None = None
+    instrument_serial: str | None = None
+    run_performed_at: AwareDatetime | None = None
+    extra_metadata: dict[str, Any] | None = None
+
+
+class SequencingRunCreateResponse(BaseModel):
+    """Returned by POST /api/v1/sequencing-run on success."""
+
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+
+
+class SequencedPoolCreateRequest(BaseModel):
+    """Body for POST /api/v1/sequencing-run/{sequencing_run_idx}/sequenced-pool.
+
+    `run_preflight_blob` is the run preflight (typically a SQLite file)
+    after post-sequencing info has been doped into it.
+    Pydantic's Base64Bytes decodes the JSON string field as
+    base64 on receive — a plain `bytes` field would otherwise treat the
+    incoming string as UTF-8 and the encoded payload would land in BYTEA
+    instead of the decoded blob. `run_preflight_filename` is the
+    originating file name on disk and is required by the schema.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_preflight_blob: Base64Bytes = Field(min_length=1)
+    run_preflight_filename: str = Field(min_length=1)
+    extra_metadata: dict[str, Any] | None = None
+
+
+class SequencedPoolCreateResponse(BaseModel):
+    """Returned by POST /api/v1/sequencing-run/{idx}/sequenced-pool on success."""
+
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+
+
+class SequencedSampleCreateRequest(BaseModel):
+    """Body for the sequenced-sample composer POST.
+
+    Atomically creates a prep_sample row (with processing_kind='sequenced'),
+    its 1:1 sequenced_sample subtype row, one prep_sample_to_study link
+    per study in `study_idxs`, and one prep_sample_metadata row per
+    metadata entry (resolved against prep_sample_global_field by
+    display_name). Currently rejects len(study_idxs) > 1 at the route
+    boundary: multi-study assignment requires a future schema decision
+    about which study owns the per-display_name field row.
+
+    `metadata` keys must match seeded prep_sample_global_field display_name
+    values; unknown names surface as a single 422 listing every bad key.
+    The two ENA accession fields are nullable because they are populated
+    later by the submission subsystem.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    biosample_idx: Annotated[int, Field(gt=0)]
+    prep_protocol_idx: Annotated[int, Field(gt=0)]
+    owner_idx: Annotated[int, Field(gt=0)]
+    sequenced_pool_item_id: str = Field(min_length=1)
+    study_idxs: list[Annotated[int, Field(gt=0)]] = Field(min_length=1, max_length=1)
+    metadata: dict[str, str] = Field(default_factory=dict)
+    metadata_checklist_idx: Annotated[int, Field(gt=0)] | None = None
+    ena_experiment_accession: str | None = Field(default=None, max_length=50)
+    ena_run_accession: str | None = Field(default=None, max_length=50)
+
+
+class SequencedSampleCreateResponse(BaseModel):
+    """Returned by the sequenced-sample composer POST on success.
+
+    `prep_sample_study_fields` maps each metadata display_name to a
+    `(study_field_idx, created)` pair so the caller can tell which
+    per-study prep_sample_study_field rows were created on this call
+    versus reused from a prior write.
+    """
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    sequenced_sample_idx: Annotated[int, Field(gt=0)]
+    prep_sample_study_fields: dict[str, tuple[Annotated[int, Field(gt=0)], bool]]
+
+
+class SequencedSampleResponse(BaseModel):
+    """Returned by GET /api/v1/sequenced-sample/{sequenced_sample_idx}.
+
+    Carries every caller-visible column from the sequenced_sample subtype
+    row plus the controlling supertype prep_sample row, and embeds a dict
+    of every globally-linked metadata value the prep_sample carries,
+    keyed on prep_sample_global_field.internal_name. Purely-local
+    metadata and metadata whose prep_sample_to_study link has been
+    retired are excluded -- both surface as
+    prep_sample_metadata.global_field_idx IS NULL via the existing
+    schema triggers and are filtered out by the read.
+
+    `effective_updated_at` = GREATEST(prep_sample.updated_at,
+    sequenced_sample.updated_at) — a single timestamp that bumps on a
+    write to either table, used as the source for the ETag header on
+    the GET and the If-Match contract on a future PATCH.
+    `caller_system_role` carries the caller's principal.system_role
+    verbatim from the database.
+    """
+
+    sequenced_sample_idx: Annotated[int, Field(gt=0)]
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    biosample_idx: Annotated[int, Field(gt=0)]
+    owner_idx: Annotated[int, Field(gt=0)]
+    prep_protocol_idx: Annotated[int, Field(gt=0)]
+    metadata_checklist_idx: int | None
+    sequenced_pool_idx: int | None
+    sequenced_pool_item_id: str | None
+    ena_experiment_accession: str | None
+    ena_run_accession: str | None
+    last_submission_at: AwareDatetime | None
+    submission_error: str | None
+    last_metadata_change_at: AwareDatetime | None
+    created_by_idx: Annotated[int, Field(gt=0)]
+    created_at: AwareDatetime
+    effective_updated_at: AwareDatetime
+    retired: bool
+    retired_by_idx: int | None
+    retired_at: AwareDatetime | None
+    retire_reason: str | None
+    global_metadata: dict[str, GlobalMetadataEntry]
+    caller_system_role: SystemRole
+
+
+class SequencedSamplePatchRequest(PatchRequestModel):
+    """Body for PATCH /api/v1/sequenced-sample/{sequenced_sample_idx}.
+
+    Carries only the four subtype-table columns that the submission
+    surface mutates after ingestion: the two ENA accessions and the
+    submission-tracking pair. Supertype prep_sample fields
+    (owner_idx, metadata_checklist_idx) and identity-level columns
+    (sequenced_pool_idx, sequenced_pool_item_id) are intentionally
+    out of scope; the former will land via a future
+    PATCH /prep-sample/{idx} endpoint, the latter are not editable.
+    Inherits extra="forbid" and the at_least_one_field rule from
+    PatchRequestModel.
+    """
+
+    ena_experiment_accession: str | None = Field(default=None, max_length=50)
+    ena_run_accession: str | None = Field(default=None, max_length=50)
+    last_submission_at: AwareDatetime | None = None
+    submission_error: str | None = None

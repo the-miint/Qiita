@@ -13,87 +13,27 @@ exception classes from this module.
 
 from collections.abc import Iterable
 from datetime import date
-from decimal import Decimal, InvalidOperation
-from typing import NamedTuple
+from decimal import Decimal
 
 import asyncpg
 from qiita_common.models import FieldDataType, Tier
 
-# Closed set of data_types fetch_global_metadata_for_biosample currently
-# decodes from biosample_metadata. Boolean and terminology are intentionally
-# absent so a future addition is a coordinated extension (read + write paths
-# need to learn the new value_* column at the same time).
-_GLOBAL_METADATA_VALUE_COLUMN: dict[FieldDataType, str] = {
-    FieldDataType.TEXT: "value_text",
-    FieldDataType.NUMERIC: "value_numeric",
-    FieldDataType.DATE: "value_date",
-}
+from . import (
+    GLOBAL_METADATA_VALUE_COLUMN,
+    GlobalFieldRow,
+    GlobalMetadataRow,
+    SampleEntityKind,
+    StudyFieldConflictError,
+    require_transaction,
+)
 
 # ---------------------------------------------------------------------------
 # Structured exceptions raised by the import path
 # ---------------------------------------------------------------------------
-# Each carries its own attributes so the route can build a 422 detail body
-# without parsing the message string. Subclassing Exception directly (no
-# shared base) lets the route catch them individually with distinct mappings.
-
-
-class BiosampleMetadataUnknownFieldsError(Exception):
-    """Raised when import metadata names display_names that have no matching
-    biosample_global_field row. Carries every unknown name in one list so
-    the caller can surface them all in a single 422.
-    """
-
-    def __init__(self, unknown_display_names: list[str]) -> None:
-        self.unknown_display_names = unknown_display_names
-        super().__init__(f"unknown biosample global field display_names: {unknown_display_names!r}")
-
-
-class BiosampleMetadataParseError(Exception):
-    """Raised when a metadata text value cannot be coerced into the Python
-    type that matches its global field's data_type. Carries the failing
-    display_name plus the raw inputs so the route can build a field-scoped
-    422 detail.
-    """
-
-    def __init__(
-        self,
-        display_name: str,
-        data_type: FieldDataType,
-        text_value: str,
-        reason: str,
-    ) -> None:
-        self.display_name = display_name
-        self.data_type = data_type
-        self.text_value = text_value
-        self.reason = reason
-        super().__init__(
-            f"could not parse {display_name!r} value {text_value!r} as {data_type}: {reason}"
-        )
-
-
-class BiosampleStudyFieldConflictError(Exception):
-    """Raised by get_or_create_globally_linked_biosample_study_field when a
-    biosample_study_field row already exists at (study_idx, display_name)
-    that is purely-local (found_global_field_idx is None) or globally
-    linked to a different concept than the one the caller requested.
-    """
-
-    def __init__(
-        self,
-        study_idx: int,
-        display_name: str,
-        expected_global_field_idx: int,
-        found_global_field_idx: int | None,
-    ) -> None:
-        self.study_idx = study_idx
-        self.display_name = display_name
-        self.expected_global_field_idx = expected_global_field_idx
-        self.found_global_field_idx = found_global_field_idx
-        super().__init__(
-            f"biosample_study_field at study_idx={study_idx},"
-            f" display_name={display_name!r} is bound to global"
-            f" {found_global_field_idx!r}, expected {expected_global_field_idx!r}"
-        )
+# The shared metadata exceptions (MetadataParseError, MetadataUnknownFieldsError,
+# StudyFieldConflictError) live in repositories.__init__ and take entity_kind
+# at the raise site. BiosampleOwnerIdFieldCollisionError below has no
+# prep_sample analog so it stays here.
 
 
 class BiosampleOwnerIdFieldCollisionError(Exception):
@@ -110,43 +50,12 @@ class BiosampleOwnerIdFieldCollisionError(Exception):
         )
 
 
-# ---------------------------------------------------------------------------
-# Lookup row shape for fetch_biosample_global_fields_by_display_names
-# ---------------------------------------------------------------------------
-
-
-class BiosampleGlobalFieldRow(NamedTuple):
-    """Subset of biosample_global_field columns the import path needs."""
-
-    idx: int
-    display_name: str
-    data_type: FieldDataType
-
-
-class BiosampleGlobalMetadataRow(NamedTuple):
-    """One row from fetch_global_metadata_for_biosample.
-
-    Carries the global field's stable internal_name (which doubles as the
-    dict key in the function's return mapping), the cosmetic display_name
-    and description (taken from biosample_global_field, not from any
-    per-study biosample_study_field override, because biosample reads
-    are not study-scoped), the field's data_type, and the typed Python
-    value extracted from the matching biosample_metadata.value_* column.
-    """
-
-    internal_name: str
-    display_name: str
-    description: str | None
-    data_type: FieldDataType
-    value: str | Decimal | date
-
-
 async def fetch_biosample_global_fields_by_display_names(
-    conn: asyncpg.Connection,
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     display_names: Iterable[str],
-) -> dict[str, BiosampleGlobalFieldRow]:
-    """Return a dict of display_name -> BiosampleGlobalFieldRow for the
-    matching rows in qiita.biosample_global_field.
+) -> dict[str, GlobalFieldRow]:
+    """Return a dict of display_name -> GlobalFieldRow for the matching
+    rows in qiita.biosample_global_field.
 
     Display names that have no matching row are absent from the returned
     dict; callers detect "unknown field" by checking dict membership for
@@ -158,7 +67,7 @@ async def fetch_biosample_global_fields_by_display_names(
         return {}
 
     # Single SELECT keyed on display_name = ANY($1::text[]).
-    rows = await conn.fetch(
+    rows = await pool_or_conn.fetch(
         "SELECT idx, display_name, data_type"
         " FROM qiita.biosample_global_field"
         " WHERE display_name = ANY($1::text[])",
@@ -167,7 +76,7 @@ async def fetch_biosample_global_fields_by_display_names(
 
     # Wrap each row in the typed tuple, keyed on display_name.
     return {
-        r["display_name"]: BiosampleGlobalFieldRow(
+        r["display_name"]: GlobalFieldRow(
             idx=r["idx"],
             display_name=r["display_name"],
             data_type=FieldDataType(r["data_type"]),
@@ -179,8 +88,8 @@ async def fetch_biosample_global_fields_by_display_names(
 async def fetch_global_metadata_for_biosample(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     biosample_idx: int,
-) -> dict[str, BiosampleGlobalMetadataRow]:
-    """Return a dict of internal_name -> BiosampleGlobalMetadataRow for every
+) -> dict[str, GlobalMetadataRow]:
+    """Return a dict of internal_name -> GlobalMetadataRow for every
     globally-linked metadata value the biosample carries.
 
     Filters on biosample_metadata.global_field_idx IS NOT NULL: purely-local
@@ -213,15 +122,15 @@ async def fetch_global_metadata_for_biosample(
     # Walk rows, dispatch each to the value column the data_type names.
     # The unsupported branch raises so an out-of-set data_type cannot
     # silently surface a NULL value.
-    result: dict[str, BiosampleGlobalMetadataRow] = {}
+    result: dict[str, GlobalMetadataRow] = {}
     for r in rows:
         data_type = FieldDataType(r["data_type"])
-        column = _GLOBAL_METADATA_VALUE_COLUMN.get(data_type)
+        column = GLOBAL_METADATA_VALUE_COLUMN.get(data_type)
         if column is None:
             raise NotImplementedError(
                 f"global metadata read for data_type={data_type} is not yet implemented"
             )
-        result[r["internal_name"]] = BiosampleGlobalMetadataRow(
+        result[r["internal_name"]] = GlobalMetadataRow(
             internal_name=r["internal_name"],
             display_name=r["display_name"],
             description=r["description"],
@@ -251,8 +160,8 @@ async def get_or_create_globally_linked_biosample_study_field(
     biosample_study_field_inheritance_consistent CHECK; the global concept
     owns those fields.
 
-    Raises BiosampleStudyFieldConflictError when a row at
-    (study_idx, display_name) already exists but is purely-local
+    Raises StudyFieldConflictError(entity_kind=SampleEntityKind.BIOSAMPLE, ...) when a
+    row at (study_idx, display_name) already exists but is purely-local
     (biosample_global_field_idx IS NULL) or is bound to a different global
     concept. Both cases mean the caller is trying to write metadata against
     a field that is not the global concept they think it is; silently
@@ -262,6 +171,11 @@ async def get_or_create_globally_linked_biosample_study_field(
     fallback SELECT pattern as the local sibling, race-free under
     READ COMMITTED.
     """
+    # Both branches must observe the same snapshot; require a wrapping
+    # transaction so the INSERT and the fallback SELECT cannot straddle
+    # an implicit-commit boundary.
+    require_transaction(conn)
+
     # Create branch — globally-linked row leaves the inherited columns NULL.
     idx = await conn.fetchval(
         "INSERT INTO qiita.biosample_study_field ("
@@ -291,7 +205,8 @@ async def get_or_create_globally_linked_biosample_study_field(
         display_name,
     )
     if row["biosample_global_field_idx"] != biosample_global_field_idx:
-        raise BiosampleStudyFieldConflictError(
+        raise StudyFieldConflictError(
+            entity_kind=SampleEntityKind.BIOSAMPLE,
             study_idx=study_idx,
             display_name=display_name,
             expected_global_field_idx=biosample_global_field_idx,
@@ -465,49 +380,4 @@ async def insert_biosample_metadata_date(
         biosample_study_field_idx,
         value_date,
         created_by_idx,
-    )
-
-
-def _parse_text_for_data_type(
-    display_name: str,
-    data_type: FieldDataType,
-    text_value: str,
-) -> str | Decimal | date:
-    """Coerce a text input into the Python type matching data_type.
-
-    Outer whitespace is stripped before parsing. TEXT returns the stripped
-    string; NUMERIC returns Decimal; DATE returns datetime.date. BOOLEAN
-    and TERMINOLOGY are not yet supported and raise NotImplementedError.
-
-    Conversion failures raise BiosampleMetadataParseError carrying the
-    display_name, data_type, raw text, and a friendly reason so the route
-    can build a field-scoped 422 message.
-    """
-    # Normalize once; all parse arms see the stripped value.
-    stripped = text_value.strip()
-    if data_type is FieldDataType.TEXT:
-        return stripped
-    if data_type is FieldDataType.NUMERIC:
-        try:
-            return Decimal(stripped)
-        except InvalidOperation as exc:
-            raise BiosampleMetadataParseError(
-                display_name=display_name,
-                data_type=data_type,
-                text_value=text_value,
-                reason="not a valid decimal number",
-            ) from exc
-    if data_type is FieldDataType.DATE:
-        try:
-            return date.fromisoformat(stripped)
-        except ValueError as exc:
-            raise BiosampleMetadataParseError(
-                display_name=display_name,
-                data_type=data_type,
-                text_value=text_value,
-                reason="not a valid ISO date (YYYY-MM-DD)",
-            ) from exc
-    # Closed-set fallback: BOOLEAN and TERMINOLOGY land here and raise.
-    raise NotImplementedError(
-        f"text-to-typed parsing for data_type={data_type} is not yet implemented"
     )

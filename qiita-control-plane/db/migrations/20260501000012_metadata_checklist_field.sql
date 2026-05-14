@@ -9,7 +9,7 @@ CREATE TABLE qiita.metadata_checklist_field (
     metadata_checklist_idx             BIGINT NOT NULL REFERENCES qiita.metadata_checklist(idx) ON DELETE RESTRICT,
     -- Dual-keyed; see table comment.
     biosample_global_field_idx         BIGINT REFERENCES qiita.biosample_global_field(idx) ON DELETE RESTRICT,
-    prep_sample_global_field_idx  BIGINT REFERENCES qiita.prep_sample_global_field(idx) ON DELETE RESTRICT,
+    prep_sample_global_field_idx       BIGINT REFERENCES qiita.prep_sample_global_field(idx) ON DELETE RESTRICT,
 
     CONSTRAINT metadata_checklist_field_exactly_one_target CHECK (
         (biosample_global_field_idx IS NOT NULL AND prep_sample_global_field_idx IS NULL)
@@ -35,14 +35,14 @@ CREATE UNIQUE INDEX metadata_checklist_field_unique_biosample
     WHERE biosample_global_field_idx IS NOT NULL;
 
 -- At most one row per (metadata_checklist, global prep-sample field) pair.
-CREATE UNIQUE INDEX metadata_checklist_field_unique_sequenced
+CREATE UNIQUE INDEX metadata_checklist_field_unique_prep_sample
     ON qiita.metadata_checklist_field (metadata_checklist_idx, prep_sample_global_field_idx)
     WHERE prep_sample_global_field_idx IS NOT NULL;
 
 CREATE INDEX metadata_checklist_field_biosample_idx
     ON qiita.metadata_checklist_field (biosample_global_field_idx)
     WHERE biosample_global_field_idx IS NOT NULL;
-CREATE INDEX metadata_checklist_field_sequenced_idx
+CREATE INDEX metadata_checklist_field_prep_sample_idx
     ON qiita.metadata_checklist_field (prep_sample_global_field_idx)
     WHERE prep_sample_global_field_idx IS NOT NULL;
 
