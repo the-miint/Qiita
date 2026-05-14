@@ -1,29 +1,50 @@
 """Native job: convert a FASTQ (or FASTA) file to a Parquet of reads.
 
-Reads via DuckDB + miint's `read_fastx` table function, computes a UUID
-sequence_hash via `md5(sequence)`, and writes a single Parquet file
-(`reads.parquet`) to the workspace. Mirrors the convention used by the
-reference-side hash job in `backends/local.py::_run_hash` so a sample
-FASTQ's reads share their hash representation with reference sequences
-— a future analysis can join on `sequence_hash` natively.
+Reads via DuckDB + miint's `read_fastx` table function and writes a
+single Parquet file (`reads.parquet`) to the workspace. Every read in
+the input becomes one row — no deduplication, even when sequences
+match.
 
-Schema (sorted by sequence_hash so downstream dedup joins are
-zero-shuffle):
+Schema (sorted by read_id, which is the FASTQ/A header line — the
+sample's own labeling of its reads):
 
-    read_id           VARCHAR     NOT NULL  -- FASTQ/A record id
+    read_id           VARCHAR     NOT NULL  -- FASTQ/A record id, e.g. "read_001"
     sequence          VARCHAR     NOT NULL  -- aliased from miint's sequence1
-    quality           UTINYINT[]            -- aliased from qual1 (raw phred bytes); NULL for FASTA
+    quality           UTINYINT[]            -- from qual1; phred-decoded; NULL for FASTA
     sequence_length   BIGINT      NOT NULL  -- length(sequence)
-    sequence_hash     UUID        NOT NULL  -- CAST(md5(sequence) AS UUID)
 
 The `quality` column is stored as miint's phred-decoded score array
 (values 0–93 for Sanger), not the FASTQ ASCII string. miint already
 applies the offset on read; downstream code consumes integer phred
 scores directly with no re-decoding step.
 
-The output Parquet is a workspace artifact only; this commit does not
-register it into DuckLake (no `sample_reads` table exists yet).
-DuckLake registration is a separate follow-up.
+The output Parquet is a workspace artifact only; this job does not
+register it into DuckLake (no `sample_reads` table exists yet) and
+the schema deliberately omits any CP-minted identifier columns. When
+DuckLake registration lands, the table will gain the
+qiita_common.models.ScopeTarget hierarchy fields and the sort order
+will change to the convention documented in CLAUDE.md
+("Result file requirements"); both changes happen together with the
+registration design.
+
+Sibling: `LocalBackend._run_hash` in `backends/local.py` is structurally
+similar — same DuckDB+miint plumbing, same `PARQUET_OPTS`, same use of
+`read_fastx` — but is a *reference-side dedup* job, not a per-sample
+ingest. Concrete divergences:
+
+  - `_run_hash` rejects duplicate `read_id` values with
+    `ValueError → BAD_INPUT` because a reference FASTA must have
+    unique sequence identifiers. This job keeps every read, dups and
+    all, because a sample FASTQ legitimately repeats sequences across
+    reads.
+  - `_run_hash` writes `(read_id, sequence_hash, length)` — a
+    manifest sorted by `sequence_hash` for downstream feature minting.
+    This job writes raw reads, sorted by `read_id` for natural
+    ingestion-order iteration.
+
+They share mechanics, not semantics. A future "convergence" follow-up
+would only make sense if a third caller appears that wants the
+overlap.
 """
 
 from __future__ import annotations
@@ -68,19 +89,19 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     await _ensure_miint_installed()
     with _open_conn() as conn:
         conn.execute("LOAD miint;")
-        # ORDER BY sequence_hash matches the reference-side convention
-        # in backends/local.py::_run_hash so downstream consumers that
-        # JOIN sample reads against reference sequences benefit from
-        # sorted Parquet on both sides.
+        # ORDER BY read_id matches the FASTQ's natural ingestion order
+        # — consumers iterating in submission order get it for free.
+        # When DuckLake registration lands and the schema gains the
+        # CP-minted identifier columns, the sort changes to the
+        # CLAUDE.md "Result file requirements" convention.
         conn.execute(
             "COPY ("
             "  SELECT read_id,"
             "    sequence1 AS sequence,"
             "    qual1 AS quality,"
-            "    CAST(length(sequence1) AS BIGINT) AS sequence_length,"
-            "    CAST(md5(sequence1) AS UUID) AS sequence_hash"
+            "    CAST(length(sequence1) AS BIGINT) AS sequence_length"
             "  FROM read_fastx(?)"
-            "  ORDER BY sequence_hash"
+            "  ORDER BY read_id"
             f") TO '{out}' ({PARQUET_OPTS})",
             [str(inputs.fastq_path)],
         )

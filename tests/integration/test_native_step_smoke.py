@@ -16,24 +16,21 @@ What's exercised:
   - DuckDB+miint reads the FASTQ fixture and writes reads.parquet.
   - Runner transitions the work_ticket to COMPLETED.
 
-Asserts the Parquet's shape (column names + dtypes + row count) plus a
-known-sequence sequence_hash so the md5→UUID path is covered for a
-specific deterministic value — not just "some hash appeared".
+Asserts the Parquet's shape (column names + dtypes + row count), the
+duplicate-sequence preservation guarantee, and the FASTQ quality-bytes
+round-trip.
 
 The fixture sample.fastq lives at tests/integration/fixtures/sample.fastq
 and contains four 20-bp reads, with read_001 and read_003 carrying the
-same sequence (ACGTACGTACGTACGTACGT). The expected sequence_hash is
-computed via Python's hashlib so a future miint version that returns a
-different md5 implementation surfaces as a mismatch.
+same sequence (ACGTACGTACGTACGTACGT) so the test can prove duplicates
+are kept (this is a sample-side ingest, not a reference-side dedup).
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import uuid
 from pathlib import Path
-from uuid import UUID
 
 import duckdb
 import pytest
@@ -204,40 +201,35 @@ async def test_fastq_to_parquet_through_runner(
             f" DESCRIBE SELECT * FROM '{reads_parquet}')"
         ).fetchall()
         # DuckDB DESCRIBE column order matches the Parquet's physical order.
-        # `quality` is miint's native UTINYINT[] (raw phred bytes), not the
-        # FASTQ ASCII string — see fastq_to_parquet.py module docstring.
+        # `quality` is miint's native UTINYINT[] (phred-decoded scores), not
+        # the FASTQ ASCII string — see fastq_to_parquet.py module docstring.
+        # Schema is deliberately pre-DuckLake: no CP-minted identifier
+        # columns, no content hash. When sample_reads registration lands
+        # the schema and sort change together.
         assert rows == [
             ("read_id", "VARCHAR"),
             ("sequence", "VARCHAR"),
             ("quality", "UTINYINT[]"),
             ("sequence_length", "BIGINT"),
-            ("sequence_hash", "UUID"),
         ]
 
-        # Fixture has 4 reads — no dedup at this stage (each read produces
-        # a row, including duplicate sequences). Sort by sequence_hash
-        # matches what execute() ORDER BYs.
+        # Fixture has 4 reads — no dedup, each read produces a row even
+        # when sequences match (read_001 and read_003 carry the same
+        # sequence; both appear).
         records = conn.execute(
-            "SELECT read_id, sequence, quality, sequence_length, sequence_hash"
+            "SELECT read_id, sequence, quality, sequence_length"
             f" FROM '{reads_parquet}' ORDER BY read_id"
         ).fetchall()
     assert len(records) == 4
 
     by_read_id = {r[0]: r for r in records}
-    # read_001 and read_003 share the sequence ACGTACGTACGTACGTACGT, so
-    # their sequence_hash values must match — proof the md5+UUID path is
-    # deterministic over identical bytes.
+    # read_001 and read_003 share the sequence ACGTACGTACGTACGTACGT —
+    # confirms duplicates are preserved (this is a sample-side ingest,
+    # not a reference-side dedup).
     assert by_read_id["read_001"][1] == "ACGTACGTACGTACGTACGT"
     assert by_read_id["read_003"][1] == "ACGTACGTACGTACGTACGT"
-    assert by_read_id["read_001"][4] == by_read_id["read_003"][4]
     # All sequence_lengths are 20 (each read in the fixture is 20 bp).
     assert {r[3] for r in records} == {20}
-
-    # Concrete sequence_hash for ACGTACGTACGTACGTACGT — md5 cast to UUID.
-    # Computed via Python's hashlib (the canonical md5) so a future miint
-    # version that returns a different md5 result surfaces as a mismatch.
-    expected_hash = UUID(hashlib.md5(b"ACGTACGTACGTACGTACGT").hexdigest())
-    assert by_read_id["read_001"][4] == expected_hash
 
     # Quality bytes round-trip from the FASTQ — read_001's quality is
     # twenty `!` characters (ASCII 33), and miint returns phred-decoded
