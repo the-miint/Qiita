@@ -33,9 +33,7 @@ from pathlib import Path
 from pydantic import BaseModel
 from qiita_common.parquet import validate_parquet_path
 
-from ..miint import _ensure_miint_installed, _open_conn
-
-_PARQUET_OPTS = "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd'"
+from ..miint import PARQUET_OPTS, _ensure_miint_installed, _open_conn
 
 
 class Inputs(BaseModel):
@@ -83,7 +81,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             "    CAST(md5(sequence1) AS UUID) AS sequence_hash"
             "  FROM read_fastx(?)"
             "  ORDER BY sequence_hash"
-            f") TO '{out}' ({_PARQUET_OPTS})",
+            f") TO '{out}' ({PARQUET_OPTS})",
             [str(inputs.fastq_path)],
         )
 

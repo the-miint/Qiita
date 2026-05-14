@@ -34,6 +34,13 @@ _miint_installed = False
 
 _MIINT_EXT_REPO = os.environ.get("MIINT_EXTENSION_REPO")
 
+# Canonical DuckDB COPY options for every Parquet file the orchestrator
+# writes. Lives here (next to the only DuckDB connection helpers) so a
+# Parquet-version or compression bump touches one place. backends/local.py
+# extends this with ROW_GROUP_SIZE for the chunked sequence-data write
+# (see _PARQUET_OPTS_CHUNKED there); native jobs use this as-is.
+PARQUET_OPTS: str = "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd'"
+
 
 def _open_conn() -> duckdb.DuckDBPyConnection:
     """Open a DuckDB connection. Unsigned-extensions config is enabled

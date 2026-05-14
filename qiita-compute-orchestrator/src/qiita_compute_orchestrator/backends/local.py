@@ -9,7 +9,7 @@ from qiita_common.parquet import validate_parquet_path
 
 from ..backend import ComputeBackend
 from ..jobs import flatten_native_inputs, run_native_job
-from ..miint import _ensure_miint_installed, _open_conn
+from ..miint import PARQUET_OPTS, _ensure_miint_installed, _open_conn
 
 
 class LocalBackend(ComputeBackend):
@@ -272,13 +272,12 @@ class LocalBackend(ComputeBackend):
         return output_dir
 
 
-_PARQUET_OPTS = "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd'"
 # 16384 rows × ~64 KB chunk_data ≈ 1 GB per row group. Smaller values flush
 # more frequently, preventing OOM on genome-heavy references. Empirically
 # tuned against GG2 backbone (21 MB max genome, 11 GB FASTA):
 #   16384 → 4.2 GB peak RSS (OK), 32768 → OOM on 30 GB machine.
 _CHUNK_ROW_GROUP_SIZE = 16384
-_PARQUET_OPTS_CHUNKED = f"{_PARQUET_OPTS}, ROW_GROUP_SIZE {_CHUNK_ROW_GROUP_SIZE}"
+PARQUET_OPTS_CHUNKED = f"{PARQUET_OPTS}, ROW_GROUP_SIZE {_CHUNK_ROW_GROUP_SIZE}"
 _CHUNK_SIZE = 65536  # 64 KB
 
 
@@ -333,7 +332,7 @@ def _write_sequence_metadata(conn: duckdb.DuckDBPyConnection, output_dir: Path) 
         "    CAST(sequence_length_bp AS BIGINT) AS sequence_length_bp"
         "  FROM id_map"
         "  ORDER BY feature_idx"
-        f") TO '{out}' ({_PARQUET_OPTS})"
+        f") TO '{out}' ({PARQUET_OPTS})"
     )
 
 
@@ -372,7 +371,7 @@ def _write_sequence_chunks(
         "  )"
         "  SELECT feature_idx, chunk.chunk_index, chunk.chunk_data"
         "  FROM unnested"
-        f") TO '{out}' ({_PARQUET_OPTS_CHUNKED})",
+        f") TO '{out}' ({PARQUET_OPTS_CHUNKED})",
         [str(fasta_path)],
     )
 
@@ -387,7 +386,7 @@ def _write_membership(
         f"  SELECT CAST({reference_idx} AS BIGINT) AS reference_idx, feature_idx"
         "  FROM id_map"
         "  ORDER BY feature_idx"
-        f") TO '{out}' ({_PARQUET_OPTS})"
+        f") TO '{out}' ({PARQUET_OPTS})"
     )
 
 
@@ -464,7 +463,7 @@ def _write_taxonomy(
         "    NULL::BIGINT AS ncbi_taxon_id"
         "  FROM parsed_taxonomy"
         "  ORDER BY feature_idx"
-        f") TO '{out}' ({_PARQUET_OPTS})"
+        f") TO '{out}' ({PARQUET_OPTS})"
     )
 
     conn.execute("DROP TABLE parsed_taxonomy")
@@ -496,7 +495,7 @@ def _write_phylogeny(
         "  FROM tree_nodes t"
         "  LEFT JOIN id_map m ON t.is_tip AND t.name = m.read_id"
         "  ORDER BY t.node_index"
-        f") TO '{out}' ({_PARQUET_OPTS})",
+        f") TO '{out}' ({PARQUET_OPTS})",
     )
 
     conn.execute("DROP TABLE tree_nodes")
@@ -524,6 +523,6 @@ def _write_placements(
         "  FROM read_jplace(?) j"
         "  INNER JOIN id_map m ON j.fragment = m.read_id"
         "  ORDER BY m.feature_idx, j.edge_num"
-        f") TO '{out}' ({_PARQUET_OPTS})",
+        f") TO '{out}' ({PARQUET_OPTS})",
         [str(jplace_path)],
     )
