@@ -7,10 +7,10 @@
 -- A metadata checklist is a published external specification (e.g., MIxS,
 -- MIMS, MIMARKS) that lists fields expected for samples claiming conformance
 -- to it. Checklists describe required fields on both the biosample side
--- (collection metadata, environmental context) and the sequenced-study side
+-- (collection metadata, environmental context) and the prep-sample side
 -- (library construction, sequencing parameters). metadata_checklist_field is
 -- defined in a later migration because it references both
--- biosample_global_field and sequenced_sample_global_field, which are not
+-- biosample_global_field and prep_sample_global_field, which are not
 -- declared until after this one.
 
 CREATE TABLE qiita.metadata_checklist (

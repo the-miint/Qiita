@@ -24,12 +24,16 @@ from decimal import Decimal
 import asyncpg
 from qiita_common.models import FieldDataType, Tier
 
-from . import require_transaction
+from . import (
+    GlobalFieldRow,
+    MetadataUnknownFieldsError,
+    SampleEntityKind,
+    parse_text_for_data_type,
+    require_transaction,
+    validate_patch_fields,
+)
 from .biosample_metadata import (
-    BiosampleGlobalFieldRow,
-    BiosampleMetadataUnknownFieldsError,
     BiosampleOwnerIdFieldCollisionError,
-    _parse_text_for_data_type,
     fetch_biosample_global_fields_by_display_names,
     get_or_create_globally_linked_biosample_study_field,
     get_or_create_local_biosample_study_field,
@@ -161,11 +165,9 @@ async def update_biosample(
     """
     # Reject misuse at the repo boundary so the SQL builder never sees
     # an empty SET clause or an unknown column name.
-    if not fields:
-        raise ValueError("update_biosample requires at least one field")
-    unknown = set(fields) - BIOSAMPLE_PATCHABLE_COLUMNS
-    if unknown:
-        raise ValueError(f"update_biosample rejects non-patchable column(s): {sorted(unknown)}")
+    validate_patch_fields(
+        fields, allowlist=BIOSAMPLE_PATCHABLE_COLUMNS, repo_name="update_biosample"
+    )
 
     # Build the parameterized SET clause. Column names come from the
     # allowlist above so f-string interpolation is safe; the per-column
@@ -326,11 +328,11 @@ async def import_biosample_from_owner_biosample_id(
           entry whose key equals owner_biosample_id_field_name (the
           owner-biosample-id row must remain purely-local; the same
           display_name cannot also be a globally-linked metadata entry).
-        - BiosampleMetadataUnknownFieldsError when any metadata key has
+        - MetadataUnknownFieldsError when any metadata key has
           no matching biosample_global_field row; all unknown names are
           collected in one error.
-        - BiosampleMetadataParseError on first failure to coerce a text
-          value into the type its global field declares.
+        - MetadataParseError on first failure to coerce a text value
+          into the type its global field declares.
 
     The caller must wrap the call in `async with conn.transaction():`; the
     guard at entry raises RuntimeError otherwise so partial failure cannot
@@ -351,16 +353,16 @@ async def import_biosample_from_owner_biosample_id(
     global_field_rows = await fetch_biosample_global_fields_by_display_names(conn, metadata.keys())
     unknown = [name for name in metadata if name not in global_field_rows]
     if unknown:
-        raise BiosampleMetadataUnknownFieldsError(unknown)
+        raise MetadataUnknownFieldsError(SampleEntityKind.BIOSAMPLE, unknown)
 
     # Pre-flight: parse every text value into its typed Python value.
     # Failing here keeps the writes below from running for partial inputs;
     # the surrounding transaction would still roll back, but pre-flight
     # avoids the wasted writes.
-    parsed_metadata: list[tuple[BiosampleGlobalFieldRow, str | Decimal | date]] = []
+    parsed_metadata: list[tuple[GlobalFieldRow, str | Decimal | date]] = []
     for display_name, text_value in metadata.items():
         global_row = global_field_rows[display_name]
-        parsed_value = _parse_text_for_data_type(display_name, global_row.data_type, text_value)
+        parsed_value = parse_text_for_data_type(display_name, global_row.data_type, text_value)
         parsed_metadata.append((global_row, parsed_value))
 
     # Step a: create the biosample.
@@ -394,7 +396,7 @@ async def import_biosample_from_owner_biosample_id(
         # Dispatch on the global field's data_type. The else branch covers
         # FieldDataType members the if/elif chain does not name (BOOLEAN,
         # TERMINOLOGY today); it is unreachable in practice because
-        # _parse_text_for_data_type raises NotImplementedError for those
+        # parse_text_for_data_type raises NotImplementedError for those
         # types in the pre-flight parse pass. A future maintainer adding
         # BOOLEAN/TERMINOLOGY support must extend both the parser and this
         # dispatch.

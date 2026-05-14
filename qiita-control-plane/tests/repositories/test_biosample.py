@@ -20,6 +20,10 @@ import pytest
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 from qiita_common.models import FieldDataType
 
+from qiita_control_plane.repositories import (
+    MetadataParseError,
+    MetadataUnknownFieldsError,
+)
 from qiita_control_plane.repositories.biosample import (
     BiosampleImportResult,
     fetch_biosample,
@@ -31,8 +35,6 @@ from qiita_control_plane.repositories.biosample import (
     update_biosample,
 )
 from qiita_control_plane.repositories.biosample_metadata import (
-    BiosampleMetadataParseError,
-    BiosampleMetadataUnknownFieldsError,
     BiosampleOwnerIdFieldCollisionError,
 )
 from qiita_control_plane.testing.db_seeds import (
@@ -723,10 +725,10 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_unknown_metada
     unknown_b = f"Unknown B {suffix}"
 
     # Two metadata keys that have no matching biosample_global_field row.
-    # The composer must collect both into one BiosampleMetadataUnknownFieldsError
+    # The composer must collect both into one MetadataUnknownFieldsError
     # before any writes.
     async with ctx["pool"].acquire() as conn:
-        with pytest.raises(BiosampleMetadataUnknownFieldsError) as excinfo:
+        with pytest.raises(MetadataUnknownFieldsError) as excinfo:
             async with conn.transaction():
                 await import_biosample_from_owner_biosample_id(
                     conn,
@@ -756,7 +758,7 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_metadata_parse
 
     # Numeric global field, garbage value — composer raises pre-write.
     async with ctx["pool"].acquire() as conn:
-        with pytest.raises(BiosampleMetadataParseError) as excinfo:
+        with pytest.raises(MetadataParseError) as excinfo:
             async with conn.transaction():
                 await import_biosample_from_owner_biosample_id(
                     conn,
