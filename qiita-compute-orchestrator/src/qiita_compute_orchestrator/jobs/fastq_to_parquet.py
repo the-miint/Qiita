@@ -10,11 +10,16 @@ FASTQ's reads share their hash representation with reference sequences
 Schema (sorted by sequence_hash so downstream dedup joins are
 zero-shuffle):
 
-    read_id           VARCHAR  NOT NULL    -- FASTQ/A record id
-    sequence          VARCHAR  NOT NULL    -- aliased from miint's sequence1
-    quality           VARCHAR              -- aliased from quality1; NULL for FASTA
-    sequence_length   BIGINT   NOT NULL    -- length(sequence)
-    sequence_hash     UUID     NOT NULL    -- CAST(md5(sequence) AS UUID)
+    read_id           VARCHAR     NOT NULL  -- FASTQ/A record id
+    sequence          VARCHAR     NOT NULL  -- aliased from miint's sequence1
+    quality           UTINYINT[]            -- aliased from qual1 (raw phred bytes); NULL for FASTA
+    sequence_length   BIGINT      NOT NULL  -- length(sequence)
+    sequence_hash     UUID        NOT NULL  -- CAST(md5(sequence) AS UUID)
+
+The `quality` column is stored as miint's phred-decoded score array
+(values 0–93 for Sanger), not the FASTQ ASCII string. miint already
+applies the offset on read; downstream code consumes integer phred
+scores directly with no re-decoding step.
 
 The output Parquet is a workspace artifact only; this commit does not
 register it into DuckLake (no `sample_reads` table exists yet).
@@ -73,7 +78,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             "COPY ("
             "  SELECT read_id,"
             "    sequence1 AS sequence,"
-            "    quality1 AS quality,"
+            "    qual1 AS quality,"
             "    CAST(length(sequence1) AS BIGINT) AS sequence_length,"
             "    CAST(md5(sequence1) AS UUID) AS sequence_hash"
             "  FROM read_fastx(?)"
