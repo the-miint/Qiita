@@ -71,7 +71,7 @@ class LocalBackend(ComputeBackend):
         inputs: dict[str, Path],
         workspace: Path,
         *,
-        reference_idx: int,
+        scope_target: dict,
         work_ticket_idx: int,  # noqa: ARG002 — accepted for protocol parity
         container: str | None = None,  # inspected by the runtime guard below; otherwise ignored
         module: str | None = None,  # inspected by the native-dispatch guard below
@@ -103,7 +103,7 @@ class LocalBackend(ComputeBackend):
             # validates raw_inputs via mod.Inputs, invokes
             # mod.execute(inputs, workspace), and maps known exceptions
             # to typed BackendFailure. `flatten_native_inputs` merges
-            # the work-ticket scalars and rejects reserved-key
+            # the scope-target idx scalars and rejects reserved-key
             # collisions the same way the SLURM launcher does — a job
             # module sees identical raw_inputs regardless of runtime.
             # `step_name=name` plumbs the YAML step name (e.g. "fastq")
@@ -112,10 +112,26 @@ class LocalBackend(ComputeBackend):
             raw_inputs = flatten_native_inputs(
                 {k: str(v) for k, v in inputs.items()},
                 step_name=name,
-                reference_idx=reference_idx,
+                scope_target=scope_target,
                 work_ticket_idx=work_ticket_idx,
             )
             return await run_native_job(module, raw_inputs, workspace, step_name=name)
+        # Container path: hash and load both need a reference_idx. The
+        # workflow YAML for reference-add is reference-scoped, so this
+        # branch only runs under that scope today. Refuse anything else
+        # with a typed contract violation instead of silently picking up
+        # the wrong scalar.
+        if scope_target.get("kind") != "reference":
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=name,
+                reason=(
+                    f"container step {name!r} requires a reference-scoped ticket; "
+                    f"got scope_target.kind={scope_target.get('kind')!r}"
+                ),
+            )
+        reference_idx = scope_target["reference_idx"]
         try:
             if name == "hash":
                 manifest = await self._run_hash(inputs["fasta_path"], workspace, reference_idx)

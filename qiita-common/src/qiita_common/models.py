@@ -6,7 +6,15 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 # `SystemRole` is re-exported so existing `from qiita_common.models import SystemRole`
 # imports keep working after the move to qiita_common.auth_constants.
@@ -155,17 +163,40 @@ class StepRunRequest(BaseModel):
     `work_ticket_idx` flows through so SlurmBackend can stamp the SLURM
     job name with the originating ticket id — making scheduler dumps
     cross-referenceable back to the work_ticket row.
+
+    `scope_target` carries the work ticket's discriminated-union scope
+    target (matches `qiita_common.models.ScopeTarget`). The container
+    path inspects `scope_target["kind"]` and extracts the scalar(s) it
+    needs (e.g. `reference_idx` for reference-add); the native path
+    routes the dict through `flatten_native_inputs`, which merges the
+    scope's idx scalars into the job's `Inputs` model. Typed as a dict
+    (not the ScopeTarget union directly) to avoid a forward-reference /
+    model_rebuild dance — the field validator below runs the same
+    discriminated-union validation as `WorkTicket.scope_target`.
     """
 
     step_name: str = Field(min_length=1)
     inputs: dict[str, str] = Field(default_factory=dict)
     workspace: str = Field(min_length=1)
-    reference_idx: Annotated[int, Field(gt=0)]
+    scope_target: dict[str, Any]
     work_ticket_idx: Annotated[int, Field(gt=0)]
     container: str | None = Field(default=None, min_length=1, max_length=512)
     module: str | None = Field(default=None, min_length=1, max_length=512)
     entrypoint: str | None = None
     baseline_resources: StepBaselineResources | None = None
+
+    @field_validator("scope_target", mode="after")
+    @classmethod
+    def _validate_scope_target(cls, v: dict[str, Any]) -> dict[str, Any]:
+        # Delegate to the ScopeTarget discriminated union (defined later
+        # in this module) so the wire-side validation rule lives in one
+        # place. Returns the original dict on success — the route handler
+        # passes the dict downstream; backends consume it without needing
+        # the typed instance.
+        from pydantic import TypeAdapter
+
+        TypeAdapter(ScopeTarget).validate_python(v)
+        return v
 
     @model_validator(mode="after")
     def _exactly_one_runtime(self) -> StepRunRequest:

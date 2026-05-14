@@ -27,6 +27,7 @@ matching the step's `outputs:` list.
 
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Any
 
 from qiita_common.models import StepBaselineResources
 
@@ -52,7 +53,7 @@ class ComputeBackend(ABC):
         inputs: dict[str, Path],
         workspace: Path,
         *,
-        reference_idx: int,
+        scope_target: dict[str, Any],
         work_ticket_idx: int,
         container: str | None = None,
         module: str | None = None,

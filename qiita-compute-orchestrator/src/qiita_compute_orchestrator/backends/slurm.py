@@ -100,7 +100,7 @@ class SlurmBackend(ComputeBackend):
         inputs: dict[str, Path],
         workspace: Path,
         *,
-        reference_idx: int,
+        scope_target: dict,
         work_ticket_idx: int,
         container: str | None = None,
         module: str | None = None,
@@ -140,16 +140,17 @@ class SlurmBackend(ComputeBackend):
         # slurmrestd submit body, which is visible in `scontrol show job`
         # and SLURM accounting (no place for signed Flight tickets or
         # per-step parameters). The container reads it from
-        # $QIITA_INPUT_PATH. Extend this dict when new step types land:
-        # per-sample steps add a prep_sample_idx list; tunable steps add
-        # an action-parameters block; data-plane-reading steps add a
-        # control-plane-minted Flight ticket.
+        # $QIITA_INPUT_PATH. `scope_target` is the work ticket's full
+        # tagged-union scope (matches qiita_common.models.ScopeTarget);
+        # the native-step launcher reads scope_target["kind"] to pick
+        # the right idx scalars to merge into the job's Inputs model,
+        # and container entrypoints inspect it for the same purpose.
         params_path = input_path / "params.json"
         params_path.write_text(
             json.dumps(
                 {
                     "step_name": name,
-                    "reference_idx": reference_idx,
+                    "scope_target": scope_target,
                     "work_ticket_idx": work_ticket_idx,
                     "inputs": {k: str(v) for k, v in inputs.items()},
                     "output_path": str(output_path),

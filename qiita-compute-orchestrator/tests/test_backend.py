@@ -70,7 +70,7 @@ async def test_local_backend_rejects_unknown_step():
             "nonexistent",
             {},
             Path("/fake"),
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=1,
             container="qiita/test:1.0.0",
         )

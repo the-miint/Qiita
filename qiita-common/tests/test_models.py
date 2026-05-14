@@ -173,7 +173,7 @@ def _minimal_step_run_kwargs() -> dict:
         step_name="hash",
         inputs={"fasta_path": "/data/in.fa"},
         workspace="/workspace",
-        reference_idx=1,
+        scope_target={"kind": "reference", "reference_idx": 1},
         work_ticket_idx=1,
         container=REFERENCE_HASH_CONTAINER,
     )

@@ -72,7 +72,7 @@ async def run_step(
             body.step_name,
             {k: Path(v) for k, v in body.inputs.items()},
             Path(body.workspace),
-            reference_idx=body.reference_idx,
+            scope_target=body.scope_target,
             work_ticket_idx=body.work_ticket_idx,
             container=body.container,
             module=body.module,

@@ -58,7 +58,7 @@ def _write_params(input_path: Path, *, fastq_path: str, reference_idx: int, work
         json.dumps(
             {
                 "step_name": "fastq",
-                "reference_idx": reference_idx,
+                "scope_target": {"kind": "reference", "reference_idx": reference_idx},
                 "work_ticket_idx": work_ticket_idx,
                 "inputs": {"fastq_path": fastq_path},
             }
@@ -127,7 +127,7 @@ def test_flatten_params_merges_scalars_and_inputs():
     dict ready for Inputs.model_validate."""
     params = {
         "step_name": "fastq",
-        "reference_idx": 7,
+        "scope_target": {"kind": "reference", "reference_idx": 7},
         "work_ticket_idx": 99,
         "inputs": {"fastq_path": "/data/in.fa"},
         "output_path": "/scratch/out",  # ignored
@@ -151,7 +151,7 @@ def test_flatten_params_rejects_reserved_key_collision(reserved_key):
 
     params = {
         "step_name": "fastq",
-        "reference_idx": 7,
+        "scope_target": {"kind": "reference", "reference_idx": 7},
         "work_ticket_idx": 99,
         "inputs": {reserved_key: "/data/in.fa"},  # accidental collision
     }
@@ -183,7 +183,7 @@ def test_main_returns_1_on_reserved_key_collision(reserved_key, monkeypatch, io_
         json.dumps(
             {
                 "step_name": "fastq",
-                "reference_idx": 1,
+                "scope_target": {"kind": "reference", "reference_idx": 1},
                 "work_ticket_idx": 1,
                 "inputs": {reserved_key: "evil-string"},
             }

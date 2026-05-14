@@ -33,7 +33,7 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 from qiita_common.actions import NATIVE_MODULE_PREFIX
 from qiita_common.backend_failure import BackendFailure, FailureKind
-from qiita_common.models import WorkTicketFailureStage
+from qiita_common.models import ScopeTargetKind, WorkTicketFailureStage
 
 
 def _contract_violation(*, step_name: str, reason: str) -> BackendFailure:
@@ -45,20 +45,38 @@ def _contract_violation(*, step_name: str, reason: str) -> BackendFailure:
     )
 
 
+# Per-scope idx scalars merged into raw_inputs before `Inputs.model_validate`.
+# A SCOPE_SCALARS_BY_KIND[kind] entry lists which scope_target keys the
+# framework flows through to native jobs under that kind. Job `Inputs`
+# models declare which they expect (e.g. fastq_to_parquet's Inputs has
+# `sequenced_sample_idx: int`); a mismatch surfaces as BAD_INPUT via the
+# Pydantic validator.
+SCOPE_SCALARS_BY_KIND: dict[str, frozenset[str]] = {
+    ScopeTargetKind.REFERENCE.value: frozenset({"reference_idx"}),
+    ScopeTargetKind.STUDY_PREP.value: frozenset({"study_idx", "prep_idx"}),
+    ScopeTargetKind.SEQUENCED_SAMPLE.value: frozenset({"sequenced_sample_idx"}),
+}
+
 # Framework scalars that get merged into raw_inputs before
 # `Inputs.model_validate`. A step `inputs:` entry sharing one of these
 # names would silently shadow the work-ticket value; `flatten_native_inputs`
 # rejects the collision so LocalBackend and the SLURM launcher behave
 # the same way. Public-ish — tests parameterize over it so adding a
-# fourth reserved name doesn't need a sweep of hardcoded string assertions.
-RESERVED_INPUT_KEYS: frozenset[str] = frozenset({"reference_idx", "work_ticket_idx"})
+# new reserved name doesn't need a sweep of hardcoded string assertions.
+# Union of every scope's idx scalars plus the always-on work_ticket_idx,
+# so the collision check stays scope-agnostic (an inputs map cannot use
+# a name reserved under ANY scope, even if the current ticket is on a
+# different scope — keeps job modules portable across scopes).
+RESERVED_INPUT_KEYS: frozenset[str] = frozenset(
+    {"work_ticket_idx"} | {key for scalars in SCOPE_SCALARS_BY_KIND.values() for key in scalars}
+)
 
 
 def flatten_native_inputs(
     inputs: dict[str, Any],
     *,
     step_name: str,
-    reference_idx: int,
+    scope_target: dict[str, Any],
     work_ticket_idx: int,
 ) -> dict[str, Any]:
     """Build the `raw_inputs` dict `Inputs.model_validate` consumes.
@@ -67,6 +85,15 @@ def flatten_native_inputs(
     so the reserved-key check fires symmetrically. Raises a typed
     BackendFailure(CONTRACT_VIOLATION) on collision — the runner sees
     the same shape regardless of which backend produced the violation.
+
+    `scope_target` is the work ticket's discriminated-union scope
+    (matching `qiita_common.models.ScopeTarget`); the kind discriminator
+    selects which idx scalars get merged (e.g. `reference_idx` for a
+    REFERENCE-scoped ticket, `sequenced_sample_idx` for a
+    SEQUENCED_SAMPLE-scoped one). An unknown kind surfaces as a
+    CONTRACT_VIOLATION — this is the dispatcher boundary, the only
+    place where scope-target shape mismatches can land.
+
     `step_name` is the YAML step name (e.g. "fastq"); failures carry it
     on BackendFailure.step_name to match the work_ticket failure-attribution
     contract.
@@ -77,7 +104,15 @@ def flatten_native_inputs(
             step_name=step_name,
             reason=f"step `inputs:` cannot use framework-reserved names: {overlap}",
         )
-    return {**inputs, "reference_idx": reference_idx, "work_ticket_idx": work_ticket_idx}
+    kind = scope_target.get("kind")
+    scalar_keys = SCOPE_SCALARS_BY_KIND.get(kind) if isinstance(kind, str) else None
+    if scalar_keys is None:
+        raise _contract_violation(
+            step_name=step_name,
+            reason=f"scope_target has unknown kind: {kind!r}",
+        )
+    scope_scalars = {key: scope_target[key] for key in scalar_keys}
+    return {**inputs, **scope_scalars, "work_ticket_idx": work_ticket_idx}
 
 
 async def run_native_job(

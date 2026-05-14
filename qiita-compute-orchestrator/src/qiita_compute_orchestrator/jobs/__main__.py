@@ -56,24 +56,24 @@ def _flatten_params(params: dict) -> dict:
     writes `params.json` with the shape
         {
           "step_name": <str>,
-          "reference_idx": <int>,
+          "scope_target": {<discriminated-union dict>},
           "work_ticket_idx": <int>,
           "inputs": {<input_name>: <path>, ...},
           "output_path": <str>,  # written but ignored here; env var wins
         }
-    This reader pulls `step_name`, `reference_idx`, `work_ticket_idx`,
+    This reader pulls `step_name`, `scope_target`, `work_ticket_idx`,
     and every entry of `inputs`. Other keys in params.json are ignored.
 
     Delegates the merge + reserved-key check to `flatten_native_inputs`
     so the launcher and LocalBackend share one code path. A collision
-    surfaces as BackendFailure(CONTRACT_VIOLATION) — carrying the
-    YAML step name from params — which `main()` catches and renders
-    to structured stderr.
+    or unknown scope kind surfaces as BackendFailure(CONTRACT_VIOLATION)
+    — carrying the YAML step name from params — which `main()` catches
+    and renders to structured stderr.
     """
     return flatten_native_inputs(
         params.get("inputs", {}),
         step_name=params["step_name"],
-        reference_idx=params["reference_idx"],
+        scope_target=params["scope_target"],
         work_ticket_idx=params["work_ticket_idx"],
     )
 

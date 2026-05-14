@@ -28,7 +28,7 @@ class _RecordedCall:
     name: str
     inputs: dict[str, Path]
     workspace: Path
-    reference_idx: int
+    scope_target: dict[str, Any]
     work_ticket_idx: int
     container: str | None
     module: str | None
@@ -46,7 +46,7 @@ class _RecordingBackend(ComputeBackend):
         inputs: dict[str, Path],
         workspace: Path,
         *,
-        reference_idx: int,
+        scope_target: dict[str, Any],
         work_ticket_idx: int,
         container: str | None = None,
         module: str | None = None,
@@ -58,7 +58,7 @@ class _RecordingBackend(ComputeBackend):
                 name=name,
                 inputs=dict(inputs),
                 workspace=workspace,
-                reference_idx=reference_idx,
+                scope_target=scope_target,
                 work_ticket_idx=work_ticket_idx,
                 container=container,
                 module=module,
@@ -87,7 +87,7 @@ def test_step_run_requires_bearer_token(http_client):
             "step_name": "hash",
             "inputs": {"fasta_path": "/tmp/x.fa"},
             "workspace": "/tmp/ws",
-            "reference_idx": 1,
+            "scope_target": {"kind": "reference", "reference_idx": 1},
             "work_ticket_idx": 1,
         },
     )
@@ -103,7 +103,7 @@ def test_step_run_rejects_wrong_token(http_client, cp_to_co_token):
             "step_name": "hash",
             "inputs": {"fasta_path": "/tmp/x.fa"},
             "workspace": "/tmp/ws",
-            "reference_idx": 1,
+            "scope_target": {"kind": "reference", "reference_idx": 1},
             "work_ticket_idx": 1,
         },
     )
@@ -122,7 +122,7 @@ def test_step_run_dispatches_to_backend(http_client, cp_to_co_token, tmp_path):
             "step_name": "hash",
             "inputs": {"fasta_path": str(fasta)},
             "workspace": str(tmp_path),
-            "reference_idx": 7,
+            "scope_target": {"kind": "reference", "reference_idx": 7},
             "work_ticket_idx": 99,
             # Required by StepRunRequest's exactly-one(container, module)
             # validator. The route test doesn't care which runtime drives
@@ -140,7 +140,7 @@ def test_step_run_dispatches_to_backend(http_client, cp_to_co_token, tmp_path):
     assert call.name == "hash"
     assert call.inputs == {"fasta_path": fasta}
     assert call.workspace == tmp_path
-    assert call.reference_idx == 7
+    assert call.scope_target == {"kind": "reference", "reference_idx": 7}
     assert call.work_ticket_idx == 99
     assert call.container == REFERENCE_HASH_CONTAINER
     assert call.module is None
@@ -160,7 +160,7 @@ def test_step_run_forwards_module_to_backend(http_client, cp_to_co_token, tmp_pa
             "step_name": "fastq",
             "inputs": {},
             "workspace": str(tmp_path),
-            "reference_idx": 1,
+            "scope_target": {"kind": "reference", "reference_idx": 1},
             "work_ticket_idx": 1,
             "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
         },
@@ -187,7 +187,7 @@ def test_step_run_translates_backend_value_error(http_client, cp_to_co_token, tm
             "step_name": "nope",
             "inputs": {},
             "workspace": str(tmp_path),
-            "reference_idx": 1,
+            "scope_target": {"kind": "reference", "reference_idx": 1},
             "work_ticket_idx": 1,
             "container": "qiita/test:1.0.0",
         },
@@ -231,7 +231,7 @@ def test_step_run_serializes_backend_failure(http_client, cp_to_co_token, tmp_pa
             "step_name": "hash",
             "inputs": {},
             "workspace": str(tmp_path),
-            "reference_idx": 1,
+            "scope_target": {"kind": "reference", "reference_idx": 1},
             "work_ticket_idx": 1,
             "container": REFERENCE_HASH_CONTAINER,
         },
@@ -259,7 +259,7 @@ def test_step_run_rejects_wrong_prefix_module(http_client, cp_to_co_token, tmp_p
             "step_name": "x",
             "inputs": {},
             "workspace": str(tmp_path),
-            "reference_idx": 1,
+            "scope_target": {"kind": "reference", "reference_idx": 1},
             "work_ticket_idx": 1,
             "module": "os.system",  # bad prefix
         },
@@ -281,7 +281,7 @@ def test_step_run_rejects_payload_without_runtime(http_client, cp_to_co_token, t
             "step_name": "hash",
             "inputs": {"fasta_path": "/tmp/x.fa"},
             "workspace": str(tmp_path),
-            "reference_idx": 1,
+            "scope_target": {"kind": "reference", "reference_idx": 1},
             "work_ticket_idx": 1,
         },
     )
@@ -301,7 +301,7 @@ def test_step_run_rejects_payload_with_both_runtimes(http_client, cp_to_co_token
             "step_name": "hash",
             "inputs": {"fasta_path": "/tmp/x.fa"},
             "workspace": str(tmp_path),
-            "reference_idx": 1,
+            "scope_target": {"kind": "reference", "reference_idx": 1},
             "work_ticket_idx": 1,
             "container": REFERENCE_HASH_CONTAINER,
             "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
