@@ -54,7 +54,7 @@ from pathlib import Path
 from pydantic import BaseModel
 from qiita_common.parquet import validate_parquet_path
 
-from ..miint import PARQUET_OPTS, _ensure_miint_installed, _open_conn
+from ..miint import PARQUET_OPTS, ensure_miint_installed, open_conn
 
 
 class Inputs(BaseModel):
@@ -86,8 +86,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     out_path = workspace / "reads.parquet"
     out = validate_parquet_path(out_path)
 
-    await _ensure_miint_installed()
-    with _open_conn() as conn:
+    await ensure_miint_installed()
+    with open_conn() as conn:
         conn.execute("LOAD miint;")
         # ORDER BY read_id matches the FASTQ's natural ingestion order
         # — consumers iterating in submission order get it for free.

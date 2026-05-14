@@ -9,7 +9,7 @@ from qiita_common.parquet import validate_parquet_path
 
 from ..backend import ComputeBackend
 from ..jobs import flatten_native_inputs, run_native_job
-from ..miint import PARQUET_OPTS, _ensure_miint_installed, _open_conn
+from ..miint import PARQUET_OPTS, ensure_miint_installed, open_conn
 
 
 class LocalBackend(ComputeBackend):
@@ -172,11 +172,11 @@ class LocalBackend(ComputeBackend):
             raise FileNotFoundError(f"FASTA file not found: {fasta_path}")
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        await _ensure_miint_installed()
+        await ensure_miint_installed()
         manifest_path = output_dir / "manifest.parquet"
         out = validate_parquet_path(manifest_path)
 
-        with _open_conn() as conn:
+        with open_conn() as conn:
             conn.execute("LOAD miint;")
 
             # Materialize FASTA into a temp table — single read of the file.
@@ -246,9 +246,9 @@ class LocalBackend(ComputeBackend):
             raise FileNotFoundError(f"jplace file not found: {jplace_path}")
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        await _ensure_miint_installed()
+        await ensure_miint_installed()
 
-        with _open_conn() as conn:
+        with open_conn() as conn:
             conn.execute("LOAD miint;")
             conn.execute("SET preserve_insertion_order=false;")
             conn.execute(f"SET temp_directory='{output_dir}/.duckdb_tmp';")

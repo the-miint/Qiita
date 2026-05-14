@@ -10,8 +10,8 @@ Two callers:
   step path: hash, load).
 - `qiita_compute_orchestrator.jobs.fastq_to_parquet` (native step
   path; reads + transforms FASTQ via DuckDB+miint).
-Both use `_ensure_miint_installed()` to lazily install miint once per
-process (concurrency-safe via asyncio.Lock), then `_open_conn()` to
+Both use `ensure_miint_installed()` to lazily install miint once per
+process (concurrency-safe via asyncio.Lock), then `open_conn()` to
 materialize a fresh DuckDB connection with the right config — the
 caller `LOAD miint;`s the extension on its own connection.
 
@@ -42,7 +42,7 @@ _MIINT_EXT_REPO = os.environ.get("MIINT_EXTENSION_REPO")
 PARQUET_OPTS: str = "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd'"
 
 
-def _open_conn() -> duckdb.DuckDBPyConnection:
+def open_conn() -> duckdb.DuckDBPyConnection:
     """Open a DuckDB connection. Unsigned-extensions config is enabled
     only when MIINT_EXTENSION_REPO points at a non-default repo (the
     team mirror), since that path serves community-signed binaries."""
@@ -51,7 +51,7 @@ def _open_conn() -> duckdb.DuckDBPyConnection:
     return duckdb.connect(":memory:")
 
 
-async def _ensure_miint_installed() -> None:
+async def ensure_miint_installed() -> None:
     """Install miint once per process, concurrency-safe."""
     global _miint_installed
     if _miint_installed:
@@ -59,7 +59,7 @@ async def _ensure_miint_installed() -> None:
     async with _miint_install_lock:
         if _miint_installed:
             return
-        with _open_conn() as conn:
+        with open_conn() as conn:
             if _MIINT_EXT_REPO is not None:
                 conn.execute(f"FORCE INSTALL miint FROM '{_MIINT_EXT_REPO}';")
             else:
