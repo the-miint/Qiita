@@ -21,6 +21,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER, REFERENCE_LOAD_CONTAINER
 
 pytestmark = pytest.mark.db
 
@@ -48,13 +49,14 @@ class FakeBackendClient:
         reference_idx: int,
         work_ticket_idx: int,
         container: str | None = None,
+        module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources=None,
     ) -> dict[str, Path]:
         # Accepted for protocol parity (the runner now forwards container
         # metadata for SlurmBackend); the LocalBackend-shaped fake here
         # ignores them.
-        del work_ticket_idx, container, entrypoint, baseline_resources
+        del work_ticket_idx, container, module, entrypoint, baseline_resources
         self.calls.append((step_name, dict(inputs), workspace, reference_idx))
         outputs = self.outputs_for.get(step_name, {})
         for path in outputs.values():
@@ -116,7 +118,7 @@ _REFERENCE_ADD_STEPS = [
         "kind": "step",
         "name": "hash",
         "step_type": "singleton",
-        "container": "qiita/reference-hash:1.0.0",
+        "container": REFERENCE_HASH_CONTAINER,
         "target_status": "hashing",
         "inputs": ["fasta_path"],
         "outputs": ["manifest"],
@@ -139,7 +141,7 @@ _REFERENCE_ADD_STEPS = [
         "kind": "step",
         "name": "load",
         "step_type": "singleton",
-        "container": "qiita/reference-load:1.0.0",
+        "container": REFERENCE_LOAD_CONTAINER,
         "target_status": "loading",
         "inputs": ["fasta_path", "manifest", "feature_map"],
         "outputs": ["staging_dir"],
@@ -522,13 +524,14 @@ class _RetryingBackendClient:
         reference_idx: int,
         work_ticket_idx: int,
         container: str | None = None,
+        module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources=None,
     ) -> dict[str, Path]:
         from qiita_common.backend_failure import BackendFailure
         from qiita_common.models import WorkTicketFailureStage
 
-        del work_ticket_idx, container, entrypoint, baseline_resources
+        del work_ticket_idx, container, module, entrypoint, baseline_resources
         self.attempts[step_name] = self.attempts.get(step_name, 0) + 1
         if step_name == self.fail_step and self.attempts[step_name] <= self.fail_n_times:
             raise BackendFailure(

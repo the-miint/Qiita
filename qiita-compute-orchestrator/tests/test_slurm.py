@@ -178,6 +178,91 @@ def test_payload_zero_walltime_rejected(common_kwargs):
         )
 
 
+# ----------------------------------------------------------------------------
+# Native (`module:`) script branch
+# ----------------------------------------------------------------------------
+
+
+@pytest.fixture
+def native_kwargs(baseline, tmp_path):
+    """Same shape as common_kwargs but the runtime is `module:` instead
+    of `container:`. The non-runtime fields stay identical so the test
+    can isolate the runtime difference."""
+    return {
+        "step_name": "fastq",
+        "work_ticket_idx": 42,
+        "container": None,
+        "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
+        "entrypoint": None,
+        "baseline_resources": baseline,
+        "input_path": tmp_path / "in",
+        "output_path": tmp_path / "out",
+        "workspace": tmp_path / "ws",
+        "log_stdout": tmp_path / "logs" / "stdout",
+        "log_stderr": tmp_path / "logs" / "stderr",
+        "partition": "qiita",
+        "account": "qiita-prod",
+    }
+
+
+def test_native_payload_script_invokes_python_m_launcher(native_kwargs):
+    """Native step's SBATCH script must call the shared launcher with
+    the short job name (NATIVE_MODULE_PREFIX stripped) and must NOT
+    contain `apptainer exec` (no container to bind into)."""
+    payload = build_job_submit_payload(**native_kwargs)
+    script = payload["script"]
+    assert "srun python -m qiita_compute_orchestrator.jobs --job fastq_to_parquet" in script
+    assert "apptainer exec" not in script
+    assert script.startswith("#!/bin/bash\nset -euo pipefail\n")
+
+
+def test_native_payload_has_no_bind_mounts(native_kwargs):
+    """Native dispatch runs in the orchestrator's installed Python env
+    on the compute node; nothing to bind into. The script must not
+    carry --bind flags."""
+    payload = build_job_submit_payload(**native_kwargs)
+    assert "--bind" not in payload["script"]
+
+
+def test_native_payload_keeps_qiita_env_vars(native_kwargs):
+    """The launcher reads $QIITA_INPUT_PATH / $QIITA_OUTPUT_PATH from
+    environment just like the container does — both runtimes share the
+    same env contract."""
+    payload = build_job_submit_payload(**native_kwargs)
+    env = dict(item.split("=", 1) for item in payload["job"]["environment"])
+    assert env["QIITA_INPUT_PATH"] == str(native_kwargs["input_path"])
+    assert env["QIITA_OUTPUT_PATH"] == str(native_kwargs["output_path"])
+    assert env["QIITA_WORK_TICKET_IDX"] == str(native_kwargs["work_ticket_idx"])
+
+
+def test_native_payload_keeps_job_metadata(native_kwargs, baseline):
+    """The slurmrestd `job` block (resources, name, partition, etc.) is
+    runtime-independent — switching from container to module must not
+    perturb the scheduler-visible metadata."""
+    payload = build_job_submit_payload(**native_kwargs)
+    job = payload["job"]
+    assert job["name"] == "qiita-fastq-wt42"
+    assert job["account"] == "qiita-prod"
+    assert job["partition"] == "qiita"
+    assert job["cpus_per_task"] == baseline.cpu
+    assert job["memory_per_node"]["number"] == baseline.mem_gb * 1024
+
+
+def test_payload_rejects_both_container_and_module(common_kwargs):
+    """Exactly-one runtime — both set is rejected by the builder. The
+    wire validator catches this upstream; the builder's own check
+    protects direct callers (tests, future programmatic submission)."""
+    common_kwargs["module"] = "qiita_compute_orchestrator.jobs.fastq_to_parquet"
+    with pytest.raises(ValueError, match="exactly one"):
+        build_job_submit_payload(**common_kwargs)
+
+
+def test_payload_rejects_neither_container_nor_module(common_kwargs):
+    common_kwargs["container"] = None
+    with pytest.raises(ValueError, match="exactly one"):
+        build_job_submit_payload(**common_kwargs)
+
+
 def test_payload_rejects_empty_partition(common_kwargs):
     common_kwargs["partition"] = ""
     with pytest.raises(ValueError, match="partition"):

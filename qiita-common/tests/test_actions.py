@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import ScopeTargetKind, StepType
+from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER
 
 
 def _minimal_action_kwargs() -> dict:
@@ -28,7 +29,7 @@ def _minimal_action_kwargs() -> dict:
             {
                 "step": "hash",
                 "step_type": StepType.SINGLETON,
-                "container": "qiita/reference-hash:1.0.0",
+                "container": REFERENCE_HASH_CONTAINER,
                 "baseline_resources": {
                     "cpu": 4,
                     "mem_gb": 8,
@@ -289,3 +290,86 @@ def test_status_fields_reject_blank_strings():
     kwargs2["steps"][0]["target_status"] = ""
     with pytest.raises(ValidationError):
         ActionDefinition(**kwargs2)
+
+
+# --- WorkflowStep runtime-selection validator -----------------------------
+# Shape-only: every step must declare exactly one of `container:` or
+# `module:`. Prefix validation on `module` is enforced separately (not
+# in this validator).
+
+
+def test_workflow_step_native_module_form_validates():
+    """A step with `module` set (and no container) validates cleanly."""
+    from qiita_common.actions import ActionDefinition, WorkflowStep
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0] = {
+        "step": "fastq",
+        "step_type": StepType.SINGLETON,
+        "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
+        "baseline_resources": {"cpu": 4, "mem_gb": 8, "walltime": "PT1H"},
+    }
+    a = ActionDefinition(**kwargs)
+    assert isinstance(a.steps[0], WorkflowStep)
+    assert a.steps[0].container is None
+    assert a.steps[0].module == "qiita_compute_orchestrator.jobs.fastq_to_parquet"
+
+
+def test_workflow_step_rejects_both_container_and_module():
+    """A step with both `container` and `module` is rejected — runtime
+    must be unambiguous."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0]["module"] = "qiita_compute_orchestrator.jobs.x"
+    with pytest.raises(ValidationError) as exc_info:
+        ActionDefinition(**kwargs)
+    assert "exactly one" in str(exc_info.value)
+
+
+def test_workflow_step_rejects_neither_container_nor_module():
+    """A step with neither runtime field is rejected."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    del kwargs["steps"][0]["container"]
+    with pytest.raises(ValidationError) as exc_info:
+        ActionDefinition(**kwargs)
+    assert "exactly one" in str(exc_info.value)
+
+
+def test_workflow_step_rejects_entrypoint_without_container():
+    """`entrypoint` overrides a container's ENTRYPOINT — it's meaningless
+    for native steps, which dispatch via `python -m`."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0] = {
+        "step": "fastq",
+        "step_type": StepType.SINGLETON,
+        "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
+        "entrypoint": "/usr/local/bin/run",
+        "baseline_resources": {"cpu": 4, "mem_gb": 8, "walltime": "PT1H"},
+    }
+    with pytest.raises(ValidationError) as exc_info:
+        ActionDefinition(**kwargs)
+    assert "entrypoint" in str(exc_info.value).lower()
+
+
+def test_workflow_step_entrypoint_with_container_ok():
+    """Container steps may set `entrypoint` to override the image's
+    default ENTRYPOINT."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"][0]["entrypoint"] = "/usr/local/bin/qiita-hash"
+    a = ActionDefinition(**kwargs)
+    assert a.steps[0].entrypoint == "/usr/local/bin/qiita-hash"
+
+
+def test_native_module_prefix_constant_value():
+    """NATIVE_MODULE_PREFIX is the single source of truth for the allowed
+    module path; CP sync, CO boot scan, and the wire validator all import it."""
+    from qiita_common.actions import NATIVE_MODULE_PREFIX
+
+    assert NATIVE_MODULE_PREFIX == "qiita_compute_orchestrator.jobs."

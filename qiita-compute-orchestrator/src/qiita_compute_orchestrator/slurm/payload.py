@@ -10,18 +10,29 @@ writing). Newer versions add fields but the subset used here is stable;
 if a deploy needs an older or newer version, only the
 `number/set/infinite` envelope and the field names need adjusting.
 
-The script body invokes the workflow container via apptainer:
+The builder supports two runtimes, selected by which of `container` or
+`module` is set:
 
-    #!/bin/bash
-    set -euo pipefail
-    apptainer exec [args] <container_image> [<entrypoint>]
+- Container form (apptainer):
+      #!/bin/bash
+      set -euo pipefail
+      apptainer exec [args] <container_image> [<entrypoint>]
+  Apptainer is the SLURM-cluster convention (Linux Foundation's
+  continuation of Singularity); the cluster has it installed.
 
-Apptainer is the SLURM-cluster convention (Linux Foundation's
-continuation of Singularity); the cluster has it installed. The
-container is responsible for the qiita container contract — reading
-`$QIITA_INPUT_PATH/params.json`, writing outputs to
-`$QIITA_OUTPUT_PATH`, producing `manifest.json` with size_bytes per
-file, chmod 440 on outputs.
+- Native form (`python -m`):
+      #!/bin/bash
+      set -euo pipefail
+      srun python -m qiita_compute_orchestrator.jobs --job <short_name>
+  `<short_name>` is `module` with `NATIVE_MODULE_PREFIX` stripped.
+  The shared launcher (`jobs/__main__.py`) reads
+  `$QIITA_INPUT_PATH/params.json` and routes through `run_native_job`.
+
+Either way, the producer is responsible for the qiita output contract —
+reading `$QIITA_INPUT_PATH/params.json`, writing outputs and
+`manifest.json` to `$QIITA_OUTPUT_PATH`, chmod 440 on every file (see
+`slurm/contract.py` for the load-bearing constants and
+`slurm/verify.py` for the checker).
 """
 
 from __future__ import annotations
@@ -30,7 +41,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from qiita_common.actions import BaselineResources
+from qiita_common.actions import NATIVE_MODULE_PREFIX, BaselineResources
 
 
 def _number_envelope(value: int) -> dict[str, Any]:
@@ -74,11 +85,24 @@ def _build_script(
     return f"#!/bin/bash\nset -euo pipefail\n{cmd}\n"
 
 
+def _build_native_script(*, module: str) -> str:
+    """Shell launcher for a native-step job. Invokes the shared
+    Python launcher (`jobs/__main__.py`) with the short job name,
+    which reads `$QIITA_INPUT_PATH/params.json` and routes through
+    `run_native_job` exactly as `LocalBackend` does in-process —
+    same dispatcher, same error classification, same manifest
+    contract."""
+    short = module.removeprefix(NATIVE_MODULE_PREFIX)
+    cmd = f"srun python -m qiita_compute_orchestrator.jobs --job {short}"
+    return f"#!/bin/bash\nset -euo pipefail\n{cmd}\n"
+
+
 def build_job_submit_payload(
     *,
     step_name: str,
     work_ticket_idx: int,
-    container: str,
+    container: str | None,
+    module: str | None = None,
     entrypoint: str | None,
     baseline_resources: BaselineResources,
     input_path: Path,
@@ -92,6 +116,10 @@ def build_job_submit_payload(
 ) -> dict[str, Any]:
     """Build the slurmrestd `POST /slurm/{version}/job/submit` JSON body.
 
+    Exactly one of `container` or `module` must be set — the wire
+    validator on StepRunRequest enforces this upstream; this builder
+    re-checks defensively because direct callers (tests) skip the wire.
+
     Args:
         step_name: YAML step name; used in the SLURM job name for
             ops visibility. Not the FailureKind step_name (which is
@@ -102,16 +130,26 @@ def build_job_submit_payload(
         container: apptainer-runnable image (e.g.
             `/opt/qiita/containers/reference-hash:1.0.0.sif`,
             `qiita/reference-hash:1.0.0` for community-extension hosts).
-        entrypoint: optional binary inside the container. None means the
-            container's own ENTRYPOINT runs.
+            Mutually exclusive with `module`.
+        module: native-job module path under `NATIVE_MODULE_PREFIX`
+            (e.g. `qiita_compute_orchestrator.jobs.fastq_to_parquet`).
+            Mutually exclusive with `container`. When set, the SBATCH
+            script invokes the shared `python -m` launcher instead of
+            `apptainer exec`; bind mounts are not emitted because
+            there's no container to bind into.
+        entrypoint: optional binary inside the container. None means
+            the container's own ENTRYPOINT runs. Meaningful only when
+            `container` is set.
         baseline_resources: CPU / memory / walltime from the YAML step.
             Used as-is — there is no originator-profile multiplier
             applied here. Caller is responsible for clamping against
             the action's ceiling before passing in.
-        input_path: Bind-mounted as `$QIITA_INPUT_PATH` inside the
-            container. Caller writes `params.json` here before submit.
-        output_path: Bind-mounted as `$QIITA_OUTPUT_PATH`. Container
-            writes outputs + `manifest.json` here.
+        input_path: `$QIITA_INPUT_PATH`. For container steps this is
+            bind-mounted; for native steps the launcher reads from it
+            directly. Caller writes `params.json` here before submit.
+        output_path: `$QIITA_OUTPUT_PATH`. Same dual role; the
+            producer (container or launcher) writes outputs +
+            `manifest.json` here.
         workspace: SLURM job's `current_working_directory`. Distinct
             from input/output (which are container-internal paths).
         log_stdout, log_stderr: Where slurmd writes job logs. Caller
@@ -130,14 +168,18 @@ def build_job_submit_payload(
         endpoint. The caller is responsible for adding the SLURM JWT
         header and POSTing.
     """
-    if not container:
+    if (container is None) == (module is None):
+        raise ValueError("build_job_submit_payload requires exactly one of `container` or `module`")
+    if container is not None and not container:
         raise ValueError("container must be a non-empty string")
+    if module is not None and not module:
+        raise ValueError("module must be a non-empty string")
     if not partition:
         raise ValueError("partition must be set on the orchestrator config")
     if not account:
         raise ValueError("account must be set on the orchestrator config")
 
-    # QIITA_WORK_TICKET_IDX is mirrored from params.json so containers
+    # QIITA_WORK_TICKET_IDX is mirrored from params.json so producers
     # that want to stamp output filenames or logs with the originating
     # ticket don't have to JSON-parse params just to read one scalar.
     # params.json remains the contract source of truth for everything
@@ -150,22 +192,28 @@ def build_job_submit_payload(
     if extra_env:
         env.update(extra_env)
 
-    # Bind mounts let the container see the host paths under their own
-    # names. Without --bind, the container can't access input_path /
-    # output_path on the shared filesystem.
-    apptainer_args = [
-        "--bind",
-        f"{input_path}:{input_path}",
-        "--bind",
-        f"{output_path}:{output_path}",
-    ]
-
-    return {
-        "script": _build_script(
+    if module is not None:
+        # Native: no bind mounts — the launcher runs in the
+        # orchestrator's installed Python env on the compute node,
+        # reading/writing host paths directly via QIITA_*_PATH.
+        script = _build_native_script(module=module)
+    else:
+        # Container: bind mounts let apptainer see input_path /
+        # output_path under the same names from inside the container.
+        apptainer_args = [
+            "--bind",
+            f"{input_path}:{input_path}",
+            "--bind",
+            f"{output_path}:{output_path}",
+        ]
+        script = _build_script(
             container=container,
             entrypoint=entrypoint,
             apptainer_extra_args=apptainer_args,
-        ),
+        )
+
+    return {
+        "script": script,
         "job": {
             "name": f"qiita-{step_name}-wt{work_ticket_idx}",
             "account": account,

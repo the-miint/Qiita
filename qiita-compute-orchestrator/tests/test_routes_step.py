@@ -6,19 +6,39 @@ miint to test the route surface.
 """
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 from qiita_common.api_paths import URL_STEP_RUN
+from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER
 
 from qiita_compute_orchestrator.backend import ComputeBackend
 from qiita_compute_orchestrator.main import app
 
 
+@dataclass(frozen=True)
+class _RecordedCall:
+    """One recorded call into `_RecordingBackend.run_step`. Per-attribute
+    access keeps test assertions readable; adding a new protocol kwarg
+    means adding one field here rather than re-counting tuple slots."""
+
+    name: str
+    inputs: dict[str, Path]
+    workspace: Path
+    reference_idx: int
+    work_ticket_idx: int
+    container: str | None
+    module: str | None
+    entrypoint: str | None
+    baseline_resources: Any
+
+
 class _RecordingBackend(ComputeBackend):
     def __init__(self) -> None:
-        self.calls: list[tuple[str, dict, Path, int]] = []
+        self.calls: list[_RecordedCall] = []
 
     async def run_step(
         self,
@@ -29,22 +49,21 @@ class _RecordingBackend(ComputeBackend):
         reference_idx: int,
         work_ticket_idx: int,
         container: str | None = None,
+        module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources=None,
     ) -> dict[str, Path]:
-        # Existing tests don't exercise every field; they get captured
-        # into the calls log as a tuple so future tests that DO
-        # exercise them can assert on the values.
         self.calls.append(
-            (
-                name,
-                dict(inputs),
-                workspace,
-                reference_idx,
-                work_ticket_idx,
-                container,
-                entrypoint,
-                baseline_resources,
+            _RecordedCall(
+                name=name,
+                inputs=dict(inputs),
+                workspace=workspace,
+                reference_idx=reference_idx,
+                work_ticket_idx=work_ticket_idx,
+                container=container,
+                module=module,
+                entrypoint=entrypoint,
+                baseline_resources=baseline_resources,
             )
         )
         return {"manifest": workspace / "manifest.parquet"}
@@ -105,6 +124,10 @@ def test_step_run_dispatches_to_backend(http_client, cp_to_co_token, tmp_path):
             "workspace": str(tmp_path),
             "reference_idx": 7,
             "work_ticket_idx": 99,
+            # Required by StepRunRequest's exactly-one(container, module)
+            # validator. The route test doesn't care which runtime drives
+            # the recording backend; container is the simpler choice.
+            "container": REFERENCE_HASH_CONTAINER,
         },
     )
     assert resp.status_code == 200, resp.text
@@ -113,25 +136,40 @@ def test_step_run_dispatches_to_backend(http_client, cp_to_co_token, tmp_path):
     assert body["outputs"]["manifest"].endswith("manifest.parquet")
 
     assert len(backend.calls) == 1
-    (
-        name,
-        inputs,
-        workspace,
-        reference_idx,
-        work_ticket_idx,
-        container,
-        entrypoint,
-        baseline,
-    ) = backend.calls[0]
-    assert name == "hash"
-    assert inputs == {"fasta_path": fasta}
-    assert workspace == tmp_path
-    assert reference_idx == 7
-    assert work_ticket_idx == 99
-    # Old call sites omit container metadata; protocol defaults to None.
-    assert container is None
-    assert entrypoint is None
-    assert baseline is None
+    call = backend.calls[0]
+    assert call.name == "hash"
+    assert call.inputs == {"fasta_path": fasta}
+    assert call.workspace == tmp_path
+    assert call.reference_idx == 7
+    assert call.work_ticket_idx == 99
+    assert call.container == REFERENCE_HASH_CONTAINER
+    assert call.module is None
+    assert call.entrypoint is None
+    assert call.baseline_resources is None
+
+
+def test_step_run_forwards_module_to_backend(http_client, cp_to_co_token, tmp_path):
+    """The module form on the wire must reach backend.run_step verbatim.
+    Catches dropped-on-the-floor regressions where the route accepts module
+    in the payload but doesn't forward it through."""
+    client, backend = http_client
+    resp = client.post(
+        URL_STEP_RUN,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "fastq",
+            "inputs": {},
+            "workspace": str(tmp_path),
+            "reference_idx": 1,
+            "work_ticket_idx": 1,
+            "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(backend.calls) == 1
+    call = backend.calls[0]
+    assert call.container is None
+    assert call.module == "qiita_compute_orchestrator.jobs.fastq_to_parquet"
 
 
 def test_step_run_translates_backend_value_error(http_client, cp_to_co_token, tmp_path):
@@ -151,6 +189,7 @@ def test_step_run_translates_backend_value_error(http_client, cp_to_co_token, tm
             "workspace": str(tmp_path),
             "reference_idx": 1,
             "work_ticket_idx": 1,
+            "container": "qiita/test:1.0.0",
         },
     )
     assert resp.status_code == 422
@@ -194,6 +233,7 @@ def test_step_run_serializes_backend_failure(http_client, cp_to_co_token, tmp_pa
             "workspace": str(tmp_path),
             "reference_idx": 1,
             "work_ticket_idx": 1,
+            "container": REFERENCE_HASH_CONTAINER,
         },
     )
     assert resp.status_code == BACKEND_FAILURE_HTTP_STATUS
@@ -204,6 +244,72 @@ def test_step_run_serializes_backend_failure(http_client, cp_to_co_token, tmp_pa
         "step_name": "hash",
         "reason": "slurm reported node n01 lost mid-step",
     }
+
+
+def test_step_run_rejects_wrong_prefix_module(http_client, cp_to_co_token, tmp_path):
+    """Defense in depth: a module path outside NATIVE_MODULE_PREFIX is
+    rejected at the route boundary before the backend tries to import
+    it. The wire validator only checks shape (exactly-one runtime); the
+    prefix check lives in the handler."""
+    client, backend = http_client
+    resp = client.post(
+        URL_STEP_RUN,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "x",
+            "inputs": {},
+            "workspace": str(tmp_path),
+            "reference_idx": 1,
+            "work_ticket_idx": 1,
+            "module": "os.system",  # bad prefix
+        },
+    )
+    assert resp.status_code == 422
+    assert "qiita_compute_orchestrator.jobs." in resp.text
+    assert backend.calls == []
+
+
+def test_step_run_rejects_payload_without_runtime(http_client, cp_to_co_token, tmp_path):
+    """A request body with neither `container` nor `module` is rejected at
+    the wire boundary by the StepRunRequest validator; the route never
+    reaches the backend dispatch."""
+    client, backend = http_client
+    resp = client.post(
+        URL_STEP_RUN,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "hash",
+            "inputs": {"fasta_path": "/tmp/x.fa"},
+            "workspace": str(tmp_path),
+            "reference_idx": 1,
+            "work_ticket_idx": 1,
+        },
+    )
+    assert resp.status_code == 422
+    assert "exactly one" in resp.text
+    assert backend.calls == []
+
+
+def test_step_run_rejects_payload_with_both_runtimes(http_client, cp_to_co_token, tmp_path):
+    """A request body with both `container` AND `module` is rejected at
+    the wire boundary — runtime must be unambiguous."""
+    client, backend = http_client
+    resp = client.post(
+        URL_STEP_RUN,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "hash",
+            "inputs": {"fasta_path": "/tmp/x.fa"},
+            "workspace": str(tmp_path),
+            "reference_idx": 1,
+            "work_ticket_idx": 1,
+            "container": REFERENCE_HASH_CONTAINER,
+            "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
+        },
+    )
+    assert resp.status_code == 422
+    assert "exactly one" in resp.text
+    assert backend.calls == []
 
 
 def test_settings_resolves_token_from_env():

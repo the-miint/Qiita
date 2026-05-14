@@ -641,7 +641,13 @@ A gate failure after exit code 0 is a permanent failure — the container return
 - No root required (runs unprivileged)
 - SLURM submits via `srun apptainer exec` or native integration
 
-**Backend code-sharing:** Both `LocalBackend` (DuckDB+miint in-process) and `SlurmBackend` (submits jobs via slurmrestd) are wired. SlurmBackend owns submit / poll / verify / classify; the work each step actually performs still lives in LocalBackend's per-step helpers (`_run_hash`, `_run_load`, the module-level `_write_*` builders) — the source of truth for what each step does. When SLURM container images ship, their entrypoint must execute the *same* DuckDB+miint logic — not a parallel implementation. The cleanest path is to extract the SQL/script bodies into a shared `qiita_compute_orchestrator.jobs` module that both backends consume: LocalBackend imports it directly; SLURM containers ship a CLI wrapper that reads `params.json` and dispatches into the same module. The dev/test path and the production SLURM path must not diverge. (Open follow-ups — the shared `jobs` module and the per-step container images don't exist yet; SlurmBackend is plumbed but has no container to run.)
+**Workflow runtimes (`container:` vs `module:`).** Each `step:` entry in a workflow YAML declares exactly one of two runtimes. `container:` names an apptainer image; the SBATCH script invokes `apptainer exec <image> [entrypoint]`. `module:` names a Python module path under `qiita_compute_orchestrator.jobs.*`; the SBATCH script invokes `srun python -m qiita_compute_orchestrator.jobs --job <short_name>` against the orchestrator's installed Python environment on the compute node. Native steps are the right choice when a step's only dependencies are already in `qiita-compute-orchestrator`'s `pyproject.toml`; container steps are required when the step pulls in heavier bioinformatics deps or system packages.
+
+Every native job module exports exactly two symbols: a `class Inputs(BaseModel)` declaring its typed input contract, and `async def execute(inputs, workspace) -> dict[str, Path]` doing the work. A single framework dispatcher (`run_native_job` in `jobs/__init__.py`) imports the module, validates `raw_inputs` against `mod.Inputs`, invokes `execute`, and maps known exceptions (`NotImplementedError`, `FileNotFoundError`, `ValueError`, `ValidationError`) to typed `BackendFailure` values. Both `LocalBackend` and the shared SLURM launcher (`jobs/__main__.py`) route through `run_native_job`, so a job sees identical inputs and identical failure classification regardless of runtime.
+
+The wire validator on `StepRunRequest` is shape-only — it enforces exactly-one(`container`, `module`) but does not check the prefix. The native-job module prefix (`qiita_compute_orchestrator.jobs.`) itself is enforced at four other sites: sync (control plane refuses to persist a YAML whose `module:` is outside the prefix), submit (the `/step/run` route handler checks before invoking the backend), boot (the orchestrator's lifespan scan walks `jobs/` and refuses to start if any submodule fails the `Inputs`/`execute` contract), and dispatcher (`run_native_job` re-validates so direct in-process callers can't bypass the check). The `slurm/contract.py` module holds the two constants the producer (container entrypoint or native launcher) and the verifier (`slurm/verify.py`) both depend on — `EXPECTED_FILE_MODE = 0o440` and `MANIFEST_FILENAME = "manifest.json"`.
+
+**Backend code-sharing:** Both `LocalBackend` (DuckDB+miint in-process) and `SlurmBackend` (submits jobs via slurmrestd) are wired. SlurmBackend owns submit / poll / verify / classify; for container steps, the work each step performs lives in LocalBackend's per-step helpers (`_run_hash`, `_run_load`, the module-level `_write_*` builders) — the source of truth for that family of steps until those helpers fold into the `jobs/` package. For native steps, both backends route through `run_native_job` and the work lives in the job module itself, so the dev/test path and the production SLURM path share the same code regardless of runtime.
 
 **Future:** Clean `ComputeBackend` interface allows adding alternative backends (cloud, Kubernetes) without changing the control plane.
 
@@ -802,16 +808,21 @@ qiita/
 │   ├── src/
 │   │   └── qiita_compute_orchestrator/
 │   │       ├── __init__.py
-│   │       ├── main.py             # service entry point + /health + /step/run route
+│   │       ├── main.py             # service entry point + /health; lifespan runs jobs/ boot scan
 │   │       ├── config.py           # settings (compute backend, shared FS root, CP↔CO token, SLURM creds)
-│   │       ├── backend.py          # ComputeBackend interface (run_step + verify_outputs contract)
-│   │       ├── step.py             # per-step verification helpers (output paths, file modes)
+│   │       ├── backend.py          # ComputeBackend abstract base (run_step + aclose contracts)
+│   │       ├── step.py             # /api/v1/step/run route handler + submit-time prefix check
 │   │       ├── backends/
 │   │       │   ├── local.py        # LocalBackend (DuckDB + miint in-process; dev / test)
 │   │       │   └── slurm.py        # SlurmBackend (slurmrestd dispatch + polling)
+│   │       ├── jobs/
+│   │       │   ├── __init__.py     # run_native_job framework dispatcher + boot-time scan
+│   │       │   ├── __main__.py     # `python -m` SLURM launcher (params.json → run_native_job)
+│   │       │   └── fastq_to_parquet.py  # native skeleton (Inputs + execute = NotImplementedError)
 │   │       └── slurm/
 │   │           ├── client.py       # slurmrestd REST client
-│   │           ├── payload.py      # JSON job-submit payload builder
+│   │           ├── contract.py     # shared constants: EXPECTED_FILE_MODE, MANIFEST_FILENAME
+│   │           ├── payload.py      # JSON job-submit payload builder (container + native scripts)
 │   │           └── verify.py       # post-job output verification (mode 440, identifier sort)
 │   └── tests/
 │       └── conftest.py

@@ -37,11 +37,16 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-# 0o440: owner read, group read, no other access. The data plane refuses
-# to register files that aren't 440 (see qiita-data-plane file-mode
-# check); the orchestrator enforces it earlier so a contract violation
-# fails the step rather than failing later at registration time.
-EXPECTED_FILE_MODE: int = 0o440
+from .contract import EXPECTED_FILE_MODE, MANIFEST_FILENAME
+
+__all__ = [
+    # Re-exported for backward compatibility with `from .verify import
+    # EXPECTED_FILE_MODE`; the canonical home is now `slurm/contract.py`.
+    "EXPECTED_FILE_MODE",
+    "VerificationFailure",
+    "parse_outputs_map",
+    "verify_container_output",
+]
 
 # Size cap on the manifest itself. A pathologically large manifest
 # (tens of MB) would slow ops dashboards and indicate a malformed
@@ -90,7 +95,7 @@ def verify_container_output(output_path: Path) -> list[VerificationFailure]:
     # the directory (and chase symlinks) on every entry.
     output_path_resolved = output_path.resolve()
 
-    manifest_path = output_path / "manifest.json"
+    manifest_path = output_path / MANIFEST_FILENAME
     if not manifest_path.exists():
         return [
             VerificationFailure(
@@ -291,5 +296,5 @@ def parse_outputs_map(output_path: Path) -> dict[str, Path]:
     Caller is the orchestrator's run_step, which catches and wraps as
     CONTRACT_VIOLATION (the verifier should already have caught this,
     but defense in depth)."""
-    manifest = json.loads((output_path / "manifest.json").read_text())
+    manifest = json.loads((output_path / MANIFEST_FILENAME).read_text())
     return {name: (output_path / value).resolve() for name, value in manifest["outputs"].items()}

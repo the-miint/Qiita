@@ -35,6 +35,7 @@ from qiita_common.models import (
     FailureType,
     ReferenceStatus,
     ScopeTargetKind,
+    StepBaselineResources,
     WorkTicketFailureStage,
     WorkTicketState,
 )
@@ -572,8 +573,6 @@ async def _dispatch_step(
     # Forward static step metadata so the orchestrator's backend can run
     # the right container with the right resource ask. SlurmBackend
     # requires these; LocalBackend ignores them.
-    from qiita_common.models import StepBaselineResources
-
     baseline = StepBaselineResources(
         cpu=entry.baseline_resources.cpu,
         mem_gb=entry.baseline_resources.mem_gb,
@@ -587,6 +586,7 @@ async def _dispatch_step(
         reference_idx=scope_target["reference_idx"],
         work_ticket_idx=work_ticket_idx,
         container=entry.container,
+        module=entry.module,
         entrypoint=entry.entrypoint,
         baseline_resources=baseline,
     )

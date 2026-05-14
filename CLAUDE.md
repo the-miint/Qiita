@@ -63,6 +63,10 @@ cd qiita-control-plane && uv sync --reinstall-package qiita-common
 
 **Fail fast, fail early, fail loudly.** Validate inputs at every boundary. Return structured errors with enough context to diagnose without a debugger. Prefer raising/panicking over silently returning defaults for unexpected states. Silent failures are bugs.
 
+## Workflow runtimes
+
+A step in a workflow YAML must declare exactly one of `container:` or `module:`. The `module:` form (a native step) runs in the orchestrator's Python environment under SLURM and must only use dependencies that already ship in `qiita-compute-orchestrator`'s `pyproject.toml`. Anything heavier (extra bioinformatics deps, system packages) belongs in a container. Native job modules live under `qiita-compute-orchestrator/src/qiita_compute_orchestrator/jobs/` and export exactly two symbols: `class Inputs(BaseModel)` declaring the job's typed input contract, and `async def execute(inputs, workspace)` doing the work. A single framework dispatcher (`run_native_job`) handles import, validation, and error classification; both `LocalBackend` and the shared `python -m` SLURM launcher route through it. The wire validator (`StepRunRequest`) enforces shape only — exactly one of `container` or `module` must be set. The module prefix (`qiita_compute_orchestrator.jobs.`) itself is enforced at four other sites: sync (CP, `actions/sync.py`), submit (CO `/step/run` handler), boot (orchestrator lifespan scan), and dispatcher (`run_native_job`).
+
 ## Naming conventions
 
 **DB tables, REST resource segments, scope strings, OpenAPI tags, and the source files that own them are always singular**, never plural — `reference` not `references`, `auth_event` not `auth_events`, `/user` not `/users`, `reference:read` not `references:read`, `routes/reference.py` not `routes/references.py`, `tests/test_user.py` not `tests/test_users.py`. This applies to junction tables (`user_identity`, not `user_identities`); use `_to_` for many-to-many junctions when both sides need to be named (e.g. `biosample_to_study`). Column names follow the same rule unless the column genuinely holds a list/array.

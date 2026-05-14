@@ -123,6 +123,22 @@ class StepBaselineResources(BaseModel):
     gpu: Annotated[int, Field(ge=0)] = 0
 
 
+def check_exactly_one_runtime(
+    *,
+    container: str | None,
+    module: str | None,
+    entrypoint: str | None,
+    owner: str,
+) -> None:
+    """Shared runtime-selection check for WorkflowStep (YAML side) and
+    StepRunRequest (wire side). Raises ValueError when the shape is wrong.
+    Kept in one place so the rule can't drift between the two layers."""
+    if (container is None) == (module is None):
+        raise ValueError(f"{owner} must declare exactly one of 'container' or 'module'")
+    if entrypoint is not None and container is None:
+        raise ValueError("'entrypoint' requires 'container'")
+
+
 class StepRunRequest(BaseModel):
     """Body for POST /api/v1/step/run on the orchestrator.
 
@@ -131,11 +147,10 @@ class StepRunRequest(BaseModel):
     `run_step`. Paths are absolute and live on the workspace shared
     between control plane and orchestrator.
 
-    `container`, `entrypoint`, and `baseline_resources` come from the
-    YAML step's static metadata. They are optional on the wire so
-    LocalBackend (which dispatches on step_name and uses internal
-    helpers) can be invoked without populating them; SlurmBackend
-    requires them and refuses the request when they're absent.
+    Runtime selection (`container` vs `module`) follows the same rules
+    as `qiita_common.actions.WorkflowStep` — exactly one must be set,
+    enforced by the same `check_exactly_one_runtime` helper. See that
+    class's docstring for the container-vs-native semantics.
 
     `work_ticket_idx` flows through so SlurmBackend can stamp the SLURM
     job name with the originating ticket id — making scheduler dumps
@@ -147,9 +162,24 @@ class StepRunRequest(BaseModel):
     workspace: str = Field(min_length=1)
     reference_idx: Annotated[int, Field(gt=0)]
     work_ticket_idx: Annotated[int, Field(gt=0)]
-    container: str | None = Field(default=None, max_length=512)
+    container: str | None = Field(default=None, min_length=1, max_length=512)
+    module: str | None = Field(default=None, min_length=1, max_length=512)
     entrypoint: str | None = None
     baseline_resources: StepBaselineResources | None = None
+
+    @model_validator(mode="after")
+    def _exactly_one_runtime(self) -> StepRunRequest:
+        # Mirrors WorkflowStep's exactly-one rule at the wire boundary.
+        # Pydantic raises a 422 at FastAPI deserialization, before any
+        # backend code runs — single enforcement point, no per-backend
+        # drift risk.
+        check_exactly_one_runtime(
+            container=self.container,
+            module=self.module,
+            entrypoint=self.entrypoint,
+            owner="StepRunRequest",
+        )
+        return self
 
 
 class StepRunResponse(BaseModel):

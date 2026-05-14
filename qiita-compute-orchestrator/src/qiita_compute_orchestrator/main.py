@@ -9,6 +9,7 @@ from .backend import ComputeBackend
 from .backends.local import LocalBackend
 from .backends.slurm import SlurmBackend
 from .config import BACKEND_LOCAL, BACKEND_SLURM, Settings
+from .jobs import scan_native_jobs
 from .slurm import SlurmrestdClient
 from .step import router as step_router
 
@@ -45,14 +46,16 @@ async def lifespan(app: FastAPI):
     app.state.settings = settings
     app.state.backend = _build_backend(settings)
     app.state.cp_to_co_token = settings.cp_to_co_token
+    # Refuse to start with a malformed native-job tree. Surfacing a
+    # missing `Inputs` or `execute` export at boot beats discovering
+    # it on the first submission.
+    scan_native_jobs()
     try:
         yield
     finally:
-        # SlurmBackend owns an httpx client; close it on shutdown so
-        # asyncio doesn't warn about an unclosed transport.
-        backend = app.state.backend
-        if isinstance(backend, SlurmBackend):
-            await backend._client.close()  # noqa: SLF001 — module-private close
+        # Backends own their own resources; aclose() is a no-op for
+        # LocalBackend and closes the httpx client for SlurmBackend.
+        await app.state.backend.aclose()
 
 
 app = FastAPI(title="qiita-compute-orchestrator", lifespan=lifespan)

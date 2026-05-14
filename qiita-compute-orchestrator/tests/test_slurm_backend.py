@@ -110,7 +110,10 @@ def _write_completed_output(workspace: Path, *, manifest_extra: dict | None = No
 
 
 @pytest.mark.asyncio
-async def test_run_step_requires_container(jwt_path, baseline, tmp_path):
+async def test_run_step_requires_container_or_module(jwt_path, baseline, tmp_path):
+    """Neither runtime field set → CONTRACT_VIOLATION. The wire validator
+    on StepRunRequest catches this upstream, but direct callers (and
+    this test) bypass the wire, so SlurmBackend re-checks."""
     handler = httpx.MockTransport(lambda req: httpx.Response(500))
     backend = _make_backend(handler, jwt_path)
     with pytest.raises(BackendFailure) as ei:
@@ -121,11 +124,36 @@ async def test_run_step_requires_container(jwt_path, baseline, tmp_path):
             reference_idx=1,
             work_ticket_idx=99,
             container=None,
+            module=None,
             entrypoint=None,
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
-    assert "container" in ei.value.reason
+    assert "exactly one" in ei.value.reason
+
+
+@pytest.mark.asyncio
+async def test_run_step_rejects_both_container_and_module(jwt_path, baseline, tmp_path):
+    """Both set is a contract violation too — must surface as a typed
+    BackendFailure, not as a raw ValueError leaking out of the payload
+    builder. Both this case and the "neither set" case above ride the
+    same `exactly-one` guard."""
+    handler = httpx.MockTransport(lambda req: httpx.Response(500))
+    backend = _make_backend(handler, jwt_path)
+    with pytest.raises(BackendFailure) as ei:
+        await backend.run_step(
+            "hash",
+            {},
+            tmp_path,
+            reference_idx=1,
+            work_ticket_idx=99,
+            container="qiita/hash:1.0.0",
+            module="qiita_compute_orchestrator.jobs.fastq_to_parquet",
+            entrypoint=None,
+            baseline_resources=baseline,
+        )
+    assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
+    assert "exactly one" in ei.value.reason
 
 
 @pytest.mark.asyncio
@@ -244,6 +272,103 @@ async def test_run_step_terminal_states_map_to_kinds(
     assert ei.value.step_name == "hash"
     # State name surfaces in reason for ops triage.
     assert slurm_state in ei.value.reason
+
+
+# ============================================================================
+# Launcher-stderr enrichment for native steps
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_run_step_native_failure_enriched_from_launcher_stderr(jwt_path, baseline, tmp_path):
+    """A native step that fails inside its execute() writes a structured
+    JSON line to stderr; SlurmBackend reads that line and uses it to
+    populate the BackendFailure so the work_ticket's failure_reason
+    carries the application-level message (not just "exit_code=1").
+
+    Sets up SLURM to report FAILED, drops a real stderr file under
+    `<workspace>/logs/stderr` matching what jobs/__main__.py would
+    emit on a NotImplementedError, and asserts the BackendFailure
+    surface."""
+    import json
+
+    transport, _ = _job_running_then("FAILED", exit_code=1)
+    backend = _make_backend(transport, jwt_path)
+
+    # SlurmBackend creates <workspace>/logs/ itself, but we pre-create
+    # the stderr file before run_step so the launcher's would-be output
+    # is in place when SlurmBackend looks for it post-poll.
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    launcher_reason = (
+        "native job 'qiita_compute_orchestrator.jobs.fastq_to_parquet' not implemented: skeleton"
+    )
+    (logs_dir / "stderr").write_text(
+        json.dumps(
+            {
+                "kind": "unknown_permanent",
+                "step_name": "fastq",
+                "reason": launcher_reason,
+            }
+        )
+        + "\n"
+    )
+
+    with pytest.raises(BackendFailure) as ei:
+        await backend.run_step(
+            "fastq",  # YAML step name passed in by the runner
+            {},
+            tmp_path,
+            reference_idx=1,
+            work_ticket_idx=99,
+            module="qiita_compute_orchestrator.jobs.fastq_to_parquet",
+            baseline_resources=baseline,
+        )
+
+    # Launcher's kind/step_name/reason override the state-based defaults.
+    assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT  # not EXIT_NONZERO
+    assert ei.value.step_name == "fastq"  # YAML name, not the job name passed at `name=`
+    assert "fastq_to_parquet" in ei.value.reason
+    assert "not implemented" in ei.value.reason
+    # SLURM-side context is preserved in the reason (bracketed suffix)
+    # so operators still see the job_id / state / exit_code.
+    assert "FAILED" in ei.value.reason
+    assert "exit_code=1" in ei.value.reason
+
+
+@pytest.mark.asyncio
+async def test_run_step_falls_back_to_state_based_kind_when_no_launcher_line(
+    jwt_path, baseline, tmp_path
+):
+    """When stderr has no structured line (container step, or an
+    infra-killed native job that died before flushing), SlurmBackend
+    falls back to the state-based classification — preserves the
+    current behavior unchanged."""
+    transport, _ = _job_running_then("FAILED", exit_code=1, reason="container exited nonzero")
+    backend = _make_backend(transport, jwt_path)
+
+    # Pre-create logs/ with a stderr file that has only container-style
+    # text (no JSON line). This is what the container case looks like.
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    (logs_dir / "stderr").write_text("ERROR: container exited with code 1\n")
+
+    with pytest.raises(BackendFailure) as ei:
+        await backend.run_step(
+            "hash",
+            {},
+            tmp_path,
+            reference_idx=1,
+            work_ticket_idx=99,
+            container="qiita/hash:1.0.0",
+            entrypoint=None,
+            baseline_resources=baseline,
+        )
+    # State-based classification stands.
+    assert ei.value.kind is FailureKind.EXIT_NONZERO
+    assert ei.value.step_name == "hash"  # the `name` arg, not a launcher-supplied value
+    assert "FAILED" in ei.value.reason
+    assert "exit_code=1" in ei.value.reason
 
 
 # ============================================================================

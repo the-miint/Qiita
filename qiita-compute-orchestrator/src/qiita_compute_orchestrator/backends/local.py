@@ -10,6 +10,7 @@ from qiita_common.models import WorkTicketFailureStage
 from qiita_common.parquet import validate_parquet_path
 
 from ..backend import ComputeBackend
+from ..jobs import flatten_native_inputs, run_native_job
 
 # miint is installed once per process to avoid a network call on every hash job.
 _miint_install_lock = asyncio.Lock()
@@ -72,8 +73,9 @@ class LocalBackend(ComputeBackend):
         *,
         reference_idx: int,
         work_ticket_idx: int,  # noqa: ARG002 — accepted for protocol parity
-        container: str | None = None,
-        entrypoint: str | None = None,
+        container: str | None = None,  # inspected by the runtime guard below; otherwise ignored
+        module: str | None = None,  # inspected by the native-dispatch guard below
+        entrypoint: str | None = None,  # noqa: ARG002 — LocalBackend ignores entrypoint
         baseline_resources=None,  # noqa: ARG002 — accepted for protocol parity
     ) -> dict[str, Path]:
         """Public backend interface. Translates known internal exceptions
@@ -82,6 +84,38 @@ class LocalBackend(ComputeBackend):
         `_write_*`) keep raising plain Python exceptions — they're
         unit-testable in isolation that way; only the run_step boundary
         wraps."""
+        if (container is None) == (module is None):
+            # Symmetric with SlurmBackend's guard: both None (neither
+            # runtime declared) and both set (ambiguous runtime) are
+            # contract violations. The wire validator on StepRunRequest
+            # catches this upstream; this guard protects direct callers
+            # (tests, programmatic submission) so silently preferring
+            # one runtime over the other can't happen.
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=name,
+                reason="LocalBackend requires exactly one of `container` or `module` on the step",
+            )
+        if module is not None:
+            # Native step: delegate to the framework dispatcher. It
+            # validates the module prefix, imports the module,
+            # validates raw_inputs via mod.Inputs, invokes
+            # mod.execute(inputs, workspace), and maps known exceptions
+            # to typed BackendFailure. `flatten_native_inputs` merges
+            # the work-ticket scalars and rejects reserved-key
+            # collisions the same way the SLURM launcher does — a job
+            # module sees identical raw_inputs regardless of runtime.
+            # `step_name=name` plumbs the YAML step name (e.g. "fastq")
+            # to all BackendFailures so they match the work_ticket
+            # `failure_step_name` contract.
+            raw_inputs = flatten_native_inputs(
+                {k: str(v) for k, v in inputs.items()},
+                step_name=name,
+                reference_idx=reference_idx,
+                work_ticket_idx=work_ticket_idx,
+            )
+            return await run_native_job(module, raw_inputs, workspace, step_name=name)
         try:
             if name == "hash":
                 manifest = await self._run_hash(inputs["fasta_path"], workspace, reference_idx)

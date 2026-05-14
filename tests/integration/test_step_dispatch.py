@@ -21,6 +21,7 @@ import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.compute_backend_client import ComputeBackendClient
+from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER
 from qiita_compute_orchestrator.backends.local import LocalBackend
 from qiita_compute_orchestrator.main import app as orch_app
 
@@ -64,6 +65,10 @@ async def test_step_dispatch_hash_end_to_end(orchestrator_app, tmp_path):
             workspace=workspace,
             reference_idx=1,
             work_ticket_idx=1,
+            # Required by StepRunRequest's exactly-one(container, module)
+            # validator. LocalBackend ignores the value for the hash step
+            # (name-dispatch into _run_hash); the field declares the runtime.
+            container=REFERENCE_HASH_CONTAINER,
         )
 
     manifest = outputs["manifest"]
@@ -102,5 +107,6 @@ async def test_step_dispatch_rejects_wrong_token(orchestrator_app, tmp_path):
                 workspace=tmp_path,
                 reference_idx=1,
                 work_ticket_idx=1,
+                container=REFERENCE_HASH_CONTAINER,
             )
         assert exc_info.value.response.status_code == 401

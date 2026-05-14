@@ -32,6 +32,7 @@ class LocalComputeBackendClient:
         reference_idx: int,
         work_ticket_idx: int,
         container: str | None = None,
+        module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources=None,
     ) -> dict[str, Path]:
@@ -42,6 +43,7 @@ class LocalComputeBackendClient:
             reference_idx=reference_idx,
             work_ticket_idx=work_ticket_idx,
             container=container,
+            module=module,
             entrypoint=entrypoint,
             baseline_resources=baseline_resources,
         )

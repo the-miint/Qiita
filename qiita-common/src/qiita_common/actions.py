@@ -34,7 +34,15 @@ from qiita_common.auth_constants import (
     Scope,
     SystemRole,
 )
-from qiita_common.models import ScopeTargetKind, StepType
+from qiita_common.models import ScopeTargetKind, StepType, check_exactly_one_runtime
+
+# Native job modules must live under qiita_compute_orchestrator.jobs.
+# Defined here so every layer that checks the prefix (CP sync, CO boot
+# scan, CO /step/run route, the framework dispatcher) imports a single
+# value rather than re-typing the string. The wire validator on
+# StepRunRequest deliberately stays shape-only — the prefix check
+# belongs at the layers that actually import / dispatch.
+NATIVE_MODULE_PREFIX = "qiita_compute_orchestrator.jobs."
 
 
 class Audience(BaseModel):
@@ -79,7 +87,21 @@ class ActionCeiling(BaselineResources):
 
 
 class WorkflowStep(BaseModel):
-    """SLURM-dispatched containerized step.
+    """Workflow step. Runs in one of two runtimes, selected by which
+    field is set — exactly one of `container` or `module` must be
+    populated. Whether a particular backend implements each runtime is
+    a backend concern; the schema describes what's expressible.
+
+    - `container` form: the step's image is executed via apptainer (or
+      in-process via LocalBackend in dev/test). `entrypoint` may override
+      the container's default ENTRYPOINT.
+    - `module` form (native step): the named Python module lives under
+      `qiita_compute_orchestrator.jobs.*` and runs in the orchestrator's
+      Python environment — either in-process via LocalBackend or under
+      SLURM via `srun python -m qiita_compute_orchestrator.jobs --job <name>`.
+      Use this only when the job's dependencies are already in
+      `qiita-compute-orchestrator`'s `pyproject.toml`; anything heavier
+      (extra bioinformatics deps, system packages) belongs in a container.
 
     `step_type` ∈ {map, reduce, singleton}: map runs once per sample, reduce
     runs once over the union of map outputs, singleton runs once per workflow
@@ -94,7 +116,8 @@ class WorkflowStep(BaseModel):
     kind: Literal["step"]
     name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     step_type: StepType
-    container: str = Field(min_length=1, max_length=512)
+    container: str | None = Field(default=None, min_length=1, max_length=512)
+    module: str | None = Field(default=None, min_length=1, max_length=512)
     entrypoint: str | None = None
     inputs: list[str] = Field(default_factory=list)
     # Names that flow through from action_context if present, but do not
@@ -104,6 +127,19 @@ class WorkflowStep(BaseModel):
     outputs: list[str] = Field(default_factory=list)
     baseline_resources: BaselineResources
     target_status: str | None = Field(default=None, min_length=1, max_length=MAX_NAME_LENGTH)
+
+    @model_validator(mode="after")
+    def _exactly_one_runtime(self) -> WorkflowStep:
+        # Shape-only validator. Prefix validation on `module` is enforced
+        # separately (see the NATIVE_MODULE_PREFIX comment above) — keeps
+        # the schema decoupled from the orchestrator package path.
+        check_exactly_one_runtime(
+            container=self.container,
+            module=self.module,
+            entrypoint=self.entrypoint,
+            owner="WorkflowStep",
+        )
+        return self
 
 
 class WorkflowAction(BaseModel):
