@@ -77,6 +77,8 @@ async def human_admin_session(postgres_pool):
             Scope.REFERENCE_WRITE,
             Scope.BIOSAMPLE_READ,
             Scope.BIOSAMPLE_WRITE,
+            Scope.PREP_SAMPLE_READ,
+            Scope.PREP_SAMPLE_WRITE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
             Scope.ADMIN_USER,
@@ -151,6 +153,8 @@ async def wet_lab_admin_session(postgres_pool):
             Scope.REFERENCE_WRITE,
             Scope.BIOSAMPLE_READ,
             Scope.BIOSAMPLE_WRITE,
+            Scope.PREP_SAMPLE_READ,
+            Scope.PREP_SAMPLE_WRITE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
         ],
@@ -203,6 +207,7 @@ async def regular_user_session(postgres_pool):
             Scope.REFERENCE_READ,
             Scope.BIOSAMPLE_READ,
             Scope.BIOSAMPLE_WRITE,
+            Scope.PREP_SAMPLE_READ,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
         ],
@@ -264,6 +269,7 @@ async def compute_worker_service_account(postgres_pool, tmp_path_factory):
             Scope.REFERENCE_REGISTER_FILES,
             Scope.REFERENCE_READ,
             Scope.TICKET_DOGET,
+            Scope.SEQUENCE_RANGE_MINT,
         ],
     )
     token_path = tmp_path_factory.mktemp("orchestrator-token") / "token"

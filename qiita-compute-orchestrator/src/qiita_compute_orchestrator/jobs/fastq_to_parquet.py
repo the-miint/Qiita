@@ -62,7 +62,7 @@ class Inputs(BaseModel):
     """Typed input contract for fastq_to_parquet.
 
     `fastq_path` is the workflow-declared input (the action_context's
-    fastq_path flows through here). `sequenced_sample_idx` and
+    fastq_path flows through here). `prep_sample_idx` and
     `work_ticket_idx` are framework-injected scope scalars merged by
     `flatten_native_inputs`; the job records them implicitly via its
     output's location under the per-step workspace, but accepts them
@@ -71,7 +71,7 @@ class Inputs(BaseModel):
     """
 
     fastq_path: Path
-    sequenced_sample_idx: int
+    prep_sample_idx: int
     work_ticket_idx: int
 
 

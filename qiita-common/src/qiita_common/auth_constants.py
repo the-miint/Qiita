@@ -46,6 +46,13 @@ class Scope(StrEnum):
     BIOSAMPLE_READ = "biosample:read"
     BIOSAMPLE_WRITE = "biosample:write"
 
+    # Prep-sample data
+    PREP_SAMPLE_READ = "prep_sample:read"
+    PREP_SAMPLE_WRITE = "prep_sample:write"
+
+    # Sequence-range allocation (workers-only)
+    SEQUENCE_RANGE_MINT = "sequence_range:mint"
+
     # Study data
     STUDY_READ = "study:read"
     STUDY_WRITE = "study:write"

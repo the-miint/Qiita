@@ -1,19 +1,24 @@
 action_id: fastq-to-parquet
 version: 1.0.0
-target_kind: sequenced_sample
+target_kind: prep_sample
+# Sequenced-only by definition: FASTQ files are sequencing artifacts.
+# The submit route reads the prep_sample's processing_kind and 422s if
+# it's not in this list. Cross-kind admin actions leave the list empty.
+target_processing_kinds: [sequenced]
 
 description: >
   Convert a single sample's FASTQ (or FASTA) file into a Parquet of
-  reads. Schema: (read_id, sequence, quality, sequence_length,
-  sequence_hash), sorted by sequence_hash. The sequence_hash column
-  is `CAST(md5(sequence) AS UUID)`, matching the reference-side
-  convention so a future join between a sample's reads and a
-  reference's sequences can use the column natively.
+  reads. Schema: (read_id, sequence, quality, sequence_length), sorted
+  by read_id. Workspace-only artifact (no DuckLake registration yet);
+  schema and sort will pivot to include CP-minted identifier columns
+  and the CLAUDE.md "Result file requirements" sort order when
+  registration lands together with sample_reads.
 
-  Per-sample scope (target_kind: sequenced_sample) — one ticket per
-  sample, one Parquet artifact under the work_ticket's workspace. The
-  artifact is not registered into DuckLake at this stage (no
-  sample_reads table exists yet); registration is a follow-up.
+  Per-sample scope (target_kind: prep_sample, scoped at the supertype)
+  — one ticket per sample, one Parquet artifact under the work_ticket's
+  workspace. The "processing_kind = sequenced" constraint is expressed
+  declaratively via target_processing_kinds below; the route's
+  submit-time check rejects tickets pointing at non-sequenced preps.
 
 scopes: []
 

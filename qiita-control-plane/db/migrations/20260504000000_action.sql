@@ -11,7 +11,7 @@
 CREATE TYPE qiita.scope_target_kind AS ENUM (
     'study_prep',
     'reference',
-    'sequenced_sample'
+    'prep_sample'
 );
 
 
@@ -44,6 +44,16 @@ CREATE TABLE qiita.action (
     -- match the ticket's scope_target.kind at submission (route handler
     -- 422s on mismatch).
     target_kind        qiita.scope_target_kind NOT NULL,
+
+    -- When target_kind = 'prep_sample', this list of processing_kind values
+    -- declares which prep_sample subtypes the action accepts. The submit
+    -- route reads the prep_sample's actual processing_kind and 422s if it's
+    -- not in this list. Empty array = "any kind" (cross-kind admin
+    -- actions). For non-prep_sample target_kinds, the column must be empty
+    -- (enforced by action_processing_kinds_only_for_prep_sample CHECK
+    -- below). qiita.processing_kind is the same ENUM qiita.prep_sample
+    -- uses, defined in 20260501000011_prep_sample.sql.
+    target_processing_kinds  qiita.processing_kind[] NOT NULL DEFAULT '{}',
 
     description        TEXT,
 
@@ -117,6 +127,18 @@ CREATE TABLE qiita.action (
         (enabled = false
             AND disabled_at IS NOT NULL
             AND disabled_by_idx IS NOT NULL)
+    ),
+
+    -- target_processing_kinds is only meaningful when target_kind =
+    -- 'prep_sample'; for other scope kinds (reference, study_prep) the
+    -- column must be empty. Catches a YAML that declares
+    -- target_processing_kinds against a non-prep_sample target_kind —
+    -- such a declaration would silently no-op at the route layer
+    -- (which only consults the list for prep_sample-scoped submissions),
+    -- so reject it at sync time.
+    CONSTRAINT action_processing_kinds_only_for_prep_sample CHECK (
+        target_kind = 'prep_sample'
+        OR cardinality(target_processing_kinds) = 0
     )
 );
 

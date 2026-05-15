@@ -12,9 +12,9 @@
 -- globally-linked biosample metadata values terminate at
 -- biosample_global_field.default_tier (2 steps); purely study-local
 -- biosample metadata values fall through to study.default_tier (3 steps);
--- globally-linked sequenced-study metadata values terminate at
--- sequenced_sample_global_field.default_tier (2 steps); purely study-local
--- sequenced-study metadata values fall through to study.default_tier (3 steps).
+-- globally-linked prep-sample metadata values terminate at
+-- prep_sample_global_field.default_tier (2 steps); purely study-local
+-- prep-sample metadata values fall through to study.default_tier (3 steps).
 -- The read-access check is a straightforward numeric comparison on the
 -- ordering below: a user can read a value iff their effective tier on
 -- the value's reachable study is >= the value's required tier. System
@@ -104,7 +104,7 @@ CREATE TABLE qiita.study_access (
 
     -- NOTE on the absence of retirement columns: study_access rows are
     -- hard-deleted when access is revoked, not soft-retired. Unlike
-    -- biosamples, sequenced samples, etc (where a retired row remains
+    -- biosamples, prep samples, etc (where a retired row remains
     -- visible to the entity's owner and to admins and carries audit
     -- metadata), access grants have no lingering meaning once revoked:
     -- the only question the table answers is "does this principal

@@ -23,9 +23,9 @@ CREATE UNIQUE INDEX work_ticket_one_in_flight_per_study_prep
     WHERE study_idx IS NOT NULL
       AND state IN ('pending', 'queued', 'processing');
 
-CREATE UNIQUE INDEX work_ticket_one_in_flight_per_sequenced_sample
-    ON qiita.work_ticket (action_id, action_version, sequenced_sample_idx)
-    WHERE sequenced_sample_idx IS NOT NULL
+CREATE UNIQUE INDEX work_ticket_one_in_flight_per_prep_sample
+    ON qiita.work_ticket (action_id, action_version, prep_sample_idx)
+    WHERE prep_sample_idx IS NOT NULL
       AND state IN ('pending', 'queued', 'processing');
 
 
@@ -47,5 +47,5 @@ COMMENT ON COLUMN qiita.work_ticket.action_context IS
 
 DROP INDEX IF EXISTS qiita.work_ticket_one_in_flight_per_reference;
 DROP INDEX IF EXISTS qiita.work_ticket_one_in_flight_per_study_prep;
-DROP INDEX IF EXISTS qiita.work_ticket_one_in_flight_per_sequenced_sample;
+DROP INDEX IF EXISTS qiita.work_ticket_one_in_flight_per_prep_sample;
 COMMENT ON COLUMN qiita.work_ticket.action_context IS NULL;

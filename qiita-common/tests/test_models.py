@@ -238,3 +238,60 @@ def test_step_run_request_entrypoint_with_container_ok():
     kwargs["entrypoint"] = "/usr/local/bin/qiita-hash"
     req = StepRunRequest(**kwargs)
     assert req.entrypoint == "/usr/local/bin/qiita-hash"
+
+
+# ---------------------------------------------------------------------------
+# SequenceRangeMintRequest / SequenceRange
+# ---------------------------------------------------------------------------
+
+
+def test_sequence_range_mint_request_accepts_valid_input():
+    from qiita_common.models import SequenceRangeMintRequest
+
+    req = SequenceRangeMintRequest(prep_sample_idx=7, count=100)
+    assert req.prep_sample_idx == 7
+    assert req.count == 100
+
+
+@pytest.mark.parametrize("bad_count", [0, -1, -1000])
+def test_sequence_range_mint_request_rejects_nonpositive_count(bad_count):
+    from qiita_common.models import SequenceRangeMintRequest
+
+    with pytest.raises(ValidationError):
+        SequenceRangeMintRequest(prep_sample_idx=1, count=bad_count)
+
+
+@pytest.mark.parametrize("bad_idx", [0, -1])
+def test_sequence_range_mint_request_rejects_nonpositive_prep_sample_idx(bad_idx):
+    from qiita_common.models import SequenceRangeMintRequest
+
+    with pytest.raises(ValidationError):
+        SequenceRangeMintRequest(prep_sample_idx=bad_idx, count=10)
+
+
+def test_sequence_range_mint_request_rejects_extra_fields():
+    """ConfigDict(extra='forbid') so an unknown key at the API boundary
+    fails fast rather than being silently dropped."""
+    from qiita_common.models import SequenceRangeMintRequest
+
+    with pytest.raises(ValidationError):
+        SequenceRangeMintRequest.model_validate(
+            {"prep_sample_idx": 1, "count": 10, "extra": "smuggled"}
+        )
+
+
+def test_sequence_range_round_trips_through_json():
+    from qiita_common.models import SequenceRange
+
+    payload = {
+        "prep_sample_idx": 7,
+        "sequence_idx_start": 1,
+        "sequence_idx_stop": 100,
+        "created_at": "2026-05-14T12:00:00+00:00",
+    }
+    model = SequenceRange.model_validate(payload)
+    assert model.sequence_idx_start == 1
+    assert model.sequence_idx_stop == 100
+    assert model.prep_sample_idx == 7
+    # Aware datetime (qiita_common convention).
+    assert model.created_at.tzinfo is not None

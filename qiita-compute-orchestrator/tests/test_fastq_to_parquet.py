@@ -62,7 +62,7 @@ def test_execute_writes_reads_parquet_for_fastq(tmp_path):
     )
 
     outputs = _run(
-        Inputs(fastq_path=fastq, sequenced_sample_idx=1, work_ticket_idx=1),
+        Inputs(fastq_path=fastq, prep_sample_idx=1, work_ticket_idx=1),
         tmp_path / "ws",
     )
     parquet = outputs["reads"]
@@ -91,7 +91,7 @@ def test_execute_handles_fasta_with_null_quality(tmp_path):
     fasta.write_text(">r1\nACGT\n>r2\nTGCA\n")
 
     outputs = _run(
-        Inputs(fastq_path=fasta, sequenced_sample_idx=1, work_ticket_idx=1),
+        Inputs(fastq_path=fasta, prep_sample_idx=1, work_ticket_idx=1),
         tmp_path / "ws",
     )
     parquet = outputs["reads"]
@@ -115,7 +115,7 @@ def test_execute_handles_empty_input(tmp_path):
     empty.write_text("")
 
     outputs = _run(
-        Inputs(fastq_path=empty, sequenced_sample_idx=1, work_ticket_idx=1),
+        Inputs(fastq_path=empty, prep_sample_idx=1, work_ticket_idx=1),
         tmp_path / "ws",
     )
     parquet = outputs["reads"]
@@ -147,6 +147,6 @@ def test_execute_raises_file_not_found(tmp_path):
 
     with pytest.raises(FileNotFoundError, match="FASTQ file not found"):
         _run(
-            Inputs(fastq_path=missing, sequenced_sample_idx=1, work_ticket_idx=1),
+            Inputs(fastq_path=missing, prep_sample_idx=1, work_ticket_idx=1),
             tmp_path / "ws",
         )

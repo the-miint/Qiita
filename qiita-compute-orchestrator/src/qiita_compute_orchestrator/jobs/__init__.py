@@ -49,12 +49,12 @@ def _contract_violation(*, step_name: str, reason: str) -> BackendFailure:
 # A SCOPE_SCALARS_BY_KIND[kind] entry lists which scope_target keys the
 # framework flows through to native jobs under that kind. Job `Inputs`
 # models declare which they expect (e.g. fastq_to_parquet's Inputs has
-# `sequenced_sample_idx: int`); a mismatch surfaces as BAD_INPUT via the
+# `prep_sample_idx: int`); a mismatch surfaces as BAD_INPUT via the
 # Pydantic validator.
 SCOPE_SCALARS_BY_KIND: dict[str, frozenset[str]] = {
     ScopeTargetKind.REFERENCE.value: frozenset({"reference_idx"}),
     ScopeTargetKind.STUDY_PREP.value: frozenset({"study_idx", "prep_idx"}),
-    ScopeTargetKind.SEQUENCED_SAMPLE.value: frozenset({"sequenced_sample_idx"}),
+    ScopeTargetKind.PREP_SAMPLE.value: frozenset({"prep_sample_idx"}),
 }
 
 # Framework scalars that get merged into raw_inputs before
@@ -89,8 +89,8 @@ def flatten_native_inputs(
     `scope_target` is the work ticket's discriminated-union scope
     (matching `qiita_common.models.ScopeTarget`); the kind discriminator
     selects which idx scalars get merged (e.g. `reference_idx` for a
-    REFERENCE-scoped ticket, `sequenced_sample_idx` for a
-    SEQUENCED_SAMPLE-scoped one). An unknown kind surfaces as a
+    REFERENCE-scoped ticket, `prep_sample_idx` for a
+    PREP_SAMPLE-scoped one). An unknown kind surfaces as a
     CONTRACT_VIOLATION — this is the dispatcher boundary, the only
     place where scope-target shape mismatches can land.
 

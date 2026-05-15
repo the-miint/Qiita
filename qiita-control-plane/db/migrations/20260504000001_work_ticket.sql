@@ -76,36 +76,39 @@ CREATE TABLE qiita.work_ticket (
     originator_principal_idx BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
 
     -- Tagged-union scope target. Exactly one of (study_idx, prep_idx),
-    -- reference_idx, or sequenced_sample_idx is non-null, governed by
+    -- reference_idx, or prep_sample_idx is non-null, governed by
     -- scope_target_kind via the work_ticket_scope_target_consistent CHECK
     -- below. This is the column the resource-ACL gate keys off; matches
     -- the discriminated-union shape of qiita_common.models.ScopeTarget.
     --
     -- prep_idx carries no FK because there is no prep table yet; it's a
-    -- plain BIGINT. study_idx, reference_idx, and sequenced_sample_idx
-    -- all RESTRICT so a referenced row can't disappear from under an
-    -- in-flight ticket.
+    -- plain BIGINT. study_idx, reference_idx, and prep_sample_idx all
+    -- RESTRICT so a referenced row can't disappear from under an
+    -- in-flight ticket. prep_sample_idx targets the supertype
+    -- qiita.prep_sample; kind-specific actions (e.g., fastq-to-parquet
+    -- on processing_kind='sequenced') express their constraint via
+    -- qiita.action.target_processing_kinds, checked at submission.
     scope_target_kind        qiita.scope_target_kind NOT NULL,
     study_idx                BIGINT REFERENCES qiita.study(idx) ON DELETE RESTRICT,
     prep_idx                 BIGINT,
     reference_idx            BIGINT REFERENCES qiita.reference(reference_idx) ON DELETE RESTRICT,
-    sequenced_sample_idx     BIGINT REFERENCES qiita.sequenced_sample(idx) ON DELETE RESTRICT,
+    prep_sample_idx          BIGINT REFERENCES qiita.prep_sample(idx) ON DELETE RESTRICT,
 
     CONSTRAINT work_ticket_scope_target_consistent CHECK (
         (scope_target_kind = 'study_prep'
             AND study_idx IS NOT NULL
             AND prep_idx IS NOT NULL
             AND reference_idx IS NULL
-            AND sequenced_sample_idx IS NULL)
+            AND prep_sample_idx IS NULL)
         OR
         (scope_target_kind = 'reference'
             AND reference_idx IS NOT NULL
             AND study_idx IS NULL
             AND prep_idx IS NULL
-            AND sequenced_sample_idx IS NULL)
+            AND prep_sample_idx IS NULL)
         OR
-        (scope_target_kind = 'sequenced_sample'
-            AND sequenced_sample_idx IS NOT NULL
+        (scope_target_kind = 'prep_sample'
+            AND prep_sample_idx IS NOT NULL
             AND study_idx IS NULL
             AND prep_idx IS NULL
             AND reference_idx IS NULL)
@@ -188,13 +191,15 @@ COMMENT ON TABLE qiita.work_ticket IS
     'Action invocations: who requested, which resource, what action-defined '
     'context, and lifecycle state. (action_id, action_version) FK into '
     'qiita.action. Granularity is one row per action invocation, scoped at '
-    'reference, study_prep, or sequenced_sample level. Two per-sample '
-    'patterns coexist: (a) a singleton ticket scoped at one sequenced '
-    'sample (scope_target_kind = ''sequenced_sample'') for actions that '
-    'naturally operate on one sample at a time, e.g. fastq-to-parquet; '
-    '(b) a study_prep ticket whose `step:` entries fan out per sample at '
-    'execution time (e.g. map steps submitting one SLURM job per sample); '
-    'all jobs from (b) share the same work_ticket_idx.';
+    'reference, study_prep, or prep_sample level. Two per-sample patterns '
+    'coexist: (a) a singleton ticket scoped at one prep_sample '
+    '(scope_target_kind = ''prep_sample'') for actions that naturally '
+    'operate on one sample at a time, e.g. fastq-to-parquet — actions '
+    'that only apply to specific processing_kind values (e.g. '
+    '''sequenced'') express that via qiita.action.target_processing_kinds, '
+    'checked at submission; (b) a study_prep ticket whose `step:` entries '
+    'fan out per sample at execution time (e.g. map steps submitting one '
+    'SLURM job per sample); all jobs from (b) share the same work_ticket_idx.';
 
 COMMENT ON COLUMN qiita.work_ticket.failure_step_name IS
     'Free-text step name copied from action.steps[i].name when a STEP_RUN '
@@ -231,9 +236,9 @@ CREATE INDEX work_ticket_study_prep_idx
     ON qiita.work_ticket (study_idx, prep_idx)
     WHERE study_idx IS NOT NULL;
 
-CREATE INDEX work_ticket_sequenced_sample_idx
-    ON qiita.work_ticket (sequenced_sample_idx)
-    WHERE sequenced_sample_idx IS NOT NULL;
+CREATE INDEX work_ticket_prep_sample_idx
+    ON qiita.work_ticket (prep_sample_idx)
+    WHERE prep_sample_idx IS NOT NULL;
 
 CREATE TRIGGER work_ticket_set_updated_at
     BEFORE UPDATE ON qiita.work_ticket

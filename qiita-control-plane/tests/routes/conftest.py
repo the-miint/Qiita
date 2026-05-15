@@ -7,6 +7,7 @@ route test still owns its own `ctx` and `_cleanup_tracked` because the
 tracked table set differs per route.
 """
 
+import secrets
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
 
@@ -117,6 +118,48 @@ async def make_pat_client(postgres_pool, regular_user_session):
     # Close every client the factory handed out, in reverse order.
     for c in reversed(opened):
         await c.__aexit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# Shared sequencing-route fixtures and helpers
+# ---------------------------------------------------------------------------
+# Every sequencing-ingestion route gates on Scope.PREP_SAMPLE_WRITE and the
+# WET_LAB_ADMIN role, so the three test files share one PAT-client pair and
+# one instrument-run-id generator instead of redefining them per file.
+
+
+@pytest_asyncio.fixture
+async def no_prep_sample_write_client(make_pat_client):
+    """A regular_user PAT with a scope set that EXCLUDES Scope.PREP_SAMPLE_WRITE
+    so the require_scope guard's missing-scope 403 surfaces."""
+    return await make_pat_client(label="no-prep-sample-write", scopes=[Scope.SELF_PROFILE])
+
+
+@pytest_asyncio.fixture
+async def no_prep_sample_read_client(make_pat_client):
+    """A regular_user PAT with a scope set that EXCLUDES Scope.PREP_SAMPLE_READ
+    so the require_scope guard's missing-scope 403 surfaces on the
+    sequenced-sample read endpoints."""
+    return await make_pat_client(label="no-prep-sample-read", scopes=[Scope.SELF_PROFILE])
+
+
+@pytest_asyncio.fixture
+async def regular_user_with_prep_sample_write_client(make_pat_client):
+    """A regular_user PAT that *does* carry Scope.PREP_SAMPLE_WRITE so the
+    require_scope gate passes and the require_role_at_least(WET_LAB_ADMIN)
+    gate is what trips. PREP_SAMPLE_WRITE is outside the USER role ceiling
+    by policy; mint_api_token only validates against VALID_SCOPES."""
+    return await make_pat_client(
+        label="user-with-prep-sample-write",
+        scopes=[Scope.SELF_PROFILE, Scope.PREP_SAMPLE_WRITE],
+    )
+
+
+def unique_instrument_id(prefix: str) -> str:
+    """Build a per-test sequencing_run.instrument_run_id with a caller-supplied
+    prefix. Used by every test that seeds a sequencing_run so the unique
+    constraint never collides across parallel test runs."""
+    return f"{prefix}-{secrets.token_hex(6)}"
 
 
 # ---------------------------------------------------------------------------

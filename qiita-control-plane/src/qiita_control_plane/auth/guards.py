@@ -20,6 +20,7 @@ from qiita_common.auth_constants import SystemRole
 from qiita_common.models import Tier
 
 from ..deps import get_db_pool
+from ..repositories.sequencing_run import fetch_sequenced_pool, fetch_sequencing_run_exists
 from ..repositories.study import fetch_study_exists
 from ..repositories.study_access import fetch_caller_study_access
 from ..repositories.user_eligibility import fetch_user_eligibility
@@ -157,6 +158,35 @@ def require_scope(scope: str) -> Callable[..., Principal]:
     return _dep
 
 
+def require_service_with_scope(scope: str) -> Callable[..., ServiceAccount]:
+    """Factory: bundle `require_service` + a scope check into one dep,
+    with the ordering wired as a *data-flow* edge in the dep graph.
+
+    The inner `_dep` takes `Depends(require_service)` as input, so the
+    kind guard's 403 ("service accounts only") fires before the scope
+    check would ever run. This removes the implicit-ordering question
+    a route would otherwise have when listing both guards as siblings:
+
+        sa: ServiceAccount = Depends(require_service)
+        _scope: Principal = Depends(require_scope(...))
+
+    FastAPI does evaluate sibling deps in declaration order in practice,
+    but the structural form makes the kind-first ordering a property of
+    the dep graph rather than a property of FastAPI's evaluation policy.
+    """
+    scope_str = str(scope)
+
+    def _dep(sa: ServiceAccount = Depends(require_service)) -> ServiceAccount:
+        if not sa.has_scope(scope_str):
+            raise HTTPException(
+                status_code=403,
+                detail=f"missing required scope {scope_str!r}",
+            )
+        return sa
+
+    return _dep
+
+
 # ---------------------------------------------------------------------------
 # Profile completeness
 # ---------------------------------------------------------------------------
@@ -259,6 +289,52 @@ async def require_study_exists(
         raise HTTPException(
             status_code=404,
             detail=f"study {study_idx} not found",
+        )
+
+
+async def require_sequencing_run_exists(
+    sequencing_run_idx: int,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+) -> None:
+    """Existence-only guard: 404 if no qiita.sequencing_run row matches
+    the path's sequencing_run_idx. Direct mirror of require_study_exists
+    for routes that mount on a path containing {sequencing_run_idx} and
+    need a clean 404 before opening their write transaction.
+    """
+    if not await fetch_sequencing_run_exists(pool, sequencing_run_idx):
+        raise HTTPException(
+            status_code=404,
+            detail=f"sequencing_run {sequencing_run_idx} not found",
+        )
+
+
+async def require_sequenced_pool_in_run(
+    sequencing_run_idx: int,
+    sequenced_pool_idx: int,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+) -> None:
+    """Existence + parent-run consistency guard: 404 if no sequenced_pool
+    row matches the path's sequenced_pool_idx; 422 if the pool exists but
+    its sequencing_run_idx does not match the path's sequencing_run_idx.
+
+    Folded into one DB round-trip: the pool row's stored sequencing_run_idx
+    is checked directly, so a parent-run-exists pre-check is unnecessary
+    (the FK invariant guarantees the run exists if the pool's
+    sequencing_run_idx matches the path).
+    """
+    pool_row = await fetch_sequenced_pool(pool, sequenced_pool_idx)
+    if pool_row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"sequenced_pool {sequenced_pool_idx} not found",
+        )
+    if pool_row["sequencing_run_idx"] != sequencing_run_idx:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"sequenced_pool {sequenced_pool_idx} does not belong to"
+                f" sequencing_run {sequencing_run_idx}"
+            ),
         )
 
 

@@ -21,8 +21,32 @@ _DEFAULT_AUTH_HANDOFF_FRESHNESS_SECONDS = 60
 # Short TTL so an intercepted code dies within seconds.
 _DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS = 30
 
+# Hard cap on a single POST /sequence-range allocation. The bigint domain
+# is 2^63 so a runaway loop in a compute step could otherwise burn an
+# arbitrary slice of the sequence_idx space; this gives a generous
+# upper bound (10^10) while making accidental over-allocation rejected
+# at the route layer rather than absorbed silently.
+_DEFAULT_MAX_SEQUENCE_MINT_COUNT = 10_000_000_000
+
 
 _DEFAULT_CP_TO_CO_TOKEN_PATH = Path("/etc/qiita/cp-to-co.token")
+
+
+def _parse_positive_int_env(var: str, default: int) -> int:
+    """Read `var` from the environment as a positive int, or fall back to
+    `default`. Raises RuntimeError naming the variable on a non-int value
+    or on a value <= 0 — "fail loudly with context" per the project ethos.
+    """
+    raw = os.environ.get(var)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{var} must be an integer, got {raw!r}") from exc
+    if value <= 0:
+        raise RuntimeError(f"{var} must be positive, got {value}")
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +85,7 @@ class Settings:
     qiita_endpoint_url: str | None = None
     auth_handoff_freshness_seconds: int = _DEFAULT_AUTH_HANDOFF_FRESHNESS_SECONDS
     cli_login_code_ttl_seconds: int = _DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS
+    max_sequence_mint_count: int = _DEFAULT_MAX_SEQUENCE_MINT_COUNT
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -117,5 +142,9 @@ class Settings:
                     "CLI_LOGIN_CODE_TTL_SECONDS",
                     str(_DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS),
                 )
+            ),
+            max_sequence_mint_count=_parse_positive_int_env(
+                "QIITA_MAX_SEQUENCE_MINT_COUNT",
+                _DEFAULT_MAX_SEQUENCE_MINT_COUNT,
             ),
         )

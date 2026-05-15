@@ -240,7 +240,7 @@ Qiita's login flow uses AuthRocket's LoginRocket Web hosted-redirect path. The u
 Defined in `auth.scopes`. Two ceilings:
 
 - **`ROLE_IMPLIED_SCOPES`** — hierarchical, per `system_role`. Each entry is the **full** ceiling, not the increment, with `system_admin ⊇ wet_lab_admin ⊇ user`. Future readers don't have to chase inheritance to know what role X can do.
-- **`SERVICE_ACCOUNT_SCOPE_CEILING`** — flat, non-inherited. Workers don't fit the human hierarchy; admin-mint of a service-account token must spell out scopes explicitly within this set.
+- **`SERVICE_ACCOUNT_SCOPE_CEILING`** — flat, non-inherited. Workers don't fit the human hierarchy; admin-mint of a service-account token must spell out scopes explicitly within this set. Includes worker-only scopes like `feature:mint`, `ticket:doget`, and `sequence_range:mint` — these are deliberately absent from every role ceiling so a human PAT can't carry them.
 
 The hierarchical claim is enforced by a unit test (`test_role_ceilings_are_hierarchical`) that asserts `user ⊊ wet_lab_admin ⊊ system_admin` strictly. If that test ever fails, the inheritance contract is broken and downstream guards become unsound.
 

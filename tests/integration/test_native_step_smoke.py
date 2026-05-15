@@ -6,12 +6,13 @@ What's exercised:
     materialized under a tmp dir with a unique version stamp, loaded
     via qiita_control_plane.actions.load_actions, and synced into
     qiita.action — the same path `make sync-actions` uses in prod.
-  - Submission of a sequenced_sample-scoped work_ticket.
+  - Submission of a prep_sample-scoped work_ticket (the seeded
+    prep_sample has processing_kind='sequenced').
   - Runner reads the action row, walks the single step entry.
   - Runner forwards module= and scope_target= to LocalComputeBackendClient.
   - LocalBackend delegates to run_native_job.
-  - flatten_native_inputs merges sequenced_sample_idx into raw_inputs.
-  - run_native_job validates Inputs(fastq_path, sequenced_sample_idx,
+  - flatten_native_inputs merges prep_sample_idx into raw_inputs.
+  - run_native_job validates Inputs(fastq_path, prep_sample_idx,
     work_ticket_idx) and invokes the real execute().
   - DuckDB+miint reads the FASTQ fixture and writes reads.parquet.
   - Runner transitions the work_ticket to COMPLETED.
@@ -82,22 +83,19 @@ async def fastq_to_parquet_action(postgres_pool, tmp_path):
 
 
 @pytest.fixture
-async def smoke_sequenced_sample(postgres_pool, human_admin_session):
-    """A minimal qiita.sequenced_sample row to scope the smoke ticket
-    against. Seeds the full FK chain (metadata_checklist, biosample,
-    prep_protocol) so the row satisfies every NOT NULL FK constraint;
-    reverse-FK cleanup runs on yield exit."""
+async def smoke_prep_sample(postgres_pool, human_admin_session):
+    """A minimal qiita.prep_sample row (the supertype introduced by #35)
+    with processing_kind='sequenced', to scope the smoke ticket against.
+    Seeds the FK chain (biosample + prep_protocol); the sequenced_sample
+    1:1 subtype row is intentionally NOT created — fastq_to_parquet
+    never reads sequencing-specific columns. Reverse-FK cleanup runs
+    on yield exit."""
     admin_idx = human_admin_session["principal_idx"]
 
-    checklist_idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.metadata_checklist (name) VALUES ($1) RETURNING idx",
-        f"smoke-chk-{uuid.uuid4()}",
-    )
     biosample_idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.biosample (owner_idx, metadata_checklist_idx, created_by_idx)"
-        " VALUES ($1, $2, $1) RETURNING idx",
+        "INSERT INTO qiita.biosample (owner_idx, created_by_idx)"
+        " VALUES ($1, $1) RETURNING idx",
         admin_idx,
-        checklist_idx,
     )
     prep_protocol_idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.prep_protocol (name, created_by_idx)"
@@ -107,59 +105,53 @@ async def smoke_sequenced_sample(postgres_pool, human_admin_session):
         admin_idx,
     )
     idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.sequenced_sample ("
-        "  biosample_idx, owner_idx, prep_protocol_idx, metadata_checklist_idx,"
-        "  created_by_idx"
-        ") VALUES ($1, $2, $3, $4, $2) RETURNING idx",
+        "INSERT INTO qiita.prep_sample ("
+        "  biosample_idx, owner_idx, prep_protocol_idx,"
+        "  processing_kind, created_by_idx"
+        ") VALUES ($1, $2, $3, 'sequenced', $2) RETURNING idx",
         biosample_idx,
         admin_idx,
         prep_protocol_idx,
-        checklist_idx,
     )
     yield idx
     await postgres_pool.execute(
-        "DELETE FROM qiita.work_ticket WHERE sequenced_sample_idx = $1", idx
+        "DELETE FROM qiita.work_ticket WHERE prep_sample_idx = $1", idx
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.sequenced_sample WHERE idx = $1", idx
-    )
+    await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", idx)
     await postgres_pool.execute(
         "DELETE FROM qiita.prep_protocol WHERE idx = $1", prep_protocol_idx
     )
     await postgres_pool.execute(
         "DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx
     )
-    await postgres_pool.execute(
-        "DELETE FROM qiita.metadata_checklist WHERE idx = $1", checklist_idx
-    )
 
 
 async def test_fastq_to_parquet_through_runner(
     postgres_pool,
     fastq_to_parquet_action,
-    smoke_sequenced_sample,
+    smoke_prep_sample,
     human_admin_session,
     tmp_path,
 ):
-    """End-to-end: a sequenced_sample-scoped ticket runs fastq_to_parquet
-    against the checked-in FASTQ fixture and completes. The Parquet's
-    schema and a known-sequence sequence_hash are both asserted so the
-    md5 → UUID path is covered for a deterministic value."""
+    """End-to-end: a prep_sample-scoped ticket (processing_kind='sequenced')
+    runs fastq_to_parquet against the checked-in FASTQ fixture and
+    completes. Asserts the Parquet's column schema and the duplicate-
+    sequence preservation guarantee."""
     from qiita_control_plane.runner import run_workflow
 
     action_id, action_version = fastq_to_parquet_action
-    sequenced_sample_idx = smoke_sequenced_sample
+    prep_sample_idx = smoke_prep_sample
 
     work_ticket_idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.work_ticket ("
         "  action_id, action_version, originator_principal_idx,"
-        "  scope_target_kind, sequenced_sample_idx, action_context"
-        ") VALUES ($1, $2, $3, 'sequenced_sample', $4, $5::jsonb)"
+        "  scope_target_kind, prep_sample_idx, action_context"
+        ") VALUES ($1, $2, $3, 'prep_sample', $4, $5::jsonb)"
         " RETURNING work_ticket_idx",
         action_id,
         action_version,
         human_admin_session["principal_idx"],
-        sequenced_sample_idx,
+        prep_sample_idx,
         json.dumps({"fastq_path": str(FIXTURE_FASTQ)}),
     )
 

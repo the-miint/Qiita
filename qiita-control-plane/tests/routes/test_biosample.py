@@ -666,7 +666,7 @@ async def test_post_biosample_metadata_writes_global_fields(ctx):
 
 async def test_post_biosample_metadata_unknown_field_422(ctx):
     # Two metadata keys that have no matching biosample_global_field row.
-    # The route's BiosampleMetadataUnknownFieldsError handler must return
+    # The route's MetadataUnknownFieldsError handler must return
     # 422 with both unknown names listed.
     suffix = secrets.token_hex(4)
     unknown_a = f"Unknown A {suffix}"
@@ -983,7 +983,7 @@ async def test_list_biosample_idxs_owner_returns_payload(ctx):
     resp = await ctx["user"].get(f"/api/v1/study/{study_idx}/biosample/list-idxs")
     assert resp.status_code == 200, resp.text
     expected = {
-        "biosample_idxs": list(reversed(bs_idxs)),
+        "idxs": list(reversed(bs_idxs)),
         "count": 2,
         "truncated": False,
         "caller_system_role": "user",
@@ -1010,7 +1010,7 @@ async def test_list_biosample_idxs_viewer_access_returns_payload(ctx):
     resp = await ctx["user"].get(f"/api/v1/study/{study_idx}/biosample/list-idxs")
     assert resp.status_code == 200, resp.text
     expected = {
-        "biosample_idxs": [],
+        "idxs": [],
         "count": 0,
         "truncated": False,
         "caller_system_role": "user",
@@ -1035,7 +1035,7 @@ async def test_list_biosample_idxs_wet_lab_admin_bypasses_access(ctx):
     resp = await ctx["wet"].get(f"/api/v1/study/{study_idx}/biosample/list-idxs")
     assert resp.status_code == 200, resp.text
     expected = {
-        "biosample_idxs": [bs_idx],
+        "idxs": [bs_idx],
         "count": 1,
         "truncated": False,
         "caller_system_role": "wet_lab_admin",
@@ -1054,7 +1054,7 @@ async def test_list_biosample_idxs_system_admin_bypasses_access(ctx):
     resp = await ctx["admin"].get(f"/api/v1/study/{study_idx}/biosample/list-idxs")
     assert resp.status_code == 200, resp.text
     expected = {
-        "biosample_idxs": [],
+        "idxs": [],
         "count": 0,
         "truncated": False,
         "caller_system_role": "system_admin",
@@ -1089,7 +1089,7 @@ async def test_list_biosample_idxs_excludes_retired_link_and_retired_biosample(c
     resp = await ctx["user"].get(f"/api/v1/study/{study_idx}/biosample/list-idxs")
     assert resp.status_code == 200, resp.text
     expected = {
-        "biosample_idxs": [active_idx],
+        "idxs": [active_idx],
         "count": 1,
         "truncated": False,
         "caller_system_role": "user",
