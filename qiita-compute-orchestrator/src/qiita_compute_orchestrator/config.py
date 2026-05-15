@@ -20,6 +20,15 @@ from .slurm import DEFAULT_SLURMRESTD_API_VERSION
 # the pattern at /etc/qiita/orchestrator.token used elsewhere.
 DEFAULT_CP_TO_CO_TOKEN_PATH = "/etc/qiita/cp-to-co.token"
 
+# Default install location for the compute service-account PAT the
+# orchestrator presents on outbound calls to the control plane (e.g.
+# POST /api/v1/sequence-range). Distinct from CP_TO_CO_TOKEN above —
+# this is CO → CP, presented as Bearer auth on httpx requests. The
+# token belongs to the `compute-worker` service-account principal
+# whose provisioning is documented in
+# docs/runbooks/compute-service-account-provisioning.md.
+DEFAULT_CO_TO_CP_TOKEN_PATH = "/etc/qiita/co-to-cp.token"
+
 BACKEND_LOCAL = "local"
 BACKEND_SLURM = "slurm"
 
@@ -56,6 +65,14 @@ class Settings:
     # The shared bearer token CP-to-CO calls present. Loaded from a file
     # in production; env-var fallback only when QIITA_ALLOW_TOKEN_ENV=true.
     cp_to_co_token: str
+    # Control plane base URL the orchestrator hits for outbound calls
+    # (sequence-range mint, future CO→CP endpoints). Includes scheme +
+    # host + port; route paths from qiita_common.api_paths get appended.
+    cp_url: str
+    # PAT belonging to the compute-worker service-account principal,
+    # presented as Bearer auth on outbound CO→CP calls. Same file-or-env
+    # resolution pattern as cp_to_co_token.
+    co_to_cp_token: str
     # SLURM config — non-None only when backend_type=slurm.
     slurm: SlurmSettings | None = None
 
@@ -70,6 +87,8 @@ class Settings:
                 os.environ.get("TMPDIR", "/tmp") + "/qiita",
             ),
             cp_to_co_token=_resolve_cp_to_co_token(),
+            cp_url=_resolve_cp_url(),
+            co_to_cp_token=_resolve_co_to_cp_token(),
             slurm=slurm,
         )
 
@@ -125,4 +144,41 @@ def _resolve_cp_to_co_token() -> str:
         f"orchestrator: no CP↔CO token available. Either install the token at"
         f" {path} (mode 0400) or set QIITA_ALLOW_TOKEN_ENV=true and"
         f" CP_TO_CO_TOKEN for dev/CI."
+    )
+
+
+def _resolve_cp_url() -> str:
+    """The control plane base URL for outbound CO→CP calls. Defaults
+    to http://localhost:8080 for dev; production sets QIITA_CP_URL to
+    the nginx-fronted https origin (e.g. https://qiita-miint.ucsd.edu).
+    """
+    return os.environ.get("QIITA_CP_URL", "http://localhost:8080").rstrip("/")
+
+
+def _resolve_co_to_cp_token() -> str:
+    """Resolve the outbound bearer token the orchestrator presents on
+    CO→CP calls (e.g. POST /api/v1/sequence-range).
+
+    Distinct from cp_to_co_token: this is the compute service-account
+    PAT, provisioned per docs/runbooks/compute-service-account-provisioning.md.
+
+    Same file-or-env precedence as cp_to_co_token:
+      1. CO_TO_CP_TOKEN_PATH (default /etc/qiita/co-to-cp.token).
+      2. CO_TO_CP_TOKEN env var, gated on QIITA_ALLOW_TOKEN_ENV=true.
+    """
+    path = Path(os.environ.get("CO_TO_CP_TOKEN_PATH", DEFAULT_CO_TO_CP_TOKEN_PATH))
+    if path.is_file():
+        return path.read_text().strip()
+
+    if os.environ.get("QIITA_ALLOW_TOKEN_ENV", "false").lower() == "true":
+        token = os.environ.get("CO_TO_CP_TOKEN")
+        if token:
+            return token.strip()
+
+    raise RuntimeError(
+        f"orchestrator: no CO→CP token available. Either install the token at"
+        f" {path} (mode 0400) or set QIITA_ALLOW_TOKEN_ENV=true and"
+        f" CO_TO_CP_TOKEN for dev/CI. See"
+        f" docs/runbooks/compute-service-account-provisioning.md for the"
+        f" production provisioning flow."
     )
