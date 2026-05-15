@@ -44,8 +44,8 @@ Pipeline (B-staged-Parquet):
 
 DuckDB settings applied on every connection:
 
-  - `max_memory='{N}GB'`     : cap RAM so SLURM cgroups don't OOM-kill.
-  - `max_threads={N}`        : match the cgroup cpu allocation; defaults
+  - `memory_limit='{N}GB'`   : cap RAM so SLURM cgroups don't OOM-kill.
+  - `threads={N}`            : match the cgroup cpu allocation; defaults
                                try to use all host cores.
   - `preserve_insertion_order=false` : let DuckDB parallelize freely.
                                Determinism is guaranteed by the explicit
@@ -101,9 +101,12 @@ _DUCKDB_MAX_THREADS = 2
 
 def _apply_duckdb_settings(conn: duckdb.DuckDBPyConnection, duckdb_tmp: Path) -> None:
     """Apply the four standard DuckDB knobs the other dev recommended.
-    Called at the top of every connection in the pipeline."""
-    conn.execute(f"SET max_memory='{_DUCKDB_MAX_MEMORY_GB}GB'")
-    conn.execute(f"SET max_threads={_DUCKDB_MAX_THREADS}")
+    Called at the top of every connection in the pipeline. The
+    canonical setting names are `memory_limit` and `threads` —
+    `max_memory` / `max_threads` are aliases in newer DuckDB versions
+    but not the ones miint targets, so use the canonical forms."""
+    conn.execute(f"SET memory_limit='{_DUCKDB_MAX_MEMORY_GB}GB'")
+    conn.execute(f"SET threads={_DUCKDB_MAX_THREADS}")
     conn.execute("SET preserve_insertion_order=false")
     conn.execute(f"SET temp_directory='{duckdb_tmp}'")
 

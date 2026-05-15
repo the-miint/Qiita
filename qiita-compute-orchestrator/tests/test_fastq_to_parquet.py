@@ -6,15 +6,17 @@ The full-stack happy path lives in
 `tests/integration/test_native_step_smoke.py`; this file covers
 branches that path doesn't exercise:
 
+  - FASTQ with duplicate sequences (no dedup; sequence_idx still unique).
   - FASTA input (no quality scores) writes NULL into the quality column.
   - Empty input writes an empty (header-only) Parquet rather than
-    failing.
+    failing, and DOES NOT mint a range (the CP would reject count=0).
   - Missing input path raises FileNotFoundError (the framework
     dispatcher maps that to BackendFailure(BAD_INPUT) one layer up).
 
-The happy-path case round-trips a small FASTQ to verify column shape
-and duplicate-preservation under direct invocation; the smoke test
-covers the same shape via the full stack.
+mint_sequence_range is monkey-patched in every test that exercises the
+mint path so the HTTP call doesn't need a live CP. The fake returns a
+deterministic SequenceRange and records the calls; assertions verify
+the count passed in and the sequence_idx values written to the Parquet.
 
 All tests need the miint extension available — set
 MIINT_EXTENSION_REPO if your host installs from the team mirror.
@@ -27,7 +29,9 @@ import asyncio
 import duckdb
 import pytest
 
+import qiita_compute_orchestrator.jobs.fastq_to_parquet as fastq_module
 from qiita_compute_orchestrator.jobs.fastq_to_parquet import Inputs, execute
+from qiita_compute_orchestrator.sequence_range import SequenceRange
 
 
 def _run(inputs: Inputs, workspace) -> dict:
@@ -38,22 +42,41 @@ def _run(inputs: Inputs, workspace) -> dict:
 
 
 def _read_parquet(path) -> list[tuple]:
-    """Materialize reads.parquet into a list of tuples, ordered by
-    read_id so assertions don't depend on row-group iteration order
-    (the file is already sorted by read_id, but DuckDB scans in
-    physical order)."""
+    """Materialize reads.parquet into a list of tuples ordered by
+    sequence_idx (the file's natural sort)."""
     with duckdb.connect(":memory:") as conn:
         return conn.execute(
-            "SELECT read_id, sequence, quality, sequence_length"
-            f" FROM read_parquet('{path}') ORDER BY read_id"
+            "SELECT sequence_idx, read_id, sequence, quality, sequence_length"
+            f" FROM read_parquet('{path}') ORDER BY sequence_idx"
         ).fetchall()
 
 
-def test_execute_writes_reads_parquet_for_fastq(tmp_path):
+@pytest.fixture
+def fake_mint(monkeypatch):
+    """Replace mint_sequence_range with a recorder. Returns the list of
+    recorded calls; each entry is (prep_sample_idx, count). The fake
+    hands back a SequenceRange starting at 1000 (a non-zero base so the
+    "+ row_number() - 1" arithmetic is visible)."""
+    calls: list[tuple[int, int]] = []
+
+    async def _fake(*, http, prep_sample_idx, count):
+        calls.append((prep_sample_idx, count))
+        return SequenceRange(
+            prep_sample_idx=prep_sample_idx,
+            sequence_idx_start=1000,
+            sequence_idx_stop=1000 + count - 1,
+        )
+
+    monkeypatch.setattr(fastq_module, "mint_sequence_range", _fake)
+    return calls
+
+
+def test_execute_writes_reads_parquet_for_fastq(fake_mint, tmp_path):
     """Happy path under direct invocation: a 3-read FASTQ with two
     identical sequences round-trips faithfully — both duplicates appear
-    as separate rows (no dedup) and the qual1 column comes back as a
-    phred-decoded UTINYINT[]."""
+    as separate rows (no dedup), each gets a unique sequence_idx from
+    the minted range, and the qual1 column comes back as a phred-decoded
+    UTINYINT[]."""
     fastq = tmp_path / "in.fastq"
     fastq.write_text(
         "@r1\nACGT\n+\n!!!!\n"  # quality "!" * 4 → phred [0, 0, 0, 0]
@@ -62,27 +85,33 @@ def test_execute_writes_reads_parquet_for_fastq(tmp_path):
     )
 
     outputs = _run(
-        Inputs(fastq_path=fastq, prep_sample_idx=1, work_ticket_idx=1),
+        Inputs(fastq_path=fastq, prep_sample_idx=42, work_ticket_idx=1),
         tmp_path / "ws",
     )
     parquet = outputs["reads"]
     assert parquet.name == "reads.parquet"
     assert parquet.exists()
 
+    # mint was called once with the exact count.
+    assert fake_mint == [(42, 3)]
+
     rows = _read_parquet(parquet)
     assert len(rows) == 3
-    # Duplicate sequences kept, both r1 and r3 appear.
-    by_id = {r[0]: r for r in rows}
-    assert by_id["r1"][1] == "ACGT"
-    assert by_id["r3"][1] == "ACGT"
+    # sequence_idx values are contiguous, starting at the minted start (1000).
+    assert [r[0] for r in rows] == [1000, 1001, 1002]
+    # Duplicate sequences kept; sequence_idx is assigned by read_id sort
+    # so r1 (gets 1000) and r3 (gets 1002) keep their identical sequence.
+    by_read_id = {r[1]: r for r in rows}
+    assert by_read_id["r1"][2] == "ACGT"
+    assert by_read_id["r3"][2] == "ACGT"
     # Quality is UTINYINT[] (phred-decoded), not the ASCII string.
-    assert by_id["r1"][2] == [0, 0, 0, 0]
-    assert by_id["r2"][2] == [2, 2, 2, 2]
+    assert by_read_id["r1"][3] == [0, 0, 0, 0]
+    assert by_read_id["r2"][3] == [2, 2, 2, 2]
     # sequence_length is BIGINT — fixture is uniformly 4 bp.
-    assert {r[3] for r in rows} == {4}
+    assert {r[4] for r in rows} == {4}
 
 
-def test_execute_handles_fasta_with_null_quality(tmp_path):
+def test_execute_handles_fasta_with_null_quality(fake_mint, tmp_path):
     """FASTA input has no quality line — the Parquet must write NULL
     into the quality column for every row. Confirms the FASTA branch
     on miint's read_fastx and that the output's quality column is
@@ -91,42 +120,45 @@ def test_execute_handles_fasta_with_null_quality(tmp_path):
     fasta.write_text(">r1\nACGT\n>r2\nTGCA\n")
 
     outputs = _run(
-        Inputs(fastq_path=fasta, prep_sample_idx=1, work_ticket_idx=1),
+        Inputs(fastq_path=fasta, prep_sample_idx=42, work_ticket_idx=1),
         tmp_path / "ws",
     )
     parquet = outputs["reads"]
 
+    assert fake_mint == [(42, 2)]
+
     rows = _read_parquet(parquet)
     assert len(rows) == 2
+    assert [r[0] for r in rows] == [1000, 1001]
     # Every quality value is None — FASTA has no quality scores.
-    assert all(r[2] is None for r in rows)
+    assert all(r[3] is None for r in rows)
     # Sequences still round-trip.
-    by_id = {r[0]: r for r in rows}
-    assert by_id["r1"][1] == "ACGT"
-    assert by_id["r2"][1] == "TGCA"
+    by_read_id = {r[1]: r for r in rows}
+    assert by_read_id["r1"][2] == "ACGT"
+    assert by_read_id["r2"][2] == "TGCA"
 
 
-def test_execute_handles_empty_input(tmp_path):
+def test_execute_handles_empty_input(fake_mint, tmp_path):
     """An empty input file must produce an empty (header-only) Parquet
-    rather than raising. The job pre-allocates the workspace and writes
-    via DuckDB COPY; an empty `read_fastx(...)` yields zero rows and
-    the COPY still emits a valid Parquet — assert both."""
+    rather than raising, AND must skip the mint (the CP rejects count
+    <= 0 — calling it with count=0 would be both wasteful and an
+    error). Schema stays the five-column shape so downstream consumers
+    don't see a different shape for empty samples."""
     empty = tmp_path / "empty.fastq"
     empty.write_text("")
 
     outputs = _run(
-        Inputs(fastq_path=empty, prep_sample_idx=1, work_ticket_idx=1),
+        Inputs(fastq_path=empty, prep_sample_idx=42, work_ticket_idx=1),
         tmp_path / "ws",
     )
     parquet = outputs["reads"]
     assert parquet.exists()
-    # Empty file produces zero rows but a valid Parquet — DuckDB can
-    # still describe + count it.
+
+    # No mint call for an empty sample.
+    assert fake_mint == []
+
     with duckdb.connect(":memory:") as conn:
         n = conn.execute(f"SELECT count(*) FROM read_parquet('{parquet}')").fetchone()[0]
-        # Schema is still the four-column shape even with zero rows so
-        # downstream consumers don't see a different schema for empty
-        # samples.
         cols = [
             r[0]
             for r in conn.execute(
@@ -134,19 +166,19 @@ def test_execute_handles_empty_input(tmp_path):
             ).fetchall()
         ]
     assert n == 0
-    assert cols == ["read_id", "sequence", "quality", "sequence_length"]
+    assert cols == ["sequence_idx", "read_id", "sequence", "quality", "sequence_length"]
 
 
-def test_execute_raises_file_not_found(tmp_path):
+def test_execute_raises_file_not_found(fake_mint, tmp_path):
     """A missing fastq_path raises FileNotFoundError from `execute`
     itself — the framework dispatcher (run_native_job) is responsible
-    for mapping that to BackendFailure(BAD_INPUT) one layer up. Test
-    the raw raise here so the dispatcher's mapping test stays
-    independent."""
+    for mapping that to BackendFailure(BAD_INPUT) one layer up. The
+    mint is NOT called (the check fires before phase 1)."""
     missing = tmp_path / "does-not-exist.fastq"
 
     with pytest.raises(FileNotFoundError, match="FASTQ file not found"):
         _run(
-            Inputs(fastq_path=missing, prep_sample_idx=1, work_ticket_idx=1),
+            Inputs(fastq_path=missing, prep_sample_idx=42, work_ticket_idx=1),
             tmp_path / "ws",
         )
+    assert fake_mint == []
