@@ -41,6 +41,32 @@ from dataclasses import dataclass
 import httpx
 from qiita_common.api_paths import URL_SEQUENCE_RANGE_PREFIX
 
+from .config import Settings
+
+
+def make_cp_client(settings: Settings | None = None) -> httpx.AsyncClient:
+    """Build an authed AsyncClient pointed at the control plane.
+
+    The compute service-account PAT goes into the Authorization header
+    on every request. Caller is responsible for `async with`-style
+    lifetime management; one client per execute() invocation is the
+    expected pattern (cheap to construct, no connection pooling
+    benefit at our call rate).
+
+    `settings` is injectable for tests; production code passes nothing
+    and Settings.from_env() runs.
+    """
+    if settings is None:
+        settings = Settings.from_env()
+    return httpx.AsyncClient(
+        base_url=settings.cp_url,
+        headers={"Authorization": f"Bearer {settings.co_to_cp_token}"},
+        # 30s caters to a slow nextval/setval/INSERT under contention;
+        # the CP route is bounded by the advisory lock + a few ms of
+        # plpgsql, so a longer timeout would only mask infra issues.
+        timeout=httpx.Timeout(30.0),
+    )
+
 
 @dataclass(frozen=True, slots=True)
 class SequenceRange:

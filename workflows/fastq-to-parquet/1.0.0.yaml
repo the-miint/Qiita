@@ -8,17 +8,27 @@ target_processing_kinds: [sequenced]
 
 description: >
   Convert a single sample's FASTQ (or FASTA) file into a Parquet of
-  reads. Schema: (read_id, sequence, quality, sequence_length), sorted
-  by read_id. Workspace-only artifact (no DuckLake registration yet);
-  schema and sort will pivot to include CP-minted identifier columns
-  and the CLAUDE.md "Result file requirements" sort order when
-  registration lands together with sample_reads.
+  reads, keyed by a CP-minted sequence_idx. The orchestrator counts
+  the reads, POSTs to /api/v1/sequence-range (PR #36's allocator) for
+  a contiguous bigint range against this prep_sample, and writes the
+  final Parquet with sequence_idx as the first column.
+
+  Schema: (sequence_idx, read_id, sequence, quality, sequence_length),
+  sorted by sequence_idx. Workspace-only artifact (no DuckLake
+  registration yet); registration adds the rest of the CLAUDE.md
+  identifier-column hierarchy when sample_reads lands data-plane-side.
 
   Per-sample scope (target_kind: prep_sample, scoped at the supertype)
   — one ticket per sample, one Parquet artifact under the work_ticket's
   workspace. The "processing_kind = sequenced" constraint is expressed
   declaratively via target_processing_kinds below; the route's
   submit-time check rejects tickets pointing at non-sequenced preps.
+
+  The orchestrator authenticates to the CP using the compute
+  service-account PAT (Settings.co_to_cp_token, provisioned per
+  docs/runbooks/compute-service-account-provisioning.md); the
+  submitter does NOT need sequence_range:mint scope on their own
+  token.
 
 scopes: []
 
