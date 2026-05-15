@@ -132,15 +132,49 @@ async def test_fastq_to_parquet_through_runner(
     smoke_prep_sample,
     human_admin_session,
     tmp_path,
+    monkeypatch,
 ):
     """End-to-end: a prep_sample-scoped ticket (processing_kind='sequenced')
     runs fastq_to_parquet against the checked-in FASTQ fixture and
-    completes. Asserts the Parquet's column schema and the duplicate-
-    sequence preservation guarantee."""
+    completes. Asserts the Parquet's column schema, the duplicate-
+    sequence preservation guarantee, and the CP-minted sequence_idx
+    values.
+
+    The mint helper is monkey-patched to bypass HTTP and call
+    qiita.mint_sequence_range() directly via the postgres_pool. The
+    HTTP path is exercised by the orchestrator's isolated unit tests
+    (tests/test_sequence_range.py); spinning up the CP app in-process
+    here would add infrastructure for one assertion that the unit
+    tests already cover."""
+    from qiita_compute_orchestrator.jobs import fastq_to_parquet as fastq_module
+    from qiita_compute_orchestrator.sequence_range import SequenceRange
     from qiita_control_plane.runner import run_workflow
 
     action_id, action_version = fastq_to_parquet_action
     prep_sample_idx = smoke_prep_sample
+    admin_idx = human_admin_session["principal_idx"]
+
+    # In-process replacement for mint_sequence_range that calls the CP's
+    # mint function directly through the existing postgres_pool. The
+    # real signature is `(http, prep_sample_idx, count) -> SequenceRange`;
+    # the fake ignores http (no client is constructed at all).
+    mint_calls: list[tuple[int, int]] = []
+
+    async def _local_mint(*, http, prep_sample_idx, count):
+        mint_calls.append((prep_sample_idx, count))
+        row = await postgres_pool.fetchrow(
+            "SELECT * FROM qiita.mint_sequence_range($1, $2, $3)",
+            prep_sample_idx,
+            count,
+            admin_idx,
+        )
+        return SequenceRange(
+            prep_sample_idx=row["prep_sample_idx"],
+            sequence_idx_start=row["sequence_idx_start"],
+            sequence_idx_stop=row["sequence_idx_stop"],
+        )
+
+    monkeypatch.setattr(fastq_module, "mint_sequence_range", _local_mint)
 
     work_ticket_idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.work_ticket ("
@@ -186,6 +220,19 @@ async def test_fastq_to_parquet_through_runner(
     )
     assert reads_parquet.exists(), f"expected reads.parquet at {reads_parquet}"
 
+    # Mint helper called exactly once with the fixture's read count.
+    assert mint_calls == [(prep_sample_idx, 4)]
+
+    # The minted range is persisted on the CP side too.
+    range_row = await postgres_pool.fetchrow(
+        "SELECT sequence_idx_start, sequence_idx_stop "
+        "FROM qiita.sequence_range WHERE prep_sample_idx = $1",
+        prep_sample_idx,
+    )
+    assert range_row is not None
+    first_idx = range_row["sequence_idx_start"]
+    assert range_row["sequence_idx_stop"] == first_idx + 3  # count=4, inclusive
+
     # Verify the Parquet's schema and content.
     with duckdb.connect(":memory:") as conn:
         rows = conn.execute(
@@ -193,12 +240,11 @@ async def test_fastq_to_parquet_through_runner(
             f" DESCRIBE SELECT * FROM '{reads_parquet}')"
         ).fetchall()
         # DuckDB DESCRIBE column order matches the Parquet's physical order.
-        # `quality` is miint's native UTINYINT[] (phred-decoded scores), not
-        # the FASTQ ASCII string — see fastq_to_parquet.py module docstring.
-        # Schema is deliberately pre-DuckLake: no CP-minted identifier
-        # columns, no content hash. When sample_reads registration lands
-        # the schema and sort change together.
+        # sequence_idx is the CP-minted join key; read_id stays as a
+        # label. `quality` is miint's native UTINYINT[] (phred-decoded
+        # scores).
         assert rows == [
+            ("sequence_idx", "BIGINT"),
             ("read_id", "VARCHAR"),
             ("sequence", "VARCHAR"),
             ("quality", "UTINYINT[]"),
@@ -209,23 +255,28 @@ async def test_fastq_to_parquet_through_runner(
         # when sequences match (read_001 and read_003 carry the same
         # sequence; both appear).
         records = conn.execute(
-            "SELECT read_id, sequence, quality, sequence_length"
-            f" FROM '{reads_parquet}' ORDER BY read_id"
+            "SELECT sequence_idx, read_id, sequence, quality, sequence_length"
+            f" FROM '{reads_parquet}' ORDER BY sequence_idx"
         ).fetchall()
     assert len(records) == 4
 
-    by_read_id = {r[0]: r for r in records}
+    # sequence_idx values are exactly the contiguous minted range.
+    assert [r[0] for r in records] == [first_idx + i for i in range(4)]
+
+    by_read_id = {r[1]: r for r in records}
     # read_001 and read_003 share the sequence ACGTACGTACGTACGTACGT —
     # confirms duplicates are preserved (this is a sample-side ingest,
-    # not a reference-side dedup).
-    assert by_read_id["read_001"][1] == "ACGTACGTACGTACGTACGT"
-    assert by_read_id["read_003"][1] == "ACGTACGTACGTACGTACGT"
+    # not a reference-side dedup). Both still get distinct sequence_idx
+    # values from the minted range.
+    assert by_read_id["read_001"][2] == "ACGTACGTACGTACGTACGT"
+    assert by_read_id["read_003"][2] == "ACGTACGTACGTACGTACGT"
+    assert by_read_id["read_001"][0] != by_read_id["read_003"][0]
     # All sequence_lengths are 20 (each read in the fixture is 20 bp).
-    assert {r[3] for r in records} == {20}
+    assert {r[4] for r in records} == {20}
 
     # Quality bytes round-trip from the FASTQ — read_001's quality is
     # twenty `!` characters (ASCII 33), and miint returns phred-decoded
     # scores so each entry is 33 - 33 = 0. Confirms the FASTA-vs-FASTQ
     # branch on read_fastx populates the qual1 column for FASTQ inputs
     # and that the decoding offset is applied.
-    assert by_read_id["read_001"][2] == [0] * 20
+    assert by_read_id["read_001"][3] == [0] * 20
