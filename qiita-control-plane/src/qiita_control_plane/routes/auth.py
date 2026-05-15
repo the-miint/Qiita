@@ -75,22 +75,9 @@ from ..auth.scopes import (
     validate_scopes_against_ceiling,
 )
 from ..auth.token import mint_api_token
-from ..config import Settings
-from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
+from ..deps import TxConnFactory, get_db_pool, get_settings, get_tx_conn_factory
 
 router = APIRouter(prefix="/auth", tags=["auth"])
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _get_settings(request: Request) -> Settings:
-    settings = getattr(request.app.state, "settings", None)
-    if settings is None:
-        raise RuntimeError("Settings not initialised — lifespan may not have run")
-    return settings
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +139,7 @@ async def mint_pat(
     connection briefly; a transaction opens only around the mint +
     audit pair so 4xx paths return without an empty commit.
     """
-    settings = _get_settings(request)
+    settings = get_settings(request)
     verifier = get_oidc_verifier(request)
 
     auth = request.headers.get("Authorization", "")
@@ -397,7 +384,7 @@ async def begin_login(
     SameSite=Lax. SameSite=Strict would break the AuthRocket-driven
     cross-origin redirect back to /auth/handoff.
     """
-    settings = _get_settings(request)
+    settings = get_settings(request)
     if not settings.authrocket_loginrocket_url:
         raise HTTPException(
             status_code=503,
@@ -495,7 +482,7 @@ async def handoff(
     - **Browser flow** (no `cli`): render an HTML page displaying the PAT
       plaintext for the user to copy into `~/.qiita/token`.
     """
-    settings = _get_settings(request)
+    settings = get_settings(request)
     verifier = get_oidc_verifier(request)
 
     cookie = request.cookies.get(LOGIN_COOKIE_NAME)

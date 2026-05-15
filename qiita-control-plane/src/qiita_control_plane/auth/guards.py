@@ -158,6 +158,35 @@ def require_scope(scope: str) -> Callable[..., Principal]:
     return _dep
 
 
+def require_service_with_scope(scope: str) -> Callable[..., ServiceAccount]:
+    """Factory: bundle `require_service` + a scope check into one dep,
+    with the ordering wired as a *data-flow* edge in the dep graph.
+
+    The inner `_dep` takes `Depends(require_service)` as input, so the
+    kind guard's 403 ("service accounts only") fires before the scope
+    check would ever run. This removes the implicit-ordering question
+    a route would otherwise have when listing both guards as siblings:
+
+        sa: ServiceAccount = Depends(require_service)
+        _scope: Principal = Depends(require_scope(...))
+
+    FastAPI does evaluate sibling deps in declaration order in practice,
+    but the structural form makes the kind-first ordering a property of
+    the dep graph rather than a property of FastAPI's evaluation policy.
+    """
+    scope_str = str(scope)
+
+    def _dep(sa: ServiceAccount = Depends(require_service)) -> ServiceAccount:
+        if not sa.has_scope(scope_str):
+            raise HTTPException(
+                status_code=403,
+                detail=f"missing required scope {scope_str!r}",
+            )
+        return sa
+
+    return _dep
+
+
 # ---------------------------------------------------------------------------
 # Profile completeness
 # ---------------------------------------------------------------------------

@@ -78,6 +78,7 @@ SERVICE_ACCOUNT_SCOPE_CEILING: frozenset[Scope] = frozenset(
         Scope.REFERENCE_REGISTER_FILES,
         Scope.REFERENCE_READ,
         Scope.TICKET_DOGET,
+        Scope.SEQUENCE_RANGE_MINT,
     }
 )
 

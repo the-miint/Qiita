@@ -1021,3 +1021,38 @@ class SequencedSamplePatchRequest(PatchRequestModel):
     ena_run_accession: str | None = Field(default=None, max_length=50)
     last_submission_at: AwareDatetime | None = None
     submission_error: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Sequence-range allocator
+# ---------------------------------------------------------------------------
+
+
+class SequenceRangeMintRequest(BaseModel):
+    """Body for POST /api/v1/sequence-range.
+
+    Allocates `count` contiguous sequence_idx values for `prep_sample_idx`.
+    Both fields are positive integers; the route layer additionally
+    enforces `count <= Settings.max_sequence_mint_count`. Service-account
+    callers with `sequence_range:mint` only — humans never mint.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    count: Annotated[int, Field(gt=0)]
+
+
+class SequenceRange(BaseModel):
+    """Returned by POST /api/v1/sequence-range (201) and
+    GET /api/v1/sequence-range/{prep_sample_idx} (200).
+
+    The pair (sequence_idx_start, sequence_idx_stop) is inclusive on
+    both ends — `stop - start + 1` is the count of sequence_idx values
+    reserved for raw reads belonging to this prep_sample.
+    """
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    sequence_idx_start: Annotated[int, Field(gt=0)]
+    sequence_idx_stop: Annotated[int, Field(gt=0)]
+    created_at: AwareDatetime

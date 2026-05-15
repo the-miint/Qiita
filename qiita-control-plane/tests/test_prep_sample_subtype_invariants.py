@@ -1,13 +1,25 @@
 """Tests for the disjoint-subtype contract on prep_sample.
 
-Each value in qiita.processing_kind must map to exactly one subtype
-table. Each subtype table must FK to qiita.prep_sample via the composite
-(prep_sample_idx, processing_kind) key, must carry a processing_kind
-column pinned to a literal via GENERATED ALWAYS AS STORED, must have
-UNIQUE (prep_sample_idx) for 1:1 cardinality, and must have NOT NULL on
-prep_sample_idx. Catches regressions where a new subtype is added with
-a single-column FK or with a non-pinned processing_kind, either of
-which would silently break the disjointness guarantee.
+Two related but distinct contracts are enforced here:
+
+1. **Subtype coverage** (`EXPECTED_SUBTYPE_BY_KIND`): every value in
+   `qiita.processing_kind` must map to exactly one subtype table that
+   *is* the downstream specialization of prep_sample for that kind.
+   Catches regressions where a new enum value is added without its
+   subtype table, or a subtype table without its enum value.
+
+2. **Composite-FK + GENERATED contract** (`KIND_PINNED_TABLES`): every
+   table that attaches to prep_sample by kind — whether *the* subtype
+   for that kind (e.g., `sequenced_sample`) or an auxiliary kind-pinned
+   table (e.g., `sequence_range`, which carries the per-prep_sample
+   sequence_idx allocation only for sequenced preps) — must FK to
+   `qiita.prep_sample` via the composite (prep_sample_idx,
+   processing_kind) key, must carry a `processing_kind` column pinned
+   to a literal via GENERATED ALWAYS AS STORED, must have UNIQUE
+   (prep_sample_idx) for 1:1 cardinality, and must have NOT NULL on
+   prep_sample_idx. Catches regressions where one of these tables is
+   added with a single-column FK or a non-pinned processing_kind,
+   either of which would silently break the disjointness guarantee.
 """
 
 import pytest
@@ -15,13 +27,26 @@ import pytest
 pytestmark = pytest.mark.db
 
 
-# Map of qiita.processing_kind enum value -> subtype table name. Adding a
-# new subtype: extend the qiita.processing_kind enum, create the subtype
-# table following the composite-FK + GENERATED ALWAYS AS pattern, and add
-# its (enum value, table name) pair here. The tests below then enforce
-# the disjoint-subtype contract on every entry.
+# Map of qiita.processing_kind enum value -> subtype table name. Adding
+# a new subtype: extend the qiita.processing_kind enum, create the
+# subtype table following the composite-FK + GENERATED ALWAYS AS
+# pattern, and add its (enum value, table name) pair here AND to
+# KIND_PINNED_TABLES below. The enum-coverage test enforces this is
+# bijective with the live Postgres enum.
 EXPECTED_SUBTYPE_BY_KIND = {
     "sequenced": "sequenced_sample",
+}
+
+
+# All tables that attach to prep_sample by kind via the composite-FK +
+# GENERATED ALWAYS AS pattern. Includes the subtype tables proper plus
+# auxiliary kind-pinned tables (e.g., sequence_range pins to
+# 'sequenced' but is not *the* subtype — that role belongs to
+# sequenced_sample). Adding a new such table: append it here, and the
+# per-table contract tests pick it up automatically.
+KIND_PINNED_TABLES = {
+    "sequenced_sample": "sequenced",
+    "sequence_range": "sequenced",
 }
 
 
@@ -80,7 +105,7 @@ async def test_prep_sample_has_composite_unique_target(postgres_pool):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("table", list(EXPECTED_SUBTYPE_BY_KIND.values()))
+@pytest.mark.parametrize("table", list(KIND_PINNED_TABLES))
 async def test_subtype_has_composite_fk_to_prep_sample(postgres_pool, table):
     # A single-column FK to prep_sample(idx) would silently let this row
     # attach to a parent whose processing_kind doesn't match. The FK must
@@ -117,8 +142,8 @@ async def test_subtype_has_composite_fk_to_prep_sample(postgres_pool, table):
 
 
 @pytest.mark.parametrize(
-    "kind,table",
-    list(EXPECTED_SUBTYPE_BY_KIND.items()),
+    "table,kind",
+    list(KIND_PINNED_TABLES.items()),
 )
 async def test_subtype_processing_kind_is_generated_literal(postgres_pool, kind, table):
     # Without GENERATED ALWAYS AS pinning the kind to a literal, a caller
@@ -155,7 +180,7 @@ async def test_subtype_processing_kind_is_generated_literal(postgres_pool, kind,
     )
 
 
-@pytest.mark.parametrize("table", list(EXPECTED_SUBTYPE_BY_KIND.values()))
+@pytest.mark.parametrize("table", list(KIND_PINNED_TABLES))
 async def test_subtype_has_unique_prep_sample_idx(postgres_pool, table):
     # 1:1 cardinality — at most one subtype row per prep_sample.
     rows = await postgres_pool.fetch(
@@ -177,7 +202,7 @@ async def test_subtype_has_unique_prep_sample_idx(postgres_pool, table):
     )
 
 
-@pytest.mark.parametrize("table", list(EXPECTED_SUBTYPE_BY_KIND.values()))
+@pytest.mark.parametrize("table", list(KIND_PINNED_TABLES))
 async def test_subtype_prep_sample_idx_not_null(postgres_pool, table):
     # No orphan subtype rows — every subtype row must reference some
     # prep_sample, even though the FK alone would not enforce non-null.

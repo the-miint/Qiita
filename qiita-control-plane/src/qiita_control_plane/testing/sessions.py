@@ -269,6 +269,7 @@ async def compute_worker_service_account(postgres_pool, tmp_path_factory):
             Scope.REFERENCE_REGISTER_FILES,
             Scope.REFERENCE_READ,
             Scope.TICKET_DOGET,
+            Scope.SEQUENCE_RANGE_MINT,
         ],
     )
     token_path = tmp_path_factory.mktemp("orchestrator-token") / "token"
