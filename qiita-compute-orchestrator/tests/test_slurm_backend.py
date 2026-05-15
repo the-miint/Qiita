@@ -176,6 +176,61 @@ async def test_run_step_requires_baseline_resources(jwt_path, tmp_path):
     assert "baseline_resources" in ei.value.reason
 
 
+@pytest.mark.asyncio
+async def test_run_step_container_rejects_non_reference_scope(jwt_path, baseline, tmp_path):
+    """Mirror of LocalBackend's container-path scope gate (S4):
+    SlurmBackend container steps assume reference_idx is on the
+    scope_target. A prep_sample-scoped or study_prep-scoped ticket
+    dispatched to a container step would silently produce wrong
+    params.json; the gate 422s at submit time instead."""
+    handler = httpx.MockTransport(lambda req: httpx.Response(500))
+    backend = _make_backend(handler, jwt_path)
+    with pytest.raises(BackendFailure) as ei:
+        await backend.run_step(
+            "hash",
+            {},
+            tmp_path,
+            scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+            work_ticket_idx=99,
+            container="qiita/hash:1.0.0",
+            entrypoint=None,
+            baseline_resources=baseline,
+        )
+    assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
+    assert "requires a reference-scoped ticket" in ei.value.reason
+    assert "prep_sample" in ei.value.reason
+
+
+@pytest.mark.asyncio
+async def test_run_step_native_accepts_non_reference_scope(jwt_path, baseline, tmp_path):
+    """The S4 container-path gate must NOT fire for native steps —
+    they thread scope_target through flatten_native_inputs and can
+    target any scope kind. Verify by submitting a module step with a
+    prep_sample scope; the run gets past the gate and proceeds to the
+    slurmrestd submission (which we let fail downstream — we just
+    need to confirm the gate didn't catch it)."""
+    transport = httpx.MockTransport(
+        lambda req: httpx.Response(500, content=b"slurmrestd unreachable")
+    )
+    backend = _make_backend(transport, jwt_path)
+    with pytest.raises(BackendFailure) as ei:
+        await backend.run_step(
+            "fastq",
+            {},
+            tmp_path,
+            scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+            work_ticket_idx=99,
+            module="qiita_compute_orchestrator.jobs.fastq_to_parquet",
+            entrypoint=None,
+            baseline_resources=baseline,
+        )
+    # Past the container-path gate; failure here is from slurmrestd
+    # mock returning 500, NOT from a scope-kind contract violation.
+    # The kind would be a SLURMRESTD_UNREACHABLE-style failure, not
+    # CONTRACT_VIOLATION with a "reference-scoped" reason.
+    assert "requires a reference-scoped ticket" not in (ei.value.reason or "")
+
+
 # ============================================================================
 # Happy path
 # ============================================================================

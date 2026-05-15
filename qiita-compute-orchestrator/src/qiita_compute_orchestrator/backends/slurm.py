@@ -23,7 +23,7 @@ from pathlib import Path
 
 from qiita_common.actions import BaselineResources
 from qiita_common.backend_failure import BackendFailure, FailureKind
-from qiita_common.models import StepBaselineResources, WorkTicketFailureStage
+from qiita_common.models import ScopeTargetKind, StepBaselineResources, WorkTicketFailureStage
 
 from ..backend import ComputeBackend
 from ..slurm import (
@@ -126,6 +126,26 @@ class SlurmBackend(ComputeBackend):
                 stage=WorkTicketFailureStage.STEP_RUN,
                 step_name=name,
                 reason="SlurmBackend requires `baseline_resources` from the YAML step",
+            )
+
+        # Container-path scope-kind gate, mirrors LocalBackend's check at
+        # backends/local.py: today's container steps (hash, load) all
+        # extract reference_idx from scope_target, so a non-reference
+        # scope would either KeyError reading params.json inside the
+        # container or silently produce garbage. Surface as
+        # CONTRACT_VIOLATION at submit time instead. Native steps
+        # (`module is not None`) flow scope_target through
+        # flatten_native_inputs and can target any scope kind, so they
+        # bypass this gate.
+        if container is not None and scope_target.get("kind") != ScopeTargetKind.REFERENCE.value:
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=name,
+                reason=(
+                    f"container step {name!r} requires a reference-scoped ticket; "
+                    f"got scope_target.kind={scope_target.get('kind')!r}"
+                ),
             )
 
         # Lay out the workspace tree the container reads/writes:
