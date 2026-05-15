@@ -41,7 +41,7 @@ from dataclasses import dataclass
 import httpx
 from qiita_common.api_paths import URL_SEQUENCE_RANGE_PREFIX
 
-from .config import Settings
+from .config import Settings, get_settings
 
 
 def make_cp_client(settings: Settings | None = None) -> httpx.AsyncClient:
@@ -54,10 +54,13 @@ def make_cp_client(settings: Settings | None = None) -> httpx.AsyncClient:
     benefit at our call rate).
 
     `settings` is injectable for tests; production code passes nothing
-    and Settings.from_env() runs.
+    and get_settings() (config.py) resolves either the lifespan-installed
+    cached value (orchestrator service) or a fresh Settings.from_env()
+    (SLURM launcher / CLI). See config.py module header for the
+    asymmetric resolution rationale.
     """
     if settings is None:
-        settings = Settings.from_env()
+        settings = get_settings()
     return httpx.AsyncClient(
         base_url=settings.cp_url,
         headers={"Authorization": f"Bearer {settings.co_to_cp_token}"},

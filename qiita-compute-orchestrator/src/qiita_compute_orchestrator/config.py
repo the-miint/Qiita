@@ -1,15 +1,31 @@
 """Compute orchestrator configuration.
 
-The orchestrator is a passive HTTP service: it accepts `POST /step/run`
-from the control-plane runner, dispatches to its ComputeBackend, and
-returns the outputs. It has no outbound calls in v1, so there is no
-credential for talking _to_ the control plane — only the inbound bearer
-token used to authenticate CP-originated requests.
+The orchestrator is mostly a passive HTTP service: it accepts
+`POST /step/run` from the control-plane runner, dispatches to its
+ComputeBackend, and returns the outputs. As of PR #36 it also makes a
+single class of outbound call -- POST /api/v1/sequence-range -- so
+two credentials live here: the inbound shared bearer (cp_to_co_token)
+and the outbound compute service-account PAT (co_to_cp_token).
+
+Settings access pattern (asymmetric):
+
+  - Orchestrator FastAPI service: lifespan handler calls Settings.from_env()
+    and install_settings(...) so misconfig (missing token, missing env)
+    fails the boot. Every subsequent get_settings() call returns the
+    cached value with no I/O.
+
+  - SLURM launcher (`python -m qiita_compute_orchestrator.jobs`) and any
+    CLI invocation: do NOT call install_settings. get_settings() falls
+    back to Settings.from_env() on first call, so jobs that don't reach
+    for the CP (e.g., a future native step that only reads from disk)
+    never resolve credentials. Jobs that DO reach for CP fail per-step
+    if env is missing — same surface as any other per-job dependency.
 """
 
 from __future__ import annotations
 
 import os
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -182,3 +198,45 @@ def _resolve_co_to_cp_token() -> str:
         f" docs/runbooks/compute-service-account-provisioning.md for the"
         f" production provisioning flow."
     )
+
+
+# ContextVar-backed install/get to drive the asymmetric pattern
+# documented in the module header. Default = None means "not installed
+# yet"; get_settings() then falls back to Settings.from_env() so the
+# SLURM launcher / CLI paths work without an explicit install step.
+_settings_ctx: ContextVar[Settings | None] = ContextVar("qiita_co_settings", default=None)
+
+
+def install_settings(settings: Settings) -> None:
+    """Cache a Settings instance for subsequent get_settings() calls.
+
+    The FastAPI lifespan handler calls this at boot so misconfig
+    (missing CO_TO_CP_TOKEN, unreadable token file, etc.) surfaces as
+    a boot-time RuntimeError before any work_ticket can be accepted.
+
+    The SLURM launcher does NOT call this — its main() runs once per
+    job, and we want jobs that don't reach for the CP to skip the
+    Settings resolution entirely. Same applies to ad-hoc CLI
+    invocations for debugging.
+
+    Tests use this to inject a fake Settings; production code only
+    calls it from the lifespan handler.
+    """
+    _settings_ctx.set(settings)
+
+
+def get_settings() -> Settings:
+    """Return the installed Settings, or resolve fresh from env if no
+    install has happened yet.
+
+    Service path: lifespan called install_settings at boot, get_settings
+    returns the cached value with no I/O.
+
+    Launcher / CLI path: install_settings was never called, get_settings
+    calls Settings.from_env() lazily. Jobs that never invoke this don't
+    pay the token-resolution cost.
+    """
+    s = _settings_ctx.get()
+    if s is not None:
+        return s
+    return Settings.from_env()
