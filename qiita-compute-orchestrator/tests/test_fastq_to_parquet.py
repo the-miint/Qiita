@@ -182,3 +182,128 @@ def test_execute_raises_file_not_found(fake_mint, tmp_path):
             tmp_path / "ws",
         )
     assert fake_mint == []
+
+
+# --- Mint-side failure mapping (S1-B) -------------------------------------
+#
+# The mint helper raises typed Python exceptions; the framework dispatcher
+# only wraps NotImplementedError / FileNotFoundError / ValueError. So
+# execute() itself maps the mint exceptions to typed BackendFailures.
+# These tests inject a mint that raises and assert the right
+# (kind, step_name, reason) on the resulting BackendFailure.
+
+
+def _make_failing_mint(monkeypatch, exc):
+    """Patch mint_sequence_range with a function that raises `exc`."""
+
+    async def _raise(*, http, prep_sample_idx, count):
+        raise exc
+
+    monkeypatch.setattr(fastq_module, "mint_sequence_range", _raise)
+
+
+def _minimal_fastq(tmp_path):
+    """A single-read FASTQ — enough to drive phase 1+2 to a non-zero
+    count so phase 3 actually runs."""
+    fastq = tmp_path / "in.fastq"
+    fastq.write_text("@r1\nACGT\n+\n!!!!\n")
+    return fastq
+
+
+def test_execute_maps_already_exists_to_unknown_permanent(monkeypatch, tmp_path):
+    """SequenceRangeAlreadyExists (CP 409, mid-step failure left a
+    range on a previous attempt) -> BackendFailure(UNKNOWN_PERMANENT)
+    with step_name='fastq' and a reason that points operators at the
+    recovery (DELETE prep_sample + resubmit)."""
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+    from qiita_common.models import WorkTicketFailureStage
+
+    from qiita_compute_orchestrator.sequence_range import SequenceRangeAlreadyExists
+
+    _make_failing_mint(monkeypatch, SequenceRangeAlreadyExists(42, 1))
+
+    with pytest.raises(BackendFailure) as ei:
+        _run(
+            Inputs(fastq_path=_minimal_fastq(tmp_path), prep_sample_idx=42, work_ticket_idx=1),
+            tmp_path / "ws",
+        )
+
+    assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
+    assert ei.value.stage is WorkTicketFailureStage.STEP_RUN
+    assert ei.value.step_name == "fastq"
+    assert "already has a sequence_range" in ei.value.reason
+    # Recovery hint is in the exception's str — the operator needs it.
+    assert "deleting the prep_sample" in ei.value.reason
+
+
+def test_execute_maps_not_eligible_to_bad_input(monkeypatch, tmp_path):
+    """PrepSampleNotEligibleForSequenceRange (CP 404, prep_sample
+    deleted between submission and step execution) -> BAD_INPUT."""
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+
+    from qiita_compute_orchestrator.sequence_range import (
+        PrepSampleNotEligibleForSequenceRange,
+    )
+
+    _make_failing_mint(monkeypatch, PrepSampleNotEligibleForSequenceRange(42))
+
+    with pytest.raises(BackendFailure) as ei:
+        _run(
+            Inputs(fastq_path=_minimal_fastq(tmp_path), prep_sample_idx=42, work_ticket_idx=1),
+            tmp_path / "ws",
+        )
+
+    assert ei.value.kind is FailureKind.BAD_INPUT
+    assert ei.value.step_name == "fastq"
+    assert "not found or not eligible" in ei.value.reason
+
+
+def test_execute_maps_401_to_contract_violation(monkeypatch, tmp_path):
+    """HTTP 401 from CP (bad/missing SA PAT) -> CONTRACT_VIOLATION
+    with a reason that points at the SA-provisioning runbook."""
+    import httpx
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+
+    err = httpx.HTTPStatusError(
+        "Unauthorized",
+        request=httpx.Request("POST", "http://cp.test/api/v1/sequence-range"),
+        response=httpx.Response(401),
+    )
+    _make_failing_mint(monkeypatch, err)
+
+    with pytest.raises(BackendFailure) as ei:
+        _run(
+            Inputs(fastq_path=_minimal_fastq(tmp_path), prep_sample_idx=42, work_ticket_idx=1),
+            tmp_path / "ws",
+        )
+
+    assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
+    assert ei.value.step_name == "fastq"
+    assert "HTTP 401" in ei.value.reason
+    # The reason points operators at the runbook.
+    assert "compute-service-account-provisioning" in ei.value.reason
+
+
+def test_execute_maps_5xx_to_unknown_permanent(monkeypatch, tmp_path):
+    """HTTP 5xx from CP (CP DB error, infra blip) -> UNKNOWN_PERMANENT.
+    Conservative today; a follow-up could add a retriable
+    CP_UNREACHABLE FailureKind."""
+    import httpx
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+
+    err = httpx.HTTPStatusError(
+        "Internal Server Error",
+        request=httpx.Request("POST", "http://cp.test/api/v1/sequence-range"),
+        response=httpx.Response(503, content=b"service unavailable"),
+    )
+    _make_failing_mint(monkeypatch, err)
+
+    with pytest.raises(BackendFailure) as ei:
+        _run(
+            Inputs(fastq_path=_minimal_fastq(tmp_path), prep_sample_idx=42, work_ticket_idx=1),
+            tmp_path / "ws",
+        )
+
+    assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
+    assert ei.value.step_name == "fastq"
+    assert "HTTP 503" in ei.value.reason

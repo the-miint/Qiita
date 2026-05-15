@@ -83,6 +83,7 @@ async def test_mint_raises_already_exists_on_409():
         with pytest.raises(SequenceRangeAlreadyExists) as ei:
             await mint_sequence_range(http=http, prep_sample_idx=42, count=100)
     assert ei.value.prep_sample_idx == 42
+    assert ei.value.count == 100
     assert "already has a sequence_range" in str(ei.value)
 
 

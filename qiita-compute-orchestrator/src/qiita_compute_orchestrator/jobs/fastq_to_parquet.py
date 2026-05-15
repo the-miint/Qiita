@@ -61,14 +61,27 @@ in this commit; a follow-up should plumb them from JobParams /
 baseline_resources so each step's allocation drives DuckDB's own
 limits.
 
-Recovery semantics. If execute() crashes between phase 3 (mint) and
-phase 4's COPY, the prep_sample's sequence_range row already exists.
-A retry's POST returns 409 (SequenceRangeAlreadyExists); the helper
-raises and the runner classifies as UNKNOWN_PERMANENT. Operator
-recovery: DELETE the prep_sample (CASCADE removes the range) and
-resubmit the work_ticket. See sequence_range.py module docstring for
-the longer-term GET-on-mint-scope follow-up that would make retries
-transparent.
+Mint-side failure mapping. The mint helper raises typed Python
+exceptions; the native-step dispatcher (jobs/__init__.py) only wraps
+bare NotImplementedError/FileNotFoundError/ValueError, so this module
+maps each mint exception to an explicit BackendFailure at the call
+site in phase 3:
+
+  - SequenceRangeAlreadyExists (409) → UNKNOWN_PERMANENT.
+    The prep_sample's range was minted on a previous attempt that
+    failed before phase 4. Operator recovery: DELETE the prep_sample
+    (CASCADE removes the range) and resubmit the work_ticket. See
+    sequence_range.py module docstring for the GET-on-mint-scope
+    follow-up that would make retries transparent.
+  - PrepSampleNotEligibleForSequenceRange (404) → BAD_INPUT.
+    The prep_sample was deleted between submission and step execution.
+  - httpx.HTTPStatusError 401/403 → CONTRACT_VIOLATION.
+    The compute service-account PAT is missing/wrong; deploy issue,
+    retry won't help. (see compute-service-account-provisioning.md)
+  - httpx.HTTPStatusError 5xx and other → UNKNOWN_PERMANENT.
+    Conservative today; a follow-up could add a retriable
+    CP_UNREACHABLE FailureKind alongside SLURMRESTD_UNREACHABLE so
+    genuine 5xx blips bounce back to QUEUED.
 
 Sibling: `LocalBackend._run_hash` in `backends/local.py` is
 structurally similar — same DuckDB+miint plumbing, same `PARQUET_OPTS`,
@@ -85,11 +98,28 @@ import shutil
 from pathlib import Path
 
 import duckdb
+import httpx
 from pydantic import BaseModel
+from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.models import WorkTicketFailureStage
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import PARQUET_OPTS, ensure_miint_installed, open_conn
-from ..sequence_range import make_cp_client, mint_sequence_range
+from ..sequence_range import (
+    PrepSampleNotEligibleForSequenceRange,
+    SequenceRangeAlreadyExists,
+    make_cp_client,
+    mint_sequence_range,
+)
+
+# YAML step name this module implements. Hard-coded here because
+# execute() raises BackendFailures itself (the dispatcher only wraps
+# bare NotImplementedError/FileNotFoundError/ValueError) and a
+# BackendFailure needs a step_name. If the workflow YAML's
+# `- step: fastq` entry is ever renamed, this constant must follow —
+# the integration smoke test asserts work_ticket.failure_step_name,
+# so a mismatch fails loudly.
+_YAML_STEP_NAME = "fastq"
 
 # Conservative DuckDB resource caps. TODO: plumb from
 # JobParams.baseline_resources so each step's SLURM allocation drives
@@ -181,11 +211,72 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         # Phase 3: mint a sequence_idx range from the CP (skipped for
         # empty samples — the CP rejects count <= 0, and an empty file
         # has no reads to key).
+        #
+        # The mint helper raises typed Python exceptions; the framework
+        # dispatcher in jobs/__init__.py only wraps bare
+        # NotImplementedError/FileNotFoundError/ValueError, so we map
+        # each mint-side exception to an explicit BackendFailure here.
+        # Doing it at the call site (rather than upstream in
+        # sequence_range.py) keeps the helper transport-agnostic — the
+        # mapping from "how the CP responded" to "what BackendFailure
+        # kind the runner should see" is workflow-policy, not protocol.
         if count > 0:
-            async with make_cp_client() as http:
-                rng = await mint_sequence_range(
-                    http=http, prep_sample_idx=inputs.prep_sample_idx, count=count
-                )
+            try:
+                async with make_cp_client() as http:
+                    rng = await mint_sequence_range(
+                        http=http, prep_sample_idx=inputs.prep_sample_idx, count=count
+                    )
+            except SequenceRangeAlreadyExists as exc:
+                # Mid-step failure left a range on a previous attempt;
+                # this attempt's POST 409s. Operator must DELETE the
+                # prep_sample (CASCADE removes the range) and resubmit.
+                raise BackendFailure(
+                    kind=FailureKind.UNKNOWN_PERMANENT,
+                    stage=WorkTicketFailureStage.STEP_RUN,
+                    step_name=_YAML_STEP_NAME,
+                    reason=str(exc),
+                ) from exc
+            except PrepSampleNotEligibleForSequenceRange as exc:
+                # The prep_sample doesn't exist or isn't sequenced. The
+                # submit route checks processing_kind already, so this
+                # only surfaces if the prep_sample was deleted between
+                # submission and step execution. BAD_INPUT because the
+                # work_ticket's scope_target points at something that
+                # no longer exists.
+                raise BackendFailure(
+                    kind=FailureKind.BAD_INPUT,
+                    stage=WorkTicketFailureStage.STEP_RUN,
+                    step_name=_YAML_STEP_NAME,
+                    reason=str(exc),
+                ) from exc
+            except httpx.HTTPStatusError as exc:
+                # 401/403: the compute service-account PAT is missing or
+                # wrong, or its scope ceiling was lowered. The deploy is
+                # misconfigured; retry won't help.
+                if exc.response.status_code in (401, 403):
+                    raise BackendFailure(
+                        kind=FailureKind.CONTRACT_VIOLATION,
+                        stage=WorkTicketFailureStage.STEP_RUN,
+                        step_name=_YAML_STEP_NAME,
+                        reason=(
+                            f"CP rejected sequence-range mint with HTTP "
+                            f"{exc.response.status_code} — compute SA PAT misconfigured "
+                            "(see docs/runbooks/compute-service-account-provisioning.md)"
+                        ),
+                    ) from exc
+                # 5xx and anything else unexpected. Conservatively
+                # permanent today; a follow-up could add a retriable
+                # CP_UNREACHABLE FailureKind alongside SLURMRESTD_UNREACHABLE
+                # so genuine 5xx blips bounce back to QUEUED.
+                raise BackendFailure(
+                    kind=FailureKind.UNKNOWN_PERMANENT,
+                    stage=WorkTicketFailureStage.STEP_RUN,
+                    step_name=_YAML_STEP_NAME,
+                    reason=(
+                        f"CP sequence-range mint failed with HTTP "
+                        f"{exc.response.status_code}: {exc.response.text!r}"
+                    ),
+                ) from exc
             sequence_idx_start = rng.sequence_idx_start
         else:
             # Sentinel — phase 4 won't reference it for an empty input

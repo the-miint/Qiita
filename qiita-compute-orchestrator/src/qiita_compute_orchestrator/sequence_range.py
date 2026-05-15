@@ -14,11 +14,11 @@ the SA is scope-minimal at `sequence_range:mint` only). So:
 
 - First mint for a prep_sample: 201 + the range. Normal.
 - Mid-step failure after mint succeeded: the next attempt's mint
-  call 409s. The orchestrator surfaces this as a typed
-  `SequenceRangeAlreadyExists` exception, which the caller maps to a
-  `BackendFailure(UNKNOWN_PERMANENT)`. Recovery requires operator
-  intervention (DELETE the prep_sample, CASCADE removes the range,
-  resubmit the work_ticket).
+  call 409s. This helper raises `SequenceRangeAlreadyExists`; the
+  caller (`fastq_to_parquet.execute`) is responsible for mapping it
+  to a `BackendFailure` with the right `FailureKind`. The helper
+  itself stays transport-agnostic — it doesn't reach for
+  BackendFailure or know about runner-level failure classification.
 
 A future improvement (out of scope for this PR) would add a
 `GET /sequence-range/{prep_sample_idx}` variant gated on
@@ -31,7 +31,7 @@ typed: `PrepSampleNotEligibleForSequenceRange`. The submit-route
 on the CP already 404s when the work_ticket itself points at a
 non-existent prep_sample, so this exception fires only if the
 prep_sample was deleted between work_ticket submission and step
-execution.
+execution. Same caller-side mapping pattern as the 409 case.
 """
 
 from __future__ import annotations
@@ -83,20 +83,20 @@ class SequenceRange:
 class SequenceRangeAlreadyExists(Exception):
     """Raised when the CP returns 409 from POST /sequence-range — the
     prep_sample already has a sequence_range from a prior (likely
-    failed) attempt. The orchestrator can't recover today without the
-    self-read endpoint discussed in the module docstring; the caller
-    should surface this as a permanent failure with operator
-    instructions."""
+    failed) attempt. Callers map this to a permanent BackendFailure
+    with operator-recovery instructions; the helper itself does not."""
 
-    def __init__(self, prep_sample_idx: int):
+    def __init__(self, prep_sample_idx: int, count: int):
         super().__init__(
             f"prep_sample {prep_sample_idx} already has a sequence_range "
-            "(typically from a previous failed attempt). Recovery requires "
-            "deleting the prep_sample (CASCADE removes the range) and "
-            "resubmitting the work_ticket. A future CP-side endpoint will "
-            "let the minter re-read its own range; track as follow-up."
+            f"(attempted mint with count={count}, typically from a "
+            "previous failed attempt). Recovery requires deleting the "
+            "prep_sample (CASCADE removes the range) and resubmitting "
+            "the work_ticket. A future CP-side endpoint will let the "
+            "minter re-read its own range; track as follow-up."
         )
         self.prep_sample_idx = prep_sample_idx
+        self.count = count
 
 
 class PrepSampleNotEligibleForSequenceRange(Exception):
@@ -104,7 +104,8 @@ class PrepSampleNotEligibleForSequenceRange(Exception):
     or its processing_kind is not 'sequenced'. The submit route should
     have caught the latter case already; this surfaces only if the
     prep_sample was deleted between work_ticket submission and step
-    execution."""
+    execution. Callers map this to a permanent BackendFailure
+    (typically BAD_INPUT)."""
 
     def __init__(self, prep_sample_idx: int):
         super().__init__(
@@ -139,7 +140,7 @@ async def mint_sequence_range(
         json={"prep_sample_idx": prep_sample_idx, "count": count},
     )
     if resp.status_code == 409:
-        raise SequenceRangeAlreadyExists(prep_sample_idx)
+        raise SequenceRangeAlreadyExists(prep_sample_idx, count)
     if resp.status_code == 404:
         raise PrepSampleNotEligibleForSequenceRange(prep_sample_idx)
     resp.raise_for_status()
