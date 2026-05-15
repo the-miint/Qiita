@@ -168,6 +168,33 @@ async def seed_sequenced_prep_sample(
     )
 
 
+async def seed_biosample_with_sequenced_prep_sample(
+    pool: asyncpg.Pool,
+    *,
+    owner_idx: int,
+    protocol_name: str = "short_read_metagenomics",
+) -> tuple[int, int]:
+    """Seed a biosample + sequenced prep_sample owned by `owner_idx`;
+    return `(biosample_idx, prep_sample_idx)`.
+
+    Composes `seed_biosample` (owner + created_by both = owner_idx) and
+    `seed_sequenced_prep_sample`. Use this from fixtures that need a
+    sequenced prep_sample to scope a work_ticket or a sequence_range
+    against and want to track both rows for FK-reverse cleanup. Callers
+    that need a non-default prep_protocol pass `protocol_name`; the
+    underlying helper resolves it by lookup against the seeded protocols
+    (qiita.prep_protocol, populated by migration 20260501000010).
+    """
+    biosample_idx = await seed_biosample(pool, owner_idx=owner_idx, created_by_idx=owner_idx)
+    prep_sample_idx = await seed_sequenced_prep_sample(
+        pool,
+        biosample_idx=biosample_idx,
+        owner_idx=owner_idx,
+        protocol_name=protocol_name,
+    )
+    return biosample_idx, prep_sample_idx
+
+
 async def seed_biosample_global_field(
     pool: asyncpg.Pool,
     *,

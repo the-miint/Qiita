@@ -199,39 +199,28 @@ async def prep_sample_idx(postgres_pool, admin_token):
     """A minimal qiita.prep_sample row (the supertype introduced by #35)
     owned by the admin principal, with processing_kind='sequenced'.
 
-    Seeds the FK chain (biosample + prep_protocol) so the row satisfies
-    every NOT NULL FK constraint. The sequenced_sample 1:1 subtype row
-    is intentionally NOT created — the work_ticket scope target is the
-    supertype, and the tests here exercise scope/action plumbing only
-    (not sequencing-specific fields).
+    Uses the shared db_seeds composer so this fixture stays in sync with
+    every other "I need a sequenced prep_sample" site (route tests,
+    repository tests, integration smoke). The sequenced_sample 1:1
+    subtype row is intentionally NOT created — the work_ticket scope
+    target is the supertype, and the tests here exercise scope/action
+    plumbing only (not sequencing-specific fields).
 
     All seeded rows are cleaned up in reverse-FK order after the test."""
-    _, admin_idx = admin_token
+    from qiita_control_plane.testing.db_seeds import (
+        seed_biosample_with_sequenced_prep_sample,
+    )
 
-    biosample_idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.biosample (owner_idx, created_by_idx) VALUES ($1, $1) RETURNING idx",
-        admin_idx,
-    )
-    prep_protocol_idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.prep_protocol (name, created_by_idx) VALUES ($1, $2) RETURNING idx",
-        # prep_protocol_name_format CHECK: ^[a-z][a-z0-9_]*$
-        f"p_{uuid.uuid4().hex[:8]}",
-        admin_idx,
-    )
-    idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.prep_sample ("
-        "  biosample_idx, owner_idx, prep_protocol_idx,"
-        "  processing_kind, created_by_idx"
-        ") VALUES ($1, $2, $3, 'sequenced', $2) RETURNING idx",
-        biosample_idx,
-        admin_idx,
-        prep_protocol_idx,
+    _, admin_idx = admin_token
+    biosample_idx, idx = await seed_biosample_with_sequenced_prep_sample(
+        postgres_pool, owner_idx=admin_idx
     )
     yield idx
-    # FK RESTRICT cascade — drop dependents in reverse order.
+    # FK RESTRICT cascade — drop dependents in reverse order. The
+    # composer used the seeded `short_read_metagenomics` prep_protocol
+    # (system-owned), so we don't delete the protocol here.
     await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE prep_sample_idx = $1", idx)
     await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", idx)
-    await postgres_pool.execute("DELETE FROM qiita.prep_protocol WHERE idx = $1", prep_protocol_idx)
     await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
 
 

@@ -86,41 +86,27 @@ async def fastq_to_parquet_action(postgres_pool, tmp_path):
 async def smoke_prep_sample(postgres_pool, human_admin_session):
     """A minimal qiita.prep_sample row (the supertype introduced by #35)
     with processing_kind='sequenced', to scope the smoke ticket against.
-    Seeds the FK chain (biosample + prep_protocol); the sequenced_sample
-    1:1 subtype row is intentionally NOT created — fastq_to_parquet
-    never reads sequencing-specific columns. Reverse-FK cleanup runs
-    on yield exit."""
-    admin_idx = human_admin_session["principal_idx"]
 
-    biosample_idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.biosample (owner_idx, created_by_idx)"
-        " VALUES ($1, $1) RETURNING idx",
-        admin_idx,
+    Uses the shared db_seeds composer so this fixture stays in sync with
+    every other "I need a sequenced prep_sample" site (route tests,
+    repository tests). The sequenced_sample 1:1 subtype row is
+    intentionally NOT created — fastq_to_parquet never reads
+    sequencing-specific columns. Reverse-FK cleanup runs on yield exit."""
+    from qiita_control_plane.testing.db_seeds import (
+        seed_biosample_with_sequenced_prep_sample,
     )
-    prep_protocol_idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.prep_protocol (name, created_by_idx)"
-        " VALUES ($1, $2) RETURNING idx",
-        # prep_protocol_name_format CHECK requires ^[a-z][a-z0-9_]*$
-        f"p_{uuid.uuid4().hex[:8]}",
-        admin_idx,
-    )
-    idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.prep_sample ("
-        "  biosample_idx, owner_idx, prep_protocol_idx,"
-        "  processing_kind, created_by_idx"
-        ") VALUES ($1, $2, $3, 'sequenced', $2) RETURNING idx",
-        biosample_idx,
-        admin_idx,
-        prep_protocol_idx,
+
+    admin_idx = human_admin_session["principal_idx"]
+    biosample_idx, idx = await seed_biosample_with_sequenced_prep_sample(
+        postgres_pool, owner_idx=admin_idx
     )
     yield idx
+    # The composer used the seeded `short_read_metagenomics` prep_protocol
+    # (system-owned), so we don't delete the protocol here.
     await postgres_pool.execute(
         "DELETE FROM qiita.work_ticket WHERE prep_sample_idx = $1", idx
     )
     await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", idx)
-    await postgres_pool.execute(
-        "DELETE FROM qiita.prep_protocol WHERE idx = $1", prep_protocol_idx
-    )
     await postgres_pool.execute(
         "DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx
     )
