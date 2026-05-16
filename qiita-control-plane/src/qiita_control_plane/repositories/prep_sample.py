@@ -17,27 +17,24 @@ than one write guard on conn.is_in_transaction() at entry and raise if
 the caller did not wrap the call in a transaction.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 
 import asyncpg
-from qiita_common.models import FieldDataType
 
-from . import (
+from . import require_transaction, validate_patch_fields
+from ._sample_helpers import (
     GlobalFieldRow,
     MetadataUnknownFieldsError,
     SampleEntityKind,
     parse_text_for_data_type,
-    require_transaction,
-    validate_patch_fields,
+    write_global_metadata_or_diagnose,
 )
 from .prep_sample_metadata import (
+    PREP_SAMPLE_METADATA_SPEC,
     fetch_prep_sample_global_fields_by_display_names,
-    get_or_create_globally_linked_prep_sample_study_field,
-    insert_prep_sample_metadata_date,
-    insert_prep_sample_metadata_numeric,
-    insert_prep_sample_metadata_text,
 )
 
 # The single supported processing_kind today. The supertype's
@@ -304,8 +301,6 @@ class SequencedPrepSampleCreateResult:
 
     prep_sample_idx: int
     sequenced_sample_idx: int
-    # display_name -> (study_field_idx, created)
-    prep_sample_study_fields: dict[str, tuple[int, bool]]
 
 
 async def create_sequenced_prep_sample(
@@ -317,7 +312,8 @@ async def create_sequenced_prep_sample(
     owner_idx: int,
     sequenced_pool_item_id: str,
     metadata: dict[str, str],
-    study_idxs: list[int],
+    primary_study_idx: int,
+    secondary_study_idxs: Sequence[int] = (),
     caller_idx: int,
     metadata_checklist_idx: int | None = None,
     ena_experiment_accession: str | None = None,
@@ -340,38 +336,39 @@ async def create_sequenced_prep_sample(
       4. INSERT qiita.sequenced_sample referencing the new prep_sample
          and the caller-supplied sequenced_pool (the subtype's composite
          FK + the GENERATED processing_kind enforce supertype agreement).
-      5. INSERT one qiita.prep_sample_to_study row per study_idx (sorted
-         ascending for deterministic error reporting). The
-         reject_without_biosample_link trigger fires on every INSERT and
-         raises asyncpg.RaiseError if any requested study lacks a
+      5. INSERT qiita.prep_sample_to_study for primary_study_idx, then
+         for each entry in sorted(secondary_study_idxs). Primary first
+         so its link row carries the smallest created_at ordering; the
+         reject_without_biosample_link trigger fires on every INSERT
+         and raises asyncpg.RaiseError if any requested study lacks a
          non-retired biosample_to_study link.
       6. For each metadata entry: get_or_create_globally_linked_prep_sample_study_field
-         against the field-owning study, then INSERT one
-         prep_sample_metadata row. The reject_if_link_retired trigger
+         against primary_study_idx (the field-owning study), then INSERT
+         one prep_sample_metadata row. The reject_if_link_retired trigger
          fires here, which is why step 5 must precede step 6.
 
     The caller must wrap the call in `async with conn.transaction():`; the
     guard at entry raises RuntimeError otherwise so partial failure cannot
     leave orphan rows.
 
-    Currently study_idxs has length 1. The Pydantic max_length=1 at the
-    route boundary enforces this; the composer adds a defensive ValueError
-    so a future bypass route also fails loudly. Multi-study assignment
-    requires a future schema decision about which study owns the per-
-    display_name prep_sample_study_field row (cross-study reads see the
-    value through global_field_idx, which is scoped to a single
-    field-owning study).
+    primary_study_idx owns the per-display_name prep_sample_study_field
+    rows written for metadata; secondary studies share the value through
+    the global field slot but do not own the field row. The asymmetry
+    is forced by the schema's one-slot-per-(prep_sample, global_field_idx)
+    invariant, so exactly one linked study must be designated.
+    primary_study_idx must not also appear in secondary_study_idxs; the
+    Pydantic validator on SequencedSampleCreateRequest blocks this at
+    the route, and the composer raises ValueError as defense-in-depth.
     """
     # Fail-fast guard against caller forgetting to wrap in a transaction.
     require_transaction(conn)
 
-    # Multi-study guard. Pydantic blocks this at the route boundary;
-    # the defensive ValueError here covers any caller that bypasses the
-    # route.
-    if len(study_idxs) != 1:
+    # Defense-in-depth: the Pydantic validator rejects primary in
+    # secondary at the wire boundary; this guard covers any caller that
+    # bypasses the route.
+    if primary_study_idx in secondary_study_idxs:
         raise ValueError(
-            f"create_sequenced_prep_sample currently accepts exactly one study_idx;"
-            f" got {len(study_idxs)}"
+            f"primary_study_idx ({primary_study_idx}) must not appear in secondary_study_idxs"
         )
 
     # Pre-flight: resolve every metadata key against prep_sample_global_field
@@ -418,10 +415,11 @@ async def create_sequenced_prep_sample(
         ena_run_accession=ena_run_accession,
     )
 
-    # Step c: link the prep_sample to every requested study. Sorted-
-    # ascending iteration makes the failing study idx reproducible if the
-    # biosample-link trigger fires.
-    for study_idx in sorted(study_idxs):
+    # Step c: link the prep_sample to every requested study. Primary
+    # first so its link row carries the smallest created_at ordering;
+    # secondaries sorted ascending so a failing study idx is reproducible
+    # if the biosample-link trigger fires.
+    for study_idx in [primary_study_idx, *sorted(secondary_study_idxs)]:
         await insert_prep_sample_to_study(
             conn,
             prep_sample_idx=ps_idx,
@@ -429,61 +427,22 @@ async def create_sequenced_prep_sample(
             created_by_idx=caller_idx,
         )
 
-    # Step d: write each globally-linked metadata entry. The study field
-    # row is upserted on first use; subsequent entries on the same study
-    # reuse it. Currently pins the field-owning study to the sole study_idx (see
-    # the docstring's multi-study note).
-    field_owning_study_idx = study_idxs[0]
-    prep_sample_study_fields: dict[str, tuple[int, bool]] = {}
+    # Step d: write each globally-linked metadata entry against
+    # primary_study_idx, the field-owning study.
     for global_row, parsed_value in parsed_metadata:
-        linked_field_idx, created = await get_or_create_globally_linked_prep_sample_study_field(
+        await write_global_metadata_or_diagnose(
             conn,
-            study_idx=field_owning_study_idx,
-            prep_sample_global_field_idx=global_row.idx,
+            spec=PREP_SAMPLE_METADATA_SPEC,
+            entity_idx=ps_idx,
+            study_idx=primary_study_idx,
+            global_field_idx=global_row.idx,
             display_name=global_row.display_name,
-            created_by_idx=caller_idx,
+            data_type=global_row.data_type,
+            value=parsed_value,
+            caller_idx=caller_idx,
         )
-        prep_sample_study_fields[global_row.display_name] = (linked_field_idx, created)
-
-        # Dispatch on the global field's data_type. The else branch covers
-        # FieldDataType members the if/elif chain does not name (BOOLEAN,
-        # TERMINOLOGY today); it is unreachable in practice because
-        # parse_text_for_data_type raises NotImplementedError for those
-        # types in the pre-flight parse pass. A future maintainer adding
-        # BOOLEAN/TERMINOLOGY support must extend both the parser and this
-        # dispatch.
-        if global_row.data_type is FieldDataType.TEXT:
-            await insert_prep_sample_metadata_text(
-                conn,
-                prep_sample_idx=ps_idx,
-                prep_sample_study_field_idx=linked_field_idx,
-                value_text=parsed_value,
-                created_by_idx=caller_idx,
-            )
-        elif global_row.data_type is FieldDataType.NUMERIC:
-            await insert_prep_sample_metadata_numeric(
-                conn,
-                prep_sample_idx=ps_idx,
-                prep_sample_study_field_idx=linked_field_idx,
-                value_numeric=parsed_value,
-                created_by_idx=caller_idx,
-            )
-        elif global_row.data_type is FieldDataType.DATE:
-            await insert_prep_sample_metadata_date(
-                conn,
-                prep_sample_idx=ps_idx,
-                prep_sample_study_field_idx=linked_field_idx,
-                value_date=parsed_value,
-                created_by_idx=caller_idx,
-            )
-        else:
-            raise NotImplementedError(
-                f"prep_sample metadata insert for data_type={global_row.data_type}"
-                " is not yet implemented"
-            )
 
     return SequencedPrepSampleCreateResult(
         prep_sample_idx=ps_idx,
         sequenced_sample_idx=ss_idx,
-        prep_sample_study_fields=prep_sample_study_fields,
     )

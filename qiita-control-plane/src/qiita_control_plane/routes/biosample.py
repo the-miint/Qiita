@@ -45,10 +45,12 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
-from ..repositories import (
+from ..repositories._sample_helpers import (
+    GlobalFieldSlotOccupiedError,
     MetadataParseError,
     MetadataUnknownFieldsError,
     StudyFieldConflictError,
+    TransientMetadataWriteRaceError,
 )
 from ..repositories.biosample import (
     fetch_biosample,
@@ -61,7 +63,11 @@ from ..repositories.biosample_metadata import (
     BiosampleOwnerIdFieldCollisionError,
     fetch_global_metadata_for_biosample,
 )
-from ._helpers import etag_for_updated_at
+from ._helpers import (
+    detail_for_global_field_collision,
+    etag_for_updated_at,
+    raise_for_transient_write_race,
+)
 
 router = APIRouter(prefix="/study", tags=["biosample"])
 biosample_router = APIRouter(prefix="/biosample", tags=["biosample"])
@@ -117,7 +123,7 @@ async def import_biosample(
         try:
             result = await import_biosample_from_owner_biosample_id(
                 conn,
-                study_idx=study_idx,
+                primary_study_idx=study_idx,
                 owner_idx=body.owner_idx,
                 owner_biosample_id_field_name=body.owner_biosample_id_field_name,
                 owner_biosample_id_value=body.owner_biosample_id_value,
@@ -152,9 +158,37 @@ async def import_biosample(
                 status_code=422,
                 detail=(
                     f"study has an existing field at display_name {exc.display_name!r}"
-                    " bound to a different global concept"
+                    " bound to a different global field"
                 ),
             )
+        except GlobalFieldSlotOccupiedError as exc:
+            # GlobalFieldSlotOccupiedError is its own exception family (not
+            # an asyncpg.UniqueViolationError subclass), so this catch and
+            # the generic UniqueViolationError catch below are independent;
+            # both return 409, but this one's detail discriminates the five
+            # cross-study sub-cases rather than collapsing to the generic
+            # message.
+            #
+            # NOT DEAD CODE — do not prune. Currently unreachable
+            # through this POST because the route creates a fresh
+            # biosample per call, so (biosample_idx, global_field_idx)
+            # is always empty pre-INSERT and the partial unique index
+            # cannot fire. Kept for the planned PATCH-style
+            # write-metadata-on-existing-biosample endpoint, which will
+            # share this composer path; that endpoint can hit the
+            # partial index whenever a caller writes a value for a
+            # biosample whose global field slot was already claimed
+            # by another study. Helper unit tests in
+            # tests/routes/test__helpers.py cover the wording for every
+            # subclass even though no current route flow triggers them.
+            detail = await detail_for_global_field_collision(conn, exc)
+            raise HTTPException(status_code=409, detail=detail)
+        except TransientMetadataWriteRaceError as exc:
+            # The diagnostic read found the colliding occupant already
+            # gone — a concurrent delete won the race and the slot is
+            # free again. Independent of the asyncpg catches; maps to a
+            # 503 + Retry-After so the client resubmits the same request.
+            raise_for_transient_write_race(exc)
         except asyncpg.UniqueViolationError as exc:
             detail = _UNIQUE_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_UNIQUE_VIOLATION)
             raise HTTPException(status_code=409, detail=detail)
@@ -164,13 +198,16 @@ async def import_biosample(
 
     return BiosampleImportResponse(
         biosample_idx=result.biosample_idx,
-        biosample_study_field_idx=result.biosample_study_field_idx,
-        biosample_study_field_created=result.biosample_study_field_created,
+        owner_id_biosample_study_field_idx=result.owner_id_biosample_study_field_idx,
+        owner_id_biosample_study_field_created=result.owner_id_biosample_study_field_created,
     )
 
 
 # Hard cap on the bulk-id read. Sized to comfortably cover any single
 # study's biosample roster while bounding per-response payload size.
+# The sequencing-run roster cap happens to share this numeric value, but
+# the two bound conceptually distinct rosters and are sized independently;
+# they are intentionally not factored into a shared constant.
 _BIOSAMPLE_IDXS_HARD_CAP = 500_000
 
 

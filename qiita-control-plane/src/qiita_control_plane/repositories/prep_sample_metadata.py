@@ -6,13 +6,9 @@ as their first positional argument, never acquire their own connection,
 and never open their own top-level transaction; the caller controls
 transaction scope so multiple writes compose atomically on one connection.
 
-The sequenced-prep-sample composer in repositories.prep_sample re-uses the
-helpers here; routes that surface metadata-shaped errors import the
-exception classes from this module. Parallel to the biosample_metadata
-module — owner-biosample-id-shaped features (collision check, local-field
-upsert, is_owner_biosample_id flag) have no analogue on prep_sample and
-are intentionally absent. GlobalFieldRow and MetadataParseError are
-shared with biosample_metadata and live in repositories.__init__.
+Parallel to the biosample_metadata module — owner-biosample-id-shaped
+features (collision check, local-field upsert, is_owner_biosample_id
+flag) have no analogue on prep_sample and are intentionally absent.
 """
 
 from collections.abc import Iterable
@@ -20,21 +16,17 @@ from datetime import date
 from decimal import Decimal
 
 import asyncpg
-from qiita_common.models import FieldDataType
+from qiita_common.models import FieldDataType, Tier
 
-from . import (
+from . import require_transaction
+from ._sample_helpers import (
     GLOBAL_METADATA_VALUE_COLUMN,
+    EntityMetadataSpec,
     GlobalFieldRow,
     GlobalMetadataRow,
     SampleEntityKind,
     StudyFieldConflictError,
-    require_transaction,
 )
-
-# Structured exceptions raised by the composer path live in
-# repositories.__init__ (MetadataParseError, MetadataUnknownFieldsError,
-# StudyFieldConflictError) and take entity_kind at the raise site.
-# prep_sample has no owner-id-collision analog.
 
 
 async def fetch_global_metadata_for_prep_sample(
@@ -44,10 +36,11 @@ async def fetch_global_metadata_for_prep_sample(
     """Return a dict of internal_name -> GlobalMetadataRow for every
     globally-linked metadata value the prep_sample carries.
 
-    Filters on prep_sample_metadata.global_field_idx IS NOT NULL: purely-local
-    rows and rows whose prep_sample_to_study link has been retired (the
-    prep_sample_to_study_retirement_demote_globals trigger nulls out
-    global_field_idx) are both excluded by the same predicate.
+    Filters on prep_sample_metadata.global_field_idx IS NOT NULL:
+    purely-local rows are excluded. The read is not study-scoped — the
+    canonical global value persists across prep_sample_to_study link
+    retirement, and per-study read access is governed by the
+    study_access predicate at the caller's auth boundary, not here.
     Missing-reason rows are also excluded.
 
     Currently supports data_type in {TEXT, NUMERIC, DATE} (matching the
@@ -128,13 +121,18 @@ async def get_or_create_globally_linked_prep_sample_study_field(
     conn: asyncpg.Connection,
     *,
     study_idx: int,
-    prep_sample_global_field_idx: int,
+    global_field_idx: int,
     display_name: str,
     created_by_idx: int,
     description: str | None = None,
 ) -> tuple[int, bool]:
-    """Find a prep_sample_study_field linked to prep_sample_global_field_idx;
-    create on miss.
+    """Find a prep_sample_study_field linked to global_field_idx; create on miss.
+
+    `global_field_idx` is the prep_sample_global_field row this study_field
+    binds to; the SQL column on prep_sample_study_field is named
+    prep_sample_global_field_idx, but callers pass the entity-suffix-stripped
+    kwarg so the function's signature matches the parallel biosample helper
+    and the cross-entity write function in repositories.__init__.
 
     Returns (idx, created): created is True when this call inserted the
     row; False when the fallback SELECT branch resolved against a row a
@@ -142,16 +140,16 @@ async def get_or_create_globally_linked_prep_sample_study_field(
 
     The created row populates prep_sample_global_field_idx and leaves
     data_type / required / terminology_idx / tier_override NULL per the
-    prep_sample_study_field_inheritance_consistent CHECK; the global concept
+    prep_sample_study_field_inheritance_consistent CHECK; the global field
     owns those fields.
 
     Raises StudyFieldConflictError(entity_kind=SampleEntityKind.PREP_SAMPLE, ...) when a
     row at (study_idx, display_name) already exists but is purely-local
     (prep_sample_global_field_idx IS NULL) or is bound to a different
-    global concept. Both cases mean the caller is trying to write metadata
-    against a field that is not the global concept they think it is;
+    global field. Both cases mean the caller is trying to write metadata
+    against a field that is not the global field they think it is;
     silently returning the existing idx would attach the value to the
-    wrong concept.
+    wrong field.
 
     Concurrency: INSERT ... ON CONFLICT DO NOTHING RETURNING idx + a
     fallback SELECT on miss. Race-free under READ COMMITTED (the project
@@ -171,7 +169,7 @@ async def get_or_create_globally_linked_prep_sample_study_field(
         " ON CONFLICT (study_idx, display_name) DO NOTHING"
         " RETURNING idx",
         study_idx,
-        prep_sample_global_field_idx,
+        global_field_idx,
         display_name,
         description,
         created_by_idx,
@@ -181,7 +179,7 @@ async def get_or_create_globally_linked_prep_sample_study_field(
 
     # Fallback branch — existing row at (study_idx, display_name). Verify
     # its global link matches what the caller asked for; otherwise the
-    # row is bound to a different concept (or none) and reusing it would
+    # row is bound to a different global field (or none) and reusing it would
     # attach the value to the wrong field.
     row = await conn.fetchrow(
         "SELECT idx, prep_sample_global_field_idx"
@@ -190,15 +188,90 @@ async def get_or_create_globally_linked_prep_sample_study_field(
         study_idx,
         display_name,
     )
-    if row["prep_sample_global_field_idx"] != prep_sample_global_field_idx:
+    if row["prep_sample_global_field_idx"] != global_field_idx:
         raise StudyFieldConflictError(
             entity_kind=SampleEntityKind.PREP_SAMPLE,
             study_idx=study_idx,
             display_name=display_name,
-            expected_global_field_idx=prep_sample_global_field_idx,
+            expected_global_field_idx=global_field_idx,
             found_global_field_idx=row["prep_sample_global_field_idx"],
         )
     return row["idx"], False
+
+
+async def get_or_create_local_prep_sample_study_field(
+    conn: asyncpg.Connection,
+    *,
+    study_idx: int,
+    display_name: str,
+    created_by_idx: int,
+    description: str | None = None,
+    data_type: FieldDataType = FieldDataType.TEXT,
+    required: bool = False,
+    terminology_idx: int | None = None,
+    tier_override: Tier | None = None,
+) -> tuple[int, bool, int | None]:
+    """Find a prep_sample_study_field by (study_idx, display_name); create local on miss.
+
+    Parallel to the biosample-side helper. Returns
+    (idx, created, prep_sample_global_field_idx): created is True on the
+    insert branch, False on the fallback SELECT lookup branch. The third
+    element is the resolved row's prep_sample_global_field_idx — None
+    for a purely-local row, non-None when the row turned out to be
+    globally linked (only possible from the lookup branch; the create
+    branch always produces a purely-local row).
+
+    Surfacing the link status in the return tuple lets callers that need
+    strict local-only semantics (e.g., write_local_metadata_or_diagnose)
+    reject a globally-linked resolution rather than silently writing
+    through it.
+
+    Concurrency: same INSERT ... ON CONFLICT DO NOTHING RETURNING idx +
+    fallback SELECT pattern as the globally-linked sibling. Race-free
+    under READ COMMITTED (the project default, set in
+    qiita_control_plane.db).
+    """
+    # Both branches must observe the same snapshot; require a wrapping
+    # transaction so the INSERT and the fallback SELECT cannot straddle
+    # an implicit-commit boundary.
+    require_transaction(conn)
+
+    # Create branch — purely-local row, prep_sample_global_field_idx left
+    # NULL. ON CONFLICT DO NOTHING absorbs the unique-constraint hit so
+    # the concurrent loser of the race does not raise.
+    idx = await conn.fetchval(
+        "INSERT INTO qiita.prep_sample_study_field ("
+        "    study_idx, display_name, description,"
+        "    data_type, required, terminology_idx, tier_override,"
+        "    created_by_idx"
+        ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        " ON CONFLICT (study_idx, display_name) DO NOTHING"
+        " RETURNING idx",
+        study_idx,
+        display_name,
+        description,
+        data_type,
+        required,
+        terminology_idx,
+        tier_override,
+        created_by_idx,
+    )
+    if idx is not None:
+        # Create branch — the row is purely-local by construction.
+        return idx, True, None
+
+    # Lookup branch — fallback fires only on conflict; takes a fresh
+    # snapshot under READ COMMITTED so it sees the row the concurrent
+    # winner committed. Surface prep_sample_global_field_idx so callers
+    # can detect a globally-linked resolution.
+    row = await conn.fetchrow(
+        "SELECT idx, prep_sample_global_field_idx"
+        " FROM qiita.prep_sample_study_field"
+        " WHERE study_idx = $1 AND display_name = $2",
+        study_idx,
+        display_name,
+    )
+    return row["idx"], False, row["prep_sample_global_field_idx"]
 
 
 async def insert_prep_sample_metadata_text(
@@ -220,7 +293,7 @@ async def insert_prep_sample_metadata_text(
     The prep_sample_metadata_reject_if_link_retired trigger rejects writes
     against retired prep_sample_to_study links; surfaces as
     asyncpg.RaiseError. The unique-per-field and one-value-per-global-
-    concept indexes surface as asyncpg.UniqueViolationError.
+    field indexes surface as asyncpg.UniqueViolationError.
     """
     # Single INSERT; value_text is the only value column populated. The
     # other five value columns belong to sibling functions for those
@@ -293,3 +366,71 @@ async def insert_prep_sample_metadata_date(
         value_date,
         created_by_idx,
     )
+
+
+async def insert_typed_metadata_for_prep_sample(
+    conn: asyncpg.Connection,
+    *,
+    entity_idx: int,
+    study_field_idx: int,
+    data_type: FieldDataType,
+    value: str | Decimal | date,
+    created_by_idx: int,
+) -> int:
+    """Dispatch a typed metadata INSERT on data_type and return the new idx.
+
+    Bound into PREP_SAMPLE_METADATA_SPEC.insert_typed_metadata so the
+    cross-entity write function in repositories.__init__ can issue the
+    INSERT without naming a prep-sample-specific function. The else
+    branch covers FieldDataType members the if/elif chain does not name
+    (BOOLEAN, TERMINOLOGY today); it is unreachable in practice because
+    composer pre-flights and write_global_metadata_or_diagnose callers
+    screen unsupported types before reaching here.
+    """
+    # Dispatch on the field's data_type; the typed inserter validates value
+    # column placement on its own.
+    if data_type is FieldDataType.TEXT:
+        return await insert_prep_sample_metadata_text(
+            conn,
+            prep_sample_idx=entity_idx,
+            prep_sample_study_field_idx=study_field_idx,
+            value_text=value,
+            created_by_idx=created_by_idx,
+        )
+    if data_type is FieldDataType.NUMERIC:
+        return await insert_prep_sample_metadata_numeric(
+            conn,
+            prep_sample_idx=entity_idx,
+            prep_sample_study_field_idx=study_field_idx,
+            value_numeric=value,
+            created_by_idx=created_by_idx,
+        )
+    if data_type is FieldDataType.DATE:
+        return await insert_prep_sample_metadata_date(
+            conn,
+            prep_sample_idx=entity_idx,
+            prep_sample_study_field_idx=study_field_idx,
+            value_date=value,
+            created_by_idx=created_by_idx,
+        )
+    raise NotImplementedError(
+        f"prep_sample metadata insert for data_type={data_type} is not yet implemented"
+    )
+
+
+# ---------------------------------------------------------------------------
+# EntityMetadataSpec for prep_sample (consumed by write_global_metadata_or_diagnose)
+# ---------------------------------------------------------------------------
+
+PREP_SAMPLE_METADATA_SPEC = EntityMetadataSpec(
+    entity_kind=SampleEntityKind.PREP_SAMPLE,
+    metadata_table="qiita.prep_sample_metadata",
+    entity_key_column="prep_sample_idx",
+    study_field_table="qiita.prep_sample_study_field",
+    study_field_idx_column="prep_sample_study_field_idx",
+    global_field_unique_index_name="prep_sample_metadata_one_value_per_global_field",
+    local_unique_per_field_index_name="prep_sample_metadata_unique_per_field",
+    get_or_create_globally_linked_field=get_or_create_globally_linked_prep_sample_study_field,
+    get_or_create_local_field=get_or_create_local_prep_sample_study_field,
+    insert_typed_metadata=insert_typed_metadata_for_prep_sample,
+)

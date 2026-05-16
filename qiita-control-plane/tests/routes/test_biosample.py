@@ -184,8 +184,8 @@ async def _post_biosample(client, ctx, study_idx: int, **body):
         rj = resp.json()
         ctx["created"]["biosample"].append(rj["biosample_idx"])
         ctx["created"]["biosample_to_study"].append((rj["biosample_idx"], study_idx))
-        if rj["biosample_study_field_created"]:
-            ctx["created"]["biosample_study_field"].append(rj["biosample_study_field_idx"])
+        if rj["owner_id_biosample_study_field_created"]:
+            ctx["created"]["biosample_study_field"].append(rj["owner_id_biosample_study_field_idx"])
         meta_idx = await ctx["pool"].fetchval(
             "SELECT idx FROM qiita.biosample_metadata"
             " WHERE biosample_idx = $1 AND is_owner_biosample_id = true",
@@ -197,7 +197,7 @@ async def _post_biosample(client, ctx, study_idx: int, **body):
 
 
 async def _track_global_metadata_outputs(ctx, bs_idx, study_idx, global_idxs):
-    """Track globally-linked study fields (by global concept idx) and every
+    """Track globally-linked study fields (by global field idx) and every
     non-owner-id metadata row written for this biosample. Use after
     `_post_biosample` in tests that exercised the metadata dict path so
     the FK-reverse cleanup picks the new rows up. Mirrors the sibling
@@ -205,7 +205,7 @@ async def _track_global_metadata_outputs(ctx, bs_idx, study_idx, global_idxs):
     parallel.
     """
     # Pick up every globally-linked study field row at this study tied to
-    # one of the supplied global concepts.
+    # one of the supplied global fields.
     rows = await ctx["pool"].fetch(
         "SELECT idx FROM qiita.biosample_study_field"
         " WHERE study_idx = $1 AND biosample_global_field_idx = ANY($2::bigint[])",
@@ -259,8 +259,8 @@ async def test_post_biosample_wet_lab_admin_self_owner(ctx):
         # The Field(gt=0) constraint on BiosampleImportResponse already
         # rejects a zero idx at the route boundary.
         "biosample_idx": rj["biosample_idx"],
-        "biosample_study_field_idx": rj["biosample_study_field_idx"],
-        "biosample_study_field_created": True,
+        "owner_id_biosample_study_field_idx": rj["owner_id_biosample_study_field_idx"],
+        "owner_id_biosample_study_field_created": True,
     }
     assert rj == expected
 
@@ -321,8 +321,8 @@ async def test_post_biosample_system_admin_on_behalf_of_other_user(ctx):
 
 async def test_post_biosample_response_reports_field_created_flag_states(ctx):
     # Two consecutive POSTs with the same owner_biosample_id_field_name
-    # must report biosample_study_field_created=True then False, with both
-    # responses pointing at the same biosample_study_field_idx.
+    # must report owner_id_biosample_study_field_created=True then False, with both
+    # responses pointing at the same owner_id_biosample_study_field_idx.
     study_idx = await _seed_study(
         ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="reuse"
     )
@@ -348,9 +348,9 @@ async def test_post_biosample_response_reports_field_created_flag_states(ctx):
     assert r1.status_code == 201, r1.text
     assert r2.status_code == 201, r2.text
     rj1, rj2 = r1.json(), r2.json()
-    assert rj1["biosample_study_field_created"] is True
-    assert rj2["biosample_study_field_created"] is False
-    assert rj1["biosample_study_field_idx"] == rj2["biosample_study_field_idx"]
+    assert rj1["owner_id_biosample_study_field_created"] is True
+    assert rj2["owner_id_biosample_study_field_created"] is False
+    assert rj1["owner_id_biosample_study_field_idx"] == rj2["owner_id_biosample_study_field_idx"]
 
 
 # ===========================================================================
@@ -594,10 +594,10 @@ async def test_post_biosample_bad_metadata_checklist_idx_422(ctx):
 
 
 async def test_post_biosample_metadata_writes_global_fields(ctx):
-    # Seed two global concepts (DATE and NUMERIC) and post metadata that
+    # Seed two global fields (DATE and NUMERIC) and post metadata that
     # references both by display_name. Verify the route round-trips the
     # parsed values into the matching value_* columns and creates one
-    # globally-linked study field per concept.
+    # globally-linked study field per global field.
     suffix = secrets.token_hex(4)
     date_global = await seed_biosample_global_field(
         ctx["pool"],
@@ -756,9 +756,9 @@ async def test_post_biosample_metadata_owner_id_collision_422(ctx):
 
 
 async def test_post_biosample_metadata_uses_seeded_globals(ctx):
-    # Realistic 6-field MIxS-style import that resolves global concepts
+    # Realistic 6-field MIxS-style import that resolves global fields
     # against the rows seeded by migration 20260501000014 instead of
-    # creating throwaway concepts. Cleanup tracks only the per-test
+    # creating throwaway global fields. Cleanup tracks only the per-test
     # study-field and metadata rows so the seeded globals survive.
     display_names = [
         "collection date",

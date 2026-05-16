@@ -308,11 +308,17 @@ class BiosampleImportRequest(BaseModel):
 
 
 class BiosampleImportResponse(BaseModel):
-    """Returned by POST /api/v1/study/{study_idx}/biosample on success."""
+    """Returned by POST /api/v1/study/{study_idx}/biosample on success.
+
+    `owner_id_biosample_study_field_*` name the biosample_study_field row
+    that holds the owner-biosample-id for this study — the purely-local,
+    PII-tier-pinned field flagged is_owner_biosample_id=True on the
+    associated biosample_metadata row.
+    """
 
     biosample_idx: Annotated[int, Field(gt=0)]
-    biosample_study_field_idx: Annotated[int, Field(gt=0)]
-    biosample_study_field_created: bool
+    owner_id_biosample_study_field_idx: Annotated[int, Field(gt=0)]
+    owner_id_biosample_study_field_created: bool
 
 
 class GlobalMetadataEntry(BaseModel):
@@ -920,11 +926,17 @@ class SequencedSampleCreateRequest(BaseModel):
 
     Atomically creates a prep_sample row (with processing_kind='sequenced'),
     its 1:1 sequenced_sample subtype row, one prep_sample_to_study link
-    per study in `study_idxs`, and one prep_sample_metadata row per
-    metadata entry (resolved against prep_sample_global_field by
-    display_name). Currently rejects len(study_idxs) > 1 at the route
-    boundary: multi-study assignment requires a future schema decision
-    about which study owns the per-display_name field row.
+    for `primary_study_idx` plus one per entry in `secondary_study_idxs`,
+    and one prep_sample_metadata row per metadata entry (resolved against
+    prep_sample_global_field by display_name).
+
+    `primary_study_idx` owns the per-display_name prep_sample_study_field
+    rows the composer writes for `metadata`; secondary studies see those
+    values through the global field slot but do not own the field row.
+    The asymmetry is forced by the schema: a prep_sample has at most one
+    prep_sample_study_field per global_field_idx, so exactly one of the
+    linked studies must be designated. `secondary_study_idxs` must not
+    contain `primary_study_idx`.
 
     `metadata` keys must match seeded prep_sample_global_field display_name
     values; unknown names surface as a single 422 listing every bad key.
@@ -938,25 +950,28 @@ class SequencedSampleCreateRequest(BaseModel):
     prep_protocol_idx: Annotated[int, Field(gt=0)]
     owner_idx: Annotated[int, Field(gt=0)]
     sequenced_pool_item_id: str = Field(min_length=1)
-    study_idxs: list[Annotated[int, Field(gt=0)]] = Field(min_length=1, max_length=1)
+    primary_study_idx: Annotated[int, Field(gt=0)]
+    secondary_study_idxs: list[Annotated[int, Field(gt=0)]] = Field(default_factory=list)
     metadata: dict[str, str] = Field(default_factory=dict)
     metadata_checklist_idx: Annotated[int, Field(gt=0)] | None = None
     ena_experiment_accession: str | None = Field(default=None, max_length=50)
     ena_run_accession: str | None = Field(default=None, max_length=50)
 
+    @model_validator(mode="after")
+    def primary_not_in_secondary(self):
+        if self.primary_study_idx in self.secondary_study_idxs:
+            raise ValueError(
+                f"primary_study_idx ({self.primary_study_idx}) must not appear"
+                " in secondary_study_idxs"
+            )
+        return self
+
 
 class SequencedSampleCreateResponse(BaseModel):
-    """Returned by the sequenced-sample composer POST on success.
-
-    `prep_sample_study_fields` maps each metadata display_name to a
-    `(study_field_idx, created)` pair so the caller can tell which
-    per-study prep_sample_study_field rows were created on this call
-    versus reused from a prior write.
-    """
+    """Returned by the sequenced-sample composer POST on success."""
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     sequenced_sample_idx: Annotated[int, Field(gt=0)]
-    prep_sample_study_fields: dict[str, tuple[Annotated[int, Field(gt=0)], bool]]
 
 
 class SequencedSampleResponse(BaseModel):

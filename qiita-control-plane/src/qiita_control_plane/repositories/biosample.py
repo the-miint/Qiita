@@ -17,28 +17,27 @@ either a pool or a connection so they compose inside an open transaction
 or stand alone.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 
 import asyncpg
-from qiita_common.models import FieldDataType, Tier
+from qiita_common.models import Tier
 
-from . import (
+from . import require_transaction, validate_patch_fields
+from ._sample_helpers import (
     GlobalFieldRow,
     MetadataUnknownFieldsError,
     SampleEntityKind,
     parse_text_for_data_type,
-    require_transaction,
-    validate_patch_fields,
+    write_global_metadata_or_diagnose,
 )
 from .biosample_metadata import (
+    BIOSAMPLE_METADATA_SPEC,
     BiosampleOwnerIdFieldCollisionError,
     fetch_biosample_global_fields_by_display_names,
-    get_or_create_globally_linked_biosample_study_field,
     get_or_create_local_biosample_study_field,
-    insert_biosample_metadata_date,
-    insert_biosample_metadata_numeric,
     insert_biosample_metadata_text,
 )
 
@@ -290,17 +289,24 @@ async def insert_biosample_to_study(
 
 @dataclass(frozen=True)
 class BiosampleImportResult:
-    """Composite return shape for import_biosample_from_owner_biosample_id."""
+    """Composite return shape for import_biosample_from_owner_biosample_id.
+
+    owner_id_biosample_study_field_* name the biosample_study_field row
+    that holds the owner-biosample-id for this study — the purely-local,
+    PII-tier-pinned field flagged is_owner_biosample_id=True on the
+    associated biosample_metadata row.
+    """
 
     biosample_idx: int
-    biosample_study_field_idx: int
-    biosample_study_field_created: bool
+    owner_id_biosample_study_field_idx: int
+    owner_id_biosample_study_field_created: bool
 
 
 async def import_biosample_from_owner_biosample_id(
     conn: asyncpg.Connection,
     *,
-    study_idx: int,
+    primary_study_idx: int,
+    secondary_study_idxs: Sequence[int] = (),
     owner_idx: int,
     owner_biosample_id_field_name: str,
     owner_biosample_id_value: str,
@@ -312,12 +318,30 @@ async def import_biosample_from_owner_biosample_id(
 ) -> BiosampleImportResult:
     """Import one biosample with its owner-id and any globally-linked metadata.
 
-    Creates the biosample, links it to the study, writes any supplied metadata
-    against globally-linked biosample_study_field rows (auto-creating each
-    linked field on first use), and writes the owner-biosample-id metadata
-    value against a purely-local biosample_study_field flagged
-    is_owner_biosample_id=True. Returns a BiosampleImportResult naming the
-    new biosample plus the owner-biosample-id field row.
+    Creates the biosample, links it to primary_study_idx plus every entry
+    in secondary_study_idxs, writes any supplied metadata against
+    globally-linked biosample_study_field rows on primary_study_idx
+    (auto-creating each linked field on first use), and writes the
+    owner-biosample-id metadata value against a purely-local
+    biosample_study_field on primary_study_idx flagged
+    is_owner_biosample_id=True. Returns a BiosampleImportResult naming
+    the new biosample plus the owner-biosample-id field row.
+
+    primary_study_idx owns the globally-linked field rows and the
+    owner-biosample-id local field row; secondary studies share the
+    value through the global field slot but do not own the field
+    row. The asymmetry mirrors create_sequenced_prep_sample so the
+    composers stay parallel. The current POST
+    /api/v1/study/{study_idx}/biosample route only ever passes the
+    path study as primary with no secondaries: biosamples are created
+    *for a study* so they naturally start with one link, whereas
+    prep_samples are created *for a sequencing run* which is not
+    scoped to a single study. The multi-study path is kept available
+    on the composer so a future route or admin tool can exercise it
+    without reshaping this function.
+
+    primary_study_idx must not also appear in secondary_study_idxs; the
+    composer raises ValueError if it does.
 
     The metadata dict maps biosample_global_field.display_name to a text
     value; values are parsed into the Python type matching the global
@@ -340,6 +364,15 @@ async def import_biosample_from_owner_biosample_id(
     """
     # Fail-fast guard against caller forgetting to wrap in a transaction.
     require_transaction(conn)
+
+    # Reject primary appearing in the secondary list at the composer
+    # boundary. Mirrors the wire-level guard on
+    # SequencedSampleCreateRequest; the biosample wire model holds at
+    # single-study so this guard is the only check.
+    if primary_study_idx in secondary_study_idxs:
+        raise ValueError(
+            f"primary_study_idx ({primary_study_idx}) must not appear in secondary_study_idxs"
+        )
 
     # Pre-flight: pure-logic collision check between the owner-id field
     # name and the metadata dict's keys. The owner-id row is purely-local;
@@ -375,66 +408,39 @@ async def import_biosample_from_owner_biosample_id(
         ena_sample_accession=ena_sample_accession,
     )
 
-    # Step b: link the biosample to the study.
-    await insert_biosample_to_study(
-        conn,
-        biosample_idx=bs_idx,
-        study_idx=study_idx,
-        created_by_idx=caller_idx,
-    )
-
-    # Step c: write each globally-linked metadata entry. The study field row
-    # is upserted on first use; subsequent entries on the same study reuse it.
-    for global_row, parsed_value in parsed_metadata:
-        linked_field_idx, _ = await get_or_create_globally_linked_biosample_study_field(
+    # Step b: link the biosample to every requested study. Primary first
+    # so its link row carries the smallest created_at ordering;
+    # secondaries sorted ascending for deterministic error reporting.
+    for study_idx in [primary_study_idx, *sorted(secondary_study_idxs)]:
+        await insert_biosample_to_study(
             conn,
+            biosample_idx=bs_idx,
             study_idx=study_idx,
-            biosample_global_field_idx=global_row.idx,
-            display_name=global_row.display_name,
             created_by_idx=caller_idx,
         )
-        # Dispatch on the global field's data_type. The else branch covers
-        # FieldDataType members the if/elif chain does not name (BOOLEAN,
-        # TERMINOLOGY today); it is unreachable in practice because
-        # parse_text_for_data_type raises NotImplementedError for those
-        # types in the pre-flight parse pass. A future maintainer adding
-        # BOOLEAN/TERMINOLOGY support must extend both the parser and this
-        # dispatch.
-        if global_row.data_type is FieldDataType.TEXT:
-            await insert_biosample_metadata_text(
-                conn,
-                biosample_idx=bs_idx,
-                biosample_study_field_idx=linked_field_idx,
-                value_text=parsed_value,
-                created_by_idx=caller_idx,
-            )
-        elif global_row.data_type is FieldDataType.NUMERIC:
-            await insert_biosample_metadata_numeric(
-                conn,
-                biosample_idx=bs_idx,
-                biosample_study_field_idx=linked_field_idx,
-                value_numeric=parsed_value,
-                created_by_idx=caller_idx,
-            )
-        elif global_row.data_type is FieldDataType.DATE:
-            await insert_biosample_metadata_date(
-                conn,
-                biosample_idx=bs_idx,
-                biosample_study_field_idx=linked_field_idx,
-                value_date=parsed_value,
-                created_by_idx=caller_idx,
-            )
-        else:
-            raise NotImplementedError(
-                f"metadata insert for data_type={global_row.data_type} is not yet implemented"
-            )
 
-    # Step d: find or create the local owner-biosample-id field on this study.
-    # The tier_override pins the field above any study-level default so the
-    # owner display value never surfaces to non-members (PII concern).
-    field_idx, field_created = await get_or_create_local_biosample_study_field(
+    # Step c: write each globally-linked metadata entry against
+    # primary_study_idx, the field-owning study.
+    for global_row, parsed_value in parsed_metadata:
+        await write_global_metadata_or_diagnose(
+            conn,
+            spec=BIOSAMPLE_METADATA_SPEC,
+            entity_idx=bs_idx,
+            study_idx=primary_study_idx,
+            global_field_idx=global_row.idx,
+            display_name=global_row.display_name,
+            data_type=global_row.data_type,
+            value=parsed_value,
+            caller_idx=caller_idx,
+        )
+
+    # Step d: find or create the local owner-biosample-id field on
+    # primary_study_idx. The tier_override pins the field above any
+    # study-level default so the owner display value never surfaces to
+    # non-members (PII concern).
+    field_idx, field_created, _ = await get_or_create_local_biosample_study_field(
         conn,
-        study_idx=study_idx,
+        study_idx=primary_study_idx,
         display_name=owner_biosample_id_field_name,
         created_by_idx=caller_idx,
         required=True,
@@ -453,6 +459,6 @@ async def import_biosample_from_owner_biosample_id(
 
     return BiosampleImportResult(
         biosample_idx=bs_idx,
-        biosample_study_field_idx=field_idx,
-        biosample_study_field_created=field_created,
+        owner_id_biosample_study_field_idx=field_idx,
+        owner_id_biosample_study_field_created=field_created,
     )

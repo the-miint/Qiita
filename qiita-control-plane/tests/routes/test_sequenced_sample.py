@@ -2,12 +2,13 @@
 
   POST /api/v1/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample
 
-Exercises happy paths, the role / scope guards, regular-user rejection,
-Pydantic body validation, the (run, pool) path-consistency 422, owner
-eligibility 422, unknown-metadata-field 422, missing biosample-link 422,
-duplicate sequenced_pool_item_id 409, and full transaction rollback on
-trigger-raised failures. The v1 multi-study rejection is exercised via
-the Pydantic max_length=1 boundary.
+Exercises happy paths (single-study and multi-study via primary +
+secondary), the role / scope guards, regular-user rejection, Pydantic
+body validation including the primary-in-secondary rejection, the
+(run, pool) path-consistency 422, owner eligibility 422,
+unknown-metadata-field 422, missing biosample-link 422, duplicate
+sequenced_pool_item_id 409, and full transaction rollback on
+trigger-raised failures.
 """
 
 import secrets
@@ -53,7 +54,7 @@ async def _cleanup_tracked(pool, created: dict) -> None:
 
     Order matters because of ON DELETE RESTRICT FKs throughout the chain:
       prep_sample_metadata
-      prep_sample_study_field (only created=True rows)
+      prep_sample_study_field (bulk-scoped to test-owned studies)
       prep_sample_to_study (composite PK)
       sequenced_sample
       prep_sample
@@ -63,9 +64,19 @@ async def _cleanup_tracked(pool, created: dict) -> None:
       biosample
       study
       principals
+
+    prep_sample_study_field rows are bulk-deleted by parent study because
+    each test seeds its own study (see _seed_study) — no other test can
+    plant fields on a study this test owns, so the parent-FK delete is
+    safe and avoids the per-row snapshot bookkeeping the response payload
+    used to enable.
     """
     await delete_idxs(pool, "prep_sample_metadata", created["prep_sample_metadata"])
-    await delete_idxs(pool, "prep_sample_study_field", created["prep_sample_study_field"])
+    if created["study"]:
+        await pool.execute(
+            "DELETE FROM qiita.prep_sample_study_field WHERE study_idx = ANY($1::bigint[])",
+            created["study"],
+        )
     for ps, st in created["prep_sample_to_study"]:
         await pool.execute(
             "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = $1 AND study_idx = $2",
@@ -115,7 +126,6 @@ async def ctx(role_keyed_clients):
     inputs the test seeds)."""
     created: dict = {
         "prep_sample_metadata": [],
-        "prep_sample_study_field": [],
         "prep_sample_to_study": [],
         "sequenced_sample": [],
         "prep_sample": [],
@@ -206,8 +216,10 @@ async def _post_sequenced_sample(client, ctx, run_idx, pool_idx, **body):
         ss_idx = rj["sequenced_sample_idx"]
         ctx["created"]["prep_sample"].append(ps_idx)
         ctx["created"]["sequenced_sample"].append(ss_idx)
-        # Track every per-test study link the composer wrote.
-        for st in body["study_idxs"]:
+        # Track every per-test study link the composer wrote: the primary
+        # plus any secondaries.
+        ctx["created"]["prep_sample_to_study"].append((ps_idx, body["primary_study_idx"]))
+        for st in body.get("secondary_study_idxs", []):
             ctx["created"]["prep_sample_to_study"].append((ps_idx, st))
         # Track prep_sample_metadata rows by looking them up after the call.
         meta_rows = await ctx["pool"].fetch(
@@ -216,11 +228,6 @@ async def _post_sequenced_sample(client, ctx, run_idx, pool_idx, **body):
         )
         for r in meta_rows:
             ctx["created"]["prep_sample_metadata"].append(r["idx"])
-        # Track only created-True study fields so we do not double-delete
-        # rows a sibling test left behind.
-        for _name, (field_idx, created_flag) in rj["prep_sample_study_fields"].items():
-            if created_flag:
-                ctx["created"]["prep_sample_study_field"].append(field_idx)
     return resp
 
 
@@ -252,7 +259,7 @@ async def test_create_sequenced_sample_wet_lab_admin_minimal(ctx):
         prep_protocol_idx=protocol_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
         sequenced_pool_item_id=item_id,
-        study_idxs=[study_idx],
+        primary_study_idx=study_idx,
     )
     assert resp.status_code == 201, resp.text
     rj = resp.json()
@@ -261,8 +268,6 @@ async def test_create_sequenced_sample_wet_lab_admin_minimal(ctx):
         # confirms field presence without pinning idx values.
         "prep_sample_idx": rj["prep_sample_idx"],
         "sequenced_sample_idx": rj["sequenced_sample_idx"],
-        # No metadata supplied, so no study-field rows were created.
-        "prep_sample_study_fields": {},
     }
     assert rj == expected
 
@@ -321,21 +326,15 @@ async def test_create_sequenced_sample_with_metadata(ctx):
         prep_protocol_idx=protocol_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
         sequenced_pool_item_id=item_id,
-        study_idxs=[study_idx],
+        primary_study_idx=study_idx,
         metadata={"Alias": "amp-001", "Title": "Wet-lab amplicon prep 001"},
     )
     assert resp.status_code == 201, resp.text
     rj = resp.json()
 
-    # The composer creates one study-field row per metadata key on first
-    # use; both flags must be True since this is the first import on the
-    # fresh study.
-    assert set(rj["prep_sample_study_fields"]) == {"Alias", "Title"}
-    for _name, (field_idx, created) in rj["prep_sample_study_fields"].items():
-        assert created is True
-        assert field_idx > 0
-
     # Verify the two metadata rows landed with the right text values.
+    # The join through prep_sample_study_field implicitly proves both
+    # field rows were created on this fresh study.
     rows = await ctx["pool"].fetch(
         "SELECT psf.display_name, psm.value_text"
         " FROM qiita.prep_sample_metadata psm"
@@ -349,54 +348,6 @@ async def test_create_sequenced_sample_with_metadata(ctx):
         ("Alias", "amp-001"),
         ("Title", "Wet-lab amplicon prep 001"),
     ]
-
-
-async def test_create_sequenced_sample_reuses_study_field_on_second_call(ctx):
-    # Two consecutive POSTs targeting the same metadata key on the same
-    # study must report prep_sample_study_field_created=True then False,
-    # with both responses pointing at the same study-field idx.
-    run_idx, pool_idx = await _seed_run_and_pool(ctx, "wet-reuse")
-    study_idx = await _seed_study(
-        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="reuse"
-    )
-    bs_idx = await _seed_biosample_linked_to_study(
-        ctx,
-        owner_idx=ctx["wet_session"]["principal_idx"],
-        study_idx=study_idx,
-    )
-    protocol_idx = await _fetch_prep_protocol_idx(ctx)
-
-    common = dict(
-        biosample_idx=bs_idx,
-        prep_protocol_idx=protocol_idx,
-        owner_idx=ctx["wet_session"]["principal_idx"],
-        study_idxs=[study_idx],
-        metadata={"Alias": "v1"},
-    )
-    r1 = await _post_sequenced_sample(
-        ctx["wet"],
-        ctx,
-        run_idx,
-        pool_idx,
-        sequenced_pool_item_id=_unique_item_id("REUSE-A"),
-        **common,
-    )
-    r2 = await _post_sequenced_sample(
-        ctx["wet"],
-        ctx,
-        run_idx,
-        pool_idx,
-        sequenced_pool_item_id=_unique_item_id("REUSE-B"),
-        **common,
-    )
-    assert r1.status_code == 201, r1.text
-    assert r2.status_code == 201, r2.text
-
-    f1_idx, f1_created = r1.json()["prep_sample_study_fields"]["Alias"]
-    f2_idx, f2_created = r2.json()["prep_sample_study_fields"]["Alias"]
-    assert f1_created is True
-    assert f2_created is False
-    assert f1_idx == f2_idx
 
 
 # ===========================================================================
@@ -415,7 +366,7 @@ async def test_create_sequenced_sample_anonymous_401(ctx):
                 "prep_protocol_idx": 1,
                 "owner_idx": 1,
                 "sequenced_pool_item_id": "X",
-                "study_idxs": [1],
+                "primary_study_idx": 1,
             },
         )
     assert resp.status_code == 401
@@ -430,7 +381,7 @@ async def test_create_sequenced_sample_missing_scope_403(ctx, no_prep_sample_wri
             "prep_protocol_idx": 1,
             "owner_idx": 1,
             "sequenced_pool_item_id": "X",
-            "study_idxs": [1],
+            "primary_study_idx": 1,
         },
     )
     assert resp.status_code == 403
@@ -453,7 +404,7 @@ async def test_create_sequenced_sample_regular_user_role_403(
             "prep_protocol_idx": 1,
             "owner_idx": 1,
             "sequenced_pool_item_id": "X",
-            "study_idxs": [1],
+            "primary_study_idx": 1,
         },
     )
     assert resp.status_code == 403
@@ -496,7 +447,7 @@ async def test_create_sequenced_sample_owner_ineligibility_422(ctx, kind: Inelig
             prep_protocol_idx=protocol_idx,
             owner_idx=idx,
             sequenced_pool_item_id=_unique_item_id("ELIG"),
-            study_idxs=[study_idx],
+            primary_study_idx=study_idx,
         )
 
     await assert_owner_ineligibility_422(
@@ -521,7 +472,7 @@ async def test_create_sequenced_sample_nonexistent_pool_404(ctx):
             "prep_protocol_idx": 1,
             "owner_idx": ctx["wet_session"]["principal_idx"],
             "sequenced_pool_item_id": "X",
-            "study_idxs": [1],
+            "primary_study_idx": 1,
         },
     )
     assert resp.status_code == 404
@@ -540,16 +491,17 @@ async def test_create_sequenced_sample_pool_belongs_to_different_run_422(ctx):
             "prep_protocol_idx": 1,
             "owner_idx": ctx["wet_session"]["principal_idx"],
             "sequenced_pool_item_id": "X",
-            "study_idxs": [1],
+            "primary_study_idx": 1,
         },
     )
     assert resp.status_code == 422
     assert "does not belong to" in resp.json()["detail"]
 
 
-async def test_create_sequenced_sample_empty_study_idxs_422(ctx):
-    # Pydantic min_length=1 rejects an empty study_idxs list.
-    run_idx, pool_idx = await _seed_run_and_pool(ctx, "no-study")
+async def test_create_sequenced_sample_primary_in_secondary_422(ctx):
+    # The model_validator on SequencedSampleCreateRequest rejects a request
+    # whose primary_study_idx also appears in secondary_study_idxs.
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "p-in-s")
     resp = await ctx["wet"].post(
         f"/api/v1/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample",
         json={
@@ -557,27 +509,64 @@ async def test_create_sequenced_sample_empty_study_idxs_422(ctx):
             "prep_protocol_idx": 1,
             "owner_idx": ctx["wet_session"]["principal_idx"],
             "sequenced_pool_item_id": "X",
-            "study_idxs": [],
+            "primary_study_idx": 1,
+            "secondary_study_idxs": [1, 2],
         },
     )
     assert resp.status_code == 422
+    assert any("primary_study_idx" in err.get("msg", "") for err in resp.json()["detail"])
 
 
-async def test_create_sequenced_sample_multi_study_422(ctx):
-    # Pydantic max_length=1 enforces the current multi-study rejection at the
-    # body-validation layer.
-    run_idx, pool_idx = await _seed_run_and_pool(ctx, "multi")
-    resp = await ctx["wet"].post(
-        f"/api/v1/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample",
-        json={
-            "biosample_idx": 1,
-            "prep_protocol_idx": 1,
-            "owner_idx": ctx["wet_session"]["principal_idx"],
-            "sequenced_pool_item_id": "X",
-            "study_idxs": [1, 2],
-        },
+async def test_create_sequenced_sample_multi_study_happy_path(ctx):
+    # Two studies, both linked to the biosample. Primary owns the metadata
+    # field row; secondary still gets a prep_sample_to_study row but does
+    # not own a prep_sample_study_field.
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "multi-ok")
+    primary_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="multi-ok-p"
     )
-    assert resp.status_code == 422
+    secondary_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="multi-ok-s"
+    )
+    # Biosample must be linked to every requested study or the
+    # prep_sample_to_study_reject_without_biosample_link trigger fires.
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        study_idx=primary_idx,
+    )
+    await seed_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=bs_idx,
+        study_idx=secondary_idx,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["biosample_to_study"].append((bs_idx, secondary_idx))
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        sequenced_pool_item_id=_unique_item_id("MULTI"),
+        primary_study_idx=primary_idx,
+        secondary_study_idxs=[secondary_idx],
+        metadata={"Alias": "multi-001"},
+    )
+    assert resp.status_code == 201, resp.text
+    rj = resp.json()
+
+    # Both prep_sample_to_study rows landed.
+    linked = await ctx["pool"].fetch(
+        "SELECT study_idx FROM qiita.prep_sample_to_study WHERE prep_sample_idx = $1"
+        " ORDER BY study_idx",
+        rj["prep_sample_idx"],
+    )
+    assert sorted(r["study_idx"] for r in linked) == sorted([primary_idx, secondary_idx])
 
 
 async def test_create_sequenced_sample_extra_field_422(ctx):
@@ -590,7 +579,7 @@ async def test_create_sequenced_sample_extra_field_422(ctx):
             "prep_protocol_idx": 1,
             "owner_idx": ctx["wet_session"]["principal_idx"],
             "sequenced_pool_item_id": "X",
-            "study_idxs": [1],
+            "primary_study_idx": 1,
             "not_a_field": 5,
         },
     )
@@ -609,7 +598,7 @@ async def test_create_sequenced_sample_missing_required_field_422(ctx):
     assert ("body", "prep_protocol_idx") in missing_locs
     assert ("body", "owner_idx") in missing_locs
     assert ("body", "sequenced_pool_item_id") in missing_locs
-    assert ("body", "study_idxs") in missing_locs
+    assert ("body", "primary_study_idx") in missing_locs
 
 
 # ===========================================================================
@@ -638,7 +627,7 @@ async def test_create_sequenced_sample_unknown_metadata_field_422(ctx):
         prep_protocol_idx=protocol_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
         sequenced_pool_item_id=_unique_item_id("UNK"),
-        study_idxs=[study_idx],
+        primary_study_idx=study_idx,
         metadata={bad_a: "x", bad_b: "y"},
     )
     assert resp.status_code == 422
@@ -673,7 +662,7 @@ async def test_create_sequenced_sample_missing_biosample_link_422(ctx):
         prep_protocol_idx=protocol_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
         sequenced_pool_item_id=_unique_item_id("NOLINK"),
-        study_idxs=[study_idx],
+        primary_study_idx=study_idx,
     )
     assert resp.status_code == 422
     assert "not linked" in resp.json()["detail"]
@@ -706,7 +695,7 @@ async def test_create_sequenced_sample_duplicate_pool_item_id_409(ctx):
         prep_protocol_idx=protocol_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
         sequenced_pool_item_id=item_id,
-        study_idxs=[study_idx],
+        primary_study_idx=study_idx,
     )
     r1 = await _post_sequenced_sample(ctx["wet"], ctx, run_idx, pool_idx, **common)
     r2 = await _post_sequenced_sample(ctx["wet"], ctx, run_idx, pool_idx, **common)
@@ -735,7 +724,7 @@ async def test_create_sequenced_sample_unknown_biosample_idx_422(ctx):
         prep_protocol_idx=protocol_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
         sequenced_pool_item_id=_unique_item_id("BAD-BS"),
-        study_idxs=[study_idx],
+        primary_study_idx=study_idx,
     )
     assert resp.status_code == 422
     assert "biosample" in resp.json()["detail"]
@@ -771,7 +760,7 @@ async def test_create_sequenced_sample_system_admin_happy_path(ctx):
         prep_protocol_idx=protocol_idx,
         owner_idx=target_idx,
         sequenced_pool_item_id=_unique_item_id("ADM"),
-        study_idxs=[study_idx],
+        primary_study_idx=study_idx,
     )
     assert resp.status_code == 201, resp.text
 
@@ -824,7 +813,7 @@ async def _seed_one_sequenced_sample(
         prep_protocol_idx=protocol_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
         sequenced_pool_item_id=item_id,
-        study_idxs=[study_idx],
+        primary_study_idx=study_idx,
         metadata=metadata or {},
     )
     assert resp.status_code == 201, resp.text
@@ -959,7 +948,7 @@ async def test_list_sequenced_sample_idxs_wet_lab_admin_returns_newest_first(ctx
             prep_protocol_idx=protocol_idx,
             owner_idx=ctx["wet_session"]["principal_idx"],
             sequenced_pool_item_id=_unique_item_id(f"LIST-{suffix}"),
-            study_idxs=[study_idx],
+            primary_study_idx=study_idx,
         )
         assert resp.status_code == 201, resp.text
         ss_ids.append(resp.json()["sequenced_sample_idx"])
@@ -1002,7 +991,7 @@ async def test_list_sequenced_sample_idxs_excludes_retired_prep_sample(ctx):
             prep_protocol_idx=protocol_idx,
             owner_idx=ctx["wet_session"]["principal_idx"],
             sequenced_pool_item_id=_unique_item_id(f"RET-{suffix}"),
-            study_idxs=[study_idx],
+            primary_study_idx=study_idx,
         )
         assert resp.status_code == 201, resp.text
         landed.append(resp.json())

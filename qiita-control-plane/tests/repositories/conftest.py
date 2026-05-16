@@ -234,28 +234,44 @@ async def ctx(postgres_pool):
 # ---------------------------------------------------------------------------
 
 
+async def _insert_owned_biosample(conn, ctx):
+    """Insert a biosample owned by ctx['principal_idx'] on the given conn,
+    return its idx. Shared by the standalone and linked create helpers so
+    the owner/creator wiring lives in one place.
+    """
+    return await insert_biosample(
+        conn,
+        owner_idx=ctx["principal_idx"],
+        created_by_idx=ctx["principal_idx"],
+    )
+
+
 async def _create_biosample(ctx):
     """Helper: create a biosample owned by ctx['principal_idx'], track for cleanup."""
     async with ctx["pool"].acquire() as conn:
-        idx = await insert_biosample(
-            conn,
-            owner_idx=ctx["principal_idx"],
-            created_by_idx=ctx["principal_idx"],
-        )
+        idx = await _insert_owned_biosample(conn, ctx)
     ctx["created"]["biosample"].append(idx)
     return idx
 
 
 async def _create_biosample_with_link(ctx):
-    """Helper: create a biosample, link it to ctx['study_idx'], track both."""
-    bs_idx = await _create_biosample(ctx)
+    """Helper: atomically create a biosample and link it to ctx['study_idx'],
+    tracking both for cleanup.
+
+    Both inserts share one connection and one transaction so a failed link
+    cannot leak an orphan biosample row for teardown to mop up. The
+    tracking-dict appends run only after the transaction commits.
+    """
     async with ctx["pool"].acquire() as conn:
-        await insert_biosample_to_study(
-            conn,
-            biosample_idx=bs_idx,
-            study_idx=ctx["study_idx"],
-            created_by_idx=ctx["principal_idx"],
-        )
+        async with conn.transaction():
+            bs_idx = await _insert_owned_biosample(conn, ctx)
+            await insert_biosample_to_study(
+                conn,
+                biosample_idx=bs_idx,
+                study_idx=ctx["study_idx"],
+                created_by_idx=ctx["principal_idx"],
+            )
+    ctx["created"]["biosample"].append(bs_idx)
     ctx["created"]["biosample_to_study"].append((bs_idx, ctx["study_idx"]))
     return bs_idx
 
@@ -264,7 +280,7 @@ async def _create_local_field(ctx, suffix=""):
     """Helper: create a purely-local biosample_study_field, track for cleanup."""
     field_name = f"{_unique_field_name()}_{suffix}"
     async with ctx["pool"].acquire() as conn:
-        idx, _ = await get_or_create_local_biosample_study_field(
+        idx, _, _ = await get_or_create_local_biosample_study_field(
             conn,
             study_idx=ctx["study_idx"],
             display_name=field_name,

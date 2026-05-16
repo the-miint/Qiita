@@ -49,10 +49,12 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
-from ..repositories import (
+from ..repositories._sample_helpers import (
+    GlobalFieldSlotOccupiedError,
     MetadataParseError,
     MetadataUnknownFieldsError,
     StudyFieldConflictError,
+    TransientMetadataWriteRaceError,
 )
 from ..repositories.prep_sample import (
     create_sequenced_prep_sample,
@@ -65,7 +67,11 @@ from ..repositories.sequencing_run import (
     insert_sequenced_pool,
     insert_sequencing_run,
 )
-from ._helpers import etag_for_updated_at
+from ._helpers import (
+    detail_for_global_field_collision,
+    etag_for_updated_at,
+    raise_for_transient_write_race,
+)
 
 router = APIRouter(prefix="/sequencing-run", tags=["sequencing-run"])
 sequenced_sample_router = APIRouter(prefix="/sequenced-sample", tags=["sequenced-sample"])
@@ -165,8 +171,8 @@ _SEQUENCED_SAMPLE_UNIQUE_MESSAGES: dict[str, str] = {
     "prep_sample_metadata_unique_per_field": (
         "duplicate metadata entry for the same prep_sample_study_field"
     ),
-    "prep_sample_metadata_one_value_per_global_concept": (
-        "duplicate metadata entry for the same global concept on this prep_sample"
+    "prep_sample_metadata_one_value_per_global_field": (
+        "duplicate metadata entry for the same global field on this prep_sample"
     ),
 }
 _SEQUENCED_SAMPLE_FK_MESSAGES: dict[str, str] = {
@@ -230,7 +236,8 @@ async def create_sequenced_sample(
                 owner_idx=body.owner_idx,
                 sequenced_pool_item_id=body.sequenced_pool_item_id,
                 metadata=body.metadata,
-                study_idxs=body.study_idxs,
+                primary_study_idx=body.primary_study_idx,
+                secondary_study_idxs=body.secondary_study_idxs,
                 caller_idx=user.principal_idx,
                 metadata_checklist_idx=body.metadata_checklist_idx,
                 ena_experiment_accession=body.ena_experiment_accession,
@@ -255,9 +262,37 @@ async def create_sequenced_sample(
                 detail=(
                     f"study {exc.study_idx} has an existing field at"
                     f" display_name {exc.display_name!r} bound to a different"
-                    " global concept"
+                    " global field"
                 ),
             )
+        except GlobalFieldSlotOccupiedError as exc:
+            # GlobalFieldSlotOccupiedError is its own exception family (not
+            # an asyncpg.UniqueViolationError subclass), so this catch and
+            # the generic UniqueViolationError catch below are independent;
+            # both return 409, but this one's detail discriminates the five
+            # cross-study sub-cases rather than collapsing to the generic
+            # message.
+            #
+            # NOT DEAD CODE — do not prune. Currently unreachable
+            # through this POST because the route creates a fresh
+            # prep_sample per call, so (prep_sample_idx, global_field_idx)
+            # is always empty pre-INSERT and the partial unique index
+            # cannot fire. Kept for the planned PATCH-style
+            # write-metadata-on-existing-prep_sample endpoint, which
+            # will share this composer path; that endpoint can hit the
+            # partial index whenever a caller writes a value for a
+            # prep_sample whose global field slot was already claimed
+            # by another study. Helper unit tests in
+            # tests/routes/test__helpers.py cover the wording for every
+            # subclass even though no current route flow triggers them.
+            detail = await detail_for_global_field_collision(conn, exc)
+            raise HTTPException(status_code=409, detail=detail)
+        except TransientMetadataWriteRaceError as exc:
+            # The diagnostic read found the colliding occupant already
+            # gone — a concurrent delete won the race and the slot is
+            # free again. Independent of the asyncpg catches; maps to a
+            # 503 + Retry-After so the client resubmits the same request.
+            raise_for_transient_write_race(exc)
         except asyncpg.UniqueViolationError as exc:
             detail = _SEQUENCED_SAMPLE_UNIQUE_MESSAGES.get(
                 exc.constraint_name, _GENERIC_SEQ_UNIQUE_VIOLATION
@@ -283,13 +318,15 @@ async def create_sequenced_sample(
     return SequencedSampleCreateResponse(
         prep_sample_idx=result.prep_sample_idx,
         sequenced_sample_idx=result.sequenced_sample_idx,
-        prep_sample_study_fields=result.prep_sample_study_fields,
     )
 
 
 # Hard cap on the run-scoped bulk-id read. Sized to cover a fully loaded
 # illumina run (thousands of pool items per lane, several lanes per run)
 # with significant headroom while bounding per-response payload size.
+# The biosample roster cap happens to share this numeric value, but the
+# two bound conceptually distinct rosters and are sized independently;
+# they are intentionally not factored into a shared constant.
 _SEQUENCED_SAMPLE_IDXS_HARD_CAP = 500_000
 
 
