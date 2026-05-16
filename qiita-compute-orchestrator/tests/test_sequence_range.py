@@ -16,8 +16,8 @@ import pytest
 from qiita_common.api_paths import URL_SEQUENCE_RANGE_PREFIX
 
 from qiita_compute_orchestrator.sequence_range import (
+    MintedSequenceRange,
     PrepSampleNotEligibleForSequenceRange,
-    SequenceRange,
     SequenceRangeAlreadyExists,
     mint_sequence_range,
 )
@@ -33,8 +33,8 @@ def _client(handler) -> httpx.AsyncClient:
 
 
 async def test_mint_returns_range_on_201():
-    """Happy path: 201 with the SequenceRange JSON shape parses into
-    the dataclass."""
+    """Happy path: 201 with the wire SequenceRange JSON shape parses
+    into MintedSequenceRange."""
     captured: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -55,7 +55,7 @@ async def test_mint_returns_range_on_201():
     async with _client(handler) as http:
         result = await mint_sequence_range(http=http, prep_sample_idx=42, count=100)
 
-    assert result == SequenceRange(
+    assert result == MintedSequenceRange(
         prep_sample_idx=42, sequence_idx_start=1000, sequence_idx_stop=1099
     )
     # Verify wire shape: URL + JSON body the CP route expects.

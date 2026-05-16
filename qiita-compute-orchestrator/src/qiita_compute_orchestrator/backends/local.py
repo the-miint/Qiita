@@ -277,7 +277,7 @@ class LocalBackend(ComputeBackend):
 # tuned against GG2 backbone (21 MB max genome, 11 GB FASTA):
 #   16384 → 4.2 GB peak RSS (OK), 32768 → OOM on 30 GB machine.
 _CHUNK_ROW_GROUP_SIZE = 16384
-PARQUET_OPTS_CHUNKED = f"{PARQUET_OPTS}, ROW_GROUP_SIZE {_CHUNK_ROW_GROUP_SIZE}"
+_PARQUET_OPTS_CHUNKED = f"{PARQUET_OPTS}, ROW_GROUP_SIZE {_CHUNK_ROW_GROUP_SIZE}"
 _CHUNK_SIZE = 65536  # 64 KB
 
 
@@ -371,7 +371,7 @@ def _write_sequence_chunks(
         "  )"
         "  SELECT feature_idx, chunk.chunk_index, chunk.chunk_data"
         "  FROM unnested"
-        f") TO '{out}' ({PARQUET_OPTS_CHUNKED})",
+        f") TO '{out}' ({_PARQUET_OPTS_CHUNKED})",
         [str(fasta_path)],
     )
 

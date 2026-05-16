@@ -754,12 +754,22 @@ class ScopeTargetKind(StrEnum):
 
 class ProcessingKind(StrEnum):
     """Closed set of downstream-measurement specializations a prep_sample
-    may flow into. Mirrors DB-side qiita.processing_kind, defined by
-    PR #35 in 20260501000011_prep_sample.sql. Today only 'sequenced'
+    may flow into. Mirrors DB-side qiita.processing_kind, defined in
+    migrations/20260501000011_prep_sample.sql. Today only 'sequenced'
     exists; future values (e.g., 'mass_specd') would land here as the
     DB ENUM gains them. Used by `qiita.action.target_processing_kinds`
     to declare which kinds an action accepts (kind-specific actions
-    list one value; cross-kind admin actions leave the list empty)."""
+    list one value; cross-kind admin actions leave the list empty).
+
+    When extending the enum: each workflow YAML's `target_processing_kinds:`
+    is an explicit allowlist. New kinds do NOT auto-enroll into existing
+    workflows — the submission check (qiita_control_plane/routes/work_ticket.py)
+    rejects any prep_sample whose kind is not in the action's list. Adding
+    a new kind means landing the DB enum value, the subtype table (see
+    qiita-control-plane/tests/test_prep_sample_subtype_invariants.py for
+    the structural guardrail), and any new kind-specific workflows; it
+    does not require auditing existing YAMLs unless you want the new kind
+    to flow through them."""
 
     SEQUENCED = "sequenced"
 

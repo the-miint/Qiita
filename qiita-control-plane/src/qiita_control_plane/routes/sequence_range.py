@@ -123,7 +123,18 @@ async def get_sequence_range_route(
     pool: asyncpg.Pool = Depends(get_db_pool),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
 ) -> SequenceRange:
-    """Return the sequence_range row for `prep_sample_idx`, or 404."""
+    """Return the sequence_range row for `prep_sample_idx`, or 404.
+
+    SECURITY: gated by `prep_sample:read` scope only — there is no
+    per-row ACL on this read. Any caller holding the scope can fetch
+    the range for any prep_sample_idx. The two columns returned
+    (`sequence_idx_start`, `sequence_idx_stop`) are non-sensitive
+    monotonic identifiers and reveal nothing about study membership,
+    biosample metadata, or processing state, so this is acceptable in
+    v1. The compute orchestrator does not consume this endpoint (it
+    mints over POST only). Callers that need ownership-scoped row
+    visibility must add a row-level ACL here.
+    """
     row = await fetch_sequence_range_by_prep_sample_idx(pool, prep_sample_idx)
     if row is None:
         raise HTTPException(

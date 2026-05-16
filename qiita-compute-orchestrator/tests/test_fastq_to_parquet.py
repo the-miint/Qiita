@@ -15,7 +15,7 @@ branches that path doesn't exercise:
 
 mint_sequence_range is monkey-patched in every test that exercises the
 mint path so the HTTP call doesn't need a live CP. The fake returns a
-deterministic SequenceRange and records the calls; assertions verify
+deterministic MintedSequenceRange and records the calls; assertions verify
 the count passed in and the sequence_idx values written to the Parquet.
 
 All tests need the miint extension available — set
@@ -31,7 +31,7 @@ import pytest
 
 import qiita_compute_orchestrator.jobs.fastq_to_parquet as fastq_module
 from qiita_compute_orchestrator.jobs.fastq_to_parquet import Inputs, execute
-from qiita_compute_orchestrator.sequence_range import SequenceRange
+from qiita_compute_orchestrator.sequence_range import MintedSequenceRange
 
 
 def _run(inputs: Inputs, workspace) -> dict:
@@ -55,13 +55,13 @@ def _read_parquet(path) -> list[tuple]:
 def fake_mint(monkeypatch):
     """Replace mint_sequence_range with a recorder. Returns the list of
     recorded calls; each entry is (prep_sample_idx, count). The fake
-    hands back a SequenceRange starting at 1000 (a non-zero base so the
+    hands back a MintedSequenceRange starting at 1000 (a non-zero base so the
     "+ row_number() - 1" arithmetic is visible)."""
     calls: list[tuple[int, int]] = []
 
     async def _fake(*, http, prep_sample_idx, count):
         calls.append((prep_sample_idx, count))
-        return SequenceRange(
+        return MintedSequenceRange(
             prep_sample_idx=prep_sample_idx,
             sequence_idx_start=1000,
             sequence_idx_stop=1000 + count - 1,

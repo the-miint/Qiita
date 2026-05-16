@@ -2,10 +2,12 @@
 
 The orchestrator is mostly a passive HTTP service: it accepts
 `POST /step/run` from the control-plane runner, dispatches to its
-ComputeBackend, and returns the outputs. As of PR #36 it also makes a
-single class of outbound call -- POST /api/v1/sequence-range -- so
-two credentials live here: the inbound shared bearer (cp_to_co_token)
-and the outbound compute service-account PAT (co_to_cp_token).
+ComputeBackend, and returns the outputs. It also makes a single class
+of outbound call -- POST /api/v1/sequence-range (the CP route lives at
+qiita-control-plane/src/qiita_control_plane/routes/sequence_range.py)
+-- so two credentials live here: the inbound shared bearer
+(cp_to_co_token) and the outbound compute service-account PAT
+(co_to_cp_token).
 
 Settings access pattern (asymmetric):
 
@@ -28,6 +30,7 @@ import os
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from .slurm import DEFAULT_SLURMRESTD_API_VERSION
 
@@ -102,9 +105,9 @@ class Settings:
                 "SHARED_FILESYSTEM_ROOT",
                 os.environ.get("TMPDIR", "/tmp") + "/qiita",
             ),
-            cp_to_co_token=_resolve_cp_to_co_token(),
+            cp_to_co_token=_resolve_token("cp_to_co"),
             cp_url=_resolve_cp_url(),
-            co_to_cp_token=_resolve_co_to_cp_token(),
+            co_to_cp_token=_resolve_token("co_to_cp"),
             slurm=slurm,
         )
 
@@ -136,33 +139,6 @@ def _resolve_slurm_settings() -> SlurmSettings:
     )
 
 
-def _resolve_cp_to_co_token() -> str:
-    """Resolve the inbound bearer token shared with the control plane.
-
-    Order of precedence:
-      1. CP_TO_CO_TOKEN_PATH (default /etc/qiita/cp-to-co.token).
-         If the file exists, use it. The env-var path is the production
-         drop-in.
-      2. CP_TO_CO_TOKEN (env var). Only honoured when
-         QIITA_ALLOW_TOKEN_ENV=true — dev / CI explicitly opt in; prod
-         never sets the flag, so a leaked env var alone can't drive auth.
-    """
-    path = Path(os.environ.get("CP_TO_CO_TOKEN_PATH", DEFAULT_CP_TO_CO_TOKEN_PATH))
-    if path.is_file():
-        return path.read_text().strip()
-
-    if os.environ.get("QIITA_ALLOW_TOKEN_ENV", "false").lower() == "true":
-        token = os.environ.get("CP_TO_CO_TOKEN")
-        if token:
-            return token.strip()
-
-    raise RuntimeError(
-        f"orchestrator: no CP↔CO token available. Either install the token at"
-        f" {path} (mode 0400) or set QIITA_ALLOW_TOKEN_ENV=true and"
-        f" CP_TO_CO_TOKEN for dev/CI."
-    )
-
-
 def _resolve_cp_url() -> str:
     """The control plane base URL for outbound CO→CP calls. Defaults
     to http://localhost:8080 for dev; production sets QIITA_CP_URL to
@@ -171,32 +147,56 @@ def _resolve_cp_url() -> str:
     return os.environ.get("QIITA_CP_URL", "http://localhost:8080").rstrip("/")
 
 
-def _resolve_co_to_cp_token() -> str:
-    """Resolve the outbound bearer token the orchestrator presents on
-    CO→CP calls (e.g. POST /api/v1/sequence-range).
+def _resolve_token(kind: Literal["cp_to_co", "co_to_cp"]) -> str:
+    """Resolve a bearer token by direction.
 
-    Distinct from cp_to_co_token: this is the compute service-account
-    PAT, provisioned per docs/runbooks/compute-service-account-provisioning.md.
+    cp_to_co: shared bearer the control-plane runner presents on
+              inbound POST /step/run.
+    co_to_cp: compute-worker service-account PAT the orchestrator
+              presents on outbound calls (e.g. POST /sequence-range);
+              provisioning is documented in
+              docs/runbooks/compute-service-account-provisioning.md.
 
-    Same file-or-env precedence as cp_to_co_token:
-      1. CO_TO_CP_TOKEN_PATH (default /etc/qiita/co-to-cp.token).
-      2. CO_TO_CP_TOKEN env var, gated on QIITA_ALLOW_TOKEN_ENV=true.
+    Same precedence for both:
+      1. {DIRECTION}_TOKEN_PATH (default under /etc/qiita). If the
+         file exists, use it — the production drop-in.
+      2. {DIRECTION}_TOKEN env var, gated on QIITA_ALLOW_TOKEN_ENV=true.
+         Dev / CI must explicitly opt in; prod never sets the flag, so
+         a leaked env var alone can't drive auth.
     """
-    path = Path(os.environ.get("CO_TO_CP_TOKEN_PATH", DEFAULT_CO_TO_CP_TOKEN_PATH))
+    if kind == "cp_to_co":
+        path_env, default_path, env_var, label = (
+            "CP_TO_CO_TOKEN_PATH",
+            DEFAULT_CP_TO_CO_TOKEN_PATH,
+            "CP_TO_CO_TOKEN",
+            "CP↔CO",
+        )
+        runbook_hint = ""
+    else:  # "co_to_cp"
+        path_env, default_path, env_var, label = (
+            "CO_TO_CP_TOKEN_PATH",
+            DEFAULT_CO_TO_CP_TOKEN_PATH,
+            "CO_TO_CP_TOKEN",
+            "CO→CP",
+        )
+        runbook_hint = (
+            " See docs/runbooks/compute-service-account-provisioning.md"
+            " for the production provisioning flow."
+        )
+
+    path = Path(os.environ.get(path_env, default_path))
     if path.is_file():
         return path.read_text().strip()
 
     if os.environ.get("QIITA_ALLOW_TOKEN_ENV", "false").lower() == "true":
-        token = os.environ.get("CO_TO_CP_TOKEN")
+        token = os.environ.get(env_var)
         if token:
             return token.strip()
 
     raise RuntimeError(
-        f"orchestrator: no CO→CP token available. Either install the token at"
-        f" {path} (mode 0400) or set QIITA_ALLOW_TOKEN_ENV=true and"
-        f" CO_TO_CP_TOKEN for dev/CI. See"
-        f" docs/runbooks/compute-service-account-provisioning.md for the"
-        f" production provisioning flow."
+        f"orchestrator: no {label} token available. Either install the token"
+        f" at {path} (mode 0400) or set QIITA_ALLOW_TOKEN_ENV=true and"
+        f" {env_var} for dev/CI.{runbook_hint}"
     )
 
 

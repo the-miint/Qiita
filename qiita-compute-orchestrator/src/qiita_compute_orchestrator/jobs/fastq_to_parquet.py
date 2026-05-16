@@ -2,10 +2,10 @@
 keyed by a CP-minted `sequence_idx` BIGINT.
 
 Reads via DuckDB + miint's `read_fastx` table function, mints a
-contiguous bigint range from the control plane (`POST /sequence-range`,
-PR #36's allocator), and writes a Parquet with one row per input read.
-No deduplication — every read becomes one row, including duplicate
-sequences.
+contiguous bigint range from the control plane (`POST /sequence-range`
+via the sibling client in ../sequence_range.py), and writes a Parquet
+with one row per input read. No deduplication — every read becomes
+one row, including duplicate sequences.
 
 Schema (sorted by sequence_idx, the lake-friendly join key):
 
@@ -56,10 +56,9 @@ DuckDB settings applied on every connection:
                                scratch as the workspace, not the system
                                /tmp (which is often small tmpfs).
 
-The `max_memory` and `max_threads` values are conservative hardcodes
-in this commit; a follow-up should plumb them from JobParams /
-baseline_resources so each step's allocation drives DuckDB's own
-limits.
+The `memory_limit` and `threads` values are conservative hardcodes in
+this commit; #38 tracks plumbing them from JobParams.baseline_resources
+so each step's SLURM allocation drives DuckDB's own limits.
 
 Mint-side failure mapping. The mint helper raises typed Python
 exceptions; the native-step dispatcher (jobs/__init__.py) only wraps
@@ -121,7 +120,7 @@ from ..sequence_range import (
 # so a mismatch fails loudly.
 _YAML_STEP_NAME = "fastq"
 
-# Conservative DuckDB resource caps. TODO: plumb from
+# Conservative DuckDB resource caps. TODO(#38): plumb from
 # JobParams.baseline_resources so each step's SLURM allocation drives
 # DuckDB's own limits. For now these match the YAML's declared
 # baseline_resources (cpu=2, mem_gb=4) with headroom for Python+miint.

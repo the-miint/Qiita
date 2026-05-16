@@ -39,6 +39,14 @@ _MIINT_EXT_REPO = os.environ.get("MIINT_EXTENSION_REPO")
 # Parquet-version or compression bump touches one place. backends/local.py
 # extends this with ROW_GROUP_SIZE for the chunked sequence-data write
 # (see _PARQUET_OPTS_CHUNKED there); native jobs use this as-is.
+#
+# Cross-component contract: result files written with these options are
+# registered into DuckLake by the Rust data plane (qiita-data-plane,
+# DoAction "register"). Any bump (PARQUET_VERSION, COMPRESSION, etc.)
+# must be verified against the data plane's pinned DuckDB version
+# before merging — orchestrator unit tests don't exercise the read
+# side, so a breaking bump would surface only in `make test-integration`
+# with a confusing data-plane-side trace.
 PARQUET_OPTS: str = "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd'"
 
 

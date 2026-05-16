@@ -1,9 +1,9 @@
 """Client for the control plane's sequence-range allocator.
 
-The orchestrator-side caller for `POST /api/v1/sequence-range`
-(added by PR #36 to the CP). Native jobs that need a globally-unique
-bigint range per prep_sample (today: fastq_to_parquet) go through
-`mint_sequence_range` here.
+The orchestrator-side caller for `POST /api/v1/sequence-range` (CP
+route: qiita-control-plane/src/qiita_control_plane/routes/sequence_range.py).
+Native jobs that need a globally-unique bigint range per prep_sample
+(today: fastq_to_parquet) go through `mint_sequence_range` here.
 
 **Recovery model.** The CP's mint is idempotent only in that a second
 mint for the same prep_sample 409s — there is no GET-or-mint shape on
@@ -72,11 +72,14 @@ def make_cp_client(settings: Settings | None = None) -> httpx.AsyncClient:
 
 
 @dataclass(frozen=True, slots=True)
-class SequenceRange:
-    """The orchestrator's view of a minted sequence-range row. The
-    fields mirror qiita_common.models.SequenceRange but without the
-    full Pydantic surface — this is a value type for one helper.
-    Inclusive on both ends: `count = stop - start + 1`."""
+class MintedSequenceRange:
+    """The mint operation's domain-level return value — distinct from
+    the wire shape `qiita_common.models.SequenceRange` by name so a
+    reader can't conflate them. Carries only the fields downstream
+    native jobs actually consume (no `created_at`); if a job ever
+    needs the wire's audit fields, parse the response into
+    `qiita_common.models.SequenceRange` directly. Inclusive on both
+    ends: `count = stop - start + 1`."""
 
     prep_sample_idx: int
     sequence_idx_start: int
@@ -124,7 +127,7 @@ async def mint_sequence_range(
     http: httpx.AsyncClient,
     prep_sample_idx: int,
     count: int,
-) -> SequenceRange:
+) -> MintedSequenceRange:
     """POST /api/v1/sequence-range and return the minted range.
 
     `http` is the authed httpx client (Bearer with the compute SA
@@ -148,7 +151,7 @@ async def mint_sequence_range(
         raise PrepSampleNotEligibleForSequenceRange(prep_sample_idx)
     resp.raise_for_status()
     body = resp.json()
-    return SequenceRange(
+    return MintedSequenceRange(
         prep_sample_idx=body["prep_sample_idx"],
         sequence_idx_start=body["sequence_idx_start"],
         sequence_idx_stop=body["sequence_idx_stop"],
