@@ -41,57 +41,6 @@ Pipeline (B-staged-Parquet):
            before returning. The SLURM launcher's manifest walker runs
            AFTER execute() returns, so the transient files are
            invisible to it — the manifest sees only reads.parquet.
-
-DuckDB settings applied on every connection:
-
-  - `memory_limit='{N}GB'`   : cap RAM so SLURM cgroups don't OOM-kill.
-  - `threads={N}`            : match the cgroup cpu allocation; defaults
-                               try to use all host cores.
-  - `preserve_insertion_order=false` : let DuckDB parallelize freely.
-                               Determinism is guaranteed by the explicit
-                               ORDER BY read_id in phase 4 (both as the
-                               window-function ordering and the COPY's
-                               output ordering).
-  - `temp_directory='{workspace}/.duckdb_tmp'` : spill on the same fast
-                               scratch as the workspace, not the system
-                               /tmp (which is often small tmpfs).
-
-The `memory_limit` and `threads` values are conservative hardcodes in
-this commit; #38 tracks plumbing them from JobParams.baseline_resources
-so each step's SLURM allocation drives DuckDB's own limits.
-
-Mint-side failure mapping. The mint helper raises typed Python
-exceptions; the native-step dispatcher (jobs/__init__.py) only wraps
-bare NotImplementedError/FileNotFoundError/ValueError, so this module
-maps each mint exception to an explicit BackendFailure at the call
-site in phase 3:
-
-  - SequenceRangeAlreadyExists (409) → UNKNOWN_PERMANENT.
-    The prep_sample's range was minted on a previous attempt that
-    failed before phase 4. Recovery: resubmit the work_ticket with
-    `pre_minted_range` set to the existing row's (start, stop) — the
-    orchestrator skips the mint call entirely. See
-    docs/runbooks/fastq-to-parquet-retry-recovery.md for the operator
-    sequence. The heavy alternative (DELETE the prep_sample to
-    cascade-drop the range, then re-mint) still works but destroys
-    the sample row.
-  - PrepSampleNotEligibleForSequenceRange (404) → BAD_INPUT.
-    The prep_sample was deleted between submission and step execution.
-  - httpx.HTTPStatusError 401/403 → CONTRACT_VIOLATION.
-    The compute service-account PAT is missing/wrong; deploy issue,
-    retry won't help. (see compute-service-account-provisioning.md)
-  - httpx.HTTPStatusError 5xx and other → UNKNOWN_PERMANENT.
-    Conservative today; a follow-up could add a retriable
-    CP_UNREACHABLE FailureKind alongside SLURMRESTD_UNREACHABLE so
-    genuine 5xx blips bounce back to QUEUED.
-
-Sibling: `LocalBackend._run_hash` in `backends/local.py` is
-structurally similar — same DuckDB+miint plumbing, same `PARQUET_OPTS`,
-same use of `read_fastx` — but is a *reference-side dedup* job, not a
-per-sample ingest. _run_hash rejects duplicate read_ids and writes a
-manifest sorted by content hash; this job keeps every read and writes
-raw reads sorted by the CP-minted sequence_idx. They share mechanics,
-not semantics.
 """
 
 from __future__ import annotations
@@ -137,9 +86,20 @@ _DUCKDB_MAX_THREADS = 2
 
 
 def _apply_duckdb_settings(conn: duckdb.DuckDBPyConnection, duckdb_tmp: Path) -> None:
-    """Apply the four standard DuckDB knobs the other dev recommended.
-    Called at the top of every connection in the pipeline. The
-    canonical setting names are `memory_limit` and `threads` —
+    """Apply the four DuckDB settings every pipeline connection needs.
+
+    - `memory_limit='{N}GB'` — cap RAM so SLURM cgroups don't OOM-kill.
+    - `threads={N}` — match the cgroup cpu allocation; the default
+      would try to use all host cores.
+    - `preserve_insertion_order=false` — let DuckDB parallelize freely.
+      Determinism is guaranteed by the explicit ORDER BY read_id in
+      phase 4 (both as the window-function ordering and the COPY's
+      output ordering).
+    - `temp_directory='{workspace}/.duckdb_tmp'` — spill on the same
+      fast scratch as the workspace, not the system /tmp (which is
+      often small tmpfs).
+
+    The canonical setting names are `memory_limit` and `threads` —
     `max_memory` / `max_threads` are aliases in newer DuckDB versions
     but not the ones miint targets, so use the canonical forms."""
     conn.execute(f"SET memory_limit='{_DUCKDB_MAX_MEMORY_GB}GB'")
