@@ -236,7 +236,7 @@ async def _post_sequenced_sample(client, ctx, run_idx, pool_idx, **body):
 # ===========================================================================
 
 
-async def test_create_sequenced_sample_wet_lab_admin_minimal(ctx):
+async def test_import_sequenced_sample_from_run_wet_lab_admin_minimal(ctx):
     # Single study, no metadata, no accessions. Verifies the prep_sample,
     # sequenced_sample, and prep_sample_to_study rows all land and that
     # the response shape matches the model.
@@ -303,7 +303,7 @@ async def test_create_sequenced_sample_wet_lab_admin_minimal(ctx):
     assert dict(ss_row) == expected_ss_row
 
 
-async def test_create_sequenced_sample_with_metadata(ctx):
+async def test_import_sequenced_sample_from_run_with_metadata(ctx):
     # Happy path that exercises the metadata path against a seeded global
     # field (alias). Verifies the row count, the prep_sample_study_field
     # created flag, and the value_text round-trip.
@@ -355,7 +355,7 @@ async def test_create_sequenced_sample_with_metadata(ctx):
 # ===========================================================================
 
 
-async def test_create_sequenced_sample_anonymous_401(ctx):
+async def test_import_sequenced_sample_from_run_anonymous_401(ctx):
     app.state.pool = ctx["pool"]
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "anon")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
@@ -372,7 +372,7 @@ async def test_create_sequenced_sample_anonymous_401(ctx):
     assert resp.status_code == 401
 
 
-async def test_create_sequenced_sample_missing_scope_403(ctx, no_prep_sample_write_client):
+async def test_import_sequenced_sample_from_run_missing_scope_403(ctx, no_prep_sample_write_client):
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "noscope")
     resp = await no_prep_sample_write_client.post(
         f"/api/v1/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample",
@@ -388,7 +388,7 @@ async def test_create_sequenced_sample_missing_scope_403(ctx, no_prep_sample_wri
     assert "prep_sample:write" in resp.json()["detail"]
 
 
-async def test_create_sequenced_sample_regular_user_role_403(
+async def test_import_sequenced_sample_from_run_regular_user_role_403(
     ctx, regular_user_with_prep_sample_write_client
 ):
     # Regular user holding an explicit PREP_SAMPLE_WRITE-bearing PAT:
@@ -417,7 +417,7 @@ async def test_create_sequenced_sample_regular_user_role_403(
 
 
 @pytest.mark.parametrize("kind", OWNER_INELIGIBILITY_KINDS)
-async def test_create_sequenced_sample_owner_ineligibility_422(ctx, kind: IneligibilityKind):
+async def test_import_sequenced_sample_from_run_owner_ineligible_422(ctx, kind: IneligibilityKind):
     # Every ineligibility case collapses to one 422 detail; same shape as
     # the biosample import route exercises.
     run_idx, pool_idx = await _seed_run_and_pool(ctx, f"elig-{kind}")
@@ -462,7 +462,7 @@ async def test_create_sequenced_sample_owner_ineligibility_422(ctx, kind: Inelig
 # ===========================================================================
 
 
-async def test_create_sequenced_sample_nonexistent_pool_404(ctx):
+async def test_import_sequenced_sample_from_run_nonexistent_pool_404(ctx):
     run_idx, _ = await _seed_run_and_pool(ctx, "nopool")
     max_pool = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.sequenced_pool")
     resp = await ctx["wet"].post(
@@ -479,7 +479,7 @@ async def test_create_sequenced_sample_nonexistent_pool_404(ctx):
     assert "sequenced_pool" in resp.json()["detail"]
 
 
-async def test_create_sequenced_sample_pool_belongs_to_different_run_422(ctx):
+async def test_import_sequenced_sample_from_run_pool_belongs_to_different_run_422(ctx):
     # Two distinct runs and one pool attached to the second one. Posting
     # to (run_a, pool_for_b) must fail the path-consistency check with 422.
     run_a, _ = await _seed_run_and_pool(ctx, "path-a")
@@ -498,7 +498,7 @@ async def test_create_sequenced_sample_pool_belongs_to_different_run_422(ctx):
     assert "does not belong to" in resp.json()["detail"]
 
 
-async def test_create_sequenced_sample_primary_in_secondary_422(ctx):
+async def test_import_sequenced_sample_from_run_primary_in_secondary_422(ctx):
     # The model_validator on SequencedSampleCreateRequest rejects a request
     # whose primary_study_idx also appears in secondary_study_idxs.
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "p-in-s")
@@ -517,7 +517,7 @@ async def test_create_sequenced_sample_primary_in_secondary_422(ctx):
     assert any("primary_study_idx" in err.get("msg", "") for err in resp.json()["detail"])
 
 
-async def test_create_sequenced_sample_multi_study_happy_path(ctx):
+async def test_import_sequenced_sample_from_run_multi_study_happy_path(ctx):
     # Two studies, both linked to the biosample. Primary owns the metadata
     # field row; secondary still gets a prep_sample_to_study row but does
     # not own a prep_sample_study_field.
@@ -569,7 +569,7 @@ async def test_create_sequenced_sample_multi_study_happy_path(ctx):
     assert sorted(r["study_idx"] for r in linked) == sorted([primary_idx, secondary_idx])
 
 
-async def test_create_sequenced_sample_extra_field_422(ctx):
+async def test_import_sequenced_sample_from_run_extra_field_422(ctx):
     # Request model carries extra="forbid".
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "xtra")
     resp = await ctx["wet"].post(
@@ -586,7 +586,7 @@ async def test_create_sequenced_sample_extra_field_422(ctx):
     assert resp.status_code == 422
 
 
-async def test_create_sequenced_sample_missing_required_field_422(ctx):
+async def test_import_sequenced_sample_from_run_missing_required_field_422(ctx):
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "missing")
     resp = await ctx["wet"].post(
         f"/api/v1/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample",
@@ -606,7 +606,7 @@ async def test_create_sequenced_sample_missing_required_field_422(ctx):
 # ===========================================================================
 
 
-async def test_create_sequenced_sample_unknown_metadata_field_422(ctx):
+async def test_import_sequenced_sample_from_run_unknown_metadata_field_422(ctx):
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "unk")
     study_idx = await _seed_study(ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="unk")
     bs_idx = await _seed_biosample_linked_to_study(
@@ -636,7 +636,7 @@ async def test_create_sequenced_sample_unknown_metadata_field_422(ctx):
     assert bad_b in detail
 
 
-async def test_create_sequenced_sample_missing_biosample_link_422(ctx):
+async def test_import_sequenced_sample_from_run_missing_biosample_link_422(ctx):
     # The biosample is owned by the wet_lab_admin but is NOT linked to the
     # study. The prep_sample_to_study_reject_without_biosample_link trigger
     # fires inside the composer's link INSERT; the route maps the marker
@@ -676,7 +676,7 @@ async def test_create_sequenced_sample_missing_biosample_link_422(ctx):
     assert leftover == 0
 
 
-async def test_create_sequenced_sample_duplicate_pool_item_id_409(ctx):
+async def test_import_sequenced_sample_from_run_duplicate_pool_item_id_409(ctx):
     # Two POSTs to the same pool with the same sequenced_pool_item_id; the
     # second trips sequenced_sample_pool_item_id_unique and the route maps
     # to 409 with the human-readable detail.
@@ -704,7 +704,7 @@ async def test_create_sequenced_sample_duplicate_pool_item_id_409(ctx):
     assert r2.json()["detail"] == "sequenced_pool_item_id already in use for this pool"
 
 
-async def test_create_sequenced_sample_unknown_biosample_idx_422(ctx):
+async def test_import_sequenced_sample_from_run_unknown_biosample_idx_422(ctx):
     # An idx past MAX(biosample.idx) trips the prep_sample_biosample_idx_fkey
     # FK; the composer surfaces ForeignKeyViolationError and the route maps
     # it to 422 with the user-friendly detail.
@@ -735,7 +735,7 @@ async def test_create_sequenced_sample_unknown_biosample_idx_422(ctx):
 # ===========================================================================
 
 
-async def test_create_sequenced_sample_system_admin_happy_path(ctx):
+async def test_import_sequenced_sample_from_run_system_admin_happy_path(ctx):
     # system_admin caller acts on behalf of a separate user.
     target_idx = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix="adm-target")
     ctx["created"]["user_principals"].append(target_idx)
@@ -959,6 +959,56 @@ async def test_list_sequenced_sample_idxs_wet_lab_admin_returns_newest_first(ctx
         "idxs": list(reversed(ss_ids)),
         "count": 2,
         "truncated": False,
+        "caller_system_role": "wet_lab_admin",
+    }
+    assert resp.json() == expected
+
+
+async def test_list_sequenced_sample_idxs_truncated(ctx, monkeypatch):
+    # Drop the hard cap to 1 so two seeded rows force the truncation
+    # branch: the route fetches cap+1, flags truncated, then slices back
+    # to the cap. The route reads the cap as a module global at call
+    # time, so monkeypatching the attribute takes effect.
+    monkeypatch.setattr(
+        "qiita_control_plane.routes.sequenced_sample._SEQUENCED_SAMPLE_IDXS_HARD_CAP",
+        1,
+    )
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "list-trunc")
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="list-trunc"
+    )
+    bs_a = await _seed_biosample_linked_to_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], study_idx=study_idx
+    )
+    bs_b = await _seed_biosample_linked_to_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], study_idx=study_idx
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+
+    # Land two sequenced_samples on the one run, newest last.
+    ss_ids = []
+    for bs, suffix in ((bs_a, "A"), (bs_b, "B")):
+        resp = await _post_sequenced_sample(
+            ctx["wet"],
+            ctx,
+            run_idx,
+            pool_idx,
+            biosample_idx=bs,
+            prep_protocol_idx=protocol_idx,
+            owner_idx=ctx["wet_session"]["principal_idx"],
+            sequenced_pool_item_id=_unique_item_id(f"TRUNC-{suffix}"),
+            primary_study_idx=study_idx,
+        )
+        assert resp.status_code == 201, resp.text
+        ss_ids.append(resp.json()["sequenced_sample_idx"])
+
+    resp = await ctx["wet"].get(f"/api/v1/sequencing-run/{run_idx}/sequenced-sample/list-idxs")
+    assert resp.status_code == 200, resp.text
+    # cap=1 keeps only the newest (second-landed) row after the slice.
+    expected = {
+        "idxs": [ss_ids[1]],
+        "count": 1,
+        "truncated": True,
         "caller_system_role": "wet_lab_admin",
     }
     assert resp.json() == expected
@@ -1441,12 +1491,15 @@ async def test_patch_sequenced_sample_anonymous_401(ctx):
     assert resp.status_code == 401
 
 
-async def test_patch_sequenced_sample_missing_scope_403(ctx, no_prep_sample_write_client):
-    # Regular user with a PAT lacking Scope.PREP_SAMPLE_WRITE: the role
-    # guard is declared first and runs first, rejecting on role rather
-    # than scope; that is still a 403, just for the role reason. This
-    # pins that callers without the write scope can never reach the
-    # route. Matches the comment on test_patch_biosample_missing_scope_403.
+async def test_patch_sequenced_sample_non_admin_no_scope_403(ctx, no_prep_sample_write_client):
+    # Caller is a regular user whose PAT also lacks Scope.PREP_SAMPLE_WRITE.
+    # require_role_at_least is declared (and resolved) before require_scope,
+    # so the role guard rejects first: a 403 for the role reason, not the
+    # scope reason. This test therefore pins only that such a caller cannot
+    # reach the route at all -- it does NOT exercise require_scope in
+    # isolation, because no fixture mints a wet_lab_admin PAT stripped of
+    # the write scope. The analogous biosample / sequencing_run scope
+    # tests share this same limitation.
     seeded = await _seed_one_sequenced_sample(ctx, "patch-noscope")
     pre_etag = await _get_etag(ctx["wet"], seeded["sequenced_sample_idx"])
     resp = await no_prep_sample_write_client.patch(

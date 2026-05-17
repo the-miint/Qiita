@@ -330,7 +330,7 @@ async def import_biosample_from_owner_biosample_id(
     primary_study_idx owns the globally-linked field rows and the
     owner-biosample-id local field row; secondary studies share the
     value through the global field slot but do not own the field
-    row. The asymmetry mirrors create_sequenced_prep_sample so the
+    row. The asymmetry mirrors import_sequenced_prep_sample so the
     composers stay parallel. The current POST
     /api/v1/study/{study_idx}/biosample route only ever passes the
     path study as primary with no secondaries: biosamples are created

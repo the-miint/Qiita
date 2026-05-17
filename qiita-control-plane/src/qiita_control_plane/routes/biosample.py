@@ -252,7 +252,7 @@ async def list_biosample_idxs_in_study(
 
 # Roles that may bypass the per-biosample owner / linked-study-access check.
 # A bypass-role caller still gets the standard 404 on a missing or retired
-# biosample (see the docstring on get_biosample_route for the retired-row
+# biosample (see the docstring on get_biosample for the retired-row
 # carve-out planned for a future change).
 _BIOSAMPLE_GET_BYPASS_ROLE: SystemRole = SystemRole.WET_LAB_ADMIN
 
@@ -293,7 +293,7 @@ def _biosample_response_from_row(
 
 
 @biosample_router.get("/{biosample_idx}")
-async def get_biosample_route(
+async def get_biosample(
     biosample_idx: Annotated[int, Field(gt=0)],
     response: Response,
     pool: asyncpg.Pool = Depends(get_db_pool),
@@ -382,7 +382,7 @@ _OWNER_TRIGGER_RAISE_MARKER = "user-kind principal"
 
 
 @biosample_router.patch("/{biosample_idx}")
-async def patch_biosample_route(
+async def patch_biosample(
     biosample_idx: Annotated[int, Field(gt=0)],
     body: BiosamplePatchRequest,
     response: Response,

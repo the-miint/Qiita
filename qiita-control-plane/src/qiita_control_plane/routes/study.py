@@ -151,7 +151,7 @@ async def create_study_route(
 
 
 @router.get("/{study_idx}")
-async def get_study_route(
+async def get_study(
     study_idx: Annotated[int, Field(gt=0)],
     pool: asyncpg.Pool = Depends(get_db_pool),
     _scope: Principal = Depends(require_scope(Scope.STUDY_READ)),

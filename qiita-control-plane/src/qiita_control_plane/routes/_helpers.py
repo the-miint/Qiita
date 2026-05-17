@@ -21,6 +21,11 @@ from ..repositories._sample_helpers import (
     TransientMetadataWriteRaceError,
 )
 
+# Shared 422-detail string for a foreign-key violation whose constraint
+# is not in a route's specific message map. Lifted here so the wording
+# stays identical across every route that falls back to it.
+GENERIC_FK_VIOLATION = "references a row that does not exist"
+
 
 def etag_for_updated_at(updated_at: datetime) -> str:
     """Build the quoted ETag header value from a row's updated_at timestamp.
