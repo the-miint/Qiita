@@ -125,15 +125,34 @@ async def get_sequence_range_route(
 ) -> SequenceRange:
     """Return the sequence_range row for `prep_sample_idx`, or 404.
 
-    SECURITY: gated by `prep_sample:read` scope only — there is no
-    per-row ACL on this read. Any caller holding the scope can fetch
-    the range for any prep_sample_idx. The two columns returned
-    (`sequence_idx_start`, `sequence_idx_stop`) are non-sensitive
-    monotonic identifiers and reveal nothing about study membership,
-    biosample metadata, or processing state, so this is acceptable in
-    v1. The compute orchestrator does not consume this endpoint (it
-    mints over POST only). Callers that need ownership-scoped row
-    visibility must add a row-level ACL here.
+    SECURITY: gated by `prep_sample:read` scope only — no per-row ACL.
+    Any caller holding the scope can fetch the row for any
+    prep_sample_idx. Concrete information exposed to such a caller:
+
+    - **Read count** for the prep_sample
+      (`sequence_idx_stop - sequence_idx_start + 1`) — a
+      sequencing-depth signal.
+    - **Mint timestamp** (`created_at`) — when phase 3 of the
+      ingest workflow ran.
+    - **Processing-state existence** (200 vs 404) — whether this
+      prep_sample has been minted at all (i.e., processed at least
+      through phase 3).
+    - **Relative chronological order** across samples (compare
+      `sequence_idx_start` values) — leaks the order in which samples
+      were minted even without the timestamp.
+
+    What is NOT exposed: study membership, biosample metadata,
+    sequence content, the submitter's identity, or whether the
+    work_ticket ultimately succeeded (the sequence_range row persists
+    after a step failure).
+
+    Accepted in v1 because the disclosure set above is processing-
+    metadata-adjacent, not study/biosample-content. Two hardening
+    options are tracked as #40 (section (b)): a row-level ACL gate
+    (limit reads to the prep_sample's owner + admins) and a response-
+    surface trim (drop `created_at` from the wire model). The compute
+    orchestrator does not consume this endpoint (it mints over POST
+    only), so either tightening has no orchestrator-side fallout.
     """
     row = await fetch_sequence_range_by_prep_sample_idx(pool, prep_sample_idx)
     if row is None:

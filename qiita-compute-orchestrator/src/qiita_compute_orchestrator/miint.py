@@ -73,3 +73,28 @@ async def ensure_miint_installed() -> None:
             else:
                 conn.execute("INSTALL miint FROM community;")
         _miint_installed = True
+
+
+# Substring used to recognize miint's "zero records read" exception.
+# miint's C++ side throws `std::runtime_error("Empty file: " + path)` from
+# SequenceReader.cpp (see duckdb-miint/src/SequenceReader.cpp:63,78) when
+# the sequence stream yields no records; DuckDB surfaces this as a plain
+# duckdb.Error whose str() carries the C++ message. We can't switch to a
+# file-size check because gzipped-empty FASTQs are ~20 bytes (non-zero)
+# and zero-record cases include malformed inputs miint can't parse, so
+# the substring match is the only signal available today.
+#
+# Brittle by construction: any reword on the miint side silently breaks
+# the empty-fallback path on every caller. Tracked by #39 (typed signal
+# from miint). Until that lands, all string-match callers route through
+# `is_miint_empty_file_error` so a future reword updates one place.
+_MIINT_EMPTY_FILE_SUBSTRING = "Empty file"
+
+
+def is_miint_empty_file_error(exc: BaseException) -> bool:
+    """True iff `exc` is a duckdb.Error from miint reporting zero
+    records in the input file. Callers use this to branch into a
+    schema-uniform empty-Parquet fallback instead of failing the job
+    on legitimately empty inputs (the typical case: an empty
+    `.fastq.gz` from a sequencing run that produced no reads)."""
+    return isinstance(exc, duckdb.Error) and _MIINT_EMPTY_FILE_SUBSTRING in str(exc)

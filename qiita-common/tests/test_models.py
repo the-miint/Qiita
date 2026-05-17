@@ -240,6 +240,71 @@ def test_step_run_request_entrypoint_with_container_ok():
     assert req.entrypoint == "/usr/local/bin/qiita-hash"
 
 
+# --- StepRunRequest scope_target discriminated-union validator -----------
+# `_validate_scope_target` delegates to the ScopeTarget union; these tests
+# ensure each kind validates with its required scalars, that the dispatch
+# discriminator is enforced, and that per-kind required idx fields can't
+# be omitted (the cases the existing tests above don't cover — they all
+# pin scope_target = {"kind": "reference", "reference_idx": 1}).
+
+
+def test_step_run_request_scope_target_prep_sample_validates():
+    from qiita_common.models import StepRunRequest
+
+    kwargs = _minimal_step_run_kwargs()
+    kwargs["scope_target"] = {"kind": "prep_sample", "prep_sample_idx": 42}
+    # Native form pairs naturally with the prep_sample target shape
+    # (fastq_to_parquet is the canonical native+prep_sample step).
+    del kwargs["container"]
+    kwargs["module"] = FASTQ_TO_PARQUET_MODULE
+    req = StepRunRequest(**kwargs)
+    assert req.scope_target == {"kind": "prep_sample", "prep_sample_idx": 42}
+
+
+def test_step_run_request_scope_target_study_prep_validates():
+    from qiita_common.models import StepRunRequest
+
+    kwargs = _minimal_step_run_kwargs()
+    kwargs["scope_target"] = {"kind": "study_prep", "study_idx": 7, "prep_idx": 11}
+    req = StepRunRequest(**kwargs)
+    assert req.scope_target == {"kind": "study_prep", "study_idx": 7, "prep_idx": 11}
+
+
+@pytest.mark.parametrize(
+    ("bad_scope_target", "expected_in_error"),
+    [
+        # Unknown discriminator value.
+        ({"kind": "bogus", "reference_idx": 1}, "kind"),
+        # Missing discriminator entirely.
+        ({"reference_idx": 1}, "kind"),
+        # prep_sample missing its required scalar.
+        ({"kind": "prep_sample"}, "prep_sample_idx"),
+        # study_prep missing one of its required scalars.
+        ({"kind": "study_prep", "study_idx": 1}, "prep_idx"),
+        ({"kind": "study_prep", "prep_idx": 2}, "study_idx"),
+        # Wrong-kind scalar (reference_idx on a prep_sample shape).
+        # Pydantic's discriminated union flags the missing prep_sample_idx;
+        # extra wrong-kind fields are silently ignored by default. We
+        # assert the missing-field message — that's the load-bearing signal.
+        ({"kind": "prep_sample", "reference_idx": 1}, "prep_sample_idx"),
+        # gt=0 enforcement on each kind's idx scalar.
+        ({"kind": "reference", "reference_idx": 0}, "greater than"),
+        ({"kind": "prep_sample", "prep_sample_idx": 0}, "greater than"),
+        ({"kind": "study_prep", "study_idx": 0, "prep_idx": 1}, "greater than"),
+        # Empty dict — no kind, no fields.
+        ({}, "kind"),
+    ],
+)
+def test_step_run_request_scope_target_rejects_invalid_shapes(bad_scope_target, expected_in_error):
+    from qiita_common.models import StepRunRequest
+
+    kwargs = _minimal_step_run_kwargs()
+    kwargs["scope_target"] = bad_scope_target
+    with pytest.raises(ValidationError) as exc_info:
+        StepRunRequest(**kwargs)
+    assert expected_in_error in str(exc_info.value)
+
+
 # ---------------------------------------------------------------------------
 # SequenceRangeMintRequest / SequenceRange
 # ---------------------------------------------------------------------------

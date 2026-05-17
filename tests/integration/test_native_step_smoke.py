@@ -133,7 +133,7 @@ async def test_fastq_to_parquet_through_runner(
     here would add infrastructure for one assertion that the unit
     tests already cover."""
     from qiita_compute_orchestrator.jobs import fastq_to_parquet as fastq_module
-    from qiita_compute_orchestrator.sequence_range import SequenceRange
+    from qiita_compute_orchestrator.sequence_range import MintedSequenceRange
     from qiita_control_plane.runner import run_workflow
 
     action_id, action_version = fastq_to_parquet_action
@@ -142,7 +142,7 @@ async def test_fastq_to_parquet_through_runner(
 
     # In-process replacement for mint_sequence_range that calls the CP's
     # mint function directly through the existing postgres_pool. The
-    # real signature is `(http, prep_sample_idx, count) -> SequenceRange`;
+    # real signature is `(http, prep_sample_idx, count) -> MintedSequenceRange`;
     # the fake ignores http (no client is constructed at all).
     mint_calls: list[tuple[int, int]] = []
 
@@ -154,7 +154,7 @@ async def test_fastq_to_parquet_through_runner(
             count,
             admin_idx,
         )
-        return SequenceRange(
+        return MintedSequenceRange(
             prep_sample_idx=row["prep_sample_idx"],
             sequence_idx_start=row["sequence_idx_start"],
             sequence_idx_stop=row["sequence_idx_stop"],

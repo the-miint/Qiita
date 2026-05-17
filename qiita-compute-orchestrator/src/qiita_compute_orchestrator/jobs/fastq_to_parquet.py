@@ -68,10 +68,13 @@ site in phase 3:
 
   - SequenceRangeAlreadyExists (409) → UNKNOWN_PERMANENT.
     The prep_sample's range was minted on a previous attempt that
-    failed before phase 4. Operator recovery: DELETE the prep_sample
-    (CASCADE removes the range) and resubmit the work_ticket. See
-    sequence_range.py module docstring for the GET-on-mint-scope
-    follow-up that would make retries transparent.
+    failed before phase 4. Recovery: resubmit the work_ticket with
+    `pre_minted_range` set to the existing row's (start, stop) — the
+    orchestrator skips the mint call entirely. See
+    docs/runbooks/fastq-to-parquet-retry-recovery.md for the operator
+    sequence. The heavy alternative (DELETE the prep_sample to
+    cascade-drop the range, then re-mint) still works but destroys
+    the sample row.
   - PrepSampleNotEligibleForSequenceRange (404) → BAD_INPUT.
     The prep_sample was deleted between submission and step execution.
   - httpx.HTTPStatusError 401/403 → CONTRACT_VIOLATION.
@@ -98,12 +101,17 @@ from pathlib import Path
 
 import duckdb
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.models import WorkTicketFailureStage
 from qiita_common.parquet import validate_parquet_path
 
-from ..miint import PARQUET_OPTS, ensure_miint_installed, open_conn
+from ..miint import (
+    PARQUET_OPTS,
+    ensure_miint_installed,
+    is_miint_empty_file_error,
+    open_conn,
+)
 from ..sequence_range import (
     PrepSampleNotEligibleForSequenceRange,
     SequenceRangeAlreadyExists,
@@ -140,6 +148,29 @@ def _apply_duckdb_settings(conn: duckdb.DuckDBPyConnection, duckdb_tmp: Path) ->
     conn.execute(f"SET temp_directory='{duckdb_tmp}'")
 
 
+class PreMintedRange(BaseModel):
+    """Operator-supplied recovery range for a retried fastq_to_parquet
+    work_ticket.
+
+    Set only when phase 4 failed transiently on a prior attempt AFTER
+    phase 3 had already minted a sequence-range — the prep_sample's
+    `qiita.sequence_range` row exists and a fresh mint would 409. The
+    operator (or the runner-side automation tracked as #40 section (a))
+    reads the existing range, resubmits the work_ticket with this field
+    populated, and the orchestrator skips the mint call.
+
+    The two indices are inclusive on both ends and must match the
+    FASTQ's read count exactly: `sequence_idx_stop - sequence_idx_start
+    + 1 == count_of_reads`. Mismatch → BAD_INPUT.
+
+    See docs/runbooks/fastq-to-parquet-retry-recovery.md for the full
+    operator workflow.
+    """
+
+    sequence_idx_start: int = Field(gt=0)
+    sequence_idx_stop: int = Field(gt=0)
+
+
 class Inputs(BaseModel):
     """Typed input contract for fastq_to_parquet.
 
@@ -149,11 +180,17 @@ class Inputs(BaseModel):
     `flatten_native_inputs`; `prep_sample_idx` is also the key the
     CP's sequence-range allocator uses, so it's load-bearing here
     (not just provenance as the comment used to imply).
+
+    `pre_minted_range` is the optional E-operator recovery hook: set
+    only on a retry where the prior attempt successfully minted in
+    phase 3 then failed in phase 4. See `PreMintedRange` and the
+    retry-recovery runbook for the full flow.
     """
 
     fastq_path: Path
     prep_sample_idx: int
     work_ticket_idx: int
+    pre_minted_range: PreMintedRange | None = None
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
@@ -187,9 +224,9 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     [str(inputs.fastq_path)],
                 )
             except duckdb.Error as exc:
-                if "Empty file" not in str(exc):
+                if not is_miint_empty_file_error(exc):
                     raise
-                # miint refuses zero-byte input. Synthesize an empty
+                # miint refuses zero-record input. Synthesize an empty
                 # intermediate Parquet with the right schema so phases
                 # 2+4 stay schema-uniform.
                 conn.execute(
@@ -207,9 +244,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "SELECT count(*) FROM read_parquet(?)", [str(intermediate)]
             ).fetchone()[0]
 
-        # Phase 3: mint a sequence_idx range from the CP (skipped for
-        # empty samples — the CP rejects count <= 0, and an empty file
-        # has no reads to key).
+        # Phase 3: mint a sequence_idx range from the CP — unless the
+        # work_ticket carries a `pre_minted_range` (E-operator recovery
+        # path: the prior attempt already minted in phase 3 and failed
+        # transiently in phase 4; the operator resubmits with the
+        # existing range so the CP's one-shot mint contract isn't
+        # violated). Skipped entirely for empty samples.
         #
         # The mint helper raises typed Python exceptions; the framework
         # dispatcher in jobs/__init__.py only wraps bare
@@ -219,7 +259,32 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         # sequence_range.py) keeps the helper transport-agnostic — the
         # mapping from "how the CP responded" to "what BackendFailure
         # kind the runner should see" is workflow-policy, not protocol.
-        if count > 0:
+        if count == 0:
+            # Sentinel — phase 4 won't reference it for an empty input
+            # because the SELECT produces zero rows.
+            sequence_idx_start = 0
+        elif inputs.pre_minted_range is not None:
+            # E-operator recovery: skip the HTTP mint entirely. Validate
+            # the supplied range covers exactly the FASTQ's read count
+            # so a stale recovery (different mint count) fails loudly
+            # rather than producing a Parquet whose sequence_idx values
+            # would mismatch qiita.sequence_range at registration.
+            recovery = inputs.pre_minted_range
+            recovered_count = recovery.sequence_idx_stop - recovery.sequence_idx_start + 1
+            if recovered_count != count:
+                raise BackendFailure(
+                    kind=FailureKind.BAD_INPUT,
+                    stage=WorkTicketFailureStage.STEP_RUN,
+                    step_name=_YAML_STEP_NAME,
+                    reason=(
+                        f"pre_minted_range covers {recovered_count} indices "
+                        f"({recovery.sequence_idx_start}..{recovery.sequence_idx_stop}) "
+                        f"but the FASTQ has {count} reads — the recovery range "
+                        f"must match the prior attempt's mint count exactly"
+                    ),
+                )
+            sequence_idx_start = recovery.sequence_idx_start
+        else:
             try:
                 async with make_cp_client() as http:
                     rng = await mint_sequence_range(
@@ -227,8 +292,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     )
             except SequenceRangeAlreadyExists as exc:
                 # Mid-step failure left a range on a previous attempt;
-                # this attempt's POST 409s. Operator must DELETE the
-                # prep_sample (CASCADE removes the range) and resubmit.
+                # this attempt's POST 409s. Operator can either DELETE
+                # the prep_sample (CASCADE removes the range and starts
+                # over) or — preferred — resubmit with `pre_minted_range`
+                # set to the existing row's (start, stop). See
+                # docs/runbooks/fastq-to-parquet-retry-recovery.md.
                 raise BackendFailure(
                     kind=FailureKind.UNKNOWN_PERMANENT,
                     stage=WorkTicketFailureStage.STEP_RUN,
@@ -277,10 +345,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     ),
                 ) from exc
             sequence_idx_start = rng.sequence_idx_start
-        else:
-            # Sentinel — phase 4 won't reference it for an empty input
-            # because the SELECT produces zero rows.
-            sequence_idx_start = 0
 
         # Phase 4: rewrite intermediate -> final with sequence_idx
         # assigned and physically sorted on disk.

@@ -9,7 +9,12 @@ from qiita_common.parquet import validate_parquet_path
 
 from ..backend import ComputeBackend
 from ..jobs import flatten_native_inputs, run_native_job
-from ..miint import PARQUET_OPTS, ensure_miint_installed, open_conn
+from ..miint import (
+    PARQUET_OPTS,
+    ensure_miint_installed,
+    is_miint_empty_file_error,
+    open_conn,
+)
 
 
 class LocalBackend(ComputeBackend):
@@ -189,7 +194,7 @@ class LocalBackend(ComputeBackend):
                     [str(fasta_path)],
                 )
             except duckdb.Error as exc:
-                if "Empty file" in str(exc):
+                if is_miint_empty_file_error(exc):
                     conn.execute(
                         "CREATE TEMP TABLE raw_seqs (read_id VARCHAR, hash VARCHAR, len BIGINT)"
                     )

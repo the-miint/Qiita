@@ -313,6 +313,122 @@ def test_step_run_rejects_payload_with_both_runtimes(http_client, cp_to_co_token
     assert backend.calls == []
 
 
+def test_step_run_dispatches_prep_sample_scope_target(http_client, cp_to_co_token, tmp_path):
+    """prep_sample-scoped wire traffic round-trips: the validator accepts
+    the discriminated-union shape and the route forwards the dict verbatim
+    to backend.run_step. Module form because the natural pairing is
+    native step (fastq_to_parquet) + prep_sample scope."""
+    client, backend = http_client
+    resp = client.post(
+        URL_STEP_RUN,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "fastq",
+            "inputs": {"fastq_path": "/scratch/in.fastq"},
+            "workspace": str(tmp_path),
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": 42},
+            "work_ticket_idx": 1,
+            "module": FASTQ_TO_PARQUET_MODULE,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(backend.calls) == 1
+    call = backend.calls[0]
+    assert call.scope_target == {"kind": "prep_sample", "prep_sample_idx": 42}
+    assert call.module == FASTQ_TO_PARQUET_MODULE
+    assert call.container is None
+
+
+def test_step_run_dispatches_study_prep_scope_target(http_client, cp_to_co_token, tmp_path):
+    """study_prep-scoped wire traffic round-trips. Container form here
+    because there's no native step pinned to study_prep today; a future
+    container action (e.g. per-(study,prep) sample processing) would
+    naturally take this shape."""
+    client, backend = http_client
+    resp = client.post(
+        URL_STEP_RUN,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "process",
+            "inputs": {},
+            "workspace": str(tmp_path),
+            "scope_target": {
+                "kind": "study_prep",
+                "study_idx": 7,
+                "prep_idx": 11,
+            },
+            "work_ticket_idx": 1,
+            "container": "qiita/process:1.0.0",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(backend.calls) == 1
+    call = backend.calls[0]
+    assert call.scope_target == {
+        "kind": "study_prep",
+        "study_idx": 7,
+        "prep_idx": 11,
+    }
+
+
+def test_step_run_serializes_container_on_non_reference_guard(
+    http_client, cp_to_co_token, tmp_path
+):
+    """End-to-end at the HTTP boundary: a container step with a
+    non-reference scope_target must surface as the backend's
+    CONTRACT_VIOLATION BackendFailure, serialized through the route into
+    the wire shape the runner consumes. Stub backend mirrors the guard
+    in LocalBackend.run_step / SlurmBackend.run_step so we don't need to
+    spin up either real backend (LocalBackend triggers miint install,
+    SlurmBackend needs slurmrestd config); the round-trip we care about
+    is the wire serialization of the guard's BackendFailure."""
+    from qiita_common.backend_failure import (
+        BACKEND_FAILURE_HEADER,
+        BACKEND_FAILURE_HTTP_STATUS,
+        BackendFailure,
+        FailureKind,
+    )
+    from qiita_common.models import WorkTicketFailureStage
+
+    client, backend = http_client
+
+    async def _container_guard(name, inputs, workspace, *, scope_target, container=None, **_):
+        if container is not None and scope_target.get("kind") != "reference":
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=name,
+                reason=(
+                    f"container step {name!r} requires a reference-scoped "
+                    f"ticket; got scope_target.kind={scope_target.get('kind')!r}"
+                ),
+            )
+        return {}
+
+    backend.run_step = _container_guard  # type: ignore[method-assign]
+
+    resp = client.post(
+        URL_STEP_RUN,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "hash",
+            "inputs": {"fasta_path": "/tmp/x.fa"},
+            "workspace": str(tmp_path),
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": 42},
+            "work_ticket_idx": 1,
+            "container": REFERENCE_HASH_CONTAINER,
+        },
+    )
+    assert resp.status_code == BACKEND_FAILURE_HTTP_STATUS
+    assert resp.headers[BACKEND_FAILURE_HEADER] == "1"
+    body = resp.json()
+    assert body["kind"] == "contract_violation"
+    assert body["stage"] == "step_run"
+    assert body["step_name"] == "hash"
+    assert "reference-scoped ticket" in body["reason"]
+    assert "prep_sample" in body["reason"]
+
+
 def test_settings_resolves_token_from_env():
     """Sanity-check Settings.from_env reads the dev-mode env override."""
     from qiita_compute_orchestrator.config import Settings

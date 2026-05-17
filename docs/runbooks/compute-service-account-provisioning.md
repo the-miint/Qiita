@@ -56,18 +56,24 @@ from every role ceiling, so:
    it before closing the shell.
 
 2. **Install the token on the orchestrator host** under the orchestrator
-   user, mode 0400. The conventional path follows the same pattern as
-   the cron-job tokens (`/etc/qiita/<service-account-name>.token`):
+   user, mode 0400. The path follows the direction-based naming the
+   orchestrator's `Settings` resolves by default (mirrors
+   `/etc/qiita/cp-to-co.token` for the inbound side):
 
    ```bash
    sudo install -o qiita-orch -g qiita-orch -m 0400 \
-       /dev/stdin /etc/qiita/compute.token <<< "$PLAINTEXT_TOKEN"
+       /dev/stdin /etc/qiita/co-to-cp.token <<< "$PLAINTEXT_TOKEN"
    ```
+
+   The orchestrator picks this path up via `DEFAULT_CO_TO_CP_TOKEN_PATH`
+   in `qiita-compute-orchestrator/src/qiita_compute_orchestrator/config.py`;
+   override with the `CO_TO_CP_TOKEN_PATH` env var if you need a
+   non-default location.
 
 3. **Verify** the credential authenticates by hitting `whoami`:
 
    ```bash
-   curl -H "Authorization: Bearer $(cat /etc/qiita/compute.token)" \
+   curl -H "Authorization: Bearer $(cat /etc/qiita/co-to-cp.token)" \
         $CONTROL_PLANE_URL/api/v1/auth/whoami
    ```
 
@@ -87,7 +93,7 @@ from every role ceiling, so:
 
    ```bash
    curl -X POST $CONTROL_PLANE_URL/api/v1/sequence-range \
-       -H "Authorization: Bearer $(cat /etc/qiita/compute.token)" \
+       -H "Authorization: Bearer $(cat /etc/qiita/co-to-cp.token)" \
        -H "Content-Type: application/json" \
        -d '{"prep_sample_idx": 42, "count": 1}'
    ```
