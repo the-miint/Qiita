@@ -4,6 +4,11 @@ set-system-role tests use a real DB and live in tests/integration/test_admin_cli
 (deferred — for now, set-system-role is exercised manually during the
 first-deploy flow). The HTTP subcommand helpers are tested here against
 a stubbed httpx response.
+
+Shared helpers (token I/O, loopback login, whoami) live in
+qiita_control_plane.cli._common and are tested directly there or via
+test_cli_login.py. This file covers admin-specific surface plus the
+argparse wiring on the admin entry point.
 """
 
 import httpx
@@ -11,32 +16,32 @@ import pytest
 
 
 def test_read_token_from_env(monkeypatch):
-    from qiita_control_plane.cli.admin import _read_token
+    from qiita_control_plane.cli._common import read_token
 
     monkeypatch.setenv("QIITA_TOKEN", "qk_test_token")
-    assert _read_token() == "qk_test_token"
+    assert read_token() == "qk_test_token"
 
 
 def test_read_token_from_file(monkeypatch, tmp_path):
-    from qiita_control_plane.cli.admin import _read_token
+    from qiita_control_plane.cli._common import read_token
 
     monkeypatch.delenv("QIITA_TOKEN", raising=False)
     f = tmp_path / "token"
     f.write_text("qk_from_file\n")
-    assert _read_token(token_file=f) == "qk_from_file"
+    assert read_token(token_file=f) == "qk_from_file"
 
 
 def test_read_token_raises_with_actionable_message(monkeypatch, tmp_path):
-    from qiita_control_plane.cli.admin import _read_token
+    from qiita_control_plane.cli._common import read_token
 
     monkeypatch.delenv("QIITA_TOKEN", raising=False)
     nonexistent = tmp_path / "nope"
     with pytest.raises(RuntimeError, match="QIITA_TOKEN"):
-        _read_token(token_file=nonexistent)
+        read_token(token_file=nonexistent)
 
 
 def test_whoami_calls_correct_url(monkeypatch):
-    from qiita_control_plane.cli import admin as cli
+    from qiita_control_plane.cli import _common
 
     captured = {}
 
@@ -49,8 +54,8 @@ def test_whoami_calls_correct_url(monkeypatch):
             request=httpx.Request("GET", url),
         )
 
-    monkeypatch.setattr(cli.httpx, "get", fake_get)
-    body = cli._whoami("https://api.example.com/", "qk_X")
+    monkeypatch.setattr(_common.httpx, "get", fake_get)
+    body = _common.whoami("https://api.example.com/", "qk_X")
     assert captured["url"] == "https://api.example.com/api/v1/auth/whoami"
     assert captured["auth"] == "Bearer qk_X"
     assert body == {"kind": "human", "principal_idx": 7}
@@ -77,11 +82,12 @@ def test_token_revoke_all_calls_correct_url(monkeypatch):
 
 
 def test_main_login_dispatches_to_do_login(monkeypatch):
-    """Wiring test: `qiita-admin login` calls `_do_login` with the parsed
+    """Wiring test: `qiita-admin login` calls `_common.do_login` with the parsed
     --base-url and --token-file. The actual flow logic is exercised by
     test_cli_login.py (helpers) and tests/integration (end-to-end)."""
     from pathlib import Path
 
+    from qiita_control_plane.cli import _common
     from qiita_control_plane.cli import admin as cli
 
     captured: dict = {}
@@ -91,7 +97,7 @@ def test_main_login_dispatches_to_do_login(monkeypatch):
         captured["token_file"] = token_file
         return 0
 
-    monkeypatch.setattr(cli, "_do_login", fake_do_login)
+    monkeypatch.setattr(_common, "do_login", fake_do_login)
 
     rc = cli.main(
         ["--base-url", "https://qiita.example.test", "login", "--token-file", "/tmp/qiita-cli-test"]
@@ -116,7 +122,7 @@ def test_main_whoami_without_token(monkeypatch, tmp_path, capsys):
 
     monkeypatch.delenv("QIITA_TOKEN", raising=False)
     monkeypatch.setattr(
-        "qiita_control_plane.cli.admin._TOKEN_FILE_DEFAULT",
+        "qiita_control_plane.cli._common.TOKEN_FILE_DEFAULT",
         tmp_path / "absent",
     )
     rc = main(["whoami"])
