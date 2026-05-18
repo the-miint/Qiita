@@ -763,6 +763,15 @@ and DP env files (see step 1).
 
 ## 9. Start the orchestrator
 
+> **Expect to coordinate with your HPC admin** through this section.
+> Beyond the values they supply (URL, JWT, partition, account), the
+> slurmrestd → slurmctld auth path on their side (MUNGE keys, clock
+> sync between hosts) needs to be working before the orchestrator can
+> actually dispatch jobs. The orchestrator itself will start fine
+> regardless; the failure mode if HPC-side auth is broken is per-job,
+> not boot-time. Validate against `/slurm/v0.0.40/nodes` (a real RPC
+> path) rather than only `/ping` to catch the inter-daemon auth.
+
 ### 9a. Write the orchestrator env file
 
 ```bash
