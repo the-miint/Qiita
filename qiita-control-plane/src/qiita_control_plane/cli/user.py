@@ -48,6 +48,21 @@ def _patch_user_me(base_url: str, token: str, updates: dict) -> dict:
     return resp.json()
 
 
+def _post_study(base_url: str, token: str, body: dict) -> dict:
+    """POST /api/v1/study with the (already-pruned) body. Owner defaults to
+    the caller server-side; the CLI does not surface --owner-idx because
+    naming a different owner requires wet_lab_admin+ (lab-tech-on-behalf),
+    out of scope for the regular-user CLI."""
+    resp = httpx.post(
+        f"{base_url.rstrip('/')}{API_PREFIX}/study",
+        headers={"Authorization": f"Bearer {token}"},
+        json=body,
+        timeout=_common.CLI_HTTP_TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
 # ---------------------------------------------------------------------------
 # argparse entry point
 # ---------------------------------------------------------------------------
@@ -97,6 +112,31 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Opt in/out of processing-status emails (use --no- to opt out)",
     )
 
+    p_study = sub.add_parser("study", help="Study operations")
+    p_study_sub = p_study.add_subparsers(dest="study_cmd", required=True)
+    p_study_create = p_study_sub.add_parser(
+        "create",
+        help="Create a study owned by the calling principal (POST /study)",
+    )
+    p_study_create.add_argument("--title", required=True)
+    p_study_create.add_argument("--alias")
+    p_study_create.add_argument("--description")
+    p_study_create.add_argument("--abstract")
+    p_study_create.add_argument("--funding")
+    p_study_create.add_argument("--ebi-study-accession")
+    p_study_create.add_argument("--vamps-id")
+    p_study_create.add_argument("--notes")
+    p_study_create.add_argument(
+        "--principal-investigator-idx",
+        type=int,
+        help="principal_idx of the PI; must already exist as a user-kind principal",
+    )
+    p_study_create.add_argument(
+        "--default-tier",
+        choices=("public", "viewer", "member", "admin"),
+        help="Default study_access tier; server defaults to 'member' when unset",
+    )
+
     return parser
 
 
@@ -116,6 +156,28 @@ def _profile_set_updates(args: argparse.Namespace) -> dict:
     if args.receive_processing_emails is not None:
         updates["receive_processing_emails"] = args.receive_processing_emails
     return updates
+
+
+def _study_create_body(args: argparse.Namespace) -> dict:
+    """Build the POST /study body from parsed args. Required: --title.
+    Optional fields go in only when supplied, so we don't ship explicit
+    nulls the server would treat as 'caller set this to null'."""
+    body: dict = {"title": args.title}
+    for argname, field in (
+        ("alias", "alias"),
+        ("description", "description"),
+        ("abstract", "abstract"),
+        ("funding", "funding"),
+        ("ebi_study_accession", "ebi_study_accession"),
+        ("vamps_id", "vamps_id"),
+        ("notes", "notes"),
+        ("principal_investigator_idx", "principal_investigator_idx"),
+        ("default_tier", "default_tier"),
+    ):
+        value = getattr(args, argname)
+        if value is not None:
+            body[field] = value
+    return body
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -142,6 +204,11 @@ def main(argv: list[str] | None = None) -> int:
                     " --receive-processing-emails / --no-receive-processing-emails"
                 )
             return _common.run_http_subcommand(lambda t: _patch_user_me(args.base_url, t, updates))
+
+    if args.cmd == "study":
+        if args.study_cmd == "create":
+            body = _study_create_body(args)
+            return _common.run_http_subcommand(lambda t: _post_study(args.base_url, t, body))
 
     parser.error(f"unknown command: {args.cmd}")
     return 2

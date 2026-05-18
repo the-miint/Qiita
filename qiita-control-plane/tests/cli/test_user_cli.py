@@ -176,3 +176,115 @@ def test_profile_set_requires_at_least_one_flag(capsys):
         main(["profile", "set"])
     assert exc_info.value.code == 2
     assert "at least one of" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# study create
+# ---------------------------------------------------------------------------
+
+
+def test_study_create_minimal_sends_only_title(monkeypatch):
+    """`qiita study create --title X` posts a body with only `title`.
+    Optional fields stay absent so the server's column defaults apply
+    rather than caller-supplied nulls overriding them."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import user as cli
+
+    captured: dict = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["url"] = url
+        captured["auth"] = headers["Authorization"]
+        captured["json"] = json
+        return _httpx.Response(201, json={"study_idx": 42}, request=_httpx.Request("POST", url))
+
+    monkeypatch.setattr(cli.httpx, "post", fake_post)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = cli.main(
+        ["--base-url", "https://q.example.test", "study", "create", "--title", "Smoke Study"]
+    )
+    assert rc == 0
+    assert captured["url"] == "https://q.example.test/api/v1/study"
+    assert captured["auth"] == "Bearer qk_test"
+    assert captured["json"] == {"title": "Smoke Study"}
+
+
+def test_study_create_passes_through_optional_fields(monkeypatch):
+    """Every supplied optional flag lands in the POST body verbatim;
+    snake_case translations for hyphenated CLI flags happen on the
+    client side so the server contract stays clean."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import user as cli
+
+    captured: dict = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured["json"] = json
+        return _httpx.Response(201, json={"study_idx": 42}, request=_httpx.Request("POST", url))
+
+    monkeypatch.setattr(cli.httpx, "post", fake_post)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = cli.main(
+        [
+            "study",
+            "create",
+            "--title",
+            "T",
+            "--alias",
+            "T-2026",
+            "--description",
+            "smoke desc",
+            "--abstract",
+            "abs",
+            "--funding",
+            "NIH",
+            "--ebi-study-accession",
+            "PRJEB99999",
+            "--vamps-id",
+            "VAMPS-1",
+            "--notes",
+            "note",
+            "--principal-investigator-idx",
+            "5",
+            "--default-tier",
+            "member",
+        ]
+    )
+    assert rc == 0
+    assert captured["json"] == {
+        "title": "T",
+        "alias": "T-2026",
+        "description": "smoke desc",
+        "abstract": "abs",
+        "funding": "NIH",
+        "ebi_study_accession": "PRJEB99999",
+        "vamps_id": "VAMPS-1",
+        "notes": "note",
+        "principal_investigator_idx": 5,
+        "default_tier": "member",
+    }
+
+
+def test_study_create_requires_title(capsys):
+    """--title is the only required flag; missing it should produce an
+    argparse error (exit 2)."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["study", "create"])
+    assert exc_info.value.code == 2
+    assert "--title" in capsys.readouterr().err
+
+
+def test_study_create_rejects_invalid_default_tier(capsys):
+    """argparse choices= should reject a typo in --default-tier."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["study", "create", "--title", "T", "--default-tier", "owner"])
+    assert exc_info.value.code == 2
+    assert "default-tier" in capsys.readouterr().err
