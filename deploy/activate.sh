@@ -10,7 +10,8 @@ set -euo pipefail
 
 INCOMING=/opt/qiita/incoming
 
-# sudo's secure_path excludes /usr/local/bin on RHEL-family; use the full path.
+# sudo's secure_path excludes /usr/local/bin on RHEL-family. Always invoke
+# uv via $UV, never bare `uv` — bare lookup fails under sudo/systemd.
 UV=/usr/local/bin/uv
 
 # Without UV_PYTHON_INSTALL_DIR, uv writes Python into $HOME/.local/share/uv/python/.
@@ -19,9 +20,14 @@ UV=/usr/local/bin/uv
 export UV_PYTHON_INSTALL_DIR=/opt/uv-python
 install -d -o root -g root -m 0755 "$UV_PYTHON_INSTALL_DIR"
 
-rsync -a --delete "$INCOMING/qiita-common/"              /opt/qiita/qiita-common/
-rsync -a --delete "$INCOMING/qiita-control-plane/"       /opt/qiita/control-plane/
-rsync -a --delete "$INCOMING/qiita-compute-orchestrator/" /opt/qiita/compute-orchestrator/
+# Exclude transient build artifacts so a dev .venv/ or cargo target/ in the
+# source doesn't get rsync'd over the deployed venv (which `uv sync` will
+# then either trip the venv-python sanity check on or overwrite incorrectly).
+RSYNC_EXCLUDES=(--exclude='.venv/' --exclude='target/' --exclude='__pycache__/')
+
+rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$INCOMING/qiita-common/"              /opt/qiita/qiita-common/
+rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$INCOMING/qiita-control-plane/"       /opt/qiita/control-plane/
+rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$INCOMING/qiita-compute-orchestrator/" /opt/qiita/compute-orchestrator/
 
 # --reinstall-package qiita-common forces uv to rebuild the path-dep when
 # qiita-common's source changes without a version bump; without this,
@@ -39,7 +45,8 @@ for venv in /opt/qiita/control-plane/.venv /opt/qiita/compute-orchestrator/.venv
     esac
 done
 
-install -m 755 "$INCOMING/qiita-data-plane" /opt/qiita/data-plane/qiita-data-plane
+install -d -o root -g root -m 0755 /opt/qiita/data-plane
+install -m 0755 "$INCOMING/qiita-data-plane" /opt/qiita/data-plane/qiita-data-plane
 
 : "${QIITA_HOSTNAME:?QIITA_HOSTNAME must be set (e.g. qiita.example.org)}"
 cp "$INCOMING/deploy/nginx/qiita.conf" /etc/nginx/conf.d/qiita.conf

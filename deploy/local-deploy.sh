@@ -33,10 +33,21 @@ DP_BINARY="$QIITA_CLONE/qiita-data-plane/target/release/qiita-data-plane"
 INCOMING=/opt/qiita/incoming
 install -d -o root -g root -m 0755 "$INCOMING"
 
-rsync -a --delete --chown=root:root "$QIITA_CLONE/qiita-common/"              "$INCOMING/qiita-common/"
-rsync -a --delete --chown=root:root "$QIITA_CLONE/qiita-control-plane/"       "$INCOMING/qiita-control-plane/"
-rsync -a --delete --chown=root:root "$QIITA_CLONE/qiita-compute-orchestrator/" "$INCOMING/qiita-compute-orchestrator/"
-rsync -a --delete --chown=root:root "$QIITA_CLONE/deploy/"                    "$INCOMING/deploy/"
-install -m 755 -o root -g root "$DP_BINARY" "$INCOMING/qiita-data-plane"
+# Exclude transient build artifacts. Step 3 of the runbook materializes
+# qiita-control-plane/.venv/ owned by the operator; cargo build creates
+# qiita-data-plane/target/. Without these exclusions a qiita-owned .venv
+# would land at /opt/qiita/<svc>/.venv and trip activate.sh's venv-python
+# sanity check.
+RSYNC_EXCLUDES=(--exclude='.venv/' --exclude='target/' --exclude='__pycache__/')
 
+rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/qiita-common/"              "$INCOMING/qiita-common/"
+rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/qiita-control-plane/"       "$INCOMING/qiita-control-plane/"
+rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/qiita-compute-orchestrator/" "$INCOMING/qiita-compute-orchestrator/"
+rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/deploy/"                    "$INCOMING/deploy/"
+install -m 0755 -o root -g root "$DP_BINARY" "$INCOMING/qiita-data-plane"
+
+# Explicit export so QIITA_HOSTNAME crosses the exec boundary into
+# activate.sh regardless of how the invoker provided it (`VAR=val script`
+# already exports for the script's lifetime, but explicit is defensive).
+export QIITA_HOSTNAME
 exec "$QIITA_CLONE/deploy/activate.sh"

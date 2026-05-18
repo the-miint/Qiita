@@ -6,9 +6,11 @@ After=network.target postgresql.service
 Type=simple
 User=qiita-data
 # DuckDB writes its extension cache under $HOME; qiita-data's passwd home is
-# /dev/null (non-login svc account), so set a real one via StateDirectory.
-StateDirectory=qiita-data
-Environment=HOME=/var/lib/qiita-data
+# /dev/null (non-login svc account), so set a real one. Per-instance dir
+# (%i) avoids concurrent-write races between simultaneous instances when
+# horizontally scaled (qiita-data-plane@50051, @50052, …).
+StateDirectory=qiita-data/%i
+Environment=HOME=/var/lib/qiita-data/%i
 Environment=LISTEN_ADDR=127.0.0.1:%i
 EnvironmentFile=/etc/qiita/data-plane.env
 ExecStart=/opt/qiita/data-plane/qiita-data-plane
