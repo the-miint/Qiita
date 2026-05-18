@@ -164,19 +164,23 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         choices=list(_VALID_ROLE_VALUES),
     )
+    p_role.set_defaults(handler=_handle_set_system_role)
 
-    sub.add_parser("whoami", help="Print the authenticated principal")
+    p_whoami = sub.add_parser("whoami", help="Print the authenticated principal")
+    p_whoami.set_defaults(handler=_handle_whoami)
 
     p_token = sub.add_parser("token", help="Token operations")
     p_token_sub = p_token.add_subparsers(dest="token_cmd", required=True)
     p_revoke = p_token_sub.add_parser("revoke-all", help="Bulk-revoke all of a principal's tokens")
     p_revoke.add_argument("--principal-idx", required=True, type=int)
+    p_revoke.set_defaults(handler=_handle_token_revoke_all)
 
     p_login = sub.add_parser(
         "login",
         help="AuthRocket LoginRocket Web flow with localhost loopback",
     )
     _common.add_token_file_arg(p_login)
+    p_login.set_defaults(handler=_handle_login)
 
     p_actions = sub.add_parser("actions", help="Action registry operations")
     p_actions_sub = p_actions.add_subparsers(dest="actions_cmd", required=True)
@@ -190,62 +194,66 @@ def _build_parser() -> argparse.ArgumentParser:
         default=Path("workflows"),
         help="Directory to scan for action YAMLs (default: ./workflows)",
     )
+    p_actions_sync.set_defaults(handler=_handle_actions_sync)
 
     return parser
+
+
+# ---------------------------------------------------------------------------
+# Subcommand handlers (registered via parser.set_defaults(handler=...))
+# ---------------------------------------------------------------------------
+
+
+def _handle_set_system_role(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        print("error: DATABASE_URL not set", file=sys.stderr)
+        return 2
+    try:
+        idx = asyncio.run(_set_system_role(database_url, args.email, args.role))
+    except (RuntimeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(f"updated principal idx={idx} system_role={args.role}")
+    return 0
+
+
+def _handle_whoami(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    return _common.run_http_subcommand(lambda t: _common.whoami(args.base_url, t))
+
+
+def _handle_token_revoke_all(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    return _common.run_http_subcommand(
+        lambda t: _token_revoke_all(args.base_url, t, args.principal_idx)
+    )
+
+
+def _handle_login(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    return _common.do_login(
+        base_url=args.base_url,
+        token_file=args.token_file,
+        cli_command="qiita-admin login",
+    )
+
+
+def _handle_actions_sync(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        print("error: DATABASE_URL not set", file=sys.stderr)
+        return 2
+    try:
+        result = asyncio.run(_sync_actions(database_url, args.workflows_dir))
+    except (FileNotFoundError, DuplicateActionError, ValidationError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-
-    if args.cmd == "set-system-role":
-        database_url = os.environ.get("DATABASE_URL")
-        if not database_url:
-            print("error: DATABASE_URL not set", file=sys.stderr)
-            return 2
-        try:
-            idx = asyncio.run(_set_system_role(database_url, args.email, args.role))
-        except (RuntimeError, ValueError) as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 1
-        print(f"updated principal idx={idx} system_role={args.role}")
-        return 0
-
-    if args.cmd == "whoami":
-        return _common.run_http_subcommand(lambda t: _common.whoami(args.base_url, t))
-
-    if args.cmd == "token":
-        if args.token_cmd == "revoke-all":
-            return _common.run_http_subcommand(
-                lambda t: _token_revoke_all(args.base_url, t, args.principal_idx)
-            )
-
-    if args.cmd == "login":
-        return _common.do_login(
-            base_url=args.base_url,
-            token_file=args.token_file,
-            cli_command="qiita-admin login",
-        )
-
-    if args.cmd == "actions":
-        if args.actions_cmd == "sync":
-            database_url = os.environ.get("DATABASE_URL")
-            if not database_url:
-                print("error: DATABASE_URL not set", file=sys.stderr)
-                return 2
-            try:
-                result = asyncio.run(_sync_actions(database_url, args.workflows_dir))
-            except (FileNotFoundError, DuplicateActionError, ValidationError) as exc:
-                print(f"error: {exc}", file=sys.stderr)
-                return 1
-            except RuntimeError as exc:
-                print(f"error: {exc}", file=sys.stderr)
-                return 1
-            print(json.dumps(result, indent=2))
-            return 0
-
-    parser.error(f"unknown command: {args.cmd}")
-    return 2
+    return args.handler(args, parser)
 
 
 if __name__ == "__main__":  # pragma: no cover

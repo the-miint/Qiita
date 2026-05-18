@@ -62,8 +62,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="AuthRocket LoginRocket Web flow with localhost loopback",
     )
     _common.add_token_file_arg(p_login)
+    p_login.set_defaults(handler=_handle_login)
 
-    sub.add_parser("whoami", help="Print the authenticated principal")
+    p_whoami = sub.add_parser("whoami", help="Print the authenticated principal")
+    p_whoami.set_defaults(handler=_handle_whoami)
 
     p_profile = sub.add_parser("profile", help="User profile operations")
     p_profile_sub = p_profile.add_subparsers(dest="profile_cmd", required=True)
@@ -86,6 +88,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Opt in/out of processing-status emails (use --no- to opt out)",
     )
+    p_profile_set.set_defaults(handler=_handle_profile_set)
 
     p_study = sub.add_parser("study", help="Study operations")
     p_study_sub = p_study.add_subparsers(dest="study_cmd", required=True)
@@ -111,8 +114,42 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=tuple(t.value for t in Tier),
         help="Default study_access tier; server defaults to 'member' when unset",
     )
+    p_study_create.set_defaults(handler=_handle_study_create)
 
     return parser
+
+
+# ---------------------------------------------------------------------------
+# Subcommand handlers (registered via parser.set_defaults(handler=...))
+# ---------------------------------------------------------------------------
+
+
+def _handle_login(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    return _common.do_login(
+        base_url=args.base_url,
+        token_file=args.token_file,
+        cli_command="qiita login",
+    )
+
+
+def _handle_whoami(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    return _common.run_http_subcommand(lambda t: _common.whoami(args.base_url, t))
+
+
+def _handle_profile_set(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    updates = _build_body(UserUpdate, args, parser)
+    if not updates:
+        parser.error(
+            "qiita profile set requires at least one of"
+            " --affiliation / --address / --phone / --orcid /"
+            " --receive-processing-emails / --no-receive-processing-emails"
+        )
+    return _common.run_http_subcommand(lambda t: _patch_user_me(args.base_url, t, updates))
+
+
+def _handle_study_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    body = _build_body(StudyCreate, args, parser)
+    return _common.run_http_subcommand(lambda t: _post_study(args.base_url, t, body))
 
 
 def _build_body(
@@ -151,35 +188,7 @@ def _build_body(
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-
-    if args.cmd == "login":
-        return _common.do_login(
-            base_url=args.base_url,
-            token_file=args.token_file,
-            cli_command="qiita login",
-        )
-
-    if args.cmd == "whoami":
-        return _common.run_http_subcommand(lambda t: _common.whoami(args.base_url, t))
-
-    if args.cmd == "profile":
-        if args.profile_cmd == "set":
-            updates = _build_body(UserUpdate, args, parser)
-            if not updates:
-                parser.error(
-                    "qiita profile set requires at least one of"
-                    " --affiliation / --address / --phone / --orcid /"
-                    " --receive-processing-emails / --no-receive-processing-emails"
-                )
-            return _common.run_http_subcommand(lambda t: _patch_user_me(args.base_url, t, updates))
-
-    if args.cmd == "study":
-        if args.study_cmd == "create":
-            body = _build_body(StudyCreate, args, parser)
-            return _common.run_http_subcommand(lambda t: _post_study(args.base_url, t, body))
-
-    parser.error(f"unknown command: {args.cmd}")
-    return 2
+    return args.handler(args, parser)
 
 
 if __name__ == "__main__":  # pragma: no cover
