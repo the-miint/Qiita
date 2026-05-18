@@ -865,40 +865,36 @@ nginx routing + PAT verification + Postgres reachability all work.
 
 ## 11. End-to-end smoke
 
-The smoke uses the `reference-add` workflow with a 3–5 sequence FASTA.
-A single ticket touches every layer:
+The smoke uses the `fastq-to-parquet` workflow against a tiny single-
+sample FASTQ. A single ticket touches every layer:
 
-- **Control plane** — validates the action, mints `feature_idx`, writes
-  `reference_membership`.
-- **Orchestrator** — dispatches the four-step pipeline to the configured
-  backend.
-- **Data plane** — registers Parquet via `ducklake_add_data_files`.
-- **Both filesystems** — intermediates on `<scratch>/staging` (from §8a),
-  final on `<data-dir>` (the path you set as `DUCKLAKE_DATA_PATH` in §8b).
+- **Control plane** — validates the action, mints the per-sample
+  `sequence_range`, persists the work ticket, transitions it to
+  `COMPLETED` on success.
+- **Orchestrator** — dispatches the native `fastq_to_parquet` step,
+  calls back to the CP for the sequence_range mint, writes
+  `reads.parquet` into the ticket's workspace.
+- **Both filesystems** — input FASTQ on `<scratch>` (the scratch root
+  from §8a), Parquet output under the workspace path on the same
+  shared FS.
 
 ### Recipe
 
-1. **Versioned smoke tag** — each deploy uses a unique reference name
-   so the smoke is re-runnable and leaves an audit trail:
-   ```bash
-   SMOKE_TAG="smoke-$(git -C /opt/qiita/control-plane rev-parse --short HEAD)"
-   ```
+End-to-end execution requires an end-user CLI (`qiita login` /
+`qiita study create` / `qiita biosample create` /
+`qiita sequenced-sample create` / `qiita ticket submit` /
+`qiita ticket status`) plus a small pool-less API surface on the CP.
+These land together in a follow-up PR; the resulting walkthrough lives
+at [`docs/runbooks/user-cli-quickstart.md`](user-cli-quickstart.md).
 
-2. **Stage a tiny FASTA** at
-   `<scratch>/references/incoming/$SMOKE_TAG/1.0.0/seqs.fasta`
-   (`<scratch>` is the scratch root from §8a; 3-5 short sequences are
-   enough; owner `qiita-job`, group readable so the hash job can read it).
-
-3. **Submit `reference-add`** against `(name=$SMOKE_TAG, version=1.0.0)`
-   using the operator's `system_admin` PAT. The promoted operator role
-   covers `feature:mint`, `reference:write`, and
-   `reference:register_files`.
-
-4. **Verify the four layers** — work ticket reaches `COMPLETED`;
-   `qiita_miint` has a new `reference` row plus features and membership;
-   `qiita_miint_lake` has new `ducklake_data_file` rows; `<data-dir>`
-   contains recent Parquet files (mode `0440`). A failure on any single
-   check pinpoints which layer is broken.
+The walkthrough drives the smoke from a fresh user PAT through to a
+`COMPLETED` ticket and a `reads.parquet` artifact, with verification
+commands at each layer. Prerequisites that remain operator-side after
+step 10 — `qiita-admin actions sync --workflows-dir
+/opt/qiita/control-plane/workflows` and compute service-account
+provisioning per
+[`compute-service-account-provisioning.md`](compute-service-account-provisioning.md) —
+are linked from the walkthrough.
 
 ## Subsequent deploys
 
