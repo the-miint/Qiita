@@ -73,6 +73,24 @@ async def e2e_prep_sample(postgres_pool, human_admin_session):
     )
 
 
+def _make_settings(sa_token: str) -> Settings:
+    """Build an orchestrator Settings instance for the test. Settings
+    is a frozen dataclass with several required fields beyond what
+    `mint_sequence_range` actually reads; pass dummies for the
+    backend / shared_fs / cp_to_co fields so the construction
+    succeeds. `cp_url="http://test"` because httpx still uses
+    base_url for relative-path resolution even when an ASGITransport
+    is wired up downstream — ASGITransport ignores the host:port
+    part."""
+    return Settings(
+        backend_type="local",
+        shared_filesystem_root="/tmp/qiita-e2e-unused",
+        cp_to_co_token="unused-in-e2e",
+        cp_url="http://test",
+        co_to_cp_token=sa_token,
+    )
+
+
 async def test_mint_sequence_range_full_path(
     postgres_pool,
     cp_app_with_pool,
@@ -84,14 +102,7 @@ async def test_mint_sequence_range_full_path(
     that qiita.sequence_range carries a row matching the returned
     bounds — proving the full request/response/DB-write cycle, not
     just that the helper handles a 201."""
-    sa_token = compute_worker_service_account["token"]
-
-    settings = Settings(
-        # ASGITransport ignores the URL but httpx still uses base_url
-        # for relative-path resolution, so it must be a valid http URL.
-        cp_url="http://test",
-        co_to_cp_token=sa_token,
-    )
+    settings = _make_settings(compute_worker_service_account["token"])
     http = make_cp_client(
         settings=settings,
         transport=ASGITransport(app=cp_app_with_pool),
@@ -130,8 +141,7 @@ async def test_mint_sequence_range_second_attempt_raises_already_exists(
     raises SequenceRangeAlreadyExists. Proves the 409 path also flows
     end-to-end through the real CP route (not just the helper's
     branch on the mocked status code)."""
-    sa_token = compute_worker_service_account["token"]
-    settings = Settings(cp_url="http://test", co_to_cp_token=sa_token)
+    settings = _make_settings(compute_worker_service_account["token"])
     http = make_cp_client(
         settings=settings,
         transport=ASGITransport(app=cp_app_with_pool),
