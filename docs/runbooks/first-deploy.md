@@ -149,6 +149,16 @@ Two valid postures for the final Parquet dir:
 - **Mount-as-data**: the mount point itself is `qiita-data:qiita-data
   0750`. Use this when the mount is dedicated to qiita's lake. Simpler.
 
+**Placeholder vocabulary used downstream.** `<mount>` and `<scratch>`
+refer to the *roots* (the parent mounts). `<data-dir>` and `<staging-dir>`
+are the *final paths*: under the subdir-of-mount posture
+`<data-dir>` = `<mount>/parquet` and `<staging-dir>` = `<scratch>/staging`;
+under mount-as-data `<data-dir>` = `<mount>` directly (staging still
+follows the subdir form). §8a writes the dirs using `<mount>` / `<scratch>`,
+§8b sets `DUCKLAKE_DATA_PATH=<data-dir>`, step 11 references
+`<scratch>/...` and `<data-dir>` — same paths, just whichever name the
+context wants.
+
 Verification:
 ```bash
 # [either]
@@ -360,7 +370,7 @@ from many steps below; symlink it into the operator's PATH once:
 mkdir -p ~/.local/bin
 ln -sf /opt/qiita/control-plane/.venv/bin/qiita-admin ~/.local/bin/qiita-admin
 hash -r   # forget any stale lookup cache in this shell
-command -v qiita-admin   # expect /home/qiita/.local/bin/qiita-admin
+command -v qiita-admin   # expect ~/.local/bin/qiita-admin (neutral against QIITA_USER overrides)
 ```
 
 If `~/.local/bin` isn't on the operator's PATH, add it via `.bash_profile`
@@ -370,9 +380,25 @@ If `~/.local/bin` isn't on the operator's PATH, add it via `.bash_profile`
 
 systemd loads `/etc/qiita/control-plane.env` for the CP. This step
 generates the shared HMAC secret and installs a rendered copy of the
-committed template at `.env.control-plane.example`. Keep `$HMAC_SECRET_KEY`
-alive in qiita's shell — step 8b needs the same value for the data-plane
-env file.
+committed template at `.env.control-plane.example`.
+
+**Keep these shell-resident across steps 1-8b** (use tmux/screen or
+otherwise ensure the shell doesn't close):
+
+- `$HMAC_SECRET_KEY` — step 8b's data-plane env file must see the
+  byte-identical value.
+- `$DATABASE_URL` — step 2 (`make migrate`), step 3 (`verify_jwt.py`),
+  and step 6 (`qiita-admin set-system-role` — direct DB, no HTTP) all
+  read it. Sourced from `/tmp/control-plane.env` below; once `[admin]`
+  installs the final copy as `root:qiita-api 0440`, the operator can
+  no longer read it back from disk, so the in-shell copy is the only
+  surviving access until step 8b is done.
+
+If either var goes missing between steps, recover via
+`sudo cat /etc/qiita/control-plane.env` (admin shell) and re-export
+manually — or for the HMAC specifically, regenerate (in which case
+you must also re-render the data-plane env file with the new value
+and restart both services).
 
 **The cross-account handoff.** The CP env file holds secrets (DB password,
 HMAC). `[operator]` renders the working copy at `/tmp/control-plane.env`
