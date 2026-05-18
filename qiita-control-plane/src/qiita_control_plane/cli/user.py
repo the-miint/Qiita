@@ -4,10 +4,10 @@ Scope: actions a regular user performs against a running deployment.
 The parallel operator/admin CLI is `qiita-admin`; that one stays
 scoped to principal/role/token management and is deliberately separate.
 
-Shared with `qiita-admin`: the LoginRocket loopback flow, PAT file I/O,
-and the generic token-read + HTTP + JSON-print runner all live in
-`cli._common`. This module owns the user-facing argparse surface and
-its subcommand handlers.
+This module owns the user-facing argparse surface and its subcommand
+handlers. PAT file I/O, the LoginRocket loopback flow, the
+authenticated HTTP call helper, and the generic token-read + invoke +
+JSON-print runner live in `cli._common`.
 
 Authentication: HTTP subcommands read the PAT from QIITA_TOKEN env or
 from ~/.qiita/token (mode 0600).
@@ -86,7 +86,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--receive-processing-emails",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Opt in/out of processing-status emails (use --no- to opt out)",
+        help=(
+            "Opt in (--receive-processing-emails) or out"
+            " (--no-receive-processing-emails); omit to leave the current"
+            " value unchanged"
+        ),
     )
     p_profile_set.set_defaults(handler=_handle_profile_set)
 

@@ -1,10 +1,19 @@
-"""Shared CLI helpers used by both `qiita-admin` and the end-user `qiita`
-CLI: PAT file I/O, the LoginRocket loopback flow, the generic
-token-read + HTTP + JSON-print runner, and `/auth/whoami`.
+"""Package-private CLI helpers.
 
-Package-private (the filename's leading underscore signals "import only
-from inside qiita_control_plane.cli"). Names do not carry the prefix —
-within the package this module is the public surface.
+Surface:
+- argparse helpers (`add_base_url_arg`, `add_token_file_arg`) and the
+  defaults / env-var names that back them.
+- PAT file I/O (`read_token`, `write_token`).
+- The authenticated HTTP call helper (`call`) plus `whoami` as a thin
+  wrapper, and the generic token-read + invoke + JSON-print runner
+  (`run_http_subcommand`).
+- LoginRocket Web loopback flow (`do_login`, plus the `LoopbackResult`
+  / `bind_loopback` / `loopback_handler_factory` building blocks the
+  flow composes from).
+
+Filename's leading underscore signals "import only from inside
+qiita_control_plane.cli"; the names themselves do not carry the
+prefix because within the package this module is the public surface.
 """
 
 from __future__ import annotations

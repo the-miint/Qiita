@@ -25,8 +25,7 @@ Subcommands:
 
 Authentication for HTTP subcommands: read PAT from QIITA_TOKEN env var or
 from ~/.qiita/token (mode 0600 expected). Loopback login flow, token I/O,
-and the generic HTTP runner live in `cli._common` and are shared with the
-end-user `qiita` CLI.
+and the generic HTTP runner live in `cli._common`.
 """
 
 import argparse
