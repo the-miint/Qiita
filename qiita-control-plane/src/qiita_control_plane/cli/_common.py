@@ -2,7 +2,9 @@
 
 Surface:
 - argparse helpers (`add_base_url_arg`, `add_token_file_arg`) and the
-  defaults / env-var names that back them.
+  defaults / env-var names that back them. `validate_base_url(args,
+  parser)` is the post-parse companion that refuses plain http:// to
+  a non-localhost host unless --insecure was passed.
 - PAT file I/O (`read_token`, `write_token`).
 - The authenticated HTTP call helper (`call`) plus `whoami` as a thin
   wrapper, and the generic token-read + invoke + JSON-print runner
@@ -10,6 +12,23 @@ Surface:
 - LoginRocket Web loopback flow (`do_login`, plus the `LoopbackResult`
   / `bind_loopback` / `loopback_handler_factory` building blocks the
   flow composes from).
+
+Subcommand-dispatch contract (followed by both qiita-admin and qiita;
+a future third CLI should follow the same shape so the dispatch stays
+uniform):
+
+    p_<name> = sub.add_parser("<name>", help=...)
+    ...   # add per-subcommand args
+    p_<name>.set_defaults(handler=_handle_<name>)
+
+    def _handle_<name>(args: argparse.Namespace,
+                      parser: argparse.ArgumentParser) -> int: ...
+
+    def main(argv=None) -> int:
+        parser = _build_parser()
+        args = parser.parse_args(argv)
+        validate_base_url(args, parser)
+        return args.handler(args, parser)
 
 Filename's leading underscore signals "import only from inside
 qiita_control_plane.cli"; the names themselves do not carry the
