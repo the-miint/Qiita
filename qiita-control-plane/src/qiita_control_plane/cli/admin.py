@@ -232,7 +232,11 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     if args.cmd == "login":
-        return _common.do_login(base_url=args.base_url, token_file=args.token_file)
+        return _common.do_login(
+            base_url=args.base_url,
+            token_file=args.token_file,
+            cli_command="qiita-admin login",
+        )
 
     if args.cmd == "actions":
         if args.actions_cmd == "sync":

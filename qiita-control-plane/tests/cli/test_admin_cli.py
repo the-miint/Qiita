@@ -83,8 +83,10 @@ def test_token_revoke_all_calls_correct_url(monkeypatch):
 
 def test_main_login_dispatches_to_do_login(monkeypatch):
     """Wiring test: `qiita-admin login` calls `_common.do_login` with the parsed
-    --base-url and --token-file. The actual flow logic is exercised by
-    test_cli_login.py (helpers) and tests/integration (end-to-end)."""
+    --base-url and --token-file, plus cli_command="qiita-admin login" so
+    error messages tell the user to re-run the admin binary. The actual
+    flow logic is exercised by test_cli_login.py (helpers) and
+    tests/integration (end-to-end)."""
     from pathlib import Path
 
     from qiita_control_plane.cli import _common
@@ -92,9 +94,10 @@ def test_main_login_dispatches_to_do_login(monkeypatch):
 
     captured: dict = {}
 
-    def fake_do_login(*, base_url: str, token_file: Path) -> int:
+    def fake_do_login(*, base_url: str, token_file: Path, cli_command: str) -> int:
         captured["base_url"] = base_url
         captured["token_file"] = token_file
+        captured["cli_command"] = cli_command
         return 0
 
     monkeypatch.setattr(_common, "do_login", fake_do_login)
@@ -105,6 +108,7 @@ def test_main_login_dispatches_to_do_login(monkeypatch):
     assert rc == 0
     assert captured["base_url"] == "https://qiita.example.test"
     assert captured["token_file"] == Path("/tmp/qiita-cli-test")
+    assert captured["cli_command"] == "qiita-admin login"
 
 
 def test_main_set_system_role_validates_role():

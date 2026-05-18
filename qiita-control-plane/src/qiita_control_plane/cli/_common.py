@@ -218,8 +218,12 @@ def bind_loopback(*, preferred_ports: tuple[int, ...] = ()) -> tuple[http.server
     return srv, srv.server_address[1]
 
 
-def do_login(*, base_url: str, token_file: Path) -> int:
+def do_login(*, base_url: str, token_file: Path, cli_command: str) -> int:
     """Drive the LoginRocket Web flow end-to-end.
+
+    `cli_command` is the verbatim "re-run this" string embedded in error
+    messages (e.g. `"qiita-admin login"` or `"qiita login"`); both
+    consumers of this helper pass their own.
 
     Steps:
       1. Bind localhost loopback HTTP server.
@@ -254,7 +258,7 @@ def do_login(*, base_url: str, token_file: Path) -> int:
         if not result.event.wait(timeout=LOGIN_WAIT_TIMEOUT_SECONDS):
             print(
                 f"error: timed out after {LOGIN_WAIT_TIMEOUT_SECONDS}s waiting for the"
-                " browser callback. Re-run `qiita-admin login`. If the browser"
+                f" browser callback. Re-run `{cli_command}`. If the browser"
                 " never reached the qiita server, check your QIITA_CONTROL_PLANE_URL.",
                 file=sys.stderr,
             )
@@ -285,7 +289,7 @@ def do_login(*, base_url: str, token_file: Path) -> int:
     if resp.status_code == 404:
         print(
             "error: the one-time code was not recognized. It may have"
-            " expired or been used already. Re-run `qiita-admin login`.",
+            f" expired or been used already. Re-run `{cli_command}`.",
             file=sys.stderr,
         )
         return 1
