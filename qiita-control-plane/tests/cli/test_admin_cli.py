@@ -13,6 +13,7 @@ argparse wiring on the admin entry point.
 
 import httpx
 import pytest
+from qiita_common.auth_constants import BEARER_PREFIX
 
 
 def test_read_token_from_env(monkeypatch):
@@ -63,7 +64,7 @@ def test_whoami_calls_correct_url(monkeypatch):
     body = _common.whoami("https://api.example.com/", "qk_X")
     assert captured["method"] == "GET"
     assert captured["url"] == "https://api.example.com/api/v1/auth/whoami"
-    assert captured["auth"] == "Bearer qk_X"
+    assert captured["auth"] == f"{BEARER_PREFIX}qk_X"
     assert body == {"kind": "human", "principal_idx": 7}
 
 
@@ -87,7 +88,7 @@ def test_token_revoke_all_calls_correct_url(monkeypatch):
     body = cli._token_revoke_all("http://localhost:8080", "qk_admin", 42)
     assert captured["method"] == "POST"
     assert captured["url"] == "http://localhost:8080/api/v1/admin/principal/42/revoke-all-tokens"
-    assert captured["auth"] == "Bearer qk_admin"
+    assert captured["auth"] == f"{BEARER_PREFIX}qk_admin"
     assert body["revoked_token_idxs"] == [1, 2]
 
 

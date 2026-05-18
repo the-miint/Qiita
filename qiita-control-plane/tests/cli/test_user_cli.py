@@ -9,6 +9,7 @@ dispatch.
 from pathlib import Path
 
 import pytest
+from qiita_common.auth_constants import BEARER_PREFIX
 
 
 def test_help_exits_cleanly(capsys):
@@ -140,7 +141,7 @@ def test_profile_set_sends_only_supplied_fields(monkeypatch):
     assert rc == 0
     assert captured["method"] == "PATCH"
     assert captured["url"] == "https://q.example.test/api/v1/user/me"
-    assert captured["auth"] == "Bearer qk_test"
+    assert captured["auth"] == f"{BEARER_PREFIX}qk_test"
     assert captured["json"] == {"affiliation": "UCSD", "phone": "+1-555-0100"}
 
 
@@ -215,7 +216,7 @@ def test_study_create_minimal_sends_only_title(monkeypatch):
     assert rc == 0
     assert captured["method"] == "POST"
     assert captured["url"] == "https://q.example.test/api/v1/study"
-    assert captured["auth"] == "Bearer qk_test"
+    assert captured["auth"] == f"{BEARER_PREFIX}qk_test"
     assert captured["json"] == {"title": "Smoke Study"}
 
 
