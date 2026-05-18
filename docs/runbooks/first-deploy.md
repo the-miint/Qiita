@@ -24,18 +24,20 @@ callbacks).
 
 ## Account model
 
-This runbook uses two account labels on every command:
+This runbook uses two account labels on every command — both are *roles*,
+not OS users, deliberately distinct from the `qiita-*` service-account
+naming (`qiita-api`, `qiita-orch`, `qiita-data`, `qiita-job`):
 
-| Label | Account | Capability |
-|---|---|---|
-| `[qiita]` | A shared, named operational account on the deploy host (e.g. `qiita`). **No sudo.** Owns the clone, holds shell env vars across steps, runs `make migrate`, owns `~/.qiita/token`. |
+| Label | What it means |
+|---|---|
+| `[operator]` | A shared, named operational account on the deploy host — typically a user literally named `qiita` (don't confuse with `qiita-api` etc.). **No sudo.** Owns the clone, holds shell env vars across steps, runs `make migrate`, owns `~/.qiita/token`. |
 | `[admin]` | Your own personal account with sudo. Runs everything that touches `/etc/qiita/`, `/opt/qiita/`, `/etc/systemd/`, `/etc/nginx/`, and `systemctl`. |
 
-The qiita account must **not** be a member of any of `qiita-services`,
-`qiita-pipeline`, `qiita-data`, `qiita-fs`, or `qiita-job` — otherwise
-the operator gains read access to service secrets and lake data, which
-defeats the privilege separation the service users provide. Verify with
-`id qiita` in step 0.
+The `qiita` operator account must **not** be a member of any of
+`qiita-services`, `qiita-pipeline`, `qiita-data`, `qiita-fs`, or
+`qiita-job` — otherwise the operator gains read access to service
+secrets and lake data, which defeats the privilege separation the
+service users provide. Verify with `id qiita` in step 0.
 
 Service start/stop authority on the qiita-* units is **root only**
 (same model as `postgresql.service` / `nginx.service`). Operators run
@@ -113,14 +115,14 @@ Provided by your DBA:
 
 Verification:
 ```bash
-# [qiita] interactive password prompt avoids putting the password in shell history
+# [operator] interactive password prompt avoids putting the password in shell history
 psql -h <pg-host> -U qiita_miint_rw -d qiita_miint -W \
     -c "SELECT current_user, current_database();"
 
 psql -h <pg-host> -U qiita_miint_lake_rw -d qiita_miint_lake -W \
     -c "SELECT current_user, current_database();"
 
-# [qiita] confirm citext is enabled and clock skew is small
+# [operator] confirm citext is enabled and clock skew is small
 psql -h <pg-host> -U qiita_miint_rw -d qiita_miint -W -c "
   SELECT 'a'::citext = 'A'::citext AS citext_ok,
          extract(epoch from (now() AT TIME ZONE 'UTC' - now())) AS pg_now_utc_offset;"
@@ -213,7 +215,7 @@ sudo mv /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/default.conf.disabled
 
 The deploy host needs the toolchain to compile the data-plane binary
 and create the Python service venvs. Install system-wide so they're
-available to both `[qiita]` (for `make migrate`, `qiita-admin`) and
+available to both `[operator]` (for `make migrate`, `qiita-admin`) and
 `[admin]` (for `deploy/local-deploy.sh`).
 
 | Tool | Why needed | Rocky 10 install |
@@ -308,7 +310,7 @@ sudo install -d -o root -g root -m 0755 /etc/qiita
 ### Clone the repo as `qiita`
 
 ```bash
-# [qiita]
+# [operator]
 cd ~ && git clone <repo-url> qiita-miint
 ```
 
@@ -347,6 +349,23 @@ sudo -u qiita-orch /opt/qiita/compute-orchestrator/.venv/bin/python --version
 Symlinks should resolve under `/opt/uv-python/` (not `/root/.local/...`),
 and both service users should be able to execute their Python.
 
+### Put `qiita-admin` on the operator's PATH
+
+The `qiita-admin` CLI lives in the deployed CP venv at
+`/opt/qiita/control-plane/.venv/bin/qiita-admin`. The operator runs it
+from many steps below; symlink it into the operator's PATH once:
+
+```bash
+# [operator]
+mkdir -p ~/.local/bin
+ln -sf /opt/qiita/control-plane/.venv/bin/qiita-admin ~/.local/bin/qiita-admin
+hash -r   # forget any stale lookup cache in this shell
+command -v qiita-admin   # expect /home/qiita/.local/bin/qiita-admin
+```
+
+If `~/.local/bin` isn't on the operator's PATH, add it via `.bash_profile`
+(`export PATH="$HOME/.local/bin:$PATH"`).
+
 ## 1. Write the control plane env file
 
 systemd loads `/etc/qiita/control-plane.env` for the CP. This step
@@ -356,8 +375,8 @@ alive in qiita's shell — step 8b needs the same value for the data-plane
 env file.
 
 **The cross-account handoff.** The CP env file holds secrets (DB password,
-HMAC). `[qiita]` renders the working copy at `/tmp/control-plane.env`
-(mode `0600` qiita-owned), `[qiita]` sources it into their own shell
+HMAC). `[operator]` renders the working copy at `/tmp/control-plane.env`
+(mode `0600` qiita-owned), `[operator]` sources it into their own shell
 **before** `[admin]` shreds it (otherwise the operator can't read
 `DATABASE_URL` for `make migrate` and the `verify_jwt.py` step), then
 `[admin]` installs the final copy at `/etc/qiita/control-plane.env` with
@@ -368,7 +387,7 @@ realm subdomain (from `authrocket-realm-setup.md`); externally-resolvable
 FQDN.
 
 ```bash
-# [qiita] in a stable shell (use tmux/screen — HMAC_SECRET_KEY must survive
+# [operator] in a stable shell (use tmux/screen — HMAC_SECRET_KEY must survive
 # into step 8b's data-plane env file)
 cd ~/qiita-miint
 
@@ -377,7 +396,7 @@ export HMAC_SECRET_KEY=$(openssl rand -base64 32)
 
 # Render and tighten perms before any secrets land in the file
 cp .env.control-plane.example /tmp/control-plane.env
-chmod 600 /tmp/control-plane.env
+chmod 0600 /tmp/control-plane.env
 
 # Substitute every value we have. The password is filled by the editor pass below.
 sed -i.bak \
@@ -411,9 +430,13 @@ sudo shred -u /tmp/control-plane.env
 
 `?sslmode=prefer` makes `dbmate` (which uses Go's `lib/pq` driver, defaulting
 to `sslmode=require`) fall back to plain when the PG server doesn't speak SSL,
-while still upgrading if SSL becomes available later. `asyncpg` (used by the
-CP at runtime) defaults to `prefer` already; the explicit setting just makes
-`make migrate` survive a no-SSL server.
+while still upgrading if SSL becomes available later. Without the explicit
+setting, `make migrate` fails with:
+```
+Error: pq: SSL is not enabled on the server
+```
+`asyncpg` (used by the CP at runtime) defaults to `prefer` already, so the
+explicit setting only changes `make migrate`'s behavior.
 
 **If HMAC values disagree** later. Every Flight DoGet/DoAction will return
 `Unauthenticated: invalid HMAC signature` from the data plane. The control
@@ -427,7 +450,7 @@ realm-side configuration.
 ## 2. Apply migrations
 
 ```bash
-# [qiita] DATABASE_URL is already in qiita's shell from the source in step 1
+# [operator] DATABASE_URL is already in qiita's shell from the source in step 1
 make migrate
 ```
 
@@ -439,7 +462,7 @@ exist yet.
 
 Verify:
 ```bash
-# [qiita]
+# [operator]
 psql -h <pg-host> -U qiita_miint_rw -d qiita_miint -W \
     -c "SELECT idx, display_name, system_role FROM qiita.principal;"
 ```
@@ -457,7 +480,7 @@ Log into the AuthRocket realm via the hosted UI (the AuthRocket
 the raw JWT). Then:
 
 ```bash
-# [qiita] env vars are still live from step 1's source. read -s keeps
+# [operator] env vars are still live from step 1's source. read -s keeps
 # the token out of bash history.
 read -s JWT
 # (paste, Enter — no echo, that's normal)
@@ -534,7 +557,7 @@ PAT, and saves it to `~/.qiita/token` (mode 0600).
 > 5 min is still tiny in absolute terms, defensible permanent config.
 
 ```bash
-# [qiita]
+# [operator]
 qiita-admin --base-url https://<fqdn> login
 ```
 
@@ -547,7 +570,7 @@ is written to `~/.qiita/token`.
 Promote yourself to `system_admin` (direct DB; no HTTP auth needed):
 
 ```bash
-# [qiita]
+# [operator]
 qiita-admin set-system-role --email <operator-email> --role system_admin
 ```
 
@@ -644,10 +667,10 @@ Render the committed template at `.env.data-plane.example`, substituting
 the HMAC secret from step 1's shell.
 
 ```bash
-# [qiita]
+# [operator]
 cd ~/qiita-miint
 cp .env.data-plane.example /tmp/data-plane.env
-chmod 600 /tmp/data-plane.env
+chmod 0600 /tmp/data-plane.env
 
 sed -i.bak \
     -e "s|^HMAC_SECRET_KEY=.*|HMAC_SECRET_KEY=$HMAC_SECRET_KEY|" \
@@ -669,6 +692,19 @@ sudo shred -u /tmp/data-plane.env
 pairs, NOT a `postgresql://` URL. (`DATABASE_URL` in the CP env is the
 URL form because asyncpg accepts that; the data plane reads the raw
 libpq form because DuckDB's postgres extension expects it.)
+
+After this step the shared `$HMAC_SECRET_KEY` is no longer needed in
+the operator's shell (it's persisted in `/etc/qiita/{control,data}-plane.env`).
+Same for the `DATABASE_URL` / `AUTHROCKET_*` env vars we sourced in
+step 1 — they're only used by `make migrate` (step 2) and `verify_jwt.py`
+(step 3), both already done. Clear them to limit exposure:
+
+```bash
+# [operator]
+unset HMAC_SECRET_KEY DATABASE_URL \
+      AUTHROCKET_ISSUER AUTHROCKET_LOGINROCKET_URL AUTHROCKET_JWKS_URL \
+      QIITA_ENDPOINT_URL COMPUTE_ORCHESTRATOR_URL
+```
 
 ### 8c. Start the data plane
 
@@ -699,32 +735,15 @@ Expected: `status: SERVING`. `Unauthenticated: invalid HMAC signature`
 from later Flight calls means `HMAC_SECRET_KEY` differs between the CP
 and DP env files (see step 1).
 
-> **Known limitation**: `make verify-health` invokes `grpcurl` without
-> a proto file and relies on the DP server supporting gRPC reflection
-> for service discovery. The production data-plane build (with
-> `--features duckdb/bundled`) does not compile reflection in, so this
-> step returns `server does not support the reflection API` instead of
-> `SERVING`. Fall back to out-of-band checks:
->
-> ```bash
-> sudo systemctl status qiita-data-plane@50051 --no-pager | head -5
-> ss -ltn | grep ':50051'
-> sudo journalctl -u qiita-data-plane@50051 -n 5 --no-pager
-> ```
->
-> `Active: active (running)` + a `LISTEN` on `127.0.0.1:50051` + a log
-> line `qiita-data-plane listening on 127.0.0.1:50051` is the green
-> signal.
-
 ## 9. Start the orchestrator
 
 ### 9a. Write the orchestrator env file
 
 ```bash
-# [qiita]
+# [operator]
 cd ~/qiita-miint
 cp .env.compute-orchestrator.example /tmp/compute-orchestrator.env
-chmod 600 /tmp/compute-orchestrator.env
+chmod 0600 /tmp/compute-orchestrator.env
 
 sed -i.bak \
     -e "s|^COMPUTE_BACKEND=.*|COMPUTE_BACKEND=slurm|" \
@@ -776,15 +795,10 @@ endpoint on the DP (50051). All three must return `OK` / `SERVING`. A
 failure here points at a single service — `journalctl -u qiita-<service>`
 gives the boot error.
 
-The DP gRPC check needs reflection in the binary (see the note in
-step 8d); on a `--features duckdb/bundled` build the check returns
-"server does not support the reflection API". Use the `systemctl status`
-+ `ss -ltn` fallback from step 8d to validate the DP independently.
-
 ### 10b. Operator auth path works
 
 ```bash
-# [qiita]
+# [operator]
 qiita-admin --base-url https://<fqdn> whoami
 ```
 
@@ -801,7 +815,7 @@ on the role line means `set-system-role` didn't take effect.
 ### 10c. CP routing + DB connectivity
 
 ```bash
-# [qiita]
+# [operator]
 curl -sS https://<fqdn>/api/v1/reference/1 \
     -H "Authorization: Bearer $(cat ~/.qiita/token)" \
     -w "\nHTTP %{http_code}\n"
@@ -824,7 +838,8 @@ A single ticket touches every layer:
 - **Orchestrator** — dispatches the four-step pipeline to the configured
   backend.
 - **Data plane** — registers Parquet via `ducklake_add_data_files`.
-- **Both filesystems** — intermediates on staging, final on the data dir.
+- **Both filesystems** — intermediates on `<scratch>/staging` (from §8a),
+  final on `<data-dir>` (the path you set as `DUCKLAKE_DATA_PATH` in §8b).
 
 ### Recipe
 
@@ -835,9 +850,9 @@ A single ticket touches every layer:
    ```
 
 2. **Stage a tiny FASTA** at
-   `/scratch/ephemeral/references/incoming/$SMOKE_TAG/1.0.0/seqs.fasta`
-   (3-5 short sequences are enough; owner `qiita-job`, group readable
-   so the hash job can read it).
+   `<scratch>/references/incoming/$SMOKE_TAG/1.0.0/seqs.fasta`
+   (`<scratch>` is the scratch root from §8a; 3-5 short sequences are
+   enough; owner `qiita-job`, group readable so the hash job can read it).
 
 3. **Submit `reference-add`** against `(name=$SMOKE_TAG, version=1.0.0)`
    using the operator's `system_admin` PAT. The promoted operator role
@@ -846,8 +861,8 @@ A single ticket touches every layer:
 
 4. **Verify the four layers** — work ticket reaches `COMPLETED`;
    `qiita_miint` has a new `reference` row plus features and membership;
-   `qiita_miint_lake` has new `ducklake_data_file` rows; the data dir
-   contains recent Parquet files (mode 440). A failure on any single
+   `qiita_miint_lake` has new `ducklake_data_file` rows; `<data-dir>`
+   contains recent Parquet files (mode `0440`). A failure on any single
    check pinpoints which layer is broken.
 
 ## Subsequent deploys
