@@ -20,7 +20,7 @@ from . import require_transaction
 # named-key access so column order in this string is not load-bearing.
 _STUDY_RETURNING_COLS = (
     "idx, owner_idx, principal_investigator_idx, title, alias,"
-    " description, abstract, funding, ebi_study_accession, vamps_id,"
+    " description, abstract, funding, ebi_study_accession,"
     " notes, extra_metadata, default_tier, created_by_idx,"
     " created_at, updated_at"
 )
@@ -83,7 +83,6 @@ async def insert_study(
     abstract: str | None = None,
     funding: str | None = None,
     ebi_study_accession: str | None = None,
-    vamps_id: str | None = None,
     notes: str | None = None,
     extra_metadata: dict | None = None,
     default_tier: Tier | None = None,
@@ -109,9 +108,9 @@ async def insert_study(
         "INSERT INTO qiita.study ("
         "    owner_idx, principal_investigator_idx, title, alias,"
         "    description, abstract, funding, ebi_study_accession,"
-        "    vamps_id, notes, extra_metadata, default_tier, created_by_idx"
-        ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb,"
-        "          COALESCE($12::qiita.tier, 'member'::qiita.tier), $13)"
+        "    notes, extra_metadata, default_tier, created_by_idx"
+        ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb,"
+        "          COALESCE($11::qiita.tier, 'member'::qiita.tier), $12)"
         f" RETURNING {_STUDY_RETURNING_COLS}",
         owner_idx,
         principal_investigator_idx,
@@ -121,7 +120,6 @@ async def insert_study(
         abstract,
         funding,
         ebi_study_accession,
-        vamps_id,
         notes,
         extra_metadata_json,
         default_tier,
@@ -173,7 +171,6 @@ async def create_study(
     abstract: str | None = None,
     funding: str | None = None,
     ebi_study_accession: str | None = None,
-    vamps_id: str | None = None,
     notes: str | None = None,
     extra_metadata: dict | None = None,
     default_tier: Tier | None = None,
@@ -199,7 +196,6 @@ async def create_study(
         abstract=abstract,
         funding=funding,
         ebi_study_accession=ebi_study_accession,
-        vamps_id=vamps_id,
         notes=notes,
         extra_metadata=extra_metadata,
         default_tier=default_tier,

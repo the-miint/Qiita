@@ -471,7 +471,6 @@ class StudyCreate(BaseModel):
     abstract: str | None = None
     funding: str | None = Field(default=None, max_length=_STUDY_FUNDING_MAX)
     ebi_study_accession: str | None = Field(default=None, max_length=_STUDY_ACCESSION_MAX)
-    vamps_id: str | None = Field(default=None, max_length=_STUDY_ACCESSION_MAX)
     notes: str | None = None
     extra_metadata: dict[str, object] | None = None
     default_tier: Tier | None = None
@@ -494,7 +493,6 @@ class StudyResponse(BaseModel):
     abstract: str | None
     funding: str | None
     ebi_study_accession: str | None
-    vamps_id: str | None
     notes: str | None
     extra_metadata: dict[str, object] | None
     default_tier: Tier
