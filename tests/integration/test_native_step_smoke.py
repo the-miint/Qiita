@@ -227,22 +227,27 @@ async def test_fastq_to_parquet_through_runner(
         ).fetchall()
         # DuckDB DESCRIBE column order matches the Parquet's physical order.
         # sequence_idx is the CP-minted join key; read_id stays as a
-        # label. `quality` is miint's native UTINYINT[] (phred-decoded
-        # scores).
+        # label. `qual1` is miint's native UTINYINT[] (phred-decoded
+        # scores). sequence2/qual2 are always emitted for schema
+        # uniformity — they're NULL for the unpaired smoke fixture.
+        # No sequence_length column: Parquet row-group metadata + a
+        # length(sequence1) call covers the use cases.
         assert rows == [
             ("sequence_idx", "BIGINT"),
             ("read_id", "VARCHAR"),
-            ("sequence", "VARCHAR"),
-            ("quality", "UTINYINT[]"),
-            ("sequence_length", "BIGINT"),
+            ("sequence1", "VARCHAR"),
+            ("qual1", "UTINYINT[]"),
+            ("sequence2", "VARCHAR"),
+            ("qual2", "UTINYINT[]"),
         ]
 
         # Fixture has 4 reads — no dedup, each read produces a row even
         # when sequences match (read_001 and read_003 carry the same
         # sequence; both appear).
         records = conn.execute(
-            "SELECT sequence_idx, read_id, sequence, quality, sequence_length"
-            f" FROM '{reads_parquet}' ORDER BY sequence_idx"
+            "SELECT sequence_idx, read_id, sequence1, qual1,"
+            f" length(sequence1) AS seq_len FROM '{reads_parquet}'"
+            " ORDER BY sequence_idx"
         ).fetchall()
     assert len(records) == 4
 
@@ -257,7 +262,9 @@ async def test_fastq_to_parquet_through_runner(
     assert by_read_id["read_001"][2] == "ACGTACGTACGTACGTACGT"
     assert by_read_id["read_003"][2] == "ACGTACGTACGTACGTACGT"
     assert by_read_id["read_001"][0] != by_read_id["read_003"][0]
-    # All sequence_lengths are 20 (each read in the fixture is 20 bp).
+    # All read lengths are 20 (each read in the fixture is 20 bp);
+    # length() is computed at query time from sequence1 rather than
+    # stored as a column.
     assert {r[4] for r in records} == {20}
 
     # Quality bytes round-trip from the FASTQ — read_001's quality is

@@ -25,7 +25,9 @@ team's own, not DuckDB's).
 from __future__ import annotations
 
 import asyncio
+import gzip
 import os
+from pathlib import Path
 
 import duckdb
 
@@ -34,11 +36,13 @@ _miint_installed = False
 
 _MIINT_EXT_REPO = os.environ.get("MIINT_EXTENSION_REPO")
 
-# Canonical DuckDB COPY options for every Parquet file the orchestrator
-# writes. Lives here (next to the only DuckDB connection helpers) so a
-# Parquet-version or compression bump touches one place. backends/local.py
-# extends this with ROW_GROUP_SIZE for the chunked sequence-data write
-# (see _PARQUET_OPTS_CHUNKED there); native jobs use this as-is.
+# Canonical DuckDB COPY options for the *final* Parquet artifacts the
+# orchestrator writes — the ones the Rust data plane registers into
+# DuckLake. Lives here (next to the only DuckDB connection helpers) so
+# a Parquet-version or compression bump touches one place.
+# backends/local.py extends this with ROW_GROUP_SIZE for the chunked
+# sequence-data write (see _PARQUET_OPTS_CHUNKED there); native jobs
+# use this as-is for their final output.
 #
 # Cross-component contract: result files written with these options are
 # registered into DuckLake by the Rust data plane (qiita-data-plane,
@@ -48,6 +52,16 @@ _MIINT_EXT_REPO = os.environ.get("MIINT_EXTENSION_REPO")
 # side, so a breaking bump would surface only in `make test-integration`
 # with a confusing data-plane-side trace.
 PARQUET_OPTS: str = "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd'"
+
+# Same shape, but COMPRESSION 'snappy' instead of zstd. Use for
+# transient/intermediate Parquet files that are read once by a later
+# pipeline phase in the same job and then deleted — snappy decompresses
+# noticeably faster than zstd at the cost of larger on-disk files,
+# which is the right tradeoff when the file's lifetime is "until the
+# next phase reads it." NOT for files the data plane registers into
+# DuckLake (those want the smaller zstd footprint for long-term
+# storage); see PARQUET_OPTS for that path.
+PARQUET_OPTS_INTERMEDIATE: str = "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'snappy'"
 
 
 def open_conn() -> duckdb.DuckDBPyConnection:
@@ -75,26 +89,26 @@ async def ensure_miint_installed() -> None:
         _miint_installed = True
 
 
-# Substring used to recognize miint's "zero records read" exception.
-# miint's C++ side throws `std::runtime_error("Empty file: " + path)` from
-# SequenceReader.cpp (see duckdb-miint/src/SequenceReader.cpp:63,78) when
-# the sequence stream yields no records; DuckDB surfaces this as a plain
-# duckdb.Error whose str() carries the C++ message. We can't switch to a
-# file-size check because gzipped-empty FASTQs are ~20 bytes (non-zero)
-# and zero-record cases include malformed inputs miint can't parse, so
-# the substring match is the only signal available today.
-#
-# Brittle by construction: any reword on the miint side silently breaks
-# the empty-fallback path on every caller. Tracked by #39 (typed signal
-# from miint). Until that lands, all string-match callers route through
-# `is_miint_empty_file_error` so a future reword updates one place.
-_MIINT_EMPTY_FILE_SUBSTRING = "Empty file"
+def is_empty_sequence_file(path: Path) -> bool:
+    """True iff `path` decompresses to zero bytes — i.e., the file
+    holds no FASTQ/FASTA content. Callers pre-check with this before
+    handing the path to miint's `read_fastx`, which throws
+    `std::runtime_error("Empty file: " + path)` on zero-record inputs
+    (see duckdb-miint/src/SequenceReader.cpp:63,78). Pre-checking lets
+    us route empty inputs through an explicit code path instead of
+    catching the exception and matching its wording — see #39 for the
+    upstream-fix proposal that would let miint return a 0-row relation
+    here, matching `read_csv`'s behavior.
 
+    Why a decompressed-stream peek and not `os.path.getsize == 0`:
+    the realistic empty case is a `.fastq.gz` from a sequencing run
+    that produced no reads — that file is still ~20 bytes of gzip
+    framing on disk, but `gzip.open(...).read(1)` returns `b""`.
 
-def is_miint_empty_file_error(exc: BaseException) -> bool:
-    """True iff `exc` is a duckdb.Error from miint reporting zero
-    records in the input file. Callers use this to branch into a
-    schema-uniform empty-Parquet fallback instead of failing the job
-    on legitimately empty inputs (the typical case: an empty
-    `.fastq.gz` from a sequencing run that produced no reads)."""
-    return isinstance(exc, duckdb.Error) and _MIINT_EMPTY_FILE_SUBSTRING in str(exc)
+    Files with bytes but no parseable records (malformed FASTQ — stray
+    whitespace, comment lines) report False here and surface as a
+    duckdb.Error from `read_fastx` downstream. That's a real data
+    error and should fail loudly, not be silently treated as empty."""
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rb") as f:
+        return f.read(1) == b""

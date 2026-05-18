@@ -12,7 +12,7 @@ from ..jobs import flatten_native_inputs, run_native_job
 from ..miint import (
     PARQUET_OPTS,
     ensure_miint_installed,
-    is_miint_empty_file_error,
+    is_empty_sequence_file,
     open_conn,
 )
 
@@ -185,21 +185,22 @@ class LocalBackend(ComputeBackend):
             conn.execute("LOAD miint;")
 
             # Materialize FASTA into a temp table — single read of the file.
-            # DuckDB raises on empty files — treat as zero sequences.
-            try:
+            # Empty FASTA inputs are legal here (reference-add tolerates
+            # zero sequences and writes an empty manifest); detect them
+            # with a Python decompressed-stream peek instead of catching
+            # miint's "Empty file" exception. See miint.is_empty_sequence_file
+            # for the rationale; this rewire closes #39 from this site.
+            if is_empty_sequence_file(fasta_path):
+                conn.execute(
+                    "CREATE TEMP TABLE raw_seqs (read_id VARCHAR, hash VARCHAR, len BIGINT)"
+                )
+            else:
                 conn.execute(
                     "CREATE TEMP TABLE raw_seqs AS "
                     "SELECT read_id, md5(sequence1) AS hash, length(sequence1) AS len "
                     "FROM read_fastx(?)",
                     [str(fasta_path)],
                 )
-            except duckdb.Error as exc:
-                if is_miint_empty_file_error(exc):
-                    conn.execute(
-                        "CREATE TEMP TABLE raw_seqs (read_id VARCHAR, hash VARCHAR, len BIGINT)"
-                    )
-                else:
-                    raise
 
             # Reject duplicate read_ids — pure DuckDB, no second FASTA scan.
             dup_result = conn.execute(

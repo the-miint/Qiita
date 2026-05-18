@@ -9,14 +9,22 @@ target_processing_kinds: [sequenced]
 description: >
   Convert a single sample's FASTQ (or FASTA) file into a Parquet of
   reads, keyed by a CP-minted sequence_idx. The orchestrator counts
-  the reads, POSTs to /api/v1/sequence-range (PR #36's allocator) for
-  a contiguous bigint range against this prep_sample, and writes the
-  final Parquet with sequence_idx as the first column.
+  the reads (or read pairs), POSTs to /api/v1/sequence-range (PR #36's
+  allocator) for a contiguous bigint range against this prep_sample,
+  and writes the final Parquet with sequence_idx as the first column.
 
-  Schema: (sequence_idx, read_id, sequence, quality, sequence_length),
-  sorted by sequence_idx. Workspace-only artifact (no DuckLake
-  registration yet); registration adds the rest of the CLAUDE.md
-  identifier-column hierarchy when sample_reads lands data-plane-side.
+  Paired-end: when action_context carries `reverse_fastq_path`, miint
+  reads R1 + R2 in lockstep and emits one row per PAIR — the pair
+  shares a single sequence_idx (paired reads correspond to one
+  molecular event). Unpaired: sequence2/quality2 are NULL.
+
+  Schema: (sequence_idx, read_id, sequence1, qual1, sequence2,
+  qual2), sorted by sequence_idx — miint's native column names, no
+  aliasing. No `sequence_length`: Parquet row-group metadata covers
+  file-level estimates and `length(sequence1)` is trivial per row.
+  Workspace-only artifact (no DuckLake registration yet); registration
+  adds the rest of the CLAUDE.md identifier-column hierarchy when
+  sample_reads lands data-plane-side.
 
   Per-sample scope (target_kind: prep_sample, scoped at the supertype)
   — one ticket per sample, one Parquet artifact under the work_ticket's
@@ -49,16 +57,33 @@ context_schema:
       type: string
       minLength: 1
       pattern: "^/"
+    # Optional R2 file for paired-end input. Same absolute-path
+    # constraint. When supplied, miint reads both files in lockstep
+    # via `read_fastx(?, sequence2:=?)` and emits one row per pair
+    # (mate-id parity asserted at parse time by SequenceReader::
+    # read_pe), so the pair shares one sequence_idx.
+    reverse_fastq_path:
+      type: string
+      minLength: 1
+      pattern: "^/"
 
 steps:
   - step: fastq
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.fastq_to_parquet
     inputs: [fastq_path]
+    # `reverse_fastq_path` flows through only when the action_context
+    # carries it; tickets for single-end samples omit it.
+    optional_inputs: [reverse_fastq_path]
     outputs: [reads]
     baseline_resources:
       cpu: 2
-      mem_gb: 4
+      # 8 GB covers long-read inputs (~2.4 GB resident per thread:
+      # 2048 STANDARD_VECTOR_SIZE × 60 row_group_size × ~20 KB avg
+      # long-read record) with headroom. DuckDB's own memory_limit
+      # is set to mem_gb - 1 in the job module so Python + miint
+      # runtime keep ~1 GB of process headroom outside DuckDB.
+      mem_gb: 8
       walltime: PT30M
 
 action_ceiling:
