@@ -252,6 +252,7 @@ def _handle_actions_sync(args: argparse.Namespace, parser: argparse.ArgumentPars
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    _common.validate_base_url(args, parser)
     return args.handler(args, parser)
 
 

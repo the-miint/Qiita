@@ -85,14 +85,24 @@ h1   { margin-bottom: 0.4em; }
 
 
 def add_base_url_arg(parser: argparse.ArgumentParser) -> None:
-    """Add the standard --base-url flag. Default is $QIITA_CONTROL_PLANE_URL or
-    DEFAULT_CONTROL_PLANE_URL."""
+    """Add the standard --base-url and --insecure flags. Default base URL is
+    $QIITA_CONTROL_PLANE_URL or DEFAULT_CONTROL_PLANE_URL. Validate after
+    parse_args via `validate_base_url(args, parser)`."""
     parser.add_argument(
         "--base-url",
         default=os.environ.get(QIITA_CONTROL_PLANE_URL_ENV, DEFAULT_CONTROL_PLANE_URL),
         help=(
             f"Control-plane base URL (default from ${QIITA_CONTROL_PLANE_URL_ENV} or"
             f" {DEFAULT_CONTROL_PLANE_URL})"
+        ),
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help=(
+            "Allow plain http:// to a non-localhost host. Default behavior"
+            " refuses, because the PAT in the Authorization header would be"
+            " sent in cleartext on the wire."
         ),
     )
 
@@ -105,6 +115,39 @@ def add_token_file_arg(parser: argparse.ArgumentParser) -> None:
         type=Path,
         default=TOKEN_FILE_DEFAULT,
         help=f"Where to write the PAT (default {TOKEN_FILE_DEFAULT})",
+    )
+
+
+# Hostnames where plain http:// is considered safe — traffic does not leave
+# the host. ::1 is the IPv6 loopback; 127.0.0.0/8 collapses to 127.0.0.1 in
+# practice (the kernel routes the whole /8 to lo), but operators do sometimes
+# bind to 127.0.0.2 etc. to dodge port collisions, so accept the broader form.
+_LOOPBACK_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def validate_base_url(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """Refuse plain http:// to non-localhost hosts unless --insecure was
+    passed. Call after parse_args(); errors via parser.error (exit 2)."""
+    parsed = urllib.parse.urlparse(args.base_url)
+    if parsed.scheme != "http":
+        return
+    hostname = (parsed.hostname or "").lower()
+    if hostname in _LOOPBACK_HOSTNAMES:
+        return
+    if hostname.startswith("127."):
+        return
+    if args.insecure:
+        print(
+            f"warning: using plain http:// to {hostname!r}; PAT will be sent"
+            " in cleartext (--insecure acknowledged).",
+            file=sys.stderr,
+        )
+        return
+    parser.error(
+        f"refusing to use plain http:// to non-localhost host {hostname!r};"
+        " PAT would be sent in cleartext on the wire."
+        " Use https:// (recommended), QIITA_CONTROL_PLANE_URL=https://...,"
+        " or pass --insecure to override."
     )
 
 

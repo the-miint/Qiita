@@ -326,3 +326,74 @@ def test_profile_set_pydantic_validation_error_exits_2(capsys):
     err = capsys.readouterr().err
     assert "invalid UserUpdate" in err
     assert "orcid" in err
+
+
+# ---------------------------------------------------------------------------
+# --base-url http-to-non-localhost guard
+# ---------------------------------------------------------------------------
+
+
+def test_http_to_non_localhost_refused_without_insecure(capsys):
+    """Plain http:// to a non-localhost host would send the PAT in
+    cleartext. The CLI refuses (exit 2) unless --insecure is set."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--base-url", "http://qiita.example.com", "whoami"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "cleartext" in err
+    assert "qiita.example.com" in err
+    assert "--insecure" in err
+
+
+def test_http_to_non_localhost_allowed_with_insecure(monkeypatch, capsys):
+    """--insecure suppresses the refuse, prints a warning to stderr, and
+    proceeds with the call."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    def fake_whoami(base_url, token):
+        return {"kind": "human"}
+
+    monkeypatch.setattr(_common, "whoami", fake_whoami)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = main(["--base-url", "http://qiita.example.com", "--insecure", "whoami"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "warning" in err
+    assert "cleartext" in err
+
+
+def test_http_to_localhost_allowed_without_insecure(monkeypatch):
+    """Plain http:// to localhost / 127.0.0.1 / ::1 / 127.x.x.x is always
+    permitted — traffic stays on the host."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    monkeypatch.setattr(_common, "whoami", lambda base_url, token: {})
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    # Default base-url is already http://localhost — verify a few hostnames.
+    for url in (
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://127.0.0.2:8080",
+        "http://[::1]:8080",
+    ):
+        rc = main(["--base-url", url, "whoami"])
+        assert rc == 0, f"expected localhost URL to be allowed: {url}"
+
+
+def test_https_to_non_localhost_allowed(monkeypatch):
+    """https:// is always fine regardless of hostname — the bearer is
+    encrypted in transit."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    monkeypatch.setattr(_common, "whoami", lambda base_url, token: {})
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = main(["--base-url", "https://qiita.example.com", "whoami"])
+    assert rc == 0
