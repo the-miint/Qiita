@@ -107,21 +107,23 @@ async def insert_sequenced_pool(
     conn: asyncpg.Connection,
     *,
     sequencing_run_idx: int,
-    run_preflight_blob: bytes,
-    run_preflight_filename: str,
+    run_preflight_blob: bytes | None = None,
+    run_preflight_filename: str | None = None,
     created_by_idx: int,
     extra_metadata: dict[str, Any] | None = None,
 ) -> int:
     """Insert a row into qiita.sequenced_pool and return the generated idx.
 
     Exposes every column the caller may legitimately set on a fresh row:
-    the FK back to the sequencing_run, the run-preflight blob and its
-    originating filename (both NOT NULL in the schema), and the free-form
-    extra_metadata JSONB. Retirement and audit-timestamp columns are
-    populated by triggers, defaults, or schema CHECKs and are not
-    parameters of this function.
+    the FK back to the sequencing_run, the optional run-preflight blob and
+    its originating filename, and the free-form extra_metadata JSONB. The
+    blob and filename are a co-populated pair — pass both or neither; a
+    schema CHECK rejects a half-populated pair. Retirement and
+    audit-timestamp columns are populated by triggers, defaults, or schema
+    CHECKs and are not parameters of this function.
 
     Raises asyncpg.ForeignKeyViolationError on a bad sequencing_run_idx,
+    asyncpg.CheckViolationError on a half-populated preflight pair,
     asyncpg.PostgresError on other constraint failures.
     """
     # BYTEA accepts the raw bytes object; JSONB requires a JSON string

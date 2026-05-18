@@ -2,8 +2,9 @@
 
 Exercises happy paths under wet_lab_admin and system_admin, the role /
 scope guards, regular-user role rejection, Pydantic body validation,
-the 404 on a missing parent sequencing_run, and round-trip byte-equality
-of the run_preflight_blob via base64.
+the 404 on a missing parent sequencing_run, round-trip byte-equality
+of the run_preflight_blob via base64, and the both-or-neither
+nullability of the (blob, filename) preflight pair.
 """
 
 import base64
@@ -231,15 +232,69 @@ async def test_create_sequenced_pool_empty_blob_422(ctx):
     assert resp.status_code == 422
 
 
-async def test_create_sequenced_pool_missing_filename_422(ctx):
-    # The run_preflight_filename field is required (NOT NULL in the schema
-    # and required at the Pydantic boundary).
+async def test_create_sequenced_pool_blob_without_filename_422(ctx):
+    # The run preflight is a co-populated pair: a blob with no filename
+    # trips the both-or-neither model_validator (422) before reaching SQL.
     run_idx = await _seed_sequencing_run(ctx, "nofile")
     resp = await ctx["wet"].post(
         f"/api/v1/sequencing-run/{run_idx}/sequenced-pool",
         json={"run_preflight_blob": _b64(b"X")},
     )
     assert resp.status_code == 422
+
+
+async def test_create_sequenced_pool_filename_without_blob_422(ctx):
+    # Symmetric to the blob-only case: a filename with no blob trips the
+    # both-or-neither model_validator (422).
+    run_idx = await _seed_sequencing_run(ctx, "noblob")
+    resp = await ctx["wet"].post(
+        f"/api/v1/sequencing-run/{run_idx}/sequenced-pool",
+        json={"run_preflight_filename": "f.sqlite"},
+    )
+    assert resp.status_code == 422
+
+
+async def test_create_sequenced_pool_empty_filename_422(ctx):
+    # min_length=1 rejects an empty filename even when a blob is present;
+    # the validator trips without reaching SQL.
+    run_idx = await _seed_sequencing_run(ctx, "emptyfn")
+    resp = await ctx["wet"].post(
+        f"/api/v1/sequencing-run/{run_idx}/sequenced-pool",
+        json={
+            "run_preflight_blob": _b64(b"X"),
+            "run_preflight_filename": "",
+        },
+    )
+    assert resp.status_code == 422
+
+
+async def test_create_sequenced_pool_no_preflight_201(ctx):
+    # Neither blob nor filename: a pool with no preflight is valid. Both
+    # columns land NULL; the row round-trips by full-object equality.
+    run_idx = await _seed_sequencing_run(ctx, "noprefl")
+    resp = await _post_pool(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        extra_metadata={"lane": 2},
+    )
+    assert resp.status_code == 201, resp.text
+    row = await ctx["pool"].fetchrow(
+        "SELECT sequencing_run_idx, run_preflight_blob, run_preflight_filename,"
+        " extra_metadata, created_by_idx"
+        " FROM qiita.sequenced_pool WHERE idx = $1",
+        resp.json()["sequenced_pool_idx"],
+    )
+    actual = dict(row)
+    actual["extra_metadata"] = json.loads(actual["extra_metadata"])
+    expected = {
+        "sequencing_run_idx": run_idx,
+        "run_preflight_blob": None,
+        "run_preflight_filename": None,
+        "extra_metadata": {"lane": 2},
+        "created_by_idx": ctx["wet_session"]["principal_idx"],
+    }
+    assert actual == expected
 
 
 async def test_create_sequenced_pool_extra_field_422(ctx):

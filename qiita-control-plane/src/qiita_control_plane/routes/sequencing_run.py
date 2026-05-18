@@ -93,8 +93,10 @@ async def create_sequenced_pool(
     """Create a sequenced_pool attached to the path's sequencing_run.
 
     The require_sequencing_run_exists guard fires the 404 before the
-    transaction opens. The body's run_preflight_blob is base64-decoded by
-    Pydantic; the route stores the raw bytes in the BYTEA column.
+    transaction opens. The run preflight is optional: when present, the
+    body's run_preflight_blob is base64-decoded by Pydantic and the route
+    stores the raw bytes in the BYTEA column; the model rejects a
+    half-populated (blob, filename) pair before this handler runs.
     """
     async with tx() as conn:
         try:

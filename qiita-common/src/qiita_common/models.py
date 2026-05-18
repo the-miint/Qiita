@@ -905,14 +905,28 @@ class SequencedPoolCreateRequest(BaseModel):
     base64 on receive — a plain `bytes` field would otherwise treat the
     incoming string as UTF-8 and the encoded payload would land in BYTEA
     instead of the decoded blob. `run_preflight_filename` is the
-    originating file name on disk and is required by the schema.
+    originating file name on disk.
+
+    The preflight is an optional, co-populated pair: send both
+    `run_preflight_blob` and `run_preflight_filename` or neither. A
+    half-populated pair is rejected (422). When present, each must be
+    non-empty (`min_length=1`).
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    run_preflight_blob: Base64Bytes = Field(min_length=1)
-    run_preflight_filename: str = Field(min_length=1)
+    run_preflight_blob: Base64Bytes | None = Field(default=None, min_length=1)
+    run_preflight_filename: str | None = Field(default=None, min_length=1)
     extra_metadata: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def run_preflight_pair_consistent(self):
+        if (self.run_preflight_blob is None) != (self.run_preflight_filename is None):
+            raise ValueError(
+                "run_preflight_blob and run_preflight_filename must both be"
+                " provided or both be omitted"
+            )
+        return self
 
 
 class SequencedPoolCreateResponse(BaseModel):
