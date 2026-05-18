@@ -108,6 +108,8 @@ Provided by your DBA:
 - `qiita_miint` database with `qiita_miint_rw` role (used by the control plane)
 - `qiita_miint_lake` database with `qiita_miint_lake_rw` role (used by the data plane as DuckLake catalog)
 - Network reachability from the deploy host to the Postgres host
+- **Postgres extensions enabled** in `qiita_miint`: `citext` (required by the auth migrations). Created by the DBA as superuser: `sudo -u postgres psql -d qiita_miint -c "CREATE EXTENSION IF NOT EXISTS citext;"`. The `qiita_miint_rw` role doesn't need CREATE-EXTENSION privilege; the extension being installed at the DB level is enough. Keep this list current by grepping `qiita-control-plane/db/migrations/` for `CREATE EXTENSION` before each deploy.
+- **NTP** running on both the deploy host and the PG host. A `cli_login_code` CHECK constraint (`expires_at > created_at`) compares a Python-computed `expires_at` against a PG-computed `created_at`; clock drift larger than `CLI_LOGIN_CODE_TTL_SECONDS` (default 30s) violates it and produces a 500 on `/auth/handoff`. Standard `chronyd` setup on both hosts; verify with `chronyc tracking` and `timedatectl`.
 
 Verification:
 ```bash
@@ -117,6 +119,12 @@ psql -h <pg-host> -U qiita_miint_rw -d qiita_miint -W \
 
 psql -h <pg-host> -U qiita_miint_lake_rw -d qiita_miint_lake -W \
     -c "SELECT current_user, current_database();"
+
+# [qiita] confirm citext is enabled and clock skew is small
+psql -h <pg-host> -U qiita_miint_rw -d qiita_miint -W -c "
+  SELECT 'a'::citext = 'A'::citext AS citext_ok,
+         extract(epoch from (now() AT TIME ZONE 'UTC' - now())) AS pg_now_utc_offset;"
+date -u  # compare with the pg_now_utc_offset above — should agree within seconds
 ```
 
 ### 0.3 Shared filesystem
@@ -374,7 +382,7 @@ chmod 600 /tmp/control-plane.env
 # Substitute every value we have. The password is filled by the editor pass below.
 sed -i.bak \
     -e "s|^HMAC_SECRET_KEY=.*|HMAC_SECRET_KEY=$HMAC_SECRET_KEY|" \
-    -e "s|^DATABASE_URL=.*|DATABASE_URL='postgresql://qiita_miint_rw:<password>@<pg-host>/qiita_miint'|" \
+    -e "s|^DATABASE_URL=.*|DATABASE_URL='postgresql://qiita_miint_rw:<password>@<pg-host>/qiita_miint?sslmode=prefer'|" \
     -e "s|^# AUTHROCKET_ISSUER=.*|AUTHROCKET_ISSUER='https://authrocket.com'|" \
     -e "s|^# AUTHROCKET_LOGINROCKET_URL=.*|AUTHROCKET_LOGINROCKET_URL='https://<realm>.loginrocket.com'|" \
     -e "s|^# AUTHROCKET_JWKS_URL=.*|AUTHROCKET_JWKS_URL='https://<realm>.loginrocket.com/connect/jwks'|" \
@@ -397,8 +405,15 @@ set -a && source /tmp/control-plane.env && set +a
 ```bash
 # [admin] install the final copy and shred the working file
 sudo install -m 0440 -o root -g qiita-api /tmp/control-plane.env /etc/qiita/control-plane.env
-shred -u /tmp/control-plane.env
+# sudo on shred because /tmp/control-plane.env is qiita-owned mode 0600 and admin can't write it
+sudo shred -u /tmp/control-plane.env
 ```
+
+`?sslmode=prefer` makes `dbmate` (which uses Go's `lib/pq` driver, defaulting
+to `sslmode=require`) fall back to plain when the PG server doesn't speak SSL,
+while still upgrading if SSL becomes available later. `asyncpg` (used by the
+CP at runtime) defaults to `prefer` already; the explicit setting just makes
+`make migrate` survive a no-SSL server.
 
 **If HMAC values disagree** later. Every Flight DoGet/DoAction will return
 `Unauthenticated: invalid HMAC signature` from the data plane. The control
@@ -422,6 +437,19 @@ and creates the auth tables. After this, `qiita.principal` has exactly
 one row (the `system` principal); no human or service-account principals
 exist yet.
 
+Verify:
+```bash
+# [qiita]
+psql -h <pg-host> -U qiita_miint_rw -d qiita_miint -W \
+    -c "SELECT idx, display_name, system_role FROM qiita.principal;"
+```
+Expected: one row, `1 | system | system_admin`.
+
+Note: the `principal` table has no `kind` column — the principal subtype
+(human / service / system) surfaces in `qiita-admin whoami` output
+(step 10b) via joins with `qiita.user` / `qiita.service_account`, but
+isn't a column on `principal` itself. Don't add `kind` to ad-hoc queries.
+
 ## 3. One-shot JWT shape verify
 
 Log into the AuthRocket realm via the hosted UI (the AuthRocket
@@ -429,13 +457,25 @@ Log into the AuthRocket realm via the hosted UI (the AuthRocket
 the raw JWT). Then:
 
 ```bash
-# [qiita] env vars are still live from step 1's source
-uv run python scripts/verify_jwt.py "$JWT"
+# [qiita] env vars are still live from step 1's source. read -s keeps
+# the token out of bash history.
+read -s JWT
+# (paste, Enter — no echo, that's normal)
+
+# The repo has no top-level pyproject.toml; uv run needs to find one,
+# so cd into qiita-control-plane first. The verifier imports from
+# qiita_control_plane.* and reuses the production resolver path.
+cd ~/qiita-miint/qiita-control-plane
+uv run python ../scripts/verify_jwt.py "$JWT"
 ```
 
-On success it prints the parsed claims. If anything fails — bad signature,
-wrong issuer, missing required claim — fix the realm config before
-proceeding (cross-reference with `authrocket-realm-setup.md`).
+First `uv run` syncs the qiita-control-plane venv (~30s); subsequent
+runs are fast.
+
+On success it prints the parsed claims (`iss`, `sub`, `email`, etc.).
+If anything fails — bad signature, wrong issuer, missing required claim
+— fix the realm config before proceeding (cross-reference with
+`authrocket-realm-setup.md`).
 
 ## 4. Start the control plane
 
@@ -479,6 +519,19 @@ Failure modes:
 localhost loopback HTTP server, opens the browser to qiita's `/auth/login`,
 captures the AuthRocket round-trip, exchanges the one-time code for a
 PAT, and saves it to `~/.qiita/token` (mode 0600).
+
+> **Before step 6 on SSH-tunneled deploys.** The cli_login_code TTL
+> (default 30s, set by `CLI_LOGIN_CODE_TTL_SECONDS`) is way too short
+> for a flow that involves manual URL copy + SSH tunnel + curl. Bump
+> it before starting:
+>
+> ```bash
+> # [admin]
+> sudo bash -c "echo 'CLI_LOGIN_CODE_TTL_SECONDS=300' >> /etc/qiita/control-plane.env"
+> sudo systemctl restart qiita-control-plane
+> ```
+>
+> 5 min is still tiny in absolute terms, defensible permanent config.
 
 ```bash
 # [qiita]
@@ -598,7 +651,7 @@ chmod 600 /tmp/data-plane.env
 
 sed -i.bak \
     -e "s|^HMAC_SECRET_KEY=.*|HMAC_SECRET_KEY=$HMAC_SECRET_KEY|" \
-    -e "s|^DUCKLAKE_CATALOG_CONNSTR=.*|DUCKLAKE_CATALOG_CONNSTR='dbname=qiita_miint_lake host=<pg-host> user=qiita_miint_lake_rw password=<password>'|" \
+    -e "s|^DUCKLAKE_CATALOG_CONNSTR=.*|DUCKLAKE_CATALOG_CONNSTR='dbname=qiita_miint_lake host=<pg-host> user=qiita_miint_lake_rw password=<password> sslmode=prefer'|" \
     -e "s|^# DUCKLAKE_DATA_PATH=.*|DUCKLAKE_DATA_PATH=<data-dir>|" \
     /tmp/data-plane.env
 rm /tmp/data-plane.env.bak
@@ -609,7 +662,7 @@ ${EDITOR:-vi} /tmp/data-plane.env  # fill the lake DB password
 ```bash
 # [admin]
 sudo install -m 0440 -o root -g qiita-data /tmp/data-plane.env /etc/qiita/data-plane.env
-shred -u /tmp/data-plane.env
+sudo shred -u /tmp/data-plane.env
 ```
 
 `DUCKLAKE_CATALOG_CONNSTR` is libpq format — space-separated `key=value`
@@ -646,6 +699,23 @@ Expected: `status: SERVING`. `Unauthenticated: invalid HMAC signature`
 from later Flight calls means `HMAC_SECRET_KEY` differs between the CP
 and DP env files (see step 1).
 
+> **Known limitation**: `make verify-health` invokes `grpcurl` without
+> a proto file and relies on the DP server supporting gRPC reflection
+> for service discovery. The production data-plane build (with
+> `--features duckdb/bundled`) does not compile reflection in, so this
+> step returns `server does not support the reflection API` instead of
+> `SERVING`. Fall back to out-of-band checks:
+>
+> ```bash
+> sudo systemctl status qiita-data-plane@50051 --no-pager | head -5
+> ss -ltn | grep ':50051'
+> sudo journalctl -u qiita-data-plane@50051 -n 5 --no-pager
+> ```
+>
+> `Active: active (running)` + a `LISTEN` on `127.0.0.1:50051` + a log
+> line `qiita-data-plane listening on 127.0.0.1:50051` is the green
+> signal.
+
 ## 9. Start the orchestrator
 
 ### 9a. Write the orchestrator env file
@@ -673,7 +743,7 @@ ${EDITOR:-vi} /tmp/compute-orchestrator.env  # fill SLURM endpoint values
 ```bash
 # [admin]
 sudo install -m 0440 -o root -g qiita-orch /tmp/compute-orchestrator.env /etc/qiita/compute-orchestrator.env
-shred -u /tmp/compute-orchestrator.env
+sudo shred -u /tmp/compute-orchestrator.env
 ```
 
 The SLURM JWT at `SLURMRESTD_JWT_PATH` is generated by SLURM
@@ -705,6 +775,11 @@ Calls `GET /health` on the CP (8080) and CO (8081) and the gRPC health
 endpoint on the DP (50051). All three must return `OK` / `SERVING`. A
 failure here points at a single service — `journalctl -u qiita-<service>`
 gives the boot error.
+
+The DP gRPC check needs reflection in the binary (see the note in
+step 8d); on a `--features duckdb/bundled` build the check returns
+"server does not support the reflection API". Use the `systemctl status`
++ `ss -ltn` fallback from step 8d to validate the DP independently.
 
 ### 10b. Operator auth path works
 
