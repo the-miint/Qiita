@@ -23,8 +23,12 @@ rsync -a --delete "$INCOMING/qiita-common/"              /opt/qiita/qiita-common
 rsync -a --delete "$INCOMING/qiita-control-plane/"       /opt/qiita/control-plane/
 rsync -a --delete "$INCOMING/qiita-compute-orchestrator/" /opt/qiita/compute-orchestrator/
 
-( cd /opt/qiita/control-plane        && "$UV" sync --no-dev )
-( cd /opt/qiita/compute-orchestrator && "$UV" sync --no-dev )
+# --reinstall-package qiita-common forces uv to rebuild the path-dep when
+# qiita-common's source changes without a version bump; without this,
+# redeploys leave stale qiita-common in dependents' site-packages
+# (see CLAUDE.md "Cross-package staleness").
+( cd /opt/qiita/control-plane        && "$UV" sync --no-dev --reinstall-package qiita-common )
+( cd /opt/qiita/compute-orchestrator && "$UV" sync --no-dev --reinstall-package qiita-common )
 
 # Fail loud if uv put Python somewhere a service user can't read it.
 for venv in /opt/qiita/control-plane/.venv /opt/qiita/compute-orchestrator/.venv; do
