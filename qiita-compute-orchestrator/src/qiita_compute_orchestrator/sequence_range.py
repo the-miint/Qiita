@@ -37,6 +37,7 @@ execution. Same caller-side mapping pattern as the 409 case.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import httpx
 from qiita_common.api_paths import URL_SEQUENCE_RANGE_PREFIX
@@ -44,7 +45,11 @@ from qiita_common.api_paths import URL_SEQUENCE_RANGE_PREFIX
 from .config import Settings, get_settings
 
 
-def make_cp_client(settings: Settings | None = None) -> httpx.AsyncClient:
+def make_cp_client(
+    settings: Settings | None = None,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> httpx.AsyncClient:
     """Build an authed AsyncClient pointed at the control plane.
 
     The compute service-account PAT goes into the Authorization header
@@ -58,17 +63,26 @@ def make_cp_client(settings: Settings | None = None) -> httpx.AsyncClient:
     cached value (orchestrator service) or a fresh Settings.from_env()
     (SLURM launcher / CLI). See config.py module header for the
     asymmetric resolution rationale.
+
+    `transport` is injectable for tests so an integration suite can
+    swap in an `httpx.ASGITransport(app=cp_app)` and exercise the full
+    Settings → headers → httpx → CP route → DB path in-process without
+    a uvicorn subprocess. Production code passes nothing; httpx uses
+    its default network transport against `settings.cp_url`.
     """
     if settings is None:
         settings = get_settings()
-    return httpx.AsyncClient(
-        base_url=settings.cp_url,
-        headers={"Authorization": f"Bearer {settings.co_to_cp_token}"},
+    kwargs: dict[str, Any] = {
+        "base_url": settings.cp_url,
+        "headers": {"Authorization": f"Bearer {settings.co_to_cp_token}"},
         # 30s caters to a slow nextval/setval/INSERT under contention;
         # the CP route is bounded by the advisory lock + a few ms of
         # plpgsql, so a longer timeout would only mask infra issues.
-        timeout=httpx.Timeout(30.0),
-    )
+        "timeout": httpx.Timeout(30.0),
+    }
+    if transport is not None:
+        kwargs["transport"] = transport
+    return httpx.AsyncClient(**kwargs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,10 +110,13 @@ class SequenceRangeAlreadyExists(Exception):
         super().__init__(
             f"prep_sample {prep_sample_idx} already has a sequence_range "
             f"(attempted mint with count={count}, typically from a "
-            "previous failed attempt). Recovery requires deleting the "
-            "prep_sample (CASCADE removes the range) and resubmitting "
-            "the work_ticket. A future CP-side endpoint will let the "
-            "minter re-read its own range; track as follow-up."
+            "previous failed attempt). Recover by resubmitting the "
+            "work_ticket with `pre_minted_range` populated from the "
+            "existing qiita.sequence_range row — see "
+            "docs/runbooks/fastq-to-parquet-retry-recovery.md. "
+            "Deleting the prep_sample also works (CASCADE removes the "
+            "range) but is destructive; the pre_minted_range path is "
+            "preferred."
         )
         self.prep_sample_idx = prep_sample_idx
         self.count = count

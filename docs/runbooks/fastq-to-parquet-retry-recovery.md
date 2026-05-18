@@ -26,15 +26,20 @@ follow the DELETE-prep_sample path instead.
 
 ## Recovery sequence
 
-1. **Identify the prep_sample_idx** from the failed work_ticket:
+1. **Identify the prep_sample_idx** from the failed work_ticket. The
+   schema (see `qiita-control-plane/db/migrations/20260504000001_work_ticket.sql`)
+   exposes scope-target scalars as nullable columns gated by
+   `scope_target_kind`; for a fastq_to_parquet ticket the kind is
+   `prep_sample` and the value lives in `prep_sample_idx`:
 
    ```sql
    SELECT
-     w.idx                AS work_ticket_idx,
-     w.scope_target_value AS prep_sample_idx,
-     w.failure_reason
-   FROM qiita.work_ticket w
-   WHERE w.idx = $FAILED_WORK_TICKET_IDX;
+     work_ticket_idx,
+     prep_sample_idx,
+     failure_reason
+   FROM qiita.work_ticket
+   WHERE work_ticket_idx = $FAILED_WORK_TICKET_IDX
+     AND scope_target_kind = 'prep_sample';
    ```
 
 2. **Confirm the sequence-range row exists** for that prep_sample:

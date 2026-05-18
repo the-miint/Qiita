@@ -4,10 +4,10 @@ from pathlib import Path
 
 import duckdb
 from qiita_common.backend_failure import BackendFailure, FailureKind
-from qiita_common.models import ScopeTargetKind, WorkTicketFailureStage
+from qiita_common.models import WorkTicketFailureStage
 from qiita_common.parquet import validate_parquet_path
 
-from ..backend import ComputeBackend
+from ..backend import ComputeBackend, assert_container_scope_supported
 from ..jobs import flatten_native_inputs, run_native_job
 from ..miint import (
     PARQUET_OPTS,
@@ -93,17 +93,8 @@ class LocalBackend(ComputeBackend):
         # workflow YAML for reference-add is reference-scoped, so this
         # branch only runs under that scope today. Refuse anything else
         # with a typed contract violation instead of silently picking up
-        # the wrong scalar.
-        if scope_target.get("kind") != ScopeTargetKind.REFERENCE.value:
-            raise BackendFailure(
-                kind=FailureKind.CONTRACT_VIOLATION,
-                stage=WorkTicketFailureStage.STEP_RUN,
-                step_name=name,
-                reason=(
-                    f"container step {name!r} requires a reference-scoped ticket; "
-                    f"got scope_target.kind={scope_target.get('kind')!r}"
-                ),
-            )
+        # the wrong scalar. Shared helper mirrored in SlurmBackend.
+        assert_container_scope_supported(step_name=name, scope_target=scope_target)
         reference_idx = scope_target["reference_idx"]
         try:
             if name == "hash":

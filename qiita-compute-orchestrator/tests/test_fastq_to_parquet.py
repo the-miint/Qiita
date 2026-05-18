@@ -30,7 +30,11 @@ import duckdb
 import pytest
 
 import qiita_compute_orchestrator.jobs.fastq_to_parquet as fastq_module
-from qiita_compute_orchestrator.jobs.fastq_to_parquet import Inputs, execute
+from qiita_compute_orchestrator.jobs.fastq_to_parquet import (
+    YAML_STEP_NAME,
+    Inputs,
+    execute,
+)
 from qiita_compute_orchestrator.sequence_range import MintedSequenceRange
 
 
@@ -382,7 +386,7 @@ def test_execute_recovery_rejects_count_mismatch(monkeypatch, tmp_path):
         )
     assert ei.value.kind is FailureKind.BAD_INPUT
     assert ei.value.stage is WorkTicketFailureStage.STEP_RUN
-    assert ei.value.step_name == "fastq"
+    assert ei.value.step_name == YAML_STEP_NAME
     assert "5 indices" in ei.value.reason
     assert "3 reads" in ei.value.reason
 
@@ -460,10 +464,13 @@ def test_execute_maps_already_exists_to_unknown_permanent(monkeypatch, tmp_path)
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
     assert ei.value.stage is WorkTicketFailureStage.STEP_RUN
-    assert ei.value.step_name == "fastq"
+    assert ei.value.step_name == YAML_STEP_NAME
     assert "already has a sequence_range" in ei.value.reason
     # Recovery hint is in the exception's str — the operator needs it.
-    assert "deleting the prep_sample" in ei.value.reason
+    # The preferred path (pre_minted_range + the runbook) leads; the
+    # destructive delete is mentioned as a fallback.
+    assert "pre_minted_range" in ei.value.reason
+    assert "fastq-to-parquet-retry-recovery.md" in ei.value.reason
 
 
 def test_execute_maps_not_eligible_to_bad_input(monkeypatch, tmp_path):
@@ -484,7 +491,7 @@ def test_execute_maps_not_eligible_to_bad_input(monkeypatch, tmp_path):
         )
 
     assert ei.value.kind is FailureKind.BAD_INPUT
-    assert ei.value.step_name == "fastq"
+    assert ei.value.step_name == YAML_STEP_NAME
     assert "not found or not eligible" in ei.value.reason
 
 
@@ -508,7 +515,7 @@ def test_execute_maps_401_to_contract_violation(monkeypatch, tmp_path):
         )
 
     assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
-    assert ei.value.step_name == "fastq"
+    assert ei.value.step_name == YAML_STEP_NAME
     assert "HTTP 401" in ei.value.reason
     # The reason points operators at the runbook.
     assert "compute-service-account-provisioning" in ei.value.reason
@@ -535,5 +542,5 @@ def test_execute_maps_5xx_to_unknown_permanent(monkeypatch, tmp_path):
         )
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
-    assert ei.value.step_name == "fastq"
+    assert ei.value.step_name == YAML_STEP_NAME
     assert "HTTP 503" in ei.value.reason

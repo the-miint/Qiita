@@ -16,6 +16,17 @@ Mate-id parity is asserted by miint's `SequenceReader::read_pe` on
 parse; a mismatch surfaces as a duckdb.Error and propagates up as
 BAD_INPUT via the framework dispatcher.
 
+Input-immutability assumption: `fastq_path` and (when set)
+`reverse_fastq_path` MUST NOT be modified, renamed, or replaced
+between work_ticket submission and step execution. The retry
+recovery path relies on the read count being stable across attempts
+(see `PreMintedRange` and the recovery runbook); a swapped FASTQ
+whose read count differs from the original mint surfaces as
+BAD_INPUT, but a swap with the *same* count would silently produce a
+Parquet whose rows mismatch the prior attempt's assignment. Workflow
+authors stage inputs onto an immutable shared filesystem region (the
+orchestrator never writes back to the input path).
+
 Schema (sorted by sequence_idx, the lake-friendly join key) — uses
 miint's native column names so the file round-trips through
 read_fastx-shaped consumers without aliasing:
@@ -101,8 +112,9 @@ from ..sequence_range import (
 # BackendFailure needs a step_name. If the workflow YAML's
 # `- step: fastq` entry is ever renamed, this constant must follow —
 # the integration smoke test asserts work_ticket.failure_step_name,
-# so a mismatch fails loudly.
-_YAML_STEP_NAME = "fastq"
+# so a mismatch fails loudly. Public so unit tests can import it
+# instead of duplicating the literal in step_name assertions.
+YAML_STEP_NAME = "fastq"
 
 # Conservative DuckDB resource caps. TODO(#38): plumb from
 # JobParams.baseline_resources so each step's SLURM allocation drives
@@ -272,7 +284,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         # path: the prior attempt already minted in phase 3 and failed
         # transiently in phase 4; the operator resubmits with the
         # existing range so the CP's one-shot mint contract isn't
-        # violated). count > 0 by phase-1 pre-check, so no zero-count
+        # violated). count > 0 by the phase-0 pre-check, so no zero-count
         # special case here.
         #
         # The mint helper raises typed Python exceptions; the framework
@@ -295,7 +307,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 raise BackendFailure(
                     kind=FailureKind.BAD_INPUT,
                     stage=WorkTicketFailureStage.STEP_RUN,
-                    step_name=_YAML_STEP_NAME,
+                    step_name=YAML_STEP_NAME,
                     reason=(
                         f"pre_minted_range covers {recovered_count} indices "
                         f"({recovery.sequence_idx_start}..{recovery.sequence_idx_stop}) "
@@ -320,7 +332,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 raise BackendFailure(
                     kind=FailureKind.UNKNOWN_PERMANENT,
                     stage=WorkTicketFailureStage.STEP_RUN,
-                    step_name=_YAML_STEP_NAME,
+                    step_name=YAML_STEP_NAME,
                     reason=str(exc),
                 ) from exc
             except PrepSampleNotEligibleForSequenceRange as exc:
@@ -333,7 +345,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 raise BackendFailure(
                     kind=FailureKind.BAD_INPUT,
                     stage=WorkTicketFailureStage.STEP_RUN,
-                    step_name=_YAML_STEP_NAME,
+                    step_name=YAML_STEP_NAME,
                     reason=str(exc),
                 ) from exc
             except httpx.HTTPStatusError as exc:
@@ -344,7 +356,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     raise BackendFailure(
                         kind=FailureKind.CONTRACT_VIOLATION,
                         stage=WorkTicketFailureStage.STEP_RUN,
-                        step_name=_YAML_STEP_NAME,
+                        step_name=YAML_STEP_NAME,
                         reason=(
                             f"CP rejected sequence-range mint with HTTP "
                             f"{exc.response.status_code} — compute SA PAT misconfigured "
@@ -358,7 +370,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 raise BackendFailure(
                     kind=FailureKind.UNKNOWN_PERMANENT,
                     stage=WorkTicketFailureStage.STEP_RUN,
-                    step_name=_YAML_STEP_NAME,
+                    step_name=YAML_STEP_NAME,
                     reason=(
                         f"CP sequence-range mint failed with HTTP "
                         f"{exc.response.status_code}: {exc.response.text!r}"

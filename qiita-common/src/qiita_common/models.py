@@ -192,7 +192,12 @@ class StepRunRequest(BaseModel):
     scope's idx scalars into the job's `Inputs` model. Typed as a dict
     (not the ScopeTarget union directly) to avoid a forward-reference /
     model_rebuild dance — the field validator below runs the same
-    discriminated-union validation as `WorkTicket.scope_target`.
+    discriminated-union validation as `WorkTicket.scope_target` AND
+    normalizes the dict to JSON shape (`mode="json"`), so callers that
+    pass enum objects (e.g. `{"kind": ScopeTargetKind.REFERENCE}`) get
+    string values out the back. Downstream code can rely on
+    `scope_target["kind"] == ScopeTargetKind.X.value` without worrying
+    about which input shape produced the dict.
     """
 
     step_name: str = Field(min_length=1)
@@ -210,13 +215,13 @@ class StepRunRequest(BaseModel):
     def _validate_scope_target(cls, v: dict[str, Any]) -> dict[str, Any]:
         # Delegate to the ScopeTarget discriminated union (defined later
         # in this module) so the wire-side validation rule lives in one
-        # place. Returns the original dict on success — the route handler
-        # passes the dict downstream; backends consume it without needing
-        # the typed instance.
+        # place. Returns a JSON-shape dict so enum inputs (e.g.
+        # `kind=ScopeTargetKind.REFERENCE`) come back as plain strings —
+        # callers compare against `.value` without caring how the dict
+        # was constructed.
         from pydantic import TypeAdapter
 
-        TypeAdapter(ScopeTarget).validate_python(v)
-        return v
+        return TypeAdapter(ScopeTarget).validate_python(v).model_dump(mode="json")
 
     @model_validator(mode="after")
     def _exactly_one_runtime(self) -> StepRunRequest:
