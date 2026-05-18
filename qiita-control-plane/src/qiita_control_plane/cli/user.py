@@ -16,6 +16,8 @@ from ~/.qiita/token (mode 0600).
 import argparse
 import sys
 
+from qiita_common.models import Tier
+
 from . import _common
 
 # ---------------------------------------------------------------------------
@@ -105,7 +107,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_study_create.add_argument(
         "--default-tier",
-        choices=("public", "viewer", "member", "admin"),
+        choices=tuple(t.value for t in Tier),
         help="Default study_access tier; server defaults to 'member' when unset",
     )
 
