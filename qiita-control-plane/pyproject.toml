@@ -17,6 +17,7 @@ dependencies = [
 
 [project.scripts]
 qiita-admin = "qiita_control_plane.cli.admin:main"
+qiita = "qiita_control_plane.cli.user:main"
 
 [dependency-groups]
 dev = [
