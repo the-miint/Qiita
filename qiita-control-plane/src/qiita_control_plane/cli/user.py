@@ -16,9 +16,6 @@ from ~/.qiita/token (mode 0600).
 import argparse
 import sys
 
-import httpx
-from qiita_common.auth_constants import API_PREFIX
-
 from . import _common
 
 # ---------------------------------------------------------------------------
@@ -36,14 +33,7 @@ def _patch_user_me(base_url: str, token: str, updates: dict) -> dict:
     "show" but argparse requires at least one --flag here so empty
     bodies don't slip through silently.
     """
-    resp = httpx.patch(
-        f"{base_url.rstrip('/')}{API_PREFIX}/user/me",
-        headers={"Authorization": f"Bearer {token}"},
-        json=updates,
-        timeout=_common.CLI_HTTP_TIMEOUT_SECONDS,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    return _common.call("PATCH", base_url, token, "/user/me", json=updates)
 
 
 def _post_study(base_url: str, token: str, body: dict) -> dict:
@@ -51,14 +41,7 @@ def _post_study(base_url: str, token: str, body: dict) -> dict:
     the caller server-side; the CLI does not surface --owner-idx because
     naming a different owner requires wet_lab_admin+ (lab-tech-on-behalf),
     out of scope for the regular-user CLI."""
-    resp = httpx.post(
-        f"{base_url.rstrip('/')}{API_PREFIX}/study",
-        headers={"Authorization": f"Bearer {token}"},
-        json=body,
-        timeout=_common.CLI_HTTP_TIMEOUT_SECONDS,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    return _common.call("POST", base_url, token, "/study", json=body)
 
 
 # ---------------------------------------------------------------------------

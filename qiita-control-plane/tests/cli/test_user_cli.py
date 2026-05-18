@@ -109,20 +109,23 @@ def test_profile_set_sends_only_supplied_fields(monkeypatch):
     UPDATE never touches a field the user didn't ask about."""
     import httpx as _httpx
 
-    from qiita_control_plane.cli import user as cli
+    from qiita_control_plane.cli import _common
 
     captured: dict = {}
 
-    def fake_patch(url, headers=None, json=None, timeout=None):
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        captured["method"] = method
         captured["url"] = url
         captured["auth"] = headers["Authorization"]
         captured["json"] = json
-        return _httpx.Response(200, json={"principal_idx": 7}, request=_httpx.Request("PATCH", url))
+        return _httpx.Response(200, json={"principal_idx": 7}, request=_httpx.Request(method, url))
 
-    monkeypatch.setattr(cli.httpx, "patch", fake_patch)
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
     monkeypatch.setenv("QIITA_TOKEN", "qk_test")
 
-    rc = cli.main(
+    from qiita_control_plane.cli.user import main
+
+    rc = main(
         [
             "--base-url",
             "https://q.example.test",
@@ -135,6 +138,7 @@ def test_profile_set_sends_only_supplied_fields(monkeypatch):
         ]
     )
     assert rc == 0
+    assert captured["method"] == "PATCH"
     assert captured["url"] == "https://q.example.test/api/v1/user/me"
     assert captured["auth"] == "Bearer qk_test"
     assert captured["json"] == {"affiliation": "UCSD", "phone": "+1-555-0100"}
@@ -145,21 +149,23 @@ def test_profile_set_boolean_optional_action_distinguishes_unset_false_true(monk
     neither leaves the field absent from the PATCH body."""
     import httpx as _httpx
 
-    from qiita_control_plane.cli import user as cli
+    from qiita_control_plane.cli import _common
 
     captured_bodies: list[dict] = []
 
-    def fake_patch(url, headers=None, json=None, timeout=None):
+    def fake_request(method, url, headers=None, json=None, timeout=None):
         captured_bodies.append(json)
-        return _httpx.Response(200, json={"principal_idx": 7}, request=_httpx.Request("PATCH", url))
+        return _httpx.Response(200, json={"principal_idx": 7}, request=_httpx.Request(method, url))
 
-    monkeypatch.setattr(cli.httpx, "patch", fake_patch)
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
     monkeypatch.setenv("QIITA_TOKEN", "qk_test")
 
+    from qiita_control_plane.cli.user import main
+
     # --receive-processing-emails → True
-    cli.main(["profile", "set", "--receive-processing-emails"])
+    main(["profile", "set", "--receive-processing-emails"])
     # --no-receive-processing-emails → False
-    cli.main(["profile", "set", "--no-receive-processing-emails"])
+    main(["profile", "set", "--no-receive-processing-emails"])
 
     assert captured_bodies == [
         {"receive_processing_emails": True},
@@ -189,23 +195,25 @@ def test_study_create_minimal_sends_only_title(monkeypatch):
     rather than caller-supplied nulls overriding them."""
     import httpx as _httpx
 
-    from qiita_control_plane.cli import user as cli
+    from qiita_control_plane.cli import _common
 
     captured: dict = {}
 
-    def fake_post(url, headers=None, json=None, timeout=None):
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        captured["method"] = method
         captured["url"] = url
         captured["auth"] = headers["Authorization"]
         captured["json"] = json
-        return _httpx.Response(201, json={"study_idx": 42}, request=_httpx.Request("POST", url))
+        return _httpx.Response(201, json={"study_idx": 42}, request=_httpx.Request(method, url))
 
-    monkeypatch.setattr(cli.httpx, "post", fake_post)
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
     monkeypatch.setenv("QIITA_TOKEN", "qk_test")
 
-    rc = cli.main(
-        ["--base-url", "https://q.example.test", "study", "create", "--title", "Smoke Study"]
-    )
+    from qiita_control_plane.cli.user import main
+
+    rc = main(["--base-url", "https://q.example.test", "study", "create", "--title", "Smoke Study"])
     assert rc == 0
+    assert captured["method"] == "POST"
     assert captured["url"] == "https://q.example.test/api/v1/study"
     assert captured["auth"] == "Bearer qk_test"
     assert captured["json"] == {"title": "Smoke Study"}
@@ -217,18 +225,20 @@ def test_study_create_passes_through_optional_fields(monkeypatch):
     client side so the server contract stays clean."""
     import httpx as _httpx
 
-    from qiita_control_plane.cli import user as cli
+    from qiita_control_plane.cli import _common
 
     captured: dict = {}
 
-    def fake_post(url, headers=None, json=None, timeout=None):
+    def fake_request(method, url, headers=None, json=None, timeout=None):
         captured["json"] = json
-        return _httpx.Response(201, json={"study_idx": 42}, request=_httpx.Request("POST", url))
+        return _httpx.Response(201, json={"study_idx": 42}, request=_httpx.Request(method, url))
 
-    monkeypatch.setattr(cli.httpx, "post", fake_post)
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
     monkeypatch.setenv("QIITA_TOKEN", "qk_test")
 
-    rc = cli.main(
+    from qiita_control_plane.cli.user import main
+
+    rc = main(
         [
             "study",
             "create",

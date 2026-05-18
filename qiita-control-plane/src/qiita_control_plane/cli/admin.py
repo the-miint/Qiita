@@ -37,9 +37,8 @@ import sys
 from pathlib import Path
 
 import asyncpg
-import httpx
 from pydantic import ValidationError
-from qiita_common.auth_constants import API_PREFIX, SYSTEM_PRINCIPAL_IDX, SystemRole
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 
 from qiita_control_plane.actions import (
     DuplicateActionError,
@@ -137,13 +136,12 @@ async def _sync_actions(database_url: str, workflows_dir: Path) -> dict:
 
 
 def _token_revoke_all(base_url: str, token: str, principal_idx: int) -> dict:
-    resp = httpx.post(
-        f"{base_url.rstrip('/')}{API_PREFIX}/admin/principal/{principal_idx}/revoke-all-tokens",
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=_common.CLI_HTTP_TIMEOUT_SECONDS,
+    return _common.call(
+        "POST",
+        base_url,
+        token,
+        f"/admin/principal/{principal_idx}/revoke-all-tokens",
     )
-    resp.raise_for_status()
-    return resp.json()
 
 
 # ---------------------------------------------------------------------------

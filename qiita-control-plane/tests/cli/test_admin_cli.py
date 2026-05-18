@@ -41,43 +41,53 @@ def test_read_token_raises_with_actionable_message(monkeypatch, tmp_path):
 
 
 def test_whoami_calls_correct_url(monkeypatch):
+    """`_common.whoami` round-trips through the unified `call` helper:
+    base-url trimmed, API_PREFIX prepended, BEARER_PREFIX in the auth
+    header. Patches httpx.request (the verb-agnostic entry point `call`
+    delegates to) so a single test exercises the shared shape."""
     from qiita_control_plane.cli import _common
 
     captured = {}
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        captured["method"] = method
         captured["url"] = url
         captured["auth"] = headers["Authorization"]
         return httpx.Response(
             200,
             json={"kind": "human", "principal_idx": 7},
-            request=httpx.Request("GET", url),
+            request=httpx.Request(method, url),
         )
 
-    monkeypatch.setattr(_common.httpx, "get", fake_get)
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
     body = _common.whoami("https://api.example.com/", "qk_X")
+    assert captured["method"] == "GET"
     assert captured["url"] == "https://api.example.com/api/v1/auth/whoami"
     assert captured["auth"] == "Bearer qk_X"
     assert body == {"kind": "human", "principal_idx": 7}
 
 
 def test_token_revoke_all_calls_correct_url(monkeypatch):
+    from qiita_control_plane.cli import _common
     from qiita_control_plane.cli import admin as cli
 
     captured = {}
 
-    def fake_post(url, headers=None, timeout=None):
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        captured["method"] = method
         captured["url"] = url
         captured["auth"] = headers["Authorization"]
         return httpx.Response(
             200,
             json={"revoked_token_idxs": [1, 2], "already_revoked_count": 0},
-            request=httpx.Request("POST", url),
+            request=httpx.Request(method, url),
         )
 
-    monkeypatch.setattr(cli.httpx, "post", fake_post)
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
     body = cli._token_revoke_all("http://localhost:8080", "qk_admin", 42)
+    assert captured["method"] == "POST"
     assert captured["url"] == "http://localhost:8080/api/v1/admin/principal/42/revoke-all-tokens"
+    assert captured["auth"] == "Bearer qk_admin"
     assert body["revoked_token_idxs"] == [1, 2]
 
 

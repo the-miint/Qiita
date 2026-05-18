@@ -22,7 +22,7 @@ from pathlib import Path
 
 import httpx
 from qiita_common.api_paths import LOOPBACK_HOST
-from qiita_common.auth_constants import API_PREFIX
+from qiita_common.auth_constants import API_PREFIX, BEARER_PREFIX
 
 # Environment-variable names and CLI defaults are CLI conventions (not part of
 # the wire protocol — those live in qiita_common.auth_constants). Keep them
@@ -140,20 +140,41 @@ def write_token(path: Path, plaintext: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def whoami(base_url: str, token: str) -> dict:
-    resp = httpx.get(
-        f"{base_url.rstrip('/')}{API_PREFIX}/auth/whoami",
-        headers={"Authorization": f"Bearer {token}"},
+def call(
+    method: str,
+    base_url: str,
+    token: str,
+    path: str,
+    *,
+    json: dict | None = None,
+) -> dict:
+    """Authenticated control-plane call returning the decoded JSON body.
+
+    `method` is an HTTP verb ("GET", "POST", "PATCH", ...). `path` is
+    the post-API-prefix segment, e.g. "/auth/whoami" or "/study"; the
+    helper prepends API_PREFIX and the trailing-slash-trimmed base_url.
+    Raises httpx.HTTPStatusError on non-2xx (run_http_subcommand catches
+    that and converts to a stderr message + exit 1).
+    """
+    resp = httpx.request(
+        method,
+        f"{base_url.rstrip('/')}{API_PREFIX}{path}",
+        headers={"Authorization": f"{BEARER_PREFIX}{token}"},
+        json=json,
         timeout=CLI_HTTP_TIMEOUT_SECONDS,
     )
     resp.raise_for_status()
     return resp.json()
 
 
-def run_http_subcommand(call: Callable[[str], dict]) -> int:
+def whoami(base_url: str, token: str) -> dict:
+    return call("GET", base_url, token, "/auth/whoami")
+
+
+def run_http_subcommand(fn: Callable[[str], dict]) -> int:
     """Token-read + httpx invoke + json print, common to every HTTP subcommand.
 
-    `call` accepts a PAT string and returns the parsed JSON body. Any
+    `fn` accepts a PAT string and returns the parsed JSON body. Any
     RuntimeError from token-read or HTTPStatusError from the request is
     converted to a stderr message + exit code 1.
     """
@@ -163,7 +184,7 @@ def run_http_subcommand(call: Callable[[str], dict]) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     try:
-        body = call(token)
+        body = fn(token)
     except httpx.HTTPStatusError as exc:
         print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
         return 1
