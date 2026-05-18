@@ -310,16 +310,23 @@ def do_login(*, base_url: str, token_file: Path, cli_command: str) -> int:
     login_url = f"{base}{API_PREFIX}/auth/login?cli=1&port={port}"
     print("Opening browser for AuthRocket login...", file=sys.stderr)
     print(f"  If the browser doesn't open, visit: {login_url}", file=sys.stderr)
-    opened = False
     try:
         opened = webbrowser.open(login_url)
-    except Exception:
-        opened = False
-    if not opened:
+    except (webbrowser.Error, OSError) as exc:
+        # Headless host, no $BROWSER, or a misconfigured handler. The flow
+        # still works via paste — but surface the actual exception so a
+        # broken BROWSER env or missing binary is diagnosable, not silent.
         print(
-            "  webbrowser.open() returned False — paste the URL above into a browser manually.",
+            f"  webbrowser.open() raised {type(exc).__name__}: {exc}"
+            " — paste the URL above into a browser manually.",
             file=sys.stderr,
         )
+    else:
+        if not opened:
+            print(
+                "  webbrowser.open() returned False — paste the URL above into a browser manually.",
+                file=sys.stderr,
+            )
 
     try:
         if not result.event.wait(timeout=LOGIN_WAIT_TIMEOUT_SECONDS):
