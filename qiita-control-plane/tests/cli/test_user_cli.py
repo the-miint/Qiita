@@ -96,3 +96,83 @@ def test_whoami_without_token_errors(monkeypatch, tmp_path, capsys):
     rc = main(["whoami"])
     assert rc == 1
     assert "QIITA_TOKEN" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# profile set
+# ---------------------------------------------------------------------------
+
+
+def test_profile_set_sends_only_supplied_fields(monkeypatch):
+    """`qiita profile set --affiliation X --phone Y` sends a body with only
+    those two keys; unset fields stay absent so the server's exclude_unset
+    UPDATE never touches a field the user didn't ask about."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import user as cli
+
+    captured: dict = {}
+
+    def fake_patch(url, headers=None, json=None, timeout=None):
+        captured["url"] = url
+        captured["auth"] = headers["Authorization"]
+        captured["json"] = json
+        return _httpx.Response(200, json={"principal_idx": 7}, request=_httpx.Request("PATCH", url))
+
+    monkeypatch.setattr(cli.httpx, "patch", fake_patch)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = cli.main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "profile",
+            "set",
+            "--affiliation",
+            "UCSD",
+            "--phone",
+            "+1-555-0100",
+        ]
+    )
+    assert rc == 0
+    assert captured["url"] == "https://q.example.test/api/v1/user/me"
+    assert captured["auth"] == "Bearer qk_test"
+    assert captured["json"] == {"affiliation": "UCSD", "phone": "+1-555-0100"}
+
+
+def test_profile_set_boolean_optional_action_distinguishes_unset_false_true(monkeypatch):
+    """--receive-processing-emails sets True, --no-receive-processing-emails sets False,
+    neither leaves the field absent from the PATCH body."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import user as cli
+
+    captured_bodies: list[dict] = []
+
+    def fake_patch(url, headers=None, json=None, timeout=None):
+        captured_bodies.append(json)
+        return _httpx.Response(200, json={"principal_idx": 7}, request=_httpx.Request("PATCH", url))
+
+    monkeypatch.setattr(cli.httpx, "patch", fake_patch)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    # --receive-processing-emails → True
+    cli.main(["profile", "set", "--receive-processing-emails"])
+    # --no-receive-processing-emails → False
+    cli.main(["profile", "set", "--no-receive-processing-emails"])
+
+    assert captured_bodies == [
+        {"receive_processing_emails": True},
+        {"receive_processing_emails": False},
+    ]
+
+
+def test_profile_set_requires_at_least_one_flag(capsys):
+    """`qiita profile set` with no flags should error rather than POST an
+    empty body. Argparse exits 2 on parser.error()."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["profile", "set"])
+    assert exc_info.value.code == 2
+    assert "at least one of" in capsys.readouterr().err
