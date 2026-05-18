@@ -287,6 +287,8 @@ async def import_sequenced_prep_sample(
     primary_study_idx must not also appear in secondary_study_idxs; the
     Pydantic validator on SequencedSampleCreateRequest blocks this at
     the route, and the composer raises ValueError as defense-in-depth.
+    Duplicate secondary studies are collapsed (the validator dedupes for
+    route callers; the composer dedupes again for callers bypassing it).
     """
     # Fail-fast guard against caller forgetting to wrap in a transaction.
     require_transaction(conn)
@@ -298,6 +300,12 @@ async def import_sequenced_prep_sample(
         raise ValueError(
             f"primary_study_idx ({primary_study_idx}) must not appear in secondary_study_idxs"
         )
+
+    # Collapse duplicate secondary studies here too, not only in the wire
+    # validator: a caller invoking the composer directly (not through the
+    # route) would otherwise trip the prep_sample_to_study primary key on
+    # a repeated study.
+    unique_secondary_study_idxs = list(dict.fromkeys(secondary_study_idxs))
 
     # Pre-flight: resolve every metadata key against prep_sample_global_field
     # in one query. Unknown names are collected (not first-only) so the
@@ -347,7 +355,7 @@ async def import_sequenced_prep_sample(
     # first so its link row carries the smallest created_at ordering;
     # secondaries sorted ascending so a failing study idx is reproducible
     # if the biosample-link trigger fires.
-    for study_idx in [primary_study_idx, *sorted(secondary_study_idxs)]:
+    for study_idx in [primary_study_idx, *sorted(unique_secondary_study_idxs)]:
         await insert_prep_sample_to_study(
             conn,
             prep_sample_idx=ps_idx,

@@ -582,6 +582,59 @@ async def test_import_sequenced_sample_from_run_multi_study_happy_path(ctx):
     assert [r["study_idx"] for r in field_owner_rows] == [primary_idx]
 
 
+async def test_import_sequenced_sample_from_run_duplicate_secondary_dedupes(ctx):
+    # A secondary study repeated in secondary_study_idxs is collapsed to a
+    # single prep_sample_to_study row rather than tripping the
+    # (prep_sample_idx, study_idx) primary key.
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "dup-sec")
+    primary_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="dup-sec-p"
+    )
+    secondary_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="dup-sec-s"
+    )
+    # Biosample must be linked to every requested study or the
+    # prep_sample_to_study_reject_without_biosample_link trigger fires.
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        study_idx=primary_idx,
+    )
+    await seed_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=bs_idx,
+        study_idx=secondary_idx,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["biosample_to_study"].append((bs_idx, secondary_idx))
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        sequenced_pool_item_id=_unique_item_id("DUP"),
+        primary_study_idx=primary_idx,
+        secondary_study_idxs=[secondary_idx, secondary_idx],
+        metadata={"Alias": "dup-001"},
+    )
+    assert resp.status_code == 201, resp.text
+    rj = resp.json()
+
+    # The repeated secondary collapses: exactly one link row per distinct
+    # study (primary plus the single secondary), no duplicate row.
+    linked = await ctx["pool"].fetch(
+        "SELECT study_idx FROM qiita.prep_sample_to_study WHERE prep_sample_idx = $1"
+        " ORDER BY study_idx",
+        rj["prep_sample_idx"],
+    )
+    assert sorted(r["study_idx"] for r in linked) == sorted([primary_idx, secondary_idx])
+
+
 async def test_import_sequenced_sample_from_run_extra_field_422(ctx):
     # Request model carries extra="forbid".
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "xtra")

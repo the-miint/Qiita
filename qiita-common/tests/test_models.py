@@ -294,3 +294,21 @@ def test_sequence_range_round_trips_through_json():
     assert model.prep_sample_idx == 7
     # Aware datetime (qiita_common convention).
     assert model.created_at.tzinfo is not None
+
+
+def test_dedupe_secondary_study_idxs():
+    """Duplicate entries in secondary_study_idxs are collapsed
+    (order-preserving) at the wire boundary; this is benign normalization,
+    distinct from primary appearing in secondary, which stays a hard
+    rejection."""
+    from qiita_common.models import SequencedSampleCreateRequest
+
+    req = SequencedSampleCreateRequest(
+        biosample_idx=1,
+        prep_protocol_idx=1,
+        owner_idx=1,
+        sequenced_pool_item_id="X",
+        primary_study_idx=1,
+        secondary_study_idxs=[5, 5, 3],
+    )
+    assert req.secondary_study_idxs == [5, 3]

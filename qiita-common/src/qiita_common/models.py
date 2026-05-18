@@ -948,7 +948,8 @@ class SequencedSampleCreateRequest(BaseModel):
     The asymmetry is forced by the schema: a prep_sample has at most one
     prep_sample_study_field per global_field_idx, so exactly one of the
     linked studies must be designated. `secondary_study_idxs` must not
-    contain `primary_study_idx`.
+    contain `primary_study_idx`; duplicate entries within it are
+    collapsed (order-preserving) rather than rejected.
 
     `metadata` keys must match seeded prep_sample_global_field display_name
     values; unknown names surface as a single 422 listing every bad key.
@@ -968,6 +969,15 @@ class SequencedSampleCreateRequest(BaseModel):
     metadata_checklist_idx: Annotated[int, Field(gt=0)] | None = None
     ena_experiment_accession: str | None = Field(default=None, max_length=50)
     ena_run_accession: str | None = Field(default=None, max_length=50)
+
+    @model_validator(mode="after")
+    def dedupe_secondary_study_idxs(self):
+        # Collapse duplicate secondary studies (order-preserving). A study
+        # repeated in secondary_study_idxs is a benign caller convenience,
+        # not a conflict, so normalize rather than reject; primary appearing
+        # in secondary remains the genuine error, caught next.
+        self.secondary_study_idxs = list(dict.fromkeys(self.secondary_study_idxs))
+        return self
 
     @model_validator(mode="after")
     def primary_not_in_secondary(self):
