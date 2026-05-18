@@ -280,12 +280,13 @@ async def _create_local_field(ctx, suffix=""):
     """Helper: create a purely-local biosample_study_field, track for cleanup."""
     field_name = f"{_unique_field_name()}_{suffix}"
     async with ctx["pool"].acquire() as conn:
-        idx, _, _ = await get_or_create_local_biosample_study_field(
-            conn,
-            study_idx=ctx["study_idx"],
-            display_name=field_name,
-            created_by_idx=ctx["principal_idx"],
-            required=True,
-        )
+        async with conn.transaction():
+            idx, _, _ = await get_or_create_local_biosample_study_field(
+                conn,
+                study_idx=ctx["study_idx"],
+                display_name=field_name,
+                created_by_idx=ctx["principal_idx"],
+                required=True,
+            )
     ctx["created"]["biosample_study_field"].append(idx)
     return idx

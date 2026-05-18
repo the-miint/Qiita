@@ -86,9 +86,6 @@ _SEQUENCED_SAMPLE_UNIQUE_MESSAGES: dict[str, str] = {
     "prep_sample_metadata_unique_per_field": (
         "duplicate metadata entry for the same prep_sample_study_field"
     ),
-    "prep_sample_metadata_one_value_per_global_field": (
-        "duplicate metadata entry for the same global field on this prep_sample"
-    ),
 }
 _SEQUENCED_SAMPLE_FK_MESSAGES: dict[str, str] = {
     "prep_sample_biosample_idx_fkey": ("biosample_idx does not reference an existing biosample"),

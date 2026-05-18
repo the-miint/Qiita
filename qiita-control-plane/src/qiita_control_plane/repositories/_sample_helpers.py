@@ -938,9 +938,8 @@ async def write_local_metadata_or_diagnose(
     )
     if resolved_global_field_idx is not None:
         # Strict-mode: the caller asked for local-only, but the resolved
-        # field is globally linked. Refuse the write before any INSERT.
-        # The outer transaction rolls back any study_field row the
-        # get-or-create branch just created.
+        # row is an existing field that is globally linked.
+        # Refuse the write before any metadata INSERT.
         raise LocalWriteOnGloballyLinkedFieldError(
             entity_kind=spec.entity_kind,
             study_idx=study_idx,

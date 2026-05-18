@@ -21,6 +21,7 @@ from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 from qiita_common.models import FieldDataType
 
 from qiita_control_plane.repositories._sample_helpers import (
+    LocalWriteOnGloballyLinkedFieldError,
     MetadataParseError,
     MetadataUnknownFieldsError,
 )
@@ -689,6 +690,70 @@ async def test_import_biosample_from_owner_biosample_id_writes_global_metadata(c
         key=lambda r: r["global_field_idx"],
     )
     assert [dict(r) for r in meta_rows] == expected_meta
+
+
+async def test_import_biosample_from_owner_biosample_id_rejects_globally_linked_owner_field(ctx):
+    suffix = secrets.token_hex(4)
+    linked_name = f"Globally Linked {suffix}"
+
+    # Seed a global field and write a metadata value against it so a
+    # globally-linked biosample_study_field row exists at
+    # (study_idx, linked_name) for the owner-id step to later resolve.
+    global_idx = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=f"glob_{suffix}",
+        display_name=linked_name,
+        data_type=FieldDataType.TEXT,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+
+    seed_owner_field = _unique_field_name()
+    async with ctx["pool"].acquire() as conn:
+        async with conn.transaction():
+            seed_result = await import_biosample_from_owner_biosample_id(
+                conn,
+                primary_study_idx=ctx["study_idx"],
+                owner_idx=ctx["biosample_owner_idx"],
+                owner_biosample_id_field_name=seed_owner_field,
+                owner_biosample_id_value="SEED-OWNER",
+                caller_idx=ctx["principal_idx"],
+                metadata={linked_name: "seed-value"},
+            )
+    await _track_composer_outputs(
+        ctx, seed_result.biosample_idx, ctx["study_idx"], seed_owner_field
+    )
+    await _track_global_metadata_outputs(
+        ctx, seed_result.biosample_idx, ctx["study_idx"], [global_idx]
+    )
+
+    # Reuse the globally-linked display_name AS the owner-id field. The
+    # pre-flight collision check only inspects the metadata dict (empty
+    # here), so the call proceeds to step d, where get-or-create resolves
+    # the existing globally-linked row instead of creating a local one —
+    # strict-mode must reject rather than write PII through a global slot.
+    bs_acc = _unique_accession("BS-glob-owner")
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(LocalWriteOnGloballyLinkedFieldError):
+            async with conn.transaction():
+                await import_biosample_from_owner_biosample_id(
+                    conn,
+                    primary_study_idx=ctx["study_idx"],
+                    owner_idx=ctx["biosample_owner_idx"],
+                    owner_biosample_id_field_name=linked_name,
+                    owner_biosample_id_value="DOOMED",
+                    caller_idx=ctx["principal_idx"],
+                    metadata={},
+                    biosample_accession=bs_acc,
+                )
+
+    # The rejection fires after the second call's biosample/link writes;
+    # the caller's transaction must roll all of it back.
+    found = await ctx["pool"].fetchval(
+        "SELECT idx FROM qiita.biosample WHERE biosample_accession = $1",
+        bs_acc,
+    )
+    assert found is None
 
 
 async def test_import_biosample_from_owner_biosample_id_with_empty_metadata(ctx):

@@ -2,9 +2,7 @@
 
 Repo-wide helpers used by every kind of repository module — guards and
 input validators shared across study, biosample, prep_sample, and the
-rest — live in this package init. Every helper here takes an
-asyncpg.Connection as a positional argument and runs synchronously
-relative to that connection's transaction scope.
+rest — live in this package init.
 """
 
 import asyncpg

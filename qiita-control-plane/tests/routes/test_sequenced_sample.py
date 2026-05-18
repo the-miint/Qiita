@@ -568,6 +568,19 @@ async def test_import_sequenced_sample_from_run_multi_study_happy_path(ctx):
     )
     assert sorted(r["study_idx"] for r in linked) == sorted([primary_idx, secondary_idx])
 
+    # Asymmetric ownership: primary_study_idx owns the prep_sample_study_field
+    # row for the metadata field; the secondary study shares the value
+    # through the global slot but owns no field row of its own. Exactly one
+    # field row must exist across both studies, and it must be primary's.
+    field_owner_rows = await ctx["pool"].fetch(
+        "SELECT study_idx FROM qiita.prep_sample_study_field"
+        " WHERE display_name = $1 AND study_idx = ANY($2::bigint[])"
+        " ORDER BY study_idx",
+        "Alias",
+        sorted([primary_idx, secondary_idx]),
+    )
+    assert [r["study_idx"] for r in field_owner_rows] == [primary_idx]
+
 
 async def test_import_sequenced_sample_from_run_extra_field_422(ctx):
     # Request model carries extra="forbid".

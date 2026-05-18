@@ -267,6 +267,12 @@ async def get_or_create_local_biosample_study_field(
     fallback SELECT could miss a row committed after the transaction snapshot
     and a different pattern would be required.
     """
+
+    # Both branches must observe the same snapshot; require a wrapping
+    # transaction so the INSERT and the fallback SELECT cannot straddle
+    # an implicit-commit boundary.
+    require_transaction(conn)
+
     # Create branch — purely-local row, biosample_global_field_idx left NULL.
     # ON CONFLICT DO NOTHING absorbs the unique-constraint hit so the
     # concurrent loser of the race does not raise.

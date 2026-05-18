@@ -53,7 +53,7 @@ async def test_get_or_create_local_biosample_study_field_creates_purely_local(ct
     field_name = _unique_field_name()
 
     # Create a new local field with required=True (composer's intended use).
-    async with ctx["pool"].acquire() as conn:
+    async with ctx["pool"].acquire() as conn, conn.transaction():
         idx, created, resolved_global_field_idx = await get_or_create_local_biosample_study_field(
             conn,
             study_idx=ctx["study_idx"],
@@ -95,7 +95,7 @@ async def test_get_or_create_local_biosample_study_field_returns_existing(ctx):
 
     # First call inserts; second call with the same (study_idx, display_name)
     # must return the same idx without inserting a new row.
-    async with ctx["pool"].acquire() as conn:
+    async with ctx["pool"].acquire() as conn, conn.transaction():
         (
             first_idx,
             first_created,
@@ -296,7 +296,7 @@ async def test_get_or_create_globally_linked_biosample_study_field_raises_on_loc
     # local sibling. Then ask for a globally-linked row at the same key.
     suffix = secrets.token_hex(4)
     display_name = f"Collision Field {suffix}"
-    async with ctx["pool"].acquire() as conn:
+    async with ctx["pool"].acquire() as conn, conn.transaction():
         local_idx, _, _ = await get_or_create_local_biosample_study_field(
             conn,
             study_idx=ctx["study_idx"],
@@ -388,7 +388,7 @@ async def test_biosample_metadata_rejects_value_text_when_data_type_numeric(ctx)
     # Create a purely-local numeric-typed field. Mismatching the field's
     # data_type with the populated value_* column must be rejected by the
     # check_data_type half of the trigger.
-    async with ctx["pool"].acquire() as conn:
+    async with ctx["pool"].acquire() as conn, conn.transaction():
         field_idx, _, _ = await get_or_create_local_biosample_study_field(
             conn,
             study_idx=ctx["study_idx"],
@@ -418,7 +418,7 @@ async def test_biosample_metadata_accepts_value_missing_reason_for_any_data_type
 
     # Create a numeric field, but write a missing-reason row instead of a
     # value_numeric row. Missing-reason rows are exempt from the data_type match.
-    async with ctx["pool"].acquire() as conn:
+    async with ctx["pool"].acquire() as conn, conn.transaction():
         field_idx, _, _ = await get_or_create_local_biosample_study_field(
             conn,
             study_idx=ctx["study_idx"],
@@ -549,7 +549,7 @@ async def test_biosample_metadata_rejects_value_text_when_data_type_terminology(
     # Create the field via the repository function so the field-table CHECK
     # `(data_type = 'terminology') = (terminology_idx IS NOT NULL)` is exercised
     # alongside the trigger.
-    async with ctx["pool"].acquire() as conn:
+    async with ctx["pool"].acquire() as conn, conn.transaction():
         field_idx, _, _ = await get_or_create_local_biosample_study_field(
             conn,
             study_idx=ctx["study_idx"],
@@ -712,7 +712,7 @@ async def test_insert_biosample_metadata_numeric_inserts_value_numeric(ctx):
 
     # Numeric-typed local field so the field-contract trigger accepts a
     # value_numeric write.
-    async with ctx["pool"].acquire() as conn:
+    async with ctx["pool"].acquire() as conn, conn.transaction():
         field_idx, _, _ = await get_or_create_local_biosample_study_field(
             conn,
             study_idx=ctx["study_idx"],
@@ -759,7 +759,7 @@ async def test_insert_biosample_metadata_date_inserts_value_date(ctx):
 
     # Date-typed local field so the field-contract trigger accepts a
     # value_date write.
-    async with ctx["pool"].acquire() as conn:
+    async with ctx["pool"].acquire() as conn, conn.transaction():
         field_idx, _, _ = await get_or_create_local_biosample_study_field(
             conn,
             study_idx=ctx["study_idx"],
@@ -1073,7 +1073,7 @@ async def test_propagate_link_upgrade_null_to_non_null_propagates_to_metadata(ct
     ctx["created"]["biosample_global_field"].append(gf_idx)
 
     # Create a purely-local TEXT field and write one metadata row through it.
-    async with ctx["pool"].acquire() as conn:
+    async with ctx["pool"].acquire() as conn, conn.transaction():
         field_idx, _, _ = await get_or_create_local_biosample_study_field(
             conn,
             study_idx=ctx["study_idx"],

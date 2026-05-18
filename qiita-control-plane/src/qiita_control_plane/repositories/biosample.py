@@ -28,6 +28,7 @@ from qiita_common.models import Tier
 from . import require_transaction, validate_patch_fields
 from ._sample_helpers import (
     GlobalFieldRow,
+    LocalWriteOnGloballyLinkedFieldError,
     MetadataUnknownFieldsError,
     SampleEntityKind,
     parse_text_for_data_type,
@@ -358,6 +359,14 @@ async def import_biosample_from_owner_biosample_id(
         - MetadataParseError on first failure to coerce a text value
           into the type its global field declares.
 
+    The owner-biosample-id field is resolved strictly local. If
+    owner_biosample_id_field_name resolves to a biosample_study_field on
+    primary_study_idx that is already globally linked, the composer raises
+    LocalWriteOnGloballyLinkedFieldError instead of writing the PII value
+    through a cross-study global slot. This fires after the biosample,
+    study links, and globally-linked metadata have been written; the
+    caller's transaction rolls all of them back.
+
     The caller must wrap the call in `async with conn.transaction():`; the
     guard at entry raises RuntimeError otherwise so partial failure cannot
     leave orphan rows.
@@ -438,7 +447,11 @@ async def import_biosample_from_owner_biosample_id(
     # primary_study_idx. The tier_override pins the field above any
     # study-level default so the owner display value never surfaces to
     # non-members (PII concern).
-    field_idx, field_created, _ = await get_or_create_local_biosample_study_field(
+    (
+        field_idx,
+        field_created,
+        resolved_global_field_idx,
+    ) = await get_or_create_local_biosample_study_field(
         conn,
         study_idx=primary_study_idx,
         display_name=owner_biosample_id_field_name,
@@ -446,6 +459,19 @@ async def import_biosample_from_owner_biosample_id(
         required=True,
         tier_override=OWNER_BIOSAMPLE_ID_TIER_OVERRIDE,
     )
+    # Strict-mode: the owner-biosample-id row is purely-local PII. If the
+    # get-or-create resolved an already globally-linked field at this
+    # (study, display_name), refuse rather than write the value through a
+    # cross-study global slot. The caller's transaction rolls back the
+    # biosample, study links, and globally-linked metadata written above.
+    if resolved_global_field_idx is not None:
+        raise LocalWriteOnGloballyLinkedFieldError(
+            entity_kind=SampleEntityKind.BIOSAMPLE,
+            study_idx=primary_study_idx,
+            display_name=owner_biosample_id_field_name,
+            study_field_idx=field_idx,
+            found_global_field_idx=resolved_global_field_idx,
+        )
 
     # Step e: write the owner-biosample-id metadata row, flagged.
     await insert_biosample_metadata_text(

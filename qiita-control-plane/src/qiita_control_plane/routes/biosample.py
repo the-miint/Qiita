@@ -47,6 +47,7 @@ from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
 from ..repositories._sample_helpers import (
     GlobalFieldSlotOccupiedError,
+    LocalWriteOnGloballyLinkedFieldError,
     MetadataParseError,
     MetadataUnknownFieldsError,
     StudyFieldConflictError,
@@ -189,6 +190,20 @@ async def import_biosample(
             # free again. Independent of the asyncpg catches; maps to a
             # 503 + Retry-After so the client resubmits the same request.
             raise_for_transient_write_race(exc)
+        except LocalWriteOnGloballyLinkedFieldError as exc:
+            # The requested owner-biosample-id field name resolves to a
+            # field already globally linked on this study. The owner-id
+            # row is purely-local PII and must not be written through a
+            # cross-study global slot; the caller must pick a different
+            # owner_biosample_id_field_name. Its own exception family,
+            # independent of the asyncpg.UniqueViolationError catch below.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"owner_biosample_id_field_name {exc.display_name!r} is"
+                    " already bound to a global field on this study"
+                ),
+            )
         except asyncpg.UniqueViolationError as exc:
             detail = _UNIQUE_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_UNIQUE_VIOLATION)
             raise HTTPException(status_code=409, detail=detail)

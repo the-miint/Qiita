@@ -664,6 +664,54 @@ async def test_post_biosample_metadata_writes_global_fields(ctx):
     assert [dict(r) for r in rows] == expected
 
 
+async def test_post_biosample_globally_linked_owner_field_409(ctx):
+    # Seed a global field and post a metadata value against it so a
+    # globally-linked biosample_study_field exists at (study, name).
+    # A second POST that names that same display_name as the owner-id
+    # field must be rejected: the owner-id row is purely-local PII and
+    # cannot be written through a global slot. Maps to 409.
+    suffix = secrets.token_hex(4)
+    linked_name = f"Globally Linked {suffix}"
+    global_idx = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=f"r_glob_{suffix}",
+        display_name=linked_name,
+        data_type=FieldDataType.TEXT,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="glob-owner"
+    )
+    ctx["created"]["study"].append(study_idx)
+
+    seed_resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_value="SEED-OWNER",
+        metadata={linked_name: "seed-value"},
+    )
+    assert seed_resp.status_code == 201, seed_resp.text
+    await _track_global_metadata_outputs(
+        ctx, seed_resp.json()["biosample_idx"], study_idx, [global_idx]
+    )
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=linked_name,
+        owner_biosample_id_value="DOOMED",
+    )
+    assert resp.status_code == 409, resp.text
+    assert linked_name in resp.json()["detail"]
+
+
 async def test_post_biosample_metadata_unknown_field_422(ctx):
     # Two metadata keys that have no matching biosample_global_field row.
     # The route's MetadataUnknownFieldsError handler must return
