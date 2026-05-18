@@ -14,9 +14,7 @@ from ~/.qiita/token (mode 0600).
 """
 
 import argparse
-import os
 import sys
-from pathlib import Path
 
 import httpx
 from qiita_common.auth_constants import API_PREFIX
@@ -70,23 +68,14 @@ def _post_study(base_url: str, token: str, body: dict) -> dict:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="qiita", description="Qiita end-user CLI")
-    parser.add_argument(
-        "--base-url",
-        default=os.environ.get("QIITA_CONTROL_PLANE_URL", "http://localhost:8080"),
-        help="Control-plane base URL (default from QIITA_CONTROL_PLANE_URL or http://localhost:8080)",
-    )
+    _common.add_base_url_arg(parser)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_login = sub.add_parser(
         "login",
         help="AuthRocket LoginRocket Web flow with localhost loopback",
     )
-    p_login.add_argument(
-        "--token-file",
-        type=Path,
-        default=_common.TOKEN_FILE_DEFAULT,
-        help=f"Where to write the PAT (default {_common.TOKEN_FILE_DEFAULT})",
-    )
+    _common.add_token_file_arg(p_login)
 
     sub.add_parser("whoami", help="Print the authenticated principal")
 

@@ -9,6 +9,7 @@ within the package this module is the public surface.
 
 from __future__ import annotations
 
+import argparse
 import http.server
 import json
 import os
@@ -22,6 +23,13 @@ from pathlib import Path
 import httpx
 from qiita_common.api_paths import LOOPBACK_HOST
 from qiita_common.auth_constants import API_PREFIX
+
+# Environment-variable names and CLI defaults are CLI conventions (not part of
+# the wire protocol — those live in qiita_common.auth_constants). Keep them
+# centralized here so admin/user CLIs and the tests reference one string.
+QIITA_TOKEN_ENV = "QIITA_TOKEN"
+QIITA_CONTROL_PLANE_URL_ENV = "QIITA_CONTROL_PLANE_URL"
+DEFAULT_CONTROL_PLANE_URL = "http://localhost:8080"
 
 TOKEN_FILE_DEFAULT = Path.home() / ".qiita" / "token"
 
@@ -63,21 +71,50 @@ h1   { margin-bottom: 0.4em; }
 
 
 # ---------------------------------------------------------------------------
+# argparse helpers
+# ---------------------------------------------------------------------------
+
+
+def add_base_url_arg(parser: argparse.ArgumentParser) -> None:
+    """Add the standard --base-url flag. Default is $QIITA_CONTROL_PLANE_URL or
+    DEFAULT_CONTROL_PLANE_URL."""
+    parser.add_argument(
+        "--base-url",
+        default=os.environ.get(QIITA_CONTROL_PLANE_URL_ENV, DEFAULT_CONTROL_PLANE_URL),
+        help=(
+            f"Control-plane base URL (default from ${QIITA_CONTROL_PLANE_URL_ENV} or"
+            f" {DEFAULT_CONTROL_PLANE_URL})"
+        ),
+    )
+
+
+def add_token_file_arg(parser: argparse.ArgumentParser) -> None:
+    """Add the standard --token-file flag. Default is TOKEN_FILE_DEFAULT
+    (~/.qiita/token)."""
+    parser.add_argument(
+        "--token-file",
+        type=Path,
+        default=TOKEN_FILE_DEFAULT,
+        help=f"Where to write the PAT (default {TOKEN_FILE_DEFAULT})",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Token I/O
 # ---------------------------------------------------------------------------
 
 
 def read_token(token_file: Path | None = None) -> str:
-    """Read PAT from QIITA_TOKEN env or from a token file (default ~/.qiita/token).
+    """Read PAT from $QIITA_TOKEN env or from a token file (default ~/.qiita/token).
     Raises with a clear actionable message if neither is set."""
-    env = os.environ.get("QIITA_TOKEN")
+    env = os.environ.get(QIITA_TOKEN_ENV)
     if env:
         return env.strip()
     path = token_file or TOKEN_FILE_DEFAULT
     if path.is_file():
         return path.read_text().strip()
     raise RuntimeError(
-        f"no PAT found — set QIITA_TOKEN or write a token to {path}"
+        f"no PAT found — set ${QIITA_TOKEN_ENV} or write a token to {path}"
         f" (use POST {API_PREFIX}/auth/pat to mint one)"
     )
 

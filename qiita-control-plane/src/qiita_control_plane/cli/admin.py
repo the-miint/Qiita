@@ -153,11 +153,7 @@ def _token_revoke_all(base_url: str, token: str, principal_idx: int) -> dict:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="qiita-admin", description="Qiita admin CLI")
-    parser.add_argument(
-        "--base-url",
-        default=os.environ.get("QIITA_CONTROL_PLANE_URL", "http://localhost:8080"),
-        help="Control-plane base URL (default from QIITA_CONTROL_PLANE_URL or http://localhost:8080)",
-    )
+    _common.add_base_url_arg(parser)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_role = sub.add_parser(
@@ -182,12 +178,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "login",
         help="AuthRocket LoginRocket Web flow with localhost loopback",
     )
-    p_login.add_argument(
-        "--token-file",
-        type=Path,
-        default=_common.TOKEN_FILE_DEFAULT,
-        help=f"Where to write the PAT (default {_common.TOKEN_FILE_DEFAULT})",
-    )
+    _common.add_token_file_arg(p_login)
 
     p_actions = sub.add_parser("actions", help="Action registry operations")
     p_actions_sub = p_actions.add_subparsers(dest="actions_cmd", required=True)
