@@ -130,7 +130,7 @@ async def _sync_actions(database_url: str, workflows_dir: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# HTTP subcommands: token revoke-all
+# HTTP subcommand helpers
 # ---------------------------------------------------------------------------
 
 

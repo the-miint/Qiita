@@ -269,19 +269,18 @@ def run_http_subcommand(fn: Callable[[str], dict]) -> int:
 
 
 class LoopbackResult:
-    """Mailbox for the loopback HTTP handler to deposit the captured ot_code
-    or an error. The main thread blocks on `event` until the handler fires."""
+    """Mailbox for the loopback HTTP handler to deposit the captured ot_code.
+    The main thread blocks on `event` until the handler fires."""
 
     # __slots__ strings stay as literals: they're a metaprogramming declaration
     # that must match the bare-identifier attribute accesses below (`self.event`,
-    # `result.ot_code`, …). Promoting them to constants would force `getattr`
+    # `result.ot_code`). Promoting them to constants would force `getattr`
     # everywhere, which is strictly worse than dot access.
-    __slots__ = ("event", "ot_code", "error")
+    __slots__ = ("event", "ot_code")
 
     def __init__(self) -> None:
         self.event = threading.Event()
         self.ot_code: str | None = None
-        self.error: str | None = None
 
 
 def loopback_handler_factory(result: LoopbackResult):
@@ -379,14 +378,13 @@ def do_login(*, base_url: str, token_file: Path, cli_command: str) -> int:
         # still works via paste — but surface the actual exception so a
         # broken BROWSER env or missing binary is diagnosable, not silent.
         print(
-            f"  webbrowser.open() raised {type(exc).__name__}: {exc}"
-            " — paste the URL above into a browser manually.",
+            f"  note: couldn't auto-open browser ({type(exc).__name__}: {exc}); use the URL above.",
             file=sys.stderr,
         )
     else:
         if not opened:
             print(
-                "  webbrowser.open() returned False — paste the URL above into a browser manually.",
+                "  note: webbrowser.open() returned False; use the URL above.",
                 file=sys.stderr,
             )
 
@@ -406,10 +404,10 @@ def do_login(*, base_url: str, token_file: Path, cli_command: str) -> int:
         server.server_close()
 
     if result.ot_code is None:
-        print(
-            f"error: loopback received no ot_code (handler error: {result.error})",
-            file=sys.stderr,
-        )
+        # Defensive: the handler always assigns ot_code before setting the
+        # event, so reaching here means the event was set without the code
+        # being populated — a real bug in the handler.
+        print("error: loopback fired without capturing an ot_code", file=sys.stderr)
         return 1
 
     # Exchange the code for the PAT plaintext.
