@@ -16,7 +16,8 @@ from ~/.qiita/token (mode 0600).
 import argparse
 import sys
 
-from qiita_common.models import Tier
+from pydantic import BaseModel, ValidationError
+from qiita_common.models import StudyCreate, Tier, UserUpdate
 
 from . import _common
 
@@ -114,44 +115,37 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _profile_set_updates(args: argparse.Namespace) -> dict:
-    """Build the PATCH body from parsed args. Only fields the caller actually
-    supplied appear in the dict — argparse's default of None marks unset for
-    every flag here, including the BooleanOptionalAction one."""
-    updates: dict = {}
-    if args.affiliation is not None:
-        updates["affiliation"] = args.affiliation
-    if args.address is not None:
-        updates["address"] = args.address
-    if args.phone is not None:
-        updates["phone"] = args.phone
-    if args.orcid is not None:
-        updates["orcid"] = args.orcid
-    if args.receive_processing_emails is not None:
-        updates["receive_processing_emails"] = args.receive_processing_emails
-    return updates
+def _build_body(
+    model_cls: type[BaseModel],
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+) -> dict:
+    """Construct `model_cls` from the parsed-args fields that match its
+    model_fields, then return the exclude_unset JSON dump.
 
+    Filters None out of the namespace before construction so the only
+    fields Pydantic treats as "set" are the ones the caller actually
+    passed (matches the server's exclude_unset semantics on the PATCH
+    side; honest with the schema on the POST side). Argparse's dest
+    names line up with the Pydantic field names (snake_case from
+    hyphenated flags), so the filter is a single comprehension.
 
-def _study_create_body(args: argparse.Namespace) -> dict:
-    """Build the POST /study body from parsed args. Required: --title.
-    Optional fields go in only when supplied, so we don't ship explicit
-    nulls the server would treat as 'caller set this to null'."""
-    body: dict = {"title": args.title}
-    for argname, field in (
-        ("alias", "alias"),
-        ("description", "description"),
-        ("abstract", "abstract"),
-        ("funding", "funding"),
-        ("ebi_study_accession", "ebi_study_accession"),
-        ("vamps_id", "vamps_id"),
-        ("notes", "notes"),
-        ("principal_investigator_idx", "principal_investigator_idx"),
-        ("default_tier", "default_tier"),
-    ):
-        value = getattr(args, argname)
-        if value is not None:
-            body[field] = value
-    return body
+    On ValidationError (e.g. a too-long --title, malformed --orcid),
+    flattens the errors into a single stderr line and exits 2 via
+    parser.error — same code path as argparse's own validation
+    failures, so callers don't see a Python traceback for invalid
+    input.
+    """
+    fields = {
+        name: getattr(args, name)
+        for name in model_cls.model_fields
+        if getattr(args, name, None) is not None
+    }
+    try:
+        return model_cls(**fields).model_dump(exclude_unset=True, mode="json")
+    except ValidationError as exc:
+        msgs = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
+        parser.error(f"invalid {model_cls.__name__}: {msgs}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -170,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "profile":
         if args.profile_cmd == "set":
-            updates = _profile_set_updates(args)
+            updates = _build_body(UserUpdate, args, parser)
             if not updates:
                 parser.error(
                     "qiita profile set requires at least one of"
@@ -181,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "study":
         if args.study_cmd == "create":
-            body = _study_create_body(args)
+            body = _build_body(StudyCreate, args, parser)
             return _common.run_http_subcommand(lambda t: _post_study(args.base_url, t, body))
 
     parser.error(f"unknown command: {args.cmd}")

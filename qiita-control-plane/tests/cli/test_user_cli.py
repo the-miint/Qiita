@@ -298,3 +298,31 @@ def test_study_create_rejects_invalid_default_tier(capsys):
         main(["study", "create", "--title", "T", "--default-tier", "owner"])
     assert exc_info.value.code == 2
     assert "default-tier" in capsys.readouterr().err
+
+
+def test_study_create_pydantic_validation_error_exits_2(capsys):
+    """A --title longer than StudyCreate's max_length=500 trips Pydantic
+    client-side; we surface a flat error line via parser.error and exit
+    2, not a traceback."""
+    from qiita_control_plane.cli.user import main
+
+    long_title = "x" * 501
+    with pytest.raises(SystemExit) as exc_info:
+        main(["study", "create", "--title", long_title])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "invalid StudyCreate" in err
+    assert "title" in err
+
+
+def test_profile_set_pydantic_validation_error_exits_2(capsys):
+    """A malformed --orcid trips Pydantic client-side via UserUpdate's
+    pattern constraint; surfaced as a flat parser.error."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["profile", "set", "--orcid", "not-an-orcid"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "invalid UserUpdate" in err
+    assert "orcid" in err
