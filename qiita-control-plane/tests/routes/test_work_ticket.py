@@ -194,6 +194,36 @@ async def reference_idx(postgres_pool, admin_token):
     await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
 
 
+@pytest.fixture
+async def prep_sample_idx(postgres_pool, admin_token):
+    """A minimal qiita.prep_sample row (the supertype introduced by #35)
+    owned by the admin principal, with processing_kind='sequenced'.
+
+    Uses the shared db_seeds composer so this fixture stays in sync with
+    every other "I need a sequenced prep_sample" site (route tests,
+    repository tests, integration smoke). The sequenced_sample 1:1
+    subtype row is intentionally NOT created — the work_ticket scope
+    target is the supertype, and the tests here exercise scope/action
+    plumbing only (not sequencing-specific fields).
+
+    All seeded rows are cleaned up in reverse-FK order after the test."""
+    from qiita_control_plane.testing.db_seeds import (
+        seed_biosample_with_sequenced_prep_sample,
+    )
+
+    _, admin_idx = admin_token
+    biosample_idx, idx = await seed_biosample_with_sequenced_prep_sample(
+        postgres_pool, owner_idx=admin_idx
+    )
+    yield idx
+    # FK RESTRICT cascade — drop dependents in reverse order. The
+    # composer used the seeded `short_read_metagenomics` prep_protocol
+    # (system-owned), so we don't delete the protocol here.
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE prep_sample_idx = $1", idx)
+    await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", idx)
+    await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
+
+
 _TEST_STEPS = [
     {
         "kind": "step",
@@ -207,23 +237,40 @@ _TEST_STEPS = [
 ]
 
 
-async def _seed_action(postgres_pool, *, context_schema: dict) -> tuple[str, str]:
-    """Insert an enabled, reference-targeting action with the given
-    context_schema. Returns (action_id, version). Caller is responsible
-    for cleanup — fixtures wrap this with teardown."""
+async def _seed_action(
+    postgres_pool,
+    *,
+    context_schema: dict,
+    target_kind: str = "reference",
+    scopes: list[str] | None = None,
+    target_processing_kinds: list[str] | None = None,
+) -> tuple[str, str]:
+    """Insert an enabled action with the given context_schema and
+    target_kind. Returns (action_id, version). Caller is responsible
+    for cleanup — fixtures wrap this with teardown.
+
+    `target_kind` selects the scope kind the action accepts; `scopes`
+    overrides the default scope list (REFERENCE_WRITE) for targets that
+    don't fit that grant. `target_processing_kinds` only applies when
+    target_kind = 'prep_sample'; left as default-empty otherwise (the
+    DB CHECK action_processing_kinds_only_for_prep_sample enforces
+    that pairing)."""
     action_id = "wt-test-action"
     version = f"v-{uuid.uuid4()}"
     await postgres_pool.execute(
         "INSERT INTO qiita.action ("
-        "  action_id, version, target_kind, scopes, audience,"
-        "  context_schema, steps,"
+        "  action_id, version, target_kind, target_processing_kinds,"
+        "  scopes, audience, context_schema, steps,"
         "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling,"
         "  success_status, failure_status"
-        ") VALUES ($1, $2, 'reference', $3::text[], $4::jsonb,"
-        "  $5::jsonb, $6::jsonb, 1, 1, '1 minute', $7, $8)",
+        ") VALUES ($1, $2, $3::qiita.scope_target_kind,"
+        "          $4::qiita.processing_kind[], $5::text[], $6::jsonb,"
+        "          $7::jsonb, $8::jsonb, 1, 1, '1 minute', $9, $10)",
         action_id,
         version,
-        [Scope.REFERENCE_WRITE.value],
+        target_kind,
+        target_processing_kinds or [],
+        scopes if scopes is not None else [Scope.REFERENCE_WRITE.value],
         json.dumps({"service": False, "human_roles": [SystemRole.SYSTEM_ADMIN.value]}),
         json.dumps(context_schema),
         json.dumps(_TEST_STEPS),
@@ -253,6 +300,41 @@ async def reference_action(postgres_pool):
     reference:write, with an empty context_schema (accepts any object)
     — matches the admin_token fixture's grant."""
     action_id, version = await _seed_action(postgres_pool, context_schema={})
+    yield action_id, version
+    await _drop_action(postgres_pool, action_id, version)
+
+
+@pytest.fixture
+async def prep_sample_action(postgres_pool):
+    """An enabled, prep_sample-targeting action accepting any context
+    object and any processing_kind (target_processing_kinds=[] = "any").
+    Reuses the noop step shape so route-side dispatch tests don't fan out
+    — `_patch_run_and_log` short-circuits real execution."""
+    action_id, version = await _seed_action(
+        postgres_pool,
+        context_schema={},
+        target_kind="prep_sample",
+        # No reference / sample-specific scope exists yet; REFERENCE_WRITE
+        # is the closest grant the admin_token fixture carries.
+        scopes=[Scope.REFERENCE_WRITE.value],
+    )
+    yield action_id, version
+    await _drop_action(postgres_pool, action_id, version)
+
+
+@pytest.fixture
+async def sequenced_only_prep_sample_action(postgres_pool):
+    """A prep_sample-targeting action that ONLY accepts
+    processing_kind='sequenced' — drives the option-(b) check that
+    rejects submissions against a non-sequenced prep_sample. Mirrors
+    fastq-to-parquet's YAML declaration."""
+    action_id, version = await _seed_action(
+        postgres_pool,
+        context_schema={},
+        target_kind="prep_sample",
+        target_processing_kinds=["sequenced"],
+        scopes=[Scope.REFERENCE_WRITE.value],
+    )
     yield action_id, version
     await _drop_action(postgres_pool, action_id, version)
 
@@ -310,6 +392,157 @@ async def test_submit_happy_path(
         "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
     )
     assert state == WorkTicketState.PENDING.value
+
+
+async def test_submit_prep_sample_scope_persists_idx(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    prep_sample_action,
+    prep_sample_idx,
+):
+    """Submitting a prep_sample-scoped ticket round-trips the scope
+    kind through the INSERT path: 202 with PENDING, and the persisted
+    row carries scope_target_kind='prep_sample' plus the
+    prep_sample_idx the body declared (with all other scope arms NULL,
+    per the work_ticket_scope_target_consistent CHECK)."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {
+                "kind": "prep_sample",
+                "prep_sample_idx": prep_sample_idx,
+            },
+            "action_context": {},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    idx = resp.json()["work_ticket_idx"]
+    wt_client._created_tickets.append(idx)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT scope_target_kind, study_idx, prep_idx, reference_idx,"
+        "       prep_sample_idx, state"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        idx,
+    )
+    assert row["scope_target_kind"] == "prep_sample"
+    assert row["prep_sample_idx"] == prep_sample_idx
+    assert row["study_idx"] is None
+    assert row["prep_idx"] is None
+    assert row["reference_idx"] is None
+    assert row["state"] == WorkTicketState.PENDING.value
+
+
+async def test_submit_prep_sample_disallow_without_delete(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    prep_sample_action,
+    prep_sample_idx,
+):
+    """A second prep_sample submission against the same (action, sample)
+    triple while the first is non-terminal must 409 — same
+    disallow-without-delete contract reference and study_prep have,
+    now exercised through the work_ticket_one_in_flight_per_prep_sample
+    partial unique index."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    body = {
+        "action_id": action_id,
+        "action_version": version,
+        "scope_target": {
+            "kind": "prep_sample",
+            "prep_sample_idx": prep_sample_idx,
+        },
+        "action_context": {},
+    }
+    first = await wt_client.post(
+        URL_WORK_TICKET_PREFIX, json=body, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert first.status_code == 202
+    wt_client._created_tickets.append(first.json()["work_ticket_idx"])
+
+    second = await wt_client.post(
+        URL_WORK_TICKET_PREFIX, json=body, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert second.status_code == 409, second.text
+    assert "in flight" in second.text.lower()
+
+
+async def test_submit_prep_sample_kind_match_passes(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    sequenced_only_prep_sample_action,
+    prep_sample_idx,
+):
+    """Option (b): a sequenced-only action accepts a sequenced
+    prep_sample. The prep_sample fixture seeds processing_kind='sequenced'
+    and the action's target_processing_kinds=['sequenced'] — the
+    submit-time check fires and passes."""
+    token, _ = admin_token
+    action_id, version = sequenced_only_prep_sample_action
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {
+                "kind": "prep_sample",
+                "prep_sample_idx": prep_sample_idx,
+            },
+            "action_context": {},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
+
+
+async def test_submit_prep_sample_kind_check_404_on_missing_prep(
+    wt_client,
+    admin_token,
+    sequenced_only_prep_sample_action,
+):
+    """A prep_sample-scoped submission against an action that declares
+    target_processing_kinds=['sequenced'] returns 404 when the prep_sample
+    row doesn't exist. The check fires `SELECT processing_kind FROM
+    qiita.prep_sample WHERE idx = $1`, gets NULL, and 404s rather than
+    leaking a downstream FK error."""
+    token, _ = admin_token
+    action_id, version = sequenced_only_prep_sample_action
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {
+                "kind": "prep_sample",
+                # Vanishingly unlikely to collide with a real row in the
+                # short-lived test DB; the route resolves this against
+                # qiita.prep_sample.idx (BIGINT) and 404s on miss.
+                "prep_sample_idx": 99_999_999,
+            },
+            "action_context": {},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 404, resp.text
+    assert "prep_sample" in resp.text.lower()
+
+
+# A real kind-mismatch test (action target_processing_kinds=['sequenced']
+# against a prep_sample with processing_kind != 'sequenced') will become
+# meaningful when a second qiita.processing_kind enum value lands. Today
+# the enum only contains 'sequenced'; every seedable prep_sample matches
+# every sequenced-only action by construction, so the negative path
+# cannot be exercised without amending the ENUM and a new subtype.
 
 
 async def test_submit_unknown_action_returns_404(wt_client, admin_token, reference_idx):

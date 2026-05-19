@@ -20,20 +20,11 @@ from qiita_common.auth_constants import Scope
 
 from qiita_control_plane.auth.token import mint_api_token
 from qiita_control_plane.testing.db_seeds import (
-    seed_biosample,
-    seed_sequenced_prep_sample,
+    seed_biosample_with_sequenced_prep_sample,
     seed_user_principal,
 )
 
 pytestmark = pytest.mark.db
-
-
-async def _seed_prep_sample(pool, *, owner_idx: int) -> tuple[int, int]:
-    """Seed a biosample + sequenced prep_sample owned by `owner_idx`;
-    return (biosample_idx, prep_sample_idx)."""
-    bs_idx = await seed_biosample(pool, owner_idx=owner_idx, created_by_idx=owner_idx)
-    ps_idx = await seed_sequenced_prep_sample(pool, biosample_idx=bs_idx, owner_idx=owner_idx)
-    return bs_idx, ps_idx
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +63,9 @@ async def ctx(
 
     suffix = secrets.token_hex(4)
     principal_idx = await seed_user_principal(postgres_pool, prefix="sr-route", suffix=suffix)
-    bs_idx, ps_idx = await _seed_prep_sample(postgres_pool, owner_idx=principal_idx)
+    bs_idx, ps_idx = await seed_biosample_with_sequenced_prep_sample(
+        postgres_pool, owner_idx=principal_idx
+    )
     created: dict[str, list[int]] = {
         "biosample": [bs_idx],
         "prep_sample": [ps_idx],
@@ -326,7 +319,9 @@ async def test_post_concurrent_mints_disjoint(ctx):
     calls through the full HTTP stack rather than proving the advisory
     lock under real parallelism (that requires the OS-thread-driven
     test reserved for the perf-suite to-do)."""
-    _bs2, ps2 = await _seed_prep_sample(ctx["pool"], owner_idx=ctx["principal_idx"])
+    _bs2, ps2 = await seed_biosample_with_sequenced_prep_sample(
+        ctx["pool"], owner_idx=ctx["principal_idx"]
+    )
     ctx["created"]["biosample"].append(_bs2)
     ctx["created"]["prep_sample"].append(ps2)
 
@@ -428,7 +423,9 @@ async def test_cascade_then_remint_yields_advanced_start(ctx):
     assert resp.status_code == 404, resp.text
 
     # Mint against a fresh prep_sample.
-    _bs2, ps2 = await _seed_prep_sample(ctx["pool"], owner_idx=ctx["principal_idx"])
+    _bs2, ps2 = await seed_biosample_with_sequenced_prep_sample(
+        ctx["pool"], owner_idx=ctx["principal_idx"]
+    )
     ctx["created"]["biosample"].append(_bs2)
     ctx["created"]["prep_sample"].append(ps2)
     second_resp = await ctx["sa"].post(

@@ -9,6 +9,7 @@ import os
 
 os.environ.setdefault("QIITA_ALLOW_TOKEN_ENV", "true")
 os.environ.setdefault("CP_TO_CO_TOKEN", "test-cp-to-co-token")
+os.environ.setdefault("CO_TO_CP_TOKEN", "test-co-to-cp-token")
 
 import pytest  # noqa: E402
 from helpers import TEST_SEQUENCES  # noqa: E402

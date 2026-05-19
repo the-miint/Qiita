@@ -8,10 +8,13 @@ where `<short_name>` is the module path with `NATIVE_MODULE_PREFIX`
 stripped (e.g. `fastq_to_parquet`). The launcher:
 
 1. Parses `--job`.
-2. Reads `params.json` from `$QIITA_INPUT_PATH`.
-3. Flattens the work-ticket scalars (`reference_idx`, `work_ticket_idx`)
-   and the per-step `inputs` map into a single raw-inputs dict and
-   calls `run_native_job(...)`.
+2. Reads `params.json` from `$QIITA_INPUT_PATH` and validates it
+   against the `JobParams` Pydantic model in `slurm/contract.py`.
+3. Flattens the work-ticket scalars (the scope_target's kind-specific
+   idx fields plus `work_ticket_idx`) and the per-step `inputs` map
+   into a single raw-inputs dict — see `jobs/__init__.py`'s
+   `SCOPE_SCALARS_BY_KIND` for the per-scope rules — and calls
+   `run_native_job(...)`.
 4. On success, walks the output map, chmods every file to 0o440,
    writes `manifest.json` to `$QIITA_OUTPUT_PATH` matching the
    verifier's contract (see `slurm/verify.py`), and exits 0.
@@ -44,37 +47,36 @@ from pathlib import Path
 from qiita_common.actions import NATIVE_MODULE_PREFIX
 from qiita_common.backend_failure import BackendFailure
 
-from ..slurm.contract import EXPECTED_FILE_MODE, MANIFEST_FILENAME
+from ..slurm.contract import (
+    EXPECTED_FILE_MODE,
+    JOB_PARAMS_FILENAME,
+    MANIFEST_FILENAME,
+    JobParams,
+)
 from . import flatten_native_inputs, run_native_job
 
 
-def _flatten_params(params: dict) -> dict:
+def _flatten_params(params: JobParams) -> dict:
     """Combine the work-ticket scalars and the step's inputs map into a
     single dict ready for `Inputs.model_validate`.
 
     Producer side of the contract is `SlurmBackend.run_step`, which
-    writes `params.json` with the shape
-        {
-          "step_name": <str>,
-          "reference_idx": <int>,
-          "work_ticket_idx": <int>,
-          "inputs": {<input_name>: <path>, ...},
-          "output_path": <str>,  # written but ignored here; env var wins
-        }
-    This reader pulls `step_name`, `reference_idx`, `work_ticket_idx`,
-    and every entry of `inputs`. Other keys in params.json are ignored.
+    constructs a `JobParams` (slurm/contract.py) and writes its
+    `model_dump_json()` to `params.json`. `output_path` rides along on
+    the model but is ignored here — the env var ($QIITA_OUTPUT_PATH)
+    wins.
 
     Delegates the merge + reserved-key check to `flatten_native_inputs`
     so the launcher and LocalBackend share one code path. A collision
-    surfaces as BackendFailure(CONTRACT_VIOLATION) — carrying the
-    YAML step name from params — which `main()` catches and renders
-    to structured stderr.
+    or unknown scope kind surfaces as BackendFailure(CONTRACT_VIOLATION)
+    — carrying the YAML step name from params — which `main()` catches
+    and renders to structured stderr.
     """
     return flatten_native_inputs(
-        params.get("inputs", {}),
-        step_name=params["step_name"],
-        reference_idx=params["reference_idx"],
-        work_ticket_idx=params["work_ticket_idx"],
+        params.inputs,
+        step_name=params.step_name,
+        scope_target=params.scope_target,
+        work_ticket_idx=params.work_ticket_idx,
     )
 
 
@@ -139,8 +141,8 @@ def main(argv: list[str] | None = None) -> int:
     output_path = Path(os.environ["QIITA_OUTPUT_PATH"])
     module_name = f"{NATIVE_MODULE_PREFIX}{args.job}"
 
-    params = json.loads((input_path / "params.json").read_text())
-    step_name = params["step_name"]
+    params = JobParams.model_validate_json((input_path / JOB_PARAMS_FILENAME).read_text())
+    step_name = params.step_name
     try:
         raw_inputs = _flatten_params(params)
         outputs = asyncio.run(

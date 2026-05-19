@@ -15,6 +15,7 @@ import httpx
 import pytest
 from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.models import StepBaselineResources, WorkTicketFailureStage
+from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
 
 from qiita_compute_orchestrator.backends.slurm import SlurmBackend
 from qiita_compute_orchestrator.slurm import SlurmrestdClient
@@ -121,7 +122,7 @@ async def test_run_step_requires_container_or_module(jwt_path, baseline, tmp_pat
             "hash",
             {},
             tmp_path,
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container=None,
             module=None,
@@ -145,10 +146,10 @@ async def test_run_step_rejects_both_container_and_module(jwt_path, baseline, tm
             "hash",
             {},
             tmp_path,
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="qiita/hash:1.0.0",
-            module="qiita_compute_orchestrator.jobs.fastq_to_parquet",
+            module=FASTQ_TO_PARQUET_MODULE,
             entrypoint=None,
             baseline_resources=baseline,
         )
@@ -165,7 +166,7 @@ async def test_run_step_requires_baseline_resources(jwt_path, tmp_path):
             "hash",
             {},
             tmp_path,
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="qiita/hash:1.0.0",
             entrypoint=None,
@@ -173,6 +174,61 @@ async def test_run_step_requires_baseline_resources(jwt_path, tmp_path):
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
     assert "baseline_resources" in ei.value.reason
+
+
+@pytest.mark.asyncio
+async def test_run_step_container_rejects_non_reference_scope(jwt_path, baseline, tmp_path):
+    """Mirror of LocalBackend's container-path scope gate (S4):
+    SlurmBackend container steps assume reference_idx is on the
+    scope_target. A prep_sample-scoped or study_prep-scoped ticket
+    dispatched to a container step would silently produce wrong
+    params.json; the gate 422s at submit time instead."""
+    handler = httpx.MockTransport(lambda req: httpx.Response(500))
+    backend = _make_backend(handler, jwt_path)
+    with pytest.raises(BackendFailure) as ei:
+        await backend.run_step(
+            "hash",
+            {},
+            tmp_path,
+            scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+            work_ticket_idx=99,
+            container="qiita/hash:1.0.0",
+            entrypoint=None,
+            baseline_resources=baseline,
+        )
+    assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
+    assert "requires a reference-scoped ticket" in ei.value.reason
+    assert "prep_sample" in ei.value.reason
+
+
+@pytest.mark.asyncio
+async def test_run_step_native_accepts_non_reference_scope(jwt_path, baseline, tmp_path):
+    """The S4 container-path gate must NOT fire for native steps —
+    they thread scope_target through flatten_native_inputs and can
+    target any scope kind. Verify by submitting a module step with a
+    prep_sample scope; the run gets past the gate and proceeds to the
+    slurmrestd submission (which we let fail downstream — we just
+    need to confirm the gate didn't catch it)."""
+    transport = httpx.MockTransport(
+        lambda req: httpx.Response(500, content=b"slurmrestd unreachable")
+    )
+    backend = _make_backend(transport, jwt_path)
+    with pytest.raises(BackendFailure) as ei:
+        await backend.run_step(
+            "fastq",
+            {},
+            tmp_path,
+            scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+            work_ticket_idx=99,
+            module="qiita_compute_orchestrator.jobs.fastq_to_parquet",
+            entrypoint=None,
+            baseline_resources=baseline,
+        )
+    # Past the container-path gate; failure here is from slurmrestd
+    # mock returning 500, NOT from a scope-kind contract violation.
+    # The kind would be a SLURMRESTD_UNREACHABLE-style failure, not
+    # CONTRACT_VIOLATION with a "reference-scoped" reason.
+    assert "requires a reference-scoped ticket" not in (ei.value.reason or "")
 
 
 # ============================================================================
@@ -192,7 +248,7 @@ async def test_run_step_completed_returns_outputs(jwt_path, baseline, tmp_path):
         "hash",
         {"fasta_path": tmp_path / "x.fa"},
         tmp_path,
-        reference_idx=42,
+        scope_target={"kind": "reference", "reference_idx": 42},
         work_ticket_idx=99,
         container="qiita/hash:1.0.0",
         entrypoint="/usr/local/bin/hash",
@@ -215,7 +271,7 @@ async def test_run_step_writes_params_json(jwt_path, baseline, tmp_path):
         "hash",
         {"fasta_path": tmp_path / "input.fa"},
         tmp_path,
-        reference_idx=42,
+        scope_target={"kind": "reference", "reference_idx": 42},
         work_ticket_idx=99,
         container="qiita/hash:1.0.0",
         entrypoint=None,
@@ -223,7 +279,7 @@ async def test_run_step_writes_params_json(jwt_path, baseline, tmp_path):
     )
     params = json.loads((tmp_path / "input" / "params.json").read_text())
     assert params["step_name"] == "hash"
-    assert params["reference_idx"] == 42
+    assert params["scope_target"] == {"kind": "reference", "reference_idx": 42}
     assert params["work_ticket_idx"] == 99
     assert params["inputs"]["fasta_path"].endswith("input.fa")
 
@@ -260,7 +316,7 @@ async def test_run_step_terminal_states_map_to_kinds(
             "hash",
             {},
             tmp_path,
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="qiita/hash:1.0.0",
             entrypoint=None,
@@ -300,9 +356,7 @@ async def test_run_step_native_failure_enriched_from_launcher_stderr(jwt_path, b
     # is in place when SlurmBackend looks for it post-poll.
     logs_dir = tmp_path / "logs"
     logs_dir.mkdir()
-    launcher_reason = (
-        "native job 'qiita_compute_orchestrator.jobs.fastq_to_parquet' not implemented: skeleton"
-    )
+    launcher_reason = f"native job {FASTQ_TO_PARQUET_MODULE!r} not implemented: skeleton"
     (logs_dir / "stderr").write_text(
         json.dumps(
             {
@@ -319,9 +373,9 @@ async def test_run_step_native_failure_enriched_from_launcher_stderr(jwt_path, b
             "fastq",  # YAML step name passed in by the runner
             {},
             tmp_path,
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
-            module="qiita_compute_orchestrator.jobs.fastq_to_parquet",
+            module=FASTQ_TO_PARQUET_MODULE,
             baseline_resources=baseline,
         )
 
@@ -358,7 +412,7 @@ async def test_run_step_falls_back_to_state_based_kind_when_no_launcher_line(
             "hash",
             {},
             tmp_path,
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="qiita/hash:1.0.0",
             entrypoint=None,
@@ -395,7 +449,7 @@ async def test_run_step_completed_but_missing_manifest_is_contract_violation(
             "hash",
             {},
             tmp_path,
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="qiita/hash:1.0.0",
             entrypoint=None,
@@ -421,7 +475,7 @@ async def test_run_step_submit_5xx_is_unreachable(jwt_path, baseline, tmp_path):
             "hash",
             {},
             tmp_path,
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="qiita/hash:1.0.0",
             entrypoint=None,
@@ -442,7 +496,7 @@ async def test_run_step_submit_4xx_is_contract_violation(jwt_path, baseline, tmp
             "hash",
             {},
             tmp_path,
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="qiita/hash:1.0.0",
             entrypoint=None,
@@ -465,7 +519,7 @@ async def test_run_step_submit_persistent_401_is_unreachable(jwt_path, baseline,
             "hash",
             {},
             tmp_path,
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="qiita/hash:1.0.0",
             entrypoint=None,
@@ -488,7 +542,7 @@ async def test_run_step_submit_transport_error_is_unreachable(jwt_path, baseline
             "hash",
             {},
             tmp_path,
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="qiita/hash:1.0.0",
             entrypoint=None,
@@ -516,7 +570,7 @@ async def test_run_step_polling_4xx_bails_permanent(jwt_path, baseline, tmp_path
             "hash",
             {},
             tmp_path,
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
             container="qiita/hash:1.0.0",
             entrypoint=None,

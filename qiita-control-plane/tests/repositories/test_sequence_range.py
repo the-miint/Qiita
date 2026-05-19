@@ -20,21 +20,11 @@ from qiita_control_plane.repositories.sequence_range import (
     mint_sequence_range,
 )
 from qiita_control_plane.testing.db_seeds import (
-    seed_biosample,
-    seed_sequenced_prep_sample,
+    seed_biosample_with_sequenced_prep_sample,
     seed_user_principal,
 )
 
 pytestmark = pytest.mark.db
-
-
-async def _seed_prep_sample(pool, *, owner_idx: int) -> tuple[int, int]:
-    """Seed a biosample + sequenced prep_sample owned by `owner_idx`;
-    return (biosample_idx, prep_sample_idx). Composer over the two
-    db_seeds helpers."""
-    bs_idx = await seed_biosample(pool, owner_idx=owner_idx, created_by_idx=owner_idx)
-    ps_idx = await seed_sequenced_prep_sample(pool, biosample_idx=bs_idx, owner_idx=owner_idx)
-    return bs_idx, ps_idx
 
 
 @pytest_asyncio.fixture
@@ -42,12 +32,14 @@ async def parent_chain(postgres_pool):
     """Seed one principal + one prep_sample for the test; FK-reverse cleanup.
 
     Tests that need a SECOND prep_sample (e.g., concurrent / disjoint
-    range tests) call `_seed_prep_sample` again with the same
-    `principal_idx` and append to `created["prep_sample"]`.
+    range tests) call `seed_biosample_with_sequenced_prep_sample` again
+    with the same `principal_idx` and append to `created["prep_sample"]`.
     """
     suffix = secrets.token_hex(4)
     principal_idx = await seed_user_principal(postgres_pool, prefix="sr-test", suffix=suffix)
-    bs_idx, ps_idx = await _seed_prep_sample(postgres_pool, owner_idx=principal_idx)
+    bs_idx, ps_idx = await seed_biosample_with_sequenced_prep_sample(
+        postgres_pool, owner_idx=principal_idx
+    )
     created: dict[str, list[int]] = {
         "biosample": [bs_idx],
         "prep_sample": [ps_idx],
@@ -124,7 +116,9 @@ async def test_mint_sequence_range_sequential_disjoint(parent_chain):
     """Two sequential mints on different prep_samples produce disjoint
     contiguous ranges with no overlap."""
     pool = parent_chain["pool"]
-    _bs2, ps2 = await _seed_prep_sample(pool, owner_idx=parent_chain["principal_idx"])
+    _bs2, ps2 = await seed_biosample_with_sequenced_prep_sample(
+        pool, owner_idx=parent_chain["principal_idx"]
+    )
     parent_chain["created"]["biosample"].append(_bs2)
     parent_chain["created"]["prep_sample"].append(ps2)
 
@@ -153,7 +147,9 @@ async def test_mint_sequence_range_concurrent_disjoint(parent_chain):
     pool = parent_chain["pool"]
     # Seed a second prep_sample so the two mints don't collide on the
     # UNIQUE (prep_sample_idx) constraint.
-    _bs2, ps2 = await _seed_prep_sample(pool, owner_idx=parent_chain["principal_idx"])
+    _bs2, ps2 = await seed_biosample_with_sequenced_prep_sample(
+        pool, owner_idx=parent_chain["principal_idx"]
+    )
     parent_chain["created"]["biosample"].append(_bs2)
     parent_chain["created"]["prep_sample"].append(ps2)
 
@@ -316,7 +312,9 @@ async def test_sequence_idx_not_reused_after_cascade_delete(parent_chain):
     )
     parent_chain["created"]["prep_sample"].remove(parent_chain["prep_sample_idx"])
 
-    _bs2, ps2 = await _seed_prep_sample(pool, owner_idx=parent_chain["principal_idx"])
+    _bs2, ps2 = await seed_biosample_with_sequenced_prep_sample(
+        pool, owner_idx=parent_chain["principal_idx"]
+    )
     parent_chain["created"]["biosample"].append(_bs2)
     parent_chain["created"]["prep_sample"].append(ps2)
     async with pool.acquire() as conn:

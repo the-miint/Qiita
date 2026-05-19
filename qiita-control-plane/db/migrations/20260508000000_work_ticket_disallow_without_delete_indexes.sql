@@ -8,7 +8,7 @@
 -- state at a time. Previously enforced only by a SELECT-then-INSERT in the
 -- route handler, which is racy under concurrent submissions.
 --
--- Two indexes — one per scope-target arm — because the partial-uniqueness
+-- Three indexes — one per scope-target arm — because the partial-uniqueness
 -- key differs by arm. The route handler still SELECT-LIMIT-1s for the
 -- happy-path 409 with a useful blocking-ticket idx in the error body; the
 -- index is the actual gate when two submissions race past that check.
@@ -21,6 +21,11 @@ CREATE UNIQUE INDEX work_ticket_one_in_flight_per_reference
 CREATE UNIQUE INDEX work_ticket_one_in_flight_per_study_prep
     ON qiita.work_ticket (action_id, action_version, study_idx, prep_idx)
     WHERE study_idx IS NOT NULL
+      AND state IN ('pending', 'queued', 'processing');
+
+CREATE UNIQUE INDEX work_ticket_one_in_flight_per_prep_sample
+    ON qiita.work_ticket (action_id, action_version, prep_sample_idx)
+    WHERE prep_sample_idx IS NOT NULL
       AND state IN ('pending', 'queued', 'processing');
 
 
@@ -42,4 +47,5 @@ COMMENT ON COLUMN qiita.work_ticket.action_context IS
 
 DROP INDEX IF EXISTS qiita.work_ticket_one_in_flight_per_reference;
 DROP INDEX IF EXISTS qiita.work_ticket_one_in_flight_per_study_prep;
+DROP INDEX IF EXISTS qiita.work_ticket_one_in_flight_per_prep_sample;
 COMMENT ON COLUMN qiita.work_ticket.action_context IS NULL;

@@ -37,7 +37,7 @@ class FakeBackendClient:
     objects keyed by the step's declared output names)."""
 
     def __init__(self) -> None:
-        self.calls: list[tuple[str, dict[str, Path], Path, int]] = []
+        self.calls: list[tuple[str, dict[str, Path], Path, dict]] = []
         self.outputs_for: dict[str, dict[str, Path]] = {}
 
     async def run_step(
@@ -46,7 +46,7 @@ class FakeBackendClient:
         step_name: str,
         inputs: dict[str, Path],
         workspace: Path,
-        reference_idx: int,
+        scope_target: dict,
         work_ticket_idx: int,
         container: str | None = None,
         module: str | None = None,
@@ -57,7 +57,7 @@ class FakeBackendClient:
         # metadata for SlurmBackend); the LocalBackend-shaped fake here
         # ignores them.
         del work_ticket_idx, container, module, entrypoint, baseline_resources
-        self.calls.append((step_name, dict(inputs), workspace, reference_idx))
+        self.calls.append((step_name, dict(inputs), workspace, scope_target))
         outputs = self.outputs_for.get(step_name, {})
         for path in outputs.values():
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -521,7 +521,7 @@ class _RetryingBackendClient:
         step_name: str,
         inputs: dict[str, Path],
         workspace: Path,
-        reference_idx: int,
+        scope_target: dict,
         work_ticket_idx: int,
         container: str | None = None,
         module: str | None = None,
@@ -531,7 +531,7 @@ class _RetryingBackendClient:
         from qiita_common.backend_failure import BackendFailure
         from qiita_common.models import WorkTicketFailureStage
 
-        del work_ticket_idx, container, module, entrypoint, baseline_resources
+        del scope_target, work_ticket_idx, container, module, entrypoint, baseline_resources
         self.attempts[step_name] = self.attempts.get(step_name, 0) + 1
         if step_name == self.fail_step and self.attempts[step_name] <= self.fail_n_times:
             raise BackendFailure(
@@ -562,7 +562,7 @@ async def test_retry_succeeds_after_transient_failure(
     # succeeds on the second. Load step has its own success output.
     class _Backend(_RetryingBackendClient):
         async def run_step(
-            self, *, step_name, inputs, workspace, reference_idx, work_ticket_idx, **kw
+            self, *, step_name, inputs, workspace, scope_target, work_ticket_idx, **kw
         ):
             self.attempts[step_name] = self.attempts.get(step_name, 0) + 1
             if step_name == "load":
@@ -577,7 +577,7 @@ async def test_retry_succeeds_after_transient_failure(
                 step_name=step_name,
                 inputs=inputs,
                 workspace=workspace,
-                reference_idx=reference_idx,
+                scope_target=scope_target,
                 work_ticket_idx=work_ticket_idx,
                 **kw,
             )
@@ -631,7 +631,7 @@ async def test_retry_uses_isolated_per_attempt_workspace(
             self.attempts: dict[str, int] = {}
 
         async def run_step(
-            self, *, step_name, inputs, workspace, reference_idx, work_ticket_idx, **_kw
+            self, *, step_name, inputs, workspace, scope_target, work_ticket_idx, **_kw
         ):
             self.workspaces.append((step_name, workspace))
             self.attempts[step_name] = self.attempts.get(step_name, 0) + 1
@@ -791,7 +791,7 @@ async def test_retry_observable_via_state_transitions(
 
     class _Backend(_RetryingBackendClient):
         async def run_step(
-            self, *, step_name, inputs, workspace, reference_idx, work_ticket_idx, **kw
+            self, *, step_name, inputs, workspace, scope_target, work_ticket_idx, **kw
         ):
             state = await postgres_pool.fetchval(
                 "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
@@ -809,7 +809,7 @@ async def test_retry_observable_via_state_transitions(
                 step_name=step_name,
                 inputs=inputs,
                 workspace=workspace,
-                reference_idx=reference_idx,
+                scope_target=scope_target,
                 work_ticket_idx=work_ticket_idx,
                 **kw,
             )

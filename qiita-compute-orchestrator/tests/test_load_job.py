@@ -113,7 +113,7 @@ async def _run_load(backend, manifest_file, fasta_path, feature_map_file, tmp_pa
         "load",
         inputs,
         output_dir,
-        reference_idx=REFERENCE_IDX,
+        scope_target={"kind": "reference", "reference_idx": REFERENCE_IDX},
         work_ticket_idx=1,
         container=REFERENCE_LOAD_CONTAINER,
     )
@@ -327,7 +327,7 @@ async def test_phylogeny_allows_unmatched_tips(
             "tree_path": tree_path,
         },
         out,
-        reference_idx=REFERENCE_IDX,
+        scope_target={"kind": "reference", "reference_idx": REFERENCE_IDX},
         work_ticket_idx=1,
         container=REFERENCE_LOAD_CONTAINER,
     )
@@ -377,7 +377,7 @@ async def test_rejects_missing_manifest(fasta_path, feature_map_file, tmp_path):
                 "feature_map": feature_map_file,
             },
             tmp_path / "out",
-            reference_idx=REFERENCE_IDX,
+            scope_target={"kind": "reference", "reference_idx": REFERENCE_IDX},
             work_ticket_idx=1,
             container=REFERENCE_LOAD_CONTAINER,
         )
@@ -409,7 +409,7 @@ async def test_rejects_unmapped_hash(manifest_file, fasta_path, tmp_path):
                 "feature_map": empty_fm,
             },
             tmp_path / "out",
-            reference_idx=REFERENCE_IDX,
+            scope_target={"kind": "reference", "reference_idx": REFERENCE_IDX},
             work_ticket_idx=1,
             container=REFERENCE_LOAD_CONTAINER,
         )

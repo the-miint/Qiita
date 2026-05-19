@@ -23,6 +23,8 @@ A `model_validator(mode="before")` rewrites that shape into a discriminated
 union keyed on `kind` for the WorkflowStep / WorkflowAction Pydantic arms.
 """
 
+from __future__ import annotations
+
 from datetime import timedelta
 from typing import Annotated, Any, Literal
 
@@ -34,7 +36,12 @@ from qiita_common.auth_constants import (
     Scope,
     SystemRole,
 )
-from qiita_common.models import ScopeTargetKind, StepType, check_exactly_one_runtime
+from qiita_common.models import (
+    ProcessingKind,
+    ScopeTargetKind,
+    StepType,
+    check_exactly_one_runtime,
+)
 
 # Native job modules must live under qiita_compute_orchestrator.jobs.
 # Defined here so every layer that checks the prefix (CP sync, CO boot
@@ -186,6 +193,16 @@ class ActionDefinition(BaseModel):
     action_id: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
     target_kind: ScopeTargetKind
+    # When target_kind = ScopeTargetKind.PREP_SAMPLE, this list declares
+    # which prep_sample processing_kind values the action accepts. The
+    # submit route reads the prep_sample's actual processing_kind and
+    # 422s on mismatch. Empty (default) = "any kind" (cross-kind admin
+    # actions). For non-prep_sample target_kinds, the validator below
+    # rejects a nonempty list — the DB CHECK
+    # `action_processing_kinds_only_for_prep_sample` enforces the same
+    # rule at sync time, but catching it on the Pydantic side surfaces
+    # a clean error before any DB round-trip.
+    target_processing_kinds: list[ProcessingKind] = Field(default_factory=list)
     description: str | None = None
 
     scopes: list[str] = Field(default_factory=list)
@@ -253,3 +270,20 @@ class ActionDefinition(BaseModel):
         if unknown:
             raise ValueError(f"unknown scope(s): {unknown}. Valid scopes: {sorted(valid)}")
         return v
+
+    @model_validator(mode="after")
+    def _target_processing_kinds_only_for_prep_sample(self) -> ActionDefinition:
+        # Mirrors the DB CHECK action_processing_kinds_only_for_prep_sample
+        # at the Pydantic boundary so a YAML mistake (declaring
+        # target_processing_kinds against a non-prep_sample target_kind)
+        # surfaces at load time, not at sync time.
+        if self.target_kind is not ScopeTargetKind.PREP_SAMPLE and self.target_processing_kinds:
+            raise ValueError(
+                "target_processing_kinds is only meaningful when "
+                f"target_kind = 'prep_sample'; got target_kind = "
+                f"{self.target_kind.value!r} with target_processing_kinds = "
+                f"{[k.value for k in self.target_processing_kinds]!r}"
+            )
+        if len(self.target_processing_kinds) != len(set(self.target_processing_kinds)):
+            raise ValueError("target_processing_kinds must not contain duplicates")
+        return self

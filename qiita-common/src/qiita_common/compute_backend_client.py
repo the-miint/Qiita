@@ -15,6 +15,7 @@ async + callback model — when that lands, this client grows a
 """
 
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -93,7 +94,7 @@ class ComputeBackendClient:
         step_name: str,
         inputs: dict[str, Path],
         workspace: Path,
-        reference_idx: int,
+        scope_target: dict[str, Any],
         work_ticket_idx: int,
         container: str | None = None,
         module: str | None = None,
@@ -103,6 +104,11 @@ class ComputeBackendClient:
         """Dispatch one step to the orchestrator. Blocks until the
         backend returns. Returns the step's named output paths.
 
+        `scope_target` is the work ticket's discriminated-union scope
+        (matching `qiita_common.models.ScopeTarget`). The orchestrator
+        threads it into the backend; the native-step dispatcher merges
+        the scope's idx scalars into the job's `Inputs` model.
+
         Callers must pass exactly one of `container` or `module` — the
         StepRunRequest validator rejects both/neither at construction
         time, so any caller misuse surfaces as a Pydantic ValidationError
@@ -111,7 +117,7 @@ class ComputeBackendClient:
             step_name=step_name,
             inputs={k: str(v) for k, v in inputs.items()},
             workspace=str(workspace),
-            reference_idx=reference_idx,
+            scope_target=scope_target,
             work_ticket_idx=work_ticket_idx,
             container=container,
             module=module,
