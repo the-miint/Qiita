@@ -3,12 +3,12 @@ qiita.sequenced_sample subtype.
 
 Direct functions cover the sequenced_sample subtype row (the read that
 joins the supertype prep_sample for projection, the subtype-only PATCH,
-and the subtype insert) plus the run-scoped bulk-id read. The composer
-ties the supertype prep_sample, this subtype, the per-study links, and
-the globally-linked metadata writes together for one sequenced sample;
-it imports the supertype and junction inserts from the sibling
-prep_sample module. Metadata-shaped tables live in the sibling
-prep_sample_metadata module.
+and the subtype insert) plus the run-scoped and study-scoped bulk-id
+reads. The composer ties the supertype prep_sample, this subtype, the
+per-study links, and the globally-linked metadata writes together for
+one sequenced sample; it imports the supertype and junction inserts
+from the sibling prep_sample module. Metadata-shaped tables live in the
+sibling prep_sample_metadata module.
 
 Write functions take an asyncpg.Connection as their first positional
 argument, never acquire their own connection, and never open their own
@@ -411,6 +411,47 @@ async def fetch_sequenced_sample_idxs_for_run(
         " ORDER BY ss.created_at DESC, ss.idx DESC"
         " LIMIT $2",
         sequencing_run_idx,
+        limit,
+    )
+    return [r["idx"] for r in rows]
+
+
+async def fetch_sequenced_sample_idxs_for_study(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    study_idx: int,
+    limit: int,
+) -> list[int]:
+    """Return up to `limit` sequenced_sample idxs linked to study_idx, newest-linked first.
+
+    Walks the prep_sample_to_study link to its supertype prep_sample and
+    down to the sequenced_sample subtype, so only prep_samples that carry
+    a sequenced_sample row surface. Excludes retired links
+    (prep_sample_to_study.retired = true) and retired prep_samples
+    (prep_sample.retired = true); the sequenced_sample subtype has no
+    own retirement surface. Sort: (prep_sample_to_study.created_at DESC,
+    sequenced_sample.idx DESC) so newest-linked rows surface first with a
+    deterministic tiebreak. Callers that need to detect truncation pass
+    `limit = cap + 1`; if the returned list has length > cap, the
+    underlying set exceeded the cap. Accepts either a pool or a
+    connection so the helper composes inside an open transaction or
+    stands alone (mirrors fetch_biosample_idxs_for_study).
+    """
+    # Single round trip; the partial index prep_sample_to_study_active_idx
+    # covers the pts.retired = false predicate and the join to prep_sample
+    # filters out separately-retired prep_samples. Joining sequenced_sample
+    # restricts the roster to prep_samples that carry a sequenced subtype.
+    rows = await pool_or_conn.fetch(
+        "SELECT ss.idx"
+        " FROM qiita.prep_sample_to_study pts"
+        " JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = pts.prep_sample_idx"
+        " JOIN qiita.prep_sample ps ON ps.idx = pts.prep_sample_idx"
+        " WHERE pts.study_idx = $1"
+        "   AND pts.retired = false"
+        "   AND ps.retired = false"
+        " ORDER BY pts.created_at DESC, ss.idx DESC"
+        " LIMIT $2",
+        study_idx,
         limit,
     )
     return [r["idx"] for r in rows]

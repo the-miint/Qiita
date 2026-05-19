@@ -1,10 +1,12 @@
 """Sequenced-sample routes.
 
-Two routers live here. The run-scoped router (prefix=/sequencing-run)
+Three routers live here. The run-scoped router (prefix=/sequencing-run)
 carries the per-item import composer (POST
 /sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample)
 and the run-scoped bulk-id read (GET
-/sequencing-run/{run_idx}/sequenced-sample/list-idxs). The
+/sequencing-run/{run_idx}/sequenced-sample/list-idxs). The study-scoped
+router (prefix=/study) carries the study-scoped bulk-id read (GET
+/study/{study_idx}/sequenced-sample/list-idxs). The
 sequenced-sample-scoped router (prefix=/sequenced-sample) carries the
 single-resource read (GET /{sequenced_sample_idx}) that surfaces the
 combined sequenced_sample + supertype prep_sample row plus its
@@ -14,11 +16,15 @@ accessions and submission tracking).
 
 Every write handler gates on caller scope (Scope.PREP_SAMPLE_WRITE) and
 role (wet_lab_admin or higher) plus require_complete_profile
-(humans-only); the read handlers gate on Scope.PREP_SAMPLE_READ +
-wet_lab_admin role unconditionally. All handlers delegate their DB work
-to the sibling repository modules. Service accounts are rejected by the
-role gate today; a wider auth-model change is required before
-submission-subsystem service accounts can satisfy require_role_at_least.
+(humans-only). The run-scoped and single-resource reads gate on
+Scope.PREP_SAMPLE_READ + wet_lab_admin role unconditionally; the
+study-scoped roster read instead gates on Scope.STUDY_READ + study
+existence + study access (viewer tier, wet_lab_admin and system_admin
+bypass tier), mirroring the biosample study-roster read. All handlers
+delegate their DB work to the sibling repository modules. Service
+accounts are rejected by the role gate today; a wider auth-model change
+is required before submission-subsystem service accounts can satisfy
+require_role_at_least.
 """
 
 from typing import Annotated
@@ -34,6 +40,7 @@ from qiita_common.models import (
     SequencedSampleCreateResponse,
     SequencedSamplePatchRequest,
     SequencedSampleResponse,
+    Tier,
 )
 
 from ..auth.guards import (
@@ -44,6 +51,8 @@ from ..auth.guards import (
     require_scope,
     require_sequenced_pool_in_run,
     require_sequencing_run_exists,
+    require_study_access,
+    require_study_exists,
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
@@ -57,6 +66,7 @@ from ..repositories._sample_helpers import (
 from ..repositories.prep_sample_metadata import fetch_global_metadata_for_prep_sample
 from ..repositories.sequenced_sample import (
     fetch_sequenced_sample_idxs_for_run,
+    fetch_sequenced_sample_idxs_for_study,
     fetch_sequenced_sample_with_prep_sample,
     import_sequenced_prep_sample,
     update_sequenced_sample,
@@ -69,6 +79,7 @@ from ._helpers import (
 )
 
 router = APIRouter(prefix="/sequencing-run", tags=["sequenced-sample"])
+study_scoped_router = APIRouter(prefix="/study", tags=["sequenced-sample"])
 sequenced_sample_router = APIRouter(prefix="/sequenced-sample", tags=["sequenced-sample"])
 
 
@@ -233,9 +244,7 @@ async def import_sequenced_sample_from_run(
     )
 
 
-# Hard cap on the run-scoped bulk-id read. Sized to cover a fully loaded
-# illumina run (thousands of pool items per lane, several lanes per run)
-# with significant headroom while bounding per-response payload size.
+# Hard cap on the bulk-id read.
 # The biosample roster cap happens to share this numeric value, but the
 # two bound conceptually distinct rosters and are sized independently;
 # they are intentionally not factored into a shared constant.
@@ -266,6 +275,48 @@ async def list_sequenced_sample_idxs_in_run(
     rows = await fetch_sequenced_sample_idxs_for_run(
         pool,
         sequencing_run_idx=sequencing_run_idx,
+        limit=_SEQUENCED_SAMPLE_IDXS_HARD_CAP + 1,
+    )
+    truncated = len(rows) > _SEQUENCED_SAMPLE_IDXS_HARD_CAP
+    if truncated:
+        rows = rows[:_SEQUENCED_SAMPLE_IDXS_HARD_CAP]
+    return IdxsListResponse(
+        idxs=rows,
+        count=len(rows),
+        truncated=truncated,
+        caller_system_role=user.system_role,
+    )
+
+
+@study_scoped_router.get("/{study_idx}/sequenced-sample/list-idxs")
+async def list_sequenced_sample_idxs_in_study(
+    study_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.STUDY_READ)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.VIEWER, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
+) -> IdxsListResponse:
+    """List sequenced_sample idxs linked to the path's study, newest-linked first.
+
+    Caller must be a HumanUser with Scope.STUDY_READ; access to the
+    path's study_idx requires viewer tier or higher (wet_lab_admin and
+    system_admin bypass tier). require_study_exists composes alongside
+    require_study_access so admin-bypass callers still get 404 on a
+    non-existent study_idx rather than a silent empty list. Walks
+    prep_sample_to_study -> prep_sample -> sequenced_sample and excludes
+    retired prep_sample_to_study links and retired prep_samples
+    unconditionally; the sequenced_sample subtype has no own retirement
+    surface. The `truncated` flag indicates the underlying set exceeded
+    the hard cap; callers hitting it should narrow their scope.
+    """
+    # Fetch cap+1 rows so a count strictly greater than the cap signals
+    # truncation; the route slices back to the cap before returning.
+    rows = await fetch_sequenced_sample_idxs_for_study(
+        pool,
+        study_idx=study_idx,
         limit=_SEQUENCED_SAMPLE_IDXS_HARD_CAP + 1,
     )
     truncated = len(rows) > _SEQUENCED_SAMPLE_IDXS_HARD_CAP

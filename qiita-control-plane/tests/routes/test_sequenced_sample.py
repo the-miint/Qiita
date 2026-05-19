@@ -27,6 +27,7 @@ from qiita_control_plane.testing.db_seeds import (
 from .conftest import (
     OWNER_INELIGIBILITY_KINDS,
     IneligibilityKind,
+    _grant_study_access,
     assert_owner_ineligibility_422,
     delete_idxs,
     resolve_ineligible_owner_idx,
@@ -62,6 +63,7 @@ async def _cleanup_tracked(pool, created: dict) -> None:
       sequencing_run
       biosample_to_study (composite PK)
       biosample
+      study_access (composite of study_idx + principal_idx)
       study
       principals
 
@@ -94,6 +96,12 @@ async def _cleanup_tracked(pool, created: dict) -> None:
             st,
         )
     await delete_idxs(pool, "biosample", created["biosample"])
+    for st, pr in created["study_access"]:
+        await pool.execute(
+            "DELETE FROM qiita.study_access WHERE study_idx = $1 AND principal_idx = $2",
+            st,
+            pr,
+        )
     await delete_idxs(pool, "study", created["study"])
     all_principals = created["user_principals"] + created["service_account_principals"]
     if all_principals:
@@ -133,6 +141,7 @@ async def ctx(role_keyed_clients):
         "sequencing_run": [],
         "biosample_to_study": [],
         "biosample": [],
+        "study_access": [],
         "study": [],
         "user_principals": [],
         "service_account_principals": [],
@@ -1190,6 +1199,278 @@ async def test_list_sequenced_sample_idxs_nonexistent_run_404(ctx):
     )
     assert resp.status_code == 404
     assert "sequencing_run" in resp.json()["detail"]
+
+
+# ===========================================================================
+# GET /api/v1/study/{study_idx}/sequenced-sample/list-idxs
+# ===========================================================================
+#
+# Study-scoped roster read. Auth mirrors the biosample study-roster read:
+# Scope.STUDY_READ + require_study_exists + require_study_access(viewer,
+# wet_lab_admin bypass). Tests cover the owner / viewer happy paths, the
+# missing-scope and no-access 403s, the anonymous 401, and the row-level
+# filters (retired prep_sample_to_study link / retired prep_sample
+# excluded).
+
+
+async def _seed_sequenced_sample_linked_to_study(ctx, *, study_idx: int, suffix: str) -> dict:
+    """Land one sequenced_sample whose supertype prep_sample is linked to
+    `study_idx`. The study is created and owned by the calling test; this
+    helper only seeds the run / pool / biosample the composer requires and
+    POSTs the composite as the wet_lab_admin client (the composer route
+    gates on require_role_at_least(WET_LAB_ADMIN)). Returns the composer's
+    JSON (prep_sample_idx + sequenced_sample_idx).
+    """
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, suffix)
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], study_idx=study_idx
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        sequenced_pool_item_id=_unique_item_id(suffix.upper()),
+        primary_study_idx=study_idx,
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+async def _retire_prep_sample_to_study_link(
+    pool, *, prep_sample_idx: int, study_idx: int, retired_by_idx: int
+) -> None:
+    """Retire one prep_sample_to_study link via direct SQL; mirrors the
+    retire_biosample_to_study_link seed helper. No dedicated seed helper
+    exists yet because link retirement is otherwise driven by routes that
+    have not landed.
+    """
+    # Populate all three NOT-NULL retirement audit columns alongside the
+    # flag flip so the prep_sample_to_study_retirement_consistent CHECK
+    # passes; retire_reason is left NULL (the CHECK allows it).
+    await pool.execute(
+        "UPDATE qiita.prep_sample_to_study"
+        " SET retired = true, retired_at = now(), retired_by_idx = $3"
+        " WHERE prep_sample_idx = $1 AND study_idx = $2",
+        prep_sample_idx,
+        study_idx,
+        retired_by_idx,
+    )
+
+
+async def test_list_sequenced_sample_idxs_in_study_owner_returns_payload(ctx):
+    # Study owner bypasses the tier comparison; two linked sequenced_samples
+    # surface newest-linked first with the regular-user system_role.
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="study-owner"
+    )
+    ss_ids = []
+    for n in range(2):
+        seeded = await _seed_sequenced_sample_linked_to_study(
+            ctx, study_idx=study_idx, suffix=f"sown-{n}"
+        )
+        ss_ids.append(seeded["sequenced_sample_idx"])
+
+    resp = await ctx["user"].get(f"/api/v1/study/{study_idx}/sequenced-sample/list-idxs")
+    assert resp.status_code == 200, resp.text
+    expected = {
+        "idxs": list(reversed(ss_ids)),
+        "count": 2,
+        "truncated": False,
+        "caller_system_role": "user",
+    }
+    assert resp.json() == expected
+
+
+async def test_list_sequenced_sample_idxs_in_study_viewer_access_returns_payload(ctx):
+    # Regular user with an explicit viewer-tier study_access row passes the
+    # tier check (viewer >= viewer); the empty study returns the zero-row
+    # envelope.
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["admin_session"]["principal_idx"], suffix="study-viewer"
+    )
+    await _grant_study_access(
+        ctx,
+        study_idx=study_idx,
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier="viewer",
+        granted_by_idx=ctx["admin_session"]["principal_idx"],
+    )
+
+    resp = await ctx["user"].get(f"/api/v1/study/{study_idx}/sequenced-sample/list-idxs")
+    assert resp.status_code == 200, resp.text
+    expected = {
+        "idxs": [],
+        "count": 0,
+        "truncated": False,
+        "caller_system_role": "user",
+    }
+    assert resp.json() == expected
+
+
+async def test_list_sequenced_sample_idxs_in_study_excludes_retired_link_and_retired_prep_sample(
+    ctx,
+):
+    # Three linked sequenced_samples: one active, one with the
+    # prep_sample_to_study link retired, one with the supertype prep_sample
+    # retired entity-wide. Only the active row surfaces.
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="study-retired"
+    )
+    owner_idx = ctx["user_session"]["principal_idx"]
+    active = await _seed_sequenced_sample_linked_to_study(
+        ctx, study_idx=study_idx, suffix="ret-act"
+    )
+    retired_link = await _seed_sequenced_sample_linked_to_study(
+        ctx, study_idx=study_idx, suffix="ret-link"
+    )
+    retired_prep = await _seed_sequenced_sample_linked_to_study(
+        ctx, study_idx=study_idx, suffix="ret-prep"
+    )
+    await _retire_prep_sample_to_study_link(
+        ctx["pool"],
+        prep_sample_idx=retired_link["prep_sample_idx"],
+        study_idx=study_idx,
+        retired_by_idx=owner_idx,
+    )
+    await _retire_prep_sample(
+        ctx["pool"],
+        prep_sample_idx=retired_prep["prep_sample_idx"],
+        retired_by_idx=owner_idx,
+    )
+
+    resp = await ctx["user"].get(f"/api/v1/study/{study_idx}/sequenced-sample/list-idxs")
+    assert resp.status_code == 200, resp.text
+    expected = {
+        "idxs": [active["sequenced_sample_idx"]],
+        "count": 1,
+        "truncated": False,
+        "caller_system_role": "user",
+    }
+    assert resp.json() == expected
+
+
+async def test_list_sequenced_sample_idxs_in_study_anonymous_401(ctx):
+    # No Authorization header → require_human chain raises 401.
+    app.state.pool = ctx["pool"]
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="study-anon"
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
+        resp = await anon.get(f"/api/v1/study/{study_idx}/sequenced-sample/list-idxs")
+    assert resp.status_code == 401
+
+
+async def test_list_sequenced_sample_idxs_in_study_missing_scope_403(ctx, no_study_read_client):
+    # A regular_user PAT that omits Scope.STUDY_READ is rejected by
+    # require_scope before the access-tier check runs.
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="study-noscope"
+    )
+    resp = await no_study_read_client.get(f"/api/v1/study/{study_idx}/sequenced-sample/list-idxs")
+    assert resp.status_code == 403
+    assert "study:read" in resp.json()["detail"]
+
+
+async def test_list_sequenced_sample_idxs_in_study_no_access_403(ctx):
+    # Regular user is neither owner nor study_access row holder; effective
+    # tier is public-by-absence, below the route's viewer minimum → 403.
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["admin_session"]["principal_idx"], suffix="study-noaccess"
+    )
+    resp = await ctx["user"].get(f"/api/v1/study/{study_idx}/sequenced-sample/list-idxs")
+    assert resp.status_code == 403
+
+
+async def test_list_sequenced_sample_idxs_in_study_nonexistent_study_regular_user_404(ctx):
+    # require_study_exists fires before require_study_access for a regular
+    # user, so a study_idx past the highest existing study returns 404.
+    max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
+    resp = await ctx["user"].get(f"/api/v1/study/{max_idx + 100_000}/sequenced-sample/list-idxs")
+    assert resp.status_code == 404
+
+
+async def test_list_sequenced_sample_idxs_in_study_nonexistent_study_admin_404(ctx):
+    # Even with the wet_lab_admin/system_admin role bypass on
+    # require_study_access, require_study_exists still surfaces 404 — the
+    # route composes both so admin-bypass callers do not silently get an
+    # empty list for a non-existent study.
+    max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
+    resp = await ctx["admin"].get(f"/api/v1/study/{max_idx + 100_000}/sequenced-sample/list-idxs")
+    assert resp.status_code == 404
+
+
+async def test_list_sequenced_sample_idxs_in_study_wet_lab_admin_bypasses_access(ctx):
+    # The wet_lab_admin role bypasses require_study_access without a
+    # study_access row on a study it does not own; caller_system_role
+    # reflects the caller's actual role.
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["admin_session"]["principal_idx"], suffix="study-wet-bypass"
+    )
+    seeded = await _seed_sequenced_sample_linked_to_study(ctx, study_idx=study_idx, suffix="wetbyp")
+
+    resp = await ctx["wet"].get(f"/api/v1/study/{study_idx}/sequenced-sample/list-idxs")
+    assert resp.status_code == 200, resp.text
+    expected = {
+        "idxs": [seeded["sequenced_sample_idx"]],
+        "count": 1,
+        "truncated": False,
+        "caller_system_role": "wet_lab_admin",
+    }
+    assert resp.json() == expected
+
+
+async def test_list_sequenced_sample_idxs_in_study_system_admin_bypasses_access(ctx):
+    # The system_admin role also bypasses require_study_access; the empty
+    # study returns the zero-row envelope with the actual role.
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="study-adm-bypass"
+    )
+
+    resp = await ctx["admin"].get(f"/api/v1/study/{study_idx}/sequenced-sample/list-idxs")
+    assert resp.status_code == 200, resp.text
+    expected = {
+        "idxs": [],
+        "count": 0,
+        "truncated": False,
+        "caller_system_role": "system_admin",
+    }
+    assert resp.json() == expected
+
+
+async def test_list_sequenced_sample_idxs_in_study_truncated(ctx, monkeypatch):
+    # Drop the hard cap to 1 so two linked sequenced_samples force the
+    # truncation branch: the route fetches cap+1, flags truncated, then
+    # slices back to the cap. The route reads the cap as a module global
+    # at call time, so monkeypatching the attribute takes effect.
+    monkeypatch.setattr(
+        "qiita_control_plane.routes.sequenced_sample._SEQUENCED_SAMPLE_IDXS_HARD_CAP",
+        1,
+    )
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="study-trunc"
+    )
+    ss_ids = []
+    for n in range(2):
+        seeded = await _seed_sequenced_sample_linked_to_study(
+            ctx, study_idx=study_idx, suffix=f"trunc-{n}"
+        )
+        ss_ids.append(seeded["sequenced_sample_idx"])
+
+    resp = await ctx["user"].get(f"/api/v1/study/{study_idx}/sequenced-sample/list-idxs")
+    assert resp.status_code == 200, resp.text
+    # cap=1 keeps only the newest-linked (second-seeded) row after the slice.
+    expected = {
+        "idxs": [ss_ids[1]],
+        "count": 1,
+        "truncated": True,
+        "caller_system_role": "user",
+    }
+    assert resp.json() == expected
 
 
 # ===========================================================================

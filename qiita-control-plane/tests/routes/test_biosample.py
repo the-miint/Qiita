@@ -30,6 +30,7 @@ from qiita_control_plane.testing.db_seeds import (
 from .conftest import (
     OWNER_INELIGIBILITY_KINDS,
     IneligibilityKind,
+    _grant_study_access,
     assert_owner_ineligibility_422,
     delete_idxs,
     resolve_ineligible_owner_idx,
@@ -921,13 +922,6 @@ async def test_post_biosample_metadata_uses_seeded_globals(ctx):
 # link / retired biosample excluded).
 
 
-@pytest_asyncio.fixture
-async def no_study_read_client(make_pat_client):
-    """A regular_user PAT with a scope set that EXCLUDES Scope.STUDY_READ —
-    drives the require_scope guard's missing-scope 403 on the list-idxs route."""
-    return await make_pat_client(label="bs-list-no-read", scopes=[Scope.SELF_PROFILE])
-
-
 async def _seed_link_to_study(ctx, *, study_idx, owner_idx):
     """Seed a biosample owned by `owner_idx`, link it to `study_idx`, and
     track both rows in `ctx['created']` for FK-reverse cleanup. Wraps the
@@ -942,19 +936,6 @@ async def _seed_link_to_study(ctx, *, study_idx, owner_idx):
     )
     ctx["created"]["biosample_to_study"].append((bs_idx, study_idx))
     return bs_idx
-
-
-async def _grant_study_access(ctx, *, study_idx, principal_idx, tier, granted_by_idx):
-    """Insert a study_access row at the named tier; track for cleanup."""
-    await ctx["pool"].execute(
-        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier, granted_by_idx)"
-        " VALUES ($1, $2, $3::qiita.tier, $4)",
-        study_idx,
-        principal_idx,
-        tier,
-        granted_by_idx,
-    )
-    ctx["created"]["study_access"].append((study_idx, principal_idx))
 
 
 async def test_list_biosample_idxs_anonymous_401(ctx):

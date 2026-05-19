@@ -163,6 +163,41 @@ def unique_instrument_id(prefix: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Shared study-access fixtures and helpers
+# ---------------------------------------------------------------------------
+# The study-scoped roster reads (biosample and sequenced-sample list-idxs)
+# share the same require_scope(STUDY_READ) gate and the same study_access
+# seeding, so the missing-scope client and the grant helper live here
+# instead of being redefined per file.
+
+
+@pytest_asyncio.fixture
+async def no_study_read_client(make_pat_client):
+    """A regular_user PAT with a scope set that EXCLUDES Scope.STUDY_READ so
+    the require_scope guard's missing-scope 403 surfaces on the study-scoped
+    list-idxs routes."""
+    return await make_pat_client(label="no-study-read", scopes=[Scope.SELF_PROFILE])
+
+
+async def _grant_study_access(ctx, *, study_idx, principal_idx, tier, granted_by_idx):
+    """Insert a study_access row at the named tier; track for cleanup.
+
+    Appends (study_idx, principal_idx) to ctx['created']['study_access'];
+    the consuming file's _cleanup_tracked deletes those rows before its
+    own study delete.
+    """
+    await ctx["pool"].execute(
+        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier, granted_by_idx)"
+        " VALUES ($1, $2, $3::qiita.tier, $4)",
+        study_idx,
+        principal_idx,
+        tier,
+        granted_by_idx,
+    )
+    ctx["created"]["study_access"].append((study_idx, principal_idx))
+
+
+# ---------------------------------------------------------------------------
 # Generic FK-reverse delete helper
 # ---------------------------------------------------------------------------
 

@@ -147,8 +147,12 @@ COMMENT ON COLUMN qiita.prep_sample_to_study.retired IS
 
 CREATE INDEX prep_sample_to_study_study_idx
     ON qiita.prep_sample_to_study (study_idx);
+-- study_idx-leading (mirrors biosample_to_study_active_idx): serves the
+-- study-scoped active-link roster read with retired rows pruned at the
+-- index rather than filtered post-scan. Do not reorder to lead with
+-- prep_sample_idx -- that re-introduces the asymmetry this index closes.
 CREATE INDEX prep_sample_to_study_active_idx
-    ON qiita.prep_sample_to_study (prep_sample_idx, study_idx)
+    ON qiita.prep_sample_to_study (study_idx, prep_sample_idx)
     WHERE retired = false;
 
 
