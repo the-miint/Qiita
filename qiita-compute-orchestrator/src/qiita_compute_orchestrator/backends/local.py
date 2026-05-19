@@ -182,13 +182,17 @@ class LocalBackend(ComputeBackend):
             # miint's "Empty file" exception. See miint.is_empty_sequence_file
             # for the rationale; this rewire closes #39 from this site.
             if is_empty_sequence_file(fasta_path):
-                conn.execute(
-                    "CREATE TEMP TABLE raw_seqs (read_id VARCHAR, hash VARCHAR, len BIGINT)"
-                )
+                conn.execute("CREATE TEMP TABLE raw_seqs (read_id VARCHAR, hash UUID, len BIGINT)")
             else:
+                # `md5(sequence1)::uuid` keeps the hash as UUID
+                # (int128 internally) end-to-end instead of carrying a
+                # 32-char VARCHAR through the temp table and casting at
+                # write time. Smaller in memory, faster to compare/JOIN,
+                # and matches the wire-side `sequence_hash` UUID column
+                # downstream consumers expect (see manifest schema below).
                 conn.execute(
                     "CREATE TEMP TABLE raw_seqs AS "
-                    "SELECT read_id, md5(sequence1) AS hash, length(sequence1) AS len "
+                    "SELECT read_id, md5(sequence1)::uuid AS hash, length(sequence1) AS len "
                     "FROM read_fastx(?)",
                     [str(fasta_path)],
                 )
@@ -202,16 +206,16 @@ class LocalBackend(ComputeBackend):
                 raise ValueError(f"FASTA contains duplicate read_id(s): {dup_ids}")
 
             # Write manifest as Parquet — columns (read_id, sequence_hash, length).
-            # The hash column is converted to UUID on the way out so downstream
-            # consumers (mint-features, load step) read it as UUID natively.
-            # Sorted by sequence_hash because every downstream consumer keys
-            # off it: mint-features dedups on it; the load step JOINs on it.
-            # reference_idx isn't embedded in the file; the caller's
+            # `hash` is already UUID by construction (md5(...)::uuid above),
+            # so no cast at write time. Sorted by sequence_hash because
+            # every downstream consumer keys off it: mint-features dedups
+            # on it; the load step JOINs on it. reference_idx isn't
+            # embedded in the file; the caller's
             # work_ticket.scope_target.reference_idx is the source of truth.
             conn.execute(
                 "COPY ("
                 "  SELECT read_id,"
-                "    CAST(hash AS UUID) AS sequence_hash,"
+                "    hash AS sequence_hash,"
                 "    len AS length"
                 "  FROM raw_seqs"
                 "  ORDER BY sequence_hash"
