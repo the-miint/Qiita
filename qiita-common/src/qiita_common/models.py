@@ -424,9 +424,6 @@ class BiosamplePatchRequest(PatchRequestModel):
 class IdxsListResponse(BaseModel):
     """Returned by every bulk-id GET that emits a hard-capped list of idxs.
 
-    Used today by GET /api/v1/study/{study_idx}/biosample/list-idxs and
-    GET /api/v1/sequencing-run/{sequencing_run_idx}/sequenced-sample/list-idxs;
-    every list-idxs endpoint that follows shares the same envelope.
     `truncated` is true when the underlying set exceeded the route's cap;
     clients seeing it should narrow their scope. `caller_system_role`
     carries the caller's principal.system_role verbatim from the database.

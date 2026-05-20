@@ -24,6 +24,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     LocalWriteOnGloballyLinkedFieldError,
     MetadataParseError,
     MetadataUnknownFieldsError,
+    insert_entity_to_study,
 )
 from qiita_control_plane.repositories.biosample import (
     BiosampleImportResult,
@@ -32,10 +33,10 @@ from qiita_control_plane.repositories.biosample import (
     fetch_caller_has_biosample_access,
     import_biosample_from_owner_biosample_id,
     insert_biosample,
-    insert_biosample_to_study,
     update_biosample,
 )
 from qiita_control_plane.repositories.biosample_metadata import (
+    BIOSAMPLE_METADATA_SPEC,
     BiosampleOwnerIdFieldCollisionError,
 )
 from qiita_control_plane.testing.db_seeds import (
@@ -123,77 +124,6 @@ async def test_insert_biosample_full_columns(ctx):
         "ena_sample_accession": ena_acc,
     }
     assert dict(row) == expected
-
-
-# ---------------------------------------------------------------------------
-# insert_biosample_to_study
-# ---------------------------------------------------------------------------
-
-
-async def test_insert_biosample_to_study_links_biosample(ctx):
-    # Seed a biosample directly so the test owns a known idx.
-    async with ctx["pool"].acquire() as conn:
-        bs_idx = await insert_biosample(
-            conn,
-            owner_idx=ctx["principal_idx"],
-            created_by_idx=ctx["principal_idx"],
-        )
-    ctx["created"]["biosample"].append(bs_idx)
-
-    # Link the biosample to the seeded study.
-    async with ctx["pool"].acquire() as conn:
-        await insert_biosample_to_study(
-            conn,
-            biosample_idx=bs_idx,
-            study_idx=ctx["study_idx"],
-            created_by_idx=ctx["principal_idx"],
-        )
-    ctx["created"]["biosample_to_study"].append((bs_idx, ctx["study_idx"]))
-
-    # Verify the link row matches the expected non-retired shape.
-    row = await ctx["pool"].fetchrow(
-        "SELECT biosample_idx, study_idx, created_by_idx, retired"
-        " FROM qiita.biosample_to_study WHERE biosample_idx = $1 AND study_idx = $2",
-        bs_idx,
-        ctx["study_idx"],
-    )
-    expected = {
-        "biosample_idx": bs_idx,
-        "study_idx": ctx["study_idx"],
-        "created_by_idx": ctx["principal_idx"],
-        "retired": False,
-    }
-    assert dict(row) == expected
-
-
-async def test_insert_biosample_to_study_rejects_duplicate(ctx):
-    async with ctx["pool"].acquire() as conn:
-        bs_idx = await insert_biosample(
-            conn,
-            owner_idx=ctx["principal_idx"],
-            created_by_idx=ctx["principal_idx"],
-        )
-    ctx["created"]["biosample"].append(bs_idx)
-
-    # First link succeeds.
-    async with ctx["pool"].acquire() as conn:
-        await insert_biosample_to_study(
-            conn,
-            biosample_idx=bs_idx,
-            study_idx=ctx["study_idx"],
-            created_by_idx=ctx["principal_idx"],
-        )
-    ctx["created"]["biosample_to_study"].append((bs_idx, ctx["study_idx"]))
-
-    # Second insert of the same (biosample, study) pair must raise on the PK.
-    async with ctx["pool"].acquire() as conn:
-        with pytest.raises(asyncpg.UniqueViolationError):
-            await insert_biosample_to_study(
-                conn,
-                biosample_idx=bs_idx,
-                study_idx=ctx["study_idx"],
-                created_by_idx=ctx["principal_idx"],
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -882,9 +812,10 @@ async def test_fetch_biosample_idxs_for_study_orders_newest_link_first(ctx):
                 owner_idx=ctx["principal_idx"],
                 created_by_idx=ctx["principal_idx"],
             )
-            await insert_biosample_to_study(
+            await insert_entity_to_study(
                 conn,
-                biosample_idx=bs_idx,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                entity_idx=bs_idx,
                 study_idx=ctx["study_idx"],
                 created_by_idx=ctx["principal_idx"],
             )

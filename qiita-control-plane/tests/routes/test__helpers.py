@@ -31,7 +31,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     DuplicateValueSameStudyError,
     SampleEntityKind,
     SlotOccupiedByMissingReasonError,
-    TransientMetadataWriteRaceError,
+    TransientWriteRaceError,
 )
 from qiita_control_plane.routes._helpers import (
     detail_for_global_field_collision,
@@ -271,9 +271,8 @@ def test_raise_for_transient_write_race():
     actually in conflict) and not 500. Slot-kind-agnostic: the helper
     surfaces whatever slot_summary the diagnostic read supplied.
     """
-    exc = TransientMetadataWriteRaceError(
-        entity_kind=SampleEntityKind.BIOSAMPLE,
-        entity_idx=42,
+    exc = TransientWriteRaceError(
+        row_label="biosample_metadata",
         slot_summary="biosample_idx=42, global_field_idx=7",
     )
     with pytest.raises(HTTPException) as excinfo:
@@ -283,7 +282,7 @@ def test_raise_for_transient_write_race():
     assert (raised.status_code, raised.detail, raised.headers) == (
         503,
         (
-            "a concurrent delete raced your metadata write"
+            "a concurrent delete raced your biosample_metadata write"
             " (biosample_idx=42, global_field_idx=7); the slot is now"
             " free — resubmit the identical request"
         ),

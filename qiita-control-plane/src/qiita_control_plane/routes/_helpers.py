@@ -18,7 +18,7 @@ from ..repositories._sample_helpers import (
     DuplicateValueSameStudyError,
     GlobalFieldSlotOccupiedError,
     SlotOccupiedByMissingReasonError,
-    TransientMetadataWriteRaceError,
+    TransientWriteRaceError,
 )
 
 # Shared 422-detail string for a foreign-key violation whose constraint
@@ -125,8 +125,8 @@ async def detail_for_global_field_collision(
 _TRANSIENT_WRITE_RACE_RETRY_AFTER = "1"
 
 
-def raise_for_transient_write_race(exc: TransientMetadataWriteRaceError) -> None:
-    """Translate a lost metadata-write race into a 503 retry response.
+def raise_for_transient_write_race(exc: TransientWriteRaceError) -> None:
+    """Translate a lost write race into a 503 retry response.
 
     Both metadata-writing routes call this so the status, wording, and
     Retry-After hint stay identical across endpoints. The occupant that
@@ -140,7 +140,7 @@ def raise_for_transient_write_race(exc: TransientMetadataWriteRaceError) -> None
     raise HTTPException(
         status_code=503,
         detail=(
-            f"a concurrent delete raced your metadata write"
+            f"a concurrent delete raced your {exc.row_label} write"
             f" ({exc.slot_summary}); the slot is now free —"
             f" resubmit the identical request"
         ),

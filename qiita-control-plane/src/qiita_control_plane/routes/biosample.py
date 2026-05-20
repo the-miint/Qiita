@@ -51,7 +51,8 @@ from ..repositories._sample_helpers import (
     MetadataParseError,
     MetadataUnknownFieldsError,
     StudyFieldConflictError,
-    TransientMetadataWriteRaceError,
+    TransientWriteRaceError,
+    fetch_global_metadata,
 )
 from ..repositories.biosample import (
     fetch_biosample,
@@ -61,10 +62,11 @@ from ..repositories.biosample import (
     update_biosample,
 )
 from ..repositories.biosample_metadata import (
+    BIOSAMPLE_METADATA_SPEC,
     BiosampleOwnerIdFieldCollisionError,
-    fetch_global_metadata_for_biosample,
 )
 from ._helpers import (
+    GENERIC_FK_VIOLATION,
     detail_for_global_field_collision,
     etag_for_updated_at,
     raise_for_transient_write_race,
@@ -90,7 +92,6 @@ _FK_VIOLATION_MESSAGES: dict[str, str] = {
     ),
 }
 _GENERIC_UNIQUE_VIOLATION = "conflicts with an existing biosample"
-_GENERIC_FK_VIOLATION = "references a row that does not exist"
 
 
 @router.post("/{study_idx}/biosample", status_code=201)
@@ -184,7 +185,7 @@ async def import_biosample(
             # subclass even though no current route flow triggers them.
             detail = await detail_for_global_field_collision(conn, exc)
             raise HTTPException(status_code=409, detail=detail)
-        except TransientMetadataWriteRaceError as exc:
+        except TransientWriteRaceError as exc:
             # The diagnostic read found the colliding occupant already
             # gone — a concurrent delete won the race and the slot is
             # free again. Independent of the asyncpg catches; maps to a
@@ -208,7 +209,7 @@ async def import_biosample(
             detail = _UNIQUE_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_UNIQUE_VIOLATION)
             raise HTTPException(status_code=409, detail=detail)
         except asyncpg.ForeignKeyViolationError as exc:
-            detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_FK_VIOLATION)
+            detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, GENERIC_FK_VIOLATION)
             raise HTTPException(status_code=422, detail=detail)
 
     return BiosampleImportResponse(
@@ -364,7 +365,9 @@ async def get_biosample(
     # Pull the globally-linked metadata once access has been resolved; the
     # repo function handles the global_field_idx IS NOT NULL filter and the
     # data_type-driven value column dispatch.
-    metadata_rows = await fetch_global_metadata_for_biosample(pool, biosample_idx)
+    metadata_rows = await fetch_global_metadata(
+        pool, spec=BIOSAMPLE_METADATA_SPEC, entity_idx=biosample_idx
+    )
     global_metadata = {
         internal_name: GlobalMetadataEntry(
             display_name=entry.display_name,
@@ -490,12 +493,14 @@ async def patch_biosample(
 
             # Re-read global metadata in the same transaction so the response
             # and the UPDATE see one consistent snapshot.
-            metadata_rows = await fetch_global_metadata_for_biosample(conn, biosample_idx)
+            metadata_rows = await fetch_global_metadata(
+                conn, spec=BIOSAMPLE_METADATA_SPEC, entity_idx=biosample_idx
+            )
         except asyncpg.UniqueViolationError as exc:
             detail = _UNIQUE_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_UNIQUE_VIOLATION)
             raise HTTPException(status_code=409, detail=detail)
         except asyncpg.ForeignKeyViolationError as exc:
-            detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_FK_VIOLATION)
+            detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, GENERIC_FK_VIOLATION)
             raise HTTPException(status_code=422, detail=detail)
         except asyncpg.RaiseError as exc:
             # Role-typed FK trigger on biosample.owner_idx: candidate is

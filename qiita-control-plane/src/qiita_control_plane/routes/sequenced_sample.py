@@ -61,9 +61,10 @@ from ..repositories._sample_helpers import (
     MetadataParseError,
     MetadataUnknownFieldsError,
     StudyFieldConflictError,
-    TransientMetadataWriteRaceError,
+    TransientWriteRaceError,
+    fetch_global_metadata,
 )
-from ..repositories.prep_sample_metadata import fetch_global_metadata_for_prep_sample
+from ..repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from ..repositories.sequenced_sample import (
     fetch_sequenced_sample_idxs_for_run,
     fetch_sequenced_sample_idxs_for_study,
@@ -210,7 +211,7 @@ async def import_sequenced_sample_from_run(
             # subclass even though no current route flow triggers them.
             detail = await detail_for_global_field_collision(conn, exc)
             raise HTTPException(status_code=409, detail=detail)
-        except TransientMetadataWriteRaceError as exc:
+        except TransientWriteRaceError as exc:
             # The diagnostic read found the colliding occupant already
             # gone — a concurrent delete won the race and the slot is
             # free again. Independent of the asyncpg catches; maps to a
@@ -417,7 +418,9 @@ async def get_sequenced_sample(
     # Pull globally-linked metadata for the supertype prep_sample; the
     # repo function handles the global_field_idx IS NOT NULL filter and
     # the data_type-driven value-column dispatch.
-    metadata_rows = await fetch_global_metadata_for_prep_sample(pool, row["prep_sample_idx"])
+    metadata_rows = await fetch_global_metadata(
+        pool, spec=PREP_SAMPLE_METADATA_SPEC, entity_idx=row["prep_sample_idx"]
+    )
     global_metadata = {
         internal_name: GlobalMetadataEntry(
             display_name=entry.display_name,
@@ -544,8 +547,8 @@ async def patch_sequenced_sample(
 
             # Re-read global metadata in the same transaction so the
             # response and the UPDATE see one consistent snapshot.
-            metadata_rows = await fetch_global_metadata_for_prep_sample(
-                conn, updated_row["prep_sample_idx"]
+            metadata_rows = await fetch_global_metadata(
+                conn, spec=PREP_SAMPLE_METADATA_SPEC, entity_idx=updated_row["prep_sample_idx"]
             )
         except asyncpg.UniqueViolationError as exc:
             detail = _SEQUENCED_SAMPLE_PATCH_UNIQUE_MESSAGES.get(

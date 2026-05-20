@@ -9,7 +9,7 @@ modules (biosample_metadata, prep_sample_metadata) and pull the shapes
 they need transitively.
 """
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -117,6 +117,7 @@ class StudyFieldConflictError(Exception):
         expected_global_field_idx: int,
         found_global_field_idx: int | None,
     ) -> None:
+        self.entity_kind = entity_kind
         self.study_idx = study_idx
         self.display_name = display_name
         self.expected_global_field_idx = expected_global_field_idx
@@ -152,36 +153,35 @@ class MetadataParseError(Exception):
         )
 
 
-class TransientMetadataWriteRaceError(Exception):
-    """Raised by the diagnostic slot-occupant reads when the row that just
-    caused a unique-violation has vanished before it could be inspected.
+class TransientWriteRaceError(Exception):
+    """Raised when an INSERT-then-diagnostic-SELECT pair lost the row it
+    expected to inspect: a concurrent transaction deleted-and-committed
+    the colliding row in the window between the unique-violation signal
+    and the follow-up SELECT.
 
-    The INSERT's index probe saw a committed occupant, but a concurrent
-    transaction deleted-and-committed that row in the window between the
-    savepoint rollback and the diagnostic SELECT. The slot is therefore
-    free again: this is a benign lost race, not schema corruption, and
-    the right answer is for the caller to resubmit the identical request.
-    Routes map it to a 503 with a Retry-After hint rather than a 500.
+    The slot is therefore free again — a benign lost race, not schema
+    corruption — and the right answer is for the caller to resubmit the
+    identical request. Routes map it to a 503 with a Retry-After hint
+    rather than a 500.
 
-    slot_summary names the (entity, slot) pair textually so the message
-    stays accurate for both the global-field and local diagnostic paths
-    without this class needing to know which slot kind it describes.
+    row_label names the row type that lost the race (e.g.,
+    "biosample_metadata", "prep_sample_study_field"); slot_summary names
+    the slot key textually. Both are caller-supplied so this class stays
+    agnostic to which table or slot kind it describes.
     """
 
     def __init__(
         self,
         *,
-        entity_kind: SampleEntityKind,
-        entity_idx: int,
+        row_label: str,
         slot_summary: str,
     ) -> None:
-        self.entity_kind = entity_kind
-        self.entity_idx = entity_idx
+        self.row_label = row_label
         self.slot_summary = slot_summary
         super().__init__(
-            f"{entity_kind}_metadata slot occupant for {slot_summary} was"
-            f" concurrently deleted before it could be diagnosed; the write"
-            f" raced a delete and should be retried"
+            f"{row_label} write raced a concurrent delete on slot"
+            f" {slot_summary}; the occupant vanished before it could be"
+            f" diagnosed — retry"
         )
 
 
@@ -231,23 +231,25 @@ def parse_text_for_data_type(
 
 
 # ---------------------------------------------------------------------------
-# Cross-entity metadata-write dispatch: spec + write_global_metadata_or_diagnose
+# Cross-entity metadata-write dispatch: spec + shared read/write helpers
 # ---------------------------------------------------------------------------
 #
 # The two metadata tables (qiita.biosample_metadata, qiita.prep_sample_metadata)
 # share a partial unique index on (entity_idx, global_field_idx) that lets at
-# most one globally-linked metadata row per (entity, global field) pair
-# exist across all studies. write_global_metadata_or_diagnose performs the
-# typed INSERT against the right table, and on collision with that partial
-# index runs a typed-value diagnostic SELECT to determine which of five
-# sub-cases is happening, then raises a typed exception describing it.
+# most one globally-linked metadata row per (entity, global field) pair exist
+# across all studies. write_global_metadata_or_diagnose performs the typed
+# INSERT against the right table, and on collision with that partial index
+# runs a typed-value diagnostic SELECT to determine which of five sub-cases
+# is happening, then raises a typed exception describing it.
+# write_local_metadata_or_diagnose follows the same shape against the
+# *_metadata_unique_per_field constraint with three local sub-cases plus
+# the LocalWriteOnGloballyLinkedFieldError pre-INSERT guard.
 #
-# Per-entity differences (which study-field table to upsert into, which idx
-# column the metadata table uses, which constraint name the partial index
-# carries, and which typed-INSERT callable to dispatch through) are captured
-# in EntityMetadataSpec. The two specs (BIOSAMPLE_METADATA_SPEC,
-# PREP_SAMPLE_METADATA_SPEC) live alongside their callables in the per-entity
-# repository modules; this module never imports them directly.
+# Per-entity differences (table and column identifiers, constraint names)
+# are captured in EntityMetadataSpec. The two specs (BIOSAMPLE_METADATA_SPEC,
+# PREP_SAMPLE_METADATA_SPEC) live in the per-entity repository modules; the
+# shared functions in this module never import them directly — callers pass
+# the matching spec in.
 # ---------------------------------------------------------------------------
 
 
@@ -270,36 +272,138 @@ class SampleMetadataWriteResult(NamedTuple):
 
 @dataclass(frozen=True)
 class EntityMetadataSpec:
-    """Per-entity binding consumed by write_global_metadata_or_diagnose.
+    """Per-entity SQL-identifier binding consumed by the shared sample-family
+    helpers in this module.
 
-    Captures the SQL identifiers and pre-bound callables that differ between
-    the biosample and prep_sample metadata stacks so the cross-entity write
-    function can stay agnostic. Constructed once per entity at module-load
-    time in the matching *_metadata repository module.
+    Holds the entity discriminator plus the table, column, and constraint
+    identifiers that differ between the biosample and prep_sample stacks
+    so the shared functions stay agnostic. Carries both metadata-side
+    bindings (metadata table, global-field table, study-field table, and
+    the constraint names the diagnostic paths key on) and per-study link
+    bindings (link_table, link_entity_key_column) consumed by
+    insert_entity_to_study and link_entity_to_studies. Constructed once
+    per entity at module-load time in the matching *_metadata repository
+    module.
     """
 
     entity_kind: SampleEntityKind
     metadata_table: str
+    # The *_global_field table (biosample_global_field / prep_sample_global_field)
+    # the globally-linked reads resolve display_name and data_type against.
+    global_field_table: str
     entity_key_column: str
     study_field_table: str
     study_field_idx_column: str
+    # The FK column on study_field_table pointing at the *_global_field
+    # table (biosample_global_field_idx / prep_sample_global_field_idx).
+    # NULL on a purely-local row, non-NULL on a globally-linked one;
+    # _get_or_create_globally_linked_study_field writes and verifies it.
+    study_field_global_fk_column: str
     global_field_unique_index_name: str
     local_unique_per_field_index_name: str
-    # Callable[..., Awaitable[tuple[int, bool]]]: get-or-create the globally-
-    # linked study_field row. Keyword args: study_idx, global_field_idx,
-    # display_name, created_by_idx. Returns (idx, created).
-    get_or_create_globally_linked_field: Callable[..., Awaitable[tuple[int, bool]]]
-    # Callable[..., Awaitable[tuple[int, bool, int | None]]]: get-or-create
-    # the local study_field row. Keyword args: study_idx, display_name,
-    # created_by_idx, data_type (TEXT default), required, terminology_idx,
-    # tier_override. Returns (idx, created, global_field_idx); the third
-    # element is non-None when the resolved row is globally linked, which
-    # write_local_metadata_or_diagnose treats as a strict-mode violation.
-    get_or_create_local_field: Callable[..., Awaitable[tuple[int, bool, int | None]]]
-    # Callable[..., Awaitable[int]]: insert one typed metadata row and
-    # return its idx. Keyword args: entity_idx, study_field_idx, data_type,
-    # value, created_by_idx. Dispatches internally on data_type.
-    insert_typed_metadata: Callable[..., Awaitable[int]]
+    # The per-study link table (biosample_to_study / prep_sample_to_study)
+    # and the entity-id column on it (biosample_idx / prep_sample_idx).
+    # Consumed by insert_entity_to_study so one parameterised INSERT
+    # covers both link tables.
+    link_table: str
+    link_entity_key_column: str
+
+
+async def fetch_global_fields_by_display_names(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    display_names: Iterable[str],
+) -> dict[str, GlobalFieldRow]:
+    """Return a dict of display_name -> GlobalFieldRow for the matching
+    rows in the *_global_field table named by spec.global_field_table.
+
+    Display names that have no matching row are absent from the returned
+    dict; callers detect "unknown field" by checking dict membership for
+    each requested name. Empty input short-circuits with no DB call.
+    """
+    # Materialize so emptiness is detectable and the param can be passed as ANY.
+    names = list(display_names)
+    if not names:
+        return {}
+
+    # f-string interpolation of the table identifier is safe: spec fields
+    # are frozen module-level constants, never reached by caller input.
+    rows = await pool_or_conn.fetch(
+        f"SELECT idx, display_name, data_type"
+        f" FROM {spec.global_field_table}"
+        f" WHERE display_name = ANY($1::text[])",
+        names,
+    )
+
+    # Wrap each row in the typed tuple, keyed on display_name.
+    return {
+        r["display_name"]: GlobalFieldRow(
+            idx=r["idx"],
+            display_name=r["display_name"],
+            data_type=FieldDataType(r["data_type"]),
+        )
+        for r in rows
+    }
+
+
+async def fetch_global_metadata(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+) -> dict[str, GlobalMetadataRow]:
+    """Return a dict of internal_name -> GlobalMetadataRow for every
+    globally-linked metadata value the entity carries.
+
+    Filters on <metadata>.global_field_idx IS NOT NULL: purely-local rows
+    (including the biosample owner-id row) are excluded. The read is not
+    study-scoped — the canonical global value persists across
+    <entity>_to_study link retirement, and per-study read access is
+    governed by the study_access predicate at the caller's auth boundary,
+    not here. Missing-reason rows (value_missing_reason_idx populated) are
+    also excluded -- they have no typed value to surface and the import
+    path does not currently write them.
+
+    Currently supports data_type in {TEXT, NUMERIC, DATE} (matching the
+    import path's closed set); rows of other data_types raise
+    NotImplementedError so a future addition is a coordinated extension of
+    read + write paths.
+    """
+    # f-string interpolation of the table identifiers is safe: spec fields
+    # are frozen module-level constants, never reached by caller input.
+    # Pull every globally-linked, non-missing-reason row for the entity in
+    # one round trip; carry every typed value column the closed set covers.
+    rows = await pool_or_conn.fetch(
+        f"SELECT gf.internal_name, gf.display_name, gf.description, gf.data_type,"
+        f" m.value_text, m.value_numeric, m.value_date"
+        f" FROM {spec.metadata_table} m"
+        f" JOIN {spec.global_field_table} gf ON gf.idx = m.global_field_idx"
+        f" WHERE m.{spec.entity_key_column} = $1"
+        f"   AND m.global_field_idx IS NOT NULL"
+        f"   AND m.value_missing_reason_idx IS NULL",
+        entity_idx,
+    )
+
+    # Walk rows, dispatch each to the value column the data_type names.
+    # The unsupported branch raises so an out-of-set data_type cannot
+    # silently surface a NULL value.
+    result: dict[str, GlobalMetadataRow] = {}
+    for r in rows:
+        data_type = FieldDataType(r["data_type"])
+        column = GLOBAL_METADATA_VALUE_COLUMN.get(data_type)
+        if column is None:
+            raise NotImplementedError(
+                f"global metadata read for data_type={data_type} is not yet implemented"
+            )
+        result[r["internal_name"]] = GlobalMetadataRow(
+            internal_name=r["internal_name"],
+            display_name=r["display_name"],
+            description=r["description"],
+            data_type=data_type,
+            value=r[column],
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -469,9 +573,8 @@ async def _fetch_global_field_slot_occupant(
         # window between the savepoint rollback and this read. The slot is
         # free again — a benign lost race, not schema corruption — so signal
         # a retry rather than masquerading it as an invariant violation.
-        raise TransientMetadataWriteRaceError(
-            entity_kind=spec.entity_kind,
-            entity_idx=entity_idx,
+        raise TransientWriteRaceError(
+            row_label=f"{spec.entity_kind}_metadata",
             slot_summary=(
                 f"{spec.entity_kind}_idx={entity_idx}, global_field_idx={global_field_idx}"
             ),
@@ -533,6 +636,168 @@ def _make_global_field_collision_error(
 
 
 # ---------------------------------------------------------------------------
+# Globally-linked study-field upsert (private)
+# ---------------------------------------------------------------------------
+
+
+async def _get_or_create_globally_linked_study_field(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    global_field_idx: int,
+    display_name: str,
+    created_by_idx: int,
+    description: str | None = None,
+) -> tuple[int, bool]:
+    """Find a {entity}_study_field linked to global_field_idx; create on miss.
+
+    The {entity}_study_field row carries spec.study_field_global_fk_column
+    pointing at the {entity}_global_field row this study_field binds to;
+    one parameterised body drives both the biosample and prep_sample
+    stacks via spec.study_field_table interpolation.
+
+    Returns (idx, created): created is True when this call inserted the
+    row; False when the fallback SELECT branch resolved against a row a
+    concurrent caller had already committed (or that pre-existed entirely).
+
+    The created row populates the global FK column and leaves
+    data_type / required / terminology_idx / tier_override NULL per the
+    *_study_field_inheritance_consistent CHECK; the global field owns
+    those fields.
+
+    Raises StudyFieldConflictError(entity_kind=spec.entity_kind, ...) when
+    a row at (study_idx, display_name) already exists but is purely-local
+    (the global FK column IS NULL) or is bound to a different global
+    field. Both cases mean the caller is trying to write metadata against
+    a field that is not the global field they think it is; silently
+    returning the existing idx would attach the value to the wrong field.
+
+    Concurrency: INSERT ... ON CONFLICT DO NOTHING RETURNING idx + a
+    fallback SELECT on miss. Race-free under READ COMMITTED (the project
+    default, set in qiita_control_plane.db).
+    """
+    # Both branches must observe the same snapshot; require a wrapping
+    # transaction so the INSERT and the fallback SELECT cannot straddle
+    # an implicit-commit boundary.
+    require_transaction(conn)
+
+    # f-string interpolation of identifiers is safe: spec fields are frozen
+    # module-level constants, never reached by caller input.
+    fk_column = spec.study_field_global_fk_column
+
+    # Create branch — globally-linked row leaves the inherited columns NULL.
+    # ON CONFLICT DO NOTHING absorbs the unique-constraint hit so the
+    # concurrent loser of the race does not raise.
+    idx = await conn.fetchval(
+        f"INSERT INTO {spec.study_field_table} ("
+        f"    study_idx, {fk_column},"
+        f"    display_name, description, created_by_idx"
+        f") VALUES ($1, $2, $3, $4, $5)"
+        f" ON CONFLICT (study_idx, display_name) DO NOTHING"
+        f" RETURNING idx",
+        study_idx,
+        global_field_idx,
+        display_name,
+        description,
+        created_by_idx,
+    )
+    if idx is not None:
+        return idx, True
+
+    # Fallback branch — existing row at (study_idx, display_name). Verify
+    # its global link matches what the caller asked for; otherwise the row
+    # is bound to a different global field (or none) and reusing it would
+    # attach the value to the wrong field. The SELECT aliases the global
+    # FK column so the Python access stays stable across entities.
+    row = await conn.fetchrow(
+        f"SELECT idx, {fk_column} AS found_global_field_idx"
+        f" FROM {spec.study_field_table}"
+        f" WHERE study_idx = $1 AND display_name = $2",
+        study_idx,
+        display_name,
+    )
+    if row is None:
+        # ON CONFLICT fired against a row that was then deleted-and-
+        # committed before this SELECT ran. The slot is free again —
+        # benign race, not schema corruption — so signal a retry.
+        raise TransientWriteRaceError(
+            row_label=f"{spec.entity_kind}_study_field",
+            slot_summary=(f"study_idx={study_idx}, display_name={display_name!r}"),
+        )
+    if row["found_global_field_idx"] != global_field_idx:
+        raise StudyFieldConflictError(
+            entity_kind=spec.entity_kind,
+            study_idx=study_idx,
+            display_name=display_name,
+            expected_global_field_idx=global_field_idx,
+            found_global_field_idx=row["found_global_field_idx"],
+        )
+    return row["idx"], False
+
+
+# ---------------------------------------------------------------------------
+# Typed metadata insert (private)
+# ---------------------------------------------------------------------------
+
+
+async def _insert_typed_metadata(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    study_field_idx: int,
+    data_type: FieldDataType,
+    value: str | Decimal | date,
+    created_by_idx: int,
+) -> int:
+    """Insert one typed metadata row into spec.metadata_table and return
+    its idx.
+
+    Looks up the value column via GLOBAL_METADATA_VALUE_COLUMN and
+    populates exactly that one value column; the other five value
+    columns stay NULL so the *_metadata_exactly_one_value CHECK is
+    satisfied. global_field_idx is populated by trigger from the source
+    field row and is not a parameter here.
+
+    The *_metadata_apply_field_contract trigger rejects writes whose
+    value column does not match the source field's resolved data_type;
+    the *_metadata_reject_if_link_retired trigger rejects writes against
+    retired *_to_study links. Both surface as asyncpg.PostgresError
+    subclasses. The cross-study partial unique index and the
+    unique-per-field constraint surface as asyncpg.UniqueViolationError;
+    write_global_metadata_or_diagnose / write_local_metadata_or_diagnose
+    drive their diagnostic SELECTs off those.
+
+    BOOLEAN and TERMINOLOGY land in the closed-set fallback and raise
+    NotImplementedError so a future addition is a coordinated extension
+    across GLOBAL_METADATA_VALUE_COLUMN and this function.
+    """
+    # Closed-set guard: unsupported data_types raise rather than silently
+    # write NULL into every value column.
+    value_column = GLOBAL_METADATA_VALUE_COLUMN.get(data_type)
+    if value_column is None:
+        raise NotImplementedError(
+            f"typed metadata insert for data_type={data_type} is not yet implemented"
+        )
+
+    # f-string interpolation of identifiers is safe: spec fields and
+    # GLOBAL_METADATA_VALUE_COLUMN values are frozen module-level
+    # constants, never reached by caller input.
+    return await conn.fetchval(
+        f"INSERT INTO {spec.metadata_table} ("
+        f"    {spec.entity_key_column}, {spec.study_field_idx_column},"
+        f"    {value_column}, created_by_idx"
+        f") VALUES ($1, $2, $3, $4)"
+        f" RETURNING idx",
+        entity_idx,
+        study_field_idx,
+        value,
+        created_by_idx,
+    )
+
+
+# ---------------------------------------------------------------------------
 # write_global_metadata_or_diagnose (public)
 # ---------------------------------------------------------------------------
 
@@ -570,7 +835,7 @@ async def write_global_metadata_or_diagnose(
     collision against a study_field bound to a different global field)
     and any UniqueViolationError whose constraint_name is NOT
     spec.global_field_unique_index_name (e.g., unique_per_field, accession
-    uniqueness) propagate unchanged. TransientMetadataWriteRaceError
+    uniqueness) propagate unchanged. TransientWriteRaceError
     propagates when the colliding occupant was concurrently deleted
     before the diagnostic read could inspect it.
     """
@@ -582,8 +847,9 @@ async def write_global_metadata_or_diagnose(
     # creating one on miss. StudyFieldConflictError propagates if an
     # existing row at (study_idx, display_name) is bound to a different
     # global field.
-    study_field_idx, study_field_created = await spec.get_or_create_globally_linked_field(
+    study_field_idx, study_field_created = await _get_or_create_globally_linked_study_field(
         conn,
+        spec=spec,
         study_idx=study_idx,
         global_field_idx=global_field_idx,
         display_name=display_name,
@@ -606,8 +872,9 @@ async def write_global_metadata_or_diagnose(
     # there.
     try:
         async with conn.transaction():
-            metadata_idx = await spec.insert_typed_metadata(
+            metadata_idx = await _insert_typed_metadata(
                 conn,
+                spec=spec,
                 entity_idx=entity_idx,
                 study_field_idx=study_field_idx,
                 data_type=data_type,
@@ -784,7 +1051,7 @@ async def _fetch_local_slot_occupant(
     but BOOLEAN/TERMINOLOGY support is a planned coordinated extension and
     selecting them now keeps this read stable when that lands.
 
-    Parallel to _fetch_global_field_slot_occupant; differs in the WHERE
+    Similar to _fetch_global_field_slot_occupant; differs in the WHERE
     key (study_field_idx instead of global_field_idx) and the absence of
     a join (a local row's contributing study is always the caller's, so
     no separate column needs surfacing).
@@ -807,9 +1074,8 @@ async def _fetch_local_slot_occupant(
         # it between the savepoint rollback and this read. The slot is free
         # again — a benign lost race, not schema corruption — so signal a
         # retry rather than masquerading it as an invariant violation.
-        raise TransientMetadataWriteRaceError(
-            entity_kind=spec.entity_kind,
-            entity_idx=entity_idx,
+        raise TransientWriteRaceError(
+            row_label=f"{spec.entity_kind}_metadata",
             slot_summary=(
                 f"{spec.entity_kind}_idx={entity_idx},"
                 f" {spec.entity_kind}_study_field_idx={study_field_idx}"
@@ -866,6 +1132,110 @@ def _make_local_collision_error(
 
 
 # ---------------------------------------------------------------------------
+# Local study-field upsert (private)
+# ---------------------------------------------------------------------------
+
+
+async def _get_or_create_local_study_field(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    study_idx: int,
+    display_name: str,
+    created_by_idx: int,
+    description: str | None = None,
+    data_type: FieldDataType = FieldDataType.TEXT,
+    required: bool = False,
+    terminology_idx: int | None = None,
+    tier_override: Tier | None = None,
+) -> tuple[int, bool, int | None]:
+    """Find a {entity}_study_field by (study_idx, display_name); create
+    purely-local on miss.
+
+    Parameterised by spec.study_field_table and
+    spec.study_field_global_fk_column; one parameterised body drives
+    both the biosample and prep_sample stacks.
+
+    Returns (idx, created, global_field_idx). created is True on the
+    insert branch (always a purely-local row, so global_field_idx is
+    None), False on the fallback SELECT branch. The third element
+    surfaces the resolved row's FK to the global field — None for a
+    purely-local row, non-None when the existing row turned out to be
+    globally linked (only possible from the lookup branch; the create
+    branch always produces a purely-local row).
+
+    Surfacing the link status in the return tuple lets callers that need
+    strict local-only semantics (write_local_metadata_or_diagnose) reject
+    a globally-linked resolution rather than silently writing through it.
+
+    The create branch produces a purely-local row (FK column NULL);
+    creating a globally-linked row is a separate operation
+    (_get_or_create_globally_linked_study_field) because its non-null
+    inputs are the inverse set per the *_study_field_inheritance_consistent
+    CHECK.
+
+    Concurrency: same INSERT ... ON CONFLICT DO NOTHING RETURNING idx +
+    fallback SELECT pattern as the globally-linked sibling. Race-free
+    under READ COMMITTED (the project default, set in
+    qiita_control_plane.db).
+    """
+    # Both branches must observe the same snapshot; require a wrapping
+    # transaction so the INSERT and the fallback SELECT cannot straddle
+    # an implicit-commit boundary.
+    require_transaction(conn)
+
+    # f-string interpolation of identifiers is safe: spec fields are frozen
+    # module-level constants, never reached by caller input.
+    fk_column = spec.study_field_global_fk_column
+
+    # Create branch — purely-local row, FK column left NULL. ON CONFLICT
+    # DO NOTHING absorbs the unique-constraint hit so the concurrent loser
+    # of the race does not raise.
+    idx = await conn.fetchval(
+        f"INSERT INTO {spec.study_field_table} ("
+        f"    study_idx, display_name, description,"
+        f"    data_type, required, terminology_idx, tier_override,"
+        f"    created_by_idx"
+        f") VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        f" ON CONFLICT (study_idx, display_name) DO NOTHING"
+        f" RETURNING idx",
+        study_idx,
+        display_name,
+        description,
+        data_type,
+        required,
+        terminology_idx,
+        tier_override,
+        created_by_idx,
+    )
+    if idx is not None:
+        # Create branch — the row is purely-local by construction.
+        return idx, True, None
+
+    # Lookup branch — fallback fires only on conflict; takes a fresh
+    # snapshot under READ COMMITTED so it sees the row the concurrent
+    # winner committed. Surface the FK column so callers can detect a
+    # globally-linked resolution; alias to a stable name so the Python
+    # access stays independent of the entity-specific column.
+    row = await conn.fetchrow(
+        f"SELECT idx, {fk_column} AS found_global_field_idx"
+        f" FROM {spec.study_field_table}"
+        f" WHERE study_idx = $1 AND display_name = $2",
+        study_idx,
+        display_name,
+    )
+    if row is None:
+        # ON CONFLICT fired against a row that was then deleted-and-
+        # committed before this SELECT ran. The slot is free again —
+        # benign race, not schema corruption — so signal a retry.
+        raise TransientWriteRaceError(
+            row_label=f"{spec.entity_kind}_study_field",
+            slot_summary=(f"study_idx={study_idx}, display_name={display_name!r}"),
+        )
+    return row["idx"], False, row["found_global_field_idx"]
+
+
+# ---------------------------------------------------------------------------
 # write_local_metadata_or_diagnose (public)
 # ---------------------------------------------------------------------------
 
@@ -910,7 +1280,7 @@ async def write_local_metadata_or_diagnose(
 
     Any UniqueViolationError whose constraint_name is NOT
     spec.local_unique_per_field_index_name propagates unchanged.
-    TransientMetadataWriteRaceError propagates when the colliding
+    TransientWriteRaceError propagates when the colliding
     occupant was concurrently deleted before the diagnostic read could
     inspect it.
     """
@@ -926,8 +1296,9 @@ async def write_local_metadata_or_diagnose(
         study_field_idx,
         study_field_created,
         resolved_global_field_idx,
-    ) = await spec.get_or_create_local_field(
+    ) = await _get_or_create_local_study_field(
         conn,
+        spec=spec,
         study_idx=study_idx,
         display_name=display_name,
         created_by_idx=caller_idx,
@@ -958,8 +1329,9 @@ async def write_local_metadata_or_diagnose(
     # alive and continuable.
     try:
         async with conn.transaction():
-            metadata_idx = await spec.insert_typed_metadata(
+            metadata_idx = await _insert_typed_metadata(
                 conn,
+                spec=spec,
                 entity_idx=entity_idx,
                 study_field_idx=study_field_idx,
                 data_type=data_type,
@@ -997,3 +1369,168 @@ async def write_local_metadata_or_diagnose(
         data_type=data_type,
         existing_row=existing_row,
     )
+
+
+# ---------------------------------------------------------------------------
+# Sample-import composer building blocks
+# ---------------------------------------------------------------------------
+#
+# The biosample and sequenced-prep-sample composers share the same
+# transaction-guarded shape: validate the primary/secondary study split,
+# preflight the metadata dict against the global-field table, link the
+# new entity to every requested study, then write the globally-linked
+# metadata rows. The four helpers below capture each shared step in a
+# spec-parameterised form so the two composers route through one code
+# path and cannot drift on details like dedup or error payload.
+# ---------------------------------------------------------------------------
+
+
+def validate_primary_secondary_studies(
+    primary_study_idx: int,
+    secondary_study_idxs: Sequence[int],
+) -> None:
+    """Reject a sample-import call whose primary study also appears in
+    secondaries, raises ValueError.
+    """
+    # Single membership test; secondary_study_idxs is small so the linear
+    # scan is cheaper than building a set.
+    if primary_study_idx in secondary_study_idxs:
+        raise ValueError(
+            f"primary_study_idx ({primary_study_idx}) must not appear in secondary_study_idxs"
+        )
+
+
+async def preflight_global_metadata(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    metadata: Mapping[str, str],
+) -> list[tuple[GlobalFieldRow, str | Decimal | date]]:
+    """Resolve every metadata display_name against spec.global_field_table
+    and parse every text value into the typed Python value matching its
+    data_type. Returns the resolved (GlobalFieldRow, parsed_value) pairs
+    in input order; the caller passes them to write_global_metadata_entries
+    to drive the actual INSERTs.
+
+    Raises MetadataUnknownFieldsError(spec.entity_kind, ...) carrying every
+    unknown name in one list, before parsing. Raises MetadataParseError on
+    first parse failure after the unknown-name check passes. Both errors
+    fire before any DB write, so a partial-input request never reaches the
+    insert path.
+    """
+    # Resolve all requested display_names in one round trip; the helper
+    # short-circuits on empty input so this is free for metadata-less callers.
+    global_field_rows = await fetch_global_fields_by_display_names(
+        conn, spec=spec, display_names=metadata.keys()
+    )
+
+    # Collect every unknown name (not first-only) so the caller can surface
+    # them all in one 422.
+    unknown = [name for name in metadata if name not in global_field_rows]
+    if unknown:
+        raise MetadataUnknownFieldsError(spec.entity_kind, unknown)
+
+    # Parse each text value into its typed Python form; MetadataParseError
+    # propagates with the failing display_name on the first bad input.
+    parsed: list[tuple[GlobalFieldRow, str | Decimal | date]] = []
+    for display_name, text_value in metadata.items():
+        global_row = global_field_rows[display_name]
+        parsed_value = parse_text_for_data_type(display_name, global_row.data_type, text_value)
+        parsed.append((global_row, parsed_value))
+    return parsed
+
+
+async def insert_entity_to_study(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    study_idx: int,
+    created_by_idx: int,
+) -> None:
+    """Insert one (entity, study) link row into spec.link_table.
+
+    The four retirement columns on both link tables are CHECK-pinned to
+    NULL/false on a fresh row so they have no place in a create call;
+    created_at defaults to now(). The prep_sample side carries a
+    reject_without_biosample_link trigger that fires before INSERT and
+    raises asyncpg.RaiseError if the underlying biosample is not linked
+    (non-retired) to the same study; the biosample side has no analogous
+    trigger.
+
+    Raises asyncpg.UniqueViolationError if the (entity_idx, study_idx)
+    pair already exists, asyncpg.ForeignKeyViolationError on bad refs.
+    """
+    # f-string interpolation of identifiers is safe: spec fields are frozen
+    # module-level constants, never reached by caller input.
+    await conn.execute(
+        f"INSERT INTO {spec.link_table} ("
+        f"    {spec.link_entity_key_column}, study_idx, created_by_idx"
+        f") VALUES ($1, $2, $3)",
+        entity_idx,
+        study_idx,
+        created_by_idx,
+    )
+
+
+async def link_entity_to_studies(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    primary_study_idx: int,
+    secondary_study_idxs: Sequence[int],
+    caller_idx: int,
+) -> None:
+    """Link entity_idx to primary_study_idx plus every entry in
+    secondary_study_idxs.
+
+    Deduplicates secondary_study_idxs before iterating so a caller that
+    passes a repeated study idx does not trip the link table's primary
+    key. Primary first so its link row carries the smallest created_at
+    ordering; secondaries sorted ascending so a failing study idx is
+    reproducible if any per-row trigger fires.
+    """
+    unique_secondaries = list(dict.fromkeys(secondary_study_idxs))
+
+    # Primary first; sorted secondaries after, for deterministic ordering.
+    for study_idx in [primary_study_idx, *sorted(unique_secondaries)]:
+        await insert_entity_to_study(
+            conn,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_idx=study_idx,
+            created_by_idx=caller_idx,
+        )
+
+
+async def write_global_metadata_entries(
+    conn: asyncpg.Connection,
+    *,
+    spec: EntityMetadataSpec,
+    entity_idx: int,
+    study_idx: int,
+    caller_idx: int,
+    parsed_metadata: Sequence[tuple[GlobalFieldRow, str | Decimal | date]],
+) -> None:
+    """Drive write_global_metadata_or_diagnose over every preflight-parsed
+    entry, writing each value against study_idx (the field-owning study).
+
+    The first collision or rollback signal write_global_metadata_or_diagnose
+    raises propagates; subsequent entries are not attempted because the
+    caller's outer transaction is the right place to roll partial state back.
+    """
+    # One write per entry, sequentially; the outer transaction is the
+    # atomicity boundary.
+    for global_row, parsed_value in parsed_metadata:
+        await write_global_metadata_or_diagnose(
+            conn,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_idx=study_idx,
+            global_field_idx=global_row.idx,
+            display_name=global_row.display_name,
+            data_type=global_row.data_type,
+            value=parsed_value,
+            caller_idx=caller_idx,
+        )

@@ -22,24 +22,18 @@ or stand alone.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
-from decimal import Decimal
 
 import asyncpg
 
 from . import require_transaction, validate_patch_fields
 from ._sample_helpers import (
-    GlobalFieldRow,
-    MetadataUnknownFieldsError,
-    SampleEntityKind,
-    parse_text_for_data_type,
-    write_global_metadata_or_diagnose,
+    link_entity_to_studies,
+    preflight_global_metadata,
+    validate_primary_secondary_studies,
+    write_global_metadata_entries,
 )
-from .prep_sample import insert_prep_sample, insert_prep_sample_to_study
-from .prep_sample_metadata import (
-    PREP_SAMPLE_METADATA_SPEC,
-    fetch_prep_sample_global_fields_by_display_names,
-)
+from .prep_sample import insert_prep_sample
+from .prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 
 # The single supported processing_kind today. The supertype's
 # processing_kind column is plain NOT NULL (not GENERATED ALWAYS), so the
@@ -270,8 +264,10 @@ async def import_sequenced_prep_sample(
          reject_without_biosample_link trigger fires on every INSERT
          and raises asyncpg.RaiseError if any requested study lacks a
          non-retired biosample_to_study link.
-      6. For each metadata entry: get_or_create_globally_linked_prep_sample_study_field
-         against primary_study_idx (the field-owning study), then INSERT
+      6. For each metadata entry: call write_global_metadata_or_diagnose
+         with PREP_SAMPLE_METADATA_SPEC against primary_study_idx (the
+         field-owning study). That upserts a globally-linked
+         prep_sample_study_field bound to the global field, then INSERTs
          one prep_sample_metadata row. The reject_if_link_retired trigger
          fires here, which is why step 5 must precede step 6.
 
@@ -287,45 +283,20 @@ async def import_sequenced_prep_sample(
     primary_study_idx must not also appear in secondary_study_idxs; the
     Pydantic validator on SequencedSampleCreateRequest blocks this at
     the route, and the composer raises ValueError as defense-in-depth.
-    Duplicate secondary studies are collapsed (the validator dedupes for
-    route callers; the composer dedupes again for callers bypassing it).
     """
     # Fail-fast guard against caller forgetting to wrap in a transaction.
     require_transaction(conn)
 
-    # Defense-in-depth: the Pydantic validator rejects primary in
-    # secondary at the wire boundary; this guard covers any caller that
-    # bypasses the route.
-    if primary_study_idx in secondary_study_idxs:
-        raise ValueError(
-            f"primary_study_idx ({primary_study_idx}) must not appear in secondary_study_idxs"
-        )
-
-    # Collapse duplicate secondary studies here too, not only in the wire
-    # validator: a caller invoking the composer directly (not through the
-    # route) would otherwise trip the prep_sample_to_study primary key on
-    # a repeated study.
-    unique_secondary_study_idxs = list(dict.fromkeys(secondary_study_idxs))
+    # Reject primary appearing in the secondary list at the composer boundary;
+    # defense-in-depth against callers bypassing the wire-level guard.
+    validate_primary_secondary_studies(primary_study_idx, secondary_study_idxs)
 
     # Pre-flight: resolve every metadata key against prep_sample_global_field
-    # in one query. Unknown names are collected (not first-only) so the
-    # caller surfaces every bad name in a single 422.
-    global_field_rows = await fetch_prep_sample_global_fields_by_display_names(
-        conn, metadata.keys()
+    # and parse every text value into its typed Python form. Both unknown-
+    # name and parse-failure cases raise before any DB write.
+    parsed_metadata = await preflight_global_metadata(
+        conn, spec=PREP_SAMPLE_METADATA_SPEC, metadata=metadata
     )
-    unknown = [name for name in metadata if name not in global_field_rows]
-    if unknown:
-        raise MetadataUnknownFieldsError(SampleEntityKind.PREP_SAMPLE, unknown)
-
-    # Pre-flight: parse every text value into its typed Python value.
-    # Failing here keeps the writes below from running for partial inputs;
-    # the surrounding transaction would still roll back, but pre-flight
-    # avoids the wasted writes.
-    parsed_metadata: list[tuple[GlobalFieldRow, str | Decimal | date]] = []
-    for display_name, text_value in metadata.items():
-        global_row = global_field_rows[display_name]
-        parsed_value = parse_text_for_data_type(display_name, global_row.data_type, text_value)
-        parsed_metadata.append((global_row, parsed_value))
 
     # Step a: create the supertype prep_sample with processing_kind pinned.
     ps_idx = await insert_prep_sample(
@@ -351,32 +322,28 @@ async def import_sequenced_prep_sample(
         ena_run_accession=ena_run_accession,
     )
 
-    # Step c: link the prep_sample to every requested study. Primary
-    # first so its link row carries the smallest created_at ordering;
-    # secondaries sorted ascending so a failing study idx is reproducible
-    # if the biosample-link trigger fires.
-    for study_idx in [primary_study_idx, *sorted(unique_secondary_study_idxs)]:
-        await insert_prep_sample_to_study(
-            conn,
-            prep_sample_idx=ps_idx,
-            study_idx=study_idx,
-            created_by_idx=caller_idx,
-        )
+    # Step c: link the prep_sample to every requested study (dedup, sort,
+    # primary first). The reject_without_biosample_link trigger fires per
+    # row inside the shared helper.
+    await link_entity_to_studies(
+        conn,
+        spec=PREP_SAMPLE_METADATA_SPEC,
+        entity_idx=ps_idx,
+        primary_study_idx=primary_study_idx,
+        secondary_study_idxs=secondary_study_idxs,
+        caller_idx=caller_idx,
+    )
 
     # Step d: write each globally-linked metadata entry against
     # primary_study_idx, the field-owning study.
-    for global_row, parsed_value in parsed_metadata:
-        await write_global_metadata_or_diagnose(
-            conn,
-            spec=PREP_SAMPLE_METADATA_SPEC,
-            entity_idx=ps_idx,
-            study_idx=primary_study_idx,
-            global_field_idx=global_row.idx,
-            display_name=global_row.display_name,
-            data_type=global_row.data_type,
-            value=parsed_value,
-            caller_idx=caller_idx,
-        )
+    await write_global_metadata_entries(
+        conn,
+        spec=PREP_SAMPLE_METADATA_SPEC,
+        entity_idx=ps_idx,
+        study_idx=primary_study_idx,
+        caller_idx=caller_idx,
+        parsed_metadata=parsed_metadata,
+    )
 
     return SequencedPrepSampleImportResult(
         prep_sample_idx=ps_idx,

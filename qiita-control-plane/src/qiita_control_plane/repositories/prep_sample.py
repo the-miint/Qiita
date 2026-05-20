@@ -1,11 +1,12 @@
-"""Single-table writers for the qiita.prep_sample supertype and its
-per-study link table.
+"""Single-table writer for the qiita.prep_sample supertype.
 
-Direct functions cover the supertype row (qiita.prep_sample) and the
-per-study link (qiita.prep_sample_to_study). The sequencing-pathway
-subtype rows and the per-sample composer that ties the supertype,
-subtype, study links, and metadata together live in the sibling
-sequenced_sample module; that composer imports the two writers here.
+Covers the supertype row insert. The per-study link table
+(qiita.prep_sample_to_study) is written through the shared
+insert_entity_to_study / link_entity_to_studies helpers in
+_sample_helpers, driven by PREP_SAMPLE_METADATA_SPEC. The
+sequencing-pathway subtype rows and the per-sample composer that ties
+the supertype, subtype, study links, and metadata together live in the
+sibling sequenced_sample module.
 
 Write functions take an asyncpg.Connection as their first positional
 argument, never acquire their own connection, and never open their own
@@ -50,39 +51,5 @@ async def insert_prep_sample(
         prep_protocol_idx,
         metadata_checklist_idx,
         processing_kind,
-        created_by_idx,
-    )
-
-
-async def insert_prep_sample_to_study(
-    conn: asyncpg.Connection,
-    *,
-    prep_sample_idx: int,
-    study_idx: int,
-    created_by_idx: int,
-) -> None:
-    """Insert a (prep_sample, study) link row in qiita.prep_sample_to_study.
-
-    The four retirement columns are CHECK-pinned to NULL/false on a fresh
-    row, so they have no place in a create call; created_at defaults to
-    now().
-
-    The schema trigger prep_sample_to_study_reject_without_biosample_link
-    fires before INSERT and raises asyncpg.RaiseError if the underlying
-    biosample is not linked (non-retired) to the same study. The composer
-    relies on this trigger rather than pre-checking (which would race);
-    callers translate the marker substring to a 422 at the route layer.
-
-    Raises asyncpg.UniqueViolationError if the (prep_sample_idx,
-    study_idx) pair already exists, asyncpg.ForeignKeyViolationError on
-    bad refs.
-    """
-    # Single INSERT against the (prep_sample_idx, study_idx) PK.
-    await conn.execute(
-        "INSERT INTO qiita.prep_sample_to_study ("
-        "    prep_sample_idx, study_idx, created_by_idx"
-        ") VALUES ($1, $2, $3)",
-        prep_sample_idx,
-        study_idx,
         created_by_idx,
     )

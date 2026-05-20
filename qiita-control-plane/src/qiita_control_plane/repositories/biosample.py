@@ -19,27 +19,24 @@ or stand alone.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
-from decimal import Decimal
 
 import asyncpg
 from qiita_common.models import Tier
 
 from . import require_transaction, validate_patch_fields
 from ._sample_helpers import (
-    GlobalFieldRow,
     LocalWriteOnGloballyLinkedFieldError,
-    MetadataUnknownFieldsError,
     SampleEntityKind,
-    parse_text_for_data_type,
-    write_global_metadata_or_diagnose,
+    _get_or_create_local_study_field,
+    link_entity_to_studies,
+    preflight_global_metadata,
+    validate_primary_secondary_studies,
+    write_global_metadata_entries,
 )
 from .biosample_metadata import (
     BIOSAMPLE_METADATA_SPEC,
     BiosampleOwnerIdFieldCollisionError,
-    fetch_biosample_global_fields_by_display_names,
-    get_or_create_local_biosample_study_field,
-    insert_biosample_metadata_text,
+    insert_owner_biosample_id_metadata,
 )
 
 # Owner display values often contain real names (PII), so the owner-biosample-id
@@ -261,33 +258,6 @@ async def fetch_biosample_idxs_for_study(
     return [r["biosample_idx"] for r in rows]
 
 
-async def insert_biosample_to_study(
-    conn: asyncpg.Connection,
-    *,
-    biosample_idx: int,
-    study_idx: int,
-    created_by_idx: int,
-) -> None:
-    """Insert a (biosample, study) link row in qiita.biosample_to_study.
-
-    The four retirement columns are CHECK-pinned to NULL/false on a fresh
-    row so they have no place in a create call; created_at defaults to
-    now(). Those are the only other settable columns on the table.
-
-    Raises asyncpg.UniqueViolationError if the (biosample_idx, study_idx)
-    pair already exists, asyncpg.ForeignKeyViolationError on bad refs.
-    """
-    # Single INSERT against the (biosample_idx, study_idx) PK.
-    await conn.execute(
-        "INSERT INTO qiita.biosample_to_study ("
-        "    biosample_idx, study_idx, created_by_idx"
-        ") VALUES ($1, $2, $3)",
-        biosample_idx,
-        study_idx,
-        created_by_idx,
-    )
-
-
 @dataclass(frozen=True)
 class BiosampleImportResult:
     """Composite return shape for import_biosample_from_owner_biosample_id.
@@ -374,14 +344,8 @@ async def import_biosample_from_owner_biosample_id(
     # Fail-fast guard against caller forgetting to wrap in a transaction.
     require_transaction(conn)
 
-    # Reject primary appearing in the secondary list at the composer
-    # boundary. Mirrors the wire-level guard on
-    # SequencedSampleCreateRequest; the biosample wire model holds at
-    # single-study so this guard is the only check.
-    if primary_study_idx in secondary_study_idxs:
-        raise ValueError(
-            f"primary_study_idx ({primary_study_idx}) must not appear in secondary_study_idxs"
-        )
+    # Reject primary appearing in the secondary list at the composer boundary.
+    validate_primary_secondary_studies(primary_study_idx, secondary_study_idxs)
 
     # Pre-flight: pure-logic collision check between the owner-id field
     # name and the metadata dict's keys. The owner-id row is purely-local;
@@ -390,22 +354,11 @@ async def import_biosample_from_owner_biosample_id(
         raise BiosampleOwnerIdFieldCollisionError(owner_biosample_id_field_name)
 
     # Pre-flight: resolve every metadata key against biosample_global_field
-    # in one query. Unknown names are collected (not first-only) so the
-    # caller surfaces every bad name in a single 422.
-    global_field_rows = await fetch_biosample_global_fields_by_display_names(conn, metadata.keys())
-    unknown = [name for name in metadata if name not in global_field_rows]
-    if unknown:
-        raise MetadataUnknownFieldsError(SampleEntityKind.BIOSAMPLE, unknown)
-
-    # Pre-flight: parse every text value into its typed Python value.
-    # Failing here keeps the writes below from running for partial inputs;
-    # the surrounding transaction would still roll back, but pre-flight
-    # avoids the wasted writes.
-    parsed_metadata: list[tuple[GlobalFieldRow, str | Decimal | date]] = []
-    for display_name, text_value in metadata.items():
-        global_row = global_field_rows[display_name]
-        parsed_value = parse_text_for_data_type(display_name, global_row.data_type, text_value)
-        parsed_metadata.append((global_row, parsed_value))
+    # and parse every text value into its typed Python form. Both unknown-
+    # name and parse-failure cases raise before any DB write.
+    parsed_metadata = await preflight_global_metadata(
+        conn, spec=BIOSAMPLE_METADATA_SPEC, metadata=metadata
+    )
 
     # Step a: create the biosample.
     bs_idx = await insert_biosample(
@@ -417,31 +370,27 @@ async def import_biosample_from_owner_biosample_id(
         ena_sample_accession=ena_sample_accession,
     )
 
-    # Step b: link the biosample to every requested study. Primary first
-    # so its link row carries the smallest created_at ordering;
-    # secondaries sorted ascending for deterministic error reporting.
-    for study_idx in [primary_study_idx, *sorted(secondary_study_idxs)]:
-        await insert_biosample_to_study(
-            conn,
-            biosample_idx=bs_idx,
-            study_idx=study_idx,
-            created_by_idx=caller_idx,
-        )
+    # Step b: link the biosample to every requested study (dedup, sort,
+    # primary first).
+    await link_entity_to_studies(
+        conn,
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=bs_idx,
+        primary_study_idx=primary_study_idx,
+        secondary_study_idxs=secondary_study_idxs,
+        caller_idx=caller_idx,
+    )
 
     # Step c: write each globally-linked metadata entry against
     # primary_study_idx, the field-owning study.
-    for global_row, parsed_value in parsed_metadata:
-        await write_global_metadata_or_diagnose(
-            conn,
-            spec=BIOSAMPLE_METADATA_SPEC,
-            entity_idx=bs_idx,
-            study_idx=primary_study_idx,
-            global_field_idx=global_row.idx,
-            display_name=global_row.display_name,
-            data_type=global_row.data_type,
-            value=parsed_value,
-            caller_idx=caller_idx,
-        )
+    await write_global_metadata_entries(
+        conn,
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=bs_idx,
+        study_idx=primary_study_idx,
+        caller_idx=caller_idx,
+        parsed_metadata=parsed_metadata,
+    )
 
     # Step d: find or create the local owner-biosample-id field on
     # primary_study_idx. The tier_override pins the field above any
@@ -451,8 +400,9 @@ async def import_biosample_from_owner_biosample_id(
         field_idx,
         field_created,
         resolved_global_field_idx,
-    ) = await get_or_create_local_biosample_study_field(
+    ) = await _get_or_create_local_study_field(
         conn,
+        spec=BIOSAMPLE_METADATA_SPEC,
         study_idx=primary_study_idx,
         display_name=owner_biosample_id_field_name,
         created_by_idx=caller_idx,
@@ -474,13 +424,12 @@ async def import_biosample_from_owner_biosample_id(
         )
 
     # Step e: write the owner-biosample-id metadata row, flagged.
-    await insert_biosample_metadata_text(
+    await insert_owner_biosample_id_metadata(
         conn,
         biosample_idx=bs_idx,
         biosample_study_field_idx=field_idx,
         value_text=owner_biosample_id_value,
         created_by_idx=caller_idx,
-        is_owner_biosample_id=True,
     )
 
     return BiosampleImportResult(
