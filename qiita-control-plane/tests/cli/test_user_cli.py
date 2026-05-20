@@ -1150,6 +1150,176 @@ def test_sequenced_sample_create_rejects_primary_in_secondary(monkeypatch, capsy
 
 
 # ---------------------------------------------------------------------------
+# ticket submit
+# ---------------------------------------------------------------------------
+
+
+def test_ticket_submit_minimal_prep_sample_scope(monkeypatch):
+    """--prep-sample-idx is the smoke-flow convenience; constructs the
+    scope_target dict and POSTs an action_context of {} by default."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"work_ticket_idx": 12, "state": "pending"},
+        status=202,
+    )
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "ticket",
+            "submit",
+            "--action-id",
+            "fastq-to-parquet",
+            "--action-version",
+            "1.0.0",
+            "--prep-sample-idx",
+            "55",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://q.example.test/api/v1/work-ticket"
+    assert captured["json"] == {
+        "action_id": "fastq-to-parquet",
+        "action_version": "1.0.0",
+        "scope_target": {"kind": "prep_sample", "prep_sample_idx": 55},
+    }
+
+
+def test_ticket_submit_with_context_json(monkeypatch):
+    """--context-json is parsed before POST; lands on the wire as action_context."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"work_ticket_idx": 12, "state": "pending"},
+        status=202,
+    )
+
+    rc = main(
+        [
+            "ticket",
+            "submit",
+            "--action-id",
+            "fastq-to-parquet",
+            "--action-version",
+            "1.0.0",
+            "--prep-sample-idx",
+            "55",
+            "--context-json",
+            '{"fastq_path": "/scratch/sample.fastq"}',
+        ]
+    )
+    assert rc == 0
+    assert captured["json"]["action_context"] == {"fastq_path": "/scratch/sample.fastq"}
+
+
+def test_ticket_submit_with_scope_target_json(monkeypatch):
+    """--scope-target-json is the escape hatch for non-prep_sample scopes."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"work_ticket_idx": 12, "state": "pending"},
+        status=202,
+    )
+
+    rc = main(
+        [
+            "ticket",
+            "submit",
+            "--action-id",
+            "reference-add",
+            "--action-version",
+            "1.0.0",
+            "--scope-target-json",
+            '{"kind": "reference", "reference_idx": 8}',
+        ]
+    )
+    assert rc == 0
+    assert captured["json"]["scope_target"] == {"kind": "reference", "reference_idx": 8}
+
+
+def test_ticket_submit_requires_a_scope_target(capsys):
+    """The mutex group is required=True; neither flag → exit 2."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "ticket",
+                "submit",
+                "--action-id",
+                "fastq-to-parquet",
+                "--action-version",
+                "1.0.0",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--prep-sample-idx" in err or "--scope-target-json" in err
+
+
+def test_ticket_submit_rejects_both_scope_target_forms(capsys):
+    """The mutex group rejects supplying both flags."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "ticket",
+                "submit",
+                "--action-id",
+                "fastq-to-parquet",
+                "--action-version",
+                "1.0.0",
+                "--prep-sample-idx",
+                "55",
+                "--scope-target-json",
+                '{"kind": "reference", "reference_idx": 8}',
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "not allowed" in err
+
+
+def test_ticket_submit_rejects_malformed_context_json(capsys):
+    """Malformed --context-json exits 2 via parser.error rather than a
+    JSONDecodeError traceback."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "ticket",
+                "submit",
+                "--action-id",
+                "fastq-to-parquet",
+                "--action-version",
+                "1.0.0",
+                "--prep-sample-idx",
+                "55",
+                "--context-json",
+                "{not-json",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--context-json" in err
+    assert "not valid JSON" in err
+
+
+# ---------------------------------------------------------------------------
 # --base-url http-to-non-localhost guard
 # ---------------------------------------------------------------------------
 

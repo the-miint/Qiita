@@ -22,12 +22,14 @@ from pydantic import BaseModel, ValidationError
 from qiita_common.models import (
     BiosampleImportRequest,
     Platform,
+    ScopeTargetKind,
     SequencedPoolCreateRequest,
     SequencedSampleCreateRequest,
     SequencingRunCreateRequest,
     StudyCreate,
     Tier,
     UserUpdate,
+    WorkTicketCreateRequest,
 )
 
 from . import _common
@@ -105,6 +107,14 @@ def _post_sequenced_sample(
         f"/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample",
         json=body,
     )
+
+
+def _post_work_ticket(base_url: str, token: str, body: dict) -> dict:
+    """POST /api/v1/work-ticket. originator_principal_idx is set server-side
+    from the authenticated caller; the body carries action_id, action_version,
+    scope_target (discriminated union), and action_context (free-form per the
+    action's declared context_schema)."""
+    return _common.call("POST", base_url, token, "/work-ticket", json=body)
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +348,44 @@ def _build_parser() -> argparse.ArgumentParser:
     # subsystem, not caller-supplied fields.
     p_seqsample_create.set_defaults(handler=_handle_sequenced_sample_create)
 
+    p_ticket = sub.add_parser("ticket", help="Work-ticket operations")
+    p_ticket_sub = p_ticket.add_subparsers(dest="ticket_cmd", required=True)
+    p_ticket_submit = p_ticket_sub.add_parser(
+        "submit",
+        help="Submit a work-ticket for an action (POST /work-ticket)",
+    )
+    p_ticket_submit.add_argument("--action-id", required=True)
+    p_ticket_submit.add_argument("--action-version", required=True)
+    # Scope-target shape is a discriminated union; the smoke path is
+    # prep_sample-scoped (fastq-to-parquet). --prep-sample-idx is the
+    # convenience flag for that common case; --scope-target-json is the
+    # escape hatch for non-prep_sample scope kinds. Exactly one is required.
+    target_group = p_ticket_submit.add_mutually_exclusive_group(required=True)
+    target_group.add_argument(
+        "--prep-sample-idx",
+        type=int,
+        help=(
+            "Submit a prep_sample-scoped ticket against this prep_sample_idx."
+            " Constructs scope_target={kind:prep_sample, prep_sample_idx:N}."
+        ),
+    )
+    target_group.add_argument(
+        "--scope-target-json",
+        help=(
+            "Verbatim scope_target as a JSON object — escape hatch for"
+            " non-prep_sample scope kinds (study_prep, reference)"
+        ),
+    )
+    p_ticket_submit.add_argument(
+        "--context-json",
+        help=(
+            "Action context as a JSON object (validated server-side against"
+            " the action's context_schema). For fastq-to-parquet:"
+            ' \'{"fastq_path": "/abs/path/sample.fastq"}\''
+        ),
+    )
+    p_ticket_submit.set_defaults(handler=_handle_ticket_submit)
+
     return parser
 
 
@@ -460,6 +508,32 @@ def _handle_sequenced_sample_create(
         return _post_sequenced_sample(args.base_url, token, args.run_idx, args.pool_idx, body)
 
     return _common.run_http_subcommand(_run)
+
+
+def _handle_ticket_submit(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Submit a work-ticket. Construct the scope_target from the convenience
+    --prep-sample-idx flag when supplied; otherwise parse --scope-target-json
+    verbatim. action_context comes from --context-json (or stays {} when
+    omitted). All JSON parsing flows through parse_json_arg so a malformed
+    paste lands as a clean exit 2.
+    """
+    if args.prep_sample_idx is not None:
+        args.scope_target = {
+            "kind": ScopeTargetKind.PREP_SAMPLE.value,
+            "prep_sample_idx": args.prep_sample_idx,
+        }
+    else:
+        args.scope_target = _common.parse_json_arg(
+            args.scope_target_json, parser, flag="--scope-target-json"
+        )
+    parsed_context = _common.parse_json_arg(args.context_json, parser, flag="--context-json")
+    # action_context defaults to {} server-side via the model; only set it
+    # when the user supplied --context-json so unset stays "not set".
+    if parsed_context is not None:
+        args.action_context = parsed_context
+
+    body = _build_body(WorkTicketCreateRequest, args, parser)
+    return _common.run_http_subcommand(lambda t: _post_work_ticket(args.base_url, t, body))
 
 
 def _build_body(
