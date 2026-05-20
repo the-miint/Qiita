@@ -313,6 +313,19 @@ Installed as the `qiita-admin` console script via `qiita-control-plane`'s pyproj
 | `token revoke-all --principal-idx N` | HTTP | Calls `POST /api/v1/admin/principal/{N}/revoke-all-tokens`. |
 | `login` | HTTP | Drives the LoginRocket Web flow end-to-end. Spawns a localhost loopback HTTP server, opens the browser to `/api/v1/auth/login?cli=1&port=N`, captures the one-time code from the redirect, exchanges it at `/api/v1/auth/cli-exchange`, and writes the PAT to `--token-file` (default `~/.qiita/token`, mode 0600). On timeout or error, prints an actionable message and exits non-zero. |
 
+## CLI (`qiita`)
+
+End-user companion to `qiita-admin`, installed as the `qiita` console script via the same pyproject. Subcommands grow as the user surface lands; current set:
+
+| Subcommand | Path | Notes |
+|---|---|---|
+| `login` | HTTP | Same LoginRocket loopback flow as `qiita-admin login`; defaults to writing the PAT to `~/.qiita/token`. |
+| `whoami` | HTTP | Calls `GET /api/v1/auth/whoami`. |
+| `profile set [--affiliation ... --address ... --phone ... --orcid ... --[no-]receive-processing-emails]` | HTTP | Calls `PATCH /api/v1/user/me` with only the fields the caller actually supplied (matches the server's `exclude_unset` semantics). Used to fill `affiliation`/`address`/`phone` so `qiita.user.profile_complete` flips to true. |
+| `study create --title T [--alias … --description … …]` | HTTP | Calls `POST /api/v1/study`. Caller is always the owner; the `--owner-idx` (lab-tech-on-behalf) path is intentionally not exposed. |
+
+Both CLIs share `cli/_common`: PAT file I/O, the loopback flow, the authenticated HTTP call helper, the `--base-url` / `--token-file` argparse helpers, and an HTTPS guard on `--base-url` (refuses plain `http://` to a non-localhost host unless `--insecure` is passed, because the PAT in the `Authorization` header would otherwise be sent in cleartext on the wire).
+
 ## CP ↔ CO service-to-service auth
 
 The control-plane runner dispatches workflow `step:` entries to the orchestrator via `POST /api/v1/step/run`. The reverse direction (CO → CP callbacks) is unused in v1 — workflow lifecycle and DB writes happen entirely on the control plane.

@@ -42,30 +42,31 @@ AUTO_DEPRECATE_REASON: str = "auto-deprecate-sync"
 # return inserted/updated counts without a second query.
 _UPSERT_SQL = """
 INSERT INTO qiita.action (
-    action_id, version, target_kind, description,
+    action_id, version, target_kind, target_processing_kinds, description,
     scopes, audience, context_schema, steps,
     cpu_ceiling, mem_ceiling_gb, walltime_ceiling, gpu_ceiling,
     success_status, failure_status
 )
 VALUES (
-    $1, $2, $3, $4,
-    $5, $6::jsonb, $7::jsonb, $8::jsonb,
-    $9, $10, $11, $12,
-    $13, $14
+    $1, $2, $3, $4::qiita.processing_kind[], $5,
+    $6, $7::jsonb, $8::jsonb, $9::jsonb,
+    $10, $11, $12, $13,
+    $14, $15
 )
 ON CONFLICT (action_id, version) DO UPDATE SET
-    target_kind      = EXCLUDED.target_kind,
-    description      = EXCLUDED.description,
-    scopes           = EXCLUDED.scopes,
-    audience         = EXCLUDED.audience,
-    context_schema   = EXCLUDED.context_schema,
-    steps            = EXCLUDED.steps,
-    cpu_ceiling      = EXCLUDED.cpu_ceiling,
-    mem_ceiling_gb   = EXCLUDED.mem_ceiling_gb,
-    walltime_ceiling = EXCLUDED.walltime_ceiling,
-    gpu_ceiling      = EXCLUDED.gpu_ceiling,
-    success_status   = EXCLUDED.success_status,
-    failure_status   = EXCLUDED.failure_status
+    target_kind             = EXCLUDED.target_kind,
+    target_processing_kinds = EXCLUDED.target_processing_kinds,
+    description             = EXCLUDED.description,
+    scopes                  = EXCLUDED.scopes,
+    audience                = EXCLUDED.audience,
+    context_schema          = EXCLUDED.context_schema,
+    steps                   = EXCLUDED.steps,
+    cpu_ceiling             = EXCLUDED.cpu_ceiling,
+    mem_ceiling_gb          = EXCLUDED.mem_ceiling_gb,
+    walltime_ceiling        = EXCLUDED.walltime_ceiling,
+    gpu_ceiling             = EXCLUDED.gpu_ceiling,
+    success_status          = EXCLUDED.success_status,
+    failure_status          = EXCLUDED.failure_status
 RETURNING xmax = 0 AS inserted
 """
 
@@ -163,6 +164,10 @@ async def sync_actions(
                 a.action_id,
                 a.version,
                 a.target_kind,
+                # asyncpg expects the array as a list of bare strings;
+                # the SQL ::qiita.processing_kind[] cast does the enum
+                # coercion on the DB side.
+                [k.value for k in a.target_processing_kinds],
                 a.description,
                 a.scopes,
                 audience_json,

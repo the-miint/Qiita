@@ -5,6 +5,9 @@ done page) and the token writer (atomic write, mode 0600, parent mkdir).
 The full process-spawn smoke is exercised by tests/integration via the
 real control plane + JwksHarness; this file's tests are stdlib-only and run
 in <100ms without I/O beyond a tmp dir.
+
+The helpers live in qiita_control_plane.cli._common; the end-user `qiita`
+CLI shares them with qiita-admin.
 """
 
 import http.client
@@ -16,11 +19,11 @@ from pathlib import Path
 import pytest
 from qiita_common.api_paths import LOOPBACK_HOST
 
-from qiita_control_plane.cli.admin import (
-    _bind_loopback,
-    _loopback_handler_factory,
-    _LoopbackResult,
-    _write_token,
+from qiita_control_plane.cli._common import (
+    LoopbackResult,
+    bind_loopback,
+    loopback_handler_factory,
+    write_token,
 )
 
 # ---------------------------------------------------------------------------
@@ -32,9 +35,9 @@ from qiita_control_plane.cli.admin import (
 def loopback_server():
     """Spin up a one-shot loopback server bound to an OS-picked port. Yields
     `(server, port, result)`; tear-down is in the finally."""
-    result = _LoopbackResult()
-    server, port = _bind_loopback()
-    server.RequestHandlerClass = _loopback_handler_factory(result)
+    result = LoopbackResult()
+    server, port = bind_loopback()
+    server.RequestHandlerClass = loopback_handler_factory(result)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -97,7 +100,7 @@ def test_loopback_ignores_root_get_without_ot_code(loopback_server):
 
 def test_write_token_creates_file_with_mode_0600(tmp_path: Path):
     target = tmp_path / "subdir" / "token"
-    _write_token(target, "qk_abcdefghij")
+    write_token(target, "qk_abcdefghij")
 
     assert target.read_text() == "qk_abcdefghij"
     # Check mode (mask off type bits).
@@ -111,7 +114,7 @@ def test_write_token_creates_parent_dir(tmp_path: Path):
     target = tmp_path / "fresh-dir" / "token"
     assert not target.parent.exists()
 
-    _write_token(target, "qk_xyz")
+    write_token(target, "qk_xyz")
 
     assert target.parent.is_dir()
     assert target.read_text() == "qk_xyz"
@@ -123,7 +126,7 @@ def test_write_token_overwrites_existing(tmp_path: Path):
     target = tmp_path / "token"
     target.write_text("qk_old_token")
 
-    _write_token(target, "qk_new_token")
+    write_token(target, "qk_new_token")
 
     assert target.read_text() == "qk_new_token"
 
@@ -132,7 +135,7 @@ def test_write_token_atomic_replace_leaves_no_tmp(tmp_path: Path):
     """The implementation writes to .tmp and renames; on success the .tmp
     file should not be left behind."""
     target = tmp_path / "token"
-    _write_token(target, "qk_value")
+    write_token(target, "qk_value")
 
     leftover = list(tmp_path.glob("*.tmp"))
     assert leftover == []

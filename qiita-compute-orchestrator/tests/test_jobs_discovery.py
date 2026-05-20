@@ -22,6 +22,7 @@ import uuid
 
 import pytest
 from pydantic import BaseModel
+from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
 
 from qiita_compute_orchestrator.jobs import (
     scan_native_jobs,
@@ -124,7 +125,7 @@ def test_scan_native_jobs_succeeds_on_real_tree():
     skeleton exports Inputs + execute and `__init__`/`__main__` are
     skipped."""
     validated = scan_native_jobs()
-    assert "qiita_compute_orchestrator.jobs.fastq_to_parquet" in validated
+    assert FASTQ_TO_PARQUET_MODULE in validated
 
 
 def test_scan_native_jobs_rejects_stray_non_dunder_file(fake_jobs_pkg):

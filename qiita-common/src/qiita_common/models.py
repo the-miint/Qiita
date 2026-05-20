@@ -6,7 +6,15 @@ from enum import StrEnum
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, EmailStr, Field, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    field_validator,
+    model_validator,
+)
 from pydantic.types import Base64Bytes
 
 # `SystemRole` is re-exported so existing `from qiita_common.models import SystemRole`
@@ -175,17 +183,45 @@ class StepRunRequest(BaseModel):
     `work_ticket_idx` flows through so SlurmBackend can stamp the SLURM
     job name with the originating ticket id — making scheduler dumps
     cross-referenceable back to the work_ticket row.
+
+    `scope_target` carries the work ticket's discriminated-union scope
+    target (matches `qiita_common.models.ScopeTarget`). The container
+    path inspects `scope_target["kind"]` and extracts the scalar(s) it
+    needs (e.g. `reference_idx` for reference-add); the native path
+    routes the dict through `flatten_native_inputs`, which merges the
+    scope's idx scalars into the job's `Inputs` model. Typed as a dict
+    (not the ScopeTarget union directly) to avoid a forward-reference /
+    model_rebuild dance — the field validator below runs the same
+    discriminated-union validation as `WorkTicket.scope_target` AND
+    normalizes the dict to JSON shape (`mode="json"`), so callers that
+    pass enum objects (e.g. `{"kind": ScopeTargetKind.REFERENCE}`) get
+    string values out the back. Downstream code can rely on
+    `scope_target["kind"] == ScopeTargetKind.X.value` without worrying
+    about which input shape produced the dict.
     """
 
     step_name: str = Field(min_length=1)
     inputs: dict[str, str] = Field(default_factory=dict)
     workspace: str = Field(min_length=1)
-    reference_idx: Annotated[int, Field(gt=0)]
+    scope_target: dict[str, Any]
     work_ticket_idx: Annotated[int, Field(gt=0)]
     container: str | None = Field(default=None, min_length=1, max_length=512)
     module: str | None = Field(default=None, min_length=1, max_length=512)
     entrypoint: str | None = None
     baseline_resources: StepBaselineResources | None = None
+
+    @field_validator("scope_target", mode="after")
+    @classmethod
+    def _validate_scope_target(cls, v: dict[str, Any]) -> dict[str, Any]:
+        # Delegate to the ScopeTarget discriminated union (defined later
+        # in this module) so the wire-side validation rule lives in one
+        # place. Returns a JSON-shape dict so enum inputs (e.g.
+        # `kind=ScopeTargetKind.REFERENCE`) come back as plain strings —
+        # callers compare against `.value` without caring how the dict
+        # was constructed.
+        from pydantic import TypeAdapter
+
+        return TypeAdapter(ScopeTarget).validate_python(v).model_dump(mode="json")
 
     @model_validator(mode="after")
     def _exactly_one_runtime(self) -> StepRunRequest:
@@ -719,6 +755,29 @@ class ScopeTargetKind(StrEnum):
 
     STUDY_PREP = "study_prep"
     REFERENCE = "reference"
+    PREP_SAMPLE = "prep_sample"
+
+
+class ProcessingKind(StrEnum):
+    """Closed set of downstream-measurement specializations a prep_sample
+    may flow into. Mirrors DB-side qiita.processing_kind, defined in
+    migrations/20260501000011_prep_sample.sql. Today only 'sequenced'
+    exists; future values (e.g., 'mass_specd') would land here as the
+    DB ENUM gains them. Used by `qiita.action.target_processing_kinds`
+    to declare which kinds an action accepts (kind-specific actions
+    list one value; cross-kind admin actions leave the list empty).
+
+    When extending the enum: each workflow YAML's `target_processing_kinds:`
+    is an explicit allowlist. New kinds do NOT auto-enroll into existing
+    workflows — the submission check (qiita_control_plane/routes/work_ticket.py)
+    rejects any prep_sample whose kind is not in the action's list. Adding
+    a new kind means landing the DB enum value, the subtype table (see
+    qiita-control-plane/tests/test_prep_sample_subtype_invariants.py for
+    the structural guardrail), and any new kind-specific workflows; it
+    does not require auditing existing YAMLs unless you want the new kind
+    to flow through them."""
+
+    SEQUENCED = "sequenced"
 
 
 class WorkTicketState(StrEnum):
@@ -784,13 +843,30 @@ class ReferenceScopeTarget(BaseModel):
     reference_idx: Annotated[int, Field(gt=0)]
 
 
+class PrepSampleScopeTarget(BaseModel):
+    """Work ticket targets one prep_sample (the supertype introduced by
+    #35) — used for actions that naturally operate on a single sample at
+    a time (e.g. fastq-to-parquet, one FASTQ → one Parquet). Distinct
+    from a study_prep-scoped ticket that fans out per sample inside a
+    map step: this form is the singleton path, one ticket per sample.
+
+    Kind-specific actions (e.g., fastq-to-parquet only makes sense for
+    processing_kind='sequenced') express their constraint through
+    `qiita.action.target_processing_kinds`, checked at submission. The
+    scope target itself stays kind-agnostic so cross-kind actions
+    (future admin/audit operations) can use the same shape."""
+
+    kind: Literal[ScopeTargetKind.PREP_SAMPLE]
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+
+
 # Discriminated union — Pydantic and OpenAPI dispatch on the `kind` field.
 # DB-side, the same shape is encoded as a tagged union of typed columns
 # (`scope_target_kind` plus the subset-relevant `study_idx` / `prep_idx` /
-# `reference_idx`) guarded by a CHECK constraint; the `kind` here is the
-# discriminator that maps to that column.
+# `reference_idx` / `prep_sample_idx`) guarded by a CHECK constraint;
+# the `kind` here is the discriminator that maps to that column.
 ScopeTarget = Annotated[
-    StudyPrepScopeTarget | ReferenceScopeTarget,
+    StudyPrepScopeTarget | ReferenceScopeTarget | PrepSampleScopeTarget,
     Field(discriminator="kind"),
 ]
 

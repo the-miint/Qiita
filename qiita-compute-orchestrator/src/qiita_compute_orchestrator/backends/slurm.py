@@ -25,7 +25,7 @@ from qiita_common.actions import BaselineResources
 from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.models import StepBaselineResources, WorkTicketFailureStage
 
-from ..backend import ComputeBackend
+from ..backend import ComputeBackend, assert_container_scope_supported
 from ..slurm import (
     SlurmJobInfo,
     SlurmrestdClient,
@@ -36,6 +36,7 @@ from ..slurm import (
     parse_outputs_map,
     verify_container_output,
 )
+from ..slurm.contract import JOB_PARAMS_FILENAME, JobParams
 
 # SLURM's job_state strings => FailureKind.
 #
@@ -100,7 +101,7 @@ class SlurmBackend(ComputeBackend):
         inputs: dict[str, Path],
         workspace: Path,
         *,
-        reference_idx: int,
+        scope_target: dict,
         work_ticket_idx: int,
         container: str | None = None,
         module: str | None = None,
@@ -127,6 +128,19 @@ class SlurmBackend(ComputeBackend):
                 reason="SlurmBackend requires `baseline_resources` from the YAML step",
             )
 
+        # Container-path scope-kind gate. Native steps
+        # (`module is not None`) flow scope_target through
+        # flatten_native_inputs and can target any scope kind, so they
+        # bypass this gate; container steps today (hash, load) all
+        # extract reference_idx from scope_target, so a non-reference
+        # scope would either KeyError reading params.json inside the
+        # container or silently produce garbage. Surface as
+        # CONTRACT_VIOLATION at submit time instead. The shared helper
+        # keeps SlurmBackend and LocalBackend in lockstep on both the
+        # predicate and the error wording.
+        if container is not None:
+            assert_container_scope_supported(step_name=name, scope_target=scope_target)
+
         # Lay out the workspace tree the container reads/writes:
         #   <workspace>/input/   contains params.json (mounted as $QIITA_INPUT_PATH)
         #   <workspace>/output/  receives manifest.json + outputs (mounted as $QIITA_OUTPUT_PATH)
@@ -140,21 +154,23 @@ class SlurmBackend(ComputeBackend):
         # slurmrestd submit body, which is visible in `scontrol show job`
         # and SLURM accounting (no place for signed Flight tickets or
         # per-step parameters). The container reads it from
-        # $QIITA_INPUT_PATH. Extend this dict when new step types land:
-        # per-sample steps add a prep_sample_idx list; tunable steps add
-        # an action-parameters block; data-plane-reading steps add a
-        # control-plane-minted Flight ticket.
-        params_path = input_path / "params.json"
+        # $QIITA_INPUT_PATH. `scope_target` is the work ticket's full
+        # tagged-union scope (matches qiita_common.models.ScopeTarget);
+        # the native-step launcher reads scope_target["kind"] to pick
+        # the right idx scalars to merge into the job's Inputs model,
+        # and container entrypoints inspect it for the same purpose.
+        # The Pydantic shape lives in slurm/contract.py so the producer
+        # here and the consumer (jobs/__main__.py) validate against the
+        # same schema.
+        params_path = input_path / JOB_PARAMS_FILENAME
         params_path.write_text(
-            json.dumps(
-                {
-                    "step_name": name,
-                    "reference_idx": reference_idx,
-                    "work_ticket_idx": work_ticket_idx,
-                    "inputs": {k: str(v) for k, v in inputs.items()},
-                    "output_path": str(output_path),
-                }
-            )
+            JobParams(
+                step_name=name,
+                scope_target=scope_target,
+                work_ticket_idx=work_ticket_idx,
+                inputs={k: str(v) for k, v in inputs.items()},
+                output_path=str(output_path),
+            ).model_dump_json()
         )
 
         baseline = BaselineResources(

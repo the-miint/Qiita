@@ -32,7 +32,7 @@ async def test_hash_job_produces_manifest(fasta_file, tmp_path):
         "hash",
         {"fasta_path": fasta_path},
         output_dir,
-        reference_idx=1,
+        scope_target={"kind": "reference", "reference_idx": 1},
         work_ticket_idx=1,
         container=REFERENCE_HASH_CONTAINER,
     )
@@ -57,7 +57,7 @@ async def test_hash_job_md5_matches_python(fasta_file, tmp_path):
         "hash",
         {"fasta_path": fasta_path},
         output_dir,
-        reference_idx=1,
+        scope_target={"kind": "reference", "reference_idx": 1},
         work_ticket_idx=1,
         container=REFERENCE_HASH_CONTAINER,
     )
@@ -85,7 +85,7 @@ async def test_hash_job_manifest_has_required_columns(fasta_file, tmp_path):
         "hash",
         {"fasta_path": fasta_path},
         output_dir,
-        reference_idx=1,
+        scope_target={"kind": "reference", "reference_idx": 1},
         work_ticket_idx=1,
         container=REFERENCE_HASH_CONTAINER,
     )
@@ -112,7 +112,7 @@ async def test_hash_job_rejects_missing_fasta(tmp_path):
             "hash",
             {"fasta_path": tmp_path / "nonexistent.fasta"},
             tmp_path / "output",
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=1,
             container=REFERENCE_HASH_CONTAINER,
         )
@@ -136,7 +136,7 @@ async def test_hash_job_rejects_duplicate_read_ids(tmp_path):
             "hash",
             {"fasta_path": fasta_path},
             tmp_path / "output",
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=1,
             container=REFERENCE_HASH_CONTAINER,
         )
@@ -157,7 +157,7 @@ async def test_hash_job_empty_fasta(tmp_path):
         "hash",
         {"fasta_path": fasta_path},
         tmp_path / "output",
-        reference_idx=1,
+        scope_target={"kind": "reference", "reference_idx": 1},
         work_ticket_idx=1,
         container=REFERENCE_HASH_CONTAINER,
     )

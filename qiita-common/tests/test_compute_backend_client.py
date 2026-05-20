@@ -102,7 +102,7 @@ async def test_run_step_posts_to_step_run_endpoint(tmp_path):
         step_name="hash",
         inputs={"fasta_path": Path("/data/in.fa")},
         workspace=Path("/workspace"),
-        reference_idx=42,
+        scope_target={"kind": "reference", "reference_idx": 42},
         work_ticket_idx=99,
         # container is required by the StepRunRequest exactly-one(container, module)
         # validator. The test exercises the wire shape; either runtime works.
@@ -117,7 +117,7 @@ async def test_run_step_posts_to_step_run_endpoint(tmp_path):
     assert body["step_name"] == "hash"
     assert body["inputs"] == {"fasta_path": "/data/in.fa"}
     assert body["workspace"] == "/workspace"
-    assert body["reference_idx"] == 42
+    assert body["scope_target"] == {"kind": "reference", "reference_idx": 42}
     assert body["work_ticket_idx"] == 99
     # Outputs come back as Paths the runner can plumb into downstream entries.
     assert outputs == {"manifest": Path("/workspace/manifest.parquet")}
@@ -170,7 +170,7 @@ async def test_run_step_reconstructs_backend_failure(tmp_path):
             step_name="load",
             inputs={},
             workspace=Path("/workspace"),
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=1,
             container=REFERENCE_LOAD_CONTAINER,
         )
@@ -209,7 +209,7 @@ async def test_run_step_without_header_falls_through_to_raise_for_status(tmp_pat
             step_name="x",
             inputs={},
             workspace=Path("/workspace"),
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=1,
             container="qiita/test:1.0.0",
         )
