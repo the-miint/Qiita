@@ -6,9 +6,10 @@ single-biosample import (POST) and the study-scoped bulk-id read
 carries the single-resource read (GET /{biosample_idx}) and the
 single-resource PATCH (PATCH /{biosample_idx}). Bulk-import,
 retirement, search, and admin metadata-schema endpoints are deferred.
-The write handler gates on caller scope, role, and study existence and
-delegates the multi-table write to the repositories.biosample composer
-inside one connection-scoped transaction; the study-scoped read gates
+The write handler gates on caller scope, study existence, and
+per-study ADMIN access (wet_lab_admin+ bypass) and delegates the
+multi-table write to the repositories.biosample composer inside one
+connection-scoped transaction; the study-scoped read gates
 on caller scope and study access (with admin role bypass); the
 single-biosample read gates on caller scope, then 404s on missing or
 retired biosamples and gates non-admin callers on
@@ -101,14 +102,20 @@ async def import_biosample(
     tx: TxConnFactory = Depends(get_tx_conn_factory),
     user: HumanUser = Depends(require_complete_profile),
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_WRITE)),
-    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
     _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
 ) -> BiosampleImportResponse:
     """Create a biosample on a study, atomically with its owner-provided id and metadata.
 
     The caller must be a HumanUser with profile_complete=True, must hold
-    the biosample:write scope, must be wet_lab_admin or higher, and the
-    path's study_idx must exist.
+    the biosample:write scope, and must have `Tier.ADMIN` access (or
+    higher) to the path's study — equivalently, must own the study OR
+    carry a `study_access` row at the ADMIN tier OR be wet_lab_admin /
+    system_admin (role bypass). `require_study_exists` composes alongside
+    `require_study_access` so role-bypass callers still get 404 on a
+    non-existent study_idx rather than slipping through to an FK violation.
     """
     async with tx() as conn:
         # Owner eligibility pre-flight; collapses every ineligibility case to

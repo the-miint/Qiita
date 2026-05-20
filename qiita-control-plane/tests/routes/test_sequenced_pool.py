@@ -1,10 +1,11 @@
 """Integration tests for POST /api/v1/sequencing-run/{idx}/sequenced-pool.
 
-Exercises happy paths under wet_lab_admin and system_admin, the role /
-scope guards, regular-user role rejection, Pydantic body validation,
-the 404 on a missing parent sequencing_run, round-trip byte-equality
-of the run_preflight_blob via base64, and the both-or-neither
-nullability of the (blob, filename) preflight pair.
+Exercises happy paths under wet_lab_admin and system_admin, the scope
+guard, the caller-creator guard on the path's sequencing_run
+(`require_caller_owns_run`, wet_lab_admin+ bypass), Pydantic body
+validation, the 404 on a missing parent sequencing_run, round-trip
+byte-equality of the run_preflight_blob via base64, and the
+both-or-neither nullability of the (blob, filename) preflight pair.
 """
 
 import base64
@@ -178,24 +179,45 @@ async def test_create_sequenced_pool_missing_scope_403(ctx, no_prep_sample_write
     assert "prep_sample:write" in resp.json()["detail"]
 
 
-async def test_create_sequenced_pool_regular_user_role_403(
-    ctx, regular_user_with_prep_sample_write_client
-):
-    # Regular user holding an explicit PREP_SAMPLE_WRITE-bearing PAT:
-    # require_scope passes, then require_role_at_least(WET_LAB_ADMIN)
-    # rejects. The session-fixture user token does not carry
-    # PREP_SAMPLE_WRITE (excluded from the USER role ceiling), so a
-    # dedicated PAT is needed to exercise the role gate independently.
+async def test_create_sequenced_pool_regular_user_not_creator_403(ctx):
+    # Regular user attempts to attach a pool to a run created by the
+    # wet_lab_admin (see `_seed_sequencing_run`). require_scope passes
+    # (prep_sample:write is in the USER ceiling) but
+    # require_caller_owns_run() rejects with 403 because the caller is
+    # not the run's `created_by_idx`. The 403 detail names the run so a
+    # client can see *why* it was denied.
     run_idx = await _seed_sequencing_run(ctx, "user")
-    resp = await regular_user_with_prep_sample_write_client.post(
-        f"/api/v1/sequencing-run/{run_idx}/sequenced-pool",
-        json={
-            "run_preflight_blob": _b64(b"X"),
-            "run_preflight_filename": "f.sqlite",
-        },
+    resp = await _post_pool(
+        ctx["user"],
+        ctx,
+        run_idx,
+        run_preflight_blob=_b64(b"X"),
+        run_preflight_filename="f.sqlite",
     )
     assert resp.status_code == 403
-    assert "wet_lab_admin" in resp.json()["detail"]
+    assert f"sequencing_run {run_idx}" in resp.json()["detail"]
+
+
+async def test_create_sequenced_pool_regular_user_creator_passes(ctx):
+    # Regular user creates their own run, then posts a pool against it;
+    # require_caller_owns_run sees them as the creator and the create
+    # succeeds. Pins the end-to-end user-CLI flow.
+    run_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.sequencing_run (instrument_run_id, platform, created_by_idx)"
+        " VALUES ($1, 'illumina'::qiita.platform, $2) RETURNING idx",
+        unique_instrument_id("user-creator"),
+        ctx["user_session"]["principal_idx"],
+    )
+    ctx["created"]["sequencing_run"].append(run_idx)
+
+    resp = await _post_pool(
+        ctx["user"],
+        ctx,
+        run_idx,
+        run_preflight_blob=_b64(b"\x00\x01"),
+        run_preflight_filename="user.sqlite",
+    )
+    assert resp.status_code == 201, resp.text
 
 
 # ===========================================================================

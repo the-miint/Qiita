@@ -145,10 +145,10 @@ async def no_prep_sample_read_client(make_pat_client):
 
 @pytest_asyncio.fixture
 async def regular_user_with_prep_sample_write_client(make_pat_client):
-    """A regular_user PAT that *does* carry Scope.PREP_SAMPLE_WRITE so the
-    require_scope gate passes and the require_role_at_least(WET_LAB_ADMIN)
-    gate is what trips. PREP_SAMPLE_WRITE is outside the USER role ceiling
-    by policy; mint_api_token only validates against VALID_SCOPES."""
+    """A regular_user PAT scoped to only SELF_PROFILE + PREP_SAMPLE_WRITE.
+
+    Use when a test needs the *minimal* scope set to reach a downstream
+    gate; the standard `ctx["user"]` client carries the full USER ceiling."""
     return await make_pat_client(
         label="user-with-prep-sample-write",
         scopes=[Scope.SELF_PROFILE, Scope.PREP_SAMPLE_WRITE],

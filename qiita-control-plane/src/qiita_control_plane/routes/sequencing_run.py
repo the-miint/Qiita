@@ -3,12 +3,14 @@
 Holds the two POST handlers that load-code uses to land a sequencing
 run and its lanes: POST /sequencing-run and POST
 /sequencing-run/{idx}/sequenced-pool. Both write handlers gate on caller
-scope (Scope.PREP_SAMPLE_WRITE) and role (wet_lab_admin or higher) plus
-require_complete_profile (humans-only) and delegate their DB work to the
-repositories.sequencing_run module. The per-item sequenced-sample import
-composer, the run-scoped sequenced_sample bulk-id read, and the
-single-sequenced-sample read/PATCH live in the sibling sequenced_sample
-route module.
+scope (Scope.PREP_SAMPLE_WRITE) plus require_complete_profile
+(humans-only). The run POST has no system_role gate (any USER may stand
+up a run); the pool POST additionally gates on caller-creator semantics
+against the path's run via `require_caller_owns_run()` (wet_lab_admin+
+bypass). Both delegate their DB work to the repositories.sequencing_run
+module. The per-item sequenced-sample import composer, the run-scoped
+sequenced_sample bulk-id read, and the single-sequenced-sample
+read/PATCH live in the sibling sequenced_sample route module.
 """
 
 from typing import Annotated
@@ -16,7 +18,7 @@ from typing import Annotated
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import Field
-from qiita_common.auth_constants import Scope, SystemRole
+from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     SequencedPoolCreateRequest,
     SequencedPoolCreateResponse,
@@ -25,8 +27,8 @@ from qiita_common.models import (
 )
 
 from ..auth.guards import (
+    require_caller_owns_run,
     require_complete_profile,
-    require_role_at_least,
     require_scope,
     require_sequencing_run_exists,
 )
@@ -52,12 +54,14 @@ async def create_sequencing_run(
     tx: TxConnFactory = Depends(get_tx_conn_factory),
     user: HumanUser = Depends(require_complete_profile),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_WRITE)),
-    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
 ) -> SequencingRunCreateResponse:
     """Create a sequencing_run row.
 
-    The caller must be a HumanUser with profile_complete=True, must hold
-    the prep_sample:write scope, and must be wet_lab_admin or higher.
+    The caller must be a HumanUser with profile_complete=True and must
+    hold the prep_sample:write scope. No system_role gate: a run is a
+    bench-side container with no per-resource ownership constraints to
+    inherit, so any USER may stand one up. Downstream pool / sample
+    routes gate on caller-creator semantics against this run.
     """
     async with tx() as conn:
         # Single INSERT inside the transaction so the audit / retention
@@ -87,16 +91,19 @@ async def create_sequenced_pool(
     tx: TxConnFactory = Depends(get_tx_conn_factory),
     user: HumanUser = Depends(require_complete_profile),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_WRITE)),
-    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
     _run_exists: None = Depends(require_sequencing_run_exists),
+    _owns_run: None = Depends(require_caller_owns_run()),
 ) -> SequencedPoolCreateResponse:
     """Create a sequenced_pool attached to the path's sequencing_run.
 
-    The require_sequencing_run_exists guard fires the 404 before the
-    transaction opens. The run preflight is optional: when present, the
-    body's run_preflight_blob is base64-decoded by Pydantic and the route
-    stores the raw bytes in the BYTEA column; the model rejects a
-    half-populated (blob, filename) pair before this handler runs.
+    `require_sequencing_run_exists` fires the 404 before the transaction
+    opens. `require_caller_owns_run()` then gates on the caller being
+    the creator of the path's `sequencing_run` (wet_lab_admin or higher
+    bypass via the guard's default `bypass_role`). The run preflight is
+    optional: when present, the body's run_preflight_blob is base64-decoded
+    by Pydantic and the route stores the raw bytes in the BYTEA column;
+    the model rejects a half-populated (blob, filename) pair before this
+    handler runs.
     """
     async with tx() as conn:
         try:

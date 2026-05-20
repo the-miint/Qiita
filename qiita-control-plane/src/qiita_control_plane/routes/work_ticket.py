@@ -24,8 +24,12 @@ fired by submission.
 
 Auth: every route here requires the caller to be in the action's
 `audience` (humans by `system_role`, or service accounts) AND to hold
-all of `action.scopes`. Resource-level ACL beyond that is action-specific
-and not enforced here.
+all of `action.scopes`. prep_sample-scoped submissions additionally
+require the caller to have `Tier.ADMIN` on every non-retired study
+linked to the prep_sample (wet_lab_admin+ bypass), see
+`_check_prep_sample_study_access`. Reference- and study_prep-scoped
+submissions carry no per-resource gate at this layer; the action's
+own audience / scope choices are the policy.
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ from qiita_common.api_paths import (
     PATH_WORK_TICKET_ROOT,
     PATH_WORK_TICKET_RUN,
 )
+from qiita_common.auth_constants import SystemRole
 from qiita_common.models import (
     ScopeTargetKind,
     WorkTicketCreateRequest,
@@ -50,9 +55,11 @@ from qiita_common.models import (
 )
 
 from ..actions.context_validator import validate_context
+from ..auth.guards import require_caller_has_admin_on_all_studies
 from ..auth.principal import HumanUser, Principal, ServiceAccount, get_current_principal
 from ..deps import get_db_pool
 from ..dispatch import NON_TERMINAL_WORK_TICKET_STATES, schedule_dispatch
+from ..repositories.prep_sample import fetch_active_study_idxs_for_prep_sample
 
 _log = logging.getLogger(__name__)
 
@@ -243,6 +250,34 @@ async def _check_disallow_without_delete(
         )
 
 
+async def _check_prep_sample_study_access(
+    pool: asyncpg.Pool, *, prep_sample_idx: int, caller: Principal
+) -> None:
+    """Require Tier.ADMIN (or owner / wet_lab_admin+) on every non-retired
+    study link of this prep_sample. Skipped for ServiceAccount (no
+    prep_sample-scoped action admits service accounts today) and
+    bypass-role callers without a DB read. An orphaned prep_sample (all
+    links retired) passes — downstream lookups fail elsewhere.
+
+    Policy is "caller had access at submit time"; this read runs on the
+    pool, not the work_ticket INSERT transaction, so a study_access row
+    racing with the gate decides arbitrarily. Future per-resource gates
+    on other scope kinds are expected to follow the same shape.
+    """
+    if isinstance(caller, ServiceAccount):
+        return
+    if caller.has_role_at_least(SystemRole.WET_LAB_ADMIN):
+        return
+    study_idxs = await fetch_active_study_idxs_for_prep_sample(pool, prep_sample_idx)
+    if not study_idxs:
+        return
+    await require_caller_has_admin_on_all_studies(
+        pool,
+        caller=caller,
+        study_idxs=study_idxs,
+    )
+
+
 def _require_compute_backend_client(request: Request) -> None:
     """Guard that 503s if the orchestrator dispatch path is not configured.
     Prevents creating tickets that can never run."""
@@ -329,6 +364,13 @@ async def submit_work_ticket(
                     "action_target_processing_kinds": action["target_processing_kinds"],
                 },
             )
+
+    if scope_target["kind"] == ScopeTargetKind.PREP_SAMPLE.value:
+        await _check_prep_sample_study_access(
+            pool,
+            prep_sample_idx=scope_target["prep_sample_idx"],
+            caller=principal,
+        )
 
     context_errors = validate_context(action["context_schema"], body.action_context)
     if context_errors:

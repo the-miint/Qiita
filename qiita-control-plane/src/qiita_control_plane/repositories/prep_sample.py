@@ -17,6 +17,22 @@ calls compose atomically on one connection.
 import asyncpg
 
 
+async def fetch_active_study_idxs_for_prep_sample(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    prep_sample_idx: int,
+) -> list[int]:
+    """Return non-retired qiita.prep_sample_to_study study_idxs for this
+    prep_sample. Empty list when every link is retired or the sample is
+    orphaned. Used by the work_ticket submission gate to enforce
+    per-study admin access on prep_sample-scoped tickets."""
+    rows = await pool_or_conn.fetch(
+        "SELECT study_idx FROM qiita.prep_sample_to_study"
+        " WHERE prep_sample_idx = $1 AND retired = false",
+        prep_sample_idx,
+    )
+    return [r["study_idx"] for r in rows]
+
+
 async def insert_prep_sample(
     conn: asyncpg.Connection,
     *,

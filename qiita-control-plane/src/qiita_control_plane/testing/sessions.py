@@ -224,6 +224,9 @@ async def regular_user_session(postgres_pool):
         postgres_pool,
         principal_idx=idx,
         label="session-user",
+        # Mirrors ROLE_IMPLIED_SCOPES[USER] in auth/scopes.py — keep in
+        # lockstep so the session-fixture user can exercise every route
+        # the USER ceiling admits.
         scopes=[
             Scope.SELF_PROFILE,
             Scope.SELF_TOKEN,
@@ -231,6 +234,7 @@ async def regular_user_session(postgres_pool):
             Scope.BIOSAMPLE_READ,
             Scope.BIOSAMPLE_WRITE,
             Scope.PREP_SAMPLE_READ,
+            Scope.PREP_SAMPLE_WRITE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
         ],

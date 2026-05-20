@@ -14,17 +14,24 @@ globally-linked metadata, and the single-resource PATCH (PATCH
 /{sequenced_sample_idx}) that edits the subtype-table columns (ENA
 accessions and submission tracking).
 
-Every write handler gates on caller scope (Scope.PREP_SAMPLE_WRITE) and
-role (wet_lab_admin or higher) plus require_complete_profile
-(humans-only). The run-scoped and single-resource reads gate on
-Scope.PREP_SAMPLE_READ + wet_lab_admin role unconditionally; the
-study-scoped roster read instead gates on Scope.STUDY_READ + study
-existence + study access (viewer tier, wet_lab_admin and system_admin
-bypass tier), mirroring the biosample study-roster read. All handlers
-delegate their DB work to the sibling repository modules. Service
-accounts are rejected by the role gate today; a wider auth-model change
-is required before submission-subsystem service accounts can satisfy
-require_role_at_least.
+Every write handler gates on caller scope (Scope.PREP_SAMPLE_WRITE) plus
+require_complete_profile (humans-only). The POST composer additionally
+gates on caller-creator semantics on the path's `sequenced_pool` (via
+`require_caller_owns_pool()`, wet_lab_admin+ bypass) and on per-study
+ADMIN access across every listed study in the body (via
+`require_caller_has_admin_on_all_studies`, same bypass). The PATCH
+still composes `require_role_at_least(WET_LAB_ADMIN)` because its
+editable column set (ENA accessions + submission tracking) is operated
+by the submission subsystem, not by sample owners. The run-scoped and
+single-resource reads gate on Scope.PREP_SAMPLE_READ + wet_lab_admin
+role unconditionally; the study-scoped roster read instead gates on
+Scope.STUDY_READ + study existence + study access (viewer tier,
+wet_lab_admin and system_admin bypass tier), mirroring the biosample
+study-roster read. All handlers delegate their DB work to the sibling
+repository modules. Service accounts are still rejected by the PATCH's
+role gate today; a wider auth-model change (so ServiceAccount carries a
+system_role) is required before submission-subsystem service accounts
+can satisfy require_role_at_least.
 """
 
 from typing import Annotated
@@ -44,6 +51,8 @@ from qiita_common.models import (
 )
 
 from ..auth.guards import (
+    require_caller_has_admin_on_all_studies,
+    require_caller_owns_pool,
     require_complete_profile,
     require_eligible_owner,
     require_human,
@@ -125,21 +134,25 @@ async def import_sequenced_sample_from_run(
     tx: TxConnFactory = Depends(get_tx_conn_factory),
     user: HumanUser = Depends(require_complete_profile),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_WRITE)),
-    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
     _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+    _owns_pool: None = Depends(require_caller_owns_pool()),
 ) -> SequencedSampleCreateResponse:
     """Create a sequenced prep_sample with study links and metadata, atomically.
 
-    Path consistency: the pool named in the URL must belong to the run
-    named in the URL. The require_sequenced_pool_in_run guard fires the
-    404 (pool missing) or 422 (pool exists but does not belong to the
-    run) before the transaction opens. Inside the transaction, the route
-    checks owner eligibility and delegates the multi-table write to the
-    import_sequenced_prep_sample composer; composer-side validation errors
-    and DB-level constraint / trigger violations are mapped to 422 / 409
-    with user-friendly detail strings.
+    The composer write runs inside one connection-scoped transaction;
+    composer-side validation errors and DB-level constraint / trigger
+    violations are mapped to 422 / 409 with user-friendly detail
+    strings. The body-level multi-study admin-access check runs first
+    inside the transaction so a forbidden study fails before the
+    owner-eligibility lookup pulls more data.
     """
     async with tx() as conn:
+        await require_caller_has_admin_on_all_studies(
+            conn,
+            caller=user,
+            study_idxs=[body.primary_study_idx, *body.secondary_study_idxs],
+        )
+
         # Owner eligibility pre-flight inside the transaction; collapses
         # every ineligibility case to one 422 and shares the lookup with
         # any future composers on the same connection.

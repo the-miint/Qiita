@@ -244,6 +244,7 @@ async def _seed_action(
     target_kind: str = "reference",
     scopes: list[str] | None = None,
     target_processing_kinds: list[str] | None = None,
+    human_roles: list[str] | None = None,
 ) -> tuple[str, str]:
     """Insert an enabled action with the given context_schema and
     target_kind. Returns (action_id, version). Caller is responsible
@@ -254,7 +255,9 @@ async def _seed_action(
     don't fit that grant. `target_processing_kinds` only applies when
     target_kind = 'prep_sample'; left as default-empty otherwise (the
     DB CHECK action_processing_kinds_only_for_prep_sample enforces
-    that pairing)."""
+    that pairing). `human_roles` overrides the default audience
+    ([system_admin]) — pass [user, wet_lab_admin, system_admin] to
+    exercise the wider audience the fastq-to-parquet YAML declares."""
     action_id = "wt-test-action"
     version = f"v-{uuid.uuid4()}"
     await postgres_pool.execute(
@@ -271,7 +274,14 @@ async def _seed_action(
         target_kind,
         target_processing_kinds or [],
         scopes if scopes is not None else [Scope.REFERENCE_WRITE.value],
-        json.dumps({"service": False, "human_roles": [SystemRole.SYSTEM_ADMIN.value]}),
+        json.dumps(
+            {
+                "service": False,
+                "human_roles": (
+                    human_roles if human_roles is not None else [SystemRole.SYSTEM_ADMIN.value]
+                ),
+            }
+        ),
         json.dumps(context_schema),
         json.dumps(_TEST_STEPS),
         "active",
@@ -337,6 +347,92 @@ async def sequenced_only_prep_sample_action(postgres_pool):
     )
     yield action_id, version
     await _drop_action(postgres_pool, action_id, version)
+
+
+@pytest.fixture
+async def user_audience_prep_sample_action(postgres_pool):
+    """An enabled, prep_sample-targeting action whose audience admits
+    USER (plus wet_lab_admin / system_admin) — mirrors the audience
+    fastq-to-parquet declares in its YAML. Drives the per-resource
+    study-access gate the work_ticket POST applies for prep_sample-
+    scoped submissions. Scopes left empty (the gate runs independent of
+    scope checks); target_processing_kinds left empty so the test
+    doesn't have to wrestle with the kind-match arm too."""
+    action_id, version = await _seed_action(
+        postgres_pool,
+        context_schema={},
+        target_kind="prep_sample",
+        scopes=[],
+        human_roles=[
+            SystemRole.USER.value,
+            SystemRole.WET_LAB_ADMIN.value,
+            SystemRole.SYSTEM_ADMIN.value,
+        ],
+    )
+    yield action_id, version
+    await _drop_action(postgres_pool, action_id, version)
+
+
+@pytest.fixture
+async def prep_sample_with_study_link(postgres_pool, prep_sample_idx, admin_token):
+    """The shared sequenced prep_sample plus a non-retired
+    `prep_sample_to_study` link against a freshly-seeded study owned by
+    the admin principal. Returns `(prep_sample_idx, study_idx,
+    study_owner_idx)`. No `study_access` row is seeded by default — the
+    test chooses whether to insert a grant.
+
+    The biosample-side link is required by the
+    `prep_sample_to_study_reject_without_biosample_link` trigger: a
+    `prep_sample_to_study` insert raises unless a non-retired
+    `biosample_to_study` already exists on the same study. Without
+    this, the fixture's INSERT fails with a confusing RaiseError instead
+    of yielding."""
+    _, admin_idx = admin_token
+    study_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
+        " VALUES ($1, $2, $1) RETURNING idx",
+        admin_idx,
+        f"wt-prep-sample-study-{uuid.uuid4()}",
+    )
+    # The biosample side has no such trigger; we resolve the prep_sample's
+    # biosample via the supertype column and link it to the new study.
+    biosample_idx = await postgres_pool.fetchval(
+        "SELECT biosample_idx FROM qiita.prep_sample WHERE idx = $1",
+        prep_sample_idx,
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.biosample_to_study (biosample_idx, study_idx, created_by_idx)"
+        " VALUES ($1, $2, $3)",
+        biosample_idx,
+        study_idx,
+        admin_idx,
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.prep_sample_to_study (prep_sample_idx, study_idx, created_by_idx)"
+        " VALUES ($1, $2, $3)",
+        prep_sample_idx,
+        study_idx,
+        admin_idx,
+    )
+
+    yield prep_sample_idx, study_idx, admin_idx
+
+    # FK-reverse cleanup of just the rows this fixture created.
+    await postgres_pool.execute(
+        "DELETE FROM qiita.study_access WHERE study_idx = $1",
+        study_idx,
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = $1 AND study_idx = $2",
+        prep_sample_idx,
+        study_idx,
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = $1 AND study_idx = $2",
+        biosample_idx,
+        study_idx,
+    )
+    await postgres_pool.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
 
 
 @pytest.fixture
@@ -543,6 +639,104 @@ async def test_submit_prep_sample_kind_check_404_on_missing_prep(
 # the enum only contains 'sequenced'; every seedable prep_sample matches
 # every sequenced-only action by construction, so the negative path
 # cannot be exercised without amending the ENUM and a new subtype.
+
+
+# ---------------------------------------------------------------------------
+# Per-resource study-access gate for prep_sample-scoped tickets
+# ---------------------------------------------------------------------------
+
+
+async def test_submit_prep_sample_user_without_admin_tier_403(
+    wt_client,
+    postgres_pool,
+    regular_token,
+    user_audience_prep_sample_action,
+    prep_sample_with_study_link,
+):
+    """USER caller submitting against a prep_sample whose only non-retired
+    linked study they have no ADMIN access to gets 403 from the new
+    per-resource gate. Pins both that the gate runs and that the 403
+    detail names the offending study (so a USER caller can ask for
+    access by study_idx)."""
+    token, _ = regular_token
+    action_id, version = user_audience_prep_sample_action
+    prep_sample_idx, study_idx, _ = prep_sample_with_study_link
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 403, resp.text
+    assert f"study {study_idx}" in resp.json()["detail"]
+
+
+async def test_submit_prep_sample_user_with_admin_tier_passes(
+    wt_client,
+    postgres_pool,
+    regular_token,
+    user_audience_prep_sample_action,
+    prep_sample_with_study_link,
+):
+    """USER caller granted Tier.ADMIN on the prep_sample's linked study
+    passes the per-resource gate and the submission lands."""
+    token, user_idx = regular_token
+    action_id, version = user_audience_prep_sample_action
+    prep_sample_idx, study_idx, granted_by_idx = prep_sample_with_study_link
+
+    await postgres_pool.execute(
+        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier, granted_by_idx)"
+        " VALUES ($1, $2, 'admin'::qiita.tier, $3)",
+        study_idx,
+        user_idx,
+        granted_by_idx,
+    )
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
+
+
+async def test_submit_prep_sample_admin_bypasses_study_access(
+    wt_client,
+    admin_token,
+    user_audience_prep_sample_action,
+    prep_sample_with_study_link,
+):
+    """system_admin submits against a prep_sample whose linked study they
+    have no `study_access` row on — `require_caller_has_admin_on_all_studies`
+    short-circuits on `has_role_at_least(WET_LAB_ADMIN)` before any DB
+    lookup runs. Pins the bypass invariant for the wider audience."""
+    token, _ = admin_token
+    action_id, version = user_audience_prep_sample_action
+    prep_sample_idx, _study_idx, _granted_by_idx = prep_sample_with_study_link
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
 
 
 async def test_submit_unknown_action_returns_404(wt_client, admin_token, reference_idx):

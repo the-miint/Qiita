@@ -41,8 +41,13 @@ description: >
 scopes: []
 
 audience:
+  # End users can submit fastq-to-parquet for prep_samples whose every
+  # non-retired linked study they have ADMIN access to. The work_ticket
+  # POST route applies the per-study tier gate; wet_lab_admin and
+  # system_admin bypass it (same bypass as the biosample / sequenced-
+  # sample write surfaces).
   service: false
-  human_roles: [system_admin]
+  human_roles: [user, wet_lab_admin, system_admin]
 
 context_schema:
   type: object
