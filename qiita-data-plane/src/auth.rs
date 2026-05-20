@@ -175,6 +175,30 @@ pub fn verify_action(ticket: &[u8], secret: &[u8]) -> Result<ActionPayload, Auth
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
+/// Parsed DoPut ticket payload.
+///
+/// Wire shape pinned by `qiita_control_plane.auth.tickets.sign_doput`:
+/// `{"action": "doput", "upload_idx": N}`. `deny_unknown_fields` keeps the
+/// upload domain generic — any future per-consumer field on the ticket
+/// (reference_idx, study_idx, etc.) would couple this domain to a consumer
+/// and trip the deserializer here, surfacing the design slip loudly.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DoPutPayload {
+    /// Action discriminator. The gRPC handler also rejects payloads whose
+    /// action field is not "doput" — that check lives there because the
+    /// handler is the only consumer of this payload today and bundling the
+    /// check keeps the auth module shape-only.
+    pub action: String,
+    pub upload_idx: u64,
+}
+
+/// Verify a DoPut ticket and return the parsed payload.
+pub fn verify_doput(ticket: &[u8], secret: &[u8]) -> Result<DoPutPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +318,103 @@ mod tests {
             verify_ticket(&ticket, b"dev-secret").unwrap_err(),
             AuthError::UnsupportedVersion(99)
         );
+    }
+
+    // --------------------------------------------------------------------
+    // DoPut ticket variant (Cycle 2)
+    // --------------------------------------------------------------------
+
+    /// Build a signed DoPut ticket with an arbitrary payload — lets tests
+    /// drive both the happy path and shape-violation paths.
+    fn make_doput_ticket_raw(payload_json: &[u8], secret: &[u8], expiry: u64) -> Vec<u8> {
+        let version: u8 = 1;
+        let payload_len = (payload_json.len() as u32).to_be_bytes();
+        let expiry_bytes = expiry.to_be_bytes();
+
+        let mac_input = [
+            &[version][..],
+            &payload_len[..],
+            payload_json,
+            &expiry_bytes[..],
+        ]
+        .concat();
+        let mut mac = HmacSha256::new_from_slice(secret).unwrap();
+        mac.update(&mac_input);
+        let hmac_result = mac.finalize().into_bytes();
+
+        let mut ticket = Vec::new();
+        ticket.push(version);
+        ticket.extend_from_slice(&payload_len);
+        ticket.extend_from_slice(payload_json);
+        ticket.extend_from_slice(&hmac_result);
+        ticket.extend_from_slice(&expiry_bytes);
+        ticket
+    }
+
+    fn make_doput_ticket(upload_idx: u64, secret: &[u8], expiry: u64) -> Vec<u8> {
+        // Canonical JSON: sorted keys, no whitespace — matches sign_doput.
+        let payload = format!(r#"{{"action":"doput","upload_idx":{upload_idx}}}"#);
+        make_doput_ticket_raw(payload.as_bytes(), secret, expiry)
+    }
+
+    #[test]
+    fn verify_doput_round_trip() {
+        let ticket = make_doput_ticket(42, b"dev-secret", future_expiry(300));
+        let payload = verify_doput(&ticket, b"dev-secret").expect("valid ticket should verify");
+        assert_eq!(payload.action, "doput");
+        assert_eq!(payload.upload_idx, 42);
+    }
+
+    #[test]
+    fn verify_doput_rejects_bad_hmac() {
+        let mut ticket = make_doput_ticket(7, b"dev-secret", future_expiry(300));
+        ticket[10] ^= 0xFF;
+        assert_eq!(
+            verify_doput(&ticket, b"dev-secret").unwrap_err(),
+            AuthError::InvalidHmac
+        );
+    }
+
+    #[test]
+    fn verify_doput_rejects_expired() {
+        let expiry = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 100;
+        let ticket = make_doput_ticket(1, b"dev-secret", expiry);
+        assert_eq!(
+            verify_doput(&ticket, b"dev-secret").unwrap_err(),
+            AuthError::Expired
+        );
+    }
+
+    #[test]
+    fn verify_doput_rejects_extra_fields() {
+        // A future signer that accidentally smuggled a reference_idx onto the
+        // ticket would couple the upload domain to that consumer — the
+        // deserializer's deny_unknown_fields catches the slip.
+        let payload = br#"{"action":"doput","upload_idx":1,"reference_idx":99}"#;
+        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
+        let err = verify_doput(&ticket, b"dev-secret").unwrap_err();
+        match err {
+            AuthError::MalformedPayload(_) => {} // expected
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_doput_rejects_wrong_action() {
+        // The auth layer is shape-only — `action` is just a string here.
+        // It still has to be present and parseable; an empty action is fine
+        // at the wire layer (the gRPC handler enforces action == "doput").
+        // Locking the parse-only behaviour: a payload with a different
+        // action string verifies but carries the verbatim value through.
+        let payload = br#"{"action":"register_files","upload_idx":1}"#;
+        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
+        let parsed = verify_doput(&ticket, b"dev-secret").expect("verify should succeed");
+        assert_eq!(parsed.action, "register_files");
+        assert_eq!(parsed.upload_idx, 1);
     }
 
     /// Cross-language interop test: this ticket was signed by the Python

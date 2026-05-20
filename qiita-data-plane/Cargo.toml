@@ -15,6 +15,11 @@ tonic-health = "0.14"
 arrow-flight = "58"
 arrow-array = "58"
 arrow-schema = "58"
+# DoPut writes incoming Arrow stream as Parquet directly. The data plane's
+# embedded DuckDB cannot ingest an arbitrary Arrow schema without C-API
+# gymnastics, so the parquet crate from the arrow-rs ecosystem is the
+# cleanest path. Keep version pinned to arrow-* major.
+parquet = "58"
 duckdb = { version = "1.10502.0" }
 hmac = "0.12"
 sha2 = "0.10"
@@ -30,3 +35,4 @@ integration = []
 
 [dev-dependencies]
 serial_test = "3"
+tempfile = "3"

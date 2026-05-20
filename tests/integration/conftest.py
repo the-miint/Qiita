@@ -183,6 +183,7 @@ def data_plane(hmac_secret, tmp_path_factory):
     _reset_ducklake_catalog()
 
     data_path = str(tmp_path_factory.mktemp("ducklake-data"))
+    staging_root = str(tmp_path_factory.mktemp("upload-staging"))
     port = _alloc_free_port()
 
     lib_path = os.environ.get(LIB_PATH_ENV, "")
@@ -195,6 +196,7 @@ def data_plane(hmac_secret, tmp_path_factory):
         "HMAC_SECRET_KEY": base64.b64encode(hmac_secret).decode(),
         "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CATALOG_CONNSTR,
         "DUCKLAKE_DATA_PATH": data_path,
+        "UPLOAD_STAGING_ROOT": staging_root,
         LIB_PATH_ENV: lib_path,
     }
 
@@ -235,6 +237,7 @@ def data_plane(hmac_secret, tmp_path_factory):
         "port": port,
         "data_path": data_path,
         "ducklake_connstr": DUCKLAKE_CATALOG_CONNSTR,
+        "upload_staging_root": staging_root,
     }
 
     proc.send_signal(signal.SIGTERM)
