@@ -133,6 +133,39 @@ def test_load_actions_missing_dir_raises(tmp_path):
         load_actions(tmp_path / "does-not-exist")
 
 
+def test_load_actions_loads_on_disk_reference_add_yaml():
+    """The actual on-disk `workflows/reference-add/1.0.0.yaml` (not a
+    synthetic inline copy) loads as a valid ActionDefinition and matches
+    the upload-doput Cycle 4 shape: hash step gone, replaced by
+    `hash_sequences` (module); `load` is a module step pointing at
+    `reference_load`; the `context_schema` requires `fasta_upload_idx`
+    rather than `fasta_path`. Locks the on-disk YAML so an accidental
+    revert to the legacy container shape surfaces here."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    actions = load_actions(repo_root / "workflows")
+    by_id = {a.action_id: a for a in actions}
+    ref_add = by_id["reference-add"]
+
+    step_names = [s.name for s in ref_add.steps]
+    assert "hash" not in step_names, "legacy `hash` container step must be gone"
+    assert "hash_sequences" in step_names
+
+    hash_step = next(s for s in ref_add.steps if s.name == "hash_sequences")
+    assert hash_step.module == "qiita_compute_orchestrator.jobs.hash_sequences"
+    assert hash_step.container is None
+
+    load_step = next(s for s in ref_add.steps if s.name == "load")
+    assert load_step.module == "qiita_compute_orchestrator.jobs.reference_load"
+    assert load_step.container is None
+
+    # context_schema must require `fasta_upload_idx`, not `fasta_path`.
+    assert ref_add.context_schema["required"] == ["fasta_upload_idx"]
+
+
 def test_load_actions_handles_two_versions_of_same_action(tmp_path):
     """Different versions of the same action_id are distinct rows, not
     duplicates."""

@@ -63,9 +63,14 @@ _DUCKDB_MAX_THREADS = 2
 class Inputs(BaseModel):
     """Typed input contract for hash_sequences.
 
-    `upload_path` is the workflow-declared input — the runner resolves
-    `fasta_upload_idx` → `staging_path_for(upload_staging_root, idx)`
-    before invoking this step (see Cycle 4 of the upload-doput plan).
+    `fasta_path` is the workflow-declared input — the runner resolves
+    `fasta_upload_idx` → staging path (compute_upload_staging_path on
+    the resolved upload row) and injects under this name. The field is
+    role-named (matching the fastq_to_parquet `fastq_path` convention)
+    rather than the upload-domain-generic `upload_path` because the
+    YAML's `inputs:` list IS the kwarg-name for `Inputs.model_validate`;
+    the runner's `{prefix}_upload_idx → {prefix}_path` convention
+    requires the role name to live on the model.
 
     `reference_idx` and `work_ticket_idx` are framework-injected scope
     scalars merged by `flatten_native_inputs`. Both are accepted (typed)
@@ -76,7 +81,7 @@ class Inputs(BaseModel):
     scope dispatch.
     """
 
-    upload_path: Path
+    fasta_path: Path
     reference_idx: int
     work_ticket_idx: int
 
@@ -84,8 +89,8 @@ class Inputs(BaseModel):
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     """Read the staged upload Parquet; emit manifest + reference_sequence
     + reference_sequence_chunks. See module docstring for the pipeline."""
-    if not inputs.upload_path.exists():
-        raise FileNotFoundError(f"upload parquet not found: {inputs.upload_path}")
+    if not inputs.fasta_path.exists():
+        raise FileNotFoundError(f"upload parquet not found: {inputs.fasta_path}")
 
     workspace.mkdir(parents=True, exist_ok=True)
     manifest_path = workspace / "manifest.parquet"
@@ -137,7 +142,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "    ) AS canonical_sequence"
                 "  FROM read_parquet(?)"
                 ")",
-                [str(inputs.upload_path)],
+                [str(inputs.fasta_path)],
             )
 
             # manifest.parquet — one row per upload read.

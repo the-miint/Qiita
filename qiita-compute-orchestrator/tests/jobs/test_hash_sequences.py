@@ -87,7 +87,7 @@ def _read_chunks(path: Path) -> list[tuple[str, int, str]]:
 def _inputs(*, upload_path: Path):
     from qiita_compute_orchestrator.jobs.hash_sequences import Inputs
 
-    return Inputs(upload_path=upload_path, reference_idx=1, work_ticket_idx=42)
+    return Inputs(fasta_path=upload_path, reference_idx=1, work_ticket_idx=42)
 
 
 def test_canonical_hashing_collapses_revcomp_duplicates(tmp_path):

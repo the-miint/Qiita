@@ -33,7 +33,7 @@ class IllegalStatusTransition(Exception):
 
 
 async def transition_reference_status(
-    pool: asyncpg.Pool,
+    pool: asyncpg.Pool | asyncpg.Connection,
     reference_idx: int,
     target: ReferenceStatus,
 ) -> ReferenceResponse:

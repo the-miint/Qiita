@@ -69,10 +69,10 @@ PARQUET_OPTS_INTERMEDIATE: str = "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESS
 # from buffering an unbounded number of chunks in memory before flush:
 # 16384 rows × ~64 KB chunk_data ≈ 1 GB per row group, empirically tuned
 # against GG2 backbone (4.2 GB peak RSS; 32768 OOMs on 30 GB hosts).
-# Lives here next to PARQUET_OPTS so a tuning change is one place;
-# both backends/local.py:_write_sequence_chunks (legacy reference-add
-# path, removed in Cycle 4) and jobs/hash_sequences (new upload-driven
-# path) consume these.
+# Consumed by `jobs/hash_sequences` (writes the chunked output keyed by
+# sequence_hash) and `jobs/reference_load` (re-keys to feature_idx for
+# DuckLake registration). Co-located with PARQUET_OPTS so a tuning
+# change is one place.
 CHUNK_SIZE: int = 65_536
 CHUNK_ROW_GROUP_SIZE: int = 16_384
 PARQUET_OPTS_CHUNKED: str = f"{PARQUET_OPTS}, ROW_GROUP_SIZE {CHUNK_ROW_GROUP_SIZE}"
