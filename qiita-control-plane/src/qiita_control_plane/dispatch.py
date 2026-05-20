@@ -66,6 +66,7 @@ async def _run_and_log(app: FastAPI, work_ticket_idx: int) -> None:
             app.state.compute_backend_client,
             hmac_secret=app.state.settings.hmac_secret_key,
             data_plane_url=app.state.settings.data_plane_url,
+            upload_staging_root=app.state.settings.upload_staging_root,
         )
     except Exception:
         # run_workflow has already transitioned to FAILED. Log and swallow

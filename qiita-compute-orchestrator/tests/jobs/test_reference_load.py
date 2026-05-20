@@ -263,11 +263,27 @@ def test_taxonomy_lifted_writer_keys_by_feature_idx(staging_inputs, taxonomy_pat
         assert strain == "Methanobacterium formicicum DSM 2320"
 
 
+def _wrap_blob_parquet(path: Path, column_name: str, payload: bytes) -> Path:
+    """Write a single-row Parquet `({column_name} BLOB)` via DuckDB.
+    Mirrors the CLI's DoPut wire shape for opaque text inputs (Newick /
+    jplace) without depending on pyarrow — the orchestrator's test
+    environment doesn't pull pyarrow in, so DuckDB is the right write
+    path here."""
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(f"CREATE TEMP TABLE wrapped ({column_name} BLOB)")
+        conn.execute("INSERT INTO wrapped VALUES (?)", [payload])
+        conn.execute(f"COPY wrapped TO '{path}' (FORMAT PARQUET)")
+    return path
+
+
 @pytest.fixture
 def tree_path(tmp_path):
-    path = tmp_path / "tree.nwk"
-    path.write_text("((seq1:0.1,seq2:0.2):0.3,(seq3:0.4,(seq4:0.5,seq5:0.6):0.7):0.8);")
-    return path
+    """Wrap a Newick tree in the CLI's DoPut shape: a single-row Parquet
+    `(newick_bytes BLOB)`. reference_load unwraps the BLOB to a temp
+    `.nwk` file before passing to miint's `read_newick` — this fixture
+    mirrors the wire format the runner actually sees."""
+    nwk_text = b"((seq1:0.1,seq2:0.2):0.3,(seq3:0.4,(seq4:0.5,seq5:0.6):0.7):0.8);"
+    return _wrap_blob_parquet(tmp_path / "tree_upload.parquet", "newick_bytes", nwk_text)
 
 
 def test_phylogeny_lifted_writer_populates_tip_feature_idx(staging_inputs, tree_path, tmp_path):
@@ -292,19 +308,20 @@ def test_phylogeny_lifted_writer_populates_tip_feature_idx(staging_inputs, tree_
 
 @pytest.fixture
 def jplace_path(tmp_path):
-    """Minimal jplace placement file: place seq1 on edge 5, seq2 on edge 7."""
-    path = tmp_path / "placement.jplace"
-    path.write_text(
-        '{"version": 3, "tree": "((seq1:0.1{0},seq2:0.2{1}):0.3{2}):0.4{3};",'
-        ' "placements": ['
-        '   {"p": [[5, -1.0, 0.9, 0.01, 0.02]], "nm": [["seq1", 1]]},'
-        '   {"p": [[7, -2.0, 0.8, 0.03, 0.04]], "nm": [["seq2", 1]]}'
-        " ],"
-        ' "fields": ["edge_num", "likelihood", "like_weight_ratio",'
-        '            "distal_length", "pendant_length"],'
-        ' "metadata": {}}'
+    """jplace input wrapped in the CLI's DoPut shape: a single-row
+    Parquet `(jplace_bytes BLOB)`. reference_load unwraps the BLOB to a
+    temp `.jplace` file before passing to miint's `read_jplace`."""
+    jplace_text = (
+        b'{"version": 3, "tree": "((seq1:0.1{0},seq2:0.2{1}):0.3{2}):0.4{3};",'
+        b' "placements": ['
+        b'   {"p": [[5, -1.0, 0.9, 0.01, 0.02]], "nm": [["seq1", 1]]},'
+        b'   {"p": [[7, -2.0, 0.8, 0.03, 0.04]], "nm": [["seq2", 1]]}'
+        b" ],"
+        b' "fields": ["edge_num", "likelihood", "like_weight_ratio",'
+        b'            "distal_length", "pendant_length"],'
+        b' "metadata": {}}'
     )
-    return path
+    return _wrap_blob_parquet(tmp_path / "jplace_upload.parquet", "jplace_bytes", jplace_text)
 
 
 def test_placements_lifted_writer_maps_fragment_to_feature_idx(

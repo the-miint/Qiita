@@ -1,0 +1,440 @@
+"""CLI-side tests for `qiita-admin reference load`.
+
+Drives the programmatic entry point `cli.reference_load.do_reference_load`
+with a mocked httpx transport + a fake Flight client. The full
+integration path (real CP + real DP subprocess + DuckLake) lives in
+`tests/integration/test_e2e_reference.py`; this file exercises only the
+CLI orchestration: the call sequence, error propagation, and the
+Arrow-conversion helpers.
+
+The Flight client is faked because pyarrow.flight requires a running
+gRPC server; tests at this tier should not spawn one. The fake records
+the FlightDescriptor.cmd bytes (the signed DoPut ticket) and returns a
+canned PutResult, which the CLI then forwards to /upload/{idx}/done.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+
+import duckdb
+import httpx
+import pytest
+
+# =============================================================================
+# Fakes
+# =============================================================================
+
+
+class _FakeWriter:
+    def __init__(self):
+        self.batches = []
+        self.done = False
+        self.closed = False
+
+    def write_batch(self, batch):
+        self.batches.append(batch)
+
+    def done_writing(self):
+        self.done = True
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeReader:
+    def __init__(self, put_metadata_bytes: bytes):
+        self._payload = put_metadata_bytes
+
+    def read(self):
+        # pyarrow exposes the metadata as a Buffer-like — for the CLI's
+        # use, returning the raw bytes object works because the helper
+        # wraps `bytes(put_metadata)` before decoding.
+        return self._payload
+
+
+class FakeFlightClient:
+    """Records each DoPut invocation and returns a scripted PutResult.
+    The CLI calls `client.do_put(descriptor, schema)` → (writer, reader);
+    we capture the ticket bytes from descriptor.cmd and return canned
+    metadata."""
+
+    def __init__(self):
+        self.calls: list[bytes] = []
+        # `responses` is a list of (upload_idx, sha256) tuples consumed
+        # in order, one per do_put call. Empty → the CLI's invariant
+        # check (put_body['upload_idx'] == upload_idx) drives the value.
+        self.responses: list[dict] = []
+        self._next_upload_idx = 1
+
+    def queue_response(self, upload_idx: int, *, sha256: str = "a" * 64, row_count: int = 1):
+        self.responses.append(
+            {
+                "upload_idx": upload_idx,
+                "sha256": sha256,
+                "row_count": row_count,
+                "bytes_received": 1024,
+            }
+        )
+
+    def do_put(self, descriptor, schema):
+        self.calls.append(bytes(descriptor.command))
+        if not self.responses:
+            raise RuntimeError("FakeFlightClient: no scripted response remaining")
+        body = self.responses.pop(0)
+        return _FakeWriter(), _FakeReader(json.dumps(body).encode())
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def upload_state():
+    """Track minted slots: maps upload_idx → status. Lets the route
+    fixture transition pending → ready on /done."""
+    return {"next_idx": 100, "slots": {}}
+
+
+@pytest.fixture
+def cp_transport(upload_state):
+    """Mock the CP REST surface the CLI hits: POST /reference, POST /upload,
+    POST /upload/{idx}/done, POST /work-ticket, GET /work-ticket/{idx}.
+    Returns the AsyncTransport + the captured call log."""
+    calls: list[tuple[str, str, dict | None]] = []
+    work_tickets: dict[int, dict] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        calls.append((request.method, request.url.path, body))
+        path = request.url.path
+        if path == "/api/v1/reference" and request.method == "POST":
+            return httpx.Response(
+                201,
+                json={
+                    "reference_idx": 999,
+                    "name": body["name"],
+                    "version": body["version"],
+                    "kind": body["kind"],
+                    "status": "pending",
+                    "created_by_idx": 1,
+                    "created_at": "2026-05-20T00:00:00Z",
+                },
+            )
+        if path == "/api/v1/upload" and request.method == "POST":
+            upload_idx = upload_state["next_idx"]
+            upload_state["next_idx"] += 1
+            upload_state["slots"][upload_idx] = "pending"
+            # Token bytes mimic the CP's signed payload shape; the fake
+            # flight client doesn't verify, just records.
+            ticket_bytes = f"signed-ticket-for-{upload_idx}".encode()
+            return httpx.Response(
+                201,
+                json={
+                    "upload_idx": upload_idx,
+                    "doput_ticket": base64.b64encode(ticket_bytes).decode(),
+                },
+            )
+        if path.startswith("/api/v1/upload/") and path.endswith("/done"):
+            upload_idx = int(path.split("/")[-2])
+            upload_state["slots"][upload_idx] = "ready"
+            return httpx.Response(
+                200,
+                json={
+                    "upload_idx": upload_idx,
+                    "status": "ready",
+                    "sha256": body["sha256"],
+                    "row_count": body["row_count"],
+                    "bytes_received": body["bytes_received"],
+                    "created_by_idx": 1,
+                    "created_at": "2026-05-20T00:00:00Z",
+                    "completed_at": "2026-05-20T00:00:01Z",
+                },
+            )
+        if path == "/api/v1/work-ticket" and request.method == "POST":
+            idx = 4242
+            work_tickets[idx] = {"work_ticket_idx": idx, "state": "completed"}
+            return httpx.Response(202, json={"work_ticket_idx": idx, "state": "pending"})
+        if path.startswith("/api/v1/work-ticket/") and request.method == "GET":
+            idx = int(path.split("/")[-1])
+            return httpx.Response(200, json=work_tickets.get(idx, {"state": "completed"}))
+        return httpx.Response(404, text=f"unhandled mock path: {request.method} {path}")
+
+    transport = httpx.MockTransport(handler)
+    return transport, calls
+
+
+@pytest.fixture
+def fasta_file(tmp_path):
+    """Tiny FASTA the FASTA→Arrow helper can convert. Two records is
+    enough; we don't assert on miint's output here, only that the helper
+    completes and yields a Parquet."""
+    path = tmp_path / "in.fasta"
+    path.write_text(">r1\nACGT\n>r2\nTTTT\n")
+    return path
+
+
+@pytest.fixture
+def taxonomy_file(tmp_path):
+    path = tmp_path / "tax.parquet"
+    with duckdb.connect(":memory:") as conn:
+        conn.execute("CREATE TABLE t (feature_id VARCHAR, taxonomy VARCHAR)")
+        conn.execute("INSERT INTO t VALUES ('r1', 'd__Bacteria; p__; c__; o__; f__; g__; s__')")
+        conn.execute(f"COPY t TO '{path}' (FORMAT PARQUET)")
+    return path
+
+
+# =============================================================================
+# Happy path
+# =============================================================================
+
+
+async def test_do_reference_load_happy_path(
+    fasta_file, taxonomy_file, tmp_path, cp_transport, upload_state
+):
+    """Happy path: create reference, upload FASTA + taxonomy, submit
+    work_ticket with both handles in action_context, watch poll returns
+    `completed` on first read. Asserts the call sequence + the
+    action_context shape."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    flight_client = FakeFlightClient()
+    flight_client.queue_response(100)  # FASTA upload — assumes first slot is 100
+    flight_client.queue_response(101)  # taxonomy upload
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        result = await do_reference_load(
+            http=http,
+            token="test-pat",
+            flight_client=flight_client,
+            fasta_path=fasta_file,
+            taxonomy_path=taxonomy_file,
+            name="cli-test",
+            version="1.0",
+            kind="sequence_reference",
+            workspace=tmp_path / "ws",
+            watch=True,
+            poll_interval_seconds=0.01,
+        )
+
+    assert result["reference_idx"] == 999
+    assert result["work_ticket_idx"] == 4242
+    assert result["upload_idxs"] == {"fasta": 100, "taxonomy": 101}
+    assert result["work_ticket"]["state"] == "completed"
+
+    # Call order: reference → fasta upload → fasta done → taxonomy upload →
+    # taxonomy done → work-ticket submit → at least one work-ticket GET.
+    method_paths = [(m, p) for (m, p, _b) in calls]
+    assert method_paths[0] == ("POST", "/api/v1/reference")
+    assert method_paths[1] == ("POST", "/api/v1/upload")
+    assert method_paths[2] == ("POST", "/api/v1/upload/100/done")
+    assert method_paths[3] == ("POST", "/api/v1/upload")
+    assert method_paths[4] == ("POST", "/api/v1/upload/101/done")
+    assert method_paths[5] == ("POST", "/api/v1/work-ticket")
+    assert any(m == "GET" and p == "/api/v1/work-ticket/4242" for m, p in method_paths)
+
+    # Work-ticket submission body carries the upload handles, NOT
+    # filesystem paths.
+    submit_call = next(c for c in calls if c[1] == "/api/v1/work-ticket" and c[0] == "POST")
+    assert submit_call[2]["action_context"] == {"fasta_upload_idx": 100, "taxonomy_upload_idx": 101}
+    assert submit_call[2]["scope_target"] == {"kind": "reference", "reference_idx": 999}
+
+    # Two DoPut calls fired with distinct ticket payloads.
+    assert flight_client.calls == [b"signed-ticket-for-100", b"signed-ticket-for-101"]
+    # Slots both ended at ready (the /done call fired for each).
+    assert upload_state["slots"] == {100: "ready", 101: "ready"}
+
+
+async def test_do_reference_load_skips_creation_when_reference_idx_set(
+    fasta_file, tmp_path, cp_transport
+):
+    """With --reference-idx, POST /reference is skipped — the CLI binds
+    to an existing reference instead of creating one."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    flight_client = FakeFlightClient()
+    flight_client.queue_response(100)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        result = await do_reference_load(
+            http=http,
+            token="t",
+            flight_client=flight_client,
+            fasta_path=fasta_file,
+            reference_idx=42,
+            workspace=tmp_path / "ws",
+            watch=False,
+        )
+
+    assert result["reference_idx"] == 42
+    assert not any(p == "/api/v1/reference" for (_m, p, _b) in calls), (
+        "POST /reference should not fire when --reference-idx is supplied"
+    )
+
+
+async def test_do_reference_load_no_watch_returns_without_polling(
+    fasta_file, tmp_path, cp_transport
+):
+    """--no-watch returns immediately after work_ticket submission; no
+    GET /work-ticket/{idx} fires."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    flight_client = FakeFlightClient()
+    flight_client.queue_response(100)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        result = await do_reference_load(
+            http=http,
+            token="t",
+            flight_client=flight_client,
+            fasta_path=fasta_file,
+            name="cli-test",
+            version="1.0",
+            workspace=tmp_path / "ws",
+            watch=False,
+        )
+
+    assert "work_ticket" not in result
+    assert not any(m == "GET" for (m, _p, _b) in calls)
+
+
+# =============================================================================
+# Failure paths — explicit, no silent retry
+# =============================================================================
+
+
+async def test_do_reference_load_fail_loud_on_doput_error(fasta_file, tmp_path, cp_transport):
+    """A Flight error mid-DoPut propagates verbatim. The CLI must NOT
+    retry silently — the operator sees the original failure and decides
+    whether to re-run with a fresh upload slot."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+
+    class _BrokenFlightClient(FakeFlightClient):
+        def do_put(self, descriptor, schema):
+            raise RuntimeError("simulated network drop mid-DoPut")
+
+    flight_client = _BrokenFlightClient()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(RuntimeError, match="simulated network drop mid-DoPut"):
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=flight_client,
+                fasta_path=fasta_file,
+                name="cli-test",
+                version="1.0",
+                workspace=tmp_path / "ws",
+                watch=False,
+            )
+
+    # POST /reference + POST /upload fired; /done never did, and no
+    # work-ticket was submitted. The upload row stays at status='pending'
+    # — the operator can clean up manually or wait for a sweep.
+    method_paths = [(m, p) for (m, p, _b) in calls]
+    assert ("POST", "/api/v1/reference") in method_paths
+    assert ("POST", "/api/v1/upload") in method_paths
+    assert not any("/done" in p for (_m, p) in method_paths)
+    assert not any(p == "/api/v1/work-ticket" for (_m, p) in method_paths)
+
+
+async def test_do_reference_load_rejects_ambiguous_reference_selection(fasta_file, tmp_path):
+    """Both --reference-idx AND --name/--version is a contract violation —
+    the caller must pick one. ValueError surfaces directly."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    async with httpx.AsyncClient(base_url="http://x") as http:
+        with pytest.raises(ValueError, match="exactly one of"):
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                fasta_path=fasta_file,
+                name="x",
+                version="1.0",
+                reference_idx=42,
+                workspace=tmp_path / "ws",
+            )
+
+
+# =============================================================================
+# Arrow conversion helpers
+# =============================================================================
+
+
+def test_blob_to_single_row_parquet_round_trips(tmp_path):
+    """Newick / jplace inputs are wrapped as a single-row Parquet with one
+    BLOB column. The helper must produce a valid Parquet whose lone row
+    carries the input bytes verbatim."""
+    from qiita_control_plane.cli.reference_load import _blob_to_single_row_parquet
+
+    src = tmp_path / "tree.nwk"
+    src.write_text("(a:0.1,b:0.2);")
+    out = _blob_to_single_row_parquet(src, tmp_path / "ws", column_name="newick_bytes")
+    assert out.exists()
+    with duckdb.connect(":memory:") as conn:
+        rows = conn.execute(f"SELECT newick_bytes FROM read_parquet('{out}')").fetchall()
+    assert len(rows) == 1
+    assert bytes(rows[0][0]) == b"(a:0.1,b:0.2);"
+
+
+def test_passthrough_parquet_copy_preserves_columns(taxonomy_file, tmp_path):
+    """Passthrough copy must round-trip every input row + column. We
+    re-encode via DuckDB to normalize the Parquet version on the wire,
+    not to filter content."""
+    from qiita_control_plane.cli.reference_load import _passthrough_parquet_copy
+
+    out = _passthrough_parquet_copy(taxonomy_file, tmp_path / "ws", "taxonomy")
+    with duckdb.connect(":memory:") as conn:
+        src_rows = conn.execute(f"SELECT * FROM read_parquet('{taxonomy_file}')").fetchall()
+        out_rows = conn.execute(f"SELECT * FROM read_parquet('{out}')").fetchall()
+    assert src_rows == out_rows
+
+
+def test_convert_for_role_rejects_unknown_role(tmp_path):
+    """A typo'd role surfaces as ValueError — the CLI doesn't silently
+    treat unknown roles as passthrough."""
+    from qiita_control_plane.cli.reference_load import _convert_for_role
+
+    with pytest.raises(ValueError, match="unknown upload role"):
+        _convert_for_role(tmp_path / "x", role="qiime2_artifact", workspace=tmp_path / "ws")
+
+
+# Smoke check that the asyncio entry point is callable from a sync test
+# context — admin.py's CLI handler does `asyncio.run(_run_reference_load(...))`.
+def test_admin_handler_returns_nonzero_on_bad_args(monkeypatch, tmp_path, capsys):
+    """`qiita-admin reference load` with neither --reference-idx nor
+    --name/--version surfaces as exit 1 with a stderr line — argparse
+    accepts the args, but the entry point's XOR check fires."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as _admin
+
+    monkeypatch.setattr(_common, "read_token", lambda: "test-pat")
+    fasta = tmp_path / "x.fasta"
+    fasta.write_text(">a\nACGT\n")
+
+    # No --name / --version / --reference-idx supplied. Use http://localhost
+    # so the base-URL validator's "no plain http to non-localhost" check
+    # passes without --insecure (we're driving the XOR check, not the URL
+    # gate, so the host doesn't matter beyond passing validation).
+    rc = _admin.main(
+        [
+            "--base-url",
+            "http://localhost:8080",
+            "reference",
+            "load",
+            "--fasta",
+            str(fasta),
+            "--data-plane-url",
+            "grpc://localhost:0",
+            "--no-watch",
+        ]
+    )
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "exactly one of" in captured.err

@@ -164,11 +164,31 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 written.append(taxonomy_out_path)
 
             if inputs.tree_path is not None:
-                _write_phylogeny(conn, inputs.tree_path, inputs.reference_idx, phylogeny_out)
+                # The CLI's DoPut writes Newick input as a single-row
+                # Parquet `(newick_bytes BLOB)` so the data plane stays
+                # schema-agnostic (Parquet-in, Parquet-out). miint's
+                # `read_newick` parses a Newick TEXT file, not a Parquet,
+                # so unwrap the BLOB to a temp `.nwk` here before reading.
+                newick_path = _unwrap_blob_to_temp_file(
+                    conn,
+                    parquet_path=inputs.tree_path,
+                    column_name="newick_bytes",
+                    out_path=duckdb_tmp / "tree.nwk",
+                )
+                _write_phylogeny(conn, newick_path, inputs.reference_idx, phylogeny_out)
                 written.append(phylogeny_out_path)
 
             if inputs.jplace_path is not None:
-                _write_placements(conn, inputs.jplace_path, inputs.reference_idx, placements_out)
+                # Same shape as the Newick branch — DoPut wrapped the
+                # jplace JSON as a single-row Parquet `(jplace_bytes
+                # BLOB)`; miint's `read_jplace` needs a JSON file.
+                jplace_path = _unwrap_blob_to_temp_file(
+                    conn,
+                    parquet_path=inputs.jplace_path,
+                    column_name="jplace_bytes",
+                    out_path=duckdb_tmp / "placement.jplace",
+                )
+                _write_placements(conn, jplace_path, inputs.reference_idx, placements_out)
                 written.append(placements_out_path)
 
             conn.execute("DROP TABLE id_map")
@@ -190,6 +210,38 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # `outputs: [staging_dir]` declaration matches this. register-files
     # globs *.parquet inside.
     return {"staging_dir": workspace}
+
+
+def _unwrap_blob_to_temp_file(
+    conn: duckdb.DuckDBPyConnection,
+    *,
+    parquet_path: Path,
+    column_name: str,
+    out_path: Path,
+) -> Path:
+    """Extract a single-row BLOB column from `parquet_path` and write its
+    bytes to `out_path`. Bridges the CLI's DoPut wire shape (Newick /
+    jplace wrapped as `(<name>_bytes BLOB)` so the data plane stays
+    schema-agnostic) to miint's `read_newick` / `read_jplace`, which
+    parse text/JSON files on disk.
+
+    Reads through DuckDB so the schema check (column exists, exactly one
+    row) surfaces as a clean error rather than a pyarrow `KeyError`.
+    Writes the bytes verbatim — no decoding, no newline normalization."""
+    rows = conn.execute(
+        f"SELECT {column_name} FROM read_parquet(?)",
+        [str(parquet_path)],
+    ).fetchall()
+    if len(rows) != 1:
+        raise ValueError(
+            f"expected exactly one row in {parquet_path} carrying {column_name!r}, got {len(rows)}"
+        )
+    payload = rows[0][0]
+    if payload is None:
+        raise ValueError(f"{parquet_path} row 0 has NULL {column_name!r} — upload was malformed")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(bytes(payload))
+    return out_path
 
 
 def _build_id_map(
