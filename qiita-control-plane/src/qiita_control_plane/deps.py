@@ -78,3 +78,33 @@ def get_tx_conn_factory(request: Request) -> TxConnFactory:
                 yield conn
 
     return _factory
+
+
+def get_snapshot_conn_factory(request: Request) -> TxConnFactory:
+    """Return a factory yielding a read-only transaction at REPEATABLE READ.
+
+    Use when a handler issues multiple SELECTs that must observe the same
+    point-in-time view. The project default isolation is READ COMMITTED,
+    under which each statement takes its own snapshot — two SELECTs in
+    the same transaction can disagree if a concurrent writer commits
+    between them. REPEATABLE READ takes one snapshot at the transaction's
+    first statement and reuses it for every later statement; readonly=True
+    documents intent and lets PostgreSQL reject accidental writes.
+
+    Acquisition is deferred to the handler's explicit
+    `async with snapshot() as conn:` block so pre-DB validation runs
+    without holding a pool slot, mirroring get_tx_conn_factory.
+
+        async def my_handler(snapshot: TxConnFactory = Depends(get_snapshot_conn_factory)):
+            async with snapshot() as conn:
+                # ... two or more SELECTs that share one snapshot ...
+    """
+    pool = get_db_pool(request)
+
+    @asynccontextmanager
+    async def _factory() -> AsyncIterator[asyncpg.Connection]:
+        async with pool.acquire() as conn:
+            async with conn.transaction(isolation="repeatable_read", readonly=True):
+                yield conn
+
+    return _factory

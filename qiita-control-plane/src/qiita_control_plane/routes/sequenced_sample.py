@@ -55,7 +55,7 @@ from ..auth.guards import (
     require_study_exists,
 )
 from ..auth.principal import HumanUser, Principal
-from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
+from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx_conn_factory
 from ..repositories._sample_helpers import (
     GlobalFieldSlotOccupiedError,
     MetadataParseError,
@@ -377,7 +377,7 @@ def _sequenced_sample_response_from_row(
 async def get_sequenced_sample(
     sequenced_sample_idx: Annotated[int, Field(gt=0)],
     response: Response,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    snapshot: TxConnFactory = Depends(get_snapshot_conn_factory),
     user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
     _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
@@ -397,30 +397,35 @@ async def get_sequenced_sample(
     sequenced_sample.updated_at)`. The format is a quoted ISO 8601
     timestamp; clients must treat it as opaque.
     """
-    # Single SELECT pulls both tables plus the GREATEST timestamp; 404 fires
-    # for either missing row or retired prep_sample (same contract as the
-    # biosample GET).
-    row = await fetch_sequenced_sample_with_prep_sample(pool, sequenced_sample_idx)
-    if row is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"sequenced_sample {sequenced_sample_idx} not found",
+    # All reads share one REPEATABLE READ snapshot so the supertype-join
+    # row and the prep_sample metadata read cannot disagree about a
+    # concurrent writer's commit.
+    async with snapshot() as conn:
+        # Single SELECT pulls both tables plus the GREATEST timestamp; 404 fires
+        # for either missing row or retired prep_sample (same contract as the
+        # biosample GET).
+        row = await fetch_sequenced_sample_with_prep_sample(conn, sequenced_sample_idx)
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"sequenced_sample {sequenced_sample_idx} not found",
+            )
+
+        # Retired-row carve-out (see docstring): treat as not found until the
+        # planned admin retired-retrieval surface lands.
+        if row["retired"]:
+            raise HTTPException(
+                status_code=404,
+                detail=f"sequenced_sample {sequenced_sample_idx} not found",
+            )
+
+        # Pull globally-linked metadata for the supertype prep_sample; the
+        # repo function handles the global_field_idx IS NOT NULL filter and
+        # the data_type-driven value-column dispatch.
+        metadata_rows = await fetch_global_metadata(
+            conn, spec=PREP_SAMPLE_METADATA_SPEC, entity_idx=row["prep_sample_idx"]
         )
 
-    # Retired-row carve-out (see docstring): treat as not found until the
-    # planned admin retired-retrieval surface lands.
-    if row["retired"]:
-        raise HTTPException(
-            status_code=404,
-            detail=f"sequenced_sample {sequenced_sample_idx} not found",
-        )
-
-    # Pull globally-linked metadata for the supertype prep_sample; the
-    # repo function handles the global_field_idx IS NOT NULL filter and
-    # the data_type-driven value-column dispatch.
-    metadata_rows = await fetch_global_metadata(
-        pool, spec=PREP_SAMPLE_METADATA_SPEC, entity_idx=row["prep_sample_idx"]
-    )
     global_metadata = {
         internal_name: GlobalMetadataEntry(
             display_name=entry.display_name,

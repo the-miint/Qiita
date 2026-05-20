@@ -44,7 +44,7 @@ from ..auth.guards import (
     require_study_exists,
 )
 from ..auth.principal import HumanUser, Principal
-from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
+from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx_conn_factory
 from ..repositories._sample_helpers import (
     GlobalFieldSlotOccupiedError,
     LocalWriteOnGloballyLinkedFieldError,
@@ -312,7 +312,7 @@ def _biosample_response_from_row(
 async def get_biosample(
     biosample_idx: Annotated[int, Field(gt=0)],
     response: Response,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    snapshot: TxConnFactory = Depends(get_snapshot_conn_factory),
     user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
 ) -> BiosampleResponse:
@@ -334,40 +334,45 @@ async def get_biosample(
     `updated_at` column. The format is a quoted ISO 8601 timestamp;
     clients must treat it as opaque.
     """
-    # Fetch the row first so 404 fires before the access predicate runs;
-    # the predicate is defined for any biosample_idx but emitting 404 here
-    # avoids a confusing "no access" 403 on a row that does not exist.
-    row = await fetch_biosample(pool, biosample_idx)
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"biosample {biosample_idx} not found")
+    # All reads share one REPEATABLE READ snapshot so the supertype row,
+    # the access predicate, and the metadata read cannot disagree about a
+    # concurrent writer's commit.
+    async with snapshot() as conn:
+        # Fetch the row first so 404 fires before the access predicate runs;
+        # the predicate is defined for any biosample_idx but emitting 404 here
+        # avoids a confusing "no access" 403 on a row that does not exist.
+        row = await fetch_biosample(conn, biosample_idx)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"biosample {biosample_idx} not found")
 
-    # Retired-row carve-out (see docstring): treat as not found until the
-    # planned wet-lab+ retired-retrieval surface lands. Applied uniformly
-    # across roles so the 404 contract is unconditional in the meantime.
-    if row["retired"]:
-        raise HTTPException(status_code=404, detail=f"biosample {biosample_idx} not found")
+        # Retired-row carve-out (see docstring): treat as not found until the
+        # planned wet-lab+ retired-retrieval surface lands. Applied uniformly
+        # across roles so the 404 contract is unconditional in the meantime.
+        if row["retired"]:
+            raise HTTPException(status_code=404, detail=f"biosample {biosample_idx} not found")
 
-    # Role bypass for wet_lab_admin and higher; everyone else must satisfy
-    # the owner-or-linked-study-access predicate.
-    authorized = user.has_role_at_least(
-        _BIOSAMPLE_GET_BYPASS_ROLE
-    ) or await fetch_caller_has_biosample_access(
-        pool,
-        principal_idx=user.principal_idx,
-        biosample_idx=biosample_idx,
-    )
-    if not authorized:
-        raise HTTPException(
-            status_code=403,
-            detail=f"caller has no read path to biosample {biosample_idx}",
+        # Role bypass for wet_lab_admin and higher; everyone else must satisfy
+        # the owner-or-linked-study-access predicate.
+        authorized = user.has_role_at_least(
+            _BIOSAMPLE_GET_BYPASS_ROLE
+        ) or await fetch_caller_has_biosample_access(
+            conn,
+            principal_idx=user.principal_idx,
+            biosample_idx=biosample_idx,
+        )
+        if not authorized:
+            raise HTTPException(
+                status_code=403,
+                detail=f"caller has no read path to biosample {biosample_idx}",
+            )
+
+        # Pull the globally-linked metadata once access has been resolved; the
+        # repo function handles the global_field_idx IS NOT NULL filter and the
+        # data_type-driven value column dispatch.
+        metadata_rows = await fetch_global_metadata(
+            conn, spec=BIOSAMPLE_METADATA_SPEC, entity_idx=biosample_idx
         )
 
-    # Pull the globally-linked metadata once access has been resolved; the
-    # repo function handles the global_field_idx IS NOT NULL filter and the
-    # data_type-driven value column dispatch.
-    metadata_rows = await fetch_global_metadata(
-        pool, spec=BIOSAMPLE_METADATA_SPEC, entity_idx=biosample_idx
-    )
     global_metadata = {
         internal_name: GlobalMetadataEntry(
             display_name=entry.display_name,
