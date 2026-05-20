@@ -14,12 +14,15 @@ from ~/.qiita/token (mode 0600).
 """
 
 import argparse
+import base64
 import sys
+from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
 from qiita_common.models import (
     BiosampleImportRequest,
     Platform,
+    SequencedPoolCreateRequest,
     SequencingRunCreateRequest,
     StudyCreate,
     Tier,
@@ -73,6 +76,18 @@ def _post_sequencing_run(base_url: str, token: str, body: dict) -> dict:
     attachment in the auth-widening pass.
     """
     return _common.call("POST", base_url, token, "/sequencing-run", json=body)
+
+
+def _post_sequenced_pool(base_url: str, token: str, run_idx: int, body: dict) -> dict:
+    """POST /api/v1/sequencing-run/{run_idx}/sequenced-pool with the
+    (already-pruned) body. The run-preflight pair (blob + filename) is
+    co-populated; the route's Pydantic validator returns 422 on a
+    half-populated pair, but the CLI guards earlier so the user sees an
+    argparse-style error instead of a server round-trip.
+    """
+    return _common.call(
+        "POST", base_url, token, f"/sequencing-run/{run_idx}/sequenced-pool", json=body
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +233,38 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_seqrun_create.set_defaults(handler=_handle_sequencing_run_create)
 
+    p_seqpool = sub.add_parser("sequenced-pool", help="Sequenced-pool operations")
+    p_seqpool_sub = p_seqpool.add_subparsers(dest="sequenced_pool_cmd", required=True)
+    p_seqpool_create = p_seqpool_sub.add_parser(
+        "create",
+        help="Create a sequenced-pool on a run (POST /sequencing-run/{R}/sequenced-pool)",
+    )
+    p_seqpool_create.add_argument("--run-idx", type=int, required=True)
+    p_seqpool_create.add_argument(
+        "--run-preflight-blob",
+        type=Path,
+        dest="run_preflight_blob",
+        help=(
+            "Path to the local run-preflight file (typically a SQLite blob)."
+            " The CLI reads it, base64-encodes the bytes, and sends them in"
+            " the JSON body. Co-populated with --run-preflight-filename."
+        ),
+    )
+    p_seqpool_create.add_argument(
+        "--run-preflight-filename",
+        dest="run_preflight_filename",
+        help=(
+            "Originating file name on disk (just the basename, e.g."
+            " 'RunPreflight.db'); defaults to the basename of"
+            " --run-preflight-blob when that flag was supplied"
+        ),
+    )
+    p_seqpool_create.add_argument(
+        "--extra-metadata",
+        help="Free-form JSON object stored as JSONB",
+    )
+    p_seqpool_create.set_defaults(handler=_handle_sequenced_pool_create)
+
     return parser
 
 
@@ -282,6 +329,46 @@ def _handle_sequencing_run_create(args: argparse.Namespace, parser: argparse.Arg
     )
     body = _build_body(SequencingRunCreateRequest, args, parser)
     return _common.run_http_subcommand(lambda t: _post_sequencing_run(args.base_url, t, body))
+
+
+def _handle_sequenced_pool_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Mint a sequenced-pool under a sequencing-run.
+
+    The run-preflight is an optional co-populated pair. When
+    --run-preflight-blob is supplied: read the file, refuse-on-empty,
+    and default --run-preflight-filename to the file's basename when
+    the user didn't pass one. When --run-preflight-filename is supplied
+    without --run-preflight-blob: refuse before the server round-trip.
+    Otherwise both flags are absent and the pool is created with no
+    preflight, which is valid post-PR #44.
+    """
+    if args.run_preflight_blob is not None:
+        blob_path: Path = args.run_preflight_blob
+        if not blob_path.is_file():
+            parser.error(f"--run-preflight-blob {blob_path} is not a regular file")
+        blob_bytes = blob_path.read_bytes()
+        if not blob_bytes:
+            parser.error(f"--run-preflight-blob {blob_path} is empty")
+        # Pydantic's Base64Bytes interprets input as an *already* base64-
+        # encoded string and decodes it. We base64-encode here so the model
+        # round-trips back to the same raw bytes; mode="json" then re-encodes
+        # to the canonical base64 string for the wire.
+        args.run_preflight_blob = base64.b64encode(blob_bytes).decode("ascii")
+        if args.run_preflight_filename is None:
+            args.run_preflight_filename = blob_path.name
+    elif args.run_preflight_filename is not None:
+        parser.error(
+            "--run-preflight-filename supplied without --run-preflight-blob;"
+            " the preflight pair must be both or neither"
+        )
+
+    args.extra_metadata = _common.parse_json_arg(
+        args.extra_metadata, parser, flag="--extra-metadata"
+    )
+    body = _build_body(SequencedPoolCreateRequest, args, parser)
+    return _common.run_http_subcommand(
+        lambda t: _post_sequenced_pool(args.base_url, t, args.run_idx, body)
+    )
 
 
 def _build_body(

@@ -739,6 +739,172 @@ def test_sequencing_run_create_rejects_non_object_extra_metadata(capsys):
 
 
 # ---------------------------------------------------------------------------
+# sequenced-pool create
+# ---------------------------------------------------------------------------
+
+
+def test_sequenced_pool_create_minimal_no_preflight(monkeypatch):
+    """No --run-preflight-blob / --run-preflight-filename means a pool
+    with no preflight; valid after PR #44 made the pair optional."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json={"sequenced_pool_idx": 9})
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "sequenced-pool",
+            "create",
+            "--run-idx",
+            "4",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://q.example.test/api/v1/sequencing-run/4/sequenced-pool"
+    # extra_metadata=None gets stripped by exclude_unset; nothing else to send.
+    assert captured["json"] == {}
+
+
+def test_sequenced_pool_create_with_preflight_blob_and_explicit_filename(monkeypatch, tmp_path):
+    """--run-preflight-blob reads bytes from the file, --run-preflight-filename
+    overrides the auto-default."""
+    import base64
+
+    from qiita_control_plane.cli.user import main
+
+    blob_path = tmp_path / "RunPreflight.db"
+    blob_bytes = b"fake-sqlite-preflight-content"
+    blob_path.write_bytes(blob_bytes)
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json={"sequenced_pool_idx": 9})
+
+    rc = main(
+        [
+            "sequenced-pool",
+            "create",
+            "--run-idx",
+            "4",
+            "--run-preflight-blob",
+            str(blob_path),
+            "--run-preflight-filename",
+            "uploaded.db",
+        ]
+    )
+    assert rc == 0
+    body = captured["json"]
+    assert body["run_preflight_filename"] == "uploaded.db"
+    # On the wire, Pydantic re-encodes the bytes as base64.
+    assert body["run_preflight_blob"] == base64.b64encode(blob_bytes).decode("ascii")
+
+
+def test_sequenced_pool_create_defaults_filename_from_blob_path(monkeypatch, tmp_path):
+    """When --run-preflight-filename is omitted, the handler defaults it to
+    the basename of --run-preflight-blob so a half-populated pair never
+    reaches the wire."""
+    from qiita_control_plane.cli.user import main
+
+    blob_path = tmp_path / "RunPreflight.db"
+    blob_path.write_bytes(b"x")
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json={"sequenced_pool_idx": 9})
+
+    rc = main(
+        [
+            "sequenced-pool",
+            "create",
+            "--run-idx",
+            "4",
+            "--run-preflight-blob",
+            str(blob_path),
+        ]
+    )
+    assert rc == 0
+    assert captured["json"]["run_preflight_filename"] == "RunPreflight.db"
+
+
+def test_sequenced_pool_create_refuses_filename_without_blob(capsys):
+    """A half-populated pair would be a 422 server-side; refuse before HTTP."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "sequenced-pool",
+                "create",
+                "--run-idx",
+                "4",
+                "--run-preflight-filename",
+                "stranded.db",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--run-preflight-filename" in err
+    assert "--run-preflight-blob" in err
+
+
+def test_sequenced_pool_create_refuses_missing_blob_file(capsys, tmp_path):
+    """A --run-preflight-blob path that doesn't exist fails before HTTP."""
+    from qiita_control_plane.cli.user import main
+
+    missing = tmp_path / "not-there.db"
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "sequenced-pool",
+                "create",
+                "--run-idx",
+                "4",
+                "--run-preflight-blob",
+                str(missing),
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--run-preflight-blob" in err
+    assert "not a regular file" in err
+
+
+def test_sequenced_pool_create_refuses_empty_blob_file(capsys, tmp_path):
+    """An empty file would trip the model's min_length=1; surface as a
+    clean argparse error."""
+    from qiita_control_plane.cli.user import main
+
+    blob_path = tmp_path / "empty.db"
+    blob_path.write_bytes(b"")
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "sequenced-pool",
+                "create",
+                "--run-idx",
+                "4",
+                "--run-preflight-blob",
+                str(blob_path),
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "is empty" in err
+
+
+def test_sequenced_pool_create_requires_run_idx(capsys):
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["sequenced-pool", "create"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--run-idx" in err
+
+
+# ---------------------------------------------------------------------------
 # --base-url http-to-non-localhost guard
 # ---------------------------------------------------------------------------
 
