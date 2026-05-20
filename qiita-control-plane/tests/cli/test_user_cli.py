@@ -327,17 +327,28 @@ def test_profile_set_pydantic_validation_error_exits_2(capsys):
 
 
 # ---------------------------------------------------------------------------
-# biosample create
+# Shared request-stub helper (used by every HTTP subcommand test below)
 # ---------------------------------------------------------------------------
 
 
-def _stub_biosample_post(monkeypatch, captured: dict, *, whoami_idx: int | None = None):
-    """Patch _common.httpx.request to capture the next POST/GET request.
+def _stub_post(
+    monkeypatch,
+    captured: dict,
+    *,
+    response_json: dict,
+    status: int = 201,
+    whoami_idx: int | None = None,
+):
+    """Patch `_common.httpx.request` to capture every call and return canned
+    responses. Each call appends to `captured['requests']` (full list); the
+    last call's fields also land flat on `captured` (method/url/json/auth)
+    so single-call tests can assert on `captured['url']` etc. without
+    indexing.
 
-    When `whoami_idx` is supplied, the GET /auth/whoami response carries
-    that principal_idx so the handler's auto-owner branch fires. Returns
-    nothing; mutates `captured` in place with each request's verb / url /
-    json / auth header.
+    When `whoami_idx` is supplied, a GET to `/auth/whoami` returns
+    `{"kind": "human", "principal_idx": whoami_idx}` (used by handlers
+    that auto-default --owner-idx). Every other request returns
+    `response_json` with HTTP `status`.
     """
     import httpx as _httpx
 
@@ -346,35 +357,47 @@ def _stub_biosample_post(monkeypatch, captured: dict, *, whoami_idx: int | None 
     captured.setdefault("requests", [])
 
     def fake_request(method, url, headers=None, json=None, timeout=None):
-        captured["requests"].append(
-            {
-                "method": method,
-                "url": url,
-                "auth": headers["Authorization"],
-                "json": json,
-            }
-        )
+        record = {
+            "method": method,
+            "url": url,
+            "auth": headers["Authorization"],
+            "json": json,
+        }
+        captured["requests"].append(record)
+        # Flat-shape mirror — last-wins so single-POST tests read the POST,
+        # whoami-then-POST tests still see the POST as the "current" record.
+        captured.update(record)
         if url.endswith("/auth/whoami"):
             assert whoami_idx is not None, (
-                "test triggered whoami without setting whoami_idx in the stub"
+                "test triggered whoami without supplying whoami_idx in the stub"
             )
             return _httpx.Response(
                 200,
                 json={"kind": "human", "principal_idx": whoami_idx},
                 request=_httpx.Request(method, url),
             )
-        return _httpx.Response(
-            201,
-            json={
-                "biosample_idx": 99,
-                "owner_id_biosample_study_field_idx": 5,
-                "owner_id_biosample_study_field_created": True,
-            },
-            request=_httpx.Request(method, url),
-        )
+        return _httpx.Response(status, json=response_json, request=_httpx.Request(method, url))
 
     monkeypatch.setattr(_common.httpx, "request", fake_request)
-    monkeypatch.setenv("QIITA_TOKEN", "qk_bs_test")
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+
+# Canned response_json bodies for the resource creates. Hoisted out of the
+# individual tests so a schema-rename only touches one site.
+_BIOSAMPLE_CREATE_RESPONSE = {
+    "biosample_idx": 99,
+    "owner_id_biosample_study_field_idx": 5,
+    "owner_id_biosample_study_field_created": True,
+}
+_SEQUENCED_SAMPLE_CREATE_RESPONSE = {
+    "prep_sample_idx": 100,
+    "sequenced_sample_idx": 200,
+}
+
+
+# ---------------------------------------------------------------------------
+# biosample create
+# ---------------------------------------------------------------------------
 
 
 def test_biosample_create_defaults_owner_idx_to_caller(monkeypatch):
@@ -383,7 +406,7 @@ def test_biosample_create_defaults_owner_idx_to_caller(monkeypatch):
     from qiita_control_plane.cli.user import main
 
     captured: dict = {}
-    _stub_biosample_post(monkeypatch, captured, whoami_idx=42)
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_CREATE_RESPONSE, whoami_idx=42)
 
     rc = main(
         [
@@ -405,11 +428,12 @@ def test_biosample_create_defaults_owner_idx_to_caller(monkeypatch):
     whoami_req, post_req = captured["requests"]
     assert whoami_req["url"].endswith("/api/v1/auth/whoami")
     assert post_req["url"] == "https://q.example.test/api/v1/study/7/biosample"
+    # Unset --metadata stays absent on the wire (default=None → not None
+    # filter drops it); server's default_factory=dict fills the model.
     assert post_req["json"] == {
         "owner_idx": 42,
         "owner_biosample_id_field_name": "owner_sample_id",
         "owner_biosample_id_value": "SMK-001",
-        "metadata": {},
     }
 
 
@@ -419,7 +443,7 @@ def test_biosample_create_explicit_owner_idx_skips_whoami(monkeypatch):
     from qiita_control_plane.cli.user import main
 
     captured: dict = {}
-    _stub_biosample_post(monkeypatch, captured)
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_CREATE_RESPONSE)
 
     rc = main(
         [
@@ -446,7 +470,7 @@ def test_biosample_create_metadata_pairs_become_dict(monkeypatch):
     from qiita_control_plane.cli.user import main
 
     captured: dict = {}
-    _stub_biosample_post(monkeypatch, captured, whoami_idx=42)
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_CREATE_RESPONSE, whoami_idx=42)
 
     rc = main(
         [
@@ -477,7 +501,7 @@ def test_biosample_create_passes_through_optional_fields(monkeypatch):
     from qiita_control_plane.cli.user import main
 
     captured: dict = {}
-    _stub_biosample_post(monkeypatch, captured, whoami_idx=42)
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_CREATE_RESPONSE, whoami_idx=42)
 
     rc = main(
         [
@@ -571,25 +595,6 @@ def test_biosample_create_rejects_duplicate_metadata_key(capsys):
 # ---------------------------------------------------------------------------
 # sequencing-run create
 # ---------------------------------------------------------------------------
-
-
-def _stub_post(monkeypatch, captured: dict, *, response_json: dict, status: int = 201):
-    """Patch _common.httpx.request to capture one POST and return a canned
-    response. Less feature-rich than _stub_biosample_post (no whoami branch)
-    because the sequencing-run path doesn't need to look up owner_idx."""
-    import httpx as _httpx
-
-    from qiita_control_plane.cli import _common
-
-    def fake_request(method, url, headers=None, json=None, timeout=None):
-        captured["method"] = method
-        captured["url"] = url
-        captured["auth"] = headers["Authorization"]
-        captured["json"] = json
-        return _httpx.Response(status, json=response_json, request=_httpx.Request(method, url))
-
-    monkeypatch.setattr(_common.httpx, "request", fake_request)
-    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
 
 
 def test_sequencing_run_create_minimal(monkeypatch):
@@ -909,48 +914,15 @@ def test_sequenced_pool_create_requires_run_idx(capsys):
 # ---------------------------------------------------------------------------
 
 
-def _stub_sequenced_sample_post(monkeypatch, captured: dict, *, whoami_idx: int | None = None):
-    """Stub for sequenced-sample create. Mirrors _stub_biosample_post: returns
-    a whoami response on /auth/whoami and a composer response on the POST."""
-    import httpx as _httpx
-
-    from qiita_control_plane.cli import _common
-
-    captured.setdefault("requests", [])
-
-    def fake_request(method, url, headers=None, json=None, timeout=None):
-        captured["requests"].append(
-            {
-                "method": method,
-                "url": url,
-                "auth": headers["Authorization"],
-                "json": json,
-            }
-        )
-        if url.endswith("/auth/whoami"):
-            assert whoami_idx is not None
-            return _httpx.Response(
-                200,
-                json={"kind": "human", "principal_idx": whoami_idx},
-                request=_httpx.Request(method, url),
-            )
-        return _httpx.Response(
-            201,
-            json={"prep_sample_idx": 100, "sequenced_sample_idx": 200},
-            request=_httpx.Request(method, url),
-        )
-
-    monkeypatch.setattr(_common.httpx, "request", fake_request)
-    monkeypatch.setenv("QIITA_TOKEN", "qk_ss_test")
-
-
 def test_sequenced_sample_create_minimal_with_caller_owner(monkeypatch):
     """Owner defaults to the caller via whoami; primary-only (no secondary
     studies, no metadata, no checklist) sends the smallest valid body."""
     from qiita_control_plane.cli.user import main
 
     captured: dict = {}
-    _stub_sequenced_sample_post(monkeypatch, captured, whoami_idx=42)
+    _stub_post(
+        monkeypatch, captured, response_json=_SEQUENCED_SAMPLE_CREATE_RESPONSE, whoami_idx=42
+    )
 
     rc = main(
         [
@@ -978,6 +950,10 @@ def test_sequenced_sample_create_minimal_with_caller_owner(monkeypatch):
     assert post["url"] == (
         "https://q.example.test/api/v1/sequencing-run/4/sequenced-pool/9/sequenced-sample"
     )
+    # --metadata stays absent (default=None → filtered, server fills {}).
+    # secondary_study_idxs always lands on the wire because the model's
+    # dedupe_secondary_study_idxs validator reassigns it, marking the field
+    # as "set" even when the caller didn't pass --secondary-study-idx.
     assert post["json"] == {
         "biosample_idx": 55,
         "prep_protocol_idx": 3,
@@ -985,7 +961,6 @@ def test_sequenced_sample_create_minimal_with_caller_owner(monkeypatch):
         "sequenced_pool_item_id": "WELL-A1",
         "primary_study_idx": 7,
         "secondary_study_idxs": [],
-        "metadata": {},
     }
 
 
@@ -995,7 +970,9 @@ def test_sequenced_sample_create_with_secondary_studies_and_metadata(monkeypatch
     from qiita_control_plane.cli.user import main
 
     captured: dict = {}
-    _stub_sequenced_sample_post(monkeypatch, captured, whoami_idx=42)
+    _stub_post(
+        monkeypatch, captured, response_json=_SEQUENCED_SAMPLE_CREATE_RESPONSE, whoami_idx=42
+    )
 
     rc = main(
         [
@@ -1038,7 +1015,7 @@ def test_sequenced_sample_create_explicit_owner_skips_whoami(monkeypatch):
     from qiita_control_plane.cli.user import main
 
     captured: dict = {}
-    _stub_sequenced_sample_post(monkeypatch, captured)
+    _stub_post(monkeypatch, captured, response_json=_SEQUENCED_SAMPLE_CREATE_RESPONSE)
 
     rc = main(
         [
@@ -1071,7 +1048,9 @@ def test_sequenced_sample_create_metadata_checklist_passes_through(monkeypatch):
     from qiita_control_plane.cli.user import main
 
     captured: dict = {}
-    _stub_sequenced_sample_post(monkeypatch, captured, whoami_idx=42)
+    _stub_post(
+        monkeypatch, captured, response_json=_SEQUENCED_SAMPLE_CREATE_RESPONSE, whoami_idx=42
+    )
 
     rc = main(
         [
@@ -1120,7 +1099,9 @@ def test_sequenced_sample_create_rejects_primary_in_secondary(monkeypatch, capsy
     from qiita_control_plane.cli.user import main
 
     captured: dict = {}
-    _stub_sequenced_sample_post(monkeypatch, captured, whoami_idx=42)
+    _stub_post(
+        monkeypatch, captured, response_json=_SEQUENCED_SAMPLE_CREATE_RESPONSE, whoami_idx=42
+    )
 
     with pytest.raises(SystemExit) as exc_info:
         main(

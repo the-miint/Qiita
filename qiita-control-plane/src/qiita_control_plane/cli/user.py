@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
+from qiita_common.api_paths import PATH_WORK_TICKET_PREFIX
 from qiita_common.models import (
     BiosampleImportRequest,
     Platform,
@@ -75,8 +76,7 @@ def _post_sequencing_run(base_url: str, token: str, body: dict) -> dict:
     """POST /api/v1/sequencing-run with the (already-pruned) body.
 
     Instrument-level resource: not study-scoped, has no owner field. The
-    creator is captured server-side as created_by_idx and gates pool/sample
-    attachment in the auth-widening pass.
+    creator is recorded server-side as created_by_idx.
     """
     return _common.call("POST", base_url, token, "/sequencing-run", json=body)
 
@@ -114,7 +114,7 @@ def _post_work_ticket(base_url: str, token: str, body: dict) -> dict:
     from the authenticated caller; the body carries action_id, action_version,
     scope_target (discriminated union), and action_context (free-form per the
     action's declared context_schema)."""
-    return _common.call("POST", base_url, token, "/work-ticket", json=body)
+    return _common.call("POST", base_url, token, PATH_WORK_TICKET_PREFIX, json=body)
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +214,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_biosample_create.add_argument(
         "--metadata",
         action="append",
-        default=[],
+        default=None,
         metavar="KEY=VALUE",
         help=(
             "Metadata entry; repeat for multiple. KEY is a biosample_global_field"
@@ -324,7 +324,7 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="secondary_study_idxs",
         type=int,
         action="append",
-        default=[],
+        default=None,
         metavar="STUDY_IDX",
         help=(
             "Additional study this sequenced_sample is linked to."
@@ -335,7 +335,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_seqsample_create.add_argument(
         "--metadata",
         action="append",
-        default=[],
+        default=None,
         metavar="KEY=VALUE",
         help=(
             "Metadata entry; repeat for multiple. KEY is a prep_sample_global_field"
@@ -433,8 +433,7 @@ def _handle_biosample_create(args: argparse.Namespace, parser: argparse.Argument
     args.metadata = _common.parse_kv_pairs(args.metadata, parser, flag="--metadata")
 
     def _run(token: str) -> dict:
-        if args.owner_idx is None:
-            args.owner_idx = _common.whoami(args.base_url, token)["principal_idx"]
+        _common.resolve_owner_idx(args, args.base_url, token)
         body = _build_body(BiosampleImportRequest, args, parser)
         return _post_biosample(args.base_url, token, args.study_idx, body)
 
@@ -461,7 +460,7 @@ def _handle_sequenced_pool_create(args: argparse.Namespace, parser: argparse.Arg
     the user didn't pass one. When --run-preflight-filename is supplied
     without --run-preflight-blob: refuse before the server round-trip.
     Otherwise both flags are absent and the pool is created with no
-    preflight, which is valid post-PR #44.
+    preflight, which is the optional-pair case the schema permits.
     """
     if args.run_preflight_blob is not None:
         blob_path: Path = args.run_preflight_blob
@@ -502,8 +501,7 @@ def _handle_sequenced_sample_create(
     args.metadata = _common.parse_kv_pairs(args.metadata, parser, flag="--metadata")
 
     def _run(token: str) -> dict:
-        if args.owner_idx is None:
-            args.owner_idx = _common.whoami(args.base_url, token)["principal_idx"]
+        _common.resolve_owner_idx(args, args.base_url, token)
         body = _build_body(SequencedSampleCreateRequest, args, parser)
         return _post_sequenced_sample(args.base_url, token, args.run_idx, args.pool_idx, body)
 

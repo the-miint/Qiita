@@ -242,6 +242,22 @@ def whoami(base_url: str, token: str) -> dict:
     return call("GET", base_url, token, "/auth/whoami")
 
 
+def resolve_owner_idx(
+    args: argparse.Namespace,
+    base_url: str,
+    token: str,
+    *,
+    attr: str = "owner_idx",
+) -> None:
+    """If `args.<attr>` is None, fill it with the caller's principal_idx via
+    whoami. Used by subcommands that let the user mint a resource for
+    themselves without first looking up their own idx. Mutates args in place
+    so the subsequent _build_body sees a populated value.
+    """
+    if getattr(args, attr) is None:
+        setattr(args, attr, whoami(base_url, token)["principal_idx"])
+
+
 def parse_json_arg(
     raw: str | None,
     parser: argparse.ArgumentParser,
@@ -269,17 +285,24 @@ def parse_json_arg(
 
 
 def parse_kv_pairs(
-    pairs: list[str],
+    pairs: list[str] | None,
     parser: argparse.ArgumentParser,
     *,
     flag: str,
-) -> dict[str, str]:
+) -> dict[str, str] | None:
     """Parse a list of "KEY=VALUE" strings (from a repeatable argparse flag)
-    into a dict. Rejects entries missing '=', entries with an empty key, and
-    duplicate keys — silently last-wins would mask typos. Errors via
-    `parser.error` (exit 2). `flag` is the originating CLI flag name used in
-    error messages so the caller knows which arg was bad.
+    into a dict, or return None when the caller didn't supply the flag at all.
+
+    Rejects entries missing '=', entries with an empty key, and duplicate
+    keys — silently last-wins would mask typos. Errors via `parser.error`
+    (exit 2). `flag` is the originating CLI flag name used in error messages.
+
+    Returning None for the unset case (rather than {}) lets _build_body's
+    is-not-None filter drop the field entirely so the wire matches the
+    server's default-on-absent semantic.
     """
+    if pairs is None:
+        return None
     result: dict[str, str] = {}
     for entry in pairs:
         if "=" not in entry:
