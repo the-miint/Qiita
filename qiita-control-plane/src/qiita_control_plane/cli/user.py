@@ -23,6 +23,7 @@ from qiita_common.models import (
     BiosampleImportRequest,
     Platform,
     SequencedPoolCreateRequest,
+    SequencedSampleCreateRequest,
     SequencingRunCreateRequest,
     StudyCreate,
     Tier,
@@ -87,6 +88,22 @@ def _post_sequenced_pool(base_url: str, token: str, run_idx: int, body: dict) ->
     """
     return _common.call(
         "POST", base_url, token, f"/sequencing-run/{run_idx}/sequenced-pool", json=body
+    )
+
+
+def _post_sequenced_sample(
+    base_url: str, token: str, run_idx: int, pool_idx: int, body: dict
+) -> dict:
+    """POST /api/v1/sequencing-run/{R}/sequenced-pool/{P}/sequenced-sample
+    composer. Atomically mints the prep_sample + sequenced_sample subtype +
+    prep_sample_to_study links (primary + each secondary) + metadata rows.
+    """
+    return _common.call(
+        "POST",
+        base_url,
+        token,
+        f"/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample",
+        json=body,
     )
 
 
@@ -265,6 +282,62 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_seqpool_create.set_defaults(handler=_handle_sequenced_pool_create)
 
+    p_seqsample = sub.add_parser("sequenced-sample", help="Sequenced-sample operations")
+    p_seqsample_sub = p_seqsample.add_subparsers(dest="sequenced_sample_cmd", required=True)
+    p_seqsample_create = p_seqsample_sub.add_parser(
+        "create",
+        help=(
+            "Create a sequenced-sample under a pool"
+            " (POST /sequencing-run/{R}/sequenced-pool/{P}/sequenced-sample)"
+        ),
+    )
+    p_seqsample_create.add_argument("--run-idx", type=int, required=True)
+    p_seqsample_create.add_argument("--pool-idx", type=int, required=True)
+    p_seqsample_create.add_argument("--biosample-idx", type=int, required=True)
+    p_seqsample_create.add_argument("--prep-protocol-idx", type=int, required=True)
+    p_seqsample_create.add_argument(
+        "--owner-idx",
+        type=int,
+        help=(
+            "principal_idx of the prep_sample's owner; defaults to the caller (resolved via whoami)"
+        ),
+    )
+    p_seqsample_create.add_argument(
+        "--pool-item-id",
+        dest="sequenced_pool_item_id",
+        required=True,
+        help="Per-pool unique item identifier (e.g., the well or library barcode)",
+    )
+    p_seqsample_create.add_argument("--primary-study-idx", type=int, required=True)
+    p_seqsample_create.add_argument(
+        "--secondary-study-idx",
+        dest="secondary_study_idxs",
+        type=int,
+        action="append",
+        default=[],
+        metavar="STUDY_IDX",
+        help=(
+            "Additional study this sequenced_sample is linked to."
+            " Repeat for multiple; the primary owns metadata rows,"
+            " secondaries read through the global field slot."
+        ),
+    )
+    p_seqsample_create.add_argument(
+        "--metadata",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Metadata entry; repeat for multiple. KEY is a prep_sample_global_field"
+            " display_name; the composer parses VALUE into the field's data type."
+        ),
+    )
+    p_seqsample_create.add_argument("--metadata-checklist-idx", type=int)
+    # ena_experiment_accession + ena_run_accession are deliberately NOT
+    # exposed: they're publication-lock signals set by the submission
+    # subsystem, not caller-supplied fields.
+    p_seqsample_create.set_defaults(handler=_handle_sequenced_sample_create)
+
     return parser
 
 
@@ -369,6 +442,24 @@ def _handle_sequenced_pool_create(args: argparse.Namespace, parser: argparse.Arg
     return _common.run_http_subcommand(
         lambda t: _post_sequenced_pool(args.base_url, t, args.run_idx, body)
     )
+
+
+def _handle_sequenced_sample_create(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    """Mint a sequenced_sample composer atomically with its study links and
+    metadata. --owner-idx auto-defaults to the caller via whoami when omitted;
+    --metadata KEY=VALUE entries collect via the shared parse_kv_pairs helper.
+    """
+    args.metadata = _common.parse_kv_pairs(args.metadata, parser, flag="--metadata")
+
+    def _run(token: str) -> dict:
+        if args.owner_idx is None:
+            args.owner_idx = _common.whoami(args.base_url, token)["principal_idx"]
+        body = _build_body(SequencedSampleCreateRequest, args, parser)
+        return _post_sequenced_sample(args.base_url, token, args.run_idx, args.pool_idx, body)
+
+    return _common.run_http_subcommand(_run)
 
 
 def _build_body(

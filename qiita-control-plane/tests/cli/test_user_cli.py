@@ -905,6 +905,251 @@ def test_sequenced_pool_create_requires_run_idx(capsys):
 
 
 # ---------------------------------------------------------------------------
+# sequenced-sample create
+# ---------------------------------------------------------------------------
+
+
+def _stub_sequenced_sample_post(monkeypatch, captured: dict, *, whoami_idx: int | None = None):
+    """Stub for sequenced-sample create. Mirrors _stub_biosample_post: returns
+    a whoami response on /auth/whoami and a composer response on the POST."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured.setdefault("requests", [])
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        captured["requests"].append(
+            {
+                "method": method,
+                "url": url,
+                "auth": headers["Authorization"],
+                "json": json,
+            }
+        )
+        if url.endswith("/auth/whoami"):
+            assert whoami_idx is not None
+            return _httpx.Response(
+                200,
+                json={"kind": "human", "principal_idx": whoami_idx},
+                request=_httpx.Request(method, url),
+            )
+        return _httpx.Response(
+            201,
+            json={"prep_sample_idx": 100, "sequenced_sample_idx": 200},
+            request=_httpx.Request(method, url),
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_ss_test")
+
+
+def test_sequenced_sample_create_minimal_with_caller_owner(monkeypatch):
+    """Owner defaults to the caller via whoami; primary-only (no secondary
+    studies, no metadata, no checklist) sends the smallest valid body."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_sequenced_sample_post(monkeypatch, captured, whoami_idx=42)
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "sequenced-sample",
+            "create",
+            "--run-idx",
+            "4",
+            "--pool-idx",
+            "9",
+            "--biosample-idx",
+            "55",
+            "--prep-protocol-idx",
+            "3",
+            "--pool-item-id",
+            "WELL-A1",
+            "--primary-study-idx",
+            "7",
+        ]
+    )
+    assert rc == 0
+    assert [r["method"] for r in captured["requests"]] == ["GET", "POST"]
+    post = captured["requests"][1]
+    assert post["url"] == (
+        "https://q.example.test/api/v1/sequencing-run/4/sequenced-pool/9/sequenced-sample"
+    )
+    assert post["json"] == {
+        "biosample_idx": 55,
+        "prep_protocol_idx": 3,
+        "owner_idx": 42,
+        "sequenced_pool_item_id": "WELL-A1",
+        "primary_study_idx": 7,
+        "secondary_study_idxs": [],
+        "metadata": {},
+    }
+
+
+def test_sequenced_sample_create_with_secondary_studies_and_metadata(monkeypatch):
+    """Repeated --secondary-study-idx accumulates into a list; metadata
+    KEY=VALUE entries collect into a dict."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_sequenced_sample_post(monkeypatch, captured, whoami_idx=42)
+
+    rc = main(
+        [
+            "sequenced-sample",
+            "create",
+            "--run-idx",
+            "4",
+            "--pool-idx",
+            "9",
+            "--biosample-idx",
+            "55",
+            "--prep-protocol-idx",
+            "3",
+            "--pool-item-id",
+            "WELL-A1",
+            "--primary-study-idx",
+            "7",
+            "--secondary-study-idx",
+            "8",
+            "--secondary-study-idx",
+            "12",
+            "--metadata",
+            "library_prep_kit=Nextera XT",
+            "--metadata",
+            "barcode=AAGCTT",
+        ]
+    )
+    assert rc == 0
+    body = captured["requests"][-1]["json"]
+    assert body["secondary_study_idxs"] == [8, 12]
+    assert body["metadata"] == {
+        "library_prep_kit": "Nextera XT",
+        "barcode": "AAGCTT",
+    }
+
+
+def test_sequenced_sample_create_explicit_owner_skips_whoami(monkeypatch):
+    """When --owner-idx is supplied, no whoami round-trip — the caller is
+    acting on someone else's behalf."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_sequenced_sample_post(monkeypatch, captured)
+
+    rc = main(
+        [
+            "sequenced-sample",
+            "create",
+            "--run-idx",
+            "4",
+            "--pool-idx",
+            "9",
+            "--biosample-idx",
+            "55",
+            "--prep-protocol-idx",
+            "3",
+            "--owner-idx",
+            "11",
+            "--pool-item-id",
+            "WELL-A1",
+            "--primary-study-idx",
+            "7",
+        ]
+    )
+    assert rc == 0
+    assert [r["method"] for r in captured["requests"]] == ["POST"]
+    assert captured["requests"][0]["json"]["owner_idx"] == 11
+
+
+def test_sequenced_sample_create_metadata_checklist_passes_through(monkeypatch):
+    """--metadata-checklist-idx flows verbatim; ENA accession fields stay
+    absent regardless (not exposed)."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_sequenced_sample_post(monkeypatch, captured, whoami_idx=42)
+
+    rc = main(
+        [
+            "sequenced-sample",
+            "create",
+            "--run-idx",
+            "4",
+            "--pool-idx",
+            "9",
+            "--biosample-idx",
+            "55",
+            "--prep-protocol-idx",
+            "3",
+            "--pool-item-id",
+            "WELL-A1",
+            "--primary-study-idx",
+            "7",
+            "--metadata-checklist-idx",
+            "2",
+        ]
+    )
+    assert rc == 0
+    body = captured["requests"][-1]["json"]
+    assert body["metadata_checklist_idx"] == 2
+    assert "ena_experiment_accession" not in body
+    assert "ena_run_accession" not in body
+
+
+def test_sequenced_sample_create_requires_required_flags(capsys):
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["sequenced-sample", "create"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    # argparse names the first missing required flag in its standard error
+    # message; just check one of ours is mentioned so the test isn't tied
+    # to argparse's choice of "which one".
+    assert "required" in err
+    assert "--run-idx" in err or "--pool-idx" in err or "--biosample-idx" in err
+
+
+def test_sequenced_sample_create_rejects_primary_in_secondary(monkeypatch, capsys):
+    """The model's primary-in-secondary validator fires client-side via
+    _build_body and surfaces as a parser.error."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_sequenced_sample_post(monkeypatch, captured, whoami_idx=42)
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "sequenced-sample",
+                "create",
+                "--run-idx",
+                "4",
+                "--pool-idx",
+                "9",
+                "--biosample-idx",
+                "55",
+                "--prep-protocol-idx",
+                "3",
+                "--pool-item-id",
+                "WELL-A1",
+                "--primary-study-idx",
+                "7",
+                "--secondary-study-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "invalid SequencedSampleCreateRequest" in err
+    assert "primary_study_idx" in err
+
+
+# ---------------------------------------------------------------------------
 # --base-url http-to-non-localhost guard
 # ---------------------------------------------------------------------------
 
