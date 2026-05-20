@@ -41,6 +41,10 @@ class Scope(StrEnum):
     REFERENCE_REGISTER_FILES = "reference:register_files"
     FEATURE_MINT = "feature:mint"
     TICKET_DOGET = "ticket:doget"
+    # Generic upload domain. Gates the slot-minting + DoPut path; not
+    # reference-specific. Carried by admins (humans uploading via qiita-admin)
+    # and service accounts (workers driving import flows).
+    TICKET_DOPUT = "ticket:doput"
 
     # Biosample data
     BIOSAMPLE_READ = "biosample:read"

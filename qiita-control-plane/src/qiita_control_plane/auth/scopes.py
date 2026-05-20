@@ -47,6 +47,10 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.PREP_SAMPLE_WRITE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
+            # Upload slots — needed to drive reference data ingest via the
+            # qiita-admin CLI, whose reference-add audience includes
+            # wet_lab_admin.
+            Scope.TICKET_DOPUT,
         }
     ),
     SystemRole.SYSTEM_ADMIN: frozenset(
@@ -64,6 +68,7 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.ADMIN_USER,
             Scope.ADMIN_SERVICE_ACCOUNT,
             Scope.ADMIN_AUDIT_READ,
+            Scope.TICKET_DOPUT,
         }
     ),
 }
@@ -78,6 +83,7 @@ SERVICE_ACCOUNT_SCOPE_CEILING: frozenset[Scope] = frozenset(
         Scope.REFERENCE_REGISTER_FILES,
         Scope.REFERENCE_READ,
         Scope.TICKET_DOGET,
+        Scope.TICKET_DOPUT,
         Scope.SEQUENCE_RANGE_MINT,
     }
 )

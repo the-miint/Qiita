@@ -16,6 +16,7 @@ from .sequencing_run import (
     sequenced_sample_router as sequenced_sample_top_level_router,
 )
 from .study import router as study_router
+from .upload import router as upload_router
 from .user import router as user_router
 from .work_ticket import router as work_ticket_router
 
@@ -27,6 +28,7 @@ api_router.include_router(sequencing_router)
 api_router.include_router(sequenced_sample_top_level_router)
 api_router.include_router(sequence_range_router)
 api_router.include_router(study_router)
+api_router.include_router(upload_router)
 api_router.include_router(user_router)
 api_router.include_router(auth_router)
 api_router.include_router(admin_router)

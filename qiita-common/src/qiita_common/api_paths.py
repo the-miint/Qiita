@@ -112,6 +112,25 @@ URL_WORK_TICKET_RUN = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_RUN}"
 
 
 # =============================================================================
+# /upload/* — generic Arrow-data staging slots
+# =============================================================================
+# POST /upload mints a row in `qiita.upload` and returns a signed DoPut
+# Flight ticket. POST /upload/{idx}/done records the client's completion
+# claim and transitions pending → ready. GET /upload/{idx} reads status.
+# The domain is content-agnostic by design; no reference / role / consumer
+# fields cross the wire.
+
+PATH_UPLOAD_PREFIX = "/upload"
+PATH_UPLOAD_ROOT = ""  # POST/list against the prefix itself
+PATH_UPLOAD_BY_IDX = "/{upload_idx}"
+PATH_UPLOAD_DONE = "/{upload_idx}/done"
+
+URL_UPLOAD_PREFIX = f"{API_PREFIX}{PATH_UPLOAD_PREFIX}"
+URL_UPLOAD_BY_IDX = f"{URL_UPLOAD_PREFIX}{PATH_UPLOAD_BY_IDX}"
+URL_UPLOAD_DONE = f"{URL_UPLOAD_PREFIX}{PATH_UPLOAD_DONE}"
+
+
+# =============================================================================
 # /sequence-range/* — control-plane sequence_idx allocator
 # =============================================================================
 # Mints contiguous bigint ranges (`sequence_idx_start..stop`) the data

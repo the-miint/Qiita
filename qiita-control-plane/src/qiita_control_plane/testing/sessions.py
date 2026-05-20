@@ -107,6 +107,7 @@ async def human_admin_session(postgres_pool):
             Scope.ADMIN_USER,
             Scope.ADMIN_SERVICE_ACCOUNT,
             Scope.ADMIN_AUDIT_READ,
+            Scope.TICKET_DOPUT,
         ],
     )
     return {
@@ -180,6 +181,7 @@ async def wet_lab_admin_session(postgres_pool):
             Scope.PREP_SAMPLE_WRITE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
+            Scope.TICKET_DOPUT,
         ],
     )
     return {

@@ -121,6 +121,23 @@ def test_sequence_range_mint_is_workers_only():
         )
 
 
+def test_ticket_doput_in_admin_role_ceilings_not_user():
+    """ticket:doput gates the generic upload-slot endpoint. Reference loading
+    (the first consumer) is admin-only — the reference-add workflow's
+    audience is `[wet_lab_admin, system_admin]` — so the scope must be in
+    both admin ceilings but NOT in the USER ceiling. Service accounts also
+    get it for future worker-driven uploads (sequencing-run import, etc.)."""
+    from qiita_control_plane.auth.scopes import (
+        ROLE_IMPLIED_SCOPES,
+        SERVICE_ACCOUNT_SCOPE_CEILING,
+    )
+
+    assert Scope.TICKET_DOPUT in ROLE_IMPLIED_SCOPES[SystemRole.SYSTEM_ADMIN]
+    assert Scope.TICKET_DOPUT in ROLE_IMPLIED_SCOPES[SystemRole.WET_LAB_ADMIN]
+    assert Scope.TICKET_DOPUT not in ROLE_IMPLIED_SCOPES[SystemRole.USER]
+    assert Scope.TICKET_DOPUT in SERVICE_ACCOUNT_SCOPE_CEILING
+
+
 def test_reject_scopes_outside_ceiling():
     from qiita_control_plane.auth.scopes import (
         ROLE_IMPLIED_SCOPES,
