@@ -569,6 +569,176 @@ def test_biosample_create_rejects_duplicate_metadata_key(capsys):
 
 
 # ---------------------------------------------------------------------------
+# sequencing-run create
+# ---------------------------------------------------------------------------
+
+
+def _stub_post(monkeypatch, captured: dict, *, response_json: dict, status: int = 201):
+    """Patch _common.httpx.request to capture one POST and return a canned
+    response. Less feature-rich than _stub_biosample_post (no whoami branch)
+    because the sequencing-run path doesn't need to look up owner_idx."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        captured["method"] = method
+        captured["url"] = url
+        captured["auth"] = headers["Authorization"]
+        captured["json"] = json
+        return _httpx.Response(status, json=response_json, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+
+def test_sequencing_run_create_minimal(monkeypatch):
+    """Only --instrument-run-id + --platform should be necessary; optional
+    columns stay absent so the server's defaults apply."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json={"sequencing_run_idx": 4})
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "sequencing-run",
+            "create",
+            "--instrument-run-id",
+            "240301_MN12345_0001_AAATEST",
+            "--platform",
+            "illumina",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://q.example.test/api/v1/sequencing-run"
+    assert captured["json"] == {
+        "instrument_run_id": "240301_MN12345_0001_AAATEST",
+        "platform": "illumina",
+    }
+
+
+def test_sequencing_run_create_passes_through_optional_fields(monkeypatch):
+    """All optional flags surface verbatim in the body. --extra-metadata
+    is parsed from JSON into a dict before send."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json={"sequencing_run_idx": 4})
+
+    rc = main(
+        [
+            "sequencing-run",
+            "create",
+            "--instrument-run-id",
+            "240301_MN12345_0001_AAATEST",
+            "--platform",
+            "oxford_nanopore",
+            "--instrument-model",
+            "MinION Mk1C",
+            "--instrument-serial",
+            "MN12345",
+            "--run-performed-at",
+            "2026-05-19T15:30:00Z",
+            "--extra-metadata",
+            '{"chemistry":"R10.4.1"}',
+        ]
+    )
+    assert rc == 0
+    assert captured["json"] == {
+        "instrument_run_id": "240301_MN12345_0001_AAATEST",
+        "platform": "oxford_nanopore",
+        "instrument_model": "MinION Mk1C",
+        "instrument_serial": "MN12345",
+        # Pydantic normalizes the trailing Z to +00:00 on AwareDatetime round-trip
+        "run_performed_at": "2026-05-19T15:30:00Z",
+        "extra_metadata": {"chemistry": "R10.4.1"},
+    }
+
+
+def test_sequencing_run_create_requires_instrument_run_id_and_platform(capsys):
+    """Argparse should refuse the call without the two required flags."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["sequencing-run", "create"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--instrument-run-id" in err
+
+
+def test_sequencing_run_create_rejects_unknown_platform(capsys):
+    """choices= guards a typo in --platform before any HTTP round-trip."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "sequencing-run",
+                "create",
+                "--instrument-run-id",
+                "X",
+                "--platform",
+                "iontorrent",  # missing underscore
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--platform" in err
+
+
+def test_sequencing_run_create_rejects_malformed_extra_metadata(capsys):
+    """Non-JSON --extra-metadata exits 2 via parser.error rather than a
+    JSONDecodeError traceback."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "sequencing-run",
+                "create",
+                "--instrument-run-id",
+                "X",
+                "--platform",
+                "illumina",
+                "--extra-metadata",
+                "{not-json",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--extra-metadata" in err
+    assert "not valid JSON" in err
+
+
+def test_sequencing_run_create_rejects_non_object_extra_metadata(capsys):
+    """--extra-metadata must be a JSON object (matches the JSONB-on-server
+    convention). A bare array or scalar should fail fast."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "sequencing-run",
+                "create",
+                "--instrument-run-id",
+                "X",
+                "--platform",
+                "illumina",
+                "--extra-metadata",
+                "[1, 2, 3]",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--extra-metadata" in err
+    assert "JSON object" in err
+
+
+# ---------------------------------------------------------------------------
 # --base-url http-to-non-localhost guard
 # ---------------------------------------------------------------------------
 

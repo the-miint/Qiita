@@ -17,7 +17,14 @@ import argparse
 import sys
 
 from pydantic import BaseModel, ValidationError
-from qiita_common.models import BiosampleImportRequest, StudyCreate, Tier, UserUpdate
+from qiita_common.models import (
+    BiosampleImportRequest,
+    Platform,
+    SequencingRunCreateRequest,
+    StudyCreate,
+    Tier,
+    UserUpdate,
+)
 
 from . import _common
 
@@ -56,6 +63,16 @@ def _post_biosample(base_url: str, token: str, study_idx: int, body: dict) -> di
     chasing their own principal_idx.
     """
     return _common.call("POST", base_url, token, f"/study/{study_idx}/biosample", json=body)
+
+
+def _post_sequencing_run(base_url: str, token: str, body: dict) -> dict:
+    """POST /api/v1/sequencing-run with the (already-pruned) body.
+
+    Instrument-level resource: not study-scoped, has no owner field. The
+    creator is captured server-side as created_by_idx and gates pool/sample
+    attachment in the auth-widening pass.
+    """
+    return _common.call("POST", base_url, token, "/sequencing-run", json=body)
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +189,35 @@ def _build_parser() -> argparse.ArgumentParser:
     # caller-supplied field.
     p_biosample_create.set_defaults(handler=_handle_biosample_create)
 
+    p_seqrun = sub.add_parser("sequencing-run", help="Sequencing-run operations")
+    p_seqrun_sub = p_seqrun.add_subparsers(dest="sequencing_run_cmd", required=True)
+    p_seqrun_create = p_seqrun_sub.add_parser(
+        "create",
+        help="Create a sequencing-run row (POST /sequencing-run)",
+    )
+    p_seqrun_create.add_argument(
+        "--instrument-run-id",
+        required=True,
+        help="Instrument-assigned run identifier; UNIQUE in the system",
+    )
+    p_seqrun_create.add_argument(
+        "--platform",
+        required=True,
+        choices=tuple(p.value for p in Platform),
+        help="Sequencing platform; values mirror ENA SRA platform names",
+    )
+    p_seqrun_create.add_argument("--instrument-model")
+    p_seqrun_create.add_argument("--instrument-serial")
+    p_seqrun_create.add_argument(
+        "--run-performed-at",
+        help="ISO-8601 timestamp with timezone, e.g. 2026-05-19T15:30:00Z",
+    )
+    p_seqrun_create.add_argument(
+        "--extra-metadata",
+        help="Free-form JSON object stored as JSONB",
+    )
+    p_seqrun_create.set_defaults(handler=_handle_sequencing_run_create)
+
     return parser
 
 
@@ -225,6 +271,17 @@ def _handle_biosample_create(args: argparse.Namespace, parser: argparse.Argument
         return _post_biosample(args.base_url, token, args.study_idx, body)
 
     return _common.run_http_subcommand(_run)
+
+
+def _handle_sequencing_run_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Mint a sequencing-run row. --extra-metadata is parsed from JSON
+    before Pydantic validation so a malformed paste surfaces as a clean
+    argparse exit 2."""
+    args.extra_metadata = _common.parse_json_arg(
+        args.extra_metadata, parser, flag="--extra-metadata"
+    )
+    body = _build_body(SequencingRunCreateRequest, args, parser)
+    return _common.run_http_subcommand(lambda t: _post_sequencing_run(args.base_url, t, body))
 
 
 def _build_body(

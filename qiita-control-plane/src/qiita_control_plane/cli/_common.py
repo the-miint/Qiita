@@ -242,6 +242,32 @@ def whoami(base_url: str, token: str) -> dict:
     return call("GET", base_url, token, "/auth/whoami")
 
 
+def parse_json_arg(
+    raw: str | None,
+    parser: argparse.ArgumentParser,
+    *,
+    flag: str,
+) -> dict | None:
+    """Parse a JSON-object string from a CLI flag into a dict, or return None
+    when the flag wasn't supplied. Used by subcommands that accept structured
+    JSON payloads (extra_metadata, action_context, ...).
+
+    Rejects JSONDecodeError and non-object roots via `parser.error` (exit 2)
+    so a malformed paste surfaces as a clean argparse-style failure rather
+    than a deeper traceback. `flag` is the originating CLI flag name embedded
+    in the error message.
+    """
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        parser.error(f"{flag} is not valid JSON: {exc}")
+    if not isinstance(parsed, dict):
+        parser.error(f"{flag} must be a JSON object; got {type(parsed).__name__}")
+    return parsed
+
+
 def parse_kv_pairs(
     pairs: list[str],
     parser: argparse.ArgumentParser,
