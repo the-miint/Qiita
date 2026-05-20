@@ -327,6 +327,248 @@ def test_profile_set_pydantic_validation_error_exits_2(capsys):
 
 
 # ---------------------------------------------------------------------------
+# biosample create
+# ---------------------------------------------------------------------------
+
+
+def _stub_biosample_post(monkeypatch, captured: dict, *, whoami_idx: int | None = None):
+    """Patch _common.httpx.request to capture the next POST/GET request.
+
+    When `whoami_idx` is supplied, the GET /auth/whoami response carries
+    that principal_idx so the handler's auto-owner branch fires. Returns
+    nothing; mutates `captured` in place with each request's verb / url /
+    json / auth header.
+    """
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured.setdefault("requests", [])
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        captured["requests"].append(
+            {
+                "method": method,
+                "url": url,
+                "auth": headers["Authorization"],
+                "json": json,
+            }
+        )
+        if url.endswith("/auth/whoami"):
+            assert whoami_idx is not None, (
+                "test triggered whoami without setting whoami_idx in the stub"
+            )
+            return _httpx.Response(
+                200,
+                json={"kind": "human", "principal_idx": whoami_idx},
+                request=_httpx.Request(method, url),
+            )
+        return _httpx.Response(
+            201,
+            json={
+                "biosample_idx": 99,
+                "owner_id_biosample_study_field_idx": 5,
+                "owner_id_biosample_study_field_created": True,
+            },
+            request=_httpx.Request(method, url),
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_bs_test")
+
+
+def test_biosample_create_defaults_owner_idx_to_caller(monkeypatch):
+    """When --owner-idx is omitted, the handler resolves the caller's
+    principal_idx via whoami and uses that as owner_idx on the POST body."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_biosample_post(monkeypatch, captured, whoami_idx=42)
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "biosample",
+            "create",
+            "--study-idx",
+            "7",
+            "--owner-biosample-id-field-name",
+            "owner_sample_id",
+            "--owner-biosample-id-value",
+            "SMK-001",
+        ]
+    )
+    assert rc == 0
+    # whoami first (to resolve owner), then the actual POST.
+    assert [r["method"] for r in captured["requests"]] == ["GET", "POST"]
+    whoami_req, post_req = captured["requests"]
+    assert whoami_req["url"].endswith("/api/v1/auth/whoami")
+    assert post_req["url"] == "https://q.example.test/api/v1/study/7/biosample"
+    assert post_req["json"] == {
+        "owner_idx": 42,
+        "owner_biosample_id_field_name": "owner_sample_id",
+        "owner_biosample_id_value": "SMK-001",
+        "metadata": {},
+    }
+
+
+def test_biosample_create_explicit_owner_idx_skips_whoami(monkeypatch):
+    """When --owner-idx is supplied, no whoami round-trip — the caller
+    is acting on someone else's behalf (lab-tech-on-behalf path)."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_biosample_post(monkeypatch, captured)
+
+    rc = main(
+        [
+            "biosample",
+            "create",
+            "--study-idx",
+            "7",
+            "--owner-idx",
+            "11",
+            "--owner-biosample-id-field-name",
+            "owner_sample_id",
+            "--owner-biosample-id-value",
+            "SMK-002",
+        ]
+    )
+    assert rc == 0
+    assert [r["method"] for r in captured["requests"]] == ["POST"]
+    assert captured["requests"][0]["json"]["owner_idx"] == 11
+
+
+def test_biosample_create_metadata_pairs_become_dict(monkeypatch):
+    """Repeated --metadata KEY=VALUE collects into a dict on the wire,
+    keyed verbatim on the user-supplied display_name strings."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_biosample_post(monkeypatch, captured, whoami_idx=42)
+
+    rc = main(
+        [
+            "biosample",
+            "create",
+            "--study-idx",
+            "7",
+            "--owner-biosample-id-field-name",
+            "owner_sample_id",
+            "--owner-biosample-id-value",
+            "SMK-001",
+            "--metadata",
+            "host_subject_id=mouse-1",
+            "--metadata",
+            "collection_date=2026-05-19",
+        ]
+    )
+    assert rc == 0
+    assert captured["requests"][-1]["json"]["metadata"] == {
+        "host_subject_id": "mouse-1",
+        "collection_date": "2026-05-19",
+    }
+
+
+def test_biosample_create_passes_through_optional_fields(monkeypatch):
+    """metadata_checklist_idx and biosample_accession flow into the body
+    when supplied; ena_sample_accession stays absent (not exposed)."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_biosample_post(monkeypatch, captured, whoami_idx=42)
+
+    rc = main(
+        [
+            "biosample",
+            "create",
+            "--study-idx",
+            "7",
+            "--owner-biosample-id-field-name",
+            "owner_sample_id",
+            "--owner-biosample-id-value",
+            "SMK-001",
+            "--metadata-checklist-idx",
+            "3",
+            "--biosample-accession",
+            "SAMN12345678",
+        ]
+    )
+    assert rc == 0
+    body = captured["requests"][-1]["json"]
+    assert body["metadata_checklist_idx"] == 3
+    assert body["biosample_accession"] == "SAMN12345678"
+    assert "ena_sample_accession" not in body
+
+
+def test_biosample_create_requires_required_flags(capsys):
+    """Missing any of --study-idx / --owner-biosample-id-field-name /
+    --owner-biosample-id-value should produce an argparse error (exit 2)."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["biosample", "create"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--study-idx" in err
+
+
+def test_biosample_create_rejects_malformed_metadata(capsys):
+    """A --metadata entry without '=' is a typo, not a key with empty
+    value; reject loudly via parser.error (exit 2)."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "biosample",
+                "create",
+                "--study-idx",
+                "7",
+                "--owner-biosample-id-field-name",
+                "owner_sample_id",
+                "--owner-biosample-id-value",
+                "SMK-001",
+                "--metadata",
+                "no_equals_sign",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--metadata" in err
+    assert "missing '='" in err
+
+
+def test_biosample_create_rejects_duplicate_metadata_key(capsys):
+    """Duplicate --metadata KEY entries are almost always a typo; reject
+    rather than silently last-wins."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "biosample",
+                "create",
+                "--study-idx",
+                "7",
+                "--owner-biosample-id-field-name",
+                "owner_sample_id",
+                "--owner-biosample-id-value",
+                "SMK-001",
+                "--metadata",
+                "k=v1",
+                "--metadata",
+                "k=v2",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--metadata" in err
+    assert "repeated" in err
+
+
+# ---------------------------------------------------------------------------
 # --base-url http-to-non-localhost guard
 # ---------------------------------------------------------------------------
 

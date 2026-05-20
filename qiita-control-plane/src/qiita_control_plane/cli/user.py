@@ -17,7 +17,7 @@ import argparse
 import sys
 
 from pydantic import BaseModel, ValidationError
-from qiita_common.models import StudyCreate, Tier, UserUpdate
+from qiita_common.models import BiosampleImportRequest, StudyCreate, Tier, UserUpdate
 
 from . import _common
 
@@ -45,6 +45,17 @@ def _post_study(base_url: str, token: str, body: dict) -> dict:
     naming a different owner requires wet_lab_admin+ (lab-tech-on-behalf),
     out of scope for the regular-user CLI."""
     return _common.call("POST", base_url, token, "/study", json=body)
+
+
+def _post_biosample(base_url: str, token: str, study_idx: int, body: dict) -> dict:
+    """POST /api/v1/study/{study_idx}/biosample with the (already-pruned) body.
+
+    The route currently requires owner_idx in the body explicitly; the CLI
+    handler resolves it via whoami when --owner-idx is omitted so the
+    caller can run `qiita biosample create` for themselves without first
+    chasing their own principal_idx.
+    """
+    return _common.call("POST", base_url, token, f"/study/{study_idx}/biosample", json=body)
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +130,48 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_study_create.set_defaults(handler=_handle_study_create)
 
+    p_biosample = sub.add_parser("biosample", help="Biosample operations")
+    p_biosample_sub = p_biosample.add_subparsers(dest="biosample_cmd", required=True)
+    p_biosample_create = p_biosample_sub.add_parser(
+        "create",
+        help="Create a biosample on a study (POST /study/{S}/biosample)",
+    )
+    p_biosample_create.add_argument("--study-idx", type=int, required=True)
+    p_biosample_create.add_argument(
+        "--owner-idx",
+        type=int,
+        help="principal_idx of the biosample's owner; defaults to the caller (resolved via whoami)",
+    )
+    p_biosample_create.add_argument(
+        "--owner-biosample-id-field-name",
+        required=True,
+        help="display_name of the study's local field that carries the owner-biosample-id",
+    )
+    p_biosample_create.add_argument(
+        "--owner-biosample-id-value",
+        required=True,
+        help="the owner-biosample-id value to record on this biosample",
+    )
+    p_biosample_create.add_argument(
+        "--metadata",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Metadata entry; repeat for multiple. KEY is a biosample_global_field"
+            " display_name; the route parses VALUE into the field's data type."
+        ),
+    )
+    p_biosample_create.add_argument("--metadata-checklist-idx", type=int)
+    p_biosample_create.add_argument(
+        "--biosample-accession",
+        help="External biosample accession (e.g. NCBI), if known at create time",
+    )
+    # --ena-sample-accession is deliberately NOT exposed: it's the
+    # publication-lock signal set by the submission subsystem, not a
+    # caller-supplied field.
+    p_biosample_create.set_defaults(handler=_handle_biosample_create)
+
     return parser
 
 
@@ -153,6 +206,25 @@ def _handle_profile_set(args: argparse.Namespace, parser: argparse.ArgumentParse
 def _handle_study_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     body = _build_body(StudyCreate, args, parser)
     return _common.run_http_subcommand(lambda t: _post_study(args.base_url, t, body))
+
+
+def _handle_biosample_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Mint a biosample on a study, auto-defaulting owner_idx to the caller.
+
+    The whoami lookup that resolves a missing --owner-idx shares the
+    token-read path with the POST itself, so both calls happen inside the
+    same `run_http_subcommand` invocation. Body construction runs after
+    that resolution so BiosampleImportRequest sees a populated owner_idx.
+    """
+    args.metadata = _common.parse_kv_pairs(args.metadata, parser, flag="--metadata")
+
+    def _run(token: str) -> dict:
+        if args.owner_idx is None:
+            args.owner_idx = _common.whoami(args.base_url, token)["principal_idx"]
+        body = _build_body(BiosampleImportRequest, args, parser)
+        return _post_biosample(args.base_url, token, args.study_idx, body)
+
+    return _common.run_http_subcommand(_run)
 
 
 def _build_body(

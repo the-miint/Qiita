@@ -242,6 +242,31 @@ def whoami(base_url: str, token: str) -> dict:
     return call("GET", base_url, token, "/auth/whoami")
 
 
+def parse_kv_pairs(
+    pairs: list[str],
+    parser: argparse.ArgumentParser,
+    *,
+    flag: str,
+) -> dict[str, str]:
+    """Parse a list of "KEY=VALUE" strings (from a repeatable argparse flag)
+    into a dict. Rejects entries missing '=', entries with an empty key, and
+    duplicate keys — silently last-wins would mask typos. Errors via
+    `parser.error` (exit 2). `flag` is the originating CLI flag name used in
+    error messages so the caller knows which arg was bad.
+    """
+    result: dict[str, str] = {}
+    for entry in pairs:
+        if "=" not in entry:
+            parser.error(f"{flag} entry {entry!r} is missing '='; expected KEY=VALUE")
+        key, value = entry.split("=", 1)
+        if not key:
+            parser.error(f"{flag} entry {entry!r} has an empty key")
+        if key in result:
+            parser.error(f"{flag} key {key!r} repeated; supply each key at most once")
+        result[key] = value
+    return result
+
+
 def run_http_subcommand(fn: Callable[[str], dict]) -> int:
     """Token-read + httpx invoke + json print, common to every HTTP subcommand.
 
