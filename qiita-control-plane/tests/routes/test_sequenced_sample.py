@@ -1473,6 +1473,72 @@ async def test_list_sequenced_sample_idxs_in_study_truncated(ctx, monkeypatch):
     assert resp.json() == expected
 
 
+async def test_list_sequenced_sample_idxs_in_study_surfaces_secondary_link(ctx):
+    # A sequenced_sample created with primary=A, secondary=[B] must surface
+    # in the study-scoped roster for B as well as A. The repository walks
+    # prep_sample_to_study with WHERE pts.study_idx = $1, which holds both
+    # link kinds; this test closes the secondary branch of that query.
+    primary_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="sec-roster-p"
+    )
+    secondary_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="sec-roster-s"
+    )
+    # Biosample must be linked to every requested study or the
+    # prep_sample_to_study_reject_without_biosample_link trigger fires.
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        study_idx=primary_idx,
+    )
+    await seed_biosample_to_study_link(
+        ctx["pool"],
+        biosample_idx=bs_idx,
+        study_idx=secondary_idx,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["biosample_to_study"].append((bs_idx, secondary_idx))
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+
+    # Compose one sequenced_sample whose supertype prep_sample lands a
+    # primary link to A and a secondary link to B in prep_sample_to_study.
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "sec-roster")
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        sequenced_pool_item_id=_unique_item_id("SECROSTER"),
+        primary_study_idx=primary_idx,
+        secondary_study_idxs=[secondary_idx],
+    )
+    assert resp.status_code == 201, resp.text
+    ss_idx = resp.json()["sequenced_sample_idx"]
+    expected = {
+        "idxs": [ss_idx],
+        "count": 1,
+        "truncated": False,
+        "caller_system_role": "user",
+    }
+
+    # Secondary side: the sample must appear in the roster for B even
+    # though B is the secondary link, not the primary.
+    secondary_resp = await ctx["user"].get(
+        f"/api/v1/study/{secondary_idx}/sequenced-sample/list-idxs"
+    )
+    assert secondary_resp.status_code == 200, secondary_resp.text
+    assert secondary_resp.json() == expected
+
+    # Primary side: the same sample also surfaces in the roster for A,
+    # confirming a single sample participates in both rosters.
+    primary_resp = await ctx["user"].get(f"/api/v1/study/{primary_idx}/sequenced-sample/list-idxs")
+    assert primary_resp.status_code == 200, primary_resp.text
+    assert primary_resp.json() == expected
+
+
 # ===========================================================================
 # GET /sequenced-sample/{idx} — happy paths
 # ===========================================================================
