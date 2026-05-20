@@ -10,7 +10,9 @@ from qiita_common.parquet import validate_parquet_path
 from ..backend import ComputeBackend, assert_container_scope_supported
 from ..jobs import flatten_native_inputs, run_native_job
 from ..miint import (
+    CHUNK_SIZE,
     PARQUET_OPTS,
+    PARQUET_OPTS_CHUNKED,
     ensure_miint_installed,
     is_empty_sequence_file,
     open_conn,
@@ -273,13 +275,9 @@ class LocalBackend(ComputeBackend):
         return output_dir
 
 
-# 16384 rows × ~64 KB chunk_data ≈ 1 GB per row group. Smaller values flush
-# more frequently, preventing OOM on genome-heavy references. Empirically
-# tuned against GG2 backbone (21 MB max genome, 11 GB FASTA):
-#   16384 → 4.2 GB peak RSS (OK), 32768 → OOM on 30 GB machine.
-_CHUNK_ROW_GROUP_SIZE = 16384
-_PARQUET_OPTS_CHUNKED = f"{PARQUET_OPTS}, ROW_GROUP_SIZE {_CHUNK_ROW_GROUP_SIZE}"
-_CHUNK_SIZE = 65536  # 64 KB
+# Chunked-sequence write constants now live in `..miint` so the
+# legacy reference-add path (this file, removed in Cycle 4) and the
+# upload-driven path (jobs/hash_sequences) share the source of truth.
 
 
 def _build_id_map(
@@ -355,10 +353,10 @@ def _write_sequence_chunks(
     conn.execute(
         f"CREATE OR REPLACE MACRO chunk_seq(str) AS "
         f"list_transform("
-        f"  range(1, CAST(length(str) + 1 AS BIGINT), {_CHUNK_SIZE}),"
+        f"  range(1, CAST(length(str) + 1 AS BIGINT), {CHUNK_SIZE}),"
         f"  lambda idx : {{"
-        f"    'chunk_index': CAST((idx - 1) / {_CHUNK_SIZE} AS INTEGER),"
-        f"    'chunk_data': substring(str, CAST(idx AS BIGINT), {_CHUNK_SIZE})"
+        f"    'chunk_index': CAST((idx - 1) / {CHUNK_SIZE} AS INTEGER),"
+        f"    'chunk_data': substring(str, CAST(idx AS BIGINT), {CHUNK_SIZE})"
         f"  }}"
         f")"
     )
@@ -372,7 +370,7 @@ def _write_sequence_chunks(
         "  )"
         "  SELECT feature_idx, chunk.chunk_index, chunk.chunk_data"
         "  FROM unnested"
-        f") TO '{out}' ({_PARQUET_OPTS_CHUNKED})",
+        f") TO '{out}' ({PARQUET_OPTS_CHUNKED})",
         [str(fasta_path)],
     )
 
