@@ -1,9 +1,10 @@
 """Repository functions for the qiita.sequencing_run and qiita.sequenced_pool tables.
 
 Direct functions cover the run-level row and the per-pool row that attaches
-to it. Subtype-level rows for individual sequenced samples live in the
-sibling prep_sample module, alongside the composer that ties the whole
-sequencing-ingestion chain together.
+to it. Subtype-level rows for individual sequenced samples, the run-scoped
+sequenced_sample idx read, and the composer that ties the whole
+sequencing-ingestion chain together live in the sibling sequenced_sample
+module.
 
 Write functions take an asyncpg.Connection as their first positional
 argument, never acquire their own connection, and never open their own
@@ -106,21 +107,23 @@ async def insert_sequenced_pool(
     conn: asyncpg.Connection,
     *,
     sequencing_run_idx: int,
-    run_preflight_blob: bytes,
-    run_preflight_filename: str,
+    run_preflight_blob: bytes | None = None,
+    run_preflight_filename: str | None = None,
     created_by_idx: int,
     extra_metadata: dict[str, Any] | None = None,
 ) -> int:
     """Insert a row into qiita.sequenced_pool and return the generated idx.
 
     Exposes every column the caller may legitimately set on a fresh row:
-    the FK back to the sequencing_run, the run-preflight blob and its
-    originating filename (both NOT NULL in the schema), and the free-form
-    extra_metadata JSONB. Retirement and audit-timestamp columns are
-    populated by triggers, defaults, or schema CHECKs and are not
-    parameters of this function.
+    the FK back to the sequencing_run, the optional run-preflight blob and
+    its originating filename, and the free-form extra_metadata JSONB. The
+    blob and filename are a co-populated pair — pass both or neither; a
+    schema CHECK rejects a half-populated pair. Retirement and
+    audit-timestamp columns are populated by triggers, defaults, or schema
+    CHECKs and are not parameters of this function.
 
     Raises asyncpg.ForeignKeyViolationError on a bad sequencing_run_idx,
+    asyncpg.CheckViolationError on a half-populated preflight pair,
     asyncpg.PostgresError on other constraint failures.
     """
     # BYTEA accepts the raw bytes object; JSONB requires a JSON string
@@ -158,38 +161,6 @@ async def fetch_sequenced_pool(
         " FROM qiita.sequenced_pool WHERE idx = $1",
         sequenced_pool_idx,
     )
-
-
-async def fetch_sequenced_sample_idxs_for_run(
-    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    *,
-    sequencing_run_idx: int,
-    limit: int,
-) -> list[int]:
-    """Return up to `limit` sequenced_sample idxs reachable from the run.
-
-    Walks the run -> sequenced_pool -> sequenced_sample -> prep_sample
-    chain and excludes sequenced_samples whose supertype prep_sample row
-    is retired. Sort: (sequenced_sample.created_at DESC, idx DESC) so
-    newer rows surface first. Callers that need to detect truncation pass
-    `limit = cap + 1`; if the returned list has length > cap, the
-    underlying set exceeded the cap.
-    """
-    # Single round trip; the partial index prep_sample_active_idx covers
-    # the retired = false predicate and the join filters down to one run.
-    rows = await pool_or_conn.fetch(
-        "SELECT ss.idx"
-        " FROM qiita.sequenced_sample ss"
-        " JOIN qiita.sequenced_pool sp ON sp.idx = ss.sequenced_pool_idx"
-        " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
-        " WHERE sp.sequencing_run_idx = $1"
-        "   AND ps.retired = false"
-        " ORDER BY ss.created_at DESC, ss.idx DESC"
-        " LIMIT $2",
-        sequencing_run_idx,
-        limit,
-    )
-    return [r["idx"] for r in rows]
 
 
 def _encode_jsonb(value: dict[str, Any] | None) -> str | None:

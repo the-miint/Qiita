@@ -44,11 +44,15 @@ from ..auth.guards import (
     require_study_exists,
 )
 from ..auth.principal import HumanUser, Principal
-from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
-from ..repositories import (
+from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx_conn_factory
+from ..repositories._sample_helpers import (
+    GlobalFieldSlotOccupiedError,
+    LocalWriteOnGloballyLinkedFieldError,
     MetadataParseError,
     MetadataUnknownFieldsError,
     StudyFieldConflictError,
+    TransientWriteRaceError,
+    fetch_global_metadata,
 )
 from ..repositories.biosample import (
     fetch_biosample,
@@ -58,10 +62,15 @@ from ..repositories.biosample import (
     update_biosample,
 )
 from ..repositories.biosample_metadata import (
+    BIOSAMPLE_METADATA_SPEC,
     BiosampleOwnerIdFieldCollisionError,
-    fetch_global_metadata_for_biosample,
 )
-from ._helpers import etag_for_updated_at
+from ._helpers import (
+    GENERIC_FK_VIOLATION,
+    detail_for_global_field_collision,
+    etag_for_updated_at,
+    raise_for_transient_write_race,
+)
 
 router = APIRouter(prefix="/study", tags=["biosample"])
 biosample_router = APIRouter(prefix="/biosample", tags=["biosample"])
@@ -83,7 +92,6 @@ _FK_VIOLATION_MESSAGES: dict[str, str] = {
     ),
 }
 _GENERIC_UNIQUE_VIOLATION = "conflicts with an existing biosample"
-_GENERIC_FK_VIOLATION = "references a row that does not exist"
 
 
 @router.post("/{study_idx}/biosample", status_code=201)
@@ -117,7 +125,7 @@ async def import_biosample(
         try:
             result = await import_biosample_from_owner_biosample_id(
                 conn,
-                study_idx=study_idx,
+                primary_study_idx=study_idx,
                 owner_idx=body.owner_idx,
                 owner_biosample_id_field_name=body.owner_biosample_id_field_name,
                 owner_biosample_id_value=body.owner_biosample_id_value,
@@ -152,25 +160,70 @@ async def import_biosample(
                 status_code=422,
                 detail=(
                     f"study has an existing field at display_name {exc.display_name!r}"
-                    " bound to a different global concept"
+                    " bound to a different global field"
+                ),
+            )
+        except GlobalFieldSlotOccupiedError as exc:
+            # GlobalFieldSlotOccupiedError is its own exception family (not
+            # an asyncpg.UniqueViolationError subclass), so this catch and
+            # the generic UniqueViolationError catch below are independent;
+            # both return 409, but this one's detail discriminates the five
+            # cross-study sub-cases rather than collapsing to the generic
+            # message.
+            #
+            # NOT DEAD CODE — do not prune. Currently unreachable
+            # through this POST because the route creates a fresh
+            # biosample per call, so (biosample_idx, global_field_idx)
+            # is always empty pre-INSERT and the partial unique index
+            # cannot fire. Kept for the planned PATCH-style
+            # write-metadata-on-existing-biosample endpoint, which will
+            # share this composer path; that endpoint can hit the
+            # partial index whenever a caller writes a value for a
+            # biosample whose global field slot was already claimed
+            # by another study. Helper unit tests in
+            # tests/routes/test__helpers.py cover the wording for every
+            # subclass even though no current route flow triggers them.
+            detail = await detail_for_global_field_collision(conn, exc)
+            raise HTTPException(status_code=409, detail=detail)
+        except TransientWriteRaceError as exc:
+            # The diagnostic read found the colliding occupant already
+            # gone — a concurrent delete won the race and the slot is
+            # free again. Independent of the asyncpg catches; maps to a
+            # 503 + Retry-After so the client resubmits the same request.
+            raise_for_transient_write_race(exc)
+        except LocalWriteOnGloballyLinkedFieldError as exc:
+            # The requested owner-biosample-id field name resolves to a
+            # field already globally linked on this study. The owner-id
+            # row is purely-local PII and must not be written through a
+            # cross-study global slot; the caller must pick a different
+            # owner_biosample_id_field_name. Its own exception family,
+            # independent of the asyncpg.UniqueViolationError catch below.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"owner_biosample_id_field_name {exc.display_name!r} is"
+                    " already bound to a global field on this study"
                 ),
             )
         except asyncpg.UniqueViolationError as exc:
             detail = _UNIQUE_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_UNIQUE_VIOLATION)
             raise HTTPException(status_code=409, detail=detail)
         except asyncpg.ForeignKeyViolationError as exc:
-            detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_FK_VIOLATION)
+            detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, GENERIC_FK_VIOLATION)
             raise HTTPException(status_code=422, detail=detail)
 
     return BiosampleImportResponse(
         biosample_idx=result.biosample_idx,
-        biosample_study_field_idx=result.biosample_study_field_idx,
-        biosample_study_field_created=result.biosample_study_field_created,
+        owner_id_biosample_study_field_idx=result.owner_id_biosample_study_field_idx,
+        owner_id_biosample_study_field_created=result.owner_id_biosample_study_field_created,
     )
 
 
 # Hard cap on the bulk-id read. Sized to comfortably cover any single
 # study's biosample roster while bounding per-response payload size.
+# The sequencing-run roster cap happens to share this numeric value, but
+# the two bound conceptually distinct rosters and are sized independently;
+# they are intentionally not factored into a shared constant.
 _BIOSAMPLE_IDXS_HARD_CAP = 500_000
 
 
@@ -215,7 +268,7 @@ async def list_biosample_idxs_in_study(
 
 # Roles that may bypass the per-biosample owner / linked-study-access check.
 # A bypass-role caller still gets the standard 404 on a missing or retired
-# biosample (see the docstring on get_biosample_route for the retired-row
+# biosample (see the docstring on get_biosample for the retired-row
 # carve-out planned for a future change).
 _BIOSAMPLE_GET_BYPASS_ROLE: SystemRole = SystemRole.WET_LAB_ADMIN
 
@@ -256,10 +309,10 @@ def _biosample_response_from_row(
 
 
 @biosample_router.get("/{biosample_idx}")
-async def get_biosample_route(
+async def get_biosample(
     biosample_idx: Annotated[int, Field(gt=0)],
     response: Response,
-    pool: asyncpg.Pool = Depends(get_db_pool),
+    snapshot: TxConnFactory = Depends(get_snapshot_conn_factory),
     user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
 ) -> BiosampleResponse:
@@ -281,38 +334,45 @@ async def get_biosample_route(
     `updated_at` column. The format is a quoted ISO 8601 timestamp;
     clients must treat it as opaque.
     """
-    # Fetch the row first so 404 fires before the access predicate runs;
-    # the predicate is defined for any biosample_idx but emitting 404 here
-    # avoids a confusing "no access" 403 on a row that does not exist.
-    row = await fetch_biosample(pool, biosample_idx)
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"biosample {biosample_idx} not found")
+    # All reads share one REPEATABLE READ snapshot so the supertype row,
+    # the access predicate, and the metadata read cannot disagree about a
+    # concurrent writer's commit.
+    async with snapshot() as conn:
+        # Fetch the row first so 404 fires before the access predicate runs;
+        # the predicate is defined for any biosample_idx but emitting 404 here
+        # avoids a confusing "no access" 403 on a row that does not exist.
+        row = await fetch_biosample(conn, biosample_idx)
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"biosample {biosample_idx} not found")
 
-    # Retired-row carve-out (see docstring): treat as not found until the
-    # planned wet-lab+ retired-retrieval surface lands. Applied uniformly
-    # across roles so the 404 contract is unconditional in the meantime.
-    if row["retired"]:
-        raise HTTPException(status_code=404, detail=f"biosample {biosample_idx} not found")
+        # Retired-row carve-out (see docstring): treat as not found until the
+        # planned wet-lab+ retired-retrieval surface lands. Applied uniformly
+        # across roles so the 404 contract is unconditional in the meantime.
+        if row["retired"]:
+            raise HTTPException(status_code=404, detail=f"biosample {biosample_idx} not found")
 
-    # Role bypass for wet_lab_admin and higher; everyone else must satisfy
-    # the owner-or-linked-study-access predicate.
-    authorized = user.has_role_at_least(
-        _BIOSAMPLE_GET_BYPASS_ROLE
-    ) or await fetch_caller_has_biosample_access(
-        pool,
-        principal_idx=user.principal_idx,
-        biosample_idx=biosample_idx,
-    )
-    if not authorized:
-        raise HTTPException(
-            status_code=403,
-            detail=f"caller has no read path to biosample {biosample_idx}",
+        # Role bypass for wet_lab_admin and higher; everyone else must satisfy
+        # the owner-or-linked-study-access predicate.
+        authorized = user.has_role_at_least(
+            _BIOSAMPLE_GET_BYPASS_ROLE
+        ) or await fetch_caller_has_biosample_access(
+            conn,
+            principal_idx=user.principal_idx,
+            biosample_idx=biosample_idx,
+        )
+        if not authorized:
+            raise HTTPException(
+                status_code=403,
+                detail=f"caller has no read path to biosample {biosample_idx}",
+            )
+
+        # Pull the globally-linked metadata once access has been resolved; the
+        # repo function handles the global_field_idx IS NOT NULL filter and the
+        # data_type-driven value column dispatch.
+        metadata_rows = await fetch_global_metadata(
+            conn, spec=BIOSAMPLE_METADATA_SPEC, entity_idx=biosample_idx
         )
 
-    # Pull the globally-linked metadata once access has been resolved; the
-    # repo function handles the global_field_idx IS NOT NULL filter and the
-    # data_type-driven value column dispatch.
-    metadata_rows = await fetch_global_metadata_for_biosample(pool, biosample_idx)
     global_metadata = {
         internal_name: GlobalMetadataEntry(
             display_name=entry.display_name,
@@ -345,7 +405,7 @@ _OWNER_TRIGGER_RAISE_MARKER = "user-kind principal"
 
 
 @biosample_router.patch("/{biosample_idx}")
-async def patch_biosample_route(
+async def patch_biosample(
     biosample_idx: Annotated[int, Field(gt=0)],
     body: BiosamplePatchRequest,
     response: Response,
@@ -438,12 +498,14 @@ async def patch_biosample_route(
 
             # Re-read global metadata in the same transaction so the response
             # and the UPDATE see one consistent snapshot.
-            metadata_rows = await fetch_global_metadata_for_biosample(conn, biosample_idx)
+            metadata_rows = await fetch_global_metadata(
+                conn, spec=BIOSAMPLE_METADATA_SPEC, entity_idx=biosample_idx
+            )
         except asyncpg.UniqueViolationError as exc:
             detail = _UNIQUE_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_UNIQUE_VIOLATION)
             raise HTTPException(status_code=409, detail=detail)
         except asyncpg.ForeignKeyViolationError as exc:
-            detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_FK_VIOLATION)
+            detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, GENERIC_FK_VIOLATION)
             raise HTTPException(status_code=422, detail=detail)
         except asyncpg.RaiseError as exc:
             # Role-typed FK trigger on biosample.owner_idx: candidate is

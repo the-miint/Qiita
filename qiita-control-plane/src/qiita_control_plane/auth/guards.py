@@ -354,7 +354,7 @@ def require_study_access(
     the resolved minimum tier. Routes that must surface 404 on a
     missing study for bypass-role callers should compose
     `require_study_exists` alongside this guard (see
-    `list_biosample_idxs_in_study` and `get_study_route`).
+    `list_biosample_idxs_in_study` and `get_study`).
 
     `min_tier=None` resolves the minimum to the study's own
     `default_tier` at request time (per-study policy). Pass an

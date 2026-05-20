@@ -48,7 +48,6 @@ CREATE TABLE qiita.study (
     abstract                     TEXT,
     funding                      VARCHAR(500),
     ebi_study_accession          VARCHAR(50),
-    vamps_id                     VARCHAR(50),
     notes                        TEXT,
     extra_metadata               JSONB,
     parent_study_idx             BIGINT REFERENCES qiita.study(idx) ON DELETE SET NULL,

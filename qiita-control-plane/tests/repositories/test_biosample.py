@@ -20,9 +20,11 @@ import pytest
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 from qiita_common.models import FieldDataType
 
-from qiita_control_plane.repositories import (
+from qiita_control_plane.repositories._sample_helpers import (
+    LocalWriteOnGloballyLinkedFieldError,
     MetadataParseError,
     MetadataUnknownFieldsError,
+    insert_entity_to_study,
 )
 from qiita_control_plane.repositories.biosample import (
     BiosampleImportResult,
@@ -31,10 +33,10 @@ from qiita_control_plane.repositories.biosample import (
     fetch_caller_has_biosample_access,
     import_biosample_from_owner_biosample_id,
     insert_biosample,
-    insert_biosample_to_study,
     update_biosample,
 )
 from qiita_control_plane.repositories.biosample_metadata import (
+    BIOSAMPLE_METADATA_SPEC,
     BiosampleOwnerIdFieldCollisionError,
 )
 from qiita_control_plane.testing.db_seeds import (
@@ -125,77 +127,6 @@ async def test_insert_biosample_full_columns(ctx):
 
 
 # ---------------------------------------------------------------------------
-# insert_biosample_to_study
-# ---------------------------------------------------------------------------
-
-
-async def test_insert_biosample_to_study_links_biosample(ctx):
-    # Seed a biosample directly so the test owns a known idx.
-    async with ctx["pool"].acquire() as conn:
-        bs_idx = await insert_biosample(
-            conn,
-            owner_idx=ctx["principal_idx"],
-            created_by_idx=ctx["principal_idx"],
-        )
-    ctx["created"]["biosample"].append(bs_idx)
-
-    # Link the biosample to the seeded study.
-    async with ctx["pool"].acquire() as conn:
-        await insert_biosample_to_study(
-            conn,
-            biosample_idx=bs_idx,
-            study_idx=ctx["study_idx"],
-            created_by_idx=ctx["principal_idx"],
-        )
-    ctx["created"]["biosample_to_study"].append((bs_idx, ctx["study_idx"]))
-
-    # Verify the link row matches the expected non-retired shape.
-    row = await ctx["pool"].fetchrow(
-        "SELECT biosample_idx, study_idx, created_by_idx, retired"
-        " FROM qiita.biosample_to_study WHERE biosample_idx = $1 AND study_idx = $2",
-        bs_idx,
-        ctx["study_idx"],
-    )
-    expected = {
-        "biosample_idx": bs_idx,
-        "study_idx": ctx["study_idx"],
-        "created_by_idx": ctx["principal_idx"],
-        "retired": False,
-    }
-    assert dict(row) == expected
-
-
-async def test_insert_biosample_to_study_rejects_duplicate(ctx):
-    async with ctx["pool"].acquire() as conn:
-        bs_idx = await insert_biosample(
-            conn,
-            owner_idx=ctx["principal_idx"],
-            created_by_idx=ctx["principal_idx"],
-        )
-    ctx["created"]["biosample"].append(bs_idx)
-
-    # First link succeeds.
-    async with ctx["pool"].acquire() as conn:
-        await insert_biosample_to_study(
-            conn,
-            biosample_idx=bs_idx,
-            study_idx=ctx["study_idx"],
-            created_by_idx=ctx["principal_idx"],
-        )
-    ctx["created"]["biosample_to_study"].append((bs_idx, ctx["study_idx"]))
-
-    # Second insert of the same (biosample, study) pair must raise on the PK.
-    async with ctx["pool"].acquire() as conn:
-        with pytest.raises(asyncpg.UniqueViolationError):
-            await insert_biosample_to_study(
-                conn,
-                biosample_idx=bs_idx,
-                study_idx=ctx["study_idx"],
-                created_by_idx=ctx["principal_idx"],
-            )
-
-
-# ---------------------------------------------------------------------------
 # import_biosample_from_owner_biosample_id (composer)
 # ---------------------------------------------------------------------------
 
@@ -242,7 +173,7 @@ async def test_import_biosample_from_owner_biosample_id_creates_full_chain(ctx):
         async with conn.transaction():
             result = await import_biosample_from_owner_biosample_id(
                 conn,
-                study_idx=ctx["study_idx"],
+                primary_study_idx=ctx["study_idx"],
                 owner_idx=ctx["biosample_owner_idx"],
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-XYZ-1",
@@ -286,8 +217,8 @@ async def test_import_biosample_from_owner_biosample_id_creates_full_chain(ctx):
     # this call created it (single-call test, no concurrent winner possible).
     assert result == BiosampleImportResult(
         biosample_idx=bs_idx,
-        biosample_study_field_idx=field_idx,
-        biosample_study_field_created=True,
+        owner_id_biosample_study_field_idx=field_idx,
+        owner_id_biosample_study_field_created=True,
     )
     actual = {
         "biosample": dict(bs_row),
@@ -335,7 +266,7 @@ async def test_import_biosample_from_owner_biosample_id_with_explicit_checklist(
         async with conn.transaction():
             result = await import_biosample_from_owner_biosample_id(
                 conn,
-                study_idx=ctx["study_idx"],
+                primary_study_idx=ctx["study_idx"],
                 owner_idx=ctx["biosample_owner_idx"],
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-CL-1",
@@ -368,7 +299,7 @@ async def test_import_biosample_from_owner_biosample_id_reuses_local_field_for_s
         async with conn.transaction():
             result1 = await import_biosample_from_owner_biosample_id(
                 conn,
-                study_idx=ctx["study_idx"],
+                primary_study_idx=ctx["study_idx"],
                 owner_idx=ctx["biosample_owner_idx"],
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="A",
@@ -377,7 +308,7 @@ async def test_import_biosample_from_owner_biosample_id_reuses_local_field_for_s
             )
             result2 = await import_biosample_from_owner_biosample_id(
                 conn,
-                study_idx=ctx["study_idx"],
+                primary_study_idx=ctx["study_idx"],
                 owner_idx=ctx["biosample_owner_idx"],
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="B",
@@ -392,9 +323,9 @@ async def test_import_biosample_from_owner_biosample_id_reuses_local_field_for_s
     # Composer-level created-flag contract: first call inserts the field
     # (created=True); second call resolves it from the existing row
     # (created=False) and both report the same field idx.
-    assert result1.biosample_study_field_created is True
-    assert result2.biosample_study_field_created is False
-    assert result1.biosample_study_field_idx == result2.biosample_study_field_idx
+    assert result1.owner_id_biosample_study_field_created is True
+    assert result2.owner_id_biosample_study_field_created is False
+    assert result1.owner_id_biosample_study_field_idx == result2.owner_id_biosample_study_field_idx
 
     # Exactly one field row exists for this (study, name); the two metadata
     # rows point at it.
@@ -430,7 +361,7 @@ async def test_import_biosample_from_owner_biosample_id_creates_distinct_fields_
         async with conn.transaction():
             result1 = await import_biosample_from_owner_biosample_id(
                 conn,
-                study_idx=ctx["study_idx"],
+                primary_study_idx=ctx["study_idx"],
                 owner_idx=ctx["biosample_owner_idx"],
                 owner_biosample_id_field_name=name_a,
                 owner_biosample_id_value="A",
@@ -439,7 +370,7 @@ async def test_import_biosample_from_owner_biosample_id_creates_distinct_fields_
             )
             result2 = await import_biosample_from_owner_biosample_id(
                 conn,
-                study_idx=ctx["study_idx"],
+                primary_study_idx=ctx["study_idx"],
                 owner_idx=ctx["biosample_owner_idx"],
                 owner_biosample_id_field_name=name_b,
                 owner_biosample_id_value="B",
@@ -452,8 +383,8 @@ async def test_import_biosample_from_owner_biosample_id_creates_distinct_fields_
     await _track_composer_outputs(ctx, bs2, ctx["study_idx"], name_b)
 
     # Distinct field names → both calls hit the insert branch → both report created=True.
-    assert result1.biosample_study_field_created is True
-    assert result2.biosample_study_field_created is True
+    assert result1.owner_id_biosample_study_field_created is True
+    assert result2.owner_id_biosample_study_field_created is True
 
     # Two field rows, one per name.
     rows = await ctx["pool"].fetch(
@@ -478,7 +409,7 @@ async def test_import_biosample_from_owner_biosample_id_rolls_back_on_failed_ste
             async with conn.transaction():
                 await import_biosample_from_owner_biosample_id(
                     conn,
-                    study_idx=bad_study_idx,
+                    primary_study_idx=bad_study_idx,
                     owner_idx=ctx["biosample_owner_idx"],
                     owner_biosample_id_field_name=_unique_field_name(),
                     owner_biosample_id_value="DOOMED",
@@ -510,7 +441,7 @@ async def test_import_biosample_from_owner_biosample_id_uses_independent_field_p
         async with conn.transaction():
             result1 = await import_biosample_from_owner_biosample_id(
                 conn,
-                study_idx=ctx["study_idx"],
+                primary_study_idx=ctx["study_idx"],
                 owner_idx=ctx["biosample_owner_idx"],
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="STUDY1-1",
@@ -519,7 +450,7 @@ async def test_import_biosample_from_owner_biosample_id_uses_independent_field_p
             )
             result2 = await import_biosample_from_owner_biosample_id(
                 conn,
-                study_idx=second_study_idx,
+                primary_study_idx=second_study_idx,
                 owner_idx=ctx["biosample_owner_idx"],
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="STUDY2-1",
@@ -532,8 +463,8 @@ async def test_import_biosample_from_owner_biosample_id_uses_independent_field_p
     await _track_composer_outputs(ctx, bs2, second_study_idx, field_name)
 
     # Independent (study_idx, display_name) keys → both hit the insert branch.
-    assert result1.biosample_study_field_created is True
-    assert result2.biosample_study_field_created is True
+    assert result1.owner_id_biosample_study_field_created is True
+    assert result2.owner_id_biosample_study_field_created is True
 
     # Two distinct field rows, one per study, sharing the same display_name.
     rows = await ctx["pool"].fetch(
@@ -558,7 +489,7 @@ async def test_import_biosample_from_owner_biosample_id_rejects_non_transactiona
         with pytest.raises(RuntimeError, match="transaction"):
             await import_biosample_from_owner_biosample_id(
                 conn,
-                study_idx=ctx["study_idx"],
+                primary_study_idx=ctx["study_idx"],
                 owner_idx=ctx["biosample_owner_idx"],
                 owner_biosample_id_field_name=_unique_field_name(),
                 owner_biosample_id_value="GUARD-CHECK",
@@ -568,13 +499,13 @@ async def test_import_biosample_from_owner_biosample_id_rejects_non_transactiona
 
 
 async def _track_global_metadata_outputs(ctx, bs_idx, study_idx, global_idxs):
-    """Track globally-linked study fields (by global concept idx) and every
+    """Track globally-linked study fields (by global field idx) and every
     non-owner-id metadata row written for this biosample. Use after
     `_track_composer_outputs` in tests that exercised the metadata dict
     path so the FK-reverse cleanup picks the new rows up.
     """
     # Pick up every globally-linked study field row at this study tied to
-    # one of the supplied global concepts.
+    # one of the supplied global fields.
     rows = await ctx["pool"].fetch(
         "SELECT idx FROM qiita.biosample_study_field"
         " WHERE study_idx = $1 AND biosample_global_field_idx = ANY($2::bigint[])",
@@ -623,12 +554,12 @@ async def test_import_biosample_from_owner_biosample_id_writes_global_metadata(c
         f"Latitude {suffix}": "32.7",
     }
 
-    # Compose the import with metadata covering both global concepts.
+    # Compose the import with metadata covering both global fields.
     async with ctx["pool"].acquire() as conn:
         async with conn.transaction():
             result = await import_biosample_from_owner_biosample_id(
                 conn,
-                study_idx=ctx["study_idx"],
+                primary_study_idx=ctx["study_idx"],
                 owner_idx=ctx["biosample_owner_idx"],
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-WG-1",
@@ -691,6 +622,70 @@ async def test_import_biosample_from_owner_biosample_id_writes_global_metadata(c
     assert [dict(r) for r in meta_rows] == expected_meta
 
 
+async def test_import_biosample_from_owner_biosample_id_rejects_globally_linked_owner_field(ctx):
+    suffix = secrets.token_hex(4)
+    linked_name = f"Globally Linked {suffix}"
+
+    # Seed a global field and write a metadata value against it so a
+    # globally-linked biosample_study_field row exists at
+    # (study_idx, linked_name) for the owner-id step to later resolve.
+    global_idx = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=f"glob_{suffix}",
+        display_name=linked_name,
+        data_type=FieldDataType.TEXT,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+
+    seed_owner_field = _unique_field_name()
+    async with ctx["pool"].acquire() as conn:
+        async with conn.transaction():
+            seed_result = await import_biosample_from_owner_biosample_id(
+                conn,
+                primary_study_idx=ctx["study_idx"],
+                owner_idx=ctx["biosample_owner_idx"],
+                owner_biosample_id_field_name=seed_owner_field,
+                owner_biosample_id_value="SEED-OWNER",
+                caller_idx=ctx["principal_idx"],
+                metadata={linked_name: "seed-value"},
+            )
+    await _track_composer_outputs(
+        ctx, seed_result.biosample_idx, ctx["study_idx"], seed_owner_field
+    )
+    await _track_global_metadata_outputs(
+        ctx, seed_result.biosample_idx, ctx["study_idx"], [global_idx]
+    )
+
+    # Reuse the globally-linked display_name AS the owner-id field. The
+    # pre-flight collision check only inspects the metadata dict (empty
+    # here), so the call proceeds to step d, where get-or-create resolves
+    # the existing globally-linked row instead of creating a local one —
+    # strict-mode must reject rather than write PII through a global slot.
+    bs_acc = _unique_accession("BS-glob-owner")
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(LocalWriteOnGloballyLinkedFieldError):
+            async with conn.transaction():
+                await import_biosample_from_owner_biosample_id(
+                    conn,
+                    primary_study_idx=ctx["study_idx"],
+                    owner_idx=ctx["biosample_owner_idx"],
+                    owner_biosample_id_field_name=linked_name,
+                    owner_biosample_id_value="DOOMED",
+                    caller_idx=ctx["principal_idx"],
+                    metadata={},
+                    biosample_accession=bs_acc,
+                )
+
+    # The rejection fires after the second call's biosample/link writes;
+    # the caller's transaction must roll all of it back.
+    found = await ctx["pool"].fetchval(
+        "SELECT idx FROM qiita.biosample WHERE biosample_accession = $1",
+        bs_acc,
+    )
+    assert found is None
+
+
 async def test_import_biosample_from_owner_biosample_id_with_empty_metadata(ctx):
     field_name = _unique_field_name()
 
@@ -700,7 +695,7 @@ async def test_import_biosample_from_owner_biosample_id_with_empty_metadata(ctx)
         async with conn.transaction():
             result = await import_biosample_from_owner_biosample_id(
                 conn,
-                study_idx=ctx["study_idx"],
+                primary_study_idx=ctx["study_idx"],
                 owner_idx=ctx["biosample_owner_idx"],
                 owner_biosample_id_field_name=field_name,
                 owner_biosample_id_value="OWNER-EM-1",
@@ -732,7 +727,7 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_unknown_metada
             async with conn.transaction():
                 await import_biosample_from_owner_biosample_id(
                     conn,
-                    study_idx=ctx["study_idx"],
+                    primary_study_idx=ctx["study_idx"],
                     owner_idx=ctx["biosample_owner_idx"],
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value="UNKNOWN",
@@ -762,7 +757,7 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_metadata_parse
             async with conn.transaction():
                 await import_biosample_from_owner_biosample_id(
                     conn,
-                    study_idx=ctx["study_idx"],
+                    primary_study_idx=ctx["study_idx"],
                     owner_idx=ctx["biosample_owner_idx"],
                     owner_biosample_id_field_name=field_name,
                     owner_biosample_id_value="PARSE-FAIL",
@@ -784,7 +779,7 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_owner_id_field
             async with conn.transaction():
                 await import_biosample_from_owner_biosample_id(
                     conn,
-                    study_idx=ctx["study_idx"],
+                    primary_study_idx=ctx["study_idx"],
                     owner_idx=ctx["biosample_owner_idx"],
                     owner_biosample_id_field_name=shared_name,
                     owner_biosample_id_value="OWNER-COLL",
@@ -817,9 +812,10 @@ async def test_fetch_biosample_idxs_for_study_orders_newest_link_first(ctx):
                 owner_idx=ctx["principal_idx"],
                 created_by_idx=ctx["principal_idx"],
             )
-            await insert_biosample_to_study(
+            await insert_entity_to_study(
                 conn,
-                biosample_idx=bs_idx,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                entity_idx=bs_idx,
                 study_idx=ctx["study_idx"],
                 created_by_idx=ctx["principal_idx"],
             )

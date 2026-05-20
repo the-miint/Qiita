@@ -156,7 +156,7 @@ async def test_post_study_regular_user_self_owner_idx_explicit(ctx):
 async def test_post_study_full_body_round_trips(ctx):
     """Every settable column on StudyCreate, including extra_metadata
     and a non-default default_tier, is reflected in the response."""
-    extra = {"site": "ucsd", "project_type": "METAGENOMIC"}
+    extra = {"site": "ucsd", "project_type": "METAGENOMIC", "vamps_id": "VAMPS-1"}
     title = _unique_title("full")
     resp = await _post_study(
         ctx["user"],
@@ -167,7 +167,6 @@ async def test_post_study_full_body_round_trips(ctx):
         abstract="abs",
         funding="NIH-R01",
         ebi_study_accession="ERP000001",
-        vamps_id="VAMPS-1",
         notes="notes-1",
         extra_metadata=extra,
         default_tier="viewer",
@@ -189,7 +188,6 @@ async def test_post_study_full_body_round_trips(ctx):
         "abstract": "abs",
         "funding": "NIH-R01",
         "ebi_study_accession": "ERP000001",
-        "vamps_id": "VAMPS-1",
         "notes": "notes-1",
         "extra_metadata": extra,
         "default_tier": "viewer",
@@ -425,7 +423,7 @@ async def no_study_read_client(make_pat_client):
 async def test_get_study_returns_same_shape_as_post(ctx):
     """A study created via POST round-trips through GET unchanged — same
     fields, same values, including JSONB extra_metadata."""
-    extra = {"site": "ucsd", "project_type": "METAGENOMIC"}
+    extra = {"site": "ucsd", "project_type": "METAGENOMIC", "vamps_id": "VAMPS-1"}
     title = _unique_title("get-roundtrip")
     create_resp = await _post_study(
         ctx["user"],
@@ -436,7 +434,6 @@ async def test_get_study_returns_same_shape_as_post(ctx):
         abstract="abs",
         funding="NIH-R01",
         ebi_study_accession="ERP000001",
-        vamps_id="VAMPS-1",
         notes="notes-1",
         extra_metadata=extra,
         default_tier="viewer",

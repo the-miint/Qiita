@@ -83,26 +83,37 @@ CREATE INDEX sequencing_run_instrument_model_idx
 CREATE TABLE qiita.sequenced_pool (
     idx                    BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
     sequencing_run_idx     BIGINT NOT NULL REFERENCES qiita.sequencing_run(idx) ON DELETE RESTRICT,
-    run_preflight_blob     BYTEA NOT NULL,
-    run_preflight_filename TEXT NOT NULL CHECK (length(run_preflight_filename) >= 1),
+    run_preflight_blob     BYTEA,
+    run_preflight_filename TEXT CHECK (length(run_preflight_filename) >= 1),
     extra_metadata         JSONB,
     created_by_idx         BIGINT NOT NULL REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
-    created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- The run preflight is an optional, co-populated pair: either the blob
+    -- and its filename are both present or both NULL. A half-populated pair
+    -- would be a blob with no originating filename or a filename naming no
+    -- blob.
+    CONSTRAINT sequenced_pool_run_preflight_pair_consistent CHECK (
+        (run_preflight_blob IS NULL) = (run_preflight_filename IS NULL)
+    )
 );
 
 COMMENT ON TABLE qiita.sequenced_pool IS
-    'A single post-sequencing run preflight attached to a sequencing run. For '
-    'platforms with lanes (e.g., illumina), one sequenced_pool row exists per '
-    '(run, lane); the lane assignment lives inside the post-sequencing '
-    'run preflight blob, not as a separate column, so there is a single source '
-    'of truth. Withdrawal of a pool decomposes onto the prep_sample / '
-    'prep_sample_to_study retirement surface; this table carries no '
-    'retirement columns of its own.';
+    'A sequencing-run pool, optionally carrying a post-sequencing run '
+    'preflight. For platforms with lanes (e.g., illumina), one sequenced_pool '
+    'row exists per (run, lane). The run preflight is the '
+    '(run_preflight_blob, run_preflight_filename) pair: either both are '
+    'present or both are NULL. When present, the lane assignment lives inside '
+    'the preflight blob, not as a separate column. Withdrawal of a pool '
+    'decomposes onto the prep_sample / prep_sample_to_study retirement '
+    'surface; this table carries no retirement columns of its own.';
 
 COMMENT ON COLUMN qiita.sequenced_pool.run_preflight_blob IS
     'Post-sequencing run preflight, typically stored as a SQLite database file. '
-    'BYTEA holds arbitrary binary; TOAST handles values larger than the inline '
-    'threshold.';
+    'NULL when the pool has no preflight; co-populated with '
+    'run_preflight_filename (the schema enforces that both are set or both '
+    'are NULL). BYTEA holds arbitrary binary; TOAST handles values larger '
+    'than the inline threshold.';
 
 CREATE INDEX sequenced_pool_sequencing_run_idx
     ON qiita.sequenced_pool (sequencing_run_idx);

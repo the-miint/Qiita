@@ -106,7 +106,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_study_create.add_argument("--abstract")
     p_study_create.add_argument("--funding")
     p_study_create.add_argument("--ebi-study-accession")
-    p_study_create.add_argument("--vamps-id")
     p_study_create.add_argument("--notes")
     p_study_create.add_argument(
         "--principal-investigator-idx",

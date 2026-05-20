@@ -344,11 +344,17 @@ class BiosampleImportRequest(BaseModel):
 
 
 class BiosampleImportResponse(BaseModel):
-    """Returned by POST /api/v1/study/{study_idx}/biosample on success."""
+    """Returned by POST /api/v1/study/{study_idx}/biosample on success.
+
+    `owner_id_biosample_study_field_*` name the biosample_study_field row
+    that holds the owner-biosample-id for this study — the purely-local,
+    PII-tier-pinned field flagged is_owner_biosample_id=True on the
+    associated biosample_metadata row.
+    """
 
     biosample_idx: Annotated[int, Field(gt=0)]
-    biosample_study_field_idx: Annotated[int, Field(gt=0)]
-    biosample_study_field_created: bool
+    owner_id_biosample_study_field_idx: Annotated[int, Field(gt=0)]
+    owner_id_biosample_study_field_created: bool
 
 
 class GlobalMetadataEntry(BaseModel):
@@ -454,9 +460,6 @@ class BiosamplePatchRequest(PatchRequestModel):
 class IdxsListResponse(BaseModel):
     """Returned by every bulk-id GET that emits a hard-capped list of idxs.
 
-    Used today by GET /api/v1/study/{study_idx}/biosample/list-idxs and
-    GET /api/v1/sequencing-run/{sequencing_run_idx}/sequenced-sample/list-idxs;
-    every list-idxs endpoint that follows shares the same envelope.
     `truncated` is true when the underlying set exceeded the route's cap;
     clients seeing it should narrow their scope. `caller_system_role`
     carries the caller's principal.system_role verbatim from the database.
@@ -501,7 +504,6 @@ class StudyCreate(BaseModel):
     abstract: str | None = None
     funding: str | None = Field(default=None, max_length=_STUDY_FUNDING_MAX)
     ebi_study_accession: str | None = Field(default=None, max_length=_STUDY_ACCESSION_MAX)
-    vamps_id: str | None = Field(default=None, max_length=_STUDY_ACCESSION_MAX)
     notes: str | None = None
     extra_metadata: dict[str, object] | None = None
     default_tier: Tier | None = None
@@ -524,7 +526,6 @@ class StudyResponse(BaseModel):
     abstract: str | None
     funding: str | None
     ebi_study_accession: str | None
-    vamps_id: str | None
     notes: str | None
     extra_metadata: dict[str, object] | None
     default_tier: Tier
@@ -975,14 +976,28 @@ class SequencedPoolCreateRequest(BaseModel):
     base64 on receive — a plain `bytes` field would otherwise treat the
     incoming string as UTF-8 and the encoded payload would land in BYTEA
     instead of the decoded blob. `run_preflight_filename` is the
-    originating file name on disk and is required by the schema.
+    originating file name on disk.
+
+    The preflight is an optional, co-populated pair: send both
+    `run_preflight_blob` and `run_preflight_filename` or neither. A
+    half-populated pair is rejected (422). When present, each must be
+    non-empty (`min_length=1`).
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    run_preflight_blob: Base64Bytes = Field(min_length=1)
-    run_preflight_filename: str = Field(min_length=1)
+    run_preflight_blob: Base64Bytes | None = Field(default=None, min_length=1)
+    run_preflight_filename: str | None = Field(default=None, min_length=1)
     extra_metadata: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def run_preflight_pair_consistent(self):
+        if (self.run_preflight_blob is None) != (self.run_preflight_filename is None):
+            raise ValueError(
+                "run_preflight_blob and run_preflight_filename must both be"
+                " provided or both be omitted"
+            )
+        return self
 
 
 class SequencedPoolCreateResponse(BaseModel):
@@ -996,11 +1011,18 @@ class SequencedSampleCreateRequest(BaseModel):
 
     Atomically creates a prep_sample row (with processing_kind='sequenced'),
     its 1:1 sequenced_sample subtype row, one prep_sample_to_study link
-    per study in `study_idxs`, and one prep_sample_metadata row per
-    metadata entry (resolved against prep_sample_global_field by
-    display_name). Currently rejects len(study_idxs) > 1 at the route
-    boundary: multi-study assignment requires a future schema decision
-    about which study owns the per-display_name field row.
+    for `primary_study_idx` plus one per entry in `secondary_study_idxs`,
+    and one prep_sample_metadata row per metadata entry (resolved against
+    prep_sample_global_field by display_name).
+
+    `primary_study_idx` owns the per-display_name prep_sample_study_field
+    rows the composer writes for `metadata`; secondary studies see those
+    values through the global field slot but do not own the field row.
+    The asymmetry is forced by the schema: a prep_sample has at most one
+    prep_sample_study_field per global_field_idx, so exactly one of the
+    linked studies must be designated. `secondary_study_idxs` must not
+    contain `primary_study_idx`; duplicate entries within it are
+    collapsed (order-preserving) rather than rejected.
 
     `metadata` keys must match seeded prep_sample_global_field display_name
     values; unknown names surface as a single 422 listing every bad key.
@@ -1014,25 +1036,37 @@ class SequencedSampleCreateRequest(BaseModel):
     prep_protocol_idx: Annotated[int, Field(gt=0)]
     owner_idx: Annotated[int, Field(gt=0)]
     sequenced_pool_item_id: str = Field(min_length=1)
-    study_idxs: list[Annotated[int, Field(gt=0)]] = Field(min_length=1, max_length=1)
+    primary_study_idx: Annotated[int, Field(gt=0)]
+    secondary_study_idxs: list[Annotated[int, Field(gt=0)]] = Field(default_factory=list)
     metadata: dict[str, str] = Field(default_factory=dict)
     metadata_checklist_idx: Annotated[int, Field(gt=0)] | None = None
     ena_experiment_accession: str | None = Field(default=None, max_length=50)
     ena_run_accession: str | None = Field(default=None, max_length=50)
 
+    @model_validator(mode="after")
+    def dedupe_secondary_study_idxs(self):
+        # Collapse duplicate secondary studies (order-preserving). A study
+        # repeated in secondary_study_idxs is a benign caller convenience,
+        # not a conflict, so normalize rather than reject; primary appearing
+        # in secondary remains the genuine error, caught next.
+        self.secondary_study_idxs = list(dict.fromkeys(self.secondary_study_idxs))
+        return self
+
+    @model_validator(mode="after")
+    def primary_not_in_secondary(self):
+        if self.primary_study_idx in self.secondary_study_idxs:
+            raise ValueError(
+                f"primary_study_idx ({self.primary_study_idx}) must not appear"
+                " in secondary_study_idxs"
+            )
+        return self
+
 
 class SequencedSampleCreateResponse(BaseModel):
-    """Returned by the sequenced-sample composer POST on success.
-
-    `prep_sample_study_fields` maps each metadata display_name to a
-    `(study_field_idx, created)` pair so the caller can tell which
-    per-study prep_sample_study_field rows were created on this call
-    versus reused from a prior write.
-    """
+    """Returned by the sequenced-sample composer POST on success."""
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     sequenced_sample_idx: Annotated[int, Field(gt=0)]
-    prep_sample_study_fields: dict[str, tuple[Annotated[int, Field(gt=0)], bool]]
 
 
 class SequencedSampleResponse(BaseModel):
