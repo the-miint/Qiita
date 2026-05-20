@@ -461,3 +461,18 @@ def _track_to_study_link(ctx, spec, entity_idx, study_idx):
         ctx["created"]["biosample_to_study"].append((entity_idx, study_idx))
     else:
         ctx["created"]["prep_sample_to_study"].append((entity_idx, study_idx))
+
+
+async def _create_linked_entity_for_spec(ctx, spec):
+    """Create an entity linked to ctx['study_idx'] for spec.entity_kind,
+    tracking all rows for cleanup. Returns the new entity_idx.
+
+    Dispatches to the existing per-entity helpers so the prep_sample branch
+    transparently seeds the underlying biosample and biosample_to_study link
+    that the prep_sample_to_study trigger requires as substrate.
+    """
+    # Both branches return an entity_idx with its *_to_study link already
+    # tracked; callers can write metadata against it without further setup.
+    if spec.entity_kind is SampleEntityKind.BIOSAMPLE:
+        return await _create_biosample_with_link(ctx)
+    return await _create_prep_sample_with_link(ctx)
