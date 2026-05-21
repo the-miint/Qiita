@@ -16,9 +16,9 @@ audience:
   service: false
   human_roles: [wet_lab_admin, system_admin]
 steps:
-  - step: hash
+  - step: hash_sequences
     step_type: singleton
-    container: qiita/reference-hash:1.0.0
+    module: qiita_compute_orchestrator.jobs.hash_sequences
     baseline_resources: {cpu: 4, mem_gb: 8, walltime: PT1H}
   - action: mint-features
   - action: write-membership

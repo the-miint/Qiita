@@ -9,9 +9,7 @@ description: >
   files, then register the staging files in DuckLake.
 
 scopes:
-  - feature:mint
   - reference:write
-  - reference:register_files
 
 audience:
   service: false
