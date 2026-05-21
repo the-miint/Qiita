@@ -9,6 +9,9 @@
 -- downstream submission paths can map 1:1 without a translation table. Add
 -- new values when a new platform comes online; values cannot be removed
 -- once any row references them.
+--
+-- Mirrored by qiita_common.models.Platform. The two value sets are kept in
+-- lockstep by tests/test_enum_parity.py — change both in the same PR.
 CREATE TYPE qiita.platform AS ENUM (
     'illumina',
     'pacbio_smrt',
