@@ -6,7 +6,10 @@ subclasses, parametrized over SampleEntityKind so both biosample and
 prep_sample wording is exercised. The missing-reason sub-case requires
 a real missing_value_reason row because the helper resolves the reason
 name via DB lookup; all sub-cases run against the same postgres_pool
-fixture for uniformity even though only one branch touches the DB.
+fixture for uniformity even though only one branch touches the DB. Also
+covers parse_kv_detail and detail_for_biosample_link_rejection — pure
+string helpers that turn a trigger's structured error DETAIL into an
+unambiguous 422 message.
 
 No route integration tests live here: both
 write_global_metadata_or_diagnose callers (the biosample import route
@@ -34,7 +37,9 @@ from qiita_control_plane.repositories._sample_helpers import (
     TransientWriteRaceError,
 )
 from qiita_control_plane.routes._helpers import (
+    detail_for_biosample_link_rejection,
     detail_for_global_field_collision,
+    parse_kv_detail,
     raise_for_transient_write_race,
 )
 
@@ -288,3 +293,60 @@ def test_raise_for_transient_write_race():
         ),
         {"Retry-After": "1"},
     )
+
+
+# ---------------------------------------------------------------------------
+# parse_kv_detail -> structured key=value parsing of a Postgres DETAIL
+# ---------------------------------------------------------------------------
+
+
+def test_parse_kv_detail_splits_pairs():
+    """Comma-separated key=value pairs parse into a dict; surrounding
+    whitespace is stripped so the trigger's `k=v, k=v` formatting (with a
+    space after each comma) round-trips cleanly. Shape mirrors the real
+    DETAIL the biosample-link trigger emits."""
+    parsed = parse_kv_detail(
+        "trigger=prep_sample_to_study_reject_without_biosample_link, study_idx=7, biosample_idx=42"
+    )
+    assert parsed == {
+        "trigger": "prep_sample_to_study_reject_without_biosample_link",
+        "study_idx": "7",
+        "biosample_idx": "42",
+    }
+
+
+def test_parse_kv_detail_skips_chunks_without_equals():
+    """A chunk carrying no '=' is dropped rather than producing a bogus
+    key; a None or empty detail yields an empty dict, never raising."""
+    assert parse_kv_detail("study_idx=7, garbage, biosample_idx=42") == {
+        "study_idx": "7",
+        "biosample_idx": "42",
+    }
+    assert parse_kv_detail(None) == {}
+    assert parse_kv_detail("") == {}
+
+
+# ---------------------------------------------------------------------------
+# detail_for_biosample_link_rejection -> 422 wording naming the failing study
+# ---------------------------------------------------------------------------
+
+
+def test_detail_for_biosample_link_rejection_names_the_study():
+    """The 422 detail names the exact failing study_idx and biosample_idx
+    pulled from the trigger's structured DETAIL — not the ambiguous
+    "the requested study" wording that issue #46 flagged when a body
+    carries a primary plus secondary studies."""
+    detail = detail_for_biosample_link_rejection({"study_idx": "7", "biosample_idx": "42"})
+    assert detail == (
+        "prep_sample cannot be linked to study_idx=7:"
+        " biosample_idx=42 is not linked to that study"
+        " (or the link is retired)"
+    )
+
+
+def test_detail_for_biosample_link_rejection_degrades_without_detail():
+    """If the trigger ever stops emitting DETAIL the helper falls back to
+    a '?' placeholder rather than crashing the route."""
+    detail = detail_for_biosample_link_rejection({})
+    assert "study_idx=?" in detail
+    assert "biosample_idx=?" in detail

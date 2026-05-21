@@ -119,6 +119,52 @@ async def detail_for_global_field_collision(
     )
 
 
+def parse_kv_detail(detail: str | None) -> dict[str, str]:
+    """Parse a Postgres error ``DETAIL`` of comma-separated ``key=value`` pairs.
+
+    A trigger that needs to hand structured data to a route puts it in
+    the error's DETAIL field as ``k1=v1, k2=v2`` rather than embedding it
+    in the human-readable MESSAGE: regex-parsing MESSAGE for data couples
+    route code to migration string literals and breaks silently when the
+    wording is edited. Chunks without an ``=`` are skipped; a None or
+    empty detail yields an empty dict.
+
+    Splitting is on a bare ``,`` — values must be comma-free (the current
+    callers emit integers and schema identifiers, both safe). A value
+    that can contain a comma needs a different encoding.
+    """
+    fields: dict[str, str] = {}
+    if not detail:
+        return fields
+    for chunk in detail.split(","):
+        key, sep, value = chunk.partition("=")
+        if sep:
+            fields[key.strip()] = value.strip()
+    return fields
+
+
+def detail_for_biosample_link_rejection(detail_fields: dict[str, str]) -> str:
+    """Build the HTTP-422 detail for a rejected prep_sample_to_study link.
+
+    Takes the already-parsed DETAIL fields (see parse_kv_detail) emitted
+    by the prep_sample_to_study_reject_without_biosample_link trigger in
+    db/migrations/20260501000011_prep_sample.sql. That trigger fires once
+    per link row the sequenced-sample composer inserts — a primary study
+    plus zero or more secondaries — so "the requested study" is ambiguous
+    when a body lists several; this helper names the exact study that
+    lacks a biosample link. Missing keys degrade to ``?`` so a trigger
+    that ever stops emitting DETAIL produces a vague message instead of
+    crashing the route.
+    """
+    study_idx = detail_fields.get("study_idx", "?")
+    biosample_idx = detail_fields.get("biosample_idx", "?")
+    return (
+        f"prep_sample cannot be linked to study_idx={study_idx}:"
+        f" biosample_idx={biosample_idx} is not linked to that study"
+        " (or the link is retired)"
+    )
+
+
 # Retry-After is advisory; the race self-resolves the instant the
 # concurrent delete commits, so a 1-second hint is generous. Sent as a
 # string because that is the on-the-wire header value.

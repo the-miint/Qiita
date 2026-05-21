@@ -581,9 +581,25 @@ BEGIN
     ) INTO biosample_link_exists_active;
 
     IF NOT biosample_link_exists_active THEN
+        -- MESSAGE stays human-readable; everything a route acts on goes
+        -- in DETAIL as comma-separated key=value pairs. The `trigger`
+        -- key carries this function's name -- a stable schema identifier
+        -- -- so the route decides WHICH rejection this is without
+        -- matching message prose; study_idx / biosample_idx let it name
+        -- the exact failing study. Consumed by routes/_helpers.py
+        -- detail_for_biosample_link_rejection and the RaiseError catch
+        -- in routes/sequenced_sample.py -- keep the keys in sync.
+        -- ERRCODE is pinned to 'P0001' to match the house style of the
+        -- publication-lock triggers.
         RAISE EXCEPTION
             'prep_sample_to_study(prep_sample=%, study=%) requires a non-retired biosample_to_study(biosample=%, study=%) link',
-            NEW.prep_sample_idx, NEW.study_idx, biosample_idx_for_prep_sample, NEW.study_idx;
+            NEW.prep_sample_idx, NEW.study_idx, biosample_idx_for_prep_sample, NEW.study_idx
+            USING
+                ERRCODE = 'P0001',
+                DETAIL = format(
+                    'trigger=prep_sample_to_study_reject_without_biosample_link, study_idx=%s, biosample_idx=%s',
+                    NEW.study_idx, biosample_idx_for_prep_sample
+                );
     END IF;
 
     RETURN NEW;
