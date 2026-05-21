@@ -1,5 +1,6 @@
 # duckdb-miint reference (internal cheat sheet)
 
+> **Audience:** developers writing or reviewing data-plane / orchestrator / reference-ingestion code that calls miint. Not an end-user reference for the extension itself — upstream owns that.
 > **Upstream:** https://github.com/the-miint/duckdb-miint
 > **Last checked:** 2026-05-20 (against default branch `v1.5-variegata`, latest docs commit `c330b11b` from 2026-05-18)
 > **Refresh trigger:** if today's date is more than 7 days after **Last checked** above, re-verify against upstream `docs/` before relying on any signature here — the project ships frequently and function signatures, parameter names, and embedded-tool versions drift. See [Keeping this doc fresh](#keeping-this-doc-fresh).
@@ -121,7 +122,7 @@ These are not just curiosities — they constrain how qiita's data-plane and orc
 
 - **GPL boundary (`install_gpl_boundary`).** Several embedded tools are GPL (notably `vsearch`, MAFFT, SortMeRNA). The extension itself is BSD; GPL-licensed code runs in a separately-distributed out-of-process host. If a function returns "gpl-boundary not installed", call `install_gpl_boundary()` first. Probe availability with `phylogeny_fasttree_available()` etc.
 - **Per-sample `sample_id='col'` knob** (see `internals/per-sample-pattern.md`). When the user passes `sample_id='some_column'`, the function partitions by that column and runs the tool per group. Reserved output column names are listed in that doc — avoid colliding with them in qiita's table schemas.
-- **Reading tables/views inside table functions** (`internals/reading-tables-views.md`). miint table functions use a **separate** DuckDB connection during bind/execute. Implication for us: any miint table-function call that names another table (e.g. `read_alignments(..., reference_lengths='ref_lens')`, `align_minimap2(query_table, subject_table=...)`) only sees committed tables, not temp tables created inside the same transaction. Plan ingestion accordingly.
+- **Reading tables/views inside table functions** (`internals/reading-tables-views.md`). miint table functions use a **separate** DuckDB connection during bind/execute. Implication for us: any miint table-function call that names another table (e.g. `read_alignments(..., reference_lengths='ref_lens')`, `align_minimap2(query_table, subject_table=...)`) resolves persistent `table` and `view` names but **does not** resolve `TEMP TABLE`s, and CTEs are not reliably visible either. Stage inputs as a regular table (or view) before the miint call rather than relying on temp tables / CTEs in the same statement.
 - **Arrow zero-copy** (`internals/arrow-zero-copy.md`). RYpe and a few others move Arrow batches across the FFI without copying — lifetime is tied to the source batch. If we ever embed miint outside DuckDB, mind the lifetime rules.
 - **Identifier-column codec** (`id_column_codec` / `id_column_utils` in `internals/architecture.md`). miint preserves arbitrary user identifier columns (e.g. `read_id`) through alignment/classification pipelines. We rely on this to carry our `prep_sample_idx` and friends through alignment.
 - **Dual-path table functions (standard + lateral) and filter pushdown.** Most readers support both `SELECT * FROM read_fastx('x.fq')` and `… JOIN LATERAL read_fastx(t.path)`. Predicate pushdown into `read_alignments` is real — `WHERE flag & 4 = 0` will prune at the HTSlib layer. Don't write helper macros that materialize before filtering.
@@ -148,7 +149,7 @@ From `docs/internals/embedded-tools.md` — pinned at the extension's build, not
 
 ## Keeping this doc fresh
 
-The upstream project ships frequently — signatures and version pins drift. To keep this file honest:
+To keep this file honest:
 
 1. **Look at the `Last checked:` date in the header.** If `today − Last checked > 7 days`, refresh before relying on a specific signature.
 2. **Refresh procedure (5–10 min):**
@@ -162,15 +163,20 @@ The upstream project ships frequently — signatures and version pins drift. To 
    # default branch (changes per minor release, e.g. v1.5-variegata → v1.6-foo)
    gh api repos/the-miint/duckdb-miint --jq .default_branch
 
-   # full headings inventory across docs/ (compare against this file's Function inventory)
+   # full headings inventory across docs/ and docs/internals/ (compare against
+   # this file's Function inventory, Internals section, and version table)
    BRANCH=$(gh api repos/the-miint/duckdb-miint --jq .default_branch)
    for f in scalar-functions analysis-functions table-functions copy-formats \
-            rype unifrac massql ena installation; do
+            rype unifrac massql ena installation \
+            internals/architecture internals/embedded-tools \
+            internals/per-sample-pattern internals/arrow-zero-copy \
+            internals/reading-tables-views; do
      echo "===== $f.md ====="
      curl -fsSL "https://raw.githubusercontent.com/the-miint/duckdb-miint/$BRANCH/docs/$f.md" \
        | grep -E '^#{1,3} '
    done
    ```
+   `internals/embedded-tools.md` is the most version-volatile of these — re-read it whenever a workflow result smells tool-version-dependent.
 3. **What to update:** the `Last checked` line; the default-branch tag in the header; any new/renamed/removed function in the inventory; the embedded-tool version table if `internals/embedded-tools.md` changed.
-4. **What NOT to copy in:** full prose, examples, or parameter tables. This file is an index — depth lives upstream. Keep it under ~200 lines so the diff stays reviewable.
+4. **What NOT to copy in:** full prose, examples, or parameter tables. This file is an index — depth lives upstream. Keep it concise.
 5. **If signatures here disagree with upstream**, upstream wins. Fix this file in the same commit as the consumer-code change that exposed the drift.
