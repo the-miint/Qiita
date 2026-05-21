@@ -1,30 +1,34 @@
-"""Native job: canonicalize, hash, dedup, and chunk an uploaded
-sequence Parquet.
+"""Native job: hash + emit a chunked-by-feature reference sequence Parquet.
 
 The CLI's DoPut writes an `upload.parquet` with shape
-`(read_id VARCHAR, sequence VARCHAR)` to the data plane's staging area.
-This step reads that file and produces the three Parquets the workflow
-needs to mint features and load reference data:
+`(read_id VARCHAR, chunk_index INTEGER, chunk_data VARCHAR)` — sequences
+are chunked at the client to keep per-row Parquet width bounded for
+genome-scale inputs (single GG2 records run up to ~21 MB).
 
-  - `manifest.parquet`           — `(read_id, sequence_hash, length)`
-    One row per upload read. Carries the read's source identifier and
-    the canonical-form sequence_hash it maps to. Downstream consumers
-    (load step taxonomy/phylogeny/placements) JOIN on `read_id`.
-  - `reference_sequence.parquet` — `(sequence_hash, sequence_length_bp)`
-    One row per UNIQUE canonical hash. Drives `mint-features`'s per-hash
-    feature_idx allocation; `write-membership` uses the same set to
-    populate `qiita.reference_membership`.
+This step reads that chunked upload and produces:
+
+  - `manifest.parquet` — `(read_id, sequence_hash, sequence_length_bp)`
+    One row per upload read.
   - `reference_sequence_chunks.parquet` — `(sequence_hash, chunk_index,
-    chunk_data)` One row per 64 KB chunk per unique canonical sequence;
-    the data plane registers this into DuckLake for query-time retrieval.
+    chunk_data)`. Same 64 KB chunks as the upload, relabeled from
+    read_id to canonical sequence_hash. When multiple reads collapse to
+    the same canonical hash (a read + its reverse complement), only one
+    read's chunks survive — the lex-smallest read_id, deterministically.
 
-**Canonical form.** A sequence and its reverse complement describe the
-same molecular entity; both must collapse to one feature. The canonical
-form is `LEAST(upper(seq), sequence_dna_reverse_complement(upper(seq)))`
-— the lexicographically smaller of the two strands. The hash is `md5()`
-over that, stored as DuckDB UUID (16 bytes) to match the wire-side
-`sequence_hash` and `feature_idx` types — no VARCHAR md5 hexstring is
-written anywhere (per the project's hash-storage rule).
+**Canonical hashing.** A sequence and its reverse complement describe
+the same molecular entity. We compute md5 on BOTH strands and store the
+lex-smaller as the canonical `sequence_hash`:
+
+    sequence_hash = LEAST(md5(upper(seq)),
+                          md5(sequence_dna_reverse_complement(upper(seq))))::uuid
+
+The stored chunk bytes are NEVER transformed — `chunk_data` is exactly
+what the client uploaded. Two strand orientations of the same molecule
+get one canonical hash but only one set of chunks survives (the one
+whose read_id won the DISTINCT ON). Stored as DuckDB UUID (16 bytes) to
+match the wire-side `sequence_hash` and `feature_idx` types — no
+VARCHAR md5 hexstring is written anywhere (per the project's
+hash-storage rule).
 
 The reverse complement comes from miint's scalar
 `sequence_dna_reverse_complement`, which honors full IUPAC ambiguity
@@ -42,7 +46,6 @@ from pydantic import BaseModel
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
-    CHUNK_SIZE,
     PARQUET_OPTS,
     PARQUET_OPTS_CHUNKED,
     ensure_miint_installed,
@@ -87,17 +90,19 @@ class Inputs(BaseModel):
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
-    """Read the staged upload Parquet; emit manifest + reference_sequence
-    + reference_sequence_chunks. See module docstring for the pipeline."""
+    """Read the chunked upload Parquet; emit manifest + chunks.
+
+    Upload shape: `(read_id, chunk_index, chunk_data)`. Reconstruct each
+    read via `string_agg(... ORDER BY chunk_index)`, compute canonical
+    hash on both strands, then relabel the upload chunks by sequence_hash
+    via JOIN. See module docstring for the canonical-hash semantics."""
     if not inputs.fasta_path.exists():
         raise FileNotFoundError(f"upload parquet not found: {inputs.fasta_path}")
 
     workspace.mkdir(parents=True, exist_ok=True)
     manifest_path = workspace / "manifest.parquet"
-    reference_sequence_path = workspace / "reference_sequence.parquet"
     reference_sequence_chunks_path = workspace / "reference_sequence_chunks.parquet"
     manifest_out = validate_parquet_path(manifest_path)
-    reference_sequence_out = validate_parquet_path(reference_sequence_path)
     reference_sequence_chunks_out = validate_parquet_path(reference_sequence_chunks_path)
     duckdb_tmp = workspace / ".duckdb_tmp"
     duckdb_tmp.mkdir(parents=True, exist_ok=True)
@@ -117,104 +122,72 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             conn.execute("SET preserve_insertion_order=false")
             conn.execute(f"SET temp_directory='{duckdb_tmp}'")
 
-            # Canonical form is materialized once per read in a nested
-            # subquery, then md5'd in the outer SELECT — keeps
-            # `sequence_dna_reverse_complement(upper(sequence))` from being
-            # evaluated twice (once for `canonical_sequence`, once
-            # inside `md5(LEAST(…))`). On a 5M-row reference upload
-            # the inner-then-outer shape is ~2x faster than restating
-            # the call in both columns; DuckDB does not CSE non-trivial
-            # function chains across top-level SELECT items.
+            # Reconstruct each read's full sequence by ordered chunk
+            # concatenation. DuckDB's vectorized aggregation streams this
+            # group-by-group; peak memory per group ≈ one sequence's
+            # length (capped at the upload's longest record).
             conn.execute(
-                "CREATE TEMP TABLE upload_canonical AS "
+                "CREATE TEMP TABLE per_read AS "
                 "SELECT "
-                "  read_id,"
-                "  canonical_sequence,"
-                "  md5(canonical_sequence)::uuid AS sequence_hash,"
-                "  CAST(length(sequence) AS BIGINT) AS sequence_length_bp "
-                "FROM ("
-                "  SELECT "
-                "    read_id,"
-                "    sequence,"
-                "    LEAST("
-                "      upper(sequence),"
-                "      sequence_dna_reverse_complement(upper(sequence))"
-                "    ) AS canonical_sequence"
-                "  FROM read_parquet(?)"
-                ")",
+                "  read_id, "
+                "  string_agg(chunk_data, '' ORDER BY chunk_index) AS sequence "
+                "FROM read_parquet(?) "
+                "GROUP BY read_id",
                 [str(inputs.fasta_path)],
             )
 
+            # Canonical hash = LEAST(forward_md5, reverse_md5). The bytes
+            # stay as the client uploaded them; the canonical identity
+            # lives in the hash alone.
+            conn.execute(
+                "CREATE TEMP TABLE hashed AS "
+                "SELECT "
+                "  read_id, "
+                "  LEAST("
+                "    md5(upper(sequence))::uuid,"
+                "    md5(sequence_dna_reverse_complement(upper(sequence)))::uuid"
+                "  ) AS sequence_hash, "
+                "  CAST(length(sequence) AS BIGINT) AS sequence_length_bp "
+                "FROM per_read"
+            )
+            conn.execute("DROP TABLE per_read")
+
             # manifest.parquet — one row per upload read.
-            # `sequence_length_bp` (not `length`) matches the column
-            # name used in reference_sequence.parquet so a downstream
-            # JOIN on a common column doesn't trip over naming drift;
-            # mint-features / write-membership read this name directly
-            # from both files.
             conn.execute(
                 "COPY ("
                 "  SELECT read_id, sequence_hash, sequence_length_bp"
-                "  FROM upload_canonical"
-                "  ORDER BY sequence_hash"
+                "  FROM hashed"
                 f") TO '{manifest_out}' ({PARQUET_OPTS})"
             )
 
-            # reference_sequence.parquet — one row per UNIQUE canonical
-            # hash. Length is taken from `length(ANY_VALUE(canonical_sequence))`
-            # so it always tracks the canonical form rather than the
-            # source read length; for the current canonicalization
-            # (strand-fold only) these are equal, but any future
-            # normalization step (gap stripping, case folding beyond
-            # upper) would silently desync the two if we picked from
-            # the source-length column instead.
+            # reference_sequence_chunks.parquet — relabel upload chunks
+            # by sequence_hash. When two reads share a canonical hash
+            # (sequence + its reverse complement) we keep ONE — the
+            # lex-smaller read_id, deterministically. ORDER BY at write
+            # time gives the chunks of each hash on-disk locality so a
+            # downstream `WHERE sequence_hash = X` doesn't scan the
+            # whole file.
             conn.execute(
                 "COPY ("
-                "  SELECT "
-                "    sequence_hash,"
-                "    CAST(length(ANY_VALUE(canonical_sequence)) AS BIGINT) AS sequence_length_bp"
-                "  FROM upload_canonical"
-                "  GROUP BY sequence_hash"
-                "  ORDER BY sequence_hash"
-                f") TO '{reference_sequence_out}' ({PARQUET_OPTS})"
-            )
-
-            # reference_sequence_chunks.parquet — 64 KB chunks over each
-            # unique canonical sequence. Keyed by sequence_hash (vs
-            # feature_idx in the post-mint shape) because mint-features
-            # hasn't run yet.
-            conn.execute(
-                "CREATE OR REPLACE MACRO chunk_seq(str) AS "
-                "list_transform("
-                f"  range(1, CAST(length(str) + 1 AS BIGINT), {CHUNK_SIZE}),"
-                "  lambda idx : {"
-                f"    'chunk_index': CAST((idx - 1) / {CHUNK_SIZE} AS INTEGER),"
-                f"    'chunk_data': substring(str, CAST(idx AS BIGINT), {CHUNK_SIZE})"
-                "  }"
-                ")"
-            )
-            conn.execute(
-                "COPY ("
-                "  WITH unique_seqs AS ("
-                "    SELECT sequence_hash, ANY_VALUE(canonical_sequence) AS canonical_sequence"
-                "    FROM upload_canonical"
-                "    GROUP BY sequence_hash"
-                "  ),"
-                "  unnested AS ("
-                "    SELECT sequence_hash, UNNEST(chunk_seq(canonical_sequence)) AS chunk"
-                "    FROM unique_seqs"
+                "  WITH canonical_read AS ("
+                "    SELECT DISTINCT ON (sequence_hash) read_id, sequence_hash"
+                "    FROM hashed"
+                "    ORDER BY sequence_hash, read_id"
                 "  )"
-                "  SELECT sequence_hash, chunk.chunk_index, chunk.chunk_data"
-                "  FROM unnested"
-                "  ORDER BY sequence_hash, chunk.chunk_index"
-                f") TO '{reference_sequence_chunks_out}' ({PARQUET_OPTS_CHUNKED})"
+                "  SELECT cr.sequence_hash, c.chunk_index, c.chunk_data"
+                "  FROM read_parquet(?) c"
+                "  JOIN canonical_read cr ON c.read_id = cr.read_id"
+                "  ORDER BY cr.sequence_hash, c.chunk_index"
+                f") TO '{reference_sequence_chunks_out}' ({PARQUET_OPTS_CHUNKED})",
+                [str(inputs.fasta_path)],
             )
 
-            conn.execute("DROP TABLE upload_canonical")
+            conn.execute("DROP TABLE hashed")
         success = True
     finally:
         # Clean up the DuckDB spill dir BEFORE returning so the SLURM
         # launcher's manifest walker (running after execute()) sees only
-        # the three output Parquets.
+        # the output Parquets.
         shutil.rmtree(duckdb_tmp, ignore_errors=True)
         # On any failure path (interrupted COPY, DuckDB OOM, ...) remove
         # partial Parquets so the launcher's manifest walker doesn't
@@ -222,15 +195,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         # a hard SIGKILL leaves them behind, but the runner allocates a
         # fresh attempt-N+1 workspace on retry so it doesn't cascade.
         if not success:
-            for partial in (
-                manifest_path,
-                reference_sequence_path,
-                reference_sequence_chunks_path,
-            ):
+            for partial in (manifest_path, reference_sequence_chunks_path):
                 partial.unlink(missing_ok=True)
 
     return {
         "manifest": manifest_path,
-        "reference_sequence": reference_sequence_path,
         "reference_sequence_chunks": reference_sequence_chunks_path,
     }

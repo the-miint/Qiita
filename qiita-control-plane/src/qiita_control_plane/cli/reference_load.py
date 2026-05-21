@@ -5,13 +5,15 @@ What the subcommand does, in order, against a running CP + DP:
   1. POST /reference (or skip if --reference-idx was supplied).
   2. For each input file (FASTA required, taxonomy/tree/jplace/genome_map
      optional):
-       a. Convert the file to an upload-shape Parquet (see Arrow conversion
-          below). The Parquet lands in a tmpdir under workspace.
+       a. Open an Arrow RecordBatch stream over the source file (see
+          "Arrow streaming" below). No intermediate Parquet is written
+          to local disk; batches go straight to DoPut.
        b. POST /upload to mint an upload slot — returns upload_idx +
           signed DoPut Flight ticket.
-       c. pyarrow.flight do_put — streams the Parquet to the data plane,
-          which writes `{root}/uploads/{upload_idx}/upload.parquet` and
-          returns a PutResult body with sha256 / row_count / bytes_received.
+       c. pyarrow.flight do_put — streams the Arrow batches to the data
+          plane, which writes `{root}/uploads/{upload_idx}/upload.parquet`
+          and returns a PutResult body with sha256 / row_count /
+          bytes_received.
        d. POST /upload/{idx}/done — descriptive claim of the data plane's
           sha256 / row_count / bytes_received. Transitions pending → ready.
   3. POST /work-ticket with `action_context = {fasta_upload_idx: N, ...}`
@@ -22,18 +24,26 @@ What the subcommand does, in order, against a running CP + DP:
      printing state transitions; (--no-watch) print the work_ticket_idx
      and exit so the caller can poll externally.
 
-**Arrow conversion** matches what `hash_sequences` and `reference_load`
-expect to read on disk:
+**Arrow streaming** (per role):
 
-  - FASTA   → ``SELECT read_id, sequence1 AS sequence FROM read_fastx(?)``
-              via duckdb-miint, streamed to a Parquet under tmp.
-  - Taxonomy Parquet (read_id+taxonomy schema)   → passthrough copy.
-  - Newick tree → single-row ``(newick_bytes BLOB)``.
-  - jplace JSON → single-row ``(jplace_bytes BLOB)``.
-  - genome_map Parquet → passthrough copy.
+  - FASTA: miint's ``read_fastx`` → 64 KB chunks via DuckDB's chunk_seq
+           macro. Upload schema: ``(read_id, chunk_index, chunk_data)``.
+           Bounded memory regardless of record size — GG2 genome records
+           up to ~21 MB stream as many small chunks instead of a single
+           multi-MB Parquet cell.
+  - Newick / jplace: Python ``read(64 KB)`` loop over the source file.
+           Upload schema: ``(chunk_index, chunk_data BLOB)``. Bounded
+           memory regardless of file size — GG2 phylogeny (~407 MB) and
+           jplace files (multi-GB) stream chunk-by-chunk.
+  - Taxonomy / genome_map Parquet: ``pq.ParquetFile.iter_batches()``
+           passthrough — these are already row-shaped data.
 
-Client does NOT canonicalize sequences — that happens server-side inside
-hash_sequences. Hashes the client forwards on /done are descriptive only.
+All chunked uploads use ROW_GROUP_SIZE = 16384 (matches the chunked-
+sequence write tuning in miint.py): ~1 GB per row group at 64 KB chunks.
+
+Client does NOT canonicalize sequences or hash anything — that happens
+server-side inside hash_sequences. The client never reconstructs a full
+sequence; chunks go on the wire as-uploaded.
 
 **Failure UX.** Mid-upload network drops surface as `httpx.HTTPStatusError`
 or `pyarrow.flight.FlightError` — no silent retry. The caller sees the
@@ -47,13 +57,13 @@ upload_idx.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import logging
 import os
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -95,33 +105,48 @@ class UploadResult:
 
 
 # =============================================================================
-# Arrow conversion
+# Arrow streaming
 # =============================================================================
 #
-# Each helper writes an `upload.parquet`-shaped file under `workspace`
-# matching what the corresponding native job will read. The DoPut handler
-# is schema-agnostic, so any Arrow stream works as long as the consumer
-# step's read_parquet call sees the columns it expects.
+# Each role exposes a context manager yielding an `UploadStream`: an
+# Arrow `Schema` plus an iterator of `RecordBatch`. The caller pipes the
+# batches straight into the DoPut writer — no intermediate Parquet hits
+# the local filesystem. The DoPut handler is schema-agnostic, so each
+# role picks the shape its server-side consumer expects to read.
+
+# Chunked-upload tuning. Matches CHUNK_SIZE / CHUNK_ROW_GROUP_SIZE in
+# qiita_compute_orchestrator.miint — 64 KB chunks at 16384 rows per
+# batch keeps each Arrow batch ~1 GB on dense data and bounds CLI
+# memory regardless of source-record size (GG2 genome records run up
+# to ~21 MB; backbone 16S records are ~1.5 KB).
+_CHUNK_SIZE = 65_536
+_CHUNK_ROWS_PER_BATCH = 16_384
 
 
-def _ensure_workspace(workspace: Path) -> None:
-    workspace.mkdir(parents=True, exist_ok=True)
+@dataclass(frozen=True)
+class UploadStream:
+    """Schema + iterator of RecordBatches the DoPut writer consumes.
+    The schema is needed up-front to open the DoPut writer; the
+    iterator may pull from a still-open file or DuckDB connection,
+    which is why this lives behind a context manager."""
+
+    schema: Any  # pyarrow.Schema, but kept Any to avoid an eager import
+    batches: Iterator[Any]  # Iterator[pyarrow.RecordBatch]
 
 
-def _fasta_to_upload_parquet(fasta_path: Path, workspace: Path) -> Path:
-    """FASTA → `(read_id VARCHAR, sequence VARCHAR)` Parquet via miint's
-    `read_fastx`. miint emits `sequence1` natively (the FASTQ paired-read
-    convention); the SELECT aliases it to `sequence` so hash_sequences'
-    `SELECT upper(sequence) FROM read_parquet(?)` picks up the right
-    column. preserve_insertion_order is left at default — read order
-    isn't load-bearing here; hash_sequences computes its own sort.
+@contextlib.contextmanager
+def _fasta_upload_stream(fasta_path: Path) -> Iterator[UploadStream]:
+    """FASTA → `(read_id, chunk_index, chunk_data)` chunked stream via
+    miint's `read_fastx` plus DuckDB's chunk_seq UNNEST. Sequences are
+    chunked at the client so a multi-MB GG2 genome record never lands
+    as a single VARCHAR cell on the wire. preserve_insertion_order is
+    left default — chunks within a read carry their own chunk_index, so
+    hash_sequences reconstructs by ORDER BY.
 
     Reuses `MIINT_EXTENSION_REPO` (the orchestrator's flag) when set so
     the team mirror's unsigned binaries are picked up here too."""
     import duckdb
 
-    _ensure_workspace(workspace)
-    out = workspace / "fasta_upload.parquet"
     mirror = os.environ.get("MIINT_EXTENSION_REPO")
     config = {"allow_unsigned_extensions": "true"} if mirror else {}
     with duckdb.connect(":memory:", config=config) as conn:
@@ -131,79 +156,97 @@ def _fasta_to_upload_parquet(fasta_path: Path, workspace: Path) -> Path:
             conn.execute("INSTALL miint FROM community;")
         conn.execute("LOAD miint;")
         conn.execute(
-            "COPY (SELECT read_id, sequence1 AS sequence "
-            "FROM read_fastx(?)) "
-            f"TO '{out}' (FORMAT PARQUET)",
-            [str(fasta_path)],
+            "CREATE OR REPLACE MACRO chunk_seq(str) AS "
+            "list_transform("
+            f"  range(1, CAST(length(str) + 1 AS BIGINT), {_CHUNK_SIZE}),"
+            "  lambda idx : {"
+            f"    'chunk_index': CAST((idx - 1) / {_CHUNK_SIZE} AS INTEGER),"
+            f"    'chunk_data': substring(str, CAST(idx AS BIGINT), {_CHUNK_SIZE})"
+            "  }"
+            ")"
         )
-    return out
-
-
-def _passthrough_parquet_copy(src: Path, workspace: Path, label: str) -> Path:
-    """Re-emit a source Parquet under a fixed name. We re-write rather
-    than shipping the original bytes to (a) sanity-check the file parses
-    as Parquet on the CLI side before paying for a DoPut round-trip, and
-    (b) normalize Parquet version / compression to the canonical form
-    upload consumers expect (snappy intermediates are fine here — the
-    server-side `register-files` pass writes the final zstd-compressed
-    DuckLake-side Parquet)."""
-    import duckdb
-
-    _ensure_workspace(workspace)
-    out = workspace / f"{label}_upload.parquet"
-    with duckdb.connect(":memory:") as conn:
-        conn.execute(
-            f"COPY (SELECT * FROM read_parquet(?)) TO '{out}' (FORMAT PARQUET)", [str(src)]
+        rel = conn.sql(
+            "SELECT read_id, chunk.chunk_index, chunk.chunk_data "
+            "FROM ("
+            f"  SELECT read_id, sequence1 AS sequence FROM read_fastx('{fasta_path}')"
+            ") "
+            "CROSS JOIN UNNEST(chunk_seq(sequence)) AS t(chunk)"
         )
-    return out
+        reader = rel.to_arrow_reader(_CHUNK_ROWS_PER_BATCH)
+        yield UploadStream(schema=reader.schema, batches=reader)
 
 
-def _blob_to_single_row_parquet(
-    src: Path, workspace: Path, *, label: str, column_name: str
-) -> Path:
-    """Newick / jplace / any opaque text file → single-row Parquet with
-    one BLOB column. The server-side native job reads the column via
-    `read_*` (read_newick / read_jplace) which expects an on-disk
-    filesystem path, not a BLOB — so this representation is provisional:
-    the orchestrator step writes the BLOB back out to its workspace
-    before invoking the parser (see `_write_phylogeny` and
-    `_write_placements` in `reference_load`). A follow-up will switch to
-    reading the BLOB inline once miint's `read_newick` accepts an
-    in-memory string."""
+@contextlib.contextmanager
+def _blob_upload_stream(src: Path) -> Iterator[UploadStream]:
+    """Opaque binary file → `(chunk_index INT, chunk_data BLOB)` chunked
+    stream. Reads `src` in 64 KB blocks and emits one Arrow batch per
+    `_CHUNK_ROWS_PER_BATCH` chunks. Bounded memory even on GG2-scale
+    inputs (407 MB phylogeny, multi-GB jplace). Server side stitches
+    chunks back into a temp file via `_unwrap_chunks_to_temp_file`."""
     import pyarrow as pa
+
+    schema = pa.schema(
+        [
+            pa.field("chunk_index", pa.int32()),
+            pa.field("chunk_data", pa.binary()),
+        ]
+    )
+
+    def _iter_batches() -> Iterator[Any]:
+        indices: list[int] = []
+        datas: list[bytes] = []
+        idx = 0
+        with src.open("rb") as f:
+            while True:
+                data = f.read(_CHUNK_SIZE)
+                if not data:
+                    break
+                indices.append(idx)
+                datas.append(data)
+                idx += 1
+                if len(indices) >= _CHUNK_ROWS_PER_BATCH:
+                    yield pa.RecordBatch.from_arrays(
+                        [pa.array(indices, type=pa.int32()), pa.array(datas, type=pa.binary())],
+                        schema=schema,
+                    )
+                    indices = []
+                    datas = []
+        if indices:
+            yield pa.RecordBatch.from_arrays(
+                [pa.array(indices, type=pa.int32()), pa.array(datas, type=pa.binary())],
+                schema=schema,
+            )
+
+    yield UploadStream(schema=schema, batches=_iter_batches())
+
+
+@contextlib.contextmanager
+def _passthrough_parquet_stream(src: Path) -> Iterator[UploadStream]:
+    """Taxonomy / genome_map already arrive as Parquet — stream their
+    existing row batches through unchanged. `iter_batches` is bounded by
+    the source's row groups; these inputs are small (tens of MB at
+    most) so default batching is fine."""
     import pyarrow.parquet as pq
 
-    _ensure_workspace(workspace)
-    out = workspace / f"{label}_upload.parquet"
-    blob = src.read_bytes()
-    table = pa.table({column_name: [blob]}, schema=pa.schema([(column_name, pa.binary())]))
-    pq.write_table(table, out)
-    return out
+    pf = pq.ParquetFile(src)
+    yield UploadStream(schema=pf.schema_arrow, batches=pf.iter_batches())
 
 
-_ROLE_CONVERTERS: dict[str, Callable[[Path, Path], Path]] = {
-    "fasta": _fasta_to_upload_parquet,
-    "taxonomy": lambda src, ws: _passthrough_parquet_copy(src, ws, "taxonomy"),
-    "tree": lambda src, ws: _blob_to_single_row_parquet(
-        src, ws, label="tree", column_name="newick_bytes"
-    ),
-    "jplace": lambda src, ws: _blob_to_single_row_parquet(
-        src, ws, label="jplace", column_name="jplace_bytes"
-    ),
-    "genome_map": lambda src, ws: _passthrough_parquet_copy(src, ws, "genome_map"),
+_ROLE_STREAMERS: dict[str, Callable[[Path], Any]] = {
+    "fasta": _fasta_upload_stream,
+    "taxonomy": _passthrough_parquet_stream,
+    "tree": _blob_upload_stream,
+    "jplace": _blob_upload_stream,
+    "genome_map": _passthrough_parquet_stream,
 }
 
 
-def _convert_for_role(file_path: Path, role: str, workspace: Path) -> Path:
-    """Dispatch on role to the right Arrow-conversion helper. Ensures
-    `workspace` exists so helpers can assume it; the top-level entry
-    point also creates it but standalone callers (tests, future custom
-    pipelines) may not."""
-    workspace.mkdir(parents=True, exist_ok=True)
-    try:
-        return _ROLE_CONVERTERS[role](file_path, workspace)
-    except KeyError as exc:
-        raise ValueError(f"unknown upload role: {role!r}") from exc
+def _open_upload_stream(file_path: Path, role: str):
+    """Dispatch on role to the right streaming context manager."""
+    streamer = _ROLE_STREAMERS.get(role)
+    if streamer is None:
+        raise ValueError(f"unknown upload role: {role!r}")
+    return streamer(file_path)
 
 
 # =============================================================================
@@ -246,35 +289,30 @@ async def _get(
     return resp.json()
 
 
-def _do_put_sync(
+def _do_put_stream(
     flight_client: flight.FlightClient,
     ticket_bytes: bytes,
-    upload_parquet_path: Path,
+    stream: UploadStream,
 ) -> dict[str, Any]:
-    """Stream `upload_parquet_path` to the data plane via DoPut. Runs
+    """Stream `stream.batches` to the data plane via DoPut. Runs
     synchronously (pyarrow.flight is a sync API); the async caller wraps
     in `asyncio.to_thread` so the event loop stays free.
 
     Returns the PutResult body the data plane wrote on the metadata
     side — `{upload_idx, sha256, row_count, bytes_received}`."""
     import pyarrow.flight as flight
-    import pyarrow.parquet as pq
 
     descriptor = flight.FlightDescriptor.for_command(ticket_bytes)
-    # iter_batches keeps memory bounded — a multi-GB FASTA Parquet never
-    # materialises in the CLI process. The pyarrow.flight writer
-    # back-pressures on the wire side.
-    pf = pq.ParquetFile(upload_parquet_path)
-    writer, reader = flight_client.do_put(descriptor, pf.schema_arrow)
+    writer, reader = flight_client.do_put(descriptor, stream.schema)
     try:
-        for batch in pf.iter_batches():
+        for batch in stream.batches:
             writer.write_batch(batch)
         writer.done_writing()
         put_metadata = reader.read()
     finally:
         writer.close()
     if put_metadata is None:
-        raise RuntimeError(f"data plane returned no PutResult for upload at {upload_parquet_path}")
+        raise RuntimeError("data plane returned no PutResult")
     return json.loads(bytes(put_metadata).decode())
 
 
@@ -290,21 +328,22 @@ async def upload_file(
     flight_client: flight.FlightClient,
     file_path: Path,
     role: str,
-    workspace: Path,
     description: str | None = None,
 ) -> UploadResult:
-    """Convert + DoPut + /done a single input file. Returns the upload
+    """Stream + DoPut + /done a single input file. Returns the upload
     metadata the caller stitches into `action_context`."""
     import asyncio
-
-    upload_parquet = _convert_for_role(file_path, role, workspace)
 
     create_body = {"description": description or f"{role}: {file_path.name}"}
     create = await _post(http, token, URL_UPLOAD_PREFIX, body=create_body, expected_status=(201,))
     upload_idx = create["upload_idx"]
     ticket_bytes = base64.b64decode(create["doput_ticket"])
 
-    put_body = await asyncio.to_thread(_do_put_sync, flight_client, ticket_bytes, upload_parquet)
+    def _do_put_with_stream() -> dict[str, Any]:
+        with _open_upload_stream(file_path, role) as stream:
+            return _do_put_stream(flight_client, ticket_bytes, stream)
+
+    put_body = await asyncio.to_thread(_do_put_with_stream)
     if put_body.get("upload_idx") != upload_idx:
         raise RuntimeError(
             f"data plane PutResult upload_idx={put_body.get('upload_idx')!r} does not match "
@@ -377,7 +416,6 @@ async def do_reference_load(
     tree_path: Path | None = None,
     jplace_path: Path | None = None,
     genome_map_path: Path | None = None,
-    workspace: Path | None = None,
     watch: bool = True,
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
     timeout_seconds: float = DEFAULT_POLL_TIMEOUT_SECONDS,
@@ -412,79 +450,63 @@ async def do_reference_load(
         reference_idx = create["reference_idx"]
         _log.info("created reference %d (%s, %s)", reference_idx, name, version)
 
-    if workspace is None:
-        # Tests pin workspace via tmp_path; production runs use a tmpdir
-        # the system reclaims on exit. The Parquets we write here are
-        # transient — only the server-side bytes (under upload_staging_root)
-        # persist past this call.
-        ctx = TemporaryDirectory(prefix="qiita-ref-load-")
-        workspace = Path(ctx.name)
-    else:
-        ctx = None
-    try:
-        workspace.mkdir(parents=True, exist_ok=True)
+    action_context: dict[str, int] = {}
+    upload_idxs: dict[str, int] = {}
 
-        action_context: dict[str, int] = {}
-        upload_idxs: dict[str, int] = {}
+    # Upload sequentially. Concurrent DoPuts would be faster on a fast
+    # link, but reference-add inputs are typically dominated by the
+    # FASTA; parallelizing taxonomy/tree/jplace saves seconds at the
+    # cost of a much harder-to-debug failure mode if one upload fails
+    # mid-stream.
+    for role, src in [
+        ("fasta", fasta_path),
+        ("taxonomy", taxonomy_path),
+        ("tree", tree_path),
+        ("jplace", jplace_path),
+        ("genome_map", genome_map_path),
+    ]:
+        if src is None:
+            continue
+        res = await upload_file(
+            http=http,
+            token=token,
+            flight_client=flight_client,
+            file_path=src,
+            role=role,
+        )
+        action_context[f"{role}_upload_idx"] = res.upload_idx
+        upload_idxs[role] = res.upload_idx
+        _log.info("uploaded %s as upload_idx=%d", role, res.upload_idx)
 
-        # Upload sequentially. Concurrent DoPuts would be faster on a
-        # fast link, but reference-add inputs are typically dominated by
-        # the FASTA; parallelizing taxonomy/tree/jplace saves seconds at
-        # the cost of a much harder-to-debug failure mode if one upload
-        # fails mid-stream.
-        for role, src in [
-            ("fasta", fasta_path),
-            ("taxonomy", taxonomy_path),
-            ("tree", tree_path),
-            ("jplace", jplace_path),
-            ("genome_map", genome_map_path),
-        ]:
-            if src is None:
-                continue
-            res = await upload_file(
-                http=http,
-                token=token,
-                flight_client=flight_client,
-                file_path=src,
-                role=role,
-                workspace=workspace,
-            )
-            action_context[f"{role}_upload_idx"] = res.upload_idx
-            upload_idxs[role] = res.upload_idx
-            _log.info("uploaded %s as upload_idx=%d", role, res.upload_idx)
+    submit_body = {
+        "action_id": "reference-add",
+        "action_version": "1.0.0",
+        "scope_target": {"kind": "reference", "reference_idx": reference_idx},
+        "action_context": action_context,
+    }
+    submit = await _post(
+        http,
+        token,
+        URL_WORK_TICKET_PREFIX,
+        body=submit_body,
+        expected_status=(202,),
+    )
+    work_ticket_idx = submit["work_ticket_idx"]
+    _log.info("submitted work_ticket %d for reference %d", work_ticket_idx, reference_idx)
 
-        submit_body = {
-            "action_id": "reference-add",
-            "action_version": "1.0.0",
-            "scope_target": {"kind": "reference", "reference_idx": reference_idx},
-            "action_context": action_context,
-        }
-        submit = await _post(
+    result: dict[str, Any] = {
+        "reference_idx": reference_idx,
+        "work_ticket_idx": work_ticket_idx,
+        "upload_idxs": upload_idxs,
+    }
+
+    if watch:
+        final = await watch_work_ticket(
             http,
             token,
-            URL_WORK_TICKET_PREFIX,
-            body=submit_body,
-            expected_status=(202,),
+            work_ticket_idx,
+            poll_interval_seconds=poll_interval_seconds,
+            timeout_seconds=timeout_seconds,
         )
-        work_ticket_idx = submit["work_ticket_idx"]
-        _log.info("submitted work_ticket %d for reference %d", work_ticket_idx, reference_idx)
-
-        result: dict[str, Any] = {
-            "reference_idx": reference_idx,
-            "work_ticket_idx": work_ticket_idx,
-            "upload_idxs": upload_idxs,
-        }
-
-        if watch:
-            final = await watch_work_ticket(
-                http,
-                token,
-                work_ticket_idx,
-                poll_interval_seconds=poll_interval_seconds,
-                timeout_seconds=timeout_seconds,
-            )
-            result["work_ticket"] = final
-        return result
-    finally:
-        if ctx is not None:
-            ctx.cleanup()
+        result["work_ticket"] = final
+    return result

@@ -42,7 +42,7 @@ steps:
     module: qiita_compute_orchestrator.jobs.hash_sequences
     target_status: hashing
     inputs: [fasta_path]
-    outputs: [manifest, reference_sequence, reference_sequence_chunks]
+    outputs: [manifest, reference_sequence_chunks]
     baseline_resources:
       cpu: 4
       mem_gb: 8
@@ -61,7 +61,7 @@ steps:
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.reference_load
     target_status: loading
-    inputs: [manifest, feature_map, reference_sequence, reference_sequence_chunks]
+    inputs: [manifest, feature_map, reference_sequence_chunks]
     optional_inputs: [taxonomy_path, tree_path, jplace_path]
     outputs: [staging_dir]
     baseline_resources:

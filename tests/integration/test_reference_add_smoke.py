@@ -110,10 +110,11 @@ async def test_reference_add_workflow_end_to_end(
     action_id, action_version = synced_reference_add_action
     reference_idx = smoke_reference
 
-    # Stage an upload row + canonical (read_id, sequence) Parquet at the
-    # path the runner will resolve from `fasta_upload_idx`. The workflow
-    # consumes the Parquet via hash_sequences' read_parquet(?); the raw
-    # FASTA shape isn't a runtime input.
+    # Stage an upload row + chunked-FASTA Parquet at the path the
+    # runner will resolve from `fasta_upload_idx`. The workflow consumes
+    # the Parquet via hash_sequences' read_parquet(?); the shape is the
+    # CLI's wire form `(read_id, chunk_index, chunk_data)` — short
+    # sequences fit in one chunk each.
     upload_staging_root = tmp_path / "upload-staging"
     upload_idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.upload (status, created_by_idx, completed_at,"
@@ -127,10 +128,10 @@ async def test_reference_add_workflow_end_to_end(
     with duckdb.connect(":memory:") as conn:
         conn.execute(
             "COPY (SELECT * FROM (VALUES"
-            "  ('seq1', 'ACGTACGTACGTACGT'),"
-            "  ('seq2', 'TTTTAAAACCCCGGGG'),"
-            "  ('seq3', 'GCATGCATGCATGCAT')"
-            ") AS upload(read_id, sequence))"
+            "  ('seq1', 0, 'ACGTACGTACGTACGT'),"
+            "  ('seq2', 0, 'TTTTAAAACCCCGGGG'),"
+            "  ('seq3', 0, 'GCATGCATGCATGCAT')"
+            ") AS upload(read_id, chunk_index, chunk_data))"
             f" TO '{upload_parquet}' (FORMAT PARQUET)"
         )
 

@@ -225,7 +225,6 @@ async def test_gg2_backbone_full_pipeline(
         tree_path=TREE,
         genome_map_path=gg2_genome_map,
         reference_idx=gg2_reference,
-        workspace=tmp_path / "cli_ws",
         watch=True,
         poll_interval_seconds=5,
         timeout_seconds=30 * 60,

@@ -74,7 +74,7 @@ def _write_parquet(path: Path, schema_sql: str, rows: list[tuple]) -> None:
 
 @pytest.fixture
 def staging_inputs(tmp_path):
-    """Synthesize hash_sequences' three Parquets + mint-features'
+    """Synthesize hash_sequences' two Parquets + mint-features'
     feature_map. Returns a dict the caller spreads into the Inputs
     model."""
     manifest_path = tmp_path / "manifest.parquet"
@@ -91,15 +91,11 @@ def staging_inputs(tmp_path):
         [(str(h), fidx) for h, fidx in _FEATURE_MAP.items()],
     )
 
-    reference_sequence_path = tmp_path / "reference_sequence.parquet"
-    _write_parquet(
-        reference_sequence_path,
-        "sequence_hash UUID, sequence_length_bp BIGINT",
-        [(str(_HASHES[name]), len(_TEST_SEQUENCES[name])) for name in _TEST_SEQUENCES],
-    )
-
     reference_sequence_chunks_path = tmp_path / "reference_sequence_chunks.parquet"
-    # Each canonical sequence is short enough to be one chunk.
+    # Chunks carry the source (unfolded) bytes of each upload read; the
+    # canonical hash lives on the row but the chunk_data is what was
+    # uploaded. For the test fixture we use _CANON[name] as a stand-in
+    # for the upload bytes (single-strand inputs in this fixture).
     _write_parquet(
         reference_sequence_chunks_path,
         "sequence_hash UUID, chunk_index INTEGER, chunk_data VARCHAR",
@@ -109,7 +105,6 @@ def staging_inputs(tmp_path):
     return {
         "manifest": manifest_path,
         "feature_map": feature_map_path,
-        "reference_sequence": reference_sequence_path,
         "reference_sequence_chunks": reference_sequence_chunks_path,
     }
 
@@ -263,27 +258,35 @@ def test_taxonomy_lifted_writer_keys_by_feature_idx(staging_inputs, taxonomy_pat
         assert strain == "Methanobacterium formicicum DSM 2320"
 
 
-def _wrap_blob_parquet(path: Path, column_name: str, payload: bytes) -> Path:
-    """Write a single-row Parquet `({column_name} BLOB)` via DuckDB.
-    Mirrors the CLI's DoPut wire shape for opaque text inputs (Newick /
-    jplace) without depending on pyarrow — the orchestrator's test
-    environment doesn't pull pyarrow in, so DuckDB is the right write
-    path here."""
+_CHUNK_SIZE = 65_536
+
+
+def _wrap_chunked_blob_parquet(path: Path, payload: bytes) -> Path:
+    """Write a chunked-blob upload Parquet `(chunk_index INTEGER,
+    chunk_data BLOB)` via DuckDB. Matches the CLI's DoPut wire shape
+    for opaque binary inputs (Newick / jplace); reference_load stitches
+    chunks back into a temp file via `_unwrap_chunks_to_temp_file`."""
+    chunks = [
+        (i // _CHUNK_SIZE, payload[i : i + _CHUNK_SIZE])
+        for i in range(0, len(payload), _CHUNK_SIZE)
+    ]
+    if not chunks:
+        chunks = [(0, b"")]
     with duckdb.connect(":memory:") as conn:
-        conn.execute(f"CREATE TEMP TABLE wrapped ({column_name} BLOB)")
-        conn.execute("INSERT INTO wrapped VALUES (?)", [payload])
+        conn.execute("CREATE TEMP TABLE wrapped (chunk_index INTEGER, chunk_data BLOB)")
+        for idx, data in chunks:
+            conn.execute("INSERT INTO wrapped VALUES (?, ?)", [idx, data])
         conn.execute(f"COPY wrapped TO '{path}' (FORMAT PARQUET)")
     return path
 
 
 @pytest.fixture
 def tree_path(tmp_path):
-    """Wrap a Newick tree in the CLI's DoPut shape: a single-row Parquet
-    `(newick_bytes BLOB)`. reference_load unwraps the BLOB to a temp
-    `.nwk` file before passing to miint's `read_newick` — this fixture
-    mirrors the wire format the runner actually sees."""
+    """Wrap a Newick tree in the CLI's chunked DoPut shape. reference_load
+    stitches chunks back into a temp `.nwk` file before passing to
+    miint's `read_newick`."""
     nwk_text = b"((seq1:0.1,seq2:0.2):0.3,(seq3:0.4,(seq4:0.5,seq5:0.6):0.7):0.8);"
-    return _wrap_blob_parquet(tmp_path / "tree_upload.parquet", "newick_bytes", nwk_text)
+    return _wrap_chunked_blob_parquet(tmp_path / "tree_upload.parquet", nwk_text)
 
 
 def test_phylogeny_lifted_writer_populates_tip_feature_idx(staging_inputs, tree_path, tmp_path):
@@ -308,9 +311,9 @@ def test_phylogeny_lifted_writer_populates_tip_feature_idx(staging_inputs, tree_
 
 @pytest.fixture
 def jplace_path(tmp_path):
-    """jplace input wrapped in the CLI's DoPut shape: a single-row
-    Parquet `(jplace_bytes BLOB)`. reference_load unwraps the BLOB to a
-    temp `.jplace` file before passing to miint's `read_jplace`."""
+    """jplace input wrapped in the CLI's chunked DoPut shape.
+    reference_load stitches chunks back to a temp `.jplace` file before
+    passing to miint's `read_jplace`."""
     jplace_text = (
         b'{"version": 3, "tree": "((seq1:0.1{0},seq2:0.2{1}):0.3{2}):0.4{3};",'
         b' "placements": ['
@@ -321,7 +324,7 @@ def jplace_path(tmp_path):
         b'            "distal_length", "pendant_length"],'
         b' "metadata": {}}'
     )
-    return _wrap_blob_parquet(tmp_path / "jplace_upload.parquet", "jplace_bytes", jplace_text)
+    return _wrap_chunked_blob_parquet(tmp_path / "jplace_upload.parquet", jplace_text)
 
 
 def test_placements_lifted_writer_maps_fragment_to_feature_idx(

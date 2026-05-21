@@ -224,7 +224,6 @@ async def test_e2e_create_to_doget(
         taxonomy_path=taxonomy_e2e,
         tree_path=tree_e2e,
         reference_idx=fresh_reference,
-        workspace=tmp_path / "cli_ws",
         watch=True,
         poll_interval_seconds=0.1,
         timeout_seconds=60,

@@ -31,14 +31,23 @@ _SHARED_TOKEN = "step-dispatch-test-token"
 _HASH_SEQUENCES_MODULE = "qiita_compute_orchestrator.jobs.hash_sequences"
 
 
+_CHUNK_SIZE = 65_536
+
+
 def _write_upload_parquet(path: Path, reads: list[tuple[str, str]]) -> Path:
-    """Synthesize an `upload.parquet` matching the DoPut writer's shape:
-    `(read_id VARCHAR, sequence VARCHAR)`. Two short sequences are enough
-    to exercise the step's full pipeline without inflating I/O."""
+    """Synthesize an `upload.parquet` matching the CLI's chunked DoPut
+    shape: `(read_id VARCHAR, chunk_index INTEGER, chunk_data VARCHAR)`.
+    Short sequences fit in one chunk each."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    rows: list[tuple[str, int, str]] = []
+    for read_id, seq in reads:
+        for i in range(0, max(len(seq), 1), _CHUNK_SIZE):
+            rows.append((read_id, i // _CHUNK_SIZE, seq[i : i + _CHUNK_SIZE]))
     with duckdb.connect(":memory:") as conn:
-        conn.execute("CREATE TEMP TABLE t (read_id VARCHAR, sequence VARCHAR)")
-        conn.executemany("INSERT INTO t VALUES (?, ?)", reads)
+        conn.execute(
+            "CREATE TEMP TABLE t (read_id VARCHAR, chunk_index INTEGER, chunk_data VARCHAR)"
+        )
+        conn.executemany("INSERT INTO t VALUES (?, ?, ?)", rows)
         conn.execute(f"COPY t TO '{path}' (FORMAT PARQUET)")
     return path
 

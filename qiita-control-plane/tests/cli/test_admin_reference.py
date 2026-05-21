@@ -213,7 +213,6 @@ async def test_do_reference_load_happy_path(
             name="cli-test",
             version="1.0",
             kind="sequence_reference",
-            workspace=tmp_path / "ws",
             watch=True,
             poll_interval_seconds=0.01,
         )
@@ -264,7 +263,6 @@ async def test_do_reference_load_skips_creation_when_reference_idx_set(
             flight_client=flight_client,
             fasta_path=fasta_file,
             reference_idx=42,
-            workspace=tmp_path / "ws",
             watch=False,
         )
 
@@ -293,7 +291,6 @@ async def test_do_reference_load_no_watch_returns_without_polling(
             fasta_path=fasta_file,
             name="cli-test",
             version="1.0",
-            workspace=tmp_path / "ws",
             watch=False,
         )
 
@@ -329,7 +326,6 @@ async def test_do_reference_load_fail_loud_on_doput_error(fasta_file, tmp_path, 
                 fasta_path=fasta_file,
                 name="cli-test",
                 version="1.0",
-                workspace=tmp_path / "ws",
                 watch=False,
             )
 
@@ -358,53 +354,64 @@ async def test_do_reference_load_rejects_ambiguous_reference_selection(fasta_fil
                 name="x",
                 version="1.0",
                 reference_idx=42,
-                workspace=tmp_path / "ws",
             )
 
 
 # =============================================================================
-# Arrow conversion helpers
+# Arrow streaming helpers
 # =============================================================================
 
 
-def test_blob_to_single_row_parquet_round_trips(tmp_path):
-    """Newick / jplace inputs are wrapped as a single-row Parquet with one
-    BLOB column. The helper must produce a valid Parquet whose lone row
-    carries the input bytes verbatim."""
-    from qiita_control_plane.cli.reference_load import _blob_to_single_row_parquet
+def test_blob_upload_stream_chunks_bytes(tmp_path):
+    """Newick / jplace inputs stream as chunked `(chunk_index, chunk_data
+    BLOB)` Arrow batches. The helper must walk the source file in
+    bounded reads and emit ordered chunks whose concatenation
+    round-trips to the source bytes."""
+    from qiita_control_plane.cli.reference_load import _blob_upload_stream
 
     src = tmp_path / "tree.nwk"
     src.write_text("(a:0.1,b:0.2);")
-    out = _blob_to_single_row_parquet(
-        src, tmp_path / "ws", label="tree", column_name="newick_bytes"
-    )
-    assert out.exists()
-    with duckdb.connect(":memory:") as conn:
-        rows = conn.execute(f"SELECT newick_bytes FROM read_parquet('{out}')").fetchall()
-    assert len(rows) == 1
-    assert bytes(rows[0][0]) == b"(a:0.1,b:0.2);"
+    with _blob_upload_stream(src) as stream:
+        schema_names = stream.schema.names
+        assert schema_names == ["chunk_index", "chunk_data"]
+        batches = list(stream.batches)
+
+    # Concatenate every batch's chunk_data column in chunk_index order.
+    pairs: list[tuple[int, bytes]] = []
+    for batch in batches:
+        for idx, data in zip(
+            batch.column("chunk_index").to_pylist(),
+            batch.column("chunk_data").to_pylist(),
+        ):
+            pairs.append((idx, data))
+    pairs.sort()
+    reassembled = b"".join(data for _idx, data in pairs)
+    assert reassembled == b"(a:0.1,b:0.2);"
 
 
-def test_passthrough_parquet_copy_preserves_columns(taxonomy_file, tmp_path):
-    """Passthrough copy must round-trip every input row + column. We
-    re-encode via DuckDB to normalize the Parquet version on the wire,
-    not to filter content."""
-    from qiita_control_plane.cli.reference_load import _passthrough_parquet_copy
+def test_passthrough_parquet_stream_iterates_source_batches(taxonomy_file):
+    """Passthrough streamer must yield every input row through its own
+    Parquet batches without dropping or reordering."""
+    from qiita_control_plane.cli.reference_load import _passthrough_parquet_stream
 
-    out = _passthrough_parquet_copy(taxonomy_file, tmp_path / "ws", "taxonomy")
+    with _passthrough_parquet_stream(taxonomy_file) as stream:
+        batches = list(stream.batches)
     with duckdb.connect(":memory:") as conn:
         src_rows = conn.execute(f"SELECT * FROM read_parquet('{taxonomy_file}')").fetchall()
-        out_rows = conn.execute(f"SELECT * FROM read_parquet('{out}')").fetchall()
-    assert src_rows == out_rows
+    streamed_rows: list[tuple] = []
+    for batch in batches:
+        streamed_rows.extend(tuple(row.values()) for row in batch.to_pylist())
+    assert streamed_rows == src_rows
 
 
-def test_convert_for_role_rejects_unknown_role(tmp_path):
+def test_open_upload_stream_rejects_unknown_role(tmp_path):
     """A typo'd role surfaces as ValueError — the CLI doesn't silently
     treat unknown roles as passthrough."""
-    from qiita_control_plane.cli.reference_load import _convert_for_role
+    from qiita_control_plane.cli.reference_load import _open_upload_stream
 
     with pytest.raises(ValueError, match="unknown upload role"):
-        _convert_for_role(tmp_path / "x", role="qiime2_artifact", workspace=tmp_path / "ws")
+        with _open_upload_stream(tmp_path / "x", role="qiime2_artifact"):
+            pass
 
 
 # Smoke check that the asyncio entry point is callable from a sync test

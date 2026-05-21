@@ -58,7 +58,7 @@ _DUCKDB_MAX_THREADS = 2
 class Inputs(BaseModel):
     """Typed input contract for reference_load.
 
-    The first four fields are required outputs of the upstream pipeline
+    The first three fields are required outputs of the upstream pipeline
     (hash_sequences → mint-features) and carry bare names matching what
     those steps emit and what the YAML's `inputs:` list declares.
 
@@ -75,7 +75,6 @@ class Inputs(BaseModel):
 
     manifest: Path
     feature_map: Path
-    reference_sequence: Path
     reference_sequence_chunks: Path
     taxonomy_path: Path | None = None
     tree_path: Path | None = None
@@ -88,7 +87,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     for label, path in [
         ("manifest", inputs.manifest),
         ("feature_map", inputs.feature_map),
-        ("reference_sequence", inputs.reference_sequence),
         ("reference_sequence_chunks", inputs.reference_sequence_chunks),
     ]:
         if not path.exists():
@@ -149,11 +147,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # Counts also drive the unmapped-hash check below.
             _build_id_map(conn, inputs.manifest)
 
-            _write_reference_sequences(
-                conn,
-                inputs.reference_sequence,
-                sequences_out,
-            )
+            _write_reference_sequences(conn, sequences_out)
             written.append(sequences_path)
 
             _write_reference_sequence_chunks(
@@ -171,28 +165,24 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 written.append(taxonomy_out_path)
 
             if inputs.tree_path is not None:
-                # The CLI's DoPut writes Newick input as a single-row
-                # Parquet `(newick_bytes BLOB)` so the data plane stays
-                # schema-agnostic (Parquet-in, Parquet-out). miint's
-                # `read_newick` parses a Newick TEXT file, not a Parquet,
-                # so unwrap the BLOB to a temp `.nwk` here before reading.
-                newick_path = _unwrap_blob_to_temp_file(
+                # The CLI's DoPut writes Newick / jplace as a chunked
+                # `(chunk_index, chunk_data BLOB)` Parquet so the data
+                # plane stays schema-agnostic and large blobs stream
+                # under bounded memory. miint's `read_newick` /
+                # `read_jplace` parse on-disk text/JSON files, so we
+                # stitch chunks back into a temp file here.
+                newick_path = _unwrap_chunks_to_temp_file(
                     conn,
                     parquet_path=inputs.tree_path,
-                    column_name="newick_bytes",
                     out_path=duckdb_tmp / "tree.nwk",
                 )
                 _write_phylogeny(conn, newick_path, inputs.reference_idx, phylogeny_out)
                 written.append(phylogeny_out_path)
 
             if inputs.jplace_path is not None:
-                # Same shape as the Newick branch — DoPut wrapped the
-                # jplace JSON as a single-row Parquet `(jplace_bytes
-                # BLOB)`; miint's `read_jplace` needs a JSON file.
-                jplace_path = _unwrap_blob_to_temp_file(
+                jplace_path = _unwrap_chunks_to_temp_file(
                     conn,
                     parquet_path=inputs.jplace_path,
-                    column_name="jplace_bytes",
                     out_path=duckdb_tmp / "placement.jplace",
                 )
                 _write_placements(conn, jplace_path, inputs.reference_idx, placements_out)
@@ -220,35 +210,34 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     return {"staging_dir": workspace}
 
 
-def _unwrap_blob_to_temp_file(
+def _unwrap_chunks_to_temp_file(
     conn: duckdb.DuckDBPyConnection,
     *,
     parquet_path: Path,
-    column_name: str,
     out_path: Path,
 ) -> Path:
-    """Extract a single-row BLOB column from `parquet_path` and write its
-    bytes to `out_path`. Bridges the CLI's DoPut wire shape (Newick /
-    jplace wrapped as `(<name>_bytes BLOB)` so the data plane stays
-    schema-agnostic) to miint's `read_newick` / `read_jplace`, which
-    parse text/JSON files on disk.
+    """Stitch a chunked-BLOB upload Parquet back into a temp file.
 
-    Reads through DuckDB so the schema check (column exists, exactly one
-    row) surfaces as a clean error rather than a pyarrow `KeyError`.
-    Writes the bytes verbatim — no decoding, no newline normalization."""
-    rows = conn.execute(
-        f"SELECT {column_name} FROM read_parquet(?)",
-        [str(parquet_path)],
-    ).fetchall()
-    if len(rows) != 1:
-        raise ValueError(
-            f"expected exactly one row in {parquet_path} carrying {column_name!r}, got {len(rows)}"
-        )
-    payload = rows[0][0]
-    if payload is None:
-        raise ValueError(f"{parquet_path} row 0 has NULL {column_name!r} — upload was malformed")
+    Upload shape: `(chunk_index INTEGER, chunk_data BLOB)`. Writes
+    `chunk_data` to `out_path` in `chunk_index` order, fetching rows in
+    batches so we never materialise the whole BLOB in memory — important
+    for jplace inputs that can run into the GB range."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_bytes(bytes(payload))
+    cursor = conn.execute(
+        "SELECT chunk_data FROM read_parquet(?) ORDER BY chunk_index",
+        [str(parquet_path)],
+    )
+    with out_path.open("wb") as f:
+        while True:
+            rows = cursor.fetchmany(1024)
+            if not rows:
+                break
+            for (chunk_data,) in rows:
+                if chunk_data is None:
+                    raise ValueError(f"{parquet_path} contains a NULL chunk_data")
+                f.write(bytes(chunk_data))
+    if out_path.stat().st_size == 0:
+        raise ValueError(f"{parquet_path} produced an empty file — upload was malformed")
     return out_path
 
 
@@ -292,23 +281,21 @@ def _build_id_map(
 
 def _write_reference_sequences(
     conn: duckdb.DuckDBPyConnection,
-    reference_sequence_path: Path,
     out: str,
 ) -> None:
-    """Re-key hash_sequences' `reference_sequence.parquet` (hash-keyed)
-    to DuckLake's `reference_sequences` schema (feature_idx-keyed) by
-    JOINing on sequence_hash. Sorted by feature_idx for row-group pruning."""
+    """Emit DuckLake's `reference_sequences` shape — one row per unique
+    feature_idx with `(feature_idx, sequence_hash, sequence_length_bp)`.
+    Pulls everything from id_map (which already carries the per-read
+    triple from the manifest × feature_map JOIN); reads sharing a
+    canonical hash all carry the same length, so DISTINCT ON
+    feature_idx collapses them deterministically."""
     conn.execute(
         "COPY ("
-        "  SELECT "
-        "    fm.feature_idx,"
-        "    rs.sequence_hash,"
-        "    rs.sequence_length_bp"
-        "  FROM read_parquet(?) rs"
-        "  JOIN feature_map fm ON rs.sequence_hash = fm.sequence_hash"
-        "  ORDER BY fm.feature_idx"
-        f") TO '{out}' ({PARQUET_OPTS})",
-        [str(reference_sequence_path)],
+        "  SELECT DISTINCT ON (feature_idx)"
+        "    feature_idx, sequence_hash, sequence_length_bp"
+        "  FROM id_map"
+        "  ORDER BY feature_idx"
+        f") TO '{out}' ({PARQUET_OPTS})"
     )
 
 
