@@ -8,6 +8,9 @@
 -- arm a given ticket carries). Living in one CREATE TYPE means the value
 -- set is defined exactly once across the schema; matches the
 -- qiita.system_role / qiita.tier convention used elsewhere.
+--
+-- Mirrored by qiita_common.models.ScopeTargetKind. The two value sets are kept
+-- in lockstep by tests/test_enum_parity.py — change both in the same PR.
 CREATE TYPE qiita.scope_target_kind AS ENUM (
     'study_prep',
     'reference',

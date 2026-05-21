@@ -8,6 +8,9 @@
 -- and a wet_lab_admin can do everything a user can do. Authorization
 -- predicates check `system_role >= 'wet_lab_admin'` or
 -- `system_role >= 'system_admin'` to gate operations by minimum required role.
+--
+-- Mirrored by qiita_common.auth_constants.SystemRole. The two value sets are
+-- kept in lockstep by tests/test_enum_parity.py — change both in the same PR.
 CREATE TYPE qiita.system_role AS ENUM (
     'user',
     'wet_lab_admin',
