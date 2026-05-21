@@ -83,8 +83,10 @@ from ..repositories.sequenced_sample import (
 )
 from ._helpers import (
     GENERIC_FK_VIOLATION,
+    detail_for_biosample_link_rejection,
     detail_for_global_field_collision,
     etag_for_updated_at,
+    parse_kv_detail,
     raise_for_transient_write_race,
 )
 
@@ -98,7 +100,14 @@ _MSG_OWNER_NOT_ELIGIBLE = "owner is not eligible to own prep samples"
 # Markers and message maps for the sequenced-sample composer's exception
 # ladder. Constraint names pin to the migration; if either side changes the
 # other must follow in lockstep.
-_BIOSAMPLE_LINK_TRIGGER_MARKER = "requires a non-retired biosample_to_study"
+#
+# The biosample-link trigger tags its error DETAIL with `trigger=<this
+# value>`; the route dispatches on that structured key, never on the
+# human-readable message prose, so trigger wording edits cannot silently
+# re-route the exception. The value is the DB function name in
+# db/migrations/20260501000011_prep_sample.sql — renaming that function
+# means updating both sites in lockstep.
+_BIOSAMPLE_LINK_TRIGGER_NAME = "prep_sample_to_study_reject_without_biosample_link"
 
 _SEQUENCED_SAMPLE_UNIQUE_MESSAGES: dict[str, str] = {
     "sequenced_sample_pool_item_id_unique": ("sequenced_pool_item_id already in use for this pool"),
@@ -240,15 +249,16 @@ async def import_sequenced_sample_from_run(
             raise HTTPException(status_code=422, detail=detail)
         except asyncpg.RaiseError as exc:
             # The prep_sample_to_study_reject_without_biosample_link trigger
-            # raises with a fixed substring; map it to 422 naming the
-            # biosample / study and re-raise anything else.
-            if _BIOSAMPLE_LINK_TRIGGER_MARKER in str(exc):
+            # tags its error DETAIL with a `trigger` key plus the failing
+            # study_idx / biosample_idx. Dispatch on the trigger key (never
+            # on message prose); map our trigger to 422 naming the exact
+            # study (a body may list a primary plus several secondaries)
+            # and re-raise every other RaiseError.
+            detail_fields = parse_kv_detail(exc.detail)
+            if detail_fields.get("trigger") == _BIOSAMPLE_LINK_TRIGGER_NAME:
                 raise HTTPException(
                     status_code=422,
-                    detail=(
-                        "prep_sample cannot be linked to the requested study;"
-                        " biosample is not linked (or link is retired) for that study"
-                    ),
+                    detail=detail_for_biosample_link_rejection(detail_fields),
                 )
             raise
 

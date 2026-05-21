@@ -829,7 +829,8 @@ async def test_import_sequenced_sample_from_run_missing_biosample_link_422(ctx):
     # The biosample is owned by the wet_lab_admin but is NOT linked to the
     # study. The prep_sample_to_study_reject_without_biosample_link trigger
     # fires inside the composer's link INSERT; the route maps the marker
-    # substring to 422.
+    # substring to 422 and names the exact failing study from the error
+    # DETAIL rather than the ambiguous "the requested study" (issue #46).
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "nolink")
     study_idx = await _seed_study(
         ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="nolink"
@@ -854,10 +855,68 @@ async def test_import_sequenced_sample_from_run_missing_biosample_link_422(ctx):
         primary_study_idx=study_idx,
     )
     assert resp.status_code == 422
-    assert "not linked" in resp.json()["detail"]
+    # The exact failing study / biosample are named, not collapsed to a
+    # vague phrase — the route reads them from the trigger's error DETAIL.
+    assert resp.json()["detail"] == (
+        f"prep_sample cannot be linked to study_idx={study_idx}:"
+        f" biosample_idx={bs_idx} is not linked to that study"
+        " (or the link is retired)"
+    )
 
     # Verify the transaction rolled back — no prep_sample row exists for
     # this biosample.
+    leftover = await ctx["pool"].fetchval(
+        "SELECT COUNT(*) FROM qiita.prep_sample WHERE biosample_idx = $1",
+        bs_idx,
+    )
+    assert leftover == 0
+
+
+async def test_import_sequenced_sample_secondary_link_422_names_that_study(ctx):
+    # The biosample is linked to the primary study but NOT to the
+    # secondary. The composer inserts the primary link (passes) then the
+    # secondary link, which trips the
+    # prep_sample_to_study_reject_without_biosample_link trigger. The 422
+    # must name the *secondary* study — the one that actually failed —
+    # since a body listing several studies makes "the requested study"
+    # ambiguous (issue #46).
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "sec-nolink")
+    primary_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="sec-nolink-p"
+    )
+    secondary_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="sec-nolink-s"
+    )
+    # Biosample linked to the primary only; the secondary link is missing.
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        study_idx=primary_idx,
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        sequenced_pool_item_id=_unique_item_id("SECNOLINK"),
+        primary_study_idx=primary_idx,
+        secondary_study_idxs=[secondary_idx],
+    )
+    assert resp.status_code == 422
+    # The failing study is the secondary; the exact-string match proves
+    # the message names it and not the (validly-linked) primary.
+    assert resp.json()["detail"] == (
+        f"prep_sample cannot be linked to study_idx={secondary_idx}:"
+        f" biosample_idx={bs_idx} is not linked to that study"
+        " (or the link is retired)"
+    )
+
+    # The whole composer transaction rolled back: no prep_sample landed.
     leftover = await ctx["pool"].fetchval(
         "SELECT COUNT(*) FROM qiita.prep_sample WHERE biosample_idx = $1",
         bs_idx,
