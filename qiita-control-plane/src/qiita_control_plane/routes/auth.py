@@ -474,6 +474,13 @@ async def handoff(
     standard OIDC resolver upsert (first-login, email drift, race
     handling), then mints a PAT scoped to the user's role ceiling.
 
+    The post-resolver writes — PAT mint, TOKEN_MINT audit, and (CLI flow)
+    the cli_login_code row — share one transaction so a failure in any
+    later write rolls back the earlier ones. The resolver upsert runs on
+    the bare pool *before* that transaction opens: it owns its own
+    first-login transaction and a deliberately pool-scoped email-collision
+    audit that must survive even when this route's transaction rolls back.
+
     - **CLI flow** (`cli=true` in cookie): store PAT under a one-time code
       in `qiita.cli_login_code`, redirect browser to
       `http://127.0.0.1:<port>/?ot_code=<plaintext>` with the cookie
@@ -527,42 +534,62 @@ async def handoff(
     # Label names the CLI that minted the PAT. `qiita-admin` is the operator
     # CLI; a future end-user `qiita` CLI would mint with its own label.
     label = "qiita-admin login" if is_cli else "browser login"
-    plaintext_pat, token_idx = await mint_api_token(
-        pool,
-        principal_idx=principal.principal_idx,
-        label=label,
-        scopes=scopes,
-        expires_at=expires_at,
-    )
-    await record_event(
-        pool,
-        event_type=AuthEventType.TOKEN_MINT,
-        principal_idx=principal.principal_idx,
-        actor_principal_idx=principal.principal_idx,
-        detail={
-            "token_idx": token_idx,
-            "kind": "pat",
-            "via": "cli_login" if is_cli else "browser_login",
-        },
-    )
 
+    # CLI flow: generate the one-time code up front so its cli_login_code
+    # INSERT can join the mint + audit transaction below.
+    ot_plaintext: str | None = None
     if is_cli:
-        # Persist the PAT plaintext under a single-use ot_code; redirect the
-        # browser to the CLI's loopback so the CLI can redeem it. The cookie
-        # is scrubbed (max-age=0) so a network observer who replays the URL
-        # can't repeat the flow.
         ot_plaintext, ot_hash = generate_ot_code()
         ot_expires = datetime.now(UTC) + timedelta(seconds=settings.cli_login_code_ttl_seconds)
-        await pool.execute(
-            "INSERT INTO qiita.cli_login_code"
-            "  (ot_code, principal_idx, token_idx, plaintext_pat, expires_at)"
-            " VALUES ($1, $2, $3, $4, $5)",
-            ot_hash,
-            principal.principal_idx,
-            token_idx,
-            plaintext_pat,
-            ot_expires,
-        )
+
+    # Mint + audit + (CLI) cli_login_code INSERT share one transaction so a
+    # failure in any later write rolls back the earlier ones — never a token
+    # without its audit row, never token + audit without a redeemable
+    # cli_login_code row. resolve_oidc above ran on the bare pool, outside
+    # this transaction, on purpose (see the docstring).
+    #
+    # Inline pool.acquire() rather than the TxConnFactory dep: the cookie /
+    # JWT / resolver work ahead of this block is non-transactional, so the
+    # body-wide-tx shape that dep wraps is a poor fit — same call shape as
+    # POST /auth/pat.
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            plaintext_pat, token_idx = await mint_api_token(
+                conn,
+                principal_idx=principal.principal_idx,
+                label=label,
+                scopes=scopes,
+                expires_at=expires_at,
+            )
+            await record_event(
+                conn,
+                event_type=AuthEventType.TOKEN_MINT,
+                principal_idx=principal.principal_idx,
+                actor_principal_idx=principal.principal_idx,
+                detail={
+                    "token_idx": token_idx,
+                    "kind": "pat",
+                    "via": "cli_login" if is_cli else "browser_login",
+                },
+            )
+            if is_cli:
+                # Persist the PAT plaintext under the single-use ot_code so
+                # the CLI loopback can redeem it.
+                await conn.execute(
+                    "INSERT INTO qiita.cli_login_code"
+                    "  (ot_code, principal_idx, token_idx, plaintext_pat, expires_at)"
+                    " VALUES ($1, $2, $3, $4, $5)",
+                    ot_hash,
+                    principal.principal_idx,
+                    token_idx,
+                    plaintext_pat,
+                    ot_expires,
+                )
+
+    if is_cli:
+        # Redirect the browser to the CLI's loopback so the CLI can redeem
+        # the ot_code. The cookie is scrubbed (max-age=0) so a network
+        # observer who replays the URL can't repeat the flow.
         port = cookie_payload["port"]
         loopback_url = f"http://{LOOPBACK_HOST}:{port}/?ot_code={ot_plaintext}"
         response = RedirectResponse(loopback_url, status_code=302)
