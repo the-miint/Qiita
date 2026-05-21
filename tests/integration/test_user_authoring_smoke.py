@@ -31,6 +31,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from qiita_common.models import WorkTicketState
 
 from qiita_control_plane.testing.postgres import resolve_postgres_url
 
@@ -41,10 +42,11 @@ _FASTQ_TO_PARQUET_YAML_PATH = (
     / "1.0.0.yaml"
 )
 
-# Every WorkTicketState value — the ticket-status assertion accepts any
-# of them because the background dispatch (against a dead orchestrator)
-# races with the read.
-_WORK_TICKET_STATES = {"pending", "queued", "processing", "completed", "failed"}
+# The ticket-status assertion accepts any WorkTicketState value because
+# the background dispatch (against a dead orchestrator) races with the
+# read. WorkTicketState is a StrEnum, so its members compare equal to
+# the plain strings the CLI prints.
+_WORK_TICKET_STATES = frozenset(WorkTicketState)
 
 
 def _free_port() -> int:
