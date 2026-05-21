@@ -195,6 +195,52 @@ async def seed_biosample_with_sequenced_prep_sample(
     return biosample_idx, prep_sample_idx
 
 
+async def seed_sequenced_sample_subtype(
+    pool: asyncpg.Pool,
+    *,
+    prep_sample_idx: int,
+    owner_idx: int,
+    sequenced_pool_item_id: str,
+) -> tuple[int, int, int]:
+    """Seed the run -> pool -> sequenced_sample subtype chain for an
+    existing sequenced prep_sample; return
+    `(sequencing_run_idx, sequenced_pool_idx, sequenced_sample_idx)`.
+
+    `prep_sample_idx` must already name a supertype prep_sample row with
+    processing_kind='sequenced' (see seed_sequenced_prep_sample). This
+    helper attaches the 1:1 sequenced_sample subtype plus the
+    sequenced_pool it references, so `sequenced_pool_item_id` is
+    populated — the sequenced_sample_pool_pair_consistent CHECK requires
+    the pool idx and item id to be set together. Use this from fixtures
+    that need a prep_sample carrying a pool item id (e.g. the
+    work_ticket fastq-filename-prefix gate). Caller does FK-reverse
+    cleanup: sequenced_sample, then sequenced_pool, then sequencing_run.
+    """
+    run_idx = await pool.fetchval(
+        "INSERT INTO qiita.sequencing_run"
+        "  (instrument_run_id, platform, created_by_idx)"
+        " VALUES ($1, 'illumina'::qiita.platform, $2) RETURNING idx",
+        f"seed-run-{secrets.token_hex(4)}",
+        owner_idx,
+    )
+    pool_idx = await pool.fetchval(
+        "INSERT INTO qiita.sequenced_pool (sequencing_run_idx, created_by_idx)"
+        " VALUES ($1, $2) RETURNING idx",
+        run_idx,
+        owner_idx,
+    )
+    sequenced_sample_idx = await pool.fetchval(
+        "INSERT INTO qiita.sequenced_sample"
+        "  (prep_sample_idx, sequenced_pool_idx, sequenced_pool_item_id, created_by_idx)"
+        " VALUES ($1, $2, $3, $4) RETURNING idx",
+        prep_sample_idx,
+        pool_idx,
+        sequenced_pool_item_id,
+        owner_idx,
+    )
+    return run_idx, pool_idx, sequenced_sample_idx
+
+
 async def seed_biosample_global_field(
     pool: asyncpg.Pool,
     *,

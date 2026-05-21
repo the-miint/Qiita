@@ -44,11 +44,12 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import PurePosixPath
 from typing import Any
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from qiita_common.actions import Audience
+from qiita_common.actions import FASTQ_PATH_CONTEXT_KEYS, Audience
 from qiita_common.api_paths import (
     PATH_WORK_TICKET_BY_IDX,
     PATH_WORK_TICKET_PREFIX,
@@ -293,6 +294,100 @@ async def _check_prep_sample_study_access(
     )
 
 
+def _basename_carries_prefix(basename: str, prefix: str) -> bool:
+    """True iff `basename` is `prefix` immediately followed by a `_` or
+    `.` separator — segment-anchored, not a bare substring match.
+
+    A plain `str.startswith` would admit `ITEM-12_R1.fastq` for a
+    sequenced_pool_item_id of `ITEM-1`; requiring the separator pins the
+    match to the documented `<pool_item_id>_R1.fastq` (paired-end) and
+    `<pool_item_id>.fastq` (single-end) filename convention exactly. A
+    basename equal to `prefix` with nothing after it is rejected — a
+    fastq file always carries an extension.
+    """
+    if not basename.startswith(prefix):
+        return False
+    return basename[len(prefix) : len(prefix) + 1] in ("_", ".")
+
+
+async def _check_fastq_filename_prefix(
+    pool: asyncpg.Pool, *, prep_sample_idx: int, action_context: dict[str, Any]
+) -> None:
+    """422 when a fastq path in `action_context` has a basename that is
+    not the prep_sample's `sequenced_pool_item_id` followed by a `_` or
+    `.` separator (see `_basename_carries_prefix`).
+
+    The rule: the `--pool-item-id` chosen at `sequenced-sample create`
+    time is the filename prefix of every fastq the work-ticket
+    processes, so the R1/R2 pair and the sequenced_sample row stay
+    mechanically tied. `action_context` and the sequenced_sample row are
+    minted in two separate calls and nothing else couples them, so the
+    check lives here. Keyed on the context keys (FASTQ_PATH_CONTEXT_KEYS),
+    not the action_id, so the route stays generic over actions.
+
+    Skipped when the resolved `sequenced_pool_item_id` is NULL. Two
+    shapes reach that branch:
+
+    - a sequenced_sample row exists but is pool-less — sequenced_pool_idx
+      and sequenced_pool_item_id are both NULL — which is legitimate; the
+      rule then has nothing to anchor against.
+    - no sequenced_sample subtype row exists for this
+      processing_kind='sequenced' prep_sample — anomalous, since the
+      sequenced-sample create composer writes supertype and subtype
+      atomically. Policing that integrity gap is not this gate's job
+      (the processing_kind check above and the create composer own it);
+      the gate just declines to invent a constraint it cannot evaluate.
+
+    Either way the rule constrains a relationship between two values and
+    is vacuous when one does not exist, so the submission proceeds.
+
+    Like `_check_prep_sample_study_access`, the read runs on the pool,
+    not the work_ticket INSERT transaction: a sequenced_sample row
+    created concurrently with the gate decides arbitrarily.
+    `sequenced_pool_item_id` is not PATCH-editable, so a value already
+    set cannot change under the gate.
+    """
+    fastq_paths = {
+        key: action_context[key]
+        for key in FASTQ_PATH_CONTEXT_KEYS
+        # Defense-in-depth: for fastq-to-parquet the context_schema pins
+        # each fastq key to a string, so validate_context already 422'd a
+        # non-string upstream. The guard still covers actions with a
+        # permissive schema — a non-string value is not a fastq path, so
+        # it is skipped here rather than rejected.
+        if isinstance(action_context.get(key), str)
+    }
+    if not fastq_paths:
+        return
+    pool_item_id = await pool.fetchval(
+        "SELECT sequenced_pool_item_id FROM qiita.sequenced_sample WHERE prep_sample_idx = $1",
+        prep_sample_idx,
+    )
+    if pool_item_id is None:
+        return
+    mismatched = [
+        {
+            "context_key": key,
+            "fastq_path": path,
+            "basename": PurePosixPath(path).name,
+        }
+        for key, path in sorted(fastq_paths.items())
+        if not _basename_carries_prefix(PurePosixPath(path).name, pool_item_id)
+    ]
+    if mismatched:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "reason": (
+                    "fastq filename must be the prep_sample's sequenced_pool_item_id"
+                    " followed by '_' or '.'"
+                ),
+                "sequenced_pool_item_id": pool_item_id,
+                "mismatched": mismatched,
+            },
+        )
+
+
 def _require_compute_backend_client(request: Request) -> None:
     """Guard that 503s if the orchestrator dispatch path is not configured.
     Prevents creating tickets that can never run."""
@@ -395,6 +490,15 @@ async def submit_work_ticket(
                 "reason": "action_context does not match action.context_schema",
                 "errors": context_errors,
             },
+        )
+
+    # A fastq path in the (now schema-valid) action_context must carry a
+    # basename prefixed by the prep_sample's sequenced_pool_item_id.
+    if scope_target["kind"] == ScopeTargetKind.PREP_SAMPLE.value:
+        await _check_fastq_filename_prefix(
+            pool,
+            prep_sample_idx=scope_target["prep_sample_idx"],
+            action_context=body.action_context,
         )
 
     await _check_disallow_without_delete(pool, body.action_id, body.action_version, scope_target)

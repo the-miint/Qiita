@@ -1173,7 +1173,8 @@ def test_ticket_submit_minimal_prep_sample_scope(monkeypatch):
 
 
 def test_ticket_submit_with_context_json(monkeypatch):
-    """--context-json is parsed before POST; lands on the wire as action_context."""
+    """A paired-end --context-json is parsed before POST; both fastq paths
+    land on the wire as action_context."""
     from qiita_control_plane.cli.user import main
 
     captured: dict = {}
@@ -1195,11 +1196,15 @@ def test_ticket_submit_with_context_json(monkeypatch):
             "--prep-sample-idx",
             "55",
             "--context-json",
-            '{"fastq_path": "/scratch/sample.fastq"}',
+            '{"fastq_path": "/scratch/filename_prefix_R1.fastq",'
+            ' "reverse_fastq_path": "/scratch/filename_prefix_R2.fastq"}',
         ]
     )
     assert rc == 0
-    assert captured["json"]["action_context"] == {"fastq_path": "/scratch/sample.fastq"}
+    assert captured["json"]["action_context"] == {
+        "fastq_path": "/scratch/filename_prefix_R1.fastq",
+        "reverse_fastq_path": "/scratch/filename_prefix_R2.fastq",
+    }
 
 
 def test_ticket_submit_with_scope_target_json(monkeypatch):

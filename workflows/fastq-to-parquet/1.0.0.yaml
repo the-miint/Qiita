@@ -57,7 +57,14 @@ context_schema:
     # read. minLength rejects an empty string; the "^/" pattern
     # rejects relative paths, which would silently resolve against
     # whatever CWD the launcher happens to start in — a SLURM-side
-    # surprise we'd rather catch at submission time.
+    # surprise we'd rather catch at submission time. The basename
+    # must also start with the prep_sample's sequenced_pool_item_id
+    # (the --pool-item-id from sequenced-sample create) — a JSON
+    # schema cannot express that, so the work_ticket POST route
+    # enforces the prefix rule. Same applies to reverse_fastq_path.
+    # The route reads these two property names from
+    # qiita_common.actions.FASTQ_PATH_CONTEXT_KEYS — keep that tuple
+    # in sync with the keys here.
     fastq_path:
       type: string
       minLength: 1

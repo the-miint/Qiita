@@ -128,9 +128,19 @@ qiita sequenced-sample create \
     --pool-idx $POOL_IDX \
     --biosample-idx $BIOSAMPLE_IDX \
     --prep-protocol-idx $PROTOCOL_IDX \
-    --pool-item-id ITEM-1 \
+    --pool-item-id filename_prefix \
     --primary-study-idx $STUDY_IDX
 ```
+
+`--pool-item-id` is a per-pool unique label for this item (a well
+position or library barcode). **It must also be the filename prefix
+of every fastq this sample's work-ticket processes** — see step 7.
+The value used here, `filename_prefix`, is a placeholder; substitute
+the actual prefix of your fastq files (for paired-end input,
+`filename_prefix` implies `filename_prefix_R1.fastq` /
+`filename_prefix_R2.fastq`). The control plane rejects a
+`fastq-to-parquet` submission whose `fastq_path` basename does not
+start with this value.
 
 Auth paths:
 
@@ -155,7 +165,7 @@ qiita ticket submit \
     --action-id fastq-to-parquet \
     --action-version 1.0.0 \
     --prep-sample-idx $PREP_SAMPLE_IDX \
-    --context-json '{"fastq_path": "/scratch/myfile.fastq"}'
+    --context-json '{"fastq_path": "/scratch/filename_prefix_R1.fastq", "reverse_fastq_path": "/scratch/filename_prefix_R2.fastq"}'
 ```
 
 The `fastq-to-parquet` action's audience admits `user`; the route
@@ -164,11 +174,22 @@ applies a per-study ADMIN check over every non-retired
 owner-bypass). Response: 202 with `work_ticket_idx` and the initial
 `state` (`pending`).
 
-The action's `fastq_path` must be an absolute path the orchestrator
-can read (validated by the action's `context_schema`).
+`fastq_path` (and, for paired-end input, `reverse_fastq_path`) must be
+absolute paths the orchestrator can read (validated by the action's
+`context_schema`).
 
-For paired-end input, add `reverse_fastq_path` to the same
-`--context-json` object.
+**Filename-prefix rule.** Every fastq basename must start with the
+`--pool-item-id` you chose in step 6 — here `filename_prefix`. The
+control plane resolves the prep_sample's `sequenced_pool_item_id` and
+rejects the submission (422) when a basename does not carry that
+prefix, so the filenames alone identify which DB row a fastq belongs
+to. The rule applies to every path you pass:
+- **Paired-end** — `fastq_path` and `reverse_fastq_path`, e.g.
+  `filename_prefix_R1.fastq` and `filename_prefix_R2.fastq`; both
+  basenames are checked.
+- **Single-end** — pass only `fastq_path` (e.g. `filename_prefix.fastq`);
+  the lone forward read is checked against the same prefix.
+  Forward-only submission is fully supported.
 
 ## 8. Poll for status
 

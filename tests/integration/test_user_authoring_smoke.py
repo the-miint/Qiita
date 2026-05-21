@@ -303,6 +303,9 @@ async def test_user_authoring_smoke_via_cli(
         #    require_caller_has_admin_on_all_studies (owner-bypass on the
         #    primary study).
         protocol_idx = await _fetch_prep_protocol_idx(postgres_pool)
+        # --pool-item-id anchors the filename-prefix rule: it must be the
+        # prefix of every fastq the work-ticket in step 6 processes.
+        pool_item_id = f"ITEM-{uuid.uuid4()}"
         sample = _run_cli(
             cp_server,
             user_token,
@@ -317,7 +320,7 @@ async def test_user_authoring_smoke_via_cli(
             "--prep-protocol-idx",
             str(protocol_idx),
             "--pool-item-id",
-            f"ITEM-{uuid.uuid4()}",
+            pool_item_id,
             "--primary-study-idx",
             str(study_idx),
         )
@@ -326,7 +329,11 @@ async def test_user_authoring_smoke_via_cli(
 
         # 6. ticket submit — fastq-to-parquet, prep_sample-scoped. The
         #    audience admits USER; the per-study ADMIN check passes via
-        #    owner-bypass.
+        #    owner-bypass. Both fastq basenames start with the
+        #    --pool-item-id from step 5, so the work-ticket POST route's
+        #    filename-prefix gate admits the submission.
+        fastq_fwd = f"/scratch/{pool_item_id}_R1.fastq"
+        fastq_rev = f"/scratch/{pool_item_id}_R2.fastq"
         ticket = _run_cli(
             cp_server,
             user_token,
@@ -339,7 +346,7 @@ async def test_user_authoring_smoke_via_cli(
             "--prep-sample-idx",
             str(prep_sample_idx),
             "--context-json",
-            '{"fastq_path": "/scratch/user-cli-smoke.fastq"}',
+            json.dumps({"fastq_path": fastq_fwd, "reverse_fastq_path": fastq_rev}),
         )
         ticket_idx = ticket["work_ticket_idx"]
         created_ticket_idxs.append(ticket_idx)
@@ -361,7 +368,8 @@ async def test_user_authoring_smoke_via_cli(
             "prep_sample_idx": prep_sample_idx,
         }
         assert status["action_context"] == {
-            "fastq_path": "/scratch/user-cli-smoke.fastq"
+            "fastq_path": fastq_fwd,
+            "reverse_fastq_path": fastq_rev,
         }
         # State may have advanced (or FAILED) as the background dispatch
         # raced against the dead orchestrator — assert only that it is a

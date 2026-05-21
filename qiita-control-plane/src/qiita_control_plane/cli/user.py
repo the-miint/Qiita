@@ -324,7 +324,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--pool-item-id",
         dest="sequenced_pool_item_id",
         required=True,
-        help="Per-pool unique item identifier (e.g., the well or library barcode)",
+        help=(
+            "Per-pool unique item identifier (a well position or library"
+            " barcode). MUST also be the filename prefix of every fastq this"
+            " sample's fastq-to-parquet ticket processes: the control plane"
+            " rejects a submission whose fastq basename does not start with"
+            " this value."
+        ),
     )
     p_seqsample_create.add_argument("--primary-study-idx", type=int, required=True)
     p_seqsample_create.add_argument(
@@ -389,8 +395,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--context-json",
         help=(
             "Action context as a JSON object (validated server-side against"
-            " the action's context_schema). For fastq-to-parquet:"
-            ' \'{"fastq_path": "/abs/path/sample.fastq"}\''
+            " the action's context_schema). For fastq-to-parquet, paired-end:"
+            ' \'{"fastq_path": "/abs/filename_prefix_R1.fastq",'
+            ' "reverse_fastq_path": "/abs/filename_prefix_R2.fastq"}\' — each'
+            " fastq basename must start with the sequenced-sample's"
+            " --pool-item-id."
         ),
     )
     p_ticket_submit.set_defaults(handler=_handle_ticket_submit)

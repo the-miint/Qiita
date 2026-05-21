@@ -228,6 +228,34 @@ async def prep_sample_idx(postgres_pool, admin_token):
     await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
 
 
+@pytest.fixture
+async def prep_sample_with_pool_item(postgres_pool, prep_sample_idx, admin_token):
+    """The shared sequenced prep_sample with its 1:1 sequenced_sample
+    subtype attached, carrying a known `sequenced_pool_item_id`. Returns
+    `(prep_sample_idx, sequenced_pool_item_id)`.
+
+    The bare `prep_sample_idx` fixture deliberately omits the subtype
+    row; this fixture adds the run -> pool -> sequenced_sample chain so
+    the work_ticket fastq-filename-prefix gate has a pool item id to
+    resolve. Teardown drops the subtype chain in reverse-FK order — it
+    runs before `prep_sample_idx`'s own teardown removes the supertype,
+    so the prep_sample DELETE there does not trip the subtype FK."""
+    from qiita_control_plane.testing.db_seeds import seed_sequenced_sample_subtype
+
+    _, admin_idx = admin_token
+    pool_item_id = f"wt-item-{uuid.uuid4()}"
+    run_idx, pool_idx, ss_idx = await seed_sequenced_sample_subtype(
+        postgres_pool,
+        prep_sample_idx=prep_sample_idx,
+        owner_idx=admin_idx,
+        sequenced_pool_item_id=pool_item_id,
+    )
+    yield prep_sample_idx, pool_item_id
+    await postgres_pool.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss_idx)
+    await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
+    await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
+
+
 _TEST_STEPS = [
     {
         "kind": "step",
@@ -948,6 +976,189 @@ async def test_submit_invalid_context_type_returns_422(
     errs = resp.json()["detail"]["errors"]
     paths = {e["path"] for e in errs}
     assert "/sample_count" in paths
+
+
+# ---------------------------------------------------------------------------
+# fastq filename-prefix gate: a fastq path in action_context must carry a
+# basename prefixed by the prep_sample's sequenced_pool_item_id.
+# ---------------------------------------------------------------------------
+
+
+async def test_submit_fastq_path_prefix_match_passes(
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item
+):
+    """fastq_path and reverse_fastq_path whose basenames both start with
+    the prep_sample's sequenced_pool_item_id clear the filename-prefix
+    gate → 202."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, pool_item_id = prep_sample_with_pool_item
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {
+                "fastq_path": f"/scratch/{pool_item_id}_R1.fastq",
+                "reverse_fastq_path": f"/scratch/{pool_item_id}_R2.fastq",
+            },
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
+
+
+async def test_submit_single_end_fastq_path_prefix_match_passes(
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item
+):
+    """Forward-only (single-end) submission stays valid: a lone fastq_path
+    with no reverse_fastq_path, basename prefixed by the
+    sequenced_pool_item_id, clears the gate → 202. The prefix rule fires
+    on the one read present rather than requiring a pair."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, pool_item_id = prep_sample_with_pool_item
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {"fastq_path": f"/scratch/{pool_item_id}.fastq"},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
+
+
+async def test_submit_fastq_path_prefix_mismatch_returns_422(
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item
+):
+    """A fastq_path whose basename does not start with the prep_sample's
+    sequenced_pool_item_id is rejected with 422; the detail names the
+    pool item id and the offending path."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, pool_item_id = prep_sample_with_pool_item
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {"fastq_path": "/scratch/wrong-prefix_R1.fastq"},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert "sequenced_pool_item_id" in detail["reason"]
+    assert detail["sequenced_pool_item_id"] == pool_item_id
+    assert len(detail["mismatched"]) == 1
+    assert detail["mismatched"][0]["context_key"] == "fastq_path"
+    assert detail["mismatched"][0]["basename"] == "wrong-prefix_R1.fastq"
+
+
+async def test_submit_fastq_path_prefix_segment_anchored(
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item
+):
+    """The gate is segment-anchored, not a bare substring match: a
+    basename carrying the pool item id followed straight by another
+    character — no `_`/`.` separator — is rejected (422). `<id>9_R1.fastq`
+    must not pass for pool item id `<id>`."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, pool_item_id = prep_sample_with_pool_item
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {"fastq_path": f"/scratch/{pool_item_id}9_R1.fastq"},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["mismatched"][0]["context_key"] == "fastq_path"
+
+
+async def test_submit_reverse_fastq_path_prefix_checked(
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item
+):
+    """The gate covers reverse_fastq_path too: a matching fastq_path
+    paired with a mismatched reverse_fastq_path still 422s, and the
+    detail flags only the reverse key."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, pool_item_id = prep_sample_with_pool_item
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {
+                "fastq_path": f"/scratch/{pool_item_id}_R1.fastq",
+                "reverse_fastq_path": "/scratch/other-sample_R2.fastq",
+            },
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422, resp.text
+    mismatched = resp.json()["detail"]["mismatched"]
+    assert [m["context_key"] for m in mismatched] == ["reverse_fastq_path"]
+
+
+async def test_submit_fastq_path_prefix_skipped_without_pool_item(
+    wt_client, admin_token, prep_sample_action, prep_sample_idx
+):
+    """When the prep_sample has no sequenced_sample subtype row (hence no
+    sequenced_pool_item_id), the filename-prefix gate is vacuous and
+    skipped — any fastq_path passes. Uses the bare `prep_sample_idx`
+    fixture, which deliberately omits the subtype row."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {"fastq_path": "/scratch/anything-goes_R1.fastq"},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
+
+
+async def test_submit_non_string_fastq_path_skipped(
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item
+):
+    """A non-string value under fastq_path is not a path: the gate's
+    isinstance guard skips it rather than 422-ing. For fastq-to-parquet
+    proper, context_schema would 422 a non-string upstream — this pins
+    the defense-in-depth branch for a permissive-schema action
+    (prep_sample_action carries context_schema={})."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, _ = prep_sample_with_pool_item
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {"fastq_path": 123},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
 
 
 async def test_submit_503_when_compute_backend_unconfigured(
