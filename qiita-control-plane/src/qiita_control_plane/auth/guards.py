@@ -343,6 +343,8 @@ async def require_caller_has_admin_on_all_studies(
             pool_or_conn, principal_idx=caller.principal_idx, study_idx=study_idx
         )
         if row is None:
+            # Study does not exist — not this gate's job to 404. The
+            # composer's INSERT trips the FK and surfaces one 422.
             continue
         if row.owner_idx == caller.principal_idx:
             continue

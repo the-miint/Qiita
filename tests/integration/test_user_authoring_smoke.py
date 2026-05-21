@@ -1,11 +1,12 @@
-"""End-to-end smoke test: a regular USER walks the full authoring CLI
+"""End-to-end smoke test: a regular USER walks the full authoring
 flow against an in-process control plane.
 
-Pins the Phase 2.b / 2.c widening: a non-admin user with the standard
-USER role ceiling can stand up a study, biosample, sequencing-run,
-sequenced-pool, sequenced-sample, then submit a fastq-to-parquet
-work-ticket and read it back via GET. Each step exercises the new
-per-resource auth gate (owner / caller-creator / per-study ADMIN).
+A non-admin user with the standard USER role ceiling stands up a
+study, biosample, sequencing-run, sequenced-pool, sequenced-sample,
+then submits a fastq-to-parquet work-ticket and reads it back via GET.
+Each step exercises a per-resource auth gate (owner / caller-creator /
+per-study ADMIN) — the regression guard against any of those gates
+silently reverting to a blanket role check.
 
 Dispatch is short-circuited at the schedule_dispatch entry point —
 this test verifies the AUTH path end-to-end, not the orchestrator

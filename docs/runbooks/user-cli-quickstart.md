@@ -1,14 +1,16 @@
 # User CLI quickstart
 
-> End-to-end walkthrough for a regular `user`-role principal: log in,
+> End-to-end walkthrough of the `user`-role authoring flow: log in,
 > author a study, register sequencing data, and submit a
 > `fastq-to-parquet` work-ticket — no `wet_lab_admin` or `system_admin`
 > in the loop.
 
-Phase 2.b widened the USER role's scope ceiling and replaced the
-wet_lab_admin role gate on every authoring route with a per-resource
-auth predicate that the study owner / pool creator can clear directly.
-This runbook is the operator-facing manifest of that flow.
+Two audiences: an operator runs these steps as a post-deploy smoke
+([`first-deploy.md`](first-deploy.md) Step 12 links here), and a user
+follows them as the reference for the authoring CLI. Every authoring
+route gates on a per-resource auth predicate — study owner, run/pool
+creator, or per-study `ADMIN` tier — rather than a blanket
+`wet_lab_admin` role check; each step below names the gate it clears.
 
 ## Prerequisites
 
@@ -85,9 +87,10 @@ study owner (owner-bypass) regardless of `study_access` row, so the
 study you just created passes immediately. `--owner-idx` defaults to
 your own principal via `whoami` if omitted.
 
-To add a biosample you don't own to a study someone else owns, the
-study owner must grant you `ADMIN` tier via `qiita-admin
-study-access` first.
+To add a biosample to a study you don't own, you need an
+`ADMIN`-tier `qiita.study_access` row on that study. There is no
+self-service grant flow yet — an operator inserts the row directly
+(see the limitations section at the end).
 
 ## 4. Create a sequencing run
 
@@ -125,17 +128,17 @@ qiita sequenced-sample create \
     --pool-idx $POOL_IDX \
     --biosample-idx $BIOSAMPLE_IDX \
     --prep-protocol-idx $PROTOCOL_IDX \
-    --sequenced-pool-item-id ITEM-1 \
+    --pool-item-id ITEM-1 \
     --primary-study-idx $STUDY_IDX
 ```
 
 Auth paths:
 
 - `require_caller_owns_pool()` — you created the pool in step 5.
-- `require_caller_has_admin_on_all_studies` over
-  `primary_study_idx + secondary_study_idxs` — you own the primary
-  study by owner-bypass; add any secondary study you also have ADMIN
-  on via `--secondary-study-idxs`.
+- `require_caller_has_admin_on_all_studies` over the primary study
+  plus every secondary — you own the primary study by owner-bypass.
+  Add a secondary study you also have ADMIN on with
+  `--secondary-study-idx STUDY_IDX` (repeat the flag for several).
 
 The response carries both `prep_sample_idx` (the supertype) and
 `sequenced_sample_idx` (the subtype); the work-ticket step uses
@@ -155,7 +158,7 @@ qiita ticket submit \
     --context-json '{"fastq_path": "/scratch/myfile.fastq"}'
 ```
 
-Phase 2.c widened the action's audience to admit `user`; the route
+The `fastq-to-parquet` action's audience admits `user`; the route
 applies a per-study ADMIN check over every non-retired
 `prep_sample_to_study` link (your primary study passes via
 owner-bypass). Response: 202 with `work_ticket_idx` and the initial
@@ -196,9 +199,13 @@ orchestrator logs.
 
 ## What this flow does NOT cover
 
-- **Cross-study sample ownership.** If you want to attach a sample to
-  a study you do not own at ADMIN tier, the study owner must grant
-  you access via `qiita-admin study-access` first.
+- **Cross-study access grants.** Attaching a biosample or sample to a
+  study you do not own requires an `ADMIN`-tier `qiita.study_access`
+  row on that study. No CLI or API surface issues those grants today:
+  an operator inserts the row with a direct
+  `INSERT INTO qiita.study_access (study_idx, principal_idx,
+  access_tier, granted_by_idx)` against the database. A self-service
+  grant flow is future work.
 - **Reference-data authoring.** `reference:write` is wet_lab_admin+;
   end-users consume references but do not author them.
 - **Service-account flows.** End-user PATs do not carry
