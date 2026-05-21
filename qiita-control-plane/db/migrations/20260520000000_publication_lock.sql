@@ -44,39 +44,20 @@
 -- trigger here without a session-var bypass would break every test that
 -- seeds a prep_sample.
 --
--- No system_admin / wet_lab_admin bypass is wired in this migration. If
--- future operations need to mutate published data, the right shape is a
--- session-scoped GUC (set_config('qiita.bypass_publication_lock', 'on',
--- TRUE)) that each lock trigger checks first; deferred until an actual
--- humans-facing PATCH endpoint requires it. The current PATCH routes
--- are admin-only and out of scope here.
-
-
--- =============================================================================
--- IS_PUBLISHED COLUMN
--- =============================================================================
-
-ALTER TABLE qiita.prep_sample_to_study
-    ADD COLUMN is_published BOOLEAN NOT NULL DEFAULT FALSE;
-
-COMMENT ON COLUMN qiita.prep_sample_to_study.is_published IS
-    'TRUE when this (prep_sample, study) link is part of the public record. '
-    'Set by the ENA-accession cascade triggers (on sequenced_sample or '
-    'biosample going NULL -> non-NULL on any ENA accession) or by a future '
-    'owner-driven publish action. Once TRUE, the link itself plus the '
-    'prep_sample, its 1:1 sequenced_sample subtype, its prep_sample_metadata '
-    'rows, the underlying biosample, its metadata, and its biosample_to_study '
-    'links are frozen against UPDATE via the publication_lock_* trigger '
-    'family. Distinct from prep_sample_to_study.retired: retirement removes '
-    'a study''s permission to use a prep; is_published locks the prep''s '
-    'shape because its bytes are out in the world.';
-
--- Partial index for the lock-trigger lookup; the EXISTS query only cares
--- about published rows, so the partial index keeps the working set small
--- as published rows accumulate.
-CREATE INDEX prep_sample_to_study_published_idx
-    ON qiita.prep_sample_to_study (prep_sample_idx)
-    WHERE is_published = TRUE;
+-- TRIPWIRE — no system_admin / wet_lab_admin bypass is wired in this
+-- migration. If future operations need to mutate published data, the
+-- right shape is a session-scoped GUC (set_config(
+-- 'qiita.bypass_publication_lock', 'on', TRUE)) that each lock trigger
+-- checks first. There are SEVEN lock triggers (publication_lock_*
+-- below); a GUC implementer must add the bypass check to EVERY one or
+-- the lock becomes selectively porous. The COMMENT ON TRIGGER strings
+-- at the bottom of this file repeat this note so a `\d+` reader sees
+-- it. Deferred until an actual humans-facing PATCH endpoint requires
+-- it; the current PATCH routes are admin-only and out of scope here.
+--
+-- The is_published column itself lives in the prep_sample_to_study
+-- CREATE TABLE (20260501000011_prep_sample.sql), not here — this
+-- migration owns only the cascade + lock trigger behavior over it.
 
 
 -- =============================================================================
@@ -313,6 +294,43 @@ CREATE TRIGGER biosample_to_study_publication_lock
 -- existing test that seeds a prep_sample.
 
 
+-- =============================================================================
+-- TRIGGER COMMENTS
+-- =============================================================================
+-- Surfaced via `\d+ <table>` / pg_description so the publication-lock
+-- policy is visible from the catalog, not only by reading this file.
+
+COMMENT ON TRIGGER sequenced_sample_cascade_publish ON qiita.sequenced_sample IS
+    'Cascade: when an ENA experiment/run accession goes NULL -> set, flips '
+    'is_published = TRUE on every prep_sample_to_study link of the prep.';
+COMMENT ON TRIGGER biosample_cascade_publish ON qiita.biosample IS
+    'Cascade: when ena_sample_accession goes NULL -> set, flips '
+    'is_published = TRUE on every prep_sample_to_study link of every prep '
+    'that references this biosample.';
+
+COMMENT ON TRIGGER prep_sample_publication_lock ON qiita.prep_sample IS
+    'Publication lock: rejects UPDATE when the prep has any published link. '
+    'TRIPWIRE: a qiita.bypass_publication_lock GUC must be checked here too.';
+COMMENT ON TRIGGER sequenced_sample_publication_lock ON qiita.sequenced_sample IS
+    'Publication lock: rejects UPDATE when the parent prep is published. '
+    'TRIPWIRE: a qiita.bypass_publication_lock GUC must be checked here too.';
+COMMENT ON TRIGGER prep_sample_metadata_publication_lock ON qiita.prep_sample_metadata IS
+    'Publication lock: rejects UPDATE when the owning prep is published. '
+    'TRIPWIRE: a qiita.bypass_publication_lock GUC must be checked here too.';
+COMMENT ON TRIGGER prep_sample_to_study_publication_lock ON qiita.prep_sample_to_study IS
+    'Publication lock: rejects UPDATE of a published link (retire/unpublish). '
+    'TRIPWIRE: a qiita.bypass_publication_lock GUC must be checked here too.';
+COMMENT ON TRIGGER biosample_publication_lock ON qiita.biosample IS
+    'Publication lock: rejects UPDATE when the biosample reaches a published prep. '
+    'TRIPWIRE: a qiita.bypass_publication_lock GUC must be checked here too.';
+COMMENT ON TRIGGER biosample_metadata_publication_lock ON qiita.biosample_metadata IS
+    'Publication lock: rejects UPDATE when the biosample reaches a published prep. '
+    'TRIPWIRE: a qiita.bypass_publication_lock GUC must be checked here too.';
+COMMENT ON TRIGGER biosample_to_study_publication_lock ON qiita.biosample_to_study IS
+    'Publication lock: rejects UPDATE when the biosample reaches a published prep. '
+    'TRIPWIRE: a qiita.bypass_publication_lock GUC must be checked here too.';
+
+
 -- migrate:down
 
 DROP TRIGGER IF EXISTS biosample_to_study_publication_lock ON qiita.biosample_to_study;
@@ -337,5 +355,6 @@ DROP FUNCTION IF EXISTS qiita.cascade_publish_from_sequenced_sample_ena();
 DROP FUNCTION IF EXISTS qiita.is_biosample_reaching_published_prep(BIGINT);
 DROP FUNCTION IF EXISTS qiita.is_prep_sample_published(BIGINT);
 
-DROP INDEX IF EXISTS qiita.prep_sample_to_study_published_idx;
-ALTER TABLE qiita.prep_sample_to_study DROP COLUMN IF EXISTS is_published;
+-- The is_published column and its partial index are owned by
+-- 20260501000011_prep_sample.sql (folded into the CREATE TABLE); this
+-- migration's down step drops only the trigger + function behavior.

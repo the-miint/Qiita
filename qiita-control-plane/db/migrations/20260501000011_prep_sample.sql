@@ -118,6 +118,11 @@ CREATE TABLE qiita.prep_sample_to_study (
     retired_by_idx        BIGINT REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
     retired_at            TIMESTAMPTZ,
     retire_reason         TEXT,
+    -- Publication-lock flag. The cascade + lock triggers that act on it
+    -- are defined in 20260520000000_publication_lock.sql; the column
+    -- lives here so prep_sample_to_study has a single CREATE-TABLE
+    -- source of truth.
+    is_published          BOOLEAN NOT NULL DEFAULT false,
 
     PRIMARY KEY (prep_sample_idx, study_idx),
 
@@ -145,6 +150,19 @@ COMMENT ON COLUMN qiita.prep_sample_to_study.retired IS
     'Distinct from prep_sample.retired, which withdraws the sample '
     'everywhere.';
 
+COMMENT ON COLUMN qiita.prep_sample_to_study.is_published IS
+    'TRUE when this (prep_sample, study) link is part of the public record. '
+    'Set by the ENA-accession cascade triggers (on sequenced_sample or '
+    'biosample going NULL -> non-NULL on any ENA accession) or by a future '
+    'owner-driven publish action. Once TRUE, the link itself plus the '
+    'prep_sample, its 1:1 sequenced_sample subtype, its prep_sample_metadata '
+    'rows, the underlying biosample, its metadata, and its biosample_to_study '
+    'links are frozen against UPDATE via the publication_lock_* trigger '
+    'family (see 20260520000000_publication_lock.sql). Distinct from '
+    'prep_sample_to_study.retired: retirement removes a study''s permission '
+    'to use a prep; is_published locks the prep''s shape because its bytes '
+    'are out in the world.';
+
 CREATE INDEX prep_sample_to_study_study_idx
     ON qiita.prep_sample_to_study (study_idx);
 -- study_idx-leading (mirrors biosample_to_study_active_idx): serves the
@@ -154,6 +172,14 @@ CREATE INDEX prep_sample_to_study_study_idx
 CREATE INDEX prep_sample_to_study_active_idx
     ON qiita.prep_sample_to_study (study_idx, prep_sample_idx)
     WHERE retired = false;
+-- Partial index for the publication-lock trigger lookup
+-- (qiita.is_prep_sample_published, defined in the publication-lock
+-- migration). The EXISTS probe only cares about published rows, so the
+-- partial predicate keeps the working set small as published rows
+-- accumulate.
+CREATE INDEX prep_sample_to_study_published_idx
+    ON qiita.prep_sample_to_study (prep_sample_idx)
+    WHERE is_published = true;
 
 
 -- =============================================================================

@@ -217,6 +217,7 @@ orchestrator logs.
 ## Smoke-testing this flow
 
 The integration test `tests/integration/test_user_authoring_smoke.py`
-walks steps 2–8 end-to-end against an in-process control plane,
-exercising every per-resource auth gate. Run it via
-`make test-integration`.
+walks steps 2–8 end-to-end: it stands up a real control-plane server
+and shells out to the actual `qiita` CLI for every command, so the
+flag names in this runbook are mechanically pinned against argparse
+drift. Run it via `make test-integration`.

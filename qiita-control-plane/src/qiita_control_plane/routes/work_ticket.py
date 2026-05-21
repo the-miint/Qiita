@@ -262,18 +262,23 @@ async def _check_prep_sample_study_access(
     pool: asyncpg.Pool, *, prep_sample_idx: int, caller: Principal
 ) -> None:
     """Require Tier.ADMIN (or owner / wet_lab_admin+) on every non-retired
-    study link of this prep_sample. Skipped for ServiceAccount (no
-    prep_sample-scoped action admits service accounts today) and
-    bypass-role callers without a DB read. An orphaned prep_sample (all
-    links retired) passes — downstream lookups fail elsewhere.
+    study link of this prep_sample. Bypass-role callers skip the DB read.
+    An orphaned prep_sample (all links retired) passes — downstream
+    lookups fail elsewhere.
+
+    No service-account special-case: a service account holds no
+    study_access rows, so `require_caller_has_admin_on_all_studies`
+    rejects it on the first linked study with a 403. For every
+    prep_sample-scoped action today the action's audience already
+    excludes service accounts, so this gate never sees one — but the
+    natural rejection means an action that later opens itself to
+    service accounts does not silently bypass the per-study check.
 
     Policy is "caller had access at submit time"; this read runs on the
     pool, not the work_ticket INSERT transaction, so a study_access row
     racing with the gate decides arbitrarily. Future per-resource gates
     on other scope kinds are expected to follow the same shape.
     """
-    if isinstance(caller, ServiceAccount):
-        return
     if caller.has_role_at_least(SystemRole.WET_LAB_ADMIN):
         return
     study_idxs = await fetch_active_study_idxs_for_prep_sample(pool, prep_sample_idx)

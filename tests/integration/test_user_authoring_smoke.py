@@ -1,27 +1,38 @@
-"""End-to-end smoke test: a regular USER walks the full authoring
-flow against an in-process control plane.
+"""End-to-end smoke test: a regular USER walks the full authoring flow
+by invoking the real `qiita` CLI against a live control-plane server.
 
-A non-admin user with the standard USER role ceiling stands up a
+A uvicorn subprocess serves the control-plane app against the test
+Postgres; the test shells out to `qiita <subcommand>` for every step —
 study, biosample, sequencing-run, sequenced-pool, sequenced-sample,
-then submits a fastq-to-parquet work-ticket and reads it back via GET.
-Each step exercises a per-resource auth gate (owner / caller-creator /
-per-study ADMIN) — the regression guard against any of those gates
+fastq-to-parquet ticket submit, ticket status. Driving the actual CLI
+(not raw HTTP) also pins the flag names documented in
+docs/runbooks/user-cli-quickstart.md against argparse drift.
+
+Each step clears a per-resource auth gate (study owner / run-or-pool
+creator / per-study ADMIN) — the regression guard against any gate
 silently reverting to a blanket role check.
 
-Dispatch is short-circuited at the schedule_dispatch entry point —
-this test verifies the AUTH path end-to-end, not the orchestrator
-execution. The reference-add smoke covers full-pipeline execution.
+The control plane dispatches the submitted ticket to a compute
+orchestrator that is deliberately unreachable here: this test verifies
+the auth + CLI surface, not workflow execution (the reference-add
+smoke covers full-pipeline execution). The ticket-status assertion is
+therefore permissive on `state`.
 """
 
+import base64
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
 import uuid
 from pathlib import Path
 
 import httpx
 import pytest
-from httpx import ASGITransport
 
-from qiita_control_plane.config import Settings as CPSettings
-from qiita_control_plane.main import app as cp_app
+from qiita_control_plane.testing.postgres import resolve_postgres_url
 
 _FASTQ_TO_PARQUET_YAML_PATH = (
     Path(__file__).parent.parent.parent
@@ -30,24 +41,90 @@ _FASTQ_TO_PARQUET_YAML_PATH = (
     / "1.0.0.yaml"
 )
 
+# Every WorkTicketState value — the ticket-status assertion accepts any
+# of them because the background dispatch (against a dead orchestrator)
+# races with the read.
+_WORK_TICKET_STATES = {"pending", "queued", "processing", "completed", "failed"}
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
 
 @pytest.fixture
-async def cp_app_with_pool(postgres_pool, hmac_secret):
-    """Wire the CP FastAPI app to the integration postgres pool +
-    settings so its routes work in-process under ASGITransport. Mirrors
-    `test_sequence_range_e2e.cp_app_with_pool`."""
-    cp_app.state.pool = postgres_pool
-    cp_app.state.settings = CPSettings(
-        database_url="unused-in-test",
-        hmac_secret_key=hmac_secret,
-        data_plane_url="grpc://unused:0",
+def cp_server(tmp_path, hmac_secret):
+    """Spawn the control-plane app under uvicorn against the test
+    Postgres; yield its base URL.
+
+    `COMPUTE_ORCHESTRATOR_URL` points at a dead port so the
+    work-ticket POST's compute-backend guard passes (it only checks the
+    client is non-None) while the background dispatch simply fails —
+    irrelevant to what this test pins. The CP→CO token file must exist
+    on disk because `ComputeBackendClient.__init__` reads it eagerly,
+    so the fixture writes a dummy one.
+    """
+    port = _free_port()
+    token_file = tmp_path / "cp-to-co.token"
+    token_file.write_text("unused-dispatch-token")
+    env = {
+        **os.environ,
+        "DATABASE_URL": resolve_postgres_url(),
+        "HMAC_SECRET_KEY": base64.b64encode(hmac_secret).decode(),
+        "COMPUTE_ORCHESTRATOR_URL": "http://127.0.0.1:1",
+        "CP_TO_CO_TOKEN_PATH": str(token_file),
+    }
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "qiita_control_plane.main:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--log-level",
+            "warning",
+        ],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
-    # compute_backend_client is None by default; the work-ticket POST
-    # gates on it via `_require_compute_backend_client` (503 otherwise).
-    # A truthy stand-in is enough — schedule_dispatch is patched below.
-    cp_app.state.compute_backend_client = object()
-    cp_app.state.running_dispatches = set()
-    yield cp_app
+    base_url = f"http://127.0.0.1:{port}"
+
+    def _fail(reason: str) -> None:
+        proc.terminate()
+        out, err = proc.communicate(timeout=5)
+        pytest.fail(
+            f"{reason}\nstdout: {out.decode()[:2000]}\nstderr: {err.decode()[:2000]}"
+        )
+
+    deadline = time.monotonic() + 20.0
+    healthy = False
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            _fail(f"cp server exited during startup (rc={proc.returncode})")
+        try:
+            resp = httpx.get(f"{base_url}/health", timeout=1.0)
+            if resp.status_code == 200 and resp.json().get("status") == "ok":
+                healthy = True
+                break
+        except httpx.HTTPError:
+            pass
+        time.sleep(0.25)
+    if not healthy:
+        _fail("cp server did not become healthy within 20s")
+
+    yield base_url
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
 
 
 @pytest.fixture
@@ -85,43 +162,57 @@ async def synced_fastq_to_parquet_action(postgres_pool, tmp_path):
     )
 
 
+def _run_cli(base_url: str, token: str, *args: str) -> dict:
+    """Invoke `qiita <args>` as a subprocess via `python -m`; assert exit
+    0; parse the JSON the CLI prints to stdout on success. The PAT is
+    handed over through the QIITA_TOKEN env var the CLI reads."""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "qiita_control_plane.cli.user",
+            "--base-url",
+            base_url,
+            *args,
+        ],
+        env={**os.environ, "QIITA_TOKEN": token},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, (
+        f"`qiita {' '.join(args)}` failed (rc={result.returncode})\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    return json.loads(result.stdout)
+
+
 async def _fetch_prep_protocol_idx(
     postgres_pool, name: str = "short_read_metagenomics"
 ) -> int:
     """The standard prep_protocol seeded by migrations is referenced by
-    name from the route body; tests resolve by lookup so a renumber on
-    the seed doesn't fan out to every fixture."""
+    name from the CLI flag; tests resolve by lookup so a renumber on the
+    seed doesn't fan out to every fixture."""
     return await postgres_pool.fetchval(
         "SELECT idx FROM qiita.prep_protocol WHERE name = $1", name
     )
 
 
-async def test_user_authoring_smoke_end_to_end(
-    monkeypatch,
+async def test_user_authoring_smoke_via_cli(
     postgres_pool,
-    cp_app_with_pool,
+    cp_server,
     synced_fastq_to_parquet_action,
     regular_user_session,
 ):
-    """As a plain USER (not admin), walk study → biosample → run → pool →
-    sample → work-ticket submit → work-ticket read-back. Each step must
-    return 2xx and the per-resource gate it composes must let the USER
-    through under owner / caller-creator / admin-tier semantics. Final
-    GET must report the USER as the originator and PENDING as state.
+    """As a plain USER (not admin), drive the real `qiita` CLI through
+    study → biosample → run → pool → sample → work-ticket submit →
+    work-ticket status. Every command must exit 0; each clears the
+    per-resource auth gate it composes. Final `ticket status` must
+    report the USER as originator.
     """
-    # Stop the background dispatch from touching an orchestrator — every
-    # work-ticket POST schedules one on app.state. We assert ticket state
-    # is PENDING right after submit, so the dispatch is a no-op for this
-    # test's purposes.
-    monkeypatch.setattr(
-        "qiita_control_plane.routes.work_ticket.schedule_dispatch",
-        lambda _app, _idx: None,
-    )
-
     action_id, action_version = synced_fastq_to_parquet_action
     user_token = regular_user_session["token"]
     user_idx = regular_user_session["principal_idx"]
-    headers = {"Authorization": f"Bearer {user_token}"}
 
     created_ticket_idxs: list[int] = []
     created_prep_sample_idxs: list[int] = []
@@ -130,182 +221,194 @@ async def test_user_authoring_smoke_end_to_end(
     created_biosample_idxs: list[int] = []
     created_study_idxs: list[int] = []
 
-    transport = ASGITransport(app=cp_app_with_pool)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        try:
-            # 1. POST /study — USER owns the new study (owner_idx defaults
-            #    to caller server-side); satisfies the owner-bypass on every
-            #    downstream require_study_access call.
-            r = await client.post(
-                "/api/v1/study",
-                json={"title": f"user-smoke-{uuid.uuid4()}"},
-                headers=headers,
-            )
-            assert r.status_code == 201, r.text
-            study_idx = r.json()["study_idx"]
-            created_study_idxs.append(study_idx)
+    try:
+        # 1. study create — USER owns the new study; satisfies the
+        #    owner-bypass on every downstream require_study_access.
+        study = _run_cli(
+            cp_server,
+            user_token,
+            "study",
+            "create",
+            "--title",
+            f"user-cli-smoke-{uuid.uuid4()}",
+        )
+        study_idx = study["study_idx"]
+        created_study_idxs.append(study_idx)
 
-            # 2. POST /study/{idx}/biosample — owner-bypass on
-            #    require_study_access(min_tier=ADMIN) admits the study owner.
-            r = await client.post(
-                f"/api/v1/study/{study_idx}/biosample",
-                json={
-                    "owner_idx": user_idx,
-                    "owner_biosample_id_field_name": "sample_name",
-                    "owner_biosample_id_value": "USER-SMOKE-1",
-                },
-                headers=headers,
-            )
-            assert r.status_code == 201, r.text
-            biosample_idx = r.json()["biosample_idx"]
-            created_biosample_idxs.append(biosample_idx)
+        # 2. biosample create — owner-bypass on
+        #    require_study_access(min_tier=ADMIN); --owner-idx omitted so
+        #    the CLI resolves it via whoami.
+        biosample = _run_cli(
+            cp_server,
+            user_token,
+            "biosample",
+            "create",
+            "--study-idx",
+            str(study_idx),
+            "--owner-biosample-id-field-name",
+            "sample_name",
+            "--owner-biosample-id-value",
+            "USER-CLI-SMOKE-1",
+        )
+        biosample_idx = biosample["biosample_idx"]
+        created_biosample_idxs.append(biosample_idx)
 
-            # 3. POST /sequencing-run — no role/tier gate; any USER with
-            #    PREP_SAMPLE_WRITE can stand up a run.
-            r = await client.post(
-                "/api/v1/sequencing-run",
-                json={
-                    "instrument_run_id": f"USER-SMOKE-{uuid.uuid4()}",
-                    "platform": "illumina",
-                },
-                headers=headers,
-            )
-            assert r.status_code == 201, r.text
-            run_idx = r.json()["sequencing_run_idx"]
-            created_sequencing_run_idxs.append(run_idx)
+        # 3. sequencing-run create — no role/tier gate.
+        run = _run_cli(
+            cp_server,
+            user_token,
+            "sequencing-run",
+            "create",
+            "--instrument-run-id",
+            f"USER-CLI-SMOKE-{uuid.uuid4()}",
+            "--platform",
+            "illumina",
+        )
+        run_idx = run["sequencing_run_idx"]
+        created_sequencing_run_idxs.append(run_idx)
 
-            # 4. POST /sequencing-run/{r}/sequenced-pool — passes
-            #    require_caller_owns_run because the user just created the run.
-            r = await client.post(
-                f"/api/v1/sequencing-run/{run_idx}/sequenced-pool",
-                json={},
-                headers=headers,
-            )
-            assert r.status_code == 201, r.text
-            pool_idx = r.json()["sequenced_pool_idx"]
-            created_sequenced_pool_idxs.append(pool_idx)
+        # 4. sequenced-pool create — require_caller_owns_run (USER created
+        #    the run in step 3).
+        pool = _run_cli(
+            cp_server,
+            user_token,
+            "sequenced-pool",
+            "create",
+            "--run-idx",
+            str(run_idx),
+        )
+        pool_idx = pool["sequenced_pool_idx"]
+        created_sequenced_pool_idxs.append(pool_idx)
 
-            # 5. POST /sequencing-run/{r}/sequenced-pool/{p}/sequenced-sample
-            #    — passes require_caller_owns_pool (user created the pool)
-            #    AND require_caller_has_admin_on_all_studies (user owns
-            #    primary study by owner-bypass).
-            protocol_idx = await _fetch_prep_protocol_idx(postgres_pool)
-            r = await client.post(
-                f"/api/v1/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample",
-                json={
-                    "biosample_idx": biosample_idx,
-                    "prep_protocol_idx": protocol_idx,
-                    "owner_idx": user_idx,
-                    "sequenced_pool_item_id": f"ITEM-{uuid.uuid4()}",
-                    "primary_study_idx": study_idx,
-                },
-                headers=headers,
-            )
-            assert r.status_code == 201, r.text
-            prep_sample_idx = r.json()["prep_sample_idx"]
-            created_prep_sample_idxs.append(prep_sample_idx)
+        # 5. sequenced-sample create — require_caller_owns_pool +
+        #    require_caller_has_admin_on_all_studies (owner-bypass on the
+        #    primary study).
+        protocol_idx = await _fetch_prep_protocol_idx(postgres_pool)
+        sample = _run_cli(
+            cp_server,
+            user_token,
+            "sequenced-sample",
+            "create",
+            "--run-idx",
+            str(run_idx),
+            "--pool-idx",
+            str(pool_idx),
+            "--biosample-idx",
+            str(biosample_idx),
+            "--prep-protocol-idx",
+            str(protocol_idx),
+            "--pool-item-id",
+            f"ITEM-{uuid.uuid4()}",
+            "--primary-study-idx",
+            str(study_idx),
+        )
+        prep_sample_idx = sample["prep_sample_idx"]
+        created_prep_sample_idxs.append(prep_sample_idx)
 
-            # 6. POST /work-ticket — fastq-to-parquet, prep_sample-scoped.
-            #    audience admits USER; per-study ADMIN check passes via
-            #    owner-bypass on the prep_sample's one non-retired study link.
-            r = await client.post(
-                "/api/v1/work-ticket",
-                json={
-                    "action_id": action_id,
-                    "action_version": action_version,
-                    "scope_target": {
-                        "kind": "prep_sample",
-                        "prep_sample_idx": prep_sample_idx,
-                    },
-                    "action_context": {"fastq_path": "/scratch/user-smoke.fastq"},
-                },
-                headers=headers,
-            )
-            assert r.status_code == 202, r.text
-            ticket_idx = r.json()["work_ticket_idx"]
-            created_ticket_idxs.append(ticket_idx)
+        # 6. ticket submit — fastq-to-parquet, prep_sample-scoped. The
+        #    audience admits USER; the per-study ADMIN check passes via
+        #    owner-bypass.
+        ticket = _run_cli(
+            cp_server,
+            user_token,
+            "ticket",
+            "submit",
+            "--action-id",
+            action_id,
+            "--action-version",
+            action_version,
+            "--prep-sample-idx",
+            str(prep_sample_idx),
+            "--context-json",
+            '{"fastq_path": "/scratch/user-cli-smoke.fastq"}',
+        )
+        ticket_idx = ticket["work_ticket_idx"]
+        created_ticket_idxs.append(ticket_idx)
+        # The POST response always reports PENDING regardless of dispatch.
+        assert ticket["state"] == "pending"
 
-            # 7. GET /work-ticket/{idx} — originator-bypass; full record back.
-            r = await client.get(
-                f"/api/v1/work-ticket/{ticket_idx}",
-                headers=headers,
+        # 7. ticket status — originator-bypass; full WorkTicket record.
+        status = _run_cli(
+            cp_server,
+            user_token,
+            "ticket",
+            "status",
+            str(ticket_idx),
+        )
+        assert status["work_ticket_idx"] == ticket_idx
+        assert status["originator_principal_idx"] == user_idx
+        assert status["scope_target"] == {
+            "kind": "prep_sample",
+            "prep_sample_idx": prep_sample_idx,
+        }
+        assert status["action_context"] == {
+            "fastq_path": "/scratch/user-cli-smoke.fastq"
+        }
+        # State may have advanced (or FAILED) as the background dispatch
+        # raced against the dead orchestrator — assert only that it is a
+        # valid WorkTicketState.
+        assert status["state"] in _WORK_TICKET_STATES
+    finally:
+        # FK-reverse cleanup of every row the flow created. The server
+        # committed these to the shared test DB; teardown runs them
+        # through the test's own pool.
+        if created_ticket_idxs:
+            await postgres_pool.execute(
+                "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
+                created_ticket_idxs,
             )
-            assert r.status_code == 200, r.text
-            body = r.json()
-            assert body["work_ticket_idx"] == ticket_idx
-            assert body["originator_principal_idx"] == user_idx
-            assert body["state"] == "pending"
-            assert body["scope_target"] == {
-                "kind": "prep_sample",
-                "prep_sample_idx": prep_sample_idx,
-            }
-            assert body["action_context"] == {"fastq_path": "/scratch/user-smoke.fastq"}
-        finally:
-            # FK-reverse cleanup of every row the test created. Order:
-            # work_ticket → sequenced_sample → prep_sample → links →
-            # sequenced_pool → sequencing_run → biosample_to_study →
-            # biosample → study_access → study. The
-            # biosample_metadata + biosample_study_field for the owner-id
-            # field are cleaned up by RESTRICT-walking the biosample.
-            if created_ticket_idxs:
-                await postgres_pool.execute(
-                    "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
-                    created_ticket_idxs,
-                )
-            if created_prep_sample_idxs:
-                await postgres_pool.execute(
-                    "DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = ANY($1::bigint[])",
-                    created_prep_sample_idxs,
-                )
-                await postgres_pool.execute(
-                    "DELETE FROM qiita.prep_sample_metadata"
-                    " WHERE prep_sample_idx = ANY($1::bigint[])",
-                    created_prep_sample_idxs,
-                )
-                await postgres_pool.execute(
-                    "DELETE FROM qiita.prep_sample_to_study"
-                    " WHERE prep_sample_idx = ANY($1::bigint[])",
-                    created_prep_sample_idxs,
-                )
-                await postgres_pool.execute(
-                    "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])",
-                    created_prep_sample_idxs,
-                )
-            if created_sequenced_pool_idxs:
-                await postgres_pool.execute(
-                    "DELETE FROM qiita.sequenced_pool WHERE idx = ANY($1::bigint[])",
-                    created_sequenced_pool_idxs,
-                )
-            if created_sequencing_run_idxs:
-                await postgres_pool.execute(
-                    "DELETE FROM qiita.sequencing_run WHERE idx = ANY($1::bigint[])",
-                    created_sequencing_run_idxs,
-                )
-            if created_biosample_idxs:
-                await postgres_pool.execute(
-                    "DELETE FROM qiita.biosample_metadata WHERE biosample_idx = ANY($1::bigint[])",
-                    created_biosample_idxs,
-                )
-                await postgres_pool.execute(
-                    "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = ANY($1::bigint[])",
-                    created_biosample_idxs,
-                )
-                await postgres_pool.execute(
-                    "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])",
-                    created_biosample_idxs,
-                )
-            if created_study_idxs:
-                await postgres_pool.execute(
-                    "DELETE FROM qiita.biosample_study_field WHERE study_idx = ANY($1::bigint[])",
-                    created_study_idxs,
-                )
-                # POST /study auto-grants the owner an ADMIN study_access
-                # row inside the same transaction; drop it before the study.
-                await postgres_pool.execute(
-                    "DELETE FROM qiita.study_access WHERE study_idx = ANY($1::bigint[])",
-                    created_study_idxs,
-                )
-                await postgres_pool.execute(
-                    "DELETE FROM qiita.study WHERE idx = ANY($1::bigint[])",
-                    created_study_idxs,
-                )
+        if created_prep_sample_idxs:
+            await postgres_pool.execute(
+                "DELETE FROM qiita.sequenced_sample WHERE prep_sample_idx = ANY($1::bigint[])",
+                created_prep_sample_idxs,
+            )
+            await postgres_pool.execute(
+                "DELETE FROM qiita.prep_sample_metadata WHERE prep_sample_idx = ANY($1::bigint[])",
+                created_prep_sample_idxs,
+            )
+            await postgres_pool.execute(
+                "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = ANY($1::bigint[])",
+                created_prep_sample_idxs,
+            )
+            await postgres_pool.execute(
+                "DELETE FROM qiita.prep_sample WHERE idx = ANY($1::bigint[])",
+                created_prep_sample_idxs,
+            )
+        if created_sequenced_pool_idxs:
+            await postgres_pool.execute(
+                "DELETE FROM qiita.sequenced_pool WHERE idx = ANY($1::bigint[])",
+                created_sequenced_pool_idxs,
+            )
+        if created_sequencing_run_idxs:
+            await postgres_pool.execute(
+                "DELETE FROM qiita.sequencing_run WHERE idx = ANY($1::bigint[])",
+                created_sequencing_run_idxs,
+            )
+        if created_biosample_idxs:
+            await postgres_pool.execute(
+                "DELETE FROM qiita.biosample_metadata WHERE biosample_idx = ANY($1::bigint[])",
+                created_biosample_idxs,
+            )
+            await postgres_pool.execute(
+                "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = ANY($1::bigint[])",
+                created_biosample_idxs,
+            )
+            await postgres_pool.execute(
+                "DELETE FROM qiita.biosample WHERE idx = ANY($1::bigint[])",
+                created_biosample_idxs,
+            )
+        if created_study_idxs:
+            await postgres_pool.execute(
+                "DELETE FROM qiita.biosample_study_field WHERE study_idx = ANY($1::bigint[])",
+                created_study_idxs,
+            )
+            # POST /study auto-grants the owner an ADMIN study_access row
+            # inside the same transaction; drop it before the study.
+            await postgres_pool.execute(
+                "DELETE FROM qiita.study_access WHERE study_idx = ANY($1::bigint[])",
+                created_study_idxs,
+            )
+            await postgres_pool.execute(
+                "DELETE FROM qiita.study WHERE idx = ANY($1::bigint[])",
+                created_study_idxs,
+            )
