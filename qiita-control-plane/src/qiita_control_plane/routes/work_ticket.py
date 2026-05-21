@@ -563,39 +563,27 @@ _WORK_TICKET_COLUMNS = (
 
 
 def _row_to_work_ticket(row: asyncpg.Record) -> WorkTicket:
-    """Reconstruct the discriminated `scope_target` from the four nullable
-    target columns the work_ticket table stores and assemble a WorkTicket.
-    `action_context` is JSONB-as-string from asyncpg and is decoded here."""
-    kind = row["scope_target_kind"]
+    """Assemble a WorkTicket from a work_ticket row. Two columns need
+    shaping: `scope_target` is rebuilt from scope_target_kind plus the
+    four nullable idx columns the table stores, and `action_context` is
+    decoded from asyncpg's JSONB-as-string. Every other column maps 1:1
+    onto a WorkTicket field and flows through unchanged — so a field
+    added to both the model and `_WORK_TICKET_COLUMNS` needs no edit
+    here."""
+    data = dict(row)
+    kind = data.pop("scope_target_kind")
+    study_idx = data.pop("study_idx")
+    prep_idx = data.pop("prep_idx")
+    reference_idx = data.pop("reference_idx")
+    prep_sample_idx = data.pop("prep_sample_idx")
     if kind == ScopeTargetKind.REFERENCE.value:
-        scope_target: dict[str, Any] = {"kind": kind, "reference_idx": row["reference_idx"]}
+        data["scope_target"] = {"kind": kind, "reference_idx": reference_idx}
     elif kind == ScopeTargetKind.STUDY_PREP.value:
-        scope_target = {
-            "kind": kind,
-            "study_idx": row["study_idx"],
-            "prep_idx": row["prep_idx"],
-        }
+        data["scope_target"] = {"kind": kind, "study_idx": study_idx, "prep_idx": prep_idx}
     else:  # PREP_SAMPLE — DB CHECK enforces one of the three valid kinds.
-        scope_target = {"kind": kind, "prep_sample_idx": row["prep_sample_idx"]}
-    return WorkTicket.model_validate(
-        {
-            "work_ticket_idx": row["work_ticket_idx"],
-            "action_id": row["action_id"],
-            "action_version": row["action_version"],
-            "originator_principal_idx": row["originator_principal_idx"],
-            "scope_target": scope_target,
-            "action_context": json.loads(row["action_context"]),
-            "state": row["state"],
-            "retry_count": row["retry_count"],
-            "max_retries": row["max_retries"],
-            "failure_type": row["failure_type"],
-            "failure_stage": row["failure_stage"],
-            "failure_step_name": row["failure_step_name"],
-            "failure_reason": row["failure_reason"],
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-        }
-    )
+        data["scope_target"] = {"kind": kind, "prep_sample_idx": prep_sample_idx}
+    data["action_context"] = json.loads(data["action_context"])
+    return WorkTicket.model_validate(data)
 
 
 @router.get(
