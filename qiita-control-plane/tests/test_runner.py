@@ -238,8 +238,14 @@ async def _run(
     pool,
     backend: FakeBackendClient,
     workspace_root: Path,
+    *,
+    upload_staging_root: Path | None = None,
 ) -> None:
     from qiita_control_plane.runner import run_workflow
+
+    kwargs = {}
+    if upload_staging_root is not None:
+        kwargs["upload_staging_root"] = upload_staging_root
 
     await run_workflow(
         work_ticket_idx,
@@ -248,6 +254,7 @@ async def _run(
         hmac_secret=b"unused",
         data_plane_url="grpc://unused:0",
         workspace_root=workspace_root,
+        **kwargs,
     )
 
 
@@ -833,3 +840,301 @@ async def test_retry_observable_via_state_transitions(
     )
     assert final["state"] == "completed"
     assert final["retry_count"] == 2
+
+
+# =============================================================================
+# Upload handle resolution
+# =============================================================================
+#
+# At workflow start the runner walks `action_context` for `*_upload_idx`
+# keys, looks each up in `qiita.upload`, asserts (status='ready',
+# created_by == work_ticket originator), and injects the resolved staging
+# path under the matching `*_path` key in the binding map. On success the
+# upload rows transition ready → consumed atomically.
+
+
+@pytest.fixture
+async def upload_staging_root(tmp_path):
+    root = tmp_path / "staging"
+    root.mkdir()
+    return root
+
+
+async def _insert_upload(pool, *, principal_idx: int, status: str = "ready") -> int:
+    """Insert a qiita.upload row at the given status. Status transitions
+    on this domain are CHECK-gated; insert direct so tests can set up
+    pending/ready/consumed/failed without going through the route."""
+    completed_at = "now()" if status != "pending" else "NULL"
+    return await pool.fetchval(
+        f"INSERT INTO qiita.upload (status, created_by_idx, completed_at)"
+        f" VALUES ($1, $2, {completed_at})"
+        " RETURNING upload_idx",
+        status,
+        principal_idx,
+    )
+
+
+@pytest.fixture
+async def upload_work_ticket(
+    postgres_pool, reference_add_action, reference_idx, upload_staging_root
+):
+    """Variant of `pending_work_ticket` whose action_context carries
+    `fasta_upload_idx` rather than `fasta_path`. The principal idx is 1
+    (the system principal) to match the existing fixture's hardcoded
+    originator."""
+    action_id, version = reference_add_action
+    upload_idx = await _insert_upload(postgres_pool, principal_idx=1, status="ready")
+    # Materialize the staged file on disk at the canonical layout so the
+    # runner's existence check (if any) wouldn't trip; the FakeBackendClient
+    # doesn't actually read it.
+    from qiita_common.api_paths import compute_upload_staging_path
+
+    staging_path = compute_upload_staging_path(upload_staging_root, upload_idx)
+    staging_path.parent.mkdir(parents=True, exist_ok=True)
+    staging_path.write_bytes(b"")
+
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, action_context"
+        ") VALUES ($1, $2, 1, 'reference', $3, $4::jsonb) RETURNING work_ticket_idx",
+        action_id,
+        version,
+        reference_idx,
+        json.dumps({"fasta_upload_idx": upload_idx}),
+    )
+    yield {
+        "work_ticket_idx": idx,
+        "reference_idx": reference_idx,
+        "fasta_upload_idx": upload_idx,
+        "staging_path": staging_path,
+        "action": (action_id, version),
+    }
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx)
+    await postgres_pool.execute("DELETE FROM qiita.upload WHERE upload_idx = $1", upload_idx)
+
+
+async def test_runner_resolves_upload_handles_and_consumes_on_success(
+    postgres_pool, upload_work_ticket, library_spy, tmp_path, upload_staging_root
+):
+    """Happy path: a `_upload_idx` key resolves to the canonical staging
+    path under the matching `_path` binding, the step sees the resolved
+    Path, and the upload transitions ready → consumed on workflow success."""
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = upload_work_ticket["work_ticket_idx"]
+    backend = FakeBackendClient()
+    _populate_step_outputs(backend, workspace_root / str(work_ticket_idx))
+
+    await _run(
+        work_ticket_idx,
+        postgres_pool,
+        backend,
+        workspace_root,
+        upload_staging_root=upload_staging_root,
+    )
+
+    hash_call = next(c for c in backend.calls if c[0] == "hash")
+    assert hash_call[1]["fasta_path"] == upload_work_ticket["staging_path"]
+
+    status = await postgres_pool.fetchval(
+        "SELECT status FROM qiita.upload WHERE upload_idx = $1",
+        upload_work_ticket["fasta_upload_idx"],
+    )
+    assert status == "consumed"
+
+
+async def test_runner_rejects_unready_upload(
+    postgres_pool, reference_add_action, reference_idx, tmp_path, upload_staging_root
+):
+    """An upload still at status='pending' fails the workflow before any
+    step runs. The upload stays pending; the work_ticket transitions to
+    FAILED."""
+    action_id, version = reference_add_action
+    pending_upload = await _insert_upload(postgres_pool, principal_idx=1, status="pending")
+    try:
+        work_ticket_idx = await postgres_pool.fetchval(
+            "INSERT INTO qiita.work_ticket ("
+            "  action_id, action_version, originator_principal_idx,"
+            "  scope_target_kind, reference_idx, action_context"
+            ") VALUES ($1, $2, 1, 'reference', $3, $4::jsonb) RETURNING work_ticket_idx",
+            action_id,
+            version,
+            reference_idx,
+            json.dumps({"fasta_upload_idx": pending_upload}),
+        )
+        try:
+            backend = FakeBackendClient()
+            with pytest.raises(Exception) as ei:
+                await _run(
+                    work_ticket_idx,
+                    postgres_pool,
+                    backend,
+                    tmp_path,
+                    upload_staging_root=upload_staging_root,
+                )
+            assert "pending" in str(ei.value).lower() or "ready" in str(ei.value).lower()
+            # Backend never invoked — resolution gate ran before the step loop.
+            assert backend.calls == []
+            state = await postgres_pool.fetchval(
+                "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+                work_ticket_idx,
+            )
+            assert state == "failed"
+            status = await postgres_pool.fetchval(
+                "SELECT status FROM qiita.upload WHERE upload_idx = $1", pending_upload
+            )
+            assert status == "pending", "unready upload must not be moved by a rejected workflow"
+        finally:
+            await postgres_pool.execute(
+                "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
+            )
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.upload WHERE upload_idx = $1", pending_upload
+        )
+
+
+async def test_runner_rejects_consumed_upload(
+    postgres_pool, reference_add_action, reference_idx, tmp_path, upload_staging_root
+):
+    """A consumed upload cannot be re-claimed by a second work ticket.
+    One-shot semantics: status='consumed' is terminal for the consume
+    path. Mint a fresh upload if you need to retry."""
+    action_id, version = reference_add_action
+    spent = await _insert_upload(postgres_pool, principal_idx=1, status="consumed")
+    try:
+        work_ticket_idx = await postgres_pool.fetchval(
+            "INSERT INTO qiita.work_ticket ("
+            "  action_id, action_version, originator_principal_idx,"
+            "  scope_target_kind, reference_idx, action_context"
+            ") VALUES ($1, $2, 1, 'reference', $3, $4::jsonb) RETURNING work_ticket_idx",
+            action_id,
+            version,
+            reference_idx,
+            json.dumps({"fasta_upload_idx": spent}),
+        )
+        try:
+            backend = FakeBackendClient()
+            with pytest.raises(Exception):
+                await _run(
+                    work_ticket_idx,
+                    postgres_pool,
+                    backend,
+                    tmp_path,
+                    upload_staging_root=upload_staging_root,
+                )
+            assert backend.calls == []
+            state = await postgres_pool.fetchval(
+                "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+                work_ticket_idx,
+            )
+            assert state == "failed"
+        finally:
+            await postgres_pool.execute(
+                "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
+            )
+    finally:
+        await postgres_pool.execute("DELETE FROM qiita.upload WHERE upload_idx = $1", spent)
+
+
+async def test_runner_rejects_unknown_upload(
+    postgres_pool, reference_add_action, reference_idx, tmp_path, upload_staging_root
+):
+    """An upload_idx that doesn't exist in qiita.upload fails the workflow
+    fast — no step runs, ticket FAILED."""
+    action_id, version = reference_add_action
+    bogus_upload_idx = 999_999_999
+    work_ticket_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, action_context"
+        ") VALUES ($1, $2, 1, 'reference', $3, $4::jsonb) RETURNING work_ticket_idx",
+        action_id,
+        version,
+        reference_idx,
+        json.dumps({"fasta_upload_idx": bogus_upload_idx}),
+    )
+    try:
+        backend = FakeBackendClient()
+        with pytest.raises(Exception):
+            await _run(
+                work_ticket_idx,
+                postgres_pool,
+                backend,
+                tmp_path,
+                upload_staging_root=upload_staging_root,
+            )
+        assert backend.calls == []
+        state = await postgres_pool.fetchval(
+            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+        assert state == "failed"
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
+        )
+
+
+async def test_runner_rejects_upload_owned_by_other_principal(
+    postgres_pool, reference_add_action, reference_idx, tmp_path, upload_staging_root
+):
+    """An upload created by principal A cannot be consumed by a work
+    ticket whose originator is principal B. The runner enforces owner
+    parity defensively even though the upload domain audience is
+    admin-only today; a future tightening (per-row creator gates on /done)
+    leans on the same invariant."""
+    action_id, version = reference_add_action
+    # Seed a second principal (idx != 1) to own the upload.
+    other_pidx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
+        " VALUES ('upload-owner-other', 'user', 1) RETURNING idx"
+    )
+    try:
+        foreign_upload = await _insert_upload(
+            postgres_pool, principal_idx=other_pidx, status="ready"
+        )
+        try:
+            work_ticket_idx = await postgres_pool.fetchval(
+                "INSERT INTO qiita.work_ticket ("
+                "  action_id, action_version, originator_principal_idx,"
+                "  scope_target_kind, reference_idx, action_context"
+                ") VALUES ($1, $2, 1, 'reference', $3, $4::jsonb) RETURNING work_ticket_idx",
+                action_id,
+                version,
+                reference_idx,
+                json.dumps({"fasta_upload_idx": foreign_upload}),
+            )
+            try:
+                backend = FakeBackendClient()
+                with pytest.raises(Exception) as ei:
+                    await _run(
+                        work_ticket_idx,
+                        postgres_pool,
+                        backend,
+                        tmp_path,
+                        upload_staging_root=upload_staging_root,
+                    )
+                msg = str(ei.value).lower()
+                assert "owner" in msg or "principal" in msg or "created_by" in msg
+                assert backend.calls == []
+                state = await postgres_pool.fetchval(
+                    "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+                    work_ticket_idx,
+                )
+                assert state == "failed"
+                # Owner-rejected upload is untouched.
+                status = await postgres_pool.fetchval(
+                    "SELECT status FROM qiita.upload WHERE upload_idx = $1", foreign_upload
+                )
+                assert status == "ready"
+            finally:
+                await postgres_pool.execute(
+                    "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
+                )
+        finally:
+            await postgres_pool.execute(
+                "DELETE FROM qiita.upload WHERE upload_idx = $1", foreign_upload
+            )
+    finally:
+        await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", other_pidx)

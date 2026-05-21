@@ -3,14 +3,13 @@ version: 1.0.0
 target_kind: reference
 
 description: >
-  Hash sequences from a FASTA, mint feature_idx values, link them to the
-  reference, write reference data to sorted Parquet, and register the
-  Parquet files in DuckLake.
+  Canonicalize and hash DoPut'd reference sequences, mint feature_idx
+  values, link them to the reference, re-key sequence data and lift
+  optional taxonomy / tree / placements into DuckLake-shape staging
+  files, then register the staging files in DuckLake.
 
 scopes:
-  - feature:mint
   - reference:write
-  - reference:register_files
 
 audience:
   service: false
@@ -18,33 +17,32 @@ audience:
 
 context_schema:
   type: object
-  required: [fasta_path]
+  required: [fasta_upload_idx]
   properties:
-    fasta_path: {type: string}
-    # Optional Parquet with (read_id, genome_source, genome_source_id).
-    # When present, mint-features additionally writes qiita.feature_genome
-    # rows JOINed against the manifest's read_id.
-    genome_map_path: {type: string}
-    # Optional Parquet with (feature_id, taxonomy). When present, the load
-    # step parses semicolon-delimited ranks and writes reference_taxonomy.parquet.
-    taxonomy_path: {type: string}
-    # Optional Newick tree. When present, the load step writes
-    # reference_phylogeny.parquet with feature_idx populated on tip nodes.
-    tree_path: {type: string}
-    # Optional jplace placements. When present, the load step writes
-    # reference_placements.parquet keyed by feature_idx.
-    jplace_path: {type: string}
+    # Required: DoPut handle for the canonical (read_id, sequence)
+    # upload that hash_sequences consumes. The runner resolves
+    # `*_upload_idx` keys to filesystem paths under matching `*_path`
+    # bindings before any step runs (see
+    # qiita_control_plane.runner._resolve_upload_handles).
+    fasta_upload_idx: {type: integer, minimum: 1}
+    # Optional DoPut handles for the supplementary reference inputs.
+    # Absent uploads → absent staging files → the corresponding
+    # DuckLake tables receive no rows from this run.
+    taxonomy_upload_idx: {type: integer, minimum: 1}
+    tree_upload_idx: {type: integer, minimum: 1}
+    jplace_upload_idx: {type: integer, minimum: 1}
+    genome_map_upload_idx: {type: integer, minimum: 1}
 
 success_status: active
 failure_status: failed
 
 steps:
-  - step: hash
+  - step: hash_sequences
     step_type: singleton
-    container: qiita/reference-hash:1.0.0
+    module: qiita_compute_orchestrator.jobs.hash_sequences
     target_status: hashing
     inputs: [fasta_path]
-    outputs: [manifest]
+    outputs: [manifest, reference_sequence_chunks]
     baseline_resources:
       cpu: 4
       mem_gb: 8
@@ -61,9 +59,9 @@ steps:
 
   - step: load
     step_type: singleton
-    container: qiita/reference-load:1.0.0
+    module: qiita_compute_orchestrator.jobs.reference_load
     target_status: loading
-    inputs: [fasta_path, manifest, feature_map]
+    inputs: [manifest, feature_map, reference_sequence_chunks]
     optional_inputs: [taxonomy_path, tree_path, jplace_path]
     outputs: [staging_dir]
     baseline_resources:

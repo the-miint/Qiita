@@ -1,14 +1,15 @@
 """End-to-end test for the CP → CO step-dispatch contract.
 
-Exercises every layer of the new private path:
+Exercises every layer of the private CP → CO step path:
 
   * `ComputeBackendClient` (qiita-common) — request envelope serialization
     (StepRunRequest), Authorization header, response parsing back into
     Path objects.
   * `POST /api/v1/step/run` (qiita-compute-orchestrator) — bearer-token
     compare, route-level dispatch into `app.state.backend`.
-  * Real `LocalBackend` (DuckDB + miint) — actually hashes the FASTA
-    and writes manifest.parquet under the workspace.
+  * Real `LocalBackend` running the `hash_sequences` native module —
+    actually canonicalizes the upload Parquet and writes manifest.parquet
+    plus the two reference_sequence* outputs under the workspace.
 
 In-process: the orchestrator FastAPI app is reached via httpx
 `ASGITransport`, not a uvicorn subprocess. Lifespan is bypassed in
@@ -16,16 +17,39 @@ favour of setting `app.state` directly — same pattern the control-plane
 integration tests use to wire `app.state.pool`.
 """
 
+from pathlib import Path
+
 import duckdb
 import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.compute_backend_client import ComputeBackendClient
-from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER
 from qiita_compute_orchestrator.backends.local import LocalBackend
 from qiita_compute_orchestrator.main import app as orch_app
 
 _SHARED_TOKEN = "step-dispatch-test-token"
+_HASH_SEQUENCES_MODULE = "qiita_compute_orchestrator.jobs.hash_sequences"
+
+
+_CHUNK_SIZE = 65_536
+
+
+def _write_upload_parquet(path: Path, reads: list[tuple[str, str]]) -> Path:
+    """Synthesize an `upload.parquet` matching the CLI's chunked DoPut
+    shape: `(read_id VARCHAR, chunk_index INTEGER, chunk_data VARCHAR)`.
+    Short sequences fit in one chunk each."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows: list[tuple[str, int, str]] = []
+    for read_id, seq in reads:
+        for i in range(0, max(len(seq), 1), _CHUNK_SIZE):
+            rows.append((read_id, i // _CHUNK_SIZE, seq[i : i + _CHUNK_SIZE]))
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(
+            "CREATE TEMP TABLE t (read_id VARCHAR, chunk_index INTEGER, chunk_data VARCHAR)"
+        )
+        conn.executemany("INSERT INTO t VALUES (?, ?, ?)", rows)
+        conn.execute(f"COPY t TO '{path}' (FORMAT PARQUET)")
+    return path
 
 
 @pytest.fixture
@@ -40,10 +64,14 @@ def orchestrator_app():
 
 
 async def test_step_dispatch_hash_end_to_end(orchestrator_app, tmp_path):
-    """A real ComputeBackendClient → /step/run → LocalBackend hash:
-    the manifest Parquet must end up on disk with the expected shape."""
-    fasta = tmp_path / "test.fa"
-    fasta.write_text(">seq1\nACGTACGTACGTACGT\n>seq2\nTTTTAAAACCCCGGGG\n")
+    """A real ComputeBackendClient → /step/run → LocalBackend → native
+    hash_sequences run: the manifest Parquet must end up on disk with the
+    expected shape. Verifies the CP-side envelope (StepRunRequest) carries
+    the YAML's module path correctly through to run_native_job dispatch."""
+    fasta = _write_upload_parquet(
+        tmp_path / "upload.parquet",
+        [("seq1", "ACGTACGTACGTACGT"), ("seq2", "TTTTAAAACCCCGGGG")],
+    )
     workspace = tmp_path / "workspace"
 
     # Caller-supplied http_client takes its auth from its own headers
@@ -60,15 +88,15 @@ async def test_step_dispatch_hash_end_to_end(orchestrator_app, tmp_path):
             http_client=http,
         )
         outputs = await client.run_step(
-            step_name="hash",
+            step_name="hash_sequences",
             inputs={"fasta_path": fasta},
             workspace=workspace,
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=1,
-            # Required by StepRunRequest's exactly-one(container, module)
-            # validator. LocalBackend ignores the value for the hash step
-            # (name-dispatch into _run_hash); the field declares the runtime.
-            container=REFERENCE_HASH_CONTAINER,
+            # StepRunRequest validates exactly-one(container, module);
+            # LocalBackend rejects container steps wholesale, so native
+            # dispatch under `module:` is the only LocalBackend path.
+            module=_HASH_SEQUENCES_MODULE,
         )
 
     manifest = outputs["manifest"]
@@ -82,7 +110,10 @@ async def test_step_dispatch_hash_end_to_end(orchestrator_app, tmp_path):
                 f"SELECT column_name FROM (DESCRIBE SELECT * FROM '{manifest}')"
             ).fetchall()
         ]
-        assert cols == ["read_id", "sequence_hash", "length"]
+        # `manifest` and `reference_sequence` share the
+        # `sequence_length_bp` column so downstream JOINs don't trip on
+        # naming drift.
+        assert cols == ["read_id", "sequence_hash", "sequence_length_bp"]
         n = conn.execute(f"SELECT count(*) FROM '{manifest}'").fetchone()[0]
         assert n == 2
 
@@ -102,11 +133,11 @@ async def test_step_dispatch_rejects_wrong_token(orchestrator_app, tmp_path):
         )
         with pytest.raises(httpx.HTTPStatusError) as exc_info:
             await client.run_step(
-                step_name="hash",
-                inputs={"fasta_path": tmp_path / "x.fa"},
+                step_name="hash_sequences",
+                inputs={"fasta_path": tmp_path / "x.parquet"},
                 workspace=tmp_path,
                 scope_target={"kind": "reference", "reference_idx": 1},
                 work_ticket_idx=1,
-                container=REFERENCE_HASH_CONTAINER,
+                module=_HASH_SEQUENCES_MODULE,
             )
         assert exc_info.value.response.status_code == 401

@@ -1,5 +1,6 @@
 use base64::Engine;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 /// Runtime configuration for qiita-data-plane.
 /// All fields read from environment variables.
@@ -14,6 +15,9 @@ pub struct Settings {
     pub ducklake_catalog_connstr: String,
     /// Directory where DuckLake stores Parquet data files.
     pub ducklake_data_path: String,
+    /// Root directory under which DoPut writes staged Parquet uploads.
+    /// Each upload lands at `{root}/uploads/{upload_idx}/upload.parquet`.
+    pub upload_staging_root: PathBuf,
 }
 
 impl Settings {
@@ -41,12 +45,16 @@ impl Settings {
             let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
             format!("{base}/qiita/ducklake")
         });
+        let upload_staging_root = std::env::var("UPLOAD_STAGING_ROOT")
+            .unwrap_or_else(|_| "/scratch/ephemeral/staging".to_string())
+            .into();
 
         Ok(Self {
             listen_addr,
             hmac_secret_key,
             ducklake_catalog_connstr,
             ducklake_data_path,
+            upload_staging_root,
         })
     }
 }

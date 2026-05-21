@@ -28,11 +28,6 @@ _REFERENCE_ADD_YAML_PATH = (
     Path(__file__).parent.parent.parent / "workflows" / "reference-add" / "1.0.0.yaml"
 )
 
-# A tiny FASTA the hash step can chew through in milliseconds.
-_TINY_FASTA = (
-    b">seq1\nACGTACGTACGTACGT\n>seq2\nTTTTAAAACCCCGGGG\n>seq3\nGCATGCATGCATGCAT\n"
-)
-
 
 @pytest.fixture
 async def synced_reference_add_action(postgres_pool, tmp_path):
@@ -107,11 +102,38 @@ async def test_reference_add_workflow_end_to_end(
     from qiita_control_plane.actions import library as _lib
     from qiita_control_plane.runner import run_workflow
 
+    import json
+
+    import duckdb
+    from qiita_common.api_paths import compute_upload_staging_path
+
     action_id, action_version = synced_reference_add_action
     reference_idx = smoke_reference
 
-    fasta = tmp_path / "input.fasta"
-    fasta.write_bytes(_TINY_FASTA)
+    # Stage an upload row + chunked-FASTA Parquet at the path the
+    # runner will resolve from `fasta_upload_idx`. The workflow consumes
+    # the Parquet via hash_sequences' read_parquet(?); the shape is the
+    # CLI's wire form `(read_id, chunk_index, chunk_data)` — short
+    # sequences fit in one chunk each.
+    upload_staging_root = tmp_path / "upload-staging"
+    upload_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.upload (status, created_by_idx, completed_at,"
+        "  sha256, row_count, bytes_received)"
+        " VALUES ('ready', $1, now(), $2, 3, 0) RETURNING upload_idx",
+        human_admin_session["principal_idx"],
+        "0" * 64,
+    )
+    upload_parquet = compute_upload_staging_path(upload_staging_root, upload_idx)
+    upload_parquet.parent.mkdir(parents=True, exist_ok=True)
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(
+            "COPY (SELECT * FROM (VALUES"
+            "  ('seq1', 0, 'ACGTACGTACGTACGT'),"
+            "  ('seq2', 0, 'TTTTAAAACCCCGGGG'),"
+            "  ('seq3', 0, 'GCATGCATGCATGCAT')"
+            ") AS upload(read_id, chunk_index, chunk_data))"
+            f" TO '{upload_parquet}' (FORMAT PARQUET)"
+        )
 
     work_ticket_idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.work_ticket ("
@@ -123,7 +145,7 @@ async def test_reference_add_workflow_end_to_end(
         action_version,
         human_admin_session["principal_idx"],
         reference_idx,
-        f'{{"fasta_path": "{fasta}"}}',
+        json.dumps({"fasta_upload_idx": upload_idx}),
     )
 
     # Stub register-files: the real path requires a running data plane
@@ -148,6 +170,7 @@ async def test_reference_add_workflow_end_to_end(
         hmac_secret=b"unused-in-smoke",
         data_plane_url="grpc://unused:0",
         workspace_root=workspace_root,
+        upload_staging_root=upload_staging_root,
     )
 
     # work_ticket transitioned to COMPLETED.
@@ -184,5 +207,5 @@ async def test_reference_add_workflow_end_to_end(
     # Layout is `<workspace_root>/<work_ticket_idx>/<entry-name>/attempt-<N>/`
     # (see qiita_control_plane/runner.py:251). Happy-path smoke = attempt-0.
     workspace = workspace_root / str(work_ticket_idx)
-    assert (workspace / "hash" / "attempt-0" / "manifest.parquet").exists()
+    assert (workspace / "hash_sequences" / "attempt-0" / "manifest.parquet").exists()
     assert (workspace / "mint-features" / "attempt-0" / "feature_map.parquet").exists()

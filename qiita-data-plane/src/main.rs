@@ -30,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.hmac_secret_key,
         cfg.ducklake_catalog_connstr,
         cfg.ducklake_data_path,
+        cfg.upload_staging_root,
     );
 
     let (health_reporter, health_service) = tonic_health::server::health_reporter();

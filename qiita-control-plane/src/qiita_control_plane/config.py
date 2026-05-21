@@ -86,6 +86,19 @@ class Settings:
     auth_handoff_freshness_seconds: int = _DEFAULT_AUTH_HANDOFF_FRESHNESS_SECONDS
     cli_login_code_ttl_seconds: int = _DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS
     max_sequence_mint_count: int = _DEFAULT_MAX_SEQUENCE_MINT_COUNT
+    # Filesystem root the data plane writes DoPut uploads under. The runner
+    # resolves `*_upload_idx` keys in a work_ticket's action_context to
+    # `{root}/uploads/{idx}/upload.parquet` (compute_upload_staging_path)
+    # before invoking workflow steps. Default matches the data plane's
+    # `UPLOAD_STAGING_ROOT` default; in production both sides set the env
+    # var to the same shared-filesystem path.
+    upload_staging_root: Path = Path("/scratch/ephemeral/staging")
+    # Per-work_ticket workspace root the runner mints attempt subdirs under
+    # (`<workspace_root>/<work_ticket_idx>/<entry-name>/attempt-<N>/`).
+    # Production points this at the shared scratch filesystem; integration
+    # tests override via the WORKSPACE_ROOT env var so the runner doesn't
+    # try to create `/scratch/ephemeral/workspace` on CI agents.
+    workspace_root: Path = Path("/scratch/ephemeral/workspace")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -147,4 +160,8 @@ class Settings:
                 "QIITA_MAX_SEQUENCE_MINT_COUNT",
                 _DEFAULT_MAX_SEQUENCE_MINT_COUNT,
             ),
+            upload_staging_root=Path(
+                os.environ.get("UPLOAD_STAGING_ROOT", "/scratch/ephemeral/staging")
+            ),
+            workspace_root=Path(os.environ.get("WORKSPACE_ROOT", "/scratch/ephemeral/workspace")),
         )

@@ -16,9 +16,9 @@ audience:
   service: false
   human_roles: [wet_lab_admin, system_admin]
 steps:
-  - step: hash
+  - step: hash_sequences
     step_type: singleton
-    container: qiita/reference-hash:1.0.0
+    module: qiita_compute_orchestrator.jobs.hash_sequences
     baseline_resources: {cpu: 4, mem_gb: 8, walltime: PT1H}
   - action: mint-features
   - action: write-membership
@@ -199,7 +199,7 @@ async def test_sync_round_trips_through_action_definition(
 
     assert reconstructed.action_id == "reference-add"
     assert reconstructed.audience.human_roles[0].value == "wet_lab_admin"
-    assert reconstructed.steps[0].name == "hash"
+    assert reconstructed.steps[0].name == "hash_sequences"
     assert reconstructed.steps[0].baseline_resources.walltime == timedelta(hours=1)
     assert reconstructed.steps[1].name == "mint-features"
     assert reconstructed.action_ceiling.walltime == timedelta(hours=4)

@@ -1,23 +1,37 @@
-"""End-to-end integration test: drive workflows/reference-add via the
-runner with real LocalBackend + real LIBRARY + real data plane Flight,
-then DoGet the registered Parquet rows back via Arrow Flight.
+"""End-to-end integration test: drive workflows/reference-add via the CLI's
+`qiita-admin reference load` programmatic entry point against real CP +
+real data-plane Flight + DuckLake, then DoGet the registered Parquet
+rows back.
 
-Exercises every component:
-  * control plane (runner, LIBRARY primitives, status transitions)
-  * orchestrator-equivalent (LocalBackend in-process)
-  * data plane (Arrow Flight DoAction for register, DoGet for read)
-  * DuckLake (Parquet registration via the data plane)
+Exercises every layer of the production path:
+  * CLI (`cli.reference_load.do_reference_load`) — Arrow conversion,
+    POST /upload + Flight DoPut, POST /upload/{idx}/done, POST /work-ticket.
+  * Control plane (route layer + runner upload resolution +
+    `_consume_upload_handles` + LIBRARY primitives + status transitions).
+  * Compute orchestrator (LocalBackend in-process via
+    LocalComputeBackendClient).
+  * Data plane (Flight DoPut for upload, DoAction for register, DoGet
+    for verification).
+  * DuckLake (Parquet registration via the data plane).
 
-Relies on the shared `data_plane`, `hmac_secret`, and `postgres_pool`
-fixtures in conftest.py — no per-module process/secret/schema plumbing
-lives here.
+Differs from the legacy direct-INSERT version: the work_ticket flows
+through POST /work-ticket → schedule_dispatch → background asyncio task
+running `run_workflow`. The test awaits completion via the CLI's
+work_ticket-poll loop (short poll interval).
+
+Shared fixtures: `data_plane`, `hmac_secret`, `postgres_pool`,
+`human_admin_session` live in conftest.py.
 """
+
+from __future__ import annotations
 
 import uuid
 from pathlib import Path
 
+import duckdb
 import pyarrow.flight as flight
 import pytest
+from httpx import ASGITransport, AsyncClient
 
 from _runner_helpers import LocalComputeBackendClient
 
@@ -39,36 +53,43 @@ def flight_client(data_plane):
 async def synced_reference_add_action(postgres_pool, tmp_path):
     """Materialize workflows/reference-add/1.0.0.yaml under tmp_path/workflows/
     so the loader's directory walk picks it up, sync it into qiita.action,
-    and clean the row up after."""
+    and clean the row up after.
+
+    Tests don't share the on-disk version_pin (1.0.0) because parallel
+    sessions would step on each other's action row; each run synthesizes a
+    unique version suffix and the CLI submits against that. But the CLI
+    hard-codes `action_version="1.0.0"` — so we keep that pin and accept
+    the parallel-session collision risk (the integration suite serializes
+    in pytest by default)."""
     from qiita_control_plane.actions import load_actions, sync_actions
 
     workflows_dir = tmp_path / "workflows" / "reference-add"
     workflows_dir.mkdir(parents=True)
-    yaml_text = _REFERENCE_ADD_YAML_PATH.read_text()
-    test_version = f"e2e-{uuid.uuid4()}"
-    yaml_text = yaml_text.replace("version: 1.0.0", f"version: {test_version}")
-    (workflows_dir / "1.0.0.yaml").write_text(yaml_text)
+    (workflows_dir / "1.0.0.yaml").write_text(_REFERENCE_ADD_YAML_PATH.read_text())
 
     actions = load_actions(tmp_path / "workflows")
     async with postgres_pool.acquire() as conn:
         await sync_actions(conn, actions)
 
-    yield ("reference-add", test_version)
+    yield ("reference-add", "1.0.0")
 
     await postgres_pool.execute(
         "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
         "reference-add",
-        test_version,
+        "1.0.0",
     )
     await postgres_pool.execute(
         "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
         "reference-add",
-        test_version,
+        "1.0.0",
     )
 
 
 @pytest.fixture
 async def fresh_reference(postgres_pool, human_admin_session):
+    """Create a reference at status='pending'. The CLI's `--reference-idx`
+    binds to this row instead of creating its own — keeps the test's
+    cleanup scoped to a single row."""
     idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
         " VALUES ($1, '1.0', 'sequence_reference', 'pending', $2)"
@@ -107,10 +128,8 @@ def fasta_e2e(tmp_path):
 @pytest.fixture
 def taxonomy_e2e(tmp_path):
     """Parquet with (feature_id, taxonomy) — feature_id matches FASTA read_ids."""
-    import duckdb as _ddb
-
     path = tmp_path / "taxonomy.parquet"
-    with _ddb.connect(":memory:") as conn:
+    with duckdb.connect(":memory:") as conn:
         conn.execute("CREATE TABLE t (feature_id VARCHAR, taxonomy VARCHAR)")
         conn.executemany(
             "INSERT INTO t VALUES (?, ?)",
@@ -133,6 +152,45 @@ def tree_e2e(tmp_path):
     return path
 
 
+@pytest.fixture
+async def cli_cp_client(postgres_pool, hmac_secret, human_admin_session, data_plane):
+    """Configure cp_app.state for dispatch — pool + settings (with the
+    data plane's actual gRPC URL and the spawned UPLOAD_STAGING_ROOT) +
+    LocalComputeBackendClient + dispatch task tracking. Yield an
+    httpx.AsyncClient over ASGITransport with the admin PAT header."""
+    from qiita_common.api_paths import LOOPBACK_HOST
+    from qiita_control_plane.config import Settings as CPSettings
+    from qiita_control_plane.main import app as cp_app
+
+    cp_app.state.pool = postgres_pool
+    cp_app.state.settings = CPSettings(
+        database_url="unused-in-test",
+        hmac_secret_key=hmac_secret,
+        data_plane_url=f"grpc://{LOOPBACK_HOST}:{data_plane['port']}",
+        upload_staging_root=Path(data_plane["upload_staging_root"]),
+        workspace_root=Path(data_plane["workspace_root"]),
+    )
+    cp_app.state.compute_backend_client = LocalComputeBackendClient()
+    cp_app.state.running_dispatches = set()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=cp_app),
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {human_admin_session['token']}"},
+    ) as client:
+        yield client
+
+    # Drain any in-flight dispatch tasks so a flaky workflow can't leak
+    # across tests.
+    import asyncio
+
+    pending = list(cp_app.state.running_dispatches)
+    if pending:
+        _, leftover = await asyncio.wait(pending, timeout=5)
+        for task in leftover:
+            task.cancel()
+
+
 async def test_e2e_create_to_doget(
     postgres_pool,
     data_plane,
@@ -144,60 +202,57 @@ async def test_e2e_create_to_doget(
     taxonomy_e2e,
     tree_e2e,
     human_admin_session,
+    cli_cp_client,
     tmp_path,
 ):
-    """Full E2E: runner walks reference-add (driving optional taxonomy +
-    tree inputs through action_context) → register Parquet via Flight →
-    DoGet round-trips sequences, chunks, taxonomy, and phylogeny.
+    """Drive the full production path via `do_reference_load`:
+    POST /reference (skipped — we bind to fresh_reference) →
+    POST /upload + Flight DoPut + POST /done for each input file →
+    POST /work-ticket → schedule_dispatch fires runner in background →
+    runner resolves upload handles, walks workflow, registers files →
+    --watch polls /work-ticket/{idx} until completed →
+    DoGet round-trips sequences / chunks / taxonomy / phylogeny.
     """
-    import json as _json
-
-    from qiita_common.api_paths import LOOPBACK_HOST
     from qiita_control_plane.auth.tickets import sign_ticket
-    from qiita_control_plane.runner import run_workflow
+    from qiita_control_plane.cli.reference_load import do_reference_load
 
-    action_id, action_version = synced_reference_add_action
-    action_context = _json.dumps(
-        {
-            "fasta_path": str(fasta_e2e),
-            "taxonomy_path": str(taxonomy_e2e),
-            "tree_path": str(tree_e2e),
-        }
+    result = await do_reference_load(
+        http=cli_cp_client,
+        token=human_admin_session["token"],
+        flight_client=flight_client,
+        fasta_path=fasta_e2e,
+        taxonomy_path=taxonomy_e2e,
+        tree_path=tree_e2e,
+        reference_idx=fresh_reference,
+        watch=True,
+        poll_interval_seconds=0.1,
+        timeout_seconds=60,
     )
-    work_ticket_idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.work_ticket ("
-        "  action_id, action_version, originator_principal_idx,"
-        "  scope_target_kind, reference_idx, action_context"
-        ") VALUES ($1, $2, $3, 'reference', $4, $5::jsonb)"
-        " RETURNING work_ticket_idx",
-        action_id,
-        action_version,
-        human_admin_session["principal_idx"],
-        fresh_reference,
-        action_context,
-    )
+    assert result["work_ticket"]["state"] == "completed", result["work_ticket"]
 
-    await run_workflow(
-        work_ticket_idx,
-        postgres_pool,
-        LocalComputeBackendClient(),  # type: ignore[arg-type]
-        hmac_secret=hmac_secret,
-        data_plane_url=f"grpc://{LOOPBACK_HOST}:{data_plane['port']}",
-        workspace_root=tmp_path / "workspace",
-    )
-
+    # Both terminal checks — same as the legacy assertions, but reached
+    # via the production HTTP path instead of direct DB INSERT.
     state = await postgres_pool.fetchval(
         "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
-        work_ticket_idx,
+        result["work_ticket_idx"],
     )
     assert state == "completed"
-
     ref_status = await postgres_pool.fetchval(
         "SELECT status FROM qiita.reference WHERE reference_idx = $1",
         fresh_reference,
     )
     assert ref_status == "active"
 
+    # The three uploads transitioned ready → consumed inside the runner's
+    # finalize transaction.
+    consumed = await postgres_pool.fetch(
+        "SELECT upload_idx, status FROM qiita.upload WHERE upload_idx = ANY($1::bigint[])",
+        list(result["upload_idxs"].values()),
+    )
+    assert all(row["status"] == "consumed" for row in consumed), consumed
+
+    # DoGet round-trip via the data plane — confirms register-files ran
+    # and the DuckLake catalog carries the new reference's rows.
     def _doget(table_name: str):
         ticket_bytes = sign_ticket(
             table=table_name,
@@ -206,25 +261,28 @@ async def test_e2e_create_to_doget(
         )
         return flight_client.do_get(flight.Ticket(ticket_bytes)).read_all()
 
-    # reference_sequences round-trip via Flight.
     table = _doget("reference_sequences")
     assert table.num_rows == 3
     assert {"feature_idx", "sequence_hash", "sequence_length_bp"}.issubset(
         set(table.column_names)
     )
 
-    # reference_sequence_chunks — sequences come back intact.
     chunks = _doget("reference_sequence_chunks")
     assert chunks.num_rows == 3
-    assert set(chunks.column("chunk_data").to_pylist()) == set(_TEST_SEQUENCES.values())
+    # Sequences come back in canonical form (LEAST of strand + revcomp)
+    # — for the three short fixture sequences each is already canonical.
+    canon_seqs = set()
+    for seq in _TEST_SEQUENCES.values():
+        rc = seq.translate(str.maketrans("ACGTRYSWKMBDHVN", "TGCAYRSWMKVHDBN"))[
+            ::-1
+        ].upper()
+        canon_seqs.add(min(seq.upper(), rc))
+    assert set(chunks.column("chunk_data").to_pylist()) == canon_seqs
 
-    # reference_taxonomy — domains parsed correctly from the optional input.
     tax = _doget("reference_taxonomy")
     assert tax.num_rows == 3
     assert set(tax.column("domain").to_pylist()) == {"Bacteria", "Archaea"}
 
-    # reference_phylogeny — Newick decomposed into nodes; the 3 tips carry
-    # the feature_idx values minted from the matching FASTA read_ids.
     phylo = _doget("reference_phylogeny")
     tip_rows = [r for r in phylo.to_pylist() if r["is_tip"]]
     assert len(tip_rows) == 3
@@ -235,7 +293,6 @@ async def test_ticket_endpoint_rejects_non_active_reference(
     postgres_pool, hmac_secret, fresh_reference, compute_worker_service_account
 ):
     """Ticket route guard still works — reference at status='pending' refuses."""
-    from httpx import ASGITransport, AsyncClient
     from qiita_common.api_paths import LOOPBACK_HOST, URL_REFERENCE_DOGET
     from qiita_control_plane.config import Settings
     from qiita_control_plane.main import app
