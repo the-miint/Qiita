@@ -107,10 +107,10 @@ def staging_inputs(tmp_path):
     )
 
     return {
-        "manifest_path": manifest_path,
-        "feature_map_path": feature_map_path,
-        "reference_sequence_path": reference_sequence_path,
-        "reference_sequence_chunks_path": reference_sequence_chunks_path,
+        "manifest": manifest_path,
+        "feature_map": feature_map_path,
+        "reference_sequence": reference_sequence_path,
+        "reference_sequence_chunks": reference_sequence_chunks_path,
     }
 
 
@@ -358,7 +358,7 @@ def test_unmapped_sequence_hash_raises_value_error(staging_inputs, tmp_path):
         [(str(_HASHES["seq1"]), 100)],
     )
     inputs = dict(staging_inputs)
-    inputs["feature_map_path"] = bad_fm
+    inputs["feature_map"] = bad_fm
 
     with pytest.raises(ValueError, match="unmapped sequence hash"):
         _run(_inputs(**inputs), tmp_path / "ws")
@@ -366,7 +366,7 @@ def test_unmapped_sequence_hash_raises_value_error(staging_inputs, tmp_path):
 
 def test_missing_manifest_raises_file_not_found(staging_inputs, tmp_path):
     inputs = dict(staging_inputs)
-    inputs["manifest_path"] = tmp_path / "does-not-exist.parquet"
+    inputs["manifest"] = tmp_path / "does-not-exist.parquet"
     with pytest.raises(FileNotFoundError):
         _run(_inputs(**inputs), tmp_path / "ws")
 

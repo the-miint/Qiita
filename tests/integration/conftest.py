@@ -184,6 +184,7 @@ def data_plane(hmac_secret, tmp_path_factory):
 
     data_path = str(tmp_path_factory.mktemp("ducklake-data"))
     staging_root = str(tmp_path_factory.mktemp("upload-staging"))
+    workspace_root = str(tmp_path_factory.mktemp("runner-workspace"))
     port = _alloc_free_port()
 
     lib_path = os.environ.get(LIB_PATH_ENV, "")
@@ -238,6 +239,7 @@ def data_plane(hmac_secret, tmp_path_factory):
         "data_path": data_path,
         "ducklake_connstr": DUCKLAKE_CATALOG_CONNSTR,
         "upload_staging_root": staging_root,
+        "workspace_root": workspace_root,
     }
 
     proc.send_signal(signal.SIGTERM)

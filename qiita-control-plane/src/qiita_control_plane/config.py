@@ -93,6 +93,12 @@ class Settings:
     # `UPLOAD_STAGING_ROOT` default; in production both sides set the env
     # var to the same shared-filesystem path.
     upload_staging_root: Path = Path("/scratch/ephemeral/staging")
+    # Per-work_ticket workspace root the runner mints attempt subdirs under
+    # (`<workspace_root>/<work_ticket_idx>/<entry-name>/attempt-<N>/`).
+    # Production points this at the shared scratch filesystem; integration
+    # tests override via the WORKSPACE_ROOT env var so the runner doesn't
+    # try to create `/scratch/ephemeral/workspace` on CI agents.
+    workspace_root: Path = Path("/scratch/ephemeral/workspace")
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -157,4 +163,5 @@ class Settings:
             upload_staging_root=Path(
                 os.environ.get("UPLOAD_STAGING_ROOT", "/scratch/ephemeral/staging")
             ),
+            workspace_root=Path(os.environ.get("WORKSPACE_ROOT", "/scratch/ephemeral/workspace")),
         )

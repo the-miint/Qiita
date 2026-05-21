@@ -58,11 +58,13 @@ _DUCKDB_MAX_THREADS = 2
 class Inputs(BaseModel):
     """Typed input contract for reference_load.
 
-    The first four paths are required outputs of the upstream pipeline
-    (hash_sequences → mint-features). `taxonomy_path` / `tree_path` /
-    `jplace_path` are optional and only set when the work_ticket's
-    `action_context` carried the matching `*_upload_idx` (the runner
-    resolves and injects them under the `_path` form).
+    The first four fields are required outputs of the upstream pipeline
+    (hash_sequences → mint-features) and carry bare names matching what
+    those steps emit and what the YAML's `inputs:` list declares.
+
+    `taxonomy_path` / `tree_path` / `jplace_path` carry the `_path`
+    suffix because the runner injects them under that form when the
+    work_ticket's `action_context` carries the matching `*_upload_idx`.
 
     `reference_idx` is framework-injected (REFERENCE-scoped ticket) and
     load-bearing: it's the `reference_membership` row's left-hand idx
@@ -71,10 +73,10 @@ class Inputs(BaseModel):
     it.
     """
 
-    manifest_path: Path
-    feature_map_path: Path
-    reference_sequence_path: Path
-    reference_sequence_chunks_path: Path
+    manifest: Path
+    feature_map: Path
+    reference_sequence: Path
+    reference_sequence_chunks: Path
     taxonomy_path: Path | None = None
     tree_path: Path | None = None
     jplace_path: Path | None = None
@@ -84,10 +86,10 @@ class Inputs(BaseModel):
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     for label, path in [
-        ("manifest", inputs.manifest_path),
-        ("feature_map", inputs.feature_map_path),
-        ("reference_sequence", inputs.reference_sequence_path),
-        ("reference_sequence_chunks", inputs.reference_sequence_chunks_path),
+        ("manifest", inputs.manifest),
+        ("feature_map", inputs.feature_map),
+        ("reference_sequence", inputs.reference_sequence),
+        ("reference_sequence_chunks", inputs.reference_sequence_chunks),
     ]:
         if not path.exists():
             raise FileNotFoundError(f"{label} not found: {path}")
@@ -138,25 +140,25 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # re-scan the file.
             conn.execute(
                 "CREATE TEMP TABLE feature_map AS SELECT * FROM read_parquet(?)",
-                [str(inputs.feature_map_path)],
+                [str(inputs.feature_map)],
             )
 
             # id_map: read_id → feature_idx (via sequence_hash). The
             # taxonomy / phylogeny / placements writes all key off
             # read_id, so this single JOIN is the bridge to feature_idx.
             # Counts also drive the unmapped-hash check below.
-            _build_id_map(conn, inputs.manifest_path)
+            _build_id_map(conn, inputs.manifest)
 
             _write_reference_sequences(
                 conn,
-                inputs.reference_sequence_path,
+                inputs.reference_sequence,
                 sequences_out,
             )
             written.append(sequences_path)
 
             _write_reference_sequence_chunks(
                 conn,
-                inputs.reference_sequence_chunks_path,
+                inputs.reference_sequence_chunks,
                 chunks_out,
             )
             written.append(chunks_path)
