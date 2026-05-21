@@ -117,6 +117,13 @@ def _post_work_ticket(base_url: str, token: str, body: dict) -> dict:
     return _common.call("POST", base_url, token, PATH_WORK_TICKET_PREFIX, json=body)
 
 
+def _get_work_ticket(base_url: str, token: str, work_ticket_idx: int) -> dict:
+    """GET /api/v1/work-ticket/{idx}. Returns the full WorkTicket record —
+    state, action info, scope_target, action_context, retry accounting,
+    failure surface, timestamps. Auth: originator or wet_lab_admin+."""
+    return _common.call("GET", base_url, token, f"{PATH_WORK_TICKET_PREFIX}/{work_ticket_idx}")
+
+
 # ---------------------------------------------------------------------------
 # argparse entry point
 # ---------------------------------------------------------------------------
@@ -386,6 +393,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_ticket_submit.set_defaults(handler=_handle_ticket_submit)
 
+    p_ticket_status = p_ticket_sub.add_parser(
+        "status",
+        help="Read a work-ticket's status (GET /work-ticket/{idx})",
+    )
+    p_ticket_status.add_argument(
+        "work_ticket_idx",
+        type=int,
+        help="Work-ticket idx returned by `qiita ticket submit`.",
+    )
+    p_ticket_status.set_defaults(handler=_handle_ticket_status)
+
     return parser
 
 
@@ -532,6 +550,15 @@ def _handle_ticket_submit(args: argparse.Namespace, parser: argparse.ArgumentPar
 
     body = _build_body(WorkTicketCreateRequest, args, parser)
     return _common.run_http_subcommand(lambda t: _post_work_ticket(args.base_url, t, body))
+
+
+def _handle_ticket_status(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """GET a single work-ticket's full record. The CLI prints the full
+    server response so a USER polling for state can render every field
+    (state, retry_count, failure_*, timestamps) without a second call."""
+    return _common.run_http_subcommand(
+        lambda t: _get_work_ticket(args.base_url, t, args.work_ticket_idx)
+    )
 
 
 def _build_body(

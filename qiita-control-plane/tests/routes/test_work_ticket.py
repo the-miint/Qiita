@@ -14,7 +14,11 @@ import uuid
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_WORK_TICKET_PREFIX, URL_WORK_TICKET_RUN
+from qiita_common.api_paths import (
+    URL_WORK_TICKET_BY_IDX,
+    URL_WORK_TICKET_PREFIX,
+    URL_WORK_TICKET_RUN,
+)
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import WorkTicketState
 
@@ -966,6 +970,147 @@ async def test_submit_503_when_compute_backend_unconfigured(
         assert resp.status_code == 503
     finally:
         app.state.compute_backend_client = saved
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/work-ticket/{idx}
+# ---------------------------------------------------------------------------
+
+
+async def _submit_reference_ticket(
+    wt_client, *, token: str, action_id: str, version: str, reference_idx: int
+) -> int:
+    """Submit a reference-scoped ticket and return its work_ticket_idx;
+    track for cleanup. Used by the GET tests to land a real row to read
+    back."""
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json=_body(action_id, version, reference_idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    idx = resp.json()["work_ticket_idx"]
+    wt_client._created_tickets.append(idx)
+    return idx
+
+
+async def test_get_work_ticket_404_on_missing(wt_client, admin_token):
+    token, _ = admin_token
+    resp = await wt_client.get(
+        URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=99_999_999),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 404
+
+
+async def test_get_work_ticket_401_on_anonymous(
+    wt_client, admin_token, reference_action, reference_idx
+):
+    # Submit so a row exists, then GET without an Authorization header.
+    token, _ = admin_token
+    action_id, version = reference_action
+    idx = await _submit_reference_ticket(
+        wt_client, token=token, action_id=action_id, version=version, reference_idx=reference_idx
+    )
+    resp = await wt_client.get(URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=idx))
+    assert resp.status_code == 401
+
+
+async def test_get_work_ticket_originator_reads_own(
+    wt_client, admin_token, reference_action, reference_idx
+):
+    """The originator (the admin who submitted) can read the ticket back.
+    Returned payload matches the full WorkTicket shape: discriminated
+    scope_target, state, action info, retry accounting, null failure
+    surface for a fresh ticket."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await _submit_reference_ticket(
+        wt_client, token=token, action_id=action_id, version=version, reference_idx=reference_idx
+    )
+    resp = await wt_client.get(
+        URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["work_ticket_idx"] == idx
+    assert body["originator_principal_idx"] == admin_idx
+    assert body["action_id"] == action_id
+    assert body["action_version"] == version
+    assert body["state"] in {WorkTicketState.PENDING.value, WorkTicketState.QUEUED.value}
+    assert body["scope_target"] == {"kind": "reference", "reference_idx": reference_idx}
+    assert body["failure_type"] is None
+    assert body["failure_stage"] is None
+
+
+async def test_get_work_ticket_non_originator_403(
+    wt_client, admin_token, regular_token, reference_action, reference_idx
+):
+    """A different USER (non-originator, no admin role) gets 403 — the
+    detail names the work_ticket so a confused client can see what they
+    asked for."""
+    token, _ = admin_token
+    user_token, _ = regular_token
+    action_id, version = reference_action
+    idx = await _submit_reference_ticket(
+        wt_client, token=token, action_id=action_id, version=version, reference_idx=reference_idx
+    )
+    resp = await wt_client.get(
+        URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert resp.status_code == 403
+    assert str(idx) in resp.json()["detail"]
+
+
+async def _seed_wet_lab_admin_token(postgres_pool, wt_client) -> tuple[str, int]:
+    """Build a throwaway wet_lab_admin and an authenticated PAT. Mirrors
+    the `admin_token` / `regular_token` fixtures inline — only the GET
+    tests need a wet_lab_admin caller, so a per-test seed avoids a
+    file-wide fixture."""
+    from qiita_control_plane.auth.token import mint_api_token
+
+    email = f"wt-wla-{uuid.uuid4()}@example.com"
+    pidx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
+        " VALUES ($1, $2, 1) RETURNING idx",
+        email,
+        SystemRole.WET_LAB_ADMIN,
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.user (principal_idx, email, affiliation, address, phone)"
+        " VALUES ($1, $2, 'X', 'Y', 'Z')",
+        pidx,
+        email,
+    )
+    wt_client._created_principals.append(pidx)
+    plaintext, _ = await mint_api_token(
+        postgres_pool,
+        principal_idx=pidx,
+        label="wt-wla",
+        scopes=[Scope.SELF_PROFILE, Scope.SELF_TOKEN, Scope.REFERENCE_READ],
+    )
+    return plaintext, pidx
+
+
+async def test_get_work_ticket_wet_lab_admin_bypasses(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """A wet_lab_admin who did not originate the ticket still reads it
+    via the role bypass — pins the operator-view path."""
+    token, _ = admin_token
+    action_id, version = reference_action
+    idx = await _submit_reference_ticket(
+        wt_client, token=token, action_id=action_id, version=version, reference_idx=reference_idx
+    )
+    wla_token, _ = await _seed_wet_lab_admin_token(postgres_pool, wt_client)
+    resp = await wt_client.get(
+        URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {wla_token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["work_ticket_idx"] == idx
 
 
 # ---------------------------------------------------------------------------

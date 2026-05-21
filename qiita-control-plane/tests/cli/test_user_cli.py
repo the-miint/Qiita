@@ -1301,6 +1301,67 @@ def test_ticket_submit_rejects_malformed_context_json(capsys):
 
 
 # ---------------------------------------------------------------------------
+# ticket status
+# ---------------------------------------------------------------------------
+
+
+_TICKET_STATUS_RESPONSE = {
+    "work_ticket_idx": 12,
+    "action_id": "fastq-to-parquet",
+    "action_version": "1.0.0",
+    "originator_principal_idx": 7,
+    "scope_target": {"kind": "prep_sample", "prep_sample_idx": 55},
+    "action_context": {"fastq_path": "/scratch/sample.fastq"},
+    "state": "processing",
+    "retry_count": 0,
+    "max_retries": 3,
+    "failure_type": None,
+    "failure_stage": None,
+    "failure_step_name": None,
+    "failure_reason": None,
+    "created_at": "2026-05-20T00:00:00+00:00",
+    "updated_at": "2026-05-20T00:00:01+00:00",
+}
+
+
+def test_ticket_status_issues_get_against_the_idx(monkeypatch):
+    """Positional `work_ticket_idx` lands on the path; the handler issues
+    a GET (not a POST) and the captured response shape carries the full
+    WorkTicket fields the route returns."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_TICKET_STATUS_RESPONSE, status=200)
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "ticket",
+            "status",
+            "12",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "GET"
+    assert captured["url"] == "https://q.example.test/api/v1/work-ticket/12"
+    # A GET has no body — assert the stub captured no JSON payload.
+    assert captured["json"] is None
+
+
+def test_ticket_status_requires_idx(capsys):
+    """Omitting the positional argument exits 2 with the standard
+    argparse error pointing at `work_ticket_idx`."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["ticket", "status"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "work_ticket_idx" in err
+
+
+# ---------------------------------------------------------------------------
 # --base-url http-to-non-localhost guard
 # ---------------------------------------------------------------------------
 

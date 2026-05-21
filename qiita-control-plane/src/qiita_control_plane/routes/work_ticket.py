@@ -8,6 +8,12 @@ is in a non-terminal state (disallow-without-delete). On success: INSERT
 the row, fire `schedule_dispatch` to start the workflow in the background,
 return 202 with the ticket id and state.
 
+`GET /api/v1/work-ticket/{idx}` — read a single ticket. Returns the full
+WorkTicket model (state, action info, scope target, action context, retry
+accounting, failure surface, timestamps) so a polling CLI can render
+everything in one round trip. Auth: the originator passes; wet_lab_admin+
+bypasses; otherwise 403.
+
 `POST /api/v1/work-ticket/{idx}/run` — operator override. State-aware:
 
 | Current state | Behavior                                          |
@@ -42,6 +48,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from qiita_common.actions import Audience
 from qiita_common.api_paths import (
+    PATH_WORK_TICKET_BY_IDX,
     PATH_WORK_TICKET_PREFIX,
     PATH_WORK_TICKET_ROOT,
     PATH_WORK_TICKET_RUN,
@@ -49,6 +56,7 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import SystemRole
 from qiita_common.models import (
     ScopeTargetKind,
+    WorkTicket,
     WorkTicketCreateRequest,
     WorkTicketResponse,
     WorkTicketState,
@@ -56,7 +64,7 @@ from qiita_common.models import (
 
 from ..actions.context_validator import validate_context
 from ..auth.guards import require_caller_has_admin_on_all_studies
-from ..auth.principal import HumanUser, Principal, ServiceAccount, get_current_principal
+from ..auth.principal import Anonymous, HumanUser, Principal, ServiceAccount, get_current_principal
 from ..deps import get_db_pool
 from ..dispatch import NON_TERMINAL_WORK_TICKET_STATES, schedule_dispatch
 from ..repositories.prep_sample import fetch_active_study_idxs_for_prep_sample
@@ -432,6 +440,90 @@ async def submit_work_ticket(
         principal.principal_idx,
     )
     return WorkTicketResponse(work_ticket_idx=work_ticket_idx, state=WorkTicketState.PENDING)
+
+
+_WORK_TICKET_COLUMNS = (
+    "work_ticket_idx, action_id, action_version, originator_principal_idx,"
+    " scope_target_kind, study_idx, prep_idx, reference_idx, prep_sample_idx,"
+    " action_context, state, retry_count, max_retries,"
+    " failure_type, failure_stage, failure_step_name, failure_reason,"
+    " created_at, updated_at"
+)
+
+
+def _row_to_work_ticket(row: asyncpg.Record) -> WorkTicket:
+    """Reconstruct the discriminated `scope_target` from the four nullable
+    target columns the work_ticket table stores and assemble a WorkTicket.
+    `action_context` is JSONB-as-string from asyncpg and is decoded here."""
+    kind = row["scope_target_kind"]
+    if kind == ScopeTargetKind.REFERENCE.value:
+        scope_target: dict[str, Any] = {"kind": kind, "reference_idx": row["reference_idx"]}
+    elif kind == ScopeTargetKind.STUDY_PREP.value:
+        scope_target = {
+            "kind": kind,
+            "study_idx": row["study_idx"],
+            "prep_idx": row["prep_idx"],
+        }
+    else:  # PREP_SAMPLE — DB CHECK enforces one of the three valid kinds.
+        scope_target = {"kind": kind, "prep_sample_idx": row["prep_sample_idx"]}
+    return WorkTicket.model_validate(
+        {
+            "work_ticket_idx": row["work_ticket_idx"],
+            "action_id": row["action_id"],
+            "action_version": row["action_version"],
+            "originator_principal_idx": row["originator_principal_idx"],
+            "scope_target": scope_target,
+            "action_context": json.loads(row["action_context"]),
+            "state": row["state"],
+            "retry_count": row["retry_count"],
+            "max_retries": row["max_retries"],
+            "failure_type": row["failure_type"],
+            "failure_stage": row["failure_stage"],
+            "failure_step_name": row["failure_step_name"],
+            "failure_reason": row["failure_reason"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+    )
+
+
+@router.get(
+    PATH_WORK_TICKET_BY_IDX,
+    response_model=WorkTicket,
+)
+async def get_work_ticket(
+    work_ticket_idx: int,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    principal: Principal = Depends(get_current_principal),
+) -> WorkTicket:
+    """Read a single ticket. Returns the full WorkTicket record so the
+    caller-side CLI can render state, retry accounting, and the failure
+    surface from one call. Auth: 401 on Anonymous; the originator passes;
+    wet_lab_admin+ bypasses; everyone else 403s. No per-study /
+    per-resource access path here — the originator-bypass already lets
+    the caller who submitted the ticket read it, and operator views are
+    served by the role bypass."""
+    if isinstance(principal, Anonymous):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required"
+        )
+    row = await pool.fetchrow(
+        f"SELECT {_WORK_TICKET_COLUMNS} FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"work_ticket {work_ticket_idx} not found",
+        )
+    is_originator = row["originator_principal_idx"] == principal.principal_idx
+    is_bypass = principal.has_role_at_least(SystemRole.WET_LAB_ADMIN)
+    if not (is_originator or is_bypass):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"caller did not originate work_ticket {work_ticket_idx}",
+        )
+    return _row_to_work_ticket(row)
 
 
 @router.post(
