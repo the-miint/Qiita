@@ -206,5 +206,5 @@ async def test_reference_add_workflow_end_to_end(
     # Layout is `<workspace_root>/<work_ticket_idx>/<entry-name>/attempt-<N>/`
     # (see qiita_control_plane/runner.py:251). Happy-path smoke = attempt-0.
     workspace = workspace_root / str(work_ticket_idx)
-    assert (workspace / "hash" / "attempt-0" / "manifest.parquet").exists()
+    assert (workspace / "hash_sequences" / "attempt-0" / "manifest.parquet").exists()
     assert (workspace / "mint-features" / "attempt-0" / "feature_map.parquet").exists()
