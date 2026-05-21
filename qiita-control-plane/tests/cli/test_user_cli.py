@@ -1362,6 +1362,33 @@ def test_ticket_status_requires_idx(capsys):
 
 
 # ---------------------------------------------------------------------------
+# HTTP-error handling (run_http_subcommand)
+# ---------------------------------------------------------------------------
+
+
+def test_http_error_response_prints_to_stderr_and_exits_1(monkeypatch, capsys):
+    """A non-2xx response surfaces through run_http_subcommand: `call`'s
+    raise_for_status() throws httpx.HTTPStatusError, the CLI prints
+    `http error <code>: <body>` to stderr and returns exit code 1."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"detail": "requires study access at tier 'admin' or higher"},
+        status=403,
+    )
+
+    rc = main(["study", "create", "--title", "denied-study"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "http error 403" in err
+    # The server's response body is echoed so the user sees the reason.
+    assert "requires study access" in err
+
+
+# ---------------------------------------------------------------------------
 # --base-url http-to-non-localhost guard
 # ---------------------------------------------------------------------------
 

@@ -233,9 +233,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--biosample-accession",
         help="External biosample accession (e.g. NCBI), if known at create time",
     )
-    # --ena-sample-accession is deliberately NOT exposed: it's the
-    # publication-lock signal set by the submission subsystem, not a
-    # caller-supplied field.
+    # --ena-sample-accession is deliberately NOT exposed: an ENA
+    # accession is a submission-tracking value the submission subsystem
+    # writes back after an ENA submission, not part of the interactive
+    # create flow.
     p_biosample_create.set_defaults(handler=_handle_biosample_create)
 
     p_seqrun = sub.add_parser("sequencing-run", help="Sequencing-run operations")
@@ -351,8 +352,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_seqsample_create.add_argument("--metadata-checklist-idx", type=int)
     # ena_experiment_accession + ena_run_accession are deliberately NOT
-    # exposed: they're publication-lock signals set by the submission
-    # subsystem, not caller-supplied fields.
+    # exposed: ENA accessions are submission-tracking values the
+    # submission subsystem writes back after an ENA submission, not part
+    # of the interactive create flow.
     p_seqsample_create.set_defaults(handler=_handle_sequenced_sample_create)
 
     p_ticket = sub.add_parser("ticket", help="Work-ticket operations")

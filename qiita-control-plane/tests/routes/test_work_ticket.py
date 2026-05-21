@@ -1044,12 +1044,12 @@ async def test_get_work_ticket_originator_reads_own(
     assert body["failure_stage"] is None
 
 
-async def test_get_work_ticket_non_originator_403(
+async def test_get_work_ticket_non_originator_404(
     wt_client, admin_token, regular_token, reference_action, reference_idx
 ):
-    """A different USER (non-originator, no admin role) gets 403 — the
-    detail names the work_ticket so a confused client can see what they
-    asked for."""
+    """A different USER (non-originator, no admin role) gets 404 — the
+    same response a genuinely missing idx returns — so they cannot probe
+    work_ticket_idx values to learn which tickets exist."""
     token, _ = admin_token
     user_token, _ = regular_token
     action_id, version = reference_action
@@ -1060,8 +1060,9 @@ async def test_get_work_ticket_non_originator_403(
         URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=idx),
         headers={"Authorization": f"Bearer {user_token}"},
     )
-    assert resp.status_code == 403
-    assert str(idx) in resp.json()["detail"]
+    assert resp.status_code == 404
+    # Detail is identical to the missing-idx case — no existence signal.
+    assert resp.json()["detail"] == f"work_ticket {idx} not found"
 
 
 async def _seed_wet_lab_admin_token(postgres_pool, wt_client) -> tuple[str, int]:

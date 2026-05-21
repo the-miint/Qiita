@@ -164,11 +164,10 @@ async def synced_fastq_to_parquet_action(postgres_pool, tmp_path):
     )
 
 
-def _run_cli(base_url: str, token: str, *args: str) -> dict:
-    """Invoke `qiita <args>` as a subprocess via `python -m`; assert exit
-    0; parse the JSON the CLI prints to stdout on success. The PAT is
+def _invoke_cli(base_url: str, token: str, *args: str) -> subprocess.CompletedProcess:
+    """Run `qiita <args>` as a subprocess via `python -m`. The PAT is
     handed over through the QIITA_TOKEN env var the CLI reads."""
-    result = subprocess.run(
+    return subprocess.run(
         [
             sys.executable,
             "-m",
@@ -182,11 +181,29 @@ def _run_cli(base_url: str, token: str, *args: str) -> dict:
         text=True,
         timeout=30,
     )
+
+
+def _run_cli(base_url: str, token: str, *args: str) -> dict:
+    """Invoke the CLI; assert exit 0; parse the JSON it prints to stdout."""
+    result = _invoke_cli(base_url, token, *args)
     assert result.returncode == 0, (
         f"`qiita {' '.join(args)}` failed (rc={result.returncode})\n"
         f"stdout: {result.stdout}\nstderr: {result.stderr}"
     )
     return json.loads(result.stdout)
+
+
+def _run_cli_expect_failure(
+    base_url: str, token: str, *args: str
+) -> subprocess.CompletedProcess:
+    """Invoke the CLI; assert it exited non-zero; return the
+    CompletedProcess so the caller can inspect stderr."""
+    result = _invoke_cli(base_url, token, *args)
+    assert result.returncode != 0, (
+        f"`qiita {' '.join(args)}` unexpectedly succeeded\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    return result
 
 
 async def _fetch_prep_protocol_idx(
@@ -414,3 +431,42 @@ async def test_user_authoring_smoke_via_cli(
                 "DELETE FROM qiita.study WHERE idx = ANY($1::bigint[])",
                 created_study_idxs,
             )
+
+
+async def test_user_cannot_author_on_study_without_admin_access(
+    postgres_pool,
+    cp_server,
+    human_admin_session,
+    regular_user_session,
+):
+    """Negative path: a USER with no ADMIN access to a study cannot
+    create a biosample on it. The route's require_study_access gate
+    returns 403; the CLI surfaces that as a non-zero exit carrying
+    `http error 403`."""
+    user_token = regular_user_session["token"]
+    admin_idx = human_admin_session["principal_idx"]
+
+    # A study owned by the admin. The USER gets no study_access row, so
+    # their effective tier is public-by-absence -- below Tier.ADMIN.
+    study_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
+        " VALUES ($1, $2, $1) RETURNING idx",
+        admin_idx,
+        f"admin-owned-{uuid.uuid4()}",
+    )
+    try:
+        result = _run_cli_expect_failure(
+            cp_server,
+            user_token,
+            "biosample",
+            "create",
+            "--study-idx",
+            str(study_idx),
+            "--owner-biosample-id-field-name",
+            "sample_name",
+            "--owner-biosample-id-value",
+            "DENIED-1",
+        )
+        assert "http error 403" in result.stderr
+    finally:
+        await postgres_pool.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)

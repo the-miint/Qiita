@@ -12,7 +12,9 @@ return 202 with the ticket id and state.
 WorkTicket model (state, action info, scope target, action context, retry
 accounting, failure surface, timestamps) so a polling CLI can render
 everything in one round trip. Auth: the originator passes; wet_lab_admin+
-bypasses; otherwise 403.
+bypasses; everyone else gets 404 (not 403 — see the route docstring for
+why non-owners cannot distinguish a missing ticket from one they lack
+access to).
 
 `POST /api/v1/work-ticket/{idx}/run` — operator override. State-aware:
 
@@ -504,30 +506,33 @@ async def get_work_ticket(
     """Read a single ticket. Returns the full WorkTicket record so the
     caller-side CLI can render state, retry accounting, and the failure
     surface from one call. Auth: 401 on Anonymous; the originator passes;
-    wet_lab_admin+ bypasses; everyone else 403s. No per-study /
-    per-resource access path here — the originator-bypass already lets
-    the caller who submitted the ticket read it, and operator views are
-    served by the role bypass."""
+    wet_lab_admin+ bypasses. No per-study / per-resource access path here
+    — the originator-bypass already lets the caller who submitted the
+    ticket read it, and operator views are served by the role bypass.
+
+    A caller who is neither the originator nor a bypass-role gets 404,
+    not 403 — the same response a genuinely missing idx returns — so a
+    caller cannot probe work_ticket_idx values to learn which tickets
+    exist. Mirrors the enumeration-safe 404 the auth-token routes use
+    (see docs/auth.md)."""
     if isinstance(principal, Anonymous):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required"
         )
+    not_found = HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"work_ticket {work_ticket_idx} not found",
+    )
     row = await pool.fetchrow(
         f"SELECT {_WORK_TICKET_COLUMNS} FROM qiita.work_ticket WHERE work_ticket_idx = $1",
         work_ticket_idx,
     )
     if row is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"work_ticket {work_ticket_idx} not found",
-        )
+        raise not_found
     is_originator = row["originator_principal_idx"] == principal.principal_idx
     is_bypass = principal.has_role_at_least(SystemRole.WET_LAB_ADMIN)
     if not (is_originator or is_bypass):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"caller did not originate work_ticket {work_ticket_idx}",
-        )
+        raise not_found
     return _row_to_work_ticket(row)
 
 
