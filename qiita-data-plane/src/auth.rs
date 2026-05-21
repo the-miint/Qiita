@@ -1,7 +1,7 @@
 //! Flight ticket HMAC-SHA256 verification.
 //!
-//! Used by the Arrow Flight service (Phase 8) to verify signed tickets.
-//! Currently only exercised by tests; will be wired into do_get/do_action.
+//! Used by the Arrow Flight service to verify signed tickets on do_get,
+//! do_action, and do_put.
 //!
 //! Wire format (all multi-byte integers are big-endian):
 //!
@@ -321,7 +321,7 @@ mod tests {
     }
 
     // --------------------------------------------------------------------
-    // DoPut ticket variant (Cycle 2)
+    // DoPut ticket variant
     // --------------------------------------------------------------------
 
     /// Build a signed DoPut ticket with an arbitrary payload — lets tests

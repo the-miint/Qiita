@@ -280,7 +280,7 @@ impl QiitaFlightService {
     where
         S: Stream<Item = Result<FlightData, Status>> + Send + Unpin + 'static,
     {
-        // Phase 1: peel the first message, extract + verify the ticket.
+        // Peel the first message, extract + verify the ticket.
         let first = stream
             .next()
             .await
@@ -303,7 +303,7 @@ impl QiitaFlightService {
             )));
         }
 
-        // Phase 2: resolve staging path, create parent dir.
+        // Resolve staging path, create parent dir.
         let staging_path = staging_path_for(&self.upload_staging_root, payload.upload_idx);
         let parent = staging_path
             .parent()
@@ -311,7 +311,7 @@ impl QiitaFlightService {
         std::fs::create_dir_all(parent)
             .map_err(|e| Status::internal(format!("mkdir {}: {e}", parent.display())))?;
 
-        // Phase 3: write the parquet + chmod + body-encode under a single
+        // Write the parquet + chmod + body-encode under a single
         // error-guarded scope. Any Err return below cleans up the partial
         // staging file via the trailing `if result.is_err()` block — this is
         // the single cleanup site so a new fallible operation in this scope
@@ -347,12 +347,14 @@ impl QiitaFlightService {
         // create_new's atomic guard); deleting it would wipe a legitimate
         // upload owned by a different call.
         if let Err(ref e) = result {
-            if e.code() != tonic::Code::AlreadyExists && path_for_cleanup.exists() {
+            if e.code() != tonic::Code::AlreadyExists {
                 if let Err(cleanup_err) = std::fs::remove_file(&path_for_cleanup) {
-                    eprintln!(
-                        "warning: failed to clean up partial DoPut at {}: {cleanup_err}",
-                        path_for_cleanup.display()
-                    );
+                    if cleanup_err.kind() != std::io::ErrorKind::NotFound {
+                        eprintln!(
+                            "warning: failed to clean up partial DoPut at {}: {cleanup_err}",
+                            path_for_cleanup.display()
+                        );
+                    }
                 }
             }
         }
@@ -486,9 +488,9 @@ fn sha256_and_size(path: &Path) -> Result<(String, u64), Status> {
 
 /// Move Parquet files from staging to permanent storage and register in DuckLake.
 ///
-/// Phase 1: validate all requested files exist in staging.
-/// Phase 2: move all files to permanent locations under `data_path/{table_name}/`.
-/// Phase 3: attach DuckLake and register all moved files.
+/// Validates all requested files exist in staging, moves them to permanent
+/// locations under `data_path/{table_name}/`, then attaches DuckLake and
+/// registers the moved files.
 ///
 /// Uses `std::fs::rename` with a copy+delete fallback for cross-filesystem moves
 /// (e.g., SLURM local scratch → shared NFS).
@@ -504,7 +506,7 @@ fn register_files(
     let staging = std::path::Path::new(&payload.staging_dir);
     let perm_root = std::path::Path::new(data_path);
 
-    // Phase 1: validate all requested files exist.
+    // Validate all requested files exist.
     for filename in payload.files.keys() {
         let src = staging.join(filename);
         if !src.exists() {
@@ -515,7 +517,7 @@ fn register_files(
         }
     }
 
-    // Phase 2: move all files to permanent storage.
+    // Move all files to permanent storage.
     let mut moved: Vec<(String, std::path::PathBuf)> = Vec::new();
     for (filename, table) in &payload.files {
         let src = staging.join(filename);
@@ -531,7 +533,7 @@ fn register_files(
         moved.push((table.clone(), dest));
     }
 
-    // Phase 3: register in DuckLake. Tables are ensured at startup in main.rs.
+    // Register in DuckLake. Tables are ensured at startup in main.rs.
     let conn = duckdb::Connection::open_in_memory()
         .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
     ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
@@ -771,7 +773,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // DoPut handler tests (Cycle 2)
+    // DoPut handler tests
     // ------------------------------------------------------------------
 
     use arrow_array::{Int64Array, RecordBatch, StringArray};

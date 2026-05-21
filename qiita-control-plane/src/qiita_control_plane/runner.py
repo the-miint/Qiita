@@ -562,10 +562,10 @@ def _safe_entry_name(action: ActionDefinition, index: int | None) -> str | None:
 # =============================================================================
 #
 # Source-of-truth for the upload domain — what a `qiita.upload` row means
-# and the consume contract — lives in db/migrations/20260519000000_upload.sql
-# and PLAN-upload-doput.md. These helpers tie that domain to the workflow
-# runner: pre-step resolution (find the file the step will read) and
-# post-success consumption (mark the slot terminal).
+# and the consume contract — lives in db/migrations/20260519000000_upload.sql.
+# These helpers tie that domain to the workflow runner: pre-step resolution
+# (find the file the step will read) and post-success consumption (mark the
+# slot terminal).
 
 
 async def _resolve_upload_handles(
@@ -602,8 +602,17 @@ async def _resolve_upload_handles(
     referenced uploads in `ready` so the operator can decide whether to
     redrive against the same handles.
     """
-    resolved: dict[str, Path] = {}
-    to_consume: list[int] = []
+
+    def _bad(reason: str) -> BackendFailure:
+        return BackendFailure(
+            kind=FailureKind.BAD_INPUT,
+            stage=WorkTicketFailureStage.SUBMISSION,
+            step_name=None,
+            reason=reason,
+        )
+
+    # First pass: validate keys + value shape, collect (key, prefix, upload_idx).
+    pending: list[tuple[str, str, int]] = []
     for key, value in sorted(action_context.items()):
         if not key.endswith(_UPLOAD_IDX_SUFFIX):
             continue
@@ -613,66 +622,49 @@ async def _resolve_upload_handles(
         # `{prefix}_path` injection is always meaningful.
         prefix = key.removesuffix(_UPLOAD_IDX_SUFFIX)
         if not prefix:
-            raise BackendFailure(
-                kind=FailureKind.BAD_INPUT,
-                stage=WorkTicketFailureStage.SUBMISSION,
-                step_name=None,
-                reason=(
-                    f"action_context key {key!r} has no name prefix before "
-                    f"{_UPLOAD_IDX_SUFFIX!r}; use e.g. fasta_upload_idx, not _upload_idx"
-                ),
+            raise _bad(
+                f"action_context key {key!r} has no name prefix before "
+                f"{_UPLOAD_IDX_SUFFIX!r}; use e.g. fasta_upload_idx, not _upload_idx"
             )
         if not isinstance(value, int) or value <= 0:
-            raise BackendFailure(
-                kind=FailureKind.BAD_INPUT,
-                stage=WorkTicketFailureStage.SUBMISSION,
-                step_name=None,
-                reason=f"action_context.{key} must be a positive integer, got {value!r}",
-            )
-        upload_idx: int = value
-        row = await pool.fetchrow(
-            "SELECT status, created_by_idx FROM qiita.upload WHERE upload_idx = $1",
-            upload_idx,
-        )
+            raise _bad(f"action_context.{key} must be a positive integer, got {value!r}")
+        pending.append((key, prefix, value))
+
+    if not pending:
+        return {}, []
+
+    # Second pass: single batched fetch keyed by upload_idx → row.
+    upload_idxs = [p[2] for p in pending]
+    rows = await pool.fetch(
+        "SELECT upload_idx, status, created_by_idx FROM qiita.upload"
+        " WHERE upload_idx = ANY($1::bigint[])",
+        upload_idxs,
+    )
+    by_idx = {r["upload_idx"]: r for r in rows}
+
+    resolved: dict[str, Path] = {}
+    to_consume: list[int] = []
+    for key, prefix, upload_idx in pending:
+        row = by_idx.get(upload_idx)
         if row is None:
-            raise BackendFailure(
-                kind=FailureKind.BAD_INPUT,
-                stage=WorkTicketFailureStage.SUBMISSION,
-                step_name=None,
-                reason=f"action_context.{key}={upload_idx} references unknown upload",
-            )
+            raise _bad(f"action_context.{key}={upload_idx} references unknown upload")
         if row["status"] != UploadStatus.READY.value:
-            raise BackendFailure(
-                kind=FailureKind.BAD_INPUT,
-                stage=WorkTicketFailureStage.SUBMISSION,
-                step_name=None,
-                reason=(
-                    f"action_context.{key}={upload_idx} expected status "
-                    f"{UploadStatus.READY.value!r}, got {row['status']!r}"
-                ),
+            raise _bad(
+                f"action_context.{key}={upload_idx} expected status "
+                f"{UploadStatus.READY.value!r}, got {row['status']!r}"
             )
         if row["created_by_idx"] != originator_principal_idx:
-            raise BackendFailure(
-                kind=FailureKind.BAD_INPUT,
-                stage=WorkTicketFailureStage.SUBMISSION,
-                step_name=None,
-                reason=(
-                    f"action_context.{key}={upload_idx} was created by principal "
-                    f"{row['created_by_idx']}, work_ticket originator is "
-                    f"{originator_principal_idx}"
-                ),
+            raise _bad(
+                f"action_context.{key}={upload_idx} was created by principal "
+                f"{row['created_by_idx']}, work_ticket originator is "
+                f"{originator_principal_idx}"
             )
         staging_path = compute_upload_staging_path(upload_staging_root, upload_idx)
         if not staging_path.exists():
-            raise BackendFailure(
-                kind=FailureKind.BAD_INPUT,
-                stage=WorkTicketFailureStage.SUBMISSION,
-                step_name=None,
-                reason=(
-                    f"action_context.{key}={upload_idx} resolves to {staging_path} "
-                    "but the staged file is missing — CP and DP "
-                    "upload_staging_root disagree, or scratch was wiped"
-                ),
+            raise _bad(
+                f"action_context.{key}={upload_idx} resolves to {staging_path} "
+                "but the staged file is missing — CP and DP "
+                "upload_staging_root disagree, or scratch was wiped"
             )
         resolved[prefix + _PATH_SUFFIX] = staging_path
         to_consume.append(upload_idx)

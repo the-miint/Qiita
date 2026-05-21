@@ -375,7 +375,9 @@ def test_blob_to_single_row_parquet_round_trips(tmp_path):
 
     src = tmp_path / "tree.nwk"
     src.write_text("(a:0.1,b:0.2);")
-    out = _blob_to_single_row_parquet(src, tmp_path / "ws", column_name="newick_bytes")
+    out = _blob_to_single_row_parquet(
+        src, tmp_path / "ws", label="tree", column_name="newick_bytes"
+    )
     assert out.exists()
     with duckdb.connect(":memory:") as conn:
         rows = conn.execute(f"SELECT newick_bytes FROM read_parquet('{out}')").fetchall()

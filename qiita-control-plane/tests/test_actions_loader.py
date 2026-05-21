@@ -135,12 +135,12 @@ def test_load_actions_missing_dir_raises(tmp_path):
 
 def test_load_actions_loads_on_disk_reference_add_yaml():
     """The actual on-disk `workflows/reference-add/1.0.0.yaml` (not a
-    synthetic inline copy) loads as a valid ActionDefinition and matches
-    the upload-doput Cycle 4 shape: hash step gone, replaced by
-    `hash_sequences` (module); `load` is a module step pointing at
-    `reference_load`; the `context_schema` requires `fasta_upload_idx`
-    rather than `fasta_path`. Locks the on-disk YAML so an accidental
-    revert to the legacy container shape surfaces here."""
+    synthetic inline copy) loads as a valid ActionDefinition: the legacy
+    container `hash` step is gone, replaced by `hash_sequences` (module);
+    `load` is a module step pointing at `reference_load`; the
+    `context_schema` requires `fasta_upload_idx` rather than `fasta_path`.
+    Locks the on-disk YAML so an accidental revert to the legacy container
+    shape surfaces here."""
     from pathlib import Path
 
     from qiita_control_plane.actions import load_actions

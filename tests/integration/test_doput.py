@@ -1,6 +1,6 @@
 """End-to-end integration test for the upload domain.
 
-Exercises the full Cycle 1 + Cycle 2 path:
+Exercises the full mint-slot + DoPut path:
 
     1. POST /api/v1/upload via the in-process CP (mints qiita.upload row,
        returns a signed DoPut ticket).

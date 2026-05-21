@@ -33,15 +33,15 @@ expect to read on disk:
   - genome_map Parquet → passthrough copy.
 
 Client does NOT canonicalize sequences — that happens server-side inside
-hash_sequences (see PLAN-upload-doput Cycle 3, locked decision #2).
+hash_sequences. Hashes the client forwards on /done are descriptive only.
 
 **Failure UX.** Mid-upload network drops surface as `httpx.HTTPStatusError`
 or `pyarrow.flight.FlightError` — no silent retry. The caller sees the
 specific failure and decides whether to restart. Already-uploaded slots
 that didn't complete /done stay at status='pending' and age out via a
 future cleanup sweep; they cannot be reused because the slot's DoPut
-ticket is one-shot (the data plane refuses a second write to the same
-upload_idx; see Cycle 2 outputs).
+ticket is one-shot — the data plane refuses a second write to the same
+upload_idx.
 """
 
 from __future__ import annotations
@@ -49,7 +49,8 @@ from __future__ import annotations
 import base64
 import json
 import logging
-from collections.abc import Iterable
+import os
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -57,9 +58,9 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 from qiita_common.api_paths import (
-    API_PREFIX,
     URL_REFERENCE_PREFIX,
     URL_UPLOAD_DONE,
+    URL_UPLOAD_PREFIX,
     URL_WORK_TICKET_BY_IDX,
     URL_WORK_TICKET_PREFIX,
 )
@@ -113,17 +114,14 @@ def _fasta_to_upload_parquet(fasta_path: Path, workspace: Path) -> Path:
     convention); the SELECT aliases it to `sequence` so hash_sequences'
     `SELECT upper(sequence) FROM read_parquet(?)` picks up the right
     column. preserve_insertion_order is left at default — read order
-    isn't load-bearing here; hash_sequences computes its own sort."""
+    isn't load-bearing here; hash_sequences computes its own sort.
+
+    Reuses `MIINT_EXTENSION_REPO` (the orchestrator's flag) when set so
+    the team mirror's unsigned binaries are picked up here too."""
     import duckdb
 
     _ensure_workspace(workspace)
     out = workspace / "fasta_upload.parquet"
-    # Install + load miint on the local connection. The orchestrator's
-    # `ensure_miint_installed` lives on a separate venv; reuse the
-    # community-mirror env var if set (team mirror serves unsigned
-    # binaries; same flag the orchestrator uses).
-    import os
-
     mirror = os.environ.get("MIINT_EXTENSION_REPO")
     config = {"allow_unsigned_extensions": "true"} if mirror else {}
     with duckdb.connect(":memory:", config=config) as conn:
@@ -160,25 +158,40 @@ def _passthrough_parquet_copy(src: Path, workspace: Path, label: str) -> Path:
     return out
 
 
-def _blob_to_single_row_parquet(src: Path, workspace: Path, *, column_name: str) -> Path:
+def _blob_to_single_row_parquet(
+    src: Path, workspace: Path, *, label: str, column_name: str
+) -> Path:
     """Newick / jplace / any opaque text file → single-row Parquet with
     one BLOB column. The server-side native job reads the column via
     `read_*` (read_newick / read_jplace) which expects an on-disk
     filesystem path, not a BLOB — so this representation is provisional:
     the orchestrator step writes the BLOB back out to its workspace
-    before invoking the parser. Cycle 4's reference_load module reads
-    Newick / jplace via filesystem paths (see `_write_phylogeny` and
-    `_write_placements`); a follow-up will switch to reading the BLOB
-    inline once miint's `read_newick` accepts an in-memory string."""
+    before invoking the parser (see `_write_phylogeny` and
+    `_write_placements` in `reference_load`). A follow-up will switch to
+    reading the BLOB inline once miint's `read_newick` accepts an
+    in-memory string."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     _ensure_workspace(workspace)
-    out = workspace / f"{column_name.split('_')[0]}_upload.parquet"
+    out = workspace / f"{label}_upload.parquet"
     blob = src.read_bytes()
     table = pa.table({column_name: [blob]}, schema=pa.schema([(column_name, pa.binary())]))
     pq.write_table(table, out)
     return out
+
+
+_ROLE_CONVERTERS: dict[str, Callable[[Path, Path], Path]] = {
+    "fasta": _fasta_to_upload_parquet,
+    "taxonomy": lambda src, ws: _passthrough_parquet_copy(src, ws, "taxonomy"),
+    "tree": lambda src, ws: _blob_to_single_row_parquet(
+        src, ws, label="tree", column_name="newick_bytes"
+    ),
+    "jplace": lambda src, ws: _blob_to_single_row_parquet(
+        src, ws, label="jplace", column_name="jplace_bytes"
+    ),
+    "genome_map": lambda src, ws: _passthrough_parquet_copy(src, ws, "genome_map"),
+}
 
 
 def _convert_for_role(file_path: Path, role: str, workspace: Path) -> Path:
@@ -187,17 +200,10 @@ def _convert_for_role(file_path: Path, role: str, workspace: Path) -> Path:
     point also creates it but standalone callers (tests, future custom
     pipelines) may not."""
     workspace.mkdir(parents=True, exist_ok=True)
-    if role == "fasta":
-        return _fasta_to_upload_parquet(file_path, workspace)
-    if role == "taxonomy":
-        return _passthrough_parquet_copy(file_path, workspace, "taxonomy")
-    if role == "tree":
-        return _blob_to_single_row_parquet(file_path, workspace, column_name="newick_bytes")
-    if role == "jplace":
-        return _blob_to_single_row_parquet(file_path, workspace, column_name="jplace_bytes")
-    if role == "genome_map":
-        return _passthrough_parquet_copy(file_path, workspace, "genome_map")
-    raise ValueError(f"unknown upload role: {role!r}")
+    try:
+        return _ROLE_CONVERTERS[role](file_path, workspace)
+    except KeyError as exc:
+        raise ValueError(f"unknown upload role: {role!r}") from exc
 
 
 # =============================================================================
@@ -212,17 +218,18 @@ def _auth_headers(token: str) -> dict[str, str]:
 async def _post(
     http: httpx.AsyncClient,
     token: str,
-    path: str,
+    url: str,
     *,
     body: dict[str, Any] | None = None,
     expected_status: Iterable[int] = (200, 201, 202),
 ) -> dict[str, Any]:
     """Authenticated POST that asserts the response status and returns
-    the decoded JSON body. Path is post-API_PREFIX (e.g. `/upload`)."""
-    resp = await http.post(f"{API_PREFIX}{path}", headers=_auth_headers(token), json=body or {})
+    the decoded JSON body. `url` is the full path including API_PREFIX
+    (e.g. `URL_UPLOAD_PREFIX`)."""
+    resp = await http.post(url, headers=_auth_headers(token), json=body or {})
     if resp.status_code not in expected_status:
         raise httpx.HTTPStatusError(
-            f"POST {path} expected {sorted(expected_status)}, got {resp.status_code}: {resp.text}",
+            f"POST {url} expected {sorted(expected_status)}, got {resp.status_code}: {resp.text}",
             request=resp.request,
             response=resp,
         )
@@ -232,9 +239,9 @@ async def _post(
 async def _get(
     http: httpx.AsyncClient,
     token: str,
-    path: str,
+    url: str,
 ) -> dict[str, Any]:
-    resp = await http.get(f"{API_PREFIX}{path}", headers=_auth_headers(token))
+    resp = await http.get(url, headers=_auth_headers(token))
     resp.raise_for_status()
     return resp.json()
 
@@ -254,30 +261,18 @@ def _do_put_sync(
     import pyarrow.parquet as pq
 
     descriptor = flight.FlightDescriptor.for_command(ticket_bytes)
-    table = pq.read_table(upload_parquet_path)
-    # Stream as RecordBatches so a multi-GB FASTA's Parquet doesn't
-    # materialise the whole table on the wire side; pyarrow.flight's
-    # writer handles back-pressure.
-    batches = table.to_batches()
-    if not batches:
-        # Empty input → still need to open the writer to surface a
-        # PutResult (the data plane writes a zero-row Parquet); use the
-        # table's schema directly.
-        writer, reader = flight_client.do_put(descriptor, table.schema)
-        try:
-            writer.done_writing()
-            put_metadata = reader.read()
-        finally:
-            writer.close()
-    else:
-        writer, reader = flight_client.do_put(descriptor, batches[0].schema)
-        try:
-            for batch in batches:
-                writer.write_batch(batch)
-            writer.done_writing()
-            put_metadata = reader.read()
-        finally:
-            writer.close()
+    # iter_batches keeps memory bounded — a multi-GB FASTA Parquet never
+    # materialises in the CLI process. The pyarrow.flight writer
+    # back-pressures on the wire side.
+    pf = pq.ParquetFile(upload_parquet_path)
+    writer, reader = flight_client.do_put(descriptor, pf.schema_arrow)
+    try:
+        for batch in pf.iter_batches():
+            writer.write_batch(batch)
+        writer.done_writing()
+        put_metadata = reader.read()
+    finally:
+        writer.close()
     if put_metadata is None:
         raise RuntimeError(f"data plane returned no PutResult for upload at {upload_parquet_path}")
     return json.loads(bytes(put_metadata).decode())
@@ -305,7 +300,7 @@ async def upload_file(
     upload_parquet = _convert_for_role(file_path, role, workspace)
 
     create_body = {"description": description or f"{role}: {file_path.name}"}
-    create = await _post(http, token, "/upload", body=create_body, expected_status=(201,))
+    create = await _post(http, token, URL_UPLOAD_PREFIX, body=create_body, expected_status=(201,))
     upload_idx = create["upload_idx"]
     ticket_bytes = base64.b64decode(create["doput_ticket"])
 
@@ -316,11 +311,10 @@ async def upload_file(
             f"minted slot {upload_idx} — likely a ticket / DP misconfiguration"
         )
 
-    done_path = URL_UPLOAD_DONE.format(upload_idx=upload_idx).removeprefix(API_PREFIX)
     await _post(
         http,
         token,
-        done_path,
+        URL_UPLOAD_DONE.format(upload_idx=upload_idx),
         body={
             "sha256": put_body["sha256"],
             "row_count": put_body["row_count"],
@@ -350,13 +344,11 @@ async def watch_work_ticket(
     import asyncio
     import time
 
-    by_idx_path = URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=work_ticket_idx).removeprefix(
-        API_PREFIX
-    )
+    by_idx_url = URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=work_ticket_idx)
     deadline = time.monotonic() + timeout_seconds
     last_state: str | None = None
     while True:
-        body = await _get(http, token, by_idx_path)
+        body = await _get(http, token, by_idx_url)
         state = body.get("state")
         if state != last_state:
             _log.info("work_ticket %d state=%s", work_ticket_idx, state)
@@ -413,7 +405,7 @@ async def do_reference_load(
         create = await _post(
             http,
             token,
-            URL_REFERENCE_PREFIX.removeprefix(API_PREFIX),
+            URL_REFERENCE_PREFIX,
             body={"name": name, "version": version, "kind": kind or "sequence_reference"},
             expected_status=(201,),
         )
@@ -470,7 +462,7 @@ async def do_reference_load(
         submit = await _post(
             http,
             token,
-            URL_WORK_TICKET_PREFIX.removeprefix(API_PREFIX),
+            URL_WORK_TICKET_PREFIX,
             body=submit_body,
             expected_status=(202,),
         )

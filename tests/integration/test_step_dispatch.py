@@ -85,9 +85,8 @@ async def test_step_dispatch_hash_end_to_end(orchestrator_app, tmp_path):
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=1,
             # StepRunRequest validates exactly-one(container, module);
-            # LocalBackend now rejects container steps wholesale, so the
-            # native dispatch under `module:` is the only LocalBackend
-            # path post-Cycle-4.
+            # LocalBackend rejects container steps wholesale, so native
+            # dispatch under `module:` is the only LocalBackend path.
             module=_HASH_SEQUENCES_MODULE,
         )
 
@@ -102,8 +101,9 @@ async def test_step_dispatch_hash_end_to_end(orchestrator_app, tmp_path):
                 f"SELECT column_name FROM (DESCRIBE SELECT * FROM '{manifest}')"
             ).fetchall()
         ]
-        # Cycle 3 renamed `length` → `sequence_length_bp` so the new
-        # manifest and `reference_sequence` share a column name.
+        # `manifest` and `reference_sequence` share the
+        # `sequence_length_bp` column so downstream JOINs don't trip on
+        # naming drift.
         assert cols == ["read_id", "sequence_hash", "sequence_length_bp"]
         n = conn.execute(f"SELECT count(*) FROM '{manifest}'").fetchone()[0]
         assert n == 2

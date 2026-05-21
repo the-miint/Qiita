@@ -142,7 +142,7 @@ async def test_create_upload_slot_without_description(ctx):
 async def test_create_upload_slot_doput_ticket_decodes_to_upload_idx(ctx):
     """The doput_ticket bytes embed the same upload_idx the response carries.
 
-    Locks the wire contract Cycle 2's Rust verifier will key off — payload
+    Locks the wire contract the data-plane Rust verifier keys off — payload
     JSON is `{"action": "doput", "upload_idx": N}`.
     """
     import base64
@@ -234,10 +234,11 @@ async def test_upload_done_rejects_conflicting_retry(ctx):
 
 
 async def test_upload_done_on_consumed_row_returns_409(ctx):
-    """Calling /done on a `consumed` row (Cycle 4 transitions ready→consumed)
-    falls through to the catch-all 409 with the current status in the detail.
+    """Calling /done on a `consumed` row (the workflow runner transitions
+    ready→consumed) falls through to the catch-all 409 with the current
+    status in the detail.
 
-    Direct-DB-insert because Cycle 1 has no public path to `consumed`.
+    Direct-DB-insert because no public route lands a row in `consumed`.
     """
     create_resp = await _create_upload(ctx["admin"])
     idx = _track(ctx, create_resp)

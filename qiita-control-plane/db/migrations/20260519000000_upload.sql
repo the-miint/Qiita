@@ -14,8 +14,8 @@
 --   ready    → client called POST /upload/{idx}/done; staged file is final.
 --   consumed → a workflow runner read the upload as an input.
 --   failed   → future: the data plane reported a write error, or a cleanup
---              sweep aged out a stale pending row. No transition path here
---              wires it in Cycle 1.
+--              sweep aged out a stale pending row. No transition path
+--              currently lands this state.
 --
 -- Source-of-truth for the staging path is `Settings.upload_staging_root +
 -- upload_idx` — not stored on the row. Keeps the schema small and lets a
@@ -69,8 +69,8 @@ COMMENT ON COLUMN qiita.upload.sha256 IS
     'computes its own content-addressing pass and surfaces mismatches.';
 
 -- Lookup by owner + status is the natural shape for a future
--- "show me my pending uploads" admin view. Cheap to add now; deferring
--- the view to a follow-up cycle.
+-- "show me my pending uploads" admin view. Cheap to add the index now;
+-- the view itself is deferred.
 CREATE INDEX upload_created_by_status_idx
     ON qiita.upload (created_by_idx, status);
 

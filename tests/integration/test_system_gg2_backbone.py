@@ -28,7 +28,7 @@ Pinned-version note: the row-count constants below
 specific to the GG2 2024.09 backbone snapshot. A future release-cycle
 update that re-pins to a newer snapshot must re-derive these.
 
-Canonical-hash note: post-Cycle-3, hash_sequences canonicalizes via
+Canonical-hash note: hash_sequences canonicalizes via
 `md5(LEAST(upper(seq), sequence_dna_reverse_complement(upper(seq))))`.
 If any backbone entries collapse under canonicalization (a sequence
 and its reverse complement both present in the input FASTA), the

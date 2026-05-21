@@ -3,8 +3,8 @@
 Calls `execute()` directly (not through LocalBackend / run_native_job)
 so failures point at the canonical-hash / dedup / chunk logic, not
 framework wiring. The full-stack happy path against a real staged
-upload Parquet lives in the integration suite added by Cycle 5; this
-file covers the branches that path won't exercise:
+upload Parquet lives in the integration suite; this file covers the
+branches that path won't exercise:
 
   - Reverse-complement collapse: a read and its revcomp share one
     canonical hash; manifest preserves both rows.

@@ -29,6 +29,7 @@ from qiita_common.models import (
     UploadCreateResponse,
     UploadDoneRequest,
     UploadResponse,
+    UploadStatus,
 )
 
 from ..auth.guards import require_scope
@@ -114,17 +115,19 @@ async def complete_upload(
     # else (or the idx doesn't exist), and we disambiguate below.
     row = await pool.fetchrow(
         "UPDATE qiita.upload"
-        " SET status = 'ready',"
-        "     sha256 = $1,"
-        "     row_count = $2,"
-        "     bytes_received = $3,"
+        " SET status = $1,"
+        "     sha256 = $2,"
+        "     row_count = $3,"
+        "     bytes_received = $4,"
         "     completed_at = now()"
-        " WHERE upload_idx = $4 AND status = 'pending'"
+        " WHERE upload_idx = $5 AND status = $6"
         f" RETURNING {_UPLOAD_RETURNING}",
+        UploadStatus.READY.value,
         body.sha256,
         body.row_count,
         body.bytes_received,
         upload_idx,
+        UploadStatus.PENDING.value,
     )
     if row is not None:
         return _record_to_response(row)
@@ -143,7 +146,7 @@ async def complete_upload(
     # Idempotency: a `ready` row with the same claim returns 200 with the
     # current state. A `ready` row with a different claim is a contract
     # violation (the staged file is immutable post-DoPut); fail loud.
-    if current["status"] == "ready":
+    if current["status"] == UploadStatus.READY.value:
         same = (
             current["sha256"] == body.sha256
             and current["row_count"] == body.row_count
@@ -158,7 +161,7 @@ async def complete_upload(
 
     raise HTTPException(
         status_code=409,
-        detail=f"upload status is {current['status']!r}, expected 'pending'",
+        detail=(f"upload status is {current['status']!r}, expected {UploadStatus.PENDING.value!r}"),
     )
 
 

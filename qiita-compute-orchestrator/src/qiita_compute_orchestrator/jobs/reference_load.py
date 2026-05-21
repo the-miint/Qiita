@@ -132,16 +132,24 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             conn.execute("SET preserve_insertion_order=false")
             conn.execute(f"SET temp_directory='{duckdb_tmp}'")
 
+            # Pull feature_map into a TEMP TABLE once — every downstream
+            # write JOINs against it (sequences, chunks, membership) and
+            # _build_id_map needs it too. Without this each helper would
+            # re-scan the file.
+            conn.execute(
+                "CREATE TEMP TABLE feature_map AS SELECT * FROM read_parquet(?)",
+                [str(inputs.feature_map_path)],
+            )
+
             # id_map: read_id → feature_idx (via sequence_hash). The
             # taxonomy / phylogeny / placements writes all key off
             # read_id, so this single JOIN is the bridge to feature_idx.
             # Counts also drive the unmapped-hash check below.
-            _build_id_map(conn, inputs.manifest_path, inputs.feature_map_path)
+            _build_id_map(conn, inputs.manifest_path)
 
             _write_reference_sequences(
                 conn,
                 inputs.reference_sequence_path,
-                inputs.feature_map_path,
                 sequences_out,
             )
             written.append(sequences_path)
@@ -149,14 +157,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             _write_reference_sequence_chunks(
                 conn,
                 inputs.reference_sequence_chunks_path,
-                inputs.feature_map_path,
                 chunks_out,
             )
             written.append(chunks_path)
 
-            _write_reference_membership(
-                conn, inputs.feature_map_path, inputs.reference_idx, membership_out
-            )
+            _write_reference_membership(conn, inputs.reference_idx, membership_out)
             written.append(membership_path)
 
             if inputs.taxonomy_path is not None:
@@ -192,6 +197,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 written.append(placements_out_path)
 
             conn.execute("DROP TABLE id_map")
+            conn.execute("DROP TABLE feature_map")
         success = True
     finally:
         shutil.rmtree(duckdb_tmp, ignore_errors=True)
@@ -247,12 +253,12 @@ def _unwrap_blob_to_temp_file(
 def _build_id_map(
     conn: duckdb.DuckDBPyConnection,
     manifest_path: Path,
-    feature_map_path: Path,
 ) -> None:
-    """Join manifest + feature_map on sequence_hash. Raises ValueError if
-    any manifest row lacks a matching feature_map row — mint-features is
-    supposed to mint a feature_idx for every distinct hash, so a gap
-    means upstream produced inconsistent inputs (permanent error)."""
+    """Join manifest + feature_map (TEMP TABLE pre-loaded by execute) on
+    sequence_hash. Raises ValueError if any manifest row lacks a matching
+    feature_map row — mint-features is supposed to mint a feature_idx for
+    every distinct hash, so a gap means upstream produced inconsistent
+    inputs (permanent error)."""
     manifest_count = conn.execute(
         "SELECT count(*) FROM read_parquet(?)",
         [str(manifest_path)],
@@ -264,9 +270,9 @@ def _build_id_map(
         "  m.sequence_hash,"
         "  m.sequence_length_bp "
         "FROM read_parquet(?) m "
-        "JOIN read_parquet(?) fm "
+        "JOIN feature_map fm "
         "  ON m.sequence_hash = fm.sequence_hash",
-        [str(manifest_path), str(feature_map_path)],
+        [str(manifest_path)],
     )
 
     id_map_count = conn.execute("SELECT count(*) FROM id_map").fetchone()[0]
@@ -285,7 +291,6 @@ def _build_id_map(
 def _write_reference_sequences(
     conn: duckdb.DuckDBPyConnection,
     reference_sequence_path: Path,
-    feature_map_path: Path,
     out: str,
 ) -> None:
     """Re-key hash_sequences' `reference_sequence.parquet` (hash-keyed)
@@ -298,17 +303,16 @@ def _write_reference_sequences(
         "    rs.sequence_hash,"
         "    rs.sequence_length_bp"
         "  FROM read_parquet(?) rs"
-        "  JOIN read_parquet(?) fm ON rs.sequence_hash = fm.sequence_hash"
+        "  JOIN feature_map fm ON rs.sequence_hash = fm.sequence_hash"
         "  ORDER BY fm.feature_idx"
         f") TO '{out}' ({PARQUET_OPTS})",
-        [str(reference_sequence_path), str(feature_map_path)],
+        [str(reference_sequence_path)],
     )
 
 
 def _write_reference_sequence_chunks(
     conn: duckdb.DuckDBPyConnection,
     reference_sequence_chunks_path: Path,
-    feature_map_path: Path,
     out: str,
 ) -> None:
     """Re-key hash_sequences' chunks (hash-keyed) to DuckLake's
@@ -322,16 +326,15 @@ def _write_reference_sequence_chunks(
         "    rc.chunk_index,"
         "    rc.chunk_data"
         "  FROM read_parquet(?) rc"
-        "  JOIN read_parquet(?) fm ON rc.sequence_hash = fm.sequence_hash"
+        "  JOIN feature_map fm ON rc.sequence_hash = fm.sequence_hash"
         "  ORDER BY fm.feature_idx, rc.chunk_index"
         f") TO '{out}' ({PARQUET_OPTS_CHUNKED})",
-        [str(reference_sequence_chunks_path), str(feature_map_path)],
+        [str(reference_sequence_chunks_path)],
     )
 
 
 def _write_reference_membership(
     conn: duckdb.DuckDBPyConnection,
-    feature_map_path: Path,
     reference_idx: int,
     out: str,
 ) -> None:
@@ -343,10 +346,9 @@ def _write_reference_membership(
     conn.execute(
         "COPY ("
         f"  SELECT CAST({reference_idx} AS BIGINT) AS reference_idx, feature_idx"
-        "  FROM read_parquet(?)"
+        "  FROM feature_map"
         "  ORDER BY feature_idx"
-        f") TO '{out}' ({PARQUET_OPTS})",
-        [str(feature_map_path)],
+        f") TO '{out}' ({PARQUET_OPTS})"
     )
 
 
@@ -358,9 +360,8 @@ def _write_taxonomy(
 ) -> None:
     """Parse semicolon-delimited rank string from the input Parquet's
     `(feature_id, taxonomy)` rows, JOIN against id_map on read_id, and
-    emit one DuckLake row per matched feature. Lifted verbatim from the
-    legacy `_write_taxonomy` in backends/local.py — same validation
-    (≤8 ranks, no blank fields, prefix order), same column shape."""
+    emit one DuckLake row per matched feature. Validation: ≤8 ranks, no
+    blank fields, prefix order."""
     conn.execute(
         "CREATE TEMP TABLE parsed_taxonomy AS "
         "SELECT "
@@ -429,8 +430,7 @@ def _write_phylogeny(
     out: str,
 ) -> None:
     """Parse a Newick tree and emit one DuckLake row per node, with
-    feature_idx populated on tips that match a known read_id. Lifted
-    verbatim from legacy `_write_phylogeny`."""
+    feature_idx populated on tips that match a known read_id."""
     conn.execute(
         "CREATE TEMP TABLE tree_nodes AS SELECT * FROM read_newick(?)",
         [str(tree_path)],
@@ -457,8 +457,7 @@ def _write_placements(
 ) -> None:
     """Parse a jplace file and emit one row per (fragment, edge_num).
     Fragments not in id_map are dropped (jplace may carry rows for
-    fragments outside this reference's mint scope). Lifted verbatim from
-    legacy `_write_placements`."""
+    fragments outside this reference's mint scope)."""
     conn.execute(
         "COPY ("
         f"  SELECT CAST({reference_idx} AS BIGINT) AS reference_idx,"

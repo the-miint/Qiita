@@ -149,8 +149,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # `sequence_length_bp` (not `length`) matches the column
             # name used in reference_sequence.parquet so a downstream
             # JOIN on a common column doesn't trip over naming drift;
-            # mint-features / write-membership (Cycle 4) read this name
-            # directly from both files.
+            # mint-features / write-membership read this name directly
+            # from both files.
             conn.execute(
                 "COPY ("
                 "  SELECT read_id, sequence_hash, sequence_length_bp"
@@ -179,12 +179,9 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             )
 
             # reference_sequence_chunks.parquet — 64 KB chunks over each
-            # unique canonical sequence. The chunking macro mirrors the
-            # legacy `_write_sequence_chunks` shape in backends/local.py
-            # (removed in Cycle 4) — same list_transform + UNNEST pattern,
-            # same CHUNK_SIZE, same ROW_GROUP_SIZE. Keyed by
-            # sequence_hash here (vs feature_idx in the legacy path)
-            # because mint-features hasn't run yet.
+            # unique canonical sequence. Keyed by sequence_hash (vs
+            # feature_idx in the post-mint shape) because mint-features
+            # hasn't run yet.
             conn.execute(
                 "CREATE OR REPLACE MACRO chunk_seq(str) AS "
                 "list_transform("
