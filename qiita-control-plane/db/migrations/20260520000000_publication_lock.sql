@@ -10,18 +10,29 @@
 -- prep_sample_metadata rows, the published link itself, and the underlying
 -- biosample plus its metadata / study-links) is frozen against mutation.
 --
--- Two paths set is_published = TRUE on a link:
---   (a) Cascade from ENA accession transitions: when sequenced_sample's
---       ena_experiment_accession or ena_run_accession goes NULL -> set,
---       OR biosample's ena_sample_accession goes NULL -> set, ALL of the
---       prep's links flip to is_published = TRUE. ENA submission is a
---       globally-observable publication event; trying to keep a prep
---       "private in some secondary study" while its data is downloadable
---       from ENA would be a fiction. The cascade reconciles the model
---       with reality.
---   (b) Owner-driven publish action (future PR): the owner explicitly
---       flips a single prep_sample_to_study.is_published from FALSE to
---       TRUE. Other links of the same prep keep their state.
+-- WHAT SETS is_published. One path: an owner-driven publish action
+-- (future PR) explicitly flips a prep_sample_to_study.is_published from
+-- FALSE to TRUE. Publication is a deliberate act.
+--
+-- ENA accessions do NOT set is_published, and this migration wires no
+-- trigger from them. An ENA accession (biosample.ena_sample_accession,
+-- sequenced_sample.ena_experiment_accession / ena_run_accession) records
+-- that the row was submitted to ENA -- and an ENA submission can sit
+-- under embargo, accession already assigned but the data not yet
+-- publicly released. "Has an accession" is a submission-tracking fact,
+-- not a publication fact; the two are independent. Conflating them would
+-- freeze records that are merely submitted (and still legitimately
+-- editable before release) and would also miss owner-published records
+-- that never went to ENA at all.
+--
+-- DIRECTION. Publication freezes UPWARD, never downward. A published
+-- prep freezes its own rows AND the biosample beneath it (the biosample
+-- sits under the published prep's record). It does NOT freeze downward:
+-- a biosample that is frozen because one prep on it is published leaves
+-- every OTHER, unpublished prep on that same biosample freely mutable --
+-- a specimen can carry preps that were never published. The per-prep
+-- is_prep_sample_published check gives this for free; the biosample is
+-- reached only via is_biosample_reaching_published_prep.
 --
 -- The lock-trigger family is BEFORE UPDATE on every row type a published
 -- prep transitively reaches:
@@ -29,11 +40,10 @@
 --     prep_sample_to_study (the published link), biosample,
 --     biosample_metadata, biosample_to_study.
 -- Each lock trigger asks "is OLD already published?" (via the relevant
--- relationship) and rejects the UPDATE if so. The first ENA-set UPDATE
--- itself is *not* blocked because pre-write the row is still
--- pre-publication (is_published is FALSE on every link); the cascade then
--- flips the flag AFTER the row is in place, so future UPDATEs see TRUE
--- and are rejected.
+-- relationship) and rejects the UPDATE if so. The publish action's own
+-- FALSE -> TRUE UPDATE on the link is not blocked: pre-write
+-- OLD.is_published is still FALSE, so the lock lets the publication
+-- through; every UPDATE after that sees TRUE and is rejected.
 --
 -- The retire path is an UPDATE (sets retired = TRUE), which the lock
 -- trigger catches when the row is published -- correct behavior, since
@@ -44,20 +54,18 @@
 -- trigger here without a session-var bypass would break every test that
 -- seeds a prep_sample.
 --
--- TRIPWIRE — no system_admin / wet_lab_admin bypass is wired in this
+-- TRIPWIRE -- no system_admin / wet_lab_admin bypass is wired in this
 -- migration. If future operations need to mutate published data, the
 -- right shape is a session-scoped GUC (set_config(
 -- 'qiita.bypass_publication_lock', 'on', TRUE)) that each lock trigger
 -- checks first. There are SEVEN lock triggers (publication_lock_*
 -- below); a GUC implementer must add the bypass check to EVERY one or
 -- the lock becomes selectively porous. The COMMENT ON TRIGGER strings
--- at the bottom of this file repeat this note so a `\d+` reader sees
--- it. Deferred until an actual humans-facing PATCH endpoint requires
--- it; the current PATCH routes are admin-only and out of scope here.
+-- at the bottom of this file repeat this note so a `\d+` reader sees it.
 --
 -- The is_published column itself lives in the prep_sample_to_study
--- CREATE TABLE (20260501000011_prep_sample.sql), not here — this
--- migration owns only the cascade + lock trigger behavior over it.
+-- CREATE TABLE (20260501000011_prep_sample.sql), not here -- this
+-- migration owns only the lock-trigger behavior over it.
 
 
 -- =============================================================================
@@ -76,7 +84,8 @@ $$ LANGUAGE sql STABLE;
 
 -- "Does this biosample reach ANY published prep_sample (via prep_sample
 -- ownership of this biosample)?" The join lives in the function rather
--- than in each caller so the lock triggers stay short.
+-- than in each caller so the lock triggers stay short. This is the
+-- upward direction: a published prep freezes the biosample beneath it.
 CREATE OR REPLACE FUNCTION qiita.is_biosample_reaching_published_prep(p_biosample_idx BIGINT)
 RETURNS BOOLEAN AS $$
     SELECT EXISTS (
@@ -86,61 +95,6 @@ RETURNS BOOLEAN AS $$
            AND pts.is_published = TRUE
     );
 $$ LANGUAGE sql STABLE;
-
-
--- =============================================================================
--- CASCADE TRIGGERS (ENA accession -> is_published)
--- =============================================================================
-
--- sequenced_sample side. The 1:1 subtype carries its own GENERATED-ALWAYS
--- idx plus the foreign-keyed prep_sample_idx column that points back at
--- the supertype; use NEW.prep_sample_idx (not NEW.idx) for the join.
-CREATE OR REPLACE FUNCTION qiita.cascade_publish_from_sequenced_sample_ena()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF (NEW.ena_experiment_accession IS NOT NULL
-            AND OLD.ena_experiment_accession IS NULL)
-       OR (NEW.ena_run_accession IS NOT NULL
-            AND OLD.ena_run_accession IS NULL) THEN
-        UPDATE qiita.prep_sample_to_study
-           SET is_published = TRUE
-         WHERE prep_sample_idx = NEW.prep_sample_idx
-           AND is_published = FALSE;
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER sequenced_sample_cascade_publish
-    AFTER UPDATE OF ena_experiment_accession, ena_run_accession
-    ON qiita.sequenced_sample
-    FOR EACH ROW EXECUTE FUNCTION qiita.cascade_publish_from_sequenced_sample_ena();
-
-
--- biosample side. ENA-publishing the biosample propagates to every prep
--- that references it. Cross-prep / cross-study span is intentional:
--- once a biosample is in ENA, every downstream prep / link it appears in
--- is observationally public too.
-CREATE OR REPLACE FUNCTION qiita.cascade_publish_from_biosample_ena()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF NEW.ena_sample_accession IS NOT NULL
-       AND OLD.ena_sample_accession IS NULL THEN
-        UPDATE qiita.prep_sample_to_study pts
-           SET is_published = TRUE
-          FROM qiita.prep_sample ps
-         WHERE ps.idx = pts.prep_sample_idx
-           AND ps.biosample_idx = NEW.idx
-           AND pts.is_published = FALSE;
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER biosample_cascade_publish
-    AFTER UPDATE OF ena_sample_accession
-    ON qiita.biosample
-    FOR EACH ROW EXECUTE FUNCTION qiita.cascade_publish_from_biosample_ena();
 
 
 -- =============================================================================
@@ -170,9 +124,8 @@ CREATE TRIGGER prep_sample_publication_lock
 
 
 -- sequenced_sample shares the prep_sample's lock state via the back-
--- pointing OLD.prep_sample_idx column. The first ENA-set UPDATE precedes
--- the cascade, so this trigger sees OLD where is_published is still
--- FALSE and lets the publication happen; subsequent UPDATEs are rejected.
+-- pointing OLD.prep_sample_idx column: it is mutable until one of the
+-- prep's links is published, and frozen against every UPDATE afterwards.
 CREATE OR REPLACE FUNCTION qiita.publication_lock_sequenced_sample()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -209,11 +162,10 @@ CREATE TRIGGER prep_sample_metadata_publication_lock
     FOR EACH ROW EXECUTE FUNCTION qiita.publication_lock_prep_sample_metadata();
 
 
--- The link itself: once is_published is TRUE, no further UPDATE on the
--- row is allowed -- including retire (sets retired = TRUE) or
--- unpublish (sets is_published back to FALSE). Cascade-driven flips
--- pass through because they target rows where OLD.is_published = FALSE
--- (the WHERE clause in both cascade functions filters those out).
+-- The link itself: the publish action's FALSE -> TRUE UPDATE passes
+-- because OLD.is_published is still FALSE at BEFORE-UPDATE time; once
+-- TRUE, every further UPDATE on the row -- retire (retired = TRUE) or
+-- unpublish (is_published back to FALSE) -- is rejected.
 CREATE OR REPLACE FUNCTION qiita.publication_lock_prep_sample_to_study()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -300,14 +252,6 @@ CREATE TRIGGER biosample_to_study_publication_lock
 -- Surfaced via `\d+ <table>` / pg_description so the publication-lock
 -- policy is visible from the catalog, not only by reading this file.
 
-COMMENT ON TRIGGER sequenced_sample_cascade_publish ON qiita.sequenced_sample IS
-    'Cascade: when an ENA experiment/run accession goes NULL -> set, flips '
-    'is_published = TRUE on every prep_sample_to_study link of the prep.';
-COMMENT ON TRIGGER biosample_cascade_publish ON qiita.biosample IS
-    'Cascade: when ena_sample_accession goes NULL -> set, flips '
-    'is_published = TRUE on every prep_sample_to_study link of every prep '
-    'that references this biosample.';
-
 COMMENT ON TRIGGER prep_sample_publication_lock ON qiita.prep_sample IS
     'Publication lock: rejects UPDATE when the prep has any published link. '
     'TRIPWIRE: a qiita.bypass_publication_lock GUC must be checked here too.';
@@ -340,8 +284,6 @@ DROP TRIGGER IF EXISTS prep_sample_to_study_publication_lock ON qiita.prep_sampl
 DROP TRIGGER IF EXISTS prep_sample_metadata_publication_lock ON qiita.prep_sample_metadata;
 DROP TRIGGER IF EXISTS sequenced_sample_publication_lock ON qiita.sequenced_sample;
 DROP TRIGGER IF EXISTS prep_sample_publication_lock ON qiita.prep_sample;
-DROP TRIGGER IF EXISTS biosample_cascade_publish ON qiita.biosample;
-DROP TRIGGER IF EXISTS sequenced_sample_cascade_publish ON qiita.sequenced_sample;
 
 DROP FUNCTION IF EXISTS qiita.publication_lock_biosample_to_study();
 DROP FUNCTION IF EXISTS qiita.publication_lock_biosample_metadata();
@@ -350,8 +292,6 @@ DROP FUNCTION IF EXISTS qiita.publication_lock_prep_sample_to_study();
 DROP FUNCTION IF EXISTS qiita.publication_lock_prep_sample_metadata();
 DROP FUNCTION IF EXISTS qiita.publication_lock_sequenced_sample();
 DROP FUNCTION IF EXISTS qiita.publication_lock_prep_sample();
-DROP FUNCTION IF EXISTS qiita.cascade_publish_from_biosample_ena();
-DROP FUNCTION IF EXISTS qiita.cascade_publish_from_sequenced_sample_ena();
 DROP FUNCTION IF EXISTS qiita.is_biosample_reaching_published_prep(BIGINT);
 DROP FUNCTION IF EXISTS qiita.is_prep_sample_published(BIGINT);
 

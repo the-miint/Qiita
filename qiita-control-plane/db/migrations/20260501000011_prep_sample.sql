@@ -118,10 +118,10 @@ CREATE TABLE qiita.prep_sample_to_study (
     retired_by_idx        BIGINT REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
     retired_at            TIMESTAMPTZ,
     retire_reason         TEXT,
-    -- Publication-lock flag. The cascade + lock triggers that act on it
-    -- are defined in 20260520000000_publication_lock.sql; the column
-    -- lives here so prep_sample_to_study has a single CREATE-TABLE
-    -- source of truth.
+    -- Publication-lock flag. The lock triggers that act on it are
+    -- defined in 20260520000000_publication_lock.sql; the column lives
+    -- here so prep_sample_to_study has a single CREATE-TABLE source of
+    -- truth.
     is_published          BOOLEAN NOT NULL DEFAULT false,
 
     PRIMARY KEY (prep_sample_idx, study_idx),
@@ -151,17 +151,17 @@ COMMENT ON COLUMN qiita.prep_sample_to_study.retired IS
     'everywhere.';
 
 COMMENT ON COLUMN qiita.prep_sample_to_study.is_published IS
-    'TRUE when this (prep_sample, study) link is part of the public record. '
-    'Set by the ENA-accession cascade triggers (on sequenced_sample or '
-    'biosample going NULL -> non-NULL on any ENA accession) or by a future '
-    'owner-driven publish action. Once TRUE, the link itself plus the '
+    'TRUE when this (prep_sample, study) link has been published. Set only '
+    'by the owner-driven publish action (future PR). ENA accessions do NOT '
+    'set it: an ENA accession records a submission (which may sit under '
+    'embargo), not a publication. Once TRUE, the link itself plus the '
     'prep_sample, its 1:1 sequenced_sample subtype, its prep_sample_metadata '
     'rows, the underlying biosample, its metadata, and its biosample_to_study '
     'links are frozen against UPDATE via the publication_lock_* trigger '
     'family (see 20260520000000_publication_lock.sql). Distinct from '
     'prep_sample_to_study.retired: retirement removes a study''s permission '
-    'to use a prep; is_published locks the prep''s shape because its bytes '
-    'are out in the world.';
+    'to use a prep; is_published locks the prep''s shape because it has been '
+    'published.';
 
 CREATE INDEX prep_sample_to_study_study_idx
     ON qiita.prep_sample_to_study (study_idx);
