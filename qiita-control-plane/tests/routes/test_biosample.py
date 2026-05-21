@@ -1,11 +1,14 @@
 """Integration tests for the POST /api/v1/study/{study_idx}/biosample route.
 
-Exercises wet_lab_admin and system_admin happy paths, the role / scope /
-study-existence guards, the parametrised owner-eligibility 422 surface,
-the metadata dict's validation 422s (unknown field, parse failure,
-owner-id collision), Pydantic body validation, and DB-level
-exception-mapping (409 / 422). Regular users are forbidden by the role
-gate; one negative test covers it.
+Exercises wet_lab_admin and system_admin happy paths, the scope and
+study-existence guards, the per-study ADMIN-access guard
+(`require_study_access(min_tier=Tier.ADMIN, bypass_role=WET_LAB_ADMIN)`
+— regular users who own a study or carry an ADMIN study_access row
+may create biosamples there), the parametrised owner-eligibility 422
+surface, the metadata dict's validation 422s (unknown field, parse
+failure, owner-id collision), Pydantic body validation, and DB-level
+exception-mapping (409 / 422). Regular-user 403 paths cover both the
+no-access-row and the below-admin-tier cases.
 """
 
 import secrets
@@ -359,11 +362,32 @@ async def test_post_biosample_response_reports_field_created_flag_states(ctx):
 # ===========================================================================
 
 
-async def test_post_biosample_regular_user_403(ctx):
-    # Regular user (system_role=user) cannot create biosamples at all —
-    # require_role_at_least(WET_LAB_ADMIN) rejects with 403.
+async def test_post_biosample_regular_user_owner_passes(ctx):
+    # Regular user creates a biosample on a study they own; the owner
+    # bypass in `require_study_access` admits the owner at every tier
+    # without a study_access row.
     study_idx = await _seed_study(
-        ctx["pool"], owner_idx=ctx["user_session"]["principal_idx"], suffix="reg"
+        ctx["pool"], owner_idx=ctx["user_session"]["principal_idx"], suffix="user-own"
+    )
+    ctx["created"]["study"].append(study_idx)
+
+    resp = await _post_biosample(
+        ctx["user"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["user_session"]["principal_idx"],
+        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_value="USER-OWN-1",
+    )
+    assert resp.status_code == 201, resp.text
+
+
+async def test_post_biosample_regular_user_no_access_403(ctx):
+    # Regular user posts to a study owned by the wet_lab_admin with no
+    # study_access row: tier resolves to public-by-absence, below
+    # Tier.ADMIN, so require_study_access raises 403.
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="no-access"
     )
     ctx["created"]["study"].append(study_idx)
 
@@ -376,7 +400,61 @@ async def test_post_biosample_regular_user_403(ctx):
         owner_biosample_id_value="X",
     )
     assert resp.status_code == 403
-    assert "wet_lab_admin" in resp.json()["detail"]
+    assert "admin" in resp.json()["detail"]
+
+
+async def test_post_biosample_regular_user_admin_tier_passes(ctx):
+    # Regular user does not own the study but has Tier.ADMIN via
+    # study_access; the tier check on the new route gate accepts the grant.
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="user-grant"
+    )
+    ctx["created"]["study"].append(study_idx)
+    await _grant_study_access(
+        ctx,
+        study_idx=study_idx,
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier="admin",
+        granted_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+
+    resp = await _post_biosample(
+        ctx["user"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["user_session"]["principal_idx"],
+        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_value="USER-GRANT-1",
+    )
+    assert resp.status_code == 201, resp.text
+
+
+async def test_post_biosample_regular_user_viewer_tier_403(ctx):
+    # A study_access row at viewer tier is below the route's ADMIN floor;
+    # require_study_access raises 403. Pins that the gate is genuinely
+    # checking the tier rather than only the row's existence.
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="user-viewer"
+    )
+    ctx["created"]["study"].append(study_idx)
+    await _grant_study_access(
+        ctx,
+        study_idx=study_idx,
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier="viewer",
+        granted_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+
+    resp = await _post_biosample(
+        ctx["user"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["user_session"]["principal_idx"],
+        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_value="X",
+    )
+    assert resp.status_code == 403
+    assert "admin" in resp.json()["detail"]
 
 
 async def test_post_biosample_anonymous_401(ctx):

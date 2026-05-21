@@ -327,11 +327,13 @@ class UserResponse(BaseModel):
 class BiosampleImportRequest(BaseModel):
     """Body for POST /api/v1/study/{study_idx}/biosample.
 
-    The route gates on wet_lab_admin or higher; owner_idx names the user the
-    biosample is being created for and must be supplied explicitly. The
-    metadata dict carries text values keyed on biosample_global_field
-    display_name; the route parses each value into the global field's data
-    type before insert. An empty dict is allowed.
+    The route gates on `Tier.ADMIN` access to the path's study
+    (study owner, an ADMIN study_access row, or wet_lab_admin+ via the
+    role bypass). owner_idx names the user the biosample is being
+    created for and must be supplied explicitly. The metadata dict
+    carries text values keyed on biosample_global_field display_name;
+    the route parses each value into the global field's data type
+    before insert. An empty dict is allowed.
     """
 
     owner_idx: Annotated[int, Field(gt=0)]

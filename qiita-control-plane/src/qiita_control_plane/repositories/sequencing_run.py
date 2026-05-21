@@ -86,6 +86,19 @@ async def fetch_sequencing_run(
     )
 
 
+async def fetch_sequencing_run_created_by(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    sequencing_run_idx: int,
+) -> int | None:
+    """Return only `created_by_idx` for the run; None on miss. Narrow
+    SELECT for the caller-ownership guard, which would otherwise pull
+    every column (notably the JSONB extra_metadata) just to read one int."""
+    return await pool_or_conn.fetchval(
+        "SELECT created_by_idx FROM qiita.sequencing_run WHERE idx = $1",
+        sequencing_run_idx,
+    )
+
+
 async def fetch_sequencing_run_exists(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     sequencing_run_idx: int,
@@ -159,6 +172,20 @@ async def fetch_sequenced_pool(
         "SELECT idx, sequencing_run_idx, run_preflight_blob, run_preflight_filename,"
         " extra_metadata, created_by_idx, created_at"
         " FROM qiita.sequenced_pool WHERE idx = $1",
+        sequenced_pool_idx,
+    )
+
+
+async def fetch_sequenced_pool_created_by(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    sequenced_pool_idx: int,
+) -> int | None:
+    """Return only `created_by_idx` for the pool; None on miss. Narrow
+    SELECT for the caller-ownership guard — the full `fetch_sequenced_pool`
+    pulls the BYTEA `run_preflight_blob` column which can be 1+ MB per
+    row, an unacceptable cost for an auth check."""
+    return await pool_or_conn.fetchval(
+        "SELECT created_by_idx FROM qiita.sequenced_pool WHERE idx = $1",
         sequenced_pool_idx,
     )
 

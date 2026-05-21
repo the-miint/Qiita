@@ -3,9 +3,13 @@
   POST /api/v1/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample
 
 Exercises happy paths (single-study and multi-study via primary +
-secondary), the role / scope guards, regular-user rejection, Pydantic
-body validation including the primary-in-secondary rejection, the
-(run, pool) path-consistency 422, owner eligibility 422,
+secondary), the scope guard, the caller-creator guard on the path's
+sequenced_pool (`require_caller_owns_pool`, wet_lab_admin+ bypass),
+the body-level multi-study admin-access check
+(`require_caller_has_admin_on_all_studies` — every listed study must
+admit the caller at Tier.ADMIN, owner / wet_lab_admin+ bypass),
+Pydantic body validation including the primary-in-secondary rejection,
+the (run, pool) path-consistency 422, owner eligibility 422,
 unknown-metadata-field 422, missing biosample-link 422, duplicate
 sequenced_pool_item_id 409, and full transaction rollback on
 trigger-raised failures.
@@ -184,10 +188,16 @@ async def _seed_biosample_linked_to_study(ctx, *, owner_idx: int, study_idx: int
     return bs_idx
 
 
-async def _seed_run_and_pool(ctx, suffix: str) -> tuple[int, int]:
+async def _seed_run_and_pool(
+    ctx, suffix: str, *, created_by_idx: int | None = None
+) -> tuple[int, int]:
     """Insert one sequencing_run and one sequenced_pool attached to it;
-    track both. Returns (run_idx, pool_idx)."""
-    creator = ctx["wet_session"]["principal_idx"]
+    track both. Returns (run_idx, pool_idx). Both rows take the same
+    creator; defaults to the wet_lab_admin session principal when
+    `created_by_idx` is omitted, so existing callers see no behavior
+    change. Pass the regular_user session principal_idx to exercise
+    the new caller-creator semantics on the pool / sample routes."""
+    creator = created_by_idx if created_by_idx is not None else ctx["wet_session"]["principal_idx"]
     run_idx = await ctx["pool"].fetchval(
         "INSERT INTO qiita.sequencing_run (instrument_run_id, platform, created_by_idx)"
         " VALUES ($1, 'illumina'::qiita.platform, $2) RETURNING idx",
@@ -397,27 +407,131 @@ async def test_import_sequenced_sample_from_run_missing_scope_403(ctx, no_prep_s
     assert "prep_sample:write" in resp.json()["detail"]
 
 
-async def test_import_sequenced_sample_from_run_regular_user_role_403(
-    ctx, regular_user_with_prep_sample_write_client
-):
-    # Regular user holding an explicit PREP_SAMPLE_WRITE-bearing PAT:
-    # require_scope passes, then require_role_at_least(WET_LAB_ADMIN)
-    # rejects. The session-fixture user token does not carry
-    # PREP_SAMPLE_WRITE (excluded from the USER role ceiling), so a
-    # dedicated PAT is needed to exercise the role gate independently.
+async def test_import_sequenced_sample_from_run_regular_user_not_pool_creator_403(ctx):
+    # Regular user attempts to compose against a pool created by the
+    # wet_lab_admin (see `_seed_run_and_pool`, which writes both run and
+    # pool with the wet_session principal as `created_by_idx`). Scope
+    # passes (prep_sample:write is in the USER ceiling); the
+    # require_caller_owns_pool() guard rejects with 403 naming the pool.
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "user")
-    resp = await regular_user_with_prep_sample_write_client.post(
-        f"/api/v1/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample",
-        json={
-            "biosample_idx": 1,
-            "prep_protocol_idx": 1,
-            "owner_idx": 1,
-            "sequenced_pool_item_id": "X",
-            "primary_study_idx": 1,
-        },
+    resp = await _post_sequenced_sample(
+        ctx["user"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=1,
+        prep_protocol_idx=1,
+        owner_idx=1,
+        sequenced_pool_item_id="X",
+        primary_study_idx=1,
     )
     assert resp.status_code == 403
-    assert "wet_lab_admin" in resp.json()["detail"]
+    assert f"sequenced_pool {pool_idx}" in resp.json()["detail"]
+
+
+async def test_import_sequenced_sample_from_run_regular_user_pool_creator_passes(ctx):
+    # End-to-end user happy path: regular user owns the study, created
+    # the run and pool, links a biosample they own, and composes a
+    # sample. All three gates pass — pool ownership, body-level
+    # admin-access check (owner bypass), and owner eligibility.
+    run_idx, pool_idx = await _seed_run_and_pool(
+        ctx, "user-creator", created_by_idx=ctx["user_session"]["principal_idx"]
+    )
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="user"
+    )
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx,
+        owner_idx=ctx["user_session"]["principal_idx"],
+        study_idx=study_idx,
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+
+    resp = await _post_sequenced_sample(
+        ctx["user"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["user_session"]["principal_idx"],
+        sequenced_pool_item_id=_unique_item_id("USER"),
+        primary_study_idx=study_idx,
+    )
+    assert resp.status_code == 201, resp.text
+
+
+async def test_import_sequenced_sample_from_run_regular_user_no_admin_tier_403(ctx):
+    # Caller-creator guard passes (user owns the pool) but the body-level
+    # multi-study check rejects: the primary study is owned by the
+    # wet_lab_admin, the user has no study_access row → effective tier
+    # public-by-absence, below Tier.ADMIN. The 403 detail names the
+    # offending study so the client knows which study to ask access for.
+    run_idx, pool_idx = await _seed_run_and_pool(
+        ctx, "user-no-tier", created_by_idx=ctx["user_session"]["principal_idx"]
+    )
+    # Study owned by someone else; user has no access row.
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="no-tier"
+    )
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        study_idx=study_idx,
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+
+    resp = await _post_sequenced_sample(
+        ctx["user"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["user_session"]["principal_idx"],
+        sequenced_pool_item_id=_unique_item_id("USER-NO"),
+        primary_study_idx=study_idx,
+    )
+    assert resp.status_code == 403
+    assert "admin" in resp.json()["detail"]
+    assert f"study {study_idx}" in resp.json()["detail"]
+
+
+async def test_import_sequenced_sample_from_run_regular_user_admin_tier_passes(ctx):
+    # User does not own the primary study but has Tier.ADMIN via
+    # study_access. The body-level multi-study check accepts the grant.
+    run_idx, pool_idx = await _seed_run_and_pool(
+        ctx, "user-grant", created_by_idx=ctx["user_session"]["principal_idx"]
+    )
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="grant"
+    )
+    await _grant_study_access(
+        ctx,
+        study_idx=study_idx,
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier="admin",
+        granted_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx,
+        owner_idx=ctx["user_session"]["principal_idx"],
+        study_idx=study_idx,
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+
+    resp = await _post_sequenced_sample(
+        ctx["user"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["user_session"]["principal_idx"],
+        sequenced_pool_item_id=_unique_item_id("USER-GR"),
+        primary_study_idx=study_idx,
+    )
+    assert resp.status_code == 201, resp.text
 
 
 # ===========================================================================

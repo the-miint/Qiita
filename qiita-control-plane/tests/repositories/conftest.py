@@ -155,6 +155,11 @@ async def _cleanup_tracked(pool, created):
             ps,
             st,
         )
+    # Subtype rows (sequenced_sample) reference prep_sample with ON DELETE
+    # RESTRICT, so they must go before the prep_sample sweep below. Tests
+    # that don't seed a subtype leave this list empty and the call is a
+    # no-op via _delete_idxs.
+    await _delete_idxs(pool, "sequenced_sample", created["sequenced_sample"])
     await _delete_idxs(pool, "prep_sample", created["prep_sample"])
     await _delete_idxs(pool, "biosample", created["biosample"])
     # study_access references study with ON DELETE RESTRICT, so any
@@ -222,6 +227,7 @@ async def ctx(postgres_pool):
         "prep_sample_study_field": [],
         "prep_sample": [],
         "prep_sample_to_study": [],
+        "sequenced_sample": [],
         "prep_sample_global_field": [],
         "terminology_term": [],
         "missing_value_reason": [],

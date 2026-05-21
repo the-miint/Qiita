@@ -14,7 +14,11 @@ import uuid
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_WORK_TICKET_PREFIX, URL_WORK_TICKET_RUN
+from qiita_common.api_paths import (
+    URL_WORK_TICKET_BY_IDX,
+    URL_WORK_TICKET_PREFIX,
+    URL_WORK_TICKET_RUN,
+)
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import WorkTicketState
 
@@ -224,6 +228,34 @@ async def prep_sample_idx(postgres_pool, admin_token):
     await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", biosample_idx)
 
 
+@pytest.fixture
+async def prep_sample_with_pool_item(postgres_pool, prep_sample_idx, admin_token):
+    """The shared sequenced prep_sample with its 1:1 sequenced_sample
+    subtype attached, carrying a known `sequenced_pool_item_id`. Returns
+    `(prep_sample_idx, sequenced_pool_item_id)`.
+
+    The bare `prep_sample_idx` fixture deliberately omits the subtype
+    row; this fixture adds the run -> pool -> sequenced_sample chain so
+    the work_ticket fastq-filename-prefix gate has a pool item id to
+    resolve. Teardown drops the subtype chain in reverse-FK order — it
+    runs before `prep_sample_idx`'s own teardown removes the supertype,
+    so the prep_sample DELETE there does not trip the subtype FK."""
+    from qiita_control_plane.testing.db_seeds import seed_sequenced_sample_subtype
+
+    _, admin_idx = admin_token
+    pool_item_id = f"wt-item-{uuid.uuid4()}"
+    run_idx, pool_idx, ss_idx = await seed_sequenced_sample_subtype(
+        postgres_pool,
+        prep_sample_idx=prep_sample_idx,
+        owner_idx=admin_idx,
+        sequenced_pool_item_id=pool_item_id,
+    )
+    yield prep_sample_idx, pool_item_id
+    await postgres_pool.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss_idx)
+    await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
+    await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
+
+
 _TEST_STEPS = [
     {
         "kind": "step",
@@ -244,6 +276,7 @@ async def _seed_action(
     target_kind: str = "reference",
     scopes: list[str] | None = None,
     target_processing_kinds: list[str] | None = None,
+    human_roles: list[str] | None = None,
 ) -> tuple[str, str]:
     """Insert an enabled action with the given context_schema and
     target_kind. Returns (action_id, version). Caller is responsible
@@ -254,7 +287,9 @@ async def _seed_action(
     don't fit that grant. `target_processing_kinds` only applies when
     target_kind = 'prep_sample'; left as default-empty otherwise (the
     DB CHECK action_processing_kinds_only_for_prep_sample enforces
-    that pairing)."""
+    that pairing). `human_roles` overrides the default audience
+    ([system_admin]) — pass [user, wet_lab_admin, system_admin] to
+    exercise the wider audience the fastq-to-parquet YAML declares."""
     action_id = "wt-test-action"
     version = f"v-{uuid.uuid4()}"
     await postgres_pool.execute(
@@ -271,7 +306,14 @@ async def _seed_action(
         target_kind,
         target_processing_kinds or [],
         scopes if scopes is not None else [Scope.REFERENCE_WRITE.value],
-        json.dumps({"service": False, "human_roles": [SystemRole.SYSTEM_ADMIN.value]}),
+        json.dumps(
+            {
+                "service": False,
+                "human_roles": (
+                    human_roles if human_roles is not None else [SystemRole.SYSTEM_ADMIN.value]
+                ),
+            }
+        ),
         json.dumps(context_schema),
         json.dumps(_TEST_STEPS),
         "active",
@@ -337,6 +379,92 @@ async def sequenced_only_prep_sample_action(postgres_pool):
     )
     yield action_id, version
     await _drop_action(postgres_pool, action_id, version)
+
+
+@pytest.fixture
+async def user_audience_prep_sample_action(postgres_pool):
+    """An enabled, prep_sample-targeting action whose audience admits
+    USER (plus wet_lab_admin / system_admin) — mirrors the audience
+    fastq-to-parquet declares in its YAML. Drives the per-resource
+    study-access gate the work_ticket POST applies for prep_sample-
+    scoped submissions. Scopes left empty (the gate runs independent of
+    scope checks); target_processing_kinds left empty so the test
+    doesn't have to wrestle with the kind-match arm too."""
+    action_id, version = await _seed_action(
+        postgres_pool,
+        context_schema={},
+        target_kind="prep_sample",
+        scopes=[],
+        human_roles=[
+            SystemRole.USER.value,
+            SystemRole.WET_LAB_ADMIN.value,
+            SystemRole.SYSTEM_ADMIN.value,
+        ],
+    )
+    yield action_id, version
+    await _drop_action(postgres_pool, action_id, version)
+
+
+@pytest.fixture
+async def prep_sample_with_study_link(postgres_pool, prep_sample_idx, admin_token):
+    """The shared sequenced prep_sample plus a non-retired
+    `prep_sample_to_study` link against a freshly-seeded study owned by
+    the admin principal. Returns `(prep_sample_idx, study_idx,
+    study_owner_idx)`. No `study_access` row is seeded by default — the
+    test chooses whether to insert a grant.
+
+    The biosample-side link is required by the
+    `prep_sample_to_study_reject_without_biosample_link` trigger: a
+    `prep_sample_to_study` insert raises unless a non-retired
+    `biosample_to_study` already exists on the same study. Without
+    this, the fixture's INSERT fails with a confusing RaiseError instead
+    of yielding."""
+    _, admin_idx = admin_token
+    study_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
+        " VALUES ($1, $2, $1) RETURNING idx",
+        admin_idx,
+        f"wt-prep-sample-study-{uuid.uuid4()}",
+    )
+    # The biosample side has no such trigger; we resolve the prep_sample's
+    # biosample via the supertype column and link it to the new study.
+    biosample_idx = await postgres_pool.fetchval(
+        "SELECT biosample_idx FROM qiita.prep_sample WHERE idx = $1",
+        prep_sample_idx,
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.biosample_to_study (biosample_idx, study_idx, created_by_idx)"
+        " VALUES ($1, $2, $3)",
+        biosample_idx,
+        study_idx,
+        admin_idx,
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.prep_sample_to_study (prep_sample_idx, study_idx, created_by_idx)"
+        " VALUES ($1, $2, $3)",
+        prep_sample_idx,
+        study_idx,
+        admin_idx,
+    )
+
+    yield prep_sample_idx, study_idx, admin_idx
+
+    # FK-reverse cleanup of just the rows this fixture created.
+    await postgres_pool.execute(
+        "DELETE FROM qiita.study_access WHERE study_idx = $1",
+        study_idx,
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = $1 AND study_idx = $2",
+        prep_sample_idx,
+        study_idx,
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.biosample_to_study WHERE biosample_idx = $1 AND study_idx = $2",
+        biosample_idx,
+        study_idx,
+    )
+    await postgres_pool.execute("DELETE FROM qiita.study WHERE idx = $1", study_idx)
 
 
 @pytest.fixture
@@ -543,6 +671,104 @@ async def test_submit_prep_sample_kind_check_404_on_missing_prep(
 # the enum only contains 'sequenced'; every seedable prep_sample matches
 # every sequenced-only action by construction, so the negative path
 # cannot be exercised without amending the ENUM and a new subtype.
+
+
+# ---------------------------------------------------------------------------
+# Per-resource study-access gate for prep_sample-scoped tickets
+# ---------------------------------------------------------------------------
+
+
+async def test_submit_prep_sample_user_without_admin_tier_403(
+    wt_client,
+    postgres_pool,
+    regular_token,
+    user_audience_prep_sample_action,
+    prep_sample_with_study_link,
+):
+    """USER caller submitting against a prep_sample whose only non-retired
+    linked study they have no ADMIN access to gets 403 from the new
+    per-resource gate. Pins both that the gate runs and that the 403
+    detail names the offending study (so a USER caller can ask for
+    access by study_idx)."""
+    token, _ = regular_token
+    action_id, version = user_audience_prep_sample_action
+    prep_sample_idx, study_idx, _ = prep_sample_with_study_link
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 403, resp.text
+    assert f"study {study_idx}" in resp.json()["detail"]
+
+
+async def test_submit_prep_sample_user_with_admin_tier_passes(
+    wt_client,
+    postgres_pool,
+    regular_token,
+    user_audience_prep_sample_action,
+    prep_sample_with_study_link,
+):
+    """USER caller granted Tier.ADMIN on the prep_sample's linked study
+    passes the per-resource gate and the submission lands."""
+    token, user_idx = regular_token
+    action_id, version = user_audience_prep_sample_action
+    prep_sample_idx, study_idx, granted_by_idx = prep_sample_with_study_link
+
+    await postgres_pool.execute(
+        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier, granted_by_idx)"
+        " VALUES ($1, $2, 'admin'::qiita.tier, $3)",
+        study_idx,
+        user_idx,
+        granted_by_idx,
+    )
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
+
+
+async def test_submit_prep_sample_admin_bypasses_study_access(
+    wt_client,
+    admin_token,
+    user_audience_prep_sample_action,
+    prep_sample_with_study_link,
+):
+    """system_admin submits against a prep_sample whose linked study they
+    have no `study_access` row on — `require_caller_has_admin_on_all_studies`
+    short-circuits on `has_role_at_least(WET_LAB_ADMIN)` before any DB
+    lookup runs. Pins the bypass invariant for the wider audience."""
+    token, _ = admin_token
+    action_id, version = user_audience_prep_sample_action
+    prep_sample_idx, _study_idx, _granted_by_idx = prep_sample_with_study_link
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
 
 
 async def test_submit_unknown_action_returns_404(wt_client, admin_token, reference_idx):
@@ -752,6 +978,189 @@ async def test_submit_invalid_context_type_returns_422(
     assert "/sample_count" in paths
 
 
+# ---------------------------------------------------------------------------
+# fastq filename-prefix gate: a fastq path in action_context must carry a
+# basename prefixed by the prep_sample's sequenced_pool_item_id.
+# ---------------------------------------------------------------------------
+
+
+async def test_submit_fastq_path_prefix_match_passes(
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item
+):
+    """fastq_path and reverse_fastq_path whose basenames both start with
+    the prep_sample's sequenced_pool_item_id clear the filename-prefix
+    gate → 202."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, pool_item_id = prep_sample_with_pool_item
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {
+                "fastq_path": f"/scratch/{pool_item_id}_R1.fastq",
+                "reverse_fastq_path": f"/scratch/{pool_item_id}_R2.fastq",
+            },
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
+
+
+async def test_submit_single_end_fastq_path_prefix_match_passes(
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item
+):
+    """Forward-only (single-end) submission stays valid: a lone fastq_path
+    with no reverse_fastq_path, basename prefixed by the
+    sequenced_pool_item_id, clears the gate → 202. The prefix rule fires
+    on the one read present rather than requiring a pair."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, pool_item_id = prep_sample_with_pool_item
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {"fastq_path": f"/scratch/{pool_item_id}.fastq"},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
+
+
+async def test_submit_fastq_path_prefix_mismatch_returns_422(
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item
+):
+    """A fastq_path whose basename does not start with the prep_sample's
+    sequenced_pool_item_id is rejected with 422; the detail names the
+    pool item id and the offending path."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, pool_item_id = prep_sample_with_pool_item
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {"fastq_path": "/scratch/wrong-prefix_R1.fastq"},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert "sequenced_pool_item_id" in detail["reason"]
+    assert detail["sequenced_pool_item_id"] == pool_item_id
+    assert len(detail["mismatched"]) == 1
+    assert detail["mismatched"][0]["context_key"] == "fastq_path"
+    assert detail["mismatched"][0]["basename"] == "wrong-prefix_R1.fastq"
+
+
+async def test_submit_fastq_path_prefix_segment_anchored(
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item
+):
+    """The gate is segment-anchored, not a bare substring match: a
+    basename carrying the pool item id followed straight by another
+    character — no `_`/`.` separator — is rejected (422). `<id>9_R1.fastq`
+    must not pass for pool item id `<id>`."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, pool_item_id = prep_sample_with_pool_item
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {"fastq_path": f"/scratch/{pool_item_id}9_R1.fastq"},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["mismatched"][0]["context_key"] == "fastq_path"
+
+
+async def test_submit_reverse_fastq_path_prefix_checked(
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item
+):
+    """The gate covers reverse_fastq_path too: a matching fastq_path
+    paired with a mismatched reverse_fastq_path still 422s, and the
+    detail flags only the reverse key."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, pool_item_id = prep_sample_with_pool_item
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {
+                "fastq_path": f"/scratch/{pool_item_id}_R1.fastq",
+                "reverse_fastq_path": "/scratch/other-sample_R2.fastq",
+            },
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422, resp.text
+    mismatched = resp.json()["detail"]["mismatched"]
+    assert [m["context_key"] for m in mismatched] == ["reverse_fastq_path"]
+
+
+async def test_submit_fastq_path_prefix_skipped_without_pool_item(
+    wt_client, admin_token, prep_sample_action, prep_sample_idx
+):
+    """When the prep_sample has no sequenced_sample subtype row (hence no
+    sequenced_pool_item_id), the filename-prefix gate is vacuous and
+    skipped — any fastq_path passes. Uses the bare `prep_sample_idx`
+    fixture, which deliberately omits the subtype row."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {"fastq_path": "/scratch/anything-goes_R1.fastq"},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
+
+
+async def test_submit_non_string_fastq_path_skipped(
+    wt_client, admin_token, prep_sample_action, prep_sample_with_pool_item
+):
+    """A non-string value under fastq_path is not a path: the gate's
+    isinstance guard skips it rather than 422-ing. For fastq-to-parquet
+    proper, context_schema would 422 a non-string upstream — this pins
+    the defense-in-depth branch for a permissive-schema action
+    (prep_sample_action carries context_schema={})."""
+    token, _ = admin_token
+    action_id, version = prep_sample_action
+    prep_sample_idx, _ = prep_sample_with_pool_item
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json={
+            "action_id": action_id,
+            "action_version": version,
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": prep_sample_idx},
+            "action_context": {"fastq_path": 123},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
+
+
 async def test_submit_503_when_compute_backend_unconfigured(
     wt_client, admin_token, reference_action, reference_idx
 ):
@@ -772,6 +1181,148 @@ async def test_submit_503_when_compute_backend_unconfigured(
         assert resp.status_code == 503
     finally:
         app.state.compute_backend_client = saved
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/work-ticket/{idx}
+# ---------------------------------------------------------------------------
+
+
+async def _submit_reference_ticket(
+    wt_client, *, token: str, action_id: str, version: str, reference_idx: int
+) -> int:
+    """Submit a reference-scoped ticket and return its work_ticket_idx;
+    track for cleanup. Used by the GET tests to land a real row to read
+    back."""
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json=_body(action_id, version, reference_idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    idx = resp.json()["work_ticket_idx"]
+    wt_client._created_tickets.append(idx)
+    return idx
+
+
+async def test_get_work_ticket_404_on_missing(wt_client, admin_token):
+    token, _ = admin_token
+    resp = await wt_client.get(
+        URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=99_999_999),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 404
+
+
+async def test_get_work_ticket_401_on_anonymous(
+    wt_client, admin_token, reference_action, reference_idx
+):
+    # Submit so a row exists, then GET without an Authorization header.
+    token, _ = admin_token
+    action_id, version = reference_action
+    idx = await _submit_reference_ticket(
+        wt_client, token=token, action_id=action_id, version=version, reference_idx=reference_idx
+    )
+    resp = await wt_client.get(URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=idx))
+    assert resp.status_code == 401
+
+
+async def test_get_work_ticket_originator_reads_own(
+    wt_client, admin_token, reference_action, reference_idx
+):
+    """The originator (the admin who submitted) can read the ticket back.
+    Returned payload matches the full WorkTicket shape: discriminated
+    scope_target, state, action info, retry accounting, null failure
+    surface for a fresh ticket."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await _submit_reference_ticket(
+        wt_client, token=token, action_id=action_id, version=version, reference_idx=reference_idx
+    )
+    resp = await wt_client.get(
+        URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["work_ticket_idx"] == idx
+    assert body["originator_principal_idx"] == admin_idx
+    assert body["action_id"] == action_id
+    assert body["action_version"] == version
+    assert body["state"] in {WorkTicketState.PENDING.value, WorkTicketState.QUEUED.value}
+    assert body["scope_target"] == {"kind": "reference", "reference_idx": reference_idx}
+    assert body["failure_type"] is None
+    assert body["failure_stage"] is None
+
+
+async def test_get_work_ticket_non_originator_404(
+    wt_client, admin_token, regular_token, reference_action, reference_idx
+):
+    """A different USER (non-originator, no admin role) gets 404 — the
+    same response a genuinely missing idx returns — so they cannot probe
+    work_ticket_idx values to learn which tickets exist."""
+    token, _ = admin_token
+    user_token, _ = regular_token
+    action_id, version = reference_action
+    idx = await _submit_reference_ticket(
+        wt_client, token=token, action_id=action_id, version=version, reference_idx=reference_idx
+    )
+    resp = await wt_client.get(
+        URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert resp.status_code == 404
+    # Detail is identical to the missing-idx case — no existence signal.
+    assert resp.json()["detail"] == f"work_ticket {idx} not found"
+
+
+async def _seed_wet_lab_admin_token(postgres_pool, wt_client) -> tuple[str, int]:
+    """Build a throwaway wet_lab_admin and an authenticated PAT. Mirrors
+    the `admin_token` / `regular_token` fixtures inline — only the GET
+    tests need a wet_lab_admin caller, so a per-test seed avoids a
+    file-wide fixture."""
+    from qiita_control_plane.auth.token import mint_api_token
+
+    email = f"wt-wla-{uuid.uuid4()}@example.com"
+    pidx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
+        " VALUES ($1, $2, 1) RETURNING idx",
+        email,
+        SystemRole.WET_LAB_ADMIN,
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.user (principal_idx, email, affiliation, address, phone)"
+        " VALUES ($1, $2, 'X', 'Y', 'Z')",
+        pidx,
+        email,
+    )
+    wt_client._created_principals.append(pidx)
+    plaintext, _ = await mint_api_token(
+        postgres_pool,
+        principal_idx=pidx,
+        label="wt-wla",
+        scopes=[Scope.SELF_PROFILE, Scope.SELF_TOKEN, Scope.REFERENCE_READ],
+    )
+    return plaintext, pidx
+
+
+async def test_get_work_ticket_wet_lab_admin_bypasses(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """A wet_lab_admin who did not originate the ticket still reads it
+    via the role bypass — pins the operator-view path."""
+    token, _ = admin_token
+    action_id, version = reference_action
+    idx = await _submit_reference_ticket(
+        wt_client, token=token, action_id=action_id, version=version, reference_idx=reference_idx
+    )
+    wla_token, _ = await _seed_wet_lab_admin_token(postgres_pool, wt_client)
+    resp = await wt_client.get(
+        URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {wla_token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["work_ticket_idx"] == idx
 
 
 # ---------------------------------------------------------------------------

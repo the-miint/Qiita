@@ -592,3 +592,21 @@ catalog files per deploy — by design. They are cheap (kilobytes) and
 the audit trail proves which deploys passed smoke. Versioned smoke
 names mean re-runs don't collide with prior smokes; no per-run
 cleanup is necessary.
+
+## 12. End-user smoke (optional)
+
+Step 11 exercises the operator-side `reference-add` pipeline. For
+deploys that will be used by `user`-role principals (the common case),
+the parallel user-side smoke is the
+[user-CLI quickstart](user-cli-quickstart.md): log in as a regular
+user (not the operator promoted in step 6), then walk study →
+biosample → sequencing-run → sequenced-pool → sequenced-sample →
+`fastq-to-parquet` ticket → ticket-status. Each step exercises a
+different per-resource auth gate (owner / caller-creator / per-study
+ADMIN) that step 11's reference-add flow does not touch.
+
+A failure here that step 11 did not flag is almost always either an
+OIDC misconfiguration (the user can't get a PAT at all) or a
+role-promotion that landed `system_admin` on every account by
+mistake (the per-resource gates only activate for `user`-role
+callers).

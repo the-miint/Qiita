@@ -242,6 +242,80 @@ def whoami(base_url: str, token: str) -> dict:
     return call("GET", base_url, token, "/auth/whoami")
 
 
+def resolve_owner_idx(
+    args: argparse.Namespace,
+    base_url: str,
+    token: str,
+    *,
+    attr: str = "owner_idx",
+) -> None:
+    """If `args.<attr>` is None, fill it with the caller's principal_idx via
+    whoami. Used by subcommands that let the user mint a resource for
+    themselves without first looking up their own idx. Mutates args in place
+    so the subsequent _build_body sees a populated value.
+    """
+    if getattr(args, attr) is None:
+        setattr(args, attr, whoami(base_url, token)["principal_idx"])
+
+
+def parse_json_arg(
+    raw: str | None,
+    parser: argparse.ArgumentParser,
+    *,
+    flag: str,
+) -> dict | None:
+    """Parse a JSON-object string from a CLI flag into a dict, or return None
+    when the flag wasn't supplied. Used by subcommands that accept structured
+    JSON payloads (extra_metadata, action_context, ...).
+
+    Rejects JSONDecodeError and non-object roots via `parser.error` (exit 2)
+    so a malformed paste surfaces as a clean argparse-style failure rather
+    than a deeper traceback. `flag` is the originating CLI flag name embedded
+    in the error message.
+    """
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        parser.error(f"{flag} is not valid JSON: {exc}")
+    if not isinstance(parsed, dict):
+        parser.error(f"{flag} must be a JSON object; got {type(parsed).__name__}")
+    return parsed
+
+
+def parse_kv_pairs(
+    pairs: list[str] | None,
+    parser: argparse.ArgumentParser,
+    *,
+    flag: str,
+) -> dict[str, str] | None:
+    """Parse a list of "KEY=VALUE" strings (from a repeatable argparse flag)
+    into a dict, or return None when the caller didn't supply the flag at all.
+
+    Rejects entries missing '=', entries with an empty key, and duplicate
+    keys — silently last-wins would mask typos. Errors via `parser.error`
+    (exit 2). `flag` is the originating CLI flag name used in error messages.
+
+    Returning None for the unset case (rather than {}) lets _build_body's
+    is-not-None filter drop the field entirely so the wire matches the
+    server's default-on-absent semantic.
+    """
+    if pairs is None:
+        return None
+    result: dict[str, str] = {}
+    for entry in pairs:
+        if "=" not in entry:
+            parser.error(f"{flag} entry {entry!r} is missing '='; expected KEY=VALUE")
+        key, value = entry.split("=", 1)
+        if not key:
+            parser.error(f"{flag} entry {entry!r} has an empty key")
+        if key in result:
+            parser.error(f"{flag} key {key!r} repeated; supply each key at most once")
+        result[key] = value
+    return result
+
+
 def run_http_subcommand(fn: Callable[[str], dict]) -> int:
     """Token-read + httpx invoke + json print, common to every HTTP subcommand.
 
