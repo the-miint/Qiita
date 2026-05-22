@@ -233,7 +233,21 @@ which covers the CO→CP PAT.)
 `SHARED_FILESYSTEM_ROOT` — where the orchestrator stages each step's
 workspace (`params.json` + outputs) — **must be on a filesystem
 mounted on the compute nodes**. The job reads its inputs from that path
-on the node; if the node cannot see it, the step fails.
+on the node; if the node cannot see it, the step fails. Pick a location
+whose **parent** dirs allow both `qiita-orch` and `qiita-job` traversal
+— don't nest it under a tightly-restricted tree like the data plane's
+`DUCKLAKE_DATA_PATH` (`qiita-data:qiita-data 0750` blocks everyone
+else, even if the leaf dir's own perms look correct).
+
+Own the dir itself **`qiita-orch:qiita-pipeline` mode `2770`**:
+`qiita-orch` writes per-step subdirs as owner, `qiita-job` writes job
+outputs via the `qiita-pipeline` group, and the setgid bit makes new
+files inherit `qiita-pipeline` so `qiita-data` reads them via the same
+group — the staging-handoff pattern from
+[`first-deploy.md`](first-deploy.md) §0.1. `qiita-orch` is deliberately
+*not* a member of `qiita-pipeline`; being the *owner* is what gives it
+write access here, which keeps the network-facing service's group
+membership bounded.
 
 `QIITA_CP_URL` defaults to `http://localhost:8080`, which is correct on
 a single-host deploy where the CP and the orchestrator share the box.
