@@ -139,7 +139,7 @@ The data plane is intentionally "dumb": it only operates on identifiers it recei
 
 The orchestrator is a passive HTTP service: it accepts `POST /api/v1/step/run` from the control-plane runner, dispatches to its configured `ComputeBackend`, and returns the step's output paths. SLURM jobs themselves remain dumb (read input, write output, exit). The orchestrator owns slurmrestd polling and output verification (identifier integrity + file mode) inside its backend implementation.
 
-**The orchestrator has no DB access and no service-account PAT to the control plane** in v1 — workflow lifecycle and DB writes happen entirely on the control plane side. Async-step + CO → CP callbacks (and the `compute` service-account credential) come back when `SlurmBackend` lands.
+**The orchestrator has no DB access** — workflow lifecycle and DB writes happen entirely on the control plane side. CO → CP callbacks exist today for `POST /sequence-range` (called by the native `fastq_to_parquet` step) and authenticate with the `compute-worker` service-account PAT installed at `/etc/qiita/co-to-cp.token` ([provisioning](docs/runbooks/compute-service-account-provisioning.md), [rotation](docs/runbooks/orchestrator-token-rotation.md)). SLURM-backend integration (cluster prereqs, identity model, the `qiita-job` JWT auto-refresh timer) lives in [`docs/runbooks/slurm-backend-setup.md`](docs/runbooks/slurm-backend-setup.md).
 
 The control plane enforces **disallow-without-delete**: before submitting any job it checks `(prep_sample_idx, processing_idx)` pairs — COMPLETED results require explicit DELETE before resubmission; PENDING/QUEUED/PROCESSING states block new submission entirely.
 

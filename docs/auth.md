@@ -347,7 +347,7 @@ Both CLIs share `cli/_common`: PAT file I/O, the loopback flow, the authenticate
 
 ## CP ↔ CO service-to-service auth
 
-The control-plane runner dispatches workflow `step:` entries to the orchestrator via `POST /api/v1/step/run`. The reverse direction (CO → CP callbacks) is unused in v1 — workflow lifecycle and DB writes happen entirely on the control plane.
+The control-plane runner dispatches workflow `step:` entries to the orchestrator via `POST /api/v1/step/run`. CO → CP callbacks exist today for `POST /sequence-range` (called by the native `fastq_to_parquet` step to mint a contiguous bigint range); they authenticate with the `compute-worker` service-account PAT installed at `/etc/qiita/co-to-cp.token` (provisioning: [`docs/runbooks/compute-service-account-provisioning.md`](runbooks/compute-service-account-provisioning.md)). Workflow lifecycle and DB writes still happen entirely on the control plane.
 
 A single shared bearer token authenticates this private path. Both services read it from the same conventional locations:
 
@@ -358,12 +358,12 @@ The orchestrator's `step.py` validates incoming requests with a constant-time co
 
 `qiita_common.log.AuthorizationScrubFilter` is a `logging.Filter` that rewrites any `Bearer <token>` substring in log messages and args to `Bearer <redacted>`. Install once at application startup so httpx's request logs can't leak the token to disk.
 
-When async-step + CO → CP callbacks land alongside `SlurmBackend` (deferred to a follow-up PR), the orchestrator will additionally need its own service-account PAT to call back into `/work-ticket/{idx}/transition`. The historical `/etc/qiita/orchestrator.token` runbook + `orchestrator-token-rotation.md` documentation will apply at that point. Today the file is unused.
+The `compute-worker` PAT covers the `/sequence-range` CO→CP path today. Future CO→CP endpoints (e.g. `/work-ticket/{idx}/transition` once the orchestrator owns ticket state transitions) reuse the same credential file (`/etc/qiita/co-to-cp.token`) and the same rotation flow ([`orchestrator-token-rotation.md`](runbooks/orchestrator-token-rotation.md)) — no new file needed.
 
 <!-- See "First-deploy bootstrap" subsection within Endpoints. -->
 ## First-deploy bootstrap
 
-See [`docs/runbooks/first-deploy.md`](runbooks/first-deploy.md) for the full sequence: write CP env file → migrate → one-shot JWT verify (`scripts/verify_jwt.py`) → start control plane → verify reverse proxy → first OIDC login → `qiita-admin set-system-role` → install CP↔CO shared bearer → bootstrap data plane → start orchestrator → smoke test. The orchestrator does not hold a service-account PAT in v1; it authenticates to the CP via the shared bearer at `/etc/qiita/cp-to-co.token`.
+See [`docs/runbooks/first-deploy.md`](runbooks/first-deploy.md) for the full sequence: write CP env file → migrate → one-shot JWT verify (`scripts/verify_jwt.py`) → start control plane → verify reverse proxy → first OIDC login → `qiita-admin set-system-role` → install CP↔CO shared bearer → bootstrap data plane → provision the `compute-worker` SA ([`compute-service-account-provisioning.md`](runbooks/compute-service-account-provisioning.md)) → start orchestrator → smoke test. The orchestrator holds two credentials: the shared bearer at `/etc/qiita/cp-to-co.token` for inbound CP↔CO calls and the `compute-worker` PAT at `/etc/qiita/co-to-cp.token` for outbound CO→CP callbacks. SLURM-backend integration lives in [`docs/runbooks/slurm-backend-setup.md`](runbooks/slurm-backend-setup.md).
 
 ## Token rotation
 

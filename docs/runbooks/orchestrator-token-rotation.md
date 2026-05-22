@@ -1,17 +1,18 @@
 # Orchestrator token rotation
 
-> **v1 status: not yet applicable.** The orchestrator does not hold a
-> service-account PAT in v1 — it authenticates to the control plane via
-> the shared bearer at `/etc/qiita/cp-to-co.token` (installed by step 7
-> of [`first-deploy.md`](first-deploy.md)). This runbook describes the
-> *future* rotation procedure for an orchestrator-owned PAT, which becomes
-> relevant once `SlurmBackend` lands and the orchestrator gains CO→CP
-> callbacks. Cron jobs that already use `ControlPlaneClient` with their
-> own service-account PATs do follow this rotation flow today.
+> **Applies today.** The compute orchestrator holds a `compute-worker`
+> service-account PAT at `/etc/qiita/co-to-cp.token`, used for outbound
+> CO→CP callbacks (currently: `POST /sequence-range` from the native
+> `fastq_to_parquet` step). It is provisioned per
+> [`compute-service-account-provisioning.md`](compute-service-account-provisioning.md);
+> this runbook covers the zero-downtime rotation of that PAT. Cron jobs
+> with their own `ControlPlaneClient` service-account PATs follow the
+> same flow.
 
 **Purpose.** Operator runbook for zero-downtime rotation of a
-service-account token used by `ControlPlaneClient` (cron jobs today;
-orchestrator in the future). In-flight requests complete with the old
+service-account token used by `ControlPlaneClient` (the compute
+orchestrator's `compute-worker` PAT, plus cron jobs with their own
+service-account PATs). In-flight requests complete with the old
 token; new requests use the new one. Use this for scheduled rotation,
 suspected compromise, or scope changes.
 
