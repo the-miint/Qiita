@@ -124,29 +124,78 @@ sudo sacctmgr modify user qiita-job where account=qiita \
 ## The SLURM JWT
 
 The orchestrator authenticates to slurmrestd with a JWT whose `sun`
-claim is `qiita-job`. Minting a token for *another* user requires root
-or SlurmUser:
+claim is `qiita-job`. It reads the token from `SLURMRESTD_JWT_PATH` per
+dispatched step and re-reads once on a `401` — but SLURM JWTs **expire**,
+so something must keep the file fresh.
 
+**Key point — a self-mint is unprivileged.** `scontrol token
+username=<other>` needs root/SlurmUser, but `scontrol token` with *no*
+`username=` mints a token for whoever runs it. So a process running as
+`qiita-job` mints its own `sun=qiita-job` token with no privilege — the
+refresh runs as the `qiita-job` service user: no sudo, no human, no
+cluster-admin.
+
+### Refresh mechanism — a `qiita-job` systemd timer
+
+On the deploy host, a `systemd` timer running as `qiita-job` re-mints
+the token on a schedule. The JWT file is owned `qiita-job:qiita-orch`
+mode `0640` — `qiita-job` (the minter) writes it, `qiita-orch` (the
+orchestrator) reads it via group.
+
+Prerequisite: the deploy host's `qiita-job` must have the **same uid as
+the cluster's** `qiita-job` (so its MUNGE credential resolves), with
+slurm CLI + MUNGE reach to slurmctld.
+
+`/usr/local/bin/qiita-refresh-slurm-jwt` (root-owned, mode `0755`):
 ```bash
-sudo scontrol token username=qiita-job lifespan=<seconds>
+#!/usr/bin/bash
+# Self-mint a fresh sun=qiita-job SLURM JWT. Runs as qiita-job.
+set -euo pipefail
+token=$(/usr/bin/scontrol token lifespan=3600)   # path from: command -v scontrol
+token=${token#SLURM_JWT=}
+[ -n "$token" ] || { echo "scontrol returned no token" >&2; exit 1; }
+printf '%s\n' "$token" > /etc/qiita/slurmrestd.jwt
 ```
 
-Install the token at `SLURMRESTD_JWT_PATH` — mode `0440`, group the
-orchestrator process user (`qiita-orch`) so it can read it:
+`/etc/systemd/system/qiita-slurm-jwt-refresh.service`:
+```ini
+[Unit]
+Description=Refresh the SLURM JWT (sun=qiita-job) for the compute orchestrator
+After=network-online.target
+Wants=network-online.target
 
-```bash
-sudo install -m 0440 -o root -g qiita-orch <token-file> /etc/qiita/slurmrestd.jwt
+[Service]
+Type=oneshot
+User=qiita-job
+Group=qiita-job
+ExecStart=/usr/local/bin/qiita-refresh-slurm-jwt
 ```
 
-SLURM JWTs **expire**. The orchestrator reads the file per dispatched
-step and re-reads once on a `401`, so rotation is transparent **as long
-as the file stays fresh** — but something must refresh it. Minting
-needs root/SlurmUser, so the refresh runs cluster-side: either a
-periodic job that mints and pushes a fresh `sun=qiita-job` token to the
-deploy host, or a long-lived token if the site's `max_token_lifespan`
-allows. (Distinct from
+`/etc/systemd/system/qiita-slurm-jwt-refresh.timer`:
+```ini
+[Unit]
+Description=Periodic SLURM JWT refresh for the compute orchestrator
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable with `systemctl enable --now qiita-slurm-jwt-refresh.timer`.
+
+A 1-hour token refreshed every 15 min means the file always holds a
+token with ≥45 min of life — it survives a couple of missed runs. The
+script's truncate-then-write has a sub-millisecond window where a reader
+could catch a partial token; the orchestrator's `401` re-read absorbs
+that.
+
+(This refresh is distinct from
 [`orchestrator-token-rotation.md`](orchestrator-token-rotation.md),
-which covers the CO→CP PAT, not this JWT.)
+which covers the CO→CP PAT.)
 
 ## Orchestrator config [operator, deploy host]
 
