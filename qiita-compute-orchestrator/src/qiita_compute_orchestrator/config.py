@@ -67,9 +67,9 @@ class SlurmSettings:
     when LocalBackend is in use these fields are unset and SlurmBackend
     is never constructed."""
 
-    base_url: str  # http://slurm-controller:6820
+    base_url: str  # slurmrestd URL, e.g. http://slurmrestd-host:6820
     jwt_path: Path  # readable by the orchestrator user
-    user_name: str  # SLURM user identity (typically qiita-orch)
+    user_name: str  # SLURM job-execution user (e.g. "qiita-job"), not the orchestrator's own user
     partition: str  # SLURM partition (e.g. "qiita")
     account: str  # SLURM account for usage reporting
     api_version: str  # default v0.0.40

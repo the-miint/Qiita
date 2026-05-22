@@ -7,8 +7,9 @@ SlurmBackend.run_step where the workflow context is available.
 Auth model:
   - SLURM JWT is read from a file at construction time and cached on
     the instance. Each request sends it in `X-SLURM-USER-TOKEN`. The
-    SLURM user identity rides in `X-SLURM-USER-NAME` (typically the
-    orchestrator's system user, e.g. `qiita-orch`).
+    SLURM user identity rides in `X-SLURM-USER-NAME` — the SLURM
+    job-execution user (e.g. `qiita-job`), distinct from the
+    orchestrator's own system user.
   - SLURM rotates JWTs periodically. On a 401, the client reloads the
     file and retries once. If the retry also 401s, it raises — a stale
     or unreadable token is operator-fixable, not retriable internally.
