@@ -820,14 +820,16 @@ sudo systemctl enable --now qiita-compute-orchestrator
 
 The orchestrator validates its credentials at startup and refuses to
 boot if any are missing: the CP↔CO bearer (`/etc/qiita/cp-to-co.token`,
-step 7) and the CO→CP compute-worker PAT (`/etc/qiita/co-to-cp.token`,
+step 7), the CO→CP compute-worker PAT (`/etc/qiita/co-to-cp.token`,
 provisioned per
-[`compute-service-account-provisioning.md`](compute-service-account-provisioning.md)).
-With `COMPUTE_BACKEND=slurm` it also requires the five `SLURM*` env
-vars to be set — but **not** the JWT file itself: `SLURMRESTD_JWT_PATH`
-only has to name a path. The JWT is read per dispatched step (and
-re-read once on a `401`), so a missing or expired token fails the first
-step, not the boot.
+[`compute-service-account-provisioning.md`](compute-service-account-provisioning.md)),
+and on the SLURM backend the five `SLURM*` env vars **and a non-empty
+JWT file at `SLURMRESTD_JWT_PATH`** (the SLURM client is constructed in
+the lifespan and reads the file). An *expired* JWT lets boot succeed
+but the first dispatched step gets a `401`; the client's 401-retry
+re-reads the file. So before `enable --now` on a SLURM-backend deploy,
+set up the JWT-refresh timer per
+[`slurm-backend-setup.md`](slurm-backend-setup.md) and run it once.
 
 ## 10. Verify the deploy
 

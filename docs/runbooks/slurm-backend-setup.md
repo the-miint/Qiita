@@ -124,9 +124,10 @@ sudo sacctmgr modify user qiita-job where account=qiita \
 ## The SLURM JWT
 
 The orchestrator authenticates to slurmrestd with a JWT whose `sun`
-claim is `qiita-job`. It reads the token from `SLURMRESTD_JWT_PATH` per
-dispatched step and re-reads once on a `401` — but SLURM JWTs **expire**,
-so something must keep the file fresh.
+claim is `qiita-job`. It loads the file **at boot** (the SLURM client
+is constructed in the FastAPI lifespan) and re-reads it once on a `401`
+from slurmrestd — but SLURM JWTs **expire**, so something must keep the
+file fresh.
 
 **Key point — a self-mint is unprivileged.** `scontrol token
 username=<other>` needs root/SlurmUser, but `scontrol token` with *no*
@@ -178,20 +179,37 @@ Description=Periodic SLURM JWT refresh for the compute orchestrator
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=15min
+OnCalendar=*:0/15
 Persistent=true
 
 [Install]
 WantedBy=timers.target
 ```
 
-Enable with `systemctl enable --now qiita-slurm-jwt-refresh.timer`.
+**One-time setup (`[admin]`):** `/etc/qiita/` is `root:root 0755`, so
+`qiita-job` cannot create files there. Pre-create the JWT file with the
+right ownership so the timer's truncate-then-write succeeds:
+```bash
+sudo install -m 0640 -o qiita-job -g qiita-orch /dev/null /etc/qiita/slurmrestd.jwt
+```
 
-A 1-hour token refreshed every 15 min means the file always holds a
-token with ≥45 min of life — it survives a couple of missed runs. The
-script's truncate-then-write has a sub-millisecond window where a reader
-could catch a partial token; the orchestrator's `401` re-read absorbs
-that.
+Then enable the timer, trigger the first mint, and verify the file is
+non-empty **before** starting the orchestrator (which reads the file at
+boot — see the "Boot vs. run" gotcha below):
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now qiita-slurm-jwt-refresh.timer
+sudo systemctl start qiita-slurm-jwt-refresh.service
+sudo ls -la /etc/qiita/slurmrestd.jwt   # non-zero size, qiita-job:qiita-orch 0640
+```
+
+A 1-hour token refreshed every 15 min — `OnCalendar=*:0/15` fires on
+wall-clock, so a failed `scontrol` run doesn't pause the schedule (the
+trap `OnUnitActiveSec` would set) — means the file always holds a token
+with ≥45 min of life (4× margin against transient mint failures). The
+script's truncate-then-write has a sub-millisecond window where a
+reader could catch a partial token; the orchestrator's `401` re-read
+absorbs that.
 
 (This refresh is distinct from
 [`orchestrator-token-rotation.md`](orchestrator-token-rotation.md),
@@ -261,10 +279,14 @@ sudo sacct -j <N> --format=JobID,User,Account,Partition,QOS,State,ExitCode,NodeL
   window, so this only bites manual polling.
 
 - **Boot vs. run.** The orchestrator validates the CP↔CO + CO→CP tokens
-  and the five `SLURM*` env vars **at boot** (fail-fast). It does
-  **not** read the JWT *file* at boot — `SLURMRESTD_JWT_PATH` only has
-  to name a path. A missing or expired JWT fails the first dispatched
-  step, not the boot.
+  and the five `SLURM*` env vars at boot (fail-fast), and on the SLURM
+  backend it also constructs the `SlurmrestdClient`, which **reads the
+  JWT file** (`main.py` lifespan → `_build_backend` →
+  `SlurmrestdClient.__init__` → `_load_jwt`). So a **missing or empty**
+  `SLURMRESTD_JWT_PATH` fails the boot. An **expired** token (file
+  present, stale content) lets boot succeed; the first dispatched step
+  gets a `401` from slurmrestd, and the client's 401-retry re-reads the
+  file once before raising.
 
 - **`meta.client.user: root`.** slurmrestd responses show
   `meta.client.user: root` under `SLURM_JWT=daemon` mode — that is
