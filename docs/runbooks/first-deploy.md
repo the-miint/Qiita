@@ -787,6 +787,7 @@ cd ~/qiita-miint
 cp .env.compute-orchestrator.example /tmp/compute-orchestrator.env
 chmod 0600 /tmp/compute-orchestrator.env
 
+# Force the SLURM backend (the example defaults to 'local' for dev/smoke).
 sed -i.bak \
     -e "s|^COMPUTE_BACKEND=.*|COMPUTE_BACKEND=slurm|" \
     -e "s|^# SHARED_FILESYSTEM_ROOT=.*|SHARED_FILESYSTEM_ROOT=<scratch>|" \

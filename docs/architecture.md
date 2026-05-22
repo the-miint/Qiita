@@ -553,7 +553,7 @@ owner column or advisory lock) before lifting that restriction.
 
 ## Compute Orchestrator
 
-Separate Python service responsible for the full compute job lifecycle.
+Separate Python service responsible for the full compute job lifecycle. SLURM-backend operational setup — cluster prerequisites, identity model, the `qiita-job` JWT auto-refresh timer — lives in [`docs/runbooks/slurm-backend-setup.md`](runbooks/slurm-backend-setup.md).
 
 **Lifecycle ownership:** The compute orchestrator owns everything between "submit job" and "report result to control plane." SLURM jobs have no knowledge of the control plane — they are truly dumb (read input, process, write output, exit). As their final act before exiting, jobs must `chmod 440` all output files and write a manifest (see Container Contract below). The data plane enforces the permission check as a pre-registration gate.
 

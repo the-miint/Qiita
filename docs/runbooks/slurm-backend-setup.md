@@ -235,6 +235,12 @@ workspace (`params.json` + outputs) — **must be on a filesystem
 mounted on the compute nodes**. The job reads its inputs from that path
 on the node; if the node cannot see it, the step fails.
 
+`QIITA_CP_URL` defaults to `http://localhost:8080`, which is correct on
+a single-host deploy where the CP and the orchestrator share the box.
+If the orchestrator runs on a different host than the CP, set
+`QIITA_CP_URL=https://<cp-fqdn>` so outbound CO→CP calls (e.g.
+`POST /sequence-range`) reach the control plane.
+
 ## Verifying the path
 
 Bottom-up, each layer proven before the next. Run as a real cluster
