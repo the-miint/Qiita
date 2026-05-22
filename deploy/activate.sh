@@ -7,8 +7,16 @@
 set -euo pipefail
 
 [ "$EUID" -eq 0 ] || { echo "ERROR: deploy/activate.sh must be run as root (sudo)." >&2; exit 1; }
+: "${QIITA_HOSTNAME:?QIITA_HOSTNAME must be set (e.g. qiita.example.org)}"
 
 INCOMING=/opt/qiita/incoming
+# Direct invocation guard: $INCOMING is normally populated by deploy/local-deploy.sh
+# or a CI rsync. If empty, the rsync below would fail with a confusing
+# "source missing" — fail fast with a useful message instead.
+[ -d "$INCOMING/qiita-control-plane" ] || {
+    echo "ERROR: $INCOMING is empty — run deploy/local-deploy.sh or rsync artifacts to $INCOMING first" >&2
+    exit 1
+}
 
 # sudo's secure_path excludes /usr/local/bin on RHEL-family. Always invoke
 # uv via $UV, never bare `uv` — bare lookup fails under sudo/systemd.
@@ -23,6 +31,7 @@ install -d -o root -g root -m 0755 "$UV_PYTHON_INSTALL_DIR"
 # Exclude transient build artifacts so a dev .venv/ or cargo target/ in the
 # source doesn't get rsync'd over the deployed venv (which `uv sync` will
 # then either trip the venv-python sanity check on or overwrite incorrectly).
+# Keep this in sync with deploy/local-deploy.sh (same list lives there).
 RSYNC_EXCLUDES=(--exclude='.venv/' --exclude='target/' --exclude='__pycache__/')
 
 rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$INCOMING/qiita-common/"              /opt/qiita/qiita-common/
@@ -48,7 +57,6 @@ done
 install -d -o root -g root -m 0755 /opt/qiita/data-plane
 install -m 0755 "$INCOMING/qiita-data-plane" /opt/qiita/data-plane/qiita-data-plane
 
-: "${QIITA_HOSTNAME:?QIITA_HOSTNAME must be set (e.g. qiita.example.org)}"
 cp "$INCOMING/deploy/nginx/qiita.conf" /etc/nginx/conf.d/qiita.conf
 sed -i "s/__QIITA_HOSTNAME__/${QIITA_HOSTNAME}/g" /etc/nginx/conf.d/qiita.conf
 cp "$INCOMING/deploy/systemd/"*.service /etc/systemd/system/
@@ -65,6 +73,8 @@ restart_if_env_present() {
 restart_if_env_present qiita-control-plane         /etc/qiita/control-plane.env
 restart_if_env_present qiita-compute-orchestrator  /etc/qiita/compute-orchestrator.env
 restart_if_env_present qiita-data-plane@50051      /etc/qiita/data-plane.env
+# If you scale out the data plane (additional qiita-data-plane@NNNN instances),
+# add a restart_if_env_present line for each here.
 
 # Skip reload when TLS files are absent (nginx -t would fail and refuse reload).
 if [ -r /etc/ssl/certs/qiita.crt ] && [ -r /etc/ssl/private/qiita.key ]; then
