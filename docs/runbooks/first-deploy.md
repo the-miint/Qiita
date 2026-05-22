@@ -8,12 +8,14 @@ authenticated and ready to serve traffic. Each step is independent —
 re-running it should be safe (idempotent) unless noted.
 
 For the conceptual reference (principal model, scopes, endpoints), see
-[`docs/auth.md`](../auth.md). [`orchestrator-token-rotation.md`](orchestrator-token-rotation.md)
-documents the future rotation procedure for the orchestrator's own
-service-account PAT — not currently used in v1 (the orchestrator
-authenticates to the CP via the shared bearer in step 7; a PAT will be
-needed once `SlurmBackend` lands and the orchestrator gains CO→CP
-callbacks).
+[`docs/auth.md`](../auth.md). The orchestrator authenticates to the CP
+in two directions: the shared bearer (`/etc/qiita/cp-to-co.token`,
+step 7) for inbound CP→CO calls, and a `compute-worker` service-account
+PAT (`/etc/qiita/co-to-cp.token`, provisioned per
+[`compute-service-account-provisioning.md`](compute-service-account-provisioning.md))
+for outbound CO→CP callbacks like `POST /sequence-range`. Rotation of
+the compute-worker PAT follows
+[`orchestrator-token-rotation.md`](orchestrator-token-rotation.md).
 
 > **Recommended workflow.** Open Claude (claude.ai/code or the CLI),
 > point it at this runbook, and ask it to walk you through one command
@@ -78,7 +80,7 @@ System users (created once as non-login system accounts):
 | `qiita-api` | Control plane (FastAPI) |
 | `qiita-orch` | Compute orchestrator |
 | `qiita-data` | Data plane (Arrow Flight / Rust) |
-| `qiita-job` | SLURM workers — runs containerized workflow jobs |
+| `qiita-job` | SLURM job-execution identity (workflow jobs run as this user on the cluster); on the deploy host, also owns the JWT-refresh timer |
 
 System groups (composition matters):
 
@@ -871,7 +873,7 @@ curl -sS https://<fqdn>/api/v1/reference/1 \
     -w "\nHTTP %{http_code}\n"
 ```
 
-Expected: `HTTP 404` with body `{"detail":"reference not found"}`. Proves
+Expected: `HTTP 404` with body `{"detail":"Reference not found"}`. Proves
 nginx routing + PAT verification + Postgres reachability all work.
 
 - `401` — PAT not loaded; check `~/.qiita/token` perms.

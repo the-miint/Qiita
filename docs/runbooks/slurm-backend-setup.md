@@ -6,7 +6,7 @@
 > orchestrator config on the deploy host.
 > [`first-deploy.md`](first-deploy.md) §9 points here.
 >
-> Validated against SLURM **25.05.7**, slurmrestd API **`v0.0.40`**.
+> Validated against SLURM **25.05.7**, slurmrestd API **`v0.0.40`**. Last checked: 2026-05-22.
 
 ## Topology
 
@@ -238,7 +238,9 @@ on the node; if the node cannot see it, the step fails.
 ## Verifying the path
 
 Bottom-up, each layer proven before the next. Run as a real cluster
-user, or as `qiita-job` once it is provisioned:
+user, or as `qiita-job` once it is provisioned. The recipe below names
+this deploy's slurmrestd host (`barnacle-api.sdsc.edu:6820`) and SLURM
+account / partition (`qiita`) — substitute your site's values:
 
 ```bash
 # 1. mint a token  [cluster host with slurm CLI; SLURM_JWT must be UNSET]
@@ -263,6 +265,11 @@ curl -s -X POST -H "X-SLURM-USER-NAME: qiita-job" -H "X-SLURM-USER-TOKEN: $SLURM
 sudo sacct -j <N> --format=JobID,User,Account,Partition,QOS,State,ExitCode,NodeList
 #   -> State=COMPLETED  ExitCode=0:0
 ```
+
+> Note on the smoke job's `current_working_directory: /tmp` — that's
+> the compute node's local `/tmp`, not the deploy host's. Fine for this
+> no-I/O smoke; real workflow steps need a path under
+> `SHARED_FILESYSTEM_ROOT` (see "Orchestrator config" above).
 
 ## Gotchas
 

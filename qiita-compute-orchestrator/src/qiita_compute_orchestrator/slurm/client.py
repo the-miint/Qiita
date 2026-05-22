@@ -116,7 +116,7 @@ class SlurmrestdClient:
         async with SlurmrestdClient(
             base_url="http://slurm-controller:6820",
             jwt_path=Path("/var/spool/slurm/jwt-token"),
-            user_name="qiita-orch",
+            user_name="qiita-job",
         ) as client:
             job_id = await client.submit_job(payload)
             info = await client.get_job(job_id)
