@@ -880,12 +880,12 @@ sample FASTQ. A single ticket touches every layer:
 
 ### Recipe
 
-End-to-end execution requires an end-user CLI (`qiita login` /
-`qiita study create` / `qiita biosample create` /
+End-to-end execution runs through the end-user `qiita` CLI
+(`qiita login` / `qiita study create` / `qiita biosample create` /
+`qiita sequencing-run create` / `qiita sequenced-pool create` /
 `qiita sequenced-sample create` / `qiita ticket submit` /
-`qiita ticket status`) plus a small pool-less API surface on the CP.
-These land together in a follow-up PR; the resulting walkthrough lives
-at [`docs/runbooks/user-cli-quickstart.md`](user-cli-quickstart.md).
+`qiita ticket status`). The walkthrough lives at
+[`docs/runbooks/user-cli-quickstart.md`](user-cli-quickstart.md).
 
 The walkthrough drives the smoke from a fresh user PAT through to a
 `COMPLETED` ticket and a `reads.parquet` artifact, with verification
@@ -895,24 +895,6 @@ step 10 — `qiita-admin actions sync --workflows-dir
 provisioning per
 [`compute-service-account-provisioning.md`](compute-service-account-provisioning.md) —
 are linked from the walkthrough.
-
-## 12. End-user smoke (optional)
-
-Step 11 exercises the operator-side `reference-add` pipeline. For
-deploys that will be used by `user`-role principals (the common case),
-the parallel user-side smoke is the
-[user-CLI quickstart](user-cli-quickstart.md): log in as a regular
-user (not the operator promoted in step 6), then walk study →
-biosample → sequencing-run → sequenced-pool → sequenced-sample →
-`fastq-to-parquet` ticket → ticket-status. Each step exercises a
-different per-resource auth gate (owner / caller-creator / per-study
-ADMIN) that step 11's reference-add flow does not touch.
-
-A failure here that step 11 did not flag is almost always either an
-OIDC misconfiguration (the user can't get a PAT at all) or a
-role-promotion that landed `system_admin` on every account by
-mistake (the per-resource gates only activate for `user`-role
-callers).
 
 ## Subsequent deploys
 

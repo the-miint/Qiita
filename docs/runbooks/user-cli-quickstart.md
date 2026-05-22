@@ -6,7 +6,7 @@
 > in the loop.
 
 Two audiences: an operator runs these steps as a post-deploy smoke
-([`first-deploy.md`](first-deploy.md) Step 12 links here), and a user
+([`first-deploy.md`](first-deploy.md) Step 11 links here), and a user
 follows them as the reference for the authoring CLI. Every authoring
 route gates on a per-resource auth predicate — study owner, run/pool
 creator, or per-study `ADMIN` tier — rather than a blanket
