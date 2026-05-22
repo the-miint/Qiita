@@ -65,7 +65,7 @@ cd qiita-control-plane && uv sync --reinstall-package qiita-common
 
 ## Workflow runtimes
 
-A step in a workflow YAML must declare exactly one of `container:` or `module:`. The `module:` form (a native step) runs in the orchestrator's Python environment under SLURM and must only use dependencies that already ship in `qiita-compute-orchestrator`'s `pyproject.toml`. Anything heavier (extra bioinformatics deps, system packages) belongs in a container. Native job modules live under `qiita-compute-orchestrator/src/qiita_compute_orchestrator/jobs/` and export exactly two symbols: `class Inputs(BaseModel)` declaring the job's typed input contract, and `async def execute(inputs, workspace)` doing the work. A single framework dispatcher (`run_native_job`) handles import, validation, and error classification; both `LocalBackend` and the shared `python -m` SLURM launcher route through it. The wire validator (`StepRunRequest`) enforces shape only — exactly one of `container` or `module` must be set. The module prefix (`qiita_compute_orchestrator.jobs.`) itself is enforced at four other sites: sync (CP, `actions/sync.py`), submit (CO `/step/run` handler), boot (orchestrator lifespan scan), and dispatcher (`run_native_job`).
+A step in a workflow YAML must declare exactly one of `container:` or `module:`. The `module:` form (a native step) runs in the orchestrator's Python environment under SLURM and must only use dependencies that already ship in `qiita-compute-orchestrator`'s `pyproject.toml`. Anything heavier (extra bioinformatics deps, system packages) belongs in a container. Native job modules live under `qiita-compute-orchestrator/src/qiita_compute_orchestrator/jobs/` and export exactly two symbols: `class Inputs(BaseModel)` declaring the job's typed input contract, and `async def execute(inputs, workspace)` doing the work. A single framework dispatcher (`run_native_job`) handles import, validation, and error classification; both `LocalBackend` and the shared `python -m` SLURM launcher route through it. The wire validator (`StepRunRequest`) enforces shape only — exactly one of `container` or `module` must be set. The module prefix (`qiita_compute_orchestrator.jobs.`) itself is enforced at multiple sites outside the wire validator (sync, submit, boot scan, dispatcher); see [`docs/architecture.md`](docs/architecture.md) for the per-site breakdown.
 
 ## Naming conventions
 
@@ -77,7 +77,7 @@ Fixed in #11 after the initial schema mixed both forms.
 
 ## Architecture
 
-See `docs/architecture.md` for the full system diagram, `docs/reference-data-staging.md` for how reference databases are ingested, and `docs/auth.md` for the authentication / authorization surface (principal subtypes, OIDC + opaque-token paths, role/scope ceilings, admin endpoints, and the `qiita-admin` CLI). Operational runbooks for the auth surface live under `docs/runbooks/`. What follows is the non-obvious cross-cutting structure.
+See `docs/architecture.md` for the full system diagram, `docs/reference-data-staging.md` for how reference databases are ingested, `docs/auth.md` for the authentication / authorization surface (principal subtypes, OIDC + opaque-token paths, role/scope ceilings, admin endpoints, and the `qiita-admin` CLI), and `docs/duckdb-miint.md` for the duckdb-miint SQL extension that powers our bioinformatics functions — that file carries a `Last checked` date; re-verify a signature against upstream before relying on it if the file looks stale. Operational runbooks for the auth surface live under `docs/runbooks/`. What follows is the non-obvious cross-cutting structure.
 
 ### Component map and ports
 
@@ -114,6 +114,8 @@ reference_idx ── reference_membership ── feature_idx ── feature_geno
 `feature_idx` bridges sample processing results (alignment detail, counts) and reference data (sequences, taxonomy, annotations, phylogeny). Alignment output contains `feature_idx` but **not** `reference_idx` — reference scoping is a query-time join against `reference_membership`.
 
 Phylogeny internal nodes are addressed by `(reference_idx, node_index)` — scoped to a single tree, not referenced across references. Tip nodes connect to `feature_idx` via the `phylogeny_tip_feature` junction table.
+
+**Hash storage: never carry MD5 as VARCHAR.** DuckDB's `md5(x)` returns the 32-char hex string by default — never write the string form into a column, temp table, or Parquet file. Cast to `UUID` (`md5(x)::uuid`, 128-bit internally) or use `md5_number(x)` for `UHUGEINT`. Both are 16-byte fixed-width, compare/JOIN as integers, and match the Postgres `uuid` column type the wire-side `sequence_hash` and `feature_idx` already use — a string-form intermediate forces a CAST at write time and burns memory + I/O between phases. Same rule applies to any other content hash (SHA-256 as fixed-width bytes, etc.); pick the narrowest integer / fixed-width type the hash fits in.
 
 ### Data plane design
 

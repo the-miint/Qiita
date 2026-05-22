@@ -109,3 +109,20 @@ PATH_WORK_TICKET_RUN = "/{work_ticket_idx}/run"
 URL_WORK_TICKET_PREFIX = f"{API_PREFIX}{PATH_WORK_TICKET_PREFIX}"
 URL_WORK_TICKET_BY_IDX = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_BY_IDX}"
 URL_WORK_TICKET_RUN = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_RUN}"
+
+
+# =============================================================================
+# /sequence-range/* — control-plane sequence_idx allocator
+# =============================================================================
+# Mints contiguous bigint ranges (`sequence_idx_start..stop`) the data
+# plane uses to key raw sequencing reads. POST is service-account-only
+# (Scope.SEQUENCE_RANGE_MINT); GET piggybacks on Scope.PREP_SAMPLE_READ.
+
+PATH_SEQUENCE_RANGE_PREFIX = "/sequence-range"
+PATH_SEQUENCE_RANGE_ROOT = ""  # POST against the prefix itself
+PATH_SEQUENCE_RANGE_BY_PREP_SAMPLE = "/{prep_sample_idx}"
+
+URL_SEQUENCE_RANGE_PREFIX = f"{API_PREFIX}{PATH_SEQUENCE_RANGE_PREFIX}"
+URL_SEQUENCE_RANGE_BY_PREP_SAMPLE = (
+    f"{URL_SEQUENCE_RANGE_PREFIX}{PATH_SEQUENCE_RANGE_BY_PREP_SAMPLE}"
+)

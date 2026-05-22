@@ -8,7 +8,7 @@ from qiita_common.models import HealthResponse
 from .backend import ComputeBackend
 from .backends.local import LocalBackend
 from .backends.slurm import SlurmBackend
-from .config import BACKEND_LOCAL, BACKEND_SLURM, Settings
+from .config import BACKEND_LOCAL, BACKEND_SLURM, Settings, install_settings
 from .jobs import scan_native_jobs
 from .slurm import SlurmrestdClient
 from .step import router as step_router
@@ -43,6 +43,12 @@ def _build_backend(settings: Settings) -> ComputeBackend:
 async def lifespan(app: FastAPI):
     install_authorization_scrub()
     settings = Settings.from_env()
+    # Install once so make_cp_client / get_settings hit the cached
+    # instance for every subsequent step. Misconfig already crashed on
+    # the Settings.from_env() line above; install_settings just makes
+    # the resolved value available to non-FastAPI code paths
+    # (sequence_range.make_cp_client) without re-reading the env.
+    install_settings(settings)
     app.state.settings = settings
     app.state.backend = _build_backend(settings)
     app.state.cp_to_co_token = settings.cp_to_co_token

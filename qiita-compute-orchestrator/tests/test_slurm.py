@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 from qiita_common.actions import BaselineResources
+from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
 
 from qiita_compute_orchestrator.slurm import (
     VerificationFailure,
@@ -192,7 +193,7 @@ def native_kwargs(baseline, tmp_path):
         "step_name": "fastq",
         "work_ticket_idx": 42,
         "container": None,
-        "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
+        "module": FASTQ_TO_PARQUET_MODULE,
         "entrypoint": None,
         "baseline_resources": baseline,
         "input_path": tmp_path / "in",
@@ -252,7 +253,7 @@ def test_payload_rejects_both_container_and_module(common_kwargs):
     """Exactly-one runtime — both set is rejected by the builder. The
     wire validator catches this upstream; the builder's own check
     protects direct callers (tests, future programmatic submission)."""
-    common_kwargs["module"] = "qiita_compute_orchestrator.jobs.fastq_to_parquet"
+    common_kwargs["module"] = FASTQ_TO_PARQUET_MODULE
     with pytest.raises(ValueError, match="exactly one"):
         build_job_submit_payload(**common_kwargs)
 

@@ -26,6 +26,7 @@ from ..auth.guards import (
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
 from ..repositories.study import create_study, fetch_study
+from ._helpers import GENERIC_FK_VIOLATION
 
 router = APIRouter(prefix="/study", tags=["study"])
 
@@ -36,12 +37,6 @@ _MSG_ON_BEHALF_REQUIRES_WET_LAB_ADMIN = (
 _MSG_OWNER_NOT_ELIGIBLE = "owner is not eligible to own studies"
 _MSG_BAD_PI_NOT_USER = "principal_investigator_idx must reference a user-kind principal"
 _MSG_BAD_OWNER_NOT_USER = "owner_idx must reference a user-kind principal"
-# Generic safety net for an unreachable FK path. owner_idx is pre-flight
-# checked via fetch_user_eligibility and PI is gated by tg_principal_must_be_user
-# (a BEFORE-INSERT trigger that fires ahead of the FK constraint), so neither
-# column can realistically surface a ForeignKeyViolationError; this message
-# only fires for a column added in the future without a similar pre-flight.
-_GENERIC_FK_VIOLATION = "references a row that does not exist"
 
 
 def _study_response_from_row(row: asyncpg.Record) -> StudyResponse:
@@ -67,7 +62,6 @@ def _study_response_from_row(row: asyncpg.Record) -> StudyResponse:
             "abstract": row["abstract"],
             "funding": row["funding"],
             "ebi_study_accession": row["ebi_study_accession"],
-            "vamps_id": row["vamps_id"],
             "notes": row["notes"],
             "extra_metadata": extra_metadata,
             "default_tier": row["default_tier"],
@@ -127,13 +121,12 @@ async def create_study_route(
                 abstract=body.abstract,
                 funding=body.funding,
                 ebi_study_accession=body.ebi_study_accession,
-                vamps_id=body.vamps_id,
                 notes=body.notes,
                 extra_metadata=body.extra_metadata,
                 default_tier=body.default_tier,
             )
         except asyncpg.ForeignKeyViolationError:
-            raise HTTPException(status_code=422, detail=_GENERIC_FK_VIOLATION)
+            raise HTTPException(status_code=422, detail=GENERIC_FK_VIOLATION)
         except asyncpg.RaiseError as exc:
             # tg_principal_must_be_user fires for owner_idx or PI idx pointing
             # at a non-user-kind principal (service account or bare principal).
@@ -151,7 +144,7 @@ async def create_study_route(
 
 
 @router.get("/{study_idx}")
-async def get_study_route(
+async def get_study(
     study_idx: Annotated[int, Field(gt=0)],
     pool: asyncpg.Pool = Depends(get_db_pool),
     _scope: Principal = Depends(require_scope(Scope.STUDY_READ)),

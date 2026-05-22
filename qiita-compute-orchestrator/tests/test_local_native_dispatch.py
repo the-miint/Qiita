@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
 
 from qiita_compute_orchestrator.backends.local import LocalBackend
 from qiita_compute_orchestrator.jobs import RESERVED_INPUT_KEYS
@@ -65,7 +66,7 @@ async def test_dispatches_to_native_module(monkeypatch, tmp_path):
         "fastq",
         {"fastq_path": tmp_path / "in.fa"},
         tmp_path,
-        reference_idx=7,
+        scope_target={"kind": "reference", "reference_idx": 7},
         work_ticket_idx=99,
         module=full,
     )
@@ -79,28 +80,6 @@ async def test_dispatches_to_native_module(monkeypatch, tmp_path):
     assert workspace == tmp_path
 
 
-async def test_skeleton_not_implemented_maps_to_unknown_permanent(tmp_path):
-    """The real fastq_to_parquet skeleton raises NotImplementedError;
-    run_native_job translates it to BackendFailure(UNKNOWN_PERMANENT)
-    and LocalBackend propagates without re-wrapping. The failure
-    carries the YAML step name (not the module path) so it lines up
-    with the work_ticket.failure_step_name DB column."""
-    backend = LocalBackend()
-
-    with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
-            "fastq",  # YAML step name
-            {"fastq_path": tmp_path / "in.fa"},
-            tmp_path,
-            reference_idx=1,
-            work_ticket_idx=1,
-            module="qiita_compute_orchestrator.jobs.fastq_to_parquet",
-        )
-    assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
-    assert ei.value.step_name == "fastq"
-    assert "fastq_to_parquet" in ei.value.reason
-
-
 async def test_bad_prefix_maps_to_contract_violation(tmp_path):
     """A module path outside NATIVE_MODULE_PREFIX is rejected by
     run_native_job; LocalBackend propagates the typed failure
@@ -112,7 +91,7 @@ async def test_bad_prefix_maps_to_contract_violation(tmp_path):
             "x",
             {},
             tmp_path,
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=1,
             module="os.system",
         )
@@ -132,10 +111,10 @@ async def test_rejects_both_container_and_module(tmp_path):
             "x",
             {},
             tmp_path,
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=1,
             container="qiita/test:1.0.0",
-            module="qiita_compute_orchestrator.jobs.fastq_to_parquet",
+            module=FASTQ_TO_PARQUET_MODULE,
         )
     assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
     assert "exactly one" in ei.value.reason
@@ -153,7 +132,7 @@ async def test_rejects_neither_container_nor_module(tmp_path):
             "hash",
             {},
             tmp_path,
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=1,
         )
     assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
@@ -182,7 +161,7 @@ async def test_rejects_inputs_overlap_with_framework_scalars(reserved_key, monke
             # shadows the framework scalar — the helper rejects.
             {reserved_key: tmp_path / "evil.fa"},
             tmp_path,
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=1,
             module=full,
         )
@@ -207,7 +186,7 @@ async def test_dispatcher_failures_propagate_through_local_backend(monkeypatch, 
             "x",
             {"fastq_path": tmp_path / "in.fa"},
             tmp_path,
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=1,
             module=full,
         )

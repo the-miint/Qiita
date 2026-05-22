@@ -1,7 +1,5 @@
 """Local compute backend — runs DuckDB+miint in-process for dev/test."""
 
-import asyncio
-import os
 from pathlib import Path
 
 import duckdb
@@ -9,39 +7,14 @@ from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.models import WorkTicketFailureStage
 from qiita_common.parquet import validate_parquet_path
 
-from ..backend import ComputeBackend
+from ..backend import ComputeBackend, assert_container_scope_supported
 from ..jobs import flatten_native_inputs, run_native_job
-
-# miint is installed once per process to avoid a network call on every hash job.
-_miint_install_lock = asyncio.Lock()
-_miint_installed = False
-
-# MIINT_EXTENSION_REPO points install at a custom extension repo (e.g. the team
-# mirror at https://ftp.microbio.me/pub/miint) instead of community-extensions.
-_MIINT_EXT_REPO = os.environ.get("MIINT_EXTENSION_REPO")
-
-
-async def _ensure_miint_installed() -> None:
-    """Install miint once per process, concurrency-safe."""
-    global _miint_installed
-    if _miint_installed:
-        return
-    async with _miint_install_lock:
-        if _miint_installed:
-            return
-        with _open_conn() as conn:
-            if _MIINT_EXT_REPO is not None:
-                conn.execute(f"FORCE INSTALL miint FROM '{_MIINT_EXT_REPO}';")
-            else:
-                conn.execute("INSTALL miint FROM community;")
-        _miint_installed = True
-
-
-def _open_conn() -> duckdb.DuckDBPyConnection:
-    """Open a DuckDB connection with unsigned extensions allowed if needed."""
-    if _MIINT_EXT_REPO is not None:
-        return duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
-    return duckdb.connect(":memory:")
+from ..miint import (
+    PARQUET_OPTS,
+    ensure_miint_installed,
+    is_empty_sequence_file,
+    open_conn,
+)
 
 
 class LocalBackend(ComputeBackend):
@@ -71,7 +44,7 @@ class LocalBackend(ComputeBackend):
         inputs: dict[str, Path],
         workspace: Path,
         *,
-        reference_idx: int,
+        scope_target: dict,
         work_ticket_idx: int,  # noqa: ARG002 — accepted for protocol parity
         container: str | None = None,  # inspected by the runtime guard below; otherwise ignored
         module: str | None = None,  # inspected by the native-dispatch guard below
@@ -103,7 +76,7 @@ class LocalBackend(ComputeBackend):
             # validates raw_inputs via mod.Inputs, invokes
             # mod.execute(inputs, workspace), and maps known exceptions
             # to typed BackendFailure. `flatten_native_inputs` merges
-            # the work-ticket scalars and rejects reserved-key
+            # the scope-target idx scalars and rejects reserved-key
             # collisions the same way the SLURM launcher does — a job
             # module sees identical raw_inputs regardless of runtime.
             # `step_name=name` plumbs the YAML step name (e.g. "fastq")
@@ -112,10 +85,17 @@ class LocalBackend(ComputeBackend):
             raw_inputs = flatten_native_inputs(
                 {k: str(v) for k, v in inputs.items()},
                 step_name=name,
-                reference_idx=reference_idx,
+                scope_target=scope_target,
                 work_ticket_idx=work_ticket_idx,
             )
             return await run_native_job(module, raw_inputs, workspace, step_name=name)
+        # Container path: hash and load both need a reference_idx. The
+        # workflow YAML for reference-add is reference-scoped, so this
+        # branch only runs under that scope today. Refuse anything else
+        # with a typed contract violation instead of silently picking up
+        # the wrong scalar. Shared helper mirrored in SlurmBackend.
+        assert_container_scope_supported(step_name=name, scope_target=scope_target)
+        reference_idx = scope_target["reference_idx"]
         try:
             if name == "hash":
                 manifest = await self._run_hash(inputs["fasta_path"], workspace, reference_idx)
@@ -188,29 +168,34 @@ class LocalBackend(ComputeBackend):
             raise FileNotFoundError(f"FASTA file not found: {fasta_path}")
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        await _ensure_miint_installed()
+        await ensure_miint_installed()
         manifest_path = output_dir / "manifest.parquet"
         out = validate_parquet_path(manifest_path)
 
-        with _open_conn() as conn:
+        with open_conn() as conn:
             conn.execute("LOAD miint;")
 
             # Materialize FASTA into a temp table — single read of the file.
-            # DuckDB raises on empty files — treat as zero sequences.
-            try:
+            # Empty FASTA inputs are legal here (reference-add tolerates
+            # zero sequences and writes an empty manifest); detect them
+            # with a Python decompressed-stream peek instead of catching
+            # miint's "Empty file" exception. See miint.is_empty_sequence_file
+            # for the rationale; this rewire closes #39 from this site.
+            if is_empty_sequence_file(fasta_path):
+                conn.execute("CREATE TEMP TABLE raw_seqs (read_id VARCHAR, hash UUID, len BIGINT)")
+            else:
+                # `md5(sequence1)::uuid` keeps the hash as UUID
+                # (int128 internally) end-to-end instead of carrying a
+                # 32-char VARCHAR through the temp table and casting at
+                # write time. Smaller in memory, faster to compare/JOIN,
+                # and matches the wire-side `sequence_hash` UUID column
+                # downstream consumers expect (see manifest schema below).
                 conn.execute(
                     "CREATE TEMP TABLE raw_seqs AS "
-                    "SELECT read_id, md5(sequence1) AS hash, length(sequence1) AS len "
+                    "SELECT read_id, md5(sequence1)::uuid AS hash, length(sequence1) AS len "
                     "FROM read_fastx(?)",
                     [str(fasta_path)],
                 )
-            except duckdb.Error as exc:
-                if "Empty file" in str(exc):
-                    conn.execute(
-                        "CREATE TEMP TABLE raw_seqs (read_id VARCHAR, hash VARCHAR, len BIGINT)"
-                    )
-                else:
-                    raise
 
             # Reject duplicate read_ids — pure DuckDB, no second FASTA scan.
             dup_result = conn.execute(
@@ -221,16 +206,16 @@ class LocalBackend(ComputeBackend):
                 raise ValueError(f"FASTA contains duplicate read_id(s): {dup_ids}")
 
             # Write manifest as Parquet — columns (read_id, sequence_hash, length).
-            # The hash column is converted to UUID on the way out so downstream
-            # consumers (mint-features, load step) read it as UUID natively.
-            # Sorted by sequence_hash because every downstream consumer keys
-            # off it: mint-features dedups on it; the load step JOINs on it.
-            # reference_idx isn't embedded in the file; the caller's
+            # `hash` is already UUID by construction (md5(...)::uuid above),
+            # so no cast at write time. Sorted by sequence_hash because
+            # every downstream consumer keys off it: mint-features dedups
+            # on it; the load step JOINs on it. reference_idx isn't
+            # embedded in the file; the caller's
             # work_ticket.scope_target.reference_idx is the source of truth.
             conn.execute(
                 "COPY ("
                 "  SELECT read_id,"
-                "    CAST(hash AS UUID) AS sequence_hash,"
+                "    hash AS sequence_hash,"
                 "    len AS length"
                 "  FROM raw_seqs"
                 "  ORDER BY sequence_hash"
@@ -262,9 +247,9 @@ class LocalBackend(ComputeBackend):
             raise FileNotFoundError(f"jplace file not found: {jplace_path}")
 
         output_dir.mkdir(parents=True, exist_ok=True)
-        await _ensure_miint_installed()
+        await ensure_miint_installed()
 
-        with _open_conn() as conn:
+        with open_conn() as conn:
             conn.execute("LOAD miint;")
             conn.execute("SET preserve_insertion_order=false;")
             conn.execute(f"SET temp_directory='{output_dir}/.duckdb_tmp';")
@@ -288,13 +273,12 @@ class LocalBackend(ComputeBackend):
         return output_dir
 
 
-_PARQUET_OPTS = "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd'"
 # 16384 rows × ~64 KB chunk_data ≈ 1 GB per row group. Smaller values flush
 # more frequently, preventing OOM on genome-heavy references. Empirically
 # tuned against GG2 backbone (21 MB max genome, 11 GB FASTA):
 #   16384 → 4.2 GB peak RSS (OK), 32768 → OOM on 30 GB machine.
 _CHUNK_ROW_GROUP_SIZE = 16384
-_PARQUET_OPTS_CHUNKED = f"{_PARQUET_OPTS}, ROW_GROUP_SIZE {_CHUNK_ROW_GROUP_SIZE}"
+_PARQUET_OPTS_CHUNKED = f"{PARQUET_OPTS}, ROW_GROUP_SIZE {_CHUNK_ROW_GROUP_SIZE}"
 _CHUNK_SIZE = 65536  # 64 KB
 
 
@@ -349,7 +333,7 @@ def _write_sequence_metadata(conn: duckdb.DuckDBPyConnection, output_dir: Path) 
         "    CAST(sequence_length_bp AS BIGINT) AS sequence_length_bp"
         "  FROM id_map"
         "  ORDER BY feature_idx"
-        f") TO '{out}' ({_PARQUET_OPTS})"
+        f") TO '{out}' ({PARQUET_OPTS})"
     )
 
 
@@ -403,7 +387,7 @@ def _write_membership(
         f"  SELECT CAST({reference_idx} AS BIGINT) AS reference_idx, feature_idx"
         "  FROM id_map"
         "  ORDER BY feature_idx"
-        f") TO '{out}' ({_PARQUET_OPTS})"
+        f") TO '{out}' ({PARQUET_OPTS})"
     )
 
 
@@ -480,7 +464,7 @@ def _write_taxonomy(
         "    NULL::BIGINT AS ncbi_taxon_id"
         "  FROM parsed_taxonomy"
         "  ORDER BY feature_idx"
-        f") TO '{out}' ({_PARQUET_OPTS})"
+        f") TO '{out}' ({PARQUET_OPTS})"
     )
 
     conn.execute("DROP TABLE parsed_taxonomy")
@@ -512,7 +496,7 @@ def _write_phylogeny(
         "  FROM tree_nodes t"
         "  LEFT JOIN id_map m ON t.is_tip AND t.name = m.read_id"
         "  ORDER BY t.node_index"
-        f") TO '{out}' ({_PARQUET_OPTS})",
+        f") TO '{out}' ({PARQUET_OPTS})",
     )
 
     conn.execute("DROP TABLE tree_nodes")
@@ -540,6 +524,6 @@ def _write_placements(
         "  FROM read_jplace(?) j"
         "  INNER JOIN id_map m ON j.fragment = m.read_id"
         "  ORDER BY m.feature_idx, j.edge_num"
-        f") TO '{out}' ({_PARQUET_OPTS})",
+        f") TO '{out}' ({PARQUET_OPTS})",
         [str(jplace_path)],
     )

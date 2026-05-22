@@ -1,11 +1,14 @@
 """Integration tests for the POST /api/v1/study/{study_idx}/biosample route.
 
-Exercises wet_lab_admin and system_admin happy paths, the role / scope /
-study-existence guards, the parametrised owner-eligibility 422 surface,
-the metadata dict's validation 422s (unknown field, parse failure,
-owner-id collision), Pydantic body validation, and DB-level
-exception-mapping (409 / 422). Regular users are forbidden by the role
-gate; one negative test covers it.
+Exercises wet_lab_admin and system_admin happy paths, the scope and
+study-existence guards, the per-study ADMIN-access guard
+(`require_study_access(min_tier=Tier.ADMIN, bypass_role=WET_LAB_ADMIN)`
+— regular users who own a study or carry an ADMIN study_access row
+may create biosamples there), the parametrised owner-eligibility 422
+surface, the metadata dict's validation 422s (unknown field, parse
+failure, owner-id collision), Pydantic body validation, and DB-level
+exception-mapping (409 / 422). Regular-user 403 paths cover both the
+no-access-row and the below-admin-tier cases.
 """
 
 import secrets
@@ -30,6 +33,7 @@ from qiita_control_plane.testing.db_seeds import (
 from .conftest import (
     OWNER_INELIGIBILITY_KINDS,
     IneligibilityKind,
+    _grant_study_access,
     assert_owner_ineligibility_422,
     delete_idxs,
     resolve_ineligible_owner_idx,
@@ -184,8 +188,8 @@ async def _post_biosample(client, ctx, study_idx: int, **body):
         rj = resp.json()
         ctx["created"]["biosample"].append(rj["biosample_idx"])
         ctx["created"]["biosample_to_study"].append((rj["biosample_idx"], study_idx))
-        if rj["biosample_study_field_created"]:
-            ctx["created"]["biosample_study_field"].append(rj["biosample_study_field_idx"])
+        if rj["owner_id_biosample_study_field_created"]:
+            ctx["created"]["biosample_study_field"].append(rj["owner_id_biosample_study_field_idx"])
         meta_idx = await ctx["pool"].fetchval(
             "SELECT idx FROM qiita.biosample_metadata"
             " WHERE biosample_idx = $1 AND is_owner_biosample_id = true",
@@ -197,7 +201,7 @@ async def _post_biosample(client, ctx, study_idx: int, **body):
 
 
 async def _track_global_metadata_outputs(ctx, bs_idx, study_idx, global_idxs):
-    """Track globally-linked study fields (by global concept idx) and every
+    """Track globally-linked study fields (by global field idx) and every
     non-owner-id metadata row written for this biosample. Use after
     `_post_biosample` in tests that exercised the metadata dict path so
     the FK-reverse cleanup picks the new rows up. Mirrors the sibling
@@ -205,7 +209,7 @@ async def _track_global_metadata_outputs(ctx, bs_idx, study_idx, global_idxs):
     parallel.
     """
     # Pick up every globally-linked study field row at this study tied to
-    # one of the supplied global concepts.
+    # one of the supplied global fields.
     rows = await ctx["pool"].fetch(
         "SELECT idx FROM qiita.biosample_study_field"
         " WHERE study_idx = $1 AND biosample_global_field_idx = ANY($2::bigint[])",
@@ -259,8 +263,8 @@ async def test_post_biosample_wet_lab_admin_self_owner(ctx):
         # The Field(gt=0) constraint on BiosampleImportResponse already
         # rejects a zero idx at the route boundary.
         "biosample_idx": rj["biosample_idx"],
-        "biosample_study_field_idx": rj["biosample_study_field_idx"],
-        "biosample_study_field_created": True,
+        "owner_id_biosample_study_field_idx": rj["owner_id_biosample_study_field_idx"],
+        "owner_id_biosample_study_field_created": True,
     }
     assert rj == expected
 
@@ -321,8 +325,8 @@ async def test_post_biosample_system_admin_on_behalf_of_other_user(ctx):
 
 async def test_post_biosample_response_reports_field_created_flag_states(ctx):
     # Two consecutive POSTs with the same owner_biosample_id_field_name
-    # must report biosample_study_field_created=True then False, with both
-    # responses pointing at the same biosample_study_field_idx.
+    # must report owner_id_biosample_study_field_created=True then False, with both
+    # responses pointing at the same owner_id_biosample_study_field_idx.
     study_idx = await _seed_study(
         ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="reuse"
     )
@@ -348,9 +352,9 @@ async def test_post_biosample_response_reports_field_created_flag_states(ctx):
     assert r1.status_code == 201, r1.text
     assert r2.status_code == 201, r2.text
     rj1, rj2 = r1.json(), r2.json()
-    assert rj1["biosample_study_field_created"] is True
-    assert rj2["biosample_study_field_created"] is False
-    assert rj1["biosample_study_field_idx"] == rj2["biosample_study_field_idx"]
+    assert rj1["owner_id_biosample_study_field_created"] is True
+    assert rj2["owner_id_biosample_study_field_created"] is False
+    assert rj1["owner_id_biosample_study_field_idx"] == rj2["owner_id_biosample_study_field_idx"]
 
 
 # ===========================================================================
@@ -358,11 +362,32 @@ async def test_post_biosample_response_reports_field_created_flag_states(ctx):
 # ===========================================================================
 
 
-async def test_post_biosample_regular_user_403(ctx):
-    # Regular user (system_role=user) cannot create biosamples at all —
-    # require_role_at_least(WET_LAB_ADMIN) rejects with 403.
+async def test_post_biosample_regular_user_owner_passes(ctx):
+    # Regular user creates a biosample on a study they own; the owner
+    # bypass in `require_study_access` admits the owner at every tier
+    # without a study_access row.
     study_idx = await _seed_study(
-        ctx["pool"], owner_idx=ctx["user_session"]["principal_idx"], suffix="reg"
+        ctx["pool"], owner_idx=ctx["user_session"]["principal_idx"], suffix="user-own"
+    )
+    ctx["created"]["study"].append(study_idx)
+
+    resp = await _post_biosample(
+        ctx["user"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["user_session"]["principal_idx"],
+        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_value="USER-OWN-1",
+    )
+    assert resp.status_code == 201, resp.text
+
+
+async def test_post_biosample_regular_user_no_access_403(ctx):
+    # Regular user posts to a study owned by the wet_lab_admin with no
+    # study_access row: tier resolves to public-by-absence, below
+    # Tier.ADMIN, so require_study_access raises 403.
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="no-access"
     )
     ctx["created"]["study"].append(study_idx)
 
@@ -375,7 +400,61 @@ async def test_post_biosample_regular_user_403(ctx):
         owner_biosample_id_value="X",
     )
     assert resp.status_code == 403
-    assert "wet_lab_admin" in resp.json()["detail"]
+    assert "admin" in resp.json()["detail"]
+
+
+async def test_post_biosample_regular_user_admin_tier_passes(ctx):
+    # Regular user does not own the study but has Tier.ADMIN via
+    # study_access; the tier check on the new route gate accepts the grant.
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="user-grant"
+    )
+    ctx["created"]["study"].append(study_idx)
+    await _grant_study_access(
+        ctx,
+        study_idx=study_idx,
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier="admin",
+        granted_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+
+    resp = await _post_biosample(
+        ctx["user"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["user_session"]["principal_idx"],
+        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_value="USER-GRANT-1",
+    )
+    assert resp.status_code == 201, resp.text
+
+
+async def test_post_biosample_regular_user_viewer_tier_403(ctx):
+    # A study_access row at viewer tier is below the route's ADMIN floor;
+    # require_study_access raises 403. Pins that the gate is genuinely
+    # checking the tier rather than only the row's existence.
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="user-viewer"
+    )
+    ctx["created"]["study"].append(study_idx)
+    await _grant_study_access(
+        ctx,
+        study_idx=study_idx,
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier="viewer",
+        granted_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+
+    resp = await _post_biosample(
+        ctx["user"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["user_session"]["principal_idx"],
+        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_value="X",
+    )
+    assert resp.status_code == 403
+    assert "admin" in resp.json()["detail"]
 
 
 async def test_post_biosample_anonymous_401(ctx):
@@ -594,10 +673,10 @@ async def test_post_biosample_bad_metadata_checklist_idx_422(ctx):
 
 
 async def test_post_biosample_metadata_writes_global_fields(ctx):
-    # Seed two global concepts (DATE and NUMERIC) and post metadata that
+    # Seed two global fields (DATE and NUMERIC) and post metadata that
     # references both by display_name. Verify the route round-trips the
     # parsed values into the matching value_* columns and creates one
-    # globally-linked study field per concept.
+    # globally-linked study field per global field.
     suffix = secrets.token_hex(4)
     date_global = await seed_biosample_global_field(
         ctx["pool"],
@@ -662,6 +741,54 @@ async def test_post_biosample_metadata_writes_global_fields(ctx):
         key=lambda r: r["global_field_idx"],
     )
     assert [dict(r) for r in rows] == expected
+
+
+async def test_post_biosample_globally_linked_owner_field_409(ctx):
+    # Seed a global field and post a metadata value against it so a
+    # globally-linked biosample_study_field exists at (study, name).
+    # A second POST that names that same display_name as the owner-id
+    # field must be rejected: the owner-id row is purely-local PII and
+    # cannot be written through a global slot. Maps to 409.
+    suffix = secrets.token_hex(4)
+    linked_name = f"Globally Linked {suffix}"
+    global_idx = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=f"r_glob_{suffix}",
+        display_name=linked_name,
+        data_type=FieldDataType.TEXT,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="glob-owner"
+    )
+    ctx["created"]["study"].append(study_idx)
+
+    seed_resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_value="SEED-OWNER",
+        metadata={linked_name: "seed-value"},
+    )
+    assert seed_resp.status_code == 201, seed_resp.text
+    await _track_global_metadata_outputs(
+        ctx, seed_resp.json()["biosample_idx"], study_idx, [global_idx]
+    )
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=linked_name,
+        owner_biosample_id_value="DOOMED",
+    )
+    assert resp.status_code == 409, resp.text
+    assert linked_name in resp.json()["detail"]
 
 
 async def test_post_biosample_metadata_unknown_field_422(ctx):
@@ -756,9 +883,9 @@ async def test_post_biosample_metadata_owner_id_collision_422(ctx):
 
 
 async def test_post_biosample_metadata_uses_seeded_globals(ctx):
-    # Realistic 6-field MIxS-style import that resolves global concepts
+    # Realistic 6-field MIxS-style import that resolves global fields
     # against the rows seeded by migration 20260501000014 instead of
-    # creating throwaway concepts. Cleanup tracks only the per-test
+    # creating throwaway global fields. Cleanup tracks only the per-test
     # study-field and metadata rows so the seeded globals survive.
     display_names = [
         "collection date",
@@ -873,13 +1000,6 @@ async def test_post_biosample_metadata_uses_seeded_globals(ctx):
 # link / retired biosample excluded).
 
 
-@pytest_asyncio.fixture
-async def no_study_read_client(make_pat_client):
-    """A regular_user PAT with a scope set that EXCLUDES Scope.STUDY_READ —
-    drives the require_scope guard's missing-scope 403 on the list-idxs route."""
-    return await make_pat_client(label="bs-list-no-read", scopes=[Scope.SELF_PROFILE])
-
-
 async def _seed_link_to_study(ctx, *, study_idx, owner_idx):
     """Seed a biosample owned by `owner_idx`, link it to `study_idx`, and
     track both rows in `ctx['created']` for FK-reverse cleanup. Wraps the
@@ -894,19 +1014,6 @@ async def _seed_link_to_study(ctx, *, study_idx, owner_idx):
     )
     ctx["created"]["biosample_to_study"].append((bs_idx, study_idx))
     return bs_idx
-
-
-async def _grant_study_access(ctx, *, study_idx, principal_idx, tier, granted_by_idx):
-    """Insert a study_access row at the named tier; track for cleanup."""
-    await ctx["pool"].execute(
-        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier, granted_by_idx)"
-        " VALUES ($1, $2, $3::qiita.tier, $4)",
-        study_idx,
-        principal_idx,
-        tier,
-        granted_by_idx,
-    )
-    ctx["created"]["study_access"].append((study_idx, principal_idx))
 
 
 async def test_list_biosample_idxs_anonymous_401(ctx):

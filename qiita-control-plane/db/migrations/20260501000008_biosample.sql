@@ -172,15 +172,15 @@ CREATE TABLE qiita.biosample_metadata (
 
 COMMENT ON COLUMN qiita.biosample_metadata.global_field_idx IS
     'Maintained by trigger from biosample_study_field.biosample_global_field_idx. '
-    'NULL when the source field is purely study-local, and ALSO NULL when the '
-    'biosample''s link to the source field''s owning study has been retired '
-    '(set to true on biosample_to_study.retired): retirement of the contributing '
-    'link demotes the row from globally-linked to study-local and releases the '
-    'cross-study uniqueness slot (biosample_idx, global_field_idx) so another '
-    'study may subsequently write a different globally-linked value on the same '
-    '(biosample, global concept) pair. Powers the partial unique index that enforces '
-    'one value per (biosample, global concept) pair across all studies, so cross-study '
-    'reads through the global field always return a single canonical value.';
+    'NULL when the source field is purely study-local, non-NULL when the source '
+    'field is bound to a global field. Powers the partial unique index that '
+    'enforces one value per (biosample, global field) pair across all studies, '
+    'so cross-study reads through the global field always return a single '
+    'canonical value. The slot is permanently held by whichever study first '
+    'wrote through the global field; retiring that study''s biosample_to_study '
+    'link does not release the slot (the canonical value persists for other '
+    'studies that retained their link). Per-study read access on retired links '
+    'is governed by the study_access predicate at read time, not by this column.';
 
 COMMENT ON COLUMN qiita.biosample_metadata.is_owner_biosample_id IS
     'True iff this metadata row holds the owner''s identifier for this biosample. '
@@ -195,8 +195,8 @@ CREATE INDEX biosample_metadata_terminology_value_idx
     WHERE value_terminology_term_idx IS NOT NULL;
 
 -- Cross-study uniqueness for globally-linked values: a given biosample has at
--- most one metadata row per global concept, even if multiple studies have local
--- fields linked to that concept. Conflicting writes are caught here rather than
+-- most one metadata row per global field, even if multiple studies have local
+-- fields linked to that global field. Conflicting writes are caught here rather than
 -- silently allowed to coexist. NULL global_field_idx (purely study-local fields)
 -- is excluded from the constraint, since study-local values are scoped to their
 -- study and cross-study uniqueness does not apply.
@@ -204,7 +204,7 @@ CREATE INDEX biosample_metadata_terminology_value_idx
 -- This partial UNIQUE index also serves as the primary lookup index for reads
 -- driven by the global field (cross-study queries), since the UNIQUE index
 -- covers the same column prefix.
-CREATE UNIQUE INDEX biosample_metadata_one_value_per_global_concept
+CREATE UNIQUE INDEX biosample_metadata_one_value_per_global_field
     ON qiita.biosample_metadata (biosample_idx, global_field_idx)
     WHERE global_field_idx IS NOT NULL;
 
@@ -268,7 +268,7 @@ CREATE UNIQUE INDEX biosample_field_exception_unique_local
     WHERE biosample_study_field_idx IS NOT NULL;
 
 -- Uniqueness for globally-linked exceptions: at most one exception per
--- (biosample, global concept) pair, regardless of which study's field row
+-- (biosample, global field) pair, regardless of which study's field row
 -- happens to be the current source of the metadata value.
 CREATE UNIQUE INDEX biosample_field_exception_unique_global
     ON qiita.biosample_field_exception (biosample_idx, global_field_idx)
@@ -299,7 +299,7 @@ CREATE TRIGGER biosample_field_exception_set_updated_at
 --      data_type is resolved via COALESCE(study_field.data_type,
 --      global_field.data_type) so the same trigger covers both purely-local
 --      study fields (which own data_type) and globally-linked ones (which
---      inherit it from the linked global concept; see the
+--      inherit it from the linked global field; see the
 --      biosample_study_field_inheritance_consistent CHECK). Rows with
 --      value_missing_reason_idx populated are exempt — a missing reason
 --      applies to any data_type and does not occupy a typed value column.
@@ -371,15 +371,93 @@ CREATE TRIGGER biosample_metadata_apply_field_contract_update
     FOR EACH ROW EXECUTE FUNCTION qiita.biosample_metadata_apply_field_contract();
 
 
+-- =============================================================================
+-- TRIGGER: propagate biosample_study_field global link changes to metadata
+--
+-- Mirrors the biosample_study_field.biosample_global_field_idx column into
+-- the denormalized biosample_metadata.global_field_idx column whenever the
+-- former changes. Three transition shapes are recognised:
+--
+--   NULL -> non-NULL (upgrade local to global): propagate the new link to
+--     every existing metadata row through this field. The partial unique
+--     index biosample_metadata_one_value_per_global_field will reject
+--     the propagation if any row's (biosample_idx, new_global_field_idx)
+--     slot is already claimed by another study; the rejection rolls back
+--     the underlying UPDATE on biosample_study_field. Existing metadata
+--     rows are unusual on a still-local field but possible (a missing-
+--     reason row written through it, for example).
+--
+--   non-NULL -> NULL (unlink), no metadata exists: propagate (no-op). The
+--     field becomes local for any future writes through it; nothing is
+--     stranded.
+--
+--   non-NULL -> NULL (unlink), metadata exists: REJECTED. Unlinking would
+--     strand globally-linked metadata rows (their global_field_idx column
+--     would be cleared) and silently break cross-study reads that other
+--     studies may depend on. Caller must explicitly delete those metadata
+--     rows first; the per-row delete makes the data loss visible and
+--     deliberate.
+--
+--   non-NULL -> different non-NULL (rebind): REJECTED unconditionally.
+--     Rebinding changes the semantic meaning of every metadata row
+--     through the field — the readers that pinned against the original
+--     global field now see a different global field's value. There is no coherent
+--     intent to mutate a field's identity in place; the correct flow is
+--     to create a new study_field bound to the desired global field and write
+--     against that.
+-- =============================================================================
+
 CREATE OR REPLACE FUNCTION qiita.propagate_global_field_link_to_biosample_metadata()
 RETURNS TRIGGER AS $$
+DECLARE
+    metadata_row_count BIGINT;
 BEGIN
-    -- Only act if the global link actually changed (not just other columns).
-    IF NEW.biosample_global_field_idx IS DISTINCT FROM OLD.biosample_global_field_idx THEN
-        UPDATE qiita.biosample_metadata
-           SET global_field_idx = NEW.biosample_global_field_idx
-         WHERE biosample_study_field_idx = NEW.idx;
+    -- Short-circuit: no actual change in the global link (the trigger
+    -- fires on any UPDATE OF biosample_global_field_idx, including
+    -- noop-self UPDATEs).
+    IF NEW.biosample_global_field_idx IS NOT DISTINCT FROM OLD.biosample_global_field_idx THEN
+        RETURN NEW;
     END IF;
+
+    -- Reject rebind (non-NULL -> different non-NULL) unconditionally:
+    -- rebinding mutates the field's identity rather than evolving it.
+    IF OLD.biosample_global_field_idx IS NOT NULL
+       AND NEW.biosample_global_field_idx IS NOT NULL THEN
+        RAISE EXCEPTION
+            'cannot rebind biosample_study_field idx=% from biosample_global_field_idx=% to %; '
+            'rebinding changes the semantic meaning of every metadata row through this field. '
+            'Create a new biosample_study_field bound to the desired global field instead.',
+            NEW.idx, OLD.biosample_global_field_idx, NEW.biosample_global_field_idx;
+    END IF;
+
+    -- Reject unlink (non-NULL -> NULL) when metadata rows exist through
+    -- this field: clearing global_field_idx on those rows would silently
+    -- break cross-study reads. Caller must delete the metadata rows first
+    -- to surface the data loss explicitly.
+    IF OLD.biosample_global_field_idx IS NOT NULL
+       AND NEW.biosample_global_field_idx IS NULL THEN
+        SELECT COUNT(*) INTO metadata_row_count
+          FROM qiita.biosample_metadata
+         WHERE biosample_study_field_idx = NEW.idx;
+        IF metadata_row_count > 0 THEN
+            RAISE EXCEPTION
+                'cannot unlink biosample_study_field idx=% from biosample_global_field_idx=%; '
+                '% metadata row(s) reference this field. Delete those rows first '
+                'if the unlink is intentional.',
+                NEW.idx, OLD.biosample_global_field_idx, metadata_row_count;
+        END IF;
+        -- No metadata rows; nothing to propagate. The field is local going forward.
+        RETURN NEW;
+    END IF;
+
+    -- Remaining case: NULL -> non-NULL (upgrade local to global).
+    -- Propagate the new link to every metadata row through this field;
+    -- the partial unique index gates collisions and the UPDATE rolls back
+    -- if any row's (biosample_idx, new_global_field_idx) slot is taken.
+    UPDATE qiita.biosample_metadata
+       SET global_field_idx = NEW.biosample_global_field_idx
+     WHERE biosample_study_field_idx = NEW.idx;
+
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -387,88 +465,6 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER biosample_study_field_propagate_global_link
     AFTER UPDATE OF biosample_global_field_idx ON qiita.biosample_study_field
     FOR EACH ROW EXECUTE FUNCTION qiita.propagate_global_field_link_to_biosample_metadata();
-
-
--- =============================================================================
--- TRIGGER: demote globally-linked metadata on biosample-to-study retirement
---
--- When a biosample_to_study link is retired (transition retired false -> true),
--- every biosample_metadata row whose biosample is the retiring link's biosample
--- and whose source biosample_study_field belongs to the retiring link's study
--- loses its global linkage: global_field_idx is set to NULL. This demotes the
--- row from globally-linked to study-local for access purposes and releases the
--- cross-study uniqueness slot (biosample_idx, global_field_idx) so another
--- study may subsequently write a different globally-linked value on the same
--- (biosample, global concept) pair.
---
--- Purely study-local rows (global_field_idx already NULL) are untouched by the
--- demotion; they were already study-local. Their access becomes practically
--- inaccessible to non-admins once the link is retired, but that is handled by
--- the authorization predicates at read time, not by schema mutation.
---
--- On un-retirement (transition retired true -> false), the trigger attempts
--- per-row restoration of global_field_idx from the source field's
--- biosample_global_field_idx. Restoration is best-effort: rows whose
--- restoration would collide with the partial unique index
--- biosample_metadata_one_value_per_global_concept (because another study has
--- claimed the slot in the meantime) silently remain study-local. The
--- un-retirement itself is not blocked by such collisions.
--- =============================================================================
-
-CREATE OR REPLACE FUNCTION qiita.biosample_to_study_retirement_demote_globals()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF NEW.retired IS DISTINCT FROM OLD.retired THEN
-        IF NEW.retired = true THEN
-            -- Demotion: null out global_field_idx on affected rows.
-            UPDATE qiita.biosample_metadata bm
-               SET global_field_idx = NULL
-              FROM qiita.biosample_study_field bsf
-             WHERE bm.biosample_study_field_idx = bsf.idx
-               AND bm.biosample_idx = NEW.biosample_idx
-               AND bsf.study_idx = NEW.study_idx
-               AND bm.global_field_idx IS NOT NULL;
-        ELSE
-            -- Restoration: per-row attempt to re-populate global_field_idx
-            -- from the source field's biosample_global_field_idx. A nested
-            -- BEGIN/EXCEPTION block isolates each row's update so that a
-            -- unique_violation on one row does not abort the others. Rows
-            -- where restoration collides with the cross-study uniqueness
-            -- index silently remain study-local.
-            DECLARE
-                r RECORD;
-            BEGIN
-                FOR r IN
-                    SELECT bm.idx AS metadata_idx,
-                           bsf.biosample_global_field_idx AS target_global
-                      FROM qiita.biosample_metadata bm
-                      JOIN qiita.biosample_study_field bsf
-                        ON bm.biosample_study_field_idx = bsf.idx
-                     WHERE bm.biosample_idx = NEW.biosample_idx
-                       AND bsf.study_idx = NEW.study_idx
-                       AND bm.global_field_idx IS NULL
-                       AND bsf.biosample_global_field_idx IS NOT NULL
-                LOOP
-                    BEGIN
-                        UPDATE qiita.biosample_metadata
-                           SET global_field_idx = r.target_global
-                         WHERE idx = r.metadata_idx;
-                    EXCEPTION WHEN unique_violation THEN
-                        -- Slot has been claimed by another study; leave the
-                        -- row study-local. Not an error.
-                        NULL;
-                    END;
-                END LOOP;
-            END;
-        END IF;
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER biosample_to_study_retirement_demote_globals
-    AFTER UPDATE OF retired ON qiita.biosample_to_study
-    FOR EACH ROW EXECUTE FUNCTION qiita.biosample_to_study_retirement_demote_globals();
 
 
 -- =============================================================================
@@ -585,7 +581,6 @@ DROP TABLE IF EXISTS qiita.biosample_to_study;
 DROP TABLE IF EXISTS qiita.biosample;
 
 DROP FUNCTION IF EXISTS qiita.biosample_metadata_reject_if_link_retired();
-DROP FUNCTION IF EXISTS qiita.biosample_to_study_retirement_demote_globals();
 DROP FUNCTION IF EXISTS qiita.propagate_global_field_link_to_biosample_metadata();
 DROP FUNCTION IF EXISTS qiita.biosample_metadata_apply_field_contract();
 DROP FUNCTION IF EXISTS qiita.biosample_clear_submission_error_on_new_attempt();

@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import ScopeTargetKind, StepType
 from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER
+from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
 
 
 def _minimal_action_kwargs() -> dict:
@@ -306,13 +307,13 @@ def test_workflow_step_native_module_form_validates():
     kwargs["steps"][0] = {
         "step": "fastq",
         "step_type": StepType.SINGLETON,
-        "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
+        "module": FASTQ_TO_PARQUET_MODULE,
         "baseline_resources": {"cpu": 4, "mem_gb": 8, "walltime": "PT1H"},
     }
     a = ActionDefinition(**kwargs)
     assert isinstance(a.steps[0], WorkflowStep)
     assert a.steps[0].container is None
-    assert a.steps[0].module == "qiita_compute_orchestrator.jobs.fastq_to_parquet"
+    assert a.steps[0].module == FASTQ_TO_PARQUET_MODULE
 
 
 def test_workflow_step_rejects_both_container_and_module():
@@ -347,7 +348,7 @@ def test_workflow_step_rejects_entrypoint_without_container():
     kwargs["steps"][0] = {
         "step": "fastq",
         "step_type": StepType.SINGLETON,
-        "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
+        "module": FASTQ_TO_PARQUET_MODULE,
         "entrypoint": "/usr/local/bin/run",
         "baseline_resources": {"cpu": 4, "mem_gb": 8, "walltime": "PT1H"},
     }

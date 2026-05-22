@@ -132,6 +132,10 @@ Reference identifiers form a parallel hierarchy for reference databases:
 
 `feature_idx` is the bridge between sample processing results (alignment detail, counts) and reference data (sequences, taxonomy, annotations, phylogeny). Alignment output contains `feature_idx` but not `reference_idx` — reference scoping is a query-time join against `reference_membership`.
 
+Raw-read identifiers extend the prep_sample hierarchy:
+
+- **`sequence_idx`** — globally-unique bigint identifying a single raw read stored in the data plane. Minted by the control plane in contiguous ranges of caller-specified size via `POST /api/v1/sequence-range`, recorded in `qiita.sequence_range` (1:1 with `prep_sample_idx`, kind-pinned to `processing_kind='sequenced'` via composite FK), and never recycled — a deleted range's `sequence_idx` values stay consumed in `qiita.sequence_idx_seq`. The endpoint is service-account-only (`sequence_range:mint` scope); the compute orchestrator obtains a range before writing raw-read Parquet to the data plane.
+
 ### Processing Methods
 
 `processing_idx` detail lives in the control plane `processing_methods` table:
@@ -818,10 +822,13 @@ qiita/
 │   │       ├── jobs/
 │   │       │   ├── __init__.py     # run_native_job framework dispatcher + boot-time scan
 │   │       │   ├── __main__.py     # `python -m` SLURM launcher (params.json → run_native_job)
-│   │       │   └── fastq_to_parquet.py  # native skeleton (Inputs + execute = NotImplementedError)
+│   │       │   └── fastq_to_parquet.py  # native job: FASTQ → Parquet via DuckDB + miint
+│   │       │                            # (per-sample, sequenced_sample-scoped)
+│   │       ├── miint.py            # shared miint install + DuckDB-conn helpers, PARQUET_OPTS
 │   │       └── slurm/
 │   │           ├── client.py       # slurmrestd REST client
-│   │           ├── contract.py     # shared constants: EXPECTED_FILE_MODE, MANIFEST_FILENAME
+│   │           ├── contract.py     # shared constants + JobParams: EXPECTED_FILE_MODE,
+│   │           │                   # MANIFEST_FILENAME, JOB_PARAMS_FILENAME, JobParams (params.json shape)
 │   │           ├── payload.py      # JSON job-submit payload builder (container + native scripts)
 │   │           └── verify.py       # post-job output verification (mode 440, identifier sort)
 │   └── tests/

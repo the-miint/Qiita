@@ -19,8 +19,17 @@ import subprocess
 import time
 from pathlib import Path
 
-import asyncpg
-import pytest
+# Set token env vars BEFORE any qiita_compute_orchestrator import so
+# Settings.from_env() — eagerly called by `make_cp_client` in the
+# fastq_to_parquet pipeline — finds the env-var fallback. Same pattern
+# used by qiita-compute-orchestrator/tests/conftest.py for its
+# in-package tests.
+os.environ.setdefault("QIITA_ALLOW_TOKEN_ENV", "true")
+os.environ.setdefault("CP_TO_CO_TOKEN", "test-cp-to-co-token")
+os.environ.setdefault("CO_TO_CP_TOKEN", "test-co-to-cp-token")
+
+import asyncpg  # noqa: E402
+import pytest  # noqa: E402
 from qiita_common.api_paths import LOOPBACK_HOST
 
 from _pg_env import (

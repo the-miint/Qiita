@@ -17,13 +17,21 @@ import secrets
 
 import pytest_asyncio
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
+from qiita_common.models import FieldDataType
 
-from qiita_control_plane.repositories.biosample import (
-    insert_biosample,
-    insert_biosample_to_study,
+from qiita_control_plane.repositories._sample_helpers import (
+    GlobalFieldRow,
+    SampleEntityKind,
+    _get_or_create_local_study_field,
+    insert_entity_to_study,
 )
-from qiita_control_plane.repositories.biosample_metadata import (
-    get_or_create_local_biosample_study_field,
+from qiita_control_plane.repositories.biosample import insert_biosample
+from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
+from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
+from qiita_control_plane.testing.db_seeds import (
+    seed_biosample_global_field,
+    seed_prep_sample_global_field,
+    seed_sequenced_prep_sample,
 )
 
 # ---------------------------------------------------------------------------
@@ -135,6 +143,24 @@ async def _cleanup_tracked(pool, created):
             bs,
             st,
         )
+    # prep_sample side, FK-reverse: EAV value rows, then field rows, then
+    # the composite-keyed link, then the prep_sample itself — which must
+    # go before its biosample (prep_sample.biosample_idx FK) is swept just
+    # below. prep_sample_to_study is composite-keyed like biosample_to_study.
+    await _delete_idxs(pool, "prep_sample_metadata", created["prep_sample_metadata"])
+    await _delete_idxs(pool, "prep_sample_study_field", created["prep_sample_study_field"])
+    for ps, st in created["prep_sample_to_study"]:
+        await pool.execute(
+            "DELETE FROM qiita.prep_sample_to_study WHERE prep_sample_idx = $1 AND study_idx = $2",
+            ps,
+            st,
+        )
+    # Subtype rows (sequenced_sample) reference prep_sample with ON DELETE
+    # RESTRICT, so they must go before the prep_sample sweep below. Tests
+    # that don't seed a subtype leave this list empty and the call is a
+    # no-op via _delete_idxs.
+    await _delete_idxs(pool, "sequenced_sample", created["sequenced_sample"])
+    await _delete_idxs(pool, "prep_sample", created["prep_sample"])
     await _delete_idxs(pool, "biosample", created["biosample"])
     # study_access references study with ON DELETE RESTRICT, so any
     # study_access rows seeded by tests must go before the auto-seeded
@@ -143,6 +169,9 @@ async def _cleanup_tracked(pool, created):
     # biosample_global_field and terminology_term both reference terminology;
     # missing_value_reason has no inbound refs left after biosample_metadata.
     await _delete_idxs(pool, "biosample_global_field", created["biosample_global_field"])
+    # prep_sample_study_field and prep_sample_metadata were swept above, so
+    # prep_sample_global_field has no inbound refs left at this tier.
+    await _delete_idxs(pool, "prep_sample_global_field", created["prep_sample_global_field"])
     await _delete_idxs(pool, "terminology_term", created["terminology_term"])
     await _delete_idxs(pool, "missing_value_reason", created["missing_value_reason"])
     await _delete_idxs(pool, "terminology", created["terminology"])
@@ -194,6 +223,12 @@ async def ctx(postgres_pool):
         "biosample_to_study": [],
         "biosample": [],
         "biosample_global_field": [],
+        "prep_sample_metadata": [],
+        "prep_sample_study_field": [],
+        "prep_sample": [],
+        "prep_sample_to_study": [],
+        "sequenced_sample": [],
+        "prep_sample_global_field": [],
         "terminology_term": [],
         "missing_value_reason": [],
         "terminology": [],
@@ -234,28 +269,45 @@ async def ctx(postgres_pool):
 # ---------------------------------------------------------------------------
 
 
+async def _insert_owned_biosample(conn, ctx):
+    """Insert a biosample owned by ctx['principal_idx'] on the given conn,
+    return its idx. Shared by the standalone and linked create helpers so
+    the owner/creator wiring lives in one place.
+    """
+    return await insert_biosample(
+        conn,
+        owner_idx=ctx["principal_idx"],
+        created_by_idx=ctx["principal_idx"],
+    )
+
+
 async def _create_biosample(ctx):
     """Helper: create a biosample owned by ctx['principal_idx'], track for cleanup."""
     async with ctx["pool"].acquire() as conn:
-        idx = await insert_biosample(
-            conn,
-            owner_idx=ctx["principal_idx"],
-            created_by_idx=ctx["principal_idx"],
-        )
+        idx = await _insert_owned_biosample(conn, ctx)
     ctx["created"]["biosample"].append(idx)
     return idx
 
 
 async def _create_biosample_with_link(ctx):
-    """Helper: create a biosample, link it to ctx['study_idx'], track both."""
-    bs_idx = await _create_biosample(ctx)
+    """Helper: atomically create a biosample and link it to ctx['study_idx'],
+    tracking both for cleanup.
+
+    Both inserts share one connection and one transaction so a failed link
+    cannot leak an orphan biosample row for teardown to mop up. The
+    tracking-dict appends run only after the transaction commits.
+    """
     async with ctx["pool"].acquire() as conn:
-        await insert_biosample_to_study(
-            conn,
-            biosample_idx=bs_idx,
-            study_idx=ctx["study_idx"],
-            created_by_idx=ctx["principal_idx"],
-        )
+        async with conn.transaction():
+            bs_idx = await _insert_owned_biosample(conn, ctx)
+            await insert_entity_to_study(
+                conn,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                entity_idx=bs_idx,
+                study_idx=ctx["study_idx"],
+                created_by_idx=ctx["principal_idx"],
+            )
+    ctx["created"]["biosample"].append(bs_idx)
     ctx["created"]["biosample_to_study"].append((bs_idx, ctx["study_idx"]))
     return bs_idx
 
@@ -264,12 +316,169 @@ async def _create_local_field(ctx, suffix=""):
     """Helper: create a purely-local biosample_study_field, track for cleanup."""
     field_name = f"{_unique_field_name()}_{suffix}"
     async with ctx["pool"].acquire() as conn:
-        idx, _ = await get_or_create_local_biosample_study_field(
-            conn,
-            study_idx=ctx["study_idx"],
-            display_name=field_name,
-            created_by_idx=ctx["principal_idx"],
-            required=True,
-        )
+        async with conn.transaction():
+            idx, _, _ = await _get_or_create_local_study_field(
+                conn,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                study_idx=ctx["study_idx"],
+                display_name=field_name,
+                created_by_idx=ctx["principal_idx"],
+                required=True,
+            )
     ctx["created"]["biosample_study_field"].append(idx)
     return idx
+
+
+async def _create_prep_sample_with_link(ctx):
+    """Helper: create a biosample+link, then a sequenced prep_sample linked
+    to ctx['study_idx'], tracking prep_sample / prep_sample_to_study for
+    cleanup. Returns the prep_sample idx.
+
+    The prep_sample requires its biosample to carry a biosample_to_study
+    link (prep_sample_to_study_reject_without_biosample_link trigger), so
+    this builds on _create_biosample_with_link.
+    """
+    bs_idx = await _create_biosample_with_link(ctx)
+    ps_idx = await seed_sequenced_prep_sample(
+        ctx["pool"],
+        biosample_idx=bs_idx,
+        owner_idx=ctx["principal_idx"],
+    )
+    async with ctx["pool"].acquire() as conn:
+        async with conn.transaction():
+            await insert_entity_to_study(
+                conn,
+                spec=PREP_SAMPLE_METADATA_SPEC,
+                entity_idx=ps_idx,
+                study_idx=ctx["study_idx"],
+                created_by_idx=ctx["principal_idx"],
+            )
+    ctx["created"]["prep_sample"].append(ps_idx)
+    ctx["created"]["prep_sample_to_study"].append((ps_idx, ctx["study_idx"]))
+    return ps_idx
+
+
+# ---------------------------------------------------------------------------
+# Parametrized sample-family helpers (biosample + prep_sample)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_unlinked_entity_for_spec(ctx, spec):
+    """Seed the substrate for an insert_entity_to_study test under spec:
+      - biosample spec: a fresh biosample (no link).
+      - prep_sample spec: a biosample linked to ctx['study_idx'] (so the
+        prep_sample_to_study trigger has its substrate) plus a fresh
+        prep_sample on that biosample (no prep_sample_to_study link).
+
+    Returns the entity_idx the caller should pass to insert_entity_to_study.
+    Cleanup is tracked on the ctx fixture.
+    """
+    # biosample branch: bare biosample; the caller is expected to write
+    # the link row itself in the test body.
+    if spec.entity_kind is SampleEntityKind.BIOSAMPLE:
+        return await _create_biosample(ctx)
+
+    # prep_sample branch: link biosample first so the
+    # reject_without_biosample_link trigger passes when the test later
+    # writes prep_sample_to_study.
+    bs_idx = await _create_biosample_with_link(ctx)
+    ps_idx = await seed_sequenced_prep_sample(
+        ctx["pool"], biosample_idx=bs_idx, owner_idx=ctx["principal_idx"]
+    )
+    ctx["created"]["prep_sample"].append(ps_idx)
+    return ps_idx
+
+
+async def _seed_secondary_studies_for_entity(ctx, spec, entity_idx, count):
+    """Seed `count` additional studies the entity can be linked to. For
+    prep_sample spec, also write a biosample_to_study link from the
+    underlying biosample to each new study (so the
+    reject_without_biosample_link trigger passes when the entity is
+    later linked to that study).
+
+    Returns the list of new study idxs in creation order.
+    """
+    # Recover the biosample idx for prep_sample so we can pre-link it to
+    # each new secondary study before the entity's own link gets written.
+    biosample_idx: int | None = None
+    if spec.entity_kind is SampleEntityKind.PREP_SAMPLE:
+        biosample_idx = await ctx["pool"].fetchval(
+            "SELECT biosample_idx FROM qiita.prep_sample WHERE idx = $1",
+            entity_idx,
+        )
+
+    # Seed each study and its (optional) biosample link.
+    new_study_idxs: list[int] = []
+    for _ in range(count):
+        st_idx = await _seed_study(ctx["pool"], ctx["principal_idx"], f"sec-{secrets.token_hex(4)}")
+        ctx["created"]["studies"].append(st_idx)
+        new_study_idxs.append(st_idx)
+        if biosample_idx is not None:
+            async with ctx["pool"].acquire() as conn:
+                await insert_entity_to_study(
+                    conn,
+                    spec=BIOSAMPLE_METADATA_SPEC,
+                    entity_idx=biosample_idx,
+                    study_idx=st_idx,
+                    created_by_idx=ctx["principal_idx"],
+                )
+            ctx["created"]["biosample_to_study"].append((biosample_idx, st_idx))
+    return new_study_idxs
+
+
+async def _seed_global_field_for_spec(ctx, spec, data_type=FieldDataType.TEXT):
+    """Seed one global field of the given data_type for spec.entity_kind
+    and track the row for cleanup. Returns a GlobalFieldRow shape so the
+    caller can drive metadata writes against it directly.
+    """
+    # Token suffix defends against unique-name collisions across re-runs.
+    suffix = secrets.token_hex(4)
+    internal_name = f"gf_{suffix}"
+    display_name = f"GF {suffix}"
+
+    # Branch on the spec's entity_kind to pick the matching seed helper;
+    # both write to structurally-parallel *_global_field tables.
+    if spec.entity_kind is SampleEntityKind.BIOSAMPLE:
+        gf_idx = await seed_biosample_global_field(
+            ctx["pool"],
+            internal_name=internal_name,
+            display_name=display_name,
+            data_type=data_type,
+            created_by_idx=ctx["principal_idx"],
+        )
+        ctx["created"]["biosample_global_field"].append(gf_idx)
+    else:
+        gf_idx = await seed_prep_sample_global_field(
+            ctx["pool"],
+            internal_name=internal_name,
+            display_name=display_name,
+            data_type=data_type,
+            created_by_idx=ctx["principal_idx"],
+        )
+        ctx["created"]["prep_sample_global_field"].append(gf_idx)
+    return GlobalFieldRow(idx=gf_idx, display_name=display_name, data_type=data_type)
+
+
+def _track_to_study_link(ctx, spec, entity_idx, study_idx):
+    """Track a (entity_idx, study_idx) link row in the cleanup dict under
+    the key matching spec.entity_kind.
+    """
+    if spec.entity_kind is SampleEntityKind.BIOSAMPLE:
+        ctx["created"]["biosample_to_study"].append((entity_idx, study_idx))
+    else:
+        ctx["created"]["prep_sample_to_study"].append((entity_idx, study_idx))
+
+
+async def _create_linked_entity_for_spec(ctx, spec):
+    """Create an entity linked to ctx['study_idx'] for spec.entity_kind,
+    tracking all rows for cleanup. Returns the new entity_idx.
+
+    Dispatches to the existing per-entity helpers so the prep_sample branch
+    transparently seeds the underlying biosample and biosample_to_study link
+    that the prep_sample_to_study trigger requires as substrate.
+    """
+    # Both branches return an entity_idx with its *_to_study link already
+    # tracked; callers can write metadata against it without further setup.
+    if spec.entity_kind is SampleEntityKind.BIOSAMPLE:
+        return await _create_biosample_with_link(ctx)
+    return await _create_prep_sample_with_link(ctx)

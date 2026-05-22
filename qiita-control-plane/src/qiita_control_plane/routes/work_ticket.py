@@ -8,6 +8,14 @@ is in a non-terminal state (disallow-without-delete). On success: INSERT
 the row, fire `schedule_dispatch` to start the workflow in the background,
 return 202 with the ticket id and state.
 
+`GET /api/v1/work-ticket/{idx}` — read a single ticket. Returns the full
+WorkTicket model (state, action info, scope target, action context, retry
+accounting, failure surface, timestamps) so a polling CLI can render
+everything in one round trip. Auth: the originator passes; wet_lab_admin+
+bypasses; everyone else gets 404 (not 403 — see the route docstring for
+why non-owners cannot distinguish a missing ticket from one they lack
+access to).
+
 `POST /api/v1/work-ticket/{idx}/run` — operator override. State-aware:
 
 | Current state | Behavior                                          |
@@ -24,35 +32,45 @@ fired by submission.
 
 Auth: every route here requires the caller to be in the action's
 `audience` (humans by `system_role`, or service accounts) AND to hold
-all of `action.scopes`. Resource-level ACL beyond that is action-specific
-and not enforced here.
+all of `action.scopes`. prep_sample-scoped submissions additionally
+require the caller to have `Tier.ADMIN` on every non-retired study
+linked to the prep_sample (wet_lab_admin+ bypass), see
+`_check_prep_sample_study_access`. Reference- and study_prep-scoped
+submissions carry no per-resource gate at this layer; the action's
+own audience / scope choices are the policy.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from pathlib import PurePosixPath
 from typing import Any
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from qiita_common.actions import Audience
+from qiita_common.actions import FASTQ_PATH_CONTEXT_KEYS, Audience
 from qiita_common.api_paths import (
+    PATH_WORK_TICKET_BY_IDX,
     PATH_WORK_TICKET_PREFIX,
     PATH_WORK_TICKET_ROOT,
     PATH_WORK_TICKET_RUN,
 )
+from qiita_common.auth_constants import SystemRole
 from qiita_common.models import (
     ScopeTargetKind,
+    WorkTicket,
     WorkTicketCreateRequest,
     WorkTicketResponse,
     WorkTicketState,
 )
 
 from ..actions.context_validator import validate_context
-from ..auth.principal import HumanUser, Principal, ServiceAccount, get_current_principal
+from ..auth.guards import require_caller_has_admin_on_all_studies
+from ..auth.principal import Anonymous, HumanUser, Principal, ServiceAccount, get_current_principal
 from ..deps import get_db_pool
 from ..dispatch import NON_TERMINAL_WORK_TICKET_STATES, schedule_dispatch
+from ..repositories.prep_sample import fetch_active_study_idxs_for_prep_sample
 
 _log = logging.getLogger(__name__)
 
@@ -67,6 +85,7 @@ _DISALLOW_WITHOUT_DELETE_INDEXES = frozenset(
     {
         "work_ticket_one_in_flight_per_reference",
         "work_ticket_one_in_flight_per_study_prep",
+        "work_ticket_one_in_flight_per_prep_sample",
     }
 )
 
@@ -88,7 +107,8 @@ async def _fetch_action_for_submission(
     (renamed/removed field) becomes a loud ValidationError at submission
     rather than a silent default in the audience check below."""
     row = await pool.fetchrow(
-        "SELECT target_kind, scopes, audience, context_schema, enabled"
+        "SELECT target_kind, target_processing_kinds,"
+        "       scopes, audience, context_schema, enabled"
         " FROM qiita.action"
         " WHERE action_id = $1 AND version = $2",
         action_id,
@@ -98,6 +118,10 @@ async def _fetch_action_for_submission(
         return None
     return {
         "target_kind": row["target_kind"],
+        # asyncpg yields qiita.processing_kind[] as a list of strings;
+        # the route compares them against prep_sample.processing_kind
+        # (also a string) so no enum coercion is needed.
+        "target_processing_kinds": list(row["target_processing_kinds"]),
         "scopes": list(row["scopes"]),
         # `audience` and `context_schema` are JSONB; asyncpg returns each
         # as a string by default.
@@ -156,14 +180,17 @@ def _check_scopes(principal: Principal, required_scopes: list[str]) -> None:
 
 def _scope_target_columns(
     scope_target: dict[str, Any],
-) -> tuple[int | None, int | None, int | None]:
+) -> tuple[int | None, int | None, int | None, int | None]:
     """Map a ScopeTarget union member to the (study_idx, prep_idx,
-    reference_idx) tuple the work_ticket table expects."""
+    reference_idx, prep_sample_idx) tuple the work_ticket table
+    expects."""
     kind = scope_target["kind"]
     if kind == ScopeTargetKind.REFERENCE.value:
-        return (None, None, scope_target["reference_idx"])
+        return (None, None, scope_target["reference_idx"], None)
     if kind == ScopeTargetKind.STUDY_PREP.value:
-        return (scope_target["study_idx"], scope_target["prep_idx"], None)
+        return (scope_target["study_idx"], scope_target["prep_idx"], None, None)
+    if kind == ScopeTargetKind.PREP_SAMPLE.value:
+        return (None, None, None, scope_target["prep_sample_idx"])
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=f"unknown scope_target.kind={kind!r}",
@@ -181,12 +208,12 @@ async def _check_disallow_without_delete(
     are tolerated; resubmission is gated until DELETE lands.
 
     Best-effort fast path. The atomic gate is the unique partial indexes
-    `work_ticket_one_in_flight_per_{reference,study_prep}`; we still
-    SELECT first so the common (non-racing) case returns a 409 carrying
-    the blocking ticket idx, which is more useful to clients than the
-    bare unique-violation that fires when two submissions race past
-    this check."""
-    study_idx, prep_idx, reference_idx = _scope_target_columns(scope_target)
+    `work_ticket_one_in_flight_per_{reference,study_prep,prep_sample}`;
+    we still SELECT first so the common (non-racing) case returns a 409
+    carrying the blocking ticket idx, which is more useful to clients
+    than the bare unique-violation that fires when two submissions race
+    past this check."""
+    study_idx, prep_idx, reference_idx, prep_sample_idx = _scope_target_columns(scope_target)
     if scope_target["kind"] == ScopeTargetKind.REFERENCE.value:
         existing = await pool.fetchval(
             "SELECT work_ticket_idx FROM qiita.work_ticket"
@@ -197,6 +224,18 @@ async def _check_disallow_without_delete(
             action_id,
             action_version,
             reference_idx,
+            list(NON_TERMINAL_WORK_TICKET_STATES),
+        )
+    elif scope_target["kind"] == ScopeTargetKind.PREP_SAMPLE.value:
+        existing = await pool.fetchval(
+            "SELECT work_ticket_idx FROM qiita.work_ticket"
+            " WHERE action_id = $1 AND action_version = $2"
+            "   AND prep_sample_idx = $3"
+            "   AND state = ANY($4::qiita.work_ticket_state[])"
+            " LIMIT 1",
+            action_id,
+            action_version,
+            prep_sample_idx,
             list(NON_TERMINAL_WORK_TICKET_STATES),
         )
     else:
@@ -218,6 +257,133 @@ async def _check_disallow_without_delete(
             detail={
                 "reason": "another ticket for this (scope_target, action) is in flight",
                 "blocking_work_ticket_idx": existing,
+            },
+        )
+
+
+async def _check_prep_sample_study_access(
+    pool: asyncpg.Pool, *, prep_sample_idx: int, caller: Principal
+) -> None:
+    """Require Tier.ADMIN (or owner / wet_lab_admin+) on every non-retired
+    study link of this prep_sample. Bypass-role callers skip the DB read.
+    An orphaned prep_sample (all links retired) passes — downstream
+    lookups fail elsewhere.
+
+    No service-account special-case: a service account holds no
+    study_access rows, so `require_caller_has_admin_on_all_studies`
+    rejects it on the first linked study with a 403. For every
+    prep_sample-scoped action today the action's audience already
+    excludes service accounts, so this gate never sees one — but the
+    natural rejection means an action that later opens itself to
+    service accounts does not silently bypass the per-study check.
+
+    Policy is "caller had access at submit time"; this read runs on the
+    pool, not the work_ticket INSERT transaction, so a study_access row
+    racing with the gate decides arbitrarily. Future per-resource gates
+    on other scope kinds are expected to follow the same shape.
+    """
+    if caller.has_role_at_least(SystemRole.WET_LAB_ADMIN):
+        return
+    study_idxs = await fetch_active_study_idxs_for_prep_sample(pool, prep_sample_idx)
+    if not study_idxs:
+        return
+    await require_caller_has_admin_on_all_studies(
+        pool,
+        caller=caller,
+        study_idxs=study_idxs,
+    )
+
+
+def _basename_carries_prefix(basename: str, prefix: str) -> bool:
+    """True iff `basename` is `prefix` immediately followed by a `_` or
+    `.` separator — segment-anchored, not a bare substring match.
+
+    A plain `str.startswith` would admit `ITEM-12_R1.fastq` for a
+    sequenced_pool_item_id of `ITEM-1`; requiring the separator pins the
+    match to the documented `<pool_item_id>_R1.fastq` (paired-end) and
+    `<pool_item_id>.fastq` (single-end) filename convention exactly. A
+    basename equal to `prefix` with nothing after it is rejected — a
+    fastq file always carries an extension.
+    """
+    if not basename.startswith(prefix):
+        return False
+    return basename[len(prefix) : len(prefix) + 1] in ("_", ".")
+
+
+async def _check_fastq_filename_prefix(
+    pool: asyncpg.Pool, *, prep_sample_idx: int, action_context: dict[str, Any]
+) -> None:
+    """422 when a fastq path in `action_context` has a basename that is
+    not the prep_sample's `sequenced_pool_item_id` followed by a `_` or
+    `.` separator (see `_basename_carries_prefix`).
+
+    The rule: the `--pool-item-id` chosen at `sequenced-sample create`
+    time is the filename prefix of every fastq the work-ticket
+    processes, so the R1/R2 pair and the sequenced_sample row stay
+    mechanically tied. `action_context` and the sequenced_sample row are
+    minted in two separate calls and nothing else couples them, so the
+    check lives here. Keyed on the context keys (FASTQ_PATH_CONTEXT_KEYS),
+    not the action_id, so the route stays generic over actions.
+
+    Skipped when the resolved `sequenced_pool_item_id` is NULL. Two
+    shapes reach that branch:
+
+    - a sequenced_sample row exists but is pool-less — sequenced_pool_idx
+      and sequenced_pool_item_id are both NULL — which is legitimate; the
+      rule then has nothing to anchor against.
+    - no sequenced_sample subtype row exists for this
+      processing_kind='sequenced' prep_sample — anomalous, since the
+      sequenced-sample create composer writes supertype and subtype
+      atomically. Policing that integrity gap is not this gate's job
+      (the processing_kind check above and the create composer own it);
+      the gate just declines to invent a constraint it cannot evaluate.
+
+    Either way the rule constrains a relationship between two values and
+    is vacuous when one does not exist, so the submission proceeds.
+
+    Like `_check_prep_sample_study_access`, the read runs on the pool,
+    not the work_ticket INSERT transaction: a sequenced_sample row
+    created concurrently with the gate decides arbitrarily.
+    `sequenced_pool_item_id` is not PATCH-editable, so a value already
+    set cannot change under the gate.
+    """
+    fastq_paths = {
+        key: action_context[key]
+        for key in FASTQ_PATH_CONTEXT_KEYS
+        # Defense-in-depth: for fastq-to-parquet the context_schema pins
+        # each fastq key to a string, so validate_context already 422'd a
+        # non-string upstream. The guard still covers actions with a
+        # permissive schema — a non-string value is not a fastq path, so
+        # it is skipped here rather than rejected.
+        if isinstance(action_context.get(key), str)
+    }
+    if not fastq_paths:
+        return
+    pool_item_id = await pool.fetchval(
+        "SELECT sequenced_pool_item_id FROM qiita.sequenced_sample WHERE prep_sample_idx = $1",
+        prep_sample_idx,
+    )
+    if pool_item_id is None:
+        return
+    mismatched = [
+        {
+            "context_key": key,
+            "fastq_path": path,
+            "basename": PurePosixPath(path).name,
+        }
+        for key, path in sorted(fastq_paths.items())
+        if not _basename_carries_prefix(PurePosixPath(path).name, pool_item_id)
+    ]
+    if mismatched:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "reason": (
+                    "fastq filename must be the prep_sample's sequenced_pool_item_id"
+                    " followed by '_' or '.'"
+                ),
+                "sequenced_pool_item_id": pool_item_id,
+                "mismatched": mismatched,
             },
         )
 
@@ -279,6 +445,43 @@ async def submit_work_ticket(
             },
         )
 
+    # Kind-specific gate for prep_sample-scoped actions: when the action
+    # declares a nonempty target_processing_kinds list, the prep_sample's
+    # actual processing_kind must be in it. Empty list = "any kind"
+    # (cross-kind admin actions). For other scope kinds the list must
+    # be empty per the DB CHECK; nothing to do here.
+    if (
+        scope_target["kind"] == ScopeTargetKind.PREP_SAMPLE.value
+        and action["target_processing_kinds"]
+    ):
+        actual_kind = await pool.fetchval(
+            "SELECT processing_kind FROM qiita.prep_sample WHERE idx = $1",
+            scope_target["prep_sample_idx"],
+        )
+        if actual_kind is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=(f"prep_sample {scope_target['prep_sample_idx']!r} not found"),
+            )
+        if actual_kind not in action["target_processing_kinds"]:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={
+                    "reason": (
+                        "prep_sample.processing_kind does not match action.target_processing_kinds"
+                    ),
+                    "prep_sample_processing_kind": actual_kind,
+                    "action_target_processing_kinds": action["target_processing_kinds"],
+                },
+            )
+
+    if scope_target["kind"] == ScopeTargetKind.PREP_SAMPLE.value:
+        await _check_prep_sample_study_access(
+            pool,
+            prep_sample_idx=scope_target["prep_sample_idx"],
+            caller=principal,
+        )
+
     context_errors = validate_context(action["context_schema"], body.action_context)
     if context_errors:
         raise HTTPException(
@@ -289,16 +492,26 @@ async def submit_work_ticket(
             },
         )
 
+    # A fastq path in the (now schema-valid) action_context must carry a
+    # basename prefixed by the prep_sample's sequenced_pool_item_id.
+    if scope_target["kind"] == ScopeTargetKind.PREP_SAMPLE.value:
+        await _check_fastq_filename_prefix(
+            pool,
+            prep_sample_idx=scope_target["prep_sample_idx"],
+            action_context=body.action_context,
+        )
+
     await _check_disallow_without_delete(pool, body.action_id, body.action_version, scope_target)
 
-    study_idx, prep_idx, reference_idx = _scope_target_columns(scope_target)
+    study_idx, prep_idx, reference_idx, prep_sample_idx = _scope_target_columns(scope_target)
     try:
         work_ticket_idx = await pool.fetchval(
             "INSERT INTO qiita.work_ticket ("
             "  action_id, action_version, originator_principal_idx,"
             "  scope_target_kind, study_idx, prep_idx, reference_idx,"
-            "  action_context"
-            ") VALUES ($1, $2, $3, $4::qiita.scope_target_kind, $5, $6, $7, $8::jsonb)"
+            "  prep_sample_idx, action_context"
+            ") VALUES ($1, $2, $3, $4::qiita.scope_target_kind,"
+            "          $5, $6, $7, $8, $9::jsonb)"
             " RETURNING work_ticket_idx",
             body.action_id,
             body.action_version,
@@ -307,6 +520,7 @@ async def submit_work_ticket(
             study_idx,
             prep_idx,
             reference_idx,
+            prep_sample_idx,
             json.dumps(body.action_context),
         )
     except asyncpg.exceptions.UniqueViolationError as exc:
@@ -337,6 +551,81 @@ async def submit_work_ticket(
         principal.principal_idx,
     )
     return WorkTicketResponse(work_ticket_idx=work_ticket_idx, state=WorkTicketState.PENDING)
+
+
+_WORK_TICKET_COLUMNS = (
+    "work_ticket_idx, action_id, action_version, originator_principal_idx,"
+    " scope_target_kind, study_idx, prep_idx, reference_idx, prep_sample_idx,"
+    " action_context, state, retry_count, max_retries,"
+    " failure_type, failure_stage, failure_step_name, failure_reason,"
+    " created_at, updated_at"
+)
+
+
+def _row_to_work_ticket(row: asyncpg.Record) -> WorkTicket:
+    """Assemble a WorkTicket from a work_ticket row. Two columns need
+    shaping: `scope_target` is rebuilt from scope_target_kind plus the
+    four nullable idx columns the table stores, and `action_context` is
+    decoded from asyncpg's JSONB-as-string. Every other column maps 1:1
+    onto a WorkTicket field and flows through unchanged — so a field
+    added to both the model and `_WORK_TICKET_COLUMNS` needs no edit
+    here."""
+    data = dict(row)
+    kind = data.pop("scope_target_kind")
+    study_idx = data.pop("study_idx")
+    prep_idx = data.pop("prep_idx")
+    reference_idx = data.pop("reference_idx")
+    prep_sample_idx = data.pop("prep_sample_idx")
+    if kind == ScopeTargetKind.REFERENCE.value:
+        data["scope_target"] = {"kind": kind, "reference_idx": reference_idx}
+    elif kind == ScopeTargetKind.STUDY_PREP.value:
+        data["scope_target"] = {"kind": kind, "study_idx": study_idx, "prep_idx": prep_idx}
+    else:  # PREP_SAMPLE — DB CHECK enforces one of the three valid kinds.
+        data["scope_target"] = {"kind": kind, "prep_sample_idx": prep_sample_idx}
+    data["action_context"] = json.loads(data["action_context"])
+    return WorkTicket.model_validate(data)
+
+
+@router.get(
+    PATH_WORK_TICKET_BY_IDX,
+    response_model=WorkTicket,
+)
+async def get_work_ticket(
+    work_ticket_idx: int,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    principal: Principal = Depends(get_current_principal),
+) -> WorkTicket:
+    """Read a single ticket. Returns the full WorkTicket record so the
+    caller-side CLI can render state, retry accounting, and the failure
+    surface from one call. Auth: 401 on Anonymous; the originator passes;
+    wet_lab_admin+ bypasses. No per-study / per-resource access path here
+    — the originator-bypass already lets the caller who submitted the
+    ticket read it, and operator views are served by the role bypass.
+
+    A caller who is neither the originator nor a bypass-role gets 404,
+    not 403 — the same response a genuinely missing idx returns — so a
+    caller cannot probe work_ticket_idx values to learn which tickets
+    exist. Mirrors the enumeration-safe 404 the auth-token routes use
+    (see docs/auth.md)."""
+    if isinstance(principal, Anonymous):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required"
+        )
+    not_found = HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"work_ticket {work_ticket_idx} not found",
+    )
+    row = await pool.fetchrow(
+        f"SELECT {_WORK_TICKET_COLUMNS} FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    if row is None:
+        raise not_found
+    is_originator = row["originator_principal_idx"] == principal.principal_idx
+    is_bypass = principal.has_role_at_least(SystemRole.WET_LAB_ADMIN)
+    if not (is_originator or is_bypass):
+        raise not_found
+    return _row_to_work_ticket(row)
 
 
 @router.post(

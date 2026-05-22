@@ -312,7 +312,7 @@ async def _run_entry_with_retry(
 
 _WORK_TICKET_COLS = (
     "work_ticket_idx, action_id, action_version, originator_principal_idx, "
-    "scope_target_kind, study_idx, prep_idx, reference_idx, "
+    "scope_target_kind, study_idx, prep_idx, reference_idx, prep_sample_idx, "
     "action_context, state, retry_count, max_retries"
 )
 
@@ -525,6 +525,11 @@ def _build_scope_target(work_ticket: dict[str, Any]) -> dict[str, Any]:
             "study_idx": work_ticket["study_idx"],
             "prep_idx": work_ticket["prep_idx"],
         }
+    if kind == ScopeTargetKind.PREP_SAMPLE.value:
+        return {
+            "kind": ScopeTargetKind.PREP_SAMPLE.value,
+            "prep_sample_idx": work_ticket["prep_sample_idx"],
+        }
     raise RuntimeError(f"unknown scope_target_kind: {kind!r}")
 
 
@@ -561,15 +566,11 @@ async def _dispatch_step(
     step handler decides what to do without them)."""
     inputs = {name: Path(bound[name]) for name in entry.inputs}
     inputs.update({name: Path(bound[name]) for name in entry.optional_inputs if name in bound})
-    # Steps that need a reference_idx (today: hash, load) only run under
-    # reference-scoped tickets. Refuse to silently substitute a 0 for
-    # non-reference scope_targets — fail-fast tells the operator the
-    # workflow YAML and the ticket scope are mismatched.
-    if scope_target["kind"] != ScopeTargetKind.REFERENCE.value:
-        raise RuntimeError(
-            f"backend step {entry.name!r} requires a reference scope_target; "
-            f"got kind={scope_target['kind']!r}"
-        )
+    # Pass the full scope_target through; the backend's native-step
+    # dispatch merges the kind-appropriate idx scalars into the job's
+    # Inputs model via `flatten_native_inputs`, while the container
+    # path inspects the kind to extract whichever scalar it needs (today
+    # only reference, gated inside LocalBackend / SlurmBackend).
     # Forward static step metadata so the orchestrator's backend can run
     # the right container with the right resource ask. SlurmBackend
     # requires these; LocalBackend ignores them.
@@ -583,7 +584,7 @@ async def _dispatch_step(
         step_name=entry.name,
         inputs=inputs,
         workspace=workspace,
-        reference_idx=scope_target["reference_idx"],
+        scope_target=scope_target,
         work_ticket_idx=work_ticket_idx,
         container=entry.container,
         module=entry.module,

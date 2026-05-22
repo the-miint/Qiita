@@ -16,6 +16,29 @@ row when absent.
 import pytest_asyncio
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 
+# Scopes the `compute_worker_service_account` fixture grants. Module-level
+# so a pure-unit test can assert this set is a subset of
+# SERVICE_ACCOUNT_SCOPE_CEILING — production-deploys mint this SA through
+# the admin route, which rejects any requested scope outside that ceiling,
+# so a fixture that grants scopes the production admin path can't grant
+# would be a silent test/prod divergence.
+#
+# REFERENCE_WRITE is deliberately ABSENT: reference creation is
+# humans-only (see qiita_control_plane/routes/reference.py:71-72:
+# "Humans only — service-kind principals can only mint features and
+# register files into existing references"); the SA ceiling enforces that
+# exclusion at admin-mint time, so granting it in the fixture would
+# create an SA shape no production deploy can replicate.
+COMPUTE_WORKER_FIXTURE_SCOPES: frozenset[Scope] = frozenset(
+    {
+        Scope.FEATURE_MINT,
+        Scope.REFERENCE_REGISTER_FILES,
+        Scope.REFERENCE_READ,
+        Scope.TICKET_DOGET,
+        Scope.SEQUENCE_RANGE_MINT,
+    }
+)
+
 
 @pytest_asyncio.fixture(scope="session")
 async def human_admin_session(postgres_pool):
@@ -201,6 +224,9 @@ async def regular_user_session(postgres_pool):
         postgres_pool,
         principal_idx=idx,
         label="session-user",
+        # Mirrors ROLE_IMPLIED_SCOPES[USER] in auth/scopes.py — keep in
+        # lockstep so the session-fixture user can exercise every route
+        # the USER ceiling admits.
         scopes=[
             Scope.SELF_PROFILE,
             Scope.SELF_TOKEN,
@@ -208,6 +234,7 @@ async def regular_user_session(postgres_pool):
             Scope.BIOSAMPLE_READ,
             Scope.BIOSAMPLE_WRITE,
             Scope.PREP_SAMPLE_READ,
+            Scope.PREP_SAMPLE_WRITE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
         ],
@@ -263,13 +290,7 @@ async def compute_worker_service_account(postgres_pool, tmp_path_factory):
         postgres_pool,
         principal_idx=pidx,
         label="orchestrator-fixture",
-        scopes=[
-            Scope.FEATURE_MINT,
-            Scope.REFERENCE_WRITE,
-            Scope.REFERENCE_REGISTER_FILES,
-            Scope.REFERENCE_READ,
-            Scope.TICKET_DOGET,
-        ],
+        scopes=list(COMPUTE_WORKER_FIXTURE_SCOPES),
     )
     token_path = tmp_path_factory.mktemp("orchestrator-token") / "token"
     token_path.write_text(plaintext)

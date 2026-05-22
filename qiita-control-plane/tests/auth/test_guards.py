@@ -633,3 +633,225 @@ async def test_require_study_exists_raises_404_for_missing_study(study_access_ct
         )
     assert exc.value.status_code == 404
     assert "study -1 not found" in exc.value.detail
+
+
+# ---------------------------------------------------------------------------
+# require_caller_owns_run / require_caller_owns_pool (DB-bound)
+# ---------------------------------------------------------------------------
+# Caller-creator predicates over sequencing_run and sequenced_pool. Both
+# guards share the same shape: anonymous → 401; role-bypass at or above
+# bypass_role; otherwise 404 on missing resource and 403 on a non-creator
+# caller. Tests seed real rows so we exercise the asyncpg.Record path
+# (created_by_idx column read) end-to-end.
+
+
+async def _seed_sequencing_run_for_test(pool, *, created_by_idx: int) -> int:
+    return await pool.fetchval(
+        "INSERT INTO qiita.sequencing_run ("
+        "  instrument_run_id, platform, created_by_idx"
+        ") VALUES ($1, 'illumina', $2) RETURNING idx",
+        f"run-{secrets.token_hex(4)}",
+        created_by_idx,
+    )
+
+
+async def _seed_sequenced_pool_for_test(
+    pool, *, sequencing_run_idx: int, created_by_idx: int
+) -> int:
+    return await pool.fetchval(
+        "INSERT INTO qiita.sequenced_pool ("
+        "  sequencing_run_idx, created_by_idx"
+        ") VALUES ($1, $2) RETURNING idx",
+        sequencing_run_idx,
+        created_by_idx,
+    )
+
+
+@pytest_asyncio.fixture
+async def run_and_pool_ctx(postgres_pool):
+    """Seed a creator-user, a stranger-user, a sequencing_run owned by the
+    creator, and a sequenced_pool attached to that run, also owned by the
+    creator. Cleanup walks the FK chain in reverse."""
+    creator_idx = await _seed_user_for_study(postgres_pool, suffix="creator")
+    stranger_idx = await _seed_user_for_study(postgres_pool, suffix="stranger")
+    run_idx = await _seed_sequencing_run_for_test(postgres_pool, created_by_idx=creator_idx)
+    pool_idx = await _seed_sequenced_pool_for_test(
+        postgres_pool, sequencing_run_idx=run_idx, created_by_idx=creator_idx
+    )
+
+    yield {
+        "pool": postgres_pool,
+        "creator_idx": creator_idx,
+        "stranger_idx": stranger_idx,
+        "run_idx": run_idx,
+        "pool_idx": pool_idx,
+    }
+
+    await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
+    await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
+    await postgres_pool.execute(
+        "DELETE FROM qiita.user WHERE principal_idx = ANY($1::bigint[])",
+        [creator_idx, stranger_idx],
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.principal WHERE idx = ANY($1::bigint[])",
+        [creator_idx, stranger_idx],
+    )
+
+
+@pytest.mark.db
+async def test_require_caller_owns_run_creator_passes(run_and_pool_ctx):
+    from qiita_control_plane.auth.guards import require_caller_owns_run
+
+    dep = require_caller_owns_run()
+    caller = _human_with_idx(run_and_pool_ctx["creator_idx"])
+    result = await dep(
+        sequencing_run_idx=run_and_pool_ctx["run_idx"],
+        p=caller,
+        pool=run_and_pool_ctx["pool"],
+    )
+    assert result is None
+
+
+@pytest.mark.db
+async def test_require_caller_owns_run_stranger_raises_403(run_and_pool_ctx):
+    from qiita_control_plane.auth.guards import require_caller_owns_run
+
+    dep = require_caller_owns_run()
+    caller = _human_with_idx(run_and_pool_ctx["stranger_idx"])
+    with pytest.raises(HTTPException) as exc:
+        await dep(
+            sequencing_run_idx=run_and_pool_ctx["run_idx"],
+            p=caller,
+            pool=run_and_pool_ctx["pool"],
+        )
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.db
+async def test_require_caller_owns_run_wet_lab_admin_bypasses(run_and_pool_ctx):
+    from qiita_control_plane.auth.guards import require_caller_owns_run
+
+    dep = require_caller_owns_run()
+    caller = _human_with_idx(run_and_pool_ctx["stranger_idx"], role=SystemRole.WET_LAB_ADMIN)
+    result = await dep(
+        sequencing_run_idx=run_and_pool_ctx["run_idx"],
+        p=caller,
+        pool=run_and_pool_ctx["pool"],
+    )
+    assert result is None
+
+
+@pytest.mark.db
+async def test_require_caller_owns_run_system_admin_bypasses(run_and_pool_ctx):
+    from qiita_control_plane.auth.guards import require_caller_owns_run
+
+    dep = require_caller_owns_run()
+    caller = _human_with_idx(run_and_pool_ctx["stranger_idx"], role=SystemRole.SYSTEM_ADMIN)
+    result = await dep(
+        sequencing_run_idx=run_and_pool_ctx["run_idx"],
+        p=caller,
+        pool=run_and_pool_ctx["pool"],
+    )
+    assert result is None
+
+
+@pytest.mark.db
+async def test_require_caller_owns_run_anonymous_raises_401(run_and_pool_ctx):
+    from qiita_control_plane.auth.guards import require_caller_owns_run
+
+    dep = require_caller_owns_run()
+    with pytest.raises(HTTPException) as exc:
+        await dep(
+            sequencing_run_idx=run_and_pool_ctx["run_idx"],
+            p=_anon(),
+            pool=run_and_pool_ctx["pool"],
+        )
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.db
+async def test_require_caller_owns_run_missing_run_raises_404(run_and_pool_ctx):
+    from qiita_control_plane.auth.guards import require_caller_owns_run
+
+    dep = require_caller_owns_run()
+    caller = _human_with_idx(run_and_pool_ctx["creator_idx"])
+    with pytest.raises(HTTPException) as exc:
+        await dep(
+            sequencing_run_idx=-1,
+            p=caller,
+            pool=run_and_pool_ctx["pool"],
+        )
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.db
+async def test_require_caller_owns_pool_creator_passes(run_and_pool_ctx):
+    from qiita_control_plane.auth.guards import require_caller_owns_pool
+
+    dep = require_caller_owns_pool()
+    caller = _human_with_idx(run_and_pool_ctx["creator_idx"])
+    result = await dep(
+        sequenced_pool_idx=run_and_pool_ctx["pool_idx"],
+        p=caller,
+        pool=run_and_pool_ctx["pool"],
+    )
+    assert result is None
+
+
+@pytest.mark.db
+async def test_require_caller_owns_pool_stranger_raises_403(run_and_pool_ctx):
+    from qiita_control_plane.auth.guards import require_caller_owns_pool
+
+    dep = require_caller_owns_pool()
+    caller = _human_with_idx(run_and_pool_ctx["stranger_idx"])
+    with pytest.raises(HTTPException) as exc:
+        await dep(
+            sequenced_pool_idx=run_and_pool_ctx["pool_idx"],
+            p=caller,
+            pool=run_and_pool_ctx["pool"],
+        )
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.db
+async def test_require_caller_owns_pool_wet_lab_admin_bypasses(run_and_pool_ctx):
+    from qiita_control_plane.auth.guards import require_caller_owns_pool
+
+    dep = require_caller_owns_pool()
+    caller = _human_with_idx(run_and_pool_ctx["stranger_idx"], role=SystemRole.WET_LAB_ADMIN)
+    result = await dep(
+        sequenced_pool_idx=run_and_pool_ctx["pool_idx"],
+        p=caller,
+        pool=run_and_pool_ctx["pool"],
+    )
+    assert result is None
+
+
+@pytest.mark.db
+async def test_require_caller_owns_pool_anonymous_raises_401(run_and_pool_ctx):
+    from qiita_control_plane.auth.guards import require_caller_owns_pool
+
+    dep = require_caller_owns_pool()
+    with pytest.raises(HTTPException) as exc:
+        await dep(
+            sequenced_pool_idx=run_and_pool_ctx["pool_idx"],
+            p=_anon(),
+            pool=run_and_pool_ctx["pool"],
+        )
+    assert exc.value.status_code == 401
+
+
+@pytest.mark.db
+async def test_require_caller_owns_pool_missing_pool_raises_404(run_and_pool_ctx):
+    from qiita_control_plane.auth.guards import require_caller_owns_pool
+
+    dep = require_caller_owns_pool()
+    caller = _human_with_idx(run_and_pool_ctx["creator_idx"])
+    with pytest.raises(HTTPException) as exc:
+        await dep(
+            sequenced_pool_idx=-1,
+            p=caller,
+            pool=run_and_pool_ctx["pool"],
+        )
+    assert exc.value.status_code == 404

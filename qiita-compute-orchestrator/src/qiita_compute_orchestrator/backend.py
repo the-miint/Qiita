@@ -27,8 +27,42 @@ matching the step's `outputs:` list.
 
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import Any
 
-from qiita_common.models import StepBaselineResources
+from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.models import (
+    ScopeTargetKind,
+    StepBaselineResources,
+    WorkTicketFailureStage,
+)
+
+
+def assert_container_scope_supported(*, step_name: str, scope_target: dict[str, Any]) -> None:
+    """Reject a container step whose work_ticket isn't reference-scoped.
+
+    Container steps today (reference-add: hash, load) are all wired
+    against `reference_idx`. Submitting one against a study_prep or
+    prep_sample ticket is a workflow-authoring error, not a data
+    error — surface it as CONTRACT_VIOLATION so the runner doesn't
+    quietly fall through to a downstream path that would extract the
+    wrong scalar. Shared between LocalBackend and SlurmBackend so the
+    two implementations cannot drift in either the predicate or the
+    error wording.
+
+    Raises BackendFailure(CONTRACT_VIOLATION) when the scope is not
+    REFERENCE. Returns None otherwise; callers consume
+    `scope_target["reference_idx"]` directly after the guard.
+    """
+    if scope_target.get("kind") != ScopeTargetKind.REFERENCE.value:
+        raise BackendFailure(
+            kind=FailureKind.CONTRACT_VIOLATION,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name=step_name,
+            reason=(
+                f"container step {step_name!r} requires a reference-scoped ticket; "
+                f"got scope_target.kind={scope_target.get('kind')!r}"
+            ),
+        )
 
 
 class ComputeBackend(ABC):
@@ -52,7 +86,7 @@ class ComputeBackend(ABC):
         inputs: dict[str, Path],
         workspace: Path,
         *,
-        reference_idx: int,
+        scope_target: dict[str, Any],
         work_ticket_idx: int,
         container: str | None = None,
         module: str | None = None,

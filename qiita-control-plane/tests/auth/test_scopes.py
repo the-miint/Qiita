@@ -87,6 +87,40 @@ def test_role_ceiling_helper_raises_on_unknown_role():
         role_ceiling("super-duper-admin")
 
 
+def test_compute_worker_fixture_scopes_subset_of_ceiling():
+    """The `compute_worker_service_account` test fixture must grant only
+    scopes that production deploys can mint via the admin path —
+    SERVICE_ACCOUNT_SCOPE_CEILING gates the admin route, so any
+    fixture-only scope creates an SA shape production can't replicate.
+    Catches drift in either direction: fixture gains an over-ceiling
+    scope, or the ceiling shrinks below what the fixture needs."""
+    from qiita_control_plane.auth.scopes import SERVICE_ACCOUNT_SCOPE_CEILING
+    from qiita_control_plane.testing.sessions import COMPUTE_WORKER_FIXTURE_SCOPES
+
+    over_ceiling = COMPUTE_WORKER_FIXTURE_SCOPES - SERVICE_ACCOUNT_SCOPE_CEILING
+    assert not over_ceiling, (
+        f"compute_worker_service_account fixture grants scopes outside the "
+        f"SA ceiling — production admin path will reject these: "
+        f"{sorted(s.value for s in over_ceiling)}"
+    )
+
+
+def test_sequence_range_mint_is_workers_only():
+    """sequence-range:mint is allocated only to compute service accounts
+    — humans never mint sequence ranges, so the scope must be on the
+    service-account ceiling and absent from every role ceiling."""
+    from qiita_control_plane.auth.scopes import (
+        ROLE_IMPLIED_SCOPES,
+        SERVICE_ACCOUNT_SCOPE_CEILING,
+    )
+
+    assert Scope.SEQUENCE_RANGE_MINT in SERVICE_ACCOUNT_SCOPE_CEILING
+    for role, ceiling in ROLE_IMPLIED_SCOPES.items():
+        assert Scope.SEQUENCE_RANGE_MINT not in ceiling, (
+            f"sequence-range:mint must not be on role {role!r}'s ceiling — compute workers only"
+        )
+
+
 def test_reject_scopes_outside_ceiling():
     from qiita_control_plane.auth.scopes import (
         ROLE_IMPLIED_SCOPES,

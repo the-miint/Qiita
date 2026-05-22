@@ -50,6 +50,9 @@ class Scope(StrEnum):
     PREP_SAMPLE_READ = "prep_sample:read"
     PREP_SAMPLE_WRITE = "prep_sample:write"
 
+    # Sequence-range allocation (workers-only)
+    SEQUENCE_RANGE_MINT = "sequence_range:mint"
+
     # Study data
     STUDY_READ = "study:read"
     STUDY_WRITE = "study:write"

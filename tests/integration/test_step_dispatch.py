@@ -63,7 +63,7 @@ async def test_step_dispatch_hash_end_to_end(orchestrator_app, tmp_path):
             step_name="hash",
             inputs={"fasta_path": fasta},
             workspace=workspace,
-            reference_idx=1,
+            scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=1,
             # Required by StepRunRequest's exactly-one(container, module)
             # validator. LocalBackend ignores the value for the hash step
@@ -105,7 +105,7 @@ async def test_step_dispatch_rejects_wrong_token(orchestrator_app, tmp_path):
                 step_name="hash",
                 inputs={"fasta_path": tmp_path / "x.fa"},
                 workspace=tmp_path,
-                reference_idx=1,
+                scope_target={"kind": "reference", "reference_idx": 1},
                 work_ticket_idx=1,
                 container=REFERENCE_HASH_CONTAINER,
             )

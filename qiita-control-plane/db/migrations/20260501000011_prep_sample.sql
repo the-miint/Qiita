@@ -118,6 +118,11 @@ CREATE TABLE qiita.prep_sample_to_study (
     retired_by_idx        BIGINT REFERENCES qiita.principal(idx) ON DELETE RESTRICT,
     retired_at            TIMESTAMPTZ,
     retire_reason         TEXT,
+    -- Publication-lock flag. The lock triggers that act on it are
+    -- defined in 20260520000000_publication_lock.sql; the column lives
+    -- here so prep_sample_to_study has a single CREATE-TABLE source of
+    -- truth.
+    is_published          BOOLEAN NOT NULL DEFAULT false,
 
     PRIMARY KEY (prep_sample_idx, study_idx),
 
@@ -145,11 +150,36 @@ COMMENT ON COLUMN qiita.prep_sample_to_study.retired IS
     'Distinct from prep_sample.retired, which withdraws the sample '
     'everywhere.';
 
+COMMENT ON COLUMN qiita.prep_sample_to_study.is_published IS
+    'TRUE when this (prep_sample, study) link has been published. Set only '
+    'by the owner-driven publish action (future PR). ENA accessions do NOT '
+    'set it: an ENA accession records a submission (which may sit under '
+    'embargo), not a publication. Once TRUE, the link itself plus the '
+    'prep_sample, its 1:1 sequenced_sample subtype, its prep_sample_metadata '
+    'rows, the underlying biosample, its metadata, and its biosample_to_study '
+    'links are frozen against UPDATE via the publication_lock_* trigger '
+    'family (see 20260520000000_publication_lock.sql). Distinct from '
+    'prep_sample_to_study.retired: retirement removes a study''s permission '
+    'to use a prep; is_published locks the prep''s shape because it has been '
+    'published.';
+
 CREATE INDEX prep_sample_to_study_study_idx
     ON qiita.prep_sample_to_study (study_idx);
+-- study_idx-leading (mirrors biosample_to_study_active_idx): serves the
+-- study-scoped active-link roster read with retired rows pruned at the
+-- index rather than filtered post-scan. Do not reorder to lead with
+-- prep_sample_idx -- that re-introduces the asymmetry this index closes.
 CREATE INDEX prep_sample_to_study_active_idx
-    ON qiita.prep_sample_to_study (prep_sample_idx, study_idx)
+    ON qiita.prep_sample_to_study (study_idx, prep_sample_idx)
     WHERE retired = false;
+-- Partial index for the publication-lock trigger lookup
+-- (qiita.is_prep_sample_published, defined in the publication-lock
+-- migration). The EXISTS probe only cares about published rows, so the
+-- partial predicate keeps the working set small as published rows
+-- accumulate.
+CREATE INDEX prep_sample_to_study_published_idx
+    ON qiita.prep_sample_to_study (prep_sample_idx)
+    WHERE is_published = true;
 
 
 -- =============================================================================
@@ -189,15 +219,16 @@ CREATE TABLE qiita.prep_sample_metadata (
 
 COMMENT ON COLUMN qiita.prep_sample_metadata.global_field_idx IS
     'Maintained by trigger from prep_sample_study_field.prep_sample_global_field_idx. '
-    'NULL when the source field is purely study-local, and ALSO NULL when the '
-    'prep sample''s link to the source field''s owning study has been '
-    'retired (set to true on prep_sample_to_study.retired): retirement '
-    'of the contributing link demotes the row from globally-linked to '
-    'study-local and releases the cross-study uniqueness slot so another '
-    'study may later claim it. Powers the partial unique index that enforces '
-    'one value per (prep_sample, global concept) pair across all '
+    'NULL when the source field is purely study-local, non-NULL when the source '
+    'field is bound to a global field. Powers the partial unique index that '
+    'enforces one value per (prep_sample, global field) pair across all '
     'studies, so cross-study reads through the global field always return a '
-    'single canonical value.';
+    'single canonical value. The slot is permanently held by whichever study '
+    'first wrote through the global field; retiring that study''s '
+    'prep_sample_to_study link does not release the slot (the canonical value '
+    'persists for other studies that retained their link). Per-study read '
+    'access on retired links is governed by the study_access predicate at '
+    'read time, not by this column.';
 
 CREATE INDEX prep_sample_metadata_field_idx
     ON qiita.prep_sample_metadata (prep_sample_study_field_idx);
@@ -206,10 +237,10 @@ CREATE INDEX prep_sample_metadata_terminology_value_idx
     WHERE value_terminology_term_idx IS NOT NULL;
 
 -- Cross-study uniqueness for globally-linked values: a given prep sample
--- has at most one metadata row per global concept, even if multiple studies
--- have local fields linked to that concept. Parallel to
--- biosample_metadata_one_value_per_global_concept.
-CREATE UNIQUE INDEX prep_sample_metadata_one_value_per_global_concept
+-- has at most one metadata row per global field, even if multiple studies
+-- have local fields linked to that global field. Parallel to
+-- biosample_metadata_one_value_per_global_field.
+CREATE UNIQUE INDEX prep_sample_metadata_one_value_per_global_field
     ON qiita.prep_sample_metadata (prep_sample_idx, global_field_idx)
     WHERE global_field_idx IS NOT NULL;
 
@@ -345,14 +376,75 @@ CREATE TRIGGER prep_sample_metadata_apply_field_contract_update
     FOR EACH ROW EXECUTE FUNCTION qiita.prep_sample_metadata_apply_field_contract();
 
 
+-- =============================================================================
+-- TRIGGER: propagate prep_sample_study_field global link changes to metadata
+--
+-- Parallel to the biosample-side trigger. Recognises three transition
+-- shapes on prep_sample_study_field.prep_sample_global_field_idx:
+--
+--   NULL -> non-NULL (upgrade local to global): propagate the new link to
+--     every existing metadata row through this field. The partial unique
+--     index prep_sample_metadata_one_value_per_global_field gates
+--     collisions and rolls back the propagation if any row's slot is
+--     already claimed by another study.
+--
+--   non-NULL -> NULL (unlink), no metadata exists: propagate (no-op);
+--     the field becomes local for future writes.
+--
+--   non-NULL -> NULL (unlink), metadata exists: REJECTED. Unlinking
+--     would strand globally-linked metadata; caller must delete those
+--     rows first to make the data loss explicit and deliberate.
+--
+--   non-NULL -> different non-NULL (rebind): REJECTED unconditionally.
+--     Rebinding mutates the field's identity, changing the semantic
+--     meaning of every existing metadata row. The correct flow is to
+--     create a new study_field bound to the desired global field.
+-- =============================================================================
+
 CREATE OR REPLACE FUNCTION qiita.propagate_global_field_link_to_prep_sample_metadata()
 RETURNS TRIGGER AS $$
+DECLARE
+    metadata_row_count BIGINT;
 BEGIN
-    IF NEW.prep_sample_global_field_idx IS DISTINCT FROM OLD.prep_sample_global_field_idx THEN
-        UPDATE qiita.prep_sample_metadata
-           SET global_field_idx = NEW.prep_sample_global_field_idx
-         WHERE prep_sample_study_field_idx = NEW.idx;
+    -- Short-circuit: no actual change in the global link.
+    IF NEW.prep_sample_global_field_idx IS NOT DISTINCT FROM OLD.prep_sample_global_field_idx THEN
+        RETURN NEW;
     END IF;
+
+    -- Reject rebind (non-NULL -> different non-NULL) unconditionally.
+    IF OLD.prep_sample_global_field_idx IS NOT NULL
+       AND NEW.prep_sample_global_field_idx IS NOT NULL THEN
+        RAISE EXCEPTION
+            'cannot rebind prep_sample_study_field idx=% from prep_sample_global_field_idx=% to %; '
+            'rebinding changes the semantic meaning of every metadata row through this field. '
+            'Create a new prep_sample_study_field bound to the desired global field instead.',
+            NEW.idx, OLD.prep_sample_global_field_idx, NEW.prep_sample_global_field_idx;
+    END IF;
+
+    -- Reject unlink (non-NULL -> NULL) when metadata rows exist through
+    -- this field.
+    IF OLD.prep_sample_global_field_idx IS NOT NULL
+       AND NEW.prep_sample_global_field_idx IS NULL THEN
+        SELECT COUNT(*) INTO metadata_row_count
+          FROM qiita.prep_sample_metadata
+         WHERE prep_sample_study_field_idx = NEW.idx;
+        IF metadata_row_count > 0 THEN
+            RAISE EXCEPTION
+                'cannot unlink prep_sample_study_field idx=% from prep_sample_global_field_idx=%; '
+                '% metadata row(s) reference this field. Delete those rows first '
+                'if the unlink is intentional.',
+                NEW.idx, OLD.prep_sample_global_field_idx, metadata_row_count;
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    -- Remaining case: NULL -> non-NULL (upgrade local to global). Propagate
+    -- the new link; the partial unique index rolls back the UPDATE if any
+    -- row's (prep_sample_idx, new_global_field_idx) slot is taken.
+    UPDATE qiita.prep_sample_metadata
+       SET global_field_idx = NEW.prep_sample_global_field_idx
+     WHERE prep_sample_study_field_idx = NEW.idx;
+
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -360,67 +452,6 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER prep_sample_study_field_propagate_global_link
     AFTER UPDATE OF prep_sample_global_field_idx ON qiita.prep_sample_study_field
     FOR EACH ROW EXECUTE FUNCTION qiita.propagate_global_field_link_to_prep_sample_metadata();
-
-
--- =============================================================================
--- TRIGGER: demote globally-linked metadata on prep-sample-to-study retirement
---
--- When a prep_sample_to_study link is retired (false -> true), any
--- prep_sample_metadata row contributed through the retiring link loses
--- its global linkage (global_field_idx set to NULL), releasing the cross-study
--- uniqueness slot. On un-retirement, per-row best-effort restoration attempts
--- to re-populate global_field_idx; rows where restoration would collide with
--- another study's claim silently remain study-local. Parallel to the
--- biosample-side trigger.
--- =============================================================================
-
-CREATE OR REPLACE FUNCTION qiita.prep_sample_to_study_retirement_demote_globals()
-RETURNS TRIGGER AS $$
-BEGIN
-    IF NEW.retired IS DISTINCT FROM OLD.retired THEN
-        IF NEW.retired = true THEN
-            UPDATE qiita.prep_sample_metadata ssm
-               SET global_field_idx = NULL
-              FROM qiita.prep_sample_study_field sssf
-             WHERE ssm.prep_sample_study_field_idx = sssf.idx
-               AND ssm.prep_sample_idx = NEW.prep_sample_idx
-               AND sssf.study_idx = NEW.study_idx
-               AND ssm.global_field_idx IS NOT NULL;
-        ELSE
-            DECLARE
-                r RECORD;
-            BEGIN
-                FOR r IN
-                    SELECT ssm.idx AS metadata_idx,
-                           sssf.prep_sample_global_field_idx AS target_global
-                      FROM qiita.prep_sample_metadata ssm
-                      JOIN qiita.prep_sample_study_field sssf
-                        ON ssm.prep_sample_study_field_idx = sssf.idx
-                     WHERE ssm.prep_sample_idx = NEW.prep_sample_idx
-                       AND sssf.study_idx = NEW.study_idx
-                       AND ssm.global_field_idx IS NULL
-                       AND sssf.prep_sample_global_field_idx IS NOT NULL
-                LOOP
-                    BEGIN
-                        UPDATE qiita.prep_sample_metadata
-                           SET global_field_idx = r.target_global
-                         WHERE idx = r.metadata_idx;
-                    EXCEPTION WHEN unique_violation THEN
-                        -- Slot has been claimed by another study; leave the
-                        -- row study-local. Not an error.
-                        NULL;
-                    END;
-                END LOOP;
-            END;
-        END IF;
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER prep_sample_to_study_retirement_demote_globals
-    AFTER UPDATE OF retired ON qiita.prep_sample_to_study
-    FOR EACH ROW EXECUTE FUNCTION qiita.prep_sample_to_study_retirement_demote_globals();
 
 
 -- =============================================================================
@@ -550,9 +581,25 @@ BEGIN
     ) INTO biosample_link_exists_active;
 
     IF NOT biosample_link_exists_active THEN
+        -- MESSAGE stays human-readable; everything a route acts on goes
+        -- in DETAIL as comma-separated key=value pairs. The `trigger`
+        -- key carries this function's name -- a stable schema identifier
+        -- -- so the route decides WHICH rejection this is without
+        -- matching message prose; study_idx / biosample_idx let it name
+        -- the exact failing study. Consumed by routes/_helpers.py
+        -- detail_for_biosample_link_rejection and the RaiseError catch
+        -- in routes/sequenced_sample.py -- keep the keys in sync.
+        -- ERRCODE is pinned to 'P0001' to match the house style of the
+        -- publication-lock triggers.
         RAISE EXCEPTION
             'prep_sample_to_study(prep_sample=%, study=%) requires a non-retired biosample_to_study(biosample=%, study=%) link',
-            NEW.prep_sample_idx, NEW.study_idx, biosample_idx_for_prep_sample, NEW.study_idx;
+            NEW.prep_sample_idx, NEW.study_idx, biosample_idx_for_prep_sample, NEW.study_idx
+            USING
+                ERRCODE = 'P0001',
+                DETAIL = format(
+                    'trigger=prep_sample_to_study_reject_without_biosample_link, study_idx=%s, biosample_idx=%s',
+                    NEW.study_idx, biosample_idx_for_prep_sample
+                );
     END IF;
 
     RETURN NEW;
@@ -628,9 +675,6 @@ CREATE TABLE qiita.sequenced_sample (
 
     -- The pool reference and the pool's per-item id are co-populated: either
     -- the sample is attached to a pool (both set) or it is not (both null).
-    -- A half-populated pair would mean either an item id without a pool
-    -- (orphan) or a pool reference without the run preflight's Sample_ID
-    -- (which is required to locate the row inside the run preflight).
     CONSTRAINT sequenced_sample_pool_pair_consistent CHECK (
         (sequenced_pool_idx IS NULL) = (sequenced_pool_item_id IS NULL)
     ),
@@ -705,7 +749,6 @@ DROP FUNCTION IF EXISTS qiita.sequenced_sample_clear_submission_error_on_new_att
 DROP FUNCTION IF EXISTS qiita.prep_sample_to_study_reject_without_biosample_link();
 DROP FUNCTION IF EXISTS qiita.prep_sample_metadata_reject_key_update();
 DROP FUNCTION IF EXISTS qiita.prep_sample_metadata_reject_if_link_retired();
-DROP FUNCTION IF EXISTS qiita.prep_sample_to_study_retirement_demote_globals();
 DROP FUNCTION IF EXISTS qiita.propagate_global_field_link_to_prep_sample_metadata();
 DROP FUNCTION IF EXISTS qiita.prep_sample_metadata_apply_field_contract();
 DROP FUNCTION IF EXISTS qiita.prep_sample_metadata_touch_prep_sample();

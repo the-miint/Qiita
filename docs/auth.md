@@ -240,7 +240,7 @@ Qiita's login flow uses AuthRocket's LoginRocket Web hosted-redirect path. The u
 Defined in `auth.scopes`. Two ceilings:
 
 - **`ROLE_IMPLIED_SCOPES`** — hierarchical, per `system_role`. Each entry is the **full** ceiling, not the increment, with `system_admin ⊇ wet_lab_admin ⊇ user`. Future readers don't have to chase inheritance to know what role X can do.
-- **`SERVICE_ACCOUNT_SCOPE_CEILING`** — flat, non-inherited. Workers don't fit the human hierarchy; admin-mint of a service-account token must spell out scopes explicitly within this set.
+- **`SERVICE_ACCOUNT_SCOPE_CEILING`** — flat, non-inherited. Workers don't fit the human hierarchy; admin-mint of a service-account token must spell out scopes explicitly within this set. Includes worker-only scopes like `feature:mint`, `ticket:doget`, and `sequence_range:mint` — these are deliberately absent from every role ceiling so a human PAT can't carry them.
 
 The hierarchical claim is enforced by a unit test (`test_role_ceilings_are_hierarchical`) that asserts `user ⊊ wet_lab_admin ⊊ system_admin` strictly. If that test ever fails, the inheritance contract is broken and downstream guards become unsound.
 
@@ -255,6 +255,25 @@ The hierarchical claim is enforced by a unit test (`test_role_ceilings_are_hiera
 | `require_complete_profile` | depends on `require_human`; 422 with `{reason: "profile_incomplete", missing_fields: [...]}` if `profile_complete=False` |
 
 Guards compose: a route can `Depends(require_role_at_least("system_admin"))` AND `Depends(require_scope("admin:user"))` AND `Depends(require_human)` simultaneously. FastAPI dedupes the underlying `get_current_principal` call across deps in one request.
+
+### Resource-access guards
+
+Beyond the kind / role / scope guards above, `auth.guards` carries resource-access guards that consult the DB to evaluate the caller's relationship to a specific resource named in the path or body. Each takes a `bypass_role` (default `WET_LAB_ADMIN` for the authoring guards, `SYSTEM_ADMIN` for `require_study_access`) — a caller at or above the bypass role passes with no DB lookup.
+
+| Guard | Predicate |
+|---|---|
+| `require_study_access(min_tier, bypass_role)` | factory; caller's tier on the path's `study_idx` ≥ `min_tier`. Study owner bypasses the tier comparison; `min_tier=None` resolves to the study's `default_tier`. |
+| `require_caller_owns_run(bypass_role)` | factory; `sequencing_run.created_by_idx == caller`. |
+| `require_caller_owns_pool(bypass_role)` | factory; `sequenced_pool.created_by_idx == caller`. |
+| `require_caller_has_admin_on_all_studies(...)` | body-time helper (not a `Depends`); caller has `Tier.ADMIN` (or owns, or bypasses) on **every** study in a list — used where the studies come from the request body, not the path. |
+
+**The authoring routes deliberately use three different shapes**, because the resources differ in what "ownership" means:
+
+- **biosample POST** (`/study/{idx}/biosample`) — `require_study_access(min_tier=ADMIN)`. A biosample is study-scoped; the natural gate is tier-on-that-study.
+- **sequencing-run POST** — no resource gate at all (only scope + complete-profile). A run is an instrument-level container with no parent resource to inherit access from; any user who can write prep-samples may stand one up.
+- **sequenced-pool / sequenced-sample POST** — `require_caller_owns_run` / `require_caller_owns_pool` (caller-creator), because a run/pool has a creator but no tier surface; the sample composer additionally runs `require_caller_has_admin_on_all_studies` over the body's primary + secondary studies.
+
+prep_sample-scoped **work-ticket** submission reuses the same per-study ADMIN check (`_check_prep_sample_study_access` walks the prep_sample's non-retired study links). All four paths bypass at `wet_lab_admin`, so the operator experience is uniform even though the user-facing predicate differs per route.
 
 ### Token-vs-OIDC scope source
 
@@ -312,6 +331,19 @@ Installed as the `qiita-admin` console script via `qiita-control-plane`'s pyproj
 | `whoami` | HTTP | Calls `GET /api/v1/auth/whoami`. PAT read from `QIITA_TOKEN` env or `~/.qiita/token` (mode 0600 expected). |
 | `token revoke-all --principal-idx N` | HTTP | Calls `POST /api/v1/admin/principal/{N}/revoke-all-tokens`. |
 | `login` | HTTP | Drives the LoginRocket Web flow end-to-end. Spawns a localhost loopback HTTP server, opens the browser to `/api/v1/auth/login?cli=1&port=N`, captures the one-time code from the redirect, exchanges it at `/api/v1/auth/cli-exchange`, and writes the PAT to `--token-file` (default `~/.qiita/token`, mode 0600). On timeout or error, prints an actionable message and exits non-zero. |
+
+## CLI (`qiita`)
+
+End-user companion to `qiita-admin`, installed as the `qiita` console script via the same pyproject. Subcommands grow as the user surface lands; current set:
+
+| Subcommand | Path | Notes |
+|---|---|---|
+| `login` | HTTP | Same LoginRocket loopback flow as `qiita-admin login`; defaults to writing the PAT to `~/.qiita/token`. |
+| `whoami` | HTTP | Calls `GET /api/v1/auth/whoami`. |
+| `profile set [--affiliation ... --address ... --phone ... --orcid ... --[no-]receive-processing-emails]` | HTTP | Calls `PATCH /api/v1/user/me` with only the fields the caller actually supplied (matches the server's `exclude_unset` semantics). Used to fill `affiliation`/`address`/`phone` so `qiita.user.profile_complete` flips to true. |
+| `study create --title T [--alias … --description … …]` | HTTP | Calls `POST /api/v1/study`. Caller is always the owner; the `--owner-idx` (lab-tech-on-behalf) path is intentionally not exposed. |
+
+Both CLIs share `cli/_common`: PAT file I/O, the loopback flow, the authenticated HTTP call helper, the `--base-url` / `--token-file` argparse helpers, and an HTTPS guard on `--base-url` (refuses plain `http://` to a non-localhost host unless `--insecure` is passed, because the PAT in the `Authorization` header would otherwise be sent in cleartext on the wire).
 
 ## CP ↔ CO service-to-service auth
 
