@@ -719,28 +719,3 @@ async def run_work_ticket(
 
     schedule_dispatch(request.app, work_ticket_idx)
     return WorkTicketResponse(work_ticket_idx=work_ticket_idx, state=WorkTicketState.PENDING)
-
-
-@router.get(PATH_WORK_TICKET_BY_IDX, response_model=WorkTicketResponse)
-async def get_work_ticket(
-    work_ticket_idx: int,
-    pool: asyncpg.Pool = Depends(get_db_pool),
-    _principal: Principal = Depends(get_current_principal),
-) -> WorkTicketResponse:
-    """Read a work_ticket's current state. Used by the qiita-admin CLI's
-    `--watch` poll loop. Auth is principal-only — any authenticated
-    caller can read the state of any ticket; resource-level scoping is
-    left to higher layers."""
-    row = await pool.fetchrow(
-        "SELECT work_ticket_idx, state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
-        work_ticket_idx,
-    )
-    if row is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"work_ticket {work_ticket_idx} not found",
-        )
-    return WorkTicketResponse(
-        work_ticket_idx=row["work_ticket_idx"],
-        state=WorkTicketState(row["state"]),
-    )

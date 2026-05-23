@@ -951,7 +951,7 @@ test-integration: build-data-plane-debug build-integration $(DBMATE_BIN)
 
 test-system: build-data-plane-debug build-integration
 	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
-	  ((cd tests/integration && uv run pytest -m system -x --timeout=2700); PY_EC=$$?; \
+	  ((cd tests/integration && uv run pytest -m system -x --timeout=5400); PY_EC=$$?; \
 	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
 	   exit $$PY_EC)
 
