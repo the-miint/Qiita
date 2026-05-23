@@ -40,9 +40,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("qiita-data-plane listening on {}", cfg.listen_addr);
 
+    // Arrow Flight DoPut batches for chunked uploads run up to ~1 GiB
+    // on dense GG2-scale data (see _CHUNK_ROWS_PER_BATCH × _CHUNK_SIZE
+    // in the CLI's reference_load.py — 16384 rows × 64 KB chunks).
+    // tonic's default 4 MiB max-decoding-message-size rejects these
+    // outright with "decoded message length too large". Bump to 1 GiB
+    // so the server accepts the batch sizes the chunked-upload design
+    // actually produces.
+    const FLIGHT_MAX_DECODING_BYTES: usize = 1024 * 1024 * 1024;
+
     Server::builder()
         .add_service(health_service)
-        .add_service(FlightServiceServer::new(flight_svc))
+        .add_service(
+            FlightServiceServer::new(flight_svc)
+                .max_decoding_message_size(FLIGHT_MAX_DECODING_BYTES),
+        )
         .serve(cfg.listen_addr)
         .await?;
 

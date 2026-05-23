@@ -83,7 +83,6 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-import duckdb
 import httpx
 from pydantic import BaseModel, Field
 from qiita_common.backend_failure import BackendFailure, FailureKind
@@ -93,6 +92,7 @@ from qiita_common.parquet import validate_parquet_path
 from ..miint import (
     PARQUET_OPTS,
     PARQUET_OPTS_INTERMEDIATE,
+    apply_duckdb_settings,
     ensure_miint_installed,
     is_empty_sequence_file,
     open_conn,
@@ -114,43 +114,16 @@ from ..sequence_range import (
 # instead of duplicating the literal in step_name assertions.
 YAML_STEP_NAME = "fastq"
 
-# Conservative DuckDB resource caps. TODO(#38): plumb from
-# JobParams.baseline_resources so each step's SLURM allocation drives
-# DuckDB's own limits. For now these mirror the YAML's declared
-# baseline_resources (cpu=2, mem_gb=8): DuckDB gets `mem_gb - 1` so
-# Python + miint runtime have ~1 GB of headroom — DuckDB's
-# memory_limit only caps DuckDB itself, not the rest of the process.
-# Long-read inputs need this safely above ~2.4 GB resident per thread
-# (2048 STANDARD_VECTOR_SIZE × 60 default Parquet row_group_size ×
-# ~20 KB avg long-read record incl. quality). Threads stay at the
-# cgroup cpu ask; oversubscribing threads doesn't kill a job, but
-# exceeding memory_limit does.
-_DUCKDB_MAX_MEMORY_GB = 7
-_DUCKDB_MAX_THREADS = 2
-
-
-def _apply_duckdb_settings(conn: duckdb.DuckDBPyConnection, duckdb_tmp: Path) -> None:
-    """Apply the four DuckDB settings every pipeline connection needs.
-
-    - `memory_limit='{N}GB'` — cap RAM so SLURM cgroups don't OOM-kill.
-    - `threads={N}` — match the cgroup cpu allocation; the default
-      would try to use all host cores.
-    - `preserve_insertion_order=false` — let DuckDB parallelize freely.
-      Determinism is guaranteed by carrying miint's per-file 1-based
-      `sequence_index` column through the intermediate Parquet:
-      sequence_idx = sequence_index + start - 1 is deterministic by
-      construction, independent of physical row order.
-    - `temp_directory='{workspace}/.duckdb_tmp'` — spill on the same
-      fast scratch as the workspace, not the system /tmp (which is
-      often small tmpfs).
-
-    The canonical setting names are `memory_limit` and `threads` —
-    `max_memory` / `max_threads` are aliases in newer DuckDB versions
-    but not the ones miint targets, so use the canonical forms."""
-    conn.execute(f"SET memory_limit='{_DUCKDB_MAX_MEMORY_GB}GB'")
-    conn.execute(f"SET threads={_DUCKDB_MAX_THREADS}")
-    conn.execute("SET preserve_insertion_order=false")
-    conn.execute(f"SET temp_directory='{duckdb_tmp}'")
+# DuckDB resource caps for this step. The YAML allocation
+# (workflows/fastq-to-parquet/1.0.0.yaml: mem_gb=8, cpu=2) sizes the
+# SLURM cgroup; DuckDB's own caps sit just below (`mem_gb - 1` leaves
+# ~1 GB for Python/miint/OS overhead). Long-read inputs need this
+# safely above ~2.4 GB resident per thread (2048 STANDARD_VECTOR_SIZE
+# × 60 default Parquet row_group_size × ~20 KB avg long-read record
+# incl. quality); 7 GB is comfortably above that. #38 will plumb these
+# directly.
+_DUCKDB_MEMORY_GB = 7
+_DUCKDB_THREADS = 2
 
 
 class PreMintedRange(BaseModel):
@@ -250,7 +223,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         # BAD_INPUT above, so read_fastx is guaranteed to have at least
         # one record here.
         with open_conn() as conn:
-            _apply_duckdb_settings(conn, duckdb_tmp)
+            apply_duckdb_settings(
+                conn,
+                duckdb_tmp,
+                memory_gb=_DUCKDB_MEMORY_GB,
+                threads=_DUCKDB_THREADS,
+            )
             conn.execute("LOAD miint;")
             # `sequence_index` (miint's 1-based per-file row index) is
             # carried through the intermediate so the sequence_idx rewrite
@@ -272,7 +250,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
         # Count via Parquet footer (no scan).
         with open_conn() as conn:
-            _apply_duckdb_settings(conn, duckdb_tmp)
+            apply_duckdb_settings(
+                conn,
+                duckdb_tmp,
+                memory_gb=_DUCKDB_MEMORY_GB,
+                threads=_DUCKDB_THREADS,
+            )
             count = conn.execute(
                 "SELECT count(*) FROM read_parquet(?)", [str(intermediate)]
             ).fetchone()[0]
@@ -378,7 +361,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         # Rewrite intermediate -> final with sequence_idx assigned and
         # physically sorted on disk.
         with open_conn() as conn:
-            _apply_duckdb_settings(conn, duckdb_tmp)
+            apply_duckdb_settings(
+                conn,
+                duckdb_tmp,
+                memory_gb=_DUCKDB_MEMORY_GB,
+                threads=_DUCKDB_THREADS,
+            )
             # sequence_idx = miint's sequence_index (1-based per file)
             # + start - 1. Deterministic by construction — file order
             # IS the assignment order. The outer ORDER BY controls the

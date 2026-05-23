@@ -19,9 +19,8 @@ Adding a route requires both flavours so the router and its callers
 stay in lockstep; removing one without the other will surface as a name
 error at import time rather than a silent route mismatch at runtime.
 
-Currently covers /feature/* and /reference/*; other tags
-(/auth, /admin, /user) still hardcode their paths and will migrate as
-they're touched.
+Coverage grows as routes are touched; other tags (/auth, /admin,
+/user) still hardcode their paths and will migrate as they're touched.
 """
 
 from enum import StrEnum

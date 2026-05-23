@@ -78,6 +78,64 @@ CHUNK_ROW_GROUP_SIZE: int = 16_384
 PARQUET_OPTS_CHUNKED: str = f"{PARQUET_OPTS}, ROW_GROUP_SIZE {CHUNK_ROW_GROUP_SIZE}"
 
 
+# DuckDB resource caps for native jobs.
+#
+# Native jobs running under SLURM share their cgroup with the wrapping
+# Python process + miint runtime + OS overhead. DuckDB's `memory_limit`
+# only bounds DuckDB itself, so we leave ~1 GB of headroom and set the
+# cap to `yaml_mem_gb - 1`. Threads match the cgroup cpu allocation 1:1;
+# under-allocating threads only costs throughput, but exceeding
+# memory_limit OOM-kills the job.
+#
+# Until #38 plumbs `JobParams.baseline_resources` directly into the job
+# at dispatch time, each call site passes the YAML numbers as literals
+# — a mismatch with the workflow YAML is visible at review time, not a
+# runtime surprise.
+#
+# Defined here so a future per-job override (or the #38 plumb) has one
+# place to land, rather than three independent copies in the jobs/*
+# modules.
+
+
+def apply_duckdb_settings(
+    conn: duckdb.DuckDBPyConnection,
+    duckdb_tmp: Path,
+    *,
+    memory_gb: int,
+    threads: int,
+) -> None:
+    """Apply the four DuckDB settings every chunked-Parquet pipeline
+    connection needs:
+
+    - `memory_limit='{N}GB'` — cap RAM so SLURM cgroups don't OOM-kill.
+    - `threads={N}` — bound parallelism. The default would try to use
+      all host cores, which can blow `memory_limit` because parallel
+      operators (HASH_AGG, sort) keep per-thread state.
+    - `preserve_insertion_order=false` — let DuckDB parallelize freely.
+      All chunked-sequence pipelines reconstruct order via an explicit
+      `chunk_index` (or per-file `sequence_index`), so DuckDB doesn't
+      need to preserve scan order. Required for the chunked-sequence
+      write path (see `feedback_sequence_chunking`) — without it the
+      vectorized engine buffers row groups in memory rather than
+      flushing eagerly, OOMing on genome-heavy uploads.
+    - `temp_directory='{workspace}/.duckdb_tmp'` — spill on the same
+      fast scratch as the workspace, not the system /tmp (which is
+      often small tmpfs).
+
+    `memory_gb` and `threads` are the actual DuckDB caps the caller
+    wants set — NOT the workflow YAML's allocation. The caller is
+    responsible for choosing values that fit (a) the SLURM cgroup
+    allocation (memory_gb < yaml_mem_gb), and (b) the query shape's
+    parallel-state cost (threads may need to be below yaml_cpu for
+    HASH_AGG-heavy workloads — see hash_sequences). #38 will replace
+    these literals with values derived from JobParams.baseline_resources
+    plus per-job overrides."""
+    conn.execute(f"SET memory_limit='{memory_gb}GB'")
+    conn.execute(f"SET threads={threads}")
+    conn.execute("SET preserve_insertion_order=false")
+    conn.execute(f"SET temp_directory='{duckdb_tmp}'")
+
+
 def open_conn() -> duckdb.DuckDBPyConnection:
     """Open a DuckDB connection. Unsigned-extensions config is enabled
     only when MIINT_EXTENSION_REPO points at a non-default repo (the

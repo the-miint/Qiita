@@ -7,8 +7,10 @@
 //! avoids shared mutable state and allows concurrent requests — DuckLake's
 //! snapshot isolation in the shared Postgres catalog handles concurrency.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use arrow_flight::decode::{DecodedPayload, FlightDataDecoder};
 use arrow_flight::encode::FlightDataEncoderBuilder;
@@ -20,6 +22,8 @@ use arrow_flight::{
 use duckdb::Connection;
 use futures::stream::{self, Stream, StreamExt};
 use parquet::arrow::ArrowWriter;
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::properties::{WriterProperties, WriterVersion};
 use sha2::{Digest, Sha256};
 use tonic::{Request, Response, Status, Streaming};
 
@@ -69,7 +73,7 @@ impl QiitaFlightService {
 
 /// Canonical staging path for an upload — single source of truth shared by
 /// the DoPut handler (writes here) and the control plane (reads here).
-pub fn staging_path_for(root: &Path, upload_idx: u64) -> PathBuf {
+pub fn staging_path_for(root: &Path, upload_idx: i64) -> PathBuf {
     root.join("uploads")
         .join(upload_idx.to_string())
         .join("upload.parquet")
@@ -270,7 +274,12 @@ impl FlightService for QiitaFlightService {
 //
 // Failure policy: any error mid-stream deletes the partial file and returns
 // a Status to the client. The upload row in `qiita.upload` stays at
-// `pending`; the client mints a fresh slot to retry. No resumability.
+// `pending`; the client mints a fresh slot to retry. Partial-write
+// failures aren't resumable. Post-write failures (the chmod 440 or the
+// PutResult JSON encode) DO clean up the just-written file, which means
+// a retry against the same upload_idx would re-trigger `create_new`
+// successfully — but the client never learns the upload_idx is reusable
+// in that window, so in practice retries always mint a fresh slot.
 
 impl QiitaFlightService {
     /// Generic over the input stream so unit tests can drive it with an
@@ -362,6 +371,37 @@ impl QiitaFlightService {
     }
 }
 
+/// `std::io::Write` adapter that incrementally feeds every byte the inner
+/// writer accepts into a shared Sha256 + byte counter. Wrapping the staging
+/// `File` in this lets ArrowWriter's normal write path also drive the digest,
+/// removing the second full-file read `sha256_and_size` used to do.
+///
+/// State lives in an `Arc<Mutex<...>>` so the outer scope can extract the
+/// final hash + byte count after `ArrowWriter::close()` consumes (and drops)
+/// the wrapped writer. Mutex is uncontended in practice — parquet-rs writes
+/// from the single async task that owns this writer.
+struct HashingWriter<W: Write> {
+    inner: W,
+    state: Arc<Mutex<(Sha256, u64)>>,
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        let mut state = self
+            .state
+            .lock()
+            .expect("HashingWriter mutex never poisoned");
+        state.0.update(&buf[..n]);
+        state.1 += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Drive the Flight stream through a Parquet writer; return
 /// `(sha256_hex, row_count, bytes_received)`. The caller owns staging-path
 /// cleanup on Err.
@@ -392,9 +432,14 @@ where
     // disk-level flush. Without it, a power loss / OOM kill between close
     // and /done can leave the client thinking the upload succeeded while
     // the bytes were never durable.
-    let mut writer: Option<ArrowWriter<std::fs::File>> = None;
+    let mut writer: Option<ArrowWriter<HashingWriter<std::fs::File>>> = None;
     let mut sync_handle: Option<std::fs::File> = None;
     let mut row_count: u64 = 0;
+    // Outer half of the shared state. The HashingWriter held inside
+    // ArrowWriter holds a clone; on ArrowWriter::close() that clone is
+    // dropped and we can `try_unwrap` to extract the final digest and
+    // byte count without a second read of the file.
+    let hash_state: Arc<Mutex<(Sha256, u64)>> = Arc::new(Mutex::new((Sha256::new(), 0)));
 
     while let Some(item) = decoder.next().await {
         let decoded = item.map_err(|e| Status::internal(format!("flight decode: {e}")))?;
@@ -426,8 +471,23 @@ where
                     file.try_clone()
                         .map_err(|e| Status::internal(format!("dup file handle: {e}")))?,
                 );
+                // Parquet v2 + zstd matches the project-wide convention
+                // (every other Parquet writer in the codebase uses these).
+                // Staging upload.parquet defaulted to uncompressed v1 —
+                // GG2 backbone FASTA blew up to ~3.5× the source on disk
+                // because DNA-chunk VARCHAR columns don't dictionary-encode.
+                // zstd level 3 is the parquet-rs default ZSTD setting and
+                // a good DNA-on-disk trade (fast, ~4× compression).
+                let props = WriterProperties::builder()
+                    .set_writer_version(WriterVersion::PARQUET_2_0)
+                    .set_compression(Compression::ZSTD(ZstdLevel::default()))
+                    .build();
+                let hashing_writer = HashingWriter {
+                    inner: file,
+                    state: hash_state.clone(),
+                };
                 writer = Some(
-                    ArrowWriter::try_new(file, schema, None)
+                    ArrowWriter::try_new(hashing_writer, schema, Some(props))
                         .map_err(|e| Status::internal(format!("parquet writer init: {e}")))?,
                 );
             }
@@ -454,36 +514,20 @@ where
         .sync_all()
         .map_err(|e| Status::internal(format!("fsync: {e}")))?;
 
-    let (sha256, bytes_received) = sha256_and_size(&staging_path)?;
-    Ok((sha256, row_count, bytes_received))
-}
-
-/// Read the file back and compute sha256 + size. Single-pass, 64 KB buffer
-/// so multi-GB Parquet uploads don't bloat RSS.
-fn sha256_and_size(path: &Path) -> Result<(String, u64), Status> {
-    use std::io::Read;
-    let mut file =
-        std::fs::File::open(path).map_err(|e| Status::internal(format!("open for sha: {e}")))?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 65536];
-    let mut total: u64 = 0;
-    loop {
-        let n = file
-            .read(&mut buf)
-            .map_err(|e| Status::internal(format!("read for sha: {e}")))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-        total += n as u64;
-    }
+    // ArrowWriter::close() above dropped the HashingWriter (and with it
+    // the inner Arc clone of hash_state); the outer Arc is now the sole
+    // owner, so try_unwrap succeeds.
+    let (hasher, bytes_received) = Arc::try_unwrap(hash_state)
+        .expect("HashingWriter dropped its Arc clone via ArrowWriter::close")
+        .into_inner()
+        .expect("hash_state mutex never poisoned");
     let digest = hasher.finalize();
-    let mut hex = String::with_capacity(64);
+    let mut sha256 = String::with_capacity(64);
     for b in digest {
         use std::fmt::Write;
-        write!(&mut hex, "{b:02x}").expect("write to String never fails");
+        write!(&mut sha256, "{b:02x}").expect("write to String never fails");
     }
-    Ok((hex, total))
+    Ok((sha256, row_count, bytes_received))
 }
 
 /// Move Parquet files from staging to permanent storage and register in DuckLake.
@@ -505,6 +549,30 @@ fn register_files(
 ) -> Result<Vec<String>, Status> {
     let staging = std::path::Path::new(&payload.staging_dir);
     let perm_root = std::path::Path::new(data_path);
+
+    // Validate every filename is a safe relative path under
+    // staging_dir. Filenames may carry a subdir prefix
+    // (e.g. "reference_sequence_chunks/part_00000.parquet") to register
+    // multiple parts under one DuckLake table, but must not contain
+    // `..` or absolute components. Although `payload.files` is
+    // HMAC-signed by the control plane and so already trusted, this
+    // defense-in-depth check keeps the data plane's filesystem
+    // contract independent of CP correctness.
+    for filename in payload.files.keys() {
+        let candidate = std::path::Path::new(filename);
+        if candidate.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }) {
+            return Err(Status::invalid_argument(format!(
+                "filename must be a relative path with no '..' components: {filename}"
+            )));
+        }
+    }
 
     // Validate all requested files exist.
     for filename in payload.files.keys() {
@@ -528,7 +596,15 @@ fn register_files(
                 dest_dir.display()
             ))
         })?;
-        let dest = dest_dir.join(filename);
+        // Multi-file tables carry a subdir prefix in `filename`
+        // (e.g. "reference_sequence_chunks/part_00000.parquet"). Use
+        // only the basename when placing into `dest_dir` — otherwise
+        // we'd nest the staging subdir inside the per-table
+        // destination dir.
+        let basename = std::path::Path::new(filename).file_name().ok_or_else(|| {
+            Status::invalid_argument(format!("filename has no basename: {filename}"))
+        })?;
+        let dest = dest_dir.join(basename);
         move_file(&src, &dest)?;
         moved.push((table.clone(), dest));
     }
@@ -786,7 +862,7 @@ mod tests {
 
     type HmacSha256 = Hmac<Sha256>;
 
-    fn sign_doput_for_test(upload_idx: u64, secret: &[u8], expiry: u64) -> Vec<u8> {
+    fn sign_doput_for_test(upload_idx: i64, secret: &[u8], expiry: u64) -> Vec<u8> {
         let payload = format!(r#"{{"action":"doput","upload_idx":{upload_idx}}}"#);
         sign_raw(payload.as_bytes(), secret, expiry)
     }

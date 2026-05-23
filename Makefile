@@ -168,10 +168,16 @@ test-integration: build-data-plane-debug build-integration $(DBMATE_BIN)
 # data is harmless. See tests/integration/test_system_gg2_backbone.py
 # for the expected file paths under localdocs/scratch/.
 #
-# Slow (~10 min): hashes 331K sequences, mints features, writes chunked Parquet.
+# Slow (~60 min on a 30 GiB host): hashes 331K sequences (≈25 min for
+# the bin-pack-batched aggregate over 12 GB compressed staging), mints
+# features, writes chunked Parquet (reference_load chunks-write is
+# another bin-pack-batched JOIN+sort over the same 30+ GB of decoded
+# chunk_data; ~20-30 min). Pytest timeout matches the test's internal
+# 90-minute watch — the work itself fits comfortably under that on this
+# host once the OOM walls are out of the way.
 test-system: build-data-plane-debug build-integration
 	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \
-	  ((cd tests/integration && uv run pytest -m system -x --timeout=2700); PY_EC=$$?; \
+	  ((cd tests/integration && uv run pytest -m system -x --timeout=5400); PY_EC=$$?; \
 	   (cd $(PG_COMPOSE_DIR) && $(PG_TEARDOWN)); \
 	   exit $$PY_EC)
 

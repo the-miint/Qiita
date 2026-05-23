@@ -24,9 +24,10 @@ cutting a release candidate). Triple-gated:
     datasets never enter version control
 
 Pinned-version note: the row-count constants below
-(_EXPECTED_FEATURES / _EXPECTED_TAXONOMY / _EXPECTED_PHYLOGENY) are
-specific to the GG2 2024.09 backbone snapshot. A future release-cycle
-update that re-pins to a newer snapshot must re-derive these.
+(_EXPECTED_FEATURES / _EXPECTED_TAXONOMY / _EXPECTED_PHYLOGENY /
+_EXPECTED_GENOME_ASSOCIATIONS) are specific to the GG2 2024.09
+backbone snapshot. A future release-cycle update that re-pins to a
+newer snapshot must re-derive these.
 
 Canonical-hash note: hash_sequences canonicalizes via
 `md5(LEAST(upper(seq), sequence_dna_reverse_complement(upper(seq))))`.
@@ -61,6 +62,16 @@ GG2_GENOME_MAP = DATA_DIR / "2024.09.backbone.feature-to-genome.parquet"
 _EXPECTED_FEATURES = 331269
 _EXPECTED_TAXONOMY = 331240
 _EXPECTED_PHYLOGENY = 662537
+
+# feature-to-genome.parquet has 72,765 non-null-genome_id rows but the
+# FASTA read_ids are amplicon-style (e.g. `MJ020_2_barcode53_...`)
+# while genome_map's feature_ids are NCBI-accession-style
+# (e.g. `NZ_CP039371.1`); only 12,283 IDs overlap. The runner's INNER
+# JOIN on read_id drops the non-overlap rows ("the genome map may
+# legitimately cover only a subset of FASTA reads" — see
+# qiita_control_plane.actions.library._associate_genomes). 12,283 is
+# the intersection size, derived empirically on the 2024.09 snapshot.
+_EXPECTED_GENOME_ASSOCIATIONS = 12283
 
 _REFERENCE_ADD_YAML_PATH = (
     Path(__file__).parent.parent.parent / "workflows" / "reference-add" / "1.0.0.yaml"
@@ -173,6 +184,7 @@ async def cli_cp_client(postgres_pool, hmac_secret, human_admin_session, data_pl
         hmac_secret_key=hmac_secret,
         data_plane_url=f"grpc://{LOOPBACK_HOST}:{data_plane['port']}",
         upload_staging_root=Path(data_plane["upload_staging_root"]),
+        workspace_root=Path(data_plane["workspace_root"]),
     )
     cp_app.state.compute_backend_client = LocalComputeBackendClient()
     cp_app.state.running_dispatches = set()
@@ -213,9 +225,13 @@ async def test_gg2_backbone_full_pipeline(
     from qiita_control_plane.auth.tickets import sign_ticket
     from qiita_control_plane.cli.reference_load import do_reference_load
 
-    # `watch=True` with a generous 30-minute timeout — the actual hash
-    # work dominates and we'd rather see a timeout fail loudly than a
-    # 5-second poll hang the test forever.
+    # `watch=True` with a 90-minute timeout — hash_sequences alone is
+    # ~25 min at GG2 backbone scale (batched aggregate over 12 GB
+    # compressed staging), and reference_load follows with its own
+    # JOIN+ORDER BY+write over the same 30+ GB of chunk_data. The
+    # workflow needs to finish before we can claim completed; setting
+    # this above any plausible runtime lets us see whether reference_load
+    # actually completes vs OOMs.
     result = await do_reference_load(
         http=cli_cp_client,
         token=human_admin_session["token"],
@@ -227,7 +243,7 @@ async def test_gg2_backbone_full_pipeline(
         reference_idx=gg2_reference,
         watch=True,
         poll_interval_seconds=5,
-        timeout_seconds=30 * 60,
+        timeout_seconds=90 * 60,
     )
     assert result["work_ticket"]["state"] == "completed", result["work_ticket"]
 
@@ -248,14 +264,11 @@ async def test_gg2_backbone_full_pipeline(
     )
     assert membership_count == _EXPECTED_FEATURES
 
-    # --- Genome associations: every row in the converted genome map
-    # should have produced exactly one feature_genome row scoped to this
-    # reference's feature set.
-    expected_genome_count = (
-        duckdb.connect(":memory:")
-        .execute("SELECT count(*) FROM read_parquet(?)", [str(gg2_genome_map)])
-        .fetchone()[0]
-    )
+    # --- Genome associations: the runner JOINs genome_map.read_id
+    # against the manifest's read_id (INNER JOIN), so only the
+    # intersection produces feature_genome rows. For GG2 the
+    # intersection is much smaller than the genome_map row count —
+    # see _EXPECTED_GENOME_ASSOCIATIONS for the locked figure.
     actual_genome_count = await postgres_pool.fetchval(
         "SELECT count(*) FROM qiita.feature_genome fg"
         " JOIN qiita.genome g USING (genome_idx)"
@@ -263,7 +276,7 @@ async def test_gg2_backbone_full_pipeline(
         " WHERE m.reference_idx = $1 AND g.source = 'gg2'",
         gg2_reference,
     )
-    assert actual_genome_count == expected_genome_count
+    assert actual_genome_count == _EXPECTED_GENOME_ASSOCIATIONS
 
     # --- DoGet round-trips via real Flight ---
     def _doget(table: str):

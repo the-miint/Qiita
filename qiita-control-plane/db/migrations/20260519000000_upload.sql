@@ -13,9 +13,8 @@
 --   pending  → mint_slot inserted the row; DoPut not yet acknowledged.
 --   ready    → client called POST /upload/{idx}/done; staged file is final.
 --   consumed → a workflow runner read the upload as an input.
---   failed   → future: the data plane reported a write error, or a cleanup
---              sweep aged out a stale pending row. No transition path
---              currently lands this state.
+--   failed   → the data plane reported a write error, or a cleanup
+--              sweep aged out a stale pending row.
 --
 -- Source-of-truth for the staging path is `Settings.upload_staging_root +
 -- upload_idx` — not stored on the row. Keeps the schema small and lets a

@@ -91,13 +91,17 @@ def staging_inputs(tmp_path):
         [(str(h), fidx) for h, fidx in _FEATURE_MAP.items()],
     )
 
-    reference_sequence_chunks_path = tmp_path / "reference_sequence_chunks.parquet"
+    # hash_sequences emits reference_sequence_chunks as a DIRECTORY of
+    # `part_*.parquet` files (avoids the single-writer OOM at GG2 scale).
+    # Test fixture matches that contract: one directory, one part inside.
     # Chunks carry the source (unfolded) bytes of each upload read; the
     # canonical hash lives on the row but the chunk_data is what was
     # uploaded. For the test fixture we use _CANON[name] as a stand-in
     # for the upload bytes (single-strand inputs in this fixture).
+    reference_sequence_chunks_dir = tmp_path / "reference_sequence_chunks"
+    reference_sequence_chunks_dir.mkdir(parents=True, exist_ok=True)
     _write_parquet(
-        reference_sequence_chunks_path,
+        reference_sequence_chunks_dir / "part_00000.parquet",
         "sequence_hash UUID, chunk_index INTEGER, chunk_data VARCHAR",
         [(str(_HASHES[name]), 0, _CANON[name]) for name in _TEST_SEQUENCES],
     )
@@ -105,7 +109,7 @@ def staging_inputs(tmp_path):
     return {
         "manifest": manifest_path,
         "feature_map": feature_map_path,
-        "reference_sequence_chunks": reference_sequence_chunks_path,
+        "reference_sequence_chunks": reference_sequence_chunks_dir,
     }
 
 
@@ -147,13 +151,22 @@ def test_emits_feature_idx_keyed_sequences(staging_inputs, tmp_path):
 
 
 def test_emits_feature_idx_keyed_chunks(staging_inputs, tmp_path):
-    """reference_sequence_chunks.parquet is keyed by feature_idx; the
-    chunk_data column carries the canonical sequence verbatim."""
+    """reference_sequence_chunks/ is a directory of part_*.parquet
+    files keyed by feature_idx; the chunk_data column carries the
+    canonical sequence verbatim. The runner's register-files
+    convention picks this directory up as a multi-file DuckLake
+    table."""
     outputs = _run(_inputs(**staging_inputs), tmp_path / "ws")
-    pq = outputs["staging_dir"] / "reference_sequence_chunks.parquet"
-    assert pq.exists()
+    chunks_dir = outputs["staging_dir"] / "reference_sequence_chunks"
+    assert chunks_dir.is_dir()
+    parts = sorted(chunks_dir.glob("part_*.parquet"))
+    assert parts, "expected at least one part file"
+    parts_glob = str(chunks_dir / "part_*.parquet")
     with duckdb.connect(":memory:") as conn:
-        cols = {c[0]: c[1] for c in conn.execute(f"DESCRIBE SELECT * FROM '{pq}'").fetchall()}
+        cols = {
+            c[0]: c[1]
+            for c in conn.execute("DESCRIBE SELECT * FROM read_parquet(?)", [parts_glob]).fetchall()
+        }
         assert cols == {
             "feature_idx": "BIGINT",
             "chunk_index": "INTEGER",
@@ -161,8 +174,9 @@ def test_emits_feature_idx_keyed_chunks(staging_inputs, tmp_path):
         }
         # Reassemble per feature_idx → canonical form.
         rows = conn.execute(
-            f"SELECT feature_idx, string_agg(chunk_data, '' ORDER BY chunk_index)"
-            f" FROM '{pq}' GROUP BY feature_idx ORDER BY feature_idx"
+            "SELECT feature_idx, string_agg(chunk_data, '' ORDER BY chunk_index)"
+            " FROM read_parquet(?) GROUP BY feature_idx ORDER BY feature_idx",
+            [parts_glob],
         ).fetchall()
     by_name = {_HASHES[n]: _CANON[n] for n in _TEST_SEQUENCES}
     fidx_to_canon = {_FEATURE_MAP[h]: c for h, c in by_name.items()}
@@ -188,11 +202,13 @@ def test_emits_reference_membership_with_reference_idx(staging_inputs, tmp_path)
 
 def test_omits_optional_outputs_when_paths_unset(staging_inputs, tmp_path):
     """With no taxonomy / tree / jplace inputs, only the three required
-    staging files are emitted."""
+    staging outputs are emitted (chunks is a directory of parts)."""
     outputs = _run(_inputs(**staging_inputs), tmp_path / "ws")
     staging = outputs["staging_dir"]
     assert (staging / "reference_sequences.parquet").exists()
-    assert (staging / "reference_sequence_chunks.parquet").exists()
+    chunks_dir = staging / "reference_sequence_chunks"
+    assert chunks_dir.is_dir()
+    assert sorted(chunks_dir.glob("part_*.parquet")), "expected at least one part"
     assert (staging / "reference_membership.parquet").exists()
     assert not (staging / "reference_taxonomy.parquet").exists()
     assert not (staging / "reference_phylogeny.parquet").exists()

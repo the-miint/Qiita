@@ -389,6 +389,34 @@ def test_blob_upload_stream_chunks_bytes(tmp_path):
     assert reassembled == b"(a:0.1,b:0.2);"
 
 
+def test_blob_upload_stream_decompresses_gzip(tmp_path):
+    """`.gz` inputs are read transparently — chunk_data carries the
+    decompressed bytes so the server's stitched temp file is valid
+    plaintext for miint's `read_newick`/`read_jplace`. Matches the FASTA
+    streamer's treatment; GG2 backbone ships the tree as `.nwk.gz`."""
+    import gzip
+
+    from qiita_control_plane.cli.reference_load import _blob_upload_stream
+
+    payload = b"((seq1:0.1,seq2:0.2):0.3,seq3:0.4);"
+    src = tmp_path / "tree.nwk.gz"
+    with gzip.open(src, "wb") as f:
+        f.write(payload)
+
+    with _blob_upload_stream(src) as stream:
+        batches = list(stream.batches)
+    pairs: list[tuple[int, bytes]] = []
+    for batch in batches:
+        for idx, data in zip(
+            batch.column("chunk_index").to_pylist(),
+            batch.column("chunk_data").to_pylist(),
+        ):
+            pairs.append((idx, data))
+    pairs.sort()
+    reassembled = b"".join(data for _idx, data in pairs)
+    assert reassembled == payload
+
+
 def test_passthrough_parquet_stream_iterates_source_batches(taxonomy_file):
     """Passthrough streamer must yield every input row through its own
     Parquet batches without dropping or reordering."""

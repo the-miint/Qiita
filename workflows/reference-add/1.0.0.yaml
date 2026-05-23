@@ -28,6 +28,14 @@ context_schema:
     # Optional DoPut handles for the supplementary reference inputs.
     # Absent uploads → absent staging files → the corresponding
     # DuckLake tables receive no rows from this run.
+    #
+    # taxonomy / tree / jplace flow into the `load` step's
+    # optional_inputs and are consumed there. genome_map_upload_idx is
+    # the odd one out: the `mint-features` action below pulls it
+    # directly via `bound.get("genome_map_path")` in runner.py — it is
+    # NOT wired through `load`. A YAML-only reader can't tell that from
+    # `mint-features`'s `inputs: [manifest]` line, so this is the only
+    # place the genome_map data flow is visible.
     taxonomy_upload_idx: {type: integer, minimum: 1}
     tree_upload_idx: {type: integer, minimum: 1}
     jplace_upload_idx: {type: integer, minimum: 1}

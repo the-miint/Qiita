@@ -31,6 +31,14 @@ _DEFAULT_MAX_SEQUENCE_MINT_COUNT = 10_000_000_000
 
 _DEFAULT_CP_TO_CO_TOKEN_PATH = Path("/etc/qiita/cp-to-co.token")
 
+# Filesystem roots — defined once at module scope so the dataclass
+# default, the `from_env` fallback, and `runner.DEFAULT_*` cannot drift
+# independently. `runner.py` re-imports both. The Rust data-plane
+# (`UPLOAD_STAGING_ROOT` env var, qiita-data-plane/src/config.rs) has
+# to spell the same path independently; production must set both.
+DEFAULT_UPLOAD_STAGING_ROOT = Path("/scratch/ephemeral/staging")
+DEFAULT_WORKSPACE_ROOT = Path("/scratch/ephemeral/workspace")
+
 
 def _parse_positive_int_env(var: str, default: int) -> int:
     """Read `var` from the environment as a positive int, or fall back to
@@ -91,14 +99,17 @@ class Settings:
     # `{root}/uploads/{idx}/upload.parquet` (compute_upload_staging_path)
     # before invoking workflow steps. Default matches the data plane's
     # `UPLOAD_STAGING_ROOT` default; in production both sides set the env
-    # var to the same shared-filesystem path.
-    upload_staging_root: Path = Path("/scratch/ephemeral/staging")
+    # var to the same shared-filesystem path. `runner.DEFAULT_UPLOAD_STAGING_ROOT`
+    # mirrors this value as a default for `run_workflow`'s kwarg.
+    upload_staging_root: Path = DEFAULT_UPLOAD_STAGING_ROOT
     # Per-work_ticket workspace root the runner mints attempt subdirs under
     # (`<workspace_root>/<work_ticket_idx>/<entry-name>/attempt-<N>/`).
     # Production points this at the shared scratch filesystem; integration
     # tests override via the WORKSPACE_ROOT env var so the runner doesn't
     # try to create `/scratch/ephemeral/workspace` on CI agents.
-    workspace_root: Path = Path("/scratch/ephemeral/workspace")
+    # `runner.DEFAULT_WORKSPACE_ROOT` mirrors this value for `run_workflow`'s
+    # default kwarg.
+    workspace_root: Path = DEFAULT_WORKSPACE_ROOT
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -161,7 +172,7 @@ class Settings:
                 _DEFAULT_MAX_SEQUENCE_MINT_COUNT,
             ),
             upload_staging_root=Path(
-                os.environ.get("UPLOAD_STAGING_ROOT", "/scratch/ephemeral/staging")
+                os.environ.get("UPLOAD_STAGING_ROOT", str(DEFAULT_UPLOAD_STAGING_ROOT))
             ),
-            workspace_root=Path(os.environ.get("WORKSPACE_ROOT", "/scratch/ephemeral/workspace")),
+            workspace_root=Path(os.environ.get("WORKSPACE_ROOT", str(DEFAULT_WORKSPACE_ROOT))),
         )

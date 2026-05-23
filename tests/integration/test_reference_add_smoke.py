@@ -196,12 +196,20 @@ async def test_reference_add_workflow_end_to_end(
     assert feature_count == 3
 
     # register-files invoked once with the staging-dir Parquet files
-    # mapped by the runner's filename → stem convention.
+    # mapped by the runner's convention: flat files → stem; subdir of
+    # part files → directory name. `reference_sequence_chunks` is the
+    # multi-file form (see reference_load.py).
     assert len(register_calls) == 1
     staging_dir, files = register_calls[0]
     assert "reference_sequences.parquet" in files
     assert files["reference_sequences.parquet"] == "reference_sequences"
     assert "reference_membership.parquet" in files
+    chunk_parts = [
+        name for name in files if name.startswith("reference_sequence_chunks/")
+    ]
+    assert chunk_parts, "expected reference_sequence_chunks subdir parts"
+    for name in chunk_parts:
+        assert files[name] == "reference_sequence_chunks"
 
     # Per-entry / per-attempt workspaces materialised the expected files.
     # Layout is `<workspace_root>/<work_ticket_idx>/<entry-name>/attempt-<N>/`

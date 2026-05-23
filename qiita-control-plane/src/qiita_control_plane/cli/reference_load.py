@@ -26,11 +26,15 @@ What the subcommand does, in order, against a running CP + DP:
 
 **Arrow streaming** (per role):
 
-  - FASTA: miint's ``read_fastx`` → 64 KB chunks via DuckDB's chunk_seq
-           macro. Upload schema: ``(read_id, chunk_index, chunk_data)``.
-           Bounded memory regardless of record size — GG2 genome records
-           up to ~21 MB stream as many small chunks instead of a single
-           multi-MB Parquet cell.
+  - FASTA: streaming Python parser → 64 KB chunks. Upload schema:
+           ``(read_id, chunk_index, chunk_data)``. Bounded memory
+           regardless of record size — GG2 genome records up to ~21 MB
+           stream as many small chunks instead of a single multi-MB
+           Parquet cell. DuckDB + miint's ``read_fastx`` is NOT used
+           here even though it would be the natural fit, because
+           DuckDB's 2048-row vector model OOMs on multi-MB strings
+           before any downstream operator runs; see
+           `_fasta_upload_stream` for the full rationale.
   - Newick / jplace: Python ``read(64 KB)`` loop over the source file.
            Upload schema: ``(chunk_index, chunk_data BLOB)``. Bounded
            memory regardless of file size — GG2 phylogeny (~407 MB) and
@@ -60,7 +64,6 @@ import base64
 import contextlib
 import json
 import logging
-import os
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -136,44 +139,88 @@ class UploadStream:
 
 @contextlib.contextmanager
 def _fasta_upload_stream(fasta_path: Path) -> Iterator[UploadStream]:
-    """FASTA → `(read_id, chunk_index, chunk_data)` chunked stream via
-    miint's `read_fastx` plus DuckDB's chunk_seq UNNEST. Sequences are
-    chunked at the client so a multi-MB GG2 genome record never lands
-    as a single VARCHAR cell on the wire. preserve_insertion_order is
-    left default — chunks within a read carry their own chunk_index, so
-    hash_sequences reconstructs by ORDER BY.
+    """FASTA → `(read_id, chunk_index, chunk_data)` chunked stream via a
+    streaming Python parser. Sequences are chunked at the client so a
+    multi-MB GG2 genome record never lands as a single VARCHAR cell on
+    the wire.
 
-    Reuses `MIINT_EXTENSION_REPO` (the orchestrator's flag) when set so
-    the team mirror's unsigned binaries are picked up here too."""
-    import duckdb
+    Why Python and not DuckDB + miint's `read_fastx` here: DuckDB's
+    vectorized engine fills 2048-row vectors before any downstream
+    operator runs. On GG2 backbone — where a handful of records reach
+    ~21 MB — one such vector is 40+ GB, OOMing reliably on any sane
+    host. `preserve_insertion_order=false` doesn't help because the
+    materialisation happens upstream of the CROSS JOIN UNNEST. A
+    line-buffered Python parser bounds memory to one record plus one
+    in-flight batch (~1 GB at 16384 chunks × 64 KB), independent of
+    record size and file size. Server-side `hash_sequences` still uses
+    miint for the read_fastx path it actually consumes (chunked
+    Parquet), so miint is not removed from the pipeline, just bypassed
+    on the client where the vector model doesn't fit the data shape.
 
-    mirror = os.environ.get("MIINT_EXTENSION_REPO")
-    config = {"allow_unsigned_extensions": "true"} if mirror else {}
-    with duckdb.connect(":memory:", config=config) as conn:
-        if mirror:
-            conn.execute(f"FORCE INSTALL miint FROM '{mirror}';")
-        else:
-            conn.execute("INSTALL miint FROM community;")
-        conn.execute("LOAD miint;")
-        conn.execute(
-            "CREATE OR REPLACE MACRO chunk_seq(str) AS "
-            "list_transform("
-            f"  range(1, CAST(length(str) + 1 AS BIGINT), {_CHUNK_SIZE}),"
-            "  lambda idx : {"
-            f"    'chunk_index': CAST((idx - 1) / {_CHUNK_SIZE} AS INTEGER),"
-            f"    'chunk_data': substring(str, CAST(idx AS BIGINT), {_CHUNK_SIZE})"
-            "  }"
-            ")"
-        )
-        rel = conn.sql(
-            "SELECT read_id, chunk.chunk_index, chunk.chunk_data "
-            "FROM ("
-            f"  SELECT read_id, sequence1 AS sequence FROM read_fastx('{fasta_path}')"
-            ") "
-            "CROSS JOIN UNNEST(chunk_seq(sequence)) AS t(chunk)"
-        )
-        reader = rel.to_arrow_reader(_CHUNK_ROWS_PER_BATCH)
-        yield UploadStream(schema=reader.schema, batches=reader)
+    chunks within a read carry their own `chunk_index`, so
+    hash_sequences reconstructs by ORDER BY regardless of arrival
+    order. Reads gzipped (`.gz`) or plain FASTA transparently."""
+    import gzip
+
+    import pyarrow as pa
+
+    schema = pa.schema(
+        [
+            pa.field("read_id", pa.string()),
+            pa.field("chunk_index", pa.int32()),
+            pa.field("chunk_data", pa.string()),
+        ]
+    )
+
+    opener = gzip.open if fasta_path.suffix == ".gz" else open
+
+    def _iter_batches() -> Iterator[Any]:
+        read_ids: list[str] = []
+        chunk_indexes: list[int] = []
+        chunk_datas: list[str] = []
+
+        def _emit_batch() -> Any:
+            batch = pa.RecordBatch.from_arrays(
+                [
+                    pa.array(read_ids, type=pa.string()),
+                    pa.array(chunk_indexes, type=pa.int32()),
+                    pa.array(chunk_datas, type=pa.string()),
+                ],
+                schema=schema,
+            )
+            read_ids.clear()
+            chunk_indexes.clear()
+            chunk_datas.clear()
+            return batch
+
+        def _explode(read_id: str, sequence: str) -> Iterator[Any]:
+            for offset in range(0, len(sequence), _CHUNK_SIZE):
+                read_ids.append(read_id)
+                chunk_indexes.append(offset // _CHUNK_SIZE)
+                chunk_datas.append(sequence[offset : offset + _CHUNK_SIZE])
+                if len(read_ids) >= _CHUNK_ROWS_PER_BATCH:
+                    yield _emit_batch()
+
+        with opener(fasta_path, "rt") as f:
+            current_id: str | None = None
+            seq_parts: list[str] = []
+            for line in f:
+                if line.startswith(">"):
+                    if current_id is not None:
+                        yield from _explode(current_id, "".join(seq_parts))
+                    # read_id is everything between '>' and the first
+                    # whitespace; description (if any) is dropped, matching
+                    # miint's read_fastx behaviour.
+                    current_id = line[1:].split(None, 1)[0]
+                    seq_parts = []
+                else:
+                    seq_parts.append(line.strip())
+            if current_id is not None:
+                yield from _explode(current_id, "".join(seq_parts))
+            if read_ids:
+                yield _emit_batch()
+
+    yield UploadStream(schema=schema, batches=_iter_batches())
 
 
 @contextlib.contextmanager
@@ -182,7 +229,15 @@ def _blob_upload_stream(src: Path) -> Iterator[UploadStream]:
     stream. Reads `src` in 64 KB blocks and emits one Arrow batch per
     `_CHUNK_ROWS_PER_BATCH` chunks. Bounded memory even on GG2-scale
     inputs (407 MB phylogeny, multi-GB jplace). Server side stitches
-    chunks back into a temp file via `_unwrap_chunks_to_temp_file`."""
+    chunks back into a temp file via `_unwrap_chunks_to_temp_file`.
+
+    Reads gzipped (`.gz`) inputs transparently — chunk_data carries the
+    decompressed bytes. The server's stitched temp file is then valid
+    plaintext for miint's `read_newick` / `read_jplace`, which only
+    accept on-disk text/JSON. Mirrors the FASTA streamer's treatment of
+    `.gz` for the same reason."""
+    import gzip
+
     import pyarrow as pa
 
     schema = pa.schema(
@@ -192,11 +247,13 @@ def _blob_upload_stream(src: Path) -> Iterator[UploadStream]:
         ]
     )
 
+    opener = gzip.open if src.suffix == ".gz" else open
+
     def _iter_batches() -> Iterator[Any]:
         indices: list[int] = []
         datas: list[bytes] = []
         idx = 0
-        with src.open("rb") as f:
+        with opener(src, "rb") as f:
             while True:
                 data = f.read(_CHUNK_SIZE)
                 if not data:

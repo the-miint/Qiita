@@ -29,12 +29,17 @@ async def ctx(
     postgres_pool,
     human_admin_session,
     regular_user_session,
+    wet_lab_admin_session,
 ):
-    """Yield {pool, admin, user, admin_session, created} for upload route tests.
+    """Yield {pool, admin, user, other_admin, *_session, created} for upload route tests.
 
     `created` accumulates `upload_idx` values for FK-reverse cleanup at
     teardown — the upload row has only `created_by_idx → principal` as an
     outgoing FK, so a simple DELETE WHERE upload_idx = ANY(...) is enough.
+
+    `other_admin` is a second admin (wet_lab_admin) that also carries
+    TICKET_DOPUT but is a DIFFERENT principal — used to lock the
+    per-creator ownership gate on /done and GET /upload.
     """
     from qiita_control_plane.config import Settings
     from qiita_control_plane.main import app
@@ -60,13 +65,20 @@ async def ctx(
             base_url="http://test",
             headers={"Authorization": f"Bearer {regular_user_session['token']}"},
         ) as user,
+        AsyncClient(
+            transport=transport,
+            base_url="http://test",
+            headers={"Authorization": f"Bearer {wet_lab_admin_session['token']}"},
+        ) as other_admin,
     ):
         yield {
             "pool": postgres_pool,
             "admin": admin,
             "user": user,
+            "other_admin": other_admin,
             "admin_session": human_admin_session,
             "user_session": regular_user_session,
+            "other_admin_session": wet_lab_admin_session,
             "created": created,
         }
 
@@ -342,3 +354,39 @@ async def test_get_upload_rejects_zero(ctx):
     """upload_idx=0 trips the gt=0 Pydantic constraint."""
     resp = await ctx["admin"].get(URL_UPLOAD_BY_IDX.format(upload_idx=0))
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Per-creator ownership gate (mirrors _resolve_upload_handles in the runner)
+# ---------------------------------------------------------------------------
+
+
+async def test_get_upload_owned_by_other_admin_404(ctx):
+    """A second admin (different principal) reading another admin's upload
+    sees 404, not 200 — existence is not leaked across owners."""
+    create_resp = await _create_upload(ctx["admin"], description="admin-only")
+    idx = _track(ctx, create_resp)
+
+    resp = await ctx["other_admin"].get(URL_UPLOAD_BY_IDX.format(upload_idx=idx))
+    assert resp.status_code == 404
+
+
+async def test_upload_done_rejected_for_non_owner_admin(ctx):
+    """A second admin attempting /done on someone else's pending row
+    receives 404 and the row stays pending — matches the runner's
+    `created_by_idx == originator_principal_idx` invariant."""
+    create_resp = await _create_upload(ctx["admin"])
+    idx = _track(ctx, create_resp)
+
+    resp = await ctx["other_admin"].post(
+        URL_UPLOAD_DONE.format(upload_idx=idx),
+        json={"sha256": "1" * 64, "row_count": 1, "bytes_received": 1},
+    )
+    assert resp.status_code == 404
+    row = await ctx["pool"].fetchrow(
+        "SELECT status, sha256, completed_at FROM qiita.upload WHERE upload_idx = $1",
+        idx,
+    )
+    assert row["status"] == "pending"
+    assert row["sha256"] is None
+    assert row["completed_at"] is None

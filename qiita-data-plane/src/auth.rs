@@ -190,7 +190,14 @@ pub struct DoPutPayload {
     /// handler is the only consumer of this payload today and bundling the
     /// check keeps the auth module shape-only.
     pub action: String,
-    pub upload_idx: u64,
+    /// `i64`, matching the Postgres source of truth
+    /// (`qiita.upload.upload_idx BIGINT GENERATED ALWAYS AS IDENTITY`) and
+    /// the runner's `::bigint[]` cast in `_resolve_upload_handles`. The
+    /// IDENTITY column never reaches `i64::MAX` in practice; using `u64`
+    /// here would let a CP-signed ticket carry a value past `i64::MAX`
+    /// that `staging_path_for` would still happily turn into a directory
+    /// name, diverging from what the Postgres row could ever hold.
+    pub upload_idx: i64,
 }
 
 /// Verify a DoPut ticket and return the parsed payload.
@@ -351,7 +358,7 @@ mod tests {
         ticket
     }
 
-    fn make_doput_ticket(upload_idx: u64, secret: &[u8], expiry: u64) -> Vec<u8> {
+    fn make_doput_ticket(upload_idx: i64, secret: &[u8], expiry: u64) -> Vec<u8> {
         // Canonical JSON: sorted keys, no whitespace — matches sign_doput.
         let payload = format!(r#"{{"action":"doput","upload_idx":{upload_idx}}}"#);
         make_doput_ticket_raw(payload.as_bytes(), secret, expiry)
@@ -404,12 +411,12 @@ mod tests {
     }
 
     #[test]
-    fn verify_doput_rejects_wrong_action() {
+    fn verify_doput_passes_action_string_through() {
         // The auth layer is shape-only — `action` is just a string here.
-        // It still has to be present and parseable; an empty action is fine
-        // at the wire layer (the gRPC handler enforces action == "doput").
-        // Locking the parse-only behaviour: a payload with a different
-        // action string verifies but carries the verbatim value through.
+        // It still has to be present and parseable; the gRPC handler is
+        // what enforces action == "doput". Locking the parse-only
+        // behaviour: a payload with a different action string verifies
+        // but carries the verbatim value through.
         let payload = br#"{"action":"register_files","upload_idx":1}"#;
         let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
         let parsed = verify_doput(&ticket, b"dev-secret").expect("verify should succeed");

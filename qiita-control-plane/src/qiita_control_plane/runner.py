@@ -44,10 +44,13 @@ from qiita_common.models import (
 from .actions.library import LIBRARY
 from .actions.reference import transition_reference_status
 
-_log = logging.getLogger(__name__)
+# Re-export the canonical config-side defaults so the runner's `run_workflow`
+# default kwargs and `Settings`' dataclass defaults can't drift. The Rust
+# data plane carries its own UPLOAD_STAGING_ROOT default (config.rs); in
+# production all three are set to the same env-overridden path.
+from .config import DEFAULT_UPLOAD_STAGING_ROOT, DEFAULT_WORKSPACE_ROOT  # noqa: F401
 
-DEFAULT_WORKSPACE_ROOT = Path("/scratch/ephemeral/workspace")
-DEFAULT_UPLOAD_STAGING_ROOT = Path("/scratch/ephemeral/staging")
+_log = logging.getLogger(__name__)
 
 # Suffix that marks an action_context key as a DoPut upload handle. The
 # runner resolves every `{prefix}_upload_idx` entry to the canonical
@@ -583,10 +586,11 @@ async def _resolve_upload_handles(
       1. The upload row exists.
       2. status='ready' — the DoPut completed and /done was called.
       3. created_by_idx == originator_principal_idx — uploaders can only
-         feed their own work tickets. Defensive even though /upload's
-         audience is admin-only today; a future tightening of the
-         /done route to enforce per-row ownership would lean on the
-         same invariant.
+         feed their own work tickets. Matches the same per-row ownership
+         gate `POST /upload/{idx}/done` and `GET /upload/{idx}` enforce
+         (see routes/upload.py); the runner double-checks here because
+         the originator on a work_ticket isn't necessarily the same as
+         the principal that created each referenced upload.
       4. The on-disk file exists at the canonical staging path. Catches
          a CP↔DP layout drift (or a deleted scratch) before the workflow
          hands the path to a step that would 404 on it.
@@ -844,11 +848,27 @@ async def _dispatch_action(
     if entry.name == LibraryPrimitive.REGISTER_FILES:
         staging_dir = Path(bound[entry.inputs[0]])
         # Filename → DuckLake table mapping derived from the staging dir.
-        # Convention: every *.parquet file in the dir gets registered to
-        # a table whose name matches the filename stem. Workflows that
-        # want a different mapping should declare it in YAML; today the
-        # only caller (reference-add) follows the convention.
-        files = {p.name: p.stem for p in sorted(staging_dir.glob("*.parquet"))}
+        # Convention:
+        #   - Top-level `<table>.parquet` files register as the table
+        #     named after the file's stem (single-file table).
+        #   - Top-level subdirs containing `*.parquet` files register
+        #     each part as the table named after the directory
+        #     (multi-file table). The filename in `files` carries the
+        #     subdir prefix relative to staging_dir; the data plane
+        #     normalises to basename when placing each part in the
+        #     permanent per-table directory.
+        # The multi-file form exists for `reference_sequence_chunks` —
+        # at GG2 scale a single-file sort+write of ~30 GB of chunk_data
+        # OOMs DuckDB; reference_load batches it into part files
+        # instead (jobs/reference_load.py:_write_reference_sequence_chunks).
+        files: dict[str, str] = {}
+        for entry_path in sorted(staging_dir.iterdir()):
+            if entry_path.is_file() and entry_path.suffix == ".parquet":
+                files[entry_path.name] = entry_path.stem
+            elif entry_path.is_dir():
+                for part in sorted(entry_path.glob("*.parquet")):
+                    rel = part.relative_to(staging_dir).as_posix()
+                    files[rel] = entry_path.name
         if not files:
             raise RuntimeError(
                 f"register-files: staging_dir {staging_dir} contains no Parquet files"

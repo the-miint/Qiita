@@ -364,6 +364,11 @@ async def test_refuses_unknown_ticket(postgres_pool, tmp_path):
 async def test_register_files_globs_staging_dir(
     postgres_pool, pending_work_ticket, library_spy, tmp_path
 ):
+    """register-files picks up both flat *.parquet files (single-file
+    tables, table name = stem) and top-level subdirs of part_*.parquet
+    (multi-file tables, table name = subdir name). The multi-file form
+    exists for `reference_sequence_chunks` — see
+    qiita_compute_orchestrator.jobs.reference_load."""
     workspace_root = tmp_path / "ws"
     work_ticket_idx = pending_work_ticket["work_ticket_idx"]
     backend = FakeBackendClient()
@@ -374,11 +379,14 @@ async def test_register_files_globs_staging_dir(
     staging.mkdir(parents=True, exist_ok=True)
     for name in (
         "reference_sequences.parquet",
-        "reference_sequence_chunks.parquet",
         "reference_membership.parquet",
         "reference_taxonomy.parquet",
     ):
         (staging / name).touch(exist_ok=True)
+    chunks_dir = staging / "reference_sequence_chunks"
+    chunks_dir.mkdir(parents=True, exist_ok=True)
+    (chunks_dir / "part_00000.parquet").touch()
+    (chunks_dir / "part_00001.parquet").touch()
 
     await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
 
@@ -386,9 +394,10 @@ async def test_register_files_globs_staging_dir(
     files = register_call[2]  # ("register-files", staging_dir, files)
     assert files == {
         "reference_sequences.parquet": "reference_sequences",
-        "reference_sequence_chunks.parquet": "reference_sequence_chunks",
         "reference_membership.parquet": "reference_membership",
         "reference_taxonomy.parquet": "reference_taxonomy",
+        "reference_sequence_chunks/part_00000.parquet": "reference_sequence_chunks",
+        "reference_sequence_chunks/part_00001.parquet": "reference_sequence_chunks",
     }
 
 
