@@ -81,12 +81,12 @@ CREATE TABLE qiita.prep_sample_global_field (
 );
 
 COMMENT ON TABLE qiita.prep_sample_global_field IS
-    'Global concept registry for prep-sample fields. Parallel to '
+    'Global field registry for prep-sample fields. Parallel to '
     'biosample_global_field. internal_name is the stable cross-study query '
     'identifier; display_name is the default human-readable label used as a '
     'fallback when a study has not provided its own. data_type, '
     'terminology_idx, default_tier, and required are owned at the global '
-    'level and apply uniformly across every study that links to this concept; '
+    'level and apply uniformly across every study that links to this global field; '
     'per-study disagreement on these properties is forbidden so that '
     'cross-study reads remain sound.';
 
@@ -135,7 +135,7 @@ COMMENT ON TABLE qiita.prep_sample_study_field IS
     'Per-study field definitions for prep samples. Parallel to '
     'biosample_study_field. May be linked to a prep_sample_global_field, '
     'in which case data_type, terminology_idx, tier_override, and required '
-    'are all owned by the global concept and must be NULL on this row. Only '
+    'are all owned by the global field and must be NULL on this row. Only '
     'display_name and description may be overridden per-study on linked rows, '
     'as cosmetic presentation for that study''s own users. Unlinked rows are '
     'purely study-local and carry their own type, terminology, tier, and '
@@ -167,10 +167,10 @@ COMMENT ON TABLE qiita.prep_protocol_field IS
     'Each row says "this global field is allowed (and possibly required) for '
     'prep samples following this protocol." Protocol requirements are '
     'cross-study governance -- the protocol is defined once and used by many '
-    'studies -- so requirements reference only globally-known concepts, not '
+    'studies -- so requirements reference only global fields, not '
     'study-local fields. A study that wishes to require a study-local field '
     'for its own use of a protocol must first promote the field to a global '
-    'concept via the field-promotion flow.';
+    'field via the field-promotion flow.';
 
 CREATE INDEX prep_protocol_field_field_idx
     ON qiita.prep_protocol_field (prep_sample_global_field_idx);

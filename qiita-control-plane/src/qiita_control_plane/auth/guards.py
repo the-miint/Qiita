@@ -20,7 +20,12 @@ from qiita_common.auth_constants import SystemRole
 from qiita_common.models import Tier
 
 from ..deps import get_db_pool
-from ..repositories.sequencing_run import fetch_sequenced_pool, fetch_sequencing_run_exists
+from ..repositories.sequencing_run import (
+    fetch_sequenced_pool,
+    fetch_sequenced_pool_created_by,
+    fetch_sequencing_run_created_by,
+    fetch_sequencing_run_exists,
+)
 from ..repositories.study import fetch_study_exists
 from ..repositories.study_access import fetch_caller_study_access
 from ..repositories.user_eligibility import fetch_user_eligibility
@@ -308,6 +313,142 @@ async def require_sequencing_run_exists(
         )
 
 
+async def require_caller_has_admin_on_all_studies(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    caller: Principal,
+    study_idxs: list[int],
+    bypass_role: SystemRole = SystemRole.WET_LAB_ADMIN,
+) -> None:
+    """Require the caller to have `Tier.ADMIN` access to every study_idx
+    in the list, deduplicated.
+
+    Per study, in input order: role-bypass at or above `bypass_role`
+    short-circuits with no DB lookup; 401 on Anonymous (defense in depth);
+    owner bypass or `Tier.ADMIN` passes; anything below 403s naming the
+    offending study. A non-existent study row is silently skipped — the
+    composer's FK violation surfaces as 422 from one source. Precedence:
+    when the body has both a missing study and a no-access study, the
+    403 fires on whichever appears first in the input, not 422.
+    Iteration is deduped because secondary_study_idxs may repeat the
+    primary on misuse paths the composer rejects later.
+    """
+    if isinstance(caller, Anonymous):
+        raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
+    if caller.has_role_at_least(bypass_role):
+        return
+
+    for study_idx in dict.fromkeys(study_idxs):
+        row = await fetch_caller_study_access(
+            pool_or_conn, principal_idx=caller.principal_idx, study_idx=study_idx
+        )
+        if row is None:
+            # Study does not exist — not this gate's job to 404. The
+            # composer's INSERT trips the FK and surfaces one 422.
+            continue
+        if row.owner_idx == caller.principal_idx:
+            continue
+        if row.access_tier == Tier.ADMIN:
+            continue
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"requires study access at tier {str(Tier.ADMIN)!r} or higher on study {study_idx}"
+            ),
+        )
+
+
+async def _check_caller_owns_resource(
+    *,
+    pool: asyncpg.Pool,
+    principal: Principal,
+    bypass_role: SystemRole,
+    fetch_created_by: Callable[[asyncpg.Pool, int], asyncpg.connection.Connection],
+    resource_idx: int,
+    resource_label: str,
+) -> None:
+    """Shared body for the per-resource caller-creator guards.
+
+    Order: 401 on Anonymous; role-bypass for callers at or above
+    `bypass_role` (no DB lookup); 404 if `fetch_created_by` returns None;
+    403 if the row's `created_by_idx` is not the caller. `fetch_created_by`
+    is a narrow `SELECT created_by_idx FROM ... WHERE idx = $1` so the
+    auth check costs one round trip and one column — never the full row,
+    which (for sequenced_pool) includes a BYTEA preflight blob.
+    """
+    if isinstance(principal, Anonymous):
+        raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
+    if principal.has_role_at_least(bypass_role):
+        return
+    created_by_idx = await fetch_created_by(pool, resource_idx)
+    if created_by_idx is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"{resource_label} {resource_idx} not found",
+        )
+    if created_by_idx == principal.principal_idx:
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=f"caller did not create {resource_label} {resource_idx}",
+    )
+
+
+def require_caller_owns_run(
+    *,
+    bypass_role: SystemRole = SystemRole.WET_LAB_ADMIN,
+) -> Callable[..., None]:
+    """Factory: gate the route on `sequencing_run.created_by_idx ==
+    caller.principal_idx`. `bypass_role` defaults to WET_LAB_ADMIN so
+    any wet-lab admin or higher operates on any run regardless of
+    creator (mirrors `require_study_access(bypass_role=WET_LAB_ADMIN)`).
+    """
+
+    async def _dep(
+        sequencing_run_idx: int,
+        p: Principal = Depends(get_current_principal),
+        pool: asyncpg.Pool = Depends(get_db_pool),
+    ) -> None:
+        await _check_caller_owns_resource(
+            pool=pool,
+            principal=p,
+            bypass_role=bypass_role,
+            fetch_created_by=fetch_sequencing_run_created_by,
+            resource_idx=sequencing_run_idx,
+            resource_label="sequencing_run",
+        )
+
+    return _dep
+
+
+def require_caller_owns_pool(
+    *,
+    bypass_role: SystemRole = SystemRole.WET_LAB_ADMIN,
+) -> Callable[..., None]:
+    """Factory: gate the route on `sequenced_pool.created_by_idx ==
+    caller.principal_idx`. Composes alongside `require_sequenced_pool_in_run`
+    on routes whose path names both run and pool — that guard enforces
+    parent-run consistency, this one enforces caller ownership of the
+    pool itself.
+    """
+
+    async def _dep(
+        sequenced_pool_idx: int,
+        p: Principal = Depends(get_current_principal),
+        pool: asyncpg.Pool = Depends(get_db_pool),
+    ) -> None:
+        await _check_caller_owns_resource(
+            pool=pool,
+            principal=p,
+            bypass_role=bypass_role,
+            fetch_created_by=fetch_sequenced_pool_created_by,
+            resource_idx=sequenced_pool_idx,
+            resource_label="sequenced_pool",
+        )
+
+    return _dep
+
+
 async def require_sequenced_pool_in_run(
     sequencing_run_idx: int,
     sequenced_pool_idx: int,
@@ -354,7 +495,7 @@ def require_study_access(
     the resolved minimum tier. Routes that must surface 404 on a
     missing study for bypass-role callers should compose
     `require_study_exists` alongside this guard (see
-    `list_biosample_idxs_in_study` and `get_study_route`).
+    `list_biosample_idxs_in_study` and `get_study`).
 
     `min_tier=None` resolves the minimum to the study's own
     `default_tier` at request time (per-study policy). Pass an

@@ -195,6 +195,52 @@ async def seed_biosample_with_sequenced_prep_sample(
     return biosample_idx, prep_sample_idx
 
 
+async def seed_sequenced_sample_subtype(
+    pool: asyncpg.Pool,
+    *,
+    prep_sample_idx: int,
+    owner_idx: int,
+    sequenced_pool_item_id: str,
+) -> tuple[int, int, int]:
+    """Seed the run -> pool -> sequenced_sample subtype chain for an
+    existing sequenced prep_sample; return
+    `(sequencing_run_idx, sequenced_pool_idx, sequenced_sample_idx)`.
+
+    `prep_sample_idx` must already name a supertype prep_sample row with
+    processing_kind='sequenced' (see seed_sequenced_prep_sample). This
+    helper attaches the 1:1 sequenced_sample subtype plus the
+    sequenced_pool it references, so `sequenced_pool_item_id` is
+    populated — the sequenced_sample_pool_pair_consistent CHECK requires
+    the pool idx and item id to be set together. Use this from fixtures
+    that need a prep_sample carrying a pool item id (e.g. the
+    work_ticket fastq-filename-prefix gate). Caller does FK-reverse
+    cleanup: sequenced_sample, then sequenced_pool, then sequencing_run.
+    """
+    run_idx = await pool.fetchval(
+        "INSERT INTO qiita.sequencing_run"
+        "  (instrument_run_id, platform, created_by_idx)"
+        " VALUES ($1, 'illumina'::qiita.platform, $2) RETURNING idx",
+        f"seed-run-{secrets.token_hex(4)}",
+        owner_idx,
+    )
+    pool_idx = await pool.fetchval(
+        "INSERT INTO qiita.sequenced_pool (sequencing_run_idx, created_by_idx)"
+        " VALUES ($1, $2) RETURNING idx",
+        run_idx,
+        owner_idx,
+    )
+    sequenced_sample_idx = await pool.fetchval(
+        "INSERT INTO qiita.sequenced_sample"
+        "  (prep_sample_idx, sequenced_pool_idx, sequenced_pool_item_id, created_by_idx)"
+        " VALUES ($1, $2, $3, $4) RETURNING idx",
+        prep_sample_idx,
+        pool_idx,
+        sequenced_pool_item_id,
+        owner_idx,
+    )
+    return run_idx, pool_idx, sequenced_sample_idx
+
+
 async def seed_biosample_global_field(
     pool: asyncpg.Pool,
     *,
@@ -215,6 +261,35 @@ async def seed_biosample_global_field(
     """
     return await pool.fetchval(
         "INSERT INTO qiita.biosample_global_field"
+        "  (internal_name, display_name, data_type, created_by_idx)"
+        " VALUES ($1, $2, $3, $4) RETURNING idx",
+        internal_name,
+        display_name,
+        data_type,
+        created_by_idx,
+    )
+
+
+async def seed_prep_sample_global_field(
+    pool: asyncpg.Pool,
+    *,
+    internal_name: str,
+    display_name: str,
+    data_type: FieldDataType,
+    created_by_idx: int,
+) -> int:
+    """Insert a qiita.prep_sample_global_field row and return its idx.
+
+    Parallel to seed_biosample_global_field; mirrors the same column
+    subset (internal_name, display_name, data_type, plus the creating
+    principal). required and default_tier rely on schema defaults;
+    description is intentionally omitted -- callers that need a non-null
+    description set it via UPDATE so the helper surface stays small.
+    asyncpg coerces the StrEnum value to text for the
+    qiita.field_data_type cast.
+    """
+    return await pool.fetchval(
+        "INSERT INTO qiita.prep_sample_global_field"
         "  (internal_name, display_name, data_type, created_by_idx)"
         " VALUES ($1, $2, $3, $4) RETURNING idx",
         internal_name,
@@ -267,6 +342,33 @@ async def retire_biosample_to_study_link(
         " SET retired = true, retired_at = now(), retired_by_idx = $3"
         " WHERE biosample_idx = $1 AND study_idx = $2",
         biosample_idx,
+        study_idx,
+        retired_by_idx,
+    )
+
+
+async def retire_prep_sample_to_study_link(
+    pool: asyncpg.Pool,
+    *,
+    prep_sample_idx: int,
+    study_idx: int,
+    retired_by_idx: int,
+) -> None:
+    """UPDATE qiita.prep_sample_to_study to retire the (prep_sample, study)
+    link.
+
+    Parallel to retire_biosample_to_study_link: populates retired,
+    retired_at, and retired_by_idx together so the
+    prep_sample_to_study_retirement_consistent CHECK passes; retire_reason
+    is left NULL (the CHECK allows it). Caller supplies retired_by_idx
+    explicitly so the helper does not need to know which test fixture
+    owns the action.
+    """
+    await pool.execute(
+        "UPDATE qiita.prep_sample_to_study"
+        " SET retired = true, retired_at = now(), retired_by_idx = $3"
+        " WHERE prep_sample_idx = $1 AND study_idx = $2",
+        prep_sample_idx,
         study_idx,
         retired_by_idx,
     )

@@ -11,7 +11,12 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
+from qiita_common.auth_constants import (
+    SYSTEM_PRINCIPAL_IDX,
+    AuthEventType,
+    Scope,
+    SystemRole,
+)
 
 pytestmark = pytest.mark.db
 
@@ -1202,4 +1207,142 @@ async def test_delete_token_rolls_back_when_audit_fails(
     )
     actual = (resp.status_code, revoked_at)
     expected = (500, None)
+    assert actual == expected
+
+
+async def test_handoff_cli_rolls_back_when_audit_fails(
+    auth_client, postgres_pool, jwks_harness, monkeypatch, audit_failure, fail_safe_client
+):
+    """CLI handoff: if the TOKEN_MINT audit insert fails, the PAT mint and the
+    cli_login_code row must both roll back. The route shares one transaction
+    across mint + audit + cli_login_code, so no partial state survives — no
+    token without its audit, no token+audit without a redeemable code."""
+    from qiita_control_plane.main import app
+
+    pidx = await _seed_user(
+        postgres_pool,
+        email="rollback-handoff-cli@example.com",
+        issuer=jwks_harness.issuer,
+        subject="rollback-handoff-cli",
+    )
+    _track(auth_client, pidx)
+
+    # Only the route's record_event is patched — resolve_oidc's audit binding
+    # lives in auth.principal and is untouched, so the resolver upsert (which
+    # runs outside the route's transaction) is unaffected.
+    monkeypatch.setattr("qiita_control_plane.routes.auth.record_event", audit_failure)
+
+    saved_verifier = app.state.oidc_verifier
+    app.state.oidc_verifier = _lr_verifier(jwks_harness)
+    try:
+        token = jwks_harness.sign(
+            _lr_claims(
+                jwks_harness,
+                sub="rollback-handoff-cli",
+                email="rollback-handoff-cli@example.com",
+            )
+        )
+        cookie = _make_login_cookie(cli=True, port=16001)
+        resp = await fail_safe_client.get(
+            f"/api/v1/auth/handoff?token={token}",
+            cookies=_cookie_jar(cookie),
+            follow_redirects=False,
+        )
+    finally:
+        app.state.oidc_verifier = saved_verifier
+
+    token_count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.api_token WHERE principal_idx = $1", pidx
+    )
+    code_count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.cli_login_code WHERE principal_idx = $1", pidx
+    )
+    mint_audit_count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.auth_event WHERE principal_idx = $1 AND event_type = $2",
+        pidx,
+        AuthEventType.TOKEN_MINT,
+    )
+    actual = (resp.status_code, token_count, code_count, mint_audit_count)
+    expected = (500, 0, 0, 0)
+    assert actual == expected
+
+
+async def test_handoff_cli_rolls_back_when_cli_login_code_insert_fails(
+    auth_client, postgres_pool, jwks_harness, monkeypatch, fail_safe_client
+):
+    """CLI handoff: if the cli_login_code INSERT fails (here, a duplicate
+    ot_code primary key), the PAT mint and its TOKEN_MINT audit row must both
+    roll back — the user is never left with a token + audit but no redeemable
+    login code. This exercises the failure mode unique to the handoff route:
+    the cli_login_code write."""
+    from qiita_control_plane.auth.token import mint_api_token
+    from qiita_control_plane.main import app
+
+    pidx = await _seed_user(
+        postgres_pool,
+        email="rollback-handoff-otcode@example.com",
+        issuer=jwks_harness.issuer,
+        subject="rollback-handoff-otcode",
+    )
+    _track(auth_client, pidx)
+
+    # Pre-occupy an ot_code so the route's INSERT collides on the PK. The
+    # squatting row needs a valid principal + token to satisfy its FKs.
+    _, squat_token_idx = await mint_api_token(
+        postgres_pool,
+        principal_idx=pidx,
+        label="otcode-squatter",
+        scopes=[Scope.SELF_TOKEN],
+    )
+    collide_hash = b"\x42" * 32
+    await postgres_pool.execute(
+        "INSERT INTO qiita.cli_login_code"
+        "  (ot_code, principal_idx, token_idx, plaintext_pat, expires_at)"
+        " VALUES ($1, $2, $3, $4, now() + interval '1 hour')",
+        collide_hash,
+        pidx,
+        squat_token_idx,
+        "squatter-pat",
+    )
+
+    # Force the route to generate the already-taken ot_code.
+    monkeypatch.setattr(
+        "qiita_control_plane.routes.auth.generate_ot_code",
+        lambda: ("collide-plaintext", collide_hash),
+    )
+
+    saved_verifier = app.state.oidc_verifier
+    app.state.oidc_verifier = _lr_verifier(jwks_harness)
+    try:
+        token = jwks_harness.sign(
+            _lr_claims(
+                jwks_harness,
+                sub="rollback-handoff-otcode",
+                email="rollback-handoff-otcode@example.com",
+            )
+        )
+        cookie = _make_login_cookie(cli=True, port=16002)
+        resp = await fail_safe_client.get(
+            f"/api/v1/auth/handoff?token={token}",
+            cookies=_cookie_jar(cookie),
+            follow_redirects=False,
+        )
+    finally:
+        app.state.oidc_verifier = saved_verifier
+
+    # Only the squatter token + the pre-seeded code remain; the handoff's
+    # mint, audit, and cli_login_code INSERT all rolled back together.
+    token_count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.api_token WHERE principal_idx = $1", pidx
+    )
+    code_count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.cli_login_code WHERE principal_idx = $1", pidx
+    )
+    mint_audit_count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.auth_event WHERE principal_idx = $1 AND event_type = $2",
+        pidx,
+        AuthEventType.TOKEN_MINT,
+    )
+    actual = (resp.status_code, token_count, code_count, mint_audit_count)
+    expected = (500, 1, 1, 0)
     assert actual == expected

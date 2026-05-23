@@ -31,6 +31,7 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.BIOSAMPLE_READ,
             Scope.BIOSAMPLE_WRITE,
             Scope.PREP_SAMPLE_READ,
+            Scope.PREP_SAMPLE_WRITE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
         }

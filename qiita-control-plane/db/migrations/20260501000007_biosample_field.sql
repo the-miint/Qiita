@@ -48,11 +48,11 @@ CREATE TABLE qiita.biosample_global_field (
 );
 
 COMMENT ON TABLE qiita.biosample_global_field IS
-    'Global concept registry. internal_name is the stable cross-study query identifier; '
+    'Global field registry. internal_name is the stable cross-study query identifier; '
     'display_name is the default human-readable label used as a fallback when a study '
     'has not provided its own label. data_type, terminology_idx, default_tier, and '
     'required are owned at the global level and apply uniformly to every study that '
-    'links to this concept; per-study disagreement on these properties is forbidden '
+    'links to this global field; per-study disagreement on these properties is forbidden '
     'so that cross-study reads remain sound.';
 
 COMMENT ON COLUMN qiita.biosample_global_field.internal_name IS
@@ -105,7 +105,7 @@ CREATE TABLE qiita.biosample_study_field (
 COMMENT ON TABLE qiita.biosample_study_field IS
     'Per-study field definitions. May be linked to a biosample_global_field, in which '
     'case data_type, terminology_idx, tier_override, and required are all owned by the '
-    'global concept and must be NULL on this row. Only display_name and description '
+    'global field and must be NULL on this row. Only display_name and description '
     'may be overridden per-study on linked rows, as cosmetic presentation for that '
     'study''s own users. Unlinked rows are purely study-local and carry their own type, '
     'terminology, tier, and required policy.';
@@ -120,7 +120,7 @@ CREATE INDEX biosample_study_field_global_link_idx
 -- BIOSAMPLE GLOBAL FIELD SEED
 -- =============================================================================
 --
--- Bootstraps the cross-study biosample concept registry with the minimum set
+-- Bootstraps the cross-study biosample global-field registry with the minimum set
 -- of fields every biosample needs in order to be submittable to BioSample.
 -- created_by_idx = 1 names the seeded system principal (SYSTEM_PRINCIPAL_IDX).
 -- ON CONFLICT DO NOTHING keeps the seed re-runnable: if dbmate's tracking row

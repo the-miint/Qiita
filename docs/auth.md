@@ -256,6 +256,25 @@ The hierarchical claim is enforced by a unit test (`test_role_ceilings_are_hiera
 
 Guards compose: a route can `Depends(require_role_at_least("system_admin"))` AND `Depends(require_scope("admin:user"))` AND `Depends(require_human)` simultaneously. FastAPI dedupes the underlying `get_current_principal` call across deps in one request.
 
+### Resource-access guards
+
+Beyond the kind / role / scope guards above, `auth.guards` carries resource-access guards that consult the DB to evaluate the caller's relationship to a specific resource named in the path or body. Each takes a `bypass_role` (default `WET_LAB_ADMIN` for the authoring guards, `SYSTEM_ADMIN` for `require_study_access`) — a caller at or above the bypass role passes with no DB lookup.
+
+| Guard | Predicate |
+|---|---|
+| `require_study_access(min_tier, bypass_role)` | factory; caller's tier on the path's `study_idx` ≥ `min_tier`. Study owner bypasses the tier comparison; `min_tier=None` resolves to the study's `default_tier`. |
+| `require_caller_owns_run(bypass_role)` | factory; `sequencing_run.created_by_idx == caller`. |
+| `require_caller_owns_pool(bypass_role)` | factory; `sequenced_pool.created_by_idx == caller`. |
+| `require_caller_has_admin_on_all_studies(...)` | body-time helper (not a `Depends`); caller has `Tier.ADMIN` (or owns, or bypasses) on **every** study in a list — used where the studies come from the request body, not the path. |
+
+**The authoring routes deliberately use three different shapes**, because the resources differ in what "ownership" means:
+
+- **biosample POST** (`/study/{idx}/biosample`) — `require_study_access(min_tier=ADMIN)`. A biosample is study-scoped; the natural gate is tier-on-that-study.
+- **sequencing-run POST** — no resource gate at all (only scope + complete-profile). A run is an instrument-level container with no parent resource to inherit access from; any user who can write prep-samples may stand one up.
+- **sequenced-pool / sequenced-sample POST** — `require_caller_owns_run` / `require_caller_owns_pool` (caller-creator), because a run/pool has a creator but no tier surface; the sample composer additionally runs `require_caller_has_admin_on_all_studies` over the body's primary + secondary studies.
+
+prep_sample-scoped **work-ticket** submission reuses the same per-study ADMIN check (`_check_prep_sample_study_access` walks the prep_sample's non-retired study links). All four paths bypass at `wet_lab_admin`, so the operator experience is uniform even though the user-facing predicate differs per route.
+
 ### Token-vs-OIDC scope source
 
 The token path returns the token's **own** `scopes` frozenset (whatever the mint stored). The OIDC path (no token; bearer is a fresh JWT) hands back the **role's full ceiling** — `POST /auth/pat` is the route that narrows this when it mints a PAT. Per-request bearers always carry their own scope set via the token path.

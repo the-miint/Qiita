@@ -145,10 +145,10 @@ async def no_prep_sample_read_client(make_pat_client):
 
 @pytest_asyncio.fixture
 async def regular_user_with_prep_sample_write_client(make_pat_client):
-    """A regular_user PAT that *does* carry Scope.PREP_SAMPLE_WRITE so the
-    require_scope gate passes and the require_role_at_least(WET_LAB_ADMIN)
-    gate is what trips. PREP_SAMPLE_WRITE is outside the USER role ceiling
-    by policy; mint_api_token only validates against VALID_SCOPES."""
+    """A regular_user PAT scoped to only SELF_PROFILE + PREP_SAMPLE_WRITE.
+
+    Use when a test needs the *minimal* scope set to reach a downstream
+    gate; the standard `ctx["user"]` client carries the full USER ceiling."""
     return await make_pat_client(
         label="user-with-prep-sample-write",
         scopes=[Scope.SELF_PROFILE, Scope.PREP_SAMPLE_WRITE],
@@ -160,6 +160,41 @@ def unique_instrument_id(prefix: str) -> str:
     prefix. Used by every test that seeds a sequencing_run so the unique
     constraint never collides across parallel test runs."""
     return f"{prefix}-{secrets.token_hex(6)}"
+
+
+# ---------------------------------------------------------------------------
+# Shared study-access fixtures and helpers
+# ---------------------------------------------------------------------------
+# The study-scoped roster reads (biosample and sequenced-sample list-idxs)
+# share the same require_scope(STUDY_READ) gate and the same study_access
+# seeding, so the missing-scope client and the grant helper live here
+# instead of being redefined per file.
+
+
+@pytest_asyncio.fixture
+async def no_study_read_client(make_pat_client):
+    """A regular_user PAT with a scope set that EXCLUDES Scope.STUDY_READ so
+    the require_scope guard's missing-scope 403 surfaces on the study-scoped
+    list-idxs routes."""
+    return await make_pat_client(label="no-study-read", scopes=[Scope.SELF_PROFILE])
+
+
+async def _grant_study_access(ctx, *, study_idx, principal_idx, tier, granted_by_idx):
+    """Insert a study_access row at the named tier; track for cleanup.
+
+    Appends (study_idx, principal_idx) to ctx['created']['study_access'];
+    the consuming file's _cleanup_tracked deletes those rows before its
+    own study delete.
+    """
+    await ctx["pool"].execute(
+        "INSERT INTO qiita.study_access (study_idx, principal_idx, access_tier, granted_by_idx)"
+        " VALUES ($1, $2, $3::qiita.tier, $4)",
+        study_idx,
+        principal_idx,
+        tier,
+        granted_by_idx,
+    )
+    ctx["created"]["study_access"].append((study_idx, principal_idx))
 
 
 # ---------------------------------------------------------------------------

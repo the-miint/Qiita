@@ -52,6 +52,19 @@ from qiita_common.models import (
 NATIVE_MODULE_PREFIX = "qiita_compute_orchestrator.jobs."
 
 
+# action_context property keys that name a fastq file path. The
+# fastq-to-parquet action declares them in its context_schema (see
+# workflows/fastq-to-parquet/1.0.0.yaml) and the orchestrator's
+# fastq_to_parquet job binds them as Inputs fields. Defined here, beside
+# the action contract, so the control plane's work_ticket submit gate
+# tests action_context against one canonical set instead of re-typing
+# the strings — a key renamed in the YAML then lights up its importers
+# rather than silently drifting. The gate enforces that each such path's
+# basename is prefixed by the prep_sample's sequenced_pool_item_id (see
+# docs/runbooks/user-cli-quickstart.md).
+FASTQ_PATH_CONTEXT_KEYS: tuple[str, str] = ("fastq_path", "reverse_fastq_path")
+
+
 class Audience(BaseModel):
     """Who may invoke this action — answers "may invoke", not "may execute".
 

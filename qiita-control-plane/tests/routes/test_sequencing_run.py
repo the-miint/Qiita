@@ -1,9 +1,11 @@
 """Integration tests for POST /api/v1/sequencing-run.
 
-Exercises wet_lab_admin and system_admin happy paths, the role / scope
-guards, regular-user role rejection, Pydantic body validation, and the
-instrument_run_id uniqueness collision mapping (409 with the human-readable
-detail).
+Exercises the wet_lab_admin and system_admin happy paths plus a
+regular-user happy path (no system_role gate on this route — the USER
+ceiling covers prep_sample:write and run creation carries no further
+auth), the scope guard, anonymous 401, Pydantic body validation, and
+the instrument_run_id uniqueness collision mapping (409 with the
+human-readable detail).
 """
 
 import json
@@ -179,24 +181,27 @@ async def test_create_sequencing_run_missing_scope_403(ctx, no_prep_sample_write
     assert "prep_sample:write" in resp.json()["detail"]
 
 
-async def test_create_sequencing_run_regular_user_role_403(
-    ctx, regular_user_with_prep_sample_write_client
-):
-    # Regular user (system_role=user) holding an explicit
-    # PREP_SAMPLE_WRITE-bearing PAT: require_scope passes, but
-    # require_role_at_least(WET_LAB_ADMIN) rejects with 403. The user's
-    # session-fixture token does not carry PREP_SAMPLE_WRITE (the USER
-    # role ceiling excludes it), so this fixture mints a PAT directly to
-    # exercise the role gate independently of the scope gate.
-    resp = await regular_user_with_prep_sample_write_client.post(
-        _ROUTE,
-        json={
-            "instrument_run_id": unique_instrument_id("USER"),
-            "platform": "illumina",
-        },
+async def test_create_sequencing_run_regular_user_passes(ctx):
+    # Regular user (system_role=user) using their session-fixture
+    # OIDC-resolved token: prep_sample:write is now part of the USER role
+    # ceiling, and the route no longer composes require_role_at_least —
+    # so a vanilla user can stand up a run. Downstream pool / sample
+    # routes enforce caller-creator semantics from this point on.
+    resp = await _post_run(
+        ctx["user"],
+        ctx,
+        instrument_run_id=unique_instrument_id("USER"),
+        platform="illumina",
     )
-    assert resp.status_code == 403
-    assert "wet_lab_admin" in resp.json()["detail"]
+    assert resp.status_code == 201, resp.text
+    # Pin caller-creator semantics for the downstream pool/sample routes:
+    # the resulting run's created_by_idx equals the regular-user principal,
+    # so a subsequent pool POST by this user satisfies require_caller_owns_run.
+    created_by = await ctx["pool"].fetchval(
+        "SELECT created_by_idx FROM qiita.sequencing_run WHERE idx = $1",
+        resp.json()["sequencing_run_idx"],
+    )
+    assert created_by == ctx["user_session"]["principal_idx"]
 
 
 # ===========================================================================

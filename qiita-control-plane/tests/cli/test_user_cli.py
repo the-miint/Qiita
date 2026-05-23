@@ -255,8 +255,6 @@ def test_study_create_passes_through_optional_fields(monkeypatch):
             "NIH",
             "--ebi-study-accession",
             "PRJEB99999",
-            "--vamps-id",
-            "VAMPS-1",
             "--notes",
             "note",
             "--principal-investigator-idx",
@@ -273,7 +271,6 @@ def test_study_create_passes_through_optional_fields(monkeypatch):
         "abstract": "abs",
         "funding": "NIH",
         "ebi_study_accession": "PRJEB99999",
-        "vamps_id": "VAMPS-1",
         "notes": "note",
         "principal_investigator_idx": 5,
         "default_tier": "member",
@@ -327,6 +324,1073 @@ def test_profile_set_pydantic_validation_error_exits_2(capsys):
     err = capsys.readouterr().err
     assert "invalid UserUpdate" in err
     assert "orcid" in err
+
+
+# ---------------------------------------------------------------------------
+# Shared request-stub helper (used by every HTTP subcommand test below)
+# ---------------------------------------------------------------------------
+
+
+def _stub_post(
+    monkeypatch,
+    captured: dict,
+    *,
+    response_json: dict,
+    status: int = 201,
+    whoami_idx: int | None = None,
+):
+    """Patch `_common.httpx.request` to capture every call and return canned
+    responses. Each call appends to `captured['requests']` (full list); the
+    last call's fields also land flat on `captured` (method/url/json/auth)
+    so single-call tests can assert on `captured['url']` etc. without
+    indexing.
+
+    When `whoami_idx` is supplied, a GET to `/auth/whoami` returns
+    `{"kind": "human", "principal_idx": whoami_idx}` (used by handlers
+    that auto-default --owner-idx). Every other request returns
+    `response_json` with HTTP `status`.
+    """
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured.setdefault("requests", [])
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        record = {
+            "method": method,
+            "url": url,
+            "auth": headers["Authorization"],
+            "json": json,
+        }
+        captured["requests"].append(record)
+        # Flat-shape mirror — last-wins so single-POST tests read the POST,
+        # whoami-then-POST tests still see the POST as the "current" record.
+        captured.update(record)
+        if url.endswith("/auth/whoami"):
+            assert whoami_idx is not None, (
+                "test triggered whoami without supplying whoami_idx in the stub"
+            )
+            return _httpx.Response(
+                200,
+                json={"kind": "human", "principal_idx": whoami_idx},
+                request=_httpx.Request(method, url),
+            )
+        return _httpx.Response(status, json=response_json, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+
+# Canned response_json bodies for the resource creates. Hoisted out of the
+# individual tests so a schema-rename only touches one site.
+_BIOSAMPLE_CREATE_RESPONSE = {
+    "biosample_idx": 99,
+    "owner_id_biosample_study_field_idx": 5,
+    "owner_id_biosample_study_field_created": True,
+}
+_SEQUENCED_SAMPLE_CREATE_RESPONSE = {
+    "prep_sample_idx": 100,
+    "sequenced_sample_idx": 200,
+}
+
+
+# ---------------------------------------------------------------------------
+# biosample create
+# ---------------------------------------------------------------------------
+
+
+def test_biosample_create_defaults_owner_idx_to_caller(monkeypatch):
+    """When --owner-idx is omitted, the handler resolves the caller's
+    principal_idx via whoami and uses that as owner_idx on the POST body."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_CREATE_RESPONSE, whoami_idx=42)
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "biosample",
+            "create",
+            "--study-idx",
+            "7",
+            "--owner-biosample-id-field-name",
+            "owner_sample_id",
+            "--owner-biosample-id-value",
+            "SMK-001",
+        ]
+    )
+    assert rc == 0
+    # whoami first (to resolve owner), then the actual POST.
+    assert [r["method"] for r in captured["requests"]] == ["GET", "POST"]
+    whoami_req, post_req = captured["requests"]
+    assert whoami_req["url"].endswith("/api/v1/auth/whoami")
+    assert post_req["url"] == "https://q.example.test/api/v1/study/7/biosample"
+    # Unset --metadata stays absent on the wire (default=None → not None
+    # filter drops it); server's default_factory=dict fills the model.
+    assert post_req["json"] == {
+        "owner_idx": 42,
+        "owner_biosample_id_field_name": "owner_sample_id",
+        "owner_biosample_id_value": "SMK-001",
+    }
+
+
+def test_biosample_create_explicit_owner_idx_skips_whoami(monkeypatch):
+    """When --owner-idx is supplied, no whoami round-trip — the caller
+    is acting on someone else's behalf (lab-tech-on-behalf path)."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_CREATE_RESPONSE)
+
+    rc = main(
+        [
+            "biosample",
+            "create",
+            "--study-idx",
+            "7",
+            "--owner-idx",
+            "11",
+            "--owner-biosample-id-field-name",
+            "owner_sample_id",
+            "--owner-biosample-id-value",
+            "SMK-002",
+        ]
+    )
+    assert rc == 0
+    assert [r["method"] for r in captured["requests"]] == ["POST"]
+    assert captured["requests"][0]["json"]["owner_idx"] == 11
+
+
+def test_biosample_create_metadata_pairs_become_dict(monkeypatch):
+    """Repeated --metadata KEY=VALUE collects into a dict on the wire,
+    keyed verbatim on the user-supplied display_name strings."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_CREATE_RESPONSE, whoami_idx=42)
+
+    rc = main(
+        [
+            "biosample",
+            "create",
+            "--study-idx",
+            "7",
+            "--owner-biosample-id-field-name",
+            "owner_sample_id",
+            "--owner-biosample-id-value",
+            "SMK-001",
+            "--metadata",
+            "host_subject_id=mouse-1",
+            "--metadata",
+            "collection_date=2026-05-19",
+        ]
+    )
+    assert rc == 0
+    assert captured["requests"][-1]["json"]["metadata"] == {
+        "host_subject_id": "mouse-1",
+        "collection_date": "2026-05-19",
+    }
+
+
+def test_biosample_create_passes_through_optional_fields(monkeypatch):
+    """metadata_checklist_idx and biosample_accession flow into the body
+    when supplied; ena_sample_accession stays absent (not exposed)."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_BIOSAMPLE_CREATE_RESPONSE, whoami_idx=42)
+
+    rc = main(
+        [
+            "biosample",
+            "create",
+            "--study-idx",
+            "7",
+            "--owner-biosample-id-field-name",
+            "owner_sample_id",
+            "--owner-biosample-id-value",
+            "SMK-001",
+            "--metadata-checklist-idx",
+            "3",
+            "--biosample-accession",
+            "SAMN12345678",
+        ]
+    )
+    assert rc == 0
+    body = captured["requests"][-1]["json"]
+    assert body["metadata_checklist_idx"] == 3
+    assert body["biosample_accession"] == "SAMN12345678"
+    assert "ena_sample_accession" not in body
+
+
+def test_biosample_create_requires_required_flags(capsys):
+    """Missing any of --study-idx / --owner-biosample-id-field-name /
+    --owner-biosample-id-value should produce an argparse error (exit 2)."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["biosample", "create"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--study-idx" in err
+
+
+def test_biosample_create_rejects_malformed_metadata(capsys):
+    """A --metadata entry without '=' is a typo, not a key with empty
+    value; reject loudly via parser.error (exit 2)."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "biosample",
+                "create",
+                "--study-idx",
+                "7",
+                "--owner-biosample-id-field-name",
+                "owner_sample_id",
+                "--owner-biosample-id-value",
+                "SMK-001",
+                "--metadata",
+                "no_equals_sign",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--metadata" in err
+    assert "missing '='" in err
+
+
+def test_biosample_create_rejects_duplicate_metadata_key(capsys):
+    """Duplicate --metadata KEY entries are almost always a typo; reject
+    rather than silently last-wins."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "biosample",
+                "create",
+                "--study-idx",
+                "7",
+                "--owner-biosample-id-field-name",
+                "owner_sample_id",
+                "--owner-biosample-id-value",
+                "SMK-001",
+                "--metadata",
+                "k=v1",
+                "--metadata",
+                "k=v2",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--metadata" in err
+    assert "repeated" in err
+
+
+# ---------------------------------------------------------------------------
+# sequencing-run create
+# ---------------------------------------------------------------------------
+
+
+def test_sequencing_run_create_minimal(monkeypatch):
+    """Only --instrument-run-id + --platform should be necessary; optional
+    columns stay absent so the server's defaults apply."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json={"sequencing_run_idx": 4})
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "sequencing-run",
+            "create",
+            "--instrument-run-id",
+            "240301_MN12345_0001_AAATEST",
+            "--platform",
+            "illumina",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://q.example.test/api/v1/sequencing-run"
+    assert captured["json"] == {
+        "instrument_run_id": "240301_MN12345_0001_AAATEST",
+        "platform": "illumina",
+    }
+
+
+def test_sequencing_run_create_passes_through_optional_fields(monkeypatch):
+    """All optional flags surface verbatim in the body. --extra-metadata
+    is parsed from JSON into a dict before send."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json={"sequencing_run_idx": 4})
+
+    rc = main(
+        [
+            "sequencing-run",
+            "create",
+            "--instrument-run-id",
+            "240301_MN12345_0001_AAATEST",
+            "--platform",
+            "oxford_nanopore",
+            "--instrument-model",
+            "MinION Mk1C",
+            "--instrument-serial",
+            "MN12345",
+            "--run-performed-at",
+            "2026-05-19T15:30:00Z",
+            "--extra-metadata",
+            '{"chemistry":"R10.4.1"}',
+        ]
+    )
+    assert rc == 0
+    assert captured["json"] == {
+        "instrument_run_id": "240301_MN12345_0001_AAATEST",
+        "platform": "oxford_nanopore",
+        "instrument_model": "MinION Mk1C",
+        "instrument_serial": "MN12345",
+        # Pydantic normalizes the trailing Z to +00:00 on AwareDatetime round-trip
+        "run_performed_at": "2026-05-19T15:30:00Z",
+        "extra_metadata": {"chemistry": "R10.4.1"},
+    }
+
+
+def test_sequencing_run_create_requires_instrument_run_id_and_platform(capsys):
+    """Argparse should refuse the call without the two required flags."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["sequencing-run", "create"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--instrument-run-id" in err
+
+
+def test_sequencing_run_create_rejects_unknown_platform(capsys):
+    """choices= guards a typo in --platform before any HTTP round-trip."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "sequencing-run",
+                "create",
+                "--instrument-run-id",
+                "X",
+                "--platform",
+                "iontorrent",  # missing underscore
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--platform" in err
+
+
+def test_sequencing_run_create_rejects_malformed_extra_metadata(capsys):
+    """Non-JSON --extra-metadata exits 2 via parser.error rather than a
+    JSONDecodeError traceback."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "sequencing-run",
+                "create",
+                "--instrument-run-id",
+                "X",
+                "--platform",
+                "illumina",
+                "--extra-metadata",
+                "{not-json",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--extra-metadata" in err
+    assert "not valid JSON" in err
+
+
+def test_sequencing_run_create_rejects_non_object_extra_metadata(capsys):
+    """--extra-metadata must be a JSON object (matches the JSONB-on-server
+    convention). A bare array or scalar should fail fast."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "sequencing-run",
+                "create",
+                "--instrument-run-id",
+                "X",
+                "--platform",
+                "illumina",
+                "--extra-metadata",
+                "[1, 2, 3]",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--extra-metadata" in err
+    assert "JSON object" in err
+
+
+# ---------------------------------------------------------------------------
+# sequenced-pool create
+# ---------------------------------------------------------------------------
+
+
+def test_sequenced_pool_create_minimal_no_preflight(monkeypatch):
+    """No --run-preflight-blob / --run-preflight-filename means a pool
+    with no preflight; valid after PR #44 made the pair optional."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json={"sequenced_pool_idx": 9})
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "sequenced-pool",
+            "create",
+            "--run-idx",
+            "4",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://q.example.test/api/v1/sequencing-run/4/sequenced-pool"
+    # extra_metadata=None gets stripped by exclude_unset; nothing else to send.
+    assert captured["json"] == {}
+
+
+def test_sequenced_pool_create_with_preflight_blob_and_explicit_filename(monkeypatch, tmp_path):
+    """--run-preflight-blob reads bytes from the file, --run-preflight-filename
+    overrides the auto-default."""
+    import base64
+
+    from qiita_control_plane.cli.user import main
+
+    blob_path = tmp_path / "RunPreflight.db"
+    blob_bytes = b"fake-sqlite-preflight-content"
+    blob_path.write_bytes(blob_bytes)
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json={"sequenced_pool_idx": 9})
+
+    rc = main(
+        [
+            "sequenced-pool",
+            "create",
+            "--run-idx",
+            "4",
+            "--run-preflight-blob",
+            str(blob_path),
+            "--run-preflight-filename",
+            "uploaded.db",
+        ]
+    )
+    assert rc == 0
+    body = captured["json"]
+    assert body["run_preflight_filename"] == "uploaded.db"
+    # On the wire, Pydantic re-encodes the bytes as base64.
+    assert body["run_preflight_blob"] == base64.b64encode(blob_bytes).decode("ascii")
+
+
+def test_sequenced_pool_create_defaults_filename_from_blob_path(monkeypatch, tmp_path):
+    """When --run-preflight-filename is omitted, the handler defaults it to
+    the basename of --run-preflight-blob so a half-populated pair never
+    reaches the wire."""
+    from qiita_control_plane.cli.user import main
+
+    blob_path = tmp_path / "RunPreflight.db"
+    blob_path.write_bytes(b"x")
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json={"sequenced_pool_idx": 9})
+
+    rc = main(
+        [
+            "sequenced-pool",
+            "create",
+            "--run-idx",
+            "4",
+            "--run-preflight-blob",
+            str(blob_path),
+        ]
+    )
+    assert rc == 0
+    assert captured["json"]["run_preflight_filename"] == "RunPreflight.db"
+
+
+def test_sequenced_pool_create_refuses_filename_without_blob(capsys):
+    """A half-populated pair would be a 422 server-side; refuse before HTTP."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "sequenced-pool",
+                "create",
+                "--run-idx",
+                "4",
+                "--run-preflight-filename",
+                "stranded.db",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--run-preflight-filename" in err
+    assert "--run-preflight-blob" in err
+
+
+def test_sequenced_pool_create_refuses_missing_blob_file(capsys, tmp_path):
+    """A --run-preflight-blob path that doesn't exist fails before HTTP."""
+    from qiita_control_plane.cli.user import main
+
+    missing = tmp_path / "not-there.db"
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "sequenced-pool",
+                "create",
+                "--run-idx",
+                "4",
+                "--run-preflight-blob",
+                str(missing),
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--run-preflight-blob" in err
+    assert "not a regular file" in err
+
+
+def test_sequenced_pool_create_refuses_empty_blob_file(capsys, tmp_path):
+    """An empty file would trip the model's min_length=1; surface as a
+    clean argparse error."""
+    from qiita_control_plane.cli.user import main
+
+    blob_path = tmp_path / "empty.db"
+    blob_path.write_bytes(b"")
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "sequenced-pool",
+                "create",
+                "--run-idx",
+                "4",
+                "--run-preflight-blob",
+                str(blob_path),
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "is empty" in err
+
+
+def test_sequenced_pool_create_requires_run_idx(capsys):
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["sequenced-pool", "create"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--run-idx" in err
+
+
+# ---------------------------------------------------------------------------
+# sequenced-sample create
+# ---------------------------------------------------------------------------
+
+
+def test_sequenced_sample_create_minimal_with_caller_owner(monkeypatch):
+    """Owner defaults to the caller via whoami; primary-only (no secondary
+    studies, no metadata, no checklist) sends the smallest valid body."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch, captured, response_json=_SEQUENCED_SAMPLE_CREATE_RESPONSE, whoami_idx=42
+    )
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "sequenced-sample",
+            "create",
+            "--run-idx",
+            "4",
+            "--pool-idx",
+            "9",
+            "--biosample-idx",
+            "55",
+            "--prep-protocol-idx",
+            "3",
+            "--pool-item-id",
+            "WELL-A1",
+            "--primary-study-idx",
+            "7",
+        ]
+    )
+    assert rc == 0
+    assert [r["method"] for r in captured["requests"]] == ["GET", "POST"]
+    post = captured["requests"][1]
+    assert post["url"] == (
+        "https://q.example.test/api/v1/sequencing-run/4/sequenced-pool/9/sequenced-sample"
+    )
+    # --metadata stays absent (default=None → filtered, server fills {}).
+    # secondary_study_idxs always lands on the wire because the model's
+    # dedupe_secondary_study_idxs validator reassigns it, marking the field
+    # as "set" even when the caller didn't pass --secondary-study-idx.
+    assert post["json"] == {
+        "biosample_idx": 55,
+        "prep_protocol_idx": 3,
+        "owner_idx": 42,
+        "sequenced_pool_item_id": "WELL-A1",
+        "primary_study_idx": 7,
+        "secondary_study_idxs": [],
+    }
+
+
+def test_sequenced_sample_create_with_secondary_studies_and_metadata(monkeypatch):
+    """Repeated --secondary-study-idx accumulates into a list; metadata
+    KEY=VALUE entries collect into a dict."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch, captured, response_json=_SEQUENCED_SAMPLE_CREATE_RESPONSE, whoami_idx=42
+    )
+
+    rc = main(
+        [
+            "sequenced-sample",
+            "create",
+            "--run-idx",
+            "4",
+            "--pool-idx",
+            "9",
+            "--biosample-idx",
+            "55",
+            "--prep-protocol-idx",
+            "3",
+            "--pool-item-id",
+            "WELL-A1",
+            "--primary-study-idx",
+            "7",
+            "--secondary-study-idx",
+            "8",
+            "--secondary-study-idx",
+            "12",
+            "--metadata",
+            "library_prep_kit=Nextera XT",
+            "--metadata",
+            "barcode=AAGCTT",
+        ]
+    )
+    assert rc == 0
+    body = captured["requests"][-1]["json"]
+    assert body["secondary_study_idxs"] == [8, 12]
+    assert body["metadata"] == {
+        "library_prep_kit": "Nextera XT",
+        "barcode": "AAGCTT",
+    }
+
+
+def test_sequenced_sample_create_explicit_owner_skips_whoami(monkeypatch):
+    """When --owner-idx is supplied, no whoami round-trip — the caller is
+    acting on someone else's behalf."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_SEQUENCED_SAMPLE_CREATE_RESPONSE)
+
+    rc = main(
+        [
+            "sequenced-sample",
+            "create",
+            "--run-idx",
+            "4",
+            "--pool-idx",
+            "9",
+            "--biosample-idx",
+            "55",
+            "--prep-protocol-idx",
+            "3",
+            "--owner-idx",
+            "11",
+            "--pool-item-id",
+            "WELL-A1",
+            "--primary-study-idx",
+            "7",
+        ]
+    )
+    assert rc == 0
+    assert [r["method"] for r in captured["requests"]] == ["POST"]
+    assert captured["requests"][0]["json"]["owner_idx"] == 11
+
+
+def test_sequenced_sample_create_metadata_checklist_passes_through(monkeypatch):
+    """--metadata-checklist-idx flows verbatim; ENA accession fields stay
+    absent regardless (not exposed)."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch, captured, response_json=_SEQUENCED_SAMPLE_CREATE_RESPONSE, whoami_idx=42
+    )
+
+    rc = main(
+        [
+            "sequenced-sample",
+            "create",
+            "--run-idx",
+            "4",
+            "--pool-idx",
+            "9",
+            "--biosample-idx",
+            "55",
+            "--prep-protocol-idx",
+            "3",
+            "--pool-item-id",
+            "WELL-A1",
+            "--primary-study-idx",
+            "7",
+            "--metadata-checklist-idx",
+            "2",
+        ]
+    )
+    assert rc == 0
+    body = captured["requests"][-1]["json"]
+    assert body["metadata_checklist_idx"] == 2
+    assert "ena_experiment_accession" not in body
+    assert "ena_run_accession" not in body
+
+
+def test_sequenced_sample_create_requires_required_flags(capsys):
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["sequenced-sample", "create"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    # argparse names the first missing required flag in its standard error
+    # message; just check one of ours is mentioned so the test isn't tied
+    # to argparse's choice of "which one".
+    assert "required" in err
+    assert "--run-idx" in err or "--pool-idx" in err or "--biosample-idx" in err
+
+
+def test_sequenced_sample_create_rejects_primary_in_secondary(monkeypatch, capsys):
+    """The model's primary-in-secondary validator fires client-side via
+    _build_body and surfaces as a parser.error."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch, captured, response_json=_SEQUENCED_SAMPLE_CREATE_RESPONSE, whoami_idx=42
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "sequenced-sample",
+                "create",
+                "--run-idx",
+                "4",
+                "--pool-idx",
+                "9",
+                "--biosample-idx",
+                "55",
+                "--prep-protocol-idx",
+                "3",
+                "--pool-item-id",
+                "WELL-A1",
+                "--primary-study-idx",
+                "7",
+                "--secondary-study-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "invalid SequencedSampleCreateRequest" in err
+    assert "primary_study_idx" in err
+
+
+# ---------------------------------------------------------------------------
+# ticket submit
+# ---------------------------------------------------------------------------
+
+
+def test_ticket_submit_minimal_prep_sample_scope(monkeypatch):
+    """--prep-sample-idx is the smoke-flow convenience; constructs the
+    scope_target dict and POSTs an action_context of {} by default."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"work_ticket_idx": 12, "state": "pending"},
+        status=202,
+    )
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "ticket",
+            "submit",
+            "--action-id",
+            "fastq-to-parquet",
+            "--action-version",
+            "1.0.0",
+            "--prep-sample-idx",
+            "55",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "POST"
+    assert captured["url"] == "https://q.example.test/api/v1/work-ticket"
+    assert captured["json"] == {
+        "action_id": "fastq-to-parquet",
+        "action_version": "1.0.0",
+        "scope_target": {"kind": "prep_sample", "prep_sample_idx": 55},
+    }
+
+
+def test_ticket_submit_with_context_json(monkeypatch):
+    """A paired-end --context-json is parsed before POST; both fastq paths
+    land on the wire as action_context."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"work_ticket_idx": 12, "state": "pending"},
+        status=202,
+    )
+
+    rc = main(
+        [
+            "ticket",
+            "submit",
+            "--action-id",
+            "fastq-to-parquet",
+            "--action-version",
+            "1.0.0",
+            "--prep-sample-idx",
+            "55",
+            "--context-json",
+            '{"fastq_path": "/scratch/filename_prefix_R1.fastq",'
+            ' "reverse_fastq_path": "/scratch/filename_prefix_R2.fastq"}',
+        ]
+    )
+    assert rc == 0
+    assert captured["json"]["action_context"] == {
+        "fastq_path": "/scratch/filename_prefix_R1.fastq",
+        "reverse_fastq_path": "/scratch/filename_prefix_R2.fastq",
+    }
+
+
+def test_ticket_submit_with_scope_target_json(monkeypatch):
+    """--scope-target-json is the escape hatch for non-prep_sample scopes."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"work_ticket_idx": 12, "state": "pending"},
+        status=202,
+    )
+
+    rc = main(
+        [
+            "ticket",
+            "submit",
+            "--action-id",
+            "reference-add",
+            "--action-version",
+            "1.0.0",
+            "--scope-target-json",
+            '{"kind": "reference", "reference_idx": 8}',
+        ]
+    )
+    assert rc == 0
+    assert captured["json"]["scope_target"] == {"kind": "reference", "reference_idx": 8}
+
+
+def test_ticket_submit_requires_a_scope_target(capsys):
+    """The mutex group is required=True; neither flag → exit 2."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "ticket",
+                "submit",
+                "--action-id",
+                "fastq-to-parquet",
+                "--action-version",
+                "1.0.0",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--prep-sample-idx" in err or "--scope-target-json" in err
+
+
+def test_ticket_submit_rejects_both_scope_target_forms(capsys):
+    """The mutex group rejects supplying both flags."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "ticket",
+                "submit",
+                "--action-id",
+                "fastq-to-parquet",
+                "--action-version",
+                "1.0.0",
+                "--prep-sample-idx",
+                "55",
+                "--scope-target-json",
+                '{"kind": "reference", "reference_idx": 8}',
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "not allowed" in err
+
+
+def test_ticket_submit_rejects_malformed_context_json(capsys):
+    """Malformed --context-json exits 2 via parser.error rather than a
+    JSONDecodeError traceback."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "ticket",
+                "submit",
+                "--action-id",
+                "fastq-to-parquet",
+                "--action-version",
+                "1.0.0",
+                "--prep-sample-idx",
+                "55",
+                "--context-json",
+                "{not-json",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--context-json" in err
+    assert "not valid JSON" in err
+
+
+# ---------------------------------------------------------------------------
+# ticket status
+# ---------------------------------------------------------------------------
+
+
+_TICKET_STATUS_RESPONSE = {
+    "work_ticket_idx": 12,
+    "action_id": "fastq-to-parquet",
+    "action_version": "1.0.0",
+    "originator_principal_idx": 7,
+    "scope_target": {"kind": "prep_sample", "prep_sample_idx": 55},
+    "action_context": {"fastq_path": "/scratch/sample.fastq"},
+    "state": "processing",
+    "retry_count": 0,
+    "max_retries": 3,
+    "failure_type": None,
+    "failure_stage": None,
+    "failure_step_name": None,
+    "failure_reason": None,
+    "created_at": "2026-05-20T00:00:00+00:00",
+    "updated_at": "2026-05-20T00:00:01+00:00",
+}
+
+
+def test_ticket_status_issues_get_against_the_idx(monkeypatch):
+    """Positional `work_ticket_idx` lands on the path; the handler issues
+    a GET (not a POST) and the captured response shape carries the full
+    WorkTicket fields the route returns."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_TICKET_STATUS_RESPONSE, status=200)
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "ticket",
+            "status",
+            "12",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "GET"
+    assert captured["url"] == "https://q.example.test/api/v1/work-ticket/12"
+    # A GET has no body — assert the stub captured no JSON payload.
+    assert captured["json"] is None
+
+
+def test_ticket_status_requires_idx(capsys):
+    """Omitting the positional argument exits 2 with the standard
+    argparse error pointing at `work_ticket_idx`."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["ticket", "status"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "work_ticket_idx" in err
+
+
+# ---------------------------------------------------------------------------
+# HTTP-error handling (run_http_subcommand)
+# ---------------------------------------------------------------------------
+
+
+def test_http_error_response_prints_to_stderr_and_exits_1(monkeypatch, capsys):
+    """A non-2xx response surfaces through run_http_subcommand: `call`'s
+    raise_for_status() throws httpx.HTTPStatusError, the CLI prints
+    `http error <code>: <body>` to stderr and returns exit code 1."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"detail": "requires study access at tier 'admin' or higher"},
+        status=403,
+    )
+
+    rc = main(["study", "create", "--title", "denied-study"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "http error 403" in err
+    # The server's response body is echoed so the user sees the reason.
+    assert "requires study access" in err
 
 
 # ---------------------------------------------------------------------------

@@ -4,6 +4,12 @@
 > sequence-range was already minted by the failed attempt. Avoids
 > destroying the prep_sample (the heavy-handed alternative).
 
+Audience: operators and `system_admin`s. The steps below read
+`qiita.work_ticket` and `qiita.sequence_range` directly and resubmit a
+work_ticket with a `pre_minted_range` the public `qiita` CLI does not
+expose — this is not an end-user `user`-role flow (contrast
+[`user-cli-quickstart.md`](user-cli-quickstart.md)).
+
 ## When this applies
 
 The job ran past phase 3 (CP-minted sequence_idx range) and then failed
@@ -67,7 +73,7 @@ follow the DELETE-prep_sample path instead.
 
    ```json
    {
-     "fastq_path": "/scratch/.../sample.fastq.gz",
+     "fastq_path": "/scratch/.../filename_prefix.fastq.gz",
      "prep_sample_idx": 42,
      "work_ticket_idx": <new_work_ticket_idx>,
      "pre_minted_range": {
@@ -76,6 +82,14 @@ follow the DELETE-prep_sample path instead.
      }
    }
    ```
+
+   Each fastq basename must start with the prep_sample's
+   `sequenced_pool_item_id` — the same filename-prefix rule the
+   `POST /work-ticket` route enforces (see
+   [`user-cli-quickstart.md`](user-cli-quickstart.md)). A paired-end
+   ticket adds `reverse_fastq_path` (e.g. `filename_prefix_R2.fastq.gz`);
+   a forward-only (single-end) ticket carries just `fastq_path`, as the
+   example above shows, and the prefix rule applies to that single read.
 
    The orchestrator skips phase 3's HTTP mint call entirely when
    `pre_minted_range` is set; phases 1, 2, and 4 run as on the first

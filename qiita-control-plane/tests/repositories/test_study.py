@@ -274,7 +274,6 @@ async def test_create_study_minimum_body_inserts_row_and_owner_admin_grant(postg
             assert row["abstract"] is None
             assert row["funding"] is None
             assert row["ebi_study_accession"] is None
-            assert row["vamps_id"] is None
             assert row["notes"] is None
             assert row["extra_metadata"] is None
             assert row["default_tier"] == "member"
@@ -304,7 +303,7 @@ async def test_create_study_full_body_round_trips_every_field(postgres_pool):
             owner = await _create_user(conn)
             pi = await _create_user(conn)
             title = _suffix("full-study")
-            extra = {"site": "ucsd", "season": "spring"}
+            extra = {"site": "ucsd", "season": "spring", "vamps_id": "VAMPS-1"}
 
             row = await create_study(
                 conn,
@@ -317,7 +316,6 @@ async def test_create_study_full_body_round_trips_every_field(postgres_pool):
                 abstract="abs",
                 funding="NIH-R01",
                 ebi_study_accession="ERP000001",
-                vamps_id="VAMPS-1",
                 notes="notes-1",
                 extra_metadata=extra,
                 default_tier=Tier.VIEWER,
@@ -330,7 +328,6 @@ async def test_create_study_full_body_round_trips_every_field(postgres_pool):
             assert row["abstract"] == "abs"
             assert row["funding"] == "NIH-R01"
             assert row["ebi_study_accession"] == "ERP000001"
-            assert row["vamps_id"] == "VAMPS-1"
             assert row["notes"] == "notes-1"
             # asyncpg returns JSONB as a string; decode for comparison.
             assert json.loads(row["extra_metadata"]) == extra
@@ -481,7 +478,7 @@ async def test_fetch_study_returns_full_row_for_existing_idx(postgres_pool):
             owner = await _create_user(conn)
             pi = await _create_user(conn)
             title = _suffix("fetch-full")
-            extra = {"site": "ucsd", "season": "spring"}
+            extra = {"site": "ucsd", "season": "spring", "vamps_id": "VAMPS-1"}
 
             created_row = await create_study(
                 conn,
@@ -494,7 +491,6 @@ async def test_fetch_study_returns_full_row_for_existing_idx(postgres_pool):
                 abstract="abs",
                 funding="NIH-R01",
                 ebi_study_accession="ERP000001",
-                vamps_id="VAMPS-1",
                 notes="notes-1",
                 extra_metadata=extra,
                 default_tier=Tier.VIEWER,
@@ -513,7 +509,6 @@ async def test_fetch_study_returns_full_row_for_existing_idx(postgres_pool):
             assert fetched["abstract"] == "abs"
             assert fetched["funding"] == "NIH-R01"
             assert fetched["ebi_study_accession"] == "ERP000001"
-            assert fetched["vamps_id"] == "VAMPS-1"
             assert fetched["notes"] == "notes-1"
             assert json.loads(fetched["extra_metadata"]) == extra
             assert fetched["default_tier"] == "viewer"
