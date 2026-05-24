@@ -17,12 +17,15 @@ for outbound CO→CP callbacks like `POST /sequence-range`. Rotation of
 the compute-worker PAT follows
 [`orchestrator-token-rotation.md`](orchestrator-token-rotation.md).
 
-> **Recommended workflow.** Open Claude (claude.ai/code or the CLI),
-> point it at this runbook, and ask it to walk you through one command
-> at a time. Paste each command's output back; Claude will catch the
-> failure modes the runbook doesn't anticipate (sudoer PATH quirks,
-> cross-distro path conventions, conda shadowing, AuthRocket UI drift,
-> etc.). The non-obvious gotchas captured below were surfaced this way.
+> **Optional workflow tip.** If you have access to Claude (claude.ai/code
+> or the CLI), pointing it at this runbook and asking it to walk you
+> through one command at a time — pasting each command's output back —
+> tends to catch failure modes the runbook doesn't yet anticipate
+> (sudoer PATH quirks, cross-distro path conventions, conda shadowing,
+> AuthRocket UI drift, etc.). The non-obvious gotchas captured below
+> were surfaced this way. The runbook is meant to be self-contained
+> without an AI assistant — every step has its own verification
+> command; this tip is a convenience, not a prerequisite.
 
 ## Account model
 
@@ -35,11 +38,12 @@ naming (`qiita-api`, `qiita-orch`, `qiita-data`, `qiita-job`):
 | `[operator]` | A shared, named operational account on the deploy host — typically a user literally named `qiita` (don't confuse with `qiita-api` etc.). **No sudo.** Owns the clone, holds shell env vars across steps, runs `make migrate`, owns `~/.qiita/token`. |
 | `[admin]` | Your own personal account with sudo. Runs everything that touches `/etc/qiita/`, `/opt/qiita/`, `/etc/systemd/`, `/etc/nginx/`, and `systemctl`. |
 
-The `qiita` operator account must **not** be a member of any of
-`qiita-services`, `qiita-pipeline`, `qiita-data`, `qiita-fs`, or
-`qiita-job` — otherwise the operator gains read access to service
-secrets and lake data, which defeats the privilege separation the
-service users provide. Verify with `id qiita` in step 0.
+The operator account (`qiita` in this runbook; substitute your site's
+name) must **not** be a member of any of `qiita-services`,
+`qiita-pipeline`, `qiita-data`, `qiita-fs`, or `qiita-job` — otherwise
+the operator gains read access to service secrets and lake data, which
+defeats the privilege separation the service users provide. Verify
+with `id <operator>` in step 0.
 
 Service start/stop authority on the qiita-* units is **root only**
 (same model as `postgresql.service` / `nginx.service`). Operators run
@@ -87,8 +91,16 @@ System groups (composition matters):
 | Group | Members | Purpose |
 |---|---|---|
 | `qiita-services` | `qiita-api`, `qiita-orch` | Read shared service secrets (`/etc/qiita/cp-to-co.token`). |
-| `qiita-pipeline` | `qiita-data`, `qiita-job` | Staging handoff: jobs write Parquet under the staging dir; the data plane reads via group membership. Sites sometimes provision this under a different name (e.g. `qiita-fs`) — what matters is the *membership*. |
+| `qiita-pipeline` | `qiita-api`, `qiita-data`, `qiita-job` | Two adjacent jobs: (a) staging handoff — SLURM jobs write Parquet under the staging dir, DP reads via group membership; (b) orchestrator workspace — qiita-api (CP runner) writes per-ticket subdirs via group, alongside `qiita-orch` (owner) and `qiita-job` (output writer). Sites sometimes provision under a different name (e.g. `qiita-fs`) — what matters is the *membership*. |
 | `qiita-data` | `qiita-data` (single member) | Locks the durable Parquet dir to the DP only. Required as a separate group so the data dir at mode `0750` does **not** also grant read to `qiita-job` (which would defeat the staging/parquet split). |
+
+`qiita-api` belongs to **both** `qiita-services` and `qiita-pipeline`.
+The pipeline membership is what lets the CP runner mkdir per-ticket
+workspaces under the orchestrator workspace dir (see §0.3) — without
+it, the first work-ticket dispatch fails at `workspace.mkdir(...)`
+because the dir is owned `qiita-orch:qiita-pipeline 2770`. `qiita-orch`
+is deliberately *not* in `qiita-pipeline` here; ownership is what gives
+it write access, which keeps the orchestrator's group reach bounded.
 
 Verification:
 ```bash
@@ -99,6 +111,7 @@ getent passwd qiita qiita-api qiita-orch qiita-data qiita-job
 getent group qiita-services qiita-pipeline qiita-data
 
 # [either] service users have the right primary / secondary groups
+# (qiita-api must show BOTH qiita-services AND qiita-pipeline in `groups=`)
 id qiita-api qiita-orch qiita-data qiita-job
 
 # [either] operator is NOT in any service group
@@ -135,13 +148,16 @@ date -u  # compare with the pg_now_utc_offset above — should agree within seco
 
 The data plane writes Parquet under a durable shared mount; SLURM jobs
 write to a staging mount that's ideally on the same filesystem (for the
-atomic rename fast path).
+atomic rename fast path). The compute orchestrator stages per-ticket
+workspaces under a third shared mount, visible from every compute node
+(SLURM uses it as the job's `current_working_directory`).
 
 | Path role | Owner | Group | Mode | Notes |
 |---|---|---|---|---|
 | Mount point parent | `root` | `root` | `0755` | Infra-owned. |
 | Final Parquet dir | `qiita-data` | `qiita-data` | `0750` | DP-only. Two valid postures (see below). |
 | Staging dir | `qiita-data` | `qiita-pipeline` | `2770` | Setgid forces `qiita-pipeline` group on inherited files. |
+| Orchestrator workspace dir | `qiita-orch` | `qiita-pipeline` | `2770` | Holds per-ticket workspace trees (`<work_ticket_idx>/<step>/attempt-N/`). `qiita-orch` writes per-step subdirs as owner; `qiita-api` (CP runner) and `qiita-job` (SLURM job outputs) write via the `qiita-pipeline` group. Setgid carries the group to inherited files. Two valid postures (see below). |
 
 Two valid postures for the final Parquet dir:
 
@@ -151,20 +167,39 @@ Two valid postures for the final Parquet dir:
 - **Mount-as-data**: the mount point itself is `qiita-data:qiita-data
   0750`. Use this when the mount is dedicated to qiita's lake. Simpler.
 
+Two valid postures for the orchestrator workspace dir, mirroring the
+above:
+
+- **Subdir-of-mount**: an `orch-workspace/` subdir under `<scratch>`
+  (or another shared mount) carries the `qiita-orch:qiita-pipeline 2770`
+  ownership. Use when the mount hosts other content alongside.
+- **Mount-as-workspace** (this deploy's posture): the mount itself is
+  `qiita-orch:qiita-pipeline 2770`. Use when the mount is dedicated to
+  orchestrator workspaces.
+
 **Placeholder vocabulary used downstream.** `<mount>` and `<scratch>`
-refer to the *roots* (the parent mounts). `<data-dir>` and `<staging-dir>`
-are the *final paths*: under the subdir-of-mount posture
-`<data-dir>` = `<mount>/parquet` and `<staging-dir>` = `<scratch>/staging`;
-under mount-as-data `<data-dir>` = `<mount>` directly (staging still
-follows the subdir form). §8a writes the dirs using `<mount>` / `<scratch>`,
-§8b sets `DUCKLAKE_DATA_PATH=<data-dir>`, step 11 references
-`<scratch>/...` and `<data-dir>` — same paths, just whichever name the
-context wants.
+refer to the *roots* (the parent mounts). `<data-dir>`, `<staging-dir>`,
+and `<orch-workspace>` are the *final paths*: under subdir-of-mount,
+`<data-dir>` = `<mount>/parquet`, `<staging-dir>` = `<scratch>/staging`,
+`<orch-workspace>` = `<scratch>/orch-workspace`; under mount-as-data /
+mount-as-workspace the corresponding root path IS the final dir.
+
+Three places consume these placeholders, named here so renumbering
+doesn't strand the reference:
+- the data-plane dir-creation step uses `<mount>` / `<scratch>`
+- the orchestrator workspace dir-creation step uses `<scratch>` /
+  `<orch-workspace>`
+- the env-file rendering steps wire `DUCKLAKE_DATA_PATH=<data-dir>`
+  (data plane), `WORK_TICKET_WORKSPACE_ROOT=<orch-workspace>` (control
+  plane), and `SHARED_FILESYSTEM_ROOT=<orch-workspace>` (compute
+  orchestrator — same path as the CP env var on a single-host deploy)
+- the end-to-end smoke references both `<data-dir>` and
+  `<orch-workspace>` paths.
 
 Verification:
 ```bash
 # [either]
-stat -c '%n  owner=%U  group=%G  mode=%a  device=%d' <data-dir> <staging-dir>
+stat -c '%n  owner=%U  group=%G  mode=%a  device=%d' <data-dir> <staging-dir> <orch-workspace>
 ```
 
 Watch the **device numbers**: if data and staging are on different
@@ -275,11 +310,12 @@ Defaults  secure_path = /sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local
 
 ### 0.7 Conda interference on shared operator accounts
 
-If `qiita` is a shared cross-server operator account whose login dotfiles
-auto-activate a conda environment (common on HPC sites), conda will
-shadow system binaries (`openssl`, `jq`) and add noise. To keep the
-deploy host clean without disturbing qiita's setup elsewhere, append a
-host-scoped opt-out to `~/.bash_profile` on the deploy host:
+If your operator account (e.g. `qiita`) is a shared cross-server
+identity whose login dotfiles auto-activate a conda environment
+(common on HPC sites), conda will shadow system binaries (`openssl`,
+`jq`) and add noise. To keep the deploy host clean without disturbing
+the account's setup elsewhere, append a host-scoped opt-out to
+`~/.bash_profile` on the deploy host:
 ```bash
 if [ "$(hostname -s)" = "<deploy-hostname>" ]; then
     while [ -n "${CONDA_DEFAULT_ENV:-}" ]; do conda deactivate 2>/dev/null || break; done
@@ -412,7 +448,11 @@ HMAC). `[operator]` renders the working copy at `/tmp/control-plane.env`
 
 Prerequisites: pg-host + password for `qiita_miint_rw` (DBA); AuthRocket
 realm subdomain (from `authrocket-realm-setup.md`); externally-resolvable
-FQDN.
+FQDN; the path you've picked for `<orch-workspace>` (the orchestrator
+workspace dir from §0.3 — it doesn't have to exist yet, it gets
+created in §9a). The CP boot fails fast if `WORK_TICKET_WORKSPACE_ROOT`
+is unset, so you're committing to the path here even though the dir
+shows up two steps later.
 
 ```bash
 # [operator] in a stable shell (use tmux/screen — HMAC_SECRET_KEY must survive
@@ -435,6 +475,7 @@ sed -i.bak \
     -e "s|^# AUTHROCKET_JWKS_URL=.*|AUTHROCKET_JWKS_URL='https://<realm>.loginrocket.com/connect/jwks'|" \
     -e "s|^# QIITA_ENDPOINT_URL=.*|QIITA_ENDPOINT_URL='https://<fqdn>'|" \
     -e "s|^# COMPUTE_ORCHESTRATOR_URL=.*|COMPUTE_ORCHESTRATOR_URL=http://127.0.0.1:8081|" \
+    -e "s|^WORK_TICKET_WORKSPACE_ROOT=.*|WORK_TICKET_WORKSPACE_ROOT=<orch-workspace>|" \
     /tmp/control-plane.env
 rm /tmp/control-plane.env.bak
 
@@ -573,8 +614,8 @@ PAT, and saves it to `~/.qiita/token` (mode 0600).
 
 > **Before step 6 on SSH-tunneled deploys.** The cli_login_code TTL
 > (default 30s, set by `CLI_LOGIN_CODE_TTL_SECONDS`) is way too short
-> for a flow that involves manual URL copy + SSH tunnel + curl. Bump
-> it before starting:
+> for a flow that involves manual URL copy + SSH tunnel + curl. For
+> the duration of the SSH-tunneled flow, bump it:
 >
 > ```bash
 > # [admin]
@@ -582,7 +623,16 @@ PAT, and saves it to `~/.qiita/token` (mode 0600).
 > sudo systemctl restart qiita-control-plane
 > ```
 >
-> 5 min is still tiny in absolute terms, defensible permanent config.
+> **Set it back to the default once the local browser-loopback flow
+> works on this deploy.** The 30s default deliberately keeps the
+> intercept window short; a permanent 300s value is only justified if
+> you'll keep doing the SSH-tunneled flow regularly. Roll back with:
+>
+> ```bash
+> # [admin]
+> sudo sed -i '/^CLI_LOGIN_CODE_TTL_SECONDS=/d' /etc/qiita/control-plane.env
+> sudo systemctl restart qiita-control-plane
+> ```
 
 ```bash
 # [operator]
@@ -779,7 +829,45 @@ and DP env files (see step 1).
 > [`slurm-backend-setup.md`](slurm-backend-setup.md). This section
 > covers only the deploy-host orchestrator config.
 
-### 9a. Write the orchestrator env file
+### 9a. Create the orchestrator workspace dir
+
+Both the CP runner (`qiita-api`) and the CO (`qiita-orch`) need to
+write here, plus SLURM jobs (`qiita-job`) write outputs underneath. Per
+§0.3 the dir is owned `qiita-orch:qiita-pipeline 2770`; qiita-api and
+qiita-job get write access via the `qiita-pipeline` group (§0.1).
+
+**Default (subdir-of-mount).**
+
+```bash
+# [admin]
+sudo install -d -o qiita-orch -g qiita-pipeline -m 2770 <scratch>/orch-workspace
+```
+
+Then `<orch-workspace>` = `<scratch>/orch-workspace` for §9b and the
+CP env file in §1.
+
+**Alternative (mount-as-workspace)** for deploys where `<scratch>` is
+dedicated to orchestrator workspaces (this deploy's posture):
+
+```bash
+# [admin]
+sudo chown qiita-orch:qiita-pipeline <scratch>
+sudo chmod 2770 <scratch>
+```
+
+Then `<orch-workspace>` = `<scratch>` directly.
+
+The setgid bit on `2770` is load-bearing: SLURM jobs writing outputs
+inherit the `qiita-pipeline` group regardless of `qiita-job`'s primary
+group, so the next workflow step (running as `qiita-orch` or `qiita-api`)
+can read them. Same pattern as the data plane's staging dir (§8a).
+
+**Did the CP env in §1 already set `WORK_TICKET_WORKSPACE_ROOT`?** If
+not, edit `/etc/qiita/control-plane.env` to set it now and restart the
+CP — boot will fail-fast if it's unset. The path **must equal** what
+§9b puts in `SHARED_FILESYSTEM_ROOT`.
+
+### 9b. Write the orchestrator env file
 
 ```bash
 # [operator]
@@ -790,7 +878,7 @@ chmod 0600 /tmp/compute-orchestrator.env
 # Force the SLURM backend (the example defaults to 'local' for dev/smoke).
 sed -i.bak \
     -e "s|^COMPUTE_BACKEND=.*|COMPUTE_BACKEND=slurm|" \
-    -e "s|^# SHARED_FILESYSTEM_ROOT=.*|SHARED_FILESYSTEM_ROOT=<scratch>|" \
+    -e "s|^# SHARED_FILESYSTEM_ROOT=.*|SHARED_FILESYSTEM_ROOT=<orch-workspace>|" \
     -e "s|^# SLURMRESTD_URL=|SLURMRESTD_URL=|" \
     -e "s|^# SLURMRESTD_JWT_PATH=|SLURMRESTD_JWT_PATH=|" \
     -e "s|^# SLURMRESTD_USER_NAME=|SLURMRESTD_USER_NAME=|" \
@@ -814,7 +902,7 @@ SlurmUser on the cluster, and SLURM JWTs expire. See
 [`slurm-backend-setup.md`](slurm-backend-setup.md) for minting and the
 rotation options; the orchestrator re-reads the file on a `401`.
 
-### 9b. Start the orchestrator
+### 9c. Start the orchestrator
 
 ```bash
 # [admin]

@@ -114,7 +114,7 @@ class SlurmrestdClient:
     Usage:
 
         async with SlurmrestdClient(
-            base_url="http://slurm-controller:6820",
+            base_url="http://slurmrestd-host:6820",   # the slurmrestd host, NOT slurmctld
             jwt_path=Path("/var/spool/slurm/jwt-token"),
             user_name="qiita-job",
         ) as client:
@@ -123,7 +123,7 @@ class SlurmrestdClient:
 
     Constructor accepts an optional `http_client` for tests — pass an
     `httpx.AsyncClient` with a `httpx.MockTransport` to drive the unit
-    tests without a live SLURM controller.
+    tests without a live slurmrestd.
     """
 
     def __init__(

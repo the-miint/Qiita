@@ -9,6 +9,9 @@ User=qiita-data
 # /dev/null (non-login svc account), so set a real one. Per-instance dir
 # (%i) avoids concurrent-write races between simultaneous instances when
 # horizontally scaled (qiita-data-plane@50051, @50052, …).
+# Nested StateDirectory (subpath after the first segment) needs systemd ≥235;
+# Rocky 10 ships systemd 256 so this is fine. On older distros, flatten the
+# path to e.g. StateDirectory=qiita-data-%i and update HOME= accordingly.
 StateDirectory=qiita-data/%i
 Environment=HOME=/var/lib/qiita-data/%i
 Environment=LISTEN_ADDR=127.0.0.1:%i

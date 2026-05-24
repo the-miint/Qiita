@@ -33,13 +33,8 @@ DP_BINARY="$QIITA_CLONE/qiita-data-plane/target/release/qiita-data-plane"
 INCOMING=/opt/qiita/incoming
 install -d -o root -g root -m 0755 "$INCOMING"
 
-# Exclude transient build artifacts. The operator's earlier `uv run` in
-# the git clone materializes qiita-control-plane/.venv/ owned by the
-# operator; cargo build creates qiita-data-plane/target/. Without these
-# exclusions a qiita-owned .venv would land at /opt/qiita/<svc>/.venv
-# and trip activate.sh's venv-python sanity check.
-# Keep this in sync with deploy/activate.sh (same list lives there).
-RSYNC_EXCLUDES=(--exclude='.venv/' --exclude='target/' --exclude='__pycache__/')
+# shellcheck source=deploy/_common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"   # populates RSYNC_EXCLUDES
 
 rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/qiita-common/"              "$INCOMING/qiita-common/"
 rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/qiita-control-plane/"       "$INCOMING/qiita-control-plane/"

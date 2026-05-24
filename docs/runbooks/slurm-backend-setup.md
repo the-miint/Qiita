@@ -219,7 +219,7 @@ which covers the CO→CP PAT.)
 
 `COMPUTE_BACKEND=slurm` adds these to
 `/etc/qiita/compute-orchestrator.env` (written in
-[`first-deploy.md`](first-deploy.md) §9a):
+[`first-deploy.md`](first-deploy.md) §9b — §9a creates the workspace dir):
 
 | Var | This deploy | Notes |
 |---|---|---|
@@ -234,20 +234,28 @@ which covers the CO→CP PAT.)
 workspace (`params.json` + outputs) — **must be on a filesystem
 mounted on the compute nodes**. The job reads its inputs from that path
 on the node; if the node cannot see it, the step fails. Pick a location
-whose **parent** dirs allow both `qiita-orch` and `qiita-job` traversal
-— don't nest it under a tightly-restricted tree like the data plane's
-`DUCKLAKE_DATA_PATH` (`qiita-data:qiita-data 0750` blocks everyone
-else, even if the leaf dir's own perms look correct).
+whose **parent** dirs allow `qiita-orch` (owner), `qiita-api` (CP runner,
+writes via group), and `qiita-job` (writes outputs via group) all to
+traverse — don't nest it under a tightly-restricted tree like the data
+plane's `DUCKLAKE_DATA_PATH` (`qiita-data:qiita-data 0750` blocks
+everyone else, even if the leaf dir's own perms look correct).
 
-Own the dir itself **`qiita-orch:qiita-pipeline` mode `2770`**:
-`qiita-orch` writes per-step subdirs as owner, `qiita-job` writes job
-outputs via the `qiita-pipeline` group, and the setgid bit makes new
-files inherit `qiita-pipeline` so `qiita-data` reads them via the same
-group — the staging-handoff pattern from
-[`first-deploy.md`](first-deploy.md) §0.1. `qiita-orch` is deliberately
+The dir itself is **`qiita-orch:qiita-pipeline` mode `2770`** (creation
+recipe in [`first-deploy.md`](first-deploy.md) §9a, group composition
+in §0.1): `qiita-orch` writes per-step subdirs as owner; `qiita-api`
+and `qiita-job` write via the `qiita-pipeline` group; the setgid bit
+makes new files inherit `qiita-pipeline` so the next step (which may
+run as any of the three) can read them. `qiita-orch` is deliberately
 *not* a member of `qiita-pipeline`; being the *owner* is what gives it
 write access here, which keeps the network-facing service's group
 membership bounded.
+
+`SHARED_FILESYSTEM_ROOT` and the CP's `WORK_TICKET_WORKSPACE_ROOT`
+**must point at the same directory** on a single-host deploy — the CP
+runner mints `<root>/<work_ticket_idx>/<step>/attempt-N/` and POSTs
+that exact path to the CO as `body.workspace`. A mismatch means the
+CO tries to chdir to a path that doesn't exist (or, worse, exists at a
+different inode if the same filesystem is mounted twice).
 
 `QIITA_CP_URL` defaults to `http://localhost:8080`, which is correct on
 a single-host deploy where the CP and the orchestrator share the box.

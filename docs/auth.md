@@ -356,7 +356,7 @@ A single shared bearer token authenticates this private path. Both services read
 
 The orchestrator's `step.py` validates incoming requests with a constant-time compare against the configured token. The control plane (when wiring `ComputeBackendClient`) reads from the same config.
 
-`qiita_common.log.AuthorizationScrubFilter` is a `logging.Filter` that rewrites any `Bearer <token>` substring in log messages and args to `Bearer <redacted>`. Install once at application startup so httpx's request logs can't leak the token to disk.
+`qiita_common.log.AuthorizationScrubFilter` is a `logging.Filter` that rewrites any `Bearer <token>` substring in log messages and args to `Bearer <redacted>`. Installed at the startup of both services — the CP installs it in its lifespan, and the CO does the same in its own lifespan (the CO holds two bearers: the inbound CP↔CO token and the outbound CO→CP compute-worker PAT, both go through the same filter). So httpx's request logs can't leak either token to disk.
 
 The `compute-worker` PAT covers the `/sequence-range` CO→CP path today. Future CO→CP endpoints (e.g. `/work-ticket/{idx}/transition` once the orchestrator owns ticket state transitions) reuse the same credential file (`/etc/qiita/co-to-cp.token`) and the same rotation flow ([`orchestrator-token-rotation.md`](runbooks/orchestrator-token-rotation.md)) — no new file needed.
 

@@ -28,11 +28,8 @@ UV=/usr/local/bin/uv
 export UV_PYTHON_INSTALL_DIR=/opt/uv-python
 install -d -o root -g root -m 0755 "$UV_PYTHON_INSTALL_DIR"
 
-# Exclude transient build artifacts so a dev .venv/ or cargo target/ in the
-# source doesn't get rsync'd over the deployed venv (which `uv sync` will
-# then either trip the venv-python sanity check on or overwrite incorrectly).
-# Keep this in sync with deploy/local-deploy.sh (same list lives there).
-RSYNC_EXCLUDES=(--exclude='.venv/' --exclude='target/' --exclude='__pycache__/')
+# shellcheck source=deploy/_common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"   # populates RSYNC_EXCLUDES
 
 rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$INCOMING/qiita-common/"              /opt/qiita/qiita-common/
 rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$INCOMING/qiita-control-plane/"       /opt/qiita/control-plane/

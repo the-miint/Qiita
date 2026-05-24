@@ -77,7 +77,7 @@ Fixed in #11 after the initial schema mixed both forms.
 
 ## Database migrations
 
-The qiita-miint deploy is live; migrations 0001–0019 under `qiita-control-plane/db/migrations/` have been applied to its Postgres. **Never edit an already-applied migration** — `dbmate` tracks applied versions in `schema_migrations` and won't re-run an edited file, so the live DB silently drifts from the source.
+The qiita-miint deploy is live; every migration currently in `qiita-control-plane/db/migrations/` (`YYYYMMDDHHMMSS_<name>.sql`, starting with `20260501000000_schema.sql`) has been applied to its Postgres. **Never edit an already-applied migration** — `dbmate` tracks applied versions in `schema_migrations` and won't re-run an edited file, so the live DB silently drifts from the source.
 
 Every schema change is a **new migration file** (`YYYYMMDDHHMMSS_<name>.sql`, with `migrate:up` and `migrate:down` blocks). Common shapes:
 - Add a column / index / constraint: a single `ALTER TABLE` migration.
