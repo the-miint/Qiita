@@ -10,7 +10,7 @@
 -- `system_role >= 'system_admin'` to gate operations by minimum required role.
 --
 -- Mirrored by qiita_common.auth_constants.SystemRole. The two value sets are
--- kept in lockstep by tests/test_enum_parity.py — change both in the same PR.
+-- kept in lockstep by tests — change both in the same PR.
 CREATE TYPE qiita.system_role AS ENUM (
     'user',
     'wet_lab_admin',

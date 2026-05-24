@@ -1,27 +1,17 @@
 """Parity checks between qiita-common Python enums and their Postgres ENUM twins.
 
-The system deliberately duplicates many closed value sets: once as a Python
-`StrEnum` in `qiita-common` (so Pydantic models get strong typing without a DB
-connection at import time) and once as a Postgres `CREATE TYPE ... AS ENUM` (so
-the database itself rejects bad values). Per issue #37 this duplication is a
-chosen compromise — the DB is *not* treated as the single source of truth — and
-this module is the automated guard that keeps the two copies from drifting.
+See CLAUDE.md for the rationale and the rules. Not every closed value set is a
+Postgres ENUM, and this module covers only value sets that are
+`CREATE TYPE ... AS ENUM`. Two failure modes are covered:
 
-Not every closed value set is a Postgres ENUM — `auth_event.event_type`,
-`reference.status`, and `reference.kind` are intentionally plain `TEXT`/`CHECK`
-columns (see those migrations) and are out of scope here. This module covers
-only value sets that are `CREATE TYPE ... AS ENUM`.
+* `test_enum_parity` asserts exact value-set equality for every entry in
+  `ENUM_PAIRS`.
+* `test_all_postgres_enums_are_covered` fails if a `qiita`-schema ENUM is not
+  registered in `ENUM_PAIRS`, so a newly added Postgres ENUM cannot silently
+  escape the parity check.
 
-Two failure modes are covered:
-
-* `test_enum_parity` — for each registered (Python enum, Postgres ENUM) pair,
-  the two value sets must be exactly equal.
-* `test_all_postgres_enums_are_covered` — every ENUM type in the `qiita` schema
-  must be registered in `ENUM_PAIRS`, so a newly added Postgres ENUM cannot
-  silently escape the parity check.
-
-When you add or change a mirrored enum, change both sides and update
-`ENUM_PAIRS`. See the "Enum parity" section in the repo-root CLAUDE.md.
+When you add a new mirrored enum, register its (Python class, Postgres type
+name) pair in `ENUM_PAIRS` below.
 """
 
 import pytest
@@ -87,7 +77,7 @@ async def test_enum_parity(py_enum, pg_type, postgres_pool):
         f"Enum drift between {py_enum.__module__}.{py_enum.__name__} and "
         f"qiita.{pg_type}: Python has {sorted(py_values)}, Postgres has "
         f"{sorted(pg_values)}. Update both the Python StrEnum and the Postgres "
-        f"CREATE TYPE so the value sets match (issue #37)."
+        f"CREATE TYPE so the value sets match."
     )
 
 
@@ -108,5 +98,5 @@ async def test_all_postgres_enums_are_covered(postgres_pool):
     assert not uncovered, (
         f"Postgres ENUM type(s) {sorted(uncovered)} in schema qiita have no "
         f"entry in ENUM_PAIRS. Define a mirroring Python StrEnum in "
-        f"qiita-common and register the (enum, type) pair here (issue #37)."
+        f"qiita-common and register the (enum, type) pair here."
     )

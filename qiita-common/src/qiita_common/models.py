@@ -44,8 +44,8 @@ class ReferenceStatus(StrEnum):
 
     Mirrored DB-side by the `status` column on `qiita.reference`, which is a
     plain `TEXT` + `CHECK` column (not a Postgres `CREATE TYPE` ENUM) — so this
-    enum is intentionally *not* covered by tests/test_enum_parity.py. Keep this
-    set and the migration's `CHECK (status IN (...))` list in sync by hand.
+    enum is intentionally not covered by the parity tests. Keep this set and
+    the matching `CHECK` list in sync by hand.
     """
 
     PENDING = "pending"

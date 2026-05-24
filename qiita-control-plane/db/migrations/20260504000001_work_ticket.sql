@@ -7,7 +7,7 @@
 -- qiita_common.models.WorkTicketState. PENDING / QUEUED / PROCESSING are
 -- the non-terminal states the orchestrator actively manages. COMPLETED /
 -- FAILED are terminal. The two value sets are kept in lockstep by
--- tests/test_enum_parity.py — change both in the same PR.
+-- tests — change both in the same PR.
 CREATE TYPE qiita.work_ticket_state AS ENUM (
     'pending',
     'queued',
@@ -22,7 +22,7 @@ CREATE TYPE qiita.work_ticket_state AS ENUM (
 -- retries-exhausted). The runner consults the type to decide PROCESSING →
 -- QUEUED retry vs PROCESSING → FAILED. Mirrored by
 -- qiita_common.models.FailureType; the two value sets are kept in lockstep
--- by tests/test_enum_parity.py — change both in the same PR.
+-- by tests — change both in the same PR.
 CREATE TYPE qiita.failure_type AS ENUM (
     'retriable',
     'permanent'
@@ -32,9 +32,8 @@ CREATE TYPE qiita.failure_type AS ENUM (
 -- fail" discriminator. step_run is paired with a non-NULL
 -- failure_step_name pointing at the specific entry in action.steps that
 -- raised; submission and finalize cover everything outside the step loop.
--- Mirrored by qiita_common.models.WorkTicketFailureStage; the two value
--- sets are kept in lockstep by tests/test_enum_parity.py — change both in
--- the same PR.
+-- Mirrored by qiita_common.models.WorkTicketFailureStage; the two value sets
+-- are kept in lockstep by tests — change both in the same PR.
 CREATE TYPE qiita.work_ticket_failure_stage AS ENUM (
     'submission',  -- before the runner loop: action lookup, scope_target,
                    -- ticket transition PENDING → PROCESSING

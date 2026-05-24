@@ -10,7 +10,7 @@
 -- qiita.system_role / qiita.tier convention used elsewhere.
 --
 -- Mirrored by qiita_common.models.ScopeTargetKind. The two value sets are kept
--- in lockstep by tests/test_enum_parity.py — change both in the same PR.
+-- in lockstep by tests — change both in the same PR.
 CREATE TYPE qiita.scope_target_kind AS ENUM (
     'study_prep',
     'reference',

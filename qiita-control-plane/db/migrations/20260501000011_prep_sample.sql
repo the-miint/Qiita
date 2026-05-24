@@ -13,7 +13,7 @@
 -- the FK from at most one subtype.
 --
 -- Mirrored by qiita_common.models.ProcessingKind. The two value sets are kept
--- in lockstep by tests/test_enum_parity.py — change both in the same PR.
+-- in lockstep by tests — change both in the same PR.
 CREATE TYPE qiita.processing_kind AS ENUM ('sequenced');
 
 

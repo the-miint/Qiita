@@ -28,7 +28,7 @@
 --   * All other columns that reference 'tier' accept any value.
 --
 -- Mirrored by qiita_common.models.Tier. The two value sets are kept in
--- lockstep by tests/test_enum_parity.py — change both in the same PR.
+-- lockstep by tests — change both in the same PR.
 CREATE TYPE qiita.tier AS ENUM (
     'public',
     'viewer',

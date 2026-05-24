@@ -12,7 +12,7 @@
 -- new arm in the trigger that checks the match), not a per-row decision.
 --
 -- Mirrored by qiita_common.models.FieldDataType. The two value sets are kept
--- in lockstep by tests/test_enum_parity.py — change both in the same PR.
+-- in lockstep by tests — change both in the same PR.
 CREATE TYPE qiita.field_data_type AS ENUM (
     'text',
     'numeric',

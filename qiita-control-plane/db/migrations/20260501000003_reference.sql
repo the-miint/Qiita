@@ -15,8 +15,7 @@ CREATE TABLE qiita.reference (
     -- `kind` and `status` are intentionally plain TEXT + CHECK, not Postgres
     -- ENUMs. Their value sets mirror qiita_common.models.ReferenceKind (a
     -- Literal) and qiita_common.models.ReferenceStatus (a StrEnum), so they
-    -- are deliberately NOT registered in tests/test_enum_parity.py — issue #37
-    -- scoped that parity check to `CREATE TYPE ... AS ENUM` types only.
+    -- are deliberately not registered in the tests.
     kind            TEXT        NOT NULL CHECK (kind IN ('sequence_reference', 'taxonomy_authority')),
     status          TEXT        NOT NULL DEFAULT 'pending'
                                 CHECK (status IN ('pending', 'hashing', 'minting', 'loading', 'active', 'failed')),
