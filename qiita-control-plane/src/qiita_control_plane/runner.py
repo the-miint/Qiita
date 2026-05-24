@@ -45,8 +45,6 @@ from .actions.reference import transition_reference_status
 
 _log = logging.getLogger(__name__)
 
-DEFAULT_WORKSPACE_ROOT = Path("/scratch/ephemeral/workspace")
-
 
 async def run_workflow(
     work_ticket_idx: int,
@@ -55,7 +53,7 @@ async def run_workflow(
     *,
     hmac_secret: bytes,
     data_plane_url: str,
-    workspace_root: Path = DEFAULT_WORKSPACE_ROOT,
+    workspace_root: Path,
 ) -> None:
     """Execute the workflow attached to one work ticket.
 
