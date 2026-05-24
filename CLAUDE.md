@@ -75,6 +75,19 @@ A step in a workflow YAML must declare exactly one of `container:` or `module:`.
 
 Fixed in #11 after the initial schema mixed both forms.
 
+## Database migrations
+
+The qiita-miint deploy is live; migrations 0001–0019 under `qiita-control-plane/db/migrations/` have been applied to its Postgres. **Never edit an already-applied migration** — `dbmate` tracks applied versions in `schema_migrations` and won't re-run an edited file, so the live DB silently drifts from the source.
+
+Every schema change is a **new migration file** (`YYYYMMDDHHMMSS_<name>.sql`, with `migrate:up` and `migrate:down` blocks). Common shapes:
+- Add a column / index / constraint: a single `ALTER TABLE` migration.
+- Add a Postgres ENUM value: `ALTER TYPE ... ADD VALUE`, with the Python `StrEnum` twin updated in the same PR.
+- Rename / drop / type-change: expand-then-contract across two migrations (and usually two PRs) so a rolling deploy doesn't 500.
+
+Before merging: `make test-control-plane-with-db` runs `dbmate up` against a fresh DB and must pass — that's the only safety net before the migration touches production. After merging: the operator runs `make migrate` against the live DB on the next deploy.
+
+The pre-deploy convention of editing migration SQL files in place ended with the first deploy of qiita-miint; it does not come back.
+
 ## Architecture
 
 See `docs/architecture.md` for the full system diagram, `docs/reference-data-staging.md` for how reference databases are ingested, `docs/auth.md` for the authentication / authorization surface (principal subtypes, OIDC + opaque-token paths, role/scope ceilings, admin endpoints, and the `qiita-admin` CLI), and `docs/duckdb-miint.md` for the duckdb-miint SQL extension that powers our bioinformatics functions — that file carries a `Last checked` date; re-verify a signature against upstream before relying on it if the file looks stale. Operational runbooks for the auth surface live under `docs/runbooks/`. What follows is the non-obvious cross-cutting structure.
