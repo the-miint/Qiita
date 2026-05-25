@@ -75,6 +75,19 @@ A step in a workflow YAML must declare exactly one of `container:` or `module:`.
 
 Fixed in #11 after the initial schema mixed both forms.
 
+## Database migrations
+
+The qiita-miint deploy is live; every migration currently in `qiita-control-plane/db/migrations/` (`YYYYMMDDHHMMSS_<name>.sql`, starting with `20260501000000_schema.sql`) has been applied to its Postgres. **Never edit an already-applied migration** — `dbmate` tracks applied versions in `schema_migrations` and won't re-run an edited file, so the live DB silently drifts from the source.
+
+Every schema change is a **new migration file** (`YYYYMMDDHHMMSS_<name>.sql`, with `migrate:up` and `migrate:down` blocks). Common shapes:
+- Add a column / index / constraint: a single `ALTER TABLE` migration.
+- Add a Postgres ENUM value: `ALTER TYPE ... ADD VALUE`, with the Python `StrEnum` twin updated in the same PR (see Enum parity below).
+- Rename / drop / type-change: expand-then-contract across two migrations (and usually two PRs) so a rolling deploy doesn't 500.
+
+Before merging: `make test-control-plane-with-db` runs `dbmate up` against a fresh DB and must pass — that's the only safety net before the migration touches production. After merging: the operator runs `make migrate` against the live DB on the next deploy.
+
+The pre-deploy convention of editing migration SQL files in place ended with the first deploy of qiita-miint; it does not come back.
+
 ## Enum parity (Python ↔ Postgres)
 
 Many closed value sets are **deliberately duplicated**: once as a Python `StrEnum` in `qiita-common` (so Pydantic models type-check at import time, with no DB connection) and once as a Postgres `CREATE TYPE ... AS ENUM` (so the database itself rejects bad values). Per issue #37 this duplication is a chosen compromise — the DB is *not* the single source of truth — so do **not** try to derive one side from the other.
@@ -83,7 +96,7 @@ Not every closed value set is a Postgres ENUM. `auth_event.event_type`, `referen
 
 Whenever you add, rename, or remove a value in an enum that *does* have a Postgres `CREATE TYPE` twin:
 
-1. **Change both sides in the same PR.** Update the Python `StrEnum` *and* the Postgres ENUM. Postgres ENUM changes go in a **new migration** (`ALTER TYPE ... ADD VALUE` / rename) — editing an already-applied `CREATE TYPE` migration does not reach databases that already ran it.
+1. **Change both sides in the same PR.** Update the Python `StrEnum` *and* the Postgres ENUM. Postgres ENUM changes go in a **new migration** (`ALTER TYPE ... ADD VALUE` / rename) — editing an already-applied `CREATE TYPE` migration does not reach databases that already ran it (see Database migrations above).
 2. **Keep the two-way comment.** The Python enum's docstring names its Postgres twin; the Postgres `CREATE TYPE` comment names its Python twin. Both must stay accurate so anyone reading either one is reminded of the other.
 3. **Register the pair for the parity test.** `ENUM_PAIRS` in `qiita-control-plane/tests/test_enum_parity.py` lists every `(Python enum, Postgres ENUM)` pair. `test_enum_parity` fails on value drift; `test_all_postgres_enums_are_covered` fails if a Postgres ENUM in the `qiita` schema is not registered there. Both run under `make test-control-plane-with-db`. A brand-new mirrored enum must be added to `ENUM_PAIRS`.
 
@@ -153,7 +166,7 @@ The data plane is intentionally "dumb": it only operates on identifiers it recei
 
 The orchestrator is a passive HTTP service: it accepts `POST /api/v1/step/run` from the control-plane runner, dispatches to its configured `ComputeBackend`, and returns the step's output paths. SLURM jobs themselves remain dumb (read input, write output, exit). The orchestrator owns slurmrestd polling and output verification (identifier integrity + file mode) inside its backend implementation.
 
-**The orchestrator has no DB access and no service-account PAT to the control plane** in v1 — workflow lifecycle and DB writes happen entirely on the control plane side. Async-step + CO → CP callbacks (and the `compute` service-account credential) come back when `SlurmBackend` lands.
+**The orchestrator has no DB access** — workflow lifecycle and DB writes happen entirely on the control plane side. CO → CP callbacks exist today for `POST /sequence-range` (called by the native `fastq_to_parquet` step) and authenticate with the `compute-worker` service-account PAT installed at `/etc/qiita/co-to-cp.token` ([provisioning](docs/runbooks/compute-service-account-provisioning.md), [rotation](docs/runbooks/orchestrator-token-rotation.md)). SLURM-backend integration (cluster prereqs, identity model, the `qiita-job` JWT auto-refresh timer) lives in [`docs/runbooks/slurm-backend-setup.md`](docs/runbooks/slurm-backend-setup.md).
 
 The control plane enforces **disallow-without-delete**: before submitting any job it checks `(prep_sample_idx, processing_idx)` pairs — COMPLETED results require explicit DELETE before resubmission; PENDING/QUEUED/PROCESSING states block new submission entirely.
 
