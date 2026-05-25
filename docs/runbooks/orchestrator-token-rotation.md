@@ -57,42 +57,47 @@ token file.
 
 ## Steps
 
-> **v1 reminder.** The steps below describe the full rotation procedure
-> for any `ControlPlaneClient` consumer. In v1 that's cron jobs only;
-> the orchestrator's PAT and reload handler land later. Where the two
-> paths diverge — notably step 3 — the cron path is the only one that
-> works today.
+> **v1 reality.** The orchestrator reads its PAT once at boot
+> (`config.py:_resolve_token` → cached in `Settings`); there is no
+> SIGHUP handler and the systemd unit declares no `ExecReload=`. So
+> the orchestrator-PAT rotation today is **restart-based, not
+> zero-downtime** — step 3 below uses `systemctl restart` rather than
+> `reload`. Cron-job rotations stay zero-downtime (each invocation
+> re-reads its own token file). The zero-downtime daemon path (SIGHUP
+> handler + `ExecReload=`) is future work and will replace step 3 when
+> it lands.
 
-1. **Mint the replacement token** from any host with the admin PAT:
+1. **Mint the replacement token** from any host with the admin PAT.
+   This rotates the *orchestrator's* `compute-worker` token; for a
+   cron-job rotation substitute the cron's name + scope set
+   accordingly:
 
    ```bash
    curl -X POST $CONTROL_PLANE_URL/api/v1/admin/service-account \
        -H "Authorization: Bearer qk_<ADMIN_PAT>" \
        -H "Content-Type: application/json" \
        -d '{
-         "name": "orchestrator-rot-2026-04-27",
-         "scopes": [
-           "feature:mint",
-           "reference:register_files",
-           "reference:read",
-           "ticket:doget"
-         ]
+         "name": "compute-worker-rot-2026-05-25",
+         "scopes": ["sequence_range:mint"]
        }'
    ```
 
    Copy the returned `token` and `principal_idx` immediately — the token
    is shown exactly once. Take note of both `principal_idx` values: the
    one returned here is the *new* service account (used in step 4), and
-   the existing orchestrator's `principal_idx` is the *old* one whose
+   the existing `compute-worker` principal_idx is the *old* one whose
    tokens you'll revoke in step 5. See the "Service accounts vs. tokens"
    section above for why each rotation creates a new service account
-   today.
+   today. The compute-worker scope set is provisioned per
+   [`compute-service-account-provisioning.md`](compute-service-account-provisioning.md);
+   match its scope list exactly to avoid a drifted-scope ceiling
+   between cycles.
 
 2. **Install the new token** atomically on the orchestrator host:
 
    ```bash
    ./scripts/install-orchestrator-token.sh \
-       /etc/qiita/orchestrator.token <<<"$NEW_TOKEN"
+       /etc/qiita/co-to-cp.token <<<"$NEW_TOKEN"
    ```
 
    The script stages at `<target>.new` (mode `0400`, owner `qiita-orch:qiita-orch`),
@@ -103,24 +108,29 @@ token file.
 
 3. **Pick up the new token** in the running service:
 
-   For a short-lived process (cron jobs today): no action needed — the
-   next scheduled invocation reads the new file on startup. Any
-   invocation already in flight finishes with the old token, which is
-   fine: the old token stays valid until step 5.
+   For a short-lived process (cron jobs): no action needed — the next
+   scheduled invocation reads the new file on startup. Any invocation
+   already in flight finishes with the old token, which is fine: the
+   old token stays valid until step 5.
 
-   For a long-running daemon (orchestrator, future):
+   For the orchestrator daemon (today, restart-based):
 
    ```bash
-   systemctl reload qiita-compute-orchestrator
+   sudo systemctl restart qiita-compute-orchestrator
    ```
 
-   The reload is meant to trigger a SIGHUP handler that re-reads the
-   token file; in-flight HTTP calls finish with the old token while new
-   calls use the new one. The orchestrator does not implement this
-   handler in v1 (see the status banner at the top of this runbook) and
-   the shipped systemd unit declares no `ExecReload=`, so `systemctl
-   reload` will currently fail with "Job type reload is not applicable".
-   Wiring both pieces in is part of the future orchestrator-PAT work.
+   In-flight CO→CP calls (today: only `POST /sequence-range` from the
+   native `fastq_to_parquet` step) are interrupted by the restart; the
+   step's job-side error path retries on the next workflow attempt, so
+   the practical impact is one extra retry per work-ticket that was
+   mid-flight at rotation. The zero-downtime SIGHUP path is future
+   work — the `reload` form below will become the recommended one once
+   it lands:
+
+   ```bash
+   # FUTURE — does not work today (no SIGHUP handler, no ExecReload=)
+   # systemctl reload qiita-compute-orchestrator
+   ```
 
 4. **Wait for new-token use** — confirm the service has actually
    exercised the new token before revoking the old one:
@@ -148,15 +158,15 @@ token file.
 
 The orchestrator will hit 401 on every control-plane call. Roll back
 the file swap first; how the running service picks up the rollback
-follows the same case-split as step 3 (v1: cron jobs only — the
-orchestrator's reload handler lands with the future PAT work, so
-`systemctl reload` will fail today):
+follows the same case-split as step 3 (orchestrator daemon today:
+restart; cron jobs: next invocation; zero-downtime SIGHUP path is
+future work):
 
 ```bash
-mv /etc/qiita/orchestrator.token /etc/qiita/orchestrator.token.bad
-mv /etc/qiita/orchestrator.token.previous /etc/qiita/orchestrator.token
+sudo mv /etc/qiita/co-to-cp.token /etc/qiita/co-to-cp.token.bad
+sudo mv /etc/qiita/co-to-cp.token.previous /etc/qiita/co-to-cp.token
+# Orchestrator daemon: sudo systemctl restart qiita-compute-orchestrator
 # Cron job: wait for the next scheduled invocation.
-# Long-running daemon (future): systemctl reload qiita-compute-orchestrator
 ```
 
 `install-orchestrator-token.sh` writes `<target>.previous` on every

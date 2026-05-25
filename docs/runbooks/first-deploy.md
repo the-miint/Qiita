@@ -102,6 +102,25 @@ because the dir is owned `qiita-orch:qiita-pipeline 2770`. `qiita-orch`
 is deliberately *not* in `qiita-pipeline` here; ownership is what gives
 it write access, which keeps the orchestrator's group reach bounded.
 
+> **Known gap — nested workspace dir perms.** The pipeline-membership
+> fix gets the CP runner *into* the workspace root, but the per-ticket
+> subdirs it creates inherit systemd's default UMask (0022), so they
+> land mode `0755`: `qiita-orch` is "other" → 0o5 → traverse but no
+> write. The orchestrator's SlurmBackend then tries to mkdir
+> `input/output/logs` under the attempt dir and hits PermissionError.
+> The marker-file SLURM verification did not exercise this path; the
+> first real fastq-to-parquet dispatch will. Three plausible
+> mitigations, none shipped today: (a) set `UMask=0007` on the
+> `qiita-control-plane` systemd unit, so the CP runner's mkdir mode
+> becomes `2770` and `qiita-orch` (via group `qiita-pipeline`) gains
+> write; (b) explicit `chmod(0o2770)` after each `mkdir` in
+> `qiita-control-plane/src/qiita_control_plane/runner.py`; or (c) add
+> `qiita-orch` to `qiita-pipeline` (revises the "ownership not
+> membership" stance above and widens the orchestrator's group
+> reach). Pick one before the first end-to-end workflow runs; (a) is
+> the smallest change and the one most aligned with the existing
+> setgid-propagation pattern.
+
 Verification:
 ```bash
 # [either] system users exist with nologin shell

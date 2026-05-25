@@ -118,11 +118,12 @@ the only orchestrator-specific detail.
 
 ## Why a separate principal
 
-The data-flow scopes for the orchestrator's downstream activity
-(`feature:mint`, `ticket:doget`, `reference:register_files`) are
-already provisioned on the long-standing `orchestrator` service
-account. Bundling `sequence_range:mint` there would expand its
-authority across two unrelated identifier domains (sequence_idx and
-feature_idx) — a single compromised token would then carry minting
-authority for both. A dedicated `compute-worker` principal preserves
-least-privilege at the cost of one extra row in `qiita.service_account`.
+Least-privilege per identifier domain. `sequence_range:mint` allocates
+ranges in the `sequence_idx` space; the *other* scopes the orchestrator
+will need as more native steps land (`feature:mint`, `ticket:doget`,
+`reference:register_files`) authorize writes in the `feature_idx`
+space. Bundling them on one principal would mean a single compromised
+token carries minting authority across two unrelated identifier
+domains. Keeping `compute-worker` scoped narrowly to
+`sequence_range:mint` preserves the split at the cost of one extra
+row in `qiita.service_account` per added domain.
