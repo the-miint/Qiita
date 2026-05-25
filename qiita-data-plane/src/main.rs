@@ -103,16 +103,25 @@ mod tests {
     #[test]
     #[serial]
     fn config_with_valid_env() {
-        let _snapshot =
-            EnvSnapshot::capture(&["LISTEN_ADDR", "HMAC_SECRET_KEY", "DUCKLAKE_CATALOG_CONNSTR"]);
+        let _snapshot = EnvSnapshot::capture(&[
+            "LISTEN_ADDR",
+            "HMAC_SECRET_KEY",
+            "DUCKLAKE_CATALOG_CONNSTR",
+            "UPLOAD_STAGING_ROOT",
+        ]);
         std::env::remove_var("LISTEN_ADDR");
         let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
         std::env::set_var("HMAC_SECRET_KEY", &secret);
         std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test host=localhost");
+        std::env::set_var("UPLOAD_STAGING_ROOT", "/tmp/qiita-test-staging");
         let cfg = Settings::from_env().expect("Settings::from_env() failed with valid config");
         assert_eq!(cfg.listen_addr.to_string(), "0.0.0.0:50051");
         assert_eq!(cfg.hmac_secret_key.len(), 32);
         assert_eq!(cfg.ducklake_catalog_connstr, "dbname=test host=localhost");
+        assert_eq!(
+            cfg.upload_staging_root,
+            std::path::PathBuf::from("/tmp/qiita-test-staging")
+        );
     }
 
     #[test]
@@ -125,6 +134,44 @@ mod tests {
         assert!(
             err.contains("HMAC_SECRET_KEY"),
             "error should mention HMAC_SECRET_KEY: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn config_rejects_missing_upload_staging_root() {
+        let _snapshot = EnvSnapshot::capture(&[
+            "HMAC_SECRET_KEY",
+            "DUCKLAKE_CATALOG_CONNSTR",
+            "UPLOAD_STAGING_ROOT",
+        ]);
+        let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
+        std::env::set_var("HMAC_SECRET_KEY", &secret);
+        std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
+        std::env::remove_var("UPLOAD_STAGING_ROOT");
+        let err = Settings::from_env().unwrap_err();
+        assert!(
+            err.contains("UPLOAD_STAGING_ROOT"),
+            "error should mention UPLOAD_STAGING_ROOT: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn config_rejects_relative_upload_staging_root() {
+        let _snapshot = EnvSnapshot::capture(&[
+            "HMAC_SECRET_KEY",
+            "DUCKLAKE_CATALOG_CONNSTR",
+            "UPLOAD_STAGING_ROOT",
+        ]);
+        let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
+        std::env::set_var("HMAC_SECRET_KEY", &secret);
+        std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
+        std::env::set_var("UPLOAD_STAGING_ROOT", "relative/staging");
+        let err = Settings::from_env().unwrap_err();
+        assert!(
+            err.contains("must be an absolute path"),
+            "error should mention absolute path requirement: {err}"
         );
     }
 

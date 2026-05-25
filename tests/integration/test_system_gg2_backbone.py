@@ -184,7 +184,7 @@ async def cli_cp_client(postgres_pool, hmac_secret, human_admin_session, data_pl
         hmac_secret_key=hmac_secret,
         data_plane_url=f"grpc://{LOOPBACK_HOST}:{data_plane['port']}",
         upload_staging_root=Path(data_plane["upload_staging_root"]),
-        workspace_root=Path(data_plane["workspace_root"]),
+        work_ticket_workspace_root=Path(data_plane["workspace_root"]),
     )
     cp_app.state.compute_backend_client = LocalComputeBackendClient()
     cp_app.state.running_dispatches = set()

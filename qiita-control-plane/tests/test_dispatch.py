@@ -10,6 +10,7 @@ once those land.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -31,7 +32,16 @@ def _fake_app(*, compute_backend_client=object(), pool=object()) -> SimpleNamesp
         compute_backend_client=compute_backend_client,
         running_dispatches=set(),
         pool=pool,
-        settings=SimpleNamespace(hmac_secret_key=b"x" * 16, data_plane_url="grpc://unused"),
+        settings=SimpleNamespace(
+            hmac_secret_key=b"x" * 16,
+            data_plane_url="grpc://unused",
+            # _run_and_log reads both before dispatching to run_workflow.
+            # Real Paths keep the defensive None-check happy without
+            # making the test reach any filesystem operation (run_workflow
+            # is monkeypatched in every test that actually dispatches).
+            work_ticket_workspace_root=Path("/tmp/qiita-test-ws-unused"),
+            upload_staging_root=Path("/tmp/qiita-test-staging-unused"),
+        ),
     )
     return SimpleNamespace(state=state)
 

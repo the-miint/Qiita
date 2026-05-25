@@ -243,9 +243,12 @@ async def _run(
 ) -> None:
     from qiita_control_plane.runner import run_workflow
 
-    kwargs = {}
-    if upload_staging_root is not None:
-        kwargs["upload_staging_root"] = upload_staging_root
+    # Tests that don't exercise upload-handle resolution still need to pass
+    # something for upload_staging_root (no default on the kwarg). The path
+    # only matters if a step actually reads from it.
+    effective_upload_root = (
+        upload_staging_root if upload_staging_root is not None else workspace_root / "uploads"
+    )
 
     await run_workflow(
         work_ticket_idx,
@@ -253,8 +256,8 @@ async def _run(
         backend,  # type: ignore[arg-type]  # protocol-shaped duck
         hmac_secret=b"unused",
         data_plane_url="grpc://unused:0",
-        workspace_root=workspace_root,
-        **kwargs,
+        work_ticket_workspace_root=workspace_root,
+        upload_staging_root=effective_upload_root,
     )
 
 

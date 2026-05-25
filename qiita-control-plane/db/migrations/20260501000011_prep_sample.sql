@@ -11,6 +11,9 @@
 -- enforces mutual exclusion declaratively: each subtype table pins its own
 -- processing_kind column to a single value, so a prep_sample row can satisfy
 -- the FK from at most one subtype.
+--
+-- Mirrored by qiita_common.models.ProcessingKind. The two value sets are kept
+-- in lockstep by tests — change both in the same PR.
 CREATE TYPE qiita.processing_kind AS ENUM ('sequenced');
 
 

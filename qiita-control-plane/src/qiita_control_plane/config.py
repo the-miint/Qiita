@@ -31,14 +31,6 @@ _DEFAULT_MAX_SEQUENCE_MINT_COUNT = 10_000_000_000
 
 _DEFAULT_CP_TO_CO_TOKEN_PATH = Path("/etc/qiita/cp-to-co.token")
 
-# Filesystem roots — defined once at module scope so the dataclass
-# default, the `from_env` fallback, and `runner.DEFAULT_*` cannot drift
-# independently. `runner.py` re-imports both. The Rust data-plane
-# (`UPLOAD_STAGING_ROOT` env var, qiita-data-plane/src/config.rs) has
-# to spell the same path independently; production must set both.
-DEFAULT_UPLOAD_STAGING_ROOT = Path("/scratch/ephemeral/staging")
-DEFAULT_WORKSPACE_ROOT = Path("/scratch/ephemeral/workspace")
-
 
 def _parse_positive_int_env(var: str, default: int) -> int:
     """Read `var` from the environment as a positive int, or fall back to
@@ -94,22 +86,25 @@ class Settings:
     auth_handoff_freshness_seconds: int = _DEFAULT_AUTH_HANDOFF_FRESHNESS_SECONDS
     cli_login_code_ttl_seconds: int = _DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS
     max_sequence_mint_count: int = _DEFAULT_MAX_SEQUENCE_MINT_COUNT
-    # Filesystem root the data plane writes DoPut uploads under. The runner
-    # resolves `*_upload_idx` keys in a work_ticket's action_context to
-    # `{root}/uploads/{idx}/upload.parquet` (compute_upload_staging_path)
-    # before invoking workflow steps. Default matches the data plane's
-    # `UPLOAD_STAGING_ROOT` default; in production both sides set the env
-    # var to the same shared-filesystem path. `runner.DEFAULT_UPLOAD_STAGING_ROOT`
-    # mirrors this value as a default for `run_workflow`'s kwarg.
-    upload_staging_root: Path = DEFAULT_UPLOAD_STAGING_ROOT
-    # Per-work_ticket workspace root the runner mints attempt subdirs under
-    # (`<workspace_root>/<work_ticket_idx>/<entry-name>/attempt-<N>/`).
-    # Production points this at the shared scratch filesystem; integration
-    # tests override via the WORKSPACE_ROOT env var so the runner doesn't
-    # try to create `/scratch/ephemeral/workspace` on CI agents.
-    # `runner.DEFAULT_WORKSPACE_ROOT` mirrors this value for `run_workflow`'s
-    # default kwarg.
-    workspace_root: Path = DEFAULT_WORKSPACE_ROOT
+    # Filesystem root the workflow runner mints per-ticket workspaces under
+    # (`<root>/<work_ticket_idx>/<step>/attempt-N/`). The CP creates the
+    # subdir; the path is POSTed to the orchestrator as the SLURM job's
+    # `current_working_directory`, so the same path must resolve on every
+    # compute node — i.e. a shared filesystem mount. On a single-host
+    # deploy this is the same dir as the orchestrator's SHARED_FILESYSTEM_ROOT.
+    # Optional in the dataclass so tests don't have to set it; required by
+    # from_env() so production boot fails fast if WORK_TICKET_WORKSPACE_ROOT
+    # is unset. dispatch._run_and_log raises if None reaches use-time.
+    work_ticket_workspace_root: Path | None = None
+    # Filesystem root the data plane writes DoPut uploads under, shared
+    # between CP and DP. The runner resolves `*_upload_idx` keys in a
+    # work_ticket's action_context to `{root}/uploads/{idx}/upload.parquet`
+    # (compute_upload_staging_path) before invoking workflow steps. The Rust
+    # data plane carries its own UPLOAD_STAGING_ROOT env var (config.rs) —
+    # both sides must be set to the same shared-filesystem path. Same
+    # required-but-Optional shape as work_ticket_workspace_root for the same
+    # reasons; dispatch._run_and_log raises if None reaches use-time.
+    upload_staging_root: Path | None = None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -131,6 +126,28 @@ class Settings:
         cp_to_co_token_path = Path(
             os.environ.get("CP_TO_CO_TOKEN_PATH", str(_DEFAULT_CP_TO_CO_TOKEN_PATH))
         )
+
+        # Required + must be absolute. Relative paths would be resolved
+        # against the service's CWD (whatever systemd / uvicorn happened to
+        # start in), which is non-obvious surface for an operator to reason
+        # about. Force the operator to spell out the shared mount. Same
+        # treatment for UPLOAD_STAGING_ROOT — the DP writes uploads here and
+        # the CP runner resolves `*_upload_idx` action_context keys against
+        # it; a mismatched or non-absolute root surfaces as a "no such file"
+        # deep inside a workflow step, long after the route returned.
+        ws_root_raw = require_env("WORK_TICKET_WORKSPACE_ROOT")
+        ws_root = Path(ws_root_raw)
+        if not ws_root.is_absolute():
+            raise RuntimeError(
+                f"WORK_TICKET_WORKSPACE_ROOT must be an absolute path, got {ws_root_raw!r}"
+            )
+
+        upload_root_raw = require_env("UPLOAD_STAGING_ROOT")
+        upload_root = Path(upload_root_raw)
+        if not upload_root.is_absolute():
+            raise RuntimeError(
+                f"UPLOAD_STAGING_ROOT must be an absolute path, got {upload_root_raw!r}"
+            )
 
         return cls(
             database_url=require_env("DATABASE_URL"),
@@ -171,8 +188,6 @@ class Settings:
                 "QIITA_MAX_SEQUENCE_MINT_COUNT",
                 _DEFAULT_MAX_SEQUENCE_MINT_COUNT,
             ),
-            upload_staging_root=Path(
-                os.environ.get("UPLOAD_STAGING_ROOT", str(DEFAULT_UPLOAD_STAGING_ROOT))
-            ),
-            workspace_root=Path(os.environ.get("WORKSPACE_ROOT", str(DEFAULT_WORKSPACE_ROOT))),
+            work_ticket_workspace_root=ws_root,
+            upload_staging_root=upload_root,
         )

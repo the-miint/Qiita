@@ -7,8 +7,9 @@ SlurmBackend.run_step where the workflow context is available.
 Auth model:
   - SLURM JWT is read from a file at construction time and cached on
     the instance. Each request sends it in `X-SLURM-USER-TOKEN`. The
-    SLURM user identity rides in `X-SLURM-USER-NAME` (typically the
-    orchestrator's system user, e.g. `qiita-orch`).
+    SLURM user identity rides in `X-SLURM-USER-NAME` — the SLURM
+    job-execution user (e.g. `qiita-job`), distinct from the
+    orchestrator's own system user.
   - SLURM rotates JWTs periodically. On a 401, the client reloads the
     file and retries once. If the retry also 401s, it raises — a stale
     or unreadable token is operator-fixable, not retriable internally.
@@ -113,16 +114,16 @@ class SlurmrestdClient:
     Usage:
 
         async with SlurmrestdClient(
-            base_url="http://slurm-controller:6820",
+            base_url="http://slurmrestd-host:6820",   # the slurmrestd host, NOT slurmctld
             jwt_path=Path("/var/spool/slurm/jwt-token"),
-            user_name="qiita-orch",
+            user_name="qiita-job",
         ) as client:
             job_id = await client.submit_job(payload)
             info = await client.get_job(job_id)
 
     Constructor accepts an optional `http_client` for tests — pass an
     `httpx.AsyncClient` with a `httpx.MockTransport` to drive the unit
-    tests without a live SLURM controller.
+    tests without a live slurmrestd.
     """
 
     def __init__(

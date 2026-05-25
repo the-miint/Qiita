@@ -9,6 +9,15 @@ import pytest
 _TEST_SECRET_B64 = base64.b64encode(secrets.token_bytes(32)).decode()
 
 
+@pytest.fixture(autouse=True)
+def _set_workspace_root(monkeypatch):
+    """Default WORK_TICKET_WORKSPACE_ROOT + UPLOAD_STAGING_ROOT for every
+    test. Tests that specifically exercise an env var's absence or invalid
+    values can `delenv` / `setenv` to override after this fixture runs."""
+    monkeypatch.setenv("WORK_TICKET_WORKSPACE_ROOT", "/tmp/qiita-test-ws-unused")
+    monkeypatch.setenv("UPLOAD_STAGING_ROOT", "/tmp/qiita-test-staging-unused")
+
+
 def test_settings_has_database_url(monkeypatch):
     """Settings must expose a database_url field read from DATABASE_URL env var."""
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
@@ -129,3 +138,88 @@ def test_settings_rejects_non_integer_max_sequence_mint_count(monkeypatch):
 
     with pytest.raises(RuntimeError, match="QIITA_MAX_SEQUENCE_MINT_COUNT"):
         Settings.from_env()
+
+
+def test_settings_requires_work_ticket_workspace_root(monkeypatch):
+    """Production boot must fail fast if WORK_TICKET_WORKSPACE_ROOT is
+    unset — the alternative is the first dispatched ticket failing at
+    `mkdir` inside the runner, after the route has already returned 202."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.delenv("WORK_TICKET_WORKSPACE_ROOT", raising=False)
+
+    from qiita_control_plane.config import Settings
+
+    with pytest.raises(RuntimeError, match="WORK_TICKET_WORKSPACE_ROOT"):
+        Settings.from_env()
+
+
+def test_settings_rejects_relative_work_ticket_workspace_root(monkeypatch):
+    """A relative path resolves against the service's CWD (whatever
+    systemd / uvicorn happened to start in), which is non-obvious surface
+    for an operator. Force absolute."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.setenv("WORK_TICKET_WORKSPACE_ROOT", "relative/path")
+
+    from qiita_control_plane.config import Settings
+
+    with pytest.raises(RuntimeError, match="WORK_TICKET_WORKSPACE_ROOT must be an absolute path"):
+        Settings.from_env()
+
+
+def test_settings_work_ticket_workspace_root_set_from_env(monkeypatch):
+    """The happy path: an absolute WORK_TICKET_WORKSPACE_ROOT is loaded
+    as a Path on the Settings object."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.setenv("WORK_TICKET_WORKSPACE_ROOT", "/var/lib/qiita/orch-workspace")
+
+    from pathlib import Path
+
+    from qiita_control_plane.config import Settings
+
+    settings = Settings.from_env()
+    assert settings.work_ticket_workspace_root == Path("/var/lib/qiita/orch-workspace")
+
+
+def test_settings_requires_upload_staging_root(monkeypatch):
+    """Production boot must fail fast if UPLOAD_STAGING_ROOT is unset —
+    a missing root surfaces only when an `*_upload_idx` action_context
+    key gets resolved deep inside the runner, after the route has already
+    returned 202."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.delenv("UPLOAD_STAGING_ROOT", raising=False)
+
+    from qiita_control_plane.config import Settings
+
+    with pytest.raises(RuntimeError, match="UPLOAD_STAGING_ROOT"):
+        Settings.from_env()
+
+
+def test_settings_rejects_relative_upload_staging_root(monkeypatch):
+    """Same rationale as WORK_TICKET_WORKSPACE_ROOT — a relative path
+    resolves against the service CWD."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.setenv("UPLOAD_STAGING_ROOT", "relative/staging")
+
+    from qiita_control_plane.config import Settings
+
+    with pytest.raises(RuntimeError, match="UPLOAD_STAGING_ROOT must be an absolute path"):
+        Settings.from_env()
+
+
+def test_settings_upload_staging_root_set_from_env(monkeypatch):
+    """Happy path: absolute UPLOAD_STAGING_ROOT is loaded as a Path."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.setenv("UPLOAD_STAGING_ROOT", "/var/lib/qiita/uploads")
+
+    from pathlib import Path
+
+    from qiita_control_plane.config import Settings
+
+    settings = Settings.from_env()
+    assert settings.upload_staging_root == Path("/var/lib/qiita/uploads")

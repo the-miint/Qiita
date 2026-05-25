@@ -24,6 +24,10 @@
 CREATE TABLE qiita.upload (
     upload_idx       BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
 
+    -- Mirrored by qiita_common.models.UploadStatus. Stored as TEXT/CHECK,
+    -- not a Postgres ENUM — same carve-out as reference.status and
+    -- auth_event.event_type; see CLAUDE.md "Enum parity". Keep both sides
+    -- in sync by hand.
     status           TEXT NOT NULL DEFAULT 'pending'
                      CHECK (status IN ('pending', 'ready', 'consumed', 'failed')),
 

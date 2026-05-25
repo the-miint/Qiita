@@ -45,9 +45,14 @@ impl Settings {
             let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
             format!("{base}/qiita/ducklake")
         });
-        let upload_staging_root = std::env::var("UPLOAD_STAGING_ROOT")
-            .unwrap_or_else(|_| "/scratch/ephemeral/staging".to_string())
-            .into();
+        let upload_staging_raw = std::env::var("UPLOAD_STAGING_ROOT")
+            .map_err(|_| "UPLOAD_STAGING_ROOT is required but not set".to_string())?;
+        let upload_staging_root: PathBuf = upload_staging_raw.clone().into();
+        if !upload_staging_root.is_absolute() {
+            return Err(format!(
+                "UPLOAD_STAGING_ROOT must be an absolute path, got {upload_staging_raw:?}"
+            ));
+        }
 
         Ok(Self {
             listen_addr,

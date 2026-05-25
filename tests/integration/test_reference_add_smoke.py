@@ -169,7 +169,7 @@ async def test_reference_add_workflow_end_to_end(
         backend_client,  # type: ignore[arg-type]  # protocol-shaped duck
         hmac_secret=b"unused-in-smoke",
         data_plane_url="grpc://unused:0",
-        workspace_root=workspace_root,
+        work_ticket_workspace_root=workspace_root,
         upload_staging_root=upload_staging_root,
     )
 

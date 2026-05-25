@@ -10,13 +10,13 @@ reference rows is legitimate here. The orchestrator is reduced to its
 SLURM-driver role behind `POST /step/run`.
 
 Workspace contract: each entry runs against a per-attempt subdir
-`<workspace_root>/<work_ticket_idx>/<entry-name>/attempt-<N>/` minted by
-`_run_entry_with_retry`. The nesting gives two properties at once —
-retries land in fresh dirs (the verifier's "every file in $output_path
-must be in manifest" gate stays clean), and prior attempts persist on
-disk for postmortem. Entries see each other's outputs via the runner's
-binding map, which carries absolute paths forward so consumers don't
-need to know the producer's attempt number.
+`<work_ticket_workspace_root>/<work_ticket_idx>/<entry-name>/attempt-<N>/`
+minted by `_run_entry_with_retry`. The nesting gives two properties at
+once — retries land in fresh dirs (the verifier's "every file in
+$output_path must be in manifest" gate stays clean), and prior attempts
+persist on disk for postmortem. Entries see each other's outputs via
+the runner's binding map, which carries absolute paths forward so
+consumers don't need to know the producer's attempt number.
 """
 
 from __future__ import annotations
@@ -44,12 +44,6 @@ from qiita_common.models import (
 from .actions.library import LIBRARY
 from .actions.reference import transition_reference_status
 
-# Re-export the canonical config-side defaults so the runner's `run_workflow`
-# default kwargs and `Settings`' dataclass defaults can't drift. The Rust
-# data plane carries its own UPLOAD_STAGING_ROOT default (config.rs); in
-# production all three are set to the same env-overridden path.
-from .config import DEFAULT_UPLOAD_STAGING_ROOT, DEFAULT_WORKSPACE_ROOT  # noqa: F401
-
 _log = logging.getLogger(__name__)
 
 # Suffix that marks an action_context key as a DoPut upload handle. The
@@ -66,8 +60,8 @@ async def run_workflow(
     *,
     hmac_secret: bytes,
     data_plane_url: str,
-    workspace_root: Path = DEFAULT_WORKSPACE_ROOT,
-    upload_staging_root: Path = DEFAULT_UPLOAD_STAGING_ROOT,
+    work_ticket_workspace_root: Path,
+    upload_staging_root: Path,
 ) -> None:
     """Execute the workflow attached to one work ticket.
 
@@ -105,7 +99,7 @@ async def run_workflow(
         new=WorkTicketState.PROCESSING,
     )
 
-    workspace = workspace_root / str(work_ticket_idx)
+    workspace = work_ticket_workspace_root / str(work_ticket_idx)
     workspace.mkdir(parents=True, exist_ok=True)
 
     bound: dict[str, Any] = dict(work_ticket["action_context"] or {})

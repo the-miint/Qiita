@@ -1,266 +1,674 @@
 # First-deploy bootstrap
 
 **Purpose.** Operator runbook for bringing up a fresh deployment: from
-env-var configuration through migrations against a clean database, the
+host provisioning through migrations against a clean database, the
 first OIDC login, operator promotion to `system_admin`, data-plane
 bootstrap, and orchestrator startup. End state: all three services
 authenticated and ready to serve traffic. Each step is independent —
 re-running it should be safe (idempotent) unless noted.
 
 For the conceptual reference (principal model, scopes, endpoints), see
-[`docs/auth.md`](../auth.md). [`orchestrator-token-rotation.md`](orchestrator-token-rotation.md)
-documents the future rotation procedure for the orchestrator's own
-service-account PAT — not currently used in v1 (the orchestrator
-authenticates to the CP via the shared bearer in step 7; a PAT will be
-needed once `SlurmBackend` lands and the orchestrator gains CO→CP
-callbacks).
+[`docs/auth.md`](../auth.md). The orchestrator authenticates to the CP
+in two directions: the shared bearer (`/etc/qiita/cp-to-co.token`,
+step 7) for inbound CP→CO calls, and a `compute-worker` service-account
+PAT (`/etc/qiita/co-to-cp.token`, provisioned per
+[`compute-service-account-provisioning.md`](compute-service-account-provisioning.md))
+for outbound CO→CP callbacks like `POST /sequence-range`. Rotation of
+the compute-worker PAT follows
+[`orchestrator-token-rotation.md`](orchestrator-token-rotation.md).
+
+> **Optional workflow tip.** If you have access to Claude (claude.ai/code
+> or the CLI), pointing it at this runbook and asking it to walk you
+> through one command at a time — pasting each command's output back —
+> tends to catch failure modes the runbook doesn't yet anticipate
+> (sudoer PATH quirks, cross-distro path conventions, conda shadowing,
+> AuthRocket UI drift, etc.). The non-obvious gotchas captured below
+> were surfaced this way. The runbook is meant to be self-contained
+> without an AI assistant — every step has its own verification
+> command; this tip is a convenience, not a prerequisite.
+
+## Account model
+
+This runbook uses two account labels on every command — both are *roles*,
+not OS users, deliberately distinct from the `qiita-*` service-account
+naming (`qiita-api`, `qiita-orch`, `qiita-data`, `qiita-job`):
+
+| Label | What it means |
+|---|---|
+| `[operator]` | A shared, named operational account on the deploy host — typically a user literally named `qiita` (don't confuse with `qiita-api` etc.). **No sudo.** Owns the clone, holds shell env vars across steps, runs `make migrate`, owns `~/.qiita/token`. |
+| `[admin]` | Your own personal account with sudo. Runs everything that touches `/etc/qiita/`, `/opt/qiita/`, `/etc/systemd/`, `/etc/nginx/`, and `systemctl`. |
+
+The operator account (`qiita` in this runbook; substitute your site's
+name) must **not** be a member of any of `qiita-services`,
+`qiita-pipeline`, `qiita-data`, `qiita-fs`, or `qiita-job` — otherwise
+the operator gains read access to service secrets and lake data, which
+defeats the privilege separation the service users provide. Verify
+with `id <operator>` in step 0.
+
+Service start/stop authority on the qiita-* units is **root only**
+(same model as `postgresql.service` / `nginx.service`). Operators run
+`sudo systemctl restart qiita-control-plane` from their personal admin
+account. There is no polkit rule or sudoers grant for `qiita`.
+
+## Deploy mechanics: the two entry points
+
+This runbook references two scripts under `deploy/`. They share the
+same install logic; the difference is where the artifacts come from:
+
+- **`deploy/activate.sh`** — installs whatever's already in
+  `/opt/qiita/incoming/` (rsync target). Run by **CI** after CI builds
+  on a separate host and rsyncs the artifacts over. CI invokes it
+  directly: `sudo QIITA_HOSTNAME=... deploy/activate.sh`.
+- **`deploy/local-deploy.sh`** — the **manual / CI-less** entry point.
+  Run on the deploy host from a local git clone. It does the rsync
+  (after `git pull` + `make build-data-plane` as the operator account)
+  and then exec's `activate.sh`. First deploy uses this; ongoing manual
+  deploys also use this. Until CI exists, this is the only deploy path.
+
+When CI lands, ongoing deploys move to it automatically; `local-deploy.sh`
+remains as the manual fallback (broken CI, hotfix from a feature
+branch, etc.).
 
 ## 0. Prerequisites
 
-This runbook assumes the host has already been provisioned. Specifically:
+This runbook assumes the host has been provisioned by your infra / DBA
+team. Each prerequisite below comes with a one-line verification
+command so you can confirm the state before running step 1.
 
-**System users exist** (created once by your sysadmin / infrastructure team
-as non-login system accounts):
+### 0.1 System users + groups
+
+System users (created once as non-login system accounts):
 
 | User | Role |
 |---|---|
-| `qiita-api` | Control plane (FastAPI service) |
+| `qiita-api` | Control plane (FastAPI) |
 | `qiita-orch` | Compute orchestrator |
 | `qiita-data` | Data plane (Arrow Flight / Rust) |
-| `qiita-job` | SLURM workers — runs containerized workflow jobs |
+| `qiita-job` | SLURM job-execution identity (workflow jobs run as this user on the cluster); on the deploy host, also owns the JWT-refresh timer |
 
-**System groups exist**:
+System groups (composition matters):
 
 | Group | Members | Purpose |
 |---|---|---|
-| `qiita-services` | `qiita-api`, `qiita-orch` | Read shared secrets (e.g. `/etc/qiita/cp-to-co.token`) that both the control plane and the compute orchestrator need access to. |
-| `qiita-pipeline` | `qiita-data`, `qiita-job` | Lets the data plane read SLURM job outputs. Jobs write Parquet under `/scratch/ephemeral/staging/` as `qiita-job:qiita-pipeline` mode `440`; the data plane reads them via group membership and renames into `/data/parquet/`. The 440 mode (enforced as a pre-registration gate by the DP) prevents any other `qiita-job` process from overwriting a registered file. |
+| `qiita-services` | `qiita-api`, `qiita-orch` | Read shared service secrets (`/etc/qiita/cp-to-co.token`). |
+| `qiita-pipeline` | `qiita-api`, `qiita-data`, `qiita-job` | Two adjacent jobs: (a) staging handoff — SLURM jobs write Parquet under the staging dir, DP reads via group membership; (b) orchestrator workspace — qiita-api (CP runner) writes per-ticket subdirs via group, alongside `qiita-orch` (owner) and `qiita-job` (output writer). Sites sometimes provision under a different name (e.g. `qiita-fs`) — what matters is the *membership*. |
+| `qiita-data` | `qiita-data` (single member) | Locks the durable Parquet dir to the DP only. Required as a separate group so the data dir at mode `0750` does **not** also grant read to `qiita-job` (which would defeat the staging/parquet split). |
 
-Deliberately *not* one combined group: putting `qiita-job` in `qiita-services` would give workflow job code (which may execute user-authored containers) read access to `/etc/qiita/cp-to-co.token` and any future shared service secret. Keep secret-sharing and pipeline-handoff separate.
+`qiita-api` belongs to **both** `qiita-services` and `qiita-pipeline`.
+The pipeline membership is what lets the CP runner mkdir per-ticket
+workspaces under the orchestrator workspace dir (see §0.3) — without
+it, the first work-ticket dispatch fails at `workspace.mkdir(...)`
+because the dir is owned `qiita-orch:qiita-pipeline 2770`. `qiita-orch`
+is deliberately *not* in `qiita-pipeline` here; ownership is what gives
+it write access, which keeps the orchestrator's group reach bounded.
 
-These are independent identities from the Postgres roles (`qiita_miint_rw`,
-`qiita_miint_lake_rw`) and from qiita's own principal/PAT model — same name
-in different layers does not imply a connection.
+> **Known gap — nested workspace dir perms.** The pipeline-membership
+> fix gets the CP runner *into* the workspace root, but the per-ticket
+> subdirs it creates inherit systemd's default UMask (0022), so they
+> land mode `0755`: `qiita-orch` is "other" → 0o5 → traverse but no
+> write. The orchestrator's SlurmBackend then tries to mkdir
+> `input/output/logs` under the attempt dir and hits PermissionError.
+> The marker-file SLURM verification did not exercise this path; the
+> first real fastq-to-parquet dispatch will. Three plausible
+> mitigations, none shipped today: (a) set `UMask=0007` on the
+> `qiita-control-plane` systemd unit, so the CP runner's mkdir mode
+> becomes `2770` and `qiita-orch` (via group `qiita-pipeline`) gains
+> write; (b) explicit `chmod(0o2770)` after each `mkdir` in
+> `qiita-control-plane/src/qiita_control_plane/runner.py`; or (c) add
+> `qiita-orch` to `qiita-pipeline` (revises the "ownership not
+> membership" stance above and widens the orchestrator's group
+> reach). Pick one before the first end-to-end workflow runs; (a) is
+> the smallest change and the one most aligned with the existing
+> setgid-propagation pattern.
 
-**Postgres databases and roles exist** (provided by your DBA /
-infrastructure team): see step 1 (`qiita_miint`) and step 8
-(`qiita_miint_lake`).
-
-**Code is installed** at `/opt/qiita/` via `deploy/activate.sh` (rsync from
-your build host). systemd units are copied to `/etc/systemd/system/`,
-`daemon-reload` has run, and nginx config is at `/etc/nginx/conf.d/qiita.conf`.
-
-**Reverse proxy is up** with TLS termination, configured to route REST to
-the CP and gRPC to the DP. The shipped template (`deploy/nginx/qiita.conf`)
-contains a `__QIITA_HOSTNAME__` placeholder that `deploy/activate.sh`
-substitutes at deploy time using the `QIITA_HOSTNAME` env var
-(e.g. `QIITA_HOSTNAME=qiita-miint.ucsd.edu`). The rendered conf expects:
-
-- TLS cert / key at `/etc/ssl/certs/qiita.crt` and `/etc/ssl/private/qiita.key`
-- DNS for `$QIITA_HOSTNAME` resolving to the deploy host
-- nginx reloaded after the substitution (the activate script does this)
-
-**You (the operator) have sudo** for the commands below: writing
-`/etc/qiita/*.env`, creating data directories, and running
-`systemctl enable --now`. Service processes themselves run as the system
-users above (systemd drops to `User=` from each unit), not as you.
-
-**Pick a data root.** The data plane writes Parquet under the deploy's
-durable shared mount; the runbook below threads that path through env
-files and `install -d` commands by heredoc-expanding `$QIITA_DATA_ROOT`
-from the operator's shell. The default `/data` works on the dev VM
-defined in this repo's compose file; production deploys whose shared
-filesystem is mounted elsewhere override:
-
+Verification:
 ```bash
-# Stays in the operator's shell across the next several env-file writes
-# and `install -d` commands. Substitute the actual mount path your
-# infrastructure team provisioned.
-export QIITA_DATA_ROOT=/your/shared/mount
+# [either] system users exist with nologin shell
+getent passwd qiita qiita-api qiita-orch qiita-data qiita-job
+
+# [either] groups exist with expected memberships
+getent group qiita-services qiita-pipeline qiita-data
+
+# [either] service users have the right primary / secondary groups
+# (qiita-api must show BOTH qiita-services AND qiita-pipeline in `groups=`)
+id qiita-api qiita-orch qiita-data qiita-job
+
+# [either] operator is NOT in any service group
+id qiita
 ```
 
-`QIITA_DATA_ROOT` is purely a runbook-template variable: no Qiita process
-reads it directly. Switching mount paths later is a one-line export
-change rather than a multi-file search-and-replace.
+### 0.2 Postgres databases + roles
+
+Provided by your DBA:
+
+- `qiita_miint` database with `qiita_miint_rw` role (used by the control plane)
+- `qiita_miint_lake` database with `qiita_miint_lake_rw` role (used by the data plane as DuckLake catalog)
+- Network reachability from the deploy host to the Postgres host
+- **Postgres extensions enabled** in `qiita_miint`: `citext` (required by the auth migrations). Created by the DBA as superuser: `sudo -u postgres psql -d qiita_miint -c "CREATE EXTENSION IF NOT EXISTS citext;"`. The `qiita_miint_rw` role doesn't need CREATE-EXTENSION privilege; the extension being installed at the DB level is enough. Keep this list current by grepping `qiita-control-plane/db/migrations/` for `CREATE EXTENSION` before each deploy.
+- **NTP** running on both the deploy host and the PG host. A `cli_login_code` CHECK constraint (`expires_at > created_at`) compares a Python-computed `expires_at` against a PG-computed `created_at`; clock drift larger than `CLI_LOGIN_CODE_TTL_SECONDS` (default 30s) violates it and produces a 500 on `/auth/handoff`. Standard `chronyd` setup on both hosts; verify with `chronyc tracking` and `timedatectl`.
+
+Verification:
+```bash
+# [operator] interactive password prompt avoids putting the password in shell history
+psql -h <pg-host> -U qiita_miint_rw -d qiita_miint -W \
+    -c "SELECT current_user, current_database();"
+
+psql -h <pg-host> -U qiita_miint_lake_rw -d qiita_miint_lake -W \
+    -c "SELECT current_user, current_database();"
+
+# [operator] confirm citext is enabled and clock skew is small
+psql -h <pg-host> -U qiita_miint_rw -d qiita_miint -W -c "
+  SELECT 'a'::citext = 'A'::citext AS citext_ok,
+         extract(epoch from (now() AT TIME ZONE 'UTC' - now())) AS pg_now_utc_offset;"
+date -u  # compare with the pg_now_utc_offset above — should agree within seconds
+```
+
+### 0.3 Shared filesystem
+
+The data plane writes Parquet under a durable shared mount; SLURM jobs
+write to a staging mount that's ideally on the same filesystem (for the
+atomic rename fast path). The compute orchestrator stages per-ticket
+workspaces under a third shared mount, visible from every compute node
+(SLURM uses it as the job's `current_working_directory`).
+
+| Path role | Owner | Group | Mode | Notes |
+|---|---|---|---|---|
+| Mount point parent | `root` | `root` | `0755` | Infra-owned. |
+| Final Parquet dir | `qiita-data` | `qiita-data` | `0750` | DP-only. Two valid postures (see below). |
+| Staging dir | `qiita-data` | `qiita-pipeline` | `2770` | Setgid forces `qiita-pipeline` group on inherited files. |
+| Orchestrator workspace dir | `qiita-orch` | `qiita-pipeline` | `2770` | Holds per-ticket workspace trees (`<work_ticket_idx>/<step>/attempt-N/`). `qiita-orch` writes per-step subdirs as owner; `qiita-api` (CP runner) and `qiita-job` (SLURM job outputs) write via the `qiita-pipeline` group. Setgid carries the group to inherited files. Two valid postures (see below). |
+
+Two valid postures for the final Parquet dir:
+
+- **Subdir-of-mount** (runbook default): mount stays infra-owned; a
+  `parquet/` subdir under it is what carries `qiita-data:qiita-data 0750`.
+  Use this when the mount may host other content alongside Parquet.
+- **Mount-as-data**: the mount point itself is `qiita-data:qiita-data
+  0750`. Use this when the mount is dedicated to qiita's lake. Simpler.
+
+Two valid postures for the orchestrator workspace dir, mirroring the
+above:
+
+- **Subdir-of-mount**: an `orch-workspace/` subdir under `<scratch>`
+  (or another shared mount) carries the `qiita-orch:qiita-pipeline 2770`
+  ownership. Use when the mount hosts other content alongside.
+- **Mount-as-workspace** (this deploy's posture): the mount itself is
+  `qiita-orch:qiita-pipeline 2770`. Use when the mount is dedicated to
+  orchestrator workspaces.
+
+**Placeholder vocabulary used downstream.** `<mount>` and `<scratch>`
+refer to the *roots* (the parent mounts). `<data-dir>`, `<staging-dir>`,
+and `<orch-workspace>` are the *final paths*: under subdir-of-mount,
+`<data-dir>` = `<mount>/parquet`, `<staging-dir>` = `<scratch>/staging`,
+`<orch-workspace>` = `<scratch>/orch-workspace`; under mount-as-data /
+mount-as-workspace the corresponding root path IS the final dir.
+
+Three places consume these placeholders, named here so renumbering
+doesn't strand the reference:
+- the data-plane dir-creation step uses `<mount>` / `<scratch>`
+- the orchestrator workspace dir-creation step uses `<scratch>` /
+  `<orch-workspace>`
+- the env-file rendering steps wire `DUCKLAKE_DATA_PATH=<data-dir>`
+  (data plane), `WORK_TICKET_WORKSPACE_ROOT=<orch-workspace>` (control
+  plane), and `SHARED_FILESYSTEM_ROOT=<orch-workspace>` (compute
+  orchestrator — same path as the CP env var on a single-host deploy)
+- the end-to-end smoke references both `<data-dir>` and
+  `<orch-workspace>` paths.
+
+Verification:
+```bash
+# [either]
+stat -c '%n  owner=%U  group=%G  mode=%a  device=%d' <data-dir> <staging-dir> <orch-workspace>
+```
+
+Watch the **device numbers**: if data and staging are on different
+volumes, the DP's rename from staging to final falls back to
+copy+delete. Works correctly, just slower. Flag to infra if you want
+the fast path; not blocking otherwise.
+
+### 0.4 nginx + TLS + DNS
+
+Required:
+
+- nginx is installed and `active` on the deploy host.
+- DNS for the externally-resolvable hostname (e.g. `qiita.example.org`)
+  resolves to this host.
+- TLS cert + key are installed.
+
+**Cert path convention varies by distro family**:
+
+- Debian-family: typically `/etc/ssl/certs/...`, `/etc/ssl/private/...`
+- RHEL-family (Rocky / RHEL / Alma): typically `/etc/pki/tls/certs/...`, `/etc/pki/tls/private/...`
+
+The shipped nginx template (`deploy/nginx/qiita.conf`) hard-codes the
+Debian paths at `/etc/ssl/certs/qiita.crt` and `/etc/ssl/private/qiita.key`.
+On a RHEL-family host where the sysadmin installed certs under
+`/etc/pki/tls/`, **symlink** the qiita-expected paths to where the
+certs actually live:
+```bash
+# [admin]
+sudo install -d -o root -g root -m 0755 /etc/ssl/certs
+sudo install -d -o root -g root -m 0710 /etc/ssl/private
+sudo ln -s /etc/pki/tls/certs/<cert>.cer    /etc/ssl/certs/qiita.crt
+sudo ln -s /etc/pki/tls/private/<key>.key   /etc/ssl/private/qiita.key
+```
+Symlinks survive in-place cert rotation (sysadmin replaces the underlying
+file; symlink target stays valid) and survive every redeploy. Editing
+`qiita.conf` to point at the real paths is a trap: `activate.sh`
+re-installs the upstream template on every deploy and silently
+overwrites the edit.
+
+Verification:
+```bash
+# [admin]
+systemctl is-active nginx
+sudo ls -la /etc/ssl/certs/qiita.crt /etc/ssl/private/qiita.key
+sudo readlink -f /etc/ssl/certs/qiita.crt /etc/ssl/private/qiita.key
+dig +short <fqdn>
+hostname -I
+```
+
+If there's a pre-existing `/etc/nginx/conf.d/default.conf` (or any
+non-qiita vhost) on the host, disable it before reloading nginx — it
+can shadow `qiita.conf` and serve a different TLS chain that breaks
+AuthRocket's URL validator on first realm setup:
+```bash
+# [admin]
+sudo mv /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/default.conf.disabled
+```
+
+### 0.5 Build + ops tooling
+
+The deploy host needs the toolchain to compile the data-plane binary
+and create the Python service venvs. Install system-wide so they're
+available to both `[operator]` (for `make migrate`, `qiita-admin`) and
+`[admin]` (for `deploy/local-deploy.sh`).
+
+| Tool | Why needed | Rocky 10 install |
+|---|---|---|
+| `git`, `make`, `psql`, `curl`, `openssl`, `jq` | basic ops | usually pre-installed; if any are missing, `sudo dnf install -y <tool-name>` |
+| `gcc`, `gcc-c++`, `cmake` | build duckdb (bundled) | `sudo dnf install -y gcc gcc-c++ cmake` |
+| `rust`, `cargo` | build data plane | `sudo dnf install -y rust cargo` |
+| `apptainer` | run workflow containers (optional for first deploy) | `sudo dnf install -y epel-release && sudo dnf install -y apptainer` |
+| `uv` | Python venv management | not in dnf — install standalone (see below) |
+
+uv install (standalone tarball, no `curl \| sh`-as-root):
+```bash
+# [admin]
+cd /tmp && \
+  curl -LsSf -o uv.tar.gz https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-gnu.tar.gz && \
+  tar -xzf uv.tar.gz && \
+  sudo install -m 0755 uv-x86_64-unknown-linux-gnu/uv  /usr/local/bin/uv && \
+  sudo install -m 0755 uv-x86_64-unknown-linux-gnu/uvx /usr/local/bin/uvx && \
+  rm -rf uv-x86_64-unknown-linux-gnu uv.tar.gz
+```
+
+`dbmate` (used by `make migrate`) and `grpcurl` (used by `make
+verify-health`) **do not** need a system-wide install — the Makefile
+auto-fetches them into `~/.local/bin/` of whoever runs them.
+
+Verification:
+```bash
+# [admin]
+command -v uv cargo rustc apptainer cmake gcc g++ make rsync
+```
+All should resolve to `/usr/local/bin/...` or `/usr/bin/...`.
+
+### 0.6 sudo's `secure_path`
+
+RHEL-family `/etc/sudoers` ships with a `secure_path` that does **not**
+include `/usr/local/bin`. So `sudo uv ...` fails with "command not found"
+even though `uv` is at `/usr/local/bin/uv`. The shipped
+`deploy/activate.sh` works around this by hard-coding `/usr/local/bin/uv`,
+but for any other sudo'd commands you'd run that need `/usr/local/bin`
+tools, either use the full path or have the sysadmin add the directory
+to `secure_path`:
+```
+Defaults  secure_path = /sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin
+```
+
+### 0.7 Conda interference on shared operator accounts
+
+If your operator account (e.g. `qiita`) is a shared cross-server
+identity whose login dotfiles auto-activate a conda environment
+(common on HPC sites), conda will shadow system binaries (`openssl`,
+`jq`) and add noise. To keep the deploy host clean without disturbing
+the account's setup elsewhere, append a host-scoped opt-out to
+`~/.bash_profile` on the deploy host:
+```bash
+if [ "$(hostname -s)" = "<deploy-hostname>" ]; then
+    while [ -n "${CONDA_DEFAULT_ENV:-}" ]; do conda deactivate 2>/dev/null || break; done
+    [ -n "${PATH:-}" ] && export PATH=$(echo "$PATH" | awk -v RS=: -v ORS=: '!/miniconda3|conda/' | sed 's/:$//')
+    unset -f conda 2>/dev/null
+    unset CONDA_SHLVL CONDA_DEFAULT_ENV CONDA_PYTHON_EXE CONDA_EXE CONDA_PREFIX 2>/dev/null
+fi
+```
+Reopen the shell to confirm `command -v python openssl jq` resolves
+under `/usr/bin/`.
+
+### 0.8 AuthRocket realm
+
+Configured per [`authrocket-realm-setup.md`](authrocket-realm-setup.md).
+The realm must be reachable (`curl -sSf
+https://<realm>.loginrocket.com/connect/jwks` returns a JWKS JSON)
+**before** step 1.
+
+**Ordering caveat**: if AuthRocket's "App or login URL" field validation
+fails, it's almost certainly because the validator probes the URL and
+your nginx isn't serving cleanly yet. Complete steps 0.4 and the
+bootstrap section below first (so `https://<fqdn>/` returns a 502 from
+qiita's nginx), then revisit the realm field.
+
+## Bootstrap (one-time, before step 1)
+
+`/opt/qiita/` is empty on a fresh host. This section gets the code +
+binaries onto the host so the rest of the runbook works. Subsequent
+deploys after the first will use the same machinery (just re-run
+`local-deploy.sh`).
+
+### Create `/opt/qiita/` and `/etc/qiita/`
+
+```bash
+# [admin]
+sudo install -d -o root -g root -m 0755 /opt/qiita
+sudo install -d -o root -g root -m 0755 /etc/qiita
+```
+
+### Clone the repo as `qiita`
+
+```bash
+# [operator]
+cd ~ && git clone <repo-url> qiita-miint
+```
+
+Pick `main` unless you have a specific reason to deploy a feature
+branch. The clone path here (`~/qiita-miint`) is referenced by
+`deploy/local-deploy.sh` as the default `QIITA_CLONE`.
+
+### Run the first deploy
+
+`deploy/local-deploy.sh` does the rest: pulls latest source, builds the
+data-plane binary (slow, ~5-20 min on first run as DuckDB compiles from
+source — use tmux/screen if SSH might drop), stages everything into
+`/opt/qiita/incoming/`, and exec's `deploy/activate.sh`. Activate is
+first-deploy-safe: it skips service restarts when env files are absent
+and skips the nginx reload when TLS files are absent (both states are
+resolved later by the steps below).
+
+```bash
+# [admin]
+sudo QIITA_HOSTNAME=<fqdn> /home/qiita/qiita-miint/deploy/local-deploy.sh
+```
+
+Expected: build runs to completion; rsyncs land in `/opt/qiita/`; `uv
+sync` populates each Python venv under `/opt/qiita/<service>/.venv/`;
+data-plane binary is installed at `/opt/qiita/data-plane/qiita-data-plane`;
+systemd units land in `/etc/systemd/system/`; nginx config installs at
+`/etc/nginx/conf.d/qiita.conf` with `__QIITA_HOSTNAME__` substituted.
+
+Verify the venvs use a world-traversable Python (not `/root/.local/`):
+```bash
+# [admin]
+ls -la /opt/qiita/control-plane/.venv/bin/python /opt/qiita/compute-orchestrator/.venv/bin/python
+sudo -u qiita-api  /opt/qiita/control-plane/.venv/bin/python --version
+sudo -u qiita-orch /opt/qiita/compute-orchestrator/.venv/bin/python --version
+```
+Symlinks should resolve under `/opt/uv-python/` (not `/root/.local/...`),
+and both service users should be able to execute their Python.
+
+### Put `qiita-admin` on the operator's PATH
+
+The `qiita-admin` CLI lives in the deployed CP venv at
+`/opt/qiita/control-plane/.venv/bin/qiita-admin`. The operator runs it
+from many steps below; symlink it into the operator's PATH once:
+
+```bash
+# [operator]
+mkdir -p ~/.local/bin
+ln -sf /opt/qiita/control-plane/.venv/bin/qiita-admin ~/.local/bin/qiita-admin
+hash -r   # forget any stale lookup cache in this shell
+command -v qiita-admin   # expect ~/.local/bin/qiita-admin (neutral against QIITA_USER overrides)
+```
+
+If `~/.local/bin` isn't on the operator's PATH, add it via `.bash_profile`
+(`export PATH="$HOME/.local/bin:$PATH"`).
 
 ## 1. Write the control plane env file
 
-systemd loads `/etc/qiita/control-plane.env` for the CP. This step generates
-the shared HMAC secret and installs a rendered copy of the committed
-template at `.env.control-plane.example` (repo root — same template the
-README's local-dev path uses). Keep the secret in your shell — the
-data-plane bootstrap (step 8) needs the same value.
+systemd loads `/etc/qiita/control-plane.env` for the CP. This step
+generates the shared HMAC secret and installs a rendered copy of the
+committed template at `.env.control-plane.example`.
 
-The env file is also the source of `DATABASE_URL` for step 2 (`make
-migrate`) — `dbmate` reads it from the operator's shell, so step 2
-sources this file before invoking `make`.
+**Keep these shell-resident across steps 1-8b** (use tmux/screen or
+otherwise ensure the shell doesn't close):
 
-Prerequisites obtained from your DBA / infrastructure team:
+- `$HMAC_SECRET_KEY` — step 8b's data-plane env file must see the
+  byte-identical value.
+- `$DATABASE_URL` — step 2 (`make migrate`), step 3 (`verify_jwt.py`),
+  and step 6 (`qiita-admin set-system-role` — direct DB, no HTTP) all
+  read it. Sourced from `/tmp/control-plane.env` below; once `[admin]`
+  installs the final copy as `root:qiita-api 0440`, the operator can
+  no longer read it back from disk, so the in-shell copy is the only
+  surviving access until step 8b is done.
 
-- `qiita_miint` Postgres database
-- `qiita_miint_rw` role with login password
-- Network reachability from the CP host to the Postgres host
+If either var goes missing between steps, recover via
+`sudo cat /etc/qiita/control-plane.env` (admin shell) and re-export
+manually — or for the HMAC specifically, regenerate (in which case
+you must also re-render the data-plane env file with the new value
+and restart both services).
 
-**How the env-file rendering works (read once, applies to steps 1, 8b, 9a).**
-Each step starts by `cp`'ing the committed `.env.<svc>.example` template
-to `/tmp/<svc>.env`, then `sed`-substituting the prod form for every var
-the runbook can determine *without* operator-supplied secrets: values
-fixed in shell state (`$HMAC_SECRET_KEY`, `$QIITA_DATA_ROOT`), constants
-(`COMPUTE_BACKEND=slurm`), and uncomment-toggles for vars whose template
-default is the prod-shape with placeholders. After the sed, the operator's
-editor pass only has to fill in remaining `<password>` / `<pg-host>` /
-`<realm>` / hostname chunks — no comment-toggling, no swapping dev/prod
-alternatives. The install is `sudo install -m 0440 -o root -g qiita-<grp>`
-and the working file is shredded after.
+**The cross-account handoff.** The CP env file holds secrets (DB password,
+HMAC). `[operator]` renders the working copy at `/tmp/control-plane.env`
+(mode `0600` qiita-owned), `[operator]` sources it into their own shell
+**before** `[admin]` shreds it (otherwise the operator can't read
+`DATABASE_URL` for `make migrate` and the `verify_jwt.py` step), then
+`[admin]` installs the final copy at `/etc/qiita/control-plane.env` with
+`root:qiita-api 0440` and shreds the working copy.
+
+Prerequisites: pg-host + password for `qiita_miint_rw` (DBA); AuthRocket
+realm subdomain (from `authrocket-realm-setup.md`); externally-resolvable
+FQDN; the path you've picked for `<orch-workspace>` (the orchestrator
+workspace dir from §0.3 — it doesn't have to exist yet, it gets
+created in §9a). The CP boot fails fast if `WORK_TICKET_WORKSPACE_ROOT`
+is unset, so you're committing to the path here even though the dir
+shows up two steps later.
 
 ```bash
-# Generate the shared HMAC secret. Both the CP and DP must see the same
-# value — they sign and verify Flight tickets against it.
+# [operator] in a stable shell (use tmux/screen — HMAC_SECRET_KEY must survive
+# into step 8b's data-plane env file)
+cd ~/qiita-miint
+
+# Shared HMAC. CP and DP must see the byte-identical value.
 export HMAC_SECRET_KEY=$(openssl rand -base64 32)
 
-# Render the committed template into a working file with the prod form
-# substituted for every var the runbook can pre-fill.
+# Render and tighten perms before any secrets land in the file
 cp .env.control-plane.example /tmp/control-plane.env
+chmod 0600 /tmp/control-plane.env
 
+# Substitute every value we have. The password is filled by the editor pass below.
 sed -i.bak \
     -e "s|^HMAC_SECRET_KEY=.*|HMAC_SECRET_KEY=$HMAC_SECRET_KEY|" \
-    -e "s|^DATABASE_URL=.*|DATABASE_URL='postgresql://qiita_miint_rw:<password>@<pg-host>/qiita_miint'|" \
-    -e "s|^# AUTHROCKET_ISSUER=|AUTHROCKET_ISSUER=|" \
-    -e "s|^# AUTHROCKET_LOGINROCKET_URL=|AUTHROCKET_LOGINROCKET_URL=|" \
-    -e "s|^# AUTHROCKET_JWKS_URL=|AUTHROCKET_JWKS_URL=|" \
-    -e "s|^# QIITA_ENDPOINT_URL=|QIITA_ENDPOINT_URL=|" \
-    -e "s|^# COMPUTE_ORCHESTRATOR_URL=|COMPUTE_ORCHESTRATOR_URL=|" \
+    -e "s|^DATABASE_URL=.*|DATABASE_URL='postgresql://qiita_miint_rw:<password>@<pg-host>/qiita_miint?sslmode=prefer'|" \
+    -e "s|^# AUTHROCKET_ISSUER=.*|AUTHROCKET_ISSUER='https://authrocket.com'|" \
+    -e "s|^# AUTHROCKET_LOGINROCKET_URL=.*|AUTHROCKET_LOGINROCKET_URL='https://<realm>.loginrocket.com'|" \
+    -e "s|^# AUTHROCKET_JWKS_URL=.*|AUTHROCKET_JWKS_URL='https://<realm>.loginrocket.com/connect/jwks'|" \
+    -e "s|^# QIITA_ENDPOINT_URL=.*|QIITA_ENDPOINT_URL='https://<fqdn>'|" \
+    -e "s|^# COMPUTE_ORCHESTRATOR_URL=.*|COMPUTE_ORCHESTRATOR_URL=http://127.0.0.1:8081|" \
+    -e "s|^WORK_TICKET_WORKSPACE_ROOT=.*|WORK_TICKET_WORKSPACE_ROOT=<orch-workspace>|" \
     /tmp/control-plane.env
 rm /tmp/control-plane.env.bak
 
-# Edit /tmp/control-plane.env: fill in the remaining placeholders —
-#   DATABASE_URL          <password>, <pg-host>
-#   AUTHROCKET_LOGINROCKET_URL / AUTHROCKET_JWKS_URL
-#                         <realm> (qiita-dev realm: merry-lion-7652.e2.loginrocket.com)
-#   QIITA_ENDPOINT_URL    change qiita.example.org to your externally-resolvable URL
+# Fill in the remaining placeholders interactively (DB password and any
+# realm/fqdn values you didn't sed-substitute above)
 ${EDITOR:-vi} /tmp/control-plane.env
 
-sudo install -d -m 0755 /etc/qiita
-sudo install -m 0440 -o root -g qiita-api \
-    /tmp/control-plane.env /etc/qiita/control-plane.env
-shred -u /tmp/control-plane.env  # holds the DB password — wipe the working copy
-
-# Keep $HMAC_SECRET_KEY in your shell for step 8 (data-plane bootstrap).
-# If you lose it, regenerate and update both env files — services restart
-# is enough to pick up the new value.
+# Source into qiita's shell — DATABASE_URL is needed by `make migrate` in
+# step 2 and the env vars are needed by scripts/verify_jwt.py in step 3.
+# Once admin installs the file at /etc/qiita/control-plane.env, qiita can't
+# read it back (root:qiita-api 0440), so source must happen first.
+set -a && source /tmp/control-plane.env && set +a
 ```
 
-**If HMAC values disagree.** Every Flight DoGet/DoAction will return
+```bash
+# [admin] install the final copy and shred the working file
+sudo install -m 0440 -o root -g qiita-api /tmp/control-plane.env /etc/qiita/control-plane.env
+# sudo on shred because /tmp/control-plane.env is qiita-owned mode 0600 and admin can't write it
+sudo shred -u /tmp/control-plane.env
+```
+
+`?sslmode=prefer` makes `dbmate` (which uses Go's `lib/pq` driver, defaulting
+to `sslmode=require`) fall back to plain when the PG server doesn't speak SSL,
+while still upgrading if SSL becomes available later. Without the explicit
+setting, `make migrate` fails with:
+```
+Error: pq: SSL is not enabled on the server
+```
+`asyncpg` (used by the CP at runtime) defaults to `prefer` already, so the
+explicit setting only changes `make migrate`'s behavior.
+
+**If HMAC values disagree** later. Every Flight DoGet/DoAction will return
 `Unauthenticated: invalid HMAC signature` from the data plane. The control
 plane logs the signed ticket with no error — the failure shows up only at
-DP. Symptom: CP returns 200 OK on `POST /reference/{idx}/ingest`, but
-downstream Flight calls 401. Fix: confirm `HMAC_SECRET_KEY` is byte-identical
-in both env files (including base64 padding), then
-`systemctl restart qiita-control-plane qiita-data-plane@*`.
+the DP. Fix: confirm `HMAC_SECRET_KEY` is byte-identical in both env files,
+then `sudo systemctl restart qiita-control-plane qiita-data-plane@*`.
 
 See [`authrocket-realm-setup.md`](authrocket-realm-setup.md) for the
-realm-side configuration (test users, email-verification policy, the
-`iss=https://authrocket.com` footgun).
+realm-side configuration.
 
 ## 2. Apply migrations
 
-`make migrate` runs `dbmate up` against `DATABASE_URL`, which it reads
-from the operator's shell. Source the env file you just wrote so the
-migration runs against the right database:
-
 ```bash
-set -a && source /etc/qiita/control-plane.env && set +a
+# [operator] DATABASE_URL is already in qiita's shell from the source in step 1
 make migrate
 ```
 
-Seeds the system principal at `idx=1` and creates the auth tables. After
-this, `qiita.principal` has exactly one row (the `system` principal); no
-human or service-account principals exist yet.
+`make migrate` runs `dbmate up` and auto-installs `dbmate` to
+`~/.local/bin/` on first run. Seeds the system principal at `idx=1`
+and creates the auth tables. After this, `qiita.principal` has exactly
+one row (the `system` principal); no human or service-account principals
+exist yet.
+
+Verify:
+```bash
+# [operator]
+psql -h <pg-host> -U qiita_miint_rw -d qiita_miint -W \
+    -c "SELECT idx, display_name, system_role FROM qiita.principal;"
+```
+Expected: one row, `1 | system | system_admin`.
+
+Note: the `principal` table has no `kind` column — the principal subtype
+(human / service / system) surfaces in `qiita-admin whoami` output
+(step 10b) via joins with `qiita.user` / `qiita.service_account`, but
+isn't a column on `principal` itself. Don't add `kind` to ad-hoc queries.
 
 ## 3. One-shot JWT shape verify
 
-Log into the AuthRocket realm via the hosted UI and capture the raw JWT.
-The script reads the same env vars the CP does — source them from the env
-file you wrote in step 1 before running it:
+Log into the AuthRocket realm via the hosted UI (the AuthRocket
+[smoke test](authrocket-realm-setup.md#smoke-test) shows how to capture
+the raw JWT). Then:
 
 ```bash
-set -a && source /etc/qiita/control-plane.env && set +a
-uv run python scripts/verify_jwt.py "$JWT"
+# [operator] env vars are still live from step 1's source. read -s keeps
+# the token out of bash history.
+read -s JWT
+# (paste, Enter — no echo, that's normal)
+
+# The repo has no top-level pyproject.toml; uv run needs to find one,
+# so cd into qiita-control-plane first. The verifier imports from
+# qiita_control_plane.* and reuses the production resolver path.
+cd ~/qiita-miint/qiita-control-plane
+uv run python ../scripts/verify_jwt.py "$JWT"
 ```
 
-On success it prints the parsed claims. If anything fails — bad signature,
-wrong issuer, missing required claim — file an issue before proceeding.
+First `uv run` syncs the qiita-control-plane venv (~30s); subsequent
+runs are fast.
+
+On success it prints the parsed claims (`iss`, `sub`, `email`, etc.).
+If anything fails — bad signature, wrong issuer, missing required claim
+— fix the realm config before proceeding (cross-reference with
+`authrocket-realm-setup.md`).
 
 ## 4. Start the control plane
 
 ```bash
+# [admin]
 sudo systemctl enable --now qiita-control-plane
 ```
 
 systemd loads `/etc/qiita/control-plane.env`. `AuthRocketVerifier.from_settings`
-runs at FastAPI lifespan — if any required env var is missing the boot fails
-fast and the service enters `failed` state. Check `journalctl -u
-qiita-control-plane` for the specific missing var.
+runs at FastAPI lifespan — if any required env var is missing the boot
+fails fast. Check `journalctl -u qiita-control-plane` for the specific
+missing var.
 
 ## 5. Verify the reverse proxy is reachable
 
-Before the first login, confirm that the externally-resolvable URL serves
-traffic to the control plane through nginx with a valid TLS cert. The
-shipped nginx config (`deploy/nginx/qiita.conf`, deployed via
-`deploy/activate.sh`) carries a `__QIITA_HOSTNAME__` placeholder that is
-substituted at deploy time; if you are reaching this step the substitution
-should already have run.
-
 ```bash
-curl -sSf -o /dev/null -w "%{http_code}\n" https://qiita.example.org/health
+# [anywhere — qiita's shell, your laptop, etc.]
+curl -sSf -o /dev/null -w "%{http_code}\n" https://<fqdn>/health
 # expected: 200
 ```
 
 The CP exposes `GET /health` at the root (not under `/api/v1/`); nginx's
 catch-all `location /` proxies it to `qiita_control_plane` upstream.
 
-If the request fails:
+Failure modes:
 
-- **DNS error / connection refused** — the hostname does not resolve to
-  this host, or nginx is not running. `systemctl status nginx`. Your infra
-  team owns the DNS and proxy layer.
-- **`curl: (60) SSL certificate problem`** — cert/key mismatch or expired
-  cert at `/etc/ssl/certs/qiita.crt` and `/etc/ssl/private/qiita.key`.
-- **`404 Not Found` on `/health` but other paths return 502** — likely the
-  `__QIITA_HOSTNAME__` substitution did not run; nginx's `server_name` does
-  not match the URL you curled. Check `grep server_name
-  /etc/nginx/conf.d/qiita.conf` — it should contain your hostname, not the
-  placeholder.
-- **`502 Bad Gateway`** — nginx is up but cannot reach the CP. Verify step 4
-  (`systemctl status qiita-control-plane`) and that the CP is listening on
-  `127.0.0.1:8080` (`ss -ltn | grep 8080`).
-
-This step is a *gate*, not a setup. nginx, TLS provisioning, and DNS are
-owned by your infra team (see step 0 prerequisites). If the gate fails,
-stop and coordinate with them — running steps 6+ will not make the gate
-pass.
+- **DNS / connection refused** — hostname doesn't resolve, or nginx
+  isn't running.
+- **`curl: (60) SSL certificate problem`** — cert/key mismatch, expired
+  cert, or the symlinks at `/etc/ssl/{certs,private}/qiita.{crt,key}`
+  don't resolve. `sudo readlink -f` them.
+- **`404 Not Found` on `/health` but other paths return 502** — the
+  `__QIITA_HOSTNAME__` substitution didn't run. Check `grep server_name
+  /etc/nginx/conf.d/qiita.conf` for the placeholder still present.
+- **`502 Bad Gateway`** — nginx is up but the CP isn't on `127.0.0.1:8080`.
+  `systemctl status qiita-control-plane` and `journalctl -u qiita-control-plane`.
 
 ## 6. First human login (operator promotion + PAT mint)
 
-`qiita-admin login` drives the LoginRocket Web flow end-to-end: it spawns
-a localhost loopback HTTP server, opens the browser to qiita's `/auth/login`,
-captures the AuthRocket round-trip, exchanges the resulting one-time code
-for a PAT, and saves it to `~/.qiita/token` (mode 0600).
+`qiita-admin login` drives the LoginRocket Web flow end-to-end: spawns a
+localhost loopback HTTP server, opens the browser to qiita's `/auth/login`,
+captures the AuthRocket round-trip, exchanges the one-time code for a
+PAT, and saves it to `~/.qiita/token` (mode 0600).
+
+> **Before step 6 on SSH-tunneled deploys.** The cli_login_code TTL
+> (default 30s, set by `CLI_LOGIN_CODE_TTL_SECONDS`) is way too short
+> for a flow that involves manual URL copy + SSH tunnel + curl. For
+> the duration of the SSH-tunneled flow, bump it:
+>
+> ```bash
+> # [admin]
+> sudo bash -c "echo 'CLI_LOGIN_CODE_TTL_SECONDS=300' >> /etc/qiita/control-plane.env"
+> sudo systemctl restart qiita-control-plane
+> ```
+>
+> **Set it back to the default once the local browser-loopback flow
+> works on this deploy.** The 30s default deliberately keeps the
+> intercept window short; a permanent 300s value is only justified if
+> you'll keep doing the SSH-tunneled flow regularly. Roll back with:
+>
+> ```bash
+> # [admin]
+> sudo sed -i '/^CLI_LOGIN_CODE_TTL_SECONDS=/d' /etc/qiita/control-plane.env
+> sudo systemctl restart qiita-control-plane
+> ```
 
 ```bash
-qiita-admin --base-url https://qiita.example.org login
+# [operator]
+qiita-admin --base-url https://<fqdn> login
 ```
 
 On the *first* login, the resolver creates a `principal` row
 (`system_role='user'`), a `user` row keyed on that principal, and a
 `user_identities(iss, sub)` link in one transaction. An
-`oidc_create_principal` audit event is recorded. The freshly-minted PAT is
-written to `~/.qiita/token`.
+`oidc_create_principal` audit event is recorded. The freshly-minted PAT
+is written to `~/.qiita/token`.
 
-Then promote yourself to `system_admin` (direct DB; no HTTP auth needed):
+Promote yourself to `system_admin` (direct DB; no HTTP auth needed):
 
 ```bash
-qiita-admin set-system-role --email operator@example.org --role system_admin
+# [operator]
+qiita-admin set-system-role --email <operator-email> --role system_admin
 ```
 
 After the role change takes effect, the existing PAT carries `user`-level
@@ -269,165 +677,227 @@ scopes. Re-run `qiita-admin login` to mint a fresh PAT scoped to the
 
 ### Headless / no-browser fallback
 
-For environments without a browser (SSH'd remote, CI, container without DISPLAY),
-`qiita-admin login` will print the URL it tried to open. Open it on a machine
-with a browser, complete the AuthRocket login, and the redirect will land at
-`http://127.0.0.1:<port>/?ot_code=<value>`. If that loopback isn't reachable
-on the same host, capture the JWT manually via the AuthRocket admin UI and use
-the legacy direct PAT mint:
+For SSH'd remotes / CI / containers without DISPLAY, `qiita-admin login`
+prints the URL it tried to open. Open it on a machine with a browser,
+complete the AuthRocket login, and the redirect will land at
+`http://127.0.0.1:<port>/?ot_code=<value>`. If that loopback isn't
+reachable on the same host, capture the JWT manually via the AuthRocket
+admin UI and use the legacy direct PAT mint:
 
 ```bash
-curl -X POST https://qiita.example.org/api/v1/auth/pat \
+curl -X POST https://<fqdn>/api/v1/auth/pat \
     -H "Authorization: Bearer $JWT" \
     -H "Content-Type: application/json" \
     -d '{"label":"my-laptop","ttl_days":90}'
 ```
 
-`POST /api/v1/auth/pat` continues to accept fresh OIDC JWTs in the
-`Authorization` header for this purpose. Save the plaintext `qk_...` to
-`~/.qiita/token` (mode 0600).
+Save the plaintext `qk_...` to `~/.qiita/token` (mode 0600).
 
 ## 7. Install the CP↔CO shared bearer
 
 The control plane and the compute orchestrator authenticate to each other
-on a private path — a constant-time string compare against a shared bearer
-token. Both services read the same file. This is *not* a PAT and is not
-managed via the principal model; it's a simple shared secret on the
-internal network between two services.
+on a private path via a constant-time string compare against a shared
+bearer. Both services read the same file.
 
 ```bash
+# [admin]
 openssl rand -base64 32 | sudo tee /etc/qiita/cp-to-co.token > /dev/null
 sudo chown root:qiita-services /etc/qiita/cp-to-co.token
 sudo chmod 0440 /etc/qiita/cp-to-co.token
 ```
 
-Owner `root`, group `qiita-services` (created in step 0; contains both
-`qiita-api` and `qiita-orch`), mode `0440`: both service users get read
-access via group membership; only root can write.
+Owner `root`, group `qiita-services` (contains `qiita-api` and
+`qiita-orch`), mode `0440`: both service users read via group membership;
+only root can write.
 
 The CO loads it via `CP_TO_CO_TOKEN_PATH` (default
-`/etc/qiita/cp-to-co.token`; see
-`qiita-compute-orchestrator/src/qiita_compute_orchestrator/config.py`).
-The orchestrator will refuse to start if the file is missing or unreadable.
-Dev / CI can opt into env-var fallback by setting `QIITA_ALLOW_TOKEN_ENV=true`
-and providing `CP_TO_CO_TOKEN`; production must use the file.
-
-The shared bearer is what the CP attaches to its `POST /api/v1/step/run`
-calls into the orchestrator and what the orchestrator's auth dependency
-constant-time-compares against. Both services refuse to boot without it
-on a path they can read, so install it before either service starts.
+`/etc/qiita/cp-to-co.token`); it will refuse to start if the file is
+missing or unreadable. Dev / CI can opt into env-var fallback by setting
+`QIITA_ALLOW_TOKEN_ENV=true` and providing `CP_TO_CO_TOKEN`; production
+must use the file.
 
 ## 8. Bootstrap the data plane
 
-Prerequisites obtained from your DBA / infrastructure team:
+Prerequisites from your DBA: `qiita_miint_lake` database,
+`qiita_miint_lake_rw` role with login password, network reachability
+from the data plane host to the Postgres host.
 
-- `qiita_miint_lake` Postgres database
-- `qiita_miint_lake_rw` role with login password
-- Network reachability from the data plane host to the Postgres host
-
-The data plane bootstraps its own DuckLake catalog on first start — there's
-no `make migrate` equivalent. You only need to give it the catalog DB
-credentials, a directory on the shared filesystem to hold Parquet files,
-and an env file.
+The data plane bootstraps its own DuckLake catalog on first start —
+there's no `make migrate` equivalent. You only need to give it the
+catalog DB credentials, a directory on the shared filesystem to hold
+Parquet files, and an env file.
 
 ### 8a. Create the Parquet data and staging directories
 
-```bash
-# Final Parquet location — owned by the DP, not group-writable. The DP
-# atomic-renames into here from staging; nothing else writes here.
-sudo install -d -o qiita-data -g qiita-data -m 0750 "$QIITA_DATA_ROOT/parquet"
+**Default (subdir-of-mount).** The rest of the runbook — `DUCKLAKE_DATA_PATH`
+in step 8b, smoke-test paths in step 11 — assumes this. Use it unless
+you have a specific reason to deviate.
 
-# SLURM job staging — group-writable + setgid so files written by qiita-job
-# inherit the qiita-pipeline group, and the DP (also in qiita-pipeline) can
-# read the 440-mode outputs before renaming them into $QIITA_DATA_ROOT/parquet.
-sudo install -d -o qiita-data -g qiita-pipeline -m 2770 /scratch/ephemeral/staging
+```bash
+# [admin]
+sudo install -d -o qiita-data -g qiita-data -m 0750     <mount>/parquet
+sudo install -d -o qiita-data -g qiita-pipeline -m 2770 <scratch>/staging
 ```
 
-If `$QIITA_DATA_ROOT` and `/scratch` are on different filesystems, the
-atomic rename falls back to copy+delete (slower; see
-`qiita-data-plane/src/flight_service.rs::move_file`). Provision them on
-the same filesystem when possible. (Some HPC environments expose the
-staging tier under a different mount than `$QIITA_DATA_ROOT`; coordinate
-with your infrastructure team to keep them on one volume if you can.)
+Then `DUCKLAKE_DATA_PATH=<mount>/parquet` in step 8b.
 
-The setgid bit (`2770`) on the staging directory is load-bearing: without
-it, files created by `qiita-job` would inherit `qiita-job`'s primary group
-and the data plane could not read them. With it, every file inherits
-`qiita-pipeline` regardless of the writing process's primary group.
+**Alternative (mount-as-data)** for deploys where `<mount>` is dedicated
+to qiita's lake and will host nothing else:
+
+```bash
+# [admin]
+sudo chown qiita-data:qiita-data <mount>
+sudo chmod 0750 <mount>
+sudo install -d -o qiita-data -g qiita-pipeline -m 2770 <scratch>/staging
+```
+
+Then `DUCKLAKE_DATA_PATH=<mount>` in step 8b.
+
+The setgid bit on the staging dir (`2770`) is load-bearing: files
+written by `qiita-job` inherit the `qiita-pipeline` group regardless
+of the writing process's primary group, so the data plane (also in
+`qiita-pipeline`) can read them.
 
 ### 8b. Write the data plane env file
 
-Render the committed template at `.env.data-plane.example` (same template
-the README's local-dev path uses), substituting the HMAC secret from
-step 1's shell — the CP and DP must agree exactly.
+Render the committed template at `.env.data-plane.example`, substituting
+the HMAC secret from step 1's shell.
 
 ```bash
+# [operator]
+cd ~/qiita-miint
 cp .env.data-plane.example /tmp/data-plane.env
+chmod 0600 /tmp/data-plane.env
 
 sed -i.bak \
     -e "s|^HMAC_SECRET_KEY=.*|HMAC_SECRET_KEY=$HMAC_SECRET_KEY|" \
-    -e "s|^DUCKLAKE_CATALOG_CONNSTR=.*|DUCKLAKE_CATALOG_CONNSTR='dbname=qiita_miint_lake host=<pg-host> user=qiita_miint_lake_rw password=<password>'|" \
-    -e "s|^# DUCKLAKE_DATA_PATH=.*|DUCKLAKE_DATA_PATH=$QIITA_DATA_ROOT/parquet|" \
+    -e "s|^DUCKLAKE_CATALOG_CONNSTR=.*|DUCKLAKE_CATALOG_CONNSTR='dbname=qiita_miint_lake host=<pg-host> user=qiita_miint_lake_rw password=<password> sslmode=prefer'|" \
+    -e "s|^# DUCKLAKE_DATA_PATH=.*|DUCKLAKE_DATA_PATH=<data-dir>|" \
     /tmp/data-plane.env
 rm /tmp/data-plane.env.bak
 
-# Edit /tmp/data-plane.env: fill in the remaining placeholders —
-#   DUCKLAKE_CATALOG_CONNSTR    <pg-host>, <password>
-${EDITOR:-vi} /tmp/data-plane.env
+${EDITOR:-vi} /tmp/data-plane.env  # fill the lake DB password
+```
 
-sudo install -m 0440 -o root -g qiita-data \
-    /tmp/data-plane.env /etc/qiita/data-plane.env
-shred -u /tmp/data-plane.env  # holds the lake DB password — wipe the working copy
+```bash
+# [admin]
+sudo install -m 0440 -o root -g qiita-data /tmp/data-plane.env /etc/qiita/data-plane.env
+sudo shred -u /tmp/data-plane.env
 ```
 
 `DUCKLAKE_CATALOG_CONNSTR` is libpq format — space-separated `key=value`
-pairs, NOT a `postgresql://` URL. (`DATABASE_URL` in the CP env is the URL
-form because asyncpg accepts that; the data plane reads the raw libpq form
-because DuckDB's postgres extension expects it.)
+pairs, NOT a `postgresql://` URL. (`DATABASE_URL` in the CP env is the
+URL form because asyncpg accepts that; the data plane reads the raw
+libpq form because DuckDB's postgres extension expects it.)
+
+After this step the shared `$HMAC_SECRET_KEY` is no longer needed in
+the operator's shell (it's persisted in `/etc/qiita/{control,data}-plane.env`).
+Same for the `DATABASE_URL` / `AUTHROCKET_*` env vars we sourced in
+step 1 — they're only used by `make migrate` (step 2) and `verify_jwt.py`
+(step 3), both already done. Clear them to limit exposure:
+
+```bash
+# [operator]
+unset HMAC_SECRET_KEY DATABASE_URL \
+      AUTHROCKET_ISSUER AUTHROCKET_LOGINROCKET_URL AUTHROCKET_JWKS_URL \
+      QIITA_ENDPOINT_URL COMPUTE_ORCHESTRATOR_URL
+```
 
 ### 8c. Start the data plane
 
 ```bash
+# [admin]
 sudo systemctl enable --now qiita-data-plane@50051
 ```
 
-The systemd template at `deploy/systemd/qiita-data-plane@.service` reads
-`LISTEN_ADDR=127.0.0.1:%i` from the instance specifier — the instance number
-*is* the port. `qiita-data-plane@50051` listens on `127.0.0.1:50051`, which
-is the upstream nginx already routes to (`deploy/nginx/qiita.conf`). For
-first deploy a single instance is fine; add `qiita-data-plane@50052` (etc.)
-and the matching nginx upstream entry when traffic warrants horizontal
-scaling.
+The systemd template `qiita-data-plane@.service` reads
+`LISTEN_ADDR=127.0.0.1:%i` — the instance number *is* the port.
+`qiita-data-plane@50051` listens on `127.0.0.1:50051`, the upstream
+nginx already routes to. For first deploy a single instance is fine;
+add `qiita-data-plane@50052` (etc.) and the matching nginx upstream
+entry when traffic warrants horizontal scaling.
 
-On first start, the DP attaches DuckLake to `qiita_miint_lake` (which creates
-the DuckLake metadata tables) and runs `ensure_reference_tables` to create
-the reference data tables. All idempotent — restarts are safe.
+On first start, the DP attaches DuckLake to `qiita_miint_lake` (creates
+metadata tables) and runs `ensure_reference_tables`. All idempotent —
+restarts are safe.
 
 ### 8d. Verify the data plane is up
 
 ```bash
+# [admin]
 make verify-health
 ```
 
-Expected: `status: SERVING`. If you see `Unauthenticated: invalid HMAC
-signature` later from any Flight call, the most common cause is that
-`HMAC_SECRET_KEY` differs between the CP and DP env files (see step 1).
+Expected: `status: SERVING`. `Unauthenticated: invalid HMAC signature`
+from later Flight calls means `HMAC_SECRET_KEY` differs between the CP
+and DP env files (see step 1).
 
 ## 9. Start the orchestrator
 
-### 9a. Write the orchestrator env file
+> **Expect to coordinate with your HPC admin** through this section.
+> Beyond the values they supply (URL, JWT, partition, account), the
+> slurmrestd → slurmctld auth path on their side (MUNGE keys, clock
+> sync between hosts) needs to be working before the orchestrator can
+> actually dispatch jobs. The orchestrator itself will start fine
+> regardless; the failure mode if HPC-side auth is broken is per-job,
+> not boot-time. Validate against `/slurm/v0.0.40/nodes` (a real RPC
+> path) rather than only `/ping` to catch the inter-daemon auth.
+>
+> The cluster-side prerequisites — the `qiita-job` identity, SLURM
+> account / QOS, libjwt version — and the full SLURM gotcha list are in
+> [`slurm-backend-setup.md`](slurm-backend-setup.md). This section
+> covers only the deploy-host orchestrator config.
 
-Render the committed template at `.env.compute-orchestrator.example` (same
-template the README's local-dev path uses). The template ships with
-`COMPUTE_BACKEND=local` (development); production deploys flip it to
-`slurm` and fill in the SLURM block.
+### 9a. Create the orchestrator workspace dir
+
+Both the CP runner (`qiita-api`) and the CO (`qiita-orch`) need to
+write here, plus SLURM jobs (`qiita-job`) write outputs underneath. Per
+§0.3 the dir is owned `qiita-orch:qiita-pipeline 2770`; qiita-api and
+qiita-job get write access via the `qiita-pipeline` group (§0.1).
+
+**Default (subdir-of-mount).**
 
 ```bash
-cp .env.compute-orchestrator.example /tmp/compute-orchestrator.env
+# [admin]
+sudo install -d -o qiita-orch -g qiita-pipeline -m 2770 <scratch>/orch-workspace
+```
 
+Then `<orch-workspace>` = `<scratch>/orch-workspace` for §9b and the
+CP env file in §1.
+
+**Alternative (mount-as-workspace)** for deploys where `<scratch>` is
+dedicated to orchestrator workspaces (this deploy's posture):
+
+```bash
+# [admin]
+sudo chown qiita-orch:qiita-pipeline <scratch>
+sudo chmod 2770 <scratch>
+```
+
+Then `<orch-workspace>` = `<scratch>` directly.
+
+The setgid bit on `2770` is load-bearing: SLURM jobs writing outputs
+inherit the `qiita-pipeline` group regardless of `qiita-job`'s primary
+group, so the next workflow step (running as `qiita-orch` or `qiita-api`)
+can read them. Same pattern as the data plane's staging dir (§8a).
+
+**Did the CP env in §1 already set `WORK_TICKET_WORKSPACE_ROOT`?** If
+not, edit `/etc/qiita/control-plane.env` to set it now and restart the
+CP — boot will fail-fast if it's unset. The path **must equal** what
+§9b puts in `SHARED_FILESYSTEM_ROOT`.
+
+### 9b. Write the orchestrator env file
+
+```bash
+# [operator]
+cd ~/qiita-miint
+cp .env.compute-orchestrator.example /tmp/compute-orchestrator.env
+chmod 0600 /tmp/compute-orchestrator.env
+
+# Force the SLURM backend (the example defaults to 'local' for dev/smoke).
 sed -i.bak \
     -e "s|^COMPUTE_BACKEND=.*|COMPUTE_BACKEND=slurm|" \
-    -e "s|^# SHARED_FILESYSTEM_ROOT=.*|SHARED_FILESYSTEM_ROOT=$QIITA_DATA_ROOT|" \
+    -e "s|^# SHARED_FILESYSTEM_ROOT=.*|SHARED_FILESYSTEM_ROOT=<orch-workspace>|" \
     -e "s|^# SLURMRESTD_URL=|SLURMRESTD_URL=|" \
     -e "s|^# SLURMRESTD_JWT_PATH=|SLURMRESTD_JWT_PATH=|" \
     -e "s|^# SLURMRESTD_USER_NAME=|SLURMRESTD_USER_NAME=|" \
@@ -436,50 +906,47 @@ sed -i.bak \
     /tmp/compute-orchestrator.env
 rm /tmp/compute-orchestrator.env.bak
 
-# Edit /tmp/compute-orchestrator.env: fill in the remaining placeholders —
-#   SLURMRESTD_URL              <slurmctld-host>
-#   SLURM_PARTITION / _ACCOUNT  override the qiita / qiita-prod defaults
-#                               if your cluster uses different names
-${EDITOR:-vi} /tmp/compute-orchestrator.env
-
-sudo install -m 0440 -o root -g qiita-orch \
-    /tmp/compute-orchestrator.env /etc/qiita/compute-orchestrator.env
-shred -u /tmp/compute-orchestrator.env
+${EDITOR:-vi} /tmp/compute-orchestrator.env  # fill SLURM endpoint values
 ```
 
-The SLURM JWT file at `SLURMRESTD_JWT_PATH` is generated by SLURM
-(`scontrol token`) and rotated periodically. Install it once now;
-the orchestrator reloads on 401 automatically. Coordinate with your
-HPC team for the rotation schedule.
+```bash
+# [admin]
+sudo install -m 0440 -o root -g qiita-orch /tmp/compute-orchestrator.env /etc/qiita/compute-orchestrator.env
+sudo shred -u /tmp/compute-orchestrator.env
+```
 
-### 9b. Start the orchestrator service
+The SLURM JWT at `SLURMRESTD_JWT_PATH` must be a token minted for the
+`qiita-job` identity (`sun=qiita-job`) — minting needs root or
+SlurmUser on the cluster, and SLURM JWTs expire. See
+[`slurm-backend-setup.md`](slurm-backend-setup.md) for minting and the
+rotation options; the orchestrator re-reads the file on a `401`.
+
+### 9c. Start the orchestrator
 
 ```bash
+# [admin]
 sudo systemctl enable --now qiita-compute-orchestrator
 ```
 
-systemd loads the env file you just wrote. The orchestrator reads
-`/etc/qiita/cp-to-co.token` (installed in step 7) at startup and will
-refuse to boot if the file is missing or unreadable by `qiita-orch`.
-With `COMPUTE_BACKEND=slurm`, it also reads `SLURMRESTD_JWT_PATH` —
-boot fails fast if that file is missing.
-
-The orchestrator authenticates only with the CP↔CO shared bearer
-installed in step 7 — it does not load a PAT.
-[`orchestrator-token-rotation.md`](orchestrator-token-rotation.md) is
-the rotation procedure once a PAT is wired in for CO→CP callbacks.
+The orchestrator validates its credentials at startup and refuses to
+boot if any are missing: the CP↔CO bearer (`/etc/qiita/cp-to-co.token`,
+step 7), the CO→CP compute-worker PAT (`/etc/qiita/co-to-cp.token`,
+provisioned per
+[`compute-service-account-provisioning.md`](compute-service-account-provisioning.md)),
+and on the SLURM backend the five `SLURM*` env vars **and a non-empty
+JWT file at `SLURMRESTD_JWT_PATH`** (the SLURM client is constructed in
+the lifespan and reads the file). An *expired* JWT lets boot succeed
+but the first dispatched step gets a `401`; the client's 401-retry
+re-reads the file. So before `enable --now` on a SLURM-backend deploy,
+set up the JWT-refresh timer per
+[`slurm-backend-setup.md`](slurm-backend-setup.md) and run it once.
 
 ## 10. Verify the deploy
-
-Per-service liveness plus auth probes — confirms every layer the previous
-steps wired up is actually responding. This is the gate that says "the
-deploy worked." Step 11 is the end-to-end pipeline smoke that submits a
-real workflow and follows it through to DuckLake; run it after step 10
-passes.
 
 ### 10a. All three services healthy
 
 ```bash
+# [admin]
 make verify-health
 ```
 
@@ -490,123 +957,94 @@ gives the boot error.
 
 ### 10b. Operator auth path works
 
-Confirms the OIDC + PAT flow you exercised in step 6 still works and the
-operator's PAT carries the expected scopes after the role promotion:
-
 ```bash
-qiita-admin --base-url https://qiita.example.org whoami
+# [operator]
+qiita-admin --base-url https://<fqdn> whoami
 ```
 
 Expected fields:
 
 - `kind: human`
-- `email: <operator email>`
+- `email: <operator-email>`
 - `system_role: system_admin`
-- `scopes: [...]` — the full `system_admin` ceiling (see
-  [`docs/auth.md`](../auth.md))
+- `scopes: [...]` — the full `system_admin` ceiling
 
-A 401 here means `~/.qiita/token` is missing or revoked; re-run step 6.
-A 403 on the role line means `set-system-role` did not take effect;
-re-check that you ran step 6's promotion command after the first login.
+A 401 means `~/.qiita/token` is missing or revoked; re-run step 6. A 403
+on the role line means `set-system-role` didn't take effect.
 
 ### 10c. CP routing + DB connectivity
 
-Reads a non-existent reference. Proves nginx routing, PAT verification,
-and Postgres reachability without depending on any data being present:
-
 ```bash
-curl -sS https://qiita.example.org/api/v1/reference/1 \
+# [operator]
+curl -sS https://<fqdn>/api/v1/reference/1 \
     -H "Authorization: Bearer $(cat ~/.qiita/token)" \
     -w "\nHTTP %{http_code}\n"
 ```
 
-Expected: `HTTP 404` with body `{"detail":"reference not found"}` (or the
-equivalent — exact wording is set by the route handler). Other outcomes:
+Expected: `HTTP 404` with body `{"detail":"Reference not found"}`. Proves
+nginx routing + PAT verification + Postgres reachability all work.
 
-- `401` — PAT not loaded; check `~/.qiita/token` permissions.
+- `401` — PAT not loaded; check `~/.qiita/token` perms.
 - `502` — CP not reachable through nginx; back to step 5.
-- `500` — likely a DB connectivity issue;
-  `journalctl -u qiita-control-plane | tail -50`.
-
-### What is *not* verified by step 10
-
-- The CP↔DP HMAC handshake (no Flight call is made by a 404 lookup).
-- Orchestrator dispatch end-to-end.
-- Parquet registration into DuckLake — depends on the orchestrator path.
-
-These are exercised by step 11.
+- `500` — DB connectivity issue; `journalctl -u qiita-control-plane`.
 
 ## 11. End-to-end smoke
 
-The smoke uses the `reference-add` workflow with a 3–5 sequence FASTA.
-A single ticket touches every layer:
+The smoke uses the `fastq-to-parquet` workflow against a tiny single-
+sample FASTQ. A single ticket touches every layer:
 
-- **Control plane** — validates the action, mints `feature_idx`, writes
-  `reference_membership`.
-- **Orchestrator** — dispatches the four-step pipeline to the configured
-  backend (`SlurmBackend` runs containerized jobs as `qiita-job` on the
-  cluster; `LocalBackend` runs in-process for development).
-- **Data plane** — registers Parquet via `ducklake_add_data_files`
-  (writes to `qiita_miint_lake`, lands files in
-  `$QIITA_DATA_ROOT/parquet/<table>/`).
-- **Both filesystems** — intermediates on `/scratch/ephemeral/staging/`,
-  final output on `$QIITA_DATA_ROOT/parquet/`.
+- **Control plane** — validates the action, mints the per-sample
+  `sequence_range`, persists the work ticket, transitions it to
+  `COMPLETED` on success.
+- **Orchestrator** — dispatches the native `fastq_to_parquet` step,
+  calls back to the CP for the sequence_range mint, writes
+  `reads.parquet` into the ticket's workspace.
+- **Both filesystems** — input FASTQ on `<scratch>` (the scratch root
+  from §8a), Parquet output under the workspace path on the same
+  shared FS.
 
 ### Recipe
 
-1. **Versioned smoke tag.** Each deploy uses a unique reference name so
-   the smoke is idempotently re-runnable and leaves an audit trail:
+End-to-end execution runs through the end-user `qiita` CLI
+(`qiita login` / `qiita study create` / `qiita biosample create` /
+`qiita sequencing-run create` / `qiita sequenced-pool create` /
+`qiita sequenced-sample create` / `qiita ticket submit` /
+`qiita ticket status`). The walkthrough lives at
+[`docs/runbooks/user-cli-quickstart.md`](user-cli-quickstart.md).
 
-   ```bash
-   SMOKE_TAG="smoke-$(git -C /opt/qiita/control-plane rev-parse --short HEAD)"
-   ```
+The walkthrough drives the smoke from a fresh user PAT through to a
+`COMPLETED` ticket and a `reads.parquet` artifact, with verification
+commands at each layer. Prerequisites that remain operator-side after
+step 10 — `qiita-admin actions sync --workflows-dir
+/opt/qiita/control-plane/workflows` and compute service-account
+provisioning per
+[`compute-service-account-provisioning.md`](compute-service-account-provisioning.md) —
+are linked from the walkthrough.
 
-2. **Stage a tiny FASTA** at
-   `/scratch/ephemeral/references/incoming/$SMOKE_TAG/1.0.0/seqs.fasta`
-   (3–5 short sequences are enough; owner `qiita-job`, group readable
-   so the hash job can read it).
+## Subsequent deploys
 
-3. **Submit `reference-add`** against `(name=$SMOKE_TAG, version=1.0.0)`
-   using the operator's `system_admin` PAT. The promoted operator role
-   covers `feature:mint`, `reference:write`, and
-   `reference:register_files` — the full scope set the workflow declares.
+After first deploy, every redeploy is **one command** from admin's
+shell:
 
-4. **Verify the four layers:**
+```bash
+# [admin]
+sudo QIITA_HOSTNAME=<fqdn> /home/qiita/qiita-miint/deploy/local-deploy.sh
+```
 
-   - Work ticket reaches `COMPLETED` — query it via the `qiita-admin`
-     work-ticket subcommand (or directly against `qiita.work_ticket`
-     if the CLI surface isn't installed on this host).
-   - `qiita_miint` has a new `reference` row plus features and
-     membership rows for the smoke tag.
-   - `qiita_miint_lake` has new `ducklake_data_file` rows from the last
-     few minutes.
-   - `$QIITA_DATA_ROOT/parquet/<table>/` contains recent Parquet files,
-     mode 440.
+`local-deploy.sh` does: drop privileges to `qiita` for `git pull` and
+`make build-data-plane`, then back to root for rsync-into-`/opt/qiita/`,
+`uv sync`, install systemd / nginx, restart services, reload nginx.
 
-   A failure on any single check pinpoints which layer is broken.
+Env vars for `local-deploy.sh`:
 
-### Post-smoke
+| Env var | Default | When to set |
+|---|---|---|
+| `QIITA_HOSTNAME` | (required) | Always. |
+| `QIITA_USER` | `qiita` | If the operator account isn't `qiita`. |
+| `QIITA_CLONE` | parent of the script's location | If you want to deploy a clone elsewhere. |
+| `SKIP_PULL=1` | unset | Deploying a local feature branch, don't `git pull`. |
+| `SKIP_BUILD=1` | unset | Re-running after a non-build failure. |
 
-The smoke leaves one tagged reference plus a handful of features and
-catalog files per deploy — by design. They are cheap (kilobytes) and
-the audit trail proves which deploys passed smoke. Versioned smoke
-names mean re-runs don't collide with prior smokes; no per-run
-cleanup is necessary.
-
-## 12. End-user smoke (optional)
-
-Step 11 exercises the operator-side `reference-add` pipeline. For
-deploys that will be used by `user`-role principals (the common case),
-the parallel user-side smoke is the
-[user-CLI quickstart](user-cli-quickstart.md): log in as a regular
-user (not the operator promoted in step 6), then walk study →
-biosample → sequencing-run → sequenced-pool → sequenced-sample →
-`fastq-to-parquet` ticket → ticket-status. Each step exercises a
-different per-resource auth gate (owner / caller-creator / per-study
-ADMIN) that step 11's reference-add flow does not touch.
-
-A failure here that step 11 did not flag is almost always either an
-OIDC misconfiguration (the user can't get a PAT at all) or a
-role-promotion that landed `system_admin` on every account by
-mistake (the per-resource gates only activate for `user`-role
-callers).
+For CI: when CI is wired up, it builds on a build host and rsyncs to
+`/opt/qiita/incoming/`, then invokes `deploy/activate.sh` directly.
+`local-deploy.sh` is the manual equivalent of that pipeline.

@@ -40,6 +40,14 @@ class HealthResponse(BaseModel):
 
 
 class ReferenceStatus(StrEnum):
+    """Lifecycle states of a reference database during staging.
+
+    Mirrored DB-side by the `status` column on `qiita.reference`, which is a
+    plain `TEXT` + `CHECK` column (not a Postgres `CREATE TYPE` ENUM) — so this
+    enum is intentionally not covered by the parity tests. Keep this set and
+    the matching `CHECK` list in sync by hand.
+    """
+
     PENDING = "pending"
     HASHING = "hashing"
     MINTING = "minting"
@@ -284,6 +292,11 @@ class DoGetTicketResponse(BaseModel):
 
 
 class UploadStatus(StrEnum):
+    """Mirrored by the `upload.status` CHECK constraint in
+    db/migrations/20260519000000_upload.sql. Stored as TEXT/CHECK, not a
+    Postgres ENUM — same carve-out as ReferenceStatus and AuthEventType;
+    see CLAUDE.md "Enum parity". Keep both sides in sync by hand."""
+
     PENDING = "pending"
     READY = "ready"
     CONSUMED = "consumed"
