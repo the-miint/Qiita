@@ -20,11 +20,13 @@ import secrets
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from qiita_common.models import FieldDataType
 
 from qiita_control_plane.main import app
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample,
     seed_biosample_to_study_link,
+    seed_prep_sample_global_field,
     seed_user_principal,
 )
 
@@ -107,6 +109,11 @@ async def _cleanup_tracked(pool, created: dict) -> None:
             pr,
         )
     await delete_idxs(pool, "study", created["study"])
+    # No inbound FKs left at this point: prep_sample_metadata has been
+    # deleted, so missing_value_reason is unreferenced; prep_sample_study_field
+    # has been bulk-deleted, so prep_sample_global_field is unreferenced.
+    await delete_idxs(pool, "prep_sample_global_field", created["prep_sample_global_field"])
+    await delete_idxs(pool, "missing_value_reason", created["missing_value_reason"])
     all_principals = created["user_principals"] + created["service_account_principals"]
     if all_principals:
         await pool.execute(
@@ -147,6 +154,8 @@ async def ctx(role_keyed_clients):
         "biosample": [],
         "study_access": [],
         "study": [],
+        "prep_sample_global_field": [],
+        "missing_value_reason": [],
         "user_principals": [],
         "service_account_principals": [],
     }
@@ -366,6 +375,78 @@ async def test_import_sequenced_sample_from_run_with_metadata(ctx):
     assert [(r["display_name"], r["value_text"]) for r in rows] == [
         ("Alias", "amp-001"),
         ("Title", "Wet-lab amplicon prep 001"),
+    ]
+
+
+async def test_import_sequenced_prep_sample_metadata_missing_value_persists(ctx):
+    """Tests the case where a metadata text value matches a known
+    missing_value_reason name: the composer routes the value to
+    value_missing_reason_idx and the persisted row has every typed value
+    column NULL.
+    """
+    suffix = secrets.token_hex(4)
+    reason_name = f"reason_{suffix}"
+    reason_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.missing_value_reason (name) VALUES ($1) RETURNING idx",
+        reason_name,
+    )
+    ctx["created"]["missing_value_reason"].append(reason_idx)
+
+    # NUMERIC global field; a literal reason name fails typed parsing
+    # without the missing-reason routing, so the test pinpoints that
+    # routing fires.
+    global_idx = await seed_prep_sample_global_field(
+        ctx["pool"],
+        internal_name=f"num_{suffix}",
+        display_name=f"Latitude {suffix}",
+        data_type=FieldDataType.NUMERIC,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["prep_sample_global_field"].append(global_idx)
+
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "wet-missing")
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="missing"
+    )
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        study_idx=study_idx,
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    item_id = _unique_item_id("WET-MISSING")
+
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        sequenced_pool_item_id=item_id,
+        primary_study_idx=study_idx,
+        metadata={f"Latitude {suffix}": reason_name},
+    )
+    assert resp.status_code == 201, resp.text
+    rj = resp.json()
+
+    # value_missing_reason_idx populated; every typed value column NULL.
+    rows = await ctx["pool"].fetch(
+        "SELECT global_field_idx, value_text, value_numeric, value_date,"
+        " value_missing_reason_idx"
+        " FROM qiita.prep_sample_metadata"
+        " WHERE prep_sample_idx = $1",
+        rj["prep_sample_idx"],
+    )
+    assert [dict(r) for r in rows] == [
+        {
+            "global_field_idx": global_idx,
+            "value_text": None,
+            "value_numeric": None,
+            "value_date": None,
+            "value_missing_reason_idx": reason_idx,
+        }
     ]
 
 

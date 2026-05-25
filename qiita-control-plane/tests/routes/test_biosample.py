@@ -91,6 +91,9 @@ async def _cleanup_tracked(pool, created: dict) -> None:
     so the subtype row must go first.
     """
     await delete_idxs(pool, "biosample_metadata", created["biosample_metadata"])
+    # biosample_metadata.value_missing_reason_idx FKs missing_value_reason
+    # ON DELETE RESTRICT; sweep after the metadata rows are gone.
+    await delete_idxs(pool, "missing_value_reason", created["missing_value_reason"])
     await delete_idxs(pool, "biosample_study_field", created["biosample_study_field"])
     await delete_idxs(pool, "biosample_global_field", created["biosample_global_field"])
     for bs, st in created["biosample_to_study"]:
@@ -147,6 +150,7 @@ async def ctx(role_keyed_clients):
     """
     created: dict = {
         "biosample_metadata": [],
+        "missing_value_reason": [],
         "biosample_study_field": [],
         "biosample_global_field": [],
         "biosample_to_study": [],
@@ -880,6 +884,46 @@ async def test_post_biosample_metadata_owner_id_collision_422(ctx):
     assert resp.status_code == 422
     assert shared_name in resp.json()["detail"]
     assert "owner_biosample_id_field_name" in resp.json()["detail"]
+
+
+async def test_post_biosample_owner_id_missing_value_marker_422(ctx):
+    """Tests the case where owner_biosample_id_value matches a known
+    missing_value_reason name: the composer raises
+    BiosampleOwnerIdMissingValueError and the route maps it to 422
+    naming the offending value. No biosample row is created.
+    """
+    reason_name = f"reason_{secrets.token_hex(4)}"
+    reason_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.missing_value_reason (name) VALUES ($1) RETURNING idx",
+        reason_name,
+    )
+    ctx["created"]["missing_value_reason"].append(reason_idx)
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="owner-mv"
+    )
+    ctx["created"]["study"].append(study_idx)
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=_unique_field_name("owner_mv"),
+        owner_biosample_id_value=reason_name,
+        metadata={},
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert reason_name in detail
+    assert "missing-value marker" in detail
+
+    # No biosample row landed: the pre-flight rejection fired before any
+    # INSERT, and the route's transaction rolled back.
+    bs_count = await ctx["pool"].fetchval(
+        "SELECT COUNT(*) FROM qiita.biosample_to_study WHERE study_idx = $1",
+        study_idx,
+    )
+    assert bs_count == 0
 
 
 async def test_post_biosample_metadata_uses_seeded_globals(ctx):

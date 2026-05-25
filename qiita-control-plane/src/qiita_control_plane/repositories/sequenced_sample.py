@@ -27,6 +27,7 @@ import asyncpg
 
 from . import require_transaction, validate_patch_fields
 from ._sample_helpers import (
+    fetch_missing_value_reason_idxs_by_names,
     link_entity_to_studies,
     preflight_global_metadata,
     validate_primary_secondary_studies,
@@ -249,9 +250,11 @@ async def import_sequenced_prep_sample(
       1. Require an open transaction (fail-fast at the function boundary).
       2. Pre-flight metadata validation: resolve every metadata key
          against prep_sample_global_field in one SELECT, then parse every
-         text value into its typed Python value. No DB writes yet; both
-         unknown-name and parse-failure cases raise typed exceptions
-         before any row is touched.
+         text value into its typed Python value (or, when the text matches
+         a missing_value_reason name, into a MissingReasonRef that lands
+         as value_missing_reason_idx). No DB writes yet; both unknown-name
+         and parse-failure cases raise typed exceptions before any row is
+         touched.
       3. INSERT qiita.prep_sample with processing_kind='sequenced'
          supplied explicitly (the supertype column is plain NOT NULL,
          not GENERATED ALWAYS).
@@ -291,11 +294,22 @@ async def import_sequenced_prep_sample(
     # defense-in-depth against callers bypassing the wire-level guard.
     validate_primary_secondary_studies(primary_study_idx, secondary_study_idxs)
 
+    # Pre-flight: resolve every text value that could plausibly be a
+    # missing-reason marker in one DB round trip; the prep-sample composer
+    # has no owner-id field so the candidate set is just the metadata values.
+    # Values are stripped so a padded marker (e.g. " not collected ") resolves.
+    candidate_texts = {v.strip() for v in metadata.values()}
+    known_missing_reasons = await fetch_missing_value_reason_idxs_by_names(conn, candidate_texts)
+
     # Pre-flight: resolve every metadata key against prep_sample_global_field
-    # and parse every text value into its typed Python form. Both unknown-
-    # name and parse-failure cases raise before any DB write.
+    # and parse every text value into its typed Python form, routing marker
+    # texts to MissingReasonRef ahead of typed parsing. Both unknown-name
+    # and parse-failure cases raise before any DB write.
     parsed_metadata = await preflight_global_metadata(
-        conn, spec=PREP_SAMPLE_METADATA_SPEC, metadata=metadata
+        conn,
+        spec=PREP_SAMPLE_METADATA_SPEC,
+        metadata=metadata,
+        known_missing_reasons=known_missing_reasons,
     )
 
     # Step a: create the supertype prep_sample with processing_kind pinned.

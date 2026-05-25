@@ -47,10 +47,10 @@ from ..auth.guards import (
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_snapshot_conn_factory, get_tx_conn_factory
 from ..repositories._sample_helpers import (
-    GlobalFieldSlotOccupiedError,
     LocalWriteOnGloballyLinkedFieldError,
     MetadataParseError,
     MetadataUnknownFieldsError,
+    SlotOccupiedError,
     StudyFieldConflictError,
     TransientWriteRaceError,
     fetch_global_metadata,
@@ -65,10 +65,11 @@ from ..repositories.biosample import (
 from ..repositories.biosample_metadata import (
     BIOSAMPLE_METADATA_SPEC,
     BiosampleOwnerIdFieldCollisionError,
+    BiosampleOwnerIdMissingValueError,
 )
 from ._helpers import (
     GENERIC_FK_VIOLATION,
-    detail_for_global_field_collision,
+    detail_for_slot_collision,
     etag_for_updated_at,
     raise_for_transient_write_race,
 )
@@ -149,6 +150,17 @@ async def import_biosample(
                     f"metadata key {exc.display_name!r} collides with owner_biosample_id_field_name"
                 ),
             )
+        except BiosampleOwnerIdMissingValueError as exc:
+            # owner_biosample_id_value matches a missing_value_reason name.
+            # The owner-id row carries an identifier; a missing-value
+            # marker is incompatible with that contract.
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"owner_biosample_id_value {exc.owner_biosample_id_value!r}"
+                    " cannot be a missing-value marker"
+                ),
+            )
         except MetadataUnknownFieldsError as exc:
             raise HTTPException(
                 status_code=422,
@@ -170,27 +182,25 @@ async def import_biosample(
                     " bound to a different global field"
                 ),
             )
-        except GlobalFieldSlotOccupiedError as exc:
-            # GlobalFieldSlotOccupiedError is its own exception family (not
-            # an asyncpg.UniqueViolationError subclass), so this catch and
+        except SlotOccupiedError as exc:
+            # SlotOccupiedError is its own exception family (not an
+            # asyncpg.UniqueViolationError subclass), so this catch and
             # the generic UniqueViolationError catch below are independent;
-            # both return 409, but this one's detail discriminates the five
-            # cross-study sub-cases rather than collapsing to the generic
-            # message.
+            # both return 409, but this one's detail discriminates the
+            # six sub-cases rather than collapsing to the generic message.
             #
             # NOT DEAD CODE — do not prune. Currently unreachable
             # through this POST because the route creates a fresh
-            # biosample per call, so (biosample_idx, global_field_idx)
-            # is always empty pre-INSERT and the partial unique index
-            # cannot fire. Kept for the planned PATCH-style
-            # write-metadata-on-existing-biosample endpoint, which will
-            # share this composer path; that endpoint can hit the
-            # partial index whenever a caller writes a value for a
-            # biosample whose global field slot was already claimed
-            # by another study. Helper unit tests in
-            # tests/routes/test__helpers.py cover the wording for every
-            # subclass even though no current route flow triggers them.
-            detail = await detail_for_global_field_collision(conn, exc)
+            # biosample per call, so neither the global-field slot nor
+            # the per-field local slot for that biosample can be pre-
+            # occupied and the unique constraint cannot fire. Kept for
+            # the planned PATCH-style write-metadata-on-existing-
+            # biosample endpoint, which will share this composer path;
+            # that endpoint can hit either constraint whenever a caller
+            # writes a value into a biosample whose slot was already
+            # claimed (by another study on the global path, or by an
+            # earlier write on the same study on the local path).
+            detail = await detail_for_slot_collision(conn, exc)
             raise HTTPException(status_code=409, detail=detail)
         except TransientWriteRaceError as exc:
             # The diagnostic read found the colliding occupant already
@@ -201,7 +211,7 @@ async def import_biosample(
         except LocalWriteOnGloballyLinkedFieldError as exc:
             # The requested owner-biosample-id field name resolves to a
             # field already globally linked on this study. The owner-id
-            # row is purely-local PII and must not be written through a
+            # row is purely-local identifier and must not be written through a
             # cross-study global slot; the caller must pick a different
             # owner_biosample_id_field_name. Its own exception family,
             # independent of the asyncpg.UniqueViolationError catch below.

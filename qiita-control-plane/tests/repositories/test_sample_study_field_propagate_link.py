@@ -20,7 +20,7 @@ from qiita_common.models import FieldDataType
 from qiita_control_plane.repositories._sample_helpers import (
     _get_or_create_globally_linked_study_field,
     _get_or_create_local_study_field,
-    _insert_typed_metadata,
+    _insert_metadata,
 )
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
@@ -74,7 +74,7 @@ async def test_propagate_link_upgrade_null_to_non_null_propagates_to_metadata(ct
             data_type=FieldDataType.TEXT,
             required=False,
         )
-        meta_idx = await _insert_typed_metadata(
+        meta_idx = await _insert_metadata(
             conn,
             spec=spec,
             entity_idx=entity_idx,
@@ -169,7 +169,7 @@ async def test_propagate_link_unlink_with_metadata_raises(ctx, spec):
             display_name=_unique_field_name("unlink_full"),
             created_by_idx=ctx["principal_idx"],
         )
-        meta_idx = await _insert_typed_metadata(
+        meta_idx = await _insert_metadata(
             conn,
             spec=spec,
             entity_idx=entity_idx,

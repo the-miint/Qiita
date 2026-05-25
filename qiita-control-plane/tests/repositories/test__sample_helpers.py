@@ -2,13 +2,16 @@
 
 Covers parse_text_for_data_type (pure-unit), write_global_metadata_or_diagnose
 and write_local_metadata_or_diagnose (DB-bound): happy paths for each
-supported data_type, every collision sub-case from both write functions
-(five for the global path, three for the local path), the strict-mode
-LocalWriteOnGloballyLinkedFieldError guard, StudyFieldConflictError and
-non-target UniqueViolation pass-through, transaction rollback of a
-freshly-created study_field on collision, and a prep_sample-spec sanity
-test that proves PREP_SAMPLE_METADATA_SPEC's identifiers and callables
-are correctly bound.
+supported data_type, every collision sub-case from the global write
+function (six SlotOccupiedError leaves) and the same-study + cross-
+kind subset reachable from the local write function (four leaves; the
+*DifferentStudy variants are unreachable on a single-study local row),
+the strict-mode LocalWriteOnGloballyLinkedFieldError guard,
+StudyFieldConflictError and non-target UniqueViolation pass-through,
+transaction rollback of a freshly-created study_field on collision,
+and a prep_sample-spec sanity test that proves
+PREP_SAMPLE_METADATA_SPEC's identifiers and callables are correctly
+bound.
 
 Biosample tests use the ctx fixture (Pattern 2: committed rows + FK-reverse
 cleanup) so the diagnostic SELECT sees the prior writer's committed row.
@@ -39,23 +42,22 @@ from qiita_control_plane.repositories._sample_helpers import (
     DuplicateValueSameStudyError,
     GlobalFieldRow,
     GlobalMetadataRow,
-    LocalConflictingValueError,
-    LocalDuplicateValueError,
-    LocalSlotOccupiedByMissingReasonError,
     LocalWriteOnGloballyLinkedFieldError,
     MetadataParseError,
     MetadataUnknownFieldsError,
+    MissingReasonRef,
     SampleEntityKind,
     SlotOccupiedByMissingReasonError,
+    SlotOccupiedByTypedValueError,
     StudyFieldConflictError,
     TransientWriteRaceError,
-    _fetch_global_field_slot_occupant,
-    _fetch_local_slot_occupant,
+    _fetch_slot_occupant,
     _get_or_create_globally_linked_study_field,
     _get_or_create_local_study_field,
-    _insert_typed_metadata,
+    _insert_metadata,
     fetch_global_fields_by_display_names,
     fetch_global_metadata,
+    fetch_missing_value_reason_idxs_by_names,
     insert_entity_to_study,
     link_entity_to_studies,
     parse_text_for_data_type,
@@ -326,6 +328,49 @@ async def test_write_global_metadata_or_diagnose_date_returns_result_and_persist
         value=date(2026, 5, 15),
         caller_idx=ctx["principal_idx"],
     )
+    assert actual == expected
+
+
+async def test_write_global_metadata_or_diagnose_missing_reason_persists(ctx):
+    """Tests the case where the caller writes a MissingReasonRef against a
+    typed global field: the row carries value_missing_reason_idx populated
+    and every value_* typed column NULL, regardless of the field's
+    data_type.
+    """
+    bs_idx = await _create_biosample_with_link(ctx)
+    # Use a NUMERIC field so any "leak" into a typed column would violate
+    # the data-type contract; the missing-reason exemption is what allows
+    # this row to land.
+    gf_idx = await _seed_global(ctx, FieldDataType.NUMERIC, "missing_happy")
+    reason_idx = await _seed_missing_value_reason(ctx, f"reason_{secrets.token_hex(4)}")
+    display_name = _unique_field_name("missing_global")
+
+    result = await _commit_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        gf_idx=gf_idx,
+        display_name=display_name,
+        data_type=FieldDataType.NUMERIC,
+        value=MissingReasonRef(reason_idx, "any_name"),
+    )
+
+    # value_missing_reason_idx populated; every typed value column NULL.
+    assert result.study_field_created is True
+    actual = await _fetch_metadata_row(ctx["pool"], result.metadata_idx)
+    expected = {
+        "biosample_idx": bs_idx,
+        "biosample_study_field_idx": result.study_field_idx,
+        "global_field_idx": gf_idx,
+        "value_text": None,
+        "value_numeric": None,
+        "value_boolean": None,
+        "value_date": None,
+        "value_terminology_term_idx": None,
+        "value_missing_reason_idx": reason_idx,
+        "is_owner_biosample_id": False,
+        "created_by_idx": ctx["principal_idx"],
+    }
     assert actual == expected
 
 
@@ -626,6 +671,150 @@ async def test_write_global_metadata_or_diagnose_slot_held_by_missing_reason_rai
     assert exc.existing_metadata_idx == seeded_meta_idx
     assert exc.existing_value is None
     assert exc.existing_missing_reason_idx == reason_idx
+
+
+async def test_write_global_metadata_or_diagnose_missing_reason_dup_same_study(ctx):
+    """Tests the case where the slot already holds a missing-reason row
+    and the caller re-attempts the same missing-reason from the same
+    study: the write raises DuplicateValueSameStudyError with the existing
+    missing-reason idx reported as the existing value.
+    """
+    bs_idx = await _create_biosample_with_link(ctx)
+    gf_idx = await _seed_global(ctx, FieldDataType.NUMERIC, "miss_dup_same")
+    reason_idx = await _seed_missing_value_reason(ctx, f"reason_{secrets.token_hex(4)}")
+    display_name_first = _unique_field_name("miss_dup_same_a")
+    display_name_second = _unique_field_name("miss_dup_same_b")
+
+    # First write seeds the missing-reason row through the first display_name.
+    first = await _commit_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        gf_idx=gf_idx,
+        display_name=display_name_first,
+        data_type=FieldDataType.NUMERIC,
+        value=MissingReasonRef(reason_idx, "ignored"),
+    )
+
+    # Second write under the same study via a different display_name with
+    # the same missing-reason -> DuplicateValueSameStudyError.
+    with pytest.raises(DuplicateValueSameStudyError) as excinfo:
+        async with ctx["pool"].acquire() as conn:
+            async with conn.transaction():
+                await write_global_metadata_or_diagnose(
+                    conn,
+                    spec=BIOSAMPLE_METADATA_SPEC,
+                    entity_idx=bs_idx,
+                    study_idx=ctx["study_idx"],
+                    global_field_idx=gf_idx,
+                    display_name=display_name_second,
+                    data_type=FieldDataType.NUMERIC,
+                    value=MissingReasonRef(reason_idx, "ignored"),
+                    caller_idx=ctx["principal_idx"],
+                )
+
+    exc = excinfo.value
+    assert exc.existing_metadata_idx == first.metadata_idx
+    assert exc.existing_value is None
+    assert exc.existing_missing_reason_idx == reason_idx
+    assert exc.contributing_study_idx == ctx["study_idx"]
+
+
+async def test_write_global_metadata_or_diagnose_missing_reason_conflict_diff_study(ctx):
+    """Tests the case where the slot holds a missing-reason from one study
+    and a different study attempts a different missing-reason: the write
+    raises ConflictingValueDifferentStudyError with the original study
+    reported as the contributing study.
+    """
+    bs_idx = await _create_biosample_with_link(ctx)
+    gf_idx = await _seed_global(ctx, FieldDataType.NUMERIC, "miss_conf_x")
+    reason_a_idx = await _seed_missing_value_reason(ctx, f"reason_a_{secrets.token_hex(4)}")
+    reason_b_idx = await _seed_missing_value_reason(ctx, f"reason_b_{secrets.token_hex(4)}")
+    display_name_first = _unique_field_name("miss_conf_a")
+    display_name_second = _unique_field_name("miss_conf_b")
+
+    # First write through the original study seeds missing-reason A.
+    first = await _commit_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        gf_idx=gf_idx,
+        display_name=display_name_first,
+        data_type=FieldDataType.NUMERIC,
+        value=MissingReasonRef(reason_a_idx, "ignored_a"),
+    )
+
+    # Link biosample to a second study so the cross-study path is reachable.
+    second_study_idx = await _create_second_study_and_link_biosample(ctx, bs_idx)
+
+    # Second write from the second study attempts a different
+    # missing-reason -> ConflictingValueDifferentStudyError.
+    with pytest.raises(ConflictingValueDifferentStudyError) as excinfo:
+        async with ctx["pool"].acquire() as conn:
+            async with conn.transaction():
+                await write_global_metadata_or_diagnose(
+                    conn,
+                    spec=BIOSAMPLE_METADATA_SPEC,
+                    entity_idx=bs_idx,
+                    study_idx=second_study_idx,
+                    global_field_idx=gf_idx,
+                    display_name=display_name_second,
+                    data_type=FieldDataType.NUMERIC,
+                    value=MissingReasonRef(reason_b_idx, "ignored_b"),
+                    caller_idx=ctx["principal_idx"],
+                )
+
+    exc = excinfo.value
+    assert exc.existing_metadata_idx == first.metadata_idx
+    assert exc.existing_value is None
+    assert exc.existing_missing_reason_idx == reason_a_idx
+    assert exc.contributing_study_idx == ctx["study_idx"]
+
+
+async def test_write_global_metadata_or_diagnose_raises_slot_occupied_by_typed_value(ctx):
+    """Tests the case where the slot holds a typed value and the caller
+    attempts to record a missing-reason marker: the write raises
+    SlotOccupiedByTypedValueError carrying the typed existing value.
+    """
+    bs_idx = await _create_biosample_with_link(ctx)
+    gf_idx = await _seed_global(ctx, FieldDataType.TEXT, "typed_then_missing")
+    reason_idx = await _seed_missing_value_reason(ctx, f"reason_{secrets.token_hex(4)}")
+    display_name_first = _unique_field_name("typed_first")
+    display_name_second = _unique_field_name("missing_second")
+
+    # First write seeds a typed value through the first display_name.
+    first = await _commit_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        gf_idx=gf_idx,
+        display_name=display_name_first,
+        data_type=FieldDataType.TEXT,
+        value="typed_value",
+    )
+
+    # Second write through a different display_name attempts a
+    # missing-reason against the typed-occupant slot ->
+    # SlotOccupiedByTypedValueError.
+    with pytest.raises(SlotOccupiedByTypedValueError) as excinfo:
+        async with ctx["pool"].acquire() as conn:
+            async with conn.transaction():
+                await write_global_metadata_or_diagnose(
+                    conn,
+                    spec=BIOSAMPLE_METADATA_SPEC,
+                    entity_idx=bs_idx,
+                    study_idx=ctx["study_idx"],
+                    global_field_idx=gf_idx,
+                    display_name=display_name_second,
+                    data_type=FieldDataType.TEXT,
+                    value=MissingReasonRef(reason_idx, "ignored"),
+                    caller_idx=ctx["principal_idx"],
+                )
+
+    exc = excinfo.value
+    assert exc.existing_metadata_idx == first.metadata_idx
+    assert exc.existing_value == "typed_value"
+    assert exc.existing_missing_reason_idx is None
 
 
 # ---------------------------------------------------------------------------
@@ -1044,6 +1233,44 @@ async def test_write_local_metadata_or_diagnose_date_returns_result_and_persists
     assert actual == expected
 
 
+async def test_write_local_metadata_or_diagnose_missing_reason_persists(ctx):
+    """Tests the case where the caller writes a MissingReasonRef through a
+    purely-local study field: value_missing_reason_idx is populated and
+    every value_* typed column stays NULL.
+    """
+    bs_idx = await _create_biosample_with_link(ctx)
+    reason_idx = await _seed_missing_value_reason(ctx, f"reason_{secrets.token_hex(4)}")
+    display_name = _unique_field_name("local_missing")
+
+    result = await _commit_local_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        display_name=display_name,
+        data_type=FieldDataType.TEXT,
+        value=MissingReasonRef(reason_idx, "any_name"),
+    )
+
+    # Full-row assert: missing-reason column populated; global_field_idx
+    # and every typed value column NULL.
+    assert result.study_field_created is True
+    actual = await _fetch_metadata_row(ctx["pool"], result.metadata_idx)
+    expected = {
+        "biosample_idx": bs_idx,
+        "biosample_study_field_idx": result.study_field_idx,
+        "global_field_idx": None,
+        "value_text": None,
+        "value_numeric": None,
+        "value_boolean": None,
+        "value_date": None,
+        "value_terminology_term_idx": None,
+        "value_missing_reason_idx": reason_idx,
+        "is_owner_biosample_id": False,
+        "created_by_idx": ctx["principal_idx"],
+    }
+    assert actual == expected
+
+
 # ---------------------------------------------------------------------------
 # write_local_metadata_or_diagnose: collision sub-cases
 # ---------------------------------------------------------------------------
@@ -1068,8 +1295,9 @@ async def test_write_local_metadata_or_diagnose_raises_duplicate_value(ctx):
 
     # Second write via the same display_name -> get-or-create returns the
     # same study_field; INSERT collides on unique_per_field; same value
-    # -> LocalDuplicateValueError.
-    with pytest.raises(LocalDuplicateValueError) as excinfo:
+    # -> DuplicateValueSameStudyError (single-study local row -> the
+    # contributing study is trivially the caller's).
+    with pytest.raises(DuplicateValueSameStudyError) as excinfo:
         async with ctx["pool"].acquire() as conn:
             async with conn.transaction():
                 await write_local_metadata_or_diagnose(
@@ -1086,9 +1314,11 @@ async def test_write_local_metadata_or_diagnose_raises_duplicate_value(ctx):
     exc = excinfo.value
     assert exc.entity_kind == SampleEntityKind.BIOSAMPLE
     assert exc.entity_idx == bs_idx
-    assert exc.study_idx == ctx["study_idx"]
+    assert exc.attempted_study_idx == ctx["study_idx"]
+    assert exc.contributing_study_idx == ctx["study_idx"]
     assert exc.study_field_idx == first.study_field_idx
     assert exc.display_name == display_name
+    assert exc.global_field_idx is None
     assert exc.existing_metadata_idx == first.metadata_idx
     assert exc.existing_value == "v1"
     assert exc.attempted_value == "v1"
@@ -1111,8 +1341,8 @@ async def test_write_local_metadata_or_diagnose_raises_conflicting_value(ctx):
         value="v1",
     )
 
-    # Second write with a different value -> LocalConflictingValueError.
-    with pytest.raises(LocalConflictingValueError) as excinfo:
+    # Second write with a different value -> ConflictingValueSameStudyError.
+    with pytest.raises(ConflictingValueSameStudyError) as excinfo:
         async with ctx["pool"].acquire() as conn:
             async with conn.transaction():
                 await write_local_metadata_or_diagnose(
@@ -1175,8 +1405,8 @@ async def test_write_local_metadata_or_diagnose_slot_held_by_missing_reason_rais
 
     # write_local_metadata_or_diagnose collides on unique_per_field; the
     # diagnostic SELECT sees the missing-reason row -> raises
-    # LocalSlotOccupiedByMissingReasonError.
-    with pytest.raises(LocalSlotOccupiedByMissingReasonError) as excinfo:
+    # SlotOccupiedByMissingReasonError.
+    with pytest.raises(SlotOccupiedByMissingReasonError) as excinfo:
         async with ctx["pool"].acquire() as conn:
             async with conn.transaction():
                 await write_local_metadata_or_diagnose(
@@ -1194,6 +1424,47 @@ async def test_write_local_metadata_or_diagnose_slot_held_by_missing_reason_rais
     assert exc.existing_metadata_idx == seeded_meta_idx
     assert exc.existing_value is None
     assert exc.existing_missing_reason_idx == reason_idx
+
+
+async def test_write_local_metadata_or_diagnose_raises_slot_occupied_by_typed_value(ctx):
+    """Tests the case where the local slot holds a typed value and the
+    caller attempts a missing-reason write: the write raises
+    SlotOccupiedByTypedValueError carrying the typed existing value.
+    """
+    bs_idx = await _create_biosample_with_link(ctx)
+    reason_idx = await _seed_missing_value_reason(ctx, f"reason_{secrets.token_hex(4)}")
+    display_name = _unique_field_name("local_typed_first")
+
+    # First write commits a typed value through the new local study_field.
+    first = await _commit_local_write(
+        ctx,
+        bs_idx=bs_idx,
+        study_idx=ctx["study_idx"],
+        display_name=display_name,
+        data_type=FieldDataType.TEXT,
+        value="typed_value",
+    )
+
+    # Second write via the same display_name attempts a missing-reason
+    # against the typed-occupant slot -> SlotOccupiedByTypedValueError.
+    with pytest.raises(SlotOccupiedByTypedValueError) as excinfo:
+        async with ctx["pool"].acquire() as conn:
+            async with conn.transaction():
+                await write_local_metadata_or_diagnose(
+                    conn,
+                    spec=BIOSAMPLE_METADATA_SPEC,
+                    entity_idx=bs_idx,
+                    study_idx=ctx["study_idx"],
+                    display_name=display_name,
+                    data_type=FieldDataType.TEXT,
+                    value=MissingReasonRef(reason_idx, "ignored"),
+                    caller_idx=ctx["principal_idx"],
+                )
+
+    exc = excinfo.value
+    assert exc.existing_metadata_idx == first.metadata_idx
+    assert exc.existing_value == "typed_value"
+    assert exc.existing_missing_reason_idx is None
 
 
 # ---------------------------------------------------------------------------
@@ -1343,10 +1614,10 @@ async def test_write_local_metadata_or_diagnose_prep_sample_spec(postgres_pool):
             assert result.study_field_created is True
 
             # Second write via the same display_name with the same value
-            # -> LocalDuplicateValueError via the prep_sample-spec
+            # -> DuplicateValueSameStudyError via the prep_sample-spec
             # diagnostic. Proves the SELECT's interpolated identifiers
             # resolve to the prep_sample side.
-            with pytest.raises(LocalDuplicateValueError) as excinfo:
+            with pytest.raises(DuplicateValueSameStudyError) as excinfo:
                 await write_local_metadata_or_diagnose(
                     conn,
                     spec=PREP_SAMPLE_METADATA_SPEC,
@@ -1360,7 +1631,9 @@ async def test_write_local_metadata_or_diagnose_prep_sample_spec(postgres_pool):
             assert excinfo.value.entity_kind == SampleEntityKind.PREP_SAMPLE
             assert excinfo.value.entity_idx == prep_sample_idx
             assert excinfo.value.existing_value == "local_v1"
-            assert excinfo.value.study_idx == study_idx
+            assert excinfo.value.attempted_study_idx == study_idx
+            assert excinfo.value.contributing_study_idx == study_idx
+            assert excinfo.value.global_field_idx is None
         finally:
             # Pattern 1: never commit; transaction rolls back at finally.
             await tr.rollback()
@@ -1427,17 +1700,19 @@ def test_parse_text_for_data_type_raises_not_implemented(data_type):
 # ---------------------------------------------------------------------------
 
 
-async def test__fetch_global_field_slot_occupant_raises_transient_write_race(ctx):
+async def test__fetch_slot_occupant_global_path_raises_transient_write_race(ctx):
     """A diagnostic SELECT that finds no occupant means the colliding row
     was concurrently deleted-and-committed between the savepoint rollback
-    and this read; the helper raises TransientWriteRaceError (a
-    benign retry signal), not RuntimeError (a schema-corruption claim).
+    and this read; the helper raises TransientWriteRaceError (a benign
+    retry signal), not RuntimeError (a schema-corruption claim). The
+    global-path discriminator (global_field_idx kwarg) selects the
+    global_field_idx WHERE filter and slot_summary label.
     """
     # Sentinel idxs with no metadata row model the occupant having been
     # deleted-and-committed in the race window; the SELECT returns nothing.
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(TransientWriteRaceError) as excinfo:
-            await _fetch_global_field_slot_occupant(
+            await _fetch_slot_occupant(
                 conn,
                 spec=BIOSAMPLE_METADATA_SPEC,
                 entity_idx=2_000_000_000,
@@ -1449,15 +1724,17 @@ async def test__fetch_global_field_slot_occupant_raises_transient_write_race(ctx
     )
 
 
-async def test__fetch_local_slot_occupant_raises_transient_write_race(ctx):
+async def test__fetch_slot_occupant_local_path_raises_transient_write_race(ctx):
     """Local-path twin: a no-occupant diagnostic SELECT on the
     unique-per-field constraint path raises TransientWriteRaceError
     rather than RuntimeError, for the same concurrent-delete reason.
+    The local-path discriminator (study_field_idx kwarg) selects the
+    spec.study_field_idx_column WHERE filter and slot_summary label.
     """
     # Sentinel idxs with no metadata row; same race model as the global twin.
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(TransientWriteRaceError) as excinfo:
-            await _fetch_local_slot_occupant(
+            await _fetch_slot_occupant(
                 conn,
                 spec=PREP_SAMPLE_METADATA_SPEC,
                 entity_idx=2_000_000_000,
@@ -1467,6 +1744,30 @@ async def test__fetch_local_slot_occupant_raises_transient_write_race(ctx):
         "prep_sample_metadata",
         "prep_sample_idx=2000000000, prep_sample_study_field_idx=2000000000",
     )
+
+
+async def test__fetch_slot_occupant_rejects_both_or_neither_idx(ctx):
+    """Tests the case where the caller passes both or neither of the
+    two idx kwargs: the XOR guard rejects the call with ValueError
+    before any DB roundtrip.
+    """
+    async with ctx["pool"].acquire() as conn:
+        # Both kwargs passed -> caller bug, no DB roundtrip.
+        with pytest.raises(ValueError, match="exactly one of"):
+            await _fetch_slot_occupant(
+                conn,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                entity_idx=1,
+                global_field_idx=1,
+                study_field_idx=1,
+            )
+        # Neither kwarg passed -> caller bug, no DB roundtrip.
+        with pytest.raises(ValueError, match="exactly one of"):
+            await _fetch_slot_occupant(
+                conn,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                entity_idx=1,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1552,6 +1853,60 @@ async def test_fetch_global_fields_by_display_names_omits_unknown(
         known_name: GlobalFieldRow(idx=idx, display_name=known_name, data_type=FieldDataType.TEXT),
     }
     assert result == expected
+
+
+# ---------------------------------------------------------------------------
+# fetch_missing_value_reason_idxs_by_names
+# ---------------------------------------------------------------------------
+
+
+async def _seed_missing_value_reason(ctx, name: str) -> int:
+    """Insert one qiita.missing_value_reason row, track for cleanup, return idx."""
+    idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.missing_value_reason (name) VALUES ($1) RETURNING idx",
+        name,
+    )
+    ctx["created"]["missing_value_reason"].append(idx)
+    return idx
+
+
+async def test_fetch_missing_value_reason_idxs_by_names_returns_idxs(ctx):
+    """Tests the case where every requested name has a matching row: the
+    returned dict carries name -> idx for each one.
+    """
+    suffix = secrets.token_hex(4)
+    name_a = f"mv_a_{suffix}"
+    name_b = f"mv_b_{suffix}"
+    idx_a = await _seed_missing_value_reason(ctx, name_a)
+    idx_b = await _seed_missing_value_reason(ctx, name_b)
+
+    async with ctx["pool"].acquire() as conn:
+        result = await fetch_missing_value_reason_idxs_by_names(conn, [name_a, name_b])
+
+    assert result == {name_a: idx_a, name_b: idx_b}
+
+
+async def test_fetch_missing_value_reason_idxs_by_names_empty_input(ctx):
+    """Tests the case where the names iterable is empty: returns an empty
+    dict.
+    """
+    async with ctx["pool"].acquire() as conn:
+        result = await fetch_missing_value_reason_idxs_by_names(conn, [])
+
+    assert result == {}
+
+
+async def test_fetch_missing_value_reason_idxs_by_names_no_matches(ctx):
+    """Tests the case where no requested name has a matching row: returns
+    an empty dict.
+    """
+    suffix = secrets.token_hex(4)
+    async with ctx["pool"].acquire() as conn:
+        result = await fetch_missing_value_reason_idxs_by_names(
+            conn, [f"no_such_reason_{suffix}_x", f"no_such_reason_{suffix}_y"]
+        )
+
+    assert result == {}
 
 
 # ---------------------------------------------------------------------------
@@ -1900,7 +2255,7 @@ async def test__get_or_create_local_study_field_returns_existing(ctx, spec):
 
 
 # ---------------------------------------------------------------------------
-# _insert_typed_metadata (parametrized over both specs and all data_types)
+# _insert_metadata (parametrized over both specs and all data_types)
 # ---------------------------------------------------------------------------
 
 
@@ -1918,7 +2273,7 @@ async def test__get_or_create_local_study_field_returns_existing(ctx, spec):
     ],
     ids=["text", "numeric", "date"],
 )
-async def test__insert_typed_metadata_writes_typed_value(ctx, spec, data_type, value, value_column):
+async def test__insert_metadata_writes_typed_value(ctx, spec, data_type, value, value_column):
     """Happy path: one insert per (spec, data_type); the row lands in
     exactly the matching value_* column and the others stay NULL.
     """
@@ -1944,7 +2299,7 @@ async def test__insert_typed_metadata_writes_typed_value(ctx, spec, data_type, v
 
     # Insert via the shared typed inserter.
     async with ctx["pool"].acquire() as conn:
-        meta_idx = await _insert_typed_metadata(
+        meta_idx = await _insert_metadata(
             conn,
             spec=spec,
             entity_idx=entity_idx,
@@ -1981,7 +2336,72 @@ async def test__insert_typed_metadata_writes_typed_value(ctx, spec, data_type, v
     [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
     ids=["biosample", "prep_sample"],
 )
-async def test__insert_typed_metadata_unsupported_data_type_raises(ctx, spec):
+async def test__insert_metadata_writes_missing_reason_value(ctx, spec):
+    """Tests the case where the value is a MissingReasonRef: the row lands
+    with value_missing_reason_idx populated and every typed value column
+    NULL, regardless of the field's data_type.
+    """
+    entity_idx = await (
+        _create_biosample_with_link(ctx)
+        if spec.entity_kind is SampleEntityKind.BIOSAMPLE
+        else _create_prep_sample_with_link(ctx)
+    )
+    reason_idx = await _seed_missing_value_reason(ctx, f"reason_{secrets.token_hex(4)}")
+
+    # Local NUMERIC field so a typed-column write would violate the
+    # data-type contract; the missing-reason exemption is what lets the
+    # row land.
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        field_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=_unique_field_name("missing_insert"),
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.NUMERIC,
+            required=True,
+        )
+    ctx["created"][f"{spec.entity_kind}_study_field"].append(field_idx)
+
+    async with ctx["pool"].acquire() as conn:
+        meta_idx = await _insert_metadata(
+            conn,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_field_idx=field_idx,
+            data_type=FieldDataType.NUMERIC,
+            value=MissingReasonRef(reason_idx, "ignored_in_insert"),
+            created_by_idx=ctx["principal_idx"],
+        )
+    ctx["created"][f"{spec.entity_kind}_metadata"].append(meta_idx)
+
+    # Full-row assert: missing-reason column carries the FK; every typed
+    # value column is NULL.
+    row = await ctx["pool"].fetchrow(
+        f"SELECT {spec.entity_key_column}, {spec.study_field_idx_column},"
+        f" value_text, value_numeric, value_date, value_missing_reason_idx,"
+        f" created_by_idx"
+        f" FROM {spec.metadata_table} WHERE idx = $1",
+        meta_idx,
+    )
+    expected = {
+        spec.entity_key_column: entity_idx,
+        spec.study_field_idx_column: field_idx,
+        "value_text": None,
+        "value_numeric": None,
+        "value_date": None,
+        "value_missing_reason_idx": reason_idx,
+        "created_by_idx": ctx["principal_idx"],
+    }
+    assert dict(row) == expected
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test__insert_metadata_unsupported_data_type_raises(ctx, spec):
     """Closed-set guard: BOOLEAN and TERMINOLOGY are not yet decodable
     via GLOBAL_METADATA_VALUE_COLUMN, so the shared inserter raises
     NotImplementedError rather than silently writing NULL into every
@@ -1990,7 +2410,7 @@ async def test__insert_typed_metadata_unsupported_data_type_raises(ctx, spec):
     """
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(NotImplementedError):
-            await _insert_typed_metadata(
+            await _insert_metadata(
                 conn,
                 spec=spec,
                 entity_idx=1,
@@ -2057,7 +2477,7 @@ async def _seed_globally_linked_metadata(
             display_name=display_name,
             created_by_idx=ctx["principal_idx"],
         )
-        meta_idx = await _insert_typed_metadata(
+        meta_idx = await _insert_metadata(
             conn,
             spec=spec,
             entity_idx=entity_idx,
@@ -2169,7 +2589,7 @@ async def test_fetch_global_metadata_excludes_purely_local_rows(ctx, spec):
     local_field_idx = await _create_local_field(ctx, suffix=f"plain_{suffix}")
     owner_id_field_idx = await _create_local_field(ctx, suffix=f"owner_{suffix}")
     async with ctx["pool"].acquire() as conn:
-        local_meta = await _insert_typed_metadata(
+        local_meta = await _insert_metadata(
             conn,
             spec=BIOSAMPLE_METADATA_SPEC,
             entity_idx=bs_idx,
@@ -2505,6 +2925,97 @@ async def test_preflight_global_metadata_raises_parse_error(ctx, spec):
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(MetadataParseError):
             await preflight_global_metadata(conn, spec=spec, metadata=metadata)
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_preflight_global_metadata_routes_missing_marker(ctx, spec):
+    """Tests the case where a metadata text value matches a known
+    missing-reason name: the corresponding entry resolves to a
+    MissingReasonRef carrying the reason's idx and name.
+    """
+    # Seed a NUMERIC field: missing-marker recognition is the only way
+    # for a non-numeric text to resolve in this slot.
+    gf_row = await _seed_global_field_for_spec(ctx, spec, FieldDataType.NUMERIC)
+    suffix = secrets.token_hex(4)
+    reason_name = f"mv_marker_{suffix}"
+    reason_idx = await _seed_missing_value_reason(ctx, reason_name)
+
+    metadata = {gf_row.display_name: reason_name}
+    async with ctx["pool"].acquire() as conn:
+        result = await preflight_global_metadata(
+            conn,
+            spec=spec,
+            metadata=metadata,
+            known_missing_reasons={reason_name: reason_idx},
+        )
+
+    assert result == [(gf_row, MissingReasonRef(reason_idx, reason_name))]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_preflight_global_metadata_unchanged_for_typed_values_with_empty_map(ctx, spec):
+    """Tests the case where known_missing_reasons is empty: typed parsing
+    runs and produces typed Python values.
+    """
+    gf_row = await _seed_global_field_for_spec(ctx, spec, FieldDataType.TEXT)
+
+    metadata = {gf_row.display_name: "  hello  "}
+    async with ctx["pool"].acquire() as conn:
+        result = await preflight_global_metadata(
+            conn,
+            spec=spec,
+            metadata=metadata,
+            known_missing_reasons={},
+        )
+
+    # Outer whitespace is stripped from the TEXT value.
+    assert result == [(gf_row, "hello")]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_preflight_global_metadata_recognizes_padded_marker(ctx, spec):
+    """Tests the case where a TEXT-field metadata value is a missing-reason
+    name with surrounding whitespace: the value resolves to a MissingReasonRef
+    (carrying the stripped reason name), not a literal text value.
+    """
+    # TEXT field: without stripped marker recognition, a padded marker
+    # would be silently stored as a literal text value via parse_text_for_data_type.
+    gf_row = await _seed_global_field_for_spec(ctx, spec, FieldDataType.TEXT)
+    suffix = secrets.token_hex(4)
+    reason_name = f"mv_marker_{suffix}"
+    reason_idx = await _seed_missing_value_reason(ctx, reason_name)
+
+    metadata = {gf_row.display_name: f"  {reason_name}  "}
+    async with ctx["pool"].acquire() as conn:
+        result = await preflight_global_metadata(
+            conn,
+            spec=spec,
+            metadata=metadata,
+            known_missing_reasons={reason_name: reason_idx},
+        )
+
+    assert result == [(gf_row, MissingReasonRef(reason_idx, reason_name))]
+
+
+def test_parse_text_for_data_type_unchanged_for_missing_reason_name():
+    """Tests the case where a text value matches a known missing-reason
+    name: parse_text_for_data_type raises MetadataParseError when the
+    field is NUMERIC. Marker recognition is not performed at this layer.
+    """
+    with pytest.raises(MetadataParseError):
+        parse_text_for_data_type("temp_c", FieldDataType.NUMERIC, "not collected")
 
 
 # ---------------------------------------------------------------------------
