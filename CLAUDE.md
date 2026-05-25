@@ -102,6 +102,22 @@ Whenever you add, rename, or remove a value in an enum that *does* have a Postgr
 
 This also applies when reviewing code: a PR that changes a `CREATE TYPE ... AS ENUM` or its Python twin without the matching other-side change, two-way comment, and `ENUM_PAIRS` entry is incomplete. A new `StrEnum`/`Literal` with no Postgres ENUM is *not* a defect — see the `TEXT`/`CHECK` carve-out above — so do not flag it for a missing ENUM twin.
 
+## Operator-facing changes (CHANGELOG.md)
+
+`CHANGELOG.md` at the repo root is the operator's release-notes channel for deploys. It lives separately from the git log and the PR descriptions because future operators read `tail CHANGELOG.md` before running `sudo local-deploy.sh` to find out what's new since their last deploy — PR descriptions sit inside closed PRs and stop being a natural lookup target once merged.
+
+Add a new entry to `CHANGELOG.md` *in the same PR* whenever the PR introduces any of:
+
+- A new required env var (CP, DP, or CO) — the boot-time `from_env()` fail-fast catches it, but the operator should set it pre-deploy, not after the systemd unit fails to start.
+- A new shared directory the operator must create with specific owner/group/mode (e.g. an upload-staging or workspace root).
+- A migration that needs out-of-band setup the runbook doesn't already cover (CREATE EXTENSION, manual data backfill, etc.).
+- A breaking change in `/etc/qiita/*.env` shape (renamed key, removed key with no compat alias).
+- Any other action the operator must take on the deploy host *before* `sudo local-deploy.sh` for the deploy to succeed.
+
+A PR that only changes Python/Rust code, tests, docs, or migrations that the existing dbmate flow handles autonomously does **not** need an entry. When in doubt: "if the operator follows the existing runbook + `sudo local-deploy.sh` without reading this PR, does the deploy succeed?" If no, add an entry.
+
+Entry format: `## PR #N — <title>` heading, newest on top, with concrete `bash` commands the operator can copy/paste. The existing entries in the file show the shape. Reviewers check that the entry exists when the PR description (or the diff) implies operator action.
+
 ## Architecture
 
 See `docs/architecture.md` for the full system diagram, `docs/reference-data-staging.md` for how reference databases are ingested, `docs/auth.md` for the authentication / authorization surface (principal subtypes, OIDC + opaque-token paths, role/scope ceilings, admin endpoints, and the `qiita-admin` CLI), and `docs/duckdb-miint.md` for the duckdb-miint SQL extension that powers our bioinformatics functions — that file carries a `Last checked` date; re-verify a signature against upstream before relying on it if the file looks stale. Operational runbooks for the auth surface live under `docs/runbooks/`. What follows is the non-obvious cross-cutting structure.
