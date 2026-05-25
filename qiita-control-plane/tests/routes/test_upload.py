@@ -15,6 +15,7 @@ from qiita_common.api_paths import (
     URL_UPLOAD_PREFIX,
 )
 from qiita_common.auth_constants import Scope
+from qiita_common.models import UploadStatus
 
 pytestmark = pytest.mark.db
 
@@ -130,7 +131,7 @@ async def test_create_upload_slot_ok(ctx):
         " FROM qiita.upload WHERE upload_idx = $1",
         body["upload_idx"],
     )
-    assert row["status"] == "pending"
+    assert row["status"] == UploadStatus.PENDING.value
     assert row["description"] == "cycle1 happy path"
     assert row["created_by_idx"] == ctx["admin_session"]["principal_idx"]
     # done-fields must be NULL on a freshly-minted slot.
@@ -201,7 +202,7 @@ async def test_upload_done_transitions_to_ready(ctx):
     assert done_resp.status_code == 200, done_resp.text
 
     body = done_resp.json()
-    assert body["status"] == "ready"
+    assert body["status"] == UploadStatus.READY.value
     assert body["sha256"] == "a" * 64
     assert body["row_count"] == 3
     assert body["bytes_received"] == 1024
@@ -255,15 +256,16 @@ async def test_upload_done_on_consumed_row_returns_409(ctx):
     create_resp = await _create_upload(ctx["admin"])
     idx = _track(ctx, create_resp)
     await ctx["pool"].execute(
-        "UPDATE qiita.upload SET status = 'consumed', completed_at = now() WHERE upload_idx = $1",
+        "UPDATE qiita.upload SET status = $2, completed_at = now() WHERE upload_idx = $1",
         idx,
+        UploadStatus.CONSUMED.value,
     )
     resp = await ctx["admin"].post(
         URL_UPLOAD_DONE.format(upload_idx=idx),
         json={"sha256": "0" * 64, "row_count": 0, "bytes_received": 0},
     )
     assert resp.status_code == 409
-    assert "consumed" in resp.json()["detail"]
+    assert UploadStatus.CONSUMED.value in resp.json()["detail"]
 
 
 async def test_upload_done_unknown_idx(ctx):
@@ -319,7 +321,7 @@ async def test_get_upload_status_pending(ctx):
     assert resp.status_code == 200
     body = resp.json()
     assert body["upload_idx"] == idx
-    assert body["status"] == "pending"
+    assert body["status"] == UploadStatus.PENDING.value
     assert body["description"] == "just minted"
     assert body["sha256"] is None
     assert body["completed_at"] is None
@@ -337,7 +339,7 @@ async def test_get_upload_status_after_done(ctx):
     resp = await ctx["admin"].get(URL_UPLOAD_BY_IDX.format(upload_idx=idx))
     assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] == "ready"
+    assert body["status"] == UploadStatus.READY.value
     assert body["sha256"] == "f" * 64
     assert body["row_count"] == 7
     assert body["bytes_received"] == 4096
@@ -387,6 +389,6 @@ async def test_upload_done_rejected_for_non_owner_admin(ctx):
         "SELECT status, sha256, completed_at FROM qiita.upload WHERE upload_idx = $1",
         idx,
     )
-    assert row["status"] == "pending"
+    assert row["status"] == UploadStatus.PENDING.value
     assert row["sha256"] is None
     assert row["completed_at"] is None

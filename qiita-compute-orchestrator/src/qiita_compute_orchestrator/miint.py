@@ -87,12 +87,12 @@ PARQUET_OPTS_CHUNKED: str = f"{PARQUET_OPTS}, ROW_GROUP_SIZE {CHUNK_ROW_GROUP_SI
 # under-allocating threads only costs throughput, but exceeding
 # memory_limit OOM-kills the job.
 #
-# Until #38 plumbs `JobParams.baseline_resources` directly into the job
-# at dispatch time, each call site passes the YAML numbers as literals
-# — a mismatch with the workflow YAML is visible at review time, not a
-# runtime surprise.
+# Each call site passes the YAML numbers as literals — a mismatch with
+# the workflow YAML is visible at review time, not a runtime surprise.
+# A future refactor should thread `JobParams.baseline_resources` into
+# the job at dispatch time so the literals can go away.
 #
-# Defined here so a future per-job override (or the #38 plumb) has one
+# Defined here so per-job overrides (or that future plumb) have one
 # place to land, rather than three independent copies in the jobs/*
 # modules.
 
@@ -127,9 +127,9 @@ def apply_duckdb_settings(
     responsible for choosing values that fit (a) the SLURM cgroup
     allocation (memory_gb < yaml_mem_gb), and (b) the query shape's
     parallel-state cost (threads may need to be below yaml_cpu for
-    HASH_AGG-heavy workloads — see hash_sequences). #38 will replace
-    these literals with values derived from JobParams.baseline_resources
-    plus per-job overrides."""
+    HASH_AGG-heavy workloads — see hash_sequences). A future refactor
+    should derive these from JobParams.baseline_resources plus per-job
+    overrides, eliminating the duplicated literals."""
     conn.execute(f"SET memory_limit='{memory_gb}GB'")
     conn.execute(f"SET threads={threads}")
     conn.execute("SET preserve_insertion_order=false")

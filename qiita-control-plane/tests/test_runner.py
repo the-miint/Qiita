@@ -21,6 +21,7 @@ import uuid
 from pathlib import Path
 
 import pytest
+from qiita_common.models import UploadStatus
 from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER, REFERENCE_LOAD_CONTAINER
 
 pytestmark = pytest.mark.db
@@ -872,16 +873,18 @@ async def upload_staging_root(tmp_path):
     return root
 
 
-async def _insert_upload(pool, *, principal_idx: int, status: str = "ready") -> int:
+async def _insert_upload(
+    pool, *, principal_idx: int, status: UploadStatus = UploadStatus.READY
+) -> int:
     """Insert a qiita.upload row at the given status. Status transitions
     on this domain are CHECK-gated; insert direct so tests can set up
     pending/ready/consumed/failed without going through the route."""
-    completed_at = "now()" if status != "pending" else "NULL"
+    completed_at = "now()" if status != UploadStatus.PENDING else "NULL"
     return await pool.fetchval(
         f"INSERT INTO qiita.upload (status, created_by_idx, completed_at)"
         f" VALUES ($1, $2, {completed_at})"
         " RETURNING upload_idx",
-        status,
+        status.value,
         principal_idx,
     )
 
@@ -895,7 +898,7 @@ async def upload_work_ticket(
     (the system principal) to match the existing fixture's hardcoded
     originator."""
     action_id, version = reference_add_action
-    upload_idx = await _insert_upload(postgres_pool, principal_idx=1, status="ready")
+    upload_idx = await _insert_upload(postgres_pool, principal_idx=1, status=UploadStatus.READY)
     # Materialize the staged file on disk at the canonical layout so the
     # runner's existence check (if any) wouldn't trip; the FakeBackendClient
     # doesn't actually read it.
@@ -952,7 +955,7 @@ async def test_runner_resolves_upload_handles_and_consumes_on_success(
         "SELECT status FROM qiita.upload WHERE upload_idx = $1",
         upload_work_ticket["fasta_upload_idx"],
     )
-    assert status == "consumed"
+    assert status == UploadStatus.CONSUMED.value
 
 
 async def test_runner_rejects_unready_upload(
@@ -962,7 +965,9 @@ async def test_runner_rejects_unready_upload(
     step runs. The upload stays pending; the work_ticket transitions to
     FAILED."""
     action_id, version = reference_add_action
-    pending_upload = await _insert_upload(postgres_pool, principal_idx=1, status="pending")
+    pending_upload = await _insert_upload(
+        postgres_pool, principal_idx=1, status=UploadStatus.PENDING
+    )
     try:
         work_ticket_idx = await postgres_pool.fetchval(
             "INSERT INTO qiita.work_ticket ("
@@ -995,7 +1000,9 @@ async def test_runner_rejects_unready_upload(
             status = await postgres_pool.fetchval(
                 "SELECT status FROM qiita.upload WHERE upload_idx = $1", pending_upload
             )
-            assert status == "pending", "unready upload must not be moved by a rejected workflow"
+            assert status == UploadStatus.PENDING.value, (
+                "unready upload must not be moved by a rejected workflow"
+            )
         finally:
             await postgres_pool.execute(
                 "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
@@ -1013,7 +1020,7 @@ async def test_runner_rejects_consumed_upload(
     One-shot semantics: status='consumed' is terminal for the consume
     path. Mint a fresh upload if you need to retry."""
     action_id, version = reference_add_action
-    spent = await _insert_upload(postgres_pool, principal_idx=1, status="consumed")
+    spent = await _insert_upload(postgres_pool, principal_idx=1, status=UploadStatus.CONSUMED)
     try:
         work_ticket_idx = await postgres_pool.fetchval(
             "INSERT INTO qiita.work_ticket ("
@@ -1104,7 +1111,7 @@ async def test_runner_rejects_upload_owned_by_other_principal(
     )
     try:
         foreign_upload = await _insert_upload(
-            postgres_pool, principal_idx=other_pidx, status="ready"
+            postgres_pool, principal_idx=other_pidx, status=UploadStatus.READY
         )
         try:
             work_ticket_idx = await postgres_pool.fetchval(
@@ -1139,7 +1146,7 @@ async def test_runner_rejects_upload_owned_by_other_principal(
                 status = await postgres_pool.fetchval(
                     "SELECT status FROM qiita.upload WHERE upload_idx = $1", foreign_upload
                 )
-                assert status == "ready"
+                assert status == UploadStatus.READY.value
             finally:
                 await postgres_pool.execute(
                     "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx

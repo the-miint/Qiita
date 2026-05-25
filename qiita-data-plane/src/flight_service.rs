@@ -471,13 +471,20 @@ where
                     file.try_clone()
                         .map_err(|e| Status::internal(format!("dup file handle: {e}")))?,
                 );
-                // Parquet v2 + zstd matches the project-wide convention
-                // (every other Parquet writer in the codebase uses these).
-                // Staging upload.parquet defaulted to uncompressed v1 —
-                // GG2 backbone FASTA blew up to ~3.5× the source on disk
-                // because DNA-chunk VARCHAR columns don't dictionary-encode.
-                // zstd level 3 is the parquet-rs default ZSTD setting and
-                // a good DNA-on-disk trade (fast, ~4× compression).
+                // Parquet v2 + zstd. The orchestrator's miint.py defines
+                // two conventions: PARQUET_OPTS (zstd, for DuckLake-bound
+                // durable artifacts) and PARQUET_OPTS_INTERMEDIATE (snappy,
+                // for transient files read once then deleted in the same
+                // job). DoPut uploads are intermediate in the consumed-once
+                // sense — but their disk-residency is "from /done to
+                // (eventual) cleanup," not "until the next phase in the
+                // same job." That can be minutes to indefinitely with the
+                // current no-sweep follow-up open. The disk-footprint
+                // tradeoff outweighs the snappy fast-decode win at GG2
+                // scale: backbone FASTA blew up to ~3.5× the source on
+                // disk under uncompressed v1 (DNA-chunk VARCHAR columns
+                // don't dictionary-encode), and zstd-default level 3
+                // gives ~4× compression at parquet-rs's default cost.
                 let props = WriterProperties::builder()
                     .set_writer_version(WriterVersion::PARQUET_2_0)
                     .set_compression(Compression::ZSTD(ZstdLevel::default()))

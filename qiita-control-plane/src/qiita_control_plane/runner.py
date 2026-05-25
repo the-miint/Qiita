@@ -559,7 +559,7 @@ def _safe_entry_name(action: ActionDefinition, index: int | None) -> str | None:
 # =============================================================================
 #
 # Source-of-truth for the upload domain — what a `qiita.upload` row means
-# and the consume contract — lives in db/migrations/20260519000000_upload.sql.
+# and the consume contract — lives in db/migrations/20260521000000_upload.sql.
 # These helpers tie that domain to the workflow runner: pre-step resolution
 # (find the file the step will read) and post-success consumption (mark the
 # slot terminal).
@@ -682,10 +682,15 @@ async def _consume_upload_handles(
     work_ticket COMPLETED transition."""
     if not upload_idxs:
         return
+    # completed_at is pinned at the first terminal transition (the
+    # pending→ready UPDATE in POST /upload/{idx}/done) per the migration
+    # comment on `upload_terminal_has_completed_at`. Any other path that
+    # mutates `status` off `pending` must populate `completed_at`; paths
+    # that move between non-pending states (ready→consumed here, a future
+    # consumed→archived, etc.) must NOT overwrite it.
     rows = await pool.fetch(
         "UPDATE qiita.upload"
-        " SET status = $1,"
-        "     completed_at = now()"
+        " SET status = $1"
         " WHERE upload_idx = ANY($2::bigint[])"
         "   AND status = $3"
         " RETURNING upload_idx",

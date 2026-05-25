@@ -62,9 +62,12 @@ YAML_STEP_NAME = "load"
 # DuckDB resource caps for this step. The YAML allocation
 # (workflows/reference-add/1.0.0.yaml: mem_gb=32, cpu=8) sizes the
 # SLURM cgroup; DuckDB's own caps sit just below it (`mem_gb - 1`
-# leaves ~1 GB for Python/miint/OS overhead). #38 will plumb these
-# directly. The prior shape (mem_gb=7) left 25 GB of the allocation
-# unused; this step's workload genuinely benefits from the headroom.
+# leaves ~1 GB for Python/miint/OS overhead). These literals duplicate
+# the workflow YAML's baseline_resources — a mismatch is visible at
+# review time. A future refactor should thread the YAML values through
+# `Inputs` instead of duplicating. The prior shape (mem_gb=7) left 25 GB
+# of the allocation unused; this step's workload genuinely benefits
+# from the headroom.
 _DUCKDB_MEMORY_GB = 31
 _DUCKDB_THREADS = 8
 

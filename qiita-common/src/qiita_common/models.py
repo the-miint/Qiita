@@ -293,7 +293,7 @@ class DoGetTicketResponse(BaseModel):
 
 class UploadStatus(StrEnum):
     """Mirrored by the `upload.status` CHECK constraint in
-    db/migrations/20260519000000_upload.sql. Stored as TEXT/CHECK, not a
+    db/migrations/20260521000000_upload.sql. Stored as TEXT/CHECK, not a
     Postgres ENUM — same carve-out as ReferenceStatus and AuthEventType;
     see CLAUDE.md "Enum parity". Keep both sides in sync by hand."""
 

@@ -61,7 +61,9 @@ YAML_STEP_NAME = "hash_sequences"
 # many of GG2's ~21 MB genome tail). The 7 GB cap from the YAML
 # (mem_gb=8 minus 1 GB Python headroom) is uncomfortable for that
 # worst case; this step intentionally takes a larger DuckDB cap.
-# #38 will plumb these from JobParams.baseline_resources directly.
+# These literals duplicate the workflow YAML's baseline_resources for
+# this step; a mismatch is visible at review time. A future refactor
+# should thread the YAML values through `Inputs` instead of duplicating.
 _DUCKDB_MEMORY_GB = 24
 _DUCKDB_THREADS = 4
 
