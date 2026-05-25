@@ -75,6 +75,20 @@ A step in a workflow YAML must declare exactly one of `container:` or `module:`.
 
 Fixed in #11 after the initial schema mixed both forms.
 
+## Enum parity (Python ↔ Postgres)
+
+Many closed value sets are **deliberately duplicated**: once as a Python `StrEnum` in `qiita-common` (so Pydantic models type-check at import time, with no DB connection) and once as a Postgres `CREATE TYPE ... AS ENUM` (so the database itself rejects bad values). Per issue #37 this duplication is a chosen compromise — the DB is *not* the single source of truth — so do **not** try to derive one side from the other.
+
+Not every closed value set is a Postgres ENUM. `auth_event.event_type`, `reference.status`, and `reference.kind` are intentionally plain `TEXT` (with a `CHECK` where appropriate) even though their Python twins exist (`AuthEventType` and `ReferenceStatus` are `StrEnum`s; `ReferenceKind` is a `Literal`) — see those migrations for the rationale. The rules below apply **only** to value sets that are `CREATE TYPE ... AS ENUM`; a `StrEnum`/`Literal` backed by a `TEXT`/`CHECK` column is a valid, deliberate choice and is out of scope for the parity test.
+
+Whenever you add, rename, or remove a value in an enum that *does* have a Postgres `CREATE TYPE` twin:
+
+1. **Change both sides in the same PR.** Update the Python `StrEnum` *and* the Postgres ENUM. Postgres ENUM changes go in a **new migration** (`ALTER TYPE ... ADD VALUE` / rename) — editing an already-applied `CREATE TYPE` migration does not reach databases that already ran it.
+2. **Keep the two-way comment.** The Python enum's docstring names its Postgres twin; the Postgres `CREATE TYPE` comment names its Python twin. Both must stay accurate so anyone reading either one is reminded of the other.
+3. **Register the pair for the parity test.** `ENUM_PAIRS` in `qiita-control-plane/tests/test_enum_parity.py` lists every `(Python enum, Postgres ENUM)` pair. `test_enum_parity` fails on value drift; `test_all_postgres_enums_are_covered` fails if a Postgres ENUM in the `qiita` schema is not registered there. Both run under `make test-control-plane-with-db`. A brand-new mirrored enum must be added to `ENUM_PAIRS`.
+
+This also applies when reviewing code: a PR that changes a `CREATE TYPE ... AS ENUM` or its Python twin without the matching other-side change, two-way comment, and `ENUM_PAIRS` entry is incomplete. A new `StrEnum`/`Literal` with no Postgres ENUM is *not* a defect — see the `TEXT`/`CHECK` carve-out above — so do not flag it for a missing ENUM twin.
+
 ## Architecture
 
 See `docs/architecture.md` for the full system diagram, `docs/reference-data-staging.md` for how reference databases are ingested, `docs/auth.md` for the authentication / authorization surface (principal subtypes, OIDC + opaque-token paths, role/scope ceilings, admin endpoints, and the `qiita-admin` CLI), and `docs/duckdb-miint.md` for the duckdb-miint SQL extension that powers our bioinformatics functions — that file carries a `Last checked` date; re-verify a signature against upstream before relying on it if the file looks stale. Operational runbooks for the auth surface live under `docs/runbooks/`. What follows is the non-obvious cross-cutting structure.
