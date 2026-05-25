@@ -8,8 +8,8 @@
 --   2. terminology_term obsoletion tracking (kind, version, FK replaced_by,
 --      notes) and a composite-FK invariant on terminology_closure that ties
 --      both endpoints to the same terminology
---   3. missing_value_reason obsoletion columns and seed of the
---      pre-2023 + 2023 INSDC curated vocabulary
+--   3. missing_value_reason obsoletion columns, a nonempty-name CHECK, and
+--      seed of the pre-2023 + 2023 INSDC curated vocabulary
 
 -- -----------------------------------------------------------------------------
 -- terminology.status
@@ -149,12 +149,18 @@ COMMENT ON TABLE qiita.terminology_closure IS
 -- missing_value_reason: obsoletion columns + INSDC seed
 -- -----------------------------------------------------------------------------
 
+-- The base table declares name VARCHAR(100) NOT NULL, but Postgres NOT NULL
+-- still accepts the empty string. Pair the application-side Pydantic
+-- min_length=1 guard on MissingReasonRef.name with a DB-side CHECK so the
+-- empty-string marker can never reach a wire response.
 ALTER TABLE qiita.missing_value_reason
     ADD COLUMN is_obsolete  BOOLEAN NOT NULL DEFAULT false,
     ADD COLUMN replaced_by  BIGINT REFERENCES qiita.missing_value_reason(idx) ON DELETE RESTRICT,
     ADD COLUMN notes        TEXT,
     ADD CONSTRAINT missing_value_reason_replaced_by_only_if_obsolete
-        CHECK (replaced_by IS NULL OR is_obsolete = true);
+        CHECK (replaced_by IS NULL OR is_obsolete = true),
+    ADD CONSTRAINT missing_value_reason_name_nonempty
+        CHECK (length(name) > 0);
 
 COMMENT ON COLUMN qiita.missing_value_reason.is_obsolete IS
     'True when this reason has been retired from the curated set. '
@@ -225,6 +231,7 @@ WHERE name IN (
 );
 
 ALTER TABLE qiita.missing_value_reason
+    DROP CONSTRAINT missing_value_reason_name_nonempty,
     DROP CONSTRAINT missing_value_reason_replaced_by_only_if_obsolete,
     DROP COLUMN notes,
     DROP COLUMN replaced_by,

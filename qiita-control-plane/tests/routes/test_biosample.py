@@ -1433,6 +1433,84 @@ async def test_get_biosample_system_admin_bypasses_access(ctx):
     assert rj == expected
 
 
+async def test_get_biosample_carries_missing_reason_marker(ctx):
+    """Tests the case where a globally-linked metadata row is an
+    intentionally-missing entry: the GET response surfaces the row's
+    value as a MissingReasonRef on the wire (idx + name).
+    """
+    suffix = secrets.token_hex(4)
+    reason_name = f"reason_{suffix}"
+    reason_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.missing_value_reason (name) VALUES ($1) RETURNING idx",
+        reason_name,
+    )
+    ctx["created"]["missing_value_reason"].append(reason_idx)
+
+    # NUMERIC global field; a literal reason name would fail typed parsing
+    # without the missing-reason routing, so the assertion pinpoints that
+    # the read returned the marker shape (not a coerced typed value).
+    internal_name = f"r_miss_{suffix}"
+    display_name = f"Latitude {suffix}"
+    global_idx = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=internal_name,
+        display_name=display_name,
+        data_type=FieldDataType.NUMERIC,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="get-miss"
+    )
+    ctx["created"]["study"].append(study_idx)
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_value="META-MISS-1",
+        metadata={display_name: reason_name},
+    )
+    assert resp.status_code == 201, resp.text
+    bs_idx = resp.json()["biosample_idx"]
+    await _track_global_metadata_outputs(ctx, bs_idx, study_idx, [global_idx])
+
+    resp = await ctx["wet"].get(f"/api/v1/biosample/{bs_idx}")
+    assert resp.status_code == 200, resp.text
+    _assert_etag_quoted(resp)
+
+    rj = resp.json()
+    expected = {
+        "biosample_idx": bs_idx,
+        "owner_idx": ctx["wet_session"]["principal_idx"],
+        "metadata_checklist_idx": None,
+        "biosample_accession": None,
+        "ena_sample_accession": None,
+        "last_submission_at": None,
+        "submission_error": None,
+        "last_metadata_change_at": rj["last_metadata_change_at"],
+        "created_by_idx": ctx["wet_session"]["principal_idx"],
+        "created_at": rj["created_at"],
+        "updated_at": rj["updated_at"],
+        "retired": False,
+        "retired_by_idx": None,
+        "retired_at": None,
+        "retire_reason": None,
+        "global_metadata": {
+            internal_name: {
+                "display_name": display_name,
+                "description": None,
+                "data_type": "numeric",
+                "value": {"kind": "missing_reason", "idx": reason_idx, "name": reason_name},
+            },
+        },
+        "caller_system_role": "wet_lab_admin",
+    }
+    assert rj == expected
+
+
 async def test_get_biosample_anonymous_401(ctx):
     # No Authorization header → require_human raises 401.
     owner_idx = ctx["user_session"]["principal_idx"]

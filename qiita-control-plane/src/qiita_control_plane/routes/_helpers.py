@@ -10,13 +10,13 @@ from datetime import datetime
 
 import asyncpg
 from fastapi import HTTPException
+from qiita_common.models import MissingReasonRef
 
 from ..repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
     ConflictingValueSameStudyError,
     DuplicateValueDifferentStudyError,
     DuplicateValueSameStudyError,
-    MissingReasonRef,
     SlotOccupiedByMissingReasonError,
     SlotOccupiedByTypedValueError,
     SlotOccupiedError,

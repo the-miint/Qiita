@@ -13,7 +13,7 @@ from enum import StrEnum
 from typing import Literal, NamedTuple
 
 import asyncpg
-from qiita_common.models import FieldDataType, Tier
+from qiita_common.models import MISSING_REASON_VALUE_COLUMN, FieldDataType, MissingReasonRef, Tier
 
 from . import require_transaction
 
@@ -49,15 +49,16 @@ class GlobalFieldRow(NamedTuple):
 class GlobalMetadataRow(NamedTuple):
     """One row of globally-linked metadata: the field's stable internal_name,
     the cosmetic display_name and description from the *_global_field row
-    (not study-scoped), its data_type, and the typed Python value extracted
-    from the matching value_* column.
+    (not study-scoped), its data_type, and the value extracted from the row
+    — either the typed Python value from the matching value_* column or a
+    MissingReasonRef carrying the intentionally-missing reason's idx + name.
     """
 
     internal_name: str
     display_name: str
     description: str | None
     data_type: FieldDataType
-    value: str | Decimal | date
+    value: str | Decimal | date | MissingReasonRef
 
 
 # Closed set of data_types currently decoded. BOOLEAN and TERMINOLOGY
@@ -68,29 +69,6 @@ GLOBAL_METADATA_VALUE_COLUMN: dict[FieldDataType, str] = {
     FieldDataType.NUMERIC: "value_numeric",
     FieldDataType.DATE: "value_date",
 }
-
-MISSING_REASON_VALUE_COLUMN = "value_missing_reason_idx"
-
-
-# ---------------------------------------------------------------------------
-# Resolved missing-value marker
-# ---------------------------------------------------------------------------
-
-
-class MissingReasonRef(NamedTuple):
-    """Resolved-once shape for a metadata text value recognised as a marker
-    for an intentionally-missing entry. Carries the qiita.missing_value_reason
-    row's idx (the FK target on *_metadata.value_missing_reason_idx) and
-    the matched reason name. value_column is the target value_* column for
-    a missing-reason write.
-    """
-
-    idx: int
-    name: str
-
-    @property
-    def value_column(self) -> str:
-        return MISSING_REASON_VALUE_COLUMN
 
 
 # ---------------------------------------------------------------------------
@@ -349,43 +327,57 @@ async def fetch_global_metadata(
     metadata value the entity carries.
 
     Filters on global_field_idx IS NOT NULL (purely-local rows are
-    excluded) and value_missing_reason_idx IS NULL (missing-reason rows
-    have no typed value to surface). Not study-scoped: the canonical
-    global value persists across link retirement. Supports data_type in
-    {TEXT, NUMERIC, DATE}; others raise NotImplementedError.
+    excluded). Intentionally-missing entries (value_missing_reason_idx
+    populated) surface as MissingReasonRef in the row's `value`,
+    regardless of data_type. Typed rows (value_missing_reason_idx NULL)
+    require data_type in {TEXT, NUMERIC, DATE}; others raise
+    NotImplementedError. Not study-scoped: the canonical global value
+    persists across link retirement.
     """
-    # f-string interpolation of the table identifiers is safe: spec fields
-    # are frozen module-level constants, never reached by caller input.
-    # Pull every globally-linked, non-missing-reason row for the entity in
-    # one round trip; carry every typed value column the closed set covers.
+    # f-string interpolation of the table identifiers is safe: all
+    # (including spec fields) are frozen constants, never reached by caller input.
+    # LEFT JOIN qiita.missing_value_reason so an intentionally-missing
+    # entry's reason name comes back in one round trip; typed rows have
+    # value_missing_reason_idx NULL and mvr.name yields NULL.
     rows = await pool_or_conn.fetch(
         f"SELECT gf.internal_name, gf.display_name, gf.description, gf.data_type,"
-        f" m.value_text, m.value_numeric, m.value_date"
+        f" m.value_text, m.value_numeric, m.value_date,"
+        f" m.{MISSING_REASON_VALUE_COLUMN}, mvr.name AS missing_reason_name"
         f" FROM {spec.metadata_table} m"
         f" JOIN {spec.global_field_table} gf ON gf.idx = m.global_field_idx"
+        f" LEFT JOIN qiita.missing_value_reason mvr"
+        f"   ON mvr.idx = m.{MISSING_REASON_VALUE_COLUMN}"
         f" WHERE m.{spec.entity_key_column} = $1"
-        f"   AND m.global_field_idx IS NOT NULL"
-        f"   AND m.{MISSING_REASON_VALUE_COLUMN} IS NULL",
+        f"   AND m.global_field_idx IS NOT NULL",
         entity_idx,
     )
 
-    # Walk rows, dispatch each to the value column the data_type names.
-    # The unsupported branch raises so an out-of-set data_type cannot
-    # silently surface a NULL value.
+    # Walk rows. Missing-reason takes precedence over data_type: a row
+    # with value_missing_reason_idx populated surfaces as MissingReasonRef
+    # regardless of data_type. Typed rows dispatch to the value column the
+    # data_type names; the unsupported branch raises so an out-of-set
+    # data_type cannot silently surface a NULL value.
     result: dict[str, GlobalMetadataRow] = {}
     for r in rows:
         data_type = FieldDataType(r["data_type"])
-        column = GLOBAL_METADATA_VALUE_COLUMN.get(data_type)
-        if column is None:
-            raise NotImplementedError(
-                f"global metadata read for data_type={data_type} is not yet implemented"
+        missing_reason_idx = r[MISSING_REASON_VALUE_COLUMN]
+        if missing_reason_idx is not None:
+            value: str | Decimal | date | MissingReasonRef = MissingReasonRef(
+                idx=missing_reason_idx, name=r["missing_reason_name"]
             )
+        else:
+            column = GLOBAL_METADATA_VALUE_COLUMN.get(data_type)
+            if column is None:
+                raise NotImplementedError(
+                    f"global metadata read for data_type={data_type} is not yet implemented"
+                )
+            value = r[column]
         result[r["internal_name"]] = GlobalMetadataRow(
             internal_name=r["internal_name"],
             display_name=r["display_name"],
             description=r["description"],
             data_type=data_type,
-            value=r[column],
+            value=value,
         )
     return result
 
@@ -1236,7 +1228,9 @@ async def preflight_global_metadata(
         global_row = global_field_rows[display_name]
         stripped = text_value.strip()
         if stripped in reason_lookup:
-            parsed.append((global_row, MissingReasonRef(reason_lookup[stripped], stripped)))
+            parsed.append(
+                (global_row, MissingReasonRef(idx=reason_lookup[stripped], name=stripped))
+            )
             continue
         parsed_value = parse_text_for_data_type(display_name, global_row.data_type, text_value)
         parsed.append((global_row, parsed_value))

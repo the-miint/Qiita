@@ -378,3 +378,14 @@ def test_dedupe_secondary_study_idxs():
         secondary_study_idxs=[5, 5, 3],
     )
     assert req.secondary_study_idxs == [5, 3]
+
+
+def test_missing_reason_ref_rejects_empty_name():
+    """Tests the case where MissingReasonRef is constructed with an
+    empty name: validation fails so the empty marker never reaches the
+    wire boundary.
+    """
+    from qiita_common.models import MissingReasonRef
+
+    with pytest.raises(ValidationError):
+        MissingReasonRef(idx=1, name="")

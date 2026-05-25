@@ -1862,6 +1862,62 @@ async def test_get_sequenced_sample_carries_global_metadata(ctx):
     assert rj == expected
 
 
+async def test_get_sequenced_sample_carries_missing_reason_marker(ctx):
+    """Tests the case where a globally-linked metadata row is an
+    intentionally-missing entry: the GET response surfaces the row's
+    value as a MissingReasonRef on the wire (idx + name).
+    """
+    suffix = secrets.token_hex(4)
+    reason_name = f"reason_{suffix}"
+    reason_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.missing_value_reason (name) VALUES ($1) RETURNING idx",
+        reason_name,
+    )
+    ctx["created"]["missing_value_reason"].append(reason_idx)
+
+    # NUMERIC global field; a literal reason name would fail typed parsing
+    # without the missing-reason routing, so the assertion pinpoints that
+    # the read returned the marker shape (not a coerced typed value).
+    internal_name = f"num_{suffix}"
+    display_name = f"Latitude {suffix}"
+    global_idx = await seed_prep_sample_global_field(
+        ctx["pool"],
+        internal_name=internal_name,
+        display_name=display_name,
+        data_type=FieldDataType.NUMERIC,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["prep_sample_global_field"].append(global_idx)
+
+    seeded = await _seed_one_sequenced_sample(
+        ctx,
+        "get-missing",
+        metadata={display_name: reason_name},
+    )
+
+    resp = await ctx["wet"].get(f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}")
+    assert resp.status_code == 200, resp.text
+    rj = resp.json()
+    expected_metadata = {
+        internal_name: {
+            "display_name": display_name,
+            "description": None,
+            "data_type": "numeric",
+            "value": {"kind": "missing_reason", "idx": reason_idx, "name": reason_name},
+        },
+    }
+    expected = _expected_read_response(
+        seeded,
+        rj=rj,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+        caller_system_role="wet_lab_admin",
+        global_metadata=expected_metadata,
+        has_metadata=True,
+    )
+    assert rj == expected
+
+
 async def test_get_sequenced_sample_system_admin_happy_path(ctx):
     # system_admin satisfies the role gate via the hierarchical check; full
     # response equality confirms caller_system_role surfaces correctly.

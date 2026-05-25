@@ -33,7 +33,7 @@ from decimal import Decimal
 import asyncpg
 import pytest
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
-from qiita_common.models import FieldDataType
+from qiita_common.models import FieldDataType, MissingReasonRef
 
 from qiita_control_plane.repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
@@ -45,7 +45,6 @@ from qiita_control_plane.repositories._sample_helpers import (
     LocalWriteOnGloballyLinkedFieldError,
     MetadataParseError,
     MetadataUnknownFieldsError,
-    MissingReasonRef,
     SampleEntityKind,
     SlotOccupiedByMissingReasonError,
     SlotOccupiedByTypedValueError,
@@ -352,7 +351,7 @@ async def test_write_global_metadata_or_diagnose_missing_reason_persists(ctx):
         gf_idx=gf_idx,
         display_name=display_name,
         data_type=FieldDataType.NUMERIC,
-        value=MissingReasonRef(reason_idx, "any_name"),
+        value=MissingReasonRef(idx=reason_idx, name="any_name"),
     )
 
     # value_missing_reason_idx populated; every typed value column NULL.
@@ -693,7 +692,7 @@ async def test_write_global_metadata_or_diagnose_missing_reason_dup_same_study(c
         gf_idx=gf_idx,
         display_name=display_name_first,
         data_type=FieldDataType.NUMERIC,
-        value=MissingReasonRef(reason_idx, "ignored"),
+        value=MissingReasonRef(idx=reason_idx, name="ignored"),
     )
 
     # Second write under the same study via a different display_name with
@@ -709,7 +708,7 @@ async def test_write_global_metadata_or_diagnose_missing_reason_dup_same_study(c
                     global_field_idx=gf_idx,
                     display_name=display_name_second,
                     data_type=FieldDataType.NUMERIC,
-                    value=MissingReasonRef(reason_idx, "ignored"),
+                    value=MissingReasonRef(idx=reason_idx, name="ignored"),
                     caller_idx=ctx["principal_idx"],
                 )
 
@@ -741,7 +740,7 @@ async def test_write_global_metadata_or_diagnose_missing_reason_conflict_diff_st
         gf_idx=gf_idx,
         display_name=display_name_first,
         data_type=FieldDataType.NUMERIC,
-        value=MissingReasonRef(reason_a_idx, "ignored_a"),
+        value=MissingReasonRef(idx=reason_a_idx, name="ignored_a"),
     )
 
     # Link biosample to a second study so the cross-study path is reachable.
@@ -760,7 +759,7 @@ async def test_write_global_metadata_or_diagnose_missing_reason_conflict_diff_st
                     global_field_idx=gf_idx,
                     display_name=display_name_second,
                     data_type=FieldDataType.NUMERIC,
-                    value=MissingReasonRef(reason_b_idx, "ignored_b"),
+                    value=MissingReasonRef(idx=reason_b_idx, name="ignored_b"),
                     caller_idx=ctx["principal_idx"],
                 )
 
@@ -807,7 +806,7 @@ async def test_write_global_metadata_or_diagnose_raises_slot_occupied_by_typed_v
                     global_field_idx=gf_idx,
                     display_name=display_name_second,
                     data_type=FieldDataType.TEXT,
-                    value=MissingReasonRef(reason_idx, "ignored"),
+                    value=MissingReasonRef(idx=reason_idx, name="ignored"),
                     caller_idx=ctx["principal_idx"],
                 )
 
@@ -1248,7 +1247,7 @@ async def test_write_local_metadata_or_diagnose_missing_reason_persists(ctx):
         study_idx=ctx["study_idx"],
         display_name=display_name,
         data_type=FieldDataType.TEXT,
-        value=MissingReasonRef(reason_idx, "any_name"),
+        value=MissingReasonRef(idx=reason_idx, name="any_name"),
     )
 
     # Full-row assert: missing-reason column populated; global_field_idx
@@ -1457,7 +1456,7 @@ async def test_write_local_metadata_or_diagnose_raises_slot_occupied_by_typed_va
                     study_idx=ctx["study_idx"],
                     display_name=display_name,
                     data_type=FieldDataType.TEXT,
-                    value=MissingReasonRef(reason_idx, "ignored"),
+                    value=MissingReasonRef(idx=reason_idx, name="ignored"),
                     caller_idx=ctx["principal_idx"],
                 )
 
@@ -2370,7 +2369,7 @@ async def test__insert_metadata_writes_missing_reason_value(ctx, spec):
             entity_idx=entity_idx,
             study_field_idx=field_idx,
             data_type=FieldDataType.NUMERIC,
-            value=MissingReasonRef(reason_idx, "ignored_in_insert"),
+            value=MissingReasonRef(idx=reason_idx, name="ignored_in_insert"),
             created_by_idx=ctx["principal_idx"],
         )
     ctx["created"][f"{spec.entity_kind}_metadata"].append(meta_idx)
@@ -2699,6 +2698,80 @@ async def test_fetch_global_metadata_empty_when_none_exist(ctx, spec):
     assert result == {}
 
 
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_global_metadata_surfaces_missing_reason_rows(ctx, spec):
+    """Tests the case where a globally-linked metadata row records an
+    intentionally-missing entry (value_missing_reason_idx populated): the
+    fetch returns a MissingReasonRef carrying the reason's idx and name.
+    """
+    entity_idx = await (
+        _create_biosample_with_link(ctx)
+        if spec.entity_kind is SampleEntityKind.BIOSAMPLE
+        else _create_prep_sample_with_link(ctx)
+    )
+    suffix = secrets.token_hex(4)
+    reason_name = f"reason_{suffix}"
+    reason_idx = await _seed_missing_value_reason(ctx, reason_name)
+
+    # Seed two globally-linked rows on the same entity: one typed value
+    # and one intentionally-missing entry on a different field. Both are
+    # written through _insert_metadata so the production dispatch handles
+    # the value-column routing.
+    await _seed_globally_linked_metadata(
+        ctx,
+        spec=spec,
+        entity_idx=entity_idx,
+        internal_name=f"host_subject_id_{suffix}",
+        display_name=f"Host Subject ID {suffix}",
+        description=None,
+        data_type=FieldDataType.TEXT,
+        value="HOST-9",
+    )
+    await _seed_globally_linked_metadata(
+        ctx,
+        spec=spec,
+        entity_idx=entity_idx,
+        internal_name=f"latitude_{suffix}",
+        display_name=f"Latitude {suffix}",
+        description=None,
+        data_type=FieldDataType.NUMERIC,
+        value=MissingReasonRef(idx=reason_idx, name=reason_name),
+    )
+
+    result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=entity_idx)
+
+    expected = {
+        f"host_subject_id_{suffix}": GlobalMetadataRow(
+            internal_name=f"host_subject_id_{suffix}",
+            display_name=f"Host Subject ID {suffix}",
+            description=None,
+            data_type=FieldDataType.TEXT,
+            value="HOST-9",
+        ),
+        f"latitude_{suffix}": GlobalMetadataRow(
+            internal_name=f"latitude_{suffix}",
+            display_name=f"Latitude {suffix}",
+            description=None,
+            data_type=FieldDataType.NUMERIC,
+            value=MissingReasonRef(idx=reason_idx, name=reason_name),
+        ),
+    }
+    assert result == expected
+
+
+async def test_missing_value_reason_name_rejects_empty_string(postgres_pool):
+    """Tests the case where a direct insert tries to seed an empty-string
+    reason name: the layered CHECK rejects it with CheckViolationError,
+    pairing the application-side MissingReasonRef.name min_length=1 guard.
+    """
+    with pytest.raises(asyncpg.CheckViolationError):
+        await postgres_pool.execute("INSERT INTO qiita.missing_value_reason (name) VALUES ('')")
+
+
 # ---------------------------------------------------------------------------
 # validate_primary_secondary_studies (pure-unit)
 # ---------------------------------------------------------------------------
@@ -2953,7 +3026,7 @@ async def test_preflight_global_metadata_routes_missing_marker(ctx, spec):
             known_missing_reasons={reason_name: reason_idx},
         )
 
-    assert result == [(gf_row, MissingReasonRef(reason_idx, reason_name))]
+    assert result == [(gf_row, MissingReasonRef(idx=reason_idx, name=reason_name))]
 
 
 @pytest.mark.parametrize(
@@ -3006,7 +3079,7 @@ async def test_preflight_global_metadata_recognizes_padded_marker(ctx, spec):
             known_missing_reasons={reason_name: reason_idx},
         )
 
-    assert result == [(gf_row, MissingReasonRef(reason_idx, reason_name))]
+    assert result == [(gf_row, MissingReasonRef(idx=reason_idx, name=reason_name))]
 
 
 def test_parse_text_for_data_type_unchanged_for_missing_reason_name():

@@ -28,14 +28,13 @@ from decimal import Decimal
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
-from qiita_common.models import FieldDataType
+from qiita_common.models import FieldDataType, MissingReasonRef
 
 from qiita_control_plane.repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
     ConflictingValueSameStudyError,
     DuplicateValueDifferentStudyError,
     DuplicateValueSameStudyError,
-    MissingReasonRef,
     SampleEntityKind,
     SlotOccupiedByMissingReasonError,
     SlotOccupiedByTypedValueError,
@@ -282,7 +281,7 @@ async def test_detail_for_slot_occupied_by_typed_value(
             entity_kind=entity_kind,
             existing_value=existing_value,
             existing_missing_reason_idx=None,
-            attempted_value=MissingReasonRef(42, "ignored"),
+            attempted_value=MissingReasonRef(idx=42, name="ignored"),
         )
     )
     detail = await detail_for_slot_collision(conn, exc)
@@ -312,7 +311,7 @@ async def test_detail_for_duplicate_value_same_study_with_missing_reason(conn, e
             entity_kind=entity_kind,
             existing_value=None,
             existing_missing_reason_idx=11,
-            attempted_value=MissingReasonRef(11, "ignored"),
+            attempted_value=MissingReasonRef(idx=11, name="ignored"),
         )
     )
     detail = await detail_for_slot_collision(conn, exc)
@@ -453,7 +452,7 @@ async def test_detail_for_slot_occupied_by_typed_value_local_path(conn, entity_k
             entity_kind=entity_kind,
             existing_value="typed_value",
             existing_missing_reason_idx=None,
-            attempted_value=MissingReasonRef(42, "ignored"),
+            attempted_value=MissingReasonRef(idx=42, name="ignored"),
             global_field_idx=None,
         )
     )
