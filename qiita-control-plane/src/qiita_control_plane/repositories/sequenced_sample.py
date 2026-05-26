@@ -252,9 +252,11 @@ async def import_sequenced_prep_sample(
          against prep_sample_global_field in one SELECT, then parse every
          text value into its typed Python value (or, when the text matches
          a missing_value_reason name, into a MissingReasonRef that lands
-         as value_missing_reason_idx). No DB writes yet; both unknown-name
-         and parse-failure cases raise typed exceptions before any row is
-         touched.
+         as value_missing_reason_idx; or, on a TERMINOLOGY-typed field,
+         into a TerminologyTermRef that lands as
+         value_terminology_term_idx). No DB writes yet; unknown-name,
+         parse-failure, and unresolved-terminology cases raise typed
+         exceptions before any row is touched.
       3. INSERT qiita.prep_sample with processing_kind='sequenced'
          supplied explicitly (the supertype column is plain NOT NULL,
          not GENERATED ALWAYS).
@@ -301,10 +303,9 @@ async def import_sequenced_prep_sample(
     candidate_texts = {v.strip() for v in metadata.values()}
     known_missing_reasons = await fetch_missing_value_reason_idxs_by_names(conn, candidate_texts)
 
-    # Pre-flight: resolve every metadata key against prep_sample_global_field
-    # and parse every text value into its typed Python form, routing marker
-    # texts to MissingReasonRef ahead of typed parsing. Both unknown-name
-    # and parse-failure cases raise before any DB write.
+    # Pre-flight: type-resolve every metadata entry against
+    # prep_sample_global_field; unknown-name, parse-failure, and
+    # unresolved-terminology cases raise before any DB write.
     parsed_metadata = await preflight_global_metadata(
         conn,
         spec=PREP_SAMPLE_METADATA_SPEC,

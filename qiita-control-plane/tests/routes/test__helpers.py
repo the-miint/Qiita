@@ -28,7 +28,7 @@ from decimal import Decimal
 import pytest
 import pytest_asyncio
 from fastapi import HTTPException
-from qiita_common.models import FieldDataType, MissingReasonRef
+from qiita_common.models import FieldDataType, MissingReasonRef, TerminologyTermRef
 
 from qiita_control_plane.repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
@@ -46,6 +46,7 @@ from qiita_control_plane.routes._helpers import (
     parse_kv_detail,
     raise_for_transient_write_race,
 )
+from qiita_control_plane.testing.db_seeds import fetch_seeded_metagenome_term
 
 pytestmark = pytest.mark.db
 
@@ -547,3 +548,63 @@ def test_detail_for_biosample_link_rejection_degrades_without_detail():
     detail = detail_for_biosample_link_rejection({})
     assert "study_idx=?" in detail
     assert "biosample_idx=?" in detail
+
+
+# ---------------------------------------------------------------------------
+# Terminology-attempted wording: the four same/different branches emit
+# "terminology term" in place of "value" when attempted_value is a Ref.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("entity_kind", _ENTITY_KINDS)
+async def test_detail_for_duplicate_value_same_study_with_terminology_term(conn, entity_kind):
+    """Tests the case where the attempted value is a TerminologyTermRef:
+    the same/different branches read "terminology term" instead of "value".
+    """
+    exc = DuplicateValueSameStudyError(
+        **_make_exception_kwargs(
+            entity_kind=entity_kind,
+            existing_value=17,
+            existing_missing_reason_idx=None,
+            attempted_value=TerminologyTermRef(idx=17, term_id="256318", label="metagenome"),
+        )
+    )
+    detail = await detail_for_slot_collision(conn, exc)
+
+    assert "already wrote this same terminology term" in detail
+    assert "no new row was created" in detail
+    assert f"field {_DISPLAY_NAME!r}" in detail
+    assert f"{entity_kind}_idx=42" in detail
+
+
+# ---------------------------------------------------------------------------
+# Terminology-occupant rendering: SlotOccupiedByTypedValueError surfaces
+# the term_id and label via a DB lookup against qiita.terminology_term.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("entity_kind", _ENTITY_KINDS)
+async def test_detail_for_slot_occupied_by_typed_value_terminology(postgres_pool, entity_kind):
+    """Tests the case where the typed-occupant value is a
+    qiita.terminology_term idx: the helper renders the term_id and label
+    rather than the bare idx.
+    """
+    # Look up the seeded NCBI Taxonomy metagenome term — present in every
+    # test DB via the schema-seed migrations.
+    term_row = await fetch_seeded_metagenome_term(postgres_pool)
+    async with postgres_pool.acquire() as conn:
+        exc = SlotOccupiedByTypedValueError(
+            **_make_exception_kwargs(
+                entity_kind=entity_kind,
+                existing_value=term_row["idx"],
+                existing_missing_reason_idx=None,
+                attempted_value=MissingReasonRef(idx=42, name="ignored"),
+            )
+        )
+        detail = await detail_for_slot_collision(conn, exc)
+
+    # The render embeds the term_id and label, not the raw idx.
+    assert f"terminology term {term_row['term_id']!r}" in detail
+    assert f"({term_row['label']!r})" in detail
+    assert "typed row must be deleted" in detail
+    assert f"({term_row['idx']})" not in detail

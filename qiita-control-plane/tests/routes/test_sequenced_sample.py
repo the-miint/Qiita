@@ -24,6 +24,7 @@ from qiita_common.models import FieldDataType
 
 from qiita_control_plane.main import app
 from qiita_control_plane.testing.db_seeds import (
+    fetch_seeded_metagenome_term,
     seed_biosample,
     seed_biosample_to_study_link,
     seed_prep_sample_global_field,
@@ -1904,6 +1905,66 @@ async def test_get_sequenced_sample_carries_missing_reason_marker(ctx):
             "description": None,
             "data_type": "numeric",
             "value": {"kind": "missing_reason", "idx": reason_idx, "name": reason_name},
+        },
+    }
+    expected = _expected_read_response(
+        seeded,
+        rj=rj,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+        caller_system_role="wet_lab_admin",
+        global_metadata=expected_metadata,
+        has_metadata=True,
+    )
+    assert rj == expected
+
+
+async def test_get_sequenced_sample_carries_terminology_term(ctx):
+    """Tests the case where a globally-linked metadata row is a terminology
+    term (value_terminology_term_idx populated): the GET response surfaces
+    the row's value as a TerminologyTermRef on the wire (idx + term_id +
+    label).
+    """
+    # Reuse the seeded NCBI Taxonomy + metagenome term.
+    term_row = await fetch_seeded_metagenome_term(ctx["pool"])
+    terminology_idx = term_row["terminology_idx"]
+
+    # TERMINOLOGY global field bound to NCBI Taxonomy on the prep_sample
+    # side; no terminology-typed prep_sample_global_field ships in the
+    # production seed.
+    suffix = secrets.token_hex(4)
+    internal_name = f"term_{suffix}"
+    display_name = f"Sample Taxon {suffix}"
+    global_idx = await seed_prep_sample_global_field(
+        ctx["pool"],
+        internal_name=internal_name,
+        display_name=display_name,
+        data_type=FieldDataType.TERMINOLOGY,
+        created_by_idx=ctx["wet_session"]["principal_idx"],
+        terminology_idx=terminology_idx,
+    )
+    ctx["created"]["prep_sample_global_field"].append(global_idx)
+
+    seeded = await _seed_one_sequenced_sample(
+        ctx,
+        "get-term",
+        metadata={display_name: term_row["term_id"]},
+    )
+
+    resp = await ctx["wet"].get(f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}")
+    assert resp.status_code == 200, resp.text
+    rj = resp.json()
+    expected_metadata = {
+        internal_name: {
+            "display_name": display_name,
+            "description": None,
+            "data_type": "terminology",
+            "value": {
+                "kind": "terminology_term",
+                "idx": term_row["idx"],
+                "term_id": term_row["term_id"],
+                "label": term_row["label"],
+            },
         },
     }
     expected = _expected_read_response(

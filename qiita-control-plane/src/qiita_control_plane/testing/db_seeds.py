@@ -1,9 +1,10 @@
 """Pytest seed and state-change helpers for DB-row fixtures.
 
 Plain async functions (not pytest fixtures) so callers can pass test-local
-arguments. Helpers fall into two groups: seeders that insert rows and
-return the new idx, and state-changers that update existing rows
-(disabling, retiring, etc.). Cleanup is the caller's responsibility
+arguments. Helpers fall into three groups: seeders that insert rows and
+return the new idx, state-changers that update existing rows (disabling,
+retiring, etc.), and lookup helpers for migration-seeded reference data
+that every test DB carries. Cleanup is the caller's responsibility
 (route tests do FK-reverse cleanup against a per-test `created` tracker;
 integration tests may rely on a session-scoped truncate). Helpers are
 pool-based and commit their writes — for repository-layer trigger tests
@@ -15,6 +16,24 @@ import secrets
 import asyncpg
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 from qiita_common.models import FieldDataType
+
+# Seeded NCBI Taxonomy fixture data — must match the seed migration at
+# qiita-control-plane/db/migrations/20260525000000_seed_ncbi_taxonomy.sql.
+NCBI_TAXONOMY_NAME = "NCBI Taxonomy"
+NCBI_TAXONOMY_METAGENOME_TERM_ID = "256318"
+
+
+async def fetch_seeded_metagenome_term(pool: asyncpg.Pool) -> asyncpg.Record:
+    """Return the seeded NCBI Taxonomy metagenome term row (idx, term_id,
+    label, terminology_idx)."""
+    return await pool.fetchrow(
+        "SELECT tt.idx, tt.term_id, tt.label, tt.terminology_idx"
+        " FROM qiita.terminology_term tt"
+        " JOIN qiita.terminology t ON t.idx = tt.terminology_idx"
+        " WHERE t.name = $1 AND tt.term_id = $2",
+        NCBI_TAXONOMY_NAME,
+        NCBI_TAXONOMY_METAGENOME_TERM_ID,
+    )
 
 
 async def seed_user_principal(
@@ -248,6 +267,7 @@ async def seed_biosample_global_field(
     display_name: str,
     data_type: FieldDataType,
     created_by_idx: int,
+    terminology_idx: int | None = None,
 ) -> int:
     """Insert a qiita.biosample_global_field row and return its idx.
 
@@ -257,15 +277,18 @@ async def seed_biosample_global_field(
     description is intentionally omitted -- callers that need a non-null
     description set it via UPDATE so the helper surface stays small.
     asyncpg coerces the StrEnum value to text for the
-    qiita.field_data_type cast.
+    qiita.field_data_type cast. terminology_idx must be supplied for
+    data_type=TERMINOLOGY (the CHECK enforces the iff coupling) and
+    omitted otherwise.
     """
     return await pool.fetchval(
         "INSERT INTO qiita.biosample_global_field"
-        "  (internal_name, display_name, data_type, created_by_idx)"
-        " VALUES ($1, $2, $3, $4) RETURNING idx",
+        "  (internal_name, display_name, data_type, terminology_idx, created_by_idx)"
+        " VALUES ($1, $2, $3, $4, $5) RETURNING idx",
         internal_name,
         display_name,
         data_type,
+        terminology_idx,
         created_by_idx,
     )
 
@@ -277,6 +300,7 @@ async def seed_prep_sample_global_field(
     display_name: str,
     data_type: FieldDataType,
     created_by_idx: int,
+    terminology_idx: int | None = None,
 ) -> int:
     """Insert a qiita.prep_sample_global_field row and return its idx.
 
@@ -286,15 +310,18 @@ async def seed_prep_sample_global_field(
     description is intentionally omitted -- callers that need a non-null
     description set it via UPDATE so the helper surface stays small.
     asyncpg coerces the StrEnum value to text for the
-    qiita.field_data_type cast.
+    qiita.field_data_type cast. terminology_idx must be supplied for
+    data_type=TERMINOLOGY (the CHECK enforces the iff coupling) and
+    omitted otherwise.
     """
     return await pool.fetchval(
         "INSERT INTO qiita.prep_sample_global_field"
-        "  (internal_name, display_name, data_type, created_by_idx)"
-        " VALUES ($1, $2, $3, $4) RETURNING idx",
+        "  (internal_name, display_name, data_type, terminology_idx, created_by_idx)"
+        " VALUES ($1, $2, $3, $4, $5) RETURNING idx",
         internal_name,
         display_name,
         data_type,
+        terminology_idx,
         created_by_idx,
     )
 

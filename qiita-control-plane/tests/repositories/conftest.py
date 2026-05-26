@@ -426,10 +426,14 @@ async def _seed_secondary_studies_for_entity(ctx, spec, entity_idx, count):
     return new_study_idxs
 
 
-async def _seed_global_field_for_spec(ctx, spec, data_type=FieldDataType.TEXT):
+async def _seed_global_field_for_spec(
+    ctx, spec, data_type=FieldDataType.TEXT, terminology_idx=None
+):
     """Seed one global field of the given data_type for spec.entity_kind
     and track the row for cleanup. Returns a GlobalFieldRow shape so the
-    caller can drive metadata writes against it directly.
+    caller can drive metadata writes against it directly. terminology_idx
+    must be supplied when data_type=TERMINOLOGY (the *_global_field
+    CHECK enforces the iff coupling) and omitted otherwise.
     """
     # Token suffix defends against unique-name collisions across re-runs.
     suffix = secrets.token_hex(4)
@@ -445,6 +449,7 @@ async def _seed_global_field_for_spec(ctx, spec, data_type=FieldDataType.TEXT):
             display_name=display_name,
             data_type=data_type,
             created_by_idx=ctx["principal_idx"],
+            terminology_idx=terminology_idx,
         )
         ctx["created"]["biosample_global_field"].append(gf_idx)
     else:
@@ -454,9 +459,12 @@ async def _seed_global_field_for_spec(ctx, spec, data_type=FieldDataType.TEXT):
             display_name=display_name,
             data_type=data_type,
             created_by_idx=ctx["principal_idx"],
+            terminology_idx=terminology_idx,
         )
         ctx["created"]["prep_sample_global_field"].append(gf_idx)
-    return GlobalFieldRow(idx=gf_idx, display_name=display_name, data_type=data_type)
+    return GlobalFieldRow(
+        idx=gf_idx, display_name=display_name, data_type=data_type, terminology_idx=terminology_idx
+    )
 
 
 def _track_to_study_link(ctx, spec, entity_idx, study_idx):

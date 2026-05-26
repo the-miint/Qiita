@@ -22,6 +22,7 @@ from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import FieldDataType
 
 from qiita_control_plane.testing.db_seeds import (
+    fetch_seeded_metagenome_term,
     retire_biosample,
     retire_biosample_to_study_link,
     seed_biosample,
@@ -1504,6 +1505,87 @@ async def test_get_biosample_carries_missing_reason_marker(ctx):
                 "description": None,
                 "data_type": "numeric",
                 "value": {"kind": "missing_reason", "idx": reason_idx, "name": reason_name},
+            },
+        },
+        "caller_system_role": "wet_lab_admin",
+    }
+    assert rj == expected
+
+
+async def test_get_biosample_carries_terminology_term(ctx):
+    """Tests the case where a globally-linked metadata row is a terminology
+    term (value_terminology_term_idx populated): the GET response surfaces
+    the row's value as a TerminologyTermRef on the wire (idx + term_id +
+    label).
+    """
+    # Reuse the seeded NCBI Taxonomy + metagenome term.
+    term_row = await fetch_seeded_metagenome_term(ctx["pool"])
+    terminology_idx = term_row["terminology_idx"]
+
+    # TERMINOLOGY global field bound to NCBI Taxonomy so the
+    # value_terminology_term_idx write satisfies the field contract.
+    suffix = secrets.token_hex(4)
+    internal_name = f"r_term_{suffix}"
+    display_name = f"Sample Taxon {suffix}"
+    global_idx = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=internal_name,
+        display_name=display_name,
+        data_type=FieldDataType.TERMINOLOGY,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+        terminology_idx=terminology_idx,
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="get-term"
+    )
+    ctx["created"]["study"].append(study_idx)
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_value="META-TERM-1",
+        metadata={display_name: term_row["term_id"]},
+    )
+    assert resp.status_code == 201, resp.text
+    bs_idx = resp.json()["biosample_idx"]
+    await _track_global_metadata_outputs(ctx, bs_idx, study_idx, [global_idx])
+
+    resp = await ctx["wet"].get(f"/api/v1/biosample/{bs_idx}")
+    assert resp.status_code == 200, resp.text
+    _assert_etag_quoted(resp)
+
+    rj = resp.json()
+    expected = {
+        "biosample_idx": bs_idx,
+        "owner_idx": ctx["wet_session"]["principal_idx"],
+        "metadata_checklist_idx": None,
+        "biosample_accession": None,
+        "ena_sample_accession": None,
+        "last_submission_at": None,
+        "submission_error": None,
+        "last_metadata_change_at": rj["last_metadata_change_at"],
+        "created_by_idx": ctx["wet_session"]["principal_idx"],
+        "created_at": rj["created_at"],
+        "updated_at": rj["updated_at"],
+        "retired": False,
+        "retired_by_idx": None,
+        "retired_at": None,
+        "retire_reason": None,
+        "global_metadata": {
+            internal_name: {
+                "display_name": display_name,
+                "description": None,
+                "data_type": "terminology",
+                "value": {
+                    "kind": "terminology_term",
+                    "idx": term_row["idx"],
+                    "term_id": term_row["term_id"],
+                    "label": term_row["label"],
+                },
             },
         },
         "caller_system_role": "wet_lab_admin",

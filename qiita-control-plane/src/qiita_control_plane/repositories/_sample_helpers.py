@@ -13,7 +13,14 @@ from enum import StrEnum
 from typing import Literal, NamedTuple
 
 import asyncpg
-from qiita_common.models import MISSING_REASON_VALUE_COLUMN, FieldDataType, MissingReasonRef, Tier
+from qiita_common.models import (
+    MISSING_REASON_VALUE_COLUMN,
+    TERMINOLOGY_TERM_VALUE_COLUMN,
+    FieldDataType,
+    MissingReasonRef,
+    TerminologyTermRef,
+    Tier,
+)
 
 from . import require_transaction
 
@@ -28,17 +35,29 @@ class SampleEntityKind(StrEnum):
     PREP_SAMPLE = "prep_sample"
 
 
+# One globally-linked metadata value as it travels through this module:
+# a parsed scalar, an intentionally-missing marker, or a terminology term.
+# Mirrors the wire-side qiita_common.models.GlobalMetadataEntry.value union.
+type GlobalMetadataValue = str | Decimal | date | MissingReasonRef | TerminologyTermRef
+
+
 # ---------------------------------------------------------------------------
 # Shared *_global_field lookup row shape
 # ---------------------------------------------------------------------------
 
 
 class GlobalFieldRow(NamedTuple):
-    """Subset of *_global_field columns used by metadata pre-flight reads."""
+    """Subset of *_global_field columns used by metadata pre-flight reads.
+
+    terminology_idx is non-None iff data_type is TERMINOLOGY (enforced by
+    the *_global_field CHECK), and identifies the terminology that scopes
+    any term-id lookup against the field.
+    """
 
     idx: int
     display_name: str
     data_type: FieldDataType
+    terminology_idx: int | None
 
 
 # ---------------------------------------------------------------------------
@@ -50,24 +69,26 @@ class GlobalMetadataRow(NamedTuple):
     """One row of globally-linked metadata: the field's stable internal_name,
     the cosmetic display_name and description from the *_global_field row
     (not study-scoped), its data_type, and the value extracted from the row
-    — either the typed Python value from the matching value_* column or a
-    MissingReasonRef carrying the intentionally-missing reason's idx + name.
+    — either the typed Python value from the matching value_* column, a
+    MissingReasonRef carrying an intentionally-missing reason's idx + name,
+    or a TerminologyTermRef carrying a terminology-term's idx + term_id + label.
     """
 
     internal_name: str
     display_name: str
     description: str | None
     data_type: FieldDataType
-    value: str | Decimal | date | MissingReasonRef
+    value: GlobalMetadataValue
 
 
-# Closed set of data_types currently decoded. BOOLEAN and TERMINOLOGY
-# are intentionally absent so adding one requires updating both the
-# value_* column mapping and any sibling write-side parsers together.
+# Closed set of data_types currently decoded. BOOLEAN is intentionally
+# absent so adding it requires updating both the value_* column mapping
+# and any sibling write-side parsers together.
 GLOBAL_METADATA_VALUE_COLUMN: dict[FieldDataType, str] = {
     FieldDataType.TEXT: "value_text",
     FieldDataType.NUMERIC: "value_numeric",
     FieldDataType.DATE: "value_date",
+    FieldDataType.TERMINOLOGY: TERMINOLOGY_TERM_VALUE_COLUMN,
 }
 
 
@@ -172,7 +193,8 @@ def parse_text_for_data_type(
     Outer whitespace is stripped before parsing. TEXT returns the stripped
     string; NUMERIC returns Decimal; DATE returns datetime.date. BOOLEAN
     and TERMINOLOGY raise NotImplementedError. Conversion failures raise
-    MetadataParseError carrying display_name, data_type, raw text, and reason.
+    MetadataParseError carrying display_name, data_type, raw text, and
+    reason.
     """
     # Normalize once; all parse arms see the stripped value.
     stripped = text_value.strip()
@@ -273,7 +295,7 @@ async def fetch_global_fields_by_display_names(
     # f-string interpolation of the table identifier is safe: spec fields
     # are frozen module-level constants, never reached by caller input.
     rows = await pool_or_conn.fetch(
-        f"SELECT idx, display_name, data_type"
+        f"SELECT idx, display_name, data_type, terminology_idx"
         f" FROM {spec.global_field_table}"
         f" WHERE display_name = ANY($1::text[])",
         names,
@@ -285,6 +307,7 @@ async def fetch_global_fields_by_display_names(
             idx=r["idx"],
             display_name=r["display_name"],
             data_type=FieldDataType(r["data_type"]),
+            terminology_idx=r["terminology_idx"],
         )
         for r in rows
     }
@@ -297,11 +320,10 @@ async def fetch_missing_value_reason_idxs_by_names(
     """Return a dict of name -> idx for every qiita.missing_value_reason row
     whose name appears in `names`.
 
-    Names absent from the table are absent from the returned dict; callers
-    detect "no matching reason" by checking dict membership. Empty input
-    short-circuits with no DB call. No is_obsolete filter — any row in the
-    table is treated as a valid marker; obsoletion lifecycle is not yet
-    exercised by any policy in the import path.
+    Names absent from the table are absent from the returned dict. Empty
+    input short-circuits with no DB call. No is_obsolete filter — any row
+    in the table is treated as a valid marker; the obsoletion lifecycle is
+    not yet exercised.
     """
     # Materialize so emptiness is detectable and the param can be passed as ANY.
     candidate_names = list(names)
@@ -317,6 +339,39 @@ async def fetch_missing_value_reason_idxs_by_names(
     return {r["name"]: r["idx"] for r in rows}
 
 
+async def fetch_terminology_term_idxs_by_term_ids(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    terminology_idx: int,
+    term_ids: Iterable[str],
+) -> dict[str, tuple[int, str]]:
+    """Return a dict of term_id -> (idx, label) for every qiita.terminology_term
+    row whose term_id appears in `term_ids` AND whose terminology_idx matches.
+
+    Term ids absent from the table are absent from the returned dict. Empty
+    input short-circuits with no DB call. No is_obsolete filter — any row in
+    the table scoped to this terminology is treated as a valid marker; the
+    obsoletion lifecycle is not yet exercised. Scoped to one terminology_idx
+    because (terminology_idx, term_id) is the table's unique key — the same
+    term_id can recur across different terminologies.
+    """
+    # Materialize so emptiness is detectable and the param can be passed as ANY.
+    candidate_term_ids = list(term_ids)
+    if not candidate_term_ids:
+        return {}
+
+    # Single batch SELECT keyed on term_id and scoped to terminology_idx.
+    # The (terminology_idx, term_id) UNIQUE constraint bounds the row count
+    # by len(candidate_term_ids).
+    rows = await pool_or_conn.fetch(
+        "SELECT idx, term_id, label FROM qiita.terminology_term"
+        " WHERE terminology_idx = $1 AND term_id = ANY($2::text[])",
+        terminology_idx,
+        candidate_term_ids,
+    )
+    return {r["term_id"]: (r["idx"], r["label"]) for r in rows}
+
+
 async def fetch_global_metadata(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
@@ -328,42 +383,57 @@ async def fetch_global_metadata(
 
     Filters on global_field_idx IS NOT NULL (purely-local rows are
     excluded). Intentionally-missing entries (value_missing_reason_idx
-    populated) surface as MissingReasonRef in the row's `value`,
-    regardless of data_type. Typed rows (value_missing_reason_idx NULL)
-    require data_type in {TEXT, NUMERIC, DATE}; others raise
+    populated) surface as MissingReasonRef in the row's `value`;
+    terminology-term entries (value_terminology_term_idx populated)
+    surface as TerminologyTermRef. Both Ref kinds supersede
+    data_type-driven decoding. Other typed rows require data_type in
+    {TEXT, NUMERIC, DATE}; unsupported data_types raise
     NotImplementedError. Not study-scoped: the canonical global value
     persists across link retirement.
     """
     # f-string interpolation of the table identifiers is safe: all
     # (including spec fields) are frozen constants, never reached by caller input.
-    # LEFT JOIN qiita.missing_value_reason so an intentionally-missing
-    # entry's reason name comes back in one round trip; typed rows have
-    # value_missing_reason_idx NULL and mvr.name yields NULL.
+    # LEFT JOINs on qiita.missing_value_reason and qiita.terminology_term so
+    # a Ref-surfaced row's display payload comes back in one round trip; typed
+    # rows have both join keys NULL.
     rows = await pool_or_conn.fetch(
         f"SELECT gf.internal_name, gf.display_name, gf.description, gf.data_type,"
         f" m.value_text, m.value_numeric, m.value_date,"
-        f" m.{MISSING_REASON_VALUE_COLUMN}, mvr.name AS missing_reason_name"
+        f" m.{MISSING_REASON_VALUE_COLUMN}, mvr.name AS missing_reason_name,"
+        f" m.{TERMINOLOGY_TERM_VALUE_COLUMN},"
+        f" tt.term_id AS terminology_term_id,"
+        f" tt.label AS terminology_term_label"
         f" FROM {spec.metadata_table} m"
         f" JOIN {spec.global_field_table} gf ON gf.idx = m.global_field_idx"
         f" LEFT JOIN qiita.missing_value_reason mvr"
         f"   ON mvr.idx = m.{MISSING_REASON_VALUE_COLUMN}"
+        f" LEFT JOIN qiita.terminology_term tt"
+        f"   ON tt.idx = m.{TERMINOLOGY_TERM_VALUE_COLUMN}"
         f" WHERE m.{spec.entity_key_column} = $1"
         f"   AND m.global_field_idx IS NOT NULL",
         entity_idx,
     )
 
-    # Walk rows. Missing-reason takes precedence over data_type: a row
-    # with value_missing_reason_idx populated surfaces as MissingReasonRef
-    # regardless of data_type. Typed rows dispatch to the value column the
-    # data_type names; the unsupported branch raises so an out-of-set
-    # data_type cannot silently surface a NULL value.
+    # Walk rows. Ref kinds take precedence over data_type: a row with
+    # value_missing_reason_idx populated surfaces as MissingReasonRef and
+    # a row with value_terminology_term_idx populated surfaces as
+    # TerminologyTermRef, regardless of data_type. Other typed rows
+    # dispatch to the value column the data_type names; the unsupported
+    # branch raises so an out-of-set data_type cannot silently surface
+    # a NULL value.
     result: dict[str, GlobalMetadataRow] = {}
     for r in rows:
         data_type = FieldDataType(r["data_type"])
         missing_reason_idx = r[MISSING_REASON_VALUE_COLUMN]
+        terminology_term_idx = r[TERMINOLOGY_TERM_VALUE_COLUMN]
+        value: GlobalMetadataValue
         if missing_reason_idx is not None:
-            value: str | Decimal | date | MissingReasonRef = MissingReasonRef(
-                idx=missing_reason_idx, name=r["missing_reason_name"]
+            value = MissingReasonRef(idx=missing_reason_idx, name=r["missing_reason_name"])
+        elif terminology_term_idx is not None:
+            value = TerminologyTermRef(
+                idx=terminology_term_idx,
+                term_id=r["terminology_term_id"],
+                label=r["terminology_term_label"],
             )
         else:
             column = GLOBAL_METADATA_VALUE_COLUMN.get(data_type)
@@ -416,10 +486,12 @@ class SlotOccupiedError(Exception):
         study_field_idx: int,
         attempted_study_idx: int,
         contributing_study_idx: int,
-        attempted_value: str | Decimal | date | MissingReasonRef,
+        attempted_value: GlobalMetadataValue,
         data_type: FieldDataType,
         existing_metadata_idx: int,
-        existing_value: str | Decimal | date | None,
+        # int arm is the terminology_term.idx FK (read from the typed value
+        # column of a TERMINOLOGY-typed row); the scalar arms cover str/Decimal/date.
+        existing_value: str | Decimal | date | int | None,
         existing_missing_reason_idx: int | None,
         global_field_idx: int | None = None,
     ) -> None:
@@ -479,15 +551,16 @@ class ConflictingValueDifferentStudyError(SlotOccupiedError):
 
 class SlotOccupiedByMissingReasonError(SlotOccupiedError):
     """The slot holds a row recorded as intentionally missing
-    (value_missing_reason_idx populated); the caller attempted a typed write.
-    The missing-reason row must be deleted before a typed value can be
-    written."""
+    (value_missing_reason_idx populated); the caller attempted to write
+    something other than a missing-reason marker (a typed value or a
+    terminology term). The missing-reason row must be deleted before a
+    non-missing value can be written."""
 
 
 class SlotOccupiedByTypedValueError(SlotOccupiedError):
-    """The slot holds a typed value; the caller attempted to record an
-    intentionally-missing marker. The typed row must be deleted before
-    a missing-reason can be written."""
+    """The slot holds a typed value (incl. a terminology-term idx); the
+    caller attempted to record an intentionally-missing marker. The
+    typed row must be deleted before a missing-reason can be written."""
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +571,7 @@ class SlotOccupiedByTypedValueError(SlotOccupiedError):
 def _resolve_typed_value_column(data_type: FieldDataType) -> str:
     """Map data_type to the qiita.*_metadata.value_* column holding its typed
     value, via GLOBAL_METADATA_VALUE_COLUMN. Raises NotImplementedError for
-    data_types not yet decodable (BOOLEAN, TERMINOLOGY).
+    data_types absent from the mapping (BOOLEAN).
     """
     column = GLOBAL_METADATA_VALUE_COLUMN.get(data_type)
     if column is None:
@@ -511,36 +584,46 @@ def _resolve_typed_value_column(data_type: FieldDataType) -> str:
 def _compare_slot_occupant(
     value_column: str,
     existing_row: Mapping[str, object],
-    attempted_value: str | Decimal | date | MissingReasonRef,
+    attempted_value: GlobalMetadataValue,
 ) -> Literal["same", "different", "occupied_by_missing", "occupied_by_typed"]:
     """Classify the existing slot occupant vs the attempted write.
 
-    - "same" / "different" — both sides typed, or both missing-reason;
-      discriminator is value equality (typed equality or missing_reason_idx
-      equality).
-    - "occupied_by_missing" — slot holds missing-reason; attempted is typed.
-    - "occupied_by_typed" — slot holds typed; attempted is missing-reason.
+    - "same" / "different" — both sides typed (incl. terminology-term-idx
+      equality), or both missing-reason; discriminator is value equality
+      (scalar equality, terminology-term idx equality, or missing-reason
+      idx equality).
+    - "occupied_by_missing" — slot holds missing-reason; attempted is typed
+      or terminology-term.
+    - "occupied_by_typed" — slot holds typed (incl. terminology-term);
+      attempted is missing-reason.
 
     The cross-kind cases trump same/different because no typed value can
     be compared across kinds.
     """
     existing_missing_reason_idx = existing_row[MISSING_REASON_VALUE_COLUMN]
     attempted_is_missing = isinstance(attempted_value, MissingReasonRef)
+    # Terminology-term writes carry a Ref, not the raw idx; extract the
+    # idx so the typed-vs-typed equality below compares int-to-int.
+    attempted_comparable = (
+        attempted_value.idx if isinstance(attempted_value, TerminologyTermRef) else attempted_value
+    )
 
     # Existing-missing slot: both sides may agree on missing kind, or the
-    # caller attempted a typed write against a missing slot.
+    # caller attempted a non-missing write against a missing slot.
     if existing_missing_reason_idx is not None:
         if attempted_is_missing:
             return "same" if existing_missing_reason_idx == attempted_value.idx else "different"
         return "occupied_by_missing"
 
-    # Existing-typed slot: a missing-reason attempt cannot compare against a
-    # typed value, so it is the symmetric twin of the case above.
+    # Existing-typed slot (incl. terminology-term-idx): a missing-reason
+    # attempt cannot compare against a typed value, so it is the symmetric
+    # twin of the case above.
     if attempted_is_missing:
         return "occupied_by_typed"
 
-    # Both sides typed; Decimal/date/str equality is well-defined.
-    return "same" if existing_row[value_column] == attempted_value else "different"
+    # Both sides typed (or both terminology-term-idx); equality is
+    # well-defined on the comparable scalar.
+    return "same" if existing_row[value_column] == attempted_comparable else "different"
 
 
 async def _fetch_slot_occupant(
@@ -559,9 +642,8 @@ async def _fetch_slot_occupant(
     per-field unique-constraint path filters by m.{study_field_idx_column})
     and the slot identifier embedded in any TransientWriteRaceError raised
     when the occupant has been concurrently deleted. Returns all six value
-    columns so callers can dispatch on data_type; value_boolean and
-    value_terminology_term_idx are fetched ahead of need (BOOLEAN/
-    TERMINOLOGY support is a planned coordinated extension).
+    columns; value_boolean is read ahead of BOOLEAN support being wired
+    in coordinated with the value-column map.
     """
     # XOR check: exactly one of the two idx kwargs must be passed.
     if (global_field_idx is None) == (study_field_idx is None):
@@ -608,16 +690,17 @@ async def _fetch_slot_occupant(
 def _diagnose_slot_occupant(
     data_type: FieldDataType,
     existing_row: Mapping[str, object],
-    attempted_value: str | Decimal | date | MissingReasonRef,
+    attempted_value: GlobalMetadataValue,
 ) -> tuple[
     Literal["same", "different", "occupied_by_missing", "occupied_by_typed"],
-    str | Decimal | date | None,
+    str | Decimal | date | int | None,
     int | None,
 ]:
     """Resolve the typed value column, classify the slot occupant vs the
     attempted write, and extract the existing typed value (or None when
     the slot holds a missing reason). Returns (compare_result,
-    existing_value, existing_missing_reason_idx).
+    existing_value, existing_missing_reason_idx). For a terminology-typed
+    field the existing_value is the int FK to qiita.terminology_term.
     """
     # Resolve the value_* column once; reused for the typed compare and
     # the existing-value extraction below.
@@ -638,7 +721,7 @@ def _make_collision_error(
     display_name: str,
     study_field_idx: int,
     attempted_study_idx: int,
-    attempted_value: str | Decimal | date | MissingReasonRef,
+    attempted_value: GlobalMetadataValue,
     data_type: FieldDataType,
     existing_row: Mapping[str, object],
     global_field_idx: int | None = None,
@@ -788,22 +871,22 @@ async def _insert_metadata(
     entity_idx: int,
     study_field_idx: int,
     data_type: FieldDataType,
-    value: str | Decimal | date | MissingReasonRef,
+    value: GlobalMetadataValue,
     created_by_idx: int,
 ) -> int:
     """Insert one metadata row into spec.metadata_table and return its idx.
 
-    Populates exactly one value column: the typed value column for a typed
-    value (via GLOBAL_METADATA_VALUE_COLUMN) or value_missing_reason_idx for
-    a MissingReasonRef. global_field_idx is populated by trigger from the
-    source field row. BOOLEAN and TERMINOLOGY typed values raise
-    NotImplementedError.
+    Populates exactly one value column: the typed value column for a bare
+    typed value (via GLOBAL_METADATA_VALUE_COLUMN), value_missing_reason_idx
+    for a MissingReasonRef, or value_terminology_term_idx for a
+    TerminologyTermRef. global_field_idx is populated by trigger from the
+    source field row. BOOLEAN typed values raise NotImplementedError.
     """
-    # Dispatch on the value's kind: a missing-reason sentinel names its
-    # own target column and binds the reason idx; a typed value resolves
-    # the column via GLOBAL_METADATA_VALUE_COLUMN and binds the value
-    # itself.
-    if isinstance(value, MissingReasonRef):
+    # Dispatch on the value's kind: a resolved Ref (missing-reason or
+    # terminology-term) names its own target column and binds its idx;
+    # a bare typed value resolves the column via GLOBAL_METADATA_VALUE_COLUMN
+    # and binds the value itself.
+    if isinstance(value, (MissingReasonRef, TerminologyTermRef)):
         value_column = value.value_column
         bound_value: int | str | Decimal | date = value.idx
     else:
@@ -847,7 +930,7 @@ async def write_global_metadata_or_diagnose(
     global_field_idx: int,
     display_name: str,
     data_type: FieldDataType,
-    value: str | Decimal | date | MissingReasonRef,
+    value: GlobalMetadataValue,
     caller_idx: int,
 ) -> SampleMetadataWriteResult:
     """Write one globally-linked metadata row; on cross-study slot collision,
@@ -1063,7 +1146,7 @@ async def write_local_metadata_or_diagnose(
     study_idx: int,
     display_name: str,
     data_type: FieldDataType,
-    value: str | Decimal | date | MissingReasonRef,
+    value: GlobalMetadataValue,
     caller_idx: int,
     required: bool = False,
     terminology_idx: int | None = None,
@@ -1192,17 +1275,20 @@ async def preflight_global_metadata(
     spec: EntityMetadataSpec,
     metadata: Mapping[str, str],
     known_missing_reasons: Mapping[str, int] | None = None,
-) -> list[tuple[GlobalFieldRow, str | Decimal | date | MissingReasonRef]]:
+) -> list[tuple[GlobalFieldRow, GlobalMetadataValue]]:
     """Resolve every metadata display_name against spec.global_field_table
-    and parse each text value into a typed Python value or, if the text
-    matches a known missing-reason name, into a MissingReasonRef. Returns
-    (GlobalFieldRow, parsed_value) pairs in input order.
+    and parse each text value into a typed Python value, a MissingReasonRef
+    (if the text matches a known missing-reason name) or a TerminologyTermRef
+    (if the text matches a qiita.terminology_term row scoped to the field's
+    terminology_idx). Returns (GlobalFieldRow, parsed_value) pairs in input
+    order.
 
     known_missing_reasons maps reason name -> idx; a text value matching a
     key (after outer-whitespace stripping) is emitted as MissingReasonRef
     and skips typed parsing. None or empty disables marker recognition.
     Raises MetadataUnknownFieldsError (carrying every unknown name) before
-    parsing, then MetadataParseError on the first typed-parse failure.
+    parsing, then MetadataParseError on the first typed-parse failure or
+    unresolved terminology term.
     """
     # Resolve all requested display_names in one round trip; the helper
     # short-circuits on empty input so this is free for metadata-less callers.
@@ -1221,15 +1307,67 @@ async def preflight_global_metadata(
     # disables marker recognition.
     reason_lookup: Mapping[str, int] = known_missing_reasons or {}
 
+    # Group terminology candidates by terminology_idx so we can batch the
+    # lookups per terminology, then resolve into a (terminology_idx,
+    # term_id) -> (idx, label) map. Missing-reason markers take precedence
+    # over the terminology lookup, so a text already matching a known
+    # missing-reason name is excluded from the candidate set.
+    terminology_candidates: dict[int, set[str]] = {}
+    for display_name, text_value in metadata.items():
+        global_row = global_field_rows[display_name]
+        if global_row.data_type is not FieldDataType.TERMINOLOGY:
+            continue
+        stripped = text_value.strip()
+        if stripped in reason_lookup:
+            continue
+        # terminology_idx is non-None for TERMINOLOGY-typed rows by the
+        # *_global_field CHECK; assert rather than guard so a CHECK violation
+        # surfaces loudly instead of silently dropping the row.
+        assert global_row.terminology_idx is not None
+        terminology_candidates.setdefault(global_row.terminology_idx, set()).add(stripped)
+
+    # One round trip per distinct terminology_idx; the helper short-circuits
+    # on empty inputs so a no-terminology import pays nothing.
+    terminology_lookup: dict[tuple[int, str], tuple[int, str]] = {}
+    for terminology_idx, term_ids in terminology_candidates.items():
+        resolved = await fetch_terminology_term_idxs_by_term_ids(
+            conn, terminology_idx=terminology_idx, term_ids=term_ids
+        )
+        for term_id, idx_label in resolved.items():
+            terminology_lookup[(terminology_idx, term_id)] = idx_label
+
     # Parse each text value: missing-reason markers route to MissingReasonRef
-    # ahead of typed parsing; MetadataParseError on the first bad typed input.
-    parsed: list[tuple[GlobalFieldRow, str | Decimal | date | MissingReasonRef]] = []
+    # first; TERMINOLOGY-typed fields then route to TerminologyTermRef on hit
+    # or raise MetadataParseError on miss; other values dispatch to the
+    # typed parser.
+    parsed: list[tuple[GlobalFieldRow, GlobalMetadataValue]] = []
     for display_name, text_value in metadata.items():
         global_row = global_field_rows[display_name]
         stripped = text_value.strip()
         if stripped in reason_lookup:
             parsed.append(
                 (global_row, MissingReasonRef(idx=reason_lookup[stripped], name=stripped))
+            )
+            continue
+        if global_row.data_type is FieldDataType.TERMINOLOGY:
+            # terminology_idx is non-None for TERMINOLOGY-typed rows by the
+            # *_global_field CHECK; assert rather than guard so a CHECK violation
+            # surfaces loudly instead of silently dropping the row.
+            assert global_row.terminology_idx is not None
+            resolved_idx_label = terminology_lookup.get((global_row.terminology_idx, stripped))
+            if resolved_idx_label is None:
+                raise MetadataParseError(
+                    display_name=display_name,
+                    data_type=global_row.data_type,
+                    text_value=text_value,
+                    reason="no matching terminology term",
+                )
+            term_idx, term_label = resolved_idx_label
+            parsed.append(
+                (
+                    global_row,
+                    TerminologyTermRef(idx=term_idx, term_id=stripped, label=term_label),
+                )
             )
             continue
         parsed_value = parse_text_for_data_type(display_name, global_row.data_type, text_value)
@@ -1305,7 +1443,7 @@ async def write_global_metadata_entries(
     entity_idx: int,
     study_idx: int,
     caller_idx: int,
-    parsed_metadata: Sequence[tuple[GlobalFieldRow, str | Decimal | date | MissingReasonRef]],
+    parsed_metadata: Sequence[tuple[GlobalFieldRow, GlobalMetadataValue]],
 ) -> None:
     """Drive write_global_metadata_or_diagnose over every preflight-parsed
     entry, writing each value against study_idx (the field-owning study).

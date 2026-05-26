@@ -285,8 +285,11 @@ async def import_biosample_from_owner_biosample_id(
     text value; values are parsed into the Python type matching the
     global field's data_type before insert. A text value matching a
     qiita.missing_value_reason name is recorded as
-    value_missing_reason_idx rather than typed-parsed. Pre-flight
-    validation runs before any writes:
+    value_missing_reason_idx rather than typed-parsed; a text value on a
+    TERMINOLOGY-typed field that matches a qiita.terminology_term row
+    scoped to the field's terminology_idx is recorded as
+    value_terminology_term_idx. Pre-flight validation runs before any
+    writes:
 
         - BiosampleOwnerIdFieldCollisionError when metadata carries an
           entry whose key equals owner_biosample_id_field_name.
@@ -296,7 +299,9 @@ async def import_biosample_from_owner_biosample_id(
           matching biosample_global_field row; all unknown names are
           collected in one error.
         - MetadataParseError on first failure to coerce a non-marker
-          text value into the type its global field declares.
+          text value into the type its global field declares, or on
+          first TERMINOLOGY-typed text that does not resolve to a term
+          in the field's terminology.
         - LocalWriteOnGloballyLinkedFieldError when
           owner_biosample_id_field_name resolves to a field on
           primary_study_idx that is already globally linked.
@@ -333,10 +338,9 @@ async def import_biosample_from_owner_biosample_id(
             owner_biosample_id_value, known_missing_reasons[stripped_owner_id]
         )
 
-    # Pre-flight: resolve every metadata key against biosample_global_field
-    # and parse every text value into its typed Python form or — if the
-    # text matches a known missing-reason name — into a MissingReasonRef.
-    # Both unknown-name and parse-failure cases raise before any DB write.
+    # Pre-flight: type-resolve every metadata entry against
+    # biosample_global_field; unknown-name, parse-failure, and
+    # unresolved-terminology cases raise before any DB write.
     parsed_metadata = await preflight_global_metadata(
         conn,
         spec=BIOSAMPLE_METADATA_SPEC,

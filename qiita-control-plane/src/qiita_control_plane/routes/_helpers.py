@@ -10,7 +10,7 @@ from datetime import datetime
 
 import asyncpg
 from fastapi import HTTPException
-from qiita_common.models import MissingReasonRef
+from qiita_common.models import MissingReasonRef, TerminologyTermRef
 
 from ..repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
@@ -22,6 +22,20 @@ from ..repositories._sample_helpers import (
     SlotOccupiedError,
     TransientWriteRaceError,
 )
+
+
+def _attempted_label(value: object) -> str:
+    """Render the 'what was attempted' noun for a slot-collision message.
+
+    Returns "missing-reason marker" for MissingReasonRef, "terminology
+    term" for TerminologyTermRef, and "value" for bare typed scalars.
+    """
+    if isinstance(value, MissingReasonRef):
+        return "missing-reason marker"
+    if isinstance(value, TerminologyTermRef):
+        return "terminology term"
+    return "value"
+
 
 # Shared 422-detail string for a foreign-key violation whose constraint
 # is not in a route's specific message map. Lifted here so the wording
@@ -63,10 +77,11 @@ async def detail_for_slot_collision(
     correlate; study name is intentionally not joined (caller may not
     have read access to that study).
     """
-    # The same/different subclasses cover both typed-vs-typed and
-    # missing-vs-missing equality; the attempted_value's kind selects the
-    # wording variant per branch.
-    attempted_is_missing = isinstance(exc.attempted_value, MissingReasonRef)
+    # The same/different subclasses cover typed-vs-typed,
+    # missing-vs-missing, and terminology-vs-terminology equality; the
+    # attempted_value's kind selects the wording noun per branch via
+    # _attempted_label.
+    what = _attempted_label(exc.attempted_value)
     # Slot identifier: global path is keyed by global_field_idx, local
     # path by the entity-scoped study_field_idx. The non-None-ness of
     # exc.global_field_idx discriminates without a separate flag.
@@ -80,14 +95,12 @@ async def detail_for_slot_collision(
     # added without a wording branch here; reading the catch-all
     # message in production points the maintainer at this dispatch.
     if isinstance(exc, DuplicateValueSameStudyError):
-        what = "missing-reason marker" if attempted_is_missing else "value"
         return (
             f"your study already wrote this same {what} for field"
             f" {exc.display_name!r} on {exc.entity_kind}_idx={exc.entity_idx}"
             f" ({slot_id}); no new row was created"
         )
     if isinstance(exc, ConflictingValueSameStudyError):
-        what = "missing-reason marker" if attempted_is_missing else "value"
         return (
             f"your study previously wrote a different {what} for field"
             f" {exc.display_name!r} on {exc.entity_kind}_idx={exc.entity_idx}"
@@ -95,7 +108,6 @@ async def detail_for_slot_collision(
             f" correct it via PATCH or DELETE+INSERT, not INSERT"
         )
     if isinstance(exc, DuplicateValueDifferentStudyError):
-        what = "missing-reason marker" if attempted_is_missing else "value"
         return (
             f"the {what} you attempted is already present for field"
             f" {exc.display_name!r} on {exc.entity_kind}_idx={exc.entity_idx}"
@@ -104,7 +116,6 @@ async def detail_for_slot_collision(
             f" not own the row"
         )
     if isinstance(exc, ConflictingValueDifferentStudyError):
-        what = "missing-reason marker" if attempted_is_missing else "value"
         return (
             f"another study (study_idx={exc.contributing_study_idx}) has"
             f" written a different {what} for field"
@@ -116,6 +127,10 @@ async def detail_for_slot_collision(
         # One extra SELECT to resolve the human-readable reason name so the
         # caller knows what reason occupies the slot; the missing_value_reason
         # table is shared across all entity kinds (no spec dispatch needed).
+        # existing_missing_reason_idx is non-None whenever this subclass fires
+        # (the diagnose path only constructs it when the missing-reason FK is
+        # populated); the assert documents the invariant for asyncpg's binder.
+        assert exc.existing_missing_reason_idx is not None
         reason_name = await conn.fetchval(
             "SELECT name FROM qiita.missing_value_reason WHERE idx = $1",
             exc.existing_missing_reason_idx,
@@ -128,11 +143,25 @@ async def detail_for_slot_collision(
             f" value can be written"
         )
     if isinstance(exc, SlotOccupiedByTypedValueError):
-        # Existing typed value travels on the exception payload — no DB roundtrip needed.
+        # Existing typed value travels on the exception payload — no DB
+        # roundtrip needed for str/Decimal/date. A terminology-term slot
+        # carries an int FK (qiita.terminology_term.idx); resolve it to
+        # the human-readable term_id + label with one extra SELECT so the
+        # caller sees what term occupies the slot rather than a bare idx.
         # str values render via repr() (quoting distinguishes "123" from 123);
         # Decimal / date render via str() so the body shows "1.5" / "2024-01-02"
         # instead of "Decimal('1.5')" / "datetime.date(2024, 1, 2)".
-        if isinstance(exc.existing_value, str):
+        if isinstance(exc.existing_value, int) and not isinstance(exc.existing_value, bool):
+            term_row = await conn.fetchrow(
+                "SELECT term_id, label FROM qiita.terminology_term WHERE idx = $1",
+                exc.existing_value,
+            )
+            rendered_existing = (
+                f"terminology term {term_row['term_id']!r} ({term_row['label']!r})"
+                if term_row is not None
+                else f"terminology_term_idx={exc.existing_value}"
+            )
+        elif isinstance(exc.existing_value, str):
             rendered_existing = repr(exc.existing_value)
         else:
             rendered_existing = str(exc.existing_value)

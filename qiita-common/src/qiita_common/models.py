@@ -365,6 +365,12 @@ class BiosampleImportResponse(BaseModel):
 # repository-side write dispatch can import it from one place.
 MISSING_REASON_VALUE_COLUMN = "value_missing_reason_idx"
 
+# SQL column name on biosample_metadata / prep_sample_metadata that holds
+# a terminology-term entry's qiita.terminology_term FK. Mirrors
+# MISSING_REASON_VALUE_COLUMN for the terminology variant of the resolved
+# value sentinels.
+TERMINOLOGY_TERM_VALUE_COLUMN = "value_terminology_term_idx"
+
 
 class MissingReasonRef(BaseModel):
     """Resolved-once shape for a metadata text value recognised as a marker
@@ -384,6 +390,27 @@ class MissingReasonRef(BaseModel):
         return MISSING_REASON_VALUE_COLUMN
 
 
+class TerminologyTermRef(BaseModel):
+    """Resolved-once shape for a metadata text value matched against a
+    qiita.terminology_term row scoped to the field's terminology_idx.
+    Carries the term's idx (the FK target on
+    *_metadata.value_terminology_term_idx), its term_id (the CURIE the
+    caller passed) and its label (the human-readable term name).
+    `kind` discriminates this variant from other dict-shaped value
+    variants on GlobalMetadataEntry.value. value_column is the target
+    value_* column for a terminology-term write.
+    """
+
+    kind: Literal["terminology_term"] = "terminology_term"
+    idx: Annotated[int, Field(gt=0)]
+    term_id: Annotated[str, Field(min_length=1)]
+    label: Annotated[str, Field(min_length=1)]
+
+    @property
+    def value_column(self) -> str:
+        return TERMINOLOGY_TERM_VALUE_COLUMN
+
+
 class GlobalMetadataEntry(BaseModel):
     """One globally-linked metadata value for a biosample or prep_sample,
     with cosmetic context.
@@ -394,14 +421,20 @@ class GlobalMetadataEntry(BaseModel):
     override, because these reads are not study-scoped. data_type
     identifies which Python type carries the value: TEXT -> str,
     NUMERIC -> Decimal, DATE -> date; a MissingReasonRef carries an
-    intentionally-missing entry's reason idx + name and supersedes
-    data_type-driven decoding.
+    intentionally-missing entry's reason idx + name; a TerminologyTermRef
+    carries a terminology-term entry's idx + term_id + label. Both Ref
+    variants supersede data_type-driven decoding.
     """
 
     display_name: str
     description: str | None
     data_type: FieldDataType
-    value: str | Decimal | date | MissingReasonRef
+    value: (
+        str
+        | Decimal
+        | date
+        | Annotated[MissingReasonRef | TerminologyTermRef, Field(discriminator="kind")]
+    )
 
 
 class BiosampleResponse(BaseModel):
@@ -415,9 +448,10 @@ class BiosampleResponse(BaseModel):
     surface as biosample_metadata.global_field_idx IS NULL via the
     existing schema triggers and are filtered out by the read.
     Intentionally-missing entries (value_missing_reason_idx populated)
-    surface via a MissingReasonRef in the entry's `value` field.
-    `caller_system_role` carries the caller's principal.system_role
-    verbatim from the database.
+    surface via a MissingReasonRef in the entry's `value` field;
+    terminology-term entries (value_terminology_term_idx populated)
+    surface via a TerminologyTermRef. `caller_system_role` carries the
+    caller's principal.system_role verbatim from the database.
     """
 
     biosample_idx: Annotated[int, Field(gt=0)]

@@ -33,7 +33,7 @@ from decimal import Decimal
 import asyncpg
 import pytest
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
-from qiita_common.models import FieldDataType, MissingReasonRef
+from qiita_common.models import FieldDataType, MissingReasonRef, TerminologyTermRef
 
 from qiita_control_plane.repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
@@ -57,6 +57,7 @@ from qiita_control_plane.repositories._sample_helpers import (
     fetch_global_fields_by_display_names,
     fetch_global_metadata,
     fetch_missing_value_reason_idxs_by_names,
+    fetch_terminology_term_idxs_by_term_ids,
     insert_entity_to_study,
     link_entity_to_studies,
     parse_text_for_data_type,
@@ -72,6 +73,8 @@ from qiita_control_plane.repositories.biosample_metadata import (
 )
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from qiita_control_plane.testing.db_seeds import (
+    NCBI_TAXONOMY_METAGENOME_TERM_ID,
+    fetch_seeded_metagenome_term,
     retire_biosample_to_study_link,
     retire_prep_sample_to_study_link,
     seed_biosample_global_field,
@@ -217,6 +220,7 @@ def _expected_metadata_row(
         FieldDataType.TEXT: "value_text",
         FieldDataType.NUMERIC: "value_numeric",
         FieldDataType.DATE: "value_date",
+        FieldDataType.TERMINOLOGY: "value_terminology_term_idx",
     }
     row[column_for_type[data_type]] = value
     return row
@@ -1812,8 +1816,12 @@ async def test_fetch_global_fields_by_display_names_returns_matching(
         )
 
     expected = {
-        name_a: GlobalFieldRow(idx=idx_a, display_name=name_a, data_type=FieldDataType.TEXT),
-        name_b: GlobalFieldRow(idx=idx_b, display_name=name_b, data_type=FieldDataType.NUMERIC),
+        name_a: GlobalFieldRow(
+            idx=idx_a, display_name=name_a, data_type=FieldDataType.TEXT, terminology_idx=None
+        ),
+        name_b: GlobalFieldRow(
+            idx=idx_b, display_name=name_b, data_type=FieldDataType.NUMERIC, terminology_idx=None
+        ),
     }
     assert result == expected
 
@@ -1849,7 +1857,9 @@ async def test_fetch_global_fields_by_display_names_omits_unknown(
 
     # Only the known name appears; unknown is silently absent.
     expected = {
-        known_name: GlobalFieldRow(idx=idx, display_name=known_name, data_type=FieldDataType.TEXT),
+        known_name: GlobalFieldRow(
+            idx=idx, display_name=known_name, data_type=FieldDataType.TEXT, terminology_idx=None
+        ),
     }
     assert result == expected
 
@@ -1920,10 +1930,13 @@ async def _seed_global_field(
     internal_name: str,
     display_name: str,
     data_type: FieldDataType,
+    terminology_idx: int | None = None,
 ) -> int:
     """Seed a *_global_field row for the entity named by spec, track for
     cleanup, return its idx. Branches on spec.entity_kind because the two
     seed helpers take entity-specific table identifiers internally.
+    terminology_idx is forwarded; the *_global_field CHECK enforces the
+    iff coupling with data_type=TERMINOLOGY.
     """
     seeder = (
         seed_biosample_global_field
@@ -1935,6 +1948,7 @@ async def _seed_global_field(
         internal_name=internal_name,
         display_name=display_name,
         data_type=data_type,
+        terminology_idx=terminology_idx,
         created_by_idx=SYSTEM_PRINCIPAL_IDX,
     )
     ctx["created"][f"{spec.entity_kind}_global_field"].append(idx)
@@ -2401,11 +2415,10 @@ async def test__insert_metadata_writes_missing_reason_value(ctx, spec):
     ids=["biosample", "prep_sample"],
 )
 async def test__insert_metadata_unsupported_data_type_raises(ctx, spec):
-    """Closed-set guard: BOOLEAN and TERMINOLOGY are not yet decodable
-    via GLOBAL_METADATA_VALUE_COLUMN, so the shared inserter raises
-    NotImplementedError rather than silently writing NULL into every
-    value column. Exercised without touching the DB because the guard
-    fires before any INSERT.
+    """Closed-set guard: BOOLEAN is absent from GLOBAL_METADATA_VALUE_COLUMN,
+    so the shared inserter raises NotImplementedError rather than silently
+    writing NULL into every value column. Exercised without touching the DB
+    because the guard fires before any INSERT.
     """
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(NotImplementedError):
@@ -2435,13 +2448,15 @@ async def _seed_globally_linked_metadata(
     description: str | None,
     data_type: FieldDataType,
     value,
+    terminology_idx: int | None = None,
 ):
     """Test helper: seed a *_global_field for the entity named by spec,
     link a study field to it, write one metadata row of the matching
     typed-column flavor via the shared inserter, and track the
     *_global_field / *_study_field / *_metadata idxs for fixture cleanup.
     Returns the global field idx for callers that want to inspect or
-    extend the row.
+    extend the row. terminology_idx is required when
+    data_type=TERMINOLOGY.
     """
     # Seed the global field; *_global_field rows persist beyond the test
     # so the helper tracks them on the cleanup dict.
@@ -2451,6 +2466,7 @@ async def _seed_globally_linked_metadata(
         internal_name=internal_name,
         display_name=display_name,
         data_type=data_type,
+        terminology_idx=terminology_idx,
     )
     # The seed helper omits description; set it via UPDATE when needed so
     # the seed helper surface stays small. spec.global_field_table is a
@@ -3187,3 +3203,478 @@ async def test_write_global_metadata_entries_empty_input_is_noop(ctx, spec):
         entity_idx,
     )
     assert count == 0
+
+
+# ---------------------------------------------------------------------------
+# fetch_terminology_term_idxs_by_term_ids
+# ---------------------------------------------------------------------------
+
+
+async def test_fetch_terminology_term_idxs_by_term_ids_returns_idx_and_label(ctx):
+    """Tests the case where every requested term_id has a matching row in
+    the named terminology: the returned dict carries term_id -> (idx,
+    label) for each one.
+    """
+    terminology_idx = (await fetch_seeded_metagenome_term(ctx["pool"]))["terminology_idx"]
+
+    async with ctx["pool"].acquire() as conn:
+        result = await fetch_terminology_term_idxs_by_term_ids(
+            conn, terminology_idx=terminology_idx, term_ids=["256318", "408170"]
+        )
+
+    # The seeded label pairing is fixed by the migration; assert the full
+    # returned shape against the expected (idx, label) tuples by re-looking
+    # up the idxs since they are GENERATED ALWAYS.
+    rows = await ctx["pool"].fetch(
+        "SELECT term_id, idx, label FROM qiita.terminology_term"
+        " WHERE terminology_idx = $1 AND term_id = ANY($2::text[])",
+        terminology_idx,
+        ["256318", "408170"],
+    )
+    expected = {r["term_id"]: (r["idx"], r["label"]) for r in rows}
+    assert result == expected
+
+
+async def test_fetch_terminology_term_idxs_by_term_ids_empty_input(ctx):
+    """Tests the case where the term_ids iterable is empty: returns an
+    empty dict and short-circuits without touching the DB.
+    """
+    terminology_idx = (await fetch_seeded_metagenome_term(ctx["pool"]))["terminology_idx"]
+
+    async with ctx["pool"].acquire() as conn:
+        result = await fetch_terminology_term_idxs_by_term_ids(
+            conn, terminology_idx=terminology_idx, term_ids=[]
+        )
+
+    assert result == {}
+
+
+async def test_fetch_terminology_term_idxs_by_term_ids_no_matches(ctx):
+    """Tests the case where no requested term_id has a matching row in
+    the named terminology: returns an empty dict.
+    """
+    terminology_idx = (await fetch_seeded_metagenome_term(ctx["pool"]))["terminology_idx"]
+    suffix = secrets.token_hex(4)
+
+    async with ctx["pool"].acquire() as conn:
+        result = await fetch_terminology_term_idxs_by_term_ids(
+            conn,
+            terminology_idx=terminology_idx,
+            term_ids=[f"no_such_term_{suffix}_a", f"no_such_term_{suffix}_b"],
+        )
+
+    assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# preflight_global_metadata terminology routing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_preflight_global_metadata_routes_terminology_term(ctx, spec):
+    """Tests the case where a TERMINOLOGY-typed field's text value matches
+    a qiita.terminology_term row in the field's terminology: preflight
+    emits a TerminologyTermRef carrying idx, term_id, and label and the
+    field's data_type is reflected on the GlobalFieldRow.
+    """
+    term_row = await fetch_seeded_metagenome_term(ctx["pool"])
+    terminology_idx = term_row["terminology_idx"]
+    global_row = await _seed_global_field_for_spec(
+        ctx, spec, data_type=FieldDataType.TERMINOLOGY, terminology_idx=terminology_idx
+    )
+
+    async with ctx["pool"].acquire() as conn:
+        parsed = await preflight_global_metadata(
+            conn,
+            spec=spec,
+            metadata={global_row.display_name: NCBI_TAXONOMY_METAGENOME_TERM_ID},
+        )
+
+    expected_ref = TerminologyTermRef(
+        idx=term_row["idx"], term_id=term_row["term_id"], label=term_row["label"]
+    )
+    assert parsed == [(global_row, expected_ref)]
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_preflight_global_metadata_unresolved_terminology_raises(ctx, spec):
+    """Tests the case where a TERMINOLOGY-typed field's text value does
+    not match any qiita.terminology_term row in the field's terminology:
+    preflight raises MetadataParseError carrying the unresolved text and
+    the field's display_name.
+    """
+    terminology_idx = (await fetch_seeded_metagenome_term(ctx["pool"]))["terminology_idx"]
+    global_row = await _seed_global_field_for_spec(
+        ctx, spec, data_type=FieldDataType.TERMINOLOGY, terminology_idx=terminology_idx
+    )
+    bogus_term = f"no_such_term_{secrets.token_hex(4)}"
+
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(MetadataParseError) as excinfo:
+            await preflight_global_metadata(
+                conn,
+                spec=spec,
+                metadata={global_row.display_name: bogus_term},
+            )
+
+    assert excinfo.value.display_name == global_row.display_name
+    assert excinfo.value.data_type is FieldDataType.TERMINOLOGY
+    assert excinfo.value.text_value == bogus_term
+    assert excinfo.value.reason == "no matching terminology term"
+
+
+# ---------------------------------------------------------------------------
+# _insert_metadata terminology persistence
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test__insert_metadata_writes_terminology_term_value(ctx, spec):
+    """Tests the case where the value is a TerminologyTermRef: the row
+    lands with value_terminology_term_idx populated and every other
+    value_* column NULL.
+    """
+    term_row = await fetch_seeded_metagenome_term(ctx["pool"])
+    terminology_idx = term_row["terminology_idx"]
+    # Seed entity + a TERMINOLOGY-typed local study field bound to the
+    # NCBI Taxonomy terminology so the value_terminology_term_idx write
+    # satisfies the field contract.
+    entity_idx = await (
+        _create_biosample_with_link(ctx)
+        if spec.entity_kind is SampleEntityKind.BIOSAMPLE
+        else _create_prep_sample_with_link(ctx)
+    )
+    async with ctx["pool"].acquire() as conn, conn.transaction():
+        field_idx, _, _ = await _get_or_create_local_study_field(
+            conn,
+            spec=spec,
+            study_idx=ctx["study_idx"],
+            display_name=_unique_field_name("term_insert"),
+            created_by_idx=ctx["principal_idx"],
+            data_type=FieldDataType.TERMINOLOGY,
+            required=True,
+            terminology_idx=terminology_idx,
+        )
+    ctx["created"][f"{spec.entity_kind}_study_field"].append(field_idx)
+
+    async with ctx["pool"].acquire() as conn:
+        meta_idx = await _insert_metadata(
+            conn,
+            spec=spec,
+            entity_idx=entity_idx,
+            study_field_idx=field_idx,
+            data_type=FieldDataType.TERMINOLOGY,
+            value=TerminologyTermRef(
+                idx=term_row["idx"],
+                term_id=term_row["term_id"],
+                label=term_row["label"],
+            ),
+            created_by_idx=ctx["principal_idx"],
+        )
+    ctx["created"][f"{spec.entity_kind}_metadata"].append(meta_idx)
+
+    # Full-row assert: value_terminology_term_idx carries the FK; every
+    # other typed value_* column is NULL.
+    row = await ctx["pool"].fetchrow(
+        f"SELECT {spec.entity_key_column}, {spec.study_field_idx_column},"
+        f" value_text, value_numeric, value_date, value_terminology_term_idx,"
+        f" value_missing_reason_idx, created_by_idx"
+        f" FROM {spec.metadata_table} WHERE idx = $1",
+        meta_idx,
+    )
+    expected = {
+        spec.entity_key_column: entity_idx,
+        spec.study_field_idx_column: field_idx,
+        "value_text": None,
+        "value_numeric": None,
+        "value_date": None,
+        "value_terminology_term_idx": term_row["idx"],
+        "value_missing_reason_idx": None,
+        "created_by_idx": ctx["principal_idx"],
+    }
+    assert dict(row) == expected
+
+
+# ---------------------------------------------------------------------------
+# write_*_metadata_or_diagnose terminology collisions
+# ---------------------------------------------------------------------------
+
+
+async def test_write_global_metadata_or_diagnose_terminology_dup_same_study(ctx):
+    """Tests the case where the slot already holds the same terminology
+    term and the same study attempts to re-write it through a different
+    display_name (same global_field): the second call raises
+    DuplicateValueSameStudyError with the same term as attempted_value.
+    """
+    term_row = await fetch_seeded_metagenome_term(ctx["pool"])
+    terminology_idx = term_row["terminology_idx"]
+    ref = TerminologyTermRef(
+        idx=term_row["idx"], term_id=term_row["term_id"], label=term_row["label"]
+    )
+    bs_idx = await _create_biosample_with_link(ctx)
+    suffix = secrets.token_hex(4)
+    display_name_first = f"Terminology Field A {suffix}"
+    display_name_second = f"Terminology Field B {suffix}"
+
+    # First write commits via the spec-driven helper; the second uses a
+    # different display_name (so a fresh study_field is created, bound to
+    # the same global_field) and trips the cross-study partial unique
+    # index on (entity, global_field_idx). The diagnose path classifies
+    # the equal-term-idx case as a same-study duplicate.
+    await _seed_globally_linked_metadata(
+        ctx,
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=bs_idx,
+        internal_name=f"term_{suffix}",
+        display_name=display_name_first,
+        description=None,
+        data_type=FieldDataType.TERMINOLOGY,
+        value=ref,
+        terminology_idx=terminology_idx,
+    )
+    gf_idx = ctx["created"]["biosample_global_field"][-1]
+
+    with pytest.raises(DuplicateValueSameStudyError) as excinfo:
+        async with ctx["pool"].acquire() as conn:
+            async with conn.transaction():
+                await write_global_metadata_or_diagnose(
+                    conn,
+                    spec=BIOSAMPLE_METADATA_SPEC,
+                    entity_idx=bs_idx,
+                    study_idx=ctx["study_idx"],
+                    global_field_idx=gf_idx,
+                    display_name=display_name_second,
+                    data_type=FieldDataType.TERMINOLOGY,
+                    value=ref,
+                    caller_idx=ctx["principal_idx"],
+                )
+    assert excinfo.value.attempted_value == ref
+    assert excinfo.value.existing_value == term_row["idx"]
+
+
+async def test_write_global_metadata_or_diagnose_terminology_conflict_diff_study(ctx):
+    """Tests the case where the slot holds one terminology term contributed
+    by one study and a second study attempts to write a different term in
+    the same terminology: ConflictingValueDifferentStudyError fires with
+    the two terms surfaced as the existing and attempted values.
+    """
+    term_a = await fetch_seeded_metagenome_term(ctx["pool"])
+    terminology_idx = term_a["terminology_idx"]
+    term_b = await ctx["pool"].fetchrow(
+        "SELECT idx, term_id, label FROM qiita.terminology_term"
+        " WHERE terminology_idx = $1 AND term_id = '646099'",
+        terminology_idx,
+    )
+    ref_a = TerminologyTermRef(idx=term_a["idx"], term_id=term_a["term_id"], label=term_a["label"])
+    ref_b = TerminologyTermRef(idx=term_b["idx"], term_id=term_b["term_id"], label=term_b["label"])
+    bs_idx = await _create_biosample_with_link(ctx)
+    second_study_idx = await _create_second_study_and_link_biosample(ctx, bs_idx)
+    suffix = secrets.token_hex(4)
+    display_name_first = f"Terminology Field A {suffix}"
+    display_name_second = f"Terminology Field B {suffix}"
+
+    # First study commits term A; second study uses a different display_name
+    # (fresh study_field bound to the same global_field) and attempts term B,
+    # tripping the cross-study partial unique index — different-study conflict.
+    await _seed_globally_linked_metadata(
+        ctx,
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=bs_idx,
+        internal_name=f"term_{suffix}",
+        display_name=display_name_first,
+        description=None,
+        data_type=FieldDataType.TERMINOLOGY,
+        value=ref_a,
+        terminology_idx=terminology_idx,
+    )
+    gf_idx = ctx["created"]["biosample_global_field"][-1]
+
+    with pytest.raises(ConflictingValueDifferentStudyError) as excinfo:
+        async with ctx["pool"].acquire() as conn:
+            async with conn.transaction():
+                await write_global_metadata_or_diagnose(
+                    conn,
+                    spec=BIOSAMPLE_METADATA_SPEC,
+                    entity_idx=bs_idx,
+                    study_idx=second_study_idx,
+                    global_field_idx=gf_idx,
+                    display_name=display_name_second,
+                    data_type=FieldDataType.TERMINOLOGY,
+                    value=ref_b,
+                    caller_idx=ctx["principal_idx"],
+                )
+    assert excinfo.value.existing_value == term_a["idx"]
+    assert excinfo.value.attempted_value == ref_b
+
+
+async def test_write_global_metadata_or_diagnose_terminology_attempted_against_missing_slot(ctx):
+    """Tests the case where the slot holds a missing-reason row and the
+    caller attempts to write a terminology term:
+    SlotOccupiedByMissingReasonError fires (cross-kind: existing-missing
+    + attempted-non-missing).
+    """
+    term_row = await fetch_seeded_metagenome_term(ctx["pool"])
+    terminology_idx = term_row["terminology_idx"]
+    ref = TerminologyTermRef(
+        idx=term_row["idx"], term_id=term_row["term_id"], label=term_row["label"]
+    )
+    reason_idx = await _seed_missing_value_reason(ctx, f"reason_{secrets.token_hex(4)}")
+    bs_idx = await _create_biosample_with_link(ctx)
+    suffix = secrets.token_hex(4)
+    display_name_first = f"Terminology Field A {suffix}"
+    display_name_second = f"Terminology Field B {suffix}"
+
+    # Seed a missing-reason row in the slot via the spec-driven helper;
+    # the second write uses a different display_name (fresh study_field
+    # bound to the same global_field) so the cross-study partial unique
+    # fires and the diagnose path classifies the existing-missing case.
+    await _seed_globally_linked_metadata(
+        ctx,
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=bs_idx,
+        internal_name=f"term_{suffix}",
+        display_name=display_name_first,
+        description=None,
+        data_type=FieldDataType.TERMINOLOGY,
+        value=MissingReasonRef(idx=reason_idx, name="ignored"),
+        terminology_idx=terminology_idx,
+    )
+    gf_idx = ctx["created"]["biosample_global_field"][-1]
+
+    with pytest.raises(SlotOccupiedByMissingReasonError) as excinfo:
+        async with ctx["pool"].acquire() as conn:
+            async with conn.transaction():
+                await write_global_metadata_or_diagnose(
+                    conn,
+                    spec=BIOSAMPLE_METADATA_SPEC,
+                    entity_idx=bs_idx,
+                    study_idx=ctx["study_idx"],
+                    global_field_idx=gf_idx,
+                    display_name=display_name_second,
+                    data_type=FieldDataType.TERMINOLOGY,
+                    value=ref,
+                    caller_idx=ctx["principal_idx"],
+                )
+    assert excinfo.value.existing_missing_reason_idx == reason_idx
+    assert excinfo.value.attempted_value == ref
+
+
+async def test_write_global_metadata_or_diagnose_missing_attempted_against_terminology_slot(ctx):
+    """Tests the case where the slot holds a terminology term and the
+    caller attempts to write a missing-reason marker:
+    SlotOccupiedByTypedValueError fires (cross-kind: existing-typed +
+    attempted-missing, where the typed value is a terminology term idx).
+    """
+    term_row = await fetch_seeded_metagenome_term(ctx["pool"])
+    terminology_idx = term_row["terminology_idx"]
+    ref = TerminologyTermRef(
+        idx=term_row["idx"], term_id=term_row["term_id"], label=term_row["label"]
+    )
+    reason_idx = await _seed_missing_value_reason(ctx, f"reason_{secrets.token_hex(4)}")
+    bs_idx = await _create_biosample_with_link(ctx)
+    suffix = secrets.token_hex(4)
+    display_name_first = f"Terminology Field A {suffix}"
+    display_name_second = f"Terminology Field B {suffix}"
+
+    # Seed a terminology row in the slot; the second write uses a different
+    # display_name (fresh study_field bound to the same global_field) so the
+    # cross-study partial unique fires and the diagnose path classifies the
+    # symmetric cross-kind case (existing-typed + attempted-missing).
+    await _seed_globally_linked_metadata(
+        ctx,
+        spec=BIOSAMPLE_METADATA_SPEC,
+        entity_idx=bs_idx,
+        internal_name=f"term_{suffix}",
+        display_name=display_name_first,
+        description=None,
+        data_type=FieldDataType.TERMINOLOGY,
+        value=ref,
+        terminology_idx=terminology_idx,
+    )
+    gf_idx = ctx["created"]["biosample_global_field"][-1]
+    missing_ref = MissingReasonRef(idx=reason_idx, name="ignored")
+
+    with pytest.raises(SlotOccupiedByTypedValueError) as excinfo:
+        async with ctx["pool"].acquire() as conn:
+            async with conn.transaction():
+                await write_global_metadata_or_diagnose(
+                    conn,
+                    spec=BIOSAMPLE_METADATA_SPEC,
+                    entity_idx=bs_idx,
+                    study_idx=ctx["study_idx"],
+                    global_field_idx=gf_idx,
+                    display_name=display_name_second,
+                    data_type=FieldDataType.TERMINOLOGY,
+                    value=missing_ref,
+                    caller_idx=ctx["principal_idx"],
+                )
+    # existing_value is the terminology_term idx (int); attempted_value is the missing-reason Ref.
+    assert excinfo.value.existing_value == term_row["idx"]
+    assert excinfo.value.attempted_value == missing_ref
+
+
+# ---------------------------------------------------------------------------
+# fetch_global_metadata surfaces terminology rows
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [BIOSAMPLE_METADATA_SPEC, PREP_SAMPLE_METADATA_SPEC],
+    ids=["biosample", "prep_sample"],
+)
+async def test_fetch_global_metadata_surfaces_terminology_term_rows(ctx, spec):
+    """Tests the case where the entity carries one TERMINOLOGY-typed row:
+    fetch returns a TerminologyTermRef carrying the term's idx, term_id,
+    and label.
+    """
+    term_row = await fetch_seeded_metagenome_term(ctx["pool"])
+    terminology_idx = term_row["terminology_idx"]
+    ref = TerminologyTermRef(
+        idx=term_row["idx"], term_id=term_row["term_id"], label=term_row["label"]
+    )
+    entity_idx = await (
+        _create_biosample_with_link(ctx)
+        if spec.entity_kind is SampleEntityKind.BIOSAMPLE
+        else _create_prep_sample_with_link(ctx)
+    )
+    suffix = secrets.token_hex(4)
+    internal_name = f"term_{suffix}"
+    display_name = f"Terminology Field {suffix}"
+    await _seed_globally_linked_metadata(
+        ctx,
+        spec=spec,
+        entity_idx=entity_idx,
+        internal_name=internal_name,
+        display_name=display_name,
+        description=None,
+        data_type=FieldDataType.TERMINOLOGY,
+        value=ref,
+        terminology_idx=terminology_idx,
+    )
+
+    result = await fetch_global_metadata(ctx["pool"], spec=spec, entity_idx=entity_idx)
+
+    expected = {
+        internal_name: GlobalMetadataRow(
+            internal_name=internal_name,
+            display_name=display_name,
+            description=None,
+            data_type=FieldDataType.TERMINOLOGY,
+            value=ref,
+        )
+    }
+    assert result == expected
