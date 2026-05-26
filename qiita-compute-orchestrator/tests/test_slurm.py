@@ -321,6 +321,21 @@ def test_payload_log_paths_round_trip(common_kwargs):
     assert payload["job"]["current_working_directory"] == str(common_kwargs["workspace"])
 
 
+def test_payload_qos_omitted_by_default(common_kwargs):
+    """Default qos="" (unset) must omit the qos field entirely so
+    slurmrestd applies the submitting user's default QOS."""
+    payload = build_job_submit_payload(**common_kwargs)
+    assert "qos" not in payload["job"]
+
+
+def test_payload_qos_set_when_non_empty(common_kwargs):
+    """An explicit qos value lands in the submit body so the
+    orchestrator pins the QOS instead of depending on user defaults."""
+    common_kwargs["qos"] = "qiita_norm"
+    payload = build_job_submit_payload(**common_kwargs)
+    assert payload["job"]["qos"] == "qiita_norm"
+
+
 # ============================================================================
 # verify_container_output
 # ============================================================================

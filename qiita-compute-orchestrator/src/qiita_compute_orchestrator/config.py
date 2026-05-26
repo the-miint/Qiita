@@ -83,6 +83,11 @@ class SlurmSettings:
     # absolute path on the shared filesystem (the orchestrator host's
     # venv interpreter, visible from compute nodes).
     native_python: str
+    # Optional SLURM QOS to set on submit. Empty string means "omit
+    # qos from the submit body" — the cluster falls back to the
+    # SLURMRESTD_USER_NAME's default QOS. Set explicitly so the
+    # orchestrator doesn't depend on user-default state.
+    qos: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +150,7 @@ def _resolve_slurm_settings() -> SlurmSettings:
             os.environ.get("SLURM_JOB_TIMEOUT_SECONDS", str(DEFAULT_SLURM_JOB_TIMEOUT_SECONDS))
         ),
         native_python=os.environ.get("SLURM_NATIVE_PYTHON", "python"),
+        qos=os.environ.get("SLURM_QOS", ""),
     )
 
 

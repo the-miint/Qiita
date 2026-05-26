@@ -124,6 +124,7 @@ def build_job_submit_payload(
     account: str,
     extra_env: dict[str, str] | None = None,
     native_python: str = "python",
+    qos: str = "",
 ) -> dict[str, Any]:
     """Build the slurmrestd `POST /slurm/{version}/job/submit` JSON body.
 
@@ -232,21 +233,27 @@ def build_job_submit_payload(
             apptainer_extra_args=apptainer_args,
         )
 
+    job: dict[str, Any] = {
+        "name": f"qiita-{step_name}-wt{work_ticket_idx}",
+        "account": account,
+        "partition": partition,
+        "current_working_directory": str(workspace),
+        # slurmrestd takes environment as a list of "KEY=VAL" strings.
+        # Sorted for determinism so payload tests are stable.
+        "environment": [f"{k}={v}" for k, v in sorted(env.items())],
+        "memory_per_node": _number_envelope(baseline_resources.mem_gb * 1024),
+        "tasks": 1,
+        "cpus_per_task": baseline_resources.cpu,
+        "time_limit": _number_envelope(_walltime_minutes(baseline_resources.walltime)),
+        "standard_output": str(log_stdout),
+        "standard_error": str(log_stderr),
+    }
+    # Only emit qos when the operator set one — omitting the field lets
+    # slurmrestd apply the submitting user's default QOS, which is the
+    # right behavior for sites that don't run a multi-QOS cluster.
+    if qos:
+        job["qos"] = qos
     return {
         "script": script,
-        "job": {
-            "name": f"qiita-{step_name}-wt{work_ticket_idx}",
-            "account": account,
-            "partition": partition,
-            "current_working_directory": str(workspace),
-            # slurmrestd takes environment as a list of "KEY=VAL" strings.
-            # Sorted for determinism so payload tests are stable.
-            "environment": [f"{k}={v}" for k, v in sorted(env.items())],
-            "memory_per_node": _number_envelope(baseline_resources.mem_gb * 1024),
-            "tasks": 1,
-            "cpus_per_task": baseline_resources.cpu,
-            "time_limit": _number_envelope(_walltime_minutes(baseline_resources.walltime)),
-            "standard_output": str(log_stdout),
-            "standard_error": str(log_stderr),
-        },
+        "job": job,
     }

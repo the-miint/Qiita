@@ -43,6 +43,7 @@ def _build_backend(settings: Settings) -> ComputeBackend:
             cp_to_co_token=settings.cp_to_co_token,
             co_to_cp_token=settings.co_to_cp_token,
             cp_url=settings.cp_url,
+            qos=settings.slurm.qos,
         )
     raise RuntimeError(f"unknown COMPUTE_BACKEND={settings.backend_type!r}")
 

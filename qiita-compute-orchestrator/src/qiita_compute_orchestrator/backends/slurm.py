@@ -87,6 +87,7 @@ class SlurmBackend(ComputeBackend):
         cp_to_co_token: str = "",
         co_to_cp_token: str = "",
         cp_url: str = "",
+        qos: str = "",
     ) -> None:
         self._client = client
         self._partition = partition
@@ -104,6 +105,10 @@ class SlurmBackend(ComputeBackend):
         self._cp_to_co_token = cp_to_co_token
         self._co_to_cp_token = co_to_cp_token
         self._cp_url = cp_url
+        # Optional SLURM QOS to set on submit; empty string means "let
+        # SLURM apply the submitting user's default QOS" (the orchestrator
+        # doesn't override).
+        self._qos = qos
 
     async def aclose(self) -> None:
         """Close the underlying httpx client so asyncio doesn't warn
@@ -229,6 +234,7 @@ class SlurmBackend(ComputeBackend):
             account=self._account,
             native_python=self._native_python,
             extra_env=extra_env or None,
+            qos=self._qos,
         )
 
         try:
