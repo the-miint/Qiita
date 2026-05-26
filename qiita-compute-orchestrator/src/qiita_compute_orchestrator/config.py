@@ -109,7 +109,22 @@ class Settings:
     slurm: SlurmSettings | None = None
 
     @classmethod
-    def from_env(cls) -> Settings:
+    def from_env(cls, *, require_cp_to_co_token: bool = True) -> Settings:
+        """Resolve a Settings from environment.
+
+        `require_cp_to_co_token` is True for the orchestrator FastAPI
+        service (the lifespan handler) — `cp_to_co_token` is the shared
+        bearer it must present-compare on inbound `POST /step/run`, so
+        a missing token is a boot-time fatal.
+
+        It's False on the SLURM-launcher / CLI path (set by the
+        no-install fallback in `get_settings()` below). Those processes
+        never serve inbound traffic; they only ever *make* outbound
+        CO→CP calls, which use `co_to_cp_token`. Skipping
+        `cp_to_co_token` resolution lets us drop `CP_TO_CO_TOKEN` from
+        the SLURM job env entirely, which narrows the `scontrol show
+        job` exposure to just the outbound PAT.
+        """
         backend_type = os.environ.get("COMPUTE_BACKEND", BACKEND_LOCAL)
         slurm = _resolve_slurm_settings() if backend_type == BACKEND_SLURM else None
         return cls(
@@ -118,7 +133,7 @@ class Settings:
                 "SHARED_FILESYSTEM_ROOT",
                 os.environ.get("TMPDIR", "/tmp") + "/qiita",
             ),
-            cp_to_co_token=_resolve_token("cp_to_co"),
+            cp_to_co_token=_resolve_token("cp_to_co") if require_cp_to_co_token else "",
             cp_url=_resolve_cp_url(),
             co_to_cp_token=_resolve_token("co_to_cp"),
             slurm=slurm,
@@ -249,9 +264,14 @@ def get_settings() -> Settings:
 
     Launcher / CLI path: install_settings was never called, get_settings
     calls Settings.from_env() lazily. Jobs that never invoke this don't
-    pay the token-resolution cost.
+    pay the token-resolution cost. We pass
+    `require_cp_to_co_token=False` because that token is *inbound*
+    auth on `POST /step/run` — the launcher / CLI never serves that
+    route, so demanding it would force the orchestrator to propagate
+    the token through SLURM env just to satisfy a path no job
+    exercises.
     """
     s = _settings_ctx.get()
     if s is not None:
         return s
-    return Settings.from_env()
+    return Settings.from_env(require_cp_to_co_token=False)
