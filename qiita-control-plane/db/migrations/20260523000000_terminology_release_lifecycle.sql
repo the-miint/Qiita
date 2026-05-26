@@ -15,6 +15,8 @@
 -- terminology.status
 -- -----------------------------------------------------------------------------
 
+-- Mirrored by qiita_common.models.TerminologyStatus. The two value sets are
+-- kept in lockstep by tests — change both in the same PR.
 CREATE TYPE qiita.terminology_status AS ENUM (
     'loading',
     'active',
@@ -47,6 +49,8 @@ COMMENT ON COLUMN qiita.terminology.status IS
 -- terminology_term obsoletion tracking + composite-uniqueness target
 -- -----------------------------------------------------------------------------
 
+-- Mirrored by qiita_common.models.TerminologyTermObsoletionKind. The two
+-- value sets are kept in lockstep by tests — change both in the same PR.
 CREATE TYPE qiita.terminology_term_obsoletion_kind AS ENUM (
     'source_deprecated',
     'source_merged',
