@@ -86,6 +86,16 @@ class Settings:
     auth_handoff_freshness_seconds: int = _DEFAULT_AUTH_HANDOFF_FRESHNESS_SECONDS
     cli_login_code_ttl_seconds: int = _DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS
     max_sequence_mint_count: int = _DEFAULT_MAX_SEQUENCE_MINT_COUNT
+    # Filesystem root the workflow runner mints per-ticket workspaces under
+    # (`<root>/<work_ticket_idx>/<step>/attempt-N/`). The CP creates the
+    # subdir; the path is POSTed to the orchestrator as the SLURM job's
+    # `current_working_directory`, so the same path must resolve on every
+    # compute node — i.e. a shared filesystem mount. On a single-host
+    # deploy this is the same dir as the orchestrator's SHARED_FILESYSTEM_ROOT.
+    # Optional in the dataclass so tests don't have to set it; required by
+    # from_env() so production boot fails fast if WORK_TICKET_WORKSPACE_ROOT
+    # is unset. dispatch._run_and_log raises if None reaches use-time.
+    work_ticket_workspace_root: Path | None = None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -107,6 +117,17 @@ class Settings:
         cp_to_co_token_path = Path(
             os.environ.get("CP_TO_CO_TOKEN_PATH", str(_DEFAULT_CP_TO_CO_TOKEN_PATH))
         )
+
+        # Required + must be absolute. Relative paths would be resolved
+        # against the service's CWD (whatever systemd / uvicorn happened to
+        # start in), which is non-obvious surface for an operator to reason
+        # about. Force the operator to spell out the shared mount.
+        ws_root_raw = require_env("WORK_TICKET_WORKSPACE_ROOT")
+        ws_root = Path(ws_root_raw)
+        if not ws_root.is_absolute():
+            raise RuntimeError(
+                f"WORK_TICKET_WORKSPACE_ROOT must be an absolute path, got {ws_root_raw!r}"
+            )
 
         return cls(
             database_url=require_env("DATABASE_URL"),
@@ -147,4 +168,5 @@ class Settings:
                 "QIITA_MAX_SEQUENCE_MINT_COUNT",
                 _DEFAULT_MAX_SEQUENCE_MINT_COUNT,
             ),
+            work_ticket_workspace_root=ws_root,
         )

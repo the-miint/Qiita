@@ -40,6 +40,14 @@ class HealthResponse(BaseModel):
 
 
 class ReferenceStatus(StrEnum):
+    """Lifecycle states of a reference database during staging.
+
+    Mirrored DB-side by the `status` column on `qiita.reference`, which is a
+    plain `TEXT` + `CHECK` column (not a Postgres `CREATE TYPE` ENUM) — so this
+    enum is intentionally not covered by the parity tests. Keep this set and
+    the matching `CHECK` list in sync by hand.
+    """
+
     PENDING = "pending"
     HASHING = "hashing"
     MINTING = "minting"

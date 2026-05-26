@@ -48,14 +48,28 @@ In AuthRocket admin → your realm → **Settings**:
   `email_verified` at the JWT layer because LoginRocket Web tokens omit
   it; the realm policy is what makes that safe.
 
-### 2. Default Login URL (optional)
+### 2. App or login URL (optional)
 
-Per AuthRocket's docs, "the Default Login URL may be overridden by using
-the `?redirect_uri=[url]` query parameter." Qiita always passes
-`redirect_uri` explicitly in `/auth/login`, so the Default Login URL is
-unused by qiita's code path. You can leave it blank or set it to
-`https://<qiita-host>/api/v1/auth/handoff` for direct login attempts that
-bypass `/auth/login`.
+In current AuthRocket UI versions this field is labeled "App or login
+URL" (previously "Default Login URL"). Set it to the **app's base URL**
+(e.g. `https://<qiita-host>`) — AuthRocket validates this as a homepage
+and rejects deep paths like `/api/v1/auth/handoff` with "App or login
+URL is invalid".
+
+Qiita's `/auth/login` flow passes `redirect_uri` explicitly on every
+request, so this value is functionally a fallback for direct
+AuthRocket-side login attempts that bypass `/auth/login`. You can leave
+it blank.
+
+**Ordering caveat.** The validator does a live HTTP probe of the URL
+before accepting it. If the qiita host isn't serving cleanly yet —
+because nginx is still on a pre-existing `default.conf` with a different
+TLS chain, or qiita's nginx config isn't yet active — AuthRocket will
+reject *any* URL you enter (including unrelated ones like
+`https://example.com`) with the same vague "invalid" message. Complete
+[`first-deploy.md`](first-deploy.md) steps 0.4 and the bootstrap section
+first (so `curl https://<qiita-host>/` returns a 502 from qiita's nginx),
+then set this field.
 
 ### 3. Users
 

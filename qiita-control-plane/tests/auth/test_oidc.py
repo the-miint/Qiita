@@ -19,6 +19,15 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from jwt.algorithms import RSAAlgorithm
 from qiita_common.api_paths import LOOPBACK_HOST
 
+
+@pytest.fixture(autouse=True)
+def _workspace_root_env(monkeypatch):
+    """Settings.from_env() (called by several AuthRocket tests below) now
+    requires WORK_TICKET_WORKSPACE_ROOT. Set a default so those tests can
+    focus on the OIDC surface they actually care about."""
+    monkeypatch.setenv("WORK_TICKET_WORKSPACE_ROOT", "/tmp/qiita-test-ws-unused")
+
+
 # ---------------------------------------------------------------------------
 # JWKS harness
 # ---------------------------------------------------------------------------

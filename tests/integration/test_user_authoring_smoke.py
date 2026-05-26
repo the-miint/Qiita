@@ -70,12 +70,18 @@ def cp_server(tmp_path, hmac_secret):
     port = _free_port()
     token_file = tmp_path / "cp-to-co.token"
     token_file.write_text("unused-dispatch-token")
+    # Settings.from_env() requires WORK_TICKET_WORKSPACE_ROOT — the CP
+    # would fail to boot without it. The dir doesn't need to exist for
+    # this smoke (the dispatch points at a dead orchestrator port, so
+    # the runner never reaches mkdir); the value just needs to be an
+    # absolute path so the boot-time validation passes.
     env = {
         **os.environ,
         "DATABASE_URL": resolve_postgres_url(),
         "HMAC_SECRET_KEY": base64.b64encode(hmac_secret).decode(),
         "COMPUTE_ORCHESTRATOR_URL": "http://127.0.0.1:1",
         "CP_TO_CO_TOKEN_PATH": str(token_file),
+        "WORK_TICKET_WORKSPACE_ROOT": str(tmp_path / "orch-workspace"),
     }
     proc = subprocess.Popen(
         [
