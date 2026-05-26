@@ -8,6 +8,33 @@ Newest entry on top. Pre-deploy entries (PRs not yet merged to `main`) are allow
 
 ---
 
+## `feat/issue-53-landing-and-invitation` — feat: public landing page + invitation acceptance fix
+
+Fixes issue #53. Two user-visible problems addressed together:
+
+1. Visiting the bare host (`https://qiita-miint.ucsd.edu/`) returned `{"detail":"Not Found"}`. This PR adds a public landing page at `GET /` (project name, status badge, alpha / invitation-only / CLI-only callout, links into the repo, contact mailto).
+2. AuthRocket's post-invitation redirect to `/api/v1/auth/handoff?token=...` returned `401 login session missing` because the handoff route required a cookie that only the regular `/auth/login` flow sets. This PR makes the cookie optional in `/auth/handoff` — when absent, the route treats the request as an invitation acceptance, verifies the JWT alone, mints a PAT, and renders the same browser HTML the cookie-bearing flow does. CLI flow is unchanged.
+
+**New required env var on the CP: `CONTACT_EMAIL`.** Boot fails fast (`RuntimeError: CONTACT_EMAIL must be a local@domain.tld address`) when unset or malformed. The value renders into both `mailto:` links on the landing page (request access + need help).
+
+Before `sudo local-deploy.sh`:
+
+1. Append `CONTACT_EMAIL` to the env file. Pick the address invitation requests and help requests should reach:
+   ```bash
+   # [admin]
+   echo "CONTACT_EMAIL=qiita-help@ucsd.edu" | sudo tee -a /etc/qiita/control-plane.env
+   ```
+
+2. Confirm the AuthRocket realm's invitation-acceptance redirect URI is set to `https://qiita-miint.ucsd.edu/api/v1/auth/handoff` in the AuthRocket admin dashboard. (Likely already there if you previously tried to fix this.) After this PR ships, that URL works without any cookie — invitation acceptance lands directly there with the JWT in the query string and mints a PAT.
+
+3. Now run `sudo local-deploy.sh`. No new migrations.
+
+Also new in this PR (no operator action, just so you know what landed):
+
+- `qiita.auth_event.detail.via` now carries `"invitation"` (alongside the existing `"cli_login"` / `"browser_login"`) so anyone reading auth-event audit rows can tell which entry point produced a given PAT.
+
+---
+
 ## PR #49 — feat(upload): Arrow Flight DoPut upload domain
 
 **New required env var on both CP and DP: `UPLOAD_STAGING_ROOT`.** Boot fails fast (`RuntimeError: UPLOAD_STAGING_ROOT is required but not set`) without it.

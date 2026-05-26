@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>qiita-miint</title>
+<link rel="stylesheet" href="/static/landing.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>qiita-miint</h1>
+    <span id="status-badge" class="status-badge status-unknown" role="status" aria-live="polite">
+      checking&hellip;
+    </span>
+  </header>
+
+  <p class="callout">
+    <strong>Status:</strong> alpha &middot; invitation-only &middot; CLI-only
+  </p>
+
+  <p>
+    Registration is by invitation. There is no web UI today &mdash; all
+    interactions go through the
+    <a href="https://github.com/the-miint/Qiita/blob/main/docs/runbooks/user-cli-quickstart.md"><code>qiita</code> command-line tool</a>.
+  </p>
+
+  <p>
+    To request an invitation, email
+    <a href="mailto:{{ contact_email }}?subject=qiita-miint%20access%20request">{{ contact_email }}</a>
+    with a short note about the data you'd like to bring in.
+  </p>
+
+  <nav aria-label="Documentation">
+    <ul>
+      <li><a href="https://github.com/the-miint/Qiita#readme">About</a></li>
+      <li><a href="https://github.com/the-miint/Qiita/blob/main/docs/runbooks/user-cli-quickstart.md">Get started (CLI)</a></li>
+      <li><a href="https://github.com/the-miint/Qiita/blob/main/docs/architecture.md">How it works</a></li>
+      <li><a href="https://github.com/the-miint/Qiita">Source</a></li>
+    </ul>
+  </nav>
+</main>
+
+<footer>
+  <span>UC San Diego &middot; v{{ version }}</span>
+  <span>Need help? <a href="mailto:{{ contact_email }}?subject=qiita-miint%20help">{{ contact_email }}</a></span>
+</footer>
+
+<script src="/static/landing.js"></script>
+</body>
+</html>

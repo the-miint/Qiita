@@ -1,0 +1,134 @@
+:root {
+  --fg: #1a1a1a;
+  --fg-muted: #6a6a6a;
+  --bg: #fafafa;
+  --rule: #d8d8d8;
+  --accent: #1d4ed8;
+  --ok: #16a34a;
+  --bad: #dc2626;
+  --unknown: #6a6a6a;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+}
+
+main {
+  flex: 1;
+  max-width: 42rem;
+  margin: 0 auto;
+  padding: 3rem 1.5rem 2rem;
+  width: 100%;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 0.75rem;
+  margin-bottom: 1.5rem;
+}
+
+h1 {
+  margin: 0;
+  font-size: 1.6rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.2rem 0.65rem;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  border: 1px solid var(--rule);
+  background: #fff;
+}
+
+.status-badge::before {
+  content: "";
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  background: var(--unknown);
+}
+
+.status-ok { color: var(--ok); border-color: var(--ok); }
+.status-ok::before { background: var(--ok); }
+
+.status-bad { color: var(--bad); border-color: var(--bad); }
+.status-bad::before { background: var(--bad); }
+
+.status-unknown { color: var(--fg-muted); }
+
+.callout {
+  background: #fff;
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--accent);
+  padding: 0.65rem 0.9rem;
+  margin: 1.25rem 0;
+  font-size: 0.95rem;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+a:hover { text-decoration: underline; }
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.92em;
+  background: #f0f0f0;
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+}
+
+nav {
+  margin-top: 2rem;
+  border-top: 1px solid var(--rule);
+  padding-top: 1rem;
+}
+
+nav ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+footer {
+  border-top: 1px solid var(--rule);
+  padding: 1rem 1.5rem;
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  max-width: 42rem;
+  width: 100%;
+  margin: 0 auto;
+}

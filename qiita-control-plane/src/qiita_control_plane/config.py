@@ -2,10 +2,15 @@
 
 import base64
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from qiita_common.config import require_env
+
+# Local@domain.tld shape check for CONTACT_EMAIL. Deliberately loose —
+# the real test is whether mail reaches the address. See from_env().
+_CONTACT_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # Field defaults for the auth-related Settings knobs. Defined once at module
 # scope so the dataclass declaration and the from_env() env-var fallback
@@ -105,6 +110,15 @@ class Settings:
     # required-but-Optional shape as work_ticket_workspace_root for the same
     # reasons; dispatch._run_and_log raises if None reaches use-time.
     upload_staging_root: Path | None = None
+    # Contact email rendered on the public landing page (`GET /`) as the
+    # destination for both the "request access" and "need help" mailto
+    # links. Required at boot so the landing page never ships with a
+    # placeholder; validated as a minimal `local@domain` shape since the
+    # only real test is whether mail can be delivered to it. Optional in
+    # the dataclass shape so tests that don't exercise the landing page
+    # don't have to set it; required by from_env(). The landing route is
+    # the only consumer — `None` is safe everywhere else in the codebase.
+    contact_email: str | None = None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -149,6 +163,18 @@ class Settings:
                 f"UPLOAD_STAGING_ROOT must be an absolute path, got {upload_root_raw!r}"
             )
 
+        contact_email = require_env("CONTACT_EMAIL")
+        # Minimal shape check — exactly one `@`, non-empty local part,
+        # domain with at least one dot, no whitespace. Not a full RFC-5322
+        # validation (the real test is whether mail reaches the address);
+        # the goal is just to catch the obvious typo / placeholder cases
+        # ("tbd", "foo@", "user@@example.org") at boot rather than
+        # shipping them into the rendered landing page.
+        if not _CONTACT_EMAIL_RE.match(contact_email):
+            raise RuntimeError(
+                f"CONTACT_EMAIL must be a local@domain.tld address, got {contact_email!r}"
+            )
+
         return cls(
             database_url=require_env("DATABASE_URL"),
             hmac_secret_key=secret,
@@ -190,4 +216,5 @@ class Settings:
             ),
             work_ticket_workspace_root=ws_root,
             upload_staging_root=upload_root,
+            contact_email=contact_email,
         )

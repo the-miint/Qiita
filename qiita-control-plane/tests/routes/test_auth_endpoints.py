@@ -999,15 +999,154 @@ async def test_handoff_cli_flow_redirects_to_loopback_with_ot_code(
         app.state.oidc_verifier = saved_verifier
 
 
-async def test_handoff_rejects_missing_cookie(auth_client, jwks_harness):
-    """No cookie → 401. The cookie is set by /auth/login; without it the
-    user hasn't gone through the documented flow."""
-    token = jwks_harness.sign(_lr_claims(jwks_harness))
+async def test_handoff_invitation_flow_no_cookie_mints_pat(
+    auth_client, postgres_pool, jwks_harness
+):
+    """Invitation acceptance lands here directly from AuthRocket's signup
+    redirect — the user never traversed /auth/login, so no cookie is
+    present. The route must accept the JWT alone, mint a PAT, and render
+    the same browser HTML the cookie-bearing browser-login flow does."""
+    from qiita_control_plane.main import app
+
+    saved_verifier = app.state.oidc_verifier
+    app.state.oidc_verifier = _lr_verifier(jwks_harness)
+    try:
+        token = jwks_harness.sign(
+            _lr_claims(jwks_harness, sub="invite-accept", email="invite-accept@example.com")
+        )
+        resp = await auth_client.get(
+            f"/api/v1/auth/handoff?token={token}",
+            follow_redirects=False,
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.headers["content-type"].startswith("text/html")
+        # No Location header — invitation flow must never redirect to a
+        # CLI loopback (no cookie means we don't know any port to redirect
+        # to, and invitations are browser-only by definition).
+        assert "location" not in {k.lower() for k in resp.headers.keys()}
+        body = resp.text
+        assert "invite-accept@example.com" in body
+        assert "qk_" in body
+
+        pidx = await postgres_pool.fetchval(
+            "SELECT principal_idx FROM qiita.user_identity WHERE issuer = $1 AND subject = $2",
+            jwks_harness.issuer,
+            "invite-accept",
+        )
+        assert pidx is not None
+        _track(auth_client, pidx)
+    finally:
+        app.state.oidc_verifier = saved_verifier
+
+
+async def test_handoff_invitation_flow_records_audit_via_invitation(
+    auth_client, postgres_pool, jwks_harness
+):
+    """Audit detail.via must distinguish invitation acceptance from the
+    cookie-bearing browser and CLI flows so audit-log readers can tell
+    at a glance which entry point produced a given PAT."""
+    from qiita_control_plane.main import app
+
+    saved_verifier = app.state.oidc_verifier
+    app.state.oidc_verifier = _lr_verifier(jwks_harness)
+    try:
+        token = jwks_harness.sign(
+            _lr_claims(jwks_harness, sub="invite-audit", email="invite-audit@example.com")
+        )
+        resp = await auth_client.get(
+            f"/api/v1/auth/handoff?token={token}",
+            follow_redirects=False,
+        )
+        assert resp.status_code == 200, resp.text
+
+        pidx = await postgres_pool.fetchval(
+            "SELECT principal_idx FROM qiita.user_identity WHERE issuer = $1 AND subject = $2",
+            jwks_harness.issuer,
+            "invite-audit",
+        )
+        _track(auth_client, pidx)
+
+        rows = await postgres_pool.fetch(
+            "SELECT detail FROM qiita.auth_event"
+            " WHERE event_type = 'token_mint' AND principal_idx = $1",
+            pidx,
+        )
+        assert rows
+        detail = _detail(rows[-1])
+        assert detail["via"] == "invitation"
+    finally:
+        app.state.oidc_verifier = saved_verifier
+
+
+async def test_handoff_invitation_flow_no_token_returns_400(auth_client):
+    """No cookie + no token still rejected — the token is the JWT
+    AuthRocket appends to the redirect; without it there's nothing to
+    verify. The missing-token check has to fire even in the cookie-less
+    path (it's the only thing standing between an empty GET and a 500)."""
     resp = await auth_client.get(
-        f"/api/v1/auth/handoff?token={token}",
+        "/api/v1/auth/handoff",
         follow_redirects=False,
     )
-    assert resp.status_code == 401
+    assert resp.status_code == 400
+
+
+async def test_handoff_invitation_flow_rejects_invalid_jwt(auth_client, jwks_harness):
+    """A JWT signed by a key the verifier doesn't trust is rejected even
+    in the cookie-less path. The JWT is the *only* authentication signal
+    on the invitation flow; relaxing this check would let anyone with a
+    self-signed JWT mint a PAT."""
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    from qiita_control_plane.main import app
+
+    saved_verifier = app.state.oidc_verifier
+    app.state.oidc_verifier = _lr_verifier(jwks_harness)
+    try:
+        rogue_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        bad_token = jwks_harness.sign(_lr_claims(jwks_harness), key=rogue_key)
+        resp = await auth_client.get(
+            f"/api/v1/auth/handoff?token={bad_token}",
+            follow_redirects=False,
+        )
+        assert resp.status_code == 401
+    finally:
+        app.state.oidc_verifier = saved_verifier
+
+
+async def test_handoff_invitation_flow_does_not_write_cli_login_code(
+    auth_client, postgres_pool, jwks_harness
+):
+    """CLI dispatch must be unreachable from the invitation flow — there
+    is no cookie carrying a loopback port, so the route's CLI branch
+    cannot fire, and no row should appear in qiita.cli_login_code. A
+    regression here (e.g. a future refactor that defaults is_cli to True
+    when the cookie is absent) would silently leak a redeemable PAT
+    plaintext into a DB row no one is listening for."""
+    from qiita_control_plane.main import app
+
+    saved_verifier = app.state.oidc_verifier
+    app.state.oidc_verifier = _lr_verifier(jwks_harness)
+    try:
+        token = jwks_harness.sign(
+            _lr_claims(jwks_harness, sub="invite-no-cli", email="invite-no-cli@example.com")
+        )
+        before = await postgres_pool.fetchval("SELECT count(*) FROM qiita.cli_login_code")
+        resp = await auth_client.get(
+            f"/api/v1/auth/handoff?token={token}",
+            follow_redirects=False,
+        )
+        assert resp.status_code == 200, resp.text
+        after = await postgres_pool.fetchval("SELECT count(*) FROM qiita.cli_login_code")
+        assert after == before
+
+        pidx = await postgres_pool.fetchval(
+            "SELECT principal_idx FROM qiita.user_identity WHERE issuer = $1 AND subject = $2",
+            jwks_harness.issuer,
+            "invite-no-cli",
+        )
+        _track(auth_client, pidx)
+    finally:
+        app.state.oidc_verifier = saved_verifier
 
 
 async def test_handoff_rejects_expired_cookie(auth_client, jwks_harness):
@@ -1023,6 +1162,37 @@ async def test_handoff_rejects_expired_cookie(auth_client, jwks_harness):
         resp = await auth_client.get(
             f"/api/v1/auth/handoff?token={token}",
             cookies=_cookie_jar(cookie),
+            follow_redirects=False,
+        )
+        assert resp.status_code == 401
+    finally:
+        app.state.oidc_verifier = saved_verifier
+
+
+async def test_handoff_rejects_tampered_cookie(auth_client, jwks_harness):
+    """A present cookie with a busted signature must still 401, not
+    silently fall through to the cookie-less invitation lane.
+
+    The handoff handler branches on `if cookie:` (cookie absent → invitation
+    flow) and `except CookieInvalid:` (cookie present-but-invalid → 401).
+    This test pins the second branch: a future refactor that flattens the
+    two — e.g. catching CookieInvalid and re-entering the invitation
+    flow — would silently widen the invitation surface to anyone who can
+    plant a cookie on the user's browser. The signature half is corrupted
+    here (not just an obviously-malformed string) so the test exercises
+    the HMAC check rather than the len(parts) != 2 fast-path."""
+    from qiita_control_plane.main import app
+
+    saved_verifier = app.state.oidc_verifier
+    app.state.oidc_verifier = _lr_verifier(jwks_harness)
+    try:
+        token = jwks_harness.sign(_lr_claims(jwks_harness))
+        valid = _make_login_cookie(cli=False)
+        body, _sig = valid.split(".")
+        tampered = f"{body}.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        resp = await auth_client.get(
+            f"/api/v1/auth/handoff?token={token}",
+            cookies=_cookie_jar(tampered),
             follow_redirects=False,
         )
         assert resp.status_code == 401

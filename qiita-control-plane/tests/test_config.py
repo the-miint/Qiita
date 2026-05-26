@@ -11,11 +11,13 @@ _TEST_SECRET_B64 = base64.b64encode(secrets.token_bytes(32)).decode()
 
 @pytest.fixture(autouse=True)
 def _set_workspace_root(monkeypatch):
-    """Default WORK_TICKET_WORKSPACE_ROOT + UPLOAD_STAGING_ROOT for every
-    test. Tests that specifically exercise an env var's absence or invalid
-    values can `delenv` / `setenv` to override after this fixture runs."""
+    """Default required env vars (WORK_TICKET_WORKSPACE_ROOT,
+    UPLOAD_STAGING_ROOT, CONTACT_EMAIL) for every test. Tests that
+    specifically exercise an env var's absence or invalid values can
+    `delenv` / `setenv` to override after this fixture runs."""
     monkeypatch.setenv("WORK_TICKET_WORKSPACE_ROOT", "/tmp/qiita-test-ws-unused")
     monkeypatch.setenv("UPLOAD_STAGING_ROOT", "/tmp/qiita-test-staging-unused")
+    monkeypatch.setenv("CONTACT_EMAIL", "qiita-test@example.org")
 
 
 def test_settings_has_database_url(monkeypatch):
@@ -223,3 +225,47 @@ def test_settings_upload_staging_root_set_from_env(monkeypatch):
 
     settings = Settings.from_env()
     assert settings.upload_staging_root == Path("/var/lib/qiita/uploads")
+
+
+def test_settings_requires_contact_email(monkeypatch):
+    """Production boot must fail fast if CONTACT_EMAIL is unset — the
+    landing page renders the value into both `mailto:` links, and a
+    placeholder shipping into a public page is exactly the failure mode
+    fail-fast is meant to catch."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.delenv("CONTACT_EMAIL", raising=False)
+
+    from qiita_control_plane.config import Settings
+
+    with pytest.raises(RuntimeError, match="CONTACT_EMAIL"):
+        Settings.from_env()
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    ["not-an-email", "@example.org", "user@", "user@localhost", "user@@example.org"],
+)
+def test_settings_rejects_malformed_contact_email(monkeypatch, bad_value):
+    """Catch the obvious typo / placeholder shapes at boot rather than
+    shipping a broken `mailto:` into the public page."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.setenv("CONTACT_EMAIL", bad_value)
+
+    from qiita_control_plane.config import Settings
+
+    with pytest.raises(RuntimeError, match="CONTACT_EMAIL"):
+        Settings.from_env()
+
+
+def test_settings_contact_email_set_from_env(monkeypatch):
+    """Happy path: a well-formed CONTACT_EMAIL lands on the Settings object."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.setenv("CONTACT_EMAIL", "qiita-help@ucsd.edu")
+
+    from qiita_control_plane.config import Settings
+
+    settings = Settings.from_env()
+    assert settings.contact_email == "qiita-help@ucsd.edu"

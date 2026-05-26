@@ -461,6 +461,19 @@ To rotate, run <code>qiita-admin login</code> again or visit
 """
 
 
+# PAT labels surfaced via `api_token.label` and rendered in
+# `qiita-admin token list` — pin the spelling so a typo in a future
+# refactor doesn't silently change what users see in their token table.
+# Audit `via` discriminators are kept side-by-side so the two stay in
+# lockstep (they describe the same three flows, from two angles).
+_LABEL_CLI = "qiita-admin login"
+_LABEL_BROWSER = "browser login"
+_LABEL_INVITATION = "invitation accept"
+_VIA_CLI = "cli_login"
+_VIA_BROWSER = "browser_login"
+_VIA_INVITATION = "invitation"
+
+
 @router.get("/handoff")
 async def handoff(
     request: Request,
@@ -469,8 +482,7 @@ async def handoff(
 ) -> Response:
     """Receive `?token=<JWT>` from AuthRocket and mint a PAT for the user.
 
-    Verifies the signed login cookie (set by /auth/login) is fresh,
-    verifies the JWT through the configured AuthRocketVerifier, runs the
+    Verifies the JWT through the configured AuthRocketVerifier, runs the
     standard OIDC resolver upsert (first-login, email drift, race
     handling), then mints a PAT scoped to the user's role ceiling.
 
@@ -481,35 +493,56 @@ async def handoff(
     first-login transaction and a deliberately pool-scoped email-collision
     audit that must survive even when this route's transaction rolls back.
 
-    - **CLI flow** (`cli=true` in cookie): store PAT under a one-time code
-      in `qiita.cli_login_code`, redirect browser to
+    Three flows, discriminated by the presence and contents of the login
+    cookie set by `/auth/login`:
+
+    - **CLI flow** (cookie present, `cli=true`): store PAT under a
+      one-time code in `qiita.cli_login_code`, redirect browser to
       `http://127.0.0.1:<port>/?ot_code=<plaintext>` with the cookie
       scrubbed. The CLI's loopback HTTP server captures the code and POSTs
       it back to /auth/cli-exchange.
-    - **Browser flow** (no `cli`): render an HTML page displaying the PAT
-      plaintext for the user to copy into `~/.qiita/token`.
+    - **Browser-login flow** (cookie present, no `cli`): render an HTML
+      page displaying the PAT plaintext for the user to copy into
+      `~/.qiita/token`.
+    - **Invitation flow** (cookie absent): same HTML render as
+      browser-login. AuthRocket's invitation-acceptance redirect sends the
+      user here directly without ever traversing `/auth/login`, so there
+      is no cookie to verify; the JWT's own `exp` is the freshness anchor.
+      No CLI dispatch possible — invitations are browser-only.
+
+    **Freshness anchors differ across the three flows.** CLI and
+    browser-login bound the AuthRocket round-trip with the signed cookie's
+    `auth_handoff_freshness_seconds` timestamp; the invitation flow has
+    only the JWT's `exp` (≥5 min per the realm runbook). `POST /auth/pat`
+    elsewhere in this file enforces `auth_time` freshness via
+    `authrocket_pat_max_auth_age_seconds`, which neither handoff path
+    currently checks. Any future tightening of PAT-mint freshness
+    (`jti`-based deduplication, tighter realm-side JWT TTL, `auth_time`
+    enforcement parity) must consider all three flows together — they
+    share the same PAT-mint code path below but anchor freshness in
+    different places upstream.
     """
     settings = get_settings(request)
     verifier = get_oidc_verifier(request)
 
     cookie = request.cookies.get(LOGIN_COOKIE_NAME)
-    if not cookie:
-        raise HTTPException(
-            status_code=401,
-            detail="login session missing — start at /auth/login",
-        )
-    try:
-        cookie_payload = verify_login_cookie(
-            cookie,
-            settings.hmac_secret_key,
-            max_age_seconds=settings.auth_handoff_freshness_seconds,
-        )
-    except CookieInvalid as exc:
-        # Static-text 401 to avoid leaking which check failed.
-        raise HTTPException(
-            status_code=401,
-            detail="login session invalid or expired",
-        ) from exc
+    cookie_payload: dict | None = None
+    if cookie:
+        try:
+            cookie_payload = verify_login_cookie(
+                cookie,
+                settings.hmac_secret_key,
+                max_age_seconds=settings.auth_handoff_freshness_seconds,
+            )
+        except CookieInvalid as exc:
+            # Static-text 401 to avoid leaking which check failed. A
+            # *present-but-invalid* cookie is rejected rather than treated
+            # as absent — the difference matters because an attacker
+            # cannot forge "no cookie" but can plant a malformed one.
+            raise HTTPException(
+                status_code=401,
+                detail="login session invalid or expired",
+            ) from exc
 
     if not token:
         raise HTTPException(status_code=400, detail="missing token query parameter")
@@ -528,12 +561,19 @@ async def handoff(
     # Mint the PAT against the user's role ceiling. The scope set comes from
     # role_ceiling — same as POST /auth/pat with scopes=None — so the auto-
     # minted PAT mirrors what an interactive PAT mint would produce.
-    is_cli = bool(cookie_payload.get("cli"))
+    is_cli = bool(cookie_payload and cookie_payload.get("cli"))
+    is_invitation = cookie_payload is None
     scopes = sorted(role_ceiling(principal.system_role))
     expires_at = datetime.now(UTC) + timedelta(days=settings.token_default_ttl_days)
-    # Label names the CLI that minted the PAT. `qiita-admin` is the operator
-    # CLI; a future end-user `qiita` CLI would mint with its own label.
-    label = "qiita-admin login" if is_cli else "browser login"
+    # Label + audit `via` distinguish the three entry points so audit-log
+    # readers and end users (via `qiita-admin token list`) can tell at a
+    # glance which flow produced a given PAT.
+    if is_cli:
+        label, via = _LABEL_CLI, _VIA_CLI
+    elif is_invitation:
+        label, via = _LABEL_INVITATION, _VIA_INVITATION
+    else:
+        label, via = _LABEL_BROWSER, _VIA_BROWSER
 
     # CLI flow: generate the one-time code up front so its cli_login_code
     # INSERT can join the mint + audit transaction below.
@@ -569,7 +609,7 @@ async def handoff(
                 detail={
                     "token_idx": token_idx,
                     "kind": "pat",
-                    "via": "cli_login" if is_cli else "browser_login",
+                    "via": via,
                 },
             )
             if is_cli:
