@@ -1014,12 +1014,12 @@ End-to-end execution runs through the end-user `qiita` CLI
 
 The walkthrough drives the smoke from a fresh user PAT through to a
 `COMPLETED` ticket and a `reads.parquet` artifact, with verification
-commands at each layer. Prerequisites that remain operator-side after
-step 10 — `qiita-admin actions sync --workflows-dir
-/opt/qiita/control-plane/workflows` and compute service-account
-provisioning per
-[`compute-service-account-provisioning.md`](compute-service-account-provisioning.md) —
-are linked from the walkthrough.
+commands at each layer. Compute service-account provisioning per
+[`compute-service-account-provisioning.md`](compute-service-account-provisioning.md)
+is the one prerequisite that remains operator-side after step 10 —
+`qiita-admin actions sync` is now run automatically by
+`deploy/activate.sh` against `/opt/qiita/workflows/` (synced from
+`workflows/` in the repo) every redeploy.
 
 ## Subsequent deploys
 

@@ -34,6 +34,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"   # populates RSYNC_EXCLUDES
 rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$INCOMING/qiita-common/"              /opt/qiita/qiita-common/
 rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$INCOMING/qiita-control-plane/"       /opt/qiita/control-plane/
 rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$INCOMING/qiita-compute-orchestrator/" /opt/qiita/compute-orchestrator/
+# workflows/ is YAML the CP runner reads at request time (qiita-admin
+# actions sync below upserts the YAML-authoritative columns into
+# qiita.action). Out-of-tree from the three Python packages above so
+# it ships independently of qiita-control-plane source.
+rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$INCOMING/workflows/"                 /opt/qiita/workflows/
 
 # --reinstall-package qiita-common forces uv to rebuild the path-dep when
 # qiita-common's source changes without a version bump; without this,
@@ -41,6 +46,26 @@ rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$INCOMING/qiita-compute-orchestrator/"
 # (see CLAUDE.md "Cross-package staleness").
 ( cd /opt/qiita/control-plane        && "$UV" sync --no-dev --reinstall-package qiita-common )
 ( cd /opt/qiita/compute-orchestrator && "$UV" sync --no-dev --reinstall-package qiita-common )
+
+# Upsert YAML-authoritative action columns into qiita.action. Runs as
+# qiita-api so DATABASE_URL is sourced from the CP env file the user
+# already reads. Idempotent: re-runs converge to the YAML state without
+# touching operational columns (enabled / first_seen_at / disabled_*).
+# Skipped on first deploy when /etc/qiita/control-plane.env doesn't yet
+# exist — same gate as the systemd restarts below.
+if [ -r /etc/qiita/control-plane.env ]; then
+    sudo -u qiita-api bash -c '
+        set -euo pipefail
+        set -a
+        # shellcheck disable=SC1091
+        source /etc/qiita/control-plane.env
+        set +a
+        /opt/qiita/control-plane/.venv/bin/qiita-admin \
+            actions sync --workflows-dir /opt/qiita/workflows
+    '
+else
+    echo "skipping qiita-admin actions sync — /etc/qiita/control-plane.env not present" >&2
+fi
 
 # Fail loud if uv put Python somewhere a service user can't read it.
 for venv in /opt/qiita/control-plane/.venv /opt/qiita/compute-orchestrator/.venv; do
