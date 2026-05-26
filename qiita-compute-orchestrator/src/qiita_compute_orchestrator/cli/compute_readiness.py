@@ -1,14 +1,14 @@
 """qiita compute-readiness — operator-facing diagnostic.
 
-Exercises the path qiita-job needs end-to-end so the next deploy site
-doesn't rediscover gaps interactively. The first end-to-end
-fastq-to-parquet smoke (May 2026) surfaced 9 distinct gaps, several
-of which only manifested when SLURM submitted a job to a compute
-node: SLURM_NATIVE_PYTHON pointing at a non-visible venv, HOME unset
-breaking DuckDB's extension cache, /etc/qiita/*.token not readable
-from compute nodes, a stale JWT silently authenticating as the prior
-tester. Discovery was iterative — submit a workflow, watch it fail,
-ssh to the node to probe. This command compresses that into one run.
+Exercises the path qiita-job needs end-to-end and reports per-check
+status so operators can diagnose cluster-side misconfig without
+submitting a real workflow and reading SLURM job logs. The classes of
+problem this surfaces: native-step launcher's Python not visible from
+a compute node, shared filesystem mount missing on the cluster, HOME
+unset breaking job-side scratch writes, /etc/qiita/*.token unreadable
+from a compute node, JWT whose `sun` no longer matches
+`SLURMRESTD_USER_NAME`, control plane unreachable through nginx with
+the configured CO→CP token.
 
 Two phases:
 
@@ -50,9 +50,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import base64
 import json
 import os
+import secrets
 import shlex
 import sys
 import time
@@ -63,6 +63,13 @@ from typing import Any
 import httpx
 
 from ..config import Settings
+from ..slurm.client import (
+    SlurmrestdClient,
+    SlurmrestdError,
+    TerminalSlurmState,
+    decode_jwt_payload,
+)
+from ..slurm.payload import number_envelope
 
 # Probe job constants. Conservative: the probe is purely diagnostic, no
 # need to fight for big allocations.
@@ -101,28 +108,6 @@ class CheckResult:
 # ---------------------------------------------------------------------------
 
 
-def _decode_jwt_payload(token: str) -> dict[str, Any]:
-    """Decode the payload segment of a JWT to a Python dict. Stdlib
-    only — signature verification is slurmrestd's job; we only need
-    the claims to be readable.
-
-    Mirrors the decode in `slurm/client._verify_jwt_sun_matches`;
-    duplicated here because that helper raises specific RuntimeErrors
-    suited to boot-time fail-fast, whereas this CLI wants to surface
-    each subclaim as a separate CheckResult.
-    """
-    parts = token.split(".")
-    if len(parts) != 3:
-        raise ValueError(f"expected 3 segments (header.payload.signature), got {len(parts)}")
-    payload_segment = parts[1]
-    padding = "=" * (-len(payload_segment) % 4)
-    payload_bytes = base64.urlsafe_b64decode(payload_segment + padding)
-    payload = json.loads(payload_bytes)
-    if not isinstance(payload, dict):
-        raise ValueError(f"payload is not a JSON object: {payload!r}")
-    return payload
-
-
 def check_jwt(jwt_path: Path, expected_user: str) -> list[CheckResult]:
     """Read SLURM JWT, decode, validate `sun` matches the configured
     user and `exp` is in the future. Each subclaim is its own check
@@ -140,8 +125,8 @@ def check_jwt(jwt_path: Path, expected_user: str) -> list[CheckResult]:
     results.append(CheckResult("jwt-readable", "pass", str(jwt_path)))
 
     try:
-        payload = _decode_jwt_payload(token)
-    except (ValueError, json.JSONDecodeError) as exc:
+        payload = decode_jwt_payload(token, jwt_path)
+    except SlurmrestdError as exc:
         results.append(CheckResult("jwt-shape", "fail", str(exc)))
         return results
     results.append(
@@ -239,19 +224,27 @@ def build_probe_script(*, shared_filesystem_root: str) -> str:
     # `set -u` is intentionally off so a missing env var isn't a hard
     # script error — we want the report line, not a non-zero exit.
     sf_default = shlex.quote(shared_filesystem_root)
+    # The probe reads `QIITA_NATIVE_PYTHON` (not `SLURM_NATIVE_PYTHON`)
+    # to dodge the `SLURM_*` namespace — slurmd/slurmctld populate
+    # many `SLURM_*` vars on the compute node and on some sites reset
+    # user-set vars in that namespace, which would silently defeat
+    # the override. The orchestrator-host env var the operator sets
+    # in /etc/qiita/compute-orchestrator.env stays
+    # `SLURM_NATIVE_PYTHON`; only the probe job's per-job env uses
+    # the renamed key.
     return f"""#!/bin/bash
-# Stay forgiving: a missing env var should produce a `*-set=no` line,
+# Stay forgiving: a missing env var should produce a `*=fail` line,
 # not abort the probe and lose all subsequent diagnostics.
 set +u
 echo "{_PROBE_LINE_PREFIX} hostname=$(hostname)"
 echo "{_PROBE_LINE_PREFIX} uid=$(id -u)"
 echo "{_PROBE_LINE_PREFIX} user=$(id -un)"
 
-PYTHON="${{SLURM_NATIVE_PYTHON:-python}}"
+PYTHON="${{QIITA_NATIVE_PYTHON:-python}}"
 if [ -x "$PYTHON" ]; then
     echo "{_PROBE_LINE_PREFIX} native-python-on-compute=ok path=$PYTHON"
 else
-    echo "{_PROBE_LINE_PREFIX} native-python-on-compute=missing path=$PYTHON"
+    echo "{_PROBE_LINE_PREFIX} native-python-on-compute=fail path=$PYTHON"
 fi
 
 if "$PYTHON" -c 'import qiita_compute_orchestrator.jobs' 2>/dev/null; then
@@ -262,15 +255,15 @@ fi
 
 SF="${{SHARED_FILESYSTEM_ROOT:-{sf_default}}}"
 if [ -d "$SF" ]; then
-    echo "{_PROBE_LINE_PREFIX} shared-fs-visible=yes path=$SF"
+    echo "{_PROBE_LINE_PREFIX} shared-fs-visible=ok path=$SF"
     PROBE_DIR="$SF/.compute-readiness.$$"
     if mkdir "$PROBE_DIR" 2>/dev/null && rmdir "$PROBE_DIR"; then
-        echo "{_PROBE_LINE_PREFIX} shared-fs-writable=yes"
+        echo "{_PROBE_LINE_PREFIX} shared-fs-writable=ok"
     else
-        echo "{_PROBE_LINE_PREFIX} shared-fs-writable=no"
+        echo "{_PROBE_LINE_PREFIX} shared-fs-writable=fail"
     fi
 else
-    echo "{_PROBE_LINE_PREFIX} shared-fs-visible=no path=$SF"
+    echo "{_PROBE_LINE_PREFIX} shared-fs-visible=fail path=$SF"
 fi
 
 CP_URL="${{QIITA_CP_URL:-}}"
@@ -282,8 +275,8 @@ if [ -n "$CP_URL" ] && [ -n "$TOK" ]; then
         echo "{_PROBE_LINE_PREFIX} cp-from-compute=fail cp_url=$CP_URL"
     fi
 else
-    CPSET=$([ -n "$CP_URL" ] && echo y || echo n)
-    TOKSET=$([ -n "$TOK" ] && echo y || echo n)
+    CPSET=$([ -n "$CP_URL" ] && echo ok || echo fail)
+    TOKSET=$([ -n "$TOK" ] && echo ok || echo fail)
     echo "{_PROBE_LINE_PREFIX} cp-from-compute=skip cp_url_set=$CPSET token_set=$TOKSET"
 fi
 exit 0
@@ -301,8 +294,11 @@ def build_probe_submit_payload(
     encodes qiita-step contract (params.json, mounts, native vs
     container dispatch) the probe doesn't need."""
     assert settings.slurm is not None, "build_probe_submit_payload requires slurm settings"
+    # `QIITA_NATIVE_PYTHON` (not `SLURM_NATIVE_PYTHON`) so the value
+    # survives slurmd's `SLURM_*` namespace handling on the compute
+    # node. See `build_probe_script` for the corresponding read.
     env: dict[str, str] = {
-        "SLURM_NATIVE_PYTHON": settings.slurm.native_python,
+        "QIITA_NATIVE_PYTHON": settings.slurm.native_python,
         "SHARED_FILESYSTEM_ROOT": settings.shared_filesystem_root,
     }
     if settings.cp_url:
@@ -318,11 +314,10 @@ def build_probe_submit_payload(
         # there anyway.
         "current_working_directory": "/tmp",
         "environment": [f"{k}={v}" for k, v in sorted(env.items())],
-        # slurmrestd wants the typed-numeric envelope here.
-        "memory_per_node": {"number": _PROBE_MEM_MB, "set": True, "infinite": False},
+        "memory_per_node": number_envelope(_PROBE_MEM_MB),
         "tasks": 1,
         "cpus_per_task": _PROBE_CPU,
-        "time_limit": {"number": _PROBE_TIME_LIMIT_MINUTES, "set": True, "infinite": False},
+        "time_limit": number_envelope(_PROBE_TIME_LIMIT_MINUTES),
         "standard_output": str(log_path),
         "standard_error": str(log_path),
     }
@@ -331,18 +326,11 @@ def build_probe_submit_payload(
     return {"script": script, "job": job}
 
 
-_TERMINAL_STATES = {
-    "COMPLETED",
-    "FAILED",
-    "CANCELLED",
-    "TIMEOUT",
-    "NODE_FAIL",
-    "BOOT_FAIL",
-    "DEADLINE",
-    "OUT_OF_MEMORY",
-    "PREEMPTED",
-    "SPECIAL_EXIT",
-}
+# Derived from TerminalSlurmState so a new state added there is
+# automatically picked up by the probe poll loop — otherwise the
+# probe would hang until probe_timeout_seconds for any future
+# terminal state we forget to mirror.
+_TERMINAL_STATES = frozenset(s.value for s in TerminalSlurmState)
 
 
 async def submit_probe_and_collect(
@@ -351,17 +339,23 @@ async def submit_probe_and_collect(
     poll_interval_seconds: float = _DEFAULT_POLL_INTERVAL_SECONDS,
     probe_timeout_seconds: float = _DEFAULT_PROBE_TIMEOUT_SECONDS,
     log_dir: Path | None = None,
+    log_path: Path | None = None,
 ) -> list[CheckResult]:
     """End-to-end probe: build script + payload, submit via the
     configured slurmrestd, poll until terminal or timeout, read the
-    log file, parse `compute-readiness:` lines into CheckResults."""
-    # Lazy import so this module is loadable in tests that don't have
-    # an httpx-backed slurmrestd available.
-    from ..slurm.client import SlurmrestdClient
+    log file, parse `compute-readiness:` lines into CheckResults.
 
+    `log_path` is injectable for tests (which pre-stage a log file at
+    a known path). Production omits it and a path is computed from
+    `log_dir` + pid + random suffix."""
     assert settings.slurm is not None, "compute-readiness probe requires COMPUTE_BACKEND=slurm"
-    log_dir = log_dir or Path("/tmp")
-    log_path = log_dir / f"qiita-compute-readiness.{os.getpid()}.log"
+    if log_path is None:
+        log_dir = log_dir or Path("/tmp")
+        # `pid + random suffix` rather than pid alone: pids reuse on
+        # long-running hosts, and two concurrent operators / retries
+        # would otherwise collide on the log path (and a stale log from
+        # a previous run might be read by the next).
+        log_path = log_dir / f"qiita-compute-readiness.{os.getpid()}.{secrets.token_hex(4)}.log"
     script = build_probe_script(shared_filesystem_root=settings.shared_filesystem_root)
     payload = build_probe_submit_payload(script=script, settings=settings, log_path=log_path)
 
@@ -475,8 +469,14 @@ def _parse_probe_log(log_text: str) -> list[CheckResult]:
     return results
 
 
-_PROBE_PASS_VALUES = {"ok", "yes"}
-_PROBE_FAIL_VALUES = {"fail", "no", "missing"}
+# Probe-script value alphabet. The bash script in `build_probe_script`
+# emits exactly these literals. Kept as module constants so the
+# parity test `test_probe_script_emits_only_known_values` enforces
+# that the two sides stay in sync — adding a new state on one side
+# without the other is the contract-drift the strict default-to-fail
+# rule below is designed to surface.
+_PROBE_PASS_VALUES = {"ok"}
+_PROBE_FAIL_VALUES = {"fail"}
 _PROBE_SKIP_VALUES = {"skip"}
 # `hostname`, `uid`, `user` are informational — never a fail condition;
 # the operator reads the actual value to confirm the job ran as the

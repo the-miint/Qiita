@@ -1007,16 +1007,29 @@ default, submits a minimal SLURM probe-job that runs the same checks
 on a compute node — including whether the orchestrator's venv is
 visible there and whether the compute node can reach the CP.
 
+Run as `qiita-orch` with `/etc/qiita/compute-orchestrator.env` sourced
+— the diagnostic needs `SLURMRESTD_URL` / `SLURMRESTD_JWT_PATH` /
+`CO_TO_CP_TOKEN_PATH` / etc., which the file installs `0440
+root:qiita-orch` (step 9b); the operator's UID can't read it directly:
+
 ```bash
-# [operator]
-qiita-admin compute-readiness
+# [admin]
+sudo -u qiita-orch bash -lc '
+    set -a
+    # shellcheck disable=SC1091
+    source /etc/qiita/compute-orchestrator.env
+    set +a
+    qiita-admin compute-readiness
+'
 ```
 
-Expected: every row `✓ pass` and a summary like `8 pass, 0 fail, N
-skip`. `skip` is non-fatal (e.g. `SLURM_NATIVE_PYTHON=python` skips
-the host-side native-python check because the path resolution depends
-on the compute node's PATH). Any `✗ fail` row names the misconfig:
-JWT mismatch / expired, CP unreachable, native-python missing on the
+Expected: zero `✗ fail` rows; the summary line reads
+`N pass, 0 fail, M skip`. `skip` rows are non-fatal — they mean a
+specific check didn't apply (e.g. `SLURM_NATIVE_PYTHON=python`
+skips the host-side native-python check because the path resolution
+depends on the compute node's PATH; missing `QIITA_CP_URL` skips the
+CP reachability check). Any `✗ fail` row names the misconfig: JWT
+mismatch / expired, CP unreachable, native-python missing on the
 compute node, shared FS not visible, etc. Re-run step 9b / 9c with the
 diagnosis applied before continuing.
 

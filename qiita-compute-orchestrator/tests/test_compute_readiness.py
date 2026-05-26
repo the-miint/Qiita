@@ -190,8 +190,8 @@ compute-readiness: uid=1234
 compute-readiness: user=qiita-job
 compute-readiness: native-python-on-compute=ok path=/opt/qiita/co/.venv/bin/python
 compute-readiness: native-import=ok
-compute-readiness: shared-fs-visible=yes path=/scratch/qiita
-compute-readiness: shared-fs-writable=yes
+compute-readiness: shared-fs-visible=ok path=/scratch/qiita
+compute-readiness: shared-fs-writable=ok
 compute-readiness: cp-from-compute=ok cp_url=https://qiita.example.org
 trailing line outside the prefix
 """
@@ -211,10 +211,10 @@ trailing line outside the prefix
 
 def test_parse_probe_log_failures_propagate():
     log = """\
-compute-readiness: native-python-on-compute=missing path=/opt/qiita/co/.venv/bin/python
+compute-readiness: native-python-on-compute=fail path=/opt/qiita/co/.venv/bin/python
 compute-readiness: native-import=fail
-compute-readiness: shared-fs-visible=no path=/scratch/qiita
-compute-readiness: cp-from-compute=skip cp_url_set=n token_set=n
+compute-readiness: shared-fs-visible=fail path=/scratch/qiita
+compute-readiness: cp-from-compute=skip cp_url_set=fail token_set=fail
 """
     statuses = {r.name: r.status for r in cr._parse_probe_log(log)}
     assert statuses == {
@@ -223,6 +223,38 @@ compute-readiness: cp-from-compute=skip cp_url_set=n token_set=n
         "probe/shared-fs-visible": "fail",
         "probe/cp-from-compute": "skip",
     }
+
+
+def test_probe_script_emits_only_known_values():
+    """Script-vs-parser contract test. The bash probe script's emitted
+    `<key>=<value>` literals must all be drawn from the parser's known
+    alphabet (pass / fail / skip), otherwise the parser would reject
+    them as contract drift and the report would silently show every
+    drifted line as `fail`.
+
+    Pulls every `compute-readiness: <key>=<value>` token out of the
+    script string and asserts each `<value>` is recognized. Excludes
+    the informational keys (hostname/uid/user) whose values are
+    runtime-substituted shell expansions, not literal status strings.
+    """
+    import re
+
+    script = cr.build_probe_script(shared_filesystem_root="/scratch/qiita")
+    known = cr._PROBE_PASS_VALUES | cr._PROBE_FAIL_VALUES | cr._PROBE_SKIP_VALUES
+    # Match `<prefix> <key>=<value>` where value is a bare word (no
+    # `$(...)`, no quotes, no shell expansion). Informational lines
+    # like `hostname=$(hostname)` are deliberately excluded by the
+    # `[a-z]+` value class.
+    pattern = re.compile(rf"{re.escape(cr._PROBE_LINE_PREFIX)} ([a-z][a-z0-9-]*)=([a-z]+)\b")
+    found = pattern.findall(script)
+    assert found, "script-vs-parser parity check found no testable lines"
+    for key, value in found:
+        if key in cr._INFORMATIONAL_KEYS:
+            continue
+        assert value in known, (
+            f"script emits {key}={value!r} but parser's alphabet is {sorted(known)};"
+            " update _PROBE_*_VALUES or the script to keep them in sync."
+        )
 
 
 def test_parse_probe_log_unknown_value_defaults_to_fail():
@@ -252,19 +284,18 @@ async def test_submit_probe_and_collect_happy_path(monkeypatch, tmp_path):
     jwt_path.write_text(_make_jwt("qiita-orch"))
     settings = _make_settings(jwt_path)
 
-    # Stash the log under tmp_path; submit_probe_and_collect computes
-    # log_path = log_dir / f"qiita-compute-readiness.{pid}.log".
+    # submit_probe_and_collect accepts log_path explicitly for tests
+    # so we can pre-stage a deterministic file. Production omits it
+    # and the path is computed from pid + random suffix.
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
-    import os as _os
-
-    log_path = log_dir / f"qiita-compute-readiness.{_os.getpid()}.log"
+    log_path = log_dir / "probe.log"
     log_path.write_text(
         "compute-readiness: hostname=node42\n"
         "compute-readiness: native-python-on-compute=ok path=/x/python\n"
         "compute-readiness: native-import=ok\n"
-        "compute-readiness: shared-fs-visible=yes path=/scratch/qiita\n"
-        "compute-readiness: shared-fs-writable=yes\n"
+        "compute-readiness: shared-fs-visible=ok path=/scratch/qiita\n"
+        "compute-readiness: shared-fs-writable=ok\n"
         "compute-readiness: cp-from-compute=ok cp_url=https://qiita.example.org\n"
     )
 
@@ -282,12 +313,9 @@ async def test_submit_probe_and_collect_happy_path(monkeypatch, tmp_path):
             )
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
-    # Patch SlurmrestdClient to use our MockTransport. The submit_probe_and_collect
-    # function imports SlurmrestdClient lazily inside its body; patch the source
-    # module so the lazy import picks up our patched class.
-    from qiita_compute_orchestrator.slurm import client as slurm_client_module
-
-    real_cls = slurm_client_module.SlurmrestdClient
+    # Patch SlurmrestdClient as imported into the `cr` module so the
+    # MockTransport wires into `submit_probe_and_collect`'s `async with`.
+    real_cls = cr.SlurmrestdClient
 
     class _PatchedClient(real_cls):
         def __init__(self, *args, **kwargs):
@@ -298,13 +326,13 @@ async def test_submit_probe_and_collect_happy_path(monkeypatch, tmp_path):
             )
             super().__init__(*args, **kwargs)
 
-    monkeypatch.setattr(slurm_client_module, "SlurmrestdClient", _PatchedClient)
+    monkeypatch.setattr(cr, "SlurmrestdClient", _PatchedClient)
 
     results = await cr.submit_probe_and_collect(
         settings,
         poll_interval_seconds=0,
         probe_timeout_seconds=30,
-        log_dir=log_dir,
+        log_path=log_path,
     )
     by_name = {r.name: r for r in results}
     assert by_name["slurm-submit"].status == "pass"
@@ -333,7 +361,11 @@ def test_build_probe_submit_payload_includes_required_fields(tmp_path):
     env = dict(item.split("=", 1) for item in job["environment"])
     assert env["QIITA_CP_URL"] == "https://qiita.example.org"
     assert env["CO_TO_CP_TOKEN"] == "probe-co-to-cp-token"
-    assert env["SLURM_NATIVE_PYTHON"] == settings.slurm.native_python
+    # `QIITA_NATIVE_PYTHON`, not `SLURM_NATIVE_PYTHON`: slurmd handles
+    # its own `SLURM_*` namespace on the compute node and may reset
+    # user-set vars in it. Renaming sidesteps the collision.
+    assert env["QIITA_NATIVE_PYTHON"] == settings.slurm.native_python
+    assert "SLURM_NATIVE_PYTHON" not in env
     # qos is omitted when settings.slurm.qos is empty.
     assert "qos" not in job
 

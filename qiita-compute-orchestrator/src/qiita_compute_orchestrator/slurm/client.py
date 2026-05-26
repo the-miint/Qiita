@@ -110,29 +110,26 @@ class TerminalSlurmState(StrEnum):
     SPECIAL_EXIT = "SPECIAL_EXIT"
 
 
-def _verify_jwt_sun_matches(token: str, expected_user: str, jwt_path: Path) -> None:
-    """Refuse to start with a SLURM JWT whose `sun` claim names a different
-    user than SLURMRESTD_USER_NAME.
+def decode_jwt_payload(token: str, jwt_path: Path) -> dict[str, Any]:
+    """Decode a JWT's payload segment to a Python dict.
 
-    Surfaced by the first smoke: a stale JWT (sun=<previous-tester>)
-    lingered in memory and slurmrestd happily authenticated jobs as
-    that user. A boot-time check catches the mismatch loudly so the
-    operator notices before any work runs as the wrong identity.
+    Stdlib only — signature verification is slurmrestd's job, and we
+    don't want to pull in a cryptographic JWT library just for a
+    claim read.
 
-    Decodes the standard `header.payload.signature` JWT shape, base64-
-    urlsafe-decoding the middle segment to JSON and reading the `sun`
-    claim. Stdlib only — we don't have or want a cryptographic JWT
-    library here; signature verification is slurmrestd's job and only
-    the claim has to match the configured user.
-
-    Tokens that aren't shaped like a JWT (no dots, payload not JSON, no
-    sun claim) raise RuntimeError so a corrupt or mistyped token file
-    fails the boot the same way a sun-mismatch does.
+    Raises `SlurmrestdError` (not `RuntimeError`) so callers that hit
+    this via the 401-retry rotation path (`_load_jwt` → `_headers` →
+    `_request_with_jwt_retry`) get a typed error that
+    `SlurmBackend._classify_submit_error` can handle uniformly; the
+    boot-time path (construction) still surfaces it as an
+    `__init__`-fatal because `SlurmrestdError` is a `RuntimeError`
+    subclass.
     """
     parts = token.split(".")
     if len(parts) != 3:
-        raise RuntimeError(
-            f"SLURM JWT at {jwt_path} is not a 3-segment JWT (header.payload.signature)"
+        raise SlurmrestdError(
+            f"SLURM JWT at {jwt_path} is not a 3-segment JWT (header.payload.signature)",
+            url=str(jwt_path),
         )
     payload_segment = parts[1]
     # JWT uses unpadded base64-urlsafe; pad before decoding.
@@ -140,23 +137,51 @@ def _verify_jwt_sun_matches(token: str, expected_user: str, jwt_path: Path) -> N
     try:
         payload_bytes = base64.urlsafe_b64decode(payload_segment + padding)
     except (ValueError, TypeError) as exc:
-        raise RuntimeError(
-            f"SLURM JWT at {jwt_path} payload is not valid base64-urlsafe: {exc}"
+        raise SlurmrestdError(
+            f"SLURM JWT at {jwt_path} payload is not valid base64-urlsafe: {exc}",
+            url=str(jwt_path),
         ) from exc
     try:
         payload = json.loads(payload_bytes)
     except ValueError as exc:
-        raise RuntimeError(f"SLURM JWT at {jwt_path} payload is not valid JSON: {exc}") from exc
-    sun = payload.get("sun") if isinstance(payload, dict) else None
+        raise SlurmrestdError(
+            f"SLURM JWT at {jwt_path} payload is not valid JSON: {exc}",
+            url=str(jwt_path),
+        ) from exc
+    if not isinstance(payload, dict):
+        raise SlurmrestdError(
+            f"SLURM JWT at {jwt_path} payload is not a JSON object: {payload!r}",
+            url=str(jwt_path),
+        )
+    return payload
+
+
+def _verify_jwt_sun_matches(token: str, expected_user: str, jwt_path: Path) -> None:
+    """Refuse to start with a SLURM JWT whose `sun` claim names a
+    different user than SLURMRESTD_USER_NAME — otherwise slurmrestd
+    will authenticate jobs as whoever the JWT was minted for, not the
+    orchestrator's configured user.
+
+    Reached at boot (construction) and during 401-retry rotation
+    (`_load_jwt` → `_headers`). Both paths want the same shape of
+    failure: `SlurmrestdError` typed so the retry classifier
+    distinguishes a sun-mismatch from other 401 causes, and a
+    `RuntimeError` subtype so boot-time mismatches still crash
+    `__init__`.
+    """
+    payload = decode_jwt_payload(token, jwt_path)
+    sun = payload.get("sun")
     if not isinstance(sun, str):
-        raise RuntimeError(
-            f"SLURM JWT at {jwt_path} payload is missing a string `sun` claim: {payload!r}"
+        raise SlurmrestdError(
+            f"SLURM JWT at {jwt_path} payload is missing a string `sun` claim: {payload!r}",
+            url=str(jwt_path),
         )
     if sun != expected_user:
-        raise RuntimeError(
+        raise SlurmrestdError(
             f"JWT sun={sun!r} does not match SLURMRESTD_USER_NAME={expected_user!r} —"
             " refusing to start with stale JWT (was this JWT minted by the wrong user,"
-            " or before the qiita-slurm-jwt-refresh.timer was provisioned?)"
+            " or before the qiita-slurm-jwt-refresh.timer was provisioned?)",
+            url=str(jwt_path),
         )
 
 

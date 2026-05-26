@@ -44,7 +44,7 @@ from typing import Any
 from qiita_common.actions import NATIVE_MODULE_PREFIX, BaselineResources
 
 
-def _number_envelope(value: int) -> dict[str, Any]:
+def number_envelope(value: int) -> dict[str, Any]:
     """slurmrestd's typed-numeric envelope. Used for memory / cpus /
     time fields so missing values can be expressed as set=False rather
     than a sentinel like 0 (which would mean "use default partition
@@ -241,10 +241,10 @@ def build_job_submit_payload(
         # slurmrestd takes environment as a list of "KEY=VAL" strings.
         # Sorted for determinism so payload tests are stable.
         "environment": [f"{k}={v}" for k, v in sorted(env.items())],
-        "memory_per_node": _number_envelope(baseline_resources.mem_gb * 1024),
+        "memory_per_node": number_envelope(baseline_resources.mem_gb * 1024),
         "tasks": 1,
         "cpus_per_task": baseline_resources.cpu,
-        "time_limit": _number_envelope(_walltime_minutes(baseline_resources.walltime)),
+        "time_limit": number_envelope(_walltime_minutes(baseline_resources.walltime)),
         "standard_output": str(log_stdout),
         "standard_error": str(log_stderr),
     }
