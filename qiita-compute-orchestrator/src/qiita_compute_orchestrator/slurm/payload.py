@@ -85,15 +85,25 @@ def _build_script(
     return f"#!/bin/bash\nset -euo pipefail\n{cmd}\n"
 
 
-def _build_native_script(*, module: str) -> str:
+def _build_native_script(*, module: str, python: str) -> str:
     """Shell launcher for a native-step job. Invokes the shared
     Python launcher (`jobs/__main__.py`) with the short job name,
     which reads `$QIITA_INPUT_PATH/params.json` and routes through
     `run_native_job` exactly as `LocalBackend` does in-process —
     same dispatcher, same error classification, same manifest
-    contract."""
+    contract.
+
+    `python` is the Python interpreter the SBATCH script invokes. The
+    caller (build_job_submit_payload) threads it from
+    Settings.slurm.native_python, which the orchestrator resolves from
+    SLURM_NATIVE_PYTHON (default "python"). Sites whose compute nodes
+    don't have a Python with qiita_compute_orchestrator on PATH point
+    this at an absolute interpreter path under a shared-filesystem venv.
+    """
+    if not python:
+        raise ValueError("python must be a non-empty string")
     short = module.removeprefix(NATIVE_MODULE_PREFIX)
-    cmd = f"srun python -m qiita_compute_orchestrator.jobs --job {short}"
+    cmd = f"srun {python} -m qiita_compute_orchestrator.jobs --job {short}"
     return f"#!/bin/bash\nset -euo pipefail\n{cmd}\n"
 
 
@@ -113,6 +123,7 @@ def build_job_submit_payload(
     partition: str,
     account: str,
     extra_env: dict[str, str] | None = None,
+    native_python: str = "python",
 ) -> dict[str, Any]:
     """Build the slurmrestd `POST /slurm/{version}/job/submit` JSON body.
 
@@ -197,7 +208,7 @@ def build_job_submit_payload(
         # Native: no bind mounts — the launcher runs in the
         # orchestrator's installed Python env on the compute node,
         # reading/writing host paths directly via QIITA_*_PATH.
-        script = _build_native_script(module=module)
+        script = _build_native_script(module=module, python=native_python)
     else:
         # Container: bind mounts let apptainer see input_path /
         # output_path under the same names from inside the container.

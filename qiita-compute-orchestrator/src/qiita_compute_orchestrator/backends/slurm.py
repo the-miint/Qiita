@@ -83,12 +83,14 @@ class SlurmBackend(ComputeBackend):
         account: str,
         poll_interval_seconds: int,
         job_timeout_seconds: int,
+        native_python: str = "python",
     ) -> None:
         self._client = client
         self._partition = partition
         self._account = account
         self._poll_interval = poll_interval_seconds
         self._job_timeout = job_timeout_seconds
+        self._native_python = native_python
 
     async def aclose(self) -> None:
         """Close the underlying httpx client so asyncio doesn't warn
@@ -194,6 +196,7 @@ class SlurmBackend(ComputeBackend):
             log_stderr=logs_path / "stderr",
             partition=self._partition,
             account=self._account,
+            native_python=self._native_python,
         )
 
         try:

@@ -75,6 +75,14 @@ class SlurmSettings:
     api_version: str  # default v0.0.40
     poll_interval_seconds: int
     job_timeout_seconds: int
+    # Python executable the native-step SBATCH script invokes via
+    # `srun <native_python> -m qiita_compute_orchestrator.jobs ...`.
+    # Default "python" assumes compute nodes already have a Python on
+    # PATH with qiita_compute_orchestrator installed. Sites where the
+    # cluster does NOT carry the orchestrator's venv set this to an
+    # absolute path on the shared filesystem (the orchestrator host's
+    # venv interpreter, visible from compute nodes).
+    native_python: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +144,7 @@ def _resolve_slurm_settings() -> SlurmSettings:
         job_timeout_seconds=int(
             os.environ.get("SLURM_JOB_TIMEOUT_SECONDS", str(DEFAULT_SLURM_JOB_TIMEOUT_SECONDS))
         ),
+        native_python=os.environ.get("SLURM_NATIVE_PYTHON", "python"),
     )
 
 

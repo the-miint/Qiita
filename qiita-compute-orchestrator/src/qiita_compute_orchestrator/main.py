@@ -35,6 +35,7 @@ def _build_backend(settings: Settings) -> ComputeBackend:
             account=settings.slurm.account,
             poll_interval_seconds=settings.slurm.poll_interval_seconds,
             job_timeout_seconds=settings.slurm.job_timeout_seconds,
+            native_python=settings.slurm.native_python,
         )
     raise RuntimeError(f"unknown COMPUTE_BACKEND={settings.backend_type!r}")
 

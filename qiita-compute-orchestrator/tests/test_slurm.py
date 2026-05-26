@@ -209,12 +209,35 @@ def native_kwargs(baseline, tmp_path):
 def test_native_payload_script_invokes_python_m_launcher(native_kwargs):
     """Native step's SBATCH script must call the shared launcher with
     the short job name (NATIVE_MODULE_PREFIX stripped) and must NOT
-    contain `apptainer exec` (no container to bind into)."""
+    contain `apptainer exec` (no container to bind into).
+
+    Default `native_python` is "python" (bare interpreter on PATH) —
+    sites whose compute nodes lack the orchestrator on PATH override
+    via SLURM_NATIVE_PYTHON; see
+    test_native_payload_script_uses_native_python_override below."""
     payload = build_job_submit_payload(**native_kwargs)
     script = payload["script"]
     assert "srun python -m qiita_compute_orchestrator.jobs --job fastq_to_parquet" in script
     assert "apptainer exec" not in script
     assert script.startswith("#!/bin/bash\nset -euo pipefail\n")
+
+
+def test_native_payload_script_uses_native_python_override(native_kwargs):
+    """When the orchestrator threads a non-default native_python through
+    (sites whose compute nodes don't have a python on PATH with
+    qiita_compute_orchestrator installed), the SBATCH script must call
+    `srun <native_python> -m ...` — not bare `srun python`."""
+    native_kwargs["native_python"] = (
+        "/home/qiita/qiita-miint/qiita-compute-orchestrator/.venv/bin/python"
+    )
+    payload = build_job_submit_payload(**native_kwargs)
+    script = payload["script"]
+    assert (
+        "srun /home/qiita/qiita-miint/qiita-compute-orchestrator/.venv/bin/python"
+        " -m qiita_compute_orchestrator.jobs --job fastq_to_parquet"
+    ) in script
+    # And the default interpreter token isn't present.
+    assert "srun python -m" not in script
 
 
 def test_native_payload_has_no_bind_mounts(native_kwargs):
