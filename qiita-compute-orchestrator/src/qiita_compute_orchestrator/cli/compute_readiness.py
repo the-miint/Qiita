@@ -71,12 +71,18 @@ from ..slurm.client import (
 )
 from ..slurm.payload import number_envelope
 
-# Probe job constants. Conservative: the probe is purely diagnostic, no
-# need to fight for big allocations.
+# Probe job constants. Conservative: the probe is purely diagnostic,
+# no need to fight for big allocations.
 _PROBE_JOB_NAME = "qiita-compute-readiness-probe"
 _PROBE_CPU = 1
 _PROBE_MEM_MB = 256
 _PROBE_TIME_LIMIT_MINUTES = 5
+# The poll interval is intentionally tighter than the regular
+# SlurmBackend's `DEFAULT_SLURM_POLL_INTERVAL_SECONDS` (config.py).
+# Compute-readiness is an interactive operator command (someone is
+# watching the terminal); faster feedback beats slurmrestd-load
+# concerns, especially because the probe job's wall-time is capped at
+# 5 minutes so there are ~60 polls maximum.
 _DEFAULT_POLL_INTERVAL_SECONDS = 5
 _DEFAULT_PROBE_TIMEOUT_SECONDS = 5 * 60
 
@@ -485,17 +491,31 @@ _INFORMATIONAL_KEYS = {"hostname", "uid", "user"}
 
 
 def _classify_probe_pair(key: str, value: str) -> str:
+    """Map one parsed `<key>=<value>` line to a check status.
+
+    The function operates in two layers:
+
+    1. **Informational keys** (`hostname`, `uid`, `user`) carry
+       runtime-substituted values rather than a status alphabet, so
+       there's nothing to validate — they're always `pass` and the
+       operator reads `detail` for the substance.
+    2. **Status keys** must use the parser's known alphabet
+       (`_PROBE_PASS_VALUES` / `_PROBE_FAIL_VALUES` /
+       `_PROBE_SKIP_VALUES`), which the parity test pins against the
+       bash script's emitted literals. Anything off the alphabet falls
+       through to `fail` so a script-vs-parser version skew (or a
+       future script revision read by an older parser) surfaces as a
+       visible failure rather than silently passing.
+    """
     if key in _INFORMATIONAL_KEYS:
         return "pass"
     if value in _PROBE_PASS_VALUES:
         return "pass"
-    if value in _PROBE_FAIL_VALUES:
-        return "fail"
     if value in _PROBE_SKIP_VALUES:
         return "skip"
-    # Unknown values default to "fail" rather than silently passing —
-    # an unrecognized probe line is a contract drift and the operator
-    # should see it.
+    # `_PROBE_FAIL_VALUES` and any unknown value collapse here: an
+    # unrecognized probe line is contract drift and the operator
+    # should see the row as a failure.
     return "fail"
 
 

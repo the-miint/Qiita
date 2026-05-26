@@ -74,11 +74,12 @@ from . import _common
 # stall here masks misconfiguration.
 _DB_CONNECT_TIMEOUT_SECONDS = 5
 
-# Production install location for the orchestrator's venv (matches
-# deploy/activate.sh's `(cd /opt/qiita/compute-orchestrator && uv sync ...)`).
-# `compute-readiness` subprocess-execs `<venv>/bin/python -m
-# qiita_compute_orchestrator.cli.compute_readiness`. Overridable via
-# --orchestrator-venv for dev hosts or unusual layouts.
+# Production install location for the orchestrator's venv. Same path
+# the deploy script writes to and the systemd unit launches from —
+# this constant is a default for the operator-side wrapper, not the
+# source of truth; --orchestrator-venv overrides for dev hosts or
+# unusual layouts. The wrapper subprocess-execs `<venv>/bin/python -m
+# qiita_compute_orchestrator.cli.compute_readiness`.
 _DEFAULT_ORCHESTRATOR_VENV = Path("/opt/qiita/compute-orchestrator/.venv")
 
 # Derived from SystemRole so the role list isn't repeated anywhere in this
