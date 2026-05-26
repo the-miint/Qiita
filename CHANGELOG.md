@@ -8,6 +8,96 @@ Newest entry on top. Pre-deploy entries (PRs not yet merged to `main`) are allow
 
 ---
 
+## `feat/post-first-smoke-fixes` — fix(deploy): close gaps surfaced by first user-CLI fastq-to-parquet smoke
+
+Bundled fixes from the first real end-to-end fastq-to-parquet run on
+the live deploy. Six items the operator needs to do on an existing
+deploy host before `sudo local-deploy.sh`; everything else is handled
+by the deploy script itself or runs out of the box on a fresh deploy.
+
+1. Confirm `qiita-pipeline` group membership. Both `qiita-api` and
+   `qiita-orch` must be members (commit 2 makes this a documented
+   prereq; not yet automated by `local-deploy.sh`). `qiita-data` and
+   `qiita-job` should already be members from the first deploy.
+   ```bash
+   # [admin]
+   id qiita-api qiita-orch qiita-data qiita-job | grep qiita-pipeline   # all four should match
+   # if any are missing:
+   sudo usermod -aG qiita-pipeline qiita-api qiita-orch qiita-data qiita-job
+   ```
+
+2. Provision the compute-node-visible orchestrator venv (commit 3
+   prereq). The smoke ran with this in place; the new
+   `SLURM_NATIVE_PYTHON` env var below points the native-step launcher
+   at this interpreter.
+   ```bash
+   # [operator]
+   sudo -u qiita bash -lc 'cd /home/qiita/qiita-miint/qiita-compute-orchestrator && uv sync --reinstall-package qiita-common'
+   ```
+   `--reinstall-package qiita-common` is required because of cross-
+   package staleness (see CLAUDE.md "Cross-package staleness"); plain
+   `uv sync` would leave a stale `qiita-common` in site-packages.
+
+3. Add the new env vars to `/etc/qiita/compute-orchestrator.env`:
+   ```bash
+   # [admin]
+   sudo tee -a /etc/qiita/compute-orchestrator.env <<'EOF'
+   SLURM_NATIVE_PYTHON=/home/qiita/qiita-miint/qiita-compute-orchestrator/.venv/bin/python
+   SLURM_QOS=qiita_norm
+   QIITA_CP_URL=https://qiita-miint.ucsd.edu
+   EOF
+   ```
+   `QIITA_CP_URL` was already supported on the CO side; this PR makes
+   it effectively required because the value is now propagated into
+   every SLURM job's env so the native-step launcher can call back
+   into the control plane from the compute node.
+
+4. Run the deploy. `deploy/local-deploy.sh` now also:
+   - rsyncs `workflows/` into `/opt/qiita/incoming/` and on to
+     `/opt/qiita/workflows/`,
+   - runs `qiita-admin actions sync` as `qiita-api` against that path
+     (idempotent — no-op if nothing changed),
+   - installs the `UMask=0007` systemd dropins for both
+     `qiita-control-plane` and `qiita-compute-orchestrator` under
+     `/etc/systemd/system/<unit>.service.d/umask.conf`, then
+     `daemon-reload` + restart.
+   ```bash
+   # [admin]
+   sudo QIITA_HOSTNAME=qiita-miint.ucsd.edu /home/qiita/qiita-miint/deploy/local-deploy.sh
+   ```
+
+5. Verify:
+   ```bash
+   # [admin]
+   # actions sync ran and at least one row is in qiita.action
+   sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; psql "$DATABASE_URL" -c "SELECT count(*) FROM qiita.action;"'
+   # UMask dropins installed and effective
+   systemctl cat qiita-compute-orchestrator | grep UMask
+   systemctl cat qiita-control-plane         | grep UMask
+   ```
+
+Also new in this PR (no operator action, just so you know what
+landed):
+
+- `qiita-admin ticket force-fail --idx N --stage <stage> [--step-name X]
+  --reason TEXT` replaces the previous "operator writes UPDATE
+  qiita.work_ticket by hand" recovery pattern. Mirrors the
+  `work_ticket_failure_step_name_consistent` CHECK constraint
+  client-side; refuses to overwrite an already-terminal ticket. See
+  `docs/runbooks/fastq-to-parquet-retry-recovery.md` for the supported
+  recovery path.
+- `SLURM_QOS` env var (empty default = "use the submitting user's
+  default QOS") so the orchestrator doesn't silently depend on
+  per-user defaults.
+- SlurmrestdClient now refuses to start when the JWT's `sun` claim
+  doesn't match `SLURMRESTD_USER_NAME` — catches a stale JWT before
+  it sends jobs as the wrong identity (which the first smoke
+  experienced).
+- The SLURM job env now carries `HOME=<workspace>` so DuckDB+miint's
+  extension cache lands inside the cleaned-up per-ticket workspace.
+
+---
+
 ## `feat/issue-53-landing-and-invitation` — feat: public landing page + invitation acceptance fix
 
 Fixes issue #53. Two user-visible problems addressed together:
