@@ -82,3 +82,26 @@ def sign_action(
         secret,
         ttl_seconds=ttl_seconds,
     )
+
+
+def sign_doput(
+    *,
+    upload_idx: int,
+    secret: bytes,
+    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    expiry_epoch: int | None = None,
+) -> bytes:
+    """Sign a DoPut Flight ticket for streaming Arrow batches into a staged
+    upload.
+
+    Payload shape (the wire contract the Rust verifier will key off):
+    `{"action": "doput", "upload_idx": N}` — no other fields. The data
+    plane resolves the staging path from `upload_idx` server-side; the
+    client never names paths.
+    """
+    return _sign_payload(
+        {"action": "doput", "upload_idx": upload_idx},
+        secret,
+        ttl_seconds=ttl_seconds,
+        expiry_epoch=expiry_epoch,
+    )

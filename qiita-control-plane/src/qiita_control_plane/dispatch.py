@@ -60,15 +60,18 @@ async def _run_and_log(app: FastAPI, work_ticket_idx: int) -> None:
     machinery doesn't see an "unhandled exception in task" warning;
     the ticket state is already correct."""
     workspace_root = app.state.settings.work_ticket_workspace_root
-    if workspace_root is None:
-        # Defensive — Settings.from_env() requires WORK_TICKET_WORKSPACE_ROOT,
-        # so the only way to reach this is a Settings(...) construction that
-        # omits it (tests, programmatic boot). Raise so the symptom isn't a
-        # silent /tmp/None or AttributeError downstream.
+    upload_staging_root = app.state.settings.upload_staging_root
+    if workspace_root is None or upload_staging_root is None:
+        # Defensive — Settings.from_env() requires both env vars, so the only
+        # way to reach this is a Settings(...) construction that omits them
+        # (tests, programmatic boot). Raise so the symptom isn't a silent
+        # /tmp/None or AttributeError downstream.
         raise RuntimeError(
             "schedule_dispatch reached _run_and_log but"
-            " settings.work_ticket_workspace_root is None;"
-            " set WORK_TICKET_WORKSPACE_ROOT or construct Settings with it"
+            f" work_ticket_workspace_root={workspace_root!r},"
+            f" upload_staging_root={upload_staging_root!r};"
+            " set WORK_TICKET_WORKSPACE_ROOT and UPLOAD_STAGING_ROOT"
+            " or construct Settings with both"
         )
     try:
         await run_workflow(
@@ -77,7 +80,8 @@ async def _run_and_log(app: FastAPI, work_ticket_idx: int) -> None:
             app.state.compute_backend_client,
             hmac_secret=app.state.settings.hmac_secret_key,
             data_plane_url=app.state.settings.data_plane_url,
-            workspace_root=workspace_root,
+            work_ticket_workspace_root=workspace_root,
+            upload_staging_root=upload_staging_root,
         )
     except Exception:
         # run_workflow has already transitioned to FAILED. Log and swallow

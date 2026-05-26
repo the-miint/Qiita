@@ -23,9 +23,12 @@ from qiita_common.api_paths import LOOPBACK_HOST
 @pytest.fixture(autouse=True)
 def _workspace_root_env(monkeypatch):
     """Settings.from_env() (called by several AuthRocket tests below) now
-    requires WORK_TICKET_WORKSPACE_ROOT. Set a default so those tests can
-    focus on the OIDC surface they actually care about."""
+    requires WORK_TICKET_WORKSPACE_ROOT, UPLOAD_STAGING_ROOT, and
+    CONTACT_EMAIL. Set defaults so those tests can focus on the OIDC
+    surface they actually care about."""
     monkeypatch.setenv("WORK_TICKET_WORKSPACE_ROOT", "/tmp/qiita-test-ws-unused")
+    monkeypatch.setenv("UPLOAD_STAGING_ROOT", "/tmp/qiita-test-staging-unused")
+    monkeypatch.setenv("CONTACT_EMAIL", "qiita-test@example.org")
 
 
 # ---------------------------------------------------------------------------

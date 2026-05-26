@@ -53,12 +53,13 @@ async def test_slurm_backend_constructor_accepts_config(tmp_path):
     assert backend is not None
 
 
-async def test_local_backend_rejects_unknown_step():
-    """LocalBackend.run_step raises BackendFailure(CONTRACT_VIOLATION)
-    for a step it doesn't implement — better than a silent no-op when
-    the runner asks for an unknown name. CONTRACT_VIOLATION (permanent)
-    rather than a generic ValueError because retry won't help: same
-    YAML against the same backend will always miss."""
+async def test_local_backend_rejects_container_step():
+    """LocalBackend no longer supports container steps — every workflow
+    step must declare `module:`. A container-shaped request is a
+    contract violation (CONTRACT_VIOLATION, permanent) rather than a
+    silent no-op so a stale YAML that escaped review surfaces here. The
+    container path still lives on SlurmBackend (production runtime); a
+    deploy that needs to test container behavior must run against SLURM."""
     from qiita_common.backend_failure import BackendFailure, FailureKind
     from qiita_common.models import WorkTicketFailureStage
 
@@ -67,7 +68,7 @@ async def test_local_backend_rejects_unknown_step():
     backend = LocalBackend()
     with pytest.raises(BackendFailure) as ei:
         await backend.run_step(
-            "nonexistent",
+            "legacy_hash",
             {},
             Path("/fake"),
             scope_target={"kind": "reference", "reference_idx": 1},
@@ -76,6 +77,6 @@ async def test_local_backend_rejects_unknown_step():
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
     assert ei.value.stage == WorkTicketFailureStage.STEP_RUN
-    assert ei.value.step_name == "nonexistent"
+    assert ei.value.step_name == "legacy_hash"
     assert not ei.value.transient
-    assert "does not implement step" in ei.value.reason
+    assert "container" in ei.value.reason.lower()

@@ -10,13 +10,13 @@ reference rows is legitimate here. The orchestrator is reduced to its
 SLURM-driver role behind `POST /step/run`.
 
 Workspace contract: each entry runs against a per-attempt subdir
-`<workspace_root>/<work_ticket_idx>/<entry-name>/attempt-<N>/` minted by
-`_run_entry_with_retry`. The nesting gives two properties at once —
-retries land in fresh dirs (the verifier's "every file in $output_path
-must be in manifest" gate stays clean), and prior attempts persist on
-disk for postmortem. Entries see each other's outputs via the runner's
-binding map, which carries absolute paths forward so consumers don't
-need to know the producer's attempt number.
+`<work_ticket_workspace_root>/<work_ticket_idx>/<entry-name>/attempt-<N>/`
+minted by `_run_entry_with_retry`. The nesting gives two properties at
+once — retries land in fresh dirs (the verifier's "every file in
+$output_path must be in manifest" gate stays clean), and prior attempts
+persist on disk for postmortem. Entries see each other's outputs via
+the runner's binding map, which carries absolute paths forward so
+consumers don't need to know the producer's attempt number.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ from typing import Any
 
 import asyncpg
 from qiita_common.actions import ActionDefinition, WorkflowAction, WorkflowStep
-from qiita_common.api_paths import LibraryPrimitive
+from qiita_common.api_paths import LibraryPrimitive, compute_upload_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.compute_backend_client import ComputeBackendClient
 from qiita_common.models import (
@@ -36,6 +36,7 @@ from qiita_common.models import (
     ReferenceStatus,
     ScopeTargetKind,
     StepBaselineResources,
+    UploadStatus,
     WorkTicketFailureStage,
     WorkTicketState,
 )
@@ -45,6 +46,12 @@ from .actions.reference import transition_reference_status
 
 _log = logging.getLogger(__name__)
 
+# Suffix that marks an action_context key as a DoPut upload handle. The
+# runner resolves every `{prefix}_upload_idx` entry to the canonical
+# staging path under `{prefix}_path` before invoking workflow steps.
+_UPLOAD_IDX_SUFFIX = "_upload_idx"
+_PATH_SUFFIX = "_path"
+
 
 async def run_workflow(
     work_ticket_idx: int,
@@ -53,7 +60,8 @@ async def run_workflow(
     *,
     hmac_secret: bytes,
     data_plane_url: str,
-    workspace_root: Path,
+    work_ticket_workspace_root: Path,
+    upload_staging_root: Path,
 ) -> None:
     """Execute the workflow attached to one work ticket.
 
@@ -91,7 +99,7 @@ async def run_workflow(
         new=WorkTicketState.PROCESSING,
     )
 
-    workspace = workspace_root / str(work_ticket_idx)
+    workspace = work_ticket_workspace_root / str(work_ticket_idx)
     workspace.mkdir(parents=True, exist_ok=True)
 
     bound: dict[str, Any] = dict(work_ticket["action_context"] or {})
@@ -107,7 +115,29 @@ async def run_workflow(
         max_retries,
     )
 
+    uploads_to_consume: list[int] = []
+
     try:
+        # Resolve `*_upload_idx` keys to filesystem paths BEFORE the step
+        # loop runs. A failure here (unknown / unready / wrong-owner /
+        # missing-staged-file) raises a typed BackendFailure that the
+        # outer `except BackendFailure` block translates into a FAILED
+        # work_ticket — same path a step-level bad input would take.
+        # The consume-list is held until workflow completion so a
+        # mid-step failure leaves its uploads in `ready` for the
+        # operator to redrive against the same handles.
+        #
+        # Inside the try block (not above the PROCESSING transition)
+        # because a raise here MUST land in the outer FAILED-transition
+        # handler — without that, the ticket sticks in PROCESSING.
+        resolved_paths, uploads_to_consume = await _resolve_upload_handles(
+            pool,
+            action_context=bound,
+            originator_principal_idx=work_ticket["originator_principal_idx"],
+            upload_staging_root=upload_staging_root,
+        )
+        bound.update(resolved_paths)
+
         for index, entry in enumerate(action.steps):
             if entry.target_status and entry.target_status != current_status:
                 await _patch_resource_status(pool, scope_target, entry.target_status)
@@ -134,15 +164,31 @@ async def run_workflow(
         # try wraps the success path so a BackendFailure raised by
         # `_atomic_transition` (e.g. PROCESSING → COMPLETED couldn't fire
         # because state changed under us) carries the right stage.
+        #
+        # Three UPDATEs fire here as ONE Postgres transaction:
+        #
+        #   (1) qiita.upload  : ready  → consumed (every resolved upload)
+        #   (2) qiita.reference: <prev> → action.success_status (e.g. active)
+        #   (3) qiita.work_ticket: processing → completed
+        #
+        # The transaction binds all three so a mid-finalize failure can't
+        # leave the system in a partial state — uploads consumed with a
+        # PROCESSING ticket, or a COMPLETED ticket whose uploads are still
+        # `ready`. Either everything advances or nothing does; the inner
+        # except below reclassifies any raise as a FINALIZE failure and
+        # the outer handler then transitions the ticket to FAILED with
+        # the rollback already applied.
         try:
-            if action.success_status:
-                await _patch_resource_status(pool, scope_target, action.success_status)
-            await _atomic_transition(
-                pool,
-                work_ticket_idx,
-                expected=WorkTicketState.PROCESSING,
-                new=WorkTicketState.COMPLETED,
-            )
+            async with pool.acquire() as conn, conn.transaction():
+                await _consume_upload_handles(conn, upload_idxs=uploads_to_consume)
+                if action.success_status:
+                    await _patch_resource_status(conn, scope_target, action.success_status)
+                await _atomic_transition(
+                    conn,
+                    work_ticket_idx,
+                    expected=WorkTicketState.PROCESSING,
+                    new=WorkTicketState.COMPLETED,
+                )
         except Exception as exc:
             raise BackendFailure(
                 kind=FailureKind.UNKNOWN_PERMANENT,
@@ -374,7 +420,7 @@ async def _fetch_action(
 
 
 async def _atomic_transition(
-    pool: asyncpg.Pool,
+    pool: asyncpg.Pool | asyncpg.Connection,
     work_ticket_idx: int,
     *,
     expected: WorkTicketState,
@@ -382,7 +428,12 @@ async def _atomic_transition(
 ) -> None:
     """UPDATE state with a TOCTOU-safe WHERE clause. Raises if the row
     isn't in the expected state — surfacing a stuck PROCESSING ticket
-    instead of silently overwriting it."""
+    instead of silently overwriting it.
+
+    Accepts either a pool (auto-acquires a transient connection) or a
+    live Connection (so the finalize block can fire this UPDATE inside
+    the same transaction as `_consume_upload_handles` and the status
+    PATCH)."""
     updated = await pool.fetchval(
         "UPDATE qiita.work_ticket SET state = $1::qiita.work_ticket_state "
         "WHERE work_ticket_idx = $2 AND state = $3::qiita.work_ticket_state "
@@ -504,6 +555,165 @@ def _safe_entry_name(action: ActionDefinition, index: int | None) -> str | None:
 
 
 # =============================================================================
+# Upload-handle resolution
+# =============================================================================
+#
+# Source-of-truth for the upload domain — what a `qiita.upload` row means
+# and the consume contract — lives in db/migrations/20260521000000_upload.sql.
+# These helpers tie that domain to the workflow runner: pre-step resolution
+# (find the file the step will read) and post-success consumption (mark the
+# slot terminal).
+
+
+async def _resolve_upload_handles(
+    pool: asyncpg.Pool,
+    *,
+    action_context: dict[str, Any],
+    originator_principal_idx: int,
+    upload_staging_root: Path,
+) -> tuple[dict[str, Path], list[int]]:
+    """For every `{prefix}_upload_idx` key in `action_context`, resolve
+    to a `{prefix}_path` Path binding pointing at the canonical staging
+    file (`{staging_root}/uploads/{idx}/upload.parquet`).
+
+    Validates four invariants per upload, in this order:
+      1. The upload row exists.
+      2. status='ready' — the DoPut completed and /done was called.
+      3. created_by_idx == originator_principal_idx — uploaders can only
+         feed their own work tickets. Matches the same per-row ownership
+         gate `POST /upload/{idx}/done` and `GET /upload/{idx}` enforce
+         (see routes/upload.py); the runner double-checks here because
+         the originator on a work_ticket isn't necessarily the same as
+         the principal that created each referenced upload.
+      4. The on-disk file exists at the canonical staging path. Catches
+         a CP↔DP layout drift (or a deleted scratch) before the workflow
+         hands the path to a step that would 404 on it.
+
+    Any violation raises a typed `BackendFailure(BAD_INPUT)` at
+    stage=SUBMISSION — the work_ticket goes to FAILED with the failure
+    attributed to the workflow's submission, not any one step.
+    Non-`_upload_idx` keys (e.g. legacy `fasta_path` literals) flow
+    through untouched in the caller's binding map.
+
+    Returns `(resolved_paths, upload_idxs_to_consume)`. The consume list
+    is held until workflow success; mid-flight failures leave the
+    referenced uploads in `ready` so the operator can decide whether to
+    redrive against the same handles.
+    """
+
+    def _bad(reason: str) -> BackendFailure:
+        return BackendFailure(
+            kind=FailureKind.BAD_INPUT,
+            stage=WorkTicketFailureStage.SUBMISSION,
+            step_name=None,
+            reason=reason,
+        )
+
+    # First pass: validate keys + value shape, collect (key, prefix, upload_idx).
+    pending: list[tuple[str, str, int]] = []
+    for key, value in sorted(action_context.items()):
+        if not key.endswith(_UPLOAD_IDX_SUFFIX):
+            continue
+        # Bare suffix as the full key — `"_upload_idx": N` — would
+        # resolve to `_path`, clobbering any unrelated binding under the
+        # same name. Reject the empty-prefix case so the convention's
+        # `{prefix}_path` injection is always meaningful.
+        prefix = key.removesuffix(_UPLOAD_IDX_SUFFIX)
+        if not prefix:
+            raise _bad(
+                f"action_context key {key!r} has no name prefix before "
+                f"{_UPLOAD_IDX_SUFFIX!r}; use e.g. fasta_upload_idx, not _upload_idx"
+            )
+        if not isinstance(value, int) or value <= 0:
+            raise _bad(f"action_context.{key} must be a positive integer, got {value!r}")
+        pending.append((key, prefix, value))
+
+    if not pending:
+        return {}, []
+
+    # Second pass: single batched fetch keyed by upload_idx → row.
+    upload_idxs = [p[2] for p in pending]
+    rows = await pool.fetch(
+        "SELECT upload_idx, status, created_by_idx FROM qiita.upload"
+        " WHERE upload_idx = ANY($1::bigint[])",
+        upload_idxs,
+    )
+    by_idx = {r["upload_idx"]: r for r in rows}
+
+    resolved: dict[str, Path] = {}
+    to_consume: list[int] = []
+    for key, prefix, upload_idx in pending:
+        row = by_idx.get(upload_idx)
+        if row is None:
+            raise _bad(f"action_context.{key}={upload_idx} references unknown upload")
+        if row["status"] != UploadStatus.READY.value:
+            raise _bad(
+                f"action_context.{key}={upload_idx} expected status "
+                f"{UploadStatus.READY.value!r}, got {row['status']!r}"
+            )
+        if row["created_by_idx"] != originator_principal_idx:
+            raise _bad(
+                f"action_context.{key}={upload_idx} was created by principal "
+                f"{row['created_by_idx']}, work_ticket originator is "
+                f"{originator_principal_idx}"
+            )
+        staging_path = compute_upload_staging_path(upload_staging_root, upload_idx)
+        if not staging_path.exists():
+            raise _bad(
+                f"action_context.{key}={upload_idx} resolves to {staging_path} "
+                "but the staged file is missing — CP and DP "
+                "upload_staging_root disagree, or scratch was wiped"
+            )
+        resolved[prefix + _PATH_SUFFIX] = staging_path
+        to_consume.append(upload_idx)
+    return resolved, to_consume
+
+
+async def _consume_upload_handles(
+    pool: asyncpg.Pool | asyncpg.Connection, *, upload_idxs: list[int]
+) -> None:
+    """Bulk-transition `ready → consumed` for the listed upload rows.
+    Mismatches (count of rows updated != len(upload_idxs)) raise a
+    FINALIZE-stage BackendFailure so a stolen handle surfaces loudly
+    instead of silently completing the workflow.
+
+    Accepts either a pool or a live Connection so the success-path
+    finalize block can run this inside the same transaction as the
+    work_ticket COMPLETED transition."""
+    if not upload_idxs:
+        return
+    # completed_at is pinned at the first terminal transition (the
+    # pending→ready UPDATE in POST /upload/{idx}/done) per the migration
+    # comment on `upload_terminal_has_completed_at`. Any other path that
+    # mutates `status` off `pending` must populate `completed_at`; paths
+    # that move between non-pending states (ready→consumed here, a future
+    # consumed→archived, etc.) must NOT overwrite it.
+    rows = await pool.fetch(
+        "UPDATE qiita.upload"
+        " SET status = $1"
+        " WHERE upload_idx = ANY($2::bigint[])"
+        "   AND status = $3"
+        " RETURNING upload_idx",
+        UploadStatus.CONSUMED.value,
+        upload_idxs,
+        UploadStatus.READY.value,
+    )
+    if len(rows) != len(upload_idxs):
+        consumed = {r["upload_idx"] for r in rows}
+        missing = sorted(set(upload_idxs) - consumed)
+        raise BackendFailure(
+            kind=FailureKind.UNKNOWN_PERMANENT,
+            stage=WorkTicketFailureStage.FINALIZE,
+            step_name=None,
+            reason=(
+                f"could not transition uploads {missing} from "
+                f"{UploadStatus.READY.value!r} to {UploadStatus.CONSUMED.value!r}: "
+                "concurrent state change"
+            ),
+        )
+
+
+# =============================================================================
 # Dispatch helpers
 # =============================================================================
 
@@ -532,7 +742,9 @@ def _build_scope_target(work_ticket: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _patch_resource_status(
-    pool: asyncpg.Pool, scope_target: dict[str, Any], target_status: str
+    pool: asyncpg.Pool | asyncpg.Connection,
+    scope_target: dict[str, Any],
+    target_status: str,
 ) -> None:
     """Drive the appropriate resource-status transition for the scope_target.
     Today only `reference` is wired."""
@@ -635,11 +847,27 @@ async def _dispatch_action(
     if entry.name == LibraryPrimitive.REGISTER_FILES:
         staging_dir = Path(bound[entry.inputs[0]])
         # Filename → DuckLake table mapping derived from the staging dir.
-        # Convention: every *.parquet file in the dir gets registered to
-        # a table whose name matches the filename stem. Workflows that
-        # want a different mapping should declare it in YAML; today the
-        # only caller (reference-add) follows the convention.
-        files = {p.name: p.stem for p in sorted(staging_dir.glob("*.parquet"))}
+        # Convention:
+        #   - Top-level `<table>.parquet` files register as the table
+        #     named after the file's stem (single-file table).
+        #   - Top-level subdirs containing `*.parquet` files register
+        #     each part as the table named after the directory
+        #     (multi-file table). The filename in `files` carries the
+        #     subdir prefix relative to staging_dir; the data plane
+        #     normalises to basename when placing each part in the
+        #     permanent per-table directory.
+        # The multi-file form exists for `reference_sequence_chunks` —
+        # at GG2 scale a single-file sort+write of ~30 GB of chunk_data
+        # OOMs DuckDB; reference_load batches it into part files
+        # instead (jobs/reference_load.py:_write_reference_sequence_chunks).
+        files: dict[str, str] = {}
+        for entry_path in sorted(staging_dir.iterdir()):
+            if entry_path.is_file() and entry_path.suffix == ".parquet":
+                files[entry_path.name] = entry_path.stem
+            elif entry_path.is_dir():
+                for part in sorted(entry_path.glob("*.parquet")):
+                    rel = part.relative_to(staging_dir).as_posix()
+                    files[rel] = entry_path.name
         if not files:
             raise RuntimeError(
                 f"register-files: staging_dir {staging_dir} contains no Parquet files"

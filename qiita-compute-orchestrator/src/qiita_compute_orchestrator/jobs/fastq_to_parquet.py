@@ -47,37 +47,35 @@ storage cost without a query-speed win.
 
 Pipeline (B-staged-Parquet):
 
-  Phase 0: Reject empty input. A decompressed-stream peek (handles
-           plain and .gz) catches zero-record FASTQs before any DuckDB
-           work; empty input raises ValueError → BAD_INPUT, and no
-           empty Parquet is emitted. This also sidesteps miint's
-           "Empty file: ..." throw, so we don't depend on the upstream
-           wording (cf. #39).
+  1. Reject empty input. A decompressed-stream peek (handles plain
+     and .gz) catches zero-record FASTQs before any DuckDB work;
+     empty input raises ValueError → BAD_INPUT, and no empty Parquet
+     is emitted. This also sidesteps miint's "Empty file: ..." throw,
+     so we don't depend on the upstream wording (cf. #39).
 
-  Phase 1: FASTQ -> intermediate Parquet (no sequence_idx yet).
-           One streaming pass through miint's read_fastx. The
-           intermediate is snappy-compressed (PARQUET_OPTS_INTERMEDIATE)
-           — read once by phase 4 and deleted, so decode speed beats
-           on-disk size here; the final phase-4 output stays on zstd.
+  2. FASTQ -> intermediate Parquet (no sequence_idx yet). One
+     streaming pass through miint's read_fastx. The intermediate is
+     snappy-compressed (PARQUET_OPTS_INTERMEDIATE) — read once by the
+     sequence_idx rewrite and deleted, so decode speed beats on-disk
+     size here; the final output stays on zstd.
 
-  Phase 2: Count via Parquet footer (sub-second; no data scan).
+  3. Count via Parquet footer (sub-second; no data scan).
 
-  Phase 3: POST /api/v1/sequence-range with the exact count. The CP
-           function holds an advisory lock for the nextval/setval/INSERT
-           critical section and returns the minted (start, stop) range.
-           count > 0 guaranteed by phase 0.
+  4. POST /api/v1/sequence-range with the exact count. The CP
+     function holds an advisory lock for the nextval/setval/INSERT
+     critical section and returns the minted (start, stop) range.
+     count > 0 guaranteed by step 1.
 
-  Phase 4: Read intermediate + assign sequence_idx via
-           `sequence_index + start - 1` (miint's per-file 1-based
-           index is carried through the intermediate), write the
-           final Parquet sorted by sequence_idx. Assignment is
-           deterministic by construction — no window function or
-           extra sort needed.
+  5. Read intermediate + assign sequence_idx via
+     `sequence_index + start - 1` (miint's per-file 1-based index is
+     carried through the intermediate), write the final Parquet
+     sorted by sequence_idx. Assignment is deterministic by
+     construction — no window function or extra sort needed.
 
-  Phase 5 (try/finally): cleanup intermediate + DuckDB temp_directory
-           before returning. The SLURM launcher's manifest walker runs
-           AFTER execute() returns, so the transient files are
-           invisible to it — the manifest sees only reads.parquet.
+  6. (try/finally) cleanup intermediate + DuckDB temp_directory
+     before returning. The SLURM launcher's manifest walker runs
+     AFTER execute() returns, so the transient files are invisible
+     to it — the manifest sees only reads.parquet.
 """
 
 from __future__ import annotations
@@ -85,7 +83,6 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-import duckdb
 import httpx
 from pydantic import BaseModel, Field
 from qiita_common.backend_failure import BackendFailure, FailureKind
@@ -95,6 +92,7 @@ from qiita_common.parquet import validate_parquet_path
 from ..miint import (
     PARQUET_OPTS,
     PARQUET_OPTS_INTERMEDIATE,
+    apply_duckdb_settings,
     ensure_miint_installed,
     is_empty_sequence_file,
     open_conn,
@@ -116,43 +114,16 @@ from ..sequence_range import (
 # instead of duplicating the literal in step_name assertions.
 YAML_STEP_NAME = "fastq"
 
-# Conservative DuckDB resource caps. TODO(#38): plumb from
-# JobParams.baseline_resources so each step's SLURM allocation drives
-# DuckDB's own limits. For now these mirror the YAML's declared
-# baseline_resources (cpu=2, mem_gb=8): DuckDB gets `mem_gb - 1` so
-# Python + miint runtime have ~1 GB of headroom — DuckDB's
-# memory_limit only caps DuckDB itself, not the rest of the process.
-# Long-read inputs need this safely above ~2.4 GB resident per thread
-# (2048 STANDARD_VECTOR_SIZE × 60 default Parquet row_group_size ×
-# ~20 KB avg long-read record incl. quality). Threads stay at the
-# cgroup cpu ask; oversubscribing threads doesn't kill a job, but
-# exceeding memory_limit does.
-_DUCKDB_MAX_MEMORY_GB = 7
-_DUCKDB_MAX_THREADS = 2
-
-
-def _apply_duckdb_settings(conn: duckdb.DuckDBPyConnection, duckdb_tmp: Path) -> None:
-    """Apply the four DuckDB settings every pipeline connection needs.
-
-    - `memory_limit='{N}GB'` — cap RAM so SLURM cgroups don't OOM-kill.
-    - `threads={N}` — match the cgroup cpu allocation; the default
-      would try to use all host cores.
-    - `preserve_insertion_order=false` — let DuckDB parallelize freely.
-      Determinism is guaranteed by carrying miint's per-file 1-based
-      `sequence_index` column through the intermediate Parquet:
-      sequence_idx = sequence_index + start - 1 is deterministic by
-      construction, independent of physical row order.
-    - `temp_directory='{workspace}/.duckdb_tmp'` — spill on the same
-      fast scratch as the workspace, not the system /tmp (which is
-      often small tmpfs).
-
-    The canonical setting names are `memory_limit` and `threads` —
-    `max_memory` / `max_threads` are aliases in newer DuckDB versions
-    but not the ones miint targets, so use the canonical forms."""
-    conn.execute(f"SET memory_limit='{_DUCKDB_MAX_MEMORY_GB}GB'")
-    conn.execute(f"SET threads={_DUCKDB_MAX_THREADS}")
-    conn.execute("SET preserve_insertion_order=false")
-    conn.execute(f"SET temp_directory='{duckdb_tmp}'")
+# DuckDB resource caps for this step. The YAML allocation
+# (workflows/fastq-to-parquet/1.0.0.yaml: mem_gb=8, cpu=2) sizes the
+# SLURM cgroup; DuckDB's own caps sit just below (`mem_gb - 1` leaves
+# ~1 GB for Python/miint/OS overhead). Long-read inputs need this
+# safely above ~2.4 GB resident per thread (2048 STANDARD_VECTOR_SIZE
+# × 60 default Parquet row_group_size × ~20 KB avg long-read record
+# incl. quality); 7 GB is comfortably above that. #38 will plumb these
+# directly.
+_DUCKDB_MEMORY_GB = 7
+_DUCKDB_THREADS = 2
 
 
 class PreMintedRange(BaseModel):
@@ -248,15 +219,20 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     await ensure_miint_installed()
 
     try:
-        # Phase 1: FASTQ -> intermediate Parquet. Empty inputs were
-        # rejected as BAD_INPUT above, so read_fastx is guaranteed to
-        # have at least one record here.
+        # FASTQ -> intermediate Parquet. Empty inputs were rejected as
+        # BAD_INPUT above, so read_fastx is guaranteed to have at least
+        # one record here.
         with open_conn() as conn:
-            _apply_duckdb_settings(conn, duckdb_tmp)
+            apply_duckdb_settings(
+                conn,
+                duckdb_tmp,
+                memory_gb=_DUCKDB_MEMORY_GB,
+                threads=_DUCKDB_THREADS,
+            )
             conn.execute("LOAD miint;")
             # `sequence_index` (miint's 1-based per-file row index) is
-            # carried through the intermediate so phase 4 can assign
-            # sequence_idx via `sequence_index + start - 1` without a
+            # carried through the intermediate so the sequence_idx rewrite
+            # below can compute `sequence_index + start - 1` without a
             # window function. Reset-per-file isn't a concern: we
             # always pass exactly one file (or one R1/R2 pair) per
             # execute() call.
@@ -272,20 +248,24 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 read_fastx_args,
             )
 
-        # Phase 2: count via Parquet footer (no scan).
+        # Count via Parquet footer (no scan).
         with open_conn() as conn:
-            _apply_duckdb_settings(conn, duckdb_tmp)
+            apply_duckdb_settings(
+                conn,
+                duckdb_tmp,
+                memory_gb=_DUCKDB_MEMORY_GB,
+                threads=_DUCKDB_THREADS,
+            )
             count = conn.execute(
                 "SELECT count(*) FROM read_parquet(?)", [str(intermediate)]
             ).fetchone()[0]
 
-        # Phase 3: mint a sequence_idx range from the CP — unless the
-        # work_ticket carries a `pre_minted_range` (E-operator recovery
-        # path: the prior attempt already minted in phase 3 and failed
-        # transiently in phase 4; the operator resubmits with the
-        # existing range so the CP's one-shot mint contract isn't
-        # violated). count > 0 by the phase-0 pre-check, so no zero-count
-        # special case here.
+        # Mint a sequence_idx range from the CP — unless the work_ticket
+        # carries a `pre_minted_range` (E-operator recovery path: a prior
+        # attempt already minted and failed transiently in the rewrite
+        # below; the operator resubmits with the existing range so the
+        # CP's one-shot mint contract isn't violated). count > 0 by the
+        # empty-input pre-check, so no zero-count special case here.
         #
         # The mint helper raises typed Python exceptions; the framework
         # dispatcher in jobs/__init__.py only wraps bare
@@ -378,10 +358,15 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 ) from exc
             sequence_idx_start = rng.sequence_idx_start
 
-        # Phase 4: rewrite intermediate -> final with sequence_idx
-        # assigned and physically sorted on disk.
+        # Rewrite intermediate -> final with sequence_idx assigned and
+        # physically sorted on disk.
         with open_conn() as conn:
-            _apply_duckdb_settings(conn, duckdb_tmp)
+            apply_duckdb_settings(
+                conn,
+                duckdb_tmp,
+                memory_gb=_DUCKDB_MEMORY_GB,
+                threads=_DUCKDB_THREADS,
+            )
             # sequence_idx = miint's sequence_index (1-based per file)
             # + start - 1. Deterministic by construction — file order
             # IS the assignment order. The outer ORDER BY controls the

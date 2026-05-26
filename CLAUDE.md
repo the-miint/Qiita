@@ -92,7 +92,7 @@ The pre-deploy convention of editing migration SQL files in place ended with the
 
 Many closed value sets are **deliberately duplicated**: once as a Python `StrEnum` in `qiita-common` (so Pydantic models type-check at import time, with no DB connection) and once as a Postgres `CREATE TYPE ... AS ENUM` (so the database itself rejects bad values). Per issue #37 this duplication is a chosen compromise — the DB is *not* the single source of truth — so do **not** try to derive one side from the other.
 
-Not every closed value set is a Postgres ENUM. `auth_event.event_type`, `reference.status`, and `reference.kind` are intentionally plain `TEXT` (with a `CHECK` where appropriate) even though their Python twins exist (`AuthEventType` and `ReferenceStatus` are `StrEnum`s; `ReferenceKind` is a `Literal`) — see those migrations for the rationale. The rules below apply **only** to value sets that are `CREATE TYPE ... AS ENUM`; a `StrEnum`/`Literal` backed by a `TEXT`/`CHECK` column is a valid, deliberate choice and is out of scope for the parity test.
+Not every closed value set is a Postgres ENUM. `auth_event.event_type`, `reference.status`, `reference.kind`, and `upload.status` are intentionally plain `TEXT` (with a `CHECK` where appropriate) even though their Python twins exist (`AuthEventType`, `ReferenceStatus`, and `UploadStatus` are `StrEnum`s; `ReferenceKind` is a `Literal`) — see those migrations for the rationale. The rules below apply **only** to value sets that are `CREATE TYPE ... AS ENUM`; a `StrEnum`/`Literal` backed by a `TEXT`/`CHECK` column is a valid, deliberate choice and is out of scope for the parity test.
 
 Whenever you add, rename, or remove a value in an enum that *does* have a Postgres `CREATE TYPE` twin:
 
@@ -101,6 +101,22 @@ Whenever you add, rename, or remove a value in an enum that *does* have a Postgr
 3. **Register the pair for the parity test.** `ENUM_PAIRS` in `qiita-control-plane/tests/test_enum_parity.py` lists every `(Python enum, Postgres ENUM)` pair. `test_enum_parity` fails on value drift; `test_all_postgres_enums_are_covered` fails if a Postgres ENUM in the `qiita` schema is not registered there. Both run under `make test-control-plane-with-db`. A brand-new mirrored enum must be added to `ENUM_PAIRS`.
 
 This also applies when reviewing code: a PR that changes a `CREATE TYPE ... AS ENUM` or its Python twin without the matching other-side change, two-way comment, and `ENUM_PAIRS` entry is incomplete. A new `StrEnum`/`Literal` with no Postgres ENUM is *not* a defect — see the `TEXT`/`CHECK` carve-out above — so do not flag it for a missing ENUM twin.
+
+## Operator-facing changes (CHANGELOG.md)
+
+`CHANGELOG.md` at the repo root is the operator's release-notes channel for deploys. It lives separately from the git log and the PR descriptions because future operators read `tail CHANGELOG.md` before running `sudo local-deploy.sh` to find out what's new since their last deploy — PR descriptions sit inside closed PRs and stop being a natural lookup target once merged.
+
+Add a new entry to `CHANGELOG.md` *in the same PR* whenever the PR introduces any of:
+
+- A new required env var (CP, DP, or CO) — the boot-time `from_env()` fail-fast catches it, but the operator should set it pre-deploy, not after the systemd unit fails to start.
+- A new shared directory the operator must create with specific owner/group/mode (e.g. an upload-staging or workspace root).
+- A migration that needs out-of-band setup the runbook doesn't already cover (CREATE EXTENSION, manual data backfill, etc.).
+- A breaking change in `/etc/qiita/*.env` shape (renamed key, removed key with no compat alias).
+- Any other action the operator must take on the deploy host *before* `sudo local-deploy.sh` for the deploy to succeed.
+
+A PR that only changes Python/Rust code, tests, docs, or migrations that the existing dbmate flow handles autonomously does **not** need an entry. When in doubt: "if the operator follows the existing runbook + `sudo local-deploy.sh` without reading this PR, does the deploy succeed?" If no, add an entry.
+
+Entry format: `## PR #N — <title>` heading, newest on top, with concrete `bash` commands the operator can copy/paste. The existing entries in the file show the shape. Reviewers check that the entry exists when the PR description (or the diff) implies operator action.
 
 ## Architecture
 

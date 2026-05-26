@@ -19,12 +19,12 @@ Adding a route requires both flavours so the router and its callers
 stay in lockstep; removing one without the other will surface as a name
 error at import time rather than a silent route mismatch at runtime.
 
-Currently covers /feature/* and /reference/*; other tags
-(/auth, /admin, /user) still hardcode their paths and will migrate as
-they're touched.
+Coverage grows as routes are touched; other tags (/auth, /admin,
+/user) still hardcode their paths and will migrate as they're touched.
 """
 
 from enum import StrEnum
+from pathlib import Path
 
 from qiita_common.auth_constants import API_PREFIX
 
@@ -109,6 +109,45 @@ PATH_WORK_TICKET_RUN = "/{work_ticket_idx}/run"
 URL_WORK_TICKET_PREFIX = f"{API_PREFIX}{PATH_WORK_TICKET_PREFIX}"
 URL_WORK_TICKET_BY_IDX = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_BY_IDX}"
 URL_WORK_TICKET_RUN = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_RUN}"
+
+
+# =============================================================================
+# /upload/* — generic Arrow-data staging slots
+# =============================================================================
+# POST /upload mints a row in `qiita.upload` and returns a signed DoPut
+# Flight ticket. POST /upload/{idx}/done records the client's completion
+# claim and transitions pending → ready. GET /upload/{idx} reads status.
+# The domain is content-agnostic by design; no reference / role / consumer
+# fields cross the wire.
+
+PATH_UPLOAD_PREFIX = "/upload"
+PATH_UPLOAD_ROOT = ""  # POST/list against the prefix itself
+PATH_UPLOAD_BY_IDX = "/{upload_idx}"
+PATH_UPLOAD_DONE = "/{upload_idx}/done"
+
+URL_UPLOAD_PREFIX = f"{API_PREFIX}{PATH_UPLOAD_PREFIX}"
+URL_UPLOAD_BY_IDX = f"{URL_UPLOAD_PREFIX}{PATH_UPLOAD_BY_IDX}"
+URL_UPLOAD_DONE = f"{URL_UPLOAD_PREFIX}{PATH_UPLOAD_DONE}"
+
+
+def compute_upload_staging_path(staging_root: Path, upload_idx: int) -> Path:
+    """Canonical filesystem path for a staged DoPut upload.
+
+    Mirrors the Rust ``staging_path_for(root, idx)`` in
+    ``qiita-data-plane/src/flight_service.rs``: a single source of truth
+    so the data plane (writes here on DoPut) and the control-plane
+    runner (reads here on workflow start) agree byte-for-byte. The
+    layout — ``{root}/uploads/{idx}/upload.parquet`` — is locked by
+    the Rust unit test ``staging_path_for_layout``; this Python
+    function MUST stay in lockstep with that test.
+
+    Lives here, not on the data-plane side, because the path layout is
+    a cross-service contract — both sides need it, and qiita-common is
+    the only place both already depend on. Not in ``qiita_common.upload``
+    because there is no such module; ``api_paths`` already owns
+    deploy-shape constants for the upload domain (PATH_UPLOAD_*).
+    """
+    return staging_root / "uploads" / str(upload_idx) / "upload.parquet"
 
 
 # =============================================================================

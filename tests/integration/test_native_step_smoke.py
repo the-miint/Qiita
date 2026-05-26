@@ -176,6 +176,7 @@ async def test_fastq_to_parquet_through_runner(
     )
 
     workspace_root = tmp_path / "workspace"
+    upload_staging_root = tmp_path / "upload-staging"
     backend_client = LocalComputeBackendClient()
 
     await run_workflow(
@@ -184,7 +185,8 @@ async def test_fastq_to_parquet_through_runner(
         backend_client,  # type: ignore[arg-type]  # protocol-shaped duck
         hmac_secret=b"unused-in-smoke",
         data_plane_url="grpc://unused:0",
-        workspace_root=workspace_root,
+        work_ticket_workspace_root=workspace_root,
+        upload_staging_root=upload_staging_root,
     )
 
     row = await postgres_pool.fetchrow(

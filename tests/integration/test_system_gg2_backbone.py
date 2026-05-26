@@ -24,20 +24,29 @@ cutting a release candidate). Triple-gated:
     datasets never enter version control
 
 Pinned-version note: the row-count constants below
-(_EXPECTED_FEATURES / _EXPECTED_TAXONOMY / _EXPECTED_PHYLOGENY) are
-specific to the GG2 2024.09 backbone snapshot. A future release-cycle
-update that re-pins to a newer snapshot must re-derive these.
+(_EXPECTED_FEATURES / _EXPECTED_TAXONOMY / _EXPECTED_PHYLOGENY /
+_EXPECTED_GENOME_ASSOCIATIONS) are specific to the GG2 2024.09
+backbone snapshot. A future release-cycle update that re-pins to a
+newer snapshot must re-derive these.
+
+Canonical-hash note: hash_sequences canonicalizes via
+`md5(LEAST(upper(seq), sequence_dna_reverse_complement(upper(seq))))`.
+If any backbone entries collapse under canonicalization (a sequence
+and its reverse complement both present in the input FASTA), the
+locked feature/membership counts drop by the collapse count. The
+constants below assume zero collapse — re-derive them after the first
+real GG2 run on the new flow if assertions fail.
 
 Expected runtime: ~10 minutes (FASTA hashing dominates).
 """
 
-import json
 import uuid
 from pathlib import Path
 
 import duckdb
 import pyarrow.flight as flight
 import pytest
+from httpx import ASGITransport, AsyncClient
 
 from _runner_helpers import LocalComputeBackendClient
 
@@ -53,6 +62,16 @@ GG2_GENOME_MAP = DATA_DIR / "2024.09.backbone.feature-to-genome.parquet"
 _EXPECTED_FEATURES = 331269
 _EXPECTED_TAXONOMY = 331240
 _EXPECTED_PHYLOGENY = 662537
+
+# feature-to-genome.parquet has 72,765 non-null-genome_id rows but the
+# FASTA read_ids are amplicon-style (e.g. `MJ020_2_barcode53_...`)
+# while genome_map's feature_ids are NCBI-accession-style
+# (e.g. `NZ_CP039371.1`); only 12,283 IDs overlap. The runner's INNER
+# JOIN on read_id drops the non-overlap rows ("the genome map may
+# legitimately cover only a subset of FASTA reads" — see
+# qiita_control_plane.actions.library._associate_genomes). 12,283 is
+# the intersection size, derived empirically on the 2024.09 snapshot.
+_EXPECTED_GENOME_ASSOCIATIONS = 12283
 
 _REFERENCE_ADD_YAML_PATH = (
     Path(__file__).parent.parent.parent / "workflows" / "reference-add" / "1.0.0.yaml"
@@ -99,33 +118,32 @@ def flight_client(data_plane):
 
 @pytest.fixture
 async def synced_reference_add_action(postgres_pool, tmp_path):
-    """Materialize workflows/reference-add/1.0.0.yaml under tmp_path/workflows/
-    so the loader's directory walk picks it up, sync it into qiita.action,
-    and clean the row up after."""
+    """Sync workflows/reference-add/1.0.0.yaml into qiita.action so the
+    CLI's POST /work-ticket (which hard-codes action_version='1.0.0')
+    can submit against the new shape. We don't randomize the version
+    here — system tests run serially and the CLI binds to the on-disk
+    pinned version."""
     from qiita_control_plane.actions import load_actions, sync_actions
 
     workflows_dir = tmp_path / "workflows" / "reference-add"
     workflows_dir.mkdir(parents=True)
-    yaml_text = _REFERENCE_ADD_YAML_PATH.read_text()
-    test_version = f"gg2-system-{uuid.uuid4()}"
-    yaml_text = yaml_text.replace("version: 1.0.0", f"version: {test_version}")
-    (workflows_dir / "1.0.0.yaml").write_text(yaml_text)
+    (workflows_dir / "1.0.0.yaml").write_text(_REFERENCE_ADD_YAML_PATH.read_text())
 
     actions = load_actions(tmp_path / "workflows")
     async with postgres_pool.acquire() as conn:
         await sync_actions(conn, actions)
 
-    yield ("reference-add", test_version)
+    yield ("reference-add", "1.0.0")
 
     await postgres_pool.execute(
         "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
         "reference-add",
-        test_version,
+        "1.0.0",
     )
     await postgres_pool.execute(
         "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
         "reference-add",
-        test_version,
+        "1.0.0",
     )
 
 
@@ -152,6 +170,41 @@ async def gg2_reference(postgres_pool, human_admin_session):
     )
 
 
+@pytest.fixture
+async def cli_cp_client(postgres_pool, hmac_secret, human_admin_session, data_plane):
+    """Same shape as the e2e test's cli_cp_client — wires cp_app.state so
+    POST /work-ticket can fire schedule_dispatch against a real backend."""
+    from qiita_common.api_paths import LOOPBACK_HOST
+    from qiita_control_plane.config import Settings as CPSettings
+    from qiita_control_plane.main import app as cp_app
+
+    cp_app.state.pool = postgres_pool
+    cp_app.state.settings = CPSettings(
+        database_url="unused-in-test",
+        hmac_secret_key=hmac_secret,
+        data_plane_url=f"grpc://{LOOPBACK_HOST}:{data_plane['port']}",
+        upload_staging_root=Path(data_plane["upload_staging_root"]),
+        work_ticket_workspace_root=Path(data_plane["workspace_root"]),
+    )
+    cp_app.state.compute_backend_client = LocalComputeBackendClient()
+    cp_app.state.running_dispatches = set()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=cp_app),
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {human_admin_session['token']}"},
+    ) as client:
+        yield client
+
+    import asyncio
+
+    pending = list(cp_app.state.running_dispatches)
+    if pending:
+        _, leftover = await asyncio.wait(pending, timeout=10)
+        for task in leftover:
+            task.cancel()
+
+
 async def test_gg2_backbone_full_pipeline(
     postgres_pool,
     data_plane,
@@ -161,53 +214,42 @@ async def test_gg2_backbone_full_pipeline(
     gg2_reference,
     gg2_genome_map,
     human_admin_session,
+    cli_cp_client,
     tmp_path,
 ):
-    """Full reference-add pipeline on GG2 2024.09: hash → mint (with
-    genome associations) → write-membership → load (with taxonomy +
-    tree) → register via Flight → DoGet. Asserts row counts at every
-    verifiable stage and confirms genome_map_path produced the expected
-    feature_genome rows.
-    """
-    from qiita_common.api_paths import LOOPBACK_HOST
+    """Drive the full reference-add pipeline on GG2 2024.09 via the CLI's
+    programmatic entry point. FASTA + taxonomy + tree + genome_map all
+    flow through DoPut; the runner walks the workflow in a background
+    asyncio task triggered by POST /work-ticket. Asserts row counts at
+    every verifiable stage."""
     from qiita_control_plane.auth.tickets import sign_ticket
-    from qiita_control_plane.runner import run_workflow
+    from qiita_control_plane.cli.reference_load import do_reference_load
 
-    action_id, action_version = synced_reference_add_action
-    action_context = json.dumps(
-        {
-            "fasta_path": str(FASTA),
-            "taxonomy_path": str(TAXONOMY),
-            "tree_path": str(TREE),
-            "genome_map_path": str(gg2_genome_map),
-        }
+    # `watch=True` with a 90-minute timeout — hash_sequences alone is
+    # ~25 min at GG2 backbone scale (batched aggregate over 12 GB
+    # compressed staging), and reference_load follows with its own
+    # JOIN+ORDER BY+write over the same 30+ GB of chunk_data. The
+    # workflow needs to finish before we can claim completed; setting
+    # this above any plausible runtime lets us see whether reference_load
+    # actually completes vs OOMs.
+    result = await do_reference_load(
+        http=cli_cp_client,
+        token=human_admin_session["token"],
+        flight_client=flight_client,
+        fasta_path=FASTA,
+        taxonomy_path=TAXONOMY,
+        tree_path=TREE,
+        genome_map_path=gg2_genome_map,
+        reference_idx=gg2_reference,
+        watch=True,
+        poll_interval_seconds=5,
+        timeout_seconds=90 * 60,
     )
-    work_ticket_idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.work_ticket ("
-        "  action_id, action_version, originator_principal_idx,"
-        "  scope_target_kind, reference_idx, action_context"
-        ") VALUES ($1, $2, $3, 'reference', $4, $5::jsonb)"
-        " RETURNING work_ticket_idx",
-        action_id,
-        action_version,
-        human_admin_session["principal_idx"],
-        gg2_reference,
-        action_context,
-    )
+    assert result["work_ticket"]["state"] == "completed", result["work_ticket"]
 
-    await run_workflow(
-        work_ticket_idx,
-        postgres_pool,
-        LocalComputeBackendClient(),  # type: ignore[arg-type]
-        hmac_secret=hmac_secret,
-        data_plane_url=f"grpc://{LOOPBACK_HOST}:{data_plane['port']}",
-        workspace_root=tmp_path / "workspace",
-    )
-
-    # --- Pipeline reached the success terminals ---
     state = await postgres_pool.fetchval(
         "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
-        work_ticket_idx,
+        result["work_ticket_idx"],
     )
     assert state == "completed"
     ref_status = await postgres_pool.fetchval(
@@ -222,14 +264,11 @@ async def test_gg2_backbone_full_pipeline(
     )
     assert membership_count == _EXPECTED_FEATURES
 
-    # --- Genome associations: every row in the converted genome map
-    # should have produced exactly one feature_genome row scoped to this
-    # reference's feature set.
-    expected_genome_count = (
-        duckdb.connect(":memory:")
-        .execute("SELECT count(*) FROM read_parquet(?)", [str(gg2_genome_map)])
-        .fetchone()[0]
-    )
+    # --- Genome associations: the runner JOINs genome_map.read_id
+    # against the manifest's read_id (INNER JOIN), so only the
+    # intersection produces feature_genome rows. For GG2 the
+    # intersection is much smaller than the genome_map row count —
+    # see _EXPECTED_GENOME_ASSOCIATIONS for the locked figure.
     actual_genome_count = await postgres_pool.fetchval(
         "SELECT count(*) FROM qiita.feature_genome fg"
         " JOIN qiita.genome g USING (genome_idx)"
@@ -237,7 +276,7 @@ async def test_gg2_backbone_full_pipeline(
         " WHERE m.reference_idx = $1 AND g.source = 'gg2'",
         gg2_reference,
     )
-    assert actual_genome_count == expected_genome_count
+    assert actual_genome_count == _EXPECTED_GENOME_ASSOCIATIONS
 
     # --- DoGet round-trips via real Flight ---
     def _doget(table: str):

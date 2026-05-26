@@ -30,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.hmac_secret_key,
         cfg.ducklake_catalog_connstr,
         cfg.ducklake_data_path,
+        cfg.upload_staging_root,
     );
 
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
@@ -39,9 +40,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("qiita-data-plane listening on {}", cfg.listen_addr);
 
+    // Arrow Flight DoPut batches for chunked uploads run up to ~1 GiB
+    // on dense GG2-scale data (see _CHUNK_ROWS_PER_BATCH × _CHUNK_SIZE
+    // in the CLI's reference_load.py — 16384 rows × 64 KB chunks).
+    // tonic's default 4 MiB max-decoding-message-size rejects these
+    // outright with "decoded message length too large". Bump to 1 GiB
+    // so the server accepts the batch sizes the chunked-upload design
+    // actually produces.
+    const FLIGHT_MAX_DECODING_BYTES: usize = 1024 * 1024 * 1024;
+
     Server::builder()
         .add_service(health_service)
-        .add_service(FlightServiceServer::new(flight_svc))
+        .add_service(
+            FlightServiceServer::new(flight_svc)
+                .max_decoding_message_size(FLIGHT_MAX_DECODING_BYTES),
+        )
         .serve(cfg.listen_addr)
         .await?;
 
@@ -90,16 +103,25 @@ mod tests {
     #[test]
     #[serial]
     fn config_with_valid_env() {
-        let _snapshot =
-            EnvSnapshot::capture(&["LISTEN_ADDR", "HMAC_SECRET_KEY", "DUCKLAKE_CATALOG_CONNSTR"]);
+        let _snapshot = EnvSnapshot::capture(&[
+            "LISTEN_ADDR",
+            "HMAC_SECRET_KEY",
+            "DUCKLAKE_CATALOG_CONNSTR",
+            "UPLOAD_STAGING_ROOT",
+        ]);
         std::env::remove_var("LISTEN_ADDR");
         let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
         std::env::set_var("HMAC_SECRET_KEY", &secret);
         std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test host=localhost");
+        std::env::set_var("UPLOAD_STAGING_ROOT", "/tmp/qiita-test-staging");
         let cfg = Settings::from_env().expect("Settings::from_env() failed with valid config");
         assert_eq!(cfg.listen_addr.to_string(), "0.0.0.0:50051");
         assert_eq!(cfg.hmac_secret_key.len(), 32);
         assert_eq!(cfg.ducklake_catalog_connstr, "dbname=test host=localhost");
+        assert_eq!(
+            cfg.upload_staging_root,
+            std::path::PathBuf::from("/tmp/qiita-test-staging")
+        );
     }
 
     #[test]
@@ -112,6 +134,44 @@ mod tests {
         assert!(
             err.contains("HMAC_SECRET_KEY"),
             "error should mention HMAC_SECRET_KEY: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn config_rejects_missing_upload_staging_root() {
+        let _snapshot = EnvSnapshot::capture(&[
+            "HMAC_SECRET_KEY",
+            "DUCKLAKE_CATALOG_CONNSTR",
+            "UPLOAD_STAGING_ROOT",
+        ]);
+        let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
+        std::env::set_var("HMAC_SECRET_KEY", &secret);
+        std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
+        std::env::remove_var("UPLOAD_STAGING_ROOT");
+        let err = Settings::from_env().unwrap_err();
+        assert!(
+            err.contains("UPLOAD_STAGING_ROOT"),
+            "error should mention UPLOAD_STAGING_ROOT: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn config_rejects_relative_upload_staging_root() {
+        let _snapshot = EnvSnapshot::capture(&[
+            "HMAC_SECRET_KEY",
+            "DUCKLAKE_CATALOG_CONNSTR",
+            "UPLOAD_STAGING_ROOT",
+        ]);
+        let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
+        std::env::set_var("HMAC_SECRET_KEY", &secret);
+        std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
+        std::env::set_var("UPLOAD_STAGING_ROOT", "relative/staging");
+        let err = Settings::from_env().unwrap_err();
+        assert!(
+            err.contains("must be an absolute path"),
+            "error should mention absolute path requirement: {err}"
         );
     }
 
