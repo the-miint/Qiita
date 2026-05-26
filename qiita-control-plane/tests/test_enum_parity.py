@@ -22,6 +22,8 @@ from qiita_common.models import (
     Platform,
     ProcessingKind,
     ScopeTargetKind,
+    TerminologyStatus,
+    TerminologyTermObsoletionKind,
     Tier,
     WorkTicketFailureStage,
     WorkTicketState,
@@ -44,6 +46,8 @@ ENUM_PAIRS = [
     (WorkTicketState, "work_ticket_state"),
     (FailureType, "failure_type"),
     (WorkTicketFailureStage, "work_ticket_failure_stage"),
+    (TerminologyStatus, "terminology_status"),
+    (TerminologyTermObsoletionKind, "terminology_term_obsoletion_kind"),
 ]
 
 

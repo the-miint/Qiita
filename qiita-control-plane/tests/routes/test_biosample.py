@@ -22,6 +22,7 @@ from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import FieldDataType
 
 from qiita_control_plane.testing.db_seeds import (
+    fetch_seeded_metagenome_term,
     retire_biosample,
     retire_biosample_to_study_link,
     seed_biosample,
@@ -91,6 +92,9 @@ async def _cleanup_tracked(pool, created: dict) -> None:
     so the subtype row must go first.
     """
     await delete_idxs(pool, "biosample_metadata", created["biosample_metadata"])
+    # biosample_metadata.value_missing_reason_idx FKs missing_value_reason
+    # ON DELETE RESTRICT; sweep after the metadata rows are gone.
+    await delete_idxs(pool, "missing_value_reason", created["missing_value_reason"])
     await delete_idxs(pool, "biosample_study_field", created["biosample_study_field"])
     await delete_idxs(pool, "biosample_global_field", created["biosample_global_field"])
     for bs, st in created["biosample_to_study"]:
@@ -147,6 +151,7 @@ async def ctx(role_keyed_clients):
     """
     created: dict = {
         "biosample_metadata": [],
+        "missing_value_reason": [],
         "biosample_study_field": [],
         "biosample_global_field": [],
         "biosample_to_study": [],
@@ -882,6 +887,46 @@ async def test_post_biosample_metadata_owner_id_collision_422(ctx):
     assert "owner_biosample_id_field_name" in resp.json()["detail"]
 
 
+async def test_post_biosample_owner_id_missing_value_marker_422(ctx):
+    """Tests the case where owner_biosample_id_value matches a known
+    missing_value_reason name: the composer raises
+    BiosampleOwnerIdMissingValueError and the route maps it to 422
+    naming the offending value. No biosample row is created.
+    """
+    reason_name = f"reason_{secrets.token_hex(4)}"
+    reason_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.missing_value_reason (name) VALUES ($1) RETURNING idx",
+        reason_name,
+    )
+    ctx["created"]["missing_value_reason"].append(reason_idx)
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="owner-mv"
+    )
+    ctx["created"]["study"].append(study_idx)
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=_unique_field_name("owner_mv"),
+        owner_biosample_id_value=reason_name,
+        metadata={},
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert reason_name in detail
+    assert "missing-value marker" in detail
+
+    # No biosample row landed: the pre-flight rejection fired before any
+    # INSERT, and the route's transaction rolled back.
+    bs_count = await ctx["pool"].fetchval(
+        "SELECT COUNT(*) FROM qiita.biosample_to_study WHERE study_idx = $1",
+        study_idx,
+    )
+    assert bs_count == 0
+
+
 async def test_post_biosample_metadata_uses_seeded_globals(ctx):
     # Realistic 6-field MIxS-style import that resolves global fields
     # against the rows seeded by migration 20260501000014 instead of
@@ -1385,6 +1430,165 @@ async def test_get_biosample_system_admin_bypasses_access(ctx):
         "retire_reason": None,
         "global_metadata": {},
         "caller_system_role": "system_admin",
+    }
+    assert rj == expected
+
+
+async def test_get_biosample_carries_missing_reason_marker(ctx):
+    """Tests the case where a globally-linked metadata row is an
+    intentionally-missing entry: the GET response surfaces the row's
+    value as a MissingReasonRef on the wire (idx + name).
+    """
+    suffix = secrets.token_hex(4)
+    reason_name = f"reason_{suffix}"
+    reason_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.missing_value_reason (name) VALUES ($1) RETURNING idx",
+        reason_name,
+    )
+    ctx["created"]["missing_value_reason"].append(reason_idx)
+
+    # NUMERIC global field; a literal reason name would fail typed parsing
+    # without the missing-reason routing, so the assertion pinpoints that
+    # the read returned the marker shape (not a coerced typed value).
+    internal_name = f"r_miss_{suffix}"
+    display_name = f"Latitude {suffix}"
+    global_idx = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=internal_name,
+        display_name=display_name,
+        data_type=FieldDataType.NUMERIC,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="get-miss"
+    )
+    ctx["created"]["study"].append(study_idx)
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_value="META-MISS-1",
+        metadata={display_name: reason_name},
+    )
+    assert resp.status_code == 201, resp.text
+    bs_idx = resp.json()["biosample_idx"]
+    await _track_global_metadata_outputs(ctx, bs_idx, study_idx, [global_idx])
+
+    resp = await ctx["wet"].get(f"/api/v1/biosample/{bs_idx}")
+    assert resp.status_code == 200, resp.text
+    _assert_etag_quoted(resp)
+
+    rj = resp.json()
+    expected = {
+        "biosample_idx": bs_idx,
+        "owner_idx": ctx["wet_session"]["principal_idx"],
+        "metadata_checklist_idx": None,
+        "biosample_accession": None,
+        "ena_sample_accession": None,
+        "last_submission_at": None,
+        "submission_error": None,
+        "last_metadata_change_at": rj["last_metadata_change_at"],
+        "created_by_idx": ctx["wet_session"]["principal_idx"],
+        "created_at": rj["created_at"],
+        "updated_at": rj["updated_at"],
+        "retired": False,
+        "retired_by_idx": None,
+        "retired_at": None,
+        "retire_reason": None,
+        "global_metadata": {
+            internal_name: {
+                "display_name": display_name,
+                "description": None,
+                "data_type": "numeric",
+                "value": {"kind": "missing_reason", "idx": reason_idx, "name": reason_name},
+            },
+        },
+        "caller_system_role": "wet_lab_admin",
+    }
+    assert rj == expected
+
+
+async def test_get_biosample_carries_terminology_term(ctx):
+    """Tests the case where a globally-linked metadata row is a terminology
+    term (value_terminology_term_idx populated): the GET response surfaces
+    the row's value as a TerminologyTermRef on the wire (idx + term_id +
+    label).
+    """
+    # Reuse the seeded NCBI Taxonomy + metagenome term.
+    term_row = await fetch_seeded_metagenome_term(ctx["pool"])
+    terminology_idx = term_row["terminology_idx"]
+
+    # TERMINOLOGY global field bound to NCBI Taxonomy so the
+    # value_terminology_term_idx write satisfies the field contract.
+    suffix = secrets.token_hex(4)
+    internal_name = f"r_term_{suffix}"
+    display_name = f"Sample Taxon {suffix}"
+    global_idx = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=internal_name,
+        display_name=display_name,
+        data_type=FieldDataType.TERMINOLOGY,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+        terminology_idx=terminology_idx,
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="get-term"
+    )
+    ctx["created"]["study"].append(study_idx)
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_value="META-TERM-1",
+        metadata={display_name: term_row["term_id"]},
+    )
+    assert resp.status_code == 201, resp.text
+    bs_idx = resp.json()["biosample_idx"]
+    await _track_global_metadata_outputs(ctx, bs_idx, study_idx, [global_idx])
+
+    resp = await ctx["wet"].get(f"/api/v1/biosample/{bs_idx}")
+    assert resp.status_code == 200, resp.text
+    _assert_etag_quoted(resp)
+
+    rj = resp.json()
+    expected = {
+        "biosample_idx": bs_idx,
+        "owner_idx": ctx["wet_session"]["principal_idx"],
+        "metadata_checklist_idx": None,
+        "biosample_accession": None,
+        "ena_sample_accession": None,
+        "last_submission_at": None,
+        "submission_error": None,
+        "last_metadata_change_at": rj["last_metadata_change_at"],
+        "created_by_idx": ctx["wet_session"]["principal_idx"],
+        "created_at": rj["created_at"],
+        "updated_at": rj["updated_at"],
+        "retired": False,
+        "retired_by_idx": None,
+        "retired_at": None,
+        "retire_reason": None,
+        "global_metadata": {
+            internal_name: {
+                "display_name": display_name,
+                "description": None,
+                "data_type": "terminology",
+                "value": {
+                    "kind": "terminology_term",
+                    "idx": term_row["idx"],
+                    "term_id": term_row["term_id"],
+                    "label": term_row["label"],
+                },
+            },
+        },
+        "caller_system_role": "wet_lab_admin",
     }
     assert rj == expected
 

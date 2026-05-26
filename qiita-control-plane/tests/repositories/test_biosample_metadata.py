@@ -15,7 +15,7 @@ from qiita_common.models import FieldDataType
 
 from qiita_control_plane.repositories._sample_helpers import (
     _get_or_create_local_study_field,
-    _insert_typed_metadata,
+    _insert_metadata,
 )
 from qiita_control_plane.repositories.biosample_metadata import (
     BIOSAMPLE_METADATA_SPEC,
@@ -321,7 +321,7 @@ async def test_insert_owner_biosample_id_metadata_rejects_second_flagged_row(ctx
             )
 
 
-async def test__insert_typed_metadata_allows_many_non_owner_id_rows_per_biosample(ctx):
+async def test__insert_metadata_allows_many_non_owner_id_rows_per_biosample(ctx):
     """Verify the partial unique index does not over-restrict non-flagged
     rows: the shared typed inserter never touches is_owner_biosample_id,
     so the DB default keeps the column FALSE and multiple rows for the
@@ -333,7 +333,7 @@ async def test__insert_typed_metadata_allows_many_non_owner_id_rows_per_biosampl
     field2_idx = await _create_local_field(ctx, "b")
 
     async with ctx["pool"].acquire() as conn:
-        m1 = await _insert_typed_metadata(
+        m1 = await _insert_metadata(
             conn,
             spec=BIOSAMPLE_METADATA_SPEC,
             entity_idx=bs_idx,
@@ -342,7 +342,7 @@ async def test__insert_typed_metadata_allows_many_non_owner_id_rows_per_biosampl
             value="VAL-A",
             created_by_idx=ctx["principal_idx"],
         )
-        m2 = await _insert_typed_metadata(
+        m2 = await _insert_metadata(
             conn,
             spec=BIOSAMPLE_METADATA_SPEC,
             entity_idx=bs_idx,

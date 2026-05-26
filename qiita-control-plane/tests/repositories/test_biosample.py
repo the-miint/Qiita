@@ -38,6 +38,7 @@ from qiita_control_plane.repositories.biosample import (
 from qiita_control_plane.repositories.biosample_metadata import (
     BIOSAMPLE_METADATA_SPEC,
     BiosampleOwnerIdFieldCollisionError,
+    BiosampleOwnerIdMissingValueError,
 )
 from qiita_control_plane.testing.db_seeds import (
     retire_biosample,
@@ -787,6 +788,146 @@ async def test_import_biosample_from_owner_biosample_id_raises_on_owner_id_field
                     metadata={shared_name: "x"},
                 )
     assert excinfo.value.display_name == shared_name
+
+
+async def test_import_biosample_from_owner_biosample_id_owner_id_missing_value_raises(ctx):
+    """Tests the case where owner_biosample_id_value matches a known
+    missing_value_reason name: the composer raises
+    BiosampleOwnerIdMissingValueError before any DB write commits.
+    """
+    reason_name = f"reason_{secrets.token_hex(4)}"
+    reason_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.missing_value_reason (name) VALUES ($1) RETURNING idx",
+        reason_name,
+    )
+    ctx["created"]["missing_value_reason"].append(reason_idx)
+    field_name = _unique_field_name("owner_missing")
+
+    # Run the composer in a transaction so partial state rolls back; the
+    # caller-facing 422 path on the route also relies on the same rollback.
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(BiosampleOwnerIdMissingValueError) as excinfo:
+            async with conn.transaction():
+                await import_biosample_from_owner_biosample_id(
+                    conn,
+                    primary_study_idx=ctx["study_idx"],
+                    owner_idx=ctx["biosample_owner_idx"],
+                    owner_biosample_id_field_name=field_name,
+                    owner_biosample_id_value=reason_name,
+                    caller_idx=ctx["principal_idx"],
+                    metadata={},
+                )
+    assert excinfo.value.owner_biosample_id_value == reason_name
+    assert excinfo.value.reason_idx == reason_idx
+
+    # No biosample row was created: the rejection fired before any INSERT.
+    bs_count = await ctx["pool"].fetchval(
+        "SELECT COUNT(*) FROM qiita.biosample WHERE owner_idx = $1",
+        ctx["biosample_owner_idx"],
+    )
+    assert bs_count == 0
+
+
+async def test_import_biosample_from_owner_biosample_id_owner_id_padded_marker_raises(ctx):
+    """Tests the case where owner_biosample_id_value matches a known
+    missing_value_reason name surrounded by whitespace: the composer strips
+    the value for marker recognition and still raises
+    BiosampleOwnerIdMissingValueError, carrying the raw padded value.
+    """
+    reason_name = f"reason_{secrets.token_hex(4)}"
+    reason_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.missing_value_reason (name) VALUES ($1) RETURNING idx",
+        reason_name,
+    )
+    ctx["created"]["missing_value_reason"].append(reason_idx)
+    field_name = _unique_field_name("owner_padded_missing")
+    padded_value = f"  {reason_name}  "
+
+    # Run the composer in a transaction so partial state rolls back.
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(BiosampleOwnerIdMissingValueError) as excinfo:
+            async with conn.transaction():
+                await import_biosample_from_owner_biosample_id(
+                    conn,
+                    primary_study_idx=ctx["study_idx"],
+                    owner_idx=ctx["biosample_owner_idx"],
+                    owner_biosample_id_field_name=field_name,
+                    owner_biosample_id_value=padded_value,
+                    caller_idx=ctx["principal_idx"],
+                    metadata={},
+                )
+    # The raw padded value is preserved on the error so the user sees what they sent.
+    assert excinfo.value.owner_biosample_id_value == padded_value
+    assert excinfo.value.reason_idx == reason_idx
+
+    # No biosample row was created: the rejection fired before any INSERT.
+    bs_count = await ctx["pool"].fetchval(
+        "SELECT COUNT(*) FROM qiita.biosample WHERE owner_idx = $1",
+        ctx["biosample_owner_idx"],
+    )
+    assert bs_count == 0
+
+
+async def test_import_biosample_from_owner_biosample_id_metadata_missing_value_persists(ctx):
+    """Tests the case where a metadata text value matches a known
+    missing_value_reason name: the composer routes the value to
+    value_missing_reason_idx and the resulting row carries every typed
+    value column NULL.
+    """
+    suffix = secrets.token_hex(4)
+    reason_name = f"reason_{suffix}"
+    reason_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.missing_value_reason (name) VALUES ($1) RETURNING idx",
+        reason_name,
+    )
+    ctx["created"]["missing_value_reason"].append(reason_idx)
+
+    # NUMERIC global field; a literal reason name would fail typed parsing
+    # without the missing-reason routing, so the test pinpoints that
+    # routing fires.
+    global_idx = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=f"num_{suffix}",
+        display_name=f"Latitude {suffix}",
+        data_type=FieldDataType.NUMERIC,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+
+    field_name = _unique_field_name("owner_id")
+    async with ctx["pool"].acquire() as conn:
+        async with conn.transaction():
+            result = await import_biosample_from_owner_biosample_id(
+                conn,
+                primary_study_idx=ctx["study_idx"],
+                owner_idx=ctx["biosample_owner_idx"],
+                owner_biosample_id_field_name=field_name,
+                owner_biosample_id_value="OWNER-MV-1",
+                caller_idx=ctx["principal_idx"],
+                metadata={f"Latitude {suffix}": reason_name},
+            )
+    bs_idx = result.biosample_idx
+    await _track_composer_outputs(ctx, bs_idx, ctx["study_idx"], field_name)
+    await _track_global_metadata_outputs(ctx, bs_idx, ctx["study_idx"], [global_idx])
+
+    # Assert one non-owner-id metadata row exists, with
+    # value_missing_reason_idx populated and every typed column NULL.
+    rows = await ctx["pool"].fetch(
+        "SELECT global_field_idx, value_text, value_numeric, value_date,"
+        " value_missing_reason_idx"
+        " FROM qiita.biosample_metadata"
+        " WHERE biosample_idx = $1 AND is_owner_biosample_id = false",
+        bs_idx,
+    )
+    assert [dict(r) for r in rows] == [
+        {
+            "global_field_idx": global_idx,
+            "value_text": None,
+            "value_numeric": None,
+            "value_date": None,
+            "value_missing_reason_idx": reason_idx,
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------

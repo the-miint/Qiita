@@ -1,7 +1,7 @@
 """Cross-route helpers shared by sibling route modules.
 
 Hosts the ETag formatter that every PATCH-bearing route calls and the
-global-field collision detail builder that every metadata-writing
+metadata slot-collision detail builder that every metadata-writing
 route calls. Lifting both here keeps response wording consistent across
 endpoints — same input shape, same on-the-wire output.
 """
@@ -10,16 +10,32 @@ from datetime import datetime
 
 import asyncpg
 from fastapi import HTTPException
+from qiita_common.models import MissingReasonRef, TerminologyTermRef
 
 from ..repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
     ConflictingValueSameStudyError,
     DuplicateValueDifferentStudyError,
     DuplicateValueSameStudyError,
-    GlobalFieldSlotOccupiedError,
     SlotOccupiedByMissingReasonError,
+    SlotOccupiedByTypedValueError,
+    SlotOccupiedError,
     TransientWriteRaceError,
 )
+
+
+def _attempted_label(value: object) -> str:
+    """Render the 'what was attempted' noun for a slot-collision message.
+
+    Returns "missing-reason marker" for MissingReasonRef, "terminology
+    term" for TerminologyTermRef, and "value" for bare typed scalars.
+    """
+    if isinstance(value, MissingReasonRef):
+        return "missing-reason marker"
+    if isinstance(value, TerminologyTermRef):
+        return "terminology term"
+    return "value"
+
 
 # Shared 422-detail string for a foreign-key violation whose constraint
 # is not in a route's specific message map. Lifted here so the wording
@@ -38,84 +54,131 @@ def etag_for_updated_at(updated_at: datetime) -> str:
     return f'"{updated_at.isoformat()}"'
 
 
-async def detail_for_global_field_collision(
+async def detail_for_slot_collision(
     conn: asyncpg.Connection,
-    exc: GlobalFieldSlotOccupiedError,
+    exc: SlotOccupiedError,
 ) -> str:
-    """Build the HTTP-409 detail string for a global-field slot collision.
+    """Build the HTTP-409 detail string for a metadata slot collision.
 
-    Dispatches on the GlobalFieldSlotOccupiedError subclass to produce
-    a sub-case-specific message; both metadata-writing routes (biosample
-    import, sequenced-sample create) call this so wording stays
-    consistent across endpoints. For the missing-reason sub-case the
-    helper resolves the missing_value_reason row's name with one extra
-    SELECT against the spec-known table — actionability over terseness,
-    so the caller learns what reason occupies the slot.
+    Dispatches on the SlotOccupiedError subclass to produce a sub-case-
+    specific message; both metadata-writing routes (biosample import,
+    sequenced-sample create) call this so wording stays consistent
+    across endpoints. Both the global-write and local-write paths route
+    through this dispatcher: exc.global_field_idx is non-None for the
+    global path and None for the local path, selecting the slot
+    identifier embedded in the message. For the missing-reason sub-case
+    the helper resolves the missing_value_reason row's name with one
+    extra SELECT against the spec-known table — actionability over
+    terseness, so the caller learns what reason occupies the slot.
 
     Returns the bare string; the caller wraps it in HTTPException with
-    status 409. Per the project decision, all five sub-cases return 409
-    (Conflict): they describe the same shape of failure (your write
-    conflicts with current state) and differ only in the precise reason.
-    Contributing study idx is surfaced so callers can correlate; study
-    name is intentionally not joined (caller may not have read access to
-    that study).
+    status 409. Per the project decision, all six sub-cases return 409
+    (Conflict). Contributing study idx is surfaced so callers can
+    correlate; study name is intentionally not joined (caller may not
+    have read access to that study).
     """
+    # The same/different subclasses cover typed-vs-typed,
+    # missing-vs-missing, and terminology-vs-terminology equality; the
+    # attempted_value's kind selects the wording noun per branch via
+    # _attempted_label.
+    what = _attempted_label(exc.attempted_value)
+    # Slot identifier: global path is keyed by global_field_idx, local
+    # path by the entity-scoped study_field_idx. The non-None-ness of
+    # exc.global_field_idx discriminates without a separate flag.
+    slot_id = (
+        f"global_field_idx={exc.global_field_idx}"
+        if exc.global_field_idx is not None
+        else f"{exc.entity_kind}_study_field_idx={exc.study_field_idx}"
+    )
     # Match on the concrete subclass to pick the right wording. The
-    # generic GlobalFieldSlotOccupiedError fallback covers any future
-    # subclass added without a wording branch here; reading the catch-
-    # all message in production points the maintainer at this dispatch.
+    # generic SlotOccupiedError fallback covers any future subclass
+    # added without a wording branch here; reading the catch-all
+    # message in production points the maintainer at this dispatch.
     if isinstance(exc, DuplicateValueSameStudyError):
         return (
-            f"your study already wrote this same value for"
-            f" {exc.entity_kind}_idx={exc.entity_idx}"
-            f" (global_field_idx={exc.global_field_idx}); no new row was created"
+            f"your study already wrote this same {what} for field"
+            f" {exc.display_name!r} on {exc.entity_kind}_idx={exc.entity_idx}"
+            f" ({slot_id}); no new row was created"
         )
     if isinstance(exc, ConflictingValueSameStudyError):
         return (
-            f"your study previously wrote a different value for"
-            f" {exc.entity_kind}_idx={exc.entity_idx}"
-            f" (global_field_idx={exc.global_field_idx});"
+            f"your study previously wrote a different {what} for field"
+            f" {exc.display_name!r} on {exc.entity_kind}_idx={exc.entity_idx}"
+            f" ({slot_id});"
             f" correct it via PATCH or DELETE+INSERT, not INSERT"
         )
     if isinstance(exc, DuplicateValueDifferentStudyError):
         return (
-            f"the value you attempted is already present for"
-            f" {exc.entity_kind}_idx={exc.entity_idx}"
-            f" (global_field_idx={exc.global_field_idx}), contributed by"
+            f"the {what} you attempted is already present for field"
+            f" {exc.display_name!r} on {exc.entity_kind}_idx={exc.entity_idx}"
+            f" ({slot_id}), contributed by"
             f" study_idx={exc.contributing_study_idx}; your study does"
             f" not own the row"
         )
     if isinstance(exc, ConflictingValueDifferentStudyError):
         return (
             f"another study (study_idx={exc.contributing_study_idx}) has"
-            f" written a different value for"
-            f" {exc.entity_kind}_idx={exc.entity_idx}"
-            f" (global_field_idx={exc.global_field_idx});"
+            f" written a different {what} for field"
+            f" {exc.display_name!r} on {exc.entity_kind}_idx={exc.entity_idx}"
+            f" ({slot_id});"
             f" the global field's canonical value is in dispute"
         )
     if isinstance(exc, SlotOccupiedByMissingReasonError):
         # One extra SELECT to resolve the human-readable reason name so the
         # caller knows what reason occupies the slot; the missing_value_reason
         # table is shared across all entity kinds (no spec dispatch needed).
+        # existing_missing_reason_idx is non-None whenever this subclass fires
+        # (the diagnose path only constructs it when the missing-reason FK is
+        # populated); the assert documents the invariant for asyncpg's binder.
+        assert exc.existing_missing_reason_idx is not None
         reason_name = await conn.fetchval(
             "SELECT name FROM qiita.missing_value_reason WHERE idx = $1",
             exc.existing_missing_reason_idx,
         )
         return (
-            f"the value for {exc.entity_kind}_idx={exc.entity_idx}"
-            f" (global_field_idx={exc.global_field_idx}) is recorded as"
-            f" intentionally missing (reason: {reason_name});"
+            f"the value for field {exc.display_name!r} on"
+            f" {exc.entity_kind}_idx={exc.entity_idx} ({slot_id}) is"
+            f" recorded as intentionally missing (reason: {reason_name});"
             f" the missing-reason row must be deleted before a typed"
             f" value can be written"
+        )
+    if isinstance(exc, SlotOccupiedByTypedValueError):
+        # Existing typed value travels on the exception payload — no DB
+        # roundtrip needed for str/Decimal/date. A terminology-term slot
+        # carries an int FK (qiita.terminology_term.idx); resolve it to
+        # the human-readable term_id + label with one extra SELECT so the
+        # caller sees what term occupies the slot rather than a bare idx.
+        # str values render via repr() (quoting distinguishes "123" from 123);
+        # Decimal / date render via str() so the body shows "1.5" / "2024-01-02"
+        # instead of "Decimal('1.5')" / "datetime.date(2024, 1, 2)".
+        if isinstance(exc.existing_value, int) and not isinstance(exc.existing_value, bool):
+            term_row = await conn.fetchrow(
+                "SELECT term_id, label FROM qiita.terminology_term WHERE idx = $1",
+                exc.existing_value,
+            )
+            rendered_existing = (
+                f"terminology term {term_row['term_id']!r} ({term_row['label']!r})"
+                if term_row is not None
+                else f"terminology_term_idx={exc.existing_value}"
+            )
+        elif isinstance(exc.existing_value, str):
+            rendered_existing = repr(exc.existing_value)
+        else:
+            rendered_existing = str(exc.existing_value)
+        return (
+            f"the value for field {exc.display_name!r} on"
+            f" {exc.entity_kind}_idx={exc.entity_idx} ({slot_id}) is"
+            f" already recorded as a typed value ({rendered_existing});"
+            f" the typed row must be deleted before a missing-reason"
+            f" marker can be written"
         )
     # Fallback: an unrecognised subclass means the exception hierarchy
     # grew without the dispatch above being extended. Surface a generic
     # message rather than crashing the route; the maintainer can find
     # the missing branch via this string.
     return (
-        f"{exc.entity_kind}_metadata global-field slot is already occupied"
-        f" (entity_idx={exc.entity_idx},"
-        f" global_field_idx={exc.global_field_idx})"
+        f"{exc.entity_kind}_metadata slot for {exc.display_name!r} is"
+        f" already occupied (entity_idx={exc.entity_idx}, {slot_id})"
     )
 
 
