@@ -1,9 +1,11 @@
 """Control plane FastAPI application."""
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import asyncpg
 from fastapi import Depends, FastAPI
+from fastapi.staticfiles import StaticFiles
 from qiita_common.log import install_authorization_scrub
 from qiita_common.models import HealthResponse
 
@@ -16,7 +18,10 @@ from .dispatch import (
     drain_running_dispatches,
     recover_orphaned_tickets,
 )
+from .landing import router as landing_router
 from .routes import api_router
+
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 # Bound on how long we wait for in-flight dispatches at shutdown. systemd's
 # default TimeoutStopSec is 90s; staying under that lets us cancel cleanly
@@ -69,6 +74,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="qiita-control-plane", lifespan=lifespan)
 app.include_router(api_router)
+app.include_router(landing_router)
+app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 
 @app.get("/health")
