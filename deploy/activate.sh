@@ -82,6 +82,19 @@ install -m 0755 "$INCOMING/qiita-data-plane" /opt/qiita/data-plane/qiita-data-pl
 cp "$INCOMING/deploy/nginx/qiita.conf" /etc/nginx/conf.d/qiita.conf
 sed -i "s/__QIITA_HOSTNAME__/${QIITA_HOSTNAME}/g" /etc/nginx/conf.d/qiita.conf
 cp "$INCOMING/deploy/systemd/"*.service /etc/systemd/system/
+# Install systemd dropin directories. Each dropin lives under
+# deploy/systemd/<unit>.service.d/*.conf and is materialized at
+# /etc/systemd/system/<unit>.service.d/. Loop over every present dropin
+# tree so new dropins drop in without editing this script.
+for dropin_src in "$INCOMING/deploy/systemd/"*.service.d; do
+    [ -d "$dropin_src" ] || continue
+    unit_dropin_name=$(basename "$dropin_src")
+    install -d -o root -g root -m 0755 "/etc/systemd/system/$unit_dropin_name"
+    for conf in "$dropin_src"/*.conf; do
+        [ -e "$conf" ] || continue
+        install -m 0644 -o root -g root "$conf" "/etc/systemd/system/$unit_dropin_name/"
+    done
+done
 systemctl daemon-reload
 
 # Skip restart when env file is absent (first deploy; operator writes envs in runbook steps 1/8b/9a).
