@@ -196,10 +196,18 @@ def build_job_submit_payload(
     # params.json (typed as JobParams in slurm/contract.py) remains the
     # contract source of truth for everything else — step_name,
     # scope_target, inputs, output_path.
+    #
+    # HOME=<workspace> is set because the native-step jobs run DuckDB
+    # with the miint extension, which caches the extension shared
+    # library under $HOME/.duckdb/extensions/. SLURM jobs on this
+    # cluster don't get a useful HOME by default; pointing at the
+    # per-ticket workspace gives each job a writable scratch HOME
+    # that's cleaned up with the workspace.
     env: dict[str, str] = {
         "QIITA_INPUT_PATH": str(input_path),
         "QIITA_OUTPUT_PATH": str(output_path),
         "QIITA_WORK_TICKET_IDX": str(work_ticket_idx),
+        "HOME": str(workspace),
     }
     if extra_env:
         env.update(extra_env)

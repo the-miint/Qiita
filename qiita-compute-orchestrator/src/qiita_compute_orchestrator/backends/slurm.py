@@ -84,6 +84,9 @@ class SlurmBackend(ComputeBackend):
         poll_interval_seconds: int,
         job_timeout_seconds: int,
         native_python: str = "python",
+        cp_to_co_token: str = "",
+        co_to_cp_token: str = "",
+        cp_url: str = "",
     ) -> None:
         self._client = client
         self._partition = partition
@@ -91,6 +94,16 @@ class SlurmBackend(ComputeBackend):
         self._poll_interval = poll_interval_seconds
         self._job_timeout = job_timeout_seconds
         self._native_python = native_python
+        # Tokens + CP URL are propagated into the SLURM job env so the
+        # native-step launcher running on a compute node can resolve
+        # Settings.from_env() without reading /etc/qiita/*.token (which
+        # is deploy-host-local). They're empty in unit tests that don't
+        # care about the propagation; production wires real values in
+        # main._build_backend(). Tokens land in `scontrol show job` —
+        # acceptable for qiita's own cluster; see PR description.
+        self._cp_to_co_token = cp_to_co_token
+        self._co_to_cp_token = co_to_cp_token
+        self._cp_url = cp_url
 
     async def aclose(self) -> None:
         """Close the underlying httpx client so asyncio doesn't warn
@@ -182,6 +195,24 @@ class SlurmBackend(ComputeBackend):
             gpu=baseline_resources.gpu,
         )
 
+        # Compose the SLURM job's extra env. The native-step launcher
+        # on the compute node calls Settings.from_env() and needs the
+        # CP↔CO tokens + QIITA_CP_URL — but it can't read
+        # /etc/qiita/*.token (deploy-host-local). We propagate the
+        # already-resolved tokens here and flip QIITA_ALLOW_TOKEN_ENV
+        # so the launcher accepts them via env. Empty values mean
+        # "don't propagate" (unit tests that don't exercise the launcher
+        # path leave them empty); production main.py wires real values.
+        extra_env: dict[str, str] = {}
+        if self._cp_to_co_token:
+            extra_env["CP_TO_CO_TOKEN"] = self._cp_to_co_token
+        if self._co_to_cp_token:
+            extra_env["CO_TO_CP_TOKEN"] = self._co_to_cp_token
+        if self._cp_to_co_token or self._co_to_cp_token:
+            extra_env["QIITA_ALLOW_TOKEN_ENV"] = "true"
+        if self._cp_url:
+            extra_env["QIITA_CP_URL"] = self._cp_url
+
         payload = build_job_submit_payload(
             step_name=name,
             work_ticket_idx=work_ticket_idx,
@@ -197,6 +228,7 @@ class SlurmBackend(ComputeBackend):
             partition=self._partition,
             account=self._account,
             native_python=self._native_python,
+            extra_env=extra_env or None,
         )
 
         try:

@@ -96,6 +96,15 @@ def test_payload_environment_includes_qiita_paths(common_kwargs):
     assert env["QIITA_WORK_TICKET_IDX"] == str(common_kwargs["work_ticket_idx"])
 
 
+def test_payload_environment_sets_home_to_workspace(common_kwargs):
+    """HOME must point at the per-job workspace so DuckDB+miint's
+    extension cache lands inside the cleaned-up workspace tree
+    instead of failing on a no-HOME compute node."""
+    payload = build_job_submit_payload(**common_kwargs)
+    env = dict(item.split("=", 1) for item in payload["job"]["environment"])
+    assert env["HOME"] == str(common_kwargs["workspace"])
+
+
 def test_payload_environment_extra_env_merged(common_kwargs):
     common_kwargs["extra_env"] = {"FOO": "bar", "BAZ": "qux"}
     payload = build_job_submit_payload(**common_kwargs)
