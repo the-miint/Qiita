@@ -1,9 +1,22 @@
 """Tests for compute backend abstraction."""
 
+import base64
+import json
 from abc import ABC
 from pathlib import Path
 
 import pytest
+
+
+def _make_jwt(sun: str) -> str:
+    """Minimal JWT-shaped string with the given `sun` claim. Used by
+    the SLURM-backend constructor test below; SlurmrestdClient refuses
+    to load a token whose sun doesn't match user_name."""
+
+    def _b64url(obj: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    return f"{_b64url({'alg': 'HS256'})}.{_b64url({'sun': sun})}.sig"
 
 
 def test_compute_backend_is_abstract():
@@ -33,7 +46,7 @@ async def test_slurm_backend_constructor_accepts_config(tmp_path):
     from qiita_compute_orchestrator.slurm import SlurmrestdClient
 
     jwt = tmp_path / "jwt"
-    jwt.write_text("test-jwt")
+    jwt.write_text(_make_jwt("qiita-orch"))
     client = SlurmrestdClient(
         base_url="http://x",
         jwt_path=jwt,

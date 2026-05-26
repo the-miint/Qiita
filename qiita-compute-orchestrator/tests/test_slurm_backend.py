@@ -8,6 +8,7 @@ FailureKind mapping.
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -21,10 +22,24 @@ from qiita_compute_orchestrator.backends.slurm import SlurmBackend
 from qiita_compute_orchestrator.slurm import SlurmrestdClient
 
 
+def _make_jwt(sun: str) -> str:
+    """Minimal JWT-shaped string with the given `sun` claim. See
+    test_slurm_client._make_jwt for the same helper; duplicated here
+    to keep test_slurm_backend.py self-contained without an awkward
+    cross-test-file import."""
+
+    def _b64url(obj: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    return f"{_b64url({'alg': 'HS256'})}.{_b64url({'sun': sun})}.sig"
+
+
 @pytest.fixture
 def jwt_path(tmp_path):
     p = tmp_path / "jwt"
-    p.write_text("test-jwt")
+    # user_name="qiita-orch" in _make_backend; sun must match or
+    # SlurmrestdClient refuses to construct.
+    p.write_text(_make_jwt("qiita-orch"))
     return p
 
 
