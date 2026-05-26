@@ -296,3 +296,100 @@ def test_force_fail_happy_path_runs_update(monkeypatch):
     assert len(fake.executed) == 1
     _query, params = fake.executed[0]
     assert params == (7, "step_run", "fastq", "hand-failed by operator")
+
+
+# ---------------------------------------------------------------------------
+# compute-readiness wrapper
+# ---------------------------------------------------------------------------
+
+
+def test_compute_readiness_missing_venv_returns_2(monkeypatch, tmp_path, capsys):
+    """When the orchestrator venv doesn't exist, the wrapper must
+    short-circuit before invoking subprocess.call — and the error
+    message must name the path it looked for so the operator can fix
+    the typo or pass --orchestrator-venv."""
+    from qiita_control_plane.cli import admin as cli
+
+    bogus = tmp_path / "no-such-venv"
+    # subprocess.call should NOT be reached on this path.
+    monkeypatch.setattr(
+        cli.subprocess,
+        "call",
+        lambda *a, **k: pytest.fail("subprocess.call should not run when python is missing"),
+    )
+    rc = cli.main(["compute-readiness", "--orchestrator-venv", str(bogus)])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert str(bogus / "bin" / "python") in err
+    assert "--orchestrator-venv" in err
+
+
+def test_compute_readiness_invokes_orchestrator_module(monkeypatch, tmp_path):
+    """Happy path: when the venv's python exists, the wrapper exec's
+    `<python> -m qiita_compute_orchestrator.cli.compute_readiness`
+    and returns whatever the subprocess returned. No translation."""
+    from qiita_control_plane.cli import admin as cli
+
+    venv = tmp_path / "venv"
+    python = venv / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/bin/sh\nexit 0\n")
+    python.chmod(0o755)
+
+    captured: dict[str, list] = {}
+
+    def fake_call(cmd, *a, **k):
+        captured["cmd"] = list(cmd)
+        return 0
+
+    monkeypatch.setattr(cli.subprocess, "call", fake_call)
+    rc = cli.main(["compute-readiness", "--orchestrator-venv", str(venv)])
+    assert rc == 0
+    assert captured["cmd"][0] == str(python)
+    assert captured["cmd"][1:4] == [
+        "-m",
+        "qiita_compute_orchestrator.cli.compute_readiness",
+    ]
+    # No optional flags were passed → none appear in the command.
+    assert "--no-slurm-probe" not in captured["cmd"]
+    assert "--json" not in captured["cmd"]
+    assert "--probe-timeout-seconds" not in captured["cmd"]
+
+
+def test_compute_readiness_propagates_flags(monkeypatch, tmp_path):
+    """Optional flags forward to the orchestrator-side CLI exactly. A
+    propagation bug here would silently mask the operator's intent
+    (e.g., a `--no-slurm-probe` request running the SLURM probe
+    anyway), so each flag is asserted independently."""
+    from qiita_control_plane.cli import admin as cli
+
+    venv = tmp_path / "venv"
+    python = venv / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/bin/sh\nexit 0\n")
+    python.chmod(0o755)
+
+    captured: dict[str, list] = {}
+
+    def fake_call(cmd, *a, **k):
+        captured["cmd"] = list(cmd)
+        return 1
+
+    monkeypatch.setattr(cli.subprocess, "call", fake_call)
+    rc = cli.main(
+        [
+            "compute-readiness",
+            "--orchestrator-venv",
+            str(venv),
+            "--no-slurm-probe",
+            "--json",
+            "--probe-timeout-seconds",
+            "120",
+        ]
+    )
+    assert rc == 1  # forwarded from subprocess
+    assert "--no-slurm-probe" in captured["cmd"]
+    assert "--json" in captured["cmd"]
+    # --probe-timeout-seconds is passed with its value as the next arg.
+    idx = captured["cmd"].index("--probe-timeout-seconds")
+    assert captured["cmd"][idx + 1] == "120.0"

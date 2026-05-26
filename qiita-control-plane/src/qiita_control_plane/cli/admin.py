@@ -35,6 +35,14 @@ Subcommands:
                      recovery pattern with a single command that
                      respects the schema's CHECK constraints. Refuses
                      to operate on already-terminal tickets.
+  compute-readiness — exercise the path qiita-job needs end-to-end and
+                     report per-check status (JWT, CP /healthz,
+                     SLURM_NATIVE_PYTHON on host, plus an optional
+                     SLURM probe-job that verifies the same env from
+                     a compute node). Subprocess-execs into the
+                     orchestrator's venv since the diagnostic uses the
+                     orchestrator's Settings.from_env() and
+                     SlurmrestdClient surfaces.
 
 Authentication for HTTP subcommands: read PAT from QIITA_TOKEN env var or
 from ~/.qiita/token (mode 0600 expected). Loopback login flow, token I/O,
@@ -45,6 +53,7 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -64,6 +73,13 @@ from . import _common
 # DB is expected to be reachable on the operator's network; a multi-second
 # stall here masks misconfiguration.
 _DB_CONNECT_TIMEOUT_SECONDS = 5
+
+# Production install location for the orchestrator's venv (matches
+# deploy/activate.sh's `(cd /opt/qiita/compute-orchestrator && uv sync ...)`).
+# `compute-readiness` subprocess-execs `<venv>/bin/python -m
+# qiita_compute_orchestrator.cli.compute_readiness`. Overridable via
+# --orchestrator-venv for dev hosts or unusual layouts.
+_DEFAULT_ORCHESTRATOR_VENV = Path("/opt/qiita/compute-orchestrator/.venv")
 
 # Derived from SystemRole so the role list isn't repeated anywhere in this
 # file — adding `SystemRole.X` widens validation, error message, and `--help`
@@ -346,6 +362,48 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_actions_sync.set_defaults(handler=_handle_actions_sync)
 
+    p_readiness = sub.add_parser(
+        "compute-readiness",
+        help=(
+            "Exercise the path qiita-job needs and report per-check status."
+            " Local checks (JWT, CP /healthz, SLURM_NATIVE_PYTHON on host)"
+            " plus an optional SLURM probe-job."
+        ),
+    )
+    p_readiness.add_argument(
+        "--orchestrator-venv",
+        type=Path,
+        default=_DEFAULT_ORCHESTRATOR_VENV,
+        help=(
+            "Path to the orchestrator's venv; the wrapper invokes"
+            f" `<venv>/bin/python -m qiita_compute_orchestrator.cli.compute_readiness`."
+            f" Default: {_DEFAULT_ORCHESTRATOR_VENV}"
+        ),
+    )
+    p_readiness.add_argument(
+        "--no-slurm-probe",
+        action="store_true",
+        dest="no_slurm_probe",
+        help="Skip the SLURM submit phase; run local checks only.",
+    )
+    p_readiness.add_argument(
+        "--json",
+        action="store_true",
+        dest="emit_json",
+        help="Emit JSON instead of the human-readable report.",
+    )
+    p_readiness.add_argument(
+        "--probe-timeout-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Override the orchestrator-side wait for the SLURM probe-job"
+            " (the probe itself also has a SLURM time_limit). Default: rely"
+            " on the orchestrator-side default."
+        ),
+    )
+    p_readiness.set_defaults(handler=_handle_compute_readiness)
+
     p_reference = sub.add_parser("reference", help="Reference-data lifecycle operations")
     p_reference_sub = p_reference.add_subparsers(dest="reference_cmd", required=True)
     p_reference_load = p_reference_sub.add_parser(
@@ -449,6 +507,35 @@ def _handle_actions_sync(args: argparse.Namespace, parser: argparse.ArgumentPars
         return 1
     print(json.dumps(result, indent=2))
     return 0
+
+
+def _handle_compute_readiness(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Subprocess into the orchestrator's venv to run the compute-readiness
+    diagnostic. The orchestrator owns the actual checks (it has the
+    Settings.from_env() + SlurmrestdClient surface); this wrapper is a
+    thin pass-through so operators have a single `qiita-admin` UX
+    surface for cluster-side problems too.
+
+    Returns the subprocess's exit code verbatim so non-zero from any
+    check failure propagates up through `qiita-admin` cleanly.
+    """
+    venv: Path = args.orchestrator_venv
+    python = venv / "bin" / "python"
+    if not python.exists():
+        print(
+            f"error: orchestrator python not found at {python}."
+            " Pass --orchestrator-venv if the venv is installed elsewhere.",
+            file=sys.stderr,
+        )
+        return 2
+    cmd = [str(python), "-m", "qiita_compute_orchestrator.cli.compute_readiness"]
+    if args.no_slurm_probe:
+        cmd.append("--no-slurm-probe")
+    if args.emit_json:
+        cmd.append("--json")
+    if args.probe_timeout_seconds is not None:
+        cmd += ["--probe-timeout-seconds", str(args.probe_timeout_seconds)]
+    return subprocess.call(cmd)
 
 
 def _handle_ticket_force_fail(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

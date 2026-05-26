@@ -997,6 +997,33 @@ nginx routing + PAT verification + Postgres reachability all work.
 - `502` — CP not reachable through nginx; back to step 5.
 - `500` — DB connectivity issue; `journalctl -u qiita-control-plane`.
 
+### 10d. Compute-readiness probe
+
+Before driving step 11's end-to-end smoke, verify the path qiita-job
+needs from a compute node. `qiita-admin compute-readiness` runs local
+checks (SLURM JWT shape + `sun` + `exp`, `SLURM_NATIVE_PYTHON` on the
+host, `QIITA_CP_URL/healthz` reachable with the CO→CP token) and, by
+default, submits a minimal SLURM probe-job that runs the same checks
+on a compute node — including whether the orchestrator's venv is
+visible there and whether the compute node can reach the CP.
+
+```bash
+# [operator]
+qiita-admin compute-readiness
+```
+
+Expected: every row `✓ pass` and a summary like `8 pass, 0 fail, N
+skip`. `skip` is non-fatal (e.g. `SLURM_NATIVE_PYTHON=python` skips
+the host-side native-python check because the path resolution depends
+on the compute node's PATH). Any `✗ fail` row names the misconfig:
+JWT mismatch / expired, CP unreachable, native-python missing on the
+compute node, shared FS not visible, etc. Re-run step 9b / 9c with the
+diagnosis applied before continuing.
+
+Pass `--no-slurm-probe` to skip the SLURM submission (host-only
+checks). Useful when the cluster is known-unreachable and you want to
+triage host-side state first.
+
 ## 11. End-to-end smoke
 
 The smoke uses the `fastq-to-parquet` workflow against a tiny single-

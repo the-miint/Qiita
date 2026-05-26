@@ -95,6 +95,20 @@ landed):
   experienced).
 - The SLURM job env now carries `HOME=<workspace>` so DuckDB+miint's
   extension cache lands inside the cleaned-up per-ticket workspace.
+- `qiita-admin compute-readiness` exercises the path `qiita-job` needs
+  end-to-end and reports per-check status. Local checks (SLURM JWT
+  shape + `sun` + `exp`, `SLURM_NATIVE_PYTHON` on host, `QIITA_CP_URL/
+  healthz` reachable with the CO→CP token) plus an optional SLURM
+  probe-job that runs the same checks from a compute node (orchestrator
+  venv visible there, shared FS writable, CP reachable from the
+  cluster). Step 10d of `docs/runbooks/first-deploy.md` shows the
+  expected pass/fail output. `--no-slurm-probe` runs host-only.
+- The SLURM job env now carries only the *outbound* CO→CP token, not
+  the inbound CP↔CO shared bearer. `Settings.from_env()` gained a
+  `require_cp_to_co_token` flag; `get_settings()`'s no-install
+  fallback (the SLURM-launcher path) passes `False`. Narrows the
+  `scontrol show job` exposure surface to the one token the launcher
+  actually uses.
 
 ---
 
