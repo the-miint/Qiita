@@ -20,9 +20,27 @@ SELECT t.idx, v.term_id, v.label
  WHERE t.name = 'NCBI Taxonomy'
 ON CONFLICT DO NOTHING;
 
+-- Refuse to flip taxon_id's data_type if any biosample_metadata rows
+-- already reference it: the metadata-side field-contract trigger fires
+-- on metadata DML, not on this field UPDATE, so pre-existing rows would
+-- survive silently misaligned under the new data_type.
+DO $$
+DECLARE n int;
+BEGIN
+    SELECT COUNT(*) INTO n
+      FROM qiita.biosample_metadata m
+      JOIN qiita.biosample_study_field bsf
+        ON bsf.idx = m.biosample_study_field_idx
+      JOIN qiita.biosample_global_field bgf
+        ON bgf.idx = bsf.biosample_global_field_idx
+     WHERE bgf.internal_name = 'taxon_id';
+    IF n > 0 THEN
+        RAISE EXCEPTION
+            'taxon_id has % biosample_metadata rows; data_type flip to terminology unsafe', n;
+    END IF;
+END $$;
+
 -- Bind taxon_id to NCBI Taxonomy now that the terminology exists.
--- Safe to flip data_type without backfill: no biosample_metadata
--- rows reference this field in deployed state.
 UPDATE qiita.biosample_global_field
    SET data_type = 'terminology',
        terminology_idx = (SELECT idx FROM qiita.terminology WHERE name = 'NCBI Taxonomy')
@@ -31,12 +49,30 @@ UPDATE qiita.biosample_global_field
 
 -- migrate:down
 
--- Reverse the taxon_id rebind first; the terminology FK is ON DELETE RESTRICT,
--- so the terminology row cannot be deleted while taxon_id references it.
--- Any biosample_metadata rows that wrote value_terminology_term_idx against
--- taxon_id while it was terminology-typed survive this flip (the trigger
--- fires on metadata DML, not on the field UPDATE), but become silently
--- inconsistent under the now-text data_type until they are deleted.
+-- Mirror of the up-direction guard: same hazard in reverse, since
+-- flipping back to 'text' would leave any value_terminology_term_idx
+-- rows silently inconsistent under the now-text data_type.
+-- same-pattern-ok: dbmate migrations cannot share code across the
+-- up/down blocks, so the guard is repeated rather than factored.
+DO $$
+DECLARE n int;
+BEGIN
+    SELECT COUNT(*) INTO n
+      FROM qiita.biosample_metadata m
+      JOIN qiita.biosample_study_field bsf
+        ON bsf.idx = m.biosample_study_field_idx
+      JOIN qiita.biosample_global_field bgf
+        ON bgf.idx = bsf.biosample_global_field_idx
+     WHERE bgf.internal_name = 'taxon_id';
+    IF n > 0 THEN
+        RAISE EXCEPTION
+            'taxon_id has % biosample_metadata rows; data_type flip to text unsafe', n;
+    END IF;
+END $$;
+
+-- Reverse the taxon_id rebind first; the terminology FK is ON DELETE
+-- RESTRICT, so the terminology row cannot be deleted while taxon_id
+-- references it.
 UPDATE qiita.biosample_global_field
    SET data_type = 'text',
        terminology_idx = NULL
