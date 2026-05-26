@@ -143,3 +143,156 @@ def test_main_whoami_without_token(monkeypatch, tmp_path, capsys):
     rc = main(["whoami"])
     assert rc == 1
     assert "QIITA_TOKEN" in capsys.readouterr().err
+
+
+# ----------------------------------------------------------------------------
+# ticket force-fail — client-side CHECK-constraint mirror
+# ----------------------------------------------------------------------------
+
+
+def test_force_fail_requires_step_name_when_stage_is_step_run():
+    """Mirrors work_ticket_failure_step_name_consistent: stage=step_run
+    must be paired with a non-empty failure_step_name. Surface the
+    constraint client-side so the operator gets a direct error message
+    instead of an asyncpg CheckViolationError."""
+    from qiita_control_plane.cli.admin import _validate_force_fail_args
+
+    with pytest.raises(ValueError, match="--step-name is required when --stage=step_run"):
+        _validate_force_fail_args("step_run", None)
+
+
+def test_force_fail_rejects_step_name_when_stage_is_submission():
+    """Mirrors the other half of the CHECK constraint: stages other
+    than step_run must NOT carry a failure_step_name."""
+    from qiita_control_plane.cli.admin import _validate_force_fail_args
+
+    with pytest.raises(ValueError, match="--step-name must not be set when --stage=submission"):
+        _validate_force_fail_args("submission", "fastq")
+
+
+def test_force_fail_rejects_step_name_when_stage_is_finalize():
+    from qiita_control_plane.cli.admin import _validate_force_fail_args
+
+    with pytest.raises(ValueError, match="--step-name must not be set when --stage=finalize"):
+        _validate_force_fail_args("finalize", "register")
+
+
+def test_force_fail_happy_path_validation():
+    """Allowed combinations don't raise."""
+    from qiita_control_plane.cli.admin import _validate_force_fail_args
+
+    _validate_force_fail_args("step_run", "fastq")
+    _validate_force_fail_args("submission", None)
+    _validate_force_fail_args("finalize", None)
+
+
+def test_force_fail_refuses_terminal_ticket(monkeypatch):
+    """Even with valid stage/step-name, the DB-facing function refuses
+    to overwrite a ticket that's already in a terminal state. This
+    test stubs asyncpg so we exercise the eligibility check without
+    needing a live DB."""
+    import asyncio
+
+    from qiita_control_plane.cli import admin as cli
+
+    class _FakeTx:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return None
+
+    class _FakeConn:
+        def __init__(self):
+            self.executed: list = []
+
+        def transaction(self):
+            return _FakeTx()
+
+        async def fetchval(self, query, *args):
+            assert "FOR UPDATE" in query
+            return "completed"  # terminal
+
+        async def execute(self, query, *args):
+            self.executed.append((query, args))
+
+        async def close(self):
+            pass
+
+    fake = _FakeConn()
+
+    async def fake_connect(database_url, **kwargs):
+        return fake
+
+    monkeypatch.setattr(cli.asyncpg, "connect", fake_connect)
+    with pytest.raises(RuntimeError, match="terminal state 'completed'"):
+        asyncio.run(
+            cli._force_fail_ticket(
+                "postgres://x",
+                work_ticket_idx=42,
+                stage="step_run",
+                step_name="fastq",
+                reason="stuck",
+            )
+        )
+    # No UPDATE issued because the eligibility check failed first.
+    assert fake.executed == []
+
+
+def test_force_fail_happy_path_runs_update(monkeypatch):
+    """A processing ticket transitions cleanly: eligibility check
+    passes, UPDATE is issued with the expected column values, and the
+    handler returns a dict carrying the previous state for the operator."""
+    import asyncio
+
+    from qiita_control_plane.cli import admin as cli
+
+    class _FakeTx:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc_info):
+            return None
+
+    class _FakeConn:
+        def __init__(self):
+            self.executed: list = []
+
+        def transaction(self):
+            return _FakeTx()
+
+        async def fetchval(self, query, *args):
+            return "processing"
+
+        async def execute(self, query, *args):
+            self.executed.append((query, args))
+
+        async def close(self):
+            pass
+
+    fake = _FakeConn()
+
+    async def fake_connect(database_url, **kwargs):
+        return fake
+
+    monkeypatch.setattr(cli.asyncpg, "connect", fake_connect)
+    result = asyncio.run(
+        cli._force_fail_ticket(
+            "postgres://x",
+            work_ticket_idx=7,
+            stage="step_run",
+            step_name="fastq",
+            reason="hand-failed by operator",
+        )
+    )
+    assert result["work_ticket_idx"] == 7
+    assert result["previous_state"] == "processing"
+    assert result["state"] == "failed"
+    assert result["failure_stage"] == "step_run"
+    assert result["failure_step_name"] == "fastq"
+    assert result["failure_type"] == "permanent"
+    assert result["failure_reason"] == "hand-failed by operator"
+    # The UPDATE was issued with the expected scalars.
+    assert len(fake.executed) == 1
+    _query, params = fake.executed[0]
+    assert params == (7, "step_run", "fastq", "hand-failed by operator")
