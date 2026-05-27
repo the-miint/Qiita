@@ -38,6 +38,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_service_status("", ServingStatus::Serving)
         .await;
 
+    // gRPC reflection lets `grpcurl` introspect the server (used by
+    // `make verify-health` from the deploy host). Register both v1
+    // and v1alpha so older grpcurl builds also work — they're free
+    // to add and many sites pin older grpcurl. Reflection only
+    // exposes the tonic-health descriptor here; the Flight service
+    // uses arrow-flight's prebuilt bindings which don't ship a
+    // public descriptor set, so it's intentionally not reflected.
+    // Internal Python-side probes (CP /health → gRPC Health.Check)
+    // use prebuilt stubs and never call reflection.
+    let reflection_v1 = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
+        .build_v1()?;
+    let reflection_v1alpha = tonic_reflection::server::Builder::configure()
+        .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
+        .build_v1alpha()?;
+
     println!("qiita-data-plane listening on {}", cfg.listen_addr);
 
     // Arrow Flight DoPut batches for chunked uploads run up to ~1 GiB
@@ -51,6 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Server::builder()
         .add_service(health_service)
+        .add_service(reflection_v1)
+        .add_service(reflection_v1alpha)
         .add_service(
             FlightServiceServer::new(flight_svc)
                 .max_decoding_message_size(FLIGHT_MAX_DECODING_BYTES),
