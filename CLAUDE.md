@@ -224,7 +224,7 @@ Both `uv.lock` (Python) and `Cargo.lock` (Rust) are committed. Do not add them t
 The test suite is split into three tiers by the infrastructure each one needs:
 
 - **Pure-unit** (no infrastructure): `make test`. Pure Python + Rust unit tests across all components. Excludes tests carrying the `db` marker.
-- **Control-plane with DB**: `make test-control-plane-with-db`. Brings up Postgres on :5433 (or uses host Postgres via `QIITA_USE_HOST_POSTGRES=1`), applies dbmate migrations, and runs every control-plane test including the `db`-marked ones. Tests opt into the marker via `pytestmark = pytest.mark.db` at module level.
+- **Control-plane with DB**: `make test-control-plane-with-db`. Brings up Postgres on :5433 (or uses host Postgres via `QIITA_USE_HOST_POSTGRES=1`), applies dbmate migrations, and runs every control-plane test including the `db`-marked ones. Tests opt in either at module scope (`pytestmark = pytest.mark.db` — pulls every test in the file into the DB tier) or per-test (`@pytest.mark.db` decorator on the function — for mixed modules where only some tests need a DB).
 - **Cross-component integration**: `make test-integration`. Same Postgres, plus builds the data-plane debug binary; runs the Python integration suite, then resets the `qiita_ducklake` catalog and runs the Rust DuckLake tests. System tests (`@pytest.mark.system`) are excluded — run those with `make test-system`.
 
 **Shared fixtures across tiers**: the DB / session / OIDC-JWKS fixtures live in `qiita-control-plane/src/qiita_control_plane/testing/` and are imported by both the control-plane and integration conftests so they cannot drift.
