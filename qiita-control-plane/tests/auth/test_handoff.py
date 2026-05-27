@@ -7,6 +7,7 @@ exercises the helpers in context against a real handoff flow.
 import secrets
 
 import pytest
+from qiita_common.api_paths import URL_AUTH_HANDOFF
 
 from qiita_control_plane.auth.handoff import (
     LOGIN_COOKIE_NAME,
@@ -172,7 +173,7 @@ def test_hash_ot_code_matches_sha256_definition():
 def test_build_authrocket_login_url_appends_prompt_login():
     url = build_authrocket_login_url(
         loginrocket_base_url="https://realm.e2.loginrocket.com",
-        redirect_uri="https://qiita.example.com/api/v1/auth/handoff",
+        redirect_uri=f"https://qiita.example.com{URL_AUTH_HANDOFF}",
     )
     assert url.startswith("https://realm.e2.loginrocket.com/login?")
     assert "prompt=login" in url

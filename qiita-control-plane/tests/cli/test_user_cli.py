@@ -9,6 +9,16 @@ dispatch.
 from pathlib import Path
 
 import pytest
+from qiita_common.api_paths import (
+    URL_BIOSAMPLE_BY_STUDY,
+    URL_SEQUENCED_SAMPLE_FROM_RUN,
+    URL_SEQUENCING_RUN_PREFIX,
+    URL_SEQUENCING_RUN_SEQUENCED_POOL,
+    URL_STUDY_PREFIX,
+    URL_USER_ME,
+    URL_WORK_TICKET_BY_IDX,
+    URL_WORK_TICKET_PREFIX,
+)
 from qiita_common.auth_constants import BEARER_PREFIX
 
 
@@ -140,7 +150,7 @@ def test_profile_set_sends_only_supplied_fields(monkeypatch):
     )
     assert rc == 0
     assert captured["method"] == "PATCH"
-    assert captured["url"] == "https://q.example.test/api/v1/user/me"
+    assert captured["url"] == f"https://q.example.test{URL_USER_ME}"
     assert captured["auth"] == f"{BEARER_PREFIX}qk_test"
     assert captured["json"] == {"affiliation": "UCSD", "phone": "+1-555-0100"}
 
@@ -215,7 +225,7 @@ def test_study_create_minimal_sends_only_title(monkeypatch):
     rc = main(["--base-url", "https://q.example.test", "study", "create", "--title", "Smoke Study"])
     assert rc == 0
     assert captured["method"] == "POST"
-    assert captured["url"] == "https://q.example.test/api/v1/study"
+    assert captured["url"] == f"https://q.example.test{URL_STUDY_PREFIX}"
     assert captured["auth"] == f"{BEARER_PREFIX}qk_test"
     assert captured["json"] == {"title": "Smoke Study"}
 
@@ -427,7 +437,9 @@ def test_biosample_create_defaults_owner_idx_to_caller(monkeypatch):
     assert [r["method"] for r in captured["requests"]] == ["GET", "POST"]
     whoami_req, post_req = captured["requests"]
     assert whoami_req["url"].endswith("/api/v1/auth/whoami")
-    assert post_req["url"] == "https://q.example.test/api/v1/study/7/biosample"
+    assert post_req["url"] == (
+        f"https://q.example.test{URL_BIOSAMPLE_BY_STUDY.format(study_idx=7)}"
+    )
     # Unset --metadata stays absent on the wire (default=None → not None
     # filter drops it); server's default_factory=dict fills the model.
     assert post_req["json"] == {
@@ -619,7 +631,7 @@ def test_sequencing_run_create_minimal(monkeypatch):
     )
     assert rc == 0
     assert captured["method"] == "POST"
-    assert captured["url"] == "https://q.example.test/api/v1/sequencing-run"
+    assert captured["url"] == f"https://q.example.test{URL_SEQUENCING_RUN_PREFIX}"
     assert captured["json"] == {
         "instrument_run_id": "240301_MN12345_0001_AAATEST",
         "platform": "illumina",
@@ -768,7 +780,9 @@ def test_sequenced_pool_create_minimal_no_preflight(monkeypatch):
     )
     assert rc == 0
     assert captured["method"] == "POST"
-    assert captured["url"] == "https://q.example.test/api/v1/sequencing-run/4/sequenced-pool"
+    assert captured["url"] == (
+        f"https://q.example.test{URL_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=4)}"
+    )
     # extra_metadata=None gets stripped by exclude_unset; nothing else to send.
     assert captured["json"] == {}
 
@@ -948,7 +962,8 @@ def test_sequenced_sample_create_minimal_with_caller_owner(monkeypatch):
     assert [r["method"] for r in captured["requests"]] == ["GET", "POST"]
     post = captured["requests"][1]
     assert post["url"] == (
-        "https://q.example.test/api/v1/sequencing-run/4/sequenced-pool/9/sequenced-sample"
+        f"https://q.example.test"
+        f"{URL_SEQUENCED_SAMPLE_FROM_RUN.format(sequencing_run_idx=4, sequenced_pool_idx=9)}"
     )
     # --metadata stays absent (default=None → filtered, server fills {}).
     # secondary_study_idxs always lands on the wire because the model's
@@ -1164,7 +1179,7 @@ def test_ticket_submit_minimal_prep_sample_scope(monkeypatch):
     )
     assert rc == 0
     assert captured["method"] == "POST"
-    assert captured["url"] == "https://q.example.test/api/v1/work-ticket"
+    assert captured["url"] == f"https://q.example.test{URL_WORK_TICKET_PREFIX}"
     assert captured["json"] == {
         "action_id": "fastq-to-parquet",
         "action_version": "1.0.0",
@@ -1349,7 +1364,9 @@ def test_ticket_status_issues_get_against_the_idx(monkeypatch):
     )
     assert rc == 0
     assert captured["method"] == "GET"
-    assert captured["url"] == "https://q.example.test/api/v1/work-ticket/12"
+    assert captured["url"] == (
+        f"https://q.example.test{URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=12)}"
+    )
     # A GET has no body — assert the stub captured no JSON payload.
     assert captured["json"] is None
 
