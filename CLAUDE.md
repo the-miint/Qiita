@@ -75,6 +75,10 @@ A step in a workflow YAML must declare exactly one of `container:` or `module:`.
 
 Fixed in #11 after the initial schema mixed both forms.
 
+## REST path constants
+
+REST paths live in `qiita-common/src/qiita_common/api_paths.py` as `PATH_*` (sub-path for FastAPI `@router.<verb>(...)` decorators and the matching `prefix=`) and `URL_*` (full path under `API_PREFIX` for tests and clients, with `{placeholder}` segments where parameterized). When you add or rename a route, define both flavours here in the same change and update every call site to use them; do not hardcode `"/api/v1/..."` literals in routes, tests, or clients. The parity test in `qiita-common/tests/test_api_paths.py` (which composes each `URL_X` from its `PATH_X_PREFIX` + `PATH_X`) is the guardrail — a new triple must be registered there too. Routers that share a prefix (`/study` is reused by biosample and sequenced-sample; `/sequencing-run` by sequenced-sample) declare `prefix=PATH_STUDY_PREFIX` etc. so a prefix rename moves every router at once. Closed in #12.
+
 ## Database migrations
 
 The qiita-miint deploy is live; every migration currently in `qiita-control-plane/db/migrations/` (`YYYYMMDDHHMMSS_<name>.sql`, starting with `20260501000000_schema.sql`) has been applied to its Postgres. **Never edit an already-applied migration** — `dbmate` tracks applied versions in `schema_migrations` and won't re-run an edited file, so the live DB silently drifts from the source.
