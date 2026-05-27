@@ -20,6 +20,7 @@ import secrets
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import FieldDataType
 
 from qiita_control_plane.main import app
@@ -2307,6 +2308,67 @@ async def test_patch_sequenced_sample_regular_user_role_403(
         headers={"If-Match": pre_etag},
     )
     assert resp.status_code == 403
+    assert "wet_lab_admin" in resp.json()["detail"]
+
+
+async def test_patch_sequenced_sample_service_account_403_pending_restructure(ctx):
+    # Pin the deferred-behavior contract: a service-account caller, even
+    # one whose qiita.principal.system_role is wet_lab_admin and whose
+    # PAT carries Scope.PREP_SAMPLE_WRITE, currently 403s here.
+    # require_role_at_least's ServiceAccount-always-fails rule (auth
+    # model treats service-account authz as scope-only;
+    # auth/principal.py ServiceAccount carries no system_role field) is
+    # what produces the 403. The ENA submission subsystem will need a
+    # separate scope-gated surface, OR the auth model will need to widen
+    # so ServiceAccount carries a role, before this PATCH can accept
+    # service-account writes. When that work lands, this test should
+    # flip to assert 200 (or be replaced by a happy-path test against
+    # the new surface) AND the assert isinstance(caller, HumanUser)
+    # guard at the top of patch_sequenced_sample becomes reachable;
+    # whoever does the widening must add an assert-reachable test
+    # alongside flipping this one. The sibling pin on the biosample
+    # PATCH is test_patch_biosample_service_account_403_pending_restructure.
+    suffix = secrets.token_hex(4)
+    svc_name = f"ss-patch-svc-{suffix}"
+    async with ctx["pool"].acquire() as conn:
+        async with conn.transaction():
+            svc_principal_idx = await conn.fetchval(
+                "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
+                " VALUES ($1, $2, $3) RETURNING idx",
+                svc_name,
+                SystemRole.WET_LAB_ADMIN,
+                SYSTEM_PRINCIPAL_IDX,
+            )
+            await conn.execute(
+                "INSERT INTO qiita.service_account (principal_idx, name) VALUES ($1, $2)",
+                svc_principal_idx,
+                svc_name,
+            )
+    ctx["created"]["service_account_principals"].append(svc_principal_idx)
+
+    from qiita_control_plane.auth.token import mint_api_token
+
+    plaintext, _ = await mint_api_token(
+        ctx["pool"],
+        principal_idx=svc_principal_idx,
+        label=f"svc-{suffix}",
+        scopes=[Scope.PREP_SAMPLE_WRITE],
+    )
+
+    seeded = await _seed_one_sequenced_sample(ctx, "patch-svc")
+    pre_etag = await _get_etag(ctx["wet"], seeded["sequenced_sample_idx"])
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers={"Authorization": f"Bearer {plaintext}"},
+    ) as svc:
+        resp = await svc.patch(
+            f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}",
+            json={"submission_error": "subsystem-recorded"},
+            headers={"If-Match": pre_etag},
+        )
+    assert resp.status_code == 403, resp.text
     assert "wet_lab_admin" in resp.json()["detail"]
 
 
