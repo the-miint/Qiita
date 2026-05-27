@@ -1,3 +1,3 @@
-from qiita_common.models import HealthResponse
+from qiita_common.models import HealthResponse, HealthStatus
 
-__all__ = ["HealthResponse"]
+__all__ = ["HealthResponse", "HealthStatus"]

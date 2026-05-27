@@ -10,10 +10,28 @@
 <main>
   <header>
     <h1>qiita-miint</h1>
-    <span id="status-badge" class="status-badge status-unknown" role="status" aria-live="polite">
-      checking&hellip;
-    </span>
   </header>
+
+  <ul class="service-status" aria-label="Service status">
+    <li>
+      <span class="service-status-label">Control plane</span>
+      <span id="status-badge-cp" class="status-badge status-unknown" role="status" aria-live="polite">
+        checking&hellip;
+      </span>
+    </li>
+    <li>
+      <span class="service-status-label">Orchestrator</span>
+      <span id="status-badge-co" class="status-badge status-unknown" role="status" aria-live="polite">
+        checking&hellip;
+      </span>
+    </li>
+    <li>
+      <span class="service-status-label">Data plane</span>
+      <span id="status-badge-dp" class="status-badge status-unknown" role="status" aria-live="polite">
+        checking&hellip;
+      </span>
+    </li>
+  </ul>
 
   <p class="callout">
     <strong>Status:</strong> alpha &middot; invitation-only &middot; CLI-only

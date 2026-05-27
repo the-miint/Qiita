@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import asyncpg
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from qiita_common.log import install_authorization_scrub
 from qiita_common.models import HealthResponse
@@ -18,6 +18,7 @@ from .dispatch import (
     drain_running_dispatches,
     recover_orphaned_tickets,
 )
+from .health import aggregate_health
 from .landing import router as landing_router
 from .routes import api_router
 
@@ -79,9 +80,22 @@ app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 
 @app.get("/health")
-async def health(pool: asyncpg.Pool = Depends(get_db_pool)) -> HealthResponse:
-    try:
-        await pool.fetchval("SELECT 1")
-    except Exception:
-        return HealthResponse(status="degraded", service="qiita-control-plane")
-    return HealthResponse(status="ok", service="qiita-control-plane")
+async def health(
+    request: Request,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+) -> HealthResponse:
+    """Aggregated `/health` covering CP + CO + DP with a short cache.
+
+    The legacy single-pool probe is now `_probe_cp` inside
+    `qiita_control_plane.health`; everything that consumes only the
+    top-level `status` field (Makefile target, landing JS) stays
+    backwards-compatible.  The new `services` dict carries the
+    per-component breakdown that drives the landing page's three
+    status pills.
+    """
+    settings: Settings = request.app.state.settings
+    return await aggregate_health(
+        pool=pool,
+        compute_orchestrator_url=settings.compute_orchestrator_url,
+        data_plane_url=settings.data_plane_url,
+    )

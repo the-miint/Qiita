@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from qiita_common.auth_constants import API_PREFIX
 from qiita_common.log import install_authorization_scrub
-from qiita_common.models import HealthResponse
+from qiita_common.models import HealthResponse, HealthStatus
 
 from .backend import ComputeBackend
 from .backends.local import LocalBackend
@@ -80,4 +80,12 @@ app.include_router(step_router, prefix=API_PREFIX)
 
 @app.get("/health")
 async def health() -> HealthResponse:
-    return HealthResponse(status="ok", service="qiita-compute-orchestrator")
+    # Process-liveness only. The CP's `/health` aggregator reads
+    # `body["status"] == HealthStatus.OK.value` here to populate
+    # `services.co` in its per-service breakdown — any change to
+    # that contract (return shape, status field name, or the value
+    # the CP compares against) needs the CP aggregator updated in
+    # the same PR. A real slurmrestd-reachability probe at this
+    # endpoint is tracked as a follow-up; today this returning OK
+    # means the FastAPI process is up, not that it can dispatch.
+    return HealthResponse(status=HealthStatus.OK.value, service="qiita-compute-orchestrator")

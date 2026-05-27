@@ -964,6 +964,16 @@ endpoint on the DP (50051). All three must return `OK` / `SERVING`. A
 failure here points at a single service — `journalctl -u qiita-<service>`
 gives the boot error.
 
+> **Note: the CP `/health` aggregates downstream.** As of the
+> `feat/honest-health-status` PR, the CP's `/health` also probes the
+> CO and DP internally and reports a per-service breakdown in a
+> `services: {cp, co, dp}` field. The top-level `status` flips to
+> `degraded` if any downstream is non-`ok`, which means `make
+> verify-health`'s first CP check now exits non-zero on a CO or DP
+> outage even though the CP itself is up. If you see CP failing but
+> CO/DP passing individually, `curl -s http://localhost:8080/health |
+> jq .services` will name the culprit.
+
 ### 10b. Operator auth path works
 
 ```bash
