@@ -267,6 +267,14 @@ async def list_biosample_idxs_in_study(
     exceeded the hard cap; callers hitting it should narrow their
     scope.
     """
+    # Defends the response shaper below: caller_system_role assumes a HumanUser.
+    # require_role_at_least currently rejects ServiceAccount; when that gate
+    # widens, fail here (pre-commit, no DB mutation) rather than 500'ing in
+    # the shaper after the read has already returned.
+    assert isinstance(user, HumanUser), (
+        "caller must be HumanUser; response shaper reads .system_role"
+    )
+
     # Fetch cap+1 rows so a count strictly greater than the cap signals
     # truncation; the route slices back to the cap before returning.
     rows = await fetch_biosample_idxs_for_study(
@@ -351,6 +359,14 @@ async def get_biosample(
     `updated_at` column. The format is a quoted ISO 8601 timestamp;
     clients must treat it as opaque.
     """
+    # Defends the response shaper below: caller_system_role assumes a HumanUser.
+    # require_role_at_least currently rejects ServiceAccount; when that gate
+    # widens, fail here (pre-commit, no DB mutation) rather than 500'ing in
+    # the shaper after the snapshot read has already returned.
+    assert isinstance(user, HumanUser), (
+        "caller must be HumanUser; response shaper reads .system_role"
+    )
+
     # All reads share one REPEATABLE READ snapshot so the supertype row,
     # the access predicate, and the metadata read cannot disagree about a
     # concurrent writer's commit.
@@ -467,6 +483,15 @@ async def patch_biosample(
     `updated_at` column; format mirrors the GET endpoint's contract
     and is opaque to clients.
     """
+    # Defends the response shaper below: caller_system_role assumes a HumanUser.
+    # require_role_at_least currently rejects ServiceAccount; when that gate
+    # widens, fail here (pre-commit, no DB mutation) rather than 500'ing in
+    # the shaper after SELECT FOR UPDATE + UPDATE has already committed and
+    # the client retry would 412 from the post-commit ETag.
+    assert isinstance(caller, HumanUser), (
+        "caller must be HumanUser; response shaper reads .system_role"
+    )
+
     # Missing If-Match is 428 before any DB work runs.
     if if_match is None:
         raise HTTPException(status_code=428, detail="If-Match header required")
