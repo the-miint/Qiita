@@ -32,12 +32,35 @@
 ALTER TABLE qiita.study       ALTER COLUMN idx RESTART WITH 25000;
 ALTER TABLE qiita.prep_sample ALTER COLUMN idx RESTART WITH 25000;
 
+-- Pin the reserved-range invariant in the catalog so it is visible from
+-- `\d+ qiita.study` / `\d+ qiita.prep_sample` and from any tooling that
+-- introspects column comments. The legacy importer (and any other code
+-- path that writes explicit idx values via OVERRIDING SYSTEM VALUE) must
+-- read this threshold from here rather than re-hardcoding 25000.
+
+COMMENT ON COLUMN qiita.study.idx IS
+    'Reserved-range identity: [1, 25000) is reserved for the one-time '
+    'legacy-Qiita import (inserted with OVERRIDING SYSTEM VALUE); new '
+    'rows mint at 25000 and above. Any code path that writes explicit '
+    'idx values must stay below 25000 and must not collide with rows '
+    'already present in the reserved band.';
+
+COMMENT ON COLUMN qiita.prep_sample.idx IS
+    'Reserved-range identity: [1, 25000) is reserved for the one-time '
+    'legacy-Qiita import (inserted with OVERRIDING SYSTEM VALUE); new '
+    'rows mint at 25000 and above. Any code path that writes explicit '
+    'idx values must stay below 25000 and must not collide with rows '
+    'already present in the reserved band.';
+
 
 -- migrate:down
 
--- Intentionally no-op: RESTART cannot be unwound without risking PK
--- collisions with rows minted after the bump (a rewind to 1 would
--- collide with both the pre-bump test rows and any new rows minted at
--- >= 25000). The forward step is itself idempotent, so re-running the
--- migration after a no-op down is safe.
-SELECT 1;
+-- Drop the column-level documentation that the up step added.
+COMMENT ON COLUMN qiita.prep_sample.idx IS NULL;
+COMMENT ON COLUMN qiita.study.idx IS NULL;
+
+-- The RESTART WITH 25000 itself is intentionally NOT unwound: rewinding
+-- to 1 would collide with both the pre-bump test rows and any new rows
+-- minted at >= 25000 after the up step ran. Re-running the up step is
+-- safe -- RESTART moves a sequence forward only, so a sequence already
+-- sitting at or above 25000 stays put.
