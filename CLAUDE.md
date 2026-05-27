@@ -17,7 +17,7 @@ make build
 # Test
 make test                          # pure-unit tests (all components, no infrastructure required)
 make test-control-plane-with-db    # full control-plane suite incl. DB-bound (-m db) tests; brings up Postgres + applies dbmate migrations
-make test-integration              # cross-component tests; requires Docker (or QIITA_USE_HOST_POSTGRES=1 with libpq env vars to use a host postgres — what CI does on macOS, see docs/runbooks/integration-tests-host-postgres.md); runs Python + Rust integration suites against postgres on :5433; excludes -m system
+make test-integration              # cross-component tests; requires Docker (or QIITA_USE_HOST_POSTGRES=1 with libpq env vars to use a host postgres); runs Python + Rust integration suites against postgres on :5433; excludes -m system
 make test-system                   # real GG2 backbone data; slow (~10 min); needs localdocs/scratch/
 make test-workflows                # requires apptainer (Linux-only — macOS skips gracefully); CI runs this on ubuntu only
 
@@ -65,7 +65,11 @@ cd qiita-control-plane && uv sync --reinstall-package qiita-common
 
 ## Workflow runtimes
 
-A step in a workflow YAML must declare exactly one of `container:` or `module:`. The `module:` form (a native step) runs in the orchestrator's Python environment under SLURM and must only use dependencies that already ship in `qiita-compute-orchestrator`'s `pyproject.toml`. Anything heavier (extra bioinformatics deps, system packages) belongs in a container. Native job modules live under `qiita-compute-orchestrator/src/qiita_compute_orchestrator/jobs/` and export exactly two symbols: `class Inputs(BaseModel)` declaring the job's typed input contract, and `async def execute(inputs, workspace)` doing the work. A single framework dispatcher (`run_native_job`) handles import, validation, and error classification; both `LocalBackend` and the shared `python -m` SLURM launcher route through it. The wire validator (`StepRunRequest`) enforces shape only — exactly one of `container` or `module` must be set. The module prefix (`qiita_compute_orchestrator.jobs.`) itself is enforced at multiple sites outside the wire validator (sync, submit, boot scan, dispatcher); see [`docs/architecture.md`](docs/architecture.md) for the per-site breakdown.
+A step in a workflow YAML must declare **exactly one** of `container:` or `module:`. The `module:` form (a native step) runs in the orchestrator's Python environment under SLURM and may only use dependencies that already ship in `qiita-compute-orchestrator`'s `pyproject.toml`; anything heavier (bioinformatics deps, system packages) belongs in a container.
+
+Native job modules export exactly two symbols — `class Inputs(BaseModel)` (typed input contract) and `async def execute(inputs, workspace)` (the work). A single framework dispatcher handles import, validation, and error classification; both the local backend and the SLURM launcher route through it.
+
+The wire validator enforces shape only (exactly-one). The module-prefix invariant (`qiita_compute_orchestrator.jobs.`) is enforced separately at sync, submit, boot scan, and dispatcher — [`docs/architecture.md`](docs/architecture.md) carries the per-site breakdown.
 
 ## Naming conventions
 
@@ -77,7 +81,14 @@ Fixed in #11 after the initial schema mixed both forms.
 
 ## REST path constants
 
-REST paths live in `qiita-common/src/qiita_common/api_paths.py` as `PATH_*` (sub-path for FastAPI `@router.<verb>(...)` decorators and the matching `prefix=`) and `URL_*` (full path under `API_PREFIX` for tests and clients, with `{placeholder}` segments where parameterized). When you add or rename a route, define both flavours here in the same change and update every call site to use them; do not hardcode `"/api/v1/..."` literals in routes, tests, or clients. The parity test in `qiita-common/tests/test_api_paths.py` (which composes each `URL_X` from its `PATH_X_PREFIX` + `PATH_X`) is the guardrail — a new triple must be registered there too. Routers that share a prefix (`/study` is reused by biosample and sequenced-sample; `/sequencing-run` by sequenced-sample) declare `prefix=PATH_STUDY_PREFIX` etc. so a prefix rename moves every router at once. Closed in #12.
+REST paths live exclusively in `qiita-common/src/qiita_common/api_paths.py`. Never hardcode `"/api/v1/..."` literals in routes, tests, or clients — import the constants instead.
+
+Two flavours per route:
+
+- `PATH_*` — sub-path used by FastAPI `@router.<verb>(...)` decorators and the matching `prefix=` declaration.
+- `URL_*` — full path under `API_PREFIX` for tests and clients, with `{placeholder}` segments where parameterized.
+
+When you add or rename a route, define both flavours and register the triple in the parity test in `qiita-common/tests/test_api_paths.py`. A missing triple fails the test; a `URL_*` constant left out of the registration list also fails. Routers sharing a prefix (`/study` is reused by biosample and sequenced-sample; `/sequencing-run` by sequenced-sample) declare `prefix=PATH_STUDY_PREFIX` etc. so a prefix rename moves every router at once.
 
 ## Database migrations
 
@@ -89,8 +100,6 @@ Every schema change is a **new migration file** (`YYYYMMDDHHMMSS_<name>.sql`, wi
 - Rename / drop / type-change: expand-then-contract across two migrations (and usually two PRs) so a rolling deploy doesn't 500.
 
 Before merging: `make test-control-plane-with-db` runs `dbmate up` against a fresh DB and must pass — that's the only safety net before the migration touches production. After merging: the operator runs `make migrate` against the live DB on the next deploy.
-
-The pre-deploy convention of editing migration SQL files in place ended with the first deploy of qiita-miint; it does not come back.
 
 ## Enum parity (Python ↔ Postgres)
 
@@ -178,8 +187,6 @@ The data plane is intentionally "dumb": it only operates on identifiers it recei
 
 **Horizontal scaling**: each data plane instance holds an independent DuckDB+DuckLake connection to the shared Postgres catalog. DuckLake's snapshot isolation means instances never block each other. Add instances to `upstream qiita_data_plane` in nginx to scale.
 
-**DuckDB**: `duckdb = { version = "1.10502.0" }` links DuckDB v1.5.2. The Rust build cache in CI (`Swatinem/rust-cache`) avoids recompiling it on every push.
-
 **Two Rust build flavors**: `make build-data-plane` produces a release binary with `--features duckdb/bundled` (statically linked, slow to build). `make build-data-plane-debug` produces a debug binary that dynamically links libduckdb via `DUCKDB_DOWNLOAD_LIB=1` (fast). `make test-integration` and `make test-system` depend on the debug binary because Python integration tests spawn it directly from its target path instead of shelling out to `cargo run`.
 
 ### Compute orchestrator pattern
@@ -216,14 +223,12 @@ Both `uv.lock` (Python) and `Cargo.lock` (Rust) are committed. Do not add them t
 
 The test suite is split into three tiers by the infrastructure each one needs:
 
-- **Pure-unit** (no infrastructure): `make test` invokes `make test-python` which runs `test-control-plane-without-db` (control-plane tests not carrying the `db` marker), `test-common`, and `test-compute-orchestrator`. No Docker, no Postgres.
-- **Control-plane with DB**: `make test-control-plane-with-db` brings up Postgres on :5433 (or uses host Postgres via `QIITA_USE_HOST_POSTGRES=1`), applies dbmate migrations, and runs the full control-plane suite — including `tests/auth/test_resolver.py`, `tests/auth/test_api_token_db.py`, and the route tests under `tests/routes/`. These files carry the `db` marker via `pytestmark = pytest.mark.db` at module level (applies to every test in the file).
-- **Cross-component integration**: `make test-integration` brings up the same Postgres and additionally builds and spawns the data plane debug binary, runs the Python integration suite under `tests/integration/`, then resets the `qiita_ducklake` catalog and runs the Rust DuckLake tests.
+- **Pure-unit** (no infrastructure): `make test`. Pure Python + Rust unit tests across all components. Excludes tests carrying the `db` marker.
+- **Control-plane with DB**: `make test-control-plane-with-db`. Brings up Postgres on :5433 (or uses host Postgres via `QIITA_USE_HOST_POSTGRES=1`), applies dbmate migrations, and runs every control-plane test including the `db`-marked ones. Tests opt into the marker via `pytestmark = pytest.mark.db` at module level.
+- **Cross-component integration**: `make test-integration`. Same Postgres, plus builds the data-plane debug binary; runs the Python integration suite, then resets the `qiita_ducklake` catalog and runs the Rust DuckLake tests. System tests (`@pytest.mark.system`) are excluded — run those with `make test-system`.
 
-**Shared fixture surface**: postgres / sessions / OIDC-JWKS fixtures live in `qiita-control-plane/src/qiita_control_plane/testing/` and are imported into both `qiita-control-plane/tests/conftest.py` and `tests/integration/conftest.py` so they cannot drift. Both suites consume the same `postgres_pool`, `human_admin_session`, `regular_user_session`, `compute_worker_service_account`, `jwks_harness`. The `fasta_file` fixture is integration-only — it lives in `tests/integration/conftest.py` because no control-plane test consumes it.
+**Shared fixtures across tiers**: the DB / session / OIDC-JWKS fixtures live in `qiita-control-plane/src/qiita_control_plane/testing/` and are imported by both the control-plane and integration conftests so they cannot drift.
 
-**Postgres harness location**: `docker-compose.yml` and `initdb/` live under `qiita-control-plane/tests/_postgres/` and are used by both `test-control-plane-with-db` and `test-integration`. Port `5433` (not `5432`) avoids collision with a system Postgres.
+**Postgres harness**: `docker-compose.yml` + `initdb/` live under `qiita-control-plane/tests/_postgres/` and are reused by both DB-bound tiers. Port `5433` (not `5432`) avoids collision with a host Postgres.
 
-**DuckLake catalog reset between phases**: `make test-integration` runs the Python suite, then drops and recreates the `qiita_ducklake` Postgres database, then runs the Rust suite. This is required because DuckLake pins `DATA_PATH` into the catalog at creation time, and the two suites use different `DATA_PATH` values (Python picks a pytest `tmp_path_factory` dir; Rust defaults to `/tmp/qiita-integration-ducklake-data`). Reusing the catalog across phases causes confusing "path mismatch" failures. The Python-side analogue is `_reset_ducklake_catalog()` in `tests/integration/conftest.py`; keep the two mechanisms in sync.
-
-**System vs integration marker**: system tests are marked `@pytest.mark.system` and are excluded from `make test-integration` via `-m 'not system'`. Run them with `make test-system`.
+**DuckLake catalog reset between phases**: `make test-integration` runs the Python suite, drops and recreates the `qiita_ducklake` Postgres database, then runs the Rust suite. DuckLake pins `DATA_PATH` into the catalog at creation time and the two suites use different `DATA_PATH` values; reusing the catalog produces confusing "path mismatch" failures. The Python conftest has the same drop/recreate logic so a single phase is self-contained too — keep the two mechanisms in sync.
