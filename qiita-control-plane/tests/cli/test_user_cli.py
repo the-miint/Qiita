@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 from qiita_common.api_paths import (
+    URL_AUTH_WHOAMI,
     URL_BIOSAMPLE_BY_STUDY,
     URL_SEQUENCED_SAMPLE_FROM_RUN,
     URL_SEQUENCING_RUN_PREFIX,
@@ -436,7 +437,7 @@ def test_biosample_create_defaults_owner_idx_to_caller(monkeypatch):
     # whoami first (to resolve owner), then the actual POST.
     assert [r["method"] for r in captured["requests"]] == ["GET", "POST"]
     whoami_req, post_req = captured["requests"]
-    assert whoami_req["url"].endswith("/api/v1/auth/whoami")
+    assert whoami_req["url"].endswith(URL_AUTH_WHOAMI)
     assert post_req["url"] == (
         f"https://q.example.test{URL_BIOSAMPLE_BY_STUDY.format(study_idx=7)}"
     )

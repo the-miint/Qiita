@@ -154,6 +154,25 @@ def test_url_path_triples_compose():
         )
 
 
+def test_every_url_constant_is_registered():
+    """Every non-prefix ``URL_*`` exposed by ``api_paths`` must appear in
+    ``_TRIPLES`` (or be a ``URL_*_PREFIX`` covered by the sibling test).
+
+    Without this guard, adding ``URL_NEW_ROUTE`` and forgetting to register
+    its triple here silently bypasses ``test_url_path_triples_compose`` —
+    the very drift mode the parity setup is supposed to catch."""
+    registered = {url_name for url_name, _prefix, _path in _TRIPLES}
+    declared = {
+        name for name in dir(api_paths) if name.startswith("URL_") and not name.endswith("_PREFIX")
+    }
+    missing = declared - registered
+    assert not missing, (
+        f"URL_* constants exist but are not in _TRIPLES: {sorted(missing)}. "
+        "Add an entry to _TRIPLES in this file so the per-route parity check "
+        "exercises the new constant."
+    )
+
+
 def test_url_prefixes_compose():
     """Every URL_*_PREFIX equals ``API_PREFIX + PATH_*_PREFIX``.
 
