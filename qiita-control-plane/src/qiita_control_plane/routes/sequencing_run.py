@@ -18,6 +18,11 @@ from typing import Annotated
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import Field
+from qiita_common.api_paths import (
+    PATH_SEQUENCING_RUN_PREFIX,
+    PATH_SEQUENCING_RUN_ROOT,
+    PATH_SEQUENCING_RUN_SEQUENCED_POOL,
+)
 from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     SequencedPoolCreateRequest,
@@ -37,7 +42,7 @@ from ..deps import TxConnFactory, get_tx_conn_factory
 from ..repositories.sequencing_run import insert_sequenced_pool, insert_sequencing_run
 from ._helpers import GENERIC_FK_VIOLATION
 
-router = APIRouter(prefix="/sequencing-run", tags=["sequencing-run"])
+router = APIRouter(prefix=PATH_SEQUENCING_RUN_PREFIX, tags=["sequencing-run"])
 
 
 # Map of constraint names insert_sequencing_run can trip. Unknown names fall
@@ -48,7 +53,7 @@ _UNIQUE_VIOLATION_MESSAGES: dict[str, str] = {
 _GENERIC_UNIQUE_VIOLATION = "conflicts with an existing sequencing_run"
 
 
-@router.post("", status_code=201)
+@router.post(PATH_SEQUENCING_RUN_ROOT, status_code=201)
 async def create_sequencing_run(
     body: SequencingRunCreateRequest,
     tx: TxConnFactory = Depends(get_tx_conn_factory),
@@ -84,7 +89,7 @@ async def create_sequencing_run(
     return SequencingRunCreateResponse(sequencing_run_idx=sequencing_run_idx)
 
 
-@router.post("/{sequencing_run_idx}/sequenced-pool", status_code=201)
+@router.post(PATH_SEQUENCING_RUN_SEQUENCED_POOL, status_code=201)
 async def create_sequenced_pool(
     sequencing_run_idx: Annotated[int, Field(gt=0)],
     body: SequencedPoolCreateRequest,

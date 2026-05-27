@@ -10,6 +10,15 @@ from datetime import UTC, datetime, timedelta
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
+from qiita_common.api_paths import (
+    PATH_ADMIN_AUDIT,
+    PATH_ADMIN_PREFIX,
+    PATH_ADMIN_PRINCIPAL_DISABLED,
+    PATH_ADMIN_PRINCIPAL_RETIRED,
+    PATH_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS,
+    PATH_ADMIN_PRINCIPAL_SYSTEM_ROLE,
+    PATH_ADMIN_SERVICE_ACCOUNT,
+)
 from qiita_common.auth_constants import (
     AUDIT_QUERY_DEFAULT_LIMIT,
     AUDIT_QUERY_MAX_LIMIT,
@@ -40,7 +49,7 @@ from ..auth.scopes import (
 from ..auth.token import mint_api_token
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
 
-router = APIRouter(prefix="/admin", tags=["admin"])
+router = APIRouter(prefix=PATH_ADMIN_PREFIX, tags=["admin"])
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +67,11 @@ def _decode_detail(raw) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@router.post("/service-account", status_code=201, response_model=ServiceAccountCreateResponse)
+@router.post(
+    PATH_ADMIN_SERVICE_ACCOUNT,
+    status_code=201,
+    response_model=ServiceAccountCreateResponse,
+)
 async def create_service_account(
     body: ServiceAccountCreate,
     tx: TxConnFactory = Depends(get_tx_conn_factory),
@@ -149,7 +162,7 @@ async def create_service_account(
 # ---------------------------------------------------------------------------
 
 
-@router.patch("/principal/{principal_idx}/disabled", status_code=204)
+@router.patch(PATH_ADMIN_PRINCIPAL_DISABLED, status_code=204)
 async def set_principal_disabled(
     principal_idx: int,
     body: PrincipalDisabledUpdate,
@@ -223,7 +236,7 @@ async def set_principal_disabled(
 # ---------------------------------------------------------------------------
 
 
-@router.patch("/principal/{principal_idx}/retired", status_code=204)
+@router.patch(PATH_ADMIN_PRINCIPAL_RETIRED, status_code=204)
 async def retire_principal(
     principal_idx: int,
     body: PrincipalRetiredUpdate,
@@ -278,7 +291,7 @@ async def retire_principal(
 # ---------------------------------------------------------------------------
 
 
-@router.patch("/principal/{principal_idx}/system-role", status_code=204)
+@router.patch(PATH_ADMIN_PRINCIPAL_SYSTEM_ROLE, status_code=204)
 async def set_principal_system_role(
     principal_idx: int,
     body: PrincipalSystemRoleUpdate,
@@ -318,7 +331,7 @@ async def set_principal_system_role(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/audit")
+@router.get(PATH_ADMIN_AUDIT)
 async def get_audit_log(
     pool: asyncpg.Pool = Depends(get_db_pool),
     _role: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
@@ -362,7 +375,7 @@ async def get_audit_log(
 # ---------------------------------------------------------------------------
 
 
-@router.post("/principal/{principal_idx}/revoke-all-tokens")
+@router.post(PATH_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS)
 async def revoke_all_principal_tokens(
     principal_idx: int,
     tx: TxConnFactory = Depends(get_tx_conn_factory),

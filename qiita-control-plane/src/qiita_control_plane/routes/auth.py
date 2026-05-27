@@ -27,9 +27,20 @@ from datetime import UTC, datetime, timedelta
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
-from qiita_common.api_paths import LOOPBACK_HOST
+from qiita_common.api_paths import (
+    LOOPBACK_HOST,
+    PATH_AUTH_CLI_EXCHANGE,
+    PATH_AUTH_HANDOFF,
+    PATH_AUTH_LOGIN,
+    PATH_AUTH_PAT,
+    PATH_AUTH_PREFIX,
+    PATH_AUTH_TOKEN,
+    PATH_AUTH_TOKEN_BY_IDX,
+    PATH_AUTH_WHOAMI,
+    URL_AUTH_HANDOFF,
+    URL_AUTH_LOGIN,
+)
 from qiita_common.auth_constants import (
-    API_PREFIX,
     BEARER_PREFIX,
     MSG_PRINCIPAL_DISABLED_OR_RETIRED,
     AuthEventType,
@@ -77,7 +88,7 @@ from ..auth.scopes import (
 from ..auth.token import mint_api_token
 from ..deps import TxConnFactory, get_db_pool, get_settings, get_tx_conn_factory
 
-router = APIRouter(prefix="/auth", tags=["auth"])
+router = APIRouter(prefix=PATH_AUTH_PREFIX, tags=["auth"])
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +96,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 # ---------------------------------------------------------------------------
 
 
-@router.get("/whoami", response_model=WhoAmIResponse)
+@router.get(PATH_AUTH_WHOAMI, response_model=WhoAmIResponse)
 async def whoami(p: Principal = Depends(get_current_principal)) -> WhoAmIResponse:
     """Return a serializable view of the authenticated principal.
 
@@ -119,7 +130,7 @@ async def whoami(p: Principal = Depends(get_current_principal)) -> WhoAmIRespons
 # ---------------------------------------------------------------------------
 
 
-@router.post("/pat", status_code=201, response_model=ApiTokenMintResponse)
+@router.post(PATH_AUTH_PAT, status_code=201, response_model=ApiTokenMintResponse)
 async def mint_pat(
     body: ApiTokenMintRequest,
     request: Request,
@@ -282,7 +293,7 @@ async def mint_pat(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/token")
+@router.get(PATH_AUTH_TOKEN)
 async def list_own_tokens(
     p: Principal = Depends(require_scope(Scope.SELF_TOKEN)),
     pool: asyncpg.Pool = Depends(get_db_pool),
@@ -304,7 +315,7 @@ async def list_own_tokens(
 # ---------------------------------------------------------------------------
 
 
-@router.delete("/token/{token_idx}", status_code=204)
+@router.delete(PATH_AUTH_TOKEN_BY_IDX, status_code=204)
 async def revoke_own_token(
     token_idx: int,
     p: Principal = Depends(require_scope(Scope.SELF_TOKEN)),
@@ -366,7 +377,7 @@ _LOGIN_COOKIE_TRANSPORT = {
 }
 
 
-@router.get("/login")
+@router.get(PATH_AUTH_LOGIN)
 async def begin_login(
     request: Request,
     cli: int = 0,
@@ -411,7 +422,7 @@ async def begin_login(
 
     cookie_value = sign_login_cookie(cookie_payload, settings.hmac_secret_key)
 
-    redirect_uri = f"{settings.qiita_endpoint_url.rstrip('/')}{API_PREFIX}/auth/handoff"
+    redirect_uri = f"{settings.qiita_endpoint_url.rstrip('/')}{URL_AUTH_HANDOFF}"
     authrocket_url = build_authrocket_login_url(
         loginrocket_base_url=settings.authrocket_loginrocket_url,
         redirect_uri=redirect_uri,
@@ -474,7 +485,7 @@ _VIA_BROWSER = "browser_login"
 _VIA_INVITATION = "invitation"
 
 
-@router.get("/handoff")
+@router.get(PATH_AUTH_HANDOFF)
 async def handoff(
     request: Request,
     token: str | None = None,
@@ -643,7 +654,7 @@ async def handoff(
     page = _HANDOFF_BROWSER_HTML.format(
         email=html.escape(principal.email, quote=True),
         plaintext=html.escape(plaintext_pat, quote=True),
-        login_path=f"{API_PREFIX}/auth/login",
+        login_path=URL_AUTH_LOGIN,
     )
     response = HTMLResponse(content=page, status_code=200)
     _scrub_login_cookie(response)
@@ -669,7 +680,7 @@ def _scrub_login_cookie(response: Response) -> None:
 # ---------------------------------------------------------------------------
 
 
-@router.post("/cli-exchange", response_model=ApiTokenMintResponse)
+@router.post(PATH_AUTH_CLI_EXCHANGE, response_model=ApiTokenMintResponse)
 async def cli_exchange(
     body: CliLoginExchangeRequest,
     pool: asyncpg.Pool = Depends(get_db_pool),
