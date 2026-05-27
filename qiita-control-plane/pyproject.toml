@@ -14,6 +14,12 @@ dependencies = [
     "duckdb>=1.5",
     "jsonschema>=4.20",
     "jinja2>=3.1",
+    # gRPC health-check stubs for the DP probe in /health. Used to
+    # ping the data plane's `grpc.health.v1.Health/Check` service
+    # without depending on gRPC reflection (DP reflection is a
+    # separate ops-tooling concern; see issue #54).
+    "grpcio>=1.66",
+    "grpcio-health-checking>=1.66",
 ]
 
 [project.scripts]

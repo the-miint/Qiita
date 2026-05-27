@@ -35,8 +35,26 @@ ORCID_PATTERN = r"^\d{4}-\d{4}-\d{4}-\d{3}[\dX]$"
 
 
 class HealthResponse(BaseModel):
+    """Health-check response shared across the three services.
+
+    `status` and `service` are the original v1 surface — a binary
+    `ok` / `degraded` summary and the responding service's name.
+    Every existing consumer (the `make verify-health` Makefile target,
+    the landing-page JS, monitoring scrapes) reads only these two
+    fields and stays compatible.
+
+    `services` is an optional per-component breakdown the control
+    plane populates when its `/health` aggregates its own DB probe
+    with downstream probes against the orchestrator and the data
+    plane. The orchestrator's `/health` leaves it `None` — its
+    aggregate is the single `status` field. Keys are component slugs
+    (`cp` / `co` / `dp`); values are per-service status strings drawn
+    from {`ok`, `degraded`, `unreachable`, `unconfigured`}.
+    """
+
     status: str
     service: str
+    services: dict[str, str] | None = None
 
 
 class ReferenceStatus(StrEnum):
