@@ -119,9 +119,22 @@ def cp_server(tmp_path, hmac_secret):
             _fail(f"cp server exited during startup (rc={proc.returncode})")
         try:
             resp = httpx.get(f"{base_url}/health", timeout=1.0)
-            if resp.status_code == 200 and resp.json().get("status") == "ok":
-                healthy = True
-                break
+            if resp.status_code == 200:
+                # The CP's aggregated /health probes the CO and DP
+                # too, but this fixture intentionally configures a
+                # dead CO (see COMPUTE_ORCHESTRATOR_URL above) and
+                # doesn't spawn a DP — so the aggregate top-level
+                # status will be `degraded`. Check the cp sub-
+                # service instead, since that's the only piece this
+                # test cares about being up. Fall back to top-level
+                # status for legacy /health responses that omit the
+                # services dict.
+                body = resp.json()
+                services = body.get("services") or {}
+                cp_status = services.get("cp", body.get("status"))
+                if cp_status == "ok":
+                    healthy = True
+                    break
         except httpx.HTTPError:
             pass
         time.sleep(0.25)
