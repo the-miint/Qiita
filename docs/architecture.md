@@ -659,9 +659,9 @@ The wire validator on `StepRunRequest` is shape-only — it enforces exactly-one
 
 Each service exposes a health check endpoint for monitoring and deployment verification.
 
-- **qiita-control-plane:** `GET /health` — checks Postgres connectivity, returns service version
-- **qiita-data-plane:** gRPC health check protocol (`grpc.health.v1.Health/Check`) — checks DuckLake catalog connectivity
-- **qiita-compute-orchestrator:** `GET /health` — checks slurmrestd reachability, returns service version
+- **qiita-control-plane:** `GET /health` — aggregated. Probes the CP's own Postgres pool (`SELECT 1`), the orchestrator's `GET /health` over HTTP, and the data plane's `grpc.health.v1.Health/Check` over gRPC, in parallel with per-probe ~1s timeouts. Returns the legacy `{"status": ..., "service": "qiita-control-plane"}` shape plus an optional `services: {"cp": ..., "co": ..., "dp": ...}` per-service breakdown. The top-level `status` is the strict aggregate (`ok` iff every configured service is `ok`; any non-`ok` configured service demotes to `degraded`). Cached for ~5s with single-flight lock semantics so a landing-page traffic spike doesn't dogpile downstream probes.
+- **qiita-data-plane:** gRPC health check protocol (`grpc.health.v1.Health/Check`) via `tonic-health` — process-liveness only (returns `SERVING` once the server has bound its port). Does not probe DuckLake catalog connectivity. `tonic-reflection` is also registered (both v1 and v1alpha) so `grpcurl` can introspect the service from `make verify-health` without a local proto.
+- **qiita-compute-orchestrator:** `GET /health` — process-liveness only (returns `{"status": "ok", "service": "qiita-compute-orchestrator"}` once the FastAPI app has started). Does not probe slurmrestd reachability today; a real downstream probe is tracked as a follow-up.
 - **nginx:** proxies health checks; can be used for readiness gating during deploys
 
 ## Work Ticket Queue

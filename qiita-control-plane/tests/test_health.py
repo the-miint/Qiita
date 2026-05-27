@@ -17,6 +17,7 @@ import grpc
 import httpx
 import pytest
 from grpc_health.v1 import health_pb2
+from qiita_common.models import HealthStatus
 
 from qiita_control_plane import health as health_module
 
@@ -95,14 +96,14 @@ def _patch_grpc_channel(monkeypatch, *, check_result=None, check_raises: Excepti
 @pytest.mark.asyncio
 async def test_probe_cp_ok():
     pool = _FakePool()
-    assert await health_module._probe_cp(pool) == "ok"
+    assert await health_module._probe_cp(pool) == HealthStatus.OK
     assert pool.calls == ["SELECT 1"]
 
 
 @pytest.mark.asyncio
 async def test_probe_cp_db_error_is_degraded():
     pool = _FakePool(fetchval_raises=RuntimeError("connection refused"))
-    assert await health_module._probe_cp(pool) == "degraded"
+    assert await health_module._probe_cp(pool) == HealthStatus.DEGRADED
 
 
 # ---------------------------------------------------------------------------
@@ -112,8 +113,8 @@ async def test_probe_cp_db_error_is_degraded():
 
 @pytest.mark.asyncio
 async def test_probe_co_unconfigured_when_url_missing():
-    assert await health_module._probe_co(None) == "unconfigured"
-    assert await health_module._probe_co("") == "unconfigured"
+    assert await health_module._probe_co(None) == HealthStatus.UNCONFIGURED
+    assert await health_module._probe_co("") == HealthStatus.UNCONFIGURED
 
 
 @pytest.mark.asyncio
@@ -126,7 +127,7 @@ async def test_probe_co_ok_when_orchestrator_returns_status_ok(monkeypatch):
 
     _patch_httpx_async_client(monkeypatch, handler)
     result = await health_module._probe_co("http://orchestrator.invalid:8081")
-    assert result == "ok"
+    assert result == HealthStatus.OK
     assert seen_paths == ["/health"]
 
 
@@ -138,7 +139,9 @@ async def test_probe_co_degraded_when_orchestrator_self_reports_not_ok(monkeypat
         )
 
     _patch_httpx_async_client(monkeypatch, handler)
-    assert await health_module._probe_co("http://orchestrator.invalid:8081") == "degraded"
+    assert (
+        await health_module._probe_co("http://orchestrator.invalid:8081") == HealthStatus.DEGRADED
+    )
 
 
 @pytest.mark.asyncio
@@ -147,7 +150,10 @@ async def test_probe_co_unreachable_on_non_200(monkeypatch):
         return httpx.Response(503, text="service unavailable")
 
     _patch_httpx_async_client(monkeypatch, handler)
-    assert await health_module._probe_co("http://orchestrator.invalid:8081") == "unreachable"
+    assert (
+        await health_module._probe_co("http://orchestrator.invalid:8081")
+        == HealthStatus.UNREACHABLE
+    )
 
 
 @pytest.mark.asyncio
@@ -156,7 +162,29 @@ async def test_probe_co_unreachable_on_transport_error(monkeypatch):
         raise httpx.ConnectError("connection refused")
 
     _patch_httpx_async_client(monkeypatch, handler)
-    assert await health_module._probe_co("http://orchestrator.invalid:8081") == "unreachable"
+    assert (
+        await health_module._probe_co("http://orchestrator.invalid:8081")
+        == HealthStatus.UNREACHABLE
+    )
+
+
+@pytest.mark.asyncio
+async def test_probe_co_unreachable_on_unparseable_body(monkeypatch):
+    """The CO returns 200 but the body isn't valid JSON — collapsed
+    into the same UNREACHABLE state the transport-failure path uses
+    (the caller doesn't distinguish; both mean 'no useful answer'). A
+    future httpx switch to orjson — whose JSONDecodeError doesn't
+    subclass ValueError — must not regress this case, which the
+    unified `except Exception` covers."""
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="not actually json")
+
+    _patch_httpx_async_client(monkeypatch, handler)
+    assert (
+        await health_module._probe_co("http://orchestrator.invalid:8081")
+        == HealthStatus.UNREACHABLE
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -165,16 +193,10 @@ async def test_probe_co_unreachable_on_transport_error(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_probe_dp_unconfigured_when_url_missing():
-    assert await health_module._probe_dp(None) == "unconfigured"
-    assert await health_module._probe_dp("") == "unconfigured"
-
-
-@pytest.mark.asyncio
 async def test_probe_dp_ok_when_serving(monkeypatch):
     response = health_pb2.HealthCheckResponse(status=health_pb2.HealthCheckResponse.SERVING)
     check_mock = _patch_grpc_channel(monkeypatch, check_result=response)
-    assert await health_module._probe_dp("grpc://data-plane.invalid:50051") == "ok"
+    assert await health_module._probe_dp("grpc://data-plane.invalid:50051") == HealthStatus.OK
     # Service field should be empty string by convention (overall-server check).
     assert check_mock.await_args.args[0].service == ""
 
@@ -183,7 +205,7 @@ async def test_probe_dp_ok_when_serving(monkeypatch):
 async def test_probe_dp_degraded_when_not_serving(monkeypatch):
     response = health_pb2.HealthCheckResponse(status=health_pb2.HealthCheckResponse.NOT_SERVING)
     _patch_grpc_channel(monkeypatch, check_result=response)
-    assert await health_module._probe_dp("grpc://data-plane.invalid:50051") == "degraded"
+    assert await health_module._probe_dp("grpc://data-plane.invalid:50051") == HealthStatus.DEGRADED
 
 
 @pytest.mark.asyncio
@@ -195,7 +217,9 @@ async def test_probe_dp_unreachable_on_rpc_error(monkeypatch):
         details="connection refused",
     )
     _patch_grpc_channel(monkeypatch, check_raises=err)
-    assert await health_module._probe_dp("grpc://data-plane.invalid:50051") == "unreachable"
+    assert (
+        await health_module._probe_dp("grpc://data-plane.invalid:50051") == HealthStatus.UNREACHABLE
+    )
 
 
 @pytest.mark.asyncio
@@ -219,11 +243,17 @@ async def test_probe_dp_strips_grpc_scheme(monkeypatch):
     monkeypatch.setattr(health_module.grpc.aio, "insecure_channel", fake_channel)
     monkeypatch.setattr(health_module.health_pb2_grpc, "HealthStub", _FakeStub)
     await health_module._probe_dp("grpc://data-plane.invalid:50051")
-    await health_module._probe_dp("grpcs://data-plane.invalid:50051")
-    assert captured_targets == [
-        "data-plane.invalid:50051",
-        "data-plane.invalid:50051",
-    ]
+    assert captured_targets == ["data-plane.invalid:50051"]
+
+
+@pytest.mark.asyncio
+async def test_probe_dp_rejects_grpcs_scheme():
+    """`grpcs://` would silently downgrade to a plaintext dial under
+    `insecure_channel` — refuse explicitly. TLS is terminated at
+    nginx in the production deploy; a direct TLS dial isn't a
+    supported path here."""
+    with pytest.raises(ValueError, match="grpcs://"):
+        await health_module._probe_dp("grpcs://data-plane.invalid:50051")
 
 
 # ---------------------------------------------------------------------------
@@ -232,20 +262,59 @@ async def test_probe_dp_strips_grpc_scheme(monkeypatch):
 
 
 def test_aggregate_all_ok_is_ok():
-    assert health_module._aggregate({"cp": "ok", "co": "ok", "dp": "ok"}) == "ok"
+    assert (
+        health_module._aggregate(
+            {"cp": HealthStatus.OK.value, "co": HealthStatus.OK.value, "dp": HealthStatus.OK.value}
+        )
+        == HealthStatus.OK
+    )
 
 
 def test_aggregate_unconfigured_does_not_demote():
-    """A CP-only dev instance with co/dp unconfigured stays overall ok."""
+    """A CP-only dev instance with co/dp unconfigured stays overall OK."""
     assert (
-        health_module._aggregate({"cp": "ok", "co": "unconfigured", "dp": "unconfigured"}) == "ok"
+        health_module._aggregate(
+            {
+                "cp": HealthStatus.OK.value,
+                "co": HealthStatus.UNCONFIGURED.value,
+                "dp": HealthStatus.UNCONFIGURED.value,
+            }
+        )
+        == HealthStatus.OK
     )
 
 
 def test_aggregate_any_non_ok_configured_service_demotes():
-    assert health_module._aggregate({"cp": "ok", "co": "degraded", "dp": "ok"}) == "degraded"
-    assert health_module._aggregate({"cp": "ok", "co": "ok", "dp": "unreachable"}) == "degraded"
-    assert health_module._aggregate({"cp": "degraded", "co": "ok", "dp": "ok"}) == "degraded"
+    assert (
+        health_module._aggregate(
+            {
+                "cp": HealthStatus.OK.value,
+                "co": HealthStatus.DEGRADED.value,
+                "dp": HealthStatus.OK.value,
+            }
+        )
+        == HealthStatus.DEGRADED
+    )
+    assert (
+        health_module._aggregate(
+            {
+                "cp": HealthStatus.OK.value,
+                "co": HealthStatus.OK.value,
+                "dp": HealthStatus.UNREACHABLE.value,
+            }
+        )
+        == HealthStatus.DEGRADED
+    )
+    assert (
+        health_module._aggregate(
+            {
+                "cp": HealthStatus.DEGRADED.value,
+                "co": HealthStatus.OK.value,
+                "dp": HealthStatus.OK.value,
+            }
+        )
+        == HealthStatus.DEGRADED
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -271,9 +340,13 @@ async def test_aggregate_health_returns_breakdown(monkeypatch):
         compute_orchestrator_url="http://orchestrator.invalid:8081",
         data_plane_url="grpc://data-plane.invalid:50051",
     )
-    assert resp.status == "ok"
+    assert resp.status == HealthStatus.OK.value
     assert resp.service == "qiita-control-plane"
-    assert resp.services == {"cp": "ok", "co": "ok", "dp": "ok"}
+    assert resp.services == {
+        "cp": HealthStatus.OK.value,
+        "co": HealthStatus.OK.value,
+        "dp": HealthStatus.OK.value,
+    }
 
 
 @pytest.mark.asyncio
@@ -326,7 +399,12 @@ async def test_aggregate_health_refreshes_after_ttl(monkeypatch):
         data_plane_url="grpc://data-plane.invalid:50051",
     )
     # Force-expire the cache rather than waiting real wall-clock time.
-    health_module._cache.expires_at = time.monotonic() - 1
+    # `_Cache` is frozen; rebind the module reference to an expired
+    # snapshot to mirror what production refresh does.
+    health_module._cache = health_module._Cache(
+        expires_at=time.monotonic() - 1,
+        response=health_module._cache.response,
+    )
     await health_module.aggregate_health(
         pool=pool,
         compute_orchestrator_url="http://orchestrator.invalid:8081",
@@ -360,5 +438,5 @@ async def test_aggregate_health_concurrent_callers_share_one_probe_round(monkeyp
             for _ in range(10)
         ]
     )
-    assert all(r.status == "ok" for r in results)
+    assert all(r.status == HealthStatus.OK.value for r in results)
     assert pool.calls == ["SELECT 1"]

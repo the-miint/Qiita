@@ -38,15 +38,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_service_status("", ServingStatus::Serving)
         .await;
 
-    // gRPC reflection lets `grpcurl` introspect the server (used by
-    // `make verify-health` from the deploy host). Register both v1
-    // and v1alpha so older grpcurl builds also work — they're free
-    // to add and many sites pin older grpcurl. Reflection only
-    // exposes the tonic-health descriptor here; the Flight service
-    // uses arrow-flight's prebuilt bindings which don't ship a
-    // public descriptor set, so it's intentionally not reflected.
-    // Internal Python-side probes (CP /health → gRPC Health.Check)
-    // use prebuilt stubs and never call reflection.
+    // gRPC reflection lets `grpcurl` introspect the server (used
+    // by `make verify-health` from the deploy host). Both v1 and
+    // v1alpha are registered: grpcurl 1.9.3 (the version pinned in
+    // the Makefile today) tries v1alpha first by default, and v1
+    // is forward-compat for when grpcurl drops v1alpha. Reflection
+    // only exposes the tonic-health descriptor here — the Flight
+    // service uses arrow-flight's prebuilt bindings, which don't
+    // ship a public descriptor set, so it's intentionally not
+    // reflected.
     let reflection_v1 = tonic_reflection::server::Builder::configure()
         .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
         .build_v1()?;

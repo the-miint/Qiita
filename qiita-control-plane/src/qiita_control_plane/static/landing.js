@@ -22,12 +22,13 @@
     badge.textContent = text;
   }
 
-  // Map a per-service status string (drawn from the CP-side
-  // {ok, degraded, unreachable, unconfigured} alphabet) to a pill
-  // class + text. Unknown values fall through to the "bad" class
-  // so a future server-side status the JS doesn't recognize
-  // surfaces as visible failure rather than silent success — same
-  // posture as the compute-readiness probe-log parser.
+  // Map a per-service status string to a pill class + text. The
+  // alphabet (ok / degraded / unreachable / unconfigured) is pinned
+  // on the wire by the HealthResponse / HealthStatus enum on the
+  // CP side; adding a new value there requires a matching case
+  // here. Unknown values fall through to the "bad" class so a
+  // contract drift surfaces as visible failure rather than silent
+  // success.
   function pillFor(status) {
     if (status === "ok") return ["status-ok", "ok"];
     if (status === "unconfigured") return ["status-unknown", "not configured"];
