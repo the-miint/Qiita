@@ -36,13 +36,7 @@ main {
 }
 
 header {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 1rem;
-  border-bottom: 1px solid var(--rule);
-  padding-bottom: 0.75rem;
-  margin-bottom: 1.5rem;
+  padding-bottom: 0.6rem;
 }
 
 h1 {
@@ -50,6 +44,34 @@ h1 {
   font-size: 1.6rem;
   font-weight: 600;
   letter-spacing: -0.01em;
+}
+
+/* Service-status pill row, rendered below the title. Three pills,
+ * one per backend service (Control plane / Orchestrator / Data
+ * plane); each updates independently from the per-component
+ * breakdown returned by /health.services. The row wraps to a
+ * vertical stack on narrow viewports so a phone-sized screen
+ * doesn't crush the labels. */
+.service-status {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 1.5rem 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem 1rem;
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 1rem;
+}
+
+.service-status li {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.service-status-label {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
 }
 
 .status-badge {

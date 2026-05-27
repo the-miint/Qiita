@@ -125,3 +125,53 @@ async def test_static_assets_served(app):
     assert css.headers["content-type"].startswith("text/css")
     assert js.status_code == 200
     assert js.headers["content-type"].startswith(("text/javascript", "application/javascript"))
+
+
+async def test_landing_renders_three_status_pills(app):
+    """The page must carry one pill per service in the
+    `qiita_control_plane.health` per-service breakdown (cp/co/dp). The
+    pill IDs are the contract the JS reads from /health.services; if
+    these IDs change, the JS must change in lockstep."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        response = await ac.get("/")
+    body = response.text
+    # Three pill elements with stable IDs.
+    assert 'id="status-badge-cp"' in body
+    assert 'id="status-badge-co"' in body
+    assert 'id="status-badge-dp"' in body
+    # Each pill carries its service-name label (visitor-facing copy
+    # — renaming these is a UX change, not a refactor).
+    assert "Control plane" in body
+    assert "Orchestrator" in body
+    assert "Data plane" in body
+
+
+async def test_landing_pills_start_in_checking_state(app):
+    """Server-side render leaves every pill in the neutral
+    'checking…' state; the JS flips to ok / degraded / unreachable
+    after fetching /health. A pre-flip render must never look like
+    'everything's fine' — that would mislead a visitor whose JS
+    failed to run."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        response = await ac.get("/")
+    body = response.text
+    # Each pill has the neutral class and the placeholder text.
+    # Three pills × one placeholder per pill = three occurrences.
+    assert body.count("status-unknown") == 3
+    assert body.count("checking") == 3
+
+
+async def test_landing_js_references_three_pill_ids(app):
+    """The landing.js must reference the same three pill IDs the
+    HTML carries. Drifts between the two sides land a pill in
+    'checking…' forever — visible but easy to miss in code review,
+    so we pin the contract here."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        js = await ac.get("/static/landing.js")
+    assert js.status_code == 200
+    js_text = js.text
+    # Either the IDs are constructed from a per-key suffix or they
+    # appear literally — accept either pattern by checking that the
+    # JS knows the three keys.
+    for key in ("cp", "co", "dp"):
+        assert f'"{key}"' in js_text, f"landing.js must reference service key {key!r}"
