@@ -523,6 +523,11 @@ async def patch_sequenced_sample(
     UPDATE explicitly sets submission_error; callers recording a failed
     attempt should patch both fields in one request.
     """
+    assert isinstance(caller, HumanUser), (
+        "caller must be HumanUser pre-commit; shaper reads .system_role and "
+        "would 500 after SELECT FOR UPDATE + UPDATE commits (see docstring)"
+    )
+
     # Missing If-Match is 428 before any DB work runs.
     if if_match is None:
         raise HTTPException(status_code=428, detail="If-Match header required")
