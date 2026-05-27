@@ -2,6 +2,7 @@
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from qiita_common.api_paths import URL_REFERENCE_BY_IDX, URL_REFERENCE_PREFIX
 
 pytestmark = pytest.mark.db
 
@@ -43,7 +44,7 @@ async def client(postgres_pool, human_admin_session):
 async def _create_ref(client, name, version="1.0", kind="sequence_reference"):
     """Helper: create a reference and track its idx for cleanup."""
     resp = await client.post(
-        "/api/v1/reference",
+        URL_REFERENCE_PREFIX,
         json={"name": name, "version": version, "kind": kind},
     )
     if resp.status_code == 201:
@@ -68,7 +69,7 @@ async def test_create_reference_returns_201(client, human_admin_session):
 async def test_create_reference_rejects_invalid_kind(client):
     """POST /api/v1/reference with invalid kind returns 422."""
     resp = await client.post(
-        "/api/v1/reference",
+        URL_REFERENCE_PREFIX,
         json={"name": "bad", "version": "1.0", "kind": "bogus"},
     )
     assert resp.status_code == 422
@@ -77,7 +78,7 @@ async def test_create_reference_rejects_invalid_kind(client):
 async def test_create_reference_rejects_empty_name(client):
     """POST /api/v1/reference with empty name returns 422."""
     resp = await client.post(
-        "/api/v1/reference",
+        URL_REFERENCE_PREFIX,
         json={"name": "", "version": "1.0", "kind": "sequence_reference"},
     )
     assert resp.status_code == 422
@@ -88,7 +89,7 @@ async def test_get_reference_by_idx(client):
     create_resp = await _create_ref(client, "test-ref-get")
     idx = create_resp.json()["reference_idx"]
 
-    get_resp = await client.get(f"/api/v1/reference/{idx}")
+    get_resp = await client.get(URL_REFERENCE_BY_IDX.format(reference_idx=idx))
     assert get_resp.status_code == 200
     body = get_resp.json()
     assert body["reference_idx"] == idx
@@ -100,19 +101,19 @@ async def test_get_reference_not_found(client, postgres_pool):
     max_idx = await postgres_pool.fetchval(
         "SELECT COALESCE(MAX(reference_idx), 0) FROM qiita.reference"
     )
-    resp = await client.get(f"/api/v1/reference/{max_idx + 1}")
+    resp = await client.get(URL_REFERENCE_BY_IDX.format(reference_idx=max_idx + 1))
     assert resp.status_code == 404
 
 
 async def test_get_reference_rejects_zero(client):
     """GET /api/v1/reference/0 returns 422 (gt=0 constraint)."""
-    resp = await client.get("/api/v1/reference/0")
+    resp = await client.get(URL_REFERENCE_BY_IDX.format(reference_idx=0))
     assert resp.status_code == 422
 
 
 async def test_get_reference_rejects_negative(client):
     """GET /api/v1/reference/-1 returns 422 (gt=0 constraint)."""
-    resp = await client.get("/api/v1/reference/-1")
+    resp = await client.get(URL_REFERENCE_BY_IDX.format(reference_idx=-1))
     assert resp.status_code == 422
 
 

@@ -11,6 +11,15 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from qiita_common.api_paths import (
+    URL_AUTH_CLI_EXCHANGE,
+    URL_AUTH_HANDOFF,
+    URL_AUTH_LOGIN,
+    URL_AUTH_PAT,
+    URL_AUTH_TOKEN,
+    URL_AUTH_TOKEN_BY_IDX,
+    URL_AUTH_WHOAMI,
+)
 from qiita_common.auth_constants import (
     SYSTEM_PRINCIPAL_IDX,
     AuthEventType,
@@ -186,7 +195,7 @@ def _detail(row) -> dict:
 
 
 async def test_auth_whoami_anonymous_returns_anonymous(auth_client):
-    resp = await auth_client.get("/api/v1/auth/whoami")
+    resp = await auth_client.get(URL_AUTH_WHOAMI)
     assert resp.status_code == 200
     assert resp.json() == {"kind": "anonymous"}
 
@@ -206,7 +215,7 @@ async def test_auth_whoami_human_returns_profile_and_role_and_scopes(
         _claims(jwks_harness, sub="whoami-human", email="whoami-human@example.com")
     )
     resp = await auth_client.get(
-        "/api/v1/auth/whoami",
+        URL_AUTH_WHOAMI,
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 200, resp.text
@@ -240,7 +249,7 @@ async def test_auth_whoami_service_returns_service_summary(auth_client, postgres
         scopes=[Scope.FEATURE_MINT],
     )
     resp = await auth_client.get(
-        "/api/v1/auth/whoami",
+        URL_AUTH_WHOAMI,
         headers={"Authorization": f"Bearer {plaintext}"},
     )
     assert resp.status_code == 200
@@ -266,7 +275,7 @@ async def test_post_pat_returns_token_once(auth_client, postgres_pool, jwks_harn
     _track(auth_client, pidx)
     jwt = jwks_harness.sign(_claims(jwks_harness, sub="pat-once", email="pat-once@example.com"))
     resp = await auth_client.post(
-        "/api/v1/auth/pat",
+        URL_AUTH_PAT,
         headers={"Authorization": f"Bearer {jwt}"},
         json={"label": "my-laptop"},
     )
@@ -296,7 +305,7 @@ async def test_post_pat_requires_oidc_jwt_not_pat(auth_client, postgres_pool, jw
         scopes=[Scope.SELF_TOKEN],
     )
     resp = await auth_client.post(
-        "/api/v1/auth/pat",
+        URL_AUTH_PAT,
         headers={"Authorization": f"Bearer {plaintext}"},
         json={"label": "would-be-new-pat"},
     )
@@ -322,7 +331,7 @@ async def test_post_pat_rejects_jwt_with_stale_auth_time(auth_client, postgres_p
         )
     )
     resp = await auth_client.post(
-        "/api/v1/auth/pat",
+        URL_AUTH_PAT,
         headers={"Authorization": f"Bearer {jwt}"},
         json={"label": "stale-attempt"},
     )
@@ -343,7 +352,7 @@ async def test_post_pat_rejects_jwt_with_missing_auth_time(
     del claims["auth_time"]
     jwt = jwks_harness.sign(claims)
     resp = await auth_client.post(
-        "/api/v1/auth/pat",
+        URL_AUTH_PAT,
         headers={"Authorization": f"Bearer {jwt}"},
         json={"label": "no-at"},
     )
@@ -361,7 +370,7 @@ async def test_post_pat_ttl_defaults_to_90_days(auth_client, postgres_pool, jwks
     jwt = jwks_harness.sign(_claims(jwks_harness, sub="pat-ttl", email="pat-ttl@example.com"))
     before = datetime.now(UTC)
     resp = await auth_client.post(
-        "/api/v1/auth/pat",
+        URL_AUTH_PAT,
         headers={"Authorization": f"Bearer {jwt}"},
         json={"label": "default-ttl"},
     )
@@ -384,7 +393,7 @@ async def test_post_pat_ttl_beyond_365_rejected(auth_client, postgres_pool, jwks
         _claims(jwks_harness, sub="pat-ttl-too-long", email="pat-ttl-too-long@example.com")
     )
     resp = await auth_client.post(
-        "/api/v1/auth/pat",
+        URL_AUTH_PAT,
         headers={"Authorization": f"Bearer {jwt}"},
         json={"label": "too-long", "ttl_days": 366},
     )
@@ -406,7 +415,7 @@ async def test_post_pat_incomplete_profile_rejects_with_422(
         _claims(jwks_harness, sub="pat-incomplete", email="pat-incomplete@example.com")
     )
     resp = await auth_client.post(
-        "/api/v1/auth/pat",
+        URL_AUTH_PAT,
         headers={"Authorization": f"Bearer {jwt}"},
         json={"label": "incomplete-attempt"},
     )
@@ -429,7 +438,7 @@ async def test_post_pat_rejects_unknown_scope(auth_client, postgres_pool, jwks_h
         _claims(jwks_harness, sub="pat-unknown-scope", email="pat-unknown-scope@example.com")
     )
     resp = await auth_client.post(
-        "/api/v1/auth/pat",
+        URL_AUTH_PAT,
         headers={"Authorization": f"Bearer {jwt}"},
         json={
             "label": "weird-scope",
@@ -464,7 +473,7 @@ async def test_post_pat_default_scopes_match_role_ceiling(auth_client, postgres_
         )
     )
     resp = await auth_client.post(
-        "/api/v1/auth/pat",
+        URL_AUTH_PAT,
         headers={"Authorization": f"Bearer {jwt}"},
         json={"label": "default-scopes"},
     )
@@ -485,7 +494,7 @@ async def test_post_pat_system_admin_role_ceiling_includes_lower_role_scopes(
     _track(auth_client, pidx)
     jwt = jwks_harness.sign(_claims(jwks_harness, sub="pat-admin", email="pat-admin@example.com"))
     resp = await auth_client.post(
-        "/api/v1/auth/pat",
+        URL_AUTH_PAT,
         headers={"Authorization": f"Bearer {jwt}"},
         json={"label": "admin-default"},
     )
@@ -512,7 +521,7 @@ async def test_post_pat_rejects_upscoping(auth_client, postgres_pool, jwks_harne
         _claims(jwks_harness, sub="pat-upscope", email="pat-upscope@example.com")
     )
     resp = await auth_client.post(
-        "/api/v1/auth/pat",
+        URL_AUTH_PAT,
         headers={"Authorization": f"Bearer {jwt}"},
         json={"label": "up", "scopes": [Scope.SELF_PROFILE, Scope.ADMIN_USER]},
     )
@@ -537,7 +546,7 @@ async def test_post_pat_upscoping_error_does_not_leak_role_ceiling(
     _track(auth_client, pidx)
     jwt = jwks_harness.sign(_claims(jwks_harness, sub="pat-noleak", email="pat-noleak@example.com"))
     resp = await auth_client.post(
-        "/api/v1/auth/pat",
+        URL_AUTH_PAT,
         headers={"Authorization": f"Bearer {jwt}"},
         json={"label": "noleak", "scopes": [Scope.ADMIN_USER]},
     )
@@ -559,7 +568,7 @@ async def test_post_pat_writes_audit_event(auth_client, postgres_pool, jwks_harn
     _track(auth_client, pidx)
     jwt = jwks_harness.sign(_claims(jwks_harness, sub="pat-audit", email="pat-audit@example.com"))
     resp = await auth_client.post(
-        "/api/v1/auth/pat",
+        URL_AUTH_PAT,
         headers={"Authorization": f"Bearer {jwt}"},
         json={"label": "audited"},
     )
@@ -602,7 +611,7 @@ async def test_get_own_tokens_lists_metadata_only(auth_client, postgres_pool, jw
     )
 
     resp = await auth_client.get(
-        "/api/v1/auth/token",
+        URL_AUTH_TOKEN,
         headers={"Authorization": f"Bearer {plaintext}"},
     )
     assert resp.status_code == 200, resp.text
@@ -648,7 +657,7 @@ async def test_get_own_tokens_cannot_see_others(auth_client, postgres_pool, jwks
     )
 
     resp = await auth_client.get(
-        "/api/v1/auth/token",
+        URL_AUTH_TOKEN,
         headers={"Authorization": f"Bearer {pa_token}"},
     )
     assert resp.status_code == 200
@@ -658,7 +667,7 @@ async def test_get_own_tokens_cannot_see_others(auth_client, postgres_pool, jwks
 
 
 async def test_list_tokens_anonymous_401(auth_client):
-    resp = await auth_client.get("/api/v1/auth/token")
+    resp = await auth_client.get(URL_AUTH_TOKEN)
     assert resp.status_code == 401
 
 
@@ -679,7 +688,7 @@ async def test_list_tokens_403_without_self_tokens_scope(auth_client, postgres_p
         scopes=[Scope.SELF_PROFILE],  # no self:tokens
     )
     resp = await auth_client.get(
-        "/api/v1/auth/token",
+        URL_AUTH_TOKEN,
         headers={"Authorization": f"Bearer {plaintext}"},
     )
     assert resp.status_code == 403
@@ -716,7 +725,7 @@ async def test_delete_own_token_revokes_and_writes_audit_event(
     )
 
     resp = await auth_client.delete(
-        f"/api/v1/auth/token/{target_idx}",
+        URL_AUTH_TOKEN_BY_IDX.format(token_idx=target_idx),
         headers={"Authorization": f"Bearer {auth_token}"},
     )
     assert resp.status_code == 204
@@ -770,11 +779,11 @@ async def test_delete_others_token_returns_404_not_403(auth_client, postgres_poo
     )
 
     resp_other = await auth_client.delete(
-        f"/api/v1/auth/token/{victim_token_idx}",
+        URL_AUTH_TOKEN_BY_IDX.format(token_idx=victim_token_idx),
         headers={"Authorization": f"Bearer {attacker_token}"},
     )
     resp_missing = await auth_client.delete(
-        "/api/v1/auth/token/9999999999",
+        URL_AUTH_TOKEN_BY_IDX.format(token_idx=9999999999),
         headers={"Authorization": f"Bearer {attacker_token}"},
     )
     # Identical response shape — attacker can't tell which token_idx values
@@ -813,7 +822,7 @@ async def test_post_pat_rejects_jwt_with_future_auth_time(auth_client, postgres_
         )
     )
     resp = await auth_client.post(
-        "/api/v1/auth/pat",
+        URL_AUTH_PAT,
         headers={"Authorization": f"Bearer {jwt}"},
         json={"label": "future-attempt"},
     )
@@ -884,7 +893,7 @@ async def test_auth_login_redirects_to_authrocket_with_prompt_login(auth_client)
     prompt=login appended and the redirect_uri pointing back at /auth/handoff."""
     from qiita_control_plane.auth.handoff import LOGIN_COOKIE_NAME
 
-    resp = await auth_client.get("/api/v1/auth/login", follow_redirects=False)
+    resp = await auth_client.get(URL_AUTH_LOGIN, follow_redirects=False)
     assert resp.status_code == 302
     location = resp.headers["location"]
     assert location.startswith("https://test-realm.example/lr/login?")
@@ -898,7 +907,7 @@ async def test_auth_login_cli_mode_requires_port(auth_client):
     """cli=1 without a port is rejected — without it the handoff has nowhere
     to redirect the browser back to the CLI."""
     resp = await auth_client.get(
-        "/api/v1/auth/login?cli=1",
+        f"{URL_AUTH_LOGIN}?cli=1",
         follow_redirects=False,
     )
     assert resp.status_code == 400
@@ -908,7 +917,7 @@ async def test_auth_login_cli_mode_redirects_with_cookie(auth_client):
     """cli=1&port=N sets a cookie that includes the port; handoff reads it
     later to construct the loopback URL."""
     resp = await auth_client.get(
-        "/api/v1/auth/login?cli=1&port=12345",
+        f"{URL_AUTH_LOGIN}?cli=1&port=12345",
         follow_redirects=False,
     )
     assert resp.status_code == 302
@@ -931,7 +940,7 @@ async def test_handoff_browser_flow_mints_pat_and_renders_html(
         )
         cookie = _make_login_cookie(cli=False)
         resp = await auth_client.get(
-            f"/api/v1/auth/handoff?token={token}",
+            f"{URL_AUTH_HANDOFF}?token={token}",
             cookies=_cookie_jar(cookie),
             follow_redirects=False,
         )
@@ -975,7 +984,7 @@ async def test_handoff_cli_flow_redirects_to_loopback_with_ot_code(
         )
         cookie = _make_login_cookie(cli=True, port=14077)
         resp = await auth_client.get(
-            f"/api/v1/auth/handoff?token={token}",
+            f"{URL_AUTH_HANDOFF}?token={token}",
             cookies=_cookie_jar(cookie),
             follow_redirects=False,
         )
@@ -1015,7 +1024,7 @@ async def test_handoff_invitation_flow_no_cookie_mints_pat(
             _lr_claims(jwks_harness, sub="invite-accept", email="invite-accept@example.com")
         )
         resp = await auth_client.get(
-            f"/api/v1/auth/handoff?token={token}",
+            f"{URL_AUTH_HANDOFF}?token={token}",
             follow_redirects=False,
         )
         assert resp.status_code == 200, resp.text
@@ -1054,7 +1063,7 @@ async def test_handoff_invitation_flow_records_audit_via_invitation(
             _lr_claims(jwks_harness, sub="invite-audit", email="invite-audit@example.com")
         )
         resp = await auth_client.get(
-            f"/api/v1/auth/handoff?token={token}",
+            f"{URL_AUTH_HANDOFF}?token={token}",
             follow_redirects=False,
         )
         assert resp.status_code == 200, resp.text
@@ -1084,7 +1093,7 @@ async def test_handoff_invitation_flow_no_token_returns_400(auth_client):
     verify. The missing-token check has to fire even in the cookie-less
     path (it's the only thing standing between an empty GET and a 500)."""
     resp = await auth_client.get(
-        "/api/v1/auth/handoff",
+        URL_AUTH_HANDOFF,
         follow_redirects=False,
     )
     assert resp.status_code == 400
@@ -1105,7 +1114,7 @@ async def test_handoff_invitation_flow_rejects_invalid_jwt(auth_client, jwks_har
         rogue_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         bad_token = jwks_harness.sign(_lr_claims(jwks_harness), key=rogue_key)
         resp = await auth_client.get(
-            f"/api/v1/auth/handoff?token={bad_token}",
+            f"{URL_AUTH_HANDOFF}?token={bad_token}",
             follow_redirects=False,
         )
         assert resp.status_code == 401
@@ -1132,7 +1141,7 @@ async def test_handoff_invitation_flow_does_not_write_cli_login_code(
         )
         before = await postgres_pool.fetchval("SELECT count(*) FROM qiita.cli_login_code")
         resp = await auth_client.get(
-            f"/api/v1/auth/handoff?token={token}",
+            f"{URL_AUTH_HANDOFF}?token={token}",
             follow_redirects=False,
         )
         assert resp.status_code == 200, resp.text
@@ -1160,7 +1169,7 @@ async def test_handoff_rejects_expired_cookie(auth_client, jwks_harness):
         # Cookie timestamp 5 minutes in the past — well outside the 60s window.
         cookie = _make_login_cookie(cli=False, age_ms=5 * 60 * 1000)
         resp = await auth_client.get(
-            f"/api/v1/auth/handoff?token={token}",
+            f"{URL_AUTH_HANDOFF}?token={token}",
             cookies=_cookie_jar(cookie),
             follow_redirects=False,
         )
@@ -1191,7 +1200,7 @@ async def test_handoff_rejects_tampered_cookie(auth_client, jwks_harness):
         body, _sig = valid.split(".")
         tampered = f"{body}.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         resp = await auth_client.get(
-            f"/api/v1/auth/handoff?token={token}",
+            f"{URL_AUTH_HANDOFF}?token={token}",
             cookies=_cookie_jar(tampered),
             follow_redirects=False,
         )
@@ -1205,7 +1214,7 @@ async def test_handoff_rejects_missing_token_param(auth_client):
     so this is an *authenticated* missing-param error."""
     cookie = _make_login_cookie(cli=False)
     resp = await auth_client.get(
-        "/api/v1/auth/handoff",
+        URL_AUTH_HANDOFF,
         cookies=_cookie_jar(cookie),
         follow_redirects=False,
     )
@@ -1225,7 +1234,7 @@ async def test_handoff_rejects_invalid_jwt(auth_client, jwks_harness):
         bad_token = jwks_harness.sign(_lr_claims(jwks_harness), key=rogue_key)
         cookie = _make_login_cookie(cli=False)
         resp = await auth_client.get(
-            f"/api/v1/auth/handoff?token={bad_token}",
+            f"{URL_AUTH_HANDOFF}?token={bad_token}",
             cookies=_cookie_jar(cookie),
             follow_redirects=False,
         )
@@ -1247,7 +1256,7 @@ async def test_cli_exchange_returns_pat_once(auth_client, postgres_pool, jwks_ha
         )
         cookie = _make_login_cookie(cli=True, port=15000)
         handoff_resp = await auth_client.get(
-            f"/api/v1/auth/handoff?token={token}",
+            f"{URL_AUTH_HANDOFF}?token={token}",
             cookies=_cookie_jar(cookie),
             follow_redirects=False,
         )
@@ -1261,7 +1270,7 @@ async def test_cli_exchange_returns_pat_once(auth_client, postgres_pool, jwks_ha
 
         # First exchange: should succeed with a PAT.
         resp = await auth_client.post(
-            "/api/v1/auth/cli-exchange",
+            URL_AUTH_CLI_EXCHANGE,
             json={"ot_code": ot_code},
         )
         assert resp.status_code == 200, resp.text
@@ -1271,7 +1280,7 @@ async def test_cli_exchange_returns_pat_once(auth_client, postgres_pool, jwks_ha
         assert isinstance(body["scopes"], list)
         # Confirm the PAT actually works against /auth/whoami.
         whoami = await auth_client.get(
-            "/api/v1/auth/whoami",
+            URL_AUTH_WHOAMI,
             headers={"Authorization": f"Bearer {body['token']}"},
         )
         assert whoami.status_code == 200
@@ -1279,7 +1288,7 @@ async def test_cli_exchange_returns_pat_once(auth_client, postgres_pool, jwks_ha
 
         # Second exchange: 404 (consumed).
         resp2 = await auth_client.post(
-            "/api/v1/auth/cli-exchange",
+            URL_AUTH_CLI_EXCHANGE,
             json={"ot_code": ot_code},
         )
         assert resp2.status_code == 404
@@ -1299,7 +1308,7 @@ async def test_cli_exchange_unknown_code_returns_404(auth_client):
     'consumed' so an attacker can't distinguish unused-but-wrong from
     correct-but-already-redeemed."""
     resp = await auth_client.post(
-        "/api/v1/auth/cli-exchange",
+        URL_AUTH_CLI_EXCHANGE,
         json={"ot_code": "definitely-not-a-real-code-just-padding-bytes"},
     )
     assert resp.status_code == 404
@@ -1329,7 +1338,7 @@ async def test_post_pat_rolls_back_when_audit_fails(
         _claims(jwks_harness, sub="rollback-pat", email="rollback-pat@example.com")
     )
     resp = await fail_safe_client.post(
-        "/api/v1/auth/pat",
+        URL_AUTH_PAT,
         headers={"Authorization": f"Bearer {jwt}"},
         json={"label": "rollback-attempt"},
     )
@@ -1367,7 +1376,7 @@ async def test_delete_token_rolls_back_when_audit_fails(
     monkeypatch.setattr("qiita_control_plane.routes.auth.record_event", audit_failure)
 
     resp = await fail_safe_client.delete(
-        f"/api/v1/auth/token/{token_idx}",
+        URL_AUTH_TOKEN_BY_IDX.format(token_idx=token_idx),
         headers={"Authorization": f"Bearer {plaintext}"},
     )
 
@@ -1414,7 +1423,7 @@ async def test_handoff_cli_rolls_back_when_audit_fails(
         )
         cookie = _make_login_cookie(cli=True, port=16001)
         resp = await fail_safe_client.get(
-            f"/api/v1/auth/handoff?token={token}",
+            f"{URL_AUTH_HANDOFF}?token={token}",
             cookies=_cookie_jar(cookie),
             follow_redirects=False,
         )
@@ -1493,7 +1502,7 @@ async def test_handoff_cli_rolls_back_when_cli_login_code_insert_fails(
         )
         cookie = _make_login_cookie(cli=True, port=16002)
         resp = await fail_safe_client.get(
-            f"/api/v1/auth/handoff?token={token}",
+            f"{URL_AUTH_HANDOFF}?token={token}",
             cookies=_cookie_jar(cookie),
             follow_redirects=False,
         )

@@ -4,6 +4,14 @@ import json
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from qiita_common.api_paths import (
+    URL_ADMIN_AUDIT,
+    URL_ADMIN_PRINCIPAL_DISABLED,
+    URL_ADMIN_PRINCIPAL_RETIRED,
+    URL_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS,
+    URL_ADMIN_PRINCIPAL_SYSTEM_ROLE,
+    URL_ADMIN_SERVICE_ACCOUNT,
+)
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 
 pytestmark = pytest.mark.db
@@ -142,7 +150,7 @@ async def test_post_service_accounts_admin_only(admin_client, postgres_pool):
         scopes=[Scope.SELF_PROFILE],
     )
     resp = await admin_client.post(
-        "/api/v1/admin/service-account",
+        URL_ADMIN_SERVICE_ACCOUNT,
         headers={"Authorization": f"Bearer {plaintext}"},
         json={"name": "blocked-svc", "scopes": [Scope.FEATURE_MINT]},
     )
@@ -152,7 +160,7 @@ async def test_post_service_accounts_admin_only(admin_client, postgres_pool):
 async def test_post_service_accounts_returns_token_once(admin_client, postgres_pool):
     admin_token, _ = await _admin_token(postgres_pool, admin_client)
     resp = await admin_client.post(
-        "/api/v1/admin/service-account",
+        URL_ADMIN_SERVICE_ACCOUNT,
         headers={"Authorization": f"Bearer {admin_token}"},
         json={
             "name": "ok-svc",
@@ -169,7 +177,7 @@ async def test_post_service_accounts_returns_token_once(admin_client, postgres_p
 async def test_post_service_accounts_requires_explicit_scopes(admin_client, postgres_pool):
     admin_token, _ = await _admin_token(postgres_pool, admin_client)
     resp = await admin_client.post(
-        "/api/v1/admin/service-account",
+        URL_ADMIN_SERVICE_ACCOUNT,
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"name": "no-scopes", "scopes": []},
     )
@@ -181,7 +189,7 @@ async def test_post_service_accounts_rejects_scope_outside_service_ceiling(
 ):
     admin_token, _ = await _admin_token(postgres_pool, admin_client)
     resp = await admin_client.post(
-        "/api/v1/admin/service-account",
+        URL_ADMIN_SERVICE_ACCOUNT,
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"name": "evil-svc", "scopes": [Scope.FEATURE_MINT, Scope.ADMIN_USER]},
     )
@@ -199,14 +207,14 @@ async def test_post_service_accounts_duplicate_name_409(admin_client, postgres_p
     admin_token, _ = await _admin_token(postgres_pool, admin_client)
     payload = {"name": "dup-svc", "scopes": [Scope.FEATURE_MINT]}
     r1 = await admin_client.post(
-        "/api/v1/admin/service-account",
+        URL_ADMIN_SERVICE_ACCOUNT,
         headers={"Authorization": f"Bearer {admin_token}"},
         json=payload,
     )
     assert r1.status_code == 201
     _track(admin_client, r1.json()["principal_idx"])
     r2 = await admin_client.post(
-        "/api/v1/admin/service-account",
+        URL_ADMIN_SERVICE_ACCOUNT,
         headers={"Authorization": f"Bearer {admin_token}"},
         json=payload,
     )
@@ -233,7 +241,7 @@ async def test_patch_principal_disabled_admin_only(admin_client, postgres_pool):
     target = await _seed_human(postgres_pool, email="target@example.com")
     _track(admin_client, target)
     resp = await admin_client.patch(
-        f"/api/v1/admin/principal/{target}/disabled",
+        URL_ADMIN_PRINCIPAL_DISABLED.format(principal_idx=target),
         headers={"Authorization": f"Bearer {plaintext}"},
         json={"disabled": True, "reason": "test"},
     )
@@ -246,7 +254,7 @@ async def test_patch_principal_disabled_then_enabled_round_trip(admin_client, po
     _track(admin_client, target)
 
     r1 = await admin_client.patch(
-        f"/api/v1/admin/principal/{target}/disabled",
+        URL_ADMIN_PRINCIPAL_DISABLED.format(principal_idx=target),
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"disabled": True, "reason": "investigation"},
     )
@@ -259,7 +267,7 @@ async def test_patch_principal_disabled_then_enabled_round_trip(admin_client, po
     assert state["disable_reason"] == "investigation"
 
     r2 = await admin_client.patch(
-        f"/api/v1/admin/principal/{target}/disabled",
+        URL_ADMIN_PRINCIPAL_DISABLED.format(principal_idx=target),
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"disabled": False},
     )
@@ -278,7 +286,7 @@ async def test_patch_principal_disabled_requires_reason(admin_client, postgres_p
     target = await _seed_human(postgres_pool, email="no-reason@example.com")
     _track(admin_client, target)
     resp = await admin_client.patch(
-        f"/api/v1/admin/principal/{target}/disabled",
+        URL_ADMIN_PRINCIPAL_DISABLED.format(principal_idx=target),
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"disabled": True},
     )
@@ -288,7 +296,7 @@ async def test_patch_principal_disabled_requires_reason(admin_client, postgres_p
 async def test_cannot_disable_system_principal(admin_client, postgres_pool):
     admin_token, _ = await _admin_token(postgres_pool, admin_client)
     resp = await admin_client.patch(
-        "/api/v1/admin/principal/1/disabled",
+        URL_ADMIN_PRINCIPAL_DISABLED.format(principal_idx=1),
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"disabled": True, "reason": "evil"},
     )
@@ -314,7 +322,7 @@ async def test_patch_principal_retired_revokes_all_tokens(admin_client, postgres
             scopes=[Scope.SELF_PROFILE],
         )
     resp = await admin_client.patch(
-        f"/api/v1/admin/principal/{target}/retired",
+        URL_ADMIN_PRINCIPAL_RETIRED.format(principal_idx=target),
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"reason": "left lab"},
     )
@@ -331,7 +339,7 @@ async def test_patch_principal_retired_is_terminal(admin_client, postgres_pool):
     target = await _seed_human(postgres_pool, email="term@example.com")
     _track(admin_client, target)
     r1 = await admin_client.patch(
-        f"/api/v1/admin/principal/{target}/retired",
+        URL_ADMIN_PRINCIPAL_RETIRED.format(principal_idx=target),
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"reason": "first"},
     )
@@ -340,7 +348,7 @@ async def test_patch_principal_retired_is_terminal(admin_client, postgres_pool):
     # transition out of retired (CHECK forbids both-true; the route's
     # WHERE clause filters out retired).
     r2 = await admin_client.patch(
-        f"/api/v1/admin/principal/{target}/disabled",
+        URL_ADMIN_PRINCIPAL_DISABLED.format(principal_idx=target),
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"disabled": True, "reason": "should-fail"},
     )
@@ -350,7 +358,7 @@ async def test_patch_principal_retired_is_terminal(admin_client, postgres_pool):
 async def test_admin_cannot_retire_themselves(admin_client, postgres_pool):
     admin_token, admin_idx = await _admin_token(postgres_pool, admin_client)
     resp = await admin_client.patch(
-        f"/api/v1/admin/principal/{admin_idx}/retired",
+        URL_ADMIN_PRINCIPAL_RETIRED.format(principal_idx=admin_idx),
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"reason": "self"},
     )
@@ -367,7 +375,7 @@ async def test_patch_principal_system_role_writes_audit_event(admin_client, post
     target = await _seed_human(postgres_pool, email="role-target@example.com")
     _track(admin_client, target)
     resp = await admin_client.patch(
-        f"/api/v1/admin/principal/{target}/system-role",
+        URL_ADMIN_PRINCIPAL_SYSTEM_ROLE.format(principal_idx=target),
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"system_role": SystemRole.WET_LAB_ADMIN, "reason": "promo"},
     )
@@ -404,7 +412,7 @@ async def test_patch_principal_system_role_admin_only(admin_client, postgres_poo
     target = await _seed_human(postgres_pool, email="rt2@example.com")
     _track(admin_client, target)
     resp = await admin_client.patch(
-        f"/api/v1/admin/principal/{target}/system-role",
+        URL_ADMIN_PRINCIPAL_SYSTEM_ROLE.format(principal_idx=target),
         headers={"Authorization": f"Bearer {plaintext}"},
         json={"system_role": SystemRole.SYSTEM_ADMIN},
     )
@@ -428,7 +436,7 @@ async def test_get_audit_log_admin_only(admin_client, postgres_pool):
         scopes=[Scope.SELF_PROFILE],
     )
     resp = await admin_client.get(
-        "/api/v1/admin/audit",
+        URL_ADMIN_AUDIT,
         headers={"Authorization": f"Bearer {plaintext}"},
     )
     assert resp.status_code == 403
@@ -440,18 +448,18 @@ async def test_get_audit_log_filters(admin_client, postgres_pool):
     _track(admin_client, target)
     # Generate some events: role change, disable, enable.
     await admin_client.patch(
-        f"/api/v1/admin/principal/{target}/system-role",
+        URL_ADMIN_PRINCIPAL_SYSTEM_ROLE.format(principal_idx=target),
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"system_role": SystemRole.WET_LAB_ADMIN},
     )
     await admin_client.patch(
-        f"/api/v1/admin/principal/{target}/disabled",
+        URL_ADMIN_PRINCIPAL_DISABLED.format(principal_idx=target),
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"disabled": True, "reason": "x"},
     )
     # Filtered by event_type.
     resp = await admin_client.get(
-        "/api/v1/admin/audit",
+        URL_ADMIN_AUDIT,
         headers={"Authorization": f"Bearer {admin_token}"},
         params={"event_type": "system_role_change", "principal_idx": target},
     )
@@ -480,7 +488,7 @@ async def test_revoke_all_tokens_admin_only(admin_client, postgres_pool):
     target = await _seed_human(postgres_pool, email="rt-target@example.com")
     _track(admin_client, target)
     resp = await admin_client.post(
-        f"/api/v1/admin/principal/{target}/revoke-all-tokens",
+        URL_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS.format(principal_idx=target),
         headers={"Authorization": f"Bearer {plaintext}"},
     )
     assert resp.status_code == 403
@@ -530,7 +538,7 @@ async def test_revoke_all_tokens_requires_admin_service_accounts_for_service_tar
     )
 
     resp = await admin_client.post(
-        f"/api/v1/admin/principal/{svc_idx}/revoke-all-tokens",
+        URL_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS.format(principal_idx=svc_idx),
         headers={"Authorization": f"Bearer {narrow_token}"},
     )
     assert resp.status_code == 403
@@ -567,7 +575,7 @@ async def test_revoke_all_tokens_requires_admin_users_for_user_target(admin_clie
     _track(admin_client, user_target)
 
     resp = await admin_client.post(
-        f"/api/v1/admin/principal/{user_target}/revoke-all-tokens",
+        URL_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS.format(principal_idx=user_target),
         headers={"Authorization": f"Bearer {narrow_token}"},
     )
     assert resp.status_code == 403
@@ -591,7 +599,7 @@ async def test_revoke_all_tokens_revokes_all_active_and_skips_revoked(admin_clie
     )
 
     resp = await admin_client.post(
-        f"/api/v1/admin/principal/{target}/revoke-all-tokens",
+        URL_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS.format(principal_idx=target),
         headers={"Authorization": f"Bearer {admin_token}"},
     )
     assert resp.status_code == 200
@@ -635,7 +643,7 @@ async def test_patch_principal_disabled_rolls_back_when_audit_fails(
     monkeypatch.setattr("qiita_control_plane.routes.admin.record_event", audit_failure)
 
     resp = await fail_safe_client.patch(
-        f"/api/v1/admin/principal/{target}/disabled",
+        URL_ADMIN_PRINCIPAL_DISABLED.format(principal_idx=target),
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"disabled": True, "reason": "test"},
     )
@@ -661,7 +669,7 @@ async def test_patch_principal_retired_rolls_back_when_audit_fails(
     monkeypatch.setattr("qiita_control_plane.routes.admin.record_event", audit_failure)
 
     resp = await fail_safe_client.patch(
-        f"/api/v1/admin/principal/{target}/retired",
+        URL_ADMIN_PRINCIPAL_RETIRED.format(principal_idx=target),
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"reason": "test rollback"},
     )
@@ -687,7 +695,7 @@ async def test_patch_principal_system_role_rolls_back_when_audit_fails(
     monkeypatch.setattr("qiita_control_plane.routes.admin.record_event", audit_failure)
 
     resp = await fail_safe_client.patch(
-        f"/api/v1/admin/principal/{target}/system-role",
+        URL_ADMIN_PRINCIPAL_SYSTEM_ROLE.format(principal_idx=target),
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"system_role": SystemRole.WET_LAB_ADMIN, "reason": "promo"},
     )
@@ -721,7 +729,7 @@ async def test_revoke_all_tokens_rolls_back_when_audit_fails(
     monkeypatch.setattr("qiita_control_plane.routes.admin.record_event_bulk", audit_failure)
 
     resp = await fail_safe_client.post(
-        f"/api/v1/admin/principal/{target}/revoke-all-tokens",
+        URL_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS.format(principal_idx=target),
         headers={"Authorization": f"Bearer {admin_token}"},
     )
 
@@ -746,7 +754,7 @@ async def test_post_service_account_rolls_back_when_audit_fails(
     # Attempt create with a unique name so the post-state query can isolate
     # any row that would survive a broken rollback.
     resp = await fail_safe_client.post(
-        "/api/v1/admin/service-account",
+        URL_ADMIN_SERVICE_ACCOUNT,
         headers={"Authorization": f"Bearer {admin_token}"},
         json={"name": "rollback-svc", "scopes": [Scope.FEATURE_MINT]},
     )
