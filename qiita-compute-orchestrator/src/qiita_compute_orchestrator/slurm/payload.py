@@ -44,7 +44,7 @@ from typing import Any
 from qiita_common.actions import NATIVE_MODULE_PREFIX, BaselineResources
 
 
-def _number_envelope(value: int) -> dict[str, Any]:
+def number_envelope(value: int) -> dict[str, Any]:
     """slurmrestd's typed-numeric envelope. Used for memory / cpus /
     time fields so missing values can be expressed as set=False rather
     than a sentinel like 0 (which would mean "use default partition
@@ -85,15 +85,25 @@ def _build_script(
     return f"#!/bin/bash\nset -euo pipefail\n{cmd}\n"
 
 
-def _build_native_script(*, module: str) -> str:
+def _build_native_script(*, module: str, python: str) -> str:
     """Shell launcher for a native-step job. Invokes the shared
     Python launcher (`jobs/__main__.py`) with the short job name,
     which reads `$QIITA_INPUT_PATH/params.json` and routes through
     `run_native_job` exactly as `LocalBackend` does in-process —
     same dispatcher, same error classification, same manifest
-    contract."""
+    contract.
+
+    `python` is the Python interpreter the SBATCH script invokes. The
+    caller (build_job_submit_payload) threads it from
+    Settings.slurm.native_python, which the orchestrator resolves from
+    SLURM_NATIVE_PYTHON (default "python"). Sites whose compute nodes
+    don't have a Python with qiita_compute_orchestrator on PATH point
+    this at an absolute interpreter path under a shared-filesystem venv.
+    """
+    if not python:
+        raise ValueError("python must be a non-empty string")
     short = module.removeprefix(NATIVE_MODULE_PREFIX)
-    cmd = f"srun python -m qiita_compute_orchestrator.jobs --job {short}"
+    cmd = f"srun {python} -m qiita_compute_orchestrator.jobs --job {short}"
     return f"#!/bin/bash\nset -euo pipefail\n{cmd}\n"
 
 
@@ -113,6 +123,8 @@ def build_job_submit_payload(
     partition: str,
     account: str,
     extra_env: dict[str, str] | None = None,
+    native_python: str = "python",
+    qos: str = "",
 ) -> dict[str, Any]:
     """Build the slurmrestd `POST /slurm/{version}/job/submit` JSON body.
 
@@ -185,10 +197,18 @@ def build_job_submit_payload(
     # params.json (typed as JobParams in slurm/contract.py) remains the
     # contract source of truth for everything else — step_name,
     # scope_target, inputs, output_path.
+    #
+    # HOME=<workspace> is set because the native-step jobs run DuckDB
+    # with the miint extension, which caches the extension shared
+    # library under $HOME/.duckdb/extensions/. SLURM jobs on this
+    # cluster don't get a useful HOME by default; pointing at the
+    # per-ticket workspace gives each job a writable scratch HOME
+    # that's cleaned up with the workspace.
     env: dict[str, str] = {
         "QIITA_INPUT_PATH": str(input_path),
         "QIITA_OUTPUT_PATH": str(output_path),
         "QIITA_WORK_TICKET_IDX": str(work_ticket_idx),
+        "HOME": str(workspace),
     }
     if extra_env:
         env.update(extra_env)
@@ -197,7 +217,7 @@ def build_job_submit_payload(
         # Native: no bind mounts — the launcher runs in the
         # orchestrator's installed Python env on the compute node,
         # reading/writing host paths directly via QIITA_*_PATH.
-        script = _build_native_script(module=module)
+        script = _build_native_script(module=module, python=native_python)
     else:
         # Container: bind mounts let apptainer see input_path /
         # output_path under the same names from inside the container.
@@ -213,21 +233,27 @@ def build_job_submit_payload(
             apptainer_extra_args=apptainer_args,
         )
 
+    job: dict[str, Any] = {
+        "name": f"qiita-{step_name}-wt{work_ticket_idx}",
+        "account": account,
+        "partition": partition,
+        "current_working_directory": str(workspace),
+        # slurmrestd takes environment as a list of "KEY=VAL" strings.
+        # Sorted for determinism so payload tests are stable.
+        "environment": [f"{k}={v}" for k, v in sorted(env.items())],
+        "memory_per_node": number_envelope(baseline_resources.mem_gb * 1024),
+        "tasks": 1,
+        "cpus_per_task": baseline_resources.cpu,
+        "time_limit": number_envelope(_walltime_minutes(baseline_resources.walltime)),
+        "standard_output": str(log_stdout),
+        "standard_error": str(log_stderr),
+    }
+    # Only emit qos when the operator set one — omitting the field lets
+    # slurmrestd apply the submitting user's default QOS, which is the
+    # right behavior for sites that don't run a multi-QOS cluster.
+    if qos:
+        job["qos"] = qos
     return {
         "script": script,
-        "job": {
-            "name": f"qiita-{step_name}-wt{work_ticket_idx}",
-            "account": account,
-            "partition": partition,
-            "current_working_directory": str(workspace),
-            # slurmrestd takes environment as a list of "KEY=VAL" strings.
-            # Sorted for determinism so payload tests are stable.
-            "environment": [f"{k}={v}" for k, v in sorted(env.items())],
-            "memory_per_node": _number_envelope(baseline_resources.mem_gb * 1024),
-            "tasks": 1,
-            "cpus_per_task": baseline_resources.cpu,
-            "time_limit": _number_envelope(_walltime_minutes(baseline_resources.walltime)),
-            "standard_output": str(log_stdout),
-            "standard_error": str(log_stderr),
-        },
+        "job": job,
     }

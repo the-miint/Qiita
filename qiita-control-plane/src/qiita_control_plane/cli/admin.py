@@ -28,6 +28,21 @@ Subcommands:
                      watch the work_ticket through to terminal. See
                      `cli.reference_load.do_reference_load` for the
                      programmatic entry point integration tests call.
+  ticket force-fail — direct-DB transition of a non-terminal work_ticket
+                     to state=failed with a captured failure_type /
+                     stage / step_name / reason. Replaces the previous
+                     "operator writes UPDATE qiita.work_ticket by hand"
+                     recovery pattern with a single command that
+                     respects the schema's CHECK constraints. Refuses
+                     to operate on already-terminal tickets.
+  compute-readiness — exercise the path qiita-job needs end-to-end and
+                     report per-check status (JWT, CP /healthz,
+                     SLURM_NATIVE_PYTHON on host, plus an optional
+                     SLURM probe-job that verifies the same env from
+                     a compute node). Subprocess-execs into the
+                     orchestrator's venv since the diagnostic uses the
+                     orchestrator's Settings.from_env() and
+                     SlurmrestdClient surfaces.
 
 Authentication for HTTP subcommands: read PAT from QIITA_TOKEN env var or
 from ~/.qiita/token (mode 0600 expected). Loopback login flow, token I/O,
@@ -38,6 +53,7 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -57,6 +73,14 @@ from . import _common
 # DB is expected to be reachable on the operator's network; a multi-second
 # stall here masks misconfiguration.
 _DB_CONNECT_TIMEOUT_SECONDS = 5
+
+# Production install location for the orchestrator's venv. Same path
+# the deploy script writes to and the systemd unit launches from —
+# this constant is a default for the operator-side wrapper, not the
+# source of truth; --orchestrator-venv overrides for dev hosts or
+# unusual layouts. The wrapper subprocess-execs `<venv>/bin/python -m
+# qiita_compute_orchestrator.cli.compute_readiness`.
+_DEFAULT_ORCHESTRATOR_VENV = Path("/opt/qiita/compute-orchestrator/.venv")
 
 # Derived from SystemRole so the role list isn't repeated anywhere in this
 # file — adding `SystemRole.X` widens validation, error message, and `--help`
@@ -136,6 +160,113 @@ async def _sync_actions(database_url: str, workflows_dir: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# ticket force-fail — direct-DB transition of a non-terminal work_ticket
+# ---------------------------------------------------------------------------
+
+# work_ticket_failure_step_name_consistent in db/migrations/20260504000001
+# requires failure_step_name IS NOT NULL iff failure_stage='step_run'.
+# Mirrored here so the CLI fails before the DB does, with a clearer message.
+_FAILURE_STAGES_REQUIRING_STEP_NAME = ("step_run",)
+_FAILURE_STAGES_REJECTING_STEP_NAME = ("submission", "finalize")
+_FAILURE_STAGE_CHOICES = _FAILURE_STAGES_REQUIRING_STEP_NAME + _FAILURE_STAGES_REJECTING_STEP_NAME
+
+# Tickets in these states are eligible for force-fail; anything terminal
+# (failed / completed) is rejected so the CLI doesn't silently overwrite
+# a captured failure or convert a real success into a fake failure.
+_FORCE_FAIL_ELIGIBLE_STATES = ("pending", "queued", "processing")
+
+
+def _validate_force_fail_args(stage: str, step_name: str | None) -> None:
+    """Surface CHECK violations before sending UPDATE so the error
+    message names the constraint directly. Stage / step-name
+    interlock matches work_ticket_failure_step_name_consistent."""
+    if stage in _FAILURE_STAGES_REQUIRING_STEP_NAME and not step_name:
+        raise ValueError(
+            f"--step-name is required when --stage={stage} (mirrors the"
+            " work_ticket_failure_step_name_consistent CHECK constraint)"
+        )
+    if stage in _FAILURE_STAGES_REJECTING_STEP_NAME and step_name:
+        raise ValueError(
+            f"--step-name must not be set when --stage={stage} (mirrors the"
+            " work_ticket_failure_step_name_consistent CHECK constraint)"
+        )
+
+
+async def _force_fail_ticket(
+    database_url: str,
+    *,
+    work_ticket_idx: int,
+    stage: str,
+    step_name: str | None,
+    reason: str,
+) -> dict:
+    """Transition a non-terminal work_ticket to state=failed with the
+    captured failure_* columns set. Refuses to overwrite an already-
+    terminal ticket so a real success or a captured prior failure isn't
+    lost.
+
+    The CHECK constraint shape (work_ticket_failure_consistent +
+    work_ticket_failure_step_name_consistent) is enforced by the DB;
+    we validate stage / step-name compatibility client-side first
+    (_validate_force_fail_args) so the error message is more direct than
+    asyncpg's CheckViolationError surface.
+
+    failure_type is always 'permanent' for the force-fail path: an
+    operator hand-failing a stuck ticket has already concluded retries
+    won't help. Sites that need a retriable force-fail (rare —
+    PROCESSING tickets already get retry semantics from the runner)
+    can extend this later.
+    """
+    _validate_force_fail_args(stage, step_name)
+    try:
+        conn = await asyncpg.connect(database_url, timeout=_DB_CONNECT_TIMEOUT_SECONDS)
+    except Exception as exc:  # noqa: BLE001 — show full reason, including OS errors
+        raise RuntimeError(
+            f"could not connect to DATABASE_URL: {type(exc).__name__}: {exc}"
+        ) from exc
+    try:
+        async with conn.transaction():
+            current_state = await conn.fetchval(
+                "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1 FOR UPDATE",
+                work_ticket_idx,
+            )
+            if current_state is None:
+                raise RuntimeError(f"no work_ticket with idx={work_ticket_idx}")
+            if current_state not in _FORCE_FAIL_ELIGIBLE_STATES:
+                raise RuntimeError(
+                    f"work_ticket idx={work_ticket_idx} is in terminal state"
+                    f" {current_state!r}; refusing to overwrite. Eligible states:"
+                    f" {', '.join(_FORCE_FAIL_ELIGIBLE_STATES)}."
+                )
+            await conn.execute(
+                """
+                UPDATE qiita.work_ticket
+                SET state             = 'failed',
+                    failure_type      = 'permanent',
+                    failure_stage     = $2,
+                    failure_step_name = $3,
+                    failure_reason    = $4
+                WHERE work_ticket_idx  = $1
+                """,
+                work_ticket_idx,
+                stage,
+                step_name,
+                reason,
+            )
+        return {
+            "work_ticket_idx": work_ticket_idx,
+            "previous_state": current_state,
+            "state": "failed",
+            "failure_type": "permanent",
+            "failure_stage": stage,
+            "failure_step_name": step_name,
+            "failure_reason": reason,
+        }
+    finally:
+        await conn.close()
+
+
+# ---------------------------------------------------------------------------
 # HTTP subcommand helpers
 # ---------------------------------------------------------------------------
 
@@ -187,6 +318,37 @@ def _build_parser() -> argparse.ArgumentParser:
     _common.add_token_file_arg(p_login)
     p_login.set_defaults(handler=_handle_login)
 
+    p_ticket = sub.add_parser("ticket", help="Work-ticket operations")
+    p_ticket_sub = p_ticket.add_subparsers(dest="ticket_cmd", required=True)
+    p_force_fail = p_ticket_sub.add_parser(
+        "force-fail",
+        help=(
+            "Direct-DB transition of a non-terminal work_ticket to state=failed."
+            " Replaces the previous 'operator runs UPDATE qiita.work_ticket by"
+            " hand' recovery pattern."
+        ),
+    )
+    p_force_fail.add_argument(
+        "--idx", required=True, type=int, dest="work_ticket_idx", help="work_ticket_idx"
+    )
+    p_force_fail.add_argument("--reason", required=True, help="Operator-supplied failure_reason")
+    p_force_fail.add_argument(
+        "--stage",
+        required=True,
+        choices=list(_FAILURE_STAGE_CHOICES),
+        help=(
+            "failure_stage: submission / step_run / finalize."
+            " --step-name is required when --stage=step_run and rejected otherwise."
+        ),
+    )
+    p_force_fail.add_argument(
+        "--step-name",
+        dest="step_name",
+        default=None,
+        help="failure_step_name (required iff --stage=step_run)",
+    )
+    p_force_fail.set_defaults(handler=_handle_ticket_force_fail)
+
     p_actions = sub.add_parser("actions", help="Action registry operations")
     p_actions_sub = p_actions.add_subparsers(dest="actions_cmd", required=True)
     p_actions_sync = p_actions_sub.add_parser(
@@ -200,6 +362,48 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Directory to scan for action YAMLs (default: ./workflows)",
     )
     p_actions_sync.set_defaults(handler=_handle_actions_sync)
+
+    p_readiness = sub.add_parser(
+        "compute-readiness",
+        help=(
+            "Exercise the path qiita-job needs and report per-check status."
+            " Local checks (JWT, CP /healthz, SLURM_NATIVE_PYTHON on host)"
+            " plus an optional SLURM probe-job."
+        ),
+    )
+    p_readiness.add_argument(
+        "--orchestrator-venv",
+        type=Path,
+        default=_DEFAULT_ORCHESTRATOR_VENV,
+        help=(
+            "Path to the orchestrator's venv; the wrapper invokes"
+            f" `<venv>/bin/python -m qiita_compute_orchestrator.cli.compute_readiness`."
+            f" Default: {_DEFAULT_ORCHESTRATOR_VENV}"
+        ),
+    )
+    p_readiness.add_argument(
+        "--no-slurm-probe",
+        action="store_true",
+        dest="no_slurm_probe",
+        help="Skip the SLURM submit phase; run local checks only.",
+    )
+    p_readiness.add_argument(
+        "--json",
+        action="store_true",
+        dest="emit_json",
+        help="Emit JSON instead of the human-readable report.",
+    )
+    p_readiness.add_argument(
+        "--probe-timeout-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Override the orchestrator-side wait for the SLURM probe-job"
+            " (the probe itself also has a SLURM time_limit). Default: rely"
+            " on the orchestrator-side default."
+        ),
+    )
+    p_readiness.set_defaults(handler=_handle_compute_readiness)
 
     p_reference = sub.add_parser("reference", help="Reference-data lifecycle operations")
     p_reference_sub = p_reference.add_subparsers(dest="reference_cmd", required=True)
@@ -300,6 +504,57 @@ def _handle_actions_sync(args: argparse.Namespace, parser: argparse.ArgumentPars
     try:
         result = asyncio.run(_sync_actions(database_url, args.workflows_dir))
     except (FileNotFoundError, DuplicateActionError, ValidationError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def _handle_compute_readiness(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Subprocess into the orchestrator's venv to run the compute-readiness
+    diagnostic. The orchestrator owns the actual checks (it has the
+    Settings.from_env() + SlurmrestdClient surface); this wrapper is a
+    thin pass-through so operators have a single `qiita-admin` UX
+    surface for cluster-side problems too.
+
+    Returns the subprocess's exit code verbatim so non-zero from any
+    check failure propagates up through `qiita-admin` cleanly.
+    """
+    venv: Path = args.orchestrator_venv
+    python = venv / "bin" / "python"
+    if not python.exists():
+        print(
+            f"error: orchestrator python not found at {python}."
+            " Pass --orchestrator-venv if the venv is installed elsewhere.",
+            file=sys.stderr,
+        )
+        return 2
+    cmd = [str(python), "-m", "qiita_compute_orchestrator.cli.compute_readiness"]
+    if args.no_slurm_probe:
+        cmd.append("--no-slurm-probe")
+    if args.emit_json:
+        cmd.append("--json")
+    if args.probe_timeout_seconds is not None:
+        cmd += ["--probe-timeout-seconds", str(args.probe_timeout_seconds)]
+    return subprocess.call(cmd)
+
+
+def _handle_ticket_force_fail(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        print("error: DATABASE_URL not set", file=sys.stderr)
+        return 2
+    try:
+        result = asyncio.run(
+            _force_fail_ticket(
+                database_url,
+                work_ticket_idx=args.work_ticket_idx,
+                stage=args.stage,
+                step_name=args.step_name,
+                reason=args.reason,
+            )
+        )
+    except (RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(result, indent=2))

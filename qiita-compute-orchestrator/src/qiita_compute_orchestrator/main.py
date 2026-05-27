@@ -35,6 +35,16 @@ def _build_backend(settings: Settings) -> ComputeBackend:
             account=settings.slurm.account,
             poll_interval_seconds=settings.slurm.poll_interval_seconds,
             job_timeout_seconds=settings.slurm.job_timeout_seconds,
+            native_python=settings.slurm.native_python,
+            # Forward the outbound CO→CP token + CP URL so SLURM jobs
+            # can re-resolve Settings.from_env(require_cp_to_co_token=False)
+            # on the compute node without reading deploy-host-local
+            # /etc/qiita/*.token. The inbound CP→CO bearer is *not*
+            # forwarded — the launcher never serves /step/run.
+            # See SlurmBackend.run_step's extra_env wiring.
+            co_to_cp_token=settings.co_to_cp_token,
+            cp_url=settings.cp_url,
+            qos=settings.slurm.qos,
         )
     raise RuntimeError(f"unknown COMPUTE_BACKEND={settings.backend_type!r}")
 

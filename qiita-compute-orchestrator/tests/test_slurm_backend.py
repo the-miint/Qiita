@@ -8,6 +8,7 @@ FailureKind mapping.
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -21,10 +22,24 @@ from qiita_compute_orchestrator.backends.slurm import SlurmBackend
 from qiita_compute_orchestrator.slurm import SlurmrestdClient
 
 
+def _make_jwt(sun: str) -> str:
+    """Minimal JWT-shaped string with the given `sun` claim. See
+    test_slurm_client._make_jwt for the same helper; duplicated here
+    to keep test_slurm_backend.py self-contained without an awkward
+    cross-test-file import."""
+
+    def _b64url(obj: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    return f"{_b64url({'alg': 'HS256'})}.{_b64url({'sun': sun})}.sig"
+
+
 @pytest.fixture
 def jwt_path(tmp_path):
     p = tmp_path / "jwt"
-    p.write_text("test-jwt")
+    # user_name="qiita-orch" in _make_backend; sun must match or
+    # SlurmrestdClient refuses to construct.
+    p.write_text(_make_jwt("qiita-orch"))
     return p
 
 
@@ -33,7 +48,13 @@ def baseline():
     return StepBaselineResources(cpu=1, mem_gb=1, walltime_seconds=60)
 
 
-def _make_backend(handler, jwt_path) -> SlurmBackend:
+def _make_backend(
+    handler,
+    jwt_path,
+    *,
+    co_to_cp_token: str = "",
+    cp_url: str = "",
+) -> SlurmBackend:
     client = SlurmrestdClient(
         base_url="http://slurm-test:6820",
         jwt_path=jwt_path,
@@ -50,6 +71,8 @@ def _make_backend(handler, jwt_path) -> SlurmBackend:
         account="qiita-prod",
         poll_interval_seconds=0,  # 0 so tests don't sleep
         job_timeout_seconds=60,
+        co_to_cp_token=co_to_cp_token,
+        cp_url=cp_url,
     )
 
 
@@ -257,6 +280,95 @@ async def test_run_step_completed_returns_outputs(jwt_path, baseline, tmp_path):
     # The manifest declares outputs={"manifest": "result.parquet"}.
     out_dir = tmp_path / "output"
     assert outputs == {"manifest": (out_dir / "result.parquet").resolve()}
+
+
+@pytest.mark.asyncio
+async def test_run_step_propagates_co_to_cp_token_and_cp_url_into_job_env(
+    jwt_path, baseline, tmp_path
+):
+    """When the backend was wired with co_to_cp_token / cp_url, those
+    values land in the SLURM submit payload's environment list as
+    CO_TO_CP_TOKEN / QIITA_CP_URL, plus QIITA_ALLOW_TOKEN_ENV=true so
+    the compute-node launcher's `Settings.from_env(
+    require_cp_to_co_token=False)` accepts the env-var token shape.
+
+    CP_TO_CO_TOKEN must NOT be propagated — it's inbound /step/run
+    auth which the launcher never serves; the job-side
+    `get_settings()` no-install fallback skips it."""
+    captured: dict[str, dict] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/job/submit"):
+            captured["payload"] = json.loads(request.content.decode())
+            return httpx.Response(200, json={"job_id": 1})
+        return httpx.Response(
+            200,
+            json={"jobs": [{"job_id": 1, "job_state": ["COMPLETED"], "exit_code": {}}]},
+        )
+
+    backend = _make_backend(
+        httpx.MockTransport(handler),
+        jwt_path,
+        co_to_cp_token="co-cp-secret",
+        cp_url="https://qiita.example.org",
+    )
+    _write_completed_output(tmp_path)
+
+    await backend.run_step(
+        "fastq",
+        {},
+        tmp_path,
+        scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+        work_ticket_idx=99,
+        module=FASTQ_TO_PARQUET_MODULE,
+        baseline_resources=baseline,
+    )
+    env = dict(item.split("=", 1) for item in captured["payload"]["job"]["environment"])
+    assert env["CO_TO_CP_TOKEN"] == "co-cp-secret"
+    assert env["QIITA_ALLOW_TOKEN_ENV"] == "true"
+    assert env["QIITA_CP_URL"] == "https://qiita.example.org"
+    # HOME is wired on every job, not just token-propagating ones.
+    assert env["HOME"] == str(tmp_path)
+    # CP_TO_CO_TOKEN is the inbound /step/run shared bearer — the
+    # launcher never serves that route, so propagating it would only
+    # widen the `scontrol show job` exposure with no consumer.
+    assert "CP_TO_CO_TOKEN" not in env
+
+
+@pytest.mark.asyncio
+async def test_run_step_omits_token_env_when_backend_has_no_tokens(jwt_path, baseline, tmp_path):
+    """When SlurmBackend was constructed without tokens/cp_url (the
+    default — unit tests, dev), the submit payload must NOT carry
+    CO_TO_CP_TOKEN / QIITA_ALLOW_TOKEN_ENV / QIITA_CP_URL. Defensive
+    against an accidental empty-string token leaking through."""
+    captured: dict[str, dict] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/job/submit"):
+            captured["payload"] = json.loads(request.content.decode())
+            return httpx.Response(200, json={"job_id": 1})
+        return httpx.Response(
+            200,
+            json={"jobs": [{"job_id": 1, "job_state": ["COMPLETED"], "exit_code": {}}]},
+        )
+
+    backend = _make_backend(httpx.MockTransport(handler), jwt_path)
+    _write_completed_output(tmp_path)
+
+    await backend.run_step(
+        "fastq",
+        {},
+        tmp_path,
+        scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+        work_ticket_idx=99,
+        module=FASTQ_TO_PARQUET_MODULE,
+        baseline_resources=baseline,
+    )
+    env = dict(item.split("=", 1) for item in captured["payload"]["job"]["environment"])
+    assert "CP_TO_CO_TOKEN" not in env
+    assert "CO_TO_CP_TOKEN" not in env
+    assert "QIITA_ALLOW_TOKEN_ENV" not in env
+    assert "QIITA_CP_URL" not in env
 
 
 @pytest.mark.asyncio

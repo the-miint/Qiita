@@ -83,12 +83,36 @@ class SlurmBackend(ComputeBackend):
         account: str,
         poll_interval_seconds: int,
         job_timeout_seconds: int,
+        native_python: str = "python",
+        co_to_cp_token: str = "",
+        cp_url: str = "",
+        qos: str = "",
     ) -> None:
         self._client = client
         self._partition = partition
         self._account = account
         self._poll_interval = poll_interval_seconds
         self._job_timeout = job_timeout_seconds
+        self._native_python = native_python
+        # CO→CP token + CP URL are propagated into the SLURM job env so
+        # the native-step launcher running on a compute node can resolve
+        # Settings.from_env() without reading /etc/qiita/*.token (which
+        # is deploy-host-local). They're empty in unit tests that don't
+        # care about the propagation; production wires real values in
+        # main._build_backend(). The token lands in `scontrol show job`
+        # — visible to cluster admins.
+        #
+        # The CP→CO *inbound* shared bearer is NOT propagated: the
+        # launcher never serves /step/run, so `get_settings()` on the
+        # compute node falls back to Settings.from_env(
+        # require_cp_to_co_token=False) and skips it. That keeps the
+        # SLURM-env exposure surface to just the outbound PAT.
+        self._co_to_cp_token = co_to_cp_token
+        self._cp_url = cp_url
+        # Optional SLURM QOS to set on submit; empty string means "let
+        # SLURM apply the submitting user's default QOS" (the orchestrator
+        # doesn't override).
+        self._qos = qos
 
     async def aclose(self) -> None:
         """Close the underlying httpx client so asyncio doesn't warn
@@ -180,6 +204,24 @@ class SlurmBackend(ComputeBackend):
             gpu=baseline_resources.gpu,
         )
 
+        # Compose the SLURM job's extra env. The native-step launcher
+        # on the compute node calls `get_settings()`, which falls back
+        # to `Settings.from_env(require_cp_to_co_token=False)` — so it
+        # needs only the *outbound* CO→CP token + QIITA_CP_URL, never
+        # the inbound CP→CO shared bearer. Files under /etc/qiita/ are
+        # deploy-host-local and not visible from compute nodes; we
+        # propagate the resolved value via env and flip
+        # QIITA_ALLOW_TOKEN_ENV so the launcher accepts it. Empty values
+        # mean "don't propagate" (unit tests that don't exercise the
+        # launcher path leave them empty); production wires real values
+        # in main._build_backend().
+        extra_env: dict[str, str] = {}
+        if self._co_to_cp_token:
+            extra_env["CO_TO_CP_TOKEN"] = self._co_to_cp_token
+            extra_env["QIITA_ALLOW_TOKEN_ENV"] = "true"
+        if self._cp_url:
+            extra_env["QIITA_CP_URL"] = self._cp_url
+
         payload = build_job_submit_payload(
             step_name=name,
             work_ticket_idx=work_ticket_idx,
@@ -194,6 +236,9 @@ class SlurmBackend(ComputeBackend):
             log_stderr=logs_path / "stderr",
             partition=self._partition,
             account=self._account,
+            native_python=self._native_python,
+            extra_env=extra_env or None,
+            qos=self._qos,
         )
 
         try:

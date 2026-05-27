@@ -75,6 +75,19 @@ class SlurmSettings:
     api_version: str  # default v0.0.40
     poll_interval_seconds: int
     job_timeout_seconds: int
+    # Python executable the native-step SBATCH script invokes via
+    # `srun <native_python> -m qiita_compute_orchestrator.jobs ...`.
+    # Default "python" assumes compute nodes already have a Python on
+    # PATH with qiita_compute_orchestrator installed. Sites where the
+    # cluster does NOT carry the orchestrator's venv set this to an
+    # absolute path on the shared filesystem (the orchestrator host's
+    # venv interpreter, visible from compute nodes).
+    native_python: str
+    # Optional SLURM QOS to set on submit. Empty string means "omit
+    # qos from the submit body" — the cluster falls back to the
+    # SLURMRESTD_USER_NAME's default QOS. Set explicitly so the
+    # orchestrator doesn't depend on user-default state.
+    qos: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,7 +109,22 @@ class Settings:
     slurm: SlurmSettings | None = None
 
     @classmethod
-    def from_env(cls) -> Settings:
+    def from_env(cls, *, require_cp_to_co_token: bool = True) -> Settings:
+        """Resolve a Settings from environment.
+
+        `require_cp_to_co_token` is True for the orchestrator FastAPI
+        service (the lifespan handler) — `cp_to_co_token` is the shared
+        bearer it must present-compare on inbound `POST /step/run`, so
+        a missing token is a boot-time fatal.
+
+        It's False on the SLURM-launcher / CLI path (set by the
+        no-install fallback in `get_settings()` below). Those processes
+        never serve inbound traffic; they only ever *make* outbound
+        CO→CP calls, which use `co_to_cp_token`. Skipping
+        `cp_to_co_token` resolution lets us drop `CP_TO_CO_TOKEN` from
+        the SLURM job env entirely, which narrows the `scontrol show
+        job` exposure to just the outbound PAT.
+        """
         backend_type = os.environ.get("COMPUTE_BACKEND", BACKEND_LOCAL)
         slurm = _resolve_slurm_settings() if backend_type == BACKEND_SLURM else None
         return cls(
@@ -105,7 +133,7 @@ class Settings:
                 "SHARED_FILESYSTEM_ROOT",
                 os.environ.get("TMPDIR", "/tmp") + "/qiita",
             ),
-            cp_to_co_token=_resolve_token("cp_to_co"),
+            cp_to_co_token=_resolve_token("cp_to_co") if require_cp_to_co_token else "",
             cp_url=_resolve_cp_url(),
             co_to_cp_token=_resolve_token("co_to_cp"),
             slurm=slurm,
@@ -136,6 +164,8 @@ def _resolve_slurm_settings() -> SlurmSettings:
         job_timeout_seconds=int(
             os.environ.get("SLURM_JOB_TIMEOUT_SECONDS", str(DEFAULT_SLURM_JOB_TIMEOUT_SECONDS))
         ),
+        native_python=os.environ.get("SLURM_NATIVE_PYTHON", "python"),
+        qos=os.environ.get("SLURM_QOS", ""),
     )
 
 
@@ -234,9 +264,14 @@ def get_settings() -> Settings:
 
     Launcher / CLI path: install_settings was never called, get_settings
     calls Settings.from_env() lazily. Jobs that never invoke this don't
-    pay the token-resolution cost.
+    pay the token-resolution cost. We pass
+    `require_cp_to_co_token=False` because that token is *inbound*
+    auth on `POST /step/run` — the launcher / CLI never serves that
+    route, so demanding it would force the orchestrator to propagate
+    the token through SLURM env just to satisfy a path no job
+    exercises.
     """
     s = _settings_ctx.get()
     if s is not None:
         return s
-    return Settings.from_env()
+    return Settings.from_env(require_cp_to_co_token=False)

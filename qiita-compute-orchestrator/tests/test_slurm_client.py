@@ -8,6 +8,7 @@ the client returns.
 
 from __future__ import annotations
 
+import base64
 import json
 
 import httpx
@@ -21,10 +22,24 @@ from qiita_compute_orchestrator.slurm import (
 )
 
 
+def _make_jwt(sun: str) -> str:
+    """Build a minimal JWT-shaped string (header.payload.signature) with
+    the given `sun` claim. The signature segment is a placeholder —
+    we never verify it; slurmrestd does. The client's only crypto-free
+    check is that `sun` matches the configured user."""
+
+    def _b64url(obj: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    header = _b64url({"alg": "HS256", "typ": "JWT"})
+    payload = _b64url({"sun": sun})
+    return f"{header}.{payload}.placeholder-signature"
+
+
 @pytest.fixture
 def jwt_path(tmp_path):
     p = tmp_path / "jwt"
-    p.write_text("test-jwt-value\n")
+    p.write_text(_make_jwt("qiita-orch") + "\n")
     return p
 
 
@@ -53,7 +68,48 @@ def _client(transport: httpx.MockTransport, jwt_path) -> SlurmrestdClient:
 def test_constructor_loads_jwt_from_file(jwt_path):
     client = _client(httpx.MockTransport(lambda req: httpx.Response(200, json={})), jwt_path)
     # JWT cached on the instance; no header sent yet but ready to send.
-    assert client._jwt == "test-jwt-value"  # type: ignore[attr-defined]
+    expected = _make_jwt("qiita-orch")
+    assert client._jwt == expected  # type: ignore[attr-defined]
+
+
+def test_constructor_rejects_jwt_with_wrong_sun(tmp_path):
+    """A SLURM JWT whose sun=<X> doesn't match SLURMRESTD_USER_NAME=<Y>
+    is refused at construction. Surfaced by the first smoke: a stale
+    JWT minted under a different user was happily used by the
+    orchestrator, and slurmrestd silently authenticated jobs as the
+    wrong identity."""
+    p = tmp_path / "jwt"
+    p.write_text(_make_jwt("antoniog") + "\n")  # not qiita-orch
+    with pytest.raises(RuntimeError, match="sun='antoniog' does not match"):
+        SlurmrestdClient(
+            base_url="http://x",
+            jwt_path=p,
+            user_name="qiita-orch",
+        )
+
+
+def test_constructor_rejects_jwt_not_three_segments(tmp_path):
+    p = tmp_path / "jwt"
+    p.write_text("not-a-jwt")
+    with pytest.raises(RuntimeError, match="3-segment JWT"):
+        SlurmrestdClient(
+            base_url="http://x",
+            jwt_path=p,
+            user_name="qiita-orch",
+        )
+
+
+def test_constructor_rejects_jwt_payload_missing_sun(tmp_path):
+    p = tmp_path / "jwt"
+    # Valid JWT shape with a payload that has no `sun` claim.
+    bad_payload = base64.urlsafe_b64encode(json.dumps({"iss": "x"}).encode()).rstrip(b"=").decode()
+    p.write_text(f"header.{bad_payload}.sig")
+    with pytest.raises(RuntimeError, match="missing a string `sun`"):
+        SlurmrestdClient(
+            base_url="http://x",
+            jwt_path=p,
+            user_name="qiita-orch",
+        )
 
 
 def test_constructor_rejects_empty_base_url(jwt_path):
@@ -117,7 +173,7 @@ async def test_submit_job_happy_path(jwt_path):
     assert captured["method"] == "POST"
     assert captured["url"].endswith(f"/slurm/{DEFAULT_SLURMRESTD_API_VERSION}/job/submit")
     assert captured["headers"]["x-slurm-user-name"] == "qiita-orch"
-    assert captured["headers"]["x-slurm-user-token"] == "test-jwt-value"
+    assert captured["headers"]["x-slurm-user-token"] == _make_jwt("qiita-orch")
     assert captured["headers"]["content-type"] == "application/json"
     assert captured["body"] == {"script": "...", "job": {}}
 
@@ -295,16 +351,21 @@ async def test_401_triggers_jwt_reload_and_one_retry(jwt_path):
             return httpx.Response(401, json={"errors": ["expired token"]})
         return httpx.Response(200, json={"job_id": 7})
 
+    original = _make_jwt("qiita-orch")
+    rotated = _make_jwt("qiita-orch") + "-rotated"
+    # _make_jwt(sun) is deterministic; suffix the rotated token so it's
+    # distinct in the byte-equality assertion below. Still has a valid
+    # 3-segment shape (`.` only in the original header.payload.sig).
     async with _client(httpx.MockTransport(handler), jwt_path) as client:
         # Simulate SLURM rotating the token between attempts: rewrite
         # the file before the retry happens. The client re-reads on 401.
-        jwt_path.write_text("rotated-jwt-value\n")
+        jwt_path.write_text(rotated + "\n")
         job_id = await client.submit_job({})
 
     assert job_id == 7
     assert call_count["n"] == 2
     # First attempt sent the original token; retry sent the rotated one.
-    assert headers_seen == ["test-jwt-value", "rotated-jwt-value"]
+    assert headers_seen == [original, rotated]
 
 
 @pytest.mark.asyncio

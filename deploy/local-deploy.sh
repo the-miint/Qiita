@@ -39,6 +39,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"   # populates RSYNC_EXCLUDES
 rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/qiita-common/"              "$INCOMING/qiita-common/"
 rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/qiita-control-plane/"       "$INCOMING/qiita-control-plane/"
 rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/qiita-compute-orchestrator/" "$INCOMING/qiita-compute-orchestrator/"
+rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/workflows/"                 "$INCOMING/workflows/"
 rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/deploy/"                    "$INCOMING/deploy/"
 install -m 0755 -o root -g root "$DP_BINARY" "$INCOMING/qiita-data-plane"
 

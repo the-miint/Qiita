@@ -100,6 +100,29 @@ follow the DELETE-prep_sample path instead.
    registers the file into DuckLake without "sequence_idx range
    mismatch" errors.
 
+## Force-failing a stuck ticket
+
+If a `pending`, `queued`, or `processing` ticket needs to be
+terminally failed (operator triage, blocked-by-unrelated-bug, etc.),
+use the `qiita-admin ticket force-fail` subcommand instead of writing
+the UPDATE statement by hand. It mirrors the
+`work_ticket_failure_step_name_consistent` CHECK constraint
+client-side and refuses to overwrite an already-terminal ticket:
+
+```bash
+# [admin] — DATABASE_URL sourced from /etc/qiita/control-plane.env
+qiita-admin ticket force-fail \
+    --idx 42 \
+    --stage step_run \
+    --step-name fastq \
+    --reason "manual triage: stuck mid-step"
+```
+
+`--step-name` is required when `--stage=step_run` and rejected when
+`--stage` is `submission` or `finalize`. The previous "UPDATE
+qiita.work_ticket SET state='failed' ..." pattern is no longer the
+supported recovery path.
+
 ## Why not just DELETE the prep_sample and start over?
 
 That path works but destroys the prep_sample row. If anything else

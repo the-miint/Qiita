@@ -91,7 +91,7 @@ System groups (composition matters):
 | Group | Members | Purpose |
 |---|---|---|
 | `qiita-services` | `qiita-api`, `qiita-orch` | Read shared service secrets (`/etc/qiita/cp-to-co.token`). |
-| `qiita-pipeline` | `qiita-api`, `qiita-data`, `qiita-job` | Two adjacent jobs: (a) staging handoff — SLURM jobs write Parquet under the staging dir, DP reads via group membership; (b) orchestrator workspace — qiita-api (CP runner) writes per-ticket subdirs via group, alongside `qiita-orch` (owner) and `qiita-job` (output writer). Sites sometimes provision under a different name (e.g. `qiita-fs`) — what matters is the *membership*. |
+| `qiita-pipeline` | `qiita-api`, `qiita-data`, `qiita-job`, `qiita-orch` | Two adjacent jobs: (a) staging handoff — SLURM jobs write Parquet under the staging dir, DP reads via group membership; (b) orchestrator workspace — qiita-api (CP runner) writes per-ticket subdirs via group, `qiita-orch` (owner) writes per-step subdirs and *also* uses pipeline group-write to descend into CP-created parents, `qiita-job` writes outputs via the same group. Sites sometimes provision under a different name (e.g. `qiita-fs`) — what matters is the *membership*. |
 | `qiita-data` | `qiita-data` (single member) | Locks the durable Parquet dir to the DP only. Required as a separate group so the data dir at mode `0750` does **not** also grant read to `qiita-job` (which would defeat the staging/parquet split). |
 
 `qiita-api` belongs to **both** `qiita-services` and `qiita-pipeline`.
@@ -99,27 +99,33 @@ The pipeline membership is what lets the CP runner mkdir per-ticket
 workspaces under the orchestrator workspace dir (see §0.3) — without
 it, the first work-ticket dispatch fails at `workspace.mkdir(...)`
 because the dir is owned `qiita-orch:qiita-pipeline 2770`. `qiita-orch`
-is deliberately *not* in `qiita-pipeline` here; ownership is what gives
-it write access, which keeps the orchestrator's group reach bounded.
+also belongs to `qiita-pipeline` so it can descend into the per-ticket
+subdirs the CP runner creates (resolved as the bundled fix for the
+nested workspace dir perms issue described next).
 
-> **Known gap — nested workspace dir perms.** The pipeline-membership
-> fix gets the CP runner *into* the workspace root, but the per-ticket
-> subdirs it creates inherit systemd's default UMask (0022), so they
-> land mode `0755`: `qiita-orch` is "other" → 0o5 → traverse but no
-> write. The orchestrator's SlurmBackend then tries to mkdir
-> `input/output/logs` under the attempt dir and hits PermissionError.
-> The marker-file SLURM verification did not exercise this path; the
-> first real fastq-to-parquet dispatch will. Three plausible
-> mitigations, none shipped today: (a) set `UMask=0007` on the
-> `qiita-control-plane` systemd unit, so the CP runner's mkdir mode
-> becomes `2770` and `qiita-orch` (via group `qiita-pipeline`) gains
-> write; (b) explicit `chmod(0o2770)` after each `mkdir` in
-> `qiita-control-plane/src/qiita_control_plane/runner.py`; or (c) add
-> `qiita-orch` to `qiita-pipeline` (revises the "ownership not
-> membership" stance above and widens the orchestrator's group
-> reach). Pick one before the first end-to-end workflow runs; (a) is
-> the smallest change and the one most aligned with the existing
-> setgid-propagation pattern.
+> **Nested workspace dir perms — both layers shipped in this PR.** The
+> per-ticket subdirs the CP runner creates inherit `qiita-pipeline` via
+> setgid, but their *mode* depends on systemd's UMask. Default UMask
+> 0022 lands them at `0755`, where `qiita-orch` is "other" → traverse
+> but no write — the orchestrator's SlurmBackend then hits
+> PermissionError on `input/output/logs/` mkdir under each attempt
+> dir. The fix combines two halves:
+>
+> 1. `UMask=0007` systemd dropins on **both** `qiita-control-plane`
+>    and `qiita-compute-orchestrator` (see
+>    `deploy/systemd/*.service.d/umask.conf`). The CP's UMask makes
+>    every per-ticket dir land at `2770`; the orchestrator's UMask
+>    propagates the same posture to the nested `input/output/logs/`
+>    dirs and to per-step attempt dirs.
+> 2. `qiita-orch` is a member of `qiita-pipeline`. Mode `2770` only
+>    helps if `qiita-orch` is *in* the group; without it, "group" still
+>    excludes the orchestrator and the mode argument is moot. With
+>    membership, `qiita-orch` writes via group both into CP-created
+>    parents (which it doesn't own) and through to its own descendant
+>    dirs (which inherit `qiita-pipeline` via setgid).
+>
+> Both halves ship in `deploy/activate.sh` and the runbook usermod
+> below; no operator-side toggle.
 
 Verification:
 ```bash
@@ -130,7 +136,10 @@ getent passwd qiita qiita-api qiita-orch qiita-data qiita-job
 getent group qiita-services qiita-pipeline qiita-data
 
 # [either] service users have the right primary / secondary groups
-# (qiita-api must show BOTH qiita-services AND qiita-pipeline in `groups=`)
+# (qiita-api must show BOTH qiita-services AND qiita-pipeline in `groups=`;
+#  qiita-orch must show BOTH qiita-services AND qiita-pipeline; if any
+#  service user is missing qiita-pipeline run `sudo usermod -aG
+#  qiita-pipeline <user>` and `systemctl restart` the service.)
 id qiita-api qiita-orch qiita-data qiita-job
 
 # [either] operator is NOT in any service group
@@ -988,6 +997,46 @@ nginx routing + PAT verification + Postgres reachability all work.
 - `502` — CP not reachable through nginx; back to step 5.
 - `500` — DB connectivity issue; `journalctl -u qiita-control-plane`.
 
+### 10d. Compute-readiness probe
+
+Before driving step 11's end-to-end smoke, verify the path qiita-job
+needs from a compute node. `qiita-admin compute-readiness` runs local
+checks (SLURM JWT shape + `sun` + `exp`, `SLURM_NATIVE_PYTHON` on the
+host, `QIITA_CP_URL/healthz` reachable with the CO→CP token) and, by
+default, submits a minimal SLURM probe-job that runs the same checks
+on a compute node — including whether the orchestrator's venv is
+visible there and whether the compute node can reach the CP.
+
+Run as `qiita-orch` with `/etc/qiita/compute-orchestrator.env` sourced
+— the diagnostic needs `SLURMRESTD_URL` / `SLURMRESTD_JWT_PATH` /
+`CO_TO_CP_TOKEN_PATH` / etc., which the file installs `0440
+root:qiita-orch` (step 9b); the operator's UID can't read it directly:
+
+```bash
+# [admin]
+sudo -u qiita-orch bash -lc '
+    set -a
+    # shellcheck disable=SC1091
+    source /etc/qiita/compute-orchestrator.env
+    set +a
+    qiita-admin compute-readiness
+'
+```
+
+Expected: zero `✗ fail` rows; the summary line reads
+`N pass, 0 fail, M skip`. `skip` rows are non-fatal — they mean a
+specific check didn't apply (e.g. `SLURM_NATIVE_PYTHON=python`
+skips the host-side native-python check because the path resolution
+depends on the compute node's PATH; missing `QIITA_CP_URL` skips the
+CP reachability check). Any `✗ fail` row names the misconfig: JWT
+mismatch / expired, CP unreachable, native-python missing on the
+compute node, shared FS not visible, etc. Re-run step 9b / 9c with the
+diagnosis applied before continuing.
+
+Pass `--no-slurm-probe` to skip the SLURM submission (host-only
+checks). Useful when the cluster is known-unreachable and you want to
+triage host-side state first.
+
 ## 11. End-to-end smoke
 
 The smoke uses the `fastq-to-parquet` workflow against a tiny single-
@@ -1014,12 +1063,12 @@ End-to-end execution runs through the end-user `qiita` CLI
 
 The walkthrough drives the smoke from a fresh user PAT through to a
 `COMPLETED` ticket and a `reads.parquet` artifact, with verification
-commands at each layer. Prerequisites that remain operator-side after
-step 10 — `qiita-admin actions sync --workflows-dir
-/opt/qiita/control-plane/workflows` and compute service-account
-provisioning per
-[`compute-service-account-provisioning.md`](compute-service-account-provisioning.md) —
-are linked from the walkthrough.
+commands at each layer. Compute service-account provisioning per
+[`compute-service-account-provisioning.md`](compute-service-account-provisioning.md)
+is the one prerequisite that remains operator-side after step 10 —
+`qiita-admin actions sync` is now run automatically by
+`deploy/activate.sh` against `/opt/qiita/workflows/` (synced from
+`workflows/` in the repo) every redeploy.
 
 ## Subsequent deploys
 

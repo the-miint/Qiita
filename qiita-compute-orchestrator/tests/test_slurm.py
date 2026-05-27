@@ -96,6 +96,15 @@ def test_payload_environment_includes_qiita_paths(common_kwargs):
     assert env["QIITA_WORK_TICKET_IDX"] == str(common_kwargs["work_ticket_idx"])
 
 
+def test_payload_environment_sets_home_to_workspace(common_kwargs):
+    """HOME must point at the per-job workspace so DuckDB+miint's
+    extension cache lands inside the cleaned-up workspace tree
+    instead of failing on a no-HOME compute node."""
+    payload = build_job_submit_payload(**common_kwargs)
+    env = dict(item.split("=", 1) for item in payload["job"]["environment"])
+    assert env["HOME"] == str(common_kwargs["workspace"])
+
+
 def test_payload_environment_extra_env_merged(common_kwargs):
     common_kwargs["extra_env"] = {"FOO": "bar", "BAZ": "qux"}
     payload = build_job_submit_payload(**common_kwargs)
@@ -209,12 +218,35 @@ def native_kwargs(baseline, tmp_path):
 def test_native_payload_script_invokes_python_m_launcher(native_kwargs):
     """Native step's SBATCH script must call the shared launcher with
     the short job name (NATIVE_MODULE_PREFIX stripped) and must NOT
-    contain `apptainer exec` (no container to bind into)."""
+    contain `apptainer exec` (no container to bind into).
+
+    Default `native_python` is "python" (bare interpreter on PATH) —
+    sites whose compute nodes lack the orchestrator on PATH override
+    via SLURM_NATIVE_PYTHON; see
+    test_native_payload_script_uses_native_python_override below."""
     payload = build_job_submit_payload(**native_kwargs)
     script = payload["script"]
     assert "srun python -m qiita_compute_orchestrator.jobs --job fastq_to_parquet" in script
     assert "apptainer exec" not in script
     assert script.startswith("#!/bin/bash\nset -euo pipefail\n")
+
+
+def test_native_payload_script_uses_native_python_override(native_kwargs):
+    """When the orchestrator threads a non-default native_python through
+    (sites whose compute nodes don't have a python on PATH with
+    qiita_compute_orchestrator installed), the SBATCH script must call
+    `srun <native_python> -m ...` — not bare `srun python`."""
+    native_kwargs["native_python"] = (
+        "/home/qiita/qiita-miint/qiita-compute-orchestrator/.venv/bin/python"
+    )
+    payload = build_job_submit_payload(**native_kwargs)
+    script = payload["script"]
+    assert (
+        "srun /home/qiita/qiita-miint/qiita-compute-orchestrator/.venv/bin/python"
+        " -m qiita_compute_orchestrator.jobs --job fastq_to_parquet"
+    ) in script
+    # And the default interpreter token isn't present.
+    assert "srun python -m" not in script
 
 
 def test_native_payload_has_no_bind_mounts(native_kwargs):
@@ -287,6 +319,21 @@ def test_payload_log_paths_round_trip(common_kwargs):
     assert payload["job"]["standard_output"] == str(common_kwargs["log_stdout"])
     assert payload["job"]["standard_error"] == str(common_kwargs["log_stderr"])
     assert payload["job"]["current_working_directory"] == str(common_kwargs["workspace"])
+
+
+def test_payload_qos_omitted_by_default(common_kwargs):
+    """Default qos="" (unset) must omit the qos field entirely so
+    slurmrestd applies the submitting user's default QOS."""
+    payload = build_job_submit_payload(**common_kwargs)
+    assert "qos" not in payload["job"]
+
+
+def test_payload_qos_set_when_non_empty(common_kwargs):
+    """An explicit qos value lands in the submit body so the
+    orchestrator pins the QOS instead of depending on user defaults."""
+    common_kwargs["qos"] = "qiita_norm"
+    payload = build_job_submit_payload(**common_kwargs)
+    assert payload["job"]["qos"] == "qiita_norm"
 
 
 # ============================================================================
