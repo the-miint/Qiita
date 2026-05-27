@@ -18,6 +18,11 @@ from decimal import Decimal
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from qiita_common.api_paths import (
+    URL_BIOSAMPLE_BY_IDX,
+    URL_BIOSAMPLE_BY_STUDY,
+    URL_BIOSAMPLE_LIST_BY_STUDY,
+)
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import FieldDataType
 
@@ -188,7 +193,7 @@ async def _post_biosample(client, ctx, study_idx: int, **body):
     the globally-linked field rows and per-key metadata rows the route
     auto-creates; this helper only tracks the owner-id surface.
     """
-    resp = await client.post(f"/api/v1/study/{study_idx}/biosample", json=body)
+    resp = await client.post(URL_BIOSAMPLE_BY_STUDY.format(study_idx=study_idx), json=body)
     if resp.status_code == 201:
         rj = resp.json()
         ctx["created"]["biosample"].append(rj["biosample_idx"])
@@ -474,7 +479,7 @@ async def test_post_biosample_anonymous_401(ctx):
     app.state.pool = ctx["pool"]
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
         resp = await anon.post(
-            f"/api/v1/study/{study_idx}/biosample",
+            URL_BIOSAMPLE_BY_STUDY.format(study_idx=study_idx),
             json={
                 "owner_idx": ctx["wet_session"]["principal_idx"],
                 "owner_biosample_id_field_name": _unique_field_name(),
@@ -495,7 +500,7 @@ async def test_post_biosample_user_without_biosample_write_scope_403(
     ctx["created"]["study"].append(study_idx)
 
     resp = await no_biosample_write_client.post(
-        f"/api/v1/study/{study_idx}/biosample",
+        URL_BIOSAMPLE_BY_STUDY.format(study_idx=study_idx),
         json={
             "owner_idx": ctx["user_session"]["principal_idx"],
             "owner_biosample_id_field_name": _unique_field_name(),
@@ -559,7 +564,7 @@ async def test_post_biosample_nonexistent_study_404(ctx):
     # fetch_study_exists returns False → 404.
     max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
     resp = await ctx["wet"].post(
-        f"/api/v1/study/{max_idx + 100_000}/biosample",
+        URL_BIOSAMPLE_BY_STUDY.format(study_idx=max_idx + 100_000),
         json={
             "owner_idx": ctx["wet_session"]["principal_idx"],
             "owner_biosample_id_field_name": _unique_field_name(),
@@ -579,7 +584,7 @@ async def test_post_biosample_empty_body_422(ctx):
     )
     ctx["created"]["study"].append(study_idx)
 
-    resp = await ctx["wet"].post(f"/api/v1/study/{study_idx}/biosample", json={})
+    resp = await ctx["wet"].post(URL_BIOSAMPLE_BY_STUDY.format(study_idx=study_idx), json={})
     assert resp.status_code == 422
     # The Pydantic missing-fields list must include owner_idx now that it
     # is required at the model level.
@@ -597,7 +602,7 @@ async def test_post_biosample_empty_owner_biosample_id_field_name_422(ctx):
     ctx["created"]["study"].append(study_idx)
 
     resp = await ctx["wet"].post(
-        f"/api/v1/study/{study_idx}/biosample",
+        URL_BIOSAMPLE_BY_STUDY.format(study_idx=study_idx),
         json={
             "owner_idx": ctx["wet_session"]["principal_idx"],
             "owner_biosample_id_field_name": "",
@@ -1071,7 +1076,7 @@ async def test_list_biosample_idxs_anonymous_401(ctx):
     )
     ctx["created"]["study"].append(study_idx)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
-        resp = await anon.get(f"/api/v1/study/{study_idx}/biosample/list-idxs")
+        resp = await anon.get(URL_BIOSAMPLE_LIST_BY_STUDY.format(study_idx=study_idx))
     assert resp.status_code == 401
 
 
@@ -1082,7 +1087,7 @@ async def test_list_biosample_idxs_missing_scope_403(ctx, no_study_read_client):
         ctx["pool"], owner_idx=ctx["user_session"]["principal_idx"], suffix="no-scope"
     )
     ctx["created"]["study"].append(study_idx)
-    resp = await no_study_read_client.get(f"/api/v1/study/{study_idx}/biosample/list-idxs")
+    resp = await no_study_read_client.get(URL_BIOSAMPLE_LIST_BY_STUDY.format(study_idx=study_idx))
     assert resp.status_code == 403
     assert "study:read" in resp.json()["detail"]
 
@@ -1091,7 +1096,7 @@ async def test_list_biosample_idxs_nonexistent_study_regular_user_404(ctx):
     # require_study_exists fires before require_study_access for a regular
     # user, so a study_idx past the highest existing study returns 404.
     max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
-    resp = await ctx["user"].get(f"/api/v1/study/{max_idx + 100_000}/biosample/list-idxs")
+    resp = await ctx["user"].get(URL_BIOSAMPLE_LIST_BY_STUDY.format(study_idx=max_idx + 100_000))
     assert resp.status_code == 404
 
 
@@ -1101,7 +1106,7 @@ async def test_list_biosample_idxs_nonexistent_study_admin_404(ctx):
     # so admin-bypass callers do not silently get an empty list for a
     # non-existent study.
     max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
-    resp = await ctx["admin"].get(f"/api/v1/study/{max_idx + 100_000}/biosample/list-idxs")
+    resp = await ctx["admin"].get(URL_BIOSAMPLE_LIST_BY_STUDY.format(study_idx=max_idx + 100_000))
     assert resp.status_code == 404
 
 
@@ -1112,7 +1117,7 @@ async def test_list_biosample_idxs_no_access_403(ctx):
         ctx["pool"], owner_idx=ctx["admin_session"]["principal_idx"], suffix="no-access"
     )
     ctx["created"]["study"].append(study_idx)
-    resp = await ctx["user"].get(f"/api/v1/study/{study_idx}/biosample/list-idxs")
+    resp = await ctx["user"].get(URL_BIOSAMPLE_LIST_BY_STUDY.format(study_idx=study_idx))
     assert resp.status_code == 403
 
 
@@ -1132,7 +1137,7 @@ async def test_list_biosample_idxs_owner_returns_payload(ctx):
         for _ in range(2)
     ]
 
-    resp = await ctx["user"].get(f"/api/v1/study/{study_idx}/biosample/list-idxs")
+    resp = await ctx["user"].get(URL_BIOSAMPLE_LIST_BY_STUDY.format(study_idx=study_idx))
     assert resp.status_code == 200, resp.text
     expected = {
         "idxs": list(reversed(bs_idxs)),
@@ -1159,7 +1164,7 @@ async def test_list_biosample_idxs_viewer_access_returns_payload(ctx):
         granted_by_idx=ctx["admin_session"]["principal_idx"],
     )
 
-    resp = await ctx["user"].get(f"/api/v1/study/{study_idx}/biosample/list-idxs")
+    resp = await ctx["user"].get(URL_BIOSAMPLE_LIST_BY_STUDY.format(study_idx=study_idx))
     assert resp.status_code == 200, resp.text
     expected = {
         "idxs": [],
@@ -1184,7 +1189,7 @@ async def test_list_biosample_idxs_wet_lab_admin_bypasses_access(ctx):
         owner_idx=ctx["admin_session"]["principal_idx"],
     )
 
-    resp = await ctx["wet"].get(f"/api/v1/study/{study_idx}/biosample/list-idxs")
+    resp = await ctx["wet"].get(URL_BIOSAMPLE_LIST_BY_STUDY.format(study_idx=study_idx))
     assert resp.status_code == 200, resp.text
     expected = {
         "idxs": [bs_idx],
@@ -1203,7 +1208,7 @@ async def test_list_biosample_idxs_system_admin_bypasses_access(ctx):
     )
     ctx["created"]["study"].append(study_idx)
 
-    resp = await ctx["admin"].get(f"/api/v1/study/{study_idx}/biosample/list-idxs")
+    resp = await ctx["admin"].get(URL_BIOSAMPLE_LIST_BY_STUDY.format(study_idx=study_idx))
     assert resp.status_code == 200, resp.text
     expected = {
         "idxs": [],
@@ -1238,7 +1243,7 @@ async def test_list_biosample_idxs_excludes_retired_link_and_retired_biosample(c
         retired_by_idx=owner_idx,
     )
 
-    resp = await ctx["user"].get(f"/api/v1/study/{study_idx}/biosample/list-idxs")
+    resp = await ctx["user"].get(URL_BIOSAMPLE_LIST_BY_STUDY.format(study_idx=study_idx))
     assert resp.status_code == 200, resp.text
     expected = {
         "idxs": [active_idx],
@@ -1284,7 +1289,7 @@ async def test_get_biosample_owner_returns_response(ctx):
     bs_idx = await seed_biosample(ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx)
     ctx["created"]["biosample"].append(bs_idx)
 
-    resp = await ctx["user"].get(f"/api/v1/biosample/{bs_idx}")
+    resp = await ctx["user"].get(URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx))
     assert resp.status_code == 200, resp.text
     _assert_etag_quoted(resp)
 
@@ -1332,7 +1337,7 @@ async def test_get_biosample_via_study_access_returns_response(ctx):
         granted_by_idx=ctx["wet_session"]["principal_idx"],
     )
 
-    resp = await ctx["user"].get(f"/api/v1/biosample/{bs_idx}")
+    resp = await ctx["user"].get(URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx))
     assert resp.status_code == 200, resp.text
     _assert_etag_quoted(resp)
 
@@ -1370,7 +1375,7 @@ async def test_get_biosample_wet_lab_admin_bypasses_access(ctx):
     bs_idx = await seed_biosample(ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx)
     ctx["created"]["biosample"].append(bs_idx)
 
-    resp = await ctx["wet"].get(f"/api/v1/biosample/{bs_idx}")
+    resp = await ctx["wet"].get(URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx))
     assert resp.status_code == 200, resp.text
     _assert_etag_quoted(resp)
 
@@ -1405,7 +1410,7 @@ async def test_get_biosample_system_admin_bypasses_access(ctx):
     bs_idx = await seed_biosample(ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx)
     ctx["created"]["biosample"].append(bs_idx)
 
-    resp = await ctx["admin"].get(f"/api/v1/biosample/{bs_idx}")
+    resp = await ctx["admin"].get(URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx))
     assert resp.status_code == 200, resp.text
     _assert_etag_quoted(resp)
 
@@ -1478,7 +1483,7 @@ async def test_get_biosample_carries_missing_reason_marker(ctx):
     bs_idx = resp.json()["biosample_idx"]
     await _track_global_metadata_outputs(ctx, bs_idx, study_idx, [global_idx])
 
-    resp = await ctx["wet"].get(f"/api/v1/biosample/{bs_idx}")
+    resp = await ctx["wet"].get(URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx))
     assert resp.status_code == 200, resp.text
     _assert_etag_quoted(resp)
 
@@ -1554,7 +1559,7 @@ async def test_get_biosample_carries_terminology_term(ctx):
     bs_idx = resp.json()["biosample_idx"]
     await _track_global_metadata_outputs(ctx, bs_idx, study_idx, [global_idx])
 
-    resp = await ctx["wet"].get(f"/api/v1/biosample/{bs_idx}")
+    resp = await ctx["wet"].get(URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx))
     assert resp.status_code == 200, resp.text
     _assert_etag_quoted(resp)
 
@@ -1603,7 +1608,7 @@ async def test_get_biosample_anonymous_401(ctx):
 
     app.state.pool = ctx["pool"]
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
-        resp = await anon.get(f"/api/v1/biosample/{bs_idx}")
+        resp = await anon.get(URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx))
     assert resp.status_code == 401
 
 
@@ -1614,7 +1619,7 @@ async def test_get_biosample_missing_scope_403(ctx, no_biosample_read_client):
     bs_idx = await seed_biosample(ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx)
     ctx["created"]["biosample"].append(bs_idx)
 
-    resp = await no_biosample_read_client.get(f"/api/v1/biosample/{bs_idx}")
+    resp = await no_biosample_read_client.get(URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx))
     assert resp.status_code == 403
     assert "biosample:read" in resp.json()["detail"]
 
@@ -1629,7 +1634,7 @@ async def test_get_biosample_no_access_403(ctx):
     bs_idx = await seed_biosample(ctx["pool"], owner_idx=owner_idx, created_by_idx=owner_idx)
     ctx["created"]["biosample"].append(bs_idx)
 
-    resp = await ctx["user"].get(f"/api/v1/biosample/{bs_idx}")
+    resp = await ctx["user"].get(URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx))
     assert resp.status_code == 403
     assert "no read path" in resp.json()["detail"]
 
@@ -1638,7 +1643,7 @@ async def test_get_biosample_nonexistent_404(ctx):
     # An idx well past MAX → fetch_biosample returns None → 404 before the
     # access predicate runs.
     max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.biosample")
-    resp = await ctx["wet"].get(f"/api/v1/biosample/{max_idx + 100_000}")
+    resp = await ctx["wet"].get(URL_BIOSAMPLE_BY_IDX.format(biosample_idx=max_idx + 100_000))
     assert resp.status_code == 404
     assert "not found" in resp.json()["detail"]
 
@@ -1653,7 +1658,7 @@ async def test_get_biosample_retired_404_even_for_wet_lab_admin(ctx):
     ctx["created"]["biosample"].append(bs_idx)
     await retire_biosample(ctx["pool"], biosample_idx=bs_idx, retired_by_idx=owner_idx)
 
-    resp = await ctx["wet"].get(f"/api/v1/biosample/{bs_idx}")
+    resp = await ctx["wet"].get(URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx))
     assert resp.status_code == 404
     assert "not found" in resp.json()["detail"]
 
@@ -1702,7 +1707,7 @@ async def test_get_biosample_returns_only_global_metadata(ctx):
     bs_idx = post_resp.json()["biosample_idx"]
     await _track_global_metadata_outputs(ctx, bs_idx, study_idx, [global_idx])
 
-    resp = await ctx["wet"].get(f"/api/v1/biosample/{bs_idx}")
+    resp = await ctx["wet"].get(URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx))
     assert resp.status_code == 200, resp.text
     rj = resp.json()
     expected_metadata = {
@@ -1761,7 +1766,7 @@ async def test_patch_biosample_wet_lab_admin_happy_path(ctx):
     new_acc = _unique_accession("PATCH-OK")
 
     resp = await ctx["wet"].patch(
-        f"/api/v1/biosample/{bs_idx}",
+        URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx),
         json={"biosample_accession": new_acc},
         headers={"If-Match": if_match},
     )
@@ -1811,7 +1816,7 @@ async def test_patch_biosample_explicit_null_clears_field(ctx):
     if_match = await _etag_for(ctx["pool"], bs_idx)
 
     resp = await ctx["wet"].patch(
-        f"/api/v1/biosample/{bs_idx}",
+        URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx),
         json={"metadata_checklist_idx": None},
         headers={"If-Match": if_match},
     )
@@ -1827,7 +1832,7 @@ async def test_patch_biosample_etag_advances(ctx):
     if_match = await _etag_for(ctx["pool"], bs_idx)
 
     resp = await ctx["wet"].patch(
-        f"/api/v1/biosample/{bs_idx}",
+        URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx),
         json={"submission_error": "transient"},
         headers={"If-Match": if_match},
     )
@@ -1887,7 +1892,7 @@ async def test_patch_biosample_service_account_403_pending_restructure(ctx):
         headers={"Authorization": f"Bearer {plaintext}"},
     ) as svc:
         resp = await svc.patch(
-            f"/api/v1/biosample/{bs_idx}",
+            URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx),
             json={"submission_error": "subsystem-recorded"},
             headers={"If-Match": if_match},
         )
@@ -1905,7 +1910,7 @@ async def test_patch_biosample_anonymous_401(ctx):
     app.state.pool = ctx["pool"]
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
         resp = await anon.patch(
-            f"/api/v1/biosample/{bs_idx}",
+            URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx),
             json={"submission_error": "x"},
             headers={"If-Match": if_match},
         )
@@ -1919,7 +1924,7 @@ async def test_patch_biosample_regular_user_403(ctx):
     if_match = await _etag_for(ctx["pool"], bs_idx)
 
     resp = await ctx["user"].patch(
-        f"/api/v1/biosample/{bs_idx}",
+        URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx),
         json={"submission_error": "x"},
         headers={"If-Match": if_match},
     )
@@ -1935,7 +1940,7 @@ async def test_patch_biosample_missing_scope_403(ctx, no_biosample_write_patch_c
     if_match = await _etag_for(ctx["pool"], bs_idx)
 
     resp = await no_biosample_write_patch_client.patch(
-        f"/api/v1/biosample/{bs_idx}",
+        URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx),
         json={"submission_error": "x"},
         headers={"If-Match": if_match},
     )
@@ -1947,7 +1952,7 @@ async def test_patch_biosample_missing_if_match_428(ctx):
     bs_idx = await _seed_biosample_for_patch(ctx)
 
     resp = await ctx["wet"].patch(
-        f"/api/v1/biosample/{bs_idx}",
+        URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx),
         json={"submission_error": "x"},
     )
     assert resp.status_code == 428
@@ -1959,7 +1964,7 @@ async def test_patch_biosample_mismatched_if_match_412(ctx):
     bs_idx = await _seed_biosample_for_patch(ctx)
 
     resp = await ctx["wet"].patch(
-        f"/api/v1/biosample/{bs_idx}",
+        URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx),
         json={"submission_error": "x"},
         headers={"If-Match": '"2000-01-01T00:00:00+00:00"'},
     )
@@ -1971,7 +1976,7 @@ async def test_patch_biosample_nonexistent_404(ctx):
     # because existence trips first.
     max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.biosample")
     resp = await ctx["wet"].patch(
-        f"/api/v1/biosample/{max_idx + 100_000}",
+        URL_BIOSAMPLE_BY_IDX.format(biosample_idx=max_idx + 100_000),
         json={"submission_error": "x"},
         headers={"If-Match": '"2000-01-01T00:00:00+00:00"'},
     )
@@ -1990,7 +1995,7 @@ async def test_patch_biosample_retired_409(ctx):
     if_match = await _etag_for(ctx["pool"], bs_idx)
 
     resp = await ctx["wet"].patch(
-        f"/api/v1/biosample/{bs_idx}",
+        URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx),
         json={"submission_error": "x"},
         headers={"If-Match": if_match},
     )
@@ -2005,7 +2010,7 @@ async def test_patch_biosample_empty_body_422(ctx):
     if_match = await _etag_for(ctx["pool"], bs_idx)
 
     resp = await ctx["wet"].patch(
-        f"/api/v1/biosample/{bs_idx}",
+        URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx),
         json={},
         headers={"If-Match": if_match},
     )
@@ -2019,7 +2024,7 @@ async def test_patch_biosample_immutable_field_422(ctx):
     if_match = await _etag_for(ctx["pool"], bs_idx)
 
     resp = await ctx["wet"].patch(
-        f"/api/v1/biosample/{bs_idx}",
+        URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx),
         json={"retired": True},
         headers={"If-Match": if_match},
     )
@@ -2041,7 +2046,7 @@ async def test_patch_biosample_owner_ineligibility_422(ctx, kind: IneligibilityK
     )
 
     resp = await ctx["wet"].patch(
-        f"/api/v1/biosample/{bs_idx}",
+        URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx),
         json={"owner_idx": bad_owner},
         headers={"If-Match": if_match},
     )
@@ -2088,7 +2093,7 @@ async def test_patch_biosample_owner_self_incomplete_profile_422(ctx):
         headers={"Authorization": f"Bearer {plaintext}"},
     ) as caller:
         resp = await caller.patch(
-            f"/api/v1/biosample/{bs_idx}",
+            URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx),
             json={"owner_idx": caller_idx},
             headers={"If-Match": if_match},
         )
@@ -2112,7 +2117,7 @@ async def test_patch_biosample_duplicate_accession_409(ctx):
     if_match = await _etag_for(ctx["pool"], bs_b)
 
     resp = await ctx["wet"].patch(
-        f"/api/v1/biosample/{bs_b}",
+        URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_b),
         json={"biosample_accession": a_acc},
         headers={"If-Match": if_match},
     )
@@ -2130,7 +2135,7 @@ async def test_patch_biosample_bad_metadata_checklist_idx_422(ctx):
     ) + 100_000
 
     resp = await ctx["wet"].patch(
-        f"/api/v1/biosample/{bs_idx}",
+        URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx),
         json={"metadata_checklist_idx": bad_checklist},
         headers={"If-Match": if_match},
     )

@@ -13,6 +13,7 @@
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
+from qiita_common.api_paths import PATH_USER_ME, PATH_USER_PREFIX, PATH_USER_ROOT
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import UserCreate, UserResponse, UserUpdate
 
@@ -25,7 +26,7 @@ from ..auth.guards import (
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
 
-router = APIRouter(prefix="/user", tags=["user"])
+router = APIRouter(prefix=PATH_USER_PREFIX, tags=["user"])
 
 
 _USER_RETURNING_COLS = (
@@ -36,7 +37,7 @@ _USER_RETURNING_COLS = (
 _MSG_NO_USER_PROFILE = "Authenticated principal has no user profile"
 
 
-@router.post("", status_code=201)
+@router.post(PATH_USER_ROOT, status_code=201)
 async def create_user(
     body: UserCreate,
     tx: TxConnFactory = Depends(get_tx_conn_factory),
@@ -79,7 +80,7 @@ async def create_user(
     )
 
 
-@router.get("/me")
+@router.get(PATH_USER_ME)
 async def get_me(
     pool: asyncpg.Pool = Depends(get_db_pool),
     user: HumanUser = Depends(require_human),
@@ -103,7 +104,7 @@ async def get_me(
     return UserResponse.model_validate(dict(row))
 
 
-@router.patch("/me")
+@router.patch(PATH_USER_ME)
 async def patch_me(
     body: UserUpdate,
     pool: asyncpg.Pool = Depends(get_db_pool),

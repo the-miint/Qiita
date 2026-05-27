@@ -13,6 +13,7 @@ from typing import Annotated
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import Field
+from qiita_common.api_paths import PATH_STUDY_BY_IDX, PATH_STUDY_PREFIX, PATH_STUDY_ROOT
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import StudyCreate, StudyResponse
 
@@ -28,7 +29,7 @@ from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
 from ..repositories.study import create_study, fetch_study
 from ._helpers import GENERIC_FK_VIOLATION
 
-router = APIRouter(prefix="/study", tags=["study"])
+router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["study"])
 
 
 _MSG_ON_BEHALF_REQUIRES_WET_LAB_ADMIN = (
@@ -72,7 +73,7 @@ def _study_response_from_row(row: asyncpg.Record) -> StudyResponse:
     )
 
 
-@router.post("", status_code=201)
+@router.post(PATH_STUDY_ROOT, status_code=201)
 async def create_study_route(
     body: StudyCreate,
     tx: TxConnFactory = Depends(get_tx_conn_factory),
@@ -143,7 +144,7 @@ async def create_study_route(
     return _study_response_from_row(row)
 
 
-@router.get("/{study_idx}")
+@router.get(PATH_STUDY_BY_IDX)
 async def get_study(
     study_idx: Annotated[int, Field(gt=0)],
     pool: asyncpg.Pool = Depends(get_db_pool),

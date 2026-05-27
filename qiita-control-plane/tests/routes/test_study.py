@@ -12,6 +12,7 @@ import secrets
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from qiita_common.api_paths import URL_STUDY_BY_IDX, URL_STUDY_PREFIX
 from qiita_common.auth_constants import Scope
 
 from qiita_control_plane.testing.db_seeds import (
@@ -103,7 +104,7 @@ async def no_study_write_client(make_pat_client):
 
 async def _post_study(client, ctx, **body):
     """POST the create-study route and, on 201, track created rows for cleanup."""
-    resp = await client.post("/api/v1/study", json=body)
+    resp = await client.post(URL_STUDY_PREFIX, json=body)
     if resp.status_code == 201:
         rj = resp.json()
         ctx["created"]["study"].append(rj["study_idx"])
@@ -297,7 +298,7 @@ async def test_post_study_anonymous_401(ctx):
 
     app.state.pool = ctx["pool"]
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
-        resp = await anon.post("/api/v1/study", json={"title": _unique_title("anon")})
+        resp = await anon.post(URL_STUDY_PREFIX, json={"title": _unique_title("anon")})
     assert resp.status_code == 401
 
 
@@ -305,7 +306,7 @@ async def test_post_study_user_without_study_write_scope_403(ctx, no_study_write
     """A regular_user PAT that omits Scope.STUDY_WRITE is rejected by
     require_scope before the route body runs."""
     resp = await no_study_write_client.post(
-        "/api/v1/study", json={"title": _unique_title("no-scope")}
+        URL_STUDY_PREFIX, json={"title": _unique_title("no-scope")}
     )
     assert resp.status_code == 403
     assert "study:write" in resp.json()["detail"]
@@ -353,13 +354,13 @@ async def test_post_study_owner_ineligibility_422(ctx, kind: IneligibilityKind):
 
 async def test_post_study_empty_body_422(ctx):
     """Pydantic rejects {} because title is required."""
-    resp = await ctx["user"].post("/api/v1/study", json={})
+    resp = await ctx["user"].post(URL_STUDY_PREFIX, json={})
     assert resp.status_code == 422
 
 
 async def test_post_study_empty_title_422(ctx):
     """Pydantic min_length=1 rejects an empty title."""
-    resp = await ctx["user"].post("/api/v1/study", json={"title": ""})
+    resp = await ctx["user"].post(URL_STUDY_PREFIX, json={"title": ""})
     assert resp.status_code == 422
 
 
@@ -443,7 +444,7 @@ async def test_get_study_returns_same_shape_as_post(ctx):
 
     # Owner has ADMIN auto-grant which beats the viewer default_tier;
     # the same client therefore passes the read-access policy.
-    get_resp = await ctx["user"].get(f"/api/v1/study/{posted['study_idx']}")
+    get_resp = await ctx["user"].get(URL_STUDY_BY_IDX.format(study_idx=posted["study_idx"]))
     assert get_resp.status_code == 200, get_resp.text
     assert get_resp.json() == posted
 
@@ -455,7 +456,7 @@ async def test_get_study_anonymous_401(ctx):
 
     app.state.pool = ctx["pool"]
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
-        resp = await anon.get("/api/v1/study/1")
+        resp = await anon.get(URL_STUDY_BY_IDX.format(study_idx=1))
     assert resp.status_code == 401
 
 
@@ -470,7 +471,7 @@ async def test_get_study_user_without_study_read_scope_403(ctx, no_study_read_cl
     assert create_resp.status_code == 201, create_resp.text
     study_idx = create_resp.json()["study_idx"]
 
-    resp = await no_study_read_client.get(f"/api/v1/study/{study_idx}")
+    resp = await no_study_read_client.get(URL_STUDY_BY_IDX.format(study_idx=study_idx))
     assert resp.status_code == 403
     assert "study:read" in resp.json()["detail"]
 
@@ -481,7 +482,7 @@ async def test_get_study_nonexistent_404(ctx):
     without a DB lookup, so this 404 is sourced from the
     require_study_exists guard composed alongside it."""
     max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
-    resp = await ctx["wet"].get(f"/api/v1/study/{max_idx + 100_000}")
+    resp = await ctx["wet"].get(URL_STUDY_BY_IDX.format(study_idx=max_idx + 100_000))
     assert resp.status_code == 404
 
 
@@ -507,6 +508,6 @@ async def test_get_study_below_default_tier_403(ctx):
     assert create_resp.status_code == 201, create_resp.text
     study_idx = create_resp.json()["study_idx"]
 
-    resp = await ctx["user"].get(f"/api/v1/study/{study_idx}")
+    resp = await ctx["user"].get(URL_STUDY_BY_IDX.format(study_idx=study_idx))
     assert resp.status_code == 403
     assert "'member'" in resp.json()["detail"]

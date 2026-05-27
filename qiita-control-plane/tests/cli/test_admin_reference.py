@@ -21,6 +21,13 @@ import json
 import duckdb
 import httpx
 import pytest
+from qiita_common.api_paths import (
+    URL_REFERENCE_PREFIX,
+    URL_UPLOAD_DONE,
+    URL_UPLOAD_PREFIX,
+    URL_WORK_TICKET_BY_IDX,
+    URL_WORK_TICKET_PREFIX,
+)
 
 # =============================================================================
 # Fakes
@@ -108,7 +115,7 @@ def cp_transport(upload_state):
         body = json.loads(request.content) if request.content else None
         calls.append((request.method, request.url.path, body))
         path = request.url.path
-        if path == "/api/v1/reference" and request.method == "POST":
+        if path == URL_REFERENCE_PREFIX and request.method == "POST":
             return httpx.Response(
                 201,
                 json={
@@ -121,7 +128,7 @@ def cp_transport(upload_state):
                     "created_at": "2026-05-20T00:00:00Z",
                 },
             )
-        if path == "/api/v1/upload" and request.method == "POST":
+        if path == URL_UPLOAD_PREFIX and request.method == "POST":
             upload_idx = upload_state["next_idx"]
             upload_state["next_idx"] += 1
             upload_state["slots"][upload_idx] = "pending"
@@ -135,7 +142,7 @@ def cp_transport(upload_state):
                     "doput_ticket": base64.b64encode(ticket_bytes).decode(),
                 },
             )
-        if path.startswith("/api/v1/upload/") and path.endswith("/done"):
+        if path.startswith(f"{URL_UPLOAD_PREFIX}/") and path.endswith("/done"):
             upload_idx = int(path.split("/")[-2])
             upload_state["slots"][upload_idx] = "ready"
             return httpx.Response(
@@ -151,11 +158,11 @@ def cp_transport(upload_state):
                     "completed_at": "2026-05-20T00:00:01Z",
                 },
             )
-        if path == "/api/v1/work-ticket" and request.method == "POST":
+        if path == URL_WORK_TICKET_PREFIX and request.method == "POST":
             idx = 4242
             work_tickets[idx] = {"work_ticket_idx": idx, "state": "completed"}
             return httpx.Response(202, json={"work_ticket_idx": idx, "state": "pending"})
-        if path.startswith("/api/v1/work-ticket/") and request.method == "GET":
+        if path.startswith(f"{URL_WORK_TICKET_PREFIX}/") and request.method == "GET":
             idx = int(path.split("/")[-1])
             return httpx.Response(200, json=work_tickets.get(idx, {"state": "completed"}))
         return httpx.Response(404, text=f"unhandled mock path: {request.method} {path}")
@@ -225,17 +232,20 @@ async def test_do_reference_load_happy_path(
     # Call order: reference → fasta upload → fasta done → taxonomy upload →
     # taxonomy done → work-ticket submit → at least one work-ticket GET.
     method_paths = [(m, p) for (m, p, _b) in calls]
-    assert method_paths[0] == ("POST", "/api/v1/reference")
-    assert method_paths[1] == ("POST", "/api/v1/upload")
-    assert method_paths[2] == ("POST", "/api/v1/upload/100/done")
-    assert method_paths[3] == ("POST", "/api/v1/upload")
-    assert method_paths[4] == ("POST", "/api/v1/upload/101/done")
-    assert method_paths[5] == ("POST", "/api/v1/work-ticket")
-    assert any(m == "GET" and p == "/api/v1/work-ticket/4242" for m, p in method_paths)
+    assert method_paths[0] == ("POST", URL_REFERENCE_PREFIX)
+    assert method_paths[1] == ("POST", URL_UPLOAD_PREFIX)
+    assert method_paths[2] == ("POST", URL_UPLOAD_DONE.format(upload_idx=100))
+    assert method_paths[3] == ("POST", URL_UPLOAD_PREFIX)
+    assert method_paths[4] == ("POST", URL_UPLOAD_DONE.format(upload_idx=101))
+    assert method_paths[5] == ("POST", URL_WORK_TICKET_PREFIX)
+    assert any(
+        m == "GET" and p == URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=4242)
+        for m, p in method_paths
+    )
 
     # Work-ticket submission body carries the upload handles, NOT
     # filesystem paths.
-    submit_call = next(c for c in calls if c[1] == "/api/v1/work-ticket" and c[0] == "POST")
+    submit_call = next(c for c in calls if c[1] == URL_WORK_TICKET_PREFIX and c[0] == "POST")
     assert submit_call[2]["action_context"] == {"fasta_upload_idx": 100, "taxonomy_upload_idx": 101}
     assert submit_call[2]["scope_target"] == {"kind": "reference", "reference_idx": 999}
 
@@ -267,7 +277,7 @@ async def test_do_reference_load_skips_creation_when_reference_idx_set(
         )
 
     assert result["reference_idx"] == 42
-    assert not any(p == "/api/v1/reference" for (_m, p, _b) in calls), (
+    assert not any(p == URL_REFERENCE_PREFIX for (_m, p, _b) in calls), (
         "POST /reference should not fire when --reference-idx is supplied"
     )
 
@@ -333,10 +343,10 @@ async def test_do_reference_load_fail_loud_on_doput_error(fasta_file, tmp_path, 
     # work-ticket was submitted. The upload row stays at status='pending'
     # — the operator can clean up manually or wait for a sweep.
     method_paths = [(m, p) for (m, p, _b) in calls]
-    assert ("POST", "/api/v1/reference") in method_paths
-    assert ("POST", "/api/v1/upload") in method_paths
+    assert ("POST", URL_REFERENCE_PREFIX) in method_paths
+    assert ("POST", URL_UPLOAD_PREFIX) in method_paths
     assert not any("/done" in p for (_m, p) in method_paths)
-    assert not any(p == "/api/v1/work-ticket" for (_m, p) in method_paths)
+    assert not any(p == URL_WORK_TICKET_PREFIX for (_m, p) in method_paths)
 
 
 async def test_do_reference_load_rejects_ambiguous_reference_selection(fasta_file, tmp_path):

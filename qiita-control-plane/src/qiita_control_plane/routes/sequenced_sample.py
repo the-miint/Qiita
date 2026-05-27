@@ -39,6 +39,15 @@ from typing import Annotated
 import asyncpg
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import Field
+from qiita_common.api_paths import (
+    PATH_SEQUENCED_SAMPLE_BY_IDX,
+    PATH_SEQUENCED_SAMPLE_FROM_RUN,
+    PATH_SEQUENCED_SAMPLE_LIST_BY_RUN,
+    PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY,
+    PATH_SEQUENCED_SAMPLE_PREFIX,
+    PATH_SEQUENCING_RUN_PREFIX,
+    PATH_STUDY_PREFIX,
+)
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
     GlobalMetadataEntry,
@@ -90,9 +99,9 @@ from ._helpers import (
     raise_for_transient_write_race,
 )
 
-router = APIRouter(prefix="/sequencing-run", tags=["sequenced-sample"])
-study_scoped_router = APIRouter(prefix="/study", tags=["sequenced-sample"])
-sequenced_sample_router = APIRouter(prefix="/sequenced-sample", tags=["sequenced-sample"])
+router = APIRouter(prefix=PATH_SEQUENCING_RUN_PREFIX, tags=["sequenced-sample"])
+study_scoped_router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["sequenced-sample"])
+sequenced_sample_router = APIRouter(prefix=PATH_SEQUENCED_SAMPLE_PREFIX, tags=["sequenced-sample"])
 
 
 _MSG_OWNER_NOT_ELIGIBLE = "owner is not eligible to own prep samples"
@@ -134,7 +143,7 @@ _GENERIC_SEQ_UNIQUE_VIOLATION = "conflicts with an existing prep_sample / sequen
 
 
 @router.post(
-    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/sequenced-sample",
+    PATH_SEQUENCED_SAMPLE_FROM_RUN,
     status_code=201,
 )
 async def import_sequenced_sample_from_run(
@@ -273,7 +282,7 @@ async def import_sequenced_sample_from_run(
 _SEQUENCED_SAMPLE_IDXS_HARD_CAP = 500_000
 
 
-@router.get("/{sequencing_run_idx}/sequenced-sample/list-idxs")
+@router.get(PATH_SEQUENCED_SAMPLE_LIST_BY_RUN)
 async def list_sequenced_sample_idxs_in_run(
     sequencing_run_idx: Annotated[int, Field(gt=0)],
     pool: asyncpg.Pool = Depends(get_db_pool),
@@ -310,7 +319,7 @@ async def list_sequenced_sample_idxs_in_run(
     )
 
 
-@study_scoped_router.get("/{study_idx}/sequenced-sample/list-idxs")
+@study_scoped_router.get(PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY)
 async def list_sequenced_sample_idxs_in_study(
     study_idx: Annotated[int, Field(gt=0)],
     pool: asyncpg.Pool = Depends(get_db_pool),
@@ -394,7 +403,7 @@ def _sequenced_sample_response_from_row(
     )
 
 
-@sequenced_sample_router.get("/{sequenced_sample_idx}")
+@sequenced_sample_router.get(PATH_SEQUENCED_SAMPLE_BY_IDX)
 async def get_sequenced_sample(
     sequenced_sample_idx: Annotated[int, Field(gt=0)],
     response: Response,
@@ -478,7 +487,7 @@ _SEQUENCED_SAMPLE_PATCH_UNIQUE_MESSAGES: dict[str, str] = {
 _SEQUENCED_SAMPLE_GENERIC_UNIQUE_VIOLATION = "conflicts with an existing sequenced_sample"
 
 
-@sequenced_sample_router.patch("/{sequenced_sample_idx}")
+@sequenced_sample_router.patch(PATH_SEQUENCED_SAMPLE_BY_IDX)
 async def patch_sequenced_sample(
     sequenced_sample_idx: Annotated[int, Field(gt=0)],
     body: SequencedSamplePatchRequest,

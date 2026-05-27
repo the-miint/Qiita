@@ -20,6 +20,12 @@ import secrets
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from qiita_common.api_paths import (
+    URL_SEQUENCED_SAMPLE_BY_IDX,
+    URL_SEQUENCED_SAMPLE_FROM_RUN,
+    URL_SEQUENCED_SAMPLE_LIST_BY_RUN,
+    URL_SEQUENCED_SAMPLE_LIST_BY_STUDY,
+)
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import FieldDataType
 
@@ -237,7 +243,9 @@ async def _fetch_prep_protocol_idx(ctx, name: str = "short_read_metagenomics") -
 async def _post_sequenced_sample(client, ctx, run_idx, pool_idx, **body):
     """POST the composer route; on 201, track every row the composer wrote."""
     resp = await client.post(
-        f"/api/v1/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample",
+        URL_SEQUENCED_SAMPLE_FROM_RUN.format(
+            sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+        ),
         json=body,
     )
     if resp.status_code == 201:
@@ -462,7 +470,9 @@ async def test_import_sequenced_sample_from_run_anonymous_401(ctx):
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "anon")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
         resp = await anon.post(
-            f"/api/v1/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample",
+            URL_SEQUENCED_SAMPLE_FROM_RUN.format(
+                sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+            ),
             json={
                 "biosample_idx": 1,
                 "prep_protocol_idx": 1,
@@ -477,7 +487,9 @@ async def test_import_sequenced_sample_from_run_anonymous_401(ctx):
 async def test_import_sequenced_sample_from_run_missing_scope_403(ctx, no_prep_sample_write_client):
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "noscope")
     resp = await no_prep_sample_write_client.post(
-        f"/api/v1/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample",
+        URL_SEQUENCED_SAMPLE_FROM_RUN.format(
+            sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+        ),
         json={
             "biosample_idx": 1,
             "prep_protocol_idx": 1,
@@ -672,7 +684,9 @@ async def test_import_sequenced_sample_from_run_nonexistent_pool_404(ctx):
     run_idx, _ = await _seed_run_and_pool(ctx, "nopool")
     max_pool = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.sequenced_pool")
     resp = await ctx["wet"].post(
-        f"/api/v1/sequencing-run/{run_idx}/sequenced-pool/{max_pool + 100_000}/sequenced-sample",
+        URL_SEQUENCED_SAMPLE_FROM_RUN.format(
+            sequencing_run_idx=run_idx, sequenced_pool_idx=max_pool + 100_000
+        ),
         json={
             "biosample_idx": 1,
             "prep_protocol_idx": 1,
@@ -691,7 +705,9 @@ async def test_import_sequenced_sample_from_run_pool_belongs_to_different_run_42
     run_a, _ = await _seed_run_and_pool(ctx, "path-a")
     _, pool_for_b = await _seed_run_and_pool(ctx, "path-b")
     resp = await ctx["wet"].post(
-        f"/api/v1/sequencing-run/{run_a}/sequenced-pool/{pool_for_b}/sequenced-sample",
+        URL_SEQUENCED_SAMPLE_FROM_RUN.format(
+            sequencing_run_idx=run_a, sequenced_pool_idx=pool_for_b
+        ),
         json={
             "biosample_idx": 1,
             "prep_protocol_idx": 1,
@@ -709,7 +725,9 @@ async def test_import_sequenced_sample_from_run_primary_in_secondary_422(ctx):
     # whose primary_study_idx also appears in secondary_study_idxs.
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "p-in-s")
     resp = await ctx["wet"].post(
-        f"/api/v1/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample",
+        URL_SEQUENCED_SAMPLE_FROM_RUN.format(
+            sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+        ),
         json={
             "biosample_idx": 1,
             "prep_protocol_idx": 1,
@@ -845,7 +863,9 @@ async def test_import_sequenced_sample_from_run_extra_field_422(ctx):
     # Request model carries extra="forbid".
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "xtra")
     resp = await ctx["wet"].post(
-        f"/api/v1/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample",
+        URL_SEQUENCED_SAMPLE_FROM_RUN.format(
+            sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+        ),
         json={
             "biosample_idx": 1,
             "prep_protocol_idx": 1,
@@ -861,7 +881,9 @@ async def test_import_sequenced_sample_from_run_extra_field_422(ctx):
 async def test_import_sequenced_sample_from_run_missing_required_field_422(ctx):
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "missing")
     resp = await ctx["wet"].post(
-        f"/api/v1/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample",
+        URL_SEQUENCED_SAMPLE_FROM_RUN.format(
+            sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+        ),
         json={},
     )
     assert resp.status_code == 422
@@ -1241,7 +1263,7 @@ async def test_list_sequenced_sample_idxs_wet_lab_admin_empty(ctx):
     )
     ctx["created"]["sequencing_run"].append(run_idx)
 
-    resp = await ctx["wet"].get(f"/api/v1/sequencing-run/{run_idx}/sequenced-sample/list-idxs")
+    resp = await ctx["wet"].get(URL_SEQUENCED_SAMPLE_LIST_BY_RUN.format(sequencing_run_idx=run_idx))
     assert resp.status_code == 200, resp.text
     expected = {
         "idxs": [],
@@ -1284,7 +1306,7 @@ async def test_list_sequenced_sample_idxs_wet_lab_admin_returns_newest_first(ctx
         assert resp.status_code == 201, resp.text
         ss_ids.append(resp.json()["sequenced_sample_idx"])
 
-    resp = await ctx["wet"].get(f"/api/v1/sequencing-run/{run_idx}/sequenced-sample/list-idxs")
+    resp = await ctx["wet"].get(URL_SEQUENCED_SAMPLE_LIST_BY_RUN.format(sequencing_run_idx=run_idx))
     assert resp.status_code == 200, resp.text
     expected = {
         "idxs": list(reversed(ss_ids)),
@@ -1333,7 +1355,7 @@ async def test_list_sequenced_sample_idxs_truncated(ctx, monkeypatch):
         assert resp.status_code == 201, resp.text
         ss_ids.append(resp.json()["sequenced_sample_idx"])
 
-    resp = await ctx["wet"].get(f"/api/v1/sequencing-run/{run_idx}/sequenced-sample/list-idxs")
+    resp = await ctx["wet"].get(URL_SEQUENCED_SAMPLE_LIST_BY_RUN.format(sequencing_run_idx=run_idx))
     assert resp.status_code == 200, resp.text
     # cap=1 keeps only the newest (second-landed) row after the slice.
     expected = {
@@ -1382,7 +1404,7 @@ async def test_list_sequenced_sample_idxs_excludes_retired_prep_sample(ctx):
         retired_by_idx=ctx["wet_session"]["principal_idx"],
     )
 
-    resp = await ctx["wet"].get(f"/api/v1/sequencing-run/{run_idx}/sequenced-sample/list-idxs")
+    resp = await ctx["wet"].get(URL_SEQUENCED_SAMPLE_LIST_BY_RUN.format(sequencing_run_idx=run_idx))
     assert resp.status_code == 200, resp.text
     # Only the second sequenced_sample survives the retired-prep filter.
     expected = {
@@ -1400,7 +1422,7 @@ async def test_list_sequenced_sample_idxs_system_admin_happy_path(ctx):
     seeded = await _seed_one_sequenced_sample(ctx, "list-adm")
 
     resp = await ctx["admin"].get(
-        f"/api/v1/sequencing-run/{seeded['run_idx']}/sequenced-sample/list-idxs"
+        URL_SEQUENCED_SAMPLE_LIST_BY_RUN.format(sequencing_run_idx=seeded["run_idx"])
     )
     assert resp.status_code == 200, resp.text
     expected = {
@@ -1422,7 +1444,7 @@ async def test_list_sequenced_sample_idxs_anonymous_401(ctx):
     app.state.pool = ctx["pool"]
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
         resp = await anon.get(
-            f"/api/v1/sequencing-run/{seeded['run_idx']}/sequenced-sample/list-idxs"
+            URL_SEQUENCED_SAMPLE_LIST_BY_RUN.format(sequencing_run_idx=seeded["run_idx"])
         )
     assert resp.status_code == 401
 
@@ -1430,7 +1452,7 @@ async def test_list_sequenced_sample_idxs_anonymous_401(ctx):
 async def test_list_sequenced_sample_idxs_missing_scope_403(ctx, no_prep_sample_read_client):
     seeded = await _seed_one_sequenced_sample(ctx, "list-noscope")
     resp = await no_prep_sample_read_client.get(
-        f"/api/v1/sequencing-run/{seeded['run_idx']}/sequenced-sample/list-idxs"
+        URL_SEQUENCED_SAMPLE_LIST_BY_RUN.format(sequencing_run_idx=seeded["run_idx"])
     )
     assert resp.status_code == 403
     assert "prep_sample:read" in resp.json()["detail"]
@@ -1442,7 +1464,7 @@ async def test_list_sequenced_sample_idxs_regular_user_role_403(ctx):
     # what trips — distinct rejection from the missing-scope path above.
     seeded = await _seed_one_sequenced_sample(ctx, "list-user")
     resp = await ctx["user"].get(
-        f"/api/v1/sequencing-run/{seeded['run_idx']}/sequenced-sample/list-idxs"
+        URL_SEQUENCED_SAMPLE_LIST_BY_RUN.format(sequencing_run_idx=seeded["run_idx"])
     )
     assert resp.status_code == 403
     assert "wet_lab_admin" in resp.json()["detail"]
@@ -1451,7 +1473,7 @@ async def test_list_sequenced_sample_idxs_regular_user_role_403(ctx):
 async def test_list_sequenced_sample_idxs_nonexistent_run_404(ctx):
     max_run = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.sequencing_run")
     resp = await ctx["wet"].get(
-        f"/api/v1/sequencing-run/{max_run + 100_000}/sequenced-sample/list-idxs"
+        URL_SEQUENCED_SAMPLE_LIST_BY_RUN.format(sequencing_run_idx=max_run + 100_000)
     )
     assert resp.status_code == 404
     assert "sequencing_run" in resp.json()["detail"]
@@ -1531,7 +1553,7 @@ async def test_list_sequenced_sample_idxs_in_study_owner_returns_payload(ctx):
         )
         ss_ids.append(seeded["sequenced_sample_idx"])
 
-    resp = await ctx["user"].get(f"/api/v1/study/{study_idx}/sequenced-sample/list-idxs")
+    resp = await ctx["user"].get(URL_SEQUENCED_SAMPLE_LIST_BY_STUDY.format(study_idx=study_idx))
     assert resp.status_code == 200, resp.text
     expected = {
         "idxs": list(reversed(ss_ids)),
@@ -1557,7 +1579,7 @@ async def test_list_sequenced_sample_idxs_in_study_viewer_access_returns_payload
         granted_by_idx=ctx["admin_session"]["principal_idx"],
     )
 
-    resp = await ctx["user"].get(f"/api/v1/study/{study_idx}/sequenced-sample/list-idxs")
+    resp = await ctx["user"].get(URL_SEQUENCED_SAMPLE_LIST_BY_STUDY.format(study_idx=study_idx))
     assert resp.status_code == 200, resp.text
     expected = {
         "idxs": [],
@@ -1599,7 +1621,7 @@ async def test_list_sequenced_sample_idxs_in_study_excludes_retired_link_and_ret
         retired_by_idx=owner_idx,
     )
 
-    resp = await ctx["user"].get(f"/api/v1/study/{study_idx}/sequenced-sample/list-idxs")
+    resp = await ctx["user"].get(URL_SEQUENCED_SAMPLE_LIST_BY_STUDY.format(study_idx=study_idx))
     assert resp.status_code == 200, resp.text
     expected = {
         "idxs": [active["sequenced_sample_idx"]],
@@ -1617,7 +1639,7 @@ async def test_list_sequenced_sample_idxs_in_study_anonymous_401(ctx):
         ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="study-anon"
     )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
-        resp = await anon.get(f"/api/v1/study/{study_idx}/sequenced-sample/list-idxs")
+        resp = await anon.get(URL_SEQUENCED_SAMPLE_LIST_BY_STUDY.format(study_idx=study_idx))
     assert resp.status_code == 401
 
 
@@ -1627,7 +1649,9 @@ async def test_list_sequenced_sample_idxs_in_study_missing_scope_403(ctx, no_stu
     study_idx = await _seed_study(
         ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="study-noscope"
     )
-    resp = await no_study_read_client.get(f"/api/v1/study/{study_idx}/sequenced-sample/list-idxs")
+    resp = await no_study_read_client.get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_STUDY.format(study_idx=study_idx)
+    )
     assert resp.status_code == 403
     assert "study:read" in resp.json()["detail"]
 
@@ -1638,7 +1662,7 @@ async def test_list_sequenced_sample_idxs_in_study_no_access_403(ctx):
     study_idx = await _seed_study(
         ctx, owner_idx=ctx["admin_session"]["principal_idx"], suffix="study-noaccess"
     )
-    resp = await ctx["user"].get(f"/api/v1/study/{study_idx}/sequenced-sample/list-idxs")
+    resp = await ctx["user"].get(URL_SEQUENCED_SAMPLE_LIST_BY_STUDY.format(study_idx=study_idx))
     assert resp.status_code == 403
 
 
@@ -1646,7 +1670,9 @@ async def test_list_sequenced_sample_idxs_in_study_nonexistent_study_regular_use
     # require_study_exists fires before require_study_access for a regular
     # user, so a study_idx past the highest existing study returns 404.
     max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
-    resp = await ctx["user"].get(f"/api/v1/study/{max_idx + 100_000}/sequenced-sample/list-idxs")
+    resp = await ctx["user"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_STUDY.format(study_idx=max_idx + 100_000)
+    )
     assert resp.status_code == 404
 
 
@@ -1656,7 +1682,9 @@ async def test_list_sequenced_sample_idxs_in_study_nonexistent_study_admin_404(c
     # route composes both so admin-bypass callers do not silently get an
     # empty list for a non-existent study.
     max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
-    resp = await ctx["admin"].get(f"/api/v1/study/{max_idx + 100_000}/sequenced-sample/list-idxs")
+    resp = await ctx["admin"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_STUDY.format(study_idx=max_idx + 100_000)
+    )
     assert resp.status_code == 404
 
 
@@ -1669,7 +1697,7 @@ async def test_list_sequenced_sample_idxs_in_study_wet_lab_admin_bypasses_access
     )
     seeded = await _seed_sequenced_sample_linked_to_study(ctx, study_idx=study_idx, suffix="wetbyp")
 
-    resp = await ctx["wet"].get(f"/api/v1/study/{study_idx}/sequenced-sample/list-idxs")
+    resp = await ctx["wet"].get(URL_SEQUENCED_SAMPLE_LIST_BY_STUDY.format(study_idx=study_idx))
     assert resp.status_code == 200, resp.text
     expected = {
         "idxs": [seeded["sequenced_sample_idx"]],
@@ -1687,7 +1715,7 @@ async def test_list_sequenced_sample_idxs_in_study_system_admin_bypasses_access(
         ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="study-adm-bypass"
     )
 
-    resp = await ctx["admin"].get(f"/api/v1/study/{study_idx}/sequenced-sample/list-idxs")
+    resp = await ctx["admin"].get(URL_SEQUENCED_SAMPLE_LIST_BY_STUDY.format(study_idx=study_idx))
     assert resp.status_code == 200, resp.text
     expected = {
         "idxs": [],
@@ -1717,7 +1745,7 @@ async def test_list_sequenced_sample_idxs_in_study_truncated(ctx, monkeypatch):
         )
         ss_ids.append(seeded["sequenced_sample_idx"])
 
-    resp = await ctx["user"].get(f"/api/v1/study/{study_idx}/sequenced-sample/list-idxs")
+    resp = await ctx["user"].get(URL_SEQUENCED_SAMPLE_LIST_BY_STUDY.format(study_idx=study_idx))
     assert resp.status_code == 200, resp.text
     # cap=1 keeps only the newest-linked (second-seeded) row after the slice.
     expected = {
@@ -1783,14 +1811,16 @@ async def test_list_sequenced_sample_idxs_in_study_surfaces_secondary_link(ctx):
     # Secondary side: the sample must appear in the roster for B even
     # though B is the secondary link, not the primary.
     secondary_resp = await ctx["user"].get(
-        f"/api/v1/study/{secondary_idx}/sequenced-sample/list-idxs"
+        URL_SEQUENCED_SAMPLE_LIST_BY_STUDY.format(study_idx=secondary_idx)
     )
     assert secondary_resp.status_code == 200, secondary_resp.text
     assert secondary_resp.json() == expected
 
     # Primary side: the same sample also surfaces in the roster for A,
     # confirming a single sample participates in both rosters.
-    primary_resp = await ctx["user"].get(f"/api/v1/study/{primary_idx}/sequenced-sample/list-idxs")
+    primary_resp = await ctx["user"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_STUDY.format(study_idx=primary_idx)
+    )
     assert primary_resp.status_code == 200, primary_resp.text
     assert primary_resp.json() == expected
 
@@ -1805,7 +1835,9 @@ async def test_get_sequenced_sample_wet_lab_admin_no_metadata(ctx):
     # against the response with timestamps copied from actual.
     seeded = await _seed_one_sequenced_sample(ctx, "get-min")
 
-    resp = await ctx["wet"].get(f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}")
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"])
+    )
     assert resp.status_code == 200, resp.text
     rj = resp.json()
     expected = _expected_read_response(
@@ -1833,7 +1865,9 @@ async def test_get_sequenced_sample_carries_global_metadata(ctx):
         metadata={"Alias": "amp-007", "Title": "Wet-lab amplicon prep 007"},
     )
 
-    resp = await ctx["wet"].get(f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}")
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"])
+    )
     assert resp.status_code == 200, resp.text
     rj = resp.json()
     # Migration 20260501000010 pins the seeded global fields' internal_names
@@ -1897,7 +1931,9 @@ async def test_get_sequenced_sample_carries_missing_reason_marker(ctx):
         metadata={display_name: reason_name},
     )
 
-    resp = await ctx["wet"].get(f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}")
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"])
+    )
     assert resp.status_code == 200, resp.text
     rj = resp.json()
     expected_metadata = {
@@ -1952,7 +1988,9 @@ async def test_get_sequenced_sample_carries_terminology_term(ctx):
         metadata={display_name: term_row["term_id"]},
     )
 
-    resp = await ctx["wet"].get(f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}")
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"])
+    )
     assert resp.status_code == 200, resp.text
     rj = resp.json()
     expected_metadata = {
@@ -1984,7 +2022,9 @@ async def test_get_sequenced_sample_system_admin_happy_path(ctx):
     # system_admin satisfies the role gate via the hierarchical check; full
     # response equality confirms caller_system_role surfaces correctly.
     seeded = await _seed_one_sequenced_sample(ctx, "get-adm")
-    resp = await ctx["admin"].get(f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}")
+    resp = await ctx["admin"].get(
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"])
+    )
     assert resp.status_code == 200, resp.text
     rj = resp.json()
     expected = _expected_read_response(
@@ -2008,14 +2048,16 @@ async def test_get_sequenced_sample_anonymous_401(ctx):
     seeded = await _seed_one_sequenced_sample(ctx, "get-anon")
     app.state.pool = ctx["pool"]
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
-        resp = await anon.get(f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}")
+        resp = await anon.get(
+            URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"])
+        )
     assert resp.status_code == 401
 
 
 async def test_get_sequenced_sample_missing_scope_403(ctx, no_prep_sample_read_client):
     seeded = await _seed_one_sequenced_sample(ctx, "get-noscope")
     resp = await no_prep_sample_read_client.get(
-        f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}"
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"])
     )
     assert resp.status_code == 403
     assert "prep_sample:read" in resp.json()["detail"]
@@ -2025,14 +2067,18 @@ async def test_get_sequenced_sample_regular_user_role_403(ctx):
     # Default regular-user session carries PREP_SAMPLE_READ; scope passes,
     # require_role_at_least(WET_LAB_ADMIN) is what rejects.
     seeded = await _seed_one_sequenced_sample(ctx, "get-user")
-    resp = await ctx["user"].get(f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}")
+    resp = await ctx["user"].get(
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"])
+    )
     assert resp.status_code == 403
     assert "wet_lab_admin" in resp.json()["detail"]
 
 
 async def test_get_sequenced_sample_nonexistent_404(ctx):
     max_ss = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.sequenced_sample")
-    resp = await ctx["wet"].get(f"/api/v1/sequenced-sample/{max_ss + 100_000}")
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=max_ss + 100_000)
+    )
     assert resp.status_code == 404
     assert "sequenced_sample" in resp.json()["detail"]
 
@@ -2047,7 +2093,9 @@ async def test_get_sequenced_sample_retired_prep_sample_404(ctx):
         retired_by_idx=ctx["wet_session"]["principal_idx"],
     )
 
-    resp = await ctx["wet"].get(f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}")
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"])
+    )
     assert resp.status_code == 404
     assert "sequenced_sample" in resp.json()["detail"]
 
@@ -2066,7 +2114,9 @@ async def _get_etag(client, sequenced_sample_idx: int) -> str:
     ETag-format change updates both endpoints in one place.
     """
     # Pull the resource and lift the header verbatim.
-    resp = await client.get(f"/api/v1/sequenced-sample/{sequenced_sample_idx}")
+    resp = await client.get(
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=sequenced_sample_idx)
+    )
     assert resp.status_code == 200, resp.text
     return resp.headers["ETag"]
 
@@ -2083,7 +2133,7 @@ async def test_patch_sequenced_sample_single_field_writes_and_bumps_etag(ctx):
     pre_etag = await _get_etag(ctx["wet"], seeded["sequenced_sample_idx"])
 
     resp = await ctx["wet"].patch(
-        f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}",
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
         json={"ena_experiment_accession": "ERX9000001"},
         headers={"If-Match": pre_etag},
     )
@@ -2122,7 +2172,7 @@ async def test_patch_sequenced_sample_all_subtype_fields(ctx):
         "submission_error": "rejected: schema validation failed",
     }
     resp = await ctx["wet"].patch(
-        f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}",
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
         json=body,
         headers={"If-Match": pre_etag},
     )
@@ -2150,7 +2200,7 @@ async def test_patch_sequenced_sample_system_admin_happy_path(ctx):
     pre_etag = await _get_etag(ctx["admin"], seeded["sequenced_sample_idx"])
 
     resp = await ctx["admin"].patch(
-        f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}",
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
         json={"submission_error": "transient ENA outage"},
         headers={"If-Match": pre_etag},
     )
@@ -2179,7 +2229,7 @@ async def test_patch_sequenced_sample_submission_error_clearing_trigger(ctx):
     # First PATCH plants a submission_error.
     etag1 = await _get_etag(ctx["wet"], seeded["sequenced_sample_idx"])
     r1 = await ctx["wet"].patch(
-        f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}",
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
         json={"submission_error": "ENA timed out"},
         headers={"If-Match": etag1},
     )
@@ -2191,7 +2241,7 @@ async def test_patch_sequenced_sample_submission_error_clearing_trigger(ctx):
     # submission_error IS NOT DISTINCT FROM OLD, and nulls submission_error.
     etag2 = r1.headers["ETag"]
     r2 = await ctx["wet"].patch(
-        f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}",
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
         json={"last_submission_at": "2026-02-01T08:30:00+00:00"},
         headers={"If-Match": etag2},
     )
@@ -2220,7 +2270,7 @@ async def test_patch_sequenced_sample_submission_error_clearing_trigger(ctx):
 async def test_patch_sequenced_sample_missing_if_match_428(ctx):
     seeded = await _seed_one_sequenced_sample(ctx, "patch-no-im")
     resp = await ctx["wet"].patch(
-        f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}",
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
         json={"ena_experiment_accession": "ERX1"},
     )
     assert resp.status_code == 428
@@ -2235,7 +2285,7 @@ async def test_patch_sequenced_sample_stale_if_match_412(ctx):
 
     # First PATCH commits and bumps the ETag.
     r1 = await ctx["wet"].patch(
-        f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}",
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
         json={"ena_experiment_accession": "ERX1"},
         headers={"If-Match": pre_etag},
     )
@@ -2243,7 +2293,7 @@ async def test_patch_sequenced_sample_stale_if_match_412(ctx):
 
     # Second PATCH submits with the stale ETag; 412 with no second write.
     r2 = await ctx["wet"].patch(
-        f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}",
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
         json={"ena_run_accession": "ERR1"},
         headers={"If-Match": pre_etag},
     )
@@ -2269,7 +2319,7 @@ async def test_patch_sequenced_sample_anonymous_401(ctx):
     app.state.pool = ctx["pool"]
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
         resp = await anon.patch(
-            f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}",
+            URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
             json={"ena_experiment_accession": "ERX1"},
             headers={"If-Match": pre_etag},
         )
@@ -2288,7 +2338,7 @@ async def test_patch_sequenced_sample_non_admin_no_scope_403(ctx, no_prep_sample
     seeded = await _seed_one_sequenced_sample(ctx, "patch-noscope")
     pre_etag = await _get_etag(ctx["wet"], seeded["sequenced_sample_idx"])
     resp = await no_prep_sample_write_client.patch(
-        f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}",
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
         json={"ena_experiment_accession": "ERX1"},
         headers={"If-Match": pre_etag},
     )
@@ -2303,7 +2353,7 @@ async def test_patch_sequenced_sample_regular_user_role_403(
     seeded = await _seed_one_sequenced_sample(ctx, "patch-user")
     pre_etag = await _get_etag(ctx["wet"], seeded["sequenced_sample_idx"])
     resp = await regular_user_with_prep_sample_write_client.patch(
-        f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}",
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
         json={"ena_experiment_accession": "ERX1"},
         headers={"If-Match": pre_etag},
     )
@@ -2364,7 +2414,7 @@ async def test_patch_sequenced_sample_service_account_403_pending_restructure(ct
         headers={"Authorization": f"Bearer {plaintext}"},
     ) as svc:
         resp = await svc.patch(
-            f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}",
+            URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
             json={"submission_error": "subsystem-recorded"},
             headers={"If-Match": pre_etag},
         )
@@ -2377,7 +2427,7 @@ async def test_patch_sequenced_sample_nonexistent_404(ctx):
     # route emits 404 before considering retired / ETag.
     max_ss = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.sequenced_sample")
     resp = await ctx["wet"].patch(
-        f"/api/v1/sequenced-sample/{max_ss + 100_000}",
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=max_ss + 100_000),
         json={"ena_experiment_accession": "ERX1"},
         headers={"If-Match": '"2026-01-01T00:00:00+00:00"'},
     )
@@ -2396,7 +2446,7 @@ async def test_patch_sequenced_sample_retired_prep_sample_409(ctx):
         retired_by_idx=ctx["wet_session"]["principal_idx"],
     )
     resp = await ctx["wet"].patch(
-        f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}",
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
         json={"ena_experiment_accession": "ERX1"},
         headers={"If-Match": pre_etag},
     )
@@ -2413,7 +2463,7 @@ async def test_patch_sequenced_sample_ena_experiment_accession_collision_409(ctx
 
     etag_a = await _get_etag(ctx["wet"], a["sequenced_sample_idx"])
     r1 = await ctx["wet"].patch(
-        f"/api/v1/sequenced-sample/{a['sequenced_sample_idx']}",
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=a["sequenced_sample_idx"]),
         json={"ena_experiment_accession": "ERX_DUP"},
         headers={"If-Match": etag_a},
     )
@@ -2421,7 +2471,7 @@ async def test_patch_sequenced_sample_ena_experiment_accession_collision_409(ctx
 
     etag_b = await _get_etag(ctx["wet"], b["sequenced_sample_idx"])
     r2 = await ctx["wet"].patch(
-        f"/api/v1/sequenced-sample/{b['sequenced_sample_idx']}",
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=b["sequenced_sample_idx"]),
         json={"ena_experiment_accession": "ERX_DUP"},
         headers={"If-Match": etag_b},
     )
@@ -2437,7 +2487,7 @@ async def test_patch_sequenced_sample_ena_run_accession_collision_409(ctx):
 
     etag_a = await _get_etag(ctx["wet"], a["sequenced_sample_idx"])
     r1 = await ctx["wet"].patch(
-        f"/api/v1/sequenced-sample/{a['sequenced_sample_idx']}",
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=a["sequenced_sample_idx"]),
         json={"ena_run_accession": "ERR_DUP"},
         headers={"If-Match": etag_a},
     )
@@ -2445,7 +2495,7 @@ async def test_patch_sequenced_sample_ena_run_accession_collision_409(ctx):
 
     etag_b = await _get_etag(ctx["wet"], b["sequenced_sample_idx"])
     r2 = await ctx["wet"].patch(
-        f"/api/v1/sequenced-sample/{b['sequenced_sample_idx']}",
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=b["sequenced_sample_idx"]),
         json={"ena_run_accession": "ERR_DUP"},
         headers={"If-Match": etag_b},
     )
@@ -2463,7 +2513,7 @@ async def test_patch_sequenced_sample_empty_body_422(ctx):
     seeded = await _seed_one_sequenced_sample(ctx, "patch-empty")
     pre_etag = await _get_etag(ctx["wet"], seeded["sequenced_sample_idx"])
     resp = await ctx["wet"].patch(
-        f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}",
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
         json={},
         headers={"If-Match": pre_etag},
     )
@@ -2475,7 +2525,7 @@ async def test_patch_sequenced_sample_extra_field_422(ctx):
     seeded = await _seed_one_sequenced_sample(ctx, "patch-extra")
     pre_etag = await _get_etag(ctx["wet"], seeded["sequenced_sample_idx"])
     resp = await ctx["wet"].patch(
-        f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}",
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
         json={"ena_experiment_accession": "ERX1", "not_a_field": 5},
         headers={"If-Match": pre_etag},
     )
@@ -2488,7 +2538,7 @@ async def test_patch_sequenced_sample_supertype_field_422(ctx):
     seeded = await _seed_one_sequenced_sample(ctx, "patch-super")
     pre_etag = await _get_etag(ctx["wet"], seeded["sequenced_sample_idx"])
     resp = await ctx["wet"].patch(
-        f"/api/v1/sequenced-sample/{seeded['sequenced_sample_idx']}",
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
         json={"owner_idx": ctx["wet_session"]["principal_idx"]},
         headers={"If-Match": pre_etag},
     )

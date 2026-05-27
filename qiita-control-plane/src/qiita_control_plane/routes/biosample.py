@@ -24,6 +24,13 @@ from typing import Annotated
 import asyncpg
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import Field
+from qiita_common.api_paths import (
+    PATH_BIOSAMPLE_BY_IDX,
+    PATH_BIOSAMPLE_BY_STUDY,
+    PATH_BIOSAMPLE_LIST_BY_STUDY,
+    PATH_BIOSAMPLE_PREFIX,
+    PATH_STUDY_PREFIX,
+)
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
     BiosampleImportRequest,
@@ -74,8 +81,8 @@ from ._helpers import (
     raise_for_transient_write_race,
 )
 
-router = APIRouter(prefix="/study", tags=["biosample"])
-biosample_router = APIRouter(prefix="/biosample", tags=["biosample"])
+router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["biosample"])
+biosample_router = APIRouter(prefix=PATH_BIOSAMPLE_PREFIX, tags=["biosample"])
 
 
 _MSG_OWNER_NOT_ELIGIBLE = "owner is not eligible to own biosamples"
@@ -96,7 +103,7 @@ _FK_VIOLATION_MESSAGES: dict[str, str] = {
 _GENERIC_UNIQUE_VIOLATION = "conflicts with an existing biosample"
 
 
-@router.post("/{study_idx}/biosample", status_code=201)
+@router.post(PATH_BIOSAMPLE_BY_STUDY, status_code=201)
 async def import_biosample(
     study_idx: Annotated[int, Field(gt=0)],
     body: BiosampleImportRequest,
@@ -244,7 +251,7 @@ async def import_biosample(
 _BIOSAMPLE_IDXS_HARD_CAP = 500_000
 
 
-@router.get("/{study_idx}/biosample/list-idxs")
+@router.get(PATH_BIOSAMPLE_LIST_BY_STUDY)
 async def list_biosample_idxs_in_study(
     study_idx: Annotated[int, Field(gt=0)],
     pool: asyncpg.Pool = Depends(get_db_pool),
@@ -325,7 +332,7 @@ def _biosample_response_from_row(
     )
 
 
-@biosample_router.get("/{biosample_idx}")
+@biosample_router.get(PATH_BIOSAMPLE_BY_IDX)
 async def get_biosample(
     biosample_idx: Annotated[int, Field(gt=0)],
     response: Response,
@@ -421,7 +428,7 @@ async def get_biosample(
 _OWNER_TRIGGER_RAISE_MARKER = "user-kind principal"
 
 
-@biosample_router.patch("/{biosample_idx}")
+@biosample_router.patch(PATH_BIOSAMPLE_BY_IDX)
 async def patch_biosample(
     biosample_idx: Annotated[int, Field(gt=0)],
     body: BiosamplePatchRequest,

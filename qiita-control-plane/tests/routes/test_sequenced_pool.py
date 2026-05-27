@@ -14,6 +14,7 @@ import json
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from qiita_common.api_paths import URL_SEQUENCING_RUN_SEQUENCED_POOL
 
 from qiita_control_plane.main import app
 
@@ -70,7 +71,7 @@ def _b64(blob: bytes) -> str:
 async def _post_pool(client, ctx, sequencing_run_idx: int, **body):
     """POST the route and, on 201, track the created sequenced_pool idx."""
     resp = await client.post(
-        f"/api/v1/sequencing-run/{sequencing_run_idx}/sequenced-pool",
+        URL_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=sequencing_run_idx),
         json=body,
     )
     if resp.status_code == 201:
@@ -156,7 +157,7 @@ async def test_create_sequenced_pool_anonymous_401(ctx):
     run_idx = await _seed_sequencing_run(ctx, "anon")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
         resp = await anon.post(
-            f"/api/v1/sequencing-run/{run_idx}/sequenced-pool",
+            URL_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=run_idx),
             json={
                 "run_preflight_blob": _b64(b"X"),
                 "run_preflight_filename": "f.sqlite",
@@ -169,7 +170,7 @@ async def test_create_sequenced_pool_missing_scope_403(ctx, no_prep_sample_write
     # PAT omits Scope.PREP_SAMPLE_WRITE → require_scope rejects with 403.
     run_idx = await _seed_sequencing_run(ctx, "noscope")
     resp = await no_prep_sample_write_client.post(
-        f"/api/v1/sequencing-run/{run_idx}/sequenced-pool",
+        URL_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=run_idx),
         json={
             "run_preflight_blob": _b64(b"X"),
             "run_preflight_filename": "f.sqlite",
@@ -230,7 +231,7 @@ async def test_create_sequenced_pool_nonexistent_run_404(ctx):
     # a run idx past the highest existing row returns 404.
     max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.sequencing_run")
     resp = await ctx["wet"].post(
-        f"/api/v1/sequencing-run/{max_idx + 100_000}/sequenced-pool",
+        URL_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=max_idx + 100_000),
         json={
             "run_preflight_blob": _b64(b"X"),
             "run_preflight_filename": "f.sqlite",
@@ -245,7 +246,7 @@ async def test_create_sequenced_pool_empty_blob_422(ctx):
     # zero-byte base64 encoding "" trips the validator without reaching SQL.
     run_idx = await _seed_sequencing_run(ctx, "empty")
     resp = await ctx["wet"].post(
-        f"/api/v1/sequencing-run/{run_idx}/sequenced-pool",
+        URL_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=run_idx),
         json={
             "run_preflight_blob": "",
             "run_preflight_filename": "f.sqlite",
@@ -259,7 +260,7 @@ async def test_create_sequenced_pool_blob_without_filename_422(ctx):
     # trips the both-or-neither model_validator (422) before reaching SQL.
     run_idx = await _seed_sequencing_run(ctx, "nofile")
     resp = await ctx["wet"].post(
-        f"/api/v1/sequencing-run/{run_idx}/sequenced-pool",
+        URL_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=run_idx),
         json={"run_preflight_blob": _b64(b"X")},
     )
     assert resp.status_code == 422
@@ -270,7 +271,7 @@ async def test_create_sequenced_pool_filename_without_blob_422(ctx):
     # both-or-neither model_validator (422).
     run_idx = await _seed_sequencing_run(ctx, "noblob")
     resp = await ctx["wet"].post(
-        f"/api/v1/sequencing-run/{run_idx}/sequenced-pool",
+        URL_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=run_idx),
         json={"run_preflight_filename": "f.sqlite"},
     )
     assert resp.status_code == 422
@@ -281,7 +282,7 @@ async def test_create_sequenced_pool_empty_filename_422(ctx):
     # the validator trips without reaching SQL.
     run_idx = await _seed_sequencing_run(ctx, "emptyfn")
     resp = await ctx["wet"].post(
-        f"/api/v1/sequencing-run/{run_idx}/sequenced-pool",
+        URL_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=run_idx),
         json={
             "run_preflight_blob": _b64(b"X"),
             "run_preflight_filename": "",
@@ -324,7 +325,7 @@ async def test_create_sequenced_pool_extra_field_422(ctx):
     # Pydantic validation rather than being silently dropped.
     run_idx = await _seed_sequencing_run(ctx, "xtra")
     resp = await ctx["wet"].post(
-        f"/api/v1/sequencing-run/{run_idx}/sequenced-pool",
+        URL_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=run_idx),
         json={
             "run_preflight_blob": _b64(b"X"),
             "run_preflight_filename": "f.sqlite",
