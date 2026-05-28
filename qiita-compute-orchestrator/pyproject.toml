@@ -13,10 +13,6 @@ dependencies = [
     # dev/test. SlurmBackend won't need it, but the orchestrator runs both
     # backends from the same image, so the dep stays.
     "duckdb>=1.5.2",
-    # bcl_convert_prep reads the vendored sequencer_types.yml at import
-    # time to derive the {machine_prefix: model_name} table; declare the
-    # YAML parser directly rather than relying on transitive resolution.
-    "pyyaml>=6.0",
     # bcl_convert_prep imports `save_legacy_csv` from
     # run_preflight.legacy.api at execute() time. SHA pin is required
     # so a re-vendor of the upstream is explicit. To bump: read the

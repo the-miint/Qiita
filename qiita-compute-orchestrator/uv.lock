@@ -341,12 +341,14 @@ source = { directory = "../qiita-common" }
 dependencies = [
     { name = "httpx" },
     { name = "pydantic", extra = ["email"] },
+    { name = "pyyaml" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "pydantic", extras = ["email"], specifier = ">=2.12" },
+    { name = "pyyaml", specifier = ">=6.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -364,7 +366,6 @@ dependencies = [
     { name = "duckdb" },
     { name = "fastapi" },
     { name = "httpx" },
-    { name = "pyyaml" },
     { name = "qiita-common" },
     { name = "run-preflight" },
     { name = "uvicorn", extra = ["standard"] },
@@ -383,7 +384,6 @@ requires-dist = [
     { name = "duckdb", specifier = ">=1.5.2" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.28" },
-    { name = "pyyaml", specifier = ">=6.0" },
     { name = "qiita-common", directory = "../qiita-common" },
     { name = "run-preflight", git = "https://github.com/the-miint/kl-run-preflight?rev=0ccab487db83ff0624998c14d664304faa5470cc" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },

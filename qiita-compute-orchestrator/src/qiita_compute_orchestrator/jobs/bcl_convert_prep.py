@@ -14,13 +14,13 @@ The instrument_model file is consumed by the RUNNER (not the container)
 to resolve baseline_resources.profiles at dispatch time. Its contents
 must exactly match a key in the workflow YAML's profiles dict.
 
-Vendored prefix table: ``sequencer_types.yml`` is a one-time snapshot of
-biocore/kl-metapool/metapool/config/sequencer_types.yml. See its header
-comment for the re-vendor protocol.
+Folder-name parsing lives in qiita_common.illumina so the user CLI
+(qiita submit-bcl-convert) and the launcher-side prep step share one
+implementation against one vendored prefix table.
 
 External dependency: ``run_preflight.legacy.api.save_legacy_csv``. The
 import is deferred to ``execute()`` so module collection (pytest) and the
-launcher's import-on-dispatch never fail just because the dep isn't
+launcher's import-on-dispatch never fail just because the dep is not
 installed in a non-bcl-convert environment.
 """
 
@@ -29,85 +29,10 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-import yaml
 from pydantic import BaseModel
+from qiita_common.illumina import instrument_model_from_run_folder
 
 from ..sequence_range import fetch_sequenced_pool_preflight, make_cp_client
-
-_SEQUENCER_TYPES_YAML = Path(__file__).parent / "sequencer_types.yml"
-
-# Illumina-only filter. The vendored YAML preserves PacBio Revio
-# verbatim (see header comment); the prep step ignores it because
-# bcl-convert is Illumina-only and a PacBio prefix accidentally
-# resolving against the workflow would surface as an unknown profile
-# key downstream rather than at parse time.
-_ILLUMINA_MODEL_PREFIX = "Illumina "
-
-
-def _load_instrument_prefix_table() -> dict[str, str]:
-    """Build ``{machine_prefix: model_name}`` from the vendored snapshot.
-
-    Filters:
-      * Skips entries without a ``machine_prefix`` (the 4 Illumina
-        families plan-D's out-of-scope #6 calls out as currently
-        unparseable).
-      * Skips entries whose ``model_name`` doesn't start with
-        ``"Illumina "`` (excludes PacBio Revio's ``r`` prefix from the
-        parser's reach — bcl-convert is Illumina-only).
-    """
-    with _SEQUENCER_TYPES_YAML.open(encoding="utf-8") as fh:
-        raw = yaml.safe_load(fh)
-    table: dict[str, str] = {}
-    for entry in raw.values():
-        prefix = entry.get("machine_prefix")
-        model_name = entry.get("model_name")
-        if not prefix or not model_name:
-            continue
-        if not model_name.startswith(_ILLUMINA_MODEL_PREFIX):
-            continue
-        table[prefix] = model_name
-    return table
-
-
-# Module-level constant: the prefix-table file is read once at import.
-# Re-vendoring requires a process restart, which matches deploy lifecycle.
-_INSTRUMENT_PREFIXES = _load_instrument_prefix_table()
-
-
-def _instrument_model_from_run_folder(folder_name: str) -> str:
-    """Parse an Illumina BCL run-folder name into the corresponding
-    ``model_name`` string.
-
-    Convention: ``<YYMMDD>_<InstrumentSerial>_<RunNum>_<FlowcellID>``.
-    The instrument-serial's leading characters identify the family.
-
-    Match policy: longest prefix wins. The vendored prefix table contains
-    overlapping entries (``LH`` vs ``L``, ``MN`` vs ``M``, ``SL`` vs
-    ``S``, ``SH`` vs ``S``); without longest-match semantics, a NovaSeq X
-    serial ``LH00345`` would resolve to whatever 1-char prefix is checked
-    first. Sorting prefixes by length descending makes the match
-    deterministic.
-
-    Raises ``ValueError`` on malformed folder names and unrecognized
-    prefixes; the launcher framework maps ValueError to
-    BackendFailure(BAD_INPUT) so the work_ticket fails fast with a
-    structured reason.
-    """
-    parts = folder_name.split("_")
-    if len(parts) < 4:
-        raise ValueError(
-            f"BCL run folder name does not match Illumina convention "
-            f"<YYMMDD>_<InstrumentSerial>_<RunNum>_<FlowcellID>: {folder_name!r}"
-        )
-    serial = parts[1]
-    for prefix in sorted(_INSTRUMENT_PREFIXES, key=len, reverse=True):
-        if serial.startswith(prefix):
-            return _INSTRUMENT_PREFIXES[prefix]
-    raise ValueError(
-        f"unknown instrument serial prefix in {folder_name!r}; "
-        f"add a machine_prefix entry to kl-metapool's sequencer_types.yml "
-        f"and re-vendor, or rename the folder to use a recognized prefix"
-    )
 
 
 class Inputs(BaseModel):
@@ -159,7 +84,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # before any CP round-trip. The runner's A4 resolution at dispatch
     # of the bcl_convert step reads instrument_model.txt; if we couldn't
     # write a valid value, fail here with the precise reason.
-    instrument_model = _instrument_model_from_run_folder(inputs.bcl_input_dir.name)
+    instrument_model = instrument_model_from_run_folder(inputs.bcl_input_dir.name)
 
     workspace.mkdir(parents=True, exist_ok=True)
 
