@@ -18,12 +18,12 @@ dependencies = [
     # YAML parser directly rather than relying on transitive resolution.
     "pyyaml>=6.0",
     # bcl_convert_prep imports `save_legacy_csv` from
-    # run_preflight.legacy.api at execute() time. SHA pin is REQUIRED
-    # before any deploy — see Plan D handoff notes. Leaving the entry
-    # commented so `uv sync` doesn't fail in environments where the
-    # upstream isn't yet reachable; bcl-convert won't run end-to-end
-    # until the next agent un-comments + pins:
-    #   "run-preflight @ git+https://github.com/the-miint/kl-run-preflight@<sha>",
+    # run_preflight.legacy.api at execute() time. SHA pin is required
+    # so a re-vendor of the upstream is explicit. To bump: read the
+    # `def save_legacy_csv` signature on a newer SHA and update the
+    # ref + comment together so an unrelated upstream change can't
+    # silently swap in.
+    "run-preflight @ git+https://github.com/the-miint/kl-run-preflight@0ccab487db83ff0624998c14d664304faa5470cc",
 ]
 
 [dependency-groups]
@@ -43,6 +43,13 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/qiita_compute_orchestrator"]
+
+# run-preflight is pinned as a git+https direct reference (see the
+# matching comment on the dependency). Hatchling refuses direct
+# references in `project.dependencies` by default; opt in explicitly
+# so `uv sync` / `pip install` against this pyproject succeed.
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
