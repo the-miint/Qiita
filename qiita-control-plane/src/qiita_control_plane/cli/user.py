@@ -20,6 +20,10 @@ from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
 from qiita_common.api_paths import PATH_WORK_TICKET_PREFIX
+from qiita_common.illumina import (
+    instrument_model_from_run_folder,
+    instrument_run_id_from_run_folder,
+)
 from qiita_common.models import (
     BiosampleImportRequest,
     Platform,
@@ -34,6 +38,13 @@ from qiita_common.models import (
 )
 
 from . import _common
+
+# action_id + version for the bundled bcl-convert submission flow. Pinned
+# here so the CLI does not drift from the workflow YAML the operator's
+# deploy syncs into qiita.action; bumping the workflow major version is a
+# coordinated change.
+_BCL_CONVERT_ACTION_ID = "bcl-convert"
+_BCL_CONVERT_ACTION_VERSION = "1.0.0"
 
 # ---------------------------------------------------------------------------
 # HTTP helpers (call sites for individual endpoints)
@@ -415,6 +426,66 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_ticket_status.set_defaults(handler=_handle_ticket_status)
 
+    p_submit_bcl = sub.add_parser(
+        "submit-bcl-convert",
+        help=(
+            "Bundled operator gesture for the bcl-convert workflow: mint"
+            " (or reuse) a sequencing-run row, attach a sequenced-pool"
+            " with the preflight blob, and submit the work-ticket against"
+            " the pool."
+        ),
+        description=(
+            "Submit a bcl-convert work-ticket end-to-end. The instrument run"
+            " ID, instrument model, and platform are derived from the"
+            " --bcl-input-dir basename using the vendored Illumina prefix"
+            " table (qiita_common.illumina); folder names from unsupported"
+            " families (HiSeq1500, HiSeq3000, NextSeq, NovaSeqXPlus) and"
+            " from PacBio fail-fast before any server round-trip. All three"
+            " server-side calls are find-or-create on their natural keys,"
+            " so a re-run after a partial failure converges on the existing"
+            " rows without operator cleanup."
+        ),
+    )
+    p_submit_bcl.add_argument(
+        "--bcl-input-dir",
+        type=Path,
+        required=True,
+        help=(
+            "Absolute path to the Illumina BCL run folder; the folder's"
+            " basename must match"
+            " <YYMMDD>_<InstrumentSerial>_<RunNum>_<FlowcellID> so the"
+            " parser can derive the instrument_run_id + instrument_model."
+            " This same path is passed through as action_context.bcl_input_dir"
+            " on the resulting work-ticket; the orchestrator binds its parent"
+            " directory into the bcl-convert container at submit time."
+        ),
+    )
+    p_submit_bcl.add_argument(
+        "--preflight-blob",
+        type=Path,
+        required=True,
+        help=(
+            "Path to the local kl-run-preflight SQLite file. The CLI reads"
+            " it (refuses empty), base64-encodes the bytes, and attaches the"
+            " blob to the sequenced-pool row; the file basename becomes"
+            " run_preflight_filename, which serves as the find-or-create key"
+            " for the pool POST."
+        ),
+    )
+    p_submit_bcl.add_argument(
+        "--prep-protocol-idx",
+        type=int,
+        required=True,
+        help=(
+            "Qiita prep_protocol_idx to FK every per-sample row to. Today"
+            " applied uniformly across the whole pool because the preflight"
+            " does not carry a Qiita prep_protocol identifier; a future"
+            " preflight column may let this flag come out of the file like"
+            " the per-row study_idx already does (project.qiita_id)."
+        ),
+    )
+    p_submit_bcl.set_defaults(handler=_handle_submit_bcl_convert)
+
     return parser
 
 
@@ -570,6 +641,131 @@ def _handle_ticket_status(args: argparse.Namespace, parser: argparse.ArgumentPar
     return _common.run_http_subcommand(
         lambda t: _get_work_ticket(args.base_url, t, args.work_ticket_idx)
     )
+
+
+def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Bundle the three POSTs the bcl-convert submission flow makes.
+
+    1. POST /sequencing-run — instrument_run_id, instrument_model, and
+       platform all derived from `--bcl-input-dir` via the shared
+       qiita_common.illumina parser. Fails fast on a folder name that
+       does not match Illumina convention or on a PacBio-prefixed
+       serial (the parser filters PacBio out at load time so the lookup
+       surfaces ``unknown instrument serial prefix``).
+    2. POST /sequencing-run/{run_idx}/sequenced-pool — attaches the
+       blob read from `--preflight-blob` (refuses empty), with the file
+       basename as ``run_preflight_filename``.
+    3. POST /work-ticket — target_kind sequenced_pool, the two idxs
+       from steps 1 and 2, action_id+version pinned at the top of this
+       module, action_context carrying the absolute bcl_input_dir.
+
+    All three calls share one PAT (one ``run_http_subcommand`` invocation,
+    one ``read_token``) so a partial-failure retry uses the same
+    credential. Find-or-create semantics on steps 1 and 2 mean a re-run
+    converges on the existing rows; the in-flight uniqueness index on
+    work_ticket means a stuck ticket surfaces as a 409 with the existing
+    ticket idx so the operator can pick recovery (wait or delete) before
+    re-submitting.
+
+    Reports per resource whether it was reused (200) or freshly minted
+    (201) so the operator can confirm the find-or-create branches the
+    submission landed on.
+    """
+    if not args.bcl_input_dir.is_absolute():
+        parser.error(f"--bcl-input-dir must be absolute, got {args.bcl_input_dir}")
+    if not args.bcl_input_dir.is_dir():
+        parser.error(
+            f"--bcl-input-dir {args.bcl_input_dir} is not a directory; the workflow"
+            " requires the on-disk Illumina BCL run folder"
+        )
+    if not args.preflight_blob.is_file():
+        parser.error(f"--preflight-blob {args.preflight_blob} is not a regular file")
+    blob_bytes = args.preflight_blob.read_bytes()
+    if not blob_bytes:
+        parser.error(f"--preflight-blob {args.preflight_blob} is empty")
+
+    folder_name = args.bcl_input_dir.name
+    try:
+        instrument_run_id = instrument_run_id_from_run_folder(folder_name)
+        instrument_model = instrument_model_from_run_folder(folder_name)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    # SequencingRunCreateRequest body. platform is fixed to illumina —
+    # the parser already filtered PacBio out at load time, so any folder
+    # name that produced an instrument_model is by definition Illumina.
+    run_body = SequencingRunCreateRequest(
+        instrument_run_id=instrument_run_id,
+        platform=Platform.ILLUMINA,
+        instrument_model=instrument_model,
+    ).model_dump(exclude_unset=True, mode="json")
+
+    # SequencedPoolCreateRequest. Pydantic's Base64Bytes validator decodes
+    # base64 on construction, so the encode here cancels with that decode
+    # and the on-wire form is the canonical base64 string.
+    pool_body = SequencedPoolCreateRequest(
+        run_preflight_blob=base64.b64encode(blob_bytes).decode("ascii"),
+        run_preflight_filename=args.preflight_blob.name,
+    ).model_dump(exclude_unset=True, mode="json")
+
+    def _run(token: str) -> dict:
+        run_resp, run_status = _common.call_with_status(
+            "POST",
+            args.base_url,
+            token,
+            "/sequencing-run",
+            json=run_body,
+        )
+        sequencing_run_idx = run_resp["sequencing_run_idx"]
+
+        pool_resp, pool_status = _common.call_with_status(
+            "POST",
+            args.base_url,
+            token,
+            f"/sequencing-run/{sequencing_run_idx}/sequenced-pool",
+            json=pool_body,
+        )
+        sequenced_pool_idx = pool_resp["sequenced_pool_idx"]
+
+        # WorkTicketCreateRequest. action_context carries the absolute
+        # bcl_input_dir as a string (Pydantic does not serialize Path
+        # objects via JSON by default, so the cast is explicit).
+        ticket_body = WorkTicketCreateRequest(
+            action_id=_BCL_CONVERT_ACTION_ID,
+            action_version=_BCL_CONVERT_ACTION_VERSION,
+            scope_target={
+                "kind": ScopeTargetKind.SEQUENCED_POOL.value,
+                "sequenced_pool_idx": sequenced_pool_idx,
+                "sequencing_run_idx": sequencing_run_idx,
+            },
+            action_context={"bcl_input_dir": str(args.bcl_input_dir)},
+        ).model_dump(exclude_unset=True, mode="json")
+        ticket_resp, _ticket_status = _common.call_with_status(
+            "POST",
+            args.base_url,
+            token,
+            PATH_WORK_TICKET_PREFIX,
+            json=ticket_body,
+        )
+
+        return {
+            "sequencing_run": {
+                "sequencing_run_idx": sequencing_run_idx,
+                "status": "created" if run_status == 201 else "reused",
+            },
+            "sequenced_pool": {
+                "sequenced_pool_idx": sequenced_pool_idx,
+                "status": "created" if pool_status == 201 else "reused",
+            },
+            "work_ticket": ticket_resp,
+            # Echo the args the orchestrator side will see so the
+            # operator can sanity-check before the workflow runs.
+            "instrument_run_id": instrument_run_id,
+            "instrument_model": instrument_model,
+            "prep_protocol_idx": args.prep_protocol_idx,
+        }
+
+    return _common.run_http_subcommand(_run)
 
 
 def _build_body(

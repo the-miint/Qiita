@@ -1480,3 +1480,332 @@ def test_https_to_non_localhost_allowed(monkeypatch):
 
     rc = main(["--base-url", "https://qiita.example.com", "whoami"])
     assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# submit-bcl-convert
+# ---------------------------------------------------------------------------
+# The bundled bcl-convert flow chains three POSTs in one CLI gesture, with
+# folder-name parsing in front of the network calls. Each test stubs httpx
+# with a multi-response queue so the three legs (sequencing-run,
+# sequenced-pool, work-ticket) can be sequenced independently — _stub_post
+# reuses one body across calls and is not enough here.
+
+
+def _stub_multi_response(monkeypatch, captured: dict, *, responses):
+    """Patch httpx.request to return canned ``(status, body)`` responses in
+    the order supplied. `captured['requests']` collects every call so a
+    test can pin per-leg URL + body + auth."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured.setdefault("requests", [])
+    queue = list(responses)
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        captured["requests"].append(
+            {
+                "method": method,
+                "url": url,
+                "auth": headers["Authorization"],
+                "json": json,
+            }
+        )
+        if not queue:
+            raise AssertionError(
+                f"submit-bcl-convert made an extra request beyond the stubbed responses: "
+                f"{method} {url}"
+            )
+        status, body = queue.pop(0)
+        return _httpx.Response(status, json=body, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+
+def _seed_bcl_folder(tmp_path: Path, name: str) -> Path:
+    folder = tmp_path / name
+    folder.mkdir()
+    return folder
+
+
+def _seed_preflight(tmp_path: Path, *, name: str = "preflight.db") -> Path:
+    blob = tmp_path / name
+    blob.write_bytes(b"\x00fake sqlite header\x01\x02\xff")
+    return blob
+
+
+def test_submit_bcl_convert_happy_path_chains_three_posts(monkeypatch, tmp_path, capsys):
+    """Three POSTs, all 201. Each leg uses the right URL + body, and the
+    summary the CLI prints reports created-vs-reused per resource plus the
+    derived instrument fields."""
+    import json as _json
+
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = _seed_preflight(tmp_path)
+
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (201, {"sequencing_run_idx": 12}),
+            (201, {"sequenced_pool_idx": 34}),
+            (
+                202,
+                {
+                    "work_ticket_idx": 56,
+                    "state": "pending",
+                    "action_id": "bcl-convert",
+                    "action_version": "1.0.0",
+                },
+            ),
+        ],
+    )
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "submit-bcl-convert",
+            "--bcl-input-dir",
+            str(folder),
+            "--preflight-blob",
+            str(blob),
+            "--prep-protocol-idx",
+            "7",
+        ]
+    )
+    assert rc == 0
+    requests = captured["requests"]
+    assert len(requests) == 3
+
+    # Leg 1: POST /sequencing-run carries the parsed run_id + model + platform.
+    assert requests[0]["method"] == "POST"
+    assert requests[0]["url"] == f"https://q.example.test{URL_SEQUENCING_RUN_PREFIX}"
+    assert requests[0]["json"] == {
+        "instrument_run_id": "230101_A00123_0001_BHXYZ",
+        "platform": "illumina",
+        "instrument_model": "Illumina NovaSeq 6000",
+    }
+
+    # Leg 2: POST /sequencing-run/{R}/sequenced-pool with the blob in
+    # base64. Pydantic re-encodes through Base64Bytes; assert on the
+    # decoded bytes round-trip rather than pinning the exact b64 string
+    # (canonical encoding is the same here but tests should remain robust
+    # to future Base64Bytes wire-format tweaks).
+    import base64 as _b64
+
+    assert requests[1]["method"] == "POST"
+    assert requests[1]["url"] == (
+        f"https://q.example.test{URL_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=12)}"
+    )
+    pool_body = requests[1]["json"]
+    assert pool_body["run_preflight_filename"] == "preflight.db"
+    assert _b64.b64decode(pool_body["run_preflight_blob"]) == blob.read_bytes()
+
+    # Leg 3: POST /work-ticket with target_kind sequenced_pool and both idxs.
+    assert requests[2]["method"] == "POST"
+    assert requests[2]["url"] == f"https://q.example.test{URL_WORK_TICKET_PREFIX}"
+    ticket_body = requests[2]["json"]
+    assert ticket_body["action_id"] == "bcl-convert"
+    assert ticket_body["action_version"] == "1.0.0"
+    assert ticket_body["scope_target"] == {
+        "kind": "sequenced_pool",
+        "sequenced_pool_idx": 34,
+        "sequencing_run_idx": 12,
+    }
+    assert ticket_body["action_context"] == {"bcl_input_dir": str(folder)}
+
+    # CLI summary echoes the three idxs and the resolved instrument fields.
+    summary = _json.loads(capsys.readouterr().out)
+    assert summary["sequencing_run"]["sequencing_run_idx"] == 12
+    assert summary["sequencing_run"]["status"] == "created"
+    assert summary["sequenced_pool"]["sequenced_pool_idx"] == 34
+    assert summary["sequenced_pool"]["status"] == "created"
+    assert summary["work_ticket"]["work_ticket_idx"] == 56
+    assert summary["instrument_run_id"] == "230101_A00123_0001_BHXYZ"
+    assert summary["instrument_model"] == "Illumina NovaSeq 6000"
+    assert summary["prep_protocol_idx"] == 7
+
+
+def test_submit_bcl_convert_reports_reused_when_run_post_returns_200(monkeypatch, tmp_path, capsys):
+    """A retry that hits an existing sequencing_run row returns 200 from
+    leg 1; the CLI summary surfaces `status: "reused"` so the operator can
+    confirm the find-or-create branch."""
+    import json as _json
+
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = _seed_preflight(tmp_path)
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, {"sequencing_run_idx": 12}),
+            (200, {"sequenced_pool_idx": 34}),
+            (202, {"work_ticket_idx": 56, "state": "pending"}),
+        ],
+    )
+
+    rc = main(
+        [
+            "submit-bcl-convert",
+            "--bcl-input-dir",
+            str(folder),
+            "--preflight-blob",
+            str(blob),
+            "--prep-protocol-idx",
+            "7",
+        ]
+    )
+    assert rc == 0
+    summary = _json.loads(capsys.readouterr().out)
+    assert summary["sequencing_run"]["status"] == "reused"
+    assert summary["sequenced_pool"]["status"] == "reused"
+
+
+def test_submit_bcl_convert_rejects_relative_bcl_input_dir(tmp_path, capsys):
+    """A relative --bcl-input-dir cannot be passed through to the
+    orchestrator's container bind logic safely; fail at argparse time
+    rather than letting the server return 422."""
+    from qiita_control_plane.cli.user import main
+
+    blob = _seed_preflight(tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                "relative/path",
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "must be absolute" in capsys.readouterr().err
+
+
+def test_submit_bcl_convert_rejects_missing_bcl_input_dir(tmp_path, capsys):
+    """A path that does not exist on disk cannot be the run folder."""
+    from qiita_control_plane.cli.user import main
+
+    blob = _seed_preflight(tmp_path)
+    bogus = tmp_path / "does-not-exist"
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                str(bogus),
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "is not a directory" in capsys.readouterr().err
+
+
+def test_submit_bcl_convert_rejects_empty_preflight_blob(tmp_path, capsys):
+    """A zero-byte preflight file cannot be a kl-run-preflight SQLite."""
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = tmp_path / "empty.db"
+    blob.write_bytes(b"")
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                str(folder),
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "is empty" in capsys.readouterr().err
+
+
+def test_submit_bcl_convert_rejects_unparseable_folder_name(tmp_path, capsys):
+    """Fewer than four underscore-separated segments fails before any
+    server round-trip with the parser's exact error message."""
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123")
+    blob = _seed_preflight(tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                str(folder),
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "Illumina convention" in capsys.readouterr().err
+
+
+def test_submit_bcl_convert_rejects_unknown_instrument_prefix(tmp_path, capsys):
+    """A serial that does not start with any known Illumina prefix
+    surfaces the parser's "unknown instrument serial prefix" error.
+    Same path catches PacBio folders, because the parser filters
+    PacBio out at table-load time."""
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_ZZZZZ999_0001_BHXYZ")
+    blob = _seed_preflight(tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                str(folder),
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "unknown instrument serial prefix" in capsys.readouterr().err
+
+
+def test_submit_bcl_convert_pacbio_folder_rejected_as_unknown_prefix(tmp_path, capsys):
+    """A PacBio Revio serial starts with lowercase r. The parser filters
+    PacBio out at load time so this surfaces as the same
+    "unknown prefix" error a malformed Illumina serial would — by design,
+    because bcl-convert is Illumina-only."""
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_r00012_0001_BHXYZ")
+    blob = _seed_preflight(tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                str(folder),
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "unknown instrument serial prefix" in capsys.readouterr().err

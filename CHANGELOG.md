@@ -8,6 +8,118 @@ Newest entry on top. Pre-deploy entries (PRs not yet merged to `main`) are allow
 
 ---
 
+## `feat/bcl-convert` — feat: bcl-convert workflow + bundled CLI + mint-route find-or-create
+
+The bcl-convert pipeline lands the demultiplex step against a
+sequenced_pool. Operator-visible changes the deploy needs before the
+first end-to-end submission can run:
+
+1. New required env var on the orchestrator side. Append to
+   `/etc/qiita/compute-orchestrator.env`:
+   ```bash
+   # [admin]
+   sudo tee -a /etc/qiita/compute-orchestrator.env <<'EOF'
+   QIITA_IMAGES_DIR=/scratch/persistent/images
+   EOF
+   ```
+   Set this to the shared-FS directory holding Apptainer SIFs the
+   bcl-convert (and future container-running) workflows consume. The
+   orchestrator validates the path at boot (absolute, exists, is a
+   directory) when `COMPUTE_BACKEND=slurm` — a missing value or a
+   non-directory path will refuse to start the systemd unit. The path
+   also has to be visible from every SLURM compute node.
+
+2. One-time bcl-convert RPM placement. The Illumina EULA forbids
+   committing the RPM to git, so the operator downloads it and drops
+   it into the SIF sources tier:
+   ```bash
+   # [operator]
+   sudo install -d -o qiita-orch -g qiita-pipeline -m 0750 \
+       "${QIITA_IMAGES_DIR}/sources"
+   sudo install -o qiita-orch -g qiita-pipeline -m 0640 \
+       bcl-convert-4.5.4-2.el8.x86_64.rpm \
+       "${QIITA_IMAGES_DIR}/sources/bcl-convert-4.5.4-2.el8.x86_64.rpm"
+   ```
+   Download URL (Illumina-gated): https://support.illumina.com/sequencing/sequencing_software/bcl-convert/downloads.html
+
+3. Build the Apptainer SIF. Idempotent; re-uses an existing SIF whose
+   embedded bcl-convert reports the expected version. Skip when
+   already-built.
+   ```bash
+   # [operator]
+   sudo -u qiita-orch bash -lc 'bash /home/qiita/qiita-miint/scripts/build-bcl-convert-sif.sh'
+   ```
+   Reads QIITA_IMAGES_DIR from the operator's env or systemd unit
+   environment. The resulting SIF lives at
+   `${QIITA_IMAGES_DIR}/bcl-convert-4.5.4.sif`.
+
+4. Grant the new SA scope to the compute-worker. The bcl-convert prep
+   step reads the pool's run-preflight blob via a new SA-only CP route
+   gated on `sequenced_pool:preflight:read`. Add it to the existing SA
+   grant; the admin CLI command:
+   ```bash
+   # [admin]
+   sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
+       qiita-admin service-account update --display-name compute-worker \
+           --add-scope sequenced_pool:preflight:read'
+   ```
+
+5. Run the deploy. `deploy/local-deploy.sh` rsyncs the new
+   `workflows/bcl-convert/` directory into `/opt/qiita/workflows/` and
+   runs `qiita-admin actions sync` which picks up the bcl-convert YAML.
+   ```bash
+   # [admin]
+   sudo QIITA_HOSTNAME=qiita-miint.ucsd.edu /home/qiita/qiita-miint/deploy/local-deploy.sh
+   ```
+
+6. Verify the workflow is registered:
+   ```bash
+   # [admin]
+   sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
+       psql "$DATABASE_URL" -c "SELECT action_id, version, enabled \
+                                FROM qiita.action WHERE action_id = '"'"'bcl-convert'"'"';"'
+   ```
+   Expect one row at version `1.0.0` with `enabled = true`.
+
+**Soft API-contract change in this PR.** The existing `POST
+/sequencing-run` and `POST /sequencing-run/{R}/sequenced-pool` routes
+return HTTP `200` on a same-key + matching-payload retry alongside the
+existing `201` on create and `409` on payload mismatch (with a
+structured `{conflicting_field, existing_value, supplied_value}`
+detail). A client that strictly required `201` from these routes
+should be updated to accept `200` as the same outcome.
+
+**Operator workflow** for the new flow:
+
+```bash
+# [operator]
+qiita submit-bcl-convert \
+    --bcl-input-dir /path/to/230101_A00123_0001_BHXYZ \
+    --preflight-blob /path/to/run-preflight.db \
+    --prep-protocol-idx <X>
+```
+
+The CLI derives `instrument_run_id`, `instrument_model`, and
+`platform` from the folder basename via the vendored kl-metapool
+prefix table; folder names from unsupported Illumina families
+(HiSeq1500, HiSeq3000, NextSeq, NovaSeqXPlus) and from PacBio fail-fast
+before any server round-trip. Find-or-create on the three POSTs means
+a re-run after a partial failure converges without operator cleanup.
+
+**Supported instruments today**: NovaSeq 6000 (`A`), NovaSeq X (`LH`),
+iSeq (`FS`). Other Illumina families parse but lack a baseline_resources
+profile and fail-fast at dispatch with `instrument 'X' has no resource
+profile`; adding a family means appending a new entry to the
+workflow YAML's `bcl_convert.baseline_resources.profiles` map. PacBio
+runs are out of scope (bcl-convert is Illumina-only).
+
+**Scratch sizing**: bcl-convert FASTQ output for a NovaSeq X 1.5B-read
+lane is ~3 TB uncompressed (~1.2 TB gzipped). Scale per-ticket scratch
+allocation accordingly; the orchestrator does not pre-allocate and a
+disk-full mid-run surfaces as a SLURM job failure.
+
+---
+
 ## `feat/post-first-smoke-fixes` — fix(deploy): close gaps surfaced by first user-CLI fastq-to-parquet smoke
 
 Bundled fixes from the first real end-to-end fastq-to-parquet run on
