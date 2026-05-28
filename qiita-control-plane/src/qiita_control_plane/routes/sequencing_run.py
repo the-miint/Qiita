@@ -27,6 +27,7 @@ sequenced_sample bulk-id read, and the single-sequenced-sample
 read/PATCH live in the sibling sequenced_sample route module.
 """
 
+import base64
 from typing import Annotated
 
 import asyncpg
@@ -207,7 +208,14 @@ async def get_sequenced_pool_preflight(
             status_code=404,
             detail=(f"sequenced_pool {sequenced_pool_idx} has no preflight populated"),
         )
+    # SequencedPoolPreflightResponse declares `run_preflight_blob` as
+    # Pydantic's `Base64Bytes`; the validator treats input bytes as already
+    # base64-encoded and decodes them on construction (the matching encoder
+    # produces base64 on serialise). The DB column holds the raw blob, so
+    # we base64-encode here before construction. Skipping this would either
+    # raise (when the blob contains non-base64 bytes) or silently corrupt
+    # the value (when the blob happens to look like valid base64).
     return SequencedPoolPreflightResponse(
-        run_preflight_blob=row["run_preflight_blob"],
+        run_preflight_blob=base64.b64encode(bytes(row["run_preflight_blob"])),
         run_preflight_filename=row["run_preflight_filename"],
     )

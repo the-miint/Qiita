@@ -1,12 +1,10 @@
--- migrate:up transaction:false
--- ALTER TYPE ... ADD VALUE cannot run inside a transaction on any Postgres
--- version. dbmate auto-wraps migrations in BEGIN/COMMIT by default; we opt
--- out via the transaction:false directive. This is the first non-atomic
--- migration in this repo. The non-atomicity is the cost; idempotency
--- helpers (IF NOT EXISTS, IF EXISTS) make re-runs safe even if a later
--- statement fails.
-
-ALTER TYPE qiita.scope_target_kind ADD VALUE IF NOT EXISTS 'sequenced_pool';
+-- migrate:up
+-- The 'sequenced_pool' ENUM value was added in the prior migration
+-- (20260528000000_scope_target_kind_add_sequenced_pool.sql); splitting the
+-- ADD VALUE off lets this migration reference the new value in a CHECK
+-- constraint without tripping Postgres's "unsafe use of new value of enum
+-- type" guard (SQLSTATE 55P04). With the ENUM value already committed,
+-- this file runs atomically under dbmate's default transactional wrapping.
 
 ALTER TABLE qiita.work_ticket
   ADD COLUMN IF NOT EXISTS sequenced_pool_idx BIGINT
@@ -52,7 +50,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS work_ticket_one_in_flight_per_sequenced_pool
     WHERE sequenced_pool_idx IS NOT NULL
       AND state IN ('pending', 'queued', 'processing');
 
--- migrate:down transaction:false
+-- migrate:down
 
 DROP INDEX IF EXISTS qiita.work_ticket_one_in_flight_per_sequenced_pool;
 DROP INDEX IF EXISTS qiita.work_ticket_sequenced_pool_idx;
@@ -77,6 +75,3 @@ ALTER TABLE qiita.work_ticket ADD CONSTRAINT work_ticket_scope_target_consistent
         AND reference_idx IS NULL)
 );
 ALTER TABLE qiita.work_ticket DROP COLUMN IF EXISTS sequenced_pool_idx;
--- A Postgres ENUM value cannot be removed without recreating the type.
--- 'sequenced_pool' stays in the ENUM after down; safe because no rows
--- with that scope_target_kind can exist (FK column has been dropped).
