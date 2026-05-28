@@ -13,6 +13,17 @@ dependencies = [
     # dev/test. SlurmBackend won't need it, but the orchestrator runs both
     # backends from the same image, so the dep stays.
     "duckdb>=1.5.2",
+    # bcl_convert_prep reads the vendored sequencer_types.yml at import
+    # time to derive the {machine_prefix: model_name} table; declare the
+    # YAML parser directly rather than relying on transitive resolution.
+    "pyyaml>=6.0",
+    # bcl_convert_prep imports `save_legacy_csv` from
+    # run_preflight.legacy.api at execute() time. SHA pin is REQUIRED
+    # before any deploy — see Plan D handoff notes. Leaving the entry
+    # commented so `uv sync` doesn't fail in environments where the
+    # upstream isn't yet reachable; bcl-convert won't run end-to-end
+    # until the next agent un-comments + pins:
+    #   "run-preflight @ git+https://github.com/the-miint/kl-run-preflight@<sha>",
 ]
 
 [dependency-groups]

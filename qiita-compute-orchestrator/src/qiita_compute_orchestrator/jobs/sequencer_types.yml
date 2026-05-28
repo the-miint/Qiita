@@ -1,0 +1,83 @@
+# Illumina + PacBio sequencer-type table consumed by the bcl-convert prep
+# step to map an instrument-serial prefix to the model_name string the
+# runner's A4 baseline_resources.profiles lookup uses.
+#
+# **Vendoring note — REPLACE WITH UPSTREAM SNAPSHOT BEFORE DEPLOY.**
+# Upstream source: biocore/kl-metapool, metapool/config/sequencer_types.yml.
+# Source SHA: <pin at vendor time>
+# Source URL: <pin at vendor time>
+#
+# kl-metapool is being deprecated; when the canonical source moves, re-vendor
+# from the new location and bump the SHA + URL comment above. Do NOT consume
+# kl-metapool as a Python dep — this is a one-time snapshot the prep step
+# parses at module import.
+#
+# The structure mirrors kl-metapool's exact YAML shape: top-level keys are
+# family names, each entry carries `machine_prefix` (the leading characters
+# of the instrument serial number; absent for families with no parseable
+# prefix) and `model_name` (the string the runner's profiles dict keys on).
+#
+# Coverage as of vendor date — 9 of 13 Illumina families parseable. The
+# four without machine_prefix (HiSeq1500, HiSeq3000, NextSeq, NovaSeqXPlus)
+# fail-fast at dispatch. Plan D explicitly defers their support to a
+# follow-up kl-metapool edit + re-vendor.
+
+HiSeq2500:
+  machine_prefix: D
+  model_name: "Illumina HiSeq 2500"
+
+HiSeq4000:
+  machine_prefix: K
+  model_name: "Illumina HiSeq 4000"
+
+iSeq:
+  machine_prefix: FS
+  model_name: "Illumina iSeq"
+
+MiniSeq:
+  machine_prefix: MN
+  model_name: "Illumina MiniSeq"
+
+MiSeq:
+  machine_prefix: M
+  model_name: "Illumina MiSeq"
+
+MiSeq_i100:
+  machine_prefix: SL
+  model_name: "Illumina MiSeq i100"
+
+MiSeq_i100_Plus:
+  machine_prefix: SH
+  model_name: "Illumina MiSeq i100 Plus"
+
+NovaSeq6000:
+  machine_prefix: A
+  model_name: "Illumina NovaSeq 6000"
+
+NovaSeqX:
+  machine_prefix: LH
+  model_name: "Illumina NovaSeq X"
+
+# Families without machine_prefix — preserved verbatim from upstream so
+# a future kl-metapool edit that adds the prefix can be re-vendored
+# cleanly. The prep step's _load_instrument_prefix_table filters these
+# out at load time.
+HiSeq1500:
+  model_name: "Illumina HiSeq 1500"
+
+HiSeq3000:
+  model_name: "Illumina HiSeq 3000"
+
+NextSeq:
+  model_name: "Illumina NextSeq"
+
+NovaSeqXPlus:
+  model_name: "Illumina NovaSeqXPlus"
+
+# PacBio Revio — preserved from upstream but not used by the bcl-convert
+# prep step (PacBio data does not go through bcl-convert). Listed here
+# only so a re-vendor that pulls the upstream YAML wholesale doesn't
+# drop it.
+Revio:
+  machine_prefix: r
+  model_name: "PacBio Revio"
