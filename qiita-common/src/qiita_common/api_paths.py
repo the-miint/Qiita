@@ -259,11 +259,15 @@ URL_STUDY_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_STUDY_BY_IDX}"
 PATH_SEQUENCING_RUN_PREFIX = "/sequencing-run"
 PATH_SEQUENCING_RUN_ROOT = ""  # POST against the prefix itself
 PATH_SEQUENCING_RUN_SEQUENCED_POOL = "/{sequencing_run_idx}/sequenced-pool"
+PATH_SEQUENCED_POOL_PREFLIGHT = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/preflight"
+)
 
 URL_SEQUENCING_RUN_PREFIX = f"{API_PREFIX}{PATH_SEQUENCING_RUN_PREFIX}"
 URL_SEQUENCING_RUN_SEQUENCED_POOL = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_SEQUENCED_POOL}"
 )
+URL_SEQUENCED_POOL_PREFLIGHT = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_PREFLIGHT}"
 
 
 # =============================================================================

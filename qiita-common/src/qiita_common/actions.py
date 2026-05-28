@@ -80,10 +80,14 @@ class Audience(BaseModel):
     human_roles: list[SystemRole] = Field(default_factory=list)
 
 
-class BaselineResources(BaseModel):
-    """Per-step resource declaration. At submit time the orchestrator
-    multiplies these by the originator's profile and clamps the result by
-    the action ceiling.
+class FlatBaselineResources(BaseModel):
+    """Flat resource declaration — cpu/mem_gb/walltime/gpu, all required.
+
+    Used as the value type in `BaselineResources.profiles` (one profile per
+    instrument family, picked at dispatch by the runner's A4 resolution
+    branch) and as the shape `ActionCeiling` carries (the ceiling is always
+    a single upper bound, regardless of which baseline-resource population
+    the step uses).
     """
 
     cpu: Annotated[int, Field(gt=0)]
@@ -99,10 +103,72 @@ class BaselineResources(BaseModel):
         return v
 
 
-class ActionCeiling(BaselineResources):
-    """Action-wide resource caps. Same shape as BaselineResources; the
-    distinct type makes call-site intent obvious — `step.baseline_resources`
-    is the per-step ask, `action.action_ceiling` is the action-wide hard cap.
+class BaselineResources(BaseModel):
+    """Per-step resource declaration. Two valid populations, never both:
+
+    * **Flat** (every existing workflow): declare ``cpu``, ``mem_gb``,
+      ``walltime`` (and optionally ``gpu``) directly. The runner uses
+      these values verbatim at dispatch.
+    * **Lookup** (introduced for bcl-convert): declare ``from_step_output``
+      (the name of an upstream step's output file) and ``profiles``
+      (a map from the file's stripped contents to a flat
+      ``FlatBaselineResources``). At dispatch the runner reads the file,
+      looks up the matching profile, and uses that as the resolved baseline.
+
+    The ``@model_validator`` enforces exactly-one-population. The runner
+    clamps the resolved values against the action ceiling.
+    """
+
+    # Flat path. gpu defaults to 0 (no GPU) for back-compat with the
+    # original BaselineResources shape — every existing YAML omits `gpu:`
+    # and expects 0. The exactly-one-population check only inspects
+    # cpu/mem_gb/walltime, so gpu=0 doesn't cause the lookup case to
+    # spuriously trigger the "mixed populations" error.
+    cpu: Annotated[int | None, Field(default=None, gt=0)] = None
+    mem_gb: Annotated[int | None, Field(default=None, gt=0)] = None
+    walltime: timedelta | None = None
+    gpu: Annotated[int, Field(default=0, ge=0)] = 0
+    # Lookup path
+    from_step_output: str | None = Field(default=None, min_length=1)
+    profiles: dict[str, FlatBaselineResources] | None = None
+
+    @field_validator("walltime")
+    @classmethod
+    def walltime_positive(cls, v: timedelta | None) -> timedelta | None:
+        if v is not None and v.total_seconds() <= 0:
+            raise ValueError("walltime must be positive")
+        return v
+
+    @model_validator(mode="after")
+    def _exactly_one_population(self) -> BaselineResources:
+        flat_set = self.cpu is not None or self.mem_gb is not None or self.walltime is not None
+        lookup_set = self.from_step_output is not None or self.profiles is not None
+        if flat_set and lookup_set:
+            raise ValueError(
+                "baseline_resources: cannot mix flat fields (cpu/mem_gb/walltime/gpu)"
+                " with lookup fields (from_step_output/profiles)"
+            )
+        if not flat_set and not lookup_set:
+            raise ValueError(
+                "baseline_resources: must populate either flat fields"
+                " (cpu/mem_gb/walltime) or lookup fields (from_step_output + profiles)"
+            )
+        if flat_set and (self.cpu is None or self.mem_gb is None or self.walltime is None):
+            raise ValueError("baseline_resources: flat shape requires cpu, mem_gb, and walltime")
+        if lookup_set and (self.from_step_output is None or self.profiles is None):
+            raise ValueError(
+                "baseline_resources: lookup shape requires both from_step_output and profiles"
+            )
+        if lookup_set and not self.profiles:
+            raise ValueError("baseline_resources: profiles must be non-empty")
+        return self
+
+
+class ActionCeiling(FlatBaselineResources):
+    """Action-wide resource caps. Always flat — a single upper bound the
+    runner clamps the resolved per-step values against, regardless of
+    whether the step's `baseline_resources` declares a flat or lookup
+    population.
     """
 
 

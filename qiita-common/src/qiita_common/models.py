@@ -985,6 +985,7 @@ class ScopeTargetKind(StrEnum):
     STUDY_PREP = "study_prep"
     REFERENCE = "reference"
     PREP_SAMPLE = "prep_sample"
+    SEQUENCED_POOL = "sequenced_pool"
 
 
 class ProcessingKind(StrEnum):
@@ -1089,13 +1090,29 @@ class PrepSampleScopeTarget(BaseModel):
     prep_sample_idx: Annotated[int, Field(gt=0)]
 
 
+class SequencedPoolScopeTarget(BaseModel):
+    """Work ticket targets one sequenced_pool (one (run, lane) pair) —
+    used for the bcl-convert workflow that demultiplexes the pool's BCL
+    run folder into per-biosample FASTQs.
+
+    Carries both the pool idx and its parent run idx. The denormalization
+    lets the SA-only preflight read route stay nested under sequencing-run
+    and lets the orchestrator's `SCOPE_SCALARS_BY_KIND` flow both scalars
+    into the prep step's `Inputs` without an extra DB lookup."""
+
+    kind: Literal[ScopeTargetKind.SEQUENCED_POOL]
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+
+
 # Discriminated union — Pydantic and OpenAPI dispatch on the `kind` field.
 # DB-side, the same shape is encoded as a tagged union of typed columns
 # (`scope_target_kind` plus the subset-relevant `study_idx` / `prep_idx` /
-# `reference_idx` / `prep_sample_idx`) guarded by a CHECK constraint;
-# the `kind` here is the discriminator that maps to that column.
+# `reference_idx` / `prep_sample_idx` / `sequenced_pool_idx`) guarded by a
+# CHECK constraint; the `kind` here is the discriminator that maps to that
+# column.
 ScopeTarget = Annotated[
-    StudyPrepScopeTarget | ReferenceScopeTarget | PrepSampleScopeTarget,
+    StudyPrepScopeTarget | ReferenceScopeTarget | PrepSampleScopeTarget | SequencedPoolScopeTarget,
     Field(discriminator="kind"),
 ]
 
@@ -1233,6 +1250,25 @@ class SequencedPoolCreateResponse(BaseModel):
     """Returned by POST /api/v1/sequencing-run/{idx}/sequenced-pool on success."""
 
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
+
+
+class SequencedPoolPreflightResponse(BaseModel):
+    """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool/{P}/preflight.
+
+    The SA-only read route the bcl-convert prep step calls to materialize
+    the sample sheet from the pool's run preflight blob. `Base64Bytes`
+    handles the wire-format base64 encoding of the BYTEA column; the
+    attribute is raw bytes after deserialization.
+
+    The route 404s if the pool has no preflight (both blob and filename
+    NULL on the pool row), so this response model treats both as
+    non-nullable.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_preflight_blob: Base64Bytes
+    run_preflight_filename: str = Field(min_length=1)
 
 
 class SequencedSampleCreateRequest(BaseModel):

@@ -234,6 +234,114 @@ def test_action_ceiling_uses_iso8601_walltime():
     assert a.action_ceiling.gpu == 1
 
 
+def test_baseline_resources_flat_shape_validates():
+    """The flat population — cpu/mem_gb/walltime/gpu — that every existing
+    workflow uses must keep validating cleanly."""
+    from qiita_common.actions import BaselineResources
+
+    br = BaselineResources(cpu=4, mem_gb=8, walltime=timedelta(hours=1))
+    assert br.cpu == 4
+    assert br.mem_gb == 8
+    assert br.walltime == timedelta(hours=1)
+    assert br.from_step_output is None
+    assert br.profiles is None
+
+
+def test_baseline_resources_lookup_shape_validates():
+    """The lookup population — from_step_output + profiles — used by the
+    bcl-convert workflow."""
+    from qiita_common.actions import BaselineResources, FlatBaselineResources
+
+    br = BaselineResources(
+        from_step_output="instrument_model",
+        profiles={
+            "Illumina NovaSeq 6000": FlatBaselineResources(
+                cpu=16, mem_gb=240, walltime=timedelta(hours=3)
+            ),
+            "Illumina iSeq": FlatBaselineResources(cpu=16, mem_gb=16, walltime=timedelta(hours=3)),
+        },
+    )
+    assert br.from_step_output == "instrument_model"
+    assert set(br.profiles) == {"Illumina NovaSeq 6000", "Illumina iSeq"}
+    assert br.cpu is None
+    assert br.mem_gb is None
+
+
+def test_baseline_resources_rejects_neither_population():
+    """An empty `baseline_resources: {}` block must fail fast."""
+    from qiita_common.actions import BaselineResources
+
+    with pytest.raises(ValidationError) as exc:
+        BaselineResources()
+    assert "must populate either flat fields" in str(exc.value)
+
+
+def test_baseline_resources_rejects_mixed_populations():
+    """A YAML that sets both flat and lookup fields is ambiguous."""
+    from qiita_common.actions import BaselineResources, FlatBaselineResources
+
+    with pytest.raises(ValidationError) as exc:
+        BaselineResources(
+            cpu=4,
+            mem_gb=8,
+            walltime=timedelta(hours=1),
+            from_step_output="instrument_model",
+            profiles={"X": FlatBaselineResources(cpu=2, mem_gb=4, walltime=timedelta(minutes=10))},
+        )
+    assert "cannot mix flat fields" in str(exc.value)
+
+
+def test_baseline_resources_flat_requires_all_three_required_fields():
+    """Setting just one or two flat fields is a partial population and rejects."""
+    from qiita_common.actions import BaselineResources
+
+    with pytest.raises(ValidationError) as exc:
+        BaselineResources(cpu=4)
+    assert "requires cpu, mem_gb, and walltime" in str(exc.value)
+
+
+def test_baseline_resources_lookup_requires_both_fields():
+    """from_step_output without profiles (or vice versa) is an incomplete lookup."""
+    from qiita_common.actions import BaselineResources
+
+    with pytest.raises(ValidationError) as exc:
+        BaselineResources(from_step_output="instrument_model")
+    assert "requires both from_step_output and profiles" in str(exc.value)
+
+
+def test_baseline_resources_lookup_rejects_empty_profiles():
+    """An empty profiles dict is a footgun — no key can possibly match."""
+    from qiita_common.actions import BaselineResources
+
+    with pytest.raises(ValidationError) as exc:
+        BaselineResources(from_step_output="instrument_model", profiles={})
+    assert "profiles must be non-empty" in str(exc.value)
+
+
+def test_baseline_resources_walltime_zero_rejected_via_direct_construction():
+    """Zero walltime is rejected by the field validator at the BaselineResources
+    level (the older test goes through ActionDefinition; this one exercises
+    the model directly to confirm the field-level guard fires before the
+    structural exactly-one-population check)."""
+    from qiita_common.actions import BaselineResources
+
+    with pytest.raises(ValidationError) as exc:
+        BaselineResources(cpu=4, mem_gb=8, walltime=timedelta(0))
+    assert "walltime must be positive" in str(exc.value)
+
+
+def test_action_ceiling_does_not_accept_lookup_fields():
+    """Ceilings are always flat — a single upper bound. Accepting lookup
+    fields on ActionCeiling would be semantically meaningless."""
+    from qiita_common.actions import ActionCeiling
+
+    with pytest.raises(ValidationError):
+        ActionCeiling(  # type: ignore[call-arg]
+            from_step_output="instrument_model",
+            profiles={},
+        )
+
+
 def test_status_fields_default_to_none():
     """success_status / failure_status / target_status are all optional —
     a workflow that doesn't track a resource lifecycle leaves them unset

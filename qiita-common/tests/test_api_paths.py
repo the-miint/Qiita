@@ -104,6 +104,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_SEQUENCING_RUN_PREFIX",
         "PATH_SEQUENCING_RUN_SEQUENCED_POOL",
     ),
+    (
+        "URL_SEQUENCED_POOL_PREFLIGHT",
+        "PATH_SEQUENCING_RUN_PREFIX",
+        "PATH_SEQUENCED_POOL_PREFLIGHT",
+    ),
     # /biosample — three routes; two re-anchor on /study, one on /biosample
     ("URL_BIOSAMPLE_BY_STUDY", "PATH_STUDY_PREFIX", "PATH_BIOSAMPLE_BY_STUDY"),
     (
