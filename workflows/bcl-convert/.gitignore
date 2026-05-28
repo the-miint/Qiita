@@ -1,0 +1,11 @@
+# Illumina bcl-convert is distributed under an EULA that prohibits
+# redistribution; the RPM cannot live in this repo. The operator
+# downloads it from Illumina and drops it into
+# ${QIITA_IMAGES_DIR}/sources/ — see CHANGELOG.md for the deploy recipe.
+*.rpm
+
+# Apptainer SIF artifacts are built locally / on the deploy host via
+# scripts/build-bcl-convert-sif.sh and live in ${QIITA_IMAGES_DIR}.
+# Anything that ends up next to Apptainer.def is a leftover from a
+# local build and should not be committed.
+*.sif
