@@ -75,6 +75,24 @@ Native job modules export exactly two symbols — `class Inputs(BaseModel)` (typ
 
 The wire validator enforces shape only (exactly-one). The module-prefix invariant (`qiita_compute_orchestrator.jobs.`) is enforced separately at sync, submit, boot scan, and dispatcher — [`docs/architecture.md`](docs/architecture.md) carries the per-site breakdown.
 
+### Container image tier
+
+Container steps declare a bare SIF filename in `container:` (e.g. `bcl-convert-4.5.4.sif`). The orchestrator joins this against `Settings.qiita_images_dir` (`QIITA_IMAGES_DIR` env var, required when `COMPUTE_BACKEND=slurm`) to resolve the absolute SIF path. Registry-URL forms with `://` pass through; anything else with a path separator → `CONTRACT_VIOLATION`.
+
+After editing a workflow YAML or its container artifacts (`workflows/<workflow>/Apptainer.def`, `entrypoint.sh`, or the shared `workflows/_shared/manifest_writer.py`):
+
+These steps run on the **Linux deploy host** — they need `apptainer` (to build the SIF) and `systemd` (to restart the services), so they don't apply on a macOS dev box (mirrors `make test-workflows`, which skips gracefully off Linux). On macOS, edit the artifacts and run the unit tests; the SIF rebuild + restart happen at deploy time on the host.
+
+```bash
+# Rebuild the SIF (idempotent — skips when the existing SIF already reports the target version).
+bash scripts/build-<workflow>-sif.sh
+make deploy
+sudo systemctl restart qiita-control-plane qiita-compute-orchestrator
+make verify-health
+```
+
+Container input bind mounts are computed by `SlurmBackend._resolve_input_binds` (file → parent dir, directory → itself, deduped by resolved path). This means a step's YAML-declared `inputs:` paths must be absolute when they originate from `action_context` and must be visible from the compute node — bind mounts only expose host paths, they do not copy.
+
 ## Naming conventions
 
 **DB tables, REST resource segments, scope strings, OpenAPI tags, and the source files that own them are always singular**, never plural — `reference` not `references`, `auth_event` not `auth_events`, `/user` not `/users`, `reference:read` not `references:read`, `routes/reference.py` not `routes/references.py`, `tests/test_user.py` not `tests/test_users.py`. This applies to junction tables (`user_identity`, not `user_identities`); use `_to_` for many-to-many junctions when both sides need to be named (e.g. `biosample_to_study`). Column names follow the same rule unless the column genuinely holds a list/array.

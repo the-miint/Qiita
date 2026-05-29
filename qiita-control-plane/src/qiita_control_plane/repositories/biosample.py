@@ -224,6 +224,37 @@ async def fetch_biosample_idxs_for_study(
     return [r["biosample_idx"] for r in rows]
 
 
+async def fetch_biosample_idxs_by_accession(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    accessions: list[str],
+) -> dict[str, int]:
+    """Return `{biosample_accession: biosample_idx}` for every accession in
+    `accessions` that resolves to a non-retired qiita.biosample row.
+
+    Accessions absent from the table or carried only by retired rows are
+    omitted from the returned map; the route layer surfaces them as the
+    `missing` list. Used by the bulk-lookup endpoint that the bundled
+    qiita submit-bcl-convert flow calls to translate preflight
+    biosample_accession values into the biosample_idx the
+    sequenced-sample composer requires.
+    """
+    if not accessions:
+        return {}
+    # ANY($1::text[]) keeps the query parameter-bound (asyncpg encodes
+    # the Python list as a PG array literal) so SQL injection is not a
+    # concern and the planner can use the existing accession unique-or-
+    # btree index. retired = false filters at the row level; a future
+    # retired-retrieval surface for admins can read this function via a
+    # caller-side decorated branch rather than threading a parameter.
+    rows = await pool_or_conn.fetch(
+        "SELECT idx, biosample_accession FROM qiita.biosample"
+        " WHERE biosample_accession = ANY($1::text[])"
+        "   AND retired = false",
+        accessions,
+    )
+    return {r["biosample_accession"]: r["idx"] for r in rows}
+
+
 @dataclass(frozen=True)
 class BiosampleImportResult:
     """Result of importing one biosample with its owner-id field.

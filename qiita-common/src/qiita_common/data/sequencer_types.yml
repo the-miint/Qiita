@@ -1,0 +1,157 @@
+# Illumina + PacBio sequencer-type table consumed by the bcl-convert prep
+# step to map an instrument-serial prefix to the model_name string the
+# runner's A4 baseline_resources.profiles lookup uses.
+#
+# One-time snapshot of biocore/kl-metapool's metapool/config/sequencer_types.yml.
+# Source SHA: 87991af25cf5a2ab433c3dc03e03f77e6a68d7dd
+# Source URL: https://github.com/biocore/kl-metapool/blob/87991af25cf5a2ab433c3dc03e03f77e6a68d7dd/metapool/config/sequencer_types.yml
+#
+# kl-metapool is being deprecated; when the canonical source moves, re-vendor
+# from the new location and bump the SHA + URL comment above. Do NOT consume
+# kl-metapool as a Python dep — this is a one-time snapshot the prep step
+# parses at module import.
+#
+# Structure mirrors the upstream YAML verbatim: top-level keys are family
+# names; each entry carries `model_name` (the string the runner's profiles
+# dict keys on) and optionally `machine_prefix` (the leading characters of
+# the instrument serial number; absent for families with no parseable
+# prefix). The other upstream fields (revcomp_samplesheet_i5_index,
+# profile_name, platform, sequencing_method, delete_settings) are preserved
+# verbatim so a future re-vendor diff is clean — `_load_instrument_prefix_table`
+# in bcl_convert_prep.py only consumes (machine_prefix, model_name) and
+# filters out PacBio (no Illumina BCL data goes through this prep step).
+#
+# Coverage as of vendor date — 9 of 13 Illumina families parseable. The
+# four without machine_prefix (HiSeq1500, HiSeq3000, NextSeq, NovaSeqXPlus)
+# fail-fast at dispatch. Plan D explicitly defers their support to a
+# follow-up kl-metapool edit + re-vendor.
+
+# NB: any sampler without a revcomp_samplesheet_i5_index key will not be
+# available to users when making illumina sample sheets, because we don't know what that
+# value should be, and it's better to error than to silently do the wrong thing
+HiSeq1500:
+    model_name: 'Illumina HiSeq 1500'
+    revcomp_samplesheet_i5_index: false
+    platform: "Illumina"
+    sequencing_method: "sequencing by synthesis"
+HiSeq2500:
+    model_name: 'Illumina HiSeq 2500'
+    revcomp_samplesheet_i5_index: false
+    machine_prefix: 'D'
+    profile_name: 'HiSeq 2500'
+    platform: "Illumina"
+    sequencing_method: "sequencing by synthesis"
+HiSeq3000:
+    model_name: 'Illumina HiSeq 3000'
+    revcomp_samplesheet_i5_index: true
+    platform: "Illumina"
+    sequencing_method: "sequencing by synthesis"
+HiSeq4000:
+    model_name: 'Illumina HiSeq 4000'
+    revcomp_samplesheet_i5_index: true
+    machine_prefix: 'K'
+    profile_name: 'HiSeq 4000'
+    platform: "Illumina"
+    sequencing_method: "sequencing by synthesis"
+iSeq:
+    model_name: 'Illumina iSeq'
+    revcomp_samplesheet_i5_index: true
+    machine_prefix: 'FS'
+    delete_settings:
+        - "MaskShortReads"
+        - "OverrideCycles"
+    profile_name: 'iSeq'
+    platform: "Illumina"
+    sequencing_method: "sequencing by synthesis"
+MiniSeq:
+    model_name: 'Illumina MiniSeq'
+    # Per the Illumina Knowledge Base's "Guidelines for reverse complementing
+    # i5 sequences for demultiplexing",
+    # https://knowledge.illumina.com/software/general/software-general-reference_material-list/000001800
+    # MiniSeq Rapid Kit always use forward orientation, so if we were to use
+    # those, we would need to modify this value.
+    revcomp_samplesheet_i5_index: true
+    machine_prefix: 'MN'
+    profile_name: 'MiniSeq'
+    platform: "Illumina"
+    sequencing_method: "sequencing by synthesis"
+MiSeq:
+    model_name: 'Illumina MiSeq'
+    revcomp_samplesheet_i5_index: false
+    machine_prefix: 'M'
+    profile_name: 'MiSeq'
+    platform: "Illumina"
+    sequencing_method: "sequencing by synthesis"
+MiSeqi100:
+    model_name: 'Illumina MiSeq i100'
+    machine_prefix: 'SL'
+    # Per the Illumina Knowledge Base's "Guidelines for reverse complementing
+    # i5 sequences for demultiplexing",
+    # https://knowledge.illumina.com/software/general/software-general-reference_material-list/000001800
+    # no revcomping of i5 index sequences is required for MiSeq i100 series *IF* we
+    # are using standalone BCL convert.  If we ever change how we are doing
+    # FASTQ generation, we may need to change this.
+    revcomp_samplesheet_i5_index: false
+    profile_name: 'MiSeq i100'
+    platform: "Illumina"
+    sequencing_method: "sequencing by synthesis"
+MiSeqi100Plus:
+    model_name: 'Illumina MiSeq i100 Plus'
+    machine_prefix: 'SH'
+    # Per the Illumina Knowledge Base's "Guidelines for reverse complementing
+    # i5 sequences for demultiplexing",
+    # https://knowledge.illumina.com/software/general/software-general-reference_material-list/000001800
+    # no revcomping of i5 index sequences is required for MiSeq i100 series
+    # (which I am going to anticipate includes the i100 Plus, since it is not listed
+    # separately in the documentation, unlike the NovaSeqX/X Plus) *IF* we
+    # are using standalone BCL convert.  If we ever change how we are doing
+    # FASTQ generation, we may need to change this.
+    revcomp_samplesheet_i5_index: false
+    profile_name: 'MiSeq i100 Plus'
+    platform: "Illumina"
+    sequencing_method: "sequencing by synthesis"
+NextSeq:
+    model_name: 'Illumina NextSeq 500/550'
+    revcomp_samplesheet_i5_index: true
+    platform: "Illumina"
+    sequencing_method: "sequencing by synthesis"
+NovaSeq6000:
+    model_name: 'Illumina NovaSeq 6000'
+    revcomp_samplesheet_i5_index: true
+    machine_prefix: 'A'
+    profile_name: 'NovaSeq 6000'
+    platform: "Illumina"
+    sequencing_method: "sequencing by synthesis"
+NovaSeqX:
+    model_name: 'Illumina NovaSeq X'
+    # Per the Illumina Knowledge Base's "Guidelines for reverse complementing
+    # i5 sequences for demultiplexing",
+    # https://knowledge.illumina.com/software/general/software-general-reference_material-list/000001800
+    # NovaSeqX/XPlus do not require reverse complementing of i5 index sequences
+    # *for standalone BCL convert*.  They *do* require it for standalone
+    # bcl2fastq or BSSH FASTQ generation, so if we ever change how we are doing
+    # FASTQ generation, we may need to change this.
+    revcomp_samplesheet_i5_index: false
+    machine_prefix: 'LH'
+    profile_name: 'NovaSeq X'
+    platform: "Illumina"
+    sequencing_method: "sequencing by synthesis"
+NovaSeqXPlus:
+    model_name: 'Illumina NovaSeq X Plus'
+    # See above comment for NovaSeqX re: revcomp_samplesheet_i5_index
+    revcomp_samplesheet_i5_index: false
+    platform: "Illumina"
+    sequencing_method: "sequencing by synthesis"
+# NB: InstrumentUtils class in qp-klp used to define
+# an 'SN': 'RapidRun' machine prefix, but as of 20250703,
+# we don't seem to have any data with that prefix.  The
+# qp-klp comments say RapidRun was HiSeq 2500 (?) which is
+# confusing, so not adding it here until/unless we need it.
+Revio:
+    model_name: 'Revio'
+    machine_prefix: 'r'
+    profile_name: 'Revio'
+    # NB: *no* revcomp_samplesheet_i5_index entry because that isn't
+    # relevant to this technology
+    platform: "PacBio_SMRT"
+    sequencing_method: "single molecule real-time (SMRT) long read sequencing"

@@ -27,7 +27,13 @@ from pathlib import Path
 from typing import Any
 
 import asyncpg
-from qiita_common.actions import ActionDefinition, WorkflowAction, WorkflowStep
+from qiita_common.actions import (
+    ActionCeiling,
+    ActionDefinition,
+    FlatBaselineResources,
+    WorkflowAction,
+    WorkflowStep,
+)
 from qiita_common.api_paths import LibraryPrimitive, compute_upload_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.compute_backend_client import ComputeBackendClient
@@ -148,6 +154,7 @@ async def run_workflow(
                 work_ticket_idx=work_ticket_idx,
                 index=index,
                 entry=entry,
+                action_ceiling=action.action_ceiling,
                 bound=bound,
                 workspace=workspace,
                 scope_target=scope_target,
@@ -255,6 +262,7 @@ async def _run_entry_with_retry(
     work_ticket_idx: int,
     index: int,
     entry: WorkflowStep | WorkflowAction,
+    action_ceiling: ActionCeiling,
     bound: dict[str, Any],
     workspace: Path,
     scope_target: dict[str, Any],
@@ -304,6 +312,7 @@ async def _run_entry_with_retry(
                     attempt_workspace,
                     scope_target,
                     work_ticket_idx=work_ticket_idx,
+                    action_ceiling=action_ceiling,
                 )
             if isinstance(entry, WorkflowAction):
                 return await _dispatch_action(
@@ -354,10 +363,18 @@ async def _run_entry_with_retry(
 # =============================================================================
 
 
+# LEFT JOIN qiita.sequenced_pool so the SEQUENCED_POOL scope_target arm
+# can carry the parent sequencing_run_idx — _build_scope_target reads it
+# alongside sequenced_pool_idx to produce the {kind: sequenced_pool, ...}
+# dict the orchestrator's SCOPE_SCALARS_BY_KIND injection consumes.
 _WORK_TICKET_COLS = (
-    "work_ticket_idx, action_id, action_version, originator_principal_idx, "
-    "scope_target_kind, study_idx, prep_idx, reference_idx, prep_sample_idx, "
-    "action_context, state, retry_count, max_retries"
+    "wt.work_ticket_idx, wt.action_id, wt.action_version, wt.originator_principal_idx, "
+    "wt.scope_target_kind, wt.study_idx, wt.prep_idx, wt.reference_idx, "
+    "wt.prep_sample_idx, wt.sequenced_pool_idx, sp.sequencing_run_idx, "
+    "wt.action_context, wt.state, wt.retry_count, wt.max_retries"
+)
+_WORK_TICKET_FROM = (
+    " FROM qiita.work_ticket wt LEFT JOIN qiita.sequenced_pool sp ON sp.idx = wt.sequenced_pool_idx"
 )
 
 _ACTION_COLS = (
@@ -370,7 +387,7 @@ _ACTION_COLS = (
 
 async def _fetch_work_ticket(pool: asyncpg.Pool, work_ticket_idx: int) -> dict[str, Any]:
     row = await pool.fetchrow(
-        f"SELECT {_WORK_TICKET_COLS} FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        f"SELECT {_WORK_TICKET_COLS}{_WORK_TICKET_FROM} WHERE wt.work_ticket_idx = $1",
         work_ticket_idx,
     )
     if row is None:
@@ -738,6 +755,12 @@ def _build_scope_target(work_ticket: dict[str, Any]) -> dict[str, Any]:
             "kind": ScopeTargetKind.PREP_SAMPLE.value,
             "prep_sample_idx": work_ticket["prep_sample_idx"],
         }
+    if kind == ScopeTargetKind.SEQUENCED_POOL.value:
+        return {
+            "kind": ScopeTargetKind.SEQUENCED_POOL.value,
+            "sequenced_pool_idx": work_ticket["sequenced_pool_idx"],
+            "sequencing_run_idx": work_ticket["sequencing_run_idx"],
+        }
     raise RuntimeError(f"unknown scope_target_kind: {kind!r}")
 
 
@@ -758,6 +781,142 @@ async def _patch_resource_status(
     )
 
 
+def _resolve_baseline_for_step(
+    *,
+    entry: WorkflowStep,
+    bound: dict[str, Any],
+    action_ceiling: ActionCeiling,
+) -> FlatBaselineResources:
+    """Resolve a step's ``baseline_resources`` to a concrete
+    ``FlatBaselineResources`` and clamp against ``action_ceiling``.
+
+    Two paths, picked by which population the YAML declared:
+
+    * Flat: cpu/mem_gb/walltime/gpu are taken verbatim from the YAML.
+    * Lookup: ``from_step_output`` names an upstream step's output file
+      already bound under that name; the file's stripped UTF-8 contents
+      are the key; ``profiles[key]`` gives the resolved resources.
+
+    Both populations end in a ``FlatBaselineResources`` that gets
+    validated against the action's ceiling. Any non-conformance —
+    missing lookup file, key not in profiles, resolved value exceeds
+    ceiling — raises ``BackendFailure(CONTRACT_VIOLATION, STEP_RUN)``
+    naming the step.
+    """
+    br = entry.baseline_resources
+    if br.from_step_output is not None:
+        # Lookup population. `from_step_output` is the name of an upstream
+        # step's output. The runner records every step's outputs into
+        # `bound` under their YAML-declared names, so the path is just a
+        # bound-key lookup. `profiles` is guaranteed non-empty by
+        # BaselineResources's model_validator.
+        lookup_path = bound.get(br.from_step_output)
+        if lookup_path is None:
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=entry.name,
+                reason=(
+                    f"baseline_resources.from_step_output={br.from_step_output!r}"
+                    " is not bound — no upstream step produced an output by that name"
+                ),
+            )
+        try:
+            key = Path(lookup_path).read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=entry.name,
+                reason=(
+                    f"baseline_resources lookup: failed to read {lookup_path}:"
+                    f" {type(exc).__name__}: {exc}"
+                ),
+            )
+        # profiles is guaranteed non-None and non-empty by the
+        # BaselineResources model_validator.
+        assert br.profiles is not None
+        if key not in br.profiles:
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=entry.name,
+                reason=(
+                    f"baseline_resources lookup: instrument {key!r} has no"
+                    f" resource profile; known profiles: {sorted(br.profiles)}"
+                ),
+            )
+        resolved = br.profiles[key]
+    else:
+        # Flat population. model_validator guarantees all three required
+        # fields are populated; the asserts narrow the Optional types
+        # without runtime cost on the happy path.
+        assert br.cpu is not None
+        assert br.mem_gb is not None
+        assert br.walltime is not None
+        resolved = FlatBaselineResources(
+            cpu=br.cpu, mem_gb=br.mem_gb, walltime=br.walltime, gpu=br.gpu
+        )
+
+    _assert_within_ceiling(entry=entry, resolved=resolved, action_ceiling=action_ceiling)
+    return resolved
+
+
+def _assert_within_ceiling(
+    *,
+    entry: WorkflowStep,
+    resolved: FlatBaselineResources,
+    action_ceiling: ActionCeiling,
+) -> None:
+    """Reject a resolved baseline that exceeds any ceiling axis.
+
+    Ceiling is always flat (a single upper bound), so the comparison is
+    field-by-field. gpu is treated symmetrically: a step that resolves
+    to gpu>0 against a ceiling of gpu=0 is rejected. Reasons name the
+    offending axis so a YAML author can fix it without reading code.
+    """
+    if resolved.cpu > action_ceiling.cpu:
+        raise BackendFailure(
+            kind=FailureKind.CONTRACT_VIOLATION,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name=entry.name,
+            reason=(
+                f"resolved baseline cpu={resolved.cpu} exceeds"
+                f" action_ceiling.cpu={action_ceiling.cpu}"
+            ),
+        )
+    if resolved.mem_gb > action_ceiling.mem_gb:
+        raise BackendFailure(
+            kind=FailureKind.CONTRACT_VIOLATION,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name=entry.name,
+            reason=(
+                f"resolved baseline mem_gb={resolved.mem_gb} exceeds"
+                f" action_ceiling.mem_gb={action_ceiling.mem_gb}"
+            ),
+        )
+    if resolved.walltime > action_ceiling.walltime:
+        raise BackendFailure(
+            kind=FailureKind.CONTRACT_VIOLATION,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name=entry.name,
+            reason=(
+                f"resolved baseline walltime={resolved.walltime} exceeds"
+                f" action_ceiling.walltime={action_ceiling.walltime}"
+            ),
+        )
+    if resolved.gpu > action_ceiling.gpu:
+        raise BackendFailure(
+            kind=FailureKind.CONTRACT_VIOLATION,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name=entry.name,
+            reason=(
+                f"resolved baseline gpu={resolved.gpu} exceeds"
+                f" action_ceiling.gpu={action_ceiling.gpu}"
+            ),
+        )
+
+
 async def _dispatch_step(
     backend_client: ComputeBackendClient,
     entry: WorkflowStep,
@@ -766,6 +925,7 @@ async def _dispatch_step(
     scope_target: dict[str, Any],
     *,
     work_ticket_idx: int,
+    action_ceiling: ActionCeiling,
 ) -> dict[str, Any]:
     """Translate the YAML-declared input names into Path arguments and
     call the orchestrator's /step/run endpoint; record outputs under the
@@ -773,7 +933,13 @@ async def _dispatch_step(
 
     `optional_inputs` flow through if present in the binding map; missing
     ones are simply omitted from the dispatch payload (the backend's
-    step handler decides what to do without them)."""
+    step handler decides what to do without them).
+
+    `action_ceiling` clamps the resolved baseline resources. The lookup
+    population (`baseline_resources.from_step_output`) reads an upstream
+    step's named output file at dispatch and selects the matching profile
+    from the YAML's `profiles` dict; the flat population uses the YAML's
+    direct values."""
     inputs = {name: Path(bound[name]) for name in entry.inputs}
     inputs.update({name: Path(bound[name]) for name in entry.optional_inputs if name in bound})
     # Pass the full scope_target through; the backend's native-step
@@ -784,11 +950,16 @@ async def _dispatch_step(
     # Forward static step metadata so the orchestrator's backend can run
     # the right container with the right resource ask. SlurmBackend
     # requires these; LocalBackend ignores them.
+    resolved = _resolve_baseline_for_step(
+        entry=entry,
+        bound=bound,
+        action_ceiling=action_ceiling,
+    )
     baseline = StepBaselineResources(
-        cpu=entry.baseline_resources.cpu,
-        mem_gb=entry.baseline_resources.mem_gb,
-        walltime_seconds=int(entry.baseline_resources.walltime.total_seconds()),
-        gpu=entry.baseline_resources.gpu,
+        cpu=resolved.cpu,
+        mem_gb=resolved.mem_gb,
+        walltime_seconds=int(resolved.walltime.total_seconds()),
+        gpu=resolved.gpu,
     )
     raw_outputs = await backend_client.run_step(
         step_name=entry.name,

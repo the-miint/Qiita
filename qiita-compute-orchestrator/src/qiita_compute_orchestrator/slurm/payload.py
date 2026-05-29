@@ -123,6 +123,7 @@ def build_job_submit_payload(
     partition: str,
     account: str,
     extra_env: dict[str, str] | None = None,
+    extra_bind_dirs: list[Path] | None = None,
     native_python: str = "python",
     qos: str = "",
 ) -> dict[str, Any]:
@@ -221,12 +222,18 @@ def build_job_submit_payload(
     else:
         # Container: bind mounts let apptainer see input_path /
         # output_path under the same names from inside the container.
+        # `extra_bind_dirs` exposes additional host directories the step
+        # needs to read — typically the parent dirs of YAML-declared
+        # `inputs:` paths so the entrypoint can `jq` a host path out of
+        # params.json and apptainer can resolve it.
         apptainer_args = [
             "--bind",
             f"{input_path}:{input_path}",
             "--bind",
             f"{output_path}:{output_path}",
         ]
+        for bind_dir in extra_bind_dirs or ():
+            apptainer_args.extend(("--bind", f"{bind_dir}:{bind_dir}"))
         script = _build_script(
             container=container,
             entrypoint=entrypoint,

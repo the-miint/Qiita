@@ -28,6 +28,7 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BY_IDX,
     PATH_BIOSAMPLE_BY_STUDY,
     PATH_BIOSAMPLE_LIST_BY_STUDY,
+    PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     PATH_BIOSAMPLE_PREFIX,
     PATH_STUDY_PREFIX,
 )
@@ -35,6 +36,8 @@ from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
     BiosampleImportRequest,
     BiosampleImportResponse,
+    BiosampleLookupByAccessionRequest,
+    BiosampleLookupByAccessionResponse,
     BiosamplePatchRequest,
     BiosampleResponse,
     GlobalMetadataEntry,
@@ -64,6 +67,7 @@ from ..repositories._sample_helpers import (
 )
 from ..repositories.biosample import (
     fetch_biosample,
+    fetch_biosample_idxs_by_accession,
     fetch_biosample_idxs_for_study,
     fetch_caller_has_biosample_access,
     import_biosample_from_owner_biosample_id,
@@ -416,6 +420,53 @@ async def get_biosample(
         global_metadata=global_metadata,
         caller_system_role=user.system_role,
     )
+
+
+@biosample_router.post(PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION)
+async def lookup_biosample_by_accession(
+    body: BiosampleLookupByAccessionRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
+) -> BiosampleLookupByAccessionResponse:
+    """Resolve a list of biosample_accession values to biosample_idx.
+
+    POST (not GET) because a typical bcl-convert pool carries up to 384
+    accessions; threaded through query-params that would exceed nginx's
+    default 8 KB request-line cap. Body has no such cap.
+
+    Auth: HumanUser with Scope.BIOSAMPLE_READ. No per-row access predicate
+    runs — the response carries only the (accession, idx) mapping with no
+    biosample columns, so a caller who sees the idx still cannot read the
+    row without satisfying GET /biosample/{idx}'s tier+access checks.
+    This keeps the bcl-convert flow from needing wet_lab_admin+ for a
+    pool whose samples span studies the caller isn't a member of.
+
+    Retired biosamples are excluded from `resolved` (and therefore listed
+    in `missing`) because the find-or-create chain the CLI uses afterwards
+    would refuse to FK a fresh prep_sample to a retired biosample.
+
+    Input deduplication: accessions appearing twice in the request are
+    deduped before the SQL fetch; `missing` echoes back the input-order
+    deduped list of accessions that did not resolve.
+    """
+    # Dedup while preserving input order so `missing` is deterministic
+    # for the operator's error message.
+    dedup_ordered: list[str] = []
+    seen: set[str] = set()
+    for accession in body.accessions:
+        if accession in seen:
+            continue
+        seen.add(accession)
+        dedup_ordered.append(accession)
+
+    # Single round trip resolves every supplied accession. _user is read
+    # only to keep the dependency chain explicit — no per-caller filter
+    # runs here (see auth docstring).
+    _ = user
+    resolved = await fetch_biosample_idxs_by_accession(pool, dedup_ordered)
+    missing = [a for a in dedup_ordered if a not in resolved]
+    return BiosampleLookupByAccessionResponse(resolved=resolved, missing=missing)
 
 
 # Substring of the asyncpg.RaiseError message thrown by the role-typed FK
