@@ -2,12 +2,21 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
+      # Vendored third-party docs assets (Swagger UI / ReDoc) are kept
+      # byte-for-byte upstream — see docs/api-docs.md. They are minified
+      # (whitespace fixers would corrupt them) and large by nature (the
+      # 500 KB cap exists to catch accidental blobs, not deliberate
+      # vendored bundles), so they are exempt from these three hooks.
+      # landing.css / landing.js in the same dir are NOT exempt.
       - id: trailing-whitespace
+        exclude: &vendored_docs_assets ^qiita-control-plane/src/qiita_control_plane/static/(swagger-ui-bundle\.js|swagger-ui\.css|redoc\.standalone\.js)$
       - id: end-of-file-fixer
+        exclude: *vendored_docs_assets
       - id: check-yaml
       - id: check-toml
       - id: check-merge-conflict
       - id: check-added-large-files
+        exclude: *vendored_docs_assets
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.0
