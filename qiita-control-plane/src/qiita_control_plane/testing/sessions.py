@@ -36,6 +36,7 @@ COMPUTE_WORKER_FIXTURE_SCOPES: frozenset[Scope] = frozenset(
         Scope.REFERENCE_READ,
         Scope.TICKET_DOGET,
         Scope.SEQUENCE_RANGE_MINT,
+        Scope.SEQUENCED_POOL_PREFLIGHT_READ,
     }
 )
 

@@ -623,12 +623,14 @@ source = { directory = "../qiita-common" }
 dependencies = [
     { name = "httpx" },
     { name = "pydantic", extra = ["email"] },
+    { name = "pyyaml" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "pydantic", extras = ["email"], specifier = ">=2.12" },
+    { name = "pyyaml", specifier = ">=6.0" },
 ]
 
 [package.metadata.requires-dev]

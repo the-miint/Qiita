@@ -406,6 +406,58 @@ async def user_audience_prep_sample_action(postgres_pool):
 
 
 @pytest.fixture
+async def sequenced_pool_for_wt(postgres_pool, admin_token):
+    """A bare sequencing_run + sequenced_pool owned by the admin
+    principal — the scope_target the bcl-convert-shaped submission tests
+    aim at. No sequenced_sample subtype is attached; the work_ticket's
+    scope target is the pool itself. Returns
+    `(sequencing_run_idx, sequenced_pool_idx)`.
+
+    Teardown is FK-reverse: drop dependent work_tickets, then the pool,
+    then the run."""
+    _, admin_idx = admin_token
+    run_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.sequencing_run (instrument_run_id, platform, created_by_idx)"
+        " VALUES ($1, 'illumina'::qiita.platform, $2) RETURNING idx",
+        f"wt-pool-run-{uuid.uuid4()}",
+        admin_idx,
+    )
+    pool_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.sequenced_pool (sequencing_run_idx, created_by_idx)"
+        " VALUES ($1, $2) RETURNING idx",
+        run_idx,
+        admin_idx,
+    )
+    yield run_idx, pool_idx
+    await postgres_pool.execute(
+        "DELETE FROM qiita.work_ticket WHERE sequenced_pool_idx = $1", pool_idx
+    )
+    await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
+    await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
+
+
+@pytest.fixture
+async def sequenced_pool_action(postgres_pool):
+    """An enabled, sequenced_pool-targeting action — the bcl-convert
+    shape. Empty scopes (bcl-convert declares `scopes: []`) and a
+    context_schema requiring an absolute `bcl_input_dir`, mirroring
+    workflows/bcl-convert/1.0.0.yaml. Default audience ([system_admin])
+    matches the admin_token fixture."""
+    action_id, version = await _seed_action(
+        postgres_pool,
+        context_schema={
+            "type": "object",
+            "required": ["bcl_input_dir"],
+            "properties": {"bcl_input_dir": {"type": "string", "pattern": "^/"}},
+        },
+        target_kind="sequenced_pool",
+        scopes=[],
+    )
+    yield action_id, version
+    await _drop_action(postgres_pool, action_id, version)
+
+
+@pytest.fixture
 async def prep_sample_with_study_link(postgres_pool, prep_sample_idx, admin_token):
     """The shared sequenced prep_sample plus a non-retired
     `prep_sample_to_study` link against a freshly-seeded study owned by
@@ -903,6 +955,124 @@ async def test_submit_unique_index_catches_select_race(
 
     second = await wt_client.post(URL_WORK_TICKET_PREFIX, json=body, headers=headers)
     assert second.status_code == 409
+    assert "in flight" in second.json()["detail"]["reason"]
+
+
+def _sequenced_pool_body(action_id, version, pool_idx, run_idx, **overrides):
+    base = {
+        "action_id": action_id,
+        "action_version": version,
+        "scope_target": {
+            "kind": "sequenced_pool",
+            "sequenced_pool_idx": pool_idx,
+            "sequencing_run_idx": run_idx,
+        },
+        "action_context": {"bcl_input_dir": "/data/runs/240101_M00001_0001_000000000-ABCDE"},
+    }
+    base.update(overrides)
+    return base
+
+
+async def test_submit_sequenced_pool_scope_round_trips_both_idxs(
+    wt_client, postgres_pool, admin_token, sequenced_pool_action, sequenced_pool_for_wt
+):
+    """A sequenced_pool-scoped submission (the bcl-convert shape) persists
+    sequenced_pool_idx with every other scope arm NULL, and a GET round-
+    trips the full scope_target — including the parent sequencing_run_idx,
+    which the table does not store on the work_ticket row but the GET route
+    reconstructs via the LEFT JOIN onto sequenced_pool."""
+    token, _ = admin_token
+    action_id, version = sequenced_pool_action
+    run_idx, pool_idx = sequenced_pool_for_wt
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json=_sequenced_pool_body(action_id, version, pool_idx, run_idx),
+        headers=headers,
+    )
+    assert resp.status_code == 202, resp.text
+    idx = resp.json()["work_ticket_idx"]
+    wt_client._created_tickets.append(idx)
+
+    # Persisted row: sequenced_pool_idx set, every other scope arm NULL
+    # (per the work_ticket_scope_target_consistent CHECK).
+    row = await postgres_pool.fetchrow(
+        "SELECT scope_target_kind, study_idx, prep_idx, reference_idx,"
+        "       prep_sample_idx, sequenced_pool_idx, state"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        idx,
+    )
+    assert row["scope_target_kind"] == "sequenced_pool"
+    assert row["sequenced_pool_idx"] == pool_idx
+    assert row["study_idx"] is None
+    assert row["prep_idx"] is None
+    assert row["reference_idx"] is None
+    assert row["prep_sample_idx"] is None
+    assert row["state"] == WorkTicketState.PENDING.value
+
+    # GET round-trips both idxs — run_idx comes back via the JOIN, not a
+    # stored work_ticket column.
+    got = await wt_client.get(URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=idx), headers=headers)
+    assert got.status_code == 200, got.text
+    assert got.json()["scope_target"] == {
+        "kind": "sequenced_pool",
+        "sequenced_pool_idx": pool_idx,
+        "sequencing_run_idx": run_idx,
+    }
+
+
+async def test_submit_sequenced_pool_disallow_without_delete(
+    wt_client, admin_token, sequenced_pool_action, sequenced_pool_for_wt
+):
+    """A second sequenced_pool submission against the same (action, pool)
+    while the first is non-terminal must 409 via the SELECT-side
+    disallow-without-delete check, naming the blocking ticket idx."""
+    token, _ = admin_token
+    action_id, version = sequenced_pool_action
+    run_idx, pool_idx = sequenced_pool_for_wt
+    headers = {"Authorization": f"Bearer {token}"}
+    body = _sequenced_pool_body(action_id, version, pool_idx, run_idx)
+
+    first = await wt_client.post(URL_WORK_TICKET_PREFIX, json=body, headers=headers)
+    assert first.status_code == 202, first.text
+    first_idx = first.json()["work_ticket_idx"]
+    wt_client._created_tickets.append(first_idx)
+
+    second = await wt_client.post(URL_WORK_TICKET_PREFIX, json=body, headers=headers)
+    assert second.status_code == 409, second.text
+    detail = second.json()["detail"]
+    assert detail["blocking_work_ticket_idx"] == first_idx
+
+
+async def test_submit_sequenced_pool_unique_index_catches_select_race(
+    wt_client, admin_token, sequenced_pool_action, sequenced_pool_for_wt, monkeypatch
+):
+    """The atomic gate for a sequenced_pool double-submit is the partial
+    unique index `work_ticket_one_in_flight_per_sequenced_pool`. Short-
+    circuit the SELECT-side check so both submissions reach INSERT; the
+    second must trip the constraint and surface as the same 409 the
+    SELECT path returns."""
+    token, _ = admin_token
+    action_id, version = sequenced_pool_action
+    run_idx, pool_idx = sequenced_pool_for_wt
+    headers = {"Authorization": f"Bearer {token}"}
+    body = _sequenced_pool_body(action_id, version, pool_idx, run_idx)
+
+    first = await wt_client.post(URL_WORK_TICKET_PREFIX, json=body, headers=headers)
+    assert first.status_code == 202, first.text
+    wt_client._created_tickets.append(first.json()["work_ticket_idx"])
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "qiita_control_plane.routes.work_ticket._check_disallow_without_delete",
+        _noop,
+    )
+
+    second = await wt_client.post(URL_WORK_TICKET_PREFIX, json=body, headers=headers)
+    assert second.status_code == 409, second.text
     assert "in flight" in second.json()["detail"]["reason"]
 
 

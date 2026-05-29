@@ -171,7 +171,7 @@ async def test_run_step_rejects_both_container_and_module(jwt_path, baseline, tm
             tmp_path,
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
-            container="qiita/hash:1.0.0",
+            container="docker://qiita/hash:1.0.0",
             module=FASTQ_TO_PARQUET_MODULE,
             entrypoint=None,
             baseline_resources=baseline,
@@ -191,7 +191,7 @@ async def test_run_step_requires_baseline_resources(jwt_path, tmp_path):
             tmp_path,
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
-            container="qiita/hash:1.0.0",
+            container="docker://qiita/hash:1.0.0",
             entrypoint=None,
             baseline_resources=None,
         )
@@ -200,12 +200,13 @@ async def test_run_step_requires_baseline_resources(jwt_path, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_run_step_container_rejects_non_reference_scope(jwt_path, baseline, tmp_path):
+async def test_run_step_container_rejects_unsupported_scope(jwt_path, baseline, tmp_path):
     """Mirror of LocalBackend's container-path scope gate (S4):
-    SlurmBackend container steps assume reference_idx is on the
-    scope_target. A prep_sample-scoped or study_prep-scoped ticket
-    dispatched to a container step would silently produce wrong
-    params.json; the gate 422s at submit time instead."""
+    SlurmBackend container steps are gated on a closed set of supported
+    scope kinds (today: reference + sequenced_pool). A prep_sample-scoped
+    or study_prep-scoped ticket dispatched to a container step would
+    silently produce wrong params.json; the gate 422s at submit time
+    instead."""
     handler = httpx.MockTransport(lambda req: httpx.Response(500))
     backend = _make_backend(handler, jwt_path)
     with pytest.raises(BackendFailure) as ei:
@@ -215,12 +216,14 @@ async def test_run_step_container_rejects_non_reference_scope(jwt_path, baseline
             tmp_path,
             scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
             work_ticket_idx=99,
-            container="qiita/hash:1.0.0",
+            container="docker://qiita/hash:1.0.0",
             entrypoint=None,
             baseline_resources=baseline,
         )
     assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
-    assert "requires a reference-scoped ticket" in ei.value.reason
+    assert "requires a scope_target with kind in" in ei.value.reason
+    assert "reference" in ei.value.reason
+    assert "sequenced_pool" in ei.value.reason
     assert "prep_sample" in ei.value.reason
 
 
@@ -273,7 +276,7 @@ async def test_run_step_completed_returns_outputs(jwt_path, baseline, tmp_path):
         tmp_path,
         scope_target={"kind": "reference", "reference_idx": 42},
         work_ticket_idx=99,
-        container="qiita/hash:1.0.0",
+        container="docker://qiita/hash:1.0.0",
         entrypoint="/usr/local/bin/hash",
         baseline_resources=baseline,
     )
@@ -385,7 +388,7 @@ async def test_run_step_writes_params_json(jwt_path, baseline, tmp_path):
         tmp_path,
         scope_target={"kind": "reference", "reference_idx": 42},
         work_ticket_idx=99,
-        container="qiita/hash:1.0.0",
+        container="docker://qiita/hash:1.0.0",
         entrypoint=None,
         baseline_resources=baseline,
     )
@@ -430,7 +433,7 @@ async def test_run_step_terminal_states_map_to_kinds(
             tmp_path,
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
-            container="qiita/hash:1.0.0",
+            container="docker://qiita/hash:1.0.0",
             entrypoint=None,
             baseline_resources=baseline,
         )
@@ -526,7 +529,7 @@ async def test_run_step_falls_back_to_state_based_kind_when_no_launcher_line(
             tmp_path,
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
-            container="qiita/hash:1.0.0",
+            container="docker://qiita/hash:1.0.0",
             entrypoint=None,
             baseline_resources=baseline,
         )
@@ -563,7 +566,7 @@ async def test_run_step_completed_but_missing_manifest_is_contract_violation(
             tmp_path,
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
-            container="qiita/hash:1.0.0",
+            container="docker://qiita/hash:1.0.0",
             entrypoint=None,
             baseline_resources=baseline,
         )
@@ -589,7 +592,7 @@ async def test_run_step_submit_5xx_is_unreachable(jwt_path, baseline, tmp_path):
             tmp_path,
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
-            container="qiita/hash:1.0.0",
+            container="docker://qiita/hash:1.0.0",
             entrypoint=None,
             baseline_resources=baseline,
         )
@@ -610,7 +613,7 @@ async def test_run_step_submit_4xx_is_contract_violation(jwt_path, baseline, tmp
             tmp_path,
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
-            container="qiita/hash:1.0.0",
+            container="docker://qiita/hash:1.0.0",
             entrypoint=None,
             baseline_resources=baseline,
         )
@@ -633,7 +636,7 @@ async def test_run_step_submit_persistent_401_is_unreachable(jwt_path, baseline,
             tmp_path,
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
-            container="qiita/hash:1.0.0",
+            container="docker://qiita/hash:1.0.0",
             entrypoint=None,
             baseline_resources=baseline,
         )
@@ -656,7 +659,7 @@ async def test_run_step_submit_transport_error_is_unreachable(jwt_path, baseline
             tmp_path,
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
-            container="qiita/hash:1.0.0",
+            container="docker://qiita/hash:1.0.0",
             entrypoint=None,
             baseline_resources=baseline,
         )
@@ -684,7 +687,7 @@ async def test_run_step_polling_4xx_bails_permanent(jwt_path, baseline, tmp_path
             tmp_path,
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=99,
-            container="qiita/hash:1.0.0",
+            container="docker://qiita/hash:1.0.0",
             entrypoint=None,
             baseline_resources=baseline,
         )

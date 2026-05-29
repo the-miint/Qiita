@@ -36,31 +36,41 @@ from qiita_common.models import (
     WorkTicketFailureStage,
 )
 
+_CONTAINER_SUPPORTED_SCOPES: frozenset[str] = frozenset(
+    {ScopeTargetKind.REFERENCE.value, ScopeTargetKind.SEQUENCED_POOL.value}
+)
+
 
 def assert_container_scope_supported(*, step_name: str, scope_target: dict[str, Any]) -> None:
-    """Reject a container step whose work_ticket isn't reference-scoped.
+    """Reject a container step whose work_ticket's scope_target isn't one
+    the backends know how to dispatch.
 
-    Container steps today (reference-add: hash, load) are all wired
-    against `reference_idx`. Submitting one against a study_prep or
-    prep_sample ticket is a workflow-authoring error, not a data
-    error — surface it as CONTRACT_VIOLATION so the runner doesn't
-    quietly fall through to a downstream path that would extract the
-    wrong scalar. Shared between LocalBackend and SlurmBackend so the
-    two implementations cannot drift in either the predicate or the
-    error wording.
+    Container steps today are referenced by two scope_target.kinds:
 
-    Raises BackendFailure(CONTRACT_VIOLATION) when the scope is not
-    REFERENCE. Returns None otherwise; callers consume
-    `scope_target["reference_idx"]` directly after the guard.
+      * REFERENCE — every reference-add container step (hash, load).
+      * SEQUENCED_POOL — the bcl-convert workflow's container step.
+
+    Submitting a container step against any other kind is a
+    workflow-authoring error, not a data error — surface it as
+    CONTRACT_VIOLATION so the runner doesn't quietly fall through to a
+    downstream path that would extract the wrong scalar. Shared between
+    LocalBackend and SlurmBackend so the two implementations cannot
+    drift in either the predicate or the error wording.
+
+    Raises BackendFailure(CONTRACT_VIOLATION) on an unsupported kind.
+    Returns None otherwise; callers consume the kind-appropriate
+    scalars from `scope_target` directly after the guard.
     """
-    if scope_target.get("kind") != ScopeTargetKind.REFERENCE.value:
+    kind = scope_target.get("kind")
+    if kind not in _CONTAINER_SUPPORTED_SCOPES:
         raise BackendFailure(
             kind=FailureKind.CONTRACT_VIOLATION,
             stage=WorkTicketFailureStage.STEP_RUN,
             step_name=step_name,
             reason=(
-                f"container step {step_name!r} requires a reference-scoped ticket; "
-                f"got scope_target.kind={scope_target.get('kind')!r}"
+                f"container step {step_name!r} requires a scope_target with kind in"
+                f" {sorted(_CONTAINER_SUPPORTED_SCOPES)};"
+                f" got scope_target.kind={kind!r}"
             ),
         )
 

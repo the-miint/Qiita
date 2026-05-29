@@ -371,38 +371,40 @@ def test_step_run_dispatches_study_prep_scope_target(http_client, cp_to_co_token
     }
 
 
-def test_step_run_serializes_container_on_non_reference_guard(
+def test_step_run_serializes_container_on_unsupported_scope_guard(
     http_client, cp_to_co_token, tmp_path
 ):
-    """End-to-end at the HTTP boundary: a container step with a
-    non-reference scope_target must surface as the backend's
-    CONTRACT_VIOLATION BackendFailure, serialized through the route into
-    the wire shape the runner consumes. Stub backend mirrors the guard
-    in LocalBackend.run_step / SlurmBackend.run_step so we don't need to
-    spin up either real backend (LocalBackend triggers miint install,
-    SlurmBackend needs slurmrestd config); the round-trip we care about
-    is the wire serialization of the guard's BackendFailure."""
+    """End-to-end at the HTTP boundary: a container step whose
+    scope_target.kind is not one the backends can dispatch must surface
+    as a CONTRACT_VIOLATION BackendFailure, serialized through the route
+    into the wire shape the runner consumes.
+
+    The stub backend calls the REAL shared guard
+    (`assert_container_scope_supported`, the same function LocalBackend
+    and SlurmBackend invoke) rather than reimplementing its predicate or
+    error string — so this test tracks the guard if the supported-kind
+    set or wording changes, instead of asserting a copy that can silently
+    rot. We still stub at the `run_step` boundary so we don't spin up
+    either real backend (LocalBackend triggers miint install, SlurmBackend
+    needs slurmrestd config); the round-trip we care about is the wire
+    serialization of the guard's BackendFailure.
+
+    `prep_sample` is the rejected kind here: the guard supports `reference`
+    and `sequenced_pool` (bcl-convert), so a prep_sample-scoped container
+    step is the contract violation."""
     from qiita_common.backend_failure import (
         BACKEND_FAILURE_HEADER,
         BACKEND_FAILURE_HTTP_STATUS,
-        BackendFailure,
-        FailureKind,
     )
-    from qiita_common.models import WorkTicketFailureStage
+
+    from qiita_compute_orchestrator.backend import assert_container_scope_supported
 
     client, backend = http_client
 
     async def _container_guard(name, inputs, workspace, *, scope_target, container=None, **_):
-        if container is not None and scope_target.get("kind") != "reference":
-            raise BackendFailure(
-                kind=FailureKind.CONTRACT_VIOLATION,
-                stage=WorkTicketFailureStage.STEP_RUN,
-                step_name=name,
-                reason=(
-                    f"container step {name!r} requires a reference-scoped "
-                    f"ticket; got scope_target.kind={scope_target.get('kind')!r}"
-                ),
-            )
+        # Mirror the backends: the guard only applies to container steps.
+        if container is not None:
+            assert_container_scope_supported(step_name=name, scope_target=scope_target)
         return {}
 
     backend.run_step = _container_guard  # type: ignore[method-assign]
@@ -425,7 +427,8 @@ def test_step_run_serializes_container_on_non_reference_guard(
     assert body["kind"] == "contract_violation"
     assert body["stage"] == "step_run"
     assert body["step_name"] == "hash"
-    assert "reference-scoped ticket" in body["reason"]
+    # Assert against the real guard's current wording, not a stale copy.
+    assert "scope_target with kind in" in body["reason"]
     assert "prep_sample" in body["reason"]
 
 

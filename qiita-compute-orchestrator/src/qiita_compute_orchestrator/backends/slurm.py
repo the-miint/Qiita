@@ -87,6 +87,7 @@ class SlurmBackend(ComputeBackend):
         co_to_cp_token: str = "",
         cp_url: str = "",
         qos: str = "",
+        qiita_images_dir: Path | None = None,
     ) -> None:
         self._client = client
         self._partition = partition
@@ -94,6 +95,13 @@ class SlurmBackend(ComputeBackend):
         self._poll_interval = poll_interval_seconds
         self._job_timeout = job_timeout_seconds
         self._native_python = native_python
+        # Shared-FS root where built SIFs live. When set, bare `container:`
+        # filenames in workflow YAML resolve as `qiita_images_dir / filename`
+        # at submit time. When None, container steps are rejected — see
+        # _resolve_container_image. Production deploys with COMPUTE_BACKEND=
+        # slurm fail-fast at Settings.from_env() if QIITA_IMAGES_DIR is
+        # missing or invalid.
+        self._qiita_images_dir = qiita_images_dir
         # CO→CP token + CP URL are propagated into the SLURM job env so
         # the native-step launcher running on a compute node can resolve
         # Settings.from_env() without reading /etc/qiita/*.token (which
@@ -118,6 +126,97 @@ class SlurmBackend(ComputeBackend):
         """Close the underlying httpx client so asyncio doesn't warn
         about an unclosed transport on shutdown."""
         await self._client.close()
+
+    def _resolve_container_image(self, container: str, *, step_name: str) -> str:
+        """Translate a YAML `container:` value into an apptainer-runnable
+        argument.
+
+        Three accepted shapes:
+
+        * Registry URL (contains ``://``) — passed through verbatim
+          (e.g. ``oras://`` / ``docker://``). Escape hatch for the rare
+          case a workflow doesn't ship a bundled SIF.
+        * Bare SIF filename (no path separators) — joined with
+          ``self._qiita_images_dir`` to produce an absolute path.
+        * Anything else — rejected as CONTRACT_VIOLATION. A path
+          separator inside a non-URL value indicates the YAML author
+          tried to override the deploy-time image tier, which we don't
+          allow (production wants every SIF under the shared
+          ``QIITA_IMAGES_DIR``).
+
+        The fail-fast pair: ``Settings.from_env()`` catches missing /
+        invalid ``QIITA_IMAGES_DIR`` at boot; this submit-time check
+        catches malformed ``container:`` strings.
+        """
+        if "://" in container:
+            return container
+        if Path(container).is_absolute() or "/" in container:
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=step_name,
+                reason=(
+                    f"container value {container!r} must be either a bare SIF"
+                    " filename (no path separators) or a registry URL containing"
+                    " '://'; the deploy-time QIITA_IMAGES_DIR supplies the path"
+                ),
+            )
+        if self._qiita_images_dir is None:
+            raise BackendFailure(
+                kind=FailureKind.CONTRACT_VIOLATION,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=step_name,
+                reason=(
+                    f"container step {step_name!r} requires QIITA_IMAGES_DIR"
+                    " to be configured on the orchestrator (bare SIF filenames"
+                    " resolve against it); not set"
+                ),
+            )
+        return str(self._qiita_images_dir / container)
+
+    def _resolve_input_binds(self, inputs: dict[str, Path], *, step_name: str) -> list[Path]:
+        """Compute the additional ``--bind`` directories a container step
+        needs so apptainer can resolve each YAML-declared input path.
+
+        For each input path:
+          * If it's a directory, bind the directory itself.
+          * If it's a file, bind its parent directory (apptainer's
+            ``--bind`` is directory-granular).
+
+        Paths are resolved to absolute form (``Path.resolve()``) and
+        deduplicated, so two inputs that share a parent emit one bind.
+        Relative paths are rejected at submit time as
+        CONTRACT_VIOLATION — the runner has already resolved every input
+        to an absolute host path via ``bound``, so a relative path here
+        indicates a programming error upstream of submit.
+
+        Path existence is NOT checked here: the orchestrator's filesystem
+        view can legitimately differ from the compute nodes' (NFS that
+        mounts only on compute, for example). A truly missing path will
+        fail loudly inside apptainer when ``--bind`` evaluates against a
+        non-existent host directory; the runner attributes that to
+        STEP_RUN with the apptainer error in the SLURM stderr.
+        """
+        bind_dirs: set[Path] = set()
+        for input_name, path in inputs.items():
+            if not path.is_absolute():
+                raise BackendFailure(
+                    kind=FailureKind.CONTRACT_VIOLATION,
+                    stage=WorkTicketFailureStage.STEP_RUN,
+                    step_name=step_name,
+                    reason=(
+                        f"container input {input_name!r} must be an absolute"
+                        f" host path; got {path!r}"
+                    ),
+                )
+            # Don't resolve symlinks (Path.resolve() does) — we want to
+            # bind the path as the workflow author wrote it. is_dir() is
+            # safe on non-existent paths (returns False), which lets the
+            # CONTRACT_VIOLATION check above stay as the only existence-
+            # related guard.
+            bind_dirs.add(path if path.is_dir() else path.parent)
+        # Sorted output makes payload tests deterministic.
+        return sorted(bind_dirs)
 
     async def run_step(
         self,
@@ -164,6 +263,7 @@ class SlurmBackend(ComputeBackend):
         # predicate and the error wording.
         if container is not None:
             assert_container_scope_supported(step_name=name, scope_target=scope_target)
+            container = self._resolve_container_image(container, step_name=name)
 
         # Lay out the workspace tree the container reads/writes:
         #   <workspace>/input/   contains params.json (mounted as $QIITA_INPUT_PATH)
@@ -222,6 +322,14 @@ class SlurmBackend(ComputeBackend):
         if self._cp_url:
             extra_env["QIITA_CP_URL"] = self._cp_url
 
+        # For container steps, expose the parent directory of every
+        # YAML-declared input path so the entrypoint can read it via
+        # apptainer's host-mounted view. Native steps don't need extra
+        # binds — the launcher runs outside any container.
+        extra_bind_dirs: list[Path] | None = None
+        if container is not None:
+            extra_bind_dirs = self._resolve_input_binds(inputs, step_name=name)
+
         payload = build_job_submit_payload(
             step_name=name,
             work_ticket_idx=work_ticket_idx,
@@ -238,6 +346,7 @@ class SlurmBackend(ComputeBackend):
             account=self._account,
             native_python=self._native_python,
             extra_env=extra_env or None,
+            extra_bind_dirs=extra_bind_dirs,
             qos=self._qos,
         )
 

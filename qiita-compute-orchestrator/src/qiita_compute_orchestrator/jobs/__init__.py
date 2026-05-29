@@ -55,6 +55,7 @@ SCOPE_SCALARS_BY_KIND: dict[str, frozenset[str]] = {
     ScopeTargetKind.REFERENCE.value: frozenset({"reference_idx"}),
     ScopeTargetKind.STUDY_PREP.value: frozenset({"study_idx", "prep_idx"}),
     ScopeTargetKind.PREP_SAMPLE.value: frozenset({"prep_sample_idx"}),
+    ScopeTargetKind.SEQUENCED_POOL.value: frozenset({"sequenced_pool_idx", "sequencing_run_idx"}),
 }
 
 # Framework scalars that get merged into raw_inputs before
