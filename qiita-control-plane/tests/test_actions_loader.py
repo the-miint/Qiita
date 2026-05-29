@@ -166,6 +166,90 @@ def test_load_actions_loads_on_disk_reference_add_yaml():
     assert ref_add.context_schema["required"] == ["fasta_upload_idx"]
 
 
+def test_load_actions_loads_on_disk_bcl_convert_yaml():
+    """The actual on-disk `workflows/bcl-convert/1.0.0.yaml` loads as a
+    valid ActionDefinition: target_kind is sequenced_pool; the
+    bcl_convert_prep step is a module pointing at
+    qiita_compute_orchestrator.jobs.bcl_convert_prep; the bcl_convert
+    step is a container with the SIF filename Settings.qiita_images_dir
+    resolves against; baseline_resources for bcl_convert uses the lookup
+    population (from_step_output + profiles with the three supported
+    Illumina families); and action_ceiling matches the largest profile.
+
+    Locks the YAML shape so the runner's A4 resolution branch (the
+    lookup vs flat split in qiita_control_plane.runner._dispatch_step)
+    is exercised end-to-end the first time sync drops bcl-convert into
+    qiita.action.
+    """
+    from datetime import timedelta
+    from pathlib import Path
+
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    actions = load_actions(repo_root / "workflows")
+    by_id = {a.action_id: a for a in actions}
+    assert "bcl-convert" in by_id, "workflows/bcl-convert/1.0.0.yaml must load"
+    bcl = by_id["bcl-convert"]
+
+    assert bcl.target_kind == ScopeTargetKind.SEQUENCED_POOL
+    assert bcl.audience.service is False
+
+    # Pin the CLI's hardcoded action_id/version against the YAML the
+    # operator's deploy syncs into qiita.action. `qiita submit-bcl-convert`
+    # submits its work_ticket against these two literals; if the YAML bumps
+    # its action_id or version without the CLI following, the bundled flow
+    # would 404 against a non-existent action at submit time. Fail here at
+    # build time instead.
+    from qiita_control_plane.cli.user import (
+        _BCL_CONVERT_ACTION_ID,
+        _BCL_CONVERT_ACTION_VERSION,
+    )
+
+    assert _BCL_CONVERT_ACTION_ID == bcl.action_id == "bcl-convert"
+    assert _BCL_CONVERT_ACTION_VERSION == bcl.version == "1.0.0"
+
+    step_names = [s.name for s in bcl.steps]
+    assert step_names == ["bcl_convert_prep", "bcl_convert"]
+
+    prep = next(s for s in bcl.steps if s.name == "bcl_convert_prep")
+    assert prep.module == "qiita_compute_orchestrator.jobs.bcl_convert_prep"
+    assert prep.container is None
+
+    convert = next(s for s in bcl.steps if s.name == "bcl_convert")
+    assert convert.container == "bcl-convert-4.5.4.sif"
+    assert convert.module is None
+    # Lookup-population baseline_resources: from_step_output names the
+    # upstream output file that carries the instrument key, and profiles
+    # covers exactly the three A4-supported Illumina families.
+    br = convert.baseline_resources
+    assert br.from_step_output == "instrument_model"
+    assert br.profiles is not None
+    assert set(br.profiles) == {
+        "Illumina NovaSeq 6000",
+        "Illumina NovaSeq X",
+        "Illumina iSeq",
+    }
+    # Flat-side fields are unset when the lookup population is used.
+    assert br.cpu is None and br.mem_gb is None and br.walltime is None
+
+    # action_ceiling matches the largest profile (NovaSeq X). A future
+    # profile bump that exceeds this must update both axes in the same PR
+    # because the runner enforces resolved <= ceiling at dispatch.
+    novaseqx = br.profiles["Illumina NovaSeq X"]
+    assert bcl.action_ceiling.cpu == novaseqx.cpu == 16
+    assert bcl.action_ceiling.mem_gb == novaseqx.mem_gb == 480
+    assert bcl.action_ceiling.walltime == novaseqx.walltime == timedelta(hours=12)
+
+    # context_schema gates on the operator-supplied BCL folder path; the
+    # absolute-path pattern keeps the launcher from resolving against a
+    # surprise CWD on the compute node.
+    assert bcl.context_schema["required"] == ["bcl_input_dir"]
+    assert bcl.context_schema["properties"]["bcl_input_dir"]["pattern"] == "^/"
+
+
 def test_load_actions_handles_two_versions_of_same_action(tmp_path):
     """Different versions of the same action_id are distinct rows, not
     duplicates."""

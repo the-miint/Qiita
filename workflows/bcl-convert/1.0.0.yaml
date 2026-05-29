@@ -1,0 +1,106 @@
+action_id: bcl-convert
+version: 1.0.0
+target_kind: sequenced_pool
+
+description: >
+  Demultiplex a sequenced_pool's Illumina BCL run folder into per-biosample
+  FASTQs using bcl-convert. The sample sheet is rehydrated from the pool's
+  run_preflight_blob via kl-run-preflight; the instrument model is parsed
+  from the BCL run-folder name and selects the SLURM resource profile for
+  the bcl_convert step. Step 1 of a planned bcl-convert → QC →
+  host-filter → fastq-to-parquet pipeline; subsequent steps will land in
+  follow-up PRs.
+
+scopes: []
+
+audience:
+  # The bcl-convert submission flow stands up a sequencing_run and a
+  # sequenced_pool then submits this ticket; both mint routes gate on
+  # prep_sample:write (in the USER ceiling) but the ticket itself is
+  # wet-lab-admin-or-higher. End-user submission disabled (the workflow
+  # touches the operator's filesystem path verbatim — wrong-pool risk is
+  # higher than for fastq-to-parquet); service-account submission
+  # disabled (no LIMS integration today).
+  service: false
+  human_roles: [wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  required: [bcl_input_dir]
+  properties:
+    # Absolute host path to the Illumina BCL run folder. The orchestrator
+    # binds the parent directory into the container at submit time (see
+    # SlurmBackend._resolve_input_binds); the container reads the value
+    # from params.json and feeds it to bcl-convert's
+    # --bcl-input-directory.
+    #
+    # The folder name MUST follow Illumina's convention,
+    # <YYMMDD>_<InstrumentSerial>_<RunNum>_<FlowcellID>, so the prep
+    # step's run-folder parser can derive the instrument model for the
+    # A4 baseline_resources lookup. Folders that don't parse fail-fast
+    # at dispatch.
+    bcl_input_dir:
+      type: string
+      minLength: 1
+      pattern: "^/"
+
+steps:
+  - step: bcl_convert_prep
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.bcl_convert_prep
+    # bcl_input_dir flows through from action_context;
+    # sequenced_pool_idx and sequencing_run_idx are framework-injected
+    # via SCOPE_SCALARS_BY_KIND[SEQUENCED_POOL] in
+    # qiita_compute_orchestrator.jobs.__init__.
+    inputs: [bcl_input_dir]
+    # samplesheet → /workspace/<step>/samplesheet.csv (rehydrated CSV
+    # for the next step's --sample-sheet); instrument_model →
+    # /workspace/<step>/instrument_model.txt (the runner reads this at
+    # dispatch time to pick the bcl_convert step's resource profile).
+    outputs: [samplesheet, instrument_model]
+    baseline_resources:
+      cpu: 2
+      mem_gb: 4
+      walltime: PT10M
+
+  - step: bcl_convert
+    step_type: singleton
+    container: bcl-convert-4.5.4.sif
+    entrypoint: /opt/qiita/entrypoint.sh
+    # `samplesheet` resolves to the prep step's output file; `bcl_input_dir`
+    # to the host path from action_context. SlurmBackend resolves both,
+    # adds the host-side --bind args so the container sees them at the
+    # same absolute paths.
+    inputs: [samplesheet, bcl_input_dir]
+    outputs: [convert_dir]
+    baseline_resources:
+      # A4 resource resolution: the runner reads
+      # `bound['instrument_model']` (the upstream output file's stripped
+      # contents), looks up the matching profile here, clamps each axis
+      # against the action_ceiling below, then constructs the
+      # StepBaselineResources from the resolved values. A folder whose
+      # instrument family lacks a profile fails-fast at dispatch with a
+      # message naming the missing key and listing the available ones.
+      from_step_output: instrument_model
+      profiles:
+        "Illumina NovaSeq 6000":
+          cpu: 16
+          mem_gb: 240
+          walltime: PT3H
+        "Illumina NovaSeq X":
+          cpu: 16
+          mem_gb: 480
+          walltime: PT12H
+        "Illumina iSeq":
+          cpu: 16
+          mem_gb: 16
+          walltime: PT3H
+
+# Cap matches the largest profile in `bcl_convert.baseline_resources.profiles`
+# above. Any future profile expansion (or per-instrument tuning that exceeds
+# these numbers) must bump this ceiling in the same PR — the runner enforces
+# `resolved <= ceiling` on every axis at dispatch.
+action_ceiling:
+  cpu: 16
+  mem_gb: 480
+  walltime: PT12H

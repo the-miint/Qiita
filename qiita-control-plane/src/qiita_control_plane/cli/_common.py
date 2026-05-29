@@ -238,6 +238,32 @@ def call(
     return resp.json()
 
 
+def call_with_status(
+    method: str,
+    base_url: str,
+    token: str,
+    path: str,
+    *,
+    json: dict | None = None,
+) -> tuple[dict, int]:
+    """Like `call`, but returns ``(body, status_code)``.
+
+    Useful for endpoints whose find-or-create semantics share a happy-path
+    body shape across 200 (existing) and 201 (created) — the bundled
+    ``qiita submit-bcl-convert`` flow uses it to report whether each of
+    the three minted resources was created or reused on retry.
+    """
+    resp = httpx.request(
+        method,
+        f"{base_url.rstrip('/')}{API_PREFIX}{path}",
+        headers={"Authorization": f"{BEARER_PREFIX}{token}"},
+        json=json,
+        timeout=CLI_HTTP_TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    return resp.json(), resp.status_code
+
+
 def whoami(base_url: str, token: str) -> dict:
     return call("GET", base_url, token, "/auth/whoami")
 

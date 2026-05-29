@@ -22,6 +22,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_BY_IDX,
     URL_BIOSAMPLE_BY_STUDY,
     URL_BIOSAMPLE_LIST_BY_STUDY,
+    URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import FieldDataType
@@ -2141,3 +2142,153 @@ async def test_patch_biosample_bad_metadata_checklist_idx_422(ctx):
     )
     assert resp.status_code == 422
     assert "metadata_checklist_idx" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# POST /biosample/lookup-by-accession — bulk accession → idx resolver
+# ---------------------------------------------------------------------------
+# Resolves an N-accession list in one round trip. Used by the bundled
+# qiita submit-bcl-convert flow to translate preflight biosample_accession
+# values into the biosample_idx the sequenced-sample composer requires.
+# The auth surface intentionally exposes only (accession, idx) pairs — no
+# row columns — so the route stays accessible to wet_lab_admin- callers
+# whose pool may span studies they do not have access to. Per-row access
+# enforcement still applies to GET /biosample/{idx}.
+
+
+async def _seed_biosample_with_accession(ctx, *, accession: str, owner_idx: int) -> int:
+    """Seed a non-retired biosample carrying the given accession; track for
+    cleanup and return its idx."""
+    idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.biosample (owner_idx, created_by_idx, biosample_accession)"
+        " VALUES ($1, $1, $2) RETURNING idx",
+        owner_idx,
+        accession,
+    )
+    ctx["created"]["biosample"].append(idx)
+    return idx
+
+
+async def test_lookup_by_accession_returns_resolved_map_and_missing_list(ctx):
+    # Three accessions: two seeded, one absent. Expect the resolved map to
+    # carry the two seeded mappings and `missing` to surface the absent one.
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    acc_a = _unique_accession("LOOKUP-A")
+    acc_b = _unique_accession("LOOKUP-B")
+    acc_missing = _unique_accession("LOOKUP-MISS")
+    bs_a = await _seed_biosample_with_accession(ctx, accession=acc_a, owner_idx=owner_idx)
+    bs_b = await _seed_biosample_with_accession(ctx, accession=acc_b, owner_idx=owner_idx)
+
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
+        json={"accessions": [acc_a, acc_b, acc_missing]},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body == {
+        "resolved": {acc_a: bs_a, acc_b: bs_b},
+        "missing": [acc_missing],
+    }
+
+
+async def test_lookup_by_accession_dedups_input_preserving_order(ctx):
+    # Repeated accessions are deduped before the fetch; the response shape
+    # carries each accession once, in input-order.
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    acc = _unique_accession("LOOKUP-DUP")
+    bs = await _seed_biosample_with_accession(ctx, accession=acc, owner_idx=owner_idx)
+    acc_miss = _unique_accession("LOOKUP-DUP-MISS")
+
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
+        json={"accessions": [acc_miss, acc, acc_miss, acc]},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["resolved"] == {acc: bs}
+    # Input-order dedup: first occurrence wins.
+    assert body["missing"] == [acc_miss]
+
+
+async def test_lookup_by_accession_excludes_retired_biosamples(ctx):
+    # A retired row is not in `resolved` (the composer would refuse to FK
+    # a fresh prep_sample to it anyway), so it lands in `missing`.
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    acc = _unique_accession("LOOKUP-RETIRED")
+    bs = await _seed_biosample_with_accession(ctx, accession=acc, owner_idx=owner_idx)
+    await retire_biosample(ctx["pool"], biosample_idx=bs, retired_by_idx=owner_idx)
+
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
+        json={"accessions": [acc]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"resolved": {}, "missing": [acc]}
+
+
+async def test_lookup_by_accession_regular_user_passes(ctx):
+    # The route has no per-row access predicate (see route docstring); a
+    # regular user with biosample:read can resolve idxs for biosamples
+    # they cannot otherwise read via GET /biosample/{idx}. This keeps the
+    # bcl-convert flow accessible to operators whose pool spans studies
+    # they are not a member of.
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    acc = _unique_accession("LOOKUP-USER")
+    bs = await _seed_biosample_with_accession(ctx, accession=acc, owner_idx=owner_idx)
+
+    resp = await ctx["user"].post(
+        URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
+        json={"accessions": [acc]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"resolved": {acc: bs}, "missing": []}
+
+
+async def test_lookup_by_accession_anonymous_401(ctx):
+    from qiita_control_plane.main import app
+
+    app.state.pool = ctx["pool"]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
+        resp = await anon.post(
+            URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
+            json={"accessions": ["SAMN00000001"]},
+        )
+    assert resp.status_code == 401
+
+
+async def test_lookup_by_accession_missing_scope_403(ctx, no_biosample_read_client):
+    resp = await no_biosample_read_client.post(
+        URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
+        json={"accessions": ["SAMN00000001"]},
+    )
+    assert resp.status_code == 403
+    assert "biosample:read" in resp.json()["detail"]
+
+
+async def test_lookup_by_accession_rejects_empty_list_422(ctx):
+    # Pydantic min_length=1 rejects [] before the SQL runs.
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
+        json={"accessions": []},
+    )
+    assert resp.status_code == 422
+
+
+async def test_lookup_by_accession_rejects_empty_string_422(ctx):
+    # Empty accession strings would silently match the empty string in the
+    # column if accepted; the per-element min_length=1 keeps that out.
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
+        json={"accessions": [""]},
+    )
+    assert resp.status_code == 422
+
+
+async def test_lookup_by_accession_rejects_extra_field_422(ctx):
+    # extra='forbid' on the request model rejects unknown fields rather
+    # than silently dropping them.
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
+        json={"accessions": ["SAMN00000001"], "unknown": "x"},
+    )
+    assert resp.status_code == 422

@@ -89,6 +89,7 @@ from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.models import WorkTicketFailureStage
 from qiita_common.parquet import validate_parquet_path
 
+from ..cp_client import make_cp_client
 from ..miint import (
     PARQUET_OPTS,
     PARQUET_OPTS_INTERMEDIATE,
@@ -100,7 +101,6 @@ from ..miint import (
 from ..sequence_range import (
     PrepSampleNotEligibleForSequenceRange,
     SequenceRangeAlreadyExists,
-    make_cp_client,
     mint_sequence_range,
 )
 

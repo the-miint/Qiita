@@ -86,6 +86,7 @@ _DISALLOW_WITHOUT_DELETE_INDEXES = frozenset(
         "work_ticket_one_in_flight_per_reference",
         "work_ticket_one_in_flight_per_study_prep",
         "work_ticket_one_in_flight_per_prep_sample",
+        "work_ticket_one_in_flight_per_sequenced_pool",
     }
 )
 
@@ -180,17 +181,25 @@ def _check_scopes(principal: Principal, required_scopes: list[str]) -> None:
 
 def _scope_target_columns(
     scope_target: dict[str, Any],
-) -> tuple[int | None, int | None, int | None, int | None]:
-    """Map a ScopeTarget union member to the (study_idx, prep_idx,
-    reference_idx, prep_sample_idx) tuple the work_ticket table
-    expects."""
+) -> tuple[int | None, int | None, int | None, int | None, int | None]:
+    """Map a ScopeTarget union member to the
+    (study_idx, prep_idx, reference_idx, prep_sample_idx, sequenced_pool_idx)
+    tuple the work_ticket table expects.
+
+    The SEQUENCED_POOL arm carries both sequenced_pool_idx and
+    sequencing_run_idx; the run idx is consumed by the orchestrator
+    framework (SCOPE_SCALARS_BY_KIND) but is not a work_ticket column —
+    it's derivable from the pool row's FK back to qiita.sequencing_run.
+    """
     kind = scope_target["kind"]
     if kind == ScopeTargetKind.REFERENCE.value:
-        return (None, None, scope_target["reference_idx"], None)
+        return (None, None, scope_target["reference_idx"], None, None)
     if kind == ScopeTargetKind.STUDY_PREP.value:
-        return (scope_target["study_idx"], scope_target["prep_idx"], None, None)
+        return (scope_target["study_idx"], scope_target["prep_idx"], None, None, None)
     if kind == ScopeTargetKind.PREP_SAMPLE.value:
-        return (None, None, None, scope_target["prep_sample_idx"])
+        return (None, None, None, scope_target["prep_sample_idx"], None)
+    if kind == ScopeTargetKind.SEQUENCED_POOL.value:
+        return (None, None, None, None, scope_target["sequenced_pool_idx"])
     raise HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=f"unknown scope_target.kind={kind!r}",
@@ -213,7 +222,9 @@ async def _check_disallow_without_delete(
     carrying the blocking ticket idx, which is more useful to clients
     than the bare unique-violation that fires when two submissions race
     past this check."""
-    study_idx, prep_idx, reference_idx, prep_sample_idx = _scope_target_columns(scope_target)
+    study_idx, prep_idx, reference_idx, prep_sample_idx, sequenced_pool_idx = _scope_target_columns(
+        scope_target
+    )
     if scope_target["kind"] == ScopeTargetKind.REFERENCE.value:
         existing = await pool.fetchval(
             "SELECT work_ticket_idx FROM qiita.work_ticket"
@@ -236,6 +247,18 @@ async def _check_disallow_without_delete(
             action_id,
             action_version,
             prep_sample_idx,
+            list(NON_TERMINAL_WORK_TICKET_STATES),
+        )
+    elif scope_target["kind"] == ScopeTargetKind.SEQUENCED_POOL.value:
+        existing = await pool.fetchval(
+            "SELECT work_ticket_idx FROM qiita.work_ticket"
+            " WHERE action_id = $1 AND action_version = $2"
+            "   AND sequenced_pool_idx = $3"
+            "   AND state = ANY($4::qiita.work_ticket_state[])"
+            " LIMIT 1",
+            action_id,
+            action_version,
+            sequenced_pool_idx,
             list(NON_TERMINAL_WORK_TICKET_STATES),
         )
     else:
@@ -503,15 +526,17 @@ async def submit_work_ticket(
 
     await _check_disallow_without_delete(pool, body.action_id, body.action_version, scope_target)
 
-    study_idx, prep_idx, reference_idx, prep_sample_idx = _scope_target_columns(scope_target)
+    study_idx, prep_idx, reference_idx, prep_sample_idx, sequenced_pool_idx = _scope_target_columns(
+        scope_target
+    )
     try:
         work_ticket_idx = await pool.fetchval(
             "INSERT INTO qiita.work_ticket ("
             "  action_id, action_version, originator_principal_idx,"
             "  scope_target_kind, study_idx, prep_idx, reference_idx,"
-            "  prep_sample_idx, action_context"
+            "  prep_sample_idx, sequenced_pool_idx, action_context"
             ") VALUES ($1, $2, $3, $4::qiita.scope_target_kind,"
-            "          $5, $6, $7, $8, $9::jsonb)"
+            "          $5, $6, $7, $8, $9, $10::jsonb)"
             " RETURNING work_ticket_idx",
             body.action_id,
             body.action_version,
@@ -521,6 +546,7 @@ async def submit_work_ticket(
             prep_idx,
             reference_idx,
             prep_sample_idx,
+            sequenced_pool_idx,
             json.dumps(body.action_context),
         )
     except asyncpg.exceptions.UniqueViolationError as exc:
@@ -553,35 +579,59 @@ async def submit_work_ticket(
     return WorkTicketResponse(work_ticket_idx=work_ticket_idx, state=WorkTicketState.PENDING)
 
 
+# Two-row-source SELECT. work_ticket carries the scope_target_kind plus
+# the four nullable scope_target idx columns; for the SEQUENCED_POOL arm
+# we additionally need the parent sequencing_run_idx to round-trip the
+# scope_target shape Pydantic expects. The LEFT JOIN against
+# qiita.sequenced_pool is a no-op for the other three kinds (the
+# work_ticket's sequenced_pool_idx is NULL, the join produces NULL).
 _WORK_TICKET_COLUMNS = (
-    "work_ticket_idx, action_id, action_version, originator_principal_idx,"
-    " scope_target_kind, study_idx, prep_idx, reference_idx, prep_sample_idx,"
-    " action_context, state, retry_count, max_retries,"
-    " failure_type, failure_stage, failure_step_name, failure_reason,"
-    " created_at, updated_at"
+    "wt.work_ticket_idx, wt.action_id, wt.action_version, wt.originator_principal_idx,"
+    " wt.scope_target_kind, wt.study_idx, wt.prep_idx, wt.reference_idx,"
+    " wt.prep_sample_idx, wt.sequenced_pool_idx,"
+    " sp.sequencing_run_idx,"
+    " wt.action_context, wt.state, wt.retry_count, wt.max_retries,"
+    " wt.failure_type, wt.failure_stage, wt.failure_step_name, wt.failure_reason,"
+    " wt.created_at, wt.updated_at"
+)
+_WORK_TICKET_FROM = (
+    " FROM qiita.work_ticket wt LEFT JOIN qiita.sequenced_pool sp ON sp.idx = wt.sequenced_pool_idx"
 )
 
 
 def _row_to_work_ticket(row: asyncpg.Record) -> WorkTicket:
     """Assemble a WorkTicket from a work_ticket row. Two columns need
     shaping: `scope_target` is rebuilt from scope_target_kind plus the
-    four nullable idx columns the table stores, and `action_context` is
-    decoded from asyncpg's JSONB-as-string. Every other column maps 1:1
-    onto a WorkTicket field and flows through unchanged — so a field
-    added to both the model and `_WORK_TICKET_COLUMNS` needs no edit
-    here."""
+    five nullable idx columns the table stores, and `action_context` is
+    decoded from asyncpg's JSONB-as-string. The SEQUENCED_POOL arm reads
+    sequencing_run_idx from the joined sequenced_pool row — fetched
+    upstream of this helper so the assembly stays a pure transformation.
+    Every other column maps 1:1 onto a WorkTicket field and flows
+    through unchanged — so a field added to both the model and
+    `_WORK_TICKET_COLUMNS` needs no edit here."""
     data = dict(row)
     kind = data.pop("scope_target_kind")
     study_idx = data.pop("study_idx")
     prep_idx = data.pop("prep_idx")
     reference_idx = data.pop("reference_idx")
     prep_sample_idx = data.pop("prep_sample_idx")
+    sequenced_pool_idx = data.pop("sequenced_pool_idx")
+    # Sequencing-run idx for the SEQUENCED_POOL arm is read via the
+    # joined column the row-producer adds when the row's
+    # scope_target_kind is sequenced_pool. Other kinds don't carry it.
+    sequencing_run_idx = data.pop("sequencing_run_idx", None)
     if kind == ScopeTargetKind.REFERENCE.value:
         data["scope_target"] = {"kind": kind, "reference_idx": reference_idx}
     elif kind == ScopeTargetKind.STUDY_PREP.value:
         data["scope_target"] = {"kind": kind, "study_idx": study_idx, "prep_idx": prep_idx}
-    else:  # PREP_SAMPLE — DB CHECK enforces one of the three valid kinds.
+    elif kind == ScopeTargetKind.PREP_SAMPLE.value:
         data["scope_target"] = {"kind": kind, "prep_sample_idx": prep_sample_idx}
+    else:  # SEQUENCED_POOL — DB CHECK enforces one of the four valid kinds.
+        data["scope_target"] = {
+            "kind": kind,
+            "sequenced_pool_idx": sequenced_pool_idx,
+            "sequencing_run_idx": sequencing_run_idx,
+        }
     data["action_context"] = json.loads(data["action_context"])
     return WorkTicket.model_validate(data)
 
@@ -616,7 +666,7 @@ async def get_work_ticket(
         detail=f"work_ticket {work_ticket_idx} not found",
     )
     row = await pool.fetchrow(
-        f"SELECT {_WORK_TICKET_COLUMNS} FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        f"SELECT {_WORK_TICKET_COLUMNS}{_WORK_TICKET_FROM} WHERE wt.work_ticket_idx = $1",
         work_ticket_idx,
     )
     if row is None:

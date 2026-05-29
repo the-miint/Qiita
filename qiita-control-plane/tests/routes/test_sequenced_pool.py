@@ -333,3 +333,83 @@ async def test_create_sequenced_pool_extra_field_422(ctx):
         },
     )
     assert resp.status_code == 422
+
+
+# ===========================================================================
+# Find-or-create idempotency (soft API-contract change in commit 2)
+# ===========================================================================
+
+
+async def test_create_sequenced_pool_find_or_create_same_blob_returns_200(ctx):
+    # Same (run_idx, filename) + byte-identical blob → 200 with the existing
+    # idx. Required so the bundled qiita submit-bcl-convert CLI's three
+    # POSTs converge on retry without operator cleanup.
+    run_idx = await _seed_sequencing_run(ctx, "foc-same")
+    blob = b"SQLite header\x00\x01\x02\xff"
+    r1 = await _post_pool(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        run_preflight_blob=_b64(blob),
+        run_preflight_filename="preflight.db",
+    )
+    assert r1.status_code == 201, r1.text
+    first_idx = r1.json()["sequenced_pool_idx"]
+
+    r2 = await _post_pool(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        run_preflight_blob=_b64(blob),
+        run_preflight_filename="preflight.db",
+    )
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["sequenced_pool_idx"] == first_idx
+
+
+async def test_create_sequenced_pool_blob_mismatch_returns_409(ctx):
+    # Same (run_idx, filename) but a different blob → 409 with the
+    # structured PayloadMismatch detail. The detail reports sizes rather
+    # than bytes (blob contents would explode log volume and could leak
+    # data).
+    run_idx = await _seed_sequencing_run(ctx, "foc-diff")
+    blob_a = b"AAAA"
+    blob_b = b"BBBBBBBB"
+    r1 = await _post_pool(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        run_preflight_blob=_b64(blob_a),
+        run_preflight_filename="preflight.db",
+    )
+    assert r1.status_code == 201, r1.text
+
+    r2 = await _post_pool(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        run_preflight_blob=_b64(blob_b),
+        run_preflight_filename="preflight.db",
+    )
+    assert r2.status_code == 409, r2.text
+    detail = r2.json()["detail"]
+    expected = {
+        "conflicting_field": "run_preflight_blob",
+        "existing_value": f"<{len(blob_a)} bytes>",
+        "supplied_value": f"<{len(blob_b)} bytes>",
+    }
+    assert detail == expected
+
+
+async def test_create_sequenced_pool_no_preflight_always_creates_201(ctx):
+    # The sequenced_pool_one_per_run_and_filename partial unique index is
+    # WHERE run_preflight_filename IS NOT NULL, so a no-preflight pool sits
+    # outside the constraint and every call creates a fresh row. Locks in
+    # the carve-out the bundled CLI relies on for retry semantics on
+    # pools with no preflight to attach.
+    run_idx = await _seed_sequencing_run(ctx, "foc-nopre")
+    r1 = await _post_pool(ctx["wet"], ctx, run_idx)
+    assert r1.status_code == 201, r1.text
+    r2 = await _post_pool(ctx["wet"], ctx, run_idx)
+    assert r2.status_code == 201, r2.text
+    assert r1.json()["sequenced_pool_idx"] != r2.json()["sequenced_pool_idx"]

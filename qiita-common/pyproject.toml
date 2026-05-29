@@ -5,6 +5,10 @@ requires-python = ">=3.14"
 dependencies = [
     "pydantic[email]>=2.12",
     "httpx>=0.28",
+    # qiita_common.illumina parses the vendored sequencer_types.yml at
+    # import time to derive the {machine_prefix: model_name} table the
+    # CLI and the bcl-convert prep step both consume.
+    "pyyaml>=6.0",
 ]
 
 [dependency-groups]

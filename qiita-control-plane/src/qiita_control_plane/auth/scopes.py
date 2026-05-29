@@ -86,6 +86,7 @@ SERVICE_ACCOUNT_SCOPE_CEILING: frozenset[Scope] = frozenset(
         Scope.TICKET_DOGET,
         Scope.TICKET_DOPUT,
         Scope.SEQUENCE_RANGE_MINT,
+        Scope.SEQUENCED_POOL_PREFLIGHT_READ,
     }
 )
 

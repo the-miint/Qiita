@@ -1,4 +1,4 @@
-"""`qiita-admin reference load` — drive a reference-add workflow end-to-end.
+"""`qiita reference load` — drive a reference-add workflow end-to-end.
 
 What the subcommand does, in order, against a running CP + DP:
 
