@@ -197,6 +197,20 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     assert bcl.target_kind == ScopeTargetKind.SEQUENCED_POOL
     assert bcl.audience.service is False
 
+    # Pin the CLI's hardcoded action_id/version against the YAML the
+    # operator's deploy syncs into qiita.action. `qiita submit-bcl-convert`
+    # submits its work_ticket against these two literals; if the YAML bumps
+    # its action_id or version without the CLI following, the bundled flow
+    # would 404 against a non-existent action at submit time. Fail here at
+    # build time instead.
+    from qiita_control_plane.cli.user import (
+        _BCL_CONVERT_ACTION_ID,
+        _BCL_CONVERT_ACTION_VERSION,
+    )
+
+    assert _BCL_CONVERT_ACTION_ID == bcl.action_id == "bcl-convert"
+    assert _BCL_CONVERT_ACTION_VERSION == bcl.version == "1.0.0"
+
     step_names = [s.name for s in bcl.steps]
     assert step_names == ["bcl_convert_prep", "bcl_convert"]
 
