@@ -1,14 +1,14 @@
 ---
-description: At deploy time, archive the Pending-deploy checklist into Deployed history stamped with date + commit
+description: After a deploy, archive the Pending-deploy checklist into Deployed history stamped with date + commit
 ---
 
-You are closing out a deploy: moving the consolidated `## Pending deploy` block in `CHANGELOG.md` into `## Deployed history` and leaving an empty Pending section for the next cycle. Run this **after** a successful deploy (the operator has finished bucket 5 verification).
+You are closing out a deploy: moving the consolidated `## Pending deploy` block in `CHANGELOG.md` into `## Deployed history` and leaving an empty Pending section for the next cycle. This is a **maintainer-on-their-own-machine** action run *after* the operator reports a successful deploy — the deploy host has no Claude and the operator doesn't edit the repo. It is a repo edit (commit + push), not an on-host step.
 
 ## 1. Gather the stamp
 
 - **Date**: use today's date from the session context (currentDate), `YYYY-MM-DD`.
-- **Deployed commit**: the commit now running on the host. If `$ARGUMENTS` provides a SHA, use it; otherwise run `git rev-parse HEAD` in the clone and confirm with the user that this is what was deployed (the local clone HEAD is normally the deployed commit right after `local-deploy.sh`).
-- Ask the user to confirm the deploy actually succeeded (bucket-5 checks passed) before archiving — don't archive a deploy that aborted.
+- **Deployed commit**: the commit the operator reported running on the host (redeploy.md step 7). **Take it from `$ARGUMENTS`.** Do **not** default to the local checkout's `git rev-parse HEAD` — `main` may have advanced past what was deployed, and stamping the wrong SHA corrupts the history record. If `$ARGUMENTS` is empty, ask the user for the operator-reported deployed SHA rather than guessing.
+- Confirm with the user that the deploy actually succeeded (bucket-5 checks passed) before archiving — don't archive a deploy that aborted.
 
 ## 2. Move the block
 

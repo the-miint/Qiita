@@ -143,14 +143,27 @@ sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; 
 ```
 
 Run every check in the Pending-deploy bucket-5 list, plus anything the
-Notes bucket flags for downstream clients.
+Notes bucket flags for downstream clients. When it passes, capture the
+deployed commit and hand it off for archiving:
 
-## 8. Archive the deploy
+```bash
+# [operator] the commit now running on the host — report this for step 8
+git -C ~/qiita-miint rev-parse HEAD
+```
 
-Once verification passes, move the just-run checklist out of `## Pending
-deploy` and into `## Deployed history`, stamped with the date and the
-deployed commit, leaving Pending empty for the next cycle. From a Claude
-session in the clone, run `/deploy-archive` (it stamps the date and
-`git rev-parse HEAD` and does the move); otherwise do the move by hand
-following the shape in `CHANGELOG.md`. Either way, also record the
-deployed commit somewhere durable (host deploy log, ops channel).
+## 8. Archive the deploy (maintainer, off-host)
+
+The deploy host has no Claude and the operator doesn't edit the repo, so
+archiving is **not** an on-host step — it's a repo edit done by a
+maintainer on their own machine *after* the operator confirms success.
+The operator reports two things: (a) verification passed, (b) the
+deployed commit from step 7.
+
+A maintainer then, in a local checkout, runs `/deploy-archive <sha>`
+(passing the operator-reported commit — not the maintainer's local
+`HEAD`, which may have moved on). It moves the just-deployed `## Pending
+deploy` block into `## Deployed history` stamped with the date + that
+commit, resets Pending to empty, and the maintainer commits + pushes.
+No Claude? Do the same move by hand following the shape in
+`CHANGELOG.md`. Either way, also record the deployed commit somewhere
+durable (deploy log, ops channel).
