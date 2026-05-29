@@ -16,28 +16,37 @@ Everything merged but not yet deployed. Run buckets 1→5 in order; buckets 1–
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
 ```bash
-# (#49) UPLOAD_STAGING_ROOT is a NEW dir on the shared scratch filesystem. You set
-# it ONCE on the CP side below; the DP value and the dir (bucket 2) are read back
-# from that, so the path is chosen in exactly one place. First, see the roots
-# already configured on this host so you pick a consistent location:
-grep -hE '^(WORK_TICKET_WORKSPACE_ROOT|DUCKLAKE_DATA_PATH|UPLOAD_STAGING_ROOT)=' \
-    /etc/qiita/control-plane.env /etc/qiita/data-plane.env 2>/dev/null   # [admin]
+# All of bucket 1 is [admin]. The /etc/qiita/*.env files are mode 0440
+# (root:qiita-api / root:qiita-data), so every read and write needs sudo —
+# the admin account is not in those groups. Provenance tags are written as
+# full-line `#` comments: systemd EnvironmentFile ignores those, but an inline
+# trailing `# ...` would become PART of the value.
 
-# [admin] control-plane.env — substitute <scratch> with a path under the scratch FS shown above
+# (#49) UPLOAD_STAGING_ROOT is a NEW dir under the shared scratch FS. Set it ONCE on
+# the CP side; the DP value and the dir (bucket 2) are read back from it. First, see
+# the roots already configured here so you pick a consistent location:
+sudo grep -hE '^(WORK_TICKET_WORKSPACE_ROOT|DUCKLAKE_DATA_PATH|UPLOAD_STAGING_ROOT)=' \
+    /etc/qiita/control-plane.env /etc/qiita/data-plane.env 2>/dev/null
+
+# control-plane.env — substitute <scratch> with a path under the scratch FS shown above
 sudo tee -a /etc/qiita/control-plane.env <<'EOF'
-CONTACT_EMAIL=qiita-help@ucsd.edu                 # (#issue-53) renders into landing-page mailto links
-UPLOAD_STAGING_ROOT=<scratch>/upload-staging      # (#49)
+# CONTACT_EMAIL (#issue-53): renders into the landing-page mailto links
+CONTACT_EMAIL=qiita-help@ucsd.edu
+# UPLOAD_STAGING_ROOT (#49): byte-identical to the DP value (derived below)
+UPLOAD_STAGING_ROOT=<scratch>/upload-staging
 EOF
 
-# [admin] data-plane.env — derived from the CP value (guaranteed byte-identical, no retyping)   (#49)
-grep '^UPLOAD_STAGING_ROOT=' /etc/qiita/control-plane.env | sudo tee -a /etc/qiita/data-plane.env
+# data-plane.env — derived from the CP value (guaranteed identical, no retyping)   (#49)
+sudo grep '^UPLOAD_STAGING_ROOT=' /etc/qiita/control-plane.env | sudo tee -a /etc/qiita/data-plane.env
 
-# [admin] compute-orchestrator.env
+# compute-orchestrator.env
 sudo tee -a /etc/qiita/compute-orchestrator.env <<'EOF'
-SLURM_NATIVE_PYTHON=/home/qiita/qiita-miint/qiita-compute-orchestrator/.venv/bin/python   # (#57)
-SLURM_QOS=qiita_norm                                                                       # (#57)
-QIITA_CP_URL=https://qiita-miint.ucsd.edu                                                  # (#57)
-QIITA_IMAGES_DIR=/scratch/persistent/images                                                # (#62) abs dir, visible from every compute node; validated at CO boot when COMPUTE_BACKEND=slurm
+# SLURM_NATIVE_PYTHON / SLURM_QOS / QIITA_CP_URL (#57)
+SLURM_NATIVE_PYTHON=/home/qiita/qiita-miint/qiita-compute-orchestrator/.venv/bin/python
+SLURM_QOS=qiita_norm
+QIITA_CP_URL=https://qiita-miint.ucsd.edu
+# QIITA_IMAGES_DIR (#62): abs dir, visible from every compute node; validated at CO boot when COMPUTE_BACKEND=slurm
+QIITA_IMAGES_DIR=/scratch/persistent/images
 EOF
 ```
 
@@ -51,11 +60,11 @@ sudo usermod -aG qiita-pipeline qiita-api qiita-orch qiita-data qiita-job   # on
 # (#57) compute-node-visible orchestrator venv   [operator]
 sudo -u qiita bash -lc 'cd /home/qiita/qiita-miint/qiita-compute-orchestrator && uv sync --reinstall-package qiita-common'
 
-# (#49) create the upload-staging dir at exactly the path just configured — read it
-#       back from the env file so it can't diverge (DP writes as owner, CP reads via
-#       qiita-pipeline)   [admin]
-source /etc/qiita/control-plane.env
-sudo install -d -o qiita-data -g qiita-pipeline -m 2770 "$UPLOAD_STAGING_ROOT"
+# (#49) create the upload-staging dir at exactly the configured path — read it back
+#       via sudo (root-owned env file) so it can't diverge (DP writes as owner, CP
+#       reads via qiita-pipeline)   [admin]
+staging=$(sudo grep '^UPLOAD_STAGING_ROOT=' /etc/qiita/control-plane.env | tail -1 | cut -d= -f2-)
+sudo install -d -o qiita-data -g qiita-pipeline -m 2770 "$staging"
 
 # (#issue-53) confirm AuthRocket realm invitation-acceptance redirect URI is
 #   https://qiita-miint.ucsd.edu/api/v1/auth/handoff   (AuthRocket admin dashboard; no host command)
@@ -76,10 +85,13 @@ sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; 
 ### 3. Migrations
 
 ```bash
-# [operator] Source the SAME env file the guard reads, so make migrate and the
-# guard target one DB. activate.sh re-checks public.schema_migrations at deploy
-# time and ABORTS before any restart if one is unapplied.
-source /etc/qiita/control-plane.env
+# [operator] DATABASE_URL must be in your shell, pointing at the SAME DB as
+# control-plane.env (the guard, running as root, checks that one). The operator
+# account can't read the 0440 control-plane.env, so use the value from your
+# provisioning / first deploy (see first-deploy.md step 1). activate.sh re-checks
+# public.schema_migrations at deploy time and ABORTS before any restart if one is
+# unapplied — pointing DATABASE_URL elsewhere migrates one DB while the guard
+# checks another (which the guard's wrong-DB hint flags).
 make -C ~/qiita-miint migrate
 ```
 `dbmate` applies whatever is unapplied (idempotent). The guard — not this checklist — owns the authoritative set of required migrations, so nothing is hand-listed here to drift out of sync.

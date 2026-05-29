@@ -63,11 +63,12 @@ checklist — copy/paste from there.
 ## 4. Apply migrations
 
 ```bash
-# [operator] Source the SAME env file the guard reads, so make migrate and the
-#            guard target the same database (the guard sources control-plane.env
-#            as root). A hand-set DATABASE_URL risks migrating one DB while the
+# [operator] DATABASE_URL must be in your shell, pointing at the SAME DB as
+#            control-plane.env (the guard, running as root, checks that one).
+#            The operator account can't read the 0440 control-plane.env, so use
+#            the value from your provisioning / first deploy (first-deploy.md
+#            step 1). A DATABASE_URL pointing elsewhere migrates one DB while the
 #            guard checks another — which the guard's "wrong-DB" hint flags.
-source /etc/qiita/control-plane.env
 make -C ~/qiita-miint migrate
 ```
 
