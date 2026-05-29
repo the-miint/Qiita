@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Python version
+
+This repo targets **Python 3.14**. Run tooling via `uv run` — a stray pre-3.14 `python3` misparses `except A, B:` ([PEP 758](https://peps.python.org/pep-0758/)), which is valid here. Don't "fix" it to `except (A, B):`.
+
 ## Common commands
 
 ```bash

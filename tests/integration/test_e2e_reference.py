@@ -1,5 +1,5 @@
 """End-to-end integration test: drive workflows/reference-add via the CLI's
-`qiita-admin reference load` programmatic entry point against real CP +
+`qiita reference load` programmatic entry point against real CP +
 real data-plane Flight + DuckLake, then DoGet the registered Parquet
 rows back.
 
