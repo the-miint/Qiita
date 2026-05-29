@@ -1,4 +1,4 @@
-"""Tests for qiita_compute_orchestrator.sequence_range.fetch_sequenced_pool_preflight.
+"""Tests for qiita_compute_orchestrator.sequencing_run.fetch_sequenced_pool_preflight.
 
 Exercises the status-code branches of the SA-only preflight read with
 httpx.MockTransport so no real HTTP server is needed. The wire shape
@@ -7,8 +7,8 @@ CP-side route lives upstream in qiita-control-plane and has its own
 tests; this file defends our orchestrator-side adapter against drift.
 
 The non-JSON 404 case covers the detail-extraction guard: the 404 branch
-reads ``resp.json().get("detail")`` under ``except ValueError,
-AttributeError``, so a body that isn't JSON must still raise the typed
+reads ``resp.json().get("detail")`` under ``except (ValueError,
+AttributeError)``, so a body that isn't JSON must still raise the typed
 NotFound with ``detail=None`` rather than letting the parse error escape.
 """
 
@@ -22,7 +22,7 @@ import pytest
 from qiita_common.api_paths import URL_SEQUENCED_POOL_PREFLIGHT
 from qiita_common.models import SequencedPoolPreflightResponse
 
-from qiita_compute_orchestrator.sequence_range import (
+from qiita_compute_orchestrator.sequencing_run import (
     SequencedPoolPreflightNotFound,
     fetch_sequenced_pool_preflight,
 )

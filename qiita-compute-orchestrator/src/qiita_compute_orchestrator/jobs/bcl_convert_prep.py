@@ -42,7 +42,8 @@ from pathlib import Path
 from pydantic import BaseModel
 from qiita_common.illumina import instrument_model_from_run_folder
 
-from ..sequence_range import fetch_sequenced_pool_preflight, make_cp_client
+from ..cp_client import make_cp_client
+from ..sequencing_run import fetch_sequenced_pool_preflight
 
 
 class Inputs(BaseModel):
@@ -77,10 +78,15 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     intermediate is tracked even though it isn't a named output. The
     verifier accepts that.
     """
-    # Deferred import so the orchestrator's pytest collection / launcher
-    # boot doesn't blow up in environments that don't ship the
-    # run-preflight dep. The dep is added to pyproject.toml in the same
-    # PR as this module (see CHANGELOG).
+    # `run_preflight` is the git-pinned `kl-run-preflight` dependency
+    # (see qiita-compute-orchestrator/pyproject.toml); `save_legacy_csv` is
+    # called below to rehydrate the preflight blob to a sample-sheet CSV.
+    # "legacy" is upstream's own module name for the legacy Qiita
+    # sample-sheet format — it is not dead/legacy code on our side.
+    # Imported here (not at module top) so the orchestrator's pytest
+    # collection / launcher boot doesn't blow up in environments that don't
+    # ship the dep. The dep was added to pyproject.toml in the same PR as
+    # this module (see CHANGELOG).
     from run_preflight.legacy.api import save_legacy_csv  # noqa: PLC0415
 
     if not inputs.bcl_input_dir.is_absolute():

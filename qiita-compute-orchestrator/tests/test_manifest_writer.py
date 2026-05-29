@@ -1,9 +1,11 @@
-"""Unit tests for workflows/bcl-convert/manifest_writer.py.
+"""Unit tests for workflows/_shared/manifest_writer.py.
 
-The script lives inside the Apptainer image at /opt/qiita/manifest_writer.py
-and runs there under the container's python3, with stdlib only. Tests load
-it via importlib (no installed package home, no entry point) so we exercise
-the actual file the container will ship, not a copy.
+The script is workflow-agnostic and is copied into each Apptainer image at
+/opt/qiita/manifest_writer.py, where it runs under the container's python3
+with stdlib only. Tests load it via importlib (no installed package home, no
+entry point) so we exercise the actual file the container will ship, not a
+copy. The fixture tree below mimics bcl-convert output, but nothing in the
+script is bcl-convert-specific.
 """
 
 from __future__ import annotations
@@ -16,14 +18,12 @@ from pathlib import Path
 import pytest
 
 _MANIFEST_WRITER_PATH = (
-    Path(__file__).resolve().parents[2] / "workflows" / "bcl-convert" / "manifest_writer.py"
+    Path(__file__).resolve().parents[2] / "workflows" / "_shared" / "manifest_writer.py"
 )
 
 
 def _load_manifest_writer():
-    spec = importlib.util.spec_from_file_location(
-        "bcl_convert_manifest_writer", _MANIFEST_WRITER_PATH
-    )
+    spec = importlib.util.spec_from_file_location("shared_manifest_writer", _MANIFEST_WRITER_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module

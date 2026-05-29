@@ -60,7 +60,7 @@ async def lifespan(app: FastAPI):
     # instance for every subsequent step. Misconfig already crashed on
     # the Settings.from_env() line above; install_settings just makes
     # the resolved value available to non-FastAPI code paths
-    # (sequence_range.make_cp_client) without re-reading the env.
+    # (cp_client.make_cp_client) without re-reading the env.
     install_settings(settings)
     app.state.settings = settings
     app.state.backend = _build_backend(settings)

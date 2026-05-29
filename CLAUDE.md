@@ -75,7 +75,9 @@ The wire validator enforces shape only (exactly-one). The module-prefix invarian
 
 Container steps declare a bare SIF filename in `container:` (e.g. `bcl-convert-4.5.4.sif`). The orchestrator joins this against `Settings.qiita_images_dir` (`QIITA_IMAGES_DIR` env var, required when `COMPUTE_BACKEND=slurm`) to resolve the absolute SIF path. Registry-URL forms with `://` pass through; anything else with a path separator → `CONTRACT_VIOLATION`.
 
-After editing a workflow YAML or its container artifacts (`workflows/<workflow>/Apptainer.def`, `entrypoint.sh`, `manifest_writer.py`):
+After editing a workflow YAML or its container artifacts (`workflows/<workflow>/Apptainer.def`, `entrypoint.sh`, or the shared `workflows/_shared/manifest_writer.py`):
+
+These steps run on the **Linux deploy host** — they need `apptainer` (to build the SIF) and `systemd` (to restart the services), so they don't apply on a macOS dev box (mirrors `make test-workflows`, which skips gracefully off Linux). On macOS, edit the artifacts and run the unit tests; the SIF rebuild + restart happen at deploy time on the host.
 
 ```bash
 # Rebuild the SIF (idempotent — skips when the existing SIF already reports the target version).

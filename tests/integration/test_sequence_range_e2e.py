@@ -25,10 +25,10 @@ from __future__ import annotations
 import pytest
 from httpx import ASGITransport
 from qiita_compute_orchestrator.config import Settings
+from qiita_compute_orchestrator.cp_client import make_cp_client
 from qiita_compute_orchestrator.sequence_range import (
     MintedSequenceRange,
     SequenceRangeAlreadyExists,
-    make_cp_client,
     mint_sequence_range,
 )
 from qiita_control_plane.config import Settings as CPSettings

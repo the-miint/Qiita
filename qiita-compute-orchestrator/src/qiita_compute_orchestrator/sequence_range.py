@@ -37,53 +37,9 @@ execution. Same caller-side mapping pattern as the 409 case.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import httpx
-from qiita_common.api_paths import URL_SEQUENCE_RANGE_PREFIX, URL_SEQUENCED_POOL_PREFLIGHT
-from qiita_common.models import SequencedPoolPreflightResponse
-
-from .config import Settings, get_settings
-
-
-def make_cp_client(
-    settings: Settings | None = None,
-    *,
-    transport: httpx.AsyncBaseTransport | None = None,
-) -> httpx.AsyncClient:
-    """Build an authed AsyncClient pointed at the control plane.
-
-    The compute service-account PAT goes into the Authorization header
-    on every request. Caller is responsible for `async with`-style
-    lifetime management; one client per execute() invocation is the
-    expected pattern (cheap to construct, no connection pooling
-    benefit at our call rate).
-
-    `settings` is injectable for tests; production code passes nothing
-    and get_settings() (config.py) resolves either the lifespan-installed
-    cached value (orchestrator service) or a fresh Settings.from_env()
-    (SLURM launcher / CLI). See config.py module header for the
-    asymmetric resolution rationale.
-
-    `transport` is injectable for tests so an integration suite can
-    swap in an `httpx.ASGITransport(app=cp_app)` and exercise the full
-    Settings → headers → httpx → CP route → DB path in-process without
-    a uvicorn subprocess. Production code passes nothing; httpx uses
-    its default network transport against `settings.cp_url`.
-    """
-    if settings is None:
-        settings = get_settings()
-    kwargs: dict[str, Any] = {
-        "base_url": settings.cp_url,
-        "headers": {"Authorization": f"Bearer {settings.co_to_cp_token}"},
-        # 30s caters to a slow nextval/setval/INSERT under contention;
-        # the CP route is bounded by the advisory lock + a few ms of
-        # plpgsql, so a longer timeout would only mask infra issues.
-        "timeout": httpx.Timeout(30.0),
-    }
-    if transport is not None:
-        kwargs["transport"] = transport
-    return httpx.AsyncClient(**kwargs)
+from qiita_common.api_paths import URL_SEQUENCE_RANGE_PREFIX
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,75 +130,3 @@ async def mint_sequence_range(
         sequence_idx_start=body["sequence_idx_start"],
         sequence_idx_stop=body["sequence_idx_stop"],
     )
-
-
-class SequencedPoolPreflightNotFound(Exception):
-    """Raised when GET /sequencing-run/{R}/sequenced-pool/{P}/preflight
-    returns 404 — either the pool doesn't exist under the named run, or
-    the pool exists but its preflight blob isn't populated.
-
-    The route distinguishes the two cases in the response body's
-    ``detail`` field; callers that need to discriminate can read
-    ``self.detail``. The bcl_convert_prep step treats both as
-    BackendFailure(BAD_INPUT) — neither is a transient infra issue —
-    so the runner side maps it to a PERMANENT work_ticket failure.
-    """
-
-    def __init__(
-        self,
-        *,
-        sequencing_run_idx: int,
-        sequenced_pool_idx: int,
-        detail: str | None = None,
-    ) -> None:
-        msg = (
-            f"sequenced_pool {sequenced_pool_idx} preflight not available"
-            f" under sequencing_run {sequencing_run_idx}"
-        )
-        if detail:
-            msg = f"{msg}: {detail}"
-        super().__init__(msg)
-        self.sequencing_run_idx = sequencing_run_idx
-        self.sequenced_pool_idx = sequenced_pool_idx
-        self.detail = detail
-
-
-async def fetch_sequenced_pool_preflight(
-    *,
-    http: httpx.AsyncClient,
-    sequencing_run_idx: int,
-    sequenced_pool_idx: int,
-) -> SequencedPoolPreflightResponse:
-    """GET /sequencing-run/{R}/sequenced-pool/{P}/preflight.
-
-    ``http`` is the authed httpx client (Bearer with the compute SA PAT,
-    base_url=the CP) returned by ``make_cp_client``. The caller manages
-    its lifetime — one client per ``execute()`` invocation matches the
-    pattern ``mint_sequence_range`` uses.
-
-    Returns the populated SequencedPoolPreflightResponse (raw bytes after
-    Pydantic's Base64Bytes decoding).
-
-    Raises:
-      SequencedPoolPreflightNotFound: 404 (pool not in run / no preflight).
-      httpx.HTTPStatusError: anything else (401/403, 5xx). The caller
-        maps to BackendFailure based on the status.
-    """
-    url = URL_SEQUENCED_POOL_PREFLIGHT.format(
-        sequencing_run_idx=sequencing_run_idx,
-        sequenced_pool_idx=sequenced_pool_idx,
-    )
-    resp = await http.get(url)
-    if resp.status_code == 404:
-        detail: str | None = None
-        try:
-            detail = resp.json().get("detail")
-        except ValueError, AttributeError:
-            pass
-        raise SequencedPoolPreflightNotFound(
-            sequencing_run_idx=sequencing_run_idx,
-            sequenced_pool_idx=sequenced_pool_idx,
-            detail=detail if isinstance(detail, str) else None,
-        )
-    resp.raise_for_status()
-    return SequencedPoolPreflightResponse.model_validate_json(resp.content)
