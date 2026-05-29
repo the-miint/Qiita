@@ -8,12 +8,12 @@ roll all of it out in one go. This runbook is the **single source of
 truth for the deploy procedure**; `CHANGELOG.md` and `CLAUDE.md` point
 here rather than restating the lifecycle.
 
-**Our deploy model.** Development is *many PRs, then one deploy*. We do
-not cut releases yet (too early). You do **not** assemble the deploy
-yourself: the `## Pending deploy` section of `CHANGELOG.md` is already
-the consolidated, ordered, deduplicated checklist of everything merged
-but not yet deployed — each PR folded its operator steps into it as it
-merged. Your job is to run that checklist, then archive it.
+**The model in one line** (the *why* lives in CLAUDE.md "Deployments"):
+you do **not** assemble the deploy yourself — the `## Pending deploy`
+section of `CHANGELOG.md` is already the consolidated, ordered,
+deduplicated checklist of everything merged but not yet deployed, folded
+in by each PR as it merged. Your job is to run that checklist, then
+archive it.
 
 This runbook is the *fixed skeleton* (the order and the invariants); the
 *variable* per-deploy steps live in `## Pending deploy`.
@@ -49,37 +49,40 @@ git -C ~/qiita-miint pull --ff-only
 ```
 
 We pull here (not via `local-deploy.sh`'s own pull) so the migration
-files are present for step 4 *before* the deploy script runs. Step 6
-therefore runs with `SKIP_PULL=1`.
+files are present for the migrate step *before* the deploy script runs.
+The deploy step therefore runs with `SKIP_PULL=1`.
 
 ## 3. Apply env-var (bucket 1) and one-time host setup (bucket 2)
 
 Run buckets 1 and 2 of the Pending-deploy checklist verbatim. Env vars
 first; everything `from_env()` requires must be in place before the
-step-6 restart, or the affected unit won't come back up. The actual
+deploy-time restart, or the affected unit won't come back up. The actual
 commands (and which `<scratch>`/FQDN values to substitute) are in the
 checklist — copy/paste from there.
 
 ## 4. Apply migrations
 
 ```bash
-# [operator] DATABASE_URL must be in the shell (source /etc/qiita/control-plane.env
-#            or your saved env; see first-deploy.md step 1)
+# [operator] Source the SAME env file the guard reads, so make migrate and the
+#            guard target the same database (the guard sources control-plane.env
+#            as root). A hand-set DATABASE_URL risks migrating one DB while the
+#            guard checks another — which the guard's "wrong-DB" hint flags.
+source /etc/qiita/control-plane.env
 make -C ~/qiita-miint migrate
 ```
 
 `make migrate` runs `dbmate up` and is idempotent — already-applied
 migrations are skipped. **This is a separate step on purpose:**
 `local-deploy.sh` / `activate.sh` do not apply migrations (auto-applying
-is unsafe for expand/contract changes). `activate.sh` *does* refuse to
-restart services if any shipped migration is unapplied (see step 6), so
-forgetting this step fails the deploy loudly instead of producing
+is unsafe for expand/contract changes). The deploy's migration guard
+*does* refuse to restart services if any shipped migration is unapplied,
+so forgetting this step fails the deploy loudly instead of producing
 runtime 500s — but run it here anyway.
 
 That guard queries the DB with `psql` (sourcing `DATABASE_URL` from
 `control-plane.env` as root). On the rare host that has `dbmate` but no
 `psql` client it refuses to proceed; install the postgres client, or —
-having confirmed migrations are applied — re-run step 6 with
+having confirmed migrations are applied — re-run the deploy with
 `SKIP_MIGRATION_GUARD=1`.
 
 Verify nothing is pending (this is a manual pre-check; `activate.sh` runs the
@@ -119,8 +122,8 @@ which: stages into `/opt/qiita/`, `uv sync`s the Python venvs
 installs systemd units + dropins, and restarts the services whose env
 files are present.
 
-If the migration guard aborts here, you skipped or under-ran step 4 —
-run `make migrate` and re-run this command.
+If the migration guard aborts here, you skipped or under-ran the migrate
+step above — run `make migrate` and re-run this command.
 
 ## 7. Verify
 

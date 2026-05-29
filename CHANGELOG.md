@@ -66,10 +66,13 @@ sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; 
 ### 3. Migrations
 
 ```bash
-# [operator] DATABASE_URL must be in the shell. activate.sh ABORTS the deploy if any of these are unapplied.
+# [operator] Source the SAME env file the guard reads, so make migrate and the
+# guard target one DB. activate.sh re-checks public.schema_migrations at deploy
+# time and ABORTS before any restart if one is unapplied.
+source /etc/qiita/control-plane.env
 make -C ~/qiita-miint migrate
 ```
-Span applies: `upload` (#49); `terminology_release_lifecycle` + `seed_metadata_checklist` + `seed_ncbi_taxonomy` (#56); `bump_identity_start_to_25k` (#61); 3× `sequenced_pool` (#62). All small.
+`dbmate` applies whatever is unapplied (idempotent). The guard — not this checklist — owns the authoritative set of required migrations, so nothing is hand-listed here to drift out of sync.
 
 ### 4. Deploy
 
