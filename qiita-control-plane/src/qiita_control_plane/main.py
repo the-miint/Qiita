@@ -5,6 +5,12 @@ from pathlib import Path
 
 import asyncpg
 from fastapi import Depends, FastAPI, Request
+from fastapi.openapi.docs import (
+    get_redoc_html,
+    get_swagger_ui_html,
+    get_swagger_ui_oauth2_redirect_html,
+)
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from qiita_common.log import install_authorization_scrub
 from qiita_common.models import HealthResponse
@@ -73,10 +79,52 @@ async def lifespan(app: FastAPI):
         await close_pool(app.state.pool)
 
 
-app = FastAPI(title="qiita-control-plane", lifespan=lifespan)
+# docs_url / redoc_url are disabled here so we can re-serve the Swagger UI
+# and ReDoc shells below from our own /static mount instead of FastAPI's
+# default jsdelivr CDN. The deploy host (and many viewers' browsers) may
+# have no outbound internet or a strict CSP, which renders the CDN-backed
+# pages blank; the vendored assets in static/ make /docs and /redoc depend
+# only on this service. openapi_url stays at its default (/openapi.json) and
+# is still generated live from the router tree, so new endpoints appear
+# automatically. See docs/api-docs.md.
+app = FastAPI(
+    title="qiita-control-plane",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+)
 app.include_router(api_router)
 app.include_router(landing_router)
 app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+
+@app.get("/docs", include_in_schema=False)
+async def swagger_ui() -> HTMLResponse:
+    """Interactive Swagger UI, served from vendored assets (no CDN)."""
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=f"{app.title} — API docs",
+        oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
+        swagger_js_url="/static/swagger-ui-bundle.js",
+        swagger_css_url="/static/swagger-ui.css",
+    )
+
+
+@app.get(app.swagger_ui_oauth2_redirect_url, include_in_schema=False)
+async def swagger_ui_redirect() -> HTMLResponse:
+    """OAuth2 redirect target the Swagger UI 'Authorize' flow posts back to."""
+    return get_swagger_ui_oauth2_redirect_html()
+
+
+@app.get("/redoc", include_in_schema=False)
+async def redoc_ui() -> HTMLResponse:
+    """Read-only ReDoc rendering, served from vendored assets (no CDN)."""
+    return get_redoc_html(
+        openapi_url=app.openapi_url,
+        title=f"{app.title} — API docs",
+        redoc_js_url="/static/redoc.standalone.js",
+        with_google_fonts=False,
+    )
 
 
 @app.get("/health")
