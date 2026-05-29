@@ -282,11 +282,19 @@ PATH_BIOSAMPLE_LIST_BY_STUDY = "/{study_idx}/biosample/list-idxs"
 
 PATH_BIOSAMPLE_PREFIX = "/biosample"
 PATH_BIOSAMPLE_BY_IDX = "/{biosample_idx}"
+# Bulk lookup of biosample_idx by biosample_accession. POST (not GET)
+# because the accession list lives in the body — a typical bcl-convert
+# pool carries ~384 accessions, which exceeds nginx's default URL-line
+# cap when threaded through query-params. The response shape carries the
+# resolved {accession: idx} map plus a missing[] list so the CLI can
+# fail-fast naming every miss without N round trips.
+PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
 
 URL_BIOSAMPLE_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY}"
 URL_BIOSAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}"
 URL_BIOSAMPLE_PREFIX = f"{API_PREFIX}{PATH_BIOSAMPLE_PREFIX}"
 URL_BIOSAMPLE_BY_IDX = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}"
+URL_BIOSAMPLE_LOOKUP_BY_ACCESSION = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}"
 
 
 # =============================================================================

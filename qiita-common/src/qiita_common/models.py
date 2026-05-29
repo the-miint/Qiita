@@ -637,6 +637,41 @@ class BiosampleResponse(BaseModel):
     caller_system_role: SystemRole
 
 
+class BiosampleLookupByAccessionRequest(BaseModel):
+    """Body for POST /api/v1/biosample/lookup-by-accession.
+
+    Resolves a list of NCBI BioSample accession strings (or any
+    biosample_accession value the deploy stores) to their qiita.biosample
+    idxs in one round trip. Used by qiita submit-bcl-convert to translate
+    the preflight rows' biosample_accession values into the biosample_idx
+    the sequenced-sample composer route requires.
+
+    The request body is the natural place for the list because a typical
+    bcl-convert pool carries 384 accessions, which exceeds nginx's
+    default URL-line cap when threaded through repeated query
+    parameters; the body has no such cap.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    accessions: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1, max_length=10_000)
+
+
+class BiosampleLookupByAccessionResponse(BaseModel):
+    """Returned by POST /api/v1/biosample/lookup-by-accession.
+
+    `resolved` maps each found accession to its biosample_idx. `missing`
+    lists accessions that did not resolve, in input order (deduped). The
+    CLI surfaces `missing` to the operator with no side effects when it
+    is non-empty so a missing biosample can be imported before re-running.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    resolved: dict[str, Annotated[int, Field(gt=0)]]
+    missing: list[str]
+
+
 class PatchRequestModel(BaseModel):
     """Base class for every PATCH-body Pydantic model in the API.
 

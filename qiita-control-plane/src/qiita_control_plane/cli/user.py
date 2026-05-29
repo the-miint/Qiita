@@ -15,17 +15,23 @@ from ~/.qiita/token (mode 0600).
 
 import argparse
 import base64
+import sqlite3
 import sys
 from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
-from qiita_common.api_paths import PATH_WORK_TICKET_PREFIX
+from qiita_common.api_paths import (
+    PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
+    PATH_BIOSAMPLE_PREFIX,
+    PATH_WORK_TICKET_PREFIX,
+)
 from qiita_common.illumina import (
     instrument_model_from_run_folder,
     instrument_run_id_from_run_folder,
 )
 from qiita_common.models import (
     BiosampleImportRequest,
+    BiosampleLookupByAccessionRequest,
     Platform,
     ScopeTargetKind,
     SequencedPoolCreateRequest,
@@ -45,6 +51,25 @@ from . import _common
 # coordinated change.
 _BCL_CONVERT_ACTION_ID = "bcl-convert"
 _BCL_CONVERT_ACTION_VERSION = "1.0.0"
+
+# Per-row pull from the kl-run-preflight SQLite. Joins prepped_sample →
+# compression_sample → input_sample for the (Sample_ID, accession) pair the
+# CLI needs, and falls back through input_plate.primary_project_idx for
+# control rows whose input_sample.project_idx is NULL (the upstream
+# schema's control-row convention). project.qiita_id is the deploy's Qiita
+# study_idx encoded as a string — the CLI casts to int per row.
+_PREFLIGHT_ROWS_SQL = """
+SELECT
+    prs.prepped_sample_idx AS prepped_sample_idx,
+    ins.biosample_accession AS biosample_accession,
+    p.qiita_id AS qiita_id
+FROM prepped_sample prs
+JOIN compression_sample cs ON cs.compression_sample_idx = prs.compression_sample_idx
+JOIN input_sample ins ON ins.input_sample_idx = cs.input_sample_idx
+JOIN input_plate ip ON ip.input_plate_idx = ins.input_plate_idx
+JOIN project p ON p.project_idx = COALESCE(ins.project_idx, ip.primary_project_idx)
+ORDER BY prs.prepped_sample_idx
+"""
 
 # ---------------------------------------------------------------------------
 # HTTP helpers (call sites for individual endpoints)
@@ -643,8 +668,74 @@ def _handle_ticket_status(args: argparse.Namespace, parser: argparse.ArgumentPar
     )
 
 
+def _read_preflight_rows(
+    preflight_blob: Path, parser: argparse.ArgumentParser
+) -> list[tuple[int, str, int]]:
+    """Open the preflight SQLite and return one tuple per illumina_sample.
+
+    Each tuple is ``(prepped_sample_idx, biosample_accession, study_idx)``.
+    ``study_idx`` is parsed from ``project.qiita_id`` (a text column on
+    the preflight side; the deploy convention is that it holds the Qiita
+    study_idx encoded as a string).
+
+    Errors that the operator can fix (file not a SQLite, project.qiita_id
+    not numeric, a row missing biosample_accession) raise via parser.error
+    so the CLI surfaces a single stderr line and exits 2 before any
+    network call.
+    """
+    try:
+        conn = sqlite3.connect(f"file:{preflight_blob}?mode=ro", uri=True)
+    except sqlite3.DatabaseError as exc:
+        parser.error(f"--preflight-blob {preflight_blob}: not a readable SQLite file: {exc}")
+    try:
+        # The SQL pulls input_plate via the join so the
+        # COALESCE(ins.project_idx, ip.primary_project_idx) fallback covers
+        # the upstream control-row convention without forcing a separate
+        # query.
+        rows = conn.execute(_PREFLIGHT_ROWS_SQL).fetchall()
+    except sqlite3.DatabaseError as exc:
+        parser.error(
+            f"--preflight-blob {preflight_blob}: preflight schema query failed ({exc});"
+            " verify the file is a kl-run-preflight SQLite"
+        )
+    finally:
+        conn.close()
+
+    if not rows:
+        parser.error(
+            f"--preflight-blob {preflight_blob} contains no illumina_sample rows;"
+            " a bcl-convert submission needs at least one sample to demultiplex"
+        )
+
+    parsed: list[tuple[int, str, int]] = []
+    for prepped_sample_idx, biosample_accession, qiita_id in rows:
+        if not biosample_accession:
+            parser.error(
+                f"--preflight-blob {preflight_blob}: prepped_sample_idx"
+                f" {prepped_sample_idx} carries no biosample_accession; populate"
+                " upstream before re-submitting"
+            )
+        try:
+            study_idx = int(qiita_id)
+        except TypeError, ValueError:
+            parser.error(
+                f"--preflight-blob {preflight_blob}: project.qiita_id"
+                f" {qiita_id!r} (prepped_sample_idx {prepped_sample_idx}) is not"
+                " an integer study_idx; the deploy convention is that"
+                " project.qiita_id holds the Qiita study_idx as text"
+            )
+        if study_idx <= 0:
+            parser.error(
+                f"--preflight-blob {preflight_blob}: project.qiita_id"
+                f" {qiita_id!r} resolves to non-positive study_idx {study_idx};"
+                " expected a positive Qiita study_idx"
+            )
+        parsed.append((int(prepped_sample_idx), biosample_accession, study_idx))
+    return parsed
+
+
 def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    """Bundle the three POSTs the bcl-convert submission flow makes.
+    """Bundle the bcl-convert submission flow into one operator gesture.
 
     1. POST /sequencing-run — instrument_run_id, instrument_model, and
        platform all derived from `--bcl-input-dir` via the shared
@@ -655,21 +746,26 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
     2. POST /sequencing-run/{run_idx}/sequenced-pool — attaches the
        blob read from `--preflight-blob` (refuses empty), with the file
        basename as ``run_preflight_filename``.
-    3. POST /work-ticket — target_kind sequenced_pool, the two idxs
+    3. For each preflight ``illumina_sample`` row: POST the
+       sequenced-sample composer with the resolved biosample_idx (from
+       step 2.5 below), the per-row study_idx (preflight
+       ``project.qiita_id``), the operator-supplied prep_protocol_idx,
+       and ``sequenced_pool_item_id = str(prepped_sample_idx)`` so the
+       eventual fastq-to-parquet step keys on the bcl-convert fastq
+       basename prefix.
+    4. POST /work-ticket — target_kind sequenced_pool, the two idxs
        from steps 1 and 2, action_id+version pinned at the top of this
        module, action_context carrying the absolute bcl_input_dir.
 
-    All three calls share one PAT (one ``run_http_subcommand`` invocation,
-    one ``read_token``) so a partial-failure retry uses the same
-    credential. Find-or-create semantics on steps 1 and 2 mean a re-run
-    converges on the existing rows; the in-flight uniqueness index on
-    work_ticket means a stuck ticket surfaces as a 409 with the existing
-    ticket idx so the operator can pick recovery (wait or delete) before
-    re-submitting.
+    Step 2.5 (before any 1/2 side effects): POST
+    /biosample/lookup-by-accession with the deduped preflight
+    accessions. If `missing` is non-empty, print the list and exit 1
+    with no side effects — the operator imports the missing
+    biosamples and re-runs. Find-or-create on 1 and 2 means a partial-
+    failure retry converges on the same rows.
 
-    Reports per resource whether it was reused (200) or freshly minted
-    (201) so the operator can confirm the find-or-create branches the
-    submission landed on.
+    All calls share one PAT (one ``run_http_subcommand`` invocation,
+    one ``read_token``) so retries use the same credential.
     """
     if not args.bcl_input_dir.is_absolute():
         parser.error(f"--bcl-input-dir must be absolute, got {args.bcl_input_dir}")
@@ -691,24 +787,68 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
     except ValueError as exc:
         parser.error(str(exc))
 
-    # SequencingRunCreateRequest body. platform is fixed to illumina —
-    # the parser already filtered PacBio out at load time, so any folder
-    # name that produced an instrument_model is by definition Illumina.
+    # Open the preflight SQLite locally and pull the per-sample rows
+    # before any network call. Errors here are operator-actionable and
+    # land as parser.error / exit 2.
+    preflight_rows = _read_preflight_rows(args.preflight_blob, parser)
+
+    # Dedup accessions while preserving input order so the lookup-by-
+    # accession route's `missing` echo is deterministic.
+    unique_accessions: list[str] = []
+    seen: set[str] = set()
+    for _prepped, accession, _study in preflight_rows:
+        if accession not in seen:
+            seen.add(accession)
+            unique_accessions.append(accession)
+
+    lookup_body = BiosampleLookupByAccessionRequest(
+        accessions=unique_accessions,
+    ).model_dump(mode="json")
     run_body = SequencingRunCreateRequest(
         instrument_run_id=instrument_run_id,
         platform=Platform.ILLUMINA,
         instrument_model=instrument_model,
     ).model_dump(exclude_unset=True, mode="json")
-
-    # SequencedPoolCreateRequest. Pydantic's Base64Bytes validator decodes
-    # base64 on construction, so the encode here cancels with that decode
-    # and the on-wire form is the canonical base64 string.
     pool_body = SequencedPoolCreateRequest(
         run_preflight_blob=base64.b64encode(blob_bytes).decode("ascii"),
         run_preflight_filename=args.preflight_blob.name,
     ).model_dump(exclude_unset=True, mode="json")
 
     def _run(token: str) -> dict:
+        # Resolve the caller's principal_idx via whoami once for the
+        # per-sample owner_idx — composer requires it, route does not
+        # auto-fill it server-side.
+        owner_idx = _common.whoami(args.base_url, token)["principal_idx"]
+
+        # Step 2.5: resolve every accession before any side effect. A
+        # non-empty `missing` is the fail-fast path — print the misses
+        # and exit 1 with no sequencing_run / sequenced_pool created.
+        lookup_resp = _common.call(
+            "POST",
+            args.base_url,
+            token,
+            f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}",
+            json=lookup_body,
+        )
+        resolved: dict[str, int] = lookup_resp["resolved"]
+        missing: list[str] = lookup_resp["missing"]
+        if missing:
+            # Names every offending preflight row so the operator can
+            # locate the upstream record.
+            misses_per_row = [
+                f"  - {accession} (prepped_sample_idx={prepped})"
+                for prepped, accession, _study in preflight_rows
+                if accession in missing
+            ]
+            print(
+                f"error: {len(missing)} preflight biosample accession"
+                f"{'s' if len(missing) != 1 else ''} not found in qiita:\n"
+                + "\n".join(misses_per_row)
+                + "\nimport the missing biosample(s) and re-run.",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
         run_resp, run_status = _common.call_with_status(
             "POST",
             args.base_url,
@@ -727,9 +867,44 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
         )
         sequenced_pool_idx = pool_resp["sequenced_pool_idx"]
 
-        # WorkTicketCreateRequest. action_context carries the absolute
-        # bcl_input_dir as a string (Pydantic does not serialize Path
-        # objects via JSON by default, so the cast is explicit).
+        # Step 3: one sequenced-sample POST per preflight row. The
+        # composer route runs each POST inside its own transaction, so a
+        # mid-loop failure leaves a partial pool — the operator re-runs
+        # the CLI and find-or-create on the run + pool plus
+        # ON CONFLICT on the (pool_idx, pool_item_id) uniqueness lands
+        # the rest. The composer route's own uniqueness check makes
+        # repeat POSTs of the same (pool_idx, sequenced_pool_item_id) a
+        # 409 — the CLI does NOT swallow this, so any divergence
+        # (e.g. someone re-ran with a different prep_protocol_idx)
+        # surfaces to the operator.
+        per_sample_results: list[dict] = []
+        for prepped_sample_idx, accession, study_idx in preflight_rows:
+            sample_body = SequencedSampleCreateRequest(
+                biosample_idx=resolved[accession],
+                owner_idx=owner_idx,
+                prep_protocol_idx=args.prep_protocol_idx,
+                sequenced_pool_item_id=str(prepped_sample_idx),
+                primary_study_idx=study_idx,
+            ).model_dump(exclude_unset=True, mode="json")
+            sample_resp = _common.call(
+                "POST",
+                args.base_url,
+                token,
+                f"/sequencing-run/{sequencing_run_idx}/sequenced-pool"
+                f"/{sequenced_pool_idx}/sequenced-sample",
+                json=sample_body,
+            )
+            per_sample_results.append(
+                {
+                    "prepped_sample_idx": prepped_sample_idx,
+                    "biosample_accession": accession,
+                    "biosample_idx": resolved[accession],
+                    "primary_study_idx": study_idx,
+                    "sequenced_sample_idx": sample_resp["sequenced_sample_idx"],
+                }
+            )
+
+        # Step 4: submit the bcl-convert work_ticket against the pool.
         ticket_body = WorkTicketCreateRequest(
             action_id=_BCL_CONVERT_ACTION_ID,
             action_version=_BCL_CONVERT_ACTION_VERSION,
@@ -757,6 +932,7 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
                 "sequenced_pool_idx": sequenced_pool_idx,
                 "status": "created" if pool_status == 201 else "reused",
             },
+            "sequenced_samples": per_sample_results,
             "work_ticket": ticket_resp,
             # Echo the args the orchestrator side will see so the
             # operator can sanity-check before the workflow runs.
