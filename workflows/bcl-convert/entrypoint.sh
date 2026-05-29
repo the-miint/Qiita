@@ -35,19 +35,26 @@ BCL_INPUT_DIR=$(jq -er '.inputs.bcl_input_dir' "${PARAMS_JSON}")
 CONVERT_DIR="${QIITA_OUTPUT_PATH}/ConvertJob"
 mkdir -p "${CONVERT_DIR}"
 
-# Thread flags are hardcoded to 16 — every A4 profile in workflows/bcl-convert/
-# 1.0.0.yaml declares cpu=16. If a future workflow YAML adds a profile with a
-# different cpu, this entrypoint will need a matching dispatch and the YAML
-# must include the thread count in an `instrument_threads` output the prep
-# step writes alongside instrument_model.
+# bcl-convert thread counts track the CPUs SLURM allocated to this step rather
+# than a hardcoded constant, so they can't drift from the resolved A4 profile.
+# SLURM_CPUS_PER_TASK is exactly the cpu the resolved profile asked for
+# (SlurmBackend sets cpus_per_task = baseline_resources.cpu in slurm/payload.py),
+# so a future profile in workflows/bcl-convert/1.0.0.yaml with a different cpu
+# needs no entrypoint change. Fall back to nproc, then 1, when SLURM didn't
+# export it (e.g. local apptainer runs).
+THREADS="${SLURM_CPUS_PER_TASK:-}"
+if [[ -z "${THREADS}" ]]; then
+    THREADS=$(nproc 2>/dev/null || echo 1)
+fi
+
 bcl-convert \
     --sample-sheet "${SAMPLESHEET}" \
     --bcl-input-directory "${BCL_INPUT_DIR}" \
     --output-directory "${CONVERT_DIR}" \
-    --bcl-num-decompression-threads 16 \
-    --bcl-num-conversion-threads 16 \
-    --bcl-num-compression-threads 16 \
-    --bcl-num-parallel-tiles 16 \
+    --bcl-num-decompression-threads "${THREADS}" \
+    --bcl-num-conversion-threads "${THREADS}" \
+    --bcl-num-compression-threads "${THREADS}" \
+    --bcl-num-parallel-tiles "${THREADS}" \
     --bcl-sampleproject-subdirectories true \
     --force
 
