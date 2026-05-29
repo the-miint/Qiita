@@ -1,5 +1,8 @@
 # API documentation surface
 
+*Audience: maintainers (who refresh the vendored assets) and operators (who
+deploy). The URL table at the top is the only end-user-facing part.*
+
 The control plane publishes interactive, always-current OpenAPI documentation:
 
 | URL | What it is |
@@ -35,8 +38,8 @@ result depends only on this service — the same origin already serving the
 API. `tests/test_api_docs.py` asserts the rendered pages contain no
 external-CDN references.
 
-The files ride along in the wheel like any other package data (verified:
-`unzip -l` on the built wheel lists them under `static/`), so there is
+The files ride along in the wheel like any other package data (hatchling
+packages everything under `src/qiita_control_plane/`), so there is
 **nothing to script at deploy time** — `make build` + restart picks them up
 exactly as it does `landing.css`.
 

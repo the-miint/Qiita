@@ -12,12 +12,28 @@ app is driven without lifespan via httpx + ASGITransport (same pattern as
 test_landing.py).
 """
 
+from pathlib import Path
+
 from httpx import ASGITransport, AsyncClient
 
 # Substrings that betray a leak back to an external CDN / font host. The
 # whole point of vendoring is that none of these appear in the rendered
 # shells.
 _CDN_MARKERS = ("jsdelivr", "cdn.", "unpkg", "googleapis", "gstatic")
+
+# Host markers to scan inside the vendored asset bodies themselves. Kept
+# precise (full hostnames, not the bare "cdn." used for the HTML shells)
+# so a minified bundle that happens to contain those bytes in code doesn't
+# false-positive. A bad asset refresh (a build that pulls fonts/sourcemaps
+# from a CDN) is exactly what this guards.
+_ASSET_HOST_MARKERS = ("cdn.jsdelivr", "fonts.googleapis", "fonts.gstatic", "unpkg.com")
+
+_STATIC_DIR = Path(__file__).resolve().parent.parent / "src" / "qiita_control_plane" / "static"
+_VENDORED_ASSETS = (
+    "swagger-ui-bundle.js",
+    "swagger-ui.css",
+    "redoc.standalone.js",
+)
 
 
 def _client():
@@ -62,9 +78,12 @@ async def test_redoc_served_from_local_assets():
 
 async def test_swagger_oauth2_redirect_served():
     """The 'Authorize' flow posts back to this route; Swagger UI 404s the
-    handshake without it."""
+    handshake without it. Resolve the path from the app rather than a
+    literal so a future custom redirect URL keeps this test honest."""
+    from qiita_control_plane.main import app
+
     async with _client() as ac:
-        r = await ac.get("/docs/oauth2-redirect")
+        r = await ac.get(app.swagger_ui_oauth2_redirect_url)
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/html")
 
@@ -87,3 +106,14 @@ async def test_vendored_assets_present_and_typed():
     assert redoc_js.headers["content-type"].startswith(
         ("text/javascript", "application/javascript")
     )
+
+
+def test_vendored_assets_contain_no_cdn_references():
+    """Guards the refresh procedure in docs/api-docs.md: a re-download that
+    pulls a build referencing a CDN font/sourcemap would reintroduce the
+    exact external dependency vendoring exists to remove. Scan the on-disk
+    bundles, not just the rendered shells."""
+    for name in _VENDORED_ASSETS:
+        body = (_STATIC_DIR / name).read_text(encoding="utf-8", errors="ignore")
+        for marker in _ASSET_HOST_MARKERS:
+            assert marker not in body, f"{name} references external host: {marker!r}"
