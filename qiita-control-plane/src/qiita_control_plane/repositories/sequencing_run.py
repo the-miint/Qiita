@@ -155,8 +155,10 @@ def _assert_jsonb_matches(
     field: str, existing_raw: str | None, supplied_value: dict[str, Any] | None
 ) -> None:
     """JSONB equality. Postgres returns JSONB as a string via asyncpg's
-    default codec; canonical-form (sort_keys) comparison ignores key-order
-    differences in the stored JSON."""
+    default codec, so we json.loads the stored value back into a dict and
+    compare with the supplied dict — Python dict equality is itself
+    order-insensitive, so key-order differences in the stored JSON don't
+    produce a spurious mismatch."""
     if supplied_value is None:
         return
     existing_value = json.loads(existing_raw) if existing_raw is not None else None

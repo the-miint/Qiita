@@ -4,8 +4,9 @@
 # Read the inputs from params.json (the SLURM native-step launcher writes
 # this on the host before exec'ing apptainer), run bcl-convert against the
 # rehydrated sample sheet and BCL run folder, emit the per-step manifest,
-# and chmod the entire output tree to 0440 — the data-plane verifier rejects
-# any output file at a stricter or looser mode.
+# and chmod every output *file* to 0440 — the data-plane verifier rejects
+# any output file at a stricter or looser mode. Directories are left
+# traversable (0550) so the verifier's rglob walk can descend.
 set -euo pipefail
 
 if [[ -z "${QIITA_INPUT_PATH:-}" ]]; then
@@ -56,7 +57,13 @@ bcl-convert \
 # produced.
 python3 /opt/qiita/manifest_writer.py "${QIITA_OUTPUT_PATH}" convert_dir=ConvertJob
 
-# Verifier requires every file under QIITA_OUTPUT_PATH at mode 0440. chmod
-# walks the tree after the manifest is written so manifest.json gets the
-# same treatment as the FASTQs.
-chmod -R 0440 "${QIITA_OUTPUT_PATH}"
+# Verifier requires every file under QIITA_OUTPUT_PATH at mode 0440 and
+# finds them by walking the tree (rglob), which needs the traverse (x) bit
+# on every directory — a blanket `chmod -R 0440` would strip it and a
+# non-owning verifier process could no longer descend. So chmod files and
+# directories separately: files 0440 (the verified contract), directories
+# 0550 (r-x: walkable, not writable). Runs after the manifest is written so
+# manifest.json gets the same 0440 as the FASTQs. The verifier only checks
+# file mode, never directory mode, so 0550 dirs pass.
+find "${QIITA_OUTPUT_PATH}" -type d -exec chmod 0550 {} +
+find "${QIITA_OUTPUT_PATH}" -type f -exec chmod 0440 {} +

@@ -7,8 +7,9 @@ The manifest carries two top-level keys:
     each entry ``{path, size_bytes}`` where ``path`` is relative to the
     output root and uses forward slashes. ``manifest.json`` itself is
     excluded so the manifest is self-describing without referencing
-    itself (mirrors the native-step launcher's behaviour at
-    qiita_compute_orchestrator/jobs/__main__.py:83-89).
+    itself (mirrors the native-step launcher's manifest file-walk in
+    qiita_compute_orchestrator/jobs/__main__.py — keep the two in
+    lockstep; the launcher applies the same self-exclusion).
   * ``outputs``: ``{name: relative_path}`` keyed on the YAML's
     ``outputs:`` declaration; the verifier resolves the value to either
     a file in ``files`` or a directory whose contents are.

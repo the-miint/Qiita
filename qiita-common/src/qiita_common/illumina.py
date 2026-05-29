@@ -71,6 +71,27 @@ def load_instrument_prefix_table() -> dict[str, str]:
 _INSTRUMENT_PREFIXES = load_instrument_prefix_table()
 
 
+def _split_run_folder(folder_name: str) -> list[str]:
+    """Split a BCL run folder name into its underscore-separated segments,
+    enforcing the Illumina convention
+    ``<YYMMDD>_<InstrumentSerial>_<RunNum>_<FlowcellID>`` (at least four
+    segments).
+
+    Single home for the convention string and the segment-count check so
+    ``instrument_run_id_from_run_folder`` and
+    ``instrument_model_from_run_folder`` validate identically — both call
+    this so a partial parse cannot silently succeed in one path while the
+    other rejects it. Raises ``ValueError`` on a non-conforming name.
+    """
+    parts = folder_name.split("_")
+    if len(parts) < 4:
+        raise ValueError(
+            f"BCL run folder name does not match Illumina convention "
+            f"<YYMMDD>_<InstrumentSerial>_<RunNum>_<FlowcellID>: {folder_name!r}"
+        )
+    return parts
+
+
 def instrument_run_id_from_run_folder(folder_name: str) -> str:
     """Return the instrument_run_id encoded in a BCL run folder name.
 
@@ -81,17 +102,12 @@ def instrument_run_id_from_run_folder(folder_name: str) -> str:
     re-type the folder name; the helper exists so the contract lives in
     one place if Illumina ever changes the convention.
 
-    Raises ``ValueError`` on a folder name that does not have at least
-    four underscore-separated segments. The downstream
-    ``instrument_model_from_run_folder`` enforces the same shape — both
-    are checked so a partial parse cannot silently succeed.
+    Raises ``ValueError`` (via ``_split_run_folder``) on a folder name
+    that does not have at least four underscore-separated segments. The
+    downstream ``instrument_model_from_run_folder`` enforces the same
+    shape — both are checked so a partial parse cannot silently succeed.
     """
-    parts = folder_name.split("_")
-    if len(parts) < 4:
-        raise ValueError(
-            f"BCL run folder name does not match Illumina convention "
-            f"<YYMMDD>_<InstrumentSerial>_<RunNum>_<FlowcellID>: {folder_name!r}"
-        )
+    _split_run_folder(folder_name)
     return folder_name
 
 
@@ -111,12 +127,7 @@ def instrument_model_from_run_folder(folder_name: str) -> str:
     ``BackendFailure(BAD_INPUT)`` for the orchestrator path; the CLI
     prints the message and exits non-zero.
     """
-    parts = folder_name.split("_")
-    if len(parts) < 4:
-        raise ValueError(
-            f"BCL run folder name does not match Illumina convention "
-            f"<YYMMDD>_<InstrumentSerial>_<RunNum>_<FlowcellID>: {folder_name!r}"
-        )
+    parts = _split_run_folder(folder_name)
     serial = parts[1]
     for prefix in sorted(_INSTRUMENT_PREFIXES, key=len, reverse=True):
         if serial.startswith(prefix):

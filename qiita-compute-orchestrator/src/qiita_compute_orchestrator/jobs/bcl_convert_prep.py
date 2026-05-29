@@ -18,6 +18,16 @@ Folder-name parsing lives in qiita_common.illumina so the user CLI
 (qiita submit-bcl-convert) and the launcher-side prep step share one
 implementation against one vendored prefix table.
 
+Why this step is native (``module:``) and not a container, despite
+CLAUDE.md's "bioinformatics deps belong in a container" rule: the work
+is a CP fetch + a SQLite→CSV rehydrate + a folder-name string parse — no
+heavy bioinformatics binaries and no system packages. The one external
+dep (``run_preflight``) is a pure-Python, git-pinned library light enough
+to ship in the orchestrator's ``pyproject.toml``; the actual heavy lifting
+(``bcl-convert`` itself) is the downstream ``container:`` step. Keeping the
+prep native avoids a second SIF for what is otherwise a few hundred lines
+of glue.
+
 External dependency: ``run_preflight.legacy.api.save_legacy_csv``. The
 import is deferred to ``execute()`` so module collection (pytest) and the
 launcher's import-on-dispatch never fail just because the dep is not

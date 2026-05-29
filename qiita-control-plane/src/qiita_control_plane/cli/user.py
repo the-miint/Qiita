@@ -23,6 +23,9 @@ from pydantic import BaseModel, ValidationError
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     PATH_BIOSAMPLE_PREFIX,
+    PATH_SEQUENCED_SAMPLE_FROM_RUN,
+    PATH_SEQUENCING_RUN_PREFIX,
+    PATH_SEQUENCING_RUN_SEQUENCED_POOL,
     PATH_WORK_TICKET_PREFIX,
 )
 from qiita_common.illumina import (
@@ -853,7 +856,7 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
             "POST",
             args.base_url,
             token,
-            "/sequencing-run",
+            PATH_SEQUENCING_RUN_PREFIX,
             json=run_body,
         )
         sequencing_run_idx = run_resp["sequencing_run_idx"]
@@ -862,7 +865,8 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
             "POST",
             args.base_url,
             token,
-            f"/sequencing-run/{sequencing_run_idx}/sequenced-pool",
+            f"{PATH_SEQUENCING_RUN_PREFIX}"
+            f"{PATH_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=sequencing_run_idx)}",
             json=pool_body,
         )
         sequenced_pool_idx = pool_resp["sequenced_pool_idx"]
@@ -886,12 +890,15 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
                 sequenced_pool_item_id=str(prepped_sample_idx),
                 primary_study_idx=study_idx,
             ).model_dump(exclude_unset=True, mode="json")
+            sample_path = PATH_SEQUENCED_SAMPLE_FROM_RUN.format(
+                sequencing_run_idx=sequencing_run_idx,
+                sequenced_pool_idx=sequenced_pool_idx,
+            )
             sample_resp = _common.call(
                 "POST",
                 args.base_url,
                 token,
-                f"/sequencing-run/{sequencing_run_idx}/sequenced-pool"
-                f"/{sequenced_pool_idx}/sequenced-sample",
+                f"{PATH_SEQUENCING_RUN_PREFIX}{sample_path}",
                 json=sample_body,
             )
             per_sample_results.append(
