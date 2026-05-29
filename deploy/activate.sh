@@ -50,7 +50,10 @@ assert_migrations_applied() {
     }
 
     local db_url
-    db_url=$( set -a; # shellcheck disable=SC1090,SC1091
+    # set +e so a sourced line that happens to evaluate non-zero doesn't abort the
+    # subshell under the script's errexit and silently blank db_url (it would then
+    # misreport as "DATABASE_URL unset" instead of the real cause).
+    db_url=$( set +e; set -a; # shellcheck disable=SC1090,SC1091
               source "$env_file"; set +a; printf '%s' "${DATABASE_URL:-}" )
     [ -n "$db_url" ] || {
         echo "ERROR: DATABASE_URL unset in $env_file — cannot verify migrations; refusing to deploy blind." >&2

@@ -25,7 +25,7 @@ If none apply, say so and stop — make no edit.
 ## 2. Fold into the right bucket — merge, don't append
 
 Edit `## Pending deploy` in `CHANGELOG.md`. Place each item in its bucket: **1. Env vars**, **2. One-time host setup**, **3. Migrations**, **5. Verify** (add a check for what you introduced), **Notes** (no-action items). Rules:
-- **Merge into the existing block, don't duplicate it.** If bucket 1 already has a `compute-orchestrator.env` `tee` block, add your var as another line inside it — do not create a second CO block. Same for the migration list and verify checks.
+- **Merge into the existing lines, don't duplicate them.** If bucket 1 already appends to `compute-orchestrator.env` (one idempotent `sudo bash -c 'grep -q … || echo "KEY=value" >> …'` per var), add your var as another such line next to them — do not start a second CO group. Same for the migration list and verify checks.
 - **Tag every line you add with `(#N)`** (the PR/branch ref) so the archive step and the operator can trace provenance.
 - **Keep it concise** — a copy-pasteable command and a half-line of why, matching the surrounding style. No prose narration of the change; the git log covers that.
 - Respect ordering: anything `from_env()` requires goes in bucket 1 (must precede the restart); migrations in bucket 3; verification in bucket 5.

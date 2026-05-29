@@ -20,7 +20,8 @@ Everything merged but not yet deployed. Run buckets 1→5 in order; buckets 1–
 # root:qiita-data), so reads and writes go through sudo — and the redirect itself
 # must run as root, hence `sudo bash -c '... >> file'` (a bare `sudo ... >> file`
 # would redirect as your unprivileged shell and fail). One line per var so the
-# block copy/pastes cleanly. `>>` appends — never `>`, which clobbers the file.
+# block copy/pastes cleanly. Each append is guarded by `grep -q ... ||`, so the
+# whole block is idempotent — safe to re-run after a partial/failed deploy.
 
 # (#49) UPLOAD_STAGING_ROOT is a NEW dir under the shared scratch FS. Set it ONCE on
 # the CP side; the DP value and the dir (bucket 2) are read back from it. First, see
@@ -28,17 +29,17 @@ Everything merged but not yet deployed. Run buckets 1→5 in order; buckets 1–
 sudo grep -hE '^(WORK_TICKET_WORKSPACE_ROOT|DUCKLAKE_DATA_PATH|UPLOAD_STAGING_ROOT)=' /etc/qiita/control-plane.env /etc/qiita/data-plane.env 2>/dev/null
 
 # control-plane.env — substitute <scratch> with a path under the scratch FS shown above
-sudo bash -c 'echo "CONTACT_EMAIL=qiita.help@gmail.com" >> /etc/qiita/control-plane.env'                   # (#issue-53) landing-page mailto
-sudo bash -c 'echo "UPLOAD_STAGING_ROOT=<scratch>/upload-staging" >> /etc/qiita/control-plane.env'         # (#49)
+sudo bash -c 'grep -q "^CONTACT_EMAIL=" /etc/qiita/control-plane.env || echo "CONTACT_EMAIL=qiita.help@gmail.com" >> /etc/qiita/control-plane.env'                 # (#issue-53)
+sudo bash -c 'grep -q "^UPLOAD_STAGING_ROOT=" /etc/qiita/control-plane.env || echo "UPLOAD_STAGING_ROOT=<scratch>/upload-staging" >> /etc/qiita/control-plane.env'  # (#49)
 
 # data-plane.env — derived from the CP value (byte-identical, no retyping)   (#49)
-sudo bash -c 'grep "^UPLOAD_STAGING_ROOT=" /etc/qiita/control-plane.env >> /etc/qiita/data-plane.env'
+sudo bash -c 'grep -q "^UPLOAD_STAGING_ROOT=" /etc/qiita/data-plane.env || grep "^UPLOAD_STAGING_ROOT=" /etc/qiita/control-plane.env >> /etc/qiita/data-plane.env'
 
 # compute-orchestrator.env
-sudo bash -c 'echo "SLURM_NATIVE_PYTHON=/home/qiita/qiita-miint/qiita-compute-orchestrator/.venv/bin/python" >> /etc/qiita/compute-orchestrator.env'   # (#57)
-sudo bash -c 'echo "SLURM_QOS=qiita_norm" >> /etc/qiita/compute-orchestrator.env'                          # (#57)
-sudo bash -c 'echo "QIITA_CP_URL=https://qiita-miint.ucsd.edu" >> /etc/qiita/compute-orchestrator.env'     # (#57)
-sudo bash -c 'echo "QIITA_IMAGES_DIR=/scratch/persistent/images" >> /etc/qiita/compute-orchestrator.env'   # (#62) abs dir, visible from every compute node; validated at CO boot when COMPUTE_BACKEND=slurm
+sudo bash -c 'grep -q "^SLURM_NATIVE_PYTHON=" /etc/qiita/compute-orchestrator.env || echo "SLURM_NATIVE_PYTHON=/home/qiita/qiita-miint/qiita-compute-orchestrator/.venv/bin/python" >> /etc/qiita/compute-orchestrator.env'   # (#57)
+sudo bash -c 'grep -q "^SLURM_QOS=" /etc/qiita/compute-orchestrator.env || echo "SLURM_QOS=qiita_norm" >> /etc/qiita/compute-orchestrator.env'                      # (#57)
+sudo bash -c 'grep -q "^QIITA_CP_URL=" /etc/qiita/compute-orchestrator.env || echo "QIITA_CP_URL=https://qiita-miint.ucsd.edu" >> /etc/qiita/compute-orchestrator.env'   # (#57)
+sudo bash -c 'grep -q "^QIITA_IMAGES_DIR=" /etc/qiita/compute-orchestrator.env || echo "QIITA_IMAGES_DIR=/scratch/persistent/images" >> /etc/qiita/compute-orchestrator.env'   # (#62) abs dir, visible from every compute node; validated at CO boot when COMPUTE_BACKEND=slurm
 ```
 
 ### 2. One-time host setup
@@ -98,8 +99,7 @@ sudo SKIP_PULL=1 QIITA_HOSTNAME=qiita-miint.ucsd.edu /home/qiita/qiita-miint/dep
 
 ```bash
 # [admin]
-curl -fsS https://qiita-miint.ucsd.edu/healthz
-curl -fsS https://qiita-miint.ucsd.edu/health                                  # per-service pills (#58/#54)
+curl -fsS https://qiita-miint.ucsd.edu/health                                  # CP+CO+DP aggregate + per-service pills (#58/#54)
 sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
     psql "$DATABASE_URL" -c "SELECT action_id, version, enabled FROM qiita.action ORDER BY action_id;"'   # bcl-convert 1.0.0 enabled (#62)
 systemctl cat qiita-control-plane qiita-compute-orchestrator | grep UMask      # UMask=0007 dropins (#57)

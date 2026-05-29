@@ -130,8 +130,7 @@ step above — run `make migrate` and re-run this command.
 
 ```bash
 # [admin] services up + honest health
-curl -fsS https://qiita-miint.ucsd.edu/healthz
-curl -fsS https://qiita-miint.ucsd.edu/health         # per-service pills (CP/CO/DP)
+curl -fsS https://qiita-miint.ucsd.edu/health         # CP+CO+DP aggregate + per-service pills
 
 # [admin] workflow actions registered at expected versions
 sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
