@@ -1,166 +1,106 @@
 # CHANGELOG
 
-Operator-facing notes for deploying merged changes. Each entry lives under the PR that introduced it. Entries describe what the operator must do **on the deploy host** before / during `sudo local-deploy.sh` — not a general "what changed" summary; the git log already serves that audience.
+Operator-facing deploy instructions — **not** a "what changed" log (the git log serves that). `## Pending deploy` is the single consolidated checklist for the next deploy; `## Deployed history` archives past ones.
 
-The convention: when a PR adds a required env var, a new directory, a migration that needs out-of-band setup, or any other operator-visible action, append an entry to this file in the same PR. Reviewers check that the entry exists. Future operators read this file (`tail CHANGELOG.md`) before deploying to find out what's new since the last deploy.
+- **Deploying?** Follow [`docs/runbooks/redeploy.md`](docs/runbooks/redeploy.md) — it is the source of truth for the procedure (bucket order, `[admin]`/`[operator]` labels, the migration guard, archiving).
+- **Adding to a PR?** Fold your operator steps into the `## Pending deploy` buckets with `/deploy-note`; don't add a standalone entry. The authoring rules are in CLAUDE.md ("Operator-facing changes").
 
-Newest entry on top. Pre-deploy entries (PRs not yet merged to `main`) are allowed; mark them with the branch name and convert the heading to the PR number at merge.
-
----
-
-## `feat/post-first-smoke-fixes` — fix(deploy): close gaps surfaced by first user-CLI fastq-to-parquet smoke
-
-Bundled fixes from the first real end-to-end fastq-to-parquet run on
-the live deploy. Six items the operator needs to do on an existing
-deploy host before `sudo local-deploy.sh`; everything else is handled
-by the deploy script itself or runs out of the box on a fresh deploy.
-
-1. Confirm `qiita-pipeline` group membership. Both `qiita-api` and
-   `qiita-orch` must be members (commit 2 makes this a documented
-   prereq; not yet automated by `local-deploy.sh`). `qiita-data` and
-   `qiita-job` should already be members from the first deploy.
-   ```bash
-   # [admin]
-   id qiita-api qiita-orch qiita-data qiita-job | grep qiita-pipeline   # all four should match
-   # if any are missing:
-   sudo usermod -aG qiita-pipeline qiita-api qiita-orch qiita-data qiita-job
-   ```
-
-2. Provision the compute-node-visible orchestrator venv (commit 3
-   prereq). The smoke ran with this in place; the new
-   `SLURM_NATIVE_PYTHON` env var below points the native-step launcher
-   at this interpreter.
-   ```bash
-   # [operator]
-   sudo -u qiita bash -lc 'cd /home/qiita/qiita-miint/qiita-compute-orchestrator && uv sync --reinstall-package qiita-common'
-   ```
-   `--reinstall-package qiita-common` is required because of cross-
-   package staleness (see CLAUDE.md "Cross-package staleness"); plain
-   `uv sync` would leave a stale `qiita-common` in site-packages.
-
-3. Add the new env vars to `/etc/qiita/compute-orchestrator.env`:
-   ```bash
-   # [admin]
-   sudo tee -a /etc/qiita/compute-orchestrator.env <<'EOF'
-   SLURM_NATIVE_PYTHON=/home/qiita/qiita-miint/qiita-compute-orchestrator/.venv/bin/python
-   SLURM_QOS=qiita_norm
-   QIITA_CP_URL=https://qiita-miint.ucsd.edu
-   EOF
-   ```
-   `QIITA_CP_URL` was already supported on the CO side; this PR makes
-   it effectively required because the value is now propagated into
-   every SLURM job's env so the native-step launcher can call back
-   into the control plane from the compute node.
-
-4. Run the deploy. `deploy/local-deploy.sh` now also:
-   - rsyncs `workflows/` into `/opt/qiita/incoming/` and on to
-     `/opt/qiita/workflows/`,
-   - runs `qiita-admin actions sync` as `qiita-api` against that path
-     (idempotent — no-op if nothing changed),
-   - installs the `UMask=0007` systemd dropins for both
-     `qiita-control-plane` and `qiita-compute-orchestrator` under
-     `/etc/systemd/system/<unit>.service.d/umask.conf`, then
-     `daemon-reload` + restart.
-   ```bash
-   # [admin]
-   sudo QIITA_HOSTNAME=qiita-miint.ucsd.edu /home/qiita/qiita-miint/deploy/local-deploy.sh
-   ```
-
-5. Verify:
-   ```bash
-   # [admin]
-   # actions sync ran and at least one row is in qiita.action
-   sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; psql "$DATABASE_URL" -c "SELECT count(*) FROM qiita.action;"'
-   # UMask dropins installed and effective
-   systemctl cat qiita-compute-orchestrator | grep UMask
-   systemctl cat qiita-control-plane         | grep UMask
-   ```
-
-Also new in this PR (no operator action, just so you know what
-landed):
-
-- `qiita-admin ticket force-fail --idx N --stage <stage> [--step-name X]
-  --reason TEXT` replaces the previous "operator writes UPDATE
-  qiita.work_ticket by hand" recovery pattern. Mirrors the
-  `work_ticket_failure_step_name_consistent` CHECK constraint
-  client-side; refuses to overwrite an already-terminal ticket. See
-  `docs/runbooks/fastq-to-parquet-retry-recovery.md` for the supported
-  recovery path.
-- `SLURM_QOS` env var (empty default = "use the submitting user's
-  default QOS") so the orchestrator doesn't silently depend on
-  per-user defaults.
-- SlurmrestdClient now refuses to start when the JWT's `sun` claim
-  doesn't match `SLURMRESTD_USER_NAME` — catches a stale JWT before
-  it sends jobs as the wrong identity (which the first smoke
-  experienced).
-- The SLURM job env now carries `HOME=<workspace>` so DuckDB+miint's
-  extension cache lands inside the cleaned-up per-ticket workspace.
-- `qiita-admin compute-readiness` exercises the path `qiita-job` needs
-  end-to-end and reports per-check status. Local checks (SLURM JWT
-  shape + `sun` + `exp`, `SLURM_NATIVE_PYTHON` on host, `QIITA_CP_URL/
-  healthz` reachable with the CO→CP token) plus an optional SLURM
-  probe-job that runs the same checks from a compute node (orchestrator
-  venv visible there, shared FS writable, CP reachable from the
-  cluster). Step 10d of `docs/runbooks/first-deploy.md` shows the
-  expected pass/fail output. `--no-slurm-probe` runs host-only.
-- The SLURM job env now carries only the *outbound* CO→CP token, not
-  the inbound CP↔CO shared bearer. `Settings.from_env()` gained a
-  `require_cp_to_co_token` flag; `get_settings()`'s no-install
-  fallback (the SLURM-launcher path) passes `False`. Narrows the
-  `scontrol show job` exposure surface to the one token the launcher
-  actually uses.
+Substitute your host's FQDN for the `qiita-miint.ucsd.edu` examples and `<scratch>` for the scratch root chosen at first deploy.
 
 ---
 
-## `feat/issue-53-landing-and-invitation` — feat: public landing page + invitation acceptance fix
+## Pending deploy
 
-Fixes issue #53. Two user-visible problems addressed together:
+Everything merged but not yet deployed. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
 
-1. Visiting the bare host (`https://qiita-miint.ucsd.edu/`) returned `{"detail":"Not Found"}`. This PR adds a public landing page at `GET /` (project name, status badge, alpha / invitation-only / CLI-only callout, links into the repo, contact mailto).
-2. AuthRocket's post-invitation redirect to `/api/v1/auth/handoff?token=...` returned `401 login session missing` because the handoff route required a cookie that only the regular `/auth/login` flow sets. This PR makes the cookie optional in `/auth/handoff` — when absent, the route treats the request as an invitation acceptance, verifies the JWT alone, mints a PAT, and renders the same browser HTML the cookie-bearing flow does. CLI flow is unchanged.
+### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
-**New required env var on the CP: `CONTACT_EMAIL`.** Boot fails fast (`RuntimeError: CONTACT_EMAIL must be a local@domain.tld address`) when unset or malformed. The value renders into both `mailto:` links on the landing page (request access + need help).
+```bash
+# [admin] control-plane.env
+sudo tee -a /etc/qiita/control-plane.env <<'EOF'
+CONTACT_EMAIL=qiita-help@ucsd.edu                 # (#issue-53) renders into landing-page mailto links
+UPLOAD_STAGING_ROOT=<scratch>/upload-staging      # (#49) MUST be byte-identical to the DP value below
+EOF
 
-Before `sudo local-deploy.sh`:
+# [admin] data-plane.env
+echo "UPLOAD_STAGING_ROOT=<scratch>/upload-staging" | sudo tee -a /etc/qiita/data-plane.env   # (#49)
 
-1. Append `CONTACT_EMAIL` to the env file. Pick the address invitation requests and help requests should reach:
-   ```bash
-   # [admin]
-   echo "CONTACT_EMAIL=qiita-help@ucsd.edu" | sudo tee -a /etc/qiita/control-plane.env
-   ```
+# [admin] compute-orchestrator.env
+sudo tee -a /etc/qiita/compute-orchestrator.env <<'EOF'
+SLURM_NATIVE_PYTHON=/home/qiita/qiita-miint/qiita-compute-orchestrator/.venv/bin/python   # (#57)
+SLURM_QOS=qiita_norm                                                                       # (#57)
+QIITA_CP_URL=https://qiita-miint.ucsd.edu                                                  # (#57)
+QIITA_IMAGES_DIR=/scratch/persistent/images                                                # (#62) abs dir, visible from every compute node; validated at CO boot when COMPUTE_BACKEND=slurm
+EOF
+```
 
-2. Confirm the AuthRocket realm's invitation-acceptance redirect URI is set to `https://qiita-miint.ucsd.edu/api/v1/auth/handoff` in the AuthRocket admin dashboard. (Likely already there if you previously tried to fix this.) After this PR ships, that URL works without any cookie — invitation acceptance lands directly there with the JWT in the query string and mints a PAT.
+### 2. One-time host setup
 
-3. Now run `sudo local-deploy.sh`. No new migrations.
+```bash
+# (#57) qiita-pipeline group membership — verify, fix if needed   [admin]
+id qiita-api qiita-orch qiita-data qiita-job | grep qiita-pipeline    # all four should match
+sudo usermod -aG qiita-pipeline qiita-api qiita-orch qiita-data qiita-job   # only if any missing
 
-Also new in this PR (no operator action, just so you know what landed):
+# (#57) compute-node-visible orchestrator venv   [operator]
+sudo -u qiita bash -lc 'cd /home/qiita/qiita-miint/qiita-compute-orchestrator && uv sync --reinstall-package qiita-common'
 
-- `qiita.auth_event.detail.via` now carries `"invitation"` (alongside the existing `"cli_login"` / `"browser_login"`) so anyone reading auth-event audit rows can tell which entry point produced a given PAT.
+# (#49) upload-staging dir on shared scratch (DP writes as owner, CP reads via qiita-pipeline)   [admin]
+sudo install -d -o qiita-data -g qiita-pipeline -m 2770 <scratch>/upload-staging
+
+# (#issue-53) confirm AuthRocket realm invitation-acceptance redirect URI is
+#   https://qiita-miint.ucsd.edu/api/v1/auth/handoff   (AuthRocket admin dashboard; no host command)
+
+# (#62) bcl-convert RPM placement (Illumina EULA: do NOT commit to git) + SIF build   [operator]
+#   download bcl-convert-4.5.4-2.el8.x86_64.rpm from
+#   https://support.illumina.com/sequencing/sequencing_software/bcl-convert/downloads.html
+sudo install -d -o qiita-orch -g qiita-pipeline -m 0750 /scratch/persistent/images/sources
+sudo install -o qiita-orch -g qiita-pipeline -m 0640 bcl-convert-4.5.4-2.el8.x86_64.rpm \
+    /scratch/persistent/images/sources/bcl-convert-4.5.4-2.el8.x86_64.rpm
+sudo -u qiita-orch bash -lc 'bash /home/qiita/qiita-miint/scripts/build-bcl-convert-sif.sh'   # idempotent
+
+# (#62) grant the new SA scope to compute-worker   [admin]
+sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
+    qiita-admin service-account update --display-name compute-worker --add-scope sequenced_pool:preflight:read'
+```
+
+### 3. Migrations
+
+```bash
+# [operator] DATABASE_URL must be in the shell. activate.sh ABORTS the deploy if any of these are unapplied.
+make -C ~/qiita-miint migrate
+```
+Span applies: `upload` (#49); `terminology_release_lifecycle` + `seed_metadata_checklist` + `seed_ncbi_taxonomy` (#56); `bump_identity_start_to_25k` (#61); 3× `sequenced_pool` (#62). All small.
+
+### 4. Deploy
+
+```bash
+# [admin] SKIP_PULL=1 because redeploy.md step 2 already pulled the clone
+sudo SKIP_PULL=1 QIITA_HOSTNAME=qiita-miint.ucsd.edu /home/qiita/qiita-miint/deploy/local-deploy.sh
+```
+
+### 5. Verify
+
+```bash
+# [admin]
+curl -fsS https://qiita-miint.ucsd.edu/healthz
+curl -fsS https://qiita-miint.ucsd.edu/health                                  # per-service pills (#58/#54)
+sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
+    psql "$DATABASE_URL" -c "SELECT action_id, version, enabled FROM qiita.action ORDER BY action_id;"'   # bcl-convert 1.0.0 enabled (#62)
+systemctl cat qiita-control-plane qiita-compute-orchestrator | grep UMask      # UMask=0007 dropins (#57)
+sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; qiita-admin compute-readiness'   # (#57)
+```
+- `/docs` and `/redoc` render (vendored assets, no CDN) — (#64)
+- landing page loads with green status pills + working contact mailto — (#issue-53, #58/#54)
+
+### Notes (no host action)
+
+- (#62) `POST /sequencing-run` and `POST /sequencing-run/{R}/sequenced-pool` now return **200** on a matching-payload retry (was always 201); **409** with `{conflicting_field, existing_value, supplied_value}` on mismatch. Clients that strictly required 201 should accept 200.
+- (#62) bcl-convert FASTQ output is large — a busy NovaSeq X lane can reach multiple TB. Size per-ticket scratch generously; the orchestrator does not pre-allocate, so disk-full mid-run surfaces as a SLURM job failure. Confirm exact per-instrument sizing against a real run before relying on a figure. Supported instruments: NovaSeq 6000, NovaSeq X, iSeq.
+- (#63) `reference load` moved from `qiita-admin` to the `qiita` end-user CLI (it's a credentialed API call, not a host operation). Retarget any `qiita-admin reference load` scripts to `qiita reference load`.
+- (#64) Interactive API docs now served from this origin: `/docs` (Swagger UI), `/redoc` (ReDoc), `/openapi.json`. No deploy action — assets ride the wheel; restart picks them up.
 
 ---
 
-## PR #49 — feat(upload): Arrow Flight DoPut upload domain
+## Deployed history
 
-**New required env var on both CP and DP: `UPLOAD_STAGING_ROOT`.** Boot fails fast (`RuntimeError: UPLOAD_STAGING_ROOT is required but not set`) without it.
-
-Before `sudo local-deploy.sh`:
-
-1. Create the upload-staging dir on the shared scratch filesystem. Use the same owner/group/mode as the existing `<scratch>/staging` dir (DP writes as owner, CP reads via the `qiita-pipeline` group):
-   ```bash
-   # [admin] — substitute <scratch> with the actual scratch root from the first deploy
-   sudo install -d -o qiita-data -g qiita-pipeline -m 2770 <scratch>/upload-staging
-   ```
-
-2. Append `UPLOAD_STAGING_ROOT` to both env files. The value **must be byte-identical** on both sides — CP resolves `*_upload_idx` action_context keys to `{root}/uploads/{idx}/upload.parquet` and the DP writes to the same path on DoPut:
-   ```bash
-   # [admin]
-   echo "UPLOAD_STAGING_ROOT=<scratch>/upload-staging" | sudo tee -a /etc/qiita/control-plane.env
-   echo "UPLOAD_STAGING_ROOT=<scratch>/upload-staging" | sudo tee -a /etc/qiita/data-plane.env
-   ```
-
-3. Now run `sudo local-deploy.sh`. The new migration `20260521000000_upload.sql` applies as part of the deploy's `make migrate`; it's table-only (no FK to anything outside `qiita.principal`) and runs in seconds.
-
-Also new in this PR (no operator action, just so you know what landed):
-
-- `Settings.workspace_root` renamed to `Settings.work_ticket_workspace_root` to converge on main's field name. `WORK_TICKET_WORKSPACE_ROOT` was already set on the host in the first deploy; no env-file change needed.
-- New table `qiita.upload`, new REST surface (`POST /upload`, `POST /upload/{idx}/done`, `GET /upload/{idx}`), new Flight DoPut handler on the DP, new `ticket:doput` scope.
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time; empty until the first deploy under this format.
