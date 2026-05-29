@@ -331,6 +331,9 @@ Installed as the `qiita-admin` console script via `qiita-control-plane`'s pyproj
 | `whoami` | HTTP | Calls `GET /api/v1/auth/whoami`. PAT read from `QIITA_TOKEN` env or `~/.qiita/token` (mode 0600 expected). |
 | `token revoke-all --principal-idx N` | HTTP | Calls `POST /api/v1/admin/principal/{N}/revoke-all-tokens`. |
 | `login` | HTTP | Drives the LoginRocket Web flow end-to-end. Spawns a localhost loopback HTTP server, opens the browser to `/api/v1/auth/login?cli=1&port=N`, captures the one-time code from the redirect, exchanges it at `/api/v1/auth/cli-exchange`, and writes the PAT to `--token-file` (default `~/.qiita/token`, mode 0600). On timeout or error, prints an actionable message and exits non-zero. |
+| `actions sync [--workflows-dir DIR]` | direct DB | Loads every action YAML under `--workflows-dir` (default `./workflows`) and upserts the YAML-authoritative columns into `qiita.action` in one transaction. Idempotent — re-runs converge to YAML state without touching operational columns (`enabled` / `first_seen_at` / `disabled_*`). Reads `DATABASE_URL` from env. |
+| `ticket force-fail --idx N --reason R --stage S [--step-name …]` | direct DB | Transitions a non-terminal `work_ticket` to `state=failed` with captured `failure_type` (`permanent`) / `failure_stage` / `failure_step_name` / `failure_reason`. Mirrors the schema CHECK (`--step-name` required iff `--stage=step_run`); refuses already-terminal tickets. Replaces the hand-written `UPDATE qiita.work_ticket` recovery pattern. Reads `DATABASE_URL` from env. |
+| `compute-readiness [--orchestrator-venv …] [--no-slurm-probe] [--json] [--probe-timeout-seconds …]` | subprocess | Subprocess-execs `<venv>/bin/python -m qiita_compute_orchestrator.cli.compute_readiness` to exercise the path `qiita-job` needs and report per-check status (JWT, CP `/healthz`, `SLURM_NATIVE_PYTHON` on host, plus an optional SLURM probe-job). Returns the subprocess exit code verbatim. |
 
 ## CLI (`qiita`)
 
@@ -342,6 +345,7 @@ End-user companion to `qiita-admin`, installed as the `qiita` console script via
 | `whoami` | HTTP | Calls `GET /api/v1/auth/whoami`. |
 | `profile set [--affiliation ... --address ... --phone ... --orcid ... --[no-]receive-processing-emails]` | HTTP | Calls `PATCH /api/v1/user/me` with only the fields the caller actually supplied (matches the server's `exclude_unset` semantics). Used to fill `affiliation`/`address`/`phone` so `qiita.user.profile_complete` flips to true. |
 | `study create --title T [--alias … --description … …]` | HTTP | Calls `POST /api/v1/study`. Caller is always the owner; the `--owner-idx` (lab-tech-on-behalf) path is intentionally not exposed. |
+| `reference load --fasta F --data-plane-url U [--name …/--version … or --reference-idx N] [--taxonomy/--tree/--jplace/--genome-map …] [--no-watch]` | HTTP | Uploads FASTA + optional inputs (Arrow `do_put` to the data plane) and submits the reference-add work-ticket, then watches it to terminal. Needs `reference:write` / `ticket:doput` (wet_lab_admin tier), not `admin:*` — a credentialed API call, so it lives here rather than in `qiita-admin`. |
 
 Both CLIs share `cli/_common`: PAT file I/O, the loopback flow, the authenticated HTTP call helper, the `--base-url` / `--token-file` argparse helpers, and an HTTPS guard on `--base-url` (refuses plain `http://` to a non-localhost host unless `--insecure` is passed, because the PAT in the `Authorization` header would otherwise be sent in cleartext on the wire).
 

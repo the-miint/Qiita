@@ -1,4 +1,4 @@
-"""CLI-side tests for `qiita-admin reference load`.
+"""CLI-side tests for `qiita reference load`.
 
 Drives the programmatic entry point `cli.reference_load.do_reference_load`
 with a mocked httpx transport + a fake Flight client. The full
@@ -453,13 +453,13 @@ def test_open_upload_stream_rejects_unknown_role(tmp_path):
 
 
 # Smoke check that the asyncio entry point is callable from a sync test
-# context — admin.py's CLI handler does `asyncio.run(_run_reference_load(...))`.
-def test_admin_handler_returns_nonzero_on_bad_args(monkeypatch, tmp_path, capsys):
-    """`qiita-admin reference load` with neither --reference-idx nor
+# context — user.py's CLI handler does `asyncio.run(_run_reference_load(...))`.
+def test_handler_returns_nonzero_on_bad_args(monkeypatch, tmp_path, capsys):
+    """`qiita reference load` with neither --reference-idx nor
     --name/--version surfaces as exit 1 with a stderr line — argparse
     accepts the args, but the entry point's XOR check fires."""
     from qiita_control_plane.cli import _common
-    from qiita_control_plane.cli import admin as _admin
+    from qiita_control_plane.cli import user as _user
 
     monkeypatch.setattr(_common, "read_token", lambda: "test-pat")
     fasta = tmp_path / "x.fasta"
@@ -469,7 +469,7 @@ def test_admin_handler_returns_nonzero_on_bad_args(monkeypatch, tmp_path, capsys
     # so the base-URL validator's "no plain http to non-localhost" check
     # passes without --insecure (we're driving the XOR check, not the URL
     # gate, so the host doesn't matter beyond passing validation).
-    rc = _admin.main(
+    rc = _user.main(
         [
             "--base-url",
             "http://localhost:8080",
