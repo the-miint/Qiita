@@ -27,7 +27,7 @@ the `no-changelog` label).
 - Self-hosted OpenAPI docs at `/docs` (Swagger UI) and `/redoc` (ReDoc), linked
   from the landing page and served from vendored assets (no CDN) (#64)
 - `changelog-check` CI gate requiring every PR to record its change here (opt
-  out with the `no-changelog` label) (#redeploy-guardrails)
+  out with the `no-changelog` label) (#65)
 
 ### Changed
 
@@ -37,7 +37,9 @@ the `no-changelog` label).
 - Moved the `reference load` command from `qiita-admin` to the `qiita` end-user
   CLI (it is a credentialed API call, not a host operation) (#63)
 - Renamed the operator deploy checklist `CHANGELOG.md` → `DEPLOY_CHECKLIST.md`;
-  `CHANGELOG.md` is now this per-change log (#redeploy-guardrails)
+  `CHANGELOG.md` is now this per-change log (#65)
+- Scoped the `push` CI trigger to `main` so PR branches get a single
+  `pull_request` run instead of duplicate push + PR runs (#65)
 
 ### Fixed
 

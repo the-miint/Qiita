@@ -1,5 +1,11 @@
 name: CI
-on: [push, pull_request]
+on:
+  # Scope push to long-lived branches only. PR branches get a single
+  # pull_request run — avoids the duplicate push+PR runs (and the PR-only
+  # gates showing up as "Skipped" on a meaningless push-event run).
+  push:
+    branches: [main]
+  pull_request:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
