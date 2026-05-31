@@ -164,9 +164,9 @@ jobs:
           rm apptainer_${APPTAINER_VERSION}_amd64.deb
       - run: make test-workflows
 
-  # Enforces the CHANGELOG.md "## Pending deploy" fold (CLAUDE.md "Operator-facing
+  # Enforces the DEPLOY_CHECKLIST.md "## Pending deploy" fold (CLAUDE.md "Operator-facing
   # changes"). If a PR touches an operator-impacting surface but never edits
-  # CHANGELOG.md, it almost certainly forgot to run /deploy-note. Heuristic, not
+  # DEPLOY_CHECKLIST.md, it almost certainly forgot to run /deploy-note. Heuristic, not
   # content-aware — the 'no-deploy-note' label opts out a PR that genuinely needs
   # no operator action. No Claude involved; pure git diff.
   deploy-note-check:
@@ -199,14 +199,48 @@ jobs:
             exit 0
           fi
           echo "Operator-impacting files changed:"; printf '%s\n' "$impacting" | sed 's/^/  /'
-          if printf '%s\n' "$changed" | grep -qx 'CHANGELOG.md'; then
-            echo "CHANGELOG.md updated — assuming the steps were folded into ## Pending deploy."
+          if printf '%s\n' "$changed" | grep -qx 'DEPLOY_CHECKLIST.md'; then
+            echo "DEPLOY_CHECKLIST.md updated — assuming the steps were folded into ## Pending deploy."
             exit 0
           fi
           {
-            echo "ERROR: this PR changes operator-impacting surfaces (above) but does not touch CHANGELOG.md."
+            echo "ERROR: this PR changes operator-impacting surfaces (above) but does not touch DEPLOY_CHECKLIST.md."
             echo "Fold the operator steps into the '## Pending deploy' buckets — run /deploy-note on this branch."
             echo "If this PR genuinely needs no operator action (a migration the dbmate flow handles on its"
             echo "own, a workflow with no new env/scope, etc.), add the 'no-deploy-note' label to say so."
+          } >&2
+          exit 1
+
+  # Every PR records what it changed in CHANGELOG.md (the per-change log, distinct
+  # from the operator deploy checklist DEPLOY_CHECKLIST.md). Pure git diff, no
+  # Claude. A PR that genuinely warrants no entry (typo, CI-only, the changelog
+  # tooling itself) opts out with the 'no-changelog' label.
+  changelog-check:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Require a CHANGELOG.md entry
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set -euo pipefail
+          case ",$LABELS," in *,no-changelog,*)
+            echo "Skipped: 'no-changelog' label present."; exit 0;;
+          esac
+          git fetch --quiet origin "$BASE_REF"
+          changed=$(git diff --name-only "origin/$BASE_REF...HEAD")
+          if printf '%s\n' "$changed" | grep -qx 'CHANGELOG.md'; then
+            echo "CHANGELOG.md updated."
+            exit 0
+          fi
+          {
+            echo "ERROR: this PR does not touch CHANGELOG.md."
+            echo "Add an entry under '## [Unreleased]' describing what changed, tagged (#N)."
+            echo "If this PR genuinely needs no changelog entry (typo, CI-only change, etc.),"
+            echo "add the 'no-changelog' label to opt out."
           } >&2
           exit 1

@@ -15,8 +15,8 @@ write handlers are find-or-create on their natural keys
 (instrument_run_id for the run; (run_idx, run_preflight_filename) for the
 pool) — a same-key + same-payload retry returns HTTP 200 with the
 existing idx; a same-key + different-payload retry returns 409 with a
-structured PayloadMismatch detail. This is the soft API-contract change
-flagged in the CHANGELOG.
+structured PayloadMismatch detail — a soft API-contract change downstream
+clients should be aware of.
 
 The preflight GET is SA-only via Scope.SEQUENCED_POOL_PREFLIGHT_READ,
 matching the existing CO→CP precedent (routes/sequence_range.py).

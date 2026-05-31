@@ -2,7 +2,7 @@
 description: After a deploy, archive the Pending-deploy checklist into Deployed history stamped with date + commit
 ---
 
-You are closing out a deploy: moving the consolidated `## Pending deploy` block in `CHANGELOG.md` into `## Deployed history` and leaving an empty Pending section for the next cycle. This is a **maintainer-on-their-own-machine** action run *after* the operator reports a successful deploy — the deploy host has no Claude and the operator doesn't edit the repo. It is a repo edit (commit + push), not an on-host step.
+You are closing out a deploy: moving the consolidated `## Pending deploy` block in `DEPLOY_CHECKLIST.md` into `## Deployed history` and leaving an empty Pending section for the next cycle. This is a **maintainer-on-their-own-machine** action run *after* the operator reports a successful deploy — the deploy host has no Claude and the operator doesn't edit the repo. It is a repo edit (commit + push), not an on-host step.
 
 ## 1. Gather the stamp
 
@@ -12,7 +12,7 @@ You are closing out a deploy: moving the consolidated `## Pending deploy` block 
 
 ## 2. Move the block
 
-Edit `CHANGELOG.md`:
+Edit `DEPLOY_CHECKLIST.md`:
 1. Take the entire current `## Pending deploy` body (buckets 1–5 + Notes) and move it under `## Deployed history` as a new newest-on-top subsection:
    ```
    ### Deployed YYYY-MM-DD — <short SHA>

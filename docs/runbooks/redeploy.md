@@ -5,12 +5,12 @@
 [`first-deploy.md`](first-deploy.md). Use this when `main` (plus any
 just-merged PRs) is ahead of what the host is running and you want to
 roll all of it out in one go. This runbook is the **single source of
-truth for the deploy procedure**; `CHANGELOG.md` and `CLAUDE.md` point
+truth for the deploy procedure**; `DEPLOY_CHECKLIST.md` and `CLAUDE.md` point
 here rather than restating the lifecycle.
 
 **The model in one line** (the *why* lives in CLAUDE.md "Deployments"):
 you do **not** assemble the deploy yourself — the `## Pending deploy`
-section of `CHANGELOG.md` is already the consolidated, ordered,
+section of `DEPLOY_CHECKLIST.md` is already the consolidated, ordered,
 deduplicated checklist of everything merged but not yet deployed, folded
 in by each PR as it merged. Your job is to run that checklist, then
 archive it.
@@ -30,7 +30,7 @@ throughout (the live deploy is `qiita-miint.ucsd.edu`).
 ```bash
 # [operator]
 git -C ~/qiita-miint fetch origin
-sed -n '/^## Pending deploy/,/^## Deployed history/p' ~/qiita-miint/CHANGELOG.md
+sed -n '/^## Pending deploy/,/^## Deployed history/p' ~/qiita-miint/DEPLOY_CHECKLIST.md
 ```
 
 That section is your deploy, in five ordered buckets: **1. Env vars**,
@@ -164,5 +164,5 @@ A maintainer then, in a local checkout, runs `/deploy-archive <sha>`
 deploy` block into `## Deployed history` stamped with the date + that
 commit, resets Pending to empty, and the maintainer commits + pushes.
 No Claude? Do the same move by hand following the shape in
-`CHANGELOG.md`. Either way, also record the deployed commit somewhere
+`DEPLOY_CHECKLIST.md`. Either way, also record the deployed commit somewhere
 durable (deploy log, ops channel).

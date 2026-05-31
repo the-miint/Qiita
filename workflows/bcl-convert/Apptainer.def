@@ -11,7 +11,7 @@ From: oraclelinux:8
     # scripts/build-bcl-convert-sif.sh expects the file at
     # ${QIITA_IMAGES_DIR}/sources/bcl-convert-4.5.4-2.el8.x86_64.rpm and runs
     # `apptainer build` from this %files directive's CWD; the operator's
-    # one-time setup step in CHANGELOG.md places it there before the build.
+    # one-time setup step in DEPLOY_CHECKLIST.md places it there before the build.
     bcl-convert-4.5.4-2.el8.x86_64.rpm /tmp/bcl-convert.rpm
     # manifest_writer.py is workflow-agnostic (output-dir walk → manifest.json)
     # and lives in workflows/_shared; every container copies it from there.
