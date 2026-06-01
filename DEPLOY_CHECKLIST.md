@@ -11,9 +11,43 @@ Substitute your host's FQDN for the `qiita-miint.ucsd.edu` examples and `<scratc
 
 ## Pending deploy
 
-Everything merged but not yet deployed. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
+Nothing pending. Each PR folds its operator steps into the buckets below via `/deploy-note`; at deploy time buckets 1→5 run in order, with buckets 1–3 preceding the bucket-4 restart. Each step carries its source `(#N)` tag.
 
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+### 2. One-time host setup
+
+_None yet._
+
+### 3. Migrations
+
+_None yet._
+
+### 4. Deploy
+
+_None yet._
+
+### 5. Verify
+
+_None yet._
+
+### Notes (no host action)
+
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-01 — 178f782
+
+Everything merged but not yet deployed. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
 ```bash
 # All of bucket 1 is [admin]. /etc/qiita/*.env is mode 0440 (root:qiita-api /
@@ -42,7 +76,7 @@ sudo bash -c 'grep -q "^QIITA_CP_URL=" /etc/qiita/compute-orchestrator.env || ec
 sudo bash -c 'grep -q "^QIITA_IMAGES_DIR=" /etc/qiita/compute-orchestrator.env || echo "QIITA_IMAGES_DIR=/scratch/persistent/images" >> /etc/qiita/compute-orchestrator.env'   # (#62) abs dir, visible from every compute node; validated at CO boot when COMPUTE_BACKEND=slurm
 ```
 
-### 2. One-time host setup
+#### 2. One-time host setup
 
 ```bash
 # (#57) qiita-pipeline group membership — verify, fix if needed   [admin]
@@ -74,7 +108,10 @@ sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; 
     qiita-admin service-account update --display-name compute-worker --add-scope sequenced_pool:preflight:read'
 ```
 
-### 3. Migrations
+> **Deploy-time deviation (2026-06-01).** This bucket-2 step as written did not work on the host and was performed differently; tracked for a checklist fix (the bucket-5 `compute-readiness` line has its own deviation note below; see [#67](https://github.com/the-miint/Qiita/issues/67) and follow-ups):
+> - **(#62) compute-worker scope grant** — `qiita-admin service-account update --add-scope` is not a real command (no such subcommand), and the scope grant must run *after* the bucket-4 deploy (the new ceiling ships in that code). Done instead as a token rotation per [`orchestrator-token-rotation.md`](docs/runbooks/orchestrator-token-rotation.md): minted `compute-rot-2026-06-01` (principal 5) with `["sequence_range:mint","sequenced_pool:preflight:read"]`, swapped `/etc/qiita/co-to-cp.token`, restarted the orchestrator, revoked the old `compute` SA (principal 3). Live SA is named `compute`, not `compute-worker`.
+
+#### 3. Migrations
 
 ```bash
 # [operator] DATABASE_URL must be in your shell, pointing at the SAME DB as
@@ -88,14 +125,14 @@ make -C ~/qiita-miint migrate
 ```
 `dbmate` applies whatever is unapplied (idempotent). The guard — not this checklist — owns the authoritative set of required migrations, so nothing is hand-listed here to drift out of sync.
 
-### 4. Deploy
+#### 4. Deploy
 
 ```bash
 # [admin] SKIP_PULL=1 because redeploy.md step 2 already pulled the clone
 sudo SKIP_PULL=1 QIITA_HOSTNAME=qiita-miint.ucsd.edu /home/qiita/qiita-miint/deploy/local-deploy.sh
 ```
 
-### 5. Verify
+#### 5. Verify
 
 ```bash
 # [admin]
@@ -108,15 +145,11 @@ sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; 
 - `/docs` and `/redoc` render (vendored assets, no CDN) — (#64)
 - landing page loads with green status pills + working contact mailto — (#issue-53, #58/#54)
 
-### Notes (no host action)
+> **Deploy-time deviation (2026-06-01).** The `compute-readiness` verify line as written fails: it runs as `qiita-api` sourcing `control-plane.env`, but the `0400 qiita-orch:qiita-orch` `co-to-cp.token` is only readable by `qiita-orch`, and the check needs the CO env. Ran instead as: `sudo -u qiita-orch bash -c 'set -a; source /etc/qiita/compute-orchestrator.env; set +a; /home/qiita/.local/bin/qiita-admin compute-readiness'`. Two of its checks are false negatives — `cp-healthz` (CP serves `/health`, not `/healthz` — [#67](https://github.com/the-miint/Qiita/issues/67)) and `slurm-probe-log` (probe log written to node-local `/tmp`, unreadable from the head node). CP health confirmed independently via `curl /health` (all pills green).
+
+#### Notes (no host action)
 
 - (#62) `POST /sequencing-run` and `POST /sequencing-run/{R}/sequenced-pool` now return **200** on a matching-payload retry (was always 201); **409** with `{conflicting_field, existing_value, supplied_value}` on mismatch. Clients that strictly required 201 should accept 200.
 - (#62) bcl-convert FASTQ output is large — a busy NovaSeq X lane can reach multiple TB. Size per-ticket scratch generously; the orchestrator does not pre-allocate, so disk-full mid-run surfaces as a SLURM job failure. Confirm exact per-instrument sizing against a real run before relying on a figure. Supported instruments: NovaSeq 6000, NovaSeq X, iSeq.
 - (#63) `reference load` moved from `qiita-admin` to the `qiita` end-user CLI (it's a credentialed API call, not a host operation). Retarget any `qiita-admin reference load` scripts to `qiita reference load`.
 - (#64) Interactive API docs now served from this origin: `/docs` (Swagger UI), `/redoc` (ReDoc), `/openapi.json`. No deploy action — assets ride the wheel; restart picks them up.
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time; empty until the first deploy under this format.
