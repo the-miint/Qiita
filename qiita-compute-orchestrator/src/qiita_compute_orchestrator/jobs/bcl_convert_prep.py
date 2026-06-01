@@ -85,8 +85,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # sample-sheet format — it is not dead/legacy code on our side.
     # Imported here (not at module top) so the orchestrator's pytest
     # collection / launcher boot doesn't blow up in environments that don't
-    # ship the dep. The dep was added to pyproject.toml in the same PR as
-    # this module (see CHANGELOG).
+    # ship the dep. The dep ships in this component's pyproject.toml.
     from run_preflight.legacy.api import save_legacy_csv  # noqa: PLC0415
 
     if not inputs.bcl_input_dir.is_absolute():
