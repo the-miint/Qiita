@@ -13,7 +13,7 @@ Substitute your host's FQDN for the `qiita-miint.ucsd.edu` examples and `<scratc
 
 Each PR folds its operator steps into the buckets below via `/deploy-note`; at deploy time buckets 1→5 run in order, with buckets 1–3 preceding the bucket-4 restart. Each step carries its source `(#N)` tag.
 
-> ⚠️ **(#72) This deploy renames every filesystem env var and relocates on-disk dirs.** Old names are gone; the services derive fixed subdirs from three base roots (`PATH_SCRATCH`, `PATH_PERSISTENT`, `PATH_DERIVED`). The CP/DP/CO won't boot until the new vars are set (bucket 1), and the DuckLake lake data must be relocated **with the data plane stopped** (bucket 2) or DuckLake reports a path mismatch. Read bucket 2 in full before starting.
+> ⚠️ **(#72) This deploy renames every filesystem env var.** Old names are gone; the services derive fixed subdirs from three base roots (`PATH_SCRATCH`, `PATH_PERSISTENT`, `PATH_DERIVED`), so the CP/DP/CO won't boot until the new vars are set (bucket 1). The lake (`PATH_PERSISTENT/ducklake`) is currently **empty** — no durable data has been written — so there is **no data to migrate**; bucket 2 only creates the derived dirs and, if the DuckLake catalog refuses the new data_path, recreates the empty catalog (lossless). If the lake is somehow non-empty at deploy time, **stop** and reassess before recreating anything.
 
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
@@ -62,26 +62,24 @@ sudo install -d -o qiita-data -g qiita-pipeline -m 2770 "$scratch/staging"
 #   sudo mv <old-images-dir> "$images"
 #   sudo chown qiita-orch:qiita-orch "$images" && sudo chmod 0755 "$images"
 
-# (#72) ⚠️ DuckLake lake data — the ONLY durable state here. The DP derives the
-# data path as PATH_PERSISTENT/ducklake; DuckLake pins the data_path into its
-# catalog at creation, so a bare filesystem move WITHOUT repointing the catalog
-# yields "path mismatch" on the next attach. Do this with the DP STOPPED:   [admin]
-#   1. sudo systemctl stop 'qiita-data-plane@*'
-#   2. old=<existing DUCKLAKE_DATA_PATH value from bucket-1 grep>; new="$(sudo grep '^PATH_PERSISTENT=' /etc/qiita/data-plane.env | tail -1 | cut -d= -f2-)/ducklake"
-#   3. sudo install -d -o qiita-data -g qiita-data -m 0750 "$(dirname "$new")"
-#      sudo mv "$old" "$new"      # if same filesystem; else rsync then remove
-#   4. Repoint the catalog's pinned data_path from "$old" to "$new". The catalog
-#      lives in the Postgres named by the DP's DUCKLAKE_CATALOG_CONNSTR; inspect
-#      its `ducklake_*` tables to determine BEFORE touching prod whether
-#      data-file paths are stored relative to the data_path (then updating the
-#      stored data_path is enough) or absolute (then the per-file path rows must
-#      also be rewritten from "$old" to "$new"). DuckLake compares the stored
-#      data_path on attach, so a bare filesystem mv without this step yields
-#      "path mismatch". VALIDATE the exact statements against a COPY of the
-#      catalog (pg_dump → restore to a scratch DB, point a throwaway DP at it,
-#      confirm a DoGet) — do NOT run them against the live catalog until the
-#      copy proves clean. ⚠️ This is the one irreversible step in the deploy.
-#   5. The DP restarts in bucket 4; confirm a DoGet in bucket 5 before declaring success.
+# (#72) Create the lake data dir the DP now derives (PATH_PERSISTENT/ducklake).
+# The lake is EMPTY — nothing has been written — so there is no data to move.   [admin]
+persistent=$(sudo grep '^PATH_PERSISTENT=' /etc/qiita/data-plane.env | tail -1 | cut -d= -f2-)
+sudo install -d -o qiita-data -g qiita-data -m 0750 "$persistent/ducklake"
+
+# (#72) ⚠️ Empty-lake guard, BEFORE the bucket-4 restart. The DuckLake catalog
+# (Postgres named by the DP's DUCKLAKE_CATALOG_CONNSTR) was pinned to the OLD
+# DUCKLAKE_DATA_PATH at the DP's first attach. With zero registered data files,
+# re-attaching at the new PATH_PERSISTENT/ducklake should just re-pin cleanly;
+# if it instead reports a "path mismatch", recreate the EMPTY catalog DB so it
+# re-pins the new data_path. This is lossless ONLY because the lake is empty —
+# first CONFIRM there are no data files (e.g. the catalog's ducklake data-file
+# table is empty / the old data dir holds no parquet). If any data exists, STOP.
+#   sudo systemctl stop 'qiita-data-plane@*'
+#   # confirm empty, then drop + recreate the lake catalog DB (DBA), e.g.:
+#   #   dropdb qiita_miint_lake && createdb -O qiita_miint_lake_rw qiita_miint_lake
+#   # the DP recreates the reference tables on its next boot (ensure_reference_tables).
+# The DP restarts in bucket 4; confirm a DoGet in bucket 5.
 ```
 
 ### 3. Migrations
@@ -100,7 +98,7 @@ _None yet._
 curl -fsS https://qiita-miint.ucsd.edu/health                                  # all three pills green
 sudo -u qiita-orch bash -c 'set -a; source /etc/qiita/compute-orchestrator.env; set +a; /home/qiita/.local/bin/qiita-admin compute-readiness'   # PATH_SCRATCH/ticket visible+writable on a compute node
 ```
-- A DoGet against an existing reference returns rows (proves the DuckLake data_path repoint worked) — (#72)
+- The data plane attaches DuckLake cleanly at `PATH_PERSISTENT/ducklake` (DP boots; `/health` DP pill green). A DoGet/DoPut round-trip works on the freshly-pinned empty lake — (#72)
 
 ### Notes (no host action)
 
