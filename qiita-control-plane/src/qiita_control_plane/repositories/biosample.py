@@ -11,7 +11,7 @@ stand alone.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, get_args
 
 import asyncpg
 from qiita_common.models import Tier
@@ -226,11 +226,6 @@ async def fetch_biosample_idxs_for_study(
     return [r["biosample_idx"] for r in rows]
 
 
-# Natural-key columns the bulk-lookup function may resolve against. The
-# Literal is the closed in-code mapping the f-string interpolation below
-# relies on; SQL table/column names cannot be parameter-bound, so the
-# safety of the interpolation comes from the call site only being able
-# to pass a value the type allows.
 BiosampleLookupKey = Literal["biosample_accession", "matrix_tube_id"]
 
 
@@ -248,16 +243,12 @@ async def fetch_biosample_idxs_by_natural_key(
     omitted from the returned map, so a caller can detect misses by
     set-difference against the input `values`.
     """
+    if key not in get_args(BiosampleLookupKey):
+        raise ValueError(f"invalid biosample lookup key: {key!r}")
     if not values:
         return {}
-    # ANY($1::text[]) keeps the values parameter-bound (asyncpg encodes
-    # the Python list as a PG array literal) so SQL injection is not a
-    # concern on the row data and the planner can use the column's
-    # unique-or-btree index. The column name is interpolated from `key`,
-    # whose type pins it to one of the strings on BiosampleLookupKey.
-    # retired = false filters at the row level; a future retired-
-    # retrieval surface for admins can read this function via a caller-
-    # side decorated branch rather than threading a parameter.
+    # Column name is interpolated because Postgres can't parameter-bind
+    # identifiers; the guard above pins it to the BiosampleLookupKey set.
     rows = await pool_or_conn.fetch(
         f"SELECT idx, {key} FROM qiita.biosample"
         f" WHERE {key} = ANY($1::text[])"

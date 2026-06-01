@@ -724,6 +724,29 @@ async def test_post_biosample_bad_matrix_tube_id_format_422(ctx, bad_value):
     assert resp.status_code == 422
 
 
+@pytest.mark.parametrize("bad_value", ["1234567", "12345678901", "1" * 51])
+async def test_post_biosample_bad_matrix_tube_id_length_422(ctx, bad_value):
+    """Tests the case where matrix_tube_id falls outside the 8-10 digit
+    length range: the Pydantic validator on BiosampleImportRequest rejects
+    the body at the wire boundary with 422.
+    """
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="tube-long"
+    )
+    ctx["created"]["study"].append(study_idx)
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=unique_field_name(),
+        owner_biosample_id_value="V-1",
+        matrix_tube_id=bad_value,
+    )
+    assert resp.status_code == 422
+
+
 async def test_post_biosample_bad_metadata_checklist_idx_422(ctx):
     # A metadata_checklist_idx far beyond the current MAX trips the
     # biosample_metadata_checklist_idx_fkey FK; route maps it to 422 with
@@ -2443,6 +2466,6 @@ async def test_lookup_by_matrix_tube_id_rejects_bad_format_422(ctx):
     """
     resp = await ctx["wet"].post(
         URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
-        json={"matrix_tube_ids": ["00123", "abc"]},
+        json={"matrix_tube_ids": [unique_matrix_tube_id(), "abc"]},
     )
     assert resp.status_code == 422

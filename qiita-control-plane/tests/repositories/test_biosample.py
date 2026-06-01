@@ -1441,8 +1441,8 @@ async def test_update_biosample_duplicate_unique_column_raises_unique_error(
 
 async def test_update_biosample_bad_matrix_tube_id_raises_check_error(ctx):
     """Tests the case where a PATCH sets matrix_tube_id to a non-digit
-    value: the column-level CHECK fires and asyncpg.CheckViolationError
-    propagates. The route layer maps this to 422.
+    value: the column-level CHECK fires and
+    asyncpg.CheckViolationError propagates.
     """
     bs_idx = await _seed_full_biosample(
         ctx,
@@ -1453,6 +1453,22 @@ async def test_update_biosample_bad_matrix_tube_id_raises_check_error(ctx):
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(asyncpg.CheckViolationError):
             await update_biosample(conn, bs_idx, fields={"matrix_tube_id": "ABC"})
+
+
+async def test_update_biosample_overlong_matrix_tube_id_raises_string_truncation(ctx):
+    """Tests the case where a PATCH sets matrix_tube_id to a value
+    longer than the VARCHAR(50) cap: the column type fires and
+    asyncpg.StringDataRightTruncationError propagates.
+    """
+    bs_idx = await _seed_full_biosample(
+        ctx,
+        owner_idx=ctx["biosample_owner_idx"],
+        bs_acc=unique_accession("BS"),
+        ena_acc=unique_accession("ENA"),
+    )
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(asyncpg.StringDataRightTruncationError):
+            await update_biosample(conn, bs_idx, fields={"matrix_tube_id": "1" * 51})
 
 
 async def test_update_biosample_advances_updated_at(ctx):
@@ -1523,6 +1539,17 @@ async def test_fetch_biosample_idxs_by_natural_key_empty_values_short_circuits(c
         ctx["pool"], key="biosample_accession", values=[]
     )
     assert result == {}
+
+
+async def test_fetch_biosample_idxs_by_natural_key_invalid_key_raises(ctx):
+    """Tests the case where `key` is a string outside BiosampleLookupKey:
+    the function raises ValueError before issuing any SQL, blocking the
+    column-name interpolation path.
+    """
+    with pytest.raises(ValueError, match="invalid biosample lookup key"):
+        await fetch_biosample_idxs_by_natural_key(
+            ctx["pool"], key="idx; DROP TABLE qiita.biosample; --", values=["x"]
+        )
 
 
 # ===========================================================================

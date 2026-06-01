@@ -34,14 +34,14 @@ from qiita_common.auth_constants import (  # noqa: F401
 ORCID_PATTERN = r"^\d{4}-\d{4}-\d{4}-\d{3}[\dX]$"
 
 # matrix_tube_id values are digit-only (per local convention) and may carry
-# leading zeros; the +-quantified pattern also rejects the empty string.
+# leading zeros; the {8,10} quantifier also rejects the empty string and
+# bounds the length range.
 #
-# Deliberately duplicated with the column-level CHECK and VARCHAR cap on
+# Deliberately duplicated with the column-level CHECK on
 # qiita.biosample.matrix_tube_id: the Pydantic side fails at the wire
 # boundary with a per-field 422; the DB side is the last line of defense.
 # Change one and you must change the other in the same PR.
-MATRIX_TUBE_ID_PATTERN = r"^[0-9]+$"  # same-pattern-ok: DB CHECK parity (see above)
-MATRIX_TUBE_ID_MAX_LENGTH = 50  # same-pattern-ok: DB VARCHAR cap parity (see above)
+MATRIX_TUBE_ID_PATTERN = r"^[0-9]{8,10}$"  # same-pattern-ok: DB CHECK parity (see above)
 
 
 class HealthStatus(StrEnum):
@@ -519,7 +519,7 @@ class BiosampleImportRequest(BaseModel):
     ena_sample_accession: str | None = None
     matrix_tube_id: Annotated[
         str | None,
-        Field(pattern=MATRIX_TUBE_ID_PATTERN, max_length=MATRIX_TUBE_ID_MAX_LENGTH),
+        Field(pattern=MATRIX_TUBE_ID_PATTERN),
     ] = None
 
 
@@ -697,9 +697,9 @@ class BiosampleLookupByMatrixTubeIdRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    matrix_tube_ids: list[
-        Annotated[str, Field(pattern=MATRIX_TUBE_ID_PATTERN, max_length=MATRIX_TUBE_ID_MAX_LENGTH)]
-    ] = Field(min_length=1, max_length=10_000)
+    matrix_tube_ids: list[Annotated[str, Field(pattern=MATRIX_TUBE_ID_PATTERN)]] = Field(
+        min_length=1, max_length=10_000
+    )
 
 
 # same-pattern-ok: per-key wire shape; parallels BiosampleLookupByAccessionResponse
@@ -754,7 +754,7 @@ class BiosamplePatchRequest(PatchRequestModel):
     ena_sample_accession: str | None = None
     matrix_tube_id: Annotated[
         str | None,
-        Field(pattern=MATRIX_TUBE_ID_PATTERN, max_length=MATRIX_TUBE_ID_MAX_LENGTH),
+        Field(pattern=MATRIX_TUBE_ID_PATTERN),
     ] = None
     last_submission_at: AwareDatetime | None = None
     submission_error: str | None = None
