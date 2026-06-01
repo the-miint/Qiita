@@ -30,7 +30,7 @@ Two phases:
        that doesn't show up in the local JWT check)
      - SLURM_NATIVE_PYTHON exists on the compute node + can import
        `qiita_compute_orchestrator.jobs` (the launcher's entry point)
-     - SHARED_FILESYSTEM_ROOT visible + writable
+     - PATH_SCRATCH/ticket visible + writable
      - QIITA_CP_URL reachable *from the compute node* with the
        CO→CP token (catches network partitions between cluster and
        deploy host that don't show up in the local CP check)
@@ -215,7 +215,7 @@ async def check_cp_healthz(cp_url: str, co_to_cp_token: str) -> CheckResult:
 # ---------------------------------------------------------------------------
 
 
-def build_probe_script(*, shared_filesystem_root: str) -> str:
+def build_probe_script(*, path_scratch: str) -> str:
     """Bash script the probe SLURM job runs on a compute node. Every
     informational line is prefixed with `compute-readiness:` so the
     parent CLI can pick it out of arbitrary stdout/stderr noise; the
@@ -229,7 +229,7 @@ def build_probe_script(*, shared_filesystem_root: str) -> str:
     # may not have set. Defaults match the Settings field defaults.
     # `set -u` is intentionally off so a missing env var isn't a hard
     # script error — we want the report line, not a non-zero exit.
-    sf_default = shlex.quote(shared_filesystem_root)
+    sf_default = shlex.quote(path_scratch)
     # The probe reads `QIITA_NATIVE_PYTHON` (not `SLURM_NATIVE_PYTHON`)
     # to dodge the `SLURM_*` namespace — slurmd/slurmctld populate
     # many `SLURM_*` vars on the compute node and on some sites reset
@@ -259,7 +259,10 @@ else
     echo "{_PROBE_LINE_PREFIX} native-import=fail"
 fi
 
-SF="${{SHARED_FILESYSTEM_ROOT:-{sf_default}}}"
+# The `/ticket` leaf must match the control plane's PATH_SCRATCH/ticket
+# derivation (qiita_control_plane.config.Settings.from_env) — that's the
+# per-ticket workspace SLURM jobs actually run in.
+SF="${{PATH_SCRATCH:-{sf_default}}}/ticket"
 if [ -d "$SF" ]; then
     echo "{_PROBE_LINE_PREFIX} shared-fs-visible=ok path=$SF"
     PROBE_DIR="$SF/.compute-readiness.$$"
@@ -305,7 +308,7 @@ def build_probe_submit_payload(
     # node. See `build_probe_script` for the corresponding read.
     env: dict[str, str] = {
         "QIITA_NATIVE_PYTHON": settings.slurm.native_python,
-        "SHARED_FILESYSTEM_ROOT": settings.shared_filesystem_root,
+        "PATH_SCRATCH": settings.path_scratch,
     }
     if settings.cp_url:
         env["QIITA_CP_URL"] = settings.cp_url
@@ -362,7 +365,7 @@ async def submit_probe_and_collect(
         # would otherwise collide on the log path (and a stale log from
         # a previous run might be read by the next).
         log_path = log_dir / f"qiita-compute-readiness.{os.getpid()}.{secrets.token_hex(4)}.log"
-    script = build_probe_script(shared_filesystem_root=settings.shared_filesystem_root)
+    script = build_probe_script(path_scratch=settings.path_scratch)
     payload = build_probe_submit_payload(script=script, settings=settings, log_path=log_path)
 
     async with SlurmrestdClient(

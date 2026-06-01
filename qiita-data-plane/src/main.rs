@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ducklake::connect_ducklake(
         &setup_conn,
         &cfg.ducklake_catalog_connstr,
-        &cfg.ducklake_data_path,
+        &cfg.path_persistent_ducklake,
     )?;
     ducklake::ensure_reference_tables(&setup_conn)?;
     drop(setup_conn);
@@ -29,8 +29,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flight_svc = flight_service::QiitaFlightService::new(
         cfg.hmac_secret_key,
         cfg.ducklake_catalog_connstr,
-        cfg.ducklake_data_path,
-        cfg.upload_staging_root,
+        cfg.path_persistent_ducklake,
+        cfg.path_scratch_staging,
     );
 
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
@@ -125,20 +125,27 @@ mod tests {
             "LISTEN_ADDR",
             "HMAC_SECRET_KEY",
             "DUCKLAKE_CATALOG_CONNSTR",
-            "UPLOAD_STAGING_ROOT",
+            "PATH_SCRATCH",
+            "PATH_PERSISTENT",
         ]);
         std::env::remove_var("LISTEN_ADDR");
         let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
         std::env::set_var("HMAC_SECRET_KEY", &secret);
         std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test host=localhost");
-        std::env::set_var("UPLOAD_STAGING_ROOT", "/tmp/qiita-test-staging");
+        std::env::set_var("PATH_SCRATCH", "/tmp/qiita-test-scratch");
+        std::env::set_var("PATH_PERSISTENT", "/tmp/qiita-test-persistent");
         let cfg = Settings::from_env().expect("Settings::from_env() failed with valid config");
         assert_eq!(cfg.listen_addr.to_string(), "0.0.0.0:50051");
         assert_eq!(cfg.hmac_secret_key.len(), 32);
         assert_eq!(cfg.ducklake_catalog_connstr, "dbname=test host=localhost");
+        // Leaf paths are derived from the base roots with fixed suffixes.
         assert_eq!(
-            cfg.upload_staging_root,
-            std::path::PathBuf::from("/tmp/qiita-test-staging")
+            cfg.path_scratch_staging,
+            std::path::PathBuf::from("/tmp/qiita-test-scratch/staging")
+        );
+        assert_eq!(
+            cfg.path_persistent_ducklake,
+            "/tmp/qiita-test-persistent/ducklake"
         );
     }
 
@@ -157,35 +164,35 @@ mod tests {
 
     #[test]
     #[serial]
-    fn config_rejects_missing_upload_staging_root() {
+    fn config_rejects_missing_path_scratch() {
         let _snapshot = EnvSnapshot::capture(&[
             "HMAC_SECRET_KEY",
             "DUCKLAKE_CATALOG_CONNSTR",
-            "UPLOAD_STAGING_ROOT",
+            "PATH_SCRATCH",
         ]);
         let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
         std::env::set_var("HMAC_SECRET_KEY", &secret);
         std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
-        std::env::remove_var("UPLOAD_STAGING_ROOT");
+        std::env::remove_var("PATH_SCRATCH");
         let err = Settings::from_env().unwrap_err();
         assert!(
-            err.contains("UPLOAD_STAGING_ROOT"),
-            "error should mention UPLOAD_STAGING_ROOT: {err}"
+            err.contains("PATH_SCRATCH"),
+            "error should mention PATH_SCRATCH: {err}"
         );
     }
 
     #[test]
     #[serial]
-    fn config_rejects_relative_upload_staging_root() {
+    fn config_rejects_relative_path_scratch() {
         let _snapshot = EnvSnapshot::capture(&[
             "HMAC_SECRET_KEY",
             "DUCKLAKE_CATALOG_CONNSTR",
-            "UPLOAD_STAGING_ROOT",
+            "PATH_SCRATCH",
         ]);
         let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
         std::env::set_var("HMAC_SECRET_KEY", &secret);
         std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
-        std::env::set_var("UPLOAD_STAGING_ROOT", "relative/staging");
+        std::env::set_var("PATH_SCRATCH", "relative/scratch");
         let err = Settings::from_env().unwrap_err();
         assert!(
             err.contains("must be an absolute path"),

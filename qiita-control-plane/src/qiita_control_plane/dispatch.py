@@ -59,19 +59,18 @@ async def _run_and_log(app: FastAPI, work_ticket_idx: int) -> None:
     re-raises. We catch the re-raise here only so the outer asyncio
     machinery doesn't see an "unhandled exception in task" warning;
     the ticket state is already correct."""
-    workspace_root = app.state.settings.work_ticket_workspace_root
-    upload_staging_root = app.state.settings.upload_staging_root
+    workspace_root = app.state.settings.path_scratch_ticket
+    upload_staging_root = app.state.settings.path_scratch_staging
     if workspace_root is None or upload_staging_root is None:
-        # Defensive — Settings.from_env() requires both env vars, so the only
-        # way to reach this is a Settings(...) construction that omits them
+        # Defensive — Settings.from_env() requires PATH_SCRATCH, so the only
+        # way to reach this is a Settings(...) construction that omits these
         # (tests, programmatic boot). Raise so the symptom isn't a silent
         # /tmp/None or AttributeError downstream.
         raise RuntimeError(
             "schedule_dispatch reached _run_and_log but"
-            f" work_ticket_workspace_root={workspace_root!r},"
-            f" upload_staging_root={upload_staging_root!r};"
-            " set WORK_TICKET_WORKSPACE_ROOT and UPLOAD_STAGING_ROOT"
-            " or construct Settings with both"
+            f" path_scratch_ticket={workspace_root!r},"
+            f" path_scratch_staging={upload_staging_root!r};"
+            " set PATH_SCRATCH or construct Settings with both"
         )
     try:
         await run_workflow(

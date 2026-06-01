@@ -174,66 +174,57 @@ date -u  # compare with the pg_now_utc_offset above — should agree within seco
 
 ### 0.3 Shared filesystem
 
-The data plane writes Parquet under a durable shared mount; SLURM jobs
-write to a staging mount that's ideally on the same filesystem (for the
-atomic rename fast path). The compute orchestrator stages per-ticket
-workspaces under a third shared mount, visible from every compute node
-(SLURM uses it as the job's `current_working_directory`).
+Qiita's filesystem paths derive from three **base roots** the operator
+sets once per component env file; the services compute fixed subdirs from
+them (no per-leaf env var). The data plane writes Parquet under a durable
+mount (`PATH_PERSISTENT/ducklake`); SLURM upload staging lives under a
+scratch mount (`PATH_SCRATCH/staging`), ideally on the same filesystem as
+the lake for the atomic-rename fast path; the orchestrator stages
+per-ticket workspaces under the same scratch mount (`PATH_SCRATCH/ticket`),
+visible from every compute node (SLURM uses it as the job's
+`current_working_directory`).
 
-| Path role | Owner | Group | Mode | Notes |
-|---|---|---|---|---|
-| Mount point parent | `root` | `root` | `0755` | Infra-owned. |
-| Final Parquet dir | `qiita-data` | `qiita-data` | `0750` | DP-only. Two valid postures (see below). |
-| Staging dir | `qiita-data` | `qiita-pipeline` | `2770` | Setgid forces `qiita-pipeline` group on inherited files. |
-| Orchestrator workspace dir | `qiita-orch` | `qiita-pipeline` | `2770` | Holds per-ticket workspace trees (`<work_ticket_idx>/<step>/attempt-N/`). `qiita-orch` writes per-step subdirs as owner; `qiita-api` (CP runner) and `qiita-job` (SLURM job outputs) write via the `qiita-pipeline` group. Setgid carries the group to inherited files. Two valid postures (see below). |
+| Base root | Derived leaf | Owner | Group | Mode | Notes |
+|---|---|---|---|---|---|
+| `PATH_PERSISTENT` | `…/ducklake` | `qiita-data` | `qiita-data` | `0750` | DuckLake data path. DP-only. |
+| `PATH_SCRATCH` | `…/staging` | `qiita-data` | `qiita-pipeline` | `2770` | DoPut upload staging. Setgid forces `qiita-pipeline` group on inherited files. |
+| `PATH_SCRATCH` | `…/ticket` | `qiita-orch` | `qiita-pipeline` | `2770` | Per-ticket workspace trees (`<work_ticket_idx>/<step>/attempt-N/`). `qiita-orch` writes per-step subdirs as owner; `qiita-api` (CP runner) and `qiita-job` (SLURM job outputs) write via the `qiita-pipeline` group. Setgid carries the group to inherited files. |
+| `PATH_DERIVED` | `…/images` | `qiita-orch` | `qiita-orch` | `0755` | Apptainer SIF tier (SLURM container steps). Created at the bcl-convert deploy, not here — see `DEPLOY_CHECKLIST.md`. |
 
-Two valid postures for the final Parquet dir:
+The leaf dirs are always those fixed subdirs of the base roots — the
+service derives them in code, so there's no subdir-vs-mount choice to
+make. The mount points themselves stay infra-owned (`root:root 0755`);
+the operator creates each derived leaf with the ownership above.
 
-- **Subdir-of-mount** (runbook default): mount stays infra-owned; a
-  `parquet/` subdir under it is what carries `qiita-data:qiita-data 0750`.
-  Use this when the mount may host other content alongside Parquet.
-- **Mount-as-data**: the mount point itself is `qiita-data:qiita-data
-  0750`. Use this when the mount is dedicated to qiita's lake. Simpler.
-
-Two valid postures for the orchestrator workspace dir, mirroring the
-above:
-
-- **Subdir-of-mount**: an `orch-workspace/` subdir under `<scratch>`
-  (or another shared mount) carries the `qiita-orch:qiita-pipeline 2770`
-  ownership. Use when the mount hosts other content alongside.
-- **Mount-as-workspace** (this deploy's posture): the mount itself is
-  `qiita-orch:qiita-pipeline 2770`. Use when the mount is dedicated to
-  orchestrator workspaces.
-
-**Placeholder vocabulary used downstream.** `<mount>` and `<scratch>`
-refer to the *roots* (the parent mounts). `<data-dir>`, `<staging-dir>`,
-and `<orch-workspace>` are the *final paths*: under subdir-of-mount,
-`<data-dir>` = `<mount>/parquet`, `<staging-dir>` = `<scratch>/staging`,
-`<orch-workspace>` = `<scratch>/orch-workspace`; under mount-as-data /
-mount-as-workspace the corresponding root path IS the final dir.
+**Placeholder vocabulary used downstream.** `<persistent>` is the value
+of `PATH_PERSISTENT` (the durable mount root); `<scratch>` is the value of
+`PATH_SCRATCH` (the scratch mount root). The final paths are always
+`<persistent>/ducklake`, `<scratch>/staging`, and `<scratch>/ticket`.
+`PATH_SCRATCH` must be byte-identical across the control-plane,
+data-plane, and compute-orchestrator env files (all three derive the same
+`/ticket` and/or `/staging`).
 
 Three places consume these placeholders, named here so renumbering
 doesn't strand the reference:
-- the data-plane dir-creation step uses `<mount>` / `<scratch>`
-- the orchestrator workspace dir-creation step uses `<scratch>` /
-  `<orch-workspace>`
-- the env-file rendering steps wire `DUCKLAKE_DATA_PATH=<data-dir>`
-  (data plane), `WORK_TICKET_WORKSPACE_ROOT=<orch-workspace>` (control
-  plane), and `SHARED_FILESYSTEM_ROOT=<orch-workspace>` (compute
-  orchestrator — same path as the CP env var on a single-host deploy)
-- the end-to-end smoke references both `<data-dir>` and
-  `<orch-workspace>` paths.
+- the data-plane dir-creation step creates `<persistent>/ducklake` and
+  `<scratch>/staging`
+- the orchestrator workspace dir-creation step creates `<scratch>/ticket`
+- the env-file rendering steps wire `PATH_PERSISTENT=<persistent>` (data
+  plane), `PATH_SCRATCH=<scratch>` (data plane, control plane, and compute
+  orchestrator — the same value in all three)
+- the end-to-end smoke references both `<persistent>/ducklake` and
+  `<scratch>/ticket` paths.
 
 Verification:
 ```bash
 # [either]
-stat -c '%n  owner=%U  group=%G  mode=%a  device=%d' <data-dir> <staging-dir> <orch-workspace>
+stat -c '%n  owner=%U  group=%G  mode=%a  device=%d' <persistent>/ducklake <scratch>/staging <scratch>/ticket
 ```
 
-Watch the **device numbers**: if data and staging are on different
-volumes, the DP's rename from staging to final falls back to
-copy+delete. Works correctly, just slower. Flag to infra if you want
-the fast path; not blocking otherwise.
+Watch the **device numbers**: if `<persistent>/ducklake` and
+`<scratch>/staging` are on different volumes, the DP's rename from staging
+to final falls back to copy+delete. Works correctly, just slower. Flag to
+infra if you want the fast path; not blocking otherwise.
 
 ### 0.4 nginx + TLS + DNS
 
@@ -476,11 +467,11 @@ HMAC). `[operator]` renders the working copy at `/tmp/control-plane.env`
 
 Prerequisites: pg-host + password for `qiita_miint_rw` (DBA); AuthRocket
 realm subdomain (from `authrocket-realm-setup.md`); externally-resolvable
-FQDN; the path you've picked for `<orch-workspace>` (the orchestrator
-workspace dir from §0.3 — it doesn't have to exist yet, it gets
-created in §9a). The CP boot fails fast if `WORK_TICKET_WORKSPACE_ROOT`
-is unset, so you're committing to the path here even though the dir
-shows up two steps later.
+FQDN; the path you've picked for `<scratch>` (the scratch mount root from
+§0.3 — the `ticket` and `staging` leaves don't have to exist yet, they get
+created in §8a/§9a). The CP boot fails fast if `PATH_SCRATCH` is unset, so
+you're committing to the path here even though the leaf dirs show up a few
+steps later.
 
 ```bash
 # [operator] in a stable shell (use tmux/screen — HMAC_SECRET_KEY must survive
@@ -503,7 +494,7 @@ sed -i.bak \
     -e "s|^# AUTHROCKET_JWKS_URL=.*|AUTHROCKET_JWKS_URL='https://<realm>.loginrocket.com/connect/jwks'|" \
     -e "s|^# QIITA_ENDPOINT_URL=.*|QIITA_ENDPOINT_URL='https://<fqdn>'|" \
     -e "s|^# COMPUTE_ORCHESTRATOR_URL=.*|COMPUTE_ORCHESTRATOR_URL=http://127.0.0.1:8081|" \
-    -e "s|^WORK_TICKET_WORKSPACE_ROOT=.*|WORK_TICKET_WORKSPACE_ROOT=<orch-workspace>|" \
+    -e "s|^PATH_SCRATCH=.*|PATH_SCRATCH=<scratch>|" \
     /tmp/control-plane.env
 rm /tmp/control-plane.env.bak
 
@@ -738,29 +729,19 @@ Parquet files, and an env file.
 
 ### 8a. Create the Parquet data and staging directories
 
-**Default (subdir-of-mount).** The rest of the runbook — `DUCKLAKE_DATA_PATH`
-in step 8b, smoke-test paths in step 11 — assumes this. Use it unless
-you have a specific reason to deviate.
+The data plane derives `PATH_PERSISTENT/ducklake` (lake data) and
+`PATH_SCRATCH/staging` (DoPut upload staging), so create exactly those
+leaf dirs under the mount roots picked in §0.3. The mounts themselves stay
+infra-owned.
 
 ```bash
 # [admin]
-sudo install -d -o qiita-data -g qiita-data -m 0750     <mount>/parquet
+sudo install -d -o qiita-data -g qiita-data -m 0750     <persistent>/ducklake
 sudo install -d -o qiita-data -g qiita-pipeline -m 2770 <scratch>/staging
 ```
 
-Then `DUCKLAKE_DATA_PATH=<mount>/parquet` in step 8b.
-
-**Alternative (mount-as-data)** for deploys where `<mount>` is dedicated
-to qiita's lake and will host nothing else:
-
-```bash
-# [admin]
-sudo chown qiita-data:qiita-data <mount>
-sudo chmod 0750 <mount>
-sudo install -d -o qiita-data -g qiita-pipeline -m 2770 <scratch>/staging
-```
-
-Then `DUCKLAKE_DATA_PATH=<mount>` in step 8b.
+Then `PATH_PERSISTENT=<persistent>` and `PATH_SCRATCH=<scratch>` in step 8b
+(the data plane appends `/ducklake` and `/staging` itself).
 
 The setgid bit on the staging dir (`2770`) is load-bearing: files
 written by `qiita-job` inherit the `qiita-pipeline` group regardless
@@ -781,7 +762,8 @@ chmod 0600 /tmp/data-plane.env
 sed -i.bak \
     -e "s|^HMAC_SECRET_KEY=.*|HMAC_SECRET_KEY=$HMAC_SECRET_KEY|" \
     -e "s|^DUCKLAKE_CATALOG_CONNSTR=.*|DUCKLAKE_CATALOG_CONNSTR='dbname=qiita_miint_lake host=<pg-host> user=qiita_miint_lake_rw password=<password> sslmode=prefer'|" \
-    -e "s|^# DUCKLAKE_DATA_PATH=.*|DUCKLAKE_DATA_PATH=<data-dir>|" \
+    -e "s|^PATH_SCRATCH=.*|PATH_SCRATCH=<scratch>|" \
+    -e "s|^# PATH_PERSISTENT=.*|PATH_PERSISTENT=<persistent>|" \
     /tmp/data-plane.env
 rm /tmp/data-plane.env.bak
 
@@ -860,40 +842,25 @@ and DP env files (see step 1).
 ### 9a. Create the orchestrator workspace dir
 
 Both the CP runner (`qiita-api`) and the CO (`qiita-orch`) need to
-write here, plus SLURM jobs (`qiita-job`) write outputs underneath. Per
-§0.3 the dir is owned `qiita-orch:qiita-pipeline 2770`; qiita-api and
-qiita-job get write access via the `qiita-pipeline` group (§0.1).
-
-**Default (subdir-of-mount).**
-
-```bash
-# [admin]
-sudo install -d -o qiita-orch -g qiita-pipeline -m 2770 <scratch>/orch-workspace
-```
-
-Then `<orch-workspace>` = `<scratch>/orch-workspace` for §9b and the
-CP env file in §1.
-
-**Alternative (mount-as-workspace)** for deploys where `<scratch>` is
-dedicated to orchestrator workspaces (this deploy's posture):
+write here, plus SLURM jobs (`qiita-job`) write outputs underneath. The
+workspace is the derived `PATH_SCRATCH/ticket`; per §0.3 it is owned
+`qiita-orch:qiita-pipeline 2770`; qiita-api and qiita-job get write access
+via the `qiita-pipeline` group (§0.1).
 
 ```bash
 # [admin]
-sudo chown qiita-orch:qiita-pipeline <scratch>
-sudo chmod 2770 <scratch>
+sudo install -d -o qiita-orch -g qiita-pipeline -m 2770 <scratch>/ticket
 ```
-
-Then `<orch-workspace>` = `<scratch>` directly.
 
 The setgid bit on `2770` is load-bearing: SLURM jobs writing outputs
 inherit the `qiita-pipeline` group regardless of `qiita-job`'s primary
 group, so the next workflow step (running as `qiita-orch` or `qiita-api`)
 can read them. Same pattern as the data plane's staging dir (§8a).
 
-**Did the CP env in §1 already set `WORK_TICKET_WORKSPACE_ROOT`?** If
-not, edit `/etc/qiita/control-plane.env` to set it now and restart the
-CP — boot will fail-fast if it's unset. The path **must equal** what
-§9b puts in `SHARED_FILESYSTEM_ROOT`.
+**Did the CP env in §1 already set `PATH_SCRATCH`?** If not, edit
+`/etc/qiita/control-plane.env` to set it now and restart the CP — boot
+will fail-fast if it's unset. The value **must equal** the `PATH_SCRATCH`
+§9b puts in the orchestrator env (both derive the same `/ticket`).
 
 ### 9b. Write the orchestrator env file
 
@@ -906,7 +873,7 @@ chmod 0600 /tmp/compute-orchestrator.env
 # Force the SLURM backend (the example defaults to 'local' for dev/smoke).
 sed -i.bak \
     -e "s|^COMPUTE_BACKEND=.*|COMPUTE_BACKEND=slurm|" \
-    -e "s|^# SHARED_FILESYSTEM_ROOT=.*|SHARED_FILESYSTEM_ROOT=<orch-workspace>|" \
+    -e "s|^# PATH_SCRATCH=.*|PATH_SCRATCH=<scratch>|" \
     -e "s|^# SLURMRESTD_URL=|SLURMRESTD_URL=|" \
     -e "s|^# SLURMRESTD_JWT_PATH=|SLURMRESTD_JWT_PATH=|" \
     -e "s|^# SLURMRESTD_USER_NAME=|SLURMRESTD_USER_NAME=|" \

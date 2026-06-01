@@ -39,8 +39,8 @@ def _fake_app(*, compute_backend_client=object(), pool=object()) -> SimpleNamesp
             # Real Paths keep the defensive None-check happy without
             # making the test reach any filesystem operation (run_workflow
             # is monkeypatched in every test that actually dispatches).
-            work_ticket_workspace_root=Path("/tmp/qiita-test-ws-unused"),
-            upload_staging_root=Path("/tmp/qiita-test-staging-unused"),
+            path_scratch_ticket=Path("/tmp/qiita-test-scratch-unused/ticket"),
+            path_scratch_staging=Path("/tmp/qiita-test-scratch-unused/staging"),
         ),
     )
     return SimpleNamespace(state=state)

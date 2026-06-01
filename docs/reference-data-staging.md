@@ -5,7 +5,7 @@ Source data for reference database ingestion is staged on the shared filesystem 
 ## Directory Layout
 
 ```
-{shared_filesystem_root}/references/staging/{name}/{version}/
+{PATH_SCRATCH}/references/staging/{name}/{version}/
 ├── seqs.fna.gz                # Sequences (FASTA, gzipped)
 ├── taxonomy.tsv.gz            # Taxonomy assignments (TSV, gzipped)
 ├── backbone.nwk               # Backbone phylogeny (Newick)
@@ -14,7 +14,7 @@ Source data for reference database ingestion is staged on the shared filesystem 
 └── manifest.json              # Declares what's present + checksums
 ```
 
-In development, `{shared_filesystem_root}` defaults to `$TMPDIR/qiita` (or `/tmp/qiita` if `$TMPDIR` is unset). In production, this is `/data`.
+In development, `{PATH_SCRATCH}` defaults to `$TMPDIR/qiita` (or `/tmp/qiita` if `$TMPDIR` is unset). In production, it is the shared scratch mount the operator sets `PATH_SCRATCH` to (e.g. `/scratch`).
 
 ## Manifest Format
 

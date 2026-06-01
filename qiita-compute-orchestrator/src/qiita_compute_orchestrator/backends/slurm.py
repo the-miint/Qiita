@@ -87,7 +87,7 @@ class SlurmBackend(ComputeBackend):
         co_to_cp_token: str = "",
         cp_url: str = "",
         qos: str = "",
-        qiita_images_dir: Path | None = None,
+        path_derived_images: Path | None = None,
     ) -> None:
         self._client = client
         self._partition = partition
@@ -95,13 +95,13 @@ class SlurmBackend(ComputeBackend):
         self._poll_interval = poll_interval_seconds
         self._job_timeout = job_timeout_seconds
         self._native_python = native_python
-        # Shared-FS root where built SIFs live. When set, bare `container:`
-        # filenames in workflow YAML resolve as `qiita_images_dir / filename`
-        # at submit time. When None, container steps are rejected — see
-        # _resolve_container_image. Production deploys with COMPUTE_BACKEND=
-        # slurm fail-fast at Settings.from_env() if QIITA_IMAGES_DIR is
-        # missing or invalid.
-        self._qiita_images_dir = qiita_images_dir
+        # Shared-FS dir where built SIFs live (PATH_DERIVED/images). When
+        # set, bare `container:` filenames in workflow YAML resolve as
+        # `path_derived_images / filename` at submit time. When None,
+        # container steps are rejected — see _resolve_container_image.
+        # Production deploys with COMPUTE_BACKEND=slurm fail-fast at
+        # Settings.from_env() if PATH_DERIVED is missing or invalid.
+        self._path_derived_images = path_derived_images
         # CO→CP token + CP URL are propagated into the SLURM job env so
         # the native-step launcher running on a compute node can resolve
         # Settings.from_env() without reading /etc/qiita/*.token (which
@@ -137,15 +137,15 @@ class SlurmBackend(ComputeBackend):
           (e.g. ``oras://`` / ``docker://``). Escape hatch for the rare
           case a workflow doesn't ship a bundled SIF.
         * Bare SIF filename (no path separators) — joined with
-          ``self._qiita_images_dir`` to produce an absolute path.
+          ``self._path_derived_images`` to produce an absolute path.
         * Anything else — rejected as CONTRACT_VIOLATION. A path
           separator inside a non-URL value indicates the YAML author
           tried to override the deploy-time image tier, which we don't
           allow (production wants every SIF under the shared
-          ``QIITA_IMAGES_DIR``).
+          ``PATH_DERIVED/images``).
 
         The fail-fast pair: ``Settings.from_env()`` catches missing /
-        invalid ``QIITA_IMAGES_DIR`` at boot; this submit-time check
+        invalid ``PATH_DERIVED`` at boot; this submit-time check
         catches malformed ``container:`` strings.
         """
         if "://" in container:
@@ -158,21 +158,21 @@ class SlurmBackend(ComputeBackend):
                 reason=(
                     f"container value {container!r} must be either a bare SIF"
                     " filename (no path separators) or a registry URL containing"
-                    " '://'; the deploy-time QIITA_IMAGES_DIR supplies the path"
+                    " '://'; the deploy-time PATH_DERIVED/images supplies the path"
                 ),
             )
-        if self._qiita_images_dir is None:
+        if self._path_derived_images is None:
             raise BackendFailure(
                 kind=FailureKind.CONTRACT_VIOLATION,
                 stage=WorkTicketFailureStage.STEP_RUN,
                 step_name=step_name,
                 reason=(
-                    f"container step {step_name!r} requires QIITA_IMAGES_DIR"
+                    f"container step {step_name!r} requires PATH_DERIVED/images"
                     " to be configured on the orchestrator (bare SIF filenames"
                     " resolve against it); not set"
                 ),
             )
-        return str(self._qiita_images_dir / container)
+        return str(self._path_derived_images / container)
 
     def _resolve_input_binds(self, inputs: dict[str, Path], *, step_name: str) -> list[Path]:
         """Compute the additional ``--bind`` directories a container step

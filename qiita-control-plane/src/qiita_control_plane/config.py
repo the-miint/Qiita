@@ -91,25 +91,28 @@ class Settings:
     auth_handoff_freshness_seconds: int = _DEFAULT_AUTH_HANDOFF_FRESHNESS_SECONDS
     cli_login_code_ttl_seconds: int = _DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS
     max_sequence_mint_count: int = _DEFAULT_MAX_SEQUENCE_MINT_COUNT
-    # Filesystem root the workflow runner mints per-ticket workspaces under
-    # (`<root>/<work_ticket_idx>/<step>/attempt-N/`). The CP creates the
-    # subdir; the path is POSTed to the orchestrator as the SLURM job's
+    # Per-ticket workspace root the workflow runner mints under
+    # (`<root>/<work_ticket_idx>/<step>/attempt-N/`). Derived in from_env()
+    # as `PATH_SCRATCH/ticket`. The CP creates the subdir; the path is
+    # POSTed to the orchestrator as the SLURM job's
     # `current_working_directory`, so the same path must resolve on every
-    # compute node — i.e. a shared filesystem mount. On a single-host
-    # deploy this is the same dir as the orchestrator's SHARED_FILESYSTEM_ROOT.
-    # Optional in the dataclass so tests don't have to set it; required by
-    # from_env() so production boot fails fast if WORK_TICKET_WORKSPACE_ROOT
-    # is unset. dispatch._run_and_log raises if None reaches use-time.
-    work_ticket_workspace_root: Path | None = None
-    # Filesystem root the data plane writes DoPut uploads under, shared
-    # between CP and DP. The runner resolves `*_upload_idx` keys in a
-    # work_ticket's action_context to `{root}/uploads/{idx}/upload.parquet`
+    # compute node — i.e. a shared filesystem mount. The orchestrator
+    # derives the identical path from the same PATH_SCRATCH (its readiness
+    # probe checks it), so set PATH_SCRATCH to the same value in both env
+    # files. Optional in the dataclass so tests don't have to set it;
+    # PATH_SCRATCH is required by from_env() so production boot fails fast
+    # if it is unset. dispatch._run_and_log raises if None reaches use-time.
+    path_scratch_ticket: Path | None = None
+    # Upload staging root the data plane writes DoPut uploads under, shared
+    # between CP and DP. Derived in from_env() as `PATH_SCRATCH/staging`.
+    # The runner resolves `*_upload_idx` keys in a work_ticket's
+    # action_context to `{root}/uploads/{idx}/upload.parquet`
     # (compute_upload_staging_path) before invoking workflow steps. The Rust
-    # data plane carries its own UPLOAD_STAGING_ROOT env var (config.rs) —
-    # both sides must be set to the same shared-filesystem path. Same
-    # required-but-Optional shape as work_ticket_workspace_root for the same
+    # data plane derives the identical path from the same PATH_SCRATCH
+    # (config.rs) — both sides must see the same PATH_SCRATCH. Same
+    # required-but-Optional shape as path_scratch_ticket for the same
     # reasons; dispatch._run_and_log raises if None reaches use-time.
-    upload_staging_root: Path | None = None
+    path_scratch_staging: Path | None = None
     # Contact email rendered on the public landing page (`GET /`) as the
     # destination for both the "request access" and "need help" mailto
     # links. Required at boot so the landing page never ships with a
@@ -141,27 +144,23 @@ class Settings:
             os.environ.get("CP_TO_CO_TOKEN_PATH", str(_DEFAULT_CP_TO_CO_TOKEN_PATH))
         )
 
-        # Required + must be absolute. Relative paths would be resolved
-        # against the service's CWD (whatever systemd / uvicorn happened to
-        # start in), which is non-obvious surface for an operator to reason
-        # about. Force the operator to spell out the shared mount. Same
-        # treatment for UPLOAD_STAGING_ROOT — the DP writes uploads here and
-        # the CP runner resolves `*_upload_idx` action_context keys against
-        # it; a mismatched or non-absolute root surfaces as a "no such file"
-        # deep inside a workflow step, long after the route returned.
-        ws_root_raw = require_env("WORK_TICKET_WORKSPACE_ROOT")
-        ws_root = Path(ws_root_raw)
-        if not ws_root.is_absolute():
-            raise RuntimeError(
-                f"WORK_TICKET_WORKSPACE_ROOT must be an absolute path, got {ws_root_raw!r}"
-            )
-
-        upload_root_raw = require_env("UPLOAD_STAGING_ROOT")
-        upload_root = Path(upload_root_raw)
-        if not upload_root.is_absolute():
-            raise RuntimeError(
-                f"UPLOAD_STAGING_ROOT must be an absolute path, got {upload_root_raw!r}"
-            )
+        # Single shared-scratch base root; the per-ticket workspace and the
+        # upload-staging dir are derived as fixed subdirs (`/ticket`,
+        # `/staging`). Required + must be absolute: relative paths would be
+        # resolved against the service's CWD (whatever systemd / uvicorn
+        # happened to start in), which is non-obvious surface for an
+        # operator to reason about, and these paths must resolve identically
+        # on every compute node — a mismatched or non-absolute root surfaces
+        # as a "no such file" deep inside a workflow step, long after the
+        # route returned. The orchestrator (PATH_SCRATCH/ticket) and the
+        # data plane (PATH_SCRATCH/staging) derive the same subdirs, so
+        # PATH_SCRATCH must be byte-identical across all three env files.
+        scratch_raw = require_env("PATH_SCRATCH")
+        scratch = Path(scratch_raw)
+        if not scratch.is_absolute():
+            raise RuntimeError(f"PATH_SCRATCH must be an absolute path, got {scratch_raw!r}")
+        ws_root = scratch / "ticket"
+        upload_root = scratch / "staging"
 
         contact_email = require_env("CONTACT_EMAIL")
         # Minimal shape check — exactly one `@`, non-empty local part,
@@ -214,7 +213,7 @@ class Settings:
                 "QIITA_MAX_SEQUENCE_MINT_COUNT",
                 _DEFAULT_MAX_SEQUENCE_MINT_COUNT,
             ),
-            work_ticket_workspace_root=ws_root,
-            upload_staging_root=upload_root,
+            path_scratch_ticket=ws_root,
+            path_scratch_staging=upload_root,
             contact_email=contact_email,
         )

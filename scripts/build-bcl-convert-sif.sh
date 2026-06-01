@@ -5,17 +5,18 @@
 # is left in place; otherwise apptainer rebuilds it from the in-tree
 # Apptainer.def. Designed to be run from the deploy host after the
 # operator has placed the Illumina-licensed RPM at
-# ${QIITA_IMAGES_DIR}/sources/.
+# ${PATH_DERIVED}/images/sources/.
 #
 # Pre-conditions:
-#   * QIITA_IMAGES_DIR is set, exists, is a directory (the orchestrator's
-#     Settings.from_env() enforces this at boot, but we re-check here so a
-#     misconfigured shell on the deploy host fails before apptainer runs).
-#   * ${QIITA_IMAGES_DIR}/sources/bcl-convert-4.5.4-2.el8.x86_64.rpm exists.
+#   * PATH_DERIVED is set, and ${PATH_DERIVED}/images exists and is a
+#     directory (the orchestrator's Settings.from_env() enforces this at
+#     boot, but we re-check here so a misconfigured shell on the deploy
+#     host fails before apptainer runs).
+#   * ${PATH_DERIVED}/images/sources/bcl-convert-4.5.4-2.el8.x86_64.rpm exists.
 #   * `apptainer` is on PATH.
 #
 # Usage:
-#   QIITA_IMAGES_DIR=/scratch/persistent/images bash scripts/build-bcl-convert-sif.sh
+#   PATH_DERIVED=/scratch/persistent bash scripts/build-bcl-convert-sif.sh
 set -euo pipefail
 
 BCL_CONVERT_VERSION="4.5.4"
@@ -26,13 +27,16 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REPO_ROOT="$( cd "${SCRIPT_DIR}/.." && pwd )"
 WORKFLOW_DIR="${REPO_ROOT}/workflows/bcl-convert"
 
-if [[ -z "${QIITA_IMAGES_DIR:-}" ]]; then
-    echo "QIITA_IMAGES_DIR is not set; set it to the shared-FS SIF tier" >&2
-    echo "(e.g. /scratch/persistent/images) and re-run" >&2
+if [[ -z "${PATH_DERIVED:-}" ]]; then
+    echo "PATH_DERIVED is not set; set it to the derived-artifact FS root" >&2
+    echo "(e.g. /scratch/persistent; SIFs live under PATH_DERIVED/images) and re-run" >&2
     exit 64
 fi
-if [[ ! -d "${QIITA_IMAGES_DIR}" ]]; then
-    echo "QIITA_IMAGES_DIR=${QIITA_IMAGES_DIR} is not a directory" >&2
+# Built SIFs live under PATH_DERIVED/images (the orchestrator derives the
+# same join). Everything below operates on that derived tier.
+IMAGES_DIR="${PATH_DERIVED}/images"
+if [[ ! -d "${IMAGES_DIR}" ]]; then
+    echo "PATH_DERIVED/images=${IMAGES_DIR} is not a directory" >&2
     exit 64
 fi
 if ! command -v apptainer >/dev/null 2>&1; then
@@ -40,7 +44,7 @@ if ! command -v apptainer >/dev/null 2>&1; then
     exit 64
 fi
 
-SOURCES_DIR="${QIITA_IMAGES_DIR}/sources"
+SOURCES_DIR="${IMAGES_DIR}/sources"
 RPM_PATH="${SOURCES_DIR}/${RPM_FILENAME}"
 if [[ ! -f "${RPM_PATH}" ]]; then
     echo "Expected Illumina-licensed RPM not found at:" >&2
@@ -50,7 +54,7 @@ if [[ ! -f "${RPM_PATH}" ]]; then
     exit 64
 fi
 
-SIF_PATH="${QIITA_IMAGES_DIR}/${SIF_FILENAME}"
+SIF_PATH="${IMAGES_DIR}/${SIF_FILENAME}"
 
 # Idempotency check: if a SIF already exists AND reports the expected
 # bcl-convert version, leave it alone. `apptainer exec` runs the
@@ -83,7 +87,7 @@ trap cleanup EXIT
 
 cp "${RPM_PATH}" "${STAGED_RPM}"
 
-# apptainer build --force overwrites any leftover SIF in $QIITA_IMAGES_DIR.
+# apptainer build --force overwrites any leftover SIF in $IMAGES_DIR.
 # Run from the workflow dir so the relative paths in Apptainer.def resolve.
 (
     cd "${WORKFLOW_DIR}"

@@ -43,6 +43,14 @@ the `no-changelog` label).
   `CHANGELOG.md` is now this per-change log (#65)
 - Scoped the `push` CI trigger to `main` so PR branches get a single
   `pull_request` run instead of duplicate push + PR runs (#65)
+- Restructured the filesystem env vars onto three base roots with derived
+  leaves: `WORK_TICKET_WORKSPACE_ROOT` + `SHARED_FILESYSTEM_ROOT` →
+  `PATH_SCRATCH/ticket`, `UPLOAD_STAGING_ROOT` → `PATH_SCRATCH/staging`,
+  `DUCKLAKE_DATA_PATH` → `PATH_PERSISTENT/ducklake`, and `QIITA_IMAGES_DIR`
+  → `PATH_DERIVED/images`. Operators now set `PATH_SCRATCH` /
+  `PATH_PERSISTENT` / `PATH_DERIVED`; the services derive the fixed
+  subdirs. Hard cutover — the old names are gone and boot fails fast until
+  the new ones are set (#73)
 
 ### Fixed
 
