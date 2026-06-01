@@ -4,8 +4,10 @@ Exercises the wet_lab_admin and system_admin happy paths plus a
 regular-user happy path (no system_role gate on this route — the USER
 ceiling covers prep_sample:write and run creation carries no further
 auth), the scope guard, anonymous 401, Pydantic body validation, and
-the instrument_run_id uniqueness collision mapping (409 with the
-human-readable detail).
+the find-or-create idempotency surface on the instrument_run_id natural
+key: same key + matching payload returns 200 with the existing idx;
+same key + mismatching payload returns 409 with a structured
+PayloadMismatch detail; supplied-None on retry is ignored.
 """
 
 import json
@@ -56,7 +58,8 @@ async def ctx(role_keyed_clients):
 
 async def _post_run(client, ctx, **body):
     """POST the route and, on 201, track the created sequencing_run idx for
-    FK-reverse cleanup."""
+    FK-reverse cleanup. 200 (find-or-create reuse) returns the same idx
+    already tracked from the first 201, so we only track on create."""
     resp = await client.post(_ROUTE, json=body)
     if resp.status_code == 201:
         ctx["created"]["sequencing_run"].append(resp.json()["sequencing_run_idx"])
@@ -259,16 +262,45 @@ async def test_create_sequencing_run_extra_field_422(ctx):
 # ===========================================================================
 
 
-async def test_create_sequencing_run_duplicate_instrument_run_id_409(ctx):
-    # First POST claims an instrument_run_id; a second POST with the same id
-    # trips sequencing_run_instrument_run_id_unique and the route maps it
-    # to 409 with the human-readable message from the mapping dict.
+async def test_create_sequencing_run_find_or_create_same_payload_returns_200(ctx):
+    # Find-or-create read-through: a second POST with the same
+    # instrument_run_id and matching fields returns 200 with the existing
+    # idx instead of 409. Required so the bundled qiita submit-bcl-convert
+    # CLI's three POSTs converge on retry without operator cleanup.
     instrument_run_id = unique_instrument_id("DUP")
     r1 = await _post_run(
         ctx["wet"],
         ctx,
         instrument_run_id=instrument_run_id,
         platform="illumina",
+        instrument_model="NovaSeq X+",
+    )
+    assert r1.status_code == 201, r1.text
+    first_idx = r1.json()["sequencing_run_idx"]
+
+    r2 = await _post_run(
+        ctx["wet"],
+        ctx,
+        instrument_run_id=instrument_run_id,
+        platform="illumina",
+        instrument_model="NovaSeq X+",
+    )
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["sequencing_run_idx"] == first_idx
+
+
+async def test_create_sequencing_run_payload_mismatch_returns_409(ctx):
+    # Same instrument_run_id + a non-None supplied field disagrees with the
+    # stored value → 409 with structured PayloadMismatch detail naming the
+    # conflicting field and both values. CLI uses this to refuse to silently
+    # mutate a row the operator may have re-bound the wrong way.
+    instrument_run_id = unique_instrument_id("MISMATCH")
+    r1 = await _post_run(
+        ctx["wet"],
+        ctx,
+        instrument_run_id=instrument_run_id,
+        platform="illumina",
+        instrument_model="NovaSeq X+",
     )
     assert r1.status_code == 201, r1.text
 
@@ -277,6 +309,49 @@ async def test_create_sequencing_run_duplicate_instrument_run_id_409(ctx):
         ctx,
         instrument_run_id=instrument_run_id,
         platform="illumina",
+        instrument_model="iSeq",
     )
-    assert r2.status_code == 409
-    assert r2.json()["detail"] == "instrument_run_id already in use"
+    assert r2.status_code == 409, r2.text
+    detail = r2.json()["detail"]
+    expected = {
+        "conflicting_field": "instrument_model",
+        "existing_value": "NovaSeq X+",
+        "supplied_value": "iSeq",
+    }
+    assert detail == expected
+
+
+async def test_create_sequencing_run_under_supply_on_retry_returns_200(ctx):
+    # A retry that omits a previously-set field (supplied None) is treated
+    # as "caller didn't override"; the field is not compared and the
+    # response is 200 with the existing idx. Matches the CLI's behaviour
+    # of leaving optional flags unset on a re-run.
+    instrument_run_id = unique_instrument_id("UNDERSUPPLY")
+    r1 = await _post_run(
+        ctx["wet"],
+        ctx,
+        instrument_run_id=instrument_run_id,
+        platform="illumina",
+        instrument_model="NovaSeq X+",
+        instrument_serial="LH00123",
+    )
+    assert r1.status_code == 201, r1.text
+    first_idx = r1.json()["sequencing_run_idx"]
+
+    r2 = await _post_run(
+        ctx["wet"],
+        ctx,
+        instrument_run_id=instrument_run_id,
+        platform="illumina",
+        # instrument_model + instrument_serial omitted → not compared.
+    )
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["sequencing_run_idx"] == first_idx
+
+    # The stored row's optional fields are unchanged — under-supply never
+    # nulls a previously-populated column.
+    row = await ctx["pool"].fetchrow(
+        "SELECT instrument_model, instrument_serial FROM qiita.sequencing_run WHERE idx = $1",
+        first_idx,
+    )
+    assert dict(row) == {"instrument_model": "NovaSeq X+", "instrument_serial": "LH00123"}

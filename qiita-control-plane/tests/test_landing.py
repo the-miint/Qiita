@@ -102,6 +102,8 @@ async def test_landing_links_into_repo_docs(app):
         "https://github.com/the-miint/Qiita/blob/main/docs/runbooks/user-cli-quickstart.md" in body
     )
     assert "https://github.com/the-miint/Qiita/blob/main/docs/architecture.md" in body
+    # Same-origin link into the self-hosted Swagger UI (served by main.py).
+    assert 'href="/docs"' in body
 
 
 async def test_landing_does_not_render_session_banner(app):

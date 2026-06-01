@@ -105,6 +105,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_SEQUENCING_RUN_PREFIX",
         "PATH_SEQUENCING_RUN_SEQUENCED_POOL",
     ),
+    (
+        "URL_SEQUENCED_POOL_PREFLIGHT",
+        "PATH_SEQUENCING_RUN_PREFIX",
+        "PATH_SEQUENCED_POOL_PREFLIGHT",
+    ),
     # /biosample — three routes; two re-anchor on /study, one on /biosample
     ("URL_BIOSAMPLE_BY_STUDY", "PATH_STUDY_PREFIX", "PATH_BIOSAMPLE_BY_STUDY"),
     (
@@ -113,6 +118,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_BIOSAMPLE_LIST_BY_STUDY",
     ),
     ("URL_BIOSAMPLE_BY_IDX", "PATH_BIOSAMPLE_PREFIX", "PATH_BIOSAMPLE_BY_IDX"),
+    (
+        "URL_BIOSAMPLE_LOOKUP_BY_ACCESSION",
+        "PATH_BIOSAMPLE_PREFIX",
+        "PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION",
+    ),
     # /sequenced-sample — re-anchored on /sequencing-run, /study, /sequenced-sample
     (
         "URL_SEQUENCED_SAMPLE_FROM_RUN",

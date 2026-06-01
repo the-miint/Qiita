@@ -1,8 +1,21 @@
-"""qiita-admin — operator (admin-only) CLI for principal/role/token management.
+"""qiita-admin — operator CLI for host-side and direct-DB tasks.
 
-Scope: operator/admin tasks only. End-user interactions with qiita (data-plane
-operations, study/sample management, etc.) will live in a separate `qiita`
-CLI; this module deliberately does not grow user-facing subcommands.
+Placement rule (qiita vs qiita-admin) — the deciding test is how a command
+reaches the system and whether the auth model can gate it:
+
+  qiita        — credentialed API calls over HTTP+PAT; the server's
+                 role/scope guards decide what's allowed. A command only a
+                 system_admin can use still belongs in `qiita` if it's a
+                 normal authenticated API call (the server 403s everyone
+                 else) — the binary is not the security boundary.
+  qiita-admin  — operator-on-the-host actions that run *outside* the
+                 API/auth model: direct Postgres writes (gated by
+                 DATABASE_URL) or host/cluster operations, for moments the
+                 auth system can't help (no admin exists yet, the API is
+                 down, or you're recovering state).
+
+`token revoke-all` is HTTP+PAT and by the rule could live in `qiita`; it
+stays here for operator discoverability, not because the split forces it.
 
 Subcommands:
   set-system-role  — direct DB UPDATE of qiita.principal.system_role.
@@ -22,12 +35,6 @@ Subcommands:
                      write; reads DATABASE_URL from env. Idempotent: re-runs
                      converge to the YAML state without touching operational
                      columns (enabled / first_seen_at / disabled_*).
-  reference load   — drive the reference-add workflow end-to-end: per-file
-                     Arrow conversion + DoPut to the data plane + POST
-                     /work-ticket with the resulting upload handles, then
-                     watch the work_ticket through to terminal. See
-                     `cli.reference_load.do_reference_load` for the
-                     programmatic entry point integration tests call.
   ticket force-fail — direct-DB transition of a non-terminal work_ticket
                      to state=failed with a captured failure_type /
                      stage / step_name / reason. Replaces the previous
@@ -405,57 +412,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_readiness.set_defaults(handler=_handle_compute_readiness)
 
-    p_reference = sub.add_parser("reference", help="Reference-data lifecycle operations")
-    p_reference_sub = p_reference.add_subparsers(dest="reference_cmd", required=True)
-    p_reference_load = p_reference_sub.add_parser(
-        "load",
-        help=("Upload FASTA + optional inputs and run the reference-add workflow end-to-end"),
-    )
-    # Reference selection — XOR enforced inside the handler so the help
-    # output reads cleanly; argparse's mutually_exclusive_group can't
-    # express "either A+B together, or C alone."
-    p_reference_load.add_argument("--name", help="New reference name (paired with --version)")
-    p_reference_load.add_argument("--version", help="New reference version (paired with --name)")
-    p_reference_load.add_argument(
-        "--kind",
-        default="sequence_reference",
-        choices=("sequence_reference", "taxonomy_authority"),
-        help="Reference kind for newly-created references (default: sequence_reference)",
-    )
-    p_reference_load.add_argument(
-        "--reference-idx",
-        type=int,
-        help="Bind to an existing reference instead of creating one",
-    )
-    p_reference_load.add_argument("--fasta", required=True, type=Path)
-    p_reference_load.add_argument("--taxonomy", type=Path)
-    p_reference_load.add_argument("--tree", type=Path)
-    p_reference_load.add_argument("--jplace", type=Path)
-    p_reference_load.add_argument("--genome-map", type=Path, dest="genome_map")
-    p_reference_load.add_argument(
-        "--data-plane-url",
-        required=True,
-        help="gRPC URL of the data plane (e.g. grpc://qiita-data.example.com:50051)",
-    )
-    p_reference_load.add_argument(
-        "--no-watch",
-        action="store_true",
-        help="Submit the work_ticket and exit without polling. Default polls until terminal.",
-    )
-    p_reference_load.add_argument(
-        "--poll-interval",
-        type=float,
-        default=2.0,
-        help="Seconds between work_ticket polls under --watch (default: 2.0)",
-    )
-    p_reference_load.add_argument(
-        "--timeout",
-        type=float,
-        default=24 * 3600,
-        help="Max seconds to wait for the work_ticket under --watch (default: 86400)",
-    )
-    p_reference_load.set_defaults(handler=_handle_reference_load)
-
     return parser
 
 
@@ -559,117 +515,6 @@ def _handle_ticket_force_fail(args: argparse.Namespace, parser: argparse.Argumen
         return 1
     print(json.dumps(result, indent=2))
     return 0
-
-
-async def _run_reference_load(
-    *,
-    base_url: str,
-    token: str,
-    data_plane_url: str,
-    args: argparse.Namespace,
-) -> dict:
-    """Construct real httpx + pyarrow.flight clients and drive
-    `do_reference_load`. Lives next to the CLI handler so the handler
-    stays a thin argparse → entry-point shim; the entry point itself
-    (in cli.reference_load) takes injected clients so tests bypass this
-    function entirely."""
-    import httpx as _httpx
-    import pyarrow.flight as flight
-
-    from .reference_load import do_reference_load
-
-    flight_client = flight.FlightClient(data_plane_url)
-    try:
-        async with _httpx.AsyncClient(
-            base_url=base_url, timeout=_common.CLI_HTTP_TIMEOUT_SECONDS
-        ) as http:
-            return await do_reference_load(
-                http=http,
-                token=token,
-                flight_client=flight_client,
-                fasta_path=args.fasta,
-                name=args.name,
-                version=args.version,
-                kind=args.kind,
-                reference_idx=args.reference_idx,
-                taxonomy_path=args.taxonomy,
-                tree_path=args.tree,
-                jplace_path=args.jplace,
-                genome_map_path=args.genome_map,
-                watch=not args.no_watch,
-                poll_interval_seconds=args.poll_interval,
-                timeout_seconds=args.timeout,
-            )
-    finally:
-        flight_client.close()
-
-
-def _handle_reference_load(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    """Entry point for `qiita-admin reference load`. Reads the PAT, builds
-    a real httpx + flight client, and calls `do_reference_load`. Maps
-    every known failure shape to exit 1 with a one-line stderr message —
-    no silent retry, no buried traceback. Terminal work_ticket=failed
-    also exits 1 so callers wrapping this in a Makefile / CI step get
-    the build break."""
-    import httpx as _httpx
-    import pyarrow.flight as _flight
-
-    try:
-        token = _common.read_token()
-    except RuntimeError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    try:
-        result = asyncio.run(
-            _run_reference_load(
-                base_url=args.base_url,
-                token=token,
-                data_plane_url=args.data_plane_url,
-                args=args,
-            )
-        )
-    except _httpx.HTTPStatusError as exc:
-        print(
-            f"http error {exc.response.status_code}: {exc.response.text}",
-            file=sys.stderr,
-        )
-        return 1
-    except _flight.FlightError as exc:
-        # Catch the gRPC-level error explicitly so the operator sees a
-        # formatted error line instead of a raw traceback. FlightError is
-        # NOT a RuntimeError subclass, so the catch-all below would miss
-        # it. Common shapes: network refused, expired ticket, DP
-        # rejected the stream mid-write.
-        print(f"flight error: {exc}", file=sys.stderr)
-        return 1
-    except (RuntimeError, ValueError, TimeoutError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
-    # Terminal work_ticket=failed under --watch surfaces as exit 1, not
-    # exit 0 — a CI step wrapping this CLI must distinguish a successful
-    # reference build from a failed one. The JSON body still goes to
-    # stdout so the caller can see the failure_reason.
-    work_ticket = result.get("work_ticket") or {}
-    final_state = work_ticket.get("state")
-    print(json.dumps(_serializable(result), indent=2))
-    if final_state == "failed":
-        return 1
-    return 0
-
-
-def _serializable(obj):
-    """Recursively replace Pydantic / Path values with their JSON form so
-    `json.dumps` succeeds on the result dict (which carries upload-idx
-    metadata + the final work_ticket body)."""
-    from pathlib import Path as _Path
-
-    if isinstance(obj, dict):
-        return {k: _serializable(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_serializable(v) for v in obj]
-    if isinstance(obj, _Path):
-        return str(obj)
-    return obj
 
 
 def main(argv: list[str] | None = None) -> int:

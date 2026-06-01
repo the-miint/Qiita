@@ -18,6 +18,84 @@ INCOMING=/opt/qiita/incoming
     exit 1
 }
 
+# Migration-pending guard. The code we're about to deploy assumes the schema
+# produced by every file in db/migrations/; restarting services against a DB
+# missing any of them surfaces as runtime 500s, not a boot failure. Applying
+# migrations (`make migrate`) is a separate manual operator step that this
+# script intentionally does NOT run — auto-applying is unsafe for
+# expand/contract changes — so we only REFUSE to deploy onto a stale schema and
+# point the operator at the runbook. Skipped on first deploy (no env file yet),
+# the same gate as the actions sync / restarts below.
+assert_migrations_applied() {
+    # Explicit, logged escape hatch (same SKIP_* convention as local-deploy.sh)
+    # for the rare host that has dbmate but no psql client, or any case where the
+    # operator has verified migrations out-of-band. Bypassing is a deliberate,
+    # visible act — never a silent fall-through.
+    [ -n "${SKIP_MIGRATION_GUARD:-}" ] && { echo "migration guard: skipped via SKIP_MIGRATION_GUARD=1" >&2; return 0; }
+
+    # We run as root (asserted at the top of this script), so the 0440
+    # root:qiita-api env file is readable here. Absent only on first deploy —
+    # the same gate as the actions sync / restarts below, where the DB is
+    # bootstrapped out-of-band by the runbook's `make migrate`.
+    local env_file=/etc/qiita/control-plane.env
+    [ -r "$env_file" ] || { echo "skipping migration guard — $env_file not present (first deploy)" >&2; return 0; }
+
+    # The states below are anomalous on an established host (env file present).
+    # The guard's whole purpose is to fail loudly rather than restart onto a
+    # stale schema, so each one REFUSES the deploy instead of waving it through.
+    command -v psql >/dev/null 2>&1 || {
+        echo "ERROR: psql not found — cannot verify migrations are applied; refusing to deploy blind." >&2
+        echo "       Install the postgres client, or re-run with SKIP_MIGRATION_GUARD=1 after confirming 'make migrate' ran." >&2
+        exit 1
+    }
+
+    local db_url
+    # set +e so a sourced line that happens to evaluate non-zero doesn't abort the
+    # subshell under the script's errexit and silently blank db_url (it would then
+    # misreport as "DATABASE_URL unset" instead of the real cause).
+    db_url=$( set +e; set -a; # shellcheck disable=SC1090,SC1091
+              source "$env_file"; set +a; printf '%s' "${DATABASE_URL:-}" )
+    [ -n "$db_url" ] || {
+        echo "ERROR: DATABASE_URL unset in $env_file — cannot verify migrations; refusing to deploy blind." >&2
+        exit 1
+    }
+
+    # dbmate records each migration's version (the numeric filename prefix
+    # before the first '_') in this table.
+    local applied
+    applied=$(psql "$db_url" -Atc 'SELECT version FROM public.schema_migrations' 2>/dev/null) || {
+        echo "ERROR: could not query public.schema_migrations on the target DB — refusing to deploy blind." >&2
+        exit 1
+    }
+
+    local f base version pending=()
+    for f in "$INCOMING"/qiita-control-plane/db/migrations/*.sql; do
+        [ -e "$f" ] || continue
+        base=$(basename "$f"); version=${base%%_*}
+        # Every dbmate migration is `<numeric-version>_name.sql`. A file whose
+        # prefix isn't numeric isn't a tracked migration — it would never match
+        # an applied version and so falsely read as "pending". Warn and skip
+        # rather than abort the deploy over a stray .sql.
+        [[ "$version" =~ ^[0-9]+$ ]] || { echo "migration guard: skipping non-migration file $base" >&2; continue; }
+        grep -qxF "$version" <<<"$applied" || pending+=("$base")
+    done
+
+    if [ "${#pending[@]}" -gt 0 ]; then
+        echo "ERROR: ${#pending[@]} migration(s) not applied to the target DB:" >&2
+        printf '         %s\n' "${pending[@]}" >&2
+        # A totally empty result on an established host (env file present) almost
+        # never means "you missed every migration" — it means we queried the
+        # wrong or un-migrated DB. Point there instead of at `make migrate`.
+        if [ -z "$applied" ]; then
+            echo "(public.schema_migrations returned 0 rows — DATABASE_URL likely points at the wrong or un-migrated database, not a single missed migration.)" >&2
+        fi
+        echo "Run 'make migrate' (see docs/runbooks/redeploy.md) before deploying — aborting before any service restart." >&2
+        exit 1
+    fi
+    echo "migration guard: no pending migrations." >&2
+}
+assert_migrations_applied
+
 # sudo's secure_path excludes /usr/local/bin on RHEL-family. Always invoke
 # uv via $UV, never bare `uv` — bare lookup fails under sudo/systemd.
 UV=/usr/local/bin/uv

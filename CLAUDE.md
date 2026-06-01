@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Python version
+
+This repo targets **Python 3.14**. Run tooling via `uv run` — a stray pre-3.14 `python3` misparses `except A, B:` ([PEP 758](https://peps.python.org/pep-0758/)), which is valid here. Don't "fix" it to `except (A, B):`.
+
 ## Common commands
 
 ```bash
@@ -71,6 +75,24 @@ Native job modules export exactly two symbols — `class Inputs(BaseModel)` (typ
 
 The wire validator enforces shape only (exactly-one). The module-prefix invariant (`qiita_compute_orchestrator.jobs.`) is enforced separately at sync, submit, boot scan, and dispatcher — [`docs/architecture.md`](docs/architecture.md) carries the per-site breakdown.
 
+### Container image tier
+
+Container steps declare a bare SIF filename in `container:` (e.g. `bcl-convert-4.5.4.sif`). The orchestrator joins this against `Settings.qiita_images_dir` (`QIITA_IMAGES_DIR` env var, required when `COMPUTE_BACKEND=slurm`) to resolve the absolute SIF path. Registry-URL forms with `://` pass through; anything else with a path separator → `CONTRACT_VIOLATION`.
+
+After editing a workflow YAML or its container artifacts (`workflows/<workflow>/Apptainer.def`, `entrypoint.sh`, or the shared `workflows/_shared/manifest_writer.py`):
+
+These steps run on the **Linux deploy host** — they need `apptainer` (to build the SIF) and `systemd` (to restart the services), so they don't apply on a macOS dev box (mirrors `make test-workflows`, which skips gracefully off Linux). On macOS, edit the artifacts and run the unit tests; the SIF rebuild + restart happen at deploy time on the host.
+
+```bash
+# Rebuild the SIF (idempotent — skips when the existing SIF already reports the target version).
+bash scripts/build-<workflow>-sif.sh
+make deploy
+sudo systemctl restart qiita-control-plane qiita-compute-orchestrator
+make verify-health
+```
+
+Container input bind mounts are computed by `SlurmBackend._resolve_input_binds` (file → parent dir, directory → itself, deduped by resolved path). This means a step's YAML-declared `inputs:` paths must be absolute when they originate from `action_context` and must be visible from the compute node — bind mounts only expose host paths, they do not copy.
+
 ## Naming conventions
 
 **DB tables, REST resource segments, scope strings, OpenAPI tags, and the source files that own them are always singular**, never plural — `reference` not `references`, `auth_event` not `auth_events`, `/user` not `/users`, `reference:read` not `references:read`, `routes/reference.py` not `routes/references.py`, `tests/test_user.py` not `tests/test_users.py`. This applies to junction tables (`user_identity`, not `user_identities`); use `_to_` for many-to-many junctions when both sides need to be named (e.g. `biosample_to_study`). Column names follow the same rule unless the column genuinely holds a list/array.
@@ -115,21 +137,40 @@ Whenever you add, rename, or remove a value in an enum that *does* have a Postgr
 
 This also applies when reviewing code: a PR that changes a `CREATE TYPE ... AS ENUM` or its Python twin without the matching other-side change, two-way comment, and `ENUM_PAIRS` entry is incomplete. A new `StrEnum`/`Literal` with no Postgres ENUM is *not* a defect — see the `TEXT`/`CHECK` carve-out above — so do not flag it for a missing ENUM twin.
 
-## Operator-facing changes (CHANGELOG.md)
+## Operator-facing changes (DEPLOY_CHECKLIST.md)
 
-`CHANGELOG.md` at the repo root is the operator's release-notes channel for deploys. It lives separately from the git log and the PR descriptions because future operators read `tail CHANGELOG.md` before running `sudo local-deploy.sh` to find out what's new since their last deploy — PR descriptions sit inside closed PRs and stop being a natural lookup target once merged.
+`DEPLOY_CHECKLIST.md` at the repo root is the operator's deploy checklist — **not** a per-PR change log (that's `CHANGELOG.md`, see "Per-PR changelog" below; the git log is the authoritative record). It is structured as one *living* `## Pending deploy` section: a consolidated, deduplicated, ordered checklist of everything merged but not yet deployed. With many devs merging into one deploy, the operator reads exactly one coherent thing, no matter how many PRs contributed. See the file's own preamble for the bucket layout and the deploy/archive lifecycle.
 
-Add a new entry to `CHANGELOG.md` *in the same PR* whenever the PR introduces any of:
+**A PR with operator-impacting changes folds its steps into `## Pending deploy` in the same PR** — it does **not** add a standalone heading. Run `/deploy-note` on the branch (`.claude/commands/deploy-note.md`); it detects the operator-impacting changes and merges them into the right bucket, tagged with the PR ref. Fold whenever the PR introduces any of:
 
-- A new required env var (CP, DP, or CO) — the boot-time `from_env()` fail-fast catches it, but the operator should set it pre-deploy, not after the systemd unit fails to start.
-- A new shared directory the operator must create with specific owner/group/mode (e.g. an upload-staging or workspace root).
-- A migration that needs out-of-band setup the runbook doesn't already cover (CREATE EXTENSION, manual data backfill, etc.).
-- A breaking change in `/etc/qiita/*.env` shape (renamed key, removed key with no compat alias).
-- Any other action the operator must take on the deploy host *before* `sudo local-deploy.sh` for the deploy to succeed.
+- A new required env var (CP, DP, or CO) — `from_env()` fail-fast keeps the unit *down* without it, so it goes in the env-vars bucket, set before the restart.
+- A new shared directory with specific owner/group/mode, a service-account scope grant, a vendored binary/SIF, or group membership the operator must establish.
+- A migration that needs out-of-band setup beyond a plain `make migrate` (CREATE EXTENSION, manual backfill).
+- A new/changed `workflows/` entry (reaches `qiita.action` via `qiita-admin actions sync`; add a verify check).
+- A soft API-contract change downstream clients should know about (Notes bucket — no host action).
 
-A PR that only changes Python/Rust code, tests, docs, or migrations that the existing dbmate flow handles autonomously does **not** need an entry. When in doubt: "if the operator follows the existing runbook + `sudo local-deploy.sh` without reading this PR, does the deploy succeed?" If no, add an entry.
+A PR that only changes Python/Rust code, tests, docs, or migrations the dbmate flow handles autonomously needs no fold. When in doubt: "if the operator follows `redeploy.md` without reading this PR, does the deploy succeed and behave as intended?" If no, fold.
 
-Entry format: `## PR #N — <title>` heading, newest on top, with concrete `bash` commands the operator can copy/paste. The existing entries in the file show the shape. Reviewers check that the entry exists when the PR description (or the diff) implies operator action.
+**Merge, don't append.** Folding means adding your line alongside the *existing* lines for that file (e.g. one more `sudo bash -c 'echo "KEY=value" >> …compute-orchestrator.env'` next to the others), never starting a parallel block. Reviewers check that an operator-impacting PR folded its steps in and that buckets weren't duplicated. The `deploy-note-check` CI job (`.github/workflows/ci.yml`) also fails a PR that changes an operator-impacting surface (a `.env.*.example` var, a `db/migrations/` file, `workflows/`, or `auth/scopes.py`) without touching `DEPLOY_CHECKLIST.md` — a PR that genuinely needs no operator action carries the `no-deploy-note` label to opt out. The deploy/archive procedure itself — how the operator runs `## Pending deploy`, and how a maintainer archives it off-host via `/deploy-archive` — lives in [`docs/runbooks/redeploy.md`](docs/runbooks/redeploy.md), the single source of truth for that lifecycle; don't restate it here or in the deploy checklist.
+
+## Per-PR changelog (CHANGELOG.md)
+
+`CHANGELOG.md` at the repo root is the "what changed" log — the human-readable counterpart to the git history, distinct from the operator deploy checklist (`DEPLOY_CHECKLIST.md`, above). It follows [Keep a Changelog](https://keepachangelog.com/); since the project doesn't cut versioned releases yet, every entry lands under `## [Unreleased]` in an `Added` / `Changed` / `Fixed` / `Removed` bucket, tagged with its `(#N)` PR ref.
+
+**Every PR adds an entry** under `## [Unreleased]`. The `changelog-check` CI job (`.github/workflows/ci.yml`) fails any PR whose diff doesn't touch `CHANGELOG.md`; a PR that genuinely warrants no entry (a typo fix, a CI-only tweak) carries the `no-changelog` label to opt out. This is a deliberately blanket gate — unlike `deploy-note-check`, it fires on *every* PR, not just operator-impacting ones. A change can warrant a `CHANGELOG.md` entry, a `DEPLOY_CHECKLIST.md` fold, or both; keep the two files from drifting into each other (the changelog says *what changed*, the checklist says *what the operator must do*).
+
+## Deployments
+
+We deploy **many PRs at once**: development is a sequence of PRs to `main`, then a single manual deploy that rolls out everything merged since the host's last deploy. We do **not** cut releases yet. The operator-facing instructions for that deploy are the single consolidated `## Pending deploy` checklist in `DEPLOY_CHECKLIST.md` (see the section above), which each PR folds its steps into as it merges. The standing procedure is [`docs/runbooks/redeploy.md`](docs/runbooks/redeploy.md) (incremental); [`docs/runbooks/first-deploy.md`](docs/runbooks/first-deploy.md) is bootstrap-only.
+
+Invariants that hold for every deploy — enforce them when writing deploy-affecting code or reviewing it:
+
+- **Migrations are applied out-of-band, before the restart.** `deploy/local-deploy.sh` and `deploy/activate.sh` do **not** run `dbmate` — `make migrate` is a separate operator step (auto-applying migrations during a deploy is unsafe for expand/contract changes). New code must never assume a schema the deploy script itself will produce. `activate.sh` *does* assert every shipped migration is recorded in `public.schema_migrations` and aborts the deploy before any service restart if one is missing — so a forgotten `make migrate` fails loudly instead of 500ing at runtime. Don't weaken that guard.
+- **Env vars are written before the restart, not after.** Any new required env var (CP/DP/CO) is caught by `from_env()` fail-fast at boot, which means a missing one keeps the systemd unit *down*. The DEPLOY_CHECKLIST.md entry that introduces the var must tell the operator to set it before `local-deploy.sh`, and the var belongs in the matching `.env.*.example`.
+- **`local-deploy.sh` is idempotent and re-runnable.** It rsyncs all four components + `workflows/`, `uv sync`s with `--reinstall-package qiita-common` (cross-package staleness), runs `qiita-admin actions sync`, and restarts only services whose env file exists. A failed deploy is safe to re-run after fixing the cause.
+- **Workflow YAML ships out-of-tree and is synced, not migrated.** New/changed files under `workflows/` reach `qiita.action` via `qiita-admin actions sync` (run inside `activate.sh`), not via a DB migration.
+
+When a change touches the deploy path (a new env var, a new `workflows/` entry, a migration needing out-of-band setup, a new host directory, a service-account scope grant), the same PR must: fold its steps into `## Pending deploy` (via `/deploy-note`), update the relevant `.env.*.example`, and — if the standing procedure changes — update `redeploy.md`. Keep `local-deploy.sh`/`activate.sh` generic; per-deploy specifics live in the deploy checklist, never hardcoded in the scripts.
 
 ## Architecture
 

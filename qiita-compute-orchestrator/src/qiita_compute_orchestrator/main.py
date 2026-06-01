@@ -45,6 +45,9 @@ def _build_backend(settings: Settings) -> ComputeBackend:
             co_to_cp_token=settings.co_to_cp_token,
             cp_url=settings.cp_url,
             qos=settings.slurm.qos,
+            # QIITA_IMAGES_DIR is validated in Settings.from_env when
+            # backend_type=slurm — non-None here on the production path.
+            qiita_images_dir=settings.qiita_images_dir,
         )
     raise RuntimeError(f"unknown COMPUTE_BACKEND={settings.backend_type!r}")
 
@@ -57,7 +60,7 @@ async def lifespan(app: FastAPI):
     # instance for every subsequent step. Misconfig already crashed on
     # the Settings.from_env() line above; install_settings just makes
     # the resolved value available to non-FastAPI code paths
-    # (sequence_range.make_cp_client) without re-reading the env.
+    # (cp_client.make_cp_client) without re-reading the env.
     install_settings(settings)
     app.state.settings = settings
     app.state.backend = _build_backend(settings)

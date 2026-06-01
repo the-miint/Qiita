@@ -57,6 +57,11 @@ class Scope(StrEnum):
     # Sequence-range allocation (workers-only)
     SEQUENCE_RANGE_MINT = "sequence_range:mint"
 
+    # Sequenced-pool preflight blob read (workers-only). Gates the SA-only
+    # GET /sequencing-run/{R}/sequenced-pool/{P}/preflight route the
+    # bcl-convert prep step calls to materialize the sample sheet.
+    SEQUENCED_POOL_PREFLIGHT_READ = "sequenced_pool:preflight:read"
+
     # Study data
     STUDY_READ = "study:read"
     STUDY_WRITE = "study:write"

@@ -35,4 +35,7 @@ target/
 localdocs/
 
 # Claude Code (workspace-local config and agent definitions)
-.claude/
+# Ignore the workspace-local bits (settings, agents, worktrees) but TRACK the
+# shared slash commands so every dev gets /deploy-note, /deploy-archive, etc.
+.claude/*
+!.claude/commands/

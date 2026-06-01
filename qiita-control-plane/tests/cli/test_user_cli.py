@@ -1480,3 +1480,659 @@ def test_https_to_non_localhost_allowed(monkeypatch):
 
     rc = main(["--base-url", "https://qiita.example.com", "whoami"])
     assert rc == 0
+
+
+# ---------------------------------------------------------------------------
+# submit-bcl-convert
+# ---------------------------------------------------------------------------
+# The bundled bcl-convert flow chains three POSTs in one CLI gesture, with
+# folder-name parsing in front of the network calls. Each test stubs httpx
+# with a multi-response queue so the three legs (sequencing-run,
+# sequenced-pool, work-ticket) can be sequenced independently — _stub_post
+# reuses one body across calls and is not enough here.
+
+
+def _stub_multi_response(monkeypatch, captured: dict, *, responses):
+    """Patch httpx.request to return canned ``(status, body)`` responses in
+    the order supplied. `captured['requests']` collects every call so a
+    test can pin per-leg URL + body + auth."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured.setdefault("requests", [])
+    queue = list(responses)
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        captured["requests"].append(
+            {
+                "method": method,
+                "url": url,
+                "auth": headers["Authorization"],
+                "json": json,
+            }
+        )
+        if not queue:
+            raise AssertionError(
+                f"submit-bcl-convert made an extra request beyond the stubbed responses: "
+                f"{method} {url}"
+            )
+        status, body = queue.pop(0)
+        return _httpx.Response(status, json=body, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+
+def _seed_bcl_folder(tmp_path: Path, name: str) -> Path:
+    folder = tmp_path / name
+    folder.mkdir()
+    return folder
+
+
+def _seed_preflight(
+    tmp_path: Path,
+    *,
+    name: str = "preflight.db",
+    rows: list[tuple[int, str, str]] | None = None,
+) -> Path:
+    """Write a real SQLite at `tmp_path/name` carrying the kl-run-preflight
+    tables (and only the columns) the CLI's preflight query reads.
+
+    `rows` is a list of (prepped_sample_idx, biosample_accession, qiita_id)
+    triples; the seeder sets up one project, one input_plate, one
+    input_sample, one compression_sample, and one prepped_sample per
+    triple, all FK-linked so the CLI's join walks them.
+
+    Default rows mimic a one-sample preflight against study idx=7 so
+    the existing happy-path tests have a sensible payload without
+    spelling it out.
+    """
+    import sqlite3 as _sqlite3
+
+    blob = tmp_path / name
+    if rows is None:
+        rows = [(1, "SAMN00000001", "7")]
+    conn = _sqlite3.connect(str(blob))
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE project (
+                project_idx INTEGER PRIMARY KEY AUTOINCREMENT,
+                qiita_id TEXT NOT NULL
+            );
+            CREATE TABLE input_plate (
+                input_plate_idx INTEGER PRIMARY KEY AUTOINCREMENT,
+                primary_project_idx INTEGER NOT NULL REFERENCES project(project_idx)
+            );
+            CREATE TABLE input_sample (
+                input_sample_idx INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_plate_idx INTEGER NOT NULL REFERENCES input_plate(input_plate_idx),
+                project_idx INTEGER REFERENCES project(project_idx),
+                biosample_accession TEXT
+            );
+            CREATE TABLE compression_sample (
+                compression_sample_idx INTEGER PRIMARY KEY AUTOINCREMENT,
+                input_sample_idx INTEGER NOT NULL REFERENCES input_sample(input_sample_idx)
+            );
+            CREATE TABLE prepped_sample (
+                prepped_sample_idx INTEGER PRIMARY KEY AUTOINCREMENT,
+                compression_sample_idx INTEGER NOT NULL
+                    REFERENCES compression_sample(compression_sample_idx)
+            );
+            """
+        )
+        # One project + plate per qiita_id (deduped); each row gets its
+        # own input_sample + compression_sample + prepped_sample.
+        project_idxs: dict[str, int] = {}
+        plate_idxs: dict[str, int] = {}
+        for prepped_sample_idx, accession, qiita_id in rows:
+            if qiita_id not in project_idxs:
+                cur = conn.execute(
+                    "INSERT INTO project (qiita_id) VALUES (?)",
+                    (qiita_id,),
+                )
+                project_idxs[qiita_id] = cur.lastrowid
+                cur = conn.execute(
+                    "INSERT INTO input_plate (primary_project_idx) VALUES (?)",
+                    (project_idxs[qiita_id],),
+                )
+                plate_idxs[qiita_id] = cur.lastrowid
+            cur = conn.execute(
+                "INSERT INTO input_sample (input_plate_idx, project_idx, biosample_accession)"
+                " VALUES (?, ?, ?)",
+                (plate_idxs[qiita_id], project_idxs[qiita_id], accession),
+            )
+            input_sample_idx = cur.lastrowid
+            cur = conn.execute(
+                "INSERT INTO compression_sample (input_sample_idx) VALUES (?)",
+                (input_sample_idx,),
+            )
+            compression_sample_idx = cur.lastrowid
+            conn.execute(
+                "INSERT INTO prepped_sample (prepped_sample_idx, compression_sample_idx)"
+                " VALUES (?, ?)",
+                (prepped_sample_idx, compression_sample_idx),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return blob
+
+
+def test_submit_bcl_convert_happy_path_chains_full_flow(monkeypatch, tmp_path, capsys):
+    """The full bundled flow:
+      1. whoami (resolve owner_idx for per-sample composer);
+      2. POST /biosample/lookup-by-accession (every accession resolves);
+      3. POST /sequencing-run (201);
+      4. POST /sequencing-run/{R}/sequenced-pool (201);
+      5. POST sequenced-sample composer once per preflight row (201);
+      6. POST /work-ticket (202).
+    Pin each leg's URL + body; check the summary echoes per-sample
+    results."""
+    import base64 as _b64
+    import json as _json
+
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = _seed_preflight(
+        tmp_path,
+        rows=[
+            (1, "SAMN001", "7"),
+            (2, "SAMN002", "7"),
+            # A third row in a different study to exercise per-row
+            # primary_study_idx threading.
+            (3, "SAMN003", "8"),
+        ],
+    )
+
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            # whoami
+            (200, {"kind": "human", "principal_idx": 99}),
+            # lookup-by-accession
+            (
+                200,
+                {
+                    "resolved": {"SAMN001": 41, "SAMN002": 42, "SAMN003": 43},
+                    "missing": [],
+                },
+            ),
+            # sequencing-run, sequenced-pool
+            (201, {"sequencing_run_idx": 12}),
+            (201, {"sequenced_pool_idx": 34}),
+            # sequenced-sample x3
+            (201, {"sequenced_sample_idx": 71, "prep_sample_idx": 81}),
+            (201, {"sequenced_sample_idx": 72, "prep_sample_idx": 82}),
+            (201, {"sequenced_sample_idx": 73, "prep_sample_idx": 83}),
+            # work-ticket
+            (202, {"work_ticket_idx": 56, "state": "pending"}),
+        ],
+    )
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "submit-bcl-convert",
+            "--bcl-input-dir",
+            str(folder),
+            "--preflight-blob",
+            str(blob),
+            "--prep-protocol-idx",
+            "7",
+        ]
+    )
+    assert rc == 0
+    requests = captured["requests"]
+    # whoami + lookup + run + pool + 3 samples + ticket = 8 calls.
+    assert len(requests) == 8
+
+    # Leg 1: whoami.
+    assert requests[0]["method"] == "GET"
+    assert requests[0]["url"].endswith("/auth/whoami")
+
+    # Leg 2: lookup-by-accession with the deduped preflight accessions
+    # (which here is the same as the row order since each is unique).
+    assert requests[1]["method"] == "POST"
+    assert requests[1]["url"].endswith("/biosample/lookup-by-accession")
+    assert requests[1]["json"] == {"accessions": ["SAMN001", "SAMN002", "SAMN003"]}
+
+    # Leg 3: POST /sequencing-run.
+    assert requests[2]["method"] == "POST"
+    assert requests[2]["url"] == f"https://q.example.test{URL_SEQUENCING_RUN_PREFIX}"
+    assert requests[2]["json"] == {
+        "instrument_run_id": "230101_A00123_0001_BHXYZ",
+        "platform": "illumina",
+        "instrument_model": "Illumina NovaSeq 6000",
+    }
+
+    # Leg 4: POST /sequencing-run/{R}/sequenced-pool. Blob round-trips
+    # byte-equal through base64.
+    assert requests[3]["method"] == "POST"
+    assert requests[3]["url"] == (
+        f"https://q.example.test{URL_SEQUENCING_RUN_SEQUENCED_POOL.format(sequencing_run_idx=12)}"
+    )
+    pool_body = requests[3]["json"]
+    assert pool_body["run_preflight_filename"] == "preflight.db"
+    assert _b64.b64decode(pool_body["run_preflight_blob"]) == blob.read_bytes()
+
+    # Legs 5..7: one sequenced-sample composer POST per preflight row.
+    expected_per_sample = [
+        (1, 41, 7),
+        (2, 42, 7),
+        (3, 43, 8),
+    ]
+    for offset, (prepped, biosample_idx, study_idx) in enumerate(expected_per_sample):
+        req = requests[4 + offset]
+        assert req["method"] == "POST"
+        assert req["url"].endswith("/sequencing-run/12/sequenced-pool/34/sequenced-sample")
+        # Pydantic counts default_factory as set for exclude_unset, so
+        # secondary_study_idxs (default []) shows up in the body. That
+        # is the documented model contract — the route accepts the empty
+        # list as "no secondaries" — and pinning it here surfaces an
+        # accidental change to the default if one ever lands.
+        assert req["json"] == {
+            "biosample_idx": biosample_idx,
+            "owner_idx": 99,
+            "prep_protocol_idx": 7,
+            "sequenced_pool_item_id": str(prepped),
+            "primary_study_idx": study_idx,
+            "secondary_study_idxs": [],
+        }
+
+    # Leg 8: POST /work-ticket.
+    assert requests[7]["method"] == "POST"
+    assert requests[7]["url"] == f"https://q.example.test{URL_WORK_TICKET_PREFIX}"
+    ticket_body = requests[7]["json"]
+    assert ticket_body["action_id"] == "bcl-convert"
+    assert ticket_body["action_version"] == "1.0.0"
+    assert ticket_body["scope_target"] == {
+        "kind": "sequenced_pool",
+        "sequenced_pool_idx": 34,
+        "sequencing_run_idx": 12,
+    }
+    assert ticket_body["action_context"] == {"bcl_input_dir": str(folder)}
+
+    # CLI summary echoes per-sample idxs alongside the run/pool/ticket idxs.
+    summary = _json.loads(capsys.readouterr().out)
+    assert summary["sequencing_run"]["status"] == "created"
+    assert summary["sequenced_pool"]["status"] == "created"
+    assert summary["work_ticket"]["work_ticket_idx"] == 56
+    assert [s["sequenced_sample_idx"] for s in summary["sequenced_samples"]] == [71, 72, 73]
+    assert summary["sequenced_samples"][0]["biosample_accession"] == "SAMN001"
+    assert summary["sequenced_samples"][0]["biosample_idx"] == 41
+    assert summary["sequenced_samples"][0]["primary_study_idx"] == 7
+
+
+def test_submit_bcl_convert_fails_fast_when_accessions_missing(monkeypatch, tmp_path, capsys):
+    """When the lookup-by-accession response carries a non-empty `missing`
+    list, the CLI prints the offending preflight rows on stderr and exits 1
+    with no sequencing-run / sequenced-pool / sequenced-sample / ticket
+    POSTs."""
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = _seed_preflight(
+        tmp_path,
+        rows=[
+            (1, "SAMN001", "7"),
+            (5, "SAMN999", "7"),
+            (8, "SAMN1000", "7"),
+        ],
+    )
+
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, {"kind": "human", "principal_idx": 99}),
+            (
+                200,
+                {
+                    "resolved": {"SAMN001": 41},
+                    "missing": ["SAMN999", "SAMN1000"],
+                },
+            ),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                str(folder),
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "2 preflight biosample accessions not found" in err
+    assert "SAMN999 (prepped_sample_idx=5)" in err
+    assert "SAMN1000 (prepped_sample_idx=8)" in err
+    # No subsequent legs ran — whoami + lookup are the only POSTs.
+    assert len(captured["requests"]) == 2
+
+
+def test_submit_bcl_convert_rejects_preflight_without_illumina_samples(
+    monkeypatch, tmp_path, capsys
+):
+    """An empty preflight (schema present, no illumina_sample rows) is a
+    misuse — the bcl-convert submission needs at least one row to
+    demultiplex. parser.error exits 2 before any network round-trip."""
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = _seed_preflight(tmp_path, rows=[])
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                str(folder),
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "no illumina_sample rows" in capsys.readouterr().err
+
+
+def test_submit_bcl_convert_rejects_non_numeric_qiita_id(monkeypatch, tmp_path, capsys):
+    """The deploy convention says preflight.project.qiita_id is the Qiita
+    study_idx encoded as a string. A non-numeric value would silently
+    submit garbage to the composer; reject at parse time."""
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = _seed_preflight(tmp_path, rows=[(1, "SAMN001", "not-a-number")])
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                str(folder),
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "qiita_id" in capsys.readouterr().err
+
+
+def test_submit_bcl_convert_rejects_non_sqlite_preflight(monkeypatch, tmp_path, capsys):
+    """A junk-bytes preflight surfaces as a clean parser.error rather than
+    a sqlite3 stack trace."""
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = tmp_path / "not-a-sqlite.db"
+    blob.write_bytes(b"\x00not actually a sqlite\xff")
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                str(folder),
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "preflight schema query failed" in err or "not a readable SQLite" in err
+
+
+def test_submit_bcl_convert_dedups_repeated_accessions_in_lookup(monkeypatch, tmp_path, capsys):
+    """Two preflight rows pointing at the same biosample_accession (which
+    can happen for replicates) → the lookup-by-accession body carries the
+    accession once; both rows still get their own sequenced-sample POST."""
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = _seed_preflight(
+        tmp_path,
+        rows=[
+            (1, "SAMN001", "7"),
+            # Same accession, different prepped_sample_idx — a replicate.
+            (2, "SAMN001", "7"),
+        ],
+    )
+
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, {"kind": "human", "principal_idx": 99}),
+            (200, {"resolved": {"SAMN001": 41}, "missing": []}),
+            (201, {"sequencing_run_idx": 12}),
+            (201, {"sequenced_pool_idx": 34}),
+            (201, {"sequenced_sample_idx": 71, "prep_sample_idx": 81}),
+            (201, {"sequenced_sample_idx": 72, "prep_sample_idx": 82}),
+            (202, {"work_ticket_idx": 56, "state": "pending"}),
+        ],
+    )
+
+    rc = main(
+        [
+            "submit-bcl-convert",
+            "--bcl-input-dir",
+            str(folder),
+            "--preflight-blob",
+            str(blob),
+            "--prep-protocol-idx",
+            "7",
+        ]
+    )
+    assert rc == 0
+    # Lookup body carries the accession exactly once.
+    assert captured["requests"][1]["json"] == {"accessions": ["SAMN001"]}
+    # Both rows still produce a sequenced-sample composer POST with the
+    # row's distinct prepped_sample_idx.
+    sample_bodies = [r["json"] for r in captured["requests"][4:6]]
+    assert sample_bodies[0]["sequenced_pool_item_id"] == "1"
+    assert sample_bodies[1]["sequenced_pool_item_id"] == "2"
+    # Both rows resolve to the same biosample_idx (replicate convention).
+    assert sample_bodies[0]["biosample_idx"] == 41
+    assert sample_bodies[1]["biosample_idx"] == 41
+    # Per-row owner_idx comes from the single up-front whoami round trip.
+    assert sample_bodies[0]["owner_idx"] == 99
+    assert sample_bodies[1]["owner_idx"] == 99
+
+
+def test_submit_bcl_convert_reports_reused_when_run_post_returns_200(monkeypatch, tmp_path, capsys):
+    """A retry that hits an existing sequencing_run row returns 200 from
+    leg 3; the CLI summary surfaces `status: "reused"` so the operator can
+    confirm the find-or-create branch."""
+    import json as _json
+
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = _seed_preflight(tmp_path)
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, {"kind": "human", "principal_idx": 99}),
+            (200, {"resolved": {"SAMN00000001": 41}, "missing": []}),
+            (200, {"sequencing_run_idx": 12}),
+            (200, {"sequenced_pool_idx": 34}),
+            (201, {"sequenced_sample_idx": 71, "prep_sample_idx": 81}),
+            (202, {"work_ticket_idx": 56, "state": "pending"}),
+        ],
+    )
+
+    rc = main(
+        [
+            "submit-bcl-convert",
+            "--bcl-input-dir",
+            str(folder),
+            "--preflight-blob",
+            str(blob),
+            "--prep-protocol-idx",
+            "7",
+        ]
+    )
+    assert rc == 0
+    summary = _json.loads(capsys.readouterr().out)
+    assert summary["sequencing_run"]["status"] == "reused"
+    assert summary["sequenced_pool"]["status"] == "reused"
+
+
+def test_submit_bcl_convert_rejects_relative_bcl_input_dir(tmp_path, capsys):
+    """A relative --bcl-input-dir cannot be passed through to the
+    orchestrator's container bind logic safely; fail at argparse time
+    rather than letting the server return 422."""
+    from qiita_control_plane.cli.user import main
+
+    blob = _seed_preflight(tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                "relative/path",
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "must be absolute" in capsys.readouterr().err
+
+
+def test_submit_bcl_convert_rejects_missing_bcl_input_dir(tmp_path, capsys):
+    """A path that does not exist on disk cannot be the run folder."""
+    from qiita_control_plane.cli.user import main
+
+    blob = _seed_preflight(tmp_path)
+    bogus = tmp_path / "does-not-exist"
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                str(bogus),
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "is not a directory" in capsys.readouterr().err
+
+
+def test_submit_bcl_convert_rejects_empty_preflight_blob(tmp_path, capsys):
+    """A zero-byte preflight file cannot be a kl-run-preflight SQLite."""
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = tmp_path / "empty.db"
+    blob.write_bytes(b"")
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                str(folder),
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "is empty" in capsys.readouterr().err
+
+
+def test_submit_bcl_convert_rejects_unparseable_folder_name(tmp_path, capsys):
+    """Fewer than four underscore-separated segments fails before any
+    server round-trip with the parser's exact error message."""
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123")
+    blob = _seed_preflight(tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                str(folder),
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "Illumina convention" in capsys.readouterr().err
+
+
+def test_submit_bcl_convert_rejects_unknown_instrument_prefix(tmp_path, capsys):
+    """A serial that does not start with any known Illumina prefix
+    surfaces the parser's "unknown instrument serial prefix" error.
+    Same path catches PacBio folders, because the parser filters
+    PacBio out at table-load time."""
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_ZZZZZ999_0001_BHXYZ")
+    blob = _seed_preflight(tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                str(folder),
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "unknown instrument serial prefix" in capsys.readouterr().err
+
+
+def test_submit_bcl_convert_pacbio_folder_rejected_as_unknown_prefix(tmp_path, capsys):
+    """A PacBio Revio serial starts with lowercase r. The parser filters
+    PacBio out at load time so this surfaces as the same
+    "unknown prefix" error a malformed Illumina serial would — by design,
+    because bcl-convert is Illumina-only."""
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_r00012_0001_BHXYZ")
+    blob = _seed_preflight(tmp_path)
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                str(folder),
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "unknown instrument serial prefix" in capsys.readouterr().err

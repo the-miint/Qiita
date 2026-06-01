@@ -28,12 +28,13 @@ def test_work_ticket_state_enum():
 
 def test_scope_target_dispatches_on_kind():
     """The discriminated union must select StudyPrepScopeTarget for kind='study_prep',
-    ReferenceScopeTarget for kind='reference', and PrepSampleScopeTarget for
-    kind='prep_sample'."""
+    ReferenceScopeTarget for kind='reference', PrepSampleScopeTarget for
+    kind='prep_sample', and SequencedPoolScopeTarget for kind='sequenced_pool'."""
     from qiita_common.models import (
         PrepSampleScopeTarget,
         ReferenceScopeTarget,
         ScopeTarget,
+        SequencedPoolScopeTarget,
         StudyPrepScopeTarget,
     )
 
@@ -51,6 +52,30 @@ def test_scope_target_dispatches_on_kind():
     ss = adapter.validate_python({"kind": "prep_sample", "prep_sample_idx": 23})
     assert isinstance(ss, PrepSampleScopeTarget)
     assert ss.prep_sample_idx == 23
+
+    pool = adapter.validate_python(
+        {"kind": "sequenced_pool", "sequenced_pool_idx": 42, "sequencing_run_idx": 7},
+    )
+    assert isinstance(pool, SequencedPoolScopeTarget)
+    assert pool.sequenced_pool_idx == 42
+    assert pool.sequencing_run_idx == 7
+
+
+def test_sequenced_pool_scope_target_requires_both_idxs():
+    """SequencedPoolScopeTarget carries both pool and run idxs so the framework
+    can flow both scalars to the prep step without an extra DB lookup."""
+    from qiita_common.models import ScopeTarget
+
+    adapter = TypeAdapter(ScopeTarget)
+
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"kind": "sequenced_pool", "sequenced_pool_idx": 1})
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"kind": "sequenced_pool", "sequencing_run_idx": 1})
+    with pytest.raises(ValidationError):
+        adapter.validate_python(
+            {"kind": "sequenced_pool", "sequenced_pool_idx": 0, "sequencing_run_idx": 1},
+        )
 
 
 def test_scope_target_rejects_unknown_kind():

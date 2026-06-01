@@ -671,6 +671,41 @@ class BiosampleResponse(BaseModel):
     caller_system_role: SystemRole
 
 
+class BiosampleLookupByAccessionRequest(BaseModel):
+    """Body for POST /api/v1/biosample/lookup-by-accession.
+
+    Resolves a list of NCBI BioSample accession strings (or any
+    biosample_accession value the deploy stores) to their qiita.biosample
+    idxs in one round trip. Used by qiita submit-bcl-convert to translate
+    the preflight rows' biosample_accession values into the biosample_idx
+    the sequenced-sample composer route requires.
+
+    The request body is the natural place for the list because a typical
+    bcl-convert pool carries 384 accessions, which exceeds nginx's
+    default URL-line cap when threaded through repeated query
+    parameters; the body has no such cap.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    accessions: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1, max_length=10_000)
+
+
+class BiosampleLookupByAccessionResponse(BaseModel):
+    """Returned by POST /api/v1/biosample/lookup-by-accession.
+
+    `resolved` maps each found accession to its biosample_idx. `missing`
+    lists accessions that did not resolve, in input order (deduped). The
+    CLI surfaces `missing` to the operator with no side effects when it
+    is non-empty so a missing biosample can be imported before re-running.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    resolved: dict[str, Annotated[int, Field(gt=0)]]
+    missing: list[str]
+
+
 class PatchRequestModel(BaseModel):
     """Base class for every PATCH-body Pydantic model in the API.
 
@@ -1019,6 +1054,7 @@ class ScopeTargetKind(StrEnum):
     STUDY_PREP = "study_prep"
     REFERENCE = "reference"
     PREP_SAMPLE = "prep_sample"
+    SEQUENCED_POOL = "sequenced_pool"
 
 
 class ProcessingKind(StrEnum):
@@ -1123,13 +1159,29 @@ class PrepSampleScopeTarget(BaseModel):
     prep_sample_idx: Annotated[int, Field(gt=0)]
 
 
+class SequencedPoolScopeTarget(BaseModel):
+    """Work ticket targets one sequenced_pool (one (run, lane) pair) —
+    used for the bcl-convert workflow that demultiplexes the pool's BCL
+    run folder into per-biosample FASTQs.
+
+    Carries both the pool idx and its parent run idx. The denormalization
+    lets the SA-only preflight read route stay nested under sequencing-run
+    and lets the orchestrator's `SCOPE_SCALARS_BY_KIND` flow both scalars
+    into the prep step's `Inputs` without an extra DB lookup."""
+
+    kind: Literal[ScopeTargetKind.SEQUENCED_POOL]
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+
+
 # Discriminated union — Pydantic and OpenAPI dispatch on the `kind` field.
 # DB-side, the same shape is encoded as a tagged union of typed columns
 # (`scope_target_kind` plus the subset-relevant `study_idx` / `prep_idx` /
-# `reference_idx` / `prep_sample_idx`) guarded by a CHECK constraint;
-# the `kind` here is the discriminator that maps to that column.
+# `reference_idx` / `prep_sample_idx` / `sequenced_pool_idx`) guarded by a
+# CHECK constraint; the `kind` here is the discriminator that maps to that
+# column.
 ScopeTarget = Annotated[
-    StudyPrepScopeTarget | ReferenceScopeTarget | PrepSampleScopeTarget,
+    StudyPrepScopeTarget | ReferenceScopeTarget | PrepSampleScopeTarget | SequencedPoolScopeTarget,
     Field(discriminator="kind"),
 ]
 
@@ -1267,6 +1319,25 @@ class SequencedPoolCreateResponse(BaseModel):
     """Returned by POST /api/v1/sequencing-run/{idx}/sequenced-pool on success."""
 
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
+
+
+class SequencedPoolPreflightResponse(BaseModel):
+    """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool/{P}/preflight.
+
+    The SA-only read route the bcl-convert prep step calls to materialize
+    the sample sheet from the pool's run preflight blob. `Base64Bytes`
+    handles the wire-format base64 encoding of the BYTEA column; the
+    attribute is raw bytes after deserialization.
+
+    The route 404s if the pool has no preflight (both blob and filename
+    NULL on the pool row), so this response model treats both as
+    non-nullable.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_preflight_blob: Base64Bytes
+    run_preflight_filename: str = Field(min_length=1)
 
 
 class SequencedSampleCreateRequest(BaseModel):
