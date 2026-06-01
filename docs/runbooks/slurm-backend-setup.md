@@ -230,17 +230,18 @@ which covers the CO→CP PAT.)
 | `SLURM_ACCOUNT` | `qiita` | |
 | `SLURMRESTD_API_VERSION` | `v0.0.40` | optional; default |
 
-`SHARED_FILESYSTEM_ROOT` — where the orchestrator stages each step's
-workspace (`params.json` + outputs) — **must be on a filesystem
-mounted on the compute nodes**. The job reads its inputs from that path
-on the node; if the node cannot see it, the step fails. Pick a location
-whose **parent** dirs allow `qiita-orch` (owner), `qiita-api` (CP runner,
-writes via group), and `qiita-job` (writes outputs via group) all to
-traverse — don't nest it under a tightly-restricted tree like the data
-plane's `DUCKLAKE_DATA_PATH` (`qiita-data:qiita-data 0750` blocks
-everyone else, even if the leaf dir's own perms look correct).
+`PATH_SCRATCH` — the shared scratch base root. The orchestrator and the
+CP both derive the per-ticket workspace (`params.json` + outputs) as
+`PATH_SCRATCH/ticket`, which **must be on a filesystem mounted on the
+compute nodes**. The job reads its inputs from that path on the node; if
+the node cannot see it, the step fails. Pick a location whose **parent**
+dirs allow `qiita-orch` (owner), `qiita-api` (CP runner, writes via
+group), and `qiita-job` (writes outputs via group) all to traverse —
+don't nest it under a tightly-restricted tree like the data plane's
+`PATH_PERSISTENT/ducklake` (`qiita-data:qiita-data 0750` blocks everyone
+else, even if the leaf dir's own perms look correct).
 
-The dir itself is **`qiita-orch:qiita-pipeline` mode `2770`** (creation
+The `PATH_SCRATCH/ticket` dir itself is **`qiita-orch:qiita-pipeline` mode `2770`** (creation
 recipe in [`first-deploy.md`](first-deploy.md) §9a, group composition
 in §0.1): `qiita-orch` writes per-step subdirs as owner; `qiita-api`
 and `qiita-job` write via the `qiita-pipeline` group; the setgid bit
@@ -250,11 +251,11 @@ run as any of the three) can read them. `qiita-orch` is deliberately
 write access here, which keeps the network-facing service's group
 membership bounded.
 
-`SHARED_FILESYSTEM_ROOT` and the CP's `WORK_TICKET_WORKSPACE_ROOT`
-**must point at the same directory** on a single-host deploy — the CP
-runner mints `<root>/<work_ticket_idx>/<step>/attempt-N/` and POSTs
-that exact path to the CO as `body.workspace`. A mismatch means the
-CO tries to chdir to a path that doesn't exist (or, worse, exists at a
+The orchestrator's `PATH_SCRATCH` and the CP's `PATH_SCRATCH`
+**must be byte-identical** — both derive `PATH_SCRATCH/ticket`, and the CP
+runner mints `<PATH_SCRATCH>/ticket/<work_ticket_idx>/<step>/attempt-N/`
+and POSTs that exact path to the CO as `body.workspace`. A mismatch means
+the CO tries to chdir to a path that doesn't exist (or, worse, exists at a
 different inode if the same filesystem is mounted twice).
 
 `QIITA_CP_URL` defaults to `http://localhost:8080`, which is correct on
@@ -297,7 +298,7 @@ sudo sacct -j <N> --format=JobID,User,Account,Partition,QOS,State,ExitCode,NodeL
 > Note on the smoke job's `current_working_directory: /tmp` — that's
 > the compute node's local `/tmp`, not the deploy host's. Fine for this
 > no-I/O smoke; real workflow steps need a path under
-> `SHARED_FILESYSTEM_ROOT` (see "Orchestrator config" above).
+> `PATH_SCRATCH/ticket` (see "Orchestrator config" above).
 
 ## Gotchas
 
