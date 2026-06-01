@@ -263,9 +263,9 @@ def test_settings_contact_email_set_from_env(monkeypatch):
     """Happy path: a well-formed CONTACT_EMAIL lands on the Settings object."""
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
     monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
-    monkeypatch.setenv("CONTACT_EMAIL", "qiita-help@ucsd.edu")
+    monkeypatch.setenv("CONTACT_EMAIL", "qiita.help@gmail.com")
 
     from qiita_control_plane.config import Settings
 
     settings = Settings.from_env()
-    assert settings.contact_email == "qiita-help@ucsd.edu"
+    assert settings.contact_email == "qiita.help@gmail.com"

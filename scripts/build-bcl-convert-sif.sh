@@ -46,7 +46,7 @@ if [[ ! -f "${RPM_PATH}" ]]; then
     echo "Expected Illumina-licensed RPM not found at:" >&2
     echo "  ${RPM_PATH}" >&2
     echo "Download bcl-convert ${BCL_CONVERT_VERSION} (EULA-gated) from Illumina" >&2
-    echo "and place it at the path above; see CHANGELOG.md for the recipe." >&2
+    echo "and place it at the path above; see DEPLOY_CHECKLIST.md for the recipe." >&2
     exit 64
 fi
 
