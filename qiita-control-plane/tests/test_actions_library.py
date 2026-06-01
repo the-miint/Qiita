@@ -9,7 +9,7 @@ runner actually calls).
 import inspect
 
 
-def test_library_exposes_three_named_primitives():
+def test_library_exposes_every_named_primitive():
     from qiita_common.api_paths import LibraryPrimitive
 
     from qiita_control_plane.actions import LIBRARY
@@ -39,3 +39,4 @@ def test_library_re_exports_match_module_callables():
     assert LIBRARY[LibraryPrimitive.MINT_FEATURES] is lib.mint_features
     assert LIBRARY[LibraryPrimitive.WRITE_MEMBERSHIP] is lib.write_membership
     assert LIBRARY[LibraryPrimitive.REGISTER_FILES] is lib.register_files
+    assert LIBRARY[LibraryPrimitive.REGISTER_INDEX] is lib.register_index

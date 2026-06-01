@@ -329,6 +329,50 @@ async def write_membership(
     return total_linked, total_seen - total_linked
 
 
+async def register_index(
+    pool: asyncpg.Pool,
+    reference_idx: int,
+    index_type: str,
+    fs_path: str,
+    params: dict[str, Any],
+) -> int:
+    """Record a built search index (e.g. a rype `.ryxdi`) for a reference in
+    qiita.reference_index. `fs_path` is the on-disk location; `params` is the
+    build configuration (k, w, bucket_name, ...) stored as JSONB — the
+    authoritative manifest lives inside the index artifact itself.
+
+    Returns the reference_index_idx. Idempotent on
+    (reference_idx, index_type, fs_path): a workflow retried from the start
+    re-runs this primitive, and re-inserting would otherwise duplicate the
+    row (the table has no UNIQUE on that triple, by design, so growth can
+    append generations). The conditional INSERT + fallback SELECT returns the
+    existing row's id instead. This guards the sequential re-run path; truly
+    concurrent registrations of the same reference are not expected (one
+    workflow runs per reference at a time).
+    """
+    row = await pool.fetchrow(
+        "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
+        " SELECT $1, $2, $3, $4::jsonb"
+        " WHERE NOT EXISTS ("
+        "   SELECT 1 FROM qiita.reference_index"
+        "   WHERE reference_idx = $1 AND index_type = $2 AND fs_path = $3)"
+        " RETURNING reference_index_idx",
+        reference_idx,
+        index_type,
+        fs_path,
+        json.dumps(params),
+    )
+    if row is not None:
+        return row["reference_index_idx"]
+    return await pool.fetchval(
+        "SELECT reference_index_idx FROM qiita.reference_index"
+        " WHERE reference_idx = $1 AND index_type = $2 AND fs_path = $3",
+        reference_idx,
+        index_type,
+        fs_path,
+    )
+
+
 async def register_files(
     *,
     staging_dir: str,
@@ -372,4 +416,5 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.MINT_FEATURES: mint_features,
     LibraryPrimitive.WRITE_MEMBERSHIP: write_membership,
     LibraryPrimitive.REGISTER_FILES: register_files,
+    LibraryPrimitive.REGISTER_INDEX: register_index,
 }

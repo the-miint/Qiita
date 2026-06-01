@@ -1157,3 +1157,56 @@ async def test_runner_rejects_upload_owned_by_other_principal(
             )
     finally:
         await postgres_pool.execute("DELETE FROM qiita.principal WHERE idx = $1", other_pidx)
+
+
+# =============================================================================
+# register-index dispatch
+# =============================================================================
+
+
+async def test_dispatch_register_index_writes_row(postgres_pool, reference_idx, tmp_path):
+    """The register-index action arm reads the build step's `rype_index_meta`
+    JSON from `bound` (native step outputs are path strings, so build params
+    ride a file) and the reference_idx from scope_target, then records a
+    qiita.reference_index row carrying the builder's index_type / fs_path /
+    params."""
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _dispatch_action
+
+    fs_path = f"/srv/qiita/references/{reference_idx}/rype/index.ryxdi"
+    meta_path = tmp_path / "rype_index_meta.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "index_type": "rype",
+                "fs_path": fs_path,
+                "params": {"k": 64, "w": 25, "bucket_name": f"reference_{reference_idx}"},
+            }
+        )
+    )
+    bound = {"rype_index_path": fs_path, "rype_index_meta": str(meta_path)}
+    entry = WorkflowAction(kind="action", name="register-index", inputs=[], outputs=[])
+
+    out = await _dispatch_action(
+        postgres_pool,
+        entry,
+        bound,
+        tmp_path,
+        {"kind": "reference", "reference_idx": reference_idx},
+        hmac_secret=b"unused",
+        data_plane_url="grpc://unused:50051",
+    )
+    assert out == {}
+
+    row = await postgres_pool.fetchrow(
+        "SELECT index_type, fs_path, params FROM qiita.reference_index WHERE reference_idx = $1",
+        reference_idx,
+    )
+    assert row is not None
+    assert row["index_type"] == "rype"
+    assert row["fs_path"].endswith("index.ryxdi")
+    assert json.loads(row["params"])["k"] == 64
+    await postgres_pool.execute(
+        "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+    )

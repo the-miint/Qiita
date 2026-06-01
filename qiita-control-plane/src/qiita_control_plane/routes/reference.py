@@ -14,6 +14,7 @@ workflow runners and HTTP callers share one transport.
 """
 
 import base64
+import json
 from typing import Annotated
 
 import asyncpg
@@ -22,6 +23,7 @@ from pydantic import Field
 from qiita_common.api_paths import (
     PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_DOGET,
+    PATH_REFERENCE_INDEX,
     PATH_REFERENCE_PREFIX,
     PATH_REFERENCE_ROOT,
     PATH_REFERENCE_STATUS,
@@ -31,12 +33,15 @@ from qiita_common.models import (
     DoGetTicketRequest,
     DoGetTicketResponse,
     ReferenceCreateRequest,
+    ReferenceIndex,
+    ReferenceKind,
     ReferenceResponse,
     ReferenceStatus,
     ReferenceStatusUpdate,
 )
 
 from ..actions.reference import (
+    REFERENCE_RETURNING,
     IllegalStatusTransition,
     ReferenceNotFound,
     transition_reference_status,
@@ -56,7 +61,9 @@ from ..deps import get_db_pool, get_hmac_secret
 router = APIRouter(prefix=PATH_REFERENCE_PREFIX, tags=["reference"])
 
 
-_REFERENCE_RETURNING = "reference_idx, name, version, kind, status, created_by_idx, created_at"
+# Single source of truth lives in actions/reference.py (REFERENCE_RETURNING);
+# aliased here so the existing in-file references read unchanged.
+_REFERENCE_RETURNING = REFERENCE_RETURNING
 
 _MSG_REFERENCE_NOT_FOUND = "Reference not found"
 
@@ -73,12 +80,13 @@ async def create_reference(
     try:
         row = await pool.fetchrow(
             "INSERT INTO qiita.reference"
-            "  (name, version, kind, created_by_idx)"
-            " VALUES ($1, $2, $3, $4)"
+            "  (name, version, kind, is_host, created_by_idx)"
+            " VALUES ($1, $2, $3, $4, $5)"
             f" RETURNING {_REFERENCE_RETURNING}",
             body.name,
             body.version,
             body.kind,
+            body.is_host,
             user.principal_idx,
         )
     except asyncpg.UniqueViolationError:
@@ -89,6 +97,73 @@ async def create_reference(
     except asyncpg.PostgresError as exc:
         raise HTTPException(status_code=500, detail="Database error") from exc
     return ReferenceResponse(**dict(row))
+
+
+@router.get(PATH_REFERENCE_ROOT)
+async def list_references(
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _principal: Principal = Depends(get_current_principal),
+    kind: ReferenceKind | None = None,
+    is_host: bool | None = None,
+    status: ReferenceStatus | None = None,
+) -> list[ReferenceResponse]:
+    """Anonymous-OK list of references, optionally filtered by `kind`,
+    `is_host`, and `status`. Ordered by reference_idx. Row-level visibility
+    (e.g. hiding private references) is not yet implemented — same posture as
+    the single-reference GET."""
+    clauses: list[str] = []
+    args: list[object] = []
+    if kind is not None:
+        args.append(kind)
+        clauses.append(f"kind = ${len(args)}")
+    if is_host is not None:
+        args.append(is_host)
+        clauses.append(f"is_host = ${len(args)}")
+    if status is not None:
+        args.append(str(status))
+        clauses.append(f"status = ${len(args)}")
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = await pool.fetch(
+        f"SELECT {_REFERENCE_RETURNING} FROM qiita.reference{where} ORDER BY reference_idx",
+        *args,
+    )
+    return [ReferenceResponse(**dict(r)) for r in rows]
+
+
+@router.get(PATH_REFERENCE_INDEX)
+async def get_reference_index(
+    reference_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCE_READ)),
+) -> list[ReferenceIndex]:
+    """List built search indexes (e.g. a rype `.ryxdi`) for a reference,
+    newest first. 404 when the reference itself doesn't exist; an empty list
+    when it exists but has no index built yet — the two are distinct.
+
+    `fs_path` is the on-disk index location a future host-filter compute job
+    consumes (the runner injects it directly; this endpoint is for general
+    visibility / admin). Scoped to reference:read — unlike the anonymous-OK
+    reference metadata GETs — because fs_path exposes internal filesystem
+    layout; reference:read is held by every human role and service account."""
+    exists = await pool.fetchval(
+        "SELECT 1 FROM qiita.reference WHERE reference_idx = $1", reference_idx
+    )
+    if exists is None:
+        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+    rows = await pool.fetch(
+        "SELECT reference_index_idx, reference_idx, index_type, fs_path, params, created_at"
+        " FROM qiita.reference_index WHERE reference_idx = $1"
+        " ORDER BY created_at DESC, reference_index_idx DESC",
+        reference_idx,
+    )
+    out: list[ReferenceIndex] = []
+    for r in rows:
+        d = dict(r)
+        # params is JSONB — asyncpg returns it as a JSON string by default.
+        if isinstance(d["params"], str):
+            d["params"] = json.loads(d["params"])
+        out.append(ReferenceIndex(**d))
+    return out
 
 
 @router.get(PATH_REFERENCE_BY_IDX)

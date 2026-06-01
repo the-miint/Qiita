@@ -10,6 +10,15 @@ import os
 os.environ.setdefault("QIITA_ALLOW_TOKEN_ENV", "true")
 os.environ.setdefault("CP_TO_CO_TOKEN", "test-cp-to-co-token")
 os.environ.setdefault("CO_TO_CP_TOKEN", "test-co-to-cp-token")
+# Pull miint from the team mirror rather than the DuckDB community channel: the
+# mirror carries the up-to-date build that includes rype_index_create (the
+# community build lags behind). MIINT_EXTENSION_REPO is read at miint.py import
+# time and also flips open_conn() to allow unsigned extensions, so it must be set
+# before any test imports the miint helper — hence here, at conftest top, like
+# the token vars above. Suite-wide (not per-test) keeps every connection on the
+# same build + signed/unsigned setting, avoiding a mixed-build clash in DuckDB's
+# shared on-disk extension directory.
+os.environ.setdefault("MIINT_EXTENSION_REPO", "https://ftp.microbio.me/pub/miint")
 
 import pytest  # noqa: E402
 from helpers import TEST_SEQUENCES  # noqa: E402

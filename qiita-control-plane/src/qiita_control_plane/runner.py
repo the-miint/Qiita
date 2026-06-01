@@ -880,4 +880,21 @@ async def _dispatch_action(
         )
         return {}
 
+    if entry.name == LibraryPrimitive.REGISTER_INDEX:
+        # Native step outputs are paths (StepRunResponse.outputs is
+        # dict[str, str]), so build-rype-index can't hand back the build
+        # params as a dict binding — it writes a small meta JSON and exposes
+        # its path as `rype_index_meta`. Read it for index_type / fs_path /
+        # params (index_type comes from the builder, not hardcoded here).
+        meta_path = Path(bound["rype_index_meta"])
+        meta = json.loads(meta_path.read_text())
+        await LIBRARY[LibraryPrimitive.REGISTER_INDEX](
+            pool,
+            reference_idx=scope_target["reference_idx"],
+            index_type=meta["index_type"],
+            fs_path=meta["fs_path"],
+            params=meta["params"],
+        )
+        return {}
+
     raise RuntimeError(f"runner has no adapter for action {entry.name!r}")
