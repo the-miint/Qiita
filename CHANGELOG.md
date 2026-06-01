@@ -50,5 +50,9 @@ the `no-changelog` label).
   biosample routes (closes #45) (#59)
 - Closed deploy gaps surfaced by the first user-CLI fastq-to-parquet smoke
   test (#57)
+- Added a lightweight CP `/healthz` liveness route so `qiita-admin
+  compute-readiness` (and its SLURM probe) stops reporting a false 404 against
+  a healthy deploy — the checker hit `/healthz`, which the CP never served
+  (closes #67) (#69)
 
 [Unreleased]: https://github.com/the-miint/Qiita/commits/main
