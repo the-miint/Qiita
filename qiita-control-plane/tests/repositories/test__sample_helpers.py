@@ -80,6 +80,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_global_field,
     seed_prep_sample_global_field,
 )
+from qiita_control_plane.testing.unique_names import unique_field_name
 
 from .conftest import (
     _create_biosample_with_link,
@@ -90,7 +91,6 @@ from .conftest import (
     _seed_study,
     _seed_unlinked_entity_for_spec,
     _track_to_study_link,
-    _unique_field_name,
 )
 
 pytestmark = pytest.mark.db
@@ -238,7 +238,7 @@ async def test_write_global_metadata_or_diagnose_text_returns_result_and_persist
     """
     bs_idx = await _create_biosample_with_link(ctx)
     gf_idx = await _seed_global(ctx, FieldDataType.TEXT, "text_happy")
-    display_name = _unique_field_name("happy_text")
+    display_name = unique_field_name("happy_text")
 
     # Single call, fresh display_name -> get-or-create creates the study_field.
     result = await _commit_write(
@@ -272,7 +272,7 @@ async def test_write_global_metadata_or_diagnose_numeric_returns_result_and_pers
     """
     bs_idx = await _create_biosample_with_link(ctx)
     gf_idx = await _seed_global(ctx, FieldDataType.NUMERIC, "num_happy")
-    display_name = _unique_field_name("happy_num")
+    display_name = unique_field_name("happy_num")
 
     # Single call, fresh display_name -> get-or-create creates the study_field.
     result = await _commit_write(
@@ -306,7 +306,7 @@ async def test_write_global_metadata_or_diagnose_date_returns_result_and_persist
     """
     bs_idx = await _create_biosample_with_link(ctx)
     gf_idx = await _seed_global(ctx, FieldDataType.DATE, "date_happy")
-    display_name = _unique_field_name("happy_date")
+    display_name = unique_field_name("happy_date")
 
     # Single call, fresh display_name -> get-or-create creates the study_field.
     result = await _commit_write(
@@ -346,7 +346,7 @@ async def test_write_global_metadata_or_diagnose_missing_reason_persists(ctx):
     # this row to land.
     gf_idx = await _seed_global(ctx, FieldDataType.NUMERIC, "missing_happy")
     reason_idx = await _seed_missing_value_reason(ctx, f"reason_{secrets.token_hex(4)}")
-    display_name = _unique_field_name("missing_global")
+    display_name = unique_field_name("missing_global")
 
     result = await _commit_write(
         ctx,
@@ -397,8 +397,8 @@ async def test_write_global_metadata_or_diagnose_raises_duplicate_value_same_stu
     # (different display_name) so unique_per_field does not fire first;
     # only the cross-study partial unique index can reject the second
     # INSERT.
-    display_name_first = _unique_field_name("dup_same_study_a")
-    display_name_second = _unique_field_name("dup_same_study_b")
+    display_name_first = unique_field_name("dup_same_study_a")
+    display_name_second = unique_field_name("dup_same_study_b")
 
     # First write commits the (biosample, global field) slot under ctx's study.
     first = await _commit_write(
@@ -454,8 +454,8 @@ async def test_write_global_metadata_or_diagnose_raises_conflicting_value_same_s
     # field. Different display_name on the second write means a
     # different study_field, so unique_per_field does not fire first;
     # the cross-study partial unique index rejects the second INSERT.
-    display_name_first = _unique_field_name("conf_same_study_a")
-    display_name_second = _unique_field_name("conf_same_study_b")
+    display_name_first = unique_field_name("conf_same_study_a")
+    display_name_second = unique_field_name("conf_same_study_b")
 
     # First write commits the slot with value "v1".
     first = await _commit_write(
@@ -506,8 +506,8 @@ async def test_write_global_metadata_or_diagnose_raises_duplicate_value_cross_st
     bs_idx = await _create_biosample_with_link(ctx)
     second_study_idx = await _create_second_study_and_link_biosample(ctx, bs_idx)
     gf_idx = await _seed_global(ctx, FieldDataType.TEXT, "dup_diff_study")
-    display_name_a = _unique_field_name("dup_diff_study_a")
-    display_name_b = _unique_field_name("dup_diff_study_b")
+    display_name_a = unique_field_name("dup_diff_study_a")
+    display_name_b = unique_field_name("dup_diff_study_b")
 
     # First study writes the slot; ctx["study_idx"] is the contributing study.
     first = await _commit_write(
@@ -554,8 +554,8 @@ async def test_write_global_metadata_or_diagnose_raises_conflicting_value_cross_
     bs_idx = await _create_biosample_with_link(ctx)
     second_study_idx = await _create_second_study_and_link_biosample(ctx, bs_idx)
     gf_idx = await _seed_global(ctx, FieldDataType.TEXT, "conf_diff_study")
-    display_name_a = _unique_field_name("conf_diff_study_a")
-    display_name_b = _unique_field_name("conf_diff_study_b")
+    display_name_a = unique_field_name("conf_diff_study_a")
+    display_name_b = unique_field_name("conf_diff_study_b")
 
     # First study writes the slot with vX.
     first = await _commit_write(
@@ -611,8 +611,8 @@ async def test_write_global_metadata_or_diagnose_slot_held_by_missing_reason_rai
     # field. The pre-seeded missing-reason row goes through the first
     # study_field; the write_global_metadata_or_diagnose call goes through
     # the second so unique_per_field does not fire first.
-    display_name_first = _unique_field_name("missing_reason_a")
-    display_name_second = _unique_field_name("missing_reason_b")
+    display_name_first = unique_field_name("missing_reason_a")
+    display_name_second = unique_field_name("missing_reason_b")
 
     # Pre-seed a globally-linked study_field so the missing-reason metadata
     # row has a study_field to attach to.
@@ -685,8 +685,8 @@ async def test_write_global_metadata_or_diagnose_missing_reason_dup_same_study(c
     bs_idx = await _create_biosample_with_link(ctx)
     gf_idx = await _seed_global(ctx, FieldDataType.NUMERIC, "miss_dup_same")
     reason_idx = await _seed_missing_value_reason(ctx, f"reason_{secrets.token_hex(4)}")
-    display_name_first = _unique_field_name("miss_dup_same_a")
-    display_name_second = _unique_field_name("miss_dup_same_b")
+    display_name_first = unique_field_name("miss_dup_same_a")
+    display_name_second = unique_field_name("miss_dup_same_b")
 
     # First write seeds the missing-reason row through the first display_name.
     first = await _commit_write(
@@ -733,8 +733,8 @@ async def test_write_global_metadata_or_diagnose_missing_reason_conflict_diff_st
     gf_idx = await _seed_global(ctx, FieldDataType.NUMERIC, "miss_conf_x")
     reason_a_idx = await _seed_missing_value_reason(ctx, f"reason_a_{secrets.token_hex(4)}")
     reason_b_idx = await _seed_missing_value_reason(ctx, f"reason_b_{secrets.token_hex(4)}")
-    display_name_first = _unique_field_name("miss_conf_a")
-    display_name_second = _unique_field_name("miss_conf_b")
+    display_name_first = unique_field_name("miss_conf_a")
+    display_name_second = unique_field_name("miss_conf_b")
 
     # First write through the original study seeds missing-reason A.
     first = await _commit_write(
@@ -782,8 +782,8 @@ async def test_write_global_metadata_or_diagnose_raises_slot_occupied_by_typed_v
     bs_idx = await _create_biosample_with_link(ctx)
     gf_idx = await _seed_global(ctx, FieldDataType.TEXT, "typed_then_missing")
     reason_idx = await _seed_missing_value_reason(ctx, f"reason_{secrets.token_hex(4)}")
-    display_name_first = _unique_field_name("typed_first")
-    display_name_second = _unique_field_name("missing_second")
+    display_name_first = unique_field_name("typed_first")
+    display_name_second = unique_field_name("missing_second")
 
     # First write seeds a typed value through the first display_name.
     first = await _commit_write(
@@ -833,7 +833,7 @@ async def test_write_global_metadata_or_diagnose_propagates_study_field_conflict
     bs_idx = await _create_biosample_with_link(ctx)
     gf_a = await _seed_global(ctx, FieldDataType.TEXT, "sfconf_a")
     gf_b = await _seed_global(ctx, FieldDataType.TEXT, "sfconf_b")
-    display_name = _unique_field_name("sfconf")
+    display_name = unique_field_name("sfconf")
 
     # Pre-create a study_field at this (study, display_name) bound to gf_a.
     study_field_idx = await ctx["pool"].fetchval(
@@ -876,7 +876,7 @@ async def test_write_global_metadata_or_diagnose_propagates_non_target_unique_vi
     """
     bs_idx = await _create_biosample_with_link(ctx)
     gf_idx = await _seed_global(ctx, FieldDataType.TEXT, "non_target")
-    display_name = _unique_field_name("non_target")
+    display_name = unique_field_name("non_target")
 
     # First write commits a (biosample, study_field) row.
     await _commit_write(
@@ -931,7 +931,7 @@ async def test_write_global_metadata_or_diagnose_rolls_back_new_study_field_on_c
     gf_idx = await _seed_global(ctx, FieldDataType.TEXT, "rollback")
 
     # Seed: first study writes the slot. ctx["study_idx"] is contributing.
-    display_name_a = _unique_field_name("rollback_a")
+    display_name_a = unique_field_name("rollback_a")
     await _commit_write(
         ctx,
         bs_idx=bs_idx,
@@ -946,7 +946,7 @@ async def test_write_global_metadata_or_diagnose_rolls_back_new_study_field_on_c
     # would create a new study_field in the second study; the INSERT then
     # collides; the typed exception propagates; the transaction rolls back;
     # the freshly-created study_field must NOT survive.
-    display_name_b = _unique_field_name("rollback_b")
+    display_name_b = unique_field_name("rollback_b")
     with pytest.raises(ConflictingValueDifferentStudyError):
         async with ctx["pool"].acquire() as conn:
             async with conn.transaction():
@@ -1147,7 +1147,7 @@ async def test_write_local_metadata_or_diagnose_text_returns_result_and_persists
     global_field_idx stays NULL.
     """
     bs_idx = await _create_biosample_with_link(ctx)
-    display_name = _unique_field_name("local_text_happy")
+    display_name = unique_field_name("local_text_happy")
 
     # Single call, fresh display_name -> get-or-create creates a purely-
     # local study_field; INSERT writes value_text and leaves
@@ -1181,7 +1181,7 @@ async def test_write_local_metadata_or_diagnose_numeric_returns_result_and_persi
     global_field_idx stays NULL.
     """
     bs_idx = await _create_biosample_with_link(ctx)
-    display_name = _unique_field_name("local_num_happy")
+    display_name = unique_field_name("local_num_happy")
 
     # Single call writes a Decimal value into the value_numeric column.
     result = await _commit_local_write(
@@ -1211,7 +1211,7 @@ async def test_write_local_metadata_or_diagnose_date_returns_result_and_persists
     global_field_idx stays NULL.
     """
     bs_idx = await _create_biosample_with_link(ctx)
-    display_name = _unique_field_name("local_date_happy")
+    display_name = unique_field_name("local_date_happy")
 
     # Single call writes a date value into the value_date column.
     result = await _commit_local_write(
@@ -1243,7 +1243,7 @@ async def test_write_local_metadata_or_diagnose_missing_reason_persists(ctx):
     """
     bs_idx = await _create_biosample_with_link(ctx)
     reason_idx = await _seed_missing_value_reason(ctx, f"reason_{secrets.token_hex(4)}")
-    display_name = _unique_field_name("local_missing")
+    display_name = unique_field_name("local_missing")
 
     result = await _commit_local_write(
         ctx,
@@ -1284,7 +1284,7 @@ async def test_write_local_metadata_or_diagnose_raises_duplicate_value(ctx):
     per-field uniqueness constraint; classified as a local duplicate.
     """
     bs_idx = await _create_biosample_with_link(ctx)
-    display_name = _unique_field_name("local_dup")
+    display_name = unique_field_name("local_dup")
 
     # First write commits a value through the new local study_field.
     first = await _commit_local_write(
@@ -1332,7 +1332,7 @@ async def test_write_local_metadata_or_diagnose_raises_conflicting_value(ctx):
     classified as a local conflict.
     """
     bs_idx = await _create_biosample_with_link(ctx)
-    display_name = _unique_field_name("local_conf")
+    display_name = unique_field_name("local_conf")
 
     # First write commits value "v1".
     first = await _commit_local_write(
@@ -1371,7 +1371,7 @@ async def test_write_local_metadata_or_diagnose_slot_held_by_missing_reason_rais
     write is rejected with no typed value to compare against.
     """
     bs_idx = await _create_biosample_with_link(ctx)
-    display_name = _unique_field_name("local_missing_reason")
+    display_name = unique_field_name("local_missing_reason")
 
     # Pre-seed a purely-local study_field directly (skipping the
     # orchestrator) and a missing-reason metadata row pointing at it.
@@ -1436,7 +1436,7 @@ async def test_write_local_metadata_or_diagnose_raises_slot_occupied_by_typed_va
     """
     bs_idx = await _create_biosample_with_link(ctx)
     reason_idx = await _seed_missing_value_reason(ctx, f"reason_{secrets.token_hex(4)}")
-    display_name = _unique_field_name("local_typed_first")
+    display_name = unique_field_name("local_typed_first")
 
     # First write commits a typed value through the new local study_field.
     first = await _commit_local_write(
@@ -1482,7 +1482,7 @@ async def test_write_local_metadata_or_diagnose_raises_on_globally_linked_field(
     """
     bs_idx = await _create_biosample_with_link(ctx)
     gf_idx = await _seed_global(ctx, FieldDataType.TEXT, "strict_mode")
-    display_name = _unique_field_name("strict_mode")
+    display_name = unique_field_name("strict_mode")
 
     # Pre-seed a study_field at this (study, display_name) that is bound
     # to a global field. write_local then resolves this row in its
@@ -2171,7 +2171,7 @@ async def test__get_or_create_globally_linked_study_field_raises_on_global_misma
     ids=["biosample", "prep_sample"],
 )
 async def test__get_or_create_local_study_field_creates_purely_local(ctx, spec):
-    field_name = _unique_field_name()
+    field_name = unique_field_name()
 
     # Create a new local field with required=True (composer's intended use).
     async with ctx["pool"].acquire() as conn, conn.transaction():
@@ -2219,7 +2219,7 @@ async def test__get_or_create_local_study_field_creates_purely_local(ctx, spec):
     ids=["biosample", "prep_sample"],
 )
 async def test__get_or_create_local_study_field_returns_existing(ctx, spec):
-    field_name = _unique_field_name()
+    field_name = unique_field_name()
 
     # First call inserts; second call with the same (study_idx, display_name)
     # must return the same idx without inserting a new row.
@@ -2303,7 +2303,7 @@ async def test__insert_metadata_writes_typed_value(ctx, spec, data_type, value, 
             conn,
             spec=spec,
             study_idx=ctx["study_idx"],
-            display_name=_unique_field_name(value_column),
+            display_name=unique_field_name(value_column),
             created_by_idx=ctx["principal_idx"],
             data_type=data_type,
             required=True,
@@ -2369,7 +2369,7 @@ async def test__insert_metadata_writes_missing_reason_value(ctx, spec):
             conn,
             spec=spec,
             study_idx=ctx["study_idx"],
-            display_name=_unique_field_name("missing_insert"),
+            display_name=unique_field_name("missing_insert"),
             created_by_idx=ctx["principal_idx"],
             data_type=FieldDataType.NUMERIC,
             required=True,
@@ -3362,7 +3362,7 @@ async def test__insert_metadata_writes_terminology_term_value(ctx, spec):
             conn,
             spec=spec,
             study_idx=ctx["study_idx"],
-            display_name=_unique_field_name("term_insert"),
+            display_name=unique_field_name("term_insert"),
             created_by_idx=ctx["principal_idx"],
             data_type=FieldDataType.TERMINOLOGY,
             required=True,

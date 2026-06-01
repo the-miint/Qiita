@@ -37,6 +37,11 @@ from qiita_control_plane.testing.db_seeds import (
     seed_biosample_to_study_link,
     seed_user_principal,
 )
+from qiita_control_plane.testing.unique_names import (
+    unique_accession,
+    unique_field_name,
+    unique_matrix_tube_id,
+)
 
 from .conftest import (
     OWNER_INELIGIBILITY_KINDS,
@@ -55,22 +60,8 @@ _ELIGIBILITY_DETAIL = "owner is not eligible to own biosamples"
 
 
 # ---------------------------------------------------------------------------
-# Biosample-specific seed helpers and unique-name helpers
+# Biosample-specific seed helpers
 # ---------------------------------------------------------------------------
-
-
-def _unique_field_name(prefix: str = "owner_bs_id") -> str:
-    return f"{prefix}_{secrets.token_hex(4)}"
-
-
-def _unique_accession(prefix: str = "BS") -> str:
-    return f"{prefix}-{secrets.token_hex(4)}"
-
-
-def _unique_matrix_tube_id() -> str:
-    # 10-digit value with a forced leading zero so every generated id
-    # exercises the leading-zero-preservation contract on the column.
-    return f"0{secrets.randbelow(10**9):09d}"
 
 
 async def _seed_study(pool, *, owner_idx: int, suffix: str) -> int:
@@ -270,7 +261,7 @@ async def test_post_biosample_wet_lab_admin_self_owner(ctx):
         ctx,
         study_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
-        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="WET-SELF-1",
     )
     assert resp.status_code == 201, resp.text
@@ -308,7 +299,7 @@ async def test_post_biosample_wet_lab_admin_on_behalf_of_other_user(ctx):
         ctx,
         study_idx,
         owner_idx=target_idx,
-        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="WET-1",
     )
     assert resp.status_code == 201, resp.text
@@ -335,7 +326,7 @@ async def test_post_biosample_system_admin_on_behalf_of_other_user(ctx):
         ctx,
         study_idx,
         owner_idx=target_idx,
-        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="ADM-1",
     )
     assert resp.status_code == 201, resp.text
@@ -350,7 +341,7 @@ async def test_post_biosample_response_reports_field_created_flag_states(ctx):
     )
     ctx["created"]["study"].append(study_idx)
 
-    field_name = _unique_field_name()
+    field_name = unique_field_name()
     r1 = await _post_biosample(
         ctx["wet"],
         ctx,
@@ -394,7 +385,7 @@ async def test_post_biosample_regular_user_owner_passes(ctx):
         ctx,
         study_idx,
         owner_idx=ctx["user_session"]["principal_idx"],
-        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="USER-OWN-1",
     )
     assert resp.status_code == 201, resp.text
@@ -414,7 +405,7 @@ async def test_post_biosample_regular_user_no_access_403(ctx):
         ctx,
         study_idx,
         owner_idx=ctx["user_session"]["principal_idx"],
-        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="X",
     )
     assert resp.status_code == 403
@@ -441,7 +432,7 @@ async def test_post_biosample_regular_user_admin_tier_passes(ctx):
         ctx,
         study_idx,
         owner_idx=ctx["user_session"]["principal_idx"],
-        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="USER-GRANT-1",
     )
     assert resp.status_code == 201, resp.text
@@ -468,7 +459,7 @@ async def test_post_biosample_regular_user_viewer_tier_403(ctx):
         ctx,
         study_idx,
         owner_idx=ctx["user_session"]["principal_idx"],
-        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="X",
     )
     assert resp.status_code == 403
@@ -490,7 +481,7 @@ async def test_post_biosample_anonymous_401(ctx):
             URL_BIOSAMPLE_BY_STUDY.format(study_idx=study_idx),
             json={
                 "owner_idx": ctx["wet_session"]["principal_idx"],
-                "owner_biosample_id_field_name": _unique_field_name(),
+                "owner_biosample_id_field_name": unique_field_name(),
                 "owner_biosample_id_value": "X",
             },
         )
@@ -511,7 +502,7 @@ async def test_post_biosample_user_without_biosample_write_scope_403(
         URL_BIOSAMPLE_BY_STUDY.format(study_idx=study_idx),
         json={
             "owner_idx": ctx["user_session"]["principal_idx"],
-            "owner_biosample_id_field_name": _unique_field_name(),
+            "owner_biosample_id_field_name": unique_field_name(),
             "owner_biosample_id_value": "X",
         },
     )
@@ -551,7 +542,7 @@ async def test_post_biosample_owner_ineligibility_422(ctx, kind: IneligibilityKi
             ctx,
             study_idx,
             owner_idx=idx,
-            owner_biosample_id_field_name=_unique_field_name(),
+            owner_biosample_id_field_name=unique_field_name(),
             owner_biosample_id_value="X",
         )
 
@@ -575,7 +566,7 @@ async def test_post_biosample_nonexistent_study_404(ctx):
         URL_BIOSAMPLE_BY_STUDY.format(study_idx=max_idx + 100_000),
         json={
             "owner_idx": ctx["wet_session"]["principal_idx"],
-            "owner_biosample_id_field_name": _unique_field_name(),
+            "owner_biosample_id_field_name": unique_field_name(),
             "owner_biosample_id_value": "X",
         },
     )
@@ -630,12 +621,12 @@ async def test_post_biosample_empty_owner_biosample_id_field_name_422(ctx):
     [
         (
             "biosample_accession",
-            lambda: _unique_accession("BS-DUP"),
+            lambda: unique_accession("BS-DUP"),
             "biosample_accession already in use",
         ),
         (
             "matrix_tube_id",
-            _unique_matrix_tube_id,
+            unique_matrix_tube_id,
             "matrix_tube_id already in use",
         ),
     ],
@@ -660,7 +651,7 @@ async def test_post_biosample_duplicate_unique_column_409(
         ctx,
         study_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
-        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="V-1",
         **{body_field: value},
     )
@@ -671,7 +662,7 @@ async def test_post_biosample_duplicate_unique_column_409(
         ctx,
         study_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
-        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="V-2",
         **{body_field: value},
     )
@@ -688,7 +679,7 @@ async def test_post_biosample_with_matrix_tube_id_round_trips(ctx):
         ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="tube-rt"
     )
     ctx["created"]["study"].append(study_idx)
-    tube_id = _unique_matrix_tube_id()
+    tube_id = unique_matrix_tube_id()
     # Sanity-check the test fixture: a generator that ever produced a
     # string with no leading zero would silently weaken this test.
     assert tube_id.startswith("0")
@@ -698,7 +689,7 @@ async def test_post_biosample_with_matrix_tube_id_round_trips(ctx):
         ctx,
         study_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
-        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="TUBE-1",
         matrix_tube_id=tube_id,
     )
@@ -726,7 +717,7 @@ async def test_post_biosample_bad_matrix_tube_id_format_422(ctx, bad_value):
         ctx,
         study_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
-        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="V-1",
         matrix_tube_id=bad_value,
     )
@@ -750,7 +741,7 @@ async def test_post_biosample_bad_metadata_checklist_idx_422(ctx):
         ctx,
         study_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
-        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="V-1",
         metadata_checklist_idx=max_cl + 100_000,
     )
@@ -796,7 +787,7 @@ async def test_post_biosample_metadata_writes_global_fields(ctx):
         ctx,
         study_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
-        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="META-WRITE-1",
         metadata={
             f"Collection Date {suffix}": "2026-05-06",
@@ -862,7 +853,7 @@ async def test_post_biosample_globally_linked_owner_field_409(ctx):
         ctx,
         study_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
-        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="SEED-OWNER",
         metadata={linked_name: "seed-value"},
     )
@@ -900,7 +891,7 @@ async def test_post_biosample_metadata_unknown_field_422(ctx):
         ctx,
         study_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
-        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="META-UNK-1",
         metadata={unknown_a: "x", unknown_b: "y"},
     )
@@ -942,7 +933,7 @@ async def test_post_biosample_metadata_unparseable_value_422(ctx, data_type, bad
         ctx,
         study_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
-        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="META-BAD-1",
         metadata={display_name: bad_value},
     )
@@ -954,7 +945,7 @@ async def test_post_biosample_metadata_owner_id_collision_422(ctx):
     # The metadata dict carries a key equal to owner_biosample_id_field_name.
     # The composer raises BiosampleOwnerIdFieldCollisionError pre-write; the
     # route maps it to 422 with the colliding name in the detail.
-    shared_name = _unique_field_name("collide")
+    shared_name = unique_field_name("collide")
     study_idx = await _seed_study(
         ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="meta-coll"
     )
@@ -996,7 +987,7 @@ async def test_post_biosample_owner_id_missing_value_marker_422(ctx):
         ctx,
         study_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
-        owner_biosample_id_field_name=_unique_field_name("owner_mv"),
+        owner_biosample_id_field_name=unique_field_name("owner_mv"),
         owner_biosample_id_value=reason_name,
         metadata={},
     )
@@ -1561,7 +1552,7 @@ async def test_get_biosample_carries_missing_reason_marker(ctx):
         ctx,
         study_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
-        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="META-MISS-1",
         metadata={display_name: reason_name},
     )
@@ -1638,7 +1629,7 @@ async def test_get_biosample_carries_terminology_term(ctx):
         ctx,
         study_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
-        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="META-TERM-1",
         metadata={display_name: term_row["term_id"]},
     )
@@ -1787,7 +1778,7 @@ async def test_get_biosample_returns_only_global_metadata(ctx):
         ctx,
         study_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
-        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="GET-MD-1",
         metadata={display_name: "HOST-99"},
     )
@@ -1851,7 +1842,7 @@ async def test_patch_biosample_wet_lab_admin_happy_path(ctx):
     # full-object equality confirms only the targeted column changed.
     bs_idx = await _seed_biosample_for_patch(ctx)
     if_match = await _etag_for(ctx["pool"], bs_idx)
-    new_acc = _unique_accession("PATCH-OK")
+    new_acc = unique_accession("PATCH-OK")
 
     resp = await ctx["wet"].patch(
         URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx),
@@ -2193,8 +2184,8 @@ async def test_patch_biosample_owner_self_incomplete_profile_422(ctx):
 @pytest.mark.parametrize(
     "column,make_value",
     [
-        ("biosample_accession", lambda: _unique_accession("PATCH-A")),
-        ("matrix_tube_id", _unique_matrix_tube_id),
+        ("biosample_accession", lambda: unique_accession("PATCH-A")),
+        ("matrix_tube_id", unique_matrix_tube_id),
     ],
 )
 async def test_patch_biosample_duplicate_unique_column_409(ctx, column, make_value):
@@ -2273,9 +2264,9 @@ async def test_lookup_by_accession_returns_resolved_map_and_missing_list(ctx):
     # Three accessions: two seeded, one absent. Expect the resolved map to
     # carry the two seeded mappings and `missing` to surface the absent one.
     owner_idx = ctx["wet_session"]["principal_idx"]
-    acc_a = _unique_accession("LOOKUP-A")
-    acc_b = _unique_accession("LOOKUP-B")
-    acc_missing = _unique_accession("LOOKUP-MISS")
+    acc_a = unique_accession("LOOKUP-A")
+    acc_b = unique_accession("LOOKUP-B")
+    acc_missing = unique_accession("LOOKUP-MISS")
     bs_a = await _seed_biosample_with_accession(ctx, accession=acc_a, owner_idx=owner_idx)
     bs_b = await _seed_biosample_with_accession(ctx, accession=acc_b, owner_idx=owner_idx)
 
@@ -2295,9 +2286,9 @@ async def test_lookup_by_accession_dedups_input_preserving_order(ctx):
     # Repeated accessions are deduped before the fetch; the response shape
     # carries each accession once, in input-order.
     owner_idx = ctx["wet_session"]["principal_idx"]
-    acc = _unique_accession("LOOKUP-DUP")
+    acc = unique_accession("LOOKUP-DUP")
     bs = await _seed_biosample_with_accession(ctx, accession=acc, owner_idx=owner_idx)
-    acc_miss = _unique_accession("LOOKUP-DUP-MISS")
+    acc_miss = unique_accession("LOOKUP-DUP-MISS")
 
     resp = await ctx["wet"].post(
         URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
@@ -2314,7 +2305,7 @@ async def test_lookup_by_accession_excludes_retired_biosamples(ctx):
     # A retired row is not in `resolved` (the composer would refuse to FK
     # a fresh prep_sample to it anyway), so it lands in `missing`.
     owner_idx = ctx["wet_session"]["principal_idx"]
-    acc = _unique_accession("LOOKUP-RETIRED")
+    acc = unique_accession("LOOKUP-RETIRED")
     bs = await _seed_biosample_with_accession(ctx, accession=acc, owner_idx=owner_idx)
     await retire_biosample(ctx["pool"], biosample_idx=bs, retired_by_idx=owner_idx)
 
@@ -2333,7 +2324,7 @@ async def test_lookup_by_accession_regular_user_passes(ctx):
     # bcl-convert flow accessible to operators whose pool spans studies
     # they are not a member of.
     owner_idx = ctx["wet_session"]["principal_idx"]
-    acc = _unique_accession("LOOKUP-USER")
+    acc = unique_accession("LOOKUP-USER")
     bs = await _seed_biosample_with_accession(ctx, accession=acc, owner_idx=owner_idx)
 
     resp = await ctx["user"].post(
@@ -2424,9 +2415,9 @@ async def test_lookup_by_matrix_tube_id_returns_resolved_map_and_missing_list(ct
     surfaces the misses verbatim, with leading zeros preserved end-to-end.
     """
     owner_idx = ctx["wet_session"]["principal_idx"]
-    tube_a = _unique_matrix_tube_id()
-    tube_b = _unique_matrix_tube_id()
-    tube_missing = _unique_matrix_tube_id()
+    tube_a = unique_matrix_tube_id()
+    tube_b = unique_matrix_tube_id()
+    tube_missing = unique_matrix_tube_id()
     bs_a = await _seed_biosample_with_matrix_tube_id(
         ctx, matrix_tube_id=tube_a, owner_idx=owner_idx
     )
