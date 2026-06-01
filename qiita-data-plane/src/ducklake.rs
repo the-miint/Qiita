@@ -152,7 +152,8 @@ mod tests {
     fn setup_conn() -> Connection {
         let conn = Connection::open_in_memory().expect("open in-memory DuckDB");
         let connstr = test_catalog_connstr();
-        let data_path = std::env::var("DUCKLAKE_DATA_PATH")
+        let data_path = std::env::var("PATH_PERSISTENT")
+            .map(|base| format!("{base}/ducklake"))
             .unwrap_or_else(|_| "/tmp/qiita-integration-ducklake-data".to_string());
         std::fs::create_dir_all(&data_path).unwrap();
         connect_ducklake(&conn, &connstr, &data_path)

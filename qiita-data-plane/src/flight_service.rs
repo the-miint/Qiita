@@ -41,7 +41,7 @@ pub struct QiitaFlightService {
     /// Root for DoPut staging — uploads land at
     /// `{root}/uploads/{upload_idx}/upload.parquet`. CP and DP must agree
     /// on the layout convention (CP derives the same path on the read
-    /// side); UPLOAD_STAGING_ROOT pins it on both.
+    /// side); both derive it as `PATH_SCRATCH/staging`.
     upload_staging_root: PathBuf,
 }
 
