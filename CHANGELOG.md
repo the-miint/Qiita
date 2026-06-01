@@ -50,7 +50,7 @@ the `no-changelog` label).
   → `PATH_DERIVED/images`. Operators now set `PATH_SCRATCH` /
   `PATH_PERSISTENT` / `PATH_DERIVED`; the services derive the fixed
   subdirs. Hard cutover — the old names are gone and boot fails fast until
-  the new ones are set (#72)
+  the new ones are set (#73)
 
 ### Fixed
 

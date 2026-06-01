@@ -13,7 +13,7 @@ Substitute your host's FQDN for the `qiita-miint.ucsd.edu` examples and `<scratc
 
 Each PR folds its operator steps into the buckets below via `/deploy-note`; at deploy time buckets 1→5 run in order, with buckets 1–3 preceding the bucket-4 restart. Each step carries its source `(#N)` tag.
 
-> ⚠️ **(#72) This deploy renames every filesystem env var.** Old names are gone; the services derive fixed subdirs from three base roots (`PATH_SCRATCH`, `PATH_PERSISTENT`, `PATH_DERIVED`), so the CP/DP/CO won't boot until the new vars are set (bucket 1). The lake (`PATH_PERSISTENT/ducklake`) is currently **empty** — no durable data has been written — so there is **no data to migrate**; bucket 2 only creates the derived dirs and, if the DuckLake catalog refuses the new data_path, recreates the empty catalog (lossless). If the lake is somehow non-empty at deploy time, **stop** and reassess before recreating anything.
+> ⚠️ **(#73) This deploy renames every filesystem env var.** Old names are gone; the services derive fixed subdirs from three base roots (`PATH_SCRATCH`, `PATH_PERSISTENT`, `PATH_DERIVED`), so the CP/DP/CO won't boot until the new vars are set (bucket 1). The lake (`PATH_PERSISTENT/ducklake`) is currently **empty** — no durable data has been written — so there is **no data to migrate**; bucket 2 only creates the derived dirs and, if the DuckLake catalog refuses the new data_path, recreates the empty catalog (lossless). If the lake is somehow non-empty at deploy time, **stop** and reassess before recreating anything.
 
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
@@ -22,31 +22,31 @@ Each PR folds its operator steps into the buckets below via `/deploy-note`; at d
 # code reads ONLY the new names; the old WORK_TICKET_WORKSPACE_ROOT /
 # SHARED_FILESYSTEM_ROOT / UPLOAD_STAGING_ROOT / DUCKLAKE_DATA_PATH /
 # QIITA_IMAGES_DIR lines are now ignored — leave them for now, delete after a
-# clean deploy. (#72)
+# clean deploy. (#73)
 
-# (#72) First, read the roots already configured so PATH_* lands consistently.
+# (#73) First, read the roots already configured so PATH_* lands consistently.
 # PATH_SCRATCH must be byte-identical in all three env files (all derive
 # /ticket and/or /staging). Pick <scratch> = the scratch root these used; pick
-# <persistent> so that <persistent>/ducklake is where the lake data WILL live
-# after the bucket-2 move; pick <derived> so <derived>/images holds the SIFs.
+# <persistent> so that <persistent>/ducklake is where the (currently empty)
+# lake will live; pick <derived> so <derived>/images holds the SIFs.
 sudo grep -hE '^(WORK_TICKET_WORKSPACE_ROOT|SHARED_FILESYSTEM_ROOT|UPLOAD_STAGING_ROOT|DUCKLAKE_DATA_PATH|QIITA_IMAGES_DIR)=' /etc/qiita/control-plane.env /etc/qiita/data-plane.env /etc/qiita/compute-orchestrator.env 2>/dev/null
 
 # control-plane.env — needs PATH_SCRATCH (derives /ticket + /staging)
-sudo bash -c 'grep -q "^PATH_SCRATCH=" /etc/qiita/control-plane.env || echo "PATH_SCRATCH=<scratch>" >> /etc/qiita/control-plane.env'   # (#72)
+sudo bash -c 'grep -q "^PATH_SCRATCH=" /etc/qiita/control-plane.env || echo "PATH_SCRATCH=<scratch>" >> /etc/qiita/control-plane.env'   # (#73)
 
 # data-plane.env — PATH_SCRATCH (byte-identical to CP, derives /staging) + PATH_PERSISTENT (derives /ducklake)
-sudo bash -c 'grep -q "^PATH_SCRATCH=" /etc/qiita/data-plane.env || grep "^PATH_SCRATCH=" /etc/qiita/control-plane.env >> /etc/qiita/data-plane.env'   # (#72)
-sudo bash -c 'grep -q "^PATH_PERSISTENT=" /etc/qiita/data-plane.env || echo "PATH_PERSISTENT=<persistent>" >> /etc/qiita/data-plane.env'   # (#72)
+sudo bash -c 'grep -q "^PATH_SCRATCH=" /etc/qiita/data-plane.env || grep "^PATH_SCRATCH=" /etc/qiita/control-plane.env >> /etc/qiita/data-plane.env'   # (#73)
+sudo bash -c 'grep -q "^PATH_PERSISTENT=" /etc/qiita/data-plane.env || echo "PATH_PERSISTENT=<persistent>" >> /etc/qiita/data-plane.env'   # (#73)
 
 # compute-orchestrator.env — PATH_SCRATCH (byte-identical, derives /ticket for the readiness probe) + PATH_DERIVED (derives /images, required when COMPUTE_BACKEND=slurm)
-sudo bash -c 'grep -q "^PATH_SCRATCH=" /etc/qiita/compute-orchestrator.env || grep "^PATH_SCRATCH=" /etc/qiita/control-plane.env >> /etc/qiita/compute-orchestrator.env'   # (#72)
-sudo bash -c 'grep -q "^PATH_DERIVED=" /etc/qiita/compute-orchestrator.env || echo "PATH_DERIVED=<derived>" >> /etc/qiita/compute-orchestrator.env'   # (#72) e.g. /scratch/persistent (SIFs live at <derived>/images)
+sudo bash -c 'grep -q "^PATH_SCRATCH=" /etc/qiita/compute-orchestrator.env || grep "^PATH_SCRATCH=" /etc/qiita/control-plane.env >> /etc/qiita/compute-orchestrator.env'   # (#73)
+sudo bash -c 'grep -q "^PATH_DERIVED=" /etc/qiita/compute-orchestrator.env || echo "PATH_DERIVED=<derived>" >> /etc/qiita/compute-orchestrator.env'   # (#73) e.g. /scratch/persistent (SIFs live at <derived>/images)
 ```
 
 ### 2. One-time host setup
 
 ```bash
-# (#72) Create the scratch leaves the services now derive. ticket + staging are
+# (#73) Create the scratch leaves the services now derive. ticket + staging are
 # the renamed orch-workspace + upload-staging dirs; safe to start empty (both
 # are scratch — any in-flight upload/ticket should be drained first). Use the
 # SAME owner/group/mode the old dirs carried.   [admin]
@@ -54,7 +54,7 @@ scratch=$(sudo grep '^PATH_SCRATCH=' /etc/qiita/control-plane.env | tail -1 | cu
 sudo install -d -o qiita-orch -g qiita-pipeline -m 2770 "$scratch/ticket"
 sudo install -d -o qiita-data -g qiita-pipeline -m 2770 "$scratch/staging"
 
-# (#72) Images tier: point <derived>/images at the existing SIF dir. If the old
+# (#73) Images tier: point <derived>/images at the existing SIF dir. If the old
 # QIITA_IMAGES_DIR was already /scratch/persistent/images and PATH_DERIVED is
 # /scratch/persistent, this is a no-op. Otherwise move it, then assert the
 # first-deploy §0.3 perms (qiita-orch:qiita-orch 0755):   [admin]
@@ -62,12 +62,12 @@ sudo install -d -o qiita-data -g qiita-pipeline -m 2770 "$scratch/staging"
 #   sudo mv <old-images-dir> "$images"
 #   sudo chown qiita-orch:qiita-orch "$images" && sudo chmod 0755 "$images"
 
-# (#72) Create the lake data dir the DP now derives (PATH_PERSISTENT/ducklake).
+# (#73) Create the lake data dir the DP now derives (PATH_PERSISTENT/ducklake).
 # The lake is EMPTY — nothing has been written — so there is no data to move.   [admin]
 persistent=$(sudo grep '^PATH_PERSISTENT=' /etc/qiita/data-plane.env | tail -1 | cut -d= -f2-)
 sudo install -d -o qiita-data -g qiita-data -m 0750 "$persistent/ducklake"
 
-# (#72) ⚠️ Empty-lake guard, BEFORE the bucket-4 restart. The DuckLake catalog
+# (#73) ⚠️ Empty-lake guard, BEFORE the bucket-4 restart. The DuckLake catalog
 # (Postgres named by the DP's DUCKLAKE_CATALOG_CONNSTR) was pinned to the OLD
 # DUCKLAKE_DATA_PATH at the DP's first attach. With zero registered data files,
 # re-attaching at the new PATH_PERSISTENT/ducklake should just re-pin cleanly;
@@ -93,16 +93,16 @@ _None yet._
 ### 5. Verify
 
 ```bash
-# (#72) [admin] After the bucket-4 restart, confirm the lake reads back and the
+# (#73) [admin] After the bucket-4 restart, confirm the lake reads back and the
 # derived workspaces are writable end-to-end.
 curl -fsS https://qiita-miint.ucsd.edu/health                                  # all three pills green
 sudo -u qiita-orch bash -c 'set -a; source /etc/qiita/compute-orchestrator.env; set +a; /home/qiita/.local/bin/qiita-admin compute-readiness'   # PATH_SCRATCH/ticket visible+writable on a compute node
 ```
-- The data plane attaches DuckLake cleanly at `PATH_PERSISTENT/ducklake` (DP boots; `/health` DP pill green). A DoGet/DoPut round-trip works on the freshly-pinned empty lake — (#72)
+- The data plane attaches DuckLake cleanly at `PATH_PERSISTENT/ducklake` (DP boots; `/health` DP pill green). A DoGet/DoPut round-trip works on the freshly-pinned empty lake — (#73)
 
 ### Notes (no host action)
 
-- (#72) Filesystem env vars restructured onto base roots: `PATH_SCRATCH` (→`/ticket`, `/staging`), `PATH_PERSISTENT` (→`/ducklake`), `PATH_DERIVED` (→`/images`). The old per-leaf vars are no longer read by any service. After a clean deploy, delete the stale `WORK_TICKET_WORKSPACE_ROOT` / `SHARED_FILESYSTEM_ROOT` / `UPLOAD_STAGING_ROOT` / `DUCKLAKE_DATA_PATH` / `QIITA_IMAGES_DIR` lines from the three env files.
+- (#73) Filesystem env vars restructured onto base roots: `PATH_SCRATCH` (→`/ticket`, `/staging`), `PATH_PERSISTENT` (→`/ducklake`), `PATH_DERIVED` (→`/images`). The old per-leaf vars are no longer read by any service. After a clean deploy, delete the stale `WORK_TICKET_WORKSPACE_ROOT` / `SHARED_FILESYSTEM_ROOT` / `UPLOAD_STAGING_ROOT` / `DUCKLAKE_DATA_PATH` / `QIITA_IMAGES_DIR` lines from the three env files.
 
 ---
 
