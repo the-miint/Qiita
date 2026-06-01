@@ -13,7 +13,7 @@ from fastapi.openapi.docs import (
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from qiita_common.log import install_authorization_scrub
-from qiita_common.models import HealthResponse
+from qiita_common.models import HealthResponse, HealthStatus
 
 from .auth.oidc import AuthRocketVerifier
 from .config import Settings
@@ -147,3 +147,21 @@ async def health(
         compute_orchestrator_url=settings.compute_orchestrator_url,
         data_plane_url=settings.data_plane_url,
     )
+
+
+@app.get("/healthz")
+async def healthz() -> HealthResponse:
+    """Cheap liveness probe: 200 iff this CP process is up and serving.
+
+    Deliberately distinct from `/health` — that route aggregates CP +
+    CO + DP, which is heavier and, when called from the orchestrator's
+    compute-readiness checker, would cascade a CO→CP probe back through
+    the CP's own aggregator. Liveness wants neither the DB hit nor the
+    downstream fan-out, so this touches no dependencies: no DB, no auth,
+    no downstream calls. The compute-orchestrator readiness checker GETs
+    this path with the CO→CP bearer and asserts only the 200; the token
+    is ignored here because "can this process answer at all" is the only
+    question liveness asks. `services` stays unset — there's no aggregate
+    to report.
+    """
+    return HealthResponse(status=HealthStatus.OK.value, service="qiita-control-plane")
