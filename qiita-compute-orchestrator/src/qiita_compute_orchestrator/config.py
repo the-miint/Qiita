@@ -93,7 +93,12 @@ class SlurmSettings:
 @dataclass(frozen=True, slots=True)
 class Settings:
     backend_type: str
-    shared_filesystem_root: str
+    # Shared scratch base root (PATH_SCRATCH). The readiness probe checks
+    # it for writability; the control plane derives PATH_SCRATCH/ticket
+    # (the per-ticket workspace SLURM jobs run in) from the same value, so
+    # set PATH_SCRATCH identically across all three env files. Optional in
+    # dev — falls back to $TMPDIR/qiita.
+    path_scratch: str
     # The shared bearer token CP-to-CO calls present. Loaded from a file
     # in production; env-var fallback only when QIITA_ALLOW_TOKEN_ENV=true.
     cp_to_co_token: str
@@ -107,11 +112,11 @@ class Settings:
     co_to_cp_token: str
     # SLURM config — non-None only when backend_type=slurm.
     slurm: SlurmSettings | None = None
-    # Shared-FS root where built SIFs land. Required for SLURM container
-    # workflows (SlurmBackend joins it with the YAML's bare `container:`
-    # filename at submit time). None on the launcher path and on
-    # LocalBackend-only deploys.
-    qiita_images_dir: Path | None = None
+    # Shared-FS dir where built SIFs land, derived as PATH_DERIVED/images.
+    # Required for SLURM container workflows (SlurmBackend joins it with the
+    # YAML's bare `container:` filename at submit time). None on the
+    # launcher path and on LocalBackend-only deploys.
+    path_derived_images: Path | None = None
 
     @classmethod
     def from_env(cls, *, require_cp_to_co_token: bool = True) -> Settings:
@@ -130,26 +135,29 @@ class Settings:
         the SLURM job env entirely, which narrows the `scontrol show
         job` exposure to just the outbound PAT.
 
-        ``QIITA_IMAGES_DIR`` is resolved only when ``backend_type=slurm``:
-        SlurmBackend joins it with the YAML's bare ``container:`` SIF
-        filename at submit time, so a misconfigured production deploy
-        fails at boot rather than at the first container step. Validation
-        is strict: absolute path that exists and is a directory.
+        ``PATH_DERIVED`` is resolved only when ``backend_type=slurm``:
+        SlurmBackend joins ``PATH_DERIVED/images`` with the YAML's bare
+        ``container:`` SIF filename at submit time, so a misconfigured
+        production deploy fails at boot rather than at the first container
+        step. Validation is strict: absolute path that exists and is a
+        directory.
         """
         backend_type = os.environ.get("COMPUTE_BACKEND", BACKEND_LOCAL)
         slurm = _resolve_slurm_settings() if backend_type == BACKEND_SLURM else None
-        qiita_images_dir = _resolve_qiita_images_dir() if backend_type == BACKEND_SLURM else None
+        path_derived_images = (
+            _resolve_path_derived_images() if backend_type == BACKEND_SLURM else None
+        )
         return cls(
             backend_type=backend_type,
-            shared_filesystem_root=os.environ.get(
-                "SHARED_FILESYSTEM_ROOT",
+            path_scratch=os.environ.get(
+                "PATH_SCRATCH",
                 os.environ.get("TMPDIR", "/tmp") + "/qiita",
             ),
             cp_to_co_token=_resolve_token("cp_to_co") if require_cp_to_co_token else "",
             cp_url=_resolve_cp_url(),
             co_to_cp_token=_resolve_token("co_to_cp"),
             slurm=slurm,
-            qiita_images_dir=qiita_images_dir,
+            path_derived_images=path_derived_images,
         )
 
 
@@ -182,28 +190,32 @@ def _resolve_slurm_settings() -> SlurmSettings:
     )
 
 
-def _resolve_qiita_images_dir() -> Path:
-    """Resolve QIITA_IMAGES_DIR to a validated absolute directory path.
+def _resolve_path_derived_images() -> Path:
+    """Resolve PATH_DERIVED/images to a validated absolute directory path.
 
-    Validation is strict — boot-time fail-fast is the contract: an
-    operator who forgets the env var sees the error before the systemd
-    unit reaches Ready, not when the first container step submits.
+    PATH_DERIVED is the derived (built-artifact) filesystem root; built
+    SIFs live under PATH_DERIVED/images. Validation is strict — boot-time
+    fail-fast is the contract: an operator who forgets PATH_DERIVED sees
+    the error before the systemd unit reaches Ready, not when the first
+    container step submits.
     """
-    raw = os.environ.get("QIITA_IMAGES_DIR")
+    raw = os.environ.get("PATH_DERIVED")
     if not raw:
         raise RuntimeError(
-            "orchestrator: COMPUTE_BACKEND=slurm requires QIITA_IMAGES_DIR"
-            " (the shared-FS tier where built SIFs live, e.g."
-            " /scratch/persistent/images). SlurmBackend joins this with the"
-            " YAML's bare `container:` filename at submit time."
+            "orchestrator: COMPUTE_BACKEND=slurm requires PATH_DERIVED"
+            " (the derived-artifact filesystem root, e.g."
+            " /scratch/persistent). Built SIFs live under PATH_DERIVED/images,"
+            " which SlurmBackend joins with the YAML's bare `container:`"
+            " filename at submit time."
         )
-    path = Path(raw)
-    if not path.is_absolute():
-        raise RuntimeError(f"orchestrator: QIITA_IMAGES_DIR must be absolute, got {raw!r}")
+    base = Path(raw)
+    if not base.is_absolute():
+        raise RuntimeError(f"orchestrator: PATH_DERIVED must be absolute, got {raw!r}")
+    path = base / "images"
     if not path.exists():
-        raise RuntimeError(f"orchestrator: QIITA_IMAGES_DIR does not exist: {path}")
+        raise RuntimeError(f"orchestrator: PATH_DERIVED/images does not exist: {path}")
     if not path.is_dir():
-        raise RuntimeError(f"orchestrator: QIITA_IMAGES_DIR is not a directory: {path}")
+        raise RuntimeError(f"orchestrator: PATH_DERIVED/images is not a directory: {path}")
     return path
 
 
