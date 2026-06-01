@@ -101,6 +101,14 @@ def _unique_accession(prefix: str = "BS") -> str:
     return f"{prefix}-{secrets.token_hex(4)}"
 
 
+def _unique_matrix_tube_id() -> str:
+    """Return a 10-digit string; the leading digit is forced to 0 so each
+    generated id exercises the column's leading-zero-preservation contract.
+    Matches the digits-only CHECK on qiita.biosample.matrix_tube_id."""
+    # 9 random digits with one zero-padded leading digit gives 10 total.
+    return f"0{secrets.randbelow(10**9):09d}"
+
+
 # ---------------------------------------------------------------------------
 # FK-reverse cleanup
 # ---------------------------------------------------------------------------

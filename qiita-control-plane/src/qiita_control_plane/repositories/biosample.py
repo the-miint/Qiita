@@ -11,6 +11,7 @@ stand alone.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 import asyncpg
 from qiita_common.models import Tier
@@ -48,26 +49,28 @@ async def insert_biosample(
     metadata_checklist_idx: int | None = None,
     biosample_accession: str | None = None,
     ena_sample_accession: str | None = None,
+    matrix_tube_id: str | None = None,
 ) -> int:
     """Insert a row into qiita.biosample and return the generated idx.
 
     Exposes every column the caller may legitimately set on a fresh
-    row: the two principal references, the optional checklist link,
-    and the two external accessions.
+    row: the two principal references (required) plus the optional
+    checklist link, two external accessions, and matrix_tube_id.
 
     Raises asyncpg.PostgresError on FK violation or constraint failure.
     """
     return await conn.fetchval(
         "INSERT INTO qiita.biosample ("
         "    owner_idx, created_by_idx, metadata_checklist_idx,"
-        "    biosample_accession, ena_sample_accession"
-        ") VALUES ($1, $2, $3, $4, $5)"
+        "    biosample_accession, ena_sample_accession, matrix_tube_id"
+        ") VALUES ($1, $2, $3, $4, $5, $6)"
         " RETURNING idx",
         owner_idx,
         created_by_idx,
         metadata_checklist_idx,
         biosample_accession,
         ena_sample_accession,
+        matrix_tube_id,
     )
 
 
@@ -92,7 +95,7 @@ async def fetch_biosample(
     """
     sql = (
         "SELECT idx, owner_idx, metadata_checklist_idx,"
-        " biosample_accession, ena_sample_accession,"
+        " biosample_accession, ena_sample_accession, matrix_tube_id,"
         " last_submission_at, submission_error, last_metadata_change_at,"
         " created_by_idx, created_at, updated_at,"
         " retired, retired_by_idx, retired_at, retire_reason"
@@ -112,6 +115,7 @@ BIOSAMPLE_PATCHABLE_COLUMNS: frozenset[str] = frozenset(
         "owner_idx",
         "biosample_accession",
         "ena_sample_accession",
+        "matrix_tube_id",
         "last_submission_at",
         "submission_error",
     }
@@ -155,7 +159,7 @@ async def update_biosample(
         f"UPDATE qiita.biosample SET {set_clause}"
         f" WHERE idx = {biosample_param}"
         " RETURNING idx, owner_idx, metadata_checklist_idx,"
-        " biosample_accession, ena_sample_accession,"
+        " biosample_accession, ena_sample_accession, matrix_tube_id,"
         " last_submission_at, submission_error, last_metadata_change_at,"
         " created_by_idx, created_at, updated_at,"
         " retired, retired_by_idx, retired_at, retire_reason",
@@ -224,35 +228,48 @@ async def fetch_biosample_idxs_for_study(
     return [r["biosample_idx"] for r in rows]
 
 
-async def fetch_biosample_idxs_by_accession(
-    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
-    accessions: list[str],
-) -> dict[str, int]:
-    """Return `{biosample_accession: biosample_idx}` for every accession in
-    `accessions` that resolves to a non-retired qiita.biosample row.
+# Natural-key columns the bulk-lookup function may resolve against. The
+# Literal is the closed in-code mapping the f-string interpolation below
+# relies on; SQL table/column names cannot be parameter-bound, so the
+# safety of the interpolation comes from the call site only being able
+# to pass a value the type allows.
+BiosampleLookupKey = Literal["biosample_accession", "matrix_tube_id"]
 
-    Accessions absent from the table or carried only by retired rows are
+
+async def fetch_biosample_idxs_by_natural_key(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    key: BiosampleLookupKey,
+    values: list[str],
+) -> dict[str, int]:
+    """Return `{value: biosample_idx}` for every value in `values` that
+    resolves to a non-retired qiita.biosample row via the named natural-key
+    column.
+
+    Values absent from the table or carried only by retired rows are
     omitted from the returned map; the route layer surfaces them as the
-    `missing` list. Used by the bulk-lookup endpoint that the bundled
-    qiita submit-bcl-convert flow calls to translate preflight
-    biosample_accession values into the biosample_idx the
-    sequenced-sample composer requires.
+    `missing` list. Used by the bulk-lookup endpoints (e.g. the bundled
+    qiita submit-bcl-convert flow calls the accession variant to
+    translate preflight biosample_accession values into the
+    biosample_idx the sequenced-sample composer requires).
     """
-    if not accessions:
+    if not values:
         return {}
-    # ANY($1::text[]) keeps the query parameter-bound (asyncpg encodes
+    # ANY($1::text[]) keeps the values parameter-bound (asyncpg encodes
     # the Python list as a PG array literal) so SQL injection is not a
-    # concern and the planner can use the existing accession unique-or-
-    # btree index. retired = false filters at the row level; a future
-    # retired-retrieval surface for admins can read this function via a
-    # caller-side decorated branch rather than threading a parameter.
+    # concern on the row data and the planner can use the column's
+    # unique-or-btree index. The column name is interpolated from `key`,
+    # whose type pins it to one of the strings on BiosampleLookupKey.
+    # retired = false filters at the row level; a future retired-
+    # retrieval surface for admins can read this function via a caller-
+    # side decorated branch rather than threading a parameter.
     rows = await pool_or_conn.fetch(
-        "SELECT idx, biosample_accession FROM qiita.biosample"
-        " WHERE biosample_accession = ANY($1::text[])"
+        f"SELECT idx, {key} FROM qiita.biosample"
+        f" WHERE {key} = ANY($1::text[])"
         "   AND retired = false",
-        accessions,
+        values,
     )
-    return {r["biosample_accession"]: r["idx"] for r in rows}
+    return {r[key]: r["idx"] for r in rows}
 
 
 @dataclass(frozen=True)
@@ -284,6 +301,7 @@ async def import_biosample_from_owner_biosample_id(
     metadata_checklist_idx: int | None = None,
     biosample_accession: str | None = None,
     ena_sample_accession: str | None = None,
+    matrix_tube_id: str | None = None,
 ) -> BiosampleImportResult:
     """Import one biosample with its owner-id and any globally-linked metadata.
 
@@ -386,6 +404,7 @@ async def import_biosample_from_owner_biosample_id(
         metadata_checklist_idx=metadata_checklist_idx,
         biosample_accession=biosample_accession,
         ena_sample_accession=ena_sample_accession,
+        matrix_tube_id=matrix_tube_id,
     )
 
     await link_entity_to_studies(

@@ -23,6 +23,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_BY_STUDY,
     URL_BIOSAMPLE_LIST_BY_STUDY,
     URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
+    URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import FieldDataType
@@ -64,6 +65,12 @@ def _unique_field_name(prefix: str = "owner_bs_id") -> str:
 
 def _unique_accession(prefix: str = "BS") -> str:
     return f"{prefix}-{secrets.token_hex(4)}"
+
+
+def _unique_matrix_tube_id() -> str:
+    # 10-digit value with a forced leading zero so every generated id
+    # exercises the leading-zero-preservation contract on the column.
+    return f"0{secrets.randbelow(10**9):09d}"
 
 
 async def _seed_study(pool, *, owner_idx: int, suffix: str) -> int:
@@ -618,16 +625,36 @@ async def test_post_biosample_empty_owner_biosample_id_field_name_422(ctx):
 # ===========================================================================
 
 
-async def test_post_biosample_duplicate_biosample_accession_409(ctx):
-    # First POST claims an accession; the second POST tripping the same
-    # biosample_accession_unique constraint must return 409 with the
-    # mapped message.
+@pytest.mark.parametrize(
+    "body_field,make_value,expected_detail",
+    [
+        (
+            "biosample_accession",
+            lambda: _unique_accession("BS-DUP"),
+            "biosample_accession already in use",
+        ),
+        (
+            "matrix_tube_id",
+            _unique_matrix_tube_id,
+            "matrix_tube_id already in use",
+        ),
+    ],
+)
+async def test_post_biosample_duplicate_unique_column_409(
+    ctx, body_field, make_value, expected_detail
+):
+    """Tests the case where a second POST tries to claim a value that
+    another biosample already carries in a unique-constrained column: the
+    route maps asyncpg.UniqueViolationError to 409 with a per-column
+    mapped message. Parameterizing over the unique-constrained columns
+    keeps the per-column 409 surface pinned through one definition.
+    """
     study_idx = await _seed_study(
-        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="dup-acc"
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="dup-col"
     )
     ctx["created"]["study"].append(study_idx)
 
-    accession = _unique_accession("BS-DUP")
+    value = make_value()
     r1 = await _post_biosample(
         ctx["wet"],
         ctx,
@@ -635,7 +662,7 @@ async def test_post_biosample_duplicate_biosample_accession_409(ctx):
         owner_idx=ctx["wet_session"]["principal_idx"],
         owner_biosample_id_field_name=_unique_field_name(),
         owner_biosample_id_value="V-1",
-        biosample_accession=accession,
+        **{body_field: value},
     )
     assert r1.status_code == 201, r1.text
 
@@ -646,10 +673,64 @@ async def test_post_biosample_duplicate_biosample_accession_409(ctx):
         owner_idx=ctx["wet_session"]["principal_idx"],
         owner_biosample_id_field_name=_unique_field_name(),
         owner_biosample_id_value="V-2",
-        biosample_accession=accession,
+        **{body_field: value},
     )
     assert r2.status_code == 409
-    assert r2.json()["detail"] == "biosample_accession already in use"
+    assert r2.json()["detail"] == expected_detail
+
+
+async def test_post_biosample_with_matrix_tube_id_round_trips(ctx):
+    """Tests the case where a POST carries matrix_tube_id with a leading
+    zero: the value reaches the DB with leading zeros intact and the
+    subsequent GET surfaces the same string verbatim.
+    """
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="tube-rt"
+    )
+    ctx["created"]["study"].append(study_idx)
+    tube_id = _unique_matrix_tube_id()
+    # Sanity-check the test fixture: a generator that ever produced a
+    # string with no leading zero would silently weaken this test.
+    assert tube_id.startswith("0")
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_value="TUBE-1",
+        matrix_tube_id=tube_id,
+    )
+    assert resp.status_code == 201, resp.text
+    bs_idx = resp.json()["biosample_idx"]
+
+    get_resp = await ctx["wet"].get(URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx))
+    assert get_resp.status_code == 200, get_resp.text
+    assert get_resp.json()["matrix_tube_id"] == tube_id
+
+
+@pytest.mark.parametrize("bad_value", ["abc", "12-34", "", "0 1"])
+async def test_post_biosample_bad_matrix_tube_id_format_422(ctx, bad_value):
+    """Tests the case where matrix_tube_id violates the digits-only
+    contract: the Pydantic validator on BiosampleImportRequest rejects
+    the body at the wire boundary with 422 before reaching the DB CHECK.
+    """
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="tube-bad"
+    )
+    ctx["created"]["study"].append(study_idx)
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=_unique_field_name(),
+        owner_biosample_id_value="V-1",
+        matrix_tube_id=bad_value,
+    )
+    assert resp.status_code == 422
 
 
 async def test_post_biosample_bad_metadata_checklist_idx_422(ctx):
@@ -1301,6 +1382,7 @@ async def test_get_biosample_owner_returns_response(ctx):
         "metadata_checklist_idx": None,
         "biosample_accession": None,
         "ena_sample_accession": None,
+        "matrix_tube_id": None,
         "last_submission_at": None,
         "submission_error": None,
         "last_metadata_change_at": None,
@@ -1350,6 +1432,7 @@ async def test_get_biosample_via_study_access_returns_response(ctx):
         "metadata_checklist_idx": None,
         "biosample_accession": None,
         "ena_sample_accession": None,
+        "matrix_tube_id": None,
         "last_submission_at": None,
         "submission_error": None,
         "last_metadata_change_at": None,
@@ -1387,6 +1470,7 @@ async def test_get_biosample_wet_lab_admin_bypasses_access(ctx):
         "metadata_checklist_idx": None,
         "biosample_accession": None,
         "ena_sample_accession": None,
+        "matrix_tube_id": None,
         "last_submission_at": None,
         "submission_error": None,
         "last_metadata_change_at": None,
@@ -1422,6 +1506,7 @@ async def test_get_biosample_system_admin_bypasses_access(ctx):
         "metadata_checklist_idx": None,
         "biosample_accession": None,
         "ena_sample_accession": None,
+        "matrix_tube_id": None,
         "last_submission_at": None,
         "submission_error": None,
         "last_metadata_change_at": None,
@@ -1495,6 +1580,7 @@ async def test_get_biosample_carries_missing_reason_marker(ctx):
         "metadata_checklist_idx": None,
         "biosample_accession": None,
         "ena_sample_accession": None,
+        "matrix_tube_id": None,
         "last_submission_at": None,
         "submission_error": None,
         "last_metadata_change_at": rj["last_metadata_change_at"],
@@ -1571,6 +1657,7 @@ async def test_get_biosample_carries_terminology_term(ctx):
         "metadata_checklist_idx": None,
         "biosample_accession": None,
         "ena_sample_accession": None,
+        "matrix_tube_id": None,
         "last_submission_at": None,
         "submission_error": None,
         "last_metadata_change_at": rj["last_metadata_change_at"],
@@ -1782,6 +1869,7 @@ async def test_patch_biosample_wet_lab_admin_happy_path(ctx):
         "metadata_checklist_idx": None,
         "biosample_accession": new_acc,
         "ena_sample_accession": None,
+        "matrix_tube_id": None,
         "last_submission_at": None,
         "submission_error": None,
         "last_metadata_change_at": None,
@@ -2102,16 +2190,28 @@ async def test_patch_biosample_owner_self_incomplete_profile_422(ctx):
     assert resp.json()["detail"] == _ELIGIBILITY_DETAIL
 
 
-async def test_patch_biosample_duplicate_accession_409(ctx):
-    # Two biosamples; PATCH B's accession to A's value triggers
-    # biosample_accession_unique → asyncpg.UniqueViolationError → 409.
-    a_acc = _unique_accession("PATCH-A")
+@pytest.mark.parametrize(
+    "column,make_value",
+    [
+        ("biosample_accession", lambda: _unique_accession("PATCH-A")),
+        ("matrix_tube_id", _unique_matrix_tube_id),
+    ],
+)
+async def test_patch_biosample_duplicate_unique_column_409(ctx, column, make_value):
+    """Tests the case where a PATCH tries to claim a value that another
+    biosample already carries in a unique-constrained column: the route
+    maps asyncpg.UniqueViolationError to 409 with a per-column detail
+    that names the violated column. Parameterizing over the unique-
+    constrained columns keeps the per-column 409 surface pinned through
+    one definition.
+    """
+    value = make_value()
     owner_idx = ctx["wet_session"]["principal_idx"]
     bs_a = await ctx["pool"].fetchval(
-        "INSERT INTO qiita.biosample (owner_idx, created_by_idx, biosample_accession)"
+        f"INSERT INTO qiita.biosample (owner_idx, created_by_idx, {column})"
         " VALUES ($1, $1, $2) RETURNING idx",
         owner_idx,
-        a_acc,
+        value,
     )
     ctx["created"]["biosample"].append(bs_a)
     bs_b = await _seed_biosample_for_patch(ctx)
@@ -2119,11 +2219,11 @@ async def test_patch_biosample_duplicate_accession_409(ctx):
 
     resp = await ctx["wet"].patch(
         URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_b),
-        json={"biosample_accession": a_acc},
+        json={column: value},
         headers={"If-Match": if_match},
     )
     assert resp.status_code == 409
-    assert "biosample_accession" in resp.json()["detail"]
+    assert column in resp.json()["detail"]
 
 
 async def test_patch_biosample_bad_metadata_checklist_idx_422(ctx):
@@ -2290,5 +2390,68 @@ async def test_lookup_by_accession_rejects_extra_field_422(ctx):
     resp = await ctx["wet"].post(
         URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
         json={"accessions": ["SAMN00000001"], "unknown": "x"},
+    )
+    assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# POST /biosample/lookup-by-matrix-tube-id — bulk matrix_tube_id → idx resolver
+# ---------------------------------------------------------------------------
+# Mirrors the accession variant; the auth surface, dedup/missing semantics,
+# and retired-row exclusion are shared with lookup_biosample_by_accession
+# via the private _resolve_biosample_idxs_by_natural_key helper. The tests
+# below cover the per-key wire surface (route exists, format validator
+# fires on bad input). The shared behavior (auth tiers, dedup, retired-row
+# exclusion) is exercised once on the accession surface above.
+
+
+async def _seed_biosample_with_matrix_tube_id(ctx, *, matrix_tube_id: str, owner_idx: int) -> int:
+    """Seed a non-retired biosample carrying the given matrix_tube_id;
+    track for cleanup and return its idx."""
+    idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.biosample (owner_idx, created_by_idx, matrix_tube_id)"
+        " VALUES ($1, $1, $2) RETURNING idx",
+        owner_idx,
+        matrix_tube_id,
+    )
+    ctx["created"]["biosample"].append(idx)
+    return idx
+
+
+async def test_lookup_by_matrix_tube_id_returns_resolved_map_and_missing_list(ctx):
+    """Tests the case where the lookup body carries a mix of present and
+    absent matrix_tube_id values: the response resolves the hits and
+    surfaces the misses verbatim, with leading zeros preserved end-to-end.
+    """
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    tube_a = _unique_matrix_tube_id()
+    tube_b = _unique_matrix_tube_id()
+    tube_missing = _unique_matrix_tube_id()
+    bs_a = await _seed_biosample_with_matrix_tube_id(
+        ctx, matrix_tube_id=tube_a, owner_idx=owner_idx
+    )
+    bs_b = await _seed_biosample_with_matrix_tube_id(
+        ctx, matrix_tube_id=tube_b, owner_idx=owner_idx
+    )
+
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
+        json={"matrix_tube_ids": [tube_a, tube_b, tube_missing]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "resolved": {tube_a: bs_a, tube_b: bs_b},
+        "missing": [tube_missing],
+    }
+
+
+async def test_lookup_by_matrix_tube_id_rejects_bad_format_422(ctx):
+    """Tests the case where any element of `matrix_tube_ids` violates the
+    digits-only format: the per-element validator on the request model
+    rejects the body at the wire boundary with 422.
+    """
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
+        json={"matrix_tube_ids": ["00123", "abc"]},
     )
     assert resp.status_code == 422

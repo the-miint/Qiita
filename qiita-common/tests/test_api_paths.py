@@ -122,6 +122,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_BIOSAMPLE_PREFIX",
         "PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION",
     ),
+    (
+        "URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID",
+        "PATH_BIOSAMPLE_PREFIX",
+        "PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID",
+    ),
     # /sequenced-sample — re-anchored on /sequencing-run, /study, /sequenced-sample
     (
         "URL_SEQUENCED_SAMPLE_FROM_RUN",

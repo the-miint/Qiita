@@ -29,6 +29,7 @@ from qiita_control_plane.repositories._sample_helpers import (
 from qiita_control_plane.repositories.biosample import (
     BiosampleImportResult,
     fetch_biosample,
+    fetch_biosample_idxs_by_natural_key,
     fetch_biosample_idxs_for_study,
     fetch_caller_has_biosample_access,
     import_biosample_from_owner_biosample_id,
@@ -51,6 +52,7 @@ from .conftest import (
     _seed_study,
     _unique_accession,
     _unique_field_name,
+    _unique_matrix_tube_id,
 )
 
 pytestmark = pytest.mark.db
@@ -76,7 +78,7 @@ async def test_insert_biosample_minimal(ctx):
     # Verify the full row matches the expected default-laden shape.
     row = await ctx["pool"].fetchrow(
         "SELECT owner_idx, created_by_idx, metadata_checklist_idx,"
-        " biosample_accession, ena_sample_accession, retired"
+        " biosample_accession, ena_sample_accession, matrix_tube_id, retired"
         " FROM qiita.biosample WHERE idx = $1",
         idx,
     )
@@ -86,6 +88,7 @@ async def test_insert_biosample_minimal(ctx):
         "metadata_checklist_idx": None,
         "biosample_accession": None,
         "ena_sample_accession": None,
+        "matrix_tube_id": None,
         "retired": False,
     }
     assert dict(row) == expected
@@ -95,6 +98,7 @@ async def test_insert_biosample_full_columns(ctx):
     # Unique-per-test accessions avoid the UNIQUE constraint on bare values.
     bs_acc = _unique_accession("BS")
     ena_acc = _unique_accession("ENA")
+    tube_id = _unique_matrix_tube_id()
 
     # Insert with every caller-settable column populated. owner_idx and
     # created_by_idx are distinct principals so the round-trip assertion
@@ -107,13 +111,15 @@ async def test_insert_biosample_full_columns(ctx):
             metadata_checklist_idx=ctx["checklist_idx"],
             biosample_accession=bs_acc,
             ena_sample_accession=ena_acc,
+            matrix_tube_id=tube_id,
         )
     ctx["created"]["biosample"].append(idx)
 
-    # Confirm the populated columns round-trip onto the inserted row.
+    # Confirm the populated columns round-trip onto the inserted row;
+    # matrix_tube_id round-trips with its leading zero intact.
     row = await ctx["pool"].fetchrow(
         "SELECT owner_idx, created_by_idx, metadata_checklist_idx,"
-        " biosample_accession, ena_sample_accession"
+        " biosample_accession, ena_sample_accession, matrix_tube_id"
         " FROM qiita.biosample WHERE idx = $1",
         idx,
     )
@@ -123,6 +129,7 @@ async def test_insert_biosample_full_columns(ctx):
         "metadata_checklist_idx": ctx["checklist_idx"],
         "biosample_accession": bs_acc,
         "ena_sample_accession": ena_acc,
+        "matrix_tube_id": tube_id,
     }
     assert dict(row) == expected
 
@@ -1023,6 +1030,7 @@ async def test_fetch_biosample_returns_row(ctx):
     # round-trip exercise covers every value the read surfaces.
     bs_acc = _unique_accession("BS")
     ena_acc = _unique_accession("ENA")
+    tube_id = _unique_matrix_tube_id()
     async with ctx["pool"].acquire() as conn:
         bs_idx = await insert_biosample(
             conn,
@@ -1031,6 +1039,7 @@ async def test_fetch_biosample_returns_row(ctx):
             metadata_checklist_idx=ctx["checklist_idx"],
             biosample_accession=bs_acc,
             ena_sample_accession=ena_acc,
+            matrix_tube_id=tube_id,
         )
     ctx["created"]["biosample"].append(bs_idx)
 
@@ -1044,6 +1053,7 @@ async def test_fetch_biosample_returns_row(ctx):
         "metadata_checklist_idx": ctx["checklist_idx"],
         "biosample_accession": bs_acc,
         "ena_sample_accession": ena_acc,
+        "matrix_tube_id": tube_id,
         "last_submission_at": None,
         "submission_error": None,
         "last_metadata_change_at": None,
@@ -1161,8 +1171,12 @@ async def test_fetch_caller_has_biosample_access_excludes_retired_link(ctx):
 # ---------------------------------------------------------------------------
 
 
-async def _seed_full_biosample(ctx, *, owner_idx, bs_acc, ena_acc):
+async def _seed_full_biosample(ctx, *, owner_idx, bs_acc, ena_acc, matrix_tube_id=None):
     """Seed a biosample with every caller-settable column populated.
+
+    `matrix_tube_id` is optional so existing call sites that pre-date the
+    column keep working with the column NULL; tests targeting the column
+    pass an explicit value.
 
     Returns the new biosample_idx; caller is responsible for the
     cleanup tracking via ctx['created']['biosample'].
@@ -1175,6 +1189,7 @@ async def _seed_full_biosample(ctx, *, owner_idx, bs_acc, ena_acc):
             metadata_checklist_idx=ctx["checklist_idx"],
             biosample_accession=bs_acc,
             ena_sample_accession=ena_acc,
+            matrix_tube_id=matrix_tube_id,
         )
     ctx["created"]["biosample"].append(bs_idx)
     return bs_idx
@@ -1202,6 +1217,7 @@ async def test_update_biosample_writes_single_field(ctx):
         "metadata_checklist_idx": ctx["checklist_idx"],
         "biosample_accession": new_acc,
         "ena_sample_accession": seed_ena,
+        "matrix_tube_id": None,
         "last_submission_at": None,
         "submission_error": None,
         "last_metadata_change_at": None,
@@ -1221,14 +1237,20 @@ async def test_update_biosample_writes_single_field(ctx):
 async def test_update_biosample_writes_all_editable_fields(ctx):
     # PATCH every editable column at once (including switching ownership
     # to the other user-kind principal); the returned row must reflect
-    # all six new values.
+    # all new values.
     seed_acc = _unique_accession("BS-old")
     seed_ena = _unique_accession("ENA-old")
+    seed_tube = _unique_matrix_tube_id()
     new_acc = _unique_accession("BS-new")
     new_ena = _unique_accession("ENA-new")
+    new_tube = _unique_matrix_tube_id()
     new_submission_at = datetime.now(UTC).replace(microsecond=0)
     bs_idx = await _seed_full_biosample(
-        ctx, owner_idx=ctx["biosample_owner_idx"], bs_acc=seed_acc, ena_acc=seed_ena
+        ctx,
+        owner_idx=ctx["biosample_owner_idx"],
+        bs_acc=seed_acc,
+        ena_acc=seed_ena,
+        matrix_tube_id=seed_tube,
     )
 
     async with ctx["pool"].acquire() as conn:
@@ -1240,6 +1262,7 @@ async def test_update_biosample_writes_all_editable_fields(ctx):
                 "owner_idx": ctx["principal_idx"],
                 "biosample_accession": new_acc,
                 "ena_sample_accession": new_ena,
+                "matrix_tube_id": new_tube,
                 "last_submission_at": new_submission_at,
                 "submission_error": "NCBI rejected: bad collection_date",
             },
@@ -1252,6 +1275,7 @@ async def test_update_biosample_writes_all_editable_fields(ctx):
         "metadata_checklist_idx": None,
         "biosample_accession": new_acc,
         "ena_sample_accession": new_ena,
+        "matrix_tube_id": new_tube,
         "last_submission_at": new_submission_at,
         "submission_error": "NCBI rejected: bad collection_date",
         "last_metadata_change_at": None,
@@ -1370,29 +1394,63 @@ async def test_update_biosample_bad_owner_idx_raises_role_typed_error(ctx):
             await update_biosample(conn, bs_idx, fields={"owner_idx": bad_owner})
 
 
-async def test_update_biosample_duplicate_accession_raises_unique_error(ctx):
-    # Two biosamples; PATCH B's accession to A's value triggers
-    # biosample_accession_unique. The route maps this to 409.
-    a_acc = _unique_accession("BS-A")
-    bs_a = await _seed_full_biosample(
-        ctx,
-        owner_idx=ctx["biosample_owner_idx"],
-        bs_acc=a_acc,
-        ena_acc=_unique_accession("ENA-A"),
-    )
+@pytest.mark.parametrize(
+    "column,make_value",
+    [
+        ("biosample_accession", lambda: _unique_accession("BS-A")),
+        ("matrix_tube_id", _unique_matrix_tube_id),
+    ],
+)
+async def test_update_biosample_duplicate_unique_column_raises_unique_error(
+    ctx, column, make_value
+):
+    """Tests the case where a PATCH to a unique-constrained column would
+    collide with another row's value: asyncpg.UniqueViolationError fires
+    regardless of which unique-constrained column triggers it. The route
+    layer maps both to 409.
+    """
+    conflicting_value = make_value()
+    # Seed A with the conflicting value populated in the target column.
+    a_kwargs = {
+        "owner_idx": ctx["biosample_owner_idx"],
+        "bs_acc": _unique_accession("BS-A"),
+        "ena_acc": _unique_accession("ENA-A"),
+    }
+    if column == "matrix_tube_id":
+        a_kwargs["matrix_tube_id"] = conflicting_value
+    else:
+        a_kwargs["bs_acc"] = conflicting_value
+    bs_a = await _seed_full_biosample(ctx, **a_kwargs)
+    # Seed B without the conflicting value; the PATCH below sets it.
     bs_b = await _seed_full_biosample(
         ctx,
         owner_idx=ctx["biosample_owner_idx"],
         bs_acc=_unique_accession("BS-B"),
         ena_acc=_unique_accession("ENA-B"),
     )
-    # A is referenced only via the seeded accession; the lookup keeps the
-    # idx in scope so the cleanup sweep removes both biosamples in order.
+    # A is referenced only via the seed value; the lookup keeps the idx
+    # in scope so the cleanup sweep removes both biosamples in order.
     assert bs_a != bs_b
 
     async with ctx["pool"].acquire() as conn:
         with pytest.raises(asyncpg.UniqueViolationError):
-            await update_biosample(conn, bs_b, fields={"biosample_accession": a_acc})
+            await update_biosample(conn, bs_b, fields={column: conflicting_value})
+
+
+async def test_update_biosample_bad_matrix_tube_id_raises_check_error(ctx):
+    """Tests the case where a PATCH sets matrix_tube_id to a non-digit
+    value: the column-level CHECK fires and asyncpg.CheckViolationError
+    propagates. The route layer maps this to 422.
+    """
+    bs_idx = await _seed_full_biosample(
+        ctx,
+        owner_idx=ctx["biosample_owner_idx"],
+        bs_acc=_unique_accession("BS"),
+        ena_acc=_unique_accession("ENA"),
+    )
+    async with ctx["pool"].acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError):
+            await update_biosample(conn, bs_idx, fields={"matrix_tube_id": "ABC"})
 
 
 async def test_update_biosample_advances_updated_at(ctx):
@@ -1412,6 +1470,57 @@ async def test_update_biosample_advances_updated_at(ctx):
     async with ctx["pool"].acquire() as conn:
         row = await update_biosample(conn, bs_idx, fields={"submission_error": "transient retry"})
     assert row["updated_at"] > initial_updated_at
+
+
+# ---------------------------------------------------------------------------
+# fetch_biosample_idxs_by_natural_key
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "key,make_value",
+    [
+        ("biosample_accession", lambda: _unique_accession("LK")),
+        ("matrix_tube_id", _unique_matrix_tube_id),
+    ],
+)
+async def test_fetch_biosample_idxs_by_natural_key_returns_resolved(ctx, key, make_value):
+    """Tests the case where the named natural-key column carries values
+    that resolve to non-retired biosamples: the function returns a
+    `{value: biosample_idx}` map for the hits and omits the misses. The
+    parameterization exercises both natural-key surfaces (accession and
+    matrix_tube_id) through one definition.
+    """
+    hit_value = make_value()
+    miss_value = make_value()
+    # Seed one biosample carrying hit_value in the target column; the
+    # paired accession/ena_accession use a separate generator so the
+    # uniqueness constraints on the other unique columns never collide.
+    kwargs = {
+        "owner_idx": ctx["biosample_owner_idx"],
+        "bs_acc": _unique_accession("LK-OTHER"),
+        "ena_acc": _unique_accession("LK-ENA"),
+    }
+    if key == "matrix_tube_id":
+        kwargs["matrix_tube_id"] = hit_value
+    else:
+        kwargs["bs_acc"] = hit_value
+    bs_idx = await _seed_full_biosample(ctx, **kwargs)
+
+    result = await fetch_biosample_idxs_by_natural_key(
+        ctx["pool"], key=key, values=[hit_value, miss_value]
+    )
+    assert result == {hit_value: bs_idx}
+
+
+async def test_fetch_biosample_idxs_by_natural_key_empty_values_short_circuits(ctx):
+    """Tests the case where `values` is empty: the function returns an
+    empty dict without executing any SQL (the no-op early-return path).
+    """
+    result = await fetch_biosample_idxs_by_natural_key(
+        ctx["pool"], key="biosample_accession", values=[]
+    )
+    assert result == {}
 
 
 # ===========================================================================
