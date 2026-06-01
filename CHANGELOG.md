@@ -13,8 +13,20 @@ the `no-changelog` label).
 
 ## [Unreleased]
 
+<!-- (#70) is a placeholder PR number for the host-reference-filtering branch;
+     confirm/replace when the PR is opened (68, 69 currently open). -->
+
 ### Added
 
+- Host references for host-read filtering: `is_host` column on `qiita.reference`,
+  the `reference_index` table tracking built indexes, an `indexing` reference
+  status (`loading → indexing → active`), and the `host-reference-add` workflow
+  that builds a rype `.ryxdi` negative-filter index (`build_rype_index` native
+  job + `register-index` library action) (#70)
+- `GET /reference` (list; filter by `kind` / `is_host` / `status`) and
+  `GET /reference/{reference_idx}/index` (list a reference's built indexes) (#70)
+- `qiita reference load --host` — create a host reference (or bind an existing
+  one) and run `host-reference-add`; requires `--taxonomy` (#70)
 - Arrow Flight DoPut upload domain + chunked reference-load pipeline (#49)
 - Support for known-missing and terminology-term metadata values (#56)
 - `/health` aggregator probing CP + CO + DP with cached aggregation, a
@@ -31,6 +43,10 @@ the `no-changelog` label).
 
 ### Changed
 
+- The SLURM backend now propagates `SHARED_FILESYSTEM_ROOT` into the compute-node
+  job environment, so native steps that derive a persistent path from it (e.g.
+  `build_rype_index` writing the rype `.ryxdi`) resolve the real shared root
+  instead of the `/tmp/qiita` default (#70)
 - Centralized all REST path string literals into `qiita-common`'s
   `api_paths.py` (closes #12) (#60)
 - Bumped the study / prep_sample identity sequence start to 25000 (#61)

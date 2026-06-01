@@ -88,6 +88,7 @@ class SlurmBackend(ComputeBackend):
         cp_url: str = "",
         qos: str = "",
         qiita_images_dir: Path | None = None,
+        shared_filesystem_root: str = "",
     ) -> None:
         self._client = client
         self._partition = partition
@@ -117,6 +118,16 @@ class SlurmBackend(ComputeBackend):
         # SLURM-env exposure surface to just the outbound PAT.
         self._co_to_cp_token = co_to_cp_token
         self._cp_url = cp_url
+        # Shared-FS root, propagated into the SLURM job env for the same
+        # reason as cp_url: /etc/qiita is deploy-host-local, invisible from
+        # compute nodes, so the native-step launcher's `get_settings()` would
+        # otherwise fall back to the `/tmp/qiita` DEFAULT for
+        # `shared_filesystem_root`. Native jobs that derive a PERSISTENT path
+        # from it — `build_rype_index` writes the `.ryxdi` under
+        # `{shared_filesystem_root}/references/{idx}/rype/` — need the real
+        # value or their output lands in node-local /tmp, invisible to the CP.
+        # Jobs that only write QIITA_OUTPUT_PATH (the workspace) don't care.
+        self._shared_filesystem_root = shared_filesystem_root
         # Optional SLURM QOS to set on submit; empty string means "let
         # SLURM apply the submitting user's default QOS" (the orchestrator
         # doesn't override).
@@ -321,6 +332,8 @@ class SlurmBackend(ComputeBackend):
             extra_env["QIITA_ALLOW_TOKEN_ENV"] = "true"
         if self._cp_url:
             extra_env["QIITA_CP_URL"] = self._cp_url
+        if self._shared_filesystem_root:
+            extra_env["SHARED_FILESYSTEM_ROOT"] = self._shared_filesystem_root
 
         # For container steps, expose the parent directory of every
         # YAML-declared input path so the entrypoint can read it via

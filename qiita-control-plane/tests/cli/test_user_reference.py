@@ -22,6 +22,7 @@ import duckdb
 import httpx
 import pytest
 from qiita_common.api_paths import (
+    URL_REFERENCE_BY_IDX,
     URL_REFERENCE_PREFIX,
     URL_UPLOAD_DONE,
     URL_UPLOAD_PREFIX,
@@ -104,10 +105,19 @@ def upload_state():
 
 
 @pytest.fixture
-def cp_transport(upload_state):
-    """Mock the CP REST surface the CLI hits: POST /reference, POST /upload,
-    POST /upload/{idx}/done, POST /work-ticket, GET /work-ticket/{idx}.
-    Returns the AsyncTransport + the captured call log."""
+def reference_state():
+    """Controls the `is_host` the mock GET /reference/{idx} reports — used by
+    the `--host` + `--reference-idx` bind-path verification tests. Default
+    false; tests that bind to a host reference flip it to true."""
+    return {"is_host": False}
+
+
+@pytest.fixture
+def cp_transport(upload_state, reference_state):
+    """Mock the CP REST surface the CLI hits: POST /reference,
+    GET /reference/{idx}, POST /upload, POST /upload/{idx}/done,
+    POST /work-ticket, GET /work-ticket/{idx}. Returns the AsyncTransport +
+    the captured call log."""
     calls: list[tuple[str, str, dict | None]] = []
     work_tickets: dict[int, dict] = {}
 
@@ -124,6 +134,21 @@ def cp_transport(upload_state):
                     "version": body["version"],
                     "kind": body["kind"],
                     "status": "pending",
+                    "created_by_idx": 1,
+                    "created_at": "2026-05-20T00:00:00Z",
+                },
+            )
+        if path.startswith(f"{URL_REFERENCE_PREFIX}/") and request.method == "GET":
+            ref_idx = int(path.split("/")[-1])
+            return httpx.Response(
+                200,
+                json={
+                    "reference_idx": ref_idx,
+                    "name": "existing",
+                    "version": "1.0",
+                    "kind": "sequence_reference",
+                    "status": "active",
+                    "is_host": reference_state["is_host"],
                     "created_by_idx": 1,
                     "created_at": "2026-05-20T00:00:00Z",
                 },
@@ -249,10 +274,175 @@ async def test_do_reference_load_happy_path(
     assert submit_call[2]["action_context"] == {"fasta_upload_idx": 100, "taxonomy_upload_idx": 101}
     assert submit_call[2]["scope_target"] == {"kind": "reference", "reference_idx": 999}
 
+    # Default (non-host): the plain reference-add action, and the created
+    # reference carries is_host=false.
+    assert submit_call[2]["action_id"] == "reference-add"
+    create_call = next(c for c in calls if c[1] == URL_REFERENCE_PREFIX and c[0] == "POST")
+    assert create_call[2]["is_host"] is False
+
     # Two DoPut calls fired with distinct ticket payloads.
     assert flight_client.calls == [b"signed-ticket-for-100", b"signed-ticket-for-101"]
     # Slots both ended at ready (the /done call fired for each).
     assert upload_state["slots"] == {100: "ready", 101: "ready"}
+
+
+async def test_do_reference_load_host_sets_is_host_and_selects_host_action(
+    fasta_file, taxonomy_file, tmp_path, cp_transport, upload_state
+):
+    """`--host` creates the reference with is_host=true and submits the
+    `host-reference-add` action (which appends the rype-index build) instead
+    of `reference-add`. Taxonomy is supplied — host references require it."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    flight_client = FakeFlightClient()
+    flight_client.queue_response(100)  # FASTA
+    flight_client.queue_response(101)  # taxonomy
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        result = await do_reference_load(
+            http=http,
+            token="t",
+            flight_client=flight_client,
+            fasta_path=fasta_file,
+            taxonomy_path=taxonomy_file,
+            name="host-ref",
+            version="1.0",
+            host=True,
+            watch=False,
+        )
+
+    assert result["reference_idx"] == 999
+    create_call = next(c for c in calls if c[1] == URL_REFERENCE_PREFIX and c[0] == "POST")
+    assert create_call[2]["is_host"] is True
+    submit_call = next(c for c in calls if c[1] == URL_WORK_TICKET_PREFIX and c[0] == "POST")
+    assert submit_call[2]["action_id"] == "host-reference-add"
+    # action_context still carries both upload handles.
+    assert submit_call[2]["action_context"] == {"fasta_upload_idx": 100, "taxonomy_upload_idx": 101}
+
+
+async def test_do_reference_load_host_requires_taxonomy(fasta_file, tmp_path, cp_transport):
+    """`--host` without `--taxonomy` is a contract violation — a host
+    reference's rype index needs the taxonomy mapping authority. The check
+    fires before any network call (no reference created, no upload)."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(ValueError, match="taxonomy"):
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                fasta_path=fasta_file,
+                name="host-ref",
+                version="1.0",
+                host=True,
+                watch=False,
+            )
+
+    # Fail-fast: nothing hit the wire.
+    assert calls == []
+
+
+async def test_do_reference_load_host_with_reference_idx_rejects_non_host(
+    fasta_file, taxonomy_file, tmp_path, cp_transport, reference_state
+):
+    """`--host --reference-idx N` against a reference whose is_host=false is
+    rejected: is_host is write-once at creation, so running host-reference-add
+    against a non-host reference would be a silent mismatch. The CLI GETs the
+    reference, sees is_host=false, and raises before any upload / work-ticket."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    reference_state["is_host"] = False  # the bound reference is NOT a host ref
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(ValueError, match="is_host=false"):
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                fasta_path=fasta_file,
+                taxonomy_path=taxonomy_file,
+                reference_idx=42,
+                host=True,
+                watch=False,
+            )
+
+    # Verified the reference, then bailed: no upload, no work-ticket submit.
+    method_paths = [(m, p) for (m, p, _b) in calls]
+    assert ("GET", URL_REFERENCE_BY_IDX.format(reference_idx=42)) in method_paths
+    assert not any(p == URL_UPLOAD_PREFIX for (_m, p) in method_paths)
+    assert not any(p == URL_WORK_TICKET_PREFIX for (_m, p) in method_paths)
+
+
+async def test_do_reference_load_host_with_reference_idx_allows_host_ref(
+    fasta_file, taxonomy_file, tmp_path, cp_transport, reference_state
+):
+    """`--host --reference-idx N` against a genuine host reference proceeds —
+    the legitimate re-run / regenerate-index flow. No POST /reference (binding),
+    but the host-reference-add action is submitted."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    reference_state["is_host"] = True  # the bound reference IS a host ref
+    flight_client = FakeFlightClient()
+    flight_client.queue_response(100)  # FASTA
+    flight_client.queue_response(101)  # taxonomy
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        result = await do_reference_load(
+            http=http,
+            token="t",
+            flight_client=flight_client,
+            fasta_path=fasta_file,
+            taxonomy_path=taxonomy_file,
+            reference_idx=42,
+            host=True,
+            watch=False,
+        )
+
+    assert result["reference_idx"] == 42
+    assert not any(p == URL_REFERENCE_PREFIX and m == "POST" for (m, p, _b) in calls), (
+        "binding to an existing reference must not POST /reference"
+    )
+    submit_call = next(c for c in calls if c[1] == URL_WORK_TICKET_PREFIX and c[0] == "POST")
+    assert submit_call[2]["action_id"] == "host-reference-add"
+
+
+def test_handler_host_without_taxonomy_exits_nonzero(monkeypatch, tmp_path, capsys):
+    """End-to-end arg plumbing: `qiita reference load --host` (no --taxonomy)
+    threads `host=True` into the entry point, whose taxonomy guard surfaces as
+    exit 1 with a stderr line. Locks both the `--host` flag and its wiring."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import user as _user
+
+    monkeypatch.setattr(_common, "read_token", lambda: "test-pat")
+    fasta = tmp_path / "x.fasta"
+    fasta.write_text(">a\nACGT\n")
+
+    rc = _user.main(
+        [
+            "--base-url",
+            "http://localhost:8080",
+            "reference",
+            "load",
+            "--name",
+            "h",
+            "--version",
+            "1.0",
+            "--host",
+            "--fasta",
+            str(fasta),
+            "--data-plane-url",
+            "grpc://localhost:0",
+            "--no-watch",
+        ]
+    )
+    assert rc == 1
+    assert "taxonomy" in capsys.readouterr().err
 
 
 async def test_do_reference_load_skips_creation_when_reference_idx_set(

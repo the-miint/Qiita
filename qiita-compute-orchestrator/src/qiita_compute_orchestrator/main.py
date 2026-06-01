@@ -44,6 +44,11 @@ def _build_backend(settings: Settings) -> ComputeBackend:
             # See SlurmBackend.run_step's extra_env wiring.
             co_to_cp_token=settings.co_to_cp_token,
             cp_url=settings.cp_url,
+            # Propagated into the job env so native steps that derive a
+            # persistent path from it (build_rype_index → the .ryxdi) resolve
+            # the real shared root on the compute node instead of the
+            # /tmp/qiita default. See SlurmBackend.run_step's extra_env wiring.
+            shared_filesystem_root=settings.shared_filesystem_root,
             qos=settings.slurm.qos,
             # QIITA_IMAGES_DIR is validated in Settings.from_env when
             # backend_type=slurm — non-None here on the production path.

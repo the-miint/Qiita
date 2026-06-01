@@ -54,6 +54,7 @@ def _make_backend(
     *,
     co_to_cp_token: str = "",
     cp_url: str = "",
+    shared_filesystem_root: str = "",
 ) -> SlurmBackend:
     client = SlurmrestdClient(
         base_url="http://slurm-test:6820",
@@ -73,6 +74,7 @@ def _make_backend(
         job_timeout_seconds=60,
         co_to_cp_token=co_to_cp_token,
         cp_url=cp_url,
+        shared_filesystem_root=shared_filesystem_root,
     )
 
 
@@ -372,6 +374,51 @@ async def test_run_step_omits_token_env_when_backend_has_no_tokens(jwt_path, bas
     assert "CO_TO_CP_TOKEN" not in env
     assert "QIITA_ALLOW_TOKEN_ENV" not in env
     assert "QIITA_CP_URL" not in env
+    # Likewise SHARED_FILESYSTEM_ROOT — only propagated when wired (below).
+    assert "SHARED_FILESYSTEM_ROOT" not in env
+
+
+@pytest.mark.asyncio
+async def test_run_step_propagates_shared_filesystem_root_into_job_env(
+    jwt_path, baseline, tmp_path
+):
+    """The compute-node native-step launcher calls `get_settings()`, whose
+    `shared_filesystem_root` falls back to a `/tmp/qiita` DEFAULT when the env
+    var is absent. Native jobs that derive a persistent path from it — notably
+    `build_rype_index`, which writes the `.ryxdi` to
+    `{SHARED_FILESYSTEM_ROOT}/references/{idx}/rype/index.ryxdi` — would
+    otherwise land their output in node-local /tmp, invisible to the CP. So the
+    backend must propagate the resolved value into the SLURM job env (the same
+    way it propagates QIITA_CP_URL — /etc/qiita is not visible from nodes)."""
+    captured: dict[str, dict] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/job/submit"):
+            captured["payload"] = json.loads(request.content.decode())
+            return httpx.Response(200, json={"job_id": 1})
+        return httpx.Response(
+            200,
+            json={"jobs": [{"job_id": 1, "job_state": ["COMPLETED"], "exit_code": {}}]},
+        )
+
+    backend = _make_backend(
+        httpx.MockTransport(handler),
+        jwt_path,
+        shared_filesystem_root="/scratch/persistent/qiita",
+    )
+    _write_completed_output(tmp_path)
+
+    await backend.run_step(
+        "fastq",
+        {},
+        tmp_path,
+        scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+        work_ticket_idx=99,
+        module=FASTQ_TO_PARQUET_MODULE,
+        baseline_resources=baseline,
+    )
+    env = dict(item.split("=", 1) for item in captured["payload"]["job"]["environment"])
+    assert env["SHARED_FILESYSTEM_ROOT"] == "/scratch/persistent/qiita"
 
 
 @pytest.mark.asyncio

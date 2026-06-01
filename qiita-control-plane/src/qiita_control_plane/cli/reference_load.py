@@ -71,6 +71,7 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 from qiita_common.api_paths import (
+    URL_REFERENCE_BY_IDX,
     URL_REFERENCE_PREFIX,
     URL_UPLOAD_DONE,
     URL_UPLOAD_PREFIX,
@@ -93,6 +94,13 @@ _TERMINAL_WORK_TICKET_STATES = frozenset({"completed", "failed"})
 # action_ceiling.walltime upper bound for reference-add.
 DEFAULT_POLL_INTERVAL_SECONDS = 2.0
 DEFAULT_POLL_TIMEOUT_SECONDS = 24 * 3600
+
+# Action identifiers the CLI submits, by host-ness. Pinned against the on-disk
+# workflow YAML in tests/test_actions_loader.py so an id/version drift fails at
+# build time instead of 404ing at submit. Both workflows ship as version 1.0.0.
+_REFERENCE_ADD_ACTION_ID = "reference-add"
+_HOST_REFERENCE_ADD_ACTION_ID = "host-reference-add"
+_REFERENCE_ADD_ACTION_VERSION = "1.0.0"
 
 
 @dataclass(frozen=True, slots=True)
@@ -468,6 +476,7 @@ async def do_reference_load(
     name: str | None = None,
     version: str | None = None,
     kind: str | None = "sequence_reference",
+    host: bool = False,
     reference_idx: int | None = None,
     taxonomy_path: Path | None = None,
     tree_path: Path | None = None,
@@ -483,7 +492,13 @@ async def do_reference_load(
 
     Exactly one of `reference_idx` or (`name` + `version`) must be set —
     the latter creates a new reference, the former binds to an existing
-    one. `kind` is consumed only when creating."""
+    one. `kind` is consumed only when creating.
+
+    `host=True` marks the new reference `is_host=true` and routes to the
+    `host-reference-add` action (which additionally builds the rype index
+    consumed as a negative filter at host-read-filtering time). A host
+    reference requires `taxonomy_path` — it's the rype mapping authority's
+    source — so it's a fail-fast precondition here."""
     has_idx = reference_idx is not None
     has_name_version = name is not None and version is not None
     if has_idx and (name is not None or version is not None):
@@ -495,17 +510,42 @@ async def do_reference_load(
         raise ValueError(
             "exactly one of (--reference-idx) or (--name + --version) must be supplied"
         )
+    if host and taxonomy_path is None:
+        raise ValueError(
+            "--host requires --taxonomy: a host reference must ship a taxonomy"
+            " mapping authority for the rype index build"
+        )
 
     if reference_idx is None:
         create = await _post(
             http,
             token,
             URL_REFERENCE_PREFIX,
-            body={"name": name, "version": version, "kind": kind or "sequence_reference"},
+            body={
+                "name": name,
+                "version": version,
+                "kind": kind or "sequence_reference",
+                "is_host": host,
+            },
             expected_status=(201,),
         )
         reference_idx = create["reference_idx"]
         _log.info("created reference %d (%s, %s)", reference_idx, name, version)
+    elif host:
+        # Binding to an existing reference with --host: is_host is write-once at
+        # creation (no PATCH path), so we can't set it here. Verify the existing
+        # reference is actually a host reference — otherwise host-reference-add
+        # would build a rype index for a reference whose is_host=false, a silent
+        # metadata/behaviour mismatch. GET only on this path; a plain bind does
+        # not pay the round-trip.
+        existing = await _get(http, token, URL_REFERENCE_BY_IDX.format(reference_idx=reference_idx))
+        if not existing.get("is_host"):
+            raise ValueError(
+                f"--host was given but reference {reference_idx} has is_host=false; "
+                "is_host is fixed at creation, so host-reference-add cannot run against "
+                "a non-host reference. Create a new host reference with --name/--version "
+                "--host, or drop --host to run reference-add against this one."
+            )
 
     action_context: dict[str, int] = {}
     upload_idxs: dict[str, int] = {}
@@ -535,9 +575,13 @@ async def do_reference_load(
         upload_idxs[role] = res.upload_idx
         _log.info("uploaded %s as upload_idx=%d", role, res.upload_idx)
 
+    # Host references run the host-reference-add workflow (reference-add steps
+    # plus the trailing rype-index build + register-index); plain references
+    # run reference-add.
+    action_id = _HOST_REFERENCE_ADD_ACTION_ID if host else _REFERENCE_ADD_ACTION_ID
     submit_body = {
-        "action_id": "reference-add",
-        "action_version": "1.0.0",
+        "action_id": action_id,
+        "action_version": _REFERENCE_ADD_ACTION_VERSION,
         "scope_target": {"kind": "reference", "reference_idx": reference_idx},
         "action_context": action_context,
     }

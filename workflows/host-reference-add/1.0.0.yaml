@@ -1,0 +1,109 @@
+action_id: host-reference-add
+version: 1.0.0
+target_kind: reference
+
+description: >
+  Like reference-add, but for a HOST reference used as a negative filter:
+  hash + mint + load the sequences (taxonomy required), then build a rype
+  `.ryxdi` minimizer index over every feature and record it in
+  qiita.reference_index. The index is consumed at host-read-filtering time as
+  rype's negative_index (reads matching it are removed). Differs from
+  reference-add only by requiring taxonomy and by the build-rype-index →
+  register-index tail; the lifecycle gains `loading → indexing → active`.
+
+scopes:
+  - reference:write
+
+audience:
+  service: false
+  human_roles: [wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  # Both required for a host reference: the FASTA is the sequence source and
+  # taxonomy is the mapping authority. tree / jplace / genome_map stay optional
+  # (same shape as reference-add). The runner resolves every `*_upload_idx`
+  # key to a `*_path` binding before any step runs
+  # (qiita_control_plane.runner._resolve_upload_handles).
+  required: [fasta_upload_idx, taxonomy_upload_idx]
+  properties:
+    fasta_upload_idx: {type: integer, minimum: 1}
+    taxonomy_upload_idx: {type: integer, minimum: 1}
+    tree_upload_idx: {type: integer, minimum: 1}
+    jplace_upload_idx: {type: integer, minimum: 1}
+    genome_map_upload_idx: {type: integer, minimum: 1}
+
+success_status: active
+failure_status: failed
+
+steps:
+  - step: hash_sequences
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.hash_sequences
+    target_status: hashing
+    inputs: [fasta_path]
+    outputs: [manifest, reference_sequence_chunks]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 8
+      walltime: PT1H
+
+  - action: mint-features
+    target_status: minting
+    inputs: [manifest]
+    outputs: [feature_map]
+
+  - action: write-membership
+    inputs: [feature_map]
+    outputs: []
+
+  - step: load
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.reference_load
+    target_status: loading
+    inputs: [manifest, feature_map, reference_sequence_chunks]
+    optional_inputs: [taxonomy_path, tree_path, jplace_path]
+    # `reference_sequence_chunks` is re-emitted feature-keyed here (the
+    # hash_sequences binding was sequence_hash-keyed); build_rype_index below
+    # consumes that re-keyed form.
+    outputs: [staging_dir, reference_sequence_chunks]
+    baseline_resources:
+      cpu: 8
+      mem_gb: 32
+      walltime: PT2H
+
+  # MUST precede register-files: register-files MOVES the feature-keyed
+  # reference_sequence_chunks part files into permanent DuckLake storage
+  # (data-plane move_file), so the index build has to read them from staging
+  # first. The persistent .ryxdi is written under the shared filesystem
+  # ({SHARED_FILESYSTEM_ROOT}/references/{reference_idx}/rype/index.ryxdi), not
+  # the ephemeral workspace; build_rype_index returns its path (rype_index_path)
+  # and a small meta JSON (rype_index_meta) carrying index_type / fs_path /
+  # params that register-index consumes.
+  - step: build_rype_index
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.build_rype_index
+    target_status: indexing
+    inputs: [reference_sequence_chunks]
+    outputs: [rype_index_path, rype_index_meta]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 32
+      walltime: PT2H
+
+  - action: register-files
+    inputs: [staging_dir]
+    outputs: []
+
+  # Records the built index in qiita.reference_index. The runner's
+  # register-index arm reads bound["rype_index_meta"] (native-step outputs are
+  # path strings, so the build params ride a file) — `inputs` here is
+  # documentation of that data flow.
+  - action: register-index
+    inputs: [rype_index_meta]
+    outputs: []
+
+action_ceiling:
+  cpu: 16
+  mem_gb: 64
+  walltime: PT4H

@@ -1210,3 +1210,85 @@ async def test_dispatch_register_index_writes_row(postgres_pool, reference_idx, 
     await postgres_pool.execute(
         "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
     )
+
+
+# =============================================================================
+# _resolve_reference_index_path
+# =============================================================================
+#
+# The on-disk path a future host-filter compute job is injected with: the
+# newest generation of a given index_type for an ACTIVE reference. Built and
+# tested now (the host-filter *processing* workflow itself is out of scope) so
+# the resolution contract — newest-generation selection + active-status gate —
+# is locked against the reference_index table the host-reference-add workflow
+# populates.
+
+
+async def _insert_reference_index(pool, reference_idx, fs_path, *, index_type="rype"):
+    return await pool.fetchval(
+        "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
+        " VALUES ($1, $2, $3, $4::jsonb) RETURNING reference_index_idx",
+        reference_idx,
+        index_type,
+        fs_path,
+        json.dumps({"k": 64, "w": 25}),
+    )
+
+
+async def test_resolve_reference_index_path_returns_latest(postgres_pool, reference_idx):
+    """When a reference is active and has multiple index generations of the
+    same type, the newest (highest reference_index_idx) fs_path is returned —
+    the "grow a reference appends a generation" path the table's lack of a
+    UNIQUE(reference_idx, index_type) deliberately allows."""
+    from qiita_control_plane.runner import _resolve_reference_index_path
+
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1", reference_idx
+    )
+    await _insert_reference_index(postgres_pool, reference_idx, "/srv/qiita/old.ryxdi")
+    newest = "/srv/qiita/new.ryxdi"
+    await _insert_reference_index(postgres_pool, reference_idx, newest)
+    try:
+        resolved = await _resolve_reference_index_path(postgres_pool, reference_idx, "rype")
+        assert resolved == newest
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_reference_index_path_raises_when_reference_absent(postgres_pool):
+    from qiita_control_plane.actions.reference import ReferenceNotFound
+    from qiita_control_plane.runner import _resolve_reference_index_path
+
+    with pytest.raises(ReferenceNotFound):
+        await _resolve_reference_index_path(postgres_pool, 999_999_999, "rype")
+
+
+async def test_resolve_reference_index_path_raises_when_not_active(postgres_pool, reference_idx):
+    """A reference still in `indexing` (or any non-active state) must not have
+    its index served — the build may be mid-flight or have failed."""
+    from qiita_control_plane.runner import _resolve_reference_index_path
+
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'indexing' WHERE reference_idx = $1", reference_idx
+    )
+    await _insert_reference_index(postgres_pool, reference_idx, "/srv/qiita/x.ryxdi")
+    try:
+        with pytest.raises(ValueError, match="active"):
+            await _resolve_reference_index_path(postgres_pool, reference_idx, "rype")
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_reference_index_path_raises_when_no_index(postgres_pool, reference_idx):
+    """Active reference, but no index of the requested type built yet."""
+    from qiita_control_plane.runner import _resolve_reference_index_path
+
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1", reference_idx
+    )
+    with pytest.raises(ValueError, match="no 'rype' index"):
+        await _resolve_reference_index_path(postgres_pool, reference_idx, "rype")

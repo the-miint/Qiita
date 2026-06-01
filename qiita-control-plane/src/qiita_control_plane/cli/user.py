@@ -491,6 +491,14 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Bind to an existing reference instead of creating one",
     )
+    p_reference_load.add_argument(
+        "--host",
+        action="store_true",
+        help=(
+            "Mark the reference as a host (is_host=true) and run host-reference-add,"
+            " which builds the rype negative-filter index. Requires --taxonomy."
+        ),
+    )
     p_reference_load.add_argument("--fasta", required=True, type=Path)
     p_reference_load.add_argument("--taxonomy", type=Path)
     p_reference_load.add_argument("--tree", type=Path)
@@ -767,6 +775,7 @@ async def _run_reference_load(
                 name=args.name,
                 version=args.version,
                 kind=args.kind,
+                host=args.host,
                 reference_idx=args.reference_idx,
                 taxonomy_path=args.taxonomy,
                 tree_path=args.tree,

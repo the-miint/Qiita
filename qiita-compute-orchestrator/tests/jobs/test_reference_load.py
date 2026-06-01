@@ -183,6 +183,22 @@ def test_emits_feature_idx_keyed_chunks(staging_inputs, tmp_path):
     assert {fidx: canon for fidx, canon in rows} == fidx_to_canon
 
 
+def test_returns_feature_keyed_chunks_binding(staging_inputs, tmp_path):
+    """execute() exposes the feature-keyed chunks directory as its own
+    `reference_sequence_chunks` binding (in addition to `staging_dir`).
+
+    host-reference-add's build_rype_index step consumes this binding to feed
+    rype the feature-keyed chunks. It must point at the same on-disk dir
+    `register-files` registers as the multi-file `reference_sequence_chunks`
+    DuckLake table — and it must be read BEFORE register-files, which MOVES
+    those part files into permanent storage."""
+    outputs = _run(_inputs(**staging_inputs), tmp_path / "ws")
+    chunks = outputs["reference_sequence_chunks"]
+    assert chunks == outputs["staging_dir"] / "reference_sequence_chunks"
+    assert chunks.is_dir()
+    assert sorted(chunks.glob("part_*.parquet")), "binding must point at the part files"
+
+
 def test_emits_reference_membership_with_reference_idx(staging_inputs, tmp_path):
     """reference_membership.parquet ties every feature_idx to this run's
     reference_idx — one row per minted feature."""

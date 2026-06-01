@@ -40,6 +40,14 @@ sudo bash -c 'grep -q "^SLURM_NATIVE_PYTHON=" /etc/qiita/compute-orchestrator.en
 sudo bash -c 'grep -q "^SLURM_QOS=" /etc/qiita/compute-orchestrator.env || echo "SLURM_QOS=qiita_norm" >> /etc/qiita/compute-orchestrator.env'                      # (#57)
 sudo bash -c 'grep -q "^QIITA_CP_URL=" /etc/qiita/compute-orchestrator.env || echo "QIITA_CP_URL=https://qiita-miint.ucsd.edu" >> /etc/qiita/compute-orchestrator.env'   # (#57)
 sudo bash -c 'grep -q "^QIITA_IMAGES_DIR=" /etc/qiita/compute-orchestrator.env || echo "QIITA_IMAGES_DIR=/scratch/persistent/images" >> /etc/qiita/compute-orchestrator.env'   # (#62) abs dir, visible from every compute node; validated at CO boot when COMPUTE_BACKEND=slurm
+# (#70) SHARED_FILESYSTEM_ROOT — UNLIKE the rest of this bucket it is NOT fail-fast
+# (it has a dev default of $TMPDIR/qiita), so a missing value does NOT keep the unit
+# down — it silently defaults. It MUST be set to the shared scratch root (same FS as
+# the roots shown by the grep above): build_rype_index writes the rype .ryxdi under
+# {SHARED_FILESYSTEM_ROOT}/references/{idx}/rype/ and the orchestrator propagates this
+# value into each SLURM job env, so an unset value lands the index in node-local /tmp,
+# invisible to the CP. Guarded append won't clobber an existing first-deploy value.
+sudo bash -c 'grep -q "^SHARED_FILESYSTEM_ROOT=" /etc/qiita/compute-orchestrator.env || echo "SHARED_FILESYSTEM_ROOT=<scratch>/qiita" >> /etc/qiita/compute-orchestrator.env'   # (#70)
 ```
 
 ### 2. One-time host setup
@@ -101,7 +109,7 @@ sudo SKIP_PULL=1 QIITA_HOSTNAME=qiita-miint.ucsd.edu /home/qiita/qiita-miint/dep
 # [admin]
 curl -fsS https://qiita-miint.ucsd.edu/health                                  # CP+CO+DP aggregate + per-service pills (#58/#54)
 sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
-    psql "$DATABASE_URL" -c "SELECT action_id, version, enabled FROM qiita.action ORDER BY action_id;"'   # bcl-convert 1.0.0 enabled (#62)
+    psql "$DATABASE_URL" -c "SELECT action_id, version, enabled FROM qiita.action ORDER BY action_id;"'   # bcl-convert 1.0.0 (#62) + host-reference-add 1.0.0 (#70) enabled
 systemctl cat qiita-control-plane qiita-compute-orchestrator | grep UMask      # UMask=0007 dropins (#57)
 sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; qiita-admin compute-readiness'   # (#57)
 ```
@@ -114,6 +122,7 @@ sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; 
 - (#62) bcl-convert FASTQ output is large — a busy NovaSeq X lane can reach multiple TB. Size per-ticket scratch generously; the orchestrator does not pre-allocate, so disk-full mid-run surfaces as a SLURM job failure. Confirm exact per-instrument sizing against a real run before relying on a figure. Supported instruments: NovaSeq 6000, NovaSeq X, iSeq.
 - (#63) `reference load` moved from `qiita-admin` to the `qiita` end-user CLI (it's a credentialed API call, not a host operation). Retarget any `qiita-admin reference load` scripts to `qiita reference load`.
 - (#64) Interactive API docs now served from this origin: `/docs` (Swagger UI), `/redoc` (ReDoc), `/openapi.json`. No deploy action — assets ride the wheel; restart picks them up.
+- (#70) Host references (additive, no client action): `qiita.reference` gains `is_host` and a new `indexing` status (`loading → indexing → active`); new read endpoints `GET /reference` (list, filterable) and `GET /reference/{idx}/index`. The `host-reference-add` workflow is a new `workflows/` entry synced into `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (verify in bucket 5) — no migration. The three `20260601*` reference migrations apply via the standard bucket-3 `make migrate` (the activate.sh guard enforces they're applied before restart). The rype `.ryxdi` index directory is `mkdir`'d at runtime under `SHARED_FILESYSTEM_ROOT` — no manual dir step.
 
 ---
 
