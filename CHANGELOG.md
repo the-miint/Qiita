@@ -28,6 +28,9 @@ the `no-changelog` label).
   from the landing page and served from vendored assets (no CDN) (#64)
 - `changelog-check` CI gate requiring every PR to record its change here (opt
   out with the `no-changelog` label) (#65)
+- `matrix_tube_id` column on biosample with digit-only format and uniqueness
+  constraints, exposed via the biosample REST routes and the
+  `qiita biosample create --matrix-tube-id` CLI flag (#68)
 
 ### Changed
 
