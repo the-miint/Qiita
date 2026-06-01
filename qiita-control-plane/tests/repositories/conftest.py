@@ -33,6 +33,7 @@ from qiita_control_plane.testing.db_seeds import (
     seed_prep_sample_global_field,
     seed_sequenced_prep_sample,
 )
+from qiita_control_plane.testing.unique_names import unique_field_name
 
 # ---------------------------------------------------------------------------
 # Pool-based seed helpers (Pattern 2 — committed rows, FK-reverse cleanup)
@@ -84,21 +85,6 @@ async def _seed_metadata_checklist(pool, name):
         "INSERT INTO qiita.metadata_checklist (name) VALUES ($1) RETURNING idx",
         name,
     )
-
-
-# ---------------------------------------------------------------------------
-# Unique-name helpers
-# ---------------------------------------------------------------------------
-
-
-def _unique_field_name(prefix: str = "owner_biosample_id") -> str:
-    """Return prefix + '_' + 8 hex chars; collision-resistant across re-runs."""
-    return f"{prefix}_{secrets.token_hex(4)}"
-
-
-def _unique_accession(prefix: str = "BS") -> str:
-    """Return prefix + '-' + 8 hex chars; for biosample/ENA accession columns."""
-    return f"{prefix}-{secrets.token_hex(4)}"
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +300,7 @@ async def _create_biosample_with_link(ctx):
 
 async def _create_local_field(ctx, suffix=""):
     """Helper: create a purely-local biosample_study_field, track for cleanup."""
-    field_name = f"{_unique_field_name()}_{suffix}"
+    field_name = f"{unique_field_name()}_{suffix}"
     async with ctx["pool"].acquire() as conn:
         async with conn.transaction():
             idx, _, _ = await _get_or_create_local_study_field(
