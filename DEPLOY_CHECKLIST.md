@@ -56,8 +56,11 @@ sudo install -d -o qiita-data -g qiita-pipeline -m 2770 "$scratch/staging"
 
 # (#72) Images tier: point <derived>/images at the existing SIF dir. If the old
 # QIITA_IMAGES_DIR was already /scratch/persistent/images and PATH_DERIVED is
-# /scratch/persistent, this is a no-op. Otherwise move it:   [admin]
-#   sudo mv <old-images-dir> "$(sudo grep '^PATH_DERIVED=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)/images"
+# /scratch/persistent, this is a no-op. Otherwise move it, then assert the
+# first-deploy §0.3 perms (qiita-orch:qiita-orch 0755):   [admin]
+#   images="$(sudo grep '^PATH_DERIVED=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)/images"
+#   sudo mv <old-images-dir> "$images"
+#   sudo chown qiita-orch:qiita-orch "$images" && sudo chmod 0755 "$images"
 
 # (#72) ⚠️ DuckLake lake data — the ONLY durable state here. The DP derives the
 # data path as PATH_PERSISTENT/ducklake; DuckLake pins the data_path into its
@@ -67,11 +70,17 @@ sudo install -d -o qiita-data -g qiita-pipeline -m 2770 "$scratch/staging"
 #   2. old=<existing DUCKLAKE_DATA_PATH value from bucket-1 grep>; new="$(sudo grep '^PATH_PERSISTENT=' /etc/qiita/data-plane.env | tail -1 | cut -d= -f2-)/ducklake"
 #   3. sudo install -d -o qiita-data -g qiita-data -m 0750 "$(dirname "$new")"
 #      sudo mv "$old" "$new"      # if same filesystem; else rsync then remove
-#   4. Repoint the catalog's pinned data_path from "$old" to "$new". VALIDATE the
-#      exact mechanism against a COPY of the catalog first — whether DuckLake
-#      stores per-file paths absolute or relative to data_path determines
-#      whether the mv alone suffices or the catalog rows also need rewriting.
-#      Do not run this against the live catalog until confirmed on a copy.
+#   4. Repoint the catalog's pinned data_path from "$old" to "$new". The catalog
+#      lives in the Postgres named by the DP's DUCKLAKE_CATALOG_CONNSTR; inspect
+#      its `ducklake_*` tables to determine BEFORE touching prod whether
+#      data-file paths are stored relative to the data_path (then updating the
+#      stored data_path is enough) or absolute (then the per-file path rows must
+#      also be rewritten from "$old" to "$new"). DuckLake compares the stored
+#      data_path on attach, so a bare filesystem mv without this step yields
+#      "path mismatch". VALIDATE the exact statements against a COPY of the
+#      catalog (pg_dump → restore to a scratch DB, point a throwaway DP at it,
+#      confirm a DoGet) — do NOT run them against the live catalog until the
+#      copy proves clean. ⚠️ This is the one irreversible step in the deploy.
 #   5. The DP restarts in bucket 4; confirm a DoGet in bucket 5 before declaring success.
 ```
 

@@ -94,10 +94,16 @@ class SlurmSettings:
 class Settings:
     backend_type: str
     # Shared scratch base root (PATH_SCRATCH). The readiness probe checks
-    # it for writability; the control plane derives PATH_SCRATCH/ticket
-    # (the per-ticket workspace SLURM jobs run in) from the same value, so
-    # set PATH_SCRATCH identically across all three env files. Optional in
-    # dev — falls back to $TMPDIR/qiita.
+    # PATH_SCRATCH/ticket for writability; the control plane derives the same
+    # PATH_SCRATCH/ticket (the per-ticket workspace SLURM jobs run in), so set
+    # PATH_SCRATCH identically across all three env files. Optional in dev —
+    # falls back to $TMPDIR/qiita. Deliberately NOT validated as absolute here
+    # (unlike the CP/DP, which require + assert absolute): the orchestrator
+    # never mints under this path itself — the CP creates the per-ticket
+    # subdir and POSTs the absolute path to the CO — so the value only feeds
+    # the diagnostic readiness probe. The CP's own absolute check is the
+    # fail-fast that matters; this mirrors main's prior SHARED_FILESYSTEM_ROOT
+    # posture.
     path_scratch: str
     # The shared bearer token CP-to-CO calls present. Loaded from a file
     # in production; env-var fallback only when QIITA_ALLOW_TOKEN_ENV=true.

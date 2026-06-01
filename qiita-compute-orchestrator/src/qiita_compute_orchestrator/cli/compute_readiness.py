@@ -259,6 +259,9 @@ else
     echo "{_PROBE_LINE_PREFIX} native-import=fail"
 fi
 
+# The `/ticket` leaf must match the control plane's PATH_SCRATCH/ticket
+# derivation (qiita_control_plane.config.Settings.from_env) — that's the
+# per-ticket workspace SLURM jobs actually run in.
 SF="${{PATH_SCRATCH:-{sf_default}}}/ticket"
 if [ -d "$SF" ]; then
     echo "{_PROBE_LINE_PREFIX} shared-fs-visible=ok path=$SF"
