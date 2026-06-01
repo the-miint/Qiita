@@ -13,18 +13,8 @@ ALTER TABLE qiita.biosample
     ADD CONSTRAINT biosample_matrix_tube_id_format
         CHECK (matrix_tube_id IS NULL OR matrix_tube_id ~ '^[0-9]+$');
 
--- When the fixed width is known, uncomment the constraint below to catch
--- integer-round-trip bugs: a value silently parsed to int and re-rendered
--- loses its leading zeros and is then shorter than the expected width, so
--- a length check rejects it at write time. Replace N with the width.
--- ALTER TABLE qiita.biosample
---     ADD CONSTRAINT biosample_matrix_tube_id_width
---         CHECK (matrix_tube_id IS NULL OR length(matrix_tube_id) = N);
-
 -- migrate:down
 
-ALTER TABLE qiita.biosample
-    DROP CONSTRAINT IF EXISTS biosample_matrix_tube_id_width;
 ALTER TABLE qiita.biosample
     DROP CONSTRAINT IF EXISTS biosample_matrix_tube_id_format;
 ALTER TABLE qiita.biosample

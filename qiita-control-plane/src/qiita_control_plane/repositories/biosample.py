@@ -135,11 +135,9 @@ async def update_biosample(
     and an empty dict raise ValueError. Returns the same column set
     as fetch_biosample via UPDATE ... RETURNING, or None when no row
     matches `biosample_idx` (possible even after a passing preflight:
-    READ COMMITTED snapshots are per-statement). Raises
-    asyncpg.UniqueViolationError on accession collisions,
-    asyncpg.ForeignKeyViolationError on a bad metadata_checklist_idx
-    or owner_idx, and asyncpg.RaiseError when owner_idx resolves to
-    a non-user principal.
+    READ COMMITTED snapshots are per-statement).
+
+    Raises asyncpg.PostgresError on FK violation or constraint failure.
     """
     validate_patch_fields(
         fields, allowlist=BIOSAMPLE_PATCHABLE_COLUMNS, repo_name="update_biosample"
@@ -247,11 +245,8 @@ async def fetch_biosample_idxs_by_natural_key(
     column.
 
     Values absent from the table or carried only by retired rows are
-    omitted from the returned map; the route layer surfaces them as the
-    `missing` list. Used by the bulk-lookup endpoints (e.g. the bundled
-    qiita submit-bcl-convert flow calls the accession variant to
-    translate preflight biosample_accession values into the
-    biosample_idx the sequenced-sample composer requires).
+    omitted from the returned map, so a caller can detect misses by
+    set-difference against the input `values`.
     """
     if not values:
         return {}

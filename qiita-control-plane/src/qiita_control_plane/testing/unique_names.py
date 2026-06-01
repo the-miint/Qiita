@@ -1,8 +1,7 @@
 """Unique-value generators for test data.
 
 Each helper returns a fresh, collision-resistant string for a specific
-column. Tests use these to seed rows that must not collide across
-re-runs or with rows seeded by sibling tests in the same suite.
+column.
 """
 
 import secrets
