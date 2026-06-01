@@ -13,9 +13,6 @@ the `no-changelog` label).
 
 ## [Unreleased]
 
-<!-- (#70) is a placeholder PR number for the host-reference-filtering branch;
-     confirm/replace when the PR is opened (68, 69 currently open). -->
-
 ### Added
 
 - Host references for host-read filtering: `is_host` column on `qiita.reference`,
