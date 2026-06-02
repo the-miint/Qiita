@@ -260,7 +260,7 @@ async def patch_study(
     `updated_at` column; format mirrors the GET endpoint's contract
     and is opaque to clients.
     """
-    # Missing If-Match is 428 before any DB work runs.
+    # Missing If-Match -> 428.
     require_if_match(if_match)
     assert if_match is not None  # narrows for the type checker after the guard above
 
