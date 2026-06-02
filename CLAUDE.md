@@ -79,13 +79,15 @@ The wire validator enforces shape only (exactly-one). The module-prefix invarian
 
 Container steps declare a bare SIF filename in `container:` (e.g. `bcl-convert-4.5.4.sif`). The orchestrator joins this against `Settings.path_derived_images` (derived as `PATH_DERIVED/images`; `PATH_DERIVED` env var required when `COMPUTE_BACKEND=slurm`) to resolve the absolute SIF path. Registry-URL forms with `://` pass through; anything else with a path separator → `CONTRACT_VIOLATION`.
 
-After editing a workflow YAML or its container artifacts (`workflows/<workflow>/Apptainer.def`, `entrypoint.sh`, or the shared `workflows/_shared/manifest_writer.py`):
+**One generic builder, declarative per-workflow spec.** `scripts/build-sif.sh <workflow>` is the *only* SIF build script. A container workflow opts in by adding a `workflows/<workflow>/sif-build.env` (`SIF_FILENAME`, optional `SOURCES`, `VERIFY_CMD`, `VERIFY_MATCH`) — never a per-workflow build script, and never stage build inputs into the checkout. The builder stages into a temp build root **owned by the invoking user** and only ever *reads* the checkout, so a locked-down service account (e.g. `qiita-orch`) can build without write access to the qiita-owned `/home/qiita` checkout. A CI guard (`qiita-compute-orchestrator/tests/test_sif_build_spec.py`, under `make test`) forbids `scripts/build-*-sif.sh`, requires each `sif-build.env` to be complete, and asserts `SIF_FILENAME` matches the workflow YAML's `container:` value.
+
+After editing a workflow YAML or its container artifacts (`workflows/<workflow>/Apptainer.def`, `entrypoint.sh`, `sif-build.env`, or the shared `workflows/_shared/manifest_writer.py`):
 
 These steps run on the **Linux deploy host** — they need `apptainer` (to build the SIF) and `systemd` (to restart the services), so they don't apply on a macOS dev box (mirrors `make test-workflows`, which skips gracefully off Linux). On macOS, edit the artifacts and run the unit tests; the SIF rebuild + restart happen at deploy time on the host.
 
 ```bash
-# Rebuild the SIF (idempotent — skips when the existing SIF already reports the target version).
-bash scripts/build-<workflow>-sif.sh
+# Rebuild the SIF (idempotent — skips when the existing SIF already satisfies the spec's VERIFY_MATCH).
+PATH_DERIVED=<derived> bash scripts/build-sif.sh <workflow>
 make deploy
 sudo systemctl restart qiita-control-plane qiita-compute-orchestrator
 make verify-health
