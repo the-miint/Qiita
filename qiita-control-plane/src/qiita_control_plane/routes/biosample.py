@@ -87,6 +87,7 @@ from ._helpers import (
     detail_for_slot_collision,
     etag_for_updated_at,
     raise_for_transient_write_race,
+    raise_for_unique_violation,
 )
 
 router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["biosample"])
@@ -248,8 +249,11 @@ async def import_biosample(
                 ),
             )
         except asyncpg.UniqueViolationError as exc:
-            detail = _UNIQUE_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_UNIQUE_VIOLATION)
-            raise HTTPException(status_code=409, detail=detail)
+            raise_for_unique_violation(
+                exc,
+                constraint_messages=_UNIQUE_VIOLATION_MESSAGES,
+                generic=_GENERIC_UNIQUE_VIOLATION,
+            )
         except asyncpg.ForeignKeyViolationError as exc:
             detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, GENERIC_FK_VIOLATION)
             raise HTTPException(status_code=422, detail=detail)
@@ -639,8 +643,11 @@ async def patch_biosample(
                 conn, spec=BIOSAMPLE_METADATA_SPEC, entity_idx=biosample_idx
             )
         except asyncpg.UniqueViolationError as exc:
-            detail = _UNIQUE_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_UNIQUE_VIOLATION)
-            raise HTTPException(status_code=409, detail=detail)
+            raise_for_unique_violation(
+                exc,
+                constraint_messages=_UNIQUE_VIOLATION_MESSAGES,
+                generic=_GENERIC_UNIQUE_VIOLATION,
+            )
         except asyncpg.ForeignKeyViolationError as exc:
             detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, GENERIC_FK_VIOLATION)
             raise HTTPException(status_code=422, detail=detail)

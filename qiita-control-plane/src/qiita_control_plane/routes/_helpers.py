@@ -43,6 +43,22 @@ def _attempted_label(value: object) -> str:
 GENERIC_FK_VIOLATION = "references a row that does not exist"
 
 
+def raise_for_unique_violation(
+    exc: asyncpg.UniqueViolationError,
+    *,
+    constraint_messages: dict[str, str],
+    generic: str,
+) -> None:
+    """Translate a UNIQUE-constraint violation into a 409 response.
+
+    Looks up `exc.constraint_name` against `constraint_messages`; an
+    unknown name yields `generic` as the detail. Never returns; always
+    raises HTTPException.
+    """
+    detail = constraint_messages.get(exc.constraint_name, generic)
+    raise HTTPException(status_code=409, detail=detail)
+
+
 def etag_for_updated_at(updated_at: datetime) -> str:
     """Build the quoted ETag header value from a row's updated_at timestamp.
 

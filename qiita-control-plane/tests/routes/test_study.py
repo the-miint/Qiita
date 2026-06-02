@@ -404,6 +404,52 @@ async def test_post_study_pi_idx_is_service_account_422(ctx):
     )
 
 
+async def test_post_study_duplicate_ebi_accession_409(ctx):
+    """Tests the case where two POSTs supply the same non-null
+    ebi_study_accession: the second trips the
+    study_ebi_study_accession_unique constraint and the route maps it
+    to 409 with the per-column detail."""
+    shared_accession = f"ERP{secrets.token_hex(4)}"
+
+    first = await _post_study(
+        ctx["user"],
+        ctx,
+        title=_unique_title("dup-first"),
+        ebi_study_accession=shared_accession,
+    )
+    assert first.status_code == 201, first.text
+
+    resp = await _post_study(
+        ctx["user"],
+        ctx,
+        title=_unique_title("dup-second"),
+        ebi_study_accession=shared_accession,
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"] == "ebi_study_accession already in use"
+
+
+async def test_post_study_two_null_ebi_accessions_both_succeed(ctx):
+    """Tests the case where two POSTs both omit ebi_study_accession:
+    Postgres UNIQUE treats NULLs as distinct, so two NULLs do not
+    collide."""
+    first = await _post_study(
+        ctx["user"],
+        ctx,
+        title=_unique_title("null-first"),
+    )
+    assert first.status_code == 201, first.text
+    assert first.json()["ebi_study_accession"] is None
+
+    second = await _post_study(
+        ctx["user"],
+        ctx,
+        title=_unique_title("null-second"),
+    )
+    assert second.status_code == 201, second.text
+    assert second.json()["ebi_study_accession"] is None
+
+
 # ===========================================================================
 # GET /api/v1/study/{study_idx} — wiring tests
 # ===========================================================================

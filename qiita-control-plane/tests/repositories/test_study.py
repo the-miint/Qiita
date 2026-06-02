@@ -437,6 +437,42 @@ async def test_create_study_outside_transaction_raises(postgres_pool):
             )
 
 
+async def test_create_study_duplicate_ebi_accession_raises_unique_error(postgres_pool):
+    """Tests the case where two studies attempt the same non-null
+    ebi_study_accession: the second create trips the
+    study_ebi_study_accession_unique constraint and surfaces as
+    asyncpg.UniqueViolationError. The route layer maps this to 409."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            shared_accession = f"ERP{secrets.token_hex(4)}"
+
+            # First study claims the accession.
+            await create_study(
+                conn,
+                owner_idx=owner,
+                created_by_idx=owner,
+                title=_suffix("dup-first"),
+                ebi_study_accession=shared_accession,
+            )
+
+            with pytest.raises(
+                asyncpg.UniqueViolationError,
+                match="study_ebi_study_accession_unique",
+            ):
+                await create_study(
+                    conn,
+                    owner_idx=owner,
+                    created_by_idx=owner,
+                    title=_suffix("dup-second"),
+                    ebi_study_accession=shared_accession,
+                )
+        finally:
+            await tr.rollback()
+
+
 # ---------------------------------------------------------------------------
 # fetch_study_exists
 # ---------------------------------------------------------------------------

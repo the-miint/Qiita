@@ -27,7 +27,7 @@ from ..auth.guards import (
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
 from ..repositories.study import create_study, fetch_study
-from ._helpers import GENERIC_FK_VIOLATION
+from ._helpers import GENERIC_FK_VIOLATION, raise_for_unique_violation
 
 router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["study"])
 
@@ -38,6 +38,13 @@ _MSG_ON_BEHALF_REQUIRES_WET_LAB_ADMIN = (
 _MSG_OWNER_NOT_ELIGIBLE = "owner is not eligible to own studies"
 _MSG_BAD_PI_NOT_USER = "principal_investigator_idx must reference a user-kind principal"
 _MSG_BAD_OWNER_NOT_USER = "owner_idx must reference a user-kind principal"
+
+# Keys must mirror constraint names from db/migrations/; drift falls
+# through to _GENERIC_UNIQUE_VIOLATION.
+_UNIQUE_VIOLATION_MESSAGES: dict[str, str] = {
+    "study_ebi_study_accession_unique": "ebi_study_accession already in use",
+}
+_GENERIC_UNIQUE_VIOLATION = "conflicts with an existing study"
 
 
 def _study_response_from_row(row: asyncpg.Record) -> StudyResponse:
@@ -109,7 +116,7 @@ async def create_study_route(
             detail=_MSG_OWNER_NOT_ELIGIBLE,
         )
 
-        # Map known FK / trigger violations to user-friendly 422 responses.
+        # Map known FK / trigger / unique violations to user-friendly responses.
         try:
             row = await create_study(
                 conn,
@@ -125,6 +132,12 @@ async def create_study_route(
                 notes=body.notes,
                 extra_metadata=body.extra_metadata,
                 default_tier=body.default_tier,
+            )
+        except asyncpg.UniqueViolationError as exc:
+            raise_for_unique_violation(
+                exc,
+                constraint_messages=_UNIQUE_VIOLATION_MESSAGES,
+                generic=_GENERIC_UNIQUE_VIOLATION,
             )
         except asyncpg.ForeignKeyViolationError:
             raise HTTPException(status_code=422, detail=GENERIC_FK_VIOLATION)

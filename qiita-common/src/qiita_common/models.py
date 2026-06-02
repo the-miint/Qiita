@@ -515,8 +515,8 @@ class BiosampleImportRequest(BaseModel):
     owner_biosample_id_value: str = Field(min_length=1)
     metadata: dict[str, str] = Field(default_factory=dict)
     metadata_checklist_idx: Annotated[int, Field(gt=0)] | None = None
-    biosample_accession: str | None = None
-    ena_sample_accession: str | None = None
+    biosample_accession: str | None = Field(default=None, min_length=1)
+    ena_sample_accession: str | None = Field(default=None, min_length=1)
     matrix_tube_id: Annotated[
         str | None,
         Field(pattern=MATRIX_TUBE_ID_PATTERN),
@@ -750,8 +750,8 @@ class BiosamplePatchRequest(PatchRequestModel):
 
     metadata_checklist_idx: Annotated[int, Field(gt=0)] | None = None
     owner_idx: Annotated[int, Field(gt=0)] | None = None
-    biosample_accession: str | None = None
-    ena_sample_accession: str | None = None
+    biosample_accession: str | None = Field(default=None, min_length=1)
+    ena_sample_accession: str | None = Field(default=None, min_length=1)
     matrix_tube_id: Annotated[
         str | None,
         Field(pattern=MATRIX_TUBE_ID_PATTERN),
@@ -816,7 +816,9 @@ class StudyCreate(BaseModel):
     description: str | None = None
     abstract: str | None = None
     funding: str | None = Field(default=None, max_length=_STUDY_FUNDING_MAX)
-    ebi_study_accession: str | None = Field(default=None, max_length=_STUDY_ACCESSION_MAX)
+    ebi_study_accession: str | None = Field(
+        default=None, min_length=1, max_length=_STUDY_ACCESSION_MAX
+    )
     notes: str | None = None
     extra_metadata: dict[str, object] | None = None
     default_tier: Tier | None = None
