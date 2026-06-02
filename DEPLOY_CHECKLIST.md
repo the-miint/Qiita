@@ -11,7 +11,7 @@ Substitute your host's FQDN for the `qiita-miint.ucsd.edu` examples and `<scratc
 
 ## Pending deploy
 
-Nothing pending. Each PR folds its operator steps into the buckets below via `/deploy-note`; at deploy time buckets 1→5 run in order, with buckets 1–3 preceding the bucket-4 restart. Each step carries its source `(#N)` tag.
+Everything merged but not yet deployed. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
 
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
@@ -23,7 +23,27 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+```sql
+-- [admin] Pre-check before `make migrate`. The migration adds
+-- UNIQUE (ebi_study_accession) on qiita.study (NULLs distinct); if any
+-- two non-NULL rows share a value, `ADD CONSTRAINT UNIQUE` aborts and
+-- `dbmate` halts mid-deploy. Resolve any duplicates surfaced here
+-- (clear the dup on the row that should keep being unique, or pick
+-- one of the rows to retain the value) BEFORE running `make migrate`.
+-- An empty result means no duplicates; proceed straight to `make migrate`. (#TBD)
+SELECT ebi_study_accession, COUNT(*) AS dup_count, array_agg(idx ORDER BY idx) AS study_idxs
+  FROM qiita.study
+ WHERE ebi_study_accession IS NOT NULL
+ GROUP BY ebi_study_accession
+HAVING COUNT(*) > 1;
+```
+
+```bash
+# [operator] Same standing instructions as the archived 2026-06-01 deploy:
+# DATABASE_URL must be in your shell, pointing at the SAME DB as
+# control-plane.env. (#TBD)
+make -C ~/qiita-miint migrate
+```
 
 ### 4. Deploy
 
