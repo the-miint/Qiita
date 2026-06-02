@@ -30,7 +30,7 @@ _None yet._
 -- `dbmate` halts mid-deploy. Resolve any duplicates surfaced here
 -- (clear the dup on the row that should keep being unique, or pick
 -- one of the rows to retain the value) BEFORE running `make migrate`.
--- An empty result means no duplicates; proceed straight to `make migrate`. (#TBD)
+-- An empty result means no duplicates; proceed straight to `make migrate`. (#74)
 SELECT ebi_study_accession, COUNT(*) AS dup_count, array_agg(idx ORDER BY idx) AS study_idxs
   FROM qiita.study
  WHERE ebi_study_accession IS NOT NULL
@@ -41,7 +41,7 @@ HAVING COUNT(*) > 1;
 ```bash
 # [operator] Same standing instructions as the archived 2026-06-01 deploy:
 # DATABASE_URL must be in your shell, pointing at the SAME DB as
-# control-plane.env. (#TBD)
+# control-plane.env. (#74)
 make -C ~/qiita-miint migrate
 ```
 

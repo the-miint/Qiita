@@ -776,7 +776,7 @@ async def test_patch_study_mismatched_if_match_412(ctx):
 
 async def test_patch_study_missing_if_match_428(ctx):
     """Tests the case where the caller omits the If-Match header.
-    require_if_match raises 428 before any DB lookup."""
+    require_if_match raises 428 once the auth and existence gates pass."""
     create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-428"))
     assert create_resp.status_code == 201, create_resp.text
     study_idx = create_resp.json()["study_idx"]

@@ -239,7 +239,8 @@ async def patch_study(
     404 on a non-existent study_idx (the access guard's bypass path returns
     without any DB lookup, so it cannot surface that 404 on its own).
 
-    If-Match is required: missing -> 428, mismatch -> 412. The body's
+    Once the scope, existence, and access gates above pass, If-Match
+    is required: missing -> 428, mismatch -> 412. The body's
     editable fields are validated by StudyPatchRequest (extra=forbid
     rejects immutable / system-managed columns with 422; an empty body
     is also 422; explicit-null title is 422). Inside one connection-
