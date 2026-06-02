@@ -577,9 +577,7 @@ async def patch_biosample(
         "would 500 after SELECT FOR UPDATE + UPDATE commits (see docstring)"
     )
 
-    # Missing If-Match is 428 before any DB work runs.
-    require_if_match(if_match)
-    assert if_match is not None  # narrows for the type checker after the guard above
+    if_match = require_if_match(if_match)
 
     # Build the column-keyed write set from the model's set fields so the
     # repository sees only what the caller explicitly included; explicit

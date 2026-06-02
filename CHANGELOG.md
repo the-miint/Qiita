@@ -15,6 +15,15 @@ the `no-changelog` label).
 
 ### Added
 
+- Host references for host-read filtering: `is_host` column on `qiita.reference`,
+  the `reference_index` table tracking built indexes, an `indexing` reference
+  status (`loading → indexing → active`), and the `host-reference-add` workflow
+  that builds a rype `.ryxdi` negative-filter index (`build_rype_index` native
+  job + `register-index` library action) (#70)
+- `GET /reference` (list; filter by `kind` / `is_host` / `status`) and
+  `GET /reference/{reference_idx}/index` (list a reference's built indexes) (#70)
+- `qiita reference load --host` — create a host reference (or bind an existing
+  one) and run `host-reference-add`; requires `--taxonomy` (#70)
 - Arrow Flight DoPut upload domain + chunked reference-load pipeline (#49)
 - Support for known-missing and terminology-term metadata values (#56)
 - `/health` aggregator probing CP + CO + DP with cached aggregation, a
@@ -43,6 +52,10 @@ the `no-changelog` label).
 
 ### Changed
 
+- The SLURM backend now propagates `PATH_SCRATCH` into the compute-node job
+  environment, so native steps that derive a persistent path from it (e.g.
+  `build_rype_index` writing the rype `.ryxdi`) resolve the real scratch root
+  instead of the `$TMPDIR/qiita` default (#70)
 - Centralized all REST path string literals into `qiita-common`'s
   `api_paths.py` (closes #12) (#60)
 - Bumped the study / prep_sample identity sequence start to 25000 (#61)
@@ -71,6 +84,16 @@ the `no-changelog` label).
   (`BiosampleImportRequest`, `BiosamplePatchRequest`) and on
   `ebi_study_accession` (`StudyCreate`) so empty strings no longer reach
   the DB (#74)
+- SIF builds go through a single generic `scripts/build-sif.sh <workflow>`
+  driven by a declarative `workflows/<workflow>/sif-build.env`; replaces the
+  per-workflow `scripts/build-bcl-convert-sif.sh`. The builder stages into a
+  temp root owned by the invoking user (the checkout is read-only), so a
+  service account can build without write access to the qiita-owned checkout.
+  A `test_sif_build_spec.py` guard forbids per-workflow build scripts, requires
+  each spec to be complete, and asserts `SIF_FILENAME` matches the workflow
+  YAML's `container:`; `make test-workflows` builds a `_sif-build-smoke`
+  sentinel through `build-sif.sh` so the temp-root staging is covered against
+  real apptainer in CI (#75)
 
 ### Fixed
 

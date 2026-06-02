@@ -48,7 +48,7 @@ from qiita_common.models import (
 )
 
 from .actions.library import LIBRARY
-from .actions.reference import transition_reference_status
+from .actions.reference import ReferenceNotFound, transition_reference_status
 
 _log = logging.getLogger(__name__)
 
@@ -731,6 +731,58 @@ async def _consume_upload_handles(
 
 
 # =============================================================================
+# Reference-index resolution
+# =============================================================================
+
+
+async def _resolve_reference_index_path(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    reference_idx: int,
+    index_type: str,
+) -> str:
+    """Resolve the on-disk path of the newest `index_type` index for an
+    ACTIVE reference — the path a host-filter compute job is injected with
+    (rype's `negative_index` for host references).
+
+    `qiita.reference_index` has no UNIQUE(reference_idx, index_type) by design
+    (growing a reference appends a newer generation), so "newest wins":
+    ordered by created_at then reference_index_idx, both descending, so a
+    same-timestamp tie still resolves deterministically to the latest row.
+
+    Raises:
+      * ReferenceNotFound — the reference row doesn't exist.
+      * ValueError — the reference exists but isn't `active` (an index built
+        against a still-`indexing`/failed reference must not be served; the
+        build may be mid-flight), or no `index_type` index exists yet.
+
+    Not yet wired into a workflow: the host-filter *processing* workflow that
+    consumes it is out of scope. Defined here, alongside the runner's other
+    resolution helpers, so its contract is locked and tested ahead of that
+    work."""
+    status = await pool.fetchval(
+        "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
+    )
+    if status is None:
+        raise ReferenceNotFound(reference_idx)
+    if status != ReferenceStatus.ACTIVE.value:
+        raise ValueError(
+            f"reference {reference_idx} status is {status!r}, must be "
+            f"{ReferenceStatus.ACTIVE.value!r} to resolve its {index_type!r} index"
+        )
+    fs_path = await pool.fetchval(
+        "SELECT fs_path FROM qiita.reference_index"
+        " WHERE reference_idx = $1 AND index_type = $2"
+        " ORDER BY created_at DESC, reference_index_idx DESC"
+        " LIMIT 1",
+        reference_idx,
+        index_type,
+    )
+    if fs_path is None:
+        raise ValueError(f"reference {reference_idx} has no {index_type!r} index built yet")
+    return fs_path
+
+
+# =============================================================================
 # Dispatch helpers
 # =============================================================================
 
@@ -1048,6 +1100,23 @@ async def _dispatch_action(
             files=files,
             hmac_secret=hmac_secret,
             data_plane_url=data_plane_url,
+        )
+        return {}
+
+    if entry.name == LibraryPrimitive.REGISTER_INDEX:
+        # Native step outputs are paths (StepRunResponse.outputs is
+        # dict[str, str]), so build-rype-index can't hand back the build
+        # params as a dict binding — it writes a small meta JSON and exposes
+        # its path as `rype_index_meta`. Read it for index_type / fs_path /
+        # params (index_type comes from the builder, not hardcoded here).
+        meta_path = Path(bound["rype_index_meta"])
+        meta = json.loads(meta_path.read_text())
+        await LIBRARY[LibraryPrimitive.REGISTER_INDEX](
+            pool,
+            reference_idx=scope_target["reference_idx"],
+            index_type=meta["index_type"],
+            fs_path=meta["fs_path"],
+            params=meta["params"],
         )
         return {}
 

@@ -69,15 +69,14 @@ def etag_for_updated_at(updated_at: datetime) -> str:
     return f'"{updated_at.isoformat()}"'
 
 
-def require_if_match(if_match: str | None) -> None:
+def require_if_match(if_match: str | None) -> str:
     """Raise 428 when the caller did not send an If-Match header.
 
-    Every PATCH surface requires optimistic-concurrency control; routing
-    the 428 through this helper keeps the wording identical across
-    endpoints and makes the missing-header check unmissable.
-    """
+    All patching requires optimistic-concurrency control; routing
+    the 428 through this helper keeps the wording identical."""
     if if_match is None:
         raise HTTPException(status_code=428, detail="If-Match header required")
+    return if_match
 
 
 def require_etag_match(

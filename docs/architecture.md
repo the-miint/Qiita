@@ -293,12 +293,13 @@ All ID minting and membership management lives in the control plane (Postgres OL
 
 | Table | Key columns | Purpose |
 |---|---|---|
-| `reference` | `reference_idx` PK | Reference-level metadata: name, version, kind, creator, timestamps |
+| `reference` | `reference_idx` PK | Reference-level metadata: name, version, kind, `is_host`, status, creator, timestamps. `is_host` is orthogonal to `kind` — a host reference is still a `sequence_reference` but is used as a negative filter (see [Host references](#host-references)) |
 | `genome` | `genome_idx` PK | Genome provenance: source, source_id, timestamps |
 | `feature` | `feature_idx` PK | Feature identity: sequence_hash, timestamps |
 | `reference_membership` | `(reference_idx, feature_idx)` | Which features are in each reference version |
 | `feature_genome` | `(feature_idx, genome_idx)` | Feature-to-genome mapping |
 | `phylogeny_tip_feature` | `(reference_idx, node_index, feature_idx)` | Tip node → feature mapping for phylogeny traversal |
+| `reference_index` | `reference_index_idx` PK, `reference_idx` FK | Built search indexes for a reference: `(index_type, fs_path, params JSONB, created_at)`. No `UNIQUE(reference_idx, index_type)` — "growing" a reference appends a newer generation, newest wins. Today `index_type='rype'` (the `.ryxdi` host-filter index); future aligner indices can register here too |
 
 **Data plane (DuckLake):**
 
@@ -348,10 +349,20 @@ Aligner indices (minimap2 `.mmi`, bowtie2 `.bt2`) are built by the compute orche
 │   ├── index.1.bt2
 │   ├── index.2.bt2
 │   └── ...
+├── rype/
+│   └── index.ryxdi/     # miint rype minimizer index (a directory: manifest.toml + Parquet shards)
 └── metadata.json        # build provenance, aligner versions, parameters
 ```
 
-The control plane records which aligner indices exist for each reference version. Processing workflows reference aligner indices by `reference_idx` in their `params.json`. When a new reference version is cut, index building is submitted as a follow-up SLURM job through the orchestrator.
+The control plane records which indices exist for each reference version in the `reference_index` table (`index_type`, `fs_path`, build `params`). Processing workflows reference indices by `reference_idx` in their `params.json`. When a new reference version is cut, index building is submitted as a follow-up SLURM job through the orchestrator.
+
+The rype `.ryxdi` is the first index minted through this table. It follows the same per-reference `references/{reference_idx}/` subtree shown above, but its root is specifically the orchestrator's **`PATH_SCRATCH`** (the `build_rype_index` native job reads `get_settings().path_scratch`); the deploy may point `PATH_SCRATCH` at a different tier than the aligner-index `<persistent-tier-root>`, so don't assume the two roots are identical. The job writes the index (a directory, not a file) to `{PATH_SCRATCH}/references/{reference_idx}/rype/index.ryxdi`, then the `register-index` action records the row. Because that path is derived on the compute node, the SLURM backend propagates `PATH_SCRATCH` into the job env (otherwise it would resolve to the `$TMPDIR/qiita` default). The build manifest (buckets, k/w, salt) lives inside the `.ryxdi`; `reference_index.params` keeps only a small copy (`{k, w, bucket_name}`).
+
+#### Host references
+
+A **host reference** is an ordinary `sequence_reference` (`is_host = true`) used as a **negative filter**: at host-read-filtering time its rype index is passed as rype's `negative_index`, and reads matching it are removed. `is_host` is orthogonal to `kind` and is fixed at creation. **Taxonomy is required** for a host reference (it's the rype mapping authority's source; phylogeny is not required).
+
+Host references run a dedicated **`host-reference-add`** workflow (`workflows/host-reference-add/1.0.0.yaml`) — the `reference-add` steps (hash → mint → write-membership → load) plus a trailing `build_rype_index` (native step) → `register-files` → `register-index`. The status lifecycle gains an `indexing` state between `loading` and `active` (`loading → indexing → active`); the unchanged `reference-add` flow still goes `loading → active` directly. `build_rype_index` runs **before** `register-files` because `register-files` *moves* the feature-keyed `reference_sequence_chunks` staging files into permanent DuckLake storage, so the index build must read them from staging first. End users drive it with `qiita reference load --host --taxonomy …`.
 
 #### Bulk Reference Ingestion
 
@@ -949,6 +960,14 @@ test-workflows:
 	apptainer build --force /tmp/qiita-workflow-smoke.sif workflows/amplicon/Apptainer.def
 	apptainer exec /tmp/qiita-workflow-smoke.sif echo "hello world"
 	rm -f /tmp/qiita-workflow-smoke.sif
+	# Exercise scripts/build-sif.sh end-to-end against real apptainer via the
+	# _sif-build-smoke sentinel (no licensed artifact). Uses a throwaway
+	# PATH_DERIVED so the built SIF lands in a temp images/ dir. The trap
+	# removes it on success, failure, OR signal; set -e propagates a build
+	# failure as the recipe's exit status (no trailing `exit` tripwire).
+	set -e; smoke_derived=$$(mktemp -d); trap 'rm -rf "$$smoke_derived"' EXIT; \
+		mkdir -p "$$smoke_derived/images"; \
+		PATH_DERIVED="$$smoke_derived" bash scripts/build-sif.sh _sif-build-smoke
 
 test-integration: build-data-plane-debug build-integration $(DBMATE_BIN)
 	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \

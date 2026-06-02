@@ -260,9 +260,7 @@ async def patch_study(
     `updated_at` column; format mirrors the GET endpoint's contract
     and is opaque to clients.
     """
-    # Missing If-Match -> 428.
-    require_if_match(if_match)
-    assert if_match is not None  # narrows for the type checker after the guard above
+    if_match = require_if_match(if_match)
 
     # Build the column-keyed write set from the model's set fields so the
     # repository sees only what the caller explicitly included; explicit

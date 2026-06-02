@@ -110,6 +110,10 @@ class ReferenceStatus(StrEnum):
     HASHING = "hashing"
     MINTING = "minting"
     LOADING = "loading"
+    # `indexing` is entered only by the host-reference-add workflow, after
+    # `loading`, while the rype index is built. Regular references skip it
+    # (loading → active directly), so `loading` keeps both outgoing edges.
+    INDEXING = "indexing"
     ACTIVE = "active"
     FAILED = "failed"
 
@@ -203,6 +207,10 @@ class ReferenceCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
     kind: ReferenceKind
+    # Orthogonal to `kind`: a host reference is still a sequence_reference,
+    # but is used as a negative filter (reads matching it are removed). The
+    # rype index built for it is wired in as rype's `negative_index`.
+    is_host: bool = False
 
 
 class ReferenceResponse(BaseModel):
@@ -211,8 +219,26 @@ class ReferenceResponse(BaseModel):
     version: str
     kind: ReferenceKind
     status: ReferenceStatus
+    is_host: bool
     # `created_by_idx` is the canonical owner reference, FK to qiita.principal.
     created_by_idx: Annotated[int, Field(gt=0)]
+    created_at: AwareDatetime
+
+
+class ReferenceIndex(BaseModel):
+    """A built search index for a reference (e.g. a rype `.ryxdi` directory).
+
+    The control plane tracks *where* the index lives and *how* it was built;
+    the authoritative manifest (buckets, minimizer params, etc.) lives inside
+    the index artifact itself. Mirrors the `qiita.reference_index` row. There
+    may be more than one index per reference (different `index_type`, or — once
+    references can grow — newer generations of the same type)."""
+
+    reference_index_idx: Annotated[int, Field(gt=0)]
+    reference_idx: Annotated[int, Field(gt=0)]
+    index_type: str
+    fs_path: str
+    params: dict[str, Any]
     created_at: AwareDatetime
 
 
@@ -349,7 +375,15 @@ VALID_STATUS_TRANSITIONS: dict[ReferenceStatus, set[ReferenceStatus]] = {
     ReferenceStatus.PENDING: {ReferenceStatus.HASHING, ReferenceStatus.FAILED},
     ReferenceStatus.HASHING: {ReferenceStatus.MINTING, ReferenceStatus.FAILED},
     ReferenceStatus.MINTING: {ReferenceStatus.LOADING, ReferenceStatus.FAILED},
-    ReferenceStatus.LOADING: {ReferenceStatus.ACTIVE, ReferenceStatus.FAILED},
+    # `loading` keeps its direct `→ active` edge for regular references (which
+    # never build an index); the host-reference-add workflow instead routes
+    # `loading → indexing → active` while it builds the rype index.
+    ReferenceStatus.LOADING: {
+        ReferenceStatus.INDEXING,
+        ReferenceStatus.ACTIVE,
+        ReferenceStatus.FAILED,
+    },
+    ReferenceStatus.INDEXING: {ReferenceStatus.ACTIVE, ReferenceStatus.FAILED},
     # ACTIVE is a terminal success state. To remediate a broken active reference,
     # delete it and re-create. No direct transition to FAILED — that path is only
     # for in-progress references that encounter errors during ingestion.

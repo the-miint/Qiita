@@ -10,12 +10,14 @@ from typing import Literal, get_args
 
 import asyncpg
 
-# Tables that the shared update_row composer is allowed to target. The
-# table name is interpolated into the SQL, so the set is a closed
-# Literal — never widen by accepting caller input directly. The
-# runtime get_args() check inside update_row rejects any string the
-# Literal does not cover, since Python does not enforce Literal at
-# runtime on its own.
+# Tables that expose a PATCH route. The set is 1:1 with the tables
+# whose ETag is read from `updated_at`: a table that supports PATCH
+# exposes the matching ETag, and a table that does not is also not
+# ETag-readable. The table name is interpolated into the SQL, so the
+# set is a closed Literal — never widen by accepting caller input
+# directly. The runtime get_args() check inside each consumer rejects
+# any string the Literal does not cover, since Python does not enforce
+# Literal at runtime on its own.
 UpdatableTable = Literal["biosample", "study"]
 
 

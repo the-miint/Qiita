@@ -25,7 +25,7 @@ dependencies = [
     # biosample + bioproject info from the operator's preflight SQLite. SHA
     # pin matches the orchestrator (which calls `save_bclconvert_v1_csv`
     # from the same release) so a re-vendor is a coordinated bump;
-    # tests/integration/test_run_preflight_pin_parity.py enforces parity.
+    # an integration parity test enforces parity.
     "run-preflight @ git+https://github.com/the-miint/kl-run-preflight@0c476dfd9f1fd4b3b2bfc54e1b301e3c09cdc879",
 ]
 
