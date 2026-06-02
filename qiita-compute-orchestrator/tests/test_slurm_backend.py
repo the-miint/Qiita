@@ -54,7 +54,7 @@ def _make_backend(
     *,
     co_to_cp_token: str = "",
     cp_url: str = "",
-    shared_filesystem_root: str = "",
+    path_scratch: str = "",
 ) -> SlurmBackend:
     client = SlurmrestdClient(
         base_url="http://slurm-test:6820",
@@ -74,7 +74,7 @@ def _make_backend(
         job_timeout_seconds=60,
         co_to_cp_token=co_to_cp_token,
         cp_url=cp_url,
-        shared_filesystem_root=shared_filesystem_root,
+        path_scratch=path_scratch,
     )
 
 
@@ -374,22 +374,20 @@ async def test_run_step_omits_token_env_when_backend_has_no_tokens(jwt_path, bas
     assert "CO_TO_CP_TOKEN" not in env
     assert "QIITA_ALLOW_TOKEN_ENV" not in env
     assert "QIITA_CP_URL" not in env
-    # Likewise SHARED_FILESYSTEM_ROOT — only propagated when wired (below).
-    assert "SHARED_FILESYSTEM_ROOT" not in env
+    # Likewise PATH_SCRATCH — only propagated when wired (below).
+    assert "PATH_SCRATCH" not in env
 
 
 @pytest.mark.asyncio
-async def test_run_step_propagates_shared_filesystem_root_into_job_env(
-    jwt_path, baseline, tmp_path
-):
+async def test_run_step_propagates_path_scratch_into_job_env(jwt_path, baseline, tmp_path):
     """The compute-node native-step launcher calls `get_settings()`, whose
-    `shared_filesystem_root` falls back to a `/tmp/qiita` DEFAULT when the env
-    var is absent. Native jobs that derive a persistent path from it — notably
+    `path_scratch` falls back to a `/tmp/qiita` DEFAULT when `PATH_SCRATCH` is
+    absent. Native jobs that derive a persistent path from it — notably
     `build_rype_index`, which writes the `.ryxdi` to
-    `{SHARED_FILESYSTEM_ROOT}/references/{idx}/rype/index.ryxdi` — would
-    otherwise land their output in node-local /tmp, invisible to the CP. So the
-    backend must propagate the resolved value into the SLURM job env (the same
-    way it propagates QIITA_CP_URL — /etc/qiita is not visible from nodes)."""
+    `{PATH_SCRATCH}/references/{idx}/rype/index.ryxdi` — would otherwise land
+    their output in node-local /tmp, invisible to the CP. So the backend must
+    propagate the resolved value into the SLURM job env (the same way it
+    propagates QIITA_CP_URL — /etc/qiita is not visible from nodes)."""
     captured: dict[str, dict] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -404,7 +402,7 @@ async def test_run_step_propagates_shared_filesystem_root_into_job_env(
     backend = _make_backend(
         httpx.MockTransport(handler),
         jwt_path,
-        shared_filesystem_root="/scratch/persistent/qiita",
+        path_scratch="/scratch/persistent/qiita",
     )
     _write_completed_output(tmp_path)
 
@@ -418,7 +416,7 @@ async def test_run_step_propagates_shared_filesystem_root_into_job_env(
         baseline_resources=baseline,
     )
     env = dict(item.split("=", 1) for item in captured["payload"]["job"]["environment"])
-    assert env["SHARED_FILESYSTEM_ROOT"] == "/scratch/persistent/qiita"
+    assert env["PATH_SCRATCH"] == "/scratch/persistent/qiita"
 
 
 @pytest.mark.asyncio

@@ -37,13 +37,16 @@ the `no-changelog` label).
   from the landing page and served from vendored assets (no CDN) (#64)
 - `changelog-check` CI gate requiring every PR to record its change here (opt
   out with the `no-changelog` label) (#65)
+- `matrix_tube_id` column on biosample with digit-only format and uniqueness
+  constraints, exposed via the biosample REST routes and the
+  `qiita biosample create --matrix-tube-id` CLI flag (#68)
 
 ### Changed
 
-- The SLURM backend now propagates `SHARED_FILESYSTEM_ROOT` into the compute-node
-  job environment, so native steps that derive a persistent path from it (e.g.
-  `build_rype_index` writing the rype `.ryxdi`) resolve the real shared root
-  instead of the `/tmp/qiita` default (#70)
+- The SLURM backend now propagates `PATH_SCRATCH` into the compute-node job
+  environment, so native steps that derive a persistent path from it (e.g.
+  `build_rype_index` writing the rype `.ryxdi`) resolve the real scratch root
+  instead of the `$TMPDIR/qiita` default (#70)
 - Centralized all REST path string literals into `qiita-common`'s
   `api_paths.py` (closes #12) (#60)
 - Bumped the study / prep_sample identity sequence start to 25000 (#61)
@@ -53,6 +56,14 @@ the `no-changelog` label).
   `CHANGELOG.md` is now this per-change log (#65)
 - Scoped the `push` CI trigger to `main` so PR branches get a single
   `pull_request` run instead of duplicate push + PR runs (#65)
+- Restructured the filesystem env vars onto three base roots with derived
+  leaves: `WORK_TICKET_WORKSPACE_ROOT` + `SHARED_FILESYSTEM_ROOT` →
+  `PATH_SCRATCH/ticket`, `UPLOAD_STAGING_ROOT` → `PATH_SCRATCH/staging`,
+  `DUCKLAKE_DATA_PATH` → `PATH_PERSISTENT/ducklake`, and `QIITA_IMAGES_DIR`
+  → `PATH_DERIVED/images`. Operators now set `PATH_SCRATCH` /
+  `PATH_PERSISTENT` / `PATH_DERIVED`; the services derive the fixed
+  subdirs. Hard cutover — the old names are gone and boot fails fast until
+  the new ones are set (#73)
 
 ### Fixed
 
@@ -60,5 +71,9 @@ the `no-changelog` label).
   biosample routes (closes #45) (#59)
 - Closed deploy gaps surfaced by the first user-CLI fastq-to-parquet smoke
   test (#57)
+- Added a lightweight CP `/healthz` liveness route so `qiita-admin
+  compute-readiness` (and its SLURM probe) stops reporting a false 404 against
+  a healthy deploy — the checker hit `/healthz`, which the CP never served
+  (closes #67) (#69)
 
 [Unreleased]: https://github.com/the-miint/Qiita/commits/main

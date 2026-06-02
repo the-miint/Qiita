@@ -24,11 +24,11 @@ from qiita_control_plane.repositories._sample_helpers import (
 )
 from qiita_control_plane.repositories.biosample_metadata import BIOSAMPLE_METADATA_SPEC
 from qiita_control_plane.repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
+from qiita_control_plane.testing.unique_names import unique_field_name
 
 from .conftest import (
     _create_linked_entity_for_spec,
     _seed_global_field_for_spec,
-    _unique_field_name,
 )
 
 pytestmark = pytest.mark.db
@@ -69,7 +69,7 @@ async def test_propagate_link_upgrade_null_to_non_null_propagates_to_metadata(ct
             conn,
             spec=spec,
             study_idx=ctx["study_idx"],
-            display_name=_unique_field_name("upgrade"),
+            display_name=unique_field_name("upgrade"),
             created_by_idx=ctx["principal_idx"],
             data_type=FieldDataType.TEXT,
             required=False,
@@ -123,7 +123,7 @@ async def test_propagate_link_unlink_with_no_metadata_succeeds(ctx, spec):
             spec=spec,
             study_idx=ctx["study_idx"],
             global_field_idx=gf.idx,
-            display_name=_unique_field_name("unlink_empty"),
+            display_name=unique_field_name("unlink_empty"),
             created_by_idx=ctx["principal_idx"],
         )
     ctx["created"][_study_field_tracking_key(spec)].append(field_idx)
@@ -166,7 +166,7 @@ async def test_propagate_link_unlink_with_metadata_raises(ctx, spec):
             spec=spec,
             study_idx=ctx["study_idx"],
             global_field_idx=gf.idx,
-            display_name=_unique_field_name("unlink_full"),
+            display_name=unique_field_name("unlink_full"),
             created_by_idx=ctx["principal_idx"],
         )
         meta_idx = await _insert_metadata(
@@ -225,7 +225,7 @@ async def test_propagate_link_rebind_raises_unconditionally(ctx, spec):
             spec=spec,
             study_idx=ctx["study_idx"],
             global_field_idx=gf_a.idx,
-            display_name=_unique_field_name("rebind"),
+            display_name=unique_field_name("rebind"),
             created_by_idx=ctx["principal_idx"],
         )
     ctx["created"][_study_field_tracking_key(spec)].append(field_idx)

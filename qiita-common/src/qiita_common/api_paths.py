@@ -292,12 +292,18 @@ PATH_BIOSAMPLE_BY_IDX = "/{biosample_idx}"
 # resolved {accession: idx} map plus a missing[] list so the CLI can
 # fail-fast naming every miss without N round trips.
 PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
+# Bulk lookup of biosample_idx by matrix_tube_id; same body-vs-querystring
+# rationale as the accession variant.
+PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = "/lookup-by-matrix-tube-id"
 
 URL_BIOSAMPLE_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_BY_STUDY}"
 URL_BIOSAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}"
 URL_BIOSAMPLE_PREFIX = f"{API_PREFIX}{PATH_BIOSAMPLE_PREFIX}"
 URL_BIOSAMPLE_BY_IDX = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}"
 URL_BIOSAMPLE_LOOKUP_BY_ACCESSION = f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}"
+URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = (
+    f"{URL_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID}"
+)
 
 
 # =============================================================================

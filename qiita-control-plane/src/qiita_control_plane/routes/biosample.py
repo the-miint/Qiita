@@ -29,6 +29,7 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BY_STUDY,
     PATH_BIOSAMPLE_LIST_BY_STUDY,
     PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
+    PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
     PATH_BIOSAMPLE_PREFIX,
     PATH_STUDY_PREFIX,
 )
@@ -38,6 +39,8 @@ from qiita_common.models import (
     BiosampleImportResponse,
     BiosampleLookupByAccessionRequest,
     BiosampleLookupByAccessionResponse,
+    BiosampleLookupByMatrixTubeIdRequest,
+    BiosampleLookupByMatrixTubeIdResponse,
     BiosamplePatchRequest,
     BiosampleResponse,
     GlobalMetadataEntry,
@@ -66,8 +69,9 @@ from ..repositories._sample_helpers import (
     fetch_global_metadata,
 )
 from ..repositories.biosample import (
+    BiosampleLookupKey,
     fetch_biosample,
-    fetch_biosample_idxs_by_accession,
+    fetch_biosample_idxs_by_natural_key,
     fetch_biosample_idxs_for_study,
     fetch_caller_has_biosample_access,
     import_biosample_from_owner_biosample_id,
@@ -98,13 +102,22 @@ _MSG_OWNER_NOT_ELIGIBLE = "owner is not eligible to own biosamples"
 _UNIQUE_VIOLATION_MESSAGES: dict[str, str] = {
     "biosample_accession_unique": "biosample_accession already in use",
     "biosample_ena_sample_accession_unique": "ena_sample_accession already in use",
+    "biosample_matrix_tube_id_unique": "matrix_tube_id already in use",
 }
 _FK_VIOLATION_MESSAGES: dict[str, str] = {
     "biosample_metadata_checklist_idx_fkey": (
         "metadata_checklist_idx does not reference an existing checklist"
     ),
 }
+# CHECK-constraint-name → caller-facing detail for 422 responses. The
+# Pydantic models for matrix_tube_id should preempt this in practice, but
+# the DB CHECK is the last line of defense and a violation here surfaces
+# the same field-specific message a bypassed validator would have.
+_CHECK_VIOLATION_MESSAGES: dict[str, str] = {
+    "biosample_matrix_tube_id_format": ("matrix_tube_id must be a non-empty string of digits"),
+}
 _GENERIC_UNIQUE_VIOLATION = "conflicts with an existing biosample"
+_GENERIC_CHECK_VIOLATION = "violates a database constraint on biosample"
 
 
 @router.post(PATH_BIOSAMPLE_BY_STUDY, status_code=201)
@@ -153,6 +166,7 @@ async def import_biosample(
                 metadata_checklist_idx=body.metadata_checklist_idx,
                 biosample_accession=body.biosample_accession,
                 ena_sample_accession=body.ena_sample_accession,
+                matrix_tube_id=body.matrix_tube_id,
             )
         except BiosampleOwnerIdFieldCollisionError as exc:
             raise HTTPException(
@@ -239,6 +253,9 @@ async def import_biosample(
         except asyncpg.ForeignKeyViolationError as exc:
             detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, GENERIC_FK_VIOLATION)
             raise HTTPException(status_code=422, detail=detail)
+        except asyncpg.CheckViolationError as exc:
+            detail = _CHECK_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_CHECK_VIOLATION)
+            raise HTTPException(status_code=422, detail=detail)
 
     return BiosampleImportResponse(
         biosample_idx=result.biosample_idx,
@@ -320,6 +337,7 @@ def _biosample_response_from_row(
             "metadata_checklist_idx": row["metadata_checklist_idx"],
             "biosample_accession": row["biosample_accession"],
             "ena_sample_accession": row["ena_sample_accession"],
+            "matrix_tube_id": row["matrix_tube_id"],
             "last_submission_at": row["last_submission_at"],
             "submission_error": row["submission_error"],
             "last_metadata_change_at": row["last_metadata_change_at"],
@@ -422,6 +440,34 @@ async def get_biosample(
     )
 
 
+async def _resolve_biosample_idxs_by_natural_key(
+    pool: asyncpg.Pool,
+    *,
+    key: BiosampleLookupKey,
+    values: list[str],
+) -> tuple[dict[str, int], list[str]]:
+    """Shared dedup-and-fetch for the natural-key lookup endpoints.
+
+    Dedups `values` in input order, resolves the survivors via the named
+    column, and returns (resolved, missing). The two route wrappers
+    differ only in the per-key Pydantic request/response classes; this
+    helper carries the actual logic.
+    """
+    # Dedup while preserving input order so `missing` is deterministic
+    # for the operator's error message.
+    dedup_ordered: list[str] = []
+    seen: set[str] = set()
+    for v in values:
+        if v in seen:
+            continue
+        seen.add(v)
+        dedup_ordered.append(v)
+
+    resolved = await fetch_biosample_idxs_by_natural_key(pool, key=key, values=dedup_ordered)
+    missing = [v for v in dedup_ordered if v not in resolved]
+    return resolved, missing
+
+
 @biosample_router.post(PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION)
 async def lookup_biosample_by_accession(
     body: BiosampleLookupByAccessionRequest,
@@ -450,23 +496,34 @@ async def lookup_biosample_by_accession(
     deduped before the SQL fetch; `missing` echoes back the input-order
     deduped list of accessions that did not resolve.
     """
-    # Dedup while preserving input order so `missing` is deterministic
-    # for the operator's error message.
-    dedup_ordered: list[str] = []
-    seen: set[str] = set()
-    for accession in body.accessions:
-        if accession in seen:
-            continue
-        seen.add(accession)
-        dedup_ordered.append(accession)
-
-    # Single round trip resolves every supplied accession. _user is read
-    # only to keep the dependency chain explicit — no per-caller filter
-    # runs here (see auth docstring).
+    # _user is read only to keep the dependency chain explicit — no
+    # per-caller filter runs here (see auth docstring).
     _ = user
-    resolved = await fetch_biosample_idxs_by_accession(pool, dedup_ordered)
-    missing = [a for a in dedup_ordered if a not in resolved]
+    resolved, missing = await _resolve_biosample_idxs_by_natural_key(
+        pool, key="biosample_accession", values=body.accessions
+    )
     return BiosampleLookupByAccessionResponse(resolved=resolved, missing=missing)
+
+
+@biosample_router.post(PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID)
+async def lookup_biosample_by_matrix_tube_id(
+    body: BiosampleLookupByMatrixTubeIdRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
+) -> BiosampleLookupByMatrixTubeIdResponse:
+    """Resolve a list of matrix_tube_id values to biosample_idx.
+
+    Mirrors the accession variant in every way except the keyed column.
+    Auth, access-predicate-skip rationale, retired-row exclusion, and
+    input-dedup behavior are identical; see lookup_biosample_by_accession
+    for the full rationale.
+    """
+    _ = user
+    resolved, missing = await _resolve_biosample_idxs_by_natural_key(
+        pool, key="matrix_tube_id", values=body.matrix_tube_ids
+    )
+    return BiosampleLookupByMatrixTubeIdResponse(resolved=resolved, missing=missing)
 
 
 # Substring of the asyncpg.RaiseError message thrown by the role-typed FK
@@ -586,6 +643,9 @@ async def patch_biosample(
             raise HTTPException(status_code=409, detail=detail)
         except asyncpg.ForeignKeyViolationError as exc:
             detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, GENERIC_FK_VIOLATION)
+            raise HTTPException(status_code=422, detail=detail)
+        except asyncpg.CheckViolationError as exc:
+            detail = _CHECK_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_CHECK_VIOLATION)
             raise HTTPException(status_code=422, detail=detail)
         except asyncpg.RaiseError as exc:
             # Role-typed FK trigger on biosample.owner_idx: candidate is

@@ -33,6 +33,16 @@ from qiita_common.auth_constants import (  # noqa: F401
 # See https://orcid.org/.
 ORCID_PATTERN = r"^\d{4}-\d{4}-\d{4}-\d{3}[\dX]$"
 
+# matrix_tube_id values are digit-only (per local convention) and may carry
+# leading zeros; the {8,10} quantifier also rejects the empty string and
+# bounds the length range.
+#
+# Deliberately duplicated with the column-level CHECK on
+# qiita.biosample.matrix_tube_id: the Pydantic side fails at the wire
+# boundary with a per-field 422; the DB side is the last line of defense.
+# Change one and you must change the other in the same PR.
+MATRIX_TUBE_ID_PATTERN = r"^[0-9]{8,10}$"  # same-pattern-ok: DB CHECK parity (see above)
+
 
 class HealthStatus(StrEnum):
     """Health states used in `HealthResponse.status` and the per-service
@@ -541,6 +551,10 @@ class BiosampleImportRequest(BaseModel):
     metadata_checklist_idx: Annotated[int, Field(gt=0)] | None = None
     biosample_accession: str | None = None
     ena_sample_accession: str | None = None
+    matrix_tube_id: Annotated[
+        str | None,
+        Field(pattern=MATRIX_TUBE_ID_PATTERN),
+    ] = None
 
 
 class BiosampleImportResponse(BaseModel):
@@ -657,6 +671,7 @@ class BiosampleResponse(BaseModel):
     metadata_checklist_idx: int | None
     biosample_accession: str | None
     ena_sample_accession: str | None
+    matrix_tube_id: str | None
     last_submission_at: AwareDatetime | None
     submission_error: str | None
     last_metadata_change_at: AwareDatetime | None
@@ -706,6 +721,36 @@ class BiosampleLookupByAccessionResponse(BaseModel):
     missing: list[str]
 
 
+# same-pattern-ok: per-key wire shape; parallels BiosampleLookupByAccessionRequest
+class BiosampleLookupByMatrixTubeIdRequest(BaseModel):
+    """Body for POST /api/v1/biosample/lookup-by-matrix-tube-id.
+
+    Bulk-resolves a list of matrix_tube_id values to biosample_idx. Same
+    body-vs-querystring rationale as the accession variant.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    matrix_tube_ids: list[Annotated[str, Field(pattern=MATRIX_TUBE_ID_PATTERN)]] = Field(
+        min_length=1, max_length=10_000
+    )
+
+
+# same-pattern-ok: per-key wire shape; parallels BiosampleLookupByAccessionResponse
+class BiosampleLookupByMatrixTubeIdResponse(BaseModel):
+    """Returned by POST /api/v1/biosample/lookup-by-matrix-tube-id.
+
+    `resolved` maps each found matrix_tube_id to its biosample_idx.
+    `missing` lists matrix_tube_id values that did not resolve, in input
+    order (deduped).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    resolved: dict[str, Annotated[int, Field(gt=0)]]
+    missing: list[str]
+
+
 class PatchRequestModel(BaseModel):
     """Base class for every PATCH-body Pydantic model in the API.
 
@@ -741,6 +786,10 @@ class BiosamplePatchRequest(PatchRequestModel):
     owner_idx: Annotated[int, Field(gt=0)] | None = None
     biosample_accession: str | None = None
     ena_sample_accession: str | None = None
+    matrix_tube_id: Annotated[
+        str | None,
+        Field(pattern=MATRIX_TUBE_ID_PATTERN),
+    ] = None
     last_submission_at: AwareDatetime | None = None
     submission_error: str | None = None
 

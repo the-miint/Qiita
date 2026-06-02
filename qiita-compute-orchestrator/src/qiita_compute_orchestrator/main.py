@@ -46,13 +46,13 @@ def _build_backend(settings: Settings) -> ComputeBackend:
             cp_url=settings.cp_url,
             # Propagated into the job env so native steps that derive a
             # persistent path from it (build_rype_index → the .ryxdi) resolve
-            # the real shared root on the compute node instead of the
+            # the real PATH_SCRATCH on the compute node instead of the
             # /tmp/qiita default. See SlurmBackend.run_step's extra_env wiring.
-            shared_filesystem_root=settings.shared_filesystem_root,
+            path_scratch=settings.path_scratch,
             qos=settings.slurm.qos,
-            # QIITA_IMAGES_DIR is validated in Settings.from_env when
+            # PATH_DERIVED/images is validated in Settings.from_env when
             # backend_type=slurm — non-None here on the production path.
-            qiita_images_dir=settings.qiita_images_dir,
+            path_derived_images=settings.path_derived_images,
         )
     raise RuntimeError(f"unknown COMPUTE_BACKEND={settings.backend_type!r}")
 

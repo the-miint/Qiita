@@ -287,6 +287,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--biosample-accession",
         help="External biosample accession (e.g. NCBI), if known at create time",
     )
+    p_biosample_create.add_argument(
+        "--matrix-tube-id",
+        help="Matrix-tube identifier (digits only); validated server-side",
+    )
     # --ena-sample-accession is deliberately NOT exposed: an ENA
     # accession is a submission-tracking value the submission subsystem
     # writes back after an ENA submission, not part of the interactive

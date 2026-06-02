@@ -21,11 +21,11 @@ from qiita_control_plane.repositories.biosample_metadata import (
     BIOSAMPLE_METADATA_SPEC,
     insert_owner_biosample_id_metadata,
 )
+from qiita_control_plane.testing.unique_names import unique_field_name
 
 from .conftest import (
     _create_biosample_with_link,
     _create_local_field,
-    _unique_field_name,
 )
 
 pytestmark = pytest.mark.db
@@ -47,7 +47,7 @@ async def test_biosample_metadata_rejects_value_text_when_data_type_numeric(ctx)
             conn,
             spec=BIOSAMPLE_METADATA_SPEC,
             study_idx=ctx["study_idx"],
-            display_name=_unique_field_name("num"),
+            display_name=unique_field_name("num"),
             created_by_idx=ctx["principal_idx"],
             data_type=FieldDataType.NUMERIC,
             required=True,
@@ -78,7 +78,7 @@ async def test_biosample_metadata_accepts_value_missing_reason_for_any_data_type
             conn,
             spec=BIOSAMPLE_METADATA_SPEC,
             study_idx=ctx["study_idx"],
-            display_name=_unique_field_name("num"),
+            display_name=unique_field_name("num"),
             created_by_idx=ctx["principal_idx"],
             data_type=FieldDataType.NUMERIC,
             required=True,
@@ -137,7 +137,7 @@ async def test_biosample_metadata_resolves_data_type_via_global_link(ctx):
         " VALUES ($1, $2, $3, $4) RETURNING idx",
         ctx["study_idx"],
         global_idx,
-        _unique_field_name("linked"),
+        unique_field_name("linked"),
         ctx["principal_idx"],
     )
     ctx["created"]["biosample_study_field"].append(field_idx)
@@ -210,7 +210,7 @@ async def test_biosample_metadata_rejects_value_text_when_data_type_terminology(
             conn,
             spec=BIOSAMPLE_METADATA_SPEC,
             study_idx=ctx["study_idx"],
-            display_name=_unique_field_name("term"),
+            display_name=unique_field_name("term"),
             created_by_idx=ctx["principal_idx"],
             data_type=FieldDataType.TERMINOLOGY,
             terminology_idx=terminology_idx,

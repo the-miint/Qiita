@@ -70,20 +70,19 @@ def cp_server(tmp_path, hmac_secret):
     port = _free_port()
     token_file = tmp_path / "cp-to-co.token"
     token_file.write_text("unused-dispatch-token")
-    # Settings.from_env() requires WORK_TICKET_WORKSPACE_ROOT,
-    # UPLOAD_STAGING_ROOT, and CONTACT_EMAIL — the CP would fail to
-    # boot without them. The dirs don't need to exist for this smoke
-    # (the dispatch points at a dead orchestrator port, so the runner
-    # never reaches mkdir); the values just need to be absolute paths
-    # so the boot-time validation passes.
+    # Settings.from_env() requires PATH_SCRATCH and CONTACT_EMAIL — the CP
+    # would fail to boot without them. PATH_SCRATCH/ticket and
+    # PATH_SCRATCH/staging are derived but don't need to exist for this
+    # smoke (the dispatch points at a dead orchestrator port, so the runner
+    # never reaches mkdir); the value just needs to be an absolute path so
+    # the boot-time validation passes.
     env = {
         **os.environ,
         "DATABASE_URL": resolve_postgres_url(),
         "HMAC_SECRET_KEY": base64.b64encode(hmac_secret).decode(),
         "COMPUTE_ORCHESTRATOR_URL": "http://127.0.0.1:1",
         "CP_TO_CO_TOKEN_PATH": str(token_file),
-        "WORK_TICKET_WORKSPACE_ROOT": str(tmp_path / "orch-workspace"),
-        "UPLOAD_STAGING_ROOT": str(tmp_path / "upload-staging"),
+        "PATH_SCRATCH": str(tmp_path / "scratch"),
         "CONTACT_EMAIL": "qiita-test@example.org",
     }
     proc = subprocess.Popen(

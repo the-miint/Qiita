@@ -262,7 +262,7 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     valid ActionDefinition: target_kind is sequenced_pool; the
     bcl_convert_prep step is a module pointing at
     qiita_compute_orchestrator.jobs.bcl_convert_prep; the bcl_convert
-    step is a container with the SIF filename Settings.qiita_images_dir
+    step is a container with the SIF filename Settings.path_derived_images
     resolves against; baseline_resources for bcl_convert uses the lookup
     population (from_step_output + profiles with the three supported
     Illumina families); and action_ceiling matches the largest profile.

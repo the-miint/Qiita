@@ -509,8 +509,10 @@ def test_biosample_create_metadata_pairs_become_dict(monkeypatch):
 
 
 def test_biosample_create_passes_through_optional_fields(monkeypatch):
-    """metadata_checklist_idx and biosample_accession flow into the body
-    when supplied; ena_sample_accession stays absent (not exposed)."""
+    """Tests the case where every CLI-exposed optional field
+    (metadata_checklist_idx, biosample_accession, matrix_tube_id) flows
+    into the POST body when supplied; ena_sample_accession stays absent
+    because the CLI does not expose it."""
     from qiita_control_plane.cli.user import main
 
     captured: dict = {}
@@ -530,12 +532,15 @@ def test_biosample_create_passes_through_optional_fields(monkeypatch):
             "3",
             "--biosample-accession",
             "SAMN12345678",
+            "--matrix-tube-id",
+            "0123456789",
         ]
     )
     assert rc == 0
     body = captured["requests"][-1]["json"]
     assert body["metadata_checklist_idx"] == 3
     assert body["biosample_accession"] == "SAMN12345678"
+    assert body["matrix_tube_id"] == "0123456789"
     assert "ena_sample_accession" not in body
 
 

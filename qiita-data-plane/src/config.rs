@@ -14,10 +14,14 @@ pub struct Settings {
     /// E.g., "dbname=qiita_ducklake host=localhost port=5432 user=qiita password=qiita"
     pub ducklake_catalog_connstr: String,
     /// Directory where DuckLake stores Parquet data files.
-    pub ducklake_data_path: String,
+    /// Derived as `PATH_PERSISTENT/ducklake`.
+    pub path_persistent_ducklake: String,
     /// Root directory under which DoPut writes staged Parquet uploads.
-    /// Each upload lands at `{root}/uploads/{upload_idx}/upload.parquet`.
-    pub upload_staging_root: PathBuf,
+    /// Derived as `PATH_SCRATCH/staging`; each upload lands at
+    /// `{root}/uploads/{upload_idx}/upload.parquet`. Must match the
+    /// control plane's PATH_SCRATCH/staging — set PATH_SCRATCH to the same
+    /// value in both env files.
+    pub path_scratch_staging: PathBuf,
 }
 
 impl Settings {
@@ -41,25 +45,34 @@ impl Settings {
 
         let ducklake_catalog_connstr = std::env::var("DUCKLAKE_CATALOG_CONNSTR")
             .map_err(|_| "DUCKLAKE_CATALOG_CONNSTR is required but not set".to_string())?;
-        let ducklake_data_path = std::env::var("DUCKLAKE_DATA_PATH").unwrap_or_else(|_| {
+        // DuckLake parquet lives at PATH_PERSISTENT/ducklake. PATH_PERSISTENT
+        // is optional in dev: it falls back to $TMPDIR/qiita (then /tmp/qiita),
+        // a tmp-rooted default and never a production-looking path.
+        let path_persistent = std::env::var("PATH_PERSISTENT").unwrap_or_else(|_| {
             let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-            format!("{base}/qiita/ducklake")
+            format!("{base}/qiita")
         });
-        let upload_staging_raw = std::env::var("UPLOAD_STAGING_ROOT")
-            .map_err(|_| "UPLOAD_STAGING_ROOT is required but not set".to_string())?;
-        let upload_staging_root: PathBuf = upload_staging_raw.clone().into();
-        if !upload_staging_root.is_absolute() {
+        let path_persistent_ducklake = format!("{path_persistent}/ducklake");
+
+        // DoPut uploads stage under PATH_SCRATCH/staging. PATH_SCRATCH is
+        // required + absolute (same posture as the control plane); the
+        // /staging subdir must match the CP's PATH_SCRATCH/staging.
+        let path_scratch_raw = std::env::var("PATH_SCRATCH")
+            .map_err(|_| "PATH_SCRATCH is required but not set".to_string())?;
+        let path_scratch: PathBuf = path_scratch_raw.clone().into();
+        if !path_scratch.is_absolute() {
             return Err(format!(
-                "UPLOAD_STAGING_ROOT must be an absolute path, got {upload_staging_raw:?}"
+                "PATH_SCRATCH must be an absolute path, got {path_scratch_raw:?}"
             ));
         }
+        let path_scratch_staging: PathBuf = path_scratch.join("staging");
 
         Ok(Self {
             listen_addr,
             hmac_secret_key,
             ducklake_catalog_connstr,
-            ducklake_data_path,
-            upload_staging_root,
+            path_persistent_ducklake,
+            path_scratch_staging,
         })
     }
 }
