@@ -182,9 +182,18 @@ def data_plane(hmac_secret, tmp_path_factory):
 
     _reset_ducklake_catalog()
 
-    data_path = str(tmp_path_factory.mktemp("ducklake-data"))
-    staging_root = str(tmp_path_factory.mktemp("upload-staging"))
-    workspace_root = str(tmp_path_factory.mktemp("runner-workspace"))
+    # Two base roots; the data plane derives PATH_SCRATCH/staging and
+    # PATH_PERSISTENT/ducklake from them (matching production). The CP
+    # runner's per-ticket workspace is the sibling PATH_SCRATCH/ticket.
+    # mkdir the derived leaves since the DP/DuckLake expect them to exist.
+    scratch_base = tmp_path_factory.mktemp("scratch")
+    persistent_base = tmp_path_factory.mktemp("persistent")
+    data_path = str(persistent_base / "ducklake")
+    staging_root = str(scratch_base / "staging")
+    workspace_root = str(scratch_base / "ticket")
+    os.makedirs(data_path, exist_ok=True)
+    os.makedirs(staging_root, exist_ok=True)
+    os.makedirs(workspace_root, exist_ok=True)
     port = _alloc_free_port()
 
     lib_path = os.environ.get(LIB_PATH_ENV, "")
@@ -196,8 +205,8 @@ def data_plane(hmac_secret, tmp_path_factory):
         "LISTEN_ADDR": f"{LOOPBACK_HOST}:{port}",
         "HMAC_SECRET_KEY": base64.b64encode(hmac_secret).decode(),
         "DUCKLAKE_CATALOG_CONNSTR": DUCKLAKE_CATALOG_CONNSTR,
-        "DUCKLAKE_DATA_PATH": data_path,
-        "UPLOAD_STAGING_ROOT": staging_root,
+        "PATH_PERSISTENT": str(persistent_base),
+        "PATH_SCRATCH": str(scratch_base),
         LIB_PATH_ENV: lib_path,
     }
 

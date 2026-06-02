@@ -45,9 +45,9 @@ def _build_backend(settings: Settings) -> ComputeBackend:
             co_to_cp_token=settings.co_to_cp_token,
             cp_url=settings.cp_url,
             qos=settings.slurm.qos,
-            # QIITA_IMAGES_DIR is validated in Settings.from_env when
+            # PATH_DERIVED/images is validated in Settings.from_env when
             # backend_type=slurm — non-None here on the production path.
-            qiita_images_dir=settings.qiita_images_dir,
+            path_derived_images=settings.path_derived_images,
         )
     raise RuntimeError(f"unknown COMPUTE_BACKEND={settings.backend_type!r}")
 

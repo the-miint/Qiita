@@ -77,7 +77,7 @@ The wire validator enforces shape only (exactly-one). The module-prefix invarian
 
 ### Container image tier
 
-Container steps declare a bare SIF filename in `container:` (e.g. `bcl-convert-4.5.4.sif`). The orchestrator joins this against `Settings.qiita_images_dir` (`QIITA_IMAGES_DIR` env var, required when `COMPUTE_BACKEND=slurm`) to resolve the absolute SIF path. Registry-URL forms with `://` pass through; anything else with a path separator → `CONTRACT_VIOLATION`.
+Container steps declare a bare SIF filename in `container:` (e.g. `bcl-convert-4.5.4.sif`). The orchestrator joins this against `Settings.path_derived_images` (derived as `PATH_DERIVED/images`; `PATH_DERIVED` env var required when `COMPUTE_BACKEND=slurm`) to resolve the absolute SIF path. Registry-URL forms with `://` pass through; anything else with a path separator → `CONTRACT_VIOLATION`.
 
 After editing a workflow YAML or its container artifacts (`workflows/<workflow>/Apptainer.def`, `entrypoint.sh`, or the shared `workflows/_shared/manifest_writer.py`):
 

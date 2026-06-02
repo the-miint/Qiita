@@ -699,16 +699,17 @@ The control-plane user (`qiita-api`) connects to `qiita_miint` only; the data-pl
 
 ## Data Storage
 
-Two shared filesystems, mounted on every host that runs Qiita components or SLURM workers:
+Three shared filesystems, mounted on every host that runs Qiita components or SLURM workers. Each is an env-var **base root** the operator sets per component; the services derive fixed subdirs from it (no per-leaf env var):
 
-- **`$QIITA_DATA_ROOT/`** — durable, backed up. System-of-record state. `QIITA_DATA_ROOT` is a runbook-template variable read only by the operator's shell — no Qiita process reads it directly. The operator exports it once and the deploy env-files expand it into `DUCKLAKE_DATA_PATH` (which the data plane *does* read). The recommended runbook value is `/data` (see `docs/runbooks/first-deploy.md`); production deploys whose shared filesystem is mounted elsewhere override at deploy time. The data plane's own fallback when `DUCKLAKE_DATA_PATH` is unset is `$TMPDIR/qiita/ducklake`, further falling back to `/tmp/qiita/ducklake` if `TMPDIR` itself is unset — a tmp-rooted default, never a production-looking path.
-- **`/scratch/`** — fast, working. Three-tier retention; path is hardcoded.
+- **`PATH_PERSISTENT/`** — durable, backed up. System-of-record state. `PATH_PERSISTENT` is an env var the data plane reads directly; it derives the DuckLake data path as `PATH_PERSISTENT/ducklake`. The recommended runbook value is `/data` (see `docs/runbooks/first-deploy.md`); production deploys whose shared filesystem is mounted elsewhere override at deploy time. The data plane's fallback when `PATH_PERSISTENT` is unset is `$TMPDIR/qiita` — so DuckLake lands at `$TMPDIR/qiita/ducklake`, further falling back to `/tmp/qiita/ducklake` if `TMPDIR` itself is unset — a tmp-rooted default, never a production-looking path.
+- **`PATH_SCRATCH/`** — fast, working. The control plane derives `PATH_SCRATCH/ticket` (per-ticket workspaces) and `PATH_SCRATCH/staging` (DoPut upload staging); the data plane derives the same `PATH_SCRATCH/staging`, and the orchestrator derives the same `PATH_SCRATCH/ticket` (its readiness probe checks it). Recommended runbook value `/scratch`. Three-tier retention.
+- **`PATH_DERIVED/`** — built artifacts. The compute orchestrator derives `PATH_DERIVED/images`, the Apptainer SIF tier SLURM container steps resolve bare `container:` filenames against (required when `COMPUTE_BACKEND=slurm`). Recommended runbook value `/scratch/persistent`.
 
-Layout (showing the recommended runbook value `/data/` for brevity; substitute `$QIITA_DATA_ROOT` in non-default deploys):
+Layout (showing the recommended runbook value `/data/` for brevity; substitute `PATH_PERSISTENT` in non-default deploys):
 
 ```
-$QIITA_DATA_ROOT/                           durable, backed up
-  parquet/<table>/<filename>                DuckLake DATA_PATH (flat per logical table; CRC sharding only if file count pressures the FS)
+PATH_PERSISTENT/                            durable, backed up
+  ducklake/<table>/<filename>               DuckLake data path (flat per logical table; CRC sharding only if file count pressures the FS)
   logs/<ticket_id>/step_n-<job>.{out,err}   archived SLURM stdout/stderr after job terminal state
 
 /scratch/
@@ -731,11 +732,11 @@ Built reference data therefore lives under exactly one of `/scratch/persistent/r
 
 Retention:
 
-- `$QIITA_DATA_ROOT/` — never auto-deleted. Backed up by cluster policy.
+- `PATH_PERSISTENT/` — never auto-deleted. Backed up by cluster policy.
 - `/scratch/persistent/` and `/scratch/persistent-local/` — never auto-deleted by us; cluster purge exemption requested for both. For aligner indices specifically, if the local-SSD copy is missing for any reason, the orchestrator rebuilds it on demand at job dispatch.
 - `/scratch/ephemeral/` — per-ticket directories are deleted 45 days after the ticket reaches a terminal state. The 45-day grace exists for post-mortem debugging.
 
-Same-FS constraint: the SLURM job's final-step output directory and DuckLake `DATA_PATH` must live on the same filesystem — the data plane moves files via atomic rename, falling back to copy+delete only on cross-filesystem moves (a slow path that bypasses the rename's atomicity guarantee). The final-step output therefore lives on `$QIITA_DATA_ROOT/` even when intermediate map/reduce outputs use `/scratch/ephemeral/staging/`.
+Same-FS constraint: the SLURM job's final-step output directory and the DuckLake data path (`PATH_PERSISTENT/ducklake`) must live on the same filesystem — the data plane moves files via atomic rename, falling back to copy+delete only on cross-filesystem moves (a slow path that bypasses the rename's atomicity guarantee). The final-step output therefore lives on `PATH_PERSISTENT/` even when intermediate map/reduce outputs use `PATH_SCRATCH/staging/`.
 
 No hive partitioning: a prep sample can be associated with multiple studies, so the on-disk layout is keyed by logical table only — never by `study_idx`. DuckLake's catalog is the sole index over file contents.
 

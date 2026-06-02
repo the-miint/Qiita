@@ -62,7 +62,7 @@ def _make_slurm_settings(jwt_path: Path) -> SlurmSettings:
 def _make_settings(jwt_path: Path) -> Settings:
     return Settings(
         backend_type="slurm",
-        shared_filesystem_root="/scratch/qiita",
+        path_scratch="/scratch/qiita",
         cp_to_co_token="",
         cp_url="https://qiita.example.org",
         co_to_cp_token="probe-co-to-cp-token",
@@ -239,7 +239,7 @@ def test_probe_script_emits_only_known_values():
     """
     import re
 
-    script = cr.build_probe_script(shared_filesystem_root="/scratch/qiita")
+    script = cr.build_probe_script(path_scratch="/scratch/qiita")
     known = cr._PROBE_PASS_VALUES | cr._PROBE_FAIL_VALUES | cr._PROBE_SKIP_VALUES
     # Match `<prefix> <key>=<value>` where value is a bare word (no
     # `$(...)`, no quotes, no shell expansion). Informational lines
@@ -361,6 +361,9 @@ def test_build_probe_submit_payload_includes_required_fields(tmp_path):
     env = dict(item.split("=", 1) for item in job["environment"])
     assert env["QIITA_CP_URL"] == "https://qiita.example.org"
     assert env["CO_TO_CP_TOKEN"] == "probe-co-to-cp-token"
+    # PATH_SCRATCH is passed through so the probe can check
+    # PATH_SCRATCH/ticket (the per-ticket workspace) on the compute node.
+    assert env["PATH_SCRATCH"] == "/scratch/qiita"
     # `QIITA_NATIVE_PYTHON`, not `SLURM_NATIVE_PYTHON`: slurmd handles
     # its own `SLURM_*` namespace on the compute node and may reset
     # user-set vars in it. Renaming sidesteps the collision.

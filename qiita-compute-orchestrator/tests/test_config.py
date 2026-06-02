@@ -83,7 +83,7 @@ def test_get_settings_returns_installed_value(monkeypatch):
     verbatim — no re-resolution from env."""
     sentinel = Settings(
         backend_type="local",
-        shared_filesystem_root="/tmp/sentinel",
+        path_scratch="/tmp/sentinel",
         cp_to_co_token="cached-cp-to-co",
         cp_url="https://sentinel.invalid",
         co_to_cp_token="cached-co-to-cp",
