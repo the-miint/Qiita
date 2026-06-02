@@ -13,13 +13,16 @@ dependencies = [
     # dev/test. SlurmBackend won't need it, but the orchestrator runs both
     # backends from the same image, so the dep stays.
     "duckdb>=1.5.2",
-    # bcl_convert_prep imports `save_legacy_csv` from
-    # run_preflight.legacy.api at execute() time. SHA pin is required
-    # so a re-vendor of the upstream is explicit. To bump: read the
-    # `def save_legacy_csv` signature on a newer SHA and update the
-    # ref + comment together so an unrelated upstream change can't
-    # silently swap in.
-    "run-preflight @ git+https://github.com/the-miint/kl-run-preflight@0ccab487db83ff0624998c14d664304faa5470cc",
+    # bcl_convert_prep imports `save_bclconvert_v1_csv` from
+    # run_preflight at execute() time. SHA pin is required so a
+    # re-vendor of the upstream is explicit. To bump: read the
+    # `def save_bclconvert_v1_csv` signature on a newer SHA and update
+    # the ref + comment together so an unrelated upstream change can't
+    # silently swap in. The control plane pins the same SHA (it imports
+    # `get_illumina_sample_info` from the same release) so a re-vendor
+    # is a coordinated bump; tests/integration/test_run_preflight_pin_parity.py
+    # enforces parity.
+    "run-preflight @ git+https://github.com/the-miint/kl-run-preflight@0c476dfd9f1fd4b3b2bfc54e1b301e3c09cdc879",
 ]
 
 [dependency-groups]

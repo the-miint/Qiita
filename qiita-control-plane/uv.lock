@@ -657,6 +657,7 @@ dependencies = [
     { name = "pyjwt", extra = ["crypto"] },
     { name = "pyyaml" },
     { name = "qiita-common" },
+    { name = "run-preflight" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -682,6 +683,7 @@ requires-dist = [
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.9" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "qiita-common", directory = "../qiita-common" },
+    { name = "run-preflight", git = "https://github.com/the-miint/kl-run-preflight?rev=0c476dfd9f1fd4b3b2bfc54e1b301e3c09cdc879" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
 ]
 
@@ -767,6 +769,11 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/2b/e9/346d4d3fffc6871125e877dae8d9a1966b254fbd92a50f8561078b88b099/ruff-0.15.7-py3-none-win_amd64.whl", hash = "sha256:4d53d712ddebcd7dace1bc395367aec12c057aacfe9adbb6d832302575f4d3a1", size = 11755839, upload-time = "2026-03-19T16:26:19.897Z" },
     { url = "https://files.pythonhosted.org/packages/8f/e8/726643a3ea68c727da31570bde48c7a10f1aa60eddd628d94078fec586ff/ruff-0.15.7-py3-none-win_arm64.whl", hash = "sha256:18e8d73f1c3fdf27931497972250340f92e8c861722161a9caeb89a58ead6ed2", size = 11023304, upload-time = "2026-03-19T16:26:51.669Z" },
 ]
+
+[[package]]
+name = "run-preflight"
+version = "0.0.0.post36+g0c476df.d20260602"
+source = { git = "https://github.com/the-miint/kl-run-preflight?rev=0c476dfd9f1fd4b3b2bfc54e1b301e3c09cdc879#0c476dfd9f1fd4b3b2bfc54e1b301e3c09cdc879" }
 
 [[package]]
 name = "starlette"
