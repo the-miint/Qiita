@@ -11,7 +11,7 @@ Substitute your host's FQDN for the `qiita-miint.ucsd.edu` examples and `<scratc
 
 ## Pending deploy
 
-Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
+Everything merged but not yet deployed, folded in by each PR as it merges. Nothing is pending right now — the most recent deploy was archived below. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
 
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
@@ -22,6 +22,40 @@ _None yet._
 _None yet._
 
 ### 3. Migrations
+
+_None yet._
+
+### 4. Deploy
+
+_None yet._
+
+### 5. Verify
+
+_None yet._
+
+### Notes (no host action)
+
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-02 — 9ee069d
+
+Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
 
 ```sql
 -- [admin] Pre-check before `make migrate`. The migration adds
@@ -46,23 +80,17 @@ make -C ~/qiita-miint migrate
 ```
 `dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#74) adds `20260601000003_study_ebi_accession_unique` (gated on the pre-check above).
 
-### 4. Deploy
+#### 4. Deploy
 
 _None yet._
 
-### 5. Verify
+#### 5. Verify
 
 _None yet._
 
-### Notes (no host action)
+#### Notes (no host action)
 
 _None yet._
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-02 — e78d601
 
