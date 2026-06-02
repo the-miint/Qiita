@@ -15,11 +15,11 @@ Everything merged but not yet deployed. Run buckets 1→5 in order; buckets 1–
 
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
-_None yet._ — host references (#70) reuse the existing `PATH_SCRATCH` (set in the 2026-06-01 deploy); no new var.
+No new env var — host references (#70) reuse the existing `PATH_SCRATCH` (set in the 2026-06-01 deploy).
 
 ### 2. One-time host setup
 
-_None yet._ — the rype `.ryxdi` dir is `mkdir`'d at runtime under `PATH_SCRATCH/references/`; no manual dir step (#70).
+No host setup — the rype `.ryxdi` dir is `mkdir`'d at runtime under `PATH_SCRATCH/references/`; no manual dir step (#70).
 
 ### 3. Migrations
 

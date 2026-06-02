@@ -381,7 +381,7 @@ async def test_run_step_omits_token_env_when_backend_has_no_tokens(jwt_path, bas
 @pytest.mark.asyncio
 async def test_run_step_propagates_path_scratch_into_job_env(jwt_path, baseline, tmp_path):
     """The compute-node native-step launcher calls `get_settings()`, whose
-    `path_scratch` falls back to a `/tmp/qiita` DEFAULT when `PATH_SCRATCH` is
+    `path_scratch` falls back to a `$TMPDIR/qiita` DEFAULT when `PATH_SCRATCH` is
     absent. Native jobs that derive a persistent path from it — notably
     `build_rype_index`, which writes the `.ryxdi` to
     `{PATH_SCRATCH}/references/{idx}/rype/index.ryxdi` — would otherwise land

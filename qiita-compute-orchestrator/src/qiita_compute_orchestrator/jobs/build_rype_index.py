@@ -20,7 +20,9 @@ the `.ryxdi` itself; the control plane records only a small params copy
 native step outputs are paths (`dict[str, Path]`), so params can't ride a
 binding directly.
 
-miint signature (the-miint/duckdb-miint@v1.5-variegata docs/rype.md):
+miint signature (see `docs/duckdb-miint.md`, which carries the qiita-verified
+signature as the single source — it tracks upstream drift so this comment
+doesn't rot against a version tag):
   rype_index_create(chunk_table, output_path, [mapping_table],
                     [k=64], [w=50], [salt=...], [orient=true], [max_memory=0])
 chunk_table needs columns feature_idx/chunk_index/chunk_data; mapping_table
@@ -49,6 +51,14 @@ YAML_STEP_NAME = "build_rype_index"
 # Together (4 + 24) they sit under a 32 GB YAML allocation with ~4 GB headroom
 # for Python / the rype runtime / OS. Literals mirror the host-reference-add
 # YAML's baseline_resources for this step (a mismatch is visible at review).
+#
+# CAVEAT: 24 GB was sized to FIT THE RESOURCE ENVELOPE (under mem_gb=32), NOT
+# empirically validated against a full host genome. The real rype build is so
+# far only smoke-tested on ~640 bp synthetic data; a real human reference
+# (e.g. T2T-CHM13, ~3.1 Gbp at k=64/w=25) has not been profiled. This cap is
+# the first thing to OOM-kill if rype's peak exceeds it — if a real host
+# reference fails here, bump `mem_gb` in the YAML and `_RYPE_MAX_MEMORY_GB`
+# together (keep the ~4 GB headroom) once a real build gives a memory figure.
 _DUCKDB_MEMORY_GB = 4
 _DUCKDB_THREADS = 4
 _RYPE_MAX_MEMORY_GB = 24
@@ -131,7 +141,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # Persistent index location under the shared scratch base (PATH_SCRATCH),
     # NOT the ephemeral per-attempt workspace. On SLURM the backend propagates
     # PATH_SCRATCH into the job env so get_settings() resolves the real value
-    # here instead of the /tmp/qiita default.
+    # here instead of the $TMPDIR/qiita default.
     scratch_root = Path(get_settings().path_scratch)
     index_dir = scratch_root / "references" / str(inputs.reference_idx) / "rype" / "index.ryxdi"
     index_dir.parent.mkdir(parents=True, exist_ok=True)

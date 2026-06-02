@@ -121,7 +121,7 @@ class SlurmBackend(ComputeBackend):
         # Shared scratch base (PATH_SCRATCH), propagated into the SLURM job
         # env for the same reason as cp_url: /etc/qiita is deploy-host-local,
         # invisible from compute nodes, so the native-step launcher's
-        # `get_settings()` would otherwise fall back to the `/tmp/qiita`
+        # `get_settings()` would otherwise fall back to the `$TMPDIR/qiita`
         # DEFAULT for `path_scratch`. Native jobs that derive a persistent
         # path from it — `build_rype_index` writes the `.ryxdi` under
         # `{path_scratch}/references/{idx}/rype/` — need the real value or
