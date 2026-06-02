@@ -165,6 +165,97 @@ def test_load_actions_loads_on_disk_reference_add_yaml():
     # context_schema must require `fasta_upload_idx`, not `fasta_path`.
     assert ref_add.context_schema["required"] == ["fasta_upload_idx"]
 
+    # Pin the CLI's hardcoded action_id/version against the YAML the deploy
+    # syncs into qiita.action. `qiita reference load` submits these literals;
+    # a YAML id/version bump without the CLI following would 404 at submit.
+    # Fail here at build time instead (mirrors the bcl-convert pin below).
+    from qiita_control_plane.cli.reference_load import (
+        _REFERENCE_ADD_ACTION_ID,
+        _REFERENCE_ADD_ACTION_VERSION,
+    )
+
+    assert _REFERENCE_ADD_ACTION_ID == ref_add.action_id == "reference-add"
+    assert _REFERENCE_ADD_ACTION_VERSION == ref_add.version == "1.0.0"
+
+
+def test_load_actions_loads_on_disk_host_reference_add_yaml():
+    """The actual on-disk `workflows/host-reference-add/1.0.0.yaml` loads as a
+    valid ActionDefinition with the host-indexing shape:
+
+      * target_kind reference, success_status active;
+      * context_schema REQUIRES both fasta_upload_idx and taxonomy_upload_idx
+        (taxonomy is mandatory for a host reference — it's the rype mapping
+        authority's source);
+      * the trailing steps are build_rype_index (module, target_status
+        indexing) → register-files → register-index, in that order;
+      * build_rype_index runs BEFORE register-files. register-files MOVES the
+        feature-keyed reference_sequence_chunks part files into permanent
+        DuckLake storage (data-plane move_file), so the index build must read
+        them from staging first — an ordering regression would leave the index
+        step with nothing to read. Locking the order here guards that.
+    """
+    from pathlib import Path
+
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    actions = load_actions(repo_root / "workflows")
+    by_id = {a.action_id: a for a in actions}
+    assert "host-reference-add" in by_id, "workflows/host-reference-add/1.0.0.yaml must load"
+    host = by_id["host-reference-add"]
+
+    assert host.target_kind == ScopeTargetKind.REFERENCE
+    assert host.success_status == "active"
+    assert host.failure_status == "failed"
+
+    # Taxonomy is required (unlike reference-add, where it's optional).
+    assert set(host.context_schema["required"]) == {"fasta_upload_idx", "taxonomy_upload_idx"}
+
+    step_names = [s.name for s in host.steps]
+    # Shares the reference-add prefix, then adds the host-indexing tail.
+    assert step_names == [
+        "hash_sequences",
+        "mint-features",
+        "write-membership",
+        "load",
+        "build_rype_index",
+        "register-files",
+        "register-index",
+    ]
+    # build_rype_index must precede register-files (move-on-register).
+    assert step_names.index("build_rype_index") < step_names.index("register-files")
+
+    build = next(s for s in host.steps if s.name == "build_rype_index")
+    assert build.module == "qiita_compute_orchestrator.jobs.build_rype_index"
+    assert build.container is None
+    assert build.target_status == "indexing"
+    # Consumes the feature-keyed chunks the load step re-exposes as a binding.
+    assert build.inputs == ["reference_sequence_chunks"]
+    assert build.outputs == ["rype_index_path", "rype_index_meta"]
+
+    # The load step re-exposes the feature-keyed chunks under its own binding so
+    # build_rype_index can consume them; reference-add declares only staging_dir.
+    load = next(s for s in host.steps if s.name == "load")
+    assert "reference_sequence_chunks" in load.outputs
+
+    # register-index consumes the build step's meta JSON (native-step outputs
+    # are path strings, so the params ride a file).
+    register_index = next(s for s in host.steps if s.name == "register-index")
+    assert register_index.inputs == ["rype_index_meta"]
+
+    # Pin the CLI's hardcoded action_id/version against the YAML — `qiita
+    # reference load --host` submits these literals; an id/version drift would
+    # 404 at submit. (Version constant is shared with reference-add.)
+    from qiita_control_plane.cli.reference_load import (
+        _HOST_REFERENCE_ADD_ACTION_ID,
+        _REFERENCE_ADD_ACTION_VERSION,
+    )
+
+    assert _HOST_REFERENCE_ADD_ACTION_ID == host.action_id == "host-reference-add"
+    assert _REFERENCE_ADD_ACTION_VERSION == host.version == "1.0.0"
+
 
 def test_load_actions_loads_on_disk_bcl_convert_yaml():
     """The actual on-disk `workflows/bcl-convert/1.0.0.yaml` loads as a

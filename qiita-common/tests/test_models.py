@@ -18,8 +18,26 @@ def test_reference_status_enum():
     assert ReferenceStatus.HASHING == "hashing"
     assert ReferenceStatus.MINTING == "minting"
     assert ReferenceStatus.LOADING == "loading"
+    assert ReferenceStatus.INDEXING == "indexing"
     assert ReferenceStatus.ACTIVE == "active"
     assert ReferenceStatus.FAILED == "failed"
+
+
+def test_reference_status_indexing_transitions():
+    """`indexing` sits between `loading` and `active`; `loading` keeps its
+    direct `→ active` edge so the existing (non-host) reference-add flow is
+    unchanged, and `indexing` is only reachable from `loading`."""
+    from qiita_common.models import VALID_STATUS_TRANSITIONS, ReferenceStatus
+
+    assert VALID_STATUS_TRANSITIONS[ReferenceStatus.LOADING] == {
+        ReferenceStatus.INDEXING,
+        ReferenceStatus.ACTIVE,
+        ReferenceStatus.FAILED,
+    }
+    assert VALID_STATUS_TRANSITIONS[ReferenceStatus.INDEXING] == {
+        ReferenceStatus.ACTIVE,
+        ReferenceStatus.FAILED,
+    }
 
 
 def test_reference_create_request_valid():
@@ -34,6 +52,72 @@ def test_reference_create_request_valid():
     assert req.name == "greengenes2"
     assert req.version == "2024.09"
     assert req.kind == "sequence_reference"
+
+
+def test_reference_create_request_is_host_defaults_false():
+    """is_host is an orthogonal flag; absent means a regular reference."""
+    from qiita_common.models import ReferenceCreateRequest
+
+    req = ReferenceCreateRequest(name="greengenes2", version="2024.09", kind="sequence_reference")
+    assert req.is_host is False
+
+    host = ReferenceCreateRequest(
+        name="human", version="t2t-chm13v2.0", kind="sequence_reference", is_host=True
+    )
+    assert host.is_host is True
+
+
+def test_reference_response_carries_is_host():
+    """ReferenceResponse surfaces the is_host flag from the DB row."""
+    from qiita_common.models import ReferenceResponse
+
+    resp = ReferenceResponse(
+        reference_idx=1,
+        name="human",
+        version="t2t-chm13v2.0",
+        kind="sequence_reference",
+        status="active",
+        is_host=True,
+        created_by_idx=42,
+        created_at=datetime.now(UTC),
+    )
+    assert resp.is_host is True
+    assert resp.model_dump()["is_host"] is True
+
+
+def test_reference_index_model_round_trips():
+    """ReferenceIndex describes a built index: where it is + how it was made."""
+    from qiita_common.models import ReferenceIndex
+
+    now = datetime.now(UTC)
+    idx = ReferenceIndex(
+        reference_index_idx=5,
+        reference_idx=1,
+        index_type="rype",
+        fs_path="/srv/qiita/references/1/rype/index.ryxdi",
+        params={"k": 64, "w": 25, "bucket_name": "reference_1"},
+        created_at=now,
+    )
+    d = idx.model_dump()
+    assert d["reference_idx"] == 1
+    assert d["index_type"] == "rype"
+    assert d["params"]["k"] == 64
+    assert d["created_at"] == now
+
+
+def test_reference_index_rejects_zero_idx():
+    """reference_idx must be positive."""
+    from qiita_common.models import ReferenceIndex
+
+    with pytest.raises(ValidationError):
+        ReferenceIndex(
+            reference_index_idx=1,
+            reference_idx=0,
+            index_type="rype",
+            fs_path="/x",
+            params={},
+            created_at=datetime.now(UTC),
+        )
 
 
 def test_reference_create_request_rejects_invalid_kind():
@@ -83,12 +167,14 @@ def test_reference_response_round_trips():
         version="2024.09",
         kind="sequence_reference",
         status="pending",
+        is_host=False,
         created_by_idx=42,
         created_at=now,
     )
     d = resp.model_dump()
     assert d["reference_idx"] == 1
     assert d["status"] == "pending"
+    assert d["is_host"] is False
     assert d["created_at"] == now
 
 

@@ -234,11 +234,21 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 partial.unlink(missing_ok=True)
             shutil.rmtree(chunks_dir, ignore_errors=True)
 
-    # Return a single binding pointing at the staging dir; the YAML's
-    # `outputs: [staging_dir]` declaration matches this. The runner's
+    # `staging_dir` is the binding register-files consumes; the YAML's
+    # `outputs: [staging_dir]` declaration matches it. The runner's
     # register-files convention picks up flat `*.parquet` files and
     # top-level subdirs of `part_*.parquet` (multi-file tables).
-    return {"staging_dir": workspace}
+    #
+    # `reference_sequence_chunks` re-exposes the feature-keyed chunks dir
+    # (written by `_write_reference_sequence_chunks` above) as its own binding.
+    # The hash_sequences step's same-named binding is sequence_hash-keyed
+    # (pre-minting); this is the feature_idx-keyed re-key, which is what rype
+    # needs. host-reference-add's build_rype_index step consumes it — and must
+    # run BEFORE register-files, which MOVES these part files into permanent
+    # DuckLake storage (data-plane `move_file`). reference-add declares only
+    # `staging_dir` as an output, so this extra key is inert there (the runner
+    # binds only a step's declared outputs).
+    return {"staging_dir": workspace, "reference_sequence_chunks": chunks_dir}
 
 
 def _unwrap_chunks_to_temp_file(

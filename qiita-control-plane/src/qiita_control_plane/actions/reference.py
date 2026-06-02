@@ -14,9 +14,12 @@ from qiita_common.models import (
     ReferenceStatus,
 )
 
-# Same projection used in routes/reference.py — kept identical so both
-# callers return the same shape.
-_REFERENCE_RETURNING = "reference_idx, name, version, kind, status, created_by_idx, created_at"
+# Column projection backing every ReferenceResponse. Imported by
+# routes/reference.py too, so the two callers can't drift (they previously
+# kept hand-synced copies).
+REFERENCE_RETURNING = (
+    "reference_idx, name, version, kind, status, is_host, created_by_idx, created_at"
+)
 
 
 class ReferenceNotFound(Exception):
@@ -53,7 +56,7 @@ async def transition_reference_status(
     row = await pool.fetchrow(
         "UPDATE qiita.reference SET status = $1"
         " WHERE reference_idx = $2 AND status = ANY($3::text[])"
-        f" RETURNING {_REFERENCE_RETURNING}",
+        f" RETURNING {REFERENCE_RETURNING}",
         str(target),
         reference_idx,
         valid_sources,

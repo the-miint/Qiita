@@ -2,7 +2,11 @@
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_REFERENCE_BY_IDX, URL_REFERENCE_PREFIX
+from qiita_common.api_paths import (
+    URL_REFERENCE_BY_IDX,
+    URL_REFERENCE_INDEX,
+    URL_REFERENCE_PREFIX,
+)
 
 pytestmark = pytest.mark.db
 
@@ -29,8 +33,12 @@ async def client(postgres_pool, human_admin_session):
         ac._created_refs = created_refs
         yield ac
 
-    # Cleanup only rows we created, in FK dependency order
+    # Cleanup only rows we created, in FK dependency order (RESTRICT FKs).
     if created_refs:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = ANY($1::bigint[])",
+            created_refs,
+        )
         await postgres_pool.execute(
             "DELETE FROM qiita.reference_membership WHERE reference_idx = ANY($1::bigint[])",
             created_refs,
@@ -64,6 +72,33 @@ async def test_create_reference_returns_201(client, human_admin_session):
     # created_by_idx is the canonical owner reference.
     assert body["created_by_idx"] == human_admin_session["principal_idx"]
     assert "created_by" not in body
+
+
+async def test_create_reference_defaults_is_host_false(client):
+    """A reference created without is_host is a regular (non-host) reference."""
+    resp = await _create_ref(client, "test-ref-nonhost")
+    assert resp.status_code == 201
+    assert resp.json()["is_host"] is False
+
+
+async def test_create_host_reference_round_trips(client):
+    """is_host=true persists and surfaces on both create and GET."""
+    resp = await client.post(
+        URL_REFERENCE_PREFIX,
+        json={
+            "name": "test-host-ref",
+            "version": "1.0",
+            "kind": "sequence_reference",
+            "is_host": True,
+        },
+    )
+    assert resp.status_code == 201
+    idx = resp.json()["reference_idx"]
+    client._created_refs.append(idx)
+    assert resp.json()["is_host"] is True
+
+    get_resp = await client.get(URL_REFERENCE_BY_IDX.format(reference_idx=idx))
+    assert get_resp.json()["is_host"] is True
 
 
 async def test_create_reference_rejects_invalid_kind(client):
@@ -124,3 +159,104 @@ async def test_create_duplicate_reference_returns_409(client):
 
     resp2 = await _create_ref(client, "test-ref-dup")
     assert resp2.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# GET /reference (list) + GET /reference/{idx}/index
+# ---------------------------------------------------------------------------
+
+
+async def test_list_references_returns_created(client):
+    """GET /reference returns a list including references we just created."""
+    r1 = await _create_ref(client, "test-list-a")
+    r2 = await _create_ref(client, "test-list-b")
+    idxs = {r1.json()["reference_idx"], r2.json()["reference_idx"]}
+
+    resp = await client.get(URL_REFERENCE_PREFIX)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert isinstance(body, list)
+    listed = {r["reference_idx"] for r in body}
+    assert idxs <= listed
+
+
+async def test_list_references_filters_is_host(client):
+    """GET /reference?is_host=true returns only host references."""
+    host = await client.post(
+        URL_REFERENCE_PREFIX,
+        json={
+            "name": "test-list-host",
+            "version": "1.0",
+            "kind": "sequence_reference",
+            "is_host": True,
+        },
+    )
+    host_idx = host.json()["reference_idx"]
+    client._created_refs.append(host_idx)
+    nonhost = await _create_ref(client, "test-list-nonhost")
+    nonhost_idx = nonhost.json()["reference_idx"]
+
+    resp = await client.get(URL_REFERENCE_PREFIX, params={"is_host": "true"})
+    assert resp.status_code == 200
+    listed = {r["reference_idx"]: r for r in resp.json()}
+    assert host_idx in listed
+    assert listed[host_idx]["is_host"] is True
+    assert nonhost_idx not in listed
+
+
+async def test_list_references_filters_status(client):
+    """GET /reference?status=pending returns only references in that status."""
+    r = await _create_ref(client, "test-list-status")
+    idx = r.json()["reference_idx"]
+
+    resp = await client.get(URL_REFERENCE_PREFIX, params={"status": "pending"})
+    assert resp.status_code == 200
+    listed = {row["reference_idx"] for row in resp.json()}
+    assert idx in listed
+
+    resp_active = await client.get(URL_REFERENCE_PREFIX, params={"status": "active"})
+    assert idx not in {row["reference_idx"] for row in resp_active.json()}
+
+
+async def test_list_references_rejects_bad_status(client):
+    """An out-of-enum status filter is a 422."""
+    resp = await client.get(URL_REFERENCE_PREFIX, params={"status": "bogus"})
+    assert resp.status_code == 422
+
+
+async def test_get_reference_index_empty_when_none(client):
+    """A reference with no built index returns an empty list (200, not 404)."""
+    r = await _create_ref(client, "test-index-empty")
+    idx = r.json()["reference_idx"]
+    resp = await client.get(URL_REFERENCE_INDEX.format(reference_idx=idx))
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+async def test_get_reference_index_returns_rows(client, postgres_pool):
+    """After an index row exists, GET returns it with path + params."""
+    r = await _create_ref(client, "test-index-rows")
+    idx = r.json()["reference_idx"]
+    await postgres_pool.execute(
+        "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
+        " VALUES ($1, 'rype', '/srv/qiita/references/x/rype/index.ryxdi', $2::jsonb)",
+        idx,
+        '{"k": 64, "w": 25}',
+    )
+    resp = await client.get(URL_REFERENCE_INDEX.format(reference_idx=idx))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    assert body[0]["index_type"] == "rype"
+    assert body[0]["fs_path"].endswith("index.ryxdi")
+    assert body[0]["params"]["k"] == 64
+    assert body[0]["reference_idx"] == idx
+
+
+async def test_get_reference_index_404_when_reference_absent(client, postgres_pool):
+    """GET index for a non-existent reference is 404 (distinct from empty list)."""
+    max_idx = await postgres_pool.fetchval(
+        "SELECT COALESCE(MAX(reference_idx), 0) FROM qiita.reference"
+    )
+    resp = await client.get(URL_REFERENCE_INDEX.format(reference_idx=max_idx + 1))
+    assert resp.status_code == 404

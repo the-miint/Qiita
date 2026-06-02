@@ -36,6 +36,15 @@ _miint_installed = False
 
 _MIINT_EXT_REPO = os.environ.get("MIINT_EXTENSION_REPO")
 
+# Optional override for DuckDB's extension directory. Primarily a test-isolation
+# hook: when the orchestrator pulls miint from a non-default repo (the team
+# mirror), pointing its installs at a private directory keeps them from clashing
+# with another component (e.g. the data plane) that installs the community build
+# into the shared default `~/.duckdb/extensions` — DuckDB refuses a plain INSTALL
+# when the cached extension's origin differs. Unset in production → DuckDB's
+# default directory, unchanged behavior.
+_MIINT_EXT_DIR = os.environ.get("MIINT_EXTENSION_DIRECTORY")
+
 # Canonical DuckDB COPY options for the *final* Parquet artifacts the
 # orchestrator writes — the ones the Rust data plane registers into
 # DuckLake. Lives here (next to the only DuckDB connection helpers) so
@@ -139,10 +148,17 @@ def apply_duckdb_settings(
 def open_conn() -> duckdb.DuckDBPyConnection:
     """Open a DuckDB connection. Unsigned-extensions config is enabled
     only when MIINT_EXTENSION_REPO points at a non-default repo (the
-    team mirror), since that path serves community-signed binaries."""
+    team mirror), since that path serves community-signed binaries.
+
+    When MIINT_EXTENSION_DIRECTORY is set, installs/loads are isolated to
+    that directory (see the constant's note) — keeps a mirror build from
+    clashing with a community build in the shared default directory."""
+    config: dict[str, str] = {}
     if _MIINT_EXT_REPO is not None:
-        return duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
-    return duckdb.connect(":memory:")
+        config["allow_unsigned_extensions"] = "true"
+    if _MIINT_EXT_DIR:
+        config["extension_directory"] = _MIINT_EXT_DIR
+    return duckdb.connect(":memory:", config=config) if config else duckdb.connect(":memory:")
 
 
 async def ensure_miint_installed() -> None:

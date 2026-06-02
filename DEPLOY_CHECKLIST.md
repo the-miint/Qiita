@@ -11,30 +11,45 @@ Substitute your host's FQDN for the `qiita-miint.ucsd.edu` examples and `<scratc
 
 ## Pending deploy
 
-Nothing pending — the buckets below are empty until the next PR folds its operator steps in via `/deploy-note`. At deploy time buckets 1→5 run in order, with buckets 1–3 preceding the bucket-4 restart. Each step carries its source `(#N)` tag.
+Everything merged but not yet deployed. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
 
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
-_None yet._
+No new env var — host references (#70) reuse the existing `PATH_SCRATCH` (set in the 2026-06-01 deploy).
 
 ### 2. One-time host setup
 
-_None yet._
+No host setup — the rype `.ryxdi` dir is `mkdir`'d at runtime under `PATH_SCRATCH/references/`; no manual dir step (#70).
 
 ### 3. Migrations
 
-_None yet._
+```bash
+# [operator] DATABASE_URL must be in your shell, pointing at the SAME DB as
+# control-plane.env. activate.sh re-checks public.schema_migrations at deploy
+# time and ABORTS before any restart if one is unapplied.
+make -C ~/qiita-miint migrate
+```
+`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#70) adds the three `20260601*` reference migrations (`is_host`, the `indexing` status CHECK, `reference_index`).
 
 ### 4. Deploy
 
-_None yet._
+```bash
+# [admin] SKIP_PULL=1 because redeploy.md step 2 already pulled the clone
+sudo SKIP_PULL=1 QIITA_HOSTNAME=qiita-miint.ucsd.edu /home/qiita/qiita-miint/deploy/local-deploy.sh
+```
 
 ### 5. Verify
 
-_None yet._
+```bash
+# [admin] host-reference-add 1.0.0 synced into qiita.action by `qiita-admin
+# actions sync` inside activate.sh (#70)
+sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
+    psql "$DATABASE_URL" -c "SELECT action_id, version, enabled FROM qiita.action ORDER BY action_id;"'   # host-reference-add 1.0.0 enabled (#70)
+```
 
 ### Notes (no host action)
 
+- (#70) Host references (additive, no client action): `qiita.reference` gains `is_host` and a new `indexing` status (`loading → indexing → active`); new read endpoints `GET /reference` (list, filterable) and `GET /reference/{idx}/index`. The `host-reference-add` workflow is a new `workflows/` entry synced into `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (verify in bucket 5) — not a migration. The rype `.ryxdi` index is written under `PATH_SCRATCH/references/{idx}/rype/` and the orchestrator propagates `PATH_SCRATCH` into SLURM jobs so it lands on the shared FS, not node-local `/tmp`. Note this is the **scratch** tier — if the deploy's scratch-cleanup policy purges `PATH_SCRATCH`, a built index would need a rebuild (re-run `host-reference-add`); a dedicated persistent tier for built indices is a possible follow-up.
 - (#75) bcl-convert SIF build is now generic. The command changed: `bash scripts/build-bcl-convert-sif.sh` → `PATH_DERIVED=<derived> bash scripts/build-sif.sh bcl-convert` (per-workflow spec now lives in `workflows/bcl-convert/sif-build.env`). The builder stages into a temp root **owned by the invoking user** and only reads the checkout, so it no longer needs the `qiita`-owned `workflows/bcl-convert/` dir writable by `qiita-orch` — if a `chmod`/`setfacl` workaround was applied there to get the build to run, it can be removed. The produced SIF is byte-for-byte the same and `local-deploy.sh` does not rebuild SIFs, so a routine deploy needs no action; this only matters next time the SIF is (re)built.
 
 ---
