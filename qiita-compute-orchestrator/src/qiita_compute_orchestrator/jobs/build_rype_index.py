@@ -52,13 +52,12 @@ YAML_STEP_NAME = "build_rype_index"
 # for Python / the rype runtime / OS. Literals mirror the host-reference-add
 # YAML's baseline_resources for this step (a mismatch is visible at review).
 #
-# CAVEAT: 24 GB was sized to FIT THE RESOURCE ENVELOPE (under mem_gb=32), NOT
-# empirically validated against a full host genome. The real rype build is so
-# far only smoke-tested on ~640 bp synthetic data; a real human reference
-# (e.g. T2T-CHM13, ~3.1 Gbp at k=64/w=25) has not been profiled. This cap is
-# the first thing to OOM-kill if rype's peak exceeds it — if a real host
-# reference fails here, bump `mem_gb` in the YAML and `_RYPE_MAX_MEMORY_GB`
-# together (keep the ~4 GB headroom) once a real build gives a memory figure.
+# 24 GB is the envelope-fit budget (under mem_gb=32). rype autoscales its work
+# to the `max_memory` ceiling it's given, so this is a budget hint, not a hard
+# minimum a large reference would OOM against. Refined per-genome levels are a
+# deliberate follow-up — when we size against a real host reference, bump
+# `mem_gb` in the YAML and `_RYPE_MAX_MEMORY_GB` together (keep the ~4 GB
+# headroom).
 _DUCKDB_MEMORY_GB = 4
 _DUCKDB_THREADS = 4
 _RYPE_MAX_MEMORY_GB = 24
