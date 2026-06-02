@@ -15,26 +15,45 @@ from typing import Annotated
 import asyncpg
 from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import Field
-from qiita_common.api_paths import PATH_STUDY_BY_IDX, PATH_STUDY_PREFIX, PATH_STUDY_ROOT
+from qiita_common.api_paths import (
+    PATH_STUDY_BY_IDX,
+    PATH_STUDY_LOOKUP_BY_ACCESSION,
+    PATH_STUDY_PREFIX,
+    PATH_STUDY_ROOT,
+)
 from qiita_common.auth_constants import Scope, SystemRole
-from qiita_common.models import StudyCreate, StudyPatchRequest, StudyResponse, Tier
+from qiita_common.models import (
+    StudyCreate,
+    StudyLookupByAccessionRequest,
+    StudyLookupByAccessionResponse,
+    StudyPatchRequest,
+    StudyResponse,
+    Tier,
+)
 
 from ..auth.guards import (
     require_complete_profile,
     require_eligible_owner,
+    require_human,
     require_scope,
     require_study_access,
     require_study_exists,
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
-from ..repositories.study import create_study, fetch_study, update_study
+from ..repositories.study import (
+    create_study,
+    fetch_study,
+    fetch_study_idxs_by_accession,
+    update_study,
+)
 from ._helpers import (
     GENERIC_FK_VIOLATION,
     etag_for_updated_at,
     raise_for_unique_violation,
     require_etag_match,
     require_if_match,
+    resolve_idxs_by_natural_key,
 )
 
 router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["study"])
@@ -293,3 +312,32 @@ async def patch_study(
     response.headers["ETag"] = etag_for_updated_at(updated_row["updated_at"])
 
     return _study_response_from_row(updated_row)
+
+
+@router.post(PATH_STUDY_LOOKUP_BY_ACCESSION)
+async def lookup_study_by_accession(
+    body: StudyLookupByAccessionRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.STUDY_READ)),
+) -> StudyLookupByAccessionResponse:
+    """Resolve a list of ebi_study_accession values to study_idx.
+
+    POST (not GET) so a long accession list rides in the body rather
+    than tripping nginx's default URL-line cap.
+
+    Auth: HumanUser with Scope.STUDY_READ. The response is only the
+    (accession, idx) mapping — no study columns — so resolution does
+    not itself disclose row contents; reading a row still requires the
+    per-row access policy on GET /study/{idx}.
+
+    `missing` lists input-order-deduped accessions that did not resolve.
+    """
+    # _user is read only to keep the dependency chain explicit — no
+    # per-caller filter runs here (see auth docstring).
+    _ = user
+    resolved, missing = await resolve_idxs_by_natural_key(
+        values=body.accessions,
+        fetcher=lambda values: fetch_study_idxs_by_accession(pool, values=values),
+    )
+    return StudyLookupByAccessionResponse(resolved=resolved, missing=missing)

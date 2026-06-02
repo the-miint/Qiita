@@ -717,6 +717,30 @@ class BiosampleLookupByMatrixTubeIdResponse(BaseModel):
     missing: list[str]
 
 
+# same-pattern-ok: per-key wire shape; parallels BiosampleLookupByAccessionRequest
+class StudyLookupByAccessionRequest(BaseModel):
+    """Resolves a list of ebi_study_accession values to study_idxs in one
+    round trip. Body-shaped (not query-params) so a long accession list
+    cannot exceed nginx's default URL-line cap.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    accessions: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1, max_length=10_000)
+
+
+# same-pattern-ok: per-key wire shape; parallels BiosampleLookupByAccessionResponse
+class StudyLookupByAccessionResponse(BaseModel):
+    """`resolved` maps each found accession to its study_idx. `missing`
+    lists accessions that did not resolve, in input order (deduped).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    resolved: dict[str, Annotated[int, Field(gt=0)]]
+    missing: list[str]
+
+
 class PatchRequestModel(BaseModel):
     """Base class for every PATCH-body Pydantic model in the API.
 

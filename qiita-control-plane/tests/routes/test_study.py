@@ -1,4 +1,5 @@
-"""Integration tests for the POST / GET / PATCH /api/v1/study routes.
+"""Integration tests for /api/v1/study routes: POST, GET, PATCH, and the
+bulk lookup-by-accession endpoint.
 
 POST: covers happy-path creation across the three caller-role variants,
 the lab-tech-on-behalf rule, auth / scope guards, the collapsed
@@ -15,6 +16,10 @@ wet_lab_admin role bypass), If-Match concurrency (428 / 412), body
 validation (empty, extra-forbidden, explicit-null title, empty title),
 the exception-mapping paths (PI FK 422, duplicate accession 409), and
 the ETag bump.
+
+POST /lookup-by-accession: covers resolved/missing wire shape, input
+dedup preserving order, the no-per-row-access-predicate behavior, auth
+and scope guards, and the request-model rejection paths.
 """
 
 import secrets
@@ -22,13 +27,18 @@ import secrets
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_STUDY_BY_IDX, URL_STUDY_PREFIX
+from qiita_common.api_paths import (
+    URL_STUDY_BY_IDX,
+    URL_STUDY_LOOKUP_BY_ACCESSION,
+    URL_STUDY_PREFIX,
+)
 from qiita_common.auth_constants import Scope
 
 from qiita_control_plane.testing.db_seeds import (
     seed_service_principal,
     seed_user_principal,
 )
+from qiita_control_plane.testing.unique_names import unique_accession
 
 from .conftest import (
     OWNER_INELIGIBILITY_KINDS,
@@ -912,3 +922,143 @@ async def test_patch_study_duplicate_ebi_accession_409(ctx):
     )
     assert resp.status_code == 409
     assert resp.json()["detail"] == "ebi_study_accession already in use"
+
+
+# ===========================================================================
+# POST /api/v1/study/lookup-by-accession — bulk accession → idx resolver
+# ===========================================================================
+# Tests below cover the resolved/missing wire shape, input-order dedup,
+# the no-per-row-access-predicate security invariant (Scope.STUDY_READ
+# resolves the idx; reading row contents still requires GET /study/{idx}),
+# and the request-model rejection paths.
+
+
+async def _create_study_with_accession(ctx, *, accession: str) -> int:
+    """Create a study via POST carrying the given ebi_study_accession and
+    return its idx; cleanup is handled by _post_study's tracker."""
+    resp = await _post_study(
+        ctx["user"],
+        ctx,
+        title=_unique_title("lookup"),
+        ebi_study_accession=accession,
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["study_idx"]
+
+
+async def test_lookup_study_by_accession_returns_resolved_map_and_missing_list(ctx):
+    """Tests the case where the lookup body mixes seeded and absent
+    accessions: `resolved` carries the hits and `missing` echoes the
+    absent value in input order."""
+    acc_a = unique_accession("ERP-LOOKUP-A")
+    acc_b = unique_accession("ERP-LOOKUP-B")
+    acc_missing = unique_accession("ERP-LOOKUP-MISS")
+    study_a = await _create_study_with_accession(ctx, accession=acc_a)
+    study_b = await _create_study_with_accession(ctx, accession=acc_b)
+
+    resp = await ctx["user"].post(
+        URL_STUDY_LOOKUP_BY_ACCESSION,
+        json={"accessions": [acc_a, acc_b, acc_missing]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "resolved": {acc_a: study_a, acc_b: study_b},
+        "missing": [acc_missing],
+    }
+
+
+async def test_lookup_study_by_accession_dedups_input_preserving_order(ctx):
+    """Tests the case where the body repeats accessions: each value is
+    deduped and `missing` echoes the deduped values in first-occurrence
+    order."""
+    acc = unique_accession("ERP-LOOKUP-DUP")
+    study_idx = await _create_study_with_accession(ctx, accession=acc)
+    acc_miss = unique_accession("ERP-LOOKUP-DUP-MISS")
+
+    resp = await ctx["user"].post(
+        URL_STUDY_LOOKUP_BY_ACCESSION,
+        json={"accessions": [acc_miss, acc, acc_miss, acc]},
+    )
+    assert resp.status_code == 200, resp.text
+    # Input-order dedup: first occurrence wins.
+    assert resp.json() == {"resolved": {acc: study_idx}, "missing": [acc_miss]}
+
+
+async def test_lookup_study_by_accession_no_access_caller_still_resolves(ctx):
+    """Tests the case where a regular user with no qiita.study_access row
+    on a wet-lab-admin-owned study still gets the resolved idx — the
+    lookup route runs no per-row access predicate (response carries only
+    the natural-key → idx map; GET /study/{idx} still gates access)."""
+    acc = unique_accession("ERP-LOOKUP-NOACC")
+    # wet_lab_admin owns the study; the regular_user has no study_access row.
+    create_resp = await _post_study(
+        ctx["wet"],
+        ctx,
+        title=_unique_title("lookup-noacc"),
+        ebi_study_accession=acc,
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    study_idx = create_resp.json()["study_idx"]
+
+    resp = await ctx["user"].post(
+        URL_STUDY_LOOKUP_BY_ACCESSION,
+        json={"accessions": [acc]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"resolved": {acc: study_idx}, "missing": []}
+
+
+async def test_lookup_study_by_accession_anonymous_401(ctx):
+    """Tests the case where the call carries no auth — require_human
+    raises 401 before any DB work runs."""
+    from qiita_control_plane.main import app
+
+    app.state.pool = ctx["pool"]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
+        resp = await anon.post(
+            URL_STUDY_LOOKUP_BY_ACCESSION,
+            json={"accessions": ["ERP000001"]},
+        )
+    assert resp.status_code == 401
+
+
+async def test_lookup_study_by_accession_missing_scope_403(ctx, no_study_read_client):
+    """Tests the case where the caller's PAT scope set excludes
+    Scope.STUDY_READ — require_scope raises 403 before any DB work."""
+    resp = await no_study_read_client.post(
+        URL_STUDY_LOOKUP_BY_ACCESSION,
+        json={"accessions": ["ERP000001"]},
+    )
+    assert resp.status_code == 403
+    assert "study:read" in resp.json()["detail"]
+
+
+async def test_lookup_study_by_accession_rejects_empty_list_422(ctx):
+    """Tests the case where `accessions` is an empty list — the request
+    model's min_length=1 rejects it at the wire boundary with 422."""
+    resp = await ctx["user"].post(
+        URL_STUDY_LOOKUP_BY_ACCESSION,
+        json={"accessions": []},
+    )
+    assert resp.status_code == 422
+
+
+async def test_lookup_study_by_accession_rejects_empty_string_422(ctx):
+    """Tests the case where any element of `accessions` is an empty
+    string — the per-element min_length=1 rejects it at the wire boundary
+    with 422."""
+    resp = await ctx["user"].post(
+        URL_STUDY_LOOKUP_BY_ACCESSION,
+        json={"accessions": [""]},
+    )
+    assert resp.status_code == 422
+
+
+async def test_lookup_study_by_accession_rejects_extra_field_422(ctx):
+    """Tests the case where the body carries an unknown key —
+    extra='forbid' rejects with 422 rather than silently dropping it."""
+    resp = await ctx["user"].post(
+        URL_STUDY_LOOKUP_BY_ACCESSION,
+        json={"accessions": ["ERP000001"], "unknown": "x"},
+    )
+    assert resp.status_code == 422

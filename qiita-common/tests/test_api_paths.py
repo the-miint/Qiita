@@ -98,6 +98,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
     ("URL_USER_ME", "PATH_USER_PREFIX", "PATH_USER_ME"),
     # /study
     ("URL_STUDY_BY_IDX", "PATH_STUDY_PREFIX", "PATH_STUDY_BY_IDX"),
+    (
+        "URL_STUDY_LOOKUP_BY_ACCESSION",
+        "PATH_STUDY_PREFIX",
+        "PATH_STUDY_LOOKUP_BY_ACCESSION",
+    ),
     # /sequencing-run
     (
         "URL_SEQUENCING_RUN_SEQUENCED_POOL",

@@ -1,11 +1,10 @@
 """Cross-route helpers shared by sibling route modules.
 
-Hosts the ETag formatter that every PATCH-bearing route calls and the
-metadata slot-collision detail builder that every metadata-writing
-route calls. Lifting both here keeps response wording consistent across
+Centralizing them keeps response wording consistent across parallel
 endpoints — same input shape, same on-the-wire output.
 """
 
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 
 import asyncpg
@@ -302,3 +301,29 @@ def raise_for_transient_write_race(exc: TransientWriteRaceError) -> None:
         ),
         headers={"Retry-After": _TRANSIENT_WRITE_RACE_RETRY_AFTER},
     )
+
+
+async def resolve_idxs_by_natural_key(
+    *,
+    values: list[str],
+    fetcher: Callable[[list[str]], Awaitable[dict[str, int]]],
+) -> tuple[dict[str, int], list[str]]:
+    """Dedup `values` in input order, resolve survivors via `fetcher`, and
+    return `(resolved, missing)`.
+
+    The caller supplies `fetcher` already bound to its pool and any per-key
+    SQL details so this helper stays table-agnostic. `missing` is the
+    input-order deduped list of values that did not resolve.
+    """
+    # Dedup while preserving input order so `missing` is deterministic.
+    dedup_ordered: list[str] = []
+    seen: set[str] = set()
+    for v in values:
+        if v in seen:
+            continue
+        seen.add(v)
+        dedup_ordered.append(v)
+
+    resolved = await fetcher(dedup_ordered)
+    missing = [v for v in dedup_ordered if v not in resolved]
+    return resolved, missing

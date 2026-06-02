@@ -2412,9 +2412,9 @@ async def test_lookup_by_accession_rejects_extra_field_422(ctx):
 # ---------------------------------------------------------------------------
 # Mirrors the accession variant; the auth surface, dedup/missing semantics,
 # and retired-row exclusion are shared with lookup_biosample_by_accession
-# via the private _resolve_biosample_idxs_by_natural_key helper. The tests
-# below cover the per-key wire surface (route exists, format validator
-# fires on bad input). The shared behavior (auth tiers, dedup, retired-row
+# via resolve_idxs_by_natural_key in routes/_helpers.py. The tests below
+# cover the per-key wire surface (route exists, format validator fires on
+# bad input). The shared behavior (auth tiers, dedup, retired-row
 # exclusion) is exercised once on the accession surface above.
 
 

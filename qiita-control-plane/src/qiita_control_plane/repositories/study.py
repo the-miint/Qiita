@@ -79,6 +79,28 @@ async def fetch_study_exists(
     )
 
 
+async def fetch_study_idxs_by_accession(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    values: list[str],
+) -> dict[str, int]:
+    """Return `{ebi_study_accession: study_idx}` for every value in `values`
+    that resolves to a qiita.study row. Values absent from the table are
+    omitted from the returned map.
+
+    The study table has no soft-delete column, so every key in the result
+    is a live row.
+    """
+    if not values:
+        return {}
+    rows = await pool_or_conn.fetch(
+        "SELECT idx, ebi_study_accession FROM qiita.study"
+        " WHERE ebi_study_accession = ANY($1::text[])",
+        values,
+    )
+    return {r["ebi_study_accession"]: r["idx"] for r in rows}
+
+
 async def insert_study(
     conn: asyncpg.Connection,
     *,

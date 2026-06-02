@@ -19,6 +19,7 @@ its mutation inside one connection-scoped transaction with required
 If-Match optimistic-concurrency control.
 """
 
+from collections.abc import Awaitable, Callable
 from typing import Annotated
 
 import asyncpg
@@ -90,6 +91,7 @@ from ._helpers import (
     raise_for_unique_violation,
     require_etag_match,
     require_if_match,
+    resolve_idxs_by_natural_key,
 )
 
 router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["biosample"])
@@ -446,32 +448,12 @@ async def get_biosample(
     )
 
 
-async def _resolve_biosample_idxs_by_natural_key(
-    pool: asyncpg.Pool,
-    *,
-    key: BiosampleLookupKey,
-    values: list[str],
-) -> tuple[dict[str, int], list[str]]:
-    """Shared dedup-and-fetch for the natural-key lookup endpoints.
-
-    Dedups `values` in input order, resolves the survivors via the named
-    column, and returns (resolved, missing). The two route wrappers
-    differ only in the per-key Pydantic request/response classes; this
-    helper carries the actual logic.
-    """
-    # Dedup while preserving input order so `missing` is deterministic
-    # for the operator's error message.
-    dedup_ordered: list[str] = []
-    seen: set[str] = set()
-    for v in values:
-        if v in seen:
-            continue
-        seen.add(v)
-        dedup_ordered.append(v)
-
-    resolved = await fetch_biosample_idxs_by_natural_key(pool, key=key, values=dedup_ordered)
-    missing = [v for v in dedup_ordered if v not in resolved]
-    return resolved, missing
+def _biosample_natural_key_fetcher(
+    pool: asyncpg.Pool, key: BiosampleLookupKey
+) -> Callable[[list[str]], Awaitable[dict[str, int]]]:
+    """Return a single-argument awaitable that resolves a list of
+    natural-key values to a `{value: biosample_idx}` map."""
+    return lambda values: fetch_biosample_idxs_by_natural_key(pool, key=key, values=values)
 
 
 @biosample_router.post(PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION)
@@ -505,8 +487,9 @@ async def lookup_biosample_by_accession(
     # _user is read only to keep the dependency chain explicit — no
     # per-caller filter runs here (see auth docstring).
     _ = user
-    resolved, missing = await _resolve_biosample_idxs_by_natural_key(
-        pool, key="biosample_accession", values=body.accessions
+    resolved, missing = await resolve_idxs_by_natural_key(
+        values=body.accessions,
+        fetcher=_biosample_natural_key_fetcher(pool, "biosample_accession"),
     )
     return BiosampleLookupByAccessionResponse(resolved=resolved, missing=missing)
 
@@ -526,8 +509,9 @@ async def lookup_biosample_by_matrix_tube_id(
     for the full rationale.
     """
     _ = user
-    resolved, missing = await _resolve_biosample_idxs_by_natural_key(
-        pool, key="matrix_tube_id", values=body.matrix_tube_ids
+    resolved, missing = await resolve_idxs_by_natural_key(
+        values=body.matrix_tube_ids,
+        fetcher=_biosample_natural_key_fetcher(pool, "matrix_tube_id"),
     )
     return BiosampleLookupByMatrixTubeIdResponse(resolved=resolved, missing=missing)
 
