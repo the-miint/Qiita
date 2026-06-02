@@ -1,7 +1,7 @@
 """Tests for the bcl_convert_prep native job module.
 
-Three layers, none requiring the optional ``run_preflight`` dep at
-collection time:
+Three layers, none requiring the ``run_preflight`` dep at collection
+time:
 
 - Discovery: the shipped module is importable and passes the native-job
   contract scan. This is the regression guard for the import chain
@@ -9,9 +9,8 @@ collection time:
   silently drops the module from the discovered set.
 - ``Inputs`` contract: the typed input model accepts the framework-injected
   shape and rejects missing/ill-typed fields.
-- ``execute`` fail-fast: with the optional ``run_preflight`` dep stubbed in,
-  the up-front absolute/exists/is-dir guards raise ValueError before any
-  CP round-trip.
+- ``execute`` fail-fast: with ``run_preflight`` stubbed in, the up-front
+  absolute/exists/is-dir guards raise ValueError before any CP round-trip.
 """
 
 from __future__ import annotations
@@ -75,23 +74,17 @@ def test_inputs_rejects_non_int_idx():
 
 @pytest.fixture
 def _stub_run_preflight(monkeypatch):
-    """Install a stub ``run_preflight.legacy.api.save_legacy_csv`` so
+    """Install a stub ``run_preflight.save_bclconvert_v1_csv`` so
     execute()'s deferred import succeeds without the real dep, letting the
     up-front fail-fast guards run. The stub raises if actually called —
     the fail-fast tests must error out before reaching it."""
-    api = types.ModuleType("run_preflight.legacy.api")
 
-    def _save_legacy_csv(conn, path):  # pragma: no cover - must not be reached
-        raise AssertionError("save_legacy_csv should not be called on a fail-fast path")
+    def _save_bclconvert_v1_csv(conn, path):  # pragma: no cover - must not be reached
+        raise AssertionError("save_bclconvert_v1_csv should not be called on a fail-fast path")
 
-    api.save_legacy_csv = _save_legacy_csv
-    legacy = types.ModuleType("run_preflight.legacy")
-    legacy.api = api
     root = types.ModuleType("run_preflight")
-    root.legacy = legacy
+    root.save_bclconvert_v1_csv = _save_bclconvert_v1_csv
     monkeypatch.setitem(sys.modules, "run_preflight", root)
-    monkeypatch.setitem(sys.modules, "run_preflight.legacy", legacy)
-    monkeypatch.setitem(sys.modules, "run_preflight.legacy.api", api)
 
 
 async def test_execute_rejects_relative_bcl_input_dir(_stub_run_preflight, tmp_path):

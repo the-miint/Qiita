@@ -26,6 +26,7 @@ from qiita_control_plane.repositories.study import (
     create_study,
     fetch_study,
     fetch_study_exists,
+    update_study,
 )
 
 pytestmark = pytest.mark.db
@@ -437,6 +438,42 @@ async def test_create_study_outside_transaction_raises(postgres_pool):
             )
 
 
+async def test_create_study_duplicate_ebi_accession_raises_unique_error(postgres_pool):
+    """Tests the case where two studies attempt the same non-null
+    ebi_study_accession: the second create trips the
+    study_ebi_study_accession_unique constraint and surfaces as
+    asyncpg.UniqueViolationError. The route layer maps this to 409."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            shared_accession = f"ERP{secrets.token_hex(4)}"
+
+            # First study claims the accession.
+            await create_study(
+                conn,
+                owner_idx=owner,
+                created_by_idx=owner,
+                title=_suffix("dup-first"),
+                ebi_study_accession=shared_accession,
+            )
+
+            with pytest.raises(
+                asyncpg.UniqueViolationError,
+                match="study_ebi_study_accession_unique",
+            ):
+                await create_study(
+                    conn,
+                    owner_idx=owner,
+                    created_by_idx=owner,
+                    title=_suffix("dup-second"),
+                    ebi_study_accession=shared_accession,
+                )
+        finally:
+            await tr.rollback()
+
+
 # ---------------------------------------------------------------------------
 # fetch_study_exists
 # ---------------------------------------------------------------------------
@@ -523,3 +560,95 @@ async def test_fetch_study_returns_none_for_missing_idx(postgres_pool):
     # A negative idx is guaranteed to miss because the IDENTITY column
     # only ever issues positive values.
     assert await fetch_study(postgres_pool, -1) is None
+
+
+# ---------------------------------------------------------------------------
+# update_study — study-specific behaviors only. The shared update_row
+# composer's structural behaviors (empty-dict / unknown-key ValueError,
+# None on missing row, updated_at bump, explicit-null, single- and
+# multi-field writes) are already covered by test_update_biosample_* in
+# tests/repositories/test_biosample.py and are not re-tested here. What
+# belongs here is the JSONB-cast carve-out (no biosample column uses
+# jsonb_cols today) and the constraints / triggers that live on
+# qiita.study.
+# ---------------------------------------------------------------------------
+
+
+async def test_update_study_jsonb_extra_metadata_round_trips(postgres_pool):
+    """Tests the case where the JSONB-cast carve-out in update_row
+    serializes dict input and the column round-trips through asyncpg as
+    JSON text."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            study_idx = await _insert_study(conn, owner_idx=owner)
+            extra = {"vamps_id": "VAMPS-42", "tags": ["a", "b"]}
+
+            row = await update_study(conn, study_idx, fields={"extra_metadata": extra})
+
+            assert row is not None
+            assert json.loads(row["extra_metadata"]) == extra
+        finally:
+            await tr.rollback()
+
+
+async def test_update_study_jsonb_extra_metadata_explicit_null_clears_column(postgres_pool):
+    """Tests the case where the JSONB column is set to SQL NULL via
+    explicit None — the carve-out must not turn None into
+    'null'::jsonb."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            study_idx = await _insert_study(conn, owner_idx=owner)
+            await update_study(conn, study_idx, fields={"extra_metadata": {"k": "v"}})
+
+            row = await update_study(conn, study_idx, fields={"extra_metadata": None})
+
+            assert row is not None
+            assert row["extra_metadata"] is None
+        finally:
+            await tr.rollback()
+
+
+async def test_update_study_duplicate_ebi_accession_raises_unique_error(postgres_pool):
+    """Tests the case where the ebi_study_accession uniqueness constraint
+    fires on a PATCH; the route layer translates this into 409 via the
+    shared raise_for_unique_violation helper."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            study_a = await _insert_study(conn, owner_idx=owner)
+            study_b = await _insert_study(conn, owner_idx=owner)
+            accession = _suffix("ERP")
+            await update_study(conn, study_a, fields={"ebi_study_accession": accession})
+
+            with pytest.raises(asyncpg.UniqueViolationError) as excinfo:
+                await update_study(conn, study_b, fields={"ebi_study_accession": accession})
+            assert excinfo.value.constraint_name == "study_ebi_study_accession_unique"
+        finally:
+            await tr.rollback()
+
+
+async def test_update_study_bad_pi_idx_raises_role_typed_error(postgres_pool):
+    """Tests the case where a non-user-kind candidate for
+    principal_investigator_idx trips the role-typed FK trigger; the
+    route layer translates this into 422 with the disambiguated PI
+    message."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            study_idx = await _insert_study(conn, owner_idx=owner)
+            svc = await _create_service_account(conn)
+
+            with pytest.raises(asyncpg.RaiseError, match="user-kind principal"):
+                await update_study(conn, study_idx, fields={"principal_investigator_idx": svc})
+        finally:
+            await tr.rollback()

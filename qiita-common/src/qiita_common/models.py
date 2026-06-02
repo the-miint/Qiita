@@ -3,7 +3,7 @@
 from datetime import date
 from decimal import Decimal
 from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, ClassVar, Literal
 from uuid import UUID
 
 from pydantic import (
@@ -549,8 +549,8 @@ class BiosampleImportRequest(BaseModel):
     owner_biosample_id_value: str = Field(min_length=1)
     metadata: dict[str, str] = Field(default_factory=dict)
     metadata_checklist_idx: Annotated[int, Field(gt=0)] | None = None
-    biosample_accession: str | None = None
-    ena_sample_accession: str | None = None
+    biosample_accession: str | None = Field(default=None, min_length=1)
+    ena_sample_accession: str | None = Field(default=None, min_length=1)
     matrix_tube_id: Annotated[
         str | None,
         Field(pattern=MATRIX_TUBE_ID_PATTERN),
@@ -751,20 +751,51 @@ class BiosampleLookupByMatrixTubeIdResponse(BaseModel):
     missing: list[str]
 
 
+# same-pattern-ok: per-key wire shape; parallels BiosampleLookupByAccessionRequest
+class StudyLookupByAccessionRequest(BaseModel):
+    """Resolves a list of ebi_study_accession values to study_idxs in one
+    round trip. Body-shaped (not query-params) so a long accession list
+    cannot exceed nginx's default URL-line cap.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    accessions: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1, max_length=10_000)
+
+
+# same-pattern-ok: per-key wire shape; parallels BiosampleLookupByAccessionResponse
+class StudyLookupByAccessionResponse(BaseModel):
+    """`resolved` maps each found accession to its study_idx. `missing`
+    lists accessions that did not resolve, in input order (deduped).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    resolved: dict[str, Annotated[int, Field(gt=0)]]
+    missing: list[str]
+
+
 class PatchRequestModel(BaseModel):
     """Base class for every PATCH-body Pydantic model in the API.
 
     Pins extra="forbid" so requests that name immutable or retirement-
     managed columns trip the model-level rejection rather than reaching
-    the repo, and enforces the "at least one editable field" rule that
-    every PATCH surface shares — derived classes inherit the validator
-    automatically. Each subtype declares its own column-typed Optional
-    fields; the route layer distinguishes "absent" (do not write) from
-    "explicit null" (set the column to NULL) by inspecting
-    `model_fields_set`.
+    the repo, enforces the "at least one editable field" rule that
+    every PATCH surface shares, and enforces "explicit null is not
+    valid input on a NOT NULL column" via the NOT_NULL_FIELDS hook.
+    Derived classes inherit both validators automatically; each subtype
+    declares its own column-typed Optional fields, and the ones whose
+    column is NOT NULL list those field names in NOT_NULL_FIELDS. The
+    route layer distinguishes "absent" (do not write) from "explicit
+    null" (set the column to NULL) by inspecting `model_fields_set`.
     """
 
     model_config = ConfigDict(extra="forbid")
+
+    # Field names whose backing column is NOT NULL. Subclasses override
+    # to declare their own; the empty default means "every field is
+    # nullable" (no validator-side rejection).
+    NOT_NULL_FIELDS: ClassVar[frozenset[str]] = frozenset()
 
     @model_validator(mode="after")
     def at_least_one_field(self):
@@ -774,34 +805,38 @@ class PatchRequestModel(BaseModel):
             raise ValueError("at least one editable field is required")
         return self
 
+    @model_validator(mode="after")
+    def reject_explicit_null_on_not_null_fields(self):
+        # Every field in NOT_NULL_FIELDS maps to a NOT NULL column;
+        # explicit null is invalid input even though the field is
+        # typed Optional for the "absent vs null" distinguishing
+        # pattern shared with the nullable fields.
+        for field_name in self.NOT_NULL_FIELDS:
+            if field_name in self.model_fields_set and getattr(self, field_name) is None:
+                raise ValueError(f"{field_name} may not be null")
+        return self
+
 
 class BiosamplePatchRequest(PatchRequestModel):
     """Body for PATCH /api/v1/biosample/{biosample_idx}.
 
-    Inherits extra="forbid" and the at_least_one_field rule from
-    PatchRequestModel; adds the NOT-NULL invariant on owner_idx.
+    Inherits extra="forbid", the at_least_one_field rule, and the
+    NOT_NULL_FIELDS explicit-null guard from PatchRequestModel; lists
+    owner_idx as the not-null field.
     """
+
+    NOT_NULL_FIELDS: ClassVar[frozenset[str]] = frozenset({"owner_idx"})
 
     metadata_checklist_idx: Annotated[int, Field(gt=0)] | None = None
     owner_idx: Annotated[int, Field(gt=0)] | None = None
-    biosample_accession: str | None = None
-    ena_sample_accession: str | None = None
+    biosample_accession: str | None = Field(default=None, min_length=1)
+    ena_sample_accession: str | None = Field(default=None, min_length=1)
     matrix_tube_id: Annotated[
         str | None,
         Field(pattern=MATRIX_TUBE_ID_PATTERN),
     ] = None
     last_submission_at: AwareDatetime | None = None
     submission_error: str | None = None
-
-    @model_validator(mode="after")
-    def owner_not_null(self):
-        # owner_idx maps to a NOT NULL column; explicit null is invalid
-        # input even though the field is typed Optional for the
-        # "absent vs null" distinguishing pattern shared with the
-        # other fields.
-        if "owner_idx" in self.model_fields_set and self.owner_idx is None:
-            raise ValueError("owner_idx may not be null")
-        return self
 
 
 class IdxsListResponse(BaseModel):
@@ -850,10 +885,40 @@ class StudyCreate(BaseModel):
     description: str | None = None
     abstract: str | None = None
     funding: str | None = Field(default=None, max_length=_STUDY_FUNDING_MAX)
-    ebi_study_accession: str | None = Field(default=None, max_length=_STUDY_ACCESSION_MAX)
+    ebi_study_accession: str | None = Field(
+        default=None, min_length=1, max_length=_STUDY_ACCESSION_MAX
+    )
     notes: str | None = None
     extra_metadata: dict[str, object] | None = None
     default_tier: Tier | None = None
+
+
+class StudyPatchRequest(PatchRequestModel):
+    """Body for PATCH /api/v1/study/{study_idx}.
+
+    Carries the editable post-create columns. Field constraints follow
+    StudyCreate so a PATCH cannot smuggle in a value that POST would
+    reject. owner_idx is intentionally not patchable (ownership transfer
+    is a separate surface) and default_tier is intentionally not
+    patchable (its policy-shape needs its own design). Inherits
+    extra="forbid", the at_least_one_field rule, and the
+    NOT_NULL_FIELDS explicit-null guard from PatchRequestModel; lists
+    title as the not-null field.
+    """
+
+    NOT_NULL_FIELDS: ClassVar[frozenset[str]] = frozenset({"title"})
+
+    title: str | None = Field(default=None, min_length=1, max_length=_STUDY_TITLE_MAX)
+    principal_investigator_idx: Annotated[int, Field(gt=0)] | None = None
+    alias: str | None = Field(default=None, max_length=_STUDY_ALIAS_MAX)
+    description: str | None = None
+    abstract: str | None = None
+    funding: str | None = Field(default=None, max_length=_STUDY_FUNDING_MAX)
+    ebi_study_accession: str | None = Field(
+        default=None, min_length=1, max_length=_STUDY_ACCESSION_MAX
+    )
+    notes: str | None = None
+    extra_metadata: dict[str, object] | None = None
 
 
 class StudyResponse(BaseModel):

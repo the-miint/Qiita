@@ -27,11 +27,6 @@ to ship in the orchestrator's ``pyproject.toml``; the actual heavy lifting
 (``bcl-convert`` itself) is the downstream ``container:`` step. Keeping the
 prep native avoids a second SIF for what is otherwise a few hundred lines
 of glue.
-
-External dependency: ``run_preflight.legacy.api.save_legacy_csv``. The
-import is deferred to ``execute()`` so module collection (pytest) and the
-launcher's import-on-dispatch never fail just because the dep is not
-installed in a non-bcl-convert environment.
 """
 
 from __future__ import annotations
@@ -73,20 +68,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         ``baseline_resources.profiles[<model_name>]``.
 
     Side-effect file: ``workspace/preflight.db`` is the raw blob written
-    for ``save_legacy_csv``. The launcher walks the entire output tree
+    for ``save_bclconvert_v1_csv``. The launcher walks the entire output tree
     and includes every file in the manifest (chmodded 0o440), so this
     intermediate is tracked even though it isn't a named output. The
     verifier accepts that.
     """
-    # `run_preflight` is the git-pinned `kl-run-preflight` dependency
-    # (see qiita-compute-orchestrator/pyproject.toml); `save_legacy_csv` is
-    # called below to rehydrate the preflight blob to a sample-sheet CSV.
-    # "legacy" is upstream's own module name for the legacy Qiita
-    # sample-sheet format — it is not dead/legacy code on our side.
-    # Imported here (not at module top) so the orchestrator's pytest
-    # collection / launcher boot doesn't blow up in environments that don't
-    # ship the dep. The dep ships in this component's pyproject.toml.
-    from run_preflight.legacy.api import save_legacy_csv  # noqa: PLC0415
+    from run_preflight import save_bclconvert_v1_csv  # noqa: PLC0415
 
     if not inputs.bcl_input_dir.is_absolute():
         raise ValueError(f"bcl_input_dir must be absolute, got {inputs.bcl_input_dir!r}")
@@ -115,7 +102,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     samplesheet = workspace / "samplesheet.csv"
     with sqlite3.connect(str(preflight_db)) as conn:
-        save_legacy_csv(conn, str(samplesheet))
+        save_bclconvert_v1_csv(conn, str(samplesheet))
 
     instrument_model_file = workspace / "instrument_model.txt"
     instrument_model_file.write_text(instrument_model, encoding="utf-8")

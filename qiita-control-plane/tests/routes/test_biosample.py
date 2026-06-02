@@ -49,6 +49,7 @@ from .conftest import (
     _grant_study_access,
     assert_owner_ineligibility_422,
     delete_idxs,
+    etag_for_row,
     resolve_ineligible_owner_idx,
 )
 
@@ -1838,13 +1839,11 @@ async def no_biosample_write_patch_client(make_pat_client):
 async def _etag_for(pool, bs_idx: int) -> str:
     """Build the quoted ISO-8601 ETag the route emits for a biosample row.
 
-    Reads updated_at directly so the helper does not depend on the GET
-    route's behavior; matches `_etag_for_updated_at` in routes/biosample.py.
+    Thin biosample-flavored wrapper around the shared etag_for_row
+    conftest helper so the test-file call sites keep their existing
+    two-argument shape.
     """
-    updated_at = await pool.fetchval(
-        "SELECT updated_at FROM qiita.biosample WHERE idx = $1", bs_idx
-    )
-    return f'"{updated_at.isoformat()}"'
+    return await etag_for_row(pool, table="biosample", row_idx=bs_idx)
 
 
 async def _seed_biosample_for_patch(ctx) -> int:
@@ -2413,9 +2412,9 @@ async def test_lookup_by_accession_rejects_extra_field_422(ctx):
 # ---------------------------------------------------------------------------
 # Mirrors the accession variant; the auth surface, dedup/missing semantics,
 # and retired-row exclusion are shared with lookup_biosample_by_accession
-# via the private _resolve_biosample_idxs_by_natural_key helper. The tests
-# below cover the per-key wire surface (route exists, format validator
-# fires on bad input). The shared behavior (auth tiers, dedup, retired-row
+# via resolve_idxs_by_natural_key in routes/_helpers.py. The tests below
+# cover the per-key wire surface (route exists, format validator fires on
+# bad input). The shared behavior (auth tiers, dedup, retired-row
 # exclusion) is exercised once on the accession surface above.
 
 

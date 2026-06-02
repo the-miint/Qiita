@@ -1,11 +1,10 @@
 """Cross-route helpers shared by sibling route modules.
 
-Hosts the ETag formatter that every PATCH-bearing route calls and the
-metadata slot-collision detail builder that every metadata-writing
-route calls. Lifting both here keeps response wording consistent across
+Centralizing them keeps response wording consistent across parallel
 endpoints — same input shape, same on-the-wire output.
 """
 
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 
 import asyncpg
@@ -43,6 +42,22 @@ def _attempted_label(value: object) -> str:
 GENERIC_FK_VIOLATION = "references a row that does not exist"
 
 
+def raise_for_unique_violation(
+    exc: asyncpg.UniqueViolationError,
+    *,
+    constraint_messages: dict[str, str],
+    generic: str,
+) -> None:
+    """Translate a UNIQUE-constraint violation into a 409 response.
+
+    Looks up `exc.constraint_name` against `constraint_messages`; an
+    unknown name yields `generic` as the detail. Never returns; always
+    raises HTTPException.
+    """
+    detail = constraint_messages.get(exc.constraint_name, generic)
+    raise HTTPException(status_code=409, detail=detail)
+
+
 def etag_for_updated_at(updated_at: datetime) -> str:
     """Build the quoted ETag header value from a row's updated_at timestamp.
 
@@ -52,6 +67,36 @@ def etag_for_updated_at(updated_at: datetime) -> str:
     byte-for-byte equality with a subsequent If-Match header matters.
     """
     return f'"{updated_at.isoformat()}"'
+
+
+def require_if_match(if_match: str | None) -> str:
+    """Raise 428 when the caller did not send an If-Match header.
+
+    All patching requires optimistic-concurrency control; routing
+    the 428 through this helper keeps the wording identical."""
+    if if_match is None:
+        raise HTTPException(status_code=428, detail="If-Match header required")
+    return if_match
+
+
+def require_etag_match(
+    row: asyncpg.Record | None,
+    *,
+    if_match: str,
+    label: str,
+    row_idx: int,
+) -> None:
+    """Run the post-FOR-UPDATE-preflight 404 / 412 checks for a PATCH route.
+
+    Called after `fetch_<entity>(conn, idx, for_update=True)` to fold
+    "row absent (404)" and "ETag stale (412)" into one site so every
+    PATCH endpoint emits the same wording. `label` is the entity noun
+    embedded in the 404 detail (e.g. "study", "biosample").
+    """
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"{label} {row_idx} not found")
+    if if_match != etag_for_updated_at(row["updated_at"]):
+        raise HTTPException(status_code=412, detail="If-Match did not match")
 
 
 async def detail_for_slot_collision(
@@ -255,3 +300,29 @@ def raise_for_transient_write_race(exc: TransientWriteRaceError) -> None:
         ),
         headers={"Retry-After": _TRANSIENT_WRITE_RACE_RETRY_AFTER},
     )
+
+
+async def resolve_idxs_by_natural_key(
+    *,
+    values: list[str],
+    fetcher: Callable[[list[str]], Awaitable[dict[str, int]]],
+) -> tuple[dict[str, int], list[str]]:
+    """Dedup `values` in input order, resolve survivors via `fetcher`, and
+    return `(resolved, missing)`.
+
+    The caller supplies `fetcher` already bound to its pool and any per-key
+    SQL details so this helper stays table-agnostic. `missing` is the
+    input-order deduped list of values that did not resolve.
+    """
+    # Dedup while preserving input order so `missing` is deterministic.
+    dedup_ordered: list[str] = []
+    seen: set[str] = set()
+    for v in values:
+        if v in seen:
+            continue
+        seen.add(v)
+        dedup_ordered.append(v)
+
+    resolved = await fetcher(dedup_ordered)
+    missing = [v for v in dedup_ordered if v not in resolved]
+    return resolved, missing

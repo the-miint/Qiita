@@ -40,6 +40,15 @@ the `no-changelog` label).
 - `matrix_tube_id` column on biosample with digit-only format and uniqueness
   constraints, exposed via the biosample REST routes and the
   `qiita biosample create --matrix-tube-id` CLI flag (#68)
+- `POST /study/lookup-by-accession` for bulk `ebi_study_accession` →
+  `study_idx` resolution; body-shaped so a long accession list rides
+  past nginx's default URL-line cap (#74)
+- `PATCH /study/{idx}` for editing the post-create study columns
+  (PI, title, alias, description, abstract, funding,
+  `ebi_study_accession`, notes, `extra_metadata`) under required
+  `If-Match` optimistic-concurrency control (#74)
+- `UNIQUE` constraint on `study.ebi_study_accession` (NULLs distinct,
+  so "unique when present") (#74)
 
 ### Changed
 
@@ -64,6 +73,17 @@ the `no-changelog` label).
   `PATH_PERSISTENT` / `PATH_DERIVED`; the services derive the fixed
   subdirs. Hard cutover — the old names are gone and boot fails fast until
   the new ones are set (#73)
+- Switched `bcl_convert_prep` from `run_preflight.legacy.api.save_legacy_csv`
+  to the public `run_preflight.save_bclconvert_v1_csv`, and `qiita
+  submit-bcl-convert` from a hard-coded JOIN against the kl-run-preflight
+  SQLite schema to upstream's `get_illumina_sample_info` plus the new
+  `POST /study/lookup-by-accession`; bumped the `run-preflight` SHA pin
+  in lock-step across CP + CO and guarded the parity with a new
+  `tests/integration/test_run_preflight_pin_parity.py` (#74)
+- Tightened `min_length=1` on `biosample_accession` / `ena_sample_accession`
+  (`BiosampleImportRequest`, `BiosamplePatchRequest`) and on
+  `ebi_study_accession` (`StudyCreate`) so empty strings no longer reach
+  the DB (#74)
 - SIF builds go through a single generic `scripts/build-sif.sh <workflow>`
   driven by a declarative `workflows/<workflow>/sif-build.env`; replaces the
   per-workflow `scripts/build-bcl-convert-sif.sh`. The builder stages into a

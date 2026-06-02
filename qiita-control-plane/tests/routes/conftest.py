@@ -10,12 +10,14 @@ tracked table set differs per route.
 import secrets
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
+from typing import get_args
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope
 
+from qiita_control_plane.repositories import UpdatableTable
 from qiita_control_plane.testing.db_seeds import (
     disable_principal,
     retire_principal,
@@ -217,6 +219,21 @@ async def delete_idxs(pool, table: str, idxs) -> None:
         f"DELETE FROM qiita.{table} WHERE idx = ANY($1::bigint[])",
         idxs,
     )
+
+
+async def etag_for_row(pool, *, table: UpdatableTable, row_idx: int) -> str:
+    """Build the quoted ISO-8601 ETag a PATCH route emits for a row.
+
+    Reads updated_at directly so the helper does not depend on the
+    route's behavior; the on-the-wire wording matches the routes'.
+    """
+    # Python does not enforce Literal at runtime; the f-string below is raw SQL.
+    if table not in get_args(UpdatableTable):
+        raise ValueError(f"etag_for_row rejects non-updatable table: {table!r}")
+    updated_at = await pool.fetchval(
+        f"SELECT updated_at FROM qiita.{table} WHERE idx = $1", row_idx
+    )
+    return f'"{updated_at.isoformat()}"'
 
 
 # ---------------------------------------------------------------------------

@@ -19,6 +19,7 @@ its mutation inside one connection-scoped transaction with required
 If-Match optimistic-concurrency control.
 """
 
+from collections.abc import Awaitable, Callable
 from typing import Annotated
 
 import asyncpg
@@ -87,6 +88,10 @@ from ._helpers import (
     detail_for_slot_collision,
     etag_for_updated_at,
     raise_for_transient_write_race,
+    raise_for_unique_violation,
+    require_etag_match,
+    require_if_match,
+    resolve_idxs_by_natural_key,
 )
 
 router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["biosample"])
@@ -248,8 +253,11 @@ async def import_biosample(
                 ),
             )
         except asyncpg.UniqueViolationError as exc:
-            detail = _UNIQUE_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_UNIQUE_VIOLATION)
-            raise HTTPException(status_code=409, detail=detail)
+            raise_for_unique_violation(
+                exc,
+                constraint_messages=_UNIQUE_VIOLATION_MESSAGES,
+                generic=_GENERIC_UNIQUE_VIOLATION,
+            )
         except asyncpg.ForeignKeyViolationError as exc:
             detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, GENERIC_FK_VIOLATION)
             raise HTTPException(status_code=422, detail=detail)
@@ -440,32 +448,12 @@ async def get_biosample(
     )
 
 
-async def _resolve_biosample_idxs_by_natural_key(
-    pool: asyncpg.Pool,
-    *,
-    key: BiosampleLookupKey,
-    values: list[str],
-) -> tuple[dict[str, int], list[str]]:
-    """Shared dedup-and-fetch for the natural-key lookup endpoints.
-
-    Dedups `values` in input order, resolves the survivors via the named
-    column, and returns (resolved, missing). The two route wrappers
-    differ only in the per-key Pydantic request/response classes; this
-    helper carries the actual logic.
-    """
-    # Dedup while preserving input order so `missing` is deterministic
-    # for the operator's error message.
-    dedup_ordered: list[str] = []
-    seen: set[str] = set()
-    for v in values:
-        if v in seen:
-            continue
-        seen.add(v)
-        dedup_ordered.append(v)
-
-    resolved = await fetch_biosample_idxs_by_natural_key(pool, key=key, values=dedup_ordered)
-    missing = [v for v in dedup_ordered if v not in resolved]
-    return resolved, missing
+def _biosample_natural_key_fetcher(
+    pool: asyncpg.Pool, key: BiosampleLookupKey
+) -> Callable[[list[str]], Awaitable[dict[str, int]]]:
+    """Return a single-argument awaitable that resolves a list of
+    natural-key values to a `{value: biosample_idx}` map."""
+    return lambda values: fetch_biosample_idxs_by_natural_key(pool, key=key, values=values)
 
 
 @biosample_router.post(PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION)
@@ -499,8 +487,9 @@ async def lookup_biosample_by_accession(
     # _user is read only to keep the dependency chain explicit — no
     # per-caller filter runs here (see auth docstring).
     _ = user
-    resolved, missing = await _resolve_biosample_idxs_by_natural_key(
-        pool, key="biosample_accession", values=body.accessions
+    resolved, missing = await resolve_idxs_by_natural_key(
+        values=body.accessions,
+        fetcher=_biosample_natural_key_fetcher(pool, "biosample_accession"),
     )
     return BiosampleLookupByAccessionResponse(resolved=resolved, missing=missing)
 
@@ -520,8 +509,9 @@ async def lookup_biosample_by_matrix_tube_id(
     for the full rationale.
     """
     _ = user
-    resolved, missing = await _resolve_biosample_idxs_by_natural_key(
-        pool, key="matrix_tube_id", values=body.matrix_tube_ids
+    resolved, missing = await resolve_idxs_by_natural_key(
+        values=body.matrix_tube_ids,
+        fetcher=_biosample_natural_key_fetcher(pool, "matrix_tube_id"),
     )
     return BiosampleLookupByMatrixTubeIdResponse(resolved=resolved, missing=missing)
 
@@ -587,9 +577,7 @@ async def patch_biosample(
         "would 500 after SELECT FOR UPDATE + UPDATE commits (see docstring)"
     )
 
-    # Missing If-Match is 428 before any DB work runs.
-    if if_match is None:
-        raise HTTPException(status_code=428, detail="If-Match header required")
+    if_match = require_if_match(if_match)
 
     # Build the column-keyed write set from the model's set fields so the
     # repository sees only what the caller explicitly included; explicit
@@ -604,12 +592,11 @@ async def patch_biosample(
             # serializes here instead of racing through the ETag check
             # and silently overwriting the first writer's update.
             row = await fetch_biosample(conn, biosample_idx, for_update=True)
-            if row is None:
-                raise HTTPException(status_code=404, detail=f"biosample {biosample_idx} not found")
-            if row["retired"]:
+            # Retirement is biosample-specific; absent / stale-ETag is
+            # the shared post-FOR-UPDATE preflight every PATCH runs.
+            if row is not None and row["retired"]:
                 raise HTTPException(status_code=409, detail=f"biosample {biosample_idx} is retired")
-            if if_match != etag_for_updated_at(row["updated_at"]):
-                raise HTTPException(status_code=412, detail="If-Match did not match")
+            require_etag_match(row, if_match=if_match, label="biosample", row_idx=biosample_idx)
 
             # Eligibility preflight runs only when ownership is being
             # transferred; collapses every ineligibility case to 422.
@@ -639,8 +626,11 @@ async def patch_biosample(
                 conn, spec=BIOSAMPLE_METADATA_SPEC, entity_idx=biosample_idx
             )
         except asyncpg.UniqueViolationError as exc:
-            detail = _UNIQUE_VIOLATION_MESSAGES.get(exc.constraint_name, _GENERIC_UNIQUE_VIOLATION)
-            raise HTTPException(status_code=409, detail=detail)
+            raise_for_unique_violation(
+                exc,
+                constraint_messages=_UNIQUE_VIOLATION_MESSAGES,
+                generic=_GENERIC_UNIQUE_VIOLATION,
+            )
         except asyncpg.ForeignKeyViolationError as exc:
             detail = _FK_VIOLATION_MESSAGES.get(exc.constraint_name, GENERIC_FK_VIOLATION)
             raise HTTPException(status_code=422, detail=detail)

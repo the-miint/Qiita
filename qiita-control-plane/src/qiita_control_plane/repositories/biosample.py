@@ -16,7 +16,7 @@ from typing import Literal, get_args
 import asyncpg
 from qiita_common.models import Tier
 
-from . import require_transaction, validate_patch_fields
+from . import require_transaction, update_row
 from ._sample_helpers import (
     LocalWriteOnGloballyLinkedFieldError,
     SampleEntityKind,
@@ -74,6 +74,17 @@ async def insert_biosample(
     )
 
 
+# Columns returned by both fetch_biosample and update_biosample so the
+# row -> response shaping has a single source of truth.
+_BIOSAMPLE_RETURNING_COLS = (
+    "idx, owner_idx, metadata_checklist_idx,"
+    " biosample_accession, ena_sample_accession, matrix_tube_id,"
+    " last_submission_at, submission_error, last_metadata_change_at,"
+    " created_by_idx, created_at, updated_at,"
+    " retired, retired_by_idx, retired_at, retire_reason"
+)
+
+
 async def fetch_biosample(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     biosample_idx: int,
@@ -93,14 +104,7 @@ async def fetch_biosample(
     single-statement transaction releases the lock immediately and
     the flag is a no-op.
     """
-    sql = (
-        "SELECT idx, owner_idx, metadata_checklist_idx,"
-        " biosample_accession, ena_sample_accession, matrix_tube_id,"
-        " last_submission_at, submission_error, last_metadata_change_at,"
-        " created_by_idx, created_at, updated_at,"
-        " retired, retired_by_idx, retired_at, retire_reason"
-        " FROM qiita.biosample WHERE idx = $1"
-    )
+    sql = f"SELECT {_BIOSAMPLE_RETURNING_COLS} FROM qiita.biosample WHERE idx = $1"
     if for_update:
         sql += " FOR UPDATE"
     return await pool_or_conn.fetchrow(sql, biosample_idx)
@@ -130,39 +134,19 @@ async def update_biosample(
 ) -> asyncpg.Record | None:
     """Update the named columns on the biosample row, return the post-UPDATE row.
 
-    `fields` maps column name -> new value; only the listed keys are
-    written, and explicit None sets the column to NULL. Unknown keys
-    and an empty dict raise ValueError. Returns the same column set
-    as fetch_biosample via UPDATE ... RETURNING, or None when no row
-    matches `biosample_idx` (possible even after a passing preflight:
-    READ COMMITTED snapshots are per-statement).
-
-    Raises asyncpg.PostgresError on FK violation or constraint failure.
+    Thin wrapper around the shared update_row composer that pins the
+    table, allowlist, and RETURNING shape for qiita.biosample. See
+    update_row for the field-validation and explicit-null semantics;
+    see fetch_biosample for the returned column list.
     """
-    validate_patch_fields(
-        fields, allowlist=BIOSAMPLE_PATCHABLE_COLUMNS, repo_name="update_biosample"
-    )
-
-    # Build the parameterized SET clause. Column names come from the
-    # allowlist above so f-string interpolation is safe; the per-column
-    # values are passed as positional asyncpg parameters.
-    columns = sorted(fields.keys())
-    set_clause = ", ".join(f"{col} = ${i + 1}" for i, col in enumerate(columns))
-    values = [fields[col] for col in columns]
-    biosample_param = f"${len(columns) + 1}"
-
-    # Single round trip: UPDATE ... RETURNING with the same column list
-    # fetch_biosample selects.
-    return await conn.fetchrow(
-        f"UPDATE qiita.biosample SET {set_clause}"
-        f" WHERE idx = {biosample_param}"
-        " RETURNING idx, owner_idx, metadata_checklist_idx,"
-        " biosample_accession, ena_sample_accession, matrix_tube_id,"
-        " last_submission_at, submission_error, last_metadata_change_at,"
-        " created_by_idx, created_at, updated_at,"
-        " retired, retired_by_idx, retired_at, retire_reason",
-        *values,
-        biosample_idx,
+    return await update_row(
+        conn,
+        table="biosample",
+        row_idx=biosample_idx,
+        fields=fields,
+        allowlist=BIOSAMPLE_PATCHABLE_COLUMNS,
+        returning_cols=_BIOSAMPLE_RETURNING_COLS,
+        repo_name="update_biosample",
     )
 
 

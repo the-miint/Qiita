@@ -13,7 +13,7 @@ import json
 import asyncpg
 from qiita_common.models import Tier
 
-from . import require_transaction
+from . import require_transaction, update_row
 
 # Columns returned by every create_study INSERT ... RETURNING. Covers every
 # caller-visible column on the row; the route consumes the result via
@@ -29,6 +29,8 @@ _STUDY_RETURNING_COLS = (
 async def fetch_study(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     study_idx: int,
+    *,
+    for_update: bool = False,
 ) -> asyncpg.Record | None:
     """Return the qiita.study row for the given idx, or None if no match.
 
@@ -40,13 +42,19 @@ async def fetch_study(
     shape is needed (mirrors the create-route pattern). Accepts either
     a pool or a connection so the helper composes inside an open
     transaction or stands alone.
+
+    `for_update=True` appends `FOR UPDATE`; concurrent callers
+    serialize on the row lock until the holder commits or rolls back.
+    Pass only inside an open transaction — with a pool the implicit
+    single-statement transaction releases the lock immediately and
+    the flag is a no-op.
     """
     # Single-row fetch by idx; same column list as the INSERT RETURNING
     # so route handlers share one row → response shaping path.
-    return await pool_or_conn.fetchrow(
-        f"SELECT {_STUDY_RETURNING_COLS} FROM qiita.study WHERE idx = $1",
-        study_idx,
-    )
+    sql = f"SELECT {_STUDY_RETURNING_COLS} FROM qiita.study WHERE idx = $1"
+    if for_update:
+        sql += " FOR UPDATE"
+    return await pool_or_conn.fetchrow(sql, study_idx)
 
 
 async def fetch_study_exists(
@@ -69,6 +77,28 @@ async def fetch_study_exists(
         )
         is not None
     )
+
+
+async def fetch_study_idxs_by_accession(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    values: list[str],
+) -> dict[str, int]:
+    """Return `{ebi_study_accession: study_idx}` for every value in `values`
+    that resolves to a qiita.study row. Values absent from the table are
+    omitted from the returned map.
+
+    The study table has no soft-delete column, so every key in the result
+    is a live row.
+    """
+    if not values:
+        return {}
+    rows = await pool_or_conn.fetch(
+        "SELECT idx, ebi_study_accession FROM qiita.study"
+        " WHERE ebi_study_accession = ANY($1::text[])",
+        values,
+    )
+    return {r["ebi_study_accession"]: r["idx"] for r in rows}
 
 
 async def insert_study(
@@ -156,6 +186,56 @@ async def insert_owner_study_access_admin(
         study_idx,
         owner_idx,
         granted_by_idx,
+    )
+
+
+# Columns this repo's PATCH composer is allowed to write. Held as a
+# frozenset so unknown column names are rejected at the repo boundary
+# rather than reaching the SQL builder. owner_idx is intentionally
+# excluded (ownership transfer is a separate surface); default_tier is
+# intentionally excluded (its policy-shape needs its own design).
+STUDY_PATCHABLE_COLUMNS: frozenset[str] = frozenset(
+    {
+        "title",
+        "alias",
+        "description",
+        "abstract",
+        "funding",
+        "ebi_study_accession",
+        "notes",
+        "extra_metadata",
+        "principal_investigator_idx",
+    }
+)
+
+# Columns serialized + cast as JSONB by the UPDATE composer. The
+# update_row helper json.dumps the value and emits `$N::jsonb`.
+_STUDY_JSONB_COLUMNS: frozenset[str] = frozenset({"extra_metadata"})
+
+
+async def update_study(
+    conn: asyncpg.Connection,
+    study_idx: int,
+    *,
+    fields: dict[str, object],
+) -> asyncpg.Record | None:
+    """Update the named columns on the study row, return the post-UPDATE row.
+
+    Thin wrapper around the shared update_row composer that pins the
+    table, allowlist, RETURNING shape, and JSONB-cast column set for
+    qiita.study. See update_row for the field-validation and
+    explicit-null semantics; see fetch_study for the returned column
+    list.
+    """
+    return await update_row(
+        conn,
+        table="study",
+        row_idx=study_idx,
+        fields=fields,
+        allowlist=STUDY_PATCHABLE_COLUMNS,
+        returning_cols=_STUDY_RETURNING_COLS,
+        jsonb_cols=_STUDY_JSONB_COLUMNS,
+        repo_name="update_study",
     )
 
 

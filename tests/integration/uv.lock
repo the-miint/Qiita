@@ -635,12 +635,14 @@ source = { directory = "../../qiita-common" }
 dependencies = [
     { name = "httpx" },
     { name = "pydantic", extra = ["email"] },
+    { name = "pyyaml" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "pydantic", extras = ["email"], specifier = ">=2.12" },
+    { name = "pyyaml", specifier = ">=6.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -658,7 +660,6 @@ dependencies = [
     { name = "duckdb" },
     { name = "fastapi" },
     { name = "httpx" },
-    { name = "pyyaml" },
     { name = "qiita-common" },
     { name = "run-preflight" },
     { name = "uvicorn", extra = ["standard"] },
@@ -669,9 +670,8 @@ requires-dist = [
     { name = "duckdb", specifier = ">=1.5.2" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.28" },
-    { name = "pyyaml", specifier = ">=6.0" },
     { name = "qiita-common", directory = "../../qiita-common" },
-    { name = "run-preflight", git = "https://github.com/the-miint/kl-run-preflight?rev=0ccab487db83ff0624998c14d664304faa5470cc" },
+    { name = "run-preflight", git = "https://github.com/the-miint/kl-run-preflight?rev=0c476dfd9f1fd4b3b2bfc54e1b301e3c09cdc879" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
 ]
 
@@ -700,6 +700,7 @@ dependencies = [
     { name = "pyjwt", extra = ["crypto"] },
     { name = "pyyaml" },
     { name = "qiita-common" },
+    { name = "run-preflight" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -717,6 +718,7 @@ requires-dist = [
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.9" },
     { name = "pyyaml", specifier = ">=6" },
     { name = "qiita-common", directory = "../../qiita-common" },
+    { name = "run-preflight", git = "https://github.com/the-miint/kl-run-preflight?rev=0c476dfd9f1fd4b3b2bfc54e1b301e3c09cdc879" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
 ]
 
@@ -811,8 +813,8 @@ wheels = [
 
 [[package]]
 name = "run-preflight"
-version = "0.0.0.post27+g0ccab48.d20260528"
-source = { git = "https://github.com/the-miint/kl-run-preflight?rev=0ccab487db83ff0624998c14d664304faa5470cc#0ccab487db83ff0624998c14d664304faa5470cc" }
+version = "0.0.0.post36+g0c476df.d20260602"
+source = { git = "https://github.com/the-miint/kl-run-preflight?rev=0c476dfd9f1fd4b3b2bfc54e1b301e3c09cdc879#0c476dfd9f1fd4b3b2bfc54e1b301e3c09cdc879" }
 
 [[package]]
 name = "starlette"

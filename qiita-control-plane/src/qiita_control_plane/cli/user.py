@@ -32,7 +32,9 @@ import base64
 import json
 import sqlite3
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple
 
 from pydantic import BaseModel, ValidationError
 from qiita_common.api_paths import (
@@ -41,6 +43,8 @@ from qiita_common.api_paths import (
     PATH_SEQUENCED_SAMPLE_FROM_RUN,
     PATH_SEQUENCING_RUN_PREFIX,
     PATH_SEQUENCING_RUN_SEQUENCED_POOL,
+    PATH_STUDY_LOOKUP_BY_ACCESSION,
+    PATH_STUDY_PREFIX,
     PATH_WORK_TICKET_PREFIX,
 )
 from qiita_common.illumina import (
@@ -56,6 +60,7 @@ from qiita_common.models import (
     SequencedSampleCreateRequest,
     SequencingRunCreateRequest,
     StudyCreate,
+    StudyLookupByAccessionRequest,
     Tier,
     UserUpdate,
     WorkTicketCreateRequest,
@@ -70,24 +75,21 @@ from . import _common
 _BCL_CONVERT_ACTION_ID = "bcl-convert"
 _BCL_CONVERT_ACTION_VERSION = "1.0.0"
 
-# Per-row pull from the kl-run-preflight SQLite. Joins prepped_sample →
-# compression_sample → input_sample for the (Sample_ID, accession) pair the
-# CLI needs, and falls back through input_plate.primary_project_idx for
-# control rows whose input_sample.project_idx is NULL (the upstream
-# schema's control-row convention). project.qiita_id is the deploy's Qiita
-# study_idx encoded as a string — the CLI casts to int per row.
-_PREFLIGHT_ROWS_SQL = """
-SELECT
-    prs.prepped_sample_idx AS prepped_sample_idx,
-    ins.biosample_accession AS biosample_accession,
-    p.qiita_id AS qiita_id
-FROM prepped_sample prs
-JOIN compression_sample cs ON cs.compression_sample_idx = prs.compression_sample_idx
-JOIN input_sample ins ON ins.input_sample_idx = cs.input_sample_idx
-JOIN input_plate ip ON ip.input_plate_idx = ins.input_plate_idx
-JOIN project p ON p.project_idx = COALESCE(ins.project_idx, ip.primary_project_idx)
-ORDER BY prs.prepped_sample_idx
-"""
+
+class _PreflightRow(NamedTuple):
+    """One illumina_sample row pulled from the kl-run-preflight SQLite.
+
+    Field names mirror `run_preflight.get_illumina_sample_info`'s 4-tuple.
+    `secondary_project_accessions` is empty for non-control samples;
+    controls carry one entry per non-primary plate project, sorted by
+    accession value.
+    """
+
+    illumina_sample_idx: int
+    biosample_accession: str
+    primary_project_accession: str
+    secondary_project_accessions: list[str]
+
 
 # ---------------------------------------------------------------------------
 # HTTP helpers (call sites for individual endpoints)
@@ -176,6 +178,25 @@ def _get_work_ticket(base_url: str, token: str, work_ticket_idx: int) -> dict:
     state, action info, scope_target, action_context, retry accounting,
     failure surface, timestamps. Auth: originator or wet_lab_admin+."""
     return _common.call("GET", base_url, token, f"{PATH_WORK_TICKET_PREFIX}/{work_ticket_idx}")
+
+
+def _lookup_accessions(
+    base_url: str,
+    token: str,
+    path: str,
+    accessions: list[str],
+    model_cls: type[BaseModel],
+) -> tuple[dict[str, int], list[str]]:
+    """POST a bulk lookup-by-accession route and return (resolved, missing).
+
+    `model_cls` is the route's request Pydantic model (e.g.
+    `BiosampleLookupByAccessionRequest`); it is constructed from the
+    accession list and json-dumped so the route's wire validation is
+    exercised. The biosample and study lookup routes share this shape.
+    """
+    body = model_cls(accessions=accessions).model_dump(mode="json")
+    resp = _common.call("POST", base_url, token, path, json=body)
+    return resp["resolved"], resp["missing"]
 
 
 # ---------------------------------------------------------------------------
@@ -863,68 +884,130 @@ def _serializable(obj):
 
 def _read_preflight_rows(
     preflight_blob: Path, parser: argparse.ArgumentParser
-) -> list[tuple[int, str, int]]:
-    """Open the preflight SQLite and return one tuple per illumina_sample.
+) -> list[_PreflightRow]:
+    """Open the preflight SQLite and return one `_PreflightRow` per illumina_sample row.
 
-    Each tuple is ``(prepped_sample_idx, biosample_accession, study_idx)``.
-    ``study_idx`` is parsed from ``project.qiita_id`` (a text column on
-    the preflight side; the deploy convention is that it holds the Qiita
-    study_idx encoded as a string).
-
-    Errors that the operator can fix (file not a SQLite, project.qiita_id
-    not numeric, a row missing biosample_accession) raise via parser.error
-    so the CLI surfaces a single stderr line and exits 2 before any
-    network call.
+    Errors that the operator can fix (file not a SQLite, library raises
+    on a malformed row, a row missing biosample_accession or
+    primary_project_accession) raise via parser.error so the CLI
+    surfaces a single stderr line and exits 2 before any network call.
     """
+    from run_preflight import get_illumina_sample_info  # noqa: PLC0415
+
     try:
         conn = sqlite3.connect(f"file:{preflight_blob}?mode=ro", uri=True)
     except sqlite3.DatabaseError as exc:
         parser.error(f"--preflight-blob {preflight_blob}: not a readable SQLite file: {exc}")
     try:
-        # The SQL pulls input_plate via the join so the
-        # COALESCE(ins.project_idx, ip.primary_project_idx) fallback covers
-        # the upstream control-row convention without forcing a separate
-        # query.
-        rows = conn.execute(_PREFLIGHT_ROWS_SQL).fetchall()
-    except sqlite3.DatabaseError as exc:
+        illumina_samples = get_illumina_sample_info(conn)
+    except (sqlite3.DatabaseError, ValueError) as exc:
         parser.error(
-            f"--preflight-blob {preflight_blob}: preflight schema query failed ({exc});"
+            f"--preflight-blob {preflight_blob}: preflight query failed ({exc});"
             " verify the file is a kl-run-preflight SQLite"
         )
     finally:
         conn.close()
 
-    if not rows:
+    if not illumina_samples:
         parser.error(
             f"--preflight-blob {preflight_blob} contains no illumina_sample rows;"
             " a bcl-convert submission needs at least one sample to demultiplex"
         )
 
-    parsed: list[tuple[int, str, int]] = []
-    for prepped_sample_idx, biosample_accession, qiita_id in rows:
+    parsed: list[_PreflightRow] = []
+    for illumina_sample_idx, biosample_accession, primary, secondary in illumina_samples:
         if not biosample_accession:
             parser.error(
-                f"--preflight-blob {preflight_blob}: prepped_sample_idx"
-                f" {prepped_sample_idx} carries no biosample_accession; populate"
+                f"--preflight-blob {preflight_blob}: illumina_sample_idx"
+                f" {illumina_sample_idx} carries no biosample_accession; populate"
                 " upstream before re-submitting"
             )
-        try:
-            study_idx = int(qiita_id)
-        except TypeError, ValueError:
+        if not primary:
             parser.error(
-                f"--preflight-blob {preflight_blob}: project.qiita_id"
-                f" {qiita_id!r} (prepped_sample_idx {prepped_sample_idx}) is not"
-                " an integer study_idx; the deploy convention is that"
-                " project.qiita_id holds the Qiita study_idx as text"
+                f"--preflight-blob {preflight_blob}: illumina_sample_idx"
+                f" {illumina_sample_idx} carries no primary_project_accession;"
+                " populate upstream before re-submitting"
             )
-        if study_idx <= 0:
-            parser.error(
-                f"--preflight-blob {preflight_blob}: project.qiita_id"
-                f" {qiita_id!r} resolves to non-positive study_idx {study_idx};"
-                " expected a positive Qiita study_idx"
+        parsed.append(
+            _PreflightRow(
+                illumina_sample_idx=int(illumina_sample_idx),
+                biosample_accession=biosample_accession,
+                primary_project_accession=primary,
+                secondary_project_accessions=list(secondary),
             )
-        parsed.append((int(prepped_sample_idx), biosample_accession, study_idx))
+        )
     return parsed
+
+
+def _build_missing_section(
+    *,
+    label: str,
+    missing: list[str],
+    preflight_rows: list[_PreflightRow],
+    row_accessions: Callable[[_PreflightRow], list[str]],
+) -> str | None:
+    """Build one labeled section naming every preflight row that carries
+    a missing accession in this class. Returns None if `missing` is empty.
+
+    `row_accessions` extracts the row's accessions in the relevant class
+    (one for biosamples, primary + secondaries for studies). The header
+    counts distinct missing accessions and the rows affected, so the
+    per-row bullet count is no longer ambiguous against the dedup count.
+    """
+    if not missing:
+        return None
+    missing_set = set(missing)
+    bullets: list[str] = []
+    for row in preflight_rows:
+        row_misses = [a for a in row_accessions(row) if a in missing_set]
+        if row_misses:
+            bullets.append(
+                f"  - {', '.join(row_misses)} (illumina_sample_idx={row.illumina_sample_idx})"
+            )
+    acc_plural = "s" if len(missing) != 1 else ""
+    rows_plural = "s" if len(bullets) != 1 else ""
+    return (
+        f"{len(missing)} distinct preflight {label} accession{acc_plural}"
+        f" not found in qiita, affecting {len(bullets)} illumina_sample row{rows_plural}:\n"
+        + "\n".join(bullets)
+    )
+
+
+def _print_missing_accession_error(
+    preflight_rows: list[_PreflightRow],
+    missing_biosamples: list[str],
+    missing_studies: list[str],
+) -> None:
+    """Emit one combined stderr block naming every offending preflight row.
+
+    Each present class (biosample, study) gets its own header + bullet
+    list, built by `_build_missing_section`.
+    """
+    sections = [
+        s
+        for s in (
+            _build_missing_section(
+                label="biosample",
+                missing=missing_biosamples,
+                preflight_rows=preflight_rows,
+                row_accessions=lambda row: [row.biosample_accession],
+            ),
+            _build_missing_section(
+                label="study",
+                missing=missing_studies,
+                preflight_rows=preflight_rows,
+                row_accessions=lambda row: [
+                    row.primary_project_accession,
+                    *row.secondary_project_accessions,
+                ],
+            ),
+        )
+        if s is not None
+    ]
+    print(
+        "error: " + "\n".join(sections) + "\nimport the missing record(s) and re-run.",
+        file=sys.stderr,
+    )
 
 
 def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -941,9 +1024,9 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
        basename as ``run_preflight_filename``.
     3. For each preflight ``illumina_sample`` row: POST the
        sequenced-sample composer with the resolved biosample_idx (from
-       step 2.5 below), the per-row study_idx (preflight
-       ``project.qiita_id``), the operator-supplied prep_protocol_idx,
-       and ``sequenced_pool_item_id = str(prepped_sample_idx)`` so the
+       step 2.5 below), the resolved study_idx (from step 2.5 below),
+       the operator-supplied prep_protocol_idx,
+       and ``sequenced_pool_item_id = str(illumina_sample_idx)`` so the
        eventual fastq-to-parquet step keys on the bcl-convert fastq
        basename prefix.
     4. POST /work-ticket — target_kind sequenced_pool, the two idxs
@@ -951,11 +1034,15 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
        module, action_context carrying the absolute bcl_input_dir.
 
     Step 2.5 (before any 1/2 side effects): POST
-    /biosample/lookup-by-accession with the deduped preflight
-    accessions. If `missing` is non-empty, print the list and exit 1
-    with no side effects — the operator imports the missing
-    biosamples and re-runs. Find-or-create on 1 and 2 means a partial-
-    failure retry converges on the same rows.
+    /biosample/lookup-by-accession with the deduped preflight biosample
+    accessions, then POST /study/lookup-by-accession with the deduped
+    union of every row's primary + secondary project accessions. Both
+    lookups always run, and if either carries a non-empty `missing`,
+    the CLI emits a single combined stderr block (labeled sub-sections
+    per class) and exits 1 with no side effects — the operator imports
+    the missing biosamples / studies and re-runs. Find-or-create on
+    steps 1 and 2 means a partial-failure retry converges on the same
+    rows.
 
     All calls share one PAT (one ``run_http_subcommand`` invocation,
     one ``read_token``) so retries use the same credential.
@@ -985,18 +1072,22 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
     # land as parser.error / exit 2.
     preflight_rows = _read_preflight_rows(args.preflight_blob, parser)
 
-    # Dedup accessions while preserving input order so the lookup-by-
-    # accession route's `missing` echo is deterministic.
-    unique_accessions: list[str] = []
-    seen: set[str] = set()
-    for _prepped, accession, _study in preflight_rows:
-        if accession not in seen:
-            seen.add(accession)
-            unique_accessions.append(accession)
+    # One-pass order-preserving dedup over preflight_rows so the lookup
+    # route's `missing` echo is deterministic; the study side pools each
+    # row's primary + secondaries so controls land their full set.
+    unique_biosample_accessions: list[str] = []
+    unique_study_accessions: list[str] = []
+    seen_biosample: set[str] = set()
+    seen_study: set[str] = set()
+    for row in preflight_rows:
+        if row.biosample_accession not in seen_biosample:
+            seen_biosample.add(row.biosample_accession)
+            unique_biosample_accessions.append(row.biosample_accession)
+        for study_accession in (row.primary_project_accession, *row.secondary_project_accessions):
+            if study_accession not in seen_study:
+                seen_study.add(study_accession)
+                unique_study_accessions.append(study_accession)
 
-    lookup_body = BiosampleLookupByAccessionRequest(
-        accessions=unique_accessions,
-    ).model_dump(mode="json")
     run_body = SequencingRunCreateRequest(
         instrument_run_id=instrument_run_id,
         platform=Platform.ILLUMINA,
@@ -1013,33 +1104,27 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
         # auto-fill it server-side.
         owner_idx = _common.whoami(args.base_url, token)["principal_idx"]
 
-        # Step 2.5: resolve every accession before any side effect. A
-        # non-empty `missing` is the fail-fast path — print the misses
-        # and exit 1 with no sequencing_run / sequenced_pool created.
-        lookup_resp = _common.call(
-            "POST",
+        # Step 2.5: resolve every accession before any side effect. Both
+        # lookups always run so the operator sees biosample + study
+        # misses in a single round trip; a non-empty miss on either side
+        # is the fail-fast path — print the combined block and exit 1
+        # with no sequencing_run / sequenced_pool created.
+        resolved_biosamples, missing_biosamples = _lookup_accessions(
             args.base_url,
             token,
             f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}",
-            json=lookup_body,
+            unique_biosample_accessions,
+            BiosampleLookupByAccessionRequest,
         )
-        resolved: dict[str, int] = lookup_resp["resolved"]
-        missing: list[str] = lookup_resp["missing"]
-        if missing:
-            # Names every offending preflight row so the operator can
-            # locate the upstream record.
-            misses_per_row = [
-                f"  - {accession} (prepped_sample_idx={prepped})"
-                for prepped, accession, _study in preflight_rows
-                if accession in missing
-            ]
-            print(
-                f"error: {len(missing)} preflight biosample accession"
-                f"{'s' if len(missing) != 1 else ''} not found in qiita:\n"
-                + "\n".join(misses_per_row)
-                + "\nimport the missing biosample(s) and re-run.",
-                file=sys.stderr,
-            )
+        resolved_studies, missing_studies = _lookup_accessions(
+            args.base_url,
+            token,
+            f"{PATH_STUDY_PREFIX}{PATH_STUDY_LOOKUP_BY_ACCESSION}",
+            unique_study_accessions,
+            StudyLookupByAccessionRequest,
+        )
+        if missing_biosamples or missing_studies:
+            _print_missing_accession_error(preflight_rows, missing_biosamples, missing_studies)
             raise SystemExit(1)
 
         run_resp, run_status = _common.call_with_status(
@@ -1072,13 +1157,15 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
         # (e.g. someone re-ran with a different prep_protocol_idx)
         # surfaces to the operator.
         per_sample_results: list[dict] = []
-        for prepped_sample_idx, accession, study_idx in preflight_rows:
+        for row in preflight_rows:
+            secondary_study_idxs = [resolved_studies[a] for a in row.secondary_project_accessions]
             sample_body = SequencedSampleCreateRequest(
-                biosample_idx=resolved[accession],
+                biosample_idx=resolved_biosamples[row.biosample_accession],
                 owner_idx=owner_idx,
                 prep_protocol_idx=args.prep_protocol_idx,
-                sequenced_pool_item_id=str(prepped_sample_idx),
-                primary_study_idx=study_idx,
+                sequenced_pool_item_id=str(row.illumina_sample_idx),
+                primary_study_idx=resolved_studies[row.primary_project_accession],
+                secondary_study_idxs=secondary_study_idxs,
             ).model_dump(exclude_unset=True, mode="json")
             sample_path = PATH_SEQUENCED_SAMPLE_FROM_RUN.format(
                 sequencing_run_idx=sequencing_run_idx,
@@ -1093,10 +1180,11 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
             )
             per_sample_results.append(
                 {
-                    "prepped_sample_idx": prepped_sample_idx,
-                    "biosample_accession": accession,
-                    "biosample_idx": resolved[accession],
-                    "primary_study_idx": study_idx,
+                    "illumina_sample_idx": row.illumina_sample_idx,
+                    "biosample_accession": row.biosample_accession,
+                    "biosample_idx": resolved_biosamples[row.biosample_accession],
+                    "primary_study_idx": resolved_studies[row.primary_project_accession],
+                    "secondary_study_idxs": secondary_study_idxs,
                     "sequenced_sample_idx": sample_resp["sequenced_sample_idx"],
                 }
             )
