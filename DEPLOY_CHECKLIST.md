@@ -35,7 +35,7 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- (#75) bcl-convert SIF build is now generic. The command changed: `bash scripts/build-bcl-convert-sif.sh` → `PATH_DERIVED=<derived> bash scripts/build-sif.sh bcl-convert` (per-workflow spec now lives in `workflows/bcl-convert/sif-build.env`). The builder stages into a temp root **owned by the invoking user** and only reads the checkout, so it no longer needs the `qiita`-owned `workflows/bcl-convert/` dir writable by `qiita-orch` — if a `chmod`/`setfacl` workaround was applied there to get the build to run, it can be removed. The produced SIF is byte-for-byte the same and `local-deploy.sh` does not rebuild SIFs, so a routine deploy needs no action; this only matters next time the SIF is (re)built.
 
 ---
 
