@@ -1,0 +1,20 @@
+Bootstrap: docker
+From: busybox:1.36
+
+# Sentinel workflow (the `_` prefix marks it a non-action helper, like
+# workflows/_shared — the control-plane loader's rglob("*.yaml") never
+# matches it because it ships no workflow YAML). Its sole purpose is to
+# give `make test-workflows` a real `apptainer build` that exercises
+# scripts/build-sif.sh's temp-root staging and the ../_shared/ %files
+# relative-path resolution, with a ~4 MB base and no licensed artifact.
+
+%files
+    # The same shared file every real container copies. build-sif.sh mirrors
+    # the repo layout into a temp build root and builds from <build>/<wf>, so
+    # this ../_shared/ path resolves exactly as it does for bcl-convert — that
+    # resolution is what we're proving here.
+    ../_shared/manifest_writer.py /opt/qiita/manifest_writer.py
+
+%test
+    # Confirm the %files copy landed; build-sif.sh's VERIFY step greps for it.
+    ls /opt/qiita

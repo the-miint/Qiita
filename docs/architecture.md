@@ -960,6 +960,14 @@ test-workflows:
 	apptainer build --force /tmp/qiita-workflow-smoke.sif workflows/amplicon/Apptainer.def
 	apptainer exec /tmp/qiita-workflow-smoke.sif echo "hello world"
 	rm -f /tmp/qiita-workflow-smoke.sif
+	# Exercise scripts/build-sif.sh end-to-end against real apptainer via the
+	# _sif-build-smoke sentinel (no licensed artifact). Uses a throwaway
+	# PATH_DERIVED so the built SIF lands in a temp images/ dir. The trap
+	# removes it on success, failure, OR signal; set -e propagates a build
+	# failure as the recipe's exit status (no trailing `exit` tripwire).
+	set -e; smoke_derived=$$(mktemp -d); trap 'rm -rf "$$smoke_derived"' EXIT; \
+		mkdir -p "$$smoke_derived/images"; \
+		PATH_DERIVED="$$smoke_derived" bash scripts/build-sif.sh _sif-build-smoke
 
 test-integration: build-data-plane-debug build-integration $(DBMATE_BIN)
 	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \

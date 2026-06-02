@@ -64,6 +64,16 @@ the `no-changelog` label).
   `PATH_PERSISTENT` / `PATH_DERIVED`; the services derive the fixed
   subdirs. Hard cutover — the old names are gone and boot fails fast until
   the new ones are set (#73)
+- SIF builds go through a single generic `scripts/build-sif.sh <workflow>`
+  driven by a declarative `workflows/<workflow>/sif-build.env`; replaces the
+  per-workflow `scripts/build-bcl-convert-sif.sh`. The builder stages into a
+  temp root owned by the invoking user (the checkout is read-only), so a
+  service account can build without write access to the qiita-owned checkout.
+  A `test_sif_build_spec.py` guard forbids per-workflow build scripts, requires
+  each spec to be complete, and asserts `SIF_FILENAME` matches the workflow
+  YAML's `container:`; `make test-workflows` builds a `_sif-build-smoke`
+  sentinel through `build-sif.sh` so the temp-root staging is covered against
+  real apptainer in CI (#75)
 
 ### Fixed
 
