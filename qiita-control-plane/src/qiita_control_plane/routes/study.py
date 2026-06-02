@@ -1,21 +1,23 @@
-"""Study create / read routes.
+"""Study create / read / patch routes.
 
 POST creates a study and gates on caller scope plus the lab-tech-on-behalf
 rule; GET reads a study by idx and gates on the per-study default_tier
-policy with admin / wet_lab_admin bypass. Both delegate the row →
-StudyResponse mapping to a shared helper. PATCH / DELETE / search
-endpoints are deferred.
+policy with admin / wet_lab_admin bypass; PATCH edits the editable
+post-create columns and gates on caller scope plus per-study Tier.ADMIN
+(wet_lab_admin bypass). The three handlers share the row → StudyResponse
+mapping via a helper in this module. DELETE / search endpoints are
+deferred.
 """
 
 import json
 from typing import Annotated
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 from pydantic import Field
 from qiita_common.api_paths import PATH_STUDY_BY_IDX, PATH_STUDY_PREFIX, PATH_STUDY_ROOT
 from qiita_common.auth_constants import Scope, SystemRole
-from qiita_common.models import StudyCreate, StudyResponse
+from qiita_common.models import StudyCreate, StudyPatchRequest, StudyResponse, Tier
 
 from ..auth.guards import (
     require_complete_profile,
@@ -26,8 +28,14 @@ from ..auth.guards import (
 )
 from ..auth.principal import HumanUser, Principal
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
-from ..repositories.study import create_study, fetch_study
-from ._helpers import GENERIC_FK_VIOLATION, raise_for_unique_violation
+from ..repositories.study import create_study, fetch_study, update_study
+from ._helpers import (
+    GENERIC_FK_VIOLATION,
+    etag_for_updated_at,
+    raise_for_unique_violation,
+    require_etag_match,
+    require_if_match,
+)
 
 router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["study"])
 
@@ -188,3 +196,100 @@ async def get_study(
             detail=f"study {study_idx} not found",
         )
     return _study_response_from_row(row)
+
+
+@router.patch(PATH_STUDY_BY_IDX)
+async def patch_study(
+    study_idx: Annotated[int, Field(gt=0)],
+    body: StudyPatchRequest,
+    response: Response,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    _scope: Principal = Depends(require_scope(Scope.STUDY_WRITE)),
+    _exists: None = Depends(require_study_exists),
+    _access: None = Depends(
+        require_study_access(min_tier=Tier.ADMIN, bypass_role=SystemRole.WET_LAB_ADMIN)
+    ),
+) -> StudyResponse:
+    """Edit a study's core record.
+
+    Auth bar: caller holds Scope.STUDY_WRITE AND either is wet_lab_admin
+    or higher, or holds Tier.ADMIN on this study (the owner-bypass path
+    inside require_study_access covers the study owner). require_study_exists
+    composes alongside require_study_access so role-bypass callers still get
+    404 on a non-existent study_idx (the access guard's bypass path returns
+    without any DB lookup, so it cannot surface that 404 on its own).
+
+    If-Match is required: missing -> 428, mismatch -> 412. The body's
+    editable fields are validated by StudyPatchRequest (extra=forbid
+    rejects immutable / system-managed columns with 422; an empty body
+    is also 422; explicit-null title is 422). Inside one connection-
+    scoped transaction the route runs a `SELECT ... FOR UPDATE`
+    preflight on the row (existence -> 404, ETag -> 412); applies the
+    UPDATE; returns the post-UPDATE row. The FOR UPDATE lock is held
+    from preflight through commit, so concurrent PATCHes on the same
+    row serialize at the preflight: the second caller blocks until
+    the first commits, then sees the post-commit `updated_at` and
+    412s on its now-stale If-Match header. Uniqueness violations on
+    ebi_study_accession map to 409 via the shared helper; FK violations
+    to the generic 422; the role-typed FK trigger on
+    principal_investigator_idx (a candidate non-user principal) to a
+    disambiguated 422.
+
+    The response carries an `ETag` header derived from the new row's
+    `updated_at` column; format mirrors the GET endpoint's contract
+    and is opaque to clients.
+    """
+    # Missing If-Match is 428 before any DB work runs.
+    require_if_match(if_match)
+    assert if_match is not None  # narrows for the type checker after the guard above
+
+    # Build the column-keyed write set from the model's set fields so the
+    # repository sees only what the caller explicitly included; explicit
+    # null vs. absent is distinguished by model_fields_set.
+    fields = {name: getattr(body, name) for name in body.model_fields_set}
+
+    async with tx() as conn:
+        try:
+            # Preflight: existence -> 404, ETag -> 412. for_update=True
+            # acquires a row-level lock for the rest of the transaction
+            # so a concurrent PATCH on the same row serializes here
+            # instead of racing through the ETag check and silently
+            # overwriting the first writer's update.
+            row = await fetch_study(conn, study_idx, for_update=True)
+            require_etag_match(row, if_match=if_match, label="study", row_idx=study_idx)
+
+            # Apply the UPDATE; the repo function returns the post-UPDATE
+            # row in the same shape fetch_study selects, so no follow-up
+            # SELECT is needed. The FOR UPDATE preflight holds a row lock
+            # for the rest of this transaction, so update_study cannot
+            # return None here — the row is guaranteed to exist under
+            # our lock. The defensive None check is kept as a backstop
+            # and surfaces as the same 404 the preflight emits, so an
+            # invariant violation (someone removing the lock without
+            # rethinking) fails loudly rather than indexing into None.
+            updated_row = await update_study(conn, study_idx, fields=fields)
+            if updated_row is None:
+                raise HTTPException(status_code=404, detail=f"study {study_idx} not found")
+        except asyncpg.UniqueViolationError as exc:
+            raise_for_unique_violation(
+                exc,
+                constraint_messages=_UNIQUE_VIOLATION_MESSAGES,
+                generic=_GENERIC_UNIQUE_VIOLATION,
+            )
+        except asyncpg.ForeignKeyViolationError:
+            raise HTTPException(status_code=422, detail=GENERIC_FK_VIOLATION)
+        except asyncpg.RaiseError as exc:
+            # tg_principal_must_be_user fires for PI idx pointing at a
+            # non-user-kind principal (service account or bare principal).
+            # owner_idx is not patchable so that arm of the trigger is
+            # unreachable here.
+            msg = str(exc)
+            if "must reference a user-kind principal" in msg:
+                raise HTTPException(status_code=422, detail=_MSG_BAD_PI_NOT_USER)
+            raise
+
+    # Set the new ETag from the updated row's bumped updated_at.
+    response.headers["ETag"] = etag_for_updated_at(updated_row["updated_at"])
+
+    return _study_response_from_row(updated_row)

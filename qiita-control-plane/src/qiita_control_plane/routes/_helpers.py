@@ -70,6 +70,37 @@ def etag_for_updated_at(updated_at: datetime) -> str:
     return f'"{updated_at.isoformat()}"'
 
 
+def require_if_match(if_match: str | None) -> None:
+    """Raise 428 when the caller did not send an If-Match header.
+
+    Every PATCH surface requires optimistic-concurrency control; routing
+    the 428 through this helper keeps the wording identical across
+    endpoints and makes the missing-header check unmissable.
+    """
+    if if_match is None:
+        raise HTTPException(status_code=428, detail="If-Match header required")
+
+
+def require_etag_match(
+    row: asyncpg.Record | None,
+    *,
+    if_match: str,
+    label: str,
+    row_idx: int,
+) -> None:
+    """Run the post-FOR-UPDATE-preflight 404 / 412 checks for a PATCH route.
+
+    Called after `fetch_<entity>(conn, idx, for_update=True)` to fold
+    "row absent (404)" and "ETag stale (412)" into one site so every
+    PATCH endpoint emits the same wording. `label` is the entity noun
+    embedded in the 404 detail (e.g. "study", "biosample").
+    """
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"{label} {row_idx} not found")
+    if if_match != etag_for_updated_at(row["updated_at"]):
+        raise HTTPException(status_code=412, detail="If-Match did not match")
+
+
 async def detail_for_slot_collision(
     conn: asyncpg.Connection,
     exc: SlotOccupiedError,

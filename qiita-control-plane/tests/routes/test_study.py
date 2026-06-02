@@ -1,10 +1,20 @@
-"""Integration tests for the POST /api/v1/study route.
+"""Integration tests for the POST / GET / PATCH /api/v1/study routes.
 
-Covers happy-path creation across the three caller-role variants,
+POST: covers happy-path creation across the three caller-role variants,
 the lab-tech-on-behalf rule, auth / scope guards, the collapsed
 owner-eligibility 422 surface (parametrised across the six
 ineligibility shapes), Pydantic validation, and the route's
 exception-mapping path (PI FK 422, owner non-user 422).
+
+GET: covers the wiring-level cases (round-trip with POST, 401, missing
+scope 403, 404, below-default-tier 403); exhaustive tier-policy edge
+cases live at the guard level in tests/auth/test_guards.py.
+
+PATCH: covers the auth-bar variants (owner self, study admin tier,
+wet_lab_admin role bypass), If-Match concurrency (428 / 412), body
+validation (empty, extra-forbidden, explicit-null title, empty title),
+the exception-mapping paths (PI FK 422, duplicate accession 409), and
+the ETag bump.
 """
 
 import secrets
@@ -23,8 +33,10 @@ from qiita_control_plane.testing.db_seeds import (
 from .conftest import (
     OWNER_INELIGIBILITY_KINDS,
     IneligibilityKind,
+    _grant_study_access,
     assert_owner_ineligibility_422,
     delete_idxs,
+    etag_for_row,
     resolve_ineligible_owner_idx,
 )
 
@@ -557,3 +569,346 @@ async def test_get_study_below_default_tier_403(ctx):
     resp = await ctx["user"].get(URL_STUDY_BY_IDX.format(study_idx=study_idx))
     assert resp.status_code == 403
     assert "'member'" in resp.json()["detail"]
+
+
+# ===========================================================================
+# PATCH /api/v1/study/{study_idx}
+# ===========================================================================
+
+
+def _assert_etag_quoted(resp) -> None:
+    """Confirm the ETag header is present and wrapped in double quotes
+    (RFC 7232 entity-tag grammar). The inside is opaque-by-contract."""
+    etag = resp.headers.get("ETag")
+    assert etag is not None and etag.startswith('"') and etag.endswith('"')
+
+
+async def _post_study_owned_by_other(ctx) -> int:
+    """Seed a study owned by a fresh user (not any of the role-keyed
+    session principals), via wet_lab_admin on-behalf. Returns the
+    study_idx; tracks the owner principal and the study for cleanup."""
+    other_owner = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix="patch-other")
+    ctx["created"]["user_principals"].append(other_owner)
+    resp = await _post_study(
+        ctx["wet"],
+        ctx,
+        title=_unique_title("patch-other"),
+        owner_idx=other_owner,
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()["study_idx"]
+
+
+async def test_patch_study_owner_self_patch_happy_path(ctx):
+    """Tests the case where a study's owner PATCHes their own study via
+    the owner-bypass path inside require_study_access (no explicit
+    study_access row needed). Response is a full StudyResponse and only
+    the targeted column changed."""
+    create_resp = await _post_study(
+        ctx["user"], ctx, title=_unique_title("patch-self"), alias="alias-pre"
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    posted = create_resp.json()
+    study_idx = posted["study_idx"]
+    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+
+    resp = await ctx["user"].patch(
+        URL_STUDY_BY_IDX.format(study_idx=study_idx),
+        json={"alias": "alias-post"},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 200, resp.text
+    _assert_etag_quoted(resp)
+    rj = resp.json()
+    expected = {**posted, "alias": "alias-post", "updated_at": rj["updated_at"]}
+    assert rj == expected
+
+
+async def test_patch_study_admin_tier_grant_happy_path(ctx):
+    """Tests the case where a non-owner caller who holds an explicit
+    Tier.ADMIN study_access grant patches the study successfully
+    (Tier.ADMIN is the min_tier the route requires)."""
+    study_idx = await _post_study_owned_by_other(ctx)
+    await _grant_study_access(
+        ctx,
+        study_idx=study_idx,
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier="admin",
+        granted_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+
+    resp = await ctx["user"].patch(
+        URL_STUDY_BY_IDX.format(study_idx=study_idx),
+        json={"notes": "patched-by-tier-admin"},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["notes"] == "patched-by-tier-admin"
+
+
+async def test_patch_study_wet_lab_admin_role_bypass(ctx):
+    """Tests the case where a wet_lab_admin who has no study_access on
+    the study patches successfully via the bypass_role path inside
+    require_study_access (no DB access-tier lookup runs)."""
+    study_idx = await _post_study_owned_by_other(ctx)
+    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+
+    resp = await ctx["wet"].patch(
+        URL_STUDY_BY_IDX.format(study_idx=study_idx),
+        json={"notes": "patched-by-wet"},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["notes"] == "patched-by-wet"
+
+
+async def test_patch_study_etag_advances_on_ebi_accession_round_trip(ctx):
+    """Tests the case where a PATCH writes a new ebi_study_accession
+    and the response's ETag advances past the If-Match value (the
+    study_set_updated_at trigger bumps updated_at on every UPDATE, and
+    the route surfaces that bump as the new ETag)."""
+    create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-etag"))
+    assert create_resp.status_code == 201, create_resp.text
+    study_idx = create_resp.json()["study_idx"]
+    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    new_acc = f"ERP{secrets.token_hex(4)}"
+
+    resp = await ctx["user"].patch(
+        URL_STUDY_BY_IDX.format(study_idx=study_idx),
+        json={"ebi_study_accession": new_acc},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 200, resp.text
+    new_etag = resp.headers["ETag"]
+    assert new_etag != if_match
+    assert resp.json()["ebi_study_accession"] == new_acc
+
+
+async def test_patch_study_anonymous_401(ctx):
+    """Tests the case where the request carries no Authorization header.
+    require_scope raises 401 before any DB lookup."""
+    from qiita_control_plane.main import app
+
+    app.state.pool = ctx["pool"]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
+        resp = await anon.patch(
+            URL_STUDY_BY_IDX.format(study_idx=1),
+            json={"alias": "x"},
+            headers={"If-Match": '"unused"'},
+        )
+    assert resp.status_code == 401
+
+
+async def test_patch_study_caller_without_study_write_scope_403(ctx, no_study_write_client):
+    """Tests the case where the caller's PAT carries a scope set that
+    excludes Scope.STUDY_WRITE. require_scope rejects with 403 before
+    any access guard runs."""
+    create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-no-scope"))
+    assert create_resp.status_code == 201, create_resp.text
+    study_idx = create_resp.json()["study_idx"]
+    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+
+    resp = await no_study_write_client.patch(
+        URL_STUDY_BY_IDX.format(study_idx=study_idx),
+        json={"alias": "x"},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 403
+    assert "study:write" in resp.json()["detail"]
+
+
+async def test_patch_study_caller_with_scope_without_tier_403(ctx):
+    """Tests the case where a regular user holds Scope.STUDY_WRITE but
+    is not the owner and has no Tier.ADMIN study_access grant on the
+    study. require_study_access returns 403."""
+    study_idx = await _post_study_owned_by_other(ctx)
+    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+
+    resp = await ctx["user"].patch(
+        URL_STUDY_BY_IDX.format(study_idx=study_idx),
+        json={"alias": "x"},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 403
+
+
+async def test_patch_study_nonexistent_404(ctx):
+    """Tests the case where a wet_lab_admin attempts to PATCH an idx
+    past the highest existing study. require_study_access's bypass-role
+    path returns without a DB lookup, so the 404 surfaces from the
+    require_study_exists guard composed alongside it."""
+    max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.study")
+    resp = await ctx["wet"].patch(
+        URL_STUDY_BY_IDX.format(study_idx=max_idx + 100_000),
+        json={"alias": "x"},
+        headers={"If-Match": '"unused"'},
+    )
+    assert resp.status_code == 404
+
+
+async def test_patch_study_mismatched_if_match_412(ctx):
+    """Tests the case where the caller sends an If-Match value that does
+    not equal the row's current ETag (e.g., a stale value). The
+    FOR UPDATE preflight returns 412 and no UPDATE runs."""
+    create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-412"))
+    assert create_resp.status_code == 201, create_resp.text
+    study_idx = create_resp.json()["study_idx"]
+
+    resp = await ctx["user"].patch(
+        URL_STUDY_BY_IDX.format(study_idx=study_idx),
+        json={"alias": "x"},
+        headers={"If-Match": '"stale"'},
+    )
+    assert resp.status_code == 412
+    assert resp.json()["detail"] == "If-Match did not match"
+
+
+async def test_patch_study_missing_if_match_428(ctx):
+    """Tests the case where the caller omits the If-Match header.
+    require_if_match raises 428 before any DB lookup."""
+    create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-428"))
+    assert create_resp.status_code == 201, create_resp.text
+    study_idx = create_resp.json()["study_idx"]
+
+    resp = await ctx["user"].patch(
+        URL_STUDY_BY_IDX.format(study_idx=study_idx), json={"alias": "x"}
+    )
+    assert resp.status_code == 428
+    assert resp.json()["detail"] == "If-Match header required"
+
+
+async def test_patch_study_empty_body_422(ctx):
+    """Tests the case where the body is `{}`. PatchRequestModel's
+    at_least_one_field validator rejects empty bodies with 422."""
+    create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-empty"))
+    assert create_resp.status_code == 201, create_resp.text
+    study_idx = create_resp.json()["study_idx"]
+    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+
+    resp = await ctx["user"].patch(
+        URL_STUDY_BY_IDX.format(study_idx=study_idx),
+        json={},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 422
+
+
+async def test_patch_study_extra_forbidden_field_422(ctx):
+    """Tests the case where the body names a field outside
+    StudyPatchRequest's field set (owner_idx is intentionally excluded
+    from the patchable set). Pydantic extra='forbid' rejects with 422."""
+    create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-extra"))
+    assert create_resp.status_code == 201, create_resp.text
+    study_idx = create_resp.json()["study_idx"]
+    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+
+    resp = await ctx["user"].patch(
+        URL_STUDY_BY_IDX.format(study_idx=study_idx),
+        json={"owner_idx": ctx["user_session"]["principal_idx"]},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 422
+
+
+async def test_patch_study_explicit_null_title_422(ctx):
+    """Tests the case where the caller sends `{"title": null}`. The
+    shared NOT_NULL_FIELDS validator on PatchRequestModel rejects with
+    422 since title backs a NOT NULL column."""
+    create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-null"))
+    assert create_resp.status_code == 201, create_resp.text
+    study_idx = create_resp.json()["study_idx"]
+    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+
+    resp = await ctx["user"].patch(
+        URL_STUDY_BY_IDX.format(study_idx=study_idx),
+        json={"title": None},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 422
+    assert "title" in resp.text
+
+
+async def test_patch_study_empty_title_422(ctx):
+    """Tests the case where the caller sends `{"title": ""}`. Pydantic
+    min_length=1 on the field rejects with 422 before any DB work."""
+    create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-empty-title"))
+    assert create_resp.status_code == 201, create_resp.text
+    study_idx = create_resp.json()["study_idx"]
+    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+
+    resp = await ctx["user"].patch(
+        URL_STUDY_BY_IDX.format(study_idx=study_idx),
+        json={"title": ""},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 422
+
+
+async def test_patch_study_unknown_pi_idx_422(ctx):
+    """Tests the case where a PATCH supplies a principal_investigator_idx
+    past the highest existing principal. tg_principal_must_be_user
+    fires (BEFORE-INSERT trigger ahead of the FK constraint); the route
+    maps the RaiseError to 422 with the disambiguated PI message."""
+    create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-bad-pi"))
+    assert create_resp.status_code == 201, create_resp.text
+    study_idx = create_resp.json()["study_idx"]
+    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    max_idx = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.principal")
+
+    resp = await ctx["user"].patch(
+        URL_STUDY_BY_IDX.format(study_idx=study_idx),
+        json={"principal_investigator_idx": max_idx + 100_000},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 422
+    assert (
+        resp.json()["detail"] == "principal_investigator_idx must reference a user-kind principal"
+    )
+
+
+async def test_patch_study_pi_is_service_account_422(ctx):
+    """Tests the case where the candidate principal_investigator_idx
+    points at a service-account-kind principal. tg_principal_must_be_user
+    trips; the route maps it to 422 with the disambiguated PI message."""
+    create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-pi-svc"))
+    assert create_resp.status_code == 201, create_resp.text
+    study_idx = create_resp.json()["study_idx"]
+    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    svc_idx = await seed_service_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix="patch-pi-svc")
+    ctx["created"]["service_account_principals"].append(svc_idx)
+
+    resp = await ctx["user"].patch(
+        URL_STUDY_BY_IDX.format(study_idx=study_idx),
+        json={"principal_investigator_idx": svc_idx},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 422
+    assert (
+        resp.json()["detail"] == "principal_investigator_idx must reference a user-kind principal"
+    )
+
+
+async def test_patch_study_duplicate_ebi_accession_409(ctx):
+    """Tests the case where a PATCH would set ebi_study_accession to a
+    value already held by another study. The
+    study_ebi_study_accession_unique constraint fires; the route maps
+    the unique-violation to 409 via the shared
+    raise_for_unique_violation helper."""
+    shared_accession = f"ERP{secrets.token_hex(4)}"
+    first = await _post_study(
+        ctx["user"], ctx, title=_unique_title("patch-dup-1"), ebi_study_accession=shared_accession
+    )
+    assert first.status_code == 201, first.text
+    second = await _post_study(ctx["user"], ctx, title=_unique_title("patch-dup-2"))
+    assert second.status_code == 201, second.text
+    study_idx = second.json()["study_idx"]
+    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+
+    resp = await ctx["user"].patch(
+        URL_STUDY_BY_IDX.format(study_idx=study_idx),
+        json={"ebi_study_accession": shared_accession},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "ebi_study_accession already in use"

@@ -88,6 +88,8 @@ from ._helpers import (
     etag_for_updated_at,
     raise_for_transient_write_race,
     raise_for_unique_violation,
+    require_etag_match,
+    require_if_match,
 )
 
 router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["biosample"])
@@ -592,8 +594,8 @@ async def patch_biosample(
     )
 
     # Missing If-Match is 428 before any DB work runs.
-    if if_match is None:
-        raise HTTPException(status_code=428, detail="If-Match header required")
+    require_if_match(if_match)
+    assert if_match is not None  # narrows for the type checker after the guard above
 
     # Build the column-keyed write set from the model's set fields so the
     # repository sees only what the caller explicitly included; explicit
@@ -608,12 +610,11 @@ async def patch_biosample(
             # serializes here instead of racing through the ETag check
             # and silently overwriting the first writer's update.
             row = await fetch_biosample(conn, biosample_idx, for_update=True)
-            if row is None:
-                raise HTTPException(status_code=404, detail=f"biosample {biosample_idx} not found")
-            if row["retired"]:
+            # Retirement is biosample-specific; absent / stale-ETag is
+            # the shared post-FOR-UPDATE preflight every PATCH runs.
+            if row is not None and row["retired"]:
                 raise HTTPException(status_code=409, detail=f"biosample {biosample_idx} is retired")
-            if if_match != etag_for_updated_at(row["updated_at"]):
-                raise HTTPException(status_code=412, detail="If-Match did not match")
+            require_etag_match(row, if_match=if_match, label="biosample", row_idx=biosample_idx)
 
             # Eligibility preflight runs only when ownership is being
             # transferred; collapses every ineligibility case to 422.

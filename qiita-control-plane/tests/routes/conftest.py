@@ -10,6 +10,7 @@ tracked table set differs per route.
 import secrets
 from collections.abc import Awaitable, Callable
 from enum import StrEnum
+from typing import Literal, get_args
 
 import pytest
 import pytest_asyncio
@@ -217,6 +218,32 @@ async def delete_idxs(pool, table: str, idxs) -> None:
         f"DELETE FROM qiita.{table} WHERE idx = ANY($1::bigint[])",
         idxs,
     )
+
+
+# Tables etag_for_row is allowed to read. The PATCH routes touch
+# qiita.biosample and qiita.study; the helper interpolates this into
+# raw SQL, so the set is a closed Literal — never widen by accepting
+# caller input directly. The runtime get_args() check inside the helper
+# rejects any string the Literal does not cover, since Python does not
+# enforce Literal at runtime on its own.
+EtagReadableTable = Literal["biosample", "study"]
+
+
+async def etag_for_row(pool, *, table: EtagReadableTable, row_idx: int) -> str:
+    """Build the quoted ISO-8601 ETag the PATCH routes emit for a row.
+
+    Reads updated_at directly from the named qiita table so the helper
+    does not depend on the route's behavior; matches
+    `etag_for_updated_at` in routes/_helpers.py. Table name is
+    interpolated into the SQL; the get_args() guard rejects anything
+    outside EtagReadableTable.
+    """
+    if table not in get_args(EtagReadableTable):
+        raise ValueError(f"etag_for_row rejects non-readable table: {table!r}")
+    updated_at = await pool.fetchval(
+        f"SELECT updated_at FROM qiita.{table} WHERE idx = $1", row_idx
+    )
+    return f'"{updated_at.isoformat()}"'
 
 
 # ---------------------------------------------------------------------------
