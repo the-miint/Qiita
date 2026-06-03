@@ -97,6 +97,16 @@ the `no-changelog` label).
 
 ### Fixed
 
+- Corrected stale identifier field names in `docs/architecture.md` to match the
+  current schema: `sample_idx` → `biosample_idx` (the physical sample is
+  `biosample`; there is no `sample` table), removed the non-existent `prep`
+  entity / `prep_idx` (no `prep` table — a preparation is a `biosample` under a
+  `prep_protocol` yielding a `prep_sample`; `prep_idx` survives only as a
+  vestigial `work_ticket` scope tuple), documented that `study`/`biosample` are
+  many-to-many with `prep_sample`, and dropped `study_idx`/`biosample_idx` from
+  the result-Parquet identifier columns (recovered via control-plane joins),
+  resolving the prior `(prep_idx, processing_idx)` vs `(prep_sample_idx,
+  processing_idx)` inconsistency (#76)
 - Assert `HumanUser` before reading `.system_role` in the sequenced-sample /
   biosample routes (closes #45) (#59)
 - Closed deploy gaps surfaced by the first user-CLI fastq-to-parquet smoke
