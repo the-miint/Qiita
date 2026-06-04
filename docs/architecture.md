@@ -118,11 +118,11 @@ graph TB
 All identifiers are uint64, minted exclusively by the control plane. The data plane treats all identifiers as opaque integers.
 
 - **`study_idx`** — unique identifier for a study. A study is a logical collection of biosamples and prep_samples — both linked **many-to-many** (a biosample or prep_sample can belong to several studies; a study includes many of each), including meta-analyses that group `prep_sample_idx` values from other studies without uploading new data. The junction tables are `biosample_to_study` and `prep_sample_to_study`.
-- **`biosample_idx`** — unique identifier for a physical sample (table `biosample`; this is the entity earlier drafts called `sample` — there is no `sample` table or `sample_idx` column). A biosample can appear across multiple studies (shared controls, meta-analysis groupings) via `biosample_to_study`.
-- **`prep_protocol_idx`** — identifies a lab preparation procedure (amplicon, shotgun, …). **There is no standalone `prep` table or `prep_idx` entity:** a *preparation* is a `biosample` prepared under a `prep_protocol`, which yields a `prep_sample`. The token `prep_idx` survives only as a vestigial `work_ticket` scope tuple `(study_idx, prep_idx)` with no backing table (see [Work Ticket Lifecycle](#work-ticket-lifecycle)).
-- **`prep_sample_idx`** — a specific biosample as prepared under a specific protocol; the finest-grained unit of raw input data and the supertype of the downstream-measurement hierarchy. Each prep_sample has exactly one parent biosample (`prep_sample.biosample_idx`); a biosample may yield multiple prep_samples (technical or biological replicates), and a prep_sample links many-to-many to studies via `prep_sample_to_study`.
+- **`biosample_idx`** — unique identifier for a physical sample (table `biosample`). (Note that **sample** is an ambiguous term and therefore is NOT used to represent any entity in the data model.) A biosample can appear across multiple studies via `biosample_to_study`.
+- **`prep_protocol_idx`** — identifies a lab preparation procedure (amplicon, shotgun, …). **Warning: The prep_protocol_idx is not linked to any explicit `prep` entity nor is it intended to be. The token `prep_idx` survives as a vestigial `work_ticket` scope tuple `(study_idx, prep_idx)` with no backing table (see [Work Ticket Lifecycle](#work-ticket-lifecycle)).  This is a design issue that must be clarified by the system designers before building on it in any way.**  *preparation* is an ambiguous term and therefore is NOT used to represent any entity in the data model.
+- **`prep_sample_idx`** — a specific instance of a specific biosample prepared under a specific protocol; the finest-grained unit of raw input data and the supertype of the downstream-measurement hierarchy. Each prep_sample has exactly one parent biosample (`prep_sample.biosample_idx`); a biosample may yield multiple prep_samples (technical or biological replicates), and a prep_sample may appear in many studies (e.g. shared extraction plate controls) via the many-to-many `prep_sample_to_study` table.
 - **`processing_idx`** — unique identifier for a processing method: a specific `(workflow_name, workflow_version, parameter_set)` combination. Immutable once created. Reusable across prep_samples and studies. Opaque integer in the data plane; detail lives in the control plane `processing_methods` table.
-- **`processed_prep_sample_idx`** — unique identifier for the result of applying a `processing_idx` to a `prep_sample_idx`. Minted by the control plane before job submission. Processing cannot create new samples — all `processed_prep_sample_idx` values for a job are pre-assigned from the known `prep_sample_idx` set in the submission.
+- **`processed_prep_sample_idx`** — unique identifier for the result of applying a `processing_idx` to a `prep_sample_idx`. Minted by the control plane before job submission. Processing cannot create new prep samples — all `processed_prep_sample_idx` values for a job are pre-assigned from the known `prep_sample_idx` set in the submission.
 
 Reference identifiers form a parallel hierarchy for reference databases:
 
@@ -171,7 +171,7 @@ All result Parquet files must include these columns, in this order, and be sorte
 prep_sample_idx  processing_idx  processed_prep_sample_idx
 ```
 
-Neither `study_idx` nor `biosample_idx` is embedded: a prep_sample maps to studies **many-to-many** (so files are never keyed by `study_idx` — see [Data Storage](#data-storage)), and its parent `biosample_idx` is a single-FK lookup; both are recovered at query time via control-plane joins (`prep_sample_to_study`, `prep_sample.biosample_idx`) rather than duplicated into every row. `prep_idx` is absent because there is no `prep` entity.
+Neither `study_idx` nor `biosample_idx` is embedded: a prep_sample maps to studies **many-to-many** (so files are never keyed by `study_idx` — see [Data Storage](#data-storage)), and its parent `biosample_idx` is a single-FK lookup; both are recovered at query time via control-plane joins (`prep_sample_to_study`, `prep_sample.biosample_idx`) rather than duplicated into every row.
 
 This sort order provides two compounding layers of query optimisation:
 
@@ -182,9 +182,9 @@ The sort is enforced in the reduce step (see Compute Orchestrator), so it is con
 
 Alignment and count result tables extend this base sort with reference columns. Alignment detail Parquet uses the sort order `(prep_sample_idx, processing_idx, processed_prep_sample_idx, feature_idx, position)` — the trailing `feature_idx, position` exploits genome locality so that reads hitting the same region of the same feature are physically adjacent. Count/aggregation Parquet uses `(..., feature_idx)` without `position`. Crucially, these tables contain `feature_idx` but **not** `reference_idx` — this means alignment and count data do not need to be recomputed when a feature is added to or removed from a reference version. Scoping results to a specific reference version is a query-time join against the `reference_membership` table.
 
-### Sample Metadata
+### Biosample and Prep Sample Metadata
 
-Sample metadata — descriptive attributes of physical samples (specimen type, collection site, host age, treatment status, environmental parameters, etc.) — lives exclusively in the control plane (Postgres app DB) as attributes on `biosample_idx` and related entities. It does not exist in the data plane.
+Sample metadata — descriptive attributes of physical biosamples (specimen type, collection site, host age, treatment status, environmental parameters, etc.) or of lab-prepared prep samples (elution volume, sequencing indexes, etc.) — lives exclusively in the control plane (Postgres app DB). It does not exist in the data plane.
 
 Reasons:
 - Metadata is structured relational data tightly coupled to the identifier model already in the control plane
