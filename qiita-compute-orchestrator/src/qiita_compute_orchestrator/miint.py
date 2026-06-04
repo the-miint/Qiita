@@ -25,25 +25,14 @@ team's own, not DuckDB's).
 from __future__ import annotations
 
 import asyncio
-import gzip
-import os
 from pathlib import Path
 
 import duckdb
+from qiita_common.chunking import CHUNK_ROW_GROUP_SIZE
+from qiita_common.duckdb_miint import miint_connect_config, miint_install_sql
 
 _miint_install_lock = asyncio.Lock()
 _miint_installed = False
-
-_MIINT_EXT_REPO = os.environ.get("MIINT_EXTENSION_REPO")
-
-# Optional override for DuckDB's extension directory. Primarily a test-isolation
-# hook: when the orchestrator pulls miint from a non-default repo (the team
-# mirror), pointing its installs at a private directory keeps them from clashing
-# with another component (e.g. the data plane) that installs the community build
-# into the shared default `~/.duckdb/extensions` — DuckDB refuses a plain INSTALL
-# when the cached extension's origin differs. Unset in production → DuckDB's
-# default directory, unchanged behavior.
-_MIINT_EXT_DIR = os.environ.get("MIINT_EXTENSION_DIRECTORY")
 
 # Canonical DuckDB COPY options for the *final* Parquet artifacts the
 # orchestrator writes — the ones the Rust data plane registers into
@@ -78,12 +67,11 @@ PARQUET_OPTS_INTERMEDIATE: str = "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESS
 # from buffering an unbounded number of chunks in memory before flush:
 # 16384 rows × ~64 KB chunk_data ≈ 1 GB per row group, empirically tuned
 # against GG2 backbone (4.2 GB peak RSS; 32768 OOMs on 30 GB hosts).
-# Consumed by `jobs/hash_sequences` (writes the chunked output keyed by
-# sequence_hash) and `jobs/reference_load` (re-keys to feature_idx for
-# DuckLake registration). Co-located with PARQUET_OPTS so a tuning
-# change is one place.
-CHUNK_SIZE: int = 65_536
-CHUNK_ROW_GROUP_SIZE: int = 16_384
+#
+# CHUNK_ROW_GROUP_SIZE (and the matching CHUNK_SIZE) are single-sourced in
+# `qiita_common.chunking`, shared with the CLI's DoPut path. The actual
+# chunking is the DuckDB list_transform/UNNEST macro over read_fastx, in
+# `stage_local_fasta` (which imports CHUNK_SIZE from qiita_common.chunking).
 PARQUET_OPTS_CHUNKED: str = f"{PARQUET_OPTS}, ROW_GROUP_SIZE {CHUNK_ROW_GROUP_SIZE}"
 
 
@@ -146,18 +134,12 @@ def apply_duckdb_settings(
 
 
 def open_conn() -> duckdb.DuckDBPyConnection:
-    """Open a DuckDB connection. Unsigned-extensions config is enabled
-    only when MIINT_EXTENSION_REPO points at a non-default repo (the
-    team mirror), since that path serves community-signed binaries.
-
-    When MIINT_EXTENSION_DIRECTORY is set, installs/loads are isolated to
-    that directory (see the constant's note) — keeps a mirror build from
-    clashing with a community build in the shared default directory."""
-    config: dict[str, str] = {}
-    if _MIINT_EXT_REPO is not None:
-        config["allow_unsigned_extensions"] = "true"
-    if _MIINT_EXT_DIR:
-        config["extension_directory"] = _MIINT_EXT_DIR
+    """Open an in-memory DuckDB connection with the miint-load config —
+    unsigned-extensions when MIINT_EXTENSION_REPO is set (the team mirror),
+    and an isolated extension_directory when MIINT_EXTENSION_DIRECTORY is set.
+    Config resolution is shared with the CLI via
+    `qiita_common.duckdb_miint.miint_connect_config`."""
+    config = miint_connect_config()
     return duckdb.connect(":memory:", config=config) if config else duckdb.connect(":memory:")
 
 
@@ -170,33 +152,5 @@ async def ensure_miint_installed() -> None:
         if _miint_installed:
             return
         with open_conn() as conn:
-            if _MIINT_EXT_REPO is not None:
-                conn.execute(f"FORCE INSTALL miint FROM '{_MIINT_EXT_REPO}';")
-            else:
-                conn.execute("INSTALL miint FROM community;")
+            conn.execute(miint_install_sql())
         _miint_installed = True
-
-
-def is_empty_sequence_file(path: Path) -> bool:
-    """True iff `path` decompresses to zero bytes — i.e., the file
-    holds no FASTQ/FASTA content. Callers pre-check with this before
-    handing the path to miint's `read_fastx`, which throws
-    `std::runtime_error("Empty file: " + path)` on zero-record inputs
-    (see duckdb-miint/src/SequenceReader.cpp:63,78). Pre-checking lets
-    us route empty inputs through an explicit code path instead of
-    catching the exception and matching its wording — see #39 for the
-    upstream-fix proposal that would let miint return a 0-row relation
-    here, matching `read_csv`'s behavior.
-
-    Why a decompressed-stream peek and not `os.path.getsize == 0`:
-    the realistic empty case is a `.fastq.gz` from a sequencing run
-    that produced no reads — that file is still ~20 bytes of gzip
-    framing on disk, but `gzip.open(...).read(1)` returns `b""`.
-
-    Files with bytes but no parseable records (malformed FASTQ — stray
-    whitespace, comment lines) report False here and surface as a
-    duckdb.Error from `read_fastx` downstream. That's a real data
-    error and should fail loudly, not be silently treated as empty."""
-    opener = gzip.open if path.suffix == ".gz" else open
-    with opener(path, "rb") as f:
-        return f.read(1) == b""

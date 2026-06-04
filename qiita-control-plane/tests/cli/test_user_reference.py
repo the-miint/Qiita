@@ -642,6 +642,39 @@ def test_open_upload_stream_rejects_unknown_role(tmp_path):
             pass
 
 
+def test_fasta_upload_stream_chunks_via_read_fastx(tmp_path):
+    """FASTA streams as chunked `(read_id, chunk_index, chunk_data)` Arrow
+    batches via miint read_fastx — schema names + reassembled per-read
+    sequence round-trip to the source records (read_id = header first token)."""
+    from qiita_control_plane.cli.reference_load import _fasta_upload_stream
+
+    src = tmp_path / "in.fasta"
+    src.write_text(">r1 desc dropped\nACGTACGT\n>r2\nTTTT\n")
+    with _fasta_upload_stream(src) as stream:
+        assert stream.schema.names == ["read_id", "chunk_index", "chunk_data"]
+        batches = list(stream.batches)
+
+    by_read: dict[str, list[tuple[int, str]]] = {}
+    for batch in batches:
+        rows = batch.to_pylist()
+        for row in rows:
+            by_read.setdefault(row["read_id"], []).append((row["chunk_index"], row["chunk_data"]))
+    reassembled = {rid: "".join(d for _i, d in sorted(parts)) for rid, parts in by_read.items()}
+    assert reassembled == {"r1": "ACGTACGT", "r2": "TTTT"}
+
+
+def test_fasta_upload_stream_rejects_empty_file(tmp_path):
+    """An empty FASTA is rejected with a clear message instead of a raw
+    read_fastx 'Empty file' error (matching stage_local_fasta's guard)."""
+    from qiita_control_plane.cli.reference_load import _fasta_upload_stream
+
+    empty = tmp_path / "empty.fasta"
+    empty.write_text("")
+    with pytest.raises(ValueError, match="no records"):
+        with _fasta_upload_stream(empty):
+            pass
+
+
 # Smoke check that the asyncio entry point is callable from a sync test
 # context — user.py's CLI handler does `asyncio.run(_run_reference_load(...))`.
 def test_handler_returns_nonzero_on_bad_args(monkeypatch, tmp_path, capsys):
