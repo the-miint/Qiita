@@ -327,6 +327,67 @@ def test_study_create_pydantic_validation_error_exits_2(capsys):
     assert "title" in err
 
 
+def test_study_create_passes_extra_metadata(monkeypatch):
+    """--extra-metadata is parsed from JSON into a dict and lands in the
+    POST body verbatim under the snake_case key."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        captured["json"] = json
+        return _httpx.Response(201, json={"study_idx": 42}, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    rc = main(
+        [
+            "study",
+            "create",
+            "--title",
+            "T",
+            "--extra-metadata",
+            '{"site":"ucsd","vamps_id":"VAMPS-1"}',
+        ]
+    )
+    assert rc == 0
+    assert captured["json"] == {
+        "title": "T",
+        "extra_metadata": {"site": "ucsd", "vamps_id": "VAMPS-1"},
+    }
+
+
+def test_study_create_rejects_malformed_extra_metadata(capsys):
+    """Non-JSON --extra-metadata exits 2 via parser.error rather than a
+    JSONDecodeError traceback."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["study", "create", "--title", "T", "--extra-metadata", "{not-json"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--extra-metadata" in err
+    assert "not valid JSON" in err
+
+
+def test_study_create_rejects_non_object_extra_metadata(capsys):
+    """--extra-metadata must be a JSON object (matches the JSONB-on-server
+    convention). A bare array or scalar should fail fast."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["study", "create", "--title", "T", "--extra-metadata", "[1, 2, 3]"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--extra-metadata" in err
+    assert "JSON object" in err
+
+
 def test_profile_set_pydantic_validation_error_exits_2(capsys):
     """A malformed --orcid trips Pydantic client-side via UserUpdate's
     pattern constraint; surfaced as a flat parser.error."""

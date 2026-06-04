@@ -269,6 +269,10 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=tuple(t.value for t in Tier),
         help="Default study_access tier; server defaults to 'member' when unset",
     )
+    p_study_create.add_argument(
+        "--extra-metadata",
+        help="Free-form JSON object stored as JSONB",
+    )
     p_study_create.set_defaults(handler=_handle_study_create)
 
     p_biosample = sub.add_parser("biosample", help="Biosample operations")
@@ -645,6 +649,12 @@ def _handle_profile_set(args: argparse.Namespace, parser: argparse.ArgumentParse
 
 
 def _handle_study_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Mint a study owned by the caller. --extra-metadata is parsed from
+    JSON before Pydantic validation so a malformed paste surfaces as a
+    clean argparse exit 2."""
+    args.extra_metadata = _common.parse_json_arg(
+        args.extra_metadata, parser, flag="--extra-metadata"
+    )
     body = _build_body(StudyCreate, args, parser)
     return _common.run_http_subcommand(lambda t: _post_study(args.base_url, t, body))
 
