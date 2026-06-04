@@ -99,9 +99,8 @@ the `no-changelog` label).
 
 - Corrected stale identifier field names in `docs/architecture.md` to match the
   current schema: `sample_idx` → `biosample_idx` (the physical sample is
-  `biosample`; there is no `sample` table), removed the non-existent `prep`
-  entity / `prep_idx` (no `prep` table — a preparation is a `biosample` under a
-  `prep_protocol` yielding a `prep_sample`; `prep_idx` survives only as a
+  `biosample`; there is no `sample` table), noted design issue to resolve the
+  non-existent `prep` entity and dangling `prep_idx` surviving only as a
   vestigial `work_ticket` scope tuple), documented that `study`/`biosample` are
   many-to-many with `prep_sample`, and dropped `study_idx`/`biosample_idx` from
   the result-Parquet identifier columns (recovered via control-plane joins),
