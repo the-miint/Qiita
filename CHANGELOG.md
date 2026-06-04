@@ -15,6 +15,10 @@ the `no-changelog` label).
 
 ### Added
 
+- `qiita study create --extra-metadata` — attach a free-form JSON object
+  (stored as JSONB) when minting a study, matching the existing
+  `--extra-metadata` flag on `sequencing-run create` / `sequenced-pool create`
+  (#75)
 - Host references for host-read filtering: `is_host` column on `qiita.reference`,
   the `reference_index` table tracking built indexes, an `indexing` reference
   status (`loading → indexing → active`), and the `host-reference-add` workflow
