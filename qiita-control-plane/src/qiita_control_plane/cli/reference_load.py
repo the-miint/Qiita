@@ -24,7 +24,18 @@ What the subcommand does, in order, against a running CP + DP:
      printing state transitions; (--no-watch) print the work_ticket_idx
      and exit so the caller can poll externally.
 
-**Arrow streaming** (per role):
+**Local ingest (`--local`).** When the FASTA files already reside on the
+compute host (e.g. ~100 human genomes ≈ 300 GB), streaming bytes over Flight is
+wasteful — `--local --fasta-manifest PATH` ingests by path instead. Step 2's
+upload loop is skipped entirely (no DoPut, no /upload slots); the manifest and
+any companions ride in `action_context` as raw absolute `*_path` keys, and the
+`local-(host-)reference-add` action is submitted. Its first step
+(`stage_local_fasta`) reads the manifest on the host and stages the files into
+the same chunked Parquet the remote path produces, so everything downstream is
+identical. No `--data-plane-url` is needed. `--fasta` and `--fasta-manifest`
+are mutually exclusive.
+
+**Arrow streaming** (per role, remote path only):
 
   - FASTA: miint ``read_fastx`` + DuckDB ``list_transform``/``UNNEST``
            64 KB chunking, streamed via ``to_arrow_reader``. Upload
@@ -94,11 +105,20 @@ _TERMINAL_WORK_TICKET_STATES = frozenset({"completed", "failed"})
 DEFAULT_POLL_INTERVAL_SECONDS = 2.0
 DEFAULT_POLL_TIMEOUT_SECONDS = 24 * 3600
 
-# Action identifiers the CLI submits, by host-ness. Pinned against the on-disk
-# workflow YAML in tests/test_actions_loader.py so an id/version drift fails at
-# build time instead of 404ing at submit. Both workflows ship as version 1.0.0.
+# Action identifiers the CLI submits, by host-ness and ingest mode. Pinned
+# against the on-disk workflow YAML in tests/test_actions_loader.py so an
+# id/version drift fails at build time instead of 404ing at submit. All four
+# workflows ship as version 1.0.0.
+#
+# Remote (DoPut upload) vs local (by-path, --local) are distinct actions
+# because their first step and context_schema differ: remote resolves a
+# `fasta_upload_idx` handle; local's stage_local_fasta reads a
+# `fasta_manifest_path` and stages many host-resident FASTA files. Everything
+# downstream of the first step is identical.
 _REFERENCE_ADD_ACTION_ID = "reference-add"
 _HOST_REFERENCE_ADD_ACTION_ID = "host-reference-add"
+_LOCAL_REFERENCE_ADD_ACTION_ID = "local-reference-add"
+_LOCAL_HOST_REFERENCE_ADD_ACTION_ID = "local-host-reference-add"
 _REFERENCE_ADD_ACTION_VERSION = "1.0.0"
 
 
@@ -441,8 +461,10 @@ async def do_reference_load(
     *,
     http: httpx.AsyncClient,
     token: str,
-    flight_client: flight.FlightClient,
-    fasta_path: Path,
+    flight_client: flight.FlightClient | None = None,
+    fasta_path: Path | None = None,
+    fasta_manifest_path: Path | None = None,
+    local: bool = False,
     name: str | None = None,
     version: str | None = None,
     kind: str | None = "sequence_reference",
@@ -464,9 +486,22 @@ async def do_reference_load(
     the latter creates a new reference, the former binds to an existing
     one. `kind` is consumed only when creating.
 
+    **Two ingest modes, selected by `local`:**
+
+    - Remote (`local=False`, the default): a single `fasta_path` is streamed
+      over Arrow Flight DoPut alongside any companions, and the
+      `(host-)reference-add` action is submitted with `*_upload_idx` handles.
+      `flight_client` is required. `fasta_manifest_path` must be unset.
+    - Local (`local=True`): no bytes cross the wire. `fasta_manifest_path`
+      (an absolute path to a manifest of absolute FASTA paths already resident
+      on the compute host) and any companions ride in `action_context` as raw
+      `*_path` keys, and the `local-(host-)reference-add` action is submitted —
+      its first step (`stage_local_fasta`) reads the manifest and stages the
+      files. `flight_client` is unused. `fasta_path` must be unset.
+
     `host=True` marks the new reference `is_host=true` and routes to the
-    `host-reference-add` action (which additionally builds the rype index
-    consumed as a negative filter at host-read-filtering time). A host
+    `(local-)host-reference-add` action (which additionally builds the rype
+    index consumed as a negative filter at host-read-filtering time). A host
     reference requires `taxonomy_path` — it's the rype mapping authority's
     source — so it's a fail-fast precondition here."""
     has_idx = reference_idx is not None
@@ -485,6 +520,50 @@ async def do_reference_load(
             "--host requires --taxonomy: a host reference must ship a taxonomy"
             " mapping authority for the rype index build"
         )
+
+    # FASTA source mode. --fasta (remote DoPut) and --fasta-manifest (--local
+    # by-path) are mutually exclusive; exactly one applies per ingest mode.
+    if local:
+        if fasta_path is not None:
+            raise ValueError(
+                "--local ingests FASTA by path via --fasta-manifest; --fasta"
+                " (a DoPut upload) cannot be combined with --local"
+            )
+        if fasta_manifest_path is None:
+            raise ValueError(
+                "--local requires --fasta-manifest: an absolute path to a manifest"
+                " listing one absolute FASTA path per line"
+            )
+        if not fasta_manifest_path.is_absolute():
+            raise ValueError(f"--fasta-manifest must be absolute, got {str(fasta_manifest_path)!r}")
+        if not fasta_manifest_path.exists() or not fasta_manifest_path.is_file():
+            raise ValueError(f"--fasta-manifest not found or not a file: {fasta_manifest_path}")
+        # Companions ride as raw `*_path` strings the compute host reads, so
+        # they must be absolute too — the workflow context_schema enforces
+        # `pattern:"^/"` on every path key, and a relative path would otherwise
+        # 422 server-side with an opaque message. Validate here for a clear,
+        # boundary-local error (existence is NOT checked: under SLURM a
+        # companion may live on a shared FS the CLI host can't see — only the
+        # manifest, which the CLI never reads either, is checked for existence
+        # because it's the by-path entry point the operator just authored).
+        for flag, companion in (
+            ("--taxonomy", taxonomy_path),
+            ("--tree", tree_path),
+            ("--jplace", jplace_path),
+            ("--genome-map", genome_map_path),
+        ):
+            if companion is not None and not companion.is_absolute():
+                raise ValueError(f"{flag} must be absolute under --local, got {str(companion)!r}")
+    else:
+        if fasta_manifest_path is not None:
+            raise ValueError(
+                "--fasta-manifest requires --local; the remote path uploads a"
+                " single --fasta over DoPut"
+            )
+        if fasta_path is None:
+            raise ValueError("--fasta is required (or use --local with --fasta-manifest)")
+        if flight_client is None:
+            raise ValueError("a Flight client is required for the remote (DoPut) ingest path")
 
     if reference_idx is None:
         create = await _post(
@@ -517,38 +596,63 @@ async def do_reference_load(
                 "--host, or drop --host to run reference-add against this one."
             )
 
-    action_context: dict[str, int] = {}
+    # Heterogeneous by ingest mode: remote keys map `*_upload_idx` -> int,
+    # local keys map `*_path` -> str. Hence dict[str, Any] rather than the
+    # remote-only dict[str, int].
+    action_context: dict[str, Any] = {}
     upload_idxs: dict[str, int] = {}
 
-    # Upload sequentially. Concurrent DoPuts would be faster on a fast
-    # link, but reference-add inputs are typically dominated by the
-    # FASTA; parallelizing taxonomy/tree/jplace saves seconds at the
-    # cost of a much harder-to-debug failure mode if one upload fails
-    # mid-stream.
-    for role, src in [
-        ("fasta", fasta_path),
-        ("taxonomy", taxonomy_path),
-        ("tree", tree_path),
-        ("jplace", jplace_path),
-        ("genome_map", genome_map_path),
-    ]:
-        if src is None:
-            continue
-        res = await upload_file(
-            http=http,
-            token=token,
-            flight_client=flight_client,
-            file_path=src,
-            role=role,
-        )
-        action_context[f"{role}_upload_idx"] = res.upload_idx
-        upload_idxs[role] = res.upload_idx
-        _log.info("uploaded %s as upload_idx=%d", role, res.upload_idx)
+    if local:
+        # By-path ingest: no bytes cross the wire. The manifest and every
+        # companion ride in action_context as raw absolute `*_path` strings;
+        # the runner leaves these untouched (it only resolves `*_upload_idx`
+        # keys), and stage_local_fasta reads the manifest on the compute host.
+        action_context["fasta_manifest_path"] = str(fasta_manifest_path)
+        for role, src in [
+            ("taxonomy", taxonomy_path),
+            ("tree", tree_path),
+            ("jplace", jplace_path),
+            ("genome_map", genome_map_path),
+        ]:
+            if src is None:
+                continue
+            action_context[f"{role}_path"] = str(src)
+            _log.info("local %s path=%s", role, src)
+    else:
+        # Remote ingest: upload sequentially. Concurrent DoPuts would be faster
+        # on a fast link, but reference-add inputs are typically dominated by
+        # the FASTA; parallelizing taxonomy/tree/jplace saves seconds at the
+        # cost of a much harder-to-debug failure mode if one upload fails
+        # mid-stream.
+        for role, src in [
+            ("fasta", fasta_path),
+            ("taxonomy", taxonomy_path),
+            ("tree", tree_path),
+            ("jplace", jplace_path),
+            ("genome_map", genome_map_path),
+        ]:
+            if src is None:
+                continue
+            res = await upload_file(
+                http=http,
+                token=token,
+                flight_client=flight_client,
+                file_path=src,
+                role=role,
+            )
+            action_context[f"{role}_upload_idx"] = res.upload_idx
+            upload_idxs[role] = res.upload_idx
+            _log.info("uploaded %s as upload_idx=%d", role, res.upload_idx)
 
-    # Host references run the host-reference-add workflow (reference-add steps
-    # plus the trailing rype-index build + register-index); plain references
-    # run reference-add.
-    action_id = _HOST_REFERENCE_ADD_ACTION_ID if host else _REFERENCE_ADD_ACTION_ID
+    # Select the action by ingest mode (local vs remote) and host-ness. Host
+    # references run the *-host-reference-add workflow (the base steps plus the
+    # trailing rype-index build + register-index); plain references run
+    # *-reference-add. The local variants prepend stage_local_fasta and take
+    # raw `*_path` keys instead of `*_upload_idx` handles.
+    if local:
+        action_id = _LOCAL_HOST_REFERENCE_ADD_ACTION_ID if host else _LOCAL_REFERENCE_ADD_ACTION_ID
+    else:
+        action_id = _HOST_REFERENCE_ADD_ACTION_ID if host else _REFERENCE_ADD_ACTION_ID
     submit_body = {
         "action_id": action_id,
         "action_version": _REFERENCE_ADD_ACTION_VERSION,

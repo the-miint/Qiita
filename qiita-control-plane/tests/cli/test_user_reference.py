@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import json
+from pathlib import Path
 
 import duckdb
 import httpx
@@ -496,6 +497,341 @@ async def test_do_reference_load_no_watch_returns_without_polling(
 
     assert "work_ticket" not in result
     assert not any(m == "GET" for (m, _p, _b) in calls)
+
+
+# =============================================================================
+# Local ingest (--local) — by path, zero DoPut
+# =============================================================================
+
+
+@pytest.fixture
+def manifest_file(tmp_path, fasta_file):
+    """A FASTA manifest: one absolute FASTA path per line. The CLI's local
+    branch only checks the manifest is absolute + exists; the orchestrator's
+    stage_local_fasta job parses the listed files."""
+    path = tmp_path / "manifest.txt"
+    path.write_text(f"{fasta_file}\n")
+    return path
+
+
+async def test_do_reference_load_local_zero_doput(
+    manifest_file, taxonomy_file, cp_transport, upload_state
+):
+    """`--local` ingests by path: NO DoPut fires, no /upload slot is minted,
+    the work_ticket carries raw `*_path` companions (not `*_upload_idx`
+    handles), and the local-reference-add action is selected."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    flight_client = FakeFlightClient()  # must stay untouched
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        result = await do_reference_load(
+            http=http,
+            token="t",
+            flight_client=flight_client,
+            local=True,
+            fasta_manifest_path=manifest_file,
+            taxonomy_path=taxonomy_file,
+            name="local-ref",
+            version="1.0",
+            watch=False,
+        )
+
+    # Zero uploads: no DoPut, no POST /upload, no /done, empty upload_idxs.
+    assert flight_client.calls == []
+    assert result["upload_idxs"] == {}
+    method_paths = [(m, p) for (m, p, _b) in calls]
+    assert not any(p == URL_UPLOAD_PREFIX for (_m, p) in method_paths)
+    assert not any("/done" in p for (_m, p) in method_paths)
+
+    # The reference is still created — minting it is orthogonal to by-path ingest.
+    assert result["reference_idx"] == 999
+
+    # action_context carries raw absolute paths under `*_path`, NOT `*_upload_idx`.
+    submit_call = next(c for c in calls if c[1] == URL_WORK_TICKET_PREFIX and c[0] == "POST")
+    assert submit_call[2]["action_context"] == {
+        "fasta_manifest_path": str(manifest_file),
+        "taxonomy_path": str(taxonomy_file),
+    }
+    assert submit_call[2]["action_id"] == "local-reference-add"
+    assert submit_call[2]["scope_target"] == {"kind": "reference", "reference_idx": 999}
+
+
+async def test_do_reference_load_local_host_selects_host_action(
+    manifest_file, taxonomy_file, cp_transport
+):
+    """`--local --host` creates the reference is_host=true and submits
+    `local-host-reference-add` (the host pipeline behind the local stager)."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        result = await do_reference_load(
+            http=http,
+            token="t",
+            flight_client=FakeFlightClient(),
+            local=True,
+            fasta_manifest_path=manifest_file,
+            taxonomy_path=taxonomy_file,
+            name="local-host",
+            version="1.0",
+            host=True,
+            watch=False,
+        )
+
+    assert result["reference_idx"] == 999
+    create_call = next(c for c in calls if c[1] == URL_REFERENCE_PREFIX and c[0] == "POST")
+    assert create_call[2]["is_host"] is True
+    submit_call = next(c for c in calls if c[1] == URL_WORK_TICKET_PREFIX and c[0] == "POST")
+    assert submit_call[2]["action_id"] == "local-host-reference-add"
+    assert submit_call[2]["action_context"] == {
+        "fasta_manifest_path": str(manifest_file),
+        "taxonomy_path": str(taxonomy_file),
+    }
+
+
+async def test_do_reference_load_local_all_companions_as_paths(
+    manifest_file, taxonomy_file, tmp_path, cp_transport
+):
+    """Every companion under --local rides as a raw `*_path` key; none is
+    uploaded. tree / jplace / genome_map join taxonomy in action_context."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    tree = tmp_path / "t.nwk"
+    tree.write_text("(a,b);")
+    jplace = tmp_path / "p.jplace"
+    jplace.write_text("{}")
+    genome_map = tmp_path / "gmap.parquet"
+    genome_map.write_text("x")  # contents never read on the local path
+    flight_client = FakeFlightClient()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        await do_reference_load(
+            http=http,
+            token="t",
+            flight_client=flight_client,
+            local=True,
+            fasta_manifest_path=manifest_file,
+            taxonomy_path=taxonomy_file,
+            tree_path=tree,
+            jplace_path=jplace,
+            genome_map_path=genome_map,
+            name="local-ref",
+            version="1.0",
+            watch=False,
+        )
+
+    assert flight_client.calls == []
+    submit_call = next(c for c in calls if c[1] == URL_WORK_TICKET_PREFIX and c[0] == "POST")
+    assert submit_call[2]["action_context"] == {
+        "fasta_manifest_path": str(manifest_file),
+        "taxonomy_path": str(taxonomy_file),
+        "tree_path": str(tree),
+        "jplace_path": str(jplace),
+        "genome_map_path": str(genome_map),
+    }
+
+
+async def test_do_reference_load_local_requires_manifest(taxonomy_file, cp_transport):
+    """`--local` without a manifest is a contract violation — there's nothing
+    to ingest. Fail fast before any wire call."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(ValueError, match="fasta-manifest|manifest"):
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                local=True,
+                taxonomy_path=taxonomy_file,
+                name="local-ref",
+                version="1.0",
+                watch=False,
+            )
+    assert calls == []
+
+
+async def test_do_reference_load_local_rejects_relative_manifest(cp_transport):
+    """A relative manifest path is rejected up front — under SLURM only an
+    absolute shared-FS path is visible from the compute node."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(ValueError, match="absolute"):
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                local=True,
+                fasta_manifest_path=Path("relative/manifest.txt"),
+                name="local-ref",
+                version="1.0",
+                watch=False,
+            )
+    assert calls == []
+
+
+async def test_do_reference_load_local_rejects_missing_manifest(tmp_path, cp_transport):
+    """An absolute manifest path that doesn't exist → error before any wire call."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(ValueError, match="not found|exist"):
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                local=True,
+                fasta_manifest_path=tmp_path / "nope.txt",
+                name="local-ref",
+                version="1.0",
+                watch=False,
+            )
+    assert calls == []
+
+
+async def test_do_reference_load_local_host_requires_taxonomy(manifest_file, cp_transport):
+    """`--local --host` without --taxonomy fails fast — a host reference needs
+    the taxonomy mapping authority for the rype index build."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(ValueError, match="taxonomy"):
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                local=True,
+                fasta_manifest_path=manifest_file,
+                name="local-host",
+                version="1.0",
+                host=True,
+                watch=False,
+            )
+    assert calls == []
+
+
+async def test_do_reference_load_rejects_fasta_and_manifest_together(
+    fasta_file, manifest_file, cp_transport
+):
+    """`--fasta` (DoPut upload) and `--fasta-manifest` (--local by-path) are
+    mutually exclusive — one streams a single FASTA, the other ingests many by
+    path. Supplying both is a contract violation."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(ValueError, match="cannot be combined with --local"):
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                local=True,
+                fasta_path=fasta_file,
+                fasta_manifest_path=manifest_file,
+                name="local-ref",
+                version="1.0",
+                watch=False,
+            )
+    assert calls == []
+
+
+async def test_do_reference_load_local_rejects_relative_companion(manifest_file, cp_transport):
+    """Companions ride to the compute host as raw paths, so a relative one is
+    rejected up front (the workflow context_schema demands `pattern:"^/"`).
+    Fail fast at the CLI boundary, not with an opaque server 422."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(ValueError, match="--tree must be absolute"):
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                local=True,
+                fasta_manifest_path=manifest_file,
+                tree_path=Path("rel/tree.nwk"),
+                name="local-ref",
+                version="1.0",
+                watch=False,
+            )
+    assert calls == []
+
+
+def test_handler_local_without_manifest_exits_nonzero(monkeypatch, capsys):
+    """End-to-end arg plumbing: `qiita reference load --local` (no
+    --fasta-manifest, and notably no --data-plane-url) parses — `--fasta` is no
+    longer required and `--data-plane-url` is optional under `--local` — but the
+    entry point's manifest guard surfaces as exit 1 with a stderr line. Locks the
+    `--local` flag, the relaxed `--data-plane-url`, and the handler wiring."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import user as _user
+
+    monkeypatch.setattr(_common, "read_token", lambda: "test-pat")
+
+    rc = _user.main(
+        [
+            "--base-url",
+            "http://localhost:8080",
+            "reference",
+            "load",
+            "--local",
+            "--name",
+            "h",
+            "--version",
+            "1.0",
+            "--no-watch",
+        ]
+    )
+    assert rc == 1
+    assert "fasta-manifest" in capsys.readouterr().err
+
+
+def test_handler_remote_without_data_plane_url_exits_nonzero(monkeypatch, tmp_path, capsys):
+    """The remote (non-`--local`) path still requires `--data-plane-url`. Since
+    it is no longer an argparse-required flag (it's optional under `--local`),
+    the requirement moved into the entry point; this locks that a remote run
+    without it surfaces as exit 1 with a clear stderr line rather than crashing
+    on a `None` Flight URL."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import user as _user
+
+    monkeypatch.setattr(_common, "read_token", lambda: "test-pat")
+    fasta = tmp_path / "x.fasta"
+    fasta.write_text(">a\nACGT\n")
+
+    rc = _user.main(
+        [
+            "--base-url",
+            "http://localhost:8080",
+            "reference",
+            "load",
+            "--name",
+            "r",
+            "--version",
+            "1.0",
+            "--fasta",
+            str(fasta),
+            "--no-watch",
+        ]
+    )
+    assert rc == 1
+    assert "data-plane-url" in capsys.readouterr().err
 
 
 # =============================================================================
