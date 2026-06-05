@@ -43,6 +43,7 @@ from .conftest import (
     IneligibilityKind,
     _grant_study_access,
     assert_owner_ineligibility_422,
+    assert_submission_error_cleared_on_new_attempt,
     delete_idxs,
     resolve_ineligible_owner_idx,
     unique_instrument_id,
@@ -2220,33 +2221,18 @@ async def test_patch_sequenced_sample_system_admin_happy_path(ctx):
 
 
 async def test_patch_sequenced_sample_submission_error_clearing_trigger(ctx):
-    # Trigger sequenced_sample_clear_submission_error_on_new_attempt nulls
-    # submission_error when last_submission_at changes and the same
-    # UPDATE does not also set submission_error. First PATCH seeds an
-    # error; second PATCH (last_submission_at only) clears it.
+    # The shared clear-submission-error-on-new-attempt trigger nulls
+    # submission_error when last_submission_at changes and the same UPDATE
+    # does not also set it. The helper drives that two-PATCH sequence; the
+    # full-object check confirms the rest of the row is untouched.
     seeded = await _seed_one_sequenced_sample(ctx, "patch-trig")
+    url = URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"])
+    initial_etag = await _get_etag(ctx["wet"], seeded["sequenced_sample_idx"])
 
-    # First PATCH plants a submission_error.
-    etag1 = await _get_etag(ctx["wet"], seeded["sequenced_sample_idx"])
-    r1 = await ctx["wet"].patch(
-        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
-        json={"submission_error": "ENA timed out"},
-        headers={"If-Match": etag1},
+    rj = await assert_submission_error_cleared_on_new_attempt(
+        ctx["wet"], url, initial_etag=initial_etag
     )
-    assert r1.status_code == 200, r1.text
-    assert r1.json()["submission_error"] == "ENA timed out"
 
-    # Second PATCH bumps last_submission_at without re-setting submission_error.
-    # The trigger detects last_submission_at IS DISTINCT FROM OLD and
-    # submission_error IS NOT DISTINCT FROM OLD, and nulls submission_error.
-    etag2 = r1.headers["ETag"]
-    r2 = await ctx["wet"].patch(
-        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
-        json={"last_submission_at": "2026-02-01T08:30:00+00:00"},
-        headers={"If-Match": etag2},
-    )
-    assert r2.status_code == 200, r2.text
-    rj = r2.json()
     expected = _expected_read_response(
         seeded,
         rj=rj,
@@ -2257,7 +2243,6 @@ async def test_patch_sequenced_sample_submission_error_clearing_trigger(ctx):
         has_metadata=False,
     )
     expected["last_submission_at"] = rj["last_submission_at"]
-    # Trigger cleared the error from the first PATCH.
     expected["submission_error"] = None
     assert rj == expected
 

@@ -21,7 +21,8 @@ from . import require_transaction, update_row
 _STUDY_RETURNING_COLS = (
     "idx, owner_idx, principal_investigator_idx, title, alias,"
     " description, abstract, funding, ebi_study_accession,"
-    " notes, extra_metadata, default_tier, created_by_idx,"
+    " notes, last_submission_at, submission_error,"
+    " extra_metadata, default_tier, created_by_idx,"
     " created_at, updated_at"
 )
 
@@ -205,6 +206,8 @@ STUDY_PATCHABLE_COLUMNS: frozenset[str] = frozenset(
         "notes",
         "extra_metadata",
         "principal_investigator_idx",
+        "last_submission_at",
+        "submission_error",
     }
 )
 

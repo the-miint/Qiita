@@ -918,6 +918,8 @@ class StudyPatchRequest(PatchRequestModel):
         default=None, min_length=1, max_length=_STUDY_ACCESSION_MAX
     )
     notes: str | None = None
+    last_submission_at: AwareDatetime | None = None
+    submission_error: str | None = None
     extra_metadata: dict[str, object] | None = None
 
 
@@ -939,6 +941,8 @@ class StudyResponse(BaseModel):
     funding: str | None
     ebi_study_accession: str | None
     notes: str | None
+    last_submission_at: AwareDatetime | None
+    submission_error: str | None
     extra_metadata: dict[str, object] | None
     default_tier: Tier
     created_by_idx: Annotated[int, Field(gt=0)]

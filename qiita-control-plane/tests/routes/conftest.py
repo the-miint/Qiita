@@ -236,6 +236,36 @@ async def etag_for_row(pool, *, table: UpdatableTable, row_idx: int) -> str:
     return f'"{updated_at.isoformat()}"'
 
 
+async def assert_submission_error_cleared_on_new_attempt(
+    client, url: str, *, initial_etag: str
+) -> dict:
+    """Drive the shared clear-submission-error-on-new-attempt trigger and
+    assert it fired, for any entity exposing the submission-tracking pair.
+
+    Seeds a submission_error via one PATCH, then bumps last_submission_at
+    alone via a second PATCH (using the first response's ETag as If-Match);
+    asserts the trigger nulled the error. `initial_etag` is the row's current
+    If-Match. Returns the final PATCH body so a caller can layer
+    entity-specific assertions on top.
+    """
+    seed = await client.patch(
+        url, json={"submission_error": "ENA timed out"}, headers={"If-Match": initial_etag}
+    )
+    assert seed.status_code == 200, seed.text
+    assert seed.json()["submission_error"] == "ENA timed out"
+
+    bump = await client.patch(
+        url,
+        json={"last_submission_at": "2026-02-01T08:30:00+00:00"},
+        headers={"If-Match": seed.headers["ETag"]},
+    )
+    assert bump.status_code == 200, bump.text
+    body = bump.json()
+    assert body["last_submission_at"] is not None
+    assert body["submission_error"] is None
+    return body
+
+
 # ---------------------------------------------------------------------------
 # Owner-eligibility 422 cases
 # ---------------------------------------------------------------------------

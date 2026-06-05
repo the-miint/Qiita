@@ -98,6 +98,8 @@ def _study_response_from_row(row: asyncpg.Record) -> StudyResponse:
             "funding": row["funding"],
             "ebi_study_accession": row["ebi_study_accession"],
             "notes": row["notes"],
+            "last_submission_at": row["last_submission_at"],
+            "submission_error": row["submission_error"],
             "extra_metadata": extra_metadata,
             "default_tier": row["default_tier"],
             "created_by_idx": row["created_by_idx"],

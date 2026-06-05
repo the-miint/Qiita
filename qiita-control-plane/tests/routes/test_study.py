@@ -45,6 +45,7 @@ from .conftest import (
     IneligibilityKind,
     _grant_study_access,
     assert_owner_ineligibility_422,
+    assert_submission_error_cleared_on_new_attempt,
     delete_idxs,
     etag_for_row,
     resolve_ineligible_owner_idx,
@@ -212,6 +213,8 @@ async def test_post_study_full_body_round_trips(ctx):
         "funding": "NIH-R01",
         "ebi_study_accession": "ERP000001",
         "notes": "notes-1",
+        "last_submission_at": None,
+        "submission_error": None,
         "extra_metadata": extra,
         "default_tier": "viewer",
         "created_by_idx": caller_idx,
@@ -693,6 +696,20 @@ async def test_patch_study_etag_advances_on_ebi_accession_round_trip(ctx):
     new_etag = resp.headers["ETag"]
     assert new_etag != if_match
     assert resp.json()["ebi_study_accession"] == new_acc
+
+
+async def test_patch_study_submission_error_clearing_trigger(ctx):
+    """Tests the case where bumping last_submission_at clears a previously
+    set submission_error via the shared clear-on-new-attempt trigger now
+    wired to qiita.study."""
+    create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-trig"))
+    assert create_resp.status_code == 201, create_resp.text
+    study_idx = create_resp.json()["study_idx"]
+    initial_etag = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+
+    await assert_submission_error_cleared_on_new_attempt(
+        ctx["user"], URL_STUDY_BY_IDX.format(study_idx=study_idx), initial_etag=initial_etag
+    )
 
 
 async def test_patch_study_anonymous_401(ctx):
