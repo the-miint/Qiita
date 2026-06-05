@@ -15,6 +15,9 @@ the `no-changelog` label).
 
 ### Added
 
+- `qiita study get`, `qiita biosample get`, and `qiita biosample list-idxs` —
+  read a study or biosample by idx, and list a study's biosample idxs, over the
+  REST API (#TBD)
 - `qiita biosample create --ena-sample-accession` and `qiita sequenced-sample
   create --ena-experiment-accession` / `--ena-run-accession` — set an entity's
   ENA accession(s) at create time when ingesting already-submitted data

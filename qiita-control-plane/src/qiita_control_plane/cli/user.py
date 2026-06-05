@@ -38,11 +38,14 @@ from typing import NamedTuple
 
 from pydantic import BaseModel, ValidationError
 from qiita_common.api_paths import (
+    PATH_BIOSAMPLE_BY_IDX,
+    PATH_BIOSAMPLE_LIST_BY_STUDY,
     PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     PATH_BIOSAMPLE_PREFIX,
     PATH_SEQUENCED_SAMPLE_FROM_RUN,
     PATH_SEQUENCING_RUN_PREFIX,
     PATH_SEQUENCING_RUN_SEQUENCED_POOL,
+    PATH_STUDY_BY_IDX,
     PATH_STUDY_LOOKUP_BY_ACCESSION,
     PATH_STUDY_PREFIX,
     PATH_WORK_TICKET_PREFIX,
@@ -275,6 +278,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_study_create.set_defaults(handler=_handle_study_create)
 
+    p_study_get = p_study_sub.add_parser(
+        "get",
+        help="Fetch a study by idx (GET /study/{study_idx})",
+    )
+    p_study_get.add_argument("--study-idx", type=int, required=True)
+    p_study_get.set_defaults(
+        handler=_handle_read,
+        read_path=f"{PATH_STUDY_PREFIX}{PATH_STUDY_BY_IDX}",
+        read_idx_arg="study_idx",
+    )
+
     p_biosample = sub.add_parser("biosample", help="Biosample operations")
     p_biosample_sub = p_biosample.add_subparsers(dest="biosample_cmd", required=True)
     p_biosample_create = p_biosample_sub.add_parser(
@@ -321,6 +335,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Matrix-tube identifier (digits only); validated server-side",
     )
     p_biosample_create.set_defaults(handler=_handle_biosample_create)
+
+    p_biosample_get = p_biosample_sub.add_parser(
+        "get",
+        help="Fetch a biosample by idx (GET /biosample/{biosample_idx})",
+    )
+    p_biosample_get.add_argument("--biosample-idx", type=int, required=True)
+    p_biosample_get.set_defaults(
+        handler=_handle_read,
+        read_path=f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}",
+        read_idx_arg="biosample_idx",
+    )
+
+    p_biosample_list = p_biosample_sub.add_parser(
+        "list-idxs",
+        help="List biosample idxs in a study (GET /study/{S}/biosample/list-idxs)",
+    )
+    p_biosample_list.add_argument("--study-idx", type=int, required=True)
+    p_biosample_list.set_defaults(
+        handler=_handle_read,
+        read_path=f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}",
+        read_idx_arg="study_idx",
+    )
 
     p_seqrun = sub.add_parser("sequencing-run", help="Sequencing-run operations")
     p_seqrun_sub = p_seqrun.add_subparsers(dest="sequencing_run_cmd", required=True)
@@ -650,6 +686,18 @@ def _handle_profile_set(args: argparse.Namespace, parser: argparse.ArgumentParse
             " --receive-processing-emails / --no-receive-processing-emails"
         )
     return _common.run_http_subcommand(lambda t: _patch_user_me(args.base_url, t, updates))
+
+
+def _handle_read(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Fetch a resource by idx (GET) and print its JSON body.
+
+    The per-command `set_defaults` supplies `read_path` (a subpath
+    template) and `read_idx_arg` (the namespace attr whose value fills
+    the template), so the path formats from exactly one identifier.
+    """
+    idx_arg = args.read_idx_arg
+    path = args.read_path.format(**{idx_arg: getattr(args, idx_arg)})
+    return _common.run_http_subcommand(lambda t: _common.call("GET", args.base_url, t, path))
 
 
 def _handle_study_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

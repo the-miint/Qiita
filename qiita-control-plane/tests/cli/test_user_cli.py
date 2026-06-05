@@ -14,10 +14,13 @@ from pathlib import Path
 import pytest
 from qiita_common.api_paths import (
     URL_AUTH_WHOAMI,
+    URL_BIOSAMPLE_BY_IDX,
     URL_BIOSAMPLE_BY_STUDY,
+    URL_BIOSAMPLE_LIST_BY_STUDY,
     URL_SEQUENCED_SAMPLE_FROM_RUN,
     URL_SEQUENCING_RUN_PREFIX,
     URL_SEQUENCING_RUN_SEQUENCED_POOL,
+    URL_STUDY_BY_IDX,
     URL_STUDY_PREFIX,
     URL_USER_ME,
     URL_WORK_TICKET_BY_IDX,
@@ -2306,3 +2309,87 @@ def test__read_preflight_rows_round_trips_library_tuples(preflight_stub):
     # library's return — mutating downstream does not contaminate the
     # caller's data.
     assert rows[0].secondary_project_accessions is not library_secondaries
+
+
+# ---------------------------------------------------------------------------
+# study get / biosample get / biosample list-idxs (read subcommands)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_url"),
+    [
+        (["study", "get", "--study-idx", "42"], URL_STUDY_BY_IDX.format(study_idx=42)),
+        (
+            ["biosample", "get", "--biosample-idx", "100"],
+            URL_BIOSAMPLE_BY_IDX.format(biosample_idx=100),
+        ),
+        (
+            ["biosample", "list-idxs", "--study-idx", "42"],
+            URL_BIOSAMPLE_LIST_BY_STUDY.format(study_idx=42),
+        ),
+    ],
+)
+def test_read_subcommand_issues_get(monkeypatch, argv, expected_url):
+    """Tests the case where a read subcommand issues an authenticated GET to
+    the resource's URL and returns the decoded body (exit 0)."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        captured["method"] = method
+        captured["url"] = url
+        captured["auth"] = headers["Authorization"]
+        return _httpx.Response(200, json={"ok": True}, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = main(["--base-url", "https://q.example.test", *argv])
+    assert rc == 0
+    assert captured["method"] == "GET"
+    assert captured["url"] == f"https://q.example.test{expected_url}"
+    assert captured["auth"] == f"{BEARER_PREFIX}qk_test"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["study", "get"],
+        ["biosample", "get"],
+        ["biosample", "list-idxs"],
+    ],
+)
+def test_read_subcommand_requires_idx(argv):
+    """Tests the case where a read subcommand's required idx flag is omitted;
+    argparse rejects the invocation with exit 2."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(argv)
+    assert exc_info.value.code == 2
+
+
+def test_read_subcommand_http_error_exits_1(monkeypatch, capsys):
+    """Tests the case where the GET returns a non-2xx status; the command
+    exits 1 and names the status on stderr."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        return _httpx.Response(
+            404, json={"detail": "not found"}, request=_httpx.Request(method, url)
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = main(["--base-url", "https://q.example.test", "study", "get", "--study-idx", "999"])
+    assert rc == 1
+    assert "404" in capsys.readouterr().err
