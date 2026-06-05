@@ -42,7 +42,9 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_LIST_BY_STUDY,
     PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     PATH_BIOSAMPLE_PREFIX,
+    PATH_SEQUENCED_SAMPLE_BY_IDX,
     PATH_SEQUENCED_SAMPLE_FROM_RUN,
+    PATH_SEQUENCED_SAMPLE_PREFIX,
     PATH_SEQUENCING_RUN_PREFIX,
     PATH_SEQUENCING_RUN_SEQUENCED_POOL,
     PATH_STUDY_BY_IDX,
@@ -57,13 +59,16 @@ from qiita_common.illumina import (
 from qiita_common.models import (
     BiosampleImportRequest,
     BiosampleLookupByAccessionRequest,
+    BiosamplePatchRequest,
     Platform,
     ScopeTargetKind,
     SequencedPoolCreateRequest,
     SequencedSampleCreateRequest,
+    SequencedSamplePatchRequest,
     SequencingRunCreateRequest,
     StudyCreate,
     StudyLookupByAccessionRequest,
+    StudyPatchRequest,
     Tier,
     UserUpdate,
     WorkTicketCreateRequest,
@@ -289,6 +294,28 @@ def _build_parser() -> argparse.ArgumentParser:
         read_idx_arg="study_idx",
     )
 
+    p_study_patch = p_study_sub.add_parser(
+        "patch",
+        help="Update editable study fields (PATCH /study/{study_idx})",
+    )
+    p_study_patch.add_argument("--study-idx", type=int, required=True)
+    p_study_patch.add_argument("--title")
+    p_study_patch.add_argument("--principal-investigator-idx", type=int)
+    p_study_patch.add_argument("--alias")
+    p_study_patch.add_argument("--description")
+    p_study_patch.add_argument("--abstract")
+    p_study_patch.add_argument("--funding")
+    p_study_patch.add_argument("--ebi-study-accession")
+    p_study_patch.add_argument("--notes")
+    p_study_patch.add_argument("--extra-metadata", help="Free-form JSON object stored as JSONB")
+    p_study_patch.set_defaults(
+        handler=_handle_patch,
+        patch_model=StudyPatchRequest,
+        patch_path=f"{PATH_STUDY_PREFIX}{PATH_STUDY_BY_IDX}",
+        patch_idx_arg="study_idx",
+        patch_json_fields=("extra_metadata",),
+    )
+
     p_biosample = sub.add_parser("biosample", help="Biosample operations")
     p_biosample_sub = p_biosample.add_subparsers(dest="biosample_cmd", required=True)
     p_biosample_create = p_biosample_sub.add_parser(
@@ -356,6 +383,24 @@ def _build_parser() -> argparse.ArgumentParser:
         handler=_handle_read,
         read_path=f"{PATH_STUDY_PREFIX}{PATH_BIOSAMPLE_LIST_BY_STUDY}",
         read_idx_arg="study_idx",
+    )
+
+    p_biosample_patch = p_biosample_sub.add_parser(
+        "patch",
+        help="Update editable biosample fields (PATCH /biosample/{biosample_idx})",
+    )
+    p_biosample_patch.add_argument("--biosample-idx", type=int, required=True)
+    p_biosample_patch.add_argument("--metadata-checklist-idx", type=int)
+    p_biosample_patch.add_argument("--owner-idx", type=int)
+    p_biosample_patch.add_argument("--biosample-accession")
+    p_biosample_patch.add_argument("--ena-sample-accession")
+    p_biosample_patch.add_argument("--matrix-tube-id")
+    p_biosample_patch.set_defaults(
+        handler=_handle_patch,
+        patch_model=BiosamplePatchRequest,
+        patch_path=f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_BY_IDX}",
+        patch_idx_arg="biosample_idx",
+        patch_json_fields=(),
     )
 
     p_seqrun = sub.add_parser("sequencing-run", help="Sequencing-run operations")
@@ -485,6 +530,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="ENA run accession (ERR…), if this sample already has one",
     )
     p_seqsample_create.set_defaults(handler=_handle_sequenced_sample_create)
+
+    p_seqsample_patch = p_seqsample_sub.add_parser(
+        "patch",
+        help="Set a sequenced-sample's ENA accessions (PATCH /sequenced-sample/{idx})",
+    )
+    p_seqsample_patch.add_argument("--sequenced-sample-idx", type=int, required=True)
+    p_seqsample_patch.add_argument("--ena-experiment-accession")
+    p_seqsample_patch.add_argument("--ena-run-accession")
+    p_seqsample_patch.set_defaults(
+        handler=_handle_patch,
+        patch_model=SequencedSamplePatchRequest,
+        patch_path=f"{PATH_SEQUENCED_SAMPLE_PREFIX}{PATH_SEQUENCED_SAMPLE_BY_IDX}",
+        patch_idx_arg="sequenced_sample_idx",
+        patch_json_fields=(),
+    )
 
     p_ticket = sub.add_parser("ticket", help="Work-ticket operations")
     p_ticket_sub = p_ticket.add_subparsers(dest="ticket_cmd", required=True)
@@ -698,6 +758,32 @@ def _handle_read(args: argparse.Namespace, parser: argparse.ArgumentParser) -> i
     idx_arg = args.read_idx_arg
     path = args.read_path.format(**{idx_arg: getattr(args, idx_arg)})
     return _common.run_http_subcommand(lambda t: _common.call("GET", args.base_url, t, path))
+
+
+def _handle_patch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Apply a partial update to a resource under optimistic concurrency.
+
+    The per-command `set_defaults` supplies `patch_model` (the
+    PatchRequestModel subclass the flags map to), `patch_path` (a subpath
+    template), `patch_idx_arg` (the namespace attr that fills it), and
+    `patch_json_fields` (flags parsed from JSON before validation). An
+    empty update (no field flags) fails the model's at-least-one-field
+    rule and exits 2.
+    """
+    for field in args.patch_json_fields:
+        setattr(
+            args,
+            field,
+            _common.parse_json_arg(
+                getattr(args, field), parser, flag=f"--{field.replace('_', '-')}"
+            ),
+        )
+    body = _build_body(args.patch_model, args, parser)
+    idx_arg = args.patch_idx_arg
+    path = args.patch_path.format(**{idx_arg: getattr(args, idx_arg)})
+    return _common.run_http_subcommand(
+        lambda t: _common.patch_with_if_match(args.base_url, t, path, body)
+    )
 
 
 def _handle_study_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

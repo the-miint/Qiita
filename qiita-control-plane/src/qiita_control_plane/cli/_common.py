@@ -211,6 +211,37 @@ def write_token(path: Path, plaintext: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _request(
+    method: str,
+    base_url: str,
+    token: str,
+    path: str,
+    *,
+    json: dict | None = None,
+    extra_headers: dict[str, str] | None = None,
+) -> httpx.Response:
+    """Issue an authenticated control-plane request and raise on non-2xx.
+
+    `path` is the post-API-prefix segment (e.g. "/auth/whoami", "/study/7");
+    the helper prepends API_PREFIX to the trailing-slash-trimmed base_url
+    and attaches the bearer token plus any `extra_headers`. Returns the raw
+    Response so the caller can read body, status, or headers; raises
+    httpx.HTTPStatusError on a non-2xx status.
+    """
+    headers = {"Authorization": f"{BEARER_PREFIX}{token}"}
+    if extra_headers:
+        headers.update(extra_headers)
+    resp = httpx.request(
+        method,
+        f"{base_url.rstrip('/')}{API_PREFIX}{path}",
+        headers=headers,
+        json=json,
+        timeout=CLI_HTTP_TIMEOUT_SECONDS,
+    )
+    resp.raise_for_status()
+    return resp
+
+
 def call(
     method: str,
     base_url: str,
@@ -219,23 +250,8 @@ def call(
     *,
     json: dict | None = None,
 ) -> dict:
-    """Authenticated control-plane call returning the decoded JSON body.
-
-    `method` is an HTTP verb ("GET", "POST", "PATCH", ...). `path` is
-    the post-API-prefix segment, e.g. "/auth/whoami" or "/study"; the
-    helper prepends API_PREFIX and the trailing-slash-trimmed base_url.
-    Raises httpx.HTTPStatusError on non-2xx (run_http_subcommand catches
-    that and converts to a stderr message + exit 1).
-    """
-    resp = httpx.request(
-        method,
-        f"{base_url.rstrip('/')}{API_PREFIX}{path}",
-        headers={"Authorization": f"{BEARER_PREFIX}{token}"},
-        json=json,
-        timeout=CLI_HTTP_TIMEOUT_SECONDS,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    """Authenticated control-plane call returning the decoded JSON body."""
+    return _request(method, base_url, token, path, json=json).json()
 
 
 def call_with_status(
@@ -253,15 +269,23 @@ def call_with_status(
     ``qiita submit-bcl-convert`` flow uses it to report whether each of
     the three minted resources was created or reused on retry.
     """
-    resp = httpx.request(
-        method,
-        f"{base_url.rstrip('/')}{API_PREFIX}{path}",
-        headers={"Authorization": f"{BEARER_PREFIX}{token}"},
-        json=json,
-        timeout=CLI_HTTP_TIMEOUT_SECONDS,
-    )
-    resp.raise_for_status()
+    resp = _request(method, base_url, token, path, json=json)
     return resp.json(), resp.status_code
+
+
+def patch_with_if_match(base_url: str, token: str, path: str, body: dict) -> dict:
+    """GET `path` to read its current ETag, then PATCH it with that ETag as
+    the If-Match header and `body` as the update; return the decoded PATCH
+    body.
+
+    The server requires If-Match on every PATCH and exposes the matching
+    value as the GET response's ETag header, so reading then writing is the
+    only way to mint a valid If-Match; pairing them here also keeps the
+    lost-update window small.
+    """
+    etag = _request("GET", base_url, token, path).headers["ETag"]
+    resp = _request("PATCH", base_url, token, path, json=body, extra_headers={"If-Match": etag})
+    return resp.json()
 
 
 def whoami(base_url: str, token: str) -> dict:

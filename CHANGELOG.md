@@ -15,6 +15,10 @@ the `no-changelog` label).
 
 ### Added
 
+- `qiita study patch`, `qiita biosample patch`, and `qiita sequenced-sample
+  patch` — update a study's or sample's editable fields (including ENA
+  accession write-back) over the REST API, under If-Match optimistic
+  concurrency (#TBD)
 - `qiita study get`, `qiita biosample get`, and `qiita biosample list-idxs` —
   read a study or biosample by idx, and list a study's biosample idxs, over the
   REST API (#TBD)

@@ -17,6 +17,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_BY_IDX,
     URL_BIOSAMPLE_BY_STUDY,
     URL_BIOSAMPLE_LIST_BY_STUDY,
+    URL_SEQUENCED_SAMPLE_BY_IDX,
     URL_SEQUENCED_SAMPLE_FROM_RUN,
     URL_SEQUENCING_RUN_PREFIX,
     URL_SEQUENCING_RUN_SEQUENCED_POOL,
@@ -2393,3 +2394,126 @@ def test_read_subcommand_http_error_exits_1(monkeypatch, capsys):
     rc = main(["--base-url", "https://q.example.test", "study", "get", "--study-idx", "999"])
     assert rc == 1
     assert "404" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# study patch / biosample patch / sequenced-sample patch (write subcommands)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_url", "expected_body"),
+    [
+        (
+            ["study", "patch", "--study-idx", "42", "--ebi-study-accession", "PRJEB1"],
+            URL_STUDY_BY_IDX.format(study_idx=42),
+            {"ebi_study_accession": "PRJEB1"},
+        ),
+        (
+            ["biosample", "patch", "--biosample-idx", "100", "--ena-sample-accession", "ERS1"],
+            URL_BIOSAMPLE_BY_IDX.format(biosample_idx=100),
+            {"ena_sample_accession": "ERS1"},
+        ),
+        (
+            [
+                "sequenced-sample",
+                "patch",
+                "--sequenced-sample-idx",
+                "5",
+                "--ena-experiment-accession",
+                "ERX1",
+                "--ena-run-accession",
+                "ERR1",
+            ],
+            URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=5),
+            {"ena_experiment_accession": "ERX1", "ena_run_accession": "ERR1"},
+        ),
+    ],
+)
+def test_patch_subcommand_get_etag_then_patch_if_match(
+    monkeypatch, argv, expected_url, expected_body
+):
+    """Tests the case where a patch subcommand GETs the resource to read its
+    ETag, then PATCHes with that ETag as If-Match and the supplied fields as
+    the body (exit 0)."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    requests: list[dict] = []
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        requests.append({"method": method, "url": url, "headers": headers, "json": json})
+        if method == "GET":
+            return _httpx.Response(
+                200, json={}, headers={"ETag": "etag-v1"}, request=_httpx.Request(method, url)
+            )
+        return _httpx.Response(200, json={"ok": True}, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = main(["--base-url", "https://q.example.test", *argv])
+    assert rc == 0
+    assert [r["method"] for r in requests] == ["GET", "PATCH"]
+    get_req, patch_req = requests
+    assert get_req["url"] == f"https://q.example.test{expected_url}"
+    assert patch_req["url"] == f"https://q.example.test{expected_url}"
+    assert patch_req["headers"]["If-Match"] == "etag-v1"
+    assert patch_req["headers"]["Authorization"] == f"{BEARER_PREFIX}qk_test"
+    assert patch_req["json"] == expected_body
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["study", "patch", "--study-idx", "42"],
+        ["biosample", "patch", "--biosample-idx", "100"],
+        ["sequenced-sample", "patch", "--sequenced-sample-idx", "5"],
+    ],
+)
+def test_patch_subcommand_empty_update_exits_2(argv):
+    """Tests the case where a patch subcommand is invoked with no field flags;
+    the PatchRequestModel's at-least-one-field rule rejects it (exit 2)."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--base-url", "https://q.example.test", *argv])
+    assert exc_info.value.code == 2
+
+
+def test_patch_subcommand_conflict_exits_1(monkeypatch, capsys):
+    """Tests the case where the PATCH is rejected with 412 (stale If-Match);
+    the command exits 1 and surfaces the status on stderr."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    def fake_request(method, url, headers=None, json=None, timeout=None):
+        if method == "GET":
+            return _httpx.Response(
+                200, json={}, headers={"ETag": "etag-stale"}, request=_httpx.Request(method, url)
+            )
+        return _httpx.Response(
+            412, json={"detail": "If-Match did not match"}, request=_httpx.Request(method, url)
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "study",
+            "patch",
+            "--study-idx",
+            "42",
+            "--ebi-study-accession",
+            "PRJEB1",
+        ]
+    )
+    assert rc == 1
+    assert "412" in capsys.readouterr().err
