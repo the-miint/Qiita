@@ -1474,8 +1474,9 @@ class SequencedSampleCreateRequest(BaseModel):
 
     `metadata` keys must match seeded prep_sample_global_field display_name
     values; unknown names surface as a single 422 listing every bad key.
-    The two ENA accession fields are nullable because they are populated
-    later by the submission subsystem.
+    The two ENA accession fields are nullable: a sample may already carry
+    ENA accessions when it is created (e.g. ingesting already-submitted
+    data), or have them written back later after an ENA submission.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1564,8 +1565,8 @@ class SequencedSampleResponse(BaseModel):
 class SequencedSamplePatchRequest(PatchRequestModel):
     """Body for PATCH /api/v1/sequenced-sample/{sequenced_sample_idx}.
 
-    Carries only the four subtype-table columns that the submission
-    surface mutates after ingestion: the two ENA accessions and the
+    Carries the four subtype-table columns editable after creation: the
+    two ENA accessions (which may also be set at create time) and the
     submission-tracking pair. Supertype prep_sample fields
     (owner_idx, metadata_checklist_idx) and identity-level columns
     (sequenced_pool_idx, sequenced_pool_item_id) are intentionally

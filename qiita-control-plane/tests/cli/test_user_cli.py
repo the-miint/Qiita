@@ -574,9 +574,8 @@ def test_biosample_create_metadata_pairs_become_dict(monkeypatch):
 
 def test_biosample_create_passes_through_optional_fields(monkeypatch):
     """Tests the case where every CLI-exposed optional field
-    (metadata_checklist_idx, biosample_accession, matrix_tube_id) flows
-    into the POST body when supplied; ena_sample_accession stays absent
-    because the CLI does not expose it."""
+    (metadata_checklist_idx, biosample_accession, ena_sample_accession,
+    matrix_tube_id) flows into the POST body when supplied."""
     from qiita_control_plane.cli.user import main
 
     captured: dict = {}
@@ -596,6 +595,8 @@ def test_biosample_create_passes_through_optional_fields(monkeypatch):
             "3",
             "--biosample-accession",
             "SAMN12345678",
+            "--ena-sample-accession",
+            "ERS1234567",
             "--matrix-tube-id",
             "0123456789",
         ]
@@ -604,8 +605,8 @@ def test_biosample_create_passes_through_optional_fields(monkeypatch):
     body = captured["requests"][-1]["json"]
     assert body["metadata_checklist_idx"] == 3
     assert body["biosample_accession"] == "SAMN12345678"
+    assert body["ena_sample_accession"] == "ERS1234567"
     assert body["matrix_tube_id"] == "0123456789"
-    assert "ena_sample_accession" not in body
 
 
 def test_biosample_create_requires_required_flags(capsys):
@@ -1129,7 +1130,7 @@ def test_sequenced_sample_create_explicit_owner_skips_whoami(monkeypatch):
 
 def test_sequenced_sample_create_metadata_checklist_passes_through(monkeypatch):
     """--metadata-checklist-idx flows verbatim; ENA accession fields stay
-    absent regardless (not exposed)."""
+    absent when their flags are not supplied."""
     from qiita_control_plane.cli.user import main
 
     captured: dict = {}
@@ -1162,6 +1163,45 @@ def test_sequenced_sample_create_metadata_checklist_passes_through(monkeypatch):
     assert body["metadata_checklist_idx"] == 2
     assert "ena_experiment_accession" not in body
     assert "ena_run_accession" not in body
+
+
+def test_sequenced_sample_create_passes_ena_accessions(monkeypatch):
+    """Tests the case where --ena-experiment-accession and --ena-run-accession
+    flow into the POST body — a sequenced sample may already carry ENA
+    accessions at create time."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch, captured, response_json=_SEQUENCED_SAMPLE_CREATE_RESPONSE, whoami_idx=42
+    )
+
+    rc = main(
+        [
+            "sequenced-sample",
+            "create",
+            "--run-idx",
+            "4",
+            "--pool-idx",
+            "9",
+            "--biosample-idx",
+            "55",
+            "--prep-protocol-idx",
+            "3",
+            "--pool-item-id",
+            "WELL-A1",
+            "--primary-study-idx",
+            "7",
+            "--ena-experiment-accession",
+            "ERX9999999",
+            "--ena-run-accession",
+            "ERR9999999",
+        ]
+    )
+    assert rc == 0
+    body = captured["requests"][-1]["json"]
+    assert body["ena_experiment_accession"] == "ERX9999999"
+    assert body["ena_run_accession"] == "ERR9999999"
 
 
 def test_sequenced_sample_create_requires_required_flags(capsys):

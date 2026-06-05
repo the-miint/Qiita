@@ -15,6 +15,10 @@ the `no-changelog` label).
 
 ### Added
 
+- `qiita biosample create --ena-sample-accession` and `qiita sequenced-sample
+  create --ena-experiment-accession` / `--ena-run-accession` — set an entity's
+  ENA accession(s) at create time when ingesting already-submitted data
+  (allowed, not required), matching `study create --ebi-study-accession` (#TBD)
 - `qiita study create --extra-metadata` — attach a free-form JSON object
   (stored as JSONB) when minting a study, matching the existing
   `--extra-metadata` flag on `sequencing-run create` / `sequenced-pool create`

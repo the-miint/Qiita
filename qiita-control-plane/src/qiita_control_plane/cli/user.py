@@ -310,16 +310,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_biosample_create.add_argument("--metadata-checklist-idx", type=int)
     p_biosample_create.add_argument(
         "--biosample-accession",
-        help="External biosample accession (e.g. NCBI), if known at create time",
+        help="External biosample accession (e.g. NCBI), if the biosample already has one",
+    )
+    p_biosample_create.add_argument(
+        "--ena-sample-accession",
+        help="ENA sample accession (ERS…), if the biosample already has one",
     )
     p_biosample_create.add_argument(
         "--matrix-tube-id",
         help="Matrix-tube identifier (digits only); validated server-side",
     )
-    # --ena-sample-accession is deliberately NOT exposed: an ENA
-    # accession is a submission-tracking value the submission subsystem
-    # writes back after an ENA submission, not part of the interactive
-    # create flow.
     p_biosample_create.set_defaults(handler=_handle_biosample_create)
 
     p_seqrun = sub.add_parser("sequencing-run", help="Sequencing-run operations")
@@ -440,10 +440,14 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_seqsample_create.add_argument("--metadata-checklist-idx", type=int)
-    # ena_experiment_accession + ena_run_accession are deliberately NOT
-    # exposed: ENA accessions are submission-tracking values the
-    # submission subsystem writes back after an ENA submission, not part
-    # of the interactive create flow.
+    p_seqsample_create.add_argument(
+        "--ena-experiment-accession",
+        help="ENA experiment accession (ERX…), if this sample already has one",
+    )
+    p_seqsample_create.add_argument(
+        "--ena-run-accession",
+        help="ENA run accession (ERR…), if this sample already has one",
+    )
     p_seqsample_create.set_defaults(handler=_handle_sequenced_sample_create)
 
     p_ticket = sub.add_parser("ticket", help="Work-ticket operations")
