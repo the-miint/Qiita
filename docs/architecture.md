@@ -116,12 +116,12 @@ graph TB
 
 All identifiers are uint64, minted exclusively by the control plane. The data plane treats all identifiers as opaque integers.
 
-- **`study_idx`** — unique identifier for a study. A study is a logical collection of samples and preparations, including meta-analyses that group `prep_sample_idx` values from other studies without uploading new data.
-- **`prep_idx`** — unique identifier for a preparation (a set of observed data, e.g., a sequencing run). Belongs to one study.
-- **`sample_idx`** — unique identifier for a physical sample. A study has one-to-many samples. A sample can appear across multiple studies (e.g., shared controls, meta-analysis groupings).
-- **`prep_sample_idx`** — unique identifier for an instance of a physical sample on a preparation. A prep can carry the same physical sample multiple times (technical or biological replicates); a sample can appear on multiple preps. `prep_sample_idx` is the finest-grained unit of raw input data.
-- **`processing_idx`** — unique identifier for a processing method: a specific `(workflow_name, workflow_version, parameter_set)` combination. Immutable once created. Reusable across preps and studies. Opaque integer in the data plane; detail lives in the control plane `processing_methods` table.
-- **`processed_prep_sample_idx`** — unique identifier for the result of applying a `processing_idx` to a `prep_sample_idx`. Minted by the control plane before job submission. Processing cannot create new samples — all `processed_prep_sample_idx` values for a job are pre-assigned from the known `prep_sample_idx` set on the prep.
+- **`study_idx`** — unique identifier for a study. A study is a logical collection of biosamples and prep_samples — both linked **many-to-many** (a biosample or prep_sample can belong to several studies; a study includes many of each), including meta-analyses that group `prep_sample_idx` values from other studies without uploading new data. The junction tables are `biosample_to_study` and `prep_sample_to_study`.
+- **`biosample_idx`** — unique identifier for a physical sample (table `biosample`). (Note that **sample** is an ambiguous term and therefore is NOT used to represent any entity in the data model.) A biosample can appear across multiple studies via `biosample_to_study`.
+- **`prep_protocol_idx`** — identifies a lab preparation procedure (amplicon, shotgun, …). **Warning: The prep_protocol_idx is not linked to any explicit `prep` entity nor is it intended to be. The token `prep_idx` survives as a vestigial `work_ticket` scope tuple `(study_idx, prep_idx)` with no backing table (see [Work Ticket Lifecycle](#work-ticket-lifecycle)).  This is a design issue that must be clarified by the system designers before building on it in any way.**  *preparation* is an ambiguous term and therefore is NOT used to represent any entity in the data model.
+- **`prep_sample_idx`** — a specific instance of a specific biosample prepared under a specific protocol; the finest-grained unit of raw input data and the supertype of the downstream-measurement hierarchy. Each prep_sample has exactly one parent biosample (`prep_sample.biosample_idx`); a biosample may yield multiple prep_samples (technical or biological replicates), and a prep_sample may appear in many studies (e.g. shared extraction plate controls) via the many-to-many `prep_sample_to_study` table.
+- **`processing_idx`** — unique identifier for a processing method: a specific `(workflow_name, workflow_version, parameter_set)` combination. Immutable once created. Reusable across prep_samples and studies. Opaque integer in the data plane; detail lives in the control plane `processing_methods` table.
+- **`processed_prep_sample_idx`** — unique identifier for the result of applying a `processing_idx` to a `prep_sample_idx`. Minted by the control plane before job submission. Processing cannot create new prep samples — all `processed_prep_sample_idx` values for a job are pre-assigned from the known `prep_sample_idx` set in the submission.
 
 Reference identifiers form a parallel hierarchy for reference databases:
 
@@ -167,8 +167,10 @@ Two submissions with identical `(workflow_name, workflow_version, parameters)` r
 All result Parquet files must include these columns, in this order, and be sorted by them:
 
 ```
-study_idx  prep_idx  sample_idx  prep_sample_idx  processing_idx  processed_prep_sample_idx
+prep_sample_idx  processing_idx  processed_prep_sample_idx
 ```
+
+Neither `study_idx` nor `biosample_idx` is embedded: a prep_sample maps to studies **many-to-many** (so files are never keyed by `study_idx` — see [Data Storage](#data-storage)), and its parent `biosample_idx` is a single-FK lookup; both are recovered at query time via control-plane joins (`prep_sample_to_study`, `prep_sample.biosample_idx`) rather than duplicated into every row.
 
 This sort order provides two compounding layers of query optimisation:
 
@@ -177,11 +179,11 @@ This sort order provides two compounding layers of query optimisation:
 
 The sort is enforced in the reduce step (see Compute Orchestrator), so it is consistent regardless of what the map phase produces.
 
-Alignment and count result tables extend this base sort with reference columns. Alignment detail Parquet uses the sort order `(study_idx, prep_idx, sample_idx, prep_sample_idx, processing_idx, processed_prep_sample_idx, feature_idx, position)` — the trailing `feature_idx, position` exploits genome locality so that reads hitting the same region of the same feature are physically adjacent. Count/aggregation Parquet uses `(..., feature_idx)` without `position`. Crucially, these tables contain `feature_idx` but **not** `reference_idx` — this means alignment and count data do not need to be recomputed when a feature is added to or removed from a reference version. Scoping results to a specific reference version is a query-time join against the `reference_membership` table.
+Alignment and count result tables extend this base sort with reference columns. Alignment detail Parquet uses the sort order `(prep_sample_idx, processing_idx, processed_prep_sample_idx, feature_idx, position)` — the trailing `feature_idx, position` exploits genome locality so that reads hitting the same region of the same feature are physically adjacent. Count/aggregation Parquet uses `(..., feature_idx)` without `position`. Crucially, these tables contain `feature_idx` but **not** `reference_idx` — this means alignment and count data do not need to be recomputed when a feature is added to or removed from a reference version. Scoping results to a specific reference version is a query-time join against the `reference_membership` table.
 
-### Sample Metadata
+### Biosample and Prep Sample Metadata
 
-Sample metadata — descriptive attributes of physical samples (specimen type, collection site, host age, treatment status, environmental parameters, etc.) — lives exclusively in the control plane (Postgres app DB) as attributes on `sample_idx` and related entities. It does not exist in the data plane.
+Sample metadata — descriptive attributes of physical biosamples (specimen type, collection site, host age, treatment status, environmental parameters, etc.) or of lab-prepared prep samples (elution volume, sequencing indexes, etc.) — lives exclusively in the control plane (Postgres app DB). It does not exist in the data plane.
 
 Reasons:
 - Metadata is structured relational data tightly coupled to the identifier model already in the control plane
@@ -211,8 +213,8 @@ This check applies at both the work ticket level (is there an active ticket for 
 
 The data plane asserts identifier integrity programmatically since DuckLake does not support explicit constraints (no unique constraints, no foreign keys at the DuckLake level):
 
-- **At registration**: before `ducklake_add_data_files`, verifies the Parquet file's `processed_prep_sample_idx` values are a subset of the expected set provided by the control plane, and that no value from the file already exists in the catalog for this `(prep_idx, processing_idx)` combination.
-- **At service startup**: scans the DuckLake catalog to verify no `processed_prep_sample_idx` appears in multiple active files for the same `(prep_idx, processing_idx)`. Violations are logged as critical errors and the affected combinations are blocked from serving until reconciled.
+- **At registration**: before `ducklake_add_data_files`, verifies the Parquet file's `processed_prep_sample_idx` values are a subset of the expected set provided by the control plane, and that no value from the file already exists in the catalog for this `(prep_sample_idx, processing_idx)` combination.
+- **At service startup**: scans the DuckLake catalog to verify no `processed_prep_sample_idx` appears in multiple active files for the same `(prep_sample_idx, processing_idx)`. Violations are logged as critical errors and the affected combinations are blocked from serving until reconciled.
 
 ### Reference Database Design
 
@@ -309,8 +311,8 @@ All ID minting and membership management lives in the control plane (Postgres OL
 | Reference annotations | `(feature_idx, position)` | GFF-like: `(feature_idx, source, type, position, stop_position, score, strand, phase, attributes)` — gene models, CDS, regulatory regions |
 | Reference phylogeny | `(reference_idx, node_index)` | Per-reference tree: `(reference_idx, node_index, name, branch_length, edge_id, parent_index, is_tip)` — Newick trees decomposed into node tables via `read_newick` |
 | Placements | `(reference_idx, fragment)` | jplace data stored as-is via `read_jplace`; reconciled against reference membership and phylogeny at query time |
-| Alignment detail | `(study_idx, ..., feature_idx, position)` | Per-read alignment results sorted for genome locality: `(study_idx, prep_idx, sample_idx, prep_sample_idx, processing_idx, processed_prep_sample_idx, feature_idx, position)` |
-| Count / aggregation | `(prep_sample_idx, ..., feature_idx)` | Sparse COO format: `(study_idx, prep_idx, sample_idx, prep_sample_idx, processing_idx, processed_prep_sample_idx, feature_idx, value)` |
+| Alignment detail | `(prep_sample_idx, …, feature_idx, position)` | Per-read alignment results sorted for genome locality: `(prep_sample_idx, processing_idx, processed_prep_sample_idx, feature_idx, position)` |
+| Count / aggregation | `(prep_sample_idx, …, feature_idx)` | Sparse COO format: `(prep_sample_idx, processing_idx, processed_prep_sample_idx, feature_idx, value)` |
 
 #### Taxonomy as a Reference
 
@@ -593,7 +595,7 @@ Separate Python service responsible for the full compute job lifecycle. SLURM-ba
 **Step types:**
 
 - **`map`** — sample-independent. The orchestrator fans out one SLURM job per `prep_sample_idx` in parallel. Each job receives a `params.json` containing the full identifier set for that sample plus processing parameters, and produces a single-sample Parquet to its own output directory. Map jobs are retried independently — a failed sample is retried without reprocessing survivors. `failed_samples` on the work ticket accumulates any `prep_sample_idx` values that exhaust retries.
-- **`reduce`** — prep-level. Executes once all map jobs for the preceding step have completed. Receives all surviving map output directories as its input. Must produce a single Parquet sorted by `(study_idx, prep_idx, sample_idx, prep_sample_idx, processing_idx, processed_prep_sample_idx)`. Two reducer implementations:
+- **`reduce`** — submission-level (all surviving prep_samples for one processing). Executes once all map jobs for the preceding step have completed. Receives all surviving map output directories as its input. Must produce a single Parquet sorted by `(prep_sample_idx, processing_idx, processed_prep_sample_idx)`. Two reducer implementations:
   - **`platform/sort-merge`**: generic platform-provided container — DuckDB reads all input Parquet files, sorts by the standard identifier columns, writes output. No workflow-specific code required for pure aggregation.
   - **workflow-specific**: custom container for cross-sample computation (normalisation, diversity metrics, etc.). Must still output sorted by the standard identifier columns as part of the container contract.
 
@@ -619,16 +621,15 @@ Inputs (orchestrator provides before submission):
 For `map` steps, `params.json` contains the sample's full identifier set and processing parameters:
 ```json
 {
-  "study_idx": 1, "prep_idx": 3, "sample_idx": 7,
   "prep_sample_idx": 42, "processing_idx": 10, "processed_prep_sample_idx": 99,
   "parameters": { }
 }
 ```
 
-For `reduce` steps, `params.json` contains the prep-level identifiers, the surviving sample set, and any parameters:
+For `reduce` steps, `params.json` contains the processing identifier, the surviving sample set, and any parameters:
 ```json
 {
-  "study_idx": 1, "prep_idx": 3, "processing_idx": 10,
+  "processing_idx": 10,
   "surviving_samples": [
     {"prep_sample_idx": 42, "processed_prep_sample_idx": 99}
   ],

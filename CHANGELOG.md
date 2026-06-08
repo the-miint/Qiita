@@ -134,6 +134,15 @@ the `no-changelog` label).
   job name `qiita-wt{idx}-{step}-a{attempt}` let resume adopt a job whose id was
   never persisted (via `find-by-name`) instead of re-submitting; retriable
   failures no longer resubmit without checking the prior job (#77)
+- Corrected stale identifier field names in `docs/architecture.md` to match the
+  current schema: `sample_idx` → `biosample_idx` (the physical sample is
+  `biosample`; there is no `sample` table), noted design issue to resolve the
+  non-existent `prep` entity and dangling `prep_idx` surviving only as a
+  vestigial `work_ticket` scope tuple), documented that `study`/`biosample` are
+  many-to-many with `prep_sample`, and dropped `study_idx`/`biosample_idx` from
+  the result-Parquet identifier columns (recovered via control-plane joins),
+  resolving the prior `(prep_idx, processing_idx)` vs `(prep_sample_idx,
+  processing_idx)` inconsistency (#76)
 - Assert `HumanUser` before reading `.system_role` in the sequenced-sample /
   biosample routes (closes #45) (#59)
 - Closed deploy gaps surfaced by the first user-CLI fastq-to-parquet smoke
