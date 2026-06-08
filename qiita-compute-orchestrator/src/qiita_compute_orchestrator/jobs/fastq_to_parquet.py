@@ -86,6 +86,7 @@ from pathlib import Path
 import httpx
 from pydantic import BaseModel, Field
 from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.duckdb_miint import is_empty_sequence_file
 from qiita_common.models import WorkTicketFailureStage
 from qiita_common.parquet import validate_parquet_path
 
@@ -95,7 +96,6 @@ from ..miint import (
     PARQUET_OPTS_INTERMEDIATE,
     apply_duckdb_settings,
     ensure_miint_installed,
-    is_empty_sequence_file,
     open_conn,
 )
 from ..sequence_range import (

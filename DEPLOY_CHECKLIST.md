@@ -11,7 +11,7 @@ Substitute your host's FQDN for the `qiita-miint.ucsd.edu` examples and `<scratc
 
 ## Pending deploy
 
-Everything merged but not yet deployed, folded in by each PR as it merges. Nothing is pending right now — the most recent deploy was archived below. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
+Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
 
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
@@ -27,15 +27,27 @@ _None yet._
 
 ### 4. Deploy
 
-_None yet._
+```bash
+# [admin] SKIP_PULL=1 because redeploy.md step 2 already pulled the clone.
+# local-deploy.sh → activate.sh runs `qiita-admin actions sync`, which picks up
+# the two new workflows/ entries. (#78)
+sudo SKIP_PULL=1 QIITA_HOSTNAME=qiita-miint.ucsd.edu /home/qiita/qiita-miint/deploy/local-deploy.sh
+```
 
 ### 5. Verify
 
-_None yet._
+```bash
+# [admin] local-reference-add + local-host-reference-add 1.0.0 synced into
+# qiita.action by `qiita-admin actions sync` inside activate.sh.
+# (#78)
+sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
+    psql "$DATABASE_URL" -c "SELECT action_id, version, enabled FROM qiita.action ORDER BY action_id;"'   # local-reference-add + local-host-reference-add 1.0.0 enabled (#78)
+```
 
 ### Notes (no host action)
 
-_None yet._
+- (#78) Local-host FASTA ingest (additive, no client breakage). Two new `workflows/` entries — `local-reference-add` and `local-host-reference-add` (both 1.0.0) — synced into `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (verify in bucket 5), **not** migrations. They back a new CLI gesture `qiita reference load --local --fasta-manifest <abs path>` that ingests many host-resident FASTA files **by path** (no DoPut upload). The manifest and every FASTA + companion it lists must be **absolute** and visible on the shared FS from the compute node (the workflow `context_schema` enforces `pattern:"^/"`; bind mounts expose host paths, they do not copy). No new env var, host dir, or migration.
+- (#78) The `qiita reference load` CLI now parses FASTA with miint's `read_fastx`, so it installs + loads the **miint DuckDB extension client-side** on first use (one-time network egress; cached after under `~/.duckdb` or `MIINT_EXTENSION_DIRECTORY`). It pulls from DuckDB community-extensions by default; set `MIINT_EXTENSION_REPO=https://ftp.microbio.me/pub/miint` (implies allow-unsigned) to use the team mirror. No action on the deployed services — this only affects the host a user runs the CLI from.
 
 ---
 

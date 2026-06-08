@@ -1292,3 +1292,240 @@ async def test_resolve_reference_index_path_raises_when_no_index(postgres_pool, 
     )
     with pytest.raises(ValueError, match="no 'rype' index"):
         await _resolve_reference_index_path(postgres_pool, reference_idx, "rype")
+
+
+# =============================================================================
+# Local (--local) by-path ingest — runner passthrough
+# =============================================================================
+#
+# The local workflows (local-reference-add / local-host-reference-add) prepend a
+# `stage_local_fasta` step that reads a raw `fasta_manifest_path` and produces
+# `fasta_path`; companions (taxonomy / genome_map / ...) ride in action_context
+# as raw absolute `*_path` strings rather than DoPut `*_upload_idx` handles. The
+# whole point of the design is that the runner needs ZERO code change to support
+# this: `_resolve_upload_handles` only touches `*_upload_idx` keys, so the raw
+# `*_path` keys flow through `bound` untouched, and the existing output-threading
+# (`bound.update(outputs)`) wires `stage_local_fasta.fasta_path` into the next
+# step's `inputs:[fasta_path]`. These tests lock that passthrough.
+
+_LOCAL_REFERENCE_ADD_STEPS = [
+    {
+        # The one new step: manifest path in, fasta_path out. Module step,
+        # like the real YAML; the fake backend ignores container/module.
+        "kind": "step",
+        "name": "stage_local_fasta",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.stage_local_fasta",
+        "inputs": ["fasta_manifest_path"],
+        "outputs": ["fasta_path"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    {
+        # Unchanged from reference-add: consumes the staged fasta_path.
+        "kind": "step",
+        "name": "hash_sequences",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.hash_sequences",
+        "target_status": "hashing",
+        "inputs": ["fasta_path"],
+        "outputs": ["manifest"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    {
+        "kind": "action",
+        "name": "mint-features",
+        "target_status": "minting",
+        "inputs": ["manifest"],
+        "outputs": ["feature_map"],
+    },
+    {
+        "kind": "action",
+        "name": "write-membership",
+        "inputs": ["feature_map"],
+        "outputs": [],
+    },
+    {
+        # taxonomy_path is an optional_input — for the local path it comes from
+        # action_context as a raw path, exactly like the remote path's resolved
+        # taxonomy_path.
+        "kind": "step",
+        "name": "load",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.reference_load",
+        "target_status": "loading",
+        "inputs": ["manifest", "feature_map"],
+        "optional_inputs": ["taxonomy_path"],
+        "outputs": ["staging_dir"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    {
+        "kind": "action",
+        "name": "register-files",
+        "inputs": ["staging_dir"],
+        "outputs": [],
+    },
+]
+
+
+@pytest.fixture
+async def local_reference_add_action(postgres_pool):
+    """A `local-reference-add` action row whose first step is stage_local_fasta."""
+    action_id = "local-reference-add"
+    version = f"runner-test-{uuid.uuid4()}"
+    await postgres_pool.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, scopes, audience, "
+        "  context_schema, steps, "
+        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling, "
+        "  success_status, failure_status"
+        ") VALUES ($1, $2, 'reference', $3::text[], $4::jsonb,"
+        "  $5::jsonb, $6::jsonb, 1, 1, '1 minute', $7, $8)",
+        action_id,
+        version,
+        ["feature:mint", "reference:write", "reference:register_files"],
+        json.dumps({"service": False, "human_roles": ["wet_lab_admin"]}),
+        json.dumps({}),
+        json.dumps(_LOCAL_REFERENCE_ADD_STEPS),
+        "active",
+        "failed",
+    )
+    yield action_id, version
+    await postgres_pool.execute(
+        "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
+        action_id,
+        version,
+    )
+
+
+@pytest.fixture
+async def local_pending_work_ticket(
+    postgres_pool, local_reference_add_action, reference_idx, tmp_path
+):
+    """A pending work_ticket whose action_context carries raw `*_path` keys
+    (manifest + companions) instead of `*_upload_idx` handles."""
+    action_id, version = local_reference_add_action
+    manifest = tmp_path / "manifest.txt"
+    fasta = tmp_path / "g1.fa"
+    fasta.write_text(">g1\nACGT\n")
+    manifest.write_text(f"{fasta}\n")
+    taxonomy = tmp_path / "tax.parquet"
+    taxonomy.write_text("taxonomy-bytes")
+    genome_map = tmp_path / "gmap.parquet"
+    genome_map.write_text("genome-map-bytes")
+
+    action_context = {
+        "fasta_manifest_path": str(manifest),
+        "taxonomy_path": str(taxonomy),
+        "genome_map_path": str(genome_map),
+    }
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, action_context"
+        ") VALUES ($1, $2, 1, 'reference', $3, $4::jsonb) RETURNING work_ticket_idx",
+        action_id,
+        version,
+        reference_idx,
+        json.dumps(action_context),
+    )
+    yield {
+        "work_ticket_idx": idx,
+        "reference_idx": reference_idx,
+        "manifest_path": manifest,
+        "taxonomy_path": taxonomy,
+        "genome_map_path": genome_map,
+        "action": (action_id, version),
+    }
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx)
+
+
+def _populate_local_step_outputs(backend: FakeBackendClient, workspace: Path) -> None:
+    """Configure the fake backend so stage_local_fasta/hash_sequences/load
+    outputs land on disk and a staging Parquet exists for register-files."""
+    backend.outputs_for["stage_local_fasta"] = {"fasta_path": workspace / "fasta.parquet"}
+    backend.outputs_for["hash_sequences"] = {"manifest": workspace / "manifest.parquet"}
+    backend.outputs_for["load"] = {"staging_dir": workspace / "staging"}
+    staging = workspace / "staging"
+    staging.mkdir(parents=True, exist_ok=True)
+    (staging / "reference_sequences.parquet").touch(exist_ok=True)
+
+
+async def test_resolve_upload_handles_leaves_raw_paths_untouched(
+    postgres_pool, upload_staging_root
+):
+    """`_resolve_upload_handles` only resolves `*_upload_idx` keys. An
+    action_context of pure raw `*_path` keys (the local-ingest shape) resolves
+    to nothing and consumes no uploads — so the keys flow through `bound`
+    verbatim and no DB upload row is touched."""
+    from qiita_control_plane.runner import _resolve_upload_handles
+
+    resolved, to_consume = await _resolve_upload_handles(
+        postgres_pool,
+        action_context={
+            "fasta_manifest_path": "/data/refs/manifest.txt",
+            "taxonomy_path": "/data/refs/tax.parquet",
+            "genome_map_path": "/data/refs/gmap.parquet",
+        },
+        originator_principal_idx=1,
+        upload_staging_root=upload_staging_root,
+    )
+    assert resolved == {}
+    assert to_consume == []
+
+
+async def test_runner_local_passthrough_threads_paths(
+    postgres_pool, local_pending_work_ticket, library_spy, tmp_path
+):
+    """End-to-end runner passthrough for the local workflow with ZERO runner
+    code change:
+
+      * raw `fasta_manifest_path` reaches stage_local_fasta as an input;
+      * stage_local_fasta's `fasta_path` output threads into hash_sequences'
+        `inputs:[fasta_path]`;
+      * the raw `taxonomy_path` reaches the load step via optional_inputs;
+      * the raw `genome_map_path` reaches mint-features via bound.get(...);
+      * the ticket completes and the reference goes active.
+    """
+    workspace_root = tmp_path / "ws"
+    wt = local_pending_work_ticket
+    work_ticket_idx = wt["work_ticket_idx"]
+
+    backend = FakeBackendClient()
+    workspace = workspace_root / str(work_ticket_idx)
+    _populate_local_step_outputs(backend, workspace)
+
+    await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    # Ticket + reference terminal state.
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
+    )
+    assert state == "completed"
+    ref_status = await postgres_pool.fetchval(
+        "SELECT status FROM qiita.reference WHERE reference_idx = $1", wt["reference_idx"]
+    )
+    assert ref_status == "active"
+
+    # Steps ran in declared order: the stager first, then the unchanged pipeline.
+    assert [c[0] for c in backend.calls] == ["stage_local_fasta", "hash_sequences", "load"]
+
+    by_step = {c[0]: c[1] for c in backend.calls}
+    # stage_local_fasta received the RAW manifest path straight from action_context.
+    assert by_step["stage_local_fasta"]["fasta_manifest_path"] == wt["manifest_path"]
+    # hash_sequences received the stage step's fasta_path output (threaded via bound),
+    # NOT anything from action_context.
+    assert by_step["hash_sequences"]["fasta_path"] == workspace / "fasta.parquet"
+    # The raw taxonomy_path reached the load step as an optional input.
+    assert by_step["load"]["taxonomy_path"] == wt["taxonomy_path"]
+
+    # mint-features picked up the raw genome_map_path from bound (4th tuple slot
+    # in the library_spy record).
+    mint_call = next(c for c in library_spy.calls if c[0] == "mint-features")
+    assert mint_call[3] == wt["genome_map_path"]
+
+    # No upload rows were consumed — the local path mints/uploads nothing.
+    assert [c[0] for c in library_spy.calls] == [
+        "mint-features",
+        "write-membership",
+        "register-files",
+    ]
