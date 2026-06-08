@@ -251,7 +251,11 @@ async def test_get_job_completed_returns_terminal_info(jwt_path):
     )
     async with _client(handler, jwt_path) as client:
         info = await client.get_job(12345)
-    assert info == SlurmJobInfo(state="COMPLETED", exit_code=0, reason=None)
+    # get_job now also carries job_id + name (name absent in this fixture
+    # response, so None) so the recovery path can match jobs by name.
+    assert info == SlurmJobInfo(
+        state="COMPLETED", exit_code=0, reason=None, job_id=12345, name=None
+    )
     assert info.is_terminal is True
 
 
@@ -329,6 +333,61 @@ async def test_get_job_missing_job_state_raises(jwt_path):
     async with _client(handler, jwt_path) as client:
         with pytest.raises(SlurmrestdError, match="missing job_state"):
             await client.get_job(1)
+
+
+# ============================================================================
+# find_jobs_by_name (recovery / idempotency lookup)
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_find_jobs_by_name_matches(jwt_path):
+    """GET /slurm/{v}/jobs, return only the jobs whose name matches. The
+    control plane uses this to adopt a job it submitted but whose id it
+    may not have persisted (CP/CO died in the submit window)."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        return httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {"job_id": 1, "name": "qiita-wt5-hash-a0", "job_state": ["RUNNING"]},
+                    {"job_id": 2, "name": "someone-elses-job", "job_state": ["RUNNING"]},
+                ]
+            },
+        )
+
+    async with _client(httpx.MockTransport(handler), jwt_path) as client:
+        jobs = await client.find_jobs_by_name("qiita-wt5-hash-a0")
+
+    assert captured["url"].endswith(f"/slurm/{DEFAULT_SLURMRESTD_API_VERSION}/jobs")
+    assert len(jobs) == 1
+    assert jobs[0].job_id == 1
+    assert jobs[0].name == "qiita-wt5-hash-a0"
+    assert jobs[0].state == "RUNNING"
+
+
+@pytest.mark.asyncio
+async def test_find_jobs_by_name_no_match_returns_empty(jwt_path):
+    """No matching name (incl. when slurmrestd has already purged the
+    job) returns [] — the caller treats an empty result as 'no live job
+    by that name' and falls back to the filesystem tiebreaker."""
+    handler = httpx.MockTransport(
+        lambda req: httpx.Response(
+            200, json={"jobs": [{"job_id": 9, "name": "other", "job_state": ["COMPLETED"]}]}
+        )
+    )
+    async with _client(handler, jwt_path) as client:
+        assert await client.find_jobs_by_name("qiita-wt5-hash-a0") == []
+
+
+@pytest.mark.asyncio
+async def test_find_jobs_by_name_empty_jobs_list(jwt_path):
+    handler = httpx.MockTransport(lambda req: httpx.Response(200, json={"jobs": []}))
+    async with _client(handler, jwt_path) as client:
+        assert await client.find_jobs_by_name("anything") == []
 
 
 # ============================================================================

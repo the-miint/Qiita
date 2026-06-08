@@ -16,11 +16,12 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
     URL_WORK_TICKET_BY_IDX,
+    URL_WORK_TICKET_LIST,
     URL_WORK_TICKET_PREFIX,
     URL_WORK_TICKET_RUN,
 )
 from qiita_common.auth_constants import Scope, SystemRole
-from qiita_common.models import WorkTicketState
+from qiita_common.models import ComputeTarget, StepProgressState, WorkTicketState
 
 pytestmark = pytest.mark.db
 
@@ -45,7 +46,7 @@ async def _patch_run_and_log(monkeypatch):
     to the orchestrator. Each test that wants to verify dispatch
     happened can re-patch with a recorder."""
 
-    async def _noop(_app, _idx):
+    async def _noop(_app, _idx, **_kwargs):
         return None
 
     monkeypatch.setattr("qiita_control_plane.dispatch._run_and_log", _noop)
@@ -1629,35 +1630,50 @@ async def test_run_on_pending_dispatches_without_state_change(
 # ---------------------------------------------------------------------------
 
 
-async def test_recover_orphaned_tickets_marks_non_terminal_failed(
-    postgres_pool, admin_token, reference_action
+async def test_reconcile_schedules_resume_for_non_terminal_only(
+    postgres_pool, admin_token, reference_action, monkeypatch
 ):
-    """All non-terminal tickets become FAILED; terminal ones are
-    untouched. Each ticket targets its own reference so the
+    """Startup reconcile schedules a resume dispatch for every non-terminal
+    ticket and leaves terminal ones alone — the re-attach replaces the old
+    blanket fail-all. Each ticket targets its own reference so the
     one-in-flight-per-reference unique index doesn't fire on insert."""
-    from qiita_control_plane.dispatch import recover_orphaned_tickets
+    from types import SimpleNamespace
+
+    from qiita_control_plane import dispatch
 
     _, admin_idx = admin_token
     action_id, version = reference_action
-    states_before = [
-        WorkTicketState.PENDING.value,
-        WorkTicketState.QUEUED.value,
-        WorkTicketState.PROCESSING.value,
-        WorkTicketState.COMPLETED.value,
-    ]
 
+    # state → seeded work_ticket_idx, for the three non-terminal states plus
+    # the two terminal ones (which must NOT be scheduled).
+    seeded: dict[str, int] = {}
     created_refs: list[int] = []
     created_idxs: list[int] = []
-    try:
-        for s in states_before:
-            ref_idx = await postgres_pool.fetchval(
-                "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
-                " VALUES ($1, '1.0', 'sequence_reference', 'pending', $2)"
-                " RETURNING reference_idx",
-                f"wt-recover-{uuid.uuid4()}",
+
+    async def _seed(state: str, *, failed: bool = False) -> int:
+        ref_idx = await postgres_pool.fetchval(
+            "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
+            " VALUES ($1, '1.0', 'sequence_reference', 'pending', $2)"
+            " RETURNING reference_idx",
+            f"wt-reconcile-{uuid.uuid4()}",
+            admin_idx,
+        )
+        created_refs.append(ref_idx)
+        if failed:
+            idx = await postgres_pool.fetchval(
+                "INSERT INTO qiita.work_ticket"
+                " (action_id, action_version, originator_principal_idx, scope_target_kind,"
+                "  reference_idx, state, failure_type, failure_stage, failure_reason)"
+                " VALUES ($1, $2, $3, 'reference', $4, 'failed'::qiita.work_ticket_state,"
+                "  'permanent'::qiita.failure_type, 'submission'::qiita.work_ticket_failure_stage,"
+                "  'seed')"
+                " RETURNING work_ticket_idx",
+                action_id,
+                version,
                 admin_idx,
+                ref_idx,
             )
-            created_refs.append(ref_idx)
+        else:
             idx = await postgres_pool.fetchval(
                 "INSERT INTO qiita.work_ticket"
                 " (action_id, action_version, originator_principal_idx,"
@@ -1668,43 +1684,38 @@ async def test_recover_orphaned_tickets_marks_non_terminal_failed(
                 version,
                 admin_idx,
                 ref_idx,
-                s,
+                state,
             )
-            created_idxs.append(idx)
+        created_idxs.append(idx)
+        return idx
 
-        recovered_count = await recover_orphaned_tickets(postgres_pool)
-        # Three non-terminal tickets we just inserted should be picked up
-        # (plus possibly orphans from earlier tests in the same session,
-        # so use >= rather than ==).
-        assert recovered_count >= 3
+    try:
+        for s in ("pending", "queued", "processing"):
+            seeded[s] = await _seed(s)
+        completed_idx = await _seed("completed")
+        failed_idx = await _seed("failed", failed=True)
 
-        rows_after = []
-        for idx in created_idxs:
-            row = await postgres_pool.fetchrow(
-                "SELECT state, failure_type, failure_stage, failure_step_name, failure_reason"
-                " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
-                idx,
-            )
-            rows_after.append(dict(row))
-        # pending, queued, processing → failed; completed untouched.
-        assert [r["state"] for r in rows_after] == [
-            WorkTicketState.FAILED.value,
-            WorkTicketState.FAILED.value,
-            WorkTicketState.FAILED.value,
-            WorkTicketState.COMPLETED.value,
-        ]
-        # The three recovered tickets carry the orphan-recovery diagnostic
-        # populated by recover_orphaned_tickets — failure_type=retriable,
-        # stage=submission (no per-step context), step_name=NULL,
-        # reason explaining the cp-restart provenance.
-        for r in rows_after[:3]:
-            assert r["failure_type"] == "retriable"
-            assert r["failure_stage"] == "submission"
-            assert r["failure_step_name"] is None
-            assert "cp restarted" in r["failure_reason"]
-        # The COMPLETED ticket was untouched: failure_* all NULL.
-        assert rows_after[3]["failure_type"] is None
-        assert rows_after[3]["failure_reason"] is None
+        scheduled: list[tuple[int, dict]] = []
+        monkeypatch.setattr(
+            dispatch,
+            "schedule_dispatch",
+            lambda app, idx, **kw: scheduled.append((idx, kw)),
+        )
+        app = SimpleNamespace(
+            state=SimpleNamespace(pool=postgres_pool, compute_backend_client=object())
+        )
+        count = await dispatch.reconcile_inflight_tickets(app)
+
+        scheduled_idxs = {idx for idx, _ in scheduled}
+        # All three non-terminal tickets scheduled for resume.
+        for s in ("pending", "queued", "processing"):
+            assert seeded[s] in scheduled_idxs
+        assert all(kw == {"resume": True} for idx, kw in scheduled if idx in seeded.values())
+        # Terminal tickets are never scheduled.
+        assert completed_idx not in scheduled_idxs
+        assert failed_idx not in scheduled_idxs
+        # Count covers at least our three (earlier tests may leave orphans).
+        assert count >= 3
     finally:
         if created_idxs:
             await postgres_pool.execute(
@@ -1716,3 +1727,409 @@ async def test_recover_orphaned_tickets_marks_non_terminal_failed(
                 "DELETE FROM qiita.reference WHERE reference_idx = ANY($1::bigint[])",
                 created_refs,
             )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/work-ticket  (list / summary, Phase 6)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def ticket_seeder(postgres_pool):
+    """Seed work_tickets — each with its own throwaway reference so the
+    one-in-flight-per-reference unique index never fires — and optional
+    work_ticket_step progress rows, directly via the pool. Returns a
+    namespace of `ticket(...)` / `step(...)` coroutines; cleans up every
+    seeded ticket (its progress rows cascade) and reference at teardown.
+
+    Seeding through the pool (not the route) lets a test pin an arbitrary
+    work_ticket state and an arbitrary current-entry compute shape, which
+    the no-op-dispatch route flow can't produce on its own."""
+    from types import SimpleNamespace
+
+    refs: list[int] = []
+    idxs: list[int] = []
+
+    async def seed_ticket(*, action, originator_idx: int, state: str = "pending") -> int:
+        action_id, version = action
+        ref_idx = await postgres_pool.fetchval(
+            "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
+            " VALUES ($1, '1.0', 'sequence_reference', 'pending', $2)"
+            " RETURNING reference_idx",
+            f"wt-list-{uuid.uuid4()}",
+            originator_idx,
+        )
+        refs.append(ref_idx)
+        if state == WorkTicketState.FAILED.value:
+            # DB CHECK requires failure_* set when state=failed.
+            idx = await postgres_pool.fetchval(
+                "INSERT INTO qiita.work_ticket"
+                " (action_id, action_version, originator_principal_idx, scope_target_kind,"
+                "  reference_idx, state, failure_type, failure_stage, failure_reason)"
+                " VALUES ($1, $2, $3, 'reference', $4, 'failed'::qiita.work_ticket_state,"
+                "  'permanent'::qiita.failure_type,"
+                "  'submission'::qiita.work_ticket_failure_stage, 'seed')"
+                " RETURNING work_ticket_idx",
+                action_id,
+                version,
+                originator_idx,
+                ref_idx,
+            )
+        else:
+            idx = await postgres_pool.fetchval(
+                "INSERT INTO qiita.work_ticket"
+                " (action_id, action_version, originator_principal_idx,"
+                "  scope_target_kind, reference_idx, state)"
+                " VALUES ($1, $2, $3, 'reference', $4, $5::qiita.work_ticket_state)"
+                " RETURNING work_ticket_idx",
+                action_id,
+                version,
+                originator_idx,
+                ref_idx,
+                state,
+            )
+        idxs.append(idx)
+        return idx
+
+    async def seed_step(
+        *,
+        work_ticket_idx: int,
+        compute_target: str,
+        state: str,
+        slurm_job_id: int | None = None,
+        job_name: str | None = None,
+        step_index: int = 0,
+        attempt: int = 0,
+        step_name: str = "step-0",
+        failure_kind: str | None = None,
+        failure_reason: str | None = None,
+    ) -> None:
+        await postgres_pool.execute(
+            "INSERT INTO qiita.work_ticket_step"
+            " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+            "  state, slurm_job_id, job_name, failure_kind, failure_reason)"
+            " VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+            work_ticket_idx,
+            step_index,
+            attempt,
+            step_name,
+            compute_target,
+            state,
+            slurm_job_id,
+            job_name,
+            failure_kind,
+            failure_reason,
+        )
+
+    yield SimpleNamespace(ticket=seed_ticket, step=seed_step)
+
+    # work_ticket_step rows cascade on the ticket delete (ON DELETE CASCADE).
+    if idxs:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = ANY($1::bigint[])",
+            idxs,
+        )
+    if refs:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference WHERE reference_idx = ANY($1::bigint[])",
+            refs,
+        )
+
+
+def _summary_by_idx(payload: list[dict], idx: int) -> dict | None:
+    """Find the summary dict for `idx` in a list response, or None."""
+    return next((row for row in payload if row["work_ticket_idx"] == idx), None)
+
+
+async def test_list_work_ticket_401_on_anonymous(wt_client):
+    """No Authorization header → 401, same as the single-ticket GET."""
+    resp = await wt_client.get(URL_WORK_TICKET_LIST)
+    assert resp.status_code == 401
+
+
+async def test_list_work_ticket_originator_sees_own_only(
+    wt_client, admin_token, regular_token, reference_action, ticket_seeder
+):
+    """Default (no `all`) scoping is caller-relative: the originating admin
+    sees the ticket; an unrelated USER does not (and cannot enumerate it)."""
+    _, admin_idx = admin_token
+    user_token, _ = regular_token
+    admin_tok, _ = admin_token
+    idx = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state="processing"
+    )
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST, headers={"Authorization": f"Bearer {admin_tok}"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert _summary_by_idx(resp.json(), idx) is not None
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST, headers={"Authorization": f"Bearer {user_token}"}
+    )
+    assert resp.status_code == 200, resp.text
+    assert _summary_by_idx(resp.json(), idx) is None
+
+
+async def test_list_work_ticket_all_requires_admin_403(wt_client, regular_token):
+    """A non-admin requesting the cross-tenant view (`?all=true`) is
+    refused — the role gate mirrors the single-ticket wet_lab_admin bypass."""
+    user_token, _ = regular_token
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"all": "true"},
+        headers={"Authorization": f"Bearer {user_token}"},
+    )
+    assert resp.status_code == 403
+
+
+async def test_list_work_ticket_admin_all_sees_other_originators(
+    wt_client, postgres_pool, admin_token, reference_action, ticket_seeder
+):
+    """`?all=true` from a wet_lab_admin returns tickets they did not
+    originate — the operator-wide view."""
+    _, admin_idx = admin_token
+    idx = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state="processing"
+    )
+    wla_token, _ = await _seed_wet_lab_admin_token(postgres_pool, wt_client)
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"all": "true"},
+        headers={"Authorization": f"Bearer {wla_token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert _summary_by_idx(resp.json(), idx) is not None
+
+
+async def test_list_work_ticket_reports_current_slurm_entry(
+    wt_client, admin_token, reference_action, ticket_seeder
+):
+    """The current entry = the highest (step_index, attempt) progress row.
+    A multi-step ticket whose step 0 (a control_plane action) completed and
+    whose step 1 is on its second attempt running a SLURM job reports
+    step 1 / slurm / the live job id / running."""
+    admin_tok, admin_idx = admin_token
+    idx = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state="processing"
+    )
+    await ticket_seeder.step(
+        work_ticket_idx=idx,
+        step_index=0,
+        attempt=0,
+        compute_target=ComputeTarget.CONTROL_PLANE.value,
+        state=StepProgressState.COMPLETED.value,
+        step_name="prep",
+    )
+    await ticket_seeder.step(
+        work_ticket_idx=idx,
+        step_index=1,
+        attempt=0,
+        compute_target=ComputeTarget.SLURM.value,
+        state=StepProgressState.SUBMITTED.value,
+        slurm_job_id=4241,
+        job_name="qiita-wt-x-a0",
+        step_name="align",
+    )
+    await ticket_seeder.step(
+        work_ticket_idx=idx,
+        step_index=1,
+        attempt=1,
+        compute_target=ComputeTarget.SLURM.value,
+        state=StepProgressState.RUNNING.value,
+        slurm_job_id=4242,
+        job_name="qiita-wt-x-a1",
+        step_name="align",
+    )
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST, headers={"Authorization": f"Bearer {admin_tok}"}
+    )
+    assert resp.status_code == 200, resp.text
+    summary = _summary_by_idx(resp.json(), idx)
+    assert summary is not None
+    assert summary["current_step_index"] == 1
+    assert summary["current_step_name"] == "align"
+    assert summary["compute_target"] == ComputeTarget.SLURM.value
+    assert summary["slurm_job_id"] == 4242
+    assert summary["step_state"] == StepProgressState.RUNNING.value
+
+
+async def test_list_work_ticket_reports_control_plane_entry_without_job_id(
+    wt_client, admin_token, reference_action, ticket_seeder
+):
+    """An in-process `action:` entry reports control_plane and no job id."""
+    admin_tok, admin_idx = admin_token
+    idx = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state="processing"
+    )
+    await ticket_seeder.step(
+        work_ticket_idx=idx,
+        compute_target=ComputeTarget.CONTROL_PLANE.value,
+        state=StepProgressState.RUNNING.value,
+        step_name="mint",
+    )
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST, headers={"Authorization": f"Bearer {admin_tok}"}
+    )
+    summary = _summary_by_idx(resp.json(), idx)
+    assert summary is not None
+    assert summary["compute_target"] == ComputeTarget.CONTROL_PLANE.value
+    assert summary["slurm_job_id"] is None
+    assert summary["step_state"] == StepProgressState.RUNNING.value
+
+
+async def test_list_work_ticket_pending_has_no_compute_fields(
+    wt_client, admin_token, reference_action, ticket_seeder
+):
+    """A ticket with no progress rows yet (PENDING before first write-ahead)
+    reports all current-entry fields as null."""
+    admin_tok, admin_idx = admin_token
+    idx = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state="pending"
+    )
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST, headers={"Authorization": f"Bearer {admin_tok}"}
+    )
+    summary = _summary_by_idx(resp.json(), idx)
+    assert summary is not None
+    assert summary["current_step_index"] is None
+    assert summary["current_step_name"] is None
+    assert summary["compute_target"] is None
+    assert summary["slurm_job_id"] is None
+    assert summary["step_state"] is None
+
+
+async def test_list_work_ticket_state_filter(
+    wt_client, admin_token, reference_action, ticket_seeder
+):
+    """`?state=processing` returns only tickets in that state (scoped to
+    the caller's own, so the assertion is exact)."""
+    admin_tok, admin_idx = admin_token
+    pending_idx = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state="pending"
+    )
+    processing_idx = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state="processing"
+    )
+    completed_idx = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state="completed"
+    )
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"state": "processing"},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    returned = {row["work_ticket_idx"] for row in resp.json()}
+    assert processing_idx in returned
+    assert pending_idx not in returned
+    assert completed_idx not in returned
+
+
+async def test_list_work_ticket_active_filter(
+    wt_client, admin_token, reference_action, ticket_seeder
+):
+    """`?active=true` returns only non-terminal tickets (excludes COMPLETED
+    and FAILED)."""
+    admin_tok, admin_idx = admin_token
+    pending_idx = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state="pending"
+    )
+    processing_idx = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state="processing"
+    )
+    completed_idx = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state="completed"
+    )
+    failed_idx = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state="failed"
+    )
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"active": "true"},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    returned = {row["work_ticket_idx"] for row in resp.json()}
+    assert {pending_idx, processing_idx} <= returned
+    assert completed_idx not in returned
+    assert failed_idx not in returned
+
+
+async def test_list_work_ticket_state_and_active_intersect(
+    wt_client, admin_token, reference_action, ticket_seeder
+):
+    """`state` and `active` AND-compose: `?state=completed&active=true` is a
+    valid query that returns the empty intersection (completed is terminal),
+    not an error — pins the docstring's contract."""
+    admin_tok, admin_idx = admin_token
+    completed_idx = await ticket_seeder.ticket(
+        action=reference_action, originator_idx=admin_idx, state="completed"
+    )
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"state": "completed", "active": "true"},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert _summary_by_idx(resp.json(), completed_idx) is None
+
+
+async def test_list_work_ticket_orders_newest_first(
+    wt_client, admin_token, reference_action, ticket_seeder
+):
+    """Results are ordered work_ticket_idx DESC (newest first). Own-scoped,
+    so the seeded ids are the only rows and their relative order is exact."""
+    admin_tok, admin_idx = admin_token
+    seeded = [
+        await ticket_seeder.ticket(
+            action=reference_action, originator_idx=admin_idx, state="processing"
+        )
+        for _ in range(3)
+    ]
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST, headers={"Authorization": f"Bearer {admin_tok}"}
+    )
+    assert resp.status_code == 200, resp.text
+    returned = [row["work_ticket_idx"] for row in resp.json()]
+    assert returned == sorted(seeded, reverse=True)
+
+
+async def test_list_work_ticket_limit_caps_results(
+    wt_client, admin_token, reference_action, ticket_seeder
+):
+    """`?limit=N` caps the page size (own-scoped, so the count is exact)."""
+    admin_tok, admin_idx = admin_token
+    for _ in range(3):
+        await ticket_seeder.ticket(
+            action=reference_action, originator_idx=admin_idx, state="processing"
+        )
+    resp = await wt_client.get(
+        URL_WORK_TICKET_LIST,
+        params={"limit": "2"},
+        headers={"Authorization": f"Bearer {admin_tok}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()) == 2
+
+
+async def test_list_work_ticket_limit_out_of_range_422(wt_client, admin_token):
+    """`limit` is bounded (ge=1, le=max) like the audit-log query param.
+    Pin the exact configured boundaries, not arbitrary values, so a change
+    to the bound is caught here."""
+    from qiita_control_plane.routes.work_ticket import _WORK_TICKET_LIST_MAX_LIMIT
+
+    admin_tok, _ = admin_token
+    for bad in ("0", str(_WORK_TICKET_LIST_MAX_LIMIT + 1)):
+        resp = await wt_client.get(
+            URL_WORK_TICKET_LIST,
+            params={"limit": bad},
+            headers={"Authorization": f"Bearer {admin_tok}"},
+        )
+        assert resp.status_code == 422, (bad, resp.text)

@@ -45,9 +45,9 @@ from qiita_common.models import (
 
 # Native job modules must live under qiita_compute_orchestrator.jobs.
 # Defined here so every layer that checks the prefix (CP sync, CO boot
-# scan, CO /step/run route, the framework dispatcher) imports a single
+# scan, CO /step/submit route, the framework dispatcher) imports a single
 # value rather than re-typing the string. The wire validator on
-# StepRunRequest deliberately stays shape-only — the prefix check
+# StepSubmitRequest deliberately stays shape-only — the prefix check
 # belongs at the layers that actually import / dispatch.
 NATIVE_MODULE_PREFIX = "qiita_compute_orchestrator.jobs."
 

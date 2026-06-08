@@ -8,18 +8,22 @@ service. Long-running steps don't block the originating HTTP request.
 Failure modes:
 
 - If the CP restarts mid-dispatch, the ticket sits in PROCESSING with no
-  live owner. `recover_orphaned_tickets` (called from lifespan startup)
-  marks every non-terminal ticket as FAILED with a 'cp restarted' reason.
-  Operators decide whether to redrive via `POST /work-ticket/{idx}/run`.
+  live owner. `reconcile_inflight_tickets` (called from lifespan startup)
+  re-drives every non-terminal ticket through `run_workflow(resume=True)`,
+  which re-attaches to a still-running SLURM job (or finalizes one that
+  succeeded while the CP was down) rather than failing live work. Deploys
+  stop/start the CP without draining queues, so a restart with in-flight
+  tickets is routine, not a crash — failing them all would nuke running
+  work on every deploy.
 
 - If the runner raises, `run_workflow` itself transitions the ticket to
   FAILED. The done-callback installed here only handles task-level errors
   (asyncio cancellation, lost-pool, etc.) and logs them.
 
-Auto-retry is not implemented: every failure ends up FAILED and requires
-a human `/run` to reset. State machine guard (atomic conditional UPDATE
-in `runner._atomic_transition`) prevents double-dispatch even if /run
-races with the implicit on-create dispatch.
+State machine guard (atomic conditional UPDATE in
+`runner._atomic_transition` / `_transition_to_processing_for_resume`)
+prevents double-dispatch even if /run races with the implicit on-create
+dispatch or a startup reconcile.
 """
 
 from __future__ import annotations
@@ -29,7 +33,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from qiita_common.compute_backend_client import ComputeBackendClient
-from qiita_common.models import FailureType, WorkTicketFailureStage, WorkTicketState
+from qiita_common.models import WorkTicketState
 
 from .runner import run_workflow
 
@@ -42,8 +46,8 @@ _log = logging.getLogger(__name__)
 
 # The orchestrator-managed lifecycle states. A ticket in any of these
 # is "in flight" — it has not reached a terminal outcome (COMPLETED /
-# FAILED). Used by `recover_orphaned_tickets` to scope the startup sweep
-# and by the work-ticket route's disallow-without-delete check.
+# FAILED). Used by `reconcile_inflight_tickets` to scope the startup resume
+# sweep and by the work-ticket route's disallow-without-delete check.
 NON_TERMINAL_WORK_TICKET_STATES: tuple[str, ...] = (
     WorkTicketState.PENDING.value,
     WorkTicketState.QUEUED.value,
@@ -51,14 +55,17 @@ NON_TERMINAL_WORK_TICKET_STATES: tuple[str, ...] = (
 )
 
 
-async def _run_and_log(app: FastAPI, work_ticket_idx: int) -> None:
+async def _run_and_log(app: FastAPI, work_ticket_idx: int, *, resume: bool = False) -> None:
     """Inner task body: call `run_workflow` and log task-level errors.
 
     Workflow-level failures (a step raising) are already handled by
     `run_workflow` itself — it transitions the ticket to FAILED and
     re-raises. We catch the re-raise here only so the outer asyncio
     machinery doesn't see an "unhandled exception in task" warning;
-    the ticket state is already correct."""
+    the ticket state is already correct.
+
+    `resume` is forwarded to `run_workflow` — set by startup reconcile to
+    re-attach an in-flight ticket instead of requiring it be PENDING."""
     workspace_root = app.state.settings.path_scratch_ticket
     upload_staging_root = app.state.settings.path_scratch_staging
     if workspace_root is None or upload_staging_root is None:
@@ -81,6 +88,7 @@ async def _run_and_log(app: FastAPI, work_ticket_idx: int) -> None:
             data_plane_url=app.state.settings.data_plane_url,
             work_ticket_workspace_root=workspace_root,
             upload_staging_root=upload_staging_root,
+            resume=resume,
         )
     except Exception:
         # run_workflow has already transitioned to FAILED. Log and swallow
@@ -91,18 +99,20 @@ async def _run_and_log(app: FastAPI, work_ticket_idx: int) -> None:
         )
 
 
-def schedule_dispatch(app: FastAPI, work_ticket_idx: int) -> asyncio.Task:
+def schedule_dispatch(app: FastAPI, work_ticket_idx: int, *, resume: bool = False) -> asyncio.Task:
     """Fire-and-forget dispatch of one work ticket.
 
-    Caller is the route handler; the task runs in the background and the
-    caller returns immediately (typically with HTTP 202 Accepted). The
-    task is registered in `app.state.running_dispatches` so the GC can't
-    drop it mid-run, and removed by a done-callback when complete.
+    Caller is the route handler (fresh dispatch) or startup reconcile
+    (`resume=True`); the task runs in the background and the caller returns
+    immediately (typically with HTTP 202 Accepted). The task is registered in
+    `app.state.running_dispatches` so the GC can't drop it mid-run, and removed
+    by a done-callback when complete.
 
     Pre-conditions enforced by the caller, not here:
-      * Ticket must be in PENDING state. The runner enforces this via its
-        own atomic transition; if it's not PENDING, the runner raises and
-        the ticket stays where it was.
+      * Without `resume`, the ticket must be PENDING. The runner enforces this
+        via its own atomic transition; if it's not PENDING, the runner raises
+        and the ticket stays where it was. With `resume`, the runner accepts
+        any non-terminal ticket.
       * `app.state.compute_backend_client` must be non-None. The route
         should 503 before reaching this if the orchestrator URL is unset.
     """
@@ -115,7 +125,7 @@ def schedule_dispatch(app: FastAPI, work_ticket_idx: int) -> asyncio.Task:
         )
 
     task = asyncio.create_task(
-        _run_and_log(app, work_ticket_idx),
+        _run_and_log(app, work_ticket_idx, resume=resume),
         name=f"dispatch_ticket_{work_ticket_idx}",
     )
     app.state.running_dispatches.add(task)
@@ -123,56 +133,68 @@ def schedule_dispatch(app: FastAPI, work_ticket_idx: int) -> asyncio.Task:
     return task
 
 
-async def recover_orphaned_tickets(pool: asyncpg.Pool) -> int:
-    """Mark every non-terminal ticket as FAILED at startup.
-
-    Call from the lifespan startup hook *before* opening listeners. Any
-    ticket in PENDING / QUEUED / PROCESSING is by definition orphaned —
-    we just started; nothing else holds it. Recovery policy is
-    fail-and-let-operator-decide rather than auto-resume, because the
-    workflow library has not been audited for idempotency across the
-    full step graph.
-
-    Single-CP-process contract: this sweep assumes no other CP process
-    is concurrently dispatching against the same database. With multiple
-    CP processes, one's startup would fail tickets another is actively
-    running. CP HA needs fencing (owner column or advisory lock) before
-    that assumption can be lifted; see docs/architecture.md "Work Ticket
-    Lifecycle".
-
-    Returns the number of tickets transitioned, for logging.
-    """
-    # Populate failure_* together with state — DB CHECK
-    # `work_ticket_failure_consistent` requires all-or-nothing on FAILED.
-    # Classify as PROCESS_RESTARTED (mirrored as failure_type=retriable
-    # because a restart is by definition a transient cause); the
-    # operator hitting /run will reset retry_count to 0 and clear these.
+async def _inflight_ticket_idxs(pool: asyncpg.Pool) -> list[int]:
+    """Every non-terminal (PENDING / QUEUED / PROCESSING) ticket id, ascending.
+    These are the tickets a startup reconcile re-drives — at startup nothing
+    else holds them."""
     rows = await pool.fetch(
-        "UPDATE qiita.work_ticket"
-        " SET state = $1::qiita.work_ticket_state,"
-        "     failure_type = $2::qiita.failure_type,"
-        "     failure_stage = $3::qiita.work_ticket_failure_stage,"
-        "     failure_step_name = NULL,"
-        "     failure_reason = $4"
-        " WHERE state = ANY($5::qiita.work_ticket_state[])"
-        " RETURNING work_ticket_idx",
-        WorkTicketState.FAILED.value,
-        FailureType.RETRIABLE.value,
-        # SUBMISSION rather than STEP_RUN because we don't know which
-        # step (or any step) was running; the failure is process-level,
-        # not step-level. The CHECK requires step_name=NULL for
-        # SUBMISSION/FINALIZE which suits "we have no step context".
-        WorkTicketFailureStage.SUBMISSION.value,
-        "cp restarted mid-dispatch; orphaned ticket recovered at startup",
+        "SELECT work_ticket_idx FROM qiita.work_ticket"
+        " WHERE state = ANY($1::qiita.work_ticket_state[])"
+        " ORDER BY work_ticket_idx",
         list(NON_TERMINAL_WORK_TICKET_STATES),
     )
-    if rows:
+    return [r["work_ticket_idx"] for r in rows]
+
+
+async def reconcile_inflight_tickets(app: FastAPI) -> int:
+    """Re-attach every in-flight ticket at startup instead of failing it.
+
+    Call from the lifespan startup hook *before* opening listeners. Any ticket
+    in PENDING / QUEUED / PROCESSING is by definition orphaned — we just
+    started; nothing else holds it. Each is re-dispatched through
+    `run_workflow(resume=True)`, which fast-forwards already-completed entries
+    (rebuilding their outputs from the shared workspace) and resumes the first
+    incomplete one — re-attaching to a live SLURM job by its persisted id,
+    finalizing one that succeeded while the CP was down, or deciding a purged
+    job from its on-disk manifest. A CO outage during reconcile leaves the
+    ticket PROCESSING and keeps retrying (the runner's poll loop never fails on
+    an unreachable orchestrator), so a deploy that stops both services is safe.
+
+    Resume policy (vs. the old fail-all sweep): deploys stop/start the CP
+    undrained, so a restart with in-flight tickets is routine, not a crash —
+    failing them all would nuke running work on every deploy.
+
+    Single-CP-process contract: assumes no other CP process is concurrently
+    dispatching against the same database. With multiple CP processes, one's
+    startup reconcile would re-drive tickets another is actively running. CP HA
+    needs fencing (owner column or advisory lock) before that assumption can be
+    lifted; see docs/architecture.md "Work Ticket Lifecycle".
+
+    Returns the number of tickets scheduled for resume, for logging.
+    """
+    idxs = await _inflight_ticket_idxs(app.state.pool)
+    if not idxs:
+        return 0
+    if app.state.compute_backend_client is None:
+        # No orchestrator configured → nothing can run a compute step, so we
+        # can't resume. Leave the tickets in place (a CP without
+        # COMPUTE_ORCHESTRATOR_URL shouldn't have in-flight compute tickets)
+        # and surface it loudly rather than silently dropping work.
         _log.warning(
-            "recovered %d orphaned work_ticket(s) by marking FAILED: %s",
-            len(rows),
-            [r["work_ticket_idx"] for r in rows],
+            "%d in-flight work_ticket(s) at startup but no compute_backend_client"
+            " configured; cannot resume %s — set COMPUTE_ORCHESTRATOR_URL",
+            len(idxs),
+            idxs,
         )
-    return len(rows)
+        return 0
+    _log.warning(
+        "resuming %d in-flight work_ticket(s) at startup: %s",
+        len(idxs),
+        idxs,
+    )
+    for idx in idxs:
+        schedule_dispatch(app, idx, resume=True)
+    return len(idxs)
 
 
 async def drain_running_dispatches(running: set[asyncio.Task], *, timeout_seconds: float) -> None:
@@ -180,9 +202,9 @@ async def drain_running_dispatches(running: set[asyncio.Task], *, timeout_second
 
     Bounded by `timeout_seconds` so a stuck workflow can't block service
     restart. Anything still running after the deadline is cancelled; the
-    runner's exception handler then transitions the ticket to FAILED. The
-    next CP startup will catch any leftover via `recover_orphaned_tickets`
-    as a safety net.
+    cancellation leaves the ticket non-terminal (a CancelledError is not
+    caught by the runner's `except Exception`), and the next CP startup
+    re-attaches it via `reconcile_inflight_tickets`.
 
     Snapshots `running` at call time. Relies on FastAPI lifespan
     ordering — uvicorn closes the listener and finishes outstanding
@@ -202,7 +224,7 @@ async def drain_running_dispatches(running: set[asyncio.Task], *, timeout_second
     if still_pending:
         _log.warning(
             "cancelled %d dispatch task(s) that did not drain in time; "
-            "their tickets will be picked up by recover_orphaned_tickets on next startup",
+            "their tickets will be re-attached by reconcile_inflight_tickets on next startup",
             len(still_pending),
         )
 

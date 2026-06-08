@@ -1,8 +1,18 @@
-"""POST /api/v1/step/run — the only client of this service.
+"""POST /api/v1/step/* — the orchestrator's step-execution surface.
 
-Issued by the control-plane runner for every workflow `step:` entry.
-Dispatches synchronously to the configured ComputeBackend and returns
-the backend's named output paths.
+The control-plane runner drives the decoupled trio:
+
+  * POST /step/submit  — submit the job, return a handle immediately.
+  * POST /step/status  — single live-status read for a submitted handle.
+  * POST /step/result  — finalize a terminal step, return verified outputs.
+  * POST /step/find-by-name — look up live jobs by deterministic name, so
+    the CP can adopt a job it submitted but never recorded the id for
+    (the write-ahead idempotency gap).
+
+The orchestrator is stateless across submit/status/result: the
+`StepHandle` returned by submit carries everything status/result need
+(job id + workspace paths), and the control plane persists those fields
+so it can re-attach after a restart.
 
 Auth is a shared bearer token loaded by `config.py` from
 `/etc/qiita/cp-to-co.token` (path overridable via `CP_TO_CO_TOKEN_PATH`;
@@ -21,16 +31,32 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from qiita_common.actions import NATIVE_MODULE_PREFIX
-from qiita_common.api_paths import PATH_STEP_PREFIX, PATH_STEP_RUN
+from qiita_common.api_paths import (
+    PATH_STEP_FIND_BY_NAME,
+    PATH_STEP_PREFIX,
+    PATH_STEP_RESULT,
+    PATH_STEP_STATUS,
+    PATH_STEP_SUBMIT,
+)
 from qiita_common.backend_failure import (
     BACKEND_FAILURE_HEADER,
     BACKEND_FAILURE_HTTP_STATUS,
     BackendFailure,
     BackendFailureBody,
 )
-from qiita_common.models import StepRunRequest, StepRunResponse
+from qiita_common.models import (
+    FoundJobWire,
+    StepFindByNameRequest,
+    StepFindByNameResponse,
+    StepHandleWire,
+    StepResultRequest,
+    StepResultResponse,
+    StepStatusRequest,
+    StepStatusWire,
+    StepSubmitRequest,
+)
 
-from .backend import ComputeBackend
+from .backend import ComputeBackend, StepHandle, StepStatusInfo
 
 router = APIRouter(prefix=PATH_STEP_PREFIX, tags=["step"])
 
@@ -50,48 +76,165 @@ def _get_backend(request: Request) -> ComputeBackend:
     return request.app.state.backend
 
 
-@router.post(PATH_STEP_RUN)
-async def run_step(
-    body: StepRunRequest,
-    backend: Annotated[ComputeBackend, Depends(_get_backend)],
-    _: Annotated[None, Depends(_require_cp_to_co_token)],
-) -> StepRunResponse:
-    # Defense in depth: the CP sync gate refuses to persist an action
-    # whose module path is outside NATIVE_MODULE_PREFIX, and the
-    # wire-level StepRunRequest validator already enforces shape. This
-    # third checkpoint catches any payload that bypassed sync — e.g.
-    # a service-account directly POSTing a hand-crafted ticket — and
-    # rejects it before the backend tries to import the module.
-    if body.module is not None and not body.module.startswith(NATIVE_MODULE_PREFIX):
+def _reject_non_native_module(module: str | None) -> None:
+    """Defense in depth: the CP sync gate refuses to persist an action
+    whose module path is outside NATIVE_MODULE_PREFIX, and the wire-level
+    request validator already enforces shape. This third checkpoint
+    catches any payload that bypassed sync — e.g. a service-account
+    directly POSTing a hand-crafted ticket — before the backend tries to
+    import the module."""
+    if module is not None and not module.startswith(NATIVE_MODULE_PREFIX):
         raise HTTPException(
             status_code=422,
-            detail=f"module must start with {NATIVE_MODULE_PREFIX!r}; got {body.module!r}",
+            detail=f"module must start with {NATIVE_MODULE_PREFIX!r}; got {module!r}",
         )
+
+
+def _backend_failure_response(exc: BackendFailure) -> JSONResponse:
+    """Serialize a BackendFailure so the runner can reconstruct the typed
+    failure and apply retry classification — without this, transient kinds
+    (NODE_FAIL, OOM_KILLED, SLURMRESTD_UNREACHABLE, ...) would surface as a
+    generic HTTPStatusError and be misclassified UNKNOWN_PERMANENT."""
+    return JSONResponse(
+        status_code=BACKEND_FAILURE_HTTP_STATUS,
+        content=BackendFailureBody.from_exception(exc).model_dump(mode="json"),
+        headers={BACKEND_FAILURE_HEADER: "1"},
+    )
+
+
+def _handle_to_wire(handle: StepHandle) -> StepHandleWire:
+    return StepHandleWire(
+        compute_target=handle.compute_target,
+        step_name=handle.step_name,
+        slurm_job_id=handle.slurm_job_id,
+        job_name=handle.job_name,
+        output_path=str(handle.output_path) if handle.output_path is not None else None,
+        logs_path=str(handle.logs_path) if handle.logs_path is not None else None,
+        terminal_outputs=(
+            {k: str(v) for k, v in handle.terminal_outputs.items()}
+            if handle.terminal_outputs is not None
+            else None
+        ),
+    )
+
+
+def _handle_from_wire(wire: StepHandleWire) -> StepHandle:
+    return StepHandle(
+        compute_target=wire.compute_target,
+        step_name=wire.step_name,
+        slurm_job_id=wire.slurm_job_id,
+        job_name=wire.job_name,
+        output_path=Path(wire.output_path) if wire.output_path is not None else None,
+        logs_path=Path(wire.logs_path) if wire.logs_path is not None else None,
+        terminal_outputs=(
+            {k: Path(v) for k, v in wire.terminal_outputs.items()}
+            if wire.terminal_outputs is not None
+            else None
+        ),
+    )
+
+
+def _status_from_wire(wire: StepStatusWire) -> StepStatusInfo:
+    return StepStatusInfo(
+        status=wire.status,
+        raw_state=wire.raw_state,
+        exit_code=wire.exit_code,
+        reason=wire.reason,
+    )
+
+
+def _status_to_wire(info: StepStatusInfo) -> StepStatusWire:
+    return StepStatusWire(
+        status=info.status,
+        raw_state=info.raw_state,
+        exit_code=info.exit_code,
+        reason=info.reason,
+    )
+
+
+@router.post(PATH_STEP_SUBMIT)
+async def submit_step(
+    body: StepSubmitRequest,
+    backend: Annotated[ComputeBackend, Depends(_get_backend)],
+    _: Annotated[None, Depends(_require_cp_to_co_token)],
+) -> StepHandleWire:
+    """Submit a step and return its handle without blocking on completion."""
+    _reject_non_native_module(body.module)
     try:
-        outputs = await backend.run_step(
+        handle = await backend.submit_step(
             body.step_name,
             {k: Path(v) for k, v in body.inputs.items()},
             Path(body.workspace),
             scope_target=body.scope_target,
             work_ticket_idx=body.work_ticket_idx,
+            attempt=body.attempt,
             container=body.container,
             module=body.module,
             entrypoint=body.entrypoint,
             baseline_resources=body.baseline_resources,
         )
     except BackendFailure as exc:
-        # Structured workflow-step failure. Serialize so the runner can
-        # reconstruct the typed BackendFailure and apply retry
-        # classification — without this, transient kinds (NODE_FAIL,
-        # OOM_KILLED, SLURMRESTD_UNREACHABLE, ...) would surface as a
-        # generic HTTPStatusError and be misclassified UNKNOWN_PERMANENT.
-        return JSONResponse(
-            status_code=BACKEND_FAILURE_HTTP_STATUS,
-            content=BackendFailureBody.from_exception(exc).model_dump(mode="json"),
-            headers={BACKEND_FAILURE_HEADER: "1"},
-        )
+        return _backend_failure_response(exc)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return StepRunResponse(outputs={k: str(v) for k, v in outputs.items()})
+    return _handle_to_wire(handle)
+
+
+@router.post(PATH_STEP_STATUS)
+async def status_step(
+    body: StepStatusRequest,
+    backend: Annotated[ComputeBackend, Depends(_get_backend)],
+    _: Annotated[None, Depends(_require_cp_to_co_token)],
+) -> StepStatusWire:
+    """Read the live status of a submitted step (single, non-blocking)."""
+    try:
+        info = await backend.status_step(_handle_from_wire(body.handle))
+    except BackendFailure as exc:
+        return _backend_failure_response(exc)
+    return _status_to_wire(info)
+
+
+@router.post(PATH_STEP_RESULT)
+async def result_step(
+    body: StepResultRequest,
+    backend: Annotated[ComputeBackend, Depends(_get_backend)],
+    _: Annotated[None, Depends(_require_cp_to_co_token)],
+) -> StepResultResponse:
+    """Finalize a terminal step: verify the output contract and return the
+    named outputs, or serialize the classified BackendFailure."""
+    try:
+        outputs = await backend.result_step(
+            _handle_from_wire(body.handle), _status_from_wire(body.status)
+        )
+    except BackendFailure as exc:
+        return _backend_failure_response(exc)
+    return StepResultResponse(outputs={k: str(v) for k, v in outputs.items()})
+
+
+@router.post(PATH_STEP_FIND_BY_NAME)
+async def find_jobs_by_name(
+    body: StepFindByNameRequest,
+    backend: Annotated[ComputeBackend, Depends(_get_backend)],
+    _: Annotated[None, Depends(_require_cp_to_co_token)],
+) -> StepFindByNameResponse:
+    """Look up live SLURM jobs by their deterministic name. The control plane
+    calls this during restart recovery to adopt a job it submitted but whose
+    id it never persisted (the write-ahead gap), instead of re-submitting.
+    Serializes a classified BackendFailure (e.g. slurmrestd unreachable) so
+    the runner retries rather than failing recovery."""
+    try:
+        found = await backend.find_jobs_by_name(body.job_name)
+    except BackendFailure as exc:
+        return _backend_failure_response(exc)
+    return StepFindByNameResponse(
+        jobs=[
+            FoundJobWire(
+                slurm_job_id=f.slurm_job_id,
+                job_name=f.job_name,
+                status=_status_to_wire(f.status),
+            )
+            for f in found
+        ]
+    )

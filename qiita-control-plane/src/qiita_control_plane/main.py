@@ -22,7 +22,7 @@ from .deps import get_db_pool
 from .dispatch import (
     build_compute_backend_client,
     drain_running_dispatches,
-    recover_orphaned_tickets,
+    reconcile_inflight_tickets,
 )
 from .health import aggregate_health
 from .landing import router as landing_router
@@ -32,7 +32,7 @@ _STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 # Bound on how long we wait for in-flight dispatches at shutdown. systemd's
 # default TimeoutStopSec is 90s; staying under that lets us cancel cleanly
-# before SIGKILL. Unfinished tasks are picked up by recover_orphaned_tickets
+# before SIGKILL. Unfinished tasks are re-attached by reconcile_inflight_tickets
 # on the next startup as a safety net.
 _DISPATCH_DRAIN_TIMEOUT_SECONDS = 60.0
 
@@ -62,10 +62,12 @@ async def lifespan(app: FastAPI):
         token_path=settings.cp_to_co_token_path,
     )
     app.state.running_dispatches = set()
-    # Recover any tickets left in non-terminal state by a previous CP
-    # process — they have no live owner. Marked FAILED with a 'cp
-    # restarted' reason; operators redrive via /work-ticket/{idx}/run.
-    await recover_orphaned_tickets(app.state.pool)
+    # Re-attach any tickets left in non-terminal state by a previous CP
+    # process — they have no live owner. Resumed in-place (re-attach to a
+    # live SLURM job, finalize one that finished while we were down, or fail
+    # cleanly from the filesystem) rather than blanket-failed, so a deploy
+    # that stops/starts the CP undrained doesn't nuke running work.
+    await reconcile_inflight_tickets(app)
 
     try:
         yield

@@ -48,7 +48,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from qiita_common.actions import FASTQ_PATH_CONTEXT_KEYS, Audience
 from qiita_common.api_paths import (
     PATH_WORK_TICKET_BY_IDX,
@@ -63,6 +63,7 @@ from qiita_common.models import (
     WorkTicketCreateRequest,
     WorkTicketResponse,
     WorkTicketState,
+    WorkTicketSummary,
 )
 
 from ..actions.context_validator import validate_context
@@ -89,6 +90,12 @@ _DISALLOW_WITHOUT_DELETE_INDEXES = frozenset(
         "work_ticket_one_in_flight_per_sequenced_pool",
     }
 )
+
+# Page-size bounds for GET /work-ticket, mirroring the audit-log query's
+# ge=1 / le=max shape (routes/admin.py). Local to this route — its only
+# consumer; the CLI just passes `--limit N` and the server enforces here.
+_WORK_TICKET_LIST_DEFAULT_LIMIT = 50
+_WORK_TICKET_LIST_MAX_LIMIT = 500
 
 
 # =============================================================================
@@ -598,42 +605,112 @@ _WORK_TICKET_FROM = (
     " FROM qiita.work_ticket wt LEFT JOIN qiita.sequenced_pool sp ON sp.idx = wt.sequenced_pool_idx"
 )
 
+# Summary read (GET /work-ticket): the work_ticket columns plus the ticket's
+# *current* step entry — the highest (step_index, attempt) progress row —
+# pulled in via a LATERAL join so the list is one query with no N+1. LEFT
+# JOIN LATERAL so a ticket with no progress rows yet (PENDING before its
+# first write-ahead) still returns, with the cur.* columns NULL. The compute
+# columns are aliased `current_*` to stay distinct from the work_ticket
+# columns; `_row_to_work_ticket_summary` re-keys them onto the model fields.
+_WORK_TICKET_SUMMARY_FROM = (
+    _WORK_TICKET_FROM + " LEFT JOIN LATERAL ("
+    "   SELECT step_index, step_name, compute_target, slurm_job_id, state"
+    "   FROM qiita.work_ticket_step wts"
+    "   WHERE wts.work_ticket_idx = wt.work_ticket_idx"
+    "   ORDER BY step_index DESC, attempt DESC"
+    "   LIMIT 1"
+    " ) cur ON true"
+)
+_WORK_TICKET_SUMMARY_COLUMNS = (
+    _WORK_TICKET_COLUMNS + ","
+    " cur.step_index AS current_step_index,"
+    " cur.step_name AS current_step_name,"
+    " cur.compute_target AS current_compute_target,"
+    " cur.slurm_job_id AS current_slurm_job_id,"
+    " cur.state AS current_step_state"
+)
+
+
+def _scope_target_from_columns(
+    kind: str,
+    *,
+    study_idx: int | None,
+    prep_idx: int | None,
+    reference_idx: int | None,
+    prep_sample_idx: int | None,
+    sequenced_pool_idx: int | None,
+    sequencing_run_idx: int | None,
+) -> dict[str, Any]:
+    """Rebuild the discriminated scope_target dict from the tagged-union
+    columns work_ticket stores (scope_target_kind + the five nullable idx
+    columns; the SEQUENCED_POOL arm additionally needs the joined
+    sequencing_run_idx). Shared by the single-ticket and list-summary row
+    shapers so the union mapping lives in exactly one place."""
+    if kind == ScopeTargetKind.REFERENCE.value:
+        return {"kind": kind, "reference_idx": reference_idx}
+    if kind == ScopeTargetKind.STUDY_PREP.value:
+        return {"kind": kind, "study_idx": study_idx, "prep_idx": prep_idx}
+    if kind == ScopeTargetKind.PREP_SAMPLE.value:
+        return {"kind": kind, "prep_sample_idx": prep_sample_idx}
+    # SEQUENCED_POOL — DB CHECK enforces one of the four valid kinds.
+    return {
+        "kind": kind,
+        "sequenced_pool_idx": sequenced_pool_idx,
+        "sequencing_run_idx": sequencing_run_idx,
+    }
+
+
+def _shape_work_ticket_columns(data: dict[str, Any]) -> dict[str, Any]:
+    """In place, fold a work_ticket row's tagged-union scope columns into a
+    single `scope_target` and decode `action_context` from asyncpg's
+    JSONB-as-string. Every other column maps 1:1 onto a WorkTicket field and
+    flows through unchanged — so a field added to both the model and
+    `_WORK_TICKET_COLUMNS` needs no edit here. Returns the same dict for
+    chaining."""
+    data["scope_target"] = _scope_target_from_columns(
+        data.pop("scope_target_kind"),
+        study_idx=data.pop("study_idx"),
+        prep_idx=data.pop("prep_idx"),
+        reference_idx=data.pop("reference_idx"),
+        prep_sample_idx=data.pop("prep_sample_idx"),
+        sequenced_pool_idx=data.pop("sequenced_pool_idx"),
+        # Joined sequencing-run idx — only the SEQUENCED_POOL arm carries a
+        # value (NULL otherwise) but the column is always selected, so pop
+        # defensively with a default.
+        sequencing_run_idx=data.pop("sequencing_run_idx", None),
+    )
+    data["action_context"] = json.loads(data["action_context"])
+    return data
+
 
 def _row_to_work_ticket(row: asyncpg.Record) -> WorkTicket:
-    """Assemble a WorkTicket from a work_ticket row. Two columns need
-    shaping: `scope_target` is rebuilt from scope_target_kind plus the
-    five nullable idx columns the table stores, and `action_context` is
-    decoded from asyncpg's JSONB-as-string. The SEQUENCED_POOL arm reads
-    sequencing_run_idx from the joined sequenced_pool row — fetched
-    upstream of this helper so the assembly stays a pure transformation.
-    Every other column maps 1:1 onto a WorkTicket field and flows
-    through unchanged — so a field added to both the model and
-    `_WORK_TICKET_COLUMNS` needs no edit here."""
+    """Assemble a WorkTicket from a work_ticket row (scope_target rebuilt
+    from the tagged-union columns, action_context JSON-decoded). The
+    SEQUENCED_POOL arm reads sequencing_run_idx from the joined
+    sequenced_pool row — selected upstream so the assembly stays a pure
+    transformation."""
+    return WorkTicket.model_validate(_shape_work_ticket_columns(dict(row)))
+
+
+def _row_to_work_ticket_summary(row: asyncpg.Record) -> WorkTicketSummary:
+    """Assemble a WorkTicketSummary from a summary-query row: the shaped
+    work_ticket columns plus the five `current_*` columns the LATERAL join
+    over the highest-(step_index, attempt) progress row adds. Re-key the
+    aliased compute columns onto the model's field names; they are all NULL
+    when the ticket has no progress rows yet (the LEFT JOIN found no match,
+    so Pydantic's `| None` defaults apply)."""
     data = dict(row)
-    kind = data.pop("scope_target_kind")
-    study_idx = data.pop("study_idx")
-    prep_idx = data.pop("prep_idx")
-    reference_idx = data.pop("reference_idx")
-    prep_sample_idx = data.pop("prep_sample_idx")
-    sequenced_pool_idx = data.pop("sequenced_pool_idx")
-    # Sequencing-run idx for the SEQUENCED_POOL arm is read via the
-    # joined column the row-producer adds when the row's
-    # scope_target_kind is sequenced_pool. Other kinds don't carry it.
-    sequencing_run_idx = data.pop("sequencing_run_idx", None)
-    if kind == ScopeTargetKind.REFERENCE.value:
-        data["scope_target"] = {"kind": kind, "reference_idx": reference_idx}
-    elif kind == ScopeTargetKind.STUDY_PREP.value:
-        data["scope_target"] = {"kind": kind, "study_idx": study_idx, "prep_idx": prep_idx}
-    elif kind == ScopeTargetKind.PREP_SAMPLE.value:
-        data["scope_target"] = {"kind": kind, "prep_sample_idx": prep_sample_idx}
-    else:  # SEQUENCED_POOL — DB CHECK enforces one of the four valid kinds.
-        data["scope_target"] = {
-            "kind": kind,
-            "sequenced_pool_idx": sequenced_pool_idx,
-            "sequencing_run_idx": sequencing_run_idx,
-        }
-    data["action_context"] = json.loads(data["action_context"])
-    return WorkTicket.model_validate(data)
+    # Pop the LATERAL-join aliases before shaping the work_ticket columns so
+    # `_shape_work_ticket_columns` sees only the columns it knows about.
+    summary_fields = {
+        "current_step_index": data.pop("current_step_index"),
+        "current_step_name": data.pop("current_step_name"),
+        "compute_target": data.pop("current_compute_target"),
+        "slurm_job_id": data.pop("current_slurm_job_id"),
+        "step_state": data.pop("current_step_state"),
+    }
+    shaped = _shape_work_ticket_columns(data)
+    return WorkTicketSummary.model_validate({**shaped, **summary_fields})
 
 
 @router.get(
@@ -676,6 +753,79 @@ async def get_work_ticket(
     if not (is_originator or is_bypass):
         raise not_found
     return _row_to_work_ticket(row)
+
+
+@router.get(
+    PATH_WORK_TICKET_ROOT,
+    response_model=list[WorkTicketSummary],
+)
+async def list_work_tickets(
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    principal: Principal = Depends(get_current_principal),
+    state: WorkTicketState | None = Query(
+        default=None, description="Filter to a single lifecycle state."
+    ),
+    active: bool = Query(
+        default=False,
+        description="Filter to non-terminal tickets (pending / queued / processing).",
+    ),
+    all_tickets: bool = Query(
+        default=False,
+        alias="all",
+        description=(
+            "Operator view: return tickets from every originator (requires "
+            "wet_lab_admin or higher). Default is the caller's own tickets."
+        ),
+    ),
+    limit: int = Query(
+        default=_WORK_TICKET_LIST_DEFAULT_LIMIT, ge=1, le=_WORK_TICKET_LIST_MAX_LIMIT
+    ),
+) -> list[WorkTicketSummary]:
+    """List work tickets, each with a snapshot of its *current* compute
+    placement (target, SLURM job id, step state) from a single LATERAL join
+    against work_ticket_step — no live SLURM hop, so the read is at most one
+    poll-interval stale (see `WorkTicketSummary`).
+
+    Scope: by default a caller sees only tickets they originated. `?all=true`
+    widens to every originator and is gated to wet_lab_admin+ (mirrors the
+    single-ticket GET's role bypass); a non-admin requesting it gets 403.
+    Anonymous → 401. Ordered newest-first (work_ticket_idx DESC), capped by
+    `limit`.
+
+    `state` and `active` AND-compose (`?state=completed&active=true` is a
+    valid — empty — intersection), so a caller can scope to "my active
+    tickets" or "all failed tickets" in one query."""
+    if isinstance(principal, Anonymous):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required"
+        )
+    if all_tickets and not principal.has_role_at_least(SystemRole.WET_LAB_ADMIN):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="listing all tickets (?all=true) requires wet_lab_admin or higher",
+        )
+
+    # Build the WHERE incrementally so each filter binds its own $n; the
+    # placeholder index is always len(args) right after the append.
+    conditions: list[str] = []
+    args: list[Any] = []
+    if not all_tickets:
+        args.append(principal.principal_idx)
+        conditions.append(f"wt.originator_principal_idx = ${len(args)}")
+    if state is not None:
+        args.append(state.value)
+        conditions.append(f"wt.state = ${len(args)}::qiita.work_ticket_state")
+    if active:
+        args.append(list(NON_TERMINAL_WORK_TICKET_STATES))
+        conditions.append(f"wt.state = ANY(${len(args)}::qiita.work_ticket_state[])")
+    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    args.append(limit)
+    rows = await pool.fetch(
+        f"SELECT {_WORK_TICKET_SUMMARY_COLUMNS}{_WORK_TICKET_SUMMARY_FROM}{where}"
+        f" ORDER BY wt.work_ticket_idx DESC LIMIT ${len(args)}",
+        *args,
+    )
+    return [_row_to_work_ticket_summary(row) for row in rows]
 
 
 @router.post(

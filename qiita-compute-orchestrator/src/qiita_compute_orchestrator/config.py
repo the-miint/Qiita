@@ -1,7 +1,7 @@
 """Compute orchestrator configuration.
 
 The orchestrator is mostly a passive HTTP service: it accepts
-`POST /step/run` from the control-plane runner, dispatches to its
+`POST /step/*` from the control-plane runner, dispatches to its
 ComputeBackend, and returns the outputs. It also makes a single class
 of outbound call -- POST /api/v1/sequence-range (the CP route lives at
 qiita-control-plane/src/qiita_control_plane/routes/sequence_range.py)
@@ -130,7 +130,7 @@ class Settings:
 
         `require_cp_to_co_token` is True for the orchestrator FastAPI
         service (the lifespan handler) — `cp_to_co_token` is the shared
-        bearer it must present-compare on inbound `POST /step/run`, so
+        bearer it must present-compare on inbound `POST /step/*`, so
         a missing token is a boot-time fatal.
 
         It's False on the SLURM-launcher / CLI path (set by the
@@ -170,7 +170,7 @@ class Settings:
 def _resolve_slurm_settings() -> SlurmSettings:
     """Read SLURM env vars and bail loudly on missing-required so a
     misconfigured `COMPUTE_BACKEND=slurm` boot fails at startup instead
-    of at the first /step/run call."""
+    of at the first /step/* call."""
 
     def _required(name: str) -> str:
         v = os.environ.get(name)
@@ -237,7 +237,7 @@ def _resolve_token(kind: Literal["cp_to_co", "co_to_cp"]) -> str:
     """Resolve a bearer token by direction.
 
     cp_to_co: shared bearer the control-plane runner presents on
-              inbound POST /step/run.
+              inbound POST /step/*.
     co_to_cp: compute-worker service-account PAT the orchestrator
               presents on outbound calls (e.g. POST /sequence-range);
               provisioning is documented in
@@ -322,7 +322,7 @@ def get_settings() -> Settings:
     calls Settings.from_env() lazily. Jobs that never invoke this don't
     pay the token-resolution cost. We pass
     `require_cp_to_co_token=False` because that token is *inbound*
-    auth on `POST /step/run` — the launcher / CLI never serves that
+    auth on `POST /step/*` — the launcher / CLI never serves that
     route, so demanding it would force the orchestrator to propagate
     the token through SLURM env just to satisfy a path no job
     exercises.

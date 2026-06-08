@@ -51,7 +51,7 @@ def test_whoami_calls_correct_url(monkeypatch):
 
     captured = {}
 
-    def fake_request(method, url, headers=None, json=None, timeout=None):
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
         captured["method"] = method
         captured["url"] = url
         captured["auth"] = headers["Authorization"]
@@ -75,7 +75,7 @@ def test_token_revoke_all_calls_correct_url(monkeypatch):
 
     captured = {}
 
-    def fake_request(method, url, headers=None, json=None, timeout=None):
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
         captured["method"] = method
         captured["url"] = url
         captured["auth"] = headers["Authorization"]

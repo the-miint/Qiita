@@ -60,7 +60,7 @@ def _flatten_params(params: JobParams) -> dict:
     """Combine the work-ticket scalars and the step's inputs map into a
     single dict ready for `Inputs.model_validate`.
 
-    Producer side of the contract is `SlurmBackend.run_step`, which
+    Producer side of the contract is `SlurmBackend.submit_step`, which
     constructs a `JobParams` (slurm/contract.py) and writes its
     `model_dump_json()` to `params.json`. `output_path` rides along on
     the model but is ignored here — the env var ($QIITA_OUTPUT_PATH)

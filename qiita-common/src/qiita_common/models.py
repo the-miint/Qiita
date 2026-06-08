@@ -264,7 +264,7 @@ class FeatureHashEntry(BaseModel):
 
 class StepBaselineResources(BaseModel):
     """Resource ask for one workflow step. Mirrors qiita_common.actions.
-    BaselineResources but lives here so the over-the-wire StepRunRequest
+    BaselineResources but lives here so the over-the-wire StepSubmitRequest
     can include it without a circular import (actions.py imports models)."""
 
     cpu: Annotated[int, Field(gt=0)]
@@ -281,7 +281,7 @@ def check_exactly_one_runtime(
     owner: str,
 ) -> None:
     """Shared runtime-selection check for WorkflowStep (YAML side) and
-    StepRunRequest (wire side). Raises ValueError when the shape is wrong.
+    StepSubmitRequest (wire side). Raises ValueError when the shape is wrong.
     Kept in one place so the rule can't drift between the two layers."""
     if (container is None) == (module is None):
         raise ValueError(f"{owner} must declare exactly one of 'container' or 'module'")
@@ -289,44 +289,53 @@ def check_exactly_one_runtime(
         raise ValueError("'entrypoint' requires 'container'")
 
 
-class StepRunRequest(BaseModel):
-    """Body for POST /api/v1/step/run on the orchestrator.
+def _normalize_scope_target(v: dict[str, Any]) -> dict[str, Any]:
+    """Validate a wire-side `scope_target` against the ScopeTarget
+    discriminated union and normalize it to JSON shape (enum `kind` →
+    plain string). Used by StepSubmitRequest's scope_target validator.
+    ScopeTarget is defined later in this module; it resolves at call time,
+    not definition time."""
+    from pydantic import TypeAdapter
 
-    Issued by the control-plane runner for every workflow `step:` entry.
-    The orchestrator dispatches to its configured ComputeBackend's
-    `run_step`. Paths are absolute and live on the workspace shared
-    between control plane and orchestrator.
+    return TypeAdapter(ScopeTarget).validate_python(v).model_dump(mode="json")
 
-    Runtime selection (`container` vs `module`) follows the same rules
-    as `qiita_common.actions.WorkflowStep` — exactly one must be set,
-    enforced by the same `check_exactly_one_runtime` helper. See that
-    class's docstring for the container-vs-native semantics.
 
-    `work_ticket_idx` flows through so SlurmBackend can stamp the SLURM
-    job name with the originating ticket id — making scheduler dumps
-    cross-referenceable back to the work_ticket row.
+# ---------------------------------------------------------------------------
+# Decoupled step wire contract: submit / status / result.
+#
+# The control-plane runner drives these three so it never holds a connection
+# open for the duration of a SLURM job: submit returns immediately with a
+# handle, the runner polls status until terminal, then asks for the result.
+# The orchestrator is stateless across the three calls, so the handle (the
+# serialized `StepHandle`) carries everything status/result need and the CP
+# persists those fields to re-attach after a restart.
+# ---------------------------------------------------------------------------
 
-    `scope_target` carries the work ticket's discriminated-union scope
-    target (matches `qiita_common.models.ScopeTarget`). The container
-    path inspects `scope_target["kind"]` and extracts the scalar(s) it
-    needs (e.g. `reference_idx` for reference-add); the native path
-    routes the dict through `flatten_native_inputs`, which merges the
-    scope's idx scalars into the job's `Inputs` model. Typed as a dict
-    (not the ScopeTarget union directly) to avoid a forward-reference /
-    model_rebuild dance — the field validator below runs the same
-    discriminated-union validation as `WorkTicket.scope_target` AND
-    normalizes the dict to JSON shape (`mode="json"`), so callers that
-    pass enum objects (e.g. `{"kind": ScopeTargetKind.REFERENCE}`) get
-    string values out the back. Downstream code can rely on
-    `scope_target["kind"] == ScopeTargetKind.X.value` without worrying
-    about which input shape produced the dict.
-    """
+
+class StepSubmitRequest(BaseModel):
+    """Body for POST /api/v1/step/submit, issued by the control-plane runner
+    for every workflow `step:` entry. The orchestrator dispatches to its
+    configured ComputeBackend's `submit_step` and returns a handle without
+    blocking on completion.
+
+    Runtime selection (`container` vs `module`) follows the same rules as
+    `qiita_common.actions.WorkflowStep` — exactly one must be set, enforced by
+    the shared `check_exactly_one_runtime` helper. `work_ticket_idx` + `attempt`
+    stamp the deterministic SLURM job name `qiita-wt{idx}-{step}-a{attempt}`, so
+    a job submitted but not yet recorded can be re-found by name. `scope_target`
+    carries the work ticket's discriminated-union scope target (matches
+    `qiita_common.models.ScopeTarget`); the field validator below runs the same
+    discriminated-union validation as `WorkTicket.scope_target` AND normalizes
+    the dict to JSON shape (`mode="json"`), so `scope_target["kind"]` is always
+    a plain string downstream. Paths are absolute and live on the workspace
+    shared between control plane and orchestrator."""
 
     step_name: str = Field(min_length=1)
     inputs: dict[str, str] = Field(default_factory=dict)
     workspace: str = Field(min_length=1)
     scope_target: dict[str, Any]
     work_ticket_idx: Annotated[int, Field(gt=0)]
+    attempt: Annotated[int, Field(ge=0)] = 0
     container: str | None = Field(default=None, min_length=1, max_length=512)
     module: str | None = Field(default=None, min_length=1, max_length=512)
     entrypoint: str | None = None
@@ -335,39 +344,101 @@ class StepRunRequest(BaseModel):
     @field_validator("scope_target", mode="after")
     @classmethod
     def _validate_scope_target(cls, v: dict[str, Any]) -> dict[str, Any]:
-        # Delegate to the ScopeTarget discriminated union (defined later
-        # in this module) so the wire-side validation rule lives in one
-        # place. Returns a JSON-shape dict so enum inputs (e.g.
-        # `kind=ScopeTargetKind.REFERENCE`) come back as plain strings —
-        # callers compare against `.value` without caring how the dict
-        # was constructed.
-        from pydantic import TypeAdapter
-
-        return TypeAdapter(ScopeTarget).validate_python(v).model_dump(mode="json")
+        return _normalize_scope_target(v)
 
     @model_validator(mode="after")
-    def _exactly_one_runtime(self) -> StepRunRequest:
-        # Mirrors WorkflowStep's exactly-one rule at the wire boundary.
-        # Pydantic raises a 422 at FastAPI deserialization, before any
-        # backend code runs — single enforcement point, no per-backend
-        # drift risk.
+    def _exactly_one_runtime(self) -> StepSubmitRequest:
         check_exactly_one_runtime(
             container=self.container,
             module=self.module,
             entrypoint=self.entrypoint,
-            owner="StepRunRequest",
+            owner="StepSubmitRequest",
         )
         return self
 
 
-class StepRunResponse(BaseModel):
-    """Returned by POST /api/v1/step/run.
+class StepHandleWire(BaseModel):
+    """Serialized `StepHandle` — POST /step/submit returns one, and POST
+    /step/status / /step/result take one back. Paths are strings on the
+    wire.
 
-    `outputs` is the backend's name → path mapping, matching the YAML's
-    declared step `outputs:`.
-    """
+    `terminal_outputs` is the "synchronous backend already finished at
+    submit time" sentinel: non-None means the step completed during submit
+    (LocalBackend runs the module in-process) and the dict holds its
+    outputs — the caller skips polling and uses it directly. For SLURM it
+    is None and the caller polls status. **Invariant: non-None implies
+    non-empty** — the runner keys off `is not None`, so an empty-but-set
+    dict would falsely signal completion."""
+
+    compute_target: ComputeTarget
+    step_name: str
+    slurm_job_id: int | None = None
+    job_name: str | None = None
+    output_path: str | None = None
+    logs_path: str | None = None
+    terminal_outputs: dict[str, str] | None = None
+
+
+class StepStatusWire(BaseModel):
+    """Serialized `StepStatusInfo` — returned by POST /step/status and fed
+    back into POST /step/result so the orchestrator (stateless) can finalize
+    a terminal step without re-reading slurmrestd."""
+
+    status: StepStatus
+    raw_state: str | None = None
+    exit_code: int | None = None
+    reason: str | None = None
+
+
+class StepStatusRequest(BaseModel):
+    """Body for POST /api/v1/step/status."""
+
+    handle: StepHandleWire
+
+
+class StepResultRequest(BaseModel):
+    """Body for POST /api/v1/step/result."""
+
+    handle: StepHandleWire
+    status: StepStatusWire
+
+
+class StepResultResponse(BaseModel):
+    """Returned by POST /api/v1/step/result — the backend's name → path
+    output map, matching the YAML's declared step `outputs:`."""
 
     outputs: dict[str, str]
+
+
+class StepFindByNameRequest(BaseModel):
+    """Body for POST /api/v1/step/find-by-name.
+
+    `job_name` is the deterministic SLURM job name
+    `qiita-wt{idx}-{step}-a{attempt}`. The control-plane runner queries this
+    during restart recovery to adopt a job it submitted but whose id it never
+    persisted (the write-ahead `submitting`-without-id gap) — closing the
+    duplicate-job window without re-submitting."""
+
+    job_name: str = Field(min_length=1, max_length=512)
+
+
+class FoundJobWire(BaseModel):
+    """One live SLURM job matched by find-by-name: its id and a status
+    snapshot (reusing StepStatusWire). The control plane adopts a found job
+    by reconstructing a StepHandle from `slurm_job_id` (workspace paths are
+    deterministic from the per-attempt workspace)."""
+
+    slurm_job_id: int
+    job_name: str
+    status: StepStatusWire
+
+
+class StepFindByNameResponse(BaseModel):
+    """Returned by POST /api/v1/step/find-by-name — the live jobs whose name
+    matched. Empty when none match: slurmrestd has purged the job, or the
+    backend is in-process (LocalBackend never submits to SLURM)."""
+
+    jobs: list[FoundJobWire]
 
 
 # Valid status transitions for references.
@@ -1239,6 +1310,64 @@ class WorkTicketFailureStage(StrEnum):
     FINALIZE = "finalize"
 
 
+class ComputeTarget(StrEnum):
+    """Where one workflow step entry actually executes.
+
+    `slurm` — a real SLURM job (carries a `slurm_job_id`). `local` — a
+    native module run in-process on the orchestrator (LocalBackend; dev /
+    test). `control_plane` — an `action:` entry run in-process on the
+    control plane (no backend hop, no job id). Only `slurm` is "on
+    compute"; the other two are in-process. Mirrored DB-side by the
+    `compute_target` TEXT+CHECK column on `qiita.work_ticket_step` — a
+    plain TEXT/CHECK, not a Postgres ENUM (see CLAUDE.md "Enum parity");
+    keep both sides in sync by hand.
+    """
+
+    SLURM = "slurm"
+    LOCAL = "local"
+    CONTROL_PLANE = "control_plane"
+
+
+class StepStatus(StrEnum):
+    """Live status of a submitted step, as reported by a backend's
+    `status_step`. Coarser than SLURM's own state vocabulary — the runner
+    and the ticket-summary read only care about queued-vs-running-vs-done.
+
+    `pending` = accepted/queued but not yet on a node; `running` = actively
+    executing; `completed` / `failed` are terminal. `completed` means the
+    job exited cleanly — the caller still runs `result_step` to verify the
+    output contract, which can itself fail.
+    """
+
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class StepProgressState(StrEnum):
+    """Control-plane-side write-ahead lifecycle of one work-ticket step
+    entry, persisted per `(work_ticket_idx, step_index, attempt)` in
+    `qiita.work_ticket_step`.
+
+    Distinct from `StepStatus` (a backend's live report of a submitted
+    job): this is the CP runner's *own* progress record, the spine of
+    restart recovery. `submitting` is the write-ahead intent written
+    *before* the backend submit fires; `submitted` records a returned
+    `slurm_job_id`; `running` mirrors a status poll; `completed` /
+    `failed` are terminal. Mirrored DB-side by the `state` TEXT+CHECK
+    column on `qiita.work_ticket_step` — a plain TEXT/CHECK, not a
+    Postgres ENUM (same carve-out as `upload.status` / `reference.status`;
+    out of scope for `ENUM_PAIRS`). Keep both sides in sync by hand.
+    """
+
+    SUBMITTING = "submitting"
+    SUBMITTED = "submitted"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class StudyPrepScopeTarget(BaseModel):
     """Work ticket targets a (study, prep) tuple — used for sample-processing
     actions (e.g. deblur, woltka)."""
@@ -1360,6 +1489,39 @@ class WorkTicketResponse(BaseModel):
 
     work_ticket_idx: Annotated[int, Field(gt=0)]
     state: WorkTicketState
+
+
+class WorkTicketSummary(WorkTicket):
+    """A WorkTicket plus a snapshot of its *current* step entry's compute
+    placement. Returned by `GET /api/v1/work-ticket` (the list view) so a
+    caller can see, in one round trip, not just a ticket's lifecycle state
+    but *where* its in-flight work is running and on which SLURM job.
+
+    The "current entry" is the highest `(step_index, attempt)` row in
+    `qiita.work_ticket_step` for the ticket — the entry the runner is on,
+    or the last one it finished. The five fields below are all NULL for a
+    ticket with no progress rows yet (a PENDING / QUEUED ticket whose first
+    write-ahead hasn't fired); for an in-process `action:` entry the
+    `slurm_*` fields stay NULL while `compute_target='control_plane'`.
+
+    This read is DB-backed and therefore at most one poll-interval stale
+    (the runner persists `running` on a status poll, default ~10s); the
+    `slurm_job_id` is exact. A live SLURM hop to refresh `step_state` is a
+    separate single-ticket concern, deliberately not done for the list.
+    """
+
+    # 0-based index into the action's `steps:` list, plus the entry name.
+    current_step_index: int | None = None
+    current_step_name: str | None = None
+    # Where the current entry runs (`slurm` / `local` / `control_plane`).
+    compute_target: ComputeTarget | None = None
+    # The SLURM job id — non-NULL only for a `slurm` current entry past
+    # write-ahead.
+    slurm_job_id: int | None = None
+    # The control-plane-side write-ahead lifecycle state of the current
+    # entry (the spine's StepProgressState, NOT a live SLURM-native state —
+    # see the class docstring on staleness).
+    step_state: StepProgressState | None = None
 
 
 # ============================================================================

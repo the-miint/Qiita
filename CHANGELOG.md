@@ -15,6 +15,20 @@ the `no-changelog` label).
 
 ### Added
 
+- `GET /work-ticket` — list work tickets, each with a snapshot of its current
+  step's compute placement (`compute_target`, `slurm_job_id`, `step_state`,
+  `current_step_index/name`) from a single join against the new
+  `qiita.work_ticket_step` progress table. Caller-relative by default;
+  `?all=true` (wet_lab_admin+) widens to every originator; filters `state` /
+  `active` / `limit` (#77)
+- `qiita ticket list [--state … --active --all --limit N]` — CLI over the new
+  list endpoint (#77)
+- `POST /step/find-by-name` (CP→CO) — look up live SLURM jobs by their
+  deterministic name so the runner can adopt a job it submitted but never
+  recorded the id for, instead of launching a duplicate on resume (#77)
+- `qiita.work_ticket_step` table — per-`(work_ticket_idx, step_index, attempt)`
+  write-ahead progress (compute_target, slurm_job_id, job_name, state, failure
+  surface) that is the spine of restart recovery (#77)
 - Host references for host-read filtering: `is_host` column on `qiita.reference`,
   the `reference_index` table tracking built indexes, an `indexing` reference
   status (`loading → indexing → active`), and the `host-reference-add` workflow
@@ -52,6 +66,21 @@ the `no-changelog` label).
 
 ### Changed
 
+- Decoupled compute-step execution: the orchestrator's single blocking
+  `POST /step/run` is replaced by the stateless `submit` / `status` / `result`
+  trio, and the **control plane** now owns the poll loop. A long SLURM job no
+  longer holds the CP→CO connection open, and the orchestrator keeps no
+  in-flight state between calls (the `StepHandle` it returns carries everything
+  status/result need; the CP persists it) (#77)
+- Restart recovery re-attaches instead of failing: on CP startup,
+  `reconcile_inflight_tickets` resumes every non-terminal ticket through
+  `run_workflow(resume=True)` — fast-forwarding completed entries, re-attaching
+  a live SLURM job by its persisted id (or adopting an orphan by deterministic
+  name), and deciding a purged job from its on-disk output manifest — rather
+  than the old blanket-fail of all in-flight work on every deploy (#77)
+- CO-unreachable during submit/poll/result (transport error or HTTP 5xx) is now
+  a transient `ORCHESTRATOR_UNREACHABLE` the runner retries in place, so
+  stopping the orchestrator mid-deploy never fails a running ticket (#77)
 - The SLURM backend now propagates `PATH_SCRATCH` into the compute-node job
   environment, so native steps that derive a persistent path from it (e.g.
   `build_rype_index` writing the rype `.ryxdi`) resolve the real scratch root
@@ -97,6 +126,14 @@ the `no-changelog` label).
 
 ### Fixed
 
+- Long compute steps no longer self-fail: under the old held-connection model a
+  step exceeding the 600s CP→CO client timeout tripped an httpx error that
+  skipped the retry loop and marked the ticket FAILED while the SLURM job kept
+  running. The CP-driven poll loop has no such ceiling (#77)
+- No duplicate concurrent SLURM jobs: a write-ahead progress row + deterministic
+  job name `qiita-wt{idx}-{step}-a{attempt}` let resume adopt a job whose id was
+  never persisted (via `find-by-name`) instead of re-submitting; retriable
+  failures no longer resubmit without checking the prior job (#77)
 - Assert `HumanUser` before reading `.system_role` in the sequenced-sample /
   biosample routes (closes #45) (#59)
 - Closed deploy gaps surfaced by the first user-CLI fastq-to-parquet smoke
@@ -105,5 +142,13 @@ the `no-changelog` label).
   compute-readiness` (and its SLURM probe) stops reporting a false 404 against
   a healthy deploy — the checker hit `/healthz`, which the CP never served
   (closes #67) (#69)
+
+### Removed
+
+- The legacy synchronous step path: `POST /step/run`, `ComputeBackend.run_step`
+  (+ the SLURM/Local overrides and the CO `_poll_until_terminal` poll loop),
+  `ComputeBackendClient.run_step`, and the `StepRunRequest` / `StepRunResponse`
+  wire models. The decoupled submit/status/result trio fully replaces it; CP
+  and CO must deploy together since the route contract changed (#77)
 
 [Unreleased]: https://github.com/the-miint/Qiita/commits/main

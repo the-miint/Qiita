@@ -535,7 +535,7 @@ async def _run_all_checks(
 ) -> list[CheckResult]:
     results: list[CheckResult] = []
     # Use require_cp_to_co_token=False because the diagnostic doesn't
-    # serve /step/run; we don't want a partial install (missing inbound
+    # serve /step/*; we don't want a partial install (missing inbound
     # bearer) to abort all checks before reporting anything actionable.
     try:
         settings = Settings.from_env(require_cp_to_co_token=False)

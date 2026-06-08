@@ -218,20 +218,25 @@ def call(
     path: str,
     *,
     json: dict | None = None,
-) -> dict:
+    params: dict | None = None,
+) -> dict | list:
     """Authenticated control-plane call returning the decoded JSON body.
 
     `method` is an HTTP verb ("GET", "POST", "PATCH", ...). `path` is
     the post-API-prefix segment, e.g. "/auth/whoami" or "/study"; the
     helper prepends API_PREFIX and the trailing-slash-trimmed base_url.
-    Raises httpx.HTTPStatusError on non-2xx (run_http_subcommand catches
-    that and converts to a stderr message + exit 1).
+    `params` are URL query parameters (e.g. list-endpoint filters). The
+    body is usually a JSON object, but list endpoints return a JSON array
+    — hence the `dict | list` return. Raises httpx.HTTPStatusError on
+    non-2xx (run_http_subcommand catches that and converts to a stderr
+    message + exit 1).
     """
     resp = httpx.request(
         method,
         f"{base_url.rstrip('/')}{API_PREFIX}{path}",
         headers={"Authorization": f"{BEARER_PREFIX}{token}"},
         json=json,
+        params=params,
         timeout=CLI_HTTP_TIMEOUT_SECONDS,
     )
     resp.raise_for_status()
@@ -342,12 +347,13 @@ def parse_kv_pairs(
     return result
 
 
-def run_http_subcommand(fn: Callable[[str], dict]) -> int:
+def run_http_subcommand(fn: Callable[[str], dict | list]) -> int:
     """Token-read + httpx invoke + json print, common to every HTTP subcommand.
 
-    `fn` accepts a PAT string and returns the parsed JSON body. Any
-    RuntimeError from token-read or HTTPStatusError from the request is
-    converted to a stderr message + exit code 1.
+    `fn` accepts a PAT string and returns the parsed JSON body (a dict for
+    most routes, a list for the list endpoints). Any RuntimeError from
+    token-read or HTTPStatusError from the request is converted to a stderr
+    message + exit code 1.
     """
     try:
         token = read_token()

@@ -9,8 +9,9 @@ Covers the two pure pieces of the SLURM backend:
   reports every container-contract violation. Each gate has its own
   test so a regression in one doesn't mask another.
 
-The HTTP client (slurm/client.py) and SlurmBackend.run_step (the wiring)
-are tested separately in test_slurm_client.py and test_slurm_backend.py.
+The HTTP client (slurm/client.py) and SlurmBackend's submit/status/result
+(the wiring) are tested separately in test_slurm_client.py and
+test_slurm_backend.py.
 """
 
 from __future__ import annotations
@@ -124,7 +125,19 @@ def test_payload_environment_is_sorted_for_determinism(common_kwargs):
 
 def test_payload_job_name_includes_step_and_ticket(common_kwargs):
     payload = build_job_submit_payload(**common_kwargs)
-    assert payload["job"]["name"] == "qiita-hash-wt42"
+    # Deterministic, recovery-findable name: ticket first, then step, then
+    # attempt. find_jobs_by_name keys off this exact shape to re-attach a
+    # job we submitted but whose id we may not have persisted.
+    assert payload["job"]["name"] == "qiita-wt42-hash-a0"
+
+
+def test_payload_job_name_includes_attempt(common_kwargs):
+    """A retry submits the same (ticket, step) under a fresh attempt
+    number, yielding a distinct job name that won't collide with the
+    terminal previous attempt's job."""
+    common_kwargs["attempt"] = 2
+    payload = build_job_submit_payload(**common_kwargs)
+    assert payload["job"]["name"] == "qiita-wt42-hash-a2"
 
 
 def test_payload_script_invokes_apptainer_with_bind_mounts(common_kwargs):
@@ -274,7 +287,7 @@ def test_native_payload_keeps_job_metadata(native_kwargs, baseline):
     perturb the scheduler-visible metadata."""
     payload = build_job_submit_payload(**native_kwargs)
     job = payload["job"]
-    assert job["name"] == "qiita-fastq-wt42"
+    assert job["name"] == "qiita-wt42-fastq-a0"
     assert job["account"] == "qiita-prod"
     assert job["partition"] == "qiita"
     assert job["cpus_per_task"] == baseline.cpu

@@ -80,7 +80,7 @@ async def test_local_backend_rejects_container_step():
 
     backend = LocalBackend()
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await backend.submit_step(
             "legacy_hash",
             {},
             Path("/fake"),
