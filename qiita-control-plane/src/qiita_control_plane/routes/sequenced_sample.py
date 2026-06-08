@@ -52,6 +52,7 @@ from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
     GlobalMetadataEntry,
     IdxsListResponse,
+    MetadataChecklistRef,
     SequencedSampleCreateRequest,
     SequencedSampleCreateResponse,
     SequencedSamplePatchRequest,
@@ -97,6 +98,7 @@ from ._helpers import (
     etag_for_updated_at,
     parse_kv_detail,
     raise_for_transient_write_race,
+    resolve_metadata_checklist_idx,
 )
 
 router = APIRouter(prefix=PATH_SEQUENCING_RUN_PREFIX, tags=["sequenced-sample"])
@@ -180,6 +182,12 @@ async def import_sequenced_sample_from_run(
             detail=_MSG_OWNER_NOT_ELIGIBLE,
         )
 
+        # Resolve the checklist name to its idx before the write; an
+        # unknown name surfaces as a clean 422 rather than an FK violation.
+        metadata_checklist_idx = await resolve_metadata_checklist_idx(
+            conn, body.metadata_checklist_name
+        )
+
         # Map known composer-side errors and DB-level violations to user-
         # friendly responses. Typed catches first so their detail wins.
         try:
@@ -194,7 +202,7 @@ async def import_sequenced_sample_from_run(
                 primary_study_idx=body.primary_study_idx,
                 secondary_study_idxs=body.secondary_study_idxs,
                 caller_idx=user.principal_idx,
-                metadata_checklist_idx=body.metadata_checklist_idx,
+                metadata_checklist_idx=metadata_checklist_idx,
                 ena_experiment_accession=body.ena_experiment_accession,
                 ena_run_accession=body.ena_run_accession,
             )
@@ -382,7 +390,9 @@ def _sequenced_sample_response_from_row(
             "biosample_idx": row["biosample_idx"],
             "owner_idx": row["owner_idx"],
             "prep_protocol_idx": row["prep_protocol_idx"],
-            "metadata_checklist_idx": row["metadata_checklist_idx"],
+            "metadata_checklist": MetadataChecklistRef.from_row(
+                row["metadata_checklist_idx"], row["metadata_checklist_name"]
+            ),
             "sequenced_pool_idx": row["sequenced_pool_idx"],
             "sequenced_pool_item_id": row["sequenced_pool_item_id"],
             "ena_experiment_accession": row["ena_experiment_accession"],

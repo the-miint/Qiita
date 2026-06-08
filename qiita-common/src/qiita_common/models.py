@@ -548,7 +548,7 @@ class BiosampleImportRequest(BaseModel):
     owner_biosample_id_field_name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     owner_biosample_id_value: str = Field(min_length=1)
     metadata: dict[str, str] = Field(default_factory=dict)
-    metadata_checklist_idx: Annotated[int, Field(gt=0)] | None = None
+    metadata_checklist_name: str | None = Field(default=None, min_length=1)
     biosample_accession: str | None = Field(default=None, min_length=1)
     ena_sample_accession: str | None = Field(default=None, min_length=1)
     matrix_tube_id: Annotated[
@@ -623,6 +623,24 @@ class TerminologyTermRef(BaseModel):
         return TERMINOLOGY_TERM_VALUE_COLUMN
 
 
+class MetadataChecklistRef(BaseModel):
+    """The metadata_checklist a biosample/sequenced_sample claims
+    conformance to, carrying both the idx and the name (= the ENA
+    checklist accession). Mirrors MissingReasonRef's idx+name shape.
+    """
+
+    idx: Annotated[int, Field(gt=0)]
+    name: Annotated[str, Field(min_length=1)]
+
+    @classmethod
+    def from_row(cls, idx: int | None, name: str | None) -> MetadataChecklistRef | None:
+        """Build the ref from a read row's nullable (idx, name); None idx
+        (no checklist on the row) yields None."""
+        if idx is None:
+            return None
+        return cls(idx=idx, name=name)
+
+
 class GlobalMetadataEntry(BaseModel):
     """One globally-linked metadata value for a biosample or prep_sample,
     with cosmetic context.
@@ -668,7 +686,7 @@ class BiosampleResponse(BaseModel):
 
     biosample_idx: Annotated[int, Field(gt=0)]
     owner_idx: Annotated[int, Field(gt=0)]
-    metadata_checklist_idx: int | None
+    metadata_checklist: MetadataChecklistRef | None
     biosample_accession: str | None
     ena_sample_accession: str | None
     matrix_tube_id: str | None
@@ -827,7 +845,7 @@ class BiosamplePatchRequest(PatchRequestModel):
 
     NOT_NULL_FIELDS: ClassVar[frozenset[str]] = frozenset({"owner_idx"})
 
-    metadata_checklist_idx: Annotated[int, Field(gt=0)] | None = None
+    metadata_checklist_name: str | None = Field(default=None, min_length=1)
     owner_idx: Annotated[int, Field(gt=0)] | None = None
     biosample_accession: str | None = Field(default=None, min_length=1)
     ena_sample_accession: str | None = Field(default=None, min_length=1)
@@ -1492,7 +1510,7 @@ class SequencedSampleCreateRequest(BaseModel):
     primary_study_idx: Annotated[int, Field(gt=0)]
     secondary_study_idxs: list[Annotated[int, Field(gt=0)]] = Field(default_factory=list)
     metadata: dict[str, str] = Field(default_factory=dict)
-    metadata_checklist_idx: Annotated[int, Field(gt=0)] | None = None
+    metadata_checklist_name: str | None = Field(default=None, min_length=1)
     ena_experiment_accession: str | None = Field(default=None, max_length=50)
     ena_run_accession: str | None = Field(default=None, max_length=50)
 
@@ -1547,7 +1565,7 @@ class SequencedSampleResponse(BaseModel):
     biosample_idx: Annotated[int, Field(gt=0)]
     owner_idx: Annotated[int, Field(gt=0)]
     prep_protocol_idx: Annotated[int, Field(gt=0)]
-    metadata_checklist_idx: int | None
+    metadata_checklist: MetadataChecklistRef | None
     sequenced_pool_idx: int | None
     sequenced_pool_item_id: str | None
     ena_experiment_accession: str | None

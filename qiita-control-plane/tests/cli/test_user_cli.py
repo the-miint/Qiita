@@ -578,7 +578,7 @@ def test_biosample_create_metadata_pairs_become_dict(monkeypatch):
 
 def test_biosample_create_passes_through_optional_fields(monkeypatch):
     """Tests the case where every CLI-exposed optional field
-    (metadata_checklist_idx, biosample_accession, ena_sample_accession,
+    (metadata_checklist_name, biosample_accession, ena_sample_accession,
     matrix_tube_id) flows into the POST body when supplied."""
     from qiita_control_plane.cli.user import main
 
@@ -595,8 +595,8 @@ def test_biosample_create_passes_through_optional_fields(monkeypatch):
             "owner_sample_id",
             "--owner-biosample-id-value",
             "SMK-001",
-            "--metadata-checklist-idx",
-            "3",
+            "--metadata-checklist-name",
+            "ERC000015",
             "--biosample-accession",
             "SAMN12345678",
             "--ena-sample-accession",
@@ -607,7 +607,7 @@ def test_biosample_create_passes_through_optional_fields(monkeypatch):
     )
     assert rc == 0
     body = captured["requests"][-1]["json"]
-    assert body["metadata_checklist_idx"] == 3
+    assert body["metadata_checklist_name"] == "ERC000015"
     assert body["biosample_accession"] == "SAMN12345678"
     assert body["ena_sample_accession"] == "ERS1234567"
     assert body["matrix_tube_id"] == "0123456789"
@@ -1133,7 +1133,7 @@ def test_sequenced_sample_create_explicit_owner_skips_whoami(monkeypatch):
 
 
 def test_sequenced_sample_create_metadata_checklist_passes_through(monkeypatch):
-    """--metadata-checklist-idx flows verbatim; ENA accession fields stay
+    """--metadata-checklist-name flows verbatim; ENA accession fields stay
     absent when their flags are not supplied."""
     from qiita_control_plane.cli.user import main
 
@@ -1158,13 +1158,13 @@ def test_sequenced_sample_create_metadata_checklist_passes_through(monkeypatch):
             "WELL-A1",
             "--primary-study-idx",
             "7",
-            "--metadata-checklist-idx",
-            "2",
+            "--metadata-checklist-name",
+            "ERC000015",
         ]
     )
     assert rc == 0
     body = captured["requests"][-1]["json"]
-    assert body["metadata_checklist_idx"] == 2
+    assert body["metadata_checklist_name"] == "ERC000015"
     assert "ena_experiment_accession" not in body
     assert "ena_run_accession" not in body
 

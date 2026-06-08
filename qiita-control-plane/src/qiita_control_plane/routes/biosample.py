@@ -46,6 +46,7 @@ from qiita_common.models import (
     BiosampleResponse,
     GlobalMetadataEntry,
     IdxsListResponse,
+    MetadataChecklistRef,
     Tier,
 )
 
@@ -92,6 +93,7 @@ from ._helpers import (
     require_etag_match,
     require_if_match,
     resolve_idxs_by_natural_key,
+    resolve_metadata_checklist_idx,
 )
 
 router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["biosample"])
@@ -159,6 +161,12 @@ async def import_biosample(
         # Map known composer-side validation errors and DB-level violations to
         # user-friendly 422 / 409 responses. Composer-specific exceptions are
         # caught first so their detail wins over the generic asyncpg fallbacks.
+        # Resolve the checklist name to its idx before the write; an
+        # unknown name surfaces as a clean 422 rather than an FK violation.
+        metadata_checklist_idx = await resolve_metadata_checklist_idx(
+            conn, body.metadata_checklist_name
+        )
+
         try:
             result = await import_biosample_from_owner_biosample_id(
                 conn,
@@ -168,7 +176,7 @@ async def import_biosample(
                 owner_biosample_id_value=body.owner_biosample_id_value,
                 caller_idx=user.principal_idx,
                 metadata=body.metadata,
-                metadata_checklist_idx=body.metadata_checklist_idx,
+                metadata_checklist_idx=metadata_checklist_idx,
                 biosample_accession=body.biosample_accession,
                 ena_sample_accession=body.ena_sample_accession,
                 matrix_tube_id=body.matrix_tube_id,
@@ -342,7 +350,9 @@ def _biosample_response_from_row(
         {
             "biosample_idx": row["idx"],
             "owner_idx": row["owner_idx"],
-            "metadata_checklist_idx": row["metadata_checklist_idx"],
+            "metadata_checklist": MetadataChecklistRef.from_row(
+                row["metadata_checklist_idx"], row["metadata_checklist_name"]
+            ),
             "biosample_accession": row["biosample_accession"],
             "ena_sample_accession": row["ena_sample_accession"],
             "matrix_tube_id": row["matrix_tube_id"],
@@ -605,6 +615,14 @@ async def patch_biosample(
                     conn,
                     candidate_idx=fields["owner_idx"],
                     detail=_MSG_OWNER_NOT_ELIGIBLE,
+                )
+
+            # Translate the caller-facing checklist name into the idx
+            # column update_biosample writes; an explicit null clears the
+            # checklist, an unknown name -> 422 below.
+            if "metadata_checklist_name" in fields:
+                fields["metadata_checklist_idx"] = await resolve_metadata_checklist_idx(
+                    conn, fields.pop("metadata_checklist_name")
                 )
 
             # Apply the UPDATE; the repo function returns the post-UPDATE

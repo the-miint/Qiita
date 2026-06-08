@@ -348,7 +348,10 @@ def _build_parser() -> argparse.ArgumentParser:
             " display_name; the route parses VALUE into the field's data type."
         ),
     )
-    p_biosample_create.add_argument("--metadata-checklist-idx", type=int)
+    p_biosample_create.add_argument(
+        "--metadata-checklist-name",
+        help="Checklist name the biosample claims conformance to (e.g. ERC000015)",
+    )
     p_biosample_create.add_argument(
         "--biosample-accession",
         help="External biosample accession (e.g. NCBI), if the biosample already has one",
@@ -390,7 +393,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Update editable biosample fields (PATCH /biosample/{biosample_idx})",
     )
     p_biosample_patch.add_argument("--biosample-idx", type=int, required=True)
-    p_biosample_patch.add_argument("--metadata-checklist-idx", type=int)
+    p_biosample_patch.add_argument(
+        "--metadata-checklist-name",
+        help="Checklist name the biosample claims conformance to (e.g. ERC000015)",
+    )
     p_biosample_patch.add_argument("--owner-idx", type=int)
     p_biosample_patch.add_argument("--biosample-accession")
     p_biosample_patch.add_argument("--ena-sample-accession")
@@ -520,7 +526,10 @@ def _build_parser() -> argparse.ArgumentParser:
             " display_name; the composer parses VALUE into the field's data type."
         ),
     )
-    p_seqsample_create.add_argument("--metadata-checklist-idx", type=int)
+    p_seqsample_create.add_argument(
+        "--metadata-checklist-name",
+        help="Checklist name the sample claims conformance to (e.g. ERC000015)",
+    )
     p_seqsample_create.add_argument(
         "--ena-experiment-accession",
         help="ENA experiment accession (ERX…), if this sample already has one",

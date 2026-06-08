@@ -462,6 +462,77 @@ async def test_import_sequenced_prep_sample_metadata_missing_value_persists(ctx)
 
 
 # ===========================================================================
+# Checklist name resolution (sets the composer's prep_sample checklist)
+# ===========================================================================
+
+
+async def test_post_sequenced_sample_metadata_checklist_name_resolves(ctx):
+    # A known checklist name on create resolves to its idx server-side and
+    # lands on the composer's prep_sample row. ERC000015 is seeded, so no
+    # checklist fixture is needed.
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "cl-name")
+    study_idx = await _seed_study(ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="cl")
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], study_idx=study_idx
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    checklist_idx = await ctx["pool"].fetchval(
+        "SELECT idx FROM qiita.metadata_checklist WHERE name = 'ERC000015'"
+    )
+
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        sequenced_pool_item_id=_unique_item_id("CL"),
+        primary_study_idx=study_idx,
+        metadata_checklist_name="ERC000015",
+    )
+    assert resp.status_code == 201, resp.text
+    stored = await ctx["pool"].fetchval(
+        "SELECT metadata_checklist_idx FROM qiita.prep_sample WHERE idx = $1",
+        resp.json()["prep_sample_idx"],
+    )
+    assert stored == checklist_idx
+
+
+async def test_post_sequenced_sample_unknown_metadata_checklist_name_422(ctx):
+    # A checklist name with no matching row is rejected with a clean 422
+    # before any write, rather than surfacing as an FK violation.
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "bad-cl")
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="badcl"
+    )
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], study_idx=study_idx
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    missing_name = f"ERC-missing-{secrets.token_hex(4)}"
+
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        sequenced_pool_item_id=_unique_item_id("BADCL"),
+        primary_study_idx=study_idx,
+        metadata_checklist_name=missing_name,
+    )
+    assert resp.status_code == 422
+    expected_detail = (
+        f"metadata_checklist_name {missing_name!r} does not reference an existing checklist"
+    )
+    assert resp.json()["detail"] == expected_detail
+
+
+# ===========================================================================
 # Auth / scope / role guards
 # ===========================================================================
 
@@ -1227,7 +1298,7 @@ def _expected_read_response(
         "biosample_idx": seeded["biosample_idx"],
         "owner_idx": owner_idx,
         "prep_protocol_idx": seeded["protocol_idx"],
-        "metadata_checklist_idx": None,
+        "metadata_checklist": None,
         "sequenced_pool_idx": seeded["pool_idx"],
         "sequenced_pool_item_id": seeded["item_id"],
         "ena_experiment_accession": None,

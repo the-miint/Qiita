@@ -13,6 +13,19 @@ the `no-changelog` label).
 
 ## [Unreleased]
 
+### Changed
+
+- Biosample/sequenced-sample create and biosample patch now take a checklist
+  **name** (e.g. `ERC000015`) instead of a `metadata_checklist_idx`, resolving
+  it to the idx server-side and returning a clean 422 for an unknown name —
+  mirroring how terminology term_ids resolve. CLI flag is now
+  `--metadata-checklist-name` on `biosample create`, `biosample patch`, and
+  `sequenced-sample create` (#TBD)
+- `BiosampleResponse` and `SequencedSampleResponse` now carry the checklist as
+  a `metadata_checklist` ref (`{idx, name}`, where name is the ENA accession)
+  instead of a bare `metadata_checklist_idx`, mirroring the missing-reason /
+  terminology-term read-back refs (#TBD)
+
 ### Added
 
 - ENVO terminology seed for the environmental-context biosample fields
