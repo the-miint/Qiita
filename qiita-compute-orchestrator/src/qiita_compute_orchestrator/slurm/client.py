@@ -2,7 +2,8 @@
 
 Thin by design: the client knows about HTTP and the SLURM JWT. State
 classification (mapping SLURM job states to FailureKind) lives in
-SlurmBackend.run_step where the workflow context is available.
+SlurmBackend's status_step / result_step where the workflow context is
+available.
 
 Auth model:
   - SLURM JWT is read from a file at construction time and cached on
@@ -78,11 +79,18 @@ class SlurmJobInfo:
     follows SLURM's own naming (PENDING / RUNNING / COMPLETED /
     FAILED / NODE_FAIL / OUT_OF_MEMORY / PREEMPTED / TIMEOUT /
     CANCELLED / ...) so the SlurmBackend mapping is faithful to what
-    SLURM reports."""
+    SLURM reports.
+
+    `job_id` / `name` are carried so the recovery path (`find_jobs_by_name`)
+    can match a job by its deterministic name and recover its id. They
+    default to None for the few call sites that construct a SlurmJobInfo
+    directly without them."""
 
     state: str
     exit_code: int | None
     reason: str | None
+    job_id: int | None = None
+    name: str | None = None
 
     @property
     def is_terminal(self) -> bool:
@@ -308,7 +316,37 @@ class SlurmrestdClient:
                 f"slurmrestd job/{job_id} response missing 'jobs' array: {body!r}",
                 url=url,
             )
-        job = jobs[0]
+        return self._parse_job(jobs[0], url=url)
+
+    async def find_jobs_by_name(self, name: str) -> list[SlurmJobInfo]:
+        """GET /slurm/{api_version}/jobs and return only the jobs whose
+        `name` equals `name`. Returns [] when none match (including when
+        slurmrestd has already purged the job).
+
+        Used by the control plane's idempotency / restart-recovery path:
+        a job submitted under the deterministic
+        `qiita-wt{idx}-{step}-a{attempt}` name can be re-found here even
+        if the control plane died before persisting its id. Filtering
+        happens client-side because slurmrestd's job-list route doesn't
+        take a name filter; we only parse the matching entries so an
+        unrelated job with a malformed shape can't break the lookup."""
+        url = f"/slurm/{self._api_version}/jobs"
+        body = await self._request_with_jwt_retry("GET", url)
+        jobs = body.get("jobs")
+        if not isinstance(jobs, list):
+            raise SlurmrestdError(
+                f"slurmrestd jobs response missing 'jobs' array: {body!r}",
+                url=url,
+            )
+        return [
+            self._parse_job(job, url=url)
+            for job in jobs
+            if isinstance(job, dict) and job.get("name") == name
+        ]
+
+    def _parse_job(self, job: dict[str, Any], *, url: str) -> SlurmJobInfo:
+        """Parse one slurmrestd job object into a SlurmJobInfo. Shared by
+        get_job (single) and find_jobs_by_name (filtered list)."""
         # job_state in v0.0.40+ is a list (multiple states can apply at
         # once, e.g. ["RUNNING", "COMPLETING"]). Pick the first one as
         # the "primary" — sufficient for terminal vs non-terminal
@@ -320,7 +358,7 @@ class SlurmrestdClient:
             state = raw_state
         else:
             raise SlurmrestdError(
-                f"slurmrestd job/{job_id} response missing job_state: {job!r}",
+                f"slurmrestd job response missing job_state: {job!r}",
                 url=url,
             )
         # exit_code shape varies by SLURM version; v0.0.40+ wraps
@@ -337,7 +375,11 @@ class SlurmrestdClient:
             # not the JSON null. Normalize so callers don't treat it as
             # a real reason string.
             reason = None
-        return SlurmJobInfo(state=state, exit_code=exit_code, reason=reason)
+        job_id = job.get("job_id") if isinstance(job.get("job_id"), int) else None
+        name = job.get("name") if isinstance(job.get("name"), str) else None
+        return SlurmJobInfo(
+            state=state, exit_code=exit_code, reason=reason, job_id=job_id, name=name
+        )
 
     # ------------------------------------------------------------------
     # HTTP helpers

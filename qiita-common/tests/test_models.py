@@ -248,14 +248,14 @@ def test_feature_hash_entry_rejects_id_without_source():
         )
 
 
-# --- StepRunRequest runtime-selection validator ---------------------------
+# --- StepSubmitRequest runtime-selection validator ---------------------------
 # Mirrors WorkflowStep's exactly-one(container, module) rule at the wire
 # boundary. Pydantic raises a 422 at FastAPI deserialization, before any
 # backend code runs — single enforcement point, no per-backend drift risk.
 
 
-def _minimal_step_run_kwargs() -> dict:
-    """Smallest valid kwargs for StepRunRequest — container form."""
+def _minimal_step_submit_kwargs() -> dict:
+    """Smallest valid kwargs for StepSubmitRequest — container form."""
     return dict(
         step_name="hash",
         inputs={"fasta_path": "/data/in.fa"},
@@ -266,67 +266,132 @@ def _minimal_step_run_kwargs() -> dict:
     )
 
 
-def test_step_run_request_container_form_validates():
-    from qiita_common.models import StepRunRequest
+def test_step_submit_request_container_form_validates():
+    from qiita_common.models import StepSubmitRequest
 
-    req = StepRunRequest(**_minimal_step_run_kwargs())
+    req = StepSubmitRequest(**_minimal_step_submit_kwargs())
     assert req.container == REFERENCE_HASH_CONTAINER
     assert req.module is None
 
 
-def test_step_run_request_module_form_validates():
-    from qiita_common.models import StepRunRequest
+def test_step_submit_request_module_form_validates():
+    from qiita_common.models import StepSubmitRequest
 
-    kwargs = _minimal_step_run_kwargs()
+    kwargs = _minimal_step_submit_kwargs()
     del kwargs["container"]
     kwargs["module"] = FASTQ_TO_PARQUET_MODULE
-    req = StepRunRequest(**kwargs)
+    req = StepSubmitRequest(**kwargs)
     assert req.module == FASTQ_TO_PARQUET_MODULE
     assert req.container is None
 
 
-def test_step_run_request_rejects_both_container_and_module():
-    from qiita_common.models import StepRunRequest
+def test_step_submit_request_rejects_both_container_and_module():
+    from qiita_common.models import StepSubmitRequest
 
-    kwargs = _minimal_step_run_kwargs()
+    kwargs = _minimal_step_submit_kwargs()
     kwargs["module"] = "qiita_compute_orchestrator.jobs.x"
     with pytest.raises(ValidationError) as exc_info:
-        StepRunRequest(**kwargs)
+        StepSubmitRequest(**kwargs)
     assert "exactly one" in str(exc_info.value)
 
 
-def test_step_run_request_rejects_neither_container_nor_module():
-    from qiita_common.models import StepRunRequest
+def test_step_submit_request_rejects_neither_container_nor_module():
+    from qiita_common.models import StepSubmitRequest
 
-    kwargs = _minimal_step_run_kwargs()
+    kwargs = _minimal_step_submit_kwargs()
     del kwargs["container"]
     with pytest.raises(ValidationError) as exc_info:
-        StepRunRequest(**kwargs)
+        StepSubmitRequest(**kwargs)
     assert "exactly one" in str(exc_info.value)
 
 
-def test_step_run_request_rejects_entrypoint_without_container():
-    from qiita_common.models import StepRunRequest
+def test_step_submit_request_defaults_attempt_and_validates_runtime():
+    from qiita_common.models import StepSubmitRequest
 
-    kwargs = _minimal_step_run_kwargs()
+    req = StepSubmitRequest(**_minimal_step_submit_kwargs())
+    assert req.attempt == 0
+    assert req.container == REFERENCE_HASH_CONTAINER
+    assert req.module is None
+
+
+def test_step_submit_request_carries_attempt():
+    from qiita_common.models import StepSubmitRequest
+
+    req = StepSubmitRequest(attempt=3, **_minimal_step_submit_kwargs())
+    assert req.attempt == 3
+
+
+def test_step_submit_request_rejects_negative_attempt():
+    from qiita_common.models import StepSubmitRequest
+
+    with pytest.raises(ValidationError):
+        StepSubmitRequest(attempt=-1, **_minimal_step_submit_kwargs())
+
+
+def test_step_submit_request_rejects_both_runtimes():
+    from qiita_common.models import StepSubmitRequest
+
+    kwargs = _minimal_step_submit_kwargs()
+    kwargs["module"] = "qiita_compute_orchestrator.jobs.x"
+    with pytest.raises(ValidationError) as exc_info:
+        StepSubmitRequest(**kwargs)
+    assert "exactly one" in str(exc_info.value)
+
+
+def test_step_handle_wire_roundtrips():
+    from qiita_common.models import ComputeTarget, StepHandleWire
+
+    wire = StepHandleWire(
+        compute_target=ComputeTarget.SLURM,
+        step_name="hash",
+        slurm_job_id=7,
+        job_name="qiita-wt9-hash-a0",
+        output_path="/ws/output",
+        logs_path="/ws/logs",
+    )
+    again = StepHandleWire.model_validate(wire.model_dump())
+    assert again == wire
+    # A local handle carries outputs and no job id.
+    local = StepHandleWire(
+        compute_target=ComputeTarget.LOCAL,
+        step_name="fastq",
+        terminal_outputs={"result": "/ws/result.parquet"},
+    )
+    assert local.slurm_job_id is None
+    assert StepHandleWire.model_validate(local.model_dump()) == local
+
+
+def test_step_status_wire_roundtrips():
+    from qiita_common.models import StepStatus, StepStatusWire
+
+    wire = StepStatusWire(status=StepStatus.RUNNING, raw_state="RUNNING")
+    again = StepStatusWire.model_validate(wire.model_dump())
+    assert again.status == StepStatus.RUNNING
+    assert again.exit_code is None
+
+
+def test_step_submit_request_rejects_entrypoint_without_container():
+    from qiita_common.models import StepSubmitRequest
+
+    kwargs = _minimal_step_submit_kwargs()
     del kwargs["container"]
     kwargs["module"] = "qiita_compute_orchestrator.jobs.x"
     kwargs["entrypoint"] = "/bin/sh"
     with pytest.raises(ValidationError) as exc_info:
-        StepRunRequest(**kwargs)
+        StepSubmitRequest(**kwargs)
     assert "entrypoint" in str(exc_info.value).lower()
 
 
-def test_step_run_request_entrypoint_with_container_ok():
-    from qiita_common.models import StepRunRequest
+def test_step_submit_request_entrypoint_with_container_ok():
+    from qiita_common.models import StepSubmitRequest
 
-    kwargs = _minimal_step_run_kwargs()
+    kwargs = _minimal_step_submit_kwargs()
     kwargs["entrypoint"] = "/usr/local/bin/qiita-hash"
-    req = StepRunRequest(**kwargs)
+    req = StepSubmitRequest(**kwargs)
     assert req.entrypoint == "/usr/local/bin/qiita-hash"
 
 
-# --- StepRunRequest scope_target discriminated-union validator -----------
+# --- StepSubmitRequest scope_target discriminated-union validator -----------
 # `_validate_scope_target` delegates to the ScopeTarget union; these tests
 # ensure each kind validates with its required scalars, that the dispatch
 # discriminator is enforced, and that per-kind required idx fields can't
@@ -334,25 +399,25 @@ def test_step_run_request_entrypoint_with_container_ok():
 # pin scope_target = {"kind": "reference", "reference_idx": 1}).
 
 
-def test_step_run_request_scope_target_prep_sample_validates():
-    from qiita_common.models import StepRunRequest
+def test_step_submit_request_scope_target_prep_sample_validates():
+    from qiita_common.models import StepSubmitRequest
 
-    kwargs = _minimal_step_run_kwargs()
+    kwargs = _minimal_step_submit_kwargs()
     kwargs["scope_target"] = {"kind": "prep_sample", "prep_sample_idx": 42}
     # Native form pairs naturally with the prep_sample target shape
     # (fastq_to_parquet is the canonical native+prep_sample step).
     del kwargs["container"]
     kwargs["module"] = FASTQ_TO_PARQUET_MODULE
-    req = StepRunRequest(**kwargs)
+    req = StepSubmitRequest(**kwargs)
     assert req.scope_target == {"kind": "prep_sample", "prep_sample_idx": 42}
 
 
-def test_step_run_request_scope_target_study_prep_validates():
-    from qiita_common.models import StepRunRequest
+def test_step_submit_request_scope_target_study_prep_validates():
+    from qiita_common.models import StepSubmitRequest
 
-    kwargs = _minimal_step_run_kwargs()
+    kwargs = _minimal_step_submit_kwargs()
     kwargs["scope_target"] = {"kind": "study_prep", "study_idx": 7, "prep_idx": 11}
-    req = StepRunRequest(**kwargs)
+    req = StepSubmitRequest(**kwargs)
     assert req.scope_target == {"kind": "study_prep", "study_idx": 7, "prep_idx": 11}
 
 
@@ -381,13 +446,15 @@ def test_step_run_request_scope_target_study_prep_validates():
         ({}, "kind"),
     ],
 )
-def test_step_run_request_scope_target_rejects_invalid_shapes(bad_scope_target, expected_in_error):
-    from qiita_common.models import StepRunRequest
+def test_step_submit_request_scope_target_rejects_invalid_shapes(
+    bad_scope_target, expected_in_error
+):
+    from qiita_common.models import StepSubmitRequest
 
-    kwargs = _minimal_step_run_kwargs()
+    kwargs = _minimal_step_submit_kwargs()
     kwargs["scope_target"] = bad_scope_target
     with pytest.raises(ValidationError) as exc_info:
-        StepRunRequest(**kwargs)
+        StepSubmitRequest(**kwargs)
     assert expected_in_error in str(exc_info.value)
 
 

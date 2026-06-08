@@ -293,7 +293,7 @@ def parse_outputs_map(output_path: Path) -> dict[str, Path]:
     list — this helper assumes the contract holds.
 
     Raises FileNotFoundError if manifest.json is missing or unreadable.
-    Caller is the orchestrator's run_step, which catches and wraps as
+    Caller is the orchestrator's result_step, which catches and wraps as
     CONTRACT_VIOLATION (the verifier should already have caught this,
     but defense in depth)."""
     manifest = json.loads((output_path / MANIFEST_FILENAME).read_text())

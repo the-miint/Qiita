@@ -1,11 +1,9 @@
 """Tests for LocalBackend's `module:` (native-step) dispatch path.
 
-LocalBackend.run_step has two branches:
+LocalBackend.submit_step (which runs the module in-process at submit time)
+has two branches:
 
-- Container form (name-dispatch on "hash" / "load"): exercised by
-  test_hash_job.py and test_load_job.py, which run the real
-  DuckDB+miint helpers (and require the miint extension to be
-  installable on the host).
+- Container form: rejected — container execution lives on SlurmBackend.
 - Native form (`module` kwarg set): delegates to
   `qiita_compute_orchestrator.jobs.run_native_job`. This file covers
   that branch with a stub job injected into sys.modules — the same
@@ -50,7 +48,8 @@ def _install_stub(monkeypatch, *, short_name: str, execute_fn) -> str:
 
 async def test_dispatches_to_native_module(monkeypatch, tmp_path):
     """The module's execute() is invoked with validated Inputs and the
-    workspace; its return value flows back as LocalBackend's output."""
+    workspace; its return value flows back as the terminal handle's outputs
+    (LocalBackend runs the module in-process at submit time)."""
     captured: list[tuple] = []
 
     async def execute(inputs, workspace):
@@ -62,7 +61,7 @@ async def test_dispatches_to_native_module(monkeypatch, tmp_path):
     full = _install_stub(monkeypatch, short_name="local_dispatch", execute_fn=execute)
     backend = LocalBackend()
 
-    outputs = await backend.run_step(
+    handle = await backend.submit_step(
         "fastq",
         {"fastq_path": tmp_path / "in.fa"},
         tmp_path,
@@ -71,13 +70,96 @@ async def test_dispatches_to_native_module(monkeypatch, tmp_path):
         module=full,
     )
 
-    assert outputs == {"result": tmp_path / "result.parquet"}
+    assert handle.terminal_outputs == {"result": tmp_path / "result.parquet"}
     assert len(captured) == 1
     inputs, workspace = captured[0]
     assert inputs.fastq_path == tmp_path / "in.fa"
     assert inputs.reference_idx == 7
     assert inputs.work_ticket_idx == 99
     assert workspace == tmp_path
+
+
+async def test_submit_status_result_runs_synchronously(monkeypatch, tmp_path):
+    """LocalBackend implements the decoupled interface as a synchronous
+    backend: submit_step runs the native job to completion and returns a
+    terminal handle (compute_target=local, no SLURM job id, outputs in
+    hand); status_step is immediately COMPLETED; result_step returns the
+    captured outputs. This is what lets the runner treat local and SLURM
+    uniformly without lying about a non-existent job id."""
+    from qiita_common.models import ComputeTarget, StepStatus
+
+    async def execute(inputs, workspace):
+        out = workspace / "result.parquet"
+        out.write_bytes(b"FAKE")
+        return {"result": out}
+
+    full = _install_stub(monkeypatch, short_name="sync_iface", execute_fn=execute)
+    backend = LocalBackend()
+
+    handle = await backend.submit_step(
+        "fastq",
+        {"fastq_path": tmp_path / "in.fa"},
+        tmp_path,
+        scope_target={"kind": "reference", "reference_idx": 7},
+        work_ticket_idx=99,
+        module=full,
+    )
+    assert handle.compute_target == ComputeTarget.LOCAL
+    assert handle.slurm_job_id is None
+    assert handle.job_name is None
+    assert handle.terminal_outputs == {"result": tmp_path / "result.parquet"}
+
+    info = await backend.status_step(handle)
+    assert info.status == StepStatus.COMPLETED
+
+    outputs = await backend.result_step(handle, info)
+    assert outputs == {"result": tmp_path / "result.parquet"}
+
+
+async def test_find_jobs_by_name_always_empty():
+    """LocalBackend never submits to SLURM, so there is never an orphaned
+    job to find — find_jobs_by_name is always empty (interface parity so the
+    CP→CO route works against either backend without an isinstance check)."""
+    backend = LocalBackend()
+    assert await backend.find_jobs_by_name("qiita-wt1-fastq-a0") == []
+
+
+async def test_result_step_raises_on_non_completed_status(tmp_path):
+    """LocalBackend.result_step honors the ABC contract: a non-COMPLETED
+    status is a caller bug and raises, rather than silently returning
+    outputs for a step that didn't succeed."""
+    from qiita_common.models import ComputeTarget, StepStatus
+
+    from qiita_compute_orchestrator.backend import StepHandle, StepStatusInfo
+
+    backend = LocalBackend()
+    handle = StepHandle(
+        compute_target=ComputeTarget.LOCAL,
+        step_name="x",
+        terminal_outputs={"a": tmp_path / "a"},
+    )
+    with pytest.raises(BackendFailure) as ei:
+        await backend.result_step(handle, StepStatusInfo(status=StepStatus.FAILED))
+    assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
+    assert "non-COMPLETED" in ei.value.reason
+
+
+async def test_submit_step_rejects_container(tmp_path):
+    """The decoupled entry point keeps LocalBackend's container refusal —
+    a container-shaped submit is a contract violation at submit_step, not
+    a silent SLURM bypass."""
+    backend = LocalBackend()
+    with pytest.raises(BackendFailure) as ei:
+        await backend.submit_step(
+            "legacy",
+            {},
+            tmp_path,
+            scope_target={"kind": "reference", "reference_idx": 1},
+            work_ticket_idx=1,
+            container="qiita/test:1.0.0",
+        )
+    assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
+    assert "container" in ei.value.reason.lower()
 
 
 async def test_bad_prefix_maps_to_contract_violation(tmp_path):
@@ -87,7 +169,7 @@ async def test_bad_prefix_maps_to_contract_violation(tmp_path):
     backend = LocalBackend()
 
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await backend.submit_step(
             "x",
             {},
             tmp_path,
@@ -107,7 +189,7 @@ async def test_rejects_both_container_and_module(tmp_path):
     backend = LocalBackend()
 
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await backend.submit_step(
             "x",
             {},
             tmp_path,
@@ -128,7 +210,7 @@ async def test_rejects_neither_container_nor_module(tmp_path):
     backend = LocalBackend()
 
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await backend.submit_step(
             "hash",
             {},
             tmp_path,
@@ -155,7 +237,7 @@ async def test_rejects_inputs_overlap_with_framework_scalars(reserved_key, monke
     backend = LocalBackend()
 
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await backend.submit_step(
             "fastq",
             # The step's input map happens to declare a name that
             # shadows the framework scalar — the helper rejects.
@@ -182,7 +264,7 @@ async def test_dispatcher_failures_propagate_through_local_backend(monkeypatch, 
     backend = LocalBackend()
 
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await backend.submit_step(
             "x",
             {"fastq_path": tmp_path / "in.fa"},
             tmp_path,

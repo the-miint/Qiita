@@ -64,6 +64,7 @@ from qiita_common.models import (
     Tier,
     UserUpdate,
     WorkTicketCreateRequest,
+    WorkTicketState,
 )
 
 from . import _common
@@ -178,6 +179,32 @@ def _get_work_ticket(base_url: str, token: str, work_ticket_idx: int) -> dict:
     state, action info, scope_target, action_context, retry accounting,
     failure surface, timestamps. Auth: originator or wet_lab_admin+."""
     return _common.call("GET", base_url, token, f"{PATH_WORK_TICKET_PREFIX}/{work_ticket_idx}")
+
+
+def _list_work_tickets(
+    base_url: str,
+    token: str,
+    *,
+    state: str | None,
+    active: bool,
+    all_tickets: bool,
+    limit: int | None,
+) -> list:
+    """GET /api/v1/work-ticket. Returns a list of WorkTicketSummary records —
+    each ticket plus its current step's compute_target / slurm_job_id /
+    step_state. Scope: the caller's own tickets, or all originators' with
+    `all_tickets` (wet_lab_admin+). Query params are sent only when set so
+    the server's defaults (own, all states, limit 50) apply otherwise."""
+    params: dict[str, str] = {}
+    if state is not None:
+        params["state"] = state
+    if active:
+        params["active"] = "true"
+    if all_tickets:
+        params["all"] = "true"
+    if limit is not None:
+        params["limit"] = str(limit)
+    return _common.call("GET", base_url, token, PATH_WORK_TICKET_PREFIX, params=params)
 
 
 def _lookup_accessions(
@@ -494,6 +521,33 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_ticket_status.set_defaults(handler=_handle_ticket_status)
 
+    p_ticket_list = p_ticket_sub.add_parser(
+        "list",
+        help="List work-tickets with their current compute placement (GET /work-ticket)",
+    )
+    p_ticket_list.add_argument(
+        "--state",
+        choices=[s.value for s in WorkTicketState],
+        help="Filter to a single lifecycle state.",
+    )
+    p_ticket_list.add_argument(
+        "--active",
+        action="store_true",
+        help="Only non-terminal tickets (pending / queued / processing).",
+    )
+    p_ticket_list.add_argument(
+        "--all",
+        dest="all_tickets",
+        action="store_true",
+        help="All originators' tickets (requires wet_lab_admin+); default is your own.",
+    )
+    p_ticket_list.add_argument(
+        "--limit",
+        type=int,
+        help="Max tickets to return (server default 50, max 500).",
+    )
+    p_ticket_list.set_defaults(handler=_handle_ticket_list)
+
     p_reference = sub.add_parser("reference", help="Reference-data lifecycle operations")
     p_reference_sub = p_reference.add_subparsers(dest="reference_cmd", required=True)
     p_reference_load = p_reference_sub.add_parser(
@@ -795,6 +849,23 @@ def _handle_ticket_status(args: argparse.Namespace, parser: argparse.ArgumentPar
     (state, retry_count, failure_*, timestamps) without a second call."""
     return _common.run_http_subcommand(
         lambda t: _get_work_ticket(args.base_url, t, args.work_ticket_idx)
+    )
+
+
+def _handle_ticket_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """List work-tickets (your own by default, or every originator's with
+    --all for wet_lab_admin+). Prints the full summary list so a poller sees
+    each ticket's state plus its current step's compute_target / slurm_job_id
+    / step_state in one call."""
+    return _common.run_http_subcommand(
+        lambda t: _list_work_tickets(
+            args.base_url,
+            t,
+            state=args.state,
+            active=args.active,
+            all_tickets=args.all_tickets,
+            limit=args.limit,
+        )
     )
 
 

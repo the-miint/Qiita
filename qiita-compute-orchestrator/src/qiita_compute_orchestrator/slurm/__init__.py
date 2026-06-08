@@ -11,9 +11,10 @@ Split into three concerns, each unit-testable in isolation:
 - `client`: thin httpx wrapper around slurmrestd's submit / get-status
   routes, plus JWT loading and refresh.
 
-`SlurmBackend.run_step` (in backends/slurm.py) wires them together:
-write `params.json` => submit via client => poll until terminal =>
-verify output => return name => path map.
+`SlurmBackend`'s submit_step / status_step / result_step (in
+backends/slurm.py) wire them together: submit_step writes `params.json` =>
+submits via client; the CP polls status_step until terminal; result_step
+verifies output => returns the name => path map.
 """
 
 from .client import (

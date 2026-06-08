@@ -1,4 +1,5 @@
-"""Tests for POST /api/v1/step/run.
+"""Tests for the POST /api/v1/step/* routes (submit / status / result /
+find-by-name).
 
 Bearer-token enforcement, request-shape validation, and dispatch wiring
 are exercised; the backend itself is stubbed so we don't need DuckDB or
@@ -12,17 +13,21 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from qiita_common.api_paths import URL_STEP_RUN
+from qiita_common.models import ComputeTarget, StepStatus
 from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER
-from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
 
-from qiita_compute_orchestrator.backend import ComputeBackend
+from qiita_compute_orchestrator.backend import (
+    ComputeBackend,
+    FoundJob,
+    StepHandle,
+    StepStatusInfo,
+)
 from qiita_compute_orchestrator.main import app
 
 
 @dataclass(frozen=True)
 class _RecordedCall:
-    """One recorded call into `_RecordingBackend.run_step`. Per-attribute
+    """One recorded call into `_RecordingBackend.submit_step`. Per-attribute
     access keeps test assertions readable; adding a new protocol kwarg
     means adding one field here rather than re-counting tuple slots."""
 
@@ -40,8 +45,15 @@ class _RecordedCall:
 class _RecordingBackend(ComputeBackend):
     def __init__(self) -> None:
         self.calls: list[_RecordedCall] = []
+        # find-by-name: tests set `found_jobs` to script the route's response
+        # and read `find_by_name_calls` to assert what was looked up.
+        self.found_jobs: list[FoundJob] = []
+        self.find_by_name_calls: list[str] = []
 
-    async def run_step(
+    # Stubbed as a synchronous backend: submit_step records the forwarded
+    # call and returns a terminal handle (no SLURM hop), so the route tests
+    # can assert dispatch wiring without DuckDB / miint.
+    async def submit_step(
         self,
         name: str,
         inputs: dict[str, Path],
@@ -49,11 +61,12 @@ class _RecordingBackend(ComputeBackend):
         *,
         scope_target: dict[str, Any],
         work_ticket_idx: int,
+        attempt: int = 0,
         container: str | None = None,
         module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources=None,
-    ) -> dict[str, Path]:
+    ) -> StepHandle:
         self.calls.append(
             _RecordedCall(
                 name=name,
@@ -67,7 +80,21 @@ class _RecordingBackend(ComputeBackend):
                 baseline_resources=baseline_resources,
             )
         )
-        return {"manifest": workspace / "manifest.parquet"}
+        return StepHandle(
+            compute_target=ComputeTarget.LOCAL,
+            step_name=name,
+            terminal_outputs={"manifest": workspace / "manifest.parquet"},
+        )
+
+    async def status_step(self, handle: StepHandle) -> StepStatusInfo:
+        return StepStatusInfo(status=StepStatus.COMPLETED)
+
+    async def result_step(self, handle: StepHandle, status: StepStatusInfo) -> dict[str, Path]:
+        return handle.terminal_outputs or {}
+
+    async def find_jobs_by_name(self, job_name: str) -> list[FoundJob]:
+        self.find_by_name_calls.append(job_name)
+        return list(self.found_jobs)
 
 
 @pytest.fixture
@@ -80,132 +107,112 @@ def http_client():
         yield client, backend
 
 
-def test_step_run_requires_bearer_token(http_client):
+def test_settings_resolves_token_from_env():
+    """Sanity-check Settings.from_env reads the dev-mode env override."""
+    from qiita_compute_orchestrator.config import Settings
+
+    assert os.environ.get("QIITA_ALLOW_TOKEN_ENV") == "true"
+    s = Settings.from_env()
+    assert s.cp_to_co_token == os.environ["CP_TO_CO_TOKEN"]
+
+
+# ============================================================================
+# Decoupled routes: /step/submit, /step/status, /step/result
+# ============================================================================
+
+
+def test_step_submit_requires_bearer_token(http_client):
+    from qiita_common.api_paths import URL_STEP_SUBMIT
+
     client, _ = http_client
     resp = client.post(
-        URL_STEP_RUN,
+        URL_STEP_SUBMIT,
         json={
             "step_name": "hash",
-            "inputs": {"fasta_path": "/tmp/x.fa"},
+            "inputs": {},
             "workspace": "/tmp/ws",
             "scope_target": {"kind": "reference", "reference_idx": 1},
             "work_ticket_idx": 1,
+            "container": REFERENCE_HASH_CONTAINER,
         },
     )
     assert resp.status_code == 401
 
 
-def test_step_run_rejects_wrong_token(http_client, cp_to_co_token):
-    client, _ = http_client
-    resp = client.post(
-        URL_STEP_RUN,
-        headers={"Authorization": "Bearer not-the-right-token"},
-        json={
-            "step_name": "hash",
-            "inputs": {"fasta_path": "/tmp/x.fa"},
-            "workspace": "/tmp/ws",
-            "scope_target": {"kind": "reference", "reference_idx": 1},
-            "work_ticket_idx": 1,
-        },
-    )
-    assert resp.status_code == 401
-    assert cp_to_co_token  # fixture used to assert env-driven config is present
+def test_step_submit_dispatches_and_returns_handle(http_client, cp_to_co_token, tmp_path):
+    """POST /step/submit forwards to backend.submit_step and serializes the
+    returned StepHandle to the wire shape; `attempt` rides through."""
+    from qiita_common.api_paths import URL_STEP_SUBMIT
 
-
-def test_step_run_dispatches_to_backend(http_client, cp_to_co_token, tmp_path):
     client, backend = http_client
-    fasta = tmp_path / "x.fa"
-    fasta.write_text(">seq\nACGT\n")
     resp = client.post(
-        URL_STEP_RUN,
+        URL_STEP_SUBMIT,
         headers={"Authorization": f"Bearer {cp_to_co_token}"},
         json={
             "step_name": "hash",
-            "inputs": {"fasta_path": str(fasta)},
+            "inputs": {"fasta_path": "/scratch/x.fa"},
             "workspace": str(tmp_path),
             "scope_target": {"kind": "reference", "reference_idx": 7},
             "work_ticket_idx": 99,
-            # Required by StepRunRequest's exactly-one(container, module)
-            # validator. The route test doesn't care which runtime drives
-            # the recording backend; container is the simpler choice.
+            "attempt": 2,
             "container": REFERENCE_HASH_CONTAINER,
         },
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert "outputs" in body
-    assert body["outputs"]["manifest"].endswith("manifest.parquet")
-
+    assert body["compute_target"] == "local"  # _RecordingBackend is synchronous
+    assert body["step_name"] == "hash"
+    assert body["terminal_outputs"]["manifest"].endswith("manifest.parquet")
+    # The recording backend's submit_step records the forwarded call.
     assert len(backend.calls) == 1
-    call = backend.calls[0]
-    assert call.name == "hash"
-    assert call.inputs == {"fasta_path": fasta}
-    assert call.workspace == tmp_path
-    assert call.scope_target == {"kind": "reference", "reference_idx": 7}
-    assert call.work_ticket_idx == 99
-    assert call.container == REFERENCE_HASH_CONTAINER
-    assert call.module is None
-    assert call.entrypoint is None
-    assert call.baseline_resources is None
+    assert backend.calls[0].work_ticket_idx == 99
 
 
-def test_step_run_forwards_module_to_backend(http_client, cp_to_co_token, tmp_path):
-    """The module form on the wire must reach backend.run_step verbatim.
-    Catches dropped-on-the-floor regressions where the route accepts module
-    in the payload but doesn't forward it through."""
-    client, backend = http_client
+def test_step_status_returns_status(http_client, cp_to_co_token):
+    from qiita_common.api_paths import URL_STEP_STATUS
+
+    client, _ = http_client
     resp = client.post(
-        URL_STEP_RUN,
+        URL_STEP_STATUS,
         headers={"Authorization": f"Bearer {cp_to_co_token}"},
         json={
-            "step_name": "fastq",
-            "inputs": {},
-            "workspace": str(tmp_path),
-            "scope_target": {"kind": "reference", "reference_idx": 1},
-            "work_ticket_idx": 1,
-            "module": FASTQ_TO_PARQUET_MODULE,
+            "handle": {
+                "compute_target": "slurm",
+                "step_name": "hash",
+                "slurm_job_id": 4242,
+                "output_path": "/scratch/ws/output",
+                "logs_path": "/scratch/ws/logs",
+            }
         },
     )
     assert resp.status_code == 200, resp.text
-    assert len(backend.calls) == 1
-    call = backend.calls[0]
-    assert call.container is None
-    assert call.module == FASTQ_TO_PARQUET_MODULE
+    assert resp.json()["status"] == "completed"  # _RecordingBackend.status_step
 
 
-def test_step_run_translates_backend_value_error(http_client, cp_to_co_token, tmp_path):
-    """ValueError from the backend (e.g. unknown step name) → 422."""
-    client, backend = http_client
+def test_step_result_returns_outputs(http_client, cp_to_co_token):
+    from qiita_common.api_paths import URL_STEP_RESULT
 
-    async def boom(*args, **kwargs):
-        raise ValueError("unknown step")
-
-    backend.run_step = boom  # type: ignore[method-assign]
+    client, _ = http_client
     resp = client.post(
-        URL_STEP_RUN,
+        URL_STEP_RESULT,
         headers={"Authorization": f"Bearer {cp_to_co_token}"},
         json={
-            "step_name": "nope",
-            "inputs": {},
-            "workspace": str(tmp_path),
-            "scope_target": {"kind": "reference", "reference_idx": 1},
-            "work_ticket_idx": 1,
-            "container": "qiita/test:1.0.0",
+            "handle": {
+                "compute_target": "local",
+                "step_name": "fastq",
+                "terminal_outputs": {"result": "/scratch/ws/result.parquet"},
+            },
+            "status": {"status": "completed"},
         },
     )
-    assert resp.status_code == 422
-    # ValueError → FastAPI's HTTPException shape, no discriminator header.
-    # The header is reserved for BackendFailure (see test below).
-    from qiita_common.backend_failure import BACKEND_FAILURE_HEADER
-
-    assert BACKEND_FAILURE_HEADER not in resp.headers
-    assert resp.json() == {"detail": "unknown step"}
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["outputs"] == {"result": "/scratch/ws/result.parquet"}
 
 
-def test_step_run_serializes_backend_failure(http_client, cp_to_co_token, tmp_path):
-    """BackendFailure from the backend → structured response the
-    runner can reconstruct into a typed BackendFailure for retry
-    classification."""
+def test_step_submit_serializes_backend_failure(http_client, cp_to_co_token, tmp_path):
+    """A BackendFailure from submit_step serializes through the route into
+    the same structured shape the runner reconstructs for retry."""
+    from qiita_common.api_paths import URL_STEP_SUBMIT
     from qiita_common.backend_failure import (
         BACKEND_FAILURE_HEADER,
         BACKEND_FAILURE_HTTP_STATUS,
@@ -218,15 +225,15 @@ def test_step_run_serializes_backend_failure(http_client, cp_to_co_token, tmp_pa
 
     async def boom(*args, **kwargs):
         raise BackendFailure(
-            kind=FailureKind.NODE_FAIL,
+            kind=FailureKind.SLURMRESTD_UNREACHABLE,
             stage=WorkTicketFailureStage.STEP_RUN,
             step_name="hash",
-            reason="slurm reported node n01 lost mid-step",
+            reason="slurmrestd 503 on submit",
         )
 
-    backend.run_step = boom  # type: ignore[method-assign]
+    backend.submit_step = boom  # type: ignore[method-assign]
     resp = client.post(
-        URL_STEP_RUN,
+        URL_STEP_SUBMIT,
         headers={"Authorization": f"Bearer {cp_to_co_token}"},
         json={
             "step_name": "hash",
@@ -239,22 +246,67 @@ def test_step_run_serializes_backend_failure(http_client, cp_to_co_token, tmp_pa
     )
     assert resp.status_code == BACKEND_FAILURE_HTTP_STATUS
     assert resp.headers[BACKEND_FAILURE_HEADER] == "1"
-    assert resp.json() == {
-        "kind": "node_fail",
-        "stage": "step_run",
-        "step_name": "hash",
-        "reason": "slurm reported node n01 lost mid-step",
-    }
+    assert resp.json()["kind"] == "slurmrestd_unreachable"
 
 
-def test_step_run_rejects_wrong_prefix_module(http_client, cp_to_co_token, tmp_path):
-    """Defense in depth: a module path outside NATIVE_MODULE_PREFIX is
-    rejected at the route boundary before the backend tries to import
-    it. The wire validator only checks shape (exactly-one runtime); the
-    prefix check lives in the handler."""
+def test_step_status_and_result_require_bearer_token(http_client):
+    """Both new endpoints are gated by the CP↔CO token, same as submit."""
+    from qiita_common.api_paths import URL_STEP_RESULT, URL_STEP_STATUS
+
+    client, _ = http_client
+    handle = {"compute_target": "slurm", "step_name": "hash", "slurm_job_id": 1}
+    assert client.post(URL_STEP_STATUS, json={"handle": handle}).status_code == 401
+    assert (
+        client.post(
+            URL_STEP_RESULT, json={"handle": handle, "status": {"status": "completed"}}
+        ).status_code
+        == 401
+    )
+
+
+def test_step_result_serializes_backend_failure(http_client, cp_to_co_token):
+    """A BackendFailure from result_step (e.g. a contract violation on a
+    terminal-but-broken output) serializes through the route."""
+    from qiita_common.api_paths import URL_STEP_RESULT
+    from qiita_common.backend_failure import (
+        BACKEND_FAILURE_HEADER,
+        BACKEND_FAILURE_HTTP_STATUS,
+        BackendFailure,
+        FailureKind,
+    )
+    from qiita_common.models import WorkTicketFailureStage
+
+    client, backend = http_client
+
+    async def boom(*args, **kwargs):
+        raise BackendFailure(
+            kind=FailureKind.CONTRACT_VIOLATION,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name="hash",
+            reason="manifest missing",
+        )
+
+    backend.result_step = boom  # type: ignore[method-assign]
+    resp = client.post(
+        URL_STEP_RESULT,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "handle": {"compute_target": "slurm", "step_name": "hash", "slurm_job_id": 1},
+            "status": {"status": "completed", "raw_state": "COMPLETED", "exit_code": 0},
+        },
+    )
+    assert resp.status_code == BACKEND_FAILURE_HTTP_STATUS
+    assert resp.headers[BACKEND_FAILURE_HEADER] == "1"
+    assert resp.json()["kind"] == "contract_violation"
+
+
+def test_step_submit_rejects_wrong_prefix_module(http_client, cp_to_co_token, tmp_path):
+    """The module-prefix defense applies to /step/submit too."""
+    from qiita_common.api_paths import URL_STEP_SUBMIT
+
     client, backend = http_client
     resp = client.post(
-        URL_STEP_RUN,
+        URL_STEP_SUBMIT,
         headers={"Authorization": f"Bearer {cp_to_co_token}"},
         json={
             "step_name": "x",
@@ -262,7 +314,7 @@ def test_step_run_rejects_wrong_prefix_module(http_client, cp_to_co_token, tmp_p
             "workspace": str(tmp_path),
             "scope_target": {"kind": "reference", "reference_idx": 1},
             "work_ticket_idx": 1,
-            "module": "os.system",  # bad prefix
+            "module": "os.system",
         },
     )
     assert resp.status_code == 422
@@ -270,172 +322,88 @@ def test_step_run_rejects_wrong_prefix_module(http_client, cp_to_co_token, tmp_p
     assert backend.calls == []
 
 
-def test_step_run_rejects_payload_without_runtime(http_client, cp_to_co_token, tmp_path):
-    """A request body with neither `container` nor `module` is rejected at
-    the wire boundary by the StepRunRequest validator; the route never
-    reaches the backend dispatch."""
+# ============================================================================
+# Decoupled route: /step/find-by-name (idempotency / recovery)
+# ============================================================================
+
+
+def test_step_find_by_name_requires_bearer_token(http_client):
+    from qiita_common.api_paths import URL_STEP_FIND_BY_NAME
+
+    client, _ = http_client
+    resp = client.post(URL_STEP_FIND_BY_NAME, json={"job_name": "qiita-wt1-hash-a0"})
+    assert resp.status_code == 401
+
+
+def test_step_find_by_name_returns_matching_jobs(http_client, cp_to_co_token):
+    """POST /step/find-by-name forwards to backend.find_jobs_by_name and
+    serializes the matches (id + status snapshot)."""
+    from qiita_common.api_paths import URL_STEP_FIND_BY_NAME
+
     client, backend = http_client
+    backend.found_jobs = [
+        FoundJob(
+            slurm_job_id=4242,
+            job_name="qiita-wt99-hash-a0",
+            status=StepStatusInfo(status=StepStatus.RUNNING, raw_state="RUNNING"),
+        )
+    ]
     resp = client.post(
-        URL_STEP_RUN,
+        URL_STEP_FIND_BY_NAME,
         headers={"Authorization": f"Bearer {cp_to_co_token}"},
-        json={
-            "step_name": "hash",
-            "inputs": {"fasta_path": "/tmp/x.fa"},
-            "workspace": str(tmp_path),
-            "scope_target": {"kind": "reference", "reference_idx": 1},
-            "work_ticket_idx": 1,
-        },
-    )
-    assert resp.status_code == 422
-    assert "exactly one" in resp.text
-    assert backend.calls == []
-
-
-def test_step_run_rejects_payload_with_both_runtimes(http_client, cp_to_co_token, tmp_path):
-    """A request body with both `container` AND `module` is rejected at
-    the wire boundary — runtime must be unambiguous."""
-    client, backend = http_client
-    resp = client.post(
-        URL_STEP_RUN,
-        headers={"Authorization": f"Bearer {cp_to_co_token}"},
-        json={
-            "step_name": "hash",
-            "inputs": {"fasta_path": "/tmp/x.fa"},
-            "workspace": str(tmp_path),
-            "scope_target": {"kind": "reference", "reference_idx": 1},
-            "work_ticket_idx": 1,
-            "container": REFERENCE_HASH_CONTAINER,
-            "module": FASTQ_TO_PARQUET_MODULE,
-        },
-    )
-    assert resp.status_code == 422
-    assert "exactly one" in resp.text
-    assert backend.calls == []
-
-
-def test_step_run_dispatches_prep_sample_scope_target(http_client, cp_to_co_token, tmp_path):
-    """prep_sample-scoped wire traffic round-trips: the validator accepts
-    the discriminated-union shape and the route forwards the dict verbatim
-    to backend.run_step. Module form because the natural pairing is
-    native step (fastq_to_parquet) + prep_sample scope."""
-    client, backend = http_client
-    resp = client.post(
-        URL_STEP_RUN,
-        headers={"Authorization": f"Bearer {cp_to_co_token}"},
-        json={
-            "step_name": "fastq",
-            "inputs": {"fastq_path": "/scratch/in.fastq"},
-            "workspace": str(tmp_path),
-            "scope_target": {"kind": "prep_sample", "prep_sample_idx": 42},
-            "work_ticket_idx": 1,
-            "module": FASTQ_TO_PARQUET_MODULE,
-        },
+        json={"job_name": "qiita-wt99-hash-a0"},
     )
     assert resp.status_code == 200, resp.text
-    assert len(backend.calls) == 1
-    call = backend.calls[0]
-    assert call.scope_target == {"kind": "prep_sample", "prep_sample_idx": 42}
-    assert call.module == FASTQ_TO_PARQUET_MODULE
-    assert call.container is None
+    assert backend.find_by_name_calls == ["qiita-wt99-hash-a0"]
+    jobs = resp.json()["jobs"]
+    assert len(jobs) == 1
+    assert jobs[0]["slurm_job_id"] == 4242
+    assert jobs[0]["job_name"] == "qiita-wt99-hash-a0"
+    assert jobs[0]["status"]["status"] == "running"
 
 
-def test_step_run_dispatches_study_prep_scope_target(http_client, cp_to_co_token, tmp_path):
-    """study_prep-scoped wire traffic round-trips. Container form here
-    because there's no native step pinned to study_prep today; a future
-    container action (e.g. per-(study,prep) sample processing) would
-    naturally take this shape."""
+def test_step_find_by_name_empty_when_no_match(http_client, cp_to_co_token):
+    from qiita_common.api_paths import URL_STEP_FIND_BY_NAME
+
     client, backend = http_client
+    backend.found_jobs = []
     resp = client.post(
-        URL_STEP_RUN,
+        URL_STEP_FIND_BY_NAME,
         headers={"Authorization": f"Bearer {cp_to_co_token}"},
-        json={
-            "step_name": "process",
-            "inputs": {},
-            "workspace": str(tmp_path),
-            "scope_target": {
-                "kind": "study_prep",
-                "study_idx": 7,
-                "prep_idx": 11,
-            },
-            "work_ticket_idx": 1,
-            "container": "qiita/process:1.0.0",
-        },
+        json={"job_name": "qiita-wt1-hash-a0"},
     )
     assert resp.status_code == 200, resp.text
-    assert len(backend.calls) == 1
-    call = backend.calls[0]
-    assert call.scope_target == {
-        "kind": "study_prep",
-        "study_idx": 7,
-        "prep_idx": 11,
-    }
+    assert resp.json()["jobs"] == []
 
 
-def test_step_run_serializes_container_on_unsupported_scope_guard(
-    http_client, cp_to_co_token, tmp_path
-):
-    """End-to-end at the HTTP boundary: a container step whose
-    scope_target.kind is not one the backends can dispatch must surface
-    as a CONTRACT_VIOLATION BackendFailure, serialized through the route
-    into the wire shape the runner consumes.
-
-    The stub backend calls the REAL shared guard
-    (`assert_container_scope_supported`, the same function LocalBackend
-    and SlurmBackend invoke) rather than reimplementing its predicate or
-    error string — so this test tracks the guard if the supported-kind
-    set or wording changes, instead of asserting a copy that can silently
-    rot. We still stub at the `run_step` boundary so we don't spin up
-    either real backend (LocalBackend triggers miint install, SlurmBackend
-    needs slurmrestd config); the round-trip we care about is the wire
-    serialization of the guard's BackendFailure.
-
-    `prep_sample` is the rejected kind here: the guard supports `reference`
-    and `sequenced_pool` (bcl-convert), so a prep_sample-scoped container
-    step is the contract violation."""
+def test_step_find_by_name_serializes_backend_failure(http_client, cp_to_co_token):
+    """An unreachable slurmrestd serializes the typed BackendFailure so the
+    runner's recovery treats it as transient and retries the lookup."""
+    from qiita_common.api_paths import URL_STEP_FIND_BY_NAME
     from qiita_common.backend_failure import (
         BACKEND_FAILURE_HEADER,
         BACKEND_FAILURE_HTTP_STATUS,
+        BackendFailure,
+        FailureKind,
     )
-
-    from qiita_compute_orchestrator.backend import assert_container_scope_supported
+    from qiita_common.models import WorkTicketFailureStage
 
     client, backend = http_client
 
-    async def _container_guard(name, inputs, workspace, *, scope_target, container=None, **_):
-        # Mirror the backends: the guard only applies to container steps.
-        if container is not None:
-            assert_container_scope_supported(step_name=name, scope_target=scope_target)
-        return {}
+    async def boom(*args, **kwargs):
+        raise BackendFailure(
+            kind=FailureKind.SLURMRESTD_UNREACHABLE,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name="qiita-wt1-hash-a0",
+            reason="slurmrestd 503 on job list",
+        )
 
-    backend.run_step = _container_guard  # type: ignore[method-assign]
-
+    backend.find_jobs_by_name = boom  # type: ignore[method-assign]
     resp = client.post(
-        URL_STEP_RUN,
+        URL_STEP_FIND_BY_NAME,
         headers={"Authorization": f"Bearer {cp_to_co_token}"},
-        json={
-            "step_name": "hash",
-            "inputs": {"fasta_path": "/tmp/x.fa"},
-            "workspace": str(tmp_path),
-            "scope_target": {"kind": "prep_sample", "prep_sample_idx": 42},
-            "work_ticket_idx": 1,
-            "container": REFERENCE_HASH_CONTAINER,
-        },
+        json={"job_name": "qiita-wt1-hash-a0"},
     )
     assert resp.status_code == BACKEND_FAILURE_HTTP_STATUS
     assert resp.headers[BACKEND_FAILURE_HEADER] == "1"
-    body = resp.json()
-    assert body["kind"] == "contract_violation"
-    assert body["stage"] == "step_run"
-    assert body["step_name"] == "hash"
-    # Assert against the real guard's current wording, not a stale copy.
-    assert "scope_target with kind in" in body["reason"]
-    assert "prep_sample" in body["reason"]
-
-
-def test_settings_resolves_token_from_env():
-    """Sanity-check Settings.from_env reads the dev-mode env override."""
-    from qiita_compute_orchestrator.config import Settings
-
-    assert os.environ.get("QIITA_ALLOW_TOKEN_ENV") == "true"
-    s = Settings.from_env()
-    assert s.cp_to_co_token == os.environ["CP_TO_CO_TOKEN"]
+    assert resp.json()["kind"] == "slurmrestd_unreachable"

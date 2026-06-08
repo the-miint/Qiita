@@ -234,7 +234,7 @@ The data plane is intentionally "dumb": it only operates on identifiers it recei
 
 ### Compute orchestrator pattern
 
-The orchestrator is a passive HTTP service: it accepts `POST /api/v1/step/run` from the control-plane runner, dispatches to its configured `ComputeBackend`, and returns the step's output paths. SLURM jobs themselves remain dumb (read input, write output, exit). The orchestrator owns slurmrestd polling and output verification (identifier integrity + file mode) inside its backend implementation.
+The orchestrator is a passive, **stateless** HTTP service: the control-plane runner drives the decoupled `POST /api/v1/step/{submit,status,result}` trio (plus `POST /api/v1/step/find-by-name`), each dispatching to the configured `ComputeBackend`. `submit_step` `sbatch`es and returns a handle (SLURM job id + workspace paths) immediately; `status_step` is a single non-looping slurmrestd read; `result_step` verifies output (identifier integrity + file mode) and returns the paths. **The CP owns the poll loop** — the orchestrator holds no in-flight job state between calls, so a long job never holds the CP→CO connection open and a CP restart re-attaches from persisted `qiita.work_ticket_step` progress. SLURM jobs themselves remain dumb (read input, write output, exit).
 
 **The orchestrator has no DB access** — workflow lifecycle and DB writes happen entirely on the control plane side. CO → CP callbacks exist today for `POST /sequence-range` (called by the native `fastq_to_parquet` step) and authenticate with the `compute-worker` service-account PAT installed at `/etc/qiita/co-to-cp.token` ([provisioning](docs/runbooks/compute-service-account-provisioning.md), [rotation](docs/runbooks/orchestrator-token-rotation.md)). SLURM-backend integration (cluster prereqs, identity model, the `qiita-job` JWT auto-refresh timer) lives in [`docs/runbooks/slurm-backend-setup.md`](docs/runbooks/slurm-backend-setup.md).
 
@@ -244,7 +244,7 @@ The control plane enforces **disallow-without-delete**: before submitting any jo
 
 `qiita_control_plane.runner.run_workflow` walks an action's `steps:` list for a single `qiita.work_ticket`. Lives in the control plane (direct DB access for work_ticket / action / reference rows is legitimate here). For each entry:
 
-- `step:` — calls the orchestrator over HTTP via `qiita_common.compute_backend_client.ComputeBackendClient` (`POST /api/v1/step/run`). Synchronous in v1: blocks for the duration of the backend step.
+- `step:` — calls the orchestrator over HTTP via `qiita_common.compute_backend_client.ComputeBackendClient`, driving `submit_step` → poll `status_step` (CP-side loop, ~10s) → `result_step`. Per-`(step_index, attempt)` progress is written to `qiita.work_ticket_step` (write-ahead `submitting` before submit) so a CP restart re-attaches via `reconcile_inflight_tickets` instead of failing in-flight work. A CO-unreachable error is transient and retried in place, never failing the ticket.
 - `action:` — calls the matching primitive in `qiita_control_plane.actions.library.LIBRARY` directly, no HTTP hop.
 
 Status PATCHes declared in YAML (`target_status`) call `qiita_control_plane.actions.reference.transition_reference_status` in-process. Same atomic, transition-validated UPDATE the public `PATCH /reference/{idx}/status` route uses.

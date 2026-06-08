@@ -21,8 +21,20 @@ import uuid
 from pathlib import Path
 
 import pytest
-from qiita_common.models import UploadStatus
+from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.models import (
+    ComputeTarget,
+    FoundJobWire,
+    StepHandleWire,
+    StepProgressState,
+    StepStatus,
+    StepStatusWire,
+    UploadStatus,
+    WorkTicketFailureStage,
+)
 from qiita_common.testing.containers import REFERENCE_HASH_CONTAINER, REFERENCE_LOAD_CONTAINER
+
+from qiita_control_plane import step_progress
 
 pytestmark = pytest.mark.db
 
@@ -32,8 +44,66 @@ pytestmark = pytest.mark.db
 # =============================================================================
 
 
-class FakeBackendClient:
-    """Stand-in for ComputeBackendClient.run_step. Records calls and
+class _LocalLikeBackendMixin:
+    """Adapts a `run_step`-style fake (synchronous: returns the outputs map or
+    raises BackendFailure) onto the decoupled submit/status/result trio the
+    runner now drives.
+
+    Models the LocalBackend's synchronous path: `submit_step` runs the step
+    in-process and returns a terminal handle (`compute_target=local`,
+    `terminal_outputs` set), or propagates the BackendFailure the fake raised.
+    The runner short-circuits on `terminal_outputs is not None`, so it never
+    calls `status_step` / `result_step` on these handles — those assert if
+    reached, catching a runner regression that would poll a synchronous job.
+
+    Subclasses keep `run_step` as the single customization point; the trio
+    above is inherited, so the existing fakes only define their step behavior
+    once."""
+
+    async def submit_step(
+        self,
+        *,
+        step_name: str,
+        inputs: dict[str, Path],
+        workspace: Path,
+        scope_target: dict,
+        work_ticket_idx: int,
+        attempt: int = 0,
+        container: str | None = None,
+        module: str | None = None,
+        entrypoint: str | None = None,
+        baseline_resources=None,
+    ) -> StepHandleWire:
+        outputs = await self.run_step(
+            step_name=step_name,
+            inputs=inputs,
+            workspace=workspace,
+            scope_target=scope_target,
+            work_ticket_idx=work_ticket_idx,
+            container=container,
+            module=module,
+            entrypoint=entrypoint,
+            baseline_resources=baseline_resources,
+        )
+        return StepHandleWire(
+            compute_target=ComputeTarget.LOCAL,
+            step_name=step_name,
+            terminal_outputs={k: str(v) for k, v in outputs.items()},
+        )
+
+    async def status_step(self, handle: StepHandleWire) -> StepStatusWire:
+        raise AssertionError(
+            "local-like fake: status_step must not be called for a terminal handle"
+        )
+
+    async def result_step(self, handle: StepHandleWire, status: StepStatusWire) -> dict[str, Path]:
+        raise AssertionError(
+            "local-like fake: result_step must not be called for a terminal handle"
+        )
+
+
+class FakeBackendClient(_LocalLikeBackendMixin):
+    """Stand-in for a synchronous (local) backend. Records calls and
     returns scripted outputs (which the runner expects to be Path
     objects keyed by the step's declared output names)."""
 
@@ -241,6 +311,7 @@ async def _run(
     workspace_root: Path,
     *,
     upload_staging_root: Path | None = None,
+    resume: bool = False,
 ) -> None:
     from qiita_control_plane.runner import run_workflow
 
@@ -259,6 +330,10 @@ async def _run(
         data_plane_url="grpc://unused:0",
         work_ticket_workspace_root=workspace_root,
         upload_staging_root=effective_upload_root,
+        # 0 so any (accidental) poll loop spins instantly; the local-like
+        # fakes complete synchronously at submit and never poll anyway.
+        poll_interval_seconds=0,
+        resume=resume,
     )
 
 
@@ -514,12 +589,16 @@ async def test_swallows_failure_status_patch_error(
 # =============================================================================
 
 
-class _RetryingBackendClient:
+class _RetryingBackendClient(_LocalLikeBackendMixin):
     """Backend stub that raises BackendFailure on the first N attempts of
     a named step, then succeeds. Used to drive the retry loop without
     needing a real orchestrator. Each call increments the per-step
     counter so an instance can fail one step transiently while another
-    succeeds first try."""
+    succeeds first try.
+
+    The raise models the LocalBackend failing in-process at submit time —
+    the mixin's `submit_step` calls `run_step` and lets the BackendFailure
+    propagate, exactly as a synchronous backend would."""
 
     def __init__(
         self,
@@ -641,7 +720,7 @@ async def test_retry_uses_isolated_per_attempt_workspace(
     workspace_root = tmp_path / "ws"
     work_ticket_idx = pending_work_ticket["work_ticket_idx"]
 
-    class _RecordingBackend:
+    class _RecordingBackend(_LocalLikeBackendMixin):
         """Records the workspace path the runner hands the backend on each
         call. Hash fails once (drops a stale file in its given workspace
         first to simulate a partial container write), then succeeds."""
@@ -1172,7 +1251,10 @@ async def test_dispatch_register_index_writes_row(postgres_pool, reference_idx, 
     params."""
     from qiita_common.actions import WorkflowAction
 
-    from qiita_control_plane.runner import _dispatch_action
+    # Targets the per-primitive dispatch arm directly (no work_ticket /
+    # progress-row plumbing); the progress-recording wrapper `_dispatch_action`
+    # is exercised through the full run_workflow path elsewhere.
+    from qiita_control_plane.runner import _run_action_primitive
 
     fs_path = f"/srv/qiita/references/{reference_idx}/rype/index.ryxdi"
     meta_path = tmp_path / "rype_index_meta.json"
@@ -1188,7 +1270,7 @@ async def test_dispatch_register_index_writes_row(postgres_pool, reference_idx, 
     bound = {"rype_index_path": fs_path, "rype_index_meta": str(meta_path)}
     entry = WorkflowAction(kind="action", name="register-index", inputs=[], outputs=[])
 
-    out = await _dispatch_action(
+    out = await _run_action_primitive(
         postgres_pool,
         entry,
         bound,
@@ -1292,6 +1374,838 @@ async def test_resolve_reference_index_path_raises_when_no_index(postgres_pool, 
     )
     with pytest.raises(ValueError, match="no 'rype' index"):
         await _resolve_reference_index_path(postgres_pool, reference_idx, "rype")
+
+
+# =============================================================================
+# Decoupled SLURM-path dispatch (submit → poll → result)
+# =============================================================================
+#
+# These exercise the asynchronous compute path the runner drives now: submit
+# returns a handle immediately, the runner polls status_step until terminal,
+# then fetches the verified result via result_step. No connection is held for
+# the job's duration — the durable proof the 600s-timeout bug is gone.
+
+
+class FakeSlurmBackendClient:
+    """Async (SLURM-shaped) backend stub. `submit_step` returns a non-terminal
+    handle carrying a job id; `status_step` replays `status_script` (each item
+    a StepStatus to return, or a BackendFailure to raise — e.g. an
+    ORCHESTRATOR_UNREACHABLE to simulate the CO being down mid-poll);
+    `result_step` replays `result_script` (a `{output_name: filename}` dict to
+    materialise + return, or a BackendFailure to raise — e.g. a job that ended
+    FAILED). Drives the runner's poll loop without a real orchestrator."""
+
+    def __init__(
+        self,
+        *,
+        status_script: list,
+        result_script: list,
+        submit_unreachable_times: int = 0,
+        slurm_job_id: int = 4242,
+        found_jobs: list | None = None,
+    ) -> None:
+        self.status_script = list(status_script)
+        self.result_script = list(result_script)
+        self._submit_unreachable_times = submit_unreachable_times
+        self._slurm_job_id = slurm_job_id
+        # find-by-name: `found_jobs` is what the orphan-adoption lookup
+        # returns (a list of FoundJobWire, or a BackendFailure to raise);
+        # `find_by_name_calls` records the names looked up.
+        self._found_jobs = found_jobs if found_jobs is not None else []
+        self.find_by_name_calls: list[str] = []
+        self.submit_calls = 0
+        self.status_calls = 0
+        self.result_calls = 0
+
+    async def submit_step(
+        self,
+        *,
+        step_name,
+        inputs,
+        workspace,
+        scope_target,
+        work_ticket_idx,
+        attempt=0,
+        container=None,
+        module=None,
+        entrypoint=None,
+        baseline_resources=None,
+    ):
+        self.submit_calls += 1
+        if self.submit_calls <= self._submit_unreachable_times:
+            raise BackendFailure(
+                kind=FailureKind.ORCHESTRATOR_UNREACHABLE,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=step_name,
+                reason="orchestrator unreachable (simulated submit)",
+            )
+        return StepHandleWire(
+            compute_target=ComputeTarget.SLURM,
+            step_name=step_name,
+            slurm_job_id=self._slurm_job_id,
+            job_name=f"qiita-wt{work_ticket_idx}-{step_name}-a{attempt}",
+            output_path=str(workspace / "output"),
+            logs_path=str(workspace / "logs"),
+        )
+
+    async def status_step(self, handle):
+        self.status_calls += 1
+        item = self.status_script.pop(0) if self.status_script else StepStatus.COMPLETED
+        if isinstance(item, BackendFailure):
+            raise item
+        return StepStatusWire(status=item, raw_state=item.value.upper())
+
+    async def result_step(self, handle, status):
+        self.result_calls += 1
+        item = self.result_script.pop(0) if self.result_script else {}
+        if isinstance(item, BackendFailure):
+            raise item
+        base = Path(handle.output_path)
+        base.mkdir(parents=True, exist_ok=True)
+        out = {}
+        for name, filename in item.items():
+            p = base / filename
+            p.touch(exist_ok=True)
+            out[name] = p
+        return out
+
+    async def find_jobs_by_name(self, job_name):
+        self.find_by_name_calls.append(job_name)
+        if isinstance(self._found_jobs, BackendFailure):
+            raise self._found_jobs
+        return list(self._found_jobs)
+
+
+_SINGLE_STEP_WORKFLOW = [
+    {
+        "kind": "step",
+        "name": "compute",
+        "step_type": "singleton",
+        "container": REFERENCE_HASH_CONTAINER,
+        "inputs": ["fasta_path"],
+        "outputs": ["result"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+]
+
+
+@pytest.fixture
+async def slurm_action(postgres_pool):
+    """A minimal one-`step:` action with no success/failure status PATCH —
+    isolates the compute poll loop from reference-status transitions."""
+    action_id = "slurm-single-step"
+    version = f"runner-test-{uuid.uuid4()}"
+    await postgres_pool.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, scopes, audience,"
+        "  context_schema, steps, cpu_ceiling, mem_ceiling_gb, walltime_ceiling"
+        ") VALUES ($1, $2, 'reference', $3::text[], $4::jsonb,"
+        "          $5::jsonb, $6::jsonb, 1, 1, '1 minute')",
+        action_id,
+        version,
+        ["reference:write"],
+        json.dumps({"service": False, "human_roles": ["wet_lab_admin"]}),
+        json.dumps({}),
+        json.dumps(_SINGLE_STEP_WORKFLOW),
+    )
+    yield action_id, version
+    await postgres_pool.execute(
+        "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
+    )
+
+
+@pytest.fixture
+async def slurm_ticket(postgres_pool, slurm_action, reference_idx, tmp_path):
+    action_id, version = slurm_action
+    fasta = tmp_path / "input.fasta"
+    fasta.write_text(">seq1\nACGT\n")
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, action_context"
+        ") VALUES ($1, $2, 1, 'reference', $3, $4::jsonb) RETURNING work_ticket_idx",
+        action_id,
+        version,
+        reference_idx,
+        json.dumps({"fasta_path": str(fasta)}),
+    )
+    yield idx
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx)
+
+
+async def _progress_rows(pool, work_ticket_idx):
+    return await step_progress.load_step_progress(pool, work_ticket_idx)
+
+
+async def test_long_running_step_completes_without_timeout(postgres_pool, slurm_ticket, tmp_path):
+    """The headline 600s-fix proof: a job observed RUNNING across dozens of
+    status polls still completes. Impossible under the old held-connection
+    model (capped at a 600s client timeout)."""
+    backend = FakeSlurmBackendClient(
+        status_script=[StepStatus.PENDING] + [StepStatus.RUNNING] * 30 + [StepStatus.COMPLETED],
+        result_script=[{"result": "result.parquet"}],
+    )
+    await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws")
+
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", slurm_ticket
+    )
+    assert state == "completed"
+    # 32 polls (1 pending + 30 running + 1 completed) — far past any single
+    # held-connection call could survive.
+    assert backend.status_calls == 32
+    assert backend.submit_calls == 1
+    rows = await _progress_rows(postgres_pool, slurm_ticket)
+    assert len(rows) == 1
+    assert rows[0].state is StepProgressState.COMPLETED
+    assert rows[0].compute_target is ComputeTarget.SLURM
+    assert rows[0].slurm_job_id == 4242
+
+
+async def test_co_unreachable_mid_poll_keeps_polling(postgres_pool, slurm_ticket, tmp_path):
+    """status_step raising ORCHESTRATOR_UNREACHABLE (CO down) must NOT fail
+    the ticket — the runner keeps polling and completes when CO returns."""
+    unreachable = BackendFailure(
+        kind=FailureKind.ORCHESTRATOR_UNREACHABLE,
+        stage=WorkTicketFailureStage.STEP_RUN,
+        step_name="compute",
+        reason="co down (simulated poll)",
+    )
+    backend = FakeSlurmBackendClient(
+        status_script=[unreachable] * 5 + [StepStatus.RUNNING, StepStatus.COMPLETED],
+        result_script=[{"result": "result.parquet"}],
+    )
+    await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws")
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, failure_type FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        slurm_ticket,
+    )
+    assert row["state"] == "completed"  # NOT failed
+    assert row["failure_type"] is None
+    # All 5 unreachable polls happened, then RUNNING + COMPLETED.
+    assert backend.status_calls == 7
+
+
+async def test_co_unreachable_during_submit_eventually_submits(
+    postgres_pool, slurm_ticket, tmp_path
+):
+    """submit_step raising ORCHESTRATOR_UNREACHABLE is retried in place until
+    the orchestrator returns — the ticket never fails on a CO outage."""
+    backend = FakeSlurmBackendClient(
+        status_script=[StepStatus.COMPLETED],
+        result_script=[{"result": "result.parquet"}],
+        submit_unreachable_times=3,
+    )
+    await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws")
+
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", slurm_ticket
+    )
+    assert state == "completed"
+    # 3 unreachable submits + 1 that landed.
+    assert backend.submit_calls == 4
+
+
+async def test_idempotent_adopt_does_not_resubmit(postgres_pool, slurm_ticket, tmp_path):
+    """If a job is already recorded for this (idx, step, attempt) — e.g. a
+    restart resuming the attempt — the runner adopts it (resumes polling)
+    instead of submitting a duplicate."""
+    # Pre-seed the progress row as already submitted with a job id.
+    await step_progress.record_submitting(
+        postgres_pool,
+        work_ticket_idx=slurm_ticket,
+        step_index=0,
+        attempt=0,
+        step_name="compute",
+        compute_target=ComputeTarget.SLURM,
+        job_name=f"qiita-wt{slurm_ticket}-compute-a0",
+    )
+    await step_progress.record_submitted(
+        postgres_pool, work_ticket_idx=slurm_ticket, step_index=0, attempt=0, slurm_job_id=777
+    )
+    backend = FakeSlurmBackendClient(
+        status_script=[StepStatus.RUNNING, StepStatus.COMPLETED],
+        result_script=[{"result": "result.parquet"}],
+    )
+    await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws")
+
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", slurm_ticket
+    )
+    assert state == "completed"
+    # Adopted the existing job — no submit at all.
+    assert backend.submit_calls == 0
+    assert backend.status_calls == 2
+    rows = await _progress_rows(postgres_pool, slurm_ticket)
+    assert rows[0].slurm_job_id == 777  # the pre-seeded job, untouched
+    assert rows[0].state is StepProgressState.COMPLETED
+
+
+async def test_job_failure_records_failed_then_retries_new_attempt(
+    postgres_pool, slurm_ticket, tmp_path
+):
+    """A SLURM job that ends FAILED with a transient kind (NODE_FAIL) marks
+    this attempt's progress row failed, then the runner retries as a NEW
+    attempt that succeeds. Two attempt rows result; the ticket completes."""
+    node_fail = BackendFailure(
+        kind=FailureKind.NODE_FAIL,
+        stage=WorkTicketFailureStage.STEP_RUN,
+        step_name="compute",
+        reason="node died (simulated)",
+    )
+    backend = FakeSlurmBackendClient(
+        # attempt 0: poll → FAILED, result raises NODE_FAIL.
+        # attempt 1: poll → COMPLETED, result returns outputs.
+        status_script=[StepStatus.FAILED, StepStatus.COMPLETED],
+        result_script=[node_fail, {"result": "result.parquet"}],
+    )
+    await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws")
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, retry_count FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        slurm_ticket,
+    )
+    assert row["state"] == "completed"
+    assert row["retry_count"] == 1
+    assert backend.submit_calls == 2  # one per attempt
+    rows = await _progress_rows(postgres_pool, slurm_ticket)
+    # Two attempt rows for step 0: attempt 0 failed, attempt 1 completed.
+    by_attempt = {r.attempt: r for r in rows}
+    assert by_attempt[0].state is StepProgressState.FAILED
+    assert by_attempt[0].failure_kind == "node_fail"
+    assert by_attempt[1].state is StepProgressState.COMPLETED
+
+
+async def test_local_step_records_compute_target_local(
+    postgres_pool, pending_work_ticket, library_spy, tmp_path
+):
+    """A step run on the synchronous local backend is recorded with
+    compute_target=local (corrected from the optimistic slurm write-ahead),
+    and an in-process action: entry is recorded as control_plane."""
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = pending_work_ticket["work_ticket_idx"]
+    backend = FakeBackendClient()
+    _populate_step_outputs(backend, workspace_root / str(work_ticket_idx))
+
+    await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    rows = await _progress_rows(postgres_pool, work_ticket_idx)
+    by_name = {r.step_name: r for r in rows}
+    # `hash` / `load` are container steps → local backend here.
+    assert by_name["hash"].compute_target is ComputeTarget.LOCAL
+    assert by_name["hash"].slurm_job_id is None
+    assert by_name["hash"].job_name is None
+    # `mint-features` / `write-membership` / `register-files` are action: entries.
+    assert by_name["mint-features"].compute_target is ComputeTarget.CONTROL_PLANE
+    assert by_name["write-membership"].compute_target is ComputeTarget.CONTROL_PLANE
+    # Every recorded entry completed.
+    assert all(r.state is StepProgressState.COMPLETED for r in rows)
+
+
+# =============================================================================
+# Restart recovery (resume = re-attach, never blanket-fail)
+# =============================================================================
+#
+# On CP startup, reconcile_inflight_tickets re-drives each non-terminal ticket
+# through run_workflow(resume=True): completed entries fast-forward (outputs
+# rebuilt from the shared workspace, not re-run), and the first incomplete
+# entry resumes — re-attaching to a live SLURM job by its persisted id,
+# finalizing one that succeeded while the CP was down, or deciding a purged job
+# from its on-disk manifest. A CO outage during reconcile never fails the
+# ticket. These drive run_workflow(resume=True) directly (reconcile's selection
+# is covered in tests/routes/test_work_ticket.py).
+
+
+async def _mark_processing(pool, work_ticket_idx):
+    await pool.execute(
+        "UPDATE qiita.work_ticket SET state = 'processing' WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+
+
+async def _seed_submitted_step(pool, work_ticket_idx, *, step_name, slurm_job_id, step_index=0):
+    """Write the progress rows for a step that was submitted (job id persisted)
+    but not yet terminal — the in-flight shape a crash leaves behind."""
+    await step_progress.record_submitting(
+        pool,
+        work_ticket_idx=work_ticket_idx,
+        step_index=step_index,
+        attempt=0,
+        step_name=step_name,
+        compute_target=ComputeTarget.SLURM,
+        job_name=f"qiita-wt{work_ticket_idx}-{step_name}-a0",
+    )
+    await step_progress.record_submitted(
+        pool,
+        work_ticket_idx=work_ticket_idx,
+        step_index=step_index,
+        attempt=0,
+        slurm_job_id=slurm_job_id,
+    )
+
+
+async def test_resume_reattaches_running_job_and_completes(postgres_pool, slurm_ticket, tmp_path):
+    """A ticket that crashed with a SLURM job in flight (id persisted) resumes
+    by adopting that job — no resubmit — and completes when it finishes."""
+    await _mark_processing(postgres_pool, slurm_ticket)
+    await _seed_submitted_step(postgres_pool, slurm_ticket, step_name="compute", slurm_job_id=900)
+
+    backend = FakeSlurmBackendClient(
+        status_script=[StepStatus.RUNNING, StepStatus.COMPLETED],
+        result_script=[{"result": "result.parquet"}],
+    )
+    await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", slurm_ticket
+    )
+    assert state == "completed"
+    assert backend.submit_calls == 0  # adopted the persisted job
+    rows = await step_progress.load_step_progress(postgres_pool, slurm_ticket)
+    assert rows[0].slurm_job_id == 900
+    assert rows[0].state is StepProgressState.COMPLETED
+
+
+async def test_resume_finalizes_job_that_succeeded_during_outage(
+    postgres_pool, slurm_ticket, tmp_path
+):
+    """The job finished while the CP was down: the first poll on resume reports
+    COMPLETED, result is fetched, the ticket finalizes."""
+    await _mark_processing(postgres_pool, slurm_ticket)
+    await _seed_submitted_step(postgres_pool, slurm_ticket, step_name="compute", slurm_job_id=901)
+
+    backend = FakeSlurmBackendClient(
+        status_script=[StepStatus.COMPLETED],
+        result_script=[{"result": "result.parquet"}],
+    )
+    await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", slurm_ticket
+    )
+    assert state == "completed"
+    assert backend.submit_calls == 0
+    assert backend.result_calls == 1
+
+
+async def test_resume_purged_job_with_valid_output_completes(postgres_pool, slurm_ticket, tmp_path):
+    """The job aged out of slurmrestd (status read raises UNKNOWN_PERMANENT),
+    but its output manifest is on disk — the filesystem tiebreaker decides
+    COMPLETED via result_step."""
+    await _mark_processing(postgres_pool, slurm_ticket)
+    await _seed_submitted_step(postgres_pool, slurm_ticket, step_name="compute", slurm_job_id=902)
+
+    purged = BackendFailure(
+        kind=FailureKind.UNKNOWN_PERMANENT,
+        stage=WorkTicketFailureStage.STEP_RUN,
+        step_name="compute",
+        reason="slurmrestd 404 (job purged)",
+    )
+    backend = FakeSlurmBackendClient(
+        status_script=[purged],
+        result_script=[{"result": "result.parquet"}],  # valid manifest on disk
+    )
+    await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", slurm_ticket
+    )
+    assert state == "completed"
+    assert backend.result_calls == 1  # tiebreaker consulted the filesystem
+
+
+async def test_resume_purged_job_without_output_fails(postgres_pool, slurm_ticket, tmp_path):
+    """The job aged out AND its output is gone/invalid — result_step's verify
+    raises CONTRACT_VIOLATION (permanent), so the resumed ticket fails."""
+    await _mark_processing(postgres_pool, slurm_ticket)
+    await _seed_submitted_step(postgres_pool, slurm_ticket, step_name="compute", slurm_job_id=903)
+
+    purged = BackendFailure(
+        kind=FailureKind.UNKNOWN_PERMANENT,
+        stage=WorkTicketFailureStage.STEP_RUN,
+        step_name="compute",
+        reason="slurmrestd 404 (job purged)",
+    )
+    contract = BackendFailure(
+        kind=FailureKind.CONTRACT_VIOLATION,
+        stage=WorkTicketFailureStage.STEP_RUN,
+        step_name="compute",
+        reason="output manifest missing on shared scratch",
+    )
+    backend = FakeSlurmBackendClient(status_script=[purged], result_script=[contract])
+    with pytest.raises(BackendFailure):
+        await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, failure_type FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        slurm_ticket,
+    )
+    assert row["state"] == "failed"
+    assert row["failure_type"] == "permanent"
+
+
+async def test_resume_never_started_runs_from_scratch(postgres_pool, slurm_ticket, tmp_path):
+    """A ticket orphaned right after PENDING → PROCESSING with no progress rows
+    runs from step 0 — resume degrades to a normal dispatch."""
+    await _mark_processing(postgres_pool, slurm_ticket)  # no progress rows seeded
+
+    backend = FakeSlurmBackendClient(
+        status_script=[StepStatus.COMPLETED],
+        result_script=[{"result": "result.parquet"}],
+    )
+    await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", slurm_ticket
+    )
+    assert state == "completed"
+    assert backend.submit_calls == 1  # fresh submit, nothing to adopt
+
+
+async def _seed_submitting_no_id(pool, work_ticket_idx, *, step_name, step_index=0):
+    """Write only the write-ahead 'submitting' row (no job id) — the exact
+    shape the duplicate-job gap leaves behind: a prior process recorded intent
+    (and the deterministic job_name) but crashed before persisting the id."""
+    await step_progress.record_submitting(
+        pool,
+        work_ticket_idx=work_ticket_idx,
+        step_index=step_index,
+        attempt=0,
+        step_name=step_name,
+        compute_target=ComputeTarget.SLURM,
+        job_name=f"qiita-wt{work_ticket_idx}-{step_name}-a0",
+    )
+
+
+async def test_resume_adopts_orphan_job_by_name(postgres_pool, slurm_ticket, tmp_path):
+    """The write-ahead gap closer: a 'submitting' row with no persisted id but
+    a recorded job_name resumes by finding the orphaned SLURM job by name and
+    adopting it — NOT re-submitting a duplicate. The adopted id is persisted
+    and the ticket completes."""
+    await _mark_processing(postgres_pool, slurm_ticket)
+    await _seed_submitting_no_id(postgres_pool, slurm_ticket, step_name="compute")
+
+    job_name = f"qiita-wt{slurm_ticket}-compute-a0"
+    backend = FakeSlurmBackendClient(
+        status_script=[StepStatus.RUNNING, StepStatus.COMPLETED],
+        result_script=[{"result": "result.parquet"}],
+        found_jobs=[
+            FoundJobWire(
+                slurm_job_id=950,
+                job_name=job_name,
+                status=StepStatusWire(status=StepStatus.RUNNING, raw_state="RUNNING"),
+            )
+        ],
+    )
+    await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", slurm_ticket
+    )
+    assert state == "completed"
+    # Adopted by name — no duplicate submit; the lookup keyed on the recorded name.
+    assert backend.submit_calls == 0
+    assert backend.find_by_name_calls == [job_name]
+    rows = await step_progress.load_step_progress(postgres_pool, slurm_ticket)
+    assert rows[0].slurm_job_id == 950  # the adopted orphan's id, now persisted
+    assert rows[0].state is StepProgressState.COMPLETED
+
+
+async def test_resume_submits_when_orphan_not_found(postgres_pool, slurm_ticket, tmp_path):
+    """If slurmrestd has no job under the name (the submit never reached SLURM,
+    or the job was purged), the find-by-name lookup is empty and the runner
+    falls through to a fresh submit — exactly once."""
+    await _mark_processing(postgres_pool, slurm_ticket)
+    await _seed_submitting_no_id(postgres_pool, slurm_ticket, step_name="compute")
+
+    backend = FakeSlurmBackendClient(
+        status_script=[StepStatus.COMPLETED],
+        result_script=[{"result": "result.parquet"}],
+        found_jobs=[],  # no orphan to adopt
+    )
+    await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", slurm_ticket
+    )
+    assert state == "completed"
+    assert backend.find_by_name_calls == [f"qiita-wt{slurm_ticket}-compute-a0"]
+    assert backend.submit_calls == 1  # nothing to adopt → fresh submit
+
+
+async def test_fresh_dispatch_does_not_look_up_by_name(postgres_pool, slurm_ticket, tmp_path):
+    """A fresh (non-resume) dispatch wrote its own 'submitting' row this
+    process, so there is no orphan to find — the (cluster-wide) find-by-name
+    lookup is skipped entirely and the step submits normally."""
+    backend = FakeSlurmBackendClient(
+        status_script=[StepStatus.COMPLETED],
+        result_script=[{"result": "result.parquet"}],
+        found_jobs=[
+            FoundJobWire(  # would be adopted if the lookup ran — it must not
+                slurm_job_id=999,
+                job_name=f"qiita-wt{slurm_ticket}-compute-a0",
+                status=StepStatusWire(status=StepStatus.RUNNING, raw_state="RUNNING"),
+            )
+        ],
+    )
+    await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws")  # resume=False
+
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", slurm_ticket
+    )
+    assert state == "completed"
+    assert backend.find_by_name_calls == []  # never looked up on a fresh dispatch
+    assert backend.submit_calls == 1
+    rows = await step_progress.load_step_progress(postgres_pool, slurm_ticket)
+    assert rows[0].slurm_job_id == 4242  # the fresh submit's id, not the orphan's 999
+
+
+async def test_resume_co_unreachable_does_not_fail_ticket(postgres_pool, slurm_ticket, tmp_path):
+    """A CO outage during reconcile keeps the resumed poll loop retrying and
+    completes when the orchestrator returns — the ticket is never failed."""
+    await _mark_processing(postgres_pool, slurm_ticket)
+    await _seed_submitted_step(postgres_pool, slurm_ticket, step_name="compute", slurm_job_id=904)
+
+    unreachable = BackendFailure(
+        kind=FailureKind.ORCHESTRATOR_UNREACHABLE,
+        stage=WorkTicketFailureStage.STEP_RUN,
+        step_name="compute",
+        reason="co down (simulated reconcile)",
+    )
+    backend = FakeSlurmBackendClient(
+        status_script=[unreachable] * 4 + [StepStatus.COMPLETED],
+        result_script=[{"result": "result.parquet"}],
+    )
+    await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, failure_type FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        slurm_ticket,
+    )
+    assert row["state"] == "completed"
+    assert row["failure_type"] is None
+
+
+# --- multi-step resume: bound rebuild + action fast-forward -----------------
+
+
+_MULTI_STEP_WORKFLOW = [
+    {
+        "kind": "step",
+        "name": "compute",
+        "step_type": "singleton",
+        "container": REFERENCE_HASH_CONTAINER,
+        "inputs": ["fasta_path"],
+        "outputs": ["manifest"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    {
+        "kind": "action",
+        "name": "mint-features",
+        "inputs": ["manifest"],
+        "outputs": ["feature_map"],
+    },
+    {
+        "kind": "step",
+        "name": "finish",
+        "step_type": "singleton",
+        "container": REFERENCE_LOAD_CONTAINER,
+        "inputs": ["feature_map"],
+        "outputs": ["result"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+]
+
+
+@pytest.fixture
+async def multi_step_ticket(postgres_pool, reference_idx, tmp_path):
+    action_id = "slurm-multi-step"
+    version = f"runner-test-{uuid.uuid4()}"
+    await postgres_pool.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, scopes, audience,"
+        "  context_schema, steps, cpu_ceiling, mem_ceiling_gb, walltime_ceiling"
+        ") VALUES ($1, $2, 'reference', $3::text[], $4::jsonb,"
+        "          $5::jsonb, $6::jsonb, 1, 1, '1 minute')",
+        action_id,
+        version,
+        ["feature:mint", "reference:write"],
+        json.dumps({"service": False, "human_roles": ["wet_lab_admin"]}),
+        json.dumps({}),
+        json.dumps(_MULTI_STEP_WORKFLOW),
+    )
+    fasta = tmp_path / "input.fasta"
+    fasta.write_text(">seq1\nACGT\n")
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, action_context"
+        ") VALUES ($1, $2, 1, 'reference', $3, $4::jsonb) RETURNING work_ticket_idx",
+        action_id,
+        version,
+        reference_idx,
+        json.dumps({"fasta_path": str(fasta)}),
+    )
+    yield idx
+    await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx)
+    await postgres_pool.execute(
+        "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
+    )
+
+
+async def test_resume_multi_step_rebuilds_bound_and_skips_completed_action(
+    postgres_pool, multi_step_ticket, library_spy, tmp_path
+):
+    """Resume of a 3-entry workflow where step 0 (compute) and the action
+    (mint-features) already completed: both are fast-forwarded (the action is
+    NOT re-run — not idempotent), their outputs are rebuilt into `bound`, and
+    the final step runs with the rebuilt feature_map input."""
+    await _mark_processing(postgres_pool, multi_step_ticket)
+    # Step 0: completed SLURM step.
+    await _seed_submitted_step(
+        postgres_pool, multi_step_ticket, step_name="compute", slurm_job_id=950, step_index=0
+    )
+    await step_progress.record_running(
+        postgres_pool, work_ticket_idx=multi_step_ticket, step_index=0, attempt=0
+    )
+    await step_progress.record_completed(
+        postgres_pool, work_ticket_idx=multi_step_ticket, step_index=0, attempt=0
+    )
+    # Step 1: completed in-process action.
+    await step_progress.record_submitting(
+        postgres_pool,
+        work_ticket_idx=multi_step_ticket,
+        step_index=1,
+        attempt=0,
+        step_name="mint-features",
+        compute_target=ComputeTarget.CONTROL_PLANE,
+    )
+    await step_progress.record_completed(
+        postgres_pool, work_ticket_idx=multi_step_ticket, step_index=1, attempt=0
+    )
+
+    backend = FakeSlurmBackendClient(
+        # result_script[0] = compute's reconstruct (fast-forward via result_step);
+        # result_script[1] = finish's fresh result. status_script drives only
+        # the fresh `finish` poll (the reconstruct doesn't poll).
+        status_script=[StepStatus.COMPLETED],
+        result_script=[{"manifest": "manifest.parquet"}, {"result": "result.parquet"}],
+    )
+    await _run(multi_step_ticket, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", multi_step_ticket
+    )
+    assert state == "completed"
+    # mint-features was fast-forwarded, NOT re-run.
+    assert [c[0] for c in library_spy.calls] == []
+    # Only the final step submitted fresh; compute was reconstructed, not resubmitted.
+    assert backend.submit_calls == 1
+    # All three entries end completed in the progress table.
+    rows = await step_progress.load_step_progress(postgres_pool, multi_step_ticket)
+    by_index = {r.step_index: r for r in rows}
+    assert by_index[0].state is StepProgressState.COMPLETED
+    assert by_index[1].state is StepProgressState.COMPLETED
+    assert by_index[2].state is StepProgressState.COMPLETED
+
+
+_TARGET_STATUS_WORKFLOW = [
+    {
+        "kind": "step",
+        "name": "s0",
+        "step_type": "singleton",
+        "container": REFERENCE_HASH_CONTAINER,
+        "target_status": "hashing",
+        "inputs": ["fasta_path"],
+        "outputs": ["manifest"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    {
+        "kind": "step",
+        "name": "s1",
+        "step_type": "singleton",
+        "container": REFERENCE_LOAD_CONTAINER,
+        "target_status": "minting",
+        "inputs": ["manifest"],
+        "outputs": ["result"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+]
+
+
+async def test_resume_with_target_status_does_not_re_patch_or_go_backward(
+    postgres_pool, reference_idx, tmp_path
+):
+    """Resume of a workflow whose entries declare `target_status`: a crash
+    after step 1's status PATCH fired (resource at 'minting') but before it
+    completed must NOT re-issue that PATCH (redundant 'minting'→'minting') nor
+    the already-completed step 0's PATCH (backward 'minting'→'hashing') — both
+    raise IllegalStatusTransition and would wrongly fail a healthy ticket. The
+    PATCH is keyed off the resource's actual status, so both are skipped."""
+    action_id = "slurm-target-status"
+    version = f"runner-test-{uuid.uuid4()}"
+    await postgres_pool.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, scopes, audience,"
+        "  context_schema, steps, cpu_ceiling, mem_ceiling_gb, walltime_ceiling"
+        ") VALUES ($1, $2, 'reference', $3::text[], $4::jsonb,"
+        "          $5::jsonb, $6::jsonb, 1, 1, '1 minute')",
+        action_id,
+        version,
+        ["reference:write"],
+        json.dumps({"service": False, "human_roles": ["wet_lab_admin"]}),
+        json.dumps({}),
+        json.dumps(_TARGET_STATUS_WORKFLOW),
+    )
+    fasta = tmp_path / "input.fasta"
+    fasta.write_text(">seq1\nACGT\n")
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, action_context, state"
+        ") VALUES ($1, $2, 1, 'reference', $3, $4::jsonb, 'processing'::qiita.work_ticket_state)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        reference_idx,
+        json.dumps({"fasta_path": str(fasta)}),
+    )
+    try:
+        # The crash left the reference at 'minting' (step 1's PATCH fired) with
+        # step 0 completed and step 1 in flight (job id persisted).
+        await postgres_pool.execute(
+            "UPDATE qiita.reference SET status = 'minting' WHERE reference_idx = $1",
+            reference_idx,
+        )
+        await _seed_submitted_step(
+            postgres_pool, idx, step_name="s0", slurm_job_id=960, step_index=0
+        )
+        await step_progress.record_completed(
+            postgres_pool, work_ticket_idx=idx, step_index=0, attempt=0
+        )
+        await _seed_submitted_step(
+            postgres_pool, idx, step_name="s1", slurm_job_id=961, step_index=1
+        )
+
+        backend = FakeSlurmBackendClient(
+            status_script=[StepStatus.COMPLETED],  # s1 re-attach → completed
+            result_script=[{"manifest": "manifest.parquet"}, {"result": "result.parquet"}],
+        )
+        # No success_status on the action → finalize issues no reference PATCH,
+        # isolating the in-loop resume PATCH behavior under test.
+        await _run(idx, postgres_pool, backend, tmp_path / "ws", resume=True)
+
+        state = await postgres_pool.fetchval(
+            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
+        )
+        assert state == "completed"
+        assert backend.submit_calls == 0  # s1 adopted, s0 reconstructed
+    finally:
+        await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx)
+        await postgres_pool.execute(
+            "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
+        )
 
 
 # =============================================================================

@@ -122,6 +122,7 @@ def build_job_submit_payload(
     log_stderr: Path,
     partition: str,
     account: str,
+    attempt: int = 0,
     extra_env: dict[str, str] | None = None,
     extra_bind_dirs: list[Path] | None = None,
     native_python: str = "python",
@@ -130,7 +131,7 @@ def build_job_submit_payload(
     """Build the slurmrestd `POST /slurm/{version}/job/submit` JSON body.
 
     Exactly one of `container` or `module` must be set — the wire
-    validator on StepRunRequest enforces this upstream; this builder
+    validator on StepSubmitRequest enforces this upstream; this builder
     re-checks defensively because direct callers (tests) skip the wire.
 
     Args:
@@ -140,6 +141,10 @@ def build_job_submit_payload(
         work_ticket_idx: control-plane work_ticket id; in the job name
             so a SLURM scheduler dump can be cross-referenced back to
             the originating ticket.
+        attempt: retry attempt number, encoded into the deterministic
+            job name so a retry doesn't collide with the previous
+            attempt's (terminal) job and so the recovery path can find
+            the current attempt's job by name.
         container: apptainer-runnable image (e.g.
             `/opt/qiita/containers/reference-hash:1.0.0.sif`,
             `qiita/reference-hash:1.0.0` for community-extension hosts).
@@ -241,7 +246,12 @@ def build_job_submit_payload(
         )
 
     job: dict[str, Any] = {
-        "name": f"qiita-{step_name}-wt{work_ticket_idx}",
+        # Deterministic, recovery-findable name: ticket, then step, then
+        # attempt. SlurmrestdClient.find_jobs_by_name keys off this exact
+        # shape to re-adopt a job the control plane submitted but may not
+        # have persisted the id for. The attempt suffix keeps a retry's
+        # job from colliding with the terminal previous attempt's job.
+        "name": f"qiita-wt{work_ticket_idx}-{step_name}-a{attempt}",
         "account": account,
         "partition": partition,
         "current_working_directory": str(workspace),

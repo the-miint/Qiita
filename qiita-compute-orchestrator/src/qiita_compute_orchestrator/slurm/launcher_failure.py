@@ -7,7 +7,7 @@ returning 1:
     {"kind": "<FailureKind value>", "step_name": "<YAML step name>",
      "reason": "<human-readable detail>"}
 
-`SlurmBackend.run_step` reads the SLURM job's stderr file after a
+`SlurmBackend.result_step` reads the SLURM job's stderr file after a
 terminal-but-not-success state and uses this parser to enrich the
 `BackendFailure` it raises — without it, the failure that surfaces
 on `qiita.work_ticket.failure_reason` would only carry the

@@ -3,9 +3,9 @@
 Exercises every layer of the private CP → CO step path:
 
   * `ComputeBackendClient` (qiita-common) — request envelope serialization
-    (StepRunRequest), Authorization header, response parsing back into
+    (StepSubmitRequest), Authorization header, response parsing back into
     Path objects.
-  * `POST /api/v1/step/run` (qiita-compute-orchestrator) — bearer-token
+  * `POST /api/v1/step/submit` (qiita-compute-orchestrator) — bearer-token
     compare, route-level dispatch into `app.state.backend`.
   * Real `LocalBackend` running the `hash_sequences` native module —
     actually canonicalizes the upload Parquet and writes manifest.parquet
@@ -55,7 +55,7 @@ def _write_upload_parquet(path: Path, reads: list[tuple[str, str]]) -> Path:
 @pytest.fixture
 def orchestrator_app():
     """Configure the orchestrator app's state without going through
-    lifespan. The /step/run route reads from `request.app.state` so
+    lifespan. The /step/* routes read from `request.app.state` so
     setting it directly is sufficient and avoids re-running lifespan
     (which would re-resolve `Settings.from_env()` on every test)."""
     orch_app.state.backend = LocalBackend()
@@ -64,10 +64,12 @@ def orchestrator_app():
 
 
 async def test_step_dispatch_hash_end_to_end(orchestrator_app, tmp_path):
-    """A real ComputeBackendClient → /step/run → LocalBackend → native
+    """A real ComputeBackendClient → /step/submit → LocalBackend → native
     hash_sequences run: the manifest Parquet must end up on disk with the
-    expected shape. Verifies the CP-side envelope (StepRunRequest) carries
-    the YAML's module path correctly through to run_native_job dispatch."""
+    expected shape. Verifies the CP-side envelope (StepSubmitRequest) carries
+    the YAML's module path correctly through to run_native_job dispatch.
+    LocalBackend is synchronous, so submit_step returns a terminal handle
+    carrying the outputs (no polling)."""
     fasta = _write_upload_parquet(
         tmp_path / "upload.parquet",
         [("seq1", "ACGTACGTACGTACGT"), ("seq2", "TTTTAAAACCCCGGGG")],
@@ -87,18 +89,21 @@ async def test_step_dispatch_hash_end_to_end(orchestrator_app, tmp_path):
             api_token=_SHARED_TOKEN,
             http_client=http,
         )
-        outputs = await client.run_step(
+        handle = await client.submit_step(
             step_name="hash_sequences",
             inputs={"fasta_path": fasta},
             workspace=workspace,
             scope_target={"kind": "reference", "reference_idx": 1},
             work_ticket_idx=1,
-            # StepRunRequest validates exactly-one(container, module);
+            # StepSubmitRequest validates exactly-one(container, module);
             # LocalBackend rejects container steps wholesale, so native
             # dispatch under `module:` is the only LocalBackend path.
             module=_HASH_SEQUENCES_MODULE,
         )
 
+    # Synchronous backend: the outputs come back on the terminal handle.
+    assert handle.terminal_outputs is not None
+    outputs = {k: Path(v) for k, v in handle.terminal_outputs.items()}
     manifest = outputs["manifest"]
     assert manifest.exists()
     assert manifest == workspace / "manifest.parquet"
@@ -132,7 +137,7 @@ async def test_step_dispatch_rejects_wrong_token(orchestrator_app, tmp_path):
             http_client=http,
         )
         with pytest.raises(httpx.HTTPStatusError) as exc_info:
-            await client.run_step(
+            await client.submit_step(
                 step_name="hash_sequences",
                 inputs={"fasta_path": tmp_path / "x.parquet"},
                 workspace=tmp_path,

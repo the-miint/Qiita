@@ -2,9 +2,8 @@
 
 Covers the asyncio-task lifecycle pieces (`schedule_dispatch`,
 `drain_running_dispatches`, `build_compute_backend_client`) without
-requiring a live DB. The DB-bound piece (`recover_orphaned_tickets`)
-is exercised by the route tests in tests/routes/test_work_ticket.py
-once those land.
+requiring a live DB. The DB-bound piece (`reconcile_inflight_tickets`)
+is exercised by the route tests in tests/routes/test_work_ticket.py.
 """
 
 from __future__ import annotations
@@ -64,7 +63,7 @@ async def test_schedule_dispatch_registers_and_removes_task(monkeypatch):
     started = asyncio.Event()
     finish = asyncio.Event()
 
-    async def _fake_run(_app, ticket_idx):
+    async def _fake_run(_app, ticket_idx, **_kwargs):
         started.set()
         await finish.wait()
 

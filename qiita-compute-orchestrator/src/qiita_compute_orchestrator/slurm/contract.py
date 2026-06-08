@@ -1,7 +1,7 @@
 """Shared container/native-output contract.
 
 These constants and types are the surface where the producer
-(`SlurmBackend.run_step` for params.json, the container's own
+(`SlurmBackend.submit_step` for params.json, the container's own
 entrypoint or `jobs/__main__.py` for manifest.json) and the consumer
 (the launcher in `jobs/__main__.py` for params.json, `slurm/verify.py`
 for manifest.json) meet. Keeping them in one module means a change
@@ -36,7 +36,7 @@ class JobParams(BaseModel):
     """Typed shape of params.json — the channel for workflow-specific
     data the SLURM job needs at execution time.
 
-    Producer: `SlurmBackend.run_step` constructs one and writes its
+    Producer: `SlurmBackend.submit_step` constructs one and writes its
     `model_dump_json()` to `<QIITA_INPUT_PATH>/<JOB_PARAMS_FILENAME>`.
     Consumer: the launcher in `jobs/__main__.py` reads the file and
     `model_validate_json`s it. Both sides type-check against this

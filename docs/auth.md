@@ -351,7 +351,7 @@ Both CLIs share `cli/_common`: PAT file I/O, the loopback flow, the authenticate
 
 ## CP ↔ CO service-to-service auth
 
-The control-plane runner dispatches workflow `step:` entries to the orchestrator via `POST /api/v1/step/run`. CO → CP callbacks exist today for `POST /sequence-range` (called by the native `fastq_to_parquet` step to mint a contiguous bigint range); they authenticate with the `compute-worker` service-account PAT installed at `/etc/qiita/co-to-cp.token` (provisioning: [`docs/runbooks/compute-service-account-provisioning.md`](runbooks/compute-service-account-provisioning.md)). Workflow lifecycle and DB writes still happen entirely on the control plane.
+The control-plane runner dispatches workflow `step:` entries to the orchestrator via the decoupled `POST /api/v1/step/{submit,status,result}` trio (plus `POST /api/v1/step/find-by-name`), all gated by the same CP↔CO shared bearer. CO → CP callbacks exist today for `POST /sequence-range` (called by the native `fastq_to_parquet` step to mint a contiguous bigint range); they authenticate with the `compute-worker` service-account PAT installed at `/etc/qiita/co-to-cp.token` (provisioning: [`docs/runbooks/compute-service-account-provisioning.md`](runbooks/compute-service-account-provisioning.md)). Workflow lifecycle and DB writes still happen entirely on the control plane.
 
 A single shared bearer token authenticates this private path. Both services read it from the same conventional locations:
 
