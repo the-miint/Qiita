@@ -34,7 +34,7 @@ import sqlite3
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from pydantic import BaseModel, ValidationError
 from qiita_common.api_paths import (
@@ -578,15 +578,43 @@ def _build_parser() -> argparse.ArgumentParser:
             " which builds the rype negative-filter index. Requires --taxonomy."
         ),
     )
-    p_reference_load.add_argument("--fasta", required=True, type=Path)
+    # FASTA source: --fasta (remote DoPut upload) XOR --fasta-manifest (--local
+    # by-path). Neither is argparse-required because exactly which one applies
+    # depends on --local; the entry point enforces the XOR and the
+    # per-mode requirement with clear messages.
+    p_reference_load.add_argument(
+        "--fasta",
+        type=Path,
+        help="Single FASTA to stream over DoPut (remote ingest; omit under --local)",
+    )
+    p_reference_load.add_argument(
+        "--local",
+        action="store_true",
+        help=(
+            "Ingest FASTA by path instead of DoPut: stage the files listed in"
+            " --fasta-manifest (and pass companions as raw paths) to the"
+            " local-(host-)reference-add workflow. No --data-plane-url needed."
+        ),
+    )
+    p_reference_load.add_argument(
+        "--fasta-manifest",
+        type=Path,
+        dest="fasta_manifest",
+        help=(
+            "Under --local: absolute path to a manifest listing one absolute"
+            " FASTA path per line (blank lines and `#` comments ignored)."
+        ),
+    )
     p_reference_load.add_argument("--taxonomy", type=Path)
     p_reference_load.add_argument("--tree", type=Path)
     p_reference_load.add_argument("--jplace", type=Path)
     p_reference_load.add_argument("--genome-map", type=Path, dest="genome_map")
     p_reference_load.add_argument(
         "--data-plane-url",
-        required=True,
-        help="gRPC URL of the data plane (e.g. grpc://qiita-data.example.com:50051)",
+        help=(
+            "gRPC URL of the data plane (e.g. grpc://qiita-data.example.com:50051)."
+            " Required for remote ingest; ignored (and optional) under --local."
+        ),
     )
     p_reference_load.add_argument(
         "--no-watch",
@@ -845,42 +873,59 @@ async def _run_reference_load(
     *,
     base_url: str,
     token: str,
-    data_plane_url: str,
+    data_plane_url: str | None,
     args: argparse.Namespace,
 ) -> dict:
-    """Construct real httpx + pyarrow.flight clients and drive
-    `do_reference_load`. Lives next to the CLI handler so the handler
+    """Construct real httpx + (for remote ingest) pyarrow.flight clients and
+    drive `do_reference_load`. Lives next to the CLI handler so the handler
     stays a thin argparse → entry-point shim; the entry point itself
     (in cli.reference_load) takes injected clients so tests bypass this
-    function entirely."""
+    function entirely.
+
+    Under `--local` no bytes cross the wire, so no Flight client is built and
+    `--data-plane-url` is not needed; the by-path manifest + companions ride in
+    action_context. The remote path requires `--data-plane-url`."""
     import httpx as _httpx
-    import pyarrow.flight as flight
 
     from .reference_load import do_reference_load
+
+    # Shared keyword args for both ingest modes.
+    common_kwargs: dict[str, Any] = dict(
+        token=token,
+        local=args.local,
+        fasta_path=args.fasta,
+        fasta_manifest_path=args.fasta_manifest,
+        name=args.name,
+        version=args.version,
+        kind=args.kind,
+        host=args.host,
+        reference_idx=args.reference_idx,
+        taxonomy_path=args.taxonomy,
+        tree_path=args.tree,
+        jplace_path=args.jplace,
+        genome_map_path=args.genome_map,
+        watch=not args.no_watch,
+        poll_interval_seconds=args.poll_interval,
+        timeout_seconds=args.timeout,
+    )
+
+    if args.local:
+        async with _httpx.AsyncClient(
+            base_url=base_url, timeout=_common.CLI_HTTP_TIMEOUT_SECONDS
+        ) as http:
+            return await do_reference_load(http=http, flight_client=None, **common_kwargs)
+
+    if not data_plane_url:
+        raise ValueError("--data-plane-url is required for remote ingest (or use --local)")
+
+    import pyarrow.flight as flight
 
     flight_client = flight.FlightClient(data_plane_url)
     try:
         async with _httpx.AsyncClient(
             base_url=base_url, timeout=_common.CLI_HTTP_TIMEOUT_SECONDS
         ) as http:
-            return await do_reference_load(
-                http=http,
-                token=token,
-                flight_client=flight_client,
-                fasta_path=args.fasta,
-                name=args.name,
-                version=args.version,
-                kind=args.kind,
-                host=args.host,
-                reference_idx=args.reference_idx,
-                taxonomy_path=args.taxonomy,
-                tree_path=args.tree,
-                jplace_path=args.jplace,
-                genome_map_path=args.genome_map,
-                watch=not args.no_watch,
-                poll_interval_seconds=args.poll_interval,
-                timeout_seconds=args.timeout,
-            )
+            return await do_reference_load(http=http, flight_client=flight_client, **common_kwargs)
     finally:
         flight_client.close()
 

@@ -1,0 +1,125 @@
+action_id: local-host-reference-add
+version: 1.0.0
+target_kind: reference
+
+description: >
+  Local-ingest variant of host-reference-add. Stages MANY host-resident FASTA
+  files (a manifest of absolute paths) into one chunked Parquet, then runs the
+  host pipeline unchanged: hash + mint + load (taxonomy required), build a rype
+  `.ryxdi` minimizer index over every feature, and record it in
+  qiita.reference_index. The index is consumed at host-read-filtering time as
+  rype's negative_index. Differs from local-reference-add only by requiring
+  taxonomy and by the build-rype-index → register-index tail; the lifecycle
+  gains `loading → indexing → active`. Companions are raw absolute paths on the
+  compute host, not DoPut uploads.
+
+scopes:
+  - reference:write
+
+audience:
+  service: false
+  human_roles: [wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  # Both required for a host reference: the FASTA manifest is the sequence
+  # source and taxonomy is the rype mapping authority. Every value is a raw
+  # absolute path on the compute host (NOT a DoPut `*_upload_idx`); `pattern:"^/"`
+  # forces absolute so the SLURM compute node can see it (bind mounts expose
+  # host paths, they do not copy). The runner leaves `*_path` keys untouched.
+  required: [fasta_manifest_path, taxonomy_path]
+  properties:
+    fasta_manifest_path: {type: string, pattern: "^/"}
+    taxonomy_path: {type: string, pattern: "^/"}
+    tree_path: {type: string, pattern: "^/"}
+    jplace_path: {type: string, pattern: "^/"}
+    genome_map_path: {type: string, pattern: "^/"}
+
+success_status: active
+failure_status: failed
+
+steps:
+  # The only new step on the local path: manifest → one combined chunked
+  # fasta.parquet, whose `fasta_path` output feeds hash_sequences (identical to
+  # host-reference-add's hash_sequences). No target_status: the reference stays
+  # `pending` through staging and hash_sequences makes the first transition.
+  - step: stage_local_fasta
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.stage_local_fasta
+    inputs: [fasta_manifest_path]
+    outputs: [fasta_path]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 8
+      walltime: PT1H
+
+  - step: hash_sequences
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.hash_sequences
+    target_status: hashing
+    inputs: [fasta_path]
+    outputs: [manifest, reference_sequence_chunks]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 8
+      walltime: PT1H
+
+  - action: mint-features
+    target_status: minting
+    inputs: [manifest]
+    outputs: [feature_map]
+
+  - action: write-membership
+    inputs: [feature_map]
+    outputs: []
+
+  - step: load
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.reference_load
+    target_status: loading
+    inputs: [manifest, feature_map, reference_sequence_chunks]
+    optional_inputs: [taxonomy_path, tree_path, jplace_path]
+    # `reference_sequence_chunks` is re-emitted feature-keyed here (the
+    # hash_sequences binding was sequence_hash-keyed); build_rype_index below
+    # consumes that re-keyed form.
+    outputs: [staging_dir, reference_sequence_chunks]
+    baseline_resources:
+      cpu: 8
+      mem_gb: 32
+      walltime: PT2H
+
+  # MUST precede register-files: register-files MOVES the feature-keyed
+  # reference_sequence_chunks part files into permanent DuckLake storage
+  # (data-plane move_file), so the index build has to read them from staging
+  # first. The persistent .ryxdi is written under the shared scratch base
+  # ({PATH_SCRATCH}/references/{reference_idx}/rype/index.ryxdi), not the
+  # ephemeral workspace; build_rype_index returns its path (rype_index_path)
+  # and a small meta JSON (rype_index_meta) carrying index_type / fs_path /
+  # params that register-index consumes.
+  - step: build_rype_index
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.build_rype_index
+    target_status: indexing
+    inputs: [reference_sequence_chunks]
+    outputs: [rype_index_path, rype_index_meta]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 32
+      walltime: PT2H
+
+  - action: register-files
+    inputs: [staging_dir]
+    outputs: []
+
+  # Records the built index in qiita.reference_index. The runner's
+  # register-index arm reads bound["rype_index_meta"] (native-step outputs are
+  # path strings, so the build params ride a file) — `inputs` here documents
+  # that data flow.
+  - action: register-index
+    inputs: [rype_index_meta]
+    outputs: []
+
+action_ceiling:
+  cpu: 16
+  mem_gb: 64
+  walltime: PT4H
