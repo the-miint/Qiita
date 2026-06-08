@@ -1030,10 +1030,12 @@ async def test_post_biosample_owner_id_missing_value_marker_422(ctx):
 
 
 async def test_post_biosample_metadata_uses_seeded_globals(ctx):
-    # Realistic 6-field MIxS-style import that resolves global fields
-    # against the rows seeded by migration 20260501000014 instead of
-    # creating throwaway global fields. Cleanup tracks only the per-test
-    # study-field and metadata rows so the seeded globals survive.
+    # Realistic 6-field MIxS-style import that resolves global fields against
+    # the seeded biosample global-field rows instead of creating throwaway
+    # global fields. The two environmental-context fields are ENVO terminology
+    # fields, so their values are submitted as ENVO term_ids and resolve into
+    # value_terminology_term_idx. Cleanup tracks only the per-test study-field
+    # and metadata rows so the seeded globals survive.
     display_names = [
         "collection date",
         "geographic location (country and/or sea)",
@@ -1051,6 +1053,21 @@ async def test_post_biosample_metadata_uses_seeded_globals(ctx):
     # Sanity-check: every seeded display_name resolved before we run the route.
     assert set(display_to_idx) == set(display_names)
 
+    # The two environmental-context fields are ENVO terminology fields; resolve
+    # the seeded term idxs their submitted term_ids will land on.
+    envo_term_ids = {
+        "broad-scale environmental context": "ENVO:01000249",
+        "local environmental context": "ENVO:00000469",
+    }
+    term_rows = await ctx["pool"].fetch(
+        "SELECT tt.term_id, tt.idx FROM qiita.terminology_term tt"
+        " JOIN qiita.terminology t ON t.idx = tt.terminology_idx"
+        " WHERE t.name = 'ENVO' AND tt.term_id = ANY($1::text[])",
+        list(envo_term_ids.values()),
+    )
+    term_id_to_idx = {r["term_id"]: r["idx"] for r in term_rows}
+    assert set(term_id_to_idx) == set(envo_term_ids.values())
+
     study_idx = await _seed_study(
         ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="seeded-meta"
     )
@@ -1063,8 +1080,8 @@ async def test_post_biosample_metadata_uses_seeded_globals(ctx):
         "geographic location (country and/or sea)": "USA",
         "geographic location (latitude)": "32.7157",
         "geographic location (longitude)": "-117.1611",
-        "broad-scale environmental context": "human-associated habitat [ENVO:00009003]",
-        "local environmental context": "gastrointestinal tract [ENVO:00002041]",
+        "broad-scale environmental context": envo_term_ids["broad-scale environmental context"],
+        "local environmental context": envo_term_ids["local environmental context"],
     }
 
     resp = await _post_biosample(
@@ -1084,9 +1101,12 @@ async def test_post_biosample_metadata_uses_seeded_globals(ctx):
     bs_idx = resp.json()["biosample_idx"]
     await _track_global_metadata_outputs(ctx, bs_idx, study_idx, list(display_to_idx.values()))
 
-    # Verify every metadata row landed in the correct typed value_* column.
+    # Verify every metadata row landed in the correct typed value_* column:
+    # typed scalars in value_text/value_numeric/value_date, ENVO terms in
+    # value_terminology_term_idx.
     rows = await ctx["pool"].fetch(
-        "SELECT global_field_idx, value_text, value_numeric, value_date"
+        "SELECT global_field_idx, value_text, value_numeric, value_date,"
+        " value_terminology_term_idx"
         " FROM qiita.biosample_metadata"
         " WHERE biosample_idx = $1 AND is_owner_biosample_id = false"
         " ORDER BY global_field_idx",
@@ -1099,36 +1119,42 @@ async def test_post_biosample_metadata_uses_seeded_globals(ctx):
                 "value_text": None,
                 "value_numeric": None,
                 "value_date": date(2026, 4, 1),
+                "value_terminology_term_idx": None,
             },
             {
                 "global_field_idx": display_to_idx["geographic location (country and/or sea)"],
                 "value_text": "USA",
                 "value_numeric": None,
                 "value_date": None,
+                "value_terminology_term_idx": None,
             },
             {
                 "global_field_idx": display_to_idx["geographic location (latitude)"],
                 "value_text": None,
                 "value_numeric": Decimal("32.7157"),
                 "value_date": None,
+                "value_terminology_term_idx": None,
             },
             {
                 "global_field_idx": display_to_idx["geographic location (longitude)"],
                 "value_text": None,
                 "value_numeric": Decimal("-117.1611"),
                 "value_date": None,
+                "value_terminology_term_idx": None,
             },
             {
                 "global_field_idx": display_to_idx["broad-scale environmental context"],
-                "value_text": "human-associated habitat [ENVO:00009003]",
+                "value_text": None,
                 "value_numeric": None,
                 "value_date": None,
+                "value_terminology_term_idx": term_id_to_idx["ENVO:01000249"],
             },
             {
                 "global_field_idx": display_to_idx["local environmental context"],
-                "value_text": "gastrointestinal tract [ENVO:00002041]",
+                "value_text": None,
                 "value_numeric": None,
                 "value_date": None,
+                "value_terminology_term_idx": term_id_to_idx["ENVO:00000469"],
             },
         ],
         key=lambda r: r["global_field_idx"],

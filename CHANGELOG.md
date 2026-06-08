@@ -15,6 +15,11 @@ the `no-changelog` label).
 
 ### Added
 
+- ENVO terminology seed for the environmental-context biosample fields
+  (`broad_scale_environmental_context`, `local_environmental_context`,
+  `environmental_medium`), plus a reusable
+  `rebind_biosample_global_field_data_type` migration helper that guards a
+  field's data_type flip against existing metadata rows (#TBD)
 - Study submission tracking: `qiita.study` gains `last_submission_at` /
   `submission_error` (exposed for read and PATCH), bringing study to parity
   with biosample and sequenced_sample. The three tables now share one
