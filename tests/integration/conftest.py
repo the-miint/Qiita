@@ -31,6 +31,7 @@ os.environ.setdefault("CO_TO_CP_TOKEN", "test-co-to-cp-token")
 import asyncpg  # noqa: E402
 import pytest  # noqa: E402
 from qiita_common.api_paths import LOOPBACK_HOST
+from qiita_common.duckdb_miint import setup_miint_test_env  # noqa: E402
 
 from _pg_env import (
     LIB_PATH_ENV,
@@ -49,6 +50,17 @@ from qiita_control_plane.testing.sessions import (  # noqa: F401
     human_admin_session,
     regular_user_session,
 )
+
+# Integration tests run native orchestrator jobs (hash_sequences,
+# stage_local_fasta, reference_load) in-process via LocalBackend, which install
+# + load the miint extension. Point those installs at the team mirror and a
+# per-suite private extension directory — same as the control-plane and
+# orchestrator conftests — so a mirror-origin extension cached in the shared
+# default `~/.duckdb/extensions` (e.g. from the data plane) doesn't collide with
+# a community-origin INSTALL here ("origin is different" / FORCE INSTALL). Set at
+# module load (before any test/fixture connects); the env is read at DuckDB
+# connect() time, so placement after the import block is correct.
+setup_miint_test_env("integration")
 
 POSTGRES_URL = resolve_postgres_url()
 REPO_ROOT = Path(__file__).parent.parent.parent

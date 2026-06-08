@@ -15,6 +15,12 @@ the `no-changelog` label).
 
 ### Added
 
+- Local-host FASTA ingest: `qiita reference load --local --fasta-manifest <path>`
+  builds a reference from many host-resident FASTA files **by path** (no DoPut
+  upload), backed by the `stage_local_fasta` native job and two new workflows,
+  `local-reference-add` and `local-host-reference-add`; companions
+  (taxonomy/tree/jplace/genome_map) ride as raw absolute paths
+  (#feature/local-many-fasta-ingest)
 - Host references for host-read filtering: `is_host` column on `qiita.reference`,
   the `reference_index` table tracking built indexes, an `indexing` reference
   status (`loading → indexing → active`), and the `host-reference-add` workflow
@@ -52,6 +58,12 @@ the `no-changelog` label).
 
 ### Changed
 
+- `qiita reference load` now parses FASTA with miint's `read_fastx` and a shared
+  DuckDB `chunk_list` macro (in new `qiita_common.chunking` /
+  `qiita_common.duckdb_miint` modules) instead of a hand-rolled Python FASTA
+  chunker; the control-plane CLI loads the miint DuckDB extension client-side.
+  No sequence bytes pass through Python and memory stays bounded for
+  genome-scale records (#feature/local-many-fasta-ingest)
 - The SLURM backend now propagates `PATH_SCRATCH` into the compute-node job
   environment, so native steps that derive a persistent path from it (e.g.
   `build_rype_index` writing the rype `.ryxdi`) resolve the real scratch root
