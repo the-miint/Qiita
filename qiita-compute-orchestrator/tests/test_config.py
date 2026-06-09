@@ -2,7 +2,7 @@
 
 Focus: the asymmetric token-resolution surface. `Settings.from_env()`
 is called eagerly by the FastAPI lifespan (where `cp_to_co_token` is
-required — it's the inbound `POST /step/run` bearer). It's *also*
+required — it's the inbound `POST /step/*` bearer). It's *also*
 called lazily by `get_settings()` from the SLURM-launcher / CLI path,
 where `cp_to_co_token` is irrelevant because the launcher never serves
 that route. The flag below threads that distinction.
@@ -64,7 +64,7 @@ def test_get_settings_no_install_fallback_skips_cp_to_co_token(monkeypatch, tmp_
     SLURM-launcher path, where the no-install fallback is supposed to
     pass `require_cp_to_co_token=False` internally.
 
-    This is the behavior that lets `SlurmBackend.run_step` drop
+    This is the behavior that lets `SlurmBackend.submit_step` drop
     `CP_TO_CO_TOKEN` from the per-job env. If this test starts
     failing, the deploy host is back to needing the inbound bearer
     in every SLURM job's `scontrol show job` output."""

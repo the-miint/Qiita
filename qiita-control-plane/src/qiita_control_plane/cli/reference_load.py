@@ -24,17 +24,26 @@ What the subcommand does, in order, against a running CP + DP:
      printing state transitions; (--no-watch) print the work_ticket_idx
      and exit so the caller can poll externally.
 
-**Arrow streaming** (per role):
+**Local ingest (`--local`).** When the FASTA files already reside on the
+compute host (e.g. ~100 human genomes ≈ 300 GB), streaming bytes over Flight is
+wasteful — `--local --fasta-manifest PATH` ingests by path instead. Step 2's
+upload loop is skipped entirely (no DoPut, no /upload slots); the manifest and
+any companions ride in `action_context` as raw absolute `*_path` keys, and the
+`local-(host-)reference-add` action is submitted. Its first step
+(`stage_local_fasta`) reads the manifest on the host and stages the files into
+the same chunked Parquet the remote path produces, so everything downstream is
+identical. No `--data-plane-url` is needed. `--fasta` and `--fasta-manifest`
+are mutually exclusive.
 
-  - FASTA: streaming Python parser → 64 KB chunks. Upload schema:
-           ``(read_id, chunk_index, chunk_data)``. Bounded memory
-           regardless of record size — GG2 genome records up to ~21 MB
-           stream as many small chunks instead of a single multi-MB
-           Parquet cell. DuckDB + miint's ``read_fastx`` is NOT used
-           here even though it would be the natural fit, because
-           DuckDB's 2048-row vector model OOMs on multi-MB strings
-           before any downstream operator runs; see
-           `_fasta_upload_stream` for the full rationale.
+**Arrow streaming** (per role, remote path only):
+
+  - FASTA: miint ``read_fastx`` + DuckDB ``list_transform``/``UNNEST``
+           64 KB chunking, streamed via ``to_arrow_reader``. Upload
+           schema: ``(read_id, chunk_index, chunk_data)``. Bounded memory
+           regardless of record size — ``max_batch_bytes`` caps the read
+           batch so a multi-MB GG2 genome record (~21 MB) streams as many
+           small chunks instead of a single multi-MB Parquet cell. No
+           sequence bytes pass through Python; see `_fasta_upload_stream`.
   - Newick / jplace: Python ``read(64 KB)`` loop over the source file.
            Upload schema: ``(chunk_index, chunk_data BLOB)``. Bounded
            memory regardless of file size — GG2 phylogeny (~407 MB) and
@@ -42,8 +51,8 @@ What the subcommand does, in order, against a running CP + DP:
   - Taxonomy / genome_map Parquet: ``pq.ParquetFile.iter_batches()``
            passthrough — these are already row-shaped data.
 
-All chunked uploads use ROW_GROUP_SIZE = 16384 (matches the chunked-
-sequence write tuning in miint.py): ~1 GB per row group at 64 KB chunks.
+All chunked uploads batch at CHUNK_ROW_GROUP_SIZE = 16384 rows (shared
+``qiita_common.chunking``): ~1 GB per batch at 64 KB chunks.
 
 Client does NOT canonicalize sequences or hash anything — that happens
 server-side inside hash_sequences. The client never reconstructs a full
@@ -79,6 +88,7 @@ from qiita_common.api_paths import (
     URL_WORK_TICKET_PREFIX,
 )
 from qiita_common.auth_constants import BEARER_PREFIX
+from qiita_common.chunking import CHUNK_LIST_MACRO_SQL, CHUNK_ROW_GROUP_SIZE, CHUNK_SIZE
 
 if TYPE_CHECKING:
     import pyarrow.flight as flight
@@ -95,11 +105,20 @@ _TERMINAL_WORK_TICKET_STATES = frozenset({"completed", "failed"})
 DEFAULT_POLL_INTERVAL_SECONDS = 2.0
 DEFAULT_POLL_TIMEOUT_SECONDS = 24 * 3600
 
-# Action identifiers the CLI submits, by host-ness. Pinned against the on-disk
-# workflow YAML in tests/test_actions_loader.py so an id/version drift fails at
-# build time instead of 404ing at submit. Both workflows ship as version 1.0.0.
+# Action identifiers the CLI submits, by host-ness and ingest mode. Pinned
+# against the on-disk workflow YAML in tests/test_actions_loader.py so an
+# id/version drift fails at build time instead of 404ing at submit. All four
+# workflows ship as version 1.0.0.
+#
+# Remote (DoPut upload) vs local (by-path, --local) are distinct actions
+# because their first step and context_schema differ: remote resolves a
+# `fasta_upload_idx` handle; local's stage_local_fasta reads a
+# `fasta_manifest_path` and stages many host-resident FASTA files. Everything
+# downstream of the first step is identical.
 _REFERENCE_ADD_ACTION_ID = "reference-add"
 _HOST_REFERENCE_ADD_ACTION_ID = "host-reference-add"
+_LOCAL_REFERENCE_ADD_ACTION_ID = "local-reference-add"
+_LOCAL_HOST_REFERENCE_ADD_ACTION_ID = "local-host-reference-add"
 _REFERENCE_ADD_ACTION_VERSION = "1.0.0"
 
 
@@ -125,13 +144,21 @@ class UploadResult:
 # the local filesystem. The DoPut handler is schema-agnostic, so each
 # role picks the shape its server-side consumer expects to read.
 
-# Chunked-upload tuning. Matches CHUNK_SIZE / CHUNK_ROW_GROUP_SIZE in
-# qiita_compute_orchestrator.miint — 64 KB chunks at 16384 rows per
-# batch keeps each Arrow batch ~1 GB on dense data and bounds CLI
-# memory regardless of source-record size (GG2 genome records run up
-# to ~21 MB; backbone 16S records are ~1.5 KB).
-_CHUNK_SIZE = 65_536
-_CHUNK_ROWS_PER_BATCH = 16_384
+# Chunked-upload tuning. The 64 KB chunk size is the shared
+# qiita_common.chunking.CHUNK_SIZE: the FASTA streamer passes it to the DuckDB
+# chunking macro over read_fastx, and the blob streamer (Newick / jplace)
+# reuses it for its byte reads. The per-RecordBatch row count —
+# CHUNK_ROW_GROUP_SIZE (16384) — keeps each batch ~1 GB on dense data and bounds
+# CLI memory regardless of source-record size (GG2 genome records run up to
+# ~21 MB; backbone 16S records are ~1.5 KB).
+_CHUNK_SIZE = CHUNK_SIZE
+_CHUNK_ROWS_PER_BATCH = CHUNK_ROW_GROUP_SIZE
+
+# Byte budget per read_fastx batch. Caps the read-side vector so a run of
+# multi-MB genome records can't materialise a giant batch before the chunking
+# macro runs — the read-side memory lever (the DuckDB result streams to the
+# DoPut writer one bounded RecordBatch at a time via to_arrow_reader).
+_READ_FASTX_MAX_BATCH_BYTES = "64MB"
 
 
 @dataclass(frozen=True)
@@ -147,88 +174,51 @@ class UploadStream:
 
 @contextlib.contextmanager
 def _fasta_upload_stream(fasta_path: Path) -> Iterator[UploadStream]:
-    """FASTA → `(read_id, chunk_index, chunk_data)` chunked stream via a
-    streaming Python parser. Sequences are chunked at the client so a
-    multi-MB GG2 genome record never lands as a single VARCHAR cell on
-    the wire.
+    """FASTA → `(read_id, chunk_index, chunk_data)` chunked stream via miint.
 
-    Why Python and not DuckDB + miint's `read_fastx` here: DuckDB's
-    vectorized engine fills 2048-row vectors before any downstream
-    operator runs. On GG2 backbone — where a handful of records reach
-    ~21 MB — one such vector is 40+ GB, OOMing reliably on any sane
-    host. `preserve_insertion_order=false` doesn't help because the
-    materialisation happens upstream of the CROSS JOIN UNNEST. A
-    line-buffered Python parser bounds memory to one record plus one
-    in-flight batch (~1 GB at 16384 chunks × 64 KB), independent of
-    record size and file size. Server-side `hash_sequences` still uses
-    miint for the read_fastx path it actually consumes (chunked
-    Parquet), so miint is not removed from the pipeline, just bypassed
-    on the client where the vector model doesn't fit the data shape.
+    miint's `read_fastx` parses FASTA natively (gz-transparent; `read_id` is
+    the header's first token, description dropped); the 64 KB chunking is the
+    DuckDB `list_transform`/`UNNEST` macro; `to_arrow_reader` hands DuckDB's
+    streaming result to the DoPut writer one bounded RecordBatch at a time. No
+    sequence bytes pass through Python and no intermediate Parquet hits local
+    disk.
 
-    chunks within a read carry their own `chunk_index`, so
-    hash_sequences reconstructs by ORDER BY regardless of arrival
-    order. Reads gzipped (`.gz`) or plain FASTA transparently."""
-    import gzip
+    Bounded memory regardless of record size: `max_batch_bytes` caps each
+    read_fastx batch by bytes so a multi-MB GG2 genome record (~21 MB) can't
+    materialise a giant vector, and the result streams (proven: emits far more
+    output than the DuckDB `memory_limit` without spilling). chunks within a
+    read carry their own `chunk_index`, so `hash_sequences` reconstructs by
+    ORDER BY regardless of arrival order.
 
-    import pyarrow as pa
+    The DuckDB connection is held open for the life of the `with` block — the
+    reader pulls from it lazily as the DoPut writer consumes batches — and
+    closed on exit.
 
-    schema = pa.schema(
-        [
-            pa.field("read_id", pa.string()),
-            pa.field("chunk_index", pa.int32()),
-            pa.field("chunk_data", pa.string()),
-        ]
-    )
+    An empty FASTA is rejected up front with a clear message: `read_fastx`
+    raises a raw "Empty file" error on a zero-record input, so pre-check with
+    the shared `is_empty_sequence_file` (matching `stage_local_fasta`)."""
+    from qiita_common.duckdb_miint import is_empty_sequence_file
 
-    opener = gzip.open if fasta_path.suffix == ".gz" else open
+    from qiita_control_plane.miint import connect_with_miint
 
-    def _iter_batches() -> Iterator[Any]:
-        read_ids: list[str] = []
-        chunk_indexes: list[int] = []
-        chunk_datas: list[str] = []
+    if is_empty_sequence_file(fasta_path):
+        raise ValueError(f"FASTA file contains no records: {fasta_path}")
 
-        def _emit_batch() -> Any:
-            batch = pa.RecordBatch.from_arrays(
-                [
-                    pa.array(read_ids, type=pa.string()),
-                    pa.array(chunk_indexes, type=pa.int32()),
-                    pa.array(chunk_datas, type=pa.string()),
-                ],
-                schema=schema,
-            )
-            read_ids.clear()
-            chunk_indexes.clear()
-            chunk_datas.clear()
-            return batch
-
-        def _explode(read_id: str, sequence: str) -> Iterator[Any]:
-            for offset in range(0, len(sequence), _CHUNK_SIZE):
-                read_ids.append(read_id)
-                chunk_indexes.append(offset // _CHUNK_SIZE)
-                chunk_datas.append(sequence[offset : offset + _CHUNK_SIZE])
-                if len(read_ids) >= _CHUNK_ROWS_PER_BATCH:
-                    yield _emit_batch()
-
-        with opener(fasta_path, "rt") as f:
-            current_id: str | None = None
-            seq_parts: list[str] = []
-            for line in f:
-                if line.startswith(">"):
-                    if current_id is not None:
-                        yield from _explode(current_id, "".join(seq_parts))
-                    # read_id is everything between '>' and the first
-                    # whitespace; description (if any) is dropped, matching
-                    # miint's read_fastx behaviour.
-                    current_id = line[1:].split(None, 1)[0]
-                    seq_parts = []
-                else:
-                    seq_parts.append(line.strip())
-            if current_id is not None:
-                yield from _explode(current_id, "".join(seq_parts))
-            if read_ids:
-                yield _emit_batch()
-
-    yield UploadStream(schema=schema, batches=_iter_batches())
+    conn = connect_with_miint()
+    try:
+        # `chunk_list` is the shared chunking macro (one definition for both the
+        # CLI and the orchestrator's stage_local_fasta; see qiita_common.chunking).
+        conn.execute(CHUNK_LIST_MACRO_SQL)
+        reader = conn.execute(
+            "SELECT read_id, c.chunk_index, c.chunk_data FROM ("
+            "  SELECT read_id, UNNEST(chunk_list(sequence1)) AS c"
+            f"  FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}')"
+            ")",
+            [str(fasta_path)],
+        ).to_arrow_reader(_CHUNK_ROWS_PER_BATCH)
+        yield UploadStream(schema=reader.schema, batches=reader)
+    finally:
+        conn.close()
 
 
 @contextlib.contextmanager
@@ -471,8 +461,10 @@ async def do_reference_load(
     *,
     http: httpx.AsyncClient,
     token: str,
-    flight_client: flight.FlightClient,
-    fasta_path: Path,
+    flight_client: flight.FlightClient | None = None,
+    fasta_path: Path | None = None,
+    fasta_manifest_path: Path | None = None,
+    local: bool = False,
     name: str | None = None,
     version: str | None = None,
     kind: str | None = "sequence_reference",
@@ -494,9 +486,22 @@ async def do_reference_load(
     the latter creates a new reference, the former binds to an existing
     one. `kind` is consumed only when creating.
 
+    **Two ingest modes, selected by `local`:**
+
+    - Remote (`local=False`, the default): a single `fasta_path` is streamed
+      over Arrow Flight DoPut alongside any companions, and the
+      `(host-)reference-add` action is submitted with `*_upload_idx` handles.
+      `flight_client` is required. `fasta_manifest_path` must be unset.
+    - Local (`local=True`): no bytes cross the wire. `fasta_manifest_path`
+      (an absolute path to a manifest of absolute FASTA paths already resident
+      on the compute host) and any companions ride in `action_context` as raw
+      `*_path` keys, and the `local-(host-)reference-add` action is submitted —
+      its first step (`stage_local_fasta`) reads the manifest and stages the
+      files. `flight_client` is unused. `fasta_path` must be unset.
+
     `host=True` marks the new reference `is_host=true` and routes to the
-    `host-reference-add` action (which additionally builds the rype index
-    consumed as a negative filter at host-read-filtering time). A host
+    `(local-)host-reference-add` action (which additionally builds the rype
+    index consumed as a negative filter at host-read-filtering time). A host
     reference requires `taxonomy_path` — it's the rype mapping authority's
     source — so it's a fail-fast precondition here."""
     has_idx = reference_idx is not None
@@ -515,6 +520,50 @@ async def do_reference_load(
             "--host requires --taxonomy: a host reference must ship a taxonomy"
             " mapping authority for the rype index build"
         )
+
+    # FASTA source mode. --fasta (remote DoPut) and --fasta-manifest (--local
+    # by-path) are mutually exclusive; exactly one applies per ingest mode.
+    if local:
+        if fasta_path is not None:
+            raise ValueError(
+                "--local ingests FASTA by path via --fasta-manifest; --fasta"
+                " (a DoPut upload) cannot be combined with --local"
+            )
+        if fasta_manifest_path is None:
+            raise ValueError(
+                "--local requires --fasta-manifest: an absolute path to a manifest"
+                " listing one absolute FASTA path per line"
+            )
+        if not fasta_manifest_path.is_absolute():
+            raise ValueError(f"--fasta-manifest must be absolute, got {str(fasta_manifest_path)!r}")
+        if not fasta_manifest_path.exists() or not fasta_manifest_path.is_file():
+            raise ValueError(f"--fasta-manifest not found or not a file: {fasta_manifest_path}")
+        # Companions ride as raw `*_path` strings the compute host reads, so
+        # they must be absolute too — the workflow context_schema enforces
+        # `pattern:"^/"` on every path key, and a relative path would otherwise
+        # 422 server-side with an opaque message. Validate here for a clear,
+        # boundary-local error (existence is NOT checked: under SLURM a
+        # companion may live on a shared FS the CLI host can't see — only the
+        # manifest, which the CLI never reads either, is checked for existence
+        # because it's the by-path entry point the operator just authored).
+        for flag, companion in (
+            ("--taxonomy", taxonomy_path),
+            ("--tree", tree_path),
+            ("--jplace", jplace_path),
+            ("--genome-map", genome_map_path),
+        ):
+            if companion is not None and not companion.is_absolute():
+                raise ValueError(f"{flag} must be absolute under --local, got {str(companion)!r}")
+    else:
+        if fasta_manifest_path is not None:
+            raise ValueError(
+                "--fasta-manifest requires --local; the remote path uploads a"
+                " single --fasta over DoPut"
+            )
+        if fasta_path is None:
+            raise ValueError("--fasta is required (or use --local with --fasta-manifest)")
+        if flight_client is None:
+            raise ValueError("a Flight client is required for the remote (DoPut) ingest path")
 
     if reference_idx is None:
         create = await _post(
@@ -547,38 +596,63 @@ async def do_reference_load(
                 "--host, or drop --host to run reference-add against this one."
             )
 
-    action_context: dict[str, int] = {}
+    # Heterogeneous by ingest mode: remote keys map `*_upload_idx` -> int,
+    # local keys map `*_path` -> str. Hence dict[str, Any] rather than the
+    # remote-only dict[str, int].
+    action_context: dict[str, Any] = {}
     upload_idxs: dict[str, int] = {}
 
-    # Upload sequentially. Concurrent DoPuts would be faster on a fast
-    # link, but reference-add inputs are typically dominated by the
-    # FASTA; parallelizing taxonomy/tree/jplace saves seconds at the
-    # cost of a much harder-to-debug failure mode if one upload fails
-    # mid-stream.
-    for role, src in [
-        ("fasta", fasta_path),
-        ("taxonomy", taxonomy_path),
-        ("tree", tree_path),
-        ("jplace", jplace_path),
-        ("genome_map", genome_map_path),
-    ]:
-        if src is None:
-            continue
-        res = await upload_file(
-            http=http,
-            token=token,
-            flight_client=flight_client,
-            file_path=src,
-            role=role,
-        )
-        action_context[f"{role}_upload_idx"] = res.upload_idx
-        upload_idxs[role] = res.upload_idx
-        _log.info("uploaded %s as upload_idx=%d", role, res.upload_idx)
+    if local:
+        # By-path ingest: no bytes cross the wire. The manifest and every
+        # companion ride in action_context as raw absolute `*_path` strings;
+        # the runner leaves these untouched (it only resolves `*_upload_idx`
+        # keys), and stage_local_fasta reads the manifest on the compute host.
+        action_context["fasta_manifest_path"] = str(fasta_manifest_path)
+        for role, src in [
+            ("taxonomy", taxonomy_path),
+            ("tree", tree_path),
+            ("jplace", jplace_path),
+            ("genome_map", genome_map_path),
+        ]:
+            if src is None:
+                continue
+            action_context[f"{role}_path"] = str(src)
+            _log.info("local %s path=%s", role, src)
+    else:
+        # Remote ingest: upload sequentially. Concurrent DoPuts would be faster
+        # on a fast link, but reference-add inputs are typically dominated by
+        # the FASTA; parallelizing taxonomy/tree/jplace saves seconds at the
+        # cost of a much harder-to-debug failure mode if one upload fails
+        # mid-stream.
+        for role, src in [
+            ("fasta", fasta_path),
+            ("taxonomy", taxonomy_path),
+            ("tree", tree_path),
+            ("jplace", jplace_path),
+            ("genome_map", genome_map_path),
+        ]:
+            if src is None:
+                continue
+            res = await upload_file(
+                http=http,
+                token=token,
+                flight_client=flight_client,
+                file_path=src,
+                role=role,
+            )
+            action_context[f"{role}_upload_idx"] = res.upload_idx
+            upload_idxs[role] = res.upload_idx
+            _log.info("uploaded %s as upload_idx=%d", role, res.upload_idx)
 
-    # Host references run the host-reference-add workflow (reference-add steps
-    # plus the trailing rype-index build + register-index); plain references
-    # run reference-add.
-    action_id = _HOST_REFERENCE_ADD_ACTION_ID if host else _REFERENCE_ADD_ACTION_ID
+    # Select the action by ingest mode (local vs remote) and host-ness. Host
+    # references run the *-host-reference-add workflow (the base steps plus the
+    # trailing rype-index build + register-index); plain references run
+    # *-reference-add. The local variants prepend stage_local_fasta and take
+    # raw `*_path` keys instead of `*_upload_idx` handles.
+    if local:
+        action_id = _LOCAL_HOST_REFERENCE_ADD_ACTION_ID if host else _LOCAL_REFERENCE_ADD_ACTION_ID
+    else:
+        action_id = _HOST_REFERENCE_ADD_ACTION_ID if host else _REFERENCE_ADD_ACTION_ID
     submit_body = {
         "action_id": action_id,
         "action_version": _REFERENCE_ADD_ACTION_VERSION,

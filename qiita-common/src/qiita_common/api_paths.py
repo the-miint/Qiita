@@ -90,17 +90,26 @@ class LibraryPrimitive(StrEnum):
 # =============================================================================
 # /step/* — orchestrator HTTP API
 # =============================================================================
-# Single endpoint the control-plane runner uses to dispatch a workflow
-# `step:` entry to the orchestrator's ComputeBackend. Synchronous for now:
-# the request blocks for the duration of `backend.run_step`. Async +
-# callback model is deferred to when SlurmBackend is wired (see
-# docs/architecture.md "Compute Orchestrator").
+# The control-plane runner dispatches each workflow `step:` entry to the
+# orchestrator's ComputeBackend via the decoupled submit / status / result
+# trio: submit returns a handle immediately, the CP runner polls status until
+# terminal, then asks for the verified result — so the runner can drive a long
+# SLURM job without holding a connection open. find-by-name closes the
+# write-ahead idempotency gap. See docs/architecture.md "Compute Orchestrator".
 
 PATH_STEP_PREFIX = "/step"
-PATH_STEP_RUN = "/run"
+PATH_STEP_SUBMIT = "/submit"
+PATH_STEP_STATUS = "/status"
+PATH_STEP_RESULT = "/result"
+# Recovery / idempotency: look up live SLURM jobs by their deterministic
+# name so the CP can adopt a job it submitted but never recorded the id for.
+PATH_STEP_FIND_BY_NAME = "/find-by-name"
 
 URL_STEP_PREFIX = f"{API_PREFIX}{PATH_STEP_PREFIX}"
-URL_STEP_RUN = f"{URL_STEP_PREFIX}{PATH_STEP_RUN}"
+URL_STEP_SUBMIT = f"{URL_STEP_PREFIX}{PATH_STEP_SUBMIT}"
+URL_STEP_STATUS = f"{URL_STEP_PREFIX}{PATH_STEP_STATUS}"
+URL_STEP_RESULT = f"{URL_STEP_PREFIX}{PATH_STEP_RESULT}"
+URL_STEP_FIND_BY_NAME = f"{URL_STEP_PREFIX}{PATH_STEP_FIND_BY_NAME}"
 
 
 # =============================================================================
@@ -113,11 +122,14 @@ URL_STEP_RUN = f"{URL_STEP_PREFIX}{PATH_STEP_RUN}"
 # implemented, so /run is the only retry mechanism.
 
 PATH_WORK_TICKET_PREFIX = "/work-ticket"
-PATH_WORK_TICKET_ROOT = ""  # POST against the prefix itself
+PATH_WORK_TICKET_ROOT = ""  # POST (submit) and GET (list) against the prefix itself
 PATH_WORK_TICKET_BY_IDX = "/{work_ticket_idx}"
 PATH_WORK_TICKET_RUN = "/{work_ticket_idx}/run"
 
 URL_WORK_TICKET_PREFIX = f"{API_PREFIX}{PATH_WORK_TICKET_PREFIX}"
+# GET-list URL — same path as the POST root, named distinctly so clients
+# and tests read intent (and so it carries its own parity triple).
+URL_WORK_TICKET_LIST = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_ROOT}"
 URL_WORK_TICKET_BY_IDX = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_BY_IDX}"
 URL_WORK_TICKET_RUN = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_RUN}"
 

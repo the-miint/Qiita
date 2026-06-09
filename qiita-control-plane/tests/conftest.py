@@ -7,17 +7,25 @@ ignore the imported fixtures and don't trigger the postgres_pool fixture
 unless they request it.
 """
 
-from pathlib import Path
+from qiita_common.duckdb_miint import setup_miint_test_env
 
-import pytest
+# The `qiita reference load` CLI parses FASTA with miint's read_fastx, so its
+# unit tests (tests/cli/test_user_reference.py) install + load the miint
+# extension. Point it at the team mirror + a per-component private extension dir
+# before any test connects (shared with the orchestrator's conftest).
+setup_miint_test_env("control-plane")
 
-from qiita_control_plane.testing.jwks import jwks_harness  # noqa: F401
-from qiita_control_plane.testing.postgres import (  # noqa: F401
+from pathlib import Path  # noqa: E402
+
+import pytest  # noqa: E402
+
+from qiita_control_plane.testing.jwks import jwks_harness  # noqa: E402, F401
+from qiita_control_plane.testing.postgres import (  # noqa: E402, F401
     _run_db_migrations,
     postgres_pool,
     postgres_url,
 )
-from qiita_control_plane.testing.sessions import (  # noqa: F401
+from qiita_control_plane.testing.sessions import (  # noqa: E402, F401
     compute_worker_service_account,
     human_admin_session,
     regular_user_session,

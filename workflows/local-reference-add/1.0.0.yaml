@@ -1,0 +1,106 @@
+action_id: local-reference-add
+version: 1.0.0
+target_kind: reference
+
+description: >
+  Local-ingest variant of reference-add. Where reference-add streams a single
+  FASTA over Arrow Flight DoPut, this stages MANY host-resident FASTA files
+  (listed in a manifest of absolute paths) into one chunked Parquet, then runs
+  the SAME hash → mint → membership → load → register pipeline unchanged.
+  Companion inputs (taxonomy / tree / jplace / genome_map) are raw absolute
+  paths on the compute host, not DoPut uploads.
+
+scopes:
+  - reference:write
+
+audience:
+  service: false
+  human_roles: [wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  # Only the manifest is required. Every value is a raw absolute path on the
+  # compute host (NOT a DoPut `*_upload_idx`), so each carries `pattern:"^/"`:
+  # under SLURM only an absolute shared-FS path is visible from the compute
+  # node (bind mounts expose host paths, they do not copy), and a CWD-relative
+  # path would resolve against a surprise directory. The runner leaves these
+  # `*_path` keys untouched (it only resolves `*_upload_idx` keys).
+  required: [fasta_manifest_path]
+  properties:
+    # Absolute path to a text file listing one absolute FASTA path per line
+    # (blank lines and `#` comments ignored). stage_local_fasta reads it,
+    # parses every file with miint's read_fastx, and emits the combined chunked
+    # fasta.parquet that hash_sequences consumes.
+    fasta_manifest_path: {type: string, pattern: "^/"}
+    # Optional companions, raw absolute paths. Same downstream wiring as
+    # reference-add: taxonomy / tree / jplace flow into the load step's
+    # optional_inputs; genome_map_path is pulled directly by the mint-features
+    # action via bound.get("genome_map_path") — a YAML-only reader can't see
+    # that from mint-features' inputs line, so it's noted here.
+    taxonomy_path: {type: string, pattern: "^/"}
+    tree_path: {type: string, pattern: "^/"}
+    jplace_path: {type: string, pattern: "^/"}
+    genome_map_path: {type: string, pattern: "^/"}
+
+success_status: active
+failure_status: failed
+
+steps:
+  # The only new step on the local path: manifest → one combined chunked
+  # fasta.parquet. Its `fasta_path` output is wired into hash_sequences below,
+  # which is byte-for-byte the reference-add hash_sequences step (the remote
+  # path produces the same shape from a DoPut'd upload). No target_status: the
+  # reference stays `pending` through staging, and hash_sequences makes the
+  # first transition (pending → hashing) exactly as in reference-add. The
+  # baseline_resources here duplicate the DuckDB caps in stage_local_fasta
+  # (mem_gb=8, cpu=4); a mismatch is visible at review time.
+  - step: stage_local_fasta
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.stage_local_fasta
+    inputs: [fasta_manifest_path]
+    outputs: [fasta_path]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 8
+      walltime: PT1H
+
+  - step: hash_sequences
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.hash_sequences
+    target_status: hashing
+    inputs: [fasta_path]
+    outputs: [manifest, reference_sequence_chunks]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 8
+      walltime: PT1H
+
+  - action: mint-features
+    target_status: minting
+    inputs: [manifest]
+    outputs: [feature_map]
+
+  - action: write-membership
+    inputs: [feature_map]
+    outputs: []
+
+  - step: load
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.reference_load
+    target_status: loading
+    inputs: [manifest, feature_map, reference_sequence_chunks]
+    optional_inputs: [taxonomy_path, tree_path, jplace_path]
+    outputs: [staging_dir]
+    baseline_resources:
+      cpu: 8
+      mem_gb: 32
+      walltime: PT2H
+
+  - action: register-files
+    inputs: [staging_dir]
+    outputs: []
+
+action_ceiling:
+  cpu: 16
+  mem_gb: 64
+  walltime: PT4H

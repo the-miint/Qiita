@@ -7,7 +7,7 @@ declares one. Workflow-level success/failure transitions wrap the run.
 
 Lives in the control plane: direct DB access for work_ticket / action /
 reference rows is legitimate here. The orchestrator is reduced to its
-SLURM-driver role behind `POST /step/run`.
+SLURM-driver role behind `POST /step/*`.
 
 Workspace contract: each entry runs against a per-attempt subdir
 `<work_ticket_workspace_root>/<work_ticket_idx>/<entry-name>/attempt-<N>/`
@@ -21,6 +21,7 @@ consumers don't need to know the producer's attempt number.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -38,15 +39,22 @@ from qiita_common.api_paths import LibraryPrimitive, compute_upload_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.compute_backend_client import ComputeBackendClient
 from qiita_common.models import (
+    ComputeTarget,
     FailureType,
+    FoundJobWire,
     ReferenceStatus,
     ScopeTargetKind,
     StepBaselineResources,
+    StepHandleWire,
+    StepProgressState,
+    StepStatus,
+    StepStatusWire,
     UploadStatus,
     WorkTicketFailureStage,
     WorkTicketState,
 )
 
+from . import step_progress
 from .actions.library import LIBRARY
 from .actions.reference import ReferenceNotFound, transition_reference_status
 
@@ -58,6 +66,28 @@ _log = logging.getLogger(__name__)
 _UPLOAD_IDX_SUFFIX = "_upload_idx"
 _PATH_SUFFIX = "_path"
 
+# How long the runner sleeps between status polls of a submitted step. The
+# control plane owns the poll loop now (the orchestrator is a stateless
+# pass-through), so this is the cadence at which a long-running SLURM job is
+# observed. Mirrors the orchestrator's prior internal poll interval. A
+# constant, not an env var: deploys don't need to tune it, and Phase-7's
+# deploy note explicitly expects no new required env var.
+_STEP_POLL_INTERVAL_SECONDS = 10.0
+
+# FailureKinds that mean "couldn't reach the orchestrator / slurmrestd to
+# read status" — an infra-reachability hiccup, NEVER a statement that the
+# step itself failed. When status_step / result_step / submit_step raise one
+# of these, the runner sleeps and retries the SAME call (same attempt, same
+# deterministic job name) instead of failing the ticket or resubmitting. This
+# is what makes a CP→CO outage during a deploy safe: the poll loop keeps
+# looping until the orchestrator comes back, capped only by the SLURM job's
+# own walltime (the job going terminal ends the loop). Every other
+# BackendFailure from the trio is a real step failure that flows to the
+# retry/fail path.
+_INFRA_UNREACHABLE_KINDS = frozenset(
+    {FailureKind.SLURMRESTD_UNREACHABLE, FailureKind.ORCHESTRATOR_UNREACHABLE}
+)
+
 
 async def run_workflow(
     work_ticket_idx: int,
@@ -68,24 +98,38 @@ async def run_workflow(
     data_plane_url: str,
     work_ticket_workspace_root: Path,
     upload_staging_root: Path,
+    poll_interval_seconds: float = _STEP_POLL_INTERVAL_SECONDS,
+    resume: bool = False,
 ) -> None:
-    """Execute the workflow attached to one work ticket.
+    """Execute (or resume) the workflow attached to one work ticket.
 
-    Reads the ticket and its action from the DB, transitions PENDING →
-    PROCESSING, walks each entry in ``action.steps``, and finishes by
-    transitioning PROCESSING → COMPLETED. Any unhandled exception
-    transitions the ticket to FAILED, best-effort PATCHes the resource
-    to ``action.failure_status``, and re-raises.
+    Reads the ticket and its action from the DB, transitions to PROCESSING,
+    walks each entry in ``action.steps``, and finishes by transitioning
+    PROCESSING → COMPLETED. Any unhandled exception transitions the ticket to
+    FAILED, best-effort PATCHes the resource to ``action.failure_status``,
+    and re-raises.
+
+    **Resume (`resume=True`).** Startup recovery re-drives an in-flight ticket
+    here instead of failing it (deploys stop/start the CP without draining).
+    The loop re-walks from entry 0, but any entry already marked COMPLETED in
+    `qiita.work_ticket_step` is *fast-forwarded* — its outputs are rebuilt from
+    the shared workspace (a SLURM step re-reads its verified manifest via
+    `result_step`; an in-process `action:` rebuilds its deterministic output
+    paths) and its `target_status` PATCH is skipped (the resource is already
+    past it) — never re-run. The first incomplete entry resumes: an in-flight
+    SLURM step re-attaches to its persisted job id (see `_adopt_or_submit`).
+    This same fast-forward also makes a `/run` redrive of a FAILED ticket skip
+    its already-completed entries.
 
     Pre-conditions:
-        * Ticket must be in 'pending' state. A leftover PROCESSING
-          (runner crashed mid-run) requires operator recovery — the
-          runner refuses to silently re-run.
-        * Action ``(action_id, version)`` must exist in qiita.action
-          with ``enabled=true``.
+        * Without `resume`, the ticket must be 'pending' (a leftover PROCESSING
+          means a crashed run — the runner refuses to silently re-run). With
+          `resume`, any non-terminal state is accepted and moved to PROCESSING.
+        * Action ``(action_id, version)`` must exist in qiita.action with
+          ``enabled=true``.
     """
     work_ticket = await _fetch_work_ticket(pool, work_ticket_idx)
-    if work_ticket["state"] != WorkTicketState.PENDING.value:
+    if not resume and work_ticket["state"] != WorkTicketState.PENDING.value:
         raise RuntimeError(
             f"work_ticket {work_ticket_idx} is in state {work_ticket['state']!r}, "
             f"must be {WorkTicketState.PENDING.value!r}; manual recovery required"
@@ -98,19 +142,29 @@ async def run_workflow(
             f"{work_ticket['action_version']!r}) not found or disabled"
         )
 
-    await _atomic_transition(
-        pool,
-        work_ticket_idx,
-        expected=WorkTicketState.PENDING,
-        new=WorkTicketState.PROCESSING,
-    )
+    if resume:
+        # Re-drive from any non-terminal state (PENDING/QUEUED/PROCESSING) →
+        # PROCESSING. Idempotent if already PROCESSING; raises on a terminal
+        # ticket (shouldn't be in the recovery set).
+        await _transition_to_processing_for_resume(pool, work_ticket_idx)
+    else:
+        await _atomic_transition(
+            pool,
+            work_ticket_idx,
+            expected=WorkTicketState.PENDING,
+            new=WorkTicketState.PROCESSING,
+        )
 
     workspace = work_ticket_workspace_root / str(work_ticket_idx)
     workspace.mkdir(parents=True, exist_ok=True)
 
+    # Per-entry progress from any prior run. Empty on a first dispatch; on a
+    # resume (or a /run redrive) it carries the COMPLETED rows the loop
+    # fast-forwards. Loaded once — this run's own writes don't feed back in.
+    progress = await step_progress.load_step_progress(pool, work_ticket_idx)
+
     bound: dict[str, Any] = dict(work_ticket["action_context"] or {})
     scope_target = _build_scope_target(work_ticket)
-    current_status: str | None = None
     max_retries: int = work_ticket["max_retries"]
 
     _log.info(
@@ -145,9 +199,34 @@ async def run_workflow(
         bound.update(resolved_paths)
 
         for index, entry in enumerate(action.steps):
-            if entry.target_status and entry.target_status != current_status:
-                await _patch_resource_status(pool, scope_target, entry.target_status)
-                current_status = entry.target_status
+            completed = _completed_progress_row(progress, index)
+
+            if completed is not None:
+                # Fast-forward an entry a prior run already finished: rebuild
+                # its outputs from disk without re-running it (an in-process
+                # action: is not idempotent; a SLURM step's result is
+                # re-verified from its manifest). Skip its status PATCH
+                # entirely — the resource is already at or past this status, so
+                # re-issuing it would be a redundant or backward transition.
+                bound.update(
+                    await _reconstruct_completed_outputs(
+                        entry,
+                        completed,
+                        workspace,
+                        backend_client,
+                        poll_interval_seconds=poll_interval_seconds,
+                    )
+                )
+                continue
+
+            if entry.target_status:
+                # Idempotent status advance, keyed off the resource's ACTUAL
+                # status (single-CP-process contract makes that authoritative).
+                # On a resume the PATCH may already have fired before the crash
+                # — re-issuing the same transition raises IllegalStatusTransition
+                # — so only PATCH when the resource isn't already there.
+                if await _current_resource_status(pool, scope_target) != entry.target_status:
+                    await _patch_resource_status(pool, scope_target, entry.target_status)
 
             outputs = await _run_entry_with_retry(
                 pool=pool,
@@ -162,6 +241,8 @@ async def run_workflow(
                 hmac_secret=hmac_secret,
                 data_plane_url=data_plane_url,
                 max_retries=max_retries,
+                poll_interval_seconds=poll_interval_seconds,
+                resume=resume,
             )
             bound.update(outputs)
 
@@ -270,11 +351,19 @@ async def _run_entry_with_retry(
     hmac_secret: bytes,
     data_plane_url: str,
     max_retries: int,
+    poll_interval_seconds: float,
+    resume: bool = False,
 ) -> dict[str, Any]:
     """Dispatch one workflow entry, with auto-retry on transient
     `BackendFailure`. Returns the entry's output map on success; raises
     `BackendFailure` on permanent failure or once retry budget is
     exhausted.
+
+    `resume` flows down to `_dispatch_step` → `_adopt_or_submit`: on a resumed
+    run a write-ahead 'submitting' row with no persisted job id may be an
+    orphan from a crashed prior process, so the adopt path does a find-by-name
+    lookup before re-submitting. On a fresh run the row was just written by
+    this process, so that lookup is skipped.
 
     Retry semantics:
       * On `BackendFailure(transient=True)` and retry_count < max_retries:
@@ -311,8 +400,13 @@ async def _run_entry_with_retry(
                     bound,
                     attempt_workspace,
                     scope_target,
+                    pool=pool,
                     work_ticket_idx=work_ticket_idx,
+                    step_index=index,
+                    attempt=attempt,
                     action_ceiling=action_ceiling,
+                    poll_interval_seconds=poll_interval_seconds,
+                    resume=resume,
                 )
             if isinstance(entry, WorkflowAction):
                 return await _dispatch_action(
@@ -321,6 +415,9 @@ async def _run_entry_with_retry(
                     bound,
                     attempt_workspace,
                     scope_target,
+                    work_ticket_idx=work_ticket_idx,
+                    step_index=index,
+                    attempt=attempt,
                     hmac_secret=hmac_secret,
                     data_plane_url=data_plane_url,
                 )
@@ -467,6 +564,36 @@ async def _atomic_transition(
         raise RuntimeError(
             f"could not transition work_ticket {work_ticket_idx} "
             f"from {expected.value!r} to {new.value!r}; actual state {actual!r}"
+        )
+
+
+async def _transition_to_processing_for_resume(pool: asyncpg.Pool, work_ticket_idx: int) -> None:
+    """Move a ticket to PROCESSING from any non-terminal state, for startup
+    recovery re-driving an in-flight ticket. Unlike `_atomic_transition`
+    (single expected state), this accepts PENDING / QUEUED / PROCESSING so
+    recovery doesn't need to know exactly where the crash left it; a
+    PROCESSING → PROCESSING is a harmless no-op. Raises on a terminal ticket
+    — recovery should never be handed one."""
+    updated = await pool.fetchval(
+        "UPDATE qiita.work_ticket SET state = $1::qiita.work_ticket_state"
+        " WHERE work_ticket_idx = $2 AND state = ANY($3::qiita.work_ticket_state[])"
+        " RETURNING work_ticket_idx",
+        WorkTicketState.PROCESSING.value,
+        work_ticket_idx,
+        [
+            WorkTicketState.PENDING.value,
+            WorkTicketState.QUEUED.value,
+            WorkTicketState.PROCESSING.value,
+        ],
+    )
+    if updated is None:
+        actual = await pool.fetchval(
+            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+        raise RuntimeError(
+            f"could not resume work_ticket {work_ticket_idx} to processing: "
+            f"expected non-terminal, got {actual!r}"
         )
 
 
@@ -833,6 +960,21 @@ async def _patch_resource_status(
     )
 
 
+async def _current_resource_status(pool: asyncpg.Pool, scope_target: dict[str, Any]) -> str | None:
+    """The scope_target resource's current status, used to make the per-entry
+    `target_status` PATCH idempotent on a resume / redrive (only PATCH when the
+    resource isn't already there). Returns None for scope kinds that carry no
+    status (only `reference` is wired today) — those entries never declare a
+    `target_status`, so the caller's `actual != target` check still does the
+    right thing."""
+    if scope_target["kind"] == ScopeTargetKind.REFERENCE.value:
+        return await pool.fetchval(
+            "SELECT status FROM qiita.reference WHERE reference_idx = $1",
+            scope_target["reference_idx"],
+        )
+    return None
+
+
 def _resolve_baseline_for_step(
     *,
     entry: WorkflowStep,
@@ -976,32 +1118,36 @@ async def _dispatch_step(
     workspace: Path,
     scope_target: dict[str, Any],
     *,
+    pool: asyncpg.Pool,
     work_ticket_idx: int,
+    step_index: int,
+    attempt: int,
     action_ceiling: ActionCeiling,
+    poll_interval_seconds: float,
+    resume: bool = False,
 ) -> dict[str, Any]:
-    """Translate the YAML-declared input names into Path arguments and
-    call the orchestrator's /step/run endpoint; record outputs under the
-    YAML's declared names so subsequent entries can reference them.
+    """Dispatch one `step:` entry: write-ahead intent, submit to the
+    orchestrator, then poll status until terminal and fetch the verified
+    result — never holding the CP→CO connection open for the job's full
+    duration (the fix for the 600s-timeout bug). Records per-attempt
+    progress in `qiita.work_ticket_step` throughout so a CP restart can
+    re-attach.
+
+    Failure handling:
+      * An infra-unreachable BackendFailure (CO / slurmrestd down) inside the
+        submit / poll / result helpers is retried in place — it never
+        advances the attempt or fails the ticket.
+      * Any other BackendFailure is a genuine step failure: this attempt's
+        progress row is marked failed and the exception propagates to
+        `_run_entry_with_retry`, which decides retry-as-new-attempt
+        (transient kinds) vs. fail (permanent / exhausted).
 
     `optional_inputs` flow through if present in the binding map; missing
-    ones are simply omitted from the dispatch payload (the backend's
-    step handler decides what to do without them).
-
-    `action_ceiling` clamps the resolved baseline resources. The lookup
-    population (`baseline_resources.from_step_output`) reads an upstream
-    step's named output file at dispatch and selects the matching profile
-    from the YAML's `profiles` dict; the flat population uses the YAML's
-    direct values."""
+    ones are simply omitted. `action_ceiling` clamps the resolved baseline;
+    the lookup population reads an upstream step's named output file and
+    selects the matching profile, the flat population uses the YAML values."""
     inputs = {name: Path(bound[name]) for name in entry.inputs}
     inputs.update({name: Path(bound[name]) for name in entry.optional_inputs if name in bound})
-    # Pass the full scope_target through; the backend's native-step
-    # dispatch merges the kind-appropriate idx scalars into the job's
-    # Inputs model via `flatten_native_inputs`, while the container
-    # path inspects the kind to extract whichever scalar it needs (today
-    # only reference, gated inside LocalBackend / SlurmBackend).
-    # Forward static step metadata so the orchestrator's backend can run
-    # the right container with the right resource ask. SlurmBackend
-    # requires these; LocalBackend ignores them.
     resolved = _resolve_baseline_for_step(
         entry=entry,
         bound=bound,
@@ -1013,24 +1159,562 @@ async def _dispatch_step(
         walltime_seconds=int(resolved.walltime.total_seconds()),
         gpu=resolved.gpu,
     )
-    raw_outputs = await backend_client.run_step(
+
+    # Write-ahead intent BEFORE submit. compute_target is the production
+    # assumption (slurm) carrying the deterministic job name; if the backend
+    # turns out to be the in-process LocalBackend, record_synchronous_completion
+    # below corrects it. record_submitting is idempotent on re-entry, so a
+    # recovery resuming this exact attempt doesn't reset the row.
+    job_name = f"qiita-wt{work_ticket_idx}-{entry.name}-a{attempt}"
+    await step_progress.record_submitting(
+        pool,
+        work_ticket_idx=work_ticket_idx,
+        step_index=step_index,
+        attempt=attempt,
         step_name=entry.name,
+        compute_target=ComputeTarget.SLURM,
+        job_name=job_name,
+    )
+
+    handle = await _adopt_or_submit(
+        backend_client,
+        pool,
+        entry=entry,
         inputs=inputs,
         workspace=workspace,
         scope_target=scope_target,
         work_ticket_idx=work_ticket_idx,
-        container=entry.container,
-        module=entry.module,
-        entrypoint=entry.entrypoint,
-        baseline_resources=baseline,
+        step_index=step_index,
+        attempt=attempt,
+        baseline=baseline,
+        poll_interval_seconds=poll_interval_seconds,
+        resume=resume,
+    )
+
+    # Synchronous backend (LocalBackend ran the module in-process and handed
+    # back terminal outputs): skip polling, correct the row's compute_target,
+    # and use the outputs directly. Invariant (StepHandleWire): terminal_outputs
+    # non-None ⇒ non-empty.
+    if handle.terminal_outputs is not None:
+        await step_progress.record_synchronous_completion(
+            pool,
+            work_ticket_idx=work_ticket_idx,
+            step_index=step_index,
+            attempt=attempt,
+            compute_target=handle.compute_target,
+        )
+        raw_outputs = {k: Path(v) for k, v in handle.terminal_outputs.items()}
+        return {name: raw_outputs[name] for name in entry.outputs}
+
+    # Asynchronous (SLURM) path: the job id is already persisted (by
+    # _adopt_or_submit, on a fresh submit). Poll to terminal, fetch the
+    # verified result.
+    try:
+        status = await _poll_until_terminal(
+            backend_client,
+            handle,
+            pool,
+            work_ticket_idx=work_ticket_idx,
+            step_index=step_index,
+            attempt=attempt,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+        raw_outputs = await _result_with_infra_retry(
+            backend_client, handle, status, poll_interval_seconds=poll_interval_seconds
+        )
+    except BackendFailure as exc:
+        # Genuine step failure (infra-unreachable kinds loop forever inside
+        # the helpers and never reach here). Mark this attempt failed; the
+        # retry loop decides retry-as-new-attempt vs. fail.
+        await _best_effort_record_failed(
+            pool,
+            work_ticket_idx=work_ticket_idx,
+            step_index=step_index,
+            attempt=attempt,
+            failure_kind=exc.kind.value,
+            failure_reason=exc.reason[:2000],
+        )
+        raise
+    await step_progress.record_completed(
+        pool, work_ticket_idx=work_ticket_idx, step_index=step_index, attempt=attempt
     )
     # Convention: the orchestrator's output dict keys match the YAML's
-    # `outputs:` names exactly. A mismatch is a workflow authoring
-    # error and surfaces here as a KeyError.
-    return {name: raw_outputs[name] for name in entry.outputs}
+    # `outputs:` names exactly. A mismatch is a workflow authoring error and
+    # surfaces here as a KeyError.
+    return {name: Path(raw_outputs[name]) for name in entry.outputs}
+
+
+async def _adopt_or_submit(
+    backend_client: ComputeBackendClient,
+    pool: asyncpg.Pool,
+    *,
+    entry: WorkflowStep,
+    inputs: dict[str, Path],
+    workspace: Path,
+    scope_target: dict[str, Any],
+    work_ticket_idx: int,
+    step_index: int,
+    attempt: int,
+    baseline: StepBaselineResources,
+    poll_interval_seconds: float,
+    resume: bool = False,
+) -> StepHandleWire:
+    """Submit the step, or adopt a job already recorded for this exact
+    `(work_ticket_idx, step_index, attempt)`.
+
+    Idempotency: if a prior dispatch of this same attempt already persisted a
+    `slurm_job_id` (a re-entry, or restart recovery resuming this attempt),
+    do NOT submit again — reconstruct the handle from the row and resume
+    polling. `output_path` / `logs_path` are deterministic from the
+    per-attempt workspace (the SLURM backend uses `<workspace>/output` and
+    `<workspace>/logs`), so the progress row need not store them. This is the
+    guard against duplicate concurrent jobs.
+
+    On a fresh SLURM submit the returned job id is persisted here
+    (`record_submitted`) before the handle is returned, so the caller's poll
+    loop and any later re-entry both see it. A synchronous (local) handle
+    carries no job id and is returned as-is for the caller to finalize. A
+    fresh submit retries in place on an infra-unreachable failure (CO down),
+    honouring the never-fail-on-CO-outage rule.
+
+    The write-ahead 'submitting' window (find-by-name closer): if a prior
+    process crashed between a successful `submit_step` and its
+    `record_submitted`, its progress row is left in `submitting` with no job
+    id but WITH the deterministic `job_name`. On a resume (`resume=True`) we
+    look that job up by name before re-submitting — if slurmrestd still has it
+    we adopt the orphan (persist its id, reconstruct the handle) instead of
+    launching a duplicate at the same `attempt-N/output` dir. This lookup runs
+    only on resume: a fresh dispatch just wrote this `submitting` row itself,
+    so there is no orphan to find and the (cluster-wide `GET /slurm/jobs`)
+    lookup would be wasted. If the lookup can't reach slurmrestd it retries in
+    place (recovery never fails on a CO/slurmrestd blip); if slurmrestd has
+    purged the job (no match), we fall through to a fresh submit."""
+    rows = await step_progress.load_step_progress(pool, work_ticket_idx)
+    existing = next((r for r in rows if r.step_index == step_index and r.attempt == attempt), None)
+    if existing is not None and existing.slurm_job_id is not None:
+        _log.info(
+            "work_ticket %d step %r attempt %d already submitted as job %s; adopting",
+            work_ticket_idx,
+            entry.name,
+            attempt,
+            existing.slurm_job_id,
+        )
+        return StepHandleWire(
+            compute_target=ComputeTarget.SLURM,
+            step_name=entry.name,
+            slurm_job_id=existing.slurm_job_id,
+            job_name=existing.job_name,
+            output_path=str(workspace / "output"),
+            logs_path=str(workspace / "logs"),
+        )
+
+    # Resume-only orphan adoption: a 'submitting' row with no job id but a
+    # recorded job_name may be a job a crashed prior process launched but
+    # never persisted. Find it by name before re-submitting.
+    if (
+        resume
+        and existing is not None
+        and existing.slurm_job_id is None
+        and existing.job_name is not None
+    ):
+        found = await _find_existing_job(
+            backend_client, existing.job_name, poll_interval_seconds=poll_interval_seconds
+        )
+        if found is not None:
+            _log.warning(
+                "work_ticket %d step %r attempt %d: adopting orphaned SLURM job %s found by"
+                " name %r (its id was never persisted); not re-submitting",
+                work_ticket_idx,
+                entry.name,
+                attempt,
+                found.slurm_job_id,
+                existing.job_name,
+            )
+            await step_progress.record_submitted(
+                pool,
+                work_ticket_idx=work_ticket_idx,
+                step_index=step_index,
+                attempt=attempt,
+                slurm_job_id=found.slurm_job_id,
+            )
+            return StepHandleWire(
+                compute_target=ComputeTarget.SLURM,
+                step_name=entry.name,
+                slurm_job_id=found.slurm_job_id,
+                job_name=existing.job_name,
+                output_path=str(workspace / "output"),
+                logs_path=str(workspace / "logs"),
+            )
+    while True:
+        try:
+            handle = await backend_client.submit_step(
+                step_name=entry.name,
+                inputs=inputs,
+                workspace=workspace,
+                scope_target=scope_target,
+                work_ticket_idx=work_ticket_idx,
+                attempt=attempt,
+                container=entry.container,
+                module=entry.module,
+                entrypoint=entry.entrypoint,
+                baseline_resources=baseline,
+            )
+            break
+        except BackendFailure as exc:
+            if exc.kind not in _INFRA_UNREACHABLE_KINDS:
+                raise
+            _log.warning(
+                "work_ticket %d step %r submit unreachable (%s); retry in %.0fs",
+                work_ticket_idx,
+                entry.name,
+                exc.kind.value,
+                poll_interval_seconds,
+            )
+            await asyncio.sleep(poll_interval_seconds)
+    # SLURM async submit — persist the job id before returning so the poll
+    # loop and any restart re-entry resolve to the same job. A synchronous
+    # (local) handle has no job id; the caller's terminal_outputs branch
+    # corrects the row's compute_target instead.
+    if handle.terminal_outputs is None:
+        await step_progress.record_submitted(
+            pool,
+            work_ticket_idx=work_ticket_idx,
+            step_index=step_index,
+            attempt=attempt,
+            slurm_job_id=handle.slurm_job_id,
+        )
+    return handle
+
+
+async def _find_existing_job(
+    backend_client: ComputeBackendClient,
+    job_name: str,
+    *,
+    poll_interval_seconds: float,
+) -> FoundJobWire | None:
+    """Look up a live SLURM job by its deterministic name for orphan
+    adoption, returning the single match or None.
+
+    Infra-unreachable failures (CO / slurmrestd down) retry in place — a
+    recovery sweep must not fail a ticket because the orchestrator is briefly
+    unreachable (the never-fail-on-outage rule). A non-infra BackendFailure
+    (slurmrestd 4xx => 'job list unreadable') is swallowed to None: if we
+    genuinely can't read the job list, fall back to a fresh submit (the gap's
+    pre-closer behavior) rather than failing recovery. More than one match for
+    a deterministic name shouldn't happen; if it does, adopt the first and log
+    — the extras keep running but the duplicate-prevention goal is already met
+    for this attempt."""
+    while True:
+        try:
+            jobs = await backend_client.find_jobs_by_name(job_name)
+            break
+        except BackendFailure as exc:
+            if exc.kind in _INFRA_UNREACHABLE_KINDS:
+                await asyncio.sleep(poll_interval_seconds)
+                continue
+            _log.warning(
+                "find_jobs_by_name(%r) failed (%s); falling back to a fresh submit",
+                job_name,
+                exc.kind.value,
+            )
+            return None
+    if not jobs:
+        return None
+    if len(jobs) > 1:
+        # Should be impossible: the name encodes work_ticket_idx (a DB PK) +
+        # step + attempt, and a single CP process submits at most once per
+        # attempt — so a duplicate means a cluster that reused the name or a
+        # double-submit from a prior bug. We adopt+poll the first and DO NOT
+        # cancel the rest (no CP→CO cancel route exists): the un-adopted jobs
+        # keep running and write to the SAME `attempt-N/output` dir, so they
+        # can race/clobber this attempt's output. Loud ERROR so it's caught —
+        # cancel the strays by hand (scancel) if this ever fires.
+        _log.error(
+            "find_jobs_by_name(%r) matched %d jobs (expected 1); adopting job %s and"
+            " polling it, but the other %d are LEFT RUNNING and will race on %s's"
+            " shared output dir — scancel them by hand",
+            job_name,
+            len(jobs),
+            jobs[0].slurm_job_id,
+            len(jobs) - 1,
+            job_name,
+        )
+    return jobs[0]
+
+
+async def _poll_until_terminal(
+    backend_client: ComputeBackendClient,
+    handle: StepHandleWire,
+    pool: asyncpg.Pool,
+    *,
+    work_ticket_idx: int,
+    step_index: int,
+    attempt: int,
+    poll_interval_seconds: float,
+) -> StepStatusWire:
+    """Poll `status_step` until the step is terminal (COMPLETED / FAILED),
+    returning the terminal status. Sleeps `poll_interval_seconds` between
+    reads — the CP, not the orchestrator, owns this loop now, so there is no
+    600s client-timeout ceiling.
+
+    An infra-unreachable BackendFailure is retried in place: the loop keeps
+    going straight through a CO / slurmrestd outage (the never-fail-on-outage
+    rule).
+
+    A non-infra BackendFailure from `status_step` means the job is no longer
+    readable from slurmrestd — i.e. it was **purged** (aged out of the
+    controller's memory after a long outage; `status_step` only raises
+    "couldn't read status", never "the job failed"). The job's true outcome
+    then lives only on the shared filesystem, so we hand back a synthesized
+    COMPLETED status: the caller's `result_step` runs verify + parse against
+    the output manifest, which decides it — a valid manifest yields the
+    outputs (completed), a missing / broken one raises CONTRACT_VIOLATION
+    (failed). This is the filesystem tiebreaker. Records the running
+    transition once, the first time the job is observed on a node."""
+    recorded_running = False
+    while True:
+        try:
+            status = await backend_client.status_step(handle)
+        except BackendFailure as exc:
+            if exc.kind in _INFRA_UNREACHABLE_KINDS:
+                await asyncio.sleep(poll_interval_seconds)
+                continue
+            # Purged job → defer to the on-disk manifest via result_step.
+            _log.warning(
+                "work_ticket %d step %d job unreadable (%s); deciding outcome"
+                " from the output manifest on shared scratch",
+                work_ticket_idx,
+                step_index,
+                exc.kind.value,
+            )
+            return StepStatusWire(
+                status=StepStatus.COMPLETED,
+                raw_state="PURGED",
+                reason=f"slurmrestd no longer has the job ({exc.kind.value}); "
+                "deciding from filesystem",
+            )
+        if status.status in (StepStatus.COMPLETED, StepStatus.FAILED):
+            return status
+        if status.status is StepStatus.RUNNING and not recorded_running:
+            await step_progress.record_running(
+                pool,
+                work_ticket_idx=work_ticket_idx,
+                step_index=step_index,
+                attempt=attempt,
+            )
+            recorded_running = True
+        await asyncio.sleep(poll_interval_seconds)
+
+
+async def _result_with_infra_retry(
+    backend_client: ComputeBackendClient,
+    handle: StepHandleWire,
+    status: StepStatusWire,
+    *,
+    poll_interval_seconds: float,
+) -> dict[str, Path]:
+    """Fetch the terminal step's verified result, retrying in place on an
+    infra-unreachable failure (CO down). A genuine step failure — the job
+    ended FAILED, so `result_step` raises the classified BackendFailure —
+    propagates to the caller, which records it and lets the retry loop
+    decide."""
+    while True:
+        try:
+            return await backend_client.result_step(handle, status)
+        except BackendFailure as exc:
+            if exc.kind not in _INFRA_UNREACHABLE_KINDS:
+                raise
+            await asyncio.sleep(poll_interval_seconds)
+
+
+async def _best_effort_record_failed(
+    pool: asyncpg.Pool,
+    *,
+    work_ticket_idx: int,
+    step_index: int,
+    attempt: int,
+    failure_kind: str,
+    failure_reason: str,
+) -> None:
+    """Mark this attempt's progress row failed, but never let a DB blip on
+    that write mask the real failure. The caller re-raises the original
+    exception (preserving its FailureKind for the retry loop's
+    transient-vs-permanent decision); a lost progress row is logged, not
+    fatal — same best-effort discipline `run_workflow` uses for the
+    failure_status PATCH."""
+    try:
+        await step_progress.record_failed(
+            pool,
+            work_ticket_idx=work_ticket_idx,
+            step_index=step_index,
+            attempt=attempt,
+            failure_kind=failure_kind,
+            failure_reason=failure_reason,
+        )
+    except Exception:
+        _log.exception(
+            "best-effort record_failed for work_ticket %d step %d attempt %d failed",
+            work_ticket_idx,
+            step_index,
+            attempt,
+        )
+
+
+# =============================================================================
+# Restart-recovery output reconstruction
+# =============================================================================
+#
+# On resume, an entry already marked COMPLETED in a prior run must NOT be
+# re-run (an in-process action: is not idempotent) — its outputs are rebuilt
+# from the shared workspace instead, then bound forward exactly as a fresh run
+# would. The per-attempt workspace layout (`<workspace>/<name>/attempt-<N>/`)
+# is deterministic, so the producer's attempt number — read from the progress
+# row — is enough to find every output on disk.
+
+
+def _completed_progress_row(
+    progress: list[step_progress.StepProgressRow], step_index: int
+) -> step_progress.StepProgressRow | None:
+    """The COMPLETED row for `step_index` across any attempt, or None. A step
+    that failed attempt 0 but completed attempt 1 counts as completed."""
+    for row in progress:
+        if row.step_index == step_index and row.state is StepProgressState.COMPLETED:
+            return row
+    return None
+
+
+async def _reconstruct_completed_outputs(
+    entry: WorkflowStep | WorkflowAction,
+    completed: step_progress.StepProgressRow,
+    workspace: Path,
+    backend_client: ComputeBackendClient,
+    *,
+    poll_interval_seconds: float,
+) -> dict[str, Any]:
+    """Rebuild the bound outputs of an already-COMPLETED entry from disk,
+    without re-running it.
+
+    A `step:` entry re-reads its verified output manifest through `result_step`
+    (reconstructing a handle from the progress row's job id + the deterministic
+    per-attempt `output`/`logs` dirs). This doubles as the filesystem
+    tiebreaker for a now-purged job: a valid manifest yields the outputs; a
+    missing / broken one raises CONTRACT_VIOLATION → the resumed workflow
+    fails, as it should when a completed step's output has vanished from
+    scratch.
+
+    An `action:` entry rebuilds its deterministic output paths in-process (see
+    `_reconstruct_action_outputs`) — the in-process primitive must not re-run.
+
+    A non-SLURM (local) completed step has no on-disk manifest to re-read;
+    recovery is a SLURM-backend concern (local steps are synchronous and don't
+    survive a restart mid-flight), so this returns its outputs empty — a
+    downstream consumer that needs a missing binding fails loudly via KeyError."""
+    attempt_workspace = workspace / entry.name / f"attempt-{completed.attempt}"
+    if isinstance(entry, WorkflowAction):
+        return _reconstruct_action_outputs(entry, attempt_workspace)
+    if completed.compute_target is not ComputeTarget.SLURM:
+        return {}
+    handle = StepHandleWire(
+        compute_target=ComputeTarget.SLURM,
+        step_name=entry.name,
+        slurm_job_id=completed.slurm_job_id,
+        job_name=completed.job_name,
+        output_path=str(attempt_workspace / "output"),
+        logs_path=str(attempt_workspace / "logs"),
+    )
+    status = StepStatusWire(status=StepStatus.COMPLETED, raw_state="RECOVERED")
+    raw_outputs = await _result_with_infra_retry(
+        backend_client, handle, status, poll_interval_seconds=poll_interval_seconds
+    )
+    return {name: Path(raw_outputs[name]) for name in entry.outputs}
+
+
+def _reconstruct_action_outputs(entry: WorkflowAction, attempt_workspace: Path) -> dict[str, Any]:
+    """Deterministic output paths an `action:` primitive wrote, for resume.
+    Only `mint-features` contributes a binding (the feature-map Parquet it
+    wrote into its workspace); the other primitives produce no bound output.
+    Mirrors the output shapes in `_run_action_primitive` — keep the two in
+    step when a primitive's outputs change."""
+    if entry.name == LibraryPrimitive.MINT_FEATURES:
+        return {entry.outputs[0]: attempt_workspace / "feature_map.parquet"}
+    return {}
 
 
 async def _dispatch_action(
+    pool: asyncpg.Pool,
+    entry: WorkflowAction,
+    bound: dict[str, Any],
+    workspace: Path,
+    scope_target: dict[str, Any],
+    *,
+    work_ticket_idx: int,
+    step_index: int,
+    attempt: int,
+    hmac_secret: bytes,
+    data_plane_url: str,
+) -> dict[str, Any]:
+    """Run one in-process `action:` entry and record its progress.
+
+    Action entries run on the control plane (no backend hop, no SLURM job),
+    so they are recorded with `compute_target='control_plane'`. They go in
+    the progress table alongside compute `step:` entries because correct
+    multi-step restart recovery needs to know which entries already completed
+    — an `action:` that succeeded must be skipped (and its outputs rebound)
+    on resume, not re-run.
+
+    A primitive raising (plain Python or BackendFailure) marks this attempt's
+    progress row failed before the exception propagates to the retry / outer
+    handler — which owns the work_ticket-level FAILED transition. The
+    exception is re-raised unchanged so the outer handler classifies it
+    exactly as before."""
+    await step_progress.record_submitting(
+        pool,
+        work_ticket_idx=work_ticket_idx,
+        step_index=step_index,
+        attempt=attempt,
+        step_name=entry.name,
+        compute_target=ComputeTarget.CONTROL_PLANE,
+    )
+    try:
+        outputs = await _run_action_primitive(
+            pool,
+            entry,
+            bound,
+            workspace,
+            scope_target,
+            hmac_secret=hmac_secret,
+            data_plane_url=data_plane_url,
+        )
+    except BackendFailure as exc:
+        await _best_effort_record_failed(
+            pool,
+            work_ticket_idx=work_ticket_idx,
+            step_index=step_index,
+            attempt=attempt,
+            failure_kind=exc.kind.value,
+            failure_reason=exc.reason[:2000],
+        )
+        raise
+    except Exception as exc:
+        # Plain Python from a LIBRARY primitive (untyped failure / bug). The
+        # outer run_workflow handler classifies it UNKNOWN_PERMANENT; record
+        # the same on the progress row, then re-raise unchanged.
+        await _best_effort_record_failed(
+            pool,
+            work_ticket_idx=work_ticket_idx,
+            step_index=step_index,
+            attempt=attempt,
+            failure_kind=FailureKind.UNKNOWN_PERMANENT.value,
+            failure_reason=f"{type(exc).__name__}: {exc!s}"[:2000],
+        )
+        raise
+    await step_progress.record_completed(
+        pool, work_ticket_idx=work_ticket_idx, step_index=step_index, attempt=attempt
+    )
+    return outputs
+
+
+async def _run_action_primitive(
     pool: asyncpg.Pool,
     entry: WorkflowAction,
     bound: dict[str, Any],
@@ -1104,7 +1788,7 @@ async def _dispatch_action(
         return {}
 
     if entry.name == LibraryPrimitive.REGISTER_INDEX:
-        # Native step outputs are paths (StepRunResponse.outputs is
+        # Native step outputs are paths (StepResultResponse.outputs is
         # dict[str, str]), so build-rype-index can't hand back the build
         # params as a dict binding — it writes a small meta JSON and exposes
         # its path as `rype_index_meta`. Read it for index_type / fs_path /

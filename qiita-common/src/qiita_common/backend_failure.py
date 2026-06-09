@@ -34,7 +34,7 @@ from pydantic import BaseModel
 from .models import WorkTicketFailureStage
 
 # Wire-format discriminator for BackendFailure round-tripping through the
-# orchestrator's /step/run HTTP boundary. The orchestrator sets this
+# orchestrator's /step/* HTTP boundary. The orchestrator sets this
 # header on responses that carry a BackendFailureBody so the client can
 # reconstruct a typed BackendFailure (and the runner sees the same
 # transient/permanent classification it would in-process). Without the
@@ -65,6 +65,14 @@ class FailureKind(StrEnum):
     PREEMPTED = "preempted"
     TRANSIENT_FS_ERROR = "transient_fs_error"
     SLURMRESTD_UNREACHABLE = "slurmrestd_unreachable"
+    # CP could not reach the orchestrator (httpx transport/timeout on a
+    # submit/status/result call). Like SLURMRESTD_UNREACHABLE it is an
+    # infra-reachability hiccup, NEVER a statement that the step failed —
+    # the runner's poll loop keeps retrying the same call rather than
+    # failing the ticket or resubmitting. This is the direct fix for the
+    # old 600s held-connection bug: a long step no longer self-fails when
+    # the CP→CO hop times out.
+    ORCHESTRATOR_UNREACHABLE = "orchestrator_unreachable"
     PROCESS_RESTARTED = "process_restarted"  # CP drain cancelled a task
 
     # ---- Permanent: workflow / input / contract issues -------------------
@@ -82,6 +90,7 @@ _RETRIABLE: frozenset[FailureKind] = frozenset(
         FailureKind.PREEMPTED,
         FailureKind.TRANSIENT_FS_ERROR,
         FailureKind.SLURMRESTD_UNREACHABLE,
+        FailureKind.ORCHESTRATOR_UNREACHABLE,
         FailureKind.PROCESS_RESTARTED,
     }
 )
@@ -149,7 +158,7 @@ class BackendFailureBody(BaseModel):
     """Wire format for BackendFailure crossing the orchestrator's HTTP
     boundary.
 
-    The orchestrator emits this in `/step/run`'s response body (with
+    The orchestrator emits this in `/step/*`'s response body (with
     `BACKEND_FAILURE_HEADER` set) when a backend raises BackendFailure;
     ComputeBackendClient reconstructs and re-raises so the runner's
     retry classification sees the same typed surface it would for an

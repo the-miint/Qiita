@@ -34,7 +34,7 @@ import sqlite3
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from pydantic import BaseModel, ValidationError
 from qiita_common.api_paths import (
@@ -72,6 +72,7 @@ from qiita_common.models import (
     Tier,
     UserUpdate,
     WorkTicketCreateRequest,
+    WorkTicketState,
 )
 
 from . import _common
@@ -186,6 +187,32 @@ def _get_work_ticket(base_url: str, token: str, work_ticket_idx: int) -> dict:
     state, action info, scope_target, action_context, retry accounting,
     failure surface, timestamps. Auth: originator or wet_lab_admin+."""
     return _common.call("GET", base_url, token, f"{PATH_WORK_TICKET_PREFIX}/{work_ticket_idx}")
+
+
+def _list_work_tickets(
+    base_url: str,
+    token: str,
+    *,
+    state: str | None,
+    active: bool,
+    all_tickets: bool,
+    limit: int | None,
+) -> list:
+    """GET /api/v1/work-ticket. Returns a list of WorkTicketSummary records —
+    each ticket plus its current step's compute_target / slurm_job_id /
+    step_state. Scope: the caller's own tickets, or all originators' with
+    `all_tickets` (wet_lab_admin+). Query params are sent only when set so
+    the server's defaults (own, all states, limit 50) apply otherwise."""
+    params: dict[str, str] = {}
+    if state is not None:
+        params["state"] = state
+    if active:
+        params["active"] = "true"
+    if all_tickets:
+        params["all"] = "true"
+    if limit is not None:
+        params["limit"] = str(limit)
+    return _common.call("GET", base_url, token, PATH_WORK_TICKET_PREFIX, params=params)
 
 
 def _lookup_accessions(
@@ -607,6 +634,33 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_ticket_status.set_defaults(handler=_handle_ticket_status)
 
+    p_ticket_list = p_ticket_sub.add_parser(
+        "list",
+        help="List work-tickets with their current compute placement (GET /work-ticket)",
+    )
+    p_ticket_list.add_argument(
+        "--state",
+        choices=[s.value for s in WorkTicketState],
+        help="Filter to a single lifecycle state.",
+    )
+    p_ticket_list.add_argument(
+        "--active",
+        action="store_true",
+        help="Only non-terminal tickets (pending / queued / processing).",
+    )
+    p_ticket_list.add_argument(
+        "--all",
+        dest="all_tickets",
+        action="store_true",
+        help="All originators' tickets (requires wet_lab_admin+); default is your own.",
+    )
+    p_ticket_list.add_argument(
+        "--limit",
+        type=int,
+        help="Max tickets to return (server default 50, max 500).",
+    )
+    p_ticket_list.set_defaults(handler=_handle_ticket_list)
+
     p_reference = sub.add_parser("reference", help="Reference-data lifecycle operations")
     p_reference_sub = p_reference.add_subparsers(dest="reference_cmd", required=True)
     p_reference_load = p_reference_sub.add_parser(
@@ -637,15 +691,43 @@ def _build_parser() -> argparse.ArgumentParser:
             " which builds the rype negative-filter index. Requires --taxonomy."
         ),
     )
-    p_reference_load.add_argument("--fasta", required=True, type=Path)
+    # FASTA source: --fasta (remote DoPut upload) XOR --fasta-manifest (--local
+    # by-path). Neither is argparse-required because exactly which one applies
+    # depends on --local; the entry point enforces the XOR and the
+    # per-mode requirement with clear messages.
+    p_reference_load.add_argument(
+        "--fasta",
+        type=Path,
+        help="Single FASTA to stream over DoPut (remote ingest; omit under --local)",
+    )
+    p_reference_load.add_argument(
+        "--local",
+        action="store_true",
+        help=(
+            "Ingest FASTA by path instead of DoPut: stage the files listed in"
+            " --fasta-manifest (and pass companions as raw paths) to the"
+            " local-(host-)reference-add workflow. No --data-plane-url needed."
+        ),
+    )
+    p_reference_load.add_argument(
+        "--fasta-manifest",
+        type=Path,
+        dest="fasta_manifest",
+        help=(
+            "Under --local: absolute path to a manifest listing one absolute"
+            " FASTA path per line (blank lines and `#` comments ignored)."
+        ),
+    )
     p_reference_load.add_argument("--taxonomy", type=Path)
     p_reference_load.add_argument("--tree", type=Path)
     p_reference_load.add_argument("--jplace", type=Path)
     p_reference_load.add_argument("--genome-map", type=Path, dest="genome_map")
     p_reference_load.add_argument(
         "--data-plane-url",
-        required=True,
-        help="gRPC URL of the data plane (e.g. grpc://qiita-data.example.com:50051)",
+        help=(
+            "gRPC URL of the data plane (e.g. grpc://qiita-data.example.com:50051)."
+            " Required for remote ingest; ignored (and optional) under --local."
+        ),
     )
     p_reference_load.add_argument(
         "--no-watch",
@@ -927,46 +1009,80 @@ def _handle_ticket_status(args: argparse.Namespace, parser: argparse.ArgumentPar
     )
 
 
+def _handle_ticket_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """List work-tickets (your own by default, or every originator's with
+    --all for wet_lab_admin+). Prints the full summary list so a poller sees
+    each ticket's state plus its current step's compute_target / slurm_job_id
+    / step_state in one call."""
+    return _common.run_http_subcommand(
+        lambda t: _list_work_tickets(
+            args.base_url,
+            t,
+            state=args.state,
+            active=args.active,
+            all_tickets=args.all_tickets,
+            limit=args.limit,
+        )
+    )
+
+
 async def _run_reference_load(
     *,
     base_url: str,
     token: str,
-    data_plane_url: str,
+    data_plane_url: str | None,
     args: argparse.Namespace,
 ) -> dict:
-    """Construct real httpx + pyarrow.flight clients and drive
-    `do_reference_load`. Lives next to the CLI handler so the handler
+    """Construct real httpx + (for remote ingest) pyarrow.flight clients and
+    drive `do_reference_load`. Lives next to the CLI handler so the handler
     stays a thin argparse → entry-point shim; the entry point itself
     (in cli.reference_load) takes injected clients so tests bypass this
-    function entirely."""
+    function entirely.
+
+    Under `--local` no bytes cross the wire, so no Flight client is built and
+    `--data-plane-url` is not needed; the by-path manifest + companions ride in
+    action_context. The remote path requires `--data-plane-url`."""
     import httpx as _httpx
-    import pyarrow.flight as flight
 
     from .reference_load import do_reference_load
+
+    # Shared keyword args for both ingest modes.
+    common_kwargs: dict[str, Any] = dict(
+        token=token,
+        local=args.local,
+        fasta_path=args.fasta,
+        fasta_manifest_path=args.fasta_manifest,
+        name=args.name,
+        version=args.version,
+        kind=args.kind,
+        host=args.host,
+        reference_idx=args.reference_idx,
+        taxonomy_path=args.taxonomy,
+        tree_path=args.tree,
+        jplace_path=args.jplace,
+        genome_map_path=args.genome_map,
+        watch=not args.no_watch,
+        poll_interval_seconds=args.poll_interval,
+        timeout_seconds=args.timeout,
+    )
+
+    if args.local:
+        async with _httpx.AsyncClient(
+            base_url=base_url, timeout=_common.CLI_HTTP_TIMEOUT_SECONDS
+        ) as http:
+            return await do_reference_load(http=http, flight_client=None, **common_kwargs)
+
+    if not data_plane_url:
+        raise ValueError("--data-plane-url is required for remote ingest (or use --local)")
+
+    import pyarrow.flight as flight
 
     flight_client = flight.FlightClient(data_plane_url)
     try:
         async with _httpx.AsyncClient(
             base_url=base_url, timeout=_common.CLI_HTTP_TIMEOUT_SECONDS
         ) as http:
-            return await do_reference_load(
-                http=http,
-                token=token,
-                flight_client=flight_client,
-                fasta_path=args.fasta,
-                name=args.name,
-                version=args.version,
-                kind=args.kind,
-                host=args.host,
-                reference_idx=args.reference_idx,
-                taxonomy_path=args.taxonomy,
-                tree_path=args.tree,
-                jplace_path=args.jplace,
-                genome_map_path=args.genome_map,
-                watch=not args.no_watch,
-                poll_interval_seconds=args.poll_interval,
-                timeout_seconds=args.timeout,
-            )
+            return await do_reference_load(http=http, flight_client=flight_client, **common_kwargs)
     finally:
         flight_client.close()
 

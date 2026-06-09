@@ -257,6 +257,158 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
     assert _REFERENCE_ADD_ACTION_VERSION == host.version == "1.0.0"
 
 
+def test_load_actions_loads_on_disk_local_reference_add_yaml():
+    """The actual on-disk `workflows/local-reference-add/1.0.0.yaml` loads as a
+    valid ActionDefinition with the local-ingest shape:
+
+      * target_kind reference, success_status active;
+      * the local stager `stage_local_fasta` (module) is PREPENDED to the full
+        reference-add step list — it produces the `fasta_path` that the
+        unchanged hash_sequences step then consumes, so the local step list is
+        reference-add's with `stage_local_fasta` in front (one more step, not a
+        swap);
+      * stage_local_fasta declares inputs:[fasta_manifest_path] /
+        outputs:[fasta_path] so the runner threads its staged Parquet into
+        hash_sequences (whose inputs stay [fasta_path]);
+      * context_schema REQUIRES `fasta_manifest_path` (a raw path, NOT a DoPut
+        `*_upload_idx`), with `pattern:"^/"` on every path key so a CWD-relative
+        path can't slip past the wire to a compute node.
+    """
+    from pathlib import Path
+
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    actions = load_actions(repo_root / "workflows")
+    by_id = {a.action_id: a for a in actions}
+    assert "local-reference-add" in by_id, "workflows/local-reference-add/1.0.0.yaml must load"
+    local = by_id["local-reference-add"]
+
+    assert local.target_kind == ScopeTargetKind.REFERENCE
+    assert local.success_status == "active"
+    assert local.failure_status == "failed"
+
+    # The step list is reference-add's with the local stager prepended; the
+    # rest of the pipeline is reused verbatim (hash_sequences and on).
+    ref_add = by_id["reference-add"]
+    local_names = [s.name for s in local.steps]
+    remote_names = [s.name for s in ref_add.steps]
+    assert local_names[0] == "stage_local_fasta"
+    assert local_names == ["stage_local_fasta"] + remote_names
+
+    stage = next(s for s in local.steps if s.name == "stage_local_fasta")
+    assert stage.module == "qiita_compute_orchestrator.jobs.stage_local_fasta"
+    assert stage.container is None
+    # The stager consumes the manifest path and produces the fasta_path that
+    # hash_sequences reads — this wiring is the whole point of the local front-end.
+    assert stage.inputs == ["fasta_manifest_path"]
+    assert stage.outputs == ["fasta_path"]
+    hash_step = next(s for s in local.steps if s.name == "hash_sequences")
+    assert hash_step.inputs == ["fasta_path"]
+
+    # context_schema requires the manifest path (raw path, not an upload idx);
+    # every declared path key is an absolute-path string.
+    assert local.context_schema["required"] == ["fasta_manifest_path"]
+    props = local.context_schema["properties"]
+    for key in (
+        "fasta_manifest_path",
+        "taxonomy_path",
+        "tree_path",
+        "jplace_path",
+        "genome_map_path",
+    ):
+        assert props[key] == {"type": "string", "pattern": "^/"}, key
+
+    # Pin the CLI's hardcoded action_id/version against the YAML the deploy
+    # syncs into qiita.action. `qiita reference load --local` submits these
+    # literals; an id/version drift would 404 at submit. Fail here at build time.
+    from qiita_control_plane.cli.reference_load import (
+        _LOCAL_REFERENCE_ADD_ACTION_ID,
+        _REFERENCE_ADD_ACTION_VERSION,
+    )
+
+    assert _LOCAL_REFERENCE_ADD_ACTION_ID == local.action_id == "local-reference-add"
+    assert _REFERENCE_ADD_ACTION_VERSION == local.version == "1.0.0"
+
+
+def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
+    """The actual on-disk `workflows/local-host-reference-add/1.0.0.yaml` loads
+    as a valid ActionDefinition: the local-ingest stager prepended to the host
+    pipeline.
+
+      * first step stage_local_fasta (module) → fasta_path;
+      * the remaining steps match host-reference-add (hash → mint → membership →
+        load → build_rype_index → register-files → register-index);
+      * context_schema REQUIRES both fasta_manifest_path and taxonomy_path
+        (taxonomy is the rype mapping authority for a host reference), every
+        path key `pattern:"^/"`.
+    """
+    from pathlib import Path
+
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    actions = load_actions(repo_root / "workflows")
+    by_id = {a.action_id: a for a in actions}
+    assert "local-host-reference-add" in by_id, (
+        "workflows/local-host-reference-add/1.0.0.yaml must load"
+    )
+    local_host = by_id["local-host-reference-add"]
+    host = by_id["host-reference-add"]
+
+    assert local_host.target_kind == ScopeTargetKind.REFERENCE
+    assert local_host.success_status == "active"
+    assert local_host.failure_status == "failed"
+
+    # The step list is host-reference-add's with the local stager prepended.
+    local_names = [s.name for s in local_host.steps]
+    remote_names = [s.name for s in host.steps]
+    assert local_names[0] == "stage_local_fasta"
+    assert local_names == ["stage_local_fasta"] + remote_names
+    assert local_names == [
+        "stage_local_fasta",
+        "hash_sequences",
+        "mint-features",
+        "write-membership",
+        "load",
+        "build_rype_index",
+        "register-files",
+        "register-index",
+    ]
+
+    stage = next(s for s in local_host.steps if s.name == "stage_local_fasta")
+    assert stage.module == "qiita_compute_orchestrator.jobs.stage_local_fasta"
+    assert stage.inputs == ["fasta_manifest_path"]
+    assert stage.outputs == ["fasta_path"]
+
+    # Taxonomy required (the rype mapping authority), same as host-reference-add.
+    assert set(local_host.context_schema["required"]) == {
+        "fasta_manifest_path",
+        "taxonomy_path",
+    }
+    props = local_host.context_schema["properties"]
+    for key in (
+        "fasta_manifest_path",
+        "taxonomy_path",
+        "tree_path",
+        "jplace_path",
+        "genome_map_path",
+    ):
+        assert props[key] == {"type": "string", "pattern": "^/"}, key
+
+    from qiita_control_plane.cli.reference_load import (
+        _LOCAL_HOST_REFERENCE_ADD_ACTION_ID,
+        _REFERENCE_ADD_ACTION_VERSION,
+    )
+
+    assert _LOCAL_HOST_REFERENCE_ADD_ACTION_ID == local_host.action_id == "local-host-reference-add"
+    assert _REFERENCE_ADD_ACTION_VERSION == local_host.version == "1.0.0"
+
+
 def test_load_actions_loads_on_disk_bcl_convert_yaml():
     """The actual on-disk `workflows/bcl-convert/1.0.0.yaml` loads as a
     valid ActionDefinition: target_kind is sequenced_pool; the

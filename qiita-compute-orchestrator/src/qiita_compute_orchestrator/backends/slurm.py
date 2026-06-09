@@ -1,11 +1,17 @@
 """SLURM compute backend.
 
-Submits each workflow step as a SLURM job via slurmrestd, polls until
-the job reaches a terminal state, runs the container-output verifier,
-and returns the parsed `outputs` map. The four pure pieces in
-`qiita_compute_orchestrator.slurm` (payload, verify, client, plus the
-ack and `parse_outputs_map` helper) carry the implementation; this
-module is the wiring.
+Submits each workflow step as a SLURM job via slurmrestd, reads its
+status, runs the container-output verifier, and returns the parsed
+`outputs` map. The four pure pieces in `qiita_compute_orchestrator.slurm`
+(payload, verify, client, plus the ack and `parse_outputs_map` helper)
+carry the implementation; this module is the wiring.
+
+The work is split across the decoupled `submit_step` / `status_step` /
+`result_step` so the control-plane runner can submit, poll, and finalize
+without holding a connection open for the duration of the SLURM job. The
+runner owns the poll loop; `status_step` is a single (non-looping) read.
+`find_jobs_by_name` lets the runner adopt a job whose id it never
+persisted (the write-ahead idempotency gap).
 
 State => BackendFailure mapping lives here (rather than in the
 slurmrestd client) because the workflow-level context — step name,
@@ -14,18 +20,26 @@ SUBMISSION vs STEP_RUN classification — is only meaningful here.
 
 from __future__ import annotations
 
-import asyncio
 import json
-import random
-import time
 from datetime import timedelta
 from pathlib import Path
 
 from qiita_common.actions import BaselineResources
 from qiita_common.backend_failure import BackendFailure, FailureKind
-from qiita_common.models import StepBaselineResources, WorkTicketFailureStage
+from qiita_common.models import (
+    ComputeTarget,
+    StepBaselineResources,
+    StepStatus,
+    WorkTicketFailureStage,
+)
 
-from ..backend import ComputeBackend, assert_container_scope_supported
+from ..backend import (
+    ComputeBackend,
+    FoundJob,
+    StepHandle,
+    StepStatusInfo,
+    assert_container_scope_supported,
+)
 from ..slurm import (
     SlurmJobInfo,
     SlurmrestdClient,
@@ -64,10 +78,10 @@ _STATE_TO_FAILURE_KIND: dict[TerminalSlurmState, FailureKind] = {
 
 
 class SlurmBackend(ComputeBackend):
-    """Submits compute jobs to SLURM via slurmrestd. Each call to
-    `run_step` submits one SLURM job and waits for it to terminate;
-    map / reduce fan-out (one SLURM job per `prep_sample_idx`) is not
-    supported yet — the backend handles a single SLURM job per step.
+    """Submits compute jobs to SLURM via slurmrestd. Each `submit_step`
+    submits one SLURM job; map / reduce fan-out (one SLURM job per
+    `prep_sample_idx`) is not supported yet — the backend handles a single
+    SLURM job per step.
 
     See docs/architecture.md "Backend code-sharing" for the
     canonical-implementation contract: the SLURM container's entrypoint
@@ -93,6 +107,14 @@ class SlurmBackend(ComputeBackend):
         self._client = client
         self._partition = partition
         self._account = account
+        # TODO(decouple-compute follow-up): remove these two fields + the
+        # SlurmSettings entries + the SLURM_POLL_INTERVAL_SECONDS /
+        # SLURM_JOB_TIMEOUT_SECONDS env vars in a dedicated config-cleanup PR.
+        # Retained-but-unread since the CP runner took over the poll loop (it
+        # drives status_step at its own interval and relies on SLURM's walltime
+        # to terminate a stuck job), so the orchestrator no longer polls or
+        # enforces a watch-timeout. Kept now only to keep this change off the
+        # deploy surface (the env vars still parse harmlessly).
         self._poll_interval = poll_interval_seconds
         self._job_timeout = job_timeout_seconds
         self._native_python = native_python
@@ -112,8 +134,8 @@ class SlurmBackend(ComputeBackend):
         # — visible to cluster admins.
         #
         # The CP→CO *inbound* shared bearer is NOT propagated: the
-        # launcher never serves /step/run, so `get_settings()` on the
-        # compute node falls back to Settings.from_env(
+        # launcher never serves the /step/* routes, so `get_settings()` on
+        # the compute node falls back to Settings.from_env(
         # require_cp_to_co_token=False) and skips it. That keeps the
         # SLURM-env exposure surface to just the outbound PAT.
         self._co_to_cp_token = co_to_cp_token
@@ -229,7 +251,7 @@ class SlurmBackend(ComputeBackend):
         # Sorted output makes payload tests deterministic.
         return sorted(bind_dirs)
 
-    async def run_step(
+    async def submit_step(
         self,
         name: str,
         inputs: dict[str, Path],
@@ -237,15 +259,19 @@ class SlurmBackend(ComputeBackend):
         *,
         scope_target: dict,
         work_ticket_idx: int,
+        attempt: int = 0,
         container: str | None = None,
         module: str | None = None,
         entrypoint: str | None = None,
         baseline_resources: StepBaselineResources | None = None,
-    ) -> dict[str, Path]:
+    ) -> StepHandle:
+        """Lay out the workspace tree + params.json, submit the SLURM job,
+        and return a StepHandle — without polling. Submission errors are
+        classified into a retriable / permanent BackendFailure."""
         if (container is None) == (module is None):
             # Both None (neither runtime declared) and both set (ambiguous
             # runtime) are contract violations. The wire validator on
-            # StepRunRequest catches this upstream; this guard protects
+            # StepSubmitRequest catches this upstream; this guard protects
             # direct callers (tests, programmatic submission) and keeps
             # the failure shape identical for either flavor.
             raise BackendFailure(
@@ -358,6 +384,7 @@ class SlurmBackend(ComputeBackend):
             partition=self._partition,
             account=self._account,
             native_python=self._native_python,
+            attempt=attempt,
             extra_env=extra_env or None,
             extra_bind_dirs=extra_bind_dirs,
             qos=self._qos,
@@ -368,12 +395,39 @@ class SlurmBackend(ComputeBackend):
         except SlurmrestdError as exc:
             raise self._classify_submit_error(exc, name) from exc
 
-        info = await self._poll_until_terminal(job_id, name)
+        return StepHandle(
+            compute_target=ComputeTarget.SLURM,
+            step_name=name,
+            slurm_job_id=job_id,
+            job_name=payload["job"]["name"],
+            output_path=output_path,
+            logs_path=logs_path,
+        )
 
-        if info.state == TerminalSlurmState.COMPLETED and (
-            info.exit_code is None or info.exit_code == 0
-        ):
-            failures = verify_container_output(output_path)
+    async def status_step(self, handle: StepHandle) -> StepStatusInfo:
+        """Single slurmrestd read => coarse StepStatus. The control-plane
+        runner owns the poll loop and the timeout; this never blocks.
+
+        slurmrestd errors are classified into a typed BackendFailure so the
+        caller sees the same surface as submit/result: transport / 5xx / 401
+        => retriable SLURMRESTD_UNREACHABLE (the runner keeps polling); other
+        4xx (e.g. 404 purged) => UNKNOWN_PERMANENT (status unknowable; Phase 5
+        recovery uses the filesystem tiebreaker)."""
+        self._require_slurm_handle(handle)
+        try:
+            info = await self._client.get_job(handle.slurm_job_id)
+        except SlurmrestdError as exc:
+            raise self._classify_status_error(exc, handle.step_name) from exc
+        return self._status_info_from_job(info)
+
+    async def result_step(self, handle: StepHandle, status: StepStatusInfo) -> dict[str, Path]:
+        """Finalize a terminal SLURM step: verify + parse outputs on
+        success, or raise the classified BackendFailure on failure. The
+        single home for the post-poll terminal logic, called by the runner
+        once `status_step` reports the job terminal."""
+        self._require_slurm_handle(handle)
+        if status.status == StepStatus.COMPLETED:
+            failures = verify_container_output(handle.output_path)
             if failures:
                 # Container exited 0 but didn't honor the contract — gate
                 # 2/3/4 violation. Permanent: same container against same
@@ -384,11 +438,11 @@ class SlurmBackend(ComputeBackend):
                 raise BackendFailure(
                     kind=FailureKind.CONTRACT_VIOLATION,
                     stage=WorkTicketFailureStage.STEP_RUN,
-                    step_name=name,
+                    step_name=handle.step_name,
                     reason=f"container output failed verification: {detail}",
                 )
             try:
-                return parse_outputs_map(output_path)
+                return parse_outputs_map(handle.output_path)
             except (OSError, json.JSONDecodeError, KeyError) as exc:
                 # Verifier already validated the manifest, so we don't
                 # expect to land here in practice — but if we do, treat
@@ -397,17 +451,27 @@ class SlurmBackend(ComputeBackend):
                 raise BackendFailure(
                     kind=FailureKind.CONTRACT_VIOLATION,
                     stage=WorkTicketFailureStage.STEP_RUN,
-                    step_name=name,
+                    step_name=handle.step_name,
                     reason=f"could not parse manifest.json outputs: {exc!s}",
                 ) from exc
 
+        if status.status != StepStatus.FAILED:
+            # A non-terminal status reached result_step — a caller bug:
+            # the runner must poll until terminal before finalizing.
+            raise BackendFailure(
+                kind=FailureKind.UNKNOWN_PERMANENT,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=handle.step_name,
+                reason=f"result_step called on non-terminal status {status.status.value!r}",
+            )
+
         # Terminal-but-not-success: map state => FailureKind.
-        kind = _STATE_TO_FAILURE_KIND.get(info.state, FailureKind.UNKNOWN_PERMANENT)
-        reason_parts = [f"SLURM job {job_id} ended in state {info.state!r}"]
-        if info.exit_code is not None:
-            reason_parts.append(f"exit_code={info.exit_code}")
-        if info.reason:
-            reason_parts.append(f"slurm_reason={info.reason}")
+        kind = _STATE_TO_FAILURE_KIND.get(status.raw_state, FailureKind.UNKNOWN_PERMANENT)
+        reason_parts = [f"SLURM job {handle.slurm_job_id} ended in state {status.raw_state!r}"]
+        if status.exit_code is not None:
+            reason_parts.append(f"exit_code={status.exit_code}")
+        if status.reason:
+            reason_parts.append(f"slurm_reason={status.reason}")
         state_reason = ", ".join(reason_parts)
 
         # Native-step jobs write a structured failure line to stderr
@@ -418,7 +482,7 @@ class SlurmBackend(ComputeBackend):
         # steps and infra-killed jobs (NODE_FAIL, OOM, ...) won't have
         # the line; in those cases parse_launcher_failure returns None
         # and the state-based classification stands.
-        launcher_failure = parse_launcher_failure(logs_path / "stderr")
+        launcher_failure = parse_launcher_failure(handle.logs_path / "stderr")
         if launcher_failure is not None:
             raise BackendFailure(
                 kind=launcher_failure.kind,
@@ -432,58 +496,73 @@ class SlurmBackend(ComputeBackend):
         raise BackendFailure(
             kind=kind,
             stage=WorkTicketFailureStage.STEP_RUN,
-            step_name=name,
+            step_name=handle.step_name,
             reason=state_reason,
         )
 
-    async def _poll_until_terminal(self, job_id: int, step_name: str) -> SlurmJobInfo:
-        """Poll slurmrestd at `poll_interval_seconds` until the job
-        reaches a terminal state or `job_timeout_seconds` elapses.
+    async def find_jobs_by_name(self, job_name: str) -> list[FoundJob]:
+        """Look up live SLURM jobs by their deterministic name (the CP
+        idempotency / recovery path). slurmrestd errors classify exactly like
+        `status_step` — transport / 5xx / 401 => retriable
+        SLURMRESTD_UNREACHABLE (recovery retries); other 4xx =>
+        UNKNOWN_PERMANENT (job list unreadable). A matched job carrying no id
+        is skipped — it can't be adopted by id."""
+        try:
+            infos = await self._client.find_jobs_by_name(job_name)
+        except SlurmrestdError as exc:
+            raise self._classify_status_error(exc, job_name) from exc
+        return [
+            FoundJob(
+                slurm_job_id=info.job_id,
+                job_name=info.name or job_name,
+                status=self._status_info_from_job(info),
+            )
+            for info in infos
+            if info.job_id is not None
+        ]
 
-        On total-timeout: raise a retriable PROCESS_RESTARTED — a job
-        that doesn't terminate within 24h either has a misconfigured
-        walltime (will hit TIMEOUT eventually) or is genuinely stuck
-        (operator-fixable). PROCESS_RESTARTED rather than a stuck-job
-        kind because there's no kind for "we gave up watching"; the
-        orchestrator may have been restarted and this job is dangling.
+    @staticmethod
+    def _require_slurm_handle(handle: StepHandle) -> None:
+        """Guard: status_step / result_step operate only on a SLURM handle
+        (one carrying a job id and the workspace paths). A handle from a
+        different backend reaching here is a caller bug — fail loudly with
+        a typed BackendFailure rather than dereferencing a None path into
+        an opaque AttributeError."""
+        if handle.slurm_job_id is None or handle.output_path is None or handle.logs_path is None:
+            raise BackendFailure(
+                kind=FailureKind.UNKNOWN_PERMANENT,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=handle.step_name,
+                reason=(
+                    "SlurmBackend status_step/result_step require a SLURM handle"
+                    f" (job id + workspace paths); got {handle!r}"
+                ),
+            )
 
-        slurmrestd 5xx / transport errors during polling don't bail the
-        whole step — they retry on the next interval. A 4xx (e.g. 404
-        because the job was purged) does bail.
-
-        Each tick's sleep is jittered by ±50% so N orchestrator
-        instances don't all hit slurmrestd in lockstep."""
-        deadline = time.monotonic() + self._job_timeout
-        while True:
-            try:
-                info = await self._client.get_job(job_id)
-            except SlurmrestdError as exc:
-                # 4xx errors mean the job state is unknowable — bail.
-                # 5xx and transport errors are transient: keep polling.
-                if exc.status_code is not None and 400 <= exc.status_code < 500:
-                    raise BackendFailure(
-                        kind=FailureKind.UNKNOWN_PERMANENT,
-                        stage=WorkTicketFailureStage.STEP_RUN,
-                        step_name=step_name,
-                        reason=(
-                            f"slurmrestd get_job({job_id}) returned {exc.status_code}: {exc!s}"
-                        ),
-                    ) from exc
-                # Transient: log via the polling loop and retry.
-                info = None  # type: ignore[assignment]
-            if info is not None and info.is_terminal:
-                return info
-            if time.monotonic() >= deadline:
-                raise BackendFailure(
-                    kind=FailureKind.PROCESS_RESTARTED,
-                    stage=WorkTicketFailureStage.STEP_RUN,
-                    step_name=step_name,
-                    reason=(
-                        f"SLURM job {job_id} did not reach terminal state "
-                        f"within {self._job_timeout}s; orchestrator gave up watching"
-                    ),
-                )
-            await asyncio.sleep(self._poll_interval * random.uniform(0.5, 1.5))
+    @staticmethod
+    def _status_info_from_job(info: SlurmJobInfo) -> StepStatusInfo:
+        """Classify a slurmrestd snapshot into the coarse StepStatus.
+        COMPLETED requires a clean (zero / unset) exit code; everything
+        else terminal is FAILED. PENDING stays PENDING; any other
+        non-terminal state (CONFIGURING, COMPLETING, SUSPENDED, ...) reads
+        as RUNNING for the summary's purposes."""
+        if info.is_terminal:
+            if info.state == TerminalSlurmState.COMPLETED and (
+                info.exit_code is None or info.exit_code == 0
+            ):
+                status = StepStatus.COMPLETED
+            else:
+                status = StepStatus.FAILED
+        elif info.state == "PENDING":
+            status = StepStatus.PENDING
+        else:
+            status = StepStatus.RUNNING
+        return StepStatusInfo(
+            status=status,
+            raw_state=info.state,
+            exit_code=info.exit_code,
+            reason=info.reason,
+        )
 
     def _classify_submit_error(self, exc: SlurmrestdError, step_name: str) -> BackendFailure:
         """Map a slurmrestd error from job/submit to a BackendFailure.
@@ -509,4 +588,29 @@ class SlurmBackend(ComputeBackend):
             stage=WorkTicketFailureStage.STEP_RUN,
             step_name=step_name,
             reason=f"slurmrestd submit failed: {exc!s}",
+        )
+
+    def _classify_status_error(self, exc: SlurmrestdError, step_name: str) -> BackendFailure:
+        """Map a slurmrestd get_job / job-list error to a BackendFailure. A
+        4xx other than 401 means the job state is unknowable (permanent —
+        purged job; the runner's filesystem tiebreaker then decides from the
+        on-disk manifest); 5xx / transport / 401 are transiently unreachable
+        (the runner retries). 401 is retriable, consistent with
+        `_classify_submit_error`: a 401 surviving the client's JWT-refresh
+        retry is a broken rotation pipeline (operator-fixable), not a terminal
+        step outcome.
+
+        Note for the runner: a BackendFailure out of `status_step` (or
+        `find_jobs_by_name`) always means "could not read status" (transport /
+        infra), never "the step failed" — retry on a transient kind rather
+        than recording a terminal step failure."""
+        if exc.status_code is not None and 400 <= exc.status_code < 500 and exc.status_code != 401:
+            kind = FailureKind.UNKNOWN_PERMANENT
+        else:
+            kind = FailureKind.SLURMRESTD_UNREACHABLE
+        return BackendFailure(
+            kind=kind,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name=step_name,
+            reason=f"slurmrestd get_job failed: {exc!s}",
         )

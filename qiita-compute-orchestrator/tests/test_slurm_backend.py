@@ -1,9 +1,15 @@
-"""Functional tests for SlurmBackend.run_step.
+"""Functional (end-to-end) tests for the SlurmBackend.
 
 Wires payload + client + verify together. Driven by httpx.MockTransport
 so no live SLURM controller is needed; the test handler shapes
 slurmrestd responses to drive each branch of the SLURM-state =>
 FailureKind mapping.
+
+The control plane drives the decoupled submit_step / status_step /
+result_step trio (it owns the poll loop), so these end-to-end tests compose
+the trio via the `_run_step_via_trio` helper — exercising the real
+production methods against a realistic slurmrestd mock. Per-method behavior
+in isolation is covered by the trio tests further down.
 """
 
 from __future__ import annotations
@@ -15,9 +21,15 @@ from pathlib import Path
 import httpx
 import pytest
 from qiita_common.backend_failure import BackendFailure, FailureKind
-from qiita_common.models import StepBaselineResources, WorkTicketFailureStage
+from qiita_common.models import (
+    ComputeTarget,
+    StepBaselineResources,
+    StepStatus,
+    WorkTicketFailureStage,
+)
 from qiita_common.testing.native_steps import FASTQ_TO_PARQUET_MODULE
 
+from qiita_compute_orchestrator.backend import StepHandle, StepStatusInfo
 from qiita_compute_orchestrator.backends.slurm import SlurmBackend
 from qiita_compute_orchestrator.slurm import SlurmrestdClient
 
@@ -76,6 +88,22 @@ def _make_backend(
         cp_url=cp_url,
         path_scratch=path_scratch,
     )
+
+
+async def _run_step_via_trio(backend: SlurmBackend, *args, **kwargs) -> dict[str, Path]:
+    """Compose submit_step → poll status_step to terminal → result_step,
+    reproducing the end-to-end step execution the control-plane runner drives.
+    The runner owns the real poll loop (with sleeps + the CP-side filesystem
+    tiebreaker); this test-side composition is the minimal equivalent so the
+    SlurmBackend functional tests exercise the production trio against a
+    realistic slurmrestd mock. `*args` / `**kwargs` match `submit_step`."""
+    handle = await backend.submit_step(*args, **kwargs)
+    assert handle.slurm_job_id is not None
+    while True:
+        info = await backend.status_step(handle)
+        if info.is_terminal:
+            break
+    return await backend.result_step(handle, info)
 
 
 def _job_running_then(state: str, *, exit_code: int | None = None, reason: str | None = None):
@@ -138,12 +166,13 @@ def _write_completed_output(workspace: Path, *, manifest_extra: dict | None = No
 @pytest.mark.asyncio
 async def test_run_step_requires_container_or_module(jwt_path, baseline, tmp_path):
     """Neither runtime field set → CONTRACT_VIOLATION. The wire validator
-    on StepRunRequest catches this upstream, but direct callers (and
+    on StepSubmitRequest catches this upstream, but direct callers (and
     this test) bypass the wire, so SlurmBackend re-checks."""
     handler = httpx.MockTransport(lambda req: httpx.Response(500))
     backend = _make_backend(handler, jwt_path)
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await _run_step_via_trio(
+            backend,
             "hash",
             {},
             tmp_path,
@@ -167,7 +196,8 @@ async def test_run_step_rejects_both_container_and_module(jwt_path, baseline, tm
     handler = httpx.MockTransport(lambda req: httpx.Response(500))
     backend = _make_backend(handler, jwt_path)
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await _run_step_via_trio(
+            backend,
             "hash",
             {},
             tmp_path,
@@ -187,7 +217,8 @@ async def test_run_step_requires_baseline_resources(jwt_path, tmp_path):
     handler = httpx.MockTransport(lambda req: httpx.Response(500))
     backend = _make_backend(handler, jwt_path)
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await _run_step_via_trio(
+            backend,
             "hash",
             {},
             tmp_path,
@@ -212,7 +243,8 @@ async def test_run_step_container_rejects_unsupported_scope(jwt_path, baseline, 
     handler = httpx.MockTransport(lambda req: httpx.Response(500))
     backend = _make_backend(handler, jwt_path)
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await _run_step_via_trio(
+            backend,
             "hash",
             {},
             tmp_path,
@@ -242,7 +274,8 @@ async def test_run_step_native_accepts_non_reference_scope(jwt_path, baseline, t
     )
     backend = _make_backend(transport, jwt_path)
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await _run_step_via_trio(
+            backend,
             "fastq",
             {},
             tmp_path,
@@ -272,7 +305,8 @@ async def test_run_step_completed_returns_outputs(jwt_path, baseline, tmp_path):
     # Pre-write the output dir's manifest so the verifier passes.
     _write_completed_output(tmp_path)
 
-    outputs = await backend.run_step(
+    outputs = await _run_step_via_trio(
+        backend,
         "hash",
         {"fasta_path": tmp_path / "x.fa"},
         tmp_path,
@@ -297,7 +331,7 @@ async def test_run_step_propagates_co_to_cp_token_and_cp_url_into_job_env(
     the compute-node launcher's `Settings.from_env(
     require_cp_to_co_token=False)` accepts the env-var token shape.
 
-    CP_TO_CO_TOKEN must NOT be propagated — it's inbound /step/run
+    CP_TO_CO_TOKEN must NOT be propagated — it's inbound /step/*
     auth which the launcher never serves; the job-side
     `get_settings()` no-install fallback skips it."""
     captured: dict[str, dict] = {}
@@ -319,7 +353,8 @@ async def test_run_step_propagates_co_to_cp_token_and_cp_url_into_job_env(
     )
     _write_completed_output(tmp_path)
 
-    await backend.run_step(
+    await _run_step_via_trio(
+        backend,
         "fastq",
         {},
         tmp_path,
@@ -334,7 +369,7 @@ async def test_run_step_propagates_co_to_cp_token_and_cp_url_into_job_env(
     assert env["QIITA_CP_URL"] == "https://qiita.example.org"
     # HOME is wired on every job, not just token-propagating ones.
     assert env["HOME"] == str(tmp_path)
-    # CP_TO_CO_TOKEN is the inbound /step/run shared bearer — the
+    # CP_TO_CO_TOKEN is the inbound /step/* shared bearer — the
     # launcher never serves that route, so propagating it would only
     # widen the `scontrol show job` exposure with no consumer.
     assert "CP_TO_CO_TOKEN" not in env
@@ -360,7 +395,8 @@ async def test_run_step_omits_token_env_when_backend_has_no_tokens(jwt_path, bas
     backend = _make_backend(httpx.MockTransport(handler), jwt_path)
     _write_completed_output(tmp_path)
 
-    await backend.run_step(
+    await _run_step_via_trio(
+        backend,
         "fastq",
         {},
         tmp_path,
@@ -406,7 +442,8 @@ async def test_run_step_propagates_path_scratch_into_job_env(jwt_path, baseline,
     )
     _write_completed_output(tmp_path)
 
-    await backend.run_step(
+    await _run_step_via_trio(
+        backend,
         "fastq",
         {},
         tmp_path,
@@ -427,7 +464,8 @@ async def test_run_step_writes_params_json(jwt_path, baseline, tmp_path):
     backend = _make_backend(transport, jwt_path)
     _write_completed_output(tmp_path)
 
-    await backend.run_step(
+    await _run_step_via_trio(
+        backend,
         "hash",
         {"fasta_path": tmp_path / "input.fa"},
         tmp_path,
@@ -472,7 +510,8 @@ async def test_run_step_terminal_states_map_to_kinds(
     transport, _ = _job_running_then(slurm_state, exit_code=1, reason="something")
     backend = _make_backend(transport, jwt_path)
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await _run_step_via_trio(
+            backend,
             "hash",
             {},
             tmp_path,
@@ -512,8 +551,8 @@ async def test_run_step_native_failure_enriched_from_launcher_stderr(jwt_path, b
     backend = _make_backend(transport, jwt_path)
 
     # SlurmBackend creates <workspace>/logs/ itself, but we pre-create
-    # the stderr file before run_step so the launcher's would-be output
-    # is in place when SlurmBackend looks for it post-poll.
+    # the stderr file before the trio runs so the launcher's would-be
+    # output is in place when result_step looks for it.
     logs_dir = tmp_path / "logs"
     logs_dir.mkdir()
     launcher_reason = f"native job {FASTQ_TO_PARQUET_MODULE!r} not implemented: skeleton"
@@ -529,7 +568,8 @@ async def test_run_step_native_failure_enriched_from_launcher_stderr(jwt_path, b
     )
 
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await _run_step_via_trio(
+            backend,
             "fastq",  # YAML step name passed in by the runner
             {},
             tmp_path,
@@ -568,7 +608,8 @@ async def test_run_step_falls_back_to_state_based_kind_when_no_launcher_line(
     (logs_dir / "stderr").write_text("ERROR: container exited with code 1\n")
 
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await _run_step_via_trio(
+            backend,
             "hash",
             {},
             tmp_path,
@@ -605,7 +646,8 @@ async def test_run_step_completed_but_missing_manifest_is_contract_violation(
     # with a manifest — we leave it empty.
 
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await _run_step_via_trio(
+            backend,
             "hash",
             {},
             tmp_path,
@@ -631,7 +673,8 @@ async def test_run_step_submit_5xx_is_unreachable(jwt_path, baseline, tmp_path):
     handler = httpx.MockTransport(lambda req: httpx.Response(503, text="slurmctld down"))
     backend = _make_backend(handler, jwt_path)
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await _run_step_via_trio(
+            backend,
             "hash",
             {},
             tmp_path,
@@ -652,7 +695,8 @@ async def test_run_step_submit_4xx_is_contract_violation(jwt_path, baseline, tmp
     handler = httpx.MockTransport(lambda req: httpx.Response(400, json={"errors": ["malformed"]}))
     backend = _make_backend(handler, jwt_path)
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await _run_step_via_trio(
+            backend,
             "hash",
             {},
             tmp_path,
@@ -675,7 +719,8 @@ async def test_run_step_submit_persistent_401_is_unreachable(jwt_path, baseline,
     handler = httpx.MockTransport(lambda req: httpx.Response(401, text="bad token"))
     backend = _make_backend(handler, jwt_path)
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await _run_step_via_trio(
+            backend,
             "hash",
             {},
             tmp_path,
@@ -698,7 +743,8 @@ async def test_run_step_submit_transport_error_is_unreachable(jwt_path, baseline
 
     backend = _make_backend(httpx.MockTransport(handler), jwt_path)
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await _run_step_via_trio(
+            backend,
             "hash",
             {},
             tmp_path,
@@ -711,22 +757,70 @@ async def test_run_step_submit_transport_error_is_unreachable(jwt_path, baseline
     assert ei.value.kind == FailureKind.SLURMRESTD_UNREACHABLE
 
 
+# ============================================================================
+# Decoupled interface: submit_step / status_step / result_step
+# ============================================================================
+
+
+def _slurm_handle(tmp_path, *, job_id: int = 1) -> StepHandle:
+    """A SLURM StepHandle pointing at the workspace tree, for driving
+    status_step / result_step in isolation."""
+    return StepHandle(
+        compute_target=ComputeTarget.SLURM,
+        step_name="hash",
+        slurm_job_id=job_id,
+        job_name="qiita-wt99-hash-a0",
+        output_path=tmp_path / "output",
+        logs_path=tmp_path / "logs",
+    )
+
+
 @pytest.mark.asyncio
-async def test_run_step_polling_4xx_bails_permanent(jwt_path, baseline, tmp_path):
-    """If the job is purged (404) during polling, the backend can't
-    know whether it succeeded — bail with UNKNOWN_PERMANENT (the
-    failure isn't classifiable)."""
-    seen: list[str] = []
+async def test_submit_step_returns_slurm_handle_without_polling(jwt_path, baseline, tmp_path):
+    """submit_step submits the job and returns a StepHandle carrying the
+    job id, the deterministic name, and the workspace paths that
+    status_step / result_step need — and does NOT poll (the CP drives
+    polling now, so a single submit must not block on completion)."""
+    captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(f"{request.method} {request.url.path}")
-        if request.method == "POST":
-            return httpx.Response(200, json={"job_id": 1})
-        return httpx.Response(404, json={"errors": ["unknown job"]})
+        if request.method == "POST" and request.url.path.endswith("/job/submit"):
+            captured["payload"] = json.loads(request.content.decode())
+            return httpx.Response(200, json={"job_id": 4242})
+        raise AssertionError(f"submit_step must not poll; saw {request.method} {request.url}")
 
     backend = _make_backend(httpx.MockTransport(handler), jwt_path)
+    handle = await backend.submit_step(
+        "hash",
+        {"fasta_path": tmp_path / "x.fa"},
+        tmp_path,
+        scope_target={"kind": "reference", "reference_idx": 42},
+        work_ticket_idx=99,
+        attempt=3,
+        container="docker://qiita/hash:1.0.0",
+        entrypoint="/usr/local/bin/hash",
+        baseline_resources=baseline,
+    )
+    assert handle.compute_target == ComputeTarget.SLURM
+    assert handle.slurm_job_id == 4242
+    assert handle.job_name == "qiita-wt99-hash-a3"
+    assert handle.output_path == tmp_path / "output"
+    assert handle.logs_path == tmp_path / "logs"
+    assert handle.terminal_outputs is None
+    # The deterministic name also went onto the submit payload.
+    assert captured["payload"]["job"]["name"] == "qiita-wt99-hash-a3"
+    # params.json was written so a later status/result (or a re-attach)
+    # finds the job's workspace fully laid out.
+    assert (tmp_path / "input" / "params.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_submit_step_classifies_submit_error(jwt_path, baseline, tmp_path):
+    """submit_step classifies a slurmrestd submit error — a 5xx is retriable
+    SLURMRESTD_UNREACHABLE."""
+    backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(503)), jwt_path)
     with pytest.raises(BackendFailure) as ei:
-        await backend.run_step(
+        await backend.submit_step(
             "hash",
             {},
             tmp_path,
@@ -736,5 +830,195 @@ async def test_run_step_polling_4xx_bails_permanent(jwt_path, baseline, tmp_path
             entrypoint=None,
             baseline_resources=baseline,
         )
+    assert ei.value.kind == FailureKind.SLURMRESTD_UNREACHABLE
+    assert ei.value.transient is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("slurm_state", "exit_code", "expected"),
+    [
+        ("PENDING", None, StepStatus.PENDING),
+        ("RUNNING", None, StepStatus.RUNNING),
+        ("COMPLETING", None, StepStatus.RUNNING),
+        ("COMPLETED", 0, StepStatus.COMPLETED),
+        ("COMPLETED", 1, StepStatus.FAILED),  # exited "COMPLETED" but nonzero rc
+        ("FAILED", 1, StepStatus.FAILED),
+        ("OUT_OF_MEMORY", None, StepStatus.FAILED),
+    ],
+)
+async def test_status_step_classifies_live_state(
+    jwt_path, tmp_path, slurm_state, exit_code, expected
+):
+    """status_step is a single (non-looping) slurmrestd read that maps the
+    live SLURM state to the coarse StepStatus the runner/summary use."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        job: dict = {"job_id": 7, "job_state": [slurm_state]}
+        if exit_code is not None:
+            job["exit_code"] = {"return_code": {"number": exit_code, "set": True}}
+        return httpx.Response(200, json={"jobs": [job]})
+
+    backend = _make_backend(httpx.MockTransport(handler), jwt_path)
+    info = await backend.status_step(_slurm_handle(tmp_path, job_id=7))
+    assert info.status == expected
+    assert info.raw_state == slurm_state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "raises_transport", "expected_kind", "expected_transient"),
+    [
+        (404, False, FailureKind.UNKNOWN_PERMANENT, False),  # purged: status unknowable
+        (400, False, FailureKind.UNKNOWN_PERMANENT, False),
+        (401, False, FailureKind.SLURMRESTD_UNREACHABLE, True),  # broken rotation, retriable
+        (503, False, FailureKind.SLURMRESTD_UNREACHABLE, True),
+        (None, True, FailureKind.SLURMRESTD_UNREACHABLE, True),  # transport error
+    ],
+)
+async def test_status_step_classifies_slurmrestd_errors(
+    jwt_path, tmp_path, status_code, raises_transport, expected_kind, expected_transient
+):
+    """status_step turns a slurmrestd error into a typed BackendFailure so
+    the route serializes it and the runner can classify retry: 4xx-not-401
+    is permanent (status unknowable); 401 / 5xx / transport are retriable."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if raises_transport:
+            raise httpx.ConnectError("connection refused")
+        return httpx.Response(status_code, json={"errors": ["x"]})
+
+    backend = _make_backend(httpx.MockTransport(handler), jwt_path)
+    with pytest.raises(BackendFailure) as ei:
+        await backend.status_step(_slurm_handle(tmp_path, job_id=7))
+    assert ei.value.kind == expected_kind
+    assert ei.value.transient is expected_transient
+
+
+@pytest.mark.asyncio
+async def test_result_step_completed_returns_outputs(jwt_path, tmp_path):
+    """On a COMPLETED status, result_step runs the container-output
+    verifier and returns the parsed outputs map — no slurmrestd call."""
+    backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
+    _write_completed_output(tmp_path)
+    outputs = await backend.result_step(
+        _slurm_handle(tmp_path),
+        StepStatusInfo(status=StepStatus.COMPLETED, raw_state="COMPLETED", exit_code=0),
+    )
+    assert outputs == {"manifest": (tmp_path / "output" / "result.parquet").resolve()}
+
+
+@pytest.mark.asyncio
+async def test_result_step_completed_missing_manifest_is_contract_violation(jwt_path, tmp_path):
+    backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
+    (tmp_path / "output").mkdir(parents=True)
+    with pytest.raises(BackendFailure) as ei:
+        await backend.result_step(
+            _slurm_handle(tmp_path),
+            StepStatusInfo(status=StepStatus.COMPLETED, raw_state="COMPLETED", exit_code=0),
+        )
+    assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
+    assert "manifest" in ei.value.reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_result_step_failed_maps_state_to_kind(jwt_path, tmp_path):
+    """On a FAILED status, result_step maps the SLURM state to a
+    FailureKind."""
+    backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
+    (tmp_path / "logs").mkdir(parents=True)
+    (tmp_path / "logs" / "stderr").write_text("ERROR: oom\n")
+    with pytest.raises(BackendFailure) as ei:
+        await backend.result_step(
+            _slurm_handle(tmp_path),
+            StepStatusInfo(
+                status=StepStatus.FAILED, raw_state="OUT_OF_MEMORY", exit_code=None, reason="oom"
+            ),
+        )
+    assert ei.value.kind == FailureKind.OOM_KILLED
+    assert ei.value.transient is True
+    assert "OUT_OF_MEMORY" in ei.value.reason
+
+
+@pytest.mark.asyncio
+async def test_result_step_rejects_non_slurm_handle(jwt_path, tmp_path):
+    """A handle missing the SLURM job id / workspace paths (e.g. a local
+    handle that wandered into SlurmBackend.result_step) is a caller bug —
+    fail loudly with a typed BackendFailure, not an opaque AttributeError
+    from dereferencing a None path."""
+    backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
+    local_handle = StepHandle(compute_target=ComputeTarget.LOCAL, step_name="hash")
+    with pytest.raises(BackendFailure) as ei:
+        await backend.result_step(
+            local_handle,
+            StepStatusInfo(status=StepStatus.COMPLETED, raw_state="COMPLETED", exit_code=0),
+        )
     assert ei.value.kind == FailureKind.UNKNOWN_PERMANENT
-    assert "404" in ei.value.reason
+    assert "SLURM handle" in ei.value.reason
+
+
+@pytest.mark.asyncio
+async def test_result_step_failed_prefers_launcher_stderr(jwt_path, tmp_path):
+    """result_step honors a native step's structured stderr line, exactly
+    like the old inline post-poll path."""
+    backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
+    (tmp_path / "logs").mkdir(parents=True)
+    (tmp_path / "logs" / "stderr").write_text(
+        json.dumps({"kind": "unknown_permanent", "step_name": "fastq", "reason": "boom in execute"})
+        + "\n"
+    )
+    with pytest.raises(BackendFailure) as ei:
+        await backend.result_step(
+            _slurm_handle(tmp_path),
+            StepStatusInfo(status=StepStatus.FAILED, raw_state="FAILED", exit_code=1),
+        )
+    assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
+    assert ei.value.step_name == "fastq"
+    assert "boom in execute" in ei.value.reason
+    assert "FAILED" in ei.value.reason  # SLURM context preserved in bracket suffix
+
+
+@pytest.mark.asyncio
+async def test_find_jobs_by_name_returns_matching_jobs(jwt_path):
+    """find_jobs_by_name lists slurmrestd jobs, filters to the deterministic
+    name, and maps each to a FoundJob with id + coarse status."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/jobs")
+        return httpx.Response(
+            200,
+            json={
+                "jobs": [
+                    {"job_id": 11, "name": "qiita-wt99-hash-a0", "job_state": ["RUNNING"]},
+                    {"job_id": 22, "name": "some-other-job", "job_state": ["RUNNING"]},
+                ]
+            },
+        )
+
+    backend = _make_backend(httpx.MockTransport(handler), jwt_path)
+    found = await backend.find_jobs_by_name("qiita-wt99-hash-a0")
+    assert len(found) == 1
+    assert found[0].slurm_job_id == 11
+    assert found[0].job_name == "qiita-wt99-hash-a0"
+    assert found[0].status.status == StepStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_find_jobs_by_name_empty_when_no_match(jwt_path):
+    """No job carries the name (purged, or never submitted) => empty list,
+    so the runner falls through to a fresh submit."""
+    backend = _make_backend(
+        httpx.MockTransport(lambda r: httpx.Response(200, json={"jobs": []})), jwt_path
+    )
+    assert await backend.find_jobs_by_name("qiita-wt1-hash-a0") == []
+
+
+@pytest.mark.asyncio
+async def test_find_jobs_by_name_classifies_slurmrestd_error(jwt_path):
+    """A 5xx from the job-list read classifies like status_step — retriable
+    SLURMRESTD_UNREACHABLE so the runner's recovery retries the lookup."""
+    backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(503)), jwt_path)
+    with pytest.raises(BackendFailure) as ei:
+        await backend.find_jobs_by_name("qiita-wt1-hash-a0")
+    assert ei.value.kind == FailureKind.SLURMRESTD_UNREACHABLE
+    assert ei.value.transient is True

@@ -59,8 +59,7 @@ graph TB
     NX -->|gRPC / HTTP/2| DP
 
     %% Service interactions
-    CP -->|"submit job"| CO
-    CO -->|"job status callback"| CP
+    CP -->|"submit / poll status / result (/step/*)"| CO
     DP -->|"upload complete callback"| CP
     CP -->|"register file"| DP
 
@@ -69,7 +68,7 @@ graph TB
     COMMON -.->|"path dependency"| CO
 
     %% Compute
-    CO -->|"submit/poll via REST"| SR
+    CO -->|"submit / status via REST"| SR
     SR -->|"schedule"| SL
 
     %% Storage
@@ -103,9 +102,9 @@ graph TB
 
 ## Components
 
-- **qiita-control-plane** — Client-facing REST API (Python 3.14, FastAPI, asyncpg, Postgres, dbmate, OpenAPI, PyTest, ruff, uv, GitHub Actions CI). Handles CRUD for study/sample/preparation, search, work ticket creation/management, and reference management (genome/feature/reference ID minting, reference membership, taxonomy authority registration). Signs Flight tickets (HMAC-SHA256) for client access to data plane. Orchestrates file registration in DuckLake (via data plane) after compute completion. Hosts the **workflow runner** (`qiita_control_plane.runner`) — for each work ticket, walks the action's `steps:` list, dispatching `action:` entries to in-process LIBRARY primitives and `step:` entries to the orchestrator's `POST /api/v1/step/run` endpoint over HTTP.
+- **qiita-control-plane** — Client-facing REST API (Python 3.14, FastAPI, asyncpg, Postgres, dbmate, OpenAPI, PyTest, ruff, uv, GitHub Actions CI). Handles CRUD for study/sample/preparation, search, work ticket creation/management, and reference management (genome/feature/reference ID minting, reference membership, taxonomy authority registration). Signs Flight tickets (HMAC-SHA256) for client access to data plane. Orchestrates file registration in DuckLake (via data plane) after compute completion. Hosts the **workflow runner** (`qiita_control_plane.runner`) — for each work ticket, walks the action's `steps:` list, dispatching `action:` entries to in-process LIBRARY primitives and `step:` entries to the orchestrator over HTTP via the decoupled `submit` / `status` / `result` trio. The control plane drives the poll loop and persists per-step progress to `qiita.work_ticket_step`.
 - **qiita-data-plane** — Data layer (Rust, arrow-flight, DuckDB v1.5.2, duckdb-miint extension, DuckLake w/ Postgres catalog). Arrow Flight protocol (gRPC-based). Intentionally "dumb" — select/insert/delete by exact integer identifiers. Clients connect directly through nginx. Verifies HMAC-signed Flight tickets issued by the control plane; performs no user authentication itself. Registers Parquet files into DuckLake via `ducklake_add_data_files` (metadata-only, no I/O). Runs as the dedicated `qiita-data` system user; verifies result file permissions before registration and rejects files that are not `440`. **Horizontally scalable**: each instance holds an independent DuckDB+DuckLake connection to the shared Postgres catalog; DuckLake's snapshot-isolated concurrent read model means multiple instances never block each other. nginx load-balances gRPC traffic across all instances.
-- **qiita-compute-orchestrator** — Separate Python service for compute lifecycle management. Exposes `POST /api/v1/step/run` which the control-plane runner calls to dispatch a workflow `step:` entry; internally the orchestrator owns the SLURM lifecycle (submit via slurmrestd, poll for status, detect completion/failure, verify output, collect logs). SLURM jobs are truly dumb (read input, process, write output, exit). Also builds aligner indices for references (minimap2 `.mmi`, bowtie2) as SLURM batch jobs. Abstracts compute backend behind a clean `ComputeBackend` interface (`LocalBackend` for dev/test runs DuckDB+miint in-process; `SlurmBackend` is the production target). Has no direct DB access — the architectural intent is that the orchestrator only knows about identifiers it receives in `/step/run` requests.
+- **qiita-compute-orchestrator** — Separate Python service for compute step execution. Exposes the decoupled `POST /api/v1/step/{submit,status,result}` trio (plus `POST /api/v1/step/find-by-name`) which the control-plane runner drives: `submit` `sbatch`es the job and returns a handle immediately, the CP polls `status` until terminal, then `result` verifies the output and returns it. The orchestrator is **stateless across these calls** — it owns no in-flight job state; the handle it returns carries everything (SLURM job id + workspace paths), and the CP persists it (so a CP restart can re-attach). SLURM jobs are truly dumb (read input, process, write output, exit). Also builds aligner indices for references (minimap2 `.mmi`, bowtie2) as SLURM batch jobs. Abstracts compute backend behind a clean `ComputeBackend` interface (`LocalBackend` for dev/test runs DuckDB+miint in-process; `SlurmBackend` is the production target). Has no direct DB access — the orchestrator only knows about identifiers it receives in `/step/*` requests.
 - **qiita-common** — Shared Python library for control plane and compute orchestrator. Pydantic models (work ticket states, API request/response schemas), config patterns, and REST client utilities. Prevents drift between services' understanding of the API contract.
 - **API gateway** — nginx: REST to qiita-control-plane, Arrow Flight/gRPC (HTTP/2+TLS) load-balanced across N qiita-data-plane instances.
 - **Auth** — three principal kinds (human, service, anonymous). Humans authenticate via AuthRocket OIDC; services hold opaque PATs; CP↔DP traffic is HMAC-signed Flight tickets. See [`docs/auth.md`](auth.md) for the principal model, scopes, endpoints, and runbooks.
@@ -458,18 +457,19 @@ sequenceDiagram
     DP->>CP: REST callback: upload complete, path=/scratch/ephemeral/staging/ticket_001/
     CP->>PG_APP: update work ticket (UPLOADED)
 
-    Note over CP,CO: 4. Compute submission
-    CP->>CO: REST: submit processing for work ticket X
+    Note over CP,CO: 4. Compute submission (CP drives; CO stateless)
+    CP->>CO: POST /step/submit (work ticket X, step entry)
     CO->>SR: POST /slurm/{slurmrestd_api_ver}/job/submit<br/>(container: qiita-workflow-amplicon:v1.2.0,<br/>input/output paths, stdout/stderr log paths)
     SR-->>CO: job_id=98765
-    CO->>CP: REST callback: SLURM job queued, job_id=98765
-    CP->>PG_APP: update work ticket (QUEUED, slurm_job_id=98765)
+    CO-->>CP: handle (slurm_job_id=98765, workspace paths)
+    CP->>PG_APP: work_ticket_step (submitted, slurm_job_id=98765); ticket QUEUED
 
-    Note over CO,SR: 5. Job monitoring (orchestrator polls)
+    Note over CP,SR: 5. Job monitoring (CP polls status_step)
+    CP->>CO: POST /step/status (handle)
     CO->>SR: GET /slurm/{slurmrestd_api_ver}/job/98765
     SR-->>CO: state=RUNNING
-    CO->>CP: REST callback: job running
-    CP->>PG_APP: update work ticket (PROCESSING)
+    CO-->>CP: status=running
+    CP->>PG_APP: work_ticket_step (running); ticket PROCESSING
 
     Note over SL,FS: 6. SLURM execution
     SL->>FS: read /scratch/ephemeral/staging/ticket_001/
@@ -477,24 +477,25 @@ sequenceDiagram
     SL->>FS: write /data/parquet/<table>/output.parquet
     SL->>FS: stdout/stderr → /data/logs/ticket_001/step_n-98765.{out,err}
 
-    Note over CO,CP: 7. Completion detection & file registration
+    Note over CP,CO: 7. Completion detection & file registration (CP-driven)
+    CP->>CO: POST /step/status (handle)
     CO->>SR: GET /slurm/{slurmrestd_api_ver}/job/98765
     SR-->>CO: state=COMPLETED, exit_code=0
-    CO->>FS: verify /data/parquet/<table>/output.parquet exists
-    CO->>FS: collect log paths
-    CO->>CP: REST (as compute user): job 98765 succeeded,<br/>output=/data/parquet/<table>/output.parquet,<br/>logs=/data/logs/ticket_001/step_n-98765.{out,err}
-    CP->>PG_APP: validate work ticket state
+    CO-->>CP: status=completed
+    CP->>CO: POST /step/result (handle, status)
+    CO->>FS: verify output + manifest, collect log paths
+    CO-->>CP: outputs={manifest, ...}
+    CP->>PG_APP: work_ticket_step (completed)
     CP->>DP: register file into DuckLake
     DP->>DP: CALL ducklake_add_data_files(catalog, T, path)<br/>(metadata only — no I/O, schema validated)
     DP-->>CP: file registered
     CP->>PG_APP: update work ticket (COMPLETED),<br/>record provenance + log paths
 
-    Note over CO,CP: 7a. Failure handling (alternative)
-    CO->>SR: GET /slurm/{slurmrestd_api_ver}/job/98765
-    SR-->>CO: state=FAILED, exit_code=1
-    CO->>FS: collect log paths
-    CO->>CP: REST: job 98765 failed, exit_code=1,<br/>logs=/data/logs/ticket_001/step_n-98765.{out,err},<br/>failure_type=job_error
-    CP->>PG_APP: increment retry_count,<br/>requeue if retries < max_retries,<br/>else mark FAILED
+    Note over CP,CO: 7a. Failure handling (alternative)
+    CP->>CO: POST /step/result (handle, status=failed)
+    CO->>FS: collect launcher-failure line + log paths
+    CO-->>CP: BackendFailure(kind, reason, exit_code=1)
+    CP->>PG_APP: work_ticket_step (failed); increment retry_count,<br/>requeue if transient & retries < max_retries, else mark FAILED
 ```
 
 **Text flow:**
@@ -502,11 +503,11 @@ sequenceDiagram
 1. **Upload request:** Client sends REST request to control plane with JWT. Control plane validates access, creates a work ticket (PENDING), and returns a signed Flight ticket authorizing a DoPut upload.
 2. **Data upload:** Client streams raw data (e.g., FASTQ) to the data plane via Arrow Flight DoPut through nginx. Data plane verifies JWT and ticket signature, writes data to the shared filesystem at a structured staging path.
 3. **Upload complete callback:** Data plane calls back to control plane with the staging path. Control plane updates the work ticket to UPLOADED.
-4. **Compute submission:** Control plane requests the compute orchestrator submit a SLURM job via slurmrestd. The job specifies a container image (e.g., `qiita-workflow-amplicon:v1.2.0`), input/output paths on the shared filesystem, and stdout/stderr log paths. SLURM jobs have no knowledge of the control plane — they are truly dumb (read input, process, write output, exit). Compute orchestrator returns the SLURM job ID. Control plane updates the work ticket to QUEUED.
-5. **Job monitoring:** Compute orchestrator polls slurmrestd for job status. When the job transitions to RUNNING, it notifies the control plane. Control plane updates the work ticket to PROCESSING.
+4. **Compute submission:** Control plane calls `POST /step/submit`; the orchestrator `sbatch`es a SLURM job via slurmrestd. The job specifies a container image (e.g., `qiita-workflow-amplicon:v1.2.0`), input/output paths on the shared filesystem, and stdout/stderr log paths. SLURM jobs have no knowledge of the control plane — they are truly dumb (read input, process, write output, exit). The orchestrator returns a handle (SLURM job id + workspace paths) immediately; the CP persists it to `qiita.work_ticket_step` and updates the ticket to QUEUED. The orchestrator keeps no in-flight state.
+5. **Job monitoring:** The control plane polls `POST /step/status` (the orchestrator does a single slurmrestd read per call) at its own cadence. When the job transitions to RUNNING, the CP records it on `work_ticket_step` and updates the ticket to PROCESSING. A CO-unreachable error here is transient and retried in place, never failing the ticket.
 6. **SLURM execution:** The containerized workflow runs on the SLURM cluster, reading input from the staging path on the shared filesystem and writing Parquet results to the results path. Stdout/stderr are captured to log files on the shared filesystem.
-7. **Completion detection & file registration:** Compute orchestrator detects job completion via slurmrestd polling. It verifies the output file exists on the shared filesystem, collects log file paths, and calls the control plane. Control plane validates the work ticket state, then instructs the data plane to register the Parquet file into DuckLake via `ducklake_add_data_files` (metadata-only operation — no I/O, only schema validation). On success, the control plane updates the work ticket to COMPLETED and records provenance (who, what, when, which workflow version, SLURM job ID, log paths).
-7a. **Failure handling:** If the SLURM job fails, the compute orchestrator detects the failure, collects log paths, and reports to the control plane with the failure type and exit code. The control plane increments the retry count. If retries remain, it requeues the job (back to QUEUED). If max retries are exhausted, it marks the work ticket as FAILED with the failure reason, stage, and log paths for diagnosis.
+7. **Completion detection & file registration:** When `status` reports terminal, the control plane calls `POST /step/result`; the orchestrator verifies the output + manifest, collects log file paths, and returns the outputs. Control plane validates the work ticket state, then instructs the data plane to register the Parquet file into DuckLake via `ducklake_add_data_files` (metadata-only operation — no I/O, only schema validation). On success, the control plane updates the work ticket to COMPLETED and records provenance (who, what, when, which workflow version, SLURM job ID, log paths).
+7a. **Failure handling:** If the SLURM job ends terminal-but-failed, `result_step` raises a classified `BackendFailure` (kind, reason, log paths). The control plane records the failed attempt on `work_ticket_step` and increments the retry count. If the kind is transient and retries remain, it requeues (back to QUEUED) as a new attempt. If permanent or max retries are exhausted, it marks the work ticket as FAILED with the failure reason, stage, and log paths for diagnosis.
 
 ## Work Ticket Lifecycle
 
@@ -567,19 +568,27 @@ Manual restart (`POST /api/v1/work-ticket/{idx}/run` on a `FAILED` ticket):
 **Single-CP-process contract.** The control plane runs as a single
 `qiita-control-plane.service` instance. Dispatch tasks are bound to the
 asyncio loop of the process that submitted them; a CP restart loses
-those tasks. To recover, the lifespan startup hook unconditionally marks
-every PENDING / QUEUED / PROCESSING ticket FAILED via
-`recover_orphaned_tickets`, on the assumption that no other CP process
-is concurrently dispatching. Running multiple CP processes against the
-same database would have one process fail tickets the other is actively
-running. Adding a CP HA topology requires fencing the sweep (per-process
-owner column or advisory lock) before lifting that restriction.
+those tasks. To recover, the lifespan startup hook calls
+`reconcile_inflight_tickets`, which **re-attaches** rather than fails:
+for every non-terminal (PENDING / QUEUED / PROCESSING) ticket it schedules
+`run_workflow(resume=True)`, which fast-forwards entries a prior run already
+completed (rebuilding their `bound` outputs from the shared workspace),
+re-attaches a still-running SLURM job by its persisted `slurm_job_id` (or
+adopts an orphan by its deterministic name via `find-by-name`), finalizes a
+job that succeeded during the outage, and decides a purged job from its
+on-disk output manifest. This is the deliberate consequence of deploys
+stopping/starting CP+CO without draining — a restart with live in-flight
+work is routine, so it must never nuke running jobs (the pre-decoupling
+`recover_orphaned_tickets` blanket-failed them). The reconcile assumes no
+other CP process is concurrently dispatching; a CP HA topology requires
+fencing it (per-process owner column or advisory lock) before lifting that
+restriction.
 
 ## Compute Orchestrator
 
 Separate Python service responsible for the full compute job lifecycle. SLURM-backend operational setup — cluster prerequisites, identity model, the `qiita-job` JWT auto-refresh timer — lives in [`docs/runbooks/slurm-backend-setup.md`](runbooks/slurm-backend-setup.md).
 
-**Lifecycle ownership:** The compute orchestrator owns everything between "submit job" and "report result to control plane." SLURM jobs have no knowledge of the control plane — they are truly dumb (read input, process, write output, exit). As their final act before exiting, jobs must `chmod 440` all output files and write a manifest (see Container Contract below). The data plane enforces the permission check as a pre-registration gate.
+**Lifecycle ownership (decoupled).** The orchestrator is a stateless pass-through over three calls: `submit_step` `sbatch`es the job and returns a handle (SLURM job id + workspace paths); `status_step` is a single non-looping slurmrestd read; `result_step` verifies the output and returns it (or raises a classified `BackendFailure`). The **control plane** owns the poll loop between submit and result — it polls `status_step` at its own cadence (a ~10s constant) and persists per-step progress to `qiita.work_ticket_step`, so a long job never holds the CP→CO connection open and a CP restart can re-attach. A CO-unreachable error (transport / HTTP 5xx) during any of the three is transient and retried in place, never failing the ticket. SLURM jobs have no knowledge of the control plane — they are truly dumb (read input, process, write output, exit). As their final act before exiting, jobs must `chmod 440` all output files and write a manifest (see Container Contract below). The data plane enforces the permission check as a pre-registration gate.
 
 **Multi-step workflows:** Workflows consist of one or more sequential steps, each with independent resource requirements and a step type of `map` or `reduce`. Steps are submitted as separate SLURM jobs so each is sized for its actual resource needs.
 
@@ -590,10 +599,10 @@ Separate Python service responsible for the full compute job lifecycle. SLURM-ba
   - **`platform/sort-merge`**: generic platform-provided container — DuckDB reads all input Parquet files, sorts by the standard identifier columns, writes output. No workflow-specific code required for pure aggregation.
   - **workflow-specific**: custom container for cross-sample computation (normalisation, diversity metrics, etc.). Must still output sorted by the standard identifier columns as part of the container contract.
 
-The orchestrator drives execution:
+Execution (the CP runner drives the per-step loop — `submit_step` → poll `status_step` → `result_step`; the orchestrator's `submit_step` lays out `params.json` and `sbatch`es, and map/reduce fan-out is a planned extension of the single-job-per-step backend):
 
-1. For each `map` step: write per-sample `params.json`, fan out N SLURM jobs (one per `prep_sample_idx`), poll all, retry failed samples independently, accumulate `failed_samples`
-2. For each `reduce` step: write `params.json` containing the expected `processed_prep_sample_idx` set for surviving samples, submit one SLURM job with all map output directories as input, poll to completion
+1. For each `map` step: write per-sample `params.json`, fan out N SLURM jobs (one per `prep_sample_idx`), the CP polls each to terminal, retry failed samples independently, accumulate `failed_samples`
+2. For each `reduce` step: write `params.json` containing the expected `processed_prep_sample_idx` set for surviving samples, submit one SLURM job with all map output directories as input, the CP polls to completion
 3. Verify three-gate output for every job (map and reduce)
 4. Advance `current_step` on the work ticket and continue
 5. After the final step, call back to the control plane to trigger data plane registration
@@ -672,9 +681,9 @@ A gate failure after exit code 0 is a permanent failure — the container return
 
 Every native job module exports exactly two symbols: a `class Inputs(BaseModel)` declaring its typed input contract, and `async def execute(inputs, workspace) -> dict[str, Path]` doing the work. A single framework dispatcher (`run_native_job` in `jobs/__init__.py`) imports the module, validates `raw_inputs` against `mod.Inputs`, invokes `execute`, and maps known exceptions (`NotImplementedError`, `FileNotFoundError`, `ValueError`, `ValidationError`) to typed `BackendFailure` values. Both `LocalBackend` and the shared SLURM launcher (`jobs/__main__.py`) route through `run_native_job`, so a job sees identical inputs and identical failure classification regardless of runtime.
 
-The wire validator on `StepRunRequest` is shape-only — it enforces exactly-one(`container`, `module`) but does not check the prefix. The native-job module prefix (`qiita_compute_orchestrator.jobs.`) itself is enforced at four other sites: sync (control plane refuses to persist a YAML whose `module:` is outside the prefix), submit (the `/step/run` route handler checks before invoking the backend), boot (the orchestrator's lifespan scan walks `jobs/` and refuses to start if any submodule fails the `Inputs`/`execute` contract), and dispatcher (`run_native_job` re-validates so direct in-process callers can't bypass the check). The `slurm/contract.py` module holds the two constants the producer (container entrypoint or native launcher) and the verifier (`slurm/verify.py`) both depend on — `EXPECTED_FILE_MODE = 0o440` and `MANIFEST_FILENAME = "manifest.json"`.
+The wire validator on `StepSubmitRequest` is shape-only — it enforces exactly-one(`container`, `module`) but does not check the prefix. The native-job module prefix (`qiita_compute_orchestrator.jobs.`) itself is enforced at four other sites: sync (control plane refuses to persist a YAML whose `module:` is outside the prefix), submit (the `/step/submit` route handler checks before invoking the backend), boot (the orchestrator's lifespan scan walks `jobs/` and refuses to start if any submodule fails the `Inputs`/`execute` contract), and dispatcher (`run_native_job` re-validates so direct in-process callers can't bypass the check). The `slurm/contract.py` module holds the two constants the producer (container entrypoint or native launcher) and the verifier (`slurm/verify.py`) both depend on — `EXPECTED_FILE_MODE = 0o440` and `MANIFEST_FILENAME = "manifest.json"`.
 
-**Backend code-sharing:** Both `LocalBackend` (DuckDB+miint in-process) and `SlurmBackend` (submits jobs via slurmrestd) are wired. SlurmBackend owns submit / poll / verify / classify; for container steps, the work each step performs lives in LocalBackend's per-step helpers (`_run_hash`, `_run_load`, the module-level `_write_*` builders) — the source of truth for that family of steps until those helpers fold into the `jobs/` package. For native steps, both backends route through `run_native_job` and the work lives in the job module itself, so the dev/test path and the production SLURM path share the same code regardless of runtime.
+**Backend code-sharing:** Both `LocalBackend` (DuckDB+miint in-process) and `SlurmBackend` (submits jobs via slurmrestd) are wired. Each implements the same `submit_step` / `status_step` / `result_step` / `find_jobs_by_name` interface: SlurmBackend submits + classifies + verifies (the CP owns the poll loop between submit and result); LocalBackend is synchronous — `submit_step` runs the module in-process and returns a terminal handle carrying the outputs, with no fake job id. For container steps, the work each step performs lives in LocalBackend's per-step helpers (`_run_hash`, `_run_load`, the module-level `_write_*` builders) — the source of truth for that family of steps until those helpers fold into the `jobs/` package. For native steps, both backends route through `run_native_job` and the work lives in the job module itself, so the dev/test path and the production SLURM path share the same code regardless of runtime.
 
 **Future:** Clean `ComputeBackend` interface allows adding alternative backends (cloud, Kubernetes) without changing the control plane.
 
@@ -784,7 +793,7 @@ qiita/
 │           ├── config.py                   # env-var loading helpers
 │           ├── log.py                      # structured-logging setup
 │           ├── client.py                   # base async REST client for service-to-service
-│           ├── compute_backend_client.py   # CP → orchestrator /step/run client
+│           ├── compute_backend_client.py   # CP → orchestrator /step/* client (submit/status/result/find-by-name)
 │           ├── backend_failure.py          # typed BackendFailure model + JSON round-trip
 │           ├── actions.py                  # action YAML schema + loader
 │           └── parquet.py                  # parquet column/sort helpers
@@ -800,8 +809,9 @@ qiita/
 │   │       ├── config.py           # settings (DB URL, HMAC secret, AuthRocket JWKS URL)
 │   │       ├── db.py               # asyncpg connection pool setup
 │   │       ├── deps.py             # FastAPI dependency-injection helpers (sessions, scopes)
-│   │       ├── dispatch.py         # compute-orchestrator dispatch (async fire-and-forget)
-│   │       ├── runner.py           # per-ticket workflow runner (walks action steps)
+│   │       ├── dispatch.py         # dispatch + reconcile_inflight_tickets (restart re-attach)
+│   │       ├── runner.py           # per-ticket workflow runner (walks action steps; drives submit→poll→result)
+│   │       ├── step_progress.py    # qiita.work_ticket_step writers/readers (restart-recovery spine)
 │   │       ├── auth/               # JWT verification, HMAC ticket signing, AuthRocket integration
 │   │       ├── actions/            # action library + sync from workflows/
 │   │       ├── cli/                # qiita-admin CLI surface
@@ -838,8 +848,8 @@ qiita/
 │   │       ├── __init__.py
 │   │       ├── main.py             # service entry point + /health; lifespan runs jobs/ boot scan
 │   │       ├── config.py           # settings (compute backend, shared FS root, CP↔CO token, SLURM creds)
-│   │       ├── backend.py          # ComputeBackend abstract base (run_step + aclose contracts)
-│   │       ├── step.py             # /api/v1/step/run route handler + submit-time prefix check
+│   │       ├── backend.py          # ComputeBackend abstract base (submit/status/result/find-by-name + aclose)
+│   │       ├── step.py             # /api/v1/step/{submit,status,result,find-by-name} routes + submit-time prefix check
 │   │       ├── backends/
 │   │       │   ├── local.py        # LocalBackend (DuckDB + miint in-process; dev / test)
 │   │       │   └── slurm.py        # SlurmBackend (slurmrestd dispatch + polling)
@@ -864,7 +874,7 @@ qiita/
 │       ├── _runner_helpers.py      # workflow-runner test helpers
 │       ├── test_smoke.py
 │       ├── test_doget.py           # CP-signed ticket → DP DoGet round-trip
-│       ├── test_step_dispatch.py   # CP → orchestrator /step/run flow
+│       ├── test_step_dispatch.py   # CP → orchestrator /step/submit flow
 │       ├── test_action_library.py
 │       ├── test_action_sync.py
 │       ├── test_reference_add_smoke.py

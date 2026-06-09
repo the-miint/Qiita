@@ -11,7 +11,7 @@ Substitute your host's FQDN for the `qiita-miint.ucsd.edu` examples and `<scratc
 
 ## Pending deploy
 
-Everything merged but not yet deployed, folded in by each PR as it merges. Nothing is pending right now — the most recent deploy was archived below. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
+Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
 
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
@@ -80,6 +80,64 @@ _None yet._
 ## Deployed history
 
 Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-08 — 2666587
+
+Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._ — (#77) the compute decoupling adds no new env var; the CP poll cadence is a code constant.
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
+```bash
+# [operator] DATABASE_URL must be in your shell, pointing at the SAME DB as
+# control-plane.env. activate.sh re-checks public.schema_migrations at deploy
+# time and ABORTS before any restart if one is unapplied.
+make -C ~/qiita-miint migrate
+```
+`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#77) adds `20260603000000_work_ticket_step` (plain `CREATE TABLE qiita.work_ticket_step` + trigger; no extension or backfill).
+
+#### 4. Deploy
+
+```bash
+# [admin] SKIP_PULL=1 because redeploy.md step 2 already pulled the clone.
+# local-deploy.sh rsyncs all four components, so CP and CO ship together in one
+# run — REQUIRED for (#77): the CP↔CO step contract changed (POST /step/run is
+# gone, replaced by /step/submit|status|result + /step/find-by-name), so a CP
+# and CO on opposite sides of this change can't talk. A single local-deploy.sh
+# satisfies this; do not deploy one service alone.
+# local-deploy.sh → activate.sh also runs `qiita-admin actions sync`, which picks
+# up the two new workflows/ entries. (#78)
+sudo SKIP_PULL=1 QIITA_HOSTNAME=qiita-miint.ucsd.edu /home/qiita/qiita-miint/deploy/local-deploy.sh
+```
+
+#### 5. Verify
+
+```bash
+# (#77) [admin] work_ticket_step table exists after `make migrate`, and the
+# decoupled step routes answer (find-by-name is CP→CO-token-gated, so an
+# unauthenticated probe should get 401, not 404 — proves the route is mounted).
+sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
+    psql "$DATABASE_URL" -c "SELECT to_regclass('"'"'qiita.work_ticket_step'"'"') IS NOT NULL AS ok;"'   # ok = t (#77)
+curl -fsS -o /dev/null -w '%{http_code}\n' https://qiita-miint.ucsd.edu/api/v1/work-ticket   # 401 (auth required), not 404 (#77)
+# [admin] local-reference-add + local-host-reference-add 1.0.0 synced into
+# qiita.action by `qiita-admin actions sync` inside activate.sh.
+# (#78)
+sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
+    psql "$DATABASE_URL" -c "SELECT action_id, version, enabled FROM qiita.action ORDER BY action_id;"'   # local-reference-add + local-host-reference-add 1.0.0 enabled (#78)
+```
+
+#### Notes (no host action)
+
+- (#77) Compute-step execution is decoupled and the CP now drives the poll loop. **CP and CO must deploy together** (bucket 4 does this) — the synchronous `POST /step/run` is removed in favour of the stateless `submit` / `status` / `result` trio plus `POST /step/find-by-name` (all CP↔CO-token-gated, internal). No external client action. Restart recovery now re-attaches in-flight tickets instead of failing them, so a CP/CO restart mid-deploy no longer nukes running work. Additive public surface: `GET /work-ticket` (list with compute status) and the `qiita ticket list` CLI.
+- (#78) Local-host FASTA ingest (additive, no client breakage). Two new `workflows/` entries — `local-reference-add` and `local-host-reference-add` (both 1.0.0) — synced into `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (verify in bucket 5), **not** migrations. They back a new CLI gesture `qiita reference load --local --fasta-manifest <abs path>` that ingests many host-resident FASTA files **by path** (no DoPut upload). The manifest and every FASTA + companion it lists must be **absolute** and visible on the shared FS from the compute node (the workflow `context_schema` enforces `pattern:"^/"`; bind mounts expose host paths, they do not copy). No new env var, host dir, or migration.
+- (#78) The `qiita reference load` CLI now parses FASTA with miint's `read_fastx`, so it installs + loads the **miint DuckDB extension client-side** on first use (one-time network egress; cached after under `~/.duckdb` or `MIINT_EXTENSION_DIRECTORY`). It pulls from DuckDB community-extensions by default; set `MIINT_EXTENSION_REPO=https://ftp.microbio.me/pub/miint` (implies allow-unsigned) to use the team mirror. No action on the deployed services — this only affects the host a user runs the CLI from.
 
 ### Deployed 2026-06-02 — 9ee069d
 

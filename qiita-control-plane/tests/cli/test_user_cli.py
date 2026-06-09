@@ -25,6 +25,7 @@ from qiita_common.api_paths import (
     URL_STUDY_PREFIX,
     URL_USER_ME,
     URL_WORK_TICKET_BY_IDX,
+    URL_WORK_TICKET_LIST,
     URL_WORK_TICKET_PREFIX,
 )
 from qiita_common.auth_constants import BEARER_PREFIX
@@ -132,7 +133,7 @@ def test_profile_set_sends_only_supplied_fields(monkeypatch):
 
     captured: dict = {}
 
-    def fake_request(method, url, headers=None, json=None, timeout=None):
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
         captured["method"] = method
         captured["url"] = url
         captured["auth"] = headers["Authorization"]
@@ -172,7 +173,7 @@ def test_profile_set_boolean_optional_action_distinguishes_unset_false_true(monk
 
     captured_bodies: list[dict] = []
 
-    def fake_request(method, url, headers=None, json=None, timeout=None):
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
         captured_bodies.append(json)
         return _httpx.Response(200, json={"principal_idx": 7}, request=_httpx.Request(method, url))
 
@@ -218,7 +219,7 @@ def test_study_create_minimal_sends_only_title(monkeypatch):
 
     captured: dict = {}
 
-    def fake_request(method, url, headers=None, json=None, timeout=None):
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
         captured["method"] = method
         captured["url"] = url
         captured["auth"] = headers["Authorization"]
@@ -248,7 +249,7 @@ def test_study_create_passes_through_optional_fields(monkeypatch):
 
     captured: dict = {}
 
-    def fake_request(method, url, headers=None, json=None, timeout=None):
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
         captured["json"] = json
         return _httpx.Response(201, json={"study_idx": 42}, request=_httpx.Request(method, url))
 
@@ -435,12 +436,13 @@ def _stub_post(
 
     captured.setdefault("requests", [])
 
-    def fake_request(method, url, headers=None, json=None, timeout=None):
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
         record = {
             "method": method,
             "url": url,
             "auth": headers["Authorization"],
             "json": json,
+            "params": params,
         }
         captured["requests"].append(record)
         # Flat-shape mirror — last-wins so single-POST tests read the POST,
@@ -1498,6 +1500,95 @@ def test_ticket_status_requires_idx(capsys):
 
 
 # ---------------------------------------------------------------------------
+# ticket list
+# ---------------------------------------------------------------------------
+
+
+_TICKET_LIST_RESPONSE = [
+    {
+        "work_ticket_idx": 12,
+        "action_id": "fastq-to-parquet",
+        "action_version": "1.0.0",
+        "originator_principal_idx": 7,
+        "scope_target": {"kind": "prep_sample", "prep_sample_idx": 55},
+        "action_context": {},
+        "state": "processing",
+        "retry_count": 0,
+        "max_retries": 3,
+        "failure_type": None,
+        "failure_stage": None,
+        "failure_step_name": None,
+        "failure_reason": None,
+        "created_at": "2026-05-20T00:00:00+00:00",
+        "updated_at": "2026-05-20T00:00:01+00:00",
+        "current_step_index": 0,
+        "current_step_name": "convert",
+        "compute_target": "slurm",
+        "slurm_job_id": 4242,
+        "step_state": "running",
+    }
+]
+
+
+def test_ticket_list_issues_get_with_no_filter_params(monkeypatch):
+    """Bare `ticket list` GETs the work-ticket root with no query params
+    (server defaults: own tickets, all states, default limit)."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_TICKET_LIST_RESPONSE, status=200)
+
+    rc = main(["--base-url", "https://q.example.test", "ticket", "list"])
+    assert rc == 0
+    assert captured["method"] == "GET"
+    assert captured["url"] == f"https://q.example.test{URL_WORK_TICKET_LIST}"
+    assert captured["json"] is None
+    assert captured["params"] == {}
+
+
+def test_ticket_list_passes_filter_params(monkeypatch):
+    """--state / --active / --all / --limit map onto the query params; --all
+    is sent as `all=true` (the route's alias)."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_TICKET_LIST_RESPONSE, status=200)
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "ticket",
+            "list",
+            "--state",
+            "processing",
+            "--active",
+            "--all",
+            "--limit",
+            "10",
+        ]
+    )
+    assert rc == 0
+    assert captured["params"] == {
+        "state": "processing",
+        "active": "true",
+        "all": "true",
+        "limit": "10",
+    }
+
+
+def test_ticket_list_rejects_unknown_state(capsys):
+    """--state is constrained to the WorkTicketState values (argparse
+    choices), so a bogus value exits 2 before any HTTP call."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["ticket", "list", "--state", "bogus"])
+    assert exc_info.value.code == 2
+    assert "bogus" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
 # HTTP-error handling (run_http_subcommand)
 # ---------------------------------------------------------------------------
 
@@ -1616,7 +1707,7 @@ def _stub_multi_response(monkeypatch, captured: dict, *, responses):
     captured.setdefault("requests", [])
     queue = list(responses)
 
-    def fake_request(method, url, headers=None, json=None, timeout=None):
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
         captured["requests"].append(
             {
                 "method": method,
