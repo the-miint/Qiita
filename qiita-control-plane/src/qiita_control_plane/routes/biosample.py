@@ -121,7 +121,7 @@ _FK_VIOLATION_MESSAGES: dict[str, str] = {
 # the DB CHECK is the last line of defense and a violation here surfaces
 # the same field-specific message a bypassed validator would have.
 _CHECK_VIOLATION_MESSAGES: dict[str, str] = {
-    "biosample_matrix_tube_id_format": ("matrix_tube_id must be a non-empty string of digits"),
+    "biosample_matrix_tube_id_format": ("matrix_tube_id must be exactly 10 digits"),
 }
 _GENERIC_UNIQUE_VIOLATION = "conflicts with an existing biosample"
 _GENERIC_CHECK_VIOLATION = "violates a database constraint on biosample"

@@ -194,7 +194,9 @@ async def insert_owner_study_access_admin(
 # frozenset so unknown column names are rejected at the repo boundary
 # rather than reaching the SQL builder. owner_idx is intentionally
 # excluded (ownership transfer is a separate surface); default_tier is
-# intentionally excluded (its policy-shape needs its own design).
+# intentionally excluded (its policy-shape needs its own design); the
+# submission-tracking columns are intentionally excluded (subsystem-owned,
+# and this route is owner-accessible).
 STUDY_PATCHABLE_COLUMNS: frozenset[str] = frozenset(
     {
         "title",
@@ -206,8 +208,6 @@ STUDY_PATCHABLE_COLUMNS: frozenset[str] = frozenset(
         "notes",
         "extra_metadata",
         "principal_investigator_idx",
-        "last_submission_at",
-        "submission_error",
     }
 )
 

@@ -918,10 +918,13 @@ class StudyPatchRequest(PatchRequestModel):
     StudyCreate so a PATCH cannot smuggle in a value that POST would
     reject. owner_idx is intentionally not patchable (ownership transfer
     is a separate surface) and default_tier is intentionally not
-    patchable (its policy-shape needs its own design). Inherits
-    extra="forbid", the at_least_one_field rule, and the
-    NOT_NULL_FIELDS explicit-null guard from PatchRequestModel; lists
-    title as the not-null field.
+    patchable (its policy-shape needs its own design). The
+    submission-tracking columns (last_submission_at, submission_error)
+    are likewise omitted: this route is owner-accessible, and those
+    columns are written by the submission subsystem, not by humans
+    editing a study. Inherits extra="forbid", the at_least_one_field
+    rule, and the NOT_NULL_FIELDS explicit-null guard from
+    PatchRequestModel.
     """
 
     NOT_NULL_FIELDS: ClassVar[frozenset[str]] = frozenset({"title"})
@@ -936,8 +939,6 @@ class StudyPatchRequest(PatchRequestModel):
         default=None, min_length=1, max_length=_STUDY_ACCESSION_MAX
     )
     notes: str | None = None
-    last_submission_at: AwareDatetime | None = None
-    submission_error: str | None = None
     extra_metadata: dict[str, object] | None = None
 
 

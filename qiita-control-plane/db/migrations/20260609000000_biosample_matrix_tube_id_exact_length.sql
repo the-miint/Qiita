@@ -12,7 +12,7 @@ BEGIN
         count(*),
         string_agg(
             format('biosample_idx=%s matrix_tube_id=%s',
-                   biosample_idx, matrix_tube_id),
+                   idx, matrix_tube_id),
             ', ')
     INTO bad_count, bad_rows
     FROM qiita.biosample

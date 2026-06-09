@@ -36,10 +36,12 @@ the `no-changelog` label).
   `rebind_biosample_global_field_data_type` migration helper that guards a
   field's data_type flip against existing metadata rows (#TBD)
 - Study submission tracking: `qiita.study` gains `last_submission_at` /
-  `submission_error` (exposed for read and PATCH), bringing study to parity
-  with biosample and sequenced_sample. The three tables now share one
-  `clear_submission_error_on_new_attempt` trigger function. Not exposed
-  through the CLI. (#TBD)
+  `submission_error`, exposed for read in `StudyResponse`. The three tables
+  now share one `clear_submission_error_on_new_attempt` trigger function.
+  These columns are subsystem-owned and are not on the (owner-accessible)
+  study PATCH surface; on biosample and sequenced_sample, whose PATCH routes
+  are wet_lab_admin-gated, they remain PATCHable. Not exposed through the
+  CLI. (#TBD)
 - `qiita study patch`, `qiita biosample patch`, and `qiita sequenced-sample
   patch` — update a study's or sample's editable fields (including ENA
   accession write-back) over the REST API, under If-Match optimistic

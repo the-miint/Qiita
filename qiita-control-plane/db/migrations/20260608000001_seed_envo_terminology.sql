@@ -37,7 +37,10 @@ SELECT qiita.rebind_biosample_global_field_data_type(
 -- migrate:down
 
 -- Unbind first; the terminology FK is ON DELETE RESTRICT, so the terminology
--- row cannot be deleted while these fields reference it.
+-- row cannot be deleted while these fields reference it. This rebind RAISES
+-- (aborting the rollback) if any biosample_metadata rows already reference
+-- these fields, so a down-migration is only possible before any environmental-
+-- context metadata has been ingested.
 SELECT qiita.rebind_biosample_global_field_data_type(
     ARRAY['broad_scale_environmental_context',
           'local_environmental_context',
