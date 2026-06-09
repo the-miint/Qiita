@@ -144,6 +144,18 @@ the `no-changelog` label).
 
 ### Fixed
 
+- Redriving a FAILED reference workflow via `POST /work-ticket/{idx}/run` now
+  actually works. Two redrive defects fixed in the same atomic reset: (F8) the
+  `reference` scope_target was left pinned at `failed`, so the redriven
+  workflow's first status PATCH (`failed → hashing`) was illegal and the redrive
+  died immediately — `/run` now resets the reference `failed → pending` (the
+  FSM's only legal exit from `failed`); (F9) the prior run's terminal `failed`
+  `work_ticket_step` rows survived, so the runner's fresh attempt-0 collided with
+  the dead row (the step-progress writers reject any transition out of `failed`)
+  — `/run` now drops every non-`completed` step row (keeping `completed` ones so
+  fast-forward still works). A reference that failed at a later step still fails
+  cleanly on redrive (the FSM can't rewind past `pending`); that multi-step case
+  is not yet supported (#TBD)
 - A rejected SLURM submit no longer looks like a success: slurmrestd answers
   HTTP 200 even when slurmctld refuses the job (unavailable partition, QOS
   limit, …), and `SlurmrestdClient.submit_job` trusted the echoed `job_id`

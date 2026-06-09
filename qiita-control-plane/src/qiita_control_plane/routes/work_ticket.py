@@ -58,7 +58,9 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import SystemRole
 from qiita_common.models import (
+    ReferenceStatus,
     ScopeTargetKind,
+    StepProgressState,
     WorkTicket,
     WorkTicketCreateRequest,
     WorkTicketResponse,
@@ -67,6 +69,11 @@ from qiita_common.models import (
 )
 
 from ..actions.context_validator import validate_context
+from ..actions.reference import (
+    IllegalStatusTransition,
+    ReferenceNotFound,
+    transition_reference_status,
+)
 from ..auth.guards import require_caller_has_admin_on_all_studies
 from ..auth.principal import Anonymous, HumanUser, Principal, ServiceAccount, get_current_principal
 from ..deps import get_db_pool
@@ -828,6 +835,59 @@ async def list_work_tickets(
     return [_row_to_work_ticket_summary(row) for row in rows]
 
 
+async def _reset_reference_scope_for_redrive(
+    conn: asyncpg.Connection, work_ticket: asyncpg.Record
+) -> None:
+    """On a FAILED→PENDING redrive, reset a `reference` scope_target back to
+    `pending` (F8).
+
+    A failed reference workflow leaves its reference at `failed` (the
+    failure_status PATCH put it there), and the reference FSM's only legal
+    exit from `failed` is `→ pending`. Without this reset the redriven
+    workflow's first status PATCH (`pending → hashing`, attempted as
+    `failed → hashing`) is illegal and the redrive dies immediately.
+
+    Only references at `failed` are touched: `transition_reference_status`
+    is the single source of truth for the matrix, and `→ pending` is legal
+    *only* from `failed`. A reference in any other state raises
+    IllegalStatusTransition, which we swallow rather than abort the
+    operator's redrive — but the two non-`failed` cases differ sharply:
+      * already `pending` (e.g. the workflow died before any status PATCH):
+        benign — the redrive's first PATCH (`pending → hashing`) is legal
+        and the run proceeds normally.
+      * an in-progress state (`hashing`/`minting`/`loading`/`indexing`) or
+        `active`: the FSM can't rewind it, so the redrive will fail cleanly
+        later in the runner. We log it at WARNING with the actual state so
+        that not-yet-supported multi-step case is visible, not silent.
+    Non-reference scopes carry no status and are skipped.
+    """
+    if work_ticket["scope_target_kind"] != ScopeTargetKind.REFERENCE.value:
+        return
+    reference_idx = work_ticket["reference_idx"]
+    if reference_idx is None:
+        return
+    try:
+        await transition_reference_status(conn, reference_idx, ReferenceStatus.PENDING)
+    except IllegalStatusTransition as exc:
+        _log.warning(
+            "redrive of work_ticket on reference %d: reference is %r, not 'failed' —"
+            " not resetting; redrive proceeds and re-walks from there"
+            " (a non-'pending' state means the FSM can't rewind and the redrive"
+            " will fail cleanly downstream)",
+            reference_idx,
+            exc.current,
+        )
+    except ReferenceNotFound:
+        # A work_ticket carries a reference_idx its FK (ON DELETE RESTRICT)
+        # guarantees exists — hitting this means the row is gone out from
+        # under a live ticket, i.e. DB corruption, not a recoverable edge.
+        _log.error(
+            "redrive references missing reference %d; skipping scope-target reset"
+            " (referential integrity violation — investigate)",
+            reference_idx,
+        )
+
+
 @router.post(
     PATH_WORK_TICKET_RUN,
     response_model=WorkTicketResponse,
@@ -844,7 +904,8 @@ async def run_work_ticket(
     one whose original create-time dispatch was lost. State-aware (see
     table at module top)."""
     row = await pool.fetchrow(
-        "SELECT action_id, action_version, state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        "SELECT action_id, action_version, state, scope_target_kind, reference_idx"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
         work_ticket_idx,
     )
     if row is None:
@@ -889,28 +950,50 @@ async def run_work_ticket(
         # retry_count to 0 (operator override of the auto-retry budget)
         # and clears the failure_* columns so the
         # work_ticket_failure_consistent DB CHECK is honoured (failure_*
-        # all NULL when state != failed). Atomic; refuses if state
-        # changed under us between the SELECT and now.
-        updated = await pool.fetchval(
-            "UPDATE qiita.work_ticket"
-            " SET state = $1::qiita.work_ticket_state,"
-            "     retry_count = 0,"
-            "     failure_type = NULL,"
-            "     failure_stage = NULL,"
-            "     failure_step_name = NULL,"
-            "     failure_reason = NULL"
-            " WHERE work_ticket_idx = $2"
-            "   AND state = $3::qiita.work_ticket_state"
-            " RETURNING work_ticket_idx",
-            WorkTicketState.PENDING.value,
-            work_ticket_idx,
-            WorkTicketState.FAILED.value,
-        )
-        if updated is None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="work_ticket state changed under /run; retry",
+        # all NULL when state != failed). The ticket reset, the dead
+        # step-row drop, and the scope-target reset are ONE transaction so
+        # a redrive never half-applies. Atomic; refuses if state changed
+        # under us between the SELECT and now.
+        async with pool.acquire() as conn, conn.transaction():
+            updated = await conn.fetchval(
+                "UPDATE qiita.work_ticket"
+                " SET state = $1::qiita.work_ticket_state,"
+                "     retry_count = 0,"
+                "     failure_type = NULL,"
+                "     failure_stage = NULL,"
+                "     failure_step_name = NULL,"
+                "     failure_reason = NULL"
+                " WHERE work_ticket_idx = $2"
+                "   AND state = $3::qiita.work_ticket_state"
+                " RETURNING work_ticket_idx",
+                WorkTicketState.PENDING.value,
+                work_ticket_idx,
+                WorkTicketState.FAILED.value,
             )
+            if updated is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="work_ticket state changed under /run; retry",
+                )
+
+            # F9: drop every non-`completed` work_ticket_step row. The runner
+            # re-enters each not-yet-completed entry at attempt 0, but a prior
+            # FAILED run left terminal `failed` rows behind; re-using that
+            # attempt would collide (the step_progress writers reject any
+            # transition out of `failed`, and record_failed refuses
+            # failed→failed), wedging the redrive on the dead row. Dropping
+            # them clears attempt-0 for a fresh run; `completed` rows are KEPT
+            # so the runner still fast-forwards already-finished entries.
+            # Safe because a FAILED ticket has no in-flight job — every step
+            # row is terminal, so this never races the resume-adoption path.
+            await conn.execute(
+                "DELETE FROM qiita.work_ticket_step WHERE work_ticket_idx = $1 AND state <> $2",
+                work_ticket_idx,
+                StepProgressState.COMPLETED.value,
+            )
+
+            await _reset_reference_scope_for_redrive(conn, row)
+
         _log.info(
             "manual restart of work_ticket %d (FAILED → PENDING; retry_count reset)",
             work_ticket_idx,

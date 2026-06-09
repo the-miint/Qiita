@@ -21,7 +21,12 @@ from qiita_common.api_paths import (
     URL_WORK_TICKET_RUN,
 )
 from qiita_common.auth_constants import Scope, SystemRole
-from qiita_common.models import ComputeTarget, StepProgressState, WorkTicketState
+from qiita_common.models import (
+    ComputeTarget,
+    ReferenceStatus,
+    StepProgressState,
+    WorkTicketState,
+)
 
 pytestmark = pytest.mark.db
 
@@ -1590,6 +1595,166 @@ async def test_run_on_failed_resets_to_pending(
     assert row["failure_stage"] is None
     assert row["failure_step_name"] is None
     assert row["failure_reason"] is None
+
+
+async def test_run_on_failed_resets_reference_scope_target_to_pending(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """A FAILED reference workflow leaves its reference pinned at the
+    'failed' status (the failure_status PATCH put it there). The reference
+    FSM's ONLY legal exit from 'failed' is '-> pending', so a redrive must
+    reset the scope_target reference too — otherwise the redriven
+    workflow's first status PATCH ('failed -> hashing') is illegal and the
+    redrive dies on the spot (F8). /run sends the reference back to
+    'pending' so the workflow can re-walk pending -> hashing -> ...."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    # The reference the workflow failed against — pin it where a real
+    # failure leaves it.
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = $1 WHERE reference_idx = $2",
+        ReferenceStatus.FAILED.value,
+        reference_idx,
+    )
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, state, retry_count,"
+        "  failure_type, failure_stage, failure_reason)"
+        " VALUES ($1, $2, $3, 'reference', $4,"
+        "  $5::qiita.work_ticket_state, 1,"
+        "  'permanent'::qiita.failure_type,"
+        "  'submission'::qiita.work_ticket_failure_stage, 'test seed')"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+        WorkTicketState.FAILED.value,
+    )
+    wt_client._created_tickets.append(idx)
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+
+    ref_status = await postgres_pool.fetchval(
+        "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
+    )
+    assert ref_status == ReferenceStatus.PENDING.value
+
+
+async def test_run_on_failed_drops_dead_step_rows_keeps_completed(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """A redrive re-enters every not-yet-completed entry at attempt 0, but a
+    prior FAILED run leaves terminal 'failed' work_ticket_step rows behind.
+    Re-using that attempt would collide — the step_progress writers reject
+    any transition out of 'failed' (and record_failed refuses
+    failed->failed), so the redrive would die re-adjudicating the dead row
+    (F9). /run drops every non-'completed' step row so the redrive's
+    attempt-0 writes land on a clean slate, while KEEPING 'completed' rows
+    so the runner still fast-forwards already-finished steps."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, state,"
+        "  failure_type, failure_stage, failure_reason)"
+        " VALUES ($1, $2, $3, 'reference', $4,"
+        "  $5::qiita.work_ticket_state, 'permanent'::qiita.failure_type,"
+        "  'submission'::qiita.work_ticket_failure_stage, 'test seed')"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+        WorkTicketState.FAILED.value,
+    )
+    wt_client._created_tickets.append(idx)
+    # An earlier step that finished (fast-forward depends on this row
+    # surviving) and a later step's dead 'failed' attempt (must clear).
+    await postgres_pool.execute(
+        "INSERT INTO qiita.work_ticket_step"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target, state)"
+        " VALUES ($1, 0, 0, 'hash', $2, $3)",
+        idx,
+        ComputeTarget.LOCAL.value,
+        StepProgressState.COMPLETED.value,
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.work_ticket_step"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        "  state, slurm_job_id, job_name, failure_kind, failure_reason)"
+        " VALUES ($1, 1, 0, 'load', $2, $3, 987654, 'qiita-wt-load-a0',"
+        "  'contract_violation', 'boom')",
+        idx,
+        ComputeTarget.SLURM.value,
+        StepProgressState.FAILED.value,
+    )
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+
+    rows = await postgres_pool.fetch(
+        "SELECT step_index, attempt, state FROM qiita.work_ticket_step"
+        " WHERE work_ticket_idx = $1 ORDER BY step_index, attempt",
+        idx,
+    )
+    surviving = [(r["step_index"], r["attempt"], r["state"]) for r in rows]
+    assert surviving == [(0, 0, StepProgressState.COMPLETED.value)]
+
+
+async def test_run_on_failed_with_non_failed_reference_does_not_abort_redrive(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """If the reference is NOT at 'failed' on a redrive (e.g. the workflow
+    died before any status PATCH, so the reference is still 'pending'), the
+    scope-target reset is a no-op — `failed -> pending` is illegal from
+    'pending', and that IllegalStatusTransition must be swallowed, not abort
+    the redrive. The redrive still succeeds (202), the ticket resets, and
+    the reference is left where it was ('pending' redrives fine on its own)."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    # reference_idx is seeded 'pending'; leave it there (the not-'failed' case).
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, state,"
+        "  failure_type, failure_stage, failure_reason)"
+        " VALUES ($1, $2, $3, 'reference', $4,"
+        "  $5::qiita.work_ticket_state, 'permanent'::qiita.failure_type,"
+        "  'submission'::qiita.work_ticket_failure_stage, 'test seed')"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        reference_idx,
+        WorkTicketState.FAILED.value,
+    )
+    wt_client._created_tickets.append(idx)
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_RUN.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    # The redrive is NOT aborted by the un-resettable reference.
+    assert resp.status_code == 202, resp.text
+
+    ticket_state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
+    )
+    assert ticket_state == WorkTicketState.PENDING.value
+    ref_status = await postgres_pool.fetchval(
+        "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
+    )
+    assert ref_status == ReferenceStatus.PENDING.value
 
 
 async def test_run_on_pending_dispatches_without_state_change(

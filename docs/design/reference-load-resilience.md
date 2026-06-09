@@ -119,6 +119,17 @@ direction, so the fixes are deliberate rather than reactive.
 - **Invariant touched:** the documented "`/run` is the only retry mechanism."
 - **Direction:** on FAILED→PENDING, `/run` also resets the `scope_target` resource to its initial status via
   the existing `transition_reference_status`.
+- **Resolved (Phase 3):** `/run` resets a `reference` scope_target `failed → pending` in the same atomic
+  transaction as the ticket reset (`failed → pending` is the FSM's *only* legal exit from `failed`). The
+  reset is best-effort over the FSM: a reference not at `failed` is left untouched (IllegalStatusTransition
+  swallowed) so the redrive isn't aborted over a reference the FSM can't rewind.
+- **Known limitation (deliberate, minimal scope):** this fully fixes a failure at the *first* status-bearing
+  step (the real-world T2T case). A reference that failed at a *later* step (e.g. `load`) cannot be redriven
+  to completion: the runner skips the `target_status` PATCH for fast-forwarded completed steps, so the
+  resume-point PATCH (`pending → loading`) is illegal. That case now fails *cleanly* — the runner's catch-all
+  (`runner.py`) turns the IllegalStatusTransition into a normal ticket FAILED with a clear
+  `failure_reason`, no wedge — rather than completing. Full multi-step redrive (re-walking the status FSM
+  forward in lockstep with fast-forwarded steps) is future work.
 
 ### F9 — `/run` doesn't reset `work_ticket_step` rows *(bug)*
 - **Symptom:** redrive logged "job unreadable → deciding from manifest → manifest.json missing", then
@@ -129,6 +140,15 @@ direction, so the fixes are deliberate rather than reactive.
 - **Invariant touched:** the resume / write-ahead step-progress contract.
 - **Direction:** on redrive, supersede the prior attempt's step rows so resume starts a *clean* attempt
   (prefer advancing the attempt counter over deleting — preserves postmortem history).
+- **Resolved (Phase 3):** `/run` deletes every non-`completed` `work_ticket_step` row for the ticket (in the
+  same transaction as the F8 reset), keeping `completed` rows so fast-forward still works. The runner
+  re-enters each not-yet-completed entry at attempt 0 onto a clean slate. The "advance the attempt counter"
+  alternative was rejected as fragile: the runner climbs `0..max_retries` on retry, so any renumbered band
+  for the old rows can collide with the redrive's own climb. Deletion is safe (not the resume-adoption
+  scope-creep it first looks like) precisely because a FAILED ticket has **no in-flight job** — every step
+  row is terminal, so there is nothing for crash-recovery to adopt; this never touches the `resume=True`
+  path. Postmortem history loss is acceptable: `/run` already clears the ticket-level `failure_*` columns,
+  and the operator has seen the failure before choosing to redrive.
 
 ### F10 — `duckdb-miint` unpinned + never refreshed on the compute side *(bug/deploy)*
 - **Symptom:** native job failed `Binder Error: Invalid named parameter "max_batch_bytes" for function
