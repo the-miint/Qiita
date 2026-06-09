@@ -1987,6 +1987,140 @@ async def test_resume_co_unreachable_does_not_fail_ticket(postgres_pool, slurm_t
     assert row["failure_type"] is None
 
 
+# --- F2/F3: infra-retry escapability, backoff, visibility -------------------
+
+
+def test_infra_backoff_delay_is_capped_exponential():
+    """The in-place infra-retry backoff grows geometrically from the base
+    interval and is clamped at the cap (F3) — and base=0 (the test cadence)
+    stays 0 so suites never sleep."""
+    from qiita_control_plane.runner import _infra_backoff_delay
+
+    assert _infra_backoff_delay(0, base=1.0, cap=60.0) == 1.0
+    assert _infra_backoff_delay(1, base=1.0, cap=60.0) == 2.0
+    assert _infra_backoff_delay(2, base=1.0, cap=60.0) == 4.0
+    # Geometric growth is clamped at the cap, never unbounded.
+    assert _infra_backoff_delay(20, base=1.0, cap=60.0) == 60.0
+    # base=0 (tests pass poll_interval_seconds=0) → never sleeps.
+    assert _infra_backoff_delay(5, base=0.0, cap=60.0) == 0.0
+    # A very long outage (huge n) must still yield a real, sleepable number —
+    # the exponent clamp prevents 2**n -> inf and 0.0*inf -> nan (which would
+    # crash asyncio.sleep). Holds for a real base and the base=0 test cadence.
+    assert _infra_backoff_delay(5000, base=1.0, cap=60.0) == 60.0
+    assert _infra_backoff_delay(5000, base=0.0, cap=60.0) == 0.0
+
+
+async def test_infra_retry_bails_when_ticket_force_failed(postgres_pool, slurm_ticket, tmp_path):
+    """An operator `force-fail` (a direct-DB FAILED transition) must stop the
+    runner's in-place infra-unreachable retry loop, which otherwise spins
+    forever (F2). The runner re-checks the ticket's DB state each iteration
+    and bails when it has gone terminal — WITHOUT clobbering the operator's
+    failure surface."""
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+    from qiita_common.models import WorkTicketFailureStage
+
+    class _ForceFailMidSubmit:
+        """submit_step simulates the force-fail landing while the runner is
+        mid-outage: flip the ticket terminal, then raise the unreachable
+        failure the runner would otherwise retry forever."""
+
+        def __init__(self, pool, idx):
+            self._pool = pool
+            self._idx = idx
+            self.submit_calls = 0
+
+        async def submit_step(self, *, step_name, **kwargs):
+            self.submit_calls += 1
+            await self._pool.execute(
+                "UPDATE qiita.work_ticket"
+                " SET state = 'failed', failure_type = 'permanent',"
+                "     failure_stage = 'submission', failure_reason = $2"
+                " WHERE work_ticket_idx = $1",
+                self._idx,
+                "operator force-fail",
+            )
+            raise BackendFailure(
+                kind=FailureKind.ORCHESTRATOR_UNREACHABLE,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=step_name,
+                reason="co down (simulated outage)",
+            )
+
+    backend = _ForceFailMidSubmit(postgres_pool, slurm_ticket)
+    # Must RETURN (bail), not hang in the retry loop or raise. The wait_for
+    # bound turns a regression (the pre-fix unbounded loop) into a fast test
+    # failure instead of a hung suite — poll_interval_seconds=0 yields at the
+    # backoff sleep, so the cancellation lands.
+    import asyncio
+
+    await asyncio.wait_for(_run(slurm_ticket, postgres_pool, backend, tmp_path / "ws"), timeout=10)
+
+    # Bailed on the first post-force-fail iteration — did not spin.
+    assert backend.submit_calls == 1
+    row = await postgres_pool.fetchrow(
+        "SELECT state, failure_type, failure_reason"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        slurm_ticket,
+    )
+    # The operator's failure surface is preserved, not overwritten.
+    assert row["state"] == "failed"
+    assert row["failure_reason"] == "operator force-fail"
+
+
+async def test_infra_retry_surfaces_then_clears_transient_reason(
+    postgres_pool, slurm_ticket, tmp_path
+):
+    """While the runner retries an unreachable orchestrator in place, it
+    surfaces *why* on the ticket (transient_reason / transient_since) so the
+    status route doesn't show a silently-wedged ticket (F3); once it makes
+    progress the marker is cleared."""
+
+    class _CapturingBackend(FakeSlurmBackendClient):
+        """Captures the ticket's transient marker on the submit that finally
+        succeeds — i.e. after the unreachable retries set it."""
+
+        def __init__(self, *, pool, idx, **kw):
+            super().__init__(**kw)
+            self._pool = pool
+            self._idx = idx
+            self.seen_transient: str | None = None
+            self.seen_since = None
+
+        async def submit_step(self, **kw):
+            if self.submit_calls >= self._submit_unreachable_times:
+                row = await self._pool.fetchrow(
+                    "SELECT transient_reason, transient_since"
+                    " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+                    self._idx,
+                )
+                self.seen_transient = row["transient_reason"]
+                self.seen_since = row["transient_since"]
+            return await super().submit_step(**kw)
+
+    backend = _CapturingBackend(
+        pool=postgres_pool,
+        idx=slurm_ticket,
+        submit_unreachable_times=2,
+        status_script=[StepStatus.COMPLETED],
+        result_script=[{"result": "result.parquet"}],
+    )
+    await _run(slurm_ticket, postgres_pool, backend, tmp_path / "ws")
+
+    # The retries surfaced the reason + a since-timestamp before recovery.
+    assert backend.seen_transient is not None
+    assert "orchestrator_unreachable" in backend.seen_transient
+    assert backend.seen_since is not None
+    # Recovery (and completion) cleared the marker — not left stale.
+    row = await postgres_pool.fetchrow(
+        "SELECT state, transient_reason, transient_since"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        slurm_ticket,
+    )
+    assert row["state"] == "completed"
+    assert row["transient_reason"] is None
+    assert row["transient_since"] is None
+
+
 # --- multi-step resume: bound rebuild + action fast-forward -----------------
 
 

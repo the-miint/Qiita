@@ -15,6 +15,12 @@ the `no-changelog` label).
 
 ### Added
 
+- Work-ticket in-place-retry visibility: `transient_reason` / `transient_since`
+  on the work-ticket status (`GET /work-ticket/{idx}` and the list view) and two
+  matching `qiita.work_ticket` columns. While the runner retries an unreachable
+  orchestrator/slurmrestd in place, it records *why* and *since when* so a
+  ticket stuck in `processing` is explainable instead of looking silently
+  wedged; cleared once it makes progress or fails (F3) (#TBD)
 - `GET /work-ticket` — list work tickets, each with a snapshot of its current
   step's compute placement (`compute_target`, `slurm_job_id`, `step_state`,
   `current_step_index/name`) from a single join against the new
@@ -144,6 +150,14 @@ the `no-changelog` label).
 
 ### Fixed
 
+- The runner's in-place infra-unreachable retry is now escapable and bounded.
+  An operator `qiita-admin ticket force-fail` (a direct-DB FAILED transition) is
+  now noticed: every infra-retry/poll iteration re-checks the ticket's DB state
+  and bails if it has gone terminal, instead of spinning forever against a
+  ticket it no longer owns — without clobbering the operator's failure surface
+  (F2). The retry sleep is now capped exponential backoff (base = poll interval,
+  doubling to a 60s cap) rather than a flat hammer, and the never-fail-on-outage
+  invariant is preserved — there is still no hard give-up (F3) (#TBD)
 - Redriving a FAILED reference workflow via `POST /work-ticket/{idx}/run` now
   actually works. Two redrive defects fixed in the same atomic reset: (F8) the
   `reference` scope_target was left pinned at `failed`, so the redriven

@@ -252,7 +252,13 @@ async def _force_fail_ticket(
                     failure_type      = 'permanent',
                     failure_stage     = $2,
                     failure_step_name = $3,
-                    failure_reason    = $4
+                    failure_reason    = $4,
+                    -- Clear any in-place-retry marker the runner left so the
+                    -- force-failed ticket shows only its real failure surface,
+                    -- not a stale "stuck since T" reason (covers the case where
+                    -- the runner died before it could clear the marker itself).
+                    transient_reason  = NULL,
+                    transient_since   = NULL
                 WHERE work_ticket_idx  = $1
                 """,
                 work_ticket_idx,

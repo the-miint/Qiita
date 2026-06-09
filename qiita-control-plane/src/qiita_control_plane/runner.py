@@ -88,6 +88,113 @@ _INFRA_UNREACHABLE_KINDS = frozenset(
     {FailureKind.SLURMRESTD_UNREACHABLE, FailureKind.ORCHESTRATOR_UNREACHABLE}
 )
 
+# Cap for the in-place infra-unreachable retry backoff. The base is the
+# caller's poll interval; each successive retry doubles it up to this cap, so a
+# long CO/slurmrestd outage backs off instead of hammering a flat cadence —
+# while still re-checking often enough (≤ cap) to notice an operator
+# force-fail. base=0 (the test cadence) stays 0, so suites never sleep.
+_INFRA_RETRY_BACKOFF_CAP_SECONDS = 60.0
+
+# Work-ticket states the runner does NOT own. Once a ticket reaches one of
+# these out from under a running workflow — an operator
+# `qiita-admin ticket force-fail` flips it to FAILED — the runner must stop:
+# the in-place infra-retry/poll loops re-check this each iteration and bail via
+# WorkflowAborted instead of retrying forever against a ticket that is no
+# longer theirs (F2).
+_TERMINAL_WORK_TICKET_STATES = frozenset(
+    {WorkTicketState.COMPLETED.value, WorkTicketState.FAILED.value}
+)
+
+
+class WorkflowAborted(Exception):
+    """Unwind a running workflow whose ticket went terminal in the DB out from
+    under the runner (operator force-fail/cancel). NOT a failure: the terminal
+    state + failure surface were set externally, so run_workflow catches this,
+    logs, and returns WITHOUT re-transitioning the ticket or PATCHing the
+    resource (which would clobber the operator's failure surface)."""
+
+    def __init__(self, work_ticket_idx: int, state: str) -> None:
+        super().__init__(f"work_ticket {work_ticket_idx} went terminal ({state}); aborting run")
+        self.work_ticket_idx = work_ticket_idx
+        self.state = state
+
+
+def _infra_backoff_delay(
+    n: int, *, base: float, cap: float = _INFRA_RETRY_BACKOFF_CAP_SECONDS
+) -> float:
+    """Delay before the (n+1)-th in-place infra-retry: ``base * 2**n`` capped
+    at ``cap`` (n starts at 0). Pure — no clock, no I/O. base=0 → always 0.
+
+    The exponent is clamped (n is bounded well past where the result saturates
+    at ``cap``) so a very long outage — n in the hundreds — can't push
+    ``2.0**n`` to float ``inf`` and turn ``0.0 * inf`` into ``nan`` (which would
+    crash ``asyncio.sleep``). 2**32 already dwarfs any sane base/cap."""
+    return min(cap, base * (2.0 ** min(n, 32)))
+
+
+async def _raise_if_ticket_terminal(pool: asyncpg.Pool, work_ticket_idx: int) -> None:
+    """Bail (WorkflowAborted) out of an in-place retry/poll loop if the ticket
+    has gone terminal in the DB — an operator force-fail/cancel — so the runner
+    stops working a ticket it no longer owns (F2). A cheap one-column read run
+    once per loop iteration.
+
+    Like every runner DB call this assumes Postgres is reachable: a PG outage
+    here raises a (non-BackendFailure) asyncpg error that unwinds the run via
+    run_workflow's catch-all, same as any other runner DB write. The
+    never-fail-on-outage invariant covers the *compute* backend (CO/slurmrestd),
+    not the control plane's own database."""
+    state = await pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    if state in _TERMINAL_WORK_TICKET_STATES:
+        raise WorkflowAborted(work_ticket_idx, state)
+
+
+async def _note_transient_retry(pool: asyncpg.Pool, work_ticket_idx: int, reason: str) -> None:
+    """Surface *why* the runner is retrying in place, for the status routes
+    (F3): refresh `transient_reason` and stamp `transient_since` on the first
+    retry of this episode (COALESCE preserves the original start time)."""
+    await pool.execute(
+        "UPDATE qiita.work_ticket"
+        " SET transient_reason = $2, transient_since = COALESCE(transient_since, now())"
+        " WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+        reason,
+    )
+
+
+async def _clear_transient_retry(
+    executor: asyncpg.Pool | asyncpg.Connection, work_ticket_idx: int
+) -> None:
+    """Clear the in-place-retry marker once the runner makes progress (a
+    backend call succeeds) or the ticket fails. Guarded so it's a no-op write
+    when nothing is set."""
+    await executor.execute(
+        "UPDATE qiita.work_ticket"
+        " SET transient_reason = NULL, transient_since = NULL"
+        " WHERE work_ticket_idx = $1 AND transient_reason IS NOT NULL",
+        work_ticket_idx,
+    )
+
+
+async def _infra_retry_wait(
+    pool: asyncpg.Pool,
+    work_ticket_idx: int,
+    *,
+    what: str,
+    kind: FailureKind,
+    n: int,
+    base: float,
+) -> int:
+    """One iteration of the in-place infra-unreachable retry: bail if the
+    ticket went terminal (F2), surface the reason (F3), then sleep with capped
+    backoff (F3). Returns the next backoff counter."""
+    await _raise_if_ticket_terminal(pool, work_ticket_idx)
+    await _note_transient_retry(pool, work_ticket_idx, f"{what}: {kind.value}")
+    await asyncio.sleep(_infra_backoff_delay(n, base=base))
+    return n + 1
+
 
 async def run_workflow(
     work_ticket_idx: int,
@@ -214,6 +321,8 @@ async def run_workflow(
                         completed,
                         workspace,
                         backend_client,
+                        pool=pool,
+                        work_ticket_idx=work_ticket_idx,
                         poll_interval_seconds=poll_interval_seconds,
                     )
                 )
@@ -286,6 +395,23 @@ async def run_workflow(
             ) from exc
 
         _log.info("workflow %d completed", work_ticket_idx)
+    except WorkflowAborted as exc:
+        # The ticket went terminal in the DB out from under us — an operator
+        # force-fail/cancel. The terminal state + failure surface were set
+        # externally; do NOT re-transition or PATCH (that would clobber the
+        # operator's failure surface). Just stop. Not re-raised: this is a
+        # clean, expected unwind, not a task-level error for _run_and_log.
+        _log.warning(
+            "workflow %d aborted: ticket went %s out from under the runner; stopping",
+            work_ticket_idx,
+            exc.state,
+        )
+        # Clear our own in-place-retry marker so the now-terminal ticket doesn't
+        # carry a stale "stuck since T" reason (which a monitoring query would
+        # misread). Safe: transient_* is orthogonal to state/failure_*, and the
+        # write is guarded to a no-op when nothing is set.
+        await _clear_transient_retry(pool, work_ticket_idx)
+        return
     except BackendFailure as exc:
         # Retry-loop already exhausted retries (transient) or this was a
         # permanent failure. The retry loop has not yet transitioned the
@@ -658,7 +784,12 @@ async def _transition_to_failed(
         "     failure_type = $2::qiita.failure_type,"
         "     failure_stage = $3::qiita.work_ticket_failure_stage,"
         "     failure_step_name = $4,"
-        "     failure_reason = $5"
+        "     failure_reason = $5,"
+        # A genuine failure ends any in-place-retry episode: clear the
+        # transient marker so the FAILED ticket shows only its real failure
+        # surface, not a stale "stuck retrying" reason.
+        "     transient_reason = NULL,"
+        "     transient_since = NULL"
         " WHERE work_ticket_idx = $6"
         "   AND state = ANY($7::qiita.work_ticket_state[])"
         " RETURNING work_ticket_idx",
@@ -1220,7 +1351,12 @@ async def _dispatch_step(
             poll_interval_seconds=poll_interval_seconds,
         )
         raw_outputs = await _result_with_infra_retry(
-            backend_client, handle, status, poll_interval_seconds=poll_interval_seconds
+            backend_client,
+            handle,
+            status,
+            pool=pool,
+            work_ticket_idx=work_ticket_idx,
+            poll_interval_seconds=poll_interval_seconds,
         )
     except BackendFailure as exc:
         # Genuine step failure (infra-unreachable kinds loop forever inside
@@ -1318,7 +1454,11 @@ async def _adopt_or_submit(
         and existing.job_name is not None
     ):
         found = await _find_existing_job(
-            backend_client, existing.job_name, poll_interval_seconds=poll_interval_seconds
+            backend_client,
+            existing.job_name,
+            pool=pool,
+            work_ticket_idx=work_ticket_idx,
+            poll_interval_seconds=poll_interval_seconds,
         )
         if found is not None:
             _log.warning(
@@ -1345,6 +1485,7 @@ async def _adopt_or_submit(
                 output_path=str(workspace / "output"),
                 logs_path=str(workspace / "logs"),
             )
+    n = 0
     while True:
         try:
             handle = await backend_client.submit_step(
@@ -1364,13 +1505,23 @@ async def _adopt_or_submit(
             if exc.kind not in _INFRA_UNREACHABLE_KINDS:
                 raise
             _log.warning(
-                "work_ticket %d step %r submit unreachable (%s); retry in %.0fs",
+                "work_ticket %d step %r submit unreachable (%s); retry %d",
                 work_ticket_idx,
                 entry.name,
                 exc.kind.value,
-                poll_interval_seconds,
+                n + 1,
             )
-            await asyncio.sleep(poll_interval_seconds)
+            n = await _infra_retry_wait(
+                pool,
+                work_ticket_idx,
+                what="submit",
+                kind=exc.kind,
+                n=n,
+                base=poll_interval_seconds,
+            )
+    if n:
+        # Submit got through after an outage — clear the stuck marker.
+        await _clear_transient_retry(pool, work_ticket_idx)
     # SLURM async submit — persist the job id before returning so the poll
     # loop and any restart re-entry resolve to the same job. A synchronous
     # (local) handle has no job id; the caller's terminal_outputs branch
@@ -1390,6 +1541,8 @@ async def _find_existing_job(
     backend_client: ComputeBackendClient,
     job_name: str,
     *,
+    pool: asyncpg.Pool,
+    work_ticket_idx: int,
     poll_interval_seconds: float,
 ) -> FoundJobWire | None:
     """Look up a live SLURM job by its deterministic name for orphan
@@ -1397,20 +1550,29 @@ async def _find_existing_job(
 
     Infra-unreachable failures (CO / slurmrestd down) retry in place — a
     recovery sweep must not fail a ticket because the orchestrator is briefly
-    unreachable (the never-fail-on-outage rule). A non-infra BackendFailure
-    (slurmrestd 4xx => 'job list unreadable') is swallowed to None: if we
-    genuinely can't read the job list, fall back to a fresh submit (the gap's
-    pre-closer behavior) rather than failing recovery. More than one match for
-    a deterministic name shouldn't happen; if it does, adopt the first and log
-    — the extras keep running but the duplicate-prevention goal is already met
-    for this attempt."""
+    unreachable (the never-fail-on-outage rule) — with capped backoff, and
+    bailing if the ticket is force-failed mid-outage (F2/F3). A non-infra
+    BackendFailure (slurmrestd 4xx => 'job list unreadable') is swallowed to
+    None: if we genuinely can't read the job list, fall back to a fresh submit
+    (the gap's pre-closer behavior) rather than failing recovery. More than one
+    match for a deterministic name shouldn't happen; if it does, adopt the
+    first and log — the extras keep running but the duplicate-prevention goal
+    is already met for this attempt."""
+    n = 0
     while True:
         try:
             jobs = await backend_client.find_jobs_by_name(job_name)
             break
         except BackendFailure as exc:
             if exc.kind in _INFRA_UNREACHABLE_KINDS:
-                await asyncio.sleep(poll_interval_seconds)
+                n = await _infra_retry_wait(
+                    pool,
+                    work_ticket_idx,
+                    what="find-by-name",
+                    kind=exc.kind,
+                    n=n,
+                    base=poll_interval_seconds,
+                )
                 continue
             _log.warning(
                 "find_jobs_by_name(%r) failed (%s); falling back to a fresh submit",
@@ -1418,6 +1580,8 @@ async def _find_existing_job(
                 exc.kind.value,
             )
             return None
+    if n:
+        await _clear_transient_retry(pool, work_ticket_idx)
     if not jobs:
         return None
     if len(jobs) > 1:
@@ -1472,12 +1636,20 @@ async def _poll_until_terminal(
     (failed). This is the filesystem tiebreaker. Records the running
     transition once, the first time the job is observed on a node."""
     recorded_running = False
+    n = 0
     while True:
         try:
             status = await backend_client.status_step(handle)
         except BackendFailure as exc:
             if exc.kind in _INFRA_UNREACHABLE_KINDS:
-                await asyncio.sleep(poll_interval_seconds)
+                n = await _infra_retry_wait(
+                    pool,
+                    work_ticket_idx,
+                    what="status",
+                    kind=exc.kind,
+                    n=n,
+                    base=poll_interval_seconds,
+                )
                 continue
             # Purged job → defer to the on-disk manifest via result_step.
             _log.warning(
@@ -1493,6 +1665,10 @@ async def _poll_until_terminal(
                 reason=f"slurmrestd no longer has the job ({exc.kind.value}); "
                 "deciding from filesystem",
             )
+        if n:
+            # status_step got through after an outage — clear the marker.
+            await _clear_transient_retry(pool, work_ticket_idx)
+            n = 0
         if status.status in (StepStatus.COMPLETED, StepStatus.FAILED):
             return status
         if status.status is StepStatus.RUNNING and not recorded_running:
@@ -1503,6 +1679,10 @@ async def _poll_until_terminal(
                 attempt=attempt,
             )
             recorded_running = True
+        # Normal poll cadence (a healthy in-flight job): flat, not backed off.
+        # Still re-check for an operator force-fail so a long-running job's
+        # poll loop is escapable, not just the outage retry (F2).
+        await _raise_if_ticket_terminal(pool, work_ticket_idx)
         await asyncio.sleep(poll_interval_seconds)
 
 
@@ -1511,20 +1691,34 @@ async def _result_with_infra_retry(
     handle: StepHandleWire,
     status: StepStatusWire,
     *,
+    pool: asyncpg.Pool,
+    work_ticket_idx: int,
     poll_interval_seconds: float,
 ) -> dict[str, Path]:
     """Fetch the terminal step's verified result, retrying in place on an
-    infra-unreachable failure (CO down). A genuine step failure — the job
-    ended FAILED, so `result_step` raises the classified BackendFailure —
-    propagates to the caller, which records it and lets the retry loop
-    decide."""
+    infra-unreachable failure (CO down) with capped backoff + a force-fail bail
+    (F2/F3). A genuine step failure — the job ended FAILED, so `result_step`
+    raises the classified BackendFailure — propagates to the caller, which
+    records it and lets the retry loop decide."""
+    n = 0
     while True:
         try:
-            return await backend_client.result_step(handle, status)
+            result = await backend_client.result_step(handle, status)
         except BackendFailure as exc:
             if exc.kind not in _INFRA_UNREACHABLE_KINDS:
                 raise
-            await asyncio.sleep(poll_interval_seconds)
+            n = await _infra_retry_wait(
+                pool,
+                work_ticket_idx,
+                what="result",
+                kind=exc.kind,
+                n=n,
+                base=poll_interval_seconds,
+            )
+            continue
+        if n:
+            await _clear_transient_retry(pool, work_ticket_idx)
+        return result
 
 
 async def _best_effort_record_failed(
@@ -1589,6 +1783,8 @@ async def _reconstruct_completed_outputs(
     workspace: Path,
     backend_client: ComputeBackendClient,
     *,
+    pool: asyncpg.Pool,
+    work_ticket_idx: int,
     poll_interval_seconds: float,
 ) -> dict[str, Any]:
     """Rebuild the bound outputs of an already-COMPLETED entry from disk,
@@ -1624,7 +1820,12 @@ async def _reconstruct_completed_outputs(
     )
     status = StepStatusWire(status=StepStatus.COMPLETED, raw_state="RECOVERED")
     raw_outputs = await _result_with_infra_retry(
-        backend_client, handle, status, poll_interval_seconds=poll_interval_seconds
+        backend_client,
+        handle,
+        status,
+        pool=pool,
+        work_ticket_idx=work_ticket_idx,
+        poll_interval_seconds=poll_interval_seconds,
     )
     return {name: Path(raw_outputs[name]) for name in entry.outputs}
 

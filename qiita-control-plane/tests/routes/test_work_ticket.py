@@ -1501,6 +1501,36 @@ async def test_get_work_ticket_wet_lab_admin_bypasses(
     assert resp.json()["work_ticket_idx"] == idx
 
 
+async def test_get_work_ticket_surfaces_transient_reason(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx
+):
+    """The runner records why it is retrying an unreachable orchestrator in
+    place on the ticket (transient_reason / transient_since); GET surfaces
+    them so a wedged-looking 'processing' ticket is explainable, not silent
+    (F3)."""
+    token, admin_idx = admin_token
+    action_id, version = reference_action
+    idx = await _submit_reference_ticket(
+        wt_client, token=token, action_id=action_id, version=version, reference_idx=reference_idx
+    )
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket"
+        " SET state = 'processing', transient_reason = $2, transient_since = now()"
+        " WHERE work_ticket_idx = $1",
+        idx,
+        "submit: orchestrator_unreachable",
+    )
+
+    resp = await wt_client.get(
+        URL_WORK_TICKET_BY_IDX.format(work_ticket_idx=idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["transient_reason"] == "submit: orchestrator_unreachable"
+    assert body["transient_since"] is not None
+
+
 # ---------------------------------------------------------------------------
 # POST /api/v1/work-ticket/{idx}/run
 # ---------------------------------------------------------------------------

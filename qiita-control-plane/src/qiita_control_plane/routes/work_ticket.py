@@ -606,6 +606,7 @@ _WORK_TICKET_COLUMNS = (
     " sp.sequencing_run_idx,"
     " wt.action_context, wt.state, wt.retry_count, wt.max_retries,"
     " wt.failure_type, wt.failure_stage, wt.failure_step_name, wt.failure_reason,"
+    " wt.transient_reason, wt.transient_since,"
     " wt.created_at, wt.updated_at"
 )
 _WORK_TICKET_FROM = (
