@@ -96,6 +96,11 @@ direction, so the fixes are deliberate rather than reactive.
 - **Invariant touched:** the documented `--local` contract (paths are compute-node-visible, not CLI-visible).
 - **Direction:** make the manifest consistent with companions — drop the hard existence failure under
   `--local` (or downgrade to a warning).
+- **Resolved (Phase 6):** the `--local` manifest existence check is downgraded from a hard `ValueError` to a
+  `_log.warning` and proceeds — consistent with the companions (now neither is existence-checked; the comment
+  was corrected too). A real typo is still surfaced (warning), but a manifest that's simply invisible from a
+  login node no longer blocks the submit. The **absoluteness** check is unchanged (the server's
+  `context_schema` enforces `^/`, so a relative path is a genuine client-side error that still raises).
 
 ### F6 — Headless `login` unusable *(UX/docs)*
 - **Symptom:** on a headless host, `qiita login` opens an AuthRocket URL that redirects to `127.0.0.1:<port>`
@@ -106,6 +111,13 @@ direction, so the fixes are deliberate rather than reactive.
 - **Invariant touched:** none.
 - **Direction:** document "carry the PAT" as the first-class headless path in the user-CLI quickstart;
   optionally add a small `--no-browser`/`--ot-code` paste affordance.
+- **Resolved (Phase 6):** the user-CLI quickstart now has a "Headless / remote hosts (carry the PAT)"
+  section — log in once on a browser-capable machine, then `export QIITA_TOKEN=…` (+ `QIITA_CONTROL_PLANE_URL`)
+  on the headless host (the env var already takes precedence over `~/.qiita/token` in `read_token`; no code
+  change needed for the path itself). The `--no-browser`/`--ot-code` paste affordance was **deliberately
+  deferred** (minimal scope, per the maintainer): the PAT-carry path is the zero-new-surface first-class
+  answer and the loopback `do_login` fundamentally can't work cross-machine; an `--ot-code` paste flow is a
+  future nice-to-have, not needed to make headless usage possible.
 
 ### F7 — Deploy never refreshes the native compute Python env *(bug/deploy)*
 - **Symptom:** native SLURM job failed `ModuleNotFoundError: qiita_common.chunking` even after re-syncing the

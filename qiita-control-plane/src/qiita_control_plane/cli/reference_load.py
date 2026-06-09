@@ -537,15 +537,29 @@ async def do_reference_load(
         if not fasta_manifest_path.is_absolute():
             raise ValueError(f"--fasta-manifest must be absolute, got {str(fasta_manifest_path)!r}")
         if not fasta_manifest_path.exists() or not fasta_manifest_path.is_file():
-            raise ValueError(f"--fasta-manifest not found or not a file: {fasta_manifest_path}")
+            # Do NOT hard-fail on existence (F5). The CLI may run on a host —
+            # e.g. a login node — that doesn't share the compute node's
+            # filesystem view, and the manifest is read by `stage_local_fasta`
+            # on the compute node, never by the CLI. A missing path here may
+            # simply be invisible from here, so warn (a real typo is still
+            # flagged) and proceed — consistent with the companions below,
+            # which aren't existence-checked at all. If the compute node can't
+            # find it either, the workflow fails loudly there.
+            _log.warning(
+                "--fasta-manifest %s is not visible from this host (not found or"
+                " not a file). If you're running --local from a login node"
+                " without the compute node's shared-FS view this is expected;"
+                " otherwise check for a typo. Proceeding — the manifest is read"
+                " on the compute node.",
+                fasta_manifest_path,
+            )
         # Companions ride as raw `*_path` strings the compute host reads, so
         # they must be absolute too — the workflow context_schema enforces
         # `pattern:"^/"` on every path key, and a relative path would otherwise
         # 422 server-side with an opaque message. Validate here for a clear,
-        # boundary-local error (existence is NOT checked: under SLURM a
-        # companion may live on a shared FS the CLI host can't see — only the
-        # manifest, which the CLI never reads either, is checked for existence
-        # because it's the by-path entry point the operator just authored).
+        # boundary-local error. Existence is NOT checked for the manifest or
+        # the companions: under SLURM they may live on a shared FS the CLI host
+        # can't see, and none of them are read by the CLI.
         for flag, companion in (
             ("--taxonomy", taxonomy_path),
             ("--tree", tree_path),

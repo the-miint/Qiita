@@ -78,6 +78,12 @@ the `no-changelog` label).
 
 ### Changed
 
+- The user-CLI quickstart now documents the headless / remote-host auth path:
+  `qiita login` needs a co-located browser + loopback receiver, so on an SSH
+  session / HPC login node / CI runner you carry the PAT instead — log in once
+  on a browser machine, then `export QIITA_TOKEN=…` (+ `QIITA_CONTROL_PLANE_URL`)
+  on the headless host. `$QIITA_TOKEN` already took precedence over the token
+  file; this just makes the supported path discoverable (F6) (#TBD)
 - miint now installs from the team mirror by default in every component (CP CLI,
   CO service, native SLURM jobs): `miint_install_sql()` always `FORCE INSTALL`s
   from `MIINT_MIRROR_URL` (override with `MIINT_EXTENSION_REPO`) instead of
@@ -150,6 +156,13 @@ the `no-changelog` label).
 
 ### Fixed
 
+- `qiita reference load --local` no longer hard-fails when the
+  `--fasta-manifest` path isn't visible from the host running the CLI (e.g. a
+  login node without the compute node's shared-FS view). The manifest is read
+  by `stage_local_fasta` on the compute node, not by the CLI, so a missing path
+  is now a warning (still flags a real typo) and the submit proceeds —
+  consistent with the companion paths, which were never existence-checked. The
+  absoluteness check is unchanged (a relative path still errors) (F5) (#TBD)
 - SLURM JWT recovery no longer depends on a clean 401. `SlurmrestdClient` now
   proactively reloads the JWT from its file when the cached token is within 60s
   of its `exp`, *before* sending the request — so a long-lived orchestrator
