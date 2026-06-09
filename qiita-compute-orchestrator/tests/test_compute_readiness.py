@@ -190,6 +190,7 @@ compute-readiness: uid=1234
 compute-readiness: user=qiita-job
 compute-readiness: native-python-on-compute=ok path=/opt/qiita/co/.venv/bin/python
 compute-readiness: native-import=ok
+compute-readiness: miint-read-fastx=ok
 compute-readiness: shared-fs-visible=ok path=/scratch/qiita
 compute-readiness: shared-fs-writable=ok
 compute-readiness: cp-from-compute=ok cp_url=https://qiita.example.org
@@ -203,6 +204,7 @@ trailing line outside the prefix
         ("probe/user", "pass"),
         ("probe/native-python-on-compute", "pass"),
         ("probe/native-import", "pass"),
+        ("probe/miint-read-fastx", "pass"),
         ("probe/shared-fs-visible", "pass"),
         ("probe/shared-fs-writable", "pass"),
         ("probe/cp-from-compute", "pass"),
@@ -213,6 +215,7 @@ def test_parse_probe_log_failures_propagate():
     log = """\
 compute-readiness: native-python-on-compute=fail path=/opt/qiita/co/.venv/bin/python
 compute-readiness: native-import=fail
+compute-readiness: miint-read-fastx=fail
 compute-readiness: shared-fs-visible=fail path=/scratch/qiita
 compute-readiness: cp-from-compute=skip cp_url_set=fail token_set=fail
 """
@@ -220,6 +223,7 @@ compute-readiness: cp-from-compute=skip cp_url_set=fail token_set=fail
     assert statuses == {
         "probe/native-python-on-compute": "fail",
         "probe/native-import": "fail",
+        "probe/miint-read-fastx": "fail",
         "probe/shared-fs-visible": "fail",
         "probe/cp-from-compute": "skip",
     }
@@ -255,6 +259,16 @@ def test_probe_script_emits_only_known_values():
             f"script emits {key}={value!r} but parser's alphabet is {sorted(known)};"
             " update _PROBE_*_VALUES or the script to keep them in sync."
         )
+
+
+def test_probe_script_checks_miint_read_fastx():
+    """The probe verifies read_fastx accepts max_batch_bytes on the compute
+    node (F10 deploy guard) — a stale extension should fail at deploy, not at
+    the first reference-load job."""
+    script = cr.build_probe_script(path_scratch="/scratch/qiita")
+    assert "miint-read-fastx=ok" in script
+    assert "miint-read-fastx=fail" in script
+    assert "max_batch_bytes" in script
 
 
 def test_parse_probe_log_unknown_value_defaults_to_fail():

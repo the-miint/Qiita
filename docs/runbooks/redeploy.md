@@ -126,6 +126,21 @@ files are present.
 If the migration guard aborts here, you skipped or under-ran the migrate
 step above — run `make migrate` and re-run this command.
 
+> **The SLURM native compute env is refreshed separately.** `local-deploy.sh`
+> only `uv sync`s the `/opt/qiita` *service* venvs. Native SLURM jobs run from
+> the venv `SLURM_NATIVE_PYTHON` points at — a separate clone on the shared
+> filesystem the compute nodes mount (e.g.
+> `/home/qiita/qiita-miint/qiita-compute-orchestrator`). On every deploy that
+> changes `qiita-common` or `qiita-compute-orchestrator`, refresh it too, or a
+> native job imports stale code (and can keep a stale cached miint extension):
+> ```bash
+> # [operator] in the SLURM_NATIVE_PYTHON checkout, on the shared FS
+> cd <native-checkout>/qiita-compute-orchestrator && uv sync --reinstall-package qiita-common
+> ```
+> The next native job FORCE-installs miint from the mirror, overwriting any
+> stale cached extension. Bucket-5 `compute-readiness` confirms both
+> (`probe/native-import=ok`, `probe/miint-read-fastx=ok`).
+
 ## 7. Verify
 
 ```bash

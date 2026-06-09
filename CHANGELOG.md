@@ -72,6 +72,12 @@ the `no-changelog` label).
 
 ### Changed
 
+- miint now installs from the team mirror by default in every component (CP CLI,
+  CO service, native SLURM jobs): `miint_install_sql()` always `FORCE INSTALL`s
+  from `MIINT_MIRROR_URL` (override with `MIINT_EXTENSION_REPO`) instead of
+  falling back to the DuckDB community channel — so one host can't drift to a
+  different `read_fastx` build, and `FORCE` overwrites a stale cached extension
+  (#TBD)
 - Decoupled compute-step execution: the orchestrator's single blocking
   `POST /step/run` is replaced by the stateless `submit` / `status` / `result`
   trio, and the **control plane** now owns the poll loop. A long SLURM job no
@@ -138,6 +144,12 @@ the `no-changelog` label).
 
 ### Fixed
 
+- Stale compute-environment failures now surface at deploy, not at the first
+  job: `compute-readiness` probes that the compute node's miint build binds
+  `read_fastx(max_batch_bytes:=…)` (the call `stage_local_fasta`/`reference load`
+  issue), and the redeploy runbook now documents refreshing the separate
+  `SLURM_NATIVE_PYTHON` checkout so native jobs don't import stale `qiita-common`
+  (#TBD)
 - Long compute steps no longer self-fail: under the old held-connection model a
   step exceeding the 600s CP→CO client timeout tripped an httpx error that
   skipped the retry loop and marked the ticket FAILED while the SLURM job kept

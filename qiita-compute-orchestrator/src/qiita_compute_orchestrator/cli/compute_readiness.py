@@ -259,6 +259,34 @@ else
     echo "{_PROBE_LINE_PREFIX} native-import=fail"
 fi
 
+# miint must LOAD on the compute node and its read_fastx must accept the
+# `max_batch_bytes` named param that stage_local_fasta / reference_load issue.
+# A stale cached extension (a community build, or a pre-max_batch_bytes mirror
+# build) binds wrong and fails the real job with a BinderError — catch it here,
+# at deploy, not at the first reference-load job (F10). Runs the exact bind via
+# the single-sourced install path, so it also proves the mirror reaches this
+# node. chr(10) builds the FASTA's newlines: a literal `\n` here would be
+# expanded by THIS f-string into a real newline inside the generated Python
+# string literal — a syntax error in the probe script — so chr(10) sidesteps it.
+MIINT_PROBE="$(mktemp)"
+cat > "$MIINT_PROBE" <<'PYEOF'
+import os, tempfile, duckdb
+from qiita_common.duckdb_miint import miint_connect_config, miint_install_sql
+fa = os.path.join(tempfile.gettempdir(), "qiita-readiness-probe.fasta")
+with open(fa, "w") as fh:
+    fh.write(">r" + chr(10) + "ACGT" + chr(10))
+conn = duckdb.connect(":memory:", config=miint_connect_config())
+conn.execute(miint_install_sql())
+conn.execute("LOAD miint;")
+conn.execute("SELECT read_id FROM read_fastx(?, max_batch_bytes:='64MB')", [fa]).fetchall()
+PYEOF
+if "$PYTHON" "$MIINT_PROBE" >/dev/null 2>&1; then
+    echo "{_PROBE_LINE_PREFIX} miint-read-fastx=ok"
+else
+    echo "{_PROBE_LINE_PREFIX} miint-read-fastx=fail"
+fi
+rm -f "$MIINT_PROBE"
+
 # The `/ticket` leaf must match the control plane's PATH_SCRATCH/ticket
 # derivation (qiita_control_plane.config.Settings.from_env) — that's the
 # per-ticket workspace SLURM jobs actually run in.
