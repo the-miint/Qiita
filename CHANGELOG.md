@@ -150,6 +150,15 @@ the `no-changelog` label).
 
 ### Fixed
 
+- SLURM JWT recovery no longer depends on a clean 401. `SlurmrestdClient` now
+  proactively reloads the JWT from its file when the cached token is within 60s
+  of its `exp`, *before* sending the request — so a long-lived orchestrator
+  can't run on a boot-cached token past expiry until a restart when slurmrestd
+  rejects an expired token with a 5xx / dropped connection instead of a 401
+  (the reload-on-401 path only fires on a 401). The 401-reload path is kept as a
+  fallback, and both the 401 reload and the submit-error classification now log
+  the exact status so the next stuck-on-submit incident is diagnosable without a
+  repro (F1) (#TBD)
 - The runner's in-place infra-unreachable retry is now escapable and bounded.
   An operator `qiita-admin ticket force-fail` (a direct-DB FAILED transition) is
   now noticed: every infra-retry/poll iteration re-checks the ticket's DB state

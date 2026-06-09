@@ -33,12 +33,16 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import time
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+_log = logging.getLogger(__name__)
 
 # Default API version. Override via the SLURMRESTD_API_VERSION env var
 # in Settings.from_env(). Routes used here (job/submit, job/{id}) are
@@ -51,6 +55,16 @@ DEFAULT_SLURMRESTD_API_VERSION = "v0.0.40"
 # want SLURMRESTD_UNREACHABLE retry semantics rather than a runaway
 # request hanging the dispatch task.
 _HTTP_TIMEOUT_SECONDS = 30
+
+# Proactively reload the SLURM JWT from its file once the cached token is
+# within this many seconds of its `exp` claim, BEFORE a request — rather than
+# waiting for slurmrestd to reject it with a 401 (F1). slurmrestd does not
+# always answer an expired token with a clean 401 (it may 5xx or drop the
+# connection), and the reload-on-401 path only fires on a 401; without this a
+# long-lived orchestrator can run on a boot-cached token past its expiry until
+# a restart. The margin only needs to cover one request's round-trip plus
+# clock skew; a token with no `exp` claim is never proactively refreshed.
+_JWT_REFRESH_MARGIN_SECONDS = 60.0
 
 
 class SlurmrestdError(RuntimeError):
@@ -238,7 +252,11 @@ class SlurmrestdClient:
         self._jwt_path = jwt_path
         self._user_name = user_name
         self._api_version = api_version
-        self._jwt = self._load_jwt()
+        # Cached token + its decoded `exp` (None when the JWT carries no expiry
+        # claim → proactive refresh disabled, reload-on-401 still applies).
+        self._jwt: str = ""
+        self._jwt_exp: float | None = None
+        self._reload_jwt_from_file()
 
         if http_client is None:
             self._http = httpx.AsyncClient(
@@ -267,6 +285,58 @@ class SlurmrestdClient:
             )
         _verify_jwt_sun_matches(token, self._user_name, self._jwt_path)
         return token
+
+    def _reload_jwt_from_file(self) -> None:
+        """Read the JWT file (validating `sun`), then cache the token and its
+        decoded `exp`. The single mutation point for `self._jwt` so the cached
+        token and its expiry never drift apart. Raises `SlurmrestdError` on an
+        unreadable/empty/wrong-`sun` file (boot-fatal; on the 401/refresh paths
+        the caller surfaces it the same as any other slurmrestd error)."""
+        # Decode `exp` BEFORE mutating either field: if `_extract_exp` ever
+        # raises (a malformed half-written file that survived `_load_jwt`'s
+        # shape check), the cached token and its expiry stay consistent rather
+        # than leaving `self._jwt` updated against a stale `self._jwt_exp`.
+        token = self._load_jwt()
+        exp = self._extract_exp(token)
+        self._jwt = token
+        self._jwt_exp = exp
+
+    def _extract_exp(self, token: str) -> float | None:
+        """Decode the JWT's `exp` (Unix-seconds expiry) for proactive refresh,
+        or None if absent / non-numeric. Stdlib decode only — `_load_jwt`
+        already validated the token's shape via `_verify_jwt_sun_matches`."""
+        exp = decode_jwt_payload(token, self._jwt_path).get("exp")
+        return float(exp) if isinstance(exp, (int, float)) else None
+
+    def _maybe_refresh_expiring_jwt(self) -> None:
+        """Reload the JWT from its file if the cached token is within
+        `_JWT_REFRESH_MARGIN_SECONDS` of its `exp` (F1) — before sending the
+        request, so we never depend on slurmrestd answering an expired token
+        with a clean 401. No-op when the token has no `exp` claim."""
+        if self._jwt_exp is None:
+            return
+        if time.time() < self._jwt_exp - _JWT_REFRESH_MARGIN_SECONDS:
+            return
+        _log.info(
+            "SLURM JWT within %.0fs of expiry (exp=%s); proactively reloading from %s",
+            _JWT_REFRESH_MARGIN_SECONDS,
+            self._jwt_exp,
+            self._jwt_path,
+        )
+        try:
+            self._reload_jwt_from_file()
+        except SlurmrestdError as exc:
+            # A transient file-read blip (NFS hiccup, rotation script mid-write)
+            # must NOT abort a request the still-valid cached token can serve —
+            # the margin means the cached token hasn't expired yet. Proceed with
+            # it; if it has in fact expired, the reload-on-401 path retries the
+            # reload. Only the *proactive* head-start is skipped this once.
+            _log.warning(
+                "proactive SLURM JWT reload from %s failed (%s); proceeding with the"
+                " still-cached token (will fall back to reload-on-401 if expired)",
+                self._jwt_path,
+                exc,
+            )
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -455,9 +525,13 @@ class SlurmrestdClient:
         *,
         json: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Issue one HTTP request. If the response is 401, re-read the
-        JWT file (handling SLURM's periodic rotation) and retry once;
-        if that also 401s, raise. Any other non-2xx raises immediately."""
+        """Issue one HTTP request. Proactively reload the JWT if it is near
+        expiry (before the request). If the response is still 401, re-read the
+        JWT file (handling SLURM's periodic rotation) and retry once; if that
+        also 401s, raise. Any other non-2xx raises immediately."""
+        # F1: refresh an about-to-expire token BEFORE sending, so recovery
+        # never hinges on slurmrestd returning a clean 401 for an expired JWT.
+        self._maybe_refresh_expiring_jwt()
         for attempt in (1, 2):
             try:
                 response = await self._http.request(
@@ -478,7 +552,13 @@ class SlurmrestdClient:
                 # JWT may have rotated since startup. Re-read and retry
                 # once. Don't loop — a second 401 means the file is
                 # actually wrong (mis-installed, permissions, etc).
-                self._jwt = self._load_jwt()
+                _log.warning(
+                    "slurmrestd %s %s returned 401; reloading JWT from %s and retrying once",
+                    method,
+                    url,
+                    self._jwt_path,
+                )
+                self._reload_jwt_from_file()
                 continue
 
             if response.status_code >= 400:

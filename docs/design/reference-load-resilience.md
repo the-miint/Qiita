@@ -38,14 +38,23 @@ direction, so the fixes are deliberate rather than reactive.
 - **Symptom:** orchestrator up since 6/8 14:33; on 6/9 the slurmrestd submit failed `slurmrestd_unreachable`
   every 10s for ~40min. The on-disk JWT + a manual `curl` with it worked throughout; only restarting the
   orchestrator fixed it.
-- **Root cause (open):** `SlurmrestdClient` caches the JWT at construction and reloads on a 401
-  (`slurm/client.py:417`). That *should* self-heal, so either the failures weren't clean 401s or the reload
-  path has a gap. Ambiguous because the CP only logs the coarse `slurmrestd_unreachable` kind
-  (= transport / 5xx / 401).
+- **Root cause:** `SlurmrestdClient` caches the JWT at construction and reloads it *only* on a clean 401
+  (`slurm/client.py`). The symptom pins the gap: the **on-disk** JWT worked via `curl` throughout (so the
+  rotation timer was fine and the file held a fresh token), yet the orchestrator never recovered until a
+  restart re-read the file. That can only mean the reload-on-401 never fired — the orchestrator's *boot-cached*
+  token expired and slurmrestd rejected it with something other than a clean 401 (a 5xx or a dropped
+  connection), which the client surfaced as the coarse `slurmrestd_unreachable` kind and never reloaded for.
+  So the client sat on its stale cached token while a fresh one waited on disk.
 - **Invariant touched:** none documented; this is a resilience gap.
-- **Direction:** add exact-status logging to disambiguate next time; add a **proactive** JWT freshness check
-  (decode `exp` via the existing `decode_jwt_payload`, reload before expiry) so recovery doesn't depend on
-  catching a 401.
+- **Resolved (Phase 5):** added a **proactive** JWT freshness check — `SlurmrestdClient` decodes the cached
+  token's `exp` (via the existing `decode_jwt_payload`) and reloads from the file when within
+  `_JWT_REFRESH_MARGIN_SECONDS` (60s) of expiry, *before* each request, so recovery no longer hinges on
+  catching a 401. The 401-reload remains as a fallback. Both the 401 reload and `_classify_submit_error` now
+  log the **exact** status (status_code / body) so a future stuck-on-submit incident is unambiguous. This
+  fixes the observed "file fresh, client stale" case definitively; it does **not** (and cannot, client-side)
+  paper over a genuinely broken rotation timer — the proactive reload would just re-read the same stale file
+  — but the new logging surfaces that case, and the timer itself is covered in
+  [`docs/runbooks/slurm-backend-setup.md`](../runbooks/slurm-backend-setup.md).
 
 ### F2 — `force-fail` doesn't stop the live retry loop *(bug)*
 - **Symptom:** after `qiita-admin ticket force-fail`, `slurmrestd_unreachable` retries kept logging.
