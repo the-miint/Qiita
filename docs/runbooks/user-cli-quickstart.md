@@ -32,6 +32,36 @@ HTTP receiver writes a PAT to `~/.qiita/token` (mode `0600`). Subsequent
 commands read the PAT from `$QIITA_TOKEN` (env var, takes precedence)
 or `~/.qiita/token`.
 
+### Headless / remote hosts (carry the PAT)
+
+`qiita login` drives a browser **and** a localhost loopback receiver, so the
+two must be on the **same machine**. On a headless or remote host — an SSH
+session, an HPC login node, a CI runner — that flow can't complete: a browser
+on your laptop would redirect to *your laptop's* localhost, not the remote
+host's. The first-class headless path is to **carry the PAT** rather than log
+in there:
+
+1. On a machine with a browser, log in once and read the minted PAT:
+
+   ```bash
+   qiita --base-url https://qiita.example.org login
+   cat ~/.qiita/token
+   ```
+
+2. On the headless host, point the CLI at the server and hand it the PAT via
+   the environment — `$QIITA_TOKEN` takes precedence over `~/.qiita/token`, so
+   no `login` runs there:
+
+   ```bash
+   export QIITA_CONTROL_PLANE_URL=https://qiita.example.org
+   export QIITA_TOKEN='<paste the PAT>'
+   qiita whoami          # no --base-url / login needed
+   ```
+
+`$QIITA_TOKEN` (+ `$QIITA_CONTROL_PLANE_URL`) is the supported automation entry
+point — CI jobs and service scripts set them directly from a secret store
+instead of calling `login`.
+
 ```bash
 qiita whoami
 ```
@@ -45,7 +75,8 @@ Expected fields:
   reference:read, biosample:read, biosample:write, prep_sample:read,
   prep_sample:write, study:read, study:write`.
 
-A 401 means the PAT is missing or revoked; re-run `qiita login`.
+A 401 means the PAT is missing or revoked; re-run `qiita login` (or, on a
+headless host, re-set `$QIITA_TOKEN` — see "Headless / remote hosts" above).
 
 ## 1. Complete your profile (one time)
 

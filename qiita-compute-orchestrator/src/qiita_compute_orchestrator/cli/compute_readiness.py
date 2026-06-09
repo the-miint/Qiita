@@ -259,6 +259,36 @@ else
     echo "{_PROBE_LINE_PREFIX} native-import=fail"
 fi
 
+# miint must install from the mirror and LOAD on the compute node, and the
+# core ingest call the jobs issue (read_fastx) must run. A stale cached
+# extension, an unreachable mirror, or an otherwise-wrong build fails the real
+# job — catch it here, at deploy, not at the first reference-load job. Runs the
+# install via the single-sourced path (so it also proves the mirror reaches
+# this node) and exercises read_fastx in the shape stage_local_fasta /
+# reference_load use; the goal is "this node runs a current, usable miint", not
+# any single function or parameter. chr(10) builds the FASTA's newlines: a
+# literal `\n` here would be
+# expanded by THIS f-string into a real newline inside the generated Python
+# string literal — a syntax error in the probe script — so chr(10) sidesteps it.
+MIINT_PROBE="$(mktemp)"
+cat > "$MIINT_PROBE" <<'PYEOF'
+import os, tempfile, duckdb
+from qiita_common.duckdb_miint import miint_connect_config, miint_install_sql
+fa = os.path.join(tempfile.gettempdir(), "qiita-readiness-probe.fasta")
+with open(fa, "w") as fh:
+    fh.write(">r" + chr(10) + "ACGT" + chr(10))
+conn = duckdb.connect(":memory:", config=miint_connect_config())
+conn.execute(miint_install_sql())
+conn.execute("LOAD miint;")
+conn.execute("SELECT read_id FROM read_fastx(?, max_batch_bytes:='64MB')", [fa]).fetchall()
+PYEOF
+if "$PYTHON" "$MIINT_PROBE" >/dev/null 2>&1; then
+    echo "{_PROBE_LINE_PREFIX} miint-read-fastx=ok"
+else
+    echo "{_PROBE_LINE_PREFIX} miint-read-fastx=fail"
+fi
+rm -f "$MIINT_PROBE"
+
 # The `/ticket` leaf must match the control plane's PATH_SCRATCH/ticket
 # derivation (qiita_control_plane.config.Settings.from_env) — that's the
 # per-ticket workspace SLURM jobs actually run in.

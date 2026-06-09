@@ -33,12 +33,16 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
+import time
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+_log = logging.getLogger(__name__)
 
 # Default API version. Override via the SLURMRESTD_API_VERSION env var
 # in Settings.from_env(). Routes used here (job/submit, job/{id}) are
@@ -52,12 +56,29 @@ DEFAULT_SLURMRESTD_API_VERSION = "v0.0.40"
 # request hanging the dispatch task.
 _HTTP_TIMEOUT_SECONDS = 30
 
+# Proactively reload the SLURM JWT from its file once the cached token is
+# within this many seconds of its `exp` claim, BEFORE a request — rather than
+# waiting for slurmrestd to reject it with a 401. slurmrestd does not
+# always answer an expired token with a clean 401 (it may 5xx or drop the
+# connection), and the reload-on-401 path only fires on a 401; without this a
+# long-lived orchestrator can run on a boot-cached token past its expiry until
+# a restart. The margin only needs to cover one request's round-trip plus
+# clock skew; a token with no `exp` claim is never proactively refreshed.
+_JWT_REFRESH_MARGIN_SECONDS = 60.0
+
 
 class SlurmrestdError(RuntimeError):
     """Wraps slurmrestd HTTP failures (non-2xx responses, transport
     errors). Carries enough context for SlurmBackend to classify into
     a BackendFailure: status code (None for transport-level errors),
-    URL, response body when available."""
+    URL, response body when available.
+
+    One case carries a *synthetic* status code: `submit_job` raises with
+    `status_code=422` when slurmrestd answered HTTP 200 but slurmctld
+    logically rejected the submission (`result.error_code != 0`). The
+    wire status was 200; the 422 exists only to route the failure to the
+    permanent-CONTRACT_VIOLATION bucket in `_classify_submit_error`. The
+    message and `body` make the real HTTP 200 explicit for log readers."""
 
     def __init__(
         self,
@@ -231,7 +252,11 @@ class SlurmrestdClient:
         self._jwt_path = jwt_path
         self._user_name = user_name
         self._api_version = api_version
-        self._jwt = self._load_jwt()
+        # Cached token + its decoded `exp` (None when the JWT carries no expiry
+        # claim → proactive refresh disabled, reload-on-401 still applies).
+        self._jwt: str = ""
+        self._jwt_exp: float | None = None
+        self._reload_jwt_from_file()
 
         if http_client is None:
             self._http = httpx.AsyncClient(
@@ -261,6 +286,58 @@ class SlurmrestdClient:
         _verify_jwt_sun_matches(token, self._user_name, self._jwt_path)
         return token
 
+    def _reload_jwt_from_file(self) -> None:
+        """Read the JWT file (validating `sun`), then cache the token and its
+        decoded `exp`. The single mutation point for `self._jwt` so the cached
+        token and its expiry never drift apart. Raises `SlurmrestdError` on an
+        unreadable/empty/wrong-`sun` file (boot-fatal; on the 401/refresh paths
+        the caller surfaces it the same as any other slurmrestd error)."""
+        # Decode `exp` BEFORE mutating either field: if `_extract_exp` ever
+        # raises (a malformed half-written file that survived `_load_jwt`'s
+        # shape check), the cached token and its expiry stay consistent rather
+        # than leaving `self._jwt` updated against a stale `self._jwt_exp`.
+        token = self._load_jwt()
+        exp = self._extract_exp(token)
+        self._jwt = token
+        self._jwt_exp = exp
+
+    def _extract_exp(self, token: str) -> float | None:
+        """Decode the JWT's `exp` (Unix-seconds expiry) for proactive refresh,
+        or None if absent / non-numeric. Stdlib decode only — `_load_jwt`
+        already validated the token's shape via `_verify_jwt_sun_matches`."""
+        exp = decode_jwt_payload(token, self._jwt_path).get("exp")
+        return float(exp) if isinstance(exp, (int, float)) else None
+
+    def _maybe_refresh_expiring_jwt(self) -> None:
+        """Reload the JWT from its file if the cached token is within
+        `_JWT_REFRESH_MARGIN_SECONDS` of its `exp` — before sending the
+        request, so we never depend on slurmrestd answering an expired token
+        with a clean 401. No-op when the token has no `exp` claim."""
+        if self._jwt_exp is None:
+            return
+        if time.time() < self._jwt_exp - _JWT_REFRESH_MARGIN_SECONDS:
+            return
+        _log.info(
+            "SLURM JWT within %.0fs of expiry (exp=%s); proactively reloading from %s",
+            _JWT_REFRESH_MARGIN_SECONDS,
+            self._jwt_exp,
+            self._jwt_path,
+        )
+        try:
+            self._reload_jwt_from_file()
+        except SlurmrestdError as exc:
+            # A transient file-read blip (NFS hiccup, rotation script mid-write)
+            # must NOT abort a request the still-valid cached token can serve —
+            # the margin means the cached token hasn't expired yet. Proceed with
+            # it; if it has in fact expired, the reload-on-401 path retries the
+            # reload. Only the *proactive* head-start is skipped this once.
+            _log.warning(
+                "proactive SLURM JWT reload from %s failed (%s); proceeding with the"
+                " still-cached token (will fall back to reload-on-401 if expired)",
+                self._jwt_path,
+                exc,
+            )
+
     def _headers(self) -> dict[str, str]:
         return {
             "X-SLURM-USER-NAME": self._user_name,
@@ -288,11 +365,21 @@ class SlurmrestdClient:
         Raises SlurmrestdError on any non-2xx or transport failure. The
         caller (SlurmBackend) classifies into a BackendFailure based on
         status_code (5xx / transport => SLURMRESTD_UNREACHABLE
-        retriable; 4xx => CONTRACT_VIOLATION permanent unless 401)."""
+        retriable; 4xx => CONTRACT_VIOLATION permanent unless 401).
+
+        Note: a successful HTTP exchange does NOT mean the job was
+        queued. slurmrestd answers HTTP 200 even when slurmctld rejected
+        the submission (bad partition, QOS limit, ...) — the real outcome
+        rides in `result.error_code` (0 == accepted) and the top-level
+        `errors` array. We surface those as a *permanent* failure before
+        trusting any echoed job_id."""
         url = f"/slurm/{self._api_version}/job/submit"
         body = await self._post_with_jwt_retry(url, json=payload)
-        # slurmrestd returns {"job_id": <int>, ...} (plus a possible
-        # "errors" array even on 2xx for warnings); pull the id out.
+        # Rejection check FIRST: on a rejected submit slurmrestd still
+        # echoes a (meaningless, usually 0) job_id, so trusting the id
+        # before checking the outcome is exactly the bug.
+        self._raise_if_submit_rejected(body, url)
+        # slurmrestd returns {"job_id": <int>, ...}; pull the id out.
         job_id = body.get("job_id")
         if not isinstance(job_id, int):
             raise SlurmrestdError(
@@ -300,6 +387,49 @@ class SlurmrestdClient:
                 url=url,
             )
         return job_id
+
+    @staticmethod
+    def _raise_if_submit_rejected(body: dict[str, Any], url: str) -> None:
+        """Detect a job/submit that slurmrestd answered HTTP 200 but
+        slurmctld rejected.
+
+        `result.error_code` is slurmrestd's authoritative accept/reject
+        signal — `0` means queued. When it is present we trust it: a
+        non-zero code is a rejection, and a `0` is an accept even if the
+        top-level `errors` array is populated (that array can carry
+        informational entries on a good submit). Only when `result` is
+        absent (older slurmrestd) do we fall back to treating a populated
+        top-level `errors` array as the rejection signal.
+
+        Warnings (`warnings` array — e.g. the benign "nodes" type warning
+        slurmrestd emits on a valid submit) are intentionally NEVER
+        treated as fatal.
+
+        On rejection we raise tagged with a synthetic 4xx status (not
+        401) so `SlurmBackend._classify_submit_error` maps it to a
+        permanent CONTRACT_VIOLATION: re-submitting the same payload to an
+        unavailable partition / over a QOS limit won't succeed, so it must
+        not be retried like a transient transport failure."""
+        result = body.get("result")
+        error_code = result.get("error_code") if isinstance(result, dict) else None
+        errors = body.get("errors")
+        if isinstance(error_code, int):
+            rejected = error_code != 0
+        else:
+            # No usable result.error_code — fall back to the errors[] array.
+            rejected = isinstance(errors, list) and len(errors) > 0
+        if not rejected:
+            return
+        detail = result.get("error") if isinstance(result, dict) else None
+        raise SlurmrestdError(
+            "slurmrestd accepted the request (HTTP 200) but slurmctld rejected the "
+            f"submission: error_code={error_code} error={detail!r} errors={errors!r}",
+            # Synthetic — the HTTP layer said 200; this normalizes a
+            # logical rejection into the permanent-4xx classification bucket.
+            status_code=422,
+            url=url,
+            body=json.dumps(body),
+        )
 
     async def get_job(self, job_id: int) -> SlurmJobInfo:
         """GET /slurm/{api_version}/job/{job_id}. Returns a SlurmJobInfo
@@ -395,9 +525,13 @@ class SlurmrestdClient:
         *,
         json: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Issue one HTTP request. If the response is 401, re-read the
-        JWT file (handling SLURM's periodic rotation) and retry once;
-        if that also 401s, raise. Any other non-2xx raises immediately."""
+        """Issue one HTTP request. Proactively reload the JWT if it is near
+        expiry (before the request). If the response is still 401, re-read the
+        JWT file (handling SLURM's periodic rotation) and retry once; if that
+        also 401s, raise. Any other non-2xx raises immediately."""
+        # Refresh an about-to-expire token BEFORE sending, so recovery
+        # never hinges on slurmrestd returning a clean 401 for an expired JWT.
+        self._maybe_refresh_expiring_jwt()
         for attempt in (1, 2):
             try:
                 response = await self._http.request(
@@ -418,7 +552,13 @@ class SlurmrestdClient:
                 # JWT may have rotated since startup. Re-read and retry
                 # once. Don't loop — a second 401 means the file is
                 # actually wrong (mis-installed, permissions, etc).
-                self._jwt = self._load_jwt()
+                _log.warning(
+                    "slurmrestd %s %s returned 401; reloading JWT from %s and retrying once",
+                    method,
+                    url,
+                    self._jwt_path,
+                )
+                self._reload_jwt_from_file()
                 continue
 
             if response.status_code >= 400:

@@ -8,12 +8,16 @@ and the empty-input pre-check that both the orchestrator
 `MIINT_EXTENSION_DIRECTORY` env contract is single-sourced rather than copied
 into each.
 
-`MIINT_EXTENSION_REPO` points installs at the team mirror; without it, install
-pulls from the DuckDB community channel. The mirror implies
+miint always installs from the team mirror (default `MIINT_MIRROR_URL`;
+`MIINT_EXTENSION_REPO` overrides for a local/dev build) so every Qiita
+component runs the **same**, current build — the mirror is the single source of
+truth for the miint version, and pulling everyone from it avoids the
+community-vs-mirror patchwork where hosts drift to different builds.
+Installing from the mirror implies
 `allow_unsigned_extensions=true` (its signing chain is the team's own, not
 DuckDB's). `MIINT_EXTENSION_DIRECTORY` isolates the install directory so a
-mirror build doesn't clash with a community build in the shared default
-`~/.duckdb/extensions` — DuckDB refuses a plain INSTALL when a cached
+mirror build doesn't clash with another origin's cached extension in the shared
+default `~/.duckdb/extensions` — DuckDB refuses a plain INSTALL when a cached
 extension's origin differs.
 """
 
@@ -27,13 +31,19 @@ from pathlib import Path
 MIINT_MIRROR_URL = "https://ftp.microbio.me/pub/miint"
 
 
+def _miint_repo() -> str:
+    """The miint extension repo. Defaults to the team mirror so every Qiita
+    component installs the SAME, current build — no community-vs-mirror
+    patchwork where hosts drift to different builds. `MIINT_EXTENSION_REPO`
+    overrides for a local/dev extension build."""
+    return os.environ.get("MIINT_EXTENSION_REPO") or MIINT_MIRROR_URL
+
+
 def miint_connect_config() -> dict[str, str]:
-    """DuckDB `connect()` config for loading miint: allow unsigned extensions
-    when a mirror repo is set, and isolate the extension directory when one is
-    configured. An empty dict means a plain `duckdb.connect(":memory:")`."""
-    config: dict[str, str] = {}
-    if os.environ.get("MIINT_EXTENSION_REPO") is not None:
-        config["allow_unsigned_extensions"] = "true"
+    """DuckDB `connect()` config for loading miint. miint always installs from
+    a mirror (the team's signing chain, not DuckDB's), so unsigned extensions
+    are always allowed; the extension directory is isolated when configured."""
+    config: dict[str, str] = {"allow_unsigned_extensions": "true"}
     ext_dir = os.environ.get("MIINT_EXTENSION_DIRECTORY")
     if ext_dir:
         config["extension_directory"] = ext_dir
@@ -41,10 +51,11 @@ def miint_connect_config() -> dict[str, str]:
 
 
 def miint_install_sql() -> str:
-    """The INSTALL statement for miint: FORCE INSTALL from the mirror when
-    MIINT_EXTENSION_REPO is set, else INSTALL FROM the community channel."""
-    repo = os.environ.get("MIINT_EXTENSION_REPO")
-    return f"FORCE INSTALL miint FROM '{repo}';" if repo else "INSTALL miint FROM community;"
+    """The INSTALL statement for miint: always FORCE INSTALL from the mirror
+    (`MIINT_EXTENSION_REPO` override, else `MIINT_MIRROR_URL`). FORCE overwrites
+    a stale cached extension so a compute node always runs the mirror's current
+    build instead of whatever it happened to cache earlier."""
+    return f"FORCE INSTALL miint FROM '{_miint_repo()}';"
 
 
 def is_empty_sequence_file(path: Path) -> bool:

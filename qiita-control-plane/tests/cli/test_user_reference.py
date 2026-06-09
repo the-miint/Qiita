@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 from pathlib import Path
 
 import duckdb
@@ -558,6 +559,68 @@ async def test_do_reference_load_local_zero_doput(
     assert submit_call[2]["scope_target"] == {"kind": "reference", "reference_idx": 999}
 
 
+async def test_do_reference_load_local_missing_manifest_warns_not_raises(
+    tmp_path, taxonomy_file, cp_transport, caplog
+):
+    """`--local` must NOT hard-fail when the manifest isn't visible from the
+    CLI host: the manifest is read on the compute node (whose shared-FS view
+    the CLI may not share — e.g. a login node), exactly like the companions,
+    which are never existence-checked. A not-visible path warns (so a real
+    typo is still flagged) and proceeds, submitting the path as-authored."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    # Absolute (satisfies the server-side `^/` contract) but not present here.
+    missing = tmp_path / "shared-fs-not-mounted-here" / "manifest.txt"
+    assert missing.is_absolute() and not missing.exists()
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with caplog.at_level(logging.WARNING, logger="qiita_control_plane.cli.reference_load"):
+            result = await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                local=True,
+                fasta_manifest_path=missing,
+                taxonomy_path=taxonomy_file,
+                name="local-ref",
+                version="1.0",
+                watch=False,
+            )
+
+    # Did NOT raise; the manifest path is submitted as-authored for the compute
+    # node to read.
+    assert result["reference_idx"] == 999
+    submit_call = next(c for c in calls if c[1] == URL_WORK_TICKET_PREFIX and c[0] == "POST")
+    assert submit_call[2]["action_context"]["fasta_manifest_path"] == str(missing)
+    # But it warned, so a genuine typo isn't swallowed silently.
+    assert any(
+        "fasta-manifest" in r.message and "not visible" in r.message.lower() for r in caplog.records
+    )
+
+
+async def test_do_reference_load_local_relative_manifest_still_raises(taxonomy_file, cp_transport):
+    """The absoluteness check is unchanged — a relative manifest is a real
+    client-side error (the server's context_schema enforces `^/`), so it still
+    raises rather than warning."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, _calls = cp_transport
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(ValueError, match="must be absolute"):
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                local=True,
+                fasta_manifest_path=Path("relative/manifest.txt"),
+                taxonomy_path=taxonomy_file,
+                name="local-ref",
+                version="1.0",
+                watch=False,
+            )
+
+
 async def test_do_reference_load_local_host_selects_host_action(
     manifest_file, taxonomy_file, cp_transport
 ):
@@ -672,27 +735,6 @@ async def test_do_reference_load_local_rejects_relative_manifest(cp_transport):
                 flight_client=FakeFlightClient(),
                 local=True,
                 fasta_manifest_path=Path("relative/manifest.txt"),
-                name="local-ref",
-                version="1.0",
-                watch=False,
-            )
-    assert calls == []
-
-
-async def test_do_reference_load_local_rejects_missing_manifest(tmp_path, cp_transport):
-    """An absolute manifest path that doesn't exist → error before any wire call."""
-    from qiita_control_plane.cli.reference_load import do_reference_load
-
-    transport, calls = cp_transport
-
-    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
-        with pytest.raises(ValueError, match="not found|exist"):
-            await do_reference_load(
-                http=http,
-                token="t",
-                flight_client=FakeFlightClient(),
-                local=True,
-                fasta_manifest_path=tmp_path / "nope.txt",
                 name="local-ref",
                 version="1.0",
                 watch=False,

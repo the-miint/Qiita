@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 
 import httpx
 import pytest
@@ -22,17 +23,21 @@ from qiita_compute_orchestrator.slurm import (
 )
 
 
-def _make_jwt(sun: str) -> str:
+def _make_jwt(sun: str, *, exp: float | None = None) -> str:
     """Build a minimal JWT-shaped string (header.payload.signature) with
-    the given `sun` claim. The signature segment is a placeholder —
-    we never verify it; slurmrestd does. The client's only crypto-free
-    check is that `sun` matches the configured user."""
+    the given `sun` claim (and optional `exp` expiry, a Unix timestamp). The
+    signature segment is a placeholder — we never verify it; slurmrestd does.
+    The client's only crypto-free checks are that `sun` matches the configured
+    user and, for proactive refresh, the `exp` claim."""
 
     def _b64url(obj: dict) -> str:
         return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
 
     header = _b64url({"alg": "HS256", "typ": "JWT"})
-    payload = _b64url({"sun": sun})
+    claims: dict = {"sun": sun}
+    if exp is not None:
+        claims["exp"] = exp
+    payload = _b64url(claims)
     return f"{header}.{payload}.placeholder-signature"
 
 
@@ -180,9 +185,11 @@ async def test_submit_job_happy_path(jwt_path):
 
 @pytest.mark.asyncio
 async def test_submit_job_missing_job_id_raises(jwt_path):
-    handler = httpx.MockTransport(
-        lambda req: httpx.Response(200, json={"errors": ["something happened"]})
-    )
+    # No job_id, no error_code, and no top-level errors[] — slurmrestd
+    # accepted the request but gave us back a body we can't read a job_id
+    # out of. (A body carrying errors[] is exercised separately below as a
+    # *rejected* submit, which is caught before the missing-id guard.)
+    handler = httpx.MockTransport(lambda req: httpx.Response(200, json={"warnings": []}))
     async with _client(handler, jwt_path) as client:
         with pytest.raises(SlurmrestdError, match="missing or non-integer job_id"):
             await client.submit_job({})
@@ -219,6 +226,102 @@ async def test_submit_job_transport_error_raises(jwt_path):
     # Transport errors carry no status_code — caller distinguishes
     # this from 4xx/5xx via .status_code is None.
     assert ei.value.status_code is None
+
+
+@pytest.mark.asyncio
+async def test_submit_job_200_with_nonzero_result_error_code_raises(jwt_path):
+    """slurmrestd can answer HTTP 200 while slurmctld *rejected* the
+    submission — the real outcome lives in result.error_code (0 ==
+    accepted). A non-zero code (e.g. 2015, partition unavailable) must
+    raise, not be mis-read as a successful submit."""
+    handler = httpx.MockTransport(
+        lambda req: httpx.Response(
+            200,
+            json={
+                # job_id echoed but meaningless — the job was NOT queued.
+                "job_id": 0,
+                "result": {
+                    "job_id": 0,
+                    "error_code": 2015,
+                    "error": "Requested partition configuration not available now",
+                },
+                "warnings": [],
+            },
+        )
+    )
+    async with _client(handler, jwt_path) as client:
+        with pytest.raises(SlurmrestdError) as ei:
+            await client.submit_job({})
+    assert "2015" in str(ei.value)
+    # Tagged 4xx-but-not-401 so SlurmBackend._classify_submit_error treats
+    # a rejected submit as a permanent CONTRACT_VIOLATION, not a retriable
+    # transport/auth failure.
+    assert ei.value.status_code is not None
+    assert 400 <= ei.value.status_code < 500
+    assert ei.value.status_code != 401
+
+
+@pytest.mark.asyncio
+async def test_submit_job_200_with_top_level_errors_raises(jwt_path):
+    """A populated top-level errors[] array on a 200 also means the
+    submission was rejected — even if a job_id is echoed."""
+    handler = httpx.MockTransport(
+        lambda req: httpx.Response(
+            200,
+            json={
+                "job_id": 999,
+                "errors": [{"error": "Access/permission denied", "error_number": 2007}],
+            },
+        )
+    )
+    async with _client(handler, jwt_path) as client:
+        with pytest.raises(SlurmrestdError) as ei:
+            await client.submit_job({})
+    assert ei.value.status_code is not None
+    assert 400 <= ei.value.status_code < 500
+    assert ei.value.status_code != 401
+
+
+@pytest.mark.asyncio
+async def test_submit_job_200_error_code_zero_is_authoritative_over_errors(jwt_path):
+    """`result.error_code == 0` means slurmctld queued the job — it is the
+    authoritative accept signal and is NOT overridden by a populated
+    top-level errors[] (which can carry informational entries on a good
+    submit). The job_id must be returned, not rejected."""
+    handler = httpx.MockTransport(
+        lambda req: httpx.Response(
+            200,
+            json={
+                "job_id": 4242,
+                "result": {"job_id": 4242, "error_code": 0, "error": ""},
+                "errors": [{"description": "informational note, not a rejection"}],
+            },
+        )
+    )
+    async with _client(handler, jwt_path) as client:
+        job_id = await client.submit_job({})
+    assert job_id == 4242
+
+
+@pytest.mark.asyncio
+async def test_submit_job_200_warnings_are_non_fatal(jwt_path):
+    """slurmrestd emits warnings[] (e.g. the 'nodes' type warning) on a
+    perfectly good submit. error_code == 0 + a real job_id + only
+    warnings means success — warnings must NOT fail the submit."""
+    handler = httpx.MockTransport(
+        lambda req: httpx.Response(
+            200,
+            json={
+                "job_id": 4242,
+                "result": {"job_id": 4242, "error_code": 0, "error": ""},
+                "errors": [],
+                "warnings": [{"description": "Unexpected key 'nodes'"}],
+            },
+        )
+    )
+    async with _client(handler, jwt_path) as client:
+        job_id = await client.submit_job({})
+    assert job_id == 4242
 
 
 # ============================================================================
@@ -436,6 +539,141 @@ async def test_double_401_raises(jwt_path):
         with pytest.raises(SlurmrestdError) as ei:
             await client.submit_job({})
     assert ei.value.status_code == 401
+
+
+# ============================================================================
+# Proactive JWT refresh: reload before expiry, not only after a 401
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_near_expired_jwt_proactively_reloaded_without_401(jwt_path):
+    """A JWT cached at construction within the refresh margin of its `exp` is
+    reloaded from the file BEFORE the next request fires — no 401 round-trip
+    needed. Belt-and-suspenders for the case where slurmrestd rejects an
+    expired token with something other than a clean 401 (5xx / dropped
+    connection), so the reload-on-401 path never triggers and the orchestrator
+    would otherwise run on a boot-cached token until restart."""
+    now = time.time()
+    near_expired = _make_jwt("qiita-orch", exp=now + 5)  # inside the refresh margin
+    fresh = _make_jwt("qiita-orch", exp=now + 3600)
+    jwt_path.write_text(near_expired + "\n")
+
+    seen: list[str] = []
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers["x-slurm-user-token"])
+        calls["n"] += 1
+        return httpx.Response(200, json={"job_id": 11})
+
+    async with _client(httpx.MockTransport(handler), jwt_path) as client:
+        # SLURM rotated a fresh token into the file after we cached the
+        # near-expired one.
+        jwt_path.write_text(fresh + "\n")
+        job_id = await client.submit_job({})
+
+    assert job_id == 11
+    assert calls["n"] == 1  # exactly one request — no 401 retry
+    assert seen == [fresh]  # proactively reloaded the fresh token before sending
+
+
+@pytest.mark.asyncio
+async def test_valid_jwt_not_proactively_reloaded(jwt_path):
+    """A cached JWT comfortably before expiry is NOT reloaded — the proactive
+    refresh fires only within the margin, so a healthy token keeps being used
+    (no needless file read per request) even if the file changes underneath."""
+    now = time.time()
+    valid = _make_jwt("qiita-orch", exp=now + 3600)
+    rotated = _make_jwt("qiita-orch", exp=now + 7200) + "-rotated"
+    jwt_path.write_text(valid + "\n")
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers["x-slurm-user-token"])
+        return httpx.Response(200, json={"job_id": 12})
+
+    async with _client(httpx.MockTransport(handler), jwt_path) as client:
+        jwt_path.write_text(rotated + "\n")  # file changes, but cached token is healthy
+        await client.submit_job({})
+
+    assert seen == [valid]  # used the cached token; no proactive reload
+
+
+@pytest.mark.asyncio
+async def test_jwt_without_exp_claim_not_proactively_reloaded(jwt_path):
+    """A JWT with no `exp` claim has no expiry to check, so the proactive
+    refresh is a no-op and the client falls back to reload-on-401 — the cached
+    token is used as-is until slurmrestd 401s. (The jwt_path fixture mints an
+    exp-less token.)"""
+    original = jwt_path.read_text().strip()
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers["x-slurm-user-token"])
+        return httpx.Response(200, json={"job_id": 13})
+
+    async with _client(httpx.MockTransport(handler), jwt_path) as client:
+        jwt_path.write_text(_make_jwt("qiita-orch") + "-changed\n")
+        await client.submit_job({})
+
+    assert seen == [original]  # no exp → no proactive reload
+
+
+@pytest.mark.asyncio
+async def test_proactive_refresh_file_blip_proceeds_with_cached_token(jwt_path):
+    """A transient file-read failure during the proactive-refresh window must
+    NOT abort a request — the cached token is still within its validity (the
+    60s margin), so the request proceeds with it (and the reload-on-401 path
+    remains the fallback for a genuinely expired token)."""
+    now = time.time()
+    near_expired = _make_jwt("qiita-orch", exp=now + 5)  # within the margin → refresh fires
+    jwt_path.write_text(near_expired + "\n")
+
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers["x-slurm-user-token"])
+        return httpx.Response(200, json={"job_id": 14})
+
+    async with _client(httpx.MockTransport(handler), jwt_path) as client:
+        # Simulate the rotation script mid-write: the file is momentarily empty
+        # when the proactive refresh tries to read it.
+        jwt_path.write_text("")
+        job_id = await client.submit_job({})
+
+    assert job_id == 14
+    assert seen == [near_expired]  # used the still-valid cached token, did not abort
+
+
+@pytest.mark.asyncio
+async def test_401_reload_refreshes_cached_exp(jwt_path):
+    """The reload-on-401 path goes through the same single mutation point, so it
+    updates the cached `exp` too — a token rotated in via a 401 reload is then
+    governed by ITS expiry for the next proactive refresh, not the old one."""
+    now = time.time()
+    # Cached token sits comfortably beyond the margin so proactive refresh does
+    # NOT fire — isolating the 401-reload's effect on _jwt_exp.
+    original = _make_jwt("qiita-orch", exp=now + 3600)
+    rotated_exp = now + 7200
+    rotated = _make_jwt("qiita-orch", exp=rotated_exp)
+    jwt_path.write_text(original + "\n")
+
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(401, json={"errors": ["expired"]})
+        return httpx.Response(200, json={"job_id": 15})
+
+    async with _client(httpx.MockTransport(handler), jwt_path) as client:
+        assert client._jwt_exp == now + 3600
+        jwt_path.write_text(rotated + "\n")
+        await client.submit_job({})
+        # The 401 reload picked up the rotated token AND its expiry.
+        assert client._jwt_exp == rotated_exp
 
 
 # ============================================================================
