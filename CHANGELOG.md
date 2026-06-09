@@ -15,6 +15,8 @@ the `no-changelog` label).
 
 ### Changed
 
+- `matrix_tube_id` must now be exactly 10 digits (previously 8–10), tightened on
+  both the Pydantic field pattern and the `qiita.biosample` column CHECK (#TBD)
 - Biosample/sequenced-sample create and biosample patch now take a checklist
   **name** (e.g. `ERC000015`) instead of a `metadata_checklist_idx`, resolving
   it to the idx server-side and returning a clean 422 for an unknown name —

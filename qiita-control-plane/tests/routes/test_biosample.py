@@ -725,11 +725,11 @@ async def test_post_biosample_bad_matrix_tube_id_format_422(ctx, bad_value):
     assert resp.status_code == 422
 
 
-@pytest.mark.parametrize("bad_value", ["1234567", "12345678901", "1" * 51])
+@pytest.mark.parametrize("bad_value", ["1234567", "12345678", "123456789", "12345678901", "1" * 51])
 async def test_post_biosample_bad_matrix_tube_id_length_422(ctx, bad_value):
-    """Tests the case where matrix_tube_id falls outside the 8-10 digit
-    length range: the Pydantic validator on BiosampleImportRequest rejects
-    the body at the wire boundary with 422.
+    """Tests the case where matrix_tube_id is not exactly 10 digits long:
+    the Pydantic validator on BiosampleImportRequest rejects the body at
+    the wire boundary with 422.
     """
     study_idx = await _seed_study(
         ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="tube-long"

@@ -34,14 +34,14 @@ from qiita_common.auth_constants import (  # noqa: F401
 ORCID_PATTERN = r"^\d{4}-\d{4}-\d{4}-\d{3}[\dX]$"
 
 # matrix_tube_id values are digit-only (per local convention) and may carry
-# leading zeros; the {8,10} quantifier also rejects the empty string and
-# bounds the length range.
+# leading zeros; the {10} quantifier fixes the length at exactly ten digits
+# and rejects the empty string.
 #
 # Deliberately duplicated with the column-level CHECK on
 # qiita.biosample.matrix_tube_id: the Pydantic side fails at the wire
 # boundary with a per-field 422; the DB side is the last line of defense.
 # Change one and you must change the other in the same PR.
-MATRIX_TUBE_ID_PATTERN = r"^[0-9]{8,10}$"  # same-pattern-ok: DB CHECK parity (see above)
+MATRIX_TUBE_ID_PATTERN = r"^[0-9]{10}$"  # same-pattern-ok: DB CHECK parity (see above)
 
 
 class HealthStatus(StrEnum):
