@@ -840,7 +840,7 @@ async def _reset_reference_scope_for_redrive(
     conn: asyncpg.Connection, work_ticket: asyncpg.Record
 ) -> None:
     """On a FAILED→PENDING redrive, reset a `reference` scope_target back to
-    `pending` (F8).
+    `pending`.
 
     A failed reference workflow leaves its reference at `failed` (the
     failure_status PATCH put it there), and the reference FSM's only legal
@@ -977,7 +977,7 @@ async def run_work_ticket(
                     detail="work_ticket state changed under /run; retry",
                 )
 
-            # F9: drop every non-`completed` work_ticket_step row. The runner
+            # Drop every non-`completed` work_ticket_step row. The runner
             # re-enters each not-yet-completed entry at attempt 0, but a prior
             # FAILED run left terminal `failed` rows behind; re-using that
             # attempt would collide (the step_progress writers reject any

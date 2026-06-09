@@ -10,9 +10,10 @@ into each.
 
 miint always installs from the team mirror (default `MIINT_MIRROR_URL`;
 `MIINT_EXTENSION_REPO` overrides for a local/dev build) so every Qiita
-component runs the **same** build — no community-vs-mirror patchwork that lets
-one host's `read_fastx` drift from another's (design note: F10 in
-docs/design/reference-load-resilience.md). Installing from the mirror implies
+component runs the **same**, current build — the mirror is the single source of
+truth for the miint version, and pulling everyone from it avoids the
+community-vs-mirror patchwork where hosts drift to different builds.
+Installing from the mirror implies
 `allow_unsigned_extensions=true` (its signing chain is the team's own, not
 DuckDB's). `MIINT_EXTENSION_DIRECTORY` isolates the install directory so a
 mirror build doesn't clash with another origin's cached extension in the shared
@@ -32,9 +33,9 @@ MIINT_MIRROR_URL = "https://ftp.microbio.me/pub/miint"
 
 def _miint_repo() -> str:
     """The miint extension repo. Defaults to the team mirror so every Qiita
-    component installs the SAME build — no community-vs-mirror patchwork that
-    lets one host's `read_fastx` drift from another's (design note F10).
-    `MIINT_EXTENSION_REPO` overrides for a local/dev extension build."""
+    component installs the SAME, current build — no community-vs-mirror
+    patchwork where hosts drift to different builds. `MIINT_EXTENSION_REPO`
+    overrides for a local/dev extension build."""
     return os.environ.get("MIINT_EXTENSION_REPO") or MIINT_MIRROR_URL
 
 
@@ -52,8 +53,8 @@ def miint_connect_config() -> dict[str, str]:
 def miint_install_sql() -> str:
     """The INSTALL statement for miint: always FORCE INSTALL from the mirror
     (`MIINT_EXTENSION_REPO` override, else `MIINT_MIRROR_URL`). FORCE overwrites
-    a stale cached extension so a compute node can't keep serving an old
-    `read_fastx` signature."""
+    a stale cached extension so a compute node always runs the mirror's current
+    build instead of whatever it happened to cache earlier."""
     return f"FORCE INSTALL miint FROM '{_miint_repo()}';"
 
 

@@ -58,7 +58,7 @@ _HTTP_TIMEOUT_SECONDS = 30
 
 # Proactively reload the SLURM JWT from its file once the cached token is
 # within this many seconds of its `exp` claim, BEFORE a request — rather than
-# waiting for slurmrestd to reject it with a 401 (F1). slurmrestd does not
+# waiting for slurmrestd to reject it with a 401. slurmrestd does not
 # always answer an expired token with a clean 401 (it may 5xx or drop the
 # connection), and the reload-on-401 path only fires on a 401; without this a
 # long-lived orchestrator can run on a boot-cached token past its expiry until
@@ -310,7 +310,7 @@ class SlurmrestdClient:
 
     def _maybe_refresh_expiring_jwt(self) -> None:
         """Reload the JWT from its file if the cached token is within
-        `_JWT_REFRESH_MARGIN_SECONDS` of its `exp` (F1) — before sending the
+        `_JWT_REFRESH_MARGIN_SECONDS` of its `exp` — before sending the
         request, so we never depend on slurmrestd answering an expired token
         with a clean 401. No-op when the token has no `exp` claim."""
         if self._jwt_exp is None:
@@ -372,12 +372,12 @@ class SlurmrestdClient:
         the submission (bad partition, QOS limit, ...) — the real outcome
         rides in `result.error_code` (0 == accepted) and the top-level
         `errors` array. We surface those as a *permanent* failure before
-        trusting any echoed job_id (F4)."""
+        trusting any echoed job_id."""
         url = f"/slurm/{self._api_version}/job/submit"
         body = await self._post_with_jwt_retry(url, json=payload)
         # Rejection check FIRST: on a rejected submit slurmrestd still
         # echoes a (meaningless, usually 0) job_id, so trusting the id
-        # before checking the outcome is exactly the F4 bug.
+        # before checking the outcome is exactly the bug.
         self._raise_if_submit_rejected(body, url)
         # slurmrestd returns {"job_id": <int>, ...}; pull the id out.
         job_id = body.get("job_id")
@@ -529,7 +529,7 @@ class SlurmrestdClient:
         expiry (before the request). If the response is still 401, re-read the
         JWT file (handling SLURM's periodic rotation) and retry once; if that
         also 401s, raise. Any other non-2xx raises immediately."""
-        # F1: refresh an about-to-expire token BEFORE sending, so recovery
+        # Refresh an about-to-expire token BEFORE sending, so recovery
         # never hinges on slurmrestd returning a clean 401 for an expired JWT.
         self._maybe_refresh_expiring_jwt()
         for attempt in (1, 2):

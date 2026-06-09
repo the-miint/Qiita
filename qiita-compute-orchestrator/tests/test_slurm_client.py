@@ -233,7 +233,7 @@ async def test_submit_job_200_with_nonzero_result_error_code_raises(jwt_path):
     """slurmrestd can answer HTTP 200 while slurmctld *rejected* the
     submission — the real outcome lives in result.error_code (0 ==
     accepted). A non-zero code (e.g. 2015, partition unavailable) must
-    raise, not be mis-read as a successful submit (F4)."""
+    raise, not be mis-read as a successful submit."""
     handler = httpx.MockTransport(
         lambda req: httpx.Response(
             200,
@@ -542,7 +542,7 @@ async def test_double_401_raises(jwt_path):
 
 
 # ============================================================================
-# Proactive JWT refresh (F1): reload before expiry, not only after a 401
+# Proactive JWT refresh: reload before expiry, not only after a 401
 # ============================================================================
 
 
@@ -550,7 +550,7 @@ async def test_double_401_raises(jwt_path):
 async def test_near_expired_jwt_proactively_reloaded_without_401(jwt_path):
     """A JWT cached at construction within the refresh margin of its `exp` is
     reloaded from the file BEFORE the next request fires — no 401 round-trip
-    needed (F1). Belt-and-suspenders for the case where slurmrestd rejects an
+    needed. Belt-and-suspenders for the case where slurmrestd rejects an
     expired token with something other than a clean 401 (5xx / dropped
     connection), so the reload-on-401 path never triggers and the orchestrator
     would otherwise run on a boot-cached token until restart."""

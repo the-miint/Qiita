@@ -566,7 +566,7 @@ async def test_do_reference_load_local_missing_manifest_warns_not_raises(
     CLI host: the manifest is read on the compute node (whose shared-FS view
     the CLI may not share — e.g. a login node), exactly like the companions,
     which are never existence-checked. A not-visible path warns (so a real
-    typo is still flagged) and proceeds, submitting the path as-authored (F5)."""
+    typo is still flagged) and proceeds, submitting the path as-authored."""
     from qiita_control_plane.cli.reference_load import do_reference_load
 
     transport, calls = cp_transport

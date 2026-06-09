@@ -1,7 +1,7 @@
 """Unit tests for the single-sourced miint install/connect helpers.
 
 These pin the "one mirror version everywhere — no community/mirror patchwork"
-contract (design note: docs/design/reference-load-resilience.md, F10): with no
+contract: with no
 ``MIINT_EXTENSION_REPO`` override, installs FORCE-install from the team mirror
 (never the community channel, which would let a host drift to a different
 build), and connections always allow the mirror's unsigned extensions.

@@ -717,7 +717,7 @@ async def test_run_step_submit_200_with_error_code_is_contract_violation(
     """slurmrestd HTTP 200 carrying a non-zero result.error_code (the job
     was rejected by slurmctld, e.g. partition unavailable) => permanent
     CONTRACT_VIOLATION, not a successful submit and not a retriable
-    transport failure (F4)."""
+    transport failure."""
     handler = httpx.MockTransport(
         lambda req: httpx.Response(
             200,

@@ -20,7 +20,7 @@ the `no-changelog` label).
   matching `qiita.work_ticket` columns. While the runner retries an unreachable
   orchestrator/slurmrestd in place, it records *why* and *since when* so a
   ticket stuck in `processing` is explainable instead of looking silently
-  wedged; cleared once it makes progress or fails (F3) (#80)
+  wedged; cleared once it makes progress or fails (#80)
 - `GET /work-ticket` — list work tickets, each with a snapshot of its current
   step's compute placement (`compute_target`, `slurm_job_id`, `step_state`,
   `current_step_index/name`) from a single join against the new
@@ -83,7 +83,7 @@ the `no-changelog` label).
   session / HPC login node / CI runner you carry the PAT instead — log in once
   on a browser machine, then `export QIITA_TOKEN=…` (+ `QIITA_CONTROL_PLANE_URL`)
   on the headless host. `$QIITA_TOKEN` already took precedence over the token
-  file; this just makes the supported path discoverable (F6) (#80)
+  file; this just makes the supported path discoverable (#80)
 - miint now installs from the team mirror by default in every component (CP CLI,
   CO service, native SLURM jobs): `miint_install_sql()` always `FORCE INSTALL`s
   from `MIINT_MIRROR_URL` (override with `MIINT_EXTENSION_REPO`) instead of
@@ -162,7 +162,7 @@ the `no-changelog` label).
   by `stage_local_fasta` on the compute node, not by the CLI, so a missing path
   is now a warning (still flags a real typo) and the submit proceeds —
   consistent with the companion paths, which were never existence-checked. The
-  absoluteness check is unchanged (a relative path still errors) (F5) (#80)
+  absoluteness check is unchanged (a relative path still errors) (#80)
 - SLURM JWT recovery no longer depends on a clean 401. `SlurmrestdClient` now
   proactively reloads the JWT from its file when the cached token is within 60s
   of its `exp`, *before* sending the request — so a long-lived orchestrator
@@ -171,21 +171,21 @@ the `no-changelog` label).
   (the reload-on-401 path only fires on a 401). The 401-reload path is kept as a
   fallback, and both the 401 reload and the submit-error classification now log
   the exact status so the next stuck-on-submit incident is diagnosable without a
-  repro (F1) (#80)
+  repro (#80)
 - The runner's in-place infra-unreachable retry is now escapable and bounded.
   An operator `qiita-admin ticket force-fail` (a direct-DB FAILED transition) is
   now noticed: every infra-retry/poll iteration re-checks the ticket's DB state
   and bails if it has gone terminal, instead of spinning forever against a
-  ticket it no longer owns — without clobbering the operator's failure surface
-  (F2). The retry sleep is now capped exponential backoff (base = poll interval,
+  ticket it no longer owns — without clobbering the operator's failure surface.
+  The retry sleep is now capped exponential backoff (base = poll interval,
   doubling to a 60s cap) rather than a flat hammer, and the never-fail-on-outage
-  invariant is preserved — there is still no hard give-up (F3) (#80)
+  invariant is preserved — there is still no hard give-up (#80)
 - Redriving a FAILED reference workflow via `POST /work-ticket/{idx}/run` now
-  actually works. Two redrive defects fixed in the same atomic reset: (F8) the
+  actually works. Two redrive defects fixed in the same atomic reset: the
   `reference` scope_target was left pinned at `failed`, so the redriven
   workflow's first status PATCH (`failed → hashing`) was illegal and the redrive
   died immediately — `/run` now resets the reference `failed → pending` (the
-  FSM's only legal exit from `failed`); (F9) the prior run's terminal `failed`
+  FSM's only legal exit from `failed`); the prior run's terminal `failed`
   `work_ticket_step` rows survived, so the runner's fresh attempt-0 collided with
   the dead row (the step-progress writers reject any transition out of `failed`)
   — `/run` now drops every non-`completed` step row (keeping `completed` ones so

@@ -587,7 +587,7 @@ class SlurmBackend(ComputeBackend):
         else:
             kind = FailureKind.CONTRACT_VIOLATION
         # Log the EXACT status + body before they're flattened into the
-        # BackendFailure reason. F1: a recurring "unreachable" submit failure
+        # BackendFailure reason. A recurring "unreachable" submit failure
         # was ambiguous in the logs (was it a 401, a 5xx, a transport drop?);
         # this records which, so the next stuck-on-submit incident is
         # diagnosable without a repro.

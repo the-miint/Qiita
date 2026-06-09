@@ -100,7 +100,7 @@ _INFRA_RETRY_BACKOFF_CAP_SECONDS = 60.0
 # `qiita-admin ticket force-fail` flips it to FAILED — the runner must stop:
 # the in-place infra-retry/poll loops re-check this each iteration and bail via
 # WorkflowAborted instead of retrying forever against a ticket that is no
-# longer theirs (F2).
+# longer theirs.
 _TERMINAL_WORK_TICKET_STATES = frozenset(
     {WorkTicketState.COMPLETED.value, WorkTicketState.FAILED.value}
 )
@@ -135,7 +135,7 @@ def _infra_backoff_delay(
 async def _raise_if_ticket_terminal(pool: asyncpg.Pool, work_ticket_idx: int) -> None:
     """Bail (WorkflowAborted) out of an in-place retry/poll loop if the ticket
     has gone terminal in the DB — an operator force-fail/cancel — so the runner
-    stops working a ticket it no longer owns (F2). A cheap one-column read run
+    stops working a ticket it no longer owns. A cheap one-column read run
     once per loop iteration.
 
     Like every runner DB call this assumes Postgres is reachable: a PG outage
@@ -152,8 +152,8 @@ async def _raise_if_ticket_terminal(pool: asyncpg.Pool, work_ticket_idx: int) ->
 
 
 async def _note_transient_retry(pool: asyncpg.Pool, work_ticket_idx: int, reason: str) -> None:
-    """Surface *why* the runner is retrying in place, for the status routes
-    (F3): refresh `transient_reason` and stamp `transient_since` on the first
+    """Surface *why* the runner is retrying in place, for the status routes:
+    refresh `transient_reason` and stamp `transient_since` on the first
     retry of this episode (COALESCE preserves the original start time)."""
     await pool.execute(
         "UPDATE qiita.work_ticket"
@@ -188,8 +188,8 @@ async def _infra_retry_wait(
     base: float,
 ) -> int:
     """One iteration of the in-place infra-unreachable retry: bail if the
-    ticket went terminal (F2), surface the reason (F3), then sleep with capped
-    backoff (F3). Returns the next backoff counter."""
+    ticket went terminal, surface the reason, then sleep with capped
+    backoff. Returns the next backoff counter."""
     await _raise_if_ticket_terminal(pool, work_ticket_idx)
     await _note_transient_retry(pool, work_ticket_idx, f"{what}: {kind.value}")
     await asyncio.sleep(_infra_backoff_delay(n, base=base))
@@ -1551,7 +1551,7 @@ async def _find_existing_job(
     Infra-unreachable failures (CO / slurmrestd down) retry in place — a
     recovery sweep must not fail a ticket because the orchestrator is briefly
     unreachable (the never-fail-on-outage rule) — with capped backoff, and
-    bailing if the ticket is force-failed mid-outage (F2/F3). A non-infra
+    bailing if the ticket is force-failed mid-outage. A non-infra
     BackendFailure (slurmrestd 4xx => 'job list unreadable') is swallowed to
     None: if we genuinely can't read the job list, fall back to a fresh submit
     (the gap's pre-closer behavior) rather than failing recovery. More than one
@@ -1681,7 +1681,7 @@ async def _poll_until_terminal(
             recorded_running = True
         # Normal poll cadence (a healthy in-flight job): flat, not backed off.
         # Still re-check for an operator force-fail so a long-running job's
-        # poll loop is escapable, not just the outage retry (F2).
+        # poll loop is escapable, not just the outage retry.
         await _raise_if_ticket_terminal(pool, work_ticket_idx)
         await asyncio.sleep(poll_interval_seconds)
 
@@ -1696,8 +1696,8 @@ async def _result_with_infra_retry(
     poll_interval_seconds: float,
 ) -> dict[str, Path]:
     """Fetch the terminal step's verified result, retrying in place on an
-    infra-unreachable failure (CO down) with capped backoff + a force-fail bail
-    (F2/F3). A genuine step failure — the job ended FAILED, so `result_step`
+    infra-unreachable failure (CO down) with capped backoff + a force-fail bail.
+    A genuine step failure — the job ended FAILED, so `result_step`
     raises the classified BackendFailure — propagates to the caller, which
     records it and lets the retry loop decide."""
     n = 0

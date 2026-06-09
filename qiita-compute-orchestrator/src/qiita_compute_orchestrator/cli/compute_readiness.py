@@ -259,13 +259,15 @@ else
     echo "{_PROBE_LINE_PREFIX} native-import=fail"
 fi
 
-# miint must LOAD on the compute node and its read_fastx must accept the
-# `max_batch_bytes` named param that stage_local_fasta / reference_load issue.
-# A stale cached extension (a community build, or a pre-max_batch_bytes mirror
-# build) binds wrong and fails the real job with a BinderError — catch it here,
-# at deploy, not at the first reference-load job (F10). Runs the exact bind via
-# the single-sourced install path, so it also proves the mirror reaches this
-# node. chr(10) builds the FASTA's newlines: a literal `\n` here would be
+# miint must install from the mirror and LOAD on the compute node, and the
+# core ingest call the jobs issue (read_fastx) must run. A stale cached
+# extension, an unreachable mirror, or an otherwise-wrong build fails the real
+# job — catch it here, at deploy, not at the first reference-load job. Runs the
+# install via the single-sourced path (so it also proves the mirror reaches
+# this node) and exercises read_fastx in the shape stage_local_fasta /
+# reference_load use; the goal is "this node runs a current, usable miint", not
+# any single function or parameter. chr(10) builds the FASTA's newlines: a
+# literal `\n` here would be
 # expanded by THIS f-string into a real newline inside the generated Python
 # string literal — a syntax error in the probe script — so chr(10) sidesteps it.
 MIINT_PROBE="$(mktemp)"

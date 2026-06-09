@@ -1506,8 +1506,7 @@ async def test_get_work_ticket_surfaces_transient_reason(
 ):
     """The runner records why it is retrying an unreachable orchestrator in
     place on the ticket (transient_reason / transient_since); GET surfaces
-    them so a wedged-looking 'processing' ticket is explainable, not silent
-    (F3)."""
+    them so a wedged-looking 'processing' ticket is explainable, not silent."""
     token, admin_idx = admin_token
     action_id, version = reference_action
     idx = await _submit_reference_ticket(
@@ -1635,7 +1634,7 @@ async def test_run_on_failed_resets_reference_scope_target_to_pending(
     FSM's ONLY legal exit from 'failed' is '-> pending', so a redrive must
     reset the scope_target reference too — otherwise the redriven
     workflow's first status PATCH ('failed -> hashing') is illegal and the
-    redrive dies on the spot (F8). /run sends the reference back to
+    redrive dies on the spot. /run sends the reference back to
     'pending' so the workflow can re-walk pending -> hashing -> ...."""
     token, admin_idx = admin_token
     action_id, version = reference_action
@@ -1683,8 +1682,8 @@ async def test_run_on_failed_drops_dead_step_rows_keeps_completed(
     prior FAILED run leaves terminal 'failed' work_ticket_step rows behind.
     Re-using that attempt would collide — the step_progress writers reject
     any transition out of 'failed' (and record_failed refuses
-    failed->failed), so the redrive would die re-adjudicating the dead row
-    (F9). /run drops every non-'completed' step row so the redrive's
+    failed->failed), so the redrive would die re-adjudicating the dead row.
+    /run drops every non-'completed' step row so the redrive's
     attempt-0 writes land on a clean slate, while KEEPING 'completed' rows
     so the runner still fast-forwards already-finished steps."""
     token, admin_idx = admin_token

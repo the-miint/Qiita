@@ -262,8 +262,8 @@ def test_probe_script_emits_only_known_values():
 
 
 def test_probe_script_checks_miint_read_fastx():
-    """The probe verifies read_fastx accepts max_batch_bytes on the compute
-    node (F10 deploy guard) — a stale extension should fail at deploy, not at
+    """The probe installs+loads miint and runs the jobs' read_fastx call on the
+    compute node — a stale/unreachable/wrong build should fail at deploy, not at
     the first reference-load job."""
     script = cr.build_probe_script(path_scratch="/scratch/qiita")
     assert "miint-read-fastx=ok" in script

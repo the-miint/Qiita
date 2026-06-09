@@ -1987,12 +1987,12 @@ async def test_resume_co_unreachable_does_not_fail_ticket(postgres_pool, slurm_t
     assert row["failure_type"] is None
 
 
-# --- F2/F3: infra-retry escapability, backoff, visibility -------------------
+# --- infra-retry escapability, backoff, visibility -------------------
 
 
 def test_infra_backoff_delay_is_capped_exponential():
     """The in-place infra-retry backoff grows geometrically from the base
-    interval and is clamped at the cap (F3) — and base=0 (the test cadence)
+    interval and is clamped at the cap — and base=0 (the test cadence)
     stays 0 so suites never sleep."""
     from qiita_control_plane.runner import _infra_backoff_delay
 
@@ -2013,7 +2013,7 @@ def test_infra_backoff_delay_is_capped_exponential():
 async def test_infra_retry_bails_when_ticket_force_failed(postgres_pool, slurm_ticket, tmp_path):
     """An operator `force-fail` (a direct-DB FAILED transition) must stop the
     runner's in-place infra-unreachable retry loop, which otherwise spins
-    forever (F2). The runner re-checks the ticket's DB state each iteration
+    forever. The runner re-checks the ticket's DB state each iteration
     and bails when it has gone terminal — WITHOUT clobbering the operator's
     failure surface."""
     from qiita_common.backend_failure import BackendFailure, FailureKind
@@ -2072,7 +2072,7 @@ async def test_infra_retry_surfaces_then_clears_transient_reason(
 ):
     """While the runner retries an unreachable orchestrator in place, it
     surfaces *why* on the ticket (transient_reason / transient_since) so the
-    status route doesn't show a silently-wedged ticket (F3); once it makes
+    status route doesn't show a silently-wedged ticket; once it makes
     progress the marker is cleared."""
 
     class _CapturingBackend(FakeSlurmBackendClient):

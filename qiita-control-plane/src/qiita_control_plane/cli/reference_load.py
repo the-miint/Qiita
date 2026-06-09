@@ -537,7 +537,7 @@ async def do_reference_load(
         if not fasta_manifest_path.is_absolute():
             raise ValueError(f"--fasta-manifest must be absolute, got {str(fasta_manifest_path)!r}")
         if not fasta_manifest_path.exists() or not fasta_manifest_path.is_file():
-            # Do NOT hard-fail on existence (F5). The CLI may run on a host —
+            # Do NOT hard-fail on existence. The CLI may run on a host —
             # e.g. a login node — that doesn't share the compute node's
             # filesystem view, and the manifest is read by `stage_local_fasta`
             # on the compute node, never by the CLI. A missing path here may

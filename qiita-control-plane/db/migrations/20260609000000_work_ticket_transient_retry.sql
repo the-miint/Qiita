@@ -1,6 +1,6 @@
 -- migrate:up
 
--- Visibility for the runner's in-place infra-unreachable retry (F3). When a
+-- Visibility for the runner's in-place infra-unreachable retry. When a
 -- step's submit/poll/result call keeps failing because the orchestrator or
 -- slurmrestd is unreachable, the runner retries in place forever (the
 -- never-fail-on-outage rule) — previously with nothing surfaced, so a ticket

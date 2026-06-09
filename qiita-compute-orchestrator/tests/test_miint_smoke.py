@@ -1,14 +1,14 @@
-"""Smoke guard: the installed miint build must provide ``read_fastx`` with the
-``max_batch_bytes`` named parameter that ``stage_local_fasta`` and the CLI's
-``reference load`` both rely on.
+"""Smoke guard: the miint build the jobs depend on installs from the mirror,
+loads, and is actually usable.
 
-This is the durable guard for F10 (docs/design/reference-load-resilience.md): a
-consumer running a miint build whose ``read_fastx`` predates ``max_batch_bytes``
-fails here, loudly, instead of at the first reference-load SLURM job with a
-``Binder Error: Invalid named parameter "max_batch_bytes"``. It exercises the
-real install path (``miint_install_sql`` + ``miint_connect_config``), so it also
-catches community-vs-mirror drift — the install is single-sourced to the team
-mirror, so every component runs the same build.
+A consumer running a stale or wrong miint build (an old cached extension, or a
+community-vs-mirror mismatch) should fail here, loudly, instead of at the first
+reference-load SLURM job. The test exercises the real, single-sourced install
+path (``miint_install_sql`` + ``miint_connect_config``) and then runs
+``read_fastx`` — the core ingest call ``stage_local_fasta`` / ``reference load``
+issue — in the exact shape the jobs use, so a build that can't serve it is
+caught at test time. (``max_batch_bytes`` is one such job-issued parameter; the
+point is the current build is installed and runs, not any single param.)
 
 Lives in the orchestrator test tree (not ``qiita-common/tests``) because
 exercising the install needs ``duckdb``, a runtime dep of this component, not of
@@ -31,9 +31,10 @@ def miint_conn():
     conn.close()
 
 
-def test_read_fastx_accepts_max_batch_bytes(miint_conn, fasta_file):
-    """Binds + runs without a BinderException → the param exists in this build.
-    The exact call shape stage_local_fasta.py / reference_load.py issue."""
+def test_miint_installs_loads_and_read_fastx_runs(miint_conn, fasta_file):
+    """The mirror build installs + loads and serves the jobs' read_fastx call
+    (the exact shape stage_local_fasta.py / reference_load.py issue) without a
+    BinderException — i.e. this host runs a current, usable miint."""
     fasta_path, _records = fasta_file
     rows = miint_conn.execute(
         "SELECT read_id, sequence1 FROM read_fastx(?, max_batch_bytes:='64MB')",
