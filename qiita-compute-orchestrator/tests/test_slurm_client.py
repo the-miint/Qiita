@@ -180,9 +180,11 @@ async def test_submit_job_happy_path(jwt_path):
 
 @pytest.mark.asyncio
 async def test_submit_job_missing_job_id_raises(jwt_path):
-    handler = httpx.MockTransport(
-        lambda req: httpx.Response(200, json={"errors": ["something happened"]})
-    )
+    # No job_id, no error_code, and no top-level errors[] — slurmrestd
+    # accepted the request but gave us back a body we can't read a job_id
+    # out of. (A body carrying errors[] is exercised separately below as a
+    # *rejected* submit, which is caught before the missing-id guard.)
+    handler = httpx.MockTransport(lambda req: httpx.Response(200, json={"warnings": []}))
     async with _client(handler, jwt_path) as client:
         with pytest.raises(SlurmrestdError, match="missing or non-integer job_id"):
             await client.submit_job({})
@@ -219,6 +221,102 @@ async def test_submit_job_transport_error_raises(jwt_path):
     # Transport errors carry no status_code — caller distinguishes
     # this from 4xx/5xx via .status_code is None.
     assert ei.value.status_code is None
+
+
+@pytest.mark.asyncio
+async def test_submit_job_200_with_nonzero_result_error_code_raises(jwt_path):
+    """slurmrestd can answer HTTP 200 while slurmctld *rejected* the
+    submission — the real outcome lives in result.error_code (0 ==
+    accepted). A non-zero code (e.g. 2015, partition unavailable) must
+    raise, not be mis-read as a successful submit (F4)."""
+    handler = httpx.MockTransport(
+        lambda req: httpx.Response(
+            200,
+            json={
+                # job_id echoed but meaningless — the job was NOT queued.
+                "job_id": 0,
+                "result": {
+                    "job_id": 0,
+                    "error_code": 2015,
+                    "error": "Requested partition configuration not available now",
+                },
+                "warnings": [],
+            },
+        )
+    )
+    async with _client(handler, jwt_path) as client:
+        with pytest.raises(SlurmrestdError) as ei:
+            await client.submit_job({})
+    assert "2015" in str(ei.value)
+    # Tagged 4xx-but-not-401 so SlurmBackend._classify_submit_error treats
+    # a rejected submit as a permanent CONTRACT_VIOLATION, not a retriable
+    # transport/auth failure.
+    assert ei.value.status_code is not None
+    assert 400 <= ei.value.status_code < 500
+    assert ei.value.status_code != 401
+
+
+@pytest.mark.asyncio
+async def test_submit_job_200_with_top_level_errors_raises(jwt_path):
+    """A populated top-level errors[] array on a 200 also means the
+    submission was rejected — even if a job_id is echoed."""
+    handler = httpx.MockTransport(
+        lambda req: httpx.Response(
+            200,
+            json={
+                "job_id": 999,
+                "errors": [{"error": "Access/permission denied", "error_number": 2007}],
+            },
+        )
+    )
+    async with _client(handler, jwt_path) as client:
+        with pytest.raises(SlurmrestdError) as ei:
+            await client.submit_job({})
+    assert ei.value.status_code is not None
+    assert 400 <= ei.value.status_code < 500
+    assert ei.value.status_code != 401
+
+
+@pytest.mark.asyncio
+async def test_submit_job_200_error_code_zero_is_authoritative_over_errors(jwt_path):
+    """`result.error_code == 0` means slurmctld queued the job — it is the
+    authoritative accept signal and is NOT overridden by a populated
+    top-level errors[] (which can carry informational entries on a good
+    submit). The job_id must be returned, not rejected."""
+    handler = httpx.MockTransport(
+        lambda req: httpx.Response(
+            200,
+            json={
+                "job_id": 4242,
+                "result": {"job_id": 4242, "error_code": 0, "error": ""},
+                "errors": [{"description": "informational note, not a rejection"}],
+            },
+        )
+    )
+    async with _client(handler, jwt_path) as client:
+        job_id = await client.submit_job({})
+    assert job_id == 4242
+
+
+@pytest.mark.asyncio
+async def test_submit_job_200_warnings_are_non_fatal(jwt_path):
+    """slurmrestd emits warnings[] (e.g. the 'nodes' type warning) on a
+    perfectly good submit. error_code == 0 + a real job_id + only
+    warnings means success — warnings must NOT fail the submit."""
+    handler = httpx.MockTransport(
+        lambda req: httpx.Response(
+            200,
+            json={
+                "job_id": 4242,
+                "result": {"job_id": 4242, "error_code": 0, "error": ""},
+                "errors": [],
+                "warnings": [{"description": "Unexpected key 'nodes'"}],
+            },
+        )
+    )
+    async with _client(handler, jwt_path) as client:
+        job_id = await client.submit_job({})
+    assert job_id == 4242
 
 
 # ============================================================================

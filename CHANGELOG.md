@@ -144,6 +144,13 @@ the `no-changelog` label).
 
 ### Fixed
 
+- A rejected SLURM submit no longer looks like a success: slurmrestd answers
+  HTTP 200 even when slurmctld refuses the job (unavailable partition, QOS
+  limit, …), and `SlurmrestdClient.submit_job` trusted the echoed `job_id`
+  blindly. It now inspects `result.error_code` and the top-level `errors[]`
+  array first and raises (classified as a permanent `CONTRACT_VIOLATION`, since
+  re-submitting the same payload won't help); benign `warnings[]` (e.g. the
+  `nodes` type warning) stay non-fatal (#TBD)
 - Stale compute-environment failures now surface at deploy, not at the first
   job: `compute-readiness` probes that the compute node's miint build binds
   `read_fastx(max_batch_bytes:=…)` (the call `stage_local_fasta`/`reference load`

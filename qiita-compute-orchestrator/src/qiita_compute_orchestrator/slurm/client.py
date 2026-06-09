@@ -57,7 +57,14 @@ class SlurmrestdError(RuntimeError):
     """Wraps slurmrestd HTTP failures (non-2xx responses, transport
     errors). Carries enough context for SlurmBackend to classify into
     a BackendFailure: status code (None for transport-level errors),
-    URL, response body when available."""
+    URL, response body when available.
+
+    One case carries a *synthetic* status code: `submit_job` raises with
+    `status_code=422` when slurmrestd answered HTTP 200 but slurmctld
+    logically rejected the submission (`result.error_code != 0`). The
+    wire status was 200; the 422 exists only to route the failure to the
+    permanent-CONTRACT_VIOLATION bucket in `_classify_submit_error`. The
+    message and `body` make the real HTTP 200 explicit for log readers."""
 
     def __init__(
         self,
@@ -288,11 +295,21 @@ class SlurmrestdClient:
         Raises SlurmrestdError on any non-2xx or transport failure. The
         caller (SlurmBackend) classifies into a BackendFailure based on
         status_code (5xx / transport => SLURMRESTD_UNREACHABLE
-        retriable; 4xx => CONTRACT_VIOLATION permanent unless 401)."""
+        retriable; 4xx => CONTRACT_VIOLATION permanent unless 401).
+
+        Note: a successful HTTP exchange does NOT mean the job was
+        queued. slurmrestd answers HTTP 200 even when slurmctld rejected
+        the submission (bad partition, QOS limit, ...) — the real outcome
+        rides in `result.error_code` (0 == accepted) and the top-level
+        `errors` array. We surface those as a *permanent* failure before
+        trusting any echoed job_id (F4)."""
         url = f"/slurm/{self._api_version}/job/submit"
         body = await self._post_with_jwt_retry(url, json=payload)
-        # slurmrestd returns {"job_id": <int>, ...} (plus a possible
-        # "errors" array even on 2xx for warnings); pull the id out.
+        # Rejection check FIRST: on a rejected submit slurmrestd still
+        # echoes a (meaningless, usually 0) job_id, so trusting the id
+        # before checking the outcome is exactly the F4 bug.
+        self._raise_if_submit_rejected(body, url)
+        # slurmrestd returns {"job_id": <int>, ...}; pull the id out.
         job_id = body.get("job_id")
         if not isinstance(job_id, int):
             raise SlurmrestdError(
@@ -300,6 +317,49 @@ class SlurmrestdClient:
                 url=url,
             )
         return job_id
+
+    @staticmethod
+    def _raise_if_submit_rejected(body: dict[str, Any], url: str) -> None:
+        """Detect a job/submit that slurmrestd answered HTTP 200 but
+        slurmctld rejected.
+
+        `result.error_code` is slurmrestd's authoritative accept/reject
+        signal — `0` means queued. When it is present we trust it: a
+        non-zero code is a rejection, and a `0` is an accept even if the
+        top-level `errors` array is populated (that array can carry
+        informational entries on a good submit). Only when `result` is
+        absent (older slurmrestd) do we fall back to treating a populated
+        top-level `errors` array as the rejection signal.
+
+        Warnings (`warnings` array — e.g. the benign "nodes" type warning
+        slurmrestd emits on a valid submit) are intentionally NEVER
+        treated as fatal.
+
+        On rejection we raise tagged with a synthetic 4xx status (not
+        401) so `SlurmBackend._classify_submit_error` maps it to a
+        permanent CONTRACT_VIOLATION: re-submitting the same payload to an
+        unavailable partition / over a QOS limit won't succeed, so it must
+        not be retried like a transient transport failure."""
+        result = body.get("result")
+        error_code = result.get("error_code") if isinstance(result, dict) else None
+        errors = body.get("errors")
+        if isinstance(error_code, int):
+            rejected = error_code != 0
+        else:
+            # No usable result.error_code — fall back to the errors[] array.
+            rejected = isinstance(errors, list) and len(errors) > 0
+        if not rejected:
+            return
+        detail = result.get("error") if isinstance(result, dict) else None
+        raise SlurmrestdError(
+            "slurmrestd accepted the request (HTTP 200) but slurmctld rejected the "
+            f"submission: error_code={error_code} error={detail!r} errors={errors!r}",
+            # Synthetic — the HTTP layer said 200; this normalizes a
+            # logical rejection into the permanent-4xx classification bucket.
+            status_code=422,
+            url=url,
+            body=json.dumps(body),
+        )
 
     async def get_job(self, job_id: int) -> SlurmJobInfo:
         """GET /slurm/{api_version}/job/{job_id}. Returns a SlurmJobInfo
