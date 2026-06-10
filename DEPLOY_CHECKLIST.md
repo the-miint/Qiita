@@ -60,7 +60,7 @@ SELECT bgf.internal_name, COUNT(*) AS metadata_rows
 # time and ABORTS before any restart if one is unapplied.
 make -C ~/qiita-miint migrate
 ```
-`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#TBD) adds `20260604000000_study_submission_tracking`, `20260608000000_biosample_field_rebind_fn`, `20260608000001_seed_envo_terminology` (gated on the ENVO pre-check above), and `20260609000000_biosample_matrix_tube_id_exact_length` (gated on the matrix-tube pre-check above).
+`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#TBD) adds `20260604000000_study_submission_tracking`, `20260608000000_biosample_field_rebind_fn`, `20260608000001_seed_envo_terminology` (gated on the ENVO pre-check above), and `20260609000001_biosample_matrix_tube_id_exact_length` (gated on the matrix-tube pre-check above).
 
 ### 4. Deploy
 

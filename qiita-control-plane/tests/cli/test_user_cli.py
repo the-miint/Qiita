@@ -341,7 +341,7 @@ def test_study_create_passes_extra_metadata(monkeypatch):
 
     captured: dict = {}
 
-    def fake_request(method, url, headers=None, json=None, timeout=None):
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
         captured["json"] = json
         return _httpx.Response(201, json={"study_idx": 42}, request=_httpx.Request(method, url))
 
@@ -2432,7 +2432,7 @@ def test_read_subcommand_issues_get(monkeypatch, argv, expected_url):
 
     captured: dict = {}
 
-    def fake_request(method, url, headers=None, json=None, timeout=None):
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
         captured["method"] = method
         captured["url"] = url
         captured["auth"] = headers["Authorization"]
@@ -2474,7 +2474,7 @@ def test_read_subcommand_http_error_exits_1(monkeypatch, capsys):
     from qiita_control_plane.cli import _common
     from qiita_control_plane.cli.user import main
 
-    def fake_request(method, url, headers=None, json=None, timeout=None):
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
         return _httpx.Response(
             404, json={"detail": "not found"}, request=_httpx.Request(method, url)
         )
@@ -2534,7 +2534,7 @@ def test_patch_subcommand_get_etag_then_patch_if_match(
 
     requests: list[dict] = []
 
-    def fake_request(method, url, headers=None, json=None, timeout=None):
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
         requests.append({"method": method, "url": url, "headers": headers, "json": json})
         if method == "GET":
             return _httpx.Response(
@@ -2582,7 +2582,7 @@ def test_patch_subcommand_conflict_exits_1(monkeypatch, capsys):
     from qiita_control_plane.cli import _common
     from qiita_control_plane.cli.user import main
 
-    def fake_request(method, url, headers=None, json=None, timeout=None):
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
         if method == "GET":
             return _httpx.Response(
                 200, json={}, headers={"ETag": "etag-stale"}, request=_httpx.Request(method, url)
