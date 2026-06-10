@@ -29,8 +29,8 @@ _None yet._
 -- migration (and halts `dbmate` mid-deploy) if any row holds a shorter
 -- 8–9 digit value. There is no safe automated fix — correct each surfaced
 -- row to its real 10-digit id BEFORE running `make migrate`. An empty
--- result means none exist; proceed straight to `make migrate`. (#TBD)
-SELECT biosample_idx, matrix_tube_id
+-- result means none exist; proceed straight to `make migrate`. (#81)
+SELECT idx, matrix_tube_id
   FROM qiita.biosample
  WHERE matrix_tube_id IS NOT NULL
    AND matrix_tube_id !~ '^[0-9]{10}$';
@@ -43,7 +43,7 @@ SELECT biosample_idx, matrix_tube_id
 -- migration (and halts `dbmate` mid-deploy) if any biosample_metadata row
 -- already references those fields, since such rows would be left misaligned
 -- under the new data_type. Resolve any rows surfaced here BEFORE running
--- `make migrate`. An empty result means none exist; proceed. (#TBD)
+-- `make migrate`. An empty result means none exist; proceed. (#81)
 SELECT bgf.internal_name, COUNT(*) AS metadata_rows
   FROM qiita.biosample_metadata m
   JOIN qiita.biosample_study_field bsf ON bsf.idx = m.biosample_study_field_idx
@@ -60,7 +60,7 @@ SELECT bgf.internal_name, COUNT(*) AS metadata_rows
 # time and ABORTS before any restart if one is unapplied.
 make -C ~/qiita-miint migrate
 ```
-`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#TBD) adds `20260604000000_study_submission_tracking`, `20260608000000_biosample_field_rebind_fn`, `20260608000001_seed_envo_terminology` (gated on the ENVO pre-check above), and `20260609000001_biosample_matrix_tube_id_exact_length` (gated on the matrix-tube pre-check above).
+`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#81) adds `20260604000000_study_submission_tracking`, `20260608000000_biosample_field_rebind_fn`, `20260608000001_seed_envo_terminology` (gated on the ENVO pre-check above), and `20260609000001_biosample_matrix_tube_id_exact_length` (gated on the matrix-tube pre-check above).
 
 ### 4. Deploy
 
@@ -72,8 +72,8 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#TBD) Checklist binding is now by **name**: biosample/sequenced-sample create and biosample patch take a checklist name (e.g. `ERC000015`) instead of a `metadata_checklist_idx` (unknown name → 422), and `BiosampleResponse`/`SequencedSampleResponse` now return the checklist as a `metadata_checklist` ref (`{idx, name}`) instead of a bare `metadata_checklist_idx`. Clients sending the old idx field or reading the old response key must update. CLI flag is now `--metadata-checklist-name`.
-- (#TBD) `matrix_tube_id` is now validated as exactly 10 digits (was 8–10); a previously-accepted 8- or 9-digit value now returns 422.
+- (#81) Checklist binding is now by **name**: biosample/sequenced-sample create and biosample patch take a checklist name (e.g. `ERC000015`) instead of a `metadata_checklist_idx` (unknown name → 422), and `BiosampleResponse`/`SequencedSampleResponse` now return the checklist as a `metadata_checklist` ref (`{idx, name}`) instead of a bare `metadata_checklist_idx`. Clients sending the old idx field or reading the old response key must update. CLI flag is now `--metadata-checklist-name`.
+- (#81) `matrix_tube_id` is now validated as exactly 10 digits (was 8–10); a previously-accepted 8- or 9-digit value now returns 422.
 
 ---
 
