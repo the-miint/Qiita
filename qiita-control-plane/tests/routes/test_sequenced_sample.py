@@ -43,6 +43,7 @@ from .conftest import (
     IneligibilityKind,
     _grant_study_access,
     assert_owner_ineligibility_422,
+    assert_submission_error_cleared_on_new_attempt,
     delete_idxs,
     resolve_ineligible_owner_idx,
     unique_instrument_id,
@@ -458,6 +459,77 @@ async def test_import_sequenced_prep_sample_metadata_missing_value_persists(ctx)
             "value_missing_reason_idx": reason_idx,
         }
     ]
+
+
+# ===========================================================================
+# Checklist name resolution (sets the composer's prep_sample checklist)
+# ===========================================================================
+
+
+async def test_post_sequenced_sample_metadata_checklist_name_resolves(ctx):
+    # A known checklist name on create resolves to its idx server-side and
+    # lands on the composer's prep_sample row. ERC000015 is seeded, so no
+    # checklist fixture is needed.
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "cl-name")
+    study_idx = await _seed_study(ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="cl")
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], study_idx=study_idx
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    checklist_idx = await ctx["pool"].fetchval(
+        "SELECT idx FROM qiita.metadata_checklist WHERE name = 'ERC000015'"
+    )
+
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        sequenced_pool_item_id=_unique_item_id("CL"),
+        primary_study_idx=study_idx,
+        metadata_checklist_name="ERC000015",
+    )
+    assert resp.status_code == 201, resp.text
+    stored = await ctx["pool"].fetchval(
+        "SELECT metadata_checklist_idx FROM qiita.prep_sample WHERE idx = $1",
+        resp.json()["prep_sample_idx"],
+    )
+    assert stored == checklist_idx
+
+
+async def test_post_sequenced_sample_unknown_metadata_checklist_name_422(ctx):
+    # A checklist name with no matching row is rejected with a clean 422
+    # before any write, rather than surfacing as an FK violation.
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "bad-cl")
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="badcl"
+    )
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], study_idx=study_idx
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    missing_name = f"ERC-missing-{secrets.token_hex(4)}"
+
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        sequenced_pool_item_id=_unique_item_id("BADCL"),
+        primary_study_idx=study_idx,
+        metadata_checklist_name=missing_name,
+    )
+    assert resp.status_code == 422
+    expected_detail = (
+        f"metadata_checklist_name {missing_name!r} does not reference an existing checklist"
+    )
+    assert resp.json()["detail"] == expected_detail
 
 
 # ===========================================================================
@@ -1226,7 +1298,7 @@ def _expected_read_response(
         "biosample_idx": seeded["biosample_idx"],
         "owner_idx": owner_idx,
         "prep_protocol_idx": seeded["protocol_idx"],
-        "metadata_checklist_idx": None,
+        "metadata_checklist": None,
         "sequenced_pool_idx": seeded["pool_idx"],
         "sequenced_pool_item_id": seeded["item_id"],
         "ena_experiment_accession": None,
@@ -2220,33 +2292,18 @@ async def test_patch_sequenced_sample_system_admin_happy_path(ctx):
 
 
 async def test_patch_sequenced_sample_submission_error_clearing_trigger(ctx):
-    # Trigger sequenced_sample_clear_submission_error_on_new_attempt nulls
-    # submission_error when last_submission_at changes and the same
-    # UPDATE does not also set submission_error. First PATCH seeds an
-    # error; second PATCH (last_submission_at only) clears it.
+    # The shared clear-submission-error-on-new-attempt trigger nulls
+    # submission_error when last_submission_at changes and the same UPDATE
+    # does not also set it. The helper drives that two-PATCH sequence; the
+    # full-object check confirms the rest of the row is untouched.
     seeded = await _seed_one_sequenced_sample(ctx, "patch-trig")
+    url = URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"])
+    initial_etag = await _get_etag(ctx["wet"], seeded["sequenced_sample_idx"])
 
-    # First PATCH plants a submission_error.
-    etag1 = await _get_etag(ctx["wet"], seeded["sequenced_sample_idx"])
-    r1 = await ctx["wet"].patch(
-        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
-        json={"submission_error": "ENA timed out"},
-        headers={"If-Match": etag1},
+    rj = await assert_submission_error_cleared_on_new_attempt(
+        ctx["wet"], url, initial_etag=initial_etag
     )
-    assert r1.status_code == 200, r1.text
-    assert r1.json()["submission_error"] == "ENA timed out"
 
-    # Second PATCH bumps last_submission_at without re-setting submission_error.
-    # The trigger detects last_submission_at IS DISTINCT FROM OLD and
-    # submission_error IS NOT DISTINCT FROM OLD, and nulls submission_error.
-    etag2 = r1.headers["ETag"]
-    r2 = await ctx["wet"].patch(
-        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"]),
-        json={"last_submission_at": "2026-02-01T08:30:00+00:00"},
-        headers={"If-Match": etag2},
-    )
-    assert r2.status_code == 200, r2.text
-    rj = r2.json()
     expected = _expected_read_response(
         seeded,
         rj=rj,
@@ -2257,7 +2314,6 @@ async def test_patch_sequenced_sample_submission_error_clearing_trigger(ctx):
         has_metadata=False,
     )
     expected["last_submission_at"] = rj["last_submission_at"]
-    # Trigger cleared the error from the first PATCH.
     expected["submission_error"] = None
     assert rj == expected
 

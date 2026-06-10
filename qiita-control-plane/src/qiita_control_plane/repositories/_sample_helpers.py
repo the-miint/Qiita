@@ -110,6 +110,16 @@ class MetadataUnknownFieldsError(Exception):
         )
 
 
+class MetadataChecklistUnknownError(Exception):
+    """Raised when a metadata_checklist name has no matching
+    qiita.metadata_checklist row. Carries the unknown name.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        super().__init__(f"unknown metadata_checklist name: {name!r}")
+
+
 class StudyFieldConflictError(Exception):
     """Raised when a {entity_kind}_study_field row at (study_idx, display_name)
     already exists but is purely-local (found_global_field_idx is None) or is
@@ -370,6 +380,27 @@ async def fetch_terminology_term_idxs_by_term_ids(
         candidate_term_ids,
     )
     return {r["term_id"]: (r["idx"], r["label"]) for r in rows}
+
+
+async def fetch_metadata_checklist_idx_by_name(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    name: str | None,
+) -> int | None:
+    """Resolve a metadata_checklist name to its idx.
+
+    None passes through as None (no checklist requested). A non-null name
+    with no matching row raises MetadataChecklistUnknownError so the caller
+    surfaces a clean error instead of a downstream FK violation.
+    metadata_checklist.name is UNIQUE, so at most one row matches.
+    """
+    if name is None:
+        return None
+    idx = await pool_or_conn.fetchval(
+        "SELECT idx FROM qiita.metadata_checklist WHERE name = $1", name
+    )
+    if idx is None:
+        raise MetadataChecklistUnknownError(name)
+    return idx
 
 
 async def fetch_global_metadata(

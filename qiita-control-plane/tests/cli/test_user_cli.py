@@ -14,10 +14,14 @@ from pathlib import Path
 import pytest
 from qiita_common.api_paths import (
     URL_AUTH_WHOAMI,
+    URL_BIOSAMPLE_BY_IDX,
     URL_BIOSAMPLE_BY_STUDY,
+    URL_BIOSAMPLE_LIST_BY_STUDY,
+    URL_SEQUENCED_SAMPLE_BY_IDX,
     URL_SEQUENCED_SAMPLE_FROM_RUN,
     URL_SEQUENCING_RUN_PREFIX,
     URL_SEQUENCING_RUN_SEQUENCED_POOL,
+    URL_STUDY_BY_IDX,
     URL_STUDY_PREFIX,
     URL_USER_ME,
     URL_WORK_TICKET_BY_IDX,
@@ -328,6 +332,67 @@ def test_study_create_pydantic_validation_error_exits_2(capsys):
     assert "title" in err
 
 
+def test_study_create_passes_extra_metadata(monkeypatch):
+    """--extra-metadata is parsed from JSON into a dict and lands in the
+    POST body verbatim under the snake_case key."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["json"] = json
+        return _httpx.Response(201, json={"study_idx": 42}, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    rc = main(
+        [
+            "study",
+            "create",
+            "--title",
+            "T",
+            "--extra-metadata",
+            '{"site":"ucsd","vamps_id":"VAMPS-1"}',
+        ]
+    )
+    assert rc == 0
+    assert captured["json"] == {
+        "title": "T",
+        "extra_metadata": {"site": "ucsd", "vamps_id": "VAMPS-1"},
+    }
+
+
+def test_study_create_rejects_malformed_extra_metadata(capsys):
+    """Non-JSON --extra-metadata exits 2 via parser.error rather than a
+    JSONDecodeError traceback."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["study", "create", "--title", "T", "--extra-metadata", "{not-json"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--extra-metadata" in err
+    assert "not valid JSON" in err
+
+
+def test_study_create_rejects_non_object_extra_metadata(capsys):
+    """--extra-metadata must be a JSON object (matches the JSONB-on-server
+    convention). A bare array or scalar should fail fast."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["study", "create", "--title", "T", "--extra-metadata", "[1, 2, 3]"])
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "--extra-metadata" in err
+    assert "JSON object" in err
+
+
 def test_profile_set_pydantic_validation_error_exits_2(capsys):
     """A malformed --orcid trips Pydantic client-side via UserUpdate's
     pattern constraint; surfaced as a flat parser.error."""
@@ -515,9 +580,8 @@ def test_biosample_create_metadata_pairs_become_dict(monkeypatch):
 
 def test_biosample_create_passes_through_optional_fields(monkeypatch):
     """Tests the case where every CLI-exposed optional field
-    (metadata_checklist_idx, biosample_accession, matrix_tube_id) flows
-    into the POST body when supplied; ena_sample_accession stays absent
-    because the CLI does not expose it."""
+    (metadata_checklist_name, biosample_accession, ena_sample_accession,
+    matrix_tube_id) flows into the POST body when supplied."""
     from qiita_control_plane.cli.user import main
 
     captured: dict = {}
@@ -533,20 +597,22 @@ def test_biosample_create_passes_through_optional_fields(monkeypatch):
             "owner_sample_id",
             "--owner-biosample-id-value",
             "SMK-001",
-            "--metadata-checklist-idx",
-            "3",
+            "--metadata-checklist-name",
+            "ERC000015",
             "--biosample-accession",
             "SAMN12345678",
+            "--ena-sample-accession",
+            "ERS1234567",
             "--matrix-tube-id",
             "0123456789",
         ]
     )
     assert rc == 0
     body = captured["requests"][-1]["json"]
-    assert body["metadata_checklist_idx"] == 3
+    assert body["metadata_checklist_name"] == "ERC000015"
     assert body["biosample_accession"] == "SAMN12345678"
+    assert body["ena_sample_accession"] == "ERS1234567"
     assert body["matrix_tube_id"] == "0123456789"
-    assert "ena_sample_accession" not in body
 
 
 def test_biosample_create_requires_required_flags(capsys):
@@ -1069,8 +1135,8 @@ def test_sequenced_sample_create_explicit_owner_skips_whoami(monkeypatch):
 
 
 def test_sequenced_sample_create_metadata_checklist_passes_through(monkeypatch):
-    """--metadata-checklist-idx flows verbatim; ENA accession fields stay
-    absent regardless (not exposed)."""
+    """--metadata-checklist-name flows verbatim; ENA accession fields stay
+    absent when their flags are not supplied."""
     from qiita_control_plane.cli.user import main
 
     captured: dict = {}
@@ -1094,15 +1160,54 @@ def test_sequenced_sample_create_metadata_checklist_passes_through(monkeypatch):
             "WELL-A1",
             "--primary-study-idx",
             "7",
-            "--metadata-checklist-idx",
-            "2",
+            "--metadata-checklist-name",
+            "ERC000015",
         ]
     )
     assert rc == 0
     body = captured["requests"][-1]["json"]
-    assert body["metadata_checklist_idx"] == 2
+    assert body["metadata_checklist_name"] == "ERC000015"
     assert "ena_experiment_accession" not in body
     assert "ena_run_accession" not in body
+
+
+def test_sequenced_sample_create_passes_ena_accessions(monkeypatch):
+    """Tests the case where --ena-experiment-accession and --ena-run-accession
+    flow into the POST body — a sequenced sample may already carry ENA
+    accessions at create time."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch, captured, response_json=_SEQUENCED_SAMPLE_CREATE_RESPONSE, whoami_idx=42
+    )
+
+    rc = main(
+        [
+            "sequenced-sample",
+            "create",
+            "--run-idx",
+            "4",
+            "--pool-idx",
+            "9",
+            "--biosample-idx",
+            "55",
+            "--prep-protocol-idx",
+            "3",
+            "--pool-item-id",
+            "WELL-A1",
+            "--primary-study-idx",
+            "7",
+            "--ena-experiment-accession",
+            "ERX9999999",
+            "--ena-run-accession",
+            "ERR9999999",
+        ]
+    )
+    assert rc == 0
+    body = captured["requests"][-1]["json"]
+    assert body["ena_experiment_accession"] == "ERX9999999"
+    assert body["ena_run_accession"] == "ERR9999999"
 
 
 def test_sequenced_sample_create_requires_required_flags(capsys):
@@ -2296,3 +2401,210 @@ def test__read_preflight_rows_round_trips_library_tuples(preflight_stub):
     # library's return — mutating downstream does not contaminate the
     # caller's data.
     assert rows[0].secondary_project_accessions is not library_secondaries
+
+
+# ---------------------------------------------------------------------------
+# study get / biosample get / biosample list-idxs (read subcommands)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_url"),
+    [
+        (["study", "get", "--study-idx", "42"], URL_STUDY_BY_IDX.format(study_idx=42)),
+        (
+            ["biosample", "get", "--biosample-idx", "100"],
+            URL_BIOSAMPLE_BY_IDX.format(biosample_idx=100),
+        ),
+        (
+            ["biosample", "list-idxs", "--study-idx", "42"],
+            URL_BIOSAMPLE_LIST_BY_STUDY.format(study_idx=42),
+        ),
+    ],
+)
+def test_read_subcommand_issues_get(monkeypatch, argv, expected_url):
+    """Tests the case where a read subcommand issues an authenticated GET to
+    the resource's URL and returns the decoded body (exit 0)."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["method"] = method
+        captured["url"] = url
+        captured["auth"] = headers["Authorization"]
+        return _httpx.Response(200, json={"ok": True}, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = main(["--base-url", "https://q.example.test", *argv])
+    assert rc == 0
+    assert captured["method"] == "GET"
+    assert captured["url"] == f"https://q.example.test{expected_url}"
+    assert captured["auth"] == f"{BEARER_PREFIX}qk_test"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["study", "get"],
+        ["biosample", "get"],
+        ["biosample", "list-idxs"],
+    ],
+)
+def test_read_subcommand_requires_idx(argv):
+    """Tests the case where a read subcommand's required idx flag is omitted;
+    argparse rejects the invocation with exit 2."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(argv)
+    assert exc_info.value.code == 2
+
+
+def test_read_subcommand_http_error_exits_1(monkeypatch, capsys):
+    """Tests the case where the GET returns a non-2xx status; the command
+    exits 1 and names the status on stderr."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        return _httpx.Response(
+            404, json={"detail": "not found"}, request=_httpx.Request(method, url)
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = main(["--base-url", "https://q.example.test", "study", "get", "--study-idx", "999"])
+    assert rc == 1
+    assert "404" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# study patch / biosample patch / sequenced-sample patch (write subcommands)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected_url", "expected_body"),
+    [
+        (
+            ["study", "patch", "--study-idx", "42", "--ebi-study-accession", "PRJEB1"],
+            URL_STUDY_BY_IDX.format(study_idx=42),
+            {"ebi_study_accession": "PRJEB1"},
+        ),
+        (
+            ["biosample", "patch", "--biosample-idx", "100", "--ena-sample-accession", "ERS1"],
+            URL_BIOSAMPLE_BY_IDX.format(biosample_idx=100),
+            {"ena_sample_accession": "ERS1"},
+        ),
+        (
+            [
+                "sequenced-sample",
+                "patch",
+                "--sequenced-sample-idx",
+                "5",
+                "--ena-experiment-accession",
+                "ERX1",
+                "--ena-run-accession",
+                "ERR1",
+            ],
+            URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=5),
+            {"ena_experiment_accession": "ERX1", "ena_run_accession": "ERR1"},
+        ),
+    ],
+)
+def test_patch_subcommand_get_etag_then_patch_if_match(
+    monkeypatch, argv, expected_url, expected_body
+):
+    """Tests the case where a patch subcommand GETs the resource to read its
+    ETag, then PATCHes with that ETag as If-Match and the supplied fields as
+    the body (exit 0)."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    requests: list[dict] = []
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        requests.append({"method": method, "url": url, "headers": headers, "json": json})
+        if method == "GET":
+            return _httpx.Response(
+                200, json={}, headers={"ETag": "etag-v1"}, request=_httpx.Request(method, url)
+            )
+        return _httpx.Response(200, json={"ok": True}, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = main(["--base-url", "https://q.example.test", *argv])
+    assert rc == 0
+    assert [r["method"] for r in requests] == ["GET", "PATCH"]
+    get_req, patch_req = requests
+    assert get_req["url"] == f"https://q.example.test{expected_url}"
+    assert patch_req["url"] == f"https://q.example.test{expected_url}"
+    assert patch_req["headers"]["If-Match"] == "etag-v1"
+    assert patch_req["headers"]["Authorization"] == f"{BEARER_PREFIX}qk_test"
+    assert patch_req["json"] == expected_body
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["study", "patch", "--study-idx", "42"],
+        ["biosample", "patch", "--biosample-idx", "100"],
+        ["sequenced-sample", "patch", "--sequenced-sample-idx", "5"],
+    ],
+)
+def test_patch_subcommand_empty_update_exits_2(argv):
+    """Tests the case where a patch subcommand is invoked with no field flags;
+    the PatchRequestModel's at-least-one-field rule rejects it (exit 2)."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--base-url", "https://q.example.test", *argv])
+    assert exc_info.value.code == 2
+
+
+def test_patch_subcommand_conflict_exits_1(monkeypatch, capsys):
+    """Tests the case where the PATCH is rejected with 412 (stale If-Match);
+    the command exits 1 and surfaces the status on stderr."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        if method == "GET":
+            return _httpx.Response(
+                200, json={}, headers={"ETag": "etag-stale"}, request=_httpx.Request(method, url)
+            )
+        return _httpx.Response(
+            412, json={"detail": "If-Match did not match"}, request=_httpx.Request(method, url)
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "study",
+            "patch",
+            "--study-idx",
+            "42",
+            "--ebi-study-accession",
+            "PRJEB1",
+        ]
+    )
+    assert rc == 1
+    assert "412" in capsys.readouterr().err

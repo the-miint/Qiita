@@ -197,7 +197,8 @@ async def ctx(postgres_pool):
     )
     await _seed_user(postgres_pool, biosample_owner_idx, f"bs-owner-{token}@test.local")
     study_idx = await _seed_study(postgres_pool, principal_idx, f"bs-{token}")
-    checklist_idx = await _seed_metadata_checklist(postgres_pool, f"bs-{token}")
+    checklist_name = f"bs-checklist-{token}"
+    checklist_idx = await _seed_metadata_checklist(postgres_pool, checklist_name)
 
     # Test-populated tracking dict; lists hold idxs (or (bs, st) tuples).
     # `studies` holds idxs of any extra studies the test seeds beyond the
@@ -228,6 +229,7 @@ async def ctx(postgres_pool):
         "biosample_owner_idx": biosample_owner_idx,
         "study_idx": study_idx,
         "checklist_idx": checklist_idx,
+        "checklist_name": checklist_name,
         "created": created,
     }
 

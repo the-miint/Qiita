@@ -23,6 +23,7 @@ and scope guards, and the request-model rejection paths.
 """
 
 import secrets
+from datetime import UTC, datetime
 
 import pytest
 import pytest_asyncio
@@ -212,6 +213,8 @@ async def test_post_study_full_body_round_trips(ctx):
         "funding": "NIH-R01",
         "ebi_study_accession": "ERP000001",
         "notes": "notes-1",
+        "last_submission_at": None,
+        "submission_error": None,
         "extra_metadata": extra,
         "default_tier": "viewer",
         "created_by_idx": caller_idx,
@@ -581,6 +584,19 @@ async def test_get_study_below_default_tier_403(ctx):
     assert "'member'" in resp.json()["detail"]
 
 
+async def test_get_study_sets_etag_header(ctx):
+    """Tests the case where GET returns the row's ETag header so a client can
+    feed it as the If-Match value on a subsequent PATCH (mirrors the biosample
+    and sequenced-sample read handlers)."""
+    create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("get-etag"))
+    assert create_resp.status_code == 201, create_resp.text
+    study_idx = create_resp.json()["study_idx"]
+
+    resp = await ctx["user"].get(URL_STUDY_BY_IDX.format(study_idx=study_idx))
+    assert resp.status_code == 200, resp.text
+    _assert_etag_quoted(resp)
+
+
 # ===========================================================================
 # PATCH /api/v1/study/{study_idx}
 # ===========================================================================
@@ -693,6 +709,63 @@ async def test_patch_study_etag_advances_on_ebi_accession_round_trip(ctx):
     new_etag = resp.headers["ETag"]
     assert new_etag != if_match
     assert resp.json()["ebi_study_accession"] == new_acc
+
+
+async def test_study_clear_submission_error_on_new_attempt_trigger(ctx):
+    """Tests the case where bumping last_submission_at on a study row nulls a
+    previously set submission_error via the shared clear-on-new-attempt
+    trigger. Driven at the DB layer because the submission-tracking columns
+    are subsystem-owned and are not on the study PATCH surface."""
+    create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("trig"))
+    assert create_resp.status_code == 201, create_resp.text
+    study_idx = create_resp.json()["study_idx"]
+    pool = ctx["pool"]
+
+    # Seed a submission_error without touching last_submission_at; the trigger
+    # keys off last_submission_at, so it does not fire on this UPDATE.
+    await pool.execute(
+        "UPDATE qiita.study SET submission_error = $2 WHERE idx = $1",
+        study_idx,
+        "ENA timed out",
+    )
+    # Bump last_submission_at alone; the trigger fires and nulls the error.
+    await pool.execute(
+        "UPDATE qiita.study SET last_submission_at = $2 WHERE idx = $1",
+        study_idx,
+        datetime(2026, 2, 1, 8, 30, tzinfo=UTC),
+    )
+
+    row = await pool.fetchrow(
+        "SELECT last_submission_at, submission_error FROM qiita.study WHERE idx = $1",
+        study_idx,
+    )
+    assert row["last_submission_at"] is not None
+    assert row["submission_error"] is None
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("last_submission_at", "2026-02-01T08:30:00+00:00"),
+        ("submission_error", "boom"),
+    ],
+)
+async def test_patch_study_submission_field_forbidden_422(ctx, field, value):
+    """Tests the case where a PATCH targets a submission-tracking column.
+    These columns are subsystem-owned and absent from StudyPatchRequest, so
+    extra='forbid' rejects the body with 422 — no owner or admin can write
+    submission state through the (owner-accessible) study PATCH route."""
+    create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-sub"))
+    assert create_resp.status_code == 201, create_resp.text
+    study_idx = create_resp.json()["study_idx"]
+    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+
+    resp = await ctx["user"].patch(
+        URL_STUDY_BY_IDX.format(study_idx=study_idx),
+        json={field: value},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 422
 
 
 async def test_patch_study_anonymous_401(ctx):

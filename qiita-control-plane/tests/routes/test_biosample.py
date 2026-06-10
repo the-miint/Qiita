@@ -725,11 +725,11 @@ async def test_post_biosample_bad_matrix_tube_id_format_422(ctx, bad_value):
     assert resp.status_code == 422
 
 
-@pytest.mark.parametrize("bad_value", ["1234567", "12345678901", "1" * 51])
+@pytest.mark.parametrize("bad_value", ["1234567", "12345678", "123456789", "12345678901", "1" * 51])
 async def test_post_biosample_bad_matrix_tube_id_length_422(ctx, bad_value):
-    """Tests the case where matrix_tube_id falls outside the 8-10 digit
-    length range: the Pydantic validator on BiosampleImportRequest rejects
-    the body at the wire boundary with 422.
+    """Tests the case where matrix_tube_id is not exactly 10 digits long:
+    the Pydantic validator on BiosampleImportRequest rejects the body at
+    the wire boundary with 422.
     """
     study_idx = await _seed_study(
         ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="tube-long"
@@ -748,17 +748,19 @@ async def test_post_biosample_bad_matrix_tube_id_length_422(ctx, bad_value):
     assert resp.status_code == 422
 
 
-async def test_post_biosample_bad_metadata_checklist_idx_422(ctx):
-    # A metadata_checklist_idx far beyond the current MAX trips the
-    # biosample_metadata_checklist_idx_fkey FK; route maps it to 422 with
-    # the user-friendly mapped message.
+async def test_post_biosample_metadata_checklist_name_resolves(ctx):
+    # A known checklist name resolves to its idx server-side and lands on
+    # the created biosample.
     study_idx = await _seed_study(
-        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="bad-cl"
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="cl-name"
     )
     ctx["created"]["study"].append(study_idx)
-    max_cl = await ctx["pool"].fetchval(
-        "SELECT COALESCE(MAX(idx), 0) FROM qiita.metadata_checklist"
+    checklist_name = f"ERC-test-{secrets.token_hex(4)}"
+    checklist_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.metadata_checklist (name) VALUES ($1) RETURNING idx",
+        checklist_name,
     )
+    ctx["created"]["metadata_checklist"].append(checklist_idx)
 
     resp = await _post_biosample(
         ctx["wet"],
@@ -767,10 +769,43 @@ async def test_post_biosample_bad_metadata_checklist_idx_422(ctx):
         owner_idx=ctx["wet_session"]["principal_idx"],
         owner_biosample_id_field_name=unique_field_name(),
         owner_biosample_id_value="V-1",
-        metadata_checklist_idx=max_cl + 100_000,
+        metadata_checklist_name=checklist_name,
+    )
+    assert resp.status_code == 201
+    bs_idx = resp.json()["biosample_idx"]
+    stored = await ctx["pool"].fetchval(
+        "SELECT metadata_checklist_idx FROM qiita.biosample WHERE idx = $1", bs_idx
+    )
+    assert stored == checklist_idx
+
+    # Read-back surfaces the checklist as a ref carrying both idx and name.
+    get_resp = await ctx["wet"].get(URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx))
+    assert get_resp.status_code == 200
+    assert get_resp.json()["metadata_checklist"] == {"idx": checklist_idx, "name": checklist_name}
+
+
+async def test_post_biosample_unknown_metadata_checklist_name_422(ctx):
+    # A checklist name with no matching row is rejected with a clean 422
+    # before any write, rather than surfacing as an FK violation.
+    study_idx = await _seed_study(
+        ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="bad-cl"
+    )
+    ctx["created"]["study"].append(study_idx)
+    missing_name = f"ERC-missing-{secrets.token_hex(4)}"
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=unique_field_name(),
+        owner_biosample_id_value="V-1",
+        metadata_checklist_name=missing_name,
     )
     assert resp.status_code == 422
-    expected_detail = "metadata_checklist_idx does not reference an existing checklist"
+    expected_detail = (
+        f"metadata_checklist_name {missing_name!r} does not reference an existing checklist"
+    )
     assert resp.json()["detail"] == expected_detail
 
 
@@ -1030,10 +1065,12 @@ async def test_post_biosample_owner_id_missing_value_marker_422(ctx):
 
 
 async def test_post_biosample_metadata_uses_seeded_globals(ctx):
-    # Realistic 6-field MIxS-style import that resolves global fields
-    # against the rows seeded by migration 20260501000014 instead of
-    # creating throwaway global fields. Cleanup tracks only the per-test
-    # study-field and metadata rows so the seeded globals survive.
+    # Realistic 6-field MIxS-style import that resolves global fields against
+    # the seeded biosample global-field rows instead of creating throwaway
+    # global fields. The two environmental-context fields are ENVO terminology
+    # fields, so their values are submitted as ENVO term_ids and resolve into
+    # value_terminology_term_idx. Cleanup tracks only the per-test study-field
+    # and metadata rows so the seeded globals survive.
     display_names = [
         "collection date",
         "geographic location (country and/or sea)",
@@ -1051,6 +1088,21 @@ async def test_post_biosample_metadata_uses_seeded_globals(ctx):
     # Sanity-check: every seeded display_name resolved before we run the route.
     assert set(display_to_idx) == set(display_names)
 
+    # The two environmental-context fields are ENVO terminology fields; resolve
+    # the seeded term idxs their submitted term_ids will land on.
+    envo_term_ids = {
+        "broad-scale environmental context": "ENVO:01000249",
+        "local environmental context": "ENVO:00000469",
+    }
+    term_rows = await ctx["pool"].fetch(
+        "SELECT tt.term_id, tt.idx FROM qiita.terminology_term tt"
+        " JOIN qiita.terminology t ON t.idx = tt.terminology_idx"
+        " WHERE t.name = 'ENVO' AND tt.term_id = ANY($1::text[])",
+        list(envo_term_ids.values()),
+    )
+    term_id_to_idx = {r["term_id"]: r["idx"] for r in term_rows}
+    assert set(term_id_to_idx) == set(envo_term_ids.values())
+
     study_idx = await _seed_study(
         ctx["pool"], owner_idx=ctx["wet_session"]["principal_idx"], suffix="seeded-meta"
     )
@@ -1063,8 +1115,8 @@ async def test_post_biosample_metadata_uses_seeded_globals(ctx):
         "geographic location (country and/or sea)": "USA",
         "geographic location (latitude)": "32.7157",
         "geographic location (longitude)": "-117.1611",
-        "broad-scale environmental context": "human-associated habitat [ENVO:00009003]",
-        "local environmental context": "gastrointestinal tract [ENVO:00002041]",
+        "broad-scale environmental context": envo_term_ids["broad-scale environmental context"],
+        "local environmental context": envo_term_ids["local environmental context"],
     }
 
     resp = await _post_biosample(
@@ -1084,9 +1136,12 @@ async def test_post_biosample_metadata_uses_seeded_globals(ctx):
     bs_idx = resp.json()["biosample_idx"]
     await _track_global_metadata_outputs(ctx, bs_idx, study_idx, list(display_to_idx.values()))
 
-    # Verify every metadata row landed in the correct typed value_* column.
+    # Verify every metadata row landed in the correct typed value_* column:
+    # typed scalars in value_text/value_numeric/value_date, ENVO terms in
+    # value_terminology_term_idx.
     rows = await ctx["pool"].fetch(
-        "SELECT global_field_idx, value_text, value_numeric, value_date"
+        "SELECT global_field_idx, value_text, value_numeric, value_date,"
+        " value_terminology_term_idx"
         " FROM qiita.biosample_metadata"
         " WHERE biosample_idx = $1 AND is_owner_biosample_id = false"
         " ORDER BY global_field_idx",
@@ -1099,36 +1154,42 @@ async def test_post_biosample_metadata_uses_seeded_globals(ctx):
                 "value_text": None,
                 "value_numeric": None,
                 "value_date": date(2026, 4, 1),
+                "value_terminology_term_idx": None,
             },
             {
                 "global_field_idx": display_to_idx["geographic location (country and/or sea)"],
                 "value_text": "USA",
                 "value_numeric": None,
                 "value_date": None,
+                "value_terminology_term_idx": None,
             },
             {
                 "global_field_idx": display_to_idx["geographic location (latitude)"],
                 "value_text": None,
                 "value_numeric": Decimal("32.7157"),
                 "value_date": None,
+                "value_terminology_term_idx": None,
             },
             {
                 "global_field_idx": display_to_idx["geographic location (longitude)"],
                 "value_text": None,
                 "value_numeric": Decimal("-117.1611"),
                 "value_date": None,
+                "value_terminology_term_idx": None,
             },
             {
                 "global_field_idx": display_to_idx["broad-scale environmental context"],
-                "value_text": "human-associated habitat [ENVO:00009003]",
+                "value_text": None,
                 "value_numeric": None,
                 "value_date": None,
+                "value_terminology_term_idx": term_id_to_idx["ENVO:01000249"],
             },
             {
                 "global_field_idx": display_to_idx["local environmental context"],
-                "value_text": "gastrointestinal tract [ENVO:00002041]",
+                "value_text": None,
                 "value_numeric": None,
                 "value_date": None,
+                "value_terminology_term_idx": term_id_to_idx["ENVO:00000469"],
             },
         ],
         key=lambda r: r["global_field_idx"],
@@ -1394,7 +1455,7 @@ async def test_get_biosample_owner_returns_response(ctx):
     expected = {
         "biosample_idx": bs_idx,
         "owner_idx": owner_idx,
-        "metadata_checklist_idx": None,
+        "metadata_checklist": None,
         "biosample_accession": None,
         "ena_sample_accession": None,
         "matrix_tube_id": None,
@@ -1444,7 +1505,7 @@ async def test_get_biosample_via_study_access_returns_response(ctx):
     expected = {
         "biosample_idx": bs_idx,
         "owner_idx": wet_idx,
-        "metadata_checklist_idx": None,
+        "metadata_checklist": None,
         "biosample_accession": None,
         "ena_sample_accession": None,
         "matrix_tube_id": None,
@@ -1482,7 +1543,7 @@ async def test_get_biosample_wet_lab_admin_bypasses_access(ctx):
     expected = {
         "biosample_idx": bs_idx,
         "owner_idx": owner_idx,
-        "metadata_checklist_idx": None,
+        "metadata_checklist": None,
         "biosample_accession": None,
         "ena_sample_accession": None,
         "matrix_tube_id": None,
@@ -1518,7 +1579,7 @@ async def test_get_biosample_system_admin_bypasses_access(ctx):
     expected = {
         "biosample_idx": bs_idx,
         "owner_idx": owner_idx,
-        "metadata_checklist_idx": None,
+        "metadata_checklist": None,
         "biosample_accession": None,
         "ena_sample_accession": None,
         "matrix_tube_id": None,
@@ -1592,7 +1653,7 @@ async def test_get_biosample_carries_missing_reason_marker(ctx):
     expected = {
         "biosample_idx": bs_idx,
         "owner_idx": ctx["wet_session"]["principal_idx"],
-        "metadata_checklist_idx": None,
+        "metadata_checklist": None,
         "biosample_accession": None,
         "ena_sample_accession": None,
         "matrix_tube_id": None,
@@ -1669,7 +1730,7 @@ async def test_get_biosample_carries_terminology_term(ctx):
     expected = {
         "biosample_idx": bs_idx,
         "owner_idx": ctx["wet_session"]["principal_idx"],
-        "metadata_checklist_idx": None,
+        "metadata_checklist": None,
         "biosample_accession": None,
         "ena_sample_accession": None,
         "matrix_tube_id": None,
@@ -1879,7 +1940,7 @@ async def test_patch_biosample_wet_lab_admin_happy_path(ctx):
     expected = {
         "biosample_idx": bs_idx,
         "owner_idx": owner_idx,
-        "metadata_checklist_idx": None,
+        "metadata_checklist": None,
         "biosample_accession": new_acc,
         "ena_sample_accession": None,
         "matrix_tube_id": None,
@@ -1902,8 +1963,8 @@ async def test_patch_biosample_wet_lab_admin_happy_path(ctx):
 
 
 async def test_patch_biosample_explicit_null_clears_field(ctx):
-    # Seed a biosample with metadata_checklist_idx set, then PATCH it to
-    # explicit null. The model_fields_set distinction (absent vs. null)
+    # Seed a biosample with a checklist set, then PATCH metadata_checklist_name
+    # to explicit null. The model_fields_set distinction (absent vs. null)
     # is what makes this clear-the-column path work.
     checklist_idx = await _seed_metadata_checklist(ctx["pool"], suffix="patch-clear")
     ctx["created"]["metadata_checklist"].append(checklist_idx)
@@ -1919,11 +1980,11 @@ async def test_patch_biosample_explicit_null_clears_field(ctx):
 
     resp = await ctx["wet"].patch(
         URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx),
-        json={"metadata_checklist_idx": None},
+        json={"metadata_checklist_name": None},
         headers={"If-Match": if_match},
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["metadata_checklist_idx"] is None
+    assert resp.json()["metadata_checklist"] is None
 
 
 async def test_patch_biosample_etag_advances(ctx):
@@ -2239,22 +2300,23 @@ async def test_patch_biosample_duplicate_unique_column_409(ctx, column, make_val
     assert column in resp.json()["detail"]
 
 
-async def test_patch_biosample_bad_metadata_checklist_idx_422(ctx):
-    # Nonexistent metadata_checklist_idx trips the FK constraint →
-    # asyncpg.ForeignKeyViolationError → 422 with the FK-specific detail.
+async def test_patch_biosample_unknown_metadata_checklist_name_422(ctx):
+    # A checklist name with no matching row is rejected with a clean 422
+    # before the UPDATE, rather than surfacing as an FK violation.
     bs_idx = await _seed_biosample_for_patch(ctx)
     if_match = await _etag_for(ctx["pool"], bs_idx)
-    bad_checklist = (
-        await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.metadata_checklist")
-    ) + 100_000
+    missing_name = f"ERC-missing-{secrets.token_hex(4)}"
 
     resp = await ctx["wet"].patch(
         URL_BIOSAMPLE_BY_IDX.format(biosample_idx=bs_idx),
-        json={"metadata_checklist_idx": bad_checklist},
+        json={"metadata_checklist_name": missing_name},
         headers={"If-Match": if_match},
     )
     assert resp.status_code == 422
-    assert "metadata_checklist_idx" in resp.json()["detail"]
+    expected_detail = (
+        f"metadata_checklist_name {missing_name!r} does not reference an existing checklist"
+    )
+    assert resp.json()["detail"] == expected_detail
 
 
 # ---------------------------------------------------------------------------

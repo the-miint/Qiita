@@ -34,14 +34,14 @@ from qiita_common.auth_constants import (  # noqa: F401
 ORCID_PATTERN = r"^\d{4}-\d{4}-\d{4}-\d{3}[\dX]$"
 
 # matrix_tube_id values are digit-only (per local convention) and may carry
-# leading zeros; the {8,10} quantifier also rejects the empty string and
-# bounds the length range.
+# leading zeros; the {10} quantifier fixes the length at exactly ten digits
+# and rejects the empty string.
 #
 # Deliberately duplicated with the column-level CHECK on
 # qiita.biosample.matrix_tube_id: the Pydantic side fails at the wire
 # boundary with a per-field 422; the DB side is the last line of defense.
 # Change one and you must change the other in the same PR.
-MATRIX_TUBE_ID_PATTERN = r"^[0-9]{8,10}$"  # same-pattern-ok: DB CHECK parity (see above)
+MATRIX_TUBE_ID_PATTERN = r"^[0-9]{10}$"  # same-pattern-ok: DB CHECK parity (see above)
 
 
 class HealthStatus(StrEnum):
@@ -619,7 +619,7 @@ class BiosampleImportRequest(BaseModel):
     owner_biosample_id_field_name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     owner_biosample_id_value: str = Field(min_length=1)
     metadata: dict[str, str] = Field(default_factory=dict)
-    metadata_checklist_idx: Annotated[int, Field(gt=0)] | None = None
+    metadata_checklist_name: str | None = Field(default=None, min_length=1)
     biosample_accession: str | None = Field(default=None, min_length=1)
     ena_sample_accession: str | None = Field(default=None, min_length=1)
     matrix_tube_id: Annotated[
@@ -694,6 +694,24 @@ class TerminologyTermRef(BaseModel):
         return TERMINOLOGY_TERM_VALUE_COLUMN
 
 
+class MetadataChecklistRef(BaseModel):
+    """The metadata_checklist a biosample/sequenced_sample claims
+    conformance to, carrying both the idx and the name (= the ENA
+    checklist accession). Mirrors MissingReasonRef's idx+name shape.
+    """
+
+    idx: Annotated[int, Field(gt=0)]
+    name: Annotated[str, Field(min_length=1)]
+
+    @classmethod
+    def from_row(cls, idx: int | None, name: str | None) -> MetadataChecklistRef | None:
+        """Build the ref from a read row's nullable (idx, name); None idx
+        (no checklist on the row) yields None."""
+        if idx is None:
+            return None
+        return cls(idx=idx, name=name)
+
+
 class GlobalMetadataEntry(BaseModel):
     """One globally-linked metadata value for a biosample or prep_sample,
     with cosmetic context.
@@ -739,7 +757,7 @@ class BiosampleResponse(BaseModel):
 
     biosample_idx: Annotated[int, Field(gt=0)]
     owner_idx: Annotated[int, Field(gt=0)]
-    metadata_checklist_idx: int | None
+    metadata_checklist: MetadataChecklistRef | None
     biosample_accession: str | None
     ena_sample_accession: str | None
     matrix_tube_id: str | None
@@ -898,7 +916,7 @@ class BiosamplePatchRequest(PatchRequestModel):
 
     NOT_NULL_FIELDS: ClassVar[frozenset[str]] = frozenset({"owner_idx"})
 
-    metadata_checklist_idx: Annotated[int, Field(gt=0)] | None = None
+    metadata_checklist_name: str | None = Field(default=None, min_length=1)
     owner_idx: Annotated[int, Field(gt=0)] | None = None
     biosample_accession: str | None = Field(default=None, min_length=1)
     ena_sample_accession: str | None = Field(default=None, min_length=1)
@@ -971,10 +989,13 @@ class StudyPatchRequest(PatchRequestModel):
     StudyCreate so a PATCH cannot smuggle in a value that POST would
     reject. owner_idx is intentionally not patchable (ownership transfer
     is a separate surface) and default_tier is intentionally not
-    patchable (its policy-shape needs its own design). Inherits
-    extra="forbid", the at_least_one_field rule, and the
-    NOT_NULL_FIELDS explicit-null guard from PatchRequestModel; lists
-    title as the not-null field.
+    patchable (its policy-shape needs its own design). The
+    submission-tracking columns (last_submission_at, submission_error)
+    are likewise omitted: this route is owner-accessible, and those
+    columns are written by the submission subsystem, not by humans
+    editing a study. Inherits extra="forbid", the at_least_one_field
+    rule, and the NOT_NULL_FIELDS explicit-null guard from
+    PatchRequestModel.
     """
 
     NOT_NULL_FIELDS: ClassVar[frozenset[str]] = frozenset({"title"})
@@ -1010,6 +1031,8 @@ class StudyResponse(BaseModel):
     funding: str | None
     ebi_study_accession: str | None
     notes: str | None
+    last_submission_at: AwareDatetime | None
+    submission_error: str | None
     extra_metadata: dict[str, object] | None
     default_tier: Tier
     created_by_idx: Annotated[int, Field(gt=0)]
@@ -1644,8 +1667,9 @@ class SequencedSampleCreateRequest(BaseModel):
 
     `metadata` keys must match seeded prep_sample_global_field display_name
     values; unknown names surface as a single 422 listing every bad key.
-    The two ENA accession fields are nullable because they are populated
-    later by the submission subsystem.
+    The two ENA accession fields are nullable: a sample may already carry
+    ENA accessions when it is created (e.g. ingesting already-submitted
+    data), or have them written back later after an ENA submission.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -1657,7 +1681,7 @@ class SequencedSampleCreateRequest(BaseModel):
     primary_study_idx: Annotated[int, Field(gt=0)]
     secondary_study_idxs: list[Annotated[int, Field(gt=0)]] = Field(default_factory=list)
     metadata: dict[str, str] = Field(default_factory=dict)
-    metadata_checklist_idx: Annotated[int, Field(gt=0)] | None = None
+    metadata_checklist_name: str | None = Field(default=None, min_length=1)
     ena_experiment_accession: str | None = Field(default=None, max_length=50)
     ena_run_accession: str | None = Field(default=None, max_length=50)
 
@@ -1712,7 +1736,7 @@ class SequencedSampleResponse(BaseModel):
     biosample_idx: Annotated[int, Field(gt=0)]
     owner_idx: Annotated[int, Field(gt=0)]
     prep_protocol_idx: Annotated[int, Field(gt=0)]
-    metadata_checklist_idx: int | None
+    metadata_checklist: MetadataChecklistRef | None
     sequenced_pool_idx: int | None
     sequenced_pool_item_id: str | None
     ena_experiment_accession: str | None
@@ -1734,8 +1758,8 @@ class SequencedSampleResponse(BaseModel):
 class SequencedSamplePatchRequest(PatchRequestModel):
     """Body for PATCH /api/v1/sequenced-sample/{sequenced_sample_idx}.
 
-    Carries only the four subtype-table columns that the submission
-    surface mutates after ingestion: the two ENA accessions and the
+    Carries the four subtype-table columns editable after creation: the
+    two ENA accessions (which may also be set at create time) and the
     submission-tracking pair. Supertype prep_sample fields
     (owner_idx, metadata_checklist_idx) and identity-level columns
     (sequenced_pool_idx, sequenced_pool_item_id) are intentionally

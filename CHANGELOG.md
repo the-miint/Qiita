@@ -13,8 +13,50 @@ the `no-changelog` label).
 
 ## [Unreleased]
 
+### Changed
+
+- `matrix_tube_id` must now be exactly 10 digits (previously 8–10), tightened on
+  both the Pydantic field pattern and the `qiita.biosample` column CHECK (#81)
+- Biosample/sequenced-sample create and biosample patch now take a checklist
+  **name** (e.g. `ERC000015`) instead of a `metadata_checklist_idx`, resolving
+  it to the idx server-side and returning a clean 422 for an unknown name —
+  mirroring how terminology term_ids resolve. CLI flag is now
+  `--metadata-checklist-name` on `biosample create`, `biosample patch`, and
+  `sequenced-sample create` (#81)
+- `BiosampleResponse` and `SequencedSampleResponse` now carry the checklist as
+  a `metadata_checklist` ref (`{idx, name}`, where name is the ENA accession)
+  instead of a bare `metadata_checklist_idx`, mirroring the missing-reason /
+  terminology-term read-back refs (#81)
+
 ### Added
 
+- ENVO terminology seed for the environmental-context biosample fields
+  (`broad_scale_environmental_context`, `local_environmental_context`,
+  `environmental_medium`), plus a reusable
+  `rebind_biosample_global_field_data_type` migration helper that guards a
+  field's data_type flip against existing metadata rows (#81)
+- Study submission tracking: `qiita.study` gains `last_submission_at` /
+  `submission_error`, exposed for read in `StudyResponse`. The three tables
+  now share one `clear_submission_error_on_new_attempt` trigger function.
+  These columns are subsystem-owned and are not on the (owner-accessible)
+  study PATCH surface; on biosample and sequenced_sample, whose PATCH routes
+  are wet_lab_admin-gated, they remain PATCHable. Not exposed through the
+  CLI. (#81)
+- `qiita study patch`, `qiita biosample patch`, and `qiita sequenced-sample
+  patch` — update a study's or sample's editable fields (including ENA
+  accession write-back) over the REST API, under If-Match optimistic
+  concurrency (#81)
+- `qiita study get`, `qiita biosample get`, and `qiita biosample list-idxs` —
+  read a study or biosample by idx, and list a study's biosample idxs, over the
+  REST API (#81)
+- `qiita biosample create --ena-sample-accession` and `qiita sequenced-sample
+  create --ena-experiment-accession` / `--ena-run-accession` — set an entity's
+  ENA accession(s) at create time when ingesting already-submitted data
+  (allowed, not required), matching `study create --ebi-study-accession` (#81)
+- `qiita study create --extra-metadata` — attach a free-form JSON object
+  (stored as JSONB) when minting a study, matching the existing
+  `--extra-metadata` flag on `sequencing-run create` / `sequenced-pool create`
+  (#81)
 - Work-ticket in-place-retry visibility: `transient_reason` / `transient_since`
   on the work-ticket status (`GET /work-ticket/{idx}` and the list view) and two
   matching `qiita.work_ticket` columns. While the runner retries an unreachable

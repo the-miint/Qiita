@@ -542,3 +542,39 @@ def test_missing_reason_ref_rejects_empty_name():
 
     with pytest.raises(ValidationError):
         MissingReasonRef(idx=1, name="")
+
+
+def test_metadata_checklist_ref_from_row_populated():
+    """Tests the case where from_row gets a non-null idx + name: it builds
+    the ref carrying both."""
+    from qiita_common.models import MetadataChecklistRef
+
+    assert MetadataChecklistRef.from_row(3, "ERC000015") == MetadataChecklistRef(
+        idx=3, name="ERC000015"
+    )
+
+
+def test_metadata_checklist_ref_from_row_none_idx():
+    """Tests the case where the row has no checklist (null idx): from_row
+    yields None rather than a ref."""
+    from qiita_common.models import MetadataChecklistRef
+
+    assert MetadataChecklistRef.from_row(None, None) is None
+
+
+def test_metadata_checklist_ref_rejects_zero_idx():
+    """Tests the case where idx is non-positive: construction fails."""
+    from qiita_common.models import MetadataChecklistRef
+
+    with pytest.raises(ValidationError):
+        MetadataChecklistRef(idx=0, name="ERC000015")
+
+
+def test_metadata_checklist_ref_rejects_empty_name():
+    """Tests the case where MetadataChecklistRef is constructed with an
+    empty name: validation fails so the empty ref never reaches the wire
+    boundary."""
+    from qiita_common.models import MetadataChecklistRef
+
+    with pytest.raises(ValidationError):
+        MetadataChecklistRef(idx=1, name="")

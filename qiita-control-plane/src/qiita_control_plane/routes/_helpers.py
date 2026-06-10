@@ -16,10 +16,12 @@ from ..repositories._sample_helpers import (
     ConflictingValueSameStudyError,
     DuplicateValueDifferentStudyError,
     DuplicateValueSameStudyError,
+    MetadataChecklistUnknownError,
     SlotOccupiedByMissingReasonError,
     SlotOccupiedByTypedValueError,
     SlotOccupiedError,
     TransientWriteRaceError,
+    fetch_metadata_checklist_idx_by_name,
 )
 
 
@@ -56,6 +58,25 @@ def raise_for_unique_violation(
     """
     detail = constraint_messages.get(exc.constraint_name, generic)
     raise HTTPException(status_code=409, detail=detail)
+
+
+async def resolve_metadata_checklist_idx(
+    conn: asyncpg.Connection,
+    name: str | None,
+) -> int | None:
+    """Resolve a caller-supplied checklist name to its idx for a write.
+
+    None passes through as None. An unknown name is mapped to a 422 so
+    every create/patch surface reports it identically rather than letting
+    it surface as a downstream FK violation.
+    """
+    try:
+        return await fetch_metadata_checklist_idx_by_name(conn, name)
+    except MetadataChecklistUnknownError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"metadata_checklist_name {exc.name!r} does not reference an existing checklist",  # noqa: E501
+        )
 
 
 def etag_for_updated_at(updated_at: datetime) -> str:

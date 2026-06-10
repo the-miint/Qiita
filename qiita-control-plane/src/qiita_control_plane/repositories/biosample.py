@@ -78,6 +78,8 @@ async def insert_biosample(
 # row -> response shaping has a single source of truth.
 _BIOSAMPLE_RETURNING_COLS = (
     "idx, owner_idx, metadata_checklist_idx,"
+    " (SELECT name FROM qiita.metadata_checklist mc"
+    "  WHERE mc.idx = biosample.metadata_checklist_idx) AS metadata_checklist_name,"
     " biosample_accession, ena_sample_accession, matrix_tube_id,"
     " last_submission_at, submission_error, last_metadata_change_at,"
     " created_by_idx, created_at, updated_at,"

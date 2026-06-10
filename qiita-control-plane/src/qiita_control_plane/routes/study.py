@@ -98,6 +98,8 @@ def _study_response_from_row(row: asyncpg.Record) -> StudyResponse:
             "funding": row["funding"],
             "ebi_study_accession": row["ebi_study_accession"],
             "notes": row["notes"],
+            "last_submission_at": row["last_submission_at"],
+            "submission_error": row["submission_error"],
             "extra_metadata": extra_metadata,
             "default_tier": row["default_tier"],
             "created_by_idx": row["created_by_idx"],
@@ -187,6 +189,7 @@ async def create_study_route(
 @router.get(PATH_STUDY_BY_IDX)
 async def get_study(
     study_idx: Annotated[int, Field(gt=0)],
+    response: Response,
     pool: asyncpg.Pool = Depends(get_db_pool),
     _scope: Principal = Depends(require_scope(Scope.STUDY_READ)),
     _exists: None = Depends(require_study_exists),
@@ -203,6 +206,10 @@ async def get_study(
     without any DB lookup, so it cannot surface that 404 on its own);
     the access guard then emits the 401 / 403 responses for callers
     that fail the tier policy.
+
+    The response carries an `ETag` header derived from the row's
+    `updated_at`, so a caller can feed it as the If-Match value on a
+    subsequent PATCH; the value is opaque-by-contract.
     """
     # The guard chain has already validated existence + access; the
     # fetch is therefore expected to find the row, but a None defends
@@ -214,6 +221,7 @@ async def get_study(
             status_code=404,
             detail=f"study {study_idx} not found",
         )
+    response.headers["ETag"] = etag_for_updated_at(row["updated_at"])
     return _study_response_from_row(row)
 
 
