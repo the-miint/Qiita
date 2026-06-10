@@ -25,7 +25,7 @@ arrow-schema = "58"
 # gymnastics, so the parquet crate from the arrow-rs ecosystem is the
 # cleanest path. Keep version pinned to arrow-* major.
 parquet = "58"
-duckdb = { version = "1.10502.0" }
+duckdb = { version = "1.10503.1" }
 hmac = "0.12"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
