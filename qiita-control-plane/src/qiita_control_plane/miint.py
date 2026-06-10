@@ -22,8 +22,9 @@ _installed = False
 
 
 def _connect() -> duckdb.DuckDBPyConnection:
-    config = miint_connect_config()
-    return duckdb.connect(":memory:", config=config) if config else duckdb.connect(":memory:")
+    # miint_connect_config() is always non-empty (allow_unsigned is always set,
+    # since miint installs from a mirror), so always pass it.
+    return duckdb.connect(":memory:", config=miint_connect_config())
 
 
 def connect_with_miint() -> duckdb.DuckDBPyConnection:

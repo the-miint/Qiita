@@ -21,6 +21,7 @@ SUBMISSION vs STEP_RUN classification — is only meaningful here.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import timedelta
 from pathlib import Path
 
@@ -51,6 +52,8 @@ from ..slurm import (
     verify_container_output,
 )
 from ..slurm.contract import JOB_PARAMS_FILENAME, JobParams
+
+_log = logging.getLogger(__name__)
 
 # SLURM's job_state strings => FailureKind.
 #
@@ -583,6 +586,19 @@ class SlurmBackend(ComputeBackend):
             kind = FailureKind.SLURMRESTD_UNREACHABLE
         else:
             kind = FailureKind.CONTRACT_VIOLATION
+        # Log the EXACT status + body before they're flattened into the
+        # BackendFailure reason. A recurring "unreachable" submit failure
+        # was ambiguous in the logs (was it a 401, a 5xx, a transport drop?);
+        # this records which, so the next stuck-on-submit incident is
+        # diagnosable without a repro.
+        _log.warning(
+            "slurmrestd submit failed for step %r → %s (status_code=%s, url=%s): %s",
+            step_name,
+            kind.value,
+            exc.status_code,
+            exc.url,
+            (exc.body or str(exc))[:500],
+        )
         return BackendFailure(
             kind=kind,
             stage=WorkTicketFailureStage.STEP_RUN,

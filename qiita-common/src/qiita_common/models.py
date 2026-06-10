@@ -1487,6 +1487,14 @@ class WorkTicket(BaseModel):
     failure_stage: WorkTicketFailureStage | None = None
     failure_step_name: str | None = Field(default=None, min_length=1, max_length=255)
     failure_reason: str | None = None
+    # In-place-retry visibility (set while the runner is stuck retrying an
+    # unreachable orchestrator/slurmrestd for this ticket; NULL otherwise).
+    # Advisory and orthogonal to the failure_* surface — the ticket is still
+    # `processing`, not `failed`. Mirrors the qiita.work_ticket columns of the
+    # same name; the status routes surface them so a wedged-looking ticket is
+    # explainable instead of silent.
+    transient_reason: str | None = None
+    transient_since: AwareDatetime | None = None
     created_at: AwareDatetime
     updated_at: AwareDatetime
 

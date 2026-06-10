@@ -15,11 +15,11 @@ process (concurrency-safe via asyncio.Lock), then `open_conn()` to
 materialize a fresh DuckDB connection with the right config — the
 caller `LOAD miint;`s the extension on its own connection.
 
-`MIINT_EXTENSION_REPO` env override exists for the team mirror at
-https://ftp.microbio.me/pub/miint; without it, install pulls from
-DuckDB community-extensions. The override implies
-`allow_unsigned_extensions=true` (the mirror's signing chain is the
-team's own, not DuckDB's).
+miint installs from the team mirror by default — the same build across all
+Qiita components, no community-vs-mirror patchwork (`MIINT_EXTENSION_REPO`
+overrides for a local/dev build). Because the source is always a mirror (its
+signing chain is the team's own, not DuckDB's), `allow_unsigned_extensions=true`
+is always set. Single-sourced in `qiita_common.duckdb_miint`.
 """
 
 from __future__ import annotations
@@ -134,13 +134,12 @@ def apply_duckdb_settings(
 
 
 def open_conn() -> duckdb.DuckDBPyConnection:
-    """Open an in-memory DuckDB connection with the miint-load config —
-    unsigned-extensions when MIINT_EXTENSION_REPO is set (the team mirror),
-    and an isolated extension_directory when MIINT_EXTENSION_DIRECTORY is set.
-    Config resolution is shared with the CLI via
-    `qiita_common.duckdb_miint.miint_connect_config`."""
-    config = miint_connect_config()
-    return duckdb.connect(":memory:", config=config) if config else duckdb.connect(":memory:")
+    """Open an in-memory DuckDB connection with the miint-load config: unsigned
+    extensions are always allowed (miint installs from a mirror, not a
+    DuckDB-signed channel), and an isolated extension_directory is used when
+    MIINT_EXTENSION_DIRECTORY is set. Config resolution is shared with the CLI
+    via `qiita_common.duckdb_miint.miint_connect_config`."""
+    return duckdb.connect(":memory:", config=miint_connect_config())
 
 
 async def ensure_miint_installed() -> None:

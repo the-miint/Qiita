@@ -57,6 +57,12 @@ the `no-changelog` label).
   (stored as JSONB) when minting a study, matching the existing
   `--extra-metadata` flag on `sequencing-run create` / `sequenced-pool create`
   (#75)
+- Work-ticket in-place-retry visibility: `transient_reason` / `transient_since`
+  on the work-ticket status (`GET /work-ticket/{idx}` and the list view) and two
+  matching `qiita.work_ticket` columns. While the runner retries an unreachable
+  orchestrator/slurmrestd in place, it records *why* and *since when* so a
+  ticket stuck in `processing` is explainable instead of looking silently
+  wedged; cleared once it makes progress or fails (#80)
 - `GET /work-ticket` — list work tickets, each with a snapshot of its current
   step's compute placement (`compute_target`, `slurm_job_id`, `step_state`,
   `current_step_index/name`) from a single join against the new
@@ -114,6 +120,18 @@ the `no-changelog` label).
 
 ### Changed
 
+- The user-CLI quickstart now documents the headless / remote-host auth path:
+  `qiita login` needs a co-located browser + loopback receiver, so on an SSH
+  session / HPC login node / CI runner you carry the PAT instead — log in once
+  on a browser machine, then `export QIITA_TOKEN=…` (+ `QIITA_CONTROL_PLANE_URL`)
+  on the headless host. `$QIITA_TOKEN` already took precedence over the token
+  file; this just makes the supported path discoverable (#80)
+- miint now installs from the team mirror by default in every component (CP CLI,
+  CO service, native SLURM jobs): `miint_install_sql()` always `FORCE INSTALL`s
+  from `MIINT_MIRROR_URL` (override with `MIINT_EXTENSION_REPO`) instead of
+  falling back to the DuckDB community channel — so one host can't drift to a
+  different `read_fastx` build, and `FORCE` overwrites a stale cached extension
+  (#80)
 - Decoupled compute-step execution: the orchestrator's single blocking
   `POST /step/run` is replaced by the stateless `submit` / `status` / `result`
   trio, and the **control plane** now owns the poll loop. A long SLURM job no
@@ -180,6 +198,55 @@ the `no-changelog` label).
 
 ### Fixed
 
+- `qiita reference load --local` no longer hard-fails when the
+  `--fasta-manifest` path isn't visible from the host running the CLI (e.g. a
+  login node without the compute node's shared-FS view). The manifest is read
+  by `stage_local_fasta` on the compute node, not by the CLI, so a missing path
+  is now a warning (still flags a real typo) and the submit proceeds —
+  consistent with the companion paths, which were never existence-checked. The
+  absoluteness check is unchanged (a relative path still errors) (#80)
+- SLURM JWT recovery no longer depends on a clean 401. `SlurmrestdClient` now
+  proactively reloads the JWT from its file when the cached token is within 60s
+  of its `exp`, *before* sending the request — so a long-lived orchestrator
+  can't run on a boot-cached token past expiry until a restart when slurmrestd
+  rejects an expired token with a 5xx / dropped connection instead of a 401
+  (the reload-on-401 path only fires on a 401). The 401-reload path is kept as a
+  fallback, and both the 401 reload and the submit-error classification now log
+  the exact status so the next stuck-on-submit incident is diagnosable without a
+  repro (#80)
+- The runner's in-place infra-unreachable retry is now escapable and bounded.
+  An operator `qiita-admin ticket force-fail` (a direct-DB FAILED transition) is
+  now noticed: every infra-retry/poll iteration re-checks the ticket's DB state
+  and bails if it has gone terminal, instead of spinning forever against a
+  ticket it no longer owns — without clobbering the operator's failure surface.
+  The retry sleep is now capped exponential backoff (base = poll interval,
+  doubling to a 60s cap) rather than a flat hammer, and the never-fail-on-outage
+  invariant is preserved — there is still no hard give-up (#80)
+- Redriving a FAILED reference workflow via `POST /work-ticket/{idx}/run` now
+  actually works. Two redrive defects fixed in the same atomic reset: the
+  `reference` scope_target was left pinned at `failed`, so the redriven
+  workflow's first status PATCH (`failed → hashing`) was illegal and the redrive
+  died immediately — `/run` now resets the reference `failed → pending` (the
+  FSM's only legal exit from `failed`); the prior run's terminal `failed`
+  `work_ticket_step` rows survived, so the runner's fresh attempt-0 collided with
+  the dead row (the step-progress writers reject any transition out of `failed`)
+  — `/run` now drops every non-`completed` step row (keeping `completed` ones so
+  fast-forward still works). A reference that failed at a later step still fails
+  cleanly on redrive (the FSM can't rewind past `pending`); that multi-step case
+  is not yet supported (#80)
+- A rejected SLURM submit no longer looks like a success: slurmrestd answers
+  HTTP 200 even when slurmctld refuses the job (unavailable partition, QOS
+  limit, …), and `SlurmrestdClient.submit_job` trusted the echoed `job_id`
+  blindly. It now inspects `result.error_code` and the top-level `errors[]`
+  array first and raises (classified as a permanent `CONTRACT_VIOLATION`, since
+  re-submitting the same payload won't help); benign `warnings[]` (e.g. the
+  `nodes` type warning) stay non-fatal (#80)
+- Stale compute-environment failures now surface at deploy, not at the first
+  job: `compute-readiness` probes that the compute node's miint build binds
+  `read_fastx(max_batch_bytes:=…)` (the call `stage_local_fasta`/`reference load`
+  issue), and the redeploy runbook now documents refreshing the separate
+  `SLURM_NATIVE_PYTHON` checkout so native jobs don't import stale `qiita-common`
+  (#80)
 - Long compute steps no longer self-fail: under the old held-connection model a
   step exceeding the 600s CP→CO client timeout tripped an httpx error that
   skipped the retry loop and marked the ticket FAILED while the SLURM job kept

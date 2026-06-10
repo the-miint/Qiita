@@ -711,6 +711,44 @@ async def test_run_step_submit_4xx_is_contract_violation(jwt_path, baseline, tmp
 
 
 @pytest.mark.asyncio
+async def test_run_step_submit_200_with_error_code_is_contract_violation(
+    jwt_path, baseline, tmp_path
+):
+    """slurmrestd HTTP 200 carrying a non-zero result.error_code (the job
+    was rejected by slurmctld, e.g. partition unavailable) => permanent
+    CONTRACT_VIOLATION, not a successful submit and not a retriable
+    transport failure."""
+    handler = httpx.MockTransport(
+        lambda req: httpx.Response(
+            200,
+            json={
+                "job_id": 0,
+                "result": {
+                    "job_id": 0,
+                    "error_code": 2015,
+                    "error": "Requested partition configuration not available now",
+                },
+            },
+        )
+    )
+    backend = _make_backend(handler, jwt_path)
+    with pytest.raises(BackendFailure) as ei:
+        await _run_step_via_trio(
+            backend,
+            "hash",
+            {},
+            tmp_path,
+            scope_target={"kind": "reference", "reference_idx": 1},
+            work_ticket_idx=99,
+            container="docker://qiita/hash:1.0.0",
+            entrypoint=None,
+            baseline_resources=baseline,
+        )
+    assert ei.value.kind == FailureKind.CONTRACT_VIOLATION
+    assert ei.value.transient is False
+
+
+@pytest.mark.asyncio
 async def test_run_step_submit_persistent_401_is_unreachable(jwt_path, baseline, tmp_path):
     """slurmrestd 401 that survives the client's JWT-refresh retry must
     classify as SLURMRESTD_UNREACHABLE (retriable). The user's rotation
