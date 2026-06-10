@@ -266,10 +266,11 @@ fi
 # install via the single-sourced path (so it also proves the mirror reaches
 # this node) and exercises read_fastx in the shape stage_local_fasta /
 # reference_load use; the goal is "this node runs a current, usable miint", not
-# any single function or parameter. chr(10) builds the FASTA's newlines: a
-# literal `\n` here would be
-# expanded by THIS f-string into a real newline inside the generated Python
-# string literal — a syntax error in the probe script — so chr(10) sidesteps it.
+# any single function or parameter. chr(10) builds the FASTA's newlines because
+# writing a backslash-n escape in this comment would itself be expanded by THIS
+# f-string into a real newline in the generated script (which previously split
+# this comment and left an unmatched backtick, aborting bash at parse time), so
+# chr(10) sidesteps it. A bash -n regression test now guards the whole script.
 MIINT_PROBE="$(mktemp)"
 cat > "$MIINT_PROBE" <<'PYEOF'
 import os, tempfile, duckdb
@@ -372,6 +373,18 @@ def build_probe_submit_payload(
 _TERMINAL_STATES = frozenset(s.value for s in TerminalSlurmState)
 
 
+def _default_probe_log_dir(settings: Settings) -> Path:
+    """Directory the probe job's stdout/stderr log defaults into when the caller
+    doesn't inject one. PATH_SCRATCH/ticket lives on the shared filesystem (the
+    same group-writable, deploy-provisioned dir the probe's own
+    shared-fs-writable check targets), so the head node can read the log back and
+    surface the compute-node native-import / miint-read-fastx results. The
+    previous default — node-local /tmp — was written on the compute node and
+    unreadable from the head node, so slurm-probe-log always failed to open it
+    and those results never surfaced."""
+    return Path(settings.path_scratch) / "ticket"
+
+
 async def submit_probe_and_collect(
     settings: Settings,
     *,
@@ -389,7 +402,7 @@ async def submit_probe_and_collect(
     `log_dir` + pid + random suffix."""
     assert settings.slurm is not None, "compute-readiness probe requires COMPUTE_BACKEND=slurm"
     if log_path is None:
-        log_dir = log_dir or Path("/tmp")
+        log_dir = log_dir or _default_probe_log_dir(settings)
         # `pid + random suffix` rather than pid alone: pids reuse on
         # long-running hosts, and two concurrent operators / retries
         # would otherwise collide on the log path (and a stale log from
@@ -460,8 +473,8 @@ async def submit_probe_and_collect(
         )
         return results
     results.extend(_parse_probe_log(log_text))
-    # Best-effort cleanup; if it fails the file is in /tmp and SLURM
-    # rotation will handle it.
+    # Best-effort cleanup of the shared-FS probe log; a leftover is harmless
+    # (uniquely named per pid+suffix) and won't be re-read by a later run.
     try:
         log_path.unlink()
     except OSError:
