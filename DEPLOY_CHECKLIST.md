@@ -72,17 +72,30 @@ sudo SKIP_PULL=1 QIITA_HOSTNAME=qiita-miint.ucsd.edu /home/qiita/qiita-miint/dep
 # Native SLURM jobs run from SLURM_NATIVE_PYTHON's SEPARATE shared-FS checkout —
 # refresh it too, or native jobs import stale qiita-common (and can keep a stale
 # cached miint whose read_fastx lacks max_batch_bytes). The next job then
-# FORCE-installs miint from the mirror. See redeploy.md §6.
-cd /home/qiita/qiita-miint/qiita-compute-orchestrator && uv sync --reinstall-package qiita-common
+# FORCE-installs miint from the mirror. See redeploy.md §6. Run as the `qiita`
+# user that OWNS the checkout — running as the deploying admin hits a
+# Permission-denied removing qiita-owned .venv files. uv is not on qiita's login
+# PATH, so invoke it by full path (/usr/local/bin/uv on qiita-miint).
+sudo -u qiita bash -lc 'cd /home/qiita/qiita-miint/qiita-compute-orchestrator && /usr/local/bin/uv sync --reinstall-package qiita-common'
 ```
 
 ### 5. Verify
 
 ```bash
-# (#80) [admin] compute node's native imports resolve AND its miint build binds
-# read_fastx(max_batch_bytes:=…) — a stale compute env fails these, loudly, here.
-sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
-    qiita-admin compute-readiness' | grep -E 'probe/(native-import|miint-read-fastx)'   # both =ok (#80)
+# (#80) [admin] Run as qiita-orch with the CO env (the CP-side form fails on
+# co-to-cp.token perms). KNOWN-BROKEN PROBE — compute-readiness currently exits 2
+# with `slurm-probe-completed: state=FAILED` (sacct: ExitCode 2:0, MaxRSS ~20MB,
+# ~1s) on EVERY host: the generated probe bash has a syntax error — a `\n` in an
+# f-string comment in build_probe_script expands to a real newline, exposing an
+# unmatched backtick, so bash aborts at parse time before any check runs. This is
+# a probe CODE bug, NOT a compute-env failure (the miint/native-import checks #80
+# added never execute). Tracked as a follow-up: escape the comment, add a `bash -n`
+# regression test on the generated script, and relocate the probe log off
+# node-local /tmp so results are head-node-readable here. The head-node check
+# `native-python-on-host=ok` does pass. Until the probe is fixed, confirm the
+# compute env with a real reference-load / fastq-to-parquet job.
+sudo -u qiita-orch bash -c 'set -a; source /etc/qiita/compute-orchestrator.env; set +a; \
+    /home/qiita/.local/bin/qiita-admin compute-readiness'   # native-python-on-host=ok; rest FAILs pending probe fix (#80)
 ```
 
 ### Notes (no host action)
