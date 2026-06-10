@@ -23,6 +23,40 @@ _None yet._
 
 ### 3. Migrations
 
+_None yet._
+
+### 4. Deploy
+
+_None yet._
+
+### 5. Verify
+
+_None yet._
+
+### Notes (no host action)
+
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-10 — c230e87
+
+Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
 ```sql
 -- [admin] Pre-check before `make migrate`. The matrix_tube_id migration
 -- tightens the format CHECK to exactly 10 digits; its guard aborts the
@@ -62,7 +96,7 @@ make -C ~/qiita-miint migrate
 ```
 `dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#80) adds `20260609000000_work_ticket_transient_retry` (plain `ALTER TABLE qiita.work_ticket ADD COLUMN transient_reason/transient_since`, both nullable; no extension or backfill). (#81) adds `20260604000000_study_submission_tracking`, `20260608000000_biosample_field_rebind_fn`, `20260608000001_seed_envo_terminology` (gated on the ENVO pre-check above), and `20260609000001_biosample_matrix_tube_id_exact_length` (gated on the matrix-tube pre-check above).
 
-### 4. Deploy
+#### 4. Deploy
 
 ```bash
 # [admin] SKIP_PULL=1 because redeploy.md step 2 already pulled the clone.
@@ -79,7 +113,7 @@ sudo SKIP_PULL=1 QIITA_HOSTNAME=qiita-miint.ucsd.edu /home/qiita/qiita-miint/dep
 sudo -u qiita bash -lc 'cd /home/qiita/qiita-miint/qiita-compute-orchestrator && /usr/local/bin/uv sync --reinstall-package qiita-common'
 ```
 
-### 5. Verify
+#### 5. Verify
 
 ```bash
 # (#80) [admin] Run as qiita-orch with the CO env (the CP-side form fails on
@@ -98,17 +132,11 @@ sudo -u qiita-orch bash -c 'set -a; source /etc/qiita/compute-orchestrator.env; 
     /home/qiita/.local/bin/qiita-admin compute-readiness'   # native-python-on-host=ok; rest FAILs pending probe fix (#80)
 ```
 
-### Notes (no host action)
+#### Notes (no host action)
 
 - (#80) Additive work-ticket status fields `transient_reason` / `transient_since` (`GET /work-ticket/{idx}` and the list view) surface why the runner is retrying an unreachable orchestrator in place. Backed by the plain `20260609000000_work_ticket_transient_retry` migration (bucket 3); additive, so existing clients are unaffected. No host action beyond `make migrate`.
 - (#81) Checklist binding is now by **name**: biosample/sequenced-sample create and biosample patch take a checklist name (e.g. `ERC000015`) instead of a `metadata_checklist_idx` (unknown name → 422), and `BiosampleResponse`/`SequencedSampleResponse` now return the checklist as a `metadata_checklist` ref (`{idx, name}`) instead of a bare `metadata_checklist_idx`. Clients sending the old idx field or reading the old response key must update. CLI flag is now `--metadata-checklist-name`.
 - (#81) `matrix_tube_id` is now validated as exactly 10 digits (was 8–10); a previously-accepted 8- or 9-digit value now returns 422.
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-08 — 2666587
 
