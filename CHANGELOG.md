@@ -15,6 +15,9 @@ the `no-changelog` label).
 
 ### Changed
 
+- Bumped the pinned `run-preflight` dependency to a newer upstream SHA in both
+  the control-plane and compute-orchestrator, kept in lockstep by the SHA parity
+  test (#82)
 - `matrix_tube_id` must now be exactly 10 digits (previously 8–10), tightened on
   both the Pydantic field pattern and the `qiita.biosample` column CHECK (#81)
 - Biosample/sequenced-sample create and biosample patch now take a checklist
