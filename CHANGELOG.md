@@ -15,6 +15,14 @@ the `no-changelog` label).
 
 ### Changed
 
+- Bumped the pinned DuckDB across all components to **1.5.3** to match the team
+  miint mirror's current build: `duckdb>=1.5.3` in control-plane,
+  compute-orchestrator, and the integration tests (locks re-resolved), and the
+  data-plane Rust crate `1.10502.0` → `1.10503.1`. The compute env was on DuckDB
+  1.5.2, so the native `stage_local_fasta` job installed the **stale** `v1.5.2`
+  miint build from the mirror instead of the current `v1.5.3` one — DuckDB
+  resolves the miint extension for its *own* version, so running 1.5.3 is the
+  only way onto the current build (#85)
 - Bumped the pinned `run-preflight` dependency to a newer upstream SHA in both
   the control-plane and compute-orchestrator, kept in lockstep by the SHA parity
   test (#82)

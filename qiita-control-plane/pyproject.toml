@@ -11,7 +11,7 @@ dependencies = [
     "pyjwt[crypto]>=2.9",
     "httpx>=0.28",
     "pyyaml>=6",
-    "duckdb>=1.5",
+    "duckdb>=1.5.3",
     "jsonschema>=4.20",
     "jinja2>=3.1",
     # gRPC health-check stubs for the DP probe in /health. Used to
