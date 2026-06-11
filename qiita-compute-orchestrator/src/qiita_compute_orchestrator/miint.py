@@ -70,8 +70,9 @@ PARQUET_OPTS_INTERMEDIATE: str = "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESS
 #
 # CHUNK_ROW_GROUP_SIZE (and the matching CHUNK_SIZE) are single-sourced in
 # `qiita_common.chunking`, shared with the CLI's DoPut path. The actual
-# chunking is the DuckDB list_transform/UNNEST macro over read_fastx, in
-# `stage_local_fasta` (which imports CHUNK_SIZE from qiita_common.chunking).
+# chunking is miint's native `sequence_split` over read_fastx, in
+# `stage_local_fasta` (which builds the expression via
+# `qiita_common.chunking.sequence_split_expr`).
 PARQUET_OPTS_CHUNKED: str = f"{PARQUET_OPTS}, ROW_GROUP_SIZE {CHUNK_ROW_GROUP_SIZE}"
 
 

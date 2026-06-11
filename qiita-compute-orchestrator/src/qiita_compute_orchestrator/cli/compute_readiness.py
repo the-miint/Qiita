@@ -290,6 +290,30 @@ else
 fi
 rm -f "$MIINT_PROBE"
 
+# `sequence_split` is the native chunker stage_local_fasta / reference_load rely
+# on (it replaced the O(L^2) list_transform/substring SQL macro; duckdb-miint
+# #121 / DuckDB #23229). It is NEWER than read_fastx, so a mirror still serving
+# an older build passes the read_fastx probe above but FAILS here — exactly the
+# stale-build case this probe exists to catch at deploy, not at the first
+# reference-load job. Separate install+load so this stands alone if the read
+# probe's tempfile was already cleaned.
+MIINT_SPLIT_PROBE="$(mktemp)"
+cat > "$MIINT_SPLIT_PROBE" <<'PYEOF'
+import duckdb
+from qiita_common.duckdb_miint import miint_connect_config, miint_install_sql
+conn = duckdb.connect(":memory:", config=miint_connect_config())
+conn.execute(miint_install_sql())
+conn.execute("LOAD miint;")
+rows = conn.execute("SELECT UNNEST(sequence_split('ACGTACGT', 4))").fetchall()
+assert len(rows) == 2, rows
+PYEOF
+if "$PYTHON" "$MIINT_SPLIT_PROBE" >/dev/null 2>&1; then
+    echo "{_PROBE_LINE_PREFIX} miint-sequence-split=ok"
+else
+    echo "{_PROBE_LINE_PREFIX} miint-sequence-split=fail"
+fi
+rm -f "$MIINT_SPLIT_PROBE"
+
 # The `/ticket` leaf must match the control plane's PATH_SCRATCH/ticket
 # derivation (qiita_control_plane.config.Settings.from_env) — that's the
 # per-ticket workspace SLURM jobs actually run in.

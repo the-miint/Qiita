@@ -290,6 +290,17 @@ def test_probe_script_is_valid_bash():
     assert proc.returncode == 0, f"probe script is not valid bash:\n{proc.stderr}"
 
 
+def test_probe_script_checks_miint_sequence_split():
+    """The probe also exercises miint's native `sequence_split` chunker, which is
+    newer than read_fastx — a mirror serving a stale build without it passes the
+    read_fastx probe but fails here, catching the stale-build case at deploy
+    rather than at the first reference-load job."""
+    script = cr.build_probe_script(path_scratch="/scratch/qiita")
+    assert "sequence_split(" in script
+    assert "miint-sequence-split=ok" in script
+    assert "miint-sequence-split=fail" in script
+
+
 def test_parse_probe_log_unknown_value_defaults_to_fail():
     """If the probe emits a value the parser doesn't recognize, it
     should be reported as a failure rather than silently passed —

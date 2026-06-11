@@ -59,6 +59,7 @@ Signatures are abbreviated — go to the upstream `.md` for full parameter docs.
 - `woltka_ogu(relation, sequence_id_field [, sample_id])` — OGU feature table
 - `sequence_dna_reverse_complement(seq)` / `sequence_rna_reverse_complement(seq)`
 - `sequence_dna_as_regexp(seq)` / `sequence_rna_as_regexp(seq)` — IUPAC-aware regex compile
+- `sequence_split(seq, chunk_size)` → `LIST(STRUCT(chunk_index INTEGER, chunk_data VARCHAR))` — fixed-width chunking in a single linear pass; `UNNEST` for chunk rows. Backs qiita's chunked-Parquet write (`stage_local_fasta`, CLI `reference load`), replacing an O(L²) SQL macro (duckdb-miint #121 / DuckDB #23229; added 2026-06)
 - `compress_intervals(start, stop)`
 - `compute_coverage_depth(position, stop_position, cigar, reference_length, mode)`
 - `genome_coverage(alignments, subject_total_length, subject_genome_id)`

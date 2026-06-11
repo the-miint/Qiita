@@ -9,7 +9,7 @@ inputs:
   version:
     description: libduckdb version (without the leading 'v').
     required: false
-    default: "1.5.2"
+    default: "1.5.3"
   runtime-libpath:
     description: |
       Set DYLD_LIBRARY_PATH (macOS) or LD_LIBRARY_PATH (Linux) so test
