@@ -178,7 +178,8 @@ async def test_long_sequence_chunks_at_default_size(tmp_path):
 async def test_exact_multiple_chunk_boundary(tmp_path):
     """A sequence whose length is an exact multiple of CHUNK_SIZE splits into
     exactly that many full chunks — no empty trailing chunk. Guards the
-    `CEIL(length(seq)/CHUNK_SIZE)` boundary in the chunk_list macro."""
+    chunk-boundary behavior of miint's `sequence_split` (last chunk = remainder,
+    so an exact multiple yields no empty trailing chunk)."""
     seq = "A" * (CHUNK_SIZE * 2)
     fa = _write_fasta(tmp_path / "a.fa", [("exact", seq)])
     manifest = _write_manifest(tmp_path / "m.txt", [str(fa)])

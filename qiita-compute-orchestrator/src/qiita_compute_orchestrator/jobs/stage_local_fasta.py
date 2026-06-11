@@ -15,7 +15,7 @@ local path; everything downstream is reused verbatim.
 **Parsing + chunking are done in DuckDB, not Python.** FASTA records are read
 with miint's `read_fastx` table function (native parser; `.gz` transparent;
 `read_id` is the header's first token, matching the remote path), and the 64 KB
-chunking is the blessed `list_transform` + `UNNEST` macro — never a hand-rolled
+chunking is miint's native `sequence_split` (`UNNEST`ed) — never a hand-rolled
 Python parser. `read_fastx` only accepts a literal path arg (no lateral join
 over a path column), so the manifest is iterated in Python with one
 `read_fastx(?)` per file; that is control flow only — no sequence bytes pass
@@ -49,7 +49,7 @@ import shutil
 from pathlib import Path
 
 from pydantic import BaseModel
-from qiita_common.chunking import CHUNK_LIST_MACRO_SQL
+from qiita_common.chunking import sequence_split_expr
 from qiita_common.duckdb_miint import is_empty_sequence_file
 from qiita_common.parquet import validate_parquet_path
 
@@ -131,7 +131,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     """Read every manifest FASTA with `read_fastx`; emit one combined chunked
     Parquet. Validates the manifest and each listed file, stages all reads into
     a DuckDB table (one `read_fastx` per file), fails fast on an empty-body
-    record or a duplicate read_id, then COPYs the `list_transform`/`UNNEST`
+    record or a duplicate read_id, then COPYs the `sequence_split`/`UNNEST`
     chunking to `fasta.parquet`. Returns `{"fasta_path": <parquet>}`.
     """
     if not inputs.fasta_manifest_path.is_absolute():
@@ -203,16 +203,14 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     f"genome_map join key and must be unique: {names}"
                 )
 
-            # Chunk + write in one COPY using the shared `chunk_list` macro
+            # Chunk + write in one COPY using miint's native `sequence_split`
             # (single chunking definition for both this job and the CLI; see
-            # qiita_common.chunking). Each sequence explodes into 64 KB pieces
-            # via list_transform/UNNEST; the substring()s are views, no
-            # re-materialisation.
-            conn.execute(CHUNK_LIST_MACRO_SQL)
+            # qiita_common.chunking). Each sequence splits into 64 KB pieces in a
+            # single linear pass; UNNEST gives one row per chunk.
             conn.execute(
                 "COPY ("
                 "  SELECT read_id, c.chunk_index, c.chunk_data FROM ("
-                "    SELECT read_id, UNNEST(chunk_list(sequence)) AS c FROM reads"
+                f"    SELECT read_id, UNNEST({sequence_split_expr('sequence')}) AS c FROM reads"
                 "  )"
                 f") TO '{fasta_out}' ({PARQUET_OPTS_CHUNKED})"
             )

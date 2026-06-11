@@ -15,6 +15,21 @@ the `no-changelog` label).
 
 ### Changed
 
+- Sequence chunking now uses miint's native `sequence_split` (single linear
+  pass) instead of the pure-SQL `list_transform`/`substring` macro, which was
+  **O(L²)** on large single records (host reference genomes) due to DuckDB
+  #23229 — inside a lambda a captured column loses the statistics that select
+  `substring`'s O(1) ASCII fast path, so it rescans from byte 0 on every chunk.
+  Affects `stage_local_fasta` and the CLI `reference load` FASTA path; ~480×
+  faster on a 256 MB record. Requires the miint build with `sequence_split`
+  (duckdb-miint #121) on the mirror — gated in `DEPLOY_CHECKLIST.md` (#86)
+- Completed the DuckDB 1.5.3 bump (#85) by updating the three spots it missed:
+  the `setup-libduckdb` action default (`1.5.2` → `1.5.3`, so the Rust data-plane
+  CI links the libduckdb matching its `1.10503.1` crate), the `deploy.yml`
+  extension cache key, and the `v1.5.2` mentions in `docs/architecture.md` and
+  the data-plane README. Added a CI guard (`test_duckdb_version_sync`) asserting
+  the action default and deploy cache key match the data-plane `duckdb` crate, so
+  a future DuckDB bump can't half-land (#86)
 - Bumped the pinned DuckDB across all components to **1.5.3** to match the team
   miint mirror's current build: `duckdb>=1.5.3` in control-plane,
   compute-orchestrator, and the integration tests (locks re-resolved), and the

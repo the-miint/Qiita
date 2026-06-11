@@ -19,7 +19,16 @@ _None yet._
 
 ### 2. One-time host setup
 
-_None yet._
+- (#86) [operator] Ensure the **v1.5.3** miint build on the mirror
+  (`https://ftp.microbio.me/pub/miint/v1.5.3/`) includes the `sequence_split`
+  scalar (duckdb-miint #121) BEFORE the bucket-4 deploy. Components run DuckDB
+  1.5.3 (#85) and `FORCE INSTALL miint` for their own version, so they pull the
+  `v1.5.3` build; the chunking SQL (`UNNEST(sequence_split(...))`) only resolves
+  if that build has the function. Adding it is backward-compatible (it only adds
+  a scalar), so publishing early does not affect already-deployed code. If the
+  v1.5.3 build lacks `sequence_split` at deploy time, `stage_local_fasta` and the
+  CLI `reference load` FASTA path fail with "Scalar Function with name
+  sequence_split does not exist" — the bucket-5 probe catches this first.
 
 ### 3. Migrations
 
@@ -31,11 +40,19 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+```bash
+# (#86) [admin] the deployed compute node's v1.5.3 miint build exposes
+# sequence_split (the native chunker stage_local_fasta / reference_load depend
+# on). It is newer than read_fastx, so a mirror build missing it passes the
+# read_fastx probe but FAILS here — confirming the bucket-2 publish reached the
+# node.
+sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
+    qiita-admin compute-readiness' | grep -E 'probe/(miint-read-fastx|miint-sequence-split)'   # both =ok (#86)
+```
 
 ### Notes (no host action)
 
-_None yet._
+- (#86) Sequence chunking switched from the pure-SQL `list_transform`/`substring` macro to miint's native `sequence_split` (duckdb-miint #121), fixing an O(L²) blow-up on large single FASTA records (DuckDB #23229). No client/API change — same chunked-Parquet shape `(read_id, chunk_index, chunk_data)`. The only operator action is the bucket-2 mirror check (the deployed code needs a v1.5.3 miint build that has `sequence_split`); no env var, host dir, or migration.
 
 ---
 

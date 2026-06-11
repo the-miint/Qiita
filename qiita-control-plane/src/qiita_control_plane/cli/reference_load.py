@@ -37,7 +37,7 @@ are mutually exclusive.
 
 **Arrow streaming** (per role, remote path only):
 
-  - FASTA: miint ``read_fastx`` + DuckDB ``list_transform``/``UNNEST``
+  - FASTA: miint ``read_fastx`` + miint ``sequence_split`` (``UNNEST``)
            64 KB chunking, streamed via ``to_arrow_reader``. Upload
            schema: ``(read_id, chunk_index, chunk_data)``. Bounded memory
            regardless of record size — ``max_batch_bytes`` caps the read
@@ -88,7 +88,7 @@ from qiita_common.api_paths import (
     URL_WORK_TICKET_PREFIX,
 )
 from qiita_common.auth_constants import BEARER_PREFIX
-from qiita_common.chunking import CHUNK_LIST_MACRO_SQL, CHUNK_ROW_GROUP_SIZE, CHUNK_SIZE
+from qiita_common.chunking import CHUNK_ROW_GROUP_SIZE, CHUNK_SIZE, sequence_split_expr
 
 if TYPE_CHECKING:
     import pyarrow.flight as flight
@@ -145,9 +145,9 @@ class UploadResult:
 # role picks the shape its server-side consumer expects to read.
 
 # Chunked-upload tuning. The 64 KB chunk size is the shared
-# qiita_common.chunking.CHUNK_SIZE: the FASTA streamer passes it to the DuckDB
-# chunking macro over read_fastx, and the blob streamer (Newick / jplace)
-# reuses it for its byte reads. The per-RecordBatch row count —
+# qiita_common.chunking.CHUNK_SIZE: the FASTA streamer passes it to miint's
+# native `sequence_split` over read_fastx, and the blob streamer (Newick /
+# jplace) reuses it for its byte reads. The per-RecordBatch row count —
 # CHUNK_ROW_GROUP_SIZE (16384) — keeps each batch ~1 GB on dense data and bounds
 # CLI memory regardless of source-record size (GG2 genome records run up to
 # ~21 MB; backbone 16S records are ~1.5 KB).
@@ -155,8 +155,8 @@ _CHUNK_SIZE = CHUNK_SIZE
 _CHUNK_ROWS_PER_BATCH = CHUNK_ROW_GROUP_SIZE
 
 # Byte budget per read_fastx batch. Caps the read-side vector so a run of
-# multi-MB genome records can't materialise a giant batch before the chunking
-# macro runs — the read-side memory lever (the DuckDB result streams to the
+# multi-MB genome records can't materialise a giant batch before `sequence_split`
+# runs — the read-side memory lever (the DuckDB result streams to the
 # DoPut writer one bounded RecordBatch at a time via to_arrow_reader).
 _READ_FASTX_MAX_BATCH_BYTES = "64MB"
 
@@ -177,8 +177,8 @@ def _fasta_upload_stream(fasta_path: Path) -> Iterator[UploadStream]:
     """FASTA → `(read_id, chunk_index, chunk_data)` chunked stream via miint.
 
     miint's `read_fastx` parses FASTA natively (gz-transparent; `read_id` is
-    the header's first token, description dropped); the 64 KB chunking is the
-    DuckDB `list_transform`/`UNNEST` macro; `to_arrow_reader` hands DuckDB's
+    the header's first token, description dropped); the 64 KB chunking is miint's
+    native `sequence_split` (`UNNEST`ed); `to_arrow_reader` hands DuckDB's
     streaming result to the DoPut writer one bounded RecordBatch at a time. No
     sequence bytes pass through Python and no intermediate Parquet hits local
     disk.
@@ -206,12 +206,12 @@ def _fasta_upload_stream(fasta_path: Path) -> Iterator[UploadStream]:
 
     conn = connect_with_miint()
     try:
-        # `chunk_list` is the shared chunking macro (one definition for both the
-        # CLI and the orchestrator's stage_local_fasta; see qiita_common.chunking).
-        conn.execute(CHUNK_LIST_MACRO_SQL)
+        # miint's native `sequence_split` is the shared chunker (one definition
+        # for both the CLI and the orchestrator's stage_local_fasta; see
+        # qiita_common.chunking).
         reader = conn.execute(
             "SELECT read_id, c.chunk_index, c.chunk_data FROM ("
-            "  SELECT read_id, UNNEST(chunk_list(sequence1)) AS c"
+            f"  SELECT read_id, UNNEST({sequence_split_expr('sequence1')}) AS c"
             f"  FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}')"
             ")",
             [str(fasta_path)],
