@@ -209,6 +209,16 @@ the `no-changelog` label).
 
 ### Fixed
 
+- `qiita-admin compute-readiness` no longer aborts its SLURM probe at parse
+  time. A newline-escape inside an f-string comment in `build_probe_script`
+  expanded to a real newline, splitting the comment and leaving an unmatched
+  backtick, so the generated probe script failed `bash` parsing (exit 2) before
+  any check ran — meaning the `native-import` / `miint-read-fastx` compute-env
+  guards #80 added never actually executed. Fixed the comment, added a `bash -n`
+  regression test over the generated script (the existing substring tests
+  couldn't catch it), and defaulted the probe log onto the shared filesystem
+  (`PATH_SCRATCH/ticket`) instead of node-local `/tmp` so the head node can read
+  the compute-node probe results back (#84)
 - `qiita reference load --local` no longer hard-fails when the
   `--fasta-manifest` path isn't visible from the host running the CLI (e.g. a
   login node without the compute node's shared-FS view). The manifest is read

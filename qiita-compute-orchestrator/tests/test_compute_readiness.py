@@ -271,6 +271,25 @@ def test_probe_script_checks_miint_read_fastx():
     assert "max_batch_bytes" in script
 
 
+def test_probe_script_is_valid_bash():
+    """The generated probe script must parse as valid bash. Regression for an
+    f-string newline-escape written inside a comment that expanded to a real
+    newline, splitting the comment and leaving an unmatched backtick — so bash
+    aborted at parse time (exit 2, ~1s on the cluster) before any check ran. The
+    Python-side substring assertions above never caught it; only parsing the
+    whole script does. `bash -n` reads the script on stdin and checks syntax
+    without executing it."""
+    import shutil
+    import subprocess
+
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover - bash is present on CI (ubuntu + macos)
+        pytest.skip("bash not available")
+    script = cr.build_probe_script(path_scratch="/scratch/qiita")
+    proc = subprocess.run([bash, "-n"], input=script, capture_output=True, text=True)
+    assert proc.returncode == 0, f"probe script is not valid bash:\n{proc.stderr}"
+
+
 def test_parse_probe_log_unknown_value_defaults_to_fail():
     """If the probe emits a value the parser doesn't recognize, it
     should be reported as a failure rather than silently passed —
@@ -353,6 +372,18 @@ async def test_submit_probe_and_collect_happy_path(monkeypatch, tmp_path):
     assert by_name["slurm-probe-completed"].status == "pass"
     assert by_name["probe/native-python-on-compute"].status == "pass"
     assert by_name["probe/cp-from-compute"].status == "pass"
+
+
+def test_default_probe_log_dir_is_on_shared_fs(tmp_path):
+    """The probe log must default onto the shared filesystem (PATH_SCRATCH/ticket),
+    NOT node-local /tmp: SLURM writes the probe's stdout on the compute node and
+    the head node reads it back to surface native-import / miint-read-fastx. A
+    node-local /tmp path is written on the compute node and unreadable across that
+    boundary, so those results never surface."""
+    jwt = tmp_path / "jwt"
+    jwt.write_text(_make_jwt("qiita-orch"))
+    settings = _make_settings(jwt)  # path_scratch="/scratch/qiita"
+    assert cr._default_probe_log_dir(settings) == Path("/scratch/qiita/ticket")
 
 
 def test_build_probe_submit_payload_includes_required_fields(tmp_path):
