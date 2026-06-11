@@ -23,6 +23,40 @@ _None yet._
 
 ### 3. Migrations
 
+_None yet._
+
+### 4. Deploy
+
+_None yet._
+
+### 5. Verify
+
+_None yet._
+
+### Notes (no host action)
+
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-10 — c230e87
+
+Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
 ```sql
 -- [admin] Pre-check before `make migrate`. The matrix_tube_id migration
 -- tightens the format CHECK to exactly 10 digits; its guard aborts the
@@ -60,26 +94,49 @@ SELECT bgf.internal_name, COUNT(*) AS metadata_rows
 # time and ABORTS before any restart if one is unapplied.
 make -C ~/qiita-miint migrate
 ```
-`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#81) adds `20260604000000_study_submission_tracking`, `20260608000000_biosample_field_rebind_fn`, `20260608000001_seed_envo_terminology` (gated on the ENVO pre-check above), and `20260609000001_biosample_matrix_tube_id_exact_length` (gated on the matrix-tube pre-check above).
+`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#80) adds `20260609000000_work_ticket_transient_retry` (plain `ALTER TABLE qiita.work_ticket ADD COLUMN transient_reason/transient_since`, both nullable; no extension or backfill). (#81) adds `20260604000000_study_submission_tracking`, `20260608000000_biosample_field_rebind_fn`, `20260608000001_seed_envo_terminology` (gated on the ENVO pre-check above), and `20260609000001_biosample_matrix_tube_id_exact_length` (gated on the matrix-tube pre-check above).
 
-### 4. Deploy
+#### 4. Deploy
 
-_None yet._
+```bash
+# [admin] SKIP_PULL=1 because redeploy.md step 2 already pulled the clone.
+sudo SKIP_PULL=1 QIITA_HOSTNAME=qiita-miint.ucsd.edu /home/qiita/qiita-miint/deploy/local-deploy.sh
 
-### 5. Verify
+# (#80) [operator] local-deploy.sh refreshes only the /opt/qiita service venvs.
+# Native SLURM jobs run from SLURM_NATIVE_PYTHON's SEPARATE shared-FS checkout —
+# refresh it too, or native jobs import stale qiita-common (and can keep a stale
+# cached miint whose read_fastx lacks max_batch_bytes). The next job then
+# FORCE-installs miint from the mirror. See redeploy.md §6. Run as the `qiita`
+# user that OWNS the checkout — running as the deploying admin hits a
+# Permission-denied removing qiita-owned .venv files. uv is not on qiita's login
+# PATH, so invoke it by full path (/usr/local/bin/uv on qiita-miint).
+sudo -u qiita bash -lc 'cd /home/qiita/qiita-miint/qiita-compute-orchestrator && /usr/local/bin/uv sync --reinstall-package qiita-common'
+```
 
-_None yet._
+#### 5. Verify
 
-### Notes (no host action)
+```bash
+# (#80) [admin] Run as qiita-orch with the CO env (the CP-side form fails on
+# co-to-cp.token perms). KNOWN-BROKEN PROBE — compute-readiness currently exits 2
+# with `slurm-probe-completed: state=FAILED` (sacct: ExitCode 2:0, MaxRSS ~20MB,
+# ~1s) on EVERY host: the generated probe bash has a syntax error — a `\n` in an
+# f-string comment in build_probe_script expands to a real newline, exposing an
+# unmatched backtick, so bash aborts at parse time before any check runs. This is
+# a probe CODE bug, NOT a compute-env failure (the miint/native-import checks #80
+# added never execute). Tracked as a follow-up: escape the comment, add a `bash -n`
+# regression test on the generated script, and relocate the probe log off
+# node-local /tmp so results are head-node-readable here. The head-node check
+# `native-python-on-host=ok` does pass. Until the probe is fixed, confirm the
+# compute env with a real reference-load / fastq-to-parquet job.
+sudo -u qiita-orch bash -c 'set -a; source /etc/qiita/compute-orchestrator.env; set +a; \
+    /home/qiita/.local/bin/qiita-admin compute-readiness'   # native-python-on-host=ok; rest FAILs pending probe fix (#80)
+```
 
+#### Notes (no host action)
+
+- (#80) Additive work-ticket status fields `transient_reason` / `transient_since` (`GET /work-ticket/{idx}` and the list view) surface why the runner is retrying an unreachable orchestrator in place. Backed by the plain `20260609000000_work_ticket_transient_retry` migration (bucket 3); additive, so existing clients are unaffected. No host action beyond `make migrate`.
 - (#81) Checklist binding is now by **name**: biosample/sequenced-sample create and biosample patch take a checklist name (e.g. `ERC000015`) instead of a `metadata_checklist_idx` (unknown name → 422), and `BiosampleResponse`/`SequencedSampleResponse` now return the checklist as a `metadata_checklist` ref (`{idx, name}`) instead of a bare `metadata_checklist_idx`. Clients sending the old idx field or reading the old response key must update. CLI flag is now `--metadata-checklist-name`.
 - (#81) `matrix_tube_id` is now validated as exactly 10 digits (was 8–10); a previously-accepted 8- or 9-digit value now returns 422.
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-08 — 2666587
 
@@ -101,7 +158,7 @@ _None yet._
 # time and ABORTS before any restart if one is unapplied.
 make -C ~/qiita-miint migrate
 ```
-`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#77) adds `20260603000000_work_ticket_step` (plain `CREATE TABLE qiita.work_ticket_step` + trigger; no extension or backfill). (#80) adds `20260609000000_work_ticket_transient_retry` (plain `ALTER TABLE qiita.work_ticket ADD COLUMN transient_reason/transient_since`, both nullable; no extension or backfill).
+`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#77) adds `20260603000000_work_ticket_step` (plain `CREATE TABLE qiita.work_ticket_step` + trigger; no extension or backfill).
 
 #### 4. Deploy
 
@@ -115,13 +172,6 @@ make -C ~/qiita-miint migrate
 # local-deploy.sh → activate.sh also runs `qiita-admin actions sync`, which picks
 # up the two new workflows/ entries. (#78)
 sudo SKIP_PULL=1 QIITA_HOSTNAME=qiita-miint.ucsd.edu /home/qiita/qiita-miint/deploy/local-deploy.sh
-
-# (#80) [operator] local-deploy.sh refreshes only the /opt/qiita service venvs.
-# Native SLURM jobs run from SLURM_NATIVE_PYTHON's SEPARATE shared-FS checkout —
-# refresh it too, or native jobs import stale qiita-common (and can keep a stale
-# cached miint whose read_fastx lacks max_batch_bytes). The next job then
-# FORCE-installs miint from the mirror. See redeploy.md §6.
-cd /home/qiita/qiita-miint/qiita-compute-orchestrator && uv sync --reinstall-package qiita-common
 ```
 
 #### 5. Verify
@@ -138,10 +188,6 @@ curl -fsS -o /dev/null -w '%{http_code}\n' https://qiita-miint.ucsd.edu/api/v1/w
 # (#78)
 sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
     psql "$DATABASE_URL" -c "SELECT action_id, version, enabled FROM qiita.action ORDER BY action_id;"'   # local-reference-add + local-host-reference-add 1.0.0 enabled (#78)
-# (#80) [admin] compute node's native imports resolve AND its miint build binds
-# read_fastx(max_batch_bytes:=…) — a stale compute env fails these, loudly, here.
-sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
-    qiita-admin compute-readiness' | grep -E 'probe/(native-import|miint-read-fastx)'   # both =ok (#80)
 ```
 
 #### Notes (no host action)
@@ -149,7 +195,6 @@ sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; 
 - (#77) Compute-step execution is decoupled and the CP now drives the poll loop. **CP and CO must deploy together** (bucket 4 does this) — the synchronous `POST /step/run` is removed in favour of the stateless `submit` / `status` / `result` trio plus `POST /step/find-by-name` (all CP↔CO-token-gated, internal). No external client action. Restart recovery now re-attaches in-flight tickets instead of failing them, so a CP/CO restart mid-deploy no longer nukes running work. Additive public surface: `GET /work-ticket` (list with compute status) and the `qiita ticket list` CLI.
 - (#78) Local-host FASTA ingest (additive, no client breakage). Two new `workflows/` entries — `local-reference-add` and `local-host-reference-add` (both 1.0.0) — synced into `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (verify in bucket 5), **not** migrations. They back a new CLI gesture `qiita reference load --local --fasta-manifest <abs path>` that ingests many host-resident FASTA files **by path** (no DoPut upload). The manifest and every FASTA + companion it lists must be **absolute** and visible on the shared FS from the compute node (the workflow `context_schema` enforces `pattern:"^/"`; bind mounts expose host paths, they do not copy). No new env var, host dir, or migration.
 - (#78) The `qiita reference load` CLI now parses FASTA with miint's `read_fastx`, so it installs + loads the **miint DuckDB extension client-side** on first use (one-time network egress; cached after under `~/.duckdb` or `MIINT_EXTENSION_DIRECTORY`). It installs from the team mirror by default (FORCE INSTALL, implies allow-unsigned; `MIINT_EXTENSION_REPO` overrides for a local/dev build), so every Qiita component runs the same build — no community-vs-mirror patchwork (#80). No action on the deployed services — this only affects the host a user runs the CLI from.
-- (#80) Additive work-ticket status fields `transient_reason` / `transient_since` (`GET /work-ticket/{idx}` and the list view) surface why the runner is retrying an unreachable orchestrator in place. Backed by the plain `20260609000000_work_ticket_transient_retry` migration (bucket 3); additive, so existing clients are unaffected. No host action beyond `make migrate`.
 
 ### Deployed 2026-06-02 — 9ee069d
 
