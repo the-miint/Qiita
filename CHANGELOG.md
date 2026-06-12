@@ -26,7 +26,7 @@ the `no-changelog` label).
   resolved against the vendored prefix table) instead of parsing the folder
   basename, which operators rename. Both the `qiita submit-bcl-convert` CLI
   and the orchestrator's `bcl_convert_prep` step fail fast on a missing or
-  malformed `RunInfo.xml` (#TBD)
+  malformed `RunInfo.xml` (#88)
 - Renamed the study EBI accession to ENA across the stack: the study table
   column and its UNIQUE constraint (`ebi_study_accession` →
   `ena_study_accession`), the REST request/response field of the same name,
