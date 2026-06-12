@@ -292,7 +292,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_study_create.add_argument("--description")
     p_study_create.add_argument("--abstract")
     p_study_create.add_argument("--funding")
-    p_study_create.add_argument("--ebi-study-accession")
+    p_study_create.add_argument("--ena-study-accession")
     p_study_create.add_argument("--notes")
     p_study_create.add_argument(
         "--principal-investigator-idx",
@@ -332,7 +332,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_study_patch.add_argument("--description")
     p_study_patch.add_argument("--abstract")
     p_study_patch.add_argument("--funding")
-    p_study_patch.add_argument("--ebi-study-accession")
+    p_study_patch.add_argument("--ena-study-accession")
     p_study_patch.add_argument("--notes")
     p_study_patch.add_argument("--extra-metadata", help="Free-form JSON object stored as JSONB")
     p_study_patch.set_defaults(

@@ -69,7 +69,7 @@ _MSG_BAD_OWNER_NOT_USER = "owner_idx must reference a user-kind principal"
 # Keys must mirror constraint names from db/migrations/; drift falls
 # through to _GENERIC_UNIQUE_VIOLATION.
 _UNIQUE_VIOLATION_MESSAGES: dict[str, str] = {
-    "study_ebi_study_accession_unique": "ebi_study_accession already in use",
+    "study_ena_study_accession_unique": "ena_study_accession already in use",
 }
 _GENERIC_UNIQUE_VIOLATION = "conflicts with an existing study"
 
@@ -96,7 +96,7 @@ def _study_response_from_row(row: asyncpg.Record) -> StudyResponse:
             "description": row["description"],
             "abstract": row["abstract"],
             "funding": row["funding"],
-            "ebi_study_accession": row["ebi_study_accession"],
+            "ena_study_accession": row["ena_study_accession"],
             "notes": row["notes"],
             "last_submission_at": row["last_submission_at"],
             "submission_error": row["submission_error"],
@@ -157,7 +157,7 @@ async def create_study_route(
                 description=body.description,
                 abstract=body.abstract,
                 funding=body.funding,
-                ebi_study_accession=body.ebi_study_accession,
+                ena_study_accession=body.ena_study_accession,
                 notes=body.notes,
                 extra_metadata=body.extra_metadata,
                 default_tier=body.default_tier,
@@ -259,7 +259,7 @@ async def patch_study(
     row serialize at the preflight: the second caller blocks until
     the first commits, then sees the post-commit `updated_at` and
     412s on its now-stale If-Match header. Uniqueness violations on
-    ebi_study_accession map to 409 via the shared helper; FK violations
+    ena_study_accession map to 409 via the shared helper; FK violations
     to the generic 422; the role-typed FK trigger on
     principal_investigator_idx (a candidate non-user principal) to a
     disambiguated 422.
@@ -328,7 +328,7 @@ async def lookup_study_by_accession(
     user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.STUDY_READ)),
 ) -> StudyLookupByAccessionResponse:
-    """Resolve a list of ebi_study_accession values to study_idx.
+    """Resolve a list of ena_study_accession values to study_idx.
 
     POST (not GET) so a long accession list rides in the body rather
     than tripping nginx's default URL-line cap.

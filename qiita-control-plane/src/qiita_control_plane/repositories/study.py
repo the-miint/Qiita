@@ -20,7 +20,7 @@ from . import require_transaction, update_row
 # named-key access so column order in this string is not load-bearing.
 _STUDY_RETURNING_COLS = (
     "idx, owner_idx, principal_investigator_idx, title, alias,"
-    " description, abstract, funding, ebi_study_accession,"
+    " description, abstract, funding, ena_study_accession,"
     " notes, last_submission_at, submission_error,"
     " extra_metadata, default_tier, created_by_idx,"
     " created_at, updated_at"
@@ -85,7 +85,7 @@ async def fetch_study_idxs_by_accession(
     *,
     values: list[str],
 ) -> dict[str, int]:
-    """Return `{ebi_study_accession: study_idx}` for every value in `values`
+    """Return `{ena_study_accession: study_idx}` for every value in `values`
     that resolves to a qiita.study row. Values absent from the table are
     omitted from the returned map.
 
@@ -95,11 +95,11 @@ async def fetch_study_idxs_by_accession(
     if not values:
         return {}
     rows = await pool_or_conn.fetch(
-        "SELECT idx, ebi_study_accession FROM qiita.study"
-        " WHERE ebi_study_accession = ANY($1::text[])",
+        "SELECT idx, ena_study_accession FROM qiita.study"
+        " WHERE ena_study_accession = ANY($1::text[])",
         values,
     )
-    return {r["ebi_study_accession"]: r["idx"] for r in rows}
+    return {r["ena_study_accession"]: r["idx"] for r in rows}
 
 
 async def insert_study(
@@ -113,7 +113,7 @@ async def insert_study(
     description: str | None = None,
     abstract: str | None = None,
     funding: str | None = None,
-    ebi_study_accession: str | None = None,
+    ena_study_accession: str | None = None,
     notes: str | None = None,
     extra_metadata: dict | None = None,
     default_tier: Tier | None = None,
@@ -138,7 +138,7 @@ async def insert_study(
     return await conn.fetchrow(
         "INSERT INTO qiita.study ("
         "    owner_idx, principal_investigator_idx, title, alias,"
-        "    description, abstract, funding, ebi_study_accession,"
+        "    description, abstract, funding, ena_study_accession,"
         "    notes, extra_metadata, default_tier, created_by_idx"
         ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb,"
         "          COALESCE($11::qiita.tier, 'member'::qiita.tier), $12)"
@@ -150,7 +150,7 @@ async def insert_study(
         description,
         abstract,
         funding,
-        ebi_study_accession,
+        ena_study_accession,
         notes,
         extra_metadata_json,
         default_tier,
@@ -204,7 +204,7 @@ STUDY_PATCHABLE_COLUMNS: frozenset[str] = frozenset(
         "description",
         "abstract",
         "funding",
-        "ebi_study_accession",
+        "ena_study_accession",
         "notes",
         "extra_metadata",
         "principal_investigator_idx",
@@ -253,7 +253,7 @@ async def create_study(
     description: str | None = None,
     abstract: str | None = None,
     funding: str | None = None,
-    ebi_study_accession: str | None = None,
+    ena_study_accession: str | None = None,
     notes: str | None = None,
     extra_metadata: dict | None = None,
     default_tier: Tier | None = None,
@@ -278,7 +278,7 @@ async def create_study(
         description=description,
         abstract=abstract,
         funding=funding,
-        ebi_study_accession=ebi_study_accession,
+        ena_study_accession=ena_study_accession,
         notes=notes,
         extra_metadata=extra_metadata,
         default_tier=default_tier,

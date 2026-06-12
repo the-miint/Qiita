@@ -842,7 +842,7 @@ class BiosampleLookupByMatrixTubeIdResponse(BaseModel):
 
 # same-pattern-ok: per-key wire shape; parallels BiosampleLookupByAccessionRequest
 class StudyLookupByAccessionRequest(BaseModel):
-    """Resolves a list of ebi_study_accession values to study_idxs in one
+    """Resolves a list of ena_study_accession values to study_idxs in one
     round trip. Body-shaped (not query-params) so a long accession list
     cannot exceed nginx's default URL-line cap.
     """
@@ -974,7 +974,7 @@ class StudyCreate(BaseModel):
     description: str | None = None
     abstract: str | None = None
     funding: str | None = Field(default=None, max_length=_STUDY_FUNDING_MAX)
-    ebi_study_accession: str | None = Field(
+    ena_study_accession: str | None = Field(
         default=None, min_length=1, max_length=_STUDY_ACCESSION_MAX
     )
     notes: str | None = None
@@ -1006,7 +1006,7 @@ class StudyPatchRequest(PatchRequestModel):
     description: str | None = None
     abstract: str | None = None
     funding: str | None = Field(default=None, max_length=_STUDY_FUNDING_MAX)
-    ebi_study_accession: str | None = Field(
+    ena_study_accession: str | None = Field(
         default=None, min_length=1, max_length=_STUDY_ACCESSION_MAX
     )
     notes: str | None = None
@@ -1029,7 +1029,7 @@ class StudyResponse(BaseModel):
     description: str | None
     abstract: str | None
     funding: str | None
-    ebi_study_accession: str | None
+    ena_study_accession: str | None
     notes: str | None
     last_submission_at: AwareDatetime | None
     submission_error: str | None

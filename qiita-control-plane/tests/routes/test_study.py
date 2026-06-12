@@ -190,7 +190,7 @@ async def test_post_study_full_body_round_trips(ctx):
         description="desc",
         abstract="abs",
         funding="NIH-R01",
-        ebi_study_accession="ERP000001",
+        ena_study_accession="ERP000001",
         notes="notes-1",
         extra_metadata=extra,
         default_tier="viewer",
@@ -211,7 +211,7 @@ async def test_post_study_full_body_round_trips(ctx):
         "description": "desc",
         "abstract": "abs",
         "funding": "NIH-R01",
-        "ebi_study_accession": "ERP000001",
+        "ena_study_accession": "ERP000001",
         "notes": "notes-1",
         "last_submission_at": None,
         "submission_error": None,
@@ -429,10 +429,10 @@ async def test_post_study_pi_idx_is_service_account_422(ctx):
     )
 
 
-async def test_post_study_duplicate_ebi_accession_409(ctx):
+async def test_post_study_duplicate_ena_accession_409(ctx):
     """Tests the case where two POSTs supply the same non-null
-    ebi_study_accession: the second trips the
-    study_ebi_study_accession_unique constraint and the route maps it
+    ena_study_accession: the second trips the
+    study_ena_study_accession_unique constraint and the route maps it
     to 409 with the per-column detail."""
     shared_accession = f"ERP{secrets.token_hex(4)}"
 
@@ -440,7 +440,7 @@ async def test_post_study_duplicate_ebi_accession_409(ctx):
         ctx["user"],
         ctx,
         title=_unique_title("dup-first"),
-        ebi_study_accession=shared_accession,
+        ena_study_accession=shared_accession,
     )
     assert first.status_code == 201, first.text
 
@@ -448,14 +448,14 @@ async def test_post_study_duplicate_ebi_accession_409(ctx):
         ctx["user"],
         ctx,
         title=_unique_title("dup-second"),
-        ebi_study_accession=shared_accession,
+        ena_study_accession=shared_accession,
     )
     assert resp.status_code == 409, resp.text
-    assert resp.json()["detail"] == "ebi_study_accession already in use"
+    assert resp.json()["detail"] == "ena_study_accession already in use"
 
 
-async def test_post_study_two_null_ebi_accessions_both_succeed(ctx):
-    """Tests the case where two POSTs both omit ebi_study_accession:
+async def test_post_study_two_null_ena_accessions_both_succeed(ctx):
+    """Tests the case where two POSTs both omit ena_study_accession:
     Postgres UNIQUE treats NULLs as distinct, so two NULLs do not
     collide."""
     first = await _post_study(
@@ -464,7 +464,7 @@ async def test_post_study_two_null_ebi_accessions_both_succeed(ctx):
         title=_unique_title("null-first"),
     )
     assert first.status_code == 201, first.text
-    assert first.json()["ebi_study_accession"] is None
+    assert first.json()["ena_study_accession"] is None
 
     second = await _post_study(
         ctx["user"],
@@ -472,7 +472,7 @@ async def test_post_study_two_null_ebi_accessions_both_succeed(ctx):
         title=_unique_title("null-second"),
     )
     assert second.status_code == 201, second.text
-    assert second.json()["ebi_study_accession"] is None
+    assert second.json()["ena_study_accession"] is None
 
 
 # ===========================================================================
@@ -505,7 +505,7 @@ async def test_get_study_returns_same_shape_as_post(ctx):
         description="desc",
         abstract="abs",
         funding="NIH-R01",
-        ebi_study_accession="ERP000001",
+        ena_study_accession="ERP000001",
         notes="notes-1",
         extra_metadata=extra,
         default_tier="viewer",
@@ -689,8 +689,8 @@ async def test_patch_study_wet_lab_admin_role_bypass(ctx):
     assert resp.json()["notes"] == "patched-by-wet"
 
 
-async def test_patch_study_etag_advances_on_ebi_accession_round_trip(ctx):
-    """Tests the case where a PATCH writes a new ebi_study_accession
+async def test_patch_study_etag_advances_on_ena_accession_round_trip(ctx):
+    """Tests the case where a PATCH writes a new ena_study_accession
     and the response's ETag advances past the If-Match value (the
     study_set_updated_at trigger bumps updated_at on every UPDATE, and
     the route surfaces that bump as the new ETag)."""
@@ -702,13 +702,13 @@ async def test_patch_study_etag_advances_on_ebi_accession_round_trip(ctx):
 
     resp = await ctx["user"].patch(
         URL_STUDY_BY_IDX.format(study_idx=study_idx),
-        json={"ebi_study_accession": new_acc},
+        json={"ena_study_accession": new_acc},
         headers={"If-Match": if_match},
     )
     assert resp.status_code == 200, resp.text
     new_etag = resp.headers["ETag"]
     assert new_etag != if_match
-    assert resp.json()["ebi_study_accession"] == new_acc
+    assert resp.json()["ena_study_accession"] == new_acc
 
 
 async def test_study_clear_submission_error_on_new_attempt_trigger(ctx):
@@ -972,15 +972,15 @@ async def test_patch_study_pi_is_service_account_422(ctx):
     )
 
 
-async def test_patch_study_duplicate_ebi_accession_409(ctx):
-    """Tests the case where a PATCH would set ebi_study_accession to a
+async def test_patch_study_duplicate_ena_accession_409(ctx):
+    """Tests the case where a PATCH would set ena_study_accession to a
     value already held by another study. The
-    study_ebi_study_accession_unique constraint fires; the route maps
+    study_ena_study_accession_unique constraint fires; the route maps
     the unique-violation to 409 via the shared
     raise_for_unique_violation helper."""
     shared_accession = f"ERP{secrets.token_hex(4)}"
     first = await _post_study(
-        ctx["user"], ctx, title=_unique_title("patch-dup-1"), ebi_study_accession=shared_accession
+        ctx["user"], ctx, title=_unique_title("patch-dup-1"), ena_study_accession=shared_accession
     )
     assert first.status_code == 201, first.text
     second = await _post_study(ctx["user"], ctx, title=_unique_title("patch-dup-2"))
@@ -990,11 +990,11 @@ async def test_patch_study_duplicate_ebi_accession_409(ctx):
 
     resp = await ctx["user"].patch(
         URL_STUDY_BY_IDX.format(study_idx=study_idx),
-        json={"ebi_study_accession": shared_accession},
+        json={"ena_study_accession": shared_accession},
         headers={"If-Match": if_match},
     )
     assert resp.status_code == 409
-    assert resp.json()["detail"] == "ebi_study_accession already in use"
+    assert resp.json()["detail"] == "ena_study_accession already in use"
 
 
 # ===========================================================================
@@ -1007,13 +1007,13 @@ async def test_patch_study_duplicate_ebi_accession_409(ctx):
 
 
 async def _create_study_with_accession(ctx, *, accession: str) -> int:
-    """Create a study via POST carrying the given ebi_study_accession and
+    """Create a study via POST carrying the given ena_study_accession and
     return its idx; cleanup is handled by _post_study's tracker."""
     resp = await _post_study(
         ctx["user"],
         ctx,
         title=_unique_title("lookup"),
-        ebi_study_accession=accession,
+        ena_study_accession=accession,
     )
     assert resp.status_code == 201, resp.text
     return resp.json()["study_idx"]
@@ -1068,7 +1068,7 @@ async def test_lookup_study_by_accession_no_access_caller_still_resolves(ctx):
         ctx["wet"],
         ctx,
         title=_unique_title("lookup-noacc"),
-        ebi_study_accession=acc,
+        ena_study_accession=acc,
     )
     assert create_resp.status_code == 201, create_resp.text
     study_idx = create_resp.json()["study_idx"]

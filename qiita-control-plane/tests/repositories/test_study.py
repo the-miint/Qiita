@@ -274,7 +274,7 @@ async def test_create_study_minimum_body_inserts_row_and_owner_admin_grant(postg
             assert row["description"] is None
             assert row["abstract"] is None
             assert row["funding"] is None
-            assert row["ebi_study_accession"] is None
+            assert row["ena_study_accession"] is None
             assert row["notes"] is None
             assert row["extra_metadata"] is None
             assert row["default_tier"] == "member"
@@ -316,7 +316,7 @@ async def test_create_study_full_body_round_trips_every_field(postgres_pool):
                 description="desc",
                 abstract="abs",
                 funding="NIH-R01",
-                ebi_study_accession="ERP000001",
+                ena_study_accession="ERP000001",
                 notes="notes-1",
                 extra_metadata=extra,
                 default_tier=Tier.VIEWER,
@@ -328,7 +328,7 @@ async def test_create_study_full_body_round_trips_every_field(postgres_pool):
             assert row["description"] == "desc"
             assert row["abstract"] == "abs"
             assert row["funding"] == "NIH-R01"
-            assert row["ebi_study_accession"] == "ERP000001"
+            assert row["ena_study_accession"] == "ERP000001"
             assert row["notes"] == "notes-1"
             # asyncpg returns JSONB as a string; decode for comparison.
             assert json.loads(row["extra_metadata"]) == extra
@@ -438,10 +438,10 @@ async def test_create_study_outside_transaction_raises(postgres_pool):
             )
 
 
-async def test_create_study_duplicate_ebi_accession_raises_unique_error(postgres_pool):
+async def test_create_study_duplicate_ena_accession_raises_unique_error(postgres_pool):
     """Tests the case where two studies attempt the same non-null
-    ebi_study_accession: the second create trips the
-    study_ebi_study_accession_unique constraint and surfaces as
+    ena_study_accession: the second create trips the
+    study_ena_study_accession_unique constraint and surfaces as
     asyncpg.UniqueViolationError. The route layer maps this to 409."""
     async with postgres_pool.acquire() as conn:
         tr = conn.transaction()
@@ -456,19 +456,19 @@ async def test_create_study_duplicate_ebi_accession_raises_unique_error(postgres
                 owner_idx=owner,
                 created_by_idx=owner,
                 title=_suffix("dup-first"),
-                ebi_study_accession=shared_accession,
+                ena_study_accession=shared_accession,
             )
 
             with pytest.raises(
                 asyncpg.UniqueViolationError,
-                match="study_ebi_study_accession_unique",
+                match="study_ena_study_accession_unique",
             ):
                 await create_study(
                     conn,
                     owner_idx=owner,
                     created_by_idx=owner,
                     title=_suffix("dup-second"),
-                    ebi_study_accession=shared_accession,
+                    ena_study_accession=shared_accession,
                 )
         finally:
             await tr.rollback()
@@ -527,7 +527,7 @@ async def test_fetch_study_returns_full_row_for_existing_idx(postgres_pool):
                 description="desc",
                 abstract="abs",
                 funding="NIH-R01",
-                ebi_study_accession="ERP000001",
+                ena_study_accession="ERP000001",
                 notes="notes-1",
                 extra_metadata=extra,
                 default_tier=Tier.VIEWER,
@@ -545,7 +545,7 @@ async def test_fetch_study_returns_full_row_for_existing_idx(postgres_pool):
             assert fetched["description"] == "desc"
             assert fetched["abstract"] == "abs"
             assert fetched["funding"] == "NIH-R01"
-            assert fetched["ebi_study_accession"] == "ERP000001"
+            assert fetched["ena_study_accession"] == "ERP000001"
             assert fetched["notes"] == "notes-1"
             assert json.loads(fetched["extra_metadata"]) == extra
             assert fetched["default_tier"] == "viewer"
@@ -614,8 +614,8 @@ async def test_update_study_jsonb_extra_metadata_explicit_null_clears_column(pos
             await tr.rollback()
 
 
-async def test_update_study_duplicate_ebi_accession_raises_unique_error(postgres_pool):
-    """Tests the case where the ebi_study_accession uniqueness constraint
+async def test_update_study_duplicate_ena_accession_raises_unique_error(postgres_pool):
+    """Tests the case where the ena_study_accession uniqueness constraint
     fires on a PATCH; the route layer translates this into 409 via the
     shared raise_for_unique_violation helper."""
     async with postgres_pool.acquire() as conn:
@@ -626,11 +626,42 @@ async def test_update_study_duplicate_ebi_accession_raises_unique_error(postgres
             study_a = await _insert_study(conn, owner_idx=owner)
             study_b = await _insert_study(conn, owner_idx=owner)
             accession = _suffix("ERP")
-            await update_study(conn, study_a, fields={"ebi_study_accession": accession})
+            await update_study(conn, study_a, fields={"ena_study_accession": accession})
 
             with pytest.raises(asyncpg.UniqueViolationError) as excinfo:
-                await update_study(conn, study_b, fields={"ebi_study_accession": accession})
-            assert excinfo.value.constraint_name == "study_ebi_study_accession_unique"
+                await update_study(conn, study_b, fields={"ena_study_accession": accession})
+            assert excinfo.value.constraint_name == "study_ena_study_accession_unique"
+        finally:
+            await tr.rollback()
+
+
+async def test_study_duplicate_bioproject_accession_raises_unique_error(postgres_pool):
+    """Tests the case where two studies carry the same non-NULL
+    bioproject_accession: the study_bioproject_accession_unique constraint
+    fires on the second write. The column is not yet wired through the
+    repository layer, so it is set with direct SQL here. Both seed studies
+    leave it NULL, confirming NULLs coexist freely."""
+    async with postgres_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            owner = await _create_user(conn)
+            study_a = await _insert_study(conn, owner_idx=owner)
+            study_b = await _insert_study(conn, owner_idx=owner)
+            accession = _suffix("PRJNA")
+            await conn.execute(
+                "UPDATE qiita.study SET bioproject_accession = $2 WHERE idx = $1",
+                study_a,
+                accession,
+            )
+
+            with pytest.raises(asyncpg.UniqueViolationError) as excinfo:
+                await conn.execute(
+                    "UPDATE qiita.study SET bioproject_accession = $2 WHERE idx = $1",
+                    study_b,
+                    accession,
+                )
+            assert excinfo.value.constraint_name == "study_bioproject_accession_unique"
         finally:
             await tr.rollback()
 
