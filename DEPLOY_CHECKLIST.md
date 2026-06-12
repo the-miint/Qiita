@@ -32,7 +32,13 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+```bash
+# [operator] DATABASE_URL must be in your shell, pointing at the SAME DB as
+# control-plane.env. activate.sh re-checks public.schema_migrations at deploy
+# time and ABORTS before any restart if one is unapplied.
+make -C ~/qiita-miint migrate
+```
+`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#TBD) adds `20260611000000_study_ena_accession_and_bioproject` (renames the study `ebi_study_accession` column + its UNIQUE constraint to `ena_study_accession`, and adds a nullable, unique-when-present `bioproject_accession` column; no extension, backfill, or pre-check).
 
 ### 4. Deploy
 
@@ -52,6 +58,11 @@ sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; 
 
 ### Notes (no host action)
 
+- (#TBD) The study REST field and `qiita study create`/`patch` CLI flag
+  `ebi_study_accession` / `--ebi-study-accession` were renamed to
+  `ena_study_accession` / `--ena-study-accession`. Any client sending the old
+  field name (or scripts using the old flag) must update; the column rename
+  itself is handled by the bucket-3 migration.
 - (#86) Sequence chunking switched from the pure-SQL `list_transform`/`substring` macro to miint's native `sequence_split` (duckdb-miint #121), fixing an O(L²) blow-up on large single FASTA records (DuckDB #23229). No client/API change — same chunked-Parquet shape `(read_id, chunk_index, chunk_data)`. The only operator action is the bucket-2 mirror check (the deployed code needs a v1.5.3 miint build that has `sequence_split`); no env var, host dir, or migration.
 
 ---

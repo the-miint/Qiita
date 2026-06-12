@@ -259,7 +259,7 @@ URL_USER_ME = f"{URL_USER_PREFIX}{PATH_USER_ME}"
 PATH_STUDY_PREFIX = "/study"
 PATH_STUDY_ROOT = ""  # POST against the prefix itself
 PATH_STUDY_BY_IDX = "/{study_idx}"
-# Bulk lookup of study_idx by ebi_study_accession; same body-vs-querystring
+# Bulk lookup of study_idx by ena_study_accession; same body-vs-querystring
 # rationale as the biosample lookup variants.
 PATH_STUDY_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
 

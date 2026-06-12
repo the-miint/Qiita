@@ -272,7 +272,7 @@ def test_study_create_passes_through_optional_fields(monkeypatch):
             "abs",
             "--funding",
             "NIH",
-            "--ebi-study-accession",
+            "--ena-study-accession",
             "PRJEB99999",
             "--notes",
             "note",
@@ -289,7 +289,7 @@ def test_study_create_passes_through_optional_fields(monkeypatch):
         "description": "smoke desc",
         "abstract": "abs",
         "funding": "NIH",
-        "ebi_study_accession": "PRJEB99999",
+        "ena_study_accession": "PRJEB99999",
         "notes": "note",
         "principal_investigator_idx": 5,
         "default_tier": "member",
@@ -2496,9 +2496,9 @@ def test_read_subcommand_http_error_exits_1(monkeypatch, capsys):
     ("argv", "expected_url", "expected_body"),
     [
         (
-            ["study", "patch", "--study-idx", "42", "--ebi-study-accession", "PRJEB1"],
+            ["study", "patch", "--study-idx", "42", "--ena-study-accession", "PRJEB1"],
             URL_STUDY_BY_IDX.format(study_idx=42),
-            {"ebi_study_accession": "PRJEB1"},
+            {"ena_study_accession": "PRJEB1"},
         ),
         (
             ["biosample", "patch", "--biosample-idx", "100", "--ena-sample-accession", "ERS1"],
@@ -2602,7 +2602,7 @@ def test_patch_subcommand_conflict_exits_1(monkeypatch, capsys):
             "patch",
             "--study-idx",
             "42",
-            "--ebi-study-accession",
+            "--ena-study-accession",
             "PRJEB1",
         ]
     )
