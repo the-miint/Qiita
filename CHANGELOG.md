@@ -17,7 +17,7 @@ the `no-changelog` label).
 
 - New nullable `bioproject_accession` column on the study table (unique
   when present), reserved for future NCBI/ENA BioProject tracking. Schema
-  only — not yet exposed through the API, repository, or CLI (#TBD)
+  only — not yet exposed through the API, repository, or CLI (#87)
 
 ### Changed
 
@@ -25,7 +25,7 @@ the `no-changelog` label).
   column and its UNIQUE constraint (`ebi_study_accession` →
   `ena_study_accession`), the REST request/response field of the same name,
   and the `qiita study create`/`patch` CLI flag (`--ebi-study-accession` →
-  `--ena-study-accession`). Clients sending the old field name must update (#TBD)
+  `--ena-study-accession`). Clients sending the old field name must update (#87)
 - Sequence chunking now uses miint's native `sequence_split` (single linear
   pass) instead of the pure-SQL `list_transform`/`substring` macro, which was
   **O(L²)** on large single records (host reference genomes) due to DuckDB

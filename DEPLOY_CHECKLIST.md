@@ -38,7 +38,7 @@ _None yet._
 # time and ABORTS before any restart if one is unapplied.
 make -C ~/qiita-miint migrate
 ```
-`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#TBD) adds `20260611000000_study_ena_accession_and_bioproject` (renames the study `ebi_study_accession` column + its UNIQUE constraint to `ena_study_accession`, and adds a nullable, unique-when-present `bioproject_accession` column; no extension, backfill, or pre-check).
+`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#87) adds `20260611000000_study_ena_accession_and_bioproject` (renames the study `ebi_study_accession` column + its UNIQUE constraint to `ena_study_accession`, and adds a nullable, unique-when-present `bioproject_accession` column; no extension, backfill, or pre-check).
 
 ### 4. Deploy
 
@@ -58,7 +58,7 @@ sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; 
 
 ### Notes (no host action)
 
-- (#TBD) The study REST field and `qiita study create`/`patch` CLI flag
+- (#87) The study REST field and `qiita study create`/`patch` CLI flag
   `ebi_study_accession` / `--ebi-study-accession` were renamed to
   `ena_study_accession` / `--ena-study-accession`. Any client sending the old
   field name (or scripts using the old flag) must update; the column rename
