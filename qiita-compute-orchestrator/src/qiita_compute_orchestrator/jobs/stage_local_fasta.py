@@ -12,6 +12,12 @@ pipeline (`hash_sequences` → `mint-features` → `write-membership` → `load`
 `register-files` → …) runs unchanged. This job is the *only* new step on the
 local path; everything downstream is reused verbatim.
 
+It also emits a `minimap2_fasta_manifest` — the subset of input paths carrying a
+trailing TAB `minimap2` flag — which the local-host-reference-add workflow feeds
+to `build_minimap2_index` (it indexes the RAW files, not this chunked output).
+The manifest is always emitted (empty when nothing is tagged); local-reference-add
+simply doesn't declare it as a step output.
+
 **Parsing + chunking are done in DuckDB, not Python.** FASTA records are read
 with miint's `read_fastx` table function (native parser; `.gz` transparent;
 `read_id` is the header's first token, matching the remote path), and the 64 KB
@@ -81,6 +87,15 @@ _READ_FASTX_MAX_BATCH_BYTES = "64MB"
 # pathologically bad manifest doesn't build a multi-megabyte message.
 _MAX_REPORT = 20
 
+# Trailing TAB-separated flag marking a manifest line for the minimap2 host
+# index (`/abs/path\tminimap2`). A TAB can't appear in a `#` comment line (those
+# are skipped wholesale) and doesn't collide with path characters, so bare-path
+# lines stay unchanged. Only this flag is recognized; any other is a fail-fast
+# data error. The tagged subset is emitted as `minimap2_fasta_manifest` for the
+# build_minimap2_index step (which reads the RAW files, not the chunked output).
+_MINIMAP2_TAG = "minimap2"
+_MINIMAP2_MANIFEST_NAME = "minimap2_fasta_manifest.txt"
+
 
 class Inputs(BaseModel):
     """Typed input contract for stage_local_fasta.
@@ -102,37 +117,57 @@ class Inputs(BaseModel):
     work_ticket_idx: int
 
 
-def _read_manifest(manifest_path: Path) -> list[Path]:
+def _read_manifest(manifest_path: Path) -> tuple[list[Path], list[Path]]:
     """Parse the manifest into validated absolute FASTA paths.
 
-    One path per line; blank lines and `#` comments are skipped. Every entry
-    must be absolute and an existing file (fail fast, mirroring
-    bcl_convert_prep's guards). Raises ValueError on the first bad entry or if
-    no real path lines remain.
+    Returns `(all_paths, minimap2_paths)`: every real path, and the subset
+    carrying a trailing TAB `minimap2` flag (`/abs/path\tminimap2`).
+
+    One entry per line; blank lines and `#` comments are skipped (a `#` line is
+    a comment even if it carries a TAB — no collision with the tag). Each line
+    is `PATH` or `PATH\t{_MINIMAP2_TAG}`; any other trailing flag (or extra TAB
+    fields) is a fail-fast data error. Every path must be absolute and an
+    existing file (mirroring bcl_convert_prep's guards). Raises ValueError on
+    the first bad entry or if no real path lines remain.
     """
-    fasta_paths: list[Path] = []
+    all_paths: list[Path] = []
+    minimap2_paths: list[Path] = []
     for raw in manifest_path.read_text().splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
-        entry = Path(line)
+        fields = line.split("\t")
+        tag = fields[1].strip() if len(fields) > 1 else None
+        if len(fields) > 2 or (tag is not None and tag != _MINIMAP2_TAG):
+            raise ValueError(
+                f"manifest line {line!r} has an unrecognized tag; only a single "
+                f"trailing '\\t{_MINIMAP2_TAG}' flag is allowed"
+            )
+        entry = Path(fields[0].strip())
         if not entry.is_absolute():
             raise ValueError(f"manifest entry must be absolute, got {line!r}")
         if not entry.exists() or not entry.is_file():
             raise ValueError(f"FASTA file in manifest not found or not a file: {entry}")
-        fasta_paths.append(entry)
+        all_paths.append(entry)
+        if tag == _MINIMAP2_TAG:
+            minimap2_paths.append(entry)
 
-    if not fasta_paths:
+    if not all_paths:
         raise ValueError(f"manifest lists zero FASTA files: {manifest_path}")
-    return fasta_paths
+    return all_paths, minimap2_paths
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     """Read every manifest FASTA with `read_fastx`; emit one combined chunked
-    Parquet. Validates the manifest and each listed file, stages all reads into
-    a DuckDB table (one `read_fastx` per file), fails fast on an empty-body
-    record or a duplicate read_id, then COPYs the `sequence_split`/`UNNEST`
-    chunking to `fasta.parquet`. Returns `{"fasta_path": <parquet>}`.
+    Parquet plus a `minimap2_fasta_manifest` subset. Validates the manifest and
+    each listed file, stages all reads into a DuckDB table (one `read_fastx` per
+    file), fails fast on an empty-body record or a duplicate read_id, then COPYs
+    the `sequence_split`/`UNNEST` chunking to `fasta.parquet`. Returns
+    `{"fasta_path": <parquet>, "minimap2_fasta_manifest": <txt>}`.
+
+    `minimap2_fasta_manifest` lists the `\\tminimap2`-tagged subset (the raw
+    files build_minimap2_index indexes); it is always emitted, empty when
+    nothing is tagged — local-reference-add just doesn't declare/consume it.
     """
     if not inputs.fasta_manifest_path.is_absolute():
         raise ValueError(
@@ -141,11 +176,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     if not inputs.fasta_manifest_path.exists() or not inputs.fasta_manifest_path.is_file():
         raise ValueError(f"FASTA manifest not found or not a file: {inputs.fasta_manifest_path}")
 
-    fasta_paths = _read_manifest(inputs.fasta_manifest_path)
+    fasta_paths, minimap2_paths = _read_manifest(inputs.fasta_manifest_path)
 
     workspace.mkdir(parents=True, exist_ok=True)
     fasta_parquet = workspace / "fasta.parquet"
     fasta_out = validate_parquet_path(fasta_parquet)
+    minimap2_manifest = workspace / _MINIMAP2_MANIFEST_NAME
     duckdb_tmp = workspace / ".duckdb_tmp"
     duckdb_tmp.mkdir(parents=True, exist_ok=True)
 
@@ -227,4 +263,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         if not success:
             fasta_parquet.unlink(missing_ok=True)
 
-    return {"fasta_path": fasta_parquet}
+    # Success-only (a failure above raises before here): write the minimap2
+    # subset manifest as bare absolute paths, one per line — empty when nothing
+    # was tagged. build_minimap2_index._read_manifest validates these the same
+    # way (absolute + existing) and fails fast on a zero-line manifest.
+    minimap2_manifest.write_text("".join(f"{p}\n" for p in minimap2_paths))
+
+    return {"fasta_path": fasta_parquet, "minimap2_fasta_manifest": minimap2_manifest}

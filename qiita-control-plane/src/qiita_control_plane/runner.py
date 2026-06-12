@@ -1990,11 +1990,18 @@ async def _run_action_primitive(
 
     if entry.name == LibraryPrimitive.REGISTER_INDEX:
         # Native step outputs are paths (StepResultResponse.outputs is
-        # dict[str, str]), so build-rype-index can't hand back the build
-        # params as a dict binding — it writes a small meta JSON and exposes
-        # its path as `rype_index_meta`. Read it for index_type / fs_path /
-        # params (index_type comes from the builder, not hardcoded here).
-        meta_path = Path(bound["rype_index_meta"])
+        # dict[str, str]), so an index builder can't hand back the build params
+        # as a dict binding — it writes a small meta JSON and exposes its path
+        # (e.g. `rype_index_meta`, `minimap2_index_meta`). The binding name is
+        # the step's single declared input, NOT hardcoded: a host reference runs
+        # two register-index steps (rype + minimap2), each pointing at its own
+        # meta. Read it for index_type / fs_path / params (index_type comes from
+        # the builder, not hardcoded here).
+        if len(entry.inputs) != 1:
+            raise RuntimeError(
+                f"register-index expects exactly one input (the index meta); got {entry.inputs!r}"
+            )
+        meta_path = Path(bound[entry.inputs[0]])
         meta = json.loads(meta_path.read_text())
         await LIBRARY[LibraryPrimitive.REGISTER_INDEX](
             pool,

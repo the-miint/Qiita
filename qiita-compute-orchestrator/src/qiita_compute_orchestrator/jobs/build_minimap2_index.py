@@ -163,7 +163,16 @@ def _read_manifest(manifest_path: Path) -> list[Path]:
         fasta_paths.append(entry)
 
     if not fasta_paths:
-        raise ValueError(f"manifest lists zero FASTA files: {manifest_path}")
+        # This step only runs in the host-reference workflows, where a minimap2
+        # index is required — an empty subset manifest means the operator didn't
+        # designate any sequences for it. stage_local_fasta builds this file from
+        # the `\tminimap2`-tagged lines of the source manifest, so the actionable
+        # cause is "no FASTA was tagged", not "the file is malformed".
+        raise ValueError(
+            f"minimap2 FASTA manifest is empty ({manifest_path}): a host reference "
+            "needs at least one FASTA designated for the minimap2 index — add a "
+            "trailing '\\tminimap2' flag to the relevant line(s) in the source manifest"
+        )
     return fasta_paths
 
 

@@ -246,6 +246,24 @@ def test_build_minimap2_index_all_empty_files_raises(tmp_path, monkeypatch):
         asyncio.run(build_minimap2_index.execute(inputs, tmp_path / "ws"))
 
 
+def test_build_minimap2_index_empty_manifest_raises_actionable(tmp_path, monkeypatch):
+    """A zero-line minimap2 manifest is the `local-host-reference-add`-with-no-tags
+    case: stage_local_fasta emits an empty subset manifest when no FASTA carries a
+    `\\tminimap2` flag. build_minimap2_index must fail with an actionable message
+    pointing at the tag, not an opaque 'malformed file' error."""
+    from qiita_compute_orchestrator.jobs import build_minimap2_index
+
+    monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "shared"))
+    manifest = tmp_path / "minimap2_fasta_manifest.txt"
+    manifest.write_text("")  # what stage_local_fasta emits with zero tags
+
+    inputs = build_minimap2_index.Inputs(
+        minimap2_fasta_manifest=manifest, reference_idx=1, work_ticket_idx=1
+    )
+    with pytest.raises(ValueError, match="minimap2"):
+        asyncio.run(build_minimap2_index.execute(inputs, tmp_path / "ws"))
+
+
 # Synthetic but STRUCTURED contigs: each is a distinct motif tiled many times so
 # minimap2 sees real (non-random, reproducible) k-mer content. ~3.6 kb each,
 # comfortably indexable under the 'sr' preset. Deterministic — no RNG.

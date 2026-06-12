@@ -1244,11 +1244,12 @@ async def test_runner_rejects_upload_owned_by_other_principal(
 
 
 async def test_dispatch_register_index_writes_row(postgres_pool, reference_idx, tmp_path):
-    """The register-index action arm reads the build step's `rype_index_meta`
-    JSON from `bound` (native step outputs are path strings, so build params
-    ride a file) and the reference_idx from scope_target, then records a
+    """The register-index action arm reads the meta JSON named by its single
+    `entry.inputs[0]` binding (native step outputs are path strings, so build
+    params ride a file) and the reference_idx from scope_target, then records a
     qiita.reference_index row carrying the builder's index_type / fs_path /
-    params."""
+    params. The binding name is NOT hardcoded — two register-index steps in one
+    workflow (rype + minimap2) target different metas via their own `inputs:`."""
     from qiita_common.actions import WorkflowAction
 
     # Targets the per-primitive dispatch arm directly (no work_ticket /
@@ -1268,7 +1269,9 @@ async def test_dispatch_register_index_writes_row(postgres_pool, reference_idx, 
         )
     )
     bound = {"rype_index_path": fs_path, "rype_index_meta": str(meta_path)}
-    entry = WorkflowAction(kind="action", name="register-index", inputs=[], outputs=[])
+    entry = WorkflowAction(
+        kind="action", name="register-index", inputs=["rype_index_meta"], outputs=[]
+    )
 
     out = await _run_action_primitive(
         postgres_pool,
@@ -1289,6 +1292,55 @@ async def test_dispatch_register_index_writes_row(postgres_pool, reference_idx, 
     assert row["index_type"] == "rype"
     assert row["fs_path"].endswith("index.ryxdi")
     assert json.loads(row["params"])["k"] == 64
+    await postgres_pool.execute(
+        "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+    )
+
+
+async def test_dispatch_register_index_minimap2_meta(postgres_pool, reference_idx, tmp_path):
+    """A second register-index step in the same workflow targets the
+    `minimap2_index_meta` binding via `entry.inputs[0]` and records a row with
+    index_type='minimap2' and the minimap2 params — proving the arm reads the
+    named input, not a hardcoded `rype_index_meta`."""
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    fs_path = f"/srv/qiita/references/{reference_idx}/minimap2/index.mmi"
+    meta_path = tmp_path / "minimap2_index_meta.json"
+    meta_path.write_text(
+        json.dumps(
+            {
+                "index_type": "minimap2",
+                "fs_path": fs_path,
+                "params": {"preset": "sr", "source_files": ["/data/host/grch38.fa"]},
+            }
+        )
+    )
+    bound = {"minimap2_index_path": fs_path, "minimap2_index_meta": str(meta_path)}
+    entry = WorkflowAction(
+        kind="action", name="register-index", inputs=["minimap2_index_meta"], outputs=[]
+    )
+
+    out = await _run_action_primitive(
+        postgres_pool,
+        entry,
+        bound,
+        tmp_path,
+        {"kind": "reference", "reference_idx": reference_idx},
+        hmac_secret=b"unused",
+        data_plane_url="grpc://unused:50051",
+    )
+    assert out == {}
+
+    row = await postgres_pool.fetchrow(
+        "SELECT index_type, fs_path, params FROM qiita.reference_index"
+        " WHERE reference_idx = $1 AND index_type = 'minimap2'",
+        reference_idx,
+    )
+    assert row is not None
+    assert row["fs_path"].endswith("index.mmi")
+    assert json.loads(row["params"])["preset"] == "sr"
     await postgres_pool.execute(
         "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
     )
