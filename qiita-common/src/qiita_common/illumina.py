@@ -1,14 +1,8 @@
-"""Illumina BCL run-folder parsing shared between the CLI and the
-orchestrator.
+"""Illumina BCL run-folder ``RunInfo.xml`` parsing.
 
-The qiita-bundled bcl-convert flow needs the instrument model in two
-places: the orchestrator's bcl_convert_prep step writes it as a sidecar
-file for the runner's A4 baseline_resources lookup, and the user CLI's
-``qiita submit-bcl-convert`` derives it from the folder name at submit
-time so it can populate ``SequencingRunCreateRequest.instrument_model``
-without an extra operator flag. Both consumers parse the same Illumina
-convention against the same vendored prefix table, so the parser lives
-here in qiita-common rather than being duplicated.
+Reads the instrument run ID and serial number from a run folder's
+``RunInfo.xml`` and resolves the serial number to a model name against a
+vendored prefix table.
 
 Prefix table: a one-time snapshot of biocore/kl-metapool's
 ``metapool/config/sequencer_types.yml`` lives at
@@ -19,15 +13,16 @@ header pins the source SHA + URL and documents the re-vendor protocol.
 from __future__ import annotations
 
 from importlib import resources
-from typing import Any
+from pathlib import Path
+from typing import Any, NamedTuple
+from xml.etree import ElementTree as ET
 
 import yaml
 
-# bcl-convert is Illumina-only. The vendored prefix table preserves a
-# PacBio Revio entry verbatim so re-vendoring stays a clean diff; this
+# bcl-convert is Illumina-only. This
 # loader filters out anything whose model_name does not start with the
 # Illumina prefix so a PacBio serial-prefix collision (e.g. a real
-# Illumina serial starting with "r") cannot silently route to a
+# Illumina serial number starting with "r") cannot silently route to a
 # PacBio model_name downstream.
 _ILLUMINA_MODEL_PREFIX = "Illumina "
 
@@ -71,69 +66,71 @@ def load_instrument_prefix_table() -> dict[str, str]:
 _INSTRUMENT_PREFIXES = load_instrument_prefix_table()
 
 
-def _split_run_folder(folder_name: str) -> list[str]:
-    """Split a BCL run folder name into its underscore-separated segments,
-    enforcing the Illumina convention
-    ``<YYMMDD>_<InstrumentSerial>_<RunNum>_<FlowcellID>`` (at least four
-    segments).
-
-    Single home for the convention string and the segment-count check so
-    ``instrument_run_id_from_run_folder`` and
-    ``instrument_model_from_run_folder`` validate identically — both call
-    this so a partial parse cannot silently succeed in one path while the
-    other rejects it. Raises ``ValueError`` on a non-conforming name.
-    """
-    parts = folder_name.split("_")
-    if len(parts) < 4:
-        raise ValueError(
-            f"BCL run folder name does not match Illumina convention "
-            f"<YYMMDD>_<InstrumentSerial>_<RunNum>_<FlowcellID>: {folder_name!r}"
-        )
-    return parts
-
-
-def instrument_run_id_from_run_folder(folder_name: str) -> str:
-    """Return the instrument_run_id encoded in a BCL run folder name.
-
-    The Illumina convention is
-    ``<YYMMDD>_<InstrumentSerial>_<RunNum>_<FlowcellID>`` and the
-    instrument run ID IS the folder basename — they are the same value
-    by definition. The CLI uses this so the operator does not have to
-    re-type the folder name; the helper exists so the contract lives in
-    one place if Illumina ever changes the convention.
-
-    Raises ``ValueError`` (via ``_split_run_folder``) on a folder name
-    that does not have at least four underscore-separated segments. The
-    downstream ``instrument_model_from_run_folder`` enforces the same
-    shape — both are checked so a partial parse cannot silently succeed.
-    """
-    _split_run_folder(folder_name)
-    return folder_name
-
-
-def instrument_model_from_run_folder(folder_name: str) -> str:
-    """Return the Illumina ``model_name`` string for a BCL run folder.
+def _instrument_model_from_serial(serial: str) -> str:
+    """Return the Illumina ``model_name`` string for an instrument serial number.
 
     Match policy: longest prefix wins. The vendored prefix table has
     overlapping entries (``LH`` vs ``L``, ``MN`` vs ``M``, ``SL`` vs
     ``S``, ``SH`` vs ``S``); without longest-match a NovaSeq X serial
-    ``LH00345`` could resolve to whatever single-character prefix is
+    number ``LH00345`` could resolve to whatever single-character prefix is
     checked first. Iterating prefixes by length descending makes the
-    match deterministic.
-
-    Raises ``ValueError`` on malformed folder names and on unrecognized
-    prefixes. Callers (the orchestrator job, the CLI submit command)
-    surface this verbatim — the launcher framework maps ValueError to
-    ``BackendFailure(BAD_INPUT)`` for the orchestrator path; the CLI
-    prints the message and exits non-zero.
+    match deterministic. Raises ``ValueError`` on an unrecognized prefix.
     """
-    parts = _split_run_folder(folder_name)
-    serial = parts[1]
     for prefix in sorted(_INSTRUMENT_PREFIXES, key=len, reverse=True):
         if serial.startswith(prefix):
             return _INSTRUMENT_PREFIXES[prefix]
     raise ValueError(
-        f"unknown instrument serial prefix in {folder_name!r}; "
+        f"unknown instrument serial prefix in {serial!r}; "
         f"add a machine_prefix entry to kl-metapool's sequencer_types.yml "
-        f"and re-vendor, or rename the folder to use a recognized prefix"
+        f"and re-vendor"
     )
+
+
+class InstrumentRunInfo(NamedTuple):
+    """The instrument run ID and resolved model name for a BCL run folder.
+
+    ``instrument_run_id`` is the ``Run`` tag's ``Id`` attribute verbatim;
+    ``instrument_model`` is the vendored ``model_name`` resolved from the
+    ``Instrument`` serial number.
+    """
+
+    instrument_run_id: str
+    instrument_model: str
+
+
+def read_instrument_run_info(bcl_input_dir: Path) -> InstrumentRunInfo:
+    """Read ``RunInfo.xml`` at the top of a BCL run folder and return the
+    instrument run ID and resolved model name.
+
+    Reading the serial number from the sequencer-written ``RunInfo.xml`` is stable
+    where the folder basename is not — operators rename run folders.
+
+    Raises ``ValueError`` when ``RunInfo.xml`` is absent or malformed, when
+    the ``Run``/``Id``/``Instrument`` pieces are missing or empty, or on an
+    unrecognized serial prefix.
+    """
+    runinfo_path = bcl_input_dir / "RunInfo.xml"
+    if not runinfo_path.is_file():
+        raise ValueError(f"RunInfo.xml not found at top level of {bcl_input_dir}")
+
+    # Parse the sequencer-written run metadata and error if malformed.
+    try:
+        root = ET.parse(runinfo_path).getroot()
+    except ET.ParseError as exc:
+        raise ValueError(f"{runinfo_path} is not well-formed XML: {exc}") from exc
+
+    # Pull the run ID from the Run tag's Id attribute.
+    run = root.find("Run")
+    if run is None:
+        raise ValueError(f"{runinfo_path} has no <Run> tag")
+    instrument_run_id = run.get("Id")
+    if not instrument_run_id:
+        raise ValueError(f"{runinfo_path} <Run> tag has no Id attribute")
+
+    # Pull the instrument serial number from the Instrument tag nested under Run.
+    instrument = run.find("Instrument")
+    serial = instrument.text.strip() if instrument is not None and instrument.text else ""
+    if not serial:
+        raise ValueError(f"{runinfo_path} has no <Instrument> serial number under <Run>")
+
+    return InstrumentRunInfo(instrument_run_id, _instrument_model_from_serial(serial))

@@ -1,9 +1,9 @@
 """bcl-convert prep step.
 
 Step 1 of the bcl-convert workflow: fetch the pool's run_preflight_blob
-from the CP, rehydrate it to a sample-sheet CSV in the workspace, parse
-the BCL run-folder name to derive the Illumina instrument model, and
-write the model to a sidecar file for the runner's A4 resource lookup.
+from the CP, rehydrate it to a sample-sheet CSV in the workspace, read
+the BCL run folder's RunInfo.xml to derive the Illumina instrument model,
+and write the model to a sidecar file for the runner's A4 resource lookup.
 
 The downstream bcl_convert step (container:) consumes:
   - samplesheet: the CSV at workspace/samplesheet.csv
@@ -14,14 +14,14 @@ The instrument_model file is consumed by the RUNNER (not the container)
 to resolve baseline_resources.profiles at dispatch time. Its contents
 must exactly match a key in the workflow YAML's profiles dict.
 
-Folder-name parsing lives in qiita_common.illumina so the user CLI
+RunInfo.xml parsing lives in qiita_common.illumina so the user CLI
 (qiita submit-bcl-convert) and the launcher-side prep step share one
 implementation against one vendored prefix table.
 
 Why this step is native (``module:``) and not a container, despite
 CLAUDE.md's "bioinformatics deps belong in a container" rule: the work
-is a CP fetch + a SQLite→CSV rehydrate + a folder-name string parse — no
-heavy bioinformatics binaries and no system packages. The one external
+is a CP fetch + a SQLite→CSV rehydrate + a RunInfo.xml read — no heavy
+bioinformatics binaries and no system packages. The one external
 dep (``run_preflight``) is a pure-Python, git-pinned library light enough
 to ship in the orchestrator's ``pyproject.toml``; the actual heavy lifting
 (``bcl-convert`` itself) is the downstream ``container:`` step. Keeping the
@@ -35,7 +35,7 @@ import sqlite3
 from pathlib import Path
 
 from pydantic import BaseModel
-from qiita_common.illumina import instrument_model_from_run_folder
+from qiita_common.illumina import read_instrument_run_info
 
 from ..cp_client import make_cp_client
 from ..sequencing_run import fetch_sequenced_pool_preflight
@@ -82,11 +82,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             f"BCL input directory not found or not a directory: {inputs.bcl_input_dir}"
         )
 
-    # Parse instrument model up-front so an unparseable folder name fails
-    # before any CP round-trip. The runner's A4 resolution at dispatch
-    # of the bcl_convert step reads instrument_model.txt; if we couldn't
-    # write a valid value, fail here with the precise reason.
-    instrument_model = instrument_model_from_run_folder(inputs.bcl_input_dir.name)
+    # Read the instrument model from RunInfo.xml up-front so an
+    # absent/malformed file fails before any CP round-trip. The runner's
+    # A4 resolution at dispatch of the bcl_convert step reads
+    # instrument_model.txt; if we couldn't write a valid value, fail here
+    # with the precise reason.
+    instrument_model = read_instrument_run_info(inputs.bcl_input_dir).instrument_model
 
     workspace.mkdir(parents=True, exist_ok=True)
 

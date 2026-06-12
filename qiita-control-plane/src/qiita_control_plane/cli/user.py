@@ -52,10 +52,7 @@ from qiita_common.api_paths import (
     PATH_STUDY_PREFIX,
     PATH_WORK_TICKET_PREFIX,
 )
-from qiita_common.illumina import (
-    instrument_model_from_run_folder,
-    instrument_run_id_from_run_folder,
-)
+from qiita_common.illumina import read_instrument_run_info
 from qiita_common.models import (
     BiosampleImportRequest,
     BiosampleLookupByAccessionRequest,
@@ -758,14 +755,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
         description=(
             "Submit a bcl-convert work-ticket end-to-end. The instrument run"
-            " ID, instrument model, and platform are derived from the"
-            " --bcl-input-dir basename using the vendored Illumina prefix"
-            " table (qiita_common.illumina); folder names from unsupported"
-            " families (HiSeq1500, HiSeq3000, NextSeq, NovaSeqXPlus) and"
-            " from PacBio fail-fast before any server round-trip. All three"
-            " server-side calls are find-or-create on their natural keys,"
-            " so a re-run after a partial failure converges on the existing"
-            " rows without operator cleanup."
+            " ID and model are read from the --bcl-input-dir's RunInfo.xml and"
+            " the serial number resolved against the vendored Illumina prefix"
+            " table (qiita_common.illumina); serial numbers from unsupported"
+            " families"
+            " (HiSeq1500, HiSeq3000, NextSeq, NovaSeqXPlus) and from PacBio"
+            " fail-fast before any server round-trip. All three server-side"
+            " calls are find-or-create on their natural keys, so a re-run"
+            " after a partial failure converges on the existing rows without"
+            " operator cleanup."
         ),
     )
     p_submit_bcl.add_argument(
@@ -773,13 +771,12 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         required=True,
         help=(
-            "Absolute path to the Illumina BCL run folder; the folder's"
-            " basename must match"
-            " <YYMMDD>_<InstrumentSerial>_<RunNum>_<FlowcellID> so the"
-            " parser can derive the instrument_run_id + instrument_model."
-            " This same path is passed through as action_context.bcl_input_dir"
-            " on the resulting work-ticket; the orchestrator binds its parent"
-            " directory into the bcl-convert container at submit time."
+            "Absolute path to the Illumina BCL run folder; it must contain a"
+            " top-level RunInfo.xml so the reader can derive the"
+            " instrument_run_id + instrument_model. This same path is passed"
+            " through as action_context.bcl_input_dir on the resulting"
+            " work-ticket; the orchestrator binds its parent directory into"
+            " the bcl-convert container at submit time."
         ),
     )
     p_submit_bcl.add_argument(
@@ -1286,12 +1283,11 @@ def _print_missing_accession_error(
 def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Bundle the bcl-convert submission flow into one operator gesture.
 
-    1. POST /sequencing-run — instrument_run_id, instrument_model, and
-       platform all derived from `--bcl-input-dir` via the shared
-       qiita_common.illumina parser. Fails fast on a folder name that
-       does not match Illumina convention or on a PacBio-prefixed
-       serial (the parser filters PacBio out at load time so the lookup
-       surfaces ``unknown instrument serial prefix``).
+    1. POST /sequencing-run — instrument_run_id and instrument_model read
+       from `--bcl-input-dir`'s RunInfo.xml via the shared
+       qiita_common.illumina reader. Fails fast on a missing/malformed RunInfo.xml
+       or on a PacBio-prefixed serial number (the parser filters PacBio out
+       at load time so the lookup surfaces ``unknown instrument serial prefix``).
     2. POST /sequencing-run/{run_idx}/sequenced-pool — attaches the
        blob read from `--preflight-blob` (refuses empty), with the file
        basename as ``run_preflight_filename``.
@@ -1333,10 +1329,8 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
     if not blob_bytes:
         parser.error(f"--preflight-blob {args.preflight_blob} is empty")
 
-    folder_name = args.bcl_input_dir.name
     try:
-        instrument_run_id = instrument_run_id_from_run_folder(folder_name)
-        instrument_model = instrument_model_from_run_folder(folder_name)
+        instrument_run_id, instrument_model = read_instrument_run_info(args.bcl_input_dir)
     except ValueError as exc:
         parser.error(str(exc))
 
