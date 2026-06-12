@@ -90,6 +90,30 @@ async def test_reference_index_table_accepts_row(postgres_pool):
         await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
 
 
+async def test_reference_index_accepts_minimap2_type(postgres_pool):
+    """The CHECK allow-list includes 'minimap2' (the sidecar host-filter index)
+    alongside 'rype'."""
+    idx = await _make_reference(postgres_pool, "schema-refindex-minimap2", is_host=True)
+    try:
+        rii = await postgres_pool.fetchval(
+            "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
+            " VALUES ($1, 'minimap2', '/srv/x/minimap2/index.mmi', $2::jsonb)"
+            " RETURNING reference_index_idx",
+            idx,
+            '{"preset": "sr", "source_files": ["/data/host/grch38.fa"]}',
+        )
+        row = await postgres_pool.fetchrow(
+            "SELECT index_type FROM qiita.reference_index WHERE reference_index_idx = $1",
+            rii,
+        )
+        assert row["index_type"] == "minimap2"
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", idx
+        )
+        await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
+
+
 async def test_reference_index_rejects_unknown_type(postgres_pool):
     idx = await _make_reference(postgres_pool, "schema-refindex-badtype")
     try:

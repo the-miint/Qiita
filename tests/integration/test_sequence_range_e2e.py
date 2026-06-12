@@ -85,6 +85,7 @@ def _make_settings(sa_token: str) -> Settings:
     return Settings(
         backend_type="local",
         path_scratch="/tmp/qiita-e2e-unused",
+        path_derived="/tmp/qiita-e2e-unused-derived",
         cp_to_co_token="unused-in-e2e",
         cp_url="http://test",
         co_to_cp_token=sa_token,

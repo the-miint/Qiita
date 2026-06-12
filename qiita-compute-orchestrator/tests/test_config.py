@@ -84,6 +84,7 @@ def test_get_settings_returns_installed_value(monkeypatch):
     sentinel = Settings(
         backend_type="local",
         path_scratch="/tmp/sentinel",
+        path_derived="/tmp/sentinel-derived",
         cp_to_co_token="cached-cp-to-co",
         cp_url="https://sentinel.invalid",
         co_to_cp_token="cached-co-to-cp",
@@ -91,3 +92,28 @@ def test_get_settings_returns_installed_value(monkeypatch):
     )
     install_settings(sentinel)
     assert get_settings() is sentinel
+
+
+def test_from_env_path_derived_explicit(monkeypatch):
+    """PATH_DERIVED is the derived-artifact ROOT (NOT .../images). Resolved on
+    every backend and leniently — no absolute/exists assertion — mirroring
+    path_scratch, because native index builders (build_rype_index,
+    build_minimap2_index) derive `{path_derived}/references/{idx}/...` under
+    both LocalBackend and SLURM. Distinct from the strict slurm-only
+    path_derived_images (which is PATH_DERIVED/images)."""
+    monkeypatch.setenv("PATH_DERIVED", "/scratch/persistent")
+    monkeypatch.setenv("QIITA_ALLOW_TOKEN_ENV", "true")
+    monkeypatch.setenv("CO_TO_CP_TOKEN", "t")
+    settings = Settings.from_env(require_cp_to_co_token=False)
+    assert settings.path_derived == "/scratch/persistent"
+
+
+def test_from_env_path_derived_dev_fallback(monkeypatch):
+    """With no PATH_DERIVED, path_derived falls back under TMPDIR — the
+    dev/local posture (no fail-fast)."""
+    monkeypatch.delenv("PATH_DERIVED", raising=False)
+    monkeypatch.setenv("TMPDIR", "/tmp/xyz")
+    monkeypatch.setenv("QIITA_ALLOW_TOKEN_ENV", "true")
+    monkeypatch.setenv("CO_TO_CP_TOKEN", "t")
+    settings = Settings.from_env(require_cp_to_co_token=False)
+    assert settings.path_derived == "/tmp/xyz/qiita/derived"

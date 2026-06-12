@@ -137,12 +137,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     bucket = inputs.bucket_name or f"reference_{inputs.reference_idx}"
 
-    # Persistent index location under the shared scratch base (PATH_SCRATCH),
+    # Persistent index location under the derived-artifact root (PATH_DERIVED),
     # NOT the ephemeral per-attempt workspace. On SLURM the backend propagates
-    # PATH_SCRATCH into the job env so get_settings() resolves the real value
-    # here instead of the $TMPDIR/qiita default.
-    scratch_root = Path(get_settings().path_scratch)
-    index_dir = scratch_root / "references" / str(inputs.reference_idx) / "rype" / "index.ryxdi"
+    # PATH_DERIVED into the job env so get_settings() resolves the real value
+    # here instead of the $TMPDIR/qiita/derived default.
+    derived_root = Path(get_settings().path_derived)
+    index_dir = derived_root / "references" / str(inputs.reference_idx) / "rype" / "index.ryxdi"
     index_dir.parent.mkdir(parents=True, exist_ok=True)
     # On a workflow retry the build re-runs against the same persistent path;
     # clear any prior (possibly partial) `.ryxdi` so the rebuild is

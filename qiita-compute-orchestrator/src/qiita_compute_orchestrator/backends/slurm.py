@@ -106,6 +106,7 @@ class SlurmBackend(ComputeBackend):
         qos: str = "",
         path_derived_images: Path | None = None,
         path_scratch: str = "",
+        path_derived: str = "",
     ) -> None:
         self._client = client
         self._partition = partition
@@ -147,12 +148,20 @@ class SlurmBackend(ComputeBackend):
         # env for the same reason as cp_url: /etc/qiita is deploy-host-local,
         # invisible from compute nodes, so the native-step launcher's
         # `get_settings()` would otherwise fall back to the `$TMPDIR/qiita`
-        # DEFAULT for `path_scratch`. Native jobs that derive a persistent
-        # path from it — `build_rype_index` writes the `.ryxdi` under
-        # `{path_scratch}/references/{idx}/rype/` — need the real value or
-        # their output lands in node-local /tmp, invisible to the CP. Jobs
-        # that only write QIITA_OUTPUT_PATH (the workspace) don't care.
+        # DEFAULT for `path_scratch`. PATH_SCRATCH is the per-ticket workspace
+        # base; persistent index artifacts now derive from PATH_DERIVED instead
+        # (see `_path_derived` below — `build_rype_index` writes the `.ryxdi`
+        # under `{path_derived}/references/{idx}/rype/`). PATH_SCRATCH is still
+        # propagated so any job resolving the scratch base sees the real shared
+        # value, not node-local /tmp. Jobs that only write QIITA_OUTPUT_PATH
+        # (the workspace) don't care.
         self._path_scratch = path_scratch
+        # Derived-artifact root (PATH_DERIVED), propagated for the same reason
+        # as PATH_SCRATCH: native index builders (build_rype_index,
+        # build_minimap2_index) write `{path_derived}/references/{idx}/...`, so
+        # the launcher's get_settings() on the compute node needs the real
+        # value, not the $TMPDIR/qiita/derived dev fallback.
+        self._path_derived = path_derived
         # Optional SLURM QOS to set on submit; empty string means "let
         # SLURM apply the submitting user's default QOS" (the orchestrator
         # doesn't override).
@@ -363,6 +372,8 @@ class SlurmBackend(ComputeBackend):
             extra_env["QIITA_CP_URL"] = self._cp_url
         if self._path_scratch:
             extra_env["PATH_SCRATCH"] = self._path_scratch
+        if self._path_derived:
+            extra_env["PATH_DERIVED"] = self._path_derived
 
         # For container steps, expose the parent directory of every
         # YAML-declared input path so the entrypoint can read it via

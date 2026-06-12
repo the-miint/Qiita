@@ -53,7 +53,7 @@ def test_build_rype_index_orchestration(tmp_path, monkeypatch):
 
     # Persistent index root → tmp via env (get_settings falls back to from_env).
     shared_root = tmp_path / "shared"
-    monkeypatch.setenv("PATH_SCRATCH", str(shared_root))
+    monkeypatch.setenv("PATH_DERIVED", str(shared_root))
 
     reference_idx = 7
     # Two features, one multi-chunk; build the chunks dir.
@@ -124,7 +124,7 @@ def test_build_rype_index_orchestration(tmp_path, monkeypatch):
 def test_build_rype_index_honours_bucket_name_override(tmp_path, monkeypatch):
     from qiita_compute_orchestrator.jobs import build_rype_index
 
-    monkeypatch.setenv("PATH_SCRATCH", str(tmp_path / "shared"))
+    monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "shared"))
     chunks_dir = _write_chunks_dir(
         tmp_path / "reference_sequence_chunks", [(1, 0, "ACGT"), (2, 0, "CCCC")]
     )
@@ -158,7 +158,7 @@ def test_build_rype_index_clears_stale_index_on_rerun(tmp_path, monkeypatch):
     from qiita_compute_orchestrator.jobs import build_rype_index
 
     shared_root = tmp_path / "shared"
-    monkeypatch.setenv("PATH_SCRATCH", str(shared_root))
+    monkeypatch.setenv("PATH_DERIVED", str(shared_root))
     chunks_dir = _write_chunks_dir(tmp_path / "reference_sequence_chunks", [(1, 0, "ACGT")])
 
     # Pre-seed a stale/partial index at the persistent location.
@@ -184,7 +184,7 @@ def test_build_rype_index_clears_stale_index_on_rerun(tmp_path, monkeypatch):
 def test_build_rype_index_raises_on_non_ok_status(tmp_path, monkeypatch):
     from qiita_compute_orchestrator.jobs import build_rype_index
 
-    monkeypatch.setenv("PATH_SCRATCH", str(tmp_path / "shared"))
+    monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "shared"))
     chunks_dir = _write_chunks_dir(tmp_path / "reference_sequence_chunks", [(1, 0, "ACGT")])
 
     def fake_build(conn, chunk_table, output_path, mapping_table, *, k, w, max_memory):
@@ -221,7 +221,7 @@ def test_build_rype_index_real_rype_smoke(tmp_path, monkeypatch):
     from qiita_compute_orchestrator.jobs import build_rype_index
 
     shared_root = tmp_path / "shared"
-    monkeypatch.setenv("PATH_SCRATCH", str(shared_root))
+    monkeypatch.setenv("PATH_DERIVED", str(shared_root))
 
     reference_idx = 4242
     rows = [(fidx, 0, seq) for fidx, seq in _SMOKE_FEATURES.items()]
@@ -252,7 +252,7 @@ def test_build_rype_index_real_rype_smoke(tmp_path, monkeypatch):
 def test_build_rype_index_missing_chunks_raises(tmp_path, monkeypatch):
     from qiita_compute_orchestrator.jobs import build_rype_index
 
-    monkeypatch.setenv("PATH_SCRATCH", str(tmp_path / "shared"))
+    monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "shared"))
     inputs = build_rype_index.Inputs(
         reference_sequence_chunks=tmp_path / "does-not-exist",
         reference_idx=1,
