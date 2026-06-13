@@ -58,6 +58,13 @@ sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; 
 
 ### Notes (no host action)
 
+- (#90) `POST /study/lookup-by-accession` now resolves by `bioproject_accession`
+  by default (was `ena_study_accession`); a caller omitting the new optional
+  `accession_field` body field will match a different column than before. The
+  `qiita submit-bcl-convert` preflight relies on this (its project accessions
+  are BioProjects). `POST /biosample/lookup-by-accession` also gained the
+  optional `accession_field` selector (`biosample_accession` default or
+  `ena_sample_accession`), default behavior unchanged. No env var or migration.
 - (#87) The study REST field and `qiita study create`/`patch` CLI flag
   `ebi_study_accession` / `--ebi-study-accession` were renamed to
   `ena_study_accession` / `--ena-study-accession`. Any client sending the old

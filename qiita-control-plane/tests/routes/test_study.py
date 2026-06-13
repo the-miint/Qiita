@@ -191,6 +191,7 @@ async def test_post_study_full_body_round_trips(ctx):
         abstract="abs",
         funding="NIH-R01",
         ena_study_accession="ERP000001",
+        bioproject_accession="PRJNA000001",
         notes="notes-1",
         extra_metadata=extra,
         default_tier="viewer",
@@ -212,6 +213,7 @@ async def test_post_study_full_body_round_trips(ctx):
         "abstract": "abs",
         "funding": "NIH-R01",
         "ena_study_accession": "ERP000001",
+        "bioproject_accession": "PRJNA000001",
         "notes": "notes-1",
         "last_submission_at": None,
         "submission_error": None,
@@ -452,6 +454,31 @@ async def test_post_study_duplicate_ena_accession_409(ctx):
     )
     assert resp.status_code == 409, resp.text
     assert resp.json()["detail"] == "ena_study_accession already in use"
+
+
+async def test_post_study_duplicate_bioproject_accession_409(ctx):
+    """Tests the case where two POSTs supply the same non-null
+    bioproject_accession: the second trips the
+    study_bioproject_accession_unique constraint and the route maps it
+    to 409 with the per-column detail."""
+    shared_accession = f"PRJNA{secrets.token_hex(4)}"
+
+    first = await _post_study(
+        ctx["user"],
+        ctx,
+        title=_unique_title("dup-bp-first"),
+        bioproject_accession=shared_accession,
+    )
+    assert first.status_code == 201, first.text
+
+    resp = await _post_study(
+        ctx["user"],
+        ctx,
+        title=_unique_title("dup-bp-second"),
+        bioproject_accession=shared_accession,
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"] == "bioproject_accession already in use"
 
 
 async def test_post_study_two_null_ena_accessions_both_succeed(ctx):
@@ -709,6 +736,24 @@ async def test_patch_study_etag_advances_on_ena_accession_round_trip(ctx):
     new_etag = resp.headers["ETag"]
     assert new_etag != if_match
     assert resp.json()["ena_study_accession"] == new_acc
+
+
+async def test_patch_study_sets_bioproject_accession(ctx):
+    """Tests the case where a PATCH writes a new bioproject_accession; the
+    column is on the study PATCH surface and the response reflects it."""
+    create_resp = await _post_study(ctx["user"], ctx, title=_unique_title("patch-bp"))
+    assert create_resp.status_code == 201, create_resp.text
+    study_idx = create_resp.json()["study_idx"]
+    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+    new_acc = f"PRJNA{secrets.token_hex(4)}"
+
+    resp = await ctx["user"].patch(
+        URL_STUDY_BY_IDX.format(study_idx=study_idx),
+        json={"bioproject_accession": new_acc},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["bioproject_accession"] == new_acc
 
 
 async def test_study_clear_submission_error_on_new_attempt_trigger(ctx):
@@ -997,6 +1042,33 @@ async def test_patch_study_duplicate_ena_accession_409(ctx):
     assert resp.json()["detail"] == "ena_study_accession already in use"
 
 
+async def test_patch_study_duplicate_bioproject_accession_409(ctx):
+    """Tests the case where a PATCH would set bioproject_accession to a
+    value already held by another study: the
+    study_bioproject_accession_unique constraint fires and the route maps
+    the unique-violation to 409 with the per-column detail."""
+    shared_accession = f"PRJNA{secrets.token_hex(4)}"
+    first = await _post_study(
+        ctx["user"],
+        ctx,
+        title=_unique_title("patch-dup-bp-1"),
+        bioproject_accession=shared_accession,
+    )
+    assert first.status_code == 201, first.text
+    second = await _post_study(ctx["user"], ctx, title=_unique_title("patch-dup-bp-2"))
+    assert second.status_code == 201, second.text
+    study_idx = second.json()["study_idx"]
+    if_match = await etag_for_row(ctx["pool"], table="study", row_idx=study_idx)
+
+    resp = await ctx["user"].patch(
+        URL_STUDY_BY_IDX.format(study_idx=study_idx),
+        json={"bioproject_accession": shared_accession},
+        headers={"If-Match": if_match},
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "bioproject_accession already in use"
+
+
 # ===========================================================================
 # POST /api/v1/study/lookup-by-accession — bulk accession → idx resolver
 # ===========================================================================
@@ -1006,14 +1078,17 @@ async def test_patch_study_duplicate_ena_accession_409(ctx):
 # and the request-model rejection paths.
 
 
-async def _create_study_with_accession(ctx, *, accession: str) -> int:
-    """Create a study via POST carrying the given ena_study_accession and
-    return its idx; cleanup is handled by _post_study's tracker."""
+async def _create_study_with_accession(
+    ctx, *, accession: str, field: str = "bioproject_accession"
+) -> int:
+    """Create a study via POST carrying `accession` in the named accession
+    column (default bioproject_accession) and return its idx; cleanup is
+    handled by _post_study's tracker."""
     resp = await _post_study(
         ctx["user"],
         ctx,
         title=_unique_title("lookup"),
-        ena_study_accession=accession,
+        **{field: accession},
     )
     assert resp.status_code == 201, resp.text
     return resp.json()["study_idx"]
@@ -1021,11 +1096,12 @@ async def _create_study_with_accession(ctx, *, accession: str) -> int:
 
 async def test_lookup_study_by_accession_returns_resolved_map_and_missing_list(ctx):
     """Tests the case where the lookup body mixes seeded and absent
-    accessions: `resolved` carries the hits and `missing` echoes the
-    absent value in input order."""
-    acc_a = unique_accession("ERP-LOOKUP-A")
-    acc_b = unique_accession("ERP-LOOKUP-B")
-    acc_missing = unique_accession("ERP-LOOKUP-MISS")
+    accessions: with accession_field omitted the default keys on
+    bioproject_accession, `resolved` carries the hits and `missing` echoes
+    the absent value in input order."""
+    acc_a = unique_accession("PRJ-LOOKUP-A")
+    acc_b = unique_accession("PRJ-LOOKUP-B")
+    acc_missing = unique_accession("PRJ-LOOKUP-MISS")
     study_a = await _create_study_with_accession(ctx, accession=acc_a)
     study_b = await _create_study_with_accession(ctx, accession=acc_b)
 
@@ -1040,13 +1116,49 @@ async def test_lookup_study_by_accession_returns_resolved_map_and_missing_list(c
     }
 
 
+async def test_lookup_study_by_accession_resolves_by_ena_when_specified(ctx):
+    """Tests the case where the body sets accession_field to
+    ena_study_accession: a study seeded with that column resolves, and a
+    study seeded only with bioproject does not."""
+    ena_acc = unique_accession("ERP-LOOKUP-ENA")
+    bioproject_acc = unique_accession("PRJ-LOOKUP-ONLY")
+    ena_study = await _create_study_with_accession(
+        ctx, accession=ena_acc, field="ena_study_accession"
+    )
+    await _create_study_with_accession(ctx, accession=bioproject_acc)
+
+    resp = await ctx["user"].post(
+        URL_STUDY_LOOKUP_BY_ACCESSION,
+        json={
+            "accessions": [ena_acc, bioproject_acc],
+            "accession_field": "ena_study_accession",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "resolved": {ena_acc: ena_study},
+        "missing": [bioproject_acc],
+    }
+
+
+async def test_lookup_study_by_accession_rejects_invalid_accession_field_422(ctx):
+    """Tests the case where accession_field is outside StudyAccessionField —
+    the Literal rejects it at the wire boundary with 422 before any DB
+    work runs."""
+    resp = await ctx["user"].post(
+        URL_STUDY_LOOKUP_BY_ACCESSION,
+        json={"accessions": ["PRJ000001"], "accession_field": "title"},
+    )
+    assert resp.status_code == 422
+
+
 async def test_lookup_study_by_accession_dedups_input_preserving_order(ctx):
     """Tests the case where the body repeats accessions: each value is
     deduped and `missing` echoes the deduped values in first-occurrence
     order."""
-    acc = unique_accession("ERP-LOOKUP-DUP")
+    acc = unique_accession("PRJ-LOOKUP-DUP")
     study_idx = await _create_study_with_accession(ctx, accession=acc)
-    acc_miss = unique_accession("ERP-LOOKUP-DUP-MISS")
+    acc_miss = unique_accession("PRJ-LOOKUP-DUP-MISS")
 
     resp = await ctx["user"].post(
         URL_STUDY_LOOKUP_BY_ACCESSION,
@@ -1062,13 +1174,13 @@ async def test_lookup_study_by_accession_no_access_caller_still_resolves(ctx):
     on a wet-lab-admin-owned study still gets the resolved idx — the
     lookup route runs no per-row access predicate (response carries only
     the natural-key → idx map; GET /study/{idx} still gates access)."""
-    acc = unique_accession("ERP-LOOKUP-NOACC")
+    acc = unique_accession("PRJ-LOOKUP-NOACC")
     # wet_lab_admin owns the study; the regular_user has no study_access row.
     create_resp = await _post_study(
         ctx["wet"],
         ctx,
         title=_unique_title("lookup-noacc"),
-        ena_study_accession=acc,
+        bioproject_accession=acc,
     )
     assert create_resp.status_code == 201, create_resp.text
     study_idx = create_resp.json()["study_idx"]

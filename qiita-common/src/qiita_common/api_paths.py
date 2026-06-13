@@ -259,8 +259,9 @@ URL_USER_ME = f"{URL_USER_PREFIX}{PATH_USER_ME}"
 PATH_STUDY_PREFIX = "/study"
 PATH_STUDY_ROOT = ""  # POST against the prefix itself
 PATH_STUDY_BY_IDX = "/{study_idx}"
-# Bulk lookup of study_idx by ena_study_accession; same body-vs-querystring
-# rationale as the biosample lookup variants.
+# Bulk lookup of study_idx by a selectable study accession column
+# (ena_study_accession or bioproject_accession; default bioproject); same
+# body-vs-querystring rationale as the biosample lookup variants.
 PATH_STUDY_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
 
 URL_STUDY_PREFIX = f"{API_PREFIX}{PATH_STUDY_PREFIX}"
@@ -301,11 +302,12 @@ PATH_BIOSAMPLE_LIST_BY_STUDY = "/{study_idx}/biosample/list-idxs"
 
 PATH_BIOSAMPLE_PREFIX = "/biosample"
 PATH_BIOSAMPLE_BY_IDX = "/{biosample_idx}"
-# Bulk lookup of biosample_idx by biosample_accession. POST (not GET)
-# because the accession list lives in the body — a typical bcl-convert
-# pool carries ~384 accessions, which exceeds nginx's default URL-line
-# cap when threaded through query-params. The response shape carries the
-# resolved {accession: idx} map plus a missing[] list so the CLI can
+# Bulk lookup of biosample_idx by a selectable biosample accession column
+# (biosample_accession or ena_sample_accession; default biosample_accession).
+# POST (not GET) because the accession list lives in the body — a typical
+# bcl-convert pool carries ~384 accessions, which exceeds nginx's default
+# URL-line cap when threaded through query-params. The response shape carries
+# the resolved {accession: idx} map plus a missing[] list so the CLI can
 # fail-fast naming every miss without N round trips.
 PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
 # Bulk lookup of biosample_idx by matrix_tube_id; same body-vs-querystring

@@ -473,7 +473,9 @@ async def lookup_biosample_by_accession(
     user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
 ) -> BiosampleLookupByAccessionResponse:
-    """Resolve a list of biosample_accession values to biosample_idx.
+    """Resolve a list of biosample accession values to biosample_idx, keyed
+    on the column named by `body.accession_field` (default
+    biosample_accession).
 
     POST (not GET) because a typical bcl-convert pool carries up to 384
     accessions; threaded through query-params that would exceed nginx's
@@ -499,7 +501,7 @@ async def lookup_biosample_by_accession(
     _ = user
     resolved, missing = await resolve_idxs_by_natural_key(
         values=body.accessions,
-        fetcher=_biosample_natural_key_fetcher(pool, "biosample_accession"),
+        fetcher=_biosample_natural_key_fetcher(pool, body.accession_field),
     )
     return BiosampleLookupByAccessionResponse(resolved=resolved, missing=missing)
 
