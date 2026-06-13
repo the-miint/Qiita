@@ -7,11 +7,14 @@ a single-bucket `(feature_idx, bucket_name)` mapping, and calls miint's
 the shared filesystem (NOT the ephemeral workspace) — the index outlives the
 work ticket and is consumed at host-filter time.
 
-For host filtering every feature goes to one bucket (the reference is a
-negative filter — reads matching it are removed). We still pass a named
-single-bucket mapping (default `reference_{reference_idx}`) rather than
-omitting the optional mapping table: it keeps the index self-describing and
-exercises the same mapping path future multi-bucket (microbial) uses will reuse.
+For host filtering every feature goes to one bucket: the `.ryxdi` is a POSITIVE
+host index — at filter time `rype_classify` emits any read matching it (host =
+any emitted row), and the `host_filter` step removes those reads (then minimap2
+re-checks the survivors). This is NOT rype's `-N` / `negative_index` mode. We
+still pass a named single-bucket mapping (default `reference_{reference_idx}`)
+rather than omitting the optional mapping table: it keeps the index
+self-describing and exercises the same mapping path future multi-bucket
+(microbial) uses will reuse.
 
 rype build parameters default to k=64, w=25 (the function's own w default is
 50, so we pass 25 explicitly). The authoritative build manifest lives inside
@@ -114,8 +117,8 @@ def _run_rype_index_create(
     `chunk_table` / `mapping_table` are table NAMES the function resolves on its
     own connection (not SQL identifiers, hence VARCHAR). Named values are
     inlined (int()/pinned constant — no injection surface), `mapping_table`
-    quote-escaped. orient=TRUE keeps both-strand matching (right for a host
-    negative filter)."""
+    quote-escaped. orient=TRUE keeps both-strand matching (right for host
+    classification — a read can match the host on either strand)."""
     mapping_sql = mapping_table.replace("'", "''")
     row = conn.execute(
         "SELECT status FROM rype_index_create(?, ?, "

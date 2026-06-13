@@ -1017,8 +1017,9 @@ async def _resolve_reference_index_path(
     index_type: str,
 ) -> str:
     """Resolve the on-disk path of the newest `index_type` index for an
-    ACTIVE reference — the path a host-filter compute job is injected with
-    (rype's `negative_index` for host references).
+    ACTIVE reference — a host-filter index path the `host_filter` step is
+    injected with (the rype `.ryxdi` or minimap2 `.mmi` for a host reference;
+    see `_resolve_host_filter_indexes`).
 
     `qiita.reference_index` has no UNIQUE(reference_idx, index_type) by design
     (growing a reference appends a newer generation), so "newest wins":
