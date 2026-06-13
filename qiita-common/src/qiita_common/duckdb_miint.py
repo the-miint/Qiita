@@ -8,17 +8,30 @@ and the empty-input pre-check that both the orchestrator
 `MIINT_EXTENSION_DIRECTORY` env contract is single-sourced rather than copied
 into each.
 
-miint always installs from the team mirror (default `MIINT_MIRROR_URL`;
+miint installs from the team mirror (default `MIINT_MIRROR_URL`;
 `MIINT_EXTENSION_REPO` overrides for a local/dev build) so every Qiita
-component runs the **same**, current build — the mirror is the single source of
-truth for the miint version, and pulling everyone from it avoids the
-community-vs-mirror patchwork where hosts drift to different builds.
-Installing from the mirror implies
-`allow_unsigned_extensions=true` (its signing chain is the team's own, not
-DuckDB's). `MIINT_EXTENSION_DIRECTORY` isolates the install directory so a
-mirror build doesn't clash with another origin's cached extension in the shared
-default `~/.duckdb/extensions` — DuckDB refuses a plain INSTALL when a cached
-extension's origin differs.
+component runs the **same** build — the mirror is the single source of truth for
+the miint version, and pulling everyone from it avoids the community-vs-mirror
+patchwork where hosts drift to different builds. Installing from the mirror
+implies `allow_unsigned_extensions=true` (its signing chain is the team's own,
+not DuckDB's). `MIINT_EXTENSION_DIRECTORY` selects the install directory; in
+production it points at a shared directory that the deploy stages **once**
+(`scripts/stage-miint-extension.sh`).
+
+Install vs. load — the two halves of the contract:
+
+- On the **cluster** (CO service, native SLURM jobs, the compute-readiness
+  probe) miint is pre-staged into `MIINT_EXTENSION_DIRECTORY` at deploy, and
+  runtime only ever `LOAD`s it (`miint_load_sql`). No compute node downloads the
+  extension, needs the mirror reachable, or needs a writable `$HOME` — the
+  per-job `FORCE INSTALL` that did all three was a footgun and is gone.
+- The **client** `qiita reference load` CLI can't reach a deploy-staged dir
+  (it runs from arbitrary hosts), so it `INSTALL`s into its own cache — but
+  plain `INSTALL`, which is a no-op on a warm cache, not `FORCE`.
+
+Cross-language note: the Rust data plane can't import this module, so it honors
+the same env contract (`MIINT_EXTENSION_REPO` / `MIINT_EXTENSION_DIRECTORY`)
+independently — keep the two sides in sync (see `qiita-data-plane/src/main.rs`).
 """
 
 from __future__ import annotations
@@ -50,12 +63,44 @@ def miint_connect_config() -> dict[str, str]:
     return config
 
 
-def miint_install_sql() -> str:
-    """The INSTALL statement for miint: always FORCE INSTALL from the mirror
-    (`MIINT_EXTENSION_REPO` override, else `MIINT_MIRROR_URL`). FORCE overwrites
-    a stale cached extension so a compute node always runs the mirror's current
-    build instead of whatever it happened to cache earlier."""
-    return f"FORCE INSTALL miint FROM '{_miint_repo()}';"
+def miint_install_sql(*, force: bool = False) -> str:
+    """The INSTALL statement for miint, from the mirror (`MIINT_EXTENSION_REPO`
+    override, else `MIINT_MIRROR_URL`).
+
+    Plain `INSTALL` by default — it is a no-op when the build is already present
+    in the active `extension_directory`, so it never re-downloads on a warm
+    cache. This is the form the client-side `qiita reference load` CLI uses (fill
+    the local cache once, then reuse it).
+
+    `force=True` is for **deploy-time staging only** (`stage_miint_extension`):
+    it re-installs even when present, so a deploy refreshes the shared
+    `extension_directory` to the mirror's current build. Cluster runtime never
+    INSTALLs at all — it `LOAD`s from that pre-staged directory (`miint_load_sql`).
+    """
+    verb = "FORCE INSTALL" if force else "INSTALL"
+    return f"{verb} miint FROM '{_miint_repo()}';"
+
+
+def miint_load_sql() -> str:
+    """The LOAD statement for miint. Cluster runtime paths (CO service, native
+    jobs, the compute-readiness probe) only LOAD: the extension is pre-staged
+    into `MIINT_EXTENSION_DIRECTORY` at deploy, so no node downloads it, depends
+    on mirror reachability, or needs a writable `$HOME`."""
+    return "LOAD miint;"
+
+
+def miint_job_env() -> dict[str, str]:
+    """The miint env vars a remote (SLURM) job must carry to LOAD the
+    deploy-staged extension. Both the orchestrator's SlurmBackend (real jobs)
+    and the compute-readiness probe inject exactly this into the job's slurmrestd
+    `environment` — single-sourced here so the two can't drift.
+
+    Only `MIINT_EXTENSION_DIRECTORY` is propagated: the cluster path is LOAD-only
+    (it reads the pre-staged dir), so `MIINT_EXTENSION_REPO` — which only selects
+    where an *install* downloads from — is irrelevant on a compute node. Returns
+    empty when unset (dev/test runs that rely on the DuckDB default dir)."""
+    ext_dir = os.environ.get("MIINT_EXTENSION_DIRECTORY")
+    return {"MIINT_EXTENSION_DIRECTORY": ext_dir} if ext_dir else {}
 
 
 def is_empty_sequence_file(path: Path) -> bool:

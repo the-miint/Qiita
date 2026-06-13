@@ -15,20 +15,37 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
-_None yet._
+- (#89) [operator] Point the orchestrator at the shared dir the deploy stages
+  miint into (`<derived>` = the `PATH_DERIVED` root). Cluster jobs and the
+  compute-readiness probe LOAD from here, and the orchestrator propagates it into
+  every job's environment, so it must precede the bucket-4 restart. (Not a hard
+  boot fail-fast like the others — an unset/unstaged dir surfaces at the bucket-5
+  probe, not at boot.)
+  ```bash
+  sudo bash -c 'grep -q "^MIINT_EXTENSION_DIRECTORY=" /etc/qiita/compute-orchestrator.env || echo "MIINT_EXTENSION_DIRECTORY=<derived>/duckdb-ext" >> /etc/qiita/compute-orchestrator.env'
+  ```
 
 ### 2. One-time host setup
 
-- (#86) [operator] Ensure the **v1.5.3** miint build on the mirror
+- (#86, #89) [operator] Ensure the **v1.5.3** miint build on the mirror
   (`https://ftp.microbio.me/pub/miint/v1.5.3/`) includes the `sequence_split`
-  scalar (duckdb-miint #121) BEFORE the bucket-4 deploy. Components run DuckDB
-  1.5.3 (#85) and `FORCE INSTALL miint` for their own version, so they pull the
-  `v1.5.3` build; the chunking SQL (`UNNEST(sequence_split(...))`) only resolves
-  if that build has the function. Adding it is backward-compatible (it only adds
-  a scalar), so publishing early does not affect already-deployed code. If the
-  v1.5.3 build lacks `sequence_split` at deploy time, `stage_local_fasta` and the
-  CLI `reference load` FASTA path fail with "Scalar Function with name
+  scalar (duckdb-miint #121) BEFORE the bucket-4 stage step. Components run DuckDB
+  1.5.3 (#85); the bucket-4 stage step (#89) pulls the `v1.5.3` build from the
+  mirror into the shared extension dir and the cluster LOADs it, so the chunking
+  SQL (`UNNEST(sequence_split(...))`) only resolves if that build has the
+  function. Adding it is backward-compatible (it only adds a scalar), so
+  publishing early does not affect already-deployed code. If the v1.5.3 build
+  lacks `sequence_split` when staged, `stage_local_fasta` and the CLI
+  `reference load` FASTA path fail with "Scalar Function with name
   sequence_split does not exist" — the bucket-5 probe catches this first.
+- (#89) [operator] Create the shared dir the orchestrator's
+  `MIINT_EXTENSION_DIRECTORY` points at — `qiita-orch` owns it and writes the
+  staged extension; every compute node reads it. The stage step itself runs in
+  bucket 4 (it needs the newly-deployed code).
+  ```bash
+  derived=$(sudo grep '^PATH_DERIVED=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)
+  sudo install -d -o qiita-orch -g qiita-orch -m 0755 "$derived/duckdb-ext"
+  ```
 
 ### 3. Migrations
 
@@ -42,18 +59,29 @@ make -C ~/qiita-miint migrate
 
 ### 4. Deploy
 
-_None yet._
+After `local-deploy.sh` (the standard deploy — see the runbook), which ships the
+new stage-miint code, stage the miint extension into the shared dir. The cluster
+is LOAD-only now, so jobs won't find miint until this runs; re-run it on any
+miint or DuckDB version bump.
+
+```bash
+derived=$(sudo grep '^PATH_DERIVED=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)
+py=$(sudo grep '^SLURM_NATIVE_PYTHON=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)
+sudo -u qiita-orch env PATH_DERIVED="$derived" SLURM_NATIVE_PYTHON="$py" \
+    bash /home/qiita/qiita-miint/scripts/stage-miint-extension.sh   # (#89)
+```
 
 ### 5. Verify
 
 ```bash
-# (#86) [admin] the deployed compute node's v1.5.3 miint build exposes
-# sequence_split (the native chunker stage_local_fasta / reference_load depend
-# on). It is newer than read_fastx, so a mirror build missing it passes the
-# read_fastx probe but FAILS here — confirming the bucket-2 publish reached the
-# node.
+# (#86, #89) [admin] the deployed compute node LOADs the staged v1.5.3 miint
+# build, which must expose sequence_split (the native chunker stage_local_fasta
+# / reference_load depend on). It is newer than read_fastx, so a staged build
+# missing it passes the read_fastx probe but FAILS here — confirming the
+# bucket-4 stage produced a current build. The probe now prints the underlying
+# error on a failure, so a red row is self-diagnosing.
 sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
-    qiita-admin compute-readiness' | grep -E 'probe/(miint-read-fastx|miint-sequence-split)'   # both =ok (#86)
+    qiita-admin compute-readiness' | grep -E 'probe/(miint-read-fastx|miint-sequence-split)'   # both =ok
 ```
 
 ### Notes (no host action)

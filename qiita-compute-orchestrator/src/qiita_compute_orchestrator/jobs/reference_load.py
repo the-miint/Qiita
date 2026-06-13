@@ -53,8 +53,7 @@ from ..miint import (
     PARQUET_OPTS,
     PARQUET_OPTS_CHUNKED,
     apply_duckdb_settings,
-    ensure_miint_installed,
-    open_conn,
+    open_miint_conn,
 )
 
 YAML_STEP_NAME = "load"
@@ -145,16 +144,13 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     duckdb_tmp.mkdir(parents=True, exist_ok=True)
 
     # miint is needed for `read_newick` and `read_jplace` when the
-    # optional tree / jplace inputs are present. Install eagerly even
-    # when those inputs are absent — the install is a no-op after the
-    # first call per process and keeps the connection setup uniform.
-    await ensure_miint_installed()
-
+    # optional tree / jplace inputs are present. LOAD unconditionally even
+    # when those inputs are absent — the extension is pre-staged, LOAD is
+    # cheap, and it keeps the connection setup uniform.
     written: list[Path] = []
     success = False
     try:
-        with open_conn() as conn:
-            conn.execute("LOAD miint;")
+        with open_miint_conn() as conn:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
