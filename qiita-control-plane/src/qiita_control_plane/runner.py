@@ -305,6 +305,14 @@ async def run_workflow(
         )
         bound.update(resolved_paths)
 
+        # Host-filter index resolution, gated by `host_filter_enabled` in
+        # action_context (fastq-to-parquet/1.1.0). Like upload-handle resolution
+        # it runs inside this try, so a raise (unknown / non-active host
+        # reference, missing index) lands in the outer FAILED handler instead of
+        # leaving the ticket stuck in PROCESSING. `host_reference_idx` is NOT a
+        # `*_upload_idx` key, so the walker above left it untouched.
+        bound.update(await _resolve_host_filter_indexes(pool, action_context=bound))
+
         for index, entry in enumerate(action.steps):
             completed = _completed_progress_row(progress, index)
 
@@ -840,6 +848,21 @@ def _safe_entry_name(action: ActionDefinition, index: int | None) -> str | None:
 # slot terminal).
 
 
+def _submission_bad_input(reason: str) -> BackendFailure:
+    """A BAD_INPUT failure attributed to workflow SUBMISSION (not any one step).
+
+    The shared shape every pre-step resolution pass raises — `_resolve_upload_handles`
+    and `_resolve_host_filter_indexes` — so the outer `except BackendFailure`
+    block in `run_workflow` translates each into a FAILED work_ticket
+    identically (step_name=None ⇒ attributed to the workflow's submission)."""
+    return BackendFailure(
+        kind=FailureKind.BAD_INPUT,
+        stage=WorkTicketFailureStage.SUBMISSION,
+        step_name=None,
+        reason=reason,
+    )
+
+
 async def _resolve_upload_handles(
     pool: asyncpg.Pool,
     *,
@@ -876,13 +899,8 @@ async def _resolve_upload_handles(
     redrive against the same handles.
     """
 
-    def _bad(reason: str) -> BackendFailure:
-        return BackendFailure(
-            kind=FailureKind.BAD_INPUT,
-            stage=WorkTicketFailureStage.SUBMISSION,
-            step_name=None,
-            reason=reason,
-        )
+    # Shared SUBMISSION-attributed BAD_INPUT shape (see _submission_bad_input).
+    _bad = _submission_bad_input
 
     # First pass: validate keys + value shape, collect (key, prefix, upload_idx).
     pending: list[tuple[str, str, int]] = []
@@ -1038,6 +1056,50 @@ async def _resolve_reference_index_path(
     if fs_path is None:
         raise ValueError(f"reference {reference_idx} has no {index_type!r} index built yet")
     return fs_path
+
+
+async def _resolve_host_filter_indexes(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    *,
+    action_context: dict[str, Any],
+) -> dict[str, Path]:
+    """Resolve the host-filter index paths when host filtering is enabled, else {}.
+
+    Gated by `host_filter_enabled` (bool) in `action_context`. When enabled,
+    `host_reference_idx` (positive int) must name an ACTIVE reference carrying
+    BOTH a `rype` and a `minimap2` index; their newest-generation paths are bound
+    as `host_rype_path` / `host_minimap2_path` — the `host_filter` step's optional
+    inputs. When disabled (flag false/absent) nothing is resolved and the step
+    runs as a pass-through (its index Inputs default to None).
+
+    Mirrors `_resolve_upload_handles`: any failure (host_reference_idx absent or
+    non-positive, reference unknown / non-active / missing an index type) raises a
+    typed `BackendFailure(BAD_INPUT)` at stage=SUBMISSION, which the outer handler
+    in `run_workflow` turns into a FAILED work_ticket. `host_reference_idx`
+    deliberately does NOT end in `_upload_idx`, so `_resolve_upload_handles` leaves
+    it untouched."""
+    if not action_context.get("host_filter_enabled"):
+        return {}
+    host_reference_idx = action_context.get("host_reference_idx")
+    # `type(...) is int` (not isinstance) so a JSON bool — a subclass of int —
+    # is rejected rather than silently treated as 0/1.
+    if type(host_reference_idx) is not int or host_reference_idx <= 0:
+        raise _submission_bad_input(
+            "host_filter_enabled requires a positive integer host_reference_idx, "
+            f"got {host_reference_idx!r}"
+        )
+    try:
+        rype_path = await _resolve_reference_index_path(pool, host_reference_idx, "rype")
+        minimap2_path = await _resolve_reference_index_path(pool, host_reference_idx, "minimap2")
+    except ReferenceNotFound as exc:
+        raise _submission_bad_input(
+            f"host_reference_idx={host_reference_idx} references an unknown reference"
+        ) from exc
+    except ValueError as exc:
+        # Reference not active, or a `rype`/`minimap2` index not built yet — the
+        # _resolve_reference_index_path contract raises ValueError for both.
+        raise _submission_bad_input(str(exc)) from exc
+    return {"host_rype_path": Path(rype_path), "host_minimap2_path": Path(minimap2_path)}
 
 
 # =============================================================================

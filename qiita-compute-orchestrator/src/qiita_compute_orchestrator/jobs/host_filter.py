@@ -29,8 +29,11 @@ miint contracts (qiita-verified against the team-mirror build; see
 docs/duckdb-miint.md):
   - `rype_classify(index_path, sequence_table, [id_column='read_id'],
     [threshold=0.1], [negative_index])` → one row per HOST read with columns
-    `(read_id, bucket_id, bucket_name, score)`. rype's id codec returns `read_id`
-    as VARCHAR even for a BIGINT input, so we CAST back to BIGINT.
+    `(read_id, bucket_id, bucket_name, score)`. The id codec round-trips a BIGINT
+    id losslessly; pre-`duckdb-miint#126` it emits `read_id` as VARCHAR, #126+
+    mirrors the input BIGINT — the explicit CAST normalizes both to BIGINT. (The
+    `mates` view feeds a real BIGINT `read_id`, which #126's tightened
+    `{VARCHAR,BIGINT,UUID}` id-type check accepts.)
   - `align_minimap2(query_table, [index_path], [preset], ...)` → SAM-like rows
     (`read_id, flags, reference, ...`); `read_id` stays BIGINT. Any row = a hit.
 Both read a `sequence1` column off the query/sequence table and resolve the
@@ -112,7 +115,8 @@ def _run_rype_classify(
 
     Positional args (index path, sequence-table NAME) + `threshold` are bound as
     `?` (INSERT...SELECT is DML, so prepared params are accepted here, unlike a
-    CREATE VIEW). rype returns `read_id` as VARCHAR — CAST back to BIGINT."""
+    CREATE VIEW). The CAST normalizes rype's `read_id` to BIGINT — VARCHAR in
+    builds before `duckdb-miint#126`, the input BIGINT after; either way exact."""
     conn.execute(
         f"INSERT INTO {dest_table} "
         "SELECT DISTINCT CAST(read_id AS BIGINT) AS sequence_idx "

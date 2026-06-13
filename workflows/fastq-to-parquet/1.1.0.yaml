@@ -1,0 +1,99 @@
+action_id: fastq-to-parquet
+version: 1.1.0
+target_kind: prep_sample
+# Sequenced-only by definition: FASTQ files are sequencing artifacts.
+target_processing_kinds: [sequenced]
+
+description: >
+  Additive successor to fastq-to-parquet/1.0.0: the same FASTQ→reads.parquet
+  conversion (CP-minted sequence_idx) plus an OPTIONAL downstream host-depletion
+  step. 1.0.0 stays available unchanged; submitters choose the version.
+
+  The `fastq` step is identical to 1.0.0 — parse, count, mint a contiguous
+  sequence_idx range, write reads.parquet. Minting happens here, before any
+  filtering. `host_filter` is an additive transform on that reads.parquet: a
+  pure reads → filtered_reads drop keyed by the already-minted sequence_idx, so
+  filtered output has benign gaps in sequence_idx (still a unique sorted join
+  key), never a re-mint.
+
+  Host filtering is GATED. When action_context sets `host_filter_enabled: true`
+  with a `host_reference_idx` naming an ACTIVE host reference, the runner
+  resolves that reference's rype (.ryxdi) and minimap2 (.mmi) indexes and binds
+  them to host_filter, which drops reads matching either (rype first, then
+  minimap2 on rype's survivors; paired-end pairs drop if either mate hits). When
+  disabled (or omitted) host_filter's index inputs stay unbound and it is a
+  pass-through copy — reads == filtered_reads.
+
+  Per-sample scope (target_kind: prep_sample); the route's submit-time check
+  rejects tickets pointing at non-sequenced preps. The orchestrator
+  authenticates sequence-range mint with the compute service-account PAT, so the
+  submitter does not need sequence_range:mint on their own token.
+
+scopes: []
+
+audience:
+  service: false
+  human_roles: [user, wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  required: [fastq_path]
+  properties:
+    fastq_path:
+      type: string
+      minLength: 1
+      pattern: "^/"
+    reverse_fastq_path:
+      type: string
+      minLength: 1
+      pattern: "^/"
+    # Host-filter gate. `host_filter_enabled` defaults off; when true,
+    # `host_reference_idx` must name an ACTIVE host reference carrying BOTH a
+    # rype and a minimap2 index (the runner's _resolve_host_filter_indexes
+    # resolves them and 400s the submission otherwise). NOTE: this is a plain
+    # reference idx, NOT a `*_upload_idx` — the upload-handle walker only touches
+    # `_upload_idx` keys, so it leaves this one alone.
+    host_filter_enabled:
+      type: boolean
+    host_reference_idx:
+      type: integer
+      minimum: 1
+
+steps:
+  - step: fastq
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.fastq_to_parquet
+    inputs: [fastq_path]
+    # `reverse_fastq_path` flows through only when the action_context carries it.
+    optional_inputs: [reverse_fastq_path]
+    outputs: [reads]
+    baseline_resources:
+      cpu: 2
+      mem_gb: 8
+      walltime: PT30M
+
+  # Optional host depletion on the minted reads. `host_rype_path` /
+  # `host_minimap2_path` are bound by the runner's _resolve_host_filter_indexes
+  # ONLY when host_filter_enabled — declared as optional_inputs so the step is a
+  # pass-through (reads → filtered_reads unchanged) when host filtering is off.
+  # No target_status: fastq-to-parquet tracks no resource lifecycle.
+  - step: host_filter
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.host_filter
+    inputs: [reads]
+    optional_inputs: [host_rype_path, host_minimap2_path]
+    outputs: [filtered_reads]
+    # mem_gb=16 / cpu=4 mirror host_filter.py's DuckDB cap (8 GB, half the
+    # allocation) + threads (4). Genome-scale host-index sizing is deferred
+    # (see host_filter.py): when sizing against a real host reference, bump
+    # mem_gb AND reconsider walltime together — minimap2 short-read alignment
+    # against a human-genome .mmi can exceed PT4H on 4 CPUs for a deep FASTQ.
+    baseline_resources:
+      cpu: 4
+      mem_gb: 16
+      walltime: PT4H
+
+action_ceiling:
+  cpu: 8
+  mem_gb: 16
+  walltime: PT4H

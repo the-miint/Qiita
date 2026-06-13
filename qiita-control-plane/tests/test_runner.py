@@ -1429,6 +1429,201 @@ async def test_resolve_reference_index_path_raises_when_no_index(postgres_pool, 
 
 
 # =============================================================================
+# _resolve_host_filter_indexes (host-filter gating, fastq-to-parquet/1.1.0)
+# =============================================================================
+
+
+async def test_resolve_host_filter_indexes_binds_both_when_enabled(postgres_pool, reference_idx):
+    """Enabled + an ACTIVE host reference with both indexes → host_rype_path and
+    host_minimap2_path bound to the newest generation of each."""
+    from qiita_control_plane.runner import _resolve_host_filter_indexes
+
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1", reference_idx
+    )
+    await _insert_reference_index(postgres_pool, reference_idx, "/srv/r.ryxdi", index_type="rype")
+    await _insert_reference_index(postgres_pool, reference_idx, "/srv/m.mmi", index_type="minimap2")
+    try:
+        out = await _resolve_host_filter_indexes(
+            postgres_pool,
+            action_context={"host_filter_enabled": True, "host_reference_idx": reference_idx},
+        )
+        assert {k: str(v) for k, v in out.items()} == {
+            "host_rype_path": "/srv/r.ryxdi",
+            "host_minimap2_path": "/srv/m.mmi",
+        }
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_host_filter_indexes_disabled_returns_empty(postgres_pool, reference_idx):
+    """Flag false or absent → {} (host_filter runs as a pass-through). No DB
+    lookup is even attempted."""
+    from qiita_control_plane.runner import _resolve_host_filter_indexes
+
+    assert (
+        await _resolve_host_filter_indexes(
+            postgres_pool,
+            action_context={"host_filter_enabled": False, "host_reference_idx": reference_idx},
+        )
+        == {}
+    )
+    assert await _resolve_host_filter_indexes(postgres_pool, action_context={}) == {}
+
+
+async def test_resolve_host_filter_indexes_enabled_requires_reference_idx(postgres_pool):
+    """Enabled but no (or non-positive / wrong-typed) host_reference_idx →
+    SUBMISSION BAD_INPUT."""
+    from qiita_control_plane.runner import _resolve_host_filter_indexes
+
+    for ctx in (
+        {"host_filter_enabled": True},  # missing
+        {"host_filter_enabled": True, "host_reference_idx": 0},  # non-positive
+        {"host_filter_enabled": True, "host_reference_idx": True},  # bool, not int
+    ):
+        with pytest.raises(BackendFailure) as ei:
+            await _resolve_host_filter_indexes(postgres_pool, action_context=ctx)
+        assert ei.value.kind == FailureKind.BAD_INPUT
+        assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
+        assert ei.value.step_name is None
+
+
+async def test_resolve_host_filter_indexes_unknown_reference(postgres_pool):
+    from qiita_control_plane.runner import _resolve_host_filter_indexes
+
+    with pytest.raises(BackendFailure) as ei:
+        await _resolve_host_filter_indexes(
+            postgres_pool,
+            action_context={"host_filter_enabled": True, "host_reference_idx": 999_999_999},
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
+
+
+async def test_resolve_host_filter_indexes_non_active_reference(postgres_pool, reference_idx):
+    """A host reference still `indexing` (build mid-flight) must not be served."""
+    from qiita_control_plane.runner import _resolve_host_filter_indexes
+
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'indexing' WHERE reference_idx = $1", reference_idx
+    )
+    await _insert_reference_index(postgres_pool, reference_idx, "/srv/r.ryxdi", index_type="rype")
+    await _insert_reference_index(postgres_pool, reference_idx, "/srv/m.mmi", index_type="minimap2")
+    try:
+        with pytest.raises(BackendFailure) as ei:
+            await _resolve_host_filter_indexes(
+                postgres_pool,
+                action_context={"host_filter_enabled": True, "host_reference_idx": reference_idx},
+            )
+        assert ei.value.kind == FailureKind.BAD_INPUT
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_host_filter_indexes_missing_minimap2_index(postgres_pool, reference_idx):
+    """Active host reference with a rype index but no minimap2 yet → BAD_INPUT
+    (a host reference needs both for the two-stage filter)."""
+    from qiita_control_plane.runner import _resolve_host_filter_indexes
+
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1", reference_idx
+    )
+    await _insert_reference_index(postgres_pool, reference_idx, "/srv/r.ryxdi", index_type="rype")
+    try:
+        with pytest.raises(BackendFailure) as ei:
+            await _resolve_host_filter_indexes(
+                postgres_pool,
+                action_context={"host_filter_enabled": True, "host_reference_idx": reference_idx},
+            )
+        assert ei.value.kind == FailureKind.BAD_INPUT
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_host_filter_indexes_missing_rype_index(postgres_pool, reference_idx):
+    """Symmetric to the minimap2-missing case: an active host reference with a
+    minimap2 index but no rype (e.g. a failed/deleted rype build) → BAD_INPUT.
+    rype is resolved first, so this locks that arm of the two-index contract."""
+    from qiita_control_plane.runner import _resolve_host_filter_indexes
+
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1", reference_idx
+    )
+    await _insert_reference_index(postgres_pool, reference_idx, "/srv/m.mmi", index_type="minimap2")
+    try:
+        with pytest.raises(BackendFailure) as ei:
+            await _resolve_host_filter_indexes(
+                postgres_pool,
+                action_context={"host_filter_enabled": True, "host_reference_idx": reference_idx},
+            )
+        assert ei.value.kind == FailureKind.BAD_INPUT
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_run_workflow_fails_ticket_on_host_filter_resolution_error(
+    postgres_pool, reference_add_action, reference_idx, tmp_path
+):
+    """End-to-end wiring: run_workflow calls _resolve_host_filter_indexes INSIDE
+    its try block, so an enabled host filter pointing at an unknown
+    host_reference_idx FAILs the ticket (SUBMISSION / BAD_INPUT) rather than
+    leaving it stuck in PROCESSING or running any step. Guards against the
+    resolver being unwired or moved outside the try. (The disabled → {} path is
+    exercised by every other run_workflow test, where the flag is absent.)"""
+    action_id, version = reference_add_action
+    fasta = tmp_path / "in.fasta"
+    fasta.write_text(">s\nACGT\n")
+    work_ticket_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, action_context"
+        ") VALUES ($1, $2, 1, 'reference', $3, $4::jsonb) RETURNING work_ticket_idx",
+        action_id,
+        version,
+        reference_idx,
+        json.dumps(
+            {
+                "fasta_path": str(fasta),
+                "host_filter_enabled": True,
+                "host_reference_idx": 999_999_999,
+            }
+        ),
+    )
+    try:
+        backend = FakeBackendClient()  # no step should run; resolution fails first
+        # run_workflow marks the ticket FAILED AND re-raises (same as any
+        # submission-stage failure), so assert both the raise and the row.
+        with pytest.raises(BackendFailure, match="999999999"):
+            await _run(work_ticket_idx, postgres_pool, backend, tmp_path / "ws")
+
+        row = await postgres_pool.fetchrow(
+            "SELECT state, failure_type, failure_stage, failure_step_name, failure_reason"
+            " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+        assert row["state"] == "failed"
+        # failure_type is the retry classification — BAD_INPUT is permanent.
+        assert row["failure_type"] == "permanent"
+        assert row["failure_stage"] == "submission"
+        assert row["failure_step_name"] is None
+        assert "999999999" in row["failure_reason"]
+        # Resolution failed before the step loop — no step was dispatched.
+        assert backend.calls == []
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
+        )
+
+
+# =============================================================================
 # Decoupled SLURM-path dispatch (submit → poll → result)
 # =============================================================================
 #
