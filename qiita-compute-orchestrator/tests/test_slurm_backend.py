@@ -67,6 +67,7 @@ def _make_backend(
     co_to_cp_token: str = "",
     cp_url: str = "",
     path_scratch: str = "",
+    path_derived: str = "",
 ) -> SlurmBackend:
     client = SlurmrestdClient(
         base_url="http://slurm-test:6820",
@@ -87,6 +88,7 @@ def _make_backend(
         co_to_cp_token=co_to_cp_token,
         cp_url=cp_url,
         path_scratch=path_scratch,
+        path_derived=path_derived,
     )
 
 
@@ -410,20 +412,21 @@ async def test_run_step_omits_token_env_when_backend_has_no_tokens(jwt_path, bas
     assert "CO_TO_CP_TOKEN" not in env
     assert "QIITA_ALLOW_TOKEN_ENV" not in env
     assert "QIITA_CP_URL" not in env
-    # Likewise PATH_SCRATCH — only propagated when wired (below).
+    # Likewise PATH_SCRATCH / PATH_DERIVED — only propagated when wired (below).
     assert "PATH_SCRATCH" not in env
+    assert "PATH_DERIVED" not in env
 
 
 @pytest.mark.asyncio
 async def test_run_step_propagates_path_scratch_into_job_env(jwt_path, baseline, tmp_path):
     """The compute-node native-step launcher calls `get_settings()`, whose
     `path_scratch` falls back to a `$TMPDIR/qiita` DEFAULT when `PATH_SCRATCH` is
-    absent. Native jobs that derive a persistent path from it — notably
-    `build_rype_index`, which writes the `.ryxdi` to
-    `{PATH_SCRATCH}/references/{idx}/rype/index.ryxdi` — would otherwise land
-    their output in node-local /tmp, invisible to the CP. So the backend must
-    propagate the resolved value into the SLURM job env (the same way it
-    propagates QIITA_CP_URL — /etc/qiita is not visible from nodes)."""
+    absent. PATH_SCRATCH is the per-ticket workspace base (persistent index
+    artifacts now derive from PATH_DERIVED — see the path_derived test below); a
+    job resolving the scratch base would otherwise land on node-local /tmp,
+    invisible to the CP. So the backend must propagate the resolved value into
+    the SLURM job env (the same way it propagates QIITA_CP_URL — /etc/qiita is
+    not visible from nodes)."""
     captured: dict[str, dict] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -454,6 +457,47 @@ async def test_run_step_propagates_path_scratch_into_job_env(jwt_path, baseline,
     )
     env = dict(item.split("=", 1) for item in captured["payload"]["job"]["environment"])
     assert env["PATH_SCRATCH"] == "/scratch/persistent/qiita"
+
+
+@pytest.mark.asyncio
+async def test_run_step_propagates_path_derived_into_job_env(jwt_path, baseline, tmp_path):
+    """Native index builders derive a persistent path from PATH_DERIVED —
+    `build_rype_index` / `build_minimap2_index` write
+    `{PATH_DERIVED}/references/{idx}/{rype,minimap2}/...`. Like PATH_SCRATCH,
+    /etc/qiita is invisible from compute nodes, so the backend must propagate
+    the resolved PATH_DERIVED into the SLURM job env or the launcher's
+    get_settings() falls back to the $TMPDIR/qiita/derived DEFAULT and the
+    index lands in node-local /tmp, invisible to the CP."""
+    captured: dict[str, dict] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/job/submit"):
+            captured["payload"] = json.loads(request.content.decode())
+            return httpx.Response(200, json={"job_id": 1})
+        return httpx.Response(
+            200,
+            json={"jobs": [{"job_id": 1, "job_state": ["COMPLETED"], "exit_code": {}}]},
+        )
+
+    backend = _make_backend(
+        httpx.MockTransport(handler),
+        jwt_path,
+        path_derived="/scratch/persistent",
+    )
+    _write_completed_output(tmp_path)
+
+    await _run_step_via_trio(
+        backend,
+        "fastq",
+        {},
+        tmp_path,
+        scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+        work_ticket_idx=99,
+        module=FASTQ_TO_PARQUET_MODULE,
+        baseline_resources=baseline,
+    )
+    env = dict(item.split("=", 1) for item in captured["payload"]["job"]["environment"])
+    assert env["PATH_DERIVED"] == "/scratch/persistent"
 
 
 @pytest.mark.asyncio

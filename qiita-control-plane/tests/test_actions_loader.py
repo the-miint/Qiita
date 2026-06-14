@@ -214,17 +214,22 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
     assert set(host.context_schema["required"]) == {"fasta_upload_idx", "taxonomy_upload_idx"}
 
     step_names = [s.name for s in host.steps]
-    # Shares the reference-add prefix, then adds the host-indexing tail.
+    # Shares the reference-add prefix, then adds the host-indexing tail: two
+    # index builders (rype + minimap2) and a register-index per build.
     assert step_names == [
         "hash_sequences",
         "mint-features",
         "write-membership",
         "load",
         "build_rype_index",
+        "build_minimap2_index",
         "register-files",
         "register-index",
+        "register-index",
     ]
-    # build_rype_index must precede register-files (move-on-register).
+    # build_rype_index must precede register-files (move-on-register); the
+    # minimap2 builder reads the RAW upload fasta, so it has no such ordering dep
+    # — but it's grouped with build_rype_index here, still before register-files.
     assert step_names.index("build_rype_index") < step_names.index("register-files")
 
     build = next(s for s in host.steps if s.name == "build_rype_index")
@@ -235,15 +240,27 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
     assert build.inputs == ["reference_sequence_chunks"]
     assert build.outputs == ["rype_index_path", "rype_index_meta"]
 
+    # The minimap2 builder consumes the resolved upload fasta_path (chunked
+    # upload.parquet → upload mode), NOT the moved staging chunks.
+    mm2 = next(s for s in host.steps if s.name == "build_minimap2_index")
+    assert mm2.module == "qiita_compute_orchestrator.jobs.build_minimap2_index"
+    assert mm2.container is None
+    assert mm2.inputs == ["fasta_path"]
+    assert mm2.outputs == ["minimap2_index_path", "minimap2_index_meta"]
+
     # The load step re-exposes the feature-keyed chunks under its own binding so
     # build_rype_index can consume them; reference-add declares only staging_dir.
     load = next(s for s in host.steps if s.name == "load")
     assert "reference_sequence_chunks" in load.outputs
 
-    # register-index consumes the build step's meta JSON (native-step outputs
-    # are path strings, so the params ride a file).
-    register_index = next(s for s in host.steps if s.name == "register-index")
-    assert register_index.inputs == ["rype_index_meta"]
+    # Two register-index steps, each consuming its own builder's meta JSON
+    # (native-step outputs are path strings, so the params ride a file). The
+    # runner reads entry.inputs[0], so the order pins which meta each registers.
+    register_index_steps = [s for s in host.steps if s.name == "register-index"]
+    assert [s.inputs for s in register_index_steps] == [
+        ["rype_index_meta"],
+        ["minimap2_index_meta"],
+    ]
 
     # Pin the CLI's hardcoded action_id/version against the YAML — `qiita
     # reference load --host` submits these literals; an id/version drift would
@@ -376,14 +393,24 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
         "write-membership",
         "load",
         "build_rype_index",
+        "build_minimap2_index",
         "register-files",
+        "register-index",
         "register-index",
     ]
 
     stage = next(s for s in local_host.steps if s.name == "stage_local_fasta")
     assert stage.module == "qiita_compute_orchestrator.jobs.stage_local_fasta"
     assert stage.inputs == ["fasta_manifest_path"]
-    assert stage.outputs == ["fasta_path"]
+    # Emits the combined chunked parquet AND the minimap2-tagged subset manifest.
+    assert stage.outputs == ["fasta_path", "minimap2_fasta_manifest"]
+
+    # The local minimap2 builder consumes the tagged-subset manifest (raw FASTA
+    # → local mode), distinct from the upload path's fasta_path.
+    mm2 = next(s for s in local_host.steps if s.name == "build_minimap2_index")
+    assert mm2.module == "qiita_compute_orchestrator.jobs.build_minimap2_index"
+    assert mm2.inputs == ["minimap2_fasta_manifest"]
+    assert mm2.outputs == ["minimap2_index_path", "minimap2_index_meta"]
 
     # Taxonomy required (the rype mapping authority), same as host-reference-add.
     assert set(local_host.context_schema["required"]) == {
@@ -407,6 +434,54 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
 
     assert _LOCAL_HOST_REFERENCE_ADD_ACTION_ID == local_host.action_id == "local-host-reference-add"
     assert _REFERENCE_ADD_ACTION_VERSION == local_host.version == "1.0.0"
+
+
+def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():
+    """Both fastq-to-parquet versions load and coexist: 1.0.0 (fastq only) and
+    1.1.0 (fastq + an OPTIONAL host_filter step). 1.1.0 gates host filtering on
+    `host_filter_enabled`/`host_reference_idx` in the context_schema and binds
+    the host indexes via host_filter's optional_inputs, so the step is a
+    pass-through when those aren't resolved."""
+    from pathlib import Path
+
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    actions = load_actions(repo_root / "workflows")
+    by_key = {(a.action_id, a.version): a for a in actions}
+
+    # Both versions present (coexistence — the submit route picks the version).
+    assert ("fastq-to-parquet", "1.0.0") in by_key
+    assert ("fastq-to-parquet", "1.1.0") in by_key
+
+    v10 = by_key[("fastq-to-parquet", "1.0.0")]
+    assert [s.name for s in v10.steps] == ["fastq"]
+
+    v11 = by_key[("fastq-to-parquet", "1.1.0")]
+    assert v11.target_kind == ScopeTargetKind.PREP_SAMPLE
+    assert v11.target_processing_kinds == ["sequenced"]
+    assert [s.name for s in v11.steps] == ["fastq", "host_filter"]
+
+    fastq = next(s for s in v11.steps if s.name == "fastq")
+    assert fastq.module == "qiita_compute_orchestrator.jobs.fastq_to_parquet"
+    assert fastq.outputs == ["reads"]
+
+    host_filter = next(s for s in v11.steps if s.name == "host_filter")
+    assert host_filter.module == "qiita_compute_orchestrator.jobs.host_filter"
+    assert host_filter.inputs == ["reads"]
+    # The host indexes are OPTIONAL — bound only when host filtering is enabled,
+    # so the step degrades to a pass-through copy when they're absent.
+    assert host_filter.optional_inputs == ["host_rype_path", "host_minimap2_path"]
+    assert host_filter.outputs == ["filtered_reads"]
+
+    # Gate keys live in the context_schema; host_reference_idx is a plain idx
+    # (NOT a `*_upload_idx`), so the runner's upload-handle walker ignores it.
+    props = v11.context_schema["properties"]
+    assert props["host_filter_enabled"]["type"] == "boolean"
+    assert props["host_reference_idx"]["type"] == "integer"
+    assert "fastq_path" in v11.context_schema["required"]
 
 
 def test_load_actions_loads_on_disk_bcl_convert_yaml():

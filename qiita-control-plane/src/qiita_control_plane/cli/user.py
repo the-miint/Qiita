@@ -685,7 +685,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Mark the reference as a host (is_host=true) and run host-reference-add,"
-            " which builds the rype negative-filter index. Requires --taxonomy."
+            " which builds the rype + minimap2 host-filter indexes. Requires --taxonomy."
         ),
     )
     # FASTA source: --fasta (remote DoPut upload) XOR --fasta-manifest (--local

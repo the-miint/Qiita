@@ -131,7 +131,9 @@ async def test_three_files_combined_into_one_parquet(tmp_path):
 
     outputs = await _run(manifest, tmp_path / "ws")
 
-    assert set(outputs) == {"fasta_path"}
+    # minimap2_fasta_manifest is always emitted (empty when nothing is tagged);
+    # local-reference-add simply doesn't declare/consume it.
+    assert set(outputs) == {"fasta_path", "minimap2_fasta_manifest"}
     assert outputs["fasta_path"].exists()
     assert outputs["fasta_path"].suffix == ".parquet"
 
@@ -234,6 +236,94 @@ async def test_empty_file_skipped(tmp_path):
 
     rows = _read_combined(outputs["fasta_path"])
     assert {rid for rid, _idx, _data in rows} == {"g1", "g2"}
+
+
+# --------------------------------------------------------------------------
+# minimap2 tag column → minimap2_fasta_manifest subset
+# --------------------------------------------------------------------------
+
+
+def _read_minimap2_manifest(path: Path) -> list[str]:
+    return [line for line in path.read_text().splitlines() if line]
+
+
+async def test_read_manifest_returns_all_and_minimap2_subset(tmp_path):
+    """`_read_manifest` returns (all_paths, minimap2_subset): every real path,
+    and the subset carrying a trailing TAB `minimap2` flag."""
+    from qiita_compute_orchestrator.jobs.stage_local_fasta import _read_manifest
+
+    fa1 = _write_fasta(tmp_path / "a.fa", [("g1", "ACGT")])
+    fa2 = _write_fasta(tmp_path / "b.fa", [("g2", "TTTT")])
+    fa3 = _write_fasta(tmp_path / "c.fa", [("g3", "GGGG")])
+    manifest = _write_manifest(
+        tmp_path / "m.txt", [str(fa1), f"{fa2}\tminimap2", f"{fa3}\tminimap2"]
+    )
+
+    all_paths, minimap2_paths = _read_manifest(manifest)
+    assert all_paths == [fa1, fa2, fa3]
+    assert minimap2_paths == [fa2, fa3]
+
+
+async def test_minimap2_fasta_manifest_emitted_with_tagged_subset(tmp_path):
+    """`execute` emits a `minimap2_fasta_manifest` listing exactly the tagged
+    files (absolute, one per line); the combined `fasta.parquet` still carries
+    every record from every file."""
+    fa1 = _write_fasta(tmp_path / "a.fa", [("g1", "ACGT")])
+    fa2 = _write_fasta(tmp_path / "b.fa", [("g2", "TTTT")])
+    fa3 = _write_fasta(tmp_path / "c.fa", [("g3", "GGGG")])
+    manifest = _write_manifest(
+        tmp_path / "m.txt", [str(fa1), f"{fa2}\tminimap2", f"{fa3}\tminimap2"]
+    )
+
+    outputs = await _run(manifest, tmp_path / "ws")
+
+    assert set(outputs) == {"fasta_path", "minimap2_fasta_manifest"}
+    # Combined parquet covers ALL files.
+    rows = _read_combined(outputs["fasta_path"])
+    assert {rid for rid, _idx, _data in rows} == {"g1", "g2", "g3"}
+    # minimap2 subset is exactly the tagged files.
+    assert _read_minimap2_manifest(outputs["minimap2_fasta_manifest"]) == [str(fa2), str(fa3)]
+
+
+async def test_minimap2_fasta_manifest_empty_when_none_tagged(tmp_path):
+    """No `minimap2` tag (the local-reference-add shape) → an emitted but empty
+    minimap2 manifest; the combined parquet is unaffected."""
+    fa1 = _write_fasta(tmp_path / "a.fa", [("g1", "ACGT")])
+    fa2 = _write_fasta(tmp_path / "b.fa", [("g2", "TTTT")])
+    manifest = _write_manifest(tmp_path / "m.txt", [str(fa1), str(fa2)])
+
+    outputs = await _run(manifest, tmp_path / "ws")
+
+    assert outputs["minimap2_fasta_manifest"].exists()
+    assert _read_minimap2_manifest(outputs["minimap2_fasta_manifest"]) == []
+    rows = _read_combined(outputs["fasta_path"])
+    assert {rid for rid, _idx, _data in rows} == {"g1", "g2"}
+
+
+async def test_tag_does_not_collide_with_comment(tmp_path):
+    """A `#`-commented line is skipped even if it carries a TAB tag; a real
+    tagged line is still picked up. No collision between `#` and the tag."""
+    fa1 = _write_fasta(tmp_path / "a.fa", [("g1", "ACGT")])
+    fa2 = _write_fasta(tmp_path / "b.fa", [("g2", "TTTT")])
+    manifest = _write_manifest(
+        tmp_path / "m.txt",
+        [f"# {fa1}\tminimap2", f"{fa2}\tminimap2"],  # first line is a comment
+    )
+
+    outputs = await _run(manifest, tmp_path / "ws")
+
+    rows = _read_combined(outputs["fasta_path"])
+    assert {rid for rid, _idx, _data in rows} == {"g2"}  # fa1 stayed commented out
+    assert _read_minimap2_manifest(outputs["minimap2_fasta_manifest"]) == [str(fa2)]
+
+
+async def test_unknown_tag_raises(tmp_path):
+    """An unrecognized trailing flag is a fail-fast data error, not silently
+    ignored (only `minimap2` is a valid tag)."""
+    fa = _write_fasta(tmp_path / "a.fa", [("g1", "ACGT")])
+    manifest = _write_manifest(tmp_path / "m.txt", [f"{fa}\tbowtie2"])
+    with pytest.raises(ValueError, match="tag"):
+        await _run(manifest, tmp_path / "ws")
 
 
 # --------------------------------------------------------------------------

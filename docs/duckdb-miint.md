@@ -2,7 +2,7 @@
 
 > **Audience:** developers writing or reviewing data-plane / orchestrator / reference-ingestion code that calls miint. Not an end-user reference for the extension itself — upstream owns that.
 > **Upstream:** https://github.com/the-miint/duckdb-miint
-> **Last checked:** 2026-05-20 (against default branch `v1.5-variegata`, latest docs commit `c330b11b` from 2026-05-18)
+> **Last checked:** 2026-06-13 (against default branch `v1.5-variegata`, latest docs commit `2cb50cd3` from 2026-06-13). This refresh focused on the host-filter functions (`save_minimap2_index`, `align_minimap2`, `rype_classify`), each qiita-verified via a real smoke; the default branch is unchanged since the prior check, so the rest of the inventory was not re-diffed.
 > **Refresh trigger:** if today's date is more than 7 days after **Last checked** above, re-verify against upstream `docs/` before relying on any signature here — the project ships frequently and function signatures, parameter names, and embedded-tool versions drift. See [Keeping this doc fresh](#keeping-this-doc-fresh).
 
 `duckdb-miint` is the DuckDB extension that powers all bioinformatics SQL in qiita — the data plane links it in, native orchestrator jobs invoke its functions, and several reference-data ingestion steps are thin wrappers around its table functions. Treat this file as the index: when you need a real signature, click through to the upstream doc rather than trusting paraphrased examples here.
@@ -90,8 +90,8 @@ Signatures are abbreviated — go to the upstream `.md` for full parameter docs.
 - `phylogeny_fasttree(table_name, [options])`
 
 **Alignment / mapping (table-valued):**
-- `align_minimap2(query_table, [subject_table=NULL], [index_path=NULL], [options])`
-- `save_minimap2_index(subject_table, output_path, [options])`
+- `align_minimap2(query_table, [subject_table=NULL], [index_path=NULL], [options])` — SAM-like rows `(read_id, flags, reference, position, …)`; any row = a hit (a non-matching read emits none). **qiita-verified 2026-06-13** (host_filter smoke): `read_id` is returned in the input type (BIGINT in → BIGINT out); named opts include `preset` (e.g. `'sr'`). Consumed by `host_filter`.
+- `save_minimap2_index(subject_table, output_path, [options])` — writes a minimap2 `.mmi`. **qiita-verified 2026-06-13** (build_minimap2_index smoke): exactly **two positional args** (subject-table NAME, output path) + named opts `eqx`/`w`/`k`/`preset` (`preset := 'sr'`); the subject table needs `(read_id, sequence1)`; returns one row `(success BOOLEAN, index_path VARCHAR, num_subjects INTEGER)` — assert `success`. Consumed by `build_minimap2_index`.
 - `align_minimap2_sharded(query_table, shard_directory, read_to_shard, [options])`
 - `align_bowtie2(query_table, subject_table, [options])` / `align_bowtie2_sharded(...)`
 - `align_mafft(table_name, [sample_id='col'])`
@@ -109,7 +109,7 @@ Signatures are abbreviated — go to the upstream `.md` for full parameter docs.
 **Diagnostics:** `miint_warnings()`.
 
 ### RYpe classification — `docs/rype.md`
-- `rype_classify(index_path, sequence_table, [id_column='read_id'], [threshold=0.1], [negative_index=path])`
+- `rype_classify(index_path, sequence_table, [id_column='read_id'], [threshold=0.1], [negative_index=path])` — one row per matched read `(read_id, bucket_id, bucket_name, score)`. **qiita-verified 2026-06-13** (host_filter smoke): qiita passes the **POSITIVE** host index (host = any emitted row, low explicit `threshold` — NOT `negative_index`/`-N`). `id_column` accepts `{VARCHAR, BIGINT, UUID}`; since **duckdb-miint #126** it mirrors the input type on output, so a BIGINT id round-trips as BIGINT (pre-#126 it always returned VARCHAR — `host_filter` CASTs to BIGINT defensively, correct either way). Consumed by `host_filter`.
 - `rype_log_ratio(numerator_path, denominator_path, sequence_table, [id_column='read_id'], [skip_threshold=0.5])`
 - `rype_extract_minimizer_set(sequence_table, k, w, [salt=6148914691236517205], [id_column='read_id'])`
 - `rype_extract_strand_minimizers(sequence_table, k, w, [salt=…], [id_column='read_id'])`

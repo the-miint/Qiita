@@ -5,13 +5,15 @@ target_kind: reference
 description: >
   Local-ingest variant of host-reference-add. Stages MANY host-resident FASTA
   files (a manifest of absolute paths) into one chunked Parquet, then runs the
-  host pipeline unchanged: hash + mint + load (taxonomy required), build a rype
-  `.ryxdi` minimizer index over every feature, and record it in
-  qiita.reference_index. The index is consumed at host-read-filtering time as
-  rype's negative_index. Differs from local-reference-add only by requiring
-  taxonomy and by the build-rype-index → register-index tail; the lifecycle
-  gains `loading → indexing → active`. Companions are raw absolute paths on the
-  compute host, not DoPut uploads.
+  host pipeline unchanged: hash + mint + load (taxonomy required), build the two
+  host-filter indexes (a rype `.ryxdi` over every feature + a minimap2 `.mmi`
+  over the trailing-TAB `minimap2`-tagged FASTA subset), and record both in
+  qiita.reference_index. They are consumed at host-read-filtering time by the
+  host_filter step: rype classify (host = any match), then minimap2 on the
+  survivors; reads matching either are removed. Differs from local-reference-add
+  only by requiring taxonomy and by the build-index → register-index tail; the
+  lifecycle gains `loading → indexing → active`. Companions are raw absolute
+  paths on the compute host, not DoPut uploads.
 
 scopes:
   - reference:write
@@ -47,7 +49,10 @@ steps:
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.stage_local_fasta
     inputs: [fasta_manifest_path]
-    outputs: [fasta_path]
+    # fasta_path = combined chunked parquet (all files) for hash_sequences;
+    # minimap2_fasta_manifest = the `\tminimap2`-tagged subset for the
+    # build_minimap2_index step below (raw FASTA, local mode).
+    outputs: [fasta_path, minimap2_fasta_manifest]
     baseline_resources:
       cpu: 4
       mem_gb: 8
@@ -91,8 +96,8 @@ steps:
   # MUST precede register-files: register-files MOVES the feature-keyed
   # reference_sequence_chunks part files into permanent DuckLake storage
   # (data-plane move_file), so the index build has to read them from staging
-  # first. The persistent .ryxdi is written under the shared scratch base
-  # ({PATH_SCRATCH}/references/{reference_idx}/rype/index.ryxdi), not the
+  # first. The persistent .ryxdi is written under the derived-artifact base
+  # ({PATH_DERIVED}/references/{reference_idx}/rype/index.ryxdi), not the
   # ephemeral workspace; build_rype_index returns its path (rype_index_path)
   # and a small meta JSON (rype_index_meta) carrying index_type / fs_path /
   # params that register-index consumes.
@@ -107,16 +112,36 @@ steps:
       mem_gb: 32
       walltime: PT2H
 
+  # Sidecar minimap2 `.mmi` for the second-pass host filter, written to
+  # {PATH_DERIVED}/references/{reference_idx}/minimap2/index.mmi. Reads the
+  # `\tminimap2`-tagged RAW FASTA subset stage_local_fasta emitted as
+  # minimap2_fasta_manifest (local mode) — NOT the moved staging chunks — so it
+  # has no register-files ordering dependency. No target_status: the reference
+  # is already `indexing` from build_rype_index above.
+  - step: build_minimap2_index
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.build_minimap2_index
+    inputs: [minimap2_fasta_manifest]
+    outputs: [minimap2_index_path, minimap2_index_meta]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 32
+      walltime: PT2H
+
   - action: register-files
     inputs: [staging_dir]
     outputs: []
 
-  # Records the built index in qiita.reference_index. The runner's
-  # register-index arm reads bound["rype_index_meta"] (native-step outputs are
-  # path strings, so the build params ride a file) — `inputs` here documents
-  # that data flow.
+  # One register-index per builder. The runner's register-index arm reads
+  # bound[entry.inputs[0]] (native-step outputs are path strings, so the build
+  # params ride a meta JSON file), so each step's `inputs` selects which index
+  # it records in qiita.reference_index.
   - action: register-index
     inputs: [rype_index_meta]
+    outputs: []
+
+  - action: register-index
+    inputs: [minimap2_index_meta]
     outputs: []
 
 action_ceiling:

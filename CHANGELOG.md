@@ -15,12 +15,37 @@ the `no-changelog` label).
 
 ### Added
 
+- Short-read host filtering. A new `host_filter` native job depletes host reads
+  from `reads.parquet` in two stages — rype `rype_classify` against a host's
+  POSITIVE `.ryxdi` (host = any match, not rype's `negative_index`), then
+  minimap2 `align_minimap2` (`preset 'sr'`) on the survivors — dropping any read
+  (or paired-end pair, if either mate hits) flagged by either tool. It's a
+  gated, optional step in a new `fastq-to-parquet/1.1.0` workflow
+  (`host_filter_enabled` + `host_reference_idx` context; pass-through when
+  disabled; `1.0.0` is kept and the submit route picks the version) (#89)
+- `build_minimap2_index` native job + a `minimap2` value for
+  `reference_index.index_type` (migration
+  `20260612000000_reference_index_minimap2_type`), so a host reference now
+  carries BOTH a rype `.ryxdi` and a minimap2 `.mmi`. The `host-reference-add` /
+  `local-host-reference-add` workflows gain the minimap2 build + a second
+  `register-index`; on the local path a trailing-TAB `minimap2` flag in the
+  FASTA manifest selects the subset to index (`stage_local_fasta` emits a
+  `minimap2_fasta_manifest`) (#89)
 - New nullable `bioproject_accession` column on the study table (unique
   when present), reserved for future NCBI/ENA BioProject tracking. Schema
   only — not yet exposed through the API, repository, or CLI (#87)
 
 ### Changed
 
+- Reference index artifacts now live under a new orchestrator `PATH_DERIVED`
+  root (`{PATH_DERIVED}/references/{idx}/{rype,minimap2}/…`), relocated from
+  `PATH_SCRATCH`. `build_rype_index` / `build_minimap2_index` read
+  `Settings.path_derived` and the SLURM backend propagates `PATH_DERIVED` into
+  the job env (no host references exist in prod, so no migration of existing
+  artifacts) (#89)
+- The runner's `register-index` action reads its YAML-declared input
+  (`entry.inputs[0]`) instead of a hardcoded `rype_index_meta`, so one workflow
+  can register multiple index types (rype + minimap2) from their own metas (#89)
 - The bcl-convert flow now derives the instrument run ID and model from the
   run folder's top-level `RunInfo.xml` (`Run@Id` plus the `Instrument` serial number
   resolved against the vendored prefix table) instead of parsing the folder
@@ -129,7 +154,7 @@ the `no-changelog` label).
 - Host references for host-read filtering: `is_host` column on `qiita.reference`,
   the `reference_index` table tracking built indexes, an `indexing` reference
   status (`loading → indexing → active`), and the `host-reference-add` workflow
-  that builds a rype `.ryxdi` negative-filter index (`build_rype_index` native
+  that builds a rype `.ryxdi` host-filter index (`build_rype_index` native
   job + `register-index` library action) (#70)
 - `GET /reference` (list; filter by `kind` / `is_host` / `status`) and
   `GET /reference/{reference_idx}/index` (list a reference's built indexes) (#70)
@@ -197,9 +222,10 @@ the `no-changelog` label).
   No sequence bytes pass through Python and memory stays bounded for
   genome-scale records (#78)
 - The SLURM backend now propagates `PATH_SCRATCH` into the compute-node job
-  environment, so native steps that derive a persistent path from it (e.g.
-  `build_rype_index` writing the rype `.ryxdi`) resolve the real scratch root
-  instead of the `$TMPDIR/qiita` default (#70)
+  environment, so native steps that derive a path from the shared scratch base
+  (the per-ticket workspace root) resolve the real value instead of the
+  `$TMPDIR/qiita` default (#70). (Persistent index artifacts later moved off
+  `PATH_SCRATCH` to `PATH_DERIVED` — see the #89 Changed entry above.)
 - Centralized all REST path string literals into `qiita-common`'s
   `api_paths.py` (closes #12) (#60)
 - Bumped the study / prep_sample identity sequence start to 25000 (#61)

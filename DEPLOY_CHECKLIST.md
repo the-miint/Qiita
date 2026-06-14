@@ -29,6 +29,26 @@ _None yet._
   v1.5.3 build lacks `sequence_split` at deploy time, `stage_local_fasta` and the
   CLI `reference load` FASTA path fail with "Scalar Function with name
   sequence_split does not exist" — the bucket-5 probe catches this first.
+- (#89) [operator] Two prerequisites for the host-filter / minimap2-index work,
+  both BEFORE the bucket-4 deploy:
+  1. The **v1.5.3** miint mirror build must also carry the host-filter functions
+     — `save_minimap2_index` (used by the new `build_minimap2_index` step) and
+     `align_minimap2` (used by `host_filter`). `rype_classify` is already
+     present; the duckdb-miint #126 BIGINT-`id_column` change is nice-to-have,
+     NOT required (`host_filter` CASTs the rype id, so a pre-#126
+     VARCHAR-returning build also works). Components `FORCE INSTALL miint` for
+     v1.5.3, so they pull this build; a missing `save_minimap2_index` fails
+     `build_minimap2_index` at the first host-reference build. Unlike
+     `sequence_split` there is **no** compute-readiness probe for these yet (a
+     follow-up could add one) — the first `host-reference-add` run is the
+     functional gate.
+  2. The index builders now write under **`PATH_DERIVED`**
+     (`{PATH_DERIVED}/references/{idx}/{rype,minimap2}/…`), relocated from
+     `PATH_SCRATCH`. `PATH_DERIVED` is already mandatory on the SLURM deploy (it
+     also roots the SIF images dir), so this adds no new env var — just ensure
+     the orchestrator service account can create/write
+     `{PATH_DERIVED}/references/` (the jobs `mkdir` it at runtime). No prod host
+     references exist yet, so nothing to migrate.
 
 ### 3. Migrations
 
@@ -38,7 +58,7 @@ _None yet._
 # time and ABORTS before any restart if one is unapplied.
 make -C ~/qiita-miint migrate
 ```
-`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#87) adds `20260611000000_study_ena_accession_and_bioproject` (renames the study `ebi_study_accession` column + its UNIQUE constraint to `ena_study_accession`, and adds a nullable, unique-when-present `bioproject_accession` column; no extension, backfill, or pre-check).
+`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#87) adds `20260611000000_study_ena_accession_and_bioproject` (renames the study `ebi_study_accession` column + its UNIQUE constraint to `ena_study_accession`, and adds a nullable, unique-when-present `bioproject_accession` column; no extension, backfill, or pre-check). (#89) adds `20260612000000_reference_index_minimap2_type` (drops + re-adds the `reference_index.index_type` CHECK to allow `'minimap2'` alongside `'rype'`; no extension, backfill, or pre-check).
 
 ### 4. Deploy
 
@@ -56,6 +76,16 @@ sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; 
     qiita-admin compute-readiness' | grep -E 'probe/(miint-read-fastx|miint-sequence-split)'   # both =ok (#86)
 ```
 
+```bash
+# (#89) [admin] spot-check that the brand-new fastq-to-parquet/1.1.0 row reached
+# qiita.action. activate.sh runs `qiita-admin actions sync` and ABORTS on
+# failure, so the in-place upserts of the *changed* host-reference-add /
+# local-host-reference-add rows are gated there — this query just confirms the
+# one new row landed.
+psql "$DATABASE_URL" -tAc \
+  "SELECT count(*) FROM qiita.action WHERE action_id='fastq-to-parquet' AND version='1.1.0'"   # 1 (#89)
+```
+
 ### Notes (no host action)
 
 - (#87) The study REST field and `qiita study create`/`patch` CLI flag
@@ -64,6 +94,7 @@ sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; 
   field name (or scripts using the old flag) must update; the column rename
   itself is handled by the bucket-3 migration.
 - (#86) Sequence chunking switched from the pure-SQL `list_transform`/`substring` macro to miint's native `sequence_split` (duckdb-miint #121), fixing an O(L²) blow-up on large single FASTA records (DuckDB #23229). No client/API change — same chunked-Parquet shape `(read_id, chunk_index, chunk_data)`. The only operator action is the bucket-2 mirror check (the deployed code needs a v1.5.3 miint build that has `sequence_split`); no env var, host dir, or migration.
+- (#89) Short-read host filtering is **opt-in** and changes no existing behavior: `fastq-to-parquet/1.0.0` is unchanged, and `1.1.0` only runs the host filter when a ticket sets `host_filter_enabled: true` + a `host_reference_idx` (a built host reference). Clients submitting `1.0.0` (or `1.1.0` without the flag) are unaffected. The host-reference-add workflows now build a minimap2 `.mmi` in addition to the rype `.ryxdi` (bucket-2 mirror prerequisite); no API/client change.
 
 ---
 
