@@ -15,7 +15,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
-- (#89) [operator] Point the orchestrator at the shared dir the deploy stages
+- (#90) [operator] Point the orchestrator at the shared dir the deploy stages
   miint into (`<derived>` = the `PATH_DERIVED` root). Cluster jobs and the
   compute-readiness probe LOAD from here, and the orchestrator propagates it into
   every job's environment, so it must precede the bucket-4 restart. (Not a hard
@@ -27,10 +27,10 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 2. One-time host setup
 
-- (#86, #89) [operator] Ensure the **v1.5.3** miint build on the mirror
+- (#86, #90) [operator] Ensure the **v1.5.3** miint build on the mirror
   (`https://ftp.microbio.me/pub/miint/v1.5.3/`) includes the `sequence_split`
   scalar (duckdb-miint #121) BEFORE the bucket-4 stage step. Components run DuckDB
-  1.5.3 (#85); the bucket-4 stage step (#89) pulls the `v1.5.3` build from the
+  1.5.3 (#85); the bucket-4 stage step (#90) pulls the `v1.5.3` build from the
   mirror into the shared extension dir and the cluster LOADs it, so the chunking
   SQL (`UNNEST(sequence_split(...))`) only resolves if that build has the
   function. Adding it is backward-compatible (it only adds a scalar), so
@@ -38,7 +38,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   lacks `sequence_split` when staged, `stage_local_fasta` and the CLI
   `reference load` FASTA path fail with "Scalar Function with name
   sequence_split does not exist" — the bucket-5 probe catches this first.
-- (#89) [operator] Create the shared dir the orchestrator's
+- (#90) [operator] Create the shared dir the orchestrator's
   `MIINT_EXTENSION_DIRECTORY` points at — `qiita-orch` owns it and writes the
   staged extension; every compute node reads it. The stage step itself runs in
   bucket 4 (it needs the newly-deployed code).
@@ -68,13 +68,13 @@ miint or DuckDB version bump.
 derived=$(sudo grep '^PATH_DERIVED=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)
 py=$(sudo grep '^SLURM_NATIVE_PYTHON=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)
 sudo -u qiita-orch env PATH_DERIVED="$derived" SLURM_NATIVE_PYTHON="$py" \
-    bash /home/qiita/qiita-miint/scripts/stage-miint-extension.sh   # (#89)
+    bash /home/qiita/qiita-miint/scripts/stage-miint-extension.sh   # (#90)
 ```
 
 ### 5. Verify
 
 ```bash
-# (#86, #89) [admin] the deployed compute node LOADs the staged v1.5.3 miint
+# (#86, #90) [admin] the deployed compute node LOADs the staged v1.5.3 miint
 # build, which must expose sequence_split (the native chunker stage_local_fasta
 # / reference_load depend on). It is newer than read_fastx, so a staged build
 # missing it passes the read_fastx probe but FAILS here — confirming the

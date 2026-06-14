@@ -45,15 +45,15 @@ the `no-changelog` label).
   install but plain + cached (was `FORCE INSTALL`, which re-downloaded every
   invocation). `miint_install_sql()` is now plain `INSTALL` with opt-in
   `force=` for deploy staging; new `miint_load_sql()` / `miint_job_env()`
-  single-source the load + remote-job-env contract (#89)
+  single-source the load + remote-job-env contract (#90)
 - The compute-readiness probe now reports *why* a miint check failed (the
   captured DuckDB/Python error) instead of a swallowed bare `=fail`, and LOADs
   the staged build exactly like the native jobs — a broken miint deploy is now
-  diagnosable from the probe output alone (#89)
+  diagnosable from the probe output alone (#90)
 - The data-plane `miint_extension_smoke` test installs from the team mirror
   (honoring `MIINT_EXTENSION_REPO` / `MIINT_EXTENSION_DIRECTORY`) instead of the
   hardcoded `community` channel, so it verifies the same build the rest of the
-  system runs (#89)
+  system runs (#90)
 - The bcl-convert flow now derives the instrument run ID and model from the
   run folder's top-level `RunInfo.xml` (`Run@Id` plus the `Instrument` serial number
   resolved against the vendored prefix table) instead of parsing the folder
