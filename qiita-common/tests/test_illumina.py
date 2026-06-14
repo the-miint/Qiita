@@ -10,10 +10,41 @@ from __future__ import annotations
 import pytest
 
 from qiita_common.illumina import (
-    instrument_model_from_run_folder,
-    instrument_run_id_from_run_folder,
+    InstrumentRunInfo,
+    _instrument_model_from_serial,
     load_instrument_prefix_table,
+    read_instrument_run_info,
 )
+
+# A minimal RunInfo.xml shaped like a real Illumina file. ``version_attrs``
+# stands in for the per-version root-tag differences (the Version 5 file
+# carries xsd/xsi namespace attrs the Version 6 file drops) — neither puts
+# Run/Instrument in a default namespace, so both parse identically.
+_RUNINFO_TEMPLATE = (
+    '<?xml version="1.0"?>\n'
+    "<RunInfo{version_attrs}>\n"
+    '  <Run Id="{run_id}" Number="28">\n'
+    "    <Flowcell>BRD91222-2611</Flowcell>\n"
+    "    <Instrument>{serial}</Instrument>\n"
+    "  </Run>\n"
+    "</RunInfo>\n"
+)
+
+
+def _write_runinfo(
+    bcl_input_dir,
+    run_id="220913_FS10001793_28_BRD91222",
+    serial="FS10001773",
+    version_attrs="",
+):
+    """Write a RunInfo.xml into bcl_input_dir and return the directory."""
+    bcl_input_dir.mkdir(parents=True, exist_ok=True)
+    (bcl_input_dir / "RunInfo.xml").write_text(
+        _RUNINFO_TEMPLATE.format(version_attrs=version_attrs, run_id=run_id, serial=serial),
+        encoding="utf-8",
+    )
+    return bcl_input_dir
+
 
 # ---------------------------------------------------------------------------
 # load_instrument_prefix_table
@@ -65,72 +96,139 @@ def test_load_table_excludes_pacbio_revio():
 
 
 # ---------------------------------------------------------------------------
-# instrument_run_id_from_run_folder
-# ---------------------------------------------------------------------------
-
-
-def test_run_id_returns_folder_basename_when_well_formed():
-    folder = "230101_A00123_0001_BHXYZ"
-    assert instrument_run_id_from_run_folder(folder) == folder
-
-
-def test_run_id_rejects_underscore_count_below_three():
-    """Fewer than four segments means the folder does not match the
-    Illumina convention; both helpers reject identically so a partial
-    parse can't slip through one path."""
-    for bad in ("230101", "230101_A00123", "230101_A00123_0001"):
-        with pytest.raises(ValueError, match="Illumina convention"):
-            instrument_run_id_from_run_folder(bad)
-
-
-# ---------------------------------------------------------------------------
-# instrument_model_from_run_folder
+# _instrument_model_from_serial
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "folder, expected",
+    "serial, expected",
     [
-        # Date prefix is irrelevant; only parts[1] is parsed.
-        ("230101_A00123_0001_BHXYZ", "Illumina NovaSeq 6000"),
-        ("260520_LH00345_0002_AXYZ12", "Illumina NovaSeq X"),
-        ("260520_FS10000A_0003_AISEQ1", "Illumina iSeq"),
-        ("260520_M07654_0004_AMISQ1", "Illumina MiSeq"),
-        ("260520_MN00321_0005_AMNSEQ", "Illumina MiniSeq"),
-        ("260520_D00567_0006_AHISQ25", "Illumina HiSeq 2500"),
-        ("260520_K00567_0007_AHISQ40", "Illumina HiSeq 4000"),
-        ("260520_SL00012_0008_AMI100", "Illumina MiSeq i100"),
-        ("260520_SH00012_0009_AMIPLUS", "Illumina MiSeq i100 Plus"),
+        ("A00123", "Illumina NovaSeq 6000"),
+        ("LH00345", "Illumina NovaSeq X"),
+        ("FS10000A", "Illumina iSeq"),
+        ("M07654", "Illumina MiSeq"),
+        ("MN00321", "Illumina MiniSeq"),
+        ("D00567", "Illumina HiSeq 2500"),
+        ("K00567", "Illumina HiSeq 4000"),
+        ("SL00012", "Illumina MiSeq i100"),
+        ("SH00012", "Illumina MiSeq i100 Plus"),
     ],
 )
-def test_model_parametrized_supported_families(folder, expected):
-    assert instrument_model_from_run_folder(folder) == expected
+def test__instrument_model_from_serial_supported_families(serial, expected):
+    assert _instrument_model_from_serial(serial) == expected
 
 
-def test_model_longest_prefix_wins_when_table_has_overlaps():
-    """NovaSeq X (LH) vs HiSeq 4000 (L)... wait, there is no `L` entry,
-    but `M` (MiSeq) vs `MN` (MiniSeq) is the real overlap. A serial of
-    `MN00321` must return MiniSeq, not MiSeq."""
-    assert instrument_model_from_run_folder("260520_MN00321_0005_X") == "Illumina MiniSeq"
+def test__instrument_model_from_serial_longest_prefix_wins():
+    """Tests the case where overlapping prefixes (`MN` MiniSeq vs `M`
+    MiSeq) could both match; the longer prefix must win so `MN00321`
+    resolves to MiniSeq, not MiSeq."""
+    assert _instrument_model_from_serial("MN00321") == "Illumina MiniSeq"
 
 
-def test_model_longest_prefix_lh_over_l():
-    """`LH` vs any 1-char prefix that happens to start with L: ensure the
-    2-char match wins. (There is no plain `L` in the table, but the sort
-    order this depends on is `len desc`; this test pins the policy.)"""
-    assert instrument_model_from_run_folder("260520_LH00345_0002_X") == "Illumina NovaSeq X"
-
-
-def test_model_rejects_unknown_prefix():
-    """A serial that does not start with any known prefix raises with a
-    message that names the offending folder and tells the operator where
-    to add the prefix upstream. Matches the error wording the CLI surfaces."""
+def test__instrument_model_from_serial_rejects_unknown_prefix():
+    """Tests the case where a serial number starts with no known prefix; the
+    error names the offending serial number and points at the upstream table."""
     with pytest.raises(ValueError, match="unknown instrument serial prefix"):
-        instrument_model_from_run_folder("260520_ZZZZZ999_0001_X")
+        _instrument_model_from_serial("ZZZZZ999")
 
 
-def test_model_rejects_malformed_folder_shape():
-    """Fewer than four underscore-separated segments fails before any
-    prefix lookup."""
-    with pytest.raises(ValueError, match="Illumina convention"):
-        instrument_model_from_run_folder("230101_A00123_0001")
+# ---------------------------------------------------------------------------
+# read_instrument_run_info
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "version_attrs",
+    [
+        # Version 6: bare root tag.
+        ' Version="6"',
+        # Version 5: root carries xsd/xsi namespace attrs, which must not
+        # push Run/Instrument into a default namespace.
+        (
+            ' xmlns:xsd="http://www.w3.org/2001/XMLSchema"'
+            ' xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" Version="5"'
+        ),
+    ],
+)
+def test_read_instrument_run_info_parses_both_versions(tmp_path, version_attrs):
+    """Tests the case where a well-formed RunInfo.xml is present: the run ID
+    comes from Run@Id verbatim and the model resolves from the Instrument
+    serial number, across both Illumina RunInfo schema versions."""
+    bcl_input_dir = _write_runinfo(
+        tmp_path / "run",
+        run_id="250606_LH00444_0355_B22VT23LT4",
+        serial="LH00444",
+        version_attrs=version_attrs,
+    )
+    expected = InstrumentRunInfo(
+        instrument_run_id="250606_LH00444_0355_B22VT23LT4",
+        instrument_model="Illumina NovaSeq X",
+    )
+    assert read_instrument_run_info(bcl_input_dir) == expected
+
+
+def test_read_instrument_run_info_rejects_missing_file(tmp_path):
+    """Tests the case where the run folder has no top-level RunInfo.xml."""
+    (tmp_path / "run").mkdir()
+    with pytest.raises(ValueError, match="RunInfo.xml not found"):
+        read_instrument_run_info(tmp_path / "run")
+
+
+def test_read_instrument_run_info_rejects_nested_only_runinfo(tmp_path):
+    """Tests the case where a RunInfo.xml exists only in a subdirectory;
+    only a top-level file counts."""
+    bcl_input_dir = tmp_path / "run"
+    _write_runinfo(bcl_input_dir / "nested")
+    with pytest.raises(ValueError, match="RunInfo.xml not found"):
+        read_instrument_run_info(bcl_input_dir)
+
+
+def test_read_instrument_run_info_rejects_malformed_xml(tmp_path):
+    """Tests the case where RunInfo.xml is not well-formed XML."""
+    bcl_input_dir = tmp_path / "run"
+    bcl_input_dir.mkdir()
+    (bcl_input_dir / "RunInfo.xml").write_text("<RunInfo><Run></RunInfo>", encoding="utf-8")
+    with pytest.raises(ValueError, match="not well-formed XML"):
+        read_instrument_run_info(bcl_input_dir)
+
+
+def test_read_instrument_run_info_rejects_missing_run_tag(tmp_path):
+    """Tests the case where the XML has no <Run> tag."""
+    bcl_input_dir = tmp_path / "run"
+    bcl_input_dir.mkdir()
+    (bcl_input_dir / "RunInfo.xml").write_text('<RunInfo Version="6" />', encoding="utf-8")
+    with pytest.raises(ValueError, match="no <Run> tag"):
+        read_instrument_run_info(bcl_input_dir)
+
+
+def test_read_instrument_run_info_rejects_missing_id_attr(tmp_path):
+    """Tests the case where the <Run> tag carries no Id attribute."""
+    bcl_input_dir = tmp_path / "run"
+    bcl_input_dir.mkdir()
+    (bcl_input_dir / "RunInfo.xml").write_text(
+        '<RunInfo Version="6"><Run><Instrument>LH00444</Instrument></Run></RunInfo>',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="no Id attribute"):
+        read_instrument_run_info(bcl_input_dir)
+
+
+def test_read_instrument_run_info_rejects_missing_instrument(tmp_path):
+    """Tests the case where the <Run> tag has no nested <Instrument>
+    serial number."""
+    bcl_input_dir = tmp_path / "run"
+    bcl_input_dir.mkdir()
+    (bcl_input_dir / "RunInfo.xml").write_text(
+        '<RunInfo Version="6"><Run Id="250606_LH00444_0355_X" /></RunInfo>',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="no <Instrument> serial number"):
+        read_instrument_run_info(bcl_input_dir)
+
+
+def test_read_instrument_run_info_rejects_unknown_prefix(tmp_path):
+    """Tests the case where the Instrument serial number starts with no known
+    prefix; the serial-resolution error surfaces unchanged."""
+    bcl_input_dir = _write_runinfo(tmp_path / "run", serial="ZZZZZ999")
+    with pytest.raises(ValueError, match="unknown instrument serial prefix"):
+        read_instrument_run_info(bcl_input_dir)

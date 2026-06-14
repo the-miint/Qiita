@@ -1690,7 +1690,7 @@ def test_https_to_non_localhost_allowed(monkeypatch):
 # submit-bcl-convert
 # ---------------------------------------------------------------------------
 # The bundled bcl-convert flow chains three POSTs in one CLI gesture, with
-# folder-name parsing in front of the network calls. Each test stubs httpx
+# RunInfo.xml parsing in front of the network calls. Each test stubs httpx
 # with a multi-response queue so the three legs (sequencing-run,
 # sequenced-pool, work-ticket) can be sequenced independently — _stub_post
 # reuses one body across calls and is not enough here.
@@ -1728,9 +1728,21 @@ def _stub_multi_response(monkeypatch, captured: dict, *, responses):
     monkeypatch.setenv("QIITA_TOKEN", "qk_test")
 
 
-def _seed_bcl_folder(tmp_path: Path, name: str) -> Path:
+def _seed_bcl_folder(tmp_path: Path, name: str, *, with_runinfo: bool = True) -> Path:
+    """Create a BCL run folder. When ``with_runinfo``, also write a top-level
+    RunInfo.xml whose ``Run@Id`` is the folder name and whose ``Instrument``
+    serial number is the name's second underscore segment (the real run-ID
+    convention), so the CLI's RunInfo reader derives the run ID + model."""
     folder = tmp_path / name
     folder.mkdir()
+    if with_runinfo:
+        serial = name.split("_")[1]
+        (folder / "RunInfo.xml").write_text(
+            '<?xml version="1.0"?>\n'
+            f'<RunInfo Version="6"><Run Id="{name}">'
+            f"<Instrument>{serial}</Instrument></Run></RunInfo>\n",
+            encoding="utf-8",
+        )
     return folder
 
 
@@ -2299,12 +2311,12 @@ def test_submit_bcl_convert_rejects_empty_preflight_blob(tmp_path, capsys):
     assert "is empty" in capsys.readouterr().err
 
 
-def test_submit_bcl_convert_rejects_unparseable_folder_name(tmp_path, capsys, preflight_stub):
-    """Fewer than four underscore-separated segments fails before any
-    server round-trip with the parser's exact error message."""
+def test_submit_bcl_convert_rejects_missing_runinfo(tmp_path, capsys, preflight_stub):
+    """Tests the case where the run folder has no top-level RunInfo.xml;
+    the reader fails before any server round-trip."""
     from qiita_control_plane.cli.user import main
 
-    folder = _seed_bcl_folder(tmp_path, "230101_A00123")
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ", with_runinfo=False)
     blob = preflight_stub()
     with pytest.raises(SystemExit) as exc_info:
         main(
@@ -2319,11 +2331,11 @@ def test_submit_bcl_convert_rejects_unparseable_folder_name(tmp_path, capsys, pr
             ]
         )
     assert exc_info.value.code == 2
-    assert "Illumina convention" in capsys.readouterr().err
+    assert "RunInfo.xml not found" in capsys.readouterr().err
 
 
 def test_submit_bcl_convert_rejects_unknown_instrument_prefix(tmp_path, capsys, preflight_stub):
-    """A serial that does not start with any known Illumina prefix
+    """A serial number that does not start with any known Illumina prefix
     surfaces the parser's "unknown instrument serial prefix" error.
     Same path catches PacBio folders, because the parser filters
     PacBio out at table-load time."""
@@ -2350,9 +2362,9 @@ def test_submit_bcl_convert_rejects_unknown_instrument_prefix(tmp_path, capsys, 
 def test_submit_bcl_convert_pacbio_folder_rejected_as_unknown_prefix(
     tmp_path, capsys, preflight_stub
 ):
-    """A PacBio Revio serial starts with lowercase r. The parser filters
+    """A PacBio Revio serial number starts with lowercase r. The parser filters
     PacBio out at load time so this surfaces as the same
-    "unknown prefix" error a malformed Illumina serial would — by design,
+    "unknown prefix" error a malformed Illumina serial number would — by design,
     because bcl-convert is Illumina-only."""
     from qiita_control_plane.cli.user import main
 

@@ -46,6 +46,12 @@ the `no-changelog` label).
 - The runner's `register-index` action reads its YAML-declared input
   (`entry.inputs[0]`) instead of a hardcoded `rype_index_meta`, so one workflow
   can register multiple index types (rype + minimap2) from their own metas (#89)
+- The bcl-convert flow now derives the instrument run ID and model from the
+  run folder's top-level `RunInfo.xml` (`Run@Id` plus the `Instrument` serial number
+  resolved against the vendored prefix table) instead of parsing the folder
+  basename, which operators rename. Both the `qiita submit-bcl-convert` CLI
+  and the orchestrator's `bcl_convert_prep` step fail fast on a missing or
+  malformed `RunInfo.xml` (#88)
 - Renamed the study EBI accession to ENA across the stack: the study table
   column and its UNIQUE constraint (`ebi_study_accession` →
   `ena_study_accession`), the REST request/response field of the same name,
