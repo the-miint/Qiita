@@ -58,7 +58,7 @@ sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; 
 
 ### Notes (no host action)
 
-- (#90) `POST /study/lookup-by-accession` now resolves by `bioproject_accession`
+- (#91) `POST /study/lookup-by-accession` now resolves by `bioproject_accession`
   by default (was `ena_study_accession`); a caller omitting the new optional
   `accession_field` body field will match a different column than before. The
   `qiita submit-bcl-convert` preflight relies on this (its project accessions
