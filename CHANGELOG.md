@@ -16,8 +16,7 @@ the `no-changelog` label).
 ### Added
 
 - New nullable `bioproject_accession` column on the study table (unique
-  when present), reserved for future NCBI/ENA BioProject tracking. Schema
-  only — not yet exposed through the API, repository, or CLI (#87)
+  when present), for NCBI/ENA BioProject tracking (#87)
 - Exposed study `bioproject_accession` through create, get, and patch: the
   REST request/response field and the `qiita study create`/`patch`
   `--bioproject-accession` flag (#91)

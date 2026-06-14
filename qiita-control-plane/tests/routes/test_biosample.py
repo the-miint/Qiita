@@ -14,6 +14,7 @@ no-access-row and the below-admin-tier cases.
 import secrets
 from datetime import date
 from decimal import Decimal
+from typing import get_args
 
 import pytest
 import pytest_asyncio
@@ -26,7 +27,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
-from qiita_common.models import FieldDataType
+from qiita_common.models import BiosampleAccessionField, FieldDataType
 
 from qiita_control_plane.testing.db_seeds import (
     fetch_seeded_metagenome_term,
@@ -2332,11 +2333,19 @@ async def test_patch_biosample_unknown_metadata_checklist_name_422(ctx):
 
 
 async def _seed_biosample_with_accession(
-    ctx, *, accession: str, owner_idx: int, field: str = "biosample_accession"
+    ctx,
+    *,
+    accession: str,
+    owner_idx: int,
+    field: BiosampleAccessionField = "biosample_accession",
 ) -> int:
     """Seed a non-retired biosample carrying `accession` in the named
     accession column (default biosample_accession); track for cleanup and
     return its idx."""
+    if field not in get_args(BiosampleAccessionField):
+        raise ValueError(f"invalid biosample accession field: {field!r}")
+    # Column name is interpolated because Postgres can't parameter-bind
+    # identifiers; the guard above pins it to the accession-column set.
     idx = await ctx["pool"].fetchval(
         f"INSERT INTO qiita.biosample (owner_idx, created_by_idx, {field})"
         " VALUES ($1, $1, $2) RETURNING idx",
