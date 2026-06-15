@@ -50,7 +50,7 @@ from pathlib import Path
 import duckdb
 from pydantic import BaseModel
 
-from ..miint import PARQUET_OPTS, apply_duckdb_settings, ensure_miint_installed, open_conn
+from ..miint import PARQUET_OPTS, apply_duckdb_settings, open_miint_conn
 
 YAML_STEP_NAME = "host_filter"
 
@@ -179,14 +179,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     reads_sql = str(inputs.reads).replace("'", "''")
     out_sql = str(filtered).replace("'", "''")
 
-    await ensure_miint_installed()
     success = False
     try:
-        with open_conn() as conn:
+        with open_miint_conn() as conn:
             apply_duckdb_settings(
                 conn, duckdb_tmp, memory_gb=_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS
             )
-            conn.execute("LOAD miint;")
 
             # One row per mate, keyed by the shared sequence_idx (passed AS the
             # tools' read_id). R2 only when present (unpaired → sequence2 NULL).
