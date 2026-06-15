@@ -15,37 +15,10 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
-- (#90) [operator] Point the orchestrator at the shared dir the deploy stages
-  miint into (`<derived>` = the `PATH_DERIVED` root). Cluster jobs and the
-  compute-readiness probe LOAD from here, and the orchestrator propagates it into
-  every job's environment, so it must precede the bucket-4 restart. (Not a hard
-  boot fail-fast like the others — an unset/unstaged dir surfaces at the bucket-5
-  probe, not at boot.)
-  ```bash
-  sudo bash -c 'grep -q "^MIINT_EXTENSION_DIRECTORY=" /etc/qiita/compute-orchestrator.env || echo "MIINT_EXTENSION_DIRECTORY=<derived>/duckdb-ext" >> /etc/qiita/compute-orchestrator.env'
-  ```
+_None yet._
 
 ### 2. One-time host setup
 
-- (#86, #90) [operator] Ensure the **v1.5.3** miint build on the mirror
-  (`https://ftp.microbio.me/pub/miint/v1.5.3/`) includes the `sequence_split`
-  scalar (duckdb-miint #121) BEFORE the bucket-4 stage step. Components run DuckDB
-  1.5.3 (#85); the bucket-4 stage step (#90) pulls the `v1.5.3` build from the
-  mirror into the shared extension dir and the cluster LOADs it, so the chunking
-  SQL (`UNNEST(sequence_split(...))`) only resolves if that build has the
-  function. Adding it is backward-compatible (it only adds a scalar), so
-  publishing early does not affect already-deployed code. If the v1.5.3 build
-  lacks `sequence_split` when staged, `stage_local_fasta` and the CLI
-  `reference load` FASTA path fail with "Scalar Function with name
-  sequence_split does not exist" — the bucket-5 probe catches this first.
-- (#90) [operator] Create the shared dir the orchestrator's
-  `MIINT_EXTENSION_DIRECTORY` points at — `qiita-orch` owns it and writes the
-  staged extension; every compute node reads it. The stage step itself runs in
-  bucket 4 (it needs the newly-deployed code).
-  ```bash
-  derived=$(sudo grep '^PATH_DERIVED=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)
-  sudo install -d -o qiita-orch -g qiita-orch -m 0755 "$derived/duckdb-ext"
-  ```
 - (#89) [operator] Two prerequisites for the host-filter / minimap2-index work,
   both BEFORE the bucket-4 deploy:
   1. The **v1.5.3** miint mirror build must also carry the host-filter functions
@@ -75,9 +48,83 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 # time and ABORTS before any restart if one is unapplied.
 make -C ~/qiita-miint migrate
 ```
-`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#87) adds `20260611000000_study_ena_accession_and_bioproject` (renames the study `ebi_study_accession` column + its UNIQUE constraint to `ena_study_accession`, and adds a nullable, unique-when-present `bioproject_accession` column; no extension, backfill, or pre-check). (#89) adds `20260612000000_reference_index_minimap2_type` (drops + re-adds the `reference_index.index_type` CHECK to allow `'minimap2'` alongside `'rype'`; no extension, backfill, or pre-check).
+`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#89) adds `20260612000000_reference_index_minimap2_type` (drops + re-adds the `reference_index.index_type` CHECK to allow `'minimap2'` alongside `'rype'`; no extension, backfill, or pre-check).
 
 ### 4. Deploy
+
+_None yet._
+
+### 5. Verify
+
+```bash
+# (#89) [admin] spot-check that the brand-new fastq-to-parquet/1.1.0 row reached
+# qiita.action. activate.sh runs `qiita-admin actions sync` and ABORTS on
+# failure, so the in-place upserts of the *changed* host-reference-add /
+# local-host-reference-add rows are gated there — this query just confirms the
+# one new row landed.
+psql "$DATABASE_URL" -tAc \
+  "SELECT count(*) FROM qiita.action WHERE action_id='fastq-to-parquet' AND version='1.1.0'"   # 1 (#89)
+```
+
+### Notes (no host action)
+
+- (#89) Short-read host filtering is **opt-in** and changes no existing behavior: `fastq-to-parquet/1.0.0` is unchanged, and `1.1.0` only runs the host filter when a ticket sets `host_filter_enabled: true` + a `host_reference_idx` (a built host reference). Clients submitting `1.0.0` (or `1.1.0` without the flag) are unaffected. The host-reference-add workflows now build a minimap2 `.mmi` in addition to the rype `.ryxdi` (bucket-2 mirror prerequisite); no API/client change.
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-15 — 03699e8
+
+Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+- (#90) [operator] Point the orchestrator at the shared dir the deploy stages
+  miint into (`<derived>` = the `PATH_DERIVED` root). Cluster jobs and the
+  compute-readiness probe LOAD from here, and the orchestrator propagates it into
+  every job's environment, so it must precede the bucket-4 restart. (Not a hard
+  boot fail-fast like the others — an unset/unstaged dir surfaces at the bucket-5
+  probe, not at boot.)
+  ```bash
+  sudo bash -c 'grep -q "^MIINT_EXTENSION_DIRECTORY=" /etc/qiita/compute-orchestrator.env || echo "MIINT_EXTENSION_DIRECTORY=<derived>/duckdb-ext" >> /etc/qiita/compute-orchestrator.env'
+  ```
+
+#### 2. One-time host setup
+
+- (#86, #90) [operator] Ensure the **v1.5.3** miint build on the mirror
+  (`https://ftp.microbio.me/pub/miint/v1.5.3/`) includes the `sequence_split`
+  scalar (duckdb-miint #121) BEFORE the bucket-4 stage step. Components run DuckDB
+  1.5.3 (#85); the bucket-4 stage step (#90) pulls the `v1.5.3` build from the
+  mirror into the shared extension dir and the cluster LOADs it, so the chunking
+  SQL (`UNNEST(sequence_split(...))`) only resolves if that build has the
+  function. Adding it is backward-compatible (it only adds a scalar), so
+  publishing early does not affect already-deployed code. If the v1.5.3 build
+  lacks `sequence_split` when staged, `stage_local_fasta` and the CLI
+  `reference load` FASTA path fail with "Scalar Function with name
+  sequence_split does not exist" — the bucket-5 probe catches this first.
+- (#90) [operator] Create the shared dir the orchestrator's
+  `MIINT_EXTENSION_DIRECTORY` points at — `qiita-orch` owns it and writes the
+  staged extension; every compute node reads it. The stage step itself runs in
+  bucket 4 (it needs the newly-deployed code).
+  ```bash
+  derived=$(sudo grep '^PATH_DERIVED=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)
+  sudo install -d -o qiita-orch -g qiita-orch -m 0755 "$derived/duckdb-ext"
+  ```
+
+#### 3. Migrations
+
+```bash
+# [operator] DATABASE_URL must be in your shell, pointing at the SAME DB as
+# control-plane.env. activate.sh re-checks public.schema_migrations at deploy
+# time and ABORTS before any restart if one is unapplied.
+make -C ~/qiita-miint migrate
+```
+`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#87) adds `20260611000000_study_ena_accession_and_bioproject` (renames the study `ebi_study_accession` column + its UNIQUE constraint to `ena_study_accession`, and adds a nullable, unique-when-present `bioproject_accession` column; no extension, backfill, or pre-check).
+
+#### 4. Deploy
 
 After `local-deploy.sh` (the standard deploy — see the runbook), which ships the
 new stage-miint code, stage the miint extension into the shared dir. The cluster
@@ -91,7 +138,7 @@ sudo -u qiita-orch env PATH_DERIVED="$derived" SLURM_NATIVE_PYTHON="$py" \
     bash /home/qiita/qiita-miint/scripts/stage-miint-extension.sh   # (#90)
 ```
 
-### 5. Verify
+#### 5. Verify
 
 ```bash
 # (#86, #90) [admin] the deployed compute node LOADs the staged v1.5.3 miint
@@ -100,21 +147,19 @@ sudo -u qiita-orch env PATH_DERIVED="$derived" SLURM_NATIVE_PYTHON="$py" \
 # missing it passes the read_fastx probe but FAILS here — confirming the
 # bucket-4 stage produced a current build. The probe now prints the underlying
 # error on a failure, so a red row is self-diagnosing.
-sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
-    qiita-admin compute-readiness' | grep -E 'probe/(miint-read-fastx|miint-sequence-split)'   # both =ok
+#
+# RUN AS qiita-orch WITH THE CO ENV — not qiita-api with control-plane.env.
+# `qiita-admin compute-readiness` subprocesses into the orchestrator venv and
+# runs Settings.from_env(), so it needs compute-orchestrator.env and reads the
+# 0400 qiita-orch:qiita-orch co-to-cp.token; qiita-admin is also not on the
+# non-login PATH, hence the absolute path. The qiita-api/control-plane.env form
+# fails on all three counts and has had to be hand-corrected every deploy
+# (see #67 and the 2026-06-10 archive deviation) — do not reintroduce it.
+sudo -u qiita-orch bash -c 'set -a; source /etc/qiita/compute-orchestrator.env; set +a; \
+    /home/qiita/.local/bin/qiita-admin compute-readiness' | grep -E 'probe/(miint-read-fastx|miint-sequence-split)'   # both =ok
 ```
 
-```bash
-# (#89) [admin] spot-check that the brand-new fastq-to-parquet/1.1.0 row reached
-# qiita.action. activate.sh runs `qiita-admin actions sync` and ABORTS on
-# failure, so the in-place upserts of the *changed* host-reference-add /
-# local-host-reference-add rows are gated there — this query just confirms the
-# one new row landed.
-psql "$DATABASE_URL" -tAc \
-  "SELECT count(*) FROM qiita.action WHERE action_id='fastq-to-parquet' AND version='1.1.0'"   # 1 (#89)
-```
-
-### Notes (no host action)
+#### Notes (no host action)
 
 - (#91) `POST /study/lookup-by-accession` now resolves by `bioproject_accession`
   by default (was `ena_study_accession`); a caller omitting the new optional
@@ -129,13 +174,6 @@ psql "$DATABASE_URL" -tAc \
   field name (or scripts using the old flag) must update; the column rename
   itself is handled by the bucket-3 migration.
 - (#86) Sequence chunking switched from the pure-SQL `list_transform`/`substring` macro to miint's native `sequence_split` (duckdb-miint #121), fixing an O(L²) blow-up on large single FASTA records (DuckDB #23229). No client/API change — same chunked-Parquet shape `(read_id, chunk_index, chunk_data)`. The only operator action is the bucket-2 mirror check (the deployed code needs a v1.5.3 miint build that has `sequence_split`); no env var, host dir, or migration.
-- (#89) Short-read host filtering is **opt-in** and changes no existing behavior: `fastq-to-parquet/1.0.0` is unchanged, and `1.1.0` only runs the host filter when a ticket sets `host_filter_enabled: true` + a `host_reference_idx` (a built host reference). Clients submitting `1.0.0` (or `1.1.0` without the flag) are unaffected. The host-reference-add workflows now build a minimap2 `.mmi` in addition to the rype `.ryxdi` (bucket-2 mirror prerequisite); no API/client change.
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-10 — c230e87
 
