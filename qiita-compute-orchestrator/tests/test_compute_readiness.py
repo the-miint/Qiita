@@ -262,9 +262,9 @@ def test_probe_script_emits_only_known_values():
 
 
 def test_probe_script_checks_miint_read_fastx():
-    """The probe installs+loads miint and runs the jobs' read_fastx call on the
-    compute node — a stale/unreachable/wrong build should fail at deploy, not at
-    the first reference-load job."""
+    """The probe LOADs the deploy-staged miint and runs the jobs' read_fastx call
+    on the compute node — a missing/wrong staged build should fail at deploy, not
+    at the first reference-load job."""
     script = cr.build_probe_script(path_scratch="/scratch/qiita")
     assert "miint-read-fastx=ok" in script
     assert "miint-read-fastx=fail" in script
@@ -292,9 +292,9 @@ def test_probe_script_is_valid_bash():
 
 def test_probe_script_checks_miint_sequence_split():
     """The probe also exercises miint's native `sequence_split` chunker, which is
-    newer than read_fastx — a mirror serving a stale build without it passes the
-    read_fastx probe but fails here, catching the stale-build case at deploy
-    rather than at the first reference-load job."""
+    newer than read_fastx — a staged build that predates it passes the read_fastx
+    probe but fails here, catching the stale-stage case at deploy rather than at
+    the first reference-load job."""
     script = cr.build_probe_script(path_scratch="/scratch/qiita")
     assert "sequence_split(" in script
     assert "miint-sequence-split=ok" in script

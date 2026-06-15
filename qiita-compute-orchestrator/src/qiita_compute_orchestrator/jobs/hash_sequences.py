@@ -49,8 +49,7 @@ from ..miint import (
     PARQUET_OPTS,
     PARQUET_OPTS_CHUNKED,
     apply_duckdb_settings,
-    ensure_miint_installed,
-    open_conn,
+    open_miint_conn,
 )
 
 YAML_STEP_NAME = "hash_sequences"
@@ -136,12 +135,9 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     duckdb_tmp = workspace / ".duckdb_tmp"
     duckdb_tmp.mkdir(parents=True, exist_ok=True)
 
-    await ensure_miint_installed()
-
     success = False
     try:
-        with open_conn() as conn:
-            conn.execute("LOAD miint;")
+        with open_miint_conn() as conn:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,

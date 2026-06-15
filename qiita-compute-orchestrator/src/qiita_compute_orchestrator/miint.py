@@ -5,34 +5,33 @@ native-job package — every non-dunder file there must export an
 `Inputs` model and an `execute` coroutine (enforced by
 `scan_native_jobs`). Shared helpers go alongside, not inside.
 
-Two callers:
-- `qiita_compute_orchestrator.backends.local.LocalBackend` (container
-  step path: hash, load).
-- `qiita_compute_orchestrator.jobs.fastq_to_parquet` (native step
-  path; reads + transforms FASTQ via DuckDB+miint).
-Both use `ensure_miint_installed()` to lazily install miint once per
-process (concurrency-safe via asyncio.Lock), then `open_conn()` to
-materialize a fresh DuckDB connection with the right config — the
-caller `LOAD miint;`s the extension on its own connection.
+miint is **not** installed at runtime here. The deploy stages it once into the
+shared `MIINT_EXTENSION_DIRECTORY` (`stage_miint_extension`, driven by
+`scripts/stage-miint-extension.sh`); every runtime path on the cluster — native
+jobs and the compute-readiness probe — only `LOAD`s it via `open_miint_conn()`.
+That removes the per-job download, the compute-node mirror dependency, and the
+writable-`$HOME` requirement the old lazy `FORCE INSTALL` carried.
 
 miint installs from the team mirror by default — the same build across all
 Qiita components, no community-vs-mirror patchwork (`MIINT_EXTENSION_REPO`
 overrides for a local/dev build). Because the source is always a mirror (its
 signing chain is the team's own, not DuckDB's), `allow_unsigned_extensions=true`
-is always set. Single-sourced in `qiita_common.duckdb_miint`.
+is always set. The install/load SQL and connect config are single-sourced in
+`qiita_common.duckdb_miint`.
 """
 
 from __future__ import annotations
 
-import asyncio
+import os
 from pathlib import Path
 
 import duckdb
 from qiita_common.chunking import CHUNK_ROW_GROUP_SIZE
-from qiita_common.duckdb_miint import miint_connect_config, miint_install_sql
-
-_miint_install_lock = asyncio.Lock()
-_miint_installed = False
+from qiita_common.duckdb_miint import (
+    miint_connect_config,
+    miint_install_sql,
+    miint_load_sql,
+)
 
 # Canonical DuckDB COPY options for the *final* Parquet artifacts the
 # orchestrator writes — the ones the Rust data plane registers into
@@ -137,20 +136,36 @@ def apply_duckdb_settings(
 def open_conn() -> duckdb.DuckDBPyConnection:
     """Open an in-memory DuckDB connection with the miint-load config: unsigned
     extensions are always allowed (miint installs from a mirror, not a
-    DuckDB-signed channel), and an isolated extension_directory is used when
+    DuckDB-signed channel), and the extension_directory is used when
     MIINT_EXTENSION_DIRECTORY is set. Config resolution is shared with the CLI
-    via `qiita_common.duckdb_miint.miint_connect_config`."""
+    via `qiita_common.duckdb_miint.miint_connect_config`. Does **not** LOAD
+    miint — use `open_miint_conn()` when you need the extension."""
     return duckdb.connect(":memory:", config=miint_connect_config())
 
 
-async def ensure_miint_installed() -> None:
-    """Install miint once per process, concurrency-safe."""
-    global _miint_installed
-    if _miint_installed:
-        return
-    async with _miint_install_lock:
-        if _miint_installed:
-            return
-        with open_conn() as conn:
-            conn.execute(miint_install_sql())
-        _miint_installed = True
+def open_miint_conn() -> duckdb.DuckDBPyConnection:
+    """Open a fresh DuckDB connection with the miint extension LOADed.
+
+    LOAD-only: miint is pre-staged into MIINT_EXTENSION_DIRECTORY at deploy, so
+    this never installs, downloads, or touches the mirror. If the extension is
+    missing from the staged directory (a forgotten/failed deploy stage), the
+    LOAD raises a DuckDB error — fail loud, as intended. The caller owns the
+    connection and must close it."""
+    conn = open_conn()
+    conn.execute(miint_load_sql())
+    return conn
+
+
+def stage_miint_extension() -> str:
+    """Deploy-time staging: FORCE INSTALL miint into the configured
+    extension_directory, then LOAD it to prove the staged build is usable.
+
+    Runs **once per deploy** (via `scripts/stage-miint-extension.sh`), not per
+    job — so FORCE (refresh to the mirror's current build) is the right call
+    here, unlike the retired per-job install. Returns the resolved
+    extension_directory for the caller to report (or the DuckDB default marker
+    when MIINT_EXTENSION_DIRECTORY is unset, e.g. in a dev/test stage)."""
+    with open_conn() as conn:
+        conn.execute(miint_install_sql(force=True))
+        conn.execute(miint_load_sql())
+    return os.environ.get("MIINT_EXTENSION_DIRECTORY", "<duckdb default ~/.duckdb>")

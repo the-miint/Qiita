@@ -32,7 +32,28 @@ the `no-changelog` label).
   against the BioProject column. This aligns the `qiita submit-bcl-convert`
   preflight, whose project accessions are BioProject identifiers, with the
   column it actually matches (#91)
-
+- miint is no longer installed lazily on every compute run. The deploy stages
+  the extension **once** into a shared `MIINT_EXTENSION_DIRECTORY`
+  (`scripts/stage-miint-extension.sh` →
+  `python -m qiita_compute_orchestrator.cli.stage_miint`), and the CO service,
+  all five native jobs, and the compute-readiness probe only `LOAD` it
+  (`miint.open_miint_conn`) — no per-job download, no compute-node mirror
+  dependency, no writable-`$HOME` requirement (the latter was the deploy
+  footgun: a slurmrestd job has no login `$HOME`, so `FORCE INSTALL` couldn't
+  write `~/.duckdb`). New orchestrator env var `MIINT_EXTENSION_DIRECTORY` (see
+  `DEPLOY_CHECKLIST.md`). The client-side `qiita reference load` CLI keeps an
+  install but plain + cached (was `FORCE INSTALL`, which re-downloaded every
+  invocation). `miint_install_sql()` is now plain `INSTALL` with opt-in
+  `force=` for deploy staging; new `miint_load_sql()` / `miint_job_env()`
+  single-source the load + remote-job-env contract (#90)
+- The compute-readiness probe now reports *why* a miint check failed (the
+  captured DuckDB/Python error) instead of a swallowed bare `=fail`, and LOADs
+  the staged build exactly like the native jobs — a broken miint deploy is now
+  diagnosable from the probe output alone (#90)
+- The data-plane `miint_extension_smoke` test installs from the team mirror
+  (honoring `MIINT_EXTENSION_REPO` / `MIINT_EXTENSION_DIRECTORY`) instead of the
+  hardcoded `community` channel, so it verifies the same build the rest of the
+  system runs (#90)
 - The bcl-convert flow now derives the instrument run ID and model from the
   run folder's top-level `RunInfo.xml` (`Run@Id` plus the `Instrument` serial number
   resolved against the vendored prefix table) instead of parsing the folder

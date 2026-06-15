@@ -27,6 +27,7 @@ from pathlib import Path
 
 from qiita_common.actions import BaselineResources
 from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.duckdb_miint import miint_job_env
 from qiita_common.models import (
     ComputeTarget,
     StepBaselineResources,
@@ -363,6 +364,11 @@ class SlurmBackend(ComputeBackend):
             extra_env["QIITA_CP_URL"] = self._cp_url
         if self._path_scratch:
             extra_env["PATH_SCRATCH"] = self._path_scratch
+        # Native jobs LOAD miint from the deploy-staged MIINT_EXTENSION_DIRECTORY
+        # (open_miint_conn); the compute node sees it only if we propagate it.
+        # Single-sourced with the compute-readiness probe via miint_job_env() so
+        # the diagnostic and the real jobs can't drift.
+        extra_env.update(miint_job_env())
 
         # For container steps, expose the parent directory of every
         # YAML-declared input path so the entrypoint can read it via
