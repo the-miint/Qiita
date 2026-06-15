@@ -15,6 +15,40 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
+_None yet._
+
+### 2. One-time host setup
+
+_None yet._
+
+### 3. Migrations
+
+_None yet._
+
+### 4. Deploy
+
+_None yet._
+
+### 5. Verify
+
+_None yet._
+
+### Notes (no host action)
+
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-15 — 03699e8
+
+Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
 - (#90) [operator] Point the orchestrator at the shared dir the deploy stages
   miint into (`<derived>` = the `PATH_DERIVED` root). Cluster jobs and the
   compute-readiness probe LOAD from here, and the orchestrator propagates it into
@@ -25,7 +59,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   sudo bash -c 'grep -q "^MIINT_EXTENSION_DIRECTORY=" /etc/qiita/compute-orchestrator.env || echo "MIINT_EXTENSION_DIRECTORY=<derived>/duckdb-ext" >> /etc/qiita/compute-orchestrator.env'
   ```
 
-### 2. One-time host setup
+#### 2. One-time host setup
 
 - (#86, #90) [operator] Ensure the **v1.5.3** miint build on the mirror
   (`https://ftp.microbio.me/pub/miint/v1.5.3/`) includes the `sequence_split`
@@ -47,7 +81,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   sudo install -d -o qiita-orch -g qiita-orch -m 0755 "$derived/duckdb-ext"
   ```
 
-### 3. Migrations
+#### 3. Migrations
 
 ```bash
 # [operator] DATABASE_URL must be in your shell, pointing at the SAME DB as
@@ -57,7 +91,7 @@ make -C ~/qiita-miint migrate
 ```
 `dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#87) adds `20260611000000_study_ena_accession_and_bioproject` (renames the study `ebi_study_accession` column + its UNIQUE constraint to `ena_study_accession`, and adds a nullable, unique-when-present `bioproject_accession` column; no extension, backfill, or pre-check).
 
-### 4. Deploy
+#### 4. Deploy
 
 After `local-deploy.sh` (the standard deploy — see the runbook), which ships the
 new stage-miint code, stage the miint extension into the shared dir. The cluster
@@ -71,7 +105,7 @@ sudo -u qiita-orch env PATH_DERIVED="$derived" SLURM_NATIVE_PYTHON="$py" \
     bash /home/qiita/qiita-miint/scripts/stage-miint-extension.sh   # (#90)
 ```
 
-### 5. Verify
+#### 5. Verify
 
 ```bash
 # (#86, #90) [admin] the deployed compute node LOADs the staged v1.5.3 miint
@@ -80,11 +114,19 @@ sudo -u qiita-orch env PATH_DERIVED="$derived" SLURM_NATIVE_PYTHON="$py" \
 # missing it passes the read_fastx probe but FAILS here — confirming the
 # bucket-4 stage produced a current build. The probe now prints the underlying
 # error on a failure, so a red row is self-diagnosing.
-sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
-    qiita-admin compute-readiness' | grep -E 'probe/(miint-read-fastx|miint-sequence-split)'   # both =ok
+#
+# RUN AS qiita-orch WITH THE CO ENV — not qiita-api with control-plane.env.
+# `qiita-admin compute-readiness` subprocesses into the orchestrator venv and
+# runs Settings.from_env(), so it needs compute-orchestrator.env and reads the
+# 0400 qiita-orch:qiita-orch co-to-cp.token; qiita-admin is also not on the
+# non-login PATH, hence the absolute path. The qiita-api/control-plane.env form
+# fails on all three counts and has had to be hand-corrected every deploy
+# (see #67 and the 2026-06-10 archive deviation) — do not reintroduce it.
+sudo -u qiita-orch bash -c 'set -a; source /etc/qiita/compute-orchestrator.env; set +a; \
+    /home/qiita/.local/bin/qiita-admin compute-readiness' | grep -E 'probe/(miint-read-fastx|miint-sequence-split)'   # both =ok
 ```
 
-### Notes (no host action)
+#### Notes (no host action)
 
 - (#91) `POST /study/lookup-by-accession` now resolves by `bioproject_accession`
   by default (was `ena_study_accession`); a caller omitting the new optional
@@ -99,12 +141,6 @@ sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; 
   field name (or scripts using the old flag) must update; the column rename
   itself is handled by the bucket-3 migration.
 - (#86) Sequence chunking switched from the pure-SQL `list_transform`/`substring` macro to miint's native `sequence_split` (duckdb-miint #121), fixing an O(L²) blow-up on large single FASTA records (DuckDB #23229). No client/API change — same chunked-Parquet shape `(read_id, chunk_index, chunk_data)`. The only operator action is the bucket-2 mirror check (the deployed code needs a v1.5.3 miint build that has `sequence_split`); no env var, host dir, or migration.
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-10 — c230e87
 
