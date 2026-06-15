@@ -31,12 +31,13 @@ empty (0-row) but well-formed Parquet, not an error.
 miint contracts (qiita-verified against the team-mirror build via the smoke; see
 docs/duckdb-miint.md):
   - `rype_classify(index_path, sequence_table, [id_column='read_id'],
-    [threshold=0.1], [negative_index])` → one row per HOST read (≤1 per read, so
-    no DISTINCT needed) with columns `(read_id, bucket_id, bucket_name, score)`.
-    It reads `sequence1` and (when present) `sequence2`. **On the current mirror
-    build it returns `read_id` as VARCHAR even for a BIGINT input** (duckdb-miint
-    #126's input-type round-trip is not in the mirror yet), so the CAST back to
-    BIGINT is load-bearing, not merely defensive — it normalizes either build.
+    [threshold=0.1], [negative_index])` → host-matching reads with columns
+    `(read_id, bucket_id, bucket_name, score)`. It reads `sequence1` and (when
+    present) `sequence2`. We DISTINCT the `read_id` — the table-function
+    interface does not guarantee one best-hit row per read (that is a CLI
+    behavior) — and append into a BIGINT accumulator column, which coerces
+    rype's `read_id` to BIGINT on insert whether the build returns it as BIGINT
+    or VARCHAR (so the typed column is the contract; no explicit cast).
   - `align_minimap2(query_table, [index_path], [preset], [max_secondary], ...)` →
     SAM-like rows (`read_id, flags, reference, ...`); `read_id` round-trips as
     BIGINT (no cast). It reads `sequence1`/`sequence2` and emits one row per mate
@@ -116,19 +117,20 @@ def _run_rype_classify(
     *,
     threshold: float,
 ) -> None:
-    """Seam around miint's `rype_classify`. Appends the host `sequence_idx` set
-    (reads that matched the positive index) into the pre-created `dest_table`.
-    Isolated so unit tests stub the real classify.
+    """Seam around miint's `rype_classify`. Appends the DISTINCT host
+    `sequence_idx` set (reads that matched the positive index) into the
+    pre-created `dest_table`. Isolated so unit tests stub the real classify.
 
     Positional args (index path, sequence-table NAME) + `threshold` are bound as
     `?` (INSERT...SELECT is DML, so prepared params are accepted here, unlike a
-    CREATE VIEW). rype emits ≤1 row per read, so no DISTINCT is needed. The CAST
-    normalizes rype's `read_id` to BIGINT — the current mirror build returns it
-    as VARCHAR regardless of input type (pre-#126), so the cast is required to
-    join against the BIGINT `sequence_idx`."""
+    CREATE VIEW). DISTINCT because the table-function interface does not
+    guarantee one best-hit row per read (that is a CLI behavior). `dest_table` is
+    declared BIGINT, so rype's `read_id` coerces to it on insert — no explicit
+    cast, and the typed column is the contract regardless of whether the build
+    returns the id as BIGINT or VARCHAR."""
     conn.execute(
         f"INSERT INTO {dest_table} "
-        "SELECT CAST(read_id AS BIGINT) AS sequence_idx "
+        "SELECT DISTINCT read_id AS sequence_idx "
         "FROM rype_classify(?, ?, id_column := 'read_id', threshold := ?)",
         [str(index_path), sequence_table, threshold],
     )
@@ -246,7 +248,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "COPY (SELECT sequence_idx, read_id, sequence1, qual1, sequence2, qual2 "
                 f"FROM read_parquet('{reads_sql}') r "
                 f"ANTI JOIN (SELECT sequence_idx FROM {_RYPE_HOST} "
-                f"           UNION SELECT sequence_idx FROM {_MM2_HOST}) drop_set "
+                f"           UNION ALL SELECT sequence_idx FROM {_MM2_HOST}) drop_set "
                 "  ON drop_set.sequence_idx = r.sequence_idx "
                 f"ORDER BY sequence_idx) TO '{out_sql}' ({PARQUET_OPTS})"
             )
