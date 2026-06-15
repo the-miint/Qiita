@@ -104,6 +104,12 @@ the `no-changelog` label).
   instead of a bare `metadata_checklist_idx`, mirroring the missing-reason /
   terminology-term read-back refs (#81)
 
+### Fixed
+
+- `qiita submit-bcl-convert` now opens the preflight blob via
+  run-preflight's `open_db_file` instead of a hand-rolled read-only
+  `sqlite3.connect`, opening it the way the library expects (#92)
+
 ### Added
 
 - ENVO terminology seed for the environmental-context biosample fields

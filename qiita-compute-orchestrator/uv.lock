@@ -385,7 +385,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "qiita-common", directory = "../qiita-common" },
-    { name = "run-preflight", git = "https://github.com/the-miint/kl-run-preflight?rev=3505f98c5237a0117e63b4cb9aab8c16764ea14d" },
+    { name = "run-preflight", git = "https://github.com/the-miint/kl-run-preflight?rev=dcce1f37c0c940478063389ef00394816bda0a2c" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
 ]
 
@@ -424,8 +424,8 @@ wheels = [
 
 [[package]]
 name = "run-preflight"
-version = "0.0.0.post38+g3505f98.d20260612"
-source = { git = "https://github.com/the-miint/kl-run-preflight?rev=3505f98c5237a0117e63b4cb9aab8c16764ea14d#3505f98c5237a0117e63b4cb9aab8c16764ea14d" }
+version = "0.0.0.post41+gdcce1f3.d20260615"
+source = { git = "https://github.com/the-miint/kl-run-preflight?rev=dcce1f37c0c940478063389ef00394816bda0a2c#dcce1f37c0c940478063389ef00394816bda0a2c" }
 
 [[package]]
 name = "starlette"
