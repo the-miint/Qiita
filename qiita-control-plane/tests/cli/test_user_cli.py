@@ -274,6 +274,8 @@ def test_study_create_passes_through_optional_fields(monkeypatch):
             "NIH",
             "--ena-study-accession",
             "PRJEB99999",
+            "--bioproject-accession",
+            "PRJNA12345",
             "--notes",
             "note",
             "--principal-investigator-idx",
@@ -290,6 +292,7 @@ def test_study_create_passes_through_optional_fields(monkeypatch):
         "abstract": "abs",
         "funding": "NIH",
         "ena_study_accession": "PRJEB99999",
+        "bioproject_accession": "PRJNA12345",
         "notes": "note",
         "principal_investigator_idx": 5,
         "default_tier": "member",
@@ -1750,11 +1753,12 @@ def _seed_bcl_folder(tmp_path: Path, name: str, *, with_runinfo: bool = True) ->
 def preflight_stub(monkeypatch, tmp_path):
     """Install a fake `run_preflight` module + return a blob-path builder.
 
-    The handler imports `get_illumina_sample_info` from `run_preflight`
-    at call time; the fixture patches `sys.modules["run_preflight"]` so
-    the test controls the function's return value (canned 4-tuples) or
-    its raised exception, without depending on the upstream library
-    being installed or on the SQLite contents matching its schema.
+    The handler imports `open_db_file` and `get_illumina_sample_info`
+    from `run_preflight` at call time; the fixture patches
+    `sys.modules["run_preflight"]` so the test controls the opened
+    connection and the function's return value (canned 4-tuples) or its
+    raised exception, without depending on the upstream library being
+    installed or on the SQLite contents matching its schema.
 
     Returns a callable `_install(rows=None, raises=None) -> Path` that
     writes a non-empty marker blob at `tmp_path/preflight.db` and yields
@@ -1770,6 +1774,10 @@ def preflight_stub(monkeypatch, tmp_path):
         blob = tmp_path / "preflight.db"
         blob.write_bytes(b"\x00stub-preflight-marker")
         stub_module = types.ModuleType("run_preflight")
+        # The handler opens the blob via open_db_file, then passes the
+        # connection to get_illumina_sample_info and closes it; the stub's
+        # connection is a closable placeholder the row-getter ignores.
+        stub_module.open_db_file = lambda _blob: types.SimpleNamespace(close=lambda: None)
         if raises is not None:
             captured_exc = raises
 
@@ -1881,7 +1889,10 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
     # accessions (here the same as row order since each is unique).
     assert requests[1]["method"] == "POST"
     assert requests[1]["url"].endswith("/biosample/lookup-by-accession")
-    assert requests[1]["json"] == {"accessions": ["SAMN001", "SAMN002", "SAMN003"]}
+    assert requests[1]["json"] == {
+        "accessions": ["SAMN001", "SAMN002", "SAMN003"],
+        "accession_field": "biosample_accession",
+    }
 
     # Leg 3: study lookup-by-accession with the order-preserving dedup
     # of every row's primary + secondary project accessions. First
@@ -1889,7 +1900,10 @@ def test_submit_bcl_convert_happy_path_chains_full_flow(
     # row3 secondary PRJ003 (PRJ001 and PRJ002 already seen).
     assert requests[2]["method"] == "POST"
     assert requests[2]["url"].endswith("/study/lookup-by-accession")
-    assert requests[2]["json"] == {"accessions": ["PRJ001", "PRJ002", "PRJ003"]}
+    assert requests[2]["json"] == {
+        "accessions": ["PRJ001", "PRJ002", "PRJ003"],
+        "accession_field": "bioproject_accession",
+    }
 
     # Leg 4: POST /sequencing-run.
     assert requests[3]["method"] == "POST"
@@ -2184,8 +2198,14 @@ def test_submit_bcl_convert_dedups_repeated_accessions_in_lookup(
     )
     assert rc == 0
     # Each lookup body carries its accession exactly once.
-    assert captured["requests"][1]["json"] == {"accessions": ["SAMN001"]}
-    assert captured["requests"][2]["json"] == {"accessions": ["PRJ001"]}
+    assert captured["requests"][1]["json"] == {
+        "accessions": ["SAMN001"],
+        "accession_field": "biosample_accession",
+    }
+    assert captured["requests"][2]["json"] == {
+        "accessions": ["PRJ001"],
+        "accession_field": "bioproject_accession",
+    }
     # Both rows still produce a sequenced-sample composer POST with the
     # row's distinct illumina_sample_idx.
     sample_bodies = [r["json"] for r in captured["requests"][5:7]]
@@ -2511,6 +2531,11 @@ def test_read_subcommand_http_error_exits_1(monkeypatch, capsys):
             ["study", "patch", "--study-idx", "42", "--ena-study-accession", "PRJEB1"],
             URL_STUDY_BY_IDX.format(study_idx=42),
             {"ena_study_accession": "PRJEB1"},
+        ),
+        (
+            ["study", "patch", "--study-idx", "42", "--bioproject-accession", "PRJNA1"],
+            URL_STUDY_BY_IDX.format(study_idx=42),
+            {"bioproject_accession": "PRJNA1"},
         ),
         (
             ["biosample", "patch", "--biosample-idx", "100", "--ena-sample-accession", "ERS1"],

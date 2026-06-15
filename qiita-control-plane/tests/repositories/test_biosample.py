@@ -1502,6 +1502,7 @@ async def test_update_biosample_advances_updated_at(ctx):
     "key,make_value",
     [
         ("biosample_accession", lambda: unique_accession("LK")),
+        ("ena_sample_accession", lambda: unique_accession("LK-ENA-HIT")),
         ("matrix_tube_id", unique_matrix_tube_id),
     ],
 )
@@ -1509,23 +1510,28 @@ async def test_fetch_biosample_idxs_by_natural_key_returns_resolved(ctx, key, ma
     """Tests the case where the named natural-key column carries values
     that resolve to non-retired biosamples: the function returns a
     `{value: biosample_idx}` map for the hits and omits the misses. The
-    parameterization exercises both natural-key surfaces (accession and
-    matrix_tube_id) through one definition.
+    parameterization exercises every natural-key surface (both accession
+    columns and matrix_tube_id) through one definition.
     """
     hit_value = make_value()
     miss_value = make_value()
-    # Seed one biosample carrying hit_value in the target column; the
-    # paired accession/ena_accession use a separate generator so the
-    # uniqueness constraints on the other unique columns never collide.
+    # Seed one biosample carrying hit_value in the target column; the other
+    # unique columns use separate generators so their uniqueness constraints
+    # never collide with hit_value.
     kwargs = {
         "owner_idx": ctx["biosample_owner_idx"],
         "bs_acc": unique_accession("LK-OTHER"),
         "ena_acc": unique_accession("LK-ENA"),
     }
-    if key == "matrix_tube_id":
-        kwargs["matrix_tube_id"] = hit_value
-    else:
-        kwargs["bs_acc"] = hit_value
+    # Closed map from natural-key column to the _seed_full_biosample kwarg
+    # that populates it.
+    kwargs[
+        {
+            "biosample_accession": "bs_acc",
+            "ena_sample_accession": "ena_acc",
+            "matrix_tube_id": "matrix_tube_id",
+        }[key]
+    ] = hit_value
     bs_idx = await _seed_full_biosample(ctx, **kwargs)
 
     result = await fetch_biosample_idxs_by_natural_key(

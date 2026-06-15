@@ -775,14 +775,19 @@ class BiosampleResponse(BaseModel):
     caller_system_role: SystemRole
 
 
+# The two qiita.biosample accession columns a lookup may key on; each value is
+# the literal Postgres column name it selects.
+BiosampleAccessionField = Literal["biosample_accession", "ena_sample_accession"]
+
+
 class BiosampleLookupByAccessionRequest(BaseModel):
     """Body for POST /api/v1/biosample/lookup-by-accession.
 
-    Resolves a list of NCBI BioSample accession strings (or any
-    biosample_accession value the deploy stores) to their qiita.biosample
-    idxs in one round trip. Used by qiita submit-bcl-convert to translate
-    the preflight rows' biosample_accession values into the biosample_idx
-    the sequenced-sample composer route requires.
+    Resolves a list of biosample accession strings to their qiita.biosample
+    idxs in one round trip, keyed on the column named by `accession_field`
+    (default biosample_accession). Used by qiita submit-bcl-convert to
+    translate the preflight rows' biosample_accession values into the
+    biosample_idx the sequenced-sample composer route requires.
 
     The request body is the natural place for the list because a typical
     bcl-convert pool carries 384 accessions, which exceeds nginx's
@@ -793,6 +798,7 @@ class BiosampleLookupByAccessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     accessions: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1, max_length=10_000)
+    accession_field: BiosampleAccessionField = "biosample_accession"
 
 
 class BiosampleLookupByAccessionResponse(BaseModel):
@@ -840,16 +846,23 @@ class BiosampleLookupByMatrixTubeIdResponse(BaseModel):
     missing: list[str]
 
 
+# The two qiita.study accession columns a lookup may key on; each value is the
+# literal Postgres column name it selects.
+StudyAccessionField = Literal["ena_study_accession", "bioproject_accession"]
+
+
 # same-pattern-ok: per-key wire shape; parallels BiosampleLookupByAccessionRequest
 class StudyLookupByAccessionRequest(BaseModel):
-    """Resolves a list of ena_study_accession values to study_idxs in one
-    round trip. Body-shaped (not query-params) so a long accession list
-    cannot exceed nginx's default URL-line cap.
+    """Resolves a list of study accession values to study_idxs in one round
+    trip, keyed on the column named by `accession_field` (default
+    bioproject_accession). Body-shaped (not query-params) so a long accession
+    list cannot exceed nginx's default URL-line cap.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     accessions: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1, max_length=10_000)
+    accession_field: StudyAccessionField = "bioproject_accession"
 
 
 # same-pattern-ok: per-key wire shape; parallels BiosampleLookupByAccessionResponse
@@ -977,6 +990,9 @@ class StudyCreate(BaseModel):
     ena_study_accession: str | None = Field(
         default=None, min_length=1, max_length=_STUDY_ACCESSION_MAX
     )
+    bioproject_accession: str | None = Field(
+        default=None, min_length=1, max_length=_STUDY_ACCESSION_MAX
+    )
     notes: str | None = None
     extra_metadata: dict[str, object] | None = None
     default_tier: Tier | None = None
@@ -1009,6 +1025,9 @@ class StudyPatchRequest(PatchRequestModel):
     ena_study_accession: str | None = Field(
         default=None, min_length=1, max_length=_STUDY_ACCESSION_MAX
     )
+    bioproject_accession: str | None = Field(
+        default=None, min_length=1, max_length=_STUDY_ACCESSION_MAX
+    )
     notes: str | None = None
     extra_metadata: dict[str, object] | None = None
 
@@ -1030,6 +1049,7 @@ class StudyResponse(BaseModel):
     abstract: str | None
     funding: str | None
     ena_study_accession: str | None
+    bioproject_accession: str | None
     notes: str | None
     last_submission_at: AwareDatetime | None
     submission_error: str | None

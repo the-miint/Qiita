@@ -18,6 +18,8 @@ SELECT * FROM miint_warnings();-- non-fatal load-time issues (e.g. GPL boundary 
 
 Local builds need `allow_unsigned_extensions=true` and `LOAD '/path/to/miint.duckdb_extension'`. There is also a companion Python CLI named `miint` (lives under `python/` in the repo) that wraps the extension for `convert`/`transform`/`align` subcommands — not on PyPI; install from a local checkout with `pip install -e python/`.
 
+**In qiita, don't `INSTALL ... FROM community`.** Every component runs the same team-mirror build, single-sourced in [`qiita_common.duckdb_miint`](../qiita-common/src/qiita_common/duckdb_miint.py) (`MIINT_EXTENSION_REPO` overrides for a local/dev build; the mirror build is unsigned, so `allow_unsigned_extensions=true` is always set). On the cluster the extension is **pre-staged once at deploy** into `MIINT_EXTENSION_DIRECTORY` (`scripts/stage-miint-extension.sh`); the CO service, the five native SLURM jobs, and the compute-readiness probe then only `LOAD miint` (`miint.open_miint_conn`) — no per-job download, no compute-node mirror dependency, no writable-`$HOME` requirement. The client-side `qiita reference load` CLI, which can't reach a deploy-staged dir, does a plain cached `INSTALL` instead. The Rust data plane honors the same `MIINT_EXTENSION_REPO` / `MIINT_EXTENSION_DIRECTORY` env contract independently (it can't import the Python module — keep the two in sync). DuckDB namespaces the staged dir by version + platform, so re-run the stage step on a miint or DuckDB bump.
+
 ## Upstream docs map
 
 The upstream `docs/` is the source of truth. The boilerplate at `docs/README.md` is the DuckDB extension template README (ignore it); same for `docs/UPDATING.md` which is generic "bump the DuckDB submodule" instructions.

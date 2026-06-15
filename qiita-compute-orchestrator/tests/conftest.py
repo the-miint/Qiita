@@ -21,6 +21,27 @@ import pytest  # noqa: E402
 from helpers import TEST_SEQUENCES  # noqa: E402
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _stage_miint_extension():
+    """Production stages miint into MIINT_EXTENSION_DIRECTORY at deploy; the
+    cluster runtime (native jobs, the probe) is then LOAD-only via
+    `open_miint_conn`. Mirror that here: install once into the per-component
+    temp extension dir (`setup_miint_test_env` above) so LOAD-only callers find
+    it. Plain INSTALL (not the deploy's FORCE) so the stable temp dir caches
+    across runs — first run downloads from the mirror, later runs are instant.
+    Kept in step with the integration conftest's identical fixture."""
+    import duckdb
+    from qiita_common.duckdb_miint import (
+        miint_connect_config,
+        miint_install_sql,
+        miint_load_sql,
+    )
+
+    with duckdb.connect(":memory:", config=miint_connect_config()) as conn:
+        conn.execute(miint_install_sql())
+        conn.execute(miint_load_sql())
+
+
 @pytest.fixture
 def fasta_file(tmp_path):
     """Create a 5-sequence FASTA file. Returns (path, sequences dict)."""

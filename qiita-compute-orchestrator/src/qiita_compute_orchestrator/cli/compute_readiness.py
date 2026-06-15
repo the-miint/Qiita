@@ -61,6 +61,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from qiita_common.duckdb_miint import miint_job_env
 
 from ..config import Settings
 from ..slurm.client import (
@@ -259,58 +260,77 @@ else
     echo "{_PROBE_LINE_PREFIX} native-import=fail"
 fi
 
-# miint must install from the mirror and LOAD on the compute node, and the
-# core ingest call the jobs issue (read_fastx) must run. A stale cached
-# extension, an unreachable mirror, or an otherwise-wrong build fails the real
-# job — catch it here, at deploy, not at the first reference-load job. Runs the
-# install via the single-sourced path (so it also proves the mirror reaches
-# this node) and exercises read_fastx in the shape stage_local_fasta /
-# reference_load use; the goal is "this node runs a current, usable miint", not
-# any single function or parameter. chr(10) builds the FASTA's newlines because
-# writing a backslash-n escape in this comment would itself be expanded by THIS
-# f-string into a real newline in the generated script (which previously split
-# this comment and left an unmatched backtick, aborting bash at parse time), so
-# chr(10) sidesteps it. A bash -n regression test now guards the whole script.
+# miint must LOAD on the compute node from the deploy-staged
+# MIINT_EXTENSION_DIRECTORY (no per-job install/download), and the core ingest
+# call the jobs issue (read_fastx) must run. A forgotten/failed deploy stage, a
+# wrong DuckDB version in the staged dir, or an otherwise-broken build fails the
+# real job — catch it here, at deploy, not at the first reference-load job.
+# LOAD-only mirrors exactly what the native jobs do (see open_miint_conn), and
+# exercises read_fastx in the shape stage_local_fasta / reference_load use; the
+# goal is "this node LOADs a current, usable staged miint". chr(10) builds the
+# FASTA's newlines because writing a backslash-n escape in this comment would
+# itself be expanded by THIS f-string into a real newline in the generated
+# script (which previously split this comment and left an unmatched backtick,
+# aborting bash at parse time), so chr(10) sidesteps it. A bash -n regression
+# test now guards the whole script.
 MIINT_PROBE="$(mktemp)"
 cat > "$MIINT_PROBE" <<'PYEOF'
-import os, tempfile, duckdb
-from qiita_common.duckdb_miint import miint_connect_config, miint_install_sql
-fa = os.path.join(tempfile.gettempdir(), "qiita-readiness-probe.fasta")
-with open(fa, "w") as fh:
-    fh.write(">r" + chr(10) + "ACGT" + chr(10))
-conn = duckdb.connect(":memory:", config=miint_connect_config())
-conn.execute(miint_install_sql())
-conn.execute("LOAD miint;")
-conn.execute("SELECT read_id FROM read_fastx(?, max_batch_bytes:='64MB')", [fa]).fetchall()
+import sys
+try:
+    import os, tempfile, duckdb
+    from qiita_common.duckdb_miint import miint_connect_config, miint_load_sql
+    fa = os.path.join(tempfile.gettempdir(), "qiita-readiness-probe.fasta")
+    with open(fa, "w") as fh:
+        fh.write(">r" + chr(10) + "ACGT" + chr(10))
+    conn = duckdb.connect(":memory:", config=miint_connect_config())
+    conn.execute(miint_load_sql())
+    conn.execute("SELECT read_id FROM read_fastx(?, max_batch_bytes:='64MB')", [fa]).fetchall()
+except Exception as exc:
+    # Collapse to one line (the parent parses one check per line) and cap length;
+    # the message is what turns an opaque `=fail` into the actual reason —
+    # ImportError, a DuckDB catalog/IO error, an unreachable mirror, etc.
+    # chr(10)/chr(13) (not a backslash escape) keeps this clear of the enclosing
+    # f-string's newline expansion.
+    msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
+    print(msg[:500])
+    sys.exit(1)
 PYEOF
-if "$PYTHON" "$MIINT_PROBE" >/dev/null 2>&1; then
+# Capture the probe's stdout (the one-line error above on failure); drop stderr
+# noise. The previous `>/dev/null 2>&1` discarded the reason entirely, which is
+# why a broken deploy reported a bare `=fail` with nothing to act on.
+if MIINT_ERR="$("$PYTHON" "$MIINT_PROBE" 2>/dev/null)"; then
     echo "{_PROBE_LINE_PREFIX} miint-read-fastx=ok"
 else
-    echo "{_PROBE_LINE_PREFIX} miint-read-fastx=fail"
+    echo "{_PROBE_LINE_PREFIX} miint-read-fastx=fail err=$MIINT_ERR"
 fi
 rm -f "$MIINT_PROBE"
 
 # `sequence_split` is the native chunker stage_local_fasta / reference_load rely
 # on (it replaced the O(L^2) list_transform/substring SQL macro; duckdb-miint
-# #121 / DuckDB #23229). It is NEWER than read_fastx, so a mirror still serving
-# an older build passes the read_fastx probe above but FAILS here — exactly the
-# stale-build case this probe exists to catch at deploy, not at the first
-# reference-load job. Separate install+load so this stands alone if the read
-# probe's tempfile was already cleaned.
+# #121 / DuckDB #23229). It is NEWER than read_fastx, so a staged build that
+# predates it passes the read_fastx probe above but FAILS here — exactly the
+# stale-stage case this probe exists to catch at deploy, not at the first
+# reference-load job. Separate load so this stands alone if the read probe's
+# tempfile was already cleaned.
 MIINT_SPLIT_PROBE="$(mktemp)"
 cat > "$MIINT_SPLIT_PROBE" <<'PYEOF'
-import duckdb
-from qiita_common.duckdb_miint import miint_connect_config, miint_install_sql
-conn = duckdb.connect(":memory:", config=miint_connect_config())
-conn.execute(miint_install_sql())
-conn.execute("LOAD miint;")
-rows = conn.execute("SELECT UNNEST(sequence_split('ACGTACGT', 4))").fetchall()
-assert len(rows) == 2, rows
+import sys
+try:
+    import duckdb
+    from qiita_common.duckdb_miint import miint_connect_config, miint_load_sql
+    conn = duckdb.connect(":memory:", config=miint_connect_config())
+    conn.execute(miint_load_sql())
+    rows = conn.execute("SELECT UNNEST(sequence_split('ACGTACGT', 4))").fetchall()
+    assert len(rows) == 2, rows
+except Exception as exc:
+    msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
+    print(msg[:500])
+    sys.exit(1)
 PYEOF
-if "$PYTHON" "$MIINT_SPLIT_PROBE" >/dev/null 2>&1; then
+if MIINT_ERR="$("$PYTHON" "$MIINT_SPLIT_PROBE" 2>/dev/null)"; then
     echo "{_PROBE_LINE_PREFIX} miint-sequence-split=ok"
 else
-    echo "{_PROBE_LINE_PREFIX} miint-sequence-split=fail"
+    echo "{_PROBE_LINE_PREFIX} miint-sequence-split=fail err=$MIINT_ERR"
 fi
 rm -f "$MIINT_SPLIT_PROBE"
 
@@ -365,6 +385,11 @@ def build_probe_submit_payload(
         "QIITA_NATIVE_PYTHON": settings.slurm.native_python,
         "PATH_SCRATCH": settings.path_scratch,
     }
+    # miint is pre-staged into MIINT_EXTENSION_DIRECTORY at deploy; the probe
+    # LOADs from there exactly like the native jobs do. `miint_job_env()` is the
+    # single source for which miint vars a remote job needs — SlurmBackend feeds
+    # its real jobs from the same helper, so probe and jobs can't drift.
+    env.update(miint_job_env())
     if settings.cp_url:
         env["QIITA_CP_URL"] = settings.cp_url
     if settings.co_to_cp_token:

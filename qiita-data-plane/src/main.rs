@@ -7,6 +7,7 @@ mod auth;
 mod config;
 mod ducklake;
 mod flight_service;
+mod miint;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -82,6 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::config::Settings;
+    use super::miint;
     use base64::Engine;
     use duckdb::Connection;
     use serial_test::serial;
@@ -201,10 +203,38 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn miint_extension_smoke() {
-        let conn = Connection::open_in_memory().expect("open in-memory DuckDB");
-        conn.execute_batch("INSTALL miint FROM community; LOAD miint;")
-            .expect("failed to install/load miint extension");
+        // The data plane uses a SINGLE deploy-staged miint build: production
+        // LOADs it from MIINT_EXTENSION_DIRECTORY and never installs its own
+        // (two drifting builds is the nightmare we avoid). `cargo test` has no
+        // deploy stage, so this test plays both roles against a stable per-suite
+        // dir: it STAGES once (the deploy's INSTALL from the team mirror), then
+        // opens a FRESH connection through the production helpers
+        // (miint::miint_config + miint::load_miint) and LOAD-only's — exercising
+        // exactly the path future DP code will use. The dir is stable (not a
+        // fresh tempdir) so the install caches across runs, mirroring the Python
+        // suites' setup_miint_test_env.
+        let _snapshot = EnvSnapshot::capture(&["MIINT_EXTENSION_DIRECTORY"]);
+        let ext_dir = std::env::temp_dir().join("qiita-data-plane-duckdb-ext");
+        std::fs::create_dir_all(&ext_dir).expect("create staged extension dir");
+        std::env::set_var("MIINT_EXTENSION_DIRECTORY", &ext_dir);
+
+        // Stage (the deploy's role): INSTALL the team-mirror build into the dir.
+        {
+            let staging =
+                Connection::open_in_memory_with_flags(miint::miint_config().expect("miint config"))
+                    .expect("open staging connection");
+            staging
+                .execute_batch(&format!("INSTALL miint FROM '{}';", miint::miint_repo()))
+                .expect("stage miint from the team mirror");
+        }
+
+        // Runtime (production's role): open through the same config and LOAD-only.
+        let conn =
+            Connection::open_in_memory_with_flags(miint::miint_config().expect("miint config"))
+                .expect("open runtime connection");
+        miint::load_miint(&conn).expect("LOAD the staged miint");
         let mut stmt = conn
             .prepare("SELECT count(*) FROM miint_versions()")
             .expect("failed to prepare miint_versions() query");

@@ -105,8 +105,8 @@ from ..miint import (
     PARQUET_OPTS,
     PARQUET_OPTS_INTERMEDIATE,
     apply_duckdb_settings,
-    ensure_miint_installed,
     open_conn,
+    open_miint_conn,
 )
 from ..sequence_range import (
     PrepSampleNotEligibleForSequenceRange,
@@ -226,20 +226,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         read_fastx_clause = "read_fastx(?)"
         read_fastx_args = [str(inputs.fastq_path)]
 
-    await ensure_miint_installed()
-
     try:
         # FASTQ -> intermediate Parquet. Empty inputs were rejected as
         # BAD_INPUT above, so read_fastx is guaranteed to have at least
         # one record here.
-        with open_conn() as conn:
+        with open_miint_conn() as conn:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
                 memory_gb=_DUCKDB_MEMORY_GB,
                 threads=_DUCKDB_THREADS,
             )
-            conn.execute("LOAD miint;")
             # `sequence_index` (miint's 1-based per-file row index) is
             # carried through the intermediate so the sequence_idx rewrite
             # below can compute `sequence_index + start - 1` without a

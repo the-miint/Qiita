@@ -290,6 +290,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_study_create.add_argument("--abstract")
     p_study_create.add_argument("--funding")
     p_study_create.add_argument("--ena-study-accession")
+    p_study_create.add_argument("--bioproject-accession")
     p_study_create.add_argument("--notes")
     p_study_create.add_argument(
         "--principal-investigator-idx",
@@ -330,6 +331,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_study_patch.add_argument("--abstract")
     p_study_patch.add_argument("--funding")
     p_study_patch.add_argument("--ena-study-accession")
+    p_study_patch.add_argument("--bioproject-accession")
     p_study_patch.add_argument("--notes")
     p_study_patch.add_argument("--extra-metadata", help="Free-form JSON object stored as JSONB")
     p_study_patch.set_defaults(
@@ -1162,10 +1164,10 @@ def _read_preflight_rows(
     primary_project_accession) raise via parser.error so the CLI
     surfaces a single stderr line and exits 2 before any network call.
     """
-    from run_preflight import get_illumina_sample_info  # noqa: PLC0415
+    from run_preflight import get_illumina_sample_info, open_db_file  # noqa: PLC0415
 
     try:
-        conn = sqlite3.connect(f"file:{preflight_blob}?mode=ro", uri=True)
+        conn = open_db_file(preflight_blob)
     except sqlite3.DatabaseError as exc:
         parser.error(f"--preflight-blob {preflight_blob}: not a readable SQLite file: {exc}")
     try:

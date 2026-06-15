@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Literal, get_args
 
 import asyncpg
-from qiita_common.models import Tier
+from qiita_common.models import BiosampleAccessionField, Tier
 
 from . import require_transaction, update_row
 from ._sample_helpers import (
@@ -212,7 +212,10 @@ async def fetch_biosample_idxs_for_study(
     return [r["biosample_idx"] for r in rows]
 
 
-BiosampleLookupKey = Literal["biosample_accession", "matrix_tube_id"]
+# The natural-key columns a biosample lookup may key on: the two wire-facing
+# accession columns plus matrix_tube_id. Deriving from BiosampleAccessionField
+# keeps the accession set defined once, in qiita_common.models.
+BiosampleLookupKey = Literal[*get_args(BiosampleAccessionField), "matrix_tube_id"]
 
 
 async def fetch_biosample_idxs_by_natural_key(

@@ -45,7 +45,7 @@ import duckdb
 from pydantic import BaseModel
 
 from ..config import get_settings
-from ..miint import apply_duckdb_settings, ensure_miint_installed, open_conn
+from ..miint import apply_duckdb_settings, open_miint_conn
 
 YAML_STEP_NAME = "build_rype_index"
 
@@ -158,12 +158,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     duckdb_tmp = workspace / ".duckdb_tmp"
     duckdb_tmp.mkdir(parents=True, exist_ok=True)
 
-    await ensure_miint_installed()
-    with open_conn() as conn:
+    with open_miint_conn() as conn:
         apply_duckdb_settings(
             conn, duckdb_tmp, memory_gb=_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS
         )
-        conn.execute("LOAD miint;")
         # Non-temp view/table so rype's separate bind/execute connection can
         # resolve them by name. DuckDB rejects prepared parameters inside
         # CREATE VIEW, so the path is inlined (quote-escaped — it's a

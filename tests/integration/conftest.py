@@ -52,15 +52,33 @@ from qiita_control_plane.testing.sessions import (  # noqa: F401
 )
 
 # Integration tests run native orchestrator jobs (hash_sequences,
-# stage_local_fasta, reference_load) in-process via LocalBackend, which install
-# + load the miint extension. Point those installs at the team mirror and a
-# per-suite private extension directory — same as the control-plane and
-# orchestrator conftests — so a mirror-origin extension cached in the shared
-# default `~/.duckdb/extensions` (e.g. from the data plane) doesn't collide with
-# a community-origin INSTALL here ("origin is different" / FORCE INSTALL). Set at
+# stage_local_fasta, reference_load) in-process via LocalBackend, which LOAD the
+# pre-staged miint extension (open_miint_conn — LOAD-only, like production).
+# Point the install at the team mirror and a per-suite private extension
+# directory — same as the control-plane and orchestrator conftests — then stage
+# once into it (`_stage_miint_extension` below), mirroring the deploy. Set at
 # module load (before any test/fixture connects); the env is read at DuckDB
 # connect() time, so placement after the import block is correct.
 setup_miint_test_env("integration")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _stage_miint_extension():
+    """Stage miint once into the per-suite extension dir so the LOAD-only job
+    paths (`open_miint_conn`) work — the integration mirror of the deploy stage.
+    Plain INSTALL (not the deploy's FORCE) so the stable temp dir caches across
+    runs. Kept in step with qiita-compute-orchestrator/tests/conftest.py's
+    identical fixture."""
+    import duckdb
+    from qiita_common.duckdb_miint import (
+        miint_connect_config,
+        miint_install_sql,
+        miint_load_sql,
+    )
+
+    with duckdb.connect(":memory:", config=miint_connect_config()) as conn:
+        conn.execute(miint_install_sql())
+        conn.execute(miint_load_sql())
 
 POSTGRES_URL = resolve_postgres_url()
 REPO_ROOT = Path(__file__).parent.parent.parent

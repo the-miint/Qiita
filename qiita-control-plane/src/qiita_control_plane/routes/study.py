@@ -70,6 +70,7 @@ _MSG_BAD_OWNER_NOT_USER = "owner_idx must reference a user-kind principal"
 # through to _GENERIC_UNIQUE_VIOLATION.
 _UNIQUE_VIOLATION_MESSAGES: dict[str, str] = {
     "study_ena_study_accession_unique": "ena_study_accession already in use",
+    "study_bioproject_accession_unique": "bioproject_accession already in use",
 }
 _GENERIC_UNIQUE_VIOLATION = "conflicts with an existing study"
 
@@ -97,6 +98,7 @@ def _study_response_from_row(row: asyncpg.Record) -> StudyResponse:
             "abstract": row["abstract"],
             "funding": row["funding"],
             "ena_study_accession": row["ena_study_accession"],
+            "bioproject_accession": row["bioproject_accession"],
             "notes": row["notes"],
             "last_submission_at": row["last_submission_at"],
             "submission_error": row["submission_error"],
@@ -158,6 +160,7 @@ async def create_study_route(
                 abstract=body.abstract,
                 funding=body.funding,
                 ena_study_accession=body.ena_study_accession,
+                bioproject_accession=body.bioproject_accession,
                 notes=body.notes,
                 extra_metadata=body.extra_metadata,
                 default_tier=body.default_tier,
@@ -328,7 +331,8 @@ async def lookup_study_by_accession(
     user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.STUDY_READ)),
 ) -> StudyLookupByAccessionResponse:
-    """Resolve a list of ena_study_accession values to study_idx.
+    """Resolve a list of study accession values to study_idx, keyed on the
+    column named by `body.accession_field` (default bioproject_accession).
 
     POST (not GET) so a long accession list rides in the body rather
     than tripping nginx's default URL-line cap.
@@ -345,6 +349,8 @@ async def lookup_study_by_accession(
     _ = user
     resolved, missing = await resolve_idxs_by_natural_key(
         values=body.accessions,
-        fetcher=lambda values: fetch_study_idxs_by_accession(pool, values=values),
+        fetcher=lambda values: fetch_study_idxs_by_accession(
+            pool, values=values, accession_field=body.accession_field
+        ),
     )
     return StudyLookupByAccessionResponse(resolved=resolved, missing=missing)
