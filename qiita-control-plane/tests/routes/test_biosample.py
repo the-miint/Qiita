@@ -14,6 +14,7 @@ no-access-row and the below-admin-tier cases.
 import secrets
 from datetime import date
 from decimal import Decimal
+from typing import get_args
 
 import pytest
 import pytest_asyncio
@@ -26,7 +27,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
-from qiita_common.models import FieldDataType
+from qiita_common.models import BiosampleAccessionField, FieldDataType
 
 from qiita_control_plane.testing.db_seeds import (
     fetch_seeded_metagenome_term,
@@ -2331,11 +2332,22 @@ async def test_patch_biosample_unknown_metadata_checklist_name_422(ctx):
 # enforcement still applies to GET /biosample/{idx}.
 
 
-async def _seed_biosample_with_accession(ctx, *, accession: str, owner_idx: int) -> int:
-    """Seed a non-retired biosample carrying the given accession; track for
-    cleanup and return its idx."""
+async def _seed_biosample_with_accession(
+    ctx,
+    *,
+    accession: str,
+    owner_idx: int,
+    field: BiosampleAccessionField = "biosample_accession",
+) -> int:
+    """Seed a non-retired biosample carrying `accession` in the named
+    accession column (default biosample_accession); track for cleanup and
+    return its idx."""
+    if field not in get_args(BiosampleAccessionField):
+        raise ValueError(f"invalid biosample accession field: {field!r}")
+    # Column name is interpolated because Postgres can't parameter-bind
+    # identifiers; the guard above pins it to the accession-column set.
     idx = await ctx["pool"].fetchval(
-        "INSERT INTO qiita.biosample (owner_idx, created_by_idx, biosample_accession)"
+        f"INSERT INTO qiita.biosample (owner_idx, created_by_idx, {field})"
         " VALUES ($1, $1, $2) RETURNING idx",
         owner_idx,
         accession,
@@ -2364,6 +2376,26 @@ async def test_lookup_by_accession_returns_resolved_map_and_missing_list(ctx):
         "resolved": {acc_a: bs_a, acc_b: bs_b},
         "missing": [acc_missing],
     }
+
+
+async def test_lookup_by_accession_resolves_by_ena_sample_accession_when_specified(ctx):
+    # accession_field selects the ena_sample_accession column: a biosample
+    # seeded with that column resolves under the selector, while one seeded
+    # only with biosample_accession does not and is reported missing.
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    ena_acc = unique_accession("LOOKUP-ENA")
+    bs_acc = unique_accession("LOOKUP-BS-ONLY")
+    ena_bs = await _seed_biosample_with_accession(
+        ctx, accession=ena_acc, owner_idx=owner_idx, field="ena_sample_accession"
+    )
+    await _seed_biosample_with_accession(ctx, accession=bs_acc, owner_idx=owner_idx)
+
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
+        json={"accessions": [ena_acc, bs_acc], "accession_field": "ena_sample_accession"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"resolved": {ena_acc: ena_bs}, "missing": [bs_acc]}
 
 
 async def test_lookup_by_accession_dedups_input_preserving_order(ctx):
@@ -2465,6 +2497,18 @@ async def test_lookup_by_accession_rejects_extra_field_422(ctx):
     resp = await ctx["wet"].post(
         URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
         json={"accessions": ["SAMN00000001"], "unknown": "x"},
+    )
+    assert resp.status_code == 422
+
+
+async def test_lookup_by_accession_rejects_invalid_accession_field_422(ctx):
+    # accession_field outside BiosampleAccessionField is rejected by the
+    # Literal at the wire boundary with 422 before any DB work runs;
+    # matrix_tube_id is a lookup key but not an accession column, so it is
+    # out of set here.
+    resp = await ctx["wet"].post(
+        URL_BIOSAMPLE_LOOKUP_BY_ACCESSION,
+        json={"accessions": ["SAMN00000001"], "accession_field": "matrix_tube_id"},
     )
     assert resp.status_code == 422
 

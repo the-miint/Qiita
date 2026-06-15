@@ -16,10 +16,22 @@ the `no-changelog` label).
 ### Added
 
 - New nullable `bioproject_accession` column on the study table (unique
-  when present), reserved for future NCBI/ENA BioProject tracking. Schema
-  only — not yet exposed through the API, repository, or CLI (#87)
+  when present), for NCBI/ENA BioProject tracking (#87)
+- Exposed study `bioproject_accession` through create, get, and patch: the
+  REST request/response field and the `qiita study create`/`patch`
+  `--bioproject-accession` flag (#91)
+- The study and biosample lookup-by-accession endpoints accept an
+  `accession_field` selector so a caller can resolve by either accession
+  column (study: `ena_study_accession` or `bioproject_accession`; biosample:
+  `biosample_accession` or `ena_sample_accession`) (#91)
 
 ### Changed
+
+- The study lookup-by-accession default is now `bioproject_accession`
+  (was `ena_study_accession`): callers omitting `accession_field` resolve
+  against the BioProject column. This aligns the `qiita submit-bcl-convert`
+  preflight, whose project accessions are BioProject identifiers, with the
+  column it actually matches (#91)
 
 - The bcl-convert flow now derives the instrument run ID and model from the
   run folder's top-level `RunInfo.xml` (`Run@Id` plus the `Instrument` serial number
