@@ -91,7 +91,9 @@ def test_host_filter_smoke_minimap2_only(tmp_path, write_reads, read_survivors):
 
 def test_host_filter_smoke_both_pe_and_reproducible(tmp_path, write_reads, read_survivors):
     """Full two-stage path on paired-end reads: a host pair drops, a clean pair
-    survives, and the surviving set is identical across two independent runs."""
+    survives, the surviving set is identical across two independent runs — and a
+    pair that is host ONLY in R2 (clean R1) still drops, proving the tools read
+    `sequence2` natively rather than us flattening mates."""
     from qiita_compute_orchestrator.jobs import host_filter
 
     ryxdi, mmi = _build_indexes(tmp_path)
@@ -100,6 +102,7 @@ def test_host_filter_smoke_both_pe_and_reproducible(tmp_path, write_reads, read_
         [
             (10, "host_pair", _HOST_READ, _HOST_READ),
             (20, "clean_pair", _CLEAN_READ, _CLEAN_READ),
+            (30, "r2_host_pair", _CLEAN_READ, _HOST_READ),  # host only in R2
         ],
     )
     inputs = host_filter.Inputs(
@@ -111,5 +114,6 @@ def test_host_filter_smoke_both_pe_and_reproducible(tmp_path, write_reads, read_
     )
     out1 = asyncio.run(host_filter.execute(inputs, tmp_path / "ws1"))
     out2 = asyncio.run(host_filter.execute(inputs, tmp_path / "ws2"))
+    # 10 (both host) and 30 (host in R2 only) drop; 20 (both clean) survives.
     assert read_survivors(out1["filtered_reads"]) == [20]
     assert read_survivors(out2["filtered_reads"]) == read_survivors(out1["filtered_reads"])

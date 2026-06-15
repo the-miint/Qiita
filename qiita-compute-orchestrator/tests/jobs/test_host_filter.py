@@ -104,8 +104,9 @@ def test_host_filter_drops_rype_union_minimap2(tmp_path, monkeypatch, write_read
 
     assert read_survivors(out["filtered_reads"]) == [20, 40]
     assert _schema(out["filtered_reads"]) == _READS_SCHEMA
-    # rype saw every mate (both mates of each pair + the single-end read).
-    assert seen["rype_query_ids"] == [10, 10, 20, 20, 30, 30, 40]
+    # rype saw one query row per pair (both mates ride sequence1/sequence2; the
+    # tools handle PE natively — no unrolling).
+    assert seen["rype_query_ids"] == [10, 20, 30, 40]
     assert seen["threshold"] == host_filter._RYPE_THRESHOLD
     # Two-stage: minimap2's query is rype's survivors — 10 excluded.
     assert 10 not in seen["mm2_query_ids"]
@@ -128,10 +129,12 @@ def test_host_filter_pe_pair_drop_either_mate(tmp_path, monkeypatch, write_reads
     )
 
     def fake_rype(conn, index_path, sequence_table, dest_table, *, threshold):
-        # Flag the sequence_idx of any mate row whose sequence is the host motif.
+        # rype reads BOTH mates natively, so flag the pair when EITHER mate
+        # carries the host motif (sequence1=R1, sequence2=R2 in one query row).
         conn.execute(
             f"INSERT INTO {dest_table} "
-            f"SELECT DISTINCT read_id FROM {sequence_table} WHERE sequence1 = 'HOST'"
+            f"SELECT read_id FROM {sequence_table} "
+            "WHERE sequence1 = 'HOST' OR sequence2 = 'HOST'"
         )
 
     monkeypatch.setattr(host_filter, "_run_rype_classify", fake_rype)

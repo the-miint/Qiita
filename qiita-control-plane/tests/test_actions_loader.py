@@ -240,12 +240,12 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
     assert build.inputs == ["reference_sequence_chunks"]
     assert build.outputs == ["rype_index_path", "rype_index_meta"]
 
-    # The minimap2 builder consumes the resolved upload fasta_path (chunked
-    # upload.parquet → upload mode), NOT the moved staging chunks.
+    # The minimap2 builder consumes the SAME feature-keyed chunks as the rype
+    # builder (reassembled into whole contigs), not a raw-FASTA side channel.
     mm2 = next(s for s in host.steps if s.name == "build_minimap2_index")
     assert mm2.module == "qiita_compute_orchestrator.jobs.build_minimap2_index"
     assert mm2.container is None
-    assert mm2.inputs == ["fasta_path"]
+    assert mm2.inputs == ["reference_sequence_chunks"]
     assert mm2.outputs == ["minimap2_index_path", "minimap2_index_meta"]
 
     # The load step re-exposes the feature-keyed chunks under its own binding so
@@ -402,14 +402,15 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
     stage = next(s for s in local_host.steps if s.name == "stage_local_fasta")
     assert stage.module == "qiita_compute_orchestrator.jobs.stage_local_fasta"
     assert stage.inputs == ["fasta_manifest_path"]
-    # Emits the combined chunked parquet AND the minimap2-tagged subset manifest.
-    assert stage.outputs == ["fasta_path", "minimap2_fasta_manifest"]
+    # Emits only the combined chunked parquet; the index builders consume the
+    # feature-keyed chunks the load step re-emits (no minimap2-specific subset).
+    assert stage.outputs == ["fasta_path"]
 
-    # The local minimap2 builder consumes the tagged-subset manifest (raw FASTA
-    # → local mode), distinct from the upload path's fasta_path.
+    # The local minimap2 builder consumes the same feature-keyed chunks as the
+    # rype builder, identical to the upload path.
     mm2 = next(s for s in local_host.steps if s.name == "build_minimap2_index")
     assert mm2.module == "qiita_compute_orchestrator.jobs.build_minimap2_index"
-    assert mm2.inputs == ["minimap2_fasta_manifest"]
+    assert mm2.inputs == ["reference_sequence_chunks"]
     assert mm2.outputs == ["minimap2_index_path", "minimap2_index_meta"]
 
     # Taxonomy required (the rype mapping authority), same as host-reference-add.

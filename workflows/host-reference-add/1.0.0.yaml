@@ -95,15 +95,16 @@ steps:
       walltime: PT2H
 
   # Sidecar minimap2 `.mmi` for the second-pass host filter, written to
-  # {PATH_DERIVED}/references/{reference_idx}/minimap2/index.mmi. Reads the
-  # RAW uploaded fasta (resolved `fasta_path` = chunked upload.parquet, upload
-  # mode) — NOT the moved staging chunks — so it has no register-files ordering
-  # dependency; grouped with build_rype_index for clarity. No target_status:
-  # the reference is already `indexing` from build_rype_index above.
+  # {PATH_DERIVED}/references/{reference_idx}/minimap2/index.mmi. Consumes the
+  # SAME feature-keyed `reference_sequence_chunks` as build_rype_index
+  # (reassembling whole contigs via string_agg) — no special raw-FASTA side
+  # channel — so it shares the register-files ordering dependency: it MUST also
+  # precede register-files (which MOVES those chunks). No target_status: the
+  # reference is already `indexing` from build_rype_index above.
   - step: build_minimap2_index
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.build_minimap2_index
-    inputs: [fasta_path]
+    inputs: [reference_sequence_chunks]
     outputs: [minimap2_index_path, minimap2_index_meta]
     baseline_resources:
       cpu: 4

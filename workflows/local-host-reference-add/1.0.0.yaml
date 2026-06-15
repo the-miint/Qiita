@@ -6,8 +6,8 @@ description: >
   Local-ingest variant of host-reference-add. Stages MANY host-resident FASTA
   files (a manifest of absolute paths) into one chunked Parquet, then runs the
   host pipeline unchanged: hash + mint + load (taxonomy required), build the two
-  host-filter indexes (a rype `.ryxdi` over every feature + a minimap2 `.mmi`
-  over the trailing-TAB `minimap2`-tagged FASTA subset), and record both in
+  host-filter indexes (a rype `.ryxdi` and a minimap2 `.mmi`, both over every
+  feature), and record both in
   qiita.reference_index. They are consumed at host-read-filtering time by the
   host_filter step: rype classify (host = any match), then minimap2 on the
   survivors; reads matching either are removed. Differs from local-reference-add
@@ -49,10 +49,10 @@ steps:
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.stage_local_fasta
     inputs: [fasta_manifest_path]
-    # fasta_path = combined chunked parquet (all files) for hash_sequences;
-    # minimap2_fasta_manifest = the `\tminimap2`-tagged subset for the
-    # build_minimap2_index step below (raw FASTA, local mode).
-    outputs: [fasta_path, minimap2_fasta_manifest]
+    # fasta_path = combined chunked parquet (all files) for hash_sequences. The
+    # host-filter index builds consume the feature-keyed chunks the `load` step
+    # re-emits, so there is no minimap2-specific subset here.
+    outputs: [fasta_path]
     baseline_resources:
       cpu: 4
       mem_gb: 8
@@ -113,15 +113,16 @@ steps:
       walltime: PT2H
 
   # Sidecar minimap2 `.mmi` for the second-pass host filter, written to
-  # {PATH_DERIVED}/references/{reference_idx}/minimap2/index.mmi. Reads the
-  # `\tminimap2`-tagged RAW FASTA subset stage_local_fasta emitted as
-  # minimap2_fasta_manifest (local mode) — NOT the moved staging chunks — so it
-  # has no register-files ordering dependency. No target_status: the reference
+  # {PATH_DERIVED}/references/{reference_idx}/minimap2/index.mmi. Consumes the
+  # SAME feature-keyed `reference_sequence_chunks` as build_rype_index
+  # (reassembling whole contigs via string_agg) — no special raw-FASTA subset —
+  # so it shares the register-files ordering dependency: it MUST also precede
+  # register-files (which MOVES those chunks). No target_status: the reference
   # is already `indexing` from build_rype_index above.
   - step: build_minimap2_index
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.build_minimap2_index
-    inputs: [minimap2_fasta_manifest]
+    inputs: [reference_sequence_chunks]
     outputs: [minimap2_index_path, minimap2_index_meta]
     baseline_resources:
       cpu: 4

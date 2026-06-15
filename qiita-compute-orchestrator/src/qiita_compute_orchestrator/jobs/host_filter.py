@@ -14,32 +14,39 @@ Two-stage host filter, locked with the design:
 The drop set is the union; minimap2 runs on the reads rype didn't already flag,
 so the two indexes never re-examine the same read.
 
-**Paired-end: drop the whole pair if either mate is flagged by either tool.**
-This falls out of the keying: both mates of a pair carry one `sequence_idx`, so
-we unroll R1/R2 into a `mates` relation keyed by `sequence_idx` (passed to the
-tools AS `read_id` — miint accepts a BIGINT id), classify/align each mate
-independently, and DISTINCT the flagged `sequence_idx`. Either mate hitting puts
-the shared `sequence_idx` in the drop set.
+**Paired-end is handled natively, not by flattening.** A row of `reads.parquet`
+is one read pair: `sequence1`/`sequence2` are R1/R2 under a single minted
+`sequence_idx`. We pass that pair straight to the tools as
+`(read_id := sequence_idx, sequence1, sequence2)` — `rype_classify` reads BOTH
+mates' k-mers and `align_minimap2` aligns the pair in proper PE mode (it sets the
+mate/template-length SAM fields). Either mate matching the host flags the read's
+single `sequence_idx`, so "drop the whole pair if either mate hits" falls out
+without ever moving R2 into an R1 slot. Single-end reads simply have
+`sequence2 IS NULL`, which both tools tolerate.
 
 Gating: when neither index path is bound (host filtering disabled) this is a
 pass-through copy. A fully host-contaminated sample is valid — the output is an
 empty (0-row) but well-formed Parquet, not an error.
 
-miint contracts (qiita-verified against the team-mirror build; see
+miint contracts (qiita-verified against the team-mirror build via the smoke; see
 docs/duckdb-miint.md):
   - `rype_classify(index_path, sequence_table, [id_column='read_id'],
-    [threshold=0.1], [negative_index])` → one row per HOST read with columns
-    `(read_id, bucket_id, bucket_name, score)`. The id codec round-trips a BIGINT
-    id losslessly; pre-`duckdb-miint#126` it emits `read_id` as VARCHAR, #126+
-    mirrors the input BIGINT — the explicit CAST normalizes both to BIGINT. (The
-    `mates` view feeds a real BIGINT `read_id`, which #126's tightened
-    `{VARCHAR,BIGINT,UUID}` id-type check accepts.)
-  - `align_minimap2(query_table, [index_path], [preset], ...)` → SAM-like rows
-    (`read_id, flags, reference, ...`); `read_id` stays BIGINT. Any row = a hit.
-Both read a `sequence1` column off the query/sequence table and resolve the
-table by NAME on a SEPARATE connection during bind/execute — so `mates` /
-`survivors` are non-temp VIEWs and the host-id accumulators are non-temp TABLEs
-(TEMP tables / CTEs are not visible to that connection; see docs/duckdb-miint.md).
+    [threshold=0.1], [negative_index])` → one row per HOST read (≤1 per read, so
+    no DISTINCT needed) with columns `(read_id, bucket_id, bucket_name, score)`.
+    It reads `sequence1` and (when present) `sequence2`. **On the current mirror
+    build it returns `read_id` as VARCHAR even for a BIGINT input** (duckdb-miint
+    #126's input-type round-trip is not in the mirror yet), so the CAST back to
+    BIGINT is load-bearing, not merely defensive — it normalizes either build.
+  - `align_minimap2(query_table, [index_path], [preset], [max_secondary], ...)` →
+    SAM-like rows (`read_id, flags, reference, ...`); `read_id` round-trips as
+    BIGINT (no cast). It reads `sequence1`/`sequence2` and emits one row per mate
+    (plus secondaries), so we pass `max_secondary := 0` and DISTINCT the
+    `read_id` to collapse a pair's rows to its single `sequence_idx`. Any
+    surviving row = a hit.
+Both resolve the query/sequence table by NAME on a SEPARATE connection during
+bind/execute — so the query / survivors relations are non-temp VIEWs and the
+host-id accumulators are non-temp TABLEs (TEMP tables / CTEs are not visible to
+that connection; see docs/duckdb-miint.md).
 """
 
 from __future__ import annotations
@@ -54,7 +61,7 @@ from ..miint import PARQUET_OPTS, apply_duckdb_settings, open_miint_conn
 
 YAML_STEP_NAME = "host_filter"
 
-# DuckDB stages the (streamed) mate VIEWs, the small host-id accumulators, and
+# DuckDB stages the (streamed) query VIEW, the small host-id accumulators, and
 # the final sorted COPY; the rype / minimap2 runtimes hold the indexes
 # out-of-heap. Literals mirror the fastq-to-parquet/1.1.0 YAML's host_filter
 # baseline_resources (a mismatch is visible at review). Genome-scale host-index
@@ -72,10 +79,10 @@ _RYPE_THRESHOLD = 0.0
 # preset the `.mmi` was built with (build_minimap2_index).
 _MINIMAP2_PRESET = "sr"
 
-# In-DuckDB relation names. mates/survivors are VIEWs read by miint's separate
+# In-DuckDB relation names. query/survivors are VIEWs read by miint's separate
 # connection; the *_host accumulators are TABLEs (set algebra + always-present
 # union, even when a tool is skipped).
-_MATES = "host_filter_mates"
+_QUERY = "host_filter_query"
 _SURVIVORS = "host_filter_survivors"
 _RYPE_HOST = "host_filter_rype_hits"
 _MM2_HOST = "host_filter_minimap2_hits"
@@ -109,17 +116,19 @@ def _run_rype_classify(
     *,
     threshold: float,
 ) -> None:
-    """Seam around miint's `rype_classify`. Appends the DISTINCT host
-    `sequence_idx` set (reads that matched the positive index) into the
-    pre-created `dest_table`. Isolated so unit tests stub the real classify.
+    """Seam around miint's `rype_classify`. Appends the host `sequence_idx` set
+    (reads that matched the positive index) into the pre-created `dest_table`.
+    Isolated so unit tests stub the real classify.
 
     Positional args (index path, sequence-table NAME) + `threshold` are bound as
     `?` (INSERT...SELECT is DML, so prepared params are accepted here, unlike a
-    CREATE VIEW). The CAST normalizes rype's `read_id` to BIGINT — VARCHAR in
-    builds before `duckdb-miint#126`, the input BIGINT after; either way exact."""
+    CREATE VIEW). rype emits ≤1 row per read, so no DISTINCT is needed. The CAST
+    normalizes rype's `read_id` to BIGINT — the current mirror build returns it
+    as VARCHAR regardless of input type (pre-#126), so the cast is required to
+    join against the BIGINT `sequence_idx`."""
     conn.execute(
         f"INSERT INTO {dest_table} "
-        "SELECT DISTINCT CAST(read_id AS BIGINT) AS sequence_idx "
+        "SELECT CAST(read_id AS BIGINT) AS sequence_idx "
         "FROM rype_classify(?, ?, id_column := 'read_id', threshold := ?)",
         [str(index_path), sequence_table, threshold],
     )
@@ -135,12 +144,14 @@ def _run_align_minimap2(
 ) -> None:
     """Seam around miint's `align_minimap2`. Appends the DISTINCT host
     `sequence_idx` set (reads with any alignment to the host index) into the
-    pre-created `dest_table`. `align_minimap2` keeps `read_id` as BIGINT, so no
-    cast is needed."""
+    pre-created `dest_table`. `align_minimap2` emits one row per mate (plus
+    secondaries) in PE mode, so `max_secondary := 0` drops secondaries and
+    DISTINCT collapses a pair's per-mate rows to its single `sequence_idx`.
+    `read_id` round-trips as BIGINT, so no cast is needed."""
     conn.execute(
         f"INSERT INTO {dest_table} "
         "SELECT DISTINCT read_id AS sequence_idx "
-        "FROM align_minimap2(?, index_path := ?, preset := ?)",
+        "FROM align_minimap2(?, index_path := ?, preset := ?, max_secondary := 0)",
         [query_table, str(index_path), preset],
     )
 
@@ -186,38 +197,37 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 conn, duckdb_tmp, memory_gb=_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS
             )
 
-            # One row per mate, keyed by the shared sequence_idx (passed AS the
-            # tools' read_id). R2 only when present (unpaired → sequence2 NULL).
-            # CREATE VIEW can't take prepared params, so the path is inlined
-            # (quote-escaped — a filesystem path, no other injection surface).
+            # One row per read PAIR, keyed by the shared sequence_idx (passed AS
+            # the tools' read_id), carrying both mates as sequence1/sequence2.
+            # The tools handle PE natively (rype reads both mates; minimap2
+            # aligns the pair). CREATE VIEW can't take prepared params, so the
+            # path is inlined (quote-escaped — a filesystem path, no other
+            # injection surface).
             conn.execute(
-                f"CREATE VIEW {_MATES} AS "
-                f"SELECT sequence_idx AS read_id, sequence1 FROM read_parquet('{reads_sql}') "
-                "UNION ALL "
-                f"SELECT sequence_idx AS read_id, sequence2 AS sequence1 "
-                f"FROM read_parquet('{reads_sql}') "
-                "WHERE sequence2 IS NOT NULL AND length(sequence2) > 0"
+                f"CREATE VIEW {_QUERY} AS "
+                "SELECT sequence_idx AS read_id, sequence1, sequence2 "
+                f"FROM read_parquet('{reads_sql}')"
             )
             # Always-present accumulators (empty when a stage is skipped) so the
-            # survivors view and the final anti-joins reference them
+            # survivors view and the final anti-join reference them
             # unconditionally.
             conn.execute(f"CREATE TABLE {_RYPE_HOST} (sequence_idx BIGINT)")
             conn.execute(f"CREATE TABLE {_MM2_HOST} (sequence_idx BIGINT)")
 
             if inputs.host_rype_path is not None:
                 _run_rype_classify(
-                    conn, inputs.host_rype_path, _MATES, _RYPE_HOST, threshold=_RYPE_THRESHOLD
+                    conn, inputs.host_rype_path, _QUERY, _RYPE_HOST, threshold=_RYPE_THRESHOLD
                 )
 
             if inputs.host_minimap2_path is not None:
-                # Stage 2 sees only the mates rype didn't flag (empty rype set →
-                # all mates). NOT EXISTS, not NOT IN: an anti-join is NULL-safe,
-                # whereas `NOT IN` over a set containing a NULL collapses to
-                # UNKNOWN for every row and would silently drop ALL reads.
+                # Stage 2 sees only the pairs rype didn't flag (empty rype set →
+                # all pairs). An ANTI JOIN is NULL-safe by construction — unlike
+                # `NOT IN`, a stray NULL can't collapse the result to empty.
+                # Carries sequence1/sequence2 so minimap2 still aligns in PE.
                 conn.execute(
-                    f"CREATE VIEW {_SURVIVORS} AS SELECT m.* FROM {_MATES} m "
-                    f"WHERE NOT EXISTS (SELECT 1 FROM {_RYPE_HOST} h "
-                    "WHERE h.sequence_idx = m.read_id)"
+                    f"CREATE VIEW {_SURVIVORS} AS "
+                    f"SELECT q.read_id, q.sequence1, q.sequence2 FROM {_QUERY} q "
+                    f"ANTI JOIN {_RYPE_HOST} h ON h.sequence_idx = q.read_id"
                 )
                 _run_align_minimap2(
                     conn,
@@ -228,17 +238,16 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 )
 
             # Drop = rype ∪ minimap2 (both empty → pass-through). A read survives
-            # only if NEITHER accumulator holds its sequence_idx — two NULL-safe
-            # anti-joins (see the NOT EXISTS note above). ORDER BY keeps the
-            # lake-friendly sorted `sequence_idx` layout fastq_to_parquet wrote
-            # and makes the output deterministic across runs.
+            # only if its sequence_idx is in NEITHER accumulator — one ANTI JOIN
+            # against the unioned drop set (NULL-safe; see the note above). ORDER
+            # BY keeps the lake-friendly sorted `sequence_idx` layout
+            # fastq_to_parquet wrote and makes the output deterministic.
             conn.execute(
                 "COPY (SELECT sequence_idx, read_id, sequence1, qual1, sequence2, qual2 "
                 f"FROM read_parquet('{reads_sql}') r "
-                f"WHERE NOT EXISTS (SELECT 1 FROM {_RYPE_HOST} h "
-                "WHERE h.sequence_idx = r.sequence_idx) "
-                f"  AND NOT EXISTS (SELECT 1 FROM {_MM2_HOST} h "
-                "WHERE h.sequence_idx = r.sequence_idx) "
+                f"ANTI JOIN (SELECT sequence_idx FROM {_RYPE_HOST} "
+                f"           UNION SELECT sequence_idx FROM {_MM2_HOST}) drop_set "
+                "  ON drop_set.sequence_idx = r.sequence_idx "
                 f"ORDER BY sequence_idx) TO '{out_sql}' ({PARQUET_OPTS})"
             )
         success = True

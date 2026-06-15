@@ -19,7 +19,10 @@ the `no-changelog` label).
   from `reads.parquet` in two stages — rype `rype_classify` against a host's
   POSITIVE `.ryxdi` (host = any match, not rype's `negative_index`), then
   minimap2 `align_minimap2` (`preset 'sr'`) on the survivors — dropping any read
-  (or paired-end pair, if either mate hits) flagged by either tool. It's a
+  flagged by either tool. Paired-end is handled natively: a read pair's R1/R2
+  ride one `sequence_idx` as `(sequence1, sequence2)` straight into the tools
+  (`rype_classify` reads both mates; `align_minimap2` aligns the pair in PE
+  mode), so either mate matching drops the whole pair without flattening. It's a
   gated, optional step in a new `fastq-to-parquet/1.1.0` workflow
   (`host_filter_enabled` + `host_reference_idx` context; pass-through when
   disabled; `1.0.0` is kept and the submit route picks the version) (#89)
@@ -28,9 +31,10 @@ the `no-changelog` label).
   `20260612000000_reference_index_minimap2_type`), so a host reference now
   carries BOTH a rype `.ryxdi` and a minimap2 `.mmi`. The `host-reference-add` /
   `local-host-reference-add` workflows gain the minimap2 build + a second
-  `register-index`; on the local path a trailing-TAB `minimap2` flag in the
-  FASTA manifest selects the subset to index (`stage_local_fasta` emits a
-  `minimap2_fasta_manifest`) (#89)
+  `register-index`. Like `build_rype_index`, it consumes the feature-keyed
+  `reference_sequence_chunks` (reassembling whole contigs via `string_agg`), so
+  the minimap2 index is built from the same data-plane bytes as everything else
+  — no raw-FASTA side channel (#89)
 - New nullable `bioproject_accession` column on the study table (unique
   when present), for NCBI/ENA BioProject tracking (#87)
 - Exposed study `bioproject_accession` through create, get, and patch: the
