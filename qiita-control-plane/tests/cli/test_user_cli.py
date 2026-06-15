@@ -1753,11 +1753,12 @@ def _seed_bcl_folder(tmp_path: Path, name: str, *, with_runinfo: bool = True) ->
 def preflight_stub(monkeypatch, tmp_path):
     """Install a fake `run_preflight` module + return a blob-path builder.
 
-    The handler imports `get_illumina_sample_info` from `run_preflight`
-    at call time; the fixture patches `sys.modules["run_preflight"]` so
-    the test controls the function's return value (canned 4-tuples) or
-    its raised exception, without depending on the upstream library
-    being installed or on the SQLite contents matching its schema.
+    The handler imports `open_db_file` and `get_illumina_sample_info`
+    from `run_preflight` at call time; the fixture patches
+    `sys.modules["run_preflight"]` so the test controls the opened
+    connection and the function's return value (canned 4-tuples) or its
+    raised exception, without depending on the upstream library being
+    installed or on the SQLite contents matching its schema.
 
     Returns a callable `_install(rows=None, raises=None) -> Path` that
     writes a non-empty marker blob at `tmp_path/preflight.db` and yields
@@ -1773,6 +1774,10 @@ def preflight_stub(monkeypatch, tmp_path):
         blob = tmp_path / "preflight.db"
         blob.write_bytes(b"\x00stub-preflight-marker")
         stub_module = types.ModuleType("run_preflight")
+        # The handler opens the blob via open_db_file, then passes the
+        # connection to get_illumina_sample_info and closes it; the stub's
+        # connection is a closable placeholder the row-getter ignores.
+        stub_module.open_db_file = lambda _blob: types.SimpleNamespace(close=lambda: None)
         if raises is not None:
             captured_exc = raises
 
