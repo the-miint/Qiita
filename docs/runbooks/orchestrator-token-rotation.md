@@ -1,7 +1,8 @@
 # Orchestrator token rotation
 
-> **Applies today.** The compute orchestrator holds a `compute-worker`
-> service-account PAT at `/etc/qiita/co-to-cp.token`, used for outbound
+> **Applies today.** The compute orchestrator holds a compute
+> service-account PAT (site-chosen principal name; `compute` on the live
+> deploy) at `/etc/qiita/co-to-cp.token`, used for outbound
 > CO→CP callbacks (currently: `POST /sequence-range` from the native
 > `fastq_to_parquet` step). It is provisioned per
 > [`compute-service-account-provisioning.md`](compute-service-account-provisioning.md);
@@ -11,7 +12,7 @@
 
 **Purpose.** Operator runbook for zero-downtime rotation of a
 service-account token used by `ControlPlaneClient` (the compute
-orchestrator's `compute-worker` PAT, plus cron jobs with their own
+orchestrator's compute service-account PAT, plus cron jobs with their own
 service-account PATs). In-flight requests complete with the old
 token; new requests use the new one. Use this for scheduled rotation,
 suspected compromise, or scope changes.
@@ -68,7 +69,7 @@ token file.
 > it lands.
 
 1. **Mint the replacement token** from any host with the admin PAT.
-   This rotates the *orchestrator's* `compute-worker` token; for a
+   This rotates the *orchestrator's* compute service-account token; for a
    cron-job rotation substitute the cron's name + scope set
    accordingly:
 
@@ -77,7 +78,7 @@ token file.
        -H "Authorization: Bearer qk_<ADMIN_PAT>" \
        -H "Content-Type: application/json" \
        -d '{
-         "name": "compute-worker-rot-2026-05-25",
+         "name": "compute-rot-2026-05-25",
          "scopes": ["sequence_range:mint"]
        }'
    ```
@@ -85,10 +86,10 @@ token file.
    Copy the returned `token` and `principal_idx` immediately — the token
    is shown exactly once. Take note of both `principal_idx` values: the
    one returned here is the *new* service account (used in step 4), and
-   the existing `compute-worker` principal_idx is the *old* one whose
+   the existing compute service-account principal_idx is the *old* one whose
    tokens you'll revoke in step 5. See the "Service accounts vs. tokens"
    section above for why each rotation creates a new service account
-   today. The compute-worker scope set is provisioned per
+   today. The compute service-account scope set is provisioned per
    [`compute-service-account-provisioning.md`](compute-service-account-provisioning.md);
    match its scope list exactly to avoid a drifted-scope ceiling
    between cycles.

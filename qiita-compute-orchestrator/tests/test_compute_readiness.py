@@ -470,3 +470,51 @@ def test_render_json_shape():
     parsed = json.loads(cr._render_json(results))
     assert parsed["summary"] == {"pass": 1, "fail": 1, "skip": 0}
     assert parsed["results"][0] == {"name": "a", "status": "pass", "detail": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Misinvocation guard (issue #72): a non-slurm backend on a real orchestrator
+# host means the command was run as the wrong user / with the wrong env sourced,
+# so COMPUTE_BACKEND defaulted to "local". That used to be a benign skip + exit
+# 0 (reads as a pass). The "real host" signal is the orchestrator env file
+# existing — file-existence ONLY, so a dev box / CI runner still skips.
+# ---------------------------------------------------------------------------
+
+
+def _local_settings() -> Settings:
+    return Settings(
+        backend_type="local",
+        path_scratch="/scratch/qiita",
+        path_derived="/scratch/persistent",
+        cp_to_co_token="",
+        cp_url="",
+        co_to_cp_token="",
+        slurm=None,
+    )
+
+
+def test_main_misinvoked_local_on_orchestrator_host_fails(monkeypatch, tmp_path, capsys):
+    """COMPUTE_BACKEND defaulted to local but the orchestrator env file exists →
+    loud fail + exit 1 naming the correct `sudo -u qiita-orch` invocation."""
+    monkeypatch.setattr(cr.Settings, "from_env", classmethod(lambda cls, **kw: _local_settings()))
+    env_file = tmp_path / "compute-orchestrator.env"
+    env_file.write_text("COMPUTE_BACKEND=local\n")
+    monkeypatch.setattr(cr, "ORCHESTRATOR_ENV_PATH", str(env_file))
+
+    rc = cr.main(["--no-slurm-probe"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "backend-is-slurm" in out
+    assert "sudo -u qiita-orch" in out
+
+
+def test_main_local_on_dev_box_still_skips(monkeypatch, tmp_path, capsys):
+    """Genuine dev-box local backend (no orchestrator env file) stays a skip /
+    exit 0 — the heuristic is file-existence only, never env-var presence."""
+    monkeypatch.setattr(cr.Settings, "from_env", classmethod(lambda cls, **kw: _local_settings()))
+    monkeypatch.setattr(cr, "ORCHESTRATOR_ENV_PATH", str(tmp_path / "absent.env"))
+
+    rc = cr.main(["--no-slurm-probe"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "0 fail" in out

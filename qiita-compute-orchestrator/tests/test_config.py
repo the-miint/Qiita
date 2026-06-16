@@ -10,10 +10,13 @@ that route. The flag below threads that distinction.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from qiita_compute_orchestrator.config import (
     Settings,
+    _resolve_token,
     _settings_ctx,
     get_settings,
     install_settings,
@@ -117,3 +120,71 @@ def test_from_env_path_derived_dev_fallback(monkeypatch):
     monkeypatch.setenv("CO_TO_CP_TOKEN", "t")
     settings = Settings.from_env(require_cp_to_co_token=False)
     assert settings.path_derived == "/tmp/xyz/qiita/derived"
+
+
+def test_resolve_co_to_cp_token_permission_denied_is_actionable(monkeypatch, tmp_path):
+    """A present-but-unreadable CO→CP token file — the compute-readiness-as-the-
+    wrong-user case (the token is 0400 qiita-orch, qiita-api can't read it) —
+    must raise an *actionable* RuntimeError that names the file, the 0400
+    qiita-orch ownership, and the correct `sudo -u qiita-orch` invocation, not
+    fall through to the generic "no token available" message (issue #72)."""
+    token_file = tmp_path / "co-to-cp.token"
+    token_file.write_text("secret-pat\n")
+    monkeypatch.setenv("CO_TO_CP_TOKEN_PATH", str(token_file))
+    # No env-var fallback — the file IS present; it's just unreadable.
+    monkeypatch.delenv("QIITA_ALLOW_TOKEN_ENV", raising=False)
+    monkeypatch.delenv("CO_TO_CP_TOKEN", raising=False)
+
+    real_read_text = Path.read_text
+
+    def fake_read_text(self, *args, **kwargs):
+        if self == token_file:
+            raise PermissionError(13, "Permission denied")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        Settings.from_env(require_cp_to_co_token=False)
+    msg = str(excinfo.value)
+    # Actionable content — not merely "a RuntimeError was raised".
+    assert str(token_file) in msg
+    assert "0400" in msg
+    assert "qiita-orch" in msg
+    assert "sudo -u qiita-orch" in msg
+    # And NOT the misleading generic path.
+    assert "no" not in msg.lower() or "token available" not in msg.lower()
+
+
+def test_resolve_cp_to_co_token_permission_denied_does_not_misdirect_to_qiita_orch(
+    monkeypatch, tmp_path
+):
+    """The CP↔CO bearer is the shared 0440 root:qiita-services token (read by
+    both qiita-api and qiita-orch), so a PermissionError there is a perms
+    misinstall — it must NOT tell the operator to "run as qiita-orch" (that's
+    only right for the 0400 CO→CP token). Pins the per-kind perms guidance so a
+    future edit can't re-hardcode the qiita-orch advice for both kinds."""
+    token_file = tmp_path / "cp-to-co.token"
+    token_file.write_text("shared-bearer\n")
+    monkeypatch.setenv("CP_TO_CO_TOKEN_PATH", str(token_file))
+    monkeypatch.delenv("QIITA_ALLOW_TOKEN_ENV", raising=False)
+    monkeypatch.delenv("CP_TO_CO_TOKEN", raising=False)
+
+    real_read_text = Path.read_text
+
+    def fake_read_text(self, *args, **kwargs):
+        if self == token_file:
+            raise PermissionError(13, "Permission denied")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _resolve_token("cp_to_co")
+    msg = str(excinfo.value)
+    assert str(token_file) in msg
+    # CP↔CO is the root:qiita-services group bearer, not the 0400 qiita-orch one.
+    assert "0440" in msg
+    assert "qiita-services" in msg
+    assert "qiita-orch" not in msg
+    assert "sudo -u qiita-orch" not in msg

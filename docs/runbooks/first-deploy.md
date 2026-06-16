@@ -10,11 +10,12 @@ re-running it should be safe (idempotent) unless noted.
 For the conceptual reference (principal model, scopes, endpoints), see
 [`docs/auth.md`](../auth.md). The orchestrator authenticates to the CP
 in two directions: the shared bearer (`/etc/qiita/cp-to-co.token`,
-step 7) for inbound CP→CO calls, and a `compute-worker` service-account
-PAT (`/etc/qiita/co-to-cp.token`, provisioned per
+step 7) for inbound CP→CO calls, and a compute service-account
+PAT (site-chosen principal name; `compute` on the live deploy) at
+`/etc/qiita/co-to-cp.token` (provisioned per
 [`compute-service-account-provisioning.md`](compute-service-account-provisioning.md))
 for outbound CO→CP callbacks like `POST /sequence-range`. Rotation of
-the compute-worker PAT follows
+that PAT follows
 [`orchestrator-token-rotation.md`](orchestrator-token-rotation.md).
 
 > **Optional workflow tip.** If you have access to Claude (claude.ai/code
@@ -40,10 +41,44 @@ naming (`qiita-api`, `qiita-orch`, `qiita-data`, `qiita-job`):
 
 The operator account (`qiita` in this runbook; substitute your site's
 name) must **not** be a member of any of `qiita-services`,
-`qiita-pipeline`, `qiita-data`, `qiita-fs`, or `qiita-job` — otherwise
-the operator gains read access to service secrets and lake data, which
-defeats the privilege separation the service users provide. Verify
-with `id <operator>` in step 0.
+`qiita-pipeline`, `qiita-data`, `qiita-fs`, or `qiita-job` — group
+membership would hand the operator read on *everything* those groups
+gate, including the **DuckLake data and scratch trees**, which defeats
+the privilege separation the service users provide. Verify with
+`id <operator>` in step 0.
+
+The operator is, however, granted a **narrow POSIX ACL read on the three
+`/etc/qiita/*.env` files only** — *not* the bearer tokens, *not* lake
+data. This removes the deploy friction of an operator who can't see the
+config it deploys (e.g. sourcing `DATABASE_URL` for `make migrate`, or
+eyeballing `PATH_SCRATCH`/`HMAC` consistency) without joining any service
+group. An ACL is the right tool here precisely because it adds the
+operator as an *extra* reader while leaving each env file's
+`root:qiita-<svc>` ownership — and thus the service's own read path and
+the secret isolation between services — untouched.
+
+Grant it (`[admin]`, **after** each env file is installed in steps 1 / 8b /
+9a — an `install` of a fresh copy drops the ACL, so re-apply if you replace
+one). The principal is the existing operator account, not a new group —
+confirm with `id qiita` first; for a multi-login site that shares an
+operators *group* instead, use `g:<group>:r`:
+
+```bash
+# [admin] traverse /etc/qiita, then read on the three env files only
+sudo setfacl -m u:qiita:x /etc/qiita
+sudo setfacl -m u:qiita:r /etc/qiita/control-plane.env \
+                          /etc/qiita/data-plane.env \
+                          /etc/qiita/compute-orchestrator.env
+# verify: the ACL entry is present and the operator can actually read
+getfacl -c /etc/qiita/control-plane.env | grep -q '^user:qiita:r' && \
+  sudo -u qiita test -r /etc/qiita/control-plane.env && \
+  echo "operator read OK"
+```
+
+(Requires an ACL-enabled filesystem — ext4/xfs default to on; a mount with
+`noacl` must be remounted with ACLs first. Deliberately **no default ACL**
+on `/etc/qiita`: that would also leak the tokens to the operator, which
+this scope explicitly excludes.)
 
 Service start/stop authority on the qiita-* units is **root only**
 (same model as `postgresql.service` / `nginx.service`). Operators run
@@ -448,8 +483,10 @@ otherwise ensure the shell doesn't close):
   and step 6 (`qiita-admin set-system-role` — direct DB, no HTTP) all
   read it. Sourced from `/tmp/control-plane.env` below; once `[admin]`
   installs the final copy as `root:qiita-api 0440`, the operator can
-  no longer read it back from disk, so the in-shell copy is the only
-  surviving access until step 8b is done.
+  no longer read it back from disk **until the §0.1 operator config-read
+  ACL is applied** (do that right after the `install` below and the
+  operator can `source /etc/qiita/control-plane.env` directly — the
+  shell-resident copy then just covers the brief window before the ACL).
 
 If either var goes missing between steps, recover via
 `sudo cat /etc/qiita/control-plane.env` (admin shell) and re-export
@@ -906,7 +943,7 @@ sudo systemctl enable --now qiita-compute-orchestrator
 
 The orchestrator validates its credentials at startup and refuses to
 boot if any are missing: the CP↔CO bearer (`/etc/qiita/cp-to-co.token`,
-step 7), the CO→CP compute-worker PAT (`/etc/qiita/co-to-cp.token`,
+step 7), the CO→CP compute service-account PAT (`/etc/qiita/co-to-cp.token`,
 provisioned per
 [`compute-service-account-provisioning.md`](compute-service-account-provisioning.md)),
 and on the SLURM backend the five `SLURM*` env vars **and a non-empty
@@ -925,6 +962,20 @@ set up the JWT-refresh timer per
 # [admin]
 make verify-health
 ```
+
+> Now that all three env files + token files exist, you can also run the
+> read-only consistency preflight — it confirms `PATH_SCRATCH` is byte-identical
+> across the three env files, `HMAC_SECRET_KEY` matches between CP and DP, and
+> the token files have the expected owner/mode, printing non-secret fingerprints
+> (never the values):
+> ```bash
+> # [admin]
+> sudo make preflight
+> ```
+> On an established host the consolidated `sudo make verify-deploy
+> QIITA_HOSTNAME=<fqdn>` runs this plus the health aggregate, the `qiita.action`
+> list, and `compute-readiness` (each with the correct run-as) in one shot — see
+> [`redeploy.md`](redeploy.md) §7.
 
 Calls `GET /health` on the CP (8080) and CO (8081) and the gRPC health
 endpoint on the DP (50051). All three must return `OK` / `SERVING`. A

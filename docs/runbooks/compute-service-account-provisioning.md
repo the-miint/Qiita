@@ -6,11 +6,18 @@ enabled, **before** that orchestrator first tries to POST to
 `/api/v1/sequence-range`. Skip on installs that do not run raw-read
 ingestion.
 
-**Purpose.** Provision the dedicated `compute-worker` service-account principal
+**Purpose.** Provision the dedicated compute service-account principal
 that the compute orchestrator's raw-read ingestion step uses to call
 `POST /api/v1/sequence-range`. Distinct from the cron-job service
 accounts covered by [`orchestrator-token-rotation.md`](orchestrator-token-rotation.md);
 those are separate principals with their own scope sets.
+
+> **The service-account name is site-chosen.** The examples below use
+> `compute` — the name on the live `qiita-miint` deploy. Nothing in the
+> code pins a specific name (the orchestrator resolves the *token* by
+> file path, not by principal name), so pick whatever your site uses and
+> substitute it consistently throughout this runbook and
+> [`orchestrator-token-rotation.md`](orchestrator-token-rotation.md).
 
 For the conceptual reference (scopes, ceilings, audit events) see
 [`docs/auth.md`](../auth.md). For the route contract and identifier model
@@ -26,8 +33,8 @@ see the **Raw-read identifiers** paragraph in [`docs/architecture.md`](../archit
 
 ## Scope grant
 
-The `compute-worker` service account needs `sequence_range:mint` and nothing
-else for raw-read ingestion. Other compute-worker responsibilities (e.g.
+The compute service account needs `sequence_range:mint` and nothing
+else for raw-read ingestion. Other compute responsibilities (e.g.
 feature minting for processed results) live on separate service accounts
 to keep blast radius bounded — do not bundle scopes that span
 identifier domains onto one principal.
@@ -55,7 +62,7 @@ from every role ceiling, so:
        -H "Authorization: Bearer qk_<ADMIN_PAT>" \
        -H "Content-Type: application/json" \
        -d '{
-         "name": "compute-worker",
+         "name": "compute",
          "scopes": ["sequence_range:mint"]
        }'
    ```
@@ -86,7 +93,8 @@ from every role ceiling, so:
    ```
 
    The response should show
-   `{"kind": "service", "name": "compute-worker", "scopes": ["sequence_range:mint"]}`.
+   `{"kind": "service", "name": "compute", "scopes": ["sequence_range:mint"]}`
+   (or whatever name you chose above).
 
 4. **Confirm the route works** end-to-end against a known
    prep_sample_idx.
@@ -112,9 +120,9 @@ from every role ceiling, so:
 ## Rotation
 
 Follow [`orchestrator-token-rotation.md`](orchestrator-token-rotation.md)
-with the `compute-worker` principal substituted for `orchestrator`. The same
-"mint new, swap file, revoke old" flow applies; the token file path is
-the only orchestrator-specific detail.
+with the compute principal (the site-chosen name above) substituted for
+`orchestrator`. The same "mint new, swap file, revoke old" flow applies;
+the token file path is the only orchestrator-specific detail.
 
 ## Why a separate principal
 
@@ -124,6 +132,6 @@ will need as more native steps land (`feature:mint`, `ticket:doget`,
 `reference:register_files`) authorize writes in the `feature_idx`
 space. Bundling them on one principal would mean a single compromised
 token carries minting authority across two unrelated identifier
-domains. Keeping `compute-worker` scoped narrowly to
+domains. Keeping the compute service account scoped narrowly to
 `sequence_range:mint` preserves the split at the cost of one extra
 row in `qiita.service_account` per added domain.

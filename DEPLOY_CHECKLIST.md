@@ -40,6 +40,21 @@ _None yet._
      the orchestrator service account can create/write
      `{PATH_DERIVED}/references/` (the jobs `mkdir` it at runtime). No prod host
      references exist yet, so nothing to migrate.
+- (#72) [admin] Grant the **operator account** read on the three service env
+  files (NOT the bearer tokens, NOT lake data) so it can source `DATABASE_URL`
+  for `make migrate` and verify `PATH_SCRATCH`/`HMAC` consistency without sudo.
+  Idempotent; re-run only if an env file is reinstalled (a fresh `install` drops
+  the ACL). Confirm the operator principal with `id qiita` first (the model uses
+  one shared `qiita` account; a multi-login site substitutes `g:<operators-group>:r`):
+  ```bash
+  sudo setfacl -m u:qiita:x /etc/qiita
+  sudo setfacl -m u:qiita:r /etc/qiita/control-plane.env \
+                            /etc/qiita/data-plane.env \
+                            /etc/qiita/compute-orchestrator.env
+  # verify
+  getfacl -c /etc/qiita/control-plane.env | grep -q '^user:qiita:r' && \
+    sudo -u qiita test -r /etc/qiita/control-plane.env && echo "operator read OK"
+  ```
 
 ### 3. Migrations
 
@@ -70,6 +85,15 @@ psql "$DATABASE_URL" -tAc \
 ### Notes (no host action)
 
 - (#89) Short-read host filtering is **opt-in** and changes no existing behavior: `fastq-to-parquet/1.0.0` is unchanged, and `1.1.0` only runs the host filter when a ticket sets `host_filter_enabled: true` + a `host_reference_idx` (a built host reference). Clients submitting `1.0.0` (or `1.1.0` without the flag) are unaffected. The host-reference-add workflows now build a minimap2 `.mmi` in addition to the rype `.ryxdi` (bucket-2 mirror prerequisite); no API/client change.
+- New deploy tooling is available from the checkout this deploy onward: run
+  `sudo make verify-deploy QIITA_HOSTNAME=<fqdn>` for the generic post-deploy
+  checks (health, `qiita.action` list, compute-readiness — each with the correct
+  run-as baked in), `sudo make preflight` for the read-only config/secret
+  consistency check (PATH_SCRATCH/HMAC/token-perm + non-secret fingerprints), and
+  `make redeploy QIITA_HOSTNAME=<fqdn>` (as the operator) to run the whole
+  skeleton. The hand-copied `compute-readiness` verify line is retired — bucket-5
+  verifies add only deploy-*specific* asserts on top of `make verify-deploy`. See
+  [`docs/runbooks/redeploy.md`](docs/runbooks/redeploy.md) §7. (#72)
 
 ---
 
