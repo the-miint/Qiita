@@ -19,6 +19,40 @@ _None yet._
 
 ### 2. One-time host setup
 
+_None yet._
+
+### 3. Migrations
+
+_None yet._
+
+### 4. Deploy
+
+_None yet._
+
+### 5. Verify
+
+_None yet._
+
+### Notes (no host action)
+
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-16 — 26838ca
+
+Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
 - (#89) [operator] Two prerequisites for the host-filter / minimap2-index work,
   both BEFORE the bucket-4 deploy:
   1. The **v1.5.3** miint mirror build must also carry the host-filter functions
@@ -56,7 +90,20 @@ _None yet._
     sudo -u qiita test -r /etc/qiita/control-plane.env && echo "operator read OK"
   ```
 
-### 3. Migrations
+> **Deploy-time deviation (2026-06-16) — (#72) ACL grant NOT applied; OUTSTANDING.**
+> This host's account model differs from the runbook's single-shared-`qiita`
+> assumption: `qiita` is a non-sudo **service** account (owns the checkout, ran
+> `git pull` + `make migrate`, already has `DATABASE_URL` in its environment, and
+> **cannot** read `control-plane.env`), while the real operators are separate
+> sudo users in a different group (`knightlab` etc.). Because no shared operators
+> group was decided, the `setfacl` target was left open and the grant was skipped
+> — it is idempotent and non-blocking (this deploy ran `make migrate` fine via
+> the `DATABASE_URL` already in `qiita`'s env). **Action still owed:** apply
+> `g:<operators-group>:r` (NOT `u:qiita:r` — see the multi-login carve-out above)
+> once the operators group is chosen. Being addressed in the deploy-ergonomics
+> follow-up that re-fits the runbook/tooling to this account model.
+
+#### 3. Migrations
 
 ```sql
 -- [admin] Pre-check before `make migrate`. The collection_date migration
@@ -106,11 +153,11 @@ make -C ~/qiita-miint migrate
 ```
 `dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#89) adds `20260612000000_reference_index_minimap2_type` (drops + re-adds the `reference_index.index_type` CHECK to allow `'minimap2'` alongside `'rype'`; no extension, backfill, or pre-check). (#98) adds `20260616000000_collection_date_text` (rebinds the `collection_date` global field to `text`; gated on the collection_date pre-check above). (#98) adds `20260616000001_sequenced_pool_idx_bump` (RESTARTs `qiita.sequenced_pool.idx` at 25000; no extension, backfill, or pre-check). (#98) adds `20260616000002_prune_prep_sample_global_fields` (deletes seven unused seeded prep-sample global fields and makes `title` / `design_description` optional; gated on the prep-field pre-check above).
 
-### 4. Deploy
+#### 4. Deploy
 
 _None yet._
 
-### 5. Verify
+#### 5. Verify
 
 ```bash
 # (#89) [admin] spot-check that the brand-new fastq-to-parquet/1.1.0 row reached
@@ -122,7 +169,7 @@ psql "$DATABASE_URL" -tAc \
   "SELECT count(*) FROM qiita.action WHERE action_id='fastq-to-parquet' AND version='1.1.0'"   # 1 (#89)
 ```
 
-### Notes (no host action)
+#### Notes (no host action)
 
 - (#89) Short-read host filtering is **opt-in** and changes no existing behavior: `fastq-to-parquet/1.0.0` is unchanged, and `1.1.0` only runs the host filter when a ticket sets `host_filter_enabled: true` + a `host_reference_idx` (a built host reference). Clients submitting `1.0.0` (or `1.1.0` without the flag) are unaffected. The host-reference-add workflows now build a minimap2 `.mmi` in addition to the rype `.ryxdi` (bucket-2 mirror prerequisite); no API/client change.
 - New deploy tooling is available from the checkout this deploy onward: run
@@ -134,12 +181,6 @@ psql "$DATABASE_URL" -tAc \
   skeleton. The hand-copied `compute-readiness` verify line is retired — bucket-5
   verifies add only deploy-*specific* asserts on top of `make verify-deploy`. See
   [`docs/runbooks/redeploy.md`](docs/runbooks/redeploy.md) §7. (#72)
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-15 — 03699e8
 
