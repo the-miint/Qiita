@@ -78,6 +78,17 @@ the `no-changelog` label).
 
 ### Changed
 
+- `deploy/redeploy.sh` (`make redeploy`) is now an all-in-one **root-run**
+  orchestrator: run it as `sudo make redeploy` from the admin account and it
+  `sudo -u`'s into the operator (`qiita`) for pull/migrate and into the service
+  accounts (`qiita-api`/`qiita-orch`) for the verify checks. This fixes the
+  prior "run as the operator, elevate via sudo" model, which could not work on
+  the documented default where the operator account has no sudo. It also reads
+  `DATABASE_URL` from `control-plane.env` itself (handing it to the operator's
+  `make migrate`), so the operator's shell no longer needs it and the #72 ACL
+  is no longer required for a normal redeploy. Migrations stay out-of-band
+  (`RUN_MIGRATE=1` opts in after a typed confirm). Docs updated in
+  `redeploy.md` / `first-deploy.md` / `CLAUDE.md` (#TBD)
 - The `collection_date` global biosample field is now a `text` field instead of
   a formal `date`, so it can hold partial dates such as a bare year (`2025`)
   (migration `20260616000000_collection_date_text`) (#98)
