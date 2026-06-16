@@ -57,6 +57,16 @@ operator as an *extra* reader while leaving each env file's
 `root:qiita-<svc>` ownership — and thus the service's own read path and
 the secret isolation between services — untouched.
 
+> **Optional since the all-in-one redeploy.** `sudo make redeploy`
+> (`deploy/redeploy.sh`, root-run by the `[admin]`) reads `DATABASE_URL`
+> from `control-plane.env` itself and hands it to the operator's
+> `make migrate`, so this ACL is **no longer required for a normal
+> redeploy**. It remains useful only for *hand-run* operator steps —
+> sourcing `DATABASE_URL` for a manual `make migrate`, or `make preflight`
+> without sudo. Grant it for that convenience; skip it if you only ever
+> deploy via `sudo make redeploy`. For a multi-login site, prefer the
+> `g:<operators-group>:r` form below over `u:qiita:r`.
+
 Grant it (`[admin]`, **after** each env file is installed in steps 1 / 8b /
 9a — an `install` of a fresh copy drops the ACL, so re-apply if you replace
 one). The principal is the existing operator account, not a new group —

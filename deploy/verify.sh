@@ -19,19 +19,17 @@
 
 set -euo pipefail
 
-[ "$EUID" -eq 0 ] || { echo "ERROR: deploy/verify.sh must be run as root (sudo) — it sudo's per service account and reads the 0440 env files." >&2; exit 1; }
-
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CP_ENV=/etc/qiita/control-plane.env
-CO_ENV=/etc/qiita/compute-orchestrator.env
+# shellcheck source=deploy/_common.sh
+source "$HERE/_common.sh"  # require_root, CP_ENV/CO_ENV, QIITA_API_USER/QIITA_ORCH_USER, pass/fail/skip
+
+require_root "deploy/verify.sh must be run as root (sudo) — it sudo's per service account and reads the 0440 env files."
+
 # The deployed orchestrator venv. The module-direct form below is PATH-independent
 # and is exactly what `qiita-admin compute-readiness` subprocesses into.
 ORCHESTRATOR_VENV="${ORCHESTRATOR_VENV:-/opt/qiita/compute-orchestrator/.venv}"
 
 n_pass=0 n_fail=0 n_skip=0
-pass() { printf '  \xe2\x9c\x93 %s: %s\n' "$1" "$2"; n_pass=$((n_pass + 1)); }
-fail() { printf '  \xe2\x9c\x97 %s: %s\n' "$1" "$2"; n_fail=$((n_fail + 1)); }
-skip() { printf '  \xc2\xb7 %s: %s\n' "$1" "$2"; n_skip=$((n_skip + 1)); }
 
 echo "verify-deploy: post-deploy checks"
 
@@ -69,7 +67,7 @@ fi
 if [ -n "${SKIP_ACTIONS:-}" ]; then
     skip "actions" "SKIP_ACTIONS=1"
 elif [ -r "$CP_ENV" ]; then
-    if out=$(sudo -u qiita-api bash -c '
+    if out=$(sudo -u "$QIITA_API_USER" bash -c '
         set -a
         # shellcheck disable=SC1091
         source /etc/qiita/control-plane.env  # nounset off: env values may interpolate
@@ -94,13 +92,13 @@ elif [ -r "$CO_ENV" ]; then
     [ -n "${SKIP_SLURM_PROBE:-}" ] && probe_flag="--no-slurm-probe"
     # Correct run-as: qiita-orch sourcing compute-orchestrator.env. Module-direct
     # form is PATH-independent (== what `qiita-admin compute-readiness` execs).
-    if sudo -u qiita-orch bash -c "
+    if sudo -u "$QIITA_ORCH_USER" bash -c "
         set -a
         # shellcheck disable=SC1091
         source /etc/qiita/compute-orchestrator.env; set +a
         exec '${ORCHESTRATOR_VENV}/bin/python' -m qiita_compute_orchestrator.cli.compute_readiness ${probe_flag}
     "; then
-        pass "compute-readiness" "all checks passed (run as qiita-orch)"
+        pass "compute-readiness" "all checks passed (run as $QIITA_ORCH_USER)"
     else
         fail "compute-readiness" "reported failures (see rows above); re-run as shown in docs/runbooks/redeploy.md §7"
     fi

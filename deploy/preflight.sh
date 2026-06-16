@@ -31,26 +31,10 @@ if [ "$EUID" -ne 0 ]; then
     echo "preflight: running as $(id -un) (non-root) — token fingerprints need root; .env checks need the operator config-read ACL (first-deploy.md §0.1)." >&2
 fi
 
-CP_ENV=/etc/qiita/control-plane.env
-DP_ENV=/etc/qiita/data-plane.env
-CO_ENV=/etc/qiita/compute-orchestrator.env
+# shellcheck source=deploy/_common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"  # CP_ENV/DP_ENV/CO_ENV, read_env_var, pass/fail/skip
 
 n_pass=0 n_fail=0 n_skip=0
-pass() { printf '  \xe2\x9c\x93 %s: %s\n' "$1" "$2"; n_pass=$((n_pass + 1)); }
-fail() { printf '  \xe2\x9c\x97 %s: %s\n' "$1" "$2"; n_fail=$((n_fail + 1)); }
-skip() { printf '  \xc2\xb7 %s: %s\n' "$1" "$2"; n_skip=$((n_skip + 1)); }
-
-# Read one KEY from an env file in an isolated subshell. `set +e` so a sourced
-# line that evaluates non-zero under this script's errexit doesn't abort and
-# blank the value; `set +u` so a value that references another (unset) variable
-# (`X=$Y/sub`) doesn't trip nounset and abort the source mid-file, silently
-# blanking this and every later var. bash itself strips the KEY='...' / KEY=...
-# quoting, so the returned value matches what the service's loader sees.
-read_env_var() {
-    local env_file="$1" var="$2"
-    ( set +eu; set -a; # shellcheck disable=SC1090,SC1091
-      source "$env_file" >/dev/null 2>&1; set +a; printf '%s' "${!var:-}" )
-}
 
 # Non-secret fingerprint: 12 hex chars of SHA-256 over the value. Trim
 # surrounding whitespace first so env-file formatting differences don't make

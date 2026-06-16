@@ -25,6 +25,42 @@ throughout (the live deploy is `qiita-miint.ucsd.edu`).
 
 ---
 
+## 0. Fast path: one command (recommended)
+
+On an established host the whole skeleton below runs from a **single command
+on your `[admin]` account**:
+
+```bash
+# [admin] root-run; sudo -u's into the operator (qiita) for pull/migrate and
+#         into qiita-api/qiita-orch for the verify checks. Substitute the clone
+#         path + FQDN for your host.
+sudo make -C /home/qiita/qiita-miint redeploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
+```
+
+`deploy/redeploy.sh` drives steps 2–7 in order: pull (as the operator) →
+print buckets 1 & 2 and pause for you to apply them → `preflight` → migration
+gate → `local-deploy.sh` → miint stage → `verify`, then prints the deployed
+commit for the §8 archive hand-off. Key behaviours:
+
+- It **reads `DATABASE_URL` from `control-plane.env` itself** (it is root) and
+  hands it to the operator's `make migrate`, so the operator's shell needn't
+  have it and you migrate exactly the DB `activate.sh`'s guard checks.
+- The migration gate stays **out-of-band**: it *refuses* if anything is
+  pending unless you pass `RUN_MIGRATE=1` (which applies after a typed
+  confirm — never silently). `activate.sh`'s guard is the backstop.
+- `ASSUME_YES=1` skips the interactive acks (automation); `SKIP_STAGE_MIINT=1`
+  skips the miint stage.
+
+This **root-run, drop-into-each-account** model is why it works where the
+operator account has **no sudo** (the documented default — see
+[`first-deploy.md`](first-deploy.md#account-model)); it mirrors how
+`local-deploy.sh` already runs as root and `sudo -u qiita` for the build. The
+manual steps below remain the source of truth for *what* each step does and
+are your fallback when you want to drive one by hand (e.g. resolving a
+migration pre-check that the gate surfaces).
+
+---
+
 ## 1. Read the Pending-deploy checklist
 
 ```bash
@@ -71,6 +107,11 @@ sudo make -C ~/qiita-miint preflight
 ```
 
 ## 4. Apply migrations
+
+> Doing the §0 fast path? Skip this — `redeploy.sh` runs the gate for you,
+> reading `DATABASE_URL` from `control-plane.env` (it is root) and handing it to
+> the operator's `make migrate`, so you need neither the ACL nor `DATABASE_URL`
+> in your shell. The manual route below is for driving the step by hand.
 
 ```bash
 # [operator] DATABASE_URL must be in your shell, pointing at the SAME DB as

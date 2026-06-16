@@ -277,8 +277,10 @@ preflight:
 verify-deploy:
 	QIITA_HOSTNAME="$(QIITA_HOSTNAME)" bash deploy/verify.sh
 
-# Guided incremental redeploy (run as the OPERATOR, not root — it elevates per
-# step via sudo):  make redeploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
+# All-in-one guided incremental redeploy. Run as ROOT from the admin account —
+# it sudo -u's into the operator (qiita) for pull/migrate and into the service
+# accounts (qiita-api/qiita-orch) for verify, so the no-sudo operator never logs
+# in:  sudo make redeploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
 # Codifies redeploy.md's skeleton (pull -> preflight -> migration gate ->
 # local-deploy.sh -> stage -> verify); migrations stay out-of-band.
 redeploy:

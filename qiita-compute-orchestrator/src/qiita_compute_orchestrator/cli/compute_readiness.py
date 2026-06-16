@@ -338,6 +338,44 @@ else
 fi
 rm -f "$MIINT_SPLIT_PROBE"
 
+# The host-filter functions `save_minimap2_index` (the build_minimap2_index step)
+# and `align_minimap2` (the host_filter step) are the newest miint additions the
+# deploy depends on. Unlike read_fastx / sequence_split there was no probe for
+# them, so a v1.5.3 mirror build missing either was only caught at the first
+# host-reference build. Assert both are REGISTERED in the staged build's
+# duckdb_functions() so a missing one fails here, at deploy. Existence-only:
+# invoking them needs a real index / alignment, but registration is exactly the
+# bucket-2 mirror prerequisite. No curly braces in the Python below — the whole
+# script is an f-string, so a `{{...}}` set literal would have to be doubled;
+# lists ([]) sidestep that.
+MIINT_HOSTFILTER_PROBE="$(mktemp)"
+cat > "$MIINT_HOSTFILTER_PROBE" <<'PYEOF'
+import sys
+try:
+    import duckdb
+    from qiita_common.duckdb_miint import miint_connect_config, miint_load_sql
+    conn = duckdb.connect(":memory:", config=miint_connect_config())
+    conn.execute(miint_load_sql())
+    want = ["save_minimap2_index", "align_minimap2"]
+    rows = conn.execute(
+        "SELECT DISTINCT function_name FROM duckdb_functions() "
+        "WHERE function_name IN ('save_minimap2_index', 'align_minimap2')"
+    ).fetchall()
+    have = [r[0] for r in rows]
+    missing = [f for f in want if f not in have]
+    assert not missing, "missing miint host-filter functions: " + ", ".join(missing)
+except Exception as exc:
+    msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
+    print(msg[:500])
+    sys.exit(1)
+PYEOF
+if MIINT_ERR="$("$PYTHON" "$MIINT_HOSTFILTER_PROBE" 2>/dev/null)"; then
+    echo "{_PROBE_LINE_PREFIX} miint-host-filter-fns=ok"
+else
+    echo "{_PROBE_LINE_PREFIX} miint-host-filter-fns=fail err=$MIINT_ERR"
+fi
+rm -f "$MIINT_HOSTFILTER_PROBE"
+
 # The `/ticket` leaf must match the control plane's PATH_SCRATCH/ticket
 # derivation (qiita_control_plane.config.Settings.from_env) — that's the
 # per-ticket workspace SLURM jobs actually run in.

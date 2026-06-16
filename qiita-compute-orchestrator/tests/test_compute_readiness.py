@@ -302,6 +302,20 @@ def test_probe_script_checks_miint_sequence_split():
     assert "miint-sequence-split=fail" in script
 
 
+def test_probe_script_checks_miint_host_filter_functions():
+    """The probe asserts the host-filter functions `save_minimap2_index`
+    (build_minimap2_index step) and `align_minimap2` (host_filter step) are
+    registered in the staged miint build. They are the newest additions and had no
+    probe before, so a v1.5.3 mirror build missing either was only caught at the
+    first host-reference build; this surfaces it at deploy."""
+    script = cr.build_probe_script(path_scratch="/scratch/qiita")
+    assert "save_minimap2_index" in script
+    assert "align_minimap2" in script
+    assert "duckdb_functions()" in script
+    assert "miint-host-filter-fns=ok" in script
+    assert "miint-host-filter-fns=fail" in script
+
+
 def test_parse_probe_log_unknown_value_defaults_to_fail():
     """If the probe emits a value the parser doesn't recognize, it
     should be reported as a failure rather than silently passed —
