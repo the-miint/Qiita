@@ -38,6 +38,7 @@ binding directly (mirrors build_rype_index).
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import duckdb
@@ -161,28 +162,34 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     duckdb_tmp = workspace / ".duckdb_tmp"
     duckdb_tmp.mkdir(parents=True, exist_ok=True)
 
-    with open_miint_conn() as conn:
-        apply_duckdb_settings(
-            conn, duckdb_tmp, memory_gb=_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS
-        )
-        num_subjects = _stage_subject(conn, read_target)
-        if num_subjects == 0:
-            # The chunked reference is empty — there is nothing to index. This
-            # step only runs in the host-reference workflows where a minimap2
-            # index is required, so an empty reference is a fail-fast, not a
-            # silent empty index.
-            raise ValueError(
-                f"reference {inputs.reference_idx} has no sequence chunks "
-                f"({read_target}): nothing to build a minimap2 index from"
+    try:
+        with open_miint_conn() as conn:
+            apply_duckdb_settings(
+                conn, duckdb_tmp, memory_gb=_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS
             )
-        success = _run_save_minimap2_index(
-            conn, _SUBJECT_RELATION, str(index_path), preset=inputs.preset
-        )
-    if not success:
-        raise RuntimeError(
-            f"save_minimap2_index reported failure for reference {inputs.reference_idx} "
-            f"→ {index_path}"
-        )
+            num_subjects = _stage_subject(conn, read_target)
+            if num_subjects == 0:
+                # The chunked reference is empty — there is nothing to index. This
+                # step only runs in the host-reference workflows where a minimap2
+                # index is required, so an empty reference is a fail-fast, not a
+                # silent empty index.
+                raise ValueError(
+                    f"reference {inputs.reference_idx} has no sequence chunks "
+                    f"({read_target}): nothing to build a minimap2 index from"
+                )
+            success = _run_save_minimap2_index(
+                conn, _SUBJECT_RELATION, str(index_path), preset=inputs.preset
+            )
+        if not success:
+            raise RuntimeError(
+                f"save_minimap2_index reported failure for reference {inputs.reference_idx} "
+                f"→ {index_path}"
+            )
+    finally:
+        # Drop the DuckDB spill dir (possibly large) before returning so it
+        # doesn't accumulate in the shared work-ticket workspace — mirrors the
+        # sibling native DuckDB jobs (host_filter, stage_local_fasta, …).
+        shutil.rmtree(duckdb_tmp, ignore_errors=True)
 
     params = {"preset": inputs.preset, "source_chunks": str(chunks), "num_subjects": num_subjects}
     meta_path = workspace / "minimap2_index_meta.json"

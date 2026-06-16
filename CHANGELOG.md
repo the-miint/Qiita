@@ -56,6 +56,11 @@ the `no-changelog` label).
 - The runner's `register-index` action reads its YAML-declared input
   (`entry.inputs[0]`) instead of a hardcoded `rype_index_meta`, so one workflow
   can register multiple index types (rype + minimap2) from their own metas (#89)
+- `ActionDefinition` now rejects duplicate `step:` entry names within an action
+  at load time — SLURM job naming and in-flight job adoption (`_find_job_by_name`)
+  key on the entry name, so two same-named steps would collide silently.
+  `action:` entries run in-process (keyed on step index) and may still repeat,
+  e.g. the two `register-index` actions in the host-reference workflows (#89)
 - The study lookup-by-accession default is now `bioproject_accession`
   (was `ena_study_accession`): callers omitting `accession_field` resolve
   against the BioProject column. This aligns the `qiita submit-bcl-convert`

@@ -163,6 +163,31 @@ def test_build_minimap2_index_clears_stale_index_on_rerun(tmp_path, monkeypatch)
     assert index_path.read_bytes() == b"NEW"
 
 
+def test_build_minimap2_index_cleans_duckdb_tmp(tmp_path, monkeypatch):
+    """The DuckDB spill dir under the workspace is removed after a run (success
+    and failure paths), so it doesn't accumulate on the shared filesystem."""
+    from qiita_compute_orchestrator.jobs import build_minimap2_index
+
+    monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "shared"))
+    parquet = _write_chunks_parquet(tmp_path / "chunks.parquet", [(1, 0, "ACGTACGT")])
+
+    # Success path.
+    _stub_capture_save(build_minimap2_index, monkeypatch)
+    ws_ok = tmp_path / "ws_ok"
+    inputs = build_minimap2_index.Inputs(
+        reference_sequence_chunks=parquet, reference_idx=1, work_ticket_idx=1
+    )
+    asyncio.run(build_minimap2_index.execute(inputs, ws_ok))
+    assert not (ws_ok / ".duckdb_tmp").exists()
+
+    # Failure path (save reports failure) — tmp still cleaned.
+    monkeypatch.setattr(build_minimap2_index, "_run_save_minimap2_index", lambda *a, **k: False)
+    ws_fail = tmp_path / "ws_fail"
+    with pytest.raises(RuntimeError):
+        asyncio.run(build_minimap2_index.execute(inputs, ws_fail))
+    assert not (ws_fail / ".duckdb_tmp").exists()
+
+
 def test_build_minimap2_index_raises_on_failure(tmp_path, monkeypatch):
     from qiita_compute_orchestrator.jobs import build_minimap2_index
 

@@ -98,6 +98,50 @@ def test_step_entry_rejects_both_keys():
     assert "exactly one of" in str(exc_info.value)
 
 
+def test_duplicate_step_names_rejected():
+    """Two `step:` entries sharing a name must be rejected — SLURM keys
+    job_name / job adoption on the entry name, so a collision would silently
+    adopt the wrong job."""
+    from qiita_common.actions import ActionDefinition
+
+    kwargs = _minimal_action_kwargs()
+    step = {
+        "step_type": StepType.SINGLETON,
+        "container": "img:1",
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    }
+    kwargs["steps"] = [
+        {"step": "build", **step},
+        {"step": "build", **step},
+    ]
+    with pytest.raises(ValidationError) as exc_info:
+        ActionDefinition(**kwargs)
+    assert "duplicate step name" in str(exc_info.value)
+
+
+def test_duplicate_action_names_allowed():
+    """Two `action:` entries may share a name — they run in-process keyed on the
+    step index, not the name (e.g. two `register-index` actions in the
+    host-reference workflows)."""
+    from qiita_common.actions import ActionDefinition, WorkflowAction
+
+    kwargs = _minimal_action_kwargs()
+    kwargs["steps"] = [
+        {
+            "step": "build",
+            "step_type": StepType.SINGLETON,
+            "container": "img:1",
+            "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+        },
+        {"action": "register-index", "inputs": ["rype_index_meta"]},
+        {"action": "register-index", "inputs": ["minimap2_index_meta"]},
+    ]
+    a = ActionDefinition(**kwargs)
+    register = [s for s in a.steps if isinstance(s, WorkflowAction)]
+    assert [s.name for s in register] == ["register-index", "register-index"]
+    assert [s.inputs for s in register] == [["rype_index_meta"], ["minimap2_index_meta"]]
+
+
 def test_step_entry_rejects_neither_key():
     """An entry with neither `step:` nor `action:` falls through to the
     discriminator and fails with a missing-discriminator error."""

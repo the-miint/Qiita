@@ -25,8 +25,9 @@ _None yet._
      — `save_minimap2_index` (used by the new `build_minimap2_index` step) and
      `align_minimap2` (used by `host_filter`). `rype_classify` is already
      present; the duckdb-miint #126 BIGINT-`id_column` change is nice-to-have,
-     NOT required (`host_filter` CASTs the rype id, so a pre-#126
-     VARCHAR-returning build also works). Components `FORCE INSTALL miint` for
+     NOT required (`host_filter` appends the rype id into a BIGINT accumulator
+     column, which coerces a VARCHAR-returning build on insert, so a pre-#126
+     build also works). Components `FORCE INSTALL miint` for
      v1.5.3, so they pull this build; a missing `save_minimap2_index` fails
      `build_minimap2_index` at the first host-reference build. Unlike
      `sequence_split` there is **no** compute-readiness probe for these yet (a
