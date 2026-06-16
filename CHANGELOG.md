@@ -208,6 +208,13 @@ the `no-changelog` label).
 - `qiita submit-bcl-convert` now opens the preflight blob via
   run-preflight's `open_db_file` instead of a hand-rolled read-only
   `sqlite3.connect`, opening it the way the library expects (#92)
+- `docs/runbooks/first-deploy.md` now documents the `PATH_DERIVED/references/`
+  host-reference index directory in the filesystem-bootstrap table (owner
+  `qiita-orch`, group `qiita-pipeline`, mode `2770`, setgid). The host-reference
+  index build and its `host_filter` consumer both run as `qiita-job`, which
+  `mkdir`s `{idx}/{rype,minimap2}/` at runtime; without the group-writable
+  setgid leaf the first `host-reference-add` build fails Permission Denied on
+  the `root:root 0755` base root. Previously only `…/images` was listed (#100)
 
 ### Added
 
