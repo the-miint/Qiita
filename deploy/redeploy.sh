@@ -70,8 +70,13 @@ for cand in "$HOME/.local/bin/dbmate" "$(command -v dbmate 2>/dev/null || true)"
 done
 pending=""
 if [ -n "$DBMATE_BIN" ] && [ -n "${DATABASE_URL:-}" ]; then
-    status=$(cd "$QIITA_CLONE/qiita-control-plane" && "$DBMATE_BIN" --migrations-table public.schema_migrations status 2>/dev/null || true)
-    printf '%s\n' "$status" | grep -E '^\[ \]' && pending="yes" || true
+    status=$(cd "$QIITA_CLONE/qiita-control-plane" \
+        && "$DBMATE_BIN" --migrations-table public.schema_migrations status 2>/dev/null) || status=""
+    pending_rows=$(printf '%s\n' "$status" | grep -E '^\[ \]' || true)
+    if [ -n "$pending_rows" ]; then
+        printf '%s\n' "$pending_rows"
+        pending="yes"
+    fi
     if [ -n "$pending" ]; then
         echo ""
         echo "Pending migrations detected (see '[ ]' rows above)."
