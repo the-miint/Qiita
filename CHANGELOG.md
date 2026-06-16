@@ -21,7 +21,7 @@ the `no-changelog` label).
   the git clone, or `GITHUB_SHA` on the CI path) and passed to the control
   plane via an optional `BUILD_SHA` env var written into a deploy-owned
   `build.env`; a from-source / first-deploy boot leaves it unset and the
-  footer renders the version alone (#TBD)
+  footer renders the version alone (#94)
 - New nullable `bioproject_accession` column on the study table (unique
   when present), for NCBI/ENA BioProject tracking (#87)
 - Exposed study `bioproject_accession` through create, get, and patch: the
