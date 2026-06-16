@@ -203,7 +203,7 @@ the `no-changelog` label).
   index build and its `host_filter` consumer both run as `qiita-job`, which
   `mkdir`s `{idx}/{rype,minimap2}/` at runtime; without the group-writable
   setgid leaf the first `host-reference-add` build fails Permission Denied on
-  the `root:root 0755` base root. Previously only `…/images` was listed (#TBD)
+  the `root:root 0755` base root. Previously only `…/images` was listed (#100)
 
 ### Added
 
