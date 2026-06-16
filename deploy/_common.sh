@@ -13,4 +13,8 @@
 #   target/     — cargo build artifacts; the deployed data-plane
 #                 binary lands via a separate `install` call
 #   __pycache__/  — Python bytecode caches; harmless but noisy
-RSYNC_EXCLUDES=(--exclude='.venv/' --exclude='target/' --exclude='__pycache__/')
+#   build.env   — deploy-written build stamp under the control-plane
+#                 rsync target; excluded so a `--delete` rsync never
+#                 wipes it. activate.sh (re)writes it every deploy, so
+#                 the write no longer has to be ordered after the rsync.
+RSYNC_EXCLUDES=(--exclude='.venv/' --exclude='target/' --exclude='__pycache__/' --exclude='build.env')

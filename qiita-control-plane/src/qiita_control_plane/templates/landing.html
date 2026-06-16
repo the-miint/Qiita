@@ -61,7 +61,7 @@
 </main>
 
 <footer>
-  <span>UC San Diego &middot; v{{ version }}</span>
+  <span>UC San Diego &middot; v{{ version }}{% if build_sha %} (<a href="https://github.com/the-miint/Qiita/commit/{{ build_sha }}">{{ build_sha }}</a>){% endif %}</span>
   <span>Need help? <a href="mailto:{{ contact_email }}?subject=qiita-miint%20help">{{ contact_email }}</a></span>
 </footer>
 

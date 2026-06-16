@@ -228,3 +228,44 @@ def test_settings_contact_email_set_from_env(monkeypatch):
 
     settings = Settings.from_env()
     assert settings.contact_email == "qiita.help@gmail.com"
+
+
+def test_settings_build_sha_defaults_to_none(monkeypatch):
+    """BUILD_SHA is optional — set only by the deploy scripts. A boot
+    without it (dev / tests / first deploy) must leave build_sha None so
+    the landing footer renders the version alone, never blocking boot."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.delenv("BUILD_SHA", raising=False)
+
+    from qiita_control_plane.config import Settings
+
+    settings = Settings.from_env()
+    assert settings.build_sha is None
+
+
+def test_settings_build_sha_set_from_env(monkeypatch):
+    """When the deploy writes BUILD_SHA, it lands on the Settings object
+    for the landing footer."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.setenv("BUILD_SHA", "a28c96e")
+
+    from qiita_control_plane.config import Settings
+
+    settings = Settings.from_env()
+    assert settings.build_sha == "a28c96e"
+
+
+def test_settings_build_sha_empty_is_none(monkeypatch):
+    """An empty BUILD_SHA (activate.sh writes an empty build.env when the
+    SHA is unavailable) must normalize to None, not the empty string —
+    the footer keys off truthiness to decide whether to render the link."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.setenv("BUILD_SHA", "")
+
+    from qiita_control_plane.config import Settings
+
+    settings = Settings.from_env()
+    assert settings.build_sha is None

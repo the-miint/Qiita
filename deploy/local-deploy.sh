@@ -27,6 +27,17 @@ id "$QIITA_USER" >/dev/null 2>&1 || { echo "ERROR: account '$QIITA_USER' not fou
 [ -z "${SKIP_PULL:-}" ]  && sudo -u "$QIITA_USER" git -C "$QIITA_CLONE" pull --ff-only
 [ -z "${SKIP_BUILD:-}" ] && sudo -u "$QIITA_USER" make -C "$QIITA_CLONE" build-data-plane
 
+# Stamp the deployed commit so the CP landing page can show it. Captured
+# here (the only stage with a git clone — /opt/qiita has no .git) and
+# handed to activate.sh via the environment; activate.sh writes it into
+# the deploy-owned build.env the systemd unit reads. The CI deploy path
+# sets QIITA_BUILD_SHA from GITHUB_SHA before invoking activate.sh.
+# Pass the FULL 40-char SHA (like CI's GITHUB_SHA); activate.sh owns the
+# single truncation site so both paths get an identically-shaped short
+# SHA. Non-fatal: an unset SHA just leaves the footer version-only.
+QIITA_BUILD_SHA="$(sudo -u "$QIITA_USER" git -C "$QIITA_CLONE" rev-parse HEAD 2>/dev/null || true)"
+export QIITA_BUILD_SHA
+
 DP_BINARY="$QIITA_CLONE/qiita-data-plane/target/release/qiita-data-plane"
 [ -x "$DP_BINARY" ] || { echo "ERROR: data-plane binary missing at $DP_BINARY" >&2; exit 1; }
 

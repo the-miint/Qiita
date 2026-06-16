@@ -122,6 +122,14 @@ class Settings:
     # don't have to set it; required by from_env(). The landing route is
     # the only consumer — `None` is safe everywhere else in the codebase.
     contact_email: str | None = None
+    # Short git SHA of the deployed commit, rendered in the landing-page
+    # footer next to the package version. Optional everywhere: it is set
+    # only by the deploy scripts (which write BUILD_SHA into the
+    # deploy-owned /opt/qiita/control-plane/build.env the systemd unit
+    # reads), so a from-source dev boot or a test leaves it None and the
+    # footer simply omits the SHA. Never required at boot — a missing
+    # build stamp must not keep the unit down.
+    build_sha: str | None = None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -216,4 +224,5 @@ class Settings:
             path_scratch_ticket=ws_root,
             path_scratch_staging=upload_root,
             contact_email=contact_email,
+            build_sha=os.environ.get("BUILD_SHA") or None,
         )

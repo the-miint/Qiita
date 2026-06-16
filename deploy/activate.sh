@@ -118,6 +118,27 @@ rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$INCOMING/qiita-compute-orchestrator/"
 # it ships independently of qiita-control-plane source.
 rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$INCOMING/workflows/"                 /opt/qiita/workflows/
 
+# Build stamp for the CP landing footer. QIITA_BUILD_SHA is the FULL
+# deployed commit SHA, set by deploy/local-deploy.sh (from the git clone)
+# or by the CI deploy step (from GITHUB_SHA); this is the single site that
+# truncates it to the 7-char short form, so both paths render identically.
+# build.env is in RSYNC_EXCLUDES (deploy/_common.sh), so the control-plane
+# rsync --delete above never wipes it and this write needn't be ordered
+# after the rsync; recreated every deploy, so it can never go stale.
+# Optional: when unset, write an empty file so the unit's
+# `EnvironmentFile=-` finds nothing and the footer stays version-only —
+# never fail the deploy over a missing stamp. Mode 0644: read by the
+# qiita-api service user via systemd; no secrets here.
+build_sha=${QIITA_BUILD_SHA:-}
+build_sha=${build_sha:0:7}
+if [ -n "$build_sha" ]; then
+    printf 'BUILD_SHA=%s\n' "$build_sha" > /opt/qiita/control-plane/build.env
+else
+    : > /opt/qiita/control-plane/build.env
+    echo "build stamp: QIITA_BUILD_SHA unset — landing footer will show version only" >&2
+fi
+chmod 0644 /opt/qiita/control-plane/build.env
+
 # --reinstall-package qiita-common forces uv to rebuild the path-dep when
 # qiita-common's source changes without a version bump; without this,
 # redeploys leave stale qiita-common in dependents' site-packages

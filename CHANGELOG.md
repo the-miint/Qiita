@@ -15,6 +15,13 @@ the `no-changelog` label).
 
 ### Added
 
+- The public landing page footer now shows the deployed commit's short git
+  SHA next to the package version (e.g. `v2026.3.0 (a28c96e)`), linked to its
+  GitHub commit. The SHA is captured at deploy (`deploy/local-deploy.sh` from
+  the git clone, or `GITHUB_SHA` on the CI path) and passed to the control
+  plane via an optional `BUILD_SHA` env var written into a deploy-owned
+  `build.env`; a from-source / first-deploy boot leaves it unset and the
+  footer renders the version alone (#94)
 - Short-read host filtering. A new `host_filter` native job depletes host reads
   from `reads.parquet` in two stages — rype `rype_classify` against a host's
   POSITIVE `.ryxdi` (host = any match, not rype's `negative_index`), then
