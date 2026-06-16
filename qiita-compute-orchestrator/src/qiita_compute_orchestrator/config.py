@@ -105,6 +105,19 @@ class Settings:
     # fail-fast that matters; this mirrors main's prior SHARED_FILESYSTEM_ROOT
     # posture.
     path_scratch: str
+    # Derived-artifact base root (PATH_DERIVED). Native index builders write
+    # their persistent, reusable artifacts here:
+    # `{path_derived}/references/{idx}/{rype,minimap2}/...`. Resolved on every
+    # backend (LocalBackend smoke runs build indexes too) and leniently — like
+    # path_scratch, NOT validated as absolute/existing here. Distinct from
+    # `path_derived_images` below (the strict, SLURM-only `PATH_DERIVED/images`
+    # SIF dir). Both read PATH_DERIVED; the SLURM backend propagates it into the
+    # native-job env (see SlurmBackend.submit_step) so the launcher's
+    # get_settings() resolves the real value, not the $TMPDIR/qiita/derived
+    # dev fallback. On a SLURM deploy PATH_DERIVED is already mandatory —
+    # from_env() raises via _resolve_path_derived_images() if it's unset — so
+    # this lenient fallback only ever applies to LocalBackend/dev.
+    path_derived: str
     # The shared bearer token CP-to-CO calls present. Loaded from a file
     # in production; env-var fallback only when QIITA_ALLOW_TOKEN_ENV=true.
     cp_to_co_token: str
@@ -158,6 +171,10 @@ class Settings:
             path_scratch=os.environ.get(
                 "PATH_SCRATCH",
                 os.environ.get("TMPDIR", "/tmp") + "/qiita",
+            ),
+            path_derived=os.environ.get(
+                "PATH_DERIVED",
+                os.environ.get("TMPDIR", "/tmp") + "/qiita/derived",
             ),
             cp_to_co_token=_resolve_token("cp_to_co") if require_cp_to_co_token else "",
             cp_url=_resolve_cp_url(),

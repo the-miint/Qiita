@@ -10,7 +10,10 @@ and produces the **same** chunked shape:
 That is exactly what `hash_sequences` consumes, so the rest of the reference-add
 pipeline (`hash_sequences` → `mint-features` → `write-membership` → `load` →
 `register-files` → …) runs unchanged. This job is the *only* new step on the
-local path; everything downstream is reused verbatim.
+local path; everything downstream is reused verbatim. The host-reference index
+builds (`build_rype_index`, `build_minimap2_index`) consume the feature-keyed
+chunks the `load` step re-emits — there is no minimap2-specific side channel
+here.
 
 **Parsing + chunking are done in DuckDB, not Python.** FASTA records are read
 with miint's `read_fastx` table function (native parser; `.gz` transparent;
@@ -104,10 +107,10 @@ class Inputs(BaseModel):
 def _read_manifest(manifest_path: Path) -> list[Path]:
     """Parse the manifest into validated absolute FASTA paths.
 
-    One path per line; blank lines and `#` comments are skipped. Every entry
-    must be absolute and an existing file (fail fast, mirroring
-    bcl_convert_prep's guards). Raises ValueError on the first bad entry or if
-    no real path lines remain.
+    One absolute path per line; blank lines and `#` comments are skipped. Every
+    path must be absolute and an existing file (mirroring bcl_convert_prep's
+    guards). Raises ValueError on the first bad entry or if no real path lines
+    remain.
     """
     fasta_paths: list[Path] = []
     for raw in manifest_path.read_text().splitlines():
@@ -128,10 +131,10 @@ def _read_manifest(manifest_path: Path) -> list[Path]:
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     """Read every manifest FASTA with `read_fastx`; emit one combined chunked
-    Parquet. Validates the manifest and each listed file, stages all reads into
-    a DuckDB table (one `read_fastx` per file), fails fast on an empty-body
-    record or a duplicate read_id, then COPYs the `sequence_split`/`UNNEST`
-    chunking to `fasta.parquet`. Returns `{"fasta_path": <parquet>}`.
+    Parquet. Validates the manifest and each listed file, stages all reads into a
+    DuckDB table (one `read_fastx` per file), fails fast on an empty-body record
+    or a duplicate read_id, then COPYs the `sequence_split`/`UNNEST` chunking to
+    `fasta.parquet`. Returns `{"fasta_path": <parquet>}`.
     """
     if not inputs.fasta_manifest_path.is_absolute():
         raise ValueError(

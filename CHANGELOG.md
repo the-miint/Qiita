@@ -22,6 +22,26 @@ the `no-changelog` label).
   plane via an optional `BUILD_SHA` env var written into a deploy-owned
   `build.env`; a from-source / first-deploy boot leaves it unset and the
   footer renders the version alone (#94)
+- Short-read host filtering. A new `host_filter` native job depletes host reads
+  from `reads.parquet` in two stages — rype `rype_classify` against a host's
+  POSITIVE `.ryxdi` (host = any match, not rype's `negative_index`), then
+  minimap2 `align_minimap2` (`preset 'sr'`) on the survivors — dropping any read
+  flagged by either tool. Paired-end is handled natively: a read pair's R1/R2
+  ride one `sequence_idx` as `(sequence1, sequence2)` straight into the tools
+  (`rype_classify` reads both mates; `align_minimap2` aligns the pair in PE
+  mode), so either mate matching drops the whole pair without flattening. It's a
+  gated, optional step in a new `fastq-to-parquet/1.1.0` workflow
+  (`host_filter_enabled` + `host_reference_idx` context; pass-through when
+  disabled; `1.0.0` is kept and the submit route picks the version) (#89)
+- `build_minimap2_index` native job + a `minimap2` value for
+  `reference_index.index_type` (migration
+  `20260612000000_reference_index_minimap2_type`), so a host reference now
+  carries BOTH a rype `.ryxdi` and a minimap2 `.mmi`. The `host-reference-add` /
+  `local-host-reference-add` workflows gain the minimap2 build + a second
+  `register-index`. Like `build_rype_index`, it consumes the feature-keyed
+  `reference_sequence_chunks` (reassembling whole contigs via `string_agg`), so
+  the minimap2 index is built from the same data-plane bytes as everything else
+  — no raw-FASTA side channel (#89)
 - New nullable `bioproject_accession` column on the study table (unique
   when present), for NCBI/ENA BioProject tracking (#87)
 - Exposed study `bioproject_accession` through create, get, and patch: the
@@ -34,6 +54,20 @@ the `no-changelog` label).
 
 ### Changed
 
+- Reference index artifacts now live under a new orchestrator `PATH_DERIVED`
+  root (`{PATH_DERIVED}/references/{idx}/{rype,minimap2}/…`), relocated from
+  `PATH_SCRATCH`. `build_rype_index` / `build_minimap2_index` read
+  `Settings.path_derived` and the SLURM backend propagates `PATH_DERIVED` into
+  the job env (no host references exist in prod, so no migration of existing
+  artifacts) (#89)
+- The runner's `register-index` action reads its YAML-declared input
+  (`entry.inputs[0]`) instead of a hardcoded `rype_index_meta`, so one workflow
+  can register multiple index types (rype + minimap2) from their own metas (#89)
+- `ActionDefinition` now rejects duplicate `step:` entry names within an action
+  at load time — SLURM job naming and in-flight job adoption (`_find_job_by_name`)
+  key on the entry name, so two same-named steps would collide silently.
+  `action:` entries run in-process (keyed on step index) and may still repeat,
+  e.g. the two `register-index` actions in the host-reference workflows (#89)
 - The study lookup-by-accession default is now `bioproject_accession`
   (was `ena_study_accession`): callers omitting `accession_field` resolve
   against the BioProject column. This aligns the `qiita submit-bcl-convert`
@@ -175,7 +209,7 @@ the `no-changelog` label).
 - Host references for host-read filtering: `is_host` column on `qiita.reference`,
   the `reference_index` table tracking built indexes, an `indexing` reference
   status (`loading → indexing → active`), and the `host-reference-add` workflow
-  that builds a rype `.ryxdi` negative-filter index (`build_rype_index` native
+  that builds a rype `.ryxdi` host-filter index (`build_rype_index` native
   job + `register-index` library action) (#70)
 - `GET /reference` (list; filter by `kind` / `is_host` / `status`) and
   `GET /reference/{reference_idx}/index` (list a reference's built indexes) (#70)
@@ -243,9 +277,10 @@ the `no-changelog` label).
   No sequence bytes pass through Python and memory stays bounded for
   genome-scale records (#78)
 - The SLURM backend now propagates `PATH_SCRATCH` into the compute-node job
-  environment, so native steps that derive a persistent path from it (e.g.
-  `build_rype_index` writing the rype `.ryxdi`) resolve the real scratch root
-  instead of the `$TMPDIR/qiita` default (#70)
+  environment, so native steps that derive a path from the shared scratch base
+  (the per-ticket workspace root) resolve the real value instead of the
+  `$TMPDIR/qiita` default (#70). (Persistent index artifacts later moved off
+  `PATH_SCRATCH` to `PATH_DERIVED` — see the #89 Changed entry above.)
 - Centralized all REST path string literals into `qiita-common`'s
   `api_paths.py` (closes #12) (#60)
 - Bumped the study / prep_sample identity sequence start to 25000 (#61)
