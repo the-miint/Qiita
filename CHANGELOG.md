@@ -96,8 +96,11 @@ the `no-changelog` label).
   is no longer required for a normal redeploy. Migrations stay out-of-band
   (`RUN_MIGRATE=1` opts in after a typed confirm). `deploy/verify.sh` also gains
   `QIITA_API_USER` / `QIITA_ORCH_USER` overrides (defaults unchanged) for
-  consistency with the new `QIITA_USER` knob. Docs updated in `redeploy.md` /
-  `first-deploy.md` / `CLAUDE.md` (#TBD)
+  consistency with the new `QIITA_USER` knob. The deploy scripts'
+  copy-pasted helpers (root-gate, env-file reader, operator/clone resolution,
+  pass/fail/skip reporters, `/etc/qiita/*.env` path + service-account constants)
+  are consolidated into `deploy/_common.sh` — single-source, no behavior change.
+  Docs updated in `redeploy.md` / `first-deploy.md` / `CLAUDE.md` (#TBD)
 - The `collection_date` global biosample field is now a `text` field instead of
   a formal `date`, so it can hold partial dates such as a bare year (`2025`)
   (migration `20260616000000_collection_date_text`) (#98)

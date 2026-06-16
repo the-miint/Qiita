@@ -6,7 +6,10 @@
 
 set -euo pipefail
 
-[ "$EUID" -eq 0 ] || { echo "ERROR: deploy/activate.sh must be run as root (sudo)." >&2; exit 1; }
+# shellcheck source=deploy/_common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"  # require_root, read_env_var, CP_ENV, RSYNC_EXCLUDES
+
+require_root "deploy/activate.sh must be run as root (sudo)."
 : "${QIITA_HOSTNAME:?QIITA_HOSTNAME must be set (e.g. qiita.example.org)}"
 
 INCOMING=/opt/qiita/incoming
@@ -37,7 +40,7 @@ assert_migrations_applied() {
     # root:qiita-api env file is readable here. Absent only on first deploy —
     # the same gate as the actions sync / restarts below, where the DB is
     # bootstrapped out-of-band by the runbook's `make migrate`.
-    local env_file=/etc/qiita/control-plane.env
+    local env_file="$CP_ENV"
     [ -r "$env_file" ] || { echo "skipping migration guard — $env_file not present (first deploy)" >&2; return 0; }
 
     # The states below are anomalous on an established host (env file present).
@@ -49,12 +52,11 @@ assert_migrations_applied() {
         exit 1
     }
 
-    local db_url
-    # set +e so a sourced line that happens to evaluate non-zero doesn't abort the
-    # subshell under the script's errexit and silently blank db_url (it would then
+    # read_env_var (deploy/_common.sh) reads DATABASE_URL in a +eu subshell so a
+    # value referencing another var can't abort and silently blank it (which would
     # misreport as "DATABASE_URL unset" instead of the real cause).
-    db_url=$( set +e; set -a; # shellcheck disable=SC1090,SC1091
-              source "$env_file"; set +a; printf '%s' "${DATABASE_URL:-}" )
+    local db_url
+    db_url=$(read_env_var "$env_file" DATABASE_URL)
     [ -n "$db_url" ] || {
         echo "ERROR: DATABASE_URL unset in $env_file — cannot verify migrations; refusing to deploy blind." >&2
         exit 1
@@ -105,9 +107,6 @@ UV=/usr/local/bin/uv
 # runtime — venv symlinks resolve to a file qiita-api etc. can't execute.
 export UV_PYTHON_INSTALL_DIR=/opt/uv-python
 install -d -o root -g root -m 0755 "$UV_PYTHON_INSTALL_DIR"
-
-# shellcheck source=deploy/_common.sh
-source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"   # populates RSYNC_EXCLUDES
 
 rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$INCOMING/qiita-common/"              /opt/qiita/qiita-common/
 rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$INCOMING/qiita-control-plane/"       /opt/qiita/control-plane/

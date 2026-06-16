@@ -19,24 +19,17 @@
 
 set -euo pipefail
 
-[ "$EUID" -eq 0 ] || { echo "ERROR: deploy/verify.sh must be run as root (sudo) — it sudo's per service account and reads the 0440 env files." >&2; exit 1; }
-
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CP_ENV=/etc/qiita/control-plane.env
-CO_ENV=/etc/qiita/compute-orchestrator.env
+# shellcheck source=deploy/_common.sh
+source "$HERE/_common.sh"  # require_root, CP_ENV/CO_ENV, QIITA_API_USER/QIITA_ORCH_USER, pass/fail/skip
+
+require_root "deploy/verify.sh must be run as root (sudo) — it sudo's per service account and reads the 0440 env files."
+
 # The deployed orchestrator venv. The module-direct form below is PATH-independent
 # and is exactly what `qiita-admin compute-readiness` subprocesses into.
 ORCHESTRATOR_VENV="${ORCHESTRATOR_VENV:-/opt/qiita/compute-orchestrator/.venv}"
-# Service accounts the per-check `sudo -u` drops into. Overridable for sites that
-# named them differently (defaults match first-deploy.md §0.1); mirrors
-# redeploy.sh's QIITA_USER override for the operator account.
-QIITA_API_USER="${QIITA_API_USER:-qiita-api}"
-QIITA_ORCH_USER="${QIITA_ORCH_USER:-qiita-orch}"
 
 n_pass=0 n_fail=0 n_skip=0
-pass() { printf '  \xe2\x9c\x93 %s: %s\n' "$1" "$2"; n_pass=$((n_pass + 1)); }
-fail() { printf '  \xe2\x9c\x97 %s: %s\n' "$1" "$2"; n_fail=$((n_fail + 1)); }
-skip() { printf '  \xc2\xb7 %s: %s\n' "$1" "$2"; n_skip=$((n_skip + 1)); }
 
 echo "verify-deploy: post-deploy checks"
 

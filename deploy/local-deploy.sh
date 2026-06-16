@@ -13,16 +13,15 @@
 
 set -euo pipefail
 
-[ "$EUID" -eq 0 ] || { echo "ERROR: run as root (sudo)." >&2; exit 1; }
+# shellcheck source=deploy/_common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"  # require_root, qiita_resolve_user_clone, RSYNC_EXCLUDES
+
+require_root "run as root (sudo)."
 
 : "${QIITA_HOSTNAME:?QIITA_HOSTNAME must be set (e.g. qiita.example.org)}"
-QIITA_USER="${QIITA_USER:-qiita}"
-# QIITA_CLONE must be a git clone (where `git pull` + `make build` work),
-# NOT the deployed copy under /opt/qiita/ — that's the install target, not source.
-QIITA_CLONE="${QIITA_CLONE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-
-id "$QIITA_USER" >/dev/null 2>&1 || { echo "ERROR: account '$QIITA_USER' not found" >&2; exit 1; }
-[ -d "$QIITA_CLONE/.git" ] || { echo "ERROR: $QIITA_CLONE is not a git clone" >&2; exit 1; }
+# Sets + validates QIITA_USER (default qiita) and QIITA_CLONE — the git clone
+# where `git pull` + `make build` run, NOT the deployed /opt/qiita copy.
+qiita_resolve_user_clone
 
 [ -z "${SKIP_PULL:-}" ]  && sudo -u "$QIITA_USER" git -C "$QIITA_CLONE" pull --ff-only
 [ -z "${SKIP_BUILD:-}" ] && sudo -u "$QIITA_USER" make -C "$QIITA_CLONE" build-data-plane
@@ -43,9 +42,6 @@ DP_BINARY="$QIITA_CLONE/qiita-data-plane/target/release/qiita-data-plane"
 
 INCOMING=/opt/qiita/incoming
 install -d -o root -g root -m 0755 "$INCOMING"
-
-# shellcheck source=deploy/_common.sh
-source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"   # populates RSYNC_EXCLUDES
 
 rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/qiita-common/"              "$INCOMING/qiita-common/"
 rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/qiita-control-plane/"       "$INCOMING/qiita-control-plane/"

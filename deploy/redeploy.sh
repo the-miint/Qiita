@@ -36,22 +36,15 @@
 
 set -euo pipefail
 
-[ "$EUID" -eq 0 ] || {
-    echo "ERROR: run deploy/redeploy.sh as root (sudo) from your admin account — it drops" >&2
-    echo "       into ${QIITA_USER:-qiita} / qiita-api / qiita-orch per step via sudo -u (see header)." >&2
-    exit 1
-}
+# shellcheck source=deploy/_common.sh
+source "$(dirname "${BASH_SOURCE[0]}")/_common.sh"  # require_root, qiita_resolve_user_clone, read_env_var, CP_ENV/CO_ENV, QIITA_*_USER
+
+require_root "run deploy/redeploy.sh as root (sudo) from your admin account — it drops into ${QIITA_USER:-qiita} / ${QIITA_API_USER} / ${QIITA_ORCH_USER} per step via sudo -u (see header)."
 : "${QIITA_HOSTNAME:?QIITA_HOSTNAME must be set (e.g. qiita-miint.ucsd.edu)}"
 
-QIITA_USER="${QIITA_USER:-qiita}"
-# QIITA_CLONE must be the git clone (where pull/build/migrate run), NOT the
-# deployed /opt/qiita copy (which has no .git).
-QIITA_CLONE="${QIITA_CLONE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-CP_ENV=/etc/qiita/control-plane.env
-CO_ENV=/etc/qiita/compute-orchestrator.env
-
-id "$QIITA_USER" >/dev/null 2>&1 || { echo "ERROR: operator account '$QIITA_USER' not found" >&2; exit 1; }
-[ -d "$QIITA_CLONE/.git" ] || { echo "ERROR: $QIITA_CLONE is not a git clone" >&2; exit 1; }
+# Sets + validates QIITA_USER (operator/checkout owner) and QIITA_CLONE (the git
+# clone where pull/build/migrate run, NOT the deployed /opt/qiita copy).
+qiita_resolve_user_clone
 
 confirm() {
     # $1 = prompt. Honors ASSUME_YES=1; aborts on anything but an explicit yes.
@@ -59,15 +52,6 @@ confirm() {
     local reply
     read -r -p "$1 [y/N] " reply
     [ "$reply" = "y" ] || [ "$reply" = "Y" ] || { echo "Aborted." >&2; exit 1; }
-}
-
-# Read one KEY from a root-only env file (we are root). Subshell + `set +eu` so a
-# value that references another (unset) var doesn't abort under errexit/nounset
-# and silently blank it. bash strips the KEY=... quoting, matching the loader.
-read_env_var() {
-    local env_file="$1" var="$2"
-    # shellcheck disable=SC1090,SC1091
-    ( set +eu; set -a; source "$env_file" >/dev/null 2>&1; set +a; printf '%s' "${!var:-}" )
 }
 
 echo "=== redeploy: $QIITA_HOSTNAME (clone: $QIITA_CLONE, operator: $QIITA_USER) ==="
@@ -121,10 +105,11 @@ else
             confirm "Apply these migrations now with 'make migrate' (as $QIITA_USER)?"
             sudo -u "$QIITA_USER" env DATABASE_URL="$db_url" bash -lc "make -C '$QIITA_CLONE' migrate"
         else
-            echo "STOP: apply them out-of-band first, then re-run this script:"
-            echo "    sudo -u $QIITA_USER env DATABASE_URL=… bash -lc 'make -C $QIITA_CLONE migrate'"
-            echo "(See redeploy.md §4–§5 for the expand/contract caution, or re-run with"
-            echo " RUN_MIGRATE=1 to apply here after a typed confirmation.)"
+            echo "STOP: apply them out-of-band first — as $QIITA_USER, with DATABASE_URL"
+            echo "      sourced from control-plane.env, run 'make -C $QIITA_CLONE migrate' —"
+            echo "      then re-run this script. Or re-run now with RUN_MIGRATE=1 to apply"
+            echo "      here after a typed confirmation."
+            echo "(See redeploy.md §4–§5 for the expand/contract caution.)"
             exit 1
         fi
     else
@@ -150,8 +135,8 @@ elif [ -r "$CO_ENV" ]; then
     derived=$(read_env_var "$CO_ENV" PATH_DERIVED)
     nativepy=$(read_env_var "$CO_ENV" SLURM_NATIVE_PYTHON)
     if [ -n "$derived" ] && [ -n "$nativepy" ]; then
-        confirm "Stage the miint extension now (scripts/stage-miint-extension.sh, as qiita-orch)?"
-        sudo -u qiita-orch env PATH_DERIVED="$derived" SLURM_NATIVE_PYTHON="$nativepy" \
+        confirm "Stage the miint extension now (scripts/stage-miint-extension.sh, as $QIITA_ORCH_USER)?"
+        sudo -u "$QIITA_ORCH_USER" env PATH_DERIVED="$derived" SLURM_NATIVE_PYTHON="$nativepy" \
             bash "$QIITA_CLONE/scripts/stage-miint-extension.sh"
     else
         echo "PATH_DERIVED / SLURM_NATIVE_PYTHON not both set in $CO_ENV — skipping miint stage"
@@ -163,7 +148,8 @@ fi
 
 # --- 6. Verify --------------------------------------------------------------
 echo "--- [6/7] Verify (health + actions + compute-readiness, correct run-as each) ---"
-QIITA_HOSTNAME="$QIITA_HOSTNAME" "$QIITA_CLONE/deploy/verify.sh"
+env QIITA_HOSTNAME="$QIITA_HOSTNAME" QIITA_API_USER="$QIITA_API_USER" QIITA_ORCH_USER="$QIITA_ORCH_USER" \
+    "$QIITA_CLONE/deploy/verify.sh"
 
 # --- 7. Report deployed commit + archive hand-off ---------------------------
 echo "--- [7/7] Done ---"
