@@ -39,6 +39,8 @@ from qiita_common.api_paths import LibraryPrimitive, compute_upload_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.compute_backend_client import ComputeBackendClient
 from qiita_common.models import (
+    HOST_FILTER_INDEX_TYPE_MINIMAP2,
+    HOST_FILTER_INDEX_TYPE_RYPE,
     ComputeTarget,
     FailureType,
     FoundJobWire,
@@ -1090,8 +1092,12 @@ async def _resolve_host_filter_indexes(
             f"got {host_reference_idx!r}"
         )
     try:
-        rype_path = await _resolve_reference_index_path(pool, host_reference_idx, "rype")
-        minimap2_path = await _resolve_reference_index_path(pool, host_reference_idx, "minimap2")
+        rype_path = await _resolve_reference_index_path(
+            pool, host_reference_idx, HOST_FILTER_INDEX_TYPE_RYPE
+        )
+        minimap2_path = await _resolve_reference_index_path(
+            pool, host_reference_idx, HOST_FILTER_INDEX_TYPE_MINIMAP2
+        )
     except ReferenceNotFound as exc:
         raise _submission_bad_input(
             f"host_reference_idx={host_reference_idx} references an unknown reference"

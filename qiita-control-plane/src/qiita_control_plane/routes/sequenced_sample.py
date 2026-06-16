@@ -42,6 +42,7 @@ from pydantic import Field
 from qiita_common.api_paths import (
     PATH_SEQUENCED_SAMPLE_BY_IDX,
     PATH_SEQUENCED_SAMPLE_FROM_RUN,
+    PATH_SEQUENCED_SAMPLE_LIST_BY_POOL,
     PATH_SEQUENCED_SAMPLE_LIST_BY_RUN,
     PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY,
     PATH_SEQUENCED_SAMPLE_PREFIX,
@@ -55,6 +56,8 @@ from qiita_common.models import (
     MetadataChecklistRef,
     SequencedSampleCreateRequest,
     SequencedSampleCreateResponse,
+    SequencedSampleListItem,
+    SequencedSampleListResponse,
     SequencedSamplePatchRequest,
     SequencedSampleResponse,
     Tier,
@@ -85,6 +88,7 @@ from ..repositories._sample_helpers import (
 )
 from ..repositories.prep_sample_metadata import PREP_SAMPLE_METADATA_SPEC
 from ..repositories.sequenced_sample import (
+    fetch_sequenced_pool_samples,
     fetch_sequenced_sample_idxs_for_run,
     fetch_sequenced_sample_idxs_for_study,
     fetch_sequenced_sample_with_prep_sample,
@@ -321,6 +325,50 @@ async def list_sequenced_sample_idxs_in_run(
         rows = rows[:_SEQUENCED_SAMPLE_IDXS_HARD_CAP]
     return IdxsListResponse(
         idxs=rows,
+        count=len(rows),
+        truncated=truncated,
+        caller_system_role=user.system_role,
+    )
+
+
+@router.get(PATH_SEQUENCED_SAMPLE_LIST_BY_POOL)
+async def list_sequenced_samples_in_pool(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> SequencedSampleListResponse:
+    """List the path's pool's active sequenced_samples with their
+    prep_sample_idx + sequenced_pool_item_id, ordered by pool-item id.
+
+    Pool-scoped sibling of `list_sequenced_sample_idxs_in_run`: that route is
+    run-scoped (spans every pool in the run) and returns bare idxs; this one
+    is scoped to a single pool and returns the richer per-sample rows a
+    fan-out needs (e.g. `qiita submit-host-filter-pool`, which keys each
+    bcl-convert FASTQ on the sequenced_pool_item_id). Caller must be a
+    HumanUser with Scope.PREP_SAMPLE_READ and system_role at least
+    wet_lab_admin — the same gate as the run-scoped list. The
+    require_sequenced_pool_in_run guard fires a 404 for an unknown pool and a
+    422 when the pool does not belong to the path's run, before the read
+    runs. Excludes rows whose supertype prep_sample is retired. The
+    `truncated` flag indicates the underlying set exceeded the hard cap;
+    callers hitting it should narrow their scope.
+    """
+    # Fetch cap+1 rows so a count strictly greater than the cap signals
+    # truncation; the route slices back to the cap before returning.
+    rows = await fetch_sequenced_pool_samples(
+        pool,
+        sequenced_pool_idx=sequenced_pool_idx,
+        limit=_SEQUENCED_SAMPLE_IDXS_HARD_CAP + 1,
+    )
+    truncated = len(rows) > _SEQUENCED_SAMPLE_IDXS_HARD_CAP
+    if truncated:
+        rows = rows[:_SEQUENCED_SAMPLE_IDXS_HARD_CAP]
+    return SequencedSampleListResponse(
+        samples=[SequencedSampleListItem.model_validate(dict(r)) for r in rows],
         count=len(rows),
         truncated=truncated,
         caller_system_role=user.system_role,

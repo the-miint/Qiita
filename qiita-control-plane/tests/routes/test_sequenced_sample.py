@@ -23,6 +23,7 @@ from httpx import ASGITransport, AsyncClient
 from qiita_common.api_paths import (
     URL_SEQUENCED_SAMPLE_BY_IDX,
     URL_SEQUENCED_SAMPLE_FROM_RUN,
+    URL_SEQUENCED_SAMPLE_LIST_BY_POOL,
     URL_SEQUENCED_SAMPLE_LIST_BY_RUN,
     URL_SEQUENCED_SAMPLE_LIST_BY_STUDY,
 )
@@ -1549,6 +1550,233 @@ async def test_list_sequenced_sample_idxs_nonexistent_run_404(ctx):
     )
     assert resp.status_code == 404
     assert "sequencing_run" in resp.json()["detail"]
+
+
+# ===========================================================================
+# GET /sequencing-run/{run}/sequenced-pool/{pool}/sequenced-sample/list
+# (pool-scoped, richer rows: prep_sample_idx + sequenced_pool_item_id)
+# ===========================================================================
+
+
+async def _seed_pool_sample(ctx, *, run_idx, pool_idx, study_idx, protocol_idx, suffix):
+    """Land one sequenced_sample on the given (run, pool) and return the
+    {sequenced_sample_idx, prep_sample_idx, sequenced_pool_item_id} the
+    pool-scoped list is expected to surface."""
+    bs = await _seed_biosample_linked_to_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], study_idx=study_idx
+    )
+    item_id = _unique_item_id(suffix)
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        sequenced_pool_item_id=item_id,
+        primary_study_idx=study_idx,
+    )
+    assert resp.status_code == 201, resp.text
+    rj = resp.json()
+    return {
+        "sequenced_sample_idx": rj["sequenced_sample_idx"],
+        "prep_sample_idx": rj["prep_sample_idx"],
+        "sequenced_pool_item_id": item_id,
+    }
+
+
+async def test_list_pool_samples_happy_path(ctx):
+    # Two samples in one pool; the list returns both with their
+    # prep_sample_idx + pool_item_id, ordered by sequenced_pool_item_id.
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "pool-list")
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="pool-list"
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    landed = [
+        await _seed_pool_sample(
+            ctx,
+            run_idx=run_idx,
+            pool_idx=pool_idx,
+            study_idx=study_idx,
+            protocol_idx=protocol_idx,
+            suffix=f"POOL-{s}",
+        )
+        for s in ("A", "B")
+    ]
+
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
+            sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+        )
+    )
+    assert resp.status_code == 200, resp.text
+    expected = {
+        "samples": sorted(landed, key=lambda s: s["sequenced_pool_item_id"]),
+        "count": 2,
+        "truncated": False,
+        "caller_system_role": "wet_lab_admin",
+    }
+    assert resp.json() == expected
+
+
+async def test_list_pool_samples_empty(ctx):
+    # A pool with no samples returns the zero-row envelope, not 404 — the
+    # require_sequenced_pool_in_run guard passes on the existing pool.
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "pool-empty")
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
+            sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+        )
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "samples": [],
+        "count": 0,
+        "truncated": False,
+        "caller_system_role": "wet_lab_admin",
+    }
+
+
+async def test_list_pool_samples_excludes_retired_prep_sample(ctx):
+    # Retiring one sample's supertype prep_sample drops it from the list.
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "pool-ret")
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="pool-ret"
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    keep = await _seed_pool_sample(
+        ctx,
+        run_idx=run_idx,
+        pool_idx=pool_idx,
+        study_idx=study_idx,
+        protocol_idx=protocol_idx,
+        suffix="POOL-KEEP",
+    )
+    drop = await _seed_pool_sample(
+        ctx,
+        run_idx=run_idx,
+        pool_idx=pool_idx,
+        study_idx=study_idx,
+        protocol_idx=protocol_idx,
+        suffix="POOL-DROP",
+    )
+    await _retire_prep_sample(
+        ctx["pool"],
+        prep_sample_idx=drop["prep_sample_idx"],
+        retired_by_idx=ctx["wet_session"]["principal_idx"],
+    )
+
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
+            sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+        )
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["count"] == 1
+    assert body["samples"] == [keep]
+
+
+async def test_list_pool_samples_truncated(ctx, monkeypatch):
+    # cap=1 forces the truncation branch on two seeded rows.
+    monkeypatch.setattr(
+        "qiita_control_plane.routes.sequenced_sample._SEQUENCED_SAMPLE_IDXS_HARD_CAP",
+        1,
+    )
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "pool-trunc")
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="pool-trunc"
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    landed = [
+        await _seed_pool_sample(
+            ctx,
+            run_idx=run_idx,
+            pool_idx=pool_idx,
+            study_idx=study_idx,
+            protocol_idx=protocol_idx,
+            suffix=f"POOL-T{s}",
+        )
+        for s in ("A", "B")
+    ]
+
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
+            sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+        )
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # cap=1 keeps the first row in sequenced_pool_item_id order.
+    first = sorted(landed, key=lambda s: s["sequenced_pool_item_id"])[0]
+    assert body == {
+        "samples": [first],
+        "count": 1,
+        "truncated": True,
+        "caller_system_role": "wet_lab_admin",
+    }
+
+
+async def test_list_pool_samples_pool_not_in_run_422(ctx):
+    # Pool exists but belongs to a different run → 422 from
+    # require_sequenced_pool_in_run.
+    run_a, pool_a = await _seed_run_and_pool(ctx, "pool-xrun-a")
+    run_b, _pool_b = await _seed_run_and_pool(ctx, "pool-xrun-b")
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
+            sequencing_run_idx=run_b, sequenced_pool_idx=pool_a
+        )
+    )
+    assert resp.status_code == 422
+    assert "does not belong to" in resp.json()["detail"]
+
+
+async def test_list_pool_samples_nonexistent_pool_404(ctx):
+    run_idx, _pool_idx = await _seed_run_and_pool(ctx, "pool-404")
+    max_pool = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.sequenced_pool")
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
+            sequencing_run_idx=run_idx, sequenced_pool_idx=max_pool + 100_000
+        )
+    )
+    assert resp.status_code == 404
+    assert "sequenced_pool" in resp.json()["detail"]
+
+
+async def test_list_pool_samples_anonymous_401(ctx):
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "pool-anon")
+    app.state.pool = ctx["pool"]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
+        resp = await anon.get(
+            URL_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
+                sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+            )
+        )
+    assert resp.status_code == 401
+
+
+async def test_list_pool_samples_missing_scope_403(ctx, no_prep_sample_read_client):
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "pool-noscope")
+    resp = await no_prep_sample_read_client.get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
+            sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+        )
+    )
+    assert resp.status_code == 403
+    assert "prep_sample:read" in resp.json()["detail"]
+
+
+async def test_list_pool_samples_regular_user_role_403(ctx):
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "pool-user")
+    resp = await ctx["user"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
+            sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+        )
+    )
+    assert resp.status_code == 403
+    assert "wet_lab_admin" in resp.json()["detail"]
 
 
 # ===========================================================================

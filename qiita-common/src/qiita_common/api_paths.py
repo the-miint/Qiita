@@ -338,6 +338,13 @@ PATH_SEQUENCED_SAMPLE_FROM_RUN = (
 )
 PATH_SEQUENCED_SAMPLE_LIST_BY_RUN = "/{sequencing_run_idx}/sequenced-sample/list-idxs"
 PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY = "/{study_idx}/sequenced-sample/list-idxs"
+# Pool-scoped sibling of LIST_BY_RUN. Returns richer per-sample rows
+# (prep_sample_idx + sequenced_pool_item_id), hence the `list` segment rather
+# than `list-idxs`. Anchored on /sequencing-run so require_sequenced_pool_in_run
+# can check both ids in one round trip.
+PATH_SEQUENCED_SAMPLE_LIST_BY_POOL = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/sequenced-sample/list"
+)
 
 PATH_SEQUENCED_SAMPLE_PREFIX = "/sequenced-sample"
 PATH_SEQUENCED_SAMPLE_BY_IDX = "/{sequenced_sample_idx}"
@@ -345,5 +352,8 @@ PATH_SEQUENCED_SAMPLE_BY_IDX = "/{sequenced_sample_idx}"
 URL_SEQUENCED_SAMPLE_FROM_RUN = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_FROM_RUN}"
 URL_SEQUENCED_SAMPLE_LIST_BY_RUN = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_RUN}"
 URL_SEQUENCED_SAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY}"
+URL_SEQUENCED_SAMPLE_LIST_BY_POOL = (
+    f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_POOL}"
+)
 URL_SEQUENCED_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_SEQUENCED_SAMPLE_PREFIX}"
 URL_SEQUENCED_SAMPLE_BY_IDX = f"{URL_SEQUENCED_SAMPLE_PREFIX}{PATH_SEQUENCED_SAMPLE_BY_IDX}"
