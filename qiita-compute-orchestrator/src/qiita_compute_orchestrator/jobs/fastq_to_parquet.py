@@ -45,6 +45,16 @@ file-level length estimate is metadata-only; per-row length is
 without a buffer copy. Carrying a precomputed BIGINT per row is a
 storage cost without a query-speed win.
 
+**sequence_idx gap note.** The minted range is sized to ALL parsed reads and is
+contiguous HERE. But `sequence_idx` is only a unique, sorted join key — it is
+NOT a dense row counter. Additive downstream steps that drop rows (today
+`host_filter` removes host reads; future QC may drop more) leave benign GAPS in
+the surviving `sequence_idx`. A consumer — especially a future DuckLake
+registration step reading `reads.parquet` / `filtered_reads.parquet` — must
+never assume `row count == (max sequence_idx − min + 1)` or that the values are
+gap-free; treat `sequence_idx` as a sparse key. (Gaps don't hurt DuckLake
+pruning / Parquet predicate pushdown, and the uint64 space isn't a concern.)
+
 Pipeline (B-staged-Parquet):
 
   1. Reject empty input. A decompressed-stream peek (handles plain

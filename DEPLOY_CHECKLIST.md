@@ -19,11 +19,37 @@ _None yet._
 
 ### 2. One-time host setup
 
-_None yet._
+- (#89) [operator] Two prerequisites for the host-filter / minimap2-index work,
+  both BEFORE the bucket-4 deploy:
+  1. The **v1.5.3** miint mirror build must also carry the host-filter functions
+     — `save_minimap2_index` (used by the new `build_minimap2_index` step) and
+     `align_minimap2` (used by `host_filter`). `rype_classify` is already
+     present; the duckdb-miint #126 BIGINT-`id_column` change is nice-to-have,
+     NOT required (`host_filter` appends the rype id into a BIGINT accumulator
+     column, which coerces a VARCHAR-returning build on insert, so a pre-#126
+     build also works). Components `FORCE INSTALL miint` for
+     v1.5.3, so they pull this build; a missing `save_minimap2_index` fails
+     `build_minimap2_index` at the first host-reference build. Unlike
+     `sequence_split` there is **no** compute-readiness probe for these yet (a
+     follow-up could add one) — the first `host-reference-add` run is the
+     functional gate.
+  2. The index builders now write under **`PATH_DERIVED`**
+     (`{PATH_DERIVED}/references/{idx}/{rype,minimap2}/…`), relocated from
+     `PATH_SCRATCH`. `PATH_DERIVED` is already mandatory on the SLURM deploy (it
+     also roots the SIF images dir), so this adds no new env var — just ensure
+     the orchestrator service account can create/write
+     `{PATH_DERIVED}/references/` (the jobs `mkdir` it at runtime). No prod host
+     references exist yet, so nothing to migrate.
 
 ### 3. Migrations
 
-_None yet._
+```bash
+# [operator] DATABASE_URL must be in your shell, pointing at the SAME DB as
+# control-plane.env. activate.sh re-checks public.schema_migrations at deploy
+# time and ABORTS before any restart if one is unapplied.
+make -C ~/qiita-miint migrate
+```
+`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#89) adds `20260612000000_reference_index_minimap2_type` (drops + re-adds the `reference_index.index_type` CHECK to allow `'minimap2'` alongside `'rype'`; no extension, backfill, or pre-check).
 
 ### 4. Deploy
 
@@ -31,11 +57,19 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+```bash
+# (#89) [admin] spot-check that the brand-new fastq-to-parquet/1.1.0 row reached
+# qiita.action. activate.sh runs `qiita-admin actions sync` and ABORTS on
+# failure, so the in-place upserts of the *changed* host-reference-add /
+# local-host-reference-add rows are gated there — this query just confirms the
+# one new row landed.
+psql "$DATABASE_URL" -tAc \
+  "SELECT count(*) FROM qiita.action WHERE action_id='fastq-to-parquet' AND version='1.1.0'"   # 1 (#89)
+```
 
 ### Notes (no host action)
 
-_None yet._
+- (#89) Short-read host filtering is **opt-in** and changes no existing behavior: `fastq-to-parquet/1.0.0` is unchanged, and `1.1.0` only runs the host filter when a ticket sets `host_filter_enabled: true` + a `host_reference_idx` (a built host reference). Clients submitting `1.0.0` (or `1.1.0` without the flag) are unaffected. The host-reference-add workflows now build a minimap2 `.mmi` in addition to the rype `.ryxdi` (bucket-2 mirror prerequisite); no API/client change.
 
 ---
 

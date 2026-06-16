@@ -2,7 +2,7 @@
 
 > **Audience:** developers writing or reviewing data-plane / orchestrator / reference-ingestion code that calls miint. Not an end-user reference for the extension itself — upstream owns that.
 > **Upstream:** https://github.com/the-miint/duckdb-miint
-> **Last checked:** 2026-05-20 (against default branch `v1.5-variegata`, latest docs commit `c330b11b` from 2026-05-18)
+> **Last checked:** 2026-06-15 (host-filter functions re-verified directly against the team-mirror build `e6f598d` via probes + smokes — `align_minimap2` paired-end query support, `rype_classify` reading `sequence2`, and the mirror's VARCHAR `read_id` output for rype). The 2026-06-13 pass diffed the default branch `v1.5-variegata` (docs commit `2cb50cd3`); the rest of the inventory was not re-diffed since.
 > **Refresh trigger:** if today's date is more than 7 days after **Last checked** above, re-verify against upstream `docs/` before relying on any signature here — the project ships frequently and function signatures, parameter names, and embedded-tool versions drift. See [Keeping this doc fresh](#keeping-this-doc-fresh).
 
 `duckdb-miint` is the DuckDB extension that powers all bioinformatics SQL in qiita — the data plane links it in, native orchestrator jobs invoke its functions, and several reference-data ingestion steps are thin wrappers around its table functions. Treat this file as the index: when you need a real signature, click through to the upstream doc rather than trusting paraphrased examples here.
@@ -92,8 +92,8 @@ Signatures are abbreviated — go to the upstream `.md` for full parameter docs.
 - `phylogeny_fasttree(table_name, [options])`
 
 **Alignment / mapping (table-valued):**
-- `align_minimap2(query_table, [subject_table=NULL], [index_path=NULL], [options])`
-- `save_minimap2_index(subject_table, output_path, [options])`
+- `align_minimap2(query_table, [subject_table=NULL], [index_path=NULL], [options])` — SAM-like rows `(read_id, flags, reference, position, …)`; any row = a hit (a non-matching read emits none). **qiita-verified 2026-06-15** (host_filter probe + smoke, mirror build `e6f598d`): the query table's first positional arg is the table NAME; `read_id` round-trips its input type (BIGINT in → BIGINT out). It reads a `sequence1` column and, when present, `sequence2` — a `(read_id, sequence1, sequence2)` query table aligns in **paired-end mode** (sets the mate / `template_length` SAM fields; one row per mate). A NULL `sequence2` is tolerated (single-end). Named opts include `preset` (e.g. `'sr'`) and `max_secondary` (`:= 0` to drop secondary alignments). Consumed by `host_filter`.
+- `save_minimap2_index(subject_table, output_path, [options])` — writes a minimap2 `.mmi`. **qiita-verified 2026-06-15** (build_minimap2_index smoke): exactly **two positional args** (subject-table NAME, output path) + named opts `eqx`/`w`/`k`/`preset` (`preset := 'sr'`); the subject table needs `(read_id, sequence1)` (`read_id` may be BIGINT); returns one row `(success BOOLEAN, index_path VARCHAR, num_subjects INTEGER)` — assert `success`. Consumed by `build_minimap2_index`.
 - `align_minimap2_sharded(query_table, shard_directory, read_to_shard, [options])`
 - `align_bowtie2(query_table, subject_table, [options])` / `align_bowtie2_sharded(...)`
 - `align_mafft(table_name, [sample_id='col'])`
@@ -111,7 +111,7 @@ Signatures are abbreviated — go to the upstream `.md` for full parameter docs.
 **Diagnostics:** `miint_warnings()`.
 
 ### RYpe classification — `docs/rype.md`
-- `rype_classify(index_path, sequence_table, [id_column='read_id'], [threshold=0.1], [negative_index=path])`
+- `rype_classify(index_path, sequence_table, [id_column='read_id'], [threshold=0.1], [negative_index=path])` — one row per matched read (**≤1 per read**) `(read_id, bucket_id, bucket_name, score)`. **qiita-verified 2026-06-15** (host_filter probe + smoke, mirror build `e6f598d`): qiita passes the **POSITIVE** host index (host = any emitted row, low explicit `threshold` — NOT `negative_index`/`-N`). It reads `sequence1` and, when present, `sequence2` (a host match in EITHER mate emits the read; a NULL `sequence2` is tolerated). `id_column` accepts `{VARCHAR, BIGINT, UUID}` on input. Output id type is build-dependent (a probe of the ftp.microbio.me build `e6f598d` returned VARCHAR for a BIGINT input; #126's input-type round-trip may differ on a newer build), so `host_filter` does not depend on it: it appends `read_id` into a BIGINT accumulator column, which coerces either type on insert. It also DISTINCTs the result — the table-function interface does not guarantee one best-hit row per read. Consumed by `host_filter`.
 - `rype_log_ratio(numerator_path, denominator_path, sequence_table, [id_column='read_id'], [skip_threshold=0.5])`
 - `rype_extract_minimizer_set(sequence_table, k, w, [salt=6148914691236517205], [id_column='read_id'])`
 - `rype_extract_strand_minimizers(sequence_table, k, w, [salt=…], [id_column='read_id'])`

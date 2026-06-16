@@ -49,6 +49,9 @@ def _build_backend(settings: Settings) -> ComputeBackend:
             # the real PATH_SCRATCH on the compute node instead of the
             # $TMPDIR/qiita default. See SlurmBackend.submit_step's extra_env wiring.
             path_scratch=settings.path_scratch,
+            # Propagated into the job env for the same reason as path_scratch:
+            # native index builders derive {path_derived}/references/{idx}/...
+            path_derived=settings.path_derived,
             qos=settings.slurm.qos,
             # PATH_DERIVED/images is validated in Settings.from_env when
             # backend_type=slurm — non-None here on the production path.

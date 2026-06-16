@@ -500,8 +500,8 @@ async def do_reference_load(
       files. `flight_client` is unused. `fasta_path` must be unset.
 
     `host=True` marks the new reference `is_host=true` and routes to the
-    `(local-)host-reference-add` action (which additionally builds the rype
-    index consumed as a negative filter at host-read-filtering time). A host
+    `(local-)host-reference-add` action (which additionally builds the rype +
+    minimap2 host-filter indexes consumed at host-read-filtering time). A host
     reference requires `taxonomy_path` — it's the rype mapping authority's
     source — so it's a fail-fast precondition here."""
     has_idx = reference_idx is not None

@@ -366,3 +366,22 @@ class ActionDefinition(BaseModel):
         if len(self.target_processing_kinds) != len(set(self.target_processing_kinds)):
             raise ValueError("target_processing_kinds must not contain duplicates")
         return self
+
+    @model_validator(mode="after")
+    def _step_entry_names_unique(self) -> ActionDefinition:
+        # SLURM keys a step's job_name and per-attempt workspace on
+        # (work_ticket_idx, entry.name, attempt), and `_find_job_by_name` adopts
+        # an in-flight job by that name — all of which assume a `step:` name is
+        # unique per ticket. Two `step:` entries sharing a name would collide
+        # silently (the wrong job could be adopted), so reject it at load time.
+        # `action:` entries run in-process keyed on the step INDEX, not the name,
+        # so they may repeat (e.g. two `register-index` actions in one workflow).
+        step_names = [e.name for e in self.steps if isinstance(e, WorkflowStep)]
+        dupes = sorted({n for n in step_names if step_names.count(n) > 1})
+        if dupes:
+            raise ValueError(
+                f"duplicate step name(s) {dupes}: `step:` entry names must be unique "
+                "within an action — SLURM job naming and job adoption key on the "
+                "name. (`action:` entries run in-process and may repeat.)"
+            )
+        return self

@@ -63,6 +63,7 @@ def _make_settings(jwt_path: Path) -> Settings:
     return Settings(
         backend_type="slurm",
         path_scratch="/scratch/qiita",
+        path_derived="/scratch/persistent",
         cp_to_co_token="",
         cp_url="https://qiita.example.org",
         co_to_cp_token="probe-co-to-cp-token",
