@@ -26,6 +26,13 @@ the `no-changelog` label).
   `GET /sequencing-run/{run}/sequenced-pool/{pool}/sequenced-sample/list`
   returning `(sequenced_sample_idx, prep_sample_idx, sequenced_pool_item_id)`
   per active sample (#99)
+- `compute-readiness` now probes that the deploy-staged miint build registers the
+  short-read host-filter functions `save_minimap2_index` (the
+  `build_minimap2_index` step) and `align_minimap2` (the `host_filter` step), via
+  a `miint-host-filter-fns` check against `duckdb_functions()`. These were the
+  newest miint additions with no probe, so a v1.5.3 mirror build missing either
+  was only caught at the first `host-reference-add` run; it now surfaces at
+  deploy alongside `miint-read-fastx` / `miint-sequence-split` (#TBD)
 - The public landing page footer now shows the deployed commit's short git
   SHA next to the package version (e.g. `v2026.3.0 (a28c96e)`), linked to its
   GitHub commit. The SHA is captured at deploy (`deploy/local-deploy.sh` from
@@ -87,8 +94,10 @@ the `no-changelog` label).
   `DATABASE_URL` from `control-plane.env` itself (handing it to the operator's
   `make migrate`), so the operator's shell no longer needs it and the #72 ACL
   is no longer required for a normal redeploy. Migrations stay out-of-band
-  (`RUN_MIGRATE=1` opts in after a typed confirm). Docs updated in
-  `redeploy.md` / `first-deploy.md` / `CLAUDE.md` (#TBD)
+  (`RUN_MIGRATE=1` opts in after a typed confirm). `deploy/verify.sh` also gains
+  `QIITA_API_USER` / `QIITA_ORCH_USER` overrides (defaults unchanged) for
+  consistency with the new `QIITA_USER` knob. Docs updated in `redeploy.md` /
+  `first-deploy.md` / `CLAUDE.md` (#TBD)
 - The `collection_date` global biosample field is now a `text` field instead of
   a formal `date`, so it can hold partial dates such as a bare year (`2025`)
   (migration `20260616000000_collection_date_text`) (#98)

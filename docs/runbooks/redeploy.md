@@ -108,6 +108,11 @@ sudo make -C ~/qiita-miint preflight
 
 ## 4. Apply migrations
 
+> Doing the §0 fast path? Skip this — `redeploy.sh` runs the gate for you,
+> reading `DATABASE_URL` from `control-plane.env` (it is root) and handing it to
+> the operator's `make migrate`, so you need neither the ACL nor `DATABASE_URL`
+> in your shell. The manual route below is for driving the step by hand.
+
 ```bash
 # [operator] DATABASE_URL must be in your shell, pointing at the SAME DB as
 #            control-plane.env (the guard, running as root, checks that one).
