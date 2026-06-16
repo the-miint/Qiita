@@ -42,6 +42,19 @@ the `no-changelog` label).
   `reference_sequence_chunks` (reassembling whole contigs via `string_agg`), so
   the minimap2 index is built from the same data-plane bytes as everything else
   — no raw-FASTA side channel (#89)
+- `make verify-deploy` (`deploy/verify.sh`) — one command runs the generic
+  post-deploy checks (health aggregate, `qiita.action` list, and
+  compute-readiness) each with the correct service account/env baked in, so the
+  compute-readiness run-as line is no longer hand-copied into every deploy
+  (#72)
+- `make preflight` (`deploy/preflight.sh`) — read-only config/secret consistency
+  check (PATH_SCRATCH byte-identity across env files, HMAC CP==DP, token-file
+  perms, connection-string shape) that prints non-secret SHA-256 fingerprints;
+  catches the silent runtime-failure class before a restart (#72)
+- `make redeploy` (`deploy/redeploy.sh`) — guided incremental redeploy that
+  codifies redeploy.md's skeleton (pull → preflight → migration gate →
+  local-deploy.sh → stage → verify); migrations stay out-of-band (verify and
+  refuse, never auto-apply) (#72)
 - New nullable `bioproject_accession` column on the study table (unique
   when present), for NCBI/ENA BioProject tracking (#87)
 - Exposed study `bioproject_accession` through create, get, and patch: the
@@ -68,6 +81,17 @@ the `no-changelog` label).
   key on the entry name, so two same-named steps would collide silently.
   `action:` entries run in-process (keyed on step index) and may still repeat,
   e.g. the two `register-index` actions in the host-reference workflows (#89)
+- The compute service-account name is documented as **site-chosen** (`compute`
+  on the live deploy) across the provisioning/rotation runbooks, `docs/auth.md`,
+  `first-deploy.md`, `CLAUDE.md`, and the orchestrator `config.py` comments —
+  the docs no longer imply a fixed `compute-worker` name that drifts from the
+  live SA (#72)
+- Operators now get a narrow POSIX ACL read on the three `/etc/qiita/*.env`
+  files (granted to the existing operator account, e.g. `u:qiita:r`; not the
+  bearer tokens, not lake data), so `make migrate` can source `DATABASE_URL` and
+  config consistency is verifiable without sudo or hand-copied secrets. Operators
+  still join no service group, preserving DuckLake/scratch isolation. Documented
+  in `first-deploy.md` §0.1 + the deploy checklist (#72)
 - The study lookup-by-accession default is now `bioproject_accession`
   (was `ena_study_accession`): callers omitting `accession_field` resolve
   against the BioProject column. This aligns the `qiita submit-bcl-convert`
@@ -147,6 +171,16 @@ the `no-changelog` label).
 
 ### Fixed
 
+- `docs/runbooks/redeploy.md` §7 no longer tells the operator to run
+  `compute-readiness` as `qiita-api` sourcing `control-plane.env` (which fails:
+  it needs the `qiita-orch` account + `compute-orchestrator.env` + the 0400
+  `co-to-cp.token`) — the recurring deploy defect from #72. It now points at
+  `make verify-deploy` and documents the correct `qiita-orch` form (#72)
+- `qiita-admin compute-readiness` / `python -m …compute_readiness` now fail
+  loudly with the correct `sudo -u qiita-orch …` invocation when misinvoked,
+  instead of silently exiting 0: a non-slurm backend on a real orchestrator host
+  (env file present) is a `fail` row, and a present-but-unreadable
+  `co-to-cp.token` raises an actionable error naming the file + ownership (#72)
 - `qiita submit-bcl-convert` now opens the preflight blob via
   run-preflight's `open_db_file` instead of a hand-rolled read-only
   `sqlite3.connect`, opening it the way the library expects (#92)

@@ -33,7 +33,12 @@ make migrate
 
 # Deploy (prints systemd + nginx instructions; does not sudo)
 make deploy
-make verify-health         # auto-installs grpcurl
+make verify-health         # auto-installs grpcurl; localhost-only health curls
+
+# Established-host deploy tooling (run on the deploy host)
+make redeploy QIITA_HOSTNAME=<fqdn>      # operator: guided incremental redeploy (pull→preflight→migrate gate→deploy→stage→verify)
+sudo make preflight                      # read-only config/secret consistency + non-secret fingerprints (or plain `make preflight` as the ACL-granted operator — token fingerprints degrade to n/a)
+sudo make verify-deploy QIITA_HOSTNAME=<fqdn>  # generic post-deploy checks (health, actions, compute-readiness) with correct run-as each
 
 # Clean component build artifacts (.venv, target/, caches)
 make clean
@@ -172,6 +177,8 @@ Invariants that hold for every deploy — enforce them when writing deploy-affec
 - **`local-deploy.sh` is idempotent and re-runnable.** It rsyncs all four components + `workflows/`, `uv sync`s with `--reinstall-package qiita-common` (cross-package staleness), runs `qiita-admin actions sync`, and restarts only services whose env file exists. A failed deploy is safe to re-run after fixing the cause.
 - **Workflow YAML ships out-of-tree and is synced, not migrated.** New/changed files under `workflows/` reach `qiita.action` via `qiita-admin actions sync` (run inside `activate.sh`), not via a DB migration.
 
+Operator helpers (do not weaken the invariants above): `make redeploy` (`deploy/redeploy.sh`) is a thin wrapper that runs `redeploy.md`'s fixed skeleton — it **verifies migrations ran and refuses otherwise, it never auto-applies them** (the out-of-band invariant stands). `make preflight` (`deploy/preflight.sh`) is a read-only config/secret consistency check (PATH_SCRATCH byte-identity, HMAC CP==DP, token-file perms, connection-string shape) that prints non-secret fingerprints; the host-file secret model (per-service `/etc/qiita/*.env` + separate `0400`/`0440` token files, hand-installed once) is unchanged. `make verify-deploy` (`deploy/verify.sh`) is the single generic post-deploy check (health, `qiita.action` list, `compute-readiness`) with the correct service account/env baked in for each — so the `compute-readiness` run-as is never hand-copied (the recurring #72 defect). `local-deploy.sh`/`activate.sh` stay generic; the new scripts are additive and read-only/orchestration-only.
+
 When a change touches the deploy path (a new env var, a new `workflows/` entry, a migration needing out-of-band setup, a new host directory, a service-account scope grant), the same PR must: fold its steps into `## Pending deploy` (via `/deploy-note`), update the relevant `.env.*.example`, and — if the standing procedure changes — update `redeploy.md`. Keep `local-deploy.sh`/`activate.sh` generic; per-deploy specifics live in the deploy checklist, never hardcoded in the scripts.
 
 ## Architecture
@@ -236,7 +243,7 @@ The data plane is intentionally "dumb": it only operates on identifiers it recei
 
 The orchestrator is a passive, **stateless** HTTP service: the control-plane runner drives the decoupled `POST /api/v1/step/{submit,status,result}` trio (plus `POST /api/v1/step/find-by-name`), each dispatching to the configured `ComputeBackend`. `submit_step` `sbatch`es and returns a handle (SLURM job id + workspace paths) immediately; `status_step` is a single non-looping slurmrestd read; `result_step` verifies output (identifier integrity + file mode) and returns the paths. **The CP owns the poll loop** — the orchestrator holds no in-flight job state between calls, so a long job never holds the CP→CO connection open and a CP restart re-attaches from persisted `qiita.work_ticket_step` progress. SLURM jobs themselves remain dumb (read input, write output, exit).
 
-**The orchestrator has no DB access** — workflow lifecycle and DB writes happen entirely on the control plane side. CO → CP callbacks exist today for `POST /sequence-range` (called by the native `fastq_to_parquet` step) and authenticate with the `compute-worker` service-account PAT installed at `/etc/qiita/co-to-cp.token` ([provisioning](docs/runbooks/compute-service-account-provisioning.md), [rotation](docs/runbooks/orchestrator-token-rotation.md)). SLURM-backend integration (cluster prereqs, identity model, the `qiita-job` JWT auto-refresh timer) lives in [`docs/runbooks/slurm-backend-setup.md`](docs/runbooks/slurm-backend-setup.md).
+**The orchestrator has no DB access** — workflow lifecycle and DB writes happen entirely on the control plane side. CO → CP callbacks exist today for `POST /sequence-range` (called by the native `fastq_to_parquet` step) and authenticate with the compute service-account PAT (site-chosen principal name; `compute` on the live deploy) installed at `/etc/qiita/co-to-cp.token` ([provisioning](docs/runbooks/compute-service-account-provisioning.md), [rotation](docs/runbooks/orchestrator-token-rotation.md)). SLURM-backend integration (cluster prereqs, identity model, the `qiita-job` JWT auto-refresh timer) lives in [`docs/runbooks/slurm-backend-setup.md`](docs/runbooks/slurm-backend-setup.md).
 
 The control plane enforces **disallow-without-delete**: before submitting any job it checks `(prep_sample_idx, processing_idx)` pairs — COMPLETED results require explicit DELETE before resubmission; PENDING/QUEUED/PROCESSING states block new submission entirely.
 

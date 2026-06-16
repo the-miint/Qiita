@@ -1,4 +1,4 @@
-.PHONY: build test test-python test-rust test-integration test-workflows lint lint-python lint-rust deploy migrate sync-actions clean verify-health dev-setup install-hooks
+.PHONY: build test test-python test-rust test-integration test-workflows lint lint-python lint-rust deploy migrate sync-actions clean verify-health verify-deploy preflight redeploy dev-setup install-hooks
 .PHONY: build-common build-control-plane build-data-plane build-data-plane-debug build-compute-orchestrator build-integration build-workflows
 .PHONY: test-common test-control-plane-without-db test-control-plane-with-db test-data-plane test-compute-orchestrator
 .PHONY: lint-common lint-control-plane lint-data-plane lint-compute-orchestrator
@@ -259,6 +259,30 @@ verify-health: $(GRPCURL_BIN)
 	@$(GRPCURL_BIN) -plaintext localhost:50051 grpc.health.v1.Health/Check || (echo "FAIL: data plane" && exit 1)
 	@echo " OK"
 	@echo "All services healthy."
+
+# Read-only config/secret preflight on an established host. Run as root
+# (`sudo make preflight`) for the full picture, or as the operator account that
+# holds the .env config-read ACL (no sudo) — env-consistency checks run and token
+# owner/mode is still verified, but token fingerprints degrade to n/a.
+# Validates PATH_SCRATCH byte-identity, HMAC CP==DP, token-file perms, and
+# connection-string shape; prints non-secret fingerprints. See deploy/preflight.sh.
+preflight:
+	bash deploy/preflight.sh
+
+# One-command post-deploy verification on an established host (run as root):
+#   sudo make verify-deploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
+# Runs health aggregate + qiita.action list + compute-readiness, each with the
+# correct service account/env baked in, then the preflight fingerprint summary.
+# Use this instead of hand-copying verify lines (see docs/runbooks/redeploy.md §7).
+verify-deploy:
+	QIITA_HOSTNAME="$(QIITA_HOSTNAME)" bash deploy/verify.sh
+
+# Guided incremental redeploy (run as the OPERATOR, not root — it elevates per
+# step via sudo):  make redeploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
+# Codifies redeploy.md's skeleton (pull -> preflight -> migration gate ->
+# local-deploy.sh -> stage -> verify); migrations stay out-of-band.
+redeploy:
+	QIITA_HOSTNAME="$(QIITA_HOSTNAME)" bash deploy/redeploy.sh
 
 # Check developer tool prerequisites and print install instructions only for missing ones
 dev-setup:

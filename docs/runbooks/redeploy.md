@@ -60,15 +60,27 @@ deploy-time restart, or the affected unit won't come back up. The actual
 commands (and which `<scratch>`/FQDN values to substitute) are in the
 checklist — copy/paste from there.
 
+Then confirm the config/secret files are mutually consistent **before** the
+restart — this catches the silent runtime failures (`PATH_SCRATCH` drift across
+the three env files, `HMAC_SECRET_KEY` mismatch between CP and DP, a missing or
+mis-permed token file) up front rather than at first request:
+
+```bash
+# [admin] read-only; prints non-secret fingerprints, never the values
+sudo make -C ~/qiita-miint preflight
+```
+
 ## 4. Apply migrations
 
 ```bash
 # [operator] DATABASE_URL must be in your shell, pointing at the SAME DB as
 #            control-plane.env (the guard, running as root, checks that one).
-#            The operator account can't read the 0440 control-plane.env, so use
-#            the value from your provisioning / first deploy (first-deploy.md
-#            step 1). A DATABASE_URL pointing elsewhere migrates one DB while the
-#            guard checks another — which the guard's "wrong-DB" hint flags.
+#            With the operator config-read ACL in place (first-deploy.md §0.1),
+#            just source it:  set -a; . /etc/qiita/control-plane.env; set +a
+#            Otherwise use the value from your provisioning / first deploy
+#            (first-deploy.md step 1). A DATABASE_URL pointing elsewhere migrates
+#            one DB while the guard checks another — the guard's "wrong-DB" hint
+#            flags it.
 make -C ~/qiita-miint migrate
 ```
 
@@ -144,19 +156,42 @@ step above — run `make migrate` and re-run this command.
 ## 7. Verify
 
 ```bash
-# [admin] services up + honest health
-curl -fsS https://qiita-miint.ucsd.edu/health         # CP+CO+DP aggregate + per-service pills
-
-# [admin] workflow actions registered at expected versions
-sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
-  psql "$DATABASE_URL" -c "SELECT action_id, version, enabled FROM qiita.action ORDER BY action_id;"'
-
-# [admin] compute path end-to-end (host checks + optional SLURM probe job)
-sudo -u qiita-api bash -c 'set -a; source /etc/qiita/control-plane.env; set +a; \
-  qiita-admin compute-readiness'
+# [admin] one command runs the three generic post-deploy checks with the
+#         correct run-as baked in for each — health aggregate, workflow
+#         actions list, and compute-readiness. Use this; do NOT hand-copy
+#         the individual invocations (that is how the compute-readiness
+#         run-as bug recurred every deploy — see below).
+sudo make -C ~/qiita-miint verify-deploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
 ```
 
-Run every check in the Pending-deploy bucket-5 list, plus anything the
+`make verify-deploy` (via `deploy/verify.sh`) runs, each with the account +
+env file it actually needs:
+
+- **health** — `curl -fsS https://$QIITA_HOSTNAME/health` (CP+CO+DP aggregate
+  + per-service pills), falling back to the localhost checks if TLS isn't up;
+- **workflow actions** — as `qiita-api` sourcing `control-plane.env`,
+  `SELECT action_id, version, enabled FROM qiita.action ORDER BY action_id;`;
+- **compute-readiness** — as **`qiita-orch`** sourcing
+  **`compute-orchestrator.env`** (NOT `qiita-api`/`control-plane.env`): the
+  command subprocesses into the orchestrator venv, reads `COMPUTE_BACKEND` /
+  `SLURM*` from that env, and reads the `0400 qiita-orch` `co-to-cp.token` —
+  none of which `qiita-api` can reach.
+
+If you need to run compute-readiness by hand (e.g. `make` is unavailable), the
+**correct** form is — matching [`first-deploy.md`](first-deploy.md) §10d:
+
+```bash
+# [admin] primary: qiita-admin on PATH for qiita-orch
+sudo -u qiita-orch bash -c 'set -a; source /etc/qiita/compute-orchestrator.env; set +a; \
+  /home/qiita/.local/bin/qiita-admin compute-readiness'
+
+# [admin] PATH-independent fallback: the module the wrapper subprocesses into
+sudo -u qiita-orch bash -c 'set -a; source /etc/qiita/compute-orchestrator.env; set +a; \
+  /opt/qiita/compute-orchestrator/.venv/bin/python -m qiita_compute_orchestrator.cli.compute_readiness'
+```
+
+Run every check in the Pending-deploy bucket-5 list (those are the
+deploy-*specific* asserts on top of `make verify-deploy`), plus anything the
 Notes bucket flags for downstream clients. When it passes, capture the
 deployed commit and hand it off for archiving:
 

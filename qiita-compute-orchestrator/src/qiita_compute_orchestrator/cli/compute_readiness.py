@@ -63,7 +63,11 @@ from typing import Any
 import httpx
 from qiita_common.duckdb_miint import miint_job_env
 
-from ..config import Settings
+from ..config import (
+    CORRECT_COMPUTE_READINESS_INVOCATION,
+    ORCHESTRATOR_ENV_PATH,
+    Settings,
+)
 from ..slurm.client import (
     SlurmrestdClient,
     SlurmrestdError,
@@ -637,13 +641,37 @@ async def _run_all_checks(
     results.append(CheckResult("settings-resolvable", "pass", f"backend={settings.backend_type}"))
 
     if settings.backend_type != "slurm":
-        results.append(
-            CheckResult(
-                "backend-is-slurm",
-                "skip",
-                f"COMPUTE_BACKEND={settings.backend_type!r} — compute-readiness is SLURM-specific",
+        # On a real orchestrator host a non-slurm backend almost always means
+        # the command was MISINVOKED: run as qiita-api sourcing control-plane.env
+        # (instead of qiita-orch sourcing compute-orchestrator.env), so
+        # COMPUTE_BACKEND was never set and defaulted to "local". That used to
+        # produce a benign `skip` + exit 0, which reads as a pass and is exactly
+        # the recurring redeploy defect (issue #72). Make it a loud failure that
+        # names the correct invocation. The "real host" signal is the
+        # orchestrator env file existing — a dev box / CI runner has no
+        # /etc/qiita/compute-orchestrator.env, so a genuine local backend there
+        # still skips (exit 0). See config.ORCHESTRATOR_ENV_PATH for why the
+        # heuristic is file-existence only, not env-var presence.
+        if Path(ORCHESTRATOR_ENV_PATH).is_file():
+            results.append(
+                CheckResult(
+                    "backend-is-slurm",
+                    "fail",
+                    f"COMPUTE_BACKEND={settings.backend_type!r} but {ORCHESTRATOR_ENV_PATH}"
+                    " exists — you likely ran this as the wrong user or sourced"
+                    " control-plane.env instead of compute-orchestrator.env. Re-run:\n      "
+                    + CORRECT_COMPUTE_READINESS_INVOCATION,
+                )
             )
-        )
+        else:
+            results.append(
+                CheckResult(
+                    "backend-is-slurm",
+                    "skip",
+                    f"COMPUTE_BACKEND={settings.backend_type!r} —"
+                    " compute-readiness is SLURM-specific",
+                )
+            )
         return results
     assert settings.slurm is not None  # narrowed by backend_type check
 

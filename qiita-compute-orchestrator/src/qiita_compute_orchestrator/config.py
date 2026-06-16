@@ -43,10 +43,32 @@ DEFAULT_CP_TO_CO_TOKEN_PATH = "/etc/qiita/cp-to-co.token"
 # orchestrator presents on outbound calls to the control plane (e.g.
 # POST /api/v1/sequence-range). Distinct from CP_TO_CO_TOKEN above —
 # this is CO → CP, presented as Bearer auth on httpx requests. The
-# token belongs to the `compute-worker` service-account principal
-# whose provisioning is documented in
-# docs/runbooks/compute-service-account-provisioning.md.
+# token belongs to the compute service-account principal (site-chosen
+# name; `compute` on the live deploy) whose provisioning is documented
+# in docs/runbooks/compute-service-account-provisioning.md.
 DEFAULT_CO_TO_CP_TOKEN_PATH = "/etc/qiita/co-to-cp.token"
+
+# Production install path of the orchestrator env file. Its mere existence is
+# the "this is a real orchestrator host" signal the compute-readiness CLI uses
+# to turn a misinvocation into a loud failure instead of a benign skip (see
+# cli/compute_readiness.py::_run_all_checks). Deliberately NOT keyed on
+# SLURMRESTD_URL / CO_TO_CP_TOKEN_PATH env presence — those can legitimately be
+# set in a dev/CI orchestrator boot and would cause false failures; the
+# /etc/qiita path is what a dev box / CI runner does not have.
+ORCHESTRATOR_ENV_PATH = "/etc/qiita/compute-orchestrator.env"
+
+# The one correct operator invocation for running the compute-readiness
+# diagnostic (and anything else that resolves the CO→CP token). It MUST run as
+# the orchestrator service account sourcing the orchestrator env file: the
+# command resolves COMPUTE_BACKEND / SLURM_* from compute-orchestrator.env and
+# reads the 0400 qiita-orch:qiita-orch co-to-cp.token, neither of which is
+# reachable as qiita-api sourcing control-plane.env. Shared by _resolve_token's
+# permission error and the compute-readiness misinvocation guard so the two
+# can't drift (the recurring redeploy defect, issue #72).
+CORRECT_COMPUTE_READINESS_INVOCATION = (
+    "sudo -u qiita-orch bash -c 'set -a; source /etc/qiita/compute-orchestrator.env; "
+    "set +a; qiita-admin compute-readiness'"
+)
 
 BACKEND_LOCAL = "local"
 BACKEND_SLURM = "slurm"
@@ -125,9 +147,9 @@ class Settings:
     # (sequence-range mint, future CO→CP endpoints). Includes scheme +
     # host + port; route paths from qiita_common.api_paths get appended.
     cp_url: str
-    # PAT belonging to the compute-worker service-account principal,
-    # presented as Bearer auth on outbound CO→CP calls. Same file-or-env
-    # resolution pattern as cp_to_co_token.
+    # PAT belonging to the compute service-account principal (site-chosen
+    # name; `compute` on the live deploy), presented as Bearer auth on
+    # outbound CO→CP calls. Same file-or-env resolution pattern as cp_to_co_token.
     co_to_cp_token: str
     # SLURM config — non-None only when backend_type=slurm.
     slurm: SlurmSettings | None = None
@@ -255,10 +277,10 @@ def _resolve_token(kind: Literal["cp_to_co", "co_to_cp"]) -> str:
 
     cp_to_co: shared bearer the control-plane runner presents on
               inbound POST /step/*.
-    co_to_cp: compute-worker service-account PAT the orchestrator
-              presents on outbound calls (e.g. POST /sequence-range);
-              provisioning is documented in
-              docs/runbooks/compute-service-account-provisioning.md.
+    co_to_cp: compute service-account PAT (site-chosen name; `compute`
+              on the live deploy) the orchestrator presents on outbound
+              calls (e.g. POST /sequence-range); provisioning is documented
+              in docs/runbooks/compute-service-account-provisioning.md.
 
     Same precedence for both:
       1. {DIRECTION}_TOKEN_PATH (default under /etc/qiita). If the
@@ -275,6 +297,9 @@ def _resolve_token(kind: Literal["cp_to_co", "co_to_cp"]) -> str:
             "CP↔CO",
         )
         runbook_hint = ""
+        # Installed 0440 root:qiita-services (first-deploy.md step 7); both
+        # qiita-api and qiita-orch read it via the qiita-services group.
+        perm_hint = "installed mode 0440 root:qiita-services — check the file's group/mode"
     else:  # "co_to_cp"
         path_env, default_path, env_var, label = (
             "CO_TO_CP_TOKEN_PATH",
@@ -286,10 +311,32 @@ def _resolve_token(kind: Literal["cp_to_co", "co_to_cp"]) -> str:
             " See docs/runbooks/compute-service-account-provisioning.md"
             " for the production provisioning flow."
         )
+        # Installed 0400 qiita-orch:qiita-orch (provisioning runbook); only
+        # qiita-orch can read it — a PermissionError here is almost always the
+        # CLI run as the wrong user.
+        perm_hint = (
+            "installed mode 0400 owned by qiita-orch — run as the qiita-orch service account"
+        )
 
     path = Path(os.environ.get(path_env, default_path))
     if path.is_file():
-        return path.read_text().strip()
+        try:
+            return path.read_text().strip()
+        except PermissionError as exc:
+            # The file is present but unreadable by the current user — for the
+            # CO→CP token this is almost always the compute-readiness CLI run as
+            # qiita-api (the token is 0400 qiita-orch). Without this branch the
+            # error fell through to the generic "no token available" message
+            # below, which misleads the operator into thinking the token is
+            # missing. Name the real cause + the fix; the perms guidance is
+            # per-kind so a CP↔CO PermissionError isn't told to "run as
+            # qiita-orch" (that token is the shared root:qiita-services bearer).
+            hint = f"\n    {CORRECT_COMPUTE_READINESS_INVOCATION}" if kind == "co_to_cp" else ""
+            raise RuntimeError(
+                f"orchestrator: {label} token file {path} exists but the current"
+                f" user cannot read it ({exc.strerror}). It is {perm_hint}."
+                f"{hint}{runbook_hint}"
+            ) from exc
 
     if os.environ.get("QIITA_ALLOW_TOKEN_ENV", "false").lower() == "true":
         token = os.environ.get(env_var)

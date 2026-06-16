@@ -25,6 +25,7 @@ If none apply, say so and stop — make no edit.
 ## 2. Fold into the right bucket — merge, don't append
 
 Edit `## Pending deploy` in `DEPLOY_CHECKLIST.md`. Place each item in its bucket: **1. Env vars**, **2. One-time host setup**, **3. Migrations**, **5. Verify** (add a check for what you introduced), **Notes** (no-action items). Rules:
+- **Bucket 5: the generic checks are `make verify-deploy` — do NOT re-paste them.** Health, the `qiita.action` list, and `compute-readiness` are all run (each with the correct service account/env baked in) by `sudo make verify-deploy QIITA_HOSTNAME=<fqdn>`. A verify fold adds only the *deploy-specific* assert your PR introduces (a new `action_id`+version to look for, a new probe row to grep, a new endpoint to curl) — never the generic `compute-readiness` invocation, whose hand-copied wrong run-as is the bug `make verify-deploy` retires (issue #72).
 - **Merge into the existing lines, don't duplicate them.** If bucket 1 already appends to `compute-orchestrator.env` (one idempotent `sudo bash -c 'grep -q … || echo "KEY=value" >> …'` per var), add your var as another such line next to them — do not start a second CO group. Same for the migration list and verify checks.
 - **Tag every line you add with `(#N)`** (the PR/branch ref) so the archive step and the operator can trace provenance.
 - **Keep it concise** — a copy-pasteable command and a half-line of why, matching the surrounding style. No prose narration of the change; the git log covers that.
