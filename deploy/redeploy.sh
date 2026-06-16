@@ -87,11 +87,20 @@ if [ -z "$db_url" ]; then
     echo "         migration pre-check. activate.sh's guard still refuses a stale schema."
     confirm "Continue without the local migration pre-check?"
 else
-    status=$(sudo -u "$QIITA_USER" env DATABASE_URL="$db_url" bash -lc \
-        "cd '$QIITA_CLONE/qiita-control-plane' && dbmate --migrations-table public.schema_migrations status" 2>/dev/null) || status=""
+    # Resolve dbmate as the operator the same way `make migrate` does: prefer the
+    # operator's ~/.local/bin/dbmate (the Makefile's DBMATE_BIN install site — so
+    # the pre-check finds it even on a bare service account whose non-interactive
+    # login shell doesn't add ~/.local/bin to PATH), falling back to PATH. $HOME
+    # here is the operator's home (the inner `bash -lc` login shell), not root's;
+    # QIITA_CLONE is passed through `env` so the single-quoted body can use it.
+    status=$(sudo -u "$QIITA_USER" env DATABASE_URL="$db_url" QIITA_CLONE="$QIITA_CLONE" bash -lc '
+        DBMATE="$HOME/.local/bin/dbmate"; [ -x "$DBMATE" ] || DBMATE=dbmate
+        cd "$QIITA_CLONE/qiita-control-plane" && "$DBMATE" --migrations-table public.schema_migrations status
+    ' 2>/dev/null) || status=""
     pending_rows=$(printf '%s\n' "$status" | grep -E '^\[ \]' || true)
     if [ -z "$status" ]; then
-        echo "WARNING: could not run 'dbmate status' as $QIITA_USER (dbmate on its PATH?)."
+        echo "WARNING: could not run 'dbmate status' as $QIITA_USER (dbmate not found at"
+        echo "         ~/.local/bin/dbmate or on PATH, or the DB was unreachable)."
         echo "         activate.sh's guard still refuses a stale schema — but verify by hand."
         confirm "Continue without the local migration pre-check?"
     elif [ -n "$pending_rows" ]; then
