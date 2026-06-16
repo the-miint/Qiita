@@ -225,6 +225,18 @@ class ReferenceResponse(BaseModel):
     created_at: AwareDatetime
 
 
+# The two search-index types a host reference must carry to host-filter: a rype
+# `.ryxdi` minimizer index (first pass) and a minimap2 `.mmi` (second pass). Shared
+# so the runner's "must carry both" gate (_resolve_host_filter_indexes) and the
+# CLI's submit-host-filter-pool pre-check resolve the same pair instead of pinning
+# the literals independently and drifting.
+HOST_FILTER_INDEX_TYPE_RYPE = "rype"
+HOST_FILTER_INDEX_TYPE_MINIMAP2 = "minimap2"
+HOST_FILTER_REQUIRED_INDEX_TYPES = frozenset(
+    {HOST_FILTER_INDEX_TYPE_RYPE, HOST_FILTER_INDEX_TYPE_MINIMAP2}
+)
+
+
 class ReferenceIndex(BaseModel):
     """A built search index for a reference (e.g. a rype `.ryxdi` directory).
 
@@ -952,6 +964,36 @@ class IdxsListResponse(BaseModel):
     """
 
     idxs: list[int]
+    count: Annotated[int, Field(ge=0)]
+    truncated: bool
+    caller_system_role: SystemRole
+
+
+class SequencedSampleListItem(BaseModel):
+    """One active sequenced_sample in a pool-scoped sample list.
+
+    Carries the subtype idx, its supertype prep_sample_idx, and the
+    sequenced_pool_item_id (which equals the bcl-convert per-sample FASTQ
+    basename prefix). Lets a caller fan out per-sample work without an N+1
+    of per-idx GETs.
+    """
+
+    sequenced_sample_idx: int
+    prep_sample_idx: int
+    sequenced_pool_item_id: str
+
+
+class SequencedSampleListResponse(BaseModel):
+    """Returned by the pool-scoped sequenced-sample list (GET
+    /sequencing-run/{run}/sequenced-pool/{pool}/sequenced-sample/list).
+
+    Unlike IdxsListResponse this carries richer per-sample rows
+    (prep_sample_idx + sequenced_pool_item_id), so the segment is `list`
+    rather than `list-idxs`. `truncated` mirrors IdxsListResponse semantics:
+    true when the underlying set exceeded the route's hard cap.
+    """
+
+    samples: list[SequencedSampleListItem]
     count: Annotated[int, Field(ge=0)]
     truncated: bool
     caller_system_role: SystemRole

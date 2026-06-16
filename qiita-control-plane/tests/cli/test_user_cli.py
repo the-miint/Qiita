@@ -2436,6 +2436,276 @@ def test__read_preflight_rows_round_trips_library_tuples(preflight_stub):
 
 
 # ---------------------------------------------------------------------------
+# submit-host-filter-pool
+# ---------------------------------------------------------------------------
+# Fans out one host-filtered fastq-to-parquet/1.1.0 ticket per pool sample.
+# The flow makes GET /reference/{idx}, GET /reference/{idx}/index, GET the
+# pool sample-list, then one POST /work-ticket per resolved sample — stubbed
+# with the same multi-response queue as submit-bcl-convert.
+
+
+def _seed_convert_dir(tmp_path: Path, samples, *, paired=True) -> Path:
+    """Build a fake bcl-convert ConvertJob dir with per-sample FASTQs nested
+    under a Sample_Project subdir (bcl-convert --bcl-sampleproject-subdirectories
+    layout). `samples` is an iterable of pool_item_id strings."""
+    convert_dir = tmp_path / "ConvertJob"
+    proj = convert_dir / "MyProject"
+    proj.mkdir(parents=True)
+    for item_id in samples:
+        (proj / f"{item_id}_S1_L001_R1_001.fastq.gz").write_bytes(b"")
+        if paired:
+            (proj / f"{item_id}_S1_L001_R2_001.fastq.gz").write_bytes(b"")
+    return convert_dir
+
+
+def _ref_active_body(reference_idx=7):
+    return {
+        "reference_idx": reference_idx,
+        "name": "human-t2t",
+        "version": "v2.0",
+        "kind": "sequence_reference",
+        "status": "active",
+        "is_host": True,
+        "created_by_idx": 1,
+        "created_at": "2026-06-16T00:00:00Z",
+    }
+
+
+def _both_indexes_body(reference_idx=7):
+    return [
+        {
+            "reference_index_idx": 1,
+            "reference_idx": reference_idx,
+            "index_type": "rype",
+            "fs_path": "/derived/7/rype/index.ryxdi",
+            "params": {},
+            "created_at": "2026-06-16T00:00:00Z",
+        },
+        {
+            "reference_index_idx": 2,
+            "reference_idx": reference_idx,
+            "index_type": "minimap2",
+            "fs_path": "/derived/7/minimap2/index.mmi",
+            "params": {},
+            "created_at": "2026-06-16T00:00:00Z",
+        },
+    ]
+
+
+def _pool_samples_body(samples):
+    """samples: list of (sequenced_sample_idx, prep_sample_idx, pool_item_id)."""
+    return {
+        "samples": [
+            {
+                "sequenced_sample_idx": ss,
+                "prep_sample_idx": ps,
+                "sequenced_pool_item_id": item,
+            }
+            for ss, ps, item in samples
+        ],
+        "count": len(samples),
+        "truncated": False,
+        "caller_system_role": "wet_lab_admin",
+    }
+
+
+def _run_submit_host_filter_pool(convert_dir, *, run=3, pool=5, ref=7):
+    from qiita_control_plane.cli.user import main
+
+    return main(
+        [
+            "submit-host-filter-pool",
+            "--sequencing-run-idx",
+            str(run),
+            "--sequenced-pool-idx",
+            str(pool),
+            "--host-reference-idx",
+            str(ref),
+            "--convert-dir",
+            str(convert_dir),
+        ]
+    )
+
+
+def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(monkeypatch, tmp_path, capsys):
+    """Two paired-end samples → two work-ticket POSTs, each host_filter_enabled
+    against the reference and scoped to the sample's prep_sample_idx."""
+    convert_dir = _seed_convert_dir(tmp_path, ["10", "11"], paired=True)
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, _ref_active_body()),
+            (200, _both_indexes_body()),
+            (200, _pool_samples_body([(100, 1000, "10"), (101, 1001, "11")])),
+            (202, {"work_ticket_idx": 900}),
+            (202, {"work_ticket_idx": 901}),
+        ],
+    )
+
+    rc = _run_submit_host_filter_pool(convert_dir)
+    assert rc == 0
+
+    posts = [r for r in captured["requests"] if r["method"] == "POST"]
+    assert len(posts) == 2
+    by_prep = {p["json"]["scope_target"]["prep_sample_idx"]: p["json"] for p in posts}
+    assert set(by_prep) == {1000, 1001}
+    for prep_idx, item_id in ((1000, "10"), (1001, "11")):
+        body = by_prep[prep_idx]
+        assert body["action_id"] == "fastq-to-parquet"
+        assert body["action_version"] == "1.1.0"
+        ctx = body["action_context"]
+        assert ctx["host_filter_enabled"] is True
+        assert ctx["host_reference_idx"] == 7
+        assert ctx["fastq_path"].endswith(f"{item_id}_S1_L001_R1_001.fastq.gz")
+        assert ctx["reverse_fastq_path"].endswith(f"{item_id}_S1_L001_R2_001.fastq.gz")
+
+
+def test_submit_host_filter_pool_single_end_omits_reverse(monkeypatch, tmp_path):
+    """A sample with only an R1 file → no reverse_fastq_path in the context."""
+    convert_dir = _seed_convert_dir(tmp_path, ["10"], paired=False)
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, _ref_active_body()),
+            (200, _both_indexes_body()),
+            (200, _pool_samples_body([(100, 1000, "10")])),
+            (202, {"work_ticket_idx": 900}),
+        ],
+    )
+
+    rc = _run_submit_host_filter_pool(convert_dir)
+    assert rc == 0
+    post = next(r for r in captured["requests"] if r["method"] == "POST")
+    assert "reverse_fastq_path" not in post["json"]["action_context"]
+
+
+def test_submit_host_filter_pool_rejects_relative_convert_dir(capsys):
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-host-filter-pool",
+                "--sequencing-run-idx",
+                "3",
+                "--sequenced-pool-idx",
+                "5",
+                "--host-reference-idx",
+                "7",
+                "--convert-dir",
+                "relative/ConvertJob",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "--convert-dir must be absolute" in capsys.readouterr().err
+
+
+def test_submit_host_filter_pool_rejects_nondir_convert_dir(capsys, tmp_path):
+    from qiita_control_plane.cli.user import main
+
+    missing = tmp_path / "nope"
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-host-filter-pool",
+                "--sequencing-run-idx",
+                "3",
+                "--sequenced-pool-idx",
+                "5",
+                "--host-reference-idx",
+                "7",
+                "--convert-dir",
+                str(missing),
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "is not a directory" in capsys.readouterr().err
+
+
+def test_submit_host_filter_pool_reference_not_active_no_posts(monkeypatch, tmp_path, capsys):
+    convert_dir = _seed_convert_dir(tmp_path, ["10"])
+    captured: dict = {}
+    inactive = _ref_active_body()
+    inactive["status"] = "indexing"
+    _stub_multi_response(monkeypatch, captured, responses=[(200, inactive)])
+
+    with pytest.raises(SystemExit) as exc_info:
+        _run_submit_host_filter_pool(convert_dir)
+    assert exc_info.value.code == 1
+    assert "not active" in capsys.readouterr().err
+    assert not [r for r in captured["requests"] if r["method"] == "POST"]
+
+
+def test_submit_host_filter_pool_missing_minimap2_index_no_posts(monkeypatch, tmp_path, capsys):
+    convert_dir = _seed_convert_dir(tmp_path, ["10"])
+    captured: dict = {}
+    rype_only = [_both_indexes_body()[0]]
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[(200, _ref_active_body()), (200, rype_only)],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        _run_submit_host_filter_pool(convert_dir)
+    assert exc_info.value.code == 1
+    assert "minimap2" in capsys.readouterr().err
+    assert not [r for r in captured["requests"] if r["method"] == "POST"]
+
+
+def test_submit_host_filter_pool_missing_fastq_no_posts(monkeypatch, tmp_path, capsys):
+    """A pool sample with no matching R1 under convert_dir aborts before any
+    ticket is submitted."""
+    convert_dir = _seed_convert_dir(tmp_path, ["10"])  # only item 10 has files
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, _ref_active_body()),
+            (200, _both_indexes_body()),
+            (200, _pool_samples_body([(100, 1000, "10"), (101, 1001, "99")])),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        _run_submit_host_filter_pool(convert_dir)
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "no R1 FASTQ matched" in err
+    assert "99" in err
+    assert not [r for r in captured["requests"] if r["method"] == "POST"]
+
+
+def test_submit_host_filter_pool_multi_lane_rejected_no_posts(monkeypatch, tmp_path, capsys):
+    """Lane-split R1 files (>1 match) are rejected — the workflow takes a
+    single fastq_path — and no tickets are submitted."""
+    convert_dir = _seed_convert_dir(tmp_path, ["10"], paired=False)
+    # Add a second lane for the same sample.
+    (convert_dir / "MyProject" / "10_S1_L002_R1_001.fastq.gz").write_bytes(b"")
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, _ref_active_body()),
+            (200, _both_indexes_body()),
+            (200, _pool_samples_body([(100, 1000, "10")])),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        _run_submit_host_filter_pool(convert_dir)
+    assert exc_info.value.code == 1
+    assert "lane-split" in capsys.readouterr().err
+    assert not [r for r in captured["requests"] if r["method"] == "POST"]
+
+
+# ---------------------------------------------------------------------------
 # study get / biosample get / biosample list-idxs (read subcommands)
 # ---------------------------------------------------------------------------
 

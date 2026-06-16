@@ -401,6 +401,44 @@ async def fetch_sequenced_sample_idxs_for_run(
     return [r["idx"] for r in rows]
 
 
+async def fetch_sequenced_pool_samples(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    sequenced_pool_idx: int,
+    limit: int,
+) -> list[asyncpg.Record]:
+    """Return up to `limit` active sequenced_samples in one pool, each with
+    its supertype prep_sample_idx and sequenced_pool_item_id.
+
+    Pool-scoped sibling of fetch_sequenced_sample_idxs_for_run: that one
+    spans every pool in a run and returns bare idxs; this one is scoped to a
+    single sequenced_pool and returns the
+    (idx, prep_sample_idx, sequenced_pool_item_id) triple a per-sample
+    fan-out needs (e.g. submit-host-filter-pool). Excludes sequenced_samples
+    whose supertype prep_sample row is retired. Sort by
+    sequenced_pool_item_id so the fan-out order is stable across calls.
+    Callers that need to detect truncation pass `limit = cap + 1`; if the
+    returned list has length > cap, the underlying set exceeded the cap.
+    """
+    # Single round trip; the partial index prep_sample_active_idx covers the
+    # retired = false predicate and the join filters down to one pool.
+    rows = await pool_or_conn.fetch(
+        # Alias ss.idx so a row maps straight onto SequencedSampleListItem via
+        # model_validate(dict(row)) — the route does no field renaming.
+        "SELECT ss.idx AS sequenced_sample_idx, ss.prep_sample_idx,"
+        " ss.sequenced_pool_item_id"
+        " FROM qiita.sequenced_sample ss"
+        " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        " WHERE ss.sequenced_pool_idx = $1"
+        "   AND ps.retired = false"
+        " ORDER BY ss.sequenced_pool_item_id"
+        " LIMIT $2",
+        sequenced_pool_idx,
+        limit,
+    )
+    return list(rows)
+
+
 async def fetch_sequenced_sample_idxs_for_study(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
