@@ -32,7 +32,7 @@ the `no-changelog` label).
   a `miint-host-filter-fns` check against `duckdb_functions()`. These were the
   newest miint additions with no probe, so a v1.5.3 mirror build missing either
   was only caught at the first `host-reference-add` run; it now surfaces at
-  deploy alongside `miint-read-fastx` / `miint-sequence-split` (#TBD)
+  deploy alongside `miint-read-fastx` / `miint-sequence-split` (#101)
 - The public landing page footer now shows the deployed commit's short git
   SHA next to the package version (e.g. `v2026.3.0 (a28c96e)`), linked to its
   GitHub commit. The SHA is captured at deploy (`deploy/local-deploy.sh` from
@@ -100,7 +100,7 @@ the `no-changelog` label).
   copy-pasted helpers (root-gate, env-file reader, operator/clone resolution,
   pass/fail/skip reporters, `/etc/qiita/*.env` path + service-account constants)
   are consolidated into `deploy/_common.sh` — single-source, no behavior change.
-  Docs updated in `redeploy.md` / `first-deploy.md` / `CLAUDE.md` (#TBD)
+  Docs updated in `redeploy.md` / `first-deploy.md` / `CLAUDE.md` (#101)
 - The `collection_date` global biosample field is now a `text` field instead of
   a formal `date`, so it can hold partial dates such as a bare year (`2025`)
   (migration `20260616000000_collection_date_text`) (#98)
