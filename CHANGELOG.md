@@ -25,7 +25,7 @@ the `no-changelog` label).
   so a misconfiguration aborts with zero side effects. Backed by a new
   `GET /sequencing-run/{run}/sequenced-pool/{pool}/sequenced-sample/list`
   returning `(sequenced_sample_idx, prep_sample_idx, sequenced_pool_item_id)`
-  per active sample (#TBD)
+  per active sample (#99)
 - The public landing page footer now shows the deployed commit's short git
   SHA next to the package version (e.g. `v2026.3.0 (a28c96e)`), linked to its
   GitHub commit. The SHA is captured at deploy (`deploy/local-deploy.sh` from
