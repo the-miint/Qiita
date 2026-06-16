@@ -1112,7 +1112,7 @@ async def test_post_biosample_metadata_uses_seeded_globals(ctx):
     # Metadata keys mirror the seeded display_names exactly so the composer's
     # display_name → global_field_idx lookup hits all six rows.
     metadata = {
-        "collection date": "2026-04-01",
+        "collection date": "2025",
         "geographic location (country and/or sea)": "USA",
         "geographic location (latitude)": "32.7157",
         "geographic location (longitude)": "-117.1611",
@@ -1152,9 +1152,9 @@ async def test_post_biosample_metadata_uses_seeded_globals(ctx):
         [
             {
                 "global_field_idx": display_to_idx["collection date"],
-                "value_text": None,
+                "value_text": "2025",
                 "value_numeric": None,
-                "value_date": date(2026, 4, 1),
+                "value_date": None,
                 "value_terminology_term_idx": None,
             },
             {

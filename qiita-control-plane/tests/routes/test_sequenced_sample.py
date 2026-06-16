@@ -366,7 +366,7 @@ async def test_import_sequenced_sample_from_run_with_metadata(ctx):
         owner_idx=ctx["wet_session"]["principal_idx"],
         sequenced_pool_item_id=item_id,
         primary_study_idx=study_idx,
-        metadata={"Alias": "amp-001", "Title": "Wet-lab amplicon prep 001"},
+        metadata={"Design description": "amp-001", "Title": "Wet-lab amplicon prep 001"},
     )
     assert resp.status_code == 201, resp.text
     rj = resp.json()
@@ -384,7 +384,7 @@ async def test_import_sequenced_sample_from_run_with_metadata(ctx):
         rj["prep_sample_idx"],
     )
     assert [(r["display_name"], r["value_text"]) for r in rows] == [
-        ("Alias", "amp-001"),
+        ("Design description", "amp-001"),
         ("Title", "Wet-lab amplicon prep 001"),
     ]
 
@@ -851,7 +851,7 @@ async def test_import_sequenced_sample_from_run_multi_study_happy_path(ctx):
         sequenced_pool_item_id=_unique_item_id("MULTI"),
         primary_study_idx=primary_idx,
         secondary_study_idxs=[secondary_idx],
-        metadata={"Alias": "multi-001"},
+        metadata={"Title": "multi-001"},
     )
     assert resp.status_code == 201, resp.text
     rj = resp.json()
@@ -872,7 +872,7 @@ async def test_import_sequenced_sample_from_run_multi_study_happy_path(ctx):
         "SELECT study_idx FROM qiita.prep_sample_study_field"
         " WHERE display_name = $1 AND study_idx = ANY($2::bigint[])"
         " ORDER BY study_idx",
-        "Alias",
+        "Title",
         sorted([primary_idx, secondary_idx]),
     )
     assert [r["study_idx"] for r in field_owner_rows] == [primary_idx]
@@ -916,7 +916,7 @@ async def test_import_sequenced_sample_from_run_duplicate_secondary_dedupes(ctx)
         sequenced_pool_item_id=_unique_item_id("DUP"),
         primary_study_idx=primary_idx,
         secondary_study_idxs=[secondary_idx, secondary_idx],
-        metadata={"Alias": "dup-001"},
+        metadata={"Title": "dup-001"},
     )
     assert resp.status_code == 201, resp.text
     rj = resp.json()
@@ -1929,12 +1929,12 @@ async def test_get_sequenced_sample_wet_lab_admin_no_metadata(ctx):
 
 
 async def test_get_sequenced_sample_carries_global_metadata(ctx):
-    # Two pre-seeded prep_sample_global_field display_names (Alias, Title)
-    # land via the composer; the GET surfaces both keyed on internal_name.
+    # Two pre-seeded prep_sample_global_field display_names (Design description,
+    # Title) land via the composer; the GET surfaces both keyed on internal_name.
     seeded = await _seed_one_sequenced_sample(
         ctx,
         "get-meta",
-        metadata={"Alias": "amp-007", "Title": "Wet-lab amplicon prep 007"},
+        metadata={"Design description": "amp-007", "Title": "Wet-lab amplicon prep 007"},
     )
 
     resp = await ctx["wet"].get(
@@ -1942,11 +1942,11 @@ async def test_get_sequenced_sample_carries_global_metadata(ctx):
     )
     assert resp.status_code == 200, resp.text
     rj = resp.json()
-    # Migration 20260501000010 pins the seeded global fields' internal_names
-    # to 'alias' and 'title'; the GET keys global_metadata on internal_name.
+    # The seeded global fields' internal_names are 'design_description' and
+    # 'title'; the GET keys global_metadata on internal_name.
     expected_metadata = {
-        "alias": {
-            "display_name": "Alias",
+        "design_description": {
+            "display_name": "Design description",
             "description": None,
             "data_type": "text",
             "value": "amp-007",

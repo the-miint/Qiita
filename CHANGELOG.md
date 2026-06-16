@@ -54,6 +54,19 @@ the `no-changelog` label).
 
 ### Changed
 
+- The `collection_date` global biosample field is now a `text` field instead of
+  a formal `date`, so it can hold partial dates such as a bare year (`2025`)
+  (migration `20260616000000_collection_date_text`) (#98)
+- Pruned the seeded `prep_sample_global_field` registry to the two fields
+  actually in use: removed the seven fields (`alias`,
+  `library_name`, `library_strategy`, `library_source`, `library_selection`,
+  `library_layout`, `library_construction_protocol`) , all of which but alias should come from sequenced_pool, and made the retained
+  `title` and `design_description` optional (migration
+  `20260616000002_prune_prep_sample_global_fields`) (#98)
+- The `qiita.sequenced_pool.idx` identity sequence now starts at 25000,
+  reserving `[1, 25000)` for legacy-Qiita import rows (matching the existing
+  `study` / `prep_sample` reservation) (migration
+  `20260616000001_sequenced_pool_idx_bump`) (#98)
 - Reference index artifacts now live under a new orchestrator `PATH_DERIVED`
   root (`{PATH_DERIVED}/references/{idx}/{rype,minimap2}/…`), relocated from
   `PATH_SCRATCH`. `build_rype_index` / `build_minimap2_index` read

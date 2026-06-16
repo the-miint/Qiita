@@ -43,13 +43,53 @@ _None yet._
 
 ### 3. Migrations
 
+```sql
+-- [admin] Pre-check before `make migrate`. The collection_date migration
+-- rebinds the collection_date global field from 'date' to 'text' (so it can
+-- hold partial dates like a bare year); its guard aborts the migration (and
+-- halts `dbmate` mid-deploy) if any biosample_metadata row already references
+-- the field, since such a row would be left misaligned under the new
+-- data_type. Resolve any rows surfaced here BEFORE running `make migrate`. An
+-- empty result means none exist; proceed. (#98)
+SELECT bgf.internal_name, COUNT(*) AS metadata_rows
+  FROM qiita.biosample_metadata m
+  JOIN qiita.biosample_study_field bsf ON bsf.idx = m.biosample_study_field_idx
+  JOIN qiita.biosample_global_field bgf ON bgf.idx = bsf.biosample_global_field_idx
+ WHERE bgf.internal_name = 'collection_date'
+ GROUP BY bgf.internal_name;
+```
+
+```sql
+-- [admin] Pre-check before `make migrate`. The prune migration removes seven
+-- unused seeded prep_sample_global_field rows. Every inbound reference is
+-- ON DELETE RESTRICT, so the DELETE aborts the migration (and halts `dbmate`
+-- mid-deploy) if any study field, metadata value, field exception, or protocol
+-- association already links one of them. This counts all four reference kinds;
+-- every count must be 0. Resolve any non-zero row BEFORE running `make migrate`.
+-- An empty result means none of the seven exist anymore; proceed. (#98)
+SELECT g.internal_name,
+       (SELECT count(*) FROM qiita.prep_sample_study_field s
+         WHERE s.prep_sample_global_field_idx = g.idx)     AS study_fields,
+       (SELECT count(*) FROM qiita.prep_sample_metadata m
+         WHERE m.global_field_idx = g.idx)                 AS metadata_rows,
+       (SELECT count(*) FROM qiita.prep_sample_field_exception e
+         WHERE e.global_field_idx = g.idx)                 AS field_exceptions,
+       (SELECT count(*) FROM qiita.prep_protocol_field p
+         WHERE p.prep_sample_global_field_idx = g.idx)     AS protocol_fields
+  FROM qiita.prep_sample_global_field g
+ WHERE g.internal_name IN ('alias', 'library_name', 'library_strategy',
+                           'library_source', 'library_selection',
+                           'library_layout', 'library_construction_protocol')
+ ORDER BY g.internal_name;
+```
+
 ```bash
 # [operator] DATABASE_URL must be in your shell, pointing at the SAME DB as
 # control-plane.env. activate.sh re-checks public.schema_migrations at deploy
 # time and ABORTS before any restart if one is unapplied.
 make -C ~/qiita-miint migrate
 ```
-`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#89) adds `20260612000000_reference_index_minimap2_type` (drops + re-adds the `reference_index.index_type` CHECK to allow `'minimap2'` alongside `'rype'`; no extension, backfill, or pre-check).
+`dbmate` applies whatever is unapplied (idempotent); the guard — not this checklist — owns the authoritative set, so nothing is hand-listed here. (#89) adds `20260612000000_reference_index_minimap2_type` (drops + re-adds the `reference_index.index_type` CHECK to allow `'minimap2'` alongside `'rype'`; no extension, backfill, or pre-check). (#98) adds `20260616000000_collection_date_text` (rebinds the `collection_date` global field to `text`; gated on the collection_date pre-check above). (#98) adds `20260616000001_sequenced_pool_idx_bump` (RESTARTs `qiita.sequenced_pool.idx` at 25000; no extension, backfill, or pre-check). (#98) adds `20260616000002_prune_prep_sample_global_fields` (deletes seven unused seeded prep-sample global fields and makes `title` / `design_description` optional; gated on the prep-field pre-check above).
 
 ### 4. Deploy
 
