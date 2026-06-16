@@ -19,21 +19,7 @@ _None yet._
 
 ### 2. One-time host setup
 
-- (#89) [admin] Create the host-reference index dir before the first
-  `host-reference-add` run. The index build **and** its consumer (`host_filter`)
-  run as `qiita-job`, which `mkdir`s `{idx}/{rype,minimap2}/` under
-  `{PATH_DERIVED}/references/` at runtime; the base root is `root:root 0755`, so a
-  missing leaf fails that first build with Permission Denied at `mkdir` (stranding
-  the reference in `indexing`). Pre-create the leaf group-writable by
-  `qiita-pipeline` (NOT owned `qiita-orch:qiita-orch` like `…/images`, whose SIFs
-  `qiita-orch` builds) — setgid carries `qiita-pipeline` onto the subdirs
-  `qiita-job` creates, mirroring `PATH_SCRATCH/ticket`. No prod host references
-  exist yet, so nothing to migrate. (Dir documented in `first-deploy.md`'s
-  dirs-perms table by #100.)
-  ```bash
-  derived=$(sudo grep '^PATH_DERIVED=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)
-  sudo install -d -o qiita-orch -g qiita-pipeline -m 2770 "$derived/references"
-  ```
+_None yet._
 
 ### 3. Migrations
 
@@ -56,6 +42,48 @@ _None yet._
 ## Deployed history
 
 Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-16 — c8981aa
+
+Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+- (#89) [admin] Create the host-reference index dir before the first
+  `host-reference-add` run. The index build **and** its consumer (`host_filter`)
+  run as `qiita-job`, which `mkdir`s `{idx}/{rype,minimap2}/` under
+  `{PATH_DERIVED}/references/` at runtime; the base root is `root:root 0755`, so a
+  missing leaf fails that first build with Permission Denied at `mkdir` (stranding
+  the reference in `indexing`). Pre-create the leaf group-writable by
+  `qiita-pipeline` (NOT owned `qiita-orch:qiita-orch` like `…/images`, whose SIFs
+  `qiita-orch` builds) — setgid carries `qiita-pipeline` onto the subdirs
+  `qiita-job` creates, mirroring `PATH_SCRATCH/ticket`. No prod host references
+  exist yet, so nothing to migrate. (Dir documented in `first-deploy.md`'s
+  dirs-perms table by #100.)
+  ```bash
+  derived=$(sudo grep '^PATH_DERIVED=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)
+  sudo install -d -o qiita-orch -g qiita-pipeline -m 2770 "$derived/references"
+  ```
+
+#### 3. Migrations
+
+_None yet._
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
+
+_None yet._
+
+#### Notes (no host action)
+
+_None yet._
 
 ### Deployed 2026-06-16 — 26838ca
 
