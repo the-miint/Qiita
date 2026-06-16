@@ -45,5 +45,12 @@ async def landing(
     return _templates.TemplateResponse(
         request,
         "landing.html",
-        {"contact_email": settings.contact_email, "version": _VERSION},
+        {
+            "contact_email": settings.contact_email,
+            "version": _VERSION,
+            # Short git SHA of the deployed commit (None in dev / tests —
+            # the template then renders the version alone). Set per-deploy
+            # via the BUILD_SHA env var; see Settings.build_sha.
+            "build_sha": settings.build_sha,
+        },
     )

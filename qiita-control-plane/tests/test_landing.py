@@ -13,11 +13,14 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 
-def _build_minimal_settings(contact_email: str = "qiita-help@example.org"):
+def _build_minimal_settings(
+    contact_email: str = "qiita-help@example.org",
+    build_sha: str | None = None,
+):
     """Most Settings fields are unused by the landing route — only
-    `contact_email` is read. Construct one directly (Settings.from_env()
-    would also work but would require monkeypatching the full
-    required-env set)."""
+    `contact_email` and `build_sha` are read. Construct one directly
+    (Settings.from_env() would also work but would require monkeypatching
+    the full required-env set)."""
     from qiita_control_plane.config import Settings
 
     return Settings(
@@ -25,6 +28,7 @@ def _build_minimal_settings(contact_email: str = "qiita-help@example.org"):
         hmac_secret_key=b"\x00" * 32,
         data_plane_url="unused",
         contact_email=contact_email,
+        build_sha=build_sha,
     )
 
 
@@ -177,3 +181,30 @@ async def test_landing_js_references_three_pill_ids(app):
     # JS knows the three keys.
     for key in ("cp", "co", "dp"):
         assert f'"{key}"' in js_text, f"landing.js must reference service key {key!r}"
+
+
+async def test_landing_footer_renders_build_sha_linked_to_commit(app):
+    """When the deploy stamps a build SHA, the footer must show it linked
+    to its GitHub commit so an operator can map the running page to an
+    exact commit. The link target is the same the-miint/Qiita repo the
+    rest of the page points into."""
+    app.state.settings = _build_minimal_settings(build_sha="a28c96e")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        response = await ac.get("/")
+    body = response.text
+    assert "a28c96e" in body
+    assert 'href="https://github.com/the-miint/Qiita/commit/a28c96e"' in body
+
+
+async def test_landing_footer_omits_build_sha_when_absent(app):
+    """A from-source / first-deploy boot leaves build_sha None. The footer
+    must then render the version alone — no empty parens, no dangling
+    commit link, no literal 'None'."""
+    app.state.settings = _build_minimal_settings(build_sha=None)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+        response = await ac.get("/")
+    body = response.text
+    assert "/commit/" not in body
+    assert "None" not in body
+    # The version label itself is still present (the footer didn't break).
+    assert "UC San Diego" in body

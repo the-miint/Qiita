@@ -11,6 +11,11 @@ ExecStart=/opt/qiita/control-plane/.venv/bin/uvicorn \
     --port 8080
 Restart=on-failure
 EnvironmentFile=/etc/qiita/control-plane.env
+# Deploy-owned build stamp (BUILD_SHA), written by deploy/activate.sh on
+# every deploy. Optional (leading '-'): absent on first deploy / dev, and
+# its absence must never keep the unit down — it only feeds the landing
+# footer. Kept separate from the operator-managed control-plane.env above.
+EnvironmentFile=-/opt/qiita/control-plane/build.env
 
 # Give the lifespan-shutdown hook room to drain in-flight dispatch
 # tasks. The CP itself bounds drain at 60s (see _DISPATCH_DRAIN_TIMEOUT_SECONDS
