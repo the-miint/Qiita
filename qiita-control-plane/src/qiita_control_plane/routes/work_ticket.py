@@ -484,7 +484,7 @@ async def submit_work_ticket(
         if not principal.has_role_at_least(SystemRole.WET_LAB_ADMIN):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="resource_override requires wet_lab_admin or system_admin",
+                detail={"reason": "resource_override requires wet_lab_admin or system_admin"},
             )
         override_mem_gb = body.resource_override.mem_gb
         if override_mem_gb is not None and override_mem_gb > action["mem_ceiling_gb"]:

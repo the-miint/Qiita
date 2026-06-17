@@ -1571,7 +1571,14 @@ class ResourceOverride(BaseModel):
     still clamped to the action's mem ceiling (an override above the ceiling is
     rejected at submission). `mem_gb=None` (the default) leaves every step's
     YAML baseline untouched. Carried on `qiita.work_ticket` so a control-plane
-    restart re-attaches in-flight work with the same override."""
+    restart re-attaches in-flight work with the same override.
+
+    INVARIANT — enforcement is NOT on this model: any route that accepts a
+    `resource_override` MUST itself gate it to wet_lab_admin+ (else a regular
+    caller could inflate their job's footprint) and clamp it to the action
+    ceiling. Today only `POST /work-ticket` accepts one — see the gate in
+    `routes/work_ticket.py::submit_work_ticket`. A new route accepting it
+    without that gate is a privilege-escalation bug."""
 
     mem_gb: Annotated[int | None, Field(default=None, gt=0)] = None
 

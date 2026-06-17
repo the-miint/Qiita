@@ -293,6 +293,57 @@ async def pending_work_ticket(postgres_pool, reference_add_action, reference_idx
     await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx)
 
 
+async def test_fetch_work_ticket_decodes_resource_override(
+    postgres_pool, reference_add_action, reference_idx
+):
+    """The dispatch seam: `_fetch_work_ticket` must decode the
+    `resource_override` JSONB column (asyncpg returns JSONB as a *string*, no
+    codec is registered) into the dict `run_workflow` indexes for `mem_gb`, and
+    leave a NULL override as None. Pins the shape so a future JSONB-codec
+    registration (which would make the `isinstance(str)` guard skip) can't
+    silently change what `run_workflow` sees."""
+    from qiita_control_plane.runner import _fetch_work_ticket
+
+    action_id, version = reference_add_action
+
+    async def _insert(resource_override_json: str | None) -> int:
+        # One at a time: the work_ticket_one_in_flight_per_reference unique
+        # index forbids two pending tickets for the same (action, reference).
+        return await postgres_pool.fetchval(
+            "INSERT INTO qiita.work_ticket ("
+            "  action_id, action_version, originator_principal_idx,"
+            "  scope_target_kind, reference_idx, action_context, resource_override"
+            ") VALUES ($1, $2, 1, 'reference', $3, '{}'::jsonb, $4::jsonb)"
+            " RETURNING work_ticket_idx",
+            action_id,
+            version,
+            reference_idx,
+            resource_override_json,
+        )
+
+    # WITH override: the JSONB string asyncpg returns is decoded to the dict
+    # run_workflow indexes — mem_gb_override = _override.get("mem_gb").
+    with_idx = await _insert(json.dumps({"mem_gb": 48}))
+    try:
+        with_row = await _fetch_work_ticket(postgres_pool, with_idx)
+        assert with_row["resource_override"] == {"mem_gb": 48}
+        assert with_row["resource_override"].get("mem_gb") == 48
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", with_idx
+        )
+
+    # WITHOUT override (NULL column) stays None.
+    without_idx = await _insert(None)
+    try:
+        without_row = await _fetch_work_ticket(postgres_pool, without_idx)
+        assert without_row["resource_override"] is None
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", without_idx
+        )
+
+
 def _populate_step_outputs(backend: FakeBackendClient, workspace: Path) -> Path:
     """Configure the fake backend so hash/load step outputs land on disk
     and a single Parquet sits in the staging dir for register-files."""
