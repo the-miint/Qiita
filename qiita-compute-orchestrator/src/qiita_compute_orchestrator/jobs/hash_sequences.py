@@ -50,6 +50,7 @@ from ..miint import (
     PARQUET_OPTS_CHUNKED,
     apply_duckdb_settings,
     open_miint_conn,
+    resolve_duckdb_memory_gb,
 )
 
 YAML_STEP_NAME = "hash_sequences"
@@ -57,12 +58,14 @@ YAML_STEP_NAME = "hash_sequences"
 # DuckDB resource caps for this step. With the read_id-batched
 # pipeline below, peak memory per batch ≈ batch_size × avg record
 # size (~50K × ~30 KB ≈ 1.5 GB, ~10 GB worst case if a batch lands
-# many of GG2's ~21 MB genome tail). The 7 GB cap from the YAML
-# (mem_gb=8 minus 1 GB Python headroom) is uncomfortable for that
-# worst case; this step intentionally takes a larger DuckDB cap.
-# These literals duplicate the workflow YAML's baseline_resources for
-# this step; a mismatch is visible at review time. A future refactor
-# should thread the YAML values through `Inputs` instead of duplicating.
+# many of GG2's ~21 MB genome tail). `_DUCKDB_MEMORY_GB` is now only the
+# OFF-SLURM fallback (local backend / tests); under SLURM the limit tracks
+# the real cgroup via `resolve_duckdb_memory_gb()` (SLURM_MEM_PER_NODE), so a
+# `--mem-gb` override (#102) reaches DuckDB. This also resolves the old
+# latent inconsistency where this 24 GB literal exceeded the step's 8 GB YAML
+# allocation — under SLURM DuckDB is now capped at the actual cgroup, not a
+# literal larger than it. DuckDB owns the whole box here (no in-process
+# co-consumer), so it gets the allocation minus headroom.
 _DUCKDB_MEMORY_GB = 24
 _DUCKDB_THREADS = 4
 
@@ -141,7 +144,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
-                memory_gb=_DUCKDB_MEMORY_GB,
+                memory_gb=resolve_duckdb_memory_gb(_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS),
                 threads=_DUCKDB_THREADS,
             )
 

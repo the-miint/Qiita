@@ -60,15 +60,18 @@ from ..miint import (
     PARQUET_OPTS_CHUNKED,
     apply_duckdb_settings,
     open_miint_conn,
+    resolve_duckdb_memory_gb,
 )
 
 YAML_STEP_NAME = "stage_local_fasta"
 
-# DuckDB resource caps for this step. These literals duplicate the workflow
-# YAML's baseline_resources for this step (mem_gb=8, cpu=4); the DuckDB cap is
-# mem_gb minus ~1 GB Python headroom. A mismatch is visible at review time. A
-# future refactor should thread the YAML values through `Inputs` instead of
-# duplicating (see hash_sequences' note).
+# DuckDB resource caps for this step. `_DUCKDB_MEMORY_GB` is the OFF-SLURM
+# fallback (local backend / tests), sized to the YAML baseline (mem_gb=8 minus
+# ~1 GB headroom). Under SLURM the limit instead tracks the real cgroup via
+# `resolve_duckdb_memory_gb()` (SLURM_MEM_PER_NODE), so a `--mem-gb` override
+# (#102) actually reaches DuckDB — a genome-scale FASTA OOM'd here at the old
+# fixed 7 GB no matter how large the allocation was. DuckDB owns the whole box in
+# this step (no in-process co-consumer), so it gets the allocation minus headroom.
 _DUCKDB_MEMORY_GB = 7
 _DUCKDB_THREADS = 4
 
@@ -157,7 +160,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
-                memory_gb=_DUCKDB_MEMORY_GB,
+                memory_gb=resolve_duckdb_memory_gb(_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS),
                 threads=_DUCKDB_THREADS,
             )
 

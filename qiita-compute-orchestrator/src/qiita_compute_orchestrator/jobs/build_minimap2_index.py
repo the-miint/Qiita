@@ -45,20 +45,28 @@ import duckdb
 from pydantic import BaseModel
 
 from ..config import get_settings
-from ..miint import apply_duckdb_settings, open_miint_conn
+from ..miint import apply_duckdb_settings, open_miint_conn, resolve_duckdb_memory_gb
 
 YAML_STEP_NAME = "build_minimap2_index"
 
-# DuckDB reassembles the per-feature subject (string_agg over chunks) and hands
-# the TABLE to minimap2, which does the heavy indexing in-process — so DuckDB's
-# own cap is modest and most of the YAML allocation is left for minimap2 + the
-# reassembled contigs + OS headroom. Literals mirror the host-reference-add YAML's
-# baseline_resources for this step (a mismatch is visible at review). Genome-scale
-# sizing (a real host reference, where reassembled chromosomes are large) is a
-# deliberate follow-up: bump the YAML mem_gb and this cap together when sized
-# against real data.
+# Co-consumer step: DuckDB reassembles the per-feature subject (string_agg over
+# chunks) and hands the TABLE to minimap2, which does the heavy indexing
+# in-process from the cgroup remainder. `_DUCKDB_MEMORY_GB` is the OFF-SLURM
+# fallback (local backend / tests). Under SLURM the limit tracks the real cgroup
+# via `resolve_duckdb_memory_gb()` with `_MINIMAP2_RESERVE_GB` carved out for
+# minimap2's in-process index — so a `--mem-gb` override (#102) grows both the
+# DuckDB reassembly headroom (genome-scale contigs are large) and minimap2's
+# index budget, instead of OOMing against a fixed 8 GB.
 _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
+# Cgroup reserved for minimap2's in-process index build — it is given no explicit
+# memory limit and allocates from whatever DuckDB's limit leaves under the cgroup.
+# Basis: a human-genome (~3.1 Gbp) `-x sr` minimap2 index is ~8 GB resident, and
+# the 'sr' preset's denser minimizers run heavier than the default preset; 16 GB
+# is a ~2x envelope over that. This is the number most likely to be wrong for the
+# genome-scale case that motivated this change — refine it against the first real
+# human-reference build's MaxRSS (sacct) and bump if the build still OOMs.
+_MINIMAP2_RESERVE_GB = 16
 
 # minimap2 preset default — 'sr' (short-read), the host-filter alignment mode
 # `host_filter` mirrors on the query side. Overridable via Inputs.
@@ -165,7 +173,14 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     try:
         with open_miint_conn() as conn:
             apply_duckdb_settings(
-                conn, duckdb_tmp, memory_gb=_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS
+                conn,
+                duckdb_tmp,
+                memory_gb=resolve_duckdb_memory_gb(
+                    _DUCKDB_MEMORY_GB,
+                    threads=_DUCKDB_THREADS,
+                    reserve_gb=_MINIMAP2_RESERVE_GB,
+                ),
+                threads=_DUCKDB_THREADS,
             )
             num_subjects = _stage_subject(conn, read_target)
             if num_subjects == 0:

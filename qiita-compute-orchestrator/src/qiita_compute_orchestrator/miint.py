@@ -22,6 +22,7 @@ is always set. The install/load SQL and connect config are single-sourced in
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -77,21 +78,15 @@ PARQUET_OPTS_CHUNKED: str = f"{PARQUET_OPTS}, ROW_GROUP_SIZE {CHUNK_ROW_GROUP_SI
 
 # DuckDB resource caps for native jobs.
 #
-# Native jobs running under SLURM share their cgroup with the wrapping
-# Python process + miint runtime + OS overhead. DuckDB's `memory_limit`
-# only bounds DuckDB itself, so we leave ~1 GB of headroom and set the
-# cap to `yaml_mem_gb - 1`. Threads match the cgroup cpu allocation 1:1;
-# under-allocating threads only costs throughput, but exceeding
-# memory_limit OOM-kills the job.
-#
-# Each call site passes the YAML numbers as literals — a mismatch with
-# the workflow YAML is visible at review time, not a runtime surprise.
-# A future refactor should thread `JobParams.baseline_resources` into
-# the job at dispatch time so the literals can go away.
-#
-# Defined here so per-job overrides (or that future plumb) have one
-# place to land, rather than three independent copies in the jobs/*
-# modules.
+# Native jobs running under SLURM share their cgroup with the wrapping Python
+# process + miint runtime + OS overhead, plus (in some steps) an in-process
+# co-consumer like rype/minimap2. DuckDB's `memory_limit` only bounds DuckDB
+# itself, so a job must set it BELOW the cgroup. The size each job wants is
+# resolved by `resolve_duckdb_memory_gb()` from the real cgroup
+# (`slurm_alloc_gb()` / `SLURM_MEM_PER_NODE`) so a per-run `--mem-gb` override
+# (#102) reaches DuckDB; a per-job literal is only the off-SLURM fallback.
+# Threads are still passed as a literal (the cgroup cpu allocation) and also size
+# the headroom — see `duckdb_headroom_gb`.
 
 
 def apply_duckdb_settings(
@@ -131,6 +126,75 @@ def apply_duckdb_settings(
     conn.execute(f"SET threads={threads}")
     conn.execute("SET preserve_insertion_order=false")
     conn.execute(f"SET temp_directory='{duckdb_tmp}'")
+
+
+# Headroom reserved below the SLURM cgroup ceiling so DuckDB's `memory_limit`
+# (and any in-process co-consumer's budget) sits under the cgroup — otherwise the
+# kernel OOM-kills the whole step instead of DuckDB raising a catchable
+# OutOfMemory. Two components:
+#
+#  - a flat base for the Python interpreter + miint/OS overhead, and
+#  - a per-thread term, because `memory_limit` is a SOFT target DuckDB overshoots
+#    in actual RSS, and the overshoot grows with parallelism (per-thread operator
+#    state — sort/HASH_AGG runs that DuckDB doesn't perfectly bound). A flat
+#    headroom that is fine for the 4-thread steps is tight for the 8-thread `load`
+#    step; fastq_to_parquet's R11 note measured ~2.4 GB *resident* per thread on
+#    long-read work, most of it inside the limit. We reserve ~0.5 GB/thread on
+#    TOP of the limit as the above-limit margin — an envelope sized for the
+#    8-thread `load` step, to refine against a real genome-scale MaxRSS.
+DUCKDB_BASE_HEADROOM_GB = 2
+DUCKDB_PER_THREAD_HEADROOM_GB = 0.5
+
+
+def slurm_alloc_gb() -> int | None:
+    """The step's true memory ceiling (GB) from the SLURM cgroup, or None off SLURM.
+
+    The SLURM launcher submits each step with `memory_per_node` (i.e. `--mem`), so
+    SLURM exports `SLURM_MEM_PER_NODE` (in MB) into the job environment — the
+    authoritative per-step allocation, and the ONLY channel by which the per-run
+    `--mem-gb` override (#102) reaches a job's in-process memory caps. The local
+    backend and unit tests run with the var absent → returns None, and callers fall
+    back to their YAML-baseline-derived literal. A malformed value is treated as
+    absent (fail soft to the literal rather than crash a job over an env quirk)."""
+    raw = os.environ.get("SLURM_MEM_PER_NODE")
+    if not raw:
+        return None
+    try:
+        return int(raw) // 1024
+    except ValueError:
+        return None
+
+
+def duckdb_headroom_gb(threads: int) -> int:
+    """Headroom (GB) to keep below the cgroup ceiling for a `threads`-wide DuckDB
+    run: the flat base plus a per-thread above-limit margin (see the constants).
+    Rounds the per-thread term up so the margin is never under-reserved."""
+    return DUCKDB_BASE_HEADROOM_GB + math.ceil(threads * DUCKDB_PER_THREAD_HEADROOM_GB)
+
+
+def resolve_duckdb_memory_gb(
+    fallback_gb: int, *, threads: int, reserve_gb: int = 0, cap_gb: int | None = None
+) -> int:
+    """DuckDB `memory_limit` (GB) sized to the real SLURM allocation, not a literal.
+
+    Under SLURM the limit tracks the cgroup: ``alloc - headroom(threads) -
+    reserve_gb``, which is how a `--mem-gb` override finally reaches DuckDB. Off
+    SLURM (`slurm_alloc_gb()` is None) it returns `fallback_gb` — the job's
+    existing YAML-baseline-derived literal — so the local backend and tests are
+    unchanged.
+
+    `threads` sizes the headroom (DuckDB's above-limit RSS overshoot scales with
+    parallelism — see `duckdb_headroom_gb`); pass the same value handed to
+    `apply_duckdb_settings`. `reserve_gb` carves the cgroup out for an in-process
+    co-consumer that shares the box with DuckDB (rype / minimap2 do their heavy
+    work in-process). `cap_gb` bounds DuckDB's share even when the allocation is
+    large — a co-consumer job wants DuckDB modest (it only feeds/reassembles
+    chunks), not allocation-sized. Never returns < 1."""
+    alloc = slurm_alloc_gb()
+    resolved = fallback_gb if alloc is None else alloc - duckdb_headroom_gb(threads) - reserve_gb
+    if cap_gb is not None:
+        resolved = min(resolved, cap_gb)
+    return max(1, resolved)
 
 
 def open_conn() -> duckdb.DuckDBPyConnection:
