@@ -376,13 +376,21 @@ def parse_kv_pairs(
     return result
 
 
-def run_http_subcommand(fn: Callable[[str], dict | list]) -> int:
-    """Token-read + httpx invoke + json print, common to every HTTP subcommand.
+def run_http_subcommand(
+    fn: Callable[[str], dict | list],
+    render: Callable[[dict | list], None] | None = None,
+) -> int:
+    """Token-read + httpx invoke + print, common to every HTTP subcommand.
 
     `fn` accepts a PAT string and returns the parsed JSON body (a dict for
     most routes, a list for the list endpoints). Any RuntimeError from
     token-read or HTTPStatusError from the request is converted to a stderr
     message + exit code 1.
+
+    By default the body is pretty-printed as JSON. A verb whose payload is meant
+    to be *read* rather than parsed (e.g. a log tail, whose embedded newlines are
+    useless JSON-escaped) passes `render` to print it its own way; `render` owns
+    stdout entirely for the success path.
     """
     try:
         token = read_token()
@@ -394,7 +402,10 @@ def run_http_subcommand(fn: Callable[[str], dict | list]) -> int:
     except httpx.HTTPStatusError as exc:
         print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
         return 1
-    print(json.dumps(body, indent=2))
+    if render is not None:
+        render(body)
+    else:
+        print(json.dumps(body, indent=2))
     return 0
 
 

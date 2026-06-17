@@ -28,6 +28,7 @@ from pathlib import Path
 from qiita_common.actions import BaselineResources
 from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.duckdb_miint import miint_job_env
+from qiita_common.log_tail import contains_oom_signature, read_text_tail
 from qiita_common.models import (
     ComputeTarget,
     StepBaselineResources,
@@ -79,6 +80,23 @@ _STATE_TO_FAILURE_KIND: dict[TerminalSlurmState, FailureKind] = {
     TerminalSlurmState.PREEMPTED: FailureKind.PREEMPTED,
     TerminalSlurmState.TIMEOUT: FailureKind.TIMEOUT_BEFORE_START,
 }
+
+# Generic failure kinds an OOM stderr signature is allowed to upgrade to
+# OOM_KILLED. A cgroup *step-level* oom_kill surfaces only as a coarse
+# job-level FAILED/exit_code=1 (=> EXIT_NONZERO), so without this the OOM is
+# invisible from `qiita ticket status`. We never reclassify a specific infra
+# kind (NODE_FAIL / TIMEOUT / PREEMPTED) — those are already correct from the
+# SLURM state and must not be downgraded.
+_OOM_UPGRADABLE_KINDS: frozenset[FailureKind] = frozenset(
+    {FailureKind.EXIT_NONZERO, FailureKind.UNKNOWN_PERMANENT}
+)
+
+# Bounds for the stderr tail folded into `failure_reason` on a state-based
+# (no launcher-line) failure. Deliberately small — `failure_reason` is
+# persisted on qiita.work_ticket_step / qiita.work_ticket and rendered by
+# `qiita ticket status`; the fuller tail is available via `qiita ticket logs`.
+_FAILURE_REASON_TAIL_LINES = 15
+_FAILURE_REASON_TAIL_BYTES = 2048
 
 
 class SlurmBackend(ComputeBackend):
@@ -513,11 +531,27 @@ class SlurmBackend(ComputeBackend):
                 # message AND the SLURM job context (job id, exit code).
                 reason=f"{launcher_failure.reason} [{state_reason}]",
             )
+
+        # No structured launcher line (a container step, or the process was
+        # infra-killed — including by OOM — before it could write one). Read
+        # the stderr tail: a step-level cgroup oom_kill surfaces only as the
+        # coarse FAILED/exit_code=1 above, so the stderr text is the one
+        # in-band signal that an otherwise-opaque failure was a memory kill.
+        # Fold the tail into failure_reason either way so `qiita ticket status`
+        # carries the real error without a host shell.
+        stderr_tail, _ = read_text_tail(
+            handle.logs_path / "stderr",
+            max_lines=_FAILURE_REASON_TAIL_LINES,
+            max_bytes=_FAILURE_REASON_TAIL_BYTES,
+        )
+        if kind in _OOM_UPGRADABLE_KINDS and contains_oom_signature(stderr_tail):
+            kind = FailureKind.OOM_KILLED
+        reason = f"{state_reason}; stderr tail: {stderr_tail}" if stderr_tail else state_reason
         raise BackendFailure(
             kind=kind,
             stage=WorkTicketFailureStage.STEP_RUN,
             step_name=handle.step_name,
-            reason=state_reason,
+            reason=reason,
         )
 
     async def find_jobs_by_name(self, job_name: str) -> list[FoundJob]:

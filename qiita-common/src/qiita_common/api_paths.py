@@ -125,6 +125,9 @@ PATH_WORK_TICKET_PREFIX = "/work-ticket"
 PATH_WORK_TICKET_ROOT = ""  # POST (submit) and GET (list) against the prefix itself
 PATH_WORK_TICKET_BY_IDX = "/{work_ticket_idx}"
 PATH_WORK_TICKET_RUN = "/{work_ticket_idx}/run"
+# Read a single step attempt's stdout/stderr tail (operator diagnosis without
+# a host shell — the logs live under PATH_SCRATCH/ticket, served by the CP).
+PATH_WORK_TICKET_STEP_LOGS = "/{work_ticket_idx}/step/{step_index}/logs"
 
 URL_WORK_TICKET_PREFIX = f"{API_PREFIX}{PATH_WORK_TICKET_PREFIX}"
 # GET-list URL — same path as the POST root, named distinctly so clients
@@ -132,6 +135,7 @@ URL_WORK_TICKET_PREFIX = f"{API_PREFIX}{PATH_WORK_TICKET_PREFIX}"
 URL_WORK_TICKET_LIST = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_ROOT}"
 URL_WORK_TICKET_BY_IDX = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_BY_IDX}"
 URL_WORK_TICKET_RUN = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_RUN}"
+URL_WORK_TICKET_STEP_LOGS = f"{URL_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_STEP_LOGS}"
 
 
 # =============================================================================

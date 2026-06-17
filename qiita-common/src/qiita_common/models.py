@@ -1643,6 +1643,29 @@ class WorkTicketSummary(WorkTicket):
     step_state: StepProgressState | None = None
 
 
+class WorkTicketStepLogs(BaseModel):
+    """Returned by `GET /api/v1/work-ticket/{idx}/step/{step_index}/logs`.
+
+    A bounded tail of a single step attempt's stdout/stderr, read by the
+    control plane straight off shared scratch (`PATH_SCRATCH/ticket/...`) and
+    served over HTTP so an operator can diagnose a failure — an OOM, a bad
+    input, a contract violation — without a host shell or sudo. Each stream is
+    independently truncated; `*_truncated` is True when older content was
+    dropped from the front. A stream the job never wrote comes back as an
+    empty string (not an error)."""
+
+    work_ticket_idx: Annotated[int, Field(gt=0)]
+    step_index: Annotated[int, Field(ge=0)]
+    # The attempt actually read — resolved to the latest recorded attempt when
+    # the caller didn't pin one, so the response is self-describing.
+    attempt: Annotated[int, Field(ge=0)]
+    step_name: str
+    stdout: str = ""
+    stderr: str = ""
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+
+
 # ============================================================================
 # Sequencing-run / sequenced-pool / sequenced-sample import models
 # ============================================================================

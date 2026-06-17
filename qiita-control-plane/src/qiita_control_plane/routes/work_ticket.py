@@ -55,8 +55,10 @@ from qiita_common.api_paths import (
     PATH_WORK_TICKET_PREFIX,
     PATH_WORK_TICKET_ROOT,
     PATH_WORK_TICKET_RUN,
+    PATH_WORK_TICKET_STEP_LOGS,
 )
 from qiita_common.auth_constants import SystemRole
+from qiita_common.log_tail import read_text_tail
 from qiita_common.models import (
     ReferenceStatus,
     ScopeTargetKind,
@@ -65,6 +67,7 @@ from qiita_common.models import (
     WorkTicketCreateRequest,
     WorkTicketResponse,
     WorkTicketState,
+    WorkTicketStepLogs,
     WorkTicketSummary,
 )
 
@@ -79,8 +82,15 @@ from ..auth.principal import Anonymous, HumanUser, Principal, ServiceAccount, ge
 from ..deps import get_db_pool
 from ..dispatch import NON_TERMINAL_WORK_TICKET_STATES, schedule_dispatch
 from ..repositories.prep_sample import fetch_active_study_idxs_for_prep_sample
+from ..step_progress import load_step_progress
 
 _log = logging.getLogger(__name__)
+
+# Step-logs tail bounds. Defaults err small so a routine `qiita ticket logs`
+# stays readable; the caller can widen `tail_lines` up to the byte ceiling.
+_STEP_LOGS_DEFAULT_TAIL_LINES = 200
+_STEP_LOGS_MAX_TAIL_LINES = 5000
+_STEP_LOGS_MAX_TAIL_BYTES = 256 * 1024
 
 router = APIRouter(prefix=PATH_WORK_TICKET_PREFIX, tags=["work-ticket"])
 
@@ -864,6 +874,117 @@ async def list_work_tickets(
         *args,
     )
     return [_row_to_work_ticket_summary(row) for row in rows]
+
+
+@router.get(
+    PATH_WORK_TICKET_STEP_LOGS,
+    response_model=WorkTicketStepLogs,
+)
+async def get_work_ticket_step_logs(
+    work_ticket_idx: int,
+    step_index: int,
+    request: Request,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    principal: Principal = Depends(get_current_principal),
+    attempt: int | None = Query(
+        default=None,
+        ge=0,
+        description="Step attempt to read; defaults to the latest recorded attempt.",
+    ),
+    tail_lines: int = Query(
+        default=_STEP_LOGS_DEFAULT_TAIL_LINES,
+        ge=1,
+        le=_STEP_LOGS_MAX_TAIL_LINES,
+        description="Max lines of each stream to return (from the end).",
+    ),
+) -> WorkTicketStepLogs:
+    """Read a bounded tail of a step attempt's stdout/stderr.
+
+    The logs live under `PATH_SCRATCH/ticket/<idx>/<step>/attempt-<n>/logs/`,
+    owned `qiita-orch:qiita-pipeline` (mode 2770). The CP service account is in
+    `qiita-pipeline` (deploy #57), so it reads them straight off shared scratch
+    and serves the tail here — letting an operator diagnose an OOM / bad input
+    / contract violation without a host shell or sudo (issue #104).
+
+    Auth mirrors `GET /work-ticket/{idx}` exactly: 401 on Anonymous; the
+    originator passes; wet_lab_admin+ bypasses; anyone else gets 404 (not 403),
+    so a caller cannot probe which tickets exist. A missing ticket, an unknown
+    step index, or an unknown attempt all return the same 404.
+
+    `attempt` defaults to the latest recorded attempt for the step — the run an
+    operator most likely just watched fail. A stream the job never wrote comes
+    back as an empty string, not an error."""
+    if isinstance(principal, Anonymous):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="authentication required"
+        )
+    not_found = HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"work_ticket {work_ticket_idx} step {step_index} logs not found",
+    )
+    owner_row = await pool.fetchrow(
+        "SELECT originator_principal_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    if owner_row is None:
+        raise not_found
+    is_originator = owner_row["originator_principal_idx"] == principal.principal_idx
+    is_bypass = principal.has_role_at_least(SystemRole.WET_LAB_ADMIN)
+    if not (is_originator or is_bypass):
+        raise not_found
+
+    # Resolve the (step_index, attempt) -> step_name from the write-ahead spine.
+    # Without a progress row the step never reached a backend, so there is no
+    # log path to read — a 404, indistinguishable from an out-of-range index.
+    all_rows = await load_step_progress(pool, work_ticket_idx)
+    rows = [r for r in all_rows if r.step_index == step_index]
+    if not rows:
+        raise not_found
+    if attempt is None:
+        chosen = max(rows, key=lambda r: r.attempt)
+    else:
+        chosen = next((r for r in rows if r.attempt == attempt), None)
+        if chosen is None:
+            raise not_found
+
+    ticket_root = request.app.state.settings.path_scratch_ticket
+    if ticket_root is None:
+        # PATH_SCRATCH is required at production boot; a None here is a
+        # misconfigured deploy, not a client error — fail loud.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="path_scratch_ticket is not configured on this control plane",
+        )
+    # Defense-in-depth: step_name comes from the DB, sourced from admin-synced
+    # workflow YAML (WorkflowStep.name, no character-class constraint) — not from
+    # the request — and the runner already uses it verbatim to build the write
+    # path. But this is the first place it's interpolated into a path on a request
+    # path, so a separator / parent-ref would let a malformed entry name escape the
+    # ticket root. That's a contract violation, never a client error: fail loud.
+    if "/" in chosen.step_name or "\\" in chosen.step_name or chosen.step_name in (".", ".."):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"step_name {chosen.step_name!r} is not a valid path segment",
+        )
+    logs_dir = (
+        ticket_root / str(work_ticket_idx) / chosen.step_name / f"attempt-{chosen.attempt}" / "logs"
+    )
+    stdout, stdout_truncated = read_text_tail(
+        logs_dir / "stdout", max_lines=tail_lines, max_bytes=_STEP_LOGS_MAX_TAIL_BYTES
+    )
+    stderr, stderr_truncated = read_text_tail(
+        logs_dir / "stderr", max_lines=tail_lines, max_bytes=_STEP_LOGS_MAX_TAIL_BYTES
+    )
+    return WorkTicketStepLogs(
+        work_ticket_idx=work_ticket_idx,
+        step_index=step_index,
+        attempt=chosen.attempt,
+        step_name=chosen.step_name,
+        stdout=stdout,
+        stderr=stderr,
+        stdout_truncated=stdout_truncated,
+        stderr_truncated=stderr_truncated,
+    )
 
 
 async def _reset_reference_scope_for_redrive(

@@ -1061,6 +1061,68 @@ async def test_result_step_failed_prefers_launcher_stderr(jwt_path, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_result_step_step_level_oom_upgrades_to_oom_killed(jwt_path, tmp_path):
+    """A cgroup step-level oom_kill surfaces only as a coarse
+    FAILED/exit_code=1 (no OUT_OF_MEMORY state, no launcher line). result_step
+    must read the stderr tail, recognize the OOM signature, and upgrade the
+    EXIT_NONZERO classification to the (retriable) OOM_KILLED — the #104 fix."""
+    backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
+    (tmp_path / "logs").mkdir(parents=True)
+    (tmp_path / "logs" / "stderr").write_text(
+        "loading reference...\n"
+        "slurmstepd: error: Detected 1 oom_kill event in StepId=141763.0. "
+        "Some of the step tasks have been OOM Killed.\n"
+    )
+    with pytest.raises(BackendFailure) as ei:
+        await backend.result_step(
+            _slurm_handle(tmp_path),
+            StepStatusInfo(
+                status=StepStatus.FAILED,
+                raw_state="FAILED",
+                exit_code=1,
+                reason="NonZeroExitCode",
+            ),
+        )
+    assert ei.value.kind is FailureKind.OOM_KILLED
+    assert ei.value.transient is True
+    # The stderr tail is folded into the reason so `qiita ticket status` shows it.
+    assert "oom_kill" in ei.value.reason
+    assert "NonZeroExitCode" in ei.value.reason  # SLURM context preserved
+
+
+@pytest.mark.asyncio
+async def test_result_step_non_oom_failure_stays_exit_nonzero_with_tail(jwt_path, tmp_path):
+    """A generic FAILED whose stderr carries no OOM signature stays
+    EXIT_NONZERO, but the stderr tail is still folded into failure_reason."""
+    backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
+    (tmp_path / "logs").mkdir(parents=True)
+    (tmp_path / "logs" / "stderr").write_text("FileNotFoundError: missing input.fastq\n")
+    with pytest.raises(BackendFailure) as ei:
+        await backend.result_step(
+            _slurm_handle(tmp_path),
+            StepStatusInfo(status=StepStatus.FAILED, raw_state="FAILED", exit_code=1),
+        )
+    assert ei.value.kind is FailureKind.EXIT_NONZERO
+    assert "missing input.fastq" in ei.value.reason
+
+
+@pytest.mark.asyncio
+async def test_result_step_oom_signature_does_not_downgrade_node_fail(jwt_path, tmp_path):
+    """An infra kind already correctly classified from the SLURM state
+    (NODE_FAIL) must NOT be reclassified to OOM_KILLED even if a broad
+    'Killed' token appears in stderr — we only upgrade generic kinds."""
+    backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
+    (tmp_path / "logs").mkdir(parents=True)
+    (tmp_path / "logs" / "stderr").write_text("srun: Killed\n")
+    with pytest.raises(BackendFailure) as ei:
+        await backend.result_step(
+            _slurm_handle(tmp_path),
+            StepStatusInfo(status=StepStatus.FAILED, raw_state="NODE_FAIL", exit_code=None),
+        )
+    assert ei.value.kind is FailureKind.NODE_FAIL
+
+
+@pytest.mark.asyncio
 async def test_find_jobs_by_name_returns_matching_jobs(jwt_path):
     """find_jobs_by_name lists slurmrestd jobs, filters to the deterministic
     name, and maps each to a FoundJob with id + coarse status."""

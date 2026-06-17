@@ -15,6 +15,16 @@ the `no-changelog` label).
 
 ### Added
 
+- Work-ticket step logs are now retrievable without sudo. New
+  `GET /work-ticket/{idx}/step/{step_index}/logs` returns a bounded
+  stdout/stderr tail (defaulting to the latest attempt; `attempt` and
+  `tail_lines` query params override), and `qiita ticket logs <idx>
+  --step-index N [--attempt N] [--tail-lines N]` surfaces it from the CLI. The
+  control plane reads the logs straight off shared scratch
+  (`PATH_SCRATCH/ticket/...`) via its existing `qiita-pipeline` group access,
+  so an operator can diagnose an OOM / bad input / contract violation without a
+  host shell. Auth mirrors `GET /work-ticket/{idx}` (originator or
+  wet_lab_admin+; non-owners get an enumeration-safe 404) (#104)
 - Per-run memory override for workflow steps. `qiita reference load` and `qiita
   ticket submit` gain `--mem-gb N`, carried as an optional `resource_override`
   on `POST /work-ticket`: at dispatch the runner raises each SLURM step's memory
@@ -229,6 +239,18 @@ the `no-changelog` label).
 
 ### Fixed
 
+- OOM-killed workflow steps are no longer mis-reported as a bare
+  `NonZeroExitCode`. A cgroup step-level `oom_kill` surfaces to slurmrestd only
+  as a coarse job-level `FAILED`/`exit_code=1`, so the orchestrator's
+  `OUT_OF_MEMORY → OOM_KILLED` classifier never fired and the launcher's
+  structured stderr line was never written (the process was killed first). The
+  SLURM backend now scans the job's stderr on an otherwise-unclassified
+  terminal failure: an OOM signature upgrades the classification to the
+  (retriable) `OOM_KILLED`, and a short stderr tail is folded into
+  `failure_reason` for every state-based failure — so `qiita ticket status`
+  reports a memory-related reason directly instead of requiring a root shell to
+  read the SLURM log. A specific infra kind (NODE_FAIL/TIMEOUT/PREEMPTED) is
+  never downgraded (#104)
 - `docs/runbooks/redeploy.md` §7 no longer tells the operator to run
   `compute-readiness` as `qiita-api` sourcing `control-plane.env` (which fails:
   it needs the `qiita-orch` account + `compute-orchestrator.env` + the 0400
