@@ -255,7 +255,7 @@ the `no-changelog` label).
   deliberate follow-up, and `host_filter` is intentionally left as-is — its
   genome-scale memory is the rype/minimap2 indexes held out of DuckDB's heap,
   which already grow into the cgroup a `--mem-gb` raise provides, so converting
-  its DuckDB cap would starve them (#TBD)
+  its DuckDB cap would starve them (#107)
 - OOM-killed workflow steps are no longer mis-reported as a bare
   `NonZeroExitCode`. A cgroup step-level `oom_kill` surfaces to slurmrestd only
   as a coarse job-level `FAILED`/`exit_code=1`, so the orchestrator's
