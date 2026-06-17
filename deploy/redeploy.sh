@@ -32,7 +32,8 @@
 #      operator/checkout owner), QIITA_CLONE (default: this script's parent's
 #      parent), ASSUME_YES=1 (skip interactive acks — for automation),
 #      RUN_MIGRATE=1 (apply pending migrations here after a typed confirm;
-#      default off — leave off for expand/contract deploys), SKIP_STAGE_MIINT=1.
+#      default off — leave off for expand/contract deploys), SKIP_STAGE_MIINT=1,
+#      SKIP_NATIVE_REFRESH=1 (skip the SLURM native-venv `uv sync` in step 5).
 
 set -euo pipefail
 
@@ -133,16 +134,45 @@ env SKIP_PULL=1 QIITA_HOSTNAME="$QIITA_HOSTNAME" QIITA_USER="$QIITA_USER" QIITA_
 
 # --- 5. SLURM native-venv refresh + miint staging (recurring footguns) ------
 echo "--- [5/7] SLURM native env (redeploy.md §6) ---"
-echo "REMINDER: local-deploy.sh only synced the /opt/qiita SERVICE venvs. Native"
-echo "SLURM jobs run from the SLURM_NATIVE_PYTHON checkout on the shared FS; on any"
-echo "deploy that changed qiita-common or qiita-compute-orchestrator, refresh it too"
-echo "(as its owner $QIITA_USER), or native jobs import stale code:"
-echo "    sudo -u $QIITA_USER bash -lc 'cd <native-checkout>/qiita-compute-orchestrator && uv sync --reinstall-package qiita-common'"
+# Native SLURM jobs run from the venv SLURM_NATIVE_PYTHON points at — a separate
+# checkout on the shared FS, NOT the /opt/qiita SERVICE venvs local-deploy.sh just
+# synced. On any deploy that changed qiita-common or qiita-compute-orchestrator,
+# that venv must be refreshed too, or native jobs silently import stale code (#106).
+# Both this refresh and the miint stage below feed native jobs, so refresh first.
+nativepy=""
+[ -r "$CO_ENV" ] && nativepy=$(read_env_var "$CO_ENV" SLURM_NATIVE_PYTHON)
+if [ -n "${SKIP_NATIVE_REFRESH:-}" ]; then
+    echo "Skipping SLURM native-venv refresh (SKIP_NATIVE_REFRESH=1). If qiita-common or"
+    echo "qiita-compute-orchestrator changed, refresh it by hand (as its owner $QIITA_USER):"
+    echo "    sudo -u $QIITA_USER bash -lc 'cd <native-checkout>/qiita-compute-orchestrator && uv sync --reinstall-package qiita-common'"
+elif native_checkout=$(qiita_native_checkout_from_python "$nativepy"); then
+    # Run as the checkout OWNER ($QIITA_USER), never root: a root-owned .venv the
+    # operator can't clean is the #80 footgun. `bash -lc` so uv is on PATH.
+    confirm "Refresh the SLURM native venv ('uv sync --reinstall-package qiita-common' in $native_checkout, as $QIITA_USER)?"
+    sudo -u "$QIITA_USER" bash -lc "cd '$native_checkout' && uv sync --reinstall-package qiita-common"
+    # Fail loud if the just-synced venv can't import what native jobs import — a
+    # broken refresh must abort here, not surface as a stale job at the next
+    # genome-scale reference-load. (compute-readiness's probe/native-import covers
+    # the compute-node side in step 6; this is the cheap head-node check.)
+    sudo -u "$QIITA_USER" "$nativepy" -c 'import qiita_common, qiita_compute_orchestrator.jobs'
+    echo "Native venv refreshed and imports verified."
+else
+    rc=$?
+    # rc=1 → SLURM_NATIVE_PYTHON unset/`python` (local backend): skip cleanly,
+    # exactly as the miint stage degrades. rc=2 → a bad derivation already printed
+    # its reason to stderr; abort rather than sync a wrong path.
+    if [ "$rc" -eq 1 ]; then
+        echo "SLURM_NATIVE_PYTHON not set in $CO_ENV — skipping native-venv refresh"
+        echo "(local backend, or refresh manually per redeploy.md §6)."
+    else
+        echo "Refusing to refresh the native venv from a bad SLURM_NATIVE_PYTHON (see above)." >&2
+        exit 1
+    fi
+fi
 if [ -n "${SKIP_STAGE_MIINT:-}" ]; then
     echo "Skipping miint extension staging (SKIP_STAGE_MIINT=1)."
 elif [ -r "$CO_ENV" ]; then
     derived=$(read_env_var "$CO_ENV" PATH_DERIVED)
-    nativepy=$(read_env_var "$CO_ENV" SLURM_NATIVE_PYTHON)
     if [ -n "$derived" ] && [ -n "$nativepy" ]; then
         confirm "Stage the miint extension now (scripts/stage-miint-extension.sh, as $QIITA_ORCH_USER)?"
         sudo -u "$QIITA_ORCH_USER" env PATH_DERIVED="$derived" SLURM_NATIVE_PYTHON="$nativepy" \

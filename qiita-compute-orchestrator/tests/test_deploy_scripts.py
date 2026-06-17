@@ -13,6 +13,7 @@ gracefully (same posture as the apptainer-optional workflow tests).
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -21,6 +22,7 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEPLOY = _REPO_ROOT / "deploy"
+_COMMON = _DEPLOY / "_common.sh"
 
 # The scripts introduced/maintained for the issue-#72 deploy-ease work. Kept
 # explicit (not a glob) so a new deploy script is a deliberate add here.
@@ -65,3 +67,74 @@ def test_deploy_script_passes_shellcheck(name: str) -> None:
         text=True,
     )
     assert result.returncode == 0, f"shellcheck flagged {name}:\n{result.stdout}\n{result.stderr}"
+
+
+def _call_native_checkout(native_python: str) -> subprocess.CompletedProcess[str]:
+    """Source _common.sh and invoke qiita_native_checkout_from_python with one arg.
+    Returns the CompletedProcess so a test can assert on returncode + stdout."""
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{_COMMON}"; qiita_native_checkout_from_python "$1"',
+            "_",
+            native_python,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+
+def _fake_native_checkout(tmp_path: Path) -> Path:
+    """Build a `<repo>/qiita-compute-orchestrator/.venv/bin/python` layout under a
+    git clone, matching what SLURM_NATIVE_PYTHON points at in production."""
+    checkout = tmp_path / "qiita-compute-orchestrator"
+    (checkout / ".venv" / "bin").mkdir(parents=True)
+    (tmp_path / ".git").mkdir()  # the repo root the checkout sits under
+    (checkout / "pyproject.toml").write_text("[project]\nname='qiita-compute-orchestrator'\n")
+    py = checkout / ".venv" / "bin" / "python"
+    py.write_text("#!/bin/sh\n")
+    py.chmod(0o755)
+    return py
+
+
+def test_native_checkout_resolves_valid_layout(tmp_path: Path) -> None:
+    py = _fake_native_checkout(tmp_path)
+    result = _call_native_checkout(str(py))
+    assert result.returncode == 0, result.stderr
+    # Realpath both sides — macOS /tmp is a /private symlink, and the helper cd's.
+    assert os.path.realpath(result.stdout) == os.path.realpath(str(py.parents[2]))
+
+
+@pytest.mark.parametrize("arg", ["", "python"])
+def test_native_checkout_skips_when_unset_or_path_based(arg: str) -> None:
+    """Empty / bare `python` (local backend) is a SKIP signal (rc=1), not a FAIL —
+    redeploy.sh degrades like the miint stage rather than aborting the deploy."""
+    result = _call_native_checkout(arg)
+    assert result.returncode == 1
+    assert result.stdout == ""
+
+
+def test_native_checkout_fails_on_wrong_basename(tmp_path: Path) -> None:
+    """A python whose grandparent dir isn't qiita-compute-orchestrator is a hard
+    FAIL (rc=2) so redeploy.sh refuses to `uv sync` a wrong path."""
+    bad = tmp_path / "some-other-dir" / ".venv" / "bin"
+    bad.mkdir(parents=True)
+    (tmp_path / ".git").mkdir()
+    py = bad / "python"
+    py.write_text("#!/bin/sh\n")
+    result = _call_native_checkout(str(py))
+    assert result.returncode == 2
+    assert "qiita-compute-orchestrator" in result.stderr
+
+
+def test_native_checkout_fails_outside_git_clone(tmp_path: Path) -> None:
+    """Right shape but no ../.git → not a checkout → hard FAIL (rc=2)."""
+    checkout = tmp_path / "qiita-compute-orchestrator"
+    (checkout / ".venv" / "bin").mkdir(parents=True)
+    (checkout / "pyproject.toml").write_text("[project]\n")
+    py = checkout / ".venv" / "bin" / "python"
+    py.write_text("#!/bin/sh\n")
+    result = _call_native_checkout(str(py))
+    assert result.returncode == 2
+    assert "git clone" in result.stderr

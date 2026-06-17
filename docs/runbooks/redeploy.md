@@ -179,13 +179,25 @@ files are present.
 If the migration guard aborts here, you skipped or under-ran the migrate
 step above — run `make migrate` and re-run this command.
 
-> **The SLURM native compute env is refreshed separately.** `local-deploy.sh`
+> **The SLURM native compute env is refreshed separately from the service
+> venvs — but `redeploy.sh` step 5 now does it for you.** `local-deploy.sh`
 > only `uv sync`s the `/opt/qiita` *service* venvs. Native SLURM jobs run from
 > the venv `SLURM_NATIVE_PYTHON` points at — a separate clone on the shared
 > filesystem the compute nodes mount (e.g.
 > `/home/qiita/qiita-miint/qiita-compute-orchestrator`). On every deploy that
-> changes `qiita-common` or `qiita-compute-orchestrator`, refresh it too, or a
-> native job imports stale code (and can keep a stale cached miint extension):
+> changes `qiita-common` or `qiita-compute-orchestrator`, that venv must be
+> refreshed too, or a native job imports stale code (and can keep a stale cached
+> miint extension) — issue #106.
+>
+> `sudo make redeploy` automates this (step 5, before the miint stage): it
+> derives the checkout from `SLURM_NATIVE_PYTHON`, runs `uv sync
+> --reinstall-package qiita-common` **as the checkout owner `qiita`** (never
+> root — a root-owned `.venv` is the #80 footgun), and fails loud if the synced
+> venv can't import. It skips cleanly when `SLURM_NATIVE_PYTHON` is unset (local
+> backend), and `SKIP_NATIVE_REFRESH=1` opts out.
+>
+> If you run `local-deploy.sh` directly (not via `redeploy.sh`), or skipped the
+> step, refresh it by hand:
 > ```bash
 > # [operator] in the SLURM_NATIVE_PYTHON checkout, on the shared FS
 > cd <native-checkout>/qiita-compute-orchestrator && uv sync --reinstall-package qiita-common
