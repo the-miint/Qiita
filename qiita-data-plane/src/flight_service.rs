@@ -247,6 +247,32 @@ impl FlightService for QiitaFlightService {
                 let output = stream::once(futures::future::ready(Ok(result)));
                 Ok(Response::new(Box::pin(output)))
             }
+            "delete_reference" => {
+                let payload = auth::verify_delete_reference(&action.body, &self.hmac_secret)
+                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
+
+                if payload.action != "delete_reference" {
+                    return Err(Status::invalid_argument(format!(
+                        "action type mismatch: header says 'delete_reference', payload says {:?}",
+                        payload.action
+                    )));
+                }
+
+                let deleted = delete_reference(
+                    &self.catalog_connstr,
+                    &self.data_path,
+                    payload.reference_idx,
+                )?;
+
+                let result_body = serde_json::to_vec(&deleted)
+                    .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+
+                let result = arrow_flight::Result {
+                    body: result_body.into(),
+                };
+                let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
             other => Err(Status::invalid_argument(format!(
                 "unknown action type: {other:?}"
             ))),
@@ -652,6 +678,113 @@ fn register_files(
     Ok(registered)
 }
 
+/// Delete every DuckLake row belonging to a reference.
+///
+/// Scoping rules mirror the identifier hierarchy:
+/// - `reference_taxonomy`, `reference_phylogeny`, `reference_placements`, and
+///   `reference_membership` carry `reference_idx` directly → deleted by a plain
+///   `WHERE reference_idx = ?`.
+/// - `reference_sequences` / `reference_sequence_chunks` are keyed by
+///   `feature_idx` and **shared across references** (a feature deduplicates by
+///   sequence hash). Only *orphan* features — owned by this reference and no
+///   other — are removed; a feature another reference still claims keeps its
+///   sequence. Orphans are computed from this data plane's own
+///   `reference_membership`, so the action ticket needs only `reference_idx`.
+///
+/// Order matters: the sequence deletes run *before* the membership delete so
+/// the orphan subquery can still see this reference's rows. Idempotent — a
+/// reference with no loaded data deletes zero rows and still succeeds.
+fn delete_reference(
+    catalog_connstr: &str,
+    data_path: &str,
+    reference_idx: i64,
+) -> Result<serde_json::Value, Status> {
+    let conn = duckdb::Connection::open_in_memory()
+        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
+    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
+        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
+
+    let exec = |sql: &str, params: &[i64]| -> Result<usize, Status> {
+        // duckdb's params! wants &dyn ToSql; i64 implements it. Build the
+        // slice explicitly so the same helper serves the 1- and 2-param calls.
+        let boxed: Vec<&dyn duckdb::ToSql> =
+            params.iter().map(|p| p as &dyn duckdb::ToSql).collect();
+        conn.execute(sql, boxed.as_slice())
+            .map_err(|e| Status::internal(format!("delete failed ({sql}): {e}")))
+    };
+
+    // All six deletes are one DuckLake transaction so the action is
+    // all-or-nothing: a mid-delete failure rolls every table back rather than
+    // leaving a half-purged reference. That atomicity is what lets the control
+    // plane safely retry — a failed call leaves DuckLake membership fully
+    // intact, so the orphan recomputation on the next attempt is unchanged.
+    conn.execute_batch("BEGIN TRANSACTION")
+        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
+
+    // Orphan features: this reference's features minus every other reference's.
+    // This set MUST match the Postgres-side orphan computation in
+    // qiita_control_plane.actions.reference.delete_reference_cascade — the two
+    // stores GC the same features independently, so a change to one query must
+    // change the other or sequences/features desync across stores.
+    let orphan_filter = "feature_idx IN (
+            SELECT feature_idx FROM qiita_lake.reference_membership WHERE reference_idx = ?
+            EXCEPT
+            SELECT feature_idx FROM qiita_lake.reference_membership WHERE reference_idx <> ?
+        )";
+
+    // Sequence/chunk deletes run BEFORE the membership delete: the orphan
+    // subquery needs this reference's membership rows still present.
+    let deletes = (|| -> Result<serde_json::Value, Status> {
+        let sequences_deleted = exec(
+            &format!("DELETE FROM qiita_lake.reference_sequences WHERE {orphan_filter}"),
+            &[reference_idx, reference_idx],
+        )?;
+        let chunks_deleted = exec(
+            &format!("DELETE FROM qiita_lake.reference_sequence_chunks WHERE {orphan_filter}"),
+            &[reference_idx, reference_idx],
+        )?;
+        let membership_deleted = exec(
+            "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = ?",
+            &[reference_idx],
+        )?;
+        let taxonomy_deleted = exec(
+            "DELETE FROM qiita_lake.reference_taxonomy WHERE reference_idx = ?",
+            &[reference_idx],
+        )?;
+        let phylogeny_deleted = exec(
+            "DELETE FROM qiita_lake.reference_phylogeny WHERE reference_idx = ?",
+            &[reference_idx],
+        )?;
+        let placements_deleted = exec(
+            "DELETE FROM qiita_lake.reference_placements WHERE reference_idx = ?",
+            &[reference_idx],
+        )?;
+        Ok(serde_json::json!({
+            "sequences_deleted": sequences_deleted,
+            "chunks_deleted": chunks_deleted,
+            "membership_deleted": membership_deleted,
+            "taxonomy_deleted": taxonomy_deleted,
+            "phylogeny_deleted": phylogeny_deleted,
+            "placements_deleted": placements_deleted,
+        }))
+    })();
+
+    let counts = match deletes {
+        Ok(counts) => counts,
+        Err(e) => {
+            // Best-effort rollback; surface the original delete error.
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    };
+    conn.execute_batch("COMMIT")
+        .map_err(|e| Status::internal(format!("failed to commit delete transaction: {e}")))?;
+
+    let mut out = counts;
+    out["reference_idx"] = serde_json::json!(reference_idx);
+    Ok(out)
+}
+
 /// Move a file, falling back to copy+delete for cross-filesystem moves.
 ///
 /// If the copy succeeds but delete fails, the dest file is kept (it's the
@@ -769,6 +902,105 @@ fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- delete_reference integration harness (mirrors ducklake.rs::tests) ---
+
+    #[cfg(feature = "integration")]
+    fn delete_test_catalog_connstr() -> String {
+        std::env::var("DUCKLAKE_CATALOG_CONNSTR").unwrap_or_else(|_| {
+            "dbname=qiita_ducklake host=localhost port=5433 user=qiita password=qiita".to_string()
+        })
+    }
+
+    #[cfg(feature = "integration")]
+    fn delete_test_data_path() -> String {
+        let data_path = std::env::var("PATH_PERSISTENT")
+            .map(|base| format!("{base}/ducklake"))
+            .unwrap_or_else(|_| "/tmp/qiita-integration-ducklake-data".to_string());
+        std::fs::create_dir_all(&data_path).unwrap();
+        data_path
+    }
+
+    /// Orphan-only sequence deletion: a feature owned by another reference
+    /// keeps its sequence; a feature owned only by the deleted reference loses
+    /// it. Reference-scoped tables (membership, taxonomy) drop fully.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn delete_reference_drops_orphans_keeps_shared() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_reference_tables(&conn).unwrap();
+
+        // Unique ids so leftover rows never collide with other tests.
+        let ref_a: i64 = 910_000;
+        let ref_b: i64 = 910_001;
+        let shared: i64 = 910_010; // claimed by ref_a AND ref_b
+        let orphan: i64 = 910_011; // claimed by ref_a only
+
+        conn.execute_batch(&format!(
+            "INSERT INTO qiita_lake.reference_membership VALUES \
+                 ({ref_a}, {shared}), ({ref_a}, {orphan}), ({ref_b}, {shared});
+             INSERT INTO qiita_lake.reference_sequences VALUES \
+                 ({shared}, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID, 4), \
+                 ({orphan}, 'b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a22'::UUID, 5);
+             INSERT INTO qiita_lake.reference_taxonomy (reference_idx, feature_idx, domain) VALUES \
+                 ({ref_a}, {shared}, 'd__Bacteria'), ({ref_a}, {orphan}, 'd__Bacteria');"
+        ))
+        .unwrap();
+
+        let counts =
+            delete_reference(&connstr, &data_path, ref_a).expect("delete_reference failed");
+        assert_eq!(counts["sequences_deleted"], 1, "only the orphan sequence");
+        assert_eq!(counts["membership_deleted"], 2, "both ref_a memberships");
+        assert_eq!(counts["taxonomy_deleted"], 2);
+
+        let remaining_seq = |feature: i64| -> i64 {
+            conn.query_row(
+                &format!(
+                    "SELECT count(*) FROM qiita_lake.reference_sequences WHERE feature_idx = {feature}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            remaining_seq(shared),
+            1,
+            "shared feature keeps its sequence"
+        );
+        assert_eq!(remaining_seq(orphan), 0, "orphan feature sequence deleted");
+
+        let ref_a_membership: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM qiita_lake.reference_membership WHERE reference_idx = {ref_a}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ref_a_membership, 0);
+        let ref_b_membership: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM qiita_lake.reference_membership WHERE reference_idx = {ref_b}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ref_b_membership, 1, "ref_b membership untouched");
+
+        // Best-effort cleanup of the surviving shared rows.
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_b};
+             DELETE FROM qiita_lake.reference_sequences WHERE feature_idx = {shared};"
+        ));
+    }
 
     #[test]
     fn build_query_no_filter() {

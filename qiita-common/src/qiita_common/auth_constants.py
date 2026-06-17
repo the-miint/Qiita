@@ -38,6 +38,11 @@ class Scope(StrEnum):
     # Reference data
     REFERENCE_READ = "reference:read"
     REFERENCE_WRITE = "reference:write"
+    # Full purge of a reference (Postgres rows + DuckLake data + on-disk
+    # indexes). Deliberately distinct from REFERENCE_WRITE: deletion is
+    # destructive and admin-only, granted solely to system_admin in
+    # ROLE_IMPLIED_SCOPES — never to wet_lab_admin or service accounts.
+    REFERENCE_DELETE = "reference:delete"
     REFERENCE_REGISTER_FILES = "reference:register_files"
     FEATURE_MINT = "feature:mint"
     TICKET_DOGET = "ticket:doget"

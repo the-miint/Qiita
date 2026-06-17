@@ -60,6 +60,10 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.SELF_TOKEN,
             Scope.REFERENCE_READ,
             Scope.REFERENCE_WRITE,
+            # Full reference purge is system_admin-only — deliberately above
+            # wet_lab_admin (who can create/load references via REFERENCE_WRITE
+            # but not destroy them). Service accounts never get it.
+            Scope.REFERENCE_DELETE,
             Scope.BIOSAMPLE_READ,
             Scope.BIOSAMPLE_WRITE,
             Scope.PREP_SAMPLE_READ,

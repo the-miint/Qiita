@@ -99,6 +99,7 @@ async def human_admin_session(postgres_pool):
             Scope.SELF_TOKEN,
             Scope.REFERENCE_READ,
             Scope.REFERENCE_WRITE,
+            Scope.REFERENCE_DELETE,
             Scope.BIOSAMPLE_READ,
             Scope.BIOSAMPLE_WRITE,
             Scope.PREP_SAMPLE_READ,

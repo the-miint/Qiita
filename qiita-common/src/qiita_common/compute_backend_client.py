@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 
 from .api_paths import (
+    URL_REFERENCE_ARTIFACT_BY_IDX,
     URL_STEP_FIND_BY_NAME,
     URL_STEP_RESULT,
     URL_STEP_STATUS,
@@ -34,6 +35,7 @@ from .backend_failure import (
 )
 from .models import (
     FoundJobWire,
+    ReferenceArtifactPurgeResponse,
     StepBaselineResources,
     StepFindByNameRequest,
     StepFindByNameResponse,
@@ -190,6 +192,22 @@ class ComputeBackendClient:
         self._raise_if_backend_failure(resp)
         resp.raise_for_status()
         return StepFindByNameResponse.model_validate(resp.json()).jobs
+
+    async def purge_reference_artifacts(self, reference_idx: int) -> ReferenceArtifactPurgeResponse:
+        """Ask the orchestrator to remove a reference's on-disk index
+        artifacts (`{path_derived}/references/{idx}`). Idempotent: a missing
+        directory is a no-op (`removed=False`), not an error.
+
+        Unlike the step trio this is a plain DELETE with no BackendFailure
+        machinery — there is no SLURM job to classify, just a synchronous
+        filesystem op on the orchestrator host. A transport error or 5xx
+        propagates raw to the caller (the CP delete route), which decides
+        whether the Postgres/DuckLake teardown already done makes the failure
+        worth surfacing as a partial-success."""
+        url = URL_REFERENCE_ARTIFACT_BY_IDX.format(reference_idx=reference_idx)
+        resp = await self._http.request("DELETE", url)
+        resp.raise_for_status()
+        return ReferenceArtifactPurgeResponse.model_validate(resp.json())
 
     async def _post(self, url: str, body, *, step_name: str) -> httpx.Response:
         """POST a wire model, converting an *unreachable* orchestrator into a

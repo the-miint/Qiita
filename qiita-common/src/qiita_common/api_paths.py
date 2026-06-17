@@ -113,6 +113,23 @@ URL_STEP_FIND_BY_NAME = f"{URL_STEP_PREFIX}{PATH_STEP_FIND_BY_NAME}"
 
 
 # =============================================================================
+# /reference-artifact/* — orchestrator on-disk reference-artifact cleanup
+# =============================================================================
+# The control-plane DELETE /reference/{idx} flow calls this so the orchestrator
+# (the only side with access to PATH_DERIVED on the compute host) can remove a
+# reference's persistent on-disk index artifacts —
+# `{path_derived}/references/{idx}/{rype,minimap2}/...`. A direct, synchronous
+# filesystem op, not a SLURM step: there is no job to schedule, just a
+# best-effort idempotent rmtree. Shares the CP↔CO bearer with /step/*.
+
+PATH_REFERENCE_ARTIFACT_PREFIX = "/reference-artifact"
+PATH_REFERENCE_ARTIFACT_BY_IDX = "/{reference_idx}"
+
+URL_REFERENCE_ARTIFACT_PREFIX = f"{API_PREFIX}{PATH_REFERENCE_ARTIFACT_PREFIX}"
+URL_REFERENCE_ARTIFACT_BY_IDX = f"{URL_REFERENCE_ARTIFACT_PREFIX}{PATH_REFERENCE_ARTIFACT_BY_IDX}"
+
+
+# =============================================================================
 # /work-ticket/* — control-plane work-ticket lifecycle
 # =============================================================================
 # Submission (POST root) creates a ticket and fires an in-process

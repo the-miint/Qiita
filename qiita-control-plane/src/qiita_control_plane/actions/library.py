@@ -196,6 +196,13 @@ def _do_action_register(data_plane_url: str, token: bytes) -> list:
         return list(client.do_action(action))
 
 
+def _do_action_delete_reference(data_plane_url: str, token: bytes) -> list:
+    """Synchronous gRPC call to data plane — runs in thread executor."""
+    with _flight.FlightClient(data_plane_url) as client:
+        action = _flight.Action("delete_reference", token)
+        return list(client.do_action(action))
+
+
 # =============================================================================
 # Public primitives — exposed through LIBRARY by name
 # =============================================================================
@@ -401,6 +408,34 @@ async def register_files(
         return []
     result_body = json.loads(results[0].body.to_pybytes())
     return result_body.get("registered", [])
+
+
+async def delete_reference_data(
+    *,
+    reference_idx: int,
+    hmac_secret: bytes,
+    data_plane_url: str,
+) -> dict:
+    """Delete a reference's DuckLake rows via the data plane's DoAction.
+
+    Signs a `delete_reference` action token carrying only `reference_idx` and
+    returns the data plane's per-table delete counts. The data plane computes
+    which features are orphaned (owned by no other reference) from its own
+    DuckLake `reference_membership` — shared features keep their sequences.
+
+    Idempotent: a reference whose data never loaded deletes zero rows. Raises
+    pyarrow.flight.FlightError on transport / data-plane failure."""
+    token = sign_action(
+        action="delete_reference",
+        payload={"reference_idx": reference_idx},
+        secret=hmac_secret,
+    )
+    results = await asyncio.get_event_loop().run_in_executor(
+        None, _do_action_delete_reference, data_plane_url, token
+    )
+    if not results:
+        return {}
+    return json.loads(results[0].body.to_pybytes())
 
 
 # =============================================================================
