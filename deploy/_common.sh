@@ -55,6 +55,49 @@ qiita_resolve_user_clone() {
     [ -d "$QIITA_CLONE/.git" ] || { echo "ERROR: $QIITA_CLONE is not a git clone" >&2; exit 1; }
 }
 
+# Resolve the SLURM native-venv checkout from SLURM_NATIVE_PYTHON.
+#
+# Native SLURM jobs run from the venv SLURM_NATIVE_PYTHON points at — a separate
+# checkout on the shared filesystem, NOT /opt/qiita. redeploy.sh (step 5) refreshes
+# that venv after a deploy; this helper turns the configured python path into the
+# `qiita-compute-orchestrator` checkout dir to `uv sync` in, and fails loud rather
+# than ever syncing a wrong path. Pure (echo + return only) so redeploy.sh and the
+# unit test in test_deploy_scripts.py can both call it.
+#
+# $1 = SLURM_NATIVE_PYTHON value. On success: echoes the checkout dir, returns 0.
+# Returns 1 (a SKIP signal — caller degrades like the miint stage) when $1 is empty
+# or the bare "python" (PATH-based local backend — no checkout to derive). Returns 2
+# (a hard FAIL — caller must abort) with a stderr reason when $1 points somewhere
+# that isn't the expected `<repo>/qiita-compute-orchestrator/.venv/bin/python`.
+qiita_native_checkout_from_python() {
+    local native_python="${1:-}"
+    # Empty or PATH-based ("python") → nothing to derive; signal skip, not fail.
+    [ -z "$native_python" ] && return 1
+    [ "$native_python" = "python" ] && return 1
+    # .venv/bin/python → up three dirnames is the qiita-compute-orchestrator dir.
+    local checkout
+    checkout=$(cd "$(dirname "$native_python")/../.." 2>/dev/null && pwd) || {
+        echo "ERROR: cannot resolve native checkout from SLURM_NATIVE_PYTHON='$native_python'" >&2
+        return 2
+    }
+    # Fail loud unless this really is the orchestrator checkout: named
+    # qiita-compute-orchestrator, has a pyproject.toml, and sits under a git clone.
+    if [ "$(basename "$checkout")" != "qiita-compute-orchestrator" ]; then
+        echo "ERROR: derived native dir '$checkout' is not named qiita-compute-orchestrator" >&2
+        echo "       (SLURM_NATIVE_PYTHON should be <checkout>/qiita-compute-orchestrator/.venv/bin/python)" >&2
+        return 2
+    fi
+    if [ ! -f "$checkout/pyproject.toml" ]; then
+        echo "ERROR: derived native dir '$checkout' has no pyproject.toml — not a checkout" >&2
+        return 2
+    fi
+    if [ ! -d "$checkout/../.git" ]; then
+        echo "ERROR: derived native checkout '$checkout' is not inside a git clone (no ../.git)" >&2
+        return 2
+    fi
+    printf '%s' "$checkout"
+}
+
 # Read one KEY from an env file in a clean subshell. `set +eu` so a value that
 # references another (unset) var doesn't abort under errexit/nounset and silently
 # blank this and every later var; `set -a` exports the `KEY=val` lines into the

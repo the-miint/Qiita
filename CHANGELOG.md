@@ -106,6 +106,19 @@ the `no-changelog` label).
 
 ### Changed
 
+- `deploy/redeploy.sh` (`make redeploy`) now **runs** the SLURM native-venv
+  refresh in step 5 instead of only printing a reminder. It derives the
+  `qiita-compute-orchestrator` checkout from `SLURM_NATIVE_PYTHON`, runs `uv sync
+  --reinstall-package qiita-common` there as the checkout owner (`qiita`, never
+  root — a root-owned `.venv` is the #80 footgun), and fails loud if the synced
+  venv can't import `qiita_common` / `qiita_compute_orchestrator.jobs`. It skips
+  cleanly when `SLURM_NATIVE_PYTHON` is unset (local backend) and aborts rather
+  than `uv sync` a wrong path; `SKIP_NATIVE_REFRESH=1` opts out. This closes the
+  recurring footgun where a deploy that changed `qiita-common` /
+  `qiita-compute-orchestrator` left native jobs importing stale code unless the
+  operator remembered to refresh by hand. The derivation lives in a pure
+  `qiita_native_checkout_from_python` helper in `deploy/_common.sh` (unit-tested)
+  (#106)
 - `deploy/redeploy.sh` (`make redeploy`) is now an all-in-one **root-run**
   orchestrator: run it as `sudo make redeploy` from the admin account and it
   `sudo -u`'s into the operator (`qiita`) for pull/migrate and into the service
