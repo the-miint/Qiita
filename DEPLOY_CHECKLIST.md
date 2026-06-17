@@ -23,7 +23,7 @@ _None yet._
 
 ### 3. Migrations
 
-- (#TBD) `make migrate` applies `20260617000000_work_ticket_resource_override` —
+- (#102) `make migrate` applies `20260617000000_work_ticket_resource_override` —
   an additive nullable `resource_override JSONB` column on `qiita.work_ticket`.
   No out-of-band setup; existing rows read as NULL.
 
@@ -37,7 +37,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#TBD) `qiita reference load` and `qiita ticket submit` gain `--mem-gb`, a
+- (#102) `qiita reference load` and `qiita ticket submit` gain `--mem-gb`, a
   per-run memory floor for a workflow's SLURM steps (wet_lab_admin /
   system_admin only, bounded by the action's mem ceiling). Use it to load a
   genome-scale host reference that OOMs the conservative default. No host

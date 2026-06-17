@@ -25,7 +25,7 @@ the `no-changelog` label).
   wet_lab_admin / system_admin (a regular user who can otherwise submit the
   workflow still gets 403); an override above the ceiling is a clean 422.
   Persisted on `qiita.work_ticket` so a control-plane restart re-attaches
-  in-flight work with the same override (#TBD)
+  in-flight work with the same override (#102)
 - `qiita submit-host-filter-pool` — a bundled operator gesture that fans out
   one host-filtered `fastq-to-parquet/1.1.0` work-ticket per sample in a
   completed bcl-convert pool. It pre-checks the `--host-reference-idx` is ACTIVE
