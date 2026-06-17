@@ -154,7 +154,13 @@ elif native_checkout=$(qiita_native_checkout_from_python "$nativepy"); then
     # broken refresh must abort here, not surface as a stale job at the next
     # genome-scale reference-load. (compute-readiness's probe/native-import covers
     # the compute-node side in step 6; this is the cheap head-node check.)
-    sudo -u "$QIITA_USER" "$nativepy" -c 'import qiita_common, qiita_compute_orchestrator.jobs'
+    if ! sudo -u "$QIITA_USER" "$nativepy" -c 'import qiita_common, qiita_compute_orchestrator.jobs'; then
+        echo "ERROR: native venv at $native_checkout cannot import qiita_common /" >&2
+        echo "       qiita_compute_orchestrator.jobs after the refresh. The /opt/qiita" >&2
+        echo "       SERVICE venvs are already deployed and serving (step 4) — only NATIVE" >&2
+        echo "       SLURM jobs are at risk. Fix the checkout and re-run (idempotent)." >&2
+        exit 1
+    fi
     echo "Native venv refreshed and imports verified."
 else
     rc=$?
@@ -166,6 +172,8 @@ else
         echo "(local backend, or refresh manually per redeploy.md §6)."
     else
         echo "Refusing to refresh the native venv from a bad SLURM_NATIVE_PYTHON (see above)." >&2
+        echo "The /opt/qiita SERVICE venvs are already deployed (step 4); only native SLURM" >&2
+        echo "jobs are affected. Fix SLURM_NATIVE_PYTHON in $CO_ENV and re-run." >&2
         exit 1
     fi
 fi

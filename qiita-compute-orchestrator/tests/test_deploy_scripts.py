@@ -27,6 +27,11 @@ _COMMON = _DEPLOY / "_common.sh"
 # The scripts introduced/maintained for the issue-#72 deploy-ease work. Kept
 # explicit (not a glob) so a new deploy script is a deliberate add here.
 _SCRIPTS = ("preflight.sh", "verify.sh", "redeploy.sh")
+# Sourced-only fragments (no shebang-as-entrypoint, not executable). _common.sh
+# carries real logic (qiita_native_checkout_from_python etc.) the executable
+# scripts rely on, so it gets the same bash -n + shellcheck gate — but NOT the
+# executable-bit check below, since it's never run directly.
+_SOURCED = ("_common.sh",)
 
 
 @pytest.mark.parametrize("name", _SCRIPTS)
@@ -36,7 +41,7 @@ def test_deploy_script_exists_and_executable(name: str) -> None:
     assert path.stat().st_mode & 0o111, f"{path} is not executable"
 
 
-@pytest.mark.parametrize("name", _SCRIPTS)
+@pytest.mark.parametrize("name", _SCRIPTS + _SOURCED)
 def test_deploy_script_is_valid_bash(name: str) -> None:
     """`bash -n` parses the script without executing it — catches the unmatched
     quote / stray fi class of bug that broke deploys before."""
@@ -49,7 +54,7 @@ def test_deploy_script_is_valid_bash(name: str) -> None:
     assert result.returncode == 0, f"bash -n failed for {name}:\n{result.stderr}"
 
 
-@pytest.mark.parametrize("name", _SCRIPTS)
+@pytest.mark.parametrize("name", _SCRIPTS + _SOURCED)
 def test_deploy_script_passes_shellcheck(name: str) -> None:
     # Gate on warnings+ (`-S warning`), not the default info/style level, so the
     # check is deterministic across shellcheck versions — info checks like SC2015
