@@ -35,6 +35,40 @@ _None yet._
 
 ### Notes (no host action)
 
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-17 — 11405b6
+
+Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
+_None yet._
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
+
+_None yet._
+
+#### Notes (no host action)
+
 - (#29) New `reference:delete` scope + `DELETE /reference/{idx}` (full reference
   purge). The scope is granted automatically to `system_admin` via the role
   ceiling (computed live at auth time), so existing admin tokens gain it on the
@@ -44,12 +78,6 @@ _None yet._
   the orchestrator (new `DELETE /reference-artifact/{idx}` on the existing CP↔CO
   bearer) to remove DuckLake rows and on-disk `rype`/`minimap2` indexes under
   `PATH_DERIVED`. No env var, host dir, or service-account grant.
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-17 — 8d340f0
 
