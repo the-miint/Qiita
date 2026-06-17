@@ -45,22 +45,26 @@ import duckdb
 from pydantic import BaseModel
 
 from ..config import get_settings
-from ..miint import apply_duckdb_settings, open_miint_conn
+from ..miint import (
+    apply_duckdb_settings,
+    duckdb_headroom_gb,
+    open_miint_conn,
+    resolve_duckdb_memory_gb,
+    slurm_alloc_gb,
+)
 
 YAML_STEP_NAME = "build_rype_index"
 
-# DuckDB only feeds chunks to rype + computes the small DISTINCT mapping, so
-# its own cap is modest; rype gets the bulk of the budget via max_memory.
-# Together (4 + 24) they sit under a 32 GB YAML allocation with ~4 GB headroom
-# for Python / the rype runtime / OS. Literals mirror the host-reference-add
-# YAML's baseline_resources for this step (a mismatch is visible at review).
-#
-# 24 GB is the envelope-fit budget (under mem_gb=32). rype autoscales its work
-# to the `max_memory` ceiling it's given, so this is a budget hint, not a hard
-# minimum a large reference would OOM against. Refined per-genome levels are a
-# deliberate follow-up — when we size against a real host reference, bump
-# `mem_gb` in the YAML and `_RYPE_MAX_MEMORY_GB` together (keep the ~4 GB
-# headroom).
+# Co-consumer step: DuckDB only feeds chunks to rype + computes the small
+# DISTINCT mapping, so its own cap stays modest; rype does the heavy build
+# in-process and gets the bulk of the cgroup via `max_memory`. The two literals
+# are the OFF-SLURM fallbacks (local backend / tests). Under SLURM the split
+# tracks the real cgroup so a `--mem-gb` override (#102) actually grows the
+# index build: DuckDB is held at `_DUCKDB_MEMORY_GB` (it never needs more) while
+# rype is handed (allocation − DuckDB − headroom), floored at the 24 GB
+# fallback. rype autoscales its work to the `max_memory` ceiling it's given, so
+# a larger allocation directly buys a bigger build for a genome-scale host
+# reference instead of OOMing against a fixed 24 GB.
 _DUCKDB_MEMORY_GB = 4
 _DUCKDB_THREADS = 4
 _RYPE_MAX_MEMORY_GB = 24
@@ -158,10 +162,25 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     duckdb_tmp = workspace / ".duckdb_tmp"
     duckdb_tmp.mkdir(parents=True, exist_ok=True)
 
-    with open_miint_conn() as conn:
-        apply_duckdb_settings(
-            conn, duckdb_tmp, memory_gb=_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS
+    # DuckDB share stays bounded (cap at the fallback); rype gets the rest of the
+    # cgroup. Off SLURM both fall back to their literals (4 + 24). The headroom
+    # subtracted from rype's share is the same margin DuckDB reserves under the
+    # cgroup, so the two stay in lockstep from one source.
+    duckdb_memory_gb = resolve_duckdb_memory_gb(
+        _DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS, cap_gb=_DUCKDB_MEMORY_GB
+    )
+    alloc_gb = slurm_alloc_gb()
+    rype_max_memory_gb = (
+        _RYPE_MAX_MEMORY_GB
+        if alloc_gb is None
+        else max(
+            _RYPE_MAX_MEMORY_GB,
+            alloc_gb - duckdb_memory_gb - duckdb_headroom_gb(_DUCKDB_THREADS),
         )
+    )
+
+    with open_miint_conn() as conn:
+        apply_duckdb_settings(conn, duckdb_tmp, memory_gb=duckdb_memory_gb, threads=_DUCKDB_THREADS)
         # Non-temp view/table so rype's separate bind/execute connection can
         # resolve them by name. DuckDB rejects prepared parameters inside
         # CREATE VIEW, so the path is inlined (quote-escaped — it's a
@@ -186,7 +205,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             _MAPPING_TABLE,
             k=inputs.k,
             w=inputs.w,
-            max_memory=_RYPE_MAX_MEMORY_GB * 1024**3,
+            max_memory=rype_max_memory_gb * 1024**3,
         )
     if status != "ok":
         raise RuntimeError(

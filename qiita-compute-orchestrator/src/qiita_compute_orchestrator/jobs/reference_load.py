@@ -54,19 +54,18 @@ from ..miint import (
     PARQUET_OPTS_CHUNKED,
     apply_duckdb_settings,
     open_miint_conn,
+    resolve_duckdb_memory_gb,
 )
 
 YAML_STEP_NAME = "load"
 
-# DuckDB resource caps for this step. The YAML allocation
-# (workflows/reference-add/1.0.0.yaml: mem_gb=32, cpu=8) sizes the
-# SLURM cgroup; DuckDB's own caps sit just below it (`mem_gb - 1`
-# leaves ~1 GB for Python/miint/OS overhead). These literals duplicate
-# the workflow YAML's baseline_resources — a mismatch is visible at
-# review time. A future refactor should thread the YAML values through
-# `Inputs` instead of duplicating. The prior shape (mem_gb=7) left 25 GB
-# of the allocation unused; this step's workload genuinely benefits
-# from the headroom.
+# DuckDB resource caps for this step. `_DUCKDB_MEMORY_GB` is the OFF-SLURM
+# fallback (local backend / tests), sized to the YAML baseline
+# (workflows/reference-add/1.0.0.yaml: mem_gb=32 minus ~1 GB Python/miint/OS
+# headroom). Under SLURM the limit instead tracks the real cgroup via
+# `resolve_duckdb_memory_gb()` (SLURM_MEM_PER_NODE), so a `--mem-gb` override
+# (#102) reaches DuckDB. DuckDB owns the whole box in this step (no in-process
+# co-consumer), so it gets the allocation minus headroom.
 _DUCKDB_MEMORY_GB = 31
 _DUCKDB_THREADS = 8
 
@@ -154,7 +153,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
-                memory_gb=_DUCKDB_MEMORY_GB,
+                memory_gb=resolve_duckdb_memory_gb(_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS),
                 threads=_DUCKDB_THREADS,
             )
 

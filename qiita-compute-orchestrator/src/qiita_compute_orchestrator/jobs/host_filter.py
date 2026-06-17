@@ -65,8 +65,18 @@ YAML_STEP_NAME = "host_filter"
 # DuckDB stages the (streamed) query VIEW, the small host-id accumulators, and
 # the final sorted COPY; the rype / minimap2 runtimes hold the indexes
 # out-of-heap. Literals mirror the fastq-to-parquet/1.1.0 YAML's host_filter
-# baseline_resources (a mismatch is visible at review). Genome-scale host-index
-# sizing is a deferred follow-up — bump the YAML mem_gb and this cap together.
+# baseline_resources (a mismatch is visible at review).
+#
+# NOT converted to the allocation-aware `resolve_duckdb_memory_gb` the
+# reference-add build steps use, and deliberately so: at filter time the
+# genome-scale memory is the loaded rype `.ryxdi` + minimap2 `.mmi`, which the
+# runtimes hold OUT of DuckDB's heap and which already grow into the cgroup
+# remainder a `--mem-gb` raise provides — DuckDB's cap doesn't gate them. Making
+# DuckDB allocation-aware here would be wrong: it would let DuckDB claim the box
+# and STARVE those out-of-heap indexes. The right lever for a genome-scale host
+# filter is the cgroup (YAML mem_gb / `--mem-gb`), which already reaches the
+# indexes with DuckDB held modest. Bump the YAML mem_gb (and this cap, if the
+# DuckDB-side staging itself ever needs it) when sized against a real host filter.
 _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
 

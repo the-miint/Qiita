@@ -239,6 +239,23 @@ the `no-changelog` label).
 
 ### Fixed
 
+- The `--mem-gb` per-run override (#102) now actually reaches the DuckDB-backed
+  reference-load steps, instead of being silently clamped by a hardcoded
+  per-job DuckDB `memory_limit`. Each native job pinned its DuckDB cap to a
+  literal (`stage_local_fasta` 7 GB, `hash_sequences` 24 GB, `load` 31 GB,
+  `build_rype_index` rype 24 GB, `build_minimap2_index` 8 GB) sized to the YAML
+  baseline, so raising the SLURM allocation grew the cgroup but DuckDB still
+  OOM'd at the literal — a genome-scale human host reference died in
+  `stage_local_fasta` at ~6.5 GiB even under `--mem-gb 48`. The jobs now size
+  DuckDB (and rype's `max_memory` / minimap2's reserve) from the real cgroup via
+  `SLURM_MEM_PER_NODE`, falling back to the literal off SLURM (local backend /
+  tests unchanged). This also resolves the latent `hash_sequences` case where
+  its 24 GB literal exceeded its own 8 GB YAML allocation. Scoped to the
+  reference-add workflow: `fastq_to_parquet` (the read-ingest path) is a
+  deliberate follow-up, and `host_filter` is intentionally left as-is — its
+  genome-scale memory is the rype/minimap2 indexes held out of DuckDB's heap,
+  which already grow into the cgroup a `--mem-gb` raise provides, so converting
+  its DuckDB cap would starve them (#TBD)
 - OOM-killed workflow steps are no longer mis-reported as a bare
   `NonZeroExitCode`. A cgroup step-level `oom_kill` surfaces to slurmrestd only
   as a coarse job-level `FAILED`/`exit_code=1`, so the orchestrator's
