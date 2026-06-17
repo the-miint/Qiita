@@ -23,9 +23,7 @@ _None yet._
 
 ### 3. Migrations
 
-- (#102) `make migrate` applies `20260617000000_work_ticket_resource_override` —
-  an additive nullable `resource_override JSONB` column on `qiita.work_ticket`.
-  No out-of-band setup; existing rows read as NULL.
+_None yet._
 
 ### 4. Deploy
 
@@ -37,17 +35,47 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#102) `qiita reference load` and `qiita ticket submit` gain `--mem-gb`, a
-  per-run memory floor for a workflow's SLURM steps (wet_lab_admin /
-  system_admin only, bounded by the action's mem ceiling). Use it to load a
-  genome-scale host reference that OOMs the conservative default. No host
-  action; surfaced so operators know the lever exists.
+_None yet._
 
 ---
 
 ## Deployed history
 
 Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-17 — 8d340f0
+
+Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
+- (#102) `make migrate` applies `20260617000000_work_ticket_resource_override` —
+  an additive nullable `resource_override JSONB` column on `qiita.work_ticket`.
+  No out-of-band setup; existing rows read as NULL.
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
+
+_None yet._
+
+#### Notes (no host action)
+
+- (#102) `qiita reference load` and `qiita ticket submit` gain `--mem-gb`, a
+  per-run memory floor for a workflow's SLURM steps (wet_lab_admin /
+  system_admin only, bounded by the action's mem ceiling). Use it to load a
+  genome-scale host reference that OOMs the conservative default. No host
+  action; surfaced so operators know the lever exists.
 
 ### Deployed 2026-06-16 — c8981aa
 
