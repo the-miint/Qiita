@@ -35,7 +35,15 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- (#29) New `reference:delete` scope + `DELETE /reference/{idx}` (full reference
+  purge). The scope is granted automatically to `system_admin` via the role
+  ceiling (computed live at auth time), so existing admin tokens gain it on the
+  next CP restart — **no token re-mint, no DB or scope migration**. Note the
+  cross-service reach so operators aren't surprised: the delete drives the data
+  plane (new `delete_reference` DoAction over the existing HMAC Flight path) and
+  the orchestrator (new `DELETE /reference-artifact/{idx}` on the existing CP↔CO
+  bearer) to remove DuckLake rows and on-disk `rype`/`minimap2` indexes under
+  `PATH_DERIVED`. No env var, host dir, or service-account grant.
 
 ---
 

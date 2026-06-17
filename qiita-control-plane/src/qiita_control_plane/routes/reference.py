@@ -18,7 +18,9 @@ import json
 from typing import Annotated
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException
+import httpx
+import pyarrow.flight as _flight
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_REFERENCE_BY_IDX,
@@ -33,6 +35,7 @@ from qiita_common.models import (
     DoGetTicketRequest,
     DoGetTicketResponse,
     ReferenceCreateRequest,
+    ReferenceDeleteResponse,
     ReferenceIndex,
     ReferenceKind,
     ReferenceResponse,
@@ -40,10 +43,14 @@ from qiita_common.models import (
     ReferenceStatusUpdate,
 )
 
+from ..actions.library import delete_reference_data
 from ..actions.reference import (
     REFERENCE_RETURNING,
     IllegalStatusTransition,
+    ReferenceDeleteBlocked,
     ReferenceNotFound,
+    assert_reference_deletable,
+    delete_reference_cascade,
     transition_reference_status,
 )
 from ..auth.guards import (
@@ -56,7 +63,13 @@ from ..auth.principal import (
     get_current_principal,
 )
 from ..auth.tickets import sign_ticket
-from ..deps import get_db_pool, get_hmac_secret
+from ..deps import (
+    TxConnFactory,
+    get_data_plane_url,
+    get_db_pool,
+    get_hmac_secret,
+    get_tx_conn_factory,
+)
 
 router = APIRouter(prefix=PATH_REFERENCE_PREFIX, tags=["reference"])
 
@@ -197,6 +210,99 @@ async def update_reference_status(
         raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
     except IllegalStatusTransition as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.delete(PATH_REFERENCE_BY_IDX)
+async def delete_reference(
+    reference_idx: Annotated[int, Field(gt=0)],
+    request: Request,
+    force: bool = False,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    hmac_secret: bytes = Depends(get_hmac_secret),
+    data_plane_url: str = Depends(get_data_plane_url),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCE_DELETE)),
+) -> ReferenceDeleteResponse:
+    """Fully purge a reference — Postgres rows, DuckLake data, and on-disk
+    indexes. system_admin only (`reference:delete`).
+
+    Gating: work tickets in-flight (pending/queued/processing) block the delete
+    unconditionally (409); completed/failed tickets block it unless `force=true`
+    is passed. Shared features (claimed by another reference) are never deleted.
+
+    Ordering is data-plane → orchestrator → Postgres, chosen so the operation
+    is *retriable*: every step is idempotent and the `qiita.reference` row — the
+    thing a retry keys off — is removed last. The data-plane delete is one
+    DuckLake transaction (all-or-nothing), so a failure there leaves DuckLake
+    membership fully intact and a retry recomputes the same orphan set. If the
+    orchestrator or Postgres step fails, the reference row survives and
+    re-issuing the DELETE re-runs every idempotent step. The one residual
+    degraded state is a Postgres teardown that fails *after* the data is gone:
+    the reference is then empty-but-listed until a retry completes the teardown
+    (Postgres membership is still intact, so its orphan GC stays correct).
+    Reclaiming DuckLake/disk bytes in that window is not yet automated — see
+    issue #29 follow-up.
+    """
+    try:
+        await assert_reference_deletable(pool, reference_idx, force=force)
+    except ReferenceNotFound:
+        raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+    except ReferenceDeleteBlocked as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    # DuckLake data (idempotent, atomic delete-by-reference_idx in the data plane).
+    try:
+        await delete_reference_data(
+            reference_idx=reference_idx,
+            hmac_secret=hmac_secret,
+            data_plane_url=data_plane_url,
+        )
+    except _flight.FlightError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"data plane reference delete failed; nothing removed yet: {exc}",
+        ) from exc
+
+    # On-disk index artifacts (orchestrator-side; only it can reach
+    # PATH_DERIVED). Skipped when no orchestrator is configured (CP-only/dev),
+    # in which case there are no compute-built indexes to remove anyway. An
+    # orchestrator transport/5xx error here surfaces as a 502 (not an unhandled
+    # 500): DuckLake data is already gone, but the reference row still exists,
+    # so the operator can re-run the idempotent DELETE to finish cleanup.
+    artifacts_removed = False
+    client = getattr(request.app.state, "compute_backend_client", None)
+    if client is not None:
+        try:
+            purge = await client.purge_reference_artifacts(reference_idx)
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "orchestrator on-disk artifact cleanup failed after DuckLake"
+                    f" data was removed; re-run the delete to finish: {exc}"
+                ),
+            ) from exc
+        artifacts_removed = purge.removed
+
+    # Re-gate inside the teardown transaction to close the precheck→cascade
+    # window: a work ticket that went in-flight since the precheck must abort
+    # the teardown (and 409 loudly) rather than be silently deleted by the
+    # cascade. force=True here means only a *new in-flight* ticket aborts —
+    # terminal tickets are still the cascade's to delete.
+    async with tx() as conn:
+        try:
+            await assert_reference_deletable(conn, reference_idx, force=True)
+        except ReferenceNotFound:
+            raise HTTPException(status_code=404, detail=_MSG_REFERENCE_NOT_FOUND)
+        except ReferenceDeleteBlocked as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        counts = await delete_reference_cascade(conn, reference_idx)
+
+    return ReferenceDeleteResponse(
+        reference_idx=reference_idx,
+        artifacts_removed=artifacts_removed,
+        **counts,
+    )
 
 
 # Tables that can appear in a DoGet ticket. Must match the data plane's

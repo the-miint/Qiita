@@ -254,6 +254,35 @@ class ReferenceIndex(BaseModel):
     created_at: AwareDatetime
 
 
+class ReferenceArtifactPurgeResponse(BaseModel):
+    """Result of the orchestrator's on-disk reference-artifact cleanup.
+
+    `removed` is True when a `{path_derived}/references/{idx}` directory was
+    found and deleted, False when nothing was there (idempotent no-op). `path`
+    echoes the directory the orchestrator targeted so the control plane can log
+    exactly what was removed."""
+
+    reference_idx: Annotated[int, Field(gt=0)]
+    path: str
+    removed: bool
+
+
+class ReferenceDeleteResponse(BaseModel):
+    """Summary of a full reference purge across Postgres, DuckLake, and disk.
+
+    Counts are the Postgres rows removed by the cascade; `orphan_feature_count`
+    is the subset of this reference's features that no other reference still
+    claimed (and so were deleted from `qiita.feature` and the DuckLake
+    sequence tables). `artifacts_removed` reflects the orchestrator cleanup."""
+
+    reference_idx: Annotated[int, Field(gt=0)]
+    membership_deleted: int
+    index_deleted: int
+    work_ticket_deleted: int
+    orphan_feature_count: int
+    artifacts_removed: bool
+
+
 # `genome_source` / `genome_source_id` and the `genome_fields_consistent`
 # validator predate the Parquet refactor (commit 3cac813); under the
 # path-based contract genome metadata flows through `genome_map.parquet`

@@ -10,6 +10,7 @@ from .backends.local import LocalBackend
 from .backends.slurm import SlurmBackend
 from .config import BACKEND_LOCAL, BACKEND_SLURM, Settings, install_settings
 from .jobs import scan_native_jobs
+from .reference_artifact import router as reference_artifact_router
 from .slurm import SlurmrestdClient
 from .step import router as step_router
 
@@ -87,6 +88,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="qiita-compute-orchestrator", lifespan=lifespan)
 app.include_router(step_router, prefix=API_PREFIX)
+app.include_router(reference_artifact_router, prefix=API_PREFIX)
 
 
 @app.get("/health")

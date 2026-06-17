@@ -15,6 +15,19 @@ the `no-changelog` label).
 
 ### Added
 
+- Delete a reference database from the system. New
+  `DELETE /reference/{idx}` fully purges a reference — Postgres rows
+  (`reference`, `reference_membership`, `reference_index`, plus orphaned
+  `feature`/`feature_genome`/`genome` no surviving reference claims), DuckLake
+  data (taxonomy/phylogeny/placements by `reference_idx`; sequences/chunks only
+  for orphan features, computed in the data plane via a new `delete_reference`
+  DoAction), and on-disk indexes (`rype`/`minimap2` under `PATH_DERIVED`, removed
+  by a new orchestrator `DELETE /reference-artifact/{idx}` endpoint). system_admin
+  only, gated by a new `reference:delete` scope. Work tickets that reference it
+  block the delete: in-flight (pending/queued/processing) unconditionally,
+  completed/failed unless `?force=true`. Shared features (claimed by another
+  reference) are never deleted. Lets operators remove test references accumulated
+  by repeated re-loads (#29)
 - Work-ticket step logs are now retrievable without sudo. New
   `GET /work-ticket/{idx}/step/{step_index}/logs` returns a bounded
   stdout/stderr tail (defaulting to the latest attempt; `attempt` and

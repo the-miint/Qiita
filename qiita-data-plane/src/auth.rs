@@ -175,6 +175,33 @@ pub fn verify_action(ticket: &[u8], secret: &[u8]) -> Result<ActionPayload, Auth
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
+/// Parsed payload for the `delete_reference` DoAction.
+///
+/// Wire shape pinned by `qiita_control_plane.actions.library.delete_reference_data`:
+/// `{"action": "delete_reference", "reference_idx": N}`. `deny_unknown_fields`
+/// keeps the contract tight — the data plane needs only the identifier and
+/// computes which features to drop from its own DuckLake `reference_membership`
+/// table, so any extra field on the ticket is a design slip surfaced loudly here.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteReferencePayload {
+    /// Action discriminator; the gRPC handler also rejects a payload whose
+    /// `action` is not "delete_reference".
+    pub action: String,
+    /// `i64`, matching the Postgres `reference.reference_idx BIGINT` source of
+    /// truth and the `BIGINT` reference_idx columns in the DuckLake tables.
+    pub reference_idx: i64,
+}
+
+/// Verify a `delete_reference` DoAction token and return its parsed payload.
+pub fn verify_delete_reference(
+    ticket: &[u8],
+    secret: &[u8],
+) -> Result<DeleteReferencePayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
 /// Parsed DoPut ticket payload.
 ///
 /// Wire shape pinned by `qiita_control_plane.auth.tickets.sign_doput`:
