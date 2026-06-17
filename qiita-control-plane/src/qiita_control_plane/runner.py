@@ -238,6 +238,11 @@ async def run_workflow(
           ``enabled=true``.
     """
     work_ticket = await _fetch_work_ticket(pool, work_ticket_idx)
+    # Optional per-run resource bump (gated to wet_lab_admin+ and validated
+    # <= the action ceiling at submission). Read once here and threaded to
+    # every step's dispatch so a CP restart re-attaches with the same override.
+    _override = work_ticket.get("resource_override")
+    mem_gb_override = _override.get("mem_gb") if isinstance(_override, dict) else None
     if not resume and work_ticket["state"] != WorkTicketState.PENDING.value:
         raise RuntimeError(
             f"work_ticket {work_ticket_idx} is in state {work_ticket['state']!r}, "
@@ -353,6 +358,7 @@ async def run_workflow(
                 index=index,
                 entry=entry,
                 action_ceiling=action.action_ceiling,
+                mem_gb_override=mem_gb_override,
                 bound=bound,
                 workspace=workspace,
                 scope_target=scope_target,
@@ -480,6 +486,7 @@ async def _run_entry_with_retry(
     index: int,
     entry: WorkflowStep | WorkflowAction,
     action_ceiling: ActionCeiling,
+    mem_gb_override: int | None = None,
     bound: dict[str, Any],
     workspace: Path,
     scope_target: dict[str, Any],
@@ -541,6 +548,7 @@ async def _run_entry_with_retry(
                     step_index=index,
                     attempt=attempt,
                     action_ceiling=action_ceiling,
+                    mem_gb_override=mem_gb_override,
                     poll_interval_seconds=poll_interval_seconds,
                     resume=resume,
                 )
@@ -604,7 +612,8 @@ _WORK_TICKET_COLS = (
     "wt.work_ticket_idx, wt.action_id, wt.action_version, wt.originator_principal_idx, "
     "wt.scope_target_kind, wt.study_idx, wt.prep_idx, wt.reference_idx, "
     "wt.prep_sample_idx, wt.sequenced_pool_idx, sp.sequencing_run_idx, "
-    "wt.action_context, wt.state, wt.retry_count, wt.max_retries"
+    "wt.action_context, wt.state, wt.retry_count, wt.max_retries, "
+    "wt.resource_override"
 )
 _WORK_TICKET_FROM = (
     " FROM qiita.work_ticket wt LEFT JOIN qiita.sequenced_pool sp ON sp.idx = wt.sequenced_pool_idx"
@@ -630,6 +639,10 @@ async def _fetch_work_ticket(pool: asyncpg.Pool, work_ticket_idx: int) -> dict[s
     # default; parse it eagerly so the runner can index into it.
     if out.get("action_context") is not None and isinstance(out["action_context"], str):
         out["action_context"] = json.loads(out["action_context"])
+    # resource_override is JSONB (nullable) — decode the same way so the runner
+    # can read its mem_gb. NULL stays None (no override).
+    if out.get("resource_override") is not None and isinstance(out["resource_override"], str):
+        out["resource_override"] = json.loads(out["resource_override"])
     return out
 
 
@@ -1180,9 +1193,17 @@ def _resolve_baseline_for_step(
     entry: WorkflowStep,
     bound: dict[str, Any],
     action_ceiling: ActionCeiling,
+    mem_gb_override: int | None = None,
 ) -> FlatBaselineResources:
     """Resolve a step's ``baseline_resources`` to a concrete
     ``FlatBaselineResources`` and clamp against ``action_ceiling``.
+
+    ``mem_gb_override`` (the ticket's optional per-run resource bump) raises the
+    resolved memory *floor*: ``mem_gb = max(resolved.mem_gb, mem_gb_override)``.
+    It only ever increases memory — a smaller override leaves a step the YAML
+    sized higher untouched. The bump is applied before the ceiling assertion
+    below, so an override above ``action_ceiling.mem_gb`` is rejected here too
+    (defense in depth; the submission route already 422s it).
 
     Two paths, picked by which population the YAML declared:
 
@@ -1251,6 +1272,11 @@ def _resolve_baseline_for_step(
         resolved = FlatBaselineResources(
             cpu=br.cpu, mem_gb=br.mem_gb, walltime=br.walltime, gpu=br.gpu
         )
+
+    # Per-run memory floor (raise-only): never lowers a step the YAML sized
+    # higher than the override.
+    if mem_gb_override is not None and mem_gb_override > resolved.mem_gb:
+        resolved = resolved.model_copy(update={"mem_gb": mem_gb_override})
 
     _assert_within_ceiling(entry=entry, resolved=resolved, action_ceiling=action_ceiling)
     return resolved
@@ -1323,6 +1349,7 @@ async def _dispatch_step(
     step_index: int,
     attempt: int,
     action_ceiling: ActionCeiling,
+    mem_gb_override: int | None = None,
     poll_interval_seconds: float,
     resume: bool = False,
 ) -> dict[str, Any]:
@@ -1352,6 +1379,7 @@ async def _dispatch_step(
         entry=entry,
         bound=bound,
         action_ceiling=action_ceiling,
+        mem_gb_override=mem_gb_override,
     )
     baseline = StepBaselineResources(
         cpu=resolved.cpu,

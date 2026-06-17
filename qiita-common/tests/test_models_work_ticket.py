@@ -26,6 +26,30 @@ def test_work_ticket_state_enum():
     assert WorkTicketState.FAILED == "failed"
 
 
+def test_resource_override_mem_gb_must_be_positive():
+    """mem_gb is gt=0; None (the default) is the no-override case."""
+    from qiita_common.models import ResourceOverride
+
+    assert ResourceOverride().mem_gb is None
+    assert ResourceOverride(mem_gb=48).mem_gb == 48
+    with pytest.raises(ValidationError):
+        ResourceOverride(mem_gb=0)
+
+
+def test_work_ticket_create_request_optional_resource_override():
+    """resource_override defaults to None and round-trips a coerced dict."""
+    from qiita_common.models import ResourceOverride, WorkTicketCreateRequest
+
+    base = {
+        "action_id": "a",
+        "action_version": "1.0.0",
+        "scope_target": {"kind": "reference", "reference_idx": 1},
+    }
+    assert WorkTicketCreateRequest(**base).resource_override is None
+    with_override = WorkTicketCreateRequest(**base, resource_override={"mem_gb": 48})
+    assert with_override.resource_override == ResourceOverride(mem_gb=48)
+
+
 def test_scope_target_dispatches_on_kind():
     """The discriminated union must select StudyPrepScopeTarget for kind='study_prep',
     ReferenceScopeTarget for kind='reference', PrepSampleScopeTarget for

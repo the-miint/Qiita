@@ -477,6 +477,7 @@ async def do_reference_load(
     watch: bool = True,
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
     timeout_seconds: float = DEFAULT_POLL_TIMEOUT_SECONDS,
+    mem_gb: int | None = None,
 ) -> dict[str, Any]:
     """Programmatic entry point. Returns a dict with `reference_idx`,
     `work_ticket_idx`, `upload_idxs`, and (when watch=True) the final
@@ -667,12 +668,17 @@ async def do_reference_load(
         action_id = _LOCAL_HOST_REFERENCE_ADD_ACTION_ID if host else _LOCAL_REFERENCE_ADD_ACTION_ID
     else:
         action_id = _HOST_REFERENCE_ADD_ACTION_ID if host else _REFERENCE_ADD_ACTION_ID
-    submit_body = {
+    submit_body: dict[str, Any] = {
         "action_id": action_id,
         "action_version": _REFERENCE_ADD_ACTION_VERSION,
         "scope_target": {"kind": "reference", "reference_idx": reference_idx},
         "action_context": action_context,
     }
+    # Optional per-run memory floor for the index-build steps (a human genome
+    # OOMs the conservative YAML default). Server-gated to wet_lab_admin+ and
+    # bounded by the action ceiling.
+    if mem_gb is not None:
+        submit_body["resource_override"] = {"mem_gb": mem_gb}
     submit = await _post(
         http,
         token,

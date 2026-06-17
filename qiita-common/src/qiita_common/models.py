@@ -1561,16 +1561,35 @@ class WorkTicket(BaseModel):
     updated_at: AwareDatetime
 
 
+class ResourceOverride(BaseModel):
+    """Per-run resource override for a work ticket's SLURM steps.
+
+    A privileged caller (wet_lab_admin / system_admin) raises the per-step
+    memory *floor* for one run — e.g. staging a human genome that OOMs the
+    workflow's conservative default — without editing the workflow YAML. The
+    runner applies `max(step baseline_resources.mem_gb, mem_gb)` at dispatch,
+    still clamped to the action's mem ceiling (an override above the ceiling is
+    rejected at submission). `mem_gb=None` (the default) leaves every step's
+    YAML baseline untouched. Carried on `qiita.work_ticket` so a control-plane
+    restart re-attaches in-flight work with the same override."""
+
+    mem_gb: Annotated[int | None, Field(default=None, gt=0)] = None
+
+
 class WorkTicketCreateRequest(BaseModel):
     """Body for `POST /api/v1/work-ticket`.
 
     `originator_principal_idx` is set server-side from the authenticated
-    caller — clients cannot submit on behalf of another principal."""
+    caller — clients cannot submit on behalf of another principal.
+
+    `resource_override` is an optional per-run resource bump, gated server-side
+    to wet_lab_admin / system_admin and bounded by the action's ceiling."""
 
     action_id: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     action_version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
     scope_target: ScopeTarget
     action_context: dict[str, Any] = Field(default_factory=dict)
+    resource_override: ResourceOverride | None = None
 
 
 class WorkTicketResponse(BaseModel):

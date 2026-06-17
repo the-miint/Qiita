@@ -15,6 +15,17 @@ the `no-changelog` label).
 
 ### Added
 
+- Per-run memory override for workflow steps. `qiita reference load` and `qiita
+  ticket submit` gain `--mem-gb N`, carried as an optional `resource_override`
+  on `POST /work-ticket`: at dispatch the runner raises each SLURM step's memory
+  floor to `max(step baseline, N)` (raise-only — never lowers a step the YAML
+  sized higher), still clamped to the action's mem ceiling. Lets an operator
+  load a genome-scale host reference (e.g. a human genome that OOMs the
+  conservative 8 GB default) without editing the workflow YAML. Gated to
+  wet_lab_admin / system_admin (a regular user who can otherwise submit the
+  workflow still gets 403); an override above the ceiling is a clean 422.
+  Persisted on `qiita.work_ticket` so a control-plane restart re-attaches
+  in-flight work with the same override (#TBD)
 - `qiita submit-host-filter-pool` — a bundled operator gesture that fans out
   one host-filtered `fastq-to-parquet/1.1.0` work-ticket per sample in a
   completed bcl-convert pool. It pre-checks the `--host-reference-idx` is ACTIVE
