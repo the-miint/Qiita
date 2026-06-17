@@ -198,6 +198,33 @@ def _get_work_ticket(base_url: str, token: str, work_ticket_idx: int) -> dict:
     return _common.call("GET", base_url, token, f"{PATH_WORK_TICKET_PREFIX}/{work_ticket_idx}")
 
 
+def _get_work_ticket_step_logs(
+    base_url: str,
+    token: str,
+    work_ticket_idx: int,
+    *,
+    step_index: int,
+    attempt: int | None,
+    tail_lines: int | None,
+) -> dict:
+    """GET /api/v1/work-ticket/{idx}/step/{step_index}/logs. Returns the step
+    attempt's stdout/stderr tail (and per-stream truncation flags). Query
+    params are sent only when set so the server's defaults (latest attempt,
+    200 lines) apply otherwise. Auth: originator or wet_lab_admin+."""
+    params: dict[str, str] = {}
+    if attempt is not None:
+        params["attempt"] = str(attempt)
+    if tail_lines is not None:
+        params["tail_lines"] = str(tail_lines)
+    return _common.call(
+        "GET",
+        base_url,
+        token,
+        f"{PATH_WORK_TICKET_PREFIX}/{work_ticket_idx}/step/{step_index}/logs",
+        params=params,
+    )
+
+
 def _list_work_tickets(
     base_url: str,
     token: str,
@@ -682,6 +709,34 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_ticket_list.set_defaults(handler=_handle_ticket_list)
 
+    p_ticket_logs = p_ticket_sub.add_parser(
+        "logs",
+        help="Read a step attempt's stdout/stderr tail "
+        "(GET /work-ticket/{idx}/step/{step_index}/logs)",
+    )
+    p_ticket_logs.add_argument(
+        "work_ticket_idx",
+        type=int,
+        help="Work-ticket idx returned by `qiita ticket submit`.",
+    )
+    p_ticket_logs.add_argument(
+        "--step-index",
+        type=int,
+        required=True,
+        help="0-based index of the step in the action's steps: list.",
+    )
+    p_ticket_logs.add_argument(
+        "--attempt",
+        type=int,
+        help="Step attempt to read (default: the latest recorded attempt).",
+    )
+    p_ticket_logs.add_argument(
+        "--tail-lines",
+        type=int,
+        help="Max lines of each stream to return (server default 200, max 5000).",
+    )
+    p_ticket_logs.set_defaults(handler=_handle_ticket_logs)
+
     p_reference = sub.add_parser("reference", help="Reference-data lifecycle operations")
     p_reference_sub = p_reference.add_subparsers(dest="reference_cmd", required=True)
     p_reference_load = p_reference_sub.add_parser(
@@ -1119,6 +1174,40 @@ def _handle_ticket_list(args: argparse.Namespace, parser: argparse.ArgumentParse
             all_tickets=args.all_tickets,
             limit=args.limit,
         )
+    )
+
+
+def _render_ticket_logs(body: dict) -> None:
+    """Print a step's logs for human reading: a one-line header, then each
+    stream raw (so embedded newlines render as newlines, not the JSON-escaped
+    `\\n` literals a plain dump would show — the whole point of a logs verb)."""
+    print(
+        f"# work_ticket {body['work_ticket_idx']} step {body['step_index']}"
+        f" attempt {body['attempt']} ({body['step_name']})"
+    )
+    for stream in ("stdout", "stderr"):
+        suffix = " (truncated)" if body.get(f"{stream}_truncated") else ""
+        print(f"\n===== {stream}{suffix} =====")
+        text = body.get(stream, "")
+        if text:
+            print(text)
+
+
+def _handle_ticket_logs(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """GET a step attempt's stdout/stderr tail so an operator can diagnose a
+    failure (OOM, bad input, contract violation) without a host shell. Renders
+    each stream raw (not JSON-escaped); defaults to the latest recorded attempt
+    when --attempt is omitted."""
+    return _common.run_http_subcommand(
+        lambda t: _get_work_ticket_step_logs(
+            args.base_url,
+            t,
+            args.work_ticket_idx,
+            step_index=args.step_index,
+            attempt=args.attempt,
+            tail_lines=args.tail_lines,
+        ),
+        render=_render_ticket_logs,
     )
 
 

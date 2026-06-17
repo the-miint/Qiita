@@ -9,6 +9,7 @@ without actually executing a workflow.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import uuid
 
@@ -19,6 +20,7 @@ from qiita_common.api_paths import (
     URL_WORK_TICKET_LIST,
     URL_WORK_TICKET_PREFIX,
     URL_WORK_TICKET_RUN,
+    URL_WORK_TICKET_STEP_LOGS,
 )
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
@@ -2405,3 +2407,316 @@ async def test_list_work_ticket_limit_out_of_range_422(wt_client, admin_token):
             headers={"Authorization": f"Bearer {admin_tok}"},
         )
         assert resp.status_code == 422, (bad, resp.text)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/v1/work-ticket/{idx}/step/{step_index}/logs
+# ---------------------------------------------------------------------------
+
+_LOGS_STEP_NAME = "stage_local_fasta"
+
+
+async def _seed_ticket_with_step_logs(
+    wt_client,
+    postgres_pool,
+    token,
+    action,
+    reference_idx,
+    tmp_path,
+    *,
+    attempts=(0,),
+    stderr_by_attempt=None,
+    stdout_by_attempt=None,
+):
+    """Create a real ticket (as `token`'s principal), seed one or more
+    `work_ticket_step` rows for step 0, write their on-disk log files under
+    `tmp_path`, and point the CP's `path_scratch_ticket` at `tmp_path`. Returns
+    the ticket idx. The work_ticket_step rows cascade-delete with the ticket in
+    the wt_client teardown."""
+    action_id, version = action
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json=_body(action_id, version, reference_idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    idx = resp.json()["work_ticket_idx"]
+    wt_client._created_tickets.append(idx)
+
+    for attempt in attempts:
+        # state='failed' requires the (failure_kind, failure_reason) pair per
+        # the work_ticket_step_failure_consistent CHECK.
+        await postgres_pool.execute(
+            "INSERT INTO qiita.work_ticket_step"
+            " (work_ticket_idx, step_index, attempt, step_name, compute_target, state,"
+            "  failure_kind, failure_reason)"
+            " VALUES ($1, 0, $2, $3, 'slurm', 'failed', 'oom_killed', 'seeded for logs test')",
+            idx,
+            attempt,
+            _LOGS_STEP_NAME,
+        )
+        logs_dir = tmp_path / str(idx) / _LOGS_STEP_NAME / f"attempt-{attempt}" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        if stderr_by_attempt and attempt in stderr_by_attempt:
+            (logs_dir / "stderr").write_text(stderr_by_attempt[attempt])
+        if stdout_by_attempt and attempt in stdout_by_attempt:
+            (logs_dir / "stdout").write_text(stdout_by_attempt[attempt])
+
+    from qiita_control_plane.main import app
+
+    app.state.settings = dataclasses.replace(app.state.settings, path_scratch_ticket=tmp_path)
+    return idx
+
+
+async def test_get_step_logs_originator_reads_stderr_tail(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx, tmp_path
+):
+    """The originator gets a step attempt's stdout/stderr tail off shared
+    scratch — the no-sudo diagnosis path (#104)."""
+    token, _ = admin_token
+    idx = await _seed_ticket_with_step_logs(
+        wt_client,
+        postgres_pool,
+        token,
+        reference_action,
+        reference_idx,
+        tmp_path,
+        stderr_by_attempt={0: "loading reference...\noom_kill event\n"},
+        stdout_by_attempt={0: "starting\n"},
+    )
+    resp = await wt_client.get(
+        URL_WORK_TICKET_STEP_LOGS.format(work_ticket_idx=idx, step_index=0),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["work_ticket_idx"] == idx
+    assert body["step_index"] == 0
+    assert body["attempt"] == 0
+    assert body["step_name"] == _LOGS_STEP_NAME
+    assert "oom_kill event" in body["stderr"]
+    assert "starting" in body["stdout"]
+    assert body["stderr_truncated"] is False
+
+
+async def test_get_step_logs_defaults_to_latest_attempt(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx, tmp_path
+):
+    """With no `attempt` query param the route returns the highest recorded
+    attempt; an explicit `attempt` pins an earlier one."""
+    token, _ = admin_token
+    idx = await _seed_ticket_with_step_logs(
+        wt_client,
+        postgres_pool,
+        token,
+        reference_action,
+        reference_idx,
+        tmp_path,
+        attempts=(0, 1),
+        stderr_by_attempt={0: "first attempt\n", 1: "second attempt\n"},
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    latest = await wt_client.get(
+        URL_WORK_TICKET_STEP_LOGS.format(work_ticket_idx=idx, step_index=0), headers=headers
+    )
+    assert latest.status_code == 200, latest.text
+    assert latest.json()["attempt"] == 1
+    assert "second attempt" in latest.json()["stderr"]
+
+    pinned = await wt_client.get(
+        URL_WORK_TICKET_STEP_LOGS.format(work_ticket_idx=idx, step_index=0),
+        params={"attempt": 0},
+        headers=headers,
+    )
+    assert pinned.status_code == 200, pinned.text
+    assert pinned.json()["attempt"] == 0
+    assert "first attempt" in pinned.json()["stderr"]
+
+
+async def test_get_step_logs_tail_lines_bounds_and_flags_truncation(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx, tmp_path
+):
+    """`tail_lines` bounds each stream from the end and sets the truncation
+    flag when older lines were dropped."""
+    token, _ = admin_token
+    body_text = "\n".join(f"line{i}" for i in range(50)) + "\n"
+    idx = await _seed_ticket_with_step_logs(
+        wt_client,
+        postgres_pool,
+        token,
+        reference_action,
+        reference_idx,
+        tmp_path,
+        stderr_by_attempt={0: body_text},
+    )
+    resp = await wt_client.get(
+        URL_WORK_TICKET_STEP_LOGS.format(work_ticket_idx=idx, step_index=0),
+        params={"tail_lines": 3},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["stderr"].splitlines() == ["line47", "line48", "line49"]
+    assert body["stderr_truncated"] is True
+
+
+async def test_get_step_logs_tail_lines_out_of_range_422(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx, tmp_path
+):
+    """`tail_lines` is bounded (ge=1, le=max); both ends 422, pinned to the
+    configured boundary so a change to the bound is caught here."""
+    from qiita_control_plane.routes.work_ticket import _STEP_LOGS_MAX_TAIL_LINES
+
+    token, _ = admin_token
+    idx = await _seed_ticket_with_step_logs(
+        wt_client, postgres_pool, token, reference_action, reference_idx, tmp_path
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+    for bad in ("0", str(_STEP_LOGS_MAX_TAIL_LINES + 1)):
+        resp = await wt_client.get(
+            URL_WORK_TICKET_STEP_LOGS.format(work_ticket_idx=idx, step_index=0),
+            params={"tail_lines": bad},
+            headers=headers,
+        )
+        assert resp.status_code == 422, (bad, resp.text)
+
+
+async def test_get_step_logs_step_name_with_separator_500(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx, tmp_path
+):
+    """A step_name carrying a path separator (would escape the ticket root) is a
+    contract violation — the route fails loud with 500, never reads the file."""
+    token, _ = admin_token
+    action_id, version = reference_action
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json=_body(action_id, version, reference_idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    idx = resp.json()["work_ticket_idx"]
+    wt_client._created_tickets.append(idx)
+    await postgres_pool.execute(
+        "INSERT INTO qiita.work_ticket_step"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target, state,"
+        "  failure_kind, failure_reason)"
+        " VALUES ($1, 0, 0, $2, 'slurm', 'failed', 'oom_killed', 'seeded')",
+        idx,
+        "evil/../etc",
+    )
+    from qiita_control_plane.main import app
+
+    app.state.settings = dataclasses.replace(app.state.settings, path_scratch_ticket=tmp_path)
+    got = await wt_client.get(
+        URL_WORK_TICKET_STEP_LOGS.format(work_ticket_idx=idx, step_index=0),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert got.status_code == 500, got.text
+
+
+async def test_get_step_logs_missing_log_file_is_empty_not_error(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx, tmp_path
+):
+    """A step that never wrote a stream comes back as an empty string, 200 —
+    not a 404 / 500."""
+    token, _ = admin_token
+    idx = await _seed_ticket_with_step_logs(
+        wt_client,
+        postgres_pool,
+        token,
+        reference_action,
+        reference_idx,
+        tmp_path,
+        stderr_by_attempt={0: "only stderr here\n"},
+        # no stdout file written
+    )
+    resp = await wt_client.get(
+        URL_WORK_TICKET_STEP_LOGS.format(work_ticket_idx=idx, step_index=0),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["stdout"] == ""
+    assert resp.json()["stderr"] == "only stderr here"
+
+
+async def test_get_step_logs_unknown_step_or_attempt_404(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx, tmp_path
+):
+    """An out-of-range step index and an unknown attempt both 404 (the same
+    response a genuinely missing ticket returns)."""
+    token, _ = admin_token
+    idx = await _seed_ticket_with_step_logs(
+        wt_client, postgres_pool, token, reference_action, reference_idx, tmp_path
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+
+    bad_step = await wt_client.get(
+        URL_WORK_TICKET_STEP_LOGS.format(work_ticket_idx=idx, step_index=9), headers=headers
+    )
+    assert bad_step.status_code == 404, bad_step.text
+
+    bad_attempt = await wt_client.get(
+        URL_WORK_TICKET_STEP_LOGS.format(work_ticket_idx=idx, step_index=0),
+        params={"attempt": 99},
+        headers=headers,
+    )
+    assert bad_attempt.status_code == 404, bad_attempt.text
+
+
+async def test_get_step_logs_missing_ticket_404(wt_client, admin_token):
+    """An unknown ticket idx → 404."""
+    token, _ = admin_token
+    resp = await wt_client.get(
+        URL_WORK_TICKET_STEP_LOGS.format(work_ticket_idx=99_999_999, step_index=0),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 404, resp.text
+
+
+async def test_get_step_logs_anonymous_401(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx, tmp_path
+):
+    """No credentials → 401, before any ownership disclosure."""
+    token, _ = admin_token
+    idx = await _seed_ticket_with_step_logs(
+        wt_client, postgres_pool, token, reference_action, reference_idx, tmp_path
+    )
+    resp = await wt_client.get(URL_WORK_TICKET_STEP_LOGS.format(work_ticket_idx=idx, step_index=0))
+    assert resp.status_code == 401, resp.text
+
+
+async def test_get_step_logs_non_owner_404(
+    wt_client, postgres_pool, admin_token, regular_token, reference_action, reference_idx, tmp_path
+):
+    """A non-originator without the bypass role gets 404, not 403 — the same
+    enumeration-safe response GET /work-ticket/{idx} returns."""
+    owner_tok, _ = admin_token
+    other_tok, _ = regular_token
+    idx = await _seed_ticket_with_step_logs(
+        wt_client, postgres_pool, owner_tok, reference_action, reference_idx, tmp_path
+    )
+    resp = await wt_client.get(
+        URL_WORK_TICKET_STEP_LOGS.format(work_ticket_idx=idx, step_index=0),
+        headers={"Authorization": f"Bearer {other_tok}"},
+    )
+    assert resp.status_code == 404, resp.text
+
+
+async def test_get_step_logs_unconfigured_scratch_500(
+    wt_client, postgres_pool, admin_token, reference_action, reference_idx, tmp_path
+):
+    """A CP with no `path_scratch_ticket` configured is a misconfigured deploy,
+    not a client error — fail loud with 500."""
+    token, _ = admin_token
+    idx = await _seed_ticket_with_step_logs(
+        wt_client, postgres_pool, token, reference_action, reference_idx, tmp_path
+    )
+    from qiita_control_plane.main import app
+
+    app.state.settings = dataclasses.replace(app.state.settings, path_scratch_ticket=None)
+    resp = await wt_client.get(
+        URL_WORK_TICKET_STEP_LOGS.format(work_ticket_idx=idx, step_index=0),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 500, resp.text

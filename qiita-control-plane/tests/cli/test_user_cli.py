@@ -27,6 +27,7 @@ from qiita_common.api_paths import (
     URL_WORK_TICKET_BY_IDX,
     URL_WORK_TICKET_LIST,
     URL_WORK_TICKET_PREFIX,
+    URL_WORK_TICKET_STEP_LOGS,
 )
 from qiita_common.auth_constants import BEARER_PREFIX
 
@@ -1585,6 +1586,105 @@ def test_ticket_status_requires_idx(capsys):
     assert exc_info.value.code == 2
     err = capsys.readouterr().err
     assert "work_ticket_idx" in err
+
+
+# ---------------------------------------------------------------------------
+# ticket logs
+# ---------------------------------------------------------------------------
+
+
+_TICKET_LOGS_RESPONSE = {
+    "work_ticket_idx": 12,
+    "step_index": 0,
+    "attempt": 1,
+    "step_name": "stage_local_fasta",
+    "stdout": "starting\n",
+    "stderr": "oom_kill event\n",
+    "stdout_truncated": False,
+    "stderr_truncated": False,
+}
+
+
+def test_ticket_logs_issues_get_against_the_step_path(monkeypatch):
+    """`ticket logs <idx> --step-index N` GETs the step-logs path; with no
+    --attempt / --tail-lines, no query params are sent so the server defaults
+    (latest attempt, 200 lines) apply."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_TICKET_LOGS_RESPONSE, status=200)
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "ticket",
+            "logs",
+            "12",
+            "--step-index",
+            "0",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "GET"
+    expected_path = URL_WORK_TICKET_STEP_LOGS.format(work_ticket_idx=12, step_index=0)
+    assert captured["url"] == f"https://q.example.test{expected_path}"
+    assert captured["json"] is None
+    assert captured["params"] == {}
+
+
+def test_ticket_logs_forwards_attempt_and_tail_lines(monkeypatch):
+    """--attempt and --tail-lines ride along as query params."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_TICKET_LOGS_RESPONSE, status=200)
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "ticket",
+            "logs",
+            "12",
+            "--step-index",
+            "0",
+            "--attempt",
+            "0",
+            "--tail-lines",
+            "50",
+        ]
+    )
+    assert rc == 0
+    assert captured["params"] == {"attempt": "0", "tail_lines": "50"}
+
+
+def test_ticket_logs_renders_streams_raw_not_json(monkeypatch, capsys):
+    """The logs verb prints each stream raw (newlines rendered) instead of a
+    JSON dump, so a fetched stack trace is actually readable."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_TICKET_LOGS_RESPONSE, status=200)
+
+    rc = main(["--base-url", "https://q.example.test", "ticket", "logs", "12", "--step-index", "0"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Raw newline rendering, not a JSON object with escaped \n.
+    assert "oom_kill event" in out
+    assert "\\n" not in out
+    assert '"stderr"' not in out
+    assert "===== stderr =====" in out
+
+
+def test_ticket_logs_requires_step_index(capsys):
+    """--step-index is required; omitting it exits 2 via argparse."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["ticket", "logs", "12"])
+    assert exc_info.value.code == 2
+    assert "step-index" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
