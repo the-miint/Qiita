@@ -123,7 +123,7 @@ async def _fetch_action_for_submission(
     rather than a silent default in the audience check below."""
     row = await pool.fetchrow(
         "SELECT target_kind, target_processing_kinds,"
-        "       scopes, audience, context_schema, enabled"
+        "       scopes, audience, context_schema, enabled, mem_ceiling_gb"
         " FROM qiita.action"
         " WHERE action_id = $1 AND version = $2",
         action_id,
@@ -143,6 +143,9 @@ async def _fetch_action_for_submission(
         "audience": Audience.model_validate_json(row["audience"]),
         "context_schema": json.loads(row["context_schema"]),
         "enabled": row["enabled"],
+        # Mem axis of the action ceiling — the upper bound a resource_override
+        # is validated against at submission (the runner re-clamps at dispatch).
+        "mem_ceiling_gb": row["mem_ceiling_gb"],
     }
 
 
@@ -471,6 +474,29 @@ async def submit_work_ticket(
     _check_audience(principal, action["audience"])
     _check_scopes(principal, action["scopes"])
 
+    # resource_override is a privileged, ceiling-bounded per-run resource bump.
+    # Gate it to wet_lab_admin / system_admin regardless of the action's own
+    # (possibly broader) audience — a regular user who can submit a workflow
+    # still cannot inflate its SLURM footprint — and reject a mem_gb above the
+    # action's ceiling here so the caller gets a clean 422 instead of a ticket
+    # that fails at dispatch.
+    if body.resource_override is not None:
+        if not principal.has_role_at_least(SystemRole.WET_LAB_ADMIN):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"reason": "resource_override requires wet_lab_admin or system_admin"},
+            )
+        override_mem_gb = body.resource_override.mem_gb
+        if override_mem_gb is not None and override_mem_gb > action["mem_ceiling_gb"]:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail={
+                    "reason": "resource_override.mem_gb exceeds the action's mem ceiling",
+                    "resource_override_mem_gb": override_mem_gb,
+                    "action_mem_ceiling_gb": action["mem_ceiling_gb"],
+                },
+            )
+
     scope_target = body.scope_target.model_dump(mode="json")
     if scope_target["kind"] != action["target_kind"]:
         raise HTTPException(
@@ -548,9 +574,10 @@ async def submit_work_ticket(
             "INSERT INTO qiita.work_ticket ("
             "  action_id, action_version, originator_principal_idx,"
             "  scope_target_kind, study_idx, prep_idx, reference_idx,"
-            "  prep_sample_idx, sequenced_pool_idx, action_context"
+            "  prep_sample_idx, sequenced_pool_idx, action_context,"
+            "  resource_override"
             ") VALUES ($1, $2, $3, $4::qiita.scope_target_kind,"
-            "          $5, $6, $7, $8, $9, $10::jsonb)"
+            "          $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb)"
             " RETURNING work_ticket_idx",
             body.action_id,
             body.action_version,
@@ -562,6 +589,9 @@ async def submit_work_ticket(
             prep_sample_idx,
             sequenced_pool_idx,
             json.dumps(body.action_context),
+            json.dumps(body.resource_override.model_dump())
+            if body.resource_override is not None
+            else None,
         )
     except asyncpg.exceptions.UniqueViolationError as exc:
         # Unique partial index fired — a concurrent submission won the

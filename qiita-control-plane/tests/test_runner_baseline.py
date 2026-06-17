@@ -209,3 +209,64 @@ def test_lookup_resolved_profile_also_clamped(tmp_path: Path):
             action_ceiling=tight,
         )
     assert "mem_gb" in ei.value.reason
+
+
+# =============================================================================
+# Per-run mem_gb override — raise-only floor, ceiling-bounded
+# =============================================================================
+
+
+def test_mem_gb_override_raises_floor_above_baseline():
+    """An override above the YAML baseline raises mem_gb; cpu/walltime/gpu
+    are untouched."""
+    step = _step(BaselineResources(cpu=4, mem_gb=8, walltime=timedelta(hours=1), gpu=1))
+    resolved = _resolve_baseline_for_step(
+        entry=step, bound={}, action_ceiling=_CEILING, mem_gb_override=48
+    )
+    assert resolved == FlatBaselineResources(cpu=4, mem_gb=48, walltime=timedelta(hours=1), gpu=1)
+
+
+def test_mem_gb_override_below_baseline_is_noop():
+    """Raise-only: an override smaller than the step's baseline never lowers
+    a step the YAML sized higher."""
+    step = _step(BaselineResources(cpu=8, mem_gb=32, walltime=timedelta(hours=2)))
+    resolved = _resolve_baseline_for_step(
+        entry=step, bound={}, action_ceiling=_CEILING, mem_gb_override=16
+    )
+    assert resolved.mem_gb == 32
+
+
+def test_mem_gb_override_none_leaves_baseline_verbatim():
+    step = _step(BaselineResources(cpu=4, mem_gb=8, walltime=timedelta(hours=1)))
+    resolved = _resolve_baseline_for_step(
+        entry=step, bound={}, action_ceiling=_CEILING, mem_gb_override=None
+    )
+    assert resolved.mem_gb == 8
+
+
+def test_mem_gb_override_applies_to_lookup_population(tmp_path: Path):
+    """The override applies after the profile is resolved, not just to flat."""
+    lookup_file = tmp_path / "instrument_model"
+    lookup_file.write_text("Illumina iSeq 100", encoding="utf-8")
+    step = _lookup_step()
+    # iSeq profile asks mem_gb=16; floor raises it to 64.
+    resolved = _resolve_baseline_for_step(
+        entry=step,
+        bound={"instrument_model": str(lookup_file)},
+        action_ceiling=_CEILING,
+        mem_gb_override=64,
+    )
+    assert resolved.mem_gb == 64
+
+
+def test_mem_gb_override_above_ceiling_is_rejected():
+    """Defense in depth: an override above the ceiling is rejected at dispatch
+    (the submission route already 422s it earlier)."""
+    step = _step(BaselineResources(cpu=4, mem_gb=8, walltime=timedelta(hours=1)), name="over")
+    tight = ActionCeiling(cpu=32, mem_gb=64, walltime=timedelta(hours=24), gpu=4)
+    with pytest.raises(BackendFailure) as ei:
+        _resolve_baseline_for_step(entry=step, bound={}, action_ceiling=tight, mem_gb_override=128)
+    exc = ei.value
+    assert exc.kind == FailureKind.CONTRACT_VIOLATION
+    assert exc.step_name == "over"
+    assert "mem_gb" in exc.reason and "exceeds" in exc.reason

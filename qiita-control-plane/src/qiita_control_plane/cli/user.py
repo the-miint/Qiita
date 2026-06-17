@@ -632,6 +632,16 @@ def _build_parser() -> argparse.ArgumentParser:
             " --pool-item-id."
         ),
     )
+    p_ticket_submit.add_argument(
+        "--mem-gb",
+        type=int,
+        help=(
+            "Per-run memory floor (GB) for this ticket's SLURM steps: raises any"
+            " step whose baseline is below it, bounded by the action's mem"
+            " ceiling. Requires wet_lab_admin / system_admin; omit to use each"
+            " step's workflow default."
+        ),
+    )
     p_ticket_submit.set_defaults(handler=_handle_ticket_submit)
 
     p_ticket_status = p_ticket_sub.add_parser(
@@ -756,6 +766,17 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=24 * 3600,
         help="Max seconds to wait for the work_ticket under --watch (default: 86400)",
+    )
+    p_reference_load.add_argument(
+        "--mem-gb",
+        type=int,
+        help=(
+            "Per-run memory floor (GB) for the workflow's SLURM steps: raises any"
+            " step whose baseline is below it, bounded by the action's mem"
+            " ceiling. Use for a genome-scale reference (e.g. a human host"
+            " genome) that OOMs the conservative default. Requires"
+            " wet_lab_admin / system_admin."
+        ),
     )
     p_reference_load.set_defaults(handler=_handle_reference_load)
 
@@ -1066,6 +1087,11 @@ def _handle_ticket_submit(args: argparse.Namespace, parser: argparse.ArgumentPar
     if parsed_context is not None:
         args.action_context = parsed_context
 
+    # Map the convenience --mem-gb flag onto the resource_override model field
+    # _build_body picks up. Only set it when supplied so unset stays "not set".
+    if args.mem_gb is not None:
+        args.resource_override = {"mem_gb": args.mem_gb}
+
     body = _build_body(WorkTicketCreateRequest, args, parser)
     return _common.run_http_subcommand(lambda t: _post_work_ticket(args.base_url, t, body))
 
@@ -1134,6 +1160,7 @@ async def _run_reference_load(
         watch=not args.no_watch,
         poll_interval_seconds=args.poll_interval,
         timeout_seconds=args.timeout,
+        mem_gb=args.mem_gb,
     )
 
     if args.local:

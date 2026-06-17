@@ -164,6 +164,91 @@ def test_profile_set_sends_only_supplied_fields(monkeypatch):
     assert captured["json"] == {"affiliation": "UCSD", "phone": "+1-555-0100"}
 
 
+def test_ticket_submit_mem_gb_sets_resource_override(monkeypatch):
+    """`qiita ticket submit --mem-gb 48` carries resource_override={'mem_gb':48}
+    in the POST body (the convenience flag mapping onto the model field)."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["method"] = method
+        captured["json"] = json
+        return _httpx.Response(
+            202,
+            json={"work_ticket_idx": 1, "state": "pending"},
+            request=_httpx.Request(method, url),
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "ticket",
+            "submit",
+            "--action-id",
+            "fastq-to-parquet",
+            "--action-version",
+            "1.1.0",
+            "--prep-sample-idx",
+            "5",
+            "--mem-gb",
+            "48",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "POST"
+    assert captured["json"]["resource_override"] == {"mem_gb": 48}
+    assert captured["json"]["scope_target"] == {"kind": "prep_sample", "prep_sample_idx": 5}
+
+
+def test_ticket_submit_without_mem_gb_omits_resource_override(monkeypatch):
+    """Without --mem-gb the field stays absent (exclude_unset), so the server
+    leaves every step on its YAML baseline."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["json"] = json
+        return _httpx.Response(
+            202,
+            json={"work_ticket_idx": 1, "state": "pending"},
+            request=_httpx.Request(method, url),
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "ticket",
+            "submit",
+            "--action-id",
+            "fastq-to-parquet",
+            "--action-version",
+            "1.1.0",
+            "--prep-sample-idx",
+            "5",
+        ]
+    )
+    assert rc == 0
+    assert "resource_override" not in captured["json"]
+
+
 def test_profile_set_boolean_optional_action_distinguishes_unset_false_true(monkeypatch):
     """--receive-processing-emails sets True, --no-receive-processing-emails sets False,
     neither leaves the field absent from the PATCH body."""

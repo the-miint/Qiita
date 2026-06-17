@@ -283,6 +283,7 @@ async def _seed_action(
     scopes: list[str] | None = None,
     target_processing_kinds: list[str] | None = None,
     human_roles: list[str] | None = None,
+    mem_ceiling_gb: int = 1,
 ) -> tuple[str, str]:
     """Insert an enabled action with the given context_schema and
     target_kind. Returns (action_id, version). Caller is responsible
@@ -306,7 +307,7 @@ async def _seed_action(
         "  success_status, failure_status"
         ") VALUES ($1, $2, $3::qiita.scope_target_kind,"
         "          $4::qiita.processing_kind[], $5::text[], $6::jsonb,"
-        "          $7::jsonb, $8::jsonb, 1, 1, '1 minute', $9, $10)",
+        f"          $7::jsonb, $8::jsonb, 1, {mem_ceiling_gb}, '1 minute', $9, $10)",
         action_id,
         version,
         target_kind,
@@ -348,6 +349,29 @@ async def reference_action(postgres_pool):
     reference:write, with an empty context_schema (accepts any object)
     — matches the admin_token fixture's grant."""
     action_id, version = await _seed_action(postgres_pool, context_schema={})
+    yield action_id, version
+    await _drop_action(postgres_pool, action_id, version)
+
+
+@pytest.fixture
+async def reference_action_open(postgres_pool):
+    """A reference-targeting action with NO scope requirement, an audience
+    admitting USER (plus the two admin roles), and a 64 GB mem ceiling. Lets
+    the resource_override tests isolate the override's own role gate (a regular
+    user clears audience + scope and is stopped only by the override gate) and
+    exercise a meaningful below-ceiling override."""
+    action_id, version = await _seed_action(
+        postgres_pool,
+        context_schema={},
+        target_kind="reference",
+        scopes=[],
+        human_roles=[
+            SystemRole.USER.value,
+            SystemRole.WET_LAB_ADMIN.value,
+            SystemRole.SYSTEM_ADMIN.value,
+        ],
+        mem_ceiling_gb=64,
+    )
     yield action_id, version
     await _drop_action(postgres_pool, action_id, version)
 
@@ -578,6 +602,60 @@ async def test_submit_happy_path(
         "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
     )
     assert state == WorkTicketState.PENDING.value
+
+
+async def test_submit_resource_override_persisted(
+    wt_client, postgres_pool, admin_token, reference_action_open, reference_idx
+):
+    """A wet_lab_admin+ caller's resource_override (<= ceiling) is accepted
+    and persisted verbatim on the work_ticket row."""
+    token, _ = admin_token
+    action_id, version = reference_action_open
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json=_body(action_id, version, reference_idx, resource_override={"mem_gb": 48}),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    idx = resp.json()["work_ticket_idx"]
+    wt_client._created_tickets.append(idx)
+    stored = await postgres_pool.fetchval(
+        "SELECT resource_override FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
+    )
+    assert json.loads(stored) == {"mem_gb": 48}
+
+
+async def test_submit_resource_override_above_ceiling_422(
+    wt_client, postgres_pool, admin_token, reference_action_open, reference_idx
+):
+    """An override above the action's mem ceiling is a clean 422 at
+    submission, not a ticket that fails later at dispatch."""
+    token, _ = admin_token
+    action_id, version = reference_action_open
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json=_body(action_id, version, reference_idx, resource_override={"mem_gb": 128}),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 422, resp.text
+    assert "ceiling" in resp.text
+
+
+async def test_submit_resource_override_requires_admin_403(
+    wt_client, postgres_pool, regular_token, reference_action_open, reference_idx
+):
+    """A regular user who clears the action's audience + (empty) scope is
+    still forbidden from setting resource_override — it is gated to
+    wet_lab_admin / system_admin regardless of the action's own audience."""
+    token, _ = regular_token
+    action_id, version = reference_action_open
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json=_body(action_id, version, reference_idx, resource_override={"mem_gb": 16}),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 403, resp.text
+    assert "wet_lab_admin" in resp.text
 
 
 async def test_submit_prep_sample_scope_persists_idx(
