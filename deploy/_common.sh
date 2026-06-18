@@ -98,6 +98,21 @@ qiita_native_checkout_from_python() {
     printf '%s' "$checkout"
 }
 
+# Does a list of changed paths touch a package a native SLURM venv runs
+# (qiita-common or qiita-compute-orchestrator)? redeploy.sh feeds this the
+# `git diff --name-only <before> <after>` of a pull to decide whether the native
+# venv needs a refresh — the path-prefix match is the part worth unit-testing
+# (e.g. it must match `qiita-common/...` but NOT a sibling like
+# `qiita-common-extra/...`), so it lives here as a pure function while the git +
+# sudo wiring stays in redeploy.sh. Pure (no side effects); the unit test in
+# test_deploy_scripts.py exercises the matching directly.
+#
+# $1 = newline-separated path list. Returns 0 when at least one path is under
+# qiita-common/ or qiita-compute-orchestrator/, 1 when none are (incl. empty).
+qiita_paths_touch_native() {
+    printf '%s\n' "${1:-}" | grep -qE '^(qiita-common|qiita-compute-orchestrator)/'
+}
+
 # Read one KEY from an env file in a clean subshell. `set +eu` so a value that
 # references another (unset) var doesn't abort under errexit/nounset and silently
 # blank this and every later var; `set -a` exports the `KEY=val` lines into the
@@ -108,6 +123,38 @@ read_env_var() {
     local env_file="$1" var="$2"
     # shellcheck disable=SC1090,SC1091
     ( set +eu; set -a; source "$env_file" >/dev/null 2>&1; set +a; printf '%s' "${!var:-}" )
+}
+
+# Extract the Env-vars + one-time-host-setup buckets (buckets 1 & 2) from a
+# DEPLOY_CHECKLIST.md and judge whether they are EMPTY. redeploy.sh uses this to
+# skip the "have buckets 1 & 2 been applied?" acknowledgement when there is
+# literally nothing to apply — the deploy stops only when the operator actually
+# has out-of-band steps to run. Pure (echo + return only) so the unit test in
+# test_deploy_scripts.py can exercise the emptiness logic directly.
+#
+# $1 = path to DEPLOY_CHECKLIST.md. Echoes the bucket 1+2 text to stdout, and:
+#   returns 0 — buckets are EMPTY (only headers + "_None yet._" placeholders);
+#               caller may skip the prompt.
+#   returns 1 — buckets carry real steps; caller must print them and prompt.
+#   returns 2 — checklist unreadable or the bucket markers weren't found; caller
+#               can't judge, so it should fall back to prompting (fail safe).
+qiita_buckets_12() {
+    local checklist="$1" text substantive
+    [ -r "$checklist" ] || return 2
+    # CONTRACT: the literal bucket headers "### 1. Env vars" and "### 3. Migrations"
+    # are the boundary markers. If DEPLOY_CHECKLIST.md ever renames or reorders
+    # these, the range below finds nothing and the function returns 2 — i.e. the
+    # caller falls back to PROMPTING, never to silently skipping a real ack. The
+    # real-file test in test_deploy_scripts.py pins these markers to the live file.
+    # From "### 1. Env vars" through the line before "### 3. Migrations" (drop the
+    # trailing migrations header that the range pattern includes).
+    text=$(sed -n '/^### 1\. Env vars/,/^### 3\. Migrations/p' "$checklist" | sed '$d')
+    [ -n "$text" ] || return 2  # markers absent → can't judge; let the caller prompt
+    printf '%s' "$text"
+    # Substantive = any line that is not blank, not a "### " header, and not the
+    # "_None yet._" placeholder. None left → the buckets hold no real steps.
+    substantive=$(printf '%s\n' "$text" | grep -vE '^[[:space:]]*$|^### |^_None yet\._[[:space:]]*$' || true)
+    [ -z "$substantive" ]
 }
 
 # Pass/fail/skip row printers + counters for the read-only check scripts
