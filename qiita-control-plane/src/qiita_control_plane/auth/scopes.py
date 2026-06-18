@@ -68,6 +68,11 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.BIOSAMPLE_WRITE,
             Scope.PREP_SAMPLE_READ,
             Scope.PREP_SAMPLE_WRITE,
+            # Full sequenced_pool purge is system_admin-only, same as
+            # REFERENCE_DELETE: wet_lab_admin can create pools/samples via
+            # PREP_SAMPLE_WRITE but not destroy them. Service accounts never
+            # get it.
+            Scope.SEQUENCED_POOL_DELETE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
             Scope.ADMIN_USER,

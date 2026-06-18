@@ -45,6 +45,7 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_INDEX,
     PATH_REFERENCE_PREFIX,
+    PATH_SEQUENCED_POOL_BY_IDX,
     PATH_SEQUENCED_SAMPLE_BY_IDX,
     PATH_SEQUENCED_SAMPLE_FROM_RUN,
     PATH_SEQUENCED_SAMPLE_LIST_BY_POOL,
@@ -925,6 +926,49 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_submit_bcl.set_defaults(handler=_handle_submit_bcl_convert)
 
+    p_delete_pool = sub.add_parser(
+        "delete-sequenced-pool",
+        help=(
+            "Hard-delete a full sequenced-pool (one bcl-convert sample"
+            " sheet's worth of samples) and everything under it. Admin only."
+        ),
+        description=(
+            "Fully purge a sequenced_pool: the pool row plus every"
+            " sequenced-sample / prep-sample under it, their metadata, study"
+            " links, and pool-/sample-scoped work tickets. The parent"
+            " sequencing-run and the underlying biosamples are retained."
+            " Because each prep-sample is exclusive to this pool, deleting it"
+            " removes those samples from EVERY study they link to, not only"
+            " one. Requires system_admin (sequenced_pool:delete). In-flight"
+            " work tickets block the delete unconditionally; completed/failed"
+            " tickets, published prep-samples, and ENA-submitted samples block"
+            " it unless --force is passed."
+        ),
+    )
+    p_delete_pool.add_argument(
+        "--sequencing-run-idx",
+        type=int,
+        required=True,
+        help="The parent sequencing_run_idx the pool belongs to.",
+    )
+    p_delete_pool.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        required=True,
+        help="The sequenced_pool_idx to purge.",
+    )
+    p_delete_pool.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Override the soft blocks: delete even when completed/failed work"
+            " tickets reference the pool, prep-samples are published into a"
+            " study, or samples carry an ENA accession. Does NOT override"
+            " in-flight work tickets."
+        ),
+    )
+    p_delete_pool.set_defaults(handler=_handle_delete_sequenced_pool)
+
     p_submit_hf = sub.add_parser(
         "submit-host-filter-pool",
         help=(
@@ -1717,6 +1761,24 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
         }
 
     return _common.run_http_subcommand(_run)
+
+
+def _handle_delete_sequenced_pool(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """DELETE /sequencing-run/{run}/sequenced-pool/{pool} — full pool purge.
+
+    system_admin only. Passes ``force=true`` as a query param when --force is
+    set; the server gates in-flight work tickets unconditionally regardless.
+    The response echoes the per-table delete counts.
+    """
+    path = f"{PATH_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_BY_IDX}".format(
+        sequencing_run_idx=args.sequencing_run_idx,
+        sequenced_pool_idx=args.sequenced_pool_idx,
+    )
+    params = {"force": "true"} if args.force else None
+
+    return _common.run_http_subcommand(
+        lambda t: _common.call("DELETE", args.base_url, t, path, params=params)
+    )
 
 
 class _FastqMatchError(NamedTuple):

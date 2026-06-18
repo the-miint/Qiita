@@ -303,12 +303,15 @@ PATH_SEQUENCING_RUN_SEQUENCED_POOL = "/{sequencing_run_idx}/sequenced-pool"
 PATH_SEQUENCED_POOL_PREFLIGHT = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/preflight"
 )
+# DELETE target: full hard-delete of one sequenced_pool (system_admin only).
+PATH_SEQUENCED_POOL_BY_IDX = "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}"
 
 URL_SEQUENCING_RUN_PREFIX = f"{API_PREFIX}{PATH_SEQUENCING_RUN_PREFIX}"
 URL_SEQUENCING_RUN_SEQUENCED_POOL = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_SEQUENCED_POOL}"
 )
 URL_SEQUENCED_POOL_PREFLIGHT = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_PREFLIGHT}"
+URL_SEQUENCED_POOL_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_BY_IDX}"
 
 
 # =============================================================================

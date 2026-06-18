@@ -1787,6 +1787,25 @@ class SequencedPoolPreflightResponse(BaseModel):
     run_preflight_filename: str = Field(min_length=1)
 
 
+class SequencedPoolDeleteResponse(BaseModel):
+    """Summary of a full sequenced_pool purge across Postgres.
+
+    Counts are the rows removed by the FK-ordered cascade. The parent
+    `sequencing_run` is intentionally retained (a run may hold other pools);
+    biosample rows are also retained — a biosample is a physical sample
+    independent of any single prep and is not pool-owned. `prep_sample_deleted`
+    therefore never drives biosample GC. See the route docstring (DELETE
+    /sequencing-run/{R}/sequenced-pool/{P}) and the delete-cascade action."""
+
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    sequenced_sample_deleted: int
+    prep_sample_deleted: int
+    metadata_deleted: int
+    field_exception_deleted: int
+    study_link_deleted: int
+    work_ticket_deleted: int
+
+
 class SequencedSampleCreateRequest(BaseModel):
     """Body for the sequenced-sample composer POST.
 

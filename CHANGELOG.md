@@ -15,6 +15,23 @@ the `no-changelog` label).
 
 ### Added
 
+- Remove a full preparation (sequenced_pool) from the system. New
+  `DELETE /sequencing-run/{run}/sequenced-pool/{pool}` hard-deletes a
+  sequenced_pool and everything under it — the pool row, every
+  `sequenced_sample`/`prep_sample` it holds, their `prep_sample_metadata`,
+  `prep_sample_field_exception`, and `prep_sample_to_study` links, and any
+  pool-/sample-scoped `work_ticket` rows (`work_ticket_step` and `sequence_range`
+  cascade) — in one FK-ordered transaction. The parent `sequencing_run` and the
+  underlying `biosample` rows are intentionally retained (a biosample is a
+  physical sample, not pool-owned). Because each prep_sample is exclusive to one
+  pool, this removes those samples from every study they link to. system_admin
+  only, gated by a new `sequenced_pool:delete` scope. Gating mirrors
+  `DELETE /reference`: in-flight work tickets (pending/queued/processing) block
+  unconditionally; completed/failed tickets, prep_samples published into a study,
+  and ENA-submitted samples block unless `?force=true`. Exposed as the
+  `qiita delete-sequenced-pool` CLI command. The data-plane DuckLake purge is a
+  no-op until processing-result tables exist; on-disk demux FASTQ cleanup is a
+  follow-up (#125)
 - Per-host-reference index selection and tunable build params. `qiita reference
   load --host` gains `--no-rype-index` / `--no-minimap2-index` (build only one
   of the two host-filter indexes; default still builds both, at least one
