@@ -33,7 +33,7 @@ the `no-changelog` label).
   reference too: `_resolve_host_filter_indexes` binds whichever of rype/minimap2
   exist (requiring at least one) and the `host_filter` step skips the stage
   whose index is absent. Index selection is initial-build-time only (the status
-  FSM is terminal at `active`) (#120)
+  FSM is terminal at `active`) (#124)
 - Delete a reference database from the system. New
   `DELETE /reference/{idx}` fully purges a reference — Postgres rows
   (`reference`, `reference_membership`, `reference_index`, plus orphaned
