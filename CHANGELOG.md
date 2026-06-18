@@ -298,6 +298,17 @@ the `no-changelog` label).
 
 ### Fixed
 
+- Container workflow steps no longer exit 64 (`QIITA_INPUT_PATH not set`) once
+  they reach the entrypoint. `apptainer exec --containall` contains the
+  environment as well as the filesystem, so the `QIITA_*` vars set in the SLURM
+  job env never crossed into the container; the entrypoint reads
+  `$QIITA_INPUT_PATH/params.json` and writes to `$QIITA_OUTPUT_PATH`, so it
+  bailed immediately. The orchestrator now forwards the container-contract vars
+  (`QIITA_INPUT_PATH`, `QIITA_OUTPUT_PATH`, `QIITA_WORK_TICKET_IDX`) via
+  apptainer `--env`; native-only env (CO→CP token, miint dirs) is deliberately
+  not exposed to containers. Surfaced running the first container step
+  (bcl-convert) end-to-end, after #116 fixed the upstream container-creation
+  failure (#122)
 - Host-reference index builds (`build_rype_index`, `build_minimap2_index`) no
   longer fail at the post-success manifest step on a real SLURM run. Both jobs
   write a *persistent* index under `PATH_DERIVED` (outside the per-attempt
