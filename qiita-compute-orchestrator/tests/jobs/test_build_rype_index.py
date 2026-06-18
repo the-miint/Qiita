@@ -287,10 +287,22 @@ def test_build_rype_index_memory_split_under_slurm(tmp_path, monkeypatch):
 
     monkeypatch.setattr(build_rype_index, "_run_rype_index_create", fake_build)
 
+    # Spy on the DuckDB-side cap directly (rype's share alone is only an inverse
+    # proxy — pin both sides of the split).
+    real_apply = build_rype_index.apply_duckdb_settings
+
+    def spy_apply(conn, duckdb_tmp, *, memory_gb, threads):
+        captured["duckdb_memory_gb"] = memory_gb
+        real_apply(conn, duckdb_tmp, memory_gb=memory_gb, threads=threads)
+
+    monkeypatch.setattr(build_rype_index, "apply_duckdb_settings", spy_apply)
+
     inputs = build_rype_index.Inputs(
         reference_sequence_chunks=chunks_dir, reference_idx=5, work_ticket_idx=1
     )
     asyncio.run(build_rype_index.execute(inputs, tmp_path / "ws"))
 
+    # DuckDB capped at _DUCKDB_MEMORY_CAP_GB (16), NOT the 4 GB fallback.
+    assert captured["duckdb_memory_gb"] == 16
     # rype gets (alloc - DuckDB cap - headroom) = 48 - 16 - 4 = 28 GB.
     assert captured["max_memory"] == 28 * 1024**3

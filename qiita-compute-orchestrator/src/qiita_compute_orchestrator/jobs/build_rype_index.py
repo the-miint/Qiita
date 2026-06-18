@@ -66,8 +66,9 @@ YAML_STEP_NAME = "build_rype_index"
 # `_DUCKDB_MEMORY_CAP_GB`), rype = (allocation − DuckDB − headroom) floored at the
 # 24 GB fallback. The DuckDB cap is NOT the 4 GB fallback: feeding a genome-scale
 # chunk scan (the full sequence bytes, streamed to rype's read) needs well more
-# than 4 GB — a human host reference (T2T-CHM13) OOMed DuckDB at 4 GB while
-# reading `rype_chunk_input`, before rype's `max_memory` was ever exercised.
+# than 4 GB — a human host reference (T2T-CHM13) OOMed DuckDB at ~3.7 GB under
+# the 4 GB cap while reading `rype_chunk_input`, before rype's `max_memory` was
+# ever exercised.
 # `_DUCKDB_MEMORY_CAP_GB` is a heuristic (~5× the raw single-genome chunk bytes);
 # tune it against a real genome-scale MaxRSS — the DuckDB/rype split here is the
 # one knob this step exposes.
