@@ -283,6 +283,16 @@ the `no-changelog` label).
 
 ### Fixed
 
+- `build_rype_index` no longer OOMs DuckDB on a genome-scale host reference.
+  The step split the SLURM cgroup DuckDB(4 GB, capped) / rype(elastic) on the
+  assumption DuckDB "never needs more" than the 4 GB off-SLURM fallback — but
+  feeding the full chunk scan to rype's read needs far more, so a human host
+  reference (T2T-CHM13) OOMed DuckDB at ~3.7 GB while reading `rype_chunk_input`,
+  before rype's `max_memory` was ever exercised (and `--mem-gb` could not raise
+  it — it only grew rype's share). DuckDB's under-SLURM cap is now
+  `_DUCKDB_MEMORY_CAP_GB` (16 GB) instead of the 4 GB fallback; rype stays the
+  elastic consumer (its share still grows with the allocation). The 16 GB cap is
+  a heuristic and should be tuned against a real genome-scale MaxRSS (#111)
 - The `--mem-gb` per-run override (#102) now actually reaches the DuckDB-backed
   reference-load steps, instead of being silently clamped by a hardcoded
   per-job DuckDB `memory_limit`. Each native job pinned its DuckDB cap to a
