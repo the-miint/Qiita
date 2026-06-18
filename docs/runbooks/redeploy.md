@@ -38,9 +38,10 @@ sudo make -C /home/qiita/qiita-miint redeploy QIITA_HOSTNAME=qiita-miint.ucsd.ed
 ```
 
 `deploy/redeploy.sh` drives steps 2–7 in order: pull (as the operator) →
-print buckets 1 & 2 and pause for you to apply them → `preflight` → migration
-gate → `local-deploy.sh` → miint stage → `verify`, then prints the deployed
-commit for the §8 archive hand-off. Key behaviours:
+print buckets 1 & 2 and pause for you to apply them (only when they hold real
+steps — see below) → `preflight` → migration gate → `local-deploy.sh` → native
+venv refresh → miint stage → `verify`, then prints the deployed commit for the
+§8 archive hand-off. Key behaviours:
 
 - It **reads `DATABASE_URL` from `control-plane.env` itself** (it is root) and
   hands it to the operator's `make migrate`, so the operator's shell needn't
@@ -48,8 +49,18 @@ commit for the §8 archive hand-off. Key behaviours:
 - The migration gate stays **out-of-band**: it *refuses* if anything is
   pending unless you pass `RUN_MIGRATE=1` (which applies after a typed
   confirm — never silently). `activate.sh`'s guard is the backstop.
+- **It only stops to ask when there is real work or a real decision** — it does
+  not pause on no-ops. The buckets 1 & 2 acknowledgement is skipped when both
+  are empty in `DEPLOY_CHECKLIST.md` (nothing to apply out-of-band → nothing to
+  confirm), and the native-venv refresh (§6) is skipped — no prompt, no `uv
+  sync` — when it is provably already current (the native checkout is the clone
+  just pulled, neither `qiita-common` nor `qiita-compute-orchestrator` changed in
+  that pull, and the existing venv still imports). Any doubt → it prompts and
+  acts exactly as before; an unreadable checklist falls back to prompting.
 - `ASSUME_YES=1` skips the interactive acks (automation); `SKIP_STAGE_MIINT=1`
-  skips the miint stage.
+  skips the miint stage; `SKIP_NATIVE_REFRESH=1` skips the native-venv refresh;
+  `FORCE_NATIVE_REFRESH=1` forces it even when the "already current" skip would
+  fire (use to recover a deploy interrupted mid-`uv sync`).
 
 This **root-run, drop-into-each-account** model is why it works where the
 operator account has **no sudo** (the documented default — see
@@ -194,7 +205,18 @@ step above — run `make migrate` and re-run this command.
 > --reinstall-package qiita-common` **as the checkout owner `qiita`** (never
 > root — a root-owned `.venv` is the #80 footgun), and fails loud if the synced
 > venv can't import. It skips cleanly when `SLURM_NATIVE_PYTHON` is unset (local
-> backend), and `SKIP_NATIVE_REFRESH=1` opts out.
+> backend), and `SKIP_NATIVE_REFRESH=1` opts out. It also **skips the refresh
+> entirely — no prompt, no `uv sync`** — when it can prove the venv is already
+> current: the native checkout is the clone this run just pulled, that pull
+> changed neither `qiita-common` nor `qiita-compute-orchestrator`, and the
+> existing venv still imports. When it can't prove that (a separate native
+> checkout, an actual code change, or a failing import probe) it prompts and
+> refreshes as before — so the optimisation never skips a refresh a code change
+> requires. The one case it can't see is a prior run that died **mid-`uv sync`**:
+> a re-run sees "nothing pulled" and a partial venv that may still import, so it
+> would skip. After an interrupted deploy, re-run with `FORCE_NATIVE_REFRESH=1`
+> (or refresh by hand per the fallback below) to force the resync — this keeps
+> the "re-run after a failed deploy is safe" property intact.
 >
 > If you run `local-deploy.sh` directly (not via `redeploy.sh`), or skipped the
 > step, refresh it by hand:

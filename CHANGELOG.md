@@ -119,6 +119,24 @@ the `no-changelog` label).
 
 ### Changed
 
+- `deploy/redeploy.sh` (`make redeploy`) now **only stops to ask when there is
+  real work or a real decision** — it no longer pauses on no-ops. The buckets
+  1 & 2 acknowledgement (env vars + one-time host setup) is skipped when both
+  are empty in `DEPLOY_CHECKLIST.md` (nothing to apply out-of-band → nothing to
+  confirm), via a new unit-tested `qiita_buckets_12` helper in
+  `deploy/_common.sh`. The SLURM native-venv refresh is skipped entirely — no
+  prompt, no `uv sync` — when it can prove the venv is already current (the
+  native checkout is the clone this run just pulled, that pull changed neither
+  `qiita-common` nor `qiita-compute-orchestrator`, and the existing venv still
+  imports); any doubt (a separate checkout, an actual code change, an unreadable
+  checklist, or a failing import probe) falls back to prompting and refreshing
+  exactly as before, so the optimisation never skips work a change requires.
+  `FORCE_NATIVE_REFRESH=1` overrides the skip for the one case it can't see — a
+  re-run after a deploy that died mid-`uv sync`. Both new decisions delegate to
+  pure, unit-tested helpers in `deploy/_common.sh` (`qiita_buckets_12` and
+  `qiita_paths_touch_native`), matching the existing
+  `qiita_native_checkout_from_python` pattern. The migration gate, `RUN_MIGRATE`
+  confirm, and miint-stage prompt are unchanged (#TBD)
 - `deploy/redeploy.sh` (`make redeploy`) now **runs** the SLURM native-venv
   refresh in step 5 instead of only printing a reminder. It derives the
   `qiita-compute-orchestrator` checkout from `SLURM_NATIVE_PYTHON`, runs `uv sync

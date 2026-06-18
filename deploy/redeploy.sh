@@ -24,6 +24,20 @@
 # typed confirm; it is never silent (unsafe for expand/contract changes), and
 # activate.sh's in-deploy guard is the backstop.
 #
+# The script only STOPS to ask when there is real work or a real decision — it
+# does not pause on no-ops:
+#   * the buckets 1 & 2 acknowledgement is skipped when both are empty in
+#     DEPLOY_CHECKLIST.md (nothing to apply out-of-band → nothing to confirm);
+#   * the SLURM native-venv refresh is skipped entirely — no prompt, no `uv sync`
+#     — when it is provably already current (the native checkout IS the clone we
+#     just pulled, neither qiita-common nor qiita-compute-orchestrator changed in
+#     that pull, and the existing venv still imports). A code change, a separate
+#     native checkout, or a failing import probe all force the prompt+refresh as
+#     before. One gap the skip can't see: a PRIOR run that died mid-`uv sync`
+#     leaves a partial venv that may still import — a re-run would see "nothing
+#     pulled" and skip it. After an interrupted deploy, re-run with
+#     FORCE_NATIVE_REFRESH=1 (or clear the stale venv) to force the resync.
+#
 # Usage:
 #   sudo QIITA_HOSTNAME=qiita-miint.ucsd.edu /home/qiita/qiita-miint/deploy/redeploy.sh
 #   (or: sudo make redeploy QIITA_HOSTNAME=qiita-miint.ucsd.edu)
@@ -33,7 +47,9 @@
 #      parent), ASSUME_YES=1 (skip interactive acks — for automation),
 #      RUN_MIGRATE=1 (apply pending migrations here after a typed confirm;
 #      default off — leave off for expand/contract deploys), SKIP_STAGE_MIINT=1,
-#      SKIP_NATIVE_REFRESH=1 (skip the SLURM native-venv `uv sync` in step 5).
+#      SKIP_NATIVE_REFRESH=1 (skip the SLURM native-venv `uv sync` in step 5),
+#      FORCE_NATIVE_REFRESH=1 (always refresh it — overrides the "already current"
+#      skip; use after a deploy that died mid-`uv sync`).
 
 set -euo pipefail
 
@@ -55,22 +71,47 @@ confirm() {
     [ "$reply" = "y" ] || [ "$reply" = "Y" ] || { echo "Aborted." >&2; exit 1; }
 }
 
+native_pkgs_changed() {
+    # Did this pull touch the packages a native SLURM venv runs (qiita-common or
+    # qiita-compute-orchestrator)? Uses the pre/post-pull commits captured in step
+    # 1; runs the diff as the operator so it works on the operator-owned clone, then
+    # delegates the path-prefix match to the pure qiita_paths_touch_native helper.
+    #   returns 0 — changed, OR we can't tell (commits unreadable / git failed) →
+    #               fail safe to "refresh needed";
+    #   returns 1 — provably unchanged (nothing pulled, or no diff in those paths).
+    [ -n "${before_head:-}" ] && [ -n "${after_head:-}" ] || return 0
+    [ "$before_head" = "$after_head" ] && return 1
+    local names
+    names=$(sudo -u "$QIITA_USER" git -C "$QIITA_CLONE" diff --name-only \
+        "$before_head" "$after_head" 2>/dev/null) || return 0
+    qiita_paths_touch_native "$names"
+}
+
 echo "=== redeploy: $QIITA_HOSTNAME (clone: $QIITA_CLONE, operator: $QIITA_USER) ==="
 
 # --- 1. Pull source as the operator ----------------------------------------
 echo "--- [1/7] Pull source (as $QIITA_USER) ---"
+# Capture HEAD either side of the pull so step 5 can tell whether the native venv
+# even needs a refresh (did this pull touch qiita-common / qiita-compute-orchestrator?).
+before_head=$(sudo -u "$QIITA_USER" git -C "$QIITA_CLONE" rev-parse HEAD 2>/dev/null || true)
 sudo -u "$QIITA_USER" git -C "$QIITA_CLONE" pull --ff-only
+after_head=$(sudo -u "$QIITA_USER" git -C "$QIITA_CLONE" rev-parse HEAD 2>/dev/null || true)
 
 # --- 2. Pending-deploy buckets 1+2 (manual) + preflight ---------------------
 echo "--- [2/7] Env vars + one-time host setup (buckets 1 & 2) ---"
 checklist="$QIITA_CLONE/DEPLOY_CHECKLIST.md"
-if [ -r "$checklist" ]; then
-    # Print buckets 1 and 2 (Env-vars header up to, but excluding, Migrations).
-    sed -n '/^### 1\. Env vars/,/^### 3\. Migrations/p' "$checklist" | sed '$d'
+# qiita_buckets_12 echoes the bucket 1+2 text and returns 0 (empty), 1 (real
+# steps), or 2 (unreadable / markers absent). Only stop to ask when there is
+# something to apply; an unreadable checklist falls back to prompting (fail safe).
+if buckets_text=$(qiita_buckets_12 "$checklist"); then
+    echo "Buckets 1 (env vars) & 2 (one-time host setup) are empty in DEPLOY_CHECKLIST.md"
+    echo "— nothing to apply out-of-band; continuing without a prompt."
+else
+    [ -n "$buckets_text" ] && printf '%s\n' "$buckets_text"
+    echo "Apply any env-var + one-time-host-setup steps above BEFORE continuing —"
+    echo "they must be in place before the restart, and stay manual (secrets, dirs, scopes)."
+    confirm "Have buckets 1 (env vars) and 2 (one-time host setup) been applied?"
 fi
-echo "Apply any env-var + one-time-host-setup steps above BEFORE continuing —"
-echo "they must be in place before the restart, and stay manual (secrets, dirs, scopes)."
-confirm "Have buckets 1 (env vars) and 2 (one-time host setup) been applied?"
 
 echo "--- Config/secret preflight (read-only; root → full token fingerprints) ---"
 QIITA_HOSTNAME="$QIITA_HOSTNAME" "$QIITA_CLONE/deploy/preflight.sh"
@@ -146,22 +187,46 @@ if [ -n "${SKIP_NATIVE_REFRESH:-}" ]; then
     echo "qiita-compute-orchestrator changed, refresh it by hand (as its owner $QIITA_USER):"
     echo "    sudo -u $QIITA_USER bash -lc 'cd <native-checkout>/qiita-compute-orchestrator && uv sync --reinstall-package qiita-common'"
 elif native_checkout=$(qiita_native_checkout_from_python "$nativepy"); then
-    # Run as the checkout OWNER ($QIITA_USER), never root: a root-owned .venv the
-    # operator can't clean is the #80 footgun. `bash -lc` so uv is on PATH.
-    confirm "Refresh the SLURM native venv ('uv sync --reinstall-package qiita-common' in $native_checkout, as $QIITA_USER)?"
-    sudo -u "$QIITA_USER" bash -lc "cd '$native_checkout' && uv sync --reinstall-package qiita-common"
-    # Fail loud if the just-synced venv can't import what native jobs import — a
-    # broken refresh must abort here, not surface as a stale job at the next
-    # genome-scale reference-load. (compute-readiness's probe/native-import covers
-    # the compute-node side in step 6; this is the cheap head-node check.)
-    if ! sudo -u "$QIITA_USER" "$nativepy" -c 'import qiita_common, qiita_compute_orchestrator.jobs'; then
-        echo "ERROR: native venv at $native_checkout cannot import qiita_common /" >&2
-        echo "       qiita_compute_orchestrator.jobs after the refresh. The /opt/qiita" >&2
-        echo "       SERVICE venvs are already deployed and serving (step 4) — only NATIVE" >&2
-        echo "       SLURM jobs are at risk. Fix the checkout and re-run (idempotent)." >&2
-        exit 1
+    # Skip the refresh entirely — no prompt, no `uv sync` — only when we can PROVE
+    # the venv is already current:
+    #   (a) the native checkout IS the clone we just pulled (so step 1's before/after
+    #       diff actually describes its sources — true on the live single-clone host;
+    #       a SEPARATE native checkout this script never pulled can't be reasoned
+    #       about from here, so we refresh), AND
+    #   (b) neither qiita-common nor qiita-compute-orchestrator changed in the pull, AND
+    #   (c) the existing venv still imports what native jobs import.
+    # A code change, a separate native checkout, or a failing import probe all fall
+    # through to the prompt + refresh below — the skip never drops a refresh an actual
+    # change requires. The one case the skip can't detect is a PRIOR run that died
+    # mid-`uv sync` (a re-run sees "nothing pulled" + maybe-still-importing partial
+    # venv); FORCE_NATIVE_REFRESH=1 overrides the skip for that recovery path.
+    native_clone=$(cd "$native_checkout/.." 2>/dev/null && pwd || true)
+    deploy_clone=$(cd "$QIITA_CLONE" 2>/dev/null && pwd || true)
+    if [ -z "${FORCE_NATIVE_REFRESH:-}" ] \
+       && [ -n "$native_clone" ] && [ "$native_clone" = "$deploy_clone" ] \
+       && ! native_pkgs_changed \
+       && sudo -u "$QIITA_USER" "$nativepy" -c 'import qiita_common, qiita_compute_orchestrator.jobs' 2>/dev/null; then
+        echo "Native venv already current — neither qiita-common nor"
+        echo "qiita-compute-orchestrator changed in this pull and the venv imports cleanly;"
+        echo "skipping the refresh (no work to do)."
+    else
+        # Run as the checkout OWNER ($QIITA_USER), never root: a root-owned .venv the
+        # operator can't clean is the #80 footgun. `bash -lc` so uv is on PATH.
+        confirm "Refresh the SLURM native venv ('uv sync --reinstall-package qiita-common' in $native_checkout, as $QIITA_USER)?"
+        sudo -u "$QIITA_USER" bash -lc "cd '$native_checkout' && uv sync --reinstall-package qiita-common"
+        # Fail loud if the just-synced venv can't import what native jobs import — a
+        # broken refresh must abort here, not surface as a stale job at the next
+        # genome-scale reference-load. (compute-readiness's probe/native-import covers
+        # the compute-node side in step 6; this is the cheap head-node check.)
+        if ! sudo -u "$QIITA_USER" "$nativepy" -c 'import qiita_common, qiita_compute_orchestrator.jobs'; then
+            echo "ERROR: native venv at $native_checkout cannot import qiita_common /" >&2
+            echo "       qiita_compute_orchestrator.jobs after the refresh. The /opt/qiita" >&2
+            echo "       SERVICE venvs are already deployed and serving (step 4) — only NATIVE" >&2
+            echo "       SLURM jobs are at risk. Fix the checkout and re-run (idempotent)." >&2
+            exit 1
+        fi
+        echo "Native venv refreshed and imports verified."
     fi
-    echo "Native venv refreshed and imports verified."
 else
     rc=$?
     # rc=1 → SLURM_NATIVE_PYTHON unset/`python` (local backend): skip cleanly,
