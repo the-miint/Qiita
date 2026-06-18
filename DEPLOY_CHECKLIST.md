@@ -43,6 +43,34 @@ _None yet._
 
 Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
+### Deployed 2026-06-18 — ee0842a
+
+Nothing was pending at archive time — the PRs deployed since the previous archive (#114, #116) carried no operator-impacting steps. Recorded for provenance only.
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None._
+
+#### 2. One-time host setup
+
+_None._
+
+#### 3. Migrations
+
+_None._
+
+#### 4. Deploy
+
+_None._
+
+#### 5. Verify
+
+_None._
+
+#### Notes (no host action)
+
+_None._
+
 ### Deployed 2026-06-18 — 1bd7c81
 
 Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
