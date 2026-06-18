@@ -22,10 +22,13 @@ From: oraclelinux:8
 
 %post
     # bcl-convert RPM has no implicit deps inside an Oracle Linux 8 base
-    # image, but the entrypoint needs `jq` (params.json parsing) and
-    # `python3` (manifest_writer.py). dnf install handles both plus the
-    # RPM itself in one transaction.
-    dnf -y install jq python3
+    # image, but the entrypoint needs `jq` (params.json parsing) and a
+    # Python for manifest_writer.py. OL8's default `python3` is 3.6, which
+    # predates PEP 585 builtin generics (`list[str]`) and crashes the
+    # workflow-agnostic manifest_writer.py at import. Install the appstream
+    # python3.11 module instead and invoke it explicitly in entrypoint.sh.
+    # dnf install handles both plus the RPM itself in one transaction.
+    dnf -y install jq python3.11
     dnf -y install /tmp/bcl-convert.rpm
     dnf clean all
     rm /tmp/bcl-convert.rpm
@@ -35,11 +38,26 @@ From: oraclelinux:8
 
 %test
     # Smoke-test that every binary the entrypoint depends on is callable.
-    # `apptainer build` runs %test after %post so a missing dep here fails
-    # the build instead of silently shipping a broken SIF.
+    # `apptainer build` runs %test after %post so a failure here fails the
+    # build instead of silently shipping a broken SIF. `set -e` makes every
+    # check below gate the build, not just the last one.
+    set -e
     bcl-convert --version
     jq --version
-    python3 --version
+    python3.11 --version
+    # Guard against the entrypoint drifting back to a bare `python3` (= OL8's
+    # 3.6): assert it invokes python3.11 for the manifest writer. The positive
+    # match fails (and so fails the build) if the invocation reverts to a bare
+    # `python3`, keeping the interpreter name in lockstep with %post and
+    # entrypoint.sh.
+    grep -q 'python3\.11 /opt/qiita/manifest_writer\.py' /opt/qiita/entrypoint.sh
+    # Actually execute manifest_writer.py's module body under the shipped
+    # interpreter. `list[str]` annotations are evaluated at def-time, so a
+    # too-old Python raises TypeError on import — a runtime failure that
+    # py_compile/ast parsing would miss. exec_module runs the body (and its
+    # annotation evaluation) without triggering the __main__ guard, so a
+    # too-old interpreter fails the build instead of a live job.
+    python3.11 -c "import importlib.util as u; s = u.spec_from_file_location('mw', '/opt/qiita/manifest_writer.py'); m = u.module_from_spec(s); s.loader.exec_module(m)"
 
 %runscript
     exec /opt/qiita/entrypoint.sh "$@"
