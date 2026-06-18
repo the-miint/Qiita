@@ -15,6 +15,25 @@ the `no-changelog` label).
 
 ### Added
 
+- Per-host-reference index selection and tunable build params. `qiita reference
+  load --host` gains `--no-rype-index` / `--no-minimap2-index` (build only one
+  of the two host-filter indexes; default still builds both, at least one
+  required), plus `--rype-w N` (rype minimizer window, default now **20**, was
+  25) and `--minimap2-preset` (one of
+  `sr`/`map-ont`/`map-pb`/`map-hifi`/`asm5`/`asm10`/`asm20`, default `sr`). These
+  ride in `action_context`
+  (`build_rype`/`build_minimap2`/`rype_w`/`minimap2_preset`), validated by the
+  `(local-)host-reference-add` `context_schema` (a `not` backstop rejects
+  building neither). Backed by two reusable workflow-engine additions:
+  `WorkflowEntry.when` (skip an entry when its named action_context flag is
+  falsy — default-on) gates each build step and its `register-index`, and
+  `WorkflowStep.params` (action_context key → native `Inputs` field) carries
+  scalar build params to a native step without a wire-contract change. The
+  fastq-to-parquet host-filter consumer now accepts a single-index host
+  reference too: `_resolve_host_filter_indexes` binds whichever of rype/minimap2
+  exist (requiring at least one) and the `host_filter` step skips the stage
+  whose index is absent. Index selection is initial-build-time only (the status
+  FSM is terminal at `active`) (#124)
 - Delete a reference database from the system. New
   `DELETE /reference/{idx}` fully purges a reference — Postgres rows
   (`reference`, `reference_membership`, `reference_index`, plus orphaned

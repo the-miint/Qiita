@@ -85,7 +85,7 @@ The index is a miint rype `.ryxdi` — a **directory** (manifest + Parquet shard
 └── *.parquet            # bucket + inverted-shard content
 ```
 
-Build defaults are **k=64, w=25** (rype's own `w` default is 50; the job passes 25 explicitly), all features mapped to a single bucket named `reference_{reference_idx}` by default. `build_rype_index` reads `PATH_DERIVED` via the orchestrator settings and `mkdir`s the directory at runtime — no operator pre-creation needed. (On SLURM the backend propagates `PATH_DERIVED` into the job env so the compute node resolves the real value, not the `$TMPDIR/qiita/derived` default.)
+Build defaults are **k=64, w=20** (rype's own `w` default is 50; the job passes 20 explicitly, overridable per build via the `rype_w` action_context key), all features mapped to a single bucket named `reference_{reference_idx}` by default. `build_rype_index` reads `PATH_DERIVED` via the orchestrator settings and `mkdir`s the directory at runtime — no operator pre-creation needed. (On SLURM the backend propagates `PATH_DERIVED` into the job env so the compute node resolves the real value, not the `$TMPDIR/qiita/derived` default.)
 
 The `register-index` action records the result in `qiita.reference_index` (`index_type='rype'`, `fs_path`, `params={k, w, bucket_name}`, `created_at`); `GET /reference/{reference_idx}/index` lists it. The authoritative manifest lives inside the `.ryxdi`; `params` is only a small copy. The table has no `UNIQUE(reference_idx, index_type)` — a future "grow a reference" can append a newer generation, and newest wins at resolution time.
 

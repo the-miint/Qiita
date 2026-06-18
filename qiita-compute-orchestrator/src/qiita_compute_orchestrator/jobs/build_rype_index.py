@@ -16,8 +16,9 @@ rather than omitting the optional mapping table: it keeps the index
 self-describing and exercises the same mapping path future multi-bucket
 (microbial) uses will reuse.
 
-rype build parameters default to k=64, w=25 (the function's own w default is
-50, so we pass 25 explicitly). The authoritative build manifest lives inside
+rype build parameters default to k=64, w=20 (the function's own w default is
+50, so we pass 20 explicitly); `w` is overridable per build via the `rype_w`
+action_context key. The authoritative build manifest lives inside
 the `.ryxdi` itself; the control plane records only a small params copy
 (see `register_index`), threaded forward via the meta JSON this job writes —
 native step outputs are paths (`dict[str, Path]`), so params can't ride a
@@ -80,9 +81,10 @@ _DUCKDB_MEMORY_CAP_GB = 16
 _DUCKDB_THREADS = 4
 _RYPE_MAX_MEMORY_GB = 24
 
-# rype build defaults. w=25 is passed explicitly (the function default is 50).
+# rype build defaults. w=20 is passed explicitly (the function default is 50).
+# Override per-build with the `rype_w` action_context key (host-reference-add).
 _DEFAULT_K = 64
-_DEFAULT_W = 25
+_DEFAULT_W = 20
 # rype's default hash salt; pinned here so the build is reproducible and the
 # call stays all-positional (see _run_rype_index_create).
 _DEFAULT_SALT = 6148914691236517205

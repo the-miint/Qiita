@@ -429,6 +429,58 @@ def test_workflow_status_round_trip():
     assert rehydrated.steps[1].target_status == "minting"
 
 
+def test_when_and_params_default_empty():
+    """`when` defaults to None (entry always runs) and `params` to an empty
+    dict (no scalar build params) — an entry that declares neither behaves
+    exactly as before."""
+    from qiita_common.actions import ActionDefinition
+
+    a = ActionDefinition(**_minimal_action_kwargs())
+    assert a.steps[0].when is None
+    assert a.steps[0].params == {}
+
+
+def test_when_and_params_round_trip():
+    """A WorkflowStep's `when` (conditional gate) and `params` (action_context
+    key -> Inputs field) and a WorkflowAction's `when` survive
+    model_dump / model_validate — the path each takes into the DB (sync stores
+    `model_dump(mode="json")`; runtime reconstructs `ActionDefinition`)."""
+    from qiita_common.actions import ActionDefinition, WorkflowAction, WorkflowStep
+
+    kwargs = _minimal_action_kwargs()
+    # Turn the lone container step into a native build step carrying when/params.
+    kwargs["steps"][0] = {
+        "step": "build_rype_index",
+        "step_type": StepType.SINGLETON,
+        "module": "qiita_compute_orchestrator.jobs.build_rype_index",
+        "inputs": ["reference_sequence_chunks"],
+        "params": {"rype_w": "w"},
+        "when": "build_rype",
+        "outputs": ["rype_index_meta"],
+        "baseline_resources": {"cpu": 4, "mem_gb": 32, "walltime": "PT2H"},
+    }
+    kwargs["steps"].append(
+        {
+            "action": "register-index",
+            "inputs": ["rype_index_meta"],
+            "when": "build_rype",
+            "outputs": [],
+        }
+    )
+
+    a = ActionDefinition(**kwargs)
+    assert isinstance(a.steps[0], WorkflowStep)
+    assert a.steps[0].when == "build_rype"
+    assert a.steps[0].params == {"rype_w": "w"}
+    assert isinstance(a.steps[1], WorkflowAction)
+    assert a.steps[1].when == "build_rype"
+
+    rehydrated = ActionDefinition.model_validate(a.model_dump(mode="json"))
+    assert rehydrated.steps[0].when == "build_rype"
+    assert rehydrated.steps[0].params == {"rype_w": "w"}
+    assert rehydrated.steps[1].when == "build_rype"
+
+
 def test_status_fields_reject_blank_strings():
     """min_length=1 — passing an empty string for any status field is a
     sentinel-versus-empty smell, rejected so YAML authors notice."""

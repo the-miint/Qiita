@@ -210,9 +210,27 @@ class WorkflowStep(BaseModel):
     # error when missing. Used for inputs whose presence is workflow-time
     # data (e.g. a taxonomy file accompanies some references but not all).
     optional_inputs: list[str] = Field(default_factory=list)
+    # Scalar build parameters pulled from action_context, keyed
+    # action_context_key -> native `Inputs` field name. Unlike `inputs` /
+    # `optional_inputs` (which the runner resolves to host Paths), these flow
+    # through verbatim — the runner merges them into the step's inputs
+    # *without* Path-coercion, and the job's Pydantic `Inputs` model re-coerces
+    # the string to its declared type (e.g. {"rype_w": "w"} sets the rype
+    # build's `w: int`). The key/value split lets a namespaced context key
+    # (`rype_w`) map onto the model's bare field (`w`) so two steps can expose
+    # same-named knobs without colliding in action_context. Native steps only —
+    # container inputs are bind-mount paths, never scalars.
+    params: dict[str, str] = Field(default_factory=dict)
     outputs: list[str] = Field(default_factory=list)
     baseline_resources: BaselineResources
     target_status: str | None = Field(default=None, min_length=1, max_length=MAX_NAME_LENGTH)
+    # Optional conditional gate: the name of an action_context boolean key.
+    # The runner runs this entry only when `bool(action_context.get(when,
+    # True))` — i.e. default-ON, skipped only when the key is present and
+    # falsy. An omitted `when` always runs. Lets one workflow opt a step (and
+    # its downstream register-* action, which carries the same `when`) out of a
+    # run from the submission's action_context.
+    when: str | None = Field(default=None, min_length=1, max_length=MAX_NAME_LENGTH)
 
     @model_validator(mode="after")
     def _exactly_one_runtime(self) -> WorkflowStep:
@@ -245,6 +263,11 @@ class WorkflowAction(BaseModel):
     inputs: list[str] = Field(default_factory=list)
     outputs: list[str] = Field(default_factory=list)
     target_status: str | None = Field(default=None, min_length=1, max_length=MAX_NAME_LENGTH)
+    # Same conditional gate as WorkflowStep.when (default-ON; skipped only when
+    # the named action_context key is present and falsy). A gated build step
+    # and the register-* action that consumes its output share the same `when`
+    # so they are skipped together.
+    when: str | None = Field(default=None, min_length=1, max_length=MAX_NAME_LENGTH)
 
 
 # Discriminated union — the model_validator on ActionDefinition rewrites

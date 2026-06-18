@@ -798,6 +798,36 @@ def _build_parser() -> argparse.ArgumentParser:
     p_reference_load.add_argument("--tree", type=Path)
     p_reference_load.add_argument("--jplace", type=Path)
     p_reference_load.add_argument("--genome-map", type=Path, dest="genome_map")
+    # Host index selection + build params (apply only with --host). Default
+    # builds both indexes; the opt-out flags skip one (not both — the entry
+    # point rejects building neither). --rype-w / --minimap2-preset tune the
+    # builders; omitted, they use the builders' defaults (w=20, preset=sr).
+    p_reference_load.add_argument(
+        "--no-rype-index",
+        action="store_true",
+        help=(
+            "With --host: skip the rype index (build minimap2 only). Cannot be"
+            " combined with --no-minimap2-index."
+        ),
+    )
+    p_reference_load.add_argument(
+        "--no-minimap2-index",
+        action="store_true",
+        help=(
+            "With --host: skip the minimap2 index (build rype only). Cannot be"
+            " combined with --no-rype-index."
+        ),
+    )
+    p_reference_load.add_argument(
+        "--rype-w",
+        type=int,
+        help="With --host: rype minimizer window `w` for the rype index build (default 20).",
+    )
+    p_reference_load.add_argument(
+        "--minimap2-preset",
+        choices=("sr", "map-ont", "map-pb", "map-hifi", "asm5", "asm10", "asm20"),
+        help="With --host: minimap2 preset baked into the .mmi index (default sr).",
+    )
     p_reference_load.add_argument(
         "--data-plane-url",
         help=(
@@ -1246,6 +1276,10 @@ async def _run_reference_load(
         tree_path=args.tree,
         jplace_path=args.jplace,
         genome_map_path=args.genome_map,
+        build_rype=not args.no_rype_index,
+        build_minimap2=not args.no_minimap2_index,
+        rype_w=args.rype_w,
+        minimap2_preset=args.minimap2_preset,
         watch=not args.no_watch,
         poll_interval_seconds=args.poll_interval,
         timeout_seconds=args.timeout,
