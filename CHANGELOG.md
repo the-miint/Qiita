@@ -136,7 +136,7 @@ the `no-changelog` label).
   pure, unit-tested helpers in `deploy/_common.sh` (`qiita_buckets_12` and
   `qiita_paths_touch_native`), matching the existing
   `qiita_native_checkout_from_python` pattern. The migration gate, `RUN_MIGRATE`
-  confirm, and miint-stage prompt are unchanged (#TBD)
+  confirm, and miint-stage prompt are unchanged (#113)
 - `deploy/redeploy.sh` (`make redeploy`) now **runs** the SLURM native-venv
   refresh in step 5 instead of only printing a reminder. It derives the
   `qiita-compute-orchestrator` checkout from `SLURM_NATIVE_PYTHON`, runs `uv sync

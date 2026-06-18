@@ -39,7 +39,7 @@ _None yet._
   1 & 2 ack when both are empty here, and skips the native-venv refresh when it's
   provably already current (`FORCE_NATIVE_REFRESH=1` overrides, e.g. recovering a
   deploy that died mid-`uv sync`). Behaviour ships with the script; no host
-  action. See CHANGELOG / `redeploy.md` for the full rules. (#TBD)
+  action. See CHANGELOG / `redeploy.md` for the full rules. (#113)
 
 ---
 
