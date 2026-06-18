@@ -191,43 +191,57 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         )
     )
 
-    with open_miint_conn() as conn:
-        apply_duckdb_settings(conn, duckdb_tmp, memory_gb=duckdb_memory_gb, threads=_DUCKDB_THREADS)
-        # Non-temp view/table so rype's separate bind/execute connection can
-        # resolve them by name. DuckDB rejects prepared parameters inside
-        # CREATE VIEW, so the path is inlined (quote-escaped — it's a
-        # filesystem path, no other injection surface).
-        read_target_sql = read_target.replace("'", "''")
-        conn.execute(
-            f"CREATE OR REPLACE VIEW {_CHUNK_VIEW} AS "
-            f"SELECT feature_idx, chunk_index, chunk_data FROM read_parquet('{read_target_sql}')"
-        )
-        # Single-bucket mapping over every distinct feature. bucket is a
-        # controlled string; escape quotes for the inlined literal.
-        bucket_sql = bucket.replace("'", "''")
-        conn.execute(
-            f"CREATE OR REPLACE TABLE {_MAPPING_TABLE} AS "
-            f"SELECT DISTINCT feature_idx, CAST('{bucket_sql}' AS VARCHAR) AS bucket_name "
-            f"FROM {_CHUNK_VIEW}"
-        )
-        status = _run_rype_index_create(
-            conn,
-            _CHUNK_VIEW,
-            str(index_dir),
-            _MAPPING_TABLE,
-            k=inputs.k,
-            w=inputs.w,
-            max_memory=rype_max_memory_gb * 1024**3,
-        )
-    if status != "ok":
-        raise RuntimeError(
-            f"rype_index_create returned status {status!r} (expected 'ok') for "
-            f"reference {inputs.reference_idx} → {index_dir}"
-        )
+    try:
+        with open_miint_conn() as conn:
+            apply_duckdb_settings(
+                conn, duckdb_tmp, memory_gb=duckdb_memory_gb, threads=_DUCKDB_THREADS
+            )
+            # Non-temp view/table so rype's separate bind/execute connection can
+            # resolve them by name. DuckDB rejects prepared parameters inside
+            # CREATE VIEW, so the path is inlined (quote-escaped — it's a
+            # filesystem path, no other injection surface).
+            read_target_sql = read_target.replace("'", "''")
+            conn.execute(
+                f"CREATE OR REPLACE VIEW {_CHUNK_VIEW} AS "
+                f"SELECT feature_idx, chunk_index, chunk_data "
+                f"FROM read_parquet('{read_target_sql}')"
+            )
+            # Single-bucket mapping over every distinct feature. bucket is a
+            # controlled string; escape quotes for the inlined literal.
+            bucket_sql = bucket.replace("'", "''")
+            conn.execute(
+                f"CREATE OR REPLACE TABLE {_MAPPING_TABLE} AS "
+                f"SELECT DISTINCT feature_idx, CAST('{bucket_sql}' AS VARCHAR) AS bucket_name "
+                f"FROM {_CHUNK_VIEW}"
+            )
+            status = _run_rype_index_create(
+                conn,
+                _CHUNK_VIEW,
+                str(index_dir),
+                _MAPPING_TABLE,
+                k=inputs.k,
+                w=inputs.w,
+                max_memory=rype_max_memory_gb * 1024**3,
+            )
+        if status != "ok":
+            raise RuntimeError(
+                f"rype_index_create returned status {status!r} (expected 'ok') for "
+                f"reference {inputs.reference_idx} → {index_dir}"
+            )
+    finally:
+        # Drop the DuckDB spill dir (possibly large for a genome-scale build)
+        # before returning so it doesn't accumulate in the shared work-ticket
+        # workspace — mirrors build_minimap2_index and the sibling DuckDB jobs.
+        shutil.rmtree(duckdb_tmp, ignore_errors=True)
 
     params = {"k": inputs.k, "w": inputs.w, "bucket_name": bucket}
     meta_path = workspace / "rype_index_meta.json"
     meta_path.write_text(
         json.dumps({"index_type": "rype", "fs_path": str(index_dir), "params": params})
     )
-    return {"rype_index_path": index_dir, "rype_index_meta": meta_path}
+    # The persistent .ryxdi lives under PATH_DERIVED, OUTSIDE the ephemeral
+    # workspace, so it is NOT a step output: the manifest/verify contract requires
+    # every declared output to resolve under $QIITA_OUTPUT_PATH (see
+    # jobs/__main__._write_manifest and slurm/verify.py). Its location travels in
+    # the meta JSON's `fs_path`, which the register-index step consumes.
+    return {"rype_index_meta": meta_path}

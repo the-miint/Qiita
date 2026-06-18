@@ -80,15 +80,16 @@ steps:
   # (data-plane move_file), so the index build has to read them from staging
   # first. The persistent .ryxdi is written under the derived-artifact base
   # ({PATH_DERIVED}/references/{reference_idx}/rype/index.ryxdi), not
-  # the ephemeral workspace; build_rype_index returns its path (rype_index_path)
-  # and a small meta JSON (rype_index_meta) carrying index_type / fs_path /
-  # params that register-index consumes.
+  # the ephemeral workspace. Because that path escapes $QIITA_OUTPUT_PATH it is
+  # NOT a step output (the manifest/verify contract rejects outputs outside the
+  # workspace); build_rype_index returns only a small meta JSON (rype_index_meta)
+  # carrying index_type / fs_path / params that register-index consumes.
   - step: build_rype_index
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.build_rype_index
     target_status: indexing
     inputs: [reference_sequence_chunks]
-    outputs: [rype_index_path, rype_index_meta]
+    outputs: [rype_index_meta]
     baseline_resources:
       cpu: 4
       mem_gb: 32
@@ -105,7 +106,7 @@ steps:
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.build_minimap2_index
     inputs: [reference_sequence_chunks]
-    outputs: [minimap2_index_path, minimap2_index_meta]
+    outputs: [minimap2_index_meta]
     baseline_resources:
       cpu: 4
       mem_gb: 32

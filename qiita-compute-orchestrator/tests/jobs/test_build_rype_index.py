@@ -10,8 +10,9 @@ around it:
     covers every feature in the chunks, with the default bucket name;
   - the persistent index path is `{shared_root}/references/{idx}/rype/index.ryxdi`
     and its parent directory is created;
-  - the returned bindings (`rype_index_path`, `rype_index_meta`) and the meta
-    JSON record index_type / fs_path / params (k, w, bucket_name).
+  - the persistent index path is NOT a step output (it escapes the workspace);
+    the only returned binding (`rype_index_meta`) and the meta JSON record
+    index_type / fs_path / params (k, w, bucket_name).
 
 The chunk Parquet shape `(feature_idx BIGINT, chunk_index INTEGER, chunk_data
 VARCHAR)` is the feature-keyed form `reference_load` emits.
@@ -100,7 +101,8 @@ def test_build_rype_index_orchestration(tmp_path, monkeypatch):
         reference_idx=reference_idx,
         work_ticket_idx=42,
     )
-    out = asyncio.run(build_rype_index.execute(inputs, tmp_path / "workspace"))
+    workspace = tmp_path / "workspace"
+    out = asyncio.run(build_rype_index.execute(inputs, workspace))
 
     # Single bucket covering both features, default name.
     assert captured["n_buckets"] == 1
@@ -111,9 +113,16 @@ def test_build_rype_index_orchestration(tmp_path, monkeypatch):
     assert captured["w"] == 25
 
     expected_dir = shared_root / "references" / str(reference_idx) / "rype" / "index.ryxdi"
-    assert out["rype_index_path"] == expected_dir
     assert expected_dir.is_dir()
     assert captured["output_path"] == str(expected_dir)
+
+    # Every returned output MUST resolve under the workspace — the persistent
+    # .ryxdi escapes it (lives under PATH_DERIVED) so it is deliberately NOT an
+    # output, and the manifest/verify contract rejects any output that escapes
+    # $QIITA_OUTPUT_PATH (regression guard for the post-success manifest crash).
+    assert set(out) == {"rype_index_meta"}
+    for name, p in out.items():
+        assert Path(p).resolve().is_relative_to(workspace.resolve()), f"{name} escapes workspace"
 
     meta = json.loads(Path(out["rype_index_meta"]).read_text())
     assert meta["index_type"] == "rype"
@@ -236,7 +245,10 @@ def test_build_rype_index_real_rype_smoke(tmp_path, monkeypatch):
     # the function returns a non-'ok' status.
     out = asyncio.run(build_rype_index.execute(inputs, tmp_path / "ws"))
 
-    index_dir = Path(out["rype_index_path"])
+    # The persistent .ryxdi path is recorded in the meta JSON's fs_path, not as a
+    # step output (it escapes the workspace).
+    meta = json.loads(Path(out["rype_index_meta"]).read_text())
+    index_dir = Path(meta["fs_path"])
     assert index_dir.is_dir(), "rype did not create the .ryxdi directory"
     # A real index has a manifest plus Parquet content (buckets + inverted
     # shards per docs). Assert the manifest exists and the tree carries data,
@@ -245,7 +257,6 @@ def test_build_rype_index_real_rype_smoke(tmp_path, monkeypatch):
     parquet_files = list(index_dir.rglob("*.parquet"))
     assert parquet_files, "rype index has no Parquet content (empty/partial build)"
 
-    meta = json.loads(Path(out["rype_index_meta"]).read_text())
     assert meta["params"] == {"k": 64, "w": 25, "bucket_name": f"reference_{reference_idx}"}
 
 

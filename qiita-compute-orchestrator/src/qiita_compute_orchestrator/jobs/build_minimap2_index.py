@@ -211,4 +211,9 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     meta_path.write_text(
         json.dumps({"index_type": "minimap2", "fs_path": str(index_path), "params": params})
     )
-    return {"minimap2_index_path": index_path, "minimap2_index_meta": meta_path}
+    # The persistent .mmi lives under PATH_DERIVED, OUTSIDE the ephemeral
+    # workspace, so it is NOT a step output: the manifest/verify contract requires
+    # every declared output to resolve under $QIITA_OUTPUT_PATH (see
+    # jobs/__main__._write_manifest and slurm/verify.py). Its location travels in
+    # the meta JSON's `fs_path`, which the register-index step consumes.
+    return {"minimap2_index_meta": meta_path}

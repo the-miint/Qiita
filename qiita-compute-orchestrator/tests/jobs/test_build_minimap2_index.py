@@ -93,7 +93,8 @@ def test_build_minimap2_index_reassembles_chunks(tmp_path, monkeypatch):
         reference_idx=reference_idx,
         work_ticket_idx=42,
     )
-    out = asyncio.run(build_minimap2_index.execute(inputs, tmp_path / "ws"))
+    workspace = tmp_path / "ws"
+    out = asyncio.run(build_minimap2_index.execute(inputs, workspace))
 
     assert captured["cols"] == ["read_id", "sequence1"]
     # read_id is feature_idx (BIGINT); feature 1 reassembled in chunk_index order.
@@ -101,9 +102,15 @@ def test_build_minimap2_index_reassembles_chunks(tmp_path, monkeypatch):
     assert captured["preset"] == "sr"
 
     expected = shared_root / "references" / str(reference_idx) / "minimap2" / "index.mmi"
-    assert out["minimap2_index_path"] == expected
     assert captured["output_path"] == str(expected)
     assert expected.is_file()
+
+    # The persistent .mmi escapes the workspace, so it is NOT a step output; only
+    # the meta JSON is returned, and every output must resolve under the workspace
+    # (manifest/verify contract — regression guard for the manifest-write crash).
+    assert set(out) == {"minimap2_index_meta"}
+    for name, p in out.items():
+        assert Path(p).resolve().is_relative_to(workspace.resolve()), f"{name} escapes workspace"
 
     meta = json.loads(Path(out["minimap2_index_meta"]).read_text())
     assert meta["index_type"] == "minimap2"
@@ -282,10 +289,12 @@ def test_build_minimap2_index_real_smoke(tmp_path, monkeypatch):
     )
     out = asyncio.run(build_minimap2_index.execute(inputs, tmp_path / "ws"))
 
-    mmi = Path(out["minimap2_index_path"])
+    # The persistent .mmi path is recorded in the meta JSON's fs_path, not as a
+    # step output (it escapes the workspace).
+    meta = json.loads(Path(out["minimap2_index_meta"]).read_text())
+    mmi = Path(meta["fs_path"])
     assert mmi.is_file(), "save_minimap2_index did not write the .mmi file"
     assert mmi.stat().st_size > 0, "minimap2 index is empty (failed/partial build)"
 
-    meta = json.loads(Path(out["minimap2_index_meta"]).read_text())
     assert meta["params"]["preset"] == "sr"
     assert meta["params"]["num_subjects"] == 2

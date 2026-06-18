@@ -238,7 +238,9 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
     assert build.target_status == "indexing"
     # Consumes the feature-keyed chunks the load step re-exposes as a binding.
     assert build.inputs == ["reference_sequence_chunks"]
-    assert build.outputs == ["rype_index_path", "rype_index_meta"]
+    # Only the meta JSON is a step output — the persistent .ryxdi escapes the
+    # workspace and travels in the meta's fs_path instead.
+    assert build.outputs == ["rype_index_meta"]
 
     # The minimap2 builder consumes the SAME feature-keyed chunks as the rype
     # builder (reassembled into whole contigs), not a raw-FASTA side channel.
@@ -246,7 +248,7 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
     assert mm2.module == "qiita_compute_orchestrator.jobs.build_minimap2_index"
     assert mm2.container is None
     assert mm2.inputs == ["reference_sequence_chunks"]
-    assert mm2.outputs == ["minimap2_index_path", "minimap2_index_meta"]
+    assert mm2.outputs == ["minimap2_index_meta"]
 
     # The load step re-exposes the feature-keyed chunks under its own binding so
     # build_rype_index can consume them; reference-add declares only staging_dir.
@@ -411,7 +413,7 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
     mm2 = next(s for s in local_host.steps if s.name == "build_minimap2_index")
     assert mm2.module == "qiita_compute_orchestrator.jobs.build_minimap2_index"
     assert mm2.inputs == ["reference_sequence_chunks"]
-    assert mm2.outputs == ["minimap2_index_path", "minimap2_index_meta"]
+    assert mm2.outputs == ["minimap2_index_meta"]
 
     # Taxonomy required (the rype mapping authority), same as host-reference-add.
     assert set(local_host.context_schema["required"]) == {

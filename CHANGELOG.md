@@ -283,6 +283,17 @@ the `no-changelog` label).
 
 ### Fixed
 
+- Host-reference index builds no longer fail at the post-success manifest write.
+  `build_rype_index` and `build_minimap2_index` declared their persistent index
+  (`{PATH_DERIVED}/references/{idx}/{rype,minimap2}/...`) as a step output, but
+  that path escapes `$QIITA_OUTPUT_PATH`, so the native launcher's manifest write
+  (and the verifier) raised `'... .ryxdi' is not in the subpath of '.../output'`
+  the moment a build actually completed (surfaced once #111 fixed the upstream
+  DuckDB OOM). The persistent path was always redundant as an output — only the
+  meta JSON (`*_index_meta`, carrying `fs_path`) is consumed, by `register-index`
+  — so both jobs and the `host-reference-add` / `local-host-reference-add`
+  workflows now declare only the meta as an output. `build_rype_index` also now
+  cleans its DuckDB spill dir on exit, matching `build_minimap2_index` (#115)
 - Retrying a `failed` reference load no longer dies instantly. A fresh
   `POST /work-ticket` bound to an existing reference (the `qiita reference load
   --reference-idx N` retry) now resets a `failed` reference back to `pending`

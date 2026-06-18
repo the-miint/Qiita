@@ -35,7 +35,14 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- (#115) The `host-reference-add` / `local-host-reference-add` workflows changed
+  the `build_rype_index` / `build_minimap2_index` step `outputs` (the persistent
+  index path is no longer a declared output — it escaped `$QIITA_OUTPUT_PATH` and
+  broke the post-success manifest write once a build actually completed). Same
+  `action_id`+version (1.0.0), picked up by `qiita-admin actions sync` in
+  `activate.sh` — no migration, env var, or host step. Unblocks host-reference
+  index builds: a previously-`failed` host reference (e.g. reference 2) can be
+  re-loaded after deploy and will now complete past `build_rype_index`.
 
 ---
 
