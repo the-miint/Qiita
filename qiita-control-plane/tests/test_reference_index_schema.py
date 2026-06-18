@@ -100,7 +100,7 @@ async def test_reference_index_accepts_minimap2_type(postgres_pool):
             " VALUES ($1, 'minimap2', '/srv/x/minimap2/index.mmi', $2::jsonb)"
             " RETURNING reference_index_idx",
             idx,
-            '{"preset": "sr", "source_files": ["/data/host/grch38.fa"]}',
+            '{"preset": "sr", "source_chunks": "/data/host/grch38.chunks", "num_subjects": 1}',
         )
         row = await postgres_pool.fetchrow(
             "SELECT index_type FROM qiita.reference_index WHERE reference_index_idx = $1",

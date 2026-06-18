@@ -131,7 +131,9 @@ the `no-changelog` label).
   gives the in-tree-vs-out-of-tree boundary one home. `docs/architecture.md` gains
   the matching note: a derived/persistent artifact is never a step output (it
   can't resolve under `$QIITA_OUTPUT_PATH`), so its location travels in an in-tree
-  meta JSON (#TBD)
+  meta JSON. Also corrects a docs/test drift — the minimap2 `reference_index.params`
+  shape is `{preset, source_chunks, num_subjects}` (what `build_minimap2_index`
+  actually writes), not the stale `{preset, source_files}` (#119)
 - `deploy/redeploy.sh` (`make redeploy`) now **only stops to ask when there is
   real work or a real decision** — it no longer pauses on no-ops. The buckets
   1 & 2 acknowledgement (env vars + one-time host setup) is skipped when both
