@@ -155,6 +155,11 @@ def test_payload_script_invokes_apptainer_with_bind_mounts(common_kwargs):
     out_path = str(common_kwargs["output_path"])
     assert f"--bind {in_path}:{in_path}" in script
     assert f"--bind {out_path}:{out_path}" in script
+    # --env re-injects the container contract vars; --containall strips the
+    # SLURM job env, so without these the entrypoint exits 64.
+    assert f"--env QIITA_INPUT_PATH={in_path}" in script
+    assert f"--env QIITA_OUTPUT_PATH={out_path}" in script
+    assert f"--env QIITA_WORK_TICKET_IDX={common_kwargs['work_ticket_idx']}" in script
     # entrypoint appended at the end
     assert script.rstrip().endswith(common_kwargs["entrypoint"])
 

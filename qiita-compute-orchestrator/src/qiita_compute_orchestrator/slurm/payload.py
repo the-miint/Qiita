@@ -239,9 +239,23 @@ def build_job_submit_payload(
         # with the device of the same name in the container layout. The
         # src:dest form keeps the in-container home equal to the HOME env
         # set below.
+        #
+        # `--env` re-injects the container contract vars. `--containall`
+        # contains the *environment* too, so the QIITA_* vars set in the
+        # SLURM job env below do not cross into the container — the
+        # entrypoint reads `$QIITA_INPUT_PATH/params.json` and writes to
+        # `$QIITA_OUTPUT_PATH`, so without this it exits 64 ("QIITA_INPUT_PATH
+        # not set"). Only the contract vars are forwarded; native-only env
+        # (CO→CP token, miint dirs) is deliberately not exposed to containers.
         apptainer_args = [
             "--home",
             f"{workspace}:{workspace}",
+            "--env",
+            f"QIITA_INPUT_PATH={input_path}",
+            "--env",
+            f"QIITA_OUTPUT_PATH={output_path}",
+            "--env",
+            f"QIITA_WORK_TICKET_IDX={work_ticket_idx}",
             "--bind",
             f"{input_path}:{input_path}",
             "--bind",
