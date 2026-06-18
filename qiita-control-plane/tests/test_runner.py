@@ -1364,7 +1364,11 @@ async def test_dispatch_register_index_minimap2_meta(postgres_pool, reference_id
             {
                 "index_type": "minimap2",
                 "fs_path": fs_path,
-                "params": {"preset": "sr", "source_files": ["/data/host/grch38.fa"]},
+                "params": {
+                    "preset": "sr",
+                    "source_chunks": "/data/host/grch38.chunks",
+                    "num_subjects": 1,
+                },
             }
         )
     )
