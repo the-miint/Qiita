@@ -180,12 +180,17 @@ echo "--- [5/7] SLURM native env (redeploy.md §6) ---"
 # synced. On any deploy that changed qiita-common or qiita-compute-orchestrator,
 # that venv must be refreshed too, or native jobs silently import stale code (#106).
 # Both this refresh and the miint stage below feed native jobs, so refresh first.
+#
+# sudo's secure_path excludes /usr/local/bin on RHEL-family, and a non-login PATH
+# (or qiita's login profile) need not carry uv either — `bash -lc` is NOT enough.
+# Invoke uv by absolute path, matching activate.sh's $UV (never bare `uv`).
+UV=/usr/local/bin/uv
 nativepy=""
 [ -r "$CO_ENV" ] && nativepy=$(read_env_var "$CO_ENV" SLURM_NATIVE_PYTHON)
 if [ -n "${SKIP_NATIVE_REFRESH:-}" ]; then
     echo "Skipping SLURM native-venv refresh (SKIP_NATIVE_REFRESH=1). If qiita-common or"
     echo "qiita-compute-orchestrator changed, refresh it by hand (as its owner $QIITA_USER):"
-    echo "    sudo -u $QIITA_USER bash -lc 'cd <native-checkout>/qiita-compute-orchestrator && uv sync --reinstall-package qiita-common'"
+    echo "    sudo -u $QIITA_USER bash -lc 'cd <native-checkout>/qiita-compute-orchestrator && /usr/local/bin/uv sync --reinstall-package qiita-common'"
 elif native_checkout=$(qiita_native_checkout_from_python "$nativepy"); then
     # Skip the refresh entirely — no prompt, no `uv sync` — only when we can PROVE
     # the venv is already current:
@@ -211,9 +216,10 @@ elif native_checkout=$(qiita_native_checkout_from_python "$nativepy"); then
         echo "skipping the refresh (no work to do)."
     else
         # Run as the checkout OWNER ($QIITA_USER), never root: a root-owned .venv the
-        # operator can't clean is the #80 footgun. `bash -lc` so uv is on PATH.
+        # operator can't clean is the #80 footgun. uv by absolute path ($UV) —
+        # bare `uv` under `bash -lc` is not reliably on PATH (see $UV above).
         confirm "Refresh the SLURM native venv ('uv sync --reinstall-package qiita-common' in $native_checkout, as $QIITA_USER)?"
-        sudo -u "$QIITA_USER" bash -lc "cd '$native_checkout' && uv sync --reinstall-package qiita-common"
+        sudo -u "$QIITA_USER" bash -lc "cd '$native_checkout' && '$UV' sync --reinstall-package qiita-common"
         # Fail loud if the just-synced venv can't import what native jobs import — a
         # broken refresh must abort here, not surface as a stale job at the next
         # genome-scale reference-load. (compute-readiness's probe/native-import covers
