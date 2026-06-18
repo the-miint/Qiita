@@ -66,6 +66,12 @@ class Scope(StrEnum):
     # GET /sequencing-run/{R}/sequenced-pool/{P}/preflight route the
     # bcl-convert prep step calls to materialize the sample sheet.
     SEQUENCED_POOL_PREFLIGHT_READ = "sequenced_pool:preflight:read"
+    # Full hard-delete of a sequenced_pool (the pool row plus every
+    # sequenced_sample / prep_sample under it, their metadata, study links,
+    # and pool-/sample-scoped work tickets). Destructive and admin-only —
+    # granted solely to system_admin in ROLE_IMPLIED_SCOPES, never to
+    # wet_lab_admin or service accounts. Mirrors REFERENCE_DELETE.
+    SEQUENCED_POOL_DELETE = "sequenced_pool:delete"
 
     # Study data
     STUDY_READ = "study:read"

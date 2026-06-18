@@ -34,6 +34,7 @@ import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import Field
 from qiita_common.api_paths import (
+    PATH_SEQUENCED_POOL_BY_IDX,
     PATH_SEQUENCED_POOL_PREFLIGHT,
     PATH_SEQUENCING_RUN_PREFIX,
     PATH_SEQUENCING_RUN_ROOT,
@@ -43,11 +44,18 @@ from qiita_common.auth_constants import Scope
 from qiita_common.models import (
     SequencedPoolCreateRequest,
     SequencedPoolCreateResponse,
+    SequencedPoolDeleteResponse,
     SequencedPoolPreflightResponse,
     SequencingRunCreateRequest,
     SequencingRunCreateResponse,
 )
 
+from ..actions.sequenced_pool import (
+    SequencedPoolDeleteBlocked,
+    SequencedPoolNotFound,
+    assert_sequenced_pool_deletable,
+    delete_sequenced_pool_cascade,
+)
 from ..auth.guards import (
     require_caller_owns_run,
     require_complete_profile,
@@ -219,3 +227,70 @@ async def get_sequenced_pool_preflight(
         run_preflight_blob=base64.b64encode(bytes(row["run_preflight_blob"])),
         run_preflight_filename=row["run_preflight_filename"],
     )
+
+
+@router.delete(PATH_SEQUENCED_POOL_BY_IDX)
+async def delete_sequenced_pool(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    force: bool = False,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    _scope: Principal = Depends(require_scope(Scope.SEQUENCED_POOL_DELETE)),
+    _run_exists: None = Depends(require_sequencing_run_exists),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> SequencedPoolDeleteResponse:
+    """Fully purge a sequenced_pool — the pool row plus every sequenced_sample /
+    prep_sample under it, their metadata, study links, and pool-/sample-scoped
+    work tickets. system_admin only (`sequenced_pool:delete`). Mirrors
+    DELETE /reference.
+
+    What survives, by design: the parent `sequencing_run` (it may hold other
+    pools) and the underlying `biosample` rows (a biosample is a physical
+    sample shared across studies, not pool-owned — the cascade stops at
+    prep_sample). Because sequenced_sample↔prep_sample is 1:1 and each
+    sequenced_sample belongs to one pool, the deleted prep_samples are
+    exclusive to this pool. They are removed outright, which severs **every**
+    study link they hold — not only the run/pool the operator is thinking of.
+
+    Gating: in-flight work tickets (pending/queued/processing) block the delete
+    unconditionally (409). Completed/failed work tickets, prep_samples published
+    into a study, and samples carrying an ENA accession each block it unless
+    `force=true`.
+
+    The data-plane DuckLake purge is a no-op today (no processing-result tables
+    keyed by prep_sample/processing_idx exist yet); when they land, issue the
+    DoAction purge here — mirroring `delete_reference_data` — before the
+    Postgres teardown.
+    """
+    # `require_sequenced_pool_in_run` already fronted existence (404) and
+    # parent-run consistency (422), so the SequencedPoolNotFound arm here is
+    # belt-and-suspenders for the precheck — kept because the action owns its
+    # own existence contract and the in-tx re-gate below CAN legitimately hit
+    # it (a concurrent delete between the guard and the teardown).
+    try:
+        await assert_sequenced_pool_deletable(pool, sequenced_pool_idx, force=force)
+    except SequencedPoolNotFound:
+        raise HTTPException(
+            status_code=404, detail=f"sequenced_pool {sequenced_pool_idx} not found"
+        )
+    except SequencedPoolDeleteBlocked as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    # Re-gate inside the teardown transaction to close the precheck→cascade
+    # window: a work ticket that went in-flight since the precheck must abort
+    # the teardown (and 409 loudly) rather than be silently deleted. force=True
+    # here means only a *new in-flight* ticket aborts — terminal tickets,
+    # published links, and ENA samples are the cascade's to delete.
+    async with tx() as conn:
+        try:
+            await assert_sequenced_pool_deletable(conn, sequenced_pool_idx, force=True)
+        except SequencedPoolNotFound:
+            raise HTTPException(
+                status_code=404, detail=f"sequenced_pool {sequenced_pool_idx} not found"
+            )
+        except SequencedPoolDeleteBlocked as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        counts = await delete_sequenced_pool_cascade(conn, sequenced_pool_idx)
+
+    return SequencedPoolDeleteResponse(sequenced_pool_idx=sequenced_pool_idx, **counts)

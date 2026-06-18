@@ -104,6 +104,7 @@ async def human_admin_session(postgres_pool):
             Scope.BIOSAMPLE_WRITE,
             Scope.PREP_SAMPLE_READ,
             Scope.PREP_SAMPLE_WRITE,
+            Scope.SEQUENCED_POOL_DELETE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
             Scope.ADMIN_USER,
