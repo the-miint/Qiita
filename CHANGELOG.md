@@ -297,7 +297,7 @@ the `no-changelog` label).
   backend never writes/verifies a manifest, so this only surfaced under SLURM;
   the launcher now also rejects an out-of-tree output with an actionable message
   (naming the output and the rule) instead of leaking the opaque `relative_to`
-  error, covered by a new launcher unit test (#TBD)
+  error, covered by a new launcher unit test (#118)
 - Container workflow steps no longer fail at apptainer container creation under
   the locked-down SLURM job account. The orchestrator now passes
   `--home <workspace>` to `apptainer exec --containall` for container steps:

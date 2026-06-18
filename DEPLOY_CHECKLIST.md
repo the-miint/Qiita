@@ -39,7 +39,7 @@ _None yet._
   Verify by resubmitting a host-reference load (e.g. the failed
   `--reference-idx 2`) and confirming it clears `build_rype_index` /
   `build_minimap2_index` instead of failing with a post-success
-  `CONTRACT_VIOLATION`. (#TBD)
+  `CONTRACT_VIOLATION`. (#118)
 
 ### Notes (no host action)
 
