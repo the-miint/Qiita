@@ -19,7 +19,6 @@ two-service path, same constant-time compare.
 from __future__ import annotations
 
 import shutil
-from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Request
@@ -31,6 +30,7 @@ from qiita_common.api_paths import (
 from qiita_common.models import ReferenceArtifactPurgeResponse
 
 from .config import Settings
+from .derived_store import reference_derived_dir
 from .step import _require_cp_to_co_token
 
 router = APIRouter(prefix=PATH_REFERENCE_ARTIFACT_PREFIX, tags=["reference-artifact"])
@@ -51,7 +51,7 @@ async def purge_reference_artifacts(
     reference that never built indexes (non-host, or never reached `indexing`)
     has no directory, so `removed` comes back False and the call still
     succeeds."""
-    target = Path(settings.path_derived) / "references" / str(reference_idx)
+    target = reference_derived_dir(settings.path_derived, reference_idx)
     removed = target.exists()
     if removed:
         # ignore_errors=False so a real failure (permissions, partial FS)

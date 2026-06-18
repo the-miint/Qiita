@@ -1,0 +1,46 @@
+"""Unit tests for the derived-storage path layout (`derived_store`).
+
+These pin the `{PATH_DERIVED}/references/{idx}/...` convention the orchestrator
+owns, so the three consumers (build_rype_index, build_minimap2_index, the
+reference-artifact purge endpoint) stay in lockstep through one source.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from qiita_compute_orchestrator.derived_store import (
+    minimap2_index_path,
+    reference_derived_dir,
+    rype_index_path,
+)
+
+
+def test_reference_derived_dir_layout():
+    root = Path("/derived")
+    assert reference_derived_dir(root, 7) == Path("/derived/references/7")
+
+
+def test_rype_index_path_layout():
+    assert rype_index_path("/derived", 7) == Path("/derived/references/7/rype/index.ryxdi")
+
+
+def test_minimap2_index_path_layout():
+    assert minimap2_index_path("/derived", 7) == Path("/derived/references/7/minimap2/index.mmi")
+
+
+@pytest.mark.parametrize("builder", [rype_index_path, minimap2_index_path])
+def test_index_paths_live_under_the_reference_dir(builder):
+    """Both index kinds must sit inside the per-reference subtree, so the purge
+    endpoint's single `reference_derived_dir` rmtree removes them both."""
+    root = Path("/derived")
+    index = builder(root, 42)
+    assert index.is_relative_to(reference_derived_dir(root, 42))
+
+
+def test_accepts_str_or_path_root():
+    """`Settings.path_derived` is a str; a caller holding a Path shouldn't have
+    to round-trip through str. Both produce the same absolute layout."""
+    assert rype_index_path("/derived", 1) == rype_index_path(Path("/derived"), 1)
