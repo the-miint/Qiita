@@ -31,15 +31,7 @@ _None yet._
 
 ### 5. Verify
 
-- `host-reference-add` / `local-host-reference-add` changed: `build_rype_index`
-  and `build_minimap2_index` now declare only `*_index_meta` as a step output
-  (the persistent `.ryxdi`/`.mmi` under `PATH_DERIVED` is no longer an output —
-  it was an impossible one that failed the launcher manifest). `activate.sh`
-  re-syncs these via `qiita-admin actions sync` automatically — no manual step.
-  Verify by resubmitting a host-reference load (e.g. the failed
-  `--reference-idx 2`) and confirming it clears `build_rype_index` /
-  `build_minimap2_index` instead of failing with a post-success
-  `CONTRACT_VIOLATION`. (#118)
+_None yet._
 
 ### Notes (no host action)
 
@@ -50,6 +42,42 @@ _None yet._
 ## Deployed history
 
 Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-18 — 20adace
+
+Everything merged but not yet deployed, folded in by each PR as it merges. Run buckets 1→5 in order; buckets 1–3 must precede the bucket-4 restart. Each step carries its source `(#N)` tag.
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
+_None yet._
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
+
+- `host-reference-add` / `local-host-reference-add` changed: `build_rype_index`
+  and `build_minimap2_index` now declare only `*_index_meta` as a step output
+  (the persistent `.ryxdi`/`.mmi` under `PATH_DERIVED` is no longer an output —
+  it was an impossible one that failed the launcher manifest). `activate.sh`
+  re-syncs these via `qiita-admin actions sync` automatically — no manual step.
+  Verify by resubmitting a host-reference load (e.g. the failed
+  `--reference-idx 2`) and confirming it clears `build_rype_index` /
+  `build_minimap2_index` instead of failing with a post-success
+  `CONTRACT_VIOLATION`. (#118)
+
+#### Notes (no host action)
+
+_None yet._
 
 ### Deployed 2026-06-18 — ee0842a
 
