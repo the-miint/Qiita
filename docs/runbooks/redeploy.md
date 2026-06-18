@@ -50,15 +50,22 @@ venv refresh → miint stage → `verify`, then prints the deployed commit for t
   pending unless you pass `RUN_MIGRATE=1` (which applies after a typed
   confirm — never silently). `activate.sh`'s guard is the backstop.
 - **It only stops to ask when there is real work or a real decision** — it does
-  not pause on no-ops. The buckets 1 & 2 acknowledgement is skipped when both
-  are empty in `DEPLOY_CHECKLIST.md` (nothing to apply out-of-band → nothing to
-  confirm), and the native-venv refresh (§6) is skipped — no prompt, no `uv
-  sync` — when it is provably already current (the native checkout is the clone
-  just pulled, neither `qiita-common` nor `qiita-compute-orchestrator` changed in
-  that pull, and the existing venv still imports). Any doubt → it prompts and
-  acts exactly as before; an unreadable checklist falls back to prompting.
+  not pause on no-ops, and it does not prompt to do work it has already proven is
+  needed. The buckets 1 & 2 acknowledgement is skipped when both are empty in
+  `DEPLOY_CHECKLIST.md` (nothing to apply out-of-band → nothing to confirm). The
+  native-venv refresh (§6) is skipped — no prompt, no `uv sync` — when provably
+  already current (the native checkout is the clone just pulled, neither
+  `qiita-common` nor `qiita-compute-orchestrator` changed in that pull, and the
+  existing venv still imports); when a refresh **is** needed on that same clone it
+  now runs automatically (no confirm), prompting only for a *separate* native
+  checkout it didn't pull. miint staging is gated the same way: a
+  `stage-miint --check` probe skips it when the staged build still matches the
+  mirror and stages automatically otherwise — so the two prompts that used to
+  fire on every deploy are gone.
 - `ASSUME_YES=1` skips the interactive acks (automation); `SKIP_STAGE_MIINT=1`
-  skips the miint stage; `SKIP_NATIVE_REFRESH=1` skips the native-venv refresh;
+  skips the miint stage; `FORCE_STAGE_MIINT=1` forces it even when `--check` says
+  it is current (use after a mirror bump the `HEAD` can't see, or to recover a
+  partial stage); `SKIP_NATIVE_REFRESH=1` skips the native-venv refresh;
   `FORCE_NATIVE_REFRESH=1` forces it even when the "already current" skip would
   fire (use to recover a deploy interrupted mid-`uv sync`).
 
@@ -210,13 +217,27 @@ step above — run `make migrate` and re-run this command.
 > current: the native checkout is the clone this run just pulled, that pull
 > changed neither `qiita-common` nor `qiita-compute-orchestrator`, and the
 > existing venv still imports. When it can't prove that (a separate native
-> checkout, an actual code change, or a failing import probe) it prompts and
-> refreshes as before — so the optimisation never skips a refresh a code change
-> requires. The one case it can't see is a prior run that died **mid-`uv sync`**:
-> a re-run sees "nothing pulled" and a partial venv that may still import, so it
-> would skip. After an interrupted deploy, re-run with `FORCE_NATIVE_REFRESH=1`
-> (or refresh by hand per the fallback below) to force the resync — this keeps
-> the "re-run after a failed deploy is safe" property intact.
+> checkout, an actual code change, or a failing import probe) it refreshes — and
+> on that same clone it does so **automatically, without a prompt** (the refresh
+> is unambiguously needed; a confirm only appears for a *separate* checkout it
+> didn't pull). So the optimisation never skips a refresh a code change requires,
+> and never stops to ask you to approve necessary work. The one case it can't see
+> is a prior run that died **mid-`uv sync`**: a re-run sees "nothing pulled" and a
+> partial venv that may still import, so it would skip. After an interrupted
+> deploy, re-run with `FORCE_NATIVE_REFRESH=1` (or refresh by hand per the
+> fallback below) to force the resync — this keeps the "re-run after a failed
+> deploy is safe" property intact.
+>
+> **miint staging is gated the same way.** Before staging, `redeploy.sh` runs
+> `stage-miint --check` (as `qiita-orch`, same interpreter + env): it compares the
+> staged build's fingerprint marker against what the mirror serves now (DuckDB
+> version + platform locally; a `HEAD` on the extension URL for a same-version
+> mirror bump) and **skips staging when they match, stages automatically when they
+> don't** — no prompt either way. Any uncertainty (no marker, network failure, a
+> mirror that returns no `ETag`/`Last-Modified`) re-stages, never skips on doubt.
+> `FORCE_STAGE_MIINT=1` stages unconditionally — use it after a mirror bump the
+> `HEAD` can't see, or to recover a partial stage; `SKIP_STAGE_MIINT=1` skips
+> entirely.
 >
 > If you run `local-deploy.sh` directly (not via `redeploy.sh`), or skipped the
 > step, refresh it by hand:

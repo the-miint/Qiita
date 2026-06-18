@@ -44,11 +44,15 @@ from pathlib import Path
 MIINT_MIRROR_URL = "https://ftp.microbio.me/pub/miint"
 
 
-def _miint_repo() -> str:
+def miint_repo() -> str:
     """The miint extension repo. Defaults to the team mirror so every Qiita
     component installs the SAME, current build — no community-vs-mirror
     patchwork where hosts drift to different builds. `MIINT_EXTENSION_REPO`
-    overrides for a local/dev extension build."""
+    overrides for a local/dev extension build.
+
+    Public because the deploy-time staging gate
+    (`qiita_compute_orchestrator.miint_staging`) builds the mirror URL it HEADs
+    from this same value `miint_install_sql()` installs from."""
     return os.environ.get("MIINT_EXTENSION_REPO") or MIINT_MIRROR_URL
 
 
@@ -78,7 +82,7 @@ def miint_install_sql(*, force: bool = False) -> str:
     INSTALLs at all — it `LOAD`s from that pre-staged directory (`miint_load_sql`).
     """
     verb = "FORCE INSTALL" if force else "INSTALL"
-    return f"{verb} miint FROM '{_miint_repo()}';"
+    return f"{verb} miint FROM '{miint_repo()}';"
 
 
 def miint_load_sql() -> str:

@@ -34,6 +34,8 @@ from qiita_common.duckdb_miint import (
     miint_load_sql,
 )
 
+from .miint_staging import write_staging_marker
+
 # Canonical DuckDB COPY options for the *final* Parquet artifacts the
 # orchestrator writes — the ones the Rust data plane registers into
 # DuckLake. Lives here (next to the only DuckDB connection helpers) so
@@ -232,4 +234,7 @@ def stage_miint_extension() -> str:
     with open_conn() as conn:
         conn.execute(miint_install_sql(force=True))
         conn.execute(miint_load_sql())
+    # Record the staged build's fingerprint so the next deploy can skip a
+    # redundant FORCE INSTALL when the mirror hasn't moved (see miint_staging).
+    write_staging_marker()
     return os.environ.get("MIINT_EXTENSION_DIRECTORY", "<duckdb default ~/.duckdb>")

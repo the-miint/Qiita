@@ -46,7 +46,10 @@
 #      operator/checkout owner), QIITA_CLONE (default: this script's parent's
 #      parent), ASSUME_YES=1 (skip interactive acks — for automation),
 #      RUN_MIGRATE=1 (apply pending migrations here after a typed confirm;
-#      default off — leave off for expand/contract deploys), SKIP_STAGE_MIINT=1,
+#      default off — leave off for expand/contract deploys), SKIP_STAGE_MIINT=1
+#      (skip miint staging entirely), FORCE_STAGE_MIINT=1 (always stage —
+#      overrides the "already current" --check skip; use after a mirror bump the
+#      HEAD can't see, or to recover a partial stage),
 #      SKIP_NATIVE_REFRESH=1 (skip the SLURM native-venv `uv sync` in step 5),
 #      FORCE_NATIVE_REFRESH=1 (always refresh it — overrides the "already current"
 #      skip; use after a deploy that died mid-`uv sync`).
@@ -215,10 +218,23 @@ elif native_checkout=$(qiita_native_checkout_from_python "$nativepy"); then
         echo "qiita-compute-orchestrator changed in this pull and the venv imports cleanly;"
         echo "skipping the refresh (no work to do)."
     else
+        # Reached when the venv is NOT provably current: a code change, a SEPARATE
+        # native checkout, or a failing import probe. When it's the SAME clone we
+        # just pulled, the refresh is unambiguously needed and there's nothing for
+        # the operator to decide — just run it (the #113 "only stop for real work"
+        # rule: don't prompt to do necessary work). Prompt ONLY for a separate
+        # checkout, where redeploy is about to mutate a tree it didn't pull and
+        # can't reason about — that's genuinely the operator's call.
         # Run as the checkout OWNER ($QIITA_USER), never root: a root-owned .venv the
         # operator can't clean is the #80 footgun. uv by absolute path ($UV) —
         # bare `uv` under `bash -lc` is not reliably on PATH (see $UV above).
-        confirm "Refresh the SLURM native venv ('$UV sync --reinstall-package qiita-common' in $native_checkout, as $QIITA_USER)?"
+        if [ -n "$native_clone" ] && [ "$native_clone" = "$deploy_clone" ]; then
+            echo "Native venv needs a refresh (qiita-common / qiita-compute-orchestrator"
+            echo "changed, or the import probe failed) — same clone we just pulled, so"
+            echo "refreshing automatically (no prompt for necessary work)."
+        else
+            confirm "Refresh the SLURM native venv ('$UV sync --reinstall-package qiita-common' in $native_checkout, as $QIITA_USER)?"
+        fi
         sudo -u "$QIITA_USER" bash -lc "cd '$native_checkout' && '$UV' sync --reinstall-package qiita-common"
         # Fail loud if the just-synced venv can't import what native jobs import — a
         # broken refresh must abort here, not surface as a stale job at the next
@@ -253,9 +269,28 @@ if [ -n "${SKIP_STAGE_MIINT:-}" ]; then
 elif [ -r "$CO_ENV" ]; then
     derived=$(read_env_var "$CO_ENV" PATH_DERIVED)
     if [ -n "$derived" ] && [ -n "$nativepy" ]; then
-        confirm "Stage the miint extension now (scripts/stage-miint-extension.sh, as $QIITA_ORCH_USER)?"
-        sudo -u "$QIITA_ORCH_USER" env PATH_DERIVED="$derived" SLURM_NATIVE_PYTHON="$nativepy" \
-            bash "$QIITA_CLONE/scripts/stage-miint-extension.sh"
+        # Resolve MIINT_EXTENSION_DIRECTORY the SAME way stage-miint-extension.sh
+        # does (explicit env var, else PATH_DERIVED/duckdb-ext) so the --check
+        # probe and the stage look at the same dir; pass it to both.
+        mext=$(read_env_var "$CO_ENV" MIINT_EXTENSION_DIRECTORY)
+        [ -z "$mext" ] && mext="${derived%/}/duckdb-ext"
+        # Gate staging on real work (no prompt): the --check probe (run as the
+        # staging account, same interpreter + env) skips when the staged build
+        # still matches the mirror, and stages otherwise (not staged, DuckDB-
+        # version/platform change, or a mirror build bump it detects via a HEAD).
+        # FORCE_STAGE_MIINT=1 stages unconditionally — for a mirror bump the HEAD
+        # somehow can't see, or to recover a partial stage.
+        if [ -z "${FORCE_STAGE_MIINT:-}" ] \
+           && sudo -u "$QIITA_ORCH_USER" env PATH_DERIVED="$derived" \
+                MIINT_EXTENSION_DIRECTORY="$mext" "$nativepy" \
+                -m qiita_compute_orchestrator.cli.stage_miint --check; then
+            echo "miint extension already current — skipping stage (no work to do)."
+        else
+            echo "Staging miint extension (not staged / DuckDB or mirror build changed)..."
+            sudo -u "$QIITA_ORCH_USER" env PATH_DERIVED="$derived" \
+                MIINT_EXTENSION_DIRECTORY="$mext" SLURM_NATIVE_PYTHON="$nativepy" \
+                bash "$QIITA_CLONE/scripts/stage-miint-extension.sh"
+        fi
     else
         echo "PATH_DERIVED / SLURM_NATIVE_PYTHON not both set in $CO_ENV — skipping miint stage"
         echo "(local backend, or stage manually per redeploy.md §6)."

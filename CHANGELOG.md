@@ -155,6 +155,18 @@ the `no-changelog` label).
 
 ### Changed
 
+- `make redeploy` no longer prompts to do work it has already proven is needed.
+  The SLURM native-venv refresh now runs automatically (no confirm) when the
+  native checkout is the same clone redeploy just pulled — the prompt remains
+  only for a separate checkout, where redeploy is about to mutate a tree it
+  didn't pull. miint staging is now gated like the native-venv refresh: a new
+  `stage-miint --check` probe (`qiita_compute_orchestrator.miint_staging`) skips
+  staging when the staged build still matches the mirror and stages
+  automatically otherwise (not staged, DuckDB-version/platform change, or a
+  mirror build bump detected via an HTTP `HEAD` on the extension URL + a
+  fingerprint marker written at stage time). `FORCE_STAGE_MIINT=1` stages
+  unconditionally; `SKIP_STAGE_MIINT=1` still skips entirely. Removes the two
+  recurring deploy prompts that fired every run regardless of need (#127)
 - The orchestrator's **derived-storage** path layout now has a single owner. The
   `{PATH_DERIVED}/references/{idx}/...` convention for the persistent host-filter
   indexes was reconstructed by hand in three places (`build_rype_index`,
