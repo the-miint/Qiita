@@ -283,6 +283,13 @@ the `no-changelog` label).
 
 ### Fixed
 
+- `make redeploy`'s SLURM native-venv refresh no longer fails with `uv: command
+  not found`. The refresh ran `sudo -u qiita bash -lc '... uv sync ...'` with a
+  bare `uv`, trusting the login PATH — but `uv` lives in `/usr/local/bin`, which
+  is absent from sudo's `secure_path` and need not be on qiita's login PATH. It
+  now invokes uv by absolute path (`$UV=/usr/local/bin/uv`), matching the
+  long-standing pattern in `activate.sh`; the manual-fallback hint and the
+  `SKIP_NATIVE_REFRESH` echo use the absolute path too (#114)
 - Retrying a `failed` reference load no longer dies instantly. A fresh
   `POST /work-ticket` bound to an existing reference (the `qiita reference load
   --reference-idx N` retry) now resets a `failed` reference back to `pending`
