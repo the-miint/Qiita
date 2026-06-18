@@ -247,6 +247,38 @@ def test_main_returns_1_on_post_success_manifest_failure(monkeypatch, io_dirs, c
     assert "simulated disk full" in err["reason"]
 
 
+def test_main_rejects_out_of_tree_output(monkeypatch, io_dirs, capsys):
+    """A native job that returns an output living OUTSIDE $QIITA_OUTPUT_PATH
+    (e.g. a persistent derived-tier index, the build_rype_index/build_minimap2_index
+    mistake) must fail as a CONTRACT_VIOLATION with an actionable reason — not the
+    opaque `relative_to` "is not in the subpath of" message. LocalBackend never
+    writes a manifest, so this launcher-only contract is exercised here."""
+    input_path, output_path = io_dirs
+
+    # Persistent artifact written outside the per-attempt output dir.
+    persistent = output_path.parent / "derived" / "index.bin"
+    persistent.parent.mkdir(parents=True)
+    persistent.write_bytes(b"PERSISTENT")
+
+    async def execute(inputs, workspace):
+        return {"derived_index": persistent}
+
+    _install_stub(monkeypatch, short_name="escapes", execute_fn=execute)
+    _write_params(input_path, fastq_path="/tmp/x.fa", reference_idx=1, work_ticket_idx=1)
+
+    rc = main(["--job", "escapes"])
+    assert rc == 1
+    err = json.loads(capsys.readouterr().err)
+    assert err["kind"] == "contract_violation"
+    assert err["step_name"] == "fastq"
+    assert "post-success manifest write failed" in err["reason"]
+    # Actionable: names the offending output, the rule, and the escape — not the
+    # bare "is not in the subpath of" leak.
+    assert "derived_index" in err["reason"]
+    assert "outside $QIITA_OUTPUT_PATH" in err["reason"]
+    assert "is not in the subpath of" not in err["reason"]
+
+
 def test_main_returns_1_and_prints_structured_error_on_backend_failure(
     monkeypatch, io_dirs, capsys
 ):

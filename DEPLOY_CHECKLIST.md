@@ -31,7 +31,15 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- `host-reference-add` / `local-host-reference-add` changed: `build_rype_index`
+  and `build_minimap2_index` now declare only `*_index_meta` as a step output
+  (the persistent `.ryxdi`/`.mmi` under `PATH_DERIVED` is no longer an output —
+  it was an impossible one that failed the launcher manifest). `activate.sh`
+  re-syncs these via `qiita-admin actions sync` automatically — no manual step.
+  Verify by resubmitting a host-reference load (e.g. the failed
+  `--reference-idx 2`) and confirming it clears `build_rype_index` /
+  `build_minimap2_index` instead of failing with a post-success
+  `CONTRACT_VIOLATION`. (#118)
 
 ### Notes (no host action)
 

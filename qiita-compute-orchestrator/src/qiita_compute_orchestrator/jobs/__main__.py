@@ -120,8 +120,26 @@ def _write_manifest(
         if resolved == output_path_resolved:
             # The output IS the directory itself (e.g. `staging_dir`).
             outputs_map[name] = "."
-        else:
-            outputs_map[name] = str(resolved.relative_to(output_path_resolved))
+            continue
+        try:
+            rel = resolved.relative_to(output_path_resolved)
+        except ValueError:
+            # A native job returned an output living OUTSIDE
+            # $QIITA_OUTPUT_PATH. The manifest + verifier contract requires
+            # every declared output to resolve under the output dir, so a
+            # persistent artifact written elsewhere (e.g. a derived-tier index
+            # under PATH_DERIVED) must NOT be a step output — its location
+            # belongs in an in-tree meta JSON the consuming action reads. Fail
+            # with the rule rather than letting relative_to's opaque "is not in
+            # the subpath of" message leak as the failure reason.
+            raise ValueError(
+                f"output {name!r} resolves to {resolved}, which is outside "
+                f"$QIITA_OUTPUT_PATH ({output_path_resolved}); a step output must "
+                "live under the output dir. A persistent/derived artifact is not a "
+                "step output — record its path in an in-tree meta file (see "
+                "build_rype_index/build_minimap2_index)."
+            ) from None
+        outputs_map[name] = str(rel)
     manifest = {"files": files_listing, "outputs": outputs_map}
     manifest_path = output_path / MANIFEST_FILENAME
     manifest_path.write_text(json.dumps(manifest))

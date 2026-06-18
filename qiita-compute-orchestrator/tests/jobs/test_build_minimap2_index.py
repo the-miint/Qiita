@@ -101,7 +101,9 @@ def test_build_minimap2_index_reassembles_chunks(tmp_path, monkeypatch):
     assert captured["preset"] == "sr"
 
     expected = shared_root / "references" / str(reference_idx) / "minimap2" / "index.mmi"
-    assert out["minimap2_index_path"] == expected
+    # The persistent .mmi is NOT a step output (it lives outside the workspace);
+    # its location reaches register-index via the meta `fs_path`.
+    assert "minimap2_index_path" not in out
     assert captured["output_path"] == str(expected)
     assert expected.is_file()
 
@@ -282,10 +284,9 @@ def test_build_minimap2_index_real_smoke(tmp_path, monkeypatch):
     )
     out = asyncio.run(build_minimap2_index.execute(inputs, tmp_path / "ws"))
 
-    mmi = Path(out["minimap2_index_path"])
+    meta = json.loads(Path(out["minimap2_index_meta"]).read_text())
+    mmi = Path(meta["fs_path"])
     assert mmi.is_file(), "save_minimap2_index did not write the .mmi file"
     assert mmi.stat().st_size > 0, "minimap2 index is empty (failed/partial build)"
-
-    meta = json.loads(Path(out["minimap2_index_meta"]).read_text())
     assert meta["params"]["preset"] == "sr"
     assert meta["params"]["num_subjects"] == 2

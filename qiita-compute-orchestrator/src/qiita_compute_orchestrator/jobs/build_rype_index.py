@@ -232,4 +232,9 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     meta_path.write_text(
         json.dumps({"index_type": "rype", "fs_path": str(index_dir), "params": params})
     )
-    return {"rype_index_path": index_dir, "rype_index_meta": meta_path}
+    # Only the in-tree meta JSON is a step output. The `.ryxdi` itself lives
+    # under PATH_DERIVED (outside the per-attempt workspace) on purpose — it
+    # outlives the work ticket — so it CANNOT be a declared output: the launcher
+    # manifest write and the verifier both require every output to resolve under
+    # $QIITA_OUTPUT_PATH. register-index reads its location from meta `fs_path`.
+    return {"rype_index_meta": meta_path}

@@ -1319,7 +1319,7 @@ async def test_dispatch_register_index_writes_row(postgres_pool, reference_idx, 
             }
         )
     )
-    bound = {"rype_index_path": fs_path, "rype_index_meta": str(meta_path)}
+    bound = {"rype_index_meta": str(meta_path)}
     entry = WorkflowAction(
         kind="action", name="register-index", inputs=["rype_index_meta"], outputs=[]
     )
@@ -1372,7 +1372,7 @@ async def test_dispatch_register_index_minimap2_meta(postgres_pool, reference_id
             }
         )
     )
-    bound = {"minimap2_index_path": fs_path, "minimap2_index_meta": str(meta_path)}
+    bound = {"minimap2_index_meta": str(meta_path)}
     entry = WorkflowAction(
         kind="action", name="register-index", inputs=["minimap2_index_meta"], outputs=[]
     )

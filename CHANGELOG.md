@@ -298,6 +298,21 @@ the `no-changelog` label).
 
 ### Fixed
 
+- Host-reference index builds (`build_rype_index`, `build_minimap2_index`) no
+  longer fail at the post-success manifest step on a real SLURM run. Both jobs
+  write a *persistent* index under `PATH_DERIVED` (outside the per-attempt
+  workspace, so it outlives the ticket) and also declared that out-of-tree path
+  as a step output (`rype_index_path` / `minimap2_index_path`). The native-step
+  launcher and the verifier both require every declared output to resolve under
+  `$QIITA_OUTPUT_PATH`, so the launcher's `relative_to` blew up *after* the job
+  succeeded — a `CONTRACT_VIOLATION` (`"... is not in the subpath of ..."`). The
+  binding was vestigial: nothing consumes it — `register-index` reads the index
+  location from the in-tree meta JSON's `fs_path`. Both jobs now return only the
+  meta output, and the workflow YAMLs declare only `*_index_meta`. The local
+  backend never writes/verifies a manifest, so this only surfaced under SLURM;
+  the launcher now also rejects an out-of-tree output with an actionable message
+  (naming the output and the rule) instead of leaking the opaque `relative_to`
+  error, covered by a new launcher unit test (#118)
 - Container workflow steps no longer fail at apptainer container creation under
   the locked-down SLURM job account. The orchestrator now passes
   `--home <workspace>` to `apptainer exec --containall` for container steps:
