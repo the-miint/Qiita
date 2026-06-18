@@ -119,6 +119,19 @@ the `no-changelog` label).
 
 ### Changed
 
+- The orchestrator's **derived-storage** path layout now has a single owner. The
+  `{PATH_DERIVED}/references/{idx}/...` convention for the persistent host-filter
+  indexes was reconstructed by hand in three places (`build_rype_index`,
+  `build_minimap2_index`, and the `DELETE /reference-artifact/{idx}` purge
+  endpoint); it now lives in one module, `qiita_compute_orchestrator/derived_store.py`
+  (`reference_derived_dir` / `rype_index_path` / `minimap2_index_path`), which all
+  three call. No behavior change — the paths are byte-identical — this names
+  derived storage as an explicit orchestrator concern (distinct from the data
+  plane's persistent DuckLake data and the ephemeral per-attempt workspace) and
+  gives the in-tree-vs-out-of-tree boundary one home. `docs/architecture.md` gains
+  the matching note: a derived/persistent artifact is never a step output (it
+  can't resolve under `$QIITA_OUTPUT_PATH`), so its location travels in an in-tree
+  meta JSON (#TBD)
 - `deploy/redeploy.sh` (`make redeploy`) now **only stops to ask when there is
   real work or a real decision** — it no longer pauses on no-ops. The buckets
   1 & 2 acknowledgement (env vars + one-time host setup) is skipped when both

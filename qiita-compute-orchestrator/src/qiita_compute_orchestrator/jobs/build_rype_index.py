@@ -45,6 +45,7 @@ import duckdb
 from pydantic import BaseModel
 
 from ..config import get_settings
+from ..derived_store import rype_index_path
 from ..miint import (
     apply_duckdb_settings,
     duckdb_headroom_gb,
@@ -157,9 +158,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # Persistent index location under the derived-artifact root (PATH_DERIVED),
     # NOT the ephemeral per-attempt workspace. On SLURM the backend propagates
     # PATH_DERIVED into the job env so get_settings() resolves the real value
-    # here instead of the $TMPDIR/qiita/derived default.
-    derived_root = Path(get_settings().path_derived)
-    index_dir = derived_root / "references" / str(inputs.reference_idx) / "rype" / "index.ryxdi"
+    # here instead of the $TMPDIR/qiita/derived default. The layout is owned by
+    # `derived_store` (the orchestrator's derived-storage convention, shared with
+    # build_minimap2_index and the reference-artifact purge endpoint).
+    index_dir = rype_index_path(get_settings().path_derived, inputs.reference_idx)
     index_dir.parent.mkdir(parents=True, exist_ok=True)
     # On a workflow retry the build re-runs against the same persistent path;
     # clear any prior (possibly partial) `.ryxdi` so the rebuild is
