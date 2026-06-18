@@ -147,6 +147,9 @@ def test_payload_script_invokes_apptainer_with_bind_mounts(common_kwargs):
     assert "set -euo pipefail" in script
     assert "apptainer exec --containall" in script
     assert common_kwargs["container"] in script
+    # --home mount target — see payload.py for why --containall needs it.
+    ws = str(common_kwargs["workspace"])
+    assert f"--home {ws}:{ws}" in script
     # bind mounts for input + output paths
     in_path = str(common_kwargs["input_path"])
     out_path = str(common_kwargs["output_path"])

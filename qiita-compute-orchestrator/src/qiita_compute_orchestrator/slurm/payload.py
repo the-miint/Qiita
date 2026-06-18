@@ -231,7 +231,17 @@ def build_job_submit_payload(
         # needs to read — typically the parent dirs of YAML-declared
         # `inputs:` paths so the entrypoint can `jq` a host path out of
         # params.json and apptainer can resolve it.
+        #
+        # `--home <workspace>` pins the container's home mount to the
+        # per-ticket workspace. `--containall` takes the home mount target
+        # from the job user's passwd entry, not $HOME — and qiita-job is a
+        # service account whose passwd home is `/dev/null`, which collides
+        # with the device of the same name in the container layout. The
+        # src:dest form keeps the in-container home equal to the HOME env
+        # set below.
         apptainer_args = [
+            "--home",
+            f"{workspace}:{workspace}",
             "--bind",
             f"{input_path}:{input_path}",
             "--bind",

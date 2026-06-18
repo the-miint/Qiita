@@ -283,6 +283,15 @@ the `no-changelog` label).
 
 ### Fixed
 
+- Container workflow steps no longer fail at apptainer container creation under
+  the locked-down SLURM job account. The orchestrator now passes
+  `--home <workspace>` to `apptainer exec --containall` for container steps:
+  `--containall` derives the container's home mount target from the job user's
+  passwd entry, and `qiita-job` is a service account whose passwd home is
+  `/dev/null`, which collided with the device of the same name in the container
+  layout (`failed to add /dev/null as session directory`). Pinning the home mount
+  to the per-ticket workspace (matching the `HOME` env already set for native
+  steps) resolves it; native steps are unaffected (they run no container) (#116)
 - `make redeploy`'s SLURM native-venv refresh no longer fails with `uv: command
   not found`. The refresh ran `sudo -u qiita bash -lc '... uv sync ...'` with a
   bare `uv`, trusting the login PATH — but `uv` lives in `/usr/local/bin`, which
