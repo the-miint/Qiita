@@ -143,3 +143,144 @@ def test_native_checkout_fails_outside_git_clone(tmp_path: Path) -> None:
     result = _call_native_checkout(str(py))
     assert result.returncode == 2
     assert "git clone" in result.stderr
+
+
+# --- qiita_buckets_12: the "skip the bucket 1 & 2 ack when there's nothing to
+# apply" predicate redeploy.sh uses. rc 0 = empty (skip prompt), 1 = has steps
+# (prompt), 2 = unreadable/markers-absent (fail safe → prompt). -----------------
+
+# Empty Pending-deploy buckets 1 & 2 — only headers + the "_None yet._"
+# placeholder. The "### 3. Migrations" header bounds the range.
+_EMPTY_BUCKETS = """\
+## Pending deploy
+
+### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast)
+
+_None yet._
+
+### 2. One-time host setup
+
+_None yet._
+
+### 3. Migrations
+
+_None yet._
+"""
+
+# A real step in bucket 1 — the operator must apply it, so the ack must NOT skip.
+_NONEMPTY_BUCKETS = """\
+## Pending deploy
+
+### 1. Env vars — set BEFORE the deploy
+
+- (#123) sudo bash -c 'echo "FOO=bar" >> /etc/qiita/compute-orchestrator.env'
+
+### 2. One-time host setup
+
+_None yet._
+
+### 3. Migrations
+
+_None yet._
+"""
+
+
+def _call_buckets_12(checklist: Path) -> subprocess.CompletedProcess[str]:
+    """Source _common.sh and invoke qiita_buckets_12 with a checklist path."""
+    return subprocess.run(
+        ["bash", "-c", f'source "{_COMMON}"; qiita_buckets_12 "$1"', "_", str(checklist)],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_buckets_12_empty_returns_zero(tmp_path: Path) -> None:
+    """Placeholder-only buckets → rc 0 so redeploy.sh skips the prompt; the text
+    is still echoed so the caller could print it."""
+    f = tmp_path / "DEPLOY_CHECKLIST.md"
+    f.write_text(_EMPTY_BUCKETS)
+    result = _call_buckets_12(f)
+    assert result.returncode == 0, result.stdout
+    assert "_None yet._" in result.stdout
+    # The bounding "### 3. Migrations" header is dropped, not part of buckets 1+2.
+    assert "Migrations" not in result.stdout
+
+
+def test_buckets_12_nonempty_returns_one(tmp_path: Path) -> None:
+    """A real step present → rc 1 so the operator is prompted, and the step text
+    is echoed for them to read."""
+    f = tmp_path / "DEPLOY_CHECKLIST.md"
+    f.write_text(_NONEMPTY_BUCKETS)
+    result = _call_buckets_12(f)
+    assert result.returncode == 1
+    assert "FOO=bar" in result.stdout
+
+
+def test_buckets_12_unreadable_returns_two(tmp_path: Path) -> None:
+    """Missing/unreadable checklist → rc 2 so the caller falls back to prompting
+    (fail safe) rather than silently skipping the ack."""
+    result = _call_buckets_12(tmp_path / "does-not-exist.md")
+    assert result.returncode == 2
+    assert result.stdout == ""
+
+
+def test_buckets_12_markers_absent_returns_two(tmp_path: Path) -> None:
+    """Readable file but no bucket markers → can't judge → rc 2 (prompt)."""
+    f = tmp_path / "DEPLOY_CHECKLIST.md"
+    f.write_text("# Some unrelated file\n\nNo bucket headers here.\n")
+    result = _call_buckets_12(f)
+    assert result.returncode == 2
+
+
+def test_buckets_12_pins_real_checklist_headers() -> None:
+    """qiita_buckets_12's bucket-1/bucket-3 markers are the contract with the
+    live DEPLOY_CHECKLIST.md. Run it against the REAL file (not a fixture copy):
+    it must return 0 (empty) or 1 (has steps) — never 2, which would mean the
+    headers it keys on no longer match the file and every deploy quietly fell
+    back to prompting. A bucket rename in DEPLOY_CHECKLIST.md fails here."""
+    result = _call_buckets_12(_REPO_ROOT / "DEPLOY_CHECKLIST.md")
+    assert result.returncode in (0, 1), (
+        "qiita_buckets_12 could not locate buckets 1 & 2 in the real "
+        f"DEPLOY_CHECKLIST.md (rc={result.returncode}); the '### 1. Env vars' / "
+        "'### 3. Migrations' markers it keys on have drifted from the file."
+    )
+
+
+# --- qiita_paths_touch_native: the pure path-prefix predicate behind redeploy.sh's
+# "did this pull touch a package the native SLURM venv runs?" decision. rc 0 = a
+# path is under qiita-common/ or qiita-compute-orchestrator/, 1 = none are. -------
+
+
+def _call_paths_touch_native(paths: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "-c", f'source "{_COMMON}"; qiita_paths_touch_native "$1"', "_", paths],
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [
+        "qiita-common/src/qiita_common/config.py\nother/x",
+        "qiita-compute-orchestrator/pyproject.toml",
+        "docs/a.md\nqiita-common/f",  # native path is not the first line
+    ],
+)
+def test_paths_touch_native_matches(paths: str) -> None:
+    """Any path under the two native packages → rc 0 (refresh needed)."""
+    assert _call_paths_touch_native(paths).returncode == 0
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [
+        "docs/a.md\nworkflows/b.yaml\nqiita-data-plane/src/main.rs",
+        "qiita-common-extra/z.py",  # sibling prefix must NOT match
+        "",  # empty diff → nothing touched
+    ],
+)
+def test_paths_touch_native_no_match(paths: str) -> None:
+    """No path under the native packages (incl. a sibling-prefix dir or an empty
+    list) → rc 1 (no refresh needed)."""
+    assert _call_paths_touch_native(paths).returncode == 1

@@ -119,6 +119,24 @@ the `no-changelog` label).
 
 ### Changed
 
+- `deploy/redeploy.sh` (`make redeploy`) now **only stops to ask when there is
+  real work or a real decision** — it no longer pauses on no-ops. The buckets
+  1 & 2 acknowledgement (env vars + one-time host setup) is skipped when both
+  are empty in `DEPLOY_CHECKLIST.md` (nothing to apply out-of-band → nothing to
+  confirm), via a new unit-tested `qiita_buckets_12` helper in
+  `deploy/_common.sh`. The SLURM native-venv refresh is skipped entirely — no
+  prompt, no `uv sync` — when it can prove the venv is already current (the
+  native checkout is the clone this run just pulled, that pull changed neither
+  `qiita-common` nor `qiita-compute-orchestrator`, and the existing venv still
+  imports); any doubt (a separate checkout, an actual code change, an unreadable
+  checklist, or a failing import probe) falls back to prompting and refreshing
+  exactly as before, so the optimisation never skips work a change requires.
+  `FORCE_NATIVE_REFRESH=1` overrides the skip for the one case it can't see — a
+  re-run after a deploy that died mid-`uv sync`. Both new decisions delegate to
+  pure, unit-tested helpers in `deploy/_common.sh` (`qiita_buckets_12` and
+  `qiita_paths_touch_native`), matching the existing
+  `qiita_native_checkout_from_python` pattern. The migration gate, `RUN_MIGRATE`
+  confirm, and miint-stage prompt are unchanged (#113)
 - `deploy/redeploy.sh` (`make redeploy`) now **runs** the SLURM native-venv
   refresh in step 5 instead of only printing a reminder. It derives the
   `qiita-compute-orchestrator` checkout from `SLURM_NATIVE_PYTHON`, runs `uv sync
@@ -274,6 +292,16 @@ the `no-changelog` label).
   reference is touched (any other state is a no-op, an unrewindable in-progress
   state is logged at WARNING); the shared reset helper is reused by both the
   submit and redrive paths (#112)
+- `build_rype_index` no longer OOMs DuckDB on a genome-scale host reference.
+  The step split the SLURM cgroup DuckDB(4 GB, capped) / rype(elastic) on the
+  assumption DuckDB "never needs more" than the 4 GB off-SLURM fallback — but
+  feeding the full chunk scan to rype's read needs far more, so a human host
+  reference (T2T-CHM13) OOMed DuckDB at ~3.7 GB while reading `rype_chunk_input`,
+  before rype's `max_memory` was ever exercised (and `--mem-gb` could not raise
+  it — it only grew rype's share). DuckDB's under-SLURM cap is now
+  `_DUCKDB_MEMORY_CAP_GB` (16 GB) instead of the 4 GB fallback; rype stays the
+  elastic consumer (its share still grows with the allocation). The 16 GB cap is
+  a heuristic and should be tuned against a real genome-scale MaxRSS (#111)
 - The `--mem-gb` per-run override (#102) now actually reaches the DuckDB-backed
   reference-load steps, instead of being silently clamped by a hardcoded
   per-job DuckDB `memory_limit`. Each native job pinned its DuckDB cap to a

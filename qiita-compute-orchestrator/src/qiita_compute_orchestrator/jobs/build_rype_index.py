@@ -55,17 +55,27 @@ from ..miint import (
 
 YAML_STEP_NAME = "build_rype_index"
 
-# Co-consumer step: DuckDB only feeds chunks to rype + computes the small
-# DISTINCT mapping, so its own cap stays modest; rype does the heavy build
-# in-process and gets the bulk of the cgroup via `max_memory`. The two literals
-# are the OFF-SLURM fallbacks (local backend / tests). Under SLURM the split
-# tracks the real cgroup so a `--mem-gb` override (#102) actually grows the
-# index build: DuckDB is held at `_DUCKDB_MEMORY_GB` (it never needs more) while
-# rype is handed (allocation − DuckDB − headroom), floored at the 24 GB
-# fallback. rype autoscales its work to the `max_memory` ceiling it's given, so
-# a larger allocation directly buys a bigger build for a genome-scale host
-# reference instead of OOMing against a fixed 24 GB.
+# Co-consumer step: DuckDB feeds the chunk stream to rype + computes the small
+# DISTINCT mapping, while rype does the heavy index build in-process and gets the
+# bulk of the cgroup via `max_memory`. rype stays the ELASTIC consumer (its share
+# grows with the allocation); DuckDB takes a bigger-but-BOUNDED share via a cap,
+# so a larger `--mem-gb` (#102) buys a bigger rype build, not a ballooning DuckDB.
+#
+# The three literals are the OFF-SLURM fallbacks (local backend / tests). Under
+# SLURM the split tracks the real cgroup: DuckDB = min(alloc − headroom,
+# `_DUCKDB_MEMORY_CAP_GB`), rype = (allocation − DuckDB − headroom) floored at the
+# 24 GB fallback. The DuckDB cap is NOT the 4 GB fallback: feeding a genome-scale
+# chunk scan (the full sequence bytes, streamed to rype's read) needs well more
+# than 4 GB — a human host reference (T2T-CHM13) OOMed DuckDB at ~3.7 GB under
+# the 4 GB cap while reading `rype_chunk_input`, before rype's `max_memory` was
+# ever exercised.
+# `_DUCKDB_MEMORY_CAP_GB` is a heuristic (~5× the raw single-genome chunk bytes);
+# tune it against a real genome-scale MaxRSS — the DuckDB/rype split here is the
+# one knob this step exposes.
 _DUCKDB_MEMORY_GB = 4
+# Under-SLURM ceiling for DuckDB's share (see the split note above); the 4 GB
+# fallback only applies off-SLURM.
+_DUCKDB_MEMORY_CAP_GB = 16
 _DUCKDB_THREADS = 4
 _RYPE_MAX_MEMORY_GB = 24
 
@@ -162,12 +172,14 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     duckdb_tmp = workspace / ".duckdb_tmp"
     duckdb_tmp.mkdir(parents=True, exist_ok=True)
 
-    # DuckDB share stays bounded (cap at the fallback); rype gets the rest of the
-    # cgroup. Off SLURM both fall back to their literals (4 + 24). The headroom
-    # subtracted from rype's share is the same margin DuckDB reserves under the
-    # cgroup, so the two stay in lockstep from one source.
+    # DuckDB share stays bounded (cap at `_DUCKDB_MEMORY_CAP_GB`, big enough to
+    # feed a genome-scale chunk scan — NOT the 4 GB fallback, which OOMed on
+    # T2T-CHM13); rype gets the rest of the cgroup. Off SLURM both fall back to
+    # their literals (4 + 24). The headroom subtracted from rype's share is the
+    # same margin DuckDB reserves under the cgroup, so the two stay in lockstep
+    # from one source.
     duckdb_memory_gb = resolve_duckdb_memory_gb(
-        _DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS, cap_gb=_DUCKDB_MEMORY_GB
+        _DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS, cap_gb=_DUCKDB_MEMORY_CAP_GB
     )
     alloc_gb = slurm_alloc_gb()
     rype_max_memory_gb = (
