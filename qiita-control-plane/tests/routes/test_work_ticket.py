@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import uuid
 
 import pytest
@@ -604,6 +605,100 @@ async def test_submit_happy_path(
         "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
     )
     assert state == WorkTicketState.PENDING.value
+
+
+async def test_submit_resets_failed_reference_scope_to_pending(
+    wt_client, postgres_pool, admin_token, reference_action_open, reference_idx
+):
+    """A fresh submission bound to a reference a prior ticket left at `failed`
+    resets it to `pending` before dispatch, so the run's first status PATCH
+    (`pending → hashing`) is legal instead of the illegal `failed → hashing`
+    that killed the ticket on a `reference load --reference-idx N` retry."""
+    token, _ = admin_token
+    action_id, version = reference_action_open
+    # A prior failed run leaves the reference at `failed`.
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'failed' WHERE reference_idx = $1",
+        reference_idx,
+    )
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json=_body(action_id, version, reference_idx),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
+
+    status = await postgres_pool.fetchval(
+        "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
+    )
+    assert status == "pending"
+
+
+async def test_submit_leaves_non_failed_reference_untouched(
+    wt_client, postgres_pool, admin_token, reference_action_open, reference_idx, caplog
+):
+    """The dispatch reset only fires from `failed`. A reference in any other
+    state (here `active`) is left as-is — the illegal `active → pending` is
+    swallowed and logged at WARNING, the submission still 202s, and the status
+    is unchanged."""
+    token, _ = admin_token
+    action_id, version = reference_action_open
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1",
+        reference_idx,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="qiita_control_plane.routes.work_ticket"):
+        resp = await wt_client.post(
+            URL_WORK_TICKET_PREFIX,
+            json=_body(action_id, version, reference_idx),
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
+
+    status = await postgres_pool.fetchval(
+        "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
+    )
+    assert status == "active"
+    # The swallowed IllegalStatusTransition is surfaced, not silent.
+    assert any("not 'failed'" in r.getMessage() for r in caplog.records)
+
+
+async def test_submit_rolls_back_ticket_if_scope_reset_fails(
+    wt_client, postgres_pool, admin_token, reference_action_open, reference_idx, monkeypatch
+):
+    """INSERT + the failed→pending reset are one transaction. An UNEXPECTED
+    reset failure (not the swallowed IllegalStatusTransition/ReferenceNotFound)
+    must roll the new ticket back — never leave a committed-but-undispatched
+    PENDING ticket that `_check_disallow_without_delete` would wedge."""
+    token, _ = admin_token
+    action_id, version = reference_action_open
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'failed' WHERE reference_idx = $1",
+        reference_idx,
+    )
+
+    async def _boom(*_args, **_kwargs):
+        raise RuntimeError("injected reset failure")
+
+    # Patch the symbol as imported into the route module.
+    monkeypatch.setattr("qiita_control_plane.routes.work_ticket.transition_reference_status", _boom)
+
+    with pytest.raises(RuntimeError, match="injected reset failure"):
+        await wt_client.post(
+            URL_WORK_TICKET_PREFIX,
+            json=_body(action_id, version, reference_idx),
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    # The INSERT rolled back with the failed reset — no orphan ticket left.
+    count = await postgres_pool.fetchval(
+        "SELECT count(*) FROM qiita.work_ticket WHERE reference_idx = $1", reference_idx
+    )
+    assert count == 0
 
 
 async def test_submit_resource_override_persisted(

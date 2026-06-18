@@ -579,30 +579,50 @@ async def submit_work_ticket(
     study_idx, prep_idx, reference_idx, prep_sample_idx, sequenced_pool_idx = _scope_target_columns(
         scope_target
     )
+    # INSERT and the failed→pending scope reset are ONE transaction so a fresh
+    # submit never half-applies — mirrors the `/run` redrive path's single-
+    # transaction guarantee. A reference this new ticket binds to may sit at
+    # `failed` from a prior ticket (a `reference load --reference-idx N` retry);
+    # the reference FSM's only legal exit from `failed` is `→ pending`, so
+    # without the reset the run's first status PATCH (`failed → hashing`) is
+    # illegal and the ticket dies immediately. Binding them atomically means an
+    # unexpected reset failure rolls the ticket back too — it never leaves a
+    # committed PENDING ticket undispatched, which `_check_disallow_without_delete`
+    # would then block from resubmission. The reset only touches a `failed`
+    # reference (any other state is a clean zero-row UPDATE the helper turns into
+    # a no-op or a logged warning — it never poisons this transaction).
+    # `schedule_dispatch` stays OUTSIDE: it is fire-and-forget, post-commit.
     try:
-        work_ticket_idx = await pool.fetchval(
-            "INSERT INTO qiita.work_ticket ("
-            "  action_id, action_version, originator_principal_idx,"
-            "  scope_target_kind, study_idx, prep_idx, reference_idx,"
-            "  prep_sample_idx, sequenced_pool_idx, action_context,"
-            "  resource_override"
-            ") VALUES ($1, $2, $3, $4::qiita.scope_target_kind,"
-            "          $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb)"
-            " RETURNING work_ticket_idx",
-            body.action_id,
-            body.action_version,
-            principal.principal_idx,
-            scope_target["kind"],
-            study_idx,
-            prep_idx,
-            reference_idx,
-            prep_sample_idx,
-            sequenced_pool_idx,
-            json.dumps(body.action_context),
-            json.dumps(body.resource_override.model_dump())
-            if body.resource_override is not None
-            else None,
-        )
+        async with pool.acquire() as conn, conn.transaction():
+            work_ticket_idx = await conn.fetchval(
+                "INSERT INTO qiita.work_ticket ("
+                "  action_id, action_version, originator_principal_idx,"
+                "  scope_target_kind, study_idx, prep_idx, reference_idx,"
+                "  prep_sample_idx, sequenced_pool_idx, action_context,"
+                "  resource_override"
+                ") VALUES ($1, $2, $3, $4::qiita.scope_target_kind,"
+                "          $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb)"
+                " RETURNING work_ticket_idx",
+                body.action_id,
+                body.action_version,
+                principal.principal_idx,
+                scope_target["kind"],
+                study_idx,
+                prep_idx,
+                reference_idx,
+                prep_sample_idx,
+                sequenced_pool_idx,
+                json.dumps(body.action_context),
+                json.dumps(body.resource_override.model_dump())
+                if body.resource_override is not None
+                else None,
+            )
+            await _reset_failed_reference_scope_for_dispatch(
+                conn,
+                scope_target_kind=scope_target["kind"],
+                reference_idx=reference_idx,
+                context="submit",
+            )
     except asyncpg.exceptions.UniqueViolationError as exc:
         # Unique partial index fired — a concurrent submission won the
         # race past `_check_disallow_without_delete`. Map to the same
@@ -987,45 +1007,55 @@ async def get_work_ticket_step_logs(
     )
 
 
-async def _reset_reference_scope_for_redrive(
-    conn: asyncpg.Connection, work_ticket: asyncpg.Record
+async def _reset_failed_reference_scope_for_dispatch(
+    executor: asyncpg.Pool | asyncpg.Connection,
+    *,
+    scope_target_kind: str,
+    reference_idx: int | None,
+    context: str,
 ) -> None:
-    """On a FAILED→PENDING redrive, reset a `reference` scope_target back to
-    `pending`.
+    """Reset a `failed` `reference` scope_target back to `pending` when
+    (re)dispatching a workflow against it, so the run's first status PATCH
+    can proceed.
 
     A failed reference workflow leaves its reference at `failed` (the
     failure_status PATCH put it there), and the reference FSM's only legal
-    exit from `failed` is `→ pending`. Without this reset the redriven
+    exit from `failed` is `→ pending`. Without this reset the (re)dispatched
     workflow's first status PATCH (`pending → hashing`, attempted as
-    `failed → hashing`) is illegal and the redrive dies immediately.
+    `failed → hashing`) is illegal and the run dies immediately. BOTH
+    dispatch paths need it: a `/run` redrive of the SAME failed ticket, and a
+    fresh `POST /work-ticket` bound to an existing reference that a prior
+    ticket left at `failed` (the `reference load --reference-idx N` retry).
 
     Only references at `failed` are touched: `transition_reference_status`
     is the single source of truth for the matrix, and `→ pending` is legal
     *only* from `failed`. A reference in any other state raises
     IllegalStatusTransition, which we swallow rather than abort the
-    operator's redrive — but the two non-`failed` cases differ sharply:
+    operator's (re)dispatch — but the two non-`failed` cases differ sharply:
       * already `pending` (e.g. the workflow died before any status PATCH):
-        benign — the redrive's first PATCH (`pending → hashing`) is legal
+        benign — the run's first PATCH (`pending → hashing`) is legal
         and the run proceeds normally.
       * an in-progress state (`hashing`/`minting`/`loading`/`indexing`) or
-        `active`: the FSM can't rewind it, so the redrive will fail cleanly
+        `active`: the FSM can't rewind it, so the run will fail cleanly
         later in the runner. We log it at WARNING with the actual state so
         that not-yet-supported multi-step case is visible, not silent.
     Non-reference scopes carry no status and are skipped.
+
+    `context` is a short label woven into the log lines ("redrive" / "submit").
     """
-    if work_ticket["scope_target_kind"] != ScopeTargetKind.REFERENCE.value:
+    if scope_target_kind != ScopeTargetKind.REFERENCE.value:
         return
-    reference_idx = work_ticket["reference_idx"]
     if reference_idx is None:
         return
     try:
-        await transition_reference_status(conn, reference_idx, ReferenceStatus.PENDING)
+        await transition_reference_status(executor, reference_idx, ReferenceStatus.PENDING)
     except IllegalStatusTransition as exc:
         _log.warning(
-            "redrive of work_ticket on reference %d: reference is %r, not 'failed' —"
-            " not resetting; redrive proceeds and re-walks from there"
-            " (a non-'pending' state means the FSM can't rewind and the redrive"
+            "%s of work_ticket on reference %d: reference is %r, not 'failed' —"
+            " not resetting; the run proceeds and re-walks from there"
+            " (a non-'pending' state means the FSM can't rewind and the run"
             " will fail cleanly downstream)",
+            context,
             reference_idx,
             exc.current,
         )
@@ -1034,8 +1064,9 @@ async def _reset_reference_scope_for_redrive(
         # guarantees exists — hitting this means the row is gone out from
         # under a live ticket, i.e. DB corruption, not a recoverable edge.
         _log.error(
-            "redrive references missing reference %d; skipping scope-target reset"
+            "%s references missing reference %d; skipping scope-target reset"
             " (referential integrity violation — investigate)",
+            context,
             reference_idx,
         )
 
@@ -1144,7 +1175,12 @@ async def run_work_ticket(
                 StepProgressState.COMPLETED.value,
             )
 
-            await _reset_reference_scope_for_redrive(conn, row)
+            await _reset_failed_reference_scope_for_dispatch(
+                conn,
+                scope_target_kind=row["scope_target_kind"],
+                reference_idx=row["reference_idx"],
+                context="redrive",
+            )
 
         _log.info(
             "manual restart of work_ticket %d (FAILED → PENDING; retry_count reset)",

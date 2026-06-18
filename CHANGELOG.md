@@ -283,6 +283,15 @@ the `no-changelog` label).
 
 ### Fixed
 
+- Retrying a `failed` reference load no longer dies instantly. A fresh
+  `POST /work-ticket` bound to an existing reference (the `qiita reference load
+  --reference-idx N` retry) now resets a `failed` reference back to `pending`
+  before dispatch — mirroring the `/run` redrive path — so the run's first
+  status PATCH is the legal `pending → hashing` instead of the illegal
+  `failed → hashing` that killed the ticket at the first step. Only a `failed`
+  reference is touched (any other state is a no-op, an unrewindable in-progress
+  state is logged at WARNING); the shared reset helper is reused by both the
+  submit and redrive paths (#112)
 - `build_rype_index` no longer OOMs DuckDB on a genome-scale host reference.
   The step split the SLURM cgroup DuckDB(4 GB, capped) / rype(elastic) on the
   assumption DuckDB "never needs more" than the 4 GB off-SLURM fallback — but
