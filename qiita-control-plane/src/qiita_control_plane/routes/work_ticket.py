@@ -579,30 +579,50 @@ async def submit_work_ticket(
     study_idx, prep_idx, reference_idx, prep_sample_idx, sequenced_pool_idx = _scope_target_columns(
         scope_target
     )
+    # INSERT and the failed→pending scope reset are ONE transaction so a fresh
+    # submit never half-applies — mirrors the `/run` redrive path's single-
+    # transaction guarantee. A reference this new ticket binds to may sit at
+    # `failed` from a prior ticket (a `reference load --reference-idx N` retry);
+    # the reference FSM's only legal exit from `failed` is `→ pending`, so
+    # without the reset the run's first status PATCH (`failed → hashing`) is
+    # illegal and the ticket dies immediately. Binding them atomically means an
+    # unexpected reset failure rolls the ticket back too — it never leaves a
+    # committed PENDING ticket undispatched, which `_check_disallow_without_delete`
+    # would then block from resubmission. The reset only touches a `failed`
+    # reference (any other state is a clean zero-row UPDATE the helper turns into
+    # a no-op or a logged warning — it never poisons this transaction).
+    # `schedule_dispatch` stays OUTSIDE: it is fire-and-forget, post-commit.
     try:
-        work_ticket_idx = await pool.fetchval(
-            "INSERT INTO qiita.work_ticket ("
-            "  action_id, action_version, originator_principal_idx,"
-            "  scope_target_kind, study_idx, prep_idx, reference_idx,"
-            "  prep_sample_idx, sequenced_pool_idx, action_context,"
-            "  resource_override"
-            ") VALUES ($1, $2, $3, $4::qiita.scope_target_kind,"
-            "          $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb)"
-            " RETURNING work_ticket_idx",
-            body.action_id,
-            body.action_version,
-            principal.principal_idx,
-            scope_target["kind"],
-            study_idx,
-            prep_idx,
-            reference_idx,
-            prep_sample_idx,
-            sequenced_pool_idx,
-            json.dumps(body.action_context),
-            json.dumps(body.resource_override.model_dump())
-            if body.resource_override is not None
-            else None,
-        )
+        async with pool.acquire() as conn, conn.transaction():
+            work_ticket_idx = await conn.fetchval(
+                "INSERT INTO qiita.work_ticket ("
+                "  action_id, action_version, originator_principal_idx,"
+                "  scope_target_kind, study_idx, prep_idx, reference_idx,"
+                "  prep_sample_idx, sequenced_pool_idx, action_context,"
+                "  resource_override"
+                ") VALUES ($1, $2, $3, $4::qiita.scope_target_kind,"
+                "          $5, $6, $7, $8, $9, $10::jsonb, $11::jsonb)"
+                " RETURNING work_ticket_idx",
+                body.action_id,
+                body.action_version,
+                principal.principal_idx,
+                scope_target["kind"],
+                study_idx,
+                prep_idx,
+                reference_idx,
+                prep_sample_idx,
+                sequenced_pool_idx,
+                json.dumps(body.action_context),
+                json.dumps(body.resource_override.model_dump())
+                if body.resource_override is not None
+                else None,
+            )
+            await _reset_failed_reference_scope_for_dispatch(
+                conn,
+                scope_target_kind=scope_target["kind"],
+                reference_idx=reference_idx,
+                context="submit",
+            )
     except asyncpg.exceptions.UniqueViolationError as exc:
         # Unique partial index fired — a concurrent submission won the
         # race past `_check_disallow_without_delete`. Map to the same
@@ -618,20 +638,6 @@ async def submit_work_ticket(
                 },
             ) from exc
         raise
-
-    # A reference this new ticket binds to may sit at `failed` from a prior
-    # ticket (a `reference load --reference-idx N` retry). The reference FSM's
-    # only legal exit from `failed` is `→ pending`, so without this the run's
-    # first status PATCH (`failed → hashing`) is illegal and the ticket dies
-    # immediately — mirror the `/run` redrive path's reset. Runs before
-    # dispatch; only touches a `failed` reference (any other state is a no-op
-    # or a logged warning).
-    await _reset_failed_reference_scope_for_dispatch(
-        pool,
-        scope_target_kind=scope_target["kind"],
-        reference_idx=reference_idx,
-        context="submit",
-    )
 
     # Fire-and-forget dispatch in the background. The route returns 202
     # immediately; the workflow runs in-process via asyncio.
