@@ -218,7 +218,7 @@ elif native_checkout=$(qiita_native_checkout_from_python "$nativepy"); then
         # Run as the checkout OWNER ($QIITA_USER), never root: a root-owned .venv the
         # operator can't clean is the #80 footgun. uv by absolute path ($UV) —
         # bare `uv` under `bash -lc` is not reliably on PATH (see $UV above).
-        confirm "Refresh the SLURM native venv ('uv sync --reinstall-package qiita-common' in $native_checkout, as $QIITA_USER)?"
+        confirm "Refresh the SLURM native venv ('$UV sync --reinstall-package qiita-common' in $native_checkout, as $QIITA_USER)?"
         sudo -u "$QIITA_USER" bash -lc "cd '$native_checkout' && '$UV' sync --reinstall-package qiita-common"
         # Fail loud if the just-synced venv can't import what native jobs import — a
         # broken refresh must abort here, not surface as a stale job at the next
