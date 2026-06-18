@@ -171,6 +171,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_SEQUENCED_SAMPLE_LIST_BY_RUN",
     ),
     (
+        "URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL",
+        "PATH_SEQUENCING_RUN_PREFIX",
+        "PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL",
+    ),
+    (
         "URL_SEQUENCED_SAMPLE_LIST_BY_STUDY",
         "PATH_STUDY_PREFIX",
         "PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY",
@@ -184,6 +189,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "URL_SEQUENCED_SAMPLE_BY_IDX",
         "PATH_SEQUENCED_SAMPLE_PREFIX",
         "PATH_SEQUENCED_SAMPLE_BY_IDX",
+    ),
+    # /prep-sample
+    (
+        "URL_PREP_SAMPLE_STUDY_LIST",
+        "PATH_PREP_SAMPLE_PREFIX",
+        "PATH_PREP_SAMPLE_STUDY_LIST",
     ),
 ]
 

@@ -408,17 +408,18 @@ async def fetch_sequenced_pool_samples(
     limit: int,
 ) -> list[asyncpg.Record]:
     """Return up to `limit` active sequenced_samples in one pool, each with
-    its supertype prep_sample_idx and sequenced_pool_item_id.
+    the SequencedSampleListItem column set (prep_sample_idx, biosample_idx,
+    sequenced_pool_item_id, and the ENA experiment/run + biosample/ena-sample
+    accessions).
 
     Pool-scoped sibling of fetch_sequenced_sample_idxs_for_run: that one
     spans every pool in a run and returns bare idxs; this one is scoped to a
-    single sequenced_pool and returns the
-    (idx, prep_sample_idx, sequenced_pool_item_id) triple a per-sample
-    fan-out needs (e.g. submit-host-filter-pool). Excludes sequenced_samples
-    whose supertype prep_sample row is retired. Sort by
-    sequenced_pool_item_id so the fan-out order is stable across calls.
-    Callers that need to detect truncation pass `limit = cap + 1`; if the
-    returned list has length > cap, the underlying set exceeded the cap.
+    single sequenced_pool and returns the richer per-sample rows a fan-out
+    needs (e.g. submit-host-filter-pool). Excludes sequenced_samples whose
+    supertype prep_sample row is retired. Sort by sequenced_pool_item_id so
+    the fan-out order is stable across calls. Callers that need to detect
+    truncation pass `limit = cap + 1`; if the returned list has length > cap,
+    the underlying set exceeded the cap.
     """
     # Single round trip; the partial index prep_sample_active_idx covers the
     # retired = false predicate and the join filters down to one pool.
@@ -426,14 +427,58 @@ async def fetch_sequenced_pool_samples(
         # Alias ss.idx so a row maps straight onto SequencedSampleListItem via
         # model_validate(dict(row)) — the route does no field renaming.
         "SELECT ss.idx AS sequenced_sample_idx, ss.prep_sample_idx,"
-        " ss.sequenced_pool_item_id"
+        " ps.biosample_idx, ss.sequenced_pool_item_id,"
+        " ss.ena_experiment_accession, ss.ena_run_accession,"
+        " bs.biosample_accession, bs.ena_sample_accession"
         " FROM qiita.sequenced_sample ss"
         " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        " JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
         " WHERE ss.sequenced_pool_idx = $1"
         "   AND ps.retired = false"
         " ORDER BY ss.sequenced_pool_item_id"
         " LIMIT $2",
         sequenced_pool_idx,
+        limit,
+    )
+    return list(rows)
+
+
+# same-pattern-ok: run-scoped sibling of fetch_sequenced_pool_samples; different
+# join/scope, kept as a separate function rather than parameterized by scope
+async def fetch_sequenced_samples_for_run(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    sequencing_run_idx: int,
+    limit: int,
+) -> list[asyncpg.Record]:
+    """Return up to `limit` active sequenced_samples across every pool in one
+    run, each with the SequencedSampleListItem column set (prep_sample_idx,
+    biosample_idx, sequenced_pool_item_id, and the ENA experiment/run +
+    biosample/ena-sample accessions).
+
+    Run-scoped sibling of fetch_sequenced_pool_samples (pool-scoped): walks
+    run -> sequenced_pool -> sequenced_sample -> prep_sample -> biosample and
+    excludes sequenced_samples whose supertype prep_sample row is retired.
+    Ordered by sequenced_sample idx for a stable order. Callers that need to
+    detect truncation pass `limit = cap + 1`; a returned length > cap means
+    the underlying set exceeded the cap.
+    """
+    rows = await pool_or_conn.fetch(
+        # Alias ss.idx so a row maps straight onto SequencedSampleListItem via
+        # model_validate(dict(row)) — the route does no field renaming.
+        "SELECT ss.idx AS sequenced_sample_idx, ss.prep_sample_idx,"
+        " ps.biosample_idx, ss.sequenced_pool_item_id,"
+        " ss.ena_experiment_accession, ss.ena_run_accession,"
+        " bs.biosample_accession, bs.ena_sample_accession"
+        " FROM qiita.sequenced_sample ss"
+        " JOIN qiita.sequenced_pool sp ON sp.idx = ss.sequenced_pool_idx"
+        " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        " JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
+        " WHERE sp.sequencing_run_idx = $1"
+        "   AND ps.retired = false"
+        " ORDER BY ss.idx"
+        " LIMIT $2",
+        sequencing_run_idx,
         limit,
     )
     return list(rows)

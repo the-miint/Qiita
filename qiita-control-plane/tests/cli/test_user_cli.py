@@ -17,8 +17,10 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_BY_IDX,
     URL_BIOSAMPLE_BY_STUDY,
     URL_BIOSAMPLE_LIST_BY_STUDY,
+    URL_PREP_SAMPLE_STUDY_LIST,
     URL_SEQUENCED_SAMPLE_BY_IDX,
     URL_SEQUENCED_SAMPLE_FROM_RUN,
+    URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL,
     URL_SEQUENCING_RUN_BY_IDX,
     URL_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID,
     URL_SEQUENCING_RUN_PREFIX,
@@ -1003,6 +1005,108 @@ def test_sequencing_run_lookup_requires_at_least_one_id(capsys):
         main(["sequencing-run", "lookup"])
     assert exc_info.value.code == 2
     assert "--instrument-run-id" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# prep-sample list-studies
+# ---------------------------------------------------------------------------
+
+
+def test_prep_sample_list_studies_issues_get_against_the_idx(monkeypatch):
+    """`prep-sample list-studies --prep-sample-idx N` GETs the study-list path
+    and issues no body."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={
+            "studies": [],
+            "count": 0,
+            "truncated": False,
+            "caller_system_role": "wet_lab_admin",
+        },
+        status=200,
+    )
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "prep-sample",
+            "list-studies",
+            "--prep-sample-idx",
+            "9",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "GET"
+    assert captured["url"] == (
+        f"https://q.example.test{URL_PREP_SAMPLE_STUDY_LIST.format(prep_sample_idx=9)}"
+    )
+    assert captured["json"] is None
+
+
+def test_prep_sample_list_studies_requires_idx(capsys):
+    """Omitting --prep-sample-idx exits 2 via argparse."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["prep-sample", "list-studies"])
+    assert exc_info.value.code == 2
+    assert "--prep-sample-idx" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# sequenced-sample list
+# ---------------------------------------------------------------------------
+
+
+def test_sequenced_sample_list_issues_get_against_the_run(monkeypatch):
+    """`sequenced-sample list --sequencing-run-idx N` GETs the run-scoped
+    full-list path and issues no body; it prints the envelope verbatim."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={
+            "samples": [],
+            "count": 0,
+            "truncated": False,
+            "caller_system_role": "wet_lab_admin",
+        },
+        status=200,
+    )
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "sequenced-sample",
+            "list",
+            "--sequencing-run-idx",
+            "7",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "GET"
+    assert captured["url"] == (
+        f"https://q.example.test{URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL.format(sequencing_run_idx=7)}"
+    )
+    assert captured["json"] is None
+
+
+def test_sequenced_sample_list_requires_run_idx(capsys):
+    """Omitting --sequencing-run-idx exits 2 via argparse."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["sequenced-sample", "list"])
+    assert exc_info.value.code == 2
+    assert "--sequencing-run-idx" in capsys.readouterr().err
 
 
 def test_sequencing_run_create_rejects_non_object_extra_metadata(capsys):

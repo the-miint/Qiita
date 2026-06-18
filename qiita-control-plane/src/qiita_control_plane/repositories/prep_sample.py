@@ -1,6 +1,7 @@
-"""Single-table writer for the qiita.prep_sample supertype.
+"""Single-table reads and writer for the qiita.prep_sample supertype.
 
-Covers the supertype row insert. The per-study link table
+Covers the supertype row insert plus the prep_sample reads. The per-study
+link table
 (qiita.prep_sample_to_study) is written through the shared
 insert_entity_to_study / link_entity_to_studies helpers in
 _sample_helpers, driven by PREP_SAMPLE_METADATA_SPEC. The
@@ -22,15 +23,60 @@ async def fetch_active_study_idxs_for_prep_sample(
     prep_sample_idx: int,
 ) -> list[int]:
     """Return non-retired qiita.prep_sample_to_study study_idxs for this
-    prep_sample. Empty list when every link is retired or the sample is
-    orphaned. Used by the work_ticket submission gate to enforce
-    per-study admin access on prep_sample-scoped tickets."""
+    prep_sample. Empty list when every link is retired or the prep_sample is
+    orphaned. The bare membership set is uncapped because the per-study
+    admin-access gate must see every linked study to be correct."""
     rows = await pool_or_conn.fetch(
         "SELECT study_idx FROM qiita.prep_sample_to_study"
         " WHERE prep_sample_idx = $1 AND retired = false",
         prep_sample_idx,
     )
     return [r["study_idx"] for r in rows]
+
+
+async def fetch_active_studies_for_prep_sample(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    prep_sample_idx: int,
+    *,
+    limit: int,
+) -> list[asyncpg.Record]:
+    """Return up to `limit` non-retired studies this prep_sample is linked to,
+    each with study_idx + both study accessions, ordered by study_idx.
+
+    The richer sibling of fetch_active_study_idxs_for_prep_sample, which
+    returns the bare idx membership set; this joins qiita.study for the
+    accession columns. Excludes retired prep_sample_to_study links. Callers
+    that need to detect truncation pass `limit = cap + 1`; a returned length >
+    cap means the underlying set exceeded the cap.
+    """
+    rows = await pool_or_conn.fetch(
+        "SELECT s.idx AS study_idx, s.bioproject_accession, s.ena_study_accession"
+        " FROM qiita.prep_sample_to_study pts"
+        " JOIN qiita.study s ON s.idx = pts.study_idx"
+        " WHERE pts.prep_sample_idx = $1 AND pts.retired = false"
+        " ORDER BY s.idx"
+        " LIMIT $2",
+        prep_sample_idx,
+        limit,
+    )
+    return list(rows)
+
+
+# same-pattern-ok: per-entity existence reader, mirrors fetch_sequencing_run_exists
+async def fetch_prep_sample_exists(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    prep_sample_idx: int,
+) -> bool:
+    """Return True iff a qiita.prep_sample row exists at this idx.
+
+    Existence-only check, separate from the full-row reads, for a cheap
+    pre-flight. No retirement filter — a retired prep_sample still returns
+    True.
+    """
+    return await pool_or_conn.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM qiita.prep_sample WHERE idx = $1)",
+        prep_sample_idx,
+    )
 
 
 async def insert_prep_sample(

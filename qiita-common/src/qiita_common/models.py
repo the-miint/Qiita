@@ -1004,22 +1004,31 @@ class IdxsListResponse(BaseModel):
 
 
 class SequencedSampleListItem(BaseModel):
-    """One active sequenced_sample in a pool-scoped sample list.
+    """One active sequenced_sample in a pool- or run-scoped sample list.
 
-    Carries the subtype idx, its supertype prep_sample_idx, and the
-    sequenced_pool_item_id (which equals the bcl-convert per-sample FASTQ
-    basename prefix). Lets a caller fan out per-sample work without an N+1
-    of per-idx GETs.
+    Carries the subtype idx, its supertype prep_sample_idx and biosample_idx,
+    the sequenced_pool_item_id (which equals the bcl-convert per-sample FASTQ
+    basename prefix), and the ENA experiment/run plus biosample/ena-sample
+    accessions. Lets a caller fan out per-sample work — including ENA
+    experiment submission, which needs the biosample's BioSample accession as
+    the experiment sample_descriptor — without an N+1 of per-idx GETs. The
+    four accession columns are nullable until their submissions succeed.
     """
 
     sequenced_sample_idx: int
     prep_sample_idx: int
+    biosample_idx: int
     sequenced_pool_item_id: str
+    ena_experiment_accession: str | None
+    ena_run_accession: str | None
+    biosample_accession: str | None
+    ena_sample_accession: str | None
 
 
 class SequencedSampleListResponse(BaseModel):
-    """Returned by the pool-scoped sequenced-sample list (GET
-    /sequencing-run/{run}/sequenced-pool/{pool}/sequenced-sample/list).
+    """Returned by the pool- and run-scoped sequenced-sample list routes
+    (GET /sequencing-run/{run}/sequenced-pool/{pool}/sequenced-sample/list
+    and GET /sequencing-run/{run}/sequenced-sample/list).
 
     Unlike IdxsListResponse this carries richer per-sample rows
     (prep_sample_idx + sequenced_pool_item_id), so the segment is `list`
@@ -1028,6 +1037,36 @@ class SequencedSampleListResponse(BaseModel):
     """
 
     samples: list[SequencedSampleListItem]
+    count: Annotated[int, Field(ge=0)]
+    truncated: bool
+    caller_system_role: SystemRole
+
+
+class StudyListItem(BaseModel):
+    """One study a prep_sample is actively linked to, with its accessions.
+
+    Carries the study_idx plus both study accessions so an ENA-submission
+    caller can read a prep_sample's studies — and the BioProject accession
+    that becomes the experiment study_ref — without a per-study GET. Both
+    accession columns are nullable until their submissions succeed.
+    """
+
+    study_idx: int
+    bioproject_accession: str | None
+    ena_study_accession: str | None
+
+
+class StudyListResponse(BaseModel):
+    """Returned by the prep-sample study list (GET
+    /prep-sample/{prep_sample_idx}/study/list).
+
+    Carries richer per-study rows (study_idx + both accessions), so the
+    segment is `list` rather than `list-idxs`. `truncated` mirrors
+    IdxsListResponse semantics: true when the underlying set exceeded the
+    route's hard cap.
+    """
+
+    studies: list[StudyListItem]
     count: Annotated[int, Field(ge=0)]
     truncated: bool
     caller_system_role: SystemRole

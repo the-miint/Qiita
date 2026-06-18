@@ -42,6 +42,8 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_LIST_BY_STUDY,
     PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     PATH_BIOSAMPLE_PREFIX,
+    PATH_PREP_SAMPLE_PREFIX,
+    PATH_PREP_SAMPLE_STUDY_LIST,
     PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_INDEX,
     PATH_REFERENCE_PREFIX,
@@ -49,6 +51,7 @@ from qiita_common.api_paths import (
     PATH_SEQUENCED_SAMPLE_BY_IDX,
     PATH_SEQUENCED_SAMPLE_FROM_RUN,
     PATH_SEQUENCED_SAMPLE_LIST_BY_POOL,
+    PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL,
     PATH_SEQUENCED_SAMPLE_PREFIX,
     PATH_SEQUENCING_RUN_BY_IDX,
     PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID,
@@ -651,6 +654,36 @@ def _build_parser() -> argparse.ArgumentParser:
         patch_path=f"{PATH_SEQUENCED_SAMPLE_PREFIX}{PATH_SEQUENCED_SAMPLE_BY_IDX}",
         patch_idx_arg="sequenced_sample_idx",
         patch_json_fields=(),
+    )
+
+    p_seqsample_list = p_seqsample_sub.add_parser(
+        "list",
+        help=(
+            "List a run's sequenced-samples with their biosample linkage and"
+            " ENA/biosample accessions (GET /sequencing-run/{R}/sequenced-sample/list)"
+        ),
+    )
+    p_seqsample_list.add_argument("--sequencing-run-idx", type=int, required=True)
+    p_seqsample_list.set_defaults(
+        handler=_handle_read,
+        read_path=f"{PATH_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL}",
+        read_idx_arg="sequencing_run_idx",
+    )
+
+    p_prepsample = sub.add_parser("prep-sample", help="Prep-sample operations")
+    p_prepsample_sub = p_prepsample.add_subparsers(dest="prep_sample_cmd", required=True)
+    p_prepsample_list_studies = p_prepsample_sub.add_parser(
+        "list-studies",
+        help=(
+            "List the studies a prep-sample is linked to, with their accessions"
+            " (GET /prep-sample/{idx}/study/list)"
+        ),
+    )
+    p_prepsample_list_studies.add_argument("--prep-sample-idx", type=int, required=True)
+    p_prepsample_list_studies.set_defaults(
+        handler=_handle_read,
+        read_path=f"{PATH_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}",
+        read_idx_arg="prep_sample_idx",
     )
 
     p_ticket = sub.add_parser("ticket", help="Work-ticket operations")

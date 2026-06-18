@@ -199,6 +199,23 @@ async def _grant_study_access(ctx, *, study_idx, principal_idx, tier, granted_by
     ctx["created"]["study_access"].append((study_idx, principal_idx))
 
 
+async def _seed_study(ctx, *, owner_idx: int, suffix: str) -> int:
+    """Insert a minimal study owned by `owner_idx`, append its idx to
+    `ctx['created']['study']` for FK-reverse teardown, and return the idx.
+
+    The title is uniquified with `suffix` plus a random token so concurrent
+    tests never collide.
+    """
+    study_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
+        " VALUES ($1, $2, $1) RETURNING idx",
+        owner_idx,
+        f"route-study-{suffix}-{secrets.token_hex(4)}",
+    )
+    ctx["created"]["study"].append(study_idx)
+    return study_idx
+
+
 # ---------------------------------------------------------------------------
 # Generic FK-reverse delete helper
 # ---------------------------------------------------------------------------
