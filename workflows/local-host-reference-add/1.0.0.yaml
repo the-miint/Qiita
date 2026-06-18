@@ -5,15 +5,24 @@ target_kind: reference
 description: >
   Local-ingest variant of host-reference-add. Stages MANY host-resident FASTA
   files (a manifest of absolute paths) into one chunked Parquet, then runs the
-  host pipeline unchanged: hash + mint + load (taxonomy required), build the two
+  host pipeline unchanged: hash + mint + load (taxonomy required), build the
   host-filter indexes (a rype `.ryxdi` and a minimap2 `.mmi`, both over every
-  feature), and record both in
+  feature), and record them in
   qiita.reference_index. They are consumed at host-read-filtering time by the
   host_filter step: rype classify (host = any match), then minimap2 on the
   survivors; reads matching either are removed. Differs from local-reference-add
   only by requiring taxonomy and by the build-index → register-index tail; the
   lifecycle gains `loading → indexing → active`. Companions are raw absolute
   paths on the compute host, not DoPut uploads.
+
+  Index selection is per-submission (same as host-reference-add): both indexes
+  build by default; `build_rype: false` / `build_minimap2: false` in
+  action_context skip a builder (and its register-index) for a rype-only or
+  minimap2-only reference, and the `not` backstop rejects building neither.
+  `rype_w` tunes the rype window `w` (default 20) and `minimap2_preset` the
+  minimap2 preset (default `sr`). Selection is INITIAL-BUILD-TIME only — the
+  status FSM is terminal at `active`, so adding a second index type to an
+  already-active reference is not supported (delete and recreate instead).
 
 scopes:
   - reference:write
@@ -36,6 +45,25 @@ context_schema:
     tree_path: {type: string, pattern: "^/"}
     jplace_path: {type: string, pattern: "^/"}
     genome_map_path: {type: string, pattern: "^/"}
+    # Index selection (default-ON via the steps' `when:`; omitting a key builds
+    # that index). The runner reads these to gate build_rype_index /
+    # build_minimap2_index and their register-index siblings.
+    build_rype: {type: boolean}
+    build_minimap2: {type: boolean}
+    # Build params surfaced to the index builders via the steps' `params:`
+    # (rype_w -> build_rype_index.w, minimap2_preset -> build_minimap2_index.preset).
+    rype_w: {type: integer, minimum: 1}
+    minimap2_preset:
+      type: string
+      enum: [sr, map-ont, map-pb, map-hifi, asm5, asm10, asm20]
+  # A host reference must carry at least one index — reject building neither.
+  # Fires only when BOTH keys are present and explicitly false (an omitted key
+  # defaults ON via the `when:` gate, so the common path is unaffected).
+  not:
+    required: [build_rype, build_minimap2]
+    properties:
+      build_rype: {const: false}
+      build_minimap2: {const: false}
 
 success_status: active
 failure_status: failed
@@ -108,6 +136,12 @@ steps:
     module: qiita_compute_orchestrator.jobs.build_rype_index
     target_status: indexing
     inputs: [reference_sequence_chunks]
+    # `rype_w` (action_context) -> build_rype_index.Inputs.w (the rype window).
+    params: {rype_w: w}
+    # Skipped when action_context sets build_rype: false (rype-only references
+    # omit it; minimap2-only references set it false). Its register-index
+    # sibling carries the same gate.
+    when: build_rype
     outputs: [rype_index_meta]
     baseline_resources:
       cpu: 4
@@ -119,12 +153,22 @@ steps:
   # SAME feature-keyed `reference_sequence_chunks` as build_rype_index
   # (reassembling whole contigs via string_agg) — no special raw-FASTA subset —
   # so it shares the register-files ordering dependency: it MUST also precede
-  # register-files (which MOVES those chunks). No target_status: the reference
-  # is already `indexing` from build_rype_index above.
+  # register-files (which MOVES those chunks). Carries `target_status: indexing`
+  # too (NOT only build_rype_index): build_rype_index may be skipped
+  # (build_rype: false, a minimap2-only reference), so this step must be able to
+  # make the `loading → indexing` transition itself. When both build, the second
+  # PATCH is an idempotent no-op (runner only PATCHes when the status differs).
   - step: build_minimap2_index
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.build_minimap2_index
+    target_status: indexing
     inputs: [reference_sequence_chunks]
+    # `minimap2_preset` (action_context) -> build_minimap2_index.Inputs.preset.
+    params: {minimap2_preset: preset}
+    # Skipped when action_context sets build_minimap2: false (minimap2-only
+    # references omit it; rype-only references set it false). Its register-index
+    # sibling carries the same gate.
+    when: build_minimap2
     # Same as build_rype_index: the persistent .mmi lives under PATH_DERIVED, so
     # the only output is the in-tree meta JSON (fs_path points at the .mmi).
     outputs: [minimap2_index_meta]
@@ -140,13 +184,17 @@ steps:
   # One register-index per builder. The runner's register-index arm reads
   # bound[entry.inputs[0]] (native-step outputs are path strings, so the build
   # params ride a meta JSON file), so each step's `inputs` selects which index
-  # it records in qiita.reference_index.
+  # it records in qiita.reference_index. Each carries the SAME `when:` as its
+  # builder so a skipped index also skips its registration (and never reads a
+  # never-produced *_index_meta binding).
   - action: register-index
     inputs: [rype_index_meta]
+    when: build_rype
     outputs: []
 
   - action: register-index
     inputs: [minimap2_index_meta]
+    when: build_minimap2
     outputs: []
 
 action_ceiling:

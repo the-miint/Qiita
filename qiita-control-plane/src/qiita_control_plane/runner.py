@@ -321,6 +321,25 @@ async def run_workflow(
         bound.update(await _resolve_host_filter_indexes(pool, action_context=bound))
 
         for index, entry in enumerate(action.steps):
+            # Conditional gate (WorkflowStep/WorkflowAction.when): skip this
+            # entry when its named action_context key is present and falsy
+            # (default-ON — an absent key runs). Evaluated FIRST, before the
+            # fast-forward / target_status PATCH / dispatch, so a gated-off
+            # entry neither advances status nor binds outputs. `bound` is
+            # seeded from the persisted action_context, so the decision is
+            # deterministic and resume-safe; skipping via `continue` (never by
+            # filtering action.steps) keeps the integer step_index that
+            # `_completed_progress_row` matches on stable across a resume.
+            if entry.when is not None and not bool(bound.get(entry.when, True)):
+                _log.info(
+                    "workflow %d: skipping entry %d (%s) — when=%r is falsy",
+                    work_ticket_idx,
+                    index,
+                    entry.name,
+                    entry.when,
+                )
+                continue
+
             completed = _completed_progress_row(progress, index)
 
             if completed is not None:
@@ -1026,6 +1045,15 @@ async def _consume_upload_handles(
 # =============================================================================
 
 
+class ReferenceIndexNotBuilt(ValueError):
+    """The reference is ACTIVE but carries no index of the requested type.
+
+    A `ValueError` subclass so existing callers / tests that catch `ValueError`
+    still match, while `_resolve_host_filter_indexes` can catch THIS narrowly to
+    treat a missing index type as "skip that host-filter stage" — distinct from a
+    non-active reference (a plain `ValueError`), which stays a hard error."""
+
+
 async def _resolve_reference_index_path(
     pool: asyncpg.Pool | asyncpg.Connection,
     reference_idx: int,
@@ -1045,12 +1073,11 @@ async def _resolve_reference_index_path(
       * ReferenceNotFound — the reference row doesn't exist.
       * ValueError — the reference exists but isn't `active` (an index built
         against a still-`indexing`/failed reference must not be served; the
-        build may be mid-flight), or no `index_type` index exists yet.
-
-    Not yet wired into a workflow: the host-filter *processing* workflow that
-    consumes it is out of scope. Defined here, alongside the runner's other
-    resolution helpers, so its contract is locked and tested ahead of that
-    work."""
+        build may be mid-flight).
+      * ReferenceIndexNotBuilt (a ValueError subclass) — the reference is active
+        but no `index_type` index exists yet. Narrower than the not-active case
+        so `_resolve_host_filter_indexes` can treat a single missing index type
+        as "skip that stage" while still hard-failing a non-active reference."""
     status = await pool.fetchval(
         "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
     )
@@ -1070,7 +1097,9 @@ async def _resolve_reference_index_path(
         index_type,
     )
     if fs_path is None:
-        raise ValueError(f"reference {reference_idx} has no {index_type!r} index built yet")
+        raise ReferenceIndexNotBuilt(
+            f"reference {reference_idx} has no {index_type!r} index built yet"
+        )
     return fs_path
 
 
@@ -1082,14 +1111,17 @@ async def _resolve_host_filter_indexes(
     """Resolve the host-filter index paths when host filtering is enabled, else {}.
 
     Gated by `host_filter_enabled` (bool) in `action_context`. When enabled,
-    `host_reference_idx` (positive int) must name an ACTIVE reference carrying
-    BOTH a `rype` and a `minimap2` index; their newest-generation paths are bound
-    as `host_rype_path` / `host_minimap2_path` — the `host_filter` step's optional
-    inputs. When disabled (flag false/absent) nothing is resolved and the step
-    runs as a pass-through (its index Inputs default to None).
+    `host_reference_idx` (positive int) must name an ACTIVE reference carrying at
+    least ONE of a `rype` (.ryxdi) or `minimap2` (.mmi) index; the newest
+    generation of whichever exist is bound as `host_rype_path` /
+    `host_minimap2_path` — the `host_filter` step's optional inputs. A
+    single-index host reference (built `--no-rype-index` / `--no-minimap2-index`)
+    binds only that one; the step skips the stage whose path is None. When
+    disabled (flag false/absent) nothing is resolved and the step runs as a
+    pass-through (its index Inputs default to None).
 
     Mirrors `_resolve_upload_handles`: any failure (host_reference_idx absent or
-    non-positive, reference unknown / non-active / missing an index type) raises a
+    non-positive, reference unknown / non-active, or NEITHER index built) raises a
     typed `BackendFailure(BAD_INPUT)` at stage=SUBMISSION, which the outer handler
     in `run_workflow` turns into a FAILED work_ticket. `host_reference_idx`
     deliberately does NOT end in `_upload_idx`, so `_resolve_upload_handles` leaves
@@ -1104,22 +1136,38 @@ async def _resolve_host_filter_indexes(
             "host_filter_enabled requires a positive integer host_reference_idx, "
             f"got {host_reference_idx!r}"
         )
-    try:
-        rype_path = await _resolve_reference_index_path(
-            pool, host_reference_idx, HOST_FILTER_INDEX_TYPE_RYPE
-        )
-        minimap2_path = await _resolve_reference_index_path(
-            pool, host_reference_idx, HOST_FILTER_INDEX_TYPE_MINIMAP2
-        )
-    except ReferenceNotFound as exc:
+
+    # Resolve each index type independently: a host reference may carry only one
+    # (rype-only / minimap2-only). A missing index type (ReferenceIndexNotBuilt)
+    # is non-fatal — that stage is simply skipped — but an unknown or non-active
+    # reference is a hard BAD_INPUT, and a reference with NEITHER index can't
+    # filter anything, so it's rejected too.
+    bound: dict[str, Path] = {}
+    for index_type, binding in (
+        (HOST_FILTER_INDEX_TYPE_RYPE, "host_rype_path"),
+        (HOST_FILTER_INDEX_TYPE_MINIMAP2, "host_minimap2_path"),
+    ):
+        try:
+            bound[binding] = Path(
+                await _resolve_reference_index_path(pool, host_reference_idx, index_type)
+            )
+        except ReferenceNotFound as exc:
+            raise _submission_bad_input(
+                f"host_reference_idx={host_reference_idx} references an unknown reference"
+            ) from exc
+        except ReferenceIndexNotBuilt:
+            # This index type wasn't built for the reference — skip its stage.
+            continue
+        except ValueError as exc:
+            # Reference not active (build may be mid-flight) — hard error.
+            raise _submission_bad_input(str(exc)) from exc
+    if not bound:
         raise _submission_bad_input(
-            f"host_reference_idx={host_reference_idx} references an unknown reference"
-        ) from exc
-    except ValueError as exc:
-        # Reference not active, or a `rype`/`minimap2` index not built yet — the
-        # _resolve_reference_index_path contract raises ValueError for both.
-        raise _submission_bad_input(str(exc)) from exc
-    return {"host_rype_path": Path(rype_path), "host_minimap2_path": Path(minimap2_path)}
+            f"host_reference_idx={host_reference_idx} has neither a "
+            f"{HOST_FILTER_INDEX_TYPE_RYPE!r} nor a {HOST_FILTER_INDEX_TYPE_MINIMAP2!r} index; "
+            "a host reference must carry at least one host-filter index"
+        )
+    return bound
 
 
 # =============================================================================
@@ -1375,6 +1423,16 @@ async def _dispatch_step(
     selects the matching profile, the flat population uses the YAML values."""
     inputs = {name: Path(bound[name]) for name in entry.inputs}
     inputs.update({name: Path(bound[name]) for name in entry.optional_inputs if name in bound})
+    # Scalar build params (WorkflowStep.params, keyed action_context_key ->
+    # Inputs field). Unlike inputs/optional_inputs these are NOT host paths, so
+    # they are merged un-Path-coerced and as strings: the wire carries
+    # `inputs: dict[str, str]` and the native job's Pydantic `Inputs` model
+    # re-coerces each string to its declared type (e.g. "35" -> int w). Native
+    # steps only — `_resolve_input_binds` (which would treat a value as a path)
+    # is container-only, so a scalar here is never mistaken for a bind mount.
+    inputs.update(
+        {field: str(bound[ctx_key]) for ctx_key, field in entry.params.items() if ctx_key in bound}
+    )
     resolved = _resolve_baseline_for_step(
         entry=entry,
         bound=bound,

@@ -319,8 +319,15 @@ async def test_do_reference_load_host_sets_is_host_and_selects_host_action(
     assert create_call[2]["is_host"] is True
     submit_call = next(c for c in calls if c[1] == URL_WORK_TICKET_PREFIX and c[0] == "POST")
     assert submit_call[2]["action_id"] == "host-reference-add"
-    # action_context still carries both upload handles.
-    assert submit_call[2]["action_context"] == {"fasta_upload_idx": 100, "taxonomy_upload_idx": 101}
+    # action_context carries both upload handles plus the index-selection flags
+    # (both default True — build both indexes; no rype_w / minimap2_preset since
+    # neither was overridden).
+    assert submit_call[2]["action_context"] == {
+        "fasta_upload_idx": 100,
+        "taxonomy_upload_idx": 101,
+        "build_rype": True,
+        "build_minimap2": True,
+    }
 
 
 async def test_do_reference_load_host_requires_taxonomy(fasta_file, tmp_path, cp_transport):
@@ -414,6 +421,129 @@ async def test_do_reference_load_host_with_reference_idx_allows_host_ref(
     assert submit_call[2]["action_id"] == "host-reference-add"
 
 
+async def test_do_reference_load_host_rype_only_with_param(fasta_file, taxonomy_file, cp_transport):
+    """`build_minimap2=False` (--no-minimap2-index) + `rype_w` builds a
+    rype-only host reference: action_context carries build_rype True /
+    build_minimap2 False and the rype_w override; no minimap2_preset (not set)."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    flight_client = FakeFlightClient()
+    flight_client.queue_response(100)  # FASTA
+    flight_client.queue_response(101)  # taxonomy
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        await do_reference_load(
+            http=http,
+            token="t",
+            flight_client=flight_client,
+            fasta_path=fasta_file,
+            taxonomy_path=taxonomy_file,
+            name="host-ref",
+            version="1.0",
+            host=True,
+            build_minimap2=False,
+            rype_w=35,
+            watch=False,
+        )
+
+    submit_call = next(c for c in calls if c[1] == URL_WORK_TICKET_PREFIX and c[0] == "POST")
+    assert submit_call[2]["action_context"] == {
+        "fasta_upload_idx": 100,
+        "taxonomy_upload_idx": 101,
+        "build_rype": True,
+        "build_minimap2": False,
+        "rype_w": 35,
+    }
+
+
+async def test_do_reference_load_host_minimap2_only_with_preset(
+    fasta_file, taxonomy_file, cp_transport
+):
+    """`build_rype=False` (--no-rype-index) + `minimap2_preset` builds a
+    minimap2-only host reference with the preset override; no rype_w."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+    flight_client = FakeFlightClient()
+    flight_client.queue_response(100)
+    flight_client.queue_response(101)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        await do_reference_load(
+            http=http,
+            token="t",
+            flight_client=flight_client,
+            fasta_path=fasta_file,
+            taxonomy_path=taxonomy_file,
+            name="host-ref",
+            version="1.0",
+            host=True,
+            build_rype=False,
+            minimap2_preset="map-ont",
+            watch=False,
+        )
+
+    submit_call = next(c for c in calls if c[1] == URL_WORK_TICKET_PREFIX and c[0] == "POST")
+    assert submit_call[2]["action_context"] == {
+        "fasta_upload_idx": 100,
+        "taxonomy_upload_idx": 101,
+        "build_rype": False,
+        "build_minimap2": True,
+        "minimap2_preset": "map-ont",
+    }
+
+
+async def test_do_reference_load_rejects_neither_index(fasta_file, taxonomy_file, cp_transport):
+    """A host reference must build at least one index — both opt-out flags set
+    is a contract violation, caught before any wire call (mirrors the workflow
+    context_schema `not` backstop server-side)."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(ValueError, match="at least one host index"):
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                fasta_path=fasta_file,
+                taxonomy_path=taxonomy_file,
+                name="host-ref",
+                version="1.0",
+                host=True,
+                build_rype=False,
+                build_minimap2=False,
+                watch=False,
+            )
+    assert calls == []
+
+
+async def test_do_reference_load_index_opts_require_host(fasta_file, cp_transport):
+    """The index-selection / build-param knobs apply only to host references —
+    using one without --host is rejected fail-fast (a non-host reference builds
+    no host-filter index)."""
+    from qiita_control_plane.cli.reference_load import do_reference_load
+
+    transport, calls = cp_transport
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://cp.test") as http:
+        with pytest.raises(ValueError, match="apply only"):
+            await do_reference_load(
+                http=http,
+                token="t",
+                flight_client=FakeFlightClient(),
+                fasta_path=fasta_file,
+                name="plain-ref",
+                version="1.0",
+                host=False,
+                rype_w=35,
+                watch=False,
+            )
+    assert calls == []
+
+
 def test_handler_host_without_taxonomy_exits_nonzero(monkeypatch, tmp_path, capsys):
     """End-to-end arg plumbing: `qiita reference load --host` (no --taxonomy)
     threads `host=True` into the entry point, whose taxonomy guard surfaces as
@@ -445,6 +575,59 @@ def test_handler_host_without_taxonomy_exits_nonzero(monkeypatch, tmp_path, caps
     )
     assert rc == 1
     assert "taxonomy" in capsys.readouterr().err
+
+
+def test_handler_threads_index_selection_flags(monkeypatch, tmp_path):
+    """`--no-rype-index` / `--no-minimap2-index` / `--rype-w` / `--minimap2-preset`
+    map to the entry point's build_rype / build_minimap2 / rype_w /
+    minimap2_preset kwargs. Captures the call so the argparse → kwarg wiring is
+    locked (a non-host knob without --host is rejected inside the entry point,
+    not here)."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import reference_load as _ref
+    from qiita_control_plane.cli import user as _user
+
+    monkeypatch.setattr(_common, "read_token", lambda: "test-pat")
+    captured: dict = {}
+
+    async def fake_do_reference_load(**kwargs):
+        captured.update(kwargs)
+        return {"reference_idx": 1, "work_ticket_idx": 2, "upload_idxs": {}}
+
+    monkeypatch.setattr(_ref, "do_reference_load", fake_do_reference_load)
+    fasta = tmp_path / "x.fasta"
+    fasta.write_text(">a\nACGT\n")
+    tax = tmp_path / "t.parquet"
+    tax.write_text("x")
+
+    rc = _user.main(
+        [
+            "--base-url",
+            "http://localhost:8080",
+            "reference",
+            "load",
+            "--name",
+            "h",
+            "--version",
+            "1.0",
+            "--host",
+            "--fasta",
+            str(fasta),
+            "--taxonomy",
+            str(tax),
+            "--data-plane-url",
+            "grpc://localhost:0",
+            "--no-minimap2-index",
+            "--rype-w",
+            "40",
+            "--no-watch",
+        ]
+    )
+    assert rc == 0
+    assert captured["build_rype"] is True
+    assert captured["build_minimap2"] is False
+    assert captured["rype_w"] == 40
+    assert captured["minimap2_preset"] is None
 
 
 async def test_do_reference_load_skips_creation_when_reference_idx_set(
@@ -652,6 +835,8 @@ async def test_do_reference_load_local_host_selects_host_action(
     assert submit_call[2]["action_context"] == {
         "fasta_manifest_path": str(manifest_file),
         "taxonomy_path": str(taxonomy_file),
+        "build_rype": True,
+        "build_minimap2": True,
     }
 
 

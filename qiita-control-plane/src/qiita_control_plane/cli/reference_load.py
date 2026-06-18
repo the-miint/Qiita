@@ -474,6 +474,10 @@ async def do_reference_load(
     tree_path: Path | None = None,
     jplace_path: Path | None = None,
     genome_map_path: Path | None = None,
+    build_rype: bool = True,
+    build_minimap2: bool = True,
+    rype_w: int | None = None,
+    minimap2_preset: str | None = None,
     watch: bool = True,
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
     timeout_seconds: float = DEFAULT_POLL_TIMEOUT_SECONDS,
@@ -504,7 +508,15 @@ async def do_reference_load(
     `(local-)host-reference-add` action (which additionally builds the rype +
     minimap2 host-filter indexes consumed at host-read-filtering time). A host
     reference requires `taxonomy_path` — it's the rype mapping authority's
-    source — so it's a fail-fast precondition here."""
+    source — so it's a fail-fast precondition here.
+
+    Host index selection / params (host-only; ignored for non-host references):
+    `build_rype` / `build_minimap2` choose which indexes to build (both default
+    True; at least one must be True). `rype_w` overrides the rype window `w` and
+    `minimap2_preset` the minimap2 preset; left None they use the builders'
+    defaults. Selection is initial-build-time only — adding an index type to an
+    already-active reference is unsupported (the status FSM is terminal at
+    `active`)."""
     has_idx = reference_idx is not None
     has_name_version = name is not None and version is not None
     if has_idx and (name is not None or version is not None):
@@ -520,6 +532,27 @@ async def do_reference_load(
         raise ValueError(
             "--host requires --taxonomy: a host reference must ship a taxonomy"
             " mapping authority for the rype index build"
+        )
+
+    # Host index-selection / build-param knobs apply only to host references —
+    # plain references run (local-)reference-add, which builds no host-filter
+    # index. Reject them up front (boundary-local message) rather than silently
+    # dropping them server-side.
+    host_index_opts_given = (
+        not build_rype or not build_minimap2 or rype_w is not None or minimap2_preset is not None
+    )
+    if host_index_opts_given and not host:
+        raise ValueError(
+            "--no-rype-index / --no-minimap2-index / --rype-w / --minimap2-preset apply only"
+            " with --host (a non-host reference builds no host-filter index)"
+        )
+    # A host reference must carry at least one host-filter index. The workflow's
+    # context_schema `not` backstop rejects this server-side too; checking here
+    # fails fast before any upload / submit.
+    if host and not build_rype and not build_minimap2:
+        raise ValueError(
+            "at least one host index must be built: --no-rype-index and --no-minimap2-index"
+            " cannot both be set"
         )
 
     # FASTA source mode. --fasta (remote DoPut) and --fasta-manifest (--local
@@ -658,6 +691,20 @@ async def do_reference_load(
             action_context[f"{role}_upload_idx"] = res.upload_idx
             upload_idxs[role] = res.upload_idx
             _log.info("uploaded %s as upload_idx=%d", role, res.upload_idx)
+
+    # Host index selection + build params (host references only; identical
+    # across ingest modes). Both selection flags are written explicitly so the
+    # persisted action_context records the choice; the workflow's `when:` gates
+    # + `not` backstop consume them. rype_w / minimap2_preset are added only
+    # when the submitter set them, so the builders otherwise use their Inputs
+    # defaults. Non-host references never carry these keys.
+    if host:
+        action_context["build_rype"] = build_rype
+        action_context["build_minimap2"] = build_minimap2
+        if rype_w is not None:
+            action_context["rype_w"] = rype_w
+        if minimap2_preset is not None:
+            action_context["minimap2_preset"] = minimap2_preset
 
     # Select the action by ingest mode (local vs remote) and host-ness. Host
     # references run the *-host-reference-add workflow (the base steps plus the

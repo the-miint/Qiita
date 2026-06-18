@@ -242,6 +242,10 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
     # lives outside $QIITA_OUTPUT_PATH and would fail the launcher manifest +
     # verifier if declared; register-index reads its location from meta fs_path.
     assert build.outputs == ["rype_index_meta"]
+    # Per-submission index selection + tunable build params: build_rype_index is
+    # gated on the build_rype action_context flag and surfaces rype_w -> w.
+    assert build.when == "build_rype"
+    assert build.params == {"rype_w": "w"}
 
     # The minimap2 builder consumes the SAME feature-keyed chunks as the rype
     # builder (reassembled into whole contigs), not a raw-FASTA side channel.
@@ -250,6 +254,25 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
     assert mm2.container is None
     assert mm2.inputs == ["reference_sequence_chunks"]
     assert mm2.outputs == ["minimap2_index_meta"]
+    # The minimap2 builder ALSO carries target_status: indexing (not only
+    # build_rype_index) — build_rype_index may be skipped (build_rype: false, a
+    # minimap2-only reference), so this step must be able to make the
+    # loading -> indexing transition itself.
+    assert mm2.target_status == "indexing"
+    assert mm2.when == "build_minimap2"
+    assert mm2.params == {"minimap2_preset": "preset"}
+
+    # Index selection knobs declared in the context_schema, with a `not`
+    # backstop that rejects building neither index (both flags explicitly false).
+    props = host.context_schema["properties"]
+    assert props["build_rype"]["type"] == "boolean"
+    assert props["build_minimap2"]["type"] == "boolean"
+    assert props["rype_w"]["type"] == "integer"
+    assert set(props["minimap2_preset"]["enum"]) >= {"sr", "map-ont", "map-hifi"}
+    assert host.context_schema["not"]["properties"] == {
+        "build_rype": {"const": False},
+        "build_minimap2": {"const": False},
+    }
 
     # The load step re-exposes the feature-keyed chunks under its own binding so
     # build_rype_index can consume them; reference-add declares only staging_dir.
@@ -264,6 +287,10 @@ def test_load_actions_loads_on_disk_host_reference_add_yaml():
         ["rype_index_meta"],
         ["minimap2_index_meta"],
     ]
+    # Each register-index carries the SAME `when:` as its builder so a skipped
+    # index also skips its registration (and never reads a never-produced
+    # *_index_meta binding).
+    assert [s.when for s in register_index_steps] == ["build_rype", "build_minimap2"]
 
     # Pin the CLI's hardcoded action_id/version against the YAML — `qiita
     # reference load --host` submits these literals; an id/version drift would
@@ -415,6 +442,28 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
     assert mm2.module == "qiita_compute_orchestrator.jobs.build_minimap2_index"
     assert mm2.inputs == ["reference_sequence_chunks"]
     assert mm2.outputs == ["minimap2_index_meta"]
+
+    # Same per-submission index selection + params as host-reference-add: both
+    # builders gated + the minimap2 builder carries target_status: indexing so a
+    # minimap2-only build still transitions out of `loading`. Each register-index
+    # carries its builder's `when:`.
+    rype = next(s for s in local_host.steps if s.name == "build_rype_index")
+    assert (rype.when, rype.params, rype.target_status) == (
+        "build_rype",
+        {"rype_w": "w"},
+        "indexing",
+    )
+    assert (mm2.when, mm2.params, mm2.target_status) == (
+        "build_minimap2",
+        {"minimap2_preset": "preset"},
+        "indexing",
+    )
+    register_index_steps = [s for s in local_host.steps if s.name == "register-index"]
+    assert [s.when for s in register_index_steps] == ["build_rype", "build_minimap2"]
+    assert local_host.context_schema["not"]["properties"] == {
+        "build_rype": {"const": False},
+        "build_minimap2": {"const": False},
+    }
 
     # Taxonomy required (the rype mapping authority), same as host-reference-add.
     assert set(local_host.context_schema["required"]) == {

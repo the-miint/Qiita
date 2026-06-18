@@ -109,7 +109,7 @@ def test_build_rype_index_orchestration(tmp_path, monkeypatch):
     assert captured["features"] == [100, 200]
     assert captured["bucket"] == f"reference_{reference_idx}"
     assert captured["k"] == 64
-    assert captured["w"] == 25
+    assert captured["w"] == 20
 
     expected_dir = shared_root / "references" / str(reference_idx) / "rype" / "index.ryxdi"
     # The persistent .ryxdi is NOT a step output (it lives outside the
@@ -121,7 +121,7 @@ def test_build_rype_index_orchestration(tmp_path, monkeypatch):
     meta = json.loads(Path(out["rype_index_meta"]).read_text())
     assert meta["index_type"] == "rype"
     assert meta["fs_path"] == str(expected_dir)
-    assert meta["params"] == {"k": 64, "w": 25, "bucket_name": f"reference_{reference_idx}"}
+    assert meta["params"] == {"k": 64, "w": 20, "bucket_name": f"reference_{reference_idx}"}
 
 
 def test_build_rype_index_honours_bucket_name_override(tmp_path, monkeypatch):
@@ -249,7 +249,7 @@ def test_build_rype_index_real_rype_smoke(tmp_path, monkeypatch):
     parquet_files = list(index_dir.rglob("*.parquet"))
     assert parquet_files, "rype index has no Parquet content (empty/partial build)"
 
-    assert meta["params"] == {"k": 64, "w": 25, "bucket_name": f"reference_{reference_idx}"}
+    assert meta["params"] == {"k": 64, "w": 20, "bucket_name": f"reference_{reference_idx}"}
 
 
 def test_build_rype_index_missing_chunks_raises(tmp_path, monkeypatch):

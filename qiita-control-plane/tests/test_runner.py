@@ -1402,6 +1402,191 @@ async def test_dispatch_register_index_minimap2_meta(postgres_pool, reference_id
 
 
 # =============================================================================
+# WorkflowEntry.when (conditional gate) + WorkflowStep.params (scalar params)
+# =============================================================================
+#
+# Mirrors the host-reference-add shape: two gated native build steps (each
+# carrying its own `params`) and a gated register-index per builder. Lets one
+# submission build rype-only / minimap2-only / both via action_context, and
+# tune the rype `w` / minimap2 `preset` the builders receive.
+
+_INDEX_SELECT_STEPS = [
+    {
+        "kind": "step",
+        "name": "build_rype_index",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.build_rype_index",
+        "inputs": [],
+        "params": {"rype_w": "w"},
+        "when": "build_rype",
+        "outputs": ["rype_index_meta"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    {
+        "kind": "step",
+        "name": "build_minimap2_index",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.build_minimap2_index",
+        "inputs": [],
+        "params": {"minimap2_preset": "preset"},
+        "when": "build_minimap2",
+        "outputs": ["minimap2_index_meta"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    {
+        "kind": "action",
+        "name": "register-index",
+        "inputs": ["rype_index_meta"],
+        "when": "build_rype",
+        "outputs": [],
+    },
+    {
+        "kind": "action",
+        "name": "register-index",
+        "inputs": ["minimap2_index_meta"],
+        "when": "build_minimap2",
+        "outputs": [],
+    },
+]
+
+
+async def _make_index_select_ticket(pool, reference_idx, action_context: dict) -> tuple[int, str]:
+    """Insert an index-selection action (the _INDEX_SELECT_STEPS shape) plus a
+    pending work_ticket carrying `action_context`. Returns (work_ticket_idx,
+    version) for cleanup."""
+    version = f"index-select-{uuid.uuid4()}"
+    await pool.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, scopes, audience,"
+        "  context_schema, steps, cpu_ceiling, mem_ceiling_gb, walltime_ceiling,"
+        "  success_status, failure_status"
+        ") VALUES ('host-reference-add', $1, 'reference', $2::text[], $3::jsonb,"
+        "  '{}'::jsonb, $4::jsonb, 4, 32, '1 hour', NULL, 'failed')",
+        version,
+        ["feature:mint", "reference:write", "reference:register_files"],
+        json.dumps({"service": False, "human_roles": ["wet_lab_admin"]}),
+        json.dumps(_INDEX_SELECT_STEPS),
+    )
+    wt_idx = await pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, action_context"
+        ") VALUES ('host-reference-add', $1, 1, 'reference', $2, $3::jsonb)"
+        " RETURNING work_ticket_idx",
+        version,
+        reference_idx,
+        json.dumps(action_context),
+    )
+    return wt_idx, version
+
+
+@pytest.fixture
+def register_index_spy(monkeypatch):
+    """Record every REGISTER_INDEX primitive call (index_type, params) without
+    a DB write, so a test can assert which index registrations fired."""
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import library as _lib
+
+    calls: list[tuple[str, dict]] = []
+
+    async def register_index(pool, *, reference_idx, index_type, fs_path, params):
+        calls.append((index_type, params))
+
+    monkeypatch.setitem(_lib.LIBRARY, LibraryPrimitive.REGISTER_INDEX, register_index)
+    return calls
+
+
+def _write_index_meta(path: Path, index_type: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"index_type": index_type, "fs_path": f"/srv/{index_type}", "params": {}})
+    )
+
+
+async def test_when_gate_skips_disabled_build_and_param_merges(
+    postgres_pool, reference_idx, register_index_spy, tmp_path
+):
+    """`build_minimap2: false` in action_context skips the minimap2 builder AND
+    its register-index (the `when:` gate fires for both step and action
+    entries), while the rype builder runs and receives its `rype_w` -> `w`
+    param merged into the native step inputs."""
+    backend = FakeBackendClient()
+    rype_meta = tmp_path / "rype_index_meta.json"
+    _write_index_meta(rype_meta, "rype")
+    backend.outputs_for["build_rype_index"] = {"rype_index_meta": rype_meta}
+
+    wt_idx, version = await _make_index_select_ticket(
+        postgres_pool, reference_idx, {"build_minimap2": False, "rype_w": 35}
+    )
+    try:
+        await _run(wt_idx, postgres_pool, backend, tmp_path)
+
+        # Only the rype builder was dispatched — minimap2 was gated off.
+        step_calls = [name for name, *_ in backend.calls]
+        assert step_calls == ["build_rype_index"]
+
+        # rype_w (35) reached the native step as `w`, merged un-Path-coerced
+        # (sent as a string the job's Inputs model re-coerces to int).
+        _name, inputs, _ws, _scope = backend.calls[0]
+        assert inputs == {"w": "35"}
+
+        # Only the rype register-index fired; the minimap2 one was skipped.
+        assert register_index_spy == [("rype", {})]
+
+        # No progress row for the skipped step.
+        rows = await step_progress.load_step_progress(postgres_pool, wt_idx)
+        assert all(r.step_name != "build_minimap2_index" for r in rows)
+
+        state = await postgres_pool.fetchval(
+            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt_idx
+        )
+        assert state == "completed"
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.action WHERE action_id = 'host-reference-add' AND version = $1",
+            version,
+        )
+
+
+async def test_when_gate_runs_both_when_flags_absent(
+    postgres_pool, reference_idx, register_index_spy, tmp_path
+):
+    """An empty action_context (no selection flags) builds BOTH indexes — the
+    `when:` gate defaults ON, so today's behavior is preserved. Omitted params
+    are not forwarded (the builders fall back to their Inputs defaults)."""
+    backend = FakeBackendClient()
+    rype_meta = tmp_path / "rype_index_meta.json"
+    mm2_meta = tmp_path / "minimap2_index_meta.json"
+    _write_index_meta(rype_meta, "rype")
+    _write_index_meta(mm2_meta, "minimap2")
+    backend.outputs_for["build_rype_index"] = {"rype_index_meta": rype_meta}
+    backend.outputs_for["build_minimap2_index"] = {"minimap2_index_meta": mm2_meta}
+
+    wt_idx, version = await _make_index_select_ticket(postgres_pool, reference_idx, {})
+    try:
+        await _run(wt_idx, postgres_pool, backend, tmp_path)
+
+        step_calls = [name for name, *_ in backend.calls]
+        assert step_calls == ["build_rype_index", "build_minimap2_index"]
+        # No param keys present in action_context -> none merged.
+        assert backend.calls[0][1] == {}
+        assert backend.calls[1][1] == {}
+        assert {t for t, _ in register_index_spy} == {"rype", "minimap2"}
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.action WHERE action_id = 'host-reference-add' AND version = $1",
+            version,
+        )
+
+
+# =============================================================================
 # _resolve_reference_index_path
 # =============================================================================
 #
@@ -1579,9 +1764,10 @@ async def test_resolve_host_filter_indexes_non_active_reference(postgres_pool, r
         )
 
 
-async def test_resolve_host_filter_indexes_missing_minimap2_index(postgres_pool, reference_idx):
-    """Active host reference with a rype index but no minimap2 yet → BAD_INPUT
-    (a host reference needs both for the two-stage filter)."""
+async def test_resolve_host_filter_indexes_rype_only(postgres_pool, reference_idx):
+    """A rype-only host reference (built --no-minimap2-index): bind only
+    host_rype_path; the minimap2 stage is skipped (its path stays unbound, so
+    host_filter's Inputs default it to None)."""
     from qiita_control_plane.runner import _resolve_host_filter_indexes
 
     await postgres_pool.execute(
@@ -1589,22 +1775,21 @@ async def test_resolve_host_filter_indexes_missing_minimap2_index(postgres_pool,
     )
     await _insert_reference_index(postgres_pool, reference_idx, "/srv/r.ryxdi", index_type="rype")
     try:
-        with pytest.raises(BackendFailure) as ei:
-            await _resolve_host_filter_indexes(
-                postgres_pool,
-                action_context={"host_filter_enabled": True, "host_reference_idx": reference_idx},
-            )
-        assert ei.value.kind == FailureKind.BAD_INPUT
+        out = await _resolve_host_filter_indexes(
+            postgres_pool,
+            action_context={"host_filter_enabled": True, "host_reference_idx": reference_idx},
+        )
+        assert {k: str(v) for k, v in out.items()} == {"host_rype_path": "/srv/r.ryxdi"}
     finally:
         await postgres_pool.execute(
             "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
         )
 
 
-async def test_resolve_host_filter_indexes_missing_rype_index(postgres_pool, reference_idx):
-    """Symmetric to the minimap2-missing case: an active host reference with a
-    minimap2 index but no rype (e.g. a failed/deleted rype build) → BAD_INPUT.
-    rype is resolved first, so this locks that arm of the two-index contract."""
+async def test_resolve_host_filter_indexes_minimap2_only(postgres_pool, reference_idx):
+    """Symmetric: a minimap2-only host reference (built --no-rype-index) binds
+    only host_minimap2_path. rype is resolved first, so this also proves a
+    missing rype doesn't abort before the minimap2 lookup runs."""
     from qiita_control_plane.runner import _resolve_host_filter_indexes
 
     await postgres_pool.execute(
@@ -1612,16 +1797,33 @@ async def test_resolve_host_filter_indexes_missing_rype_index(postgres_pool, ref
     )
     await _insert_reference_index(postgres_pool, reference_idx, "/srv/m.mmi", index_type="minimap2")
     try:
-        with pytest.raises(BackendFailure) as ei:
-            await _resolve_host_filter_indexes(
-                postgres_pool,
-                action_context={"host_filter_enabled": True, "host_reference_idx": reference_idx},
-            )
-        assert ei.value.kind == FailureKind.BAD_INPUT
+        out = await _resolve_host_filter_indexes(
+            postgres_pool,
+            action_context={"host_filter_enabled": True, "host_reference_idx": reference_idx},
+        )
+        assert {k: str(v) for k, v in out.items()} == {"host_minimap2_path": "/srv/m.mmi"}
     finally:
         await postgres_pool.execute(
             "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
         )
+
+
+async def test_resolve_host_filter_indexes_neither_index(postgres_pool, reference_idx):
+    """An active host reference with NEITHER index can't filter anything →
+    BAD_INPUT (the one remaining hard error among the single-index cases)."""
+    from qiita_control_plane.runner import _resolve_host_filter_indexes
+
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1", reference_idx
+    )
+    with pytest.raises(BackendFailure) as ei:
+        await _resolve_host_filter_indexes(
+            postgres_pool,
+            action_context={"host_filter_enabled": True, "host_reference_idx": reference_idx},
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
+    assert "neither" in ei.value.reason
 
 
 async def test_run_workflow_fails_ticket_on_host_filter_resolution_error(
