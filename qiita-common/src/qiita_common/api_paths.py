@@ -301,6 +301,9 @@ PATH_SEQUENCING_RUN_PREFIX = "/sequencing-run"
 PATH_SEQUENCING_RUN_ROOT = ""  # POST against the prefix itself
 # GET one sequencing_run by idx (run metadata incl. instrument_model).
 PATH_SEQUENCING_RUN_BY_IDX = "/{sequencing_run_idx}"
+# Bulk lookup of sequencing_run_idx by instrument_run_id; same body-vs-
+# querystring rationale as the study / biosample accession lookups.
+PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID = "/lookup-by-instrument-run-id"
 PATH_SEQUENCING_RUN_SEQUENCED_POOL = "/{sequencing_run_idx}/sequenced-pool"
 PATH_SEQUENCED_POOL_PREFLIGHT = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/preflight"
@@ -310,6 +313,9 @@ PATH_SEQUENCED_POOL_BY_IDX = "/{sequencing_run_idx}/sequenced-pool/{sequenced_po
 
 URL_SEQUENCING_RUN_PREFIX = f"{API_PREFIX}{PATH_SEQUENCING_RUN_PREFIX}"
 URL_SEQUENCING_RUN_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_BY_IDX}"
+URL_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID = (
+    f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID}"
+)
 URL_SEQUENCING_RUN_SEQUENCED_POOL = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_SEQUENCED_POOL}"
 )

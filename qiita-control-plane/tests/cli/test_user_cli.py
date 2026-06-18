@@ -19,6 +19,8 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_LIST_BY_STUDY,
     URL_SEQUENCED_SAMPLE_BY_IDX,
     URL_SEQUENCED_SAMPLE_FROM_RUN,
+    URL_SEQUENCING_RUN_BY_IDX,
+    URL_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID,
     URL_SEQUENCING_RUN_PREFIX,
     URL_SEQUENCING_RUN_SEQUENCED_POOL,
     URL_STUDY_BY_IDX,
@@ -895,6 +897,112 @@ def test_sequencing_run_create_rejects_malformed_extra_metadata(capsys):
     err = capsys.readouterr().err
     assert "--extra-metadata" in err
     assert "not valid JSON" in err
+
+
+# ---------------------------------------------------------------------------
+# sequencing-run get
+# ---------------------------------------------------------------------------
+
+
+_SEQUENCING_RUN_RESPONSE = {
+    "sequencing_run_idx": 4,
+    "instrument_run_id": "240301_MN12345_0001_AAATEST",
+    "platform": "illumina",
+    "instrument_model": "Illumina NovaSeq 6000",
+    "instrument_serial": None,
+    "run_performed_at": None,
+    "extra_metadata": None,
+    "created_by_idx": 7,
+    "created_at": "2026-05-20T00:00:00+00:00",
+    "retired": False,
+    "retired_by_idx": None,
+    "retired_at": None,
+    "retire_reason": None,
+}
+
+
+def test_sequencing_run_get_issues_get_against_the_idx(monkeypatch):
+    """`sequencing-run get --sequencing-run-idx N` GETs the by-idx path and
+    issues no body."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=_SEQUENCING_RUN_RESPONSE, status=200)
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "sequencing-run",
+            "get",
+            "--sequencing-run-idx",
+            "4",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "GET"
+    assert captured["url"] == (
+        f"https://q.example.test{URL_SEQUENCING_RUN_BY_IDX.format(sequencing_run_idx=4)}"
+    )
+    assert captured["json"] is None
+
+
+def test_sequencing_run_get_requires_idx(capsys):
+    """Omitting --sequencing-run-idx exits 2 via argparse."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["sequencing-run", "get"])
+    assert exc_info.value.code == 2
+    assert "--sequencing-run-idx" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# sequencing-run lookup
+# ---------------------------------------------------------------------------
+
+
+def test_sequencing_run_lookup_posts_instrument_run_ids(monkeypatch):
+    """`sequencing-run lookup --instrument-run-id A --instrument-run-id B`
+    POSTs the lookup path with both ids in the body list."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json={"resolved": {"A": 1, "B": 2}, "missing": []},
+        status=200,
+    )
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "sequencing-run",
+            "lookup",
+            "--instrument-run-id",
+            "A",
+            "--instrument-run-id",
+            "B",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "POST"
+    assert captured["url"] == (
+        f"https://q.example.test{URL_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID}"
+    )
+    assert captured["json"] == {"instrument_run_ids": ["A", "B"]}
+
+
+def test_sequencing_run_lookup_requires_at_least_one_id(capsys):
+    """Omitting --instrument-run-id exits 2 via argparse (required=True)."""
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["sequencing-run", "lookup"])
+    assert exc_info.value.code == 2
+    assert "--instrument-run-id" in capsys.readouterr().err
 
 
 def test_sequencing_run_create_rejects_non_object_extra_metadata(capsys):

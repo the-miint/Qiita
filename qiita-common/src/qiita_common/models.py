@@ -1759,6 +1759,32 @@ class SequencingRunResponse(BaseModel):
     retire_reason: str | None = None
 
 
+# same-pattern-ok: per-key wire shape; parallels StudyLookupByAccessionRequest
+class SequencingRunLookupByInstrumentRunIdRequest(BaseModel):
+    """Resolves a list of instrument_run_id values to sequencing_run idxs in
+    one round trip. Body-shaped (not query-params) so a long id list cannot
+    exceed nginx's default URL-line cap.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    instrument_run_ids: list[Annotated[str, Field(min_length=1)]] = Field(
+        min_length=1, max_length=10_000
+    )
+
+
+# same-pattern-ok: per-key wire shape; parallels StudyLookupByAccessionResponse
+class SequencingRunLookupByInstrumentRunIdResponse(BaseModel):
+    """`resolved` maps each found instrument_run_id to its sequencing_run_idx.
+    `missing` lists ids that did not resolve, in input order (deduped).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    resolved: dict[str, Annotated[int, Field(gt=0)]]
+    missing: list[str]
+
+
 class SequencedPoolCreateRequest(BaseModel):
     """Body for POST /api/v1/sequencing-run/{sequencing_run_idx}/sequenced-pool.
 

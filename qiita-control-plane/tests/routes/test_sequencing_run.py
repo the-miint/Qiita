@@ -20,6 +20,7 @@ import json
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from qiita_common.api_paths import URL_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID
 from qiita_common.auth_constants import API_PREFIX
 
 from qiita_control_plane.main import app
@@ -426,3 +427,41 @@ async def test_get_sequencing_run_regular_user_403(ctx):
     idx = await _create_run(ctx)
     resp = await ctx["user"].get(f"{_ROUTE}/{idx}")
     assert resp.status_code == 403
+
+
+# ===========================================================================
+# POST /api/v1/sequencing-run/lookup-by-instrument-run-id
+# ===========================================================================
+
+
+async def test_lookup_run_by_instrument_run_id_resolved_and_missing(ctx):
+    """Tests the case where the lookup body mixes seeded and absent ids:
+    `resolved` carries the hits keyed on instrument_run_id and `missing`
+    echoes the absent value."""
+    id_a = unique_instrument_id("LOOK-A")
+    id_b = unique_instrument_id("LOOK-B")
+    id_missing = unique_instrument_id("LOOK-MISS")
+    resp_a = await _post_run(ctx["wet"], ctx, instrument_run_id=id_a, platform="illumina")
+    run_a = resp_a.json()["sequencing_run_idx"]
+    resp_b = await _post_run(ctx["wet"], ctx, instrument_run_id=id_b, platform="illumina")
+    run_b = resp_b.json()["sequencing_run_idx"]
+
+    resp = await ctx["wet"].post(
+        URL_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID,
+        json={"instrument_run_ids": [id_a, id_b, id_missing]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "resolved": {id_a: run_a, id_b: run_b},
+        "missing": [id_missing],
+    }
+
+
+async def test_lookup_run_by_instrument_run_id_empty_list_422(ctx):
+    """Tests the case where instrument_run_ids is empty: the min_length=1
+    request model rejects it at the wire boundary with 422."""
+    resp = await ctx["wet"].post(
+        URL_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID,
+        json={"instrument_run_ids": []},
+    )
+    assert resp.status_code == 422

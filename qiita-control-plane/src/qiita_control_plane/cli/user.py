@@ -51,6 +51,7 @@ from qiita_common.api_paths import (
     PATH_SEQUENCED_SAMPLE_LIST_BY_POOL,
     PATH_SEQUENCED_SAMPLE_PREFIX,
     PATH_SEQUENCING_RUN_BY_IDX,
+    PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID,
     PATH_SEQUENCING_RUN_PREFIX,
     PATH_SEQUENCING_RUN_SEQUENCED_POOL,
     PATH_STUDY_BY_IDX,
@@ -506,6 +507,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Free-form JSON object stored as JSONB",
     )
     p_seqrun_create.set_defaults(handler=_handle_sequencing_run_create)
+
+    p_seqrun_get = p_seqrun_sub.add_parser(
+        "get",
+        help="Fetch a sequencing-run by idx (GET /sequencing-run/{idx})",
+    )
+    p_seqrun_get.add_argument("--sequencing-run-idx", type=int, required=True)
+    p_seqrun_get.set_defaults(
+        handler=_handle_read,
+        read_path=f"{PATH_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_BY_IDX}",
+        read_idx_arg="sequencing_run_idx",
+    )
+
+    p_seqrun_lookup = p_seqrun_sub.add_parser(
+        "lookup",
+        help=(
+            "Resolve instrument_run_id(s) to sequencing_run idx"
+            " (POST /sequencing-run/lookup-by-instrument-run-id)"
+        ),
+    )
+    p_seqrun_lookup.add_argument(
+        "--instrument-run-id",
+        dest="instrument_run_ids",
+        action="append",
+        required=True,
+        metavar="INSTRUMENT_RUN_ID",
+        help="Instrument-assigned run id; repeat for a bulk lookup",
+    )
+    p_seqrun_lookup.set_defaults(handler=_handle_sequencing_run_lookup)
 
     p_seqpool = sub.add_parser("sequenced-pool", help="Sequenced-pool operations")
     p_seqpool_sub = p_seqpool.add_subparsers(dest="sequenced_pool_cmd", required=True)
@@ -1152,6 +1181,18 @@ def _handle_sequencing_run_create(args: argparse.Namespace, parser: argparse.Arg
     )
     body = _build_body(SequencingRunCreateRequest, args, parser)
     return _common.run_http_subcommand(lambda t: _post_sequencing_run(args.base_url, t, body))
+
+
+def _handle_sequencing_run_lookup(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Resolve instrument_run_id(s) to sequencing_run idx via the bulk lookup.
+
+    Prints the {resolved, missing} mapping.
+    """
+    body = {"instrument_run_ids": args.instrument_run_ids}
+    path = f"{PATH_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID}"
+    return _common.run_http_subcommand(
+        lambda t: _common.call("POST", args.base_url, t, path, json=body)
+    )
 
 
 def _handle_sequenced_pool_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

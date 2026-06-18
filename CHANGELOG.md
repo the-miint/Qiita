@@ -92,6 +92,12 @@ the `no-changelog` label).
   exist (requiring at least one) and the `host_filter` step skips the stage
   whose index is absent. Index selection is initial-build-time only (the status
   FSM is terminal at `active`) (#124)
+- Resolve sequencing runs by instrument_run_id. New
+  `POST /sequencing-run/lookup-by-instrument-run-id` bulk-resolves
+  instrument_run_id values to sequencing_run idxs (idx-only, mirroring the
+  study/biosample accession lookups), gated on `prep_sample:read`. The `qiita`
+  CLI gains `sequencing-run get` and `sequencing-run lookup` for the
+  resolve-then-read flow against `GET /sequencing-run/{idx}` (#99)
 - Delete a reference database from the system. New
   `DELETE /reference/{idx}` fully purges a reference — Postgres rows
   (`reference`, `reference_membership`, `reference_index`, plus orphaned

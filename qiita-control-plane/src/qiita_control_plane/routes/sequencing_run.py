@@ -1,10 +1,11 @@
 """Sequencing-run routes.
 
-Holds three handlers: POST /sequencing-run and POST
-/sequencing-run/{idx}/sequenced-pool (the two mint routes the bcl-convert
-submission flow chains through), plus the SA-only
-GET /sequencing-run/{R}/sequenced-pool/{P}/preflight the bcl-convert
-prep step calls to materialize the sample sheet.
+Covers the run + sequenced-pool mint routes the bcl-convert submission
+flow chains through (POST /sequencing-run, POST
+/sequencing-run/{idx}/sequenced-pool), the run reads (GET
+/sequencing-run/{idx} and the bulk instrument_run_id → idx lookup), and
+the SA-only GET /sequencing-run/{R}/sequenced-pool/{P}/preflight the
+bcl-convert prep step calls to materialize the sample sheet.
 
 The two write handlers gate on caller scope (Scope.PREP_SAMPLE_WRITE)
 plus require_complete_profile (humans-only). The run POST has no
@@ -21,7 +22,7 @@ clients should be aware of.
 The preflight GET is SA-only via Scope.SEQUENCED_POOL_PREFLIGHT_READ,
 matching the existing CO→CP precedent (routes/sequence_range.py).
 
-All three delegate their DB work to the repositories.sequencing_run
+Every handler delegates its DB work to the repositories.sequencing_run
 module. The per-item sequenced-sample import composer, the run-scoped
 sequenced_sample bulk-id read, and the single-sequenced-sample
 read/PATCH live in the sibling sequenced_sample route module.
@@ -38,6 +39,7 @@ from qiita_common.api_paths import (
     PATH_SEQUENCED_POOL_BY_IDX,
     PATH_SEQUENCED_POOL_PREFLIGHT,
     PATH_SEQUENCING_RUN_BY_IDX,
+    PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID,
     PATH_SEQUENCING_RUN_PREFIX,
     PATH_SEQUENCING_RUN_ROOT,
     PATH_SEQUENCING_RUN_SEQUENCED_POOL,
@@ -50,6 +52,8 @@ from qiita_common.models import (
     SequencedPoolPreflightResponse,
     SequencingRunCreateRequest,
     SequencingRunCreateResponse,
+    SequencingRunLookupByInstrumentRunIdRequest,
+    SequencingRunLookupByInstrumentRunIdResponse,
     SequencingRunResponse,
 )
 
@@ -75,10 +79,11 @@ from ..repositories.sequencing_run import (
     PayloadMismatch,
     fetch_sequenced_pool_preflight,
     fetch_sequencing_run,
+    fetch_sequencing_run_idxs_by_instrument_run_id,
     insert_sequenced_pool,
     insert_sequencing_run,
 )
-from ._helpers import GENERIC_FK_VIOLATION
+from ._helpers import GENERIC_FK_VIOLATION, resolve_idxs_by_natural_key
 
 router = APIRouter(prefix=PATH_SEQUENCING_RUN_PREFIX, tags=["sequencing-run"])
 
@@ -331,3 +336,28 @@ async def delete_sequenced_pool(
         counts = await delete_sequenced_pool_cascade(conn, sequenced_pool_idx)
 
     return SequencedPoolDeleteResponse(sequenced_pool_idx=sequenced_pool_idx, **counts)
+
+
+@router.post(PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID)
+async def lookup_run_by_instrument_run_id(
+    body: SequencingRunLookupByInstrumentRunIdRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+) -> SequencingRunLookupByInstrumentRunIdResponse:
+    """Resolve a list of instrument_run_id values to sequencing_run_idx.
+
+    Auth: HumanUser with Scope.PREP_SAMPLE_READ. The response is only the
+    (instrument_run_id, idx) mapping — no run columns — so resolution does
+    not itself disclose row contents; reading a row goes through
+    GET /sequencing-run/{idx}. `missing` lists input-order-deduped ids that
+    did not resolve.
+    """
+    # user is read only to keep the dependency chain explicit — no
+    # per-caller filter runs here (see auth docstring).
+    _ = user
+    resolved, missing = await resolve_idxs_by_natural_key(
+        values=body.instrument_run_ids,
+        fetcher=lambda values: fetch_sequencing_run_idxs_by_instrument_run_id(pool, values=values),
+    )
+    return SequencingRunLookupByInstrumentRunIdResponse(resolved=resolved, missing=missing)
