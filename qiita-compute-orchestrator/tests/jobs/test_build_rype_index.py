@@ -260,3 +260,37 @@ def test_build_rype_index_missing_chunks_raises(tmp_path, monkeypatch):
     )
     with pytest.raises(FileNotFoundError):
         asyncio.run(build_rype_index.execute(inputs, tmp_path / "ws"))
+
+
+def test_build_rype_index_memory_split_under_slurm(tmp_path, monkeypatch):
+    """Under SLURM the cgroup is split DuckDB(bounded) / rype(elastic). DuckDB is
+    capped at `_DUCKDB_MEMORY_CAP_GB` (NOT the 4 GB off-SLURM fallback, which
+    OOMed feeding a genome-scale chunk scan); rype gets the remainder above its
+    floor. At a 48 GB allocation + 4-thread headroom (2 + ceil(4*0.5) = 4):
+    DuckDB = min(48-4, 16) = 16, so rype = 48 - 16 - 4 = 28 GB. The old 4 GB
+    DuckDB cap would have left rype 40 GB — asserting 28 pins the fix."""
+    from qiita_compute_orchestrator.jobs import build_rype_index
+
+    monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "shared"))
+    # 48 GB cgroup (slurm_alloc_gb reads SLURM_MEM_PER_NODE in MB).
+    monkeypatch.setenv("SLURM_MEM_PER_NODE", str(48 * 1024))
+    chunks_dir = _write_chunks_dir(
+        tmp_path / "reference_sequence_chunks", [(1, 0, "ACGT"), (2, 0, "CCCC")]
+    )
+
+    captured: dict = {}
+
+    def fake_build(conn, chunk_table, output_path, mapping_table, *, k, w, max_memory):
+        captured["max_memory"] = max_memory
+        Path(output_path).mkdir(parents=True, exist_ok=True)
+        return "ok"
+
+    monkeypatch.setattr(build_rype_index, "_run_rype_index_create", fake_build)
+
+    inputs = build_rype_index.Inputs(
+        reference_sequence_chunks=chunks_dir, reference_idx=5, work_ticket_idx=1
+    )
+    asyncio.run(build_rype_index.execute(inputs, tmp_path / "ws"))
+
+    # rype gets (alloc - DuckDB cap - headroom) = 48 - 16 - 4 = 28 GB.
+    assert captured["max_memory"] == 28 * 1024**3
