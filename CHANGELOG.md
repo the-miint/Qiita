@@ -273,7 +273,7 @@ the `no-changelog` label).
   `failed → hashing` that killed the ticket at the first step. Only a `failed`
   reference is touched (any other state is a no-op, an unrewindable in-progress
   state is logged at WARNING); the shared reset helper is reused by both the
-  submit and redrive paths (#TBD)
+  submit and redrive paths (#112)
 - The `--mem-gb` per-run override (#102) now actually reaches the DuckDB-backed
   reference-load steps, instead of being silently clamped by a hardcoded
   per-job DuckDB `memory_limit`. Each native job pinned its DuckDB cap to a
