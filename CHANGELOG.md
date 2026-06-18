@@ -334,6 +334,16 @@ the `no-changelog` label).
 
 ### Fixed
 
+- The bcl-convert step no longer fails with `TypeError: 'type' object is not
+  subscriptable` after bcl-convert itself succeeds. Its container is built
+  `From: oraclelinux:8`, whose default `python3` is 3.6 — predating PEP 585
+  builtin generics (`list[str]`), which the workflow-agnostic
+  `workflows/_shared/manifest_writer.py` uses and evaluates at import. The
+  container now installs the appstream `python3.11` and the entrypoint invokes
+  it explicitly; the `%test` block additionally `exec_module`s
+  `manifest_writer.py` under the shipped interpreter so a too-old Python fails
+  the SIF build instead of a live SLURM job. Surfaced running the first
+  container step (bcl-convert) end-to-end (SLURM job 153623) (#126)
 - Container workflow steps no longer exit 64 (`QIITA_INPUT_PATH not set`) once
   they reach the entrypoint. `apptainer exec --containall` contains the
   environment as well as the filesystem, so the `QIITA_*` vars set in the SLURM

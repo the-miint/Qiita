@@ -62,7 +62,10 @@ bcl-convert \
 # paths are passed as `<name>=<rel>` so the orchestrator-side verifier
 # can match the YAML's `outputs:` declaration against what the container
 # produced.
-python3 /opt/qiita/manifest_writer.py "${QIITA_OUTPUT_PATH}" convert_dir=ConvertJob
+# python3.11 (not OL8's default python3=3.6) — manifest_writer.py uses PEP 585
+# builtin generics (`list[str]`) that 3.6 rejects at import; the Apptainer.def
+# installs python3.11 explicitly. Keep the interpreter name in sync with it.
+python3.11 /opt/qiita/manifest_writer.py "${QIITA_OUTPUT_PATH}" convert_dir=ConvertJob
 
 # Verifier requires every file under QIITA_OUTPUT_PATH at mode 0440 and
 # finds them by walking the tree (rglob), which needs the traverse (x) bit

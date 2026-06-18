@@ -19,7 +19,21 @@ _None yet._
 
 ### 2. One-time host setup
 
-_None yet._
+- (#126) Rebuild the bcl-convert SIF. The image's Python was bumped 3.6→3.11
+  (OL8's default `python3`=3.6 crashed `manifest_writer.py` on PEP 585
+  `list[str]` annotations). `build-sif.sh` is idempotent on the bcl-convert
+  *version* (`VERIFY_MATCH`), which this change does **not** touch — so it would
+  print "nothing to do" and leave the broken SIF in place. Delete the existing
+  SIF first to force the rebuild; the rebuild's `%test` now `exec_module`s
+  `manifest_writer.py` under python3.11, so a bad interpreter fails the build
+  here instead of a live job. Run after the `git pull`, before the bucket-4
+  deploy:
+
+  ```bash
+  derived=$(sudo grep '^PATH_DERIVED=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)
+  sudo -u qiita-orch bash -lc "rm -f '$derived/images/bcl-convert-4.5.4.sif' && \
+    PATH_DERIVED='$derived' bash /home/qiita/qiita-miint/scripts/build-sif.sh bcl-convert"
+  ```
 
 ### 3. Migrations
 
@@ -31,7 +45,15 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- (#126) Confirm the rebuilt bcl-convert SIF ships the new interpreter:
+
+  ```bash
+  derived=$(sudo grep '^PATH_DERIVED=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)
+  sudo -u qiita-orch apptainer exec "$derived/images/bcl-convert-4.5.4.sif" python3.11 --version
+  ```
+
+  Expect `Python 3.11.x`. (A clean SIF rebuild already proved `manifest_writer.py`
+  imports under it via the `%test` block.)
 
 ### Notes (no host action)
 
