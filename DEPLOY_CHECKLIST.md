@@ -99,6 +99,7 @@ _None yet._
   action, no new scope. The new `workflows/fastq-to-parquet/1.2.0.yaml` (plus a
   comment-only `1.1.0` edit) re-syncs into `qiita.action` via `qiita-admin actions
   sync` inside `activate.sh` (verified in bucket 5), **not** a migration.
+- (#128) Genome-scale reference-load resource tuning (no client breakage). The two `workflows/` entries `local-reference-add` and `local-host-reference-add` (both still 1.0.0) are **edited in place** — re-synced into `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (already covered by bucket 5's `qiita.action` list check), **not** a migration. Raised baseline_resources + walltimes so loading hundreds of human genomes no longer hits the old 1h step cap (`stage_local_fasta`/`hash_sequences` → cpu=8/mem_gb=32, `build_rype_index` → cpu=8, `build_minimap2_index` → mem_gb=32; step walltimes → PT24H under a PT48H `action_ceiling`). To permit those longer walltimes the orchestrator's SLURM poll-loop timeout **default** rose 24h → 48h (`config.py` `DEFAULT_SLURM_JOB_TIMEOUT_SECONDS`); it applies on the normal bucket-4 CO restart — no new env var. **Caveat:** if `/etc/qiita/compute-orchestrator.env` pins `SLURM_JOB_TIMEOUT_SECONDS` explicitly, raise it to ≥ the longest step walltime (currently PT24H / 86400s) or genome-scale loads will be reaped mid-run. No new host dir, scope, or migration.
 
 ---
 

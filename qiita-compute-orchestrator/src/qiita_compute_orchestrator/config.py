@@ -76,11 +76,15 @@ BACKEND_SLURM = "slurm"
 # SLURM polling defaults. The interval is the gap between
 # `GET /slurm/.../job/{id}` calls when waiting for a non-terminal
 # job; 10s is a reasonable trade-off between latency and slurmrestd
-# load. The total timeout caps a single step's wall time at 24h —
-# a workflow that exceeds 24h either has a misconfigured walltime
-# (declare it longer in YAML) or is stuck (kill from outside).
+# load. The total timeout caps a single step's wall time at 48h — it
+# must stay >= the largest step walltime any workflow declares (the
+# reference-add steps now run up to PT24H under a PT48H action_ceiling)
+# so SLURM's own --time kill fires before the CP poll loop gives up. A
+# step that exceeds this is either misconfigured (declare it longer in
+# YAML *and* raise this) or stuck (kill from outside). Override per-host
+# via SLURM_JOB_TIMEOUT_SECONDS.
 DEFAULT_SLURM_POLL_INTERVAL_SECONDS = 10
-DEFAULT_SLURM_JOB_TIMEOUT_SECONDS = 24 * 60 * 60
+DEFAULT_SLURM_JOB_TIMEOUT_SECONDS = 48 * 60 * 60
 
 
 @dataclass(frozen=True, slots=True)

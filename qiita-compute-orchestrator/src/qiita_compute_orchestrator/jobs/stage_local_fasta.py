@@ -19,10 +19,15 @@ here.
 with miint's `read_fastx` table function (native parser; `.gz` transparent;
 `read_id` is the header's first token, matching the remote path), and the 64 KB
 chunking is miint's native `sequence_split` (`UNNEST`ed) — never a hand-rolled
-Python parser. `read_fastx` only accepts a literal path arg (no lateral join
-over a path column), so the manifest is iterated in Python with one
-`read_fastx(?)` per file; that is control flow only — no sequence bytes pass
-through Python.
+Python parser. `read_fastx` accepts a `VARCHAR[]` of paths, so the whole
+manifest is one streaming scan — no per-file Python loop and no sequence bytes
+through Python. The scan runs twice: pass 1 keeps only `(read_id, length,
+filepath)` for the sanity checks (so the full sequences are never materialised —
+the old per-file temp table was the dominant spill source); pass 2 streams
+read → split → Parquet without landing sequences in a table. Re-reading each
+FASTA (2× decompress) is deliberate — far cheaper than spilling hundreds of
+genomes. Empty files are pre-filtered out (`read_fastx` raises on a 0-record
+input, and one empty path aborts the whole `VARCHAR[]` scan).
 
 **Bounded memory is config, not algorithm.** `read_fastx(..., max_batch_bytes)`
 caps each read batch by bytes so a multi-MB genome record (GG2 reaches ~21 MB)
@@ -66,21 +71,21 @@ from ..miint import (
 YAML_STEP_NAME = "stage_local_fasta"
 
 # DuckDB resource caps for this step. `_DUCKDB_MEMORY_GB` is the OFF-SLURM
-# fallback (local backend / tests), sized to the YAML baseline (mem_gb=8 minus
-# ~1 GB headroom). Under SLURM the limit instead tracks the real cgroup via
+# fallback (local backend / tests), sized to the YAML baseline (mem_gb=32 minus
+# ~2 GB headroom). Under SLURM the limit instead tracks the real cgroup via
 # `resolve_duckdb_memory_gb()` (SLURM_MEM_PER_NODE), so a `--mem-gb` override
 # (#102) actually reaches DuckDB — a genome-scale FASTA OOM'd here at the old
 # fixed 7 GB no matter how large the allocation was. DuckDB owns the whole box in
 # this step (no in-process co-consumer), so it gets the allocation minus headroom.
-_DUCKDB_MEMORY_GB = 7
-_DUCKDB_THREADS = 4
+_DUCKDB_MEMORY_GB = 30
+_DUCKDB_THREADS = 8
 
 # Byte budget for each `read_fastx` batch. Caps the read-side vector so a run of
 # multi-MB genome records can't materialise a 2048-row × 21 MB chunk before the
 # chunking operator runs. One of three memory levers — the others are the
 # `memory_limit`/`temp_directory` spill (apply_duckdb_settings) and the write
 # buffer (`ROW_GROUP_SIZE` in PARQUET_OPTS_CHUNKED).
-_READ_FASTX_MAX_BATCH_BYTES = "64MB"
+_READ_FASTX_MAX_BATCH_BYTES = "512MB"
 
 # Cap on how many offending read_ids we name in a fail-fast error so a
 # pathologically bad manifest doesn't build a multi-megabyte message.
@@ -133,11 +138,12 @@ def _read_manifest(manifest_path: Path) -> list[Path]:
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
-    """Read every manifest FASTA with `read_fastx`; emit one combined chunked
-    Parquet. Validates the manifest and each listed file, stages all reads into a
-    DuckDB table (one `read_fastx` per file), fails fast on an empty-body record
-    or a duplicate read_id, then COPYs the `sequence_split`/`UNNEST` chunking to
-    `fasta.parquet`. Returns `{"fasta_path": <parquet>}`.
+    """Read every manifest FASTA with one `read_fastx(VARCHAR[])` scan; emit one
+    combined chunked Parquet. Validates the manifest and each listed file, stages
+    only `(read_id, length, filepath)` into a small temp table, fails fast on an
+    empty-body record or a duplicate read_id, then re-scans and COPYs the
+    `sequence_split`/`UNNEST` chunking to `fasta.parquet` without materialising
+    the sequences. Returns `{"fasta_path": <parquet>}`.
     """
     if not inputs.fasta_manifest_path.is_absolute():
         raise ValueError(
@@ -164,27 +170,34 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 threads=_DUCKDB_THREADS,
             )
 
-            # Stage one row per read across all files. read_fastx parses FASTA
-            # natively (gz-transparent) and only takes a literal path, so we
-            # loop in Python — control flow only, no sequence bytes in Python.
-            # `max_batch_bytes` caps the read-side vector for genome-scale
-            # records. A 0-record file would make read_fastx throw "Empty
-            # file"; the plan skips such files, so pre-check and continue.
-            conn.execute("CREATE TEMP TABLE reads (read_id VARCHAR, sequence VARCHAR)")
-            for fasta_path in fasta_paths:
-                if is_empty_sequence_file(fasta_path):
-                    continue
-                conn.execute(
-                    "INSERT INTO reads "
-                    "SELECT read_id, sequence1 "
-                    f"FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}')",
-                    [str(fasta_path)],
+            # read_fastx takes a VARCHAR[] of paths — one streaming scan over
+            # every file, no per-file Python loop and no full-sequence temp
+            # table. Pre-filter empties: read_fastx raises "Empty file" on a
+            # 0-record input, and one empty file in the list aborts the whole
+            # scan.
+            paths = [str(p) for p in fasta_paths if not is_empty_sequence_file(p)]
+            if not paths:
+                raise ValueError(
+                    f"manifest lists only empty FASTA files: {inputs.fasta_manifest_path}"
                 )
+
+            # Pass 1 — lengths + filepath only; no sequence bytes retained, so
+            # the sanity checks (empty-body, dup read_id) cost a tiny table
+            # instead of materialising every genome (the old spill source).
+            # `max_batch_bytes` caps the read-side vector for genome-scale
+            # records; `include_filepath` lets the dup report name the file.
+            conn.execute(
+                "CREATE TEMP TABLE read_sanity AS "
+                "SELECT read_id, length(sequence1) AS length, filepath "
+                f"FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}', "
+                "include_filepath:=true)",
+                [paths],
+            )
 
             # Empty-body records: a named read with no sequence is bad data.
             # read_fastx surfaces them as length-0 rows, so detect in SQL.
             empties = conn.execute(
-                "SELECT read_id FROM reads WHERE length(sequence) = 0 ORDER BY read_id LIMIT ?",
+                "SELECT read_id FROM read_sanity WHERE length = 0 ORDER BY read_id LIMIT ?",
                 [_MAX_REPORT],
             ).fetchall()
             if empties:
@@ -194,30 +207,38 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # Duplicate read_id: the global genome_map join key must be unique.
             # One row per read here, so a plain GROUP BY HAVING count(*) > 1.
             dupes = conn.execute(
-                "SELECT read_id FROM reads GROUP BY read_id HAVING count(*) > 1 "
-                "ORDER BY read_id LIMIT ?",
+                "SELECT read_id, string_agg(DISTINCT filepath, ', ') AS files "
+                "FROM read_sanity "
+                "GROUP BY read_id HAVING count(*) > 1 "
+                "ORDER BY read_id LIMIT ? ",
                 [_MAX_REPORT],
             ).fetchall()
             if dupes:
                 names = ", ".join(row[0] for row in dupes)
+                files = ", ".join(row[1] for row in dupes)
                 raise ValueError(
                     "duplicate read_id in FASTA manifest — read_id is the global "
-                    f"genome_map join key and must be unique: {names}"
+                    "genome_map join key and must be unique.\n"
+                    f"read_ids -> {names}\n"
+                    f"files -> {files}"
                 )
 
-            # Chunk + write in one COPY using miint's native `sequence_split`
-            # (single chunking definition for both this job and the CLI; see
-            # qiita_common.chunking). Each sequence splits into 64 KB pieces in a
-            # single linear pass; UNNEST gives one row per chunk.
+            # Pass 2 — chunk + write in one streaming COPY using miint's native
+            # `sequence_split` (shared chunker; see qiita_common.chunking). Each
+            # sequence splits into 64 KB pieces in a single linear pass; UNNEST
+            # gives one row per chunk. Sequences flow read -> split -> parquet
+            # without ever landing in a table. This re-reads each FASTA (2x
+            # decompress total) — deliberate: far cheaper than materialising
+            # hundreds of genomes only to spill them.
             conn.execute(
                 "COPY ("
                 "  SELECT read_id, c.chunk_index, c.chunk_data FROM ("
-                f"    SELECT read_id, UNNEST({sequence_split_expr('sequence')}) AS c FROM reads"
+                f"    SELECT read_id, UNNEST({sequence_split_expr('sequence1')}) AS c "
+                f"    FROM read_fastx(?, max_batch_bytes:='{_READ_FASTX_MAX_BATCH_BYTES}')"
                 "  )"
-                f") TO '{fasta_out}' ({PARQUET_OPTS_CHUNKED})"
+                f") TO '{fasta_out}' ({PARQUET_OPTS_CHUNKED})",
+                [paths],
             )
-
-            conn.execute("DROP TABLE reads")
         success = True
     finally:
         # Drop the DuckDB spill dir before returning so the SLURM launcher's
