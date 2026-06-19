@@ -48,11 +48,14 @@ context_schema:
       minLength: 1
       pattern: "^/"
     # Host-filter gate. `host_filter_enabled` defaults off; when true,
-    # `host_reference_idx` must name an ACTIVE host reference carrying BOTH a
-    # rype and a minimap2 index (the runner's _resolve_host_filter_indexes
-    # resolves them and 400s the submission otherwise). NOTE: this is a plain
-    # reference idx, NOT a `*_upload_idx` — the upload-handle walker only touches
-    # `_upload_idx` keys, so it leaves this one alone.
+    # `host_reference_idx` must name an ACTIVE host reference carrying at least
+    # ONE of a rype or minimap2 index (the runner's _resolve_host_filter_indexes
+    # binds whichever exist and 400s the submission if neither does). This is the
+    # legacy single-reference layout; fastq-to-parquet/1.2.0 instead takes an
+    # independent reference per tool (host_rype_reference_idx +
+    # host_minimap2_reference_idx). NOTE: this is a plain reference idx, NOT a
+    # `*_upload_idx` — the upload-handle walker only touches `_upload_idx` keys,
+    # so it leaves this one alone.
     host_filter_enabled:
       type: boolean
     host_reference_idx:

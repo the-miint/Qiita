@@ -117,6 +117,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
     ),
     # /sequencing-run
     (
+        "URL_SEQUENCING_RUN_BY_IDX",
+        "PATH_SEQUENCING_RUN_PREFIX",
+        "PATH_SEQUENCING_RUN_BY_IDX",
+    ),
+    (
         "URL_SEQUENCING_RUN_SEQUENCED_POOL",
         "PATH_SEQUENCING_RUN_PREFIX",
         "PATH_SEQUENCING_RUN_SEQUENCED_POOL",

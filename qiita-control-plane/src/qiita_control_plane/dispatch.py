@@ -88,6 +88,7 @@ async def _run_and_log(app: FastAPI, work_ticket_idx: int, *, resume: bool = Fal
             data_plane_url=app.state.settings.data_plane_url,
             work_ticket_workspace_root=workspace_root,
             upload_staging_root=upload_staging_root,
+            default_adapter_reference_idx=app.state.settings.default_adapter_reference_idx,
             resume=resume,
         )
     except Exception:

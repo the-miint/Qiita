@@ -54,6 +54,17 @@ def _parse_positive_int_env(var: str, default: int) -> int:
     return value
 
 
+def _parse_optional_positive_int_env(var: str) -> int | None:
+    """Like `_parse_positive_int_env` but returns None when the var is unset,
+    for genuinely optional positive-int settings (e.g. a default reference idx
+    that only QC-enabled deploys configure). Still fails loudly on a present-but
+    -invalid value rather than silently treating it as unset.
+    """
+    if os.environ.get(var) is None:
+        return None
+    return _parse_positive_int_env(var, default=1)
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     database_url: str
@@ -130,6 +141,13 @@ class Settings:
     # footer simply omits the SHA. Never required at boot — a missing
     # build stamp must not keep the unit down.
     build_sha: str | None = None
+    # reference_idx of the canonical `artifact_sequence_set` reference the QC
+    # step trims adapters against. Optional in the dataclass (tests and
+    # QC-less deploys don't need it); set from QIITA_DEFAULT_ADAPTER_REFERENCE_IDX.
+    # The runner's `_resolve_qc_adapters` fails the submission of any workflow
+    # whose steps need `adapter_parquet` when this is None — so a QC-enabled deploy
+    # must set it (after loading the adapter set), but a non-QC deploy needn't.
+    default_adapter_reference_idx: int | None = None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -225,4 +243,7 @@ class Settings:
             path_scratch_staging=upload_root,
             contact_email=contact_email,
             build_sha=os.environ.get("BUILD_SHA") or None,
+            default_adapter_reference_idx=_parse_optional_positive_int_env(
+                "QIITA_DEFAULT_ADAPTER_REFERENCE_IDX"
+            ),
         )

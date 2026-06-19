@@ -28,6 +28,7 @@ read/PATCH live in the sibling sequenced_sample route module.
 """
 
 import base64
+import json
 from typing import Annotated
 
 import asyncpg
@@ -36,11 +37,12 @@ from pydantic import Field
 from qiita_common.api_paths import (
     PATH_SEQUENCED_POOL_BY_IDX,
     PATH_SEQUENCED_POOL_PREFLIGHT,
+    PATH_SEQUENCING_RUN_BY_IDX,
     PATH_SEQUENCING_RUN_PREFIX,
     PATH_SEQUENCING_RUN_ROOT,
     PATH_SEQUENCING_RUN_SEQUENCED_POOL,
 )
-from qiita_common.auth_constants import Scope
+from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
     SequencedPoolCreateRequest,
     SequencedPoolCreateResponse,
@@ -48,6 +50,7 @@ from qiita_common.models import (
     SequencedPoolPreflightResponse,
     SequencingRunCreateRequest,
     SequencingRunCreateResponse,
+    SequencingRunResponse,
 )
 
 from ..actions.sequenced_pool import (
@@ -59,6 +62,8 @@ from ..actions.sequenced_pool import (
 from ..auth.guards import (
     require_caller_owns_run,
     require_complete_profile,
+    require_human,
+    require_role_at_least,
     require_scope,
     require_sequenced_pool_in_run,
     require_sequencing_run_exists,
@@ -69,6 +74,7 @@ from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
 from ..repositories.sequencing_run import (
     PayloadMismatch,
     fetch_sequenced_pool_preflight,
+    fetch_sequencing_run,
     insert_sequenced_pool,
     insert_sequencing_run,
 )
@@ -124,6 +130,37 @@ async def create_sequencing_run(
     if not created:
         response.status_code = status.HTTP_200_OK
     return SequencingRunCreateResponse(sequencing_run_idx=sequencing_run_idx)
+
+
+@router.get(PATH_SEQUENCING_RUN_BY_IDX)
+async def get_sequencing_run(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+) -> SequencingRunResponse:
+    """Read one sequencing_run's metadata by idx.
+
+    Returns the run's caller-visible columns (see `fetch_sequencing_run`),
+    notably `instrument_model` — the field `qiita submit-host-filter-pool` reads
+    to forward QC's polyG gate per sample. Same read gate as the pool roster
+    route (`list_sequenced_samples_in_pool`): a HumanUser with
+    `Scope.PREP_SAMPLE_READ` and system_role at least wet_lab_admin. 404 when the
+    run does not exist.
+    """
+    row = await fetch_sequencing_run(pool, sequencing_run_idx)
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail=f"sequencing_run {sequencing_run_idx} not found"
+        )
+    data = dict(row)
+    data["sequencing_run_idx"] = data.pop("idx")
+    # asyncpg returns JSONB as text (no codec registered); decode so the response
+    # carries an object, matching the study GET route's handling.
+    if isinstance(data["extra_metadata"], str):
+        data["extra_metadata"] = json.loads(data["extra_metadata"])
+    return SequencingRunResponse.model_validate(data)
 
 
 @router.post(PATH_SEQUENCING_RUN_SEQUENCED_POOL, status_code=201)
