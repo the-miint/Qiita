@@ -145,7 +145,7 @@ class Settings:
     # step trims adapters against. Optional in the dataclass (tests and
     # QC-less deploys don't need it); set from QIITA_DEFAULT_ADAPTER_REFERENCE_IDX.
     # The runner's `_resolve_qc_adapters` fails the submission of any workflow
-    # whose steps need `adapter_fasta` when this is None — so a QC-enabled deploy
+    # whose steps need `adapter_parquet` when this is None — so a QC-enabled deploy
     # must set it (after loading the adapter set), but a non-QC deploy needn't.
     default_adapter_reference_idx: int | None = None
 

@@ -42,9 +42,14 @@ def _q(seq: str, val: int = 35) -> list[int]:
     return [val] * len(seq)
 
 
-def _adapter_fasta(tmp_path: Path) -> Path:
-    p = tmp_path / "adapters.fasta"
-    p.write_text(f">0\n{_ADAPTER}\n")
+def _adapter_parquet(tmp_path: Path) -> Path:
+    """The runner-staged adapter Parquet (columns feature_idx, sequence) the qc
+    job reads via read_parquet."""
+    p = tmp_path / "adapters.parquet"
+    with duckdb.connect(":memory:") as conn:
+        conn.execute("CREATE TABLE a(feature_idx BIGINT, sequence VARCHAR)")
+        conn.execute("INSERT INTO a VALUES (0, ?)", [_ADAPTER])
+        conn.execute(f"COPY a TO '{p}' (FORMAT PARQUET)")
     return p
 
 
@@ -75,7 +80,7 @@ def test_qc_smoke_se_adapter_trim_and_length_filter(tmp_path, write_reads_q, rea
     )
     inputs = qc.Inputs(
         reads=reads,
-        adapter_fasta=_adapter_fasta(tmp_path),
+        adapter_parquet=_adapter_parquet(tmp_path),
         instrument_model="Illumina MiSeq",  # not 2-color: no polyG
         prep_sample_idx=5,
         work_ticket_idx=1,
@@ -103,7 +108,7 @@ def test_qc_smoke_pe_pair_drop_when_one_mate_short(tmp_path, write_reads_q, read
     )
     inputs = qc.Inputs(
         reads=reads,
-        adapter_fasta=_adapter_fasta(tmp_path),
+        adapter_parquet=_adapter_parquet(tmp_path),
         instrument_model="Illumina MiSeq",
         prep_sample_idx=5,
         work_ticket_idx=1,
@@ -125,14 +130,14 @@ def test_qc_smoke_polyg_gated_on_instrument(tmp_path, write_reads_q, read_surviv
 
     nextseq = qc.Inputs(
         reads=write_reads_q(tmp_path / "ns.parquet", rows),
-        adapter_fasta=_adapter_fasta(tmp_path),
+        adapter_parquet=_adapter_parquet(tmp_path),
         instrument_model="NextSeq 550",
         prep_sample_idx=5,
         work_ticket_idx=1,
     )
     miseq = qc.Inputs(
         reads=write_reads_q(tmp_path / "ms.parquet", rows),
-        adapter_fasta=_adapter_fasta(tmp_path),
+        adapter_parquet=_adapter_parquet(tmp_path),
         instrument_model="Illumina MiSeq",
         prep_sample_idx=5,
         work_ticket_idx=1,

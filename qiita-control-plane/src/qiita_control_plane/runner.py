@@ -324,9 +324,9 @@ async def run_workflow(
         # left them untouched.
         bound.update(await _resolve_host_filter_indexes(pool, action_context=bound))
 
-        # QC adapter materialization: when any step needs `adapter_fasta` (the
+        # QC adapter materialization: when any step needs `adapter_parquet` (the
         # qc step), DoGet the configured artifact_sequence_set reference's
-        # sequences and stage them as a local FASTA in the ticket workspace.
+        # sequences and stage them as a local Parquet in the ticket workspace.
         # Same pre-loop, inside-try placement as host-filter resolution so a
         # failure (unconfigured / non-active / empty adapter set) lands in the
         # outer FAILED handler rather than leaving the ticket stuck in PROCESSING.
@@ -1290,10 +1290,10 @@ async def _resolve_host_filter_legacy(
     return bound
 
 
-# Binding name the runner stages the canonical adapter FASTA under. A step that
-# lists this in its `inputs` (the qc step) signals the runner to materialize the
-# adapter set before the step loop (see `_resolve_qc_adapters`).
-QC_ADAPTER_BINDING = "adapter_fasta"
+# Binding name the runner stages the canonical adapter set (a Parquet) under. A
+# step that lists this in its `inputs` (the qc step) signals the runner to
+# materialize the adapter set before the step loop (see `_resolve_qc_adapters`).
+QC_ADAPTER_BINDING = "adapter_parquet"
 
 # The DuckLake table holding actual sequence bytes (reference_sequences is
 # metadata only). Must match the data plane's ALLOWED_TABLES whitelist and the
@@ -1320,12 +1320,21 @@ def _do_get_reference_sequence_chunks(
     return list(zip(cols["feature_idx"], cols["chunk_index"], cols["chunk_data"], strict=True))
 
 
-def _write_adapter_fasta(rows: list[tuple[int, int, str]], out_path: Path) -> int:
+def _write_adapter_parquet(rows: list[tuple[int, int, str]], out_path: Path) -> int:
     """Reassemble chunked sequences (group by feature_idx, order by chunk_index,
     concat chunk_data — the same string_agg the data plane documents) into a
-    FASTA at `out_path`, one record per feature. Returns the sequence count.
-    Raises ValueError on an empty set — an adapter reference with no sequences
-    is a misconfiguration, not a valid QC input.
+    Parquet at `out_path`, one row per feature with columns `feature_idx` (BIGINT,
+    provenance) and `sequence` (VARCHAR, the adapter). Rows are sorted by
+    feature_idx for determinism; the qc job reads only `sequence` via
+    `read_parquet`. Returns the sequence count. Raises ValueError on an empty set
+    — an adapter reference with no sequences is a misconfiguration, not a valid QC
+    input.
+
+    Parquet (not FASTA) keeps the adapter set in the same columnar format as the
+    reads it trims, so the qc job reads it with `read_parquet` and no FASTA
+    parsing. pyarrow (already this module's Flight dependency) writes it directly
+    from the reassembled rows — no DuckDB connection needed on the control plane's
+    pre-loop path.
 
     Input contract (the reference-load flow, jobs/reference_load.py): chunk_data
     is a substring of a parsed FASTA record, so it is newline-free, and a feature
@@ -1333,21 +1342,31 @@ def _write_adapter_fasta(rows: list[tuple[int, int, str]], out_path: Path) -> in
     pending→loading→active), so (feature_idx, chunk_index) is unique. Hence no
     newline sanitation or chunk dedup here — both would mask a real corruption we
     want to surface."""
+    import pyarrow as pa  # noqa: PLC0415
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
     by_feature: dict[int, list[tuple[int, str]]] = {}
     for feature_idx, chunk_index, chunk_data in rows:
         by_feature.setdefault(feature_idx, []).append((chunk_index, chunk_data))
     if not by_feature:
         raise ValueError("adapter reference returned no sequences")
-    parts = [
-        f">{feature_idx}\n{''.join(chunk for _, chunk in sorted(chunks))}\n"
-        for feature_idx, chunks in sorted(by_feature.items())
+    feature_ids = sorted(by_feature)
+    sequences = [
+        "".join(chunk for _, chunk in sorted(by_feature[feature_idx]))
+        for feature_idx in feature_ids
     ]
-    out_path.write_text("".join(parts), encoding="utf-8")
+    table = pa.table(
+        {
+            "feature_idx": pa.array(feature_ids, type=pa.int64()),
+            "sequence": pa.array(sequences, type=pa.string()),
+        }
+    )
+    pq.write_table(table, str(out_path))
     return len(by_feature)
 
 
 def _workflow_needs_adapters(steps: list[Any]) -> bool:
-    """True iff some entry declares `adapter_fasta` as an (optional) input — the
+    """True iff some entry declares `adapter_parquet` as an (optional) input — the
     signal the runner must materialize the adapter set before the step loop."""
     for entry in steps:
         names = list(getattr(entry, "inputs", []) or []) + list(
@@ -1366,13 +1385,14 @@ async def _resolve_qc_adapters(
     hmac_secret: bytes,
     workspace: Path,
 ) -> dict[str, Path]:
-    """Materialize the canonical adapter set as a local FASTA for the QC step.
+    """Materialize the canonical adapter set as a local one-`sequence`-column
+    Parquet for the QC step.
 
     Run before the step loop when `_workflow_needs_adapters`. Resolves the
     configured `artifact_sequence_set` reference, signs + DoGets its sequence
     chunks from the data plane, reassembles them, and writes
-    `<workspace>/adapters.fasta` (the shared-FS ticket root every compute node
-    sees) — bound to the qc step as `adapter_fasta`. Re-run safe: a resume
+    `<workspace>/adapters.parquet` (the shared-FS ticket root every compute node
+    sees) — bound to the qc step as `adapter_parquet`. Re-run safe: a resume
     re-materializes the same file (DoGet is read-only).
 
     Like `_resolve_host_filter_indexes`, every failure raises a
@@ -1433,15 +1453,15 @@ async def _resolve_qc_adapters(
             f"{type(exc).__name__}: {exc}"
         ) from exc
     workspace.mkdir(parents=True, exist_ok=True)
-    adapter_fasta = workspace / "adapters.fasta"
+    adapter_parquet = workspace / "adapters.parquet"
     try:
-        _write_adapter_fasta(rows, adapter_fasta)
+        _write_adapter_parquet(rows, adapter_parquet)
     except ValueError as exc:
-        adapter_fasta.unlink(missing_ok=True)
+        adapter_parquet.unlink(missing_ok=True)
         raise _submission_bad_input(
             f"default adapter reference {default_adapter_reference_idx}: {exc}"
         ) from exc
-    return {QC_ADAPTER_BINDING: adapter_fasta}
+    return {QC_ADAPTER_BINDING: adapter_parquet}
 
 
 # =============================================================================

@@ -33,11 +33,12 @@ Single-end rows (`sequence2 IS NULL`) take the SE chain. The two layouts are
 routed to separate seams so each runs the right miint overload.
 
 Adapters: the canonical adapter set is materialized by the runner
-(`_resolve_qc_adapters`) into the bound `adapter_fasta`, read here with miint's
-`read_fastx` (the same reader `fastq_to_parquet` uses for the input reads), and
-rendered into a constant SQL `VARCHAR[]` (miint's QC functions require bind-time
-constants — the adapter list cannot be a column/parameter). QC is always-on in
-this path, so `adapter_fasta` is a REQUIRED input and an empty one is fail-fast.
+(`_resolve_qc_adapters`) into the bound `adapter_parquet` (a one-`sequence`-column
+Parquet), read here with `read_parquet` — the same columnar format the rest of the
+pipeline uses, so no FASTA parsing — and rendered into a constant SQL `VARCHAR[]`
+(miint's QC functions require bind-time constants — the adapter list cannot be a
+column/parameter). QC is always-on in this path, so `adapter_parquet` is a
+REQUIRED input and an empty one is fail-fast.
 
 Drop-only + trim, `sequence_idx`-preserving: the 6-column schema and the
 lake-friendly `ORDER BY sequence_idx` layout are preserved. A sample where QC
@@ -98,13 +99,14 @@ _TRIM_PE_OVERLAP_DEFAULTS = "30, 5, 20, false, 0, false"
 # and forwarded per sample; None for non-bcl uploads -> polyG OFF).
 _TWO_COLOR_MODEL_SUBSTRINGS = ("nextseq", "novaseq", "miniseq")
 
-# In-DuckDB relation names. The SE/PE source views and the output accumulator
-# table. (Unlike host_filter these need not be non-temp for a separate-connection
-# reason — the QC functions are SCALAR, evaluated inline on this connection — but
-# regular views/tables are the simplest named relations the seams can target.)
+# In-DuckDB relation names for the SE/PE source views. (Unlike host_filter these
+# need not be non-temp for a separate-connection reason — the QC functions are
+# SCALAR, evaluated inline on this connection — but a regular view is the simplest
+# named relation each seam can target.) There is no output accumulator table: the
+# two seams' SELECTs are UNION ALL'd straight into the final COPY so DuckDB streams
+# the whole transform to Parquet without materialising it.
 _SE = "qc_se"
 _PE = "qc_pe"
-_OUT = "qc_out"
 
 
 class Inputs(BaseModel):
@@ -112,7 +114,7 @@ class Inputs(BaseModel):
 
     `reads` is fastq_to_parquet's `reads.parquet` (binding name `reads`):
     `(sequence_idx BIGINT, read_id, sequence1, qual1, sequence2, qual2)`.
-    `adapter_fasta` is the canonical adapter set the runner materializes
+    `adapter_parquet` is the canonical adapter set the runner materializes
     (`_resolve_qc_adapters`) — REQUIRED (QC is always-on; an empty set is a
     misconfiguration). `instrument_model` gates polyG trimming (None -> OFF);
     it is forwarded from qiita.sequencing_run per sample. `prep_sample_idx` /
@@ -120,7 +122,7 @@ class Inputs(BaseModel):
     """
 
     reads: Path
-    adapter_fasta: Path
+    adapter_parquet: Path
     instrument_model: str | None = None
     prep_sample_idx: int
     work_ticket_idx: int
@@ -135,24 +137,25 @@ def _is_two_color(instrument_model: str | None) -> bool:
     return any(sub in model for sub in _TWO_COLOR_MODEL_SUBSTRINGS)
 
 
-def _read_adapter_fasta(conn: duckdb.DuckDBPyConnection, path: Path) -> list[str]:
-    """Read adapter sequences from a FASTA via miint's `read_fastx` (one row per
-    record; `sequence1` is the adapter) — the same reader `fastq_to_parquet` uses
-    for the input reads, so FASTA wrapping/parsing is miint's job, not ours.
+def _read_adapter_parquet(conn: duckdb.DuckDBPyConnection, path: Path) -> list[str]:
+    """Read adapter sequences from the runner-staged Parquet (one row per record,
+    column `sequence`) via `read_parquet` — the same columnar format the rest of
+    the pipeline uses, so no FASTA parsing here.
 
     Raises ValueError when the set is empty or unreadable — an adapter reference
-    with no sequences (or a malformed FASTA) is a misconfiguration, not a valid
-    QC input. `read_fastx` THROWS a duckdb.Error on an empty/blank file rather
-    than returning zero rows, so we catch that and re-raise as ValueError (which
-    the framework dispatcher maps to BAD_INPUT); catching the exception TYPE,
-    not its wording, keeps this robust to a future miint message change."""
+    with no sequences (or an unreadable file) is a misconfiguration, not a valid
+    QC input. A read failure surfaces as a duckdb.Error, which we re-raise as
+    ValueError (mapped to BAD_INPUT by the framework dispatcher); catching the
+    exception TYPE, not its wording, keeps this robust to a future message change.
+    The runner guarantees >=1 sequence, but the empty guard stays so a
+    hand-staged file can't slip an empty adapter list past QC."""
     try:
-        rows = conn.execute("SELECT sequence1 FROM read_fastx(?)", [str(path)]).fetchall()
+        rows = conn.execute("SELECT sequence FROM read_parquet(?)", [str(path)]).fetchall()
     except duckdb.Error as exc:
-        raise ValueError(f"adapter_fasta could not be read as FASTA: {path}: {exc}") from exc
+        raise ValueError(f"adapter_parquet could not be read: {path}: {exc}") from exc
     adapters = [r[0] for r in rows]
     if not adapters:
-        raise ValueError(f"adapter_fasta contains no sequences: {path}")
+        raise ValueError(f"adapter_parquet contains no sequences: {path}")
     return adapters
 
 
@@ -165,17 +168,16 @@ def _adapters_sql(adapters: list[str]) -> str:
     return f"[{elements}]::VARCHAR[]"
 
 
-def _run_qc_se(
-    conn: duckdb.DuckDBPyConnection,
+def _qc_se_select(
     src_view: str,
-    dest_table: str,
     *,
     adapters_sql: str,
     apply_polyg: bool,
-) -> None:
-    """Seam around the single-end miint chain: adapter trim -> optional polyG ->
-    length/quality filter. Appends the surviving (trimmed) reads into
-    `dest_table` with a NULL R2. Isolated so unit tests stub the real miint calls.
+) -> str:
+    """Build the single-end QC SELECT: adapter trim -> optional polyG ->
+    length/quality filter, projected to the 6-column output schema with a NULL R2.
+    Returns SQL (no execution) so the SE and PE seams can be UNION ALL'd into one
+    streaming COPY. Isolated so unit tests assert the generated SQL.
 
     The trimmed sequence/quality come from the last trim step (polyG if applied,
     else adapter); `filter_read` only decides pass/fail, so its struct is read in
@@ -196,27 +198,31 @@ def _run_qc_se(
             f"trim_adapters(sequence1, qual1, {adapters_sql}) AS ta FROM {src_view}"
         )
         seq, qual = "ta['sequence']", "ta['quality']"
-    conn.execute(
-        f"INSERT INTO {dest_table} "
-        f"SELECT sequence_idx, read_id, {seq}, {qual}, NULL::VARCHAR, NULL::UTINYINT[] "
+    # Alias every output column: this SELECT is the FIRST branch of the COPY's
+    # UNION ALL, so DuckDB takes the Parquet column names from here. The 6-col
+    # (sequence_idx, read_id, sequence1, qual1, sequence2, qual2) schema is the
+    # contract host_filter consumes — without the aliases the trim-struct
+    # expressions and NULL literals would name the columns wrong.
+    return (
+        f"SELECT sequence_idx, read_id, {seq} AS sequence1, {qual} AS qual1, "
+        "NULL::VARCHAR AS sequence2, NULL::UTINYINT[] AS qual2 "
         f"FROM ({inner}) "
         f"WHERE filter_read({seq}, {qual}, {_MIN_LENGTH}, {_FILTER_READ_TAIL})['passed']"
     )
 
 
-def _run_qc_pe(
-    conn: duckdb.DuckDBPyConnection,
+def _qc_pe_select(
     src_view: str,
-    dest_table: str,
     *,
     adapters_sql: str,
     apply_polyg: bool,
-) -> None:
-    """Seam around the paired-end miint chain: overlap-aware adapter trim ->
-    optional per-mate polyG -> per-mate length/quality filter. The pair is kept
-    only when BOTH mates pass (drop the pair if EITHER mate falls below
-    min_length after trimming). Appends the surviving (trimmed) pairs into
-    `dest_table`. Isolated so unit tests stub the real miint calls."""
+) -> str:
+    """Build the paired-end QC SELECT: overlap-aware adapter trim -> optional
+    per-mate polyG -> per-mate length/quality filter, projected to the 6-column
+    output schema. The pair is kept only when BOTH mates pass (drop the pair if
+    EITHER mate falls below min_length after trimming). Returns SQL (no execution)
+    so it can be UNION ALL'd into the streaming COPY. Isolated so unit tests
+    assert the generated SQL."""
     adapter_layer = (
         "SELECT sequence_idx, read_id, "
         "trim_adapters_pe(sequence1, qual1, sequence2, qual2, "
@@ -235,9 +241,11 @@ def _run_qc_pe(
         inner = adapter_layer
         s1, q1 = "ta['sequence1']", "ta['quality1']"
         s2, q2 = "ta['sequence2']", "ta['quality2']"
-    conn.execute(
-        f"INSERT INTO {dest_table} "
-        f"SELECT sequence_idx, read_id, {s1}, {q1}, {s2}, {q2} "
+    # Aliases keep the column names aligned with the SE branch (the UNION ALL's
+    # first branch sets the Parquet column names); see _qc_se_select.
+    return (
+        f"SELECT sequence_idx, read_id, {s1} AS sequence1, {q1} AS qual1, "
+        f"{s2} AS sequence2, {q2} AS qual2 "
         f"FROM ({inner}) "
         f"WHERE filter_read({s1}, {q1}, {_MIN_LENGTH}, {_FILTER_READ_TAIL})['passed'] "
         f"AND filter_read({s2}, {q2}, {_MIN_LENGTH}, {_FILTER_READ_TAIL})['passed']"
@@ -247,8 +255,8 @@ def _run_qc_pe(
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     if not inputs.reads.exists():
         raise FileNotFoundError(f"reads parquet not found: {inputs.reads}")
-    if not inputs.adapter_fasta.exists():
-        raise FileNotFoundError(f"adapter_fasta not found: {inputs.adapter_fasta}")
+    if not inputs.adapter_parquet.exists():
+        raise FileNotFoundError(f"adapter_parquet not found: {inputs.adapter_parquet}")
 
     apply_polyg = _is_two_color(inputs.instrument_model)
 
@@ -270,10 +278,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 threads=_DUCKDB_THREADS,
             )
 
-            # Read + render the adapter set via miint's read_fastx (fail fast on
+            # Read + render the adapter set from the staged Parquet (fail fast on
             # an empty/unreadable set). The constant VARCHAR[] is inlined into the
             # QC SQL — miint requires a bind-time constant adapter list.
-            adapters_sql = _adapters_sql(_read_adapter_fasta(conn, inputs.adapter_fasta))
+            adapters_sql = _adapters_sql(_read_adapter_parquet(conn, inputs.adapter_parquet))
 
             # Route by layout: SE (sequence2 IS NULL) and PE rows take different
             # miint overloads. CREATE VIEW can't take prepared params, so the
@@ -290,23 +298,18 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "SELECT sequence_idx, read_id, sequence1, qual1, sequence2, qual2 "
                 f"FROM read_parquet('{reads_sql}') WHERE sequence2 IS NOT NULL"
             )
-            # Output accumulator (the full 6-col schema). Both seams append into
-            # it; an empty source view contributes nothing.
+            # Stream the whole transform: the SE and PE seams each emit a 6-col
+            # SELECT, UNION ALL'd and sorted straight into the COPY — no
+            # intermediate accumulator table, so DuckDB pipelines reads ->
+            # trim/filter -> sorted Parquet. ORDER BY keeps the lake-friendly
+            # sorted `sequence_idx` layout fastq_to_parquet wrote (the two seams
+            # are individually unordered) and makes the output deterministic; an
+            # empty source view contributes no rows.
+            se_select = _qc_se_select(_SE, adapters_sql=adapters_sql, apply_polyg=apply_polyg)
+            pe_select = _qc_pe_select(_PE, adapters_sql=adapters_sql, apply_polyg=apply_polyg)
             conn.execute(
-                f"CREATE TABLE {_OUT} "
-                "(sequence_idx BIGINT, read_id VARCHAR, sequence1 VARCHAR, "
-                "qual1 UTINYINT[], sequence2 VARCHAR, qual2 UTINYINT[])"
-            )
-
-            _run_qc_se(conn, _SE, _OUT, adapters_sql=adapters_sql, apply_polyg=apply_polyg)
-            _run_qc_pe(conn, _PE, _OUT, adapters_sql=adapters_sql, apply_polyg=apply_polyg)
-
-            # ORDER BY keeps the lake-friendly sorted `sequence_idx` layout
-            # fastq_to_parquet wrote (the two seams append unordered) and makes
-            # the output deterministic.
-            conn.execute(
-                "COPY (SELECT sequence_idx, read_id, sequence1, qual1, sequence2, qual2 "
-                f"FROM {_OUT} ORDER BY sequence_idx) TO '{out_sql}' ({PARQUET_OPTS})"
+                f"COPY (({se_select}) UNION ALL ({pe_select}) ORDER BY sequence_idx) "
+                f"TO '{out_sql}' ({PARQUET_OPTS})"
             )
         success = True
     finally:

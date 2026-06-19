@@ -21,7 +21,7 @@ description: >
   QC (`qc`) is a fastp-equivalent transform: adapter trim → optional polyG trim
   (gated on `instrument_model` being a 2-color instrument) → length/quality
   filter (fastp `-l 100`). It is ALWAYS ON (no gate) — every 1.2.0 run is QC'd.
-  Listing `adapter_fasta` in its inputs signals the runner to materialize the
+  Listing `adapter_parquet` in its inputs signals the runner to materialize the
   canonical adapter set (the configured artifact_sequence_set reference) before
   the step loop.
 
@@ -95,7 +95,7 @@ steps:
       mem_gb: 8
       walltime: PT30M
 
-  # Always-on QC on the minted reads. `adapter_fasta` is materialized by the
+  # Always-on QC on the minted reads. `adapter_parquet` is materialized by the
   # runner's _resolve_qc_adapters (triggered because this step lists it as an
   # input) before the step loop. `instrument_model` rides through `params:`
   # (un-Path-coerced) to gate polyG. Re-emits `reads` (the same binding it
@@ -104,7 +104,7 @@ steps:
   - step: qc
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.qc
-    inputs: [reads, adapter_fasta]
+    inputs: [reads, adapter_parquet]
     params: {instrument_model: instrument_model}
     outputs: [reads]
     # cpu=4 / mem_gb=12 sit above qc.py's DuckDB cap so resolve_duckdb_memory_gb

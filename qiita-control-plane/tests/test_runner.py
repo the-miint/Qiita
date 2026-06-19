@@ -2149,11 +2149,14 @@ async def _make_adapter_reference(pool, reference_idx) -> None:
     )
 
 
-async def test_resolve_qc_adapters_writes_fasta(
+async def test_resolve_qc_adapters_writes_parquet(
     postgres_pool, reference_idx, tmp_path, monkeypatch
 ):
-    """Active artifact_sequence_set + DoGet'd chunks → adapters.fasta in the
-    workspace, with chunks reassembled in chunk_index order per feature."""
+    """Active artifact_sequence_set + DoGet'd chunks → adapters.parquet in the
+    workspace, with chunks reassembled in chunk_index order per feature. The
+    Parquet has (feature_idx, sequence) rows sorted by feature_idx."""
+    import duckdb
+
     from qiita_control_plane import runner
 
     await _make_adapter_reference(postgres_pool, reference_idx)
@@ -2171,8 +2174,14 @@ async def test_resolve_qc_adapters_writes_fasta(
         hmac_secret=b"x" * 16,
         workspace=tmp_path,
     )
-    assert out == {"adapter_fasta": tmp_path / "adapters.fasta"}
-    assert (tmp_path / "adapters.fasta").read_text() == ">7\nAGATGGGG\n>9\nCTGTCTC\n"
+    adapter_parquet = tmp_path / "adapters.parquet"
+    assert out == {"adapter_parquet": adapter_parquet}
+    with duckdb.connect(":memory:") as conn:
+        rows = conn.execute(
+            f"SELECT feature_idx, sequence FROM read_parquet('{adapter_parquet}') "
+            "ORDER BY feature_idx"
+        ).fetchall()
+    assert rows == [(7, "AGATGGGG"), (9, "CTGTCTC")]
 
 
 async def test_resolve_qc_adapters_unconfigured(postgres_pool, tmp_path):
@@ -2248,7 +2257,7 @@ async def test_resolve_qc_adapters_non_active(postgres_pool, reference_idx, tmp_
 
 async def test_resolve_qc_adapters_empty_set(postgres_pool, reference_idx, tmp_path, monkeypatch):
     """An adapter reference that DoGets zero sequences is a misconfiguration →
-    BAD_INPUT, and no partial adapters.fasta is left behind."""
+    BAD_INPUT, and no partial adapters.parquet is left behind."""
     from qiita_control_plane import runner
 
     await _make_adapter_reference(postgres_pool, reference_idx)
@@ -2262,7 +2271,7 @@ async def test_resolve_qc_adapters_empty_set(postgres_pool, reference_idx, tmp_p
             workspace=tmp_path,
         )
     assert ei.value.kind == FailureKind.BAD_INPUT
-    assert not (tmp_path / "adapters.fasta").exists()
+    assert not (tmp_path / "adapters.parquet").exists()
 
 
 async def test_resolve_qc_adapters_dataplane_failure_is_submission_failure(
@@ -2295,13 +2304,13 @@ async def test_resolve_qc_adapters_dataplane_failure_is_submission_failure(
 
 
 async def test_workflow_needs_adapters_detects_adapter_input():
-    """The gate fires only when an entry declares adapter_fasta as an input."""
+    """The gate fires only when an entry declares adapter_parquet as an input."""
     from types import SimpleNamespace
 
     from qiita_control_plane.runner import _workflow_needs_adapters
 
     no_qc = [SimpleNamespace(inputs=["reads"], optional_inputs=["host_rype_path"])]
-    with_qc = [SimpleNamespace(inputs=["reads", "adapter_fasta"], optional_inputs=[])]
+    with_qc = [SimpleNamespace(inputs=["reads", "adapter_parquet"], optional_inputs=[])]
     assert _workflow_needs_adapters(no_qc) is False
     assert _workflow_needs_adapters(with_qc) is True
 
@@ -2313,7 +2322,7 @@ async def test_workflow_needs_adapters_detects_adapter_input():
 # The 1.2.0 chain inserts an always-on `qc` step between fastq and host_filter.
 # Each stage re-emits the `reads` binding it consumes (a transform in place), so
 # host_filter is identical to 1.1.0 and consumes qc's QC'd `reads`. The qc step
-# takes the runner-materialized `adapter_fasta` as a PATH input and the sequencing
+# takes the runner-materialized `adapter_parquet` as a PATH input and the sequencing
 # `instrument_model` as a scalar `params` value.
 
 _FASTQ_TO_PARQUET_V12_STEPS = [
@@ -2332,7 +2341,7 @@ _FASTQ_TO_PARQUET_V12_STEPS = [
         "name": "qc",
         "step_type": "singleton",
         "module": "qiita_compute_orchestrator.jobs.qc",
-        "inputs": ["reads", "adapter_fasta"],
+        "inputs": ["reads", "adapter_parquet"],
         "params": {"instrument_model": "instrument_model"},
         "outputs": ["reads"],
         "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
@@ -2388,7 +2397,7 @@ async def test_fastq_to_parquet_v12_qc_binds_adapter_and_instrument_model(
 ):
     """End-to-end 1.2.0 wiring: the runner dispatches fastq → qc → host_filter in
     order; qc receives `reads` (fastq's output) and the runner-materialized
-    `adapter_fasta` as PATH inputs plus `instrument_model` via params; and
+    `adapter_parquet` as PATH inputs plus `instrument_model` via params; and
     host_filter consumes the `reads` binding qc re-emitted (the QC'd output, not
     fastq's raw reads)."""
     from qiita_control_plane import runner
@@ -2400,7 +2409,7 @@ async def test_fastq_to_parquet_v12_qc_binds_adapter_and_instrument_model(
     )
 
     # Configured artifact_sequence_set adapter reference + a stubbed DoGet so the
-    # pre-loop adapter materialization writes a real adapters.fasta.
+    # pre-loop adapter materialization writes a real adapters.parquet.
     await _make_adapter_reference(postgres_pool, reference_idx)
     monkeypatch.setattr(
         runner,
@@ -2434,13 +2443,13 @@ async def test_fastq_to_parquet_v12_qc_binds_adapter_and_instrument_model(
         # Step order.
         assert [name for name, *_ in backend.calls] == ["fastq", "qc", "host_filter"]
 
-        # qc inputs: `reads` is fastq's output path; `adapter_fasta` is the
+        # qc inputs: `reads` is fastq's output path; `adapter_parquet` is the
         # runner-materialized canonical set (a real file on disk); `instrument_model`
         # rides through `params` as a string (not Path-coerced).
         qc_inputs = next(inp for name, inp, *_ in backend.calls if name == "qc")
         assert qc_inputs["reads"] == backend.outputs_for["fastq"]["reads"]
-        assert qc_inputs["adapter_fasta"].name == "adapters.fasta"
-        assert qc_inputs["adapter_fasta"].exists()
+        assert qc_inputs["adapter_parquet"].name == "adapters.parquet"
+        assert qc_inputs["adapter_parquet"].exists()
         assert qc_inputs["instrument_model"] == "NextSeq 550"
 
         # host_filter consumes the `reads` binding qc re-emitted (the QC'd output),

@@ -547,9 +547,9 @@ def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():
 
     qc = next(s for s in v12.steps if s.name == "qc")
     assert qc.module == "qiita_compute_orchestrator.jobs.qc"
-    # `adapter_fasta` in inputs triggers the runner's adapter materialization;
+    # `adapter_parquet` in inputs triggers the runner's adapter materialization;
     # `reads` is fastq's output, re-emitted as `reads` so host_filter consumes it.
-    assert qc.inputs == ["reads", "adapter_fasta"]
+    assert qc.inputs == ["reads", "adapter_parquet"]
     assert qc.outputs == ["reads"]
     # instrument_model rides through `params` (action_context key -> Inputs field),
     # NOT inputs (it's a scalar, not a host path).

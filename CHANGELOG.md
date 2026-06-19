@@ -26,7 +26,7 @@ the `no-changelog` label).
   consumes the QC'd reads. `context_schema` gains `instrument_model` (forwarded to
   qc's polyG gate via the step's `params`) and the two-reference host-filter keys
   (`host_rype_reference_idx` + optional `host_minimap2_reference_idx`); the qc
-  step lists `adapter_fasta`, which triggers the runner's adapter materialization.
+  step lists `adapter_parquet`, which triggers the runner's adapter materialization.
   1.0.0 and 1.1.0 stay available unchanged (#129)
 - Verified and documented the duckdb-miint fastp-port QC functions
   (`filter_read`, `trim_adapters` / `trim_adapters_pe`, `trim_polyg`) that the
@@ -43,8 +43,8 @@ the `no-changelog` label).
   CHECK widen back it. The control plane gained
   `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX` (the canonical set's reference_idx) and a
   runner resolver (`_resolve_qc_adapters`) that DoGets that set's sequences from
-  the data plane and stages them as a FASTA for the QC step — materialized only
-  for a workflow whose steps need it (#129)
+  the data plane and stages them as a one-`sequence`-column Parquet for the QC
+  step — materialized only for a workflow whose steps need it (#129)
 - New `qc` native job (`qiita_compute_orchestrator.jobs.qc`): a fastp-equivalent
   read-QC transform `reads.parquet` → `qc_reads.parquet` over the duckdb-miint
   fastp-port functions. Per read it runs adapter trim (`trim_adapters` SE /
@@ -52,9 +52,10 @@ the `no-changelog` label).
   `instrument_model`) → length/quality filter (`filter_read`, fastp `-l 100`
   defaults); drop-only and `sequence_idx`-preserving, dropping a read pair when
   EITHER mate falls below min_length after trimming. The canonical adapter set
-  is read from the runner-staged `adapter_fasta` via miint's `read_fastx` and
-  inlined as a constant `VARCHAR[]`. Slots into the bcl-convert → `fastq` →
-  `qc` → `host_filter` pipeline (#129)
+  is read from the runner-staged `adapter_parquet` via `read_parquet` and inlined
+  as a constant `VARCHAR[]`; the two SE/PE seams emit SELECTs that UNION ALL
+  straight into one streaming COPY (no intermediate accumulator table). Slots into
+  the bcl-convert → `fastq` → `qc` → `host_filter` pipeline (#129)
 - Remove a full preparation (sequenced_pool) from the system. New
   `DELETE /sequencing-run/{run}/sequenced-pool/{pool}` hard-deletes a
   sequenced_pool and everything under it — the pool row, every
