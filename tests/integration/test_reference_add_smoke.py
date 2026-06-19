@@ -152,7 +152,11 @@ async def test_reference_add_workflow_end_to_end(
     # (Arrow Flight DoAction), which test_e2e_reference covers separately.
     register_calls: list[tuple] = []
 
-    async def _stub_register_files(*, staging_dir, files, hmac_secret, data_plane_url):
+    async def _stub_register_files(
+        *, staging_dir, files, work_ticket_idx, hmac_secret, data_plane_url
+    ):
+        # work_ticket_idx is keyword-required: the runner must thread it so the
+        # data plane can mint unique, ticket-traceable lake filenames.
         register_calls.append((staging_dir, dict(files)))
         return [f"{staging_dir}/{name}" for name in files]
 

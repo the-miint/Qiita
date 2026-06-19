@@ -384,6 +384,7 @@ async def register_files(
     *,
     staging_dir: str,
     files: dict[str, str],
+    work_ticket_idx: int,
     hmac_secret: bytes,
     data_plane_url: str,
 ) -> list[str]:
@@ -394,11 +395,20 @@ async def register_files(
     Status-state guards live in the caller; reference-add typically
     requires status='loading' before invoking.
 
+    `work_ticket_idx` rides in the signed payload so the data plane can mint a
+    unique, ticket-traceable lake filename per file — the producer reuses fixed
+    basenames across loads, so the bare name would collide with an
+    already-registered file in the same per-table dir.
+
     Raises pyarrow.flight.FlightError on transport / data-plane failure.
     """
     token = sign_action(
         action="register_files",
-        payload={"staging_dir": staging_dir, "files": files},
+        payload={
+            "staging_dir": staging_dir,
+            "files": files,
+            "work_ticket_idx": work_ticket_idx,
+        },
         secret=hmac_secret,
     )
     results = await asyncio.get_event_loop().run_in_executor(

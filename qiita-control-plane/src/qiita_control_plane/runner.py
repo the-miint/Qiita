@@ -2332,6 +2332,7 @@ async def _dispatch_action(
             bound,
             workspace,
             scope_target,
+            work_ticket_idx=work_ticket_idx,
             hmac_secret=hmac_secret,
             data_plane_url=data_plane_url,
         )
@@ -2371,6 +2372,7 @@ async def _run_action_primitive(
     workspace: Path,
     scope_target: dict[str, Any],
     *,
+    work_ticket_idx: int,
     hmac_secret: bytes,
     data_plane_url: str,
 ) -> dict[str, Any]:
@@ -2432,6 +2434,7 @@ async def _run_action_primitive(
         await LIBRARY[LibraryPrimitive.REGISTER_FILES](
             staging_dir=str(staging_dir),
             files=files,
+            work_ticket_idx=work_ticket_idx,
             hmac_secret=hmac_secret,
             data_plane_url=data_plane_url,
         )

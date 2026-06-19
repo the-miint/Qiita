@@ -166,8 +166,12 @@ def library_spy(monkeypatch):
             raise RuntimeError("simulated write-membership failure")
         return 0, 0
 
-    async def register_files(*, staging_dir, files, hmac_secret, data_plane_url):
-        calls.append(("register-files", staging_dir, dict(files)))
+    async def register_files(*, staging_dir, files, work_ticket_idx, hmac_secret, data_plane_url):
+        # work_ticket_idx is keyword-required: if the runner stops threading it
+        # (it rides in the signed payload so the data plane can mint unique,
+        # ticket-traceable lake filenames), this stub raises TypeError and the
+        # test fails.
+        calls.append(("register-files", staging_dir, dict(files), work_ticket_idx))
         if state["fail_on"] == LibraryPrimitive.REGISTER_FILES:
             raise RuntimeError("simulated register-files failure")
         return [f"{staging_dir}/{name}" for name in files]
@@ -539,7 +543,12 @@ async def test_register_files_globs_staging_dir(
     await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
 
     register_call = next(c for c in library_spy.calls if c[0] == "register-files")
-    files = register_call[2]  # ("register-files", staging_dir, files)
+    # ("register-files", staging_dir, files, work_ticket_idx)
+    assert register_call[3] == work_ticket_idx, (
+        "runner must thread work_ticket_idx into register-files so the data "
+        "plane can mint unique, ticket-traceable lake filenames"
+    )
+    files = register_call[2]
     assert files == {
         "reference_sequences.parquet": "reference_sequences",
         "reference_membership.parquet": "reference_membership",
@@ -1348,6 +1357,7 @@ async def test_dispatch_register_index_writes_row(postgres_pool, reference_idx, 
         bound,
         tmp_path,
         {"kind": "reference", "reference_idx": reference_idx},
+        work_ticket_idx=1,  # register-index ignores it; required by the signature
         hmac_secret=b"unused",
         data_plane_url="grpc://unused:50051",
     )
@@ -1401,6 +1411,7 @@ async def test_dispatch_register_index_minimap2_meta(postgres_pool, reference_id
         bound,
         tmp_path,
         {"kind": "reference", "reference_idx": reference_idx},
+        work_ticket_idx=1,  # register-index ignores it; required by the signature
         hmac_secret=b"unused",
         data_plane_url="grpc://unused:50051",
     )
