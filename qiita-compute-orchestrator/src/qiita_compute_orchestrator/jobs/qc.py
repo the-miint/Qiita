@@ -265,6 +265,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     duckdb_tmp = workspace / ".duckdb_tmp"
     duckdb_tmp.mkdir(parents=True, exist_ok=True)
 
+    # These feed COPY / CREATE VIEW string literals, which can't take a bound
+    # param, so the orchestrator-controlled paths are inline single-quote-escaped
+    # (same as host_filter). Sibling jobs instead reject quote/backslash paths via
+    # qiita_common.parquet.validate_parquet_path; converging qc + host_filter on
+    # that fail-fast validator is tracked in #131.
     reads_sql = str(inputs.reads).replace("'", "''")
     out_sql = str(qc_reads).replace("'", "''")
 
