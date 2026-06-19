@@ -182,6 +182,17 @@ the `no-changelog` label).
 
 ### Changed
 
+- Host filtering can now draw its two indexes from two INDEPENDENT references.
+  The runner's `_resolve_host_filter_indexes` gained a two-reference layout
+  (fastq-to-parquet/1.2.0): `host_rype_reference_idx` (required) supplies the rype
+  `.ryxdi` and the optional `host_minimap2_reference_idx` supplies the minimap2
+  `.mmi`, each from its own ACTIVE reference that MUST carry the named index (a
+  designated reference missing its index is a hard error). The legacy
+  single-reference `host_reference_idx` layout (1.1.0, ≥1-of-either, skip on
+  missing) is unchanged and back-compatible; the two layouts are mutually
+  exclusive (mixing them, or enabling with no reference key, is a clear
+  SUBMISSION BAD_INPUT). `host_filter.py` itself is untouched — it still skips the
+  stage whose index path is None (#TBD)
 - `make redeploy` no longer prompts to do work it has already proven is needed.
   The SLURM native-venv refresh now runs automatically (no confirm) when the
   native checkout is the same clone redeploy just pulled — the prompt remains

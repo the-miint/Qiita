@@ -315,11 +315,13 @@ async def run_workflow(
         bound.update(resolved_paths)
 
         # Host-filter index resolution, gated by `host_filter_enabled` in
-        # action_context (fastq-to-parquet/1.1.0). Like upload-handle resolution
-        # it runs inside this try, so a raise (unknown / non-active host
-        # reference, missing index) lands in the outer FAILED handler instead of
-        # leaving the ticket stuck in PROCESSING. `host_reference_idx` is NOT a
-        # `*_upload_idx` key, so the walker above left it untouched.
+        # action_context (two-reference for 1.2.0 via host_rype_reference_idx /
+        # host_minimap2_reference_idx; legacy single host_reference_idx for 1.1.0).
+        # Like upload-handle resolution it runs inside this try, so a raise
+        # (unknown / non-active host reference, missing index) lands in the outer
+        # FAILED handler instead of leaving the ticket stuck in PROCESSING. None
+        # of the host_*_reference_idx keys are `*_upload_idx`, so the walker above
+        # left them untouched.
         bound.update(await _resolve_host_filter_indexes(pool, action_context=bound))
 
         # QC adapter materialization: when any step needs `adapter_fasta` (the
@@ -1122,6 +1124,39 @@ async def _resolve_reference_index_path(
     return fs_path
 
 
+def _coerce_reference_idx(value: Any, field: str) -> int:
+    """Validate a host-filter reference idx pulled from `action_context`. `type(...)
+    is int` (not isinstance) rejects a JSON bool — an int subclass — rather than
+    silently treating it as 0/1. Raises a SUBMISSION BAD_INPUT on a missing /
+    non-positive / wrong-typed value."""
+    if type(value) is not int or value <= 0:
+        raise _submission_bad_input(f"{field} must be a positive integer, got {value!r}")
+    return value
+
+
+async def _resolve_required_host_index(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    reference_idx: int,
+    index_type: str,
+    field: str,
+) -> Path:
+    """Resolve `index_type` from `reference_idx`, mapping EVERY failure mode
+    (unknown reference, non-active, index not built) to a SUBMISSION BAD_INPUT —
+    the two-reference layout designates a reference explicitly for this index
+    type, so a missing index is a hard error (not a skipped stage as in the legacy
+    single-reference layout)."""
+    try:
+        return Path(await _resolve_reference_index_path(pool, reference_idx, index_type))
+    except ReferenceNotFound as exc:
+        raise _submission_bad_input(
+            f"{field}={reference_idx} references an unknown reference"
+        ) from exc
+    except ValueError as exc:
+        # Non-active reference OR ReferenceIndexNotBuilt (a ValueError subclass) —
+        # both hard errors here (the reference was designated for this index).
+        raise _submission_bad_input(str(exc)) from exc
+
+
 async def _resolve_host_filter_indexes(
     pool: asyncpg.Pool | asyncpg.Connection,
     *,
@@ -1129,32 +1164,98 @@ async def _resolve_host_filter_indexes(
 ) -> dict[str, Path]:
     """Resolve the host-filter index paths when host filtering is enabled, else {}.
 
-    Gated by `host_filter_enabled` (bool) in `action_context`. When enabled,
-    `host_reference_idx` (positive int) must name an ACTIVE reference carrying at
-    least ONE of a `rype` (.ryxdi) or `minimap2` (.mmi) index; the newest
-    generation of whichever exist is bound as `host_rype_path` /
-    `host_minimap2_path` — the `host_filter` step's optional inputs. A
-    single-index host reference (built `--no-rype-index` / `--no-minimap2-index`)
-    binds only that one; the step skips the stage whose path is None. When
-    disabled (flag false/absent) nothing is resolved and the step runs as a
-    pass-through (its index Inputs default to None).
+    Gated by `host_filter_enabled` (bool) in `action_context`. Two layouts are
+    accepted, never mixed:
 
-    Mirrors `_resolve_upload_handles`: any failure (host_reference_idx absent or
-    non-positive, reference unknown / non-active, or NEITHER index built) raises a
-    typed `BackendFailure(BAD_INPUT)` at stage=SUBMISSION, which the outer handler
-    in `run_workflow` turns into a FAILED work_ticket. `host_reference_idx`
-    deliberately does NOT end in `_upload_idx`, so `_resolve_upload_handles` leaves
-    it untouched."""
+    * **Two-reference** (fastq-to-parquet/1.2.0): an independent reference per
+      tool — `host_rype_reference_idx` (REQUIRED) supplies the rype `.ryxdi`, and
+      the optional `host_minimap2_reference_idx` supplies the minimap2 `.mmi`.
+      Each is bound from its OWN reference, which MUST be ACTIVE and MUST carry the
+      named index type (a designated reference missing its index is a hard error).
+      minimap2 omitted → only `host_rype_path` is bound.
+    * **Legacy single-reference** (fastq-to-parquet/1.1.0): `host_reference_idx`
+      names ONE active reference; whichever of its rype/minimap2 indexes exist are
+      bound (>=1 required; a missing one just skips that stage). Kept for
+      back-compat.
+
+    Both bind `host_rype_path` / `host_minimap2_path` — the `host_filter` step's
+    optional inputs; the step skips the stage whose path is None, so
+    `host_filter.py` is unchanged across both layouts. When disabled (flag
+    false/absent) nothing is resolved and the step runs as a pass-through.
+
+    Mirrors `_resolve_upload_handles`: every failure (a required idx absent /
+    non-positive, a reference unknown / non-active / missing its designated index,
+    NEITHER index in the legacy case, or mixing the two layouts) raises a typed
+    `BackendFailure(BAD_INPUT)` at stage=SUBMISSION that `run_workflow` turns into
+    a FAILED work_ticket. None of these keys end in `_upload_idx`, so
+    `_resolve_upload_handles` leaves them untouched."""
     if not action_context.get("host_filter_enabled"):
         return {}
-    host_reference_idx = action_context.get("host_reference_idx")
-    # `type(...) is int` (not isinstance) so a JSON bool — a subclass of int —
-    # is rejected rather than silently treated as 0/1.
-    if type(host_reference_idx) is not int or host_reference_idx <= 0:
+
+    legacy_idx = action_context.get("host_reference_idx")
+    rype_idx = action_context.get("host_rype_reference_idx")
+    minimap2_idx = action_context.get("host_minimap2_reference_idx")
+
+    # The two layouts are mutually exclusive — mixing them is a contract error,
+    # not a silent precedence pick.
+    if legacy_idx is not None and (rype_idx is not None or minimap2_idx is not None):
         raise _submission_bad_input(
-            "host_filter_enabled requires a positive integer host_reference_idx, "
-            f"got {host_reference_idx!r}"
+            "host filtering accepts EITHER host_reference_idx (legacy single "
+            "reference) OR host_rype_reference_idx (+ optional "
+            "host_minimap2_reference_idx), not both"
         )
+
+    # Enabled but no reference key at all: name BOTH layouts so a caller who
+    # dropped (or typo'd) their key isn't pointed at a key they never set — the
+    # bare two-reference fallthrough below would otherwise blame
+    # host_rype_reference_idx even for a legacy 1.1.0 submission.
+    if legacy_idx is None and rype_idx is None and minimap2_idx is None:
+        raise _submission_bad_input(
+            "host_filter_enabled requires host_reference_idx (legacy single "
+            "reference) or host_rype_reference_idx (two-reference layout)"
+        )
+
+    if legacy_idx is not None:
+        return await _resolve_host_filter_legacy(pool, legacy_idx)
+    return await _resolve_host_filter_two_reference(pool, rype_idx, minimap2_idx)
+
+
+async def _resolve_host_filter_two_reference(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    rype_idx: Any,
+    minimap2_idx: Any,
+) -> dict[str, Path]:
+    """Two-reference host filter (fastq-to-parquet/1.2.0): bind the rype index from
+    the REQUIRED `host_rype_reference_idx` and, when set, the minimap2 index from
+    `host_minimap2_reference_idx` — each from its own reference. See
+    `_resolve_host_filter_indexes`."""
+    bound: dict[str, Path] = {
+        "host_rype_path": await _resolve_required_host_index(
+            pool,
+            _coerce_reference_idx(rype_idx, "host_rype_reference_idx"),
+            HOST_FILTER_INDEX_TYPE_RYPE,
+            "host_rype_reference_idx",
+        )
+    }
+    if minimap2_idx is not None:
+        bound["host_minimap2_path"] = await _resolve_required_host_index(
+            pool,
+            _coerce_reference_idx(minimap2_idx, "host_minimap2_reference_idx"),
+            HOST_FILTER_INDEX_TYPE_MINIMAP2,
+            "host_minimap2_reference_idx",
+        )
+    return bound
+
+
+async def _resolve_host_filter_legacy(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    host_reference_idx: Any,
+) -> dict[str, Path]:
+    """Legacy single-reference host filter (fastq-to-parquet/1.1.0):
+    `host_reference_idx` names ONE active reference; bind whichever of its
+    rype/minimap2 indexes exist (>=1 required; a missing one skips that stage).
+    Preserved for 1.1.0 back-compat. See `_resolve_host_filter_indexes`."""
+    host_reference_idx = _coerce_reference_idx(host_reference_idx, "host_reference_idx")
 
     # Resolve each index type independently: a host reference may carry only one
     # (rype-only / minimap2-only). A missing index type (ReferenceIndexNotBuilt)
