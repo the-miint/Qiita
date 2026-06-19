@@ -19,20 +19,21 @@ _None yet._
 
 ### 2. One-time host setup
 
-- (#126) Rebuild the bcl-convert SIF. The image's Python was bumped 3.6→3.11
-  (OL8's default `python3`=3.6 crashed `manifest_writer.py` on PEP 585
-  `list[str]` annotations). `build-sif.sh` is idempotent on the bcl-convert
-  *version* (`VERIFY_MATCH`), which this change does **not** touch — so it would
-  print "nothing to do" and leave the broken SIF in place. Delete the existing
-  SIF first to force the rebuild; the rebuild's `%test` now `exec_module`s
-  `manifest_writer.py` under python3.11, so a bad interpreter fails the build
-  here instead of a live job. Run after the `git pull`, before the bucket-4
-  deploy:
+- (#130) Rebuild the bcl-convert SIF to pick up the `entrypoint.sh` chmod fix
+  (the step's final mode-fixing `find … chmod` no longer touches the
+  orchestrator-owned `$QIITA_OUTPUT_PATH` root, which was failing live
+  bcl_convert jobs with `chmod: … Operation not permitted` under `set -e`).
+  `entrypoint.sh` is baked into the SIF, but `build-sif.sh`'s idempotency check
+  only probes the bcl-convert *version* (unchanged here) — so a plain rebuild
+  prints "nothing to do". Use the new `FORCE=1` to rebuild unconditionally. The
+  python3.11 SIF (#126) is already live on the host, so this is its own rebuild
+  (not piggybacking on a #126 step). Run after the `git pull`, before the
+  bucket-4 deploy:
 
   ```bash
   derived=$(sudo grep '^PATH_DERIVED=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)
-  sudo -u qiita-orch bash -lc "rm -f '$derived/images/bcl-convert-4.5.4.sif' && \
-    PATH_DERIVED='$derived' bash /home/qiita/qiita-miint/scripts/build-sif.sh bcl-convert"
+  sudo -u qiita-orch bash -lc "FORCE=1 PATH_DERIVED='$derived' \
+    bash /home/qiita/qiita-miint/scripts/build-sif.sh bcl-convert"
   ```
 
 - (#129) **Enable QC: load the adapter set + set `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX`.**
@@ -69,15 +70,16 @@ _None yet._
 
 ### 5. Verify
 
-- (#126) Confirm the rebuilt bcl-convert SIF ships the new interpreter:
+- (#130) Confirm the rebuilt bcl-convert SIF carries the fixed entrypoint:
 
   ```bash
   derived=$(sudo grep '^PATH_DERIVED=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)
-  sudo -u qiita-orch apptainer exec "$derived/images/bcl-convert-4.5.4.sif" python3.11 --version
+  sudo -u qiita-orch apptainer exec "$derived/images/bcl-convert-4.5.4.sif" \
+    grep -q 'mindepth 1' /opt/qiita/entrypoint.sh && echo OK
   ```
 
-  Expect `Python 3.11.x`. (A clean SIF rebuild already proved `manifest_writer.py`
-  imports under it via the `%test` block.)
+  Expect `OK` (the `-mindepth 1` guard is present). The real proof is the next
+  bcl_convert ticket completing past the output-chmod step.
 
 - (#129) Confirm `fastq-to-parquet 1.2.0` is in the `make verify-deploy` action
   list (the always-on-QC + two-reference host-filter workflow `submit-host-filter-pool`
@@ -86,13 +88,6 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#124) Per-host-reference index selection + tunable build params (additive, no client breakage). The two `workflows/` entries `host-reference-add` and `local-host-reference-add` (both still 1.0.0) are **edited in place** — re-synced into `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (already in bucket 5's `qiita.action` list check), **not** a migration. New optional `action_context` keys (`build_rype`/`build_minimap2` to pick which host-filter indexes to build, `rype_w`/`minimap2_preset` to tune them) surfaced by `qiita reference load --host --no-rype-index|--no-minimap2-index|--rype-w|--minimap2-preset`; omitted, behaviour is unchanged (both indexes built; minimap2 `preset` default `sr`). No new env var, host dir, scope, or migration. Two behaviour notes (both code-internal, no host action): the rype build window `w` default changed 25 → 20; and the fastq-to-parquet host-filter consumer now accepts a single-index host reference (binds whichever of rype/minimap2 exist, requires ≥1). The minimap2 build step also gained `target_status: indexing` so a minimap2-only build still transitions the reference out of `loading`.
-- New `sequenced_pool:delete` scope + `DELETE /sequencing-run/{run}/sequenced-pool/{pool}`
-  (and the `qiita delete-sequenced-pool` CLI) for removing a full preparation.
-  Auto-granted to system_admin via `ROLE_IMPLIED_SCOPES`, so no grant step — but
-  the scope is **not** in admin PATs minted before this deploy (tokens carry a
-  fixed scope snapshot). An admin who wants to use the delete must mint a fresh
-  PAT after the deploy. No migration, env var, or host change. (#125)
 - (#129) New `GET /sequencing-run/{idx}` route (run metadata incl.
   `instrument_model`; prep_sample:read + wet_lab_admin) — `submit-host-filter-pool`
   reads it to forward QC's polyG `instrument_model` per sample. Code-only, no host
@@ -106,6 +101,60 @@ _None yet._
 ## Deployed history
 
 Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-19 — 8e55b99
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None._
+
+#### 2. One-time host setup
+
+- (#126) Rebuild the bcl-convert SIF. The image's Python was bumped 3.6→3.11
+  (OL8's default `python3`=3.6 crashed `manifest_writer.py` on PEP 585
+  `list[str]` annotations). `build-sif.sh` is idempotent on the bcl-convert
+  *version* (`VERIFY_MATCH`), which this change does **not** touch — so it would
+  print "nothing to do" and leave the broken SIF in place. Delete the existing
+  SIF first to force the rebuild; the rebuild's `%test` now `exec_module`s
+  `manifest_writer.py` under python3.11, so a bad interpreter fails the build
+  here instead of a live job. Run after the `git pull`, before the bucket-4
+  deploy:
+
+  ```bash
+  derived=$(sudo grep '^PATH_DERIVED=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)
+  sudo -u qiita-orch bash -lc "rm -f '$derived/images/bcl-convert-4.5.4.sif' && \
+    PATH_DERIVED='$derived' bash /home/qiita/qiita-miint/scripts/build-sif.sh bcl-convert"
+  ```
+
+#### 3. Migrations
+
+_None._
+
+#### 4. Deploy
+
+_None._
+
+#### 5. Verify
+
+- (#126) Confirm the rebuilt bcl-convert SIF ships the new interpreter:
+
+  ```bash
+  derived=$(sudo grep '^PATH_DERIVED=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)
+  sudo -u qiita-orch apptainer exec "$derived/images/bcl-convert-4.5.4.sif" python3.11 --version
+  ```
+
+  Expect `Python 3.11.x`. (A clean SIF rebuild already proved `manifest_writer.py`
+  imports under it via the `%test` block.)
+
+#### Notes (no host action)
+
+- (#124) Per-host-reference index selection + tunable build params (additive, no client breakage). The two `workflows/` entries `host-reference-add` and `local-host-reference-add` (both still 1.0.0) are **edited in place** — re-synced into `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (already in bucket 5's `qiita.action` list check), **not** a migration. New optional `action_context` keys (`build_rype`/`build_minimap2` to pick which host-filter indexes to build, `rype_w`/`minimap2_preset` to tune them) surfaced by `qiita reference load --host --no-rype-index|--no-minimap2-index|--rype-w|--minimap2-preset`; omitted, behaviour is unchanged (both indexes built; minimap2 `preset` default `sr`). No new env var, host dir, scope, or migration. Two behaviour notes (both code-internal, no host action): the rype build window `w` default changed 25 → 20; and the fastq-to-parquet host-filter consumer now accepts a single-index host reference (binds whichever of rype/minimap2 exist, requires ≥1). The minimap2 build step also gained `target_status: indexing` so a minimap2-only build still transitions the reference out of `loading`.
+- New `sequenced_pool:delete` scope + `DELETE /sequencing-run/{run}/sequenced-pool/{pool}`
+  (and the `qiita delete-sequenced-pool` CLI) for removing a full preparation.
+  Auto-granted to system_admin via `ROLE_IMPLIED_SCOPES`, so no grant step — but
+  the scope is **not** in admin PATs minted before this deploy (tokens carry a
+  fixed scope snapshot). An admin who wants to use the delete must mint a fresh
+  PAT after the deploy. No migration, env var, or host change. (#125)
 
 ### Deployed 2026-06-18 — 70eb519
 

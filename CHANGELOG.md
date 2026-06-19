@@ -421,6 +421,19 @@ the `no-changelog` label).
 
 ### Fixed
 
+- The bcl-convert step no longer fails with `chmod: changing permissions of
+  '.../bcl_convert/attempt-0/output': Operation not permitted` after bcl-convert
+  and `manifest_writer.py` both succeed. The entrypoint's final mode-fixing
+  `find … -exec chmod` walked `$QIITA_OUTPUT_PATH` itself — created on the host
+  by the orchestrator (owned by the orchestrator user, not the in-container
+  user) — so chmod returned EPERM and `set -e` failed the otherwise-successful
+  job. Both finds now carry `-mindepth 1`, re-moding only what the container
+  created inside `output/`. Separately, `scripts/build-sif.sh` gains a `FORCE=1`
+  opt-out of its version-only idempotency check, so an image-baked change to
+  `entrypoint.sh`/`manifest_writer.py`/`Apptainer.def` that does not bump the
+  vendored binary version can still force a rebuild (without it the fix would
+  never reach the host). Surfaced running bcl_convert end-to-end (SLURM job
+  156785) (#130)
 - The bcl-convert step no longer fails with `TypeError: 'type' object is not
   subscriptable` after bcl-convert itself succeeds. Its container is built
   `From: oraclelinux:8`, whose default `python3` is 3.6 — predating PEP 585

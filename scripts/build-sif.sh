@@ -93,7 +93,16 @@ SIF_PATH="${IMAGES_DIR}/${SIF_FILENAME}"
 # Idempotency check: if a SIF already exists AND satisfies VERIFY_MATCH,
 # leave it alone. `apptainer exec` runs the embedded binary in a fresh
 # namespace. VERIFY_CMD is intentionally word-split (it carries args).
-if [[ -f "${SIF_PATH}" ]]; then
+#
+# VERIFY_MATCH only probes the vendored binary's version — it is blind to
+# the *image-baked* artifacts (entrypoint.sh, manifest_writer.py, the def's
+# %post). So a fix that changes one of those without bumping the binary
+# version would be skipped here and never reach the host. FORCE=1 opts out
+# of the idempotency skip to rebuild unconditionally; the deploy checklist
+# uses it whenever an entrypoint/manifest/def-only change ships.
+if [[ "${FORCE:-}" == "1" ]]; then
+    echo "FORCE=1 — rebuilding ${SIF_PATH} unconditionally (skipping idempotency check)."
+elif [[ -f "${SIF_PATH}" ]]; then
     # shellcheck disable=SC2086
     if apptainer exec "${SIF_PATH}" ${VERIFY_CMD} 2>&1 | grep -qE "${VERIFY_MATCH}"; then
         echo "Existing SIF at ${SIF_PATH} satisfies '${VERIFY_MATCH}' — nothing to do."
