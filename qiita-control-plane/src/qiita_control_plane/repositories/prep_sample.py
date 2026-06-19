@@ -1,4 +1,4 @@
-"""Single-table reads and writer for the qiita.prep_sample supertype.
+"""Single-table reads and writes for the qiita.prep_sample supertype.
 
 Covers the supertype row insert plus the prep_sample reads. The per-study
 link table

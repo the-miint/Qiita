@@ -9,7 +9,6 @@ from datetime import datetime
 
 import asyncpg
 from fastapi import HTTPException
-from qiita_common.auth_constants import SystemRole
 from qiita_common.models import IdxsListResponse, MissingReasonRef, TerminologyTermRef
 
 from ..repositories._sample_helpers import (
@@ -351,7 +350,7 @@ async def resolve_idxs_by_natural_key(
 
 
 def build_idxs_list_response(
-    idxs: list[int], *, cap: int, caller_system_role: SystemRole
+    idxs: list[int], *, cap: int, caller_system_role: str
 ) -> IdxsListResponse:
     """Build the capped IdxsListResponse envelope.
 
