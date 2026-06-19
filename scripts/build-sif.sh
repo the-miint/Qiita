@@ -93,6 +93,16 @@ if ! command -v apptainer >/dev/null 2>&1; then
     exit 64
 fi
 
+# Make the rest of the script cwd-independent. `find` (in the build-inputs hash)
+# and `apptainer exec` (the verify steps) both touch the invoking process's cwd;
+# when this is launched as a service account from a directory that account can't
+# read — e.g. a manual `sudo -u qiita-orch …` from an admin's 0700 home — `find`
+# fails to restore that cwd and aborts the build, and `apptainer exec` warns. cd
+# to / (always traversable) so neither cares where we were invoked from. Safe
+# because every path used below is absolute (PATH_DERIVED is the derived FS root)
+# and the actual `apptainer build` cd's into its own temp build dir in a subshell.
+cd / || { echo "could not cd / — refusing to run from an unstable cwd" >&2; exit 1; }
+
 SOURCES_DIR="${IMAGES_DIR}/sources"
 SIF_PATH="${IMAGES_DIR}/${SIF_FILENAME}"
 # Content stamp written next to the SIF. Lets the idempotency check below detect
