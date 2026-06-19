@@ -19,6 +19,38 @@ _None yet._
 
 ### 2. One-time host setup
 
+_None yet._
+
+### 3. Migrations
+
+_None yet._
+
+### 4. Deploy
+
+_None yet._
+
+### 5. Verify
+
+_None yet._
+
+### Notes (no host action)
+
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-19 — 50b85df
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
 - (#130) Rebuild the bcl-convert SIF to pick up the `entrypoint.sh` chmod fix
   (the step's final mode-fixing `find … chmod` no longer touches the
   orchestrator-owned `$QIITA_OUTPUT_PATH` root, which was failing live
@@ -58,17 +90,17 @@ _None yet._
   `submit-host-filter-pool` submission fails until both the adapter set and this
   var are in place.
 
-### 3. Migrations
+#### 3. Migrations
 
 - (#129) `20260618000000_reference_kind_artifact_sequence_set.sql` — widens the
   `reference.kind` CHECK to allow `artifact_sequence_set`. Plain `make migrate`,
   no out-of-band setup.
 
-### 4. Deploy
+#### 4. Deploy
 
 _None yet._
 
-### 5. Verify
+#### 5. Verify
 
 - (#130) Confirm the rebuilt bcl-convert SIF carries the fixed entrypoint:
 
@@ -86,7 +118,7 @@ _None yet._
   now targets). A 1.2.0 QC submission also needs the bucket-2 adapter set +
   `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX`.
 
-### Notes (no host action)
+#### Notes (no host action)
 
 - (#132) The deploy now builds container SIFs automatically.
   `activate.sh` runs `deploy/build-sifs.sh` (after the rsync, before the
@@ -111,12 +143,6 @@ _None yet._
   comment-only `1.1.0` edit) re-syncs into `qiita.action` via `qiita-admin actions
   sync` inside `activate.sh` (verified in bucket 5), **not** a migration.
 - (#128) Genome-scale reference-load resource tuning (no client breakage). The two `workflows/` entries `local-reference-add` and `local-host-reference-add` (both still 1.0.0) are **edited in place** — re-synced into `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (already covered by bucket 5's `qiita.action` list check), **not** a migration. Raised baseline_resources + walltimes so loading hundreds of human genomes no longer hits the old 1h step cap (`stage_local_fasta`/`hash_sequences` → cpu=8/mem_gb=32, `build_rype_index` → cpu=8, `build_minimap2_index` → mem_gb=32; step walltimes → PT24H under a PT48H `action_ceiling`). To permit those longer walltimes the orchestrator's SLURM poll-loop timeout **default** rose 24h → 48h (`config.py` `DEFAULT_SLURM_JOB_TIMEOUT_SECONDS`); it applies on the normal bucket-4 CO restart — no new env var. **Caveat:** if `/etc/qiita/compute-orchestrator.env` pins `SLURM_JOB_TIMEOUT_SECONDS` explicitly, raise it to ≥ the longest step walltime (currently PT24H / 86400s) or genome-scale loads will be reaped mid-run. No new host dir, scope, or migration.
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-19 — 8e55b99
 
