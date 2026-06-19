@@ -32,6 +32,16 @@ the `no-changelog` label).
   runner resolver (`_resolve_qc_adapters`) that DoGets that set's sequences from
   the data plane and stages them as a FASTA for the QC step — materialized only
   for a workflow whose steps need it (#TBD)
+- New `qc` native job (`qiita_compute_orchestrator.jobs.qc`): a fastp-equivalent
+  read-QC transform `reads.parquet` → `qc_reads.parquet` over the duckdb-miint
+  fastp-port functions. Per read it runs adapter trim (`trim_adapters` SE /
+  `trim_adapters_pe` PE) → optional polyG trim (`trim_polyg`, gated on a 2-color
+  `instrument_model`) → length/quality filter (`filter_read`, fastp `-l 100`
+  defaults); drop-only and `sequence_idx`-preserving, dropping a read pair when
+  EITHER mate falls below min_length after trimming. The canonical adapter set
+  is read from the runner-staged `adapter_fasta` via miint's `read_fastx` and
+  inlined as a constant `VARCHAR[]`. Slots into the bcl-convert → `fastq` →
+  `qc` → `host_filter` pipeline (#TBD)
 - Remove a full preparation (sequenced_pool) from the system. New
   `DELETE /sequencing-run/{run}/sequenced-pool/{pool}` hard-deletes a
   sequenced_pool and everything under it — the pool row, every
