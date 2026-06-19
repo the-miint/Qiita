@@ -15,6 +15,10 @@ the `no-changelog` label).
 
 ### Added
 
+- New `GET /api/v1/sequencing-run/{sequencing_run_idx}` route returning a run's
+  caller-visible metadata (notably `instrument_model`). Read-gated like the pool
+  roster route (prep_sample:read + wet_lab_admin). `qiita submit-host-filter-pool`
+  reads it to forward QC's polyG-gating `instrument_model` per sample (#TBD)
 - New `fastq-to-parquet/1.2.0` workflow: an additive successor to 1.1.0 that
   inserts an ALWAYS-ON `qc` step between `fastq` and `host_filter`
   (`fastq → qc → host_filter`). Each stage re-emits the `reads` binding it
@@ -191,6 +195,12 @@ the `no-changelog` label).
 
 ### Changed
 
+- `qiita submit-host-filter-pool` now fans out fastq-to-parquet/**1.2.0** (QC +
+  two-reference host filter) instead of 1.1.0. `--host-reference-idx` is replaced
+  by `--host-rype-reference-idx` (required) and `--host-minimap2-reference-idx`
+  (optional), each pre-flighted for ACTIVE status + its named index; the run's
+  `instrument_model` is read once (GET /sequencing-run) and forwarded per sample
+  so QC's polyG gate is set correctly (#TBD)
 - Host filtering can now draw its two indexes from two INDEPENDENT references.
   The runner's `_resolve_host_filter_indexes` gained a two-reference layout
   (fastq-to-parquet/1.2.0): `host_rype_reference_idx` (required) supplies the rype

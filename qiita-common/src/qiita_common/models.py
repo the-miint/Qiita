@@ -1734,6 +1734,31 @@ class SequencingRunCreateResponse(BaseModel):
     sequencing_run_idx: Annotated[int, Field(gt=0)]
 
 
+class SequencingRunResponse(BaseModel):
+    """Returned by GET /api/v1/sequencing-run/{sequencing_run_idx}.
+
+    The caller-visible view of a `qiita.sequencing_run` row (the column set
+    `repositories.sequencing_run.fetch_sequencing_run` selects, with the row's
+    `idx` surfaced as `sequencing_run_idx`). `instrument_model` is the field the
+    `submit-host-filter-pool` fan-out reads to forward QC's polyG gate per sample;
+    it is nullable (non-bcl runs may not record it).
+    """
+
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    instrument_run_id: str
+    platform: Platform
+    instrument_model: str | None = None
+    instrument_serial: str | None = None
+    run_performed_at: AwareDatetime | None = None
+    extra_metadata: dict[str, Any] | None = None
+    created_by_idx: Annotated[int, Field(gt=0)]
+    created_at: AwareDatetime
+    retired: bool
+    retired_by_idx: Annotated[int, Field(gt=0)] | None = None
+    retired_at: AwareDatetime | None = None
+    retire_reason: str | None = None
+
+
 class SequencedPoolCreateRequest(BaseModel):
     """Body for POST /api/v1/sequencing-run/{sequencing_run_idx}/sequenced-pool.
 

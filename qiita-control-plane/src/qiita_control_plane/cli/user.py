@@ -50,6 +50,7 @@ from qiita_common.api_paths import (
     PATH_SEQUENCED_SAMPLE_FROM_RUN,
     PATH_SEQUENCED_SAMPLE_LIST_BY_POOL,
     PATH_SEQUENCED_SAMPLE_PREFIX,
+    PATH_SEQUENCING_RUN_BY_IDX,
     PATH_SEQUENCING_RUN_PREFIX,
     PATH_SEQUENCING_RUN_SEQUENCED_POOL,
     PATH_STUDY_BY_IDX,
@@ -59,7 +60,8 @@ from qiita_common.api_paths import (
 )
 from qiita_common.illumina import read_instrument_run_info
 from qiita_common.models import (
-    HOST_FILTER_REQUIRED_INDEX_TYPES,
+    HOST_FILTER_INDEX_TYPE_MINIMAP2,
+    HOST_FILTER_INDEX_TYPE_RYPE,
     BiosampleImportRequest,
     BiosampleLookupByAccessionRequest,
     BiosamplePatchRequest,
@@ -88,11 +90,12 @@ from . import _common
 _BCL_CONVERT_ACTION_ID = "bcl-convert"
 _BCL_CONVERT_ACTION_VERSION = "1.0.0"
 
-# action_id + version for the submit-host-filter-pool fan-out. 1.1.0 is the
-# host-filter-capable fastq-to-parquet (1.0.0 has no host_filter step); pinned
-# here for the same drift reason as the bcl-convert constants above.
+# action_id + version for the submit-host-filter-pool fan-out. 1.2.0 adds the
+# always-on QC step + the two-reference host filter (1.0.0 has no host_filter,
+# 1.1.0 is the legacy single-reference host filter); pinned here for the same
+# drift reason as the bcl-convert constants above.
 _FASTQ_TO_PARQUET_ACTION_ID = "fastq-to-parquet"
-_FASTQ_TO_PARQUET_ACTION_VERSION = "1.1.0"
+_FASTQ_TO_PARQUET_ACTION_VERSION = "1.2.0"
 
 
 class _PreflightRow(NamedTuple):
@@ -980,18 +983,22 @@ def _build_parser() -> argparse.ArgumentParser:
             "For every active sequenced_sample in --sequenced-pool-idx, locate"
             " its per-sample FASTQ(s) under --convert-dir (matched on the"
             " sequenced_pool_item_id == bcl-convert Sample_ID prefix) and submit"
-            " a fastq-to-parquet/1.1.0 work-ticket with host filtering enabled"
-            " against --host-reference-idx. The host reference is checked for"
-            " ACTIVE status + both (rype, minimap2) indexes up front, and every"
-            " sample's FASTQs are resolved before any ticket is submitted, so a"
-            " misconfiguration aborts with zero side effects. Re-running after a"
-            " partial failure is safe: disallow-without-delete is keyed per"
-            " prep_sample, so only samples without an in-flight/terminal ticket"
-            " are re-submitted. ASSUMPTIONS: --convert-dir must be visible from"
-            " this host (the per-sample FASTQs are read off the shared compute"
-            " filesystem), and the run is single-lane (a sample with >1 R1 file,"
-            " e.g. lane-split _L001/_L002, is rejected — fastq-to-parquet takes a"
-            " single fastq_path)."
+            " a fastq-to-parquet/1.2.0 work-ticket: always-on QC (fastp-equivalent"
+            " adapter/polyG/length trimming) followed by host filtering against"
+            " --host-rype-reference-idx (the rype index, required) and, when"
+            " given, --host-minimap2-reference-idx (the minimap2 index). Each host"
+            " reference is checked for ACTIVE status + its required index up front,"
+            " and every sample's FASTQs are resolved before any ticket is"
+            " submitted, so a misconfiguration aborts with zero side effects. The"
+            " run's instrument_model is read once (GET /sequencing-run) and"
+            " forwarded per sample so QC's polyG step is gated correctly."
+            " Re-running after a partial failure is safe: disallow-without-delete"
+            " is keyed per prep_sample, so only samples without an"
+            " in-flight/terminal ticket are re-submitted. ASSUMPTIONS:"
+            " --convert-dir must be visible from this host (the per-sample FASTQs"
+            " are read off the shared compute filesystem), and the run is"
+            " single-lane (a sample with >1 R1 file, e.g. lane-split _L001/_L002,"
+            " is rejected — fastq-to-parquet takes a single fastq_path)."
         ),
     )
     p_submit_hf.add_argument(
@@ -1007,12 +1014,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="sequenced_pool_idx whose samples to fan out over.",
     )
     p_submit_hf.add_argument(
-        "--host-reference-idx",
+        "--host-rype-reference-idx",
         type=int,
         required=True,
         help=(
-            "ACTIVE host reference_idx (built by host-reference-add, so it"
-            " carries both a rype and a minimap2 index) to host-filter against."
+            "ACTIVE host reference_idx whose rype (.ryxdi) index drives the first"
+            " host-filter pass. Required."
+        ),
+    )
+    p_submit_hf.add_argument(
+        "--host-minimap2-reference-idx",
+        type=int,
+        default=None,
+        help=(
+            "Optional ACTIVE host reference_idx whose minimap2 (.mmi) index drives"
+            " the second host-filter pass (on the rype survivors). Omit for a"
+            " rype-only host filter."
         ),
     )
     p_submit_hf.add_argument(
@@ -1826,25 +1843,67 @@ def _match_pool_item_fastq(
     )
 
 
+def _assert_host_reference_ready(
+    base_url: str, token: str, reference_idx: int, index_type: str, flag: str
+) -> None:
+    """Pre-flight one host reference: it must be ACTIVE and carry `index_type`.
+
+    Fails the whole gesture (SystemExit(1)) with an actionable message rather than
+    letting the runner FAIL every per-sample ticket at its submission stage
+    (_resolve_host_filter_indexes) — one error instead of N FAILED tickets. `flag`
+    names the CLI flag in the message so the operator knows which reference is bad.
+    """
+    reference = _common.call(
+        "GET",
+        base_url,
+        token,
+        f"{PATH_REFERENCE_PREFIX}{PATH_REFERENCE_BY_IDX.format(reference_idx=reference_idx)}",
+    )
+    if reference.get("status") != ReferenceStatus.ACTIVE.value:
+        sys.stderr.write(
+            f"{flag} host reference {reference_idx} is not active"
+            f" (status={reference.get('status')!r}); load it to completion"
+            " before host-filtering\n"
+        )
+        raise SystemExit(1)
+    indexes = _common.call(
+        "GET",
+        base_url,
+        token,
+        f"{PATH_REFERENCE_PREFIX}{PATH_REFERENCE_INDEX.format(reference_idx=reference_idx)}",
+    )
+    index_types = {row["index_type"] for row in indexes}
+    if index_type not in index_types:
+        sys.stderr.write(
+            f"{flag} host reference {reference_idx} has no {index_type!r} index"
+            f" (has {sorted(index_types)}); build it with host-reference-add\n"
+        )
+        raise SystemExit(1)
+
+
 def _handle_submit_host_filter_pool(
     args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> int:
-    """Fan out one host-filtered fastq-to-parquet/1.1.0 ticket per active
+    """Fan out one QC'd, host-filtered fastq-to-parquet/1.2.0 ticket per active
     sequenced_sample in a completed bcl-convert pool.
 
     Flow:
       1. Validate --convert-dir (absolute, is_dir) before any network call.
-      2. Pre-flight the host reference: GET it (must be ACTIVE) and its index
-         list (must carry both rype + minimap2). A bad reference here would
-         otherwise fail every ticket at the runner's submission stage
+      2. Pre-flight each host reference: the rype reference (required) must be
+         ACTIVE + carry a rype index; the minimap2 reference (optional) must be
+         ACTIVE + carry a minimap2 index. A bad reference here would otherwise
+         fail every ticket at the runner's submission stage
          (_resolve_host_filter_indexes) — N FAILED tickets instead of one
          actionable error.
-      3. List the pool's active samples (run-scoped pool route) and resolve
+      3. Read the run's instrument_model once (GET /sequencing-run) to forward
+         per sample so QC's polyG step is gated correctly (nullable).
+      4. List the pool's active samples (run-scoped pool route) and resolve
          each one's R1 (required) + R2 (optional) FASTQ under --convert-dir.
          Resolve ALL samples before any POST so a missing/ambiguous file
          aborts with zero side effects.
-      4. POST one fastq-to-parquet/1.1.0 ticket per sample, host_filter_enabled
-         with --host-reference-idx, scoped to the sample's prep_sample_idx.
+      5. POST one fastq-to-parquet/1.2.0 ticket per sample (always-on QC +
+         host_filter_enabled with the two-reference layout), scoped to the
+         sample's prep_sample_idx.
 
     The pool_item_id == bcl-convert FASTQ basename prefix coupling holds via
     submit-bcl-convert (sequenced_pool_item_id = str(illumina_sample_idx)) and
@@ -1864,39 +1923,36 @@ def _handle_submit_host_filter_pool(
 
     def _run(token: str) -> dict:
         # Step 1: host-reference readiness — fail the whole gesture before any
-        # ticket if the reference can't actually host-filter.
-        reference = _common.call(
-            "GET",
+        # ticket if a designated reference can't host-filter. rype is required;
+        # minimap2 is optional (omitted -> rype-only host filter).
+        _assert_host_reference_ready(
             args.base_url,
             token,
-            f"{PATH_REFERENCE_PREFIX}"
-            f"{PATH_REFERENCE_BY_IDX.format(reference_idx=args.host_reference_idx)}",
+            args.host_rype_reference_idx,
+            HOST_FILTER_INDEX_TYPE_RYPE,
+            "--host-rype-reference-idx",
         )
-        if reference.get("status") != ReferenceStatus.ACTIVE.value:
-            sys.stderr.write(
-                f"host reference {args.host_reference_idx} is not active"
-                f" (status={reference.get('status')!r}); load it to completion"
-                " before host-filtering\n"
+        if args.host_minimap2_reference_idx is not None:
+            _assert_host_reference_ready(
+                args.base_url,
+                token,
+                args.host_minimap2_reference_idx,
+                HOST_FILTER_INDEX_TYPE_MINIMAP2,
+                "--host-minimap2-reference-idx",
             )
-            raise SystemExit(1)
-        indexes = _common.call(
-            "GET",
-            args.base_url,
-            token,
-            f"{PATH_REFERENCE_PREFIX}"
-            f"{PATH_REFERENCE_INDEX.format(reference_idx=args.host_reference_idx)}",
-        )
-        index_types = {row["index_type"] for row in indexes}
-        missing_indexes = HOST_FILTER_REQUIRED_INDEX_TYPES - index_types
-        if missing_indexes:
-            sys.stderr.write(
-                f"host reference {args.host_reference_idx} is missing"
-                f" {sorted(missing_indexes)} index(es); only references built by"
-                " host-reference-add carry both rype and minimap2\n"
-            )
-            raise SystemExit(1)
 
-        # Step 2: enumerate the pool's active samples (single round trip).
+        # Step 2: the run's instrument_model gates QC's polyG; read it once and
+        # forward per sample. Nullable (a non-bcl run may not record it).
+        run = _common.call(
+            "GET",
+            args.base_url,
+            token,
+            f"{PATH_SEQUENCING_RUN_PREFIX}"
+            f"{PATH_SEQUENCING_RUN_BY_IDX.format(sequencing_run_idx=args.sequencing_run_idx)}",
+        )
+        instrument_model = run.get("instrument_model")
+
+        # Step 3: enumerate the pool's active samples (single round trip).
         pool_list_path = PATH_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
             sequencing_run_idx=args.sequencing_run_idx,
             sequenced_pool_idx=args.sequenced_pool_idx,
@@ -1915,7 +1971,7 @@ def _handle_submit_host_filter_pool(
             )
             raise SystemExit(1)
 
-        # Step 3: resolve every sample's FASTQ(s) up front. Collect all errors
+        # Step 4: resolve every sample's FASTQ(s) up front. Collect all errors
         # so the operator sees the full set, and submit nothing if any fail.
         resolved: list[tuple[dict, Path, Path | None]] = []
         errors: list[str] = []
@@ -1938,16 +1994,22 @@ def _handle_submit_host_filter_pool(
             )
             raise SystemExit(1)
 
-        # Step 4: one fastq-to-parquet/1.1.0 ticket per sample, host-filtered.
+        # Step 5: one fastq-to-parquet/1.2.0 ticket per sample — always-on QC +
+        # host filtering (two-reference layout). instrument_model is forwarded
+        # only when the run records it (QC defaults polyG OFF when it's absent).
         per_sample_results: list[dict] = []
         for sample, r1_path, r2_path in resolved:
             action_context: dict[str, Any] = {
                 "fastq_path": str(r1_path),
                 "host_filter_enabled": True,
-                "host_reference_idx": args.host_reference_idx,
+                "host_rype_reference_idx": args.host_rype_reference_idx,
             }
+            if args.host_minimap2_reference_idx is not None:
+                action_context["host_minimap2_reference_idx"] = args.host_minimap2_reference_idx
             if r2_path is not None:
                 action_context["reverse_fastq_path"] = str(r2_path)
+            if instrument_model is not None:
+                action_context["instrument_model"] = instrument_model
             ticket_body = WorkTicketCreateRequest(
                 action_id=_FASTQ_TO_PARQUET_ACTION_ID,
                 action_version=_FASTQ_TO_PARQUET_ACTION_VERSION,
@@ -1975,7 +2037,9 @@ def _handle_submit_host_filter_pool(
             )
 
         return {
-            "host_reference_idx": args.host_reference_idx,
+            "host_rype_reference_idx": args.host_rype_reference_idx,
+            "host_minimap2_reference_idx": args.host_minimap2_reference_idx,
+            "instrument_model": instrument_model,
             "sequencing_run_idx": args.sequencing_run_idx,
             "sequenced_pool_idx": args.sequenced_pool_idx,
             "samples_submitted": len(per_sample_results),

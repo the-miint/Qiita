@@ -2694,35 +2694,58 @@ def _pool_samples_body(samples):
     }
 
 
-def _run_submit_host_filter_pool(convert_dir, *, run=3, pool=5, ref=7):
+def _seq_run_body(*, sequencing_run_idx=3, instrument_model="NextSeq 550"):
+    """A GET /sequencing-run/{idx} response body. The CLI only reads
+    instrument_model; the rest mirrors the SequencingRunResponse shape."""
+    return {
+        "sequencing_run_idx": sequencing_run_idx,
+        "instrument_run_id": "run-001",
+        "platform": "illumina",
+        "instrument_model": instrument_model,
+        "instrument_serial": None,
+        "run_performed_at": None,
+        "extra_metadata": None,
+        "created_by_idx": 1,
+        "created_at": "2026-06-16T00:00:00Z",
+        "retired": False,
+        "retired_by_idx": None,
+        "retired_at": None,
+        "retire_reason": None,
+    }
+
+
+def _run_submit_host_filter_pool(convert_dir, *, run=3, pool=5, rype_ref=7, minimap2_ref=None):
     from qiita_control_plane.cli.user import main
 
-    return main(
-        [
-            "submit-host-filter-pool",
-            "--sequencing-run-idx",
-            str(run),
-            "--sequenced-pool-idx",
-            str(pool),
-            "--host-reference-idx",
-            str(ref),
-            "--convert-dir",
-            str(convert_dir),
-        ]
-    )
+    argv = [
+        "submit-host-filter-pool",
+        "--sequencing-run-idx",
+        str(run),
+        "--sequenced-pool-idx",
+        str(pool),
+        "--host-rype-reference-idx",
+        str(rype_ref),
+        "--convert-dir",
+        str(convert_dir),
+    ]
+    if minimap2_ref is not None:
+        argv += ["--host-minimap2-reference-idx", str(minimap2_ref)]
+    return main(argv)
 
 
 def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(monkeypatch, tmp_path, capsys):
-    """Two paired-end samples → two work-ticket POSTs, each host_filter_enabled
-    against the reference and scoped to the sample's prep_sample_idx."""
+    """Two paired-end samples → two fastq-to-parquet/1.2.0 POSTs, each with
+    always-on QC, host_filter_enabled against the rype reference, the run's
+    instrument_model forwarded, and scoped to the sample's prep_sample_idx."""
     convert_dir = _seed_convert_dir(tmp_path, ["10", "11"], paired=True)
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
         responses=[
-            (200, _ref_active_body()),
-            (200, _both_indexes_body()),
+            (200, _ref_active_body()),  # rype reference
+            (200, _both_indexes_body()),  # its index list (carries rype)
+            (200, _seq_run_body(instrument_model="NextSeq 550")),  # run metadata
             (200, _pool_samples_body([(100, 1000, "10"), (101, 1001, "11")])),
             (202, {"work_ticket_idx": 900}),
             (202, {"work_ticket_idx": 901}),
@@ -2739,12 +2762,43 @@ def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(monkeypatch, tmp
     for prep_idx, item_id in ((1000, "10"), (1001, "11")):
         body = by_prep[prep_idx]
         assert body["action_id"] == "fastq-to-parquet"
-        assert body["action_version"] == "1.1.0"
+        assert body["action_version"] == "1.2.0"
         ctx = body["action_context"]
         assert ctx["host_filter_enabled"] is True
-        assert ctx["host_reference_idx"] == 7
+        assert ctx["host_rype_reference_idx"] == 7
+        # minimap2 not requested → its key is omitted (rype-only host filter).
+        assert "host_minimap2_reference_idx" not in ctx
+        assert ctx["instrument_model"] == "NextSeq 550"
         assert ctx["fastq_path"].endswith(f"{item_id}_S1_L001_R1_001.fastq.gz")
         assert ctx["reverse_fastq_path"].endswith(f"{item_id}_S1_L001_R2_001.fastq.gz")
+
+
+def test_submit_host_filter_pool_two_reference_forwards_both(monkeypatch, tmp_path):
+    """--host-minimap2-reference-idx adds a second pre-flight (the minimap2
+    reference + its index) and forwards host_minimap2_reference_idx per sample."""
+    convert_dir = _seed_convert_dir(tmp_path, ["10"], paired=True)
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, _ref_active_body(reference_idx=7)),  # rype reference
+            (200, [_both_indexes_body()[0]]),  # rype-only index list
+            (200, _ref_active_body(reference_idx=8)),  # minimap2 reference
+            (200, [_both_indexes_body(reference_idx=8)[1]]),  # minimap2-only index list
+            (200, _seq_run_body(instrument_model="NovaSeq 6000")),
+            (200, _pool_samples_body([(100, 1000, "10")])),
+            (202, {"work_ticket_idx": 900}),
+        ],
+    )
+
+    rc = _run_submit_host_filter_pool(convert_dir, rype_ref=7, minimap2_ref=8)
+    assert rc == 0
+    post = next(r for r in captured["requests"] if r["method"] == "POST")
+    ctx = post["json"]["action_context"]
+    assert ctx["host_rype_reference_idx"] == 7
+    assert ctx["host_minimap2_reference_idx"] == 8
+    assert ctx["instrument_model"] == "NovaSeq 6000"
 
 
 def test_submit_host_filter_pool_single_end_omits_reverse(monkeypatch, tmp_path):
@@ -2757,6 +2811,7 @@ def test_submit_host_filter_pool_single_end_omits_reverse(monkeypatch, tmp_path)
         responses=[
             (200, _ref_active_body()),
             (200, _both_indexes_body()),
+            (200, _seq_run_body()),
             (200, _pool_samples_body([(100, 1000, "10")])),
             (202, {"work_ticket_idx": 900}),
         ],
@@ -2766,6 +2821,29 @@ def test_submit_host_filter_pool_single_end_omits_reverse(monkeypatch, tmp_path)
     assert rc == 0
     post = next(r for r in captured["requests"] if r["method"] == "POST")
     assert "reverse_fastq_path" not in post["json"]["action_context"]
+
+
+def test_submit_host_filter_pool_instrument_model_absent_omitted(monkeypatch, tmp_path):
+    """When the run records no instrument_model (null), the per-sample context
+    omits the key — QC then defaults polyG OFF."""
+    convert_dir = _seed_convert_dir(tmp_path, ["10"], paired=False)
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, _ref_active_body()),
+            (200, _both_indexes_body()),
+            (200, _seq_run_body(instrument_model=None)),
+            (200, _pool_samples_body([(100, 1000, "10")])),
+            (202, {"work_ticket_idx": 900}),
+        ],
+    )
+
+    rc = _run_submit_host_filter_pool(convert_dir)
+    assert rc == 0
+    post = next(r for r in captured["requests"] if r["method"] == "POST")
+    assert "instrument_model" not in post["json"]["action_context"]
 
 
 def test_submit_host_filter_pool_rejects_relative_convert_dir(capsys):
@@ -2779,7 +2857,7 @@ def test_submit_host_filter_pool_rejects_relative_convert_dir(capsys):
                 "3",
                 "--sequenced-pool-idx",
                 "5",
-                "--host-reference-idx",
+                "--host-rype-reference-idx",
                 "7",
                 "--convert-dir",
                 "relative/ConvertJob",
@@ -2801,7 +2879,7 @@ def test_submit_host_filter_pool_rejects_nondir_convert_dir(capsys, tmp_path):
                 "3",
                 "--sequenced-pool-idx",
                 "5",
-                "--host-reference-idx",
+                "--host-rype-reference-idx",
                 "7",
                 "--convert-dir",
                 str(missing),
@@ -2825,20 +2903,53 @@ def test_submit_host_filter_pool_reference_not_active_no_posts(monkeypatch, tmp_
     assert not [r for r in captured["requests"] if r["method"] == "POST"]
 
 
-def test_submit_host_filter_pool_missing_minimap2_index_no_posts(monkeypatch, tmp_path, capsys):
+def test_submit_host_filter_pool_rype_ref_missing_rype_index_no_posts(
+    monkeypatch, tmp_path, capsys
+):
+    """The rype reference is active but carries no rype index → abort before any
+    ticket (only a minimap2 index present here)."""
     convert_dir = _seed_convert_dir(tmp_path, ["10"])
     captured: dict = {}
-    rype_only = [_both_indexes_body()[0]]
+    minimap2_only = [_both_indexes_body()[1]]
     _stub_multi_response(
         monkeypatch,
         captured,
-        responses=[(200, _ref_active_body()), (200, rype_only)],
+        responses=[(200, _ref_active_body()), (200, minimap2_only)],
     )
 
     with pytest.raises(SystemExit) as exc_info:
         _run_submit_host_filter_pool(convert_dir)
     assert exc_info.value.code == 1
-    assert "minimap2" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "rype" in err
+    assert "--host-rype-reference-idx" in err
+    assert not [r for r in captured["requests"] if r["method"] == "POST"]
+
+
+def test_submit_host_filter_pool_minimap2_ref_missing_minimap2_index_no_posts(
+    monkeypatch, tmp_path, capsys
+):
+    """The minimap2 reference is active but carries no minimap2 index → abort
+    before any ticket (the rype reference passed first)."""
+    convert_dir = _seed_convert_dir(tmp_path, ["10"])
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, _ref_active_body(reference_idx=7)),  # rype reference OK
+            (200, [_both_indexes_body()[0]]),  # rype index present
+            (200, _ref_active_body(reference_idx=8)),  # minimap2 reference active
+            (200, [_both_indexes_body(reference_idx=8)[0]]),  # but only a rype index
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        _run_submit_host_filter_pool(convert_dir, rype_ref=7, minimap2_ref=8)
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "minimap2" in err
+    assert "--host-minimap2-reference-idx" in err
     assert not [r for r in captured["requests"] if r["method"] == "POST"]
 
 
@@ -2853,6 +2964,7 @@ def test_submit_host_filter_pool_missing_fastq_no_posts(monkeypatch, tmp_path, c
         responses=[
             (200, _ref_active_body()),
             (200, _both_indexes_body()),
+            (200, _seq_run_body()),
             (200, _pool_samples_body([(100, 1000, "10"), (101, 1001, "99")])),
         ],
     )
@@ -2879,6 +2991,7 @@ def test_submit_host_filter_pool_multi_lane_rejected_no_posts(monkeypatch, tmp_p
         responses=[
             (200, _ref_active_body()),
             (200, _both_indexes_body()),
+            (200, _seq_run_body()),
             (200, _pool_samples_body([(100, 1000, "10")])),
         ],
     )
