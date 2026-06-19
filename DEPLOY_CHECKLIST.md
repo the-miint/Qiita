@@ -88,6 +88,22 @@ _None yet._
 
 ### Notes (no host action)
 
+- (#132) The deploy now builds container SIFs automatically.
+  `activate.sh` runs `deploy/build-sifs.sh` (after the rsync, before the
+  restarts): it iterates `workflows/*/sif-build.env`, builds each via the generic
+  `scripts/build-sif.sh` as root, and chowns the SIF to `qiita-orch`. **No manual
+  bucket-2 SIF rebuild is needed going forward** — an edited `Apptainer.def` /
+  `entrypoint.sh` / `manifest_writer.py` is now detected by a build-inputs content
+  hash and rebuilt during the deploy (the old `FORCE=1` manual step is no longer
+  required for those; the bucket-2 #130 step above is therefore redundant if it
+  ships in the same deploy, but harmless — it just rebuilds slightly earlier).
+  **Expect a one-time rebuild on the first deploy carrying this change:** the live
+  SIFs have no `.buildhash` stamp yet, so each is rebuilt once (then stamped, and
+  skipped thereafter). That rebuild needs the licensed `SOURCES` still staged
+  under `$PATH_DERIVED/images/sources/` — bcl-convert's RPM already is on the live
+  host, so no action; if an image's source is missing the deploy **skips** that
+  image (with a warning) rather than failing. A spec can opt out with
+  `AUTO_BUILD=0`. No new env var, host dir, scope, or migration.
 - (#129) New `GET /sequencing-run/{idx}` route (run metadata incl.
   `instrument_model`; prep_sample:read + wet_lab_admin) — `submit-host-filter-pool`
   reads it to forward QC's polyG `instrument_model` per sample. Code-only, no host

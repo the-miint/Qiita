@@ -4,7 +4,9 @@
 # (every deploy script lives in this same directory, so resolving paths from
 # THIS file's location is equivalent to resolving them from the caller's).
 #
-# Sourced by activate.sh, local-deploy.sh, redeploy.sh, preflight.sh, verify.sh.
+# Sourced by activate.sh, local-deploy.sh, redeploy.sh, preflight.sh, verify.sh,
+# build-sifs.sh, and scripts/build-sif.sh (the last reaches over from scripts/ for
+# the pure SIF-build helpers at the bottom — safe because sourcing has no side effects).
 # Putting the shared pieces here so a change in one script does NOT silently
 # drift from the others. Everything below is a definition (var or function) with
 # no side effects, so sourcing under `set -euo pipefail` is safe and a caller
@@ -111,6 +113,61 @@ qiita_native_checkout_from_python() {
 # qiita-common/ or qiita-compute-orchestrator/, 1 when none are (incl. empty).
 qiita_paths_touch_native() {
     printf '%s\n' "${1:-}" | grep -qE '^(qiita-common|qiita-compute-orchestrator)/'
+}
+
+# --- SIF auto-build helpers (used by scripts/build-sif.sh + deploy/build-sifs.sh) ---
+# Pure (echo/return only), so test_deploy_scripts.py exercises them directly while
+# the apptainer/root/chown wiring stays in the entrypoint scripts. This is why the
+# header says _common.sh is sourced by build-sif.sh too — these definitions have no
+# side effects on source.
+
+# sha256 of stdin, hex digest only. Prefers sha256sum (Linux deploy host); falls
+# back to `shasum -a 256` on a macOS dev/test box. Internal to the hash below.
+_qiita_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
+    else shasum -a 256 | cut -d' ' -f1; fi
+}
+
+# Content hash of a container workflow's IN-REPO build inputs, used by
+# build-sif.sh's idempotency check to detect a changed Apptainer.def /
+# entrypoint.sh / manifest_writer.py — none of which VERIFY_MATCH (binary version
+# only) can see, so such an edit would otherwise be skipped and never reach the
+# host, forcing a manual FORCE=1. Hashes every file under the workflow dir (minus
+# the spec, gitignore, and generated .sif/.rpm) plus _shared/, keyed by
+# REPO-RELATIVE path so the digest is identical from the operator clone or an
+# INCOMING stage. Deliberately EXCLUDES the vendored SOURCES (the licensed RPM):
+# re-vendoring 4.5.4-1 → 4.5.4-2 must NOT force a rebuild, matching VERIFY_MATCH's
+# intentionally-loose patch component.
+#
+# An empty input set would hash to a fixed "no inputs" digest (and so spuriously
+# MATCH a prior stamp), but that can't happen on the real path: build-sif.sh
+# requires Apptainer.def to exist before it calls this, so the workflow dir is
+# always non-empty.
+# $1 = repo root, $2 = workflow dir, $3 = shared dir. Echoes the hex digest.
+qiita_sif_build_inputs_hash() {
+    local repo_root="$1" workflow_dir="$2" shared_dir="$3"
+    {
+        find "$workflow_dir" -type f \
+            ! -name sif-build.env ! -name '.gitignore' \
+            ! -name '*.sif' ! -name '*.rpm' ! -path '*/__pycache__/*'
+        find "$shared_dir" -type f ! -path '*/__pycache__/*'
+    } | LC_ALL=C sort | while IFS= read -r f; do
+        printf '%s ' "${f#"$repo_root"/}"   # repo-relative path → location-independent
+        _qiita_sha256 < "$f"
+    done | _qiita_sha256
+}
+
+# Which of a workflow's vendored SOURCES are NOT staged under the images/sources
+# dir? build-sifs.sh uses this to SKIP (not fail) an image whose licensed artifact
+# the operator hasn't placed out of band. $1 = sources dir, $2 = space-separated
+# SOURCES list. Echoes each missing filename (one per line); returns 0 when all
+# are present, 1 when any are missing. An empty SOURCES list → nothing missing → 0.
+qiita_sif_missing_sources() {
+    local sources_dir="$1" sources="$2" src rc=0
+    for src in $sources; do
+        [ -f "$sources_dir/$src" ] || { printf '%s\n' "$src"; rc=1; }
+    done
+    return $rc
 }
 
 # Read one KEY from an env file in a clean subshell. `set +eu` so a value that

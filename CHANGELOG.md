@@ -196,6 +196,18 @@ the `no-changelog` label).
 
 ### Changed
 
+- The deploy now builds container SIFs automatically. `activate.sh` runs a new
+  `deploy/build-sifs.sh` after the rsync and before any service restart: it
+  iterates `workflows/*/sif-build.env`, builds each via the existing generic
+  `scripts/build-sif.sh` (as root), then chowns the produced SIF to `qiita-orch`.
+  It is idempotent — `build-sif.sh` now also stamps a content hash of the in-repo
+  build inputs (`Apptainer.def`/`entrypoint.sh`/`manifest_writer.py`) next to the
+  SIF, so an edit to any of those (which `VERIFY_MATCH`, version-only, could not
+  see) triggers a rebuild without the old manual `FORCE=1`. Missing prerequisites
+  (no `apptainer`, no `PATH_DERIVED`, an unstaged licensed `SOURCES`, or
+  `AUTO_BUILD=0` in a spec) clean-skip an image; only a real build/chown failure
+  aborts the deploy, before any restart. `local-deploy.sh` now also rsyncs
+  `scripts/` into the staging tree so the CI deploy path can build too
 - `qiita submit-host-filter-pool` now fans out fastq-to-parquet/**1.2.0** (QC +
   two-reference host filter) instead of 1.1.0. `--host-reference-idx` is replaced
   by `--host-rype-reference-idx` (required) and `--host-minimap2-reference-idx`

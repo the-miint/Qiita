@@ -23,10 +23,12 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DEPLOY = _REPO_ROOT / "deploy"
 _COMMON = _DEPLOY / "_common.sh"
+_BUILD_SIF = _REPO_ROOT / "scripts" / "build-sif.sh"
 
 # The scripts introduced/maintained for the issue-#72 deploy-ease work. Kept
 # explicit (not a glob) so a new deploy script is a deliberate add here.
-_SCRIPTS = ("preflight.sh", "verify.sh", "redeploy.sh")
+# build-sifs.sh is the deploy-time SIF auto-builder (wraps scripts/build-sif.sh).
+_SCRIPTS = ("preflight.sh", "verify.sh", "redeploy.sh", "build-sifs.sh")
 # Sourced-only fragments (no shebang-as-entrypoint, not executable). _common.sh
 # carries real logic (qiita_native_checkout_from_python etc.) the executable
 # scripts rely on, so it gets the same bash -n + shellcheck gate — but NOT the
@@ -284,3 +286,152 @@ def test_paths_touch_native_no_match(paths: str) -> None:
     """No path under the native packages (incl. a sibling-prefix dir or an empty
     list) → rc 1 (no refresh needed)."""
     assert _call_paths_touch_native(paths).returncode == 1
+
+
+# --- scripts/build-sif.sh: now sources deploy/_common.sh for the build-inputs
+# hash, so it gets the same bash -n + shellcheck gate as the deploy scripts. ------
+
+
+def test_build_sif_exists_and_executable() -> None:
+    assert _BUILD_SIF.is_file(), f"{_BUILD_SIF} missing"
+    assert _BUILD_SIF.stat().st_mode & 0o111, f"{_BUILD_SIF} is not executable"
+
+
+def test_build_sif_is_valid_bash() -> None:
+    result = subprocess.run(["bash", "-n", str(_BUILD_SIF)], capture_output=True, text=True)
+    assert result.returncode == 0, f"bash -n failed for build-sif.sh:\n{result.stderr}"
+
+
+def test_build_sif_passes_shellcheck() -> None:
+    if shutil.which("shellcheck") is None:
+        pytest.skip("shellcheck not installed")
+    # -S warning to match the deploy-script gate above; the `# shellcheck source=`
+    # directive in build-sif.sh keeps the cross-dir _common.sh source from flagging.
+    result = subprocess.run(
+        ["shellcheck", "-S", "warning", str(_BUILD_SIF)], capture_output=True, text=True
+    )
+    assert result.returncode == 0, (
+        f"shellcheck flagged build-sif.sh:\n{result.stdout}\n{result.stderr}"
+    )
+
+
+# --- qiita_sif_build_inputs_hash: the content stamp build-sif.sh uses to detect a
+# changed def/entrypoint/manifest (the #130/#126 trap VERIFY_MATCH can't see). -----
+
+
+def _make_workflow_tree(root: Path) -> tuple[Path, Path]:
+    """A minimal repo layout: workflows/<wf>/ + workflows/_shared/. Returns
+    (workflow_dir, shared_dir). Includes files the hash must IGNORE (the spec, a
+    .gitignore, a vendored *.rpm) so a test can prove they don't affect the digest."""
+    wf = root / "workflows" / "demo"
+    shared = root / "workflows" / "_shared"
+    wf.mkdir(parents=True)
+    shared.mkdir(parents=True)
+    (wf / "Apptainer.def").write_text("Bootstrap: docker\nFrom: oraclelinux:8\n")
+    (wf / "entrypoint.sh").write_text("#!/bin/sh\necho hi\n")
+    (wf / "sif-build.env").write_text('SIF_FILENAME="demo.sif"\n')  # must be ignored
+    (wf / ".gitignore").write_text("*.rpm\n")  # must be ignored
+    (wf / "demo-1.0.rpm").write_text("binary-ish")  # vendored SOURCE — must be ignored
+    (shared / "manifest_writer.py").write_text("x = 1\n")
+    return wf, shared
+
+
+def _call_build_inputs_hash(repo_root: Path, wf: Path, shared: Path) -> str:
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{_COMMON}"; qiita_sif_build_inputs_hash "$1" "$2" "$3"',
+            "_",
+            str(repo_root),
+            str(wf),
+            str(shared),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+def test_build_inputs_hash_is_deterministic(tmp_path: Path) -> None:
+    wf, shared = _make_workflow_tree(tmp_path)
+    assert _call_build_inputs_hash(tmp_path, wf, shared) == _call_build_inputs_hash(
+        tmp_path, wf, shared
+    )
+
+
+def test_build_inputs_hash_changes_on_entrypoint_edit(tmp_path: Path) -> None:
+    """A def/entrypoint/manifest edit MUST change the hash — that's the whole point
+    (it triggers the rebuild VERIFY_MATCH would have skipped)."""
+    wf, shared = _make_workflow_tree(tmp_path)
+    before = _call_build_inputs_hash(tmp_path, wf, shared)
+    (wf / "entrypoint.sh").write_text("#!/bin/sh\necho changed\n")
+    assert _call_build_inputs_hash(tmp_path, wf, shared) != before
+
+
+def test_build_inputs_hash_ignores_spec_gitignore_and_sources(tmp_path: Path) -> None:
+    """Changing the spec, .gitignore, or a vendored *.rpm must NOT change the hash —
+    re-vendoring 4.5.4-1 → 4.5.4-2 must not force a rebuild (VERIFY_MATCH's loose
+    patch component), and the spec/gitignore aren't baked into the image."""
+    wf, shared = _make_workflow_tree(tmp_path)
+    before = _call_build_inputs_hash(tmp_path, wf, shared)
+    (wf / "sif-build.env").write_text('SIF_FILENAME="demo.sif"\nSOURCES="demo-2.0.rpm"\n')
+    (wf / ".gitignore").write_text("*.rpm\n*.sif\n")
+    (wf / "demo-1.0.rpm").write_text("re-vendored bytes")
+    assert _call_build_inputs_hash(tmp_path, wf, shared) == before
+
+
+def test_build_inputs_hash_is_location_independent(tmp_path: Path) -> None:
+    """Same content under a different repo root → same digest (the keys are
+    repo-RELATIVE paths). Matters: activate.sh runs from the clone, the CI path
+    from /opt/qiita/incoming — both must agree on 'unchanged'."""
+    wf_a, shared_a = _make_workflow_tree(tmp_path / "clone")
+    wf_b, shared_b = _make_workflow_tree(tmp_path / "incoming")
+    assert _call_build_inputs_hash(tmp_path / "clone", wf_a, shared_a) == _call_build_inputs_hash(
+        tmp_path / "incoming", wf_b, shared_b
+    )
+
+
+# --- qiita_sif_missing_sources: gates whether build-sifs.sh SKIPS an image whose
+# licensed artifact isn't staged. rc 0 = all present, 1 = some missing (echoed). --
+
+
+def _call_missing_sources(sources_dir: Path, sources: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'source "{_COMMON}"; qiita_sif_missing_sources "$1" "$2"',
+            "_",
+            str(sources_dir),
+            sources,
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_missing_sources_all_present_returns_zero(tmp_path: Path) -> None:
+    (tmp_path / "a.rpm").write_text("x")
+    (tmp_path / "b.rpm").write_text("y")
+    result = _call_missing_sources(tmp_path, "a.rpm b.rpm")
+    assert result.returncode == 0
+    assert result.stdout == ""
+
+
+def test_missing_sources_empty_list_returns_zero(tmp_path: Path) -> None:
+    """A workflow that vendors nothing from sources/ (empty SOURCES) → nothing
+    missing → rc 0, so build-sifs.sh proceeds to build it."""
+    result = _call_missing_sources(tmp_path, "")
+    assert result.returncode == 0
+    assert result.stdout == ""
+
+
+def test_missing_sources_some_missing_returns_one_and_lists_them(tmp_path: Path) -> None:
+    (tmp_path / "present.rpm").write_text("x")
+    result = _call_missing_sources(tmp_path, "present.rpm gone.rpm also-gone.rpm")
+    assert result.returncode == 1
+    missing = set(result.stdout.split())
+    assert missing == {"gone.rpm", "also-gone.rpm"}
+    assert "present.rpm" not in missing

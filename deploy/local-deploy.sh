@@ -48,6 +48,11 @@ rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/qiita-c
 rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/qiita-compute-orchestrator/" "$INCOMING/qiita-compute-orchestrator/"
 rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/workflows/"                 "$INCOMING/workflows/"
 rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/deploy/"                    "$INCOMING/deploy/"
+# scripts/ carries build-sif.sh, which activate.sh's SIF auto-build (build-sifs.sh)
+# invokes. On this local path activate.sh runs from $QIITA_CLONE (which has it), but
+# the CI path runs activate.sh from $INCOMING — stage it so that path finds it too
+# (else SIF auto-build cleanly skips). Cheap; keeps $INCOMING a self-contained tree.
+rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/scripts/"                   "$INCOMING/scripts/"
 install -m 0755 -o root -g root "$DP_BINARY" "$INCOMING/qiita-data-plane"
 
 # Explicit export so QIITA_HOSTNAME crosses the exec boundary into
