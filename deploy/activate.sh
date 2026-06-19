@@ -177,6 +177,14 @@ done
 install -d -o root -g root -m 0755 /opt/qiita/data-plane
 install -m 0755 "$INCOMING/qiita-data-plane" /opt/qiita/data-plane/qiita-data-plane
 
+# Build/verify container-workflow SIFs before the restarts (a SLURM step depends
+# on its image being present and current). Runs as root and chowns each produced
+# SIF to qiita-orch. Idempotent: unchanged images cost only a fast verify. Absent
+# prerequisites (no apptainer, no PATH_DERIVED, unstaged licensed source) degrade
+# to a clean skip; a genuine build failure exits non-zero and aborts the deploy
+# here, before any service restarts onto a broken image. See build-sifs.sh.
+"$(dirname "${BASH_SOURCE[0]}")/build-sifs.sh"
+
 cp "$INCOMING/deploy/nginx/qiita.conf" /etc/nginx/conf.d/qiita.conf
 sed -i "s/__QIITA_HOSTNAME__/${QIITA_HOSTNAME}/g" /etc/nginx/conf.d/qiita.conf
 cp "$INCOMING/deploy/systemd/"*.service /etc/systemd/system/

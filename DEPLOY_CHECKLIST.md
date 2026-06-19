@@ -59,6 +59,22 @@ _None yet._
 
 ### Notes (no host action)
 
+- (#NNN — fill at PR) The deploy now builds container SIFs automatically.
+  `activate.sh` runs `deploy/build-sifs.sh` (after the rsync, before the
+  restarts): it iterates `workflows/*/sif-build.env`, builds each via the generic
+  `scripts/build-sif.sh` as root, and chowns the SIF to `qiita-orch`. **No manual
+  bucket-2 SIF rebuild is needed going forward** — an edited `Apptainer.def` /
+  `entrypoint.sh` / `manifest_writer.py` is now detected by a build-inputs content
+  hash and rebuilt during the deploy (the old `FORCE=1` manual step is no longer
+  required for those; the bucket-2 #130 step above is therefore redundant if it
+  ships in the same deploy, but harmless — it just rebuilds slightly earlier).
+  **Expect a one-time rebuild on the first deploy carrying this change:** the live
+  SIFs have no `.buildhash` stamp yet, so each is rebuilt once (then stamped, and
+  skipped thereafter). That rebuild needs the licensed `SOURCES` still staged
+  under `$PATH_DERIVED/images/sources/` — bcl-convert's RPM already is on the live
+  host, so no action; if an image's source is missing the deploy **skips** that
+  image (with a warning) rather than failing. A spec can opt out with
+  `AUTO_BUILD=0`. No new env var, host dir, scope, or migration.
 - (#128) Genome-scale reference-load resource tuning (no client breakage). The two `workflows/` entries `local-reference-add` and `local-host-reference-add` (both still 1.0.0) are **edited in place** — re-synced into `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (already covered by bucket 5's `qiita.action` list check), **not** a migration. Raised baseline_resources + walltimes so loading hundreds of human genomes no longer hits the old 1h step cap (`stage_local_fasta`/`hash_sequences` → cpu=8/mem_gb=32, `build_rype_index` → cpu=8, `build_minimap2_index` → mem_gb=32; step walltimes → PT24H under a PT48H `action_ceiling`). To permit those longer walltimes the orchestrator's SLURM poll-loop timeout **default** rose 24h → 48h (`config.py` `DEFAULT_SLURM_JOB_TIMEOUT_SECONDS`); it applies on the normal bucket-4 CO restart — no new env var. **Caveat:** if `/etc/qiita/compute-orchestrator.env` pins `SLURM_JOB_TIMEOUT_SECONDS` explicitly, raise it to ≥ the longest step walltime (currently PT24H / 86400s) or genome-scale loads will be reaped mid-run. No new host dir, scope, or migration.
 
 ---

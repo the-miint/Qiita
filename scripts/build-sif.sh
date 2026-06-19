@@ -47,6 +47,12 @@ SHARED_DIR="${REPO_ROOT}/workflows/_shared"
 SPEC="${WORKFLOW_DIR}/sif-build.env"
 DEF="${WORKFLOW_DIR}/Apptainer.def"
 
+# Reach over to the deploy/ shared shell helpers for qiita_sif_build_inputs_hash
+# (pure; no side effects on source — see its header). Keeps the hash logic in one
+# unit-tested place (test_deploy_scripts.py) instead of duplicated here.
+# shellcheck source=../deploy/_common.sh
+source "${REPO_ROOT}/deploy/_common.sh"
+
 if [[ ! -f "${SPEC}" ]]; then
     echo "No sif-build.env for workflow '${WORKFLOW}' at:" >&2
     echo "  ${SPEC}" >&2
@@ -89,26 +95,45 @@ fi
 
 SOURCES_DIR="${IMAGES_DIR}/sources"
 SIF_PATH="${IMAGES_DIR}/${SIF_FILENAME}"
+# Content stamp written next to the SIF. Lets the idempotency check below detect
+# a changed Apptainer.def / entrypoint.sh / manifest_writer.py — none of which
+# VERIFY_MATCH (binary version only) can see, so such an edit would otherwise be
+# skipped and never reach the host, forcing a manual FORCE=1. See the hash helper
+# qiita_sif_build_inputs_hash in deploy/_common.sh.
+HASH_PATH="${SIF_PATH}.buildhash"
+
+# Content hash of the in-repo build inputs (qiita_sif_build_inputs_hash, in
+# deploy/_common.sh): a changed def/entrypoint/manifest changes it and so triggers
+# a rebuild below, while a re-vendored SOURCES (deliberately excluded) does not.
+WANT_HASH="$(qiita_sif_build_inputs_hash "${REPO_ROOT}" "${WORKFLOW_DIR}" "${SHARED_DIR}")"
 
 # Idempotency check: if a SIF already exists AND satisfies VERIFY_MATCH,
 # leave it alone. `apptainer exec` runs the embedded binary in a fresh
 # namespace. VERIFY_CMD is intentionally word-split (it carries args).
 #
-# VERIFY_MATCH only probes the vendored binary's version — it is blind to
-# the *image-baked* artifacts (entrypoint.sh, manifest_writer.py, the def's
-# %post). So a fix that changes one of those without bumping the binary
-# version would be skipped here and never reach the host. FORCE=1 opts out
-# of the idempotency skip to rebuild unconditionally; the deploy checklist
-# uses it whenever an entrypoint/manifest/def-only change ships.
+# The skip now requires BOTH gates to pass: the vendored binary satisfies
+# VERIFY_MATCH *and* the build-inputs hash matches the stamp from the last
+# build. VERIFY_MATCH alone is blind to the image-baked artifacts (entrypoint.sh,
+# manifest_writer.py, the def's %post) — a fix to one of those used to be skipped
+# here and never reach the host, which forced a manual FORCE=1. The hash closes
+# that gap, so FORCE=1 is now only an emergency override (e.g. to rebuild against a
+# re-vendored SOURCES, which the hash intentionally ignores).
 if [[ "${FORCE:-}" == "1" ]]; then
     echo "FORCE=1 — rebuilding ${SIF_PATH} unconditionally (skipping idempotency check)."
 elif [[ -f "${SIF_PATH}" ]]; then
+    have_hash=""
+    [[ -f "${HASH_PATH}" ]] && have_hash="$(cat "${HASH_PATH}")"
     # shellcheck disable=SC2086
-    if apptainer exec "${SIF_PATH}" ${VERIFY_CMD} 2>&1 | grep -qE "${VERIFY_MATCH}"; then
-        echo "Existing SIF at ${SIF_PATH} satisfies '${VERIFY_MATCH}' — nothing to do."
+    if [[ "${have_hash}" == "${WANT_HASH}" ]] \
+        && apptainer exec "${SIF_PATH}" ${VERIFY_CMD} 2>&1 | grep -qE "${VERIFY_MATCH}"; then
+        echo "Existing SIF at ${SIF_PATH} satisfies '${VERIFY_MATCH}' and build inputs are unchanged — nothing to do."
         exit 0
     fi
-    echo "Existing SIF at ${SIF_PATH} does not satisfy '${VERIFY_MATCH}'; rebuilding."
+    if [[ "${have_hash}" != "${WANT_HASH}" ]]; then
+        echo "Build inputs for ${WORKFLOW} changed since the last build (def/entrypoint/manifest); rebuilding ${SIF_PATH}."
+    else
+        echo "Existing SIF at ${SIF_PATH} does not satisfy '${VERIFY_MATCH}'; rebuilding."
+    fi
 fi
 
 # Stage into a build root OWNED BY THE INVOKING USER (never the checkout).
@@ -163,4 +188,9 @@ if ! apptainer exec "${SIF_PATH}" ${VERIFY_CMD} 2>&1 | grep -qE "${VERIFY_MATCH}
     exit 1
 fi
 
-echo "Built ${SIF_PATH} (satisfies '${VERIFY_MATCH}')"
+# Stamp the build-inputs hash next to the SIF so the next run's idempotency
+# check can detect a def/entrypoint/manifest change. Written only after the SIF
+# verifies, so a failed build never leaves a stamp that would skip the retry.
+printf '%s\n' "${WANT_HASH}" > "${HASH_PATH}"
+
+echo "Built ${SIF_PATH} (satisfies '${VERIFY_MATCH}'; build-inputs stamp ${HASH_PATH})"
