@@ -78,7 +78,7 @@ _DUCKDB_MEMORY_GB = 4
 # Under-SLURM ceiling for DuckDB's share (see the split note above); the 4 GB
 # fallback only applies off-SLURM.
 _DUCKDB_MEMORY_CAP_GB = 16
-_DUCKDB_THREADS = 4
+_DUCKDB_THREADS = 8
 _RYPE_MAX_MEMORY_GB = 24
 
 # rype build defaults. w=20 is passed explicitly (the function default is 50).
