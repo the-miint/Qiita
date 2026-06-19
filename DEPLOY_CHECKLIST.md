@@ -35,9 +35,33 @@ _None yet._
     PATH_DERIVED='$derived' bash /home/qiita/qiita-miint/scripts/build-sif.sh bcl-convert"
   ```
 
+- (#TBD) **Enable QC: load the adapter set + set `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX`.**
+  fastq-to-parquet/1.2.0's always-on QC trims against a canonical adapter set
+  stored as an `artifact_sequence_set` reference. **Run AFTER the bucket-3
+  migration + bucket-4 deploy** — the new `artifact_sequence_set` kind and the
+  `qiita reference load --kind` flag must be live first. Load the set (it prints
+  the new reference_idx), pin that idx, restart CP:
+
+  ```bash
+  # [operator, with a reference:write PAT] load the canonical adapter set;
+  # note the printed reference_idx
+  qiita reference load --kind artifact_sequence_set \
+    --name qc-adapters --version 1.0 --fasta /path/to/adapters.fasta
+  # [admin] pin the printed idx (idempotent) and restart CP so it picks it up
+  sudo bash -c 'grep -q "^QIITA_DEFAULT_ADAPTER_REFERENCE_IDX=" /etc/qiita/control-plane.env \
+    || echo "QIITA_DEFAULT_ADAPTER_REFERENCE_IDX=<reference_idx>" >> /etc/qiita/control-plane.env'
+  sudo systemctl restart qiita-control-plane
+  ```
+
+  Optional at boot (CP starts without it; 1.1.0 is unaffected) — a 1.2.0 /
+  `submit-host-filter-pool` submission fails until both the adapter set and this
+  var are in place.
+
 ### 3. Migrations
 
-_None yet._
+- (#TBD) `20260618000000_reference_kind_artifact_sequence_set.sql` — widens the
+  `reference.kind` CHECK to allow `artifact_sequence_set`. Plain `make migrate`,
+  no out-of-band setup.
 
 ### 4. Deploy
 
@@ -55,6 +79,11 @@ _None yet._
   Expect `Python 3.11.x`. (A clean SIF rebuild already proved `manifest_writer.py`
   imports under it via the `%test` block.)
 
+- (#TBD) Confirm `fastq-to-parquet 1.2.0` is in the `make verify-deploy` action
+  list (the always-on-QC + two-reference host-filter workflow `submit-host-filter-pool`
+  now targets). A 1.2.0 QC submission also needs the bucket-2 adapter set +
+  `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX`.
+
 ### Notes (no host action)
 
 - (#124) Per-host-reference index selection + tunable build params (additive, no client breakage). The two `workflows/` entries `host-reference-add` and `local-host-reference-add` (both still 1.0.0) are **edited in place** — re-synced into `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (already in bucket 5's `qiita.action` list check), **not** a migration. New optional `action_context` keys (`build_rype`/`build_minimap2` to pick which host-filter indexes to build, `rype_w`/`minimap2_preset` to tune them) surfaced by `qiita reference load --host --no-rype-index|--no-minimap2-index|--rype-w|--minimap2-preset`; omitted, behaviour is unchanged (both indexes built; minimap2 `preset` default `sr`). No new env var, host dir, scope, or migration. Two behaviour notes (both code-internal, no host action): the rype build window `w` default changed 25 → 20; and the fastq-to-parquet host-filter consumer now accepts a single-index host reference (binds whichever of rype/minimap2 exist, requires ≥1). The minimap2 build step also gained `target_status: indexing` so a minimap2-only build still transitions the reference out of `loading`.
@@ -64,6 +93,12 @@ _None yet._
   the scope is **not** in admin PATs minted before this deploy (tokens carry a
   fixed scope snapshot). An admin who wants to use the delete must mint a fresh
   PAT after the deploy. No migration, env var, or host change. (#125)
+- (#TBD) New `GET /sequencing-run/{idx}` route (run metadata incl.
+  `instrument_model`; prep_sample:read + wet_lab_admin) — `submit-host-filter-pool`
+  reads it to forward QC's polyG `instrument_model` per sample. Code-only, no host
+  action, no new scope. The new `workflows/fastq-to-parquet/1.2.0.yaml` (plus a
+  comment-only `1.1.0` edit) re-syncs into `qiita.action` via `qiita-admin actions
+  sync` inside `activate.sh` (verified in bucket 5), **not** a migration.
 
 ---
 
