@@ -19,7 +19,22 @@ _None yet._
 
 ### 2. One-time host setup
 
-_None yet._
+- (#130) Rebuild the bcl-convert SIF to pick up the `entrypoint.sh` chmod fix
+  (the step's final mode-fixing `find … chmod` no longer touches the
+  orchestrator-owned `$QIITA_OUTPUT_PATH` root, which was failing live
+  bcl_convert jobs with `chmod: … Operation not permitted` under `set -e`).
+  `entrypoint.sh` is baked into the SIF, but `build-sif.sh`'s idempotency check
+  only probes the bcl-convert *version* (unchanged here) — so a plain rebuild
+  prints "nothing to do". Use the new `FORCE=1` to rebuild unconditionally. The
+  python3.11 SIF (#126) is already live on the host, so this is its own rebuild
+  (not piggybacking on a #126 step). Run after the `git pull`, before the
+  bucket-4 deploy:
+
+  ```bash
+  derived=$(sudo grep '^PATH_DERIVED=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)
+  sudo -u qiita-orch bash -lc "FORCE=1 PATH_DERIVED='$derived' \
+    bash /home/qiita/qiita-miint/scripts/build-sif.sh bcl-convert"
+  ```
 
 ### 3. Migrations
 
@@ -31,7 +46,16 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- (#130) Confirm the rebuilt bcl-convert SIF carries the fixed entrypoint:
+
+  ```bash
+  derived=$(sudo grep '^PATH_DERIVED=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)
+  sudo -u qiita-orch apptainer exec "$derived/images/bcl-convert-4.5.4.sif" \
+    grep -q 'mindepth 1' /opt/qiita/entrypoint.sh && echo OK
+  ```
+
+  Expect `OK` (the `-mindepth 1` guard is present). The real proof is the next
+  bcl_convert ticket completing past the output-chmod step.
 
 ### Notes (no host action)
 
