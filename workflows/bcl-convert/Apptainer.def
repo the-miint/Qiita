@@ -27,11 +27,12 @@ From: oraclelinux:8
     entrypoint.sh /opt/qiita/entrypoint.sh
 
 %post
-    # Fail the build on any error below (apptainer aborts when %post exits
-    # non-zero), so a regression surfaces here, not as a broken SIF or a live
-    # job. Without this, a failed `dnf install` would be logged and the build
-    # would carry on — exactly how the /tmp-shadowing bug produced a confusing
-    # "Could not open … rpm" without stopping the build.
+    # Fail the build on any error below. apptainer already aborts when %post
+    # exits non-zero, so a failed `dnf install` does stop the build — but on its
+    # own it stops with a cryptic message at the wrong layer (that's how the
+    # /tmp-shadowing bug surfaced: a confusing "Could not open … rpm"). `set -e`
+    # plus the explicit guard just below turn that into a clear, early failure on
+    # the actual offending line, rather than a broken SIF or a live-job surprise.
     set -e
 
     # Assert the licensed RPM actually made it into the image (see the /opt vs
