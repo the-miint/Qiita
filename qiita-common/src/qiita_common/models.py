@@ -200,7 +200,12 @@ class Tier(StrEnum):
     ADMIN = "admin"
 
 
-ReferenceKind = Literal["sequence_reference", "taxonomy_authority"]
+ReferenceKind = Literal["sequence_reference", "taxonomy_authority", "artifact_sequence_set"]
+"""Kinds of reference, mirroring the `qiita.reference.kind` TEXT/CHECK column
+(NOT a Postgres ENUM — see the reference migrations). `artifact_sequence_set` is
+an indexless set of artifact sequences (e.g. the canonical adapter set the QC
+step trims against): ingested through the same kind-agnostic reference-add flow,
+but carries no taxonomy and builds no rype/minimap2 index."""
 
 
 class ReferenceCreateRequest(BaseModel):

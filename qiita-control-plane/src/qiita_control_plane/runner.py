@@ -59,6 +59,7 @@ from qiita_common.models import (
 from . import step_progress
 from .actions.library import LIBRARY
 from .actions.reference import ReferenceNotFound, transition_reference_status
+from .auth.tickets import sign_ticket
 
 _log = logging.getLogger(__name__)
 
@@ -207,6 +208,7 @@ async def run_workflow(
     data_plane_url: str,
     work_ticket_workspace_root: Path,
     upload_staging_root: Path,
+    default_adapter_reference_idx: int | None = None,
     poll_interval_seconds: float = _STEP_POLL_INTERVAL_SECONDS,
     resume: bool = False,
 ) -> None:
@@ -319,6 +321,23 @@ async def run_workflow(
         # leaving the ticket stuck in PROCESSING. `host_reference_idx` is NOT a
         # `*_upload_idx` key, so the walker above left it untouched.
         bound.update(await _resolve_host_filter_indexes(pool, action_context=bound))
+
+        # QC adapter materialization: when any step needs `adapter_fasta` (the
+        # qc step), DoGet the configured artifact_sequence_set reference's
+        # sequences and stage them as a local FASTA in the ticket workspace.
+        # Same pre-loop, inside-try placement as host-filter resolution so a
+        # failure (unconfigured / non-active / empty adapter set) lands in the
+        # outer FAILED handler rather than leaving the ticket stuck in PROCESSING.
+        if _workflow_needs_adapters(action.steps):
+            bound.update(
+                await _resolve_qc_adapters(
+                    pool,
+                    default_adapter_reference_idx=default_adapter_reference_idx,
+                    data_plane_url=data_plane_url,
+                    hmac_secret=hmac_secret,
+                    workspace=workspace,
+                )
+            )
 
         for index, entry in enumerate(action.steps):
             # Conditional gate (WorkflowStep/WorkflowAction.when): skip this
@@ -1168,6 +1187,160 @@ async def _resolve_host_filter_indexes(
             "a host reference must carry at least one host-filter index"
         )
     return bound
+
+
+# Binding name the runner stages the canonical adapter FASTA under. A step that
+# lists this in its `inputs` (the qc step) signals the runner to materialize the
+# adapter set before the step loop (see `_resolve_qc_adapters`).
+QC_ADAPTER_BINDING = "adapter_fasta"
+
+# The DuckLake table holding actual sequence bytes (reference_sequences is
+# metadata only). Must match the data plane's ALLOWED_TABLES whitelist and the
+# route's _DOGET_ALLOWED_TABLES.
+_REFERENCE_CHUNKS_TABLE = "reference_sequence_chunks"
+
+
+def _do_get_reference_sequence_chunks(
+    data_plane_url: str, ticket_bytes: bytes
+) -> list[tuple[int, int, str]]:
+    """Synchronous Flight DoGet of a reference's sequence chunks — runs in a
+    thread executor (pyarrow.flight is sync). Returns (feature_idx, chunk_index,
+    chunk_data) rows. Mirrors `actions.library._do_action_register`'s client
+    use; pyarrow imported lazily to keep it off the module hot path. Isolated as
+    a module function so unit tests stub the real DoGet."""
+    import pyarrow.flight as flight  # noqa: PLC0415
+
+    with flight.FlightClient(data_plane_url) as client:
+        table = client.do_get(flight.Ticket(ticket_bytes)).read_all()
+    cols = {
+        name: table.column(name).to_pylist()
+        for name in ("feature_idx", "chunk_index", "chunk_data")
+    }
+    return list(zip(cols["feature_idx"], cols["chunk_index"], cols["chunk_data"], strict=True))
+
+
+def _write_adapter_fasta(rows: list[tuple[int, int, str]], out_path: Path) -> int:
+    """Reassemble chunked sequences (group by feature_idx, order by chunk_index,
+    concat chunk_data — the same string_agg the data plane documents) into a
+    FASTA at `out_path`, one record per feature. Returns the sequence count.
+    Raises ValueError on an empty set — an adapter reference with no sequences
+    is a misconfiguration, not a valid QC input.
+
+    Input contract (the reference-load flow, jobs/reference_load.py): chunk_data
+    is a substring of a parsed FASTA record, so it is newline-free, and a feature
+    is loaded exactly once with monotonic chunk_index (a reference is loaded once,
+    pending→loading→active), so (feature_idx, chunk_index) is unique. Hence no
+    newline sanitation or chunk dedup here — both would mask a real corruption we
+    want to surface."""
+    by_feature: dict[int, list[tuple[int, str]]] = {}
+    for feature_idx, chunk_index, chunk_data in rows:
+        by_feature.setdefault(feature_idx, []).append((chunk_index, chunk_data))
+    if not by_feature:
+        raise ValueError("adapter reference returned no sequences")
+    parts = [
+        f">{feature_idx}\n{''.join(chunk for _, chunk in sorted(chunks))}\n"
+        for feature_idx, chunks in sorted(by_feature.items())
+    ]
+    out_path.write_text("".join(parts), encoding="utf-8")
+    return len(by_feature)
+
+
+def _workflow_needs_adapters(steps: list[Any]) -> bool:
+    """True iff some entry declares `adapter_fasta` as an (optional) input — the
+    signal the runner must materialize the adapter set before the step loop."""
+    for entry in steps:
+        names = list(getattr(entry, "inputs", []) or []) + list(
+            getattr(entry, "optional_inputs", []) or []
+        )
+        if QC_ADAPTER_BINDING in names:
+            return True
+    return False
+
+
+async def _resolve_qc_adapters(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    *,
+    default_adapter_reference_idx: int | None,
+    data_plane_url: str,
+    hmac_secret: bytes,
+    workspace: Path,
+) -> dict[str, Path]:
+    """Materialize the canonical adapter set as a local FASTA for the QC step.
+
+    Run before the step loop when `_workflow_needs_adapters`. Resolves the
+    configured `artifact_sequence_set` reference, signs + DoGets its sequence
+    chunks from the data plane, reassembles them, and writes
+    `<workspace>/adapters.fasta` (the shared-FS ticket root every compute node
+    sees) — bound to the qc step as `adapter_fasta`. Re-run safe: a resume
+    re-materializes the same file (DoGet is read-only).
+
+    Like `_resolve_host_filter_indexes`, every failure raises a
+    SUBMISSION-attributed BAD_INPUT the outer handler turns into a FAILED ticket:
+    no configured default, an unknown / wrong-kind / non-active reference, or an
+    empty adapter set."""
+    if default_adapter_reference_idx is None:
+        raise _submission_bad_input(
+            "this workflow needs an adapter set but no default adapter reference is "
+            "configured — set QIITA_DEFAULT_ADAPTER_REFERENCE_IDX to the loaded "
+            "artifact_sequence_set reference_idx"
+        )
+    # NOTE: single-gate (kind/status checked here, then DoGet) — same TOCTOU
+    # shape as _resolve_reference_index_path. Safe for a canonical, static
+    # adapter set that nothing transitions out of `active` mid-run; revisit if
+    # the adapter reference ever gains a rotation lifecycle.
+    row = await pool.fetchrow(
+        "SELECT kind, status FROM qiita.reference WHERE reference_idx = $1",
+        default_adapter_reference_idx,
+    )
+    if row is None:
+        raise _submission_bad_input(
+            f"default adapter reference {default_adapter_reference_idx} does not exist"
+        )
+    if row["kind"] != "artifact_sequence_set":
+        raise _submission_bad_input(
+            f"default adapter reference {default_adapter_reference_idx} has kind "
+            f"{row['kind']!r}, expected 'artifact_sequence_set'"
+        )
+    if row["status"] != ReferenceStatus.ACTIVE.value:
+        raise _submission_bad_input(
+            f"default adapter reference {default_adapter_reference_idx} status is "
+            f"{row['status']!r}, must be {ReferenceStatus.ACTIVE.value!r}"
+        )
+
+    ticket = sign_ticket(
+        table=_REFERENCE_CHUNKS_TABLE,
+        filter={"reference_idx": [default_adapter_reference_idx]},
+        secret=hmac_secret,
+    )
+    # A Flight failure (data plane unreachable / errored) raises
+    # pyarrow.flight.FlightError, which is NOT a BackendFailure — letting it
+    # escape this pre-loop pass would hit run_workflow's bare `except Exception`,
+    # which records stage=STEP_RUN with step_name=None and so VIOLATES the
+    # work_ticket_failure_step_name_consistent CHECK (step_run ⇒ step_name NOT
+    # NULL) — the failure transition itself would throw and strand the ticket in
+    # PROCESSING. Wrap it as a SUBMISSION failure like every other pre-loop
+    # resolver. (Not retried in place: the operator resubmits if the data plane
+    # was down.)
+    try:
+        rows = await asyncio.get_event_loop().run_in_executor(
+            None, _do_get_reference_sequence_chunks, data_plane_url, ticket
+        )
+    except Exception as exc:
+        raise _submission_bad_input(
+            f"could not fetch adapter sequences for reference "
+            f"{default_adapter_reference_idx} from the data plane: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    workspace.mkdir(parents=True, exist_ok=True)
+    adapter_fasta = workspace / "adapters.fasta"
+    try:
+        _write_adapter_fasta(rows, adapter_fasta)
+    except ValueError as exc:
+        adapter_fasta.unlink(missing_ok=True)
+        raise _submission_bad_input(
+            f"default adapter reference {default_adapter_reference_idx}: {exc}"
+        ) from exc
+    return {QC_ADAPTER_BINDING: adapter_fasta}
 
 
 # =============================================================================

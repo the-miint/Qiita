@@ -1826,6 +1826,177 @@ async def test_resolve_host_filter_indexes_neither_index(postgres_pool, referenc
     assert "neither" in ei.value.reason
 
 
+# =============================================================================
+# _resolve_qc_adapters (QC adapter-set materialization)
+# =============================================================================
+
+
+async def _make_adapter_reference(pool, reference_idx) -> None:
+    """Turn the test reference into an ACTIVE artifact_sequence_set."""
+    await pool.execute(
+        "UPDATE qiita.reference SET kind = 'artifact_sequence_set', status = 'active'"
+        " WHERE reference_idx = $1",
+        reference_idx,
+    )
+
+
+async def test_resolve_qc_adapters_writes_fasta(
+    postgres_pool, reference_idx, tmp_path, monkeypatch
+):
+    """Active artifact_sequence_set + DoGet'd chunks → adapters.fasta in the
+    workspace, with chunks reassembled in chunk_index order per feature."""
+    from qiita_control_plane import runner
+
+    await _make_adapter_reference(postgres_pool, reference_idx)
+    # Out-of-order chunks + a two-chunk feature, to pin the ORDER BY chunk_index
+    # reassembly and the per-feature record split.
+    monkeypatch.setattr(
+        runner,
+        "_do_get_reference_sequence_chunks",
+        lambda _url, _ticket: [(7, 1, "GGGG"), (7, 0, "AGAT"), (9, 0, "CTGTCTC")],
+    )
+    out = await runner._resolve_qc_adapters(
+        postgres_pool,
+        default_adapter_reference_idx=reference_idx,
+        data_plane_url="grpc://unused",
+        hmac_secret=b"x" * 16,
+        workspace=tmp_path,
+    )
+    assert out == {"adapter_fasta": tmp_path / "adapters.fasta"}
+    assert (tmp_path / "adapters.fasta").read_text() == ">7\nAGATGGGG\n>9\nCTGTCTC\n"
+
+
+async def test_resolve_qc_adapters_unconfigured(postgres_pool, tmp_path):
+    """No configured default → SUBMISSION BAD_INPUT (no DB lookup needed)."""
+    from qiita_control_plane import runner
+
+    with pytest.raises(BackendFailure) as ei:
+        await runner._resolve_qc_adapters(
+            postgres_pool,
+            default_adapter_reference_idx=None,
+            data_plane_url="grpc://unused",
+            hmac_secret=b"x" * 16,
+            workspace=tmp_path,
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
+    assert "QIITA_DEFAULT_ADAPTER_REFERENCE_IDX" in ei.value.reason
+
+
+async def test_resolve_qc_adapters_unknown_reference(postgres_pool, tmp_path):
+    from qiita_control_plane import runner
+
+    with pytest.raises(BackendFailure) as ei:
+        await runner._resolve_qc_adapters(
+            postgres_pool,
+            default_adapter_reference_idx=999_999_999,
+            data_plane_url="grpc://unused",
+            hmac_secret=b"x" * 16,
+            workspace=tmp_path,
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+
+
+async def test_resolve_qc_adapters_wrong_kind(postgres_pool, reference_idx, tmp_path):
+    """A non-artifact_sequence_set reference is rejected — fail fast rather than
+    DoGet a (possibly huge) sequence_reference as 'adapters'."""
+    from qiita_control_plane import runner
+
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1", reference_idx
+    )  # leaves kind = 'sequence_reference'
+    with pytest.raises(BackendFailure) as ei:
+        await runner._resolve_qc_adapters(
+            postgres_pool,
+            default_adapter_reference_idx=reference_idx,
+            data_plane_url="grpc://unused",
+            hmac_secret=b"x" * 16,
+            workspace=tmp_path,
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert "artifact_sequence_set" in ei.value.reason
+
+
+async def test_resolve_qc_adapters_non_active(postgres_pool, reference_idx, tmp_path):
+    from qiita_control_plane import runner
+
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET kind = 'artifact_sequence_set', status = 'loading'"
+        " WHERE reference_idx = $1",
+        reference_idx,
+    )
+    with pytest.raises(BackendFailure) as ei:
+        await runner._resolve_qc_adapters(
+            postgres_pool,
+            default_adapter_reference_idx=reference_idx,
+            data_plane_url="grpc://unused",
+            hmac_secret=b"x" * 16,
+            workspace=tmp_path,
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert "active" in ei.value.reason
+
+
+async def test_resolve_qc_adapters_empty_set(postgres_pool, reference_idx, tmp_path, monkeypatch):
+    """An adapter reference that DoGets zero sequences is a misconfiguration →
+    BAD_INPUT, and no partial adapters.fasta is left behind."""
+    from qiita_control_plane import runner
+
+    await _make_adapter_reference(postgres_pool, reference_idx)
+    monkeypatch.setattr(runner, "_do_get_reference_sequence_chunks", lambda _url, _t: [])
+    with pytest.raises(BackendFailure) as ei:
+        await runner._resolve_qc_adapters(
+            postgres_pool,
+            default_adapter_reference_idx=reference_idx,
+            data_plane_url="grpc://unused",
+            hmac_secret=b"x" * 16,
+            workspace=tmp_path,
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert not (tmp_path / "adapters.fasta").exists()
+
+
+async def test_resolve_qc_adapters_dataplane_failure_is_submission_failure(
+    postgres_pool, reference_idx, tmp_path, monkeypatch
+):
+    """A Flight DoGet failure (data plane unreachable/errored) is wrapped as a
+    SUBMISSION BackendFailure — never allowed to escape as an untyped exception
+    (which run_workflow's bare handler would mis-record as STEP_RUN/step_name=None,
+    violating the failure-step-name CHECK and stranding the ticket)."""
+    from qiita_control_plane import runner
+
+    await _make_adapter_reference(postgres_pool, reference_idx)
+
+    def _boom(_url, _ticket):
+        raise RuntimeError("Flight: connection refused")
+
+    monkeypatch.setattr(runner, "_do_get_reference_sequence_chunks", _boom)
+    with pytest.raises(BackendFailure) as ei:
+        await runner._resolve_qc_adapters(
+            postgres_pool,
+            default_adapter_reference_idx=reference_idx,
+            data_plane_url="grpc://unused",
+            hmac_secret=b"x" * 16,
+            workspace=tmp_path,
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
+    assert ei.value.step_name is None
+    assert "data plane" in ei.value.reason
+
+
+async def test_workflow_needs_adapters_detects_adapter_input():
+    """The gate fires only when an entry declares adapter_fasta as an input."""
+    from types import SimpleNamespace
+
+    from qiita_control_plane.runner import _workflow_needs_adapters
+
+    no_qc = [SimpleNamespace(inputs=["reads"], optional_inputs=["host_rype_path"])]
+    with_qc = [SimpleNamespace(inputs=["reads", "adapter_fasta"], optional_inputs=[])]
+    assert _workflow_needs_adapters(no_qc) is False
+    assert _workflow_needs_adapters(with_qc) is True
+
+
 async def test_run_workflow_fails_ticket_on_host_filter_resolution_error(
     postgres_pool, reference_add_action, reference_idx, tmp_path
 ):

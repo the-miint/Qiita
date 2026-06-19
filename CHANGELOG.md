@@ -23,6 +23,15 @@ the `no-changelog` label).
   team-mirror build (the upstream `docs/qc.md` documents named params the build
   rejects); `docs/duckdb-miint.md` gains a QC section. Groundwork for the
   bcl-convert → `fastq` → `qc` → `host_filter` pipeline (#TBD)
+- New `artifact_sequence_set` reference kind — an indexless set of artifact
+  sequences (the canonical adapter set the QC step trims against), ingested
+  through the same kind-agnostic reference-add flow (no taxonomy, no index).
+  `qiita reference load --kind artifact_sequence_set` and a `reference.kind`
+  CHECK widen back it. The control plane gained
+  `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX` (the canonical set's reference_idx) and a
+  runner resolver (`_resolve_qc_adapters`) that DoGets that set's sequences from
+  the data plane and stages them as a FASTA for the QC step — materialized only
+  for a workflow whose steps need it (#TBD)
 - Remove a full preparation (sequenced_pool) from the system. New
   `DELETE /sequencing-run/{run}/sequenced-pool/{pool}` hard-deletes a
   sequenced_pool and everything under it — the pool row, every

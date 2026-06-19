@@ -269,3 +269,37 @@ def test_settings_build_sha_empty_is_none(monkeypatch):
 
     settings = Settings.from_env()
     assert settings.build_sha is None
+
+
+def test_settings_default_adapter_reference_idx_unset_is_none(monkeypatch):
+    """Optional setting: a deploy without QC leaves it unset → None."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.delenv("QIITA_DEFAULT_ADAPTER_REFERENCE_IDX", raising=False)
+
+    from qiita_control_plane.config import Settings
+
+    assert Settings.from_env().default_adapter_reference_idx is None
+
+
+def test_settings_default_adapter_reference_idx_parsed(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.setenv("QIITA_DEFAULT_ADAPTER_REFERENCE_IDX", "42")
+
+    from qiita_control_plane.config import Settings
+
+    assert Settings.from_env().default_adapter_reference_idx == 42
+
+
+def test_settings_default_adapter_reference_idx_rejects_invalid(monkeypatch):
+    """Present-but-invalid fails loudly (not silently treated as unset)."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+
+    from qiita_control_plane.config import Settings
+
+    for bad in ("0", "-1", "notanint"):
+        monkeypatch.setenv("QIITA_DEFAULT_ADAPTER_REFERENCE_IDX", bad)
+        with pytest.raises(RuntimeError, match="QIITA_DEFAULT_ADAPTER_REFERENCE_IDX"):
+            Settings.from_env()

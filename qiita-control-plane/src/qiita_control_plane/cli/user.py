@@ -752,7 +752,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_reference_load.add_argument(
         "--kind",
         default="sequence_reference",
-        choices=("sequence_reference", "taxonomy_authority"),
+        choices=("sequence_reference", "taxonomy_authority", "artifact_sequence_set"),
         help="Reference kind for newly-created references (default: sequence_reference)",
     )
     p_reference_load.add_argument(
