@@ -15,6 +15,14 @@ the `no-changelog` label).
 
 ### Added
 
+- Verified and documented the duckdb-miint fastp-port QC functions
+  (`filter_read`, `trim_adapters` / `trim_adapters_pe`, `trim_polyg`) that the
+  upcoming `qc` native job builds on. New
+  `qiita-compute-orchestrator/tests/jobs/test_qc_miint_contract.py` pins their
+  **positional-arg-only** contract and fastp-default values against the
+  team-mirror build (the upstream `docs/qc.md` documents named params the build
+  rejects); `docs/duckdb-miint.md` gains a QC section. Groundwork for the
+  bcl-convert → `fastq` → `qc` → `host_filter` pipeline (#TBD)
 - Remove a full preparation (sequenced_pool) from the system. New
   `DELETE /sequencing-run/{run}/sequenced-pool/{pool}` hard-deletes a
   sequenced_pool and everything under it — the pool row, every
