@@ -269,9 +269,9 @@ def test_build_rype_index_memory_split_under_slurm(tmp_path, monkeypatch):
     """Under SLURM the cgroup is split DuckDB(bounded) / rype(elastic). DuckDB is
     capped at `_DUCKDB_MEMORY_CAP_GB` (NOT the 4 GB off-SLURM fallback, which
     OOMed feeding a genome-scale chunk scan); rype gets the remainder above its
-    floor. At a 48 GB allocation + 4-thread headroom (2 + ceil(4*0.5) = 4):
-    DuckDB = min(48-4, 16) = 16, so rype = 48 - 16 - 4 = 28 GB. The old 4 GB
-    DuckDB cap would have left rype 40 GB — asserting 28 pins the fix."""
+    floor. At a 48 GB allocation + 8-thread headroom (2 + ceil(8*0.5) = 6):
+    DuckDB = min(48-6, 16) = 16, so rype = 48 - 16 - 6 = 26 GB. The old 4 GB
+    DuckDB cap would have left rype 38 GB — asserting 26 pins the fix."""
     from qiita_compute_orchestrator.jobs import build_rype_index
 
     monkeypatch.setenv("PATH_DERIVED", str(tmp_path / "shared"))
@@ -307,5 +307,5 @@ def test_build_rype_index_memory_split_under_slurm(tmp_path, monkeypatch):
 
     # DuckDB capped at _DUCKDB_MEMORY_CAP_GB (16), NOT the 4 GB fallback.
     assert captured["duckdb_memory_gb"] == 16
-    # rype gets (alloc - DuckDB cap - headroom) = 48 - 16 - 4 = 28 GB.
-    assert captured["max_memory"] == 28 * 1024**3
+    # rype gets (alloc - DuckDB cap - headroom) = 48 - 16 - 6 = 26 GB.
+    assert captured["max_memory"] == 26 * 1024**3
