@@ -81,6 +81,15 @@ if [[ -z "${PATH_DERIVED:-}" ]]; then
     echo "(e.g. /scratch/persistent; SIFs live under PATH_DERIVED/images) and re-run" >&2
     exit 64
 fi
+# Must be absolute: the `cd /` below rebases every relative path, so a relative
+# PATH_DERIVED would pass the `-d` check here (resolved against the caller cwd)
+# and then silently retarget the build at /<rel>/images after the cd. Reject it
+# up front — mirrors the orchestrator's from_env() is_absolute() guard, which this
+# standalone script doesn't run through.
+if [[ "${PATH_DERIVED}" != /* ]]; then
+    echo "PATH_DERIVED must be an absolute path (got '${PATH_DERIVED}')" >&2
+    exit 64
+fi
 # Built SIFs live under PATH_DERIVED/images (the orchestrator derives the
 # same join). Everything below operates on that derived tier.
 IMAGES_DIR="${PATH_DERIVED}/images"
@@ -92,6 +101,16 @@ if ! command -v apptainer >/dev/null 2>&1; then
     echo "apptainer not on PATH; install apptainer before running this script" >&2
     exit 64
 fi
+
+# Make the rest of the script cwd-independent. `find` (in the build-inputs hash)
+# and `apptainer exec` (the verify steps) both touch the invoking process's cwd;
+# when this is launched as a service account from a directory that account can't
+# read — e.g. a manual `sudo -u qiita-orch …` from an admin's 0700 home — `find`
+# fails to restore that cwd and aborts the build, and `apptainer exec` warns. cd
+# to / (always traversable) so neither cares where we were invoked from. Safe
+# because every path used below is absolute (PATH_DERIVED is the derived FS root)
+# and the actual `apptainer build` cd's into its own temp build dir in a subshell.
+cd / || { echo "could not cd / — refusing to run from an unstable cwd" >&2; exit 1; }
 
 SOURCES_DIR="${IMAGES_DIR}/sources"
 SIF_PATH="${IMAGES_DIR}/${SIF_FILENAME}"

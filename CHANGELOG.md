@@ -434,6 +434,17 @@ the `no-changelog` label).
 
 ### Fixed
 
+- SIF build no longer aborts when run as a service account from a directory that
+  account can't read. `qiita_sif_build_inputs_hash` ran `find`, which restores its
+  initial working directory on exit; a manual `sudo -u qiita-orch build-sif.sh`
+  launched from an admin's `0700` home left `find` unable to restore that cwd, so
+  it exited non-zero and tripped `set -o pipefail`, aborting the build before it
+  started (`find: Failed to restore initial working directory`). `build-sif.sh`
+  now `cd`s to `/` after its precondition checks (and the hash helper does so in
+  a subshell), so the whole build — the hash `find` and the `apptainer exec`
+  verify steps — is independent of the caller's cwd. All paths used are absolute,
+  so the build keeps producing a `qiita-orch`-owned SIF without needing root or a
+  `cd` workaround (#132 follow-up)
 - The bcl-convert step no longer fails with `chmod: changing permissions of
   '.../bcl_convert/attempt-0/output': Operation not permitted` after bcl-convert
   and `manifest_writer.py` both succeed. The entrypoint's final mode-fixing
