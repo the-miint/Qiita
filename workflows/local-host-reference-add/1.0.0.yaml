@@ -82,9 +82,9 @@ steps:
     # re-emits, so there is no minimap2-specific subset here.
     outputs: [fasta_path]
     baseline_resources:
-      cpu: 4
-      mem_gb: 8
-      walltime: PT1H
+      cpu: 8
+      mem_gb: 32
+      walltime: PT24H
 
   - step: hash_sequences
     step_type: singleton
@@ -93,9 +93,9 @@ steps:
     inputs: [fasta_path]
     outputs: [manifest, reference_sequence_chunks]
     baseline_resources:
-      cpu: 4
-      mem_gb: 8
-      walltime: PT1H
+      cpu: 8
+      mem_gb: 32
+      walltime: PT24H
 
   - action: mint-features
     target_status: minting
@@ -119,7 +119,7 @@ steps:
     baseline_resources:
       cpu: 8
       mem_gb: 32
-      walltime: PT2H
+      walltime: PT24H
 
   # MUST precede register-files: register-files MOVES the feature-keyed
   # reference_sequence_chunks part files into permanent DuckLake storage
@@ -144,9 +144,9 @@ steps:
     when: build_rype
     outputs: [rype_index_meta]
     baseline_resources:
-      cpu: 4
+      cpu: 8
       mem_gb: 32
-      walltime: PT2H
+      walltime: PT24H
 
   # Sidecar minimap2 `.mmi` for the second-pass host filter, written to
   # {PATH_DERIVED}/references/{reference_idx}/minimap2/index.mmi. Consumes the
@@ -175,7 +175,7 @@ steps:
     baseline_resources:
       cpu: 4
       mem_gb: 32
-      walltime: PT2H
+      walltime: PT24H
 
   - action: register-files
     inputs: [staging_dir]
@@ -200,4 +200,4 @@ steps:
 action_ceiling:
   cpu: 16
   mem_gb: 64
-  walltime: PT4H
+  walltime: PT48H

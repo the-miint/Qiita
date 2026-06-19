@@ -53,16 +53,16 @@ steps:
   # reference stays `pending` through staging, and hash_sequences makes the
   # first transition (pending → hashing) exactly as in reference-add. The
   # baseline_resources here duplicate the DuckDB caps in stage_local_fasta
-  # (mem_gb=8, cpu=4); a mismatch is visible at review time.
+  # (mem_gb=32, cpu=8); a mismatch is visible at review time.
   - step: stage_local_fasta
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.stage_local_fasta
     inputs: [fasta_manifest_path]
     outputs: [fasta_path]
     baseline_resources:
-      cpu: 4
-      mem_gb: 8
-      walltime: PT1H
+      cpu: 8
+      mem_gb: 32
+      walltime: PT24H
 
   - step: hash_sequences
     step_type: singleton
@@ -71,9 +71,9 @@ steps:
     inputs: [fasta_path]
     outputs: [manifest, reference_sequence_chunks]
     baseline_resources:
-      cpu: 4
-      mem_gb: 8
-      walltime: PT1H
+      cpu: 8
+      mem_gb: 32
+      walltime: PT24H
 
   - action: mint-features
     target_status: minting
@@ -94,7 +94,7 @@ steps:
     baseline_resources:
       cpu: 8
       mem_gb: 32
-      walltime: PT2H
+      walltime: PT24H
 
   - action: register-files
     inputs: [staging_dir]
@@ -103,4 +103,4 @@ steps:
 action_ceiling:
   cpu: 16
   mem_gb: 64
-  walltime: PT4H
+  walltime: PT48H

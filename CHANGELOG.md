@@ -155,6 +155,24 @@ the `no-changelog` label).
 
 ### Changed
 
+- `stage_local_fasta` now ingests the whole manifest in a single
+  `read_fastx(VARCHAR[])` scan and streams read → `sequence_split` → Parquet
+  without ever materialising sequences in a temp table. The previous per-file
+  `INSERT … SELECT` staged every genome's bytes into a `reads` table and spilled
+  hard when loading hundreds of human genomes; sanity checks (empty-body,
+  duplicate read_id) now run over a small `(read_id, length, filepath)` table
+  instead. The duplicate-read_id error names the offending files;
+  read_id stays globally unique (#128)
+- Raised compute resources for genome-scale reference loads in the
+  `local-reference-add` and `local-host-reference-add` workflows:
+  `stage_local_fasta` and `hash_sequences` to cpu=8/mem_gb=32,
+  `build_rype_index` to cpu=8 and `build_minimap2_index` to mem_gb=32, and step
+  walltimes to PT24H under a PT48H `action_ceiling`. The matching DuckDB
+  `_DUCKDB_THREADS` bumps (`hash_sequences`, `build_rype_index` → 8) keep the
+  caps in lockstep so the extra cores are actually used (`build_minimap2_index`
+  stays at 4 — minimap2 index build is single-threaded). The orchestrator's
+  SLURM poll-loop timeout default rises 24h → 48h to allow the longer walltimes
+  (override via `SLURM_JOB_TIMEOUT_SECONDS`) (#128)
 - `make redeploy` no longer prompts to do work it has already proven is needed.
   The SLURM native-venv refresh now runs automatically (no confirm) when the
   native checkout is the same clone redeploy just pulled — the prompt remains
