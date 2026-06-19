@@ -81,6 +81,15 @@ if [[ -z "${PATH_DERIVED:-}" ]]; then
     echo "(e.g. /scratch/persistent; SIFs live under PATH_DERIVED/images) and re-run" >&2
     exit 64
 fi
+# Must be absolute: the `cd /` below rebases every relative path, so a relative
+# PATH_DERIVED would pass the `-d` check here (resolved against the caller cwd)
+# and then silently retarget the build at /<rel>/images after the cd. Reject it
+# up front — mirrors the orchestrator's from_env() is_absolute() guard, which this
+# standalone script doesn't run through.
+if [[ "${PATH_DERIVED}" != /* ]]; then
+    echo "PATH_DERIVED must be an absolute path (got '${PATH_DERIVED}')" >&2
+    exit 64
+fi
 # Built SIFs live under PATH_DERIVED/images (the orchestrator derives the
 # same join). Everything below operates on that derived tier.
 IMAGES_DIR="${PATH_DERIVED}/images"
