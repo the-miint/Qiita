@@ -393,6 +393,48 @@ def test_build_inputs_hash_is_location_independent(tmp_path: Path) -> None:
     )
 
 
+def test_build_inputs_hash_survives_unreadable_cwd(tmp_path: Path) -> None:
+    """Regression: a manual `sudo -u qiita-orch build-sif.sh` launched from an
+    admin's 0700 home left `find` unable to restore that cwd, so it exited
+    non-zero and aborted the build under `set -o pipefail`. The helper now cd's to
+    / in a subshell, so it doesn't depend on (or need to restore) the caller cwd.
+
+    Reproduce deterministically: run from a directory, strip its traversal bit
+    (chmod 000) for the duration of the call so a naive `find` could not chdir
+    back, then restore it for cleanup. Skipped under root, which ignores the
+    permission and so can't exercise the failure."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the dir-traversal bit; can't reproduce the failure")
+    wf, shared = _make_workflow_tree(tmp_path)
+    expected = _call_build_inputs_hash(tmp_path, wf, shared)  # baseline from a normal cwd
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    # Spawn with cwd=locked (still traversable), then drop its traversal bit from
+    # inside so a naive `find` could not chdir back to it. Restore perms in Python
+    # via the ABSOLUTE path in finally — the parents stay traversable, so cleanup
+    # never depends on the now-unreadable cwd (chmod'ing "." from a 000 cwd is
+    # unreliable). With the fix the helper cd's to / and so doesn't care.
+    try:
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                f'chmod 000 .; source "{_COMMON}"; qiita_sif_build_inputs_hash "$1" "$2" "$3"',
+                "_",
+                str(tmp_path),
+                str(wf),
+                str(shared),
+            ],
+            cwd=str(locked),
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        os.chmod(locked, 0o755)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected
+
+
 # --- qiita_sif_missing_sources: gates whether build-sifs.sh SKIPS an image whose
 # licensed artifact isn't staged. rc 0 = all present, 1 = some missing (echoed). --
 

@@ -143,18 +143,29 @@ _qiita_sha256() {
 # MATCH a prior stamp), but that can't happen on the real path: build-sif.sh
 # requires Apptainer.def to exist before it calls this, so the workflow dir is
 # always non-empty.
+#
+# All work runs in a subshell that first cd's to / — `find` restores its initial
+# working directory when it finishes, and if that cwd is unreadable by the
+# invoking user (e.g. a manual `sudo -u qiita-orch …` launched from an admin's
+# 0700 home), GNU find exits non-zero with "Failed to restore initial working
+# directory", which would break the `set -o pipefail` pipeline and abort the
+# build. / is always traversable, and every path used here is absolute, so the cd
+# is safe; the subshell keeps it from leaking into the caller's cwd.
 # $1 = repo root, $2 = workflow dir, $3 = shared dir. Echoes the hex digest.
 qiita_sif_build_inputs_hash() {
     local repo_root="$1" workflow_dir="$2" shared_dir="$3"
-    {
-        find "$workflow_dir" -type f \
-            ! -name sif-build.env ! -name '.gitignore' \
-            ! -name '*.sif' ! -name '*.rpm' ! -path '*/__pycache__/*'
-        find "$shared_dir" -type f ! -path '*/__pycache__/*'
-    } | LC_ALL=C sort | while IFS= read -r f; do
-        printf '%s ' "${f#"$repo_root"/}"   # repo-relative path → location-independent
-        _qiita_sha256 < "$f"
-    done | _qiita_sha256
+    (
+        cd / || exit 1
+        {
+            find "$workflow_dir" -type f \
+                ! -name sif-build.env ! -name '.gitignore' \
+                ! -name '*.sif' ! -name '*.rpm' ! -path '*/__pycache__/*'
+            find "$shared_dir" -type f ! -path '*/__pycache__/*'
+        } | LC_ALL=C sort | while IFS= read -r f; do
+            printf '%s ' "${f#"$repo_root"/}"   # repo-relative path → location-independent
+            _qiita_sha256 < "$f"
+        done | _qiita_sha256
+    )
 }
 
 # Which of a workflow's vendored SOURCES are NOT staged under the images/sources
