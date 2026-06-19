@@ -75,5 +75,14 @@ python3.11 /opt/qiita/manifest_writer.py "${QIITA_OUTPUT_PATH}" convert_dir=Conv
 # 0550 (r-x: walkable, not writable). Runs after the manifest is written so
 # manifest.json gets the same 0440 as the FASTQs. The verifier only checks
 # file mode, never directory mode, so 0550 dirs pass.
-find "${QIITA_OUTPUT_PATH}" -type d -exec chmod 0550 {} +
-find "${QIITA_OUTPUT_PATH}" -type f -exec chmod 0440 {} +
+#
+# -mindepth 1 skips QIITA_OUTPUT_PATH itself: the orchestrator creates that
+# directory on the host (SlurmBackend lays out <workspace>/output/ and binds
+# it in), so it's owned by the orchestrator user, not the in-container user.
+# A chmod on it fails with EPERM ("Operation not permitted") and, under
+# `set -e`, fails an otherwise-successful job. We only need to fix the modes
+# of what the container *created* inside output/ (ConvertJob/, manifest.json);
+# the host already made output/ traversable and the verifier never checks the
+# root dir's mode.
+find "${QIITA_OUTPUT_PATH}" -mindepth 1 -type d -exec chmod 0550 {} +
+find "${QIITA_OUTPUT_PATH}" -mindepth 1 -type f -exec chmod 0440 {} +
