@@ -35,7 +35,7 @@ _None yet._
     PATH_DERIVED='$derived' bash /home/qiita/qiita-miint/scripts/build-sif.sh bcl-convert"
   ```
 
-- (#TBD) **Enable QC: load the adapter set + set `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX`.**
+- (#129) **Enable QC: load the adapter set + set `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX`.**
   fastq-to-parquet/1.2.0's always-on QC trims against a canonical adapter set
   stored as an `artifact_sequence_set` reference. **Run AFTER the bucket-3
   migration + bucket-4 deploy** — the new `artifact_sequence_set` kind and the
@@ -59,7 +59,7 @@ _None yet._
 
 ### 3. Migrations
 
-- (#TBD) `20260618000000_reference_kind_artifact_sequence_set.sql` — widens the
+- (#129) `20260618000000_reference_kind_artifact_sequence_set.sql` — widens the
   `reference.kind` CHECK to allow `artifact_sequence_set`. Plain `make migrate`,
   no out-of-band setup.
 
@@ -79,7 +79,7 @@ _None yet._
   Expect `Python 3.11.x`. (A clean SIF rebuild already proved `manifest_writer.py`
   imports under it via the `%test` block.)
 
-- (#TBD) Confirm `fastq-to-parquet 1.2.0` is in the `make verify-deploy` action
+- (#129) Confirm `fastq-to-parquet 1.2.0` is in the `make verify-deploy` action
   list (the always-on-QC + two-reference host-filter workflow `submit-host-filter-pool`
   now targets). A 1.2.0 QC submission also needs the bucket-2 adapter set +
   `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX`.
@@ -93,7 +93,7 @@ _None yet._
   the scope is **not** in admin PATs minted before this deploy (tokens carry a
   fixed scope snapshot). An admin who wants to use the delete must mint a fresh
   PAT after the deploy. No migration, env var, or host change. (#125)
-- (#TBD) New `GET /sequencing-run/{idx}` route (run metadata incl.
+- (#129) New `GET /sequencing-run/{idx}` route (run metadata incl.
   `instrument_model`; prep_sample:read + wet_lab_admin) — `submit-host-filter-pool`
   reads it to forward QC's polyG `instrument_model` per sample. Code-only, no host
   action, no new scope. The new `workflows/fastq-to-parquet/1.2.0.yaml` (plus a

@@ -18,7 +18,7 @@ the `no-changelog` label).
 - New `GET /api/v1/sequencing-run/{sequencing_run_idx}` route returning a run's
   caller-visible metadata (notably `instrument_model`). Read-gated like the pool
   roster route (prep_sample:read + wet_lab_admin). `qiita submit-host-filter-pool`
-  reads it to forward QC's polyG-gating `instrument_model` per sample (#TBD)
+  reads it to forward QC's polyG-gating `instrument_model` per sample (#129)
 - New `fastq-to-parquet/1.2.0` workflow: an additive successor to 1.1.0 that
   inserts an ALWAYS-ON `qc` step between `fastq` and `host_filter`
   (`fastq → qc → host_filter`). Each stage re-emits the `reads` binding it
@@ -27,7 +27,7 @@ the `no-changelog` label).
   qc's polyG gate via the step's `params`) and the two-reference host-filter keys
   (`host_rype_reference_idx` + optional `host_minimap2_reference_idx`); the qc
   step lists `adapter_fasta`, which triggers the runner's adapter materialization.
-  1.0.0 and 1.1.0 stay available unchanged (#TBD)
+  1.0.0 and 1.1.0 stay available unchanged (#129)
 - Verified and documented the duckdb-miint fastp-port QC functions
   (`filter_read`, `trim_adapters` / `trim_adapters_pe`, `trim_polyg`) that the
   upcoming `qc` native job builds on. New
@@ -35,7 +35,7 @@ the `no-changelog` label).
   **positional-arg-only** contract and fastp-default values against the
   team-mirror build (the upstream `docs/qc.md` documents named params the build
   rejects); `docs/duckdb-miint.md` gains a QC section. Groundwork for the
-  bcl-convert → `fastq` → `qc` → `host_filter` pipeline (#TBD)
+  bcl-convert → `fastq` → `qc` → `host_filter` pipeline (#129)
 - New `artifact_sequence_set` reference kind — an indexless set of artifact
   sequences (the canonical adapter set the QC step trims against), ingested
   through the same kind-agnostic reference-add flow (no taxonomy, no index).
@@ -44,7 +44,7 @@ the `no-changelog` label).
   `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX` (the canonical set's reference_idx) and a
   runner resolver (`_resolve_qc_adapters`) that DoGets that set's sequences from
   the data plane and stages them as a FASTA for the QC step — materialized only
-  for a workflow whose steps need it (#TBD)
+  for a workflow whose steps need it (#129)
 - New `qc` native job (`qiita_compute_orchestrator.jobs.qc`): a fastp-equivalent
   read-QC transform `reads.parquet` → `qc_reads.parquet` over the duckdb-miint
   fastp-port functions. Per read it runs adapter trim (`trim_adapters` SE /
@@ -54,7 +54,7 @@ the `no-changelog` label).
   EITHER mate falls below min_length after trimming. The canonical adapter set
   is read from the runner-staged `adapter_fasta` via miint's `read_fastx` and
   inlined as a constant `VARCHAR[]`. Slots into the bcl-convert → `fastq` →
-  `qc` → `host_filter` pipeline (#TBD)
+  `qc` → `host_filter` pipeline (#129)
 - Remove a full preparation (sequenced_pool) from the system. New
   `DELETE /sequencing-run/{run}/sequenced-pool/{pool}` hard-deletes a
   sequenced_pool and everything under it — the pool row, every
@@ -200,7 +200,7 @@ the `no-changelog` label).
   by `--host-rype-reference-idx` (required) and `--host-minimap2-reference-idx`
   (optional), each pre-flighted for ACTIVE status + its named index; the run's
   `instrument_model` is read once (GET /sequencing-run) and forwarded per sample
-  so QC's polyG gate is set correctly (#TBD)
+  so QC's polyG gate is set correctly (#129)
 - Host filtering can now draw its two indexes from two INDEPENDENT references.
   The runner's `_resolve_host_filter_indexes` gained a two-reference layout
   (fastq-to-parquet/1.2.0): `host_rype_reference_idx` (required) supplies the rype
@@ -211,7 +211,7 @@ the `no-changelog` label).
   missing) is unchanged and back-compatible; the two layouts are mutually
   exclusive (mixing them, or enabling with no reference key, is a clear
   SUBMISSION BAD_INPUT). `host_filter.py` itself is untouched — it still skips the
-  stage whose index path is None (#TBD)
+  stage whose index path is None (#129)
 - `make redeploy` no longer prompts to do work it has already proven is needed.
   The SLURM native-venv refresh now runs automatically (no confirm) when the
   native checkout is the same clone redeploy just pulled — the prompt remains
