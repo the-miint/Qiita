@@ -19,6 +19,38 @@ _None yet._
 
 ### 2. One-time host setup
 
+_None yet._
+
+### 3. Migrations
+
+_None yet._
+
+### 4. Deploy
+
+_None yet._
+
+### 5. Verify
+
+_None yet._
+
+### Notes (no host action)
+
+- (#128) Genome-scale reference-load resource tuning (no client breakage). The two `workflows/` entries `local-reference-add` and `local-host-reference-add` (both still 1.0.0) are **edited in place** — re-synced into `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (already covered by bucket 5's `qiita.action` list check), **not** a migration. Raised baseline_resources + walltimes so loading hundreds of human genomes no longer hits the old 1h step cap (`stage_local_fasta`/`hash_sequences` → cpu=8/mem_gb=32, `build_rype_index` → cpu=8, `build_minimap2_index` → mem_gb=32; step walltimes → PT24H under a PT48H `action_ceiling`). To permit those longer walltimes the orchestrator's SLURM poll-loop timeout **default** rose 24h → 48h (`config.py` `DEFAULT_SLURM_JOB_TIMEOUT_SECONDS`); it applies on the normal bucket-4 CO restart — no new env var. **Caveat:** if `/etc/qiita/compute-orchestrator.env` pins `SLURM_JOB_TIMEOUT_SECONDS` explicitly, raise it to ≥ the longest step walltime (currently PT24H / 86400s) or genome-scale loads will be reaped mid-run. No new host dir, scope, or migration.
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-19 — 8e55b99
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None._
+
+#### 2. One-time host setup
+
 - (#126) Rebuild the bcl-convert SIF. The image's Python was bumped 3.6→3.11
   (OL8's default `python3`=3.6 crashed `manifest_writer.py` on PEP 585
   `list[str]` annotations). `build-sif.sh` is idempotent on the bcl-convert
@@ -35,15 +67,15 @@ _None yet._
     PATH_DERIVED='$derived' bash /home/qiita/qiita-miint/scripts/build-sif.sh bcl-convert"
   ```
 
-### 3. Migrations
+#### 3. Migrations
 
-_None yet._
+_None._
 
-### 4. Deploy
+#### 4. Deploy
 
-_None yet._
+_None._
 
-### 5. Verify
+#### 5. Verify
 
 - (#126) Confirm the rebuilt bcl-convert SIF ships the new interpreter:
 
@@ -55,7 +87,7 @@ _None yet._
   Expect `Python 3.11.x`. (A clean SIF rebuild already proved `manifest_writer.py`
   imports under it via the `%test` block.)
 
-### Notes (no host action)
+#### Notes (no host action)
 
 - (#124) Per-host-reference index selection + tunable build params (additive, no client breakage). The two `workflows/` entries `host-reference-add` and `local-host-reference-add` (both still 1.0.0) are **edited in place** — re-synced into `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (already in bucket 5's `qiita.action` list check), **not** a migration. New optional `action_context` keys (`build_rype`/`build_minimap2` to pick which host-filter indexes to build, `rype_w`/`minimap2_preset` to tune them) surfaced by `qiita reference load --host --no-rype-index|--no-minimap2-index|--rype-w|--minimap2-preset`; omitted, behaviour is unchanged (both indexes built; minimap2 `preset` default `sr`). No new env var, host dir, scope, or migration. Two behaviour notes (both code-internal, no host action): the rype build window `w` default changed 25 → 20; and the fastq-to-parquet host-filter consumer now accepts a single-index host reference (binds whichever of rype/minimap2 exist, requires ≥1). The minimap2 build step also gained `target_status: indexing` so a minimap2-only build still transitions the reference out of `loading`.
 - New `sequenced_pool:delete` scope + `DELETE /sequencing-run/{run}/sequenced-pool/{pool}`
@@ -64,13 +96,6 @@ _None yet._
   the scope is **not** in admin PATs minted before this deploy (tokens carry a
   fixed scope snapshot). An admin who wants to use the delete must mint a fresh
   PAT after the deploy. No migration, env var, or host change. (#125)
-- (#128) Genome-scale reference-load resource tuning (no client breakage). The two `workflows/` entries `local-reference-add` and `local-host-reference-add` (both still 1.0.0) are **edited in place** — re-synced into `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (already covered by bucket 5's `qiita.action` list check), **not** a migration. Raised baseline_resources + walltimes so loading hundreds of human genomes no longer hits the old 1h step cap (`stage_local_fasta`/`hash_sequences` → cpu=8/mem_gb=32, `build_rype_index` → cpu=8, `build_minimap2_index` → mem_gb=32; step walltimes → PT24H under a PT48H `action_ceiling`). To permit those longer walltimes the orchestrator's SLURM poll-loop timeout **default** rose 24h → 48h (`config.py` `DEFAULT_SLURM_JOB_TIMEOUT_SECONDS`); it applies on the normal bucket-4 CO restart — no new env var. **Caveat:** if `/etc/qiita/compute-orchestrator.env` pins `SLURM_JOB_TIMEOUT_SECONDS` explicitly, raise it to ≥ the longest step walltime (currently PT24H / 86400s) or genome-scale loads will be reaped mid-run. No new host dir, scope, or migration.
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-18 — 70eb519
 
