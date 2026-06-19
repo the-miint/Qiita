@@ -1,6 +1,6 @@
-"""Integration tests for POST /api/v1/sequencing-run.
+"""Integration tests for POST and GET /api/v1/sequencing-run.
 
-Exercises the wet_lab_admin and system_admin happy paths plus a
+POST: exercises the wet_lab_admin and system_admin happy paths plus a
 regular-user happy path (no system_role gate on this route — the USER
 ceiling covers prep_sample:write and run creation carries no further
 auth), the scope guard, anonymous 401, Pydantic body validation, and
@@ -8,6 +8,11 @@ the find-or-create idempotency surface on the instrument_run_id natural
 key: same key + matching payload returns 200 with the existing idx;
 same key + mismatching payload returns 409 with a structured
 PayloadMismatch detail; supplied-None on retry is ignored.
+
+GET /{idx}: the run-metadata read `submit-host-filter-pool` uses to forward
+instrument_model — happy path (incl. null instrument_model + decoded JSONB),
+404 on miss, and the read gate (anonymous 401, regular-user 403; same
+prep_sample:read + wet_lab_admin gate as the pool roster route).
 """
 
 import json
@@ -355,3 +360,69 @@ async def test_create_sequencing_run_under_supply_on_retry_returns_200(ctx):
         first_idx,
     )
     assert dict(row) == {"instrument_model": "NovaSeq X+", "instrument_serial": "LH00123"}
+
+
+# ===========================================================================
+# GET /sequencing-run/{idx}
+# ===========================================================================
+
+
+async def _create_run(ctx, **body) -> int:
+    """Create a sequencing_run via the wet_lab_admin client (tracked for
+    cleanup) and return its idx."""
+    body.setdefault("instrument_run_id", unique_instrument_id("GET"))
+    body.setdefault("platform", "illumina")
+    resp = await _post_run(ctx["wet"], ctx, **body)
+    assert resp.status_code == 201, resp.text
+    return resp.json()["sequencing_run_idx"]
+
+
+async def test_get_sequencing_run_returns_metadata(ctx):
+    # The caller-visible columns round-trip, notably instrument_model.
+    idx = await _create_run(ctx, instrument_model="NovaSeq X+", instrument_serial="LH00123")
+    resp = await ctx["wet"].get(f"{_ROUTE}/{idx}")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["sequencing_run_idx"] == idx
+    assert body["platform"] == "illumina"
+    assert body["instrument_model"] == "NovaSeq X+"
+    assert body["instrument_serial"] == "LH00123"
+    assert body["retired"] is False
+    assert "instrument_run_id" in body
+
+
+async def test_get_sequencing_run_null_instrument_model(ctx):
+    # A run with no instrument_model returns it as null (the non-bcl case the
+    # CLI tolerates → QC defaults polyG OFF).
+    idx = await _create_run(ctx)  # minimal: no instrument_model
+    resp = await ctx["wet"].get(f"{_ROUTE}/{idx}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["instrument_model"] is None
+
+
+async def test_get_sequencing_run_extra_metadata_decoded(ctx):
+    # JSONB is returned as a decoded object, not a JSON string.
+    idx = await _create_run(ctx, extra_metadata={"flowcell": "FC-A", "lane_count": 2})
+    resp = await ctx["wet"].get(f"{_ROUTE}/{idx}")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["extra_metadata"] == {"flowcell": "FC-A", "lane_count": 2}
+
+
+async def test_get_sequencing_run_unknown_404(ctx):
+    resp = await ctx["wet"].get(f"{_ROUTE}/999999999")
+    assert resp.status_code == 404
+
+
+async def test_get_sequencing_run_anonymous_401(ctx):
+    app.state.pool = ctx["pool"]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
+        resp = await anon.get(f"{_ROUTE}/1")
+    assert resp.status_code == 401
+
+
+async def test_get_sequencing_run_regular_user_403(ctx):
+    # The read gate requires wet_lab_admin (mirrors the pool roster route): a
+    # plain user is rejected, even though a user MAY create a run.
+    idx = await _create_run(ctx)
+    resp = await ctx["user"].get(f"{_ROUTE}/{idx}")
+    assert resp.status_code == 403

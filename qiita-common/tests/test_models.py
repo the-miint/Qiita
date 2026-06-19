@@ -67,6 +67,28 @@ def test_reference_create_request_is_host_defaults_false():
     assert host.is_host is True
 
 
+def test_reference_create_request_accepts_artifact_sequence_set_kind():
+    """The indexless adapter/artifact kind is a valid ReferenceKind (mirrors the
+    reference.kind CHECK gaining 'artifact_sequence_set')."""
+    from qiita_common.models import ReferenceCreateRequest
+
+    req = ReferenceCreateRequest(
+        name="illumina-adapters", version="1", kind="artifact_sequence_set"
+    )
+    assert req.kind == "artifact_sequence_set"
+
+
+def test_reference_create_request_rejects_unknown_kind():
+    """A kind outside the Literal is rejected at the model boundary."""
+    import pytest
+    from pydantic import ValidationError
+
+    from qiita_common.models import ReferenceCreateRequest
+
+    with pytest.raises(ValidationError):
+        ReferenceCreateRequest(name="x", version="1", kind="not_a_kind")
+
+
 def test_reference_response_carries_is_host():
     """ReferenceResponse surfaces the is_host flag from the DB row."""
     from qiita_common.models import ReferenceResponse

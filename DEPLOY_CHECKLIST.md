@@ -36,9 +36,33 @@ _None yet._
     bash /home/qiita/qiita-miint/scripts/build-sif.sh bcl-convert"
   ```
 
+- (#129) **Enable QC: load the adapter set + set `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX`.**
+  fastq-to-parquet/1.2.0's always-on QC trims against a canonical adapter set
+  stored as an `artifact_sequence_set` reference. **Run AFTER the bucket-3
+  migration + bucket-4 deploy** — the new `artifact_sequence_set` kind and the
+  `qiita reference load --kind` flag must be live first. Load the set (it prints
+  the new reference_idx), pin that idx, restart CP:
+
+  ```bash
+  # [operator, with a reference:write PAT] load the canonical adapter set;
+  # note the printed reference_idx
+  qiita reference load --kind artifact_sequence_set \
+    --name qc-adapters --version 1.0 --fasta /path/to/adapters.fasta
+  # [admin] pin the printed idx (idempotent) and restart CP so it picks it up
+  sudo bash -c 'grep -q "^QIITA_DEFAULT_ADAPTER_REFERENCE_IDX=" /etc/qiita/control-plane.env \
+    || echo "QIITA_DEFAULT_ADAPTER_REFERENCE_IDX=<reference_idx>" >> /etc/qiita/control-plane.env'
+  sudo systemctl restart qiita-control-plane
+  ```
+
+  Optional at boot (CP starts without it; 1.1.0 is unaffected) — a 1.2.0 /
+  `submit-host-filter-pool` submission fails until both the adapter set and this
+  var are in place.
+
 ### 3. Migrations
 
-_None yet._
+- (#129) `20260618000000_reference_kind_artifact_sequence_set.sql` — widens the
+  `reference.kind` CHECK to allow `artifact_sequence_set`. Plain `make migrate`,
+  no out-of-band setup.
 
 ### 4. Deploy
 
@@ -57,8 +81,19 @@ _None yet._
   Expect `OK` (the `-mindepth 1` guard is present). The real proof is the next
   bcl_convert ticket completing past the output-chmod step.
 
+- (#129) Confirm `fastq-to-parquet 1.2.0` is in the `make verify-deploy` action
+  list (the always-on-QC + two-reference host-filter workflow `submit-host-filter-pool`
+  now targets). A 1.2.0 QC submission also needs the bucket-2 adapter set +
+  `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX`.
+
 ### Notes (no host action)
 
+- (#129) New `GET /sequencing-run/{idx}` route (run metadata incl.
+  `instrument_model`; prep_sample:read + wet_lab_admin) — `submit-host-filter-pool`
+  reads it to forward QC's polyG `instrument_model` per sample. Code-only, no host
+  action, no new scope. The new `workflows/fastq-to-parquet/1.2.0.yaml` (plus a
+  comment-only `1.1.0` edit) re-syncs into `qiita.action` via `qiita-admin actions
+  sync` inside `activate.sh` (verified in bucket 5), **not** a migration.
 - (#128) Genome-scale reference-load resource tuning (no client breakage). The two `workflows/` entries `local-reference-add` and `local-host-reference-add` (both still 1.0.0) are **edited in place** — re-synced into `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (already covered by bucket 5's `qiita.action` list check), **not** a migration. Raised baseline_resources + walltimes so loading hundreds of human genomes no longer hits the old 1h step cap (`stage_local_fasta`/`hash_sequences` → cpu=8/mem_gb=32, `build_rype_index` → cpu=8, `build_minimap2_index` → mem_gb=32; step walltimes → PT24H under a PT48H `action_ceiling`). To permit those longer walltimes the orchestrator's SLURM poll-loop timeout **default** rose 24h → 48h (`config.py` `DEFAULT_SLURM_JOB_TIMEOUT_SECONDS`); it applies on the normal bucket-4 CO restart — no new env var. **Caveat:** if `/etc/qiita/compute-orchestrator.env` pins `SLURM_JOB_TIMEOUT_SECONDS` explicitly, raise it to ≥ the longest step walltime (currently PT24H / 86400s) or genome-scale loads will be reaped mid-run. No new host dir, scope, or migration.
 
 ---

@@ -241,6 +241,22 @@ async def reference_idx(postgres_pool, human_admin_session) -> int:
 
 
 @pytest.fixture
+async def second_reference_idx(postgres_pool, human_admin_session) -> int:
+    """A second, independent reference — for the two-reference host filter
+    (fastq-to-parquet/1.2.0), where rype and minimap2 come from different
+    references."""
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
+        " VALUES ($1, '1.0', 'sequence_reference', 'pending', $2)"
+        " RETURNING reference_idx",
+        f"runner-test-{uuid.uuid4()}",
+        human_admin_session["principal_idx"],
+    )
+    yield idx
+    await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
+
+
+@pytest.fixture
 async def reference_add_action(postgres_pool):
     action_id = "reference-add"
     version = f"runner-test-{uuid.uuid4()}"
@@ -362,6 +378,7 @@ async def _run(
     workspace_root: Path,
     *,
     upload_staging_root: Path | None = None,
+    default_adapter_reference_idx: int | None = None,
     resume: bool = False,
 ) -> None:
     from qiita_control_plane.runner import run_workflow
@@ -381,6 +398,7 @@ async def _run(
         data_plane_url="grpc://unused:0",
         work_ticket_workspace_root=workspace_root,
         upload_staging_root=effective_upload_root,
+        default_adapter_reference_idx=default_adapter_reference_idx,
         # 0 so any (accidental) poll loop spins instantly; the local-like
         # fakes complete synchronously at submit and never poll anyway.
         poll_interval_seconds=0,
@@ -1669,8 +1687,12 @@ async def test_resolve_reference_index_path_raises_when_no_index(postgres_pool, 
 
 
 # =============================================================================
-# _resolve_host_filter_indexes (host-filter gating, fastq-to-parquet/1.1.0)
+# _resolve_host_filter_indexes — legacy single-reference (fastq-to-parquet/1.1.0)
 # =============================================================================
+#
+# `host_reference_idx` names ONE reference; whichever of its rype/minimap2
+# indexes exist are bound (>=1 required, a missing one skips that stage). The
+# two-reference layout (1.2.0) has its own section below.
 
 
 async def test_resolve_host_filter_indexes_binds_both_when_enabled(postgres_pool, reference_idx):
@@ -1713,13 +1735,29 @@ async def test_resolve_host_filter_indexes_disabled_returns_empty(postgres_pool,
     assert await _resolve_host_filter_indexes(postgres_pool, action_context={}) == {}
 
 
+async def test_resolve_host_filter_indexes_enabled_requires_a_layout(postgres_pool):
+    """Enabled but NO reference key at all → SUBMISSION BAD_INPUT naming BOTH
+    layouts (a legacy caller who dropped host_reference_idx must not be pointed at
+    host_rype_reference_idx, a key they never set)."""
+    from qiita_control_plane.runner import _resolve_host_filter_indexes
+
+    with pytest.raises(BackendFailure) as ei:
+        await _resolve_host_filter_indexes(
+            postgres_pool, action_context={"host_filter_enabled": True}
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
+    assert ei.value.step_name is None
+    assert "host_reference_idx" in ei.value.reason
+    assert "host_rype_reference_idx" in ei.value.reason
+
+
 async def test_resolve_host_filter_indexes_enabled_requires_reference_idx(postgres_pool):
-    """Enabled but no (or non-positive / wrong-typed) host_reference_idx →
-    SUBMISSION BAD_INPUT."""
+    """Legacy layout, non-positive / wrong-typed host_reference_idx → SUBMISSION
+    BAD_INPUT naming that field."""
     from qiita_control_plane.runner import _resolve_host_filter_indexes
 
     for ctx in (
-        {"host_filter_enabled": True},  # missing
         {"host_filter_enabled": True, "host_reference_idx": 0},  # non-positive
         {"host_filter_enabled": True, "host_reference_idx": True},  # bool, not int
     ):
@@ -1728,6 +1766,7 @@ async def test_resolve_host_filter_indexes_enabled_requires_reference_idx(postgr
         assert ei.value.kind == FailureKind.BAD_INPUT
         assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
         assert ei.value.step_name is None
+        assert "host_reference_idx" in ei.value.reason
 
 
 async def test_resolve_host_filter_indexes_unknown_reference(postgres_pool):
@@ -1824,6 +1863,617 @@ async def test_resolve_host_filter_indexes_neither_index(postgres_pool, referenc
     assert ei.value.kind == FailureKind.BAD_INPUT
     assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
     assert "neither" in ei.value.reason
+
+
+# =============================================================================
+# _resolve_host_filter_indexes — two-reference (fastq-to-parquet/1.2.0)
+# =============================================================================
+#
+# An independent reference per tool: host_rype_reference_idx (REQUIRED) for the
+# rype .ryxdi, host_minimap2_reference_idx (OPTIONAL) for the minimap2 .mmi. A
+# designated reference MUST be active and MUST carry its named index — a missing
+# index is a hard error here, NOT a skipped stage as in the legacy layout.
+
+
+async def test_resolve_host_filter_two_reference_rype_only(postgres_pool, reference_idx):
+    """rype reference only (minimap2 omitted) → just host_rype_path bound."""
+    from qiita_control_plane.runner import _resolve_host_filter_indexes
+
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1", reference_idx
+    )
+    await _insert_reference_index(postgres_pool, reference_idx, "/srv/r.ryxdi", index_type="rype")
+    try:
+        out = await _resolve_host_filter_indexes(
+            postgres_pool,
+            action_context={
+                "host_filter_enabled": True,
+                "host_rype_reference_idx": reference_idx,
+            },
+        )
+        assert {k: str(v) for k, v in out.items()} == {"host_rype_path": "/srv/r.ryxdi"}
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_host_filter_two_reference_rype_and_minimap2(
+    postgres_pool, reference_idx, second_reference_idx
+):
+    """Two distinct references: rype from one, minimap2 from the other — each
+    index resolved from its OWN reference."""
+    from qiita_control_plane.runner import _resolve_host_filter_indexes
+
+    for idx in (reference_idx, second_reference_idx):
+        await postgres_pool.execute(
+            "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1", idx
+        )
+    await _insert_reference_index(postgres_pool, reference_idx, "/srv/r.ryxdi", index_type="rype")
+    await _insert_reference_index(
+        postgres_pool, second_reference_idx, "/srv/m.mmi", index_type="minimap2"
+    )
+    try:
+        out = await _resolve_host_filter_indexes(
+            postgres_pool,
+            action_context={
+                "host_filter_enabled": True,
+                "host_rype_reference_idx": reference_idx,
+                "host_minimap2_reference_idx": second_reference_idx,
+            },
+        )
+        assert {k: str(v) for k, v in out.items()} == {
+            "host_rype_path": "/srv/r.ryxdi",
+            "host_minimap2_path": "/srv/m.mmi",
+        }
+    finally:
+        for idx in (reference_idx, second_reference_idx):
+            await postgres_pool.execute(
+                "DELETE FROM qiita.reference_index WHERE reference_idx = $1", idx
+            )
+
+
+async def test_resolve_host_filter_two_reference_requires_rype(postgres_pool, second_reference_idx):
+    """minimap2 set but rype absent → BAD_INPUT (rype is REQUIRED in this layout,
+    unlike the legacy >=1-of-either rule)."""
+    from qiita_control_plane.runner import _resolve_host_filter_indexes
+
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1",
+        second_reference_idx,
+    )
+    await _insert_reference_index(
+        postgres_pool, second_reference_idx, "/srv/m.mmi", index_type="minimap2"
+    )
+    try:
+        with pytest.raises(BackendFailure) as ei:
+            await _resolve_host_filter_indexes(
+                postgres_pool,
+                action_context={
+                    "host_filter_enabled": True,
+                    "host_minimap2_reference_idx": second_reference_idx,
+                },
+            )
+        assert ei.value.kind == FailureKind.BAD_INPUT
+        assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
+        assert "host_rype_reference_idx" in ei.value.reason
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", second_reference_idx
+        )
+
+
+async def test_resolve_host_filter_two_reference_rype_missing_its_index(
+    postgres_pool, reference_idx
+):
+    """The designated rype reference is active but carries NO rype index → hard
+    BAD_INPUT (a missing index on a designated reference is fatal here, not a
+    skipped stage)."""
+    from qiita_control_plane.runner import _resolve_host_filter_indexes
+
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1", reference_idx
+    )
+    # Only a minimap2 index exists on this reference, but it's named as the rype
+    # reference → the rype lookup must fail rather than silently skip.
+    await _insert_reference_index(postgres_pool, reference_idx, "/srv/m.mmi", index_type="minimap2")
+    try:
+        with pytest.raises(BackendFailure) as ei:
+            await _resolve_host_filter_indexes(
+                postgres_pool,
+                action_context={
+                    "host_filter_enabled": True,
+                    "host_rype_reference_idx": reference_idx,
+                },
+            )
+        assert ei.value.kind == FailureKind.BAD_INPUT
+        assert "rype" in ei.value.reason
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_host_filter_two_reference_minimap2_missing_its_index(
+    postgres_pool, reference_idx, second_reference_idx
+):
+    """The designated minimap2 reference is active but carries NO minimap2 index →
+    hard BAD_INPUT (symmetric to the rype case)."""
+    from qiita_control_plane.runner import _resolve_host_filter_indexes
+
+    for idx in (reference_idx, second_reference_idx):
+        await postgres_pool.execute(
+            "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1", idx
+        )
+    await _insert_reference_index(postgres_pool, reference_idx, "/srv/r.ryxdi", index_type="rype")
+    # second_reference_idx has no minimap2 index built.
+    try:
+        with pytest.raises(BackendFailure) as ei:
+            await _resolve_host_filter_indexes(
+                postgres_pool,
+                action_context={
+                    "host_filter_enabled": True,
+                    "host_rype_reference_idx": reference_idx,
+                    "host_minimap2_reference_idx": second_reference_idx,
+                },
+            )
+        assert ei.value.kind == FailureKind.BAD_INPUT
+        assert "minimap2" in ei.value.reason
+    finally:
+        for idx in (reference_idx, second_reference_idx):
+            await postgres_pool.execute(
+                "DELETE FROM qiita.reference_index WHERE reference_idx = $1", idx
+            )
+
+
+async def test_resolve_host_filter_two_reference_unknown_rype_reference(postgres_pool):
+    """An unknown host_rype_reference_idx → BAD_INPUT naming the field."""
+    from qiita_control_plane.runner import _resolve_host_filter_indexes
+
+    with pytest.raises(BackendFailure) as ei:
+        await _resolve_host_filter_indexes(
+            postgres_pool,
+            action_context={
+                "host_filter_enabled": True,
+                "host_rype_reference_idx": 999_999_999,
+            },
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert "host_rype_reference_idx" in ei.value.reason
+
+
+async def test_resolve_host_filter_two_reference_rejects_mixed_layouts(
+    postgres_pool, reference_idx
+):
+    """Supplying BOTH the legacy host_reference_idx and a two-reference key is a
+    contract error → BAD_INPUT (no silent precedence)."""
+    from qiita_control_plane.runner import _resolve_host_filter_indexes
+
+    with pytest.raises(BackendFailure) as ei:
+        await _resolve_host_filter_indexes(
+            postgres_pool,
+            action_context={
+                "host_filter_enabled": True,
+                "host_reference_idx": reference_idx,
+                "host_rype_reference_idx": reference_idx,
+            },
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
+
+
+async def test_resolve_host_filter_two_reference_minimap2_must_be_positive(
+    postgres_pool, reference_idx
+):
+    """A present-but-invalid host_minimap2_reference_idx (0 / bool) → BAD_INPUT,
+    even though minimap2 is otherwise optional."""
+    from qiita_control_plane.runner import _resolve_host_filter_indexes
+
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1", reference_idx
+    )
+    await _insert_reference_index(postgres_pool, reference_idx, "/srv/r.ryxdi", index_type="rype")
+    try:
+        for bad in (0, True):
+            with pytest.raises(BackendFailure) as ei:
+                await _resolve_host_filter_indexes(
+                    postgres_pool,
+                    action_context={
+                        "host_filter_enabled": True,
+                        "host_rype_reference_idx": reference_idx,
+                        "host_minimap2_reference_idx": bad,
+                    },
+                )
+            assert ei.value.kind == FailureKind.BAD_INPUT
+            assert "host_minimap2_reference_idx" in ei.value.reason
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+async def test_resolve_host_filter_two_reference_rype_must_be_positive(postgres_pool):
+    """A non-positive / wrong-typed host_rype_reference_idx (the REQUIRED field) →
+    BAD_INPUT naming it — symmetric with the minimap2 validation."""
+    from qiita_control_plane.runner import _resolve_host_filter_indexes
+
+    for bad in (0, True):
+        with pytest.raises(BackendFailure) as ei:
+            await _resolve_host_filter_indexes(
+                postgres_pool,
+                action_context={"host_filter_enabled": True, "host_rype_reference_idx": bad},
+            )
+        assert ei.value.kind == FailureKind.BAD_INPUT
+        assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
+        assert "host_rype_reference_idx" in ei.value.reason
+
+
+async def test_resolve_host_filter_two_reference_non_active_rype(postgres_pool, reference_idx):
+    """A reference still `indexing` (build mid-flight) designated as the rype
+    reference must not be served → BAD_INPUT (the two-reference path maps the
+    non-active ValueError to a SUBMISSION failure)."""
+    from qiita_control_plane.runner import _resolve_host_filter_indexes
+
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'indexing' WHERE reference_idx = $1", reference_idx
+    )
+    await _insert_reference_index(postgres_pool, reference_idx, "/srv/r.ryxdi", index_type="rype")
+    try:
+        with pytest.raises(BackendFailure) as ei:
+            await _resolve_host_filter_indexes(
+                postgres_pool,
+                action_context={
+                    "host_filter_enabled": True,
+                    "host_rype_reference_idx": reference_idx,
+                },
+            )
+        assert ei.value.kind == FailureKind.BAD_INPUT
+        assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
+        )
+
+
+# =============================================================================
+# _resolve_qc_adapters (QC adapter-set materialization)
+# =============================================================================
+
+
+async def _make_adapter_reference(pool, reference_idx) -> None:
+    """Turn the test reference into an ACTIVE artifact_sequence_set."""
+    await pool.execute(
+        "UPDATE qiita.reference SET kind = 'artifact_sequence_set', status = 'active'"
+        " WHERE reference_idx = $1",
+        reference_idx,
+    )
+
+
+async def test_resolve_qc_adapters_writes_parquet(
+    postgres_pool, reference_idx, tmp_path, monkeypatch
+):
+    """Active artifact_sequence_set + DoGet'd chunks → adapters.parquet in the
+    workspace, with chunks reassembled in chunk_index order per feature. The
+    Parquet has (feature_idx, sequence) rows sorted by feature_idx."""
+    import duckdb
+
+    from qiita_control_plane import runner
+
+    await _make_adapter_reference(postgres_pool, reference_idx)
+    # Out-of-order chunks + a two-chunk feature, to pin the ORDER BY chunk_index
+    # reassembly and the per-feature record split.
+    monkeypatch.setattr(
+        runner,
+        "_do_get_reference_sequence_chunks",
+        lambda _url, _ticket: [(7, 1, "GGGG"), (7, 0, "AGAT"), (9, 0, "CTGTCTC")],
+    )
+    out = await runner._resolve_qc_adapters(
+        postgres_pool,
+        default_adapter_reference_idx=reference_idx,
+        data_plane_url="grpc://unused",
+        hmac_secret=b"x" * 16,
+        workspace=tmp_path,
+    )
+    adapter_parquet = tmp_path / "adapters.parquet"
+    assert out == {"adapter_parquet": adapter_parquet}
+    with duckdb.connect(":memory:") as conn:
+        rows = conn.execute(
+            f"SELECT feature_idx, sequence FROM read_parquet('{adapter_parquet}') "
+            "ORDER BY feature_idx"
+        ).fetchall()
+    assert rows == [(7, "AGATGGGG"), (9, "CTGTCTC")]
+
+
+async def test_resolve_qc_adapters_unconfigured(postgres_pool, tmp_path):
+    """No configured default → SUBMISSION BAD_INPUT (no DB lookup needed)."""
+    from qiita_control_plane import runner
+
+    with pytest.raises(BackendFailure) as ei:
+        await runner._resolve_qc_adapters(
+            postgres_pool,
+            default_adapter_reference_idx=None,
+            data_plane_url="grpc://unused",
+            hmac_secret=b"x" * 16,
+            workspace=tmp_path,
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
+    assert "QIITA_DEFAULT_ADAPTER_REFERENCE_IDX" in ei.value.reason
+
+
+async def test_resolve_qc_adapters_unknown_reference(postgres_pool, tmp_path):
+    from qiita_control_plane import runner
+
+    with pytest.raises(BackendFailure) as ei:
+        await runner._resolve_qc_adapters(
+            postgres_pool,
+            default_adapter_reference_idx=999_999_999,
+            data_plane_url="grpc://unused",
+            hmac_secret=b"x" * 16,
+            workspace=tmp_path,
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+
+
+async def test_resolve_qc_adapters_wrong_kind(postgres_pool, reference_idx, tmp_path):
+    """A non-artifact_sequence_set reference is rejected — fail fast rather than
+    DoGet a (possibly huge) sequence_reference as 'adapters'."""
+    from qiita_control_plane import runner
+
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'active' WHERE reference_idx = $1", reference_idx
+    )  # leaves kind = 'sequence_reference'
+    with pytest.raises(BackendFailure) as ei:
+        await runner._resolve_qc_adapters(
+            postgres_pool,
+            default_adapter_reference_idx=reference_idx,
+            data_plane_url="grpc://unused",
+            hmac_secret=b"x" * 16,
+            workspace=tmp_path,
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert "artifact_sequence_set" in ei.value.reason
+
+
+async def test_resolve_qc_adapters_non_active(postgres_pool, reference_idx, tmp_path):
+    from qiita_control_plane import runner
+
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET kind = 'artifact_sequence_set', status = 'loading'"
+        " WHERE reference_idx = $1",
+        reference_idx,
+    )
+    with pytest.raises(BackendFailure) as ei:
+        await runner._resolve_qc_adapters(
+            postgres_pool,
+            default_adapter_reference_idx=reference_idx,
+            data_plane_url="grpc://unused",
+            hmac_secret=b"x" * 16,
+            workspace=tmp_path,
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert "active" in ei.value.reason
+
+
+async def test_resolve_qc_adapters_empty_set(postgres_pool, reference_idx, tmp_path, monkeypatch):
+    """An adapter reference that DoGets zero sequences is a misconfiguration →
+    BAD_INPUT, and no partial adapters.parquet is left behind."""
+    from qiita_control_plane import runner
+
+    await _make_adapter_reference(postgres_pool, reference_idx)
+    monkeypatch.setattr(runner, "_do_get_reference_sequence_chunks", lambda _url, _t: [])
+    with pytest.raises(BackendFailure) as ei:
+        await runner._resolve_qc_adapters(
+            postgres_pool,
+            default_adapter_reference_idx=reference_idx,
+            data_plane_url="grpc://unused",
+            hmac_secret=b"x" * 16,
+            workspace=tmp_path,
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert not (tmp_path / "adapters.parquet").exists()
+
+
+async def test_resolve_qc_adapters_dataplane_failure_is_submission_failure(
+    postgres_pool, reference_idx, tmp_path, monkeypatch
+):
+    """A Flight DoGet failure (data plane unreachable/errored) is wrapped as a
+    SUBMISSION BackendFailure — never allowed to escape as an untyped exception
+    (which run_workflow's bare handler would mis-record as STEP_RUN/step_name=None,
+    violating the failure-step-name CHECK and stranding the ticket)."""
+    from qiita_control_plane import runner
+
+    await _make_adapter_reference(postgres_pool, reference_idx)
+
+    def _boom(_url, _ticket):
+        raise RuntimeError("Flight: connection refused")
+
+    monkeypatch.setattr(runner, "_do_get_reference_sequence_chunks", _boom)
+    with pytest.raises(BackendFailure) as ei:
+        await runner._resolve_qc_adapters(
+            postgres_pool,
+            default_adapter_reference_idx=reference_idx,
+            data_plane_url="grpc://unused",
+            hmac_secret=b"x" * 16,
+            workspace=tmp_path,
+        )
+    assert ei.value.kind == FailureKind.BAD_INPUT
+    assert ei.value.stage == WorkTicketFailureStage.SUBMISSION
+    assert ei.value.step_name is None
+    assert "data plane" in ei.value.reason
+
+
+async def test_workflow_needs_adapters_detects_adapter_input():
+    """The gate fires only when an entry declares adapter_parquet as an input."""
+    from types import SimpleNamespace
+
+    from qiita_control_plane.runner import _workflow_needs_adapters
+
+    no_qc = [SimpleNamespace(inputs=["reads"], optional_inputs=["host_rype_path"])]
+    with_qc = [SimpleNamespace(inputs=["reads", "adapter_parquet"], optional_inputs=[])]
+    assert _workflow_needs_adapters(no_qc) is False
+    assert _workflow_needs_adapters(with_qc) is True
+
+
+# =============================================================================
+# fastq-to-parquet/1.2.0 step wiring (fastq -> qc -> host_filter)
+# =============================================================================
+#
+# The 1.2.0 chain inserts an always-on `qc` step between fastq and host_filter.
+# Each stage re-emits the `reads` binding it consumes (a transform in place), so
+# host_filter is identical to 1.1.0 and consumes qc's QC'd `reads`. The qc step
+# takes the runner-materialized `adapter_parquet` as a PATH input and the sequencing
+# `instrument_model` as a scalar `params` value.
+
+_FASTQ_TO_PARQUET_V12_STEPS = [
+    {
+        "kind": "step",
+        "name": "fastq",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
+        "inputs": ["fastq_path"],
+        "optional_inputs": ["reverse_fastq_path"],
+        "outputs": ["reads"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    {
+        "kind": "step",
+        "name": "qc",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.qc",
+        "inputs": ["reads", "adapter_parquet"],
+        "params": {"instrument_model": "instrument_model"},
+        "outputs": ["reads"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    {
+        "kind": "step",
+        "name": "host_filter",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.host_filter",
+        "inputs": ["reads"],
+        "optional_inputs": ["host_rype_path", "host_minimap2_path"],
+        "outputs": ["filtered_reads"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+]
+
+
+async def _make_v12_ticket(
+    pool, prep_sample_idx: int, principal_idx: int, action_context: dict
+) -> tuple[int, str]:
+    """Insert a fastq-to-parquet/1.2.0-shaped action (the _FASTQ_TO_PARQUET_V12_STEPS
+    shape) + a pending prep_sample-scoped work_ticket. Returns (work_ticket_idx,
+    version) for cleanup."""
+    version = f"fastq-to-parquet-v12-{uuid.uuid4()}"
+    await pool.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, scopes, audience,"
+        "  context_schema, steps, cpu_ceiling, mem_ceiling_gb, walltime_ceiling,"
+        "  success_status, failure_status"
+        ") VALUES ('fastq-to-parquet', $1, 'prep_sample', $2::text[], $3::jsonb,"
+        "  '{}'::jsonb, $4::jsonb, 8, 16, '4 hours', NULL, 'failed')",
+        version,
+        [],
+        json.dumps({"service": False, "human_roles": ["user"]}),
+        json.dumps(_FASTQ_TO_PARQUET_V12_STEPS),
+    )
+    wt_idx = await pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, prep_sample_idx, action_context"
+        ") VALUES ('fastq-to-parquet', $1, $2, 'prep_sample', $3, $4::jsonb)"
+        " RETURNING work_ticket_idx",
+        version,
+        principal_idx,
+        prep_sample_idx,
+        json.dumps(action_context),
+    )
+    return wt_idx, version
+
+
+async def test_fastq_to_parquet_v12_qc_binds_adapter_and_instrument_model(
+    postgres_pool, reference_idx, human_admin_session, tmp_path, monkeypatch
+):
+    """End-to-end 1.2.0 wiring: the runner dispatches fastq → qc → host_filter in
+    order; qc receives `reads` (fastq's output) and the runner-materialized
+    `adapter_parquet` as PATH inputs plus `instrument_model` via params; and
+    host_filter consumes the `reads` binding qc re-emitted (the QC'd output, not
+    fastq's raw reads)."""
+    from qiita_control_plane import runner
+    from qiita_control_plane.testing.db_seeds import seed_biosample_with_sequenced_prep_sample
+
+    principal_idx = human_admin_session["principal_idx"]
+    _bio_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+        postgres_pool, owner_idx=principal_idx
+    )
+
+    # Configured artifact_sequence_set adapter reference + a stubbed DoGet so the
+    # pre-loop adapter materialization writes a real adapters.parquet.
+    await _make_adapter_reference(postgres_pool, reference_idx)
+    monkeypatch.setattr(
+        runner,
+        "_do_get_reference_sequence_chunks",
+        lambda _url, _t: [(1, 0, "AGATCGGAAGAGC")],
+    )
+
+    backend = FakeBackendClient()
+    backend.outputs_for["fastq"] = {"reads": tmp_path / "fastq_out" / "reads.parquet"}
+    backend.outputs_for["qc"] = {"reads": tmp_path / "qc_out" / "qc_reads.parquet"}
+    backend.outputs_for["host_filter"] = {
+        "filtered_reads": tmp_path / "hf_out" / "filtered_reads.parquet"
+    }
+
+    # host_filter_enabled absent → host filtering off (no index paths bound).
+    wt_idx, version = await _make_v12_ticket(
+        postgres_pool,
+        prep_sample_idx,
+        principal_idx,
+        {"fastq_path": "/data/sample.fastq", "instrument_model": "NextSeq 550"},
+    )
+    try:
+        await _run(
+            wt_idx,
+            postgres_pool,
+            backend,
+            tmp_path / "ws",
+            default_adapter_reference_idx=reference_idx,
+        )
+
+        # Step order.
+        assert [name for name, *_ in backend.calls] == ["fastq", "qc", "host_filter"]
+
+        # qc inputs: `reads` is fastq's output path; `adapter_parquet` is the
+        # runner-materialized canonical set (a real file on disk); `instrument_model`
+        # rides through `params` as a string (not Path-coerced).
+        qc_inputs = next(inp for name, inp, *_ in backend.calls if name == "qc")
+        assert qc_inputs["reads"] == backend.outputs_for["fastq"]["reads"]
+        assert qc_inputs["adapter_parquet"].name == "adapters.parquet"
+        assert qc_inputs["adapter_parquet"].exists()
+        assert qc_inputs["instrument_model"] == "NextSeq 550"
+
+        # host_filter consumes the `reads` binding qc re-emitted (the QC'd output),
+        # NOT fastq's raw reads — proving the in-place transform chaining. Host
+        # filtering is off, so no index paths are bound.
+        hf_inputs = next(inp for name, inp, *_ in backend.calls if name == "host_filter")
+        assert hf_inputs["reads"] == backend.outputs_for["qc"]["reads"]
+        assert "host_rype_path" not in hf_inputs
+        assert "host_minimap2_path" not in hf_inputs
+
+        state = await postgres_pool.fetchval(
+            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt_idx
+        )
+        assert state == "completed"
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.action WHERE action_id = 'fastq-to-parquet' AND version = $1",
+            version,
+        )
+        await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
+        await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", _bio_idx)
 
 
 async def test_run_workflow_fails_ticket_on_host_filter_resolution_error(

@@ -490,10 +490,10 @@ def test_load_actions_loads_on_disk_local_host_reference_add_yaml():
 
 
 def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():
-    """Both fastq-to-parquet versions load and coexist: 1.0.0 (fastq only) and
-    1.1.0 (fastq + an OPTIONAL host_filter step). 1.1.0 gates host filtering on
-    `host_filter_enabled`/`host_reference_idx` in the context_schema and binds
-    the host indexes via host_filter's optional_inputs, so the step is a
+    """All three fastq-to-parquet versions load and coexist: 1.0.0 (fastq only),
+    1.1.0 (fastq + an OPTIONAL host_filter step), and 1.2.0 (fastq + ALWAYS-ON qc
+    + OPTIONAL host_filter). 1.1.0/1.2.0 gate host filtering on the context_schema
+    and bind the host indexes via host_filter's optional_inputs, so the step is a
     pass-through when those aren't resolved."""
     from pathlib import Path
 
@@ -505,9 +505,10 @@ def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():
     actions = load_actions(repo_root / "workflows")
     by_key = {(a.action_id, a.version): a for a in actions}
 
-    # Both versions present (coexistence — the submit route picks the version).
+    # All versions present (coexistence — the submit route picks the version).
     assert ("fastq-to-parquet", "1.0.0") in by_key
     assert ("fastq-to-parquet", "1.1.0") in by_key
+    assert ("fastq-to-parquet", "1.2.0") in by_key
 
     v10 = by_key[("fastq-to-parquet", "1.0.0")]
     assert [s.name for s in v10.steps] == ["fastq"]
@@ -535,6 +536,38 @@ def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():
     assert props["host_filter_enabled"]["type"] == "boolean"
     assert props["host_reference_idx"]["type"] == "integer"
     assert "fastq_path" in v11.context_schema["required"]
+
+    # 1.2.0: fastq -> qc (always-on) -> host_filter. Each stage re-emits the
+    # `reads` binding it consumes (a transform in place), so host_filter is
+    # identical to 1.1.0 and consumes qc's QC'd `reads`.
+    v12 = by_key[("fastq-to-parquet", "1.2.0")]
+    assert v12.target_kind == ScopeTargetKind.PREP_SAMPLE
+    assert v12.target_processing_kinds == ["sequenced"]
+    assert [s.name for s in v12.steps] == ["fastq", "qc", "host_filter"]
+
+    qc = next(s for s in v12.steps if s.name == "qc")
+    assert qc.module == "qiita_compute_orchestrator.jobs.qc"
+    # `adapter_parquet` in inputs triggers the runner's adapter materialization;
+    # `reads` is fastq's output, re-emitted as `reads` so host_filter consumes it.
+    assert qc.inputs == ["reads", "adapter_parquet"]
+    assert qc.outputs == ["reads"]
+    # instrument_model rides through `params` (action_context key -> Inputs field),
+    # NOT inputs (it's a scalar, not a host path).
+    assert qc.params == {"instrument_model": "instrument_model"}
+
+    v12_host_filter = next(s for s in v12.steps if s.name == "host_filter")
+    assert v12_host_filter.module == "qiita_compute_orchestrator.jobs.host_filter"
+    assert v12_host_filter.inputs == ["reads"]
+    assert v12_host_filter.optional_inputs == ["host_rype_path", "host_minimap2_path"]
+    assert v12_host_filter.outputs == ["filtered_reads"]
+
+    # 1.2.0 uses the two-reference host-filter layout + instrument_model.
+    props12 = v12.context_schema["properties"]
+    assert props12["host_filter_enabled"]["type"] == "boolean"
+    assert props12["host_rype_reference_idx"]["type"] == "integer"
+    assert props12["host_minimap2_reference_idx"]["type"] == "integer"
+    assert props12["instrument_model"]["type"] == "string"
+    assert "fastq_path" in v12.context_schema["required"]
 
 
 def test_load_actions_loads_on_disk_bcl_convert_yaml():

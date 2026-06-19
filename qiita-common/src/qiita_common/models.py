@@ -200,7 +200,12 @@ class Tier(StrEnum):
     ADMIN = "admin"
 
 
-ReferenceKind = Literal["sequence_reference", "taxonomy_authority"]
+ReferenceKind = Literal["sequence_reference", "taxonomy_authority", "artifact_sequence_set"]
+"""Kinds of reference, mirroring the `qiita.reference.kind` TEXT/CHECK column
+(NOT a Postgres ENUM — see the reference migrations). `artifact_sequence_set` is
+an indexless set of artifact sequences (e.g. the canonical adapter set the QC
+step trims against): ingested through the same kind-agnostic reference-add flow,
+but carries no taxonomy and builds no rype/minimap2 index."""
 
 
 class ReferenceCreateRequest(BaseModel):
@@ -1727,6 +1732,31 @@ class SequencingRunCreateResponse(BaseModel):
     """Returned by POST /api/v1/sequencing-run on success."""
 
     sequencing_run_idx: Annotated[int, Field(gt=0)]
+
+
+class SequencingRunResponse(BaseModel):
+    """Returned by GET /api/v1/sequencing-run/{sequencing_run_idx}.
+
+    The caller-visible view of a `qiita.sequencing_run` row (the column set
+    `repositories.sequencing_run.fetch_sequencing_run` selects, with the row's
+    `idx` surfaced as `sequencing_run_idx`). `instrument_model` is the field the
+    `submit-host-filter-pool` fan-out reads to forward QC's polyG gate per sample;
+    it is nullable (non-bcl runs may not record it).
+    """
+
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    instrument_run_id: str
+    platform: Platform
+    instrument_model: str | None = None
+    instrument_serial: str | None = None
+    run_performed_at: AwareDatetime | None = None
+    extra_metadata: dict[str, Any] | None = None
+    created_by_idx: Annotated[int, Field(gt=0)]
+    created_at: AwareDatetime
+    retired: bool
+    retired_by_idx: Annotated[int, Field(gt=0)] | None = None
+    retired_at: AwareDatetime | None = None
+    retire_reason: str | None = None
 
 
 class SequencedPoolCreateRequest(BaseModel):

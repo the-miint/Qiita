@@ -15,6 +15,47 @@ the `no-changelog` label).
 
 ### Added
 
+- New `GET /api/v1/sequencing-run/{sequencing_run_idx}` route returning a run's
+  caller-visible metadata (notably `instrument_model`). Read-gated like the pool
+  roster route (prep_sample:read + wet_lab_admin). `qiita submit-host-filter-pool`
+  reads it to forward QC's polyG-gating `instrument_model` per sample (#129)
+- New `fastq-to-parquet/1.2.0` workflow: an additive successor to 1.1.0 that
+  inserts an ALWAYS-ON `qc` step between `fastq` and `host_filter`
+  (`fastq → qc → host_filter`). Each stage re-emits the `reads` binding it
+  consumes (a transform in place), so `host_filter` is identical to 1.1.0 and
+  consumes the QC'd reads. `context_schema` gains `instrument_model` (forwarded to
+  qc's polyG gate via the step's `params`) and the two-reference host-filter keys
+  (`host_rype_reference_idx` + optional `host_minimap2_reference_idx`); the qc
+  step lists `adapter_parquet`, which triggers the runner's adapter materialization.
+  1.0.0 and 1.1.0 stay available unchanged (#129)
+- Verified and documented the duckdb-miint fastp-port QC functions
+  (`filter_read`, `trim_adapters` / `trim_adapters_pe`, `trim_polyg`) that the
+  upcoming `qc` native job builds on. New
+  `qiita-compute-orchestrator/tests/jobs/test_qc_miint_contract.py` pins their
+  **positional-arg-only** contract and fastp-default values against the
+  team-mirror build (the upstream `docs/qc.md` documents named params the build
+  rejects); `docs/duckdb-miint.md` gains a QC section. Groundwork for the
+  bcl-convert → `fastq` → `qc` → `host_filter` pipeline (#129)
+- New `artifact_sequence_set` reference kind — an indexless set of artifact
+  sequences (the canonical adapter set the QC step trims against), ingested
+  through the same kind-agnostic reference-add flow (no taxonomy, no index).
+  `qiita reference load --kind artifact_sequence_set` and a `reference.kind`
+  CHECK widen back it. The control plane gained
+  `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX` (the canonical set's reference_idx) and a
+  runner resolver (`_resolve_qc_adapters`) that DoGets that set's sequences from
+  the data plane and stages them as a one-`sequence`-column Parquet for the QC
+  step — materialized only for a workflow whose steps need it (#129)
+- New `qc` native job (`qiita_compute_orchestrator.jobs.qc`): a fastp-equivalent
+  read-QC transform `reads.parquet` → `qc_reads.parquet` over the duckdb-miint
+  fastp-port functions. Per read it runs adapter trim (`trim_adapters` SE /
+  `trim_adapters_pe` PE) → optional polyG trim (`trim_polyg`, gated on a 2-color
+  `instrument_model`) → length/quality filter (`filter_read`, fastp `-l 100`
+  defaults); drop-only and `sequence_idx`-preserving, dropping a read pair when
+  EITHER mate falls below min_length after trimming. The canonical adapter set
+  is read from the runner-staged `adapter_parquet` via `read_parquet` and inlined
+  as a constant `VARCHAR[]`; the two SE/PE seams emit SELECTs that UNION ALL
+  straight into one streaming COPY (no intermediate accumulator table). Slots into
+  the bcl-convert → `fastq` → `qc` → `host_filter` pipeline (#129)
 - Remove a full preparation (sequenced_pool) from the system. New
   `DELETE /sequencing-run/{run}/sequenced-pool/{pool}` hard-deletes a
   sequenced_pool and everything under it — the pool row, every
@@ -155,6 +196,23 @@ the `no-changelog` label).
 
 ### Changed
 
+- `qiita submit-host-filter-pool` now fans out fastq-to-parquet/**1.2.0** (QC +
+  two-reference host filter) instead of 1.1.0. `--host-reference-idx` is replaced
+  by `--host-rype-reference-idx` (required) and `--host-minimap2-reference-idx`
+  (optional), each pre-flighted for ACTIVE status + its named index; the run's
+  `instrument_model` is read once (GET /sequencing-run) and forwarded per sample
+  so QC's polyG gate is set correctly (#129)
+- Host filtering can now draw its two indexes from two INDEPENDENT references.
+  The runner's `_resolve_host_filter_indexes` gained a two-reference layout
+  (fastq-to-parquet/1.2.0): `host_rype_reference_idx` (required) supplies the rype
+  `.ryxdi` and the optional `host_minimap2_reference_idx` supplies the minimap2
+  `.mmi`, each from its own ACTIVE reference that MUST carry the named index (a
+  designated reference missing its index is a hard error). The legacy
+  single-reference `host_reference_idx` layout (1.1.0, ≥1-of-either, skip on
+  missing) is unchanged and back-compatible; the two layouts are mutually
+  exclusive (mixing them, or enabling with no reference key, is a clear
+  SUBMISSION BAD_INPUT). `host_filter.py` itself is untouched — it still skips the
+  stage whose index path is None (#129)
 - `stage_local_fasta` now ingests the whole manifest in a single
   `read_fastx(VARCHAR[])` scan and streams read → `sequence_split` → Parquet
   without ever materialising sequences in a temp table. The previous per-file
