@@ -443,6 +443,20 @@ the `no-changelog` label).
 
 ### Fixed
 
+- Data-plane file registration no longer collides with — and attempts to
+  overwrite — an already-registered DuckLake data file. `register_files` placed
+  each Parquet at `DATA_PATH/<table>/<producer-basename>`, but the reference-load
+  job emits fixed basenames (`part_00000.parquet`, `reference_<table>.parquet`)
+  on every load, so a second registration into a shared table targeted the first
+  load's live, catalog-registered file. Because registered files are mode `0440`,
+  the clobber surfaced on the live host as a cryptic `cross-fs copy failed …
+  Permission denied` rather than silent lake corruption. The data plane now mints
+  a unique, ticket-traceable destination name (`wt{work_ticket_idx}-{basename}`)
+  — it owns lake-storage layout, as DuckLake does for its own INSERT-written
+  files — and `move_file` refuses to overwrite an existing destination
+  (`AlreadyExists`) as a hard safety net. The control plane threads the
+  originating `work_ticket_idx` into the signed `register_files` action payload.
+  Fixes loading more than one reference into a lake (and reloading). (#136)
 - bcl-convert SIF auto-build no longer fails its `dnf install`. The
   `Apptainer.def` staged the licensed RPM to `/tmp/bcl-convert.rpm`, but a
   privileged `apptainer build` (the deploy's auto-build runs as root) bind-mounts

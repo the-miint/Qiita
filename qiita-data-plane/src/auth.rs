@@ -167,6 +167,12 @@ pub struct ActionPayload {
     pub staging_dir: String,
     /// Map of {filename: ducklake_table_name}.
     pub files: HashMap<String, String>,
+    /// Originating work ticket. The data plane prefixes each placed lake file
+    /// with `wt{work_ticket_idx}-` so destination names are unique across
+    /// loads — the producer reuses fixed basenames (e.g. `part_00000.parquet`)
+    /// — and trace back to the ticket that wrote them. Required: pinned by
+    /// `qiita_control_plane.actions.library.register_files`.
+    pub work_ticket_idx: i64,
 }
 
 /// Verify a DoAction token and return the parsed action payload.

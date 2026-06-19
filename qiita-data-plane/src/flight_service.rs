@@ -634,10 +634,18 @@ fn register_files(
         // only the basename when placing into `dest_dir` — otherwise
         // we'd nest the staging subdir inside the per-table
         // destination dir.
-        let basename = std::path::Path::new(filename).file_name().ok_or_else(|| {
-            Status::invalid_argument(format!("filename has no basename: {filename}"))
-        })?;
-        let dest = dest_dir.join(basename);
+        let basename = std::path::Path::new(filename)
+            .file_name()
+            .and_then(|b| b.to_str())
+            .ok_or_else(|| {
+                Status::invalid_argument(format!("filename has no UTF-8 basename: {filename}"))
+            })?;
+        // Mint a unique, ticket-traceable destination name — the data plane
+        // owns lake-storage layout, and the producer reuses fixed basenames
+        // across loads, so placing the bare basename would collide with an
+        // already-registered file in the same per-table dir. `move_file`
+        // refuses to overwrite besides, as a hard safety net.
+        let dest = dest_dir.join(lake_dest_filename(payload.work_ticket_idx, basename));
         move_file(&src, &dest)?;
         moved.push((table.clone(), dest));
     }
@@ -785,12 +793,44 @@ fn delete_reference(
     Ok(out)
 }
 
+/// Mint a unique, ticket-traceable lake-storage filename for a registered
+/// Parquet.
+///
+/// The producer (the reference-load job) reuses fixed basenames
+/// (`part_00000.parquet`, `reference_<table>.parquet`) on every load, so the
+/// bare basename is NOT unique within a per-table lake dir: two registrations
+/// into the same table would target the same path and the second would clobber
+/// the first's live, catalog-registered file. Prefixing with the originating
+/// work ticket makes the name unique across loads (every load is a distinct
+/// ticket) while staying unique within a load (the basename — part index or
+/// table name — still distinguishes files under one ticket), and lets an
+/// operator trace any lake file back to the ticket that wrote it. DuckLake
+/// names its own INSERT-written data files uniquely for the same reason; this
+/// is the equivalent for our "register an existing file" path.
+fn lake_dest_filename(work_ticket_idx: i64, basename: &str) -> String {
+    format!("wt{work_ticket_idx}-{basename}")
+}
+
 /// Move a file, falling back to copy+delete for cross-filesystem moves.
+///
+/// Refuses to overwrite an existing destination. Lake data files are
+/// registered in the DuckLake catalog by absolute path and written read-only
+/// (mode 0440); clobbering one corrupts the lake (or, because of the read-only
+/// bit, fails mid-copy with a cryptic EACCES). Callers mint unique destination
+/// names ([`lake_dest_filename`]), so a pre-existing dest signals a genuine
+/// double-registration — surface it loudly as `AlreadyExists` rather than
+/// touching the file.
 ///
 /// If the copy succeeds but delete fails, the dest file is kept (it's the
 /// correct data) and the error message includes the orphaned source path
 /// for cleanup.
 fn move_file(src: &std::path::Path, dest: &std::path::Path) -> Result<(), Status> {
+    if dest.exists() {
+        return Err(Status::already_exists(format!(
+            "refusing to overwrite existing lake file {}",
+            dest.display()
+        )));
+    }
     match std::fs::rename(src, dest) {
         Ok(()) => Ok(()),
         Err(e) if e.raw_os_error() == Some(18) => {
@@ -1000,6 +1040,71 @@ mod tests {
             "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_b};
              DELETE FROM qiita_lake.reference_sequences WHERE feature_idx = {shared};"
         ));
+    }
+
+    // Regression (data-plane lake-file placement): when `register_files`
+    // moves an externally-produced Parquet into managed lake storage, it must
+    // NEVER overwrite a file already present there. The reference-load job
+    // emits fixed basenames (`part_00000.parquet`, `reference_<table>.parquet`),
+    // so a second registration into the same table targeted the exact path of
+    // the first load's live, catalog-registered data file. Registered files are
+    // mode 0440, so on the live host the clobber surfaced as a cryptic EACCES
+    // ("cross-fs copy failed … Permission denied"); this pins the intended
+    // behavior independent of the dest's mode: refuse with AlreadyExists and
+    // leave the existing file byte-for-byte intact. The copy is the data
+    // plane's responsibility, so the guard lives at the copy primitive.
+    #[test]
+    fn move_file_refuses_to_overwrite_existing_dest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src.parquet");
+        let dest = tmp.path().join("dest.parquet");
+        std::fs::write(&src, b"new load output").unwrap();
+        std::fs::write(&dest, b"REGISTERED LAKE DATA").unwrap();
+
+        let err = move_file(&src, &dest)
+            .expect_err("move_file must refuse to overwrite an existing destination");
+        assert_eq!(
+            err.code(),
+            tonic::Code::AlreadyExists,
+            "clobber must surface as AlreadyExists, not a cryptic permission error"
+        );
+
+        // The existing (registered) lake file is untouched ...
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"REGISTERED LAKE DATA",
+            "existing lake file must not be modified"
+        );
+        // ... and the source is preserved for diagnosis (the move is refused,
+        // not half-applied).
+        assert!(
+            src.exists(),
+            "source must be preserved when the move is refused"
+        );
+    }
+
+    // The minted lake filename carries the work ticket (traceability) and is
+    // unique across loads: the same producer basename registered under two
+    // different tickets must land at distinct paths, so neither clobbers the
+    // other in the shared per-table lake dir.
+    #[test]
+    fn lake_dest_filename_is_traceable_and_unique_across_tickets() {
+        let a = lake_dest_filename(27, "part_00000.parquet");
+        let b = lake_dest_filename(31, "part_00000.parquet");
+        assert_eq!(a, "wt27-part_00000.parquet", "name embeds the work ticket");
+        assert_ne!(
+            a, b,
+            "same basename under different tickets must not collide"
+        );
+        // Deterministic — no randomness, so a resume/retry recomputes the same
+        // name and the move_file guard can detect a true double-registration.
+        assert_eq!(a, lake_dest_filename(27, "part_00000.parquet"));
+        // Distinct basenames within one ticket stay distinct (multiple parts
+        // and the flat per-table files share a ticket).
+        assert_ne!(
+            lake_dest_filename(27, "part_00001.parquet"),
+            lake_dest_filename(27, "reference_membership.parquet")
+        );
     }
 
     #[test]
