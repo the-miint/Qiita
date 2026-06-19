@@ -196,6 +196,15 @@ the `no-changelog` label).
 
 ### Changed
 
+- Retired the manual "rebuild the SIF" deploy step now that the deploy
+  auto-builds. `/deploy-note` and `CLAUDE.md` ("Container image tier") now direct
+  a container-artifact change to a Notes entry + an optional verify, never a
+  bucket-2 manual build — the auto-build's content hash picks the change up on the
+  next deploy. Bucket 2 keeps only genuinely new host setup the build depends on
+  (e.g. staging a new licensed source). The out-of-band manual `build-sif.sh` is
+  documented as a root-only escape hatch (`apptainer build` mounts the caller's
+  home; `qiita-orch`'s is `/dev/null`), and `/deploy-note` now requires any
+  `apptainer exec` verify to be home-/cwd-independent (`cd` + `--no-home`). (#134)
 - The deploy now builds container SIFs automatically. `activate.sh` runs a new
   `deploy/build-sifs.sh` after the rsync and before any service restart: it
   iterates `workflows/*/sif-build.env`, builds each via the existing generic
@@ -434,6 +443,14 @@ the `no-changelog` label).
 
 ### Fixed
 
+- bcl-convert SIF auto-build no longer fails its `dnf install`. The
+  `Apptainer.def` staged the licensed RPM to `/tmp/bcl-convert.rpm`, but a
+  privileged `apptainer build` (the deploy's auto-build runs as root) bind-mounts
+  the host `/tmp` over the image's `/tmp` during `%post`, shadowing the staged RPM
+  → `Could not open … bcl-convert.rpm`. The RPM now stages to `/opt` (not
+  bind-mounted), and `%post` runs under `set -e` with an explicit "RPM missing in
+  image" guard so a future staging regression fails the build loudly instead of
+  mid-`dnf`. (#134)
 - SIF build no longer aborts when run as a service account from a directory that
   account can't read. `qiita_sif_build_inputs_hash` ran `find`, which restores its
   initial working directory on exit; a manual `sudo -u qiita-orch build-sif.sh`

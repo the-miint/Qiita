@@ -12,7 +12,13 @@ From: oraclelinux:8
     # sif-build.env's SOURCES) from ${PATH_DERIVED}/images/sources/ into a
     # temp build root and runs `apptainer build` from there; the operator's
     # one-time setup step in DEPLOY_CHECKLIST.md places it there before the build.
-    bcl-convert-4.5.4-2.el8.x86_64.rpm /tmp/bcl-convert.rpm
+    #
+    # Staged to /opt, NOT /tmp: a privileged `apptainer build` (the deploy's
+    # auto-build runs as root) bind-mounts the HOST /tmp over the image's /tmp
+    # during %post, which shadows a /tmp-staged file and makes the `dnf install`
+    # below fail with "Could not open … rpm". /opt is part of the image and is
+    # not bind-mounted, so the staged RPM survives into %post.
+    bcl-convert-4.5.4-2.el8.x86_64.rpm /opt/bcl-convert.rpm
     # manifest_writer.py is workflow-agnostic (output-dir walk → manifest.json)
     # and lives in workflows/_shared; every container copies it from there.
     # build-sif.sh mirrors the repo layout in the temp build root and builds
@@ -21,6 +27,22 @@ From: oraclelinux:8
     entrypoint.sh /opt/qiita/entrypoint.sh
 
 %post
+    # Fail the build on any error below. apptainer already aborts when %post
+    # exits non-zero, so a failed `dnf install` does stop the build — but on its
+    # own it stops with a cryptic message at the wrong layer (that's how the
+    # /tmp-shadowing bug surfaced: a confusing "Could not open … rpm"). `set -e`
+    # plus the explicit guard just below turn that into a clear, early failure on
+    # the actual offending line, rather than a broken SIF or a live-job surprise.
+    set -e
+
+    # Assert the licensed RPM actually made it into the image (see the /opt vs
+    # /tmp note in %files). If staging regresses, fail loudly here with a clear
+    # message instead of a cryptic dnf "Can not load RPM file".
+    if [ ! -f /opt/bcl-convert.rpm ]; then
+        echo "ERROR: /opt/bcl-convert.rpm missing in image — %files staging regressed (see the /opt vs /tmp note above)" >&2
+        exit 1
+    fi
+
     # bcl-convert RPM has no implicit deps inside an Oracle Linux 8 base
     # image, but the entrypoint needs `jq` (params.json parsing) and a
     # Python for manifest_writer.py. OL8's default `python3` is 3.6, which
@@ -29,9 +51,9 @@ From: oraclelinux:8
     # python3.11 module instead and invoke it explicitly in entrypoint.sh.
     # dnf install handles both plus the RPM itself in one transaction.
     dnf -y install jq python3.11
-    dnf -y install /tmp/bcl-convert.rpm
+    dnf -y install /opt/bcl-convert.rpm
     dnf clean all
-    rm /tmp/bcl-convert.rpm
+    rm /opt/bcl-convert.rpm
 
     chmod 0755 /opt/qiita/entrypoint.sh
     chmod 0644 /opt/qiita/manifest_writer.py

@@ -90,11 +90,14 @@ Container steps declare a bare SIF filename in `container:` (e.g. `bcl-convert-4
 
 **The deploy builds SIFs automatically.** `activate.sh` runs `deploy/build-sifs.sh`, which iterates `workflows/*/sif-build.env` and invokes `build-sif.sh` for each, before the service restarts (see the SIF invariant under "Deployments"). So a routine deploy picks up an edited def/entrypoint/manifest with no manual step. A spec may opt out with `AUTO_BUILD=0` (then build it by hand); names starting with `_` (e.g. `_sif-build-smoke`) are never auto-built.
 
-After editing a workflow YAML or its container artifacts (`workflows/<workflow>/Apptainer.def`, `entrypoint.sh`, `sif-build.env`, or the shared `workflows/_shared/manifest_writer.py`), the SIF rebuild happens **automatically at the next deploy** (the content hash detects the change). These steps run on the **Linux deploy host** — they need `apptainer` and `systemd` — so they don't apply on a macOS dev box (mirrors `make test-workflows`, which skips gracefully off Linux). On macOS, edit the artifacts and run the unit tests. To build out-of-band (e.g. to verify a def change on the host before a full deploy):
+After editing a workflow YAML or its container artifacts (`workflows/<workflow>/Apptainer.def`, `entrypoint.sh`, `sif-build.env`, or the shared `workflows/_shared/manifest_writer.py`), the SIF rebuild happens **automatically at the next deploy** (the content hash detects the change) — **don't write a manual "rebuild the SIF" deploy step**, and `/deploy-note` won't either. These steps run on the **Linux deploy host** — they need `apptainer` and `systemd` — so they don't apply on a macOS dev box (mirrors `make test-workflows`, which skips gracefully off Linux). On macOS, edit the artifacts and run the unit tests.
+
+To build out-of-band (e.g. to verify a def change on the host before a full deploy), **run it as root** — `apptainer build` bind-mounts the invoking account's home, and the `qiita-orch` service account's home is `/dev/null` (build fails to mount it), whereas root's `/root` is real. This matches the deploy's auto-build, which runs as root and then chowns the SIF to `qiita-orch`:
 
 ```bash
-# Build one SIF directly (idempotent — two-gate skip above; FORCE=1 to override).
-PATH_DERIVED=<derived> bash scripts/build-sif.sh <workflow>
+# Build one SIF directly, as root (idempotent — two-gate skip above; FORCE=1 to override).
+sudo env PATH_DERIVED=<derived> bash scripts/build-sif.sh <workflow>
+sudo chown qiita-orch:qiita-orch <derived>/images/<sif> <derived>/images/<sif>.buildhash
 make deploy   # the deploy also (re)builds any changed SIF via build-sifs.sh
 sudo systemctl restart qiita-control-plane qiita-compute-orchestrator
 make verify-health

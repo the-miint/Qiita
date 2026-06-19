@@ -31,11 +31,28 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- (#134) Confirm the auto-rebuilt bcl-convert SIF installed bcl-convert from the
+  new `/opt` staging path. Run home-independently (`cd /tmp` + `--no-home`, since
+  deploys run from an NFS home and `qiita-orch`'s home is `/dev/null`):
+
+  ```bash
+  cd /tmp
+  derived=$(sudo grep '^PATH_DERIVED=' /etc/qiita/compute-orchestrator.env | tail -1 | cut -d= -f2-)
+  sudo -u qiita-orch apptainer exec --no-home "$derived/images/bcl-convert-4.5.4.sif" \
+    bcl-convert --version
+  ```
+
+  Expect `bcl-convert Version 4.5.4`.
 
 ### Notes (no host action)
 
-_None yet._
+- (#134) The bcl-convert SIF **auto-rebuilds on the next deploy** — `Apptainer.def`
+  changed (the licensed RPM now stages to `/opt`, not the bind-mounted `/tmp`, so
+  the root auto-build's `dnf install` stops failing with "Could not open … rpm").
+  `build-sif.sh`'s content hash detects the def change and `build-sifs.sh` rebuilds
+  it during the deploy; no manual `build-sif.sh` step. Needs the licensed RPM still
+  staged under `${PATH_DERIVED}/images/sources/` (already there) — if absent, the
+  auto-build skips with a warning. No new env var, host dir, scope, or migration.
 
 ---
 
