@@ -92,6 +92,30 @@ the `no-changelog` label).
   exist (requiring at least one) and the `host_filter` step skips the stage
   whose index is absent. Index selection is initial-build-time only (the status
   FSM is terminal at `active`) (#124)
+- List a sequencing run's sequenced-samples in one call. New
+  `GET /sequencing-run/{idx}/sequenced-sample/list` returns the run's active
+  sequenced-samples as `SequencedSampleListResponse` rows, and
+  `SequencedSampleListItem` now also carries `biosample_idx`, both ENA
+  accessions (`ena_experiment_accession`, `ena_run_accession`), and both
+  biosample accessions (`biosample_accession`, `ena_sample_accession`) — enough
+  for the ENA experiment fan-out (which needs the BioSample accession as the
+  experiment sample_descriptor) without per-sample GETs. Gated on
+  `prep_sample:read` + wet_lab_admin; the existing idx-only `…/list-idxs`
+  run route is unchanged. The `qiita` CLI gains `sequenced-sample list` (#135)
+- List the studies a prep-sample belongs to. New
+  `GET /prep-sample/{idx}/study/list` returns the active (non-retired) linked
+  studies ascending by idx as `StudyListResponse` rows, each carrying the
+  study's `bioproject_accession` and `ena_study_accession` — enough for the ENA
+  experiment fan-out (which uses the BioProject accession as the experiment
+  study_ref) without a per-study GET; 404 on an unknown prep-sample. Gated on
+  `prep_sample:read` + wet_lab_admin. The `qiita` CLI gains
+  `prep-sample list-studies` (#135)
+- Resolve sequencing runs by instrument_run_id. New
+  `POST /sequencing-run/lookup-by-instrument-run-id` bulk-resolves
+  instrument_run_id values to sequencing_run idxs (idx-only, mirroring the
+  study/biosample accession lookups), gated on `prep_sample:read`. The `qiita`
+  CLI gains `sequencing-run get` and `sequencing-run lookup` for the
+  resolve-then-read flow against `GET /sequencing-run/{idx}` (#135)
 - Delete a reference database from the system. New
   `DELETE /reference/{idx}` fully purges a reference — Postgres rows
   (`reference`, `reference_membership`, `reference_index`, plus orphaned

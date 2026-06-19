@@ -42,6 +42,8 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_LIST_BY_STUDY,
     PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     PATH_BIOSAMPLE_PREFIX,
+    PATH_PREP_SAMPLE_PREFIX,
+    PATH_PREP_SAMPLE_STUDY_LIST,
     PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_INDEX,
     PATH_REFERENCE_PREFIX,
@@ -49,8 +51,10 @@ from qiita_common.api_paths import (
     PATH_SEQUENCED_SAMPLE_BY_IDX,
     PATH_SEQUENCED_SAMPLE_FROM_RUN,
     PATH_SEQUENCED_SAMPLE_LIST_BY_POOL,
+    PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL,
     PATH_SEQUENCED_SAMPLE_PREFIX,
     PATH_SEQUENCING_RUN_BY_IDX,
+    PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID,
     PATH_SEQUENCING_RUN_PREFIX,
     PATH_SEQUENCING_RUN_SEQUENCED_POOL,
     PATH_STUDY_BY_IDX,
@@ -507,6 +511,34 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_seqrun_create.set_defaults(handler=_handle_sequencing_run_create)
 
+    p_seqrun_get = p_seqrun_sub.add_parser(
+        "get",
+        help="Fetch a sequencing-run by idx (GET /sequencing-run/{idx})",
+    )
+    p_seqrun_get.add_argument("--sequencing-run-idx", type=int, required=True)
+    p_seqrun_get.set_defaults(
+        handler=_handle_read,
+        read_path=f"{PATH_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_BY_IDX}",
+        read_idx_arg="sequencing_run_idx",
+    )
+
+    p_seqrun_lookup = p_seqrun_sub.add_parser(
+        "lookup",
+        help=(
+            "Resolve instrument_run_id(s) to sequencing_run idx"
+            " (POST /sequencing-run/lookup-by-instrument-run-id)"
+        ),
+    )
+    p_seqrun_lookup.add_argument(
+        "--instrument-run-id",
+        dest="instrument_run_ids",
+        action="append",
+        required=True,
+        metavar="INSTRUMENT_RUN_ID",
+        help="Instrument-assigned run id; repeat for a bulk lookup",
+    )
+    p_seqrun_lookup.set_defaults(handler=_handle_sequencing_run_lookup)
+
     p_seqpool = sub.add_parser("sequenced-pool", help="Sequenced-pool operations")
     p_seqpool_sub = p_seqpool.add_subparsers(dest="sequenced_pool_cmd", required=True)
     p_seqpool_create = p_seqpool_sub.add_parser(
@@ -622,6 +654,36 @@ def _build_parser() -> argparse.ArgumentParser:
         patch_path=f"{PATH_SEQUENCED_SAMPLE_PREFIX}{PATH_SEQUENCED_SAMPLE_BY_IDX}",
         patch_idx_arg="sequenced_sample_idx",
         patch_json_fields=(),
+    )
+
+    p_seqsample_list = p_seqsample_sub.add_parser(
+        "list",
+        help=(
+            "List a run's sequenced-samples with their biosample linkage and"
+            " ENA/biosample accessions (GET /sequencing-run/{R}/sequenced-sample/list)"
+        ),
+    )
+    p_seqsample_list.add_argument("--sequencing-run-idx", type=int, required=True)
+    p_seqsample_list.set_defaults(
+        handler=_handle_read,
+        read_path=f"{PATH_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL}",
+        read_idx_arg="sequencing_run_idx",
+    )
+
+    p_prepsample = sub.add_parser("prep-sample", help="Prep-sample operations")
+    p_prepsample_sub = p_prepsample.add_subparsers(dest="prep_sample_cmd", required=True)
+    p_prepsample_list_studies = p_prepsample_sub.add_parser(
+        "list-studies",
+        help=(
+            "List the studies a prep-sample is linked to, with their accessions"
+            " (GET /prep-sample/{idx}/study/list)"
+        ),
+    )
+    p_prepsample_list_studies.add_argument("--prep-sample-idx", type=int, required=True)
+    p_prepsample_list_studies.set_defaults(
+        handler=_handle_read,
+        read_path=f"{PATH_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}",
+        read_idx_arg="prep_sample_idx",
     )
 
     p_ticket = sub.add_parser("ticket", help="Work-ticket operations")
@@ -1152,6 +1214,18 @@ def _handle_sequencing_run_create(args: argparse.Namespace, parser: argparse.Arg
     )
     body = _build_body(SequencingRunCreateRequest, args, parser)
     return _common.run_http_subcommand(lambda t: _post_sequencing_run(args.base_url, t, body))
+
+
+def _handle_sequencing_run_lookup(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Resolve instrument_run_id(s) to sequencing_run idx via the bulk lookup.
+
+    Prints the {resolved, missing} mapping.
+    """
+    body = {"instrument_run_ids": args.instrument_run_ids}
+    path = f"{PATH_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID}"
+    return _common.run_http_subcommand(
+        lambda t: _common.call("POST", args.base_url, t, path, json=body)
+    )
 
 
 def _handle_sequenced_pool_create(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

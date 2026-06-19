@@ -177,8 +177,7 @@ async def fetch_sequencing_run(
     a pool or a connection so the helper composes inside an open
     transaction or stands alone.
     """
-    # Single-row fetch by idx; column list mirrors the future
-    # SequencingRunResponse shape (idx -> sequencing_run_idx at the route).
+    # Single-row fetch of the caller-visible column set by idx.
     return await pool_or_conn.fetchrow(
         "SELECT idx, instrument_run_id, platform, instrument_model,"
         " instrument_serial, run_performed_at, extra_metadata,"
@@ -187,6 +186,30 @@ async def fetch_sequencing_run(
         " FROM qiita.sequencing_run WHERE idx = $1",
         sequencing_run_idx,
     )
+
+
+# same-pattern-ok: per-entity guarded natural-key fetcher, matches study/biosample convention
+async def fetch_sequencing_run_idxs_by_instrument_run_id(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    values: list[str],
+) -> dict[str, int]:
+    """Return `{instrument_run_id: sequencing_run_idx}` for every value in
+    `values` that resolves to a qiita.sequencing_run row. Values absent from
+    the table are omitted from the returned map.
+
+    instrument_run_id is UNIQUE across all rows, so each key maps to at most
+    one idx. Retired runs resolve too: the row's `retired` flag is disclosed
+    on the by-idx read, so resolution and disclosure see the same rows.
+    """
+    if not values:
+        return {}
+    rows = await pool_or_conn.fetch(
+        "SELECT idx, instrument_run_id FROM qiita.sequencing_run"
+        " WHERE instrument_run_id = ANY($1::text[])",
+        values,
+    )
+    return {r["instrument_run_id"]: r["idx"] for r in rows}
 
 
 async def fetch_sequencing_run_created_by(

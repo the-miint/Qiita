@@ -20,6 +20,7 @@ from qiita_common.auth_constants import SystemRole
 from qiita_common.models import Tier
 
 from ..deps import get_db_pool
+from ..repositories.prep_sample import fetch_prep_sample_exists
 from ..repositories.sequencing_run import (
     fetch_sequenced_pool,
     fetch_sequenced_pool_created_by,
@@ -310,6 +311,22 @@ async def require_sequencing_run_exists(
         raise HTTPException(
             status_code=404,
             detail=f"sequencing_run {sequencing_run_idx} not found",
+        )
+
+
+# same-pattern-ok: per-entity existence guard, mirrors require_sequencing_run_exists
+async def require_prep_sample_exists(
+    prep_sample_idx: int,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+) -> None:
+    """Existence-only guard: 404 if no qiita.prep_sample row matches the
+    path's prep_sample_idx. Mirror of require_sequencing_run_exists for
+    routes that mount on a path containing {prep_sample_idx}.
+    """
+    if not await fetch_prep_sample_exists(pool, prep_sample_idx):
+        raise HTTPException(
+            status_code=404,
+            detail=f"prep_sample {prep_sample_idx} not found",
         )
 
 

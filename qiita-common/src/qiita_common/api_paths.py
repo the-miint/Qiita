@@ -301,6 +301,9 @@ PATH_SEQUENCING_RUN_PREFIX = "/sequencing-run"
 PATH_SEQUENCING_RUN_ROOT = ""  # POST against the prefix itself
 # GET one sequencing_run by idx (run metadata incl. instrument_model).
 PATH_SEQUENCING_RUN_BY_IDX = "/{sequencing_run_idx}"
+# Bulk lookup of sequencing_run_idx by instrument_run_id; same body-vs-
+# querystring rationale as the study / biosample accession lookups.
+PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID = "/lookup-by-instrument-run-id"
 PATH_SEQUENCING_RUN_SEQUENCED_POOL = "/{sequencing_run_idx}/sequenced-pool"
 PATH_SEQUENCED_POOL_PREFLIGHT = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/preflight"
@@ -310,6 +313,9 @@ PATH_SEQUENCED_POOL_BY_IDX = "/{sequencing_run_idx}/sequenced-pool/{sequenced_po
 
 URL_SEQUENCING_RUN_PREFIX = f"{API_PREFIX}{PATH_SEQUENCING_RUN_PREFIX}"
 URL_SEQUENCING_RUN_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_BY_IDX}"
+URL_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID = (
+    f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID}"
+)
 URL_SEQUENCING_RUN_SEQUENCED_POOL = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_SEQUENCED_POOL}"
 )
@@ -364,6 +370,10 @@ PATH_SEQUENCED_SAMPLE_FROM_RUN = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/sequenced-sample"
 )
 PATH_SEQUENCED_SAMPLE_LIST_BY_RUN = "/{sequencing_run_idx}/sequenced-sample/list-idxs"
+# Run-scoped sibling of LIST_BY_RUN that returns the richer per-sample rows
+# (SequencedSampleListResponse), not bare idxs — hence the `list` segment
+# rather than `list-idxs`, paralleling LIST_BY_POOL.
+PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL = "/{sequencing_run_idx}/sequenced-sample/list"
 PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY = "/{study_idx}/sequenced-sample/list-idxs"
 # Pool-scoped sibling of LIST_BY_RUN. Returns richer per-sample rows
 # (prep_sample_idx + sequenced_pool_item_id), hence the `list` segment rather
@@ -378,9 +388,25 @@ PATH_SEQUENCED_SAMPLE_BY_IDX = "/{sequenced_sample_idx}"
 
 URL_SEQUENCED_SAMPLE_FROM_RUN = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_FROM_RUN}"
 URL_SEQUENCED_SAMPLE_LIST_BY_RUN = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_RUN}"
+URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL = (
+    f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL}"
+)
 URL_SEQUENCED_SAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY}"
 URL_SEQUENCED_SAMPLE_LIST_BY_POOL = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_POOL}"
 )
 URL_SEQUENCED_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_SEQUENCED_SAMPLE_PREFIX}"
 URL_SEQUENCED_SAMPLE_BY_IDX = f"{URL_SEQUENCED_SAMPLE_PREFIX}{PATH_SEQUENCED_SAMPLE_BY_IDX}"
+
+
+# =============================================================================
+# /prep-sample/* — prep-sample reads (study membership)
+# =============================================================================
+# The study list returns richer per-study rows (study_idx + both accessions)
+# as StudyListResponse, hence the `list` segment rather than `list-idxs`.
+
+PATH_PREP_SAMPLE_PREFIX = "/prep-sample"
+PATH_PREP_SAMPLE_STUDY_LIST = "/{prep_sample_idx}/study/list"
+
+URL_PREP_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_PREFIX}"
+URL_PREP_SAMPLE_STUDY_LIST = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}"

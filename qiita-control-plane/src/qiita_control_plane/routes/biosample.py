@@ -86,6 +86,7 @@ from ..repositories.biosample_metadata import (
 )
 from ._helpers import (
     GENERIC_FK_VIOLATION,
+    build_idxs_list_response,
     detail_for_slot_collision,
     etag_for_updated_at,
     raise_for_transient_write_race,
@@ -312,18 +313,12 @@ async def list_biosample_idxs_in_study(
     scope.
     """
     # Fetch cap+1 rows so a count strictly greater than the cap signals
-    # truncation; the route slices back to the cap before returning.
+    # truncation; build_idxs_list_response slices back to the cap.
     rows = await fetch_biosample_idxs_for_study(
         pool, study_idx=study_idx, limit=_BIOSAMPLE_IDXS_HARD_CAP + 1
     )
-    truncated = len(rows) > _BIOSAMPLE_IDXS_HARD_CAP
-    if truncated:
-        rows = rows[:_BIOSAMPLE_IDXS_HARD_CAP]
-    return IdxsListResponse(
-        idxs=rows,
-        count=len(rows),
-        truncated=truncated,
-        caller_system_role=user.system_role,
+    return build_idxs_list_response(
+        rows, cap=_BIOSAMPLE_IDXS_HARD_CAP, caller_system_role=user.system_role
     )
 
 

@@ -2,9 +2,12 @@
 
 Three routers live here. The run-scoped router (prefix=/sequencing-run)
 carries the per-item import composer (POST
-/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample)
-and the run-scoped bulk-id read (GET
-/sequencing-run/{run_idx}/sequenced-sample/list-idxs). The study-scoped
+/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/sequenced-sample) and
+the sequenced-sample list reads scoped to a run or one of its pools —
+bare idxs (GET /sequencing-run/{run_idx}/sequenced-sample/list-idxs) and
+the richer per-sample rows (GET
+/sequencing-run/{run_idx}/sequenced-sample/list and the pool-scoped
+.../sequenced-pool/{pool_idx}/sequenced-sample/list). The study-scoped
 router (prefix=/study) carries the study-scoped bulk-id read (GET
 /study/{study_idx}/sequenced-sample/list-idxs). The
 sequenced-sample-scoped router (prefix=/sequenced-sample) carries the
@@ -44,6 +47,7 @@ from qiita_common.api_paths import (
     PATH_SEQUENCED_SAMPLE_FROM_RUN,
     PATH_SEQUENCED_SAMPLE_LIST_BY_POOL,
     PATH_SEQUENCED_SAMPLE_LIST_BY_RUN,
+    PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL,
     PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY,
     PATH_SEQUENCED_SAMPLE_PREFIX,
     PATH_SEQUENCING_RUN_PREFIX,
@@ -92,11 +96,13 @@ from ..repositories.sequenced_sample import (
     fetch_sequenced_sample_idxs_for_run,
     fetch_sequenced_sample_idxs_for_study,
     fetch_sequenced_sample_with_prep_sample,
+    fetch_sequenced_samples_for_run,
     import_sequenced_prep_sample,
     update_sequenced_sample,
 )
 from ._helpers import (
     GENERIC_FK_VIOLATION,
+    build_idxs_list_response,
     detail_for_biosample_link_rejection,
     detail_for_slot_collision,
     etag_for_updated_at,
@@ -287,11 +293,12 @@ async def import_sequenced_sample_from_run(
     )
 
 
-# Hard cap on the bulk-id read.
+# Hard cap on the sequenced_sample roster read, shared by this module's
+# idx-list and full-row list routes alike.
 # The biosample roster cap happens to share this numeric value, but the
 # two bound conceptually distinct rosters and are sized independently;
 # they are intentionally not factored into a shared constant.
-_SEQUENCED_SAMPLE_IDXS_HARD_CAP = 500_000
+_SEQUENCED_SAMPLE_HARD_CAP = 500_000
 
 
 @router.get(PATH_SEQUENCED_SAMPLE_LIST_BY_RUN)
@@ -314,20 +321,14 @@ async def list_sequenced_sample_idxs_in_run(
     the hard cap; callers hitting it should narrow their scope.
     """
     # Fetch cap+1 rows so a count strictly greater than the cap signals
-    # truncation; the route slices back to the cap before returning.
+    # truncation; build_idxs_list_response slices back to the cap.
     rows = await fetch_sequenced_sample_idxs_for_run(
         pool,
         sequencing_run_idx=sequencing_run_idx,
-        limit=_SEQUENCED_SAMPLE_IDXS_HARD_CAP + 1,
+        limit=_SEQUENCED_SAMPLE_HARD_CAP + 1,
     )
-    truncated = len(rows) > _SEQUENCED_SAMPLE_IDXS_HARD_CAP
-    if truncated:
-        rows = rows[:_SEQUENCED_SAMPLE_IDXS_HARD_CAP]
-    return IdxsListResponse(
-        idxs=rows,
-        count=len(rows),
-        truncated=truncated,
-        caller_system_role=user.system_role,
+    return build_idxs_list_response(
+        rows, cap=_SEQUENCED_SAMPLE_HARD_CAP, caller_system_role=user.system_role
     )
 
 
@@ -362,11 +363,51 @@ async def list_sequenced_samples_in_pool(
     rows = await fetch_sequenced_pool_samples(
         pool,
         sequenced_pool_idx=sequenced_pool_idx,
-        limit=_SEQUENCED_SAMPLE_IDXS_HARD_CAP + 1,
+        limit=_SEQUENCED_SAMPLE_HARD_CAP + 1,
     )
-    truncated = len(rows) > _SEQUENCED_SAMPLE_IDXS_HARD_CAP
+    truncated = len(rows) > _SEQUENCED_SAMPLE_HARD_CAP
     if truncated:
-        rows = rows[:_SEQUENCED_SAMPLE_IDXS_HARD_CAP]
+        rows = rows[:_SEQUENCED_SAMPLE_HARD_CAP]
+    return SequencedSampleListResponse(
+        samples=[SequencedSampleListItem.model_validate(dict(r)) for r in rows],
+        count=len(rows),
+        truncated=truncated,
+        caller_system_role=user.system_role,
+    )
+
+
+@router.get(PATH_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL)
+async def list_sequenced_samples_in_run(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _run_exists: None = Depends(require_sequencing_run_exists),
+) -> SequencedSampleListResponse:
+    """List a run's active sequenced_samples — across every pool in the run —
+    with their biosample linkage and ENA/biosample accessions.
+
+    Run-scoped sibling of `list_sequenced_samples_in_pool`: same richer
+    per-sample shape and the same gate (HumanUser, Scope.PREP_SAMPLE_READ,
+    system_role at least wet_lab_admin), but spans every pool in the path's
+    run instead of one pool. require_sequencing_run_exists fires a 404 for an
+    unknown run. Excludes rows whose supertype prep_sample is retired; the
+    `truncated` flag indicates the underlying set exceeded the hard cap.
+    """
+    # Fetch cap+1 rows so a count strictly greater than the cap signals
+    # truncation; the route slices back to the cap before returning.
+    rows = await fetch_sequenced_samples_for_run(
+        pool,
+        sequencing_run_idx=sequencing_run_idx,
+        limit=_SEQUENCED_SAMPLE_HARD_CAP + 1,
+    )
+    truncated = len(rows) > _SEQUENCED_SAMPLE_HARD_CAP
+    if truncated:
+        rows = rows[:_SEQUENCED_SAMPLE_HARD_CAP]
+    # same-pattern-ok: run-scoped twin of list_sequenced_samples_in_pool's
+    # envelope; the scope variants are kept as separate routes, not
+    # parameterized into one shared pool/run handler
     return SequencedSampleListResponse(
         samples=[SequencedSampleListItem.model_validate(dict(r)) for r in rows],
         count=len(rows),
@@ -400,20 +441,14 @@ async def list_sequenced_sample_idxs_in_study(
     the hard cap; callers hitting it should narrow their scope.
     """
     # Fetch cap+1 rows so a count strictly greater than the cap signals
-    # truncation; the route slices back to the cap before returning.
+    # truncation; build_idxs_list_response slices back to the cap.
     rows = await fetch_sequenced_sample_idxs_for_study(
         pool,
         study_idx=study_idx,
-        limit=_SEQUENCED_SAMPLE_IDXS_HARD_CAP + 1,
+        limit=_SEQUENCED_SAMPLE_HARD_CAP + 1,
     )
-    truncated = len(rows) > _SEQUENCED_SAMPLE_IDXS_HARD_CAP
-    if truncated:
-        rows = rows[:_SEQUENCED_SAMPLE_IDXS_HARD_CAP]
-    return IdxsListResponse(
-        idxs=rows,
-        count=len(rows),
-        truncated=truncated,
-        caller_system_role=user.system_role,
+    return build_idxs_list_response(
+        rows, cap=_SEQUENCED_SAMPLE_HARD_CAP, caller_system_role=user.system_role
     )
 
 

@@ -25,6 +25,7 @@ from qiita_common.api_paths import (
     URL_SEQUENCED_SAMPLE_FROM_RUN,
     URL_SEQUENCED_SAMPLE_LIST_BY_POOL,
     URL_SEQUENCED_SAMPLE_LIST_BY_RUN,
+    URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL,
     URL_SEQUENCED_SAMPLE_LIST_BY_STUDY,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
@@ -43,6 +44,7 @@ from .conftest import (
     OWNER_INELIGIBILITY_KINDS,
     IneligibilityKind,
     _grant_study_access,
+    _seed_study,
     assert_owner_ineligibility_422,
     assert_submission_error_cleared_on_new_attempt,
     delete_idxs,
@@ -176,18 +178,6 @@ async def ctx(role_keyed_clients):
 # ---------------------------------------------------------------------------
 # Test-local seed helpers
 # ---------------------------------------------------------------------------
-
-
-async def _seed_study(ctx, *, owner_idx: int, suffix: str) -> int:
-    """Insert a minimal study row and track it."""
-    idx = await ctx["pool"].fetchval(
-        "INSERT INTO qiita.study (owner_idx, title, created_by_idx)"
-        " VALUES ($1, $2, $1) RETURNING idx",
-        owner_idx,
-        f"ss-route-study-{suffix}-{secrets.token_hex(4)}",
-    )
-    ctx["created"]["study"].append(idx)
-    return idx
 
 
 async def _seed_biosample_linked_to_study(ctx, *, owner_idx: int, study_idx: int) -> int:
@@ -1396,7 +1386,7 @@ async def test_list_sequenced_sample_idxs_truncated(ctx, monkeypatch):
     # to the cap. The route reads the cap as a module global at call
     # time, so monkeypatching the attribute takes effect.
     monkeypatch.setattr(
-        "qiita_control_plane.routes.sequenced_sample._SEQUENCED_SAMPLE_IDXS_HARD_CAP",
+        "qiita_control_plane.routes.sequenced_sample._SEQUENCED_SAMPLE_HARD_CAP",
         1,
     )
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "list-trunc")
@@ -1559,9 +1549,11 @@ async def test_list_sequenced_sample_idxs_nonexistent_run_404(ctx):
 
 
 async def _seed_pool_sample(ctx, *, run_idx, pool_idx, study_idx, protocol_idx, suffix):
-    """Land one sequenced_sample on the given (run, pool) and return the
-    {sequenced_sample_idx, prep_sample_idx, sequenced_pool_item_id} the
-    pool-scoped list is expected to surface."""
+    """Land one sequenced_sample on the given (run, pool) and return the full
+    SequencedSampleListItem dict the pool- and run-scoped lists are expected to
+    surface. A freshly-seeded sample carries no ENA accessions and its minimal
+    biosample carries no biosample/ena-sample accessions, so all four accession
+    fields are None."""
     bs = await _seed_biosample_linked_to_study(
         ctx, owner_idx=ctx["wet_session"]["principal_idx"], study_idx=study_idx
     )
@@ -1582,7 +1574,12 @@ async def _seed_pool_sample(ctx, *, run_idx, pool_idx, study_idx, protocol_idx, 
     return {
         "sequenced_sample_idx": rj["sequenced_sample_idx"],
         "prep_sample_idx": rj["prep_sample_idx"],
+        "biosample_idx": bs,
         "sequenced_pool_item_id": item_id,
+        "ena_experiment_accession": None,
+        "ena_run_accession": None,
+        "biosample_accession": None,
+        "ena_sample_accession": None,
     }
 
 
@@ -1682,7 +1679,7 @@ async def test_list_pool_samples_excludes_retired_prep_sample(ctx):
 async def test_list_pool_samples_truncated(ctx, monkeypatch):
     # cap=1 forces the truncation branch on two seeded rows.
     monkeypatch.setattr(
-        "qiita_control_plane.routes.sequenced_sample._SEQUENCED_SAMPLE_IDXS_HARD_CAP",
+        "qiita_control_plane.routes.sequenced_sample._SEQUENCED_SAMPLE_HARD_CAP",
         1,
     )
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "pool-trunc")
@@ -2032,7 +2029,7 @@ async def test_list_sequenced_sample_idxs_in_study_truncated(ctx, monkeypatch):
     # slices back to the cap. The route reads the cap as a module global
     # at call time, so monkeypatching the attribute takes effect.
     monkeypatch.setattr(
-        "qiita_control_plane.routes.sequenced_sample._SEQUENCED_SAMPLE_IDXS_HARD_CAP",
+        "qiita_control_plane.routes.sequenced_sample._SEQUENCED_SAMPLE_HARD_CAP",
         1,
     )
     study_idx = await _seed_study(
@@ -2827,3 +2824,168 @@ async def test_patch_sequenced_sample_supertype_field_422(ctx):
         headers={"If-Match": pre_etag},
     )
     assert resp.status_code == 422
+
+
+# ===========================================================================
+# GET /api/v1/sequencing-run/{run}/sequenced-sample/list (run-scoped, full rows)
+# ===========================================================================
+#
+# Run-scoped sibling of the pool-scoped list: returns the richer
+# SequencedSampleListItem rows for every active sequenced_sample across all
+# pools in the run. Auth mirrors the pool list (Scope.PREP_SAMPLE_READ +
+# wet_lab_admin); require_sequencing_run_exists 404s an unknown run.
+
+
+async def _seed_second_pool_on_run(ctx, run_idx, *, suffix: str) -> int:
+    """Insert a second sequenced_pool on an existing run; track + return its idx."""
+    pool_idx = await ctx["pool"].fetchval(
+        "INSERT INTO qiita.sequenced_pool"
+        " (sequencing_run_idx, run_preflight_blob, run_preflight_filename, created_by_idx)"
+        " VALUES ($1, $2, $3, $4) RETURNING idx",
+        run_idx,
+        b"\x00\x01",
+        f"preflight-{suffix}.sqlite",
+        ctx["wet_session"]["principal_idx"],
+    )
+    ctx["created"]["sequenced_pool"].append(pool_idx)
+    return pool_idx
+
+
+async def test_list_run_samples_returns_items_across_pools(ctx):
+    # A run with two pools, one sample each: the run-scoped list aggregates
+    # every active sequenced_sample across the run, ascending by idx.
+    run_idx, pool_a = await _seed_run_and_pool(ctx, "run-list")
+    pool_b = await _seed_second_pool_on_run(ctx, run_idx, suffix="run-list-b")
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="run-list"
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    s_a = await _seed_pool_sample(
+        ctx,
+        run_idx=run_idx,
+        pool_idx=pool_a,
+        study_idx=study_idx,
+        protocol_idx=protocol_idx,
+        suffix="RUN-A",
+    )
+    s_b = await _seed_pool_sample(
+        ctx,
+        run_idx=run_idx,
+        pool_idx=pool_b,
+        study_idx=study_idx,
+        protocol_idx=protocol_idx,
+        suffix="RUN-B",
+    )
+
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL.format(sequencing_run_idx=run_idx)
+    )
+    assert resp.status_code == 200, resp.text
+    expected = {
+        "samples": sorted([s_a, s_b], key=lambda s: s["sequenced_sample_idx"]),
+        "count": 2,
+        "truncated": False,
+        "caller_system_role": "wet_lab_admin",
+    }
+    assert resp.json() == expected
+
+
+async def test_list_run_samples_surfaces_accessions(ctx):
+    # The four accession columns surface from the join: set them on the
+    # sequenced_sample (ENA) and its biosample, then confirm the row carries
+    # the values rather than the null placeholders a fresh sample shows.
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "run-acc")
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="run-acc"
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    sample = await _seed_pool_sample(
+        ctx,
+        run_idx=run_idx,
+        pool_idx=pool_idx,
+        study_idx=study_idx,
+        protocol_idx=protocol_idx,
+        suffix="RUN-ACC",
+    )
+    ss_idx = sample["sequenced_sample_idx"]
+    bs_idx = sample["biosample_idx"]
+    # idx-derived accessions keep the UNIQUE constraints collision-free.
+    await ctx["pool"].execute(
+        "UPDATE qiita.sequenced_sample"
+        " SET ena_experiment_accession = $2, ena_run_accession = $3 WHERE idx = $1",
+        ss_idx,
+        f"ERX-{ss_idx}",
+        f"ERR-{ss_idx}",
+    )
+    await ctx["pool"].execute(
+        "UPDATE qiita.biosample"
+        " SET biosample_accession = $2, ena_sample_accession = $3 WHERE idx = $1",
+        bs_idx,
+        f"SAMEA-{bs_idx}",
+        f"ERS-{bs_idx}",
+    )
+
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL.format(sequencing_run_idx=run_idx)
+    )
+    assert resp.status_code == 200, resp.text
+    expected_item = {
+        **sample,
+        "ena_experiment_accession": f"ERX-{ss_idx}",
+        "ena_run_accession": f"ERR-{ss_idx}",
+        "biosample_accession": f"SAMEA-{bs_idx}",
+        "ena_sample_accession": f"ERS-{bs_idx}",
+    }
+    assert resp.json()["samples"] == [expected_item]
+
+
+async def test_list_run_samples_empty(ctx):
+    # A run with no sequenced_samples returns the zero-row envelope.
+    run_idx, _pool_idx = await _seed_run_and_pool(ctx, "run-empty")
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL.format(sequencing_run_idx=run_idx)
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "samples": [],
+        "count": 0,
+        "truncated": False,
+        "caller_system_role": "wet_lab_admin",
+    }
+
+
+async def test_list_run_samples_unknown_run_404(ctx):
+    max_run = await ctx["pool"].fetchval("SELECT COALESCE(MAX(idx), 0) FROM qiita.sequencing_run")
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL.format(sequencing_run_idx=max_run + 100_000)
+    )
+    assert resp.status_code == 404
+    assert "sequencing_run" in resp.json()["detail"]
+
+
+async def test_list_run_samples_regular_user_role_403(ctx):
+    run_idx, _pool_idx = await _seed_run_and_pool(ctx, "run-user")
+    resp = await ctx["user"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL.format(sequencing_run_idx=run_idx)
+    )
+    assert resp.status_code == 403
+    assert "wet_lab_admin" in resp.json()["detail"]
+
+
+async def test_list_run_samples_anonymous_401(ctx):
+    run_idx, _pool_idx = await _seed_run_and_pool(ctx, "run-anon")
+    app.state.pool = ctx["pool"]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
+        resp = await anon.get(
+            URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL.format(sequencing_run_idx=run_idx)
+        )
+    assert resp.status_code == 401
+
+
+async def test_list_run_samples_missing_scope_403(ctx, no_prep_sample_read_client):
+    run_idx, _pool_idx = await _seed_run_and_pool(ctx, "run-noscope")
+    resp = await no_prep_sample_read_client.get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL.format(sequencing_run_idx=run_idx)
+    )
+    assert resp.status_code == 403
+    assert "prep_sample:read" in resp.json()["detail"]

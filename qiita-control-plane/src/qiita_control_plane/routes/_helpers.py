@@ -9,7 +9,7 @@ from datetime import datetime
 
 import asyncpg
 from fastapi import HTTPException
-from qiita_common.models import MissingReasonRef, TerminologyTermRef
+from qiita_common.models import IdxsListResponse, MissingReasonRef, TerminologyTermRef
 
 from ..repositories._sample_helpers import (
     ConflictingValueDifferentStudyError,
@@ -347,3 +347,23 @@ async def resolve_idxs_by_natural_key(
     resolved = await fetcher(dedup_ordered)
     missing = [v for v in dedup_ordered if v not in resolved]
     return resolved, missing
+
+
+def build_idxs_list_response(
+    idxs: list[int], *, cap: int, caller_system_role: str
+) -> IdxsListResponse:
+    """Build the capped IdxsListResponse envelope.
+
+    `idxs` is the already-fetched list; callers fetch `cap + 1` rows so a
+    length strictly greater than `cap` signals the underlying set overflowed.
+    Slices back to `cap` and sets `truncated` accordingly, centralizing the
+    fetch-cap-plus-one / slice / envelope shaping in one place.
+    """
+    truncated = len(idxs) > cap
+    kept = idxs[:cap] if truncated else idxs
+    return IdxsListResponse(
+        idxs=kept,
+        count=len(kept),
+        truncated=truncated,
+        caller_system_role=caller_system_role,
+    )
