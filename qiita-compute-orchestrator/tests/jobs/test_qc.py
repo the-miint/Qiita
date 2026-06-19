@@ -120,10 +120,10 @@ def test_qc_routes_se_pe_and_unions(tmp_path, monkeypatch, write_reads, read_sur
 
     assert seen["se_ids"] == [10, 30]
     assert seen["pe_ids"] == [20, 40]
-    assert read_survivors(out["qc_reads"]) == [10, 20, 40]
-    assert _schema(out["qc_reads"]) == _READS_SCHEMA
+    assert read_survivors(out["reads"]) == [10, 20, 40]
+    assert _schema(out["reads"]) == _READS_SCHEMA
     # 10 is SE (R2 NULL); 20, 40 are PE (R2 not NULL).
-    assert _rows(out["qc_reads"]) == [(10, True), (20, False), (40, False)]
+    assert _rows(out["reads"]) == [(10, True), (20, False), (40, False)]
 
 
 @pytest.mark.parametrize(
@@ -220,9 +220,9 @@ def test_qc_empty_output_when_all_dropped(tmp_path, monkeypatch, write_reads, re
         work_ticket_idx=1,
     )
     out = asyncio.run(qc.execute(inputs, tmp_path / "ws"))
-    assert out["qc_reads"].exists()
-    assert read_survivors(out["qc_reads"]) == []
-    assert _schema(out["qc_reads"]) == _READS_SCHEMA
+    assert out["reads"].exists()
+    assert read_survivors(out["reads"]) == []
+    assert _schema(out["reads"]) == _READS_SCHEMA
 
 
 def test_qc_missing_reads_raises(tmp_path):

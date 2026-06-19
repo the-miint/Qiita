@@ -65,13 +65,13 @@ YAML_STEP_NAME = "qc"
 # final sorted COPY — no out-of-heap co-consumer (unlike host_filter's rype /
 # minimap2 runtimes, which is why host_filter deliberately does NOT do this), so
 # the whole footprint IS DuckDB's. Hence `_DUCKDB_MEMORY_GB` is only the
-# OFF-SLURM fallback: under SLURM the real cap is sized to the cgroup via
+# OFF-SLURM fallback cap: under SLURM the real cap is sized to the cgroup via
 # `resolve_duckdb_memory_gb()` (SLURM_MEM_PER_NODE) so a per-run `--mem-gb`
 # override reaches DuckDB's `memory_limit` — the same allocation-aware pattern
-# stage_local_fasta / hash_sequences use. The fallback mirrors the
-# fastq-to-parquet/1.2.0 YAML's qc step baseline_resources (a mismatch is visible
-# at review); bump the YAML mem_gb (and this fallback) together when sized
-# against a real genome-scale sample.
+# stage_local_fasta / hash_sequences use. The fastq-to-parquet/1.2.0 YAML's qc
+# step allocates mem_gb=12, which lands DuckDB near this 8 GB fallback after the
+# 4-thread headroom; bump the YAML mem_gb when sized against a real
+# genome-scale sample (this fallback only bites the local backend / tests).
 _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
 
@@ -317,4 +317,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         if not success:
             qc_reads.unlink(missing_ok=True)
 
-    return {"qc_reads": qc_reads}
+    # Output binding is `reads` (not `qc_reads`): qc is a transform in the
+    # fastq -> qc -> host_filter chain, re-emitting the same logical `reads`
+    # artifact the next step consumes. The runner has no input aliasing — a
+    # step's wire input name must equal the downstream job's `Inputs` field — and
+    # host_filter (shared with 1.1.0's fastq -> host_filter) reads `reads`, so the
+    # binding stays `reads`. The on-disk file is qc_reads.parquet for provenance.
+    return {"reads": qc_reads}

@@ -378,6 +378,7 @@ async def _run(
     workspace_root: Path,
     *,
     upload_staging_root: Path | None = None,
+    default_adapter_reference_idx: int | None = None,
     resume: bool = False,
 ) -> None:
     from qiita_control_plane.runner import run_workflow
@@ -397,6 +398,7 @@ async def _run(
         data_plane_url="grpc://unused:0",
         work_ticket_workspace_root=workspace_root,
         upload_staging_root=effective_upload_root,
+        default_adapter_reference_idx=default_adapter_reference_idx,
         # 0 so any (accidental) poll loop spins instantly; the local-like
         # fakes complete synchronously at submit and never poll anyway.
         poll_interval_seconds=0,
@@ -2302,6 +2304,167 @@ async def test_workflow_needs_adapters_detects_adapter_input():
     with_qc = [SimpleNamespace(inputs=["reads", "adapter_fasta"], optional_inputs=[])]
     assert _workflow_needs_adapters(no_qc) is False
     assert _workflow_needs_adapters(with_qc) is True
+
+
+# =============================================================================
+# fastq-to-parquet/1.2.0 step wiring (fastq -> qc -> host_filter)
+# =============================================================================
+#
+# The 1.2.0 chain inserts an always-on `qc` step between fastq and host_filter.
+# Each stage re-emits the `reads` binding it consumes (a transform in place), so
+# host_filter is identical to 1.1.0 and consumes qc's QC'd `reads`. The qc step
+# takes the runner-materialized `adapter_fasta` as a PATH input and the sequencing
+# `instrument_model` as a scalar `params` value.
+
+_FASTQ_TO_PARQUET_V12_STEPS = [
+    {
+        "kind": "step",
+        "name": "fastq",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
+        "inputs": ["fastq_path"],
+        "optional_inputs": ["reverse_fastq_path"],
+        "outputs": ["reads"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    {
+        "kind": "step",
+        "name": "qc",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.qc",
+        "inputs": ["reads", "adapter_fasta"],
+        "params": {"instrument_model": "instrument_model"},
+        "outputs": ["reads"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    {
+        "kind": "step",
+        "name": "host_filter",
+        "step_type": "singleton",
+        "module": "qiita_compute_orchestrator.jobs.host_filter",
+        "inputs": ["reads"],
+        "optional_inputs": ["host_rype_path", "host_minimap2_path"],
+        "outputs": ["filtered_reads"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+]
+
+
+async def _make_v12_ticket(
+    pool, prep_sample_idx: int, principal_idx: int, action_context: dict
+) -> tuple[int, str]:
+    """Insert a fastq-to-parquet/1.2.0-shaped action (the _FASTQ_TO_PARQUET_V12_STEPS
+    shape) + a pending prep_sample-scoped work_ticket. Returns (work_ticket_idx,
+    version) for cleanup."""
+    version = f"fastq-to-parquet-v12-{uuid.uuid4()}"
+    await pool.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, scopes, audience,"
+        "  context_schema, steps, cpu_ceiling, mem_ceiling_gb, walltime_ceiling,"
+        "  success_status, failure_status"
+        ") VALUES ('fastq-to-parquet', $1, 'prep_sample', $2::text[], $3::jsonb,"
+        "  '{}'::jsonb, $4::jsonb, 8, 16, '4 hours', NULL, 'failed')",
+        version,
+        [],
+        json.dumps({"service": False, "human_roles": ["user"]}),
+        json.dumps(_FASTQ_TO_PARQUET_V12_STEPS),
+    )
+    wt_idx = await pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, prep_sample_idx, action_context"
+        ") VALUES ('fastq-to-parquet', $1, $2, 'prep_sample', $3, $4::jsonb)"
+        " RETURNING work_ticket_idx",
+        version,
+        principal_idx,
+        prep_sample_idx,
+        json.dumps(action_context),
+    )
+    return wt_idx, version
+
+
+async def test_fastq_to_parquet_v12_qc_binds_adapter_and_instrument_model(
+    postgres_pool, reference_idx, human_admin_session, tmp_path, monkeypatch
+):
+    """End-to-end 1.2.0 wiring: the runner dispatches fastq → qc → host_filter in
+    order; qc receives `reads` (fastq's output) and the runner-materialized
+    `adapter_fasta` as PATH inputs plus `instrument_model` via params; and
+    host_filter consumes the `reads` binding qc re-emitted (the QC'd output, not
+    fastq's raw reads)."""
+    from qiita_control_plane import runner
+    from qiita_control_plane.testing.db_seeds import seed_biosample_with_sequenced_prep_sample
+
+    principal_idx = human_admin_session["principal_idx"]
+    _bio_idx, prep_sample_idx = await seed_biosample_with_sequenced_prep_sample(
+        postgres_pool, owner_idx=principal_idx
+    )
+
+    # Configured artifact_sequence_set adapter reference + a stubbed DoGet so the
+    # pre-loop adapter materialization writes a real adapters.fasta.
+    await _make_adapter_reference(postgres_pool, reference_idx)
+    monkeypatch.setattr(
+        runner,
+        "_do_get_reference_sequence_chunks",
+        lambda _url, _t: [(1, 0, "AGATCGGAAGAGC")],
+    )
+
+    backend = FakeBackendClient()
+    backend.outputs_for["fastq"] = {"reads": tmp_path / "fastq_out" / "reads.parquet"}
+    backend.outputs_for["qc"] = {"reads": tmp_path / "qc_out" / "qc_reads.parquet"}
+    backend.outputs_for["host_filter"] = {
+        "filtered_reads": tmp_path / "hf_out" / "filtered_reads.parquet"
+    }
+
+    # host_filter_enabled absent → host filtering off (no index paths bound).
+    wt_idx, version = await _make_v12_ticket(
+        postgres_pool,
+        prep_sample_idx,
+        principal_idx,
+        {"fastq_path": "/data/sample.fastq", "instrument_model": "NextSeq 550"},
+    )
+    try:
+        await _run(
+            wt_idx,
+            postgres_pool,
+            backend,
+            tmp_path / "ws",
+            default_adapter_reference_idx=reference_idx,
+        )
+
+        # Step order.
+        assert [name for name, *_ in backend.calls] == ["fastq", "qc", "host_filter"]
+
+        # qc inputs: `reads` is fastq's output path; `adapter_fasta` is the
+        # runner-materialized canonical set (a real file on disk); `instrument_model`
+        # rides through `params` as a string (not Path-coerced).
+        qc_inputs = next(inp for name, inp, *_ in backend.calls if name == "qc")
+        assert qc_inputs["reads"] == backend.outputs_for["fastq"]["reads"]
+        assert qc_inputs["adapter_fasta"].name == "adapters.fasta"
+        assert qc_inputs["adapter_fasta"].exists()
+        assert qc_inputs["instrument_model"] == "NextSeq 550"
+
+        # host_filter consumes the `reads` binding qc re-emitted (the QC'd output),
+        # NOT fastq's raw reads — proving the in-place transform chaining. Host
+        # filtering is off, so no index paths are bound.
+        hf_inputs = next(inp for name, inp, *_ in backend.calls if name == "host_filter")
+        assert hf_inputs["reads"] == backend.outputs_for["qc"]["reads"]
+        assert "host_rype_path" not in hf_inputs
+        assert "host_minimap2_path" not in hf_inputs
+
+        state = await postgres_pool.fetchval(
+            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt_idx
+        )
+        assert state == "completed"
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", wt_idx
+        )
+        await postgres_pool.execute(
+            "DELETE FROM qiita.action WHERE action_id = 'fastq-to-parquet' AND version = $1",
+            version,
+        )
+        await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx)
+        await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", _bio_idx)
 
 
 async def test_run_workflow_fails_ticket_on_host_filter_resolution_error(

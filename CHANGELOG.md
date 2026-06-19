@@ -15,6 +15,15 @@ the `no-changelog` label).
 
 ### Added
 
+- New `fastq-to-parquet/1.2.0` workflow: an additive successor to 1.1.0 that
+  inserts an ALWAYS-ON `qc` step between `fastq` and `host_filter`
+  (`fastq → qc → host_filter`). Each stage re-emits the `reads` binding it
+  consumes (a transform in place), so `host_filter` is identical to 1.1.0 and
+  consumes the QC'd reads. `context_schema` gains `instrument_model` (forwarded to
+  qc's polyG gate via the step's `params`) and the two-reference host-filter keys
+  (`host_rype_reference_idx` + optional `host_minimap2_reference_idx`); the qc
+  step lists `adapter_fasta`, which triggers the runner's adapter materialization.
+  1.0.0 and 1.1.0 stay available unchanged (#TBD)
 - Verified and documented the duckdb-miint fastp-port QC functions
   (`filter_read`, `trim_adapters` / `trim_adapters_pe`, `trim_polyg`) that the
   upcoming `qc` native job builds on. New

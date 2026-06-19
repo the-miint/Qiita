@@ -81,9 +81,9 @@ def test_qc_smoke_se_adapter_trim_and_length_filter(tmp_path, write_reads_q, rea
         work_ticket_idx=1,
     )
     out = asyncio.run(qc.execute(inputs, tmp_path / "ws"))
-    assert read_survivors(out["qc_reads"]) == [10]
+    assert read_survivors(out["reads"]) == [10]
     # adapter removed -> the bare insert is recovered.
-    assert _read_seqs(out["qc_reads"])[10] == _INSERT
+    assert _read_seqs(out["reads"])[10] == _INSERT
 
 
 def test_qc_smoke_pe_pair_drop_when_one_mate_short(tmp_path, write_reads_q, read_survivors):
@@ -109,7 +109,7 @@ def test_qc_smoke_pe_pair_drop_when_one_mate_short(tmp_path, write_reads_q, read
         work_ticket_idx=1,
     )
     out = asyncio.run(qc.execute(inputs, tmp_path / "ws"))
-    assert read_survivors(out["qc_reads"]) == [30]
+    assert read_survivors(out["reads"]) == [30]
 
 
 def test_qc_smoke_polyg_gated_on_instrument(tmp_path, write_reads_q, read_survivors):
@@ -142,7 +142,7 @@ def test_qc_smoke_polyg_gated_on_instrument(tmp_path, write_reads_q, read_surviv
 
     # Both survive (>= 100 nt either way), but only the 2-color run had its G-run
     # trimmed back to the bare insert.
-    assert read_survivors(ns_out["qc_reads"]) == [50]
-    assert read_survivors(ms_out["qc_reads"]) == [50]
-    assert _read_seqs(ns_out["qc_reads"])[50] == _INSERT
-    assert _read_seqs(ms_out["qc_reads"])[50] == seq
+    assert read_survivors(ns_out["reads"]) == [50]
+    assert read_survivors(ms_out["reads"]) == [50]
+    assert _read_seqs(ns_out["reads"])[50] == _INSERT
+    assert _read_seqs(ms_out["reads"])[50] == seq
