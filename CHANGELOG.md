@@ -220,6 +220,10 @@ the `no-changelog` label).
 
 ### Changed
 
+- The `stage_local_fasta` native job now caps `read_fastx`'s per-batch buffer at
+  128MB (was 512MB), lowering peak memory during FASTA staging. One of the job's
+  three memory levers, alongside the DuckDB `memory_limit`/`temp_directory` spill
+  and the Parquet write buffer (#137)
 - Retired the manual "rebuild the SIF" deploy step now that the deploy
   auto-builds. `/deploy-note` and `CLAUDE.md` ("Container image tier") now direct
   a container-artifact change to a Notes entry + an optional verify, never a

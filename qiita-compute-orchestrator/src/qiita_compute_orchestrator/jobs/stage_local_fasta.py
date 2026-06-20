@@ -85,7 +85,7 @@ _DUCKDB_THREADS = 8
 # chunking operator runs. One of three memory levers — the others are the
 # `memory_limit`/`temp_directory` spill (apply_duckdb_settings) and the write
 # buffer (`ROW_GROUP_SIZE` in PARQUET_OPTS_CHUNKED).
-_READ_FASTX_MAX_BATCH_BYTES = "512MB"
+_READ_FASTX_MAX_BATCH_BYTES = "128MB"
 
 # Cap on how many offending read_ids we name in a fail-fast error so a
 # pathologically bad manifest doesn't build a multi-megabyte message.
