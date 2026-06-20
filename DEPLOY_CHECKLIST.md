@@ -31,6 +31,38 @@ _None yet._
 
 ### 5. Verify
 
+_None yet._
+
+### Notes (no host action)
+
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-19 — 1ad104b
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
+_None yet._
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
+
 - (#134) Confirm the auto-rebuilt bcl-convert SIF installed bcl-convert from the
   new `/opt` staging path. Run home-independently (`cd /tmp` + `--no-home`, since
   deploys run from an NFS home and `qiita-orch`'s home is `/dev/null`):
@@ -44,7 +76,7 @@ _None yet._
 
   Expect `bcl-convert Version 4.5.4`.
 
-### Notes (no host action)
+#### Notes (no host action)
 
 - (#134) The bcl-convert SIF **auto-rebuilds on the next deploy** — `Apptainer.def`
   changed (the licensed RPM now stages to `/opt`, not the bind-mounted `/tmp`, so
@@ -53,12 +85,6 @@ _None yet._
   it during the deploy; no manual `build-sif.sh` step. Needs the licensed RPM still
   staged under `${PATH_DERIVED}/images/sources/` (already there) — if absent, the
   auto-build skips with a warning. No new env var, host dir, scope, or migration.
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-19 — 50b85df
 
