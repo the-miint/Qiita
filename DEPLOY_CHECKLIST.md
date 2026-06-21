@@ -35,7 +35,17 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- (#140) `stage_local_fasta` resource retune in `local-host-reference-add/1.0.0`
+  (`cpu: 8`/`mem_gb: 32` → `cpu: 4`/`mem_gb: 64`; still within the `cpu: 16`/`mem_gb: 64`
+  ceiling). The `workflows/local-host-reference-add/1.0.0.yaml` entry is **edited in
+  place** — re-synced into `qiita.action` by `qiita-admin actions sync` inside
+  `activate.sh` (already covered by bucket 5's `qiita.action` list check), **not** a
+  migration. No client breakage, no new env var, host dir, scope, or migration.
+- (#140) Parquet result files are now written with `ROW_GROUP_SIZE_BYTES '64MB'`
+  (smaller row groups: finer pushdown, lower write memory). Code-only write-side
+  tuning; the data plane reads these files via the same pinned DuckDB 1.5.4, the
+  format is unchanged, and output stays clustered on the `ORDER BY` key, so DuckLake
+  registration + pruning are unaffected. No host action, env var, scope, or migration.
 
 ---
 

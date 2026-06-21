@@ -82,8 +82,8 @@ steps:
     # re-emits, so there is no minimap2-specific subset here.
     outputs: [fasta_path]
     baseline_resources:
-      cpu: 8
-      mem_gb: 32
+      cpu: 4
+      mem_gb: 64
       walltime: PT24H
 
   - step: hash_sequences

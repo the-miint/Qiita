@@ -30,7 +30,7 @@ import duckdb
 import pyarrow.flight as _flight
 from qiita_common.api_paths import LibraryPrimitive
 from qiita_common.models import FeatureHashEntry
-from qiita_common.parquet import validate_parquet_path
+from qiita_common.parquet import PARQUET_OPTS, validate_parquet_path
 
 from ..auth.tickets import sign_action
 
@@ -277,6 +277,12 @@ async def mint_features(
     # matches the data-movement direction.
     pairs = [(str(h), idx) for h, idx in full_mapping.items()]
     with duckdb.connect(":memory:") as duck:
+        # PARQUET_OPTS carries ROW_GROUP_SIZE_BYTES, which requires
+        # preserve_insertion_order=false (DuckDB errors at bind time otherwise).
+        # The explicit ORDER BY still clusters each row group tightly by
+        # feature_idx — which is what Parquet row-group pushdown reads — so
+        # dropping insertion-order preservation is safe here.
+        duck.execute("SET preserve_insertion_order=false")
         duck.execute("CREATE TEMP TABLE feature_map (sequence_hash UUID, feature_idx BIGINT)")
         # Empty manifest is a valid degenerate state (FASTA had no sequences);
         # DuckDB's executemany rejects an empty parameter list, so guard
@@ -286,8 +292,7 @@ async def mint_features(
         out = validate_parquet_path(feature_map_path)
         duck.execute(
             "COPY (SELECT sequence_hash, feature_idx FROM feature_map "
-            "      ORDER BY feature_idx) "
-            f"TO '{out}' (FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd')"
+            f"      ORDER BY feature_idx) TO '{out}' ({PARQUET_OPTS})"
         )
 
     if genome_map_path is not None:
