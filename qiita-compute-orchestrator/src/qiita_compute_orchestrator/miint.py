@@ -33,42 +33,40 @@ from qiita_common.duckdb_miint import (
     miint_install_sql,
     miint_load_sql,
 )
+from qiita_common.parquet import (
+    PARQUET_OPTS,
+    PARQUET_OPTS_INTERMEDIATE,  # noqa: F401  re-exported for jobs that import it from here
+)
 
 from .miint_staging import write_staging_marker
 
-# Canonical DuckDB COPY options for the *final* Parquet artifacts the
-# orchestrator writes — the ones the Rust data plane registers into
-# DuckLake. Lives here (next to the only DuckDB connection helpers) so
-# a Parquet-version or compression bump touches one place.
-# backends/local.py extends this with ROW_GROUP_SIZE for the chunked
-# sequence-data write (see _PARQUET_OPTS_CHUNKED there); native jobs
-# use this as-is for their final output.
+# PARQUET_OPTS / PARQUET_OPTS_INTERMEDIATE are single-sourced in
+# `qiita_common.parquet` (the one module this service and the control plane both
+# depend on) so a Parquet-version, compression, or row-group bump touches ONE
+# place. They are imported above and re-exported here for the jobs that pull
+# them via `from ..miint import PARQUET_OPTS`; see that module for the
+# ROW_GROUP_SIZE_BYTES / preserve_insertion_order semantics.
 #
 # Cross-component contract: result files written with these options are
-# registered into DuckLake by the Rust data plane (qiita-data-plane,
-# DoAction "register"). Any bump (PARQUET_VERSION, COMPRESSION, etc.)
-# must be verified against the data plane's pinned DuckDB version
-# before merging — orchestrator unit tests don't exercise the read
-# side, so a breaking bump would surface only in `make test-integration`
-# with a confusing data-plane-side trace.
-PARQUET_OPTS: str = "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd'"
-
-# Same shape, but COMPRESSION 'snappy' instead of zstd. Use for
-# transient/intermediate Parquet files that are read once by a later
-# pipeline phase in the same job and then deleted — snappy decompresses
-# noticeably faster than zstd at the cost of larger on-disk files,
-# which is the right tradeoff when the file's lifetime is "until the
-# next phase reads it." NOT for files the data plane registers into
-# DuckLake (those want the smaller zstd footprint for long-term
-# storage); see PARQUET_OPTS for that path.
-PARQUET_OPTS_INTERMEDIATE: str = "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'snappy'"
+# registered into DuckLake by the Rust data plane (qiita-data-plane, DoAction
+# "register"). Any bump (PARQUET_VERSION, COMPRESSION, etc.) must be verified
+# against the data plane's pinned DuckDB version before merging — orchestrator
+# unit tests don't exercise the read side, so a breaking bump would surface only
+# in `make test-integration` with a confusing data-plane-side trace.
+#
+# ROW_GROUP_SIZE_BYTES (carried by both) requires preserve_insertion_order=false,
+# which `apply_duckdb_settings` below sets on every pipeline connection.
 
 # Chunked-sequence write constants. Sequence data (genome-scale up to
 # ~21 MB per record on GG2) is broken into 64 KB chunks so the DuckLake
-# row layout stays narrow on long entries. ROW_GROUP_SIZE keeps DuckDB
-# from buffering an unbounded number of chunks in memory before flush:
-# 16384 rows × ~64 KB chunk_data ≈ 1 GB per row group, empirically tuned
-# against GG2 backbone (4.2 GB peak RSS; 32768 OOMs on 30 GB hosts).
+# row layout stays narrow on long entries. DuckDB flushes a row group on
+# whichever cap it hits first: the ROW_GROUP_SIZE row count (16384 rows ×
+# ~64 KB chunk_data ≈ 1 GB, empirically tuned against GG2 backbone —
+# 4.2 GB peak RSS; 32768 OOMs on 30 GB hosts) OR the ROW_GROUP_SIZE_BYTES
+# '64MB' size cap inherited from PARQUET_OPTS. On dense chunk data the
+# 64 MB cap binds first (~1024 chunks), so row groups land at ~64 MB
+# rather than ~1 GB — strictly lower write memory and finer pruning, with
+# the row-count cap still backstopping sparse/narrow records.
 #
 # CHUNK_ROW_GROUP_SIZE (and the matching CHUNK_SIZE) are single-sourced in
 # `qiita_common.chunking`, shared with the CLI's DoPut path. The actual

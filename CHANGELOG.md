@@ -224,6 +224,19 @@ the `no-changelog` label).
   `cpu: 4` / `mem_gb: 64` (was `cpu: 8` / `mem_gb: 32`) — fewer cores, more
   memory for staging many host FASTA files into one chunked Parquet. Still within
   the action's `cpu: 16` / `mem_gb: 64` ceiling (#140)
+- All Parquet writes now add `ROW_GROUP_SIZE_BYTES '64MB'` — row groups flush at
+  ~64 MB encoded size instead of buffering one large group, sharpening row-group
+  predicate pushdown (tighter per-group min/max) and lowering peak write memory.
+  The canonical `PARQUET_OPTS` / `PARQUET_OPTS_INTERMEDIATE` constants moved to
+  `qiita_common.parquet` (single-sourced for both services); the orchestrator
+  re-exports them and derives `PARQUET_OPTS_CHUNKED`, and the control-plane
+  `mint_features` write now imports `PARQUET_OPTS` instead of hardcoding the
+  string. The option requires `preserve_insertion_order=false`, already set on
+  every orchestrator pipeline connection via `apply_duckdb_settings`; the
+  control-plane write now sets it explicitly. Output stays clustered on each
+  COPY's `ORDER BY` key (what pruning reads), so the sorted-result contract is
+  unaffected. The Rust data-plane DoPut writer is unchanged — parquet-rs has no
+  byte-based row-group knob (#140)
 - Bumped the pinned DuckDB across all components from **1.5.3** to **1.5.4** to
   track the team miint mirror's current build. Python floor raised to
   `duckdb>=1.5.4` in control-plane, compute-orchestrator, and integration tests
