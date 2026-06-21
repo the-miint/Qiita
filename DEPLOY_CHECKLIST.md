@@ -19,7 +19,20 @@ _None yet._
 
 ### 2. One-time host setup
 
-_None yet._
+- (#138) **DuckDB bumped 1.5.3 → 1.5.4** — the miint extension mirror is keyed by
+  DuckDB version, so the new code needs a `v1.5.4` miint build on the mirror.
+  `miint_staging` auto-detects the version change locally and re-fetches at the
+  next orchestrator boot (no manual host step, no env var), so the only operator
+  action is confirming the mirror publishes the build before the bucket-4 restart
+  (already verified present for `linux_amd64`):
+
+  ```bash
+  curl -fsSI "https://ftp.microbio.me/pub/miint/v1.5.4/linux_amd64/miint.duckdb_extension.gz" \
+    | head -1   # expect: HTTP/.. 200
+  ```
+
+  Post-deploy, the bucket-5 `make verify-deploy` `compute-readiness` check
+  exercises the v1.5.4 miint download end-to-end.
 
 ### 3. Migrations
 

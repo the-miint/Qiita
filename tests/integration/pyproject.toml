@@ -9,7 +9,7 @@ dependencies = [
     "httpx>=0.28",
     "asyncpg>=0.31",
     "pyarrow>=19",
-    "duckdb>=1.5.3",
+    "duckdb>=1.5.4",
     "qiita-common",
     "qiita-control-plane",
     "qiita-compute-orchestrator",

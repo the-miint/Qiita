@@ -27,7 +27,7 @@ jobs:
       - uses: actions/cache@v5
         with:
           path: ~/.duckdb/extensions
-          key: duckdb-ext-${{ runner.os }}-v1.5.3
+          key: duckdb-ext-${{ runner.os }}-v1.5.4
 
       - name: Build release binary
         run: cargo build --release --features duckdb/bundled --manifest-path qiita-data-plane/Cargo.toml
