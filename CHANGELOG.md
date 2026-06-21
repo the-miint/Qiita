@@ -220,6 +220,15 @@ the `no-changelog` label).
 
 ### Changed
 
+- Bumped the pinned DuckDB across all components from **1.5.3** to **1.5.4** to
+  track the team miint mirror's current build. Python floor raised to
+  `duckdb>=1.5.4` in control-plane, compute-orchestrator, and integration tests
+  (locks regenerated); data-plane Rust crate `1.10503.1` → `1.10504.0` (DuckDB
+  1.5.4); the `setup-libduckdb` action default and the `deploy.yml` extension
+  cache key moved to `1.5.4` so CI links a matching libduckdb. The miint mirror
+  already publishes v1.5.4 builds for `linux_amd64` and `osx_arm64`. The
+  `test_duckdb_version_sync` guard keeps the crate, action default, and cache key
+  in lockstep (#138)
 - The `stage_local_fasta` native job now caps `read_fastx`'s per-batch buffer at
   128MB (was 512MB), lowering peak memory during FASTA staging. One of the job's
   three memory levers, alongside the DuckDB `memory_limit`/`temp_directory` spill

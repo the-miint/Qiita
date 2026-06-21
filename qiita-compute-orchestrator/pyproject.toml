@@ -12,7 +12,7 @@ dependencies = [
     # LocalBackend uses DuckDB+miint in-process to stand in for SLURM in
     # dev/test. SlurmBackend won't need it, but the orchestrator runs both
     # backends from the same image, so the dep stays.
-    "duckdb>=1.5.3",
+    "duckdb>=1.5.4",
     # bcl_convert_prep imports `save_bclconvert_v1_csv` from
     # run_preflight at execute() time. SHA pin is required so a
     # re-vendor of the upstream is explicit. To bump: read the
