@@ -220,6 +220,10 @@ the `no-changelog` label).
 
 ### Changed
 
+- The `stage_local_fasta` step in `local-host-reference-add/1.0.0` now requests
+  `cpu: 4` / `mem_gb: 64` (was `cpu: 8` / `mem_gb: 32`) — fewer cores, more
+  memory for staging many host FASTA files into one chunked Parquet. Still within
+  the action's `cpu: 16` / `mem_gb: 64` ceiling (#140)
 - Bumped the pinned DuckDB across all components from **1.5.3** to **1.5.4** to
   track the team miint mirror's current build. Python floor raised to
   `duckdb>=1.5.4` in control-plane, compute-orchestrator, and integration tests
