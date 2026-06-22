@@ -533,6 +533,19 @@ the `no-changelog` label).
 
 ### Fixed
 
+- Native (`module:`) SLURM steps no longer collapse to a single CPU. The
+  generated launcher ran a bare `srun`, but SLURM >= 22.05 srun no longer
+  inherits `--cpus-per-task` from the batch allocation, so it laid the single
+  task out at cpus-per-task=1 and its default `--cpu-bind` pinned that task —
+  and every thread it spawned — to one allocated CPU. Native jobs run DuckDB
+  with a multi-thread pool, so an N-CPU allocation silently ran on a single
+  core (a TB-scale `stage_local_fasta` host-reference load crawled at ~75 MB/s
+  on 1 of 4 allocated cores while the job's cgroup cpuset granted all of them).
+  The launcher now exports `SRUN_CPUS_PER_TASK` from the allocation and passes
+  `srun --cpu-bind=none`, letting the thread pool float across the whole cgroup
+  cpuset (which already constrains the job to its allocation). Container
+  (`apptainer exec`, no srun) steps were never affected. (#153)
+
 - Data-plane file registration no longer collides with — and attempts to
   overwrite — an already-registered DuckLake data file. `register_files` placed
   each Parquet at `DATA_PATH/<table>/<producer-basename>`, but the reference-load
