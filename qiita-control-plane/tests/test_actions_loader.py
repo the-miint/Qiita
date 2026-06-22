@@ -543,13 +543,16 @@ def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():
     v12 = by_key[("fastq-to-parquet", "1.2.0")]
     assert v12.target_kind == ScopeTargetKind.PREP_SAMPLE
     assert v12.target_processing_kinds == ["sequenced"]
-    # The trailing persist-read-metrics is an in-process `action:`,
-    # consuming the three count sidecars; it appears in the unified
-    # steps list after the three compute steps.
+    # qc_report_raw reports on the raw fastq output (before qc re-emits `reads`);
+    # qc_report_filtered reports on the host-filtered output. The trailing
+    # persist-read-metrics is an in-process `action:` consuming the three count
+    # sidecars. All appear in the unified steps list in execution order.
     assert [s.name for s in v12.steps] == [
         "fastq",
+        "qc_report_raw",
         "qc",
         "host_filter",
+        "qc_report_filtered",
         "persist-read-metrics",
     ]
     # Writing the sample's sequenced_sample row requires prep_sample:write.
@@ -562,6 +565,18 @@ def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():
         "quality_filtered_read_count",
     ]
     assert persist.outputs == []
+
+    # Both qc_report steps share one module, disambiguated by input/output binding:
+    # raw consumes `reads` + emits `raw_qc_report`; filtered consumes
+    # `filtered_reads` + emits `filtered_qc_report`.
+    qc_report_raw = next(s for s in v12.steps if s.name == "qc_report_raw")
+    qc_report_filtered = next(s for s in v12.steps if s.name == "qc_report_filtered")
+    assert qc_report_raw.module == "qiita_compute_orchestrator.jobs.qc_report"
+    assert qc_report_filtered.module == "qiita_compute_orchestrator.jobs.qc_report"
+    assert qc_report_raw.inputs == ["reads"]
+    assert qc_report_raw.outputs == ["raw_qc_report"]
+    assert qc_report_filtered.inputs == ["filtered_reads"]
+    assert qc_report_filtered.outputs == ["filtered_qc_report"]
 
     v12_fastq = next(s for s in v12.steps if s.name == "fastq")
     # 1.2.0's fastq also emits the raw read count sidecar, unlike 1.0.0/1.1.0.
