@@ -1296,6 +1296,13 @@ def _expected_read_response(
         "ena_run_accession": None,
         "last_submission_at": None,
         "submission_error": None,
+        # Read metrics (#142): NULL on a freshly-imported sample (not yet
+        # processed by fastq-to-parquet/1.2.0); fraction is computed-on-read and
+        # serializes None when raw is absent.
+        "raw_read_count_r1r2": None,
+        "biological_read_count_r1r2": None,
+        "quality_filtered_read_count_r1r2": None,
+        "fraction_passing_quality_filter": None,
         "last_metadata_change_at": expected_last_meta,
         "created_by_idx": created_by_idx,
         "created_at": rj["created_at"],
@@ -2151,6 +2158,28 @@ async def test_get_sequenced_sample_wet_lab_admin_no_metadata(ctx):
     # ETag is set in RFC 7232 quoted form; opaque to the test beyond shape.
     etag = resp.headers["ETag"]
     assert etag.startswith('"') and etag.endswith('"')
+
+
+async def test_get_sequenced_sample_surfaces_read_metrics(ctx):
+    # After processing, the three per-stage read counts (#142) are populated;
+    # the GET surfaces them and the computed-on-read fraction (850/1000 = 0.85).
+    seeded = await _seed_one_sequenced_sample(ctx, "get-metrics")
+    await ctx["pool"].execute(
+        "UPDATE qiita.sequenced_sample SET raw_read_count_r1r2 = 1000,"
+        " biological_read_count_r1r2 = 900, quality_filtered_read_count_r1r2 = 850"
+        " WHERE idx = $1",
+        seeded["sequenced_sample_idx"],
+    )
+
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=seeded["sequenced_sample_idx"])
+    )
+    assert resp.status_code == 200, resp.text
+    rj = resp.json()
+    assert rj["raw_read_count_r1r2"] == 1000
+    assert rj["biological_read_count_r1r2"] == 900
+    assert rj["quality_filtered_read_count_r1r2"] == 850
+    assert rj["fraction_passing_quality_filter"] == pytest.approx(0.85)
 
 
 async def test_get_sequenced_sample_carries_global_metadata(ctx):

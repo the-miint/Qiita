@@ -15,6 +15,16 @@ the `no-changelog` label).
 
 ### Added
 
+- Per-`sequenced_sample` read metrics: `sequenced_sample` gains three nullable
+  `BIGINT` columns (`raw_read_count_r1r2`, `biological_read_count_r1r2`,
+  `quality_filtered_read_count_r1r2`) with a CHECK enforcing
+  quality_filtered <= biological <= raw. A new `persist-read-metrics` library
+  primitive — added as the final `action:` step of `fastq-to-parquet/1.2.0` —
+  reads the three `read_count.json` sidecars (#141) and writes them onto the
+  sample's 1:1 `sequenced_sample`; `GET /sequenced-sample/{idx}` surfaces them
+  plus a computed-on-read `fraction_passing_quality_filter`
+  (quality_filtered / raw). The workflow now declares `prep_sample:write` (in the
+  USER ceiling, so its audience is unchanged). implements #142 (#148)
 - The `fastq`, `qc`, and `host_filter` native steps now emit a `read_count.json`
   sidecar recording how many reads survive each parquet stage, captured as the
   three SPP boundary counts per `prep_sample`: raw (`fastq` → `raw_read_count`),

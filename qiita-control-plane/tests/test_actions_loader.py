@@ -543,7 +543,25 @@ def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():
     v12 = by_key[("fastq-to-parquet", "1.2.0")]
     assert v12.target_kind == ScopeTargetKind.PREP_SAMPLE
     assert v12.target_processing_kinds == ["sequenced"]
-    assert [s.name for s in v12.steps] == ["fastq", "qc", "host_filter"]
+    # The trailing persist-read-metrics is an in-process `action:` (#142),
+    # consuming the three #141 count sidecars; it appears in the unified
+    # steps list after the three compute steps.
+    assert [s.name for s in v12.steps] == [
+        "fastq",
+        "qc",
+        "host_filter",
+        "persist-read-metrics",
+    ]
+    # Writing the sample's sequenced_sample row requires prep_sample:write.
+    assert v12.scopes == ["prep_sample:write"]
+
+    persist = next(s for s in v12.steps if s.name == "persist-read-metrics")
+    assert persist.inputs == [
+        "raw_read_count",
+        "biological_read_count",
+        "quality_filtered_read_count",
+    ]
+    assert persist.outputs == []
 
     v12_fastq = next(s for s in v12.steps if s.name == "fastq")
     # 1.2.0's fastq also emits the raw read count sidecar (#141), unlike 1.0.0/1.1.0.

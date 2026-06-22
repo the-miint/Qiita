@@ -40,3 +40,4 @@ def test_library_re_exports_match_module_callables():
     assert LIBRARY[LibraryPrimitive.WRITE_MEMBERSHIP] is lib.write_membership
     assert LIBRARY[LibraryPrimitive.REGISTER_FILES] is lib.register_files
     assert LIBRARY[LibraryPrimitive.REGISTER_INDEX] is lib.register_index
+    assert LIBRARY[LibraryPrimitive.PERSIST_READ_METRICS] is lib.persist_read_metrics

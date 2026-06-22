@@ -12,6 +12,7 @@ from pydantic import (
     ConfigDict,
     EmailStr,
     Field,
+    computed_field,
     field_validator,
     model_validator,
 )
@@ -1997,6 +1998,12 @@ class SequencedSampleResponse(BaseModel):
     ena_run_accession: str | None
     last_submission_at: AwareDatetime | None
     submission_error: str | None
+    # Per-stage read counts (#142), both-mates (R1+R2) totals. NULL until the
+    # sample is processed by fastq-to-parquet/1.2.0 (the persist-read-metrics
+    # action writes them). raw >= biological >= quality_filtered by the DB CHECK.
+    raw_read_count_r1r2: int | None
+    biological_read_count_r1r2: int | None
+    quality_filtered_read_count_r1r2: int | None
     last_metadata_change_at: AwareDatetime | None
     created_by_idx: Annotated[int, Field(gt=0)]
     created_at: AwareDatetime
@@ -2007,6 +2014,19 @@ class SequencedSampleResponse(BaseModel):
     retire_reason: str | None
     global_metadata: dict[str, GlobalMetadataEntry]
     caller_system_role: SystemRole
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def fraction_passing_quality_filter(self) -> float | None:
+        """quality_filtered / raw — the share of raw reads surviving the full
+        QC + host-filter pipeline. Computed on read (not stored) so it can never
+        drift from the counts (#142). None when either bound is absent or raw is
+        0 (no division)."""
+        if self.raw_read_count_r1r2 is None or self.quality_filtered_read_count_r1r2 is None:
+            return None
+        if self.raw_read_count_r1r2 == 0:
+            return None
+        return self.quality_filtered_read_count_r1r2 / self.raw_read_count_r1r2
 
 
 class SequencedSamplePatchRequest(PatchRequestModel):
