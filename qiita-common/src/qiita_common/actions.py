@@ -65,6 +65,19 @@ NATIVE_MODULE_PREFIX = "qiita_compute_orchestrator.jobs."
 FASTQ_PATH_CONTEXT_KEYS: tuple[str, str] = ("fastq_path", "reverse_fastq_path")
 
 
+# The per-sample FASTQ→Parquet action's bare id (its YAML lives at
+# workflows/fastq-to-parquet/<version>.yaml). Defined here, beside the action
+# contract, so the submitter that mints these tickets (the qiita-user
+# submit-host-filter-pool gesture) and any reader that keys off them (e.g. the
+# pool completion rollup query) import one canonical value instead of re-typing
+# the literal — a rename then lights up its importers rather than silently
+# zeroing a rollup. Deliberately the bare id, NOT a (id, version) pair: the
+# completion rollup is version-agnostic ("did this sample's fastq→parquet
+# finish?" regardless of version), while the submitter pins its own version
+# separately.
+FASTQ_TO_PARQUET_ACTION_ID = "fastq-to-parquet"
+
+
 class Audience(BaseModel):
     """Who may invoke this action — answers "may invoke", not "may execute".
 

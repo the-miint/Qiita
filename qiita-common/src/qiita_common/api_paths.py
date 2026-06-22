@@ -317,6 +317,12 @@ PATH_SEQUENCED_POOL_BY_IDX = "/{sequencing_run_idx}/sequenced-pool/{sequenced_po
 PATH_SEQUENCED_POOL_QC_REPORT = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/qc-report"
 )
+# GET the pool's prep-generation completion rollup: per-sample fastq-to-parquet
+# work-ticket state bucketed into completed / in-flight / failed / not-submitted
+# counts (the SPP GenPrepFileJob end-state equivalent).
+PATH_SEQUENCED_POOL_COMPLETION = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/completion"
+)
 
 URL_SEQUENCING_RUN_PREFIX = f"{API_PREFIX}{PATH_SEQUENCING_RUN_PREFIX}"
 URL_SEQUENCING_RUN_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_BY_IDX}"
@@ -329,6 +335,7 @@ URL_SEQUENCING_RUN_SEQUENCED_POOL = (
 URL_SEQUENCED_POOL_PREFLIGHT = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_PREFLIGHT}"
 URL_SEQUENCED_POOL_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_BY_IDX}"
 URL_SEQUENCED_POOL_QC_REPORT = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_QC_REPORT}"
+URL_SEQUENCED_POOL_COMPLETION = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_COMPLETION}"
 
 
 # =============================================================================

@@ -84,6 +84,16 @@ _None yet._
   ACTIVE + carry the right index (built via `host-reference-add`) or the gesture
   aborts before any side effect. No new env var, host dir, scope, or migration
   beyond the additive bucket-3 columns.
+- (#158) `qiita-user submit-host-filter-pool` now host-filters each pool sample
+  against the reference(s) recorded on it (by #156's `submit-bcl-convert`), not a
+  pool-wide reference. **Operator-facing CLI change:** the
+  `--host-rype-reference-idx` / `--host-minimap2-reference-idx` flags are
+  **removed** — an invocation still passing them now errors; host filtering is
+  per-sample (preflight `human_filtering=0` samples get a QC-only pass-through
+  ticket). New read-only `GET .../sequenced-pool/{pool}/completion` endpoint (and
+  `qiita-user pool-completion`) reporting per-sample fastq-to-parquet completion —
+  additive, read-gated like the existing pool rollups. No new env var, host dir,
+  scope, migration, or workflow/SIF change.
 
 ---
 

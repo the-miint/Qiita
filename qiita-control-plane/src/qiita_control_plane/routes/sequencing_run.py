@@ -37,6 +37,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_SEQUENCED_POOL_BY_IDX,
+    PATH_SEQUENCED_POOL_COMPLETION,
     PATH_SEQUENCED_POOL_PREFLIGHT,
     PATH_SEQUENCED_POOL_QC_REPORT,
     PATH_SEQUENCING_RUN_BY_IDX,
@@ -47,6 +48,7 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
+    PoolCompletionStatus,
     PoolQCReport,
     PoolReadMetrics,
     SampleQCReport,
@@ -83,6 +85,7 @@ from ..auth.principal import HumanUser, Principal, ServiceAccount
 from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
 from ..repositories.sequencing_run import (
     PayloadMismatch,
+    fetch_sequenced_pool_completion,
     fetch_sequenced_pool_preflight,
     fetch_sequenced_pool_read_metrics,
     fetch_sequenced_pool_sample_qc_reports,
@@ -392,6 +395,42 @@ async def get_sequenced_pool_qc_report(
         ),
         merged=merge_qc_reports(samples),
         samples=samples,
+    )
+
+
+@router.get(PATH_SEQUENCED_POOL_COMPLETION)
+async def get_sequenced_pool_completion(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> PoolCompletionStatus:
+    """Read the pool's prep-generation completion rollup: each non-retired
+    sequenced_sample classified by the state of its fastq-to-parquet work tickets
+    (any version) and tallied into completed / in-flight / failed / not-submitted
+    buckets, with a pool-level `complete` flag (every sample COMPLETED, pool
+    non-empty). This is the SPP GenPrepFileJob end-state equivalent — it answers
+    "has the per-sample fastq→parquet fan-out finished?" — surfaced alongside the
+    read-metric and QC rollups.
+
+    Everything is compute-on-read over the work_ticket table, so it never drifts
+    when a sample is re-processed, re-submitted, or deleted. Same read gate as the
+    pool metadata / QC-report endpoints: a HumanUser with `Scope.PREP_SAMPLE_READ`
+    and system_role at least wet_lab_admin. `require_sequenced_pool_in_run` fronts
+    404 (no such pool) / 422 (pool not under this run); a pool with no non-retired
+    samples reads as all-zero counts and `complete=False`."""
+    row = await fetch_sequenced_pool_completion(pool, sequenced_pool_idx)
+    return PoolCompletionStatus(
+        sequenced_pool_idx=sequenced_pool_idx,
+        sequencing_run_idx=sequencing_run_idx,
+        sample_count=row["sample_count"],
+        samples_completed=row["samples_completed"],
+        samples_in_flight=row["samples_in_flight"],
+        samples_failed=row["samples_failed"],
+        samples_not_submitted=row["samples_not_submitted"],
     )
 
 

@@ -3107,16 +3107,27 @@ def _both_indexes_body(reference_idx=7):
 
 
 def _pool_samples_body(samples):
-    """samples: list of (sequenced_sample_idx, prep_sample_idx, pool_item_id)."""
+    """samples: list of either
+        (sequenced_sample_idx, prep_sample_idx, pool_item_id)  -> no host refs, or
+        (sequenced_sample_idx, prep_sample_idx, pool_item_id, rype, minimap2)
+    where rype/minimap2 are the recorded per-sample host reference idxs (or None).
+    The 3-tuple form records no host references (an unfiltered, pass-through
+    sample)."""
+
+    def _row(entry):
+        ss, ps, item = entry[0], entry[1], entry[2]
+        rype = entry[3] if len(entry) > 3 else None
+        minimap2 = entry[4] if len(entry) > 4 else None
+        return {
+            "sequenced_sample_idx": ss,
+            "prep_sample_idx": ps,
+            "sequenced_pool_item_id": item,
+            "host_rype_reference_idx": rype,
+            "host_minimap2_reference_idx": minimap2,
+        }
+
     return {
-        "samples": [
-            {
-                "sequenced_sample_idx": ss,
-                "prep_sample_idx": ps,
-                "sequenced_pool_item_id": item,
-            }
-            for ss, ps, item in samples
-        ],
+        "samples": [_row(e) for e in samples],
         "count": len(samples),
         "truncated": False,
         "caller_system_role": "wet_lab_admin",
@@ -3143,39 +3154,38 @@ def _seq_run_body(*, sequencing_run_idx=3, instrument_model="NextSeq 550"):
     }
 
 
-def _run_submit_host_filter_pool(convert_dir, *, run=3, pool=5, rype_ref=7, minimap2_ref=None):
+def _run_submit_host_filter_pool(convert_dir, *, run=3, pool=5):
     from qiita_control_plane.cli.user import main
 
-    argv = [
-        "submit-host-filter-pool",
-        "--sequencing-run-idx",
-        str(run),
-        "--sequenced-pool-idx",
-        str(pool),
-        "--host-rype-reference-idx",
-        str(rype_ref),
-        "--convert-dir",
-        str(convert_dir),
-    ]
-    if minimap2_ref is not None:
-        argv += ["--host-minimap2-reference-idx", str(minimap2_ref)]
-    return main(argv)
+    return main(
+        [
+            "submit-host-filter-pool",
+            "--sequencing-run-idx",
+            str(run),
+            "--sequenced-pool-idx",
+            str(pool),
+            "--convert-dir",
+            str(convert_dir),
+        ]
+    )
 
 
 def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(monkeypatch, tmp_path, capsys):
-    """Two paired-end samples → two fastq-to-parquet/1.2.0 POSTs, each with
-    always-on QC, host_filter_enabled against the rype reference, the run's
-    instrument_model forwarded, and scoped to the sample's prep_sample_idx."""
+    """Two paired-end samples, each recording rype reference 7 → two
+    fastq-to-parquet/1.2.0 POSTs, each with always-on QC, host_filter_enabled
+    against the sample's recorded rype reference, the run's instrument_model
+    forwarded, and scoped to the sample's prep_sample_idx. The shared rype
+    reference is pre-flighted exactly once (deduped)."""
     convert_dir = _seed_convert_dir(tmp_path, ["10", "11"], paired=True)
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
         responses=[
-            (200, _ref_active_body()),  # rype reference
+            (200, _pool_samples_body([(100, 1000, "10", 7), (101, 1001, "11", 7)])),
+            (200, _ref_active_body()),  # rype reference 7 (pre-flighted once)
             (200, _both_indexes_body()),  # its index list (carries rype)
             (200, _seq_run_body(instrument_model="NextSeq 550")),  # run metadata
-            (200, _pool_samples_body([(100, 1000, "10"), (101, 1001, "11")])),
             (202, {"work_ticket_idx": 900}),
             (202, {"work_ticket_idx": 901}),
         ],
@@ -3183,6 +3193,12 @@ def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(monkeypatch, tmp
 
     rc = _run_submit_host_filter_pool(convert_dir)
     assert rc == 0
+
+    # The shared rype reference is GET-pre-flighted once, not once per sample.
+    ref_gets = [
+        r for r in captured["requests"] if r["method"] == "GET" and "/reference/" in r["url"]
+    ]
+    assert len([r for r in ref_gets if r["url"].endswith("/reference/7")]) == 1
 
     posts = [r for r in captured["requests"] if r["method"] == "POST"]
     assert len(posts) == 2
@@ -3195,7 +3211,7 @@ def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(monkeypatch, tmp
         ctx = body["action_context"]
         assert ctx["host_filter_enabled"] is True
         assert ctx["host_rype_reference_idx"] == 7
-        # minimap2 not requested → its key is omitted (rype-only host filter).
+        # minimap2 not recorded → its key is omitted (rype-only host filter).
         assert "host_minimap2_reference_idx" not in ctx
         assert ctx["instrument_model"] == "NextSeq 550"
         assert ctx["fastq_path"].endswith(f"{item_id}_S1_L001_R1_001.fastq.gz")
@@ -3203,31 +3219,91 @@ def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(monkeypatch, tmp
 
 
 def test_submit_host_filter_pool_two_reference_forwards_both(monkeypatch, tmp_path):
-    """--host-minimap2-reference-idx adds a second pre-flight (the minimap2
-    reference + its index) and forwards host_minimap2_reference_idx per sample."""
+    """A sample recording both a rype (7) and a minimap2 (8) reference →
+    each is pre-flighted (reference + its index) and both flow into the
+    per-sample action_context."""
     convert_dir = _seed_convert_dir(tmp_path, ["10"], paired=True)
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
         responses=[
+            (200, _pool_samples_body([(100, 1000, "10", 7, 8)])),
             (200, _ref_active_body(reference_idx=7)),  # rype reference
             (200, [_both_indexes_body()[0]]),  # rype-only index list
             (200, _ref_active_body(reference_idx=8)),  # minimap2 reference
             (200, [_both_indexes_body(reference_idx=8)[1]]),  # minimap2-only index list
             (200, _seq_run_body(instrument_model="NovaSeq 6000")),
-            (200, _pool_samples_body([(100, 1000, "10")])),
             (202, {"work_ticket_idx": 900}),
         ],
     )
 
-    rc = _run_submit_host_filter_pool(convert_dir, rype_ref=7, minimap2_ref=8)
+    rc = _run_submit_host_filter_pool(convert_dir)
     assert rc == 0
     post = next(r for r in captured["requests"] if r["method"] == "POST")
     ctx = post["json"]["action_context"]
+    assert ctx["host_filter_enabled"] is True
     assert ctx["host_rype_reference_idx"] == 7
     assert ctx["host_minimap2_reference_idx"] == 8
     assert ctx["instrument_model"] == "NovaSeq 6000"
+
+
+def test_submit_host_filter_pool_unfiltered_sample_is_passthrough(monkeypatch, tmp_path):
+    """A sample with no recorded host reference (preflight human_filtering=0) →
+    a QC-only ticket with host_filter_enabled=False and no reference keys. With
+    no filtered sample in the pool, NO reference is pre-flighted."""
+    convert_dir = _seed_convert_dir(tmp_path, ["10"], paired=True)
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, _pool_samples_body([(100, 1000, "10")])),  # no host refs recorded
+            (200, _seq_run_body(instrument_model="NextSeq 550")),
+            (202, {"work_ticket_idx": 900}),
+        ],
+    )
+
+    rc = _run_submit_host_filter_pool(convert_dir)
+    assert rc == 0
+    # No /reference/ pre-flight GET at all when nothing is host-filtered.
+    assert not [r for r in captured["requests"] if "/reference/" in r["url"]]
+    post = next(r for r in captured["requests"] if r["method"] == "POST")
+    ctx = post["json"]["action_context"]
+    assert ctx["host_filter_enabled"] is False
+    assert "host_rype_reference_idx" not in ctx
+    assert "host_minimap2_reference_idx" not in ctx
+
+
+def test_submit_host_filter_pool_mixed_filtered_and_passthrough(monkeypatch, tmp_path):
+    """A pool mixing a filtered sample (rype 7) and an unfiltered one →
+    one host_filter_enabled ticket + one pass-through ticket; only the one
+    recorded reference is pre-flighted."""
+    convert_dir = _seed_convert_dir(tmp_path, ["10", "11"], paired=True)
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, _pool_samples_body([(100, 1000, "10", 7), (101, 1001, "11")])),
+            (200, _ref_active_body()),  # rype reference 7
+            (200, _both_indexes_body()),
+            (200, _seq_run_body(instrument_model="NextSeq 550")),
+            (202, {"work_ticket_idx": 900}),
+            (202, {"work_ticket_idx": 901}),
+        ],
+    )
+
+    rc = _run_submit_host_filter_pool(convert_dir)
+    assert rc == 0
+    posts = [r for r in captured["requests"] if r["method"] == "POST"]
+    by_prep = {
+        p["json"]["scope_target"]["prep_sample_idx"]: p["json"]["action_context"] for p in posts
+    }
+    assert by_prep[1000]["host_filter_enabled"] is True
+    assert by_prep[1000]["host_rype_reference_idx"] == 7
+    assert by_prep[1001]["host_filter_enabled"] is False
+    assert "host_rype_reference_idx" not in by_prep[1001]
 
 
 def test_submit_host_filter_pool_single_end_omits_reverse(monkeypatch, tmp_path):
@@ -3238,10 +3314,10 @@ def test_submit_host_filter_pool_single_end_omits_reverse(monkeypatch, tmp_path)
         monkeypatch,
         captured,
         responses=[
+            (200, _pool_samples_body([(100, 1000, "10", 7)])),
             (200, _ref_active_body()),
             (200, _both_indexes_body()),
             (200, _seq_run_body()),
-            (200, _pool_samples_body([(100, 1000, "10")])),
             (202, {"work_ticket_idx": 900}),
         ],
     )
@@ -3261,10 +3337,10 @@ def test_submit_host_filter_pool_instrument_model_absent_omitted(monkeypatch, tm
         monkeypatch,
         captured,
         responses=[
+            (200, _pool_samples_body([(100, 1000, "10", 7)])),
             (200, _ref_active_body()),
             (200, _both_indexes_body()),
             (200, _seq_run_body(instrument_model=None)),
-            (200, _pool_samples_body([(100, 1000, "10")])),
             (202, {"work_ticket_idx": 900}),
         ],
     )
@@ -3286,8 +3362,6 @@ def test_submit_host_filter_pool_rejects_relative_convert_dir(capsys):
                 "3",
                 "--sequenced-pool-idx",
                 "5",
-                "--host-rype-reference-idx",
-                "7",
                 "--convert-dir",
                 "relative/ConvertJob",
             ]
@@ -3308,8 +3382,6 @@ def test_submit_host_filter_pool_rejects_nondir_convert_dir(capsys, tmp_path):
                 "3",
                 "--sequenced-pool-idx",
                 "5",
-                "--host-rype-reference-idx",
-                "7",
                 "--convert-dir",
                 str(missing),
             ]
@@ -3323,7 +3395,11 @@ def test_submit_host_filter_pool_reference_not_active_no_posts(monkeypatch, tmp_
     captured: dict = {}
     inactive = _ref_active_body()
     inactive["status"] = "indexing"
-    _stub_multi_response(monkeypatch, captured, responses=[(200, inactive)])
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[(200, _pool_samples_body([(100, 1000, "10", 7)])), (200, inactive)],
+    )
 
     with pytest.raises(SystemExit) as exc_info:
         _run_submit_host_filter_pool(convert_dir)
@@ -3335,15 +3411,19 @@ def test_submit_host_filter_pool_reference_not_active_no_posts(monkeypatch, tmp_
 def test_submit_host_filter_pool_rype_ref_missing_rype_index_no_posts(
     monkeypatch, tmp_path, capsys
 ):
-    """The rype reference is active but carries no rype index → abort before any
-    ticket (only a minimap2 index present here)."""
+    """A sample's recorded rype reference is active but carries no rype index →
+    abort before any ticket (only a minimap2 index present here)."""
     convert_dir = _seed_convert_dir(tmp_path, ["10"])
     captured: dict = {}
     minimap2_only = [_both_indexes_body()[1]]
     _stub_multi_response(
         monkeypatch,
         captured,
-        responses=[(200, _ref_active_body()), (200, minimap2_only)],
+        responses=[
+            (200, _pool_samples_body([(100, 1000, "10", 7)])),
+            (200, _ref_active_body()),
+            (200, minimap2_only),
+        ],
     )
 
     with pytest.raises(SystemExit) as exc_info:
@@ -3351,21 +3431,22 @@ def test_submit_host_filter_pool_rype_ref_missing_rype_index_no_posts(
     assert exc_info.value.code == 1
     err = capsys.readouterr().err
     assert "rype" in err
-    assert "--host-rype-reference-idx" in err
+    assert "host_rype_reference_idx" in err
     assert not [r for r in captured["requests"] if r["method"] == "POST"]
 
 
 def test_submit_host_filter_pool_minimap2_ref_missing_minimap2_index_no_posts(
     monkeypatch, tmp_path, capsys
 ):
-    """The minimap2 reference is active but carries no minimap2 index → abort
-    before any ticket (the rype reference passed first)."""
+    """A sample's recorded minimap2 reference is active but carries no minimap2
+    index → abort before any ticket (the rype reference passed first)."""
     convert_dir = _seed_convert_dir(tmp_path, ["10"])
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
         responses=[
+            (200, _pool_samples_body([(100, 1000, "10", 7, 8)])),
             (200, _ref_active_body(reference_idx=7)),  # rype reference OK
             (200, [_both_indexes_body()[0]]),  # rype index present
             (200, _ref_active_body(reference_idx=8)),  # minimap2 reference active
@@ -3374,11 +3455,11 @@ def test_submit_host_filter_pool_minimap2_ref_missing_minimap2_index_no_posts(
     )
 
     with pytest.raises(SystemExit) as exc_info:
-        _run_submit_host_filter_pool(convert_dir, rype_ref=7, minimap2_ref=8)
+        _run_submit_host_filter_pool(convert_dir)
     assert exc_info.value.code == 1
     err = capsys.readouterr().err
     assert "minimap2" in err
-    assert "--host-minimap2-reference-idx" in err
+    assert "host_minimap2_reference_idx" in err
     assert not [r for r in captured["requests"] if r["method"] == "POST"]
 
 
@@ -3391,10 +3472,10 @@ def test_submit_host_filter_pool_missing_fastq_no_posts(monkeypatch, tmp_path, c
         monkeypatch,
         captured,
         responses=[
+            (200, _pool_samples_body([(100, 1000, "10", 7), (101, 1001, "99", 7)])),
             (200, _ref_active_body()),
             (200, _both_indexes_body()),
             (200, _seq_run_body()),
-            (200, _pool_samples_body([(100, 1000, "10"), (101, 1001, "99")])),
         ],
     )
 
@@ -3418,10 +3499,10 @@ def test_submit_host_filter_pool_multi_lane_rejected_no_posts(monkeypatch, tmp_p
         monkeypatch,
         captured,
         responses=[
+            (200, _pool_samples_body([(100, 1000, "10", 7)])),
             (200, _ref_active_body()),
             (200, _both_indexes_body()),
             (200, _seq_run_body()),
-            (200, _pool_samples_body([(100, 1000, "10")])),
         ],
     )
 
@@ -3430,6 +3511,59 @@ def test_submit_host_filter_pool_multi_lane_rejected_no_posts(monkeypatch, tmp_p
     assert exc_info.value.code == 1
     assert "lane-split" in capsys.readouterr().err
     assert not [r for r in captured["requests"] if r["method"] == "POST"]
+
+
+# ---------------------------------------------------------------------------
+# pool-completion (two-idx GET read command)
+# ---------------------------------------------------------------------------
+
+
+def test_pool_completion_issues_get_against_run_and_pool(monkeypatch):
+    """pool-completion GETs the run+pool-scoped completion route and returns the
+    decoded body (exit 0)."""
+    import httpx as _httpx
+    from qiita_common.api_paths import URL_SEQUENCED_POOL_COMPLETION
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["method"] = method
+        captured["url"] = url
+        return _httpx.Response(
+            200,
+            json={"sequenced_pool_idx": 5, "complete": False},
+            request=_httpx.Request(method, url),
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    rc = main(
+        [
+            "pool-completion",
+            "--sequencing-run-idx",
+            "3",
+            "--sequenced-pool-idx",
+            "5",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "GET"
+    assert captured["url"].endswith(
+        URL_SEQUENCED_POOL_COMPLETION.format(sequencing_run_idx=3, sequenced_pool_idx=5)
+    )
+
+
+def test_pool_completion_requires_both_idxs(capsys):
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["pool-completion", "--sequencing-run-idx", "3"])
+    assert exc_info.value.code == 2
+    assert "--sequenced-pool-idx" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

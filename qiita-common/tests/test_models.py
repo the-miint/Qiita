@@ -702,3 +702,43 @@ def test_pool_read_metrics_fraction_recomputed_from_sums():
     )
     assert empty.fraction_passing_quality_filter is None
     assert empty.sample_count == 3
+
+
+def test_pool_completion_status_complete_flag():
+    """PoolCompletionStatus.complete is True only when the pool has samples and
+    every one is COMPLETED; a partial pool and a zero-sample pool both read
+    False (the latter is not vacuously complete)."""
+    from qiita_common.models import PoolCompletionStatus
+
+    done = PoolCompletionStatus(
+        sequenced_pool_idx=1,
+        sequencing_run_idx=1,
+        sample_count=3,
+        samples_completed=3,
+        samples_in_flight=0,
+        samples_failed=0,
+        samples_not_submitted=0,
+    )
+    assert done.complete is True
+
+    partial = PoolCompletionStatus(
+        sequenced_pool_idx=1,
+        sequencing_run_idx=1,
+        sample_count=3,
+        samples_completed=2,
+        samples_in_flight=1,
+        samples_failed=0,
+        samples_not_submitted=0,
+    )
+    assert partial.complete is False
+
+    empty = PoolCompletionStatus(
+        sequenced_pool_idx=1,
+        sequencing_run_idx=1,
+        sample_count=0,
+        samples_completed=0,
+        samples_in_flight=0,
+        samples_failed=0,
+        samples_not_submitted=0,
+    )
+    assert empty.complete is False

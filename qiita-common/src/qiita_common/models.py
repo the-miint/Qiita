@@ -2087,6 +2087,45 @@ class PoolQCReport(BaseModel):
     samples: list[SampleQCReport]
 
 
+class PoolCompletionStatus(BaseModel):
+    """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool/{P}/completion.
+
+    The pool's prep-generation completion rollup: each non-retired
+    sequenced_sample is classified by the state of its fastq-to-parquet work
+    tickets (any version), and the per-sample states are tallied into the four
+    mutually-exclusive buckets below. This is the SPP GenPrepFileJob end-state
+    equivalent — it answers "has the pool's per-sample fastq→parquet fan-out
+    finished?" — surfaced alongside the read-metric and QC rollups.
+
+    Per-sample classification (precedence, highest first), so a sample appears in
+    exactly one bucket:
+      completed     — has at least one COMPLETED fastq-to-parquet ticket.
+      in_flight     — no COMPLETED ticket but at least one PENDING/QUEUED/
+                      PROCESSING (e.g. a re-submitted retry); work is ongoing.
+      failed        — no COMPLETED and nothing in flight, but at least one FAILED.
+      not_submitted — no fastq-to-parquet ticket at all.
+
+    `complete` is the pool-level done flag: every sample COMPLETED and the pool
+    is non-empty (so a zero-sample pool reads `complete=False`, not vacuously
+    true). Everything is compute-on-read over the work_ticket table, so it never
+    drifts when a sample is re-processed, re-submitted, or deleted."""
+
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    sample_count: Annotated[int, Field(ge=0)]
+    samples_completed: Annotated[int, Field(ge=0)]
+    samples_in_flight: Annotated[int, Field(ge=0)]
+    samples_failed: Annotated[int, Field(ge=0)]
+    samples_not_submitted: Annotated[int, Field(ge=0)]
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def complete(self) -> bool:
+        """True when the pool has samples and every one has a COMPLETED
+        fastq-to-parquet ticket."""
+        return self.sample_count > 0 and self.samples_completed == self.sample_count
+
+
 class SequencedPoolPreflightResponse(BaseModel):
     """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool/{P}/preflight.
 
