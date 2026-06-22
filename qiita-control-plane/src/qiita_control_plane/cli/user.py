@@ -214,6 +214,18 @@ def _get_work_ticket(base_url: str, token: str, work_ticket_idx: int) -> dict:
     return _common.call("GET", base_url, token, f"{PATH_WORK_TICKET_PREFIX}/{work_ticket_idx}")
 
 
+def _run_work_ticket(base_url: str, token: str, work_ticket_idx: int) -> dict:
+    """POST /api/v1/work-ticket/{idx}/run. Operator override and the only retry
+    mechanism (there is no auto-retry worker): resets a FAILED ticket to PENDING
+    (clears failure_*, retry_count → 0) and re-dispatches it, or re-dispatches a
+    PENDING ticket whose create-time dispatch was lost. The runner fast-forwards
+    every step already marked COMPLETED and resumes at the first incomplete one,
+    so a costly finished step (e.g. stage_local_fasta) is not recomputed. No
+    request body. Auth: originator or wet_lab_admin+. Returns the new {idx,
+    state}."""
+    return _common.call("POST", base_url, token, f"{PATH_WORK_TICKET_PREFIX}/{work_ticket_idx}/run")
+
+
 def _get_work_ticket_step_logs(
     base_url: str,
     token: str,
@@ -755,6 +767,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Work-ticket idx returned by `qiita ticket submit`.",
     )
     p_ticket_status.set_defaults(handler=_handle_ticket_status)
+
+    p_ticket_run = p_ticket_sub.add_parser(
+        "run",
+        help="Resume/retry a work-ticket — reset a FAILED ticket and re-dispatch, "
+        "skipping already-completed steps (POST /work-ticket/{idx}/run)",
+    )
+    p_ticket_run.add_argument(
+        "work_ticket_idx",
+        type=int,
+        help="Work-ticket idx to resume (from `qiita ticket submit` / `status`).",
+    )
+    p_ticket_run.set_defaults(handler=_handle_ticket_run)
 
     p_ticket_list = p_ticket_sub.add_parser(
         "list",
@@ -1353,6 +1377,16 @@ def _handle_ticket_status(args: argparse.Namespace, parser: argparse.ArgumentPar
     (state, retry_count, failure_*, timestamps) without a second call."""
     return _common.run_http_subcommand(
         lambda t: _get_work_ticket(args.base_url, t, args.work_ticket_idx)
+    )
+
+
+def _handle_ticket_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Resume/retry a work-ticket: reset a FAILED ticket and re-dispatch (the
+    only retry path — no auto-retry worker). The runner fast-forwards every
+    already-COMPLETED step, so an expensive finished step is not re-run; the
+    ticket resumes at the first incomplete step. Prints the new {idx, state}."""
+    return _common.run_http_subcommand(
+        lambda t: _run_work_ticket(args.base_url, t, args.work_ticket_idx)
     )
 
 
