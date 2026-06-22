@@ -23,6 +23,38 @@ _None yet._
 
 ### 3. Migrations
 
+_None yet._
+
+### 4. Deploy
+
+_None yet._
+
+### 5. Verify
+
+_None yet._
+
+### Notes (no host action)
+
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-22 — f07359e
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
 - (#148) `20260622000000_sequenced_sample_read_metrics.sql` — adds three nullable
   `BIGINT` read-count columns + CHECK constraints to `qiita.sequenced_sample`.
   Plain `make migrate`; additive and backfill-free (existing rows read NULL).
@@ -36,15 +68,15 @@ _None yet._
   `qiita.sequenced_sample`. Plain `make migrate`; additive and backfill-free
   (existing rows read NULL/NULL).
 
-### 4. Deploy
+#### 4. Deploy
 
 _None yet._
 
-### 5. Verify
+#### 5. Verify
 
 _None yet._
 
-### Notes (no host action)
+#### Notes (no host action)
 
 - (#147) `fastq-to-parquet/1.2.0` now declares three additional step outputs
   (`raw_read_count` / `biological_read_count` / `quality_filtered_read_count` — the
@@ -94,12 +126,6 @@ _None yet._
   `qiita-user pool-completion`) reporting per-sample fastq-to-parquet completion —
   additive, read-gated like the existing pool rollups. No new env var, host dir,
   scope, migration, or workflow/SIF change.
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-22 — af1fa22
 
