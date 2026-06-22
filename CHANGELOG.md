@@ -22,6 +22,18 @@ the `no-changelog` label).
   so an expensive finished step (e.g. `stage_local_fasta`) is not recomputed.
   Mirrors `qiita ticket status`; no server change (the route and api_paths
   constants already existed) (#157)
+- Pool prep-generation completion rollup. New `GET
+  /api/v1/sequencing-run/{run}/sequenced-pool/{pool}/completion` route (and
+  `qiita-user pool-completion`) classifies each non-retired `sequenced_sample` by
+  the state of its `fastq-to-parquet` work tickets (any version) and tallies
+  `samples_completed` / `samples_in_flight` / `samples_failed` /
+  `samples_not_submitted` over the pool, with a `complete` flag (every sample
+  COMPLETED, pool non-empty). The SPP `GenPrepFileJob` end-state equivalent: it
+  tells the operator whether the per-sample fan-out finished. Compute-on-read
+  over the work tickets, so it never drifts when a sample is re-processed,
+  re-submitted, or deleted. Read-gated like the other pool rollups
+  (prep_sample:read + wet_lab_admin). Part of #146 (#158)
+
 - Per-sample host-filter references. `sequenced_sample` gains two nullable FK
   columns (`host_rype_reference_idx`, `host_minimap2_reference_idx` → `reference`,
   with a CHECK that minimap2 only accompanies rype) recording which host the
@@ -300,6 +312,17 @@ the `no-changelog` label).
 
 ### Changed
 
+- `qiita-user submit-host-filter-pool` now host-filters each pool sample against
+  the reference(s) recorded on it at `submit-bcl-convert` time, instead of a
+  single uniform reference for the whole pool. **Operator-facing CLI contract
+  change:** the global `--host-rype-reference-idx` / `--host-minimap2-reference-idx`
+  flags are removed (host filtering is per-sample now). Samples with a recorded
+  `host_rype_reference_idx` are depleted against it (plus their optional minimap2
+  reference); samples with none recorded (preflight `human_filtering=0`) get a
+  QC-only `host_filter_enabled=false` pass-through ticket — the first fan-out path
+  for unfiltered samples. The gesture pre-flights each distinct recorded reference
+  (ACTIVE + the required index) once up front, so a misconfiguration aborts with
+  zero side effects. Part of #146 (#158)
 - Stripped this repo's GitHub issue/PR numbers from code comments, docstrings,
   and string literals across all components (comment-only; no behavior change),
   and recorded the convention in `CLAUDE.md`: provenance lives in git / CHANGELOG
