@@ -32,6 +32,8 @@ from pathlib import Path
 import duckdb
 import pytest
 
+from qiita_compute_orchestrator.read_count import ReadCount
+
 # Independent oracle for the preserved output schema (deliberately NOT shared
 # with the writer fixture, so a drift in either is caught).
 _READS_SCHEMA = ["sequence_idx", "read_id", "sequence1", "qual1", "sequence2", "qual2"]
@@ -133,6 +135,11 @@ def test_qc_routes_se_pe_and_unions(tmp_path, monkeypatch, write_reads, read_sur
     assert _schema(out["reads"]) == _READS_SCHEMA
     # 10, 30 are SE (R2 NULL); 20, 40 are PE (R2 not NULL) — proves routing.
     assert _rows(out["reads"]) == [(10, True), (20, False), (30, True), (40, False)]
+    # Biological read count (#141) is emitted over the QC'd output: 4 rows
+    # (count(*)) + 2 R2s (count(sequence2)) = 6 reads r1r2; layout 'paired'
+    # because at least one R2 is present.
+    rc = ReadCount.model_validate_json(out["biological_read_count"].read_text())
+    assert (rc.read_pairs, rc.read_count_r1r2, rc.layout) == (4, 6, "paired")
 
 
 @pytest.mark.parametrize(

@@ -35,6 +35,7 @@ from qiita_compute_orchestrator.jobs.fastq_to_parquet import (
     Inputs,
     execute,
 )
+from qiita_compute_orchestrator.read_count import ReadCount
 from qiita_compute_orchestrator.sequence_range import MintedSequenceRange
 
 
@@ -93,6 +94,11 @@ def test_execute_writes_reads_parquet_for_fastq(fake_mint, tmp_path):
 
     # mint was called once with the exact count.
     assert fake_mint == [(42, 3)]
+
+    # Raw read count (#141): 3 single-end reads → 3 reads r1r2 (R1 only),
+    # layout 'single'.
+    rc = ReadCount.model_validate_json(outputs["raw_read_count"].read_text())
+    assert (rc.read_pairs, rc.read_count_r1r2, rc.layout) == (3, 3, "single")
 
     rows = _read_parquet(parquet)
     assert len(rows) == 3
@@ -164,6 +170,11 @@ def test_execute_writes_paired_reads_with_shared_sequence_idx(fake_mint, tmp_pat
 
     # Mint called once with count=2 (pairs), NOT count=4 (individual reads).
     assert fake_mint == [(42, 2)]
+
+    # Raw read count (#141): 2 pairs → count(*)=2 + count(sequence2)=2 = 4
+    # reads r1r2 (both mates), layout 'paired'.
+    rc = ReadCount.model_validate_json(outputs["raw_read_count"].read_text())
+    assert (rc.read_pairs, rc.read_count_r1r2, rc.layout) == (2, 4, "paired")
 
     with duckdb.connect(":memory:") as conn:
         rows = conn.execute(

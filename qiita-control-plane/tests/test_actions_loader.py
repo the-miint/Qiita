@@ -538,19 +538,23 @@ def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():
     assert "fastq_path" in v11.context_schema["required"]
 
     # 1.2.0: fastq -> qc (always-on) -> host_filter. Each stage re-emits the
-    # `reads` binding it consumes (a transform in place), so host_filter is
-    # identical to 1.1.0 and consumes qc's QC'd `reads`.
+    # `reads`/`filtered_reads` binding it consumes (a transform in place) AND a
+    # per-stage read-count sidecar (#141): raw / biological / quality-filtered.
     v12 = by_key[("fastq-to-parquet", "1.2.0")]
     assert v12.target_kind == ScopeTargetKind.PREP_SAMPLE
     assert v12.target_processing_kinds == ["sequenced"]
     assert [s.name for s in v12.steps] == ["fastq", "qc", "host_filter"]
+
+    v12_fastq = next(s for s in v12.steps if s.name == "fastq")
+    # 1.2.0's fastq also emits the raw read count sidecar (#141), unlike 1.0.0/1.1.0.
+    assert v12_fastq.outputs == ["reads", "raw_read_count"]
 
     qc = next(s for s in v12.steps if s.name == "qc")
     assert qc.module == "qiita_compute_orchestrator.jobs.qc"
     # `adapter_parquet` in inputs triggers the runner's adapter materialization;
     # `reads` is fastq's output, re-emitted as `reads` so host_filter consumes it.
     assert qc.inputs == ["reads", "adapter_parquet"]
-    assert qc.outputs == ["reads"]
+    assert qc.outputs == ["reads", "biological_read_count"]
     # instrument_model rides through `params` (action_context key -> Inputs field),
     # NOT inputs (it's a scalar, not a host path).
     assert qc.params == {"instrument_model": "instrument_model"}
@@ -559,7 +563,7 @@ def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():
     assert v12_host_filter.module == "qiita_compute_orchestrator.jobs.host_filter"
     assert v12_host_filter.inputs == ["reads"]
     assert v12_host_filter.optional_inputs == ["host_rype_path", "host_minimap2_path"]
-    assert v12_host_filter.outputs == ["filtered_reads"]
+    assert v12_host_filter.outputs == ["filtered_reads", "quality_filtered_read_count"]
 
     # 1.2.0 uses the two-reference host-filter layout + instrument_model.
     props12 = v12.context_schema["properties"]

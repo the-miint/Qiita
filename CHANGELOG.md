@@ -15,6 +15,16 @@ the `no-changelog` label).
 
 ### Added
 
+- The `fastq`, `qc`, and `host_filter` native steps now emit a `read_count.json`
+  sidecar recording how many reads survive each parquet stage, captured as the
+  three SPP boundary counts per `prep_sample`: raw (`fastq` → `raw_read_count`),
+  biological (`qc` → `biological_read_count`), and quality-filtered
+  (`host_filter` → `quality_filtered_read_count`). The count is
+  `count(*) + count(sequence2)` (both mates, the `*_r1r2` convention) via a new
+  shared `read_count.write_read_count` helper. `fastq-to-parquet/1.2.0` declares
+  the three outputs so the runner forwards them in `bound`; persisting them onto
+  `sequenced_sample` is a follow-up (#142). Emission only — no schema change;
+  implements #141 (#147)
 - New `GET /api/v1/sequencing-run/{sequencing_run_idx}` route returning a run's
   caller-visible metadata (notably `instrument_model`). Read-gated like the pool
   roster route (prep_sample:read + wet_lab_admin). `qiita submit-host-filter-pool`

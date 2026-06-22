@@ -59,6 +59,7 @@ import duckdb
 from pydantic import BaseModel
 
 from ..miint import PARQUET_OPTS, apply_duckdb_settings, open_miint_conn
+from ..read_count import write_read_count
 
 YAML_STEP_NAME = "host_filter"
 
@@ -262,6 +263,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "  ON drop_set.sequence_idx = r.sequence_idx "
                 f"ORDER BY sequence_idx) TO '{out_sql}' ({PARQUET_OPTS})"
             )
+            # Emit the quality-filtered read count (#141): reads surviving host
+            # depletion (== biological count on a pass-through). Reuse this
+            # connection — write_read_count only does a footer-level count.
+            quality_filtered_read_count = write_read_count(conn, filtered, workspace)
         success = True
     finally:
         # Drop the spill dir before returning so the SLURM launcher's manifest
@@ -271,4 +276,4 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         if not success:
             filtered.unlink(missing_ok=True)
 
-    return {"filtered_reads": filtered}
+    return {"filtered_reads": filtered, "quality_filtered_read_count": quality_filtered_read_count}
