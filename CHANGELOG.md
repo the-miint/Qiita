@@ -559,6 +559,31 @@ the `no-changelog` label).
 
 ### Fixed
 
+- `hash_sequences` no longer OOMs writing `reference_sequence_chunks` on
+  genome-scale reference loads. The per-batch output COPY joined the full
+  `hashed` table (which grows 1:1 with the input), so at scale the optimizer
+  could reorder that join ahead of the batch filter and materialize the entire
+  file's `chunk_data` (observed 38 GiB against a 39 GiB cap). It also re-scanned
+  the whole upload once per batch (~420× at 21M rows) and globally sorted by
+  `sequence_hash` — a sort no consumer needs (`reference_load` re-keys to
+  `feature_idx` with its own scan, the data plane's DoGet filters by
+  `feature_idx`, and reassembly sorts `chunk_index` in-memory per feature).
+  Replaced with a single streaming scan that relabels read_id → canonical
+  `sequence_hash` in one pass: `canonical` (one narrow row per distinct hash) is
+  always the lower-cardinality join input, so it's the hash-join build side and
+  `chunk_data` streams through the probe to the writer — peak memory ~1 GB/thread
+  and constant in file size, and the upload is scanned once instead of per batch.
+  Output schema and canonical-dedup semantics are unchanged (one
+  `part_00000.parquet` in the directory). (#155)
+- `reference_load`'s per-batch chunk re-key (`sequence_hash` → `feature_idx`)
+  carried the same latent OOM as the hash_sequences output side: each batch
+  joined the full `feature_map` table, which grows 1:1 with the feature count,
+  so at reference scale the optimizer could reorder that join ahead of the batch
+  filter and materialize the whole glob's `chunk_data`. The join is now bounded
+  to the batch's hashes by construction (an `fmb` CTE pre-filtered to the batch),
+  so no join order can exceed one batch. The feature_idx-clustered, disjoint-range
+  part layout (load-bearing for DuckLake / row-group pruning on DoGet's feature_idx
+  lookups) and per-batch sort are unchanged. (#155)
 - Native (`module:`) SLURM steps no longer collapse to a single CPU. The
   generated launcher ran a bare `srun`, but SLURM >= 22.05 srun no longer
   inherits `--cpus-per-task` from the batch allocation, so it laid the single
@@ -571,7 +596,6 @@ the `no-changelog` label).
   `srun --cpu-bind=none`, letting the thread pool float across the whole cgroup
   cpuset (which already constrains the job to its allocation). Container
   (`apptainer exec`, no srun) steps were never affected. (#153)
-
 - Data-plane file registration no longer collides with — and attempts to
   overwrite — an already-registered DuckLake data file. `register_files` placed
   each Parquet at `DATA_PATH/<table>/<producer-basename>`, but the reference-load
