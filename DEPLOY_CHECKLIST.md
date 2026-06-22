@@ -37,17 +37,6 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#140) `stage_local_fasta` resource retune in `local-host-reference-add/1.0.0`
-  (`cpu: 8`/`mem_gb: 32` → `cpu: 4`/`mem_gb: 64`; still within the `cpu: 16`/`mem_gb: 64`
-  ceiling). The `workflows/local-host-reference-add/1.0.0.yaml` entry is **edited in
-  place** — re-synced into `qiita.action` by `qiita-admin actions sync` inside
-  `activate.sh` (already covered by bucket 5's `qiita.action` list check), **not** a
-  migration. No client breakage, no new env var, host dir, scope, or migration.
-- (#140) Parquet result files are now written with `ROW_GROUP_SIZE_BYTES '64MB'`
-  (smaller row groups: finer pushdown, lower write memory). Code-only write-side
-  tuning; the data plane reads these files via the same pinned DuckDB 1.5.4, the
-  format is unchanged, and output stays clustered on the `ORDER BY` key, so DuckLake
-  registration + pruning are unaffected. No host action, env var, scope, or migration.
 - (#147) `fastq-to-parquet/1.2.0` now declares three additional step outputs
   (`raw_read_count` / `biological_read_count` / `quality_filtered_read_count` — the
   per-stage `read_count.json` sidecars). The `workflows/fastq-to-parquet/1.2.0.yaml`
@@ -69,6 +58,42 @@ _None yet._
 ## Deployed history
 
 Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-22 — af1fa22
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
+_None yet._
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
+
+_None yet._
+
+#### Notes (no host action)
+
+- (#140) `stage_local_fasta` resource retune in `local-host-reference-add/1.0.0`
+  (`cpu: 8`/`mem_gb: 32` → `cpu: 4`/`mem_gb: 64`; still within the `cpu: 16`/`mem_gb: 64`
+  ceiling). The `workflows/local-host-reference-add/1.0.0.yaml` entry is **edited in
+  place** — re-synced into `qiita.action` by `qiita-admin actions sync` inside
+  `activate.sh` (already covered by bucket 5's `qiita.action` list check), **not** a
+  migration. No client breakage, no new env var, host dir, scope, or migration.
+- (#140) Parquet result files are now written with `ROW_GROUP_SIZE_BYTES '64MB'`
+  (smaller row groups: finer pushdown, lower write memory). Code-only write-side
+  tuning; the data plane reads these files via the same pinned DuckDB 1.5.4, the
+  format is unchanged, and output stays clustered on the `ORDER BY` key, so DuckLake
+  registration + pruning are unaffected. No host action, env var, scope, or migration.
 
 ### Deployed 2026-06-20 — 5b21afe
 
