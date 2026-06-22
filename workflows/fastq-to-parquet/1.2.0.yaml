@@ -102,6 +102,20 @@ steps:
       mem_gb: 8
       walltime: PT30M
 
+  # fastqc-equivalent QC summary on the RAW reads (the fastq output, before qc
+  # trims/filters). Must run BEFORE qc: it reports on the `reads` binding while
+  # it is still fastq's output, and qc below re-emits `reads`. Emits the
+  # `raw_qc_report` qc_report.json sidecar for the merged-report step.
+  - step: qc_report_raw
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.qc_report
+    inputs: [reads]
+    outputs: [raw_qc_report]
+    baseline_resources:
+      cpu: 2
+      mem_gb: 8
+      walltime: PT1H
+
   # Always-on QC on the minted reads. `adapter_parquet` is materialized by the
   # runner's _resolve_qc_adapters (triggered because this step lists it as an
   # input) before the step loop. `instrument_model` rides through `params:`
@@ -149,6 +163,19 @@ steps:
       cpu: 4
       mem_gb: 16
       walltime: PT4H
+
+  # fastqc-equivalent QC summary on the host-filtered reads (the host_filter
+  # output). The same qc_report module as qc_report_raw, selected by binding
+  # `filtered_reads` instead of `reads`; emits the `filtered_qc_report` sidecar.
+  - step: qc_report_filtered
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.qc_report
+    inputs: [filtered_reads]
+    outputs: [filtered_qc_report]
+    baseline_resources:
+      cpu: 2
+      mem_gb: 8
+      walltime: PT1H
 
   # Persist the three per-stage read counts onto this prep_sample's 1:1
   # sequenced_sample row (raw / biological / quality-filtered, both-mates r1r2).

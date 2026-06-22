@@ -52,6 +52,12 @@ _None yet._
   in the USER ceiling, so all three audience roles keep access — only a token
   scoped *below* its role ceiling is affected). No new host dir, env var, or
   service-account grant.
+- (#152) `fastq-to-parquet/1.2.0` gains two `qc_report` steps (`qc_report_raw`,
+  `qc_report_filtered`) backed by the new native `qc_report` job module. Re-synced
+  into `qiita.action` by `qiita-admin actions sync` (same in-place edit as #147);
+  the module ships with the orchestrator code (a native step, not a container — no
+  SIF). Reporting only; no client breakage, no new env var, host dir, scope, or
+  migration.
 
 ---
 

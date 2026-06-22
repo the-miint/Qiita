@@ -15,6 +15,18 @@ the `no-changelog` label).
 
 ### Added
 
+- New `qc_report` native job: a fastqc-equivalent per-sample QC summary computed
+  in DuckDB straight from `reads.parquet` (no container, no miint extension). Per
+  mate (r1/r2) it reports read/base counts, mean quality, GC and N content,
+  length stats, and per-sequence mean-quality / GC-percent / length histograms,
+  written as a `qc_report.json` sidecar. Wired into `fastq-to-parquet/1.2.0` as
+  two steps mirroring SPP's bclconvert/filtered_sequences split — `qc_report_raw`
+  (on the raw fastq output, before qc) and `qc_report_filtered` (on the
+  host-filtered output) — sharing one module, disambiguated by input/output
+  binding (`reads`→`raw_qc_report`, `filtered_reads`→`filtered_qc_report`). The
+  artifacts feed the upcoming merged-report step; reporting only, no filtering
+  change (#152)
+
 - New `GET /api/v1/sequencing-run/{run}/sequenced-pool/{pool}` route returning a
   pool's metadata plus a compute-on-read read-metric rollup (#143): per-stage
   read-count SUMS over the pool's non-retired `sequenced_sample` rows
