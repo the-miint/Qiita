@@ -30,6 +30,11 @@ _None yet._
   `jsonb` QC-report columns (`raw_qc_report`, `filtered_qc_report`) to
   `qiita.sequenced_sample`. Plain `make migrate`; additive and backfill-free
   (existing rows read NULL).
+- (#156) `20260622020000_sequenced_sample_host_references.sql` — adds two nullable
+  FK columns (`host_rype_reference_idx`, `host_minimap2_reference_idx` →
+  `qiita.reference`, ON DELETE RESTRICT) + a CHECK (minimap2 requires rype) to
+  `qiita.sequenced_sample`. Plain `make migrate`; additive and backfill-free
+  (existing rows read NULL/NULL).
 
 ### 4. Deploy
 
@@ -69,6 +74,16 @@ _None yet._
   added), or SIF. New read-only `GET .../sequenced-pool/{pool}/qc-report` endpoint
   (the merged pool report) — additive, read-gated like the existing pool roster;
   no host action.
+- (#156) Per-sample host-filter references (new bucket-3 columns). The
+  sequenced-sample composer now accepts optional `host_rype_reference_idx` /
+  `host_minimap2_reference_idx`, and `qiita-user submit-bcl-convert` gains
+  `--host-rype-reference-idx` (+ optional `--host-minimap2-reference-idx`).
+  **Operator-facing CLI change:** a bcl-convert run whose preflight has any
+  `human_filtering` sample now requires `--host-rype-reference-idx` (the host
+  reference is recorded per sample for the later fan-out); the reference must be
+  ACTIVE + carry the right index (built via `host-reference-add`) or the gesture
+  aborts before any side effect. No new env var, host dir, scope, or migration
+  beyond the additive bucket-3 columns.
 
 ---
 

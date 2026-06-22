@@ -105,16 +105,24 @@ _FASTQ_TO_PARQUET_ACTION_VERSION = "1.2.0"
 class _PreflightRow(NamedTuple):
     """One illumina_sample row pulled from the kl-run-preflight SQLite.
 
-    Field names mirror `run_preflight.get_illumina_sample_info`'s 4-tuple.
-    `secondary_project_accessions` is empty for non-control samples;
-    controls carry one entry per non-primary plate project, sorted by
-    accession value.
+    The first four fields mirror `run_preflight.get_illumina_sample_info`'s
+    4-tuple. `secondary_project_accessions` is empty for non-control samples;
+    controls carry one entry per non-primary plate project, sorted by accession
+    value. `human_filtering` is the sample's effective project's
+    `human_filtering` flag — True -> deplete against the operator's host
+    reference(s), False -> no host filtering — mapped onto the sequenced_sample's
+    host reference columns at creation. It is sourced separately from the info
+    4-tuple: the sample's effective project comes from
+    `run_preflight.db.get_illumina_sample_rows` (the project_name column) joined
+    to a `project.human_filtering` read, since the library exposes no per-sample
+    human_filtering accessor.
     """
 
     illumina_sample_idx: int
     biosample_accession: str
     primary_project_accession: str
     secondary_project_accessions: list[str]
+    human_filtering: bool
 
 
 # ---------------------------------------------------------------------------
@@ -989,6 +997,29 @@ def _build_parser() -> argparse.ArgumentParser:
             " the per-row study_idx already does (project.qiita_id)."
         ),
     )
+    p_submit_bcl.add_argument(
+        "--host-rype-reference-idx",
+        type=int,
+        default=None,
+        help=(
+            "ACTIVE host reference_idx whose rype (.ryxdi) index every"
+            " human_filtering sample is depleted against. REQUIRED when any"
+            " preflight sample has human_filtering set; recorded per sample so the"
+            " later pool fan-out host-filters exactly those samples (preflight"
+            " human_filtering=0 samples get no host reference and are not"
+            " filtered). Checked ACTIVE + carrying a rype index up front."
+        ),
+    )
+    p_submit_bcl.add_argument(
+        "--host-minimap2-reference-idx",
+        type=int,
+        default=None,
+        help=(
+            "Optional ACTIVE host reference_idx whose minimap2 (.mmi) index drives"
+            " the second host-filter pass for human_filtering samples. Requires"
+            " --host-rype-reference-idx. Omit for a rype-only host filter."
+        ),
+    )
     p_submit_bcl.set_defaults(handler=_handle_submit_bcl_convert)
 
     p_delete_pool = sub.add_parser(
@@ -1520,6 +1551,10 @@ def _read_preflight_rows(
     primary_project_accession) raise via parser.error so the CLI
     surfaces a single stderr line and exits 2 before any network call.
     """
+    # get_illumina_sample_info / open_db_file are top-level run_preflight exports;
+    # get_illumina_sample_rows lives in the run_preflight.db submodule (NOT
+    # re-exported at the top level), so it is reached through `db`.
+    from run_preflight import db as run_preflight_db  # noqa: PLC0415
     from run_preflight import get_illumina_sample_info, open_db_file  # noqa: PLC0415
 
     try:
@@ -1528,6 +1563,17 @@ def _read_preflight_rows(
         parser.error(f"--preflight-blob {preflight_blob}: not a readable SQLite file: {exc}")
     try:
         illumina_samples = get_illumina_sample_info(conn)
+        # The library exposes no per-sample human_filtering accessor, so map each
+        # illumina_sample to its effective project (get_illumina_sample_rows,
+        # do_not_use-excluded like get_illumina_sample_info) and read that
+        # project's human_filtering flag from the preflight directly.
+        project_by_idx = {row[0]: row[4] for row in run_preflight_db.get_illumina_sample_rows(conn)}
+        filtering_by_project = {
+            name: bool(flag)
+            for name, flag in conn.execute(
+                "SELECT project_name, human_filtering FROM project"
+            ).fetchall()
+        }
     except (sqlite3.DatabaseError, ValueError) as exc:
         parser.error(
             f"--preflight-blob {preflight_blob}: preflight query failed ({exc});"
@@ -1556,12 +1602,20 @@ def _read_preflight_rows(
                 f" {illumina_sample_idx} carries no primary_project_accession;"
                 " populate upstream before re-submitting"
             )
+        project_name = project_by_idx.get(illumina_sample_idx)
+        if project_name not in filtering_by_project:
+            parser.error(
+                f"--preflight-blob {preflight_blob}: illumina_sample_idx"
+                f" {illumina_sample_idx} maps to no project with a human_filtering"
+                " flag; verify the file is a kl-run-preflight SQLite"
+            )
         parsed.append(
             _PreflightRow(
                 illumina_sample_idx=int(illumina_sample_idx),
                 biosample_accession=biosample_accession,
                 primary_project_accession=primary,
                 secondary_project_accessions=list(secondary),
+                human_filtering=filtering_by_project[project_name],
             )
         )
     return parsed
@@ -1697,6 +1751,29 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
     # land as parser.error / exit 2.
     preflight_rows = _read_preflight_rows(args.preflight_blob, parser)
 
+    # Host-filter argument coherence, validated before any network call:
+    #   - minimap2 is the optional second stage; it never runs without rype.
+    #   - if any sample requests human_filtering, --host-rype-reference-idx must
+    #     name the host reference to record on those samples; without it those
+    #     samples would silently never be host-filtered.
+    if args.host_minimap2_reference_idx is not None and args.host_rype_reference_idx is None:
+        parser.error("--host-minimap2-reference-idx requires --host-rype-reference-idx")
+    any_human_filtering = any(row.human_filtering for row in preflight_rows)
+    if any_human_filtering and args.host_rype_reference_idx is None:
+        parser.error(
+            "the preflight has human_filtering samples but no"
+            " --host-rype-reference-idx was given; pass the host reference to"
+            " deplete them against (preflight human_filtering=0 samples are left"
+            " unfiltered)"
+        )
+    if args.host_rype_reference_idx is not None and not any_human_filtering:
+        # Not fatal, but the operator likely expected the reference to take
+        # effect — every sample's per-row guard leaves it unrecorded.
+        sys.stderr.write(
+            "warning: --host-rype-reference-idx was given but no preflight sample"
+            " has human_filtering set; no sample will record a host reference\n"
+        )
+
     # One-pass order-preserving dedup over preflight_rows so the lookup
     # route's `missing` echo is deterministic; the study side pools each
     # row's primary + secondaries so controls land their full set.
@@ -1752,6 +1829,28 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
             _print_missing_accession_error(preflight_rows, missing_biosamples, missing_studies)
             raise SystemExit(1)
 
+        # Host-reference readiness — only when at least one sample is host-
+        # filtered. Fail the whole gesture before any run/pool/sample side effect
+        # if a designated host reference can't filter (not ACTIVE / missing its
+        # index), so the operator sees one actionable error instead of samples
+        # recorded against an unusable reference.
+        if any_human_filtering:
+            _assert_host_reference_ready(
+                args.base_url,
+                token,
+                args.host_rype_reference_idx,
+                HOST_FILTER_INDEX_TYPE_RYPE,
+                "--host-rype-reference-idx",
+            )
+            if args.host_minimap2_reference_idx is not None:
+                _assert_host_reference_ready(
+                    args.base_url,
+                    token,
+                    args.host_minimap2_reference_idx,
+                    HOST_FILTER_INDEX_TYPE_MINIMAP2,
+                    "--host-minimap2-reference-idx",
+                )
+
         run_resp, run_status = _common.call_with_status(
             "POST",
             args.base_url,
@@ -1784,6 +1883,18 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
         per_sample_results: list[dict] = []
         for row in preflight_rows:
             secondary_study_idxs = [resolved_studies[a] for a in row.secondary_project_accessions]
+            # human_filtering samples record the operator's host reference(s) so
+            # the pool fan-out depletes them; human_filtering=0 samples carry no
+            # host reference and are left unfiltered. Only set the keys when
+            # filtering applies so an unfiltered sample's body stays minimal
+            # (the model defaults both to None == no host filtering).
+            host_rype = args.host_rype_reference_idx if row.human_filtering else None
+            host_minimap2 = args.host_minimap2_reference_idx if row.human_filtering else None
+            host_kwargs: dict[str, int] = {}
+            if host_rype is not None:
+                host_kwargs["host_rype_reference_idx"] = host_rype
+                if host_minimap2 is not None:
+                    host_kwargs["host_minimap2_reference_idx"] = host_minimap2
             sample_body = SequencedSampleCreateRequest(
                 biosample_idx=resolved_biosamples[row.biosample_accession],
                 owner_idx=owner_idx,
@@ -1791,6 +1902,7 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
                 sequenced_pool_item_id=str(row.illumina_sample_idx),
                 primary_study_idx=resolved_studies[row.primary_project_accession],
                 secondary_study_idxs=secondary_study_idxs,
+                **host_kwargs,
             ).model_dump(exclude_unset=True, mode="json")
             sample_path = PATH_SEQUENCED_SAMPLE_FROM_RUN.format(
                 sequencing_run_idx=sequencing_run_idx,
@@ -1810,6 +1922,9 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
                     "biosample_idx": resolved_biosamples[row.biosample_accession],
                     "primary_study_idx": resolved_studies[row.primary_project_accession],
                     "secondary_study_idxs": secondary_study_idxs,
+                    "human_filtering": row.human_filtering,
+                    "host_rype_reference_idx": host_rype,
+                    "host_minimap2_reference_idx": host_minimap2,
                     "sequenced_sample_idx": sample_resp["sequenced_sample_idx"],
                 }
             )

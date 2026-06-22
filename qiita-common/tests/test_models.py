@@ -555,6 +555,55 @@ def test_dedupe_secondary_study_idxs():
     assert req.secondary_study_idxs == [5, 3]
 
 
+def test_sequenced_sample_create_accepts_host_references():
+    """host_rype_reference_idx + host_minimap2_reference_idx are accepted
+    together (the full host-filter pair)."""
+    from qiita_common.models import SequencedSampleCreateRequest
+
+    req = SequencedSampleCreateRequest(
+        biosample_idx=1,
+        prep_protocol_idx=1,
+        owner_idx=1,
+        sequenced_pool_item_id="X",
+        primary_study_idx=1,
+        host_rype_reference_idx=7,
+        host_minimap2_reference_idx=8,
+    )
+    assert req.host_rype_reference_idx == 7
+    assert req.host_minimap2_reference_idx == 8
+
+
+def test_sequenced_sample_create_defaults_host_references_none():
+    """Both host references default to None — a sample with no host filtering."""
+    from qiita_common.models import SequencedSampleCreateRequest
+
+    req = SequencedSampleCreateRequest(
+        biosample_idx=1,
+        prep_protocol_idx=1,
+        owner_idx=1,
+        sequenced_pool_item_id="X",
+        primary_study_idx=1,
+    )
+    assert req.host_rype_reference_idx is None
+    assert req.host_minimap2_reference_idx is None
+
+
+def test_sequenced_sample_create_minimap2_requires_rype():
+    """minimap2 is the optional second host-filter stage; setting it without
+    rype is rejected at the wire boundary (mirrors the DB CHECK)."""
+    from qiita_common.models import SequencedSampleCreateRequest
+
+    with pytest.raises(ValidationError, match="host_minimap2_reference_idx requires"):
+        SequencedSampleCreateRequest(
+            biosample_idx=1,
+            prep_protocol_idx=1,
+            owner_idx=1,
+            sequenced_pool_item_id="X",
+            primary_study_idx=1,
+            host_minimap2_reference_idx=8,
+        )
+
+
 def test_missing_reason_ref_rejects_empty_name():
     """Tests the case where MissingReasonRef is constructed with an
     empty name: validation fails so the empty marker never reaches the
