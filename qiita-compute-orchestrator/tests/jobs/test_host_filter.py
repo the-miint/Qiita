@@ -32,6 +32,8 @@ from pathlib import Path
 import duckdb
 import pytest
 
+from qiita_compute_orchestrator.read_count import ReadCount
+
 # Independent oracle for the preserved output schema (deliberately NOT shared
 # with the writer fixture, so a drift in either is caught).
 _READS_SCHEMA = ["sequence_idx", "read_id", "sequence1", "qual1", "sequence2", "qual2"]
@@ -104,6 +106,10 @@ def test_host_filter_drops_rype_union_minimap2(tmp_path, monkeypatch, write_read
 
     assert read_survivors(out["filtered_reads"]) == [20, 40]
     assert _schema(out["filtered_reads"]) == _READS_SCHEMA
+    # Quality-filtered read count (#141) over the survivors: 2 rows (20 PE, 40
+    # SE) → count(*)=2 + count(sequence2)=1 = 3 reads r1r2; layout 'paired'.
+    rc = ReadCount.model_validate_json(out["quality_filtered_read_count"].read_text())
+    assert (rc.read_pairs, rc.read_count_r1r2, rc.layout) == (2, 3, "paired")
     # rype saw one query row per pair (both mates ride sequence1/sequence2; the
     # tools handle PE natively — no unrolling).
     assert seen["rype_query_ids"] == [10, 20, 30, 40]

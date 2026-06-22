@@ -59,6 +59,7 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
+from ..read_count import write_read_count
 
 YAML_STEP_NAME = "qc"
 
@@ -316,6 +317,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"COPY (({se_select}) UNION ALL ({pe_select}) ORDER BY sequence_idx) "
                 f"TO '{out_sql}' ({PARQUET_OPTS})"
             )
+            # Emit the biological read count (#141): reads surviving adapter +
+            # quality/length filtering, before host_filter. Reuse this
+            # connection — write_read_count only does a footer-level count.
+            biological_read_count = write_read_count(conn, qc_reads, workspace)
         success = True
     finally:
         # Drop the spill dir before returning so the SLURM launcher's manifest
@@ -331,4 +336,4 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # step's wire input name must equal the downstream job's `Inputs` field — and
     # host_filter (shared with 1.1.0's fastq -> host_filter) reads `reads`, so the
     # binding stays `reads`. The on-disk file is qc_reads.parquet for provenance.
-    return {"reads": qc_reads}
+    return {"reads": qc_reads, "biological_read_count": biological_read_count}

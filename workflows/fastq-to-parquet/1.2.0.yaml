@@ -89,7 +89,10 @@ steps:
     inputs: [fastq_path]
     # `reverse_fastq_path` flows through only when the action_context carries it.
     optional_inputs: [reverse_fastq_path]
-    outputs: [reads]
+    # `raw_read_count` is the read_count.json sidecar (#141): raw reads out of
+    # bcl-convert, before qc/host_filter. The runner forwards it in `bound` for
+    # a future per-sample persistence consumer (#142).
+    outputs: [reads, raw_read_count]
     baseline_resources:
       cpu: 2
       mem_gb: 8
@@ -106,7 +109,10 @@ steps:
     module: qiita_compute_orchestrator.jobs.qc
     inputs: [reads, adapter_parquet]
     params: {instrument_model: instrument_model}
-    outputs: [reads]
+    # `biological_read_count` is the read_count.json sidecar (#141): reads
+    # surviving adapter + quality/length filtering, before host_filter (#142
+    # persists it). The re-emitted `reads` binding is the QC'd reads.
+    outputs: [reads, biological_read_count]
     # cpu=4 / mem_gb=12 sit above qc.py's DuckDB cap so resolve_duckdb_memory_gb
     # lands DuckDB near 8 GB after 4-thread headroom; QC holds no out-of-heap
     # co-consumer (unlike host_filter), so the whole allocation is DuckDB's.
@@ -126,7 +132,10 @@ steps:
     module: qiita_compute_orchestrator.jobs.host_filter
     inputs: [reads]
     optional_inputs: [host_rype_path, host_minimap2_path]
-    outputs: [filtered_reads]
+    # `quality_filtered_read_count` is the read_count.json sidecar (#141): reads
+    # surviving host depletion (== the biological count on a pass-through, when
+    # host filtering is disabled). #142 persists it onto sequenced_sample.
+    outputs: [filtered_reads, quality_filtered_read_count]
     # mem_gb=16 / cpu=4 mirror host_filter.py's DuckDB cap (8 GB, half the
     # allocation) + threads (4). Genome-scale host-index sizing is deferred
     # (see host_filter.py): when sizing against a real host reference, bump

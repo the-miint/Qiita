@@ -108,6 +108,7 @@ from ..miint import (
     open_conn,
     open_miint_conn,
 )
+from ..read_count import write_read_count
 from ..sequence_range import (
     PrepSampleNotEligibleForSequenceRange,
     SequenceRangeAlreadyExists,
@@ -389,6 +390,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"TO '{out}' ({PARQUET_OPTS})",
                 [sequence_idx_start, str(intermediate)],
             )
+            # Emit the raw read count (#141): the reads out of bcl-convert,
+            # before qc/host_filter. Reuse this connection — write_read_count
+            # only does a footer-level read_parquet count.
+            raw_read_count = write_read_count(conn, out_path, workspace)
     finally:
         # Clean up transient artifacts BEFORE returning so the SLURM
         # launcher's manifest walker (which runs after execute()) sees
@@ -398,4 +403,4 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         intermediate.unlink(missing_ok=True)
         shutil.rmtree(duckdb_tmp, ignore_errors=True)
 
-    return {"reads": out_path}
+    return {"reads": out_path, "raw_read_count": raw_read_count}
