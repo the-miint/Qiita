@@ -240,8 +240,7 @@ async def delete_reference(
     degraded state is a Postgres teardown that fails *after* the data is gone:
     the reference is then empty-but-listed until a retry completes the teardown
     (Postgres membership is still intact, so its orphan GC stays correct).
-    Reclaiming DuckLake/disk bytes in that window is not yet automated — see
-    issue #29 follow-up.
+    Reclaiming DuckLake/disk bytes in that window is not yet automated.
     """
     try:
         await assert_reference_deletable(pool, reference_idx, force=force)

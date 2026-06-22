@@ -5,7 +5,7 @@
 # fixed skeleton of docs/runbooks/redeploy.md and drops into the right account
 # for each step via `sudo -u`, so the no-sudo operator account never has to log
 # in and the admin never hand-copies per-account verify lines (the source of
-# recurring deploy bugs — issue #72):
+# recurring deploy bugs):
 #
 #   * operator steps (git pull, migration gate) → run as $QIITA_USER (e.g. qiita)
 #   * admin steps    (preflight, local-deploy.sh) → run as root (this process)
@@ -181,7 +181,7 @@ echo "--- [5/7] SLURM native env (redeploy.md §6) ---"
 # Native SLURM jobs run from the venv SLURM_NATIVE_PYTHON points at — a separate
 # checkout on the shared FS, NOT the /opt/qiita SERVICE venvs local-deploy.sh just
 # synced. On any deploy that changed qiita-common or qiita-compute-orchestrator,
-# that venv must be refreshed too, or native jobs silently import stale code (#106).
+# that venv must be refreshed too, or native jobs silently import stale code.
 # Both this refresh and the miint stage below feed native jobs, so refresh first.
 #
 # sudo's secure_path excludes /usr/local/bin on RHEL-family, and a non-login PATH
@@ -221,12 +221,12 @@ elif native_checkout=$(qiita_native_checkout_from_python "$nativepy"); then
         # Reached when the venv is NOT provably current: a code change, a SEPARATE
         # native checkout, or a failing import probe. When it's the SAME clone we
         # just pulled, the refresh is unambiguously needed and there's nothing for
-        # the operator to decide — just run it (the #113 "only stop for real work"
+        # the operator to decide — just run it (the "only stop for real work"
         # rule: don't prompt to do necessary work). Prompt ONLY for a separate
         # checkout, where redeploy is about to mutate a tree it didn't pull and
         # can't reason about — that's genuinely the operator's call.
         # Run as the checkout OWNER ($QIITA_USER), never root: a root-owned .venv the
-        # operator can't clean is the #80 footgun. uv by absolute path ($UV) —
+        # operator can't clean is a known footgun. uv by absolute path ($UV) —
         # bare `uv` under `bash -lc` is not reliably on PATH (see $UV above).
         if [ -n "$native_clone" ] && [ "$native_clone" = "$deploy_clone" ]; then
             echo "Native venv needs a refresh (qiita-common / qiita-compute-orchestrator"

@@ -614,7 +614,7 @@ def test_metadata_checklist_ref_rejects_empty_name():
     ],
 )
 def test_sequenced_sample_fraction_passing_quality_filter(raw, quality_filtered, expected):
-    """fraction_passing_quality_filter is computed-on-read (#142): quality_filtered
+    """fraction_passing_quality_filter is computed-on-read: quality_filtered
     / raw, or None when either bound is absent or raw is 0. model_construct sets
     only the two fields the computed property reads."""
     from qiita_common.models import SequencedSampleResponse

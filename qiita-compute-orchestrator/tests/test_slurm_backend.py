@@ -1065,7 +1065,7 @@ async def test_result_step_step_level_oom_upgrades_to_oom_killed(jwt_path, tmp_p
     """A cgroup step-level oom_kill surfaces only as a coarse
     FAILED/exit_code=1 (no OUT_OF_MEMORY state, no launcher line). result_step
     must read the stderr tail, recognize the OOM signature, and upgrade the
-    EXIT_NONZERO classification to the (retriable) OOM_KILLED — the #104 fix."""
+    EXIT_NONZERO classification to the (retriable) OOM_KILLED."""
     backend = _make_backend(httpx.MockTransport(lambda r: httpx.Response(500)), jwt_path)
     (tmp_path / "logs").mkdir(parents=True)
     (tmp_path / "logs" / "stderr").write_text(

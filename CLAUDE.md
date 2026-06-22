@@ -72,6 +72,8 @@ cd qiita-control-plane && uv sync --reinstall-package qiita-common
 
 **Fail fast, fail early, fail loudly.** Validate inputs at every boundary. Return structured errors with enough context to diagnose without a debugger. Prefer raising/panicking over silently returning defaults for unexpected states. Silent failures are bugs.
 
+**No issue/PR numbers in code.** Don't tag comments, docstrings, or string literals with this repo's GitHub issue/PR numbers (`(#142)`, `see #131`, `tracked in #40`, etc.) — keep the explanatory comment, drop the number. Provenance belongs in git history, `CHANGELOG.md`, and the PR, not the source. Two carve-outs: references to an **external** tracker are fine when qualified (`DuckDB #23229`), and `CHANGELOG.md` / `DEPLOY_CHECKLIST.md` are the provenance logs where `(#N)` PR tags belong.
+
 ## Workflow runtimes
 
 A step in a workflow YAML must declare **exactly one** of `container:` or `module:`. The `module:` form (a native step) runs in the orchestrator's Python environment under SLURM and may only use dependencies that already ship in `qiita-compute-orchestrator`'s `pyproject.toml`; anything heavier (bioinformatics deps, system packages) belongs in a container.

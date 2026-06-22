@@ -251,6 +251,11 @@ the `no-changelog` label).
 
 ### Changed
 
+- Stripped this repo's GitHub issue/PR numbers from code comments, docstrings,
+  and string literals across all components (comment-only; no behavior change),
+  and recorded the convention in `CLAUDE.md`: provenance lives in git / CHANGELOG
+  / the PR, not the source. External-tracker refs (e.g. `DuckDB #23229`) and the
+  `(#N)` tags in CHANGELOG/DEPLOY_CHECKLIST are kept (#150)
 - The `stage_local_fasta` step in `local-host-reference-add/1.0.0` now requests
   `cpu: 4` / `mem_gb: 64` (was `cpu: 8` / `mem_gb: 32`) — fewer cores, more
   memory for staging many host FASTA files into one chunked Parquet. Still within

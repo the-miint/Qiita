@@ -4,7 +4,7 @@ Pure unit, no DB marker — `/healthz` touches no dependencies (that's
 the whole point: it's a cheap liveness probe distinct from the
 CP+CO+DP aggregator at `/health`). Drives the route via httpx +
 ASGITransport against the module-level app, no lifespan / postgres /
-auth fixtures needed. See issue #67: the compute-orchestrator
+auth fixtures needed. The compute-orchestrator
 readiness checker GETs this path and the CP must actually serve it.
 """
 

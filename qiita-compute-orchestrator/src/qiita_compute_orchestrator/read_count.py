@@ -1,4 +1,4 @@
-"""Shared helper: emit a per-step read-count sidecar (issue #141).
+"""Shared helper: emit a per-step read-count sidecar.
 
 Each parquet stage of the prep-generation pipeline (`fastq` -> `qc` ->
 `host_filter`) emits a small `read_count.json` recording how many reads
@@ -10,7 +10,7 @@ survive that stage, so the three SPP boundary counts are captured per
   - `host_filter`  -> quality-filtered reads (host-depleted)
 
 This module is the WRITE side only (emission); persisting the counts onto
-`sequenced_sample` and rolling them up to the pool are #142 / #143. The
+`sequenced_sample` and rolling them up to the pool are future work. The
 sidecar lives next to the stage's reads Parquet, is declared as a step
 output, and the runner forwards it in `bound` for a future consumer.
 
@@ -42,8 +42,8 @@ class ReadCount(BaseModel):
     single-end read). `layout` is "paired" when any R2 is present, else
     "single".
 
-    Lives here (orchestrator-side) for #141, which only WRITES the sidecar.
-    When #142 adds the CP-side consumer, lift this model to qiita-common so
+    Lives here (orchestrator-side) for the step that only WRITES the sidecar.
+    When the CP-side consumer is added, lift this model to qiita-common so
     both services share one contract.
     """
 
@@ -68,7 +68,7 @@ def write_read_count(conn: duckdb.DuckDBPyConnection, reads_parquet: Path, works
     connection works. The path is inline single-quote-escaped to match the
     sibling jobs' COPY/read_parquet literals (a filesystem path, no other
     injection surface); this helper joins qc/host_filter on the inline-escape
-    side of the validate_parquet_path convergence tracked in #131."""
+    side of the validate_parquet_path convergence."""
     path_sql = str(reads_parquet).replace("'", "''")
     read_pairs, r2_reads = conn.execute(
         f"SELECT count(*), count(sequence2) FROM read_parquet('{path_sql}')"

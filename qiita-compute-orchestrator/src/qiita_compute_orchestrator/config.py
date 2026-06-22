@@ -64,7 +64,7 @@ ORCHESTRATOR_ENV_PATH = "/etc/qiita/compute-orchestrator.env"
 # reads the 0400 qiita-orch:qiita-orch co-to-cp.token, neither of which is
 # reachable as qiita-api sourcing control-plane.env. Shared by _resolve_token's
 # permission error and the compute-readiness misinvocation guard so the two
-# can't drift (the recurring redeploy defect, issue #72).
+# can't drift (the recurring redeploy defect).
 CORRECT_COMPUTE_READINESS_INVOCATION = (
     "sudo -u qiita-orch bash -c 'set -a; source /etc/qiita/compute-orchestrator.env; "
     "set +a; qiita-admin compute-readiness'"

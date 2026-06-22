@@ -25,7 +25,7 @@ _DEPLOY = _REPO_ROOT / "deploy"
 _COMMON = _DEPLOY / "_common.sh"
 _BUILD_SIF = _REPO_ROOT / "scripts" / "build-sif.sh"
 
-# The scripts introduced/maintained for the issue-#72 deploy-ease work. Kept
+# The scripts introduced/maintained for the deploy-ease work. Kept
 # explicit (not a glob) so a new deploy script is a deliberate add here.
 # build-sifs.sh is the deploy-time SIF auto-builder (wraps scripts/build-sif.sh).
 _SCRIPTS = ("preflight.sh", "verify.sh", "redeploy.sh", "build-sifs.sh")
@@ -316,7 +316,7 @@ def test_build_sif_passes_shellcheck() -> None:
 
 
 # --- qiita_sif_build_inputs_hash: the content stamp build-sif.sh uses to detect a
-# changed def/entrypoint/manifest (the #130/#126 trap VERIFY_MATCH can't see). -----
+# changed def/entrypoint/manifest (the trap VERIFY_MATCH can't see). --------------
 
 
 def _make_workflow_tree(root: Path) -> tuple[Path, Path]:

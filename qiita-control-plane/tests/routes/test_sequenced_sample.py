@@ -998,7 +998,7 @@ async def test_import_sequenced_sample_from_run_missing_biosample_link_422(ctx):
     # study. The prep_sample_to_study_reject_without_biosample_link trigger
     # fires inside the composer's link INSERT; the route maps the marker
     # substring to 422 and names the exact failing study from the error
-    # DETAIL rather than the ambiguous "the requested study" (issue #46).
+    # DETAIL rather than the ambiguous "the requested study".
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "nolink")
     study_idx = await _seed_study(
         ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="nolink"
@@ -1047,7 +1047,7 @@ async def test_import_sequenced_sample_secondary_link_422_names_that_study(ctx):
     # prep_sample_to_study_reject_without_biosample_link trigger. The 422
     # must name the *secondary* study — the one that actually failed —
     # since a body listing several studies makes "the requested study"
-    # ambiguous (issue #46).
+    # ambiguous.
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "sec-nolink")
     primary_idx = await _seed_study(
         ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="sec-nolink-p"
@@ -1296,7 +1296,7 @@ def _expected_read_response(
         "ena_run_accession": None,
         "last_submission_at": None,
         "submission_error": None,
-        # Read metrics (#142): NULL on a freshly-imported sample (not yet
+        # Read metrics: NULL on a freshly-imported sample (not yet
         # processed by fastq-to-parquet/1.2.0); fraction is computed-on-read and
         # serializes None when raw is absent.
         "raw_read_count_r1r2": None,
@@ -2161,7 +2161,7 @@ async def test_get_sequenced_sample_wet_lab_admin_no_metadata(ctx):
 
 
 async def test_get_sequenced_sample_surfaces_read_metrics(ctx):
-    # After processing, the three per-stage read counts (#142) are populated;
+    # After processing, the three per-stage read counts are populated;
     # the GET surfaces them and the computed-on-read fraction (850/1000 = 0.85).
     seeded = await _seed_one_sequenced_sample(ctx, "get-metrics")
     await ctx["pool"].execute(

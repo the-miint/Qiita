@@ -1545,9 +1545,9 @@ class ReferenceScopeTarget(BaseModel):
 
 
 class PrepSampleScopeTarget(BaseModel):
-    """Work ticket targets one prep_sample (the supertype introduced by
-    #35) — used for actions that naturally operate on a single sample at
-    a time (e.g. fastq-to-parquet, one FASTQ → one Parquet). Distinct
+    """Work ticket targets one prep_sample (the supertype) — used for
+    actions that naturally operate on a single sample at a time (e.g.
+    fastq-to-parquet, one FASTQ → one Parquet). Distinct
     from a study_prep-scoped ticket that fans out per sample inside a
     map step: this form is the singleton path, one ticket per sample.
 
@@ -2060,7 +2060,7 @@ class SequencedSampleResponse(BaseModel):
     ena_run_accession: str | None
     last_submission_at: AwareDatetime | None
     submission_error: str | None
-    # Per-stage read counts (#142), both-mates (R1+R2) totals. NULL until the
+    # Per-stage read counts, both-mates (R1+R2) totals. NULL until the
     # sample is processed by fastq-to-parquet/1.2.0 (the persist-read-metrics
     # action writes them). raw >= biological >= quality_filtered by the DB CHECK.
     raw_read_count_r1r2: int | None

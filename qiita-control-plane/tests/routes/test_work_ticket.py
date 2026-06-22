@@ -209,7 +209,7 @@ async def reference_idx(postgres_pool, admin_token):
 
 @pytest.fixture
 async def prep_sample_idx(postgres_pool, admin_token):
-    """A minimal qiita.prep_sample row (the supertype introduced by #35)
+    """A minimal qiita.prep_sample row (the supertype)
     owned by the admin principal, with processing_kind='sequenced'.
 
     Uses the shared db_seeds composer so this fixture stays in sync with
@@ -2567,7 +2567,7 @@ async def test_get_step_logs_originator_reads_stderr_tail(
     wt_client, postgres_pool, admin_token, reference_action, reference_idx, tmp_path
 ):
     """The originator gets a step attempt's stdout/stderr tail off shared
-    scratch — the no-sudo diagnosis path (#104)."""
+    scratch — the no-sudo diagnosis path."""
     token, _ = admin_token
     idx = await _seed_ticket_with_step_logs(
         wt_client,

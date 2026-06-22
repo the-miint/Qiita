@@ -5,7 +5,7 @@
 # actions list, and compute-readiness — each with the account + env file it
 # actually needs baked in, so neither operators nor PR authors hand-copy the
 # individual invocations. (Hand-copying is how the compute-readiness run-as bug
-# recurred across deploys — issue #72. The correct run-as is qiita-orch sourcing
+# recurred across deploys. The correct run-as is qiita-orch sourcing
 # compute-orchestrator.env, NOT qiita-api/control-plane.env.)
 # Also re-prints the config/secret fingerprint summary (deploy/preflight.sh).
 #

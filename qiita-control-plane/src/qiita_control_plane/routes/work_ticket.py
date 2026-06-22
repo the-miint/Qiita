@@ -922,9 +922,9 @@ async def get_work_ticket_step_logs(
 
     The logs live under `PATH_SCRATCH/ticket/<idx>/<step>/attempt-<n>/logs/`,
     owned `qiita-orch:qiita-pipeline` (mode 2770). The CP service account is in
-    `qiita-pipeline` (deploy #57), so it reads them straight off shared scratch
+    `qiita-pipeline`, so it reads them straight off shared scratch
     and serves the tail here — letting an operator diagnose an OOM / bad input
-    / contract violation without a host shell or sudo (issue #104).
+    / contract violation without a host shell or sudo.
 
     Auth mirrors `GET /work-ticket/{idx}` exactly: 401 on Anonymous; the
     originator passes; wet_lab_admin+ bypasses; anyone else gets 404 (not 403),

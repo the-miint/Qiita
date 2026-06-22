@@ -74,7 +74,7 @@ YAML_STEP_NAME = "stage_local_fasta"
 # fallback (local backend / tests), sized to the YAML baseline (mem_gb=32 minus
 # ~2 GB headroom). Under SLURM the limit instead tracks the real cgroup via
 # `resolve_duckdb_memory_gb()` (SLURM_MEM_PER_NODE), so a `--mem-gb` override
-# (#102) actually reaches DuckDB — a genome-scale FASTA OOM'd here at the old
+# actually reaches DuckDB — a genome-scale FASTA OOM'd here at the old
 # fixed 7 GB no matter how large the allocation was. DuckDB owns the whole box in
 # this step (no in-process co-consumer), so it gets the allocation minus headroom.
 _DUCKDB_MEMORY_GB = 30

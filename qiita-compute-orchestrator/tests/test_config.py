@@ -127,7 +127,7 @@ def test_resolve_co_to_cp_token_permission_denied_is_actionable(monkeypatch, tmp
     wrong-user case (the token is 0400 qiita-orch, qiita-api can't read it) —
     must raise an *actionable* RuntimeError that names the file, the 0400
     qiita-orch ownership, and the correct `sudo -u qiita-orch` invocation, not
-    fall through to the generic "no token available" message (issue #72)."""
+    fall through to the generic "no token available" message."""
     token_file = tmp_path / "co-to-cp.token"
     token_file.write_text("secret-pat\n")
     monkeypatch.setenv("CO_TO_CP_TOKEN_PATH", str(token_file))

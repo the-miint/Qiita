@@ -1,9 +1,9 @@
-"""DB tests for the persist-read-metrics library primitive (#142).
+"""DB tests for the persist-read-metrics library primitive.
 
 `persist_read_metrics` writes the three per-stage read counts (raw / biological /
 quality-filtered, both-mates r1r2) onto the 1:1 sequenced_sample for a
 prep_sample. It is the in-process action fastq-to-parquet/1.2.0 runs after
-host_filter, consuming the read_count.json sidecars #141 emits.
+host_filter, consuming the read_count.json sidecars.
 
 Each test seeds its own principal -> biosample -> prep_sample chain (and, where
 needed, the sequenced_sample subtype) so cleanup is FK-reverse and order-stable

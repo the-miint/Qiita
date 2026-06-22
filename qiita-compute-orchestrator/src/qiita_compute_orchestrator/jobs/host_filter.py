@@ -263,7 +263,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "  ON drop_set.sequence_idx = r.sequence_idx "
                 f"ORDER BY sequence_idx) TO '{out_sql}' ({PARQUET_OPTS})"
             )
-            # Emit the quality-filtered read count (#141): reads surviving host
+            # Emit the quality-filtered read count: reads surviving host
             # depletion (== biological count on a pass-through). Reuse this
             # connection — write_read_count only does a footer-level count.
             quality_filtered_read_count = write_read_count(conn, filtered, workspace)

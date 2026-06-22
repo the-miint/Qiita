@@ -61,7 +61,7 @@ YAML_STEP_NAME = "hash_sequences"
 # many of GG2's ~21 MB genome tail). `_DUCKDB_MEMORY_GB` is now only the
 # OFF-SLURM fallback (local backend / tests); under SLURM the limit tracks
 # the real cgroup via `resolve_duckdb_memory_gb()` (SLURM_MEM_PER_NODE), so a
-# `--mem-gb` override (#102) reaches DuckDB. The 24 GB literal is now only the
+# `--mem-gb` override reaches DuckDB. The 24 GB literal is now only the
 # off-SLURM fallback and is intentionally decoupled from the YAML allocation
 # (currently mem_gb=32) — under SLURM DuckDB is capped at the actual cgroup, so
 # the literal need not equal it. DuckDB owns the whole box here (no in-process

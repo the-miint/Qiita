@@ -93,9 +93,9 @@ steps:
     inputs: [fastq_path]
     # `reverse_fastq_path` flows through only when the action_context carries it.
     optional_inputs: [reverse_fastq_path]
-    # `raw_read_count` is the read_count.json sidecar (#141): raw reads out of
+    # `raw_read_count` is the read_count.json sidecar: raw reads out of
     # bcl-convert, before qc/host_filter. The runner forwards it in `bound` for
-    # a future per-sample persistence consumer (#142).
+    # a future per-sample persistence consumer.
     outputs: [reads, raw_read_count]
     baseline_resources:
       cpu: 2
@@ -113,8 +113,8 @@ steps:
     module: qiita_compute_orchestrator.jobs.qc
     inputs: [reads, adapter_parquet]
     params: {instrument_model: instrument_model}
-    # `biological_read_count` is the read_count.json sidecar (#141): reads
-    # surviving adapter + quality/length filtering, before host_filter (#142
+    # `biological_read_count` is the read_count.json sidecar: reads surviving
+    # adapter + quality/length filtering, before host_filter (persist-read-metrics
     # persists it). The re-emitted `reads` binding is the QC'd reads.
     outputs: [reads, biological_read_count]
     # cpu=4 / mem_gb=12 sit above qc.py's DuckDB cap so resolve_duckdb_memory_gb
@@ -136,7 +136,7 @@ steps:
     module: qiita_compute_orchestrator.jobs.host_filter
     inputs: [reads]
     optional_inputs: [host_rype_path, host_minimap2_path]
-    # `quality_filtered_read_count` is the read_count.json sidecar (#141): reads
+    # `quality_filtered_read_count` is the read_count.json sidecar: reads
     # surviving host depletion (== the biological count on a pass-through, when
     # host filtering is disabled). The persist-read-metrics action below consumes it.
     outputs: [filtered_reads, quality_filtered_read_count]
@@ -150,10 +150,10 @@ steps:
       mem_gb: 16
       walltime: PT4H
 
-  # Persist the three per-stage read counts (#142) onto this prep_sample's 1:1
+  # Persist the three per-stage read counts onto this prep_sample's 1:1
   # sequenced_sample row (raw / biological / quality-filtered, both-mates r1r2).
   # In-process control-plane action (direct DB write, no backend hop) — it reads
-  # the read_count.json sidecars #141 bound from fastq/qc/host_filter. Writing a
+  # the read_count.json sidecars bound from fastq/qc/host_filter. Writing a
   # prep_sample subtype row is why the workflow now declares prep_sample:write
   # in `scopes` above.
   - action: persist-read-metrics
