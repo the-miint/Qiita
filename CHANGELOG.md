@@ -561,6 +561,15 @@ the `no-changelog` label).
   and constant in file size, and the upload is scanned once instead of per batch.
   Output schema and canonical-dedup semantics are unchanged (one
   `part_00000.parquet` in the directory). (#N)
+- `reference_load`'s per-batch chunk re-key (`sequence_hash` → `feature_idx`)
+  carried the same latent OOM as the hash_sequences output side: each batch
+  joined the full `feature_map` table, which grows 1:1 with the feature count,
+  so at reference scale the optimizer could reorder that join ahead of the batch
+  filter and materialize the whole glob's `chunk_data`. The join is now bounded
+  to the batch's hashes by construction (an `fmb` CTE pre-filtered to the batch),
+  so no join order can exceed one batch. The feature_idx-clustered, disjoint-range
+  part layout (load-bearing for DuckLake / row-group pruning on DoGet's feature_idx
+  lookups) and per-batch sort are unchanged. (#N)
 - Data-plane file registration no longer collides with — and attempts to
   overwrite — an already-registered DuckLake data file. `register_files` placed
   each Parquet at `DATA_PATH/<table>/<producer-basename>`, but the reference-load
