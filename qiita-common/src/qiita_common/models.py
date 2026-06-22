@@ -1910,6 +1910,178 @@ class SequencedPoolResponse(BaseModel):
     read_metrics: PoolReadMetrics
 
 
+class SampleQCReport(BaseModel):
+    """One pool member's persisted QC reports, as carried in PoolQCReport.samples.
+
+    `raw_qc_report` / `filtered_qc_report` are the verbatim qc_report.json
+    documents the native `qc_report` job emitted at each point (the
+    `{point, layout, read_pairs, mates: {r1, r2}}` shape), or None for a sample
+    not yet processed by fastq-to-parquet/1.2.0. `sequenced_pool_item_id` is the
+    sample's per-pool item id (lane+barcode); `prep_sample_idx` identifies the
+    sample. The blobs are surfaced as-is — the pool report does not re-derive
+    them, only merges copies into `merged`."""
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    sequenced_pool_item_id: str | None
+    raw_qc_report: dict[str, Any] | None
+    filtered_qc_report: dict[str, Any] | None
+
+
+class MateQCAggregate(BaseModel):
+    """One mate's (r1 or r2) QC summary pooled across a pool's samples.
+
+    Counts (`reads`, `total_bases`) are plain sums. The means
+    (`mean_quality`, `gc_content`, `n_content`, `mean_length`) are
+    base- or read-weighted pools of the per-sample means — each per-sample mean
+    is multiplied back out by its weight (total_bases for the content/quality
+    means, reads for the mean length) to recover the underlying sum, those are
+    summed, then divided by the pooled weight. Recovering the sum from a stored
+    ratio carries negligible float error, acceptable for a human-facing report.
+    A mean is None when no contributing sample carried it. The three histograms
+    are per-bucket sums of the per-sample histograms (string bucket keys, the
+    same keying the per-sample qc_report uses)."""
+
+    reads: int
+    total_bases: int
+    mean_quality: float | None
+    gc_content: float | None
+    n_content: float | None
+    min_length: int | None
+    max_length: int | None
+    mean_length: float | None
+    quality_histogram: dict[str, int]
+    gc_histogram: dict[str, int]
+    length_histogram: dict[str, int]
+
+
+class PointQCAggregate(BaseModel):
+    """One report point (raw or filtered) pooled across a pool's samples.
+
+    `samples` is how many of the pool's samples carried a report at this point;
+    `read_pairs` sums their per-sample read_pairs. `mates.r1` is present whenever
+    any contributing sample had r1; `mates.r2` is None for an all-single-end
+    pool (no sample carried an r2 block)."""
+
+    samples: int
+    read_pairs: int
+    mates: dict[str, MateQCAggregate | None]
+
+
+class MergedQCAggregate(BaseModel):
+    """Run-level (pool-wide) merge of the per-sample QC reports — the
+    multiqc-equivalent summary. `raw` / `filtered` is None when no sample in the
+    pool carried a report at that point."""
+
+    raw: PointQCAggregate | None
+    filtered: PointQCAggregate | None
+
+
+def _merge_qc_point(reports: list[dict[str, Any]]) -> PointQCAggregate | None:
+    """Pool a list of per-sample qc_report.json documents for ONE point into a
+    single PointQCAggregate, or None when the list is empty (no sample carried a
+    report at this point).
+
+    Each `report` is one sample's `{point, layout, read_pairs, mates: {r1, r2}}`
+    document. The two mates merge independently; an absent mate (None) is
+    skipped, so r2 is only present when at least one sample had it."""
+    if not reports:
+        return None
+    mates: dict[str, MateQCAggregate | None] = {}
+    for mate in ("r1", "r2"):
+        per_sample = [r["mates"][mate] for r in reports if r["mates"].get(mate) is not None]
+        mates[mate] = _merge_mate(per_sample) if per_sample else None
+    return PointQCAggregate(
+        samples=len(reports),
+        read_pairs=sum(r["read_pairs"] for r in reports),
+        mates=mates,
+    )
+
+
+def _weighted_mean(
+    per_sample: list[dict[str, Any]], value_key: str, weight_key: str
+) -> float | None:
+    """Pool a stored per-sample ratio (`value_key`) weighted by `weight_key`.
+
+    Recovers each sample's underlying sum as ratio * weight, sums those, and
+    divides by the pooled weight. None when no sample carries the ratio or the
+    pooled weight is 0."""
+    num = 0.0
+    denom = 0
+    for s in per_sample:
+        v = s.get(value_key)
+        w = s.get(weight_key)
+        if v is None or not w:
+            continue
+        num += v * w
+        denom += w
+    return num / denom if denom else None
+
+
+def _merge_histograms(per_sample: list[dict[str, Any]], key: str) -> dict[str, int]:
+    """Per-bucket sum of the per-sample `key` histograms (string bucket keys),
+    returned ordered by numeric bucket value for a stable response."""
+    merged: dict[str, int] = {}
+    for s in per_sample:
+        for bucket, count in (s.get(key) or {}).items():
+            merged[bucket] = merged.get(bucket, 0) + count
+    return {k: merged[k] for k in sorted(merged, key=int)}
+
+
+def _merge_mate(per_sample: list[dict[str, Any]]) -> MateQCAggregate:
+    """Pool a list of per-sample mate summaries (each the r1/r2 block of a
+    qc_report) into one MateQCAggregate. See MateQCAggregate for the weighting."""
+    min_lengths = [s["min_length"] for s in per_sample if s.get("min_length") is not None]
+    max_lengths = [s["max_length"] for s in per_sample if s.get("max_length") is not None]
+    return MateQCAggregate(
+        reads=sum(s["reads"] for s in per_sample),
+        total_bases=sum(s["total_bases"] for s in per_sample),
+        mean_quality=_weighted_mean(per_sample, "mean_quality", "total_bases"),
+        gc_content=_weighted_mean(per_sample, "gc_content", "total_bases"),
+        n_content=_weighted_mean(per_sample, "n_content", "total_bases"),
+        min_length=min(min_lengths) if min_lengths else None,
+        max_length=max(max_lengths) if max_lengths else None,
+        mean_length=_weighted_mean(per_sample, "mean_length", "reads"),
+        quality_histogram=_merge_histograms(per_sample, "quality_histogram"),
+        gc_histogram=_merge_histograms(per_sample, "gc_histogram"),
+        length_histogram=_merge_histograms(per_sample, "length_histogram"),
+    )
+
+
+def merge_qc_reports(samples: list[SampleQCReport]) -> MergedQCAggregate:
+    """Merge a pool's per-sample QC reports into the run-level MergedQCAggregate.
+
+    Raw and filtered points merge independently over the samples that carry that
+    point; a point with no reports yields None. Pure (no DB) so it is unit-tested
+    directly from constructed SampleQCReport lists."""
+    return MergedQCAggregate(
+        raw=_merge_qc_point([s.raw_qc_report for s in samples if s.raw_qc_report is not None]),
+        filtered=_merge_qc_point(
+            [s.filtered_qc_report for s in samples if s.filtered_qc_report is not None]
+        ),
+    )
+
+
+class PoolQCReport(BaseModel):
+    """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool/{P}/qc-report.
+
+    The pool's merged (multiqc-equivalent) QC report: the read-metric rollup
+    (reused from the pool metadata endpoint), the run-level `merged` aggregate of
+    every per-sample QC report, and the per-sample `samples` detail. Everything
+    is compute-on-read — `merged` is aggregated from the constituent
+    sequenced_samples' persisted reports at request time, so it never drifts when
+    a sample is re-processed or deleted. `samples_with_qc_report` counts how many
+    of the pool's non-retired samples carry at least a raw report, so a partial
+    pool (some samples still unprocessed) is interpretable."""
+
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    sample_count: int
+    samples_with_qc_report: int
+    read_metrics: PoolReadMetrics
+    merged: MergedQCAggregate
+    samples: list[SampleQCReport]
+
+
 class SequencedPoolPreflightResponse(BaseModel):
     """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool/{P}/preflight.
 

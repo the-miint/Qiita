@@ -30,7 +30,7 @@ read/PATCH live in the sibling sequenced_sample route module.
 
 import base64
 import json
-from typing import Annotated
+from typing import Annotated, Any
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Response, status
@@ -38,6 +38,7 @@ from pydantic import Field
 from qiita_common.api_paths import (
     PATH_SEQUENCED_POOL_BY_IDX,
     PATH_SEQUENCED_POOL_PREFLIGHT,
+    PATH_SEQUENCED_POOL_QC_REPORT,
     PATH_SEQUENCING_RUN_BY_IDX,
     PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID,
     PATH_SEQUENCING_RUN_PREFIX,
@@ -46,7 +47,9 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
+    PoolQCReport,
     PoolReadMetrics,
+    SampleQCReport,
     SequencedPoolCreateRequest,
     SequencedPoolCreateResponse,
     SequencedPoolDeleteResponse,
@@ -57,6 +60,7 @@ from qiita_common.models import (
     SequencingRunLookupByInstrumentRunIdRequest,
     SequencingRunLookupByInstrumentRunIdResponse,
     SequencingRunResponse,
+    merge_qc_reports,
 )
 
 from ..actions.sequenced_pool import (
@@ -81,6 +85,7 @@ from ..repositories.sequencing_run import (
     PayloadMismatch,
     fetch_sequenced_pool_preflight,
     fetch_sequenced_pool_read_metrics,
+    fetch_sequenced_pool_sample_qc_reports,
     fetch_sequencing_run,
     fetch_sequencing_run_idxs_by_instrument_run_id,
     insert_sequenced_pool,
@@ -322,6 +327,72 @@ async def get_sequenced_pool(
         samples_with_metrics=data.pop("samples_with_metrics"),
     )
     return SequencedPoolResponse.model_validate(data)
+
+
+@router.get(PATH_SEQUENCED_POOL_QC_REPORT)
+async def get_sequenced_pool_qc_report(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> PoolQCReport:
+    """Read the pool's merged (multiqc-equivalent) QC report: the read-metric
+    rollup (same SUMs as the pool metadata endpoint), every non-retired sample's
+    persisted raw/filtered qc_report, and the run-level `merged` aggregate over
+    them (per-mate histograms summed, means base/read-weighted).
+
+    Everything is compute-on-read — the merge runs at request time over the
+    constituent sequenced_samples, so it never drifts when a sample is
+    re-processed or deleted. Same read gate as the pool metadata endpoint: a
+    HumanUser with `Scope.PREP_SAMPLE_READ` and system_role at least
+    wet_lab_admin. `require_sequenced_pool_in_run` fronts 404 (no such pool) /
+    422 (pool not under this run). A pool with no processed samples reads as an
+    empty `samples` list and `merged.raw`/`merged.filtered` of None."""
+    # Two sequential reads (rollup, then per-sample rows) on separate
+    # acquisitions: a concurrent writer between them could momentarily desync the
+    # rollup's sample_count from len(samples). Acceptable for a compute-on-read,
+    # read-gated human-facing report — a transient count/list mismatch is
+    # cosmetic and self-heals on the next read; not worth a serializable txn.
+    rollup = await fetch_sequenced_pool_read_metrics(pool, sequenced_pool_idx)
+    # require_sequenced_pool_in_run already 404'd a missing pool; guard
+    # belt-and-suspenders against a concurrent delete.
+    if rollup is None:
+        raise HTTPException(
+            status_code=404, detail=f"sequenced_pool {sequenced_pool_idx} not found"
+        )
+    rows = await fetch_sequenced_pool_sample_qc_reports(pool, sequenced_pool_idx)
+
+    def _report(value: Any) -> dict[str, Any] | None:
+        # asyncpg returns JSONB as text (no codec); decode to an object.
+        return json.loads(value) if isinstance(value, str) else value
+
+    samples = [
+        SampleQCReport(
+            prep_sample_idx=row["prep_sample_idx"],
+            sequenced_pool_item_id=row["sequenced_pool_item_id"],
+            raw_qc_report=_report(row["raw_qc_report"]),
+            filtered_qc_report=_report(row["filtered_qc_report"]),
+        )
+        for row in rows
+    ]
+    return PoolQCReport(
+        sequenced_pool_idx=sequenced_pool_idx,
+        sequencing_run_idx=rollup["sequencing_run_idx"],
+        sample_count=rollup["sample_count"],
+        samples_with_qc_report=sum(1 for s in samples if s.raw_qc_report is not None),
+        read_metrics=PoolReadMetrics(
+            raw_read_count_r1r2=rollup["raw_read_count_r1r2"],
+            biological_read_count_r1r2=rollup["biological_read_count_r1r2"],
+            quality_filtered_read_count_r1r2=rollup["quality_filtered_read_count_r1r2"],
+            sample_count=rollup["sample_count"],
+            samples_with_metrics=rollup["samples_with_metrics"],
+        ),
+        merged=merge_qc_reports(samples),
+        samples=samples,
+    )
 
 
 @router.delete(PATH_SEQUENCED_POOL_BY_IDX)

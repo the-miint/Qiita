@@ -554,6 +554,7 @@ def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():
         "host_filter",
         "qc_report_filtered",
         "persist-read-metrics",
+        "persist-qc-report",
     ]
     # Writing the sample's sequenced_sample row requires prep_sample:write.
     assert v12.scopes == ["prep_sample:write"]
@@ -565,6 +566,12 @@ def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():
         "quality_filtered_read_count",
     ]
     assert persist.outputs == []
+
+    # persist-qc-report consumes the two qc_report.json sidecars (raw + filtered)
+    # and writes them onto the sequenced_sample as JSONB; no bound output.
+    persist_qc = next(s for s in v12.steps if s.name == "persist-qc-report")
+    assert persist_qc.inputs == ["raw_qc_report", "filtered_qc_report"]
+    assert persist_qc.outputs == []
 
     # Both qc_report steps share one module, disambiguated by input/output binding:
     # raw consumes `reads` + emits `raw_qc_report`; filtered consumes

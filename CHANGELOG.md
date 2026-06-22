@@ -15,6 +15,20 @@ the `no-changelog` label).
 
 ### Added
 
+- Merged (multiqc-equivalent) run-level QC report for a pool. `sequenced_sample`
+  gains two nullable `jsonb` columns (`raw_qc_report`, `filtered_qc_report`)
+  holding the per-sample `qc_report.json` documents; a new `persist-qc-report`
+  library primitive — added as the final `action:` step of
+  `fastq-to-parquet/1.2.0` — writes them from the `qc_report_raw` /
+  `qc_report_filtered` sidecars (the same persist-from-sidecar pattern as
+  `persist-read-metrics`). New `GET
+  /api/v1/sequencing-run/{run}/sequenced-pool/{pool}/qc-report` route returns the
+  pool's merged report: the read-metric rollup, every non-retired sample's
+  persisted raw/filtered report, and a run-level `merged` aggregate (per-mate
+  histograms summed across samples, means base/read-weighted). Compute-on-read —
+  the merge runs at request time, so it never drifts when a sample is
+  re-processed or deleted. Read-gated like the pool roster (prep_sample:read +
+  wet_lab_admin). implements #145 (#154)
 - New `qc_report` native job: a fastqc-equivalent per-sample QC summary computed
   in DuckDB straight from `reads.parquet` (no container, no miint extension). Per
   mate (r1/r2) it reports read/base counts, mean quality, GC and N content,
@@ -570,6 +584,18 @@ the `no-changelog` label).
   so no join order can exceed one batch. The feature_idx-clustered, disjoint-range
   part layout (load-bearing for DuckLake / row-group pruning on DoGet's feature_idx
   lookups) and per-batch sort are unchanged. (#155)
+- Native (`module:`) SLURM steps no longer collapse to a single CPU. The
+  generated launcher ran a bare `srun`, but SLURM >= 22.05 srun no longer
+  inherits `--cpus-per-task` from the batch allocation, so it laid the single
+  task out at cpus-per-task=1 and its default `--cpu-bind` pinned that task —
+  and every thread it spawned — to one allocated CPU. Native jobs run DuckDB
+  with a multi-thread pool, so an N-CPU allocation silently ran on a single
+  core (a TB-scale `stage_local_fasta` host-reference load crawled at ~75 MB/s
+  on 1 of 4 allocated cores while the job's cgroup cpuset granted all of them).
+  The launcher now exports `SRUN_CPUS_PER_TASK` from the allocation and passes
+  `srun --cpu-bind=none`, letting the thread pool float across the whole cgroup
+  cpuset (which already constrains the job to its allocation). Container
+  (`apptainer exec`, no srun) steps were never affected. (#153)
 - Data-plane file registration no longer collides with — and attempts to
   overwrite — an already-registered DuckLake data file. `register_files` placed
   each Parquet at `DATA_PATH/<table>/<producer-basename>`, but the reference-load

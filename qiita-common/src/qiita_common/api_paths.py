@@ -86,6 +86,7 @@ class LibraryPrimitive(StrEnum):
     REGISTER_FILES = "register-files"
     REGISTER_INDEX = "register-index"
     PERSIST_READ_METRICS = "persist-read-metrics"
+    PERSIST_QC_REPORT = "persist-qc-report"
 
 
 # =============================================================================
@@ -311,6 +312,11 @@ PATH_SEQUENCED_POOL_PREFLIGHT = (
 )
 # DELETE target: full hard-delete of one sequenced_pool (system_admin only).
 PATH_SEQUENCED_POOL_BY_IDX = "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}"
+# GET the pool's merged (multiqc-equivalent) QC report: read-metric rollup +
+# per-sample reports + the run-level merged aggregate.
+PATH_SEQUENCED_POOL_QC_REPORT = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/qc-report"
+)
 
 URL_SEQUENCING_RUN_PREFIX = f"{API_PREFIX}{PATH_SEQUENCING_RUN_PREFIX}"
 URL_SEQUENCING_RUN_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_BY_IDX}"
@@ -322,6 +328,7 @@ URL_SEQUENCING_RUN_SEQUENCED_POOL = (
 )
 URL_SEQUENCED_POOL_PREFLIGHT = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_PREFLIGHT}"
 URL_SEQUENCED_POOL_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_BY_IDX}"
+URL_SEQUENCED_POOL_QC_REPORT = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_QC_REPORT}"
 
 
 # =============================================================================
