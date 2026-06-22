@@ -40,7 +40,11 @@ description: >
   authenticates sequence-range mint with the compute service-account PAT, so the
   submitter does not need sequence_range:mint on their own token.
 
-scopes: []
+# The persist-read-metrics action writes the per-stage read counts onto the
+# sample's sequenced_sample (prep_sample subtype) row, so submitters must hold
+# prep_sample:write (in the USER ceiling, so the audience below is unaffected).
+scopes:
+  - prep_sample:write
 
 audience:
   service: false
@@ -134,7 +138,7 @@ steps:
     optional_inputs: [host_rype_path, host_minimap2_path]
     # `quality_filtered_read_count` is the read_count.json sidecar (#141): reads
     # surviving host depletion (== the biological count on a pass-through, when
-    # host filtering is disabled). #142 persists it onto sequenced_sample.
+    # host filtering is disabled). The persist-read-metrics action below consumes it.
     outputs: [filtered_reads, quality_filtered_read_count]
     # mem_gb=16 / cpu=4 mirror host_filter.py's DuckDB cap (8 GB, half the
     # allocation) + threads (4). Genome-scale host-index sizing is deferred
@@ -145,6 +149,16 @@ steps:
       cpu: 4
       mem_gb: 16
       walltime: PT4H
+
+  # Persist the three per-stage read counts (#142) onto this prep_sample's 1:1
+  # sequenced_sample row (raw / biological / quality-filtered, both-mates r1r2).
+  # In-process control-plane action (direct DB write, no backend hop) — it reads
+  # the read_count.json sidecars #141 bound from fastq/qc/host_filter. Writing a
+  # prep_sample subtype row is why the workflow now declares prep_sample:write
+  # in `scopes` above.
+  - action: persist-read-metrics
+    inputs: [raw_read_count, biological_read_count, quality_filtered_read_count]
+    outputs: []
 
 action_ceiling:
   cpu: 8

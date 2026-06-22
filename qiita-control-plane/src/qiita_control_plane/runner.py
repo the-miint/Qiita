@@ -2464,4 +2464,35 @@ async def _run_action_primitive(
         )
         return {}
 
+    if entry.name == LibraryPrimitive.PERSIST_READ_METRICS:
+        # Persist the three per-stage read counts (#142) onto this prep_sample's
+        # 1:1 sequenced_sample. Each declared input is a Path to a #141
+        # read_count.json sidecar; we read the both-mates `read_count_r1r2` from
+        # each and hand structured ints to the primitive (same pattern as
+        # register-index reading its meta JSON). Inputs are resolved by their
+        # fixed #141 binding names — not positionally — so a YAML reorder can't
+        # silently swap raw/biological/quality_filtered.
+        if set(entry.inputs) != {
+            "raw_read_count",
+            "biological_read_count",
+            "quality_filtered_read_count",
+        }:
+            raise RuntimeError(
+                "persist-read-metrics expects inputs "
+                "[raw_read_count, biological_read_count, quality_filtered_read_count]; "
+                f"got {entry.inputs!r}"
+            )
+
+        def _count(name: str) -> int:
+            return json.loads(Path(bound[name]).read_text())["read_count_r1r2"]
+
+        await LIBRARY[LibraryPrimitive.PERSIST_READ_METRICS](
+            pool,
+            scope_target["prep_sample_idx"],
+            _count("raw_read_count"),
+            _count("biological_read_count"),
+            _count("quality_filtered_read_count"),
+        )
+        return {}
+
     raise RuntimeError(f"runner has no adapter for action {entry.name!r}")

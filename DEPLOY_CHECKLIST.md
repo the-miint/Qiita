@@ -23,7 +23,9 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- (#148) `20260622000000_sequenced_sample_read_metrics.sql` — adds three nullable
+  `BIGINT` read-count columns + CHECK constraints to `qiita.sequenced_sample`.
+  Plain `make migrate`; additive and backfill-free (existing rows read NULL).
 
 ### 4. Deploy
 
@@ -53,6 +55,14 @@ _None yet._
   sync` inside `activate.sh` (already covered by bucket 5's `qiita.action` list check),
   **not** a migration. Emission only (no consumer yet); no client breakage, no new env
   var, host dir, scope, or migration.
+- (#148) `fastq-to-parquet/1.2.0` gains a final `persist-read-metrics` action and
+  now declares `scopes: [prep_sample:write]`. Re-synced into `qiita.action` by
+  `qiita-admin actions sync` (same in-place edit as #147); the new column targets
+  ship in the bucket-3 migration above, applied before the restart. **Submitter
+  contract tightening:** submitting 1.2.0 now requires `prep_sample:write` (already
+  in the USER ceiling, so all three audience roles keep access — only a token
+  scoped *below* its role ceiling is affected). No new host dir, env var, or
+  service-account grant.
 
 ---
 

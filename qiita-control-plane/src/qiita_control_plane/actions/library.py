@@ -385,6 +385,50 @@ async def register_index(
     )
 
 
+async def persist_read_metrics(
+    pool: asyncpg.Pool,
+    prep_sample_idx: int,
+    raw_read_count_r1r2: int,
+    biological_read_count_r1r2: int,
+    quality_filtered_read_count_r1r2: int,
+) -> int:
+    """Persist the three per-stage read counts (#142) onto the 1:1
+    sequenced_sample row for `prep_sample_idx` and return its idx.
+
+    The counts are the both-mates (`*_r1r2`) totals the runner read from the
+    read_count.json sidecars #141 emits (raw -> fastq, biological -> qc,
+    quality_filtered -> host_filter). The DB CHECK enforces
+    quality_filtered <= biological <= raw, so a swapped/garbled count fails
+    loudly at write time rather than persisting silently.
+
+    Fail-fast (loud) when no sequenced_sample row exists for the prep_sample: a
+    sequenced prep_sample reaches read-metric persistence only after pooling
+    created its 1:1 sequenced_sample, so a miss is a real ordering bug, not a
+    benign skip. The UPDATE is idempotent — a workflow retried from the start
+    re-runs this primitive and overwrites with the same counts (the
+    set_updated_at trigger bumps updated_at / the ETag, which is correct: the
+    row did change)."""
+    ss_idx = await pool.fetchval(
+        "UPDATE qiita.sequenced_sample"
+        " SET raw_read_count_r1r2 = $2,"
+        "     biological_read_count_r1r2 = $3,"
+        "     quality_filtered_read_count_r1r2 = $4"
+        " WHERE prep_sample_idx = $1"
+        " RETURNING idx",
+        prep_sample_idx,
+        raw_read_count_r1r2,
+        biological_read_count_r1r2,
+        quality_filtered_read_count_r1r2,
+    )
+    if ss_idx is None:
+        raise RuntimeError(
+            f"no sequenced_sample row for prep_sample_idx={prep_sample_idx}; "
+            "read-metric persistence requires the sample to be pooled "
+            "(its 1:1 sequenced_sample created) before fastq-to-parquet runs"
+        )
+    return ss_idx
+
+
 async def register_files(
     *,
     staging_dir: str,
@@ -467,4 +511,5 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.WRITE_MEMBERSHIP: write_membership,
     LibraryPrimitive.REGISTER_FILES: register_files,
     LibraryPrimitive.REGISTER_INDEX: register_index,
+    LibraryPrimitive.PERSIST_READ_METRICS: persist_read_metrics,
 }

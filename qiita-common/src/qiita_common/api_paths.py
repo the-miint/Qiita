@@ -85,6 +85,7 @@ class LibraryPrimitive(StrEnum):
     WRITE_MEMBERSHIP = "write-membership"
     REGISTER_FILES = "register-files"
     REGISTER_INDEX = "register-index"
+    PERSIST_READ_METRICS = "persist-read-metrics"
 
 
 # =============================================================================

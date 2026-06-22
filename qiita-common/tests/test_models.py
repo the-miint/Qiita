@@ -600,3 +600,30 @@ def test_metadata_checklist_ref_rejects_empty_name():
 
     with pytest.raises(ValidationError):
         MetadataChecklistRef(idx=1, name="")
+
+
+@pytest.mark.parametrize(
+    "raw,quality_filtered,expected",
+    [
+        (1000, 850, 0.85),  # normal: end-to-end survival fraction
+        (1000, 1000, 1.0),  # nothing dropped
+        (0, 0, None),  # legal all-zeros row (empty sample) — no division
+        (None, 850, None),  # raw not yet written
+        (1000, None, None),  # quality_filtered not yet written
+        (None, None, None),  # unprocessed sample
+    ],
+)
+def test_sequenced_sample_fraction_passing_quality_filter(raw, quality_filtered, expected):
+    """fraction_passing_quality_filter is computed-on-read (#142): quality_filtered
+    / raw, or None when either bound is absent or raw is 0. model_construct sets
+    only the two fields the computed property reads."""
+    from qiita_common.models import SequencedSampleResponse
+
+    resp = SequencedSampleResponse.model_construct(
+        raw_read_count_r1r2=raw,
+        quality_filtered_read_count_r1r2=quality_filtered,
+    )
+    if expected is None:
+        assert resp.fraction_passing_quality_filter is None
+    else:
+        assert resp.fraction_passing_quality_filter == pytest.approx(expected)
