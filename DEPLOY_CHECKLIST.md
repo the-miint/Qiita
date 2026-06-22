@@ -26,6 +26,10 @@ _None yet._
 - (#148) `20260622000000_sequenced_sample_read_metrics.sql` — adds three nullable
   `BIGINT` read-count columns + CHECK constraints to `qiita.sequenced_sample`.
   Plain `make migrate`; additive and backfill-free (existing rows read NULL).
+- (#154) `20260622010000_sequenced_sample_qc_report.sql` — adds two nullable
+  `jsonb` QC-report columns (`raw_qc_report`, `filtered_qc_report`) to
+  `qiita.sequenced_sample`. Plain `make migrate`; additive and backfill-free
+  (existing rows read NULL).
 
 ### 4. Deploy
 
@@ -58,6 +62,13 @@ _None yet._
   the module ships with the orchestrator code (a native step, not a container — no
   SIF). Reporting only; no client breakage, no new env var, host dir, scope, or
   migration.
+- (#154) `fastq-to-parquet/1.2.0` gains a final `persist-qc-report` action that
+  writes the per-sample QC reports into the bucket-3 `jsonb` columns. Re-synced
+  into `qiita.action` by `qiita-admin actions sync` (same in-place edit as #147);
+  no new env var, host dir, scope (it reuses the `prep_sample:write` #148 already
+  added), or SIF. New read-only `GET .../sequenced-pool/{pool}/qc-report` endpoint
+  (the merged pool report) — additive, read-gated like the existing pool roster;
+  no host action.
 
 ---
 

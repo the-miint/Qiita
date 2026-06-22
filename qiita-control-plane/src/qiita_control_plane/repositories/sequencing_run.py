@@ -402,6 +402,31 @@ async def fetch_sequenced_pool_read_metrics(
     )
 
 
+async def fetch_sequenced_pool_sample_qc_reports(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    sequenced_pool_idx: int,
+) -> list[asyncpg.Record]:
+    """Return one row per NON-retired sequenced_sample in the pool, carrying the
+    two persisted QC-report JSONBs (raw / filtered), the prep_sample_idx, and the
+    per-pool item id — the per-sample detail the merged pool QC report aggregates.
+
+    Excludes retired samples (`ps.retired IS NOT TRUE`) to match the read-metric
+    rollup's sample set, so `sample_count` there and the length of this list agree
+    on a fully-processed pool. Ordered by prep_sample_idx for a stable response.
+    Returns `[]` for a pool with no (non-retired) samples; the caller still 404s a
+    missing pool via require_sequenced_pool_in_run + the rollup fetch. asyncpg
+    returns JSONB as text, so the caller decodes each blob."""
+    return await pool_or_conn.fetch(
+        "SELECT ss.prep_sample_idx, ss.sequenced_pool_item_id,"
+        " ss.raw_qc_report, ss.filtered_qc_report"
+        " FROM qiita.sequenced_sample ss"
+        " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        " WHERE ss.sequenced_pool_idx = $1 AND ps.retired IS NOT TRUE"
+        " ORDER BY ss.prep_sample_idx",
+        sequenced_pool_idx,
+    )
+
+
 async def fetch_sequenced_pool_created_by(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     sequenced_pool_idx: int,

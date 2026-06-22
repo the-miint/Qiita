@@ -15,6 +15,20 @@ the `no-changelog` label).
 
 ### Added
 
+- Merged (multiqc-equivalent) run-level QC report for a pool. `sequenced_sample`
+  gains two nullable `jsonb` columns (`raw_qc_report`, `filtered_qc_report`)
+  holding the per-sample `qc_report.json` documents; a new `persist-qc-report`
+  library primitive — added as the final `action:` step of
+  `fastq-to-parquet/1.2.0` — writes them from the `qc_report_raw` /
+  `qc_report_filtered` sidecars (the same persist-from-sidecar pattern as
+  `persist-read-metrics`). New `GET
+  /api/v1/sequencing-run/{run}/sequenced-pool/{pool}/qc-report` route returns the
+  pool's merged report: the read-metric rollup, every non-retired sample's
+  persisted raw/filtered report, and a run-level `merged` aggregate (per-mate
+  histograms summed across samples, means base/read-weighted). Compute-on-read —
+  the merge runs at request time, so it never drifts when a sample is
+  re-processed or deleted. Read-gated like the pool roster (prep_sample:read +
+  wet_lab_admin). implements #145 (#154)
 - New `qc_report` native job: a fastqc-equivalent per-sample QC summary computed
   in DuckDB straight from `reads.parquet` (no container, no miint extension). Per
   mate (r1/r2) it reports read/base counts, mean quality, GC and N content,
