@@ -187,6 +187,16 @@ steps:
     inputs: [raw_read_count, biological_read_count, quality_filtered_read_count]
     outputs: []
 
+  # Persist the two fastqc-equivalent QC reports onto this prep_sample's 1:1
+  # sequenced_sample row (raw_qc_report / filtered_qc_report JSONB). In-process
+  # control-plane action (direct DB write, no backend hop) — it reads the
+  # qc_report.json sidecars bound from the qc_report_raw / qc_report_filtered
+  # steps. The pool-scoped merged report endpoint aggregates these on read.
+  # Same prep_sample:write scope already declared for persist-read-metrics.
+  - action: persist-qc-report
+    inputs: [raw_qc_report, filtered_qc_report]
+    outputs: []
+
 action_ceiling:
   cpu: 8
   mem_gb: 16

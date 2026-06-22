@@ -2495,4 +2495,29 @@ async def _run_action_primitive(
         )
         return {}
 
+    if entry.name == LibraryPrimitive.PERSIST_QC_REPORT:
+        # Persist the two fastqc-equivalent QC reports onto this prep_sample's
+        # 1:1 sequenced_sample. Each declared input is a Path to a qc_report.json
+        # sidecar (the qc_report_raw / qc_report_filtered step outputs); we read
+        # each verbatim and hand the parsed dicts to the primitive. Inputs are
+        # resolved by their fixed binding names — not positionally — so a YAML
+        # reorder can't silently swap raw/filtered.
+        if set(entry.inputs) != {"raw_qc_report", "filtered_qc_report"}:
+            raise RuntimeError(
+                "persist-qc-report expects inputs "
+                "[raw_qc_report, filtered_qc_report]; "
+                f"got {entry.inputs!r}"
+            )
+
+        def _report(name: str) -> dict[str, Any]:
+            return json.loads(Path(bound[name]).read_text())
+
+        await LIBRARY[LibraryPrimitive.PERSIST_QC_REPORT](
+            pool,
+            scope_target["prep_sample_idx"],
+            _report("raw_qc_report"),
+            _report("filtered_qc_report"),
+        )
+        return {}
+
     raise RuntimeError(f"runner has no adapter for action {entry.name!r}")
