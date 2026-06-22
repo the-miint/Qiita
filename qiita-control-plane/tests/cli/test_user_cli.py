@@ -254,6 +254,38 @@ def test_ticket_submit_without_mem_gb_omits_resource_override(monkeypatch):
     assert "resource_override" not in captured["json"]
 
 
+def test_ticket_run_posts_to_run_endpoint_with_no_body(monkeypatch):
+    """`qiita ticket run <idx>` POSTs to /work-ticket/{idx}/run with no body —
+    the operator resume/retry path (reset a FAILED ticket and re-dispatch,
+    skipping already-completed steps)."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["method"] = method
+        captured["url"] = str(url)
+        captured["json"] = json
+        return _httpx.Response(
+            200,
+            json={"work_ticket_idx": 7, "state": "pending"},
+            request=_httpx.Request(method, url),
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    rc = main(["--base-url", "https://q.example.test", "ticket", "run", "7"])
+    assert rc == 0
+    assert captured["method"] == "POST"
+    assert captured["url"].endswith("/work-ticket/7/run")
+    assert captured["json"] is None  # no request body
+
+
 def test_profile_set_boolean_optional_action_distinguishes_unset_false_true(monkeypatch):
     """--receive-processing-emails sets True, --no-receive-processing-emails sets False,
     neither leaves the field absent from the PATCH body."""

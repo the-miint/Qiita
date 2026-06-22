@@ -15,6 +15,13 @@ the `no-changelog` label).
 
 ### Added
 
+- `qiita ticket run <idx>` CLI subcommand — wraps the existing
+  `POST /work-ticket/{idx}/run` operator override (reset a FAILED ticket and
+  re-dispatch; the only retry mechanism, no auto-retry worker). The runner
+  fast-forwards already-COMPLETED steps and resumes at the first incomplete one,
+  so an expensive finished step (e.g. `stage_local_fasta`) is not recomputed.
+  Mirrors `qiita ticket status`; no server change (the route and api_paths
+  constants already existed) (#TBD)
 - Per-sample host-filter references. `sequenced_sample` gains two nullable FK
   columns (`host_rype_reference_idx`, `host_minimap2_reference_idx` → `reference`,
   with a CHECK that minimap2 only accompanies rype) recording which host the
