@@ -23,10 +23,14 @@ The builder supports two runtimes, selected by which of `container` or
 - Native form (`python -m`):
       #!/bin/bash
       set -euo pipefail
-      srun python -m qiita_compute_orchestrator.jobs --job <short_name>
+      export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-1}"
+      srun --cpu-bind=none python -m qiita_compute_orchestrator.jobs --job <short_name>
   `<short_name>` is `module` with `NATIVE_MODULE_PREFIX` stripped.
   The shared launcher (`jobs/__main__.py`) reads
   `$QIITA_INPUT_PATH/params.json` and routes through `run_native_job`.
+  The `SRUN_CPUS_PER_TASK` export + `--cpu-bind=none` keep the native
+  job's thread pool from being pinned to a single CPU; see
+  `_build_native_script` for the SLURM-version rationale.
 
 Either way, the producer is responsible for the qiita output contract —
 reading `$QIITA_INPUT_PATH/params.json`, writing outputs and
@@ -103,7 +107,21 @@ def _build_native_script(*, module: str, python: str) -> str:
     if not python:
         raise ValueError("python must be a non-empty string")
     short = module.removeprefix(NATIVE_MODULE_PREFIX)
-    cmd = f"srun {python} -m qiita_compute_orchestrator.jobs --job {short}"
+    # SLURM >= 22.05 srun no longer inherits --cpus-per-task from the batch
+    # allocation, so a bare `srun` lays the single task out at cpus-per-task=1
+    # and its default --cpu-bind pins that task — and every thread it spawns —
+    # to ONE allocated CPU (the first in the set). Native jobs run DuckDB with a
+    # multi-thread pool, so that silently collapses an N-CPU allocation to a
+    # single core: observed in the wild as all worker threads sharing one CPU
+    # while the job's cgroup cpuset granted the full N. Re-assert the
+    # allocation's cpus for accounting (SRUN_CPUS_PER_TASK) and disable per-task
+    # pinning (--cpu-bind=none) so the thread pool floats across the whole
+    # cgroup cpuset, which already constrains the job to its allocation.
+    # Container steps (apptainer exec, no srun) are unaffected.
+    cmd = (
+        'export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-1}"\n'
+        f"srun --cpu-bind=none {python} -m qiita_compute_orchestrator.jobs --job {short}"
+    )
     return f"#!/bin/bash\nset -euo pipefail\n{cmd}\n"
 
 
