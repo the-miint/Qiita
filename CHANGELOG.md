@@ -15,6 +15,22 @@ the `no-changelog` label).
 
 ### Added
 
+- Per-sample host-filter references. `sequenced_sample` gains two nullable FK
+  columns (`host_rype_reference_idx`, `host_minimap2_reference_idx` → `reference`,
+  with a CHECK that minimap2 only accompanies rype) recording which host the
+  sample is depleted against — both NULL means no host filtering. They map 1:1
+  onto `fastq-to-parquet/1.2.0`'s `host_rype_reference_idx` /
+  `host_minimap2_reference_idx`, so a later pool fan-out is a pass-through; the
+  reference being `(name, version)` pins the exact host build per sample, and a
+  non-human host is just a different reference (no schema change). The
+  sequenced-sample composer request/response and the pool/run sample-list items
+  carry them. `qiita-user submit-bcl-convert` gains `--host-rype-reference-idx`
+  (+ optional `--host-minimap2-reference-idx`): it reads each sample's project
+  `human_filtering` flag from the preflight and records the host reference(s) on
+  `human_filtering` samples (blanks/controls follow their project) while leaving
+  `human_filtering=0` samples unfiltered, pre-flighting the references ACTIVE +
+  indexed up front (#156)
+
 - Merged (multiqc-equivalent) run-level QC report for a pool. `sequenced_sample`
   gains two nullable `jsonb` columns (`raw_qc_report`, `filtered_qc_report`)
   holding the per-sample `qc_report.json` documents; a new `persist-qc-report`

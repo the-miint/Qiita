@@ -2150,31 +2150,66 @@ def _seed_bcl_folder(tmp_path: Path, name: str, *, with_runinfo: bool = True) ->
 def preflight_stub(monkeypatch, tmp_path):
     """Install a fake `run_preflight` module + return a blob-path builder.
 
-    The handler imports `open_db_file` and `get_illumina_sample_info`
-    from `run_preflight` at call time; the fixture patches
-    `sys.modules["run_preflight"]` so the test controls the opened
-    connection and the function's return value (canned 4-tuples) or its
-    raised exception, without depending on the upstream library being
-    installed or on the SQLite contents matching its schema.
+    The handler imports `open_db_file`, `get_illumina_sample_info`, and
+    `get_illumina_sample_rows` from `run_preflight` at call time, and reads
+    `project.human_filtering` off the opened connection; the fixture patches
+    `sys.modules["run_preflight"]` and returns a connection whose `.execute`
+    serves canned project rows, so the test controls every per-sample input
+    without depending on the upstream library or a real SQLite schema.
 
-    Returns a callable `_install(rows=None, raises=None) -> Path` that
-    writes a non-empty marker blob at `tmp_path/preflight.db` and yields
-    its path. `rows` is a list of 4-tuples matching
-    `_PreflightRow`; `raises` is an exception instance the stub will
-    raise when invoked. Either passes through unchanged to the handler.
+    Returns a callable
+    `_install(rows=None, raises=None, project_by_idx=None,
+    filtering_by_project=None) -> Path` that writes a non-empty marker blob at
+    `tmp_path/preflight.db` and yields its path. `rows` is a list of 4-tuples
+    matching `get_illumina_sample_info`; `raises` is an exception the stub raises
+    when invoked. `project_by_idx` maps illumina_sample_idx -> project_name
+    (default: every row -> 'STUB_PROJECT'); `filtering_by_project` maps
+    project_name -> human_filtering bool (default: every project -> False, so
+    existing tests need no host reference args). The stub builds
+    get_illumina_sample_rows 6-tuples from `project_by_idx` and serves the
+    `SELECT project_name, human_filtering FROM project` rows from
+    `filtering_by_project`.
     """
 
     def _install(
         rows: list[tuple[int, str, str, list[str]]] | None = None,
         raises: Exception | None = None,
+        project_by_idx: dict[int, str] | None = None,
+        filtering_by_project: dict[str, bool] | None = None,
     ) -> Path:
         blob = tmp_path / "preflight.db"
         blob.write_bytes(b"\x00stub-preflight-marker")
+        captured_rows = list(rows or [])
+        # Default project wiring: every row -> one project, not human-filtered.
+        idx_to_project = dict(project_by_idx or {})
+        for row in captured_rows:
+            idx_to_project.setdefault(row[0], "STUB_PROJECT")
+        project_filtering = dict(filtering_by_project or {})
+        for name in idx_to_project.values():
+            project_filtering.setdefault(name, False)
+
+        class _StubCursor:
+            def __init__(self, result):
+                self._result = result
+
+            def fetchall(self):
+                return self._result
+
+        class _StubConn:
+            # The handler runs exactly one raw query:
+            # SELECT project_name, human_filtering FROM project. SQLite returns
+            # the boolean as 0/1, so serve ints to mirror it (the handler bool()s).
+            # Assert the shape so a future second raw query can't be silently fed
+            # project rows.
+            def execute(self, sql):
+                assert "FROM project" in sql, f"unexpected preflight query: {sql!r}"
+                return _StubCursor([(n, int(f)) for n, f in project_filtering.items()])
+
+            def close(self):
+                pass
+
         stub_module = types.ModuleType("run_preflight")
-        # The handler opens the blob via open_db_file, then passes the
-        # connection to get_illumina_sample_info and closes it; the stub's
-        # connection is a closable placeholder the row-getter ignores.
-        stub_module.open_db_file = lambda _blob: types.SimpleNamespace(close=lambda: None)
+        stub_module.open_db_file = lambda _blob: _StubConn()
         if raises is not None:
             captured_exc = raises
 
@@ -2183,8 +2218,16 @@ def preflight_stub(monkeypatch, tmp_path):
 
             stub_module.get_illumina_sample_info = _get
         else:
-            captured_rows = list(rows or [])
             stub_module.get_illumina_sample_info = lambda _conn: list(captured_rows)
+        # get_illumina_sample_rows lives in run_preflight.db (NOT top-level), so
+        # mirror that layout — the handler reaches it via `from run_preflight
+        # import db`. Tuple is (idx, lane, i7, i5, project_name, sample_name); the
+        # handler reads only idx ([0]) and project_name ([4]).
+        stub_module.db = types.SimpleNamespace(
+            get_illumina_sample_rows=lambda _conn: [
+                (idx, 1, "", "", idx_to_project[idx], f"s{idx}") for idx in idx_to_project
+            ]
+        )
         monkeypatch.setitem(sys.modules, "run_preflight", stub_module)
         return blob
 
@@ -2815,6 +2858,8 @@ def test__read_preflight_rows_round_trips_library_tuples(preflight_stub):
     library_secondaries = ["PRJ002", "PRJ003"]
     blob = preflight_stub(
         rows=[(7, "SAMN001", "PRJ001", library_secondaries)],
+        project_by_idx={7: "PROJ_A"},
+        filtering_by_project={"PROJ_A": True},
     )
     parser = argparse.ArgumentParser()
     rows = _read_preflight_rows(blob, parser)
@@ -2824,12 +2869,152 @@ def test__read_preflight_rows_round_trips_library_tuples(preflight_stub):
             biosample_accession="SAMN001",
             primary_project_accession="PRJ001",
             secondary_project_accessions=["PRJ002", "PRJ003"],
+            human_filtering=True,
         )
     ]
     # NamedTuple field carries a fresh list, not an alias to the
     # library's return — mutating downstream does not contaminate the
     # caller's data.
     assert rows[0].secondary_project_accessions is not library_secondaries
+
+
+def test_submit_bcl_convert_records_host_refs_for_human_filtering(
+    monkeypatch, tmp_path, capsys, preflight_stub
+):
+    """A human_filtering sample's composer POST carries the host rype + minimap2
+    reference idxs; a non-human_filtering sample in the same pool carries
+    neither. The two host references are checked ACTIVE + indexed up front."""
+    import json as _json
+
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = preflight_stub(
+        rows=[(1, "SAMN001", "PRJ001", []), (2, "SAMN002", "PRJ001", [])],
+        project_by_idx={1: "HUMAN", 2: "NOFILT"},
+        filtering_by_project={"HUMAN": True, "NOFILT": False},
+    )
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, {"kind": "human", "principal_idx": 99}),  # whoami
+            (200, {"resolved": {"SAMN001": 41, "SAMN002": 42}, "missing": []}),  # biosample
+            (200, {"resolved": {"PRJ001": 70}, "missing": []}),  # study
+            (200, _ref_active_body()),  # rype reference readiness
+            (200, _both_indexes_body()),  # rype index list (carries rype)
+            (200, _ref_active_body()),  # minimap2 reference readiness
+            (200, _both_indexes_body()),  # minimap2 index list (carries minimap2)
+            (201, {"sequencing_run_idx": 12}),
+            (201, {"sequenced_pool_idx": 34}),
+            (201, {"sequenced_sample_idx": 71, "prep_sample_idx": 81}),
+            (201, {"sequenced_sample_idx": 72, "prep_sample_idx": 82}),
+            (202, {"work_ticket_idx": 56, "state": "pending"}),
+        ],
+    )
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "submit-bcl-convert",
+            "--bcl-input-dir",
+            str(folder),
+            "--preflight-blob",
+            str(blob),
+            "--prep-protocol-idx",
+            "7",
+            "--host-rype-reference-idx",
+            "7",
+            "--host-minimap2-reference-idx",
+            "8",
+        ]
+    )
+    assert rc == 0
+    sample_posts = [
+        r for r in captured["requests"] if r["method"] == "POST" and "sequenced-sample" in r["url"]
+    ]
+    by_item = {r["json"]["sequenced_pool_item_id"]: r["json"] for r in sample_posts}
+    # human_filtering=True sample (illumina_sample_idx 1) carries both refs.
+    assert by_item["1"]["host_rype_reference_idx"] == 7
+    assert by_item["1"]["host_minimap2_reference_idx"] == 8
+    # human_filtering=False sample (idx 2) carries neither.
+    assert "host_rype_reference_idx" not in by_item["2"]
+    assert "host_minimap2_reference_idx" not in by_item["2"]
+    # Summary echoes the per-sample host filtering decision.
+    summary = _json.loads(capsys.readouterr().out)
+    by_illumina = {s["illumina_sample_idx"]: s for s in summary["sequenced_samples"]}
+    assert by_illumina[1]["human_filtering"] is True
+    assert by_illumina[1]["host_rype_reference_idx"] == 7
+    assert by_illumina[2]["human_filtering"] is False
+    assert by_illumina[2]["host_rype_reference_idx"] is None
+
+
+def test_submit_bcl_convert_human_filtering_without_rype_ref_errors(
+    monkeypatch, tmp_path, capsys, preflight_stub
+):
+    """A preflight with a human_filtering sample but no --host-rype-reference-idx
+    aborts at argument validation (exit 2) before any network call."""
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = preflight_stub(
+        rows=[(1, "SAMN001", "PRJ001", [])],
+        project_by_idx={1: "HUMAN"},
+        filtering_by_project={"HUMAN": True},
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "--base-url",
+                "https://q.example.test",
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                str(folder),
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "human_filtering samples but no --host-rype-reference-idx" in capsys.readouterr().err
+
+
+def test_submit_bcl_convert_minimap2_without_rype_errors(
+    monkeypatch, tmp_path, capsys, preflight_stub
+):
+    """--host-minimap2-reference-idx without --host-rype-reference-idx is rejected
+    (minimap2 is the optional second stage, never standalone)."""
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = preflight_stub(
+        rows=[(1, "SAMN001", "PRJ001", [])],
+        project_by_idx={1: "NOFILT"},
+        filtering_by_project={"NOFILT": False},
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "--base-url",
+                "https://q.example.test",
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                str(folder),
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+                "--host-minimap2-reference-idx",
+                "8",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "--host-minimap2-reference-idx requires --host-rype-reference-idx" in (
+        capsys.readouterr().err
+    )
 
 
 # ---------------------------------------------------------------------------
