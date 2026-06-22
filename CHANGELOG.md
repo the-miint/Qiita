@@ -15,6 +15,17 @@ the `no-changelog` label).
 
 ### Added
 
+- New `GET /api/v1/sequencing-run/{run}/sequenced-pool/{pool}` route returning a
+  pool's metadata plus a compute-on-read read-metric rollup (#143): per-stage
+  read-count SUMS over the pool's non-retired `sequenced_sample` rows
+  (`raw_read_count_r1r2` / `biological_read_count_r1r2` /
+  `quality_filtered_read_count_r1r2`), a `fraction_passing_quality_filter`
+  recomputed from the sums (not a mean of per-sample fractions), and
+  `sample_count` / `samples_with_metrics` so a partially-processed pool is
+  interpretable. Nothing is stored at the pool level — the rollup is aggregated
+  at request time, so it never drifts when a sample is re-processed or deleted.
+  Read-gated like the pool roster (prep_sample:read + wet_lab_admin). implements
+  #143 (#149)
 - Per-`sequenced_sample` read metrics: `sequenced_sample` gains three nullable
   `BIGINT` columns (`raw_read_count_r1r2`, `biological_read_count_r1r2`,
   `quality_filtered_read_count_r1r2`) with a CHECK enforcing
