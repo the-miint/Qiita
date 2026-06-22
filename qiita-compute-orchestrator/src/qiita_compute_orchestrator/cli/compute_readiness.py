@@ -310,8 +310,8 @@ fi
 rm -f "$MIINT_PROBE"
 
 # `sequence_split` is the native chunker stage_local_fasta / reference_load rely
-# on (it replaced the O(L^2) list_transform/substring SQL macro; duckdb-miint
-# #121 / DuckDB #23229). It is NEWER than read_fastx, so a staged build that
+# on (it replaced the O(L^2) list_transform/substring SQL macro; DuckDB #23229).
+# It is NEWER than read_fastx, so a staged build that
 # predates it passes the read_fastx probe above but FAILS here — exactly the
 # stale-stage case this probe exists to catch at deploy, not at the first
 # reference-load job. Separate load so this stands alone if the read probe's
@@ -684,7 +684,7 @@ async def _run_all_checks(
         # (instead of qiita-orch sourcing compute-orchestrator.env), so
         # COMPUTE_BACKEND was never set and defaulted to "local". That used to
         # produce a benign `skip` + exit 0, which reads as a pass and is exactly
-        # the recurring redeploy defect (issue #72). Make it a loud failure that
+        # the recurring redeploy defect. Make it a loud failure that
         # names the correct invocation. The "real host" signal is the
         # orchestrator env file existing — a dev box / CI runner has no
         # /etc/qiita/compute-orchestrator.env, so a genuine local backend there

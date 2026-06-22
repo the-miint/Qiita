@@ -2465,12 +2465,12 @@ async def _run_action_primitive(
         return {}
 
     if entry.name == LibraryPrimitive.PERSIST_READ_METRICS:
-        # Persist the three per-stage read counts (#142) onto this prep_sample's
-        # 1:1 sequenced_sample. Each declared input is a Path to a #141
+        # Persist the three per-stage read counts onto this prep_sample's
+        # 1:1 sequenced_sample. Each declared input is a Path to a
         # read_count.json sidecar; we read the both-mates `read_count_r1r2` from
         # each and hand structured ints to the primitive (same pattern as
         # register-index reading its meta JSON). Inputs are resolved by their
-        # fixed #141 binding names — not positionally — so a YAML reorder can't
+        # fixed binding names — not positionally — so a YAML reorder can't
         # silently swap raw/biological/quality_filtered.
         if set(entry.inputs) != {
             "raw_read_count",

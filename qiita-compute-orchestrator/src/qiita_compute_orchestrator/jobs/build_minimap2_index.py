@@ -55,7 +55,7 @@ YAML_STEP_NAME = "build_minimap2_index"
 # in-process from the cgroup remainder. `_DUCKDB_MEMORY_GB` is the OFF-SLURM
 # fallback (local backend / tests). Under SLURM the limit tracks the real cgroup
 # via `resolve_duckdb_memory_gb()` with `_MINIMAP2_RESERVE_GB` carved out for
-# minimap2's in-process index — so a `--mem-gb` override (#102) grows both the
+# minimap2's in-process index — so a `--mem-gb` override grows both the
 # DuckDB reassembly headroom (genome-scale contigs are large) and minimap2's
 # index budget, instead of OOMing against a fixed 8 GB.
 _DUCKDB_MEMORY_GB = 8

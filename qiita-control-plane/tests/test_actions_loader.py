@@ -539,12 +539,12 @@ def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():
 
     # 1.2.0: fastq -> qc (always-on) -> host_filter. Each stage re-emits the
     # `reads`/`filtered_reads` binding it consumes (a transform in place) AND a
-    # per-stage read-count sidecar (#141): raw / biological / quality-filtered.
+    # per-stage read-count sidecar: raw / biological / quality-filtered.
     v12 = by_key[("fastq-to-parquet", "1.2.0")]
     assert v12.target_kind == ScopeTargetKind.PREP_SAMPLE
     assert v12.target_processing_kinds == ["sequenced"]
-    # The trailing persist-read-metrics is an in-process `action:` (#142),
-    # consuming the three #141 count sidecars; it appears in the unified
+    # The trailing persist-read-metrics is an in-process `action:`,
+    # consuming the three count sidecars; it appears in the unified
     # steps list after the three compute steps.
     assert [s.name for s in v12.steps] == [
         "fastq",
@@ -564,7 +564,7 @@ def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():
     assert persist.outputs == []
 
     v12_fastq = next(s for s in v12.steps if s.name == "fastq")
-    # 1.2.0's fastq also emits the raw read count sidecar (#141), unlike 1.0.0/1.1.0.
+    # 1.2.0's fastq also emits the raw read count sidecar, unlike 1.0.0/1.1.0.
     assert v12_fastq.outputs == ["reads", "raw_read_count"]
 
     qc = next(s for s in v12.steps if s.name == "qc")

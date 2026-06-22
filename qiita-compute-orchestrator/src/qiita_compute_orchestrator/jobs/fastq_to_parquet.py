@@ -61,7 +61,7 @@ Pipeline (B-staged-Parquet):
      and .gz) catches zero-record FASTQs before any DuckDB work;
      empty input raises ValueError → BAD_INPUT, and no empty Parquet
      is emitted. This also sidesteps miint's "Empty file: ..." throw,
-     so we don't depend on the upstream wording (cf. #39).
+     so we don't depend on the upstream wording.
 
   2. FASTQ -> intermediate Parquet (no sequence_idx yet). One
      streaming pass through miint's read_fastx. The intermediate is
@@ -131,8 +131,7 @@ YAML_STEP_NAME = "fastq"
 # ~1 GB for Python/miint/OS overhead). Long-read inputs need this
 # safely above ~2.4 GB resident per thread (2048 STANDARD_VECTOR_SIZE
 # × 60 default Parquet row_group_size × ~20 KB avg long-read record
-# incl. quality); 7 GB is comfortably above that. #38 will plumb these
-# directly.
+# incl. quality); 7 GB is comfortably above that.
 _DUCKDB_MEMORY_GB = 7
 _DUCKDB_THREADS = 2
 
@@ -144,9 +143,9 @@ class PreMintedRange(BaseModel):
     Set only when phase 4 failed transiently on a prior attempt AFTER
     phase 3 had already minted a sequence-range — the prep_sample's
     `qiita.sequence_range` row exists and a fresh mint would 409. The
-    operator (or the runner-side automation tracked as #40 section (a))
-    reads the existing range, resubmits the work_ticket with this field
-    populated, and the orchestrator skips the mint call.
+    operator (or the runner-side automation) reads the existing range,
+    resubmits the work_ticket with this field populated, and the
+    orchestrator skips the mint call.
 
     The two indices are inclusive on both ends and must match the
     FASTQ's read count exactly: `sequence_idx_stop - sequence_idx_start
@@ -198,7 +197,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # plain and .gz). Surfaces empty FASTQs as BAD_INPUT before any
     # DuckDB work — no empty Parquet is written, no sequence-range is
     # minted, and we don't depend on miint's exception wording for the
-    # detection (cf. #39).
+    # detection.
     if is_empty_sequence_file(inputs.fastq_path):
         raise ValueError(f"FASTQ file contains no records: {inputs.fastq_path}")
     if inputs.reverse_fastq_path is not None and is_empty_sequence_file(inputs.reverse_fastq_path):
@@ -390,7 +389,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"TO '{out}' ({PARQUET_OPTS})",
                 [sequence_idx_start, str(intermediate)],
             )
-            # Emit the raw read count (#141): the reads out of bcl-convert,
+            # Emit the raw read count: the reads out of bcl-convert,
             # before qc/host_filter. Reuse this connection — write_read_count
             # only does a footer-level read_parquet count.
             raw_read_count = write_read_count(conn, out_path, workspace)

@@ -392,11 +392,11 @@ async def persist_read_metrics(
     biological_read_count_r1r2: int,
     quality_filtered_read_count_r1r2: int,
 ) -> int:
-    """Persist the three per-stage read counts (#142) onto the 1:1
+    """Persist the three per-stage read counts onto the 1:1
     sequenced_sample row for `prep_sample_idx` and return its idx.
 
     The counts are the both-mates (`*_r1r2`) totals the runner read from the
-    read_count.json sidecars #141 emits (raw -> fastq, biological -> qc,
+    read_count.json sidecars (raw -> fastq, biological -> qc,
     quality_filtered -> host_filter). The DB CHECK enforces
     quality_filtered <= biological <= raw, so a swapped/garbled count fails
     loudly at write time rather than persisting silently.

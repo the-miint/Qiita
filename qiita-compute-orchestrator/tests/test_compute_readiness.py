@@ -487,7 +487,7 @@ def test_render_json_shape():
 
 
 # ---------------------------------------------------------------------------
-# Misinvocation guard (issue #72): a non-slurm backend on a real orchestrator
+# Misinvocation guard: a non-slurm backend on a real orchestrator
 # host means the command was run as the wrong user / with the wrong env sourced,
 # so COMPUTE_BACKEND defaulted to "local". That used to be a benign skip + exit
 # 0 (reads as a pass). The "real host" signal is the orchestrator env file

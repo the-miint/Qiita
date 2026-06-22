@@ -2,7 +2,7 @@
 
 These are pure-Python (no DuckDB / no staged extension), so they run in the
 fast ``make test`` tier. They pin the behaviour that makes the per-run
-``--mem-gb`` override (#102) actually reach a job's in-process memory caps:
+``--mem-gb`` override actually reach a job's in-process memory caps:
 ``SLURM_MEM_PER_NODE`` (the real cgroup) wins over the YAML-baseline literal
 under SLURM, while off SLURM the literal fallback keeps the local backend /
 tests unchanged.

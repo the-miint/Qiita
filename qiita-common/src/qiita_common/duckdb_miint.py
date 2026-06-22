@@ -113,8 +113,8 @@ def is_empty_sequence_file(path: Path) -> bool:
     miint's `read_fastx`, which throws `std::runtime_error("Empty file: " +
     path)` on zero-record inputs (see duckdb-miint/src/SequenceReader.cpp).
     Pre-checking routes empty inputs through an explicit code path instead of
-    catching the exception and matching its wording — see #39 for the
-    upstream-fix proposal that would let miint return a 0-row relation here.
+    catching the exception and matching its wording. An upstream fix that let
+    miint return a 0-row relation here would make this pre-check unnecessary.
 
     Why a decompressed-stream peek and not `os.path.getsize == 0`: the realistic
     empty case is a `.fastq.gz` from a sequencing run that produced no reads —

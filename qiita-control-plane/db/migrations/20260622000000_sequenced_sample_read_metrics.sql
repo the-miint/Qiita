@@ -1,8 +1,8 @@
--- Per-sequenced_sample read-count metrics (#142).
+-- Per-sequenced_sample read-count metrics.
 --
 -- Three nullable BIGINT counts recording how many reads survive each stage of
 -- the fastq -> qc -> host_filter pipeline, written by the `persist-read-metrics`
--- action primitive from the read_count.json sidecars #141 emits. Each count is
+-- action primitive from the read_count.json sidecars. Each count is
 -- the both-mates total (R1 + R2; the `*_r1r2` convention), so a paired-end pair
 -- contributes 2 and a single-end read contributes 1:
 --   raw              -- reads out of bcl-convert, before any filtering (fastq)

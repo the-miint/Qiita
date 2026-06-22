@@ -84,7 +84,7 @@ PARQUET_OPTS_CHUNKED: str = f"{PARQUET_OPTS}, ROW_GROUP_SIZE {CHUNK_ROW_GROUP_SI
 # itself, so a job must set it BELOW the cgroup. The size each job wants is
 # resolved by `resolve_duckdb_memory_gb()` from the real cgroup
 # (`slurm_alloc_gb()` / `SLURM_MEM_PER_NODE`) so a per-run `--mem-gb` override
-# (#102) reaches DuckDB; a per-job literal is only the off-SLURM fallback.
+# reaches DuckDB; a per-job literal is only the off-SLURM fallback.
 # Threads are still passed as a literal (the cgroup cpu allocation) and also size
 # the headroom — see `duckdb_headroom_gb`.
 
@@ -152,7 +152,7 @@ def slurm_alloc_gb() -> int | None:
     The SLURM launcher submits each step with `memory_per_node` (i.e. `--mem`), so
     SLURM exports `SLURM_MEM_PER_NODE` (in MB) into the job environment — the
     authoritative per-step allocation, and the ONLY channel by which the per-run
-    `--mem-gb` override (#102) reaches a job's in-process memory caps. The local
+    `--mem-gb` override reaches a job's in-process memory caps. The local
     backend and unit tests run with the var absent → returns None, and callers fall
     back to their YAML-baseline-derived literal. A malformed value is treated as
     absent (fail soft to the literal rather than crash a job over an env quirk)."""

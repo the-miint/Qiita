@@ -64,7 +64,7 @@ YAML_STEP_NAME = "load"
 # (workflows/reference-add/1.0.0.yaml: mem_gb=32 minus ~1 GB Python/miint/OS
 # headroom). Under SLURM the limit instead tracks the real cgroup via
 # `resolve_duckdb_memory_gb()` (SLURM_MEM_PER_NODE), so a `--mem-gb` override
-# (#102) reaches DuckDB. DuckDB owns the whole box in this step (no in-process
+# reaches DuckDB. DuckDB owns the whole box in this step (no in-process
 # co-consumer), so it gets the allocation minus headroom.
 _DUCKDB_MEMORY_GB = 31
 _DUCKDB_THREADS = 8

@@ -9,7 +9,7 @@ target_processing_kinds: [sequenced]
 description: >
   Convert a single sample's FASTQ (or FASTA) file into a Parquet of
   reads, keyed by a CP-minted sequence_idx. The orchestrator counts
-  the reads (or read pairs), POSTs to /api/v1/sequence-range (PR #36's
+  the reads (or read pairs), POSTs to /api/v1/sequence-range (the
   allocator) for a contiguous bigint range against this prep_sample,
   and writes the final Parquet with sequence_idx as the first column.
 

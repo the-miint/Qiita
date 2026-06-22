@@ -1140,7 +1140,7 @@ def test_sequencing_run_create_rejects_non_object_extra_metadata(capsys):
 
 def test_sequenced_pool_create_minimal_no_preflight(monkeypatch):
     """No --run-preflight-blob / --run-preflight-filename means a pool
-    with no preflight; valid after PR #44 made the pair optional."""
+    with no preflight; the pair is optional."""
     from qiita_control_plane.cli.user import main
 
     captured: dict = {}

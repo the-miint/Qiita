@@ -61,7 +61,7 @@ YAML_STEP_NAME = "build_rype_index"
 # DISTINCT mapping, while rype does the heavy index build in-process and gets the
 # bulk of the cgroup via `max_memory`. rype stays the ELASTIC consumer (its share
 # grows with the allocation); DuckDB takes a bigger-but-BOUNDED share via a cap,
-# so a larger `--mem-gb` (#102) buys a bigger rype build, not a ballooning DuckDB.
+# so a larger `--mem-gb` buys a bigger rype build, not a ballooning DuckDB.
 #
 # The three literals are the OFF-SLURM fallbacks (local backend / tests). Under
 # SLURM the split tracks the real cgroup: DuckDB = min(alloc − headroom,

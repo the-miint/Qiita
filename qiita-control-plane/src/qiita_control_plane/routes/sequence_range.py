@@ -148,7 +148,7 @@ async def get_sequence_range_route(
 
     Accepted in v1 because the disclosure set above is processing-
     metadata-adjacent, not study/biosample-content. Two hardening
-    options are tracked as #40 (section (b)): a row-level ACL gate
+    options remain open: a row-level ACL gate
     (limit reads to the prep_sample's owner + admins) and a response-
     surface trim (drop `created_at` from the wire model). The compute
     orchestrator does not consume this endpoint (it mints over POST

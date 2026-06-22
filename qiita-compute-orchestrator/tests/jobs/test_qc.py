@@ -135,7 +135,7 @@ def test_qc_routes_se_pe_and_unions(tmp_path, monkeypatch, write_reads, read_sur
     assert _schema(out["reads"]) == _READS_SCHEMA
     # 10, 30 are SE (R2 NULL); 20, 40 are PE (R2 not NULL) — proves routing.
     assert _rows(out["reads"]) == [(10, True), (20, False), (30, True), (40, False)]
-    # Biological read count (#141) is emitted over the QC'd output: 4 rows
+    # Biological read count is emitted over the QC'd output: 4 rows
     # (count(*)) + 2 R2s (count(sequence2)) = 6 reads r1r2; layout 'paired'
     # because at least one R2 is present.
     rc = ReadCount.model_validate_json(out["biological_read_count"].read_text())

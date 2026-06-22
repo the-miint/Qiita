@@ -1,7 +1,7 @@
 """Guard: the libduckdb the Rust data-plane CI downloads must match the DuckDB
 version its `duckdb` crate is built against.
 
-A DuckDB bump has to land in lockstep across several spots; #85 bumped the
+A DuckDB bump has to land in lockstep across several spots; a past bump moved the
 `duckdb` crate and the Python locks but left the `setup-libduckdb` action's
 `version` default (and the deploy cache key) at the old 1.5.2, so CI would link a
 mismatched libduckdb against the new crate. This test fails that drift loudly
@@ -11,7 +11,7 @@ What it ties together:
 - `qiita-data-plane/Cargo.toml` `[dependencies].duckdb` — the crate, which decides
   the embedded/linked DuckDB version. libduckdb-sys encodes the DuckDB version in
   the crate's middle field: `<major>.1<minor:02><patch:02>.<rev>`, so crate
-  `1.10503.1` == DuckDB `1.5.3` (see CHANGELOG #85).
+  `1.10503.1` == DuckDB `1.5.3`.
 - `.github/actions/setup-libduckdb/action.yml` `version` input default — the
   libduckdb tarball CI downloads for the dynamic-link build/test path. It is a
   *default*, so any workflow that doesn't pass `version:` silently inherits it —
@@ -78,7 +78,7 @@ def test_libduckdb_action_default_matches_data_plane_crate() -> None:
         f"setup-libduckdb action `version` default ({action_default!r}) does not match the "
         f"DuckDB version the data-plane crate links ({expected!r}, from duckdb crate {crate!r}). "
         "A DuckDB bump must update BOTH qiita-data-plane/Cargo.toml's `duckdb` crate and the "
-        "action `version` default (plus the deploy.yml cache key). See CHANGELOG #85."
+        "action `version` default (plus the deploy.yml cache key)."
     )
 
 

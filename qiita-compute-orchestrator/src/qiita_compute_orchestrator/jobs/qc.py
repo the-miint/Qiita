@@ -270,7 +270,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # param, so the orchestrator-controlled paths are inline single-quote-escaped
     # (same as host_filter). Sibling jobs instead reject quote/backslash paths via
     # qiita_common.parquet.validate_parquet_path; converging qc + host_filter on
-    # that fail-fast validator is tracked in #131.
+    # that fail-fast validator is future work.
     reads_sql = str(inputs.reads).replace("'", "''")
     out_sql = str(qc_reads).replace("'", "''")
 
@@ -317,7 +317,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"COPY (({se_select}) UNION ALL ({pe_select}) ORDER BY sequence_idx) "
                 f"TO '{out_sql}' ({PARQUET_OPTS})"
             )
-            # Emit the biological read count (#141): reads surviving adapter +
+            # Emit the biological read count: reads surviving adapter +
             # quality/length filtering, before host_filter. Reuse this
             # connection — write_read_count only does a footer-level count.
             biological_read_count = write_read_count(conn, qc_reads, workspace)

@@ -106,7 +106,7 @@ def test_host_filter_drops_rype_union_minimap2(tmp_path, monkeypatch, write_read
 
     assert read_survivors(out["filtered_reads"]) == [20, 40]
     assert _schema(out["filtered_reads"]) == _READS_SCHEMA
-    # Quality-filtered read count (#141) over the survivors: 2 rows (20 PE, 40
+    # Quality-filtered read count over the survivors: 2 rows (20 PE, 40
     # SE) → count(*)=2 + count(sequence2)=1 = 3 reads r1r2; layout 'paired'.
     rc = ReadCount.model_validate_json(out["quality_filtered_read_count"].read_text())
     assert (rc.read_pairs, rc.read_count_r1r2, rc.layout) == (2, 3, "paired")

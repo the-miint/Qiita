@@ -1,4 +1,4 @@
-"""Unit tests for the shared read-count sidecar helper (issue #141).
+"""Unit tests for the shared read-count sidecar helper.
 
 `write_read_count` counts reads in a reads.parquet and writes `read_count.json`
 recording the `*_r1r2` total (both mates), the pair/row count, and the layout.
