@@ -545,6 +545,22 @@ the `no-changelog` label).
 
 ### Fixed
 
+- `hash_sequences` no longer OOMs writing `reference_sequence_chunks` on
+  genome-scale reference loads. The per-batch output COPY joined the full
+  `hashed` table (which grows 1:1 with the input), so at scale the optimizer
+  could reorder that join ahead of the batch filter and materialize the entire
+  file's `chunk_data` (observed 38 GiB against a 39 GiB cap). It also re-scanned
+  the whole upload once per batch (~420× at 21M rows) and globally sorted by
+  `sequence_hash` — a sort no consumer needs (`reference_load` re-keys to
+  `feature_idx` with its own scan, the data plane's DoGet filters by
+  `feature_idx`, and reassembly sorts `chunk_index` in-memory per feature).
+  Replaced with a single streaming scan that relabels read_id → canonical
+  `sequence_hash` in one pass: `canonical` (one narrow row per distinct hash) is
+  always the lower-cardinality join input, so it's the hash-join build side and
+  `chunk_data` streams through the probe to the writer — peak memory ~1 GB/thread
+  and constant in file size, and the upload is scanned once instead of per batch.
+  Output schema and canonical-dedup semantics are unchanged (one
+  `part_00000.parquet` in the directory). (#N)
 - Data-plane file registration no longer collides with — and attempts to
   overwrite — an already-registered DuckLake data file. `register_files` placed
   each Parquet at `DATA_PATH/<table>/<producer-basename>`, but the reference-load
