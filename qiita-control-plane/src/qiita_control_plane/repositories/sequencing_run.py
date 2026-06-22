@@ -344,17 +344,60 @@ async def fetch_sequenced_pool(
 ) -> asyncpg.Record | None:
     """Return the qiita.sequenced_pool row for the given idx, or None on miss.
 
-    Selects the caller-visible column set so a future read surface has a
-    single source of truth for row -> response shaping. Accepts either a
-    pool or a connection so the helper composes inside an open transaction
-    or stands alone.
+    The guard / byte-compare fetch: it pulls the BYTEA `run_preflight_blob` so
+    callers can round-trip it, and backs `require_sequenced_pool_in_run`. The
+    GET read surface (SequencedPoolResponse) shapes from
+    `fetch_sequenced_pool_read_metrics` instead — that one omits the blob and
+    adds the read-metric rollup. Accepts either a pool or a connection so the
+    helper composes inside an open transaction or stands alone.
     """
-    # Column list mirrors the future SequencedPoolResponse shape; the BYTEA
-    # blob is returned as-is so callers can byte-compare round-trips.
+    # The BYTEA blob is returned as-is so callers can byte-compare round-trips.
     return await pool_or_conn.fetchrow(
         "SELECT idx, sequencing_run_idx, run_preflight_blob, run_preflight_filename,"
         " extra_metadata, created_by_idx, created_at"
         " FROM qiita.sequenced_pool WHERE idx = $1",
+        sequenced_pool_idx,
+    )
+
+
+async def fetch_sequenced_pool_read_metrics(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    sequenced_pool_idx: int,
+) -> asyncpg.Record | None:
+    """Return the pool's caller-visible metadata (minus the BYTEA preflight
+    blob) plus the compute-on-read read-metric rollup, or None on a missing pool.
+
+    The three `SUM(...)::bigint` columns aggregate the per-stage read counts
+    over the pool's sequenced_samples; `count(ss.idx)` is the pool's sample
+    total and `count(ss.raw_read_count_r1r2)` is how many of those carry metrics.
+    Every aggregate uses `FILTER (WHERE ps.retired IS NOT TRUE)` so a retired
+    prep_sample contributes to neither the sums nor the counts (matching the
+    roster route's retired exclusion). `prep_sample.retired` is `NOT NULL`, so on
+    a real sample `IS NOT TRUE` is equivalent to the roster's `= false`; the
+    NULL-tolerant form is just defensive against the LEFT-JOIN'd all-NULL `ps` of
+    a zero-sample pool (whose row the LEFT JOIN keeps regardless — sums NULL,
+    counts 0). `SUM` of BIGINT is NUMERIC in Postgres, so
+    the explicit `::bigint` cast hands asyncpg a clean int (a single pool's read
+    total is far below the BIGINT ceiling). The passing fraction is recomputed
+    from these sums in PoolReadMetrics — never a mean of per-sample fractions."""
+    return await pool_or_conn.fetchrow(
+        "SELECT sp.idx, sp.sequencing_run_idx, sp.run_preflight_filename,"
+        " sp.extra_metadata, sp.created_by_idx, sp.created_at,"
+        " SUM(ss.raw_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
+        "   AS raw_read_count_r1r2,"
+        " SUM(ss.biological_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
+        "   AS biological_read_count_r1r2,"
+        " SUM(ss.quality_filtered_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)::bigint"
+        "   AS quality_filtered_read_count_r1r2,"
+        " count(ss.idx) FILTER (WHERE ps.retired IS NOT TRUE) AS sample_count,"
+        " count(ss.raw_read_count_r1r2) FILTER (WHERE ps.retired IS NOT TRUE)"
+        "   AS samples_with_metrics"
+        " FROM qiita.sequenced_pool sp"
+        " LEFT JOIN qiita.sequenced_sample ss ON ss.sequenced_pool_idx = sp.idx"
+        " LEFT JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        " WHERE sp.idx = $1"
+        " GROUP BY sp.idx, sp.sequencing_run_idx, sp.run_preflight_filename,"
+        " sp.extra_metadata, sp.created_by_idx, sp.created_at",
         sequenced_pool_idx,
     )
 

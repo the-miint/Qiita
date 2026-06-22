@@ -46,10 +46,12 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
+    PoolReadMetrics,
     SequencedPoolCreateRequest,
     SequencedPoolCreateResponse,
     SequencedPoolDeleteResponse,
     SequencedPoolPreflightResponse,
+    SequencedPoolResponse,
     SequencingRunCreateRequest,
     SequencingRunCreateResponse,
     SequencingRunLookupByInstrumentRunIdRequest,
@@ -78,6 +80,7 @@ from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
 from ..repositories.sequencing_run import (
     PayloadMismatch,
     fetch_sequenced_pool_preflight,
+    fetch_sequenced_pool_read_metrics,
     fetch_sequencing_run,
     fetch_sequencing_run_idxs_by_instrument_run_id,
     insert_sequenced_pool,
@@ -269,6 +272,56 @@ async def get_sequenced_pool_preflight(
         run_preflight_blob=base64.b64encode(bytes(row["run_preflight_blob"])),
         run_preflight_filename=row["run_preflight_filename"],
     )
+
+
+@router.get(PATH_SEQUENCED_POOL_BY_IDX)
+async def get_sequenced_pool(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> SequencedPoolResponse:
+    """Read one sequenced_pool's metadata plus its compute-on-read read-metric
+    rollup: per-stage read-count SUMS over the pool's non-retired
+    sequenced_samples, with the passing fraction recomputed from the sums (never
+    a mean of per-sample fractions) and total / with-metrics sample counts.
+
+    Nothing is stored at the pool level — the rollup is aggregated at request
+    time, so it never drifts when a sample is re-processed or deleted. Same read
+    gate as `get_sequencing_run` / the pool roster: a HumanUser with
+    `Scope.PREP_SAMPLE_READ` and system_role at least wet_lab_admin.
+    `require_sequenced_pool_in_run` fronts 404 (no such pool) and 422 (pool not
+    under this run); the rollup is always present (an unprocessed pool reads as
+    NULL sums / 0 counts). The BYTEA `run_preflight_blob` is not surfaced — only
+    its filename.
+    """
+    row = await fetch_sequenced_pool_read_metrics(pool, sequenced_pool_idx)
+    # require_sequenced_pool_in_run already 404'd a missing pool, so the fetch
+    # returns the now-guaranteed row; guard belt-and-suspenders against a
+    # concurrent delete between the dependency and this read.
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail=f"sequenced_pool {sequenced_pool_idx} not found"
+        )
+    # Shape via model_validate(dict(row)), like get_sequencing_run: rename idx and
+    # pop the aggregate columns into the nested read_metrics, leaving exactly the
+    # top-level fields. asyncpg returns JSONB as text (no codec); decode it so the
+    # response carries an object.
+    data = dict(row)
+    data["sequenced_pool_idx"] = data.pop("idx")
+    if isinstance(data["extra_metadata"], str):
+        data["extra_metadata"] = json.loads(data["extra_metadata"])
+    data["read_metrics"] = PoolReadMetrics(
+        raw_read_count_r1r2=data.pop("raw_read_count_r1r2"),
+        biological_read_count_r1r2=data.pop("biological_read_count_r1r2"),
+        quality_filtered_read_count_r1r2=data.pop("quality_filtered_read_count_r1r2"),
+        sample_count=data.pop("sample_count"),
+        samples_with_metrics=data.pop("samples_with_metrics"),
+    )
+    return SequencedPoolResponse.model_validate(data)
 
 
 @router.delete(PATH_SEQUENCED_POOL_BY_IDX)

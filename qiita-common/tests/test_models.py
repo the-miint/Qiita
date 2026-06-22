@@ -627,3 +627,29 @@ def test_sequenced_sample_fraction_passing_quality_filter(raw, quality_filtered,
         assert resp.fraction_passing_quality_filter is None
     else:
         assert resp.fraction_passing_quality_filter == pytest.approx(expected)
+
+
+def test_pool_read_metrics_fraction_recomputed_from_sums():
+    """PoolReadMetrics.fraction_passing_quality_filter uses the shared helper on
+    the SUMMED counts — here 100/1000 = 0.1, never a mean of per-sample
+    fractions. sample_count / samples_with_metrics ride through verbatim."""
+    from qiita_common.models import PoolReadMetrics
+
+    rm = PoolReadMetrics(
+        raw_read_count_r1r2=1000,
+        biological_read_count_r1r2=200,
+        quality_filtered_read_count_r1r2=100,
+        sample_count=2,
+        samples_with_metrics=2,
+    )
+    assert rm.fraction_passing_quality_filter == pytest.approx(0.1)
+    # An unprocessed pool: NULL sums -> None fraction, but counts still present.
+    empty = PoolReadMetrics(
+        raw_read_count_r1r2=None,
+        biological_read_count_r1r2=None,
+        quality_filtered_read_count_r1r2=None,
+        sample_count=3,
+        samples_with_metrics=0,
+    )
+    assert empty.fraction_passing_quality_filter is None
+    assert empty.sample_count == 3

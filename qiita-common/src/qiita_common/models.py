@@ -1864,6 +1864,52 @@ class SequencedPoolCreateResponse(BaseModel):
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
 
 
+class PoolReadMetrics(BaseModel):
+    """Compute-on-read read-metric rollup for a sequenced_pool.
+
+    The three counts are SUMS over the pool's NON-retired sequenced_samples
+    (each NULL until at least one sample in the pool has been processed);
+    `fraction_passing_quality_filter` is recomputed from the summed counts via
+    `_fraction_passing_quality_filter` — NOT a mean of per-sample fractions — and
+    is None when raw is absent or 0. `sample_count` is the pool's non-retired
+    sequenced_sample total; `samples_with_metrics` is how many of those carry
+    read counts, so a partial rollup (some samples still unprocessed) is
+    interpretable rather than looking complete."""
+
+    raw_read_count_r1r2: int | None
+    biological_read_count_r1r2: int | None
+    quality_filtered_read_count_r1r2: int | None
+    sample_count: int
+    samples_with_metrics: int
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def fraction_passing_quality_filter(self) -> float | None:
+        """Pool quality_filtered / raw, recomputed from the SUMMED counts (see
+        `_fraction_passing_quality_filter`)."""
+        return _fraction_passing_quality_filter(
+            self.raw_read_count_r1r2, self.quality_filtered_read_count_r1r2
+        )
+
+
+class SequencedPoolResponse(BaseModel):
+    """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool/{P}.
+
+    The pool's caller-visible metadata (the BYTEA `run_preflight_blob` is
+    omitted — only `run_preflight_filename` is surfaced) plus the compute-on-read
+    read-metric rollup. There is no stored pool-level metric: `read_metrics`
+    is aggregated from the constituent sequenced_samples at request time, so it
+    never drifts when a sample is re-processed or deleted."""
+
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    run_preflight_filename: str | None
+    extra_metadata: dict[str, Any] | None
+    created_by_idx: Annotated[int, Field(gt=0)]
+    created_at: AwareDatetime
+    read_metrics: PoolReadMetrics
+
+
 class SequencedPoolPreflightResponse(BaseModel):
     """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool/{P}/preflight.
 
@@ -1966,6 +2012,22 @@ class SequencedSampleCreateResponse(BaseModel):
     sequenced_sample_idx: Annotated[int, Field(gt=0)]
 
 
+def _fraction_passing_quality_filter(
+    raw_read_count_r1r2: int | None, quality_filtered_read_count_r1r2: int | None
+) -> float | None:
+    """quality_filtered / raw — the share of raw reads surviving the full QC +
+    host-filter pipeline. Computed on read so it can never drift from the counts.
+    None when either bound is absent or raw is 0 (no division). Shared
+    by the per-sample (SequencedSampleResponse) and pool-rollup (PoolReadMetrics)
+    surfaces; the pool passes its SUMMED counts here, so the pool fraction is
+    recomputed from the sums, never a mean of per-sample fractions."""
+    if raw_read_count_r1r2 is None or quality_filtered_read_count_r1r2 is None:
+        return None
+    if raw_read_count_r1r2 == 0:
+        return None
+    return quality_filtered_read_count_r1r2 / raw_read_count_r1r2
+
+
 class SequencedSampleResponse(BaseModel):
     """Returned by GET /api/v1/sequenced-sample/{sequenced_sample_idx}.
 
@@ -2018,15 +2080,12 @@ class SequencedSampleResponse(BaseModel):
     @computed_field  # type: ignore[prop-decorator]
     @property
     def fraction_passing_quality_filter(self) -> float | None:
-        """quality_filtered / raw — the share of raw reads surviving the full
-        QC + host-filter pipeline. Computed on read (not stored) so it can never
-        drift from the counts (#142). None when either bound is absent or raw is
-        0 (no division)."""
-        if self.raw_read_count_r1r2 is None or self.quality_filtered_read_count_r1r2 is None:
-            return None
-        if self.raw_read_count_r1r2 == 0:
-            return None
-        return self.quality_filtered_read_count_r1r2 / self.raw_read_count_r1r2
+        """quality_filtered / raw for this sample — see
+        `_fraction_passing_quality_filter`. Computed on read, never stored, so it
+        can't drift from the counts."""
+        return _fraction_passing_quality_filter(
+            self.raw_read_count_r1r2, self.quality_filtered_read_count_r1r2
+        )
 
 
 class SequencedSamplePatchRequest(PatchRequestModel):
