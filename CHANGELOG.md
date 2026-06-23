@@ -312,6 +312,15 @@ the `no-changelog` label).
 
 ### Changed
 
+- Workflow steps now escalate their memory allocation on an OOM-killed retry.
+  Previously every retry re-ran at the same `mem_gb`, so an OOM just OOM'd again
+  until the retry budget was exhausted. `_run_entry_with_retry` now grows the
+  step's memory floor ×2 (clamped to the action's `mem_gb` ceiling) on each
+  `OOM_KILLED` retry; other transient kinds still retry unchanged. The escalated
+  floor is process-local — a CP restart re-attaches and re-escalates from the
+  ticket's static `resource_override`. The `reference-add` and
+  `host-reference-add` action ceilings are raised 64 → 128 GB so the OOM-prone
+  `reference_load` step can climb 32 → 64 → 128 GB across retries (#TBD)
 - `qiita-user submit-host-filter-pool` now host-filters each pool sample against
   the reference(s) recorded on it at `submit-bcl-convert` time, instead of a
   single uniform reference for the whole pool. **Operator-facing CLI contract

@@ -245,8 +245,10 @@ async def run_workflow(
     """
     work_ticket = await _fetch_work_ticket(pool, work_ticket_idx)
     # Optional per-run resource bump (gated to wet_lab_admin+ and validated
-    # <= the action ceiling at submission). Read once here and threaded to
-    # every step's dispatch so a CP restart re-attaches with the same override.
+    # <= the action ceiling at submission). Read once here as the starting
+    # memory floor; `_run_entry_with_retry` raises it (up to the ceiling) on an
+    # OOM-killed retry. A CP restart re-attaches with this static floor and
+    # re-escalates from there.
     _override = work_ticket.get("resource_override")
     mem_gb_override = _override.get("mem_gb") if isinstance(_override, dict) else None
     if not resume and work_ticket["state"] != WorkTicketState.PENDING.value:
@@ -570,6 +572,13 @@ async def _run_entry_with_retry(
         increment retry_count, transition PROCESSING → QUEUED → PROCESSING
         atomically, retry the same step. Earlier successful entries are
         not re-run — `bound` carries their outputs forward.
+      * On an `OOM_KILLED` retry specifically, grow the step's memory floor
+        (×`_OOM_MEMORY_GROWTH`, clamped to `action_ceiling.mem_gb`) before the
+        next attempt — a step the scheduler OOM-killed will OOM again at the
+        same size. Other transient kinds retry at the same allocation. The
+        escalated floor is process-local (not persisted): a CP restart
+        re-attaches to the in-flight job and re-escalates from the ticket's
+        static override.
       * On permanent failure or retry_count >= max_retries: re-raise so
         the outer handler in `run_workflow` writes the failure_* columns
         and transitions to FAILED.
@@ -589,6 +598,10 @@ async def _run_entry_with_retry(
     # gaps like attempt-0 → attempt-3 for an entry that itself only
     # retried once.
     attempt = 0
+    # Escalating memory floor: starts at the ticket's static override and is
+    # raised on each OOM-killed retry (see the except arm below). Threaded into
+    # every step dispatch in place of the static `mem_gb_override`.
+    effective_mem_override = mem_gb_override
     while True:
         attempt_workspace = workspace / entry.name / f"attempt-{attempt}"
         attempt_workspace.mkdir(parents=True, exist_ok=True)
@@ -605,7 +618,7 @@ async def _run_entry_with_retry(
                     step_index=index,
                     attempt=attempt,
                     action_ceiling=action_ceiling,
-                    mem_gb_override=mem_gb_override,
+                    mem_gb_override=effective_mem_override,
                     poll_interval_seconds=poll_interval_seconds,
                     resume=resume,
                 )
@@ -638,13 +651,25 @@ async def _run_entry_with_retry(
                     max_retries,
                 )
                 raise
+            # An OOM-killed step would OOM again at the same size, so grow its
+            # memory floor (clamped to the action ceiling) before re-queuing.
+            # Steps only — `action:` entries carry no baseline_resources and
+            # never OOM-kill. Other transient kinds retry at the same size.
+            if exc.kind is FailureKind.OOM_KILLED and isinstance(entry, WorkflowStep):
+                effective_mem_override = _escalated_mem_floor_after_oom(
+                    entry=entry,
+                    bound=bound,
+                    action_ceiling=action_ceiling,
+                    current_override=effective_mem_override,
+                )
             _log.warning(
-                "work_ticket %d step %r transient failure (%s); retrying %d/%d",
+                "work_ticket %d step %r transient failure (%s); retrying %d/%d (mem_gb floor=%s)",
                 work_ticket_idx,
                 entry.name,
                 exc.kind.value,
                 current_retry + 1,
                 max_retries,
+                effective_mem_override,
             )
             attempt += 1
             await _bump_retry_and_requeue(pool, work_ticket_idx)
@@ -1677,6 +1702,42 @@ def _resolve_baseline_for_step(
 
     _assert_within_ceiling(entry=entry, resolved=resolved, action_ceiling=action_ceiling)
     return resolved
+
+
+# Growth factor applied to a step's resolved memory on each OOM_KILLED retry.
+# A step the scheduler OOM-killed will OOM again at the same size, so doubling
+# — clamped to the action's mem ceiling — is the only retry that can fit.
+_OOM_MEMORY_GROWTH = 2
+
+
+def _escalated_mem_floor_after_oom(
+    *,
+    entry: WorkflowStep,
+    bound: dict[str, Any],
+    action_ceiling: ActionCeiling,
+    current_override: int | None,
+) -> int | None:
+    """Memory floor (``mem_gb``) for the next attempt after an OOM, or
+    ``current_override`` unchanged once the resolved allocation has reached the
+    action ceiling.
+
+    The just-failed attempt ran at ``max(baseline.mem_gb, current_override)`` —
+    exactly what ``_resolve_baseline_for_step`` resolves here. Grow that by
+    ``_OOM_MEMORY_GROWTH`` and clamp to ``action_ceiling.mem_gb`` so the next
+    attempt's floor stays within the same bound the submission route and
+    ``_assert_within_ceiling`` enforce. The result is threaded back into
+    ``_dispatch_step`` as ``mem_gb_override``.
+    """
+    resolved = _resolve_baseline_for_step(
+        entry=entry,
+        bound=bound,
+        action_ceiling=action_ceiling,
+        mem_gb_override=current_override,
+    )
+    grown = min(resolved.mem_gb * _OOM_MEMORY_GROWTH, action_ceiling.mem_gb)
+    # No headroom left (already at the ceiling): keep the current floor so the
+    # retry still runs at the ceiling rather than dropping back to baseline.
+    return grown if grown > resolved.mem_gb else current_override
 
 
 def _assert_within_ceiling(
