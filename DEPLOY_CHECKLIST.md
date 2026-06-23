@@ -23,7 +23,7 @@ _None yet._
 
 ### 3. Migrations
 
-- (#feat/read-mask-1-mask-definition-route) `20260623000000_mask_definition.sql`
+- (#170) `20260623000000_mask_definition.sql`
   — adds the `qiita.mask_definition` table + `qiita.mint_mask_definition`
   function. Plain `make migrate`; additive, no extension or backfill. (Retag
   with the PR number once assigned.)
@@ -38,7 +38,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#feat/read-mask-1-mask-definition-route) New `read_masked:doget` scope on the
+- (#170) New `read_masked:doget` scope on the
   service-account ceiling, gating the new `POST /mask-definition` and
   `POST /read-masked/ticket/doget` routes. No host action this deploy: no
   production service account consumes these routes yet (the masked-read consumer

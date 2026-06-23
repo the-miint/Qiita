@@ -25,7 +25,7 @@ the `no-changelog` label).
   filter on the data plane's `read_masked` view — an unfiltered ticket is never
   signed). Both service-account-only under a new `read_masked:doget` scope.
   `read_masked` added to the CP-side DoGet table allowlist (the data-plane view
-  itself lands in PR 2). New `qiita_common.hashing` canonical-hash helper.
+  itself lands in PR 2). New `qiita_common.hashing` canonical-hash helper. (#170)
 - `qiita ticket run <idx>` CLI subcommand — wraps the existing
   `POST /work-ticket/{idx}/run` operator override (reset a FAILED ticket and
   re-dispatch; the only retry mechanism, no auto-retry worker). The runner
