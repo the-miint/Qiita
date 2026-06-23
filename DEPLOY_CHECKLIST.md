@@ -31,7 +31,7 @@ _None yet._
 
 ### 5. Verify
 
-- (#TBD) Confirm the raised `local-host-reference-add` mem ceiling synced into
+- (#169) Confirm the raised `local-host-reference-add` mem ceiling synced into
   `qiita.action` (so its `build_rype_index` OOM-retry escalation can climb to
   128 GB; `host-reference-add` was already 128):
 
@@ -42,7 +42,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#TBD) `build_rype_index` resource bump for large host sets (many human
+- (#169) `build_rype_index` resource bump for large host sets (many human
   genomes that OOMed at 32 GB). In both `host-reference-add/1.0.0` and
   `local-host-reference-add/1.0.0` the step's `baseline_resources.mem_gb` rises
   32 → 64, and `local-host-reference-add`'s `action_ceiling.mem_gb` rises 64 →
