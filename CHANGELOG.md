@@ -617,7 +617,7 @@ the `no-changelog` label).
   startup-recovery resume (resource not rewound) the re-apply is a no-op or a
   rejected backward edge, both benign. Fixes redrives of `local-host-reference-add`
   / `host-reference-add` (which walk `pending → hashing → minting → loading →
-  indexing → active`) after a `load`-step failure
+  indexing → active`) after a `load`-step failure (#165)
 - `mint-features` no longer starves the control-plane event loop on genome-scale
   reference loads. The in-process primitive read every `sequence_hash` from the
   manifest with a blocking, ORDER-BY (full-sort) DuckDB `fetchall()` and then
