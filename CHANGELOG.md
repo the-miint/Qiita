@@ -320,7 +320,7 @@ the `no-changelog` label).
   floor is process-local — a CP restart re-attaches and re-escalates from the
   ticket's static `resource_override`. The `reference-add` and
   `host-reference-add` action ceilings are raised 64 → 128 GB so the OOM-prone
-  `reference_load` step can climb 32 → 64 → 128 GB across retries (#TBD)
+  `reference_load` step can climb 32 → 64 → 128 GB across retries (#167)
 - `qiita-user submit-host-filter-pool` now host-filters each pool sample against
   the reference(s) recorded on it at `submit-bcl-convert` time, instead of a
   single uniform reference for the whole pool. **Operator-facing CLI contract

@@ -31,7 +31,7 @@ _None yet._
 
 ### 5. Verify
 
-- (#TBD) Confirm the raised `reference-add` / `host-reference-add` mem ceilings
+- (#167) Confirm the raised `reference-add` / `host-reference-add` mem ceilings
   synced into `qiita.action` (so a `resource_override.mem_gb` up to 128 is
   accepted and the OOM-retry escalation can climb to 128 GB):
   ```bash
@@ -41,7 +41,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#TBD) `reference-add/1.0.0` and `host-reference-add/1.0.0` raise their
+- (#167) `reference-add/1.0.0` and `host-reference-add/1.0.0` raise their
   `action_ceiling.mem_gb` 64 → 128 (the `reference_load` step OOMs above 40 GB
   at GG2 scale). Edited in place — re-synced into `qiita.action` by `qiita-admin
   actions sync` inside `activate.sh`, **not** a migration. Pairs with the runner
