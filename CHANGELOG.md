@@ -605,6 +605,19 @@ the `no-changelog` label).
 
 ### Fixed
 
+- `mint-features` no longer starves the control-plane event loop on genome-scale
+  reference loads. The in-process primitive read every `sequence_hash` from the
+  manifest with a blocking, ORDER-BY (full-sort) DuckDB `fetchall()` and then
+  built an O(N) Python list + dict + string-pair list — all on the single
+  uvicorn event loop — so a human-comprehensive host reference pinned the API at
+  high CPU and made every request (even a one-row `ticket status`) time out.
+  Rewritten to stream the manifest in `_CHUNK_SIZE` batches (matching
+  `write-membership`), drop the needless input sort, accumulate into a spillable
+  DuckDB temp table de-duplicated at write time, and offload the final Parquet
+  COPY to a thread. `_associate_genomes` likewise streams and resolves
+  `feature_idx` via a DuckDB JOIN against the written feature_map instead of an
+  in-memory mapping. The CP-side analog of the `hash_sequences` genome-scale fix
+  below; output Parquet schema and idempotency are unchanged.
 - `reference_load` no longer OOMs writing `reference_sequence_chunks` on
   genome-scale reference loads. Each per-part `COPY` did scan + join +
   `ORDER BY (feature_idx, chunk_index)` + write in one statement; the sort is a
