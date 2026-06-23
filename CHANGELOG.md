@@ -15,6 +15,17 @@ the `no-changelog` label).
 
 ### Added
 
+- Read-mask identity + masked-read DoGet route (PR 1 of the full-read+mask
+  feature). New `qiita.mask_definition` table + `qiita.mint_mask_definition`
+  function mint a `mask_idx` identifying a read-filtering config, deduplicated on
+  a canonical-JSON SHA-256 of the config so the same config resolves to the same
+  `mask_idx` fleet-wide (idempotent upsert; no advisory lock). New
+  `POST /api/v1/mask-definition` (mint) and `POST /api/v1/read-masked/ticket/doget`
+  (signs an HMAC DoGet ticket scoped to a mandatory `(prep_sample_idx, mask_idx)`
+  filter on the data plane's `read_masked` view — an unfiltered ticket is never
+  signed). Both service-account-only under a new `read_masked:doget` scope.
+  `read_masked` added to the CP-side DoGet table allowlist (the data-plane view
+  itself lands in PR 2). New `qiita_common.hashing` canonical-hash helper.
 - `qiita ticket run <idx>` CLI subcommand — wraps the existing
   `POST /work-ticket/{idx}/run` operator override (reset a FAILED ticket and
   re-dispatch; the only retry mechanism, no auto-retry worker). The runner

@@ -212,6 +212,33 @@ URL_SEQUENCE_RANGE_BY_PREP_SAMPLE = (
     f"{URL_SEQUENCE_RANGE_PREFIX}{PATH_SEQUENCE_RANGE_BY_PREP_SAMPLE}"
 )
 
+# =============================================================================
+# /mask-definition/* — control-plane read-filtering config identity
+# =============================================================================
+# Mints (idempotently, deduped on a canonical-config hash) the mask_idx that
+# tags the data plane's read_mask / read_masked rows. POST is service-account-
+# only (Scope.READ_MASKED_DOGET).
+
+PATH_MASK_DEFINITION_PREFIX = "/mask-definition"
+PATH_MASK_DEFINITION_ROOT = ""  # POST against the prefix itself
+
+URL_MASK_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_MASK_DEFINITION_PREFIX}"
+
+# =============================================================================
+# /read-masked/* — Flight DoGet ticket for the masked-read surface
+# =============================================================================
+# Signs an HMAC DoGet ticket scoped to a single (prep_sample_idx, mask_idx) on
+# the data plane's `read_masked` view. POST is service-account-only
+# (Scope.READ_MASKED_DOGET). The route enforces the mandatory-filter invariant:
+# both identifiers are required, so an unfiltered read_masked ticket is never
+# signed.
+
+PATH_READ_MASKED_PREFIX = "/read-masked"
+PATH_READ_MASKED_DOGET = "/ticket/doget"
+
+URL_READ_MASKED_PREFIX = f"{API_PREFIX}{PATH_READ_MASKED_PREFIX}"
+URL_READ_MASKED_DOGET = f"{URL_READ_MASKED_PREFIX}{PATH_READ_MASKED_DOGET}"
+
 
 # =============================================================================
 # /auth/* — OIDC handoff, PAT mint/list/revoke, CLI device flow
