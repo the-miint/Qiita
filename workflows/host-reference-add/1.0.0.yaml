@@ -126,9 +126,12 @@ steps:
     # sibling carries the same gate.
     when: build_rype
     outputs: [rype_index_meta]
+    # mem_gb 64 (not 32): a large host set (many human genomes) OOMed at 32.
+    # An OOM retry doubles this to the 128 GB action_ceiling; the job hard-caps
+    # DuckDB at 30 GB and hands the growing remainder to rype's `max_memory`.
     baseline_resources:
       cpu: 4
-      mem_gb: 32
+      mem_gb: 64
       walltime: PT2H
 
   # Sidecar minimap2 `.mmi` for the second-pass host filter, written to
