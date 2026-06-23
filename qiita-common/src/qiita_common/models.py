@@ -2381,3 +2381,58 @@ class SequenceRange(BaseModel):
     sequence_idx_start: Annotated[int, Field(gt=0)]
     sequence_idx_stop: Annotated[int, Field(gt=0)]
     created_at: AwareDatetime
+
+
+# ---------------------------------------------------------------------------
+# Mask definition (read-filtering config identity)
+# ---------------------------------------------------------------------------
+
+
+class MaskDefinitionMintRequest(BaseModel):
+    """Body for POST /api/v1/mask-definition.
+
+    Mints (or returns the existing) mask_idx for a read-filtering config.
+    `params` is the full config blob — host references, QC settings, etc.;
+    its canonical-JSON SHA-256 is the dedup key, so the same config always
+    resolves to the same mask_idx fleet-wide (idempotent mint). Service-account
+    callers with `read_masked:doget` only — humans never mint masks.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    filter_workflow: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
+    filter_version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
+    # The config blob the mask_idx is deduplicated on. Must be a JSON object so
+    # the hash is over a stable, named-key structure (not a bare scalar/array).
+    params: dict[str, Any]
+
+
+class MaskDefinition(BaseModel):
+    """Returned by POST /api/v1/mask-definition (200/201).
+
+    `mask_idx` is the filtering-config discriminator that tags the data plane's
+    read_mask / read_masked rows. The same `params` (canonically hashed) always
+    yields the same `mask_idx`.
+    """
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    filter_workflow: str
+    filter_version: str
+    params: dict[str, Any]
+    created_at: AwareDatetime
+
+
+class ReadMaskedDoGetTicketRequest(BaseModel):
+    """Body for POST /api/v1/read-masked/ticket/doget.
+
+    Signs a Flight DoGet ticket scoped to a single (prep_sample_idx, mask_idx)
+    on the data plane's `read_masked` view. Both identifiers are mandatory: the
+    data plane's empty-filter path would dump every sample's pass reads across
+    every mask, so the route never signs an unfiltered read_masked ticket
+    (the mandatory-filter invariant).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    mask_idx: Annotated[int, Field(gt=0)]

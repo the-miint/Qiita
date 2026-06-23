@@ -23,7 +23,9 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- (#170) `20260623000000_mask_definition.sql`
+  — adds the `qiita.mask_definition` table + `qiita.mint_mask_definition`
+  function. Plain `make migrate`; additive, no extension or backfill.
 
 ### 4. Deploy
 
@@ -42,6 +44,12 @@ _None yet._
 
 ### Notes (no host action)
 
+- (#170) New `read_masked:doget` scope on the
+  service-account ceiling, gating the new `POST /mask-definition` and
+  `POST /read-masked/ticket/doget` routes. No host action this deploy: no
+  production service account consumes these routes yet (the masked-read consumer
+  path lands in a later PR), so no token needs re-minting now. When a worker is
+  wired to pull masked reads, mint/rotate its token to include the scope.
 - (#169) `build_rype_index` resource bump for large host sets (many human
   genomes that OOMed at 32 GB). In both `host-reference-add/1.0.0` and
   `local-host-reference-add/1.0.0` the step's `baseline_resources.mem_gb` rises

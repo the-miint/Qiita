@@ -304,8 +304,11 @@ async def delete_reference(
     )
 
 
-# Tables that can appear in a DoGet ticket. Must match the data plane's
-# ALLOWED_TABLES whitelist in flight_service.rs.
+# Tables that can appear in a DoGet ticket, CP-side mirror of the data plane's
+# ALLOWED_TABLES whitelist in flight_service.rs. Must stay in sync with it.
+# `read_masked` (the masked-read surface) is the one the data plane reaches via
+# Flight in addition to the reference_* tables; raw `read`/`read_mask` are
+# deliberately absent from both allowlists (privacy by construction).
 _DOGET_ALLOWED_TABLES = frozenset(
     {
         "reference_sequences",
@@ -313,8 +316,16 @@ _DOGET_ALLOWED_TABLES = frozenset(
         "reference_taxonomy",
         "reference_phylogeny",
         "reference_placements",
+        "read_masked",
     }
 )
+
+# The subset the reference DoGet route below can sign. `read_masked` is reached
+# through the dedicated /read-masked/ticket/doget route (routes/read_masked.py),
+# whose ticket carries (prep_sample_idx, mask_idx) — not reference_idx — and
+# which enforces the mandatory-filter invariant. The reference route restricts
+# itself to the reference_* tables whose membership it resolves.
+_REFERENCE_DOGET_TABLES = _DOGET_ALLOWED_TABLES - frozenset({"read_masked"})
 
 
 @router.post(PATH_REFERENCE_DOGET, status_code=201)
@@ -336,10 +347,10 @@ async def create_doget_ticket(
     `tickets:doget` can request a ticket. Row-level visibility (private
     references) is not yet implemented.
     """
-    if body.table not in _DOGET_ALLOWED_TABLES:
+    if body.table not in _REFERENCE_DOGET_TABLES:
         raise HTTPException(
             status_code=422,
-            detail=f"Unknown table {body.table!r}; allowed: {sorted(_DOGET_ALLOWED_TABLES)}",
+            detail=f"Unknown table {body.table!r}; allowed: {sorted(_REFERENCE_DOGET_TABLES)}",
         )
 
     # Reference must be active

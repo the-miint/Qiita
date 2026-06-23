@@ -96,6 +96,10 @@ SERVICE_ACCOUNT_SCOPE_CEILING: frozenset[Scope] = frozenset(
         Scope.TICKET_DOPUT,
         Scope.SEQUENCE_RANGE_MINT,
         Scope.SEQUENCED_POOL_PREFLIGHT_READ,
+        # Mint mask_definition rows + sign masked-read DoGet tickets. Workers
+        # only — the masked-read consumer path is service-driven; no human role
+        # carries it (privacy-sensitive read surface, see Scope.READ_MASKED_DOGET).
+        Scope.READ_MASKED_DOGET,
     }
 )
 
