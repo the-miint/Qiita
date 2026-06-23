@@ -605,6 +605,21 @@ the `no-changelog` label).
 
 ### Fixed
 
+- `reference_load` no longer OOMs writing `reference_sequence_chunks` on
+  genome-scale reference loads. Each per-part `COPY` did scan + join +
+  `ORDER BY (feature_idx, chunk_index)` + write in one statement; the sort is a
+  pipeline breaker, so it buffered the batch's wide ~64 KB chunk rows while the
+  full ~30 GB glob scan and the 8-thread write buffers were all still live,
+  blowing the cap (observed 38.7 GiB against ~39 GiB). Split into two phases per
+  part: phase 1 streams the batch's chunks into a temp table (re-keyed
+  hash → feature_idx, no sort), phase 2 sorts that isolated temp table (≤ one
+  batch, never the 30 GB glob) and writes the part. The sort is kept on purpose
+  — it clusters row groups so a `WHERE feature_idx IN (...)` DoGet prunes within
+  a part, and feature_idx-ascending batches keep the parts a disjoint-range
+  dataset for catalog-level file pruning; without it a point query would scan a
+  whole part, since input order is parallel-scrambled upstream
+  (`preserve_insertion_order=false`). Sibling to the `hash_sequences`
+  genome-scale fix below.
 - `hash_sequences` no longer OOMs writing `reference_sequence_chunks` on
   genome-scale reference loads. The per-batch output COPY joined the full
   `hashed` table (which grows 1:1 with the input), so at scale the optimizer
