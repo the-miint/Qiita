@@ -422,40 +422,55 @@ def _write_reference_sequence_chunks(
         for i, batch_hashes in enumerate(batches):
             part_path = out_dir / f"part_{i:05d}.parquet"
             part_out = validate_parquet_path(part_path)
-            # Bound the feature_map JOIN to THIS batch's hashes (the `fmb`
-            # CTE) so the join is bounded by construction. Joining the
-            # full `feature_map` lets the optimizer reorder that join
-            # ahead of the batch filter once feature_map's cardinality
-            # catches the chunk scan at scale — which materializes the
-            # whole glob's chunk_data and OOMs (the hash_sequences failure
-            # mode). With `fmb` ≤ one batch, no join order can produce
-            # more than the batch's chunks. We ALSO keep `WHERE
-            # rc.sequence_hash = ANY(...)` on the input column so the
-            # filter still applies during the Parquet scan — late
-            # materialisation skips loading `chunk_data` for non-matching
-            # rows (wide ~64 KB rows dominate I/O). The per-part
-            # `ORDER BY feature_idx` plus feature_idx-ascending batches
-            # keep the parts a globally-clustered, disjoint-range dataset
-            # for DuckLake / row-group pruning on DoGet's feature_idx
-            # lookups (see the batched-shape note above).
+            # Two phases per part so the full-glob scan and the feature_idx
+            # sort never co-peak in memory. A single COPY doing
+            # scan + join + ORDER BY(chunk_data) + write at once OOMed at
+            # genome scale: the sort is a pipeline breaker, so it buffers the
+            # batch's wide ~64 KB rows while the 30 GB scan and the 8-thread
+            # write buffers are all still live. Splitting the scan from the
+            # sort means at most one of them is resident at a time.
+            #
+            # Phase 1 — STREAM this batch's chunks into a temp table, re-keyed
+            # hash → feature_idx, with NO sort. The `fmb` CTE bounds the build
+            # side to one batch of hashes (so it's the hash-join build and
+            # chunk_data streams through the probe, never into the build); the
+            # `WHERE ... = ANY(...)` on the input column keeps the filter on the
+            # Parquet scan so late materialisation skips chunk_data for
+            # non-matching rows. The insert is bounded by the batch and spills
+            # to temp_directory under pressure.
             conn.execute(
-                "COPY ("
+                "CREATE OR REPLACE TEMP TABLE part_chunks AS "
                 "  WITH fmb AS ("
                 "    SELECT feature_idx, sequence_hash"
                 "    FROM feature_map"
                 "    WHERE sequence_hash = ANY(CAST(? AS UUID[]))"
                 "  )"
-                "  SELECT "
-                "    fmb.feature_idx,"
-                "    rc.chunk_index,"
-                "    rc.chunk_data"
+                "  SELECT fmb.feature_idx, rc.chunk_index, rc.chunk_data"
                 "  FROM read_parquet(?) rc"
                 "  JOIN fmb ON rc.sequence_hash = fmb.sequence_hash"
-                "  WHERE rc.sequence_hash = ANY(CAST(? AS UUID[]))"
-                "  ORDER BY fmb.feature_idx, rc.chunk_index"
-                f") TO '{part_out}' ({PARQUET_OPTS_CHUNKED})",
+                "  WHERE rc.sequence_hash = ANY(CAST(? AS UUID[]))",
                 [batch_hashes, parts_glob, batch_hashes],
             )
+            # Phase 2 — sort THIS part in isolation and write it. The sort sees
+            # only the materialised batch (≤ _CHUNK_BUDGET_PER_BATCH chunks),
+            # never the 30 GB glob, so it fits the cap (spilling if needed). The
+            # per-part `ORDER BY feature_idx` clusters row groups so a
+            # `WHERE feature_idx IN (...)` DoGet prunes row groups WITHIN a part;
+            # feature_idx-ascending batches keep the parts a globally
+            # disjoint-range dataset for catalog-level FILE pruning. Keeping both
+            # levels is the point of sorting here — input order is
+            # parallel-scrambled upstream (preserve_insertion_order=false), so
+            # without this sort a point query would scan a whole part. The
+            # secondary `chunk_index` orders a feature's chunks for cheap
+            # reassembly.
+            conn.execute(
+                "COPY ("
+                "  SELECT feature_idx, chunk_index, chunk_data"
+                "  FROM part_chunks"
+                "  ORDER BY feature_idx, chunk_index"
+                f") TO '{part_out}' ({PARQUET_OPTS_CHUNKED})"
+            )
+        conn.execute("DROP TABLE IF EXISTS part_chunks")
     else:
         # No minted features → emit one empty part so the directory is
         # non-empty and the runner's `dir.glob('*.parquet')` discovers
