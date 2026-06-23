@@ -605,6 +605,19 @@ the `no-changelog` label).
 
 ### Fixed
 
+- `POST /work-ticket/{idx}/run` (`qiita ticket run`) can now redrive a FAILED
+  multi-transition reference workflow instead of dead-ending at a `permanent`
+  `IllegalStatusTransition`. The redrive resets a `failed` reference to `pending`
+  (its only legal exit from `failed`) while keeping the COMPLETED step rows, but
+  the runner's fast-forward used to *skip* those completed steps' `target_status`
+  PATCHes — so the reference stayed at `pending` while the first re-run step tried
+  to advance from mid-FSM (e.g. `minting → loading`), which is illegal. The
+  fast-forward now RE-WALKS each completed step's status edge, advancing the
+  resource forward along the FSM only when it is behind; on a normal
+  startup-recovery resume (resource not rewound) the re-apply is a no-op or a
+  rejected backward edge, both benign. Fixes redrives of `local-host-reference-add`
+  / `host-reference-add` (which walk `pending → hashing → minting → loading →
+  indexing → active`) after a `load`-step failure (#165)
 - `mint-features` no longer starves the control-plane event loop on genome-scale
   reference loads. The in-process primitive read every `sequence_hash` from the
   manifest with a blocking, ORDER-BY (full-sort) DuckDB `fetchall()` and then
