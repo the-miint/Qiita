@@ -31,11 +31,22 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- (#167) Confirm the raised `reference-add` / `host-reference-add` mem ceilings
+  synced into `qiita.action` (so a `resource_override.mem_gb` up to 128 is
+  accepted and the OOM-retry escalation can climb to 128 GB):
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, mem_ceiling_gb FROM qiita.action WHERE action_id IN ('reference-add','host-reference-add') AND version='1.0.0' ORDER BY action_id"
+  # expect: host-reference-add|128  and  reference-add|128
+  ```
 
 ### Notes (no host action)
 
-_None yet._
+- (#167) `reference-add/1.0.0` and `host-reference-add/1.0.0` raise their
+  `action_ceiling.mem_gb` 64 → 128 (the `reference_load` step OOMs above 40 GB
+  at GG2 scale). Edited in place — re-synced into `qiita.action` by `qiita-admin
+  actions sync` inside `activate.sh`, **not** a migration. Pairs with the runner
+  change that escalates a step's memory ×2 (clamped to this ceiling) on each
+  OOM-killed retry. No new env var, host dir, scope, or SIF.
 
 ---
 

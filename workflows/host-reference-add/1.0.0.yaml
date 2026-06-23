@@ -183,5 +183,5 @@ steps:
 
 action_ceiling:
   cpu: 16
-  mem_gb: 64
+  mem_gb: 128
   walltime: PT4H

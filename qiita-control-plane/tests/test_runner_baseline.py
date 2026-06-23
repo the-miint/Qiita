@@ -30,7 +30,10 @@ from qiita_common.actions import (
 from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.models import StepType, WorkTicketFailureStage
 
-from qiita_control_plane.runner import _resolve_baseline_for_step
+from qiita_control_plane.runner import (
+    _escalated_mem_floor_after_oom,
+    _resolve_baseline_for_step,
+)
 
 # A generous ceiling that the happy-path fixtures stay well under; the
 # overage tests construct their own tight ceilings per axis.
@@ -270,3 +273,77 @@ def test_mem_gb_override_above_ceiling_is_rejected():
     assert exc.kind == FailureKind.CONTRACT_VIOLATION
     assert exc.step_name == "over"
     assert "mem_gb" in exc.reason and "exceeds" in exc.reason
+
+
+# =============================================================================
+# OOM memory escalation — grow the floor on each OOM retry, clamped to ceiling
+# =============================================================================
+
+# The reference_load shape the escalation was written for: 32 GB baseline,
+# 128 GB action ceiling. Doubling reaches the ceiling in two OOM retries.
+_LOAD_CEILING = ActionCeiling(cpu=16, mem_gb=128, walltime=timedelta(hours=4), gpu=0)
+
+
+def _load_step() -> WorkflowStep:
+    return _step(BaselineResources(cpu=8, mem_gb=32, walltime=timedelta(hours=2)), name="load")
+
+
+def test_escalation_doubles_from_baseline_when_no_override():
+    """First OOM with no prior override grows the resolved baseline ×2."""
+    floor = _escalated_mem_floor_after_oom(
+        entry=_load_step(),
+        bound={},
+        action_ceiling=_LOAD_CEILING,
+        current_override=None,
+    )
+    assert floor == 64
+
+
+def test_escalation_doubles_from_current_override_floor():
+    """The grow is relative to what the failed attempt actually ran at —
+    max(baseline, current_override) — not the raw baseline."""
+    floor = _escalated_mem_floor_after_oom(
+        entry=_load_step(),
+        bound={},
+        action_ceiling=_LOAD_CEILING,
+        current_override=40,
+    )
+    # resolved = max(32, 40) = 40; 40 * 2 = 80, under the 128 ceiling.
+    assert floor == 80
+
+
+def test_escalation_clamps_to_action_ceiling():
+    floor = _escalated_mem_floor_after_oom(
+        entry=_load_step(),
+        bound={},
+        action_ceiling=_LOAD_CEILING,
+        current_override=80,
+    )
+    # 80 * 2 = 160, clamped down to the 128 ceiling.
+    assert floor == 128
+
+
+def test_escalation_at_ceiling_keeps_current_override():
+    """Once resolved memory is at the ceiling there is no headroom: keep the
+    current floor so the retry still runs at the ceiling (not back to baseline)."""
+    floor = _escalated_mem_floor_after_oom(
+        entry=_load_step(),
+        bound={},
+        action_ceiling=_LOAD_CEILING,
+        current_override=128,
+    )
+    assert floor == 128
+
+
+def test_escalation_full_sequence_to_ceiling():
+    """End-to-end floor trajectory across successive OOM retries: a 32 GB
+    baseline climbs 64 → 128 and then pins at the 128 GB ceiling."""
+    step, bound = _load_step(), {}
+    floor = None
+    trajectory = []
+    for _ in range(4):
+        floor = _escalated_mem_floor_after_oom(
+            entry=step, bound=bound, action_ceiling=_LOAD_CEILING, current_override=floor
+        )
+        trajectory.append(floor)
+    assert trajectory == [64, 128, 128, 128]
