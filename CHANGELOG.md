@@ -312,6 +312,16 @@ the `no-changelog` label).
 
 ### Changed
 
+- `build_rype_index` resized for large host sets (many human genomes that OOMed
+  at 32 GB). The step's `baseline_resources.mem_gb` rises 32 → 64 in both
+  `host-reference-add/1.0.0` and `local-host-reference-add/1.0.0`, and
+  `local-host-reference-add`'s `action_ceiling.mem_gb` rises 64 → 128 (matching
+  `host-reference-add`) so an OOM-killed retry can double the step 64 → 128 GB
+  (the escalator clamps to the ceiling). The job now hard-caps DuckDB at 30 GB
+  (was 16) regardless of allocation, so the larger cgroup — and the bigger one
+  an OOM retry escalates to — flows to rype: rype's `max_memory` starts at 30 GB
+  and grows with the allocation (≈92 GB at the 128 GB ceiling). Builds on the
+  OOM-retry escalation below (#TBD)
 - Workflow steps now escalate their memory allocation on an OOM-killed retry.
   Previously every retry re-ran at the same `mem_gb`, so an OOM just OOM'd again
   until the retry budget was exhausted. `_run_entry_with_retry` now grows the

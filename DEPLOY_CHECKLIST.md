@@ -31,11 +31,29 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- (#TBD) Confirm the raised `local-host-reference-add` mem ceiling synced into
+  `qiita.action` (so its `build_rype_index` OOM-retry escalation can climb to
+  128 GB; `host-reference-add` was already 128):
+
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, mem_ceiling_gb FROM qiita.action WHERE action_id IN ('host-reference-add','local-host-reference-add') AND version='1.0.0' ORDER BY action_id"
+  # expect: host-reference-add|128  and  local-host-reference-add|128
+  ```
 
 ### Notes (no host action)
 
-_None yet._
+- (#TBD) `build_rype_index` resource bump for large host sets (many human
+  genomes that OOMed at 32 GB). In both `host-reference-add/1.0.0` and
+  `local-host-reference-add/1.0.0` the step's `baseline_resources.mem_gb` rises
+  32 → 64, and `local-host-reference-add`'s `action_ceiling.mem_gb` rises 64 →
+  128 (matching `host-reference-add`) so an OOM-killed retry can double the step
+  64 → 128 GB. The job now hard-caps DuckDB at 30 GB regardless of allocation
+  and hands the growing remainder to rype's `max_memory` (starts ~30 GB, ≈92 GB
+  at the 128 GB ceiling). Both YAMLs are **edited in place** — re-synced into
+  `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (already in
+  bucket 5's `qiita.action` check), **not** a migration. No new env var, host
+  dir, scope, or SIF. Ensure the SLURM partition/QOS permits 128 GB single-step
+  jobs.
 
 ---
 
