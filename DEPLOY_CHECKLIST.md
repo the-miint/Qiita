@@ -31,6 +31,38 @@ _None yet._
 
 ### 5. Verify
 
+_None yet._
+
+### Notes (no host action)
+
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-23 — f56a470
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
+_None yet._
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
+
 - (#167) Confirm the raised `reference-add` / `host-reference-add` mem ceilings
   synced into `qiita.action` (so a `resource_override.mem_gb` up to 128 is
   accepted and the OOM-retry escalation can climb to 128 GB):
@@ -39,7 +71,7 @@ _None yet._
   # expect: host-reference-add|128  and  reference-add|128
   ```
 
-### Notes (no host action)
+#### Notes (no host action)
 
 - (#167) `reference-add/1.0.0` and `host-reference-add/1.0.0` raise their
   `action_ceiling.mem_gb` 64 → 128 (the `reference_load` step OOMs above 40 GB
@@ -47,12 +79,6 @@ _None yet._
   actions sync` inside `activate.sh`, **not** a migration. Pairs with the runner
   change that escalates a step's memory ×2 (clamped to this ceiling) on each
   OOM-killed retry. No new env var, host dir, scope, or SIF.
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-23 — 40674d7
 
