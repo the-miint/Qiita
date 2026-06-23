@@ -323,6 +323,25 @@ the `no-changelog` label).
 
 ### Changed
 
+- `build_rype_index` resized for large host sets (many human genomes that OOMed
+  at 32 GB). The step's `baseline_resources.mem_gb` rises 32 → 64 in both
+  `host-reference-add/1.0.0` and `local-host-reference-add/1.0.0`, and
+  `local-host-reference-add`'s `action_ceiling.mem_gb` rises 64 → 128 (matching
+  `host-reference-add`) so an OOM-killed retry can double the step 64 → 128 GB
+  (the escalator clamps to the ceiling). The job now hard-caps DuckDB at 30 GB
+  (was 16) regardless of allocation, so the larger cgroup — and the bigger one
+  an OOM retry escalates to — flows to rype: rype's `max_memory` starts at 30 GB
+  and grows with the allocation (≈92 GB at the 128 GB ceiling). Builds on the
+  OOM-retry escalation below (#169)
+- Workflow steps now escalate their memory allocation on an OOM-killed retry.
+  Previously every retry re-ran at the same `mem_gb`, so an OOM just OOM'd again
+  until the retry budget was exhausted. `_run_entry_with_retry` now grows the
+  step's memory floor ×2 (clamped to the action's `mem_gb` ceiling) on each
+  `OOM_KILLED` retry; other transient kinds still retry unchanged. The escalated
+  floor is process-local — a CP restart re-attaches and re-escalates from the
+  ticket's static `resource_override`. The `reference-add` and
+  `host-reference-add` action ceilings are raised 64 → 128 GB so the OOM-prone
+  `reference_load` step can climb 32 → 64 → 128 GB across retries (#167)
 - `qiita-user submit-host-filter-pool` now host-filters each pool sample against
   the reference(s) recorded on it at `submit-bcl-convert` time, instead of a
   single uniform reference for the whole pool. **Operator-facing CLI contract
@@ -616,6 +635,19 @@ the `no-changelog` label).
 
 ### Fixed
 
+- `POST /work-ticket/{idx}/run` (`qiita ticket run`) can now redrive a FAILED
+  multi-transition reference workflow instead of dead-ending at a `permanent`
+  `IllegalStatusTransition`. The redrive resets a `failed` reference to `pending`
+  (its only legal exit from `failed`) while keeping the COMPLETED step rows, but
+  the runner's fast-forward used to *skip* those completed steps' `target_status`
+  PATCHes — so the reference stayed at `pending` while the first re-run step tried
+  to advance from mid-FSM (e.g. `minting → loading`), which is illegal. The
+  fast-forward now RE-WALKS each completed step's status edge, advancing the
+  resource forward along the FSM only when it is behind; on a normal
+  startup-recovery resume (resource not rewound) the re-apply is a no-op or a
+  rejected backward edge, both benign. Fixes redrives of `local-host-reference-add`
+  / `host-reference-add` (which walk `pending → hashing → minting → loading →
+  indexing → active`) after a `load`-step failure (#165)
 - `mint-features` no longer starves the control-plane event loop on genome-scale
   reference loads. The in-process primitive read every `sequence_hash` from the
   manifest with a blocking, ORDER-BY (full-sort) DuckDB `fetchall()` and then

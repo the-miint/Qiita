@@ -25,8 +25,7 @@ _None yet._
 
 - (#170) `20260623000000_mask_definition.sql`
   — adds the `qiita.mask_definition` table + `qiita.mint_mask_definition`
-  function. Plain `make migrate`; additive, no extension or backfill. (Retag
-  with the PR number once assigned.)
+  function. Plain `make migrate`; additive, no extension or backfill.
 
 ### 4. Deploy
 
@@ -34,7 +33,14 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- (#169) Confirm the raised `local-host-reference-add` mem ceiling synced into
+  `qiita.action` (so its `build_rype_index` OOM-retry escalation can climb to
+  128 GB; `host-reference-add` was already 128):
+
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, mem_ceiling_gb FROM qiita.action WHERE action_id IN ('host-reference-add','local-host-reference-add') AND version='1.0.0' ORDER BY action_id"
+  # expect: host-reference-add|128  and  local-host-reference-add|128
+  ```
 
 ### Notes (no host action)
 
@@ -44,13 +50,89 @@ _None yet._
   production service account consumes these routes yet (the masked-read consumer
   path lands in a later PR), so no token needs re-minting now. When a worker is
   wired to pull masked reads, mint/rotate its token to include the scope.
-  (Retag with the PR number once assigned.)
+- (#169) `build_rype_index` resource bump for large host sets (many human
+  genomes that OOMed at 32 GB). In both `host-reference-add/1.0.0` and
+  `local-host-reference-add/1.0.0` the step's `baseline_resources.mem_gb` rises
+  32 → 64, and `local-host-reference-add`'s `action_ceiling.mem_gb` rises 64 →
+  128 (matching `host-reference-add`) so an OOM-killed retry can double the step
+  64 → 128 GB. The job now hard-caps DuckDB at 30 GB regardless of allocation
+  and hands the growing remainder to rype's `max_memory` (starts ~30 GB, ≈92 GB
+  at the 128 GB ceiling). Both YAMLs are **edited in place** — re-synced into
+  `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (already in
+  bucket 5's `qiita.action` check), **not** a migration. No new env var, host
+  dir, scope, or SIF. Ensure the SLURM partition/QOS permits 128 GB single-step
+  jobs.
 
 ---
 
 ## Deployed history
 
 Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-23 — f56a470
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
+_None yet._
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
+
+- (#167) Confirm the raised `reference-add` / `host-reference-add` mem ceilings
+  synced into `qiita.action` (so a `resource_override.mem_gb` up to 128 is
+  accepted and the OOM-retry escalation can climb to 128 GB):
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, mem_ceiling_gb FROM qiita.action WHERE action_id IN ('reference-add','host-reference-add') AND version='1.0.0' ORDER BY action_id"
+  # expect: host-reference-add|128  and  reference-add|128
+  ```
+
+#### Notes (no host action)
+
+- (#167) `reference-add/1.0.0` and `host-reference-add/1.0.0` raise their
+  `action_ceiling.mem_gb` 64 → 128 (the `reference_load` step OOMs above 40 GB
+  at GG2 scale). Edited in place — re-synced into `qiita.action` by `qiita-admin
+  actions sync` inside `activate.sh`, **not** a migration. Pairs with the runner
+  change that escalates a step's memory ×2 (clamped to this ceiling) on each
+  OOM-killed retry. No new env var, host dir, scope, or SIF.
+
+### Deployed 2026-06-23 — 40674d7
+
+Nothing was pending at archive time — the PRs deployed since the previous archive (#159, #160, #165) carried no operator-impacting steps. Recorded for provenance only.
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None._
+
+#### 2. One-time host setup
+
+_None._
+
+#### 3. Migrations
+
+_None._
+
+#### 4. Deploy
+
+_None._
+
+#### 5. Verify
+
+_None._
+
+#### Notes (no host action)
+
+_None._
 
 ### Deployed 2026-06-22 — f07359e
 
