@@ -58,7 +58,11 @@ from qiita_common.models import (
 
 from . import step_progress
 from .actions.library import LIBRARY
-from .actions.reference import ReferenceNotFound, transition_reference_status
+from .actions.reference import (
+    IllegalStatusTransition,
+    ReferenceNotFound,
+    transition_reference_status,
+)
 from .auth.tickets import sign_ticket
 
 _log = logging.getLogger(__name__)
@@ -367,9 +371,22 @@ async def run_workflow(
                 # Fast-forward an entry a prior run already finished: rebuild
                 # its outputs from disk without re-running it (an in-process
                 # action: is not idempotent; a SLURM step's result is
-                # re-verified from its manifest). Skip its status PATCH
-                # entirely — the resource is already at or past this status, so
-                # re-issuing it would be a redundant or backward transition.
+                # re-verified from its manifest).
+                #
+                # Its status advance must be RE-APPLIED here, not skipped: a
+                # `/run` redrive of a FAILED ticket resets a `failed` reference
+                # to `pending` (the FSM's only legal exit from `failed`) while
+                # KEEPING the completed step rows, rewinding the resource behind
+                # the transitions those steps already made. Without re-walking
+                # those edges the reference sits at `pending` while the first
+                # not-yet-completed step tries to advance from where it left off
+                # (e.g. `minting → loading`), which is illegal and dead-ends the
+                # redrive. `_advance_completed_step_status` only ever moves the
+                # resource FORWARD along a legal edge; on a normal
+                # startup-recovery resume (resource not rewound) it is a no-op or
+                # a rejected backward edge, both benign.
+                if entry.target_status:
+                    await _advance_completed_step_status(pool, scope_target, entry.target_status)
                 bound.update(
                     await _reconstruct_completed_outputs(
                         entry,
@@ -1513,6 +1530,44 @@ async def _patch_resource_status(
     raise NotImplementedError(
         f"status transition for scope_target.kind={scope_target['kind']!r} not yet wired"
     )
+
+
+async def _advance_completed_step_status(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    scope_target: dict[str, Any],
+    target_status: str,
+) -> None:
+    """Re-apply a fast-forwarded (already-completed) step's ``target_status``,
+    advancing the scope_target resource along its FSM only when it is currently
+    *behind* this step.
+
+    Needed because a ``/run`` redrive of a FAILED ticket resets a ``failed``
+    reference to ``pending`` (its only legal exit from ``failed``) while keeping
+    the completed step rows. The runner then fast-forwards those completed
+    steps; if it skipped their status advances, a multi-transition reference
+    would stay at ``pending`` and the first re-run step's transition (e.g.
+    ``minting → loading``) would raise IllegalStatusTransition and dead-end the
+    redrive. Re-walking each completed step's edge restores the resource to the
+    status the next live step expects.
+
+    Two benign no-advance cases, both on a normal startup-recovery resume where
+    the resource was never rewound:
+
+    * already AT this status — nothing to do (the ``==`` short-circuit);
+    * already PAST this status — the backward edge is illegal and
+      ``transition_reference_status`` raises IllegalStatusTransition, which we
+      swallow (the resource is correctly ahead).
+
+    ReferenceNotFound is deliberately NOT swallowed — a missing scope row under a
+    live ticket is a referential-integrity fault, not a benign skip.
+    """
+    if await _current_resource_status(pool, scope_target) == target_status:
+        return
+    try:
+        await _patch_resource_status(pool, scope_target, target_status)
+    except IllegalStatusTransition:
+        # Resource is already past this step (not rewound) — leave it ahead.
+        pass
 
 
 async def _current_resource_status(pool: asyncpg.Pool, scope_target: dict[str, Any]) -> str | None:
