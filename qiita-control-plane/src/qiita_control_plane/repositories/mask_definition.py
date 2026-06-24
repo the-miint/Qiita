@@ -30,8 +30,8 @@ async def mint_mask_definition(
     """Mint (or return the existing) mask_definition row for a config.
 
     Deduplicates on the canonical-JSON SHA-256 of `params` alone — the
-    dedup key is the config blob, matching the design's "same config →
-    same mask_idx." `filter_workflow` / `filter_version` are stored as
+    dedup key is the config blob, so the same config resolves to the same
+    `mask_idx` fleet-wide. `filter_workflow` / `filter_version` are stored as
     descriptive columns; they are expected to also appear inside `params`
     so the hash covers them, but the hash is over `params` so two callers
     that pass the same `params` collapse to one row regardless.

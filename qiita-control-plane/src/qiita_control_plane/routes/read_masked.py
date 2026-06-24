@@ -8,7 +8,7 @@ Two routers live here because they are the two halves of one feature:
 * ``POST /read-masked/ticket/doget`` signs an HMAC DoGet ticket scoped to a
   single ``(prep_sample_idx, mask_idx)`` on the data plane's ``read_masked``
   view — the only Flight-reachable read surface (raw ``read``/``read_mask`` are
-  out of Flight by construction; see the design doc).
+  out of Flight by construction, so unmasked/human reads are unreachable).
 
 Both are service-account-only, gated on ``Scope.READ_MASKED_DOGET``. Humans
 never mint masks or pull masked reads — the masked-read consumer path is
