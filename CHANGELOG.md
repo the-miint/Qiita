@@ -722,6 +722,19 @@ the `no-changelog` label).
 
 ### Fixed
 
+- The `qiita` / `qiita-admin` CLIs now emit an actionable error instead of a raw
+  import-time traceback when launched against a **stale `qiita_common`** (the
+  cross-package staleness trap: a plain `uv sync` skips reinstalling the
+  unchanged-version path-dep, leaving stale sources in the venv). The console-script
+  entry points now target a new import-clean shim (`qiita_control_plane.cli._bootstrap`)
+  that imports the real CLI `main` lazily; a `qiita_common` `ImportError` is
+  translated to a one-line message naming the exact fix
+  (`uv sync --reinstall-package qiita-common`) and echoing the original error,
+  while any unrelated `ImportError` is re-raised untouched (real bugs are never
+  masked). Complements the `make redeploy` checkout-venv refresh above — this
+  covers the case where the CLI is run without going through the redeploy script.
+  The real `cli.user:main` / `cli.admin:main` are unchanged and still used by the
+  shim, tests, and the redeploy import probe (#163)
 - `make redeploy` now refreshes the operator's **checkout** CLI venv
   (`$QIITA_CLONE/qiita-control-plane/.venv`, where `uv run qiita` / `qiita-admin`
   resolve), closing a two-tree gap: `activate.sh` `uv sync`s only the `/opt/qiita`
