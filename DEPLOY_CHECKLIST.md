@@ -30,13 +30,13 @@ _None yet._
   ```
 
   Run this before the migration; the drop migration is a single relocate with no
-  data-preservation step, so there must be no legacy sample data to strand. (#174)
+  data-preservation step, so there must be no legacy sample data to strand. (#175)
 
 ### 3. Migrations
 
 - `20260624000000_drop_sequenced_sample_host_references.sql` — drops the two
   host-reference columns (and their FKs + the minimap2-requires-rype CHECK) from
-  `qiita.sequenced_sample`. Plain `make migrate` (after the bucket-2 wipe). (#174)
+  `qiita.sequenced_sample`. Plain `make migrate` (after the bucket-2 wipe). (#175)
 
 ### 4. Deploy
 
@@ -65,7 +65,7 @@ _None yet._
   now also **requires** `--preflight-blob` (the same kl-run-preflight SQLite given
   to `submit-bcl-convert`): it cross-checks each sample's intake `human_filtering`
   intent against the host-ref choice and aborts on a mismatch unless `--force` is
-  passed. (#174)
+  passed. (#175)
 - The full-read+mask producer cutover (PR 3) ships `fastq-to-parquet/1.3.0`,
   which writes the full reads into the DuckLake `read` table and a downstream
   `read_mask` (PRs 1–2 already deployed the `mask_definition` table + the

@@ -374,7 +374,7 @@ the `no-changelog` label).
   to `submit-bcl-convert`) and guards against a pool-wide host-ref choice that
   disagrees with the samples' intake `human_filtering` intent: a mismatch aborts
   before any ticket is submitted unless `--force` downgrades it to a warning.
-  (#174)
+  (#175)
 - `build_rype_index` resized for large host sets (many human genomes that OOMed
   at 32 GB). The step's `baseline_resources.mem_gb` rises 32 → 64 in both
   `host-reference-add/1.0.0` and `local-host-reference-add/1.0.0`, and
@@ -1195,7 +1195,7 @@ the `no-changelog` label).
   references are now a human-filter submission argument, not a sample column
   (PR 4 of the full-read+mask feature). Single drop migration, no
   expand/contract: the deploy wipes all legacy sequenced/pool samples first
-  (their reads predate the lake-read model). (#174)
+  (their reads predate the lake-read model). (#175)
 - The legacy synchronous step path: `POST /step/run`, `ComputeBackend.run_step`
   (+ the SLURM/Local overrides and the CO `_poll_until_terminal` poll loop),
   `ComputeBackendClient.run_step`, and the `StepRunRequest` / `StepRunResponse`
