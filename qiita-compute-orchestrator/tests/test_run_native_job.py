@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 from pydantic import BaseModel
-from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import WorkTicketFailureStage
 
 from qiita_compute_orchestrator.jobs import run_native_job
@@ -207,6 +207,26 @@ async def test_value_error_in_execute_maps_to_bad_input(monkeypatch, tmp_path):
         await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
     assert ei.value.kind is FailureKind.BAD_INPUT
     assert "duplicate read_id" in ei.value.reason
+
+
+async def test_step_no_data_propagates_unchanged(monkeypatch, tmp_path):
+    """StepNoData is a TERMINAL no-data outcome, not a failure — the
+    dispatcher must re-raise it unchanged (NOT reclassify it into a
+    BackendFailure(BAD_INPUT)) so the backend can round-trip it to the
+    runner's NO_DATA transition. Its except arm sits above the generic
+    `except ValueError`, even though StepNoData is not a ValueError, to
+    keep the ordering intent explicit."""
+
+    async def execute(inputs, workspace):
+        raise StepNoData(step_name="fastq", reason="FASTQ file contains no records: x.fastq")
+
+    name = _install_stub(
+        monkeypatch, short_name="empty_well", inputs_cls=_Inputs, execute_fn=execute
+    )
+    with pytest.raises(StepNoData) as ei:
+        await run_native_job(name, {"x": 1}, tmp_path, step_name="fastq")
+    assert ei.value.step_name == "fastq"
+    assert "contains no records" in ei.value.reason
 
 
 async def test_step_name_carries_yaml_name_not_module_path(monkeypatch, tmp_path):

@@ -449,6 +449,12 @@ URL_SEQUENCED_SAMPLE_BY_IDX = f"{URL_SEQUENCED_SAMPLE_PREFIX}{PATH_SEQUENCED_SAM
 
 PATH_PREP_SAMPLE_PREFIX = "/prep-sample"
 PATH_PREP_SAMPLE_STUDY_LIST = "/{prep_sample_idx}/study/list"
+# Reversible operator disposition of a prep_sample: PATCH the `retired` flag so
+# an empty / failed-yield well drops out of (or returns to) a pool's active set
+# without a raw production UPDATE. Reversible by design (a misclassified well
+# must be recoverable), unlike the terminal principal retire.
+PATH_PREP_SAMPLE_RETIRED = "/{prep_sample_idx}/retired"
 
 URL_PREP_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_PREFIX}"
 URL_PREP_SAMPLE_STUDY_LIST = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}"
+URL_PREP_SAMPLE_RETIRED = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_RETIRED}"

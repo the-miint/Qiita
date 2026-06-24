@@ -48,6 +48,17 @@ BACKEND_FAILURE_HEADER = "X-Qiita-Backend-Failure"
 # {"detail": ...}).
 BACKEND_FAILURE_HTTP_STATUS = 422
 
+# Wire-format discriminator for StepNoData round-tripping through the
+# orchestrator's /step/* HTTP boundary, parallel to BACKEND_FAILURE_HEADER.
+# StepNoData is a TERMINAL-SUCCESS-ISH outcome, NOT a failure: a step
+# (fastq_to_parquet on an empty well) exits without minting identifiers or
+# writing output, and the runner transitions the ticket to NO_DATA rather than
+# FAILED. It rides its own header so the client reconstructs the distinct typed
+# signal and never confuses it with a BackendFailure. Reuses the same 422 status
+# as BackendFailure — the header is the only disambiguator.
+STEP_NO_DATA_HEADER = "X-Qiita-Step-No-Data"
+STEP_NO_DATA_HTTP_STATUS = 422
+
 
 class FailureKind(StrEnum):
     """Backend-emitted failure category. Finer-grained than the DB
@@ -190,3 +201,61 @@ class BackendFailureBody(BaseModel):
             reason=self.reason,
             step_name=self.step_name,
         )
+
+
+# Same plain-@dataclass rationale as BackendFailure above: neither `frozen`
+# nor `slots`, so Exception's traceback machinery keeps working.
+@dataclass
+class StepNoData(Exception):
+    """Terminal no-data signal raised by a native job whose input legitimately
+    carried no data — an empty FASTQ well (a blank, a no-template control, or a
+    failed-yield well).
+
+    This is NOT a failure. The step exits without minting identifiers or writing
+    output, and the runner transitions the work_ticket to NO_DATA (a terminal
+    state with NULL failure_* columns), distinct from the BackendFailure →
+    FAILED path. It is deliberately a separate type from BackendFailure — it is
+    not a FailureKind and must never ride the failure_* columns or be retried.
+
+    `step_name` is the YAML entry's `.name`, recorded for operator-side context
+    (which step produced no data). `reason` is the human-readable explanation
+    (e.g. "FASTQ file contains no records: ...").
+
+        raise StepNoData(
+            step_name="fastq",
+            reason="FASTQ file contains no records: .../<well>_R1.fastq.gz",
+        )
+    """
+
+    reason: str
+    step_name: str | None = None
+
+    def __post_init__(self) -> None:
+        # Exception() takes positional args; pass a useful str() for tracebacks.
+        Exception.__init__(self, str(self))
+
+    def __str__(self) -> str:
+        if self.step_name is not None:
+            return f"[no_data] {self.step_name}: {self.reason}"
+        return f"[no_data] {self.reason}"
+
+
+class StepNoDataBody(BaseModel):
+    """Wire format for StepNoData crossing the orchestrator's HTTP boundary,
+    parallel to BackendFailureBody.
+
+    The orchestrator emits this in `/step/*`'s response body (with
+    `STEP_NO_DATA_HEADER` set) when a backend raises StepNoData;
+    ComputeBackendClient reconstructs and re-raises so the runner's NO_DATA
+    transition fires identically for an in-process LocalBackend and a SLURM job.
+    """
+
+    reason: str
+    step_name: str | None = None
+
+    @classmethod
+    def from_exception(cls, exc: StepNoData) -> StepNoDataBody:
+        return cls(reason=exc.reason, step_name=exc.step_name)
+
+    def to_exception(self) -> StepNoData:
+        return StepNoData(reason=self.reason, step_name=self.step_name)

@@ -37,7 +37,7 @@ from qiita_common.actions import (
     WorkflowStep,
 )
 from qiita_common.api_paths import LibraryPrimitive, compute_upload_staging_path
-from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.compute_backend_client import ComputeBackendClient
 from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
@@ -111,7 +111,11 @@ _INFRA_RETRY_BACKOFF_CAP_SECONDS = 60.0
 # WorkflowAborted instead of retrying forever against a ticket that is no
 # longer theirs.
 _TERMINAL_WORK_TICKET_STATES = frozenset(
-    {WorkTicketState.COMPLETED.value, WorkTicketState.FAILED.value}
+    {
+        WorkTicketState.COMPLETED.value,
+        WorkTicketState.NO_DATA.value,
+        WorkTicketState.FAILED.value,
+    }
 )
 
 
@@ -519,6 +523,17 @@ async def run_workflow(
         # misread). Safe: transient_* is orthogonal to state/failure_*, and the
         # write is guarded to a no-op when nothing is set.
         await _clear_transient_retry(pool, work_ticket_idx)
+        return
+    except StepNoData as exc:
+        # Terminal no-data outcome (an empty FASTQ well) — NOT a failure. The
+        # step minted no identifiers and wrote no output; transition the ticket
+        # PROCESSING → NO_DATA with NULL failure_* columns. Deliberately does
+        # NOT PATCH action.failure_status (this isn't a failure) and does NOT
+        # advance action.success_status (the resource didn't reach the success
+        # state — no data was produced). Clear any in-place-retry marker so the
+        # now-terminal ticket shows no stale "stuck retrying" reason.
+        _log.info("workflow %d ended with no data: %s", work_ticket_idx, exc)
+        await _transition_to_no_data(pool, work_ticket_idx)
         return
     except BackendFailure as exc:
         # Retry-loop already exhausted retries (transient) or this was a
@@ -950,6 +965,48 @@ async def _transition_to_failed(
         )
         raise RuntimeError(
             f"could not mark work_ticket {work_ticket_idx} FAILED: "
+            f"expected non-terminal, got {actual!r}"
+        )
+
+
+async def _transition_to_no_data(pool: asyncpg.Pool, work_ticket_idx: int) -> None:
+    """Atomic transition into NO_DATA — the terminal outcome for a step that
+    legitimately produced no data (an empty FASTQ well).
+
+    Distinct from `_transition_to_failed`: NO_DATA is not a failure, so all four
+    failure_* columns are explicitly written NULL (honouring the DB's
+    `work_ticket_failure_consistent` all-or-nothing CHECK from the
+    none-populated side) and the transient-retry marker is cleared. Accepts a
+    transition from any non-terminal state (PROCESSING most commonly, or QUEUED
+    if a retry's requeue raced shutdown); refuses an already-terminal ticket so
+    a buggy second call can't overwrite a COMPLETED/FAILED state."""
+    updated = await pool.fetchval(
+        "UPDATE qiita.work_ticket"
+        " SET state = $1::qiita.work_ticket_state,"
+        "     failure_type = NULL,"
+        "     failure_stage = NULL,"
+        "     failure_step_name = NULL,"
+        "     failure_reason = NULL,"
+        "     transient_reason = NULL,"
+        "     transient_since = NULL"
+        " WHERE work_ticket_idx = $2"
+        "   AND state = ANY($3::qiita.work_ticket_state[])"
+        " RETURNING work_ticket_idx",
+        WorkTicketState.NO_DATA.value,
+        work_ticket_idx,
+        [
+            WorkTicketState.PENDING.value,
+            WorkTicketState.QUEUED.value,
+            WorkTicketState.PROCESSING.value,
+        ],
+    )
+    if updated is None:
+        actual = await pool.fetchval(
+            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+        raise RuntimeError(
+            f"could not mark work_ticket {work_ticket_idx} NO_DATA: "
             f"expected non-terminal, got {actual!r}"
         )
 

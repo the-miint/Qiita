@@ -674,8 +674,9 @@ def test_pool_read_metrics_fraction_recomputed_from_sums():
 
 def test_pool_completion_status_complete_flag():
     """PoolCompletionStatus.complete is True only when the pool has samples and
-    every one is COMPLETED; a partial pool and a zero-sample pool both read
-    False (the latter is not vacuously complete)."""
+    every one is in a terminal-accounted state (COMPLETED or NO_DATA); a partial
+    pool and a zero-sample pool both read False (the latter is not vacuously
+    complete)."""
     from qiita_common.models import PoolCompletionStatus
 
     done = PoolCompletionStatus(
@@ -684,10 +685,38 @@ def test_pool_completion_status_complete_flag():
         sample_count=3,
         samples_completed=3,
         samples_in_flight=0,
+        samples_no_data=0,
         samples_failed=0,
         samples_not_submitted=0,
     )
     assert done.complete is True
+
+    # A plate of real data with empty wells: completed + no_data == sample_count
+    # still reaches complete (the whole point of the no_data outcome).
+    done_with_empty_wells = PoolCompletionStatus(
+        sequenced_pool_idx=1,
+        sequencing_run_idx=1,
+        sample_count=3,
+        samples_completed=2,
+        samples_in_flight=0,
+        samples_no_data=1,
+        samples_failed=0,
+        samples_not_submitted=0,
+    )
+    assert done_with_empty_wells.complete is True
+
+    # A pool with a genuine failure is NOT complete (failed is not accounted).
+    with_failure = PoolCompletionStatus(
+        sequenced_pool_idx=1,
+        sequencing_run_idx=1,
+        sample_count=3,
+        samples_completed=2,
+        samples_in_flight=0,
+        samples_no_data=0,
+        samples_failed=1,
+        samples_not_submitted=0,
+    )
+    assert with_failure.complete is False
 
     partial = PoolCompletionStatus(
         sequenced_pool_idx=1,
@@ -695,6 +724,7 @@ def test_pool_completion_status_complete_flag():
         sample_count=3,
         samples_completed=2,
         samples_in_flight=1,
+        samples_no_data=0,
         samples_failed=0,
         samples_not_submitted=0,
     )
@@ -706,6 +736,7 @@ def test_pool_completion_status_complete_flag():
         sample_count=0,
         samples_completed=0,
         samples_in_flight=0,
+        samples_no_data=0,
         samples_failed=0,
         samples_not_submitted=0,
     )

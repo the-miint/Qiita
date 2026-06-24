@@ -44,6 +44,7 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     PATH_BIOSAMPLE_PREFIX,
     PATH_PREP_SAMPLE_PREFIX,
+    PATH_PREP_SAMPLE_RETIRED,
     PATH_PREP_SAMPLE_STUDY_LIST,
     PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_INDEX,
@@ -706,6 +707,31 @@ def _build_parser() -> argparse.ArgumentParser:
         handler=_handle_read,
         read_path=f"{PATH_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}",
         read_idx_arg="prep_sample_idx",
+    )
+
+    p_prepsample_retire = p_prepsample_sub.add_parser(
+        "retire",
+        help=(
+            "Retire a prep-sample so it drops out of a pool's active set —"
+            " e.g. an empty/failed-yield well (PATCH /prep-sample/{idx}/retired)"
+        ),
+    )
+    p_prepsample_retire.add_argument("--prep-sample-idx", type=int, required=True)
+    p_prepsample_retire.add_argument(
+        "--reason", help="Optional retire_reason recorded on the prep_sample"
+    )
+    p_prepsample_retire.set_defaults(handler=_handle_prep_sample_retire, retired=True)
+
+    p_prepsample_unretire = p_prepsample_sub.add_parser(
+        "un-retire",
+        help=(
+            "Un-retire a misclassified prep-sample, returning it to a pool's"
+            " active set (PATCH /prep-sample/{idx}/retired)"
+        ),
+    )
+    p_prepsample_unretire.add_argument("--prep-sample-idx", type=int, required=True)
+    p_prepsample_unretire.set_defaults(
+        handler=_handle_prep_sample_retire, retired=False, reason=None
     )
 
     p_ticket = sub.add_parser("ticket", help="Work-ticket operations")
@@ -1428,6 +1454,27 @@ def _handle_ticket_run(args: argparse.Namespace, parser: argparse.ArgumentParser
     return _common.run_http_subcommand(
         lambda t: _run_work_ticket(args.base_url, t, args.work_ticket_idx)
     )
+
+
+def _handle_prep_sample_retire(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Retire or un-retire a prep-sample (PATCH /prep-sample/{idx}/retired). The
+    `retire` subcommand sets retired=true (dropping an empty/failed-yield well
+    out of a pool's active set); `un-retire` sets retired=false (recovering a
+    misclassified one). The route returns 204, so on success we print a short
+    confirmation rather than a JSON body."""
+
+    def _do(token: str) -> dict:
+        path = PATH_PREP_SAMPLE_PREFIX + PATH_PREP_SAMPLE_RETIRED.format(
+            prep_sample_idx=args.prep_sample_idx
+        )
+        body = {"retired": args.retired, "reason": args.reason}
+        _common._request("PATCH", args.base_url, token, path, json=body)
+        return {
+            "prep_sample_idx": args.prep_sample_idx,
+            "retired": args.retired,
+        }
+
+    return _common.run_http_subcommand(_do)
 
 
 def _handle_ticket_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

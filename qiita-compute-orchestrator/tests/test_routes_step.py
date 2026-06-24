@@ -300,6 +300,73 @@ def test_step_result_serializes_backend_failure(http_client, cp_to_co_token):
     assert resp.json()["kind"] == "contract_violation"
 
 
+def test_step_submit_serializes_step_no_data(http_client, cp_to_co_token, tmp_path):
+    """A StepNoData from submit_step (LocalBackend's empty-well path) serializes
+    through the route with the no-data header — distinct from the failure header
+    — so the runner reconstructs the terminal no-data signal, not a failure."""
+    from qiita_common.api_paths import URL_STEP_SUBMIT
+    from qiita_common.backend_failure import (
+        BACKEND_FAILURE_HEADER,
+        STEP_NO_DATA_HEADER,
+        STEP_NO_DATA_HTTP_STATUS,
+        StepNoData,
+    )
+
+    client, backend = http_client
+
+    async def empty(*args, **kwargs):
+        raise StepNoData(step_name="fastq", reason="FASTQ file contains no records: x.fastq")
+
+    backend.submit_step = empty  # type: ignore[method-assign]
+    resp = client.post(
+        URL_STEP_SUBMIT,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "fastq",
+            "inputs": {},
+            "workspace": str(tmp_path),
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": 1},
+            "work_ticket_idx": 1,
+            "module": "qiita_compute_orchestrator.jobs.fastq_to_parquet",
+        },
+    )
+    assert resp.status_code == STEP_NO_DATA_HTTP_STATUS
+    assert resp.headers[STEP_NO_DATA_HEADER] == "1"
+    # The failure header is NOT set — this is not a failure.
+    assert BACKEND_FAILURE_HEADER not in resp.headers
+    assert resp.json()["step_name"] == "fastq"
+    assert "contains no records" in resp.json()["reason"]
+
+
+def test_step_result_serializes_step_no_data(http_client, cp_to_co_token):
+    """A StepNoData from result_step (SLURM's deferred empty-well path)
+    serializes through the route with the no-data header."""
+    from qiita_common.api_paths import URL_STEP_RESULT
+    from qiita_common.backend_failure import (
+        STEP_NO_DATA_HEADER,
+        STEP_NO_DATA_HTTP_STATUS,
+        StepNoData,
+    )
+
+    client, backend = http_client
+
+    async def empty(*args, **kwargs):
+        raise StepNoData(step_name="fastq", reason="FASTQ file contains no records: x.fastq")
+
+    backend.result_step = empty  # type: ignore[method-assign]
+    resp = client.post(
+        URL_STEP_RESULT,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "handle": {"compute_target": "slurm", "step_name": "fastq", "slurm_job_id": 1},
+            "status": {"status": "failed", "raw_state": "FAILED", "exit_code": 1},
+        },
+    )
+    assert resp.status_code == STEP_NO_DATA_HTTP_STATUS
+    assert resp.headers[STEP_NO_DATA_HEADER] == "1"
+    assert resp.json()["step_name"] == "fastq"
+
+
 def test_step_submit_rejects_wrong_prefix_module(http_client, cp_to_co_token, tmp_path):
     """The module-prefix defense applies to /step/submit too."""
     from qiita_common.api_paths import URL_STEP_SUBMIT

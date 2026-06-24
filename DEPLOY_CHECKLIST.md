@@ -37,6 +37,11 @@ _None yet._
 - `20260624000000_drop_sequenced_sample_host_references.sql` — drops the two
   host-reference columns (and their FKs + the minimap2-requires-rype CHECK) from
   `qiita.sequenced_sample`. Plain `make migrate` (after the bucket-2 wipe). (#175)
+- `20260624100000_work_ticket_state_no_data.sql` — additive
+  `ALTER TYPE qiita.work_ticket_state ADD VALUE 'no_data'` (the new terminal
+  empty-well outcome). `transaction:false` directive (Postgres forbids using a
+  freshly-added enum value in the same transaction); plain `make migrate`, no
+  out-of-band setup or backfill. (#176)
 
 ### 4. Deploy
 
@@ -72,6 +77,18 @@ _None yet._
   data-plane `read`/`read_mask`/`read_masked` surfaces). 1.0.0–1.2.0 stay
   available; nothing forces a re-run of in-flight tickets. No new env var or
   host directory. (#173)
+- Soft API change: empty FASTQ wells are now a terminal `no_data` outcome
+  (distinct from failure). The `GET .../sequenced-pool/{P}/completion` response
+  gains a `samples_no_data` count and its `complete` flag now fires when every
+  active sample is COMPLETED **or** NO_DATA (so a plate with empty wells reaches
+  "done"); empty wells are no longer in `samples_failed`. A work_ticket can now be
+  terminal in state `no_data` (409 on `/run` like `completed`, but freely
+  resubmittable — no result is minted, so no DELETE is required). New reversible
+  `PATCH /api/v1/prep-sample/{idx}/retired`
+  (prep_sample:write + wet_lab_admin) and `qiita prep-sample retire` /
+  `un-retire`. Until expected-empty control-well preflight marking lands
+  (deferred), EVERY empty well becomes `no_data` — data wells included, not only
+  flagged controls. No new env var, host dir, scope, or workflow. (#176)
 
 ---
 

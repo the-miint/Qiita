@@ -1357,6 +1357,21 @@ class PrincipalRetiredUpdate(BaseModel):
     reason: str = Field(min_length=1)
 
 
+class PrepSampleRetiredUpdate(BaseModel):
+    """Body for PATCH /api/v1/prep-sample/{idx}/retired.
+
+    Reversible operator disposition (unlike the terminal principal retire): set
+    `retired=true` to drop an empty / failed-yield well out of a pool's active
+    set, or `retired=false` to un-retire a misclassified one. `reason` is the
+    optional retire_reason (only meaningful when retiring; the DB CHECK requires
+    retired_by_idx/retired_at when retired=true and forbids them otherwise, both
+    populated/cleared by the route).
+    """
+
+    retired: bool
+    reason: str | None = None
+
+
 class PrincipalSystemRoleUpdate(BaseModel):
     """Body for PATCH /api/v1/admin/principal/{idx}/system-role.
 
@@ -1460,14 +1475,26 @@ class WorkTicketState(StrEnum):
 
     Submission gates: PENDING / QUEUED / PROCESSING block resubmission of
     the same `(scope_target, action_id, action_version)` triple entirely.
-    COMPLETED requires explicit DELETE before resubmission. FAILED is the
-    permanent-failure terminal state; recovery is operator-driven.
+    COMPLETED / NO_DATA / FAILED are the three terminal states, with
+    different resubmission semantics: COMPLETED is DELETE-gated (a result
+    exists, so the prior result must be deleted before a fresh submit);
+    FAILED is restarted in place via /run (operator-driven recovery);
+    NO_DATA mints no result, so it is freely resubmittable (only an
+    in-place /run redrive is refused).
+
+    NO_DATA is the terminal outcome for a step that legitimately produced
+    no data — an empty FASTQ well (a blank, a no-template control, or a
+    failed-yield well). It is distinct from FAILED: a no_data ticket
+    carries NULL failure_* columns and is tallied in its own pool-
+    completion bucket so a plate full of empty wells can still reach a
+    "done" signal rather than being stuck behind permanent failures.
     """
 
     PENDING = "pending"
     QUEUED = "queued"
     PROCESSING = "processing"
     COMPLETED = "completed"
+    NO_DATA = "no_data"
     FAILED = "failed"
 
 
@@ -2119,7 +2146,7 @@ class PoolCompletionStatus(BaseModel):
 
     The pool's prep-generation completion rollup: each non-retired
     sequenced_sample is classified by the state of its fastq-to-parquet work
-    tickets (any version), and the per-sample states are tallied into the four
+    tickets (any version), and the per-sample states are tallied into the five
     mutually-exclusive buckets below. This is the SPP GenPrepFileJob end-state
     equivalent — it answers "has the pool's per-sample fastq→parquet fan-out
     finished?" — surfaced alongside the read-metric and QC rollups.
@@ -2129,28 +2156,40 @@ class PoolCompletionStatus(BaseModel):
       completed     — has at least one COMPLETED fastq-to-parquet ticket.
       in_flight     — no COMPLETED ticket but at least one PENDING/QUEUED/
                       PROCESSING (e.g. a re-submitted retry); work is ongoing.
-      failed        — no COMPLETED and nothing in flight, but at least one FAILED.
+      no_data       — no COMPLETED and nothing in flight, but at least one
+                      NO_DATA (an empty/blank well — a terminal outcome that is
+                      NOT a failure). Outranks failed so a sample carrying both a
+                      no_data and a stale failed ticket counts as no_data.
+      failed        — no COMPLETED, nothing in flight, no NO_DATA, but at least
+                      one FAILED.
       not_submitted — no fastq-to-parquet ticket at all.
 
-    `complete` is the pool-level done flag: every sample COMPLETED and the pool
-    is non-empty (so a zero-sample pool reads `complete=False`, not vacuously
-    true). Everything is compute-on-read over the work_ticket table, so it never
-    drifts when a sample is re-processed, re-submitted, or deleted."""
+    `complete` is the pool-level done flag: the pool is non-empty and every
+    sample is in a terminal-accounted state — COMPLETED or NO_DATA (so a plate
+    of real data with empty wells still reaches `complete=True`, and a
+    zero-sample pool reads `complete=False`, not vacuously true). Everything is
+    compute-on-read over the work_ticket table, so it never drifts when a sample
+    is re-processed, re-submitted, or deleted."""
 
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     sequencing_run_idx: Annotated[int, Field(gt=0)]
     sample_count: Annotated[int, Field(ge=0)]
     samples_completed: Annotated[int, Field(ge=0)]
     samples_in_flight: Annotated[int, Field(ge=0)]
+    samples_no_data: Annotated[int, Field(ge=0)]
     samples_failed: Annotated[int, Field(ge=0)]
     samples_not_submitted: Annotated[int, Field(ge=0)]
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def complete(self) -> bool:
-        """True when the pool has samples and every one has a COMPLETED
-        fastq-to-parquet ticket."""
-        return self.sample_count > 0 and self.samples_completed == self.sample_count
+        """True when the pool has samples and every one is in a terminal-
+        accounted state: a COMPLETED fastq-to-parquet ticket or a NO_DATA
+        (empty-well) outcome."""
+        return (
+            self.sample_count > 0
+            and (self.samples_completed + self.samples_no_data) == self.sample_count
+        )
 
 
 class SequencedPoolPreflightResponse(BaseModel):

@@ -439,15 +439,19 @@ async def fetch_sequenced_pool_completion(
     counts — the caller still 404s a missing pool via require_sequenced_pool_in_run.
 
     Per-sample classification mirrors qiita_common.models.PoolCompletionStatus
-    (precedence completed > in_flight > failed > not_submitted), computed in two
-    layers:
+    (precedence completed > in_flight > no_data > failed > not_submitted),
+    computed in two layers:
 
       `sample_state` LEFT-JOINs each non-retired sample to its fastq-to-parquet
       tickets and folds them with bool_or aggregates (NULL over a sample with no
       ticket, so `ticket_count = 0` cleanly identifies not_submitted). The outer
       aggregate then tallies the mutually-exclusive buckets with FILTERs that
-      encode the precedence, so every sample lands in exactly one — and the four
+      encode the precedence, so every sample lands in exactly one — and the five
       buckets sum to `sample_count`.
+
+    no_data outranks failed: a sample with both a NO_DATA and a stale FAILED
+    ticket counts as no_data, so an empty well that was retried-then-superseded
+    doesn't get stuck in the failed bucket (and `complete` can still fire).
 
     The action_id is matched on its bare id (passed as a bound param from the
     shared FASTQ_TO_PARQUET_ACTION_ID, the same constant the submitter mints
@@ -456,14 +460,16 @@ async def fetch_sequenced_pool_completion(
     version produced it (consistent with the read-metric / QC rollups, which read
     persisted columns irrespective of the writing version). The inlined state
     literals are pinned to qiita_common.models.WorkTicketState ('completed' /
-    'pending' / 'queued' / 'processing' / 'failed' — its full closed set); keep
-    them in lockstep if that enum changes. Retired samples are excluded
-    (`ps.retired IS NOT TRUE`) to match the other pool rollups' sample set."""
+    'pending' / 'queued' / 'processing' / 'no_data' / 'failed' — its full closed
+    set); keep them in lockstep if that enum changes. Retired samples are
+    excluded (`ps.retired IS NOT TRUE`) to match the other pool rollups' sample
+    set."""
     return await pool_or_conn.fetchrow(
         "WITH sample_state AS ("
         "  SELECT ss.prep_sample_idx,"
         "    bool_or(wt.state = 'completed') AS has_completed,"
         "    bool_or(wt.state IN ('pending', 'queued', 'processing')) AS has_inflight,"
+        "    bool_or(wt.state = 'no_data') AS has_no_data,"
         "    bool_or(wt.state = 'failed') AS has_failed,"
         "    count(wt.work_ticket_idx) AS ticket_count"
         "  FROM qiita.sequenced_sample ss"
@@ -479,7 +485,10 @@ async def fetch_sequenced_pool_completion(
         "   count(*) FILTER (WHERE has_completed) AS samples_completed,"
         "   count(*) FILTER (WHERE NOT has_completed AND has_inflight)"
         "     AS samples_in_flight,"
-        "   count(*) FILTER (WHERE NOT has_completed AND NOT has_inflight AND has_failed)"
+        "   count(*) FILTER (WHERE NOT has_completed AND NOT has_inflight AND has_no_data)"
+        "     AS samples_no_data,"
+        "   count(*) FILTER ("
+        "     WHERE NOT has_completed AND NOT has_inflight AND NOT has_no_data AND has_failed)"
         "     AS samples_failed,"
         "   count(*) FILTER (WHERE ticket_count = 0) AS samples_not_submitted"
         " FROM sample_state",

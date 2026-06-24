@@ -410,9 +410,11 @@ async def get_sequenced_pool_completion(
 ) -> PoolCompletionStatus:
     """Read the pool's prep-generation completion rollup: each non-retired
     sequenced_sample classified by the state of its fastq-to-parquet work tickets
-    (any version) and tallied into completed / in-flight / failed / not-submitted
-    buckets, with a pool-level `complete` flag (every sample COMPLETED, pool
-    non-empty). This is the SPP GenPrepFileJob end-state equivalent — it answers
+    (any version) and tallied into completed / in-flight / no-data / failed /
+    not-submitted buckets, with a pool-level `complete` flag (every sample in a
+    terminal-accounted state — COMPLETED or NO_DATA — and the pool non-empty, so
+    a plate of real data with empty wells still reaches `complete=True`). This is
+    the SPP GenPrepFileJob end-state equivalent — it answers
     "has the per-sample fastq→parquet fan-out finished?" — surfaced alongside the
     read-metric and QC rollups.
 
@@ -429,6 +431,7 @@ async def get_sequenced_pool_completion(
         sample_count=row["sample_count"],
         samples_completed=row["samples_completed"],
         samples_in_flight=row["samples_in_flight"],
+        samples_no_data=row["samples_no_data"],
         samples_failed=row["samples_failed"],
         samples_not_submitted=row["samples_not_submitted"],
     )

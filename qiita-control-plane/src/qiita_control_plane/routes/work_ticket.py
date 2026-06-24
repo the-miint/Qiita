@@ -24,6 +24,7 @@ access to).
 | QUEUED        | 409 — already dispatching                         |
 | PROCESSING    | 409 — already running                             |
 | COMPLETED     | 409 — terminal                                    |
+| NO_DATA       | 409 — terminal (empty-well outcome)               |
 | FAILED        | Reset → PENDING and dispatch (manual restart)     |
 
 The atomic state transition guard inside `runner._atomic_transition`
@@ -1119,6 +1120,7 @@ async def run_work_ticket(
         WorkTicketState.QUEUED.value,
         WorkTicketState.PROCESSING.value,
         WorkTicketState.COMPLETED.value,
+        WorkTicketState.NO_DATA.value,
     ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

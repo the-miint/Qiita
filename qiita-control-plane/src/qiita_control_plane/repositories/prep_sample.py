@@ -79,6 +79,54 @@ async def fetch_prep_sample_exists(
     )
 
 
+async def set_prep_sample_retired(
+    conn: asyncpg.Connection,
+    *,
+    prep_sample_idx: int,
+    retired: bool,
+    retired_by_idx: int,
+    reason: str | None,
+) -> bool:
+    """Set (or clear) the `retired` flag on a prep_sample. Returns True iff a
+    row at this idx exists (and was updated to the requested state); False when
+    no such prep_sample exists, so the route can 404.
+
+    Reversible operator disposition (the column already exists; the completion
+    rollup already excludes retired rows). Both directions are written so the
+    `prep_sample_retirement_consistent` CHECK is honoured:
+
+      * retire (retired=true): retired_at=now(), retired_by_idx=actor,
+        retire_reason=reason (nullable).
+      * un-retire (retired=false): retired_at / retired_by_idx / retire_reason
+        all cleared to NULL.
+
+    Idempotent: re-issuing the same target state is a no-op UPDATE that still
+    returns True (the row exists). Takes a Connection (caller owns the
+    transaction), matching the module's write-function contract.
+    """
+    if retired:
+        updated = await conn.fetchval(
+            "UPDATE qiita.prep_sample SET"
+            "  retired = true, retired_at = now(),"
+            "  retired_by_idx = $2, retire_reason = $3"
+            " WHERE idx = $1"
+            " RETURNING idx",
+            prep_sample_idx,
+            retired_by_idx,
+            reason,
+        )
+    else:
+        updated = await conn.fetchval(
+            "UPDATE qiita.prep_sample SET"
+            "  retired = false, retired_at = NULL,"
+            "  retired_by_idx = NULL, retire_reason = NULL"
+            " WHERE idx = $1"
+            " RETURNING idx",
+            prep_sample_idx,
+        )
+    return updated is not None
+
+
 async def insert_prep_sample(
     conn: asyncpg.Connection,
     *,

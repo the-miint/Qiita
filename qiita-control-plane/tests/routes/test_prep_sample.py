@@ -10,7 +10,7 @@ scope, and the anonymous 401).
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from qiita_common.api_paths import URL_PREP_SAMPLE_STUDY_LIST
+from qiita_common.api_paths import URL_PREP_SAMPLE_RETIRED, URL_PREP_SAMPLE_STUDY_LIST
 
 from qiita_control_plane.main import app
 from qiita_control_plane.testing.db_seeds import (
@@ -245,3 +245,127 @@ async def test_list_studies_for_prep_sample_missing_scope_403(ctx, no_prep_sampl
     )
     assert resp.status_code == 403
     assert "prep_sample:read" in resp.json()["detail"]
+
+
+# ===========================================================================
+# PATCH /api/v1/prep-sample/{idx}/retired
+# ===========================================================================
+
+
+async def _retired_flag(ctx, prep_sample_idx: int) -> bool:
+    return await ctx["pool"].fetchval(
+        "SELECT retired FROM qiita.prep_sample WHERE idx = $1", prep_sample_idx
+    )
+
+
+async def test_retire_prep_sample_sets_flag(ctx):
+    """A wet_lab_admin retire sets retired=true plus the audit columns
+    (retired_by_idx, retired_at), honouring the consistency CHECK."""
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    prep_sample_idx = await _seed_prep_sample_linked_to_studies(
+        ctx, owner_idx=owner_idx, study_idxs=[]
+    )
+
+    resp = await ctx["wet"].patch(
+        URL_PREP_SAMPLE_RETIRED.format(prep_sample_idx=prep_sample_idx),
+        json={"retired": True, "reason": "empty well"},
+    )
+    assert resp.status_code == 204, resp.text
+
+    row = await ctx["pool"].fetchrow(
+        "SELECT retired, retired_by_idx, retired_at, retire_reason"
+        " FROM qiita.prep_sample WHERE idx = $1",
+        prep_sample_idx,
+    )
+    assert row["retired"] is True
+    assert row["retired_by_idx"] == owner_idx
+    assert row["retired_at"] is not None
+    assert row["retire_reason"] == "empty well"
+
+
+async def test_retire_prep_sample_is_idempotent(ctx):
+    """Re-retiring an already-retired prep_sample is a no-op success (204)."""
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    prep_sample_idx = await _seed_prep_sample_linked_to_studies(
+        ctx, owner_idx=owner_idx, study_idxs=[]
+    )
+    url = URL_PREP_SAMPLE_RETIRED.format(prep_sample_idx=prep_sample_idx)
+
+    assert (await ctx["wet"].patch(url, json={"retired": True})).status_code == 204
+    assert (await ctx["wet"].patch(url, json={"retired": True})).status_code == 204
+    assert await _retired_flag(ctx, prep_sample_idx) is True
+
+
+async def test_un_retire_prep_sample_clears_flag(ctx):
+    """Un-retiring (retired=false) clears the flag and the audit columns —
+    a misclassified well is recoverable, so retirement is reversible."""
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    prep_sample_idx = await _seed_prep_sample_linked_to_studies(
+        ctx, owner_idx=owner_idx, study_idxs=[]
+    )
+    url = URL_PREP_SAMPLE_RETIRED.format(prep_sample_idx=prep_sample_idx)
+
+    assert (await ctx["wet"].patch(url, json={"retired": True, "reason": "x"})).status_code == 204
+    assert (await ctx["wet"].patch(url, json={"retired": False})).status_code == 204
+
+    row = await ctx["pool"].fetchrow(
+        "SELECT retired, retired_by_idx, retired_at, retire_reason"
+        " FROM qiita.prep_sample WHERE idx = $1",
+        prep_sample_idx,
+    )
+    assert row["retired"] is False
+    assert row["retired_by_idx"] is None
+    assert row["retired_at"] is None
+    assert row["retire_reason"] is None
+
+
+async def test_retire_prep_sample_unknown_idx_404(ctx):
+    resp = await ctx["wet"].patch(
+        URL_PREP_SAMPLE_RETIRED.format(prep_sample_idx=2_000_000_000),
+        json={"retired": True},
+    )
+    assert resp.status_code == 404, resp.text
+
+
+async def test_retire_prep_sample_regular_user_403(ctx):
+    """A regular user (below wet_lab_admin) cannot retire — the role gate 403s."""
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    prep_sample_idx = await _seed_prep_sample_linked_to_studies(
+        ctx, owner_idx=owner_idx, study_idxs=[]
+    )
+    resp = await ctx["user"].patch(
+        URL_PREP_SAMPLE_RETIRED.format(prep_sample_idx=prep_sample_idx),
+        json={"retired": True},
+    )
+    assert resp.status_code == 403, resp.text
+    # Not retired — the gate fired before the write.
+    assert await _retired_flag(ctx, prep_sample_idx) is False
+
+
+async def test_retire_prep_sample_missing_scope_403(ctx, no_prep_sample_write_client):
+    """A caller lacking Scope.PREP_SAMPLE_WRITE is rejected by the scope gate."""
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    prep_sample_idx = await _seed_prep_sample_linked_to_studies(
+        ctx, owner_idx=owner_idx, study_idxs=[]
+    )
+    resp = await no_prep_sample_write_client.patch(
+        URL_PREP_SAMPLE_RETIRED.format(prep_sample_idx=prep_sample_idx),
+        json={"retired": True},
+    )
+    assert resp.status_code == 403, resp.text
+    assert "prep_sample:write" in resp.json()["detail"]
+
+
+async def test_retire_prep_sample_anonymous_401(ctx):
+    """An unauthenticated caller is rejected by require_human."""
+    owner_idx = ctx["wet_session"]["principal_idx"]
+    prep_sample_idx = await _seed_prep_sample_linked_to_studies(
+        ctx, owner_idx=owner_idx, study_idxs=[]
+    )
+    app.state.pool = ctx["pool"]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
+        resp = await anon.patch(
+            URL_PREP_SAMPLE_RETIRED.format(prep_sample_idx=prep_sample_idx),
+            json={"retired": True},
+        )
+    assert resp.status_code == 401
