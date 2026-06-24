@@ -35,7 +35,15 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- `make redeploy` now auto-refreshes the operator's **checkout** CLI venv
+  (`$QIITA_CLONE/qiita-control-plane/.venv`, where `uv run qiita` / `qiita-admin`
+  resolve) as a new step 6, as the checkout owner. The manual
+  `cd .../qiita-control-plane && uv sync --reinstall-package qiita-common`
+  workaround after a pull that bumped `qiita-common` without a version change is
+  no longer needed when deploying via `make redeploy`. And if the CLI is ever run
+  with a stale `qiita_common` anyway (outside the redeploy path), it now prints
+  that exact `uv sync --reinstall-package qiita-common` fix instead of a raw
+  import traceback. Behaviour ships with the script / CLI; no host action. (#163)
 
 ---
 

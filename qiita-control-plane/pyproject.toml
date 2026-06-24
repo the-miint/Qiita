@@ -30,8 +30,13 @@ dependencies = [
 ]
 
 [project.scripts]
-qiita-admin = "qiita_control_plane.cli.admin:main"
-qiita = "qiita_control_plane.cli.user:main"
+# Entry points target the import-clean shim (cli._bootstrap), NOT cli.admin/cli.user
+# directly: the shim imports the real `main` lazily so a stale qiita_common path-dep
+# surfaces as an actionable "uv sync --reinstall-package qiita-common" message
+# instead of a raw import-time traceback. The real main()s stay intact below the
+# shim and are still imported by it (and by tests / the redeploy CLI-venv probe).
+qiita-admin = "qiita_control_plane.cli._bootstrap:qiita_admin"
+qiita = "qiita_control_plane.cli._bootstrap:qiita"
 
 [dependency-groups]
 dev = [

@@ -37,11 +37,11 @@ on your `[admin]` account**:
 sudo make -C /home/qiita/qiita-miint redeploy QIITA_HOSTNAME=qiita-miint.ucsd.edu
 ```
 
-`deploy/redeploy.sh` drives steps 2–7 in order: pull (as the operator) →
+`deploy/redeploy.sh` drives steps 2–8 in order: pull (as the operator) →
 print buckets 1 & 2 and pause for you to apply them (only when they hold real
 steps — see below) → `preflight` → migration gate → `local-deploy.sh` → native
-venv refresh → miint stage → `verify`, then prints the deployed commit for the
-§8 archive hand-off. Key behaviours:
+venv refresh → miint stage → checkout CLI-venv refresh → `verify`, then prints
+the deployed commit for the §8 archive hand-off. Key behaviours:
 
 - It **reads `DATABASE_URL` from `control-plane.env` itself** (it is root) and
   hands it to the operator's `make migrate`, so the operator's shell needn't
@@ -67,7 +67,8 @@ venv refresh → miint stage → `verify`, then prints the deployed commit for t
   it is current (use after a mirror bump the `HEAD` can't see, or to recover a
   partial stage); `SKIP_NATIVE_REFRESH=1` skips the native-venv refresh;
   `FORCE_NATIVE_REFRESH=1` forces it even when the "already current" skip would
-  fire (use to recover a deploy interrupted mid-`uv sync`).
+  fire (use to recover a deploy interrupted mid-`uv sync`); `FORCE_CLI_REFRESH=1`
+  does the same for the operator checkout CLI-venv refresh (step 6).
 
 This **root-run, drop-into-each-account** model is why it works where the
 operator account has **no sudo** (the documented default — see
@@ -248,6 +249,23 @@ step above — run `make migrate` and re-run this command.
 > The next native job FORCE-installs miint from the mirror, overwriting any
 > stale cached extension. Bucket-5 `compute-readiness` confirms both
 > (`probe/native-import=ok`, `probe/miint-read-fastx=ok`).
+>
+> **The operator's checkout CLI venv is refreshed too (step 6).** `uv run qiita` /
+> `qiita-admin` run from the checkout's `qiita-control-plane` venv, which is a
+> THIRD tree — neither the `/opt/qiita` service venvs (refreshed by `activate.sh`)
+> nor the SLURM native venv (step 5) cover it. A pull that bumps `qiita-common`
+> without a version change leaves a plain `uv sync` skipping the unchanged-version
+> path-dep, so the CLI ImportErrors on a newly-added symbol. `redeploy.sh` step 6
+> runs `uv sync --reinstall-package qiita-common` in
+> `$QIITA_CLONE/qiita-control-plane` **as the checkout owner `qiita`** (never
+> root), skipping it when neither `qiita-common` nor `qiita-control-plane` changed
+> in the pull and the venv still imports the CLI entrypoint. `FORCE_CLI_REFRESH=1`
+> forces it (recovery after a deploy interrupted mid-`uv sync`). If you run
+> `local-deploy.sh` directly and hit the ImportError, refresh by hand:
+> ```bash
+> # [operator] in the checkout where you run `uv run qiita` / `qiita-admin`
+> cd <checkout>/qiita-control-plane && uv sync --reinstall-package qiita-common
+> ```
 
 ## 7. Verify
 
