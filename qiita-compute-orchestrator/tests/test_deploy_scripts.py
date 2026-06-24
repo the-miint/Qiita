@@ -288,6 +288,47 @@ def test_paths_touch_native_no_match(paths: str) -> None:
     assert _call_paths_touch_native(paths).returncode == 1
 
 
+# --- qiita_paths_touch_cli: the pure path-prefix predicate behind redeploy.sh's
+# "did this pull touch a package the operator's checkout CLI venv runs?" decision.
+# rc 0 = a path is under qiita-common/ or qiita-control-plane/, 1 = none are. -----
+
+
+def _call_paths_touch_cli(paths: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", "-c", f'source "{_COMMON}"; qiita_paths_touch_cli "$1"', "_", paths],
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [
+        "qiita-common/src/qiita_common/api_paths.py\nother/x",
+        "qiita-control-plane/src/qiita_control_plane/cli/user.py",
+        "docs/a.md\nqiita-control-plane/f",  # CLI path is not the first line
+    ],
+)
+def test_paths_touch_cli_matches(paths: str) -> None:
+    """Any path under qiita-common or qiita-control-plane → rc 0 (refresh needed)."""
+    assert _call_paths_touch_cli(paths).returncode == 0
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [
+        # The native packages alone do NOT change what the CLI venv imports.
+        "docs/a.md\nqiita-compute-orchestrator/pyproject.toml\nqiita-data-plane/src/main.rs",
+        "qiita-control-plane-extra/z.py",  # sibling prefix must NOT match
+        "",  # empty diff → nothing touched
+    ],
+)
+def test_paths_touch_cli_no_match(paths: str) -> None:
+    """No path under the CLI packages (incl. a sibling-prefix dir or an empty
+    list) → rc 1 (no refresh needed)."""
+    assert _call_paths_touch_cli(paths).returncode == 1
+
+
 # --- scripts/build-sif.sh: now sources deploy/_common.sh for the build-inputs
 # hash, so it gets the same bash -n + shellcheck gate as the deploy scripts. ------
 

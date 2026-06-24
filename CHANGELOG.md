@@ -722,6 +722,18 @@ the `no-changelog` label).
 
 ### Fixed
 
+- `make redeploy` now refreshes the operator's **checkout** CLI venv
+  (`$QIITA_CLONE/qiita-control-plane/.venv`, where `uv run qiita` / `qiita-admin`
+  resolve), closing a two-tree gap: `activate.sh` `uv sync`s only the `/opt/qiita`
+  service venvs and the existing native-venv step covers only
+  `qiita-compute-orchestrator`, so a pull that changed `qiita-common` without a
+  version bump left the checkout CLI ImportError-ing on a stale path-dep until the
+  operator ran `uv sync --reinstall-package qiita-common` by hand. A new step 6
+  runs that reinstall as the checkout owner (never root), with a cheap skip when
+  neither `qiita-common` nor `qiita-control-plane` changed in the pull and the venv
+  still imports the CLI entrypoint (`FORCE_CLI_REFRESH=1` overrides). The skip
+  delegates to a new pure `qiita_paths_touch_cli` helper in `deploy/_common.sh`
+  (unit-tested), mirroring `qiita_paths_touch_native` (#163)
 - `POST /work-ticket/{idx}/run` (`qiita ticket run`) can now redrive a FAILED
   multi-transition reference workflow instead of dead-ending at a `permanent`
   `IllegalStatusTransition`. The redrive resets a `failed` reference to `pending`
