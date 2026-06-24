@@ -408,6 +408,11 @@ async def run_workflow(
                     host_minimap2_reference_idx=bound.get("host_minimap2_reference_idx"),
                 )
             )
+            # Persist the minted mask_idx onto the ticket for durable traceability
+            # (and a cheap shared-mask guard). Idempotent: a re-mint on resume
+            # re-resolves to the same mask_idx via the config-hash upsert and
+            # re-writes the same value here.
+            await _persist_mask_idx(pool, work_ticket_idx, bound[MASK_IDX_BINDING])
 
         for index, entry in enumerate(action.steps):
             # Conditional gate (WorkflowStep/WorkflowAction.when): skip this
@@ -1855,6 +1860,19 @@ async def _mint_read_mask(
             f"{originator_principal_idx} does not exist"
         ) from exc
     return {MASK_IDX_BINDING: mask_row["mask_idx"]}
+
+
+async def _persist_mask_idx(pool: asyncpg.Pool, work_ticket_idx: int, mask_idx: int) -> None:
+    """Write the minted `mask_idx` onto the ticket row (durable ticket→mask
+    traceability + a cheap shared-mask guard). Idempotent: a re-mint on resume
+    re-resolves to the same mask_idx via the config-hash upsert, so re-running
+    this writes the same value. Like every runner DB write it fails loud — a PG
+    outage raises and unwinds the run via run_workflow's catch-all."""
+    await pool.execute(
+        "UPDATE qiita.work_ticket SET mask_idx = $1 WHERE work_ticket_idx = $2",
+        mask_idx,
+        work_ticket_idx,
+    )
 
 
 # =============================================================================

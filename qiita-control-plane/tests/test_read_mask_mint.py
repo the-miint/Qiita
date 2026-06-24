@@ -12,6 +12,7 @@ mints a mask before the step loop (keys off a step threading `mask_idx` via
 `params:`).
 """
 
+import json
 import secrets
 
 import pytest
@@ -173,6 +174,103 @@ async def test_mint_read_mask_adapter_bytes_drive_identity(seeded, tmp_path):
         "DELETE FROM qiita.mask_definition WHERE mask_idx = ANY($1::bigint[])",
         [a["mask_idx"], b["mask_idx"]],
     )
+
+
+@pytest.mark.db
+async def test_persist_mask_idx_writes_minted_mask_onto_ticket(seeded):
+    """The runner persists the minted mask_idx onto the ticket row. Mint a real
+    mask via `_mint_read_mask`, then persist it via the same `_persist_mask_idx`
+    the pre-loop block calls; the prep_sample-scoped work_ticket's `mask_idx`
+    column equals the minted value. Re-running is idempotent (a resume re-mints
+    to the same mask_idx and re-writes the same value)."""
+    pool = seeded["pool"]
+    principal_idx = seeded["principal_idx"]
+    prep_sample_idx = seeded["prep_sample_idx"]
+
+    action_id = "read-mask"
+    version = f"mask-persist-test-{secrets.token_hex(4)}"
+    await pool.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, scopes, audience, "
+        "  context_schema, steps, "
+        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling, "
+        "  success_status, failure_status"
+        ") VALUES ($1, $2, 'prep_sample', $3::text[], $4::jsonb,"
+        "  $5::jsonb, $6::jsonb, 1, 1, '1 minute', $7, $8)",
+        action_id,
+        version,
+        ["feature:mint"],
+        json.dumps({"service": False, "human_roles": ["wet_lab_admin"]}),
+        json.dumps({}),
+        json.dumps([]),
+        "active",
+        "failed",
+    )
+    work_ticket_idx = await pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, prep_sample_idx, action_context"
+        ") VALUES ($1, $2, $3, 'prep_sample', $4, '{}'::jsonb)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        principal_idx,
+        prep_sample_idx,
+    )
+    try:
+        minted = await runner._mint_read_mask(
+            pool,
+            action_id=action_id,
+            action_version=version,
+            prep_sample_idx=prep_sample_idx,
+            originator_principal_idx=principal_idx,
+            instrument_model="NextSeq 550",
+            adapter_parquet=None,
+            host_rype_reference_idx=None,
+            host_minimap2_reference_idx=None,
+        )
+        mask_idx = minted[runner.MASK_IDX_BINDING]
+
+        # Before persist: column is NULL.
+        assert (
+            await pool.fetchval(
+                "SELECT mask_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+                work_ticket_idx,
+            )
+            is None
+        )
+
+        await runner._persist_mask_idx(pool, work_ticket_idx, mask_idx)
+        assert (
+            await pool.fetchval(
+                "SELECT mask_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+                work_ticket_idx,
+            )
+            == mask_idx
+        )
+
+        # Idempotent: a re-mint (same config -> same mask_idx) re-writes the same
+        # value, no error.
+        await runner._persist_mask_idx(pool, work_ticket_idx, mask_idx)
+        assert (
+            await pool.fetchval(
+                "SELECT mask_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+                work_ticket_idx,
+            )
+            == mask_idx
+        )
+    finally:
+        # work_ticket.mask_idx FK is ON DELETE SET NULL, but the work_ticket row
+        # still references the mask_definition; drop the ticket first.
+        await pool.execute(
+            "DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", work_ticket_idx
+        )
+        await pool.execute(
+            "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
+            action_id,
+            version,
+        )
+        await pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
 
 
 @pytest.mark.db
