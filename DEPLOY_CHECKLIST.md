@@ -174,9 +174,11 @@ _None yet._
   `local-host-reference-add/1.0.0` the step's `baseline_resources.mem_gb` rises
   32 → 64, and `local-host-reference-add`'s `action_ceiling.mem_gb` rises 64 →
   128 (matching `host-reference-add`) so an OOM-killed retry can double the step
-  64 → 128 GB. The job now hard-caps DuckDB at 30 GB regardless of allocation
-  and hands the growing remainder to rype's `max_memory` (starts ~30 GB, ≈92 GB
-  at the 128 GB ceiling). Both YAMLs are **edited in place** — re-synced into
+  64 → 128 GB. The job now hard-caps DuckDB at 8 GB regardless of allocation
+  (safe because `rype_index_create`'s windowed feed bounds DuckDB's working set
+  to window size, not corpus size — relies on the windowed-feed miint build being
+  live on the mirror) and hands the growing remainder to rype's `max_memory`
+  (starts ~50 GB, ≈114 GB at the 128 GB ceiling). Both YAMLs are **edited in place** — re-synced into
   `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (already in
   bucket 5's `qiita.action` check), **not** a migration. No new env var, host
   dir, scope, or SIF. Ensure the SLURM partition/QOS permits 128 GB single-step
