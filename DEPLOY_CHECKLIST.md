@@ -33,7 +33,7 @@ _None yet._
 
 - New workflow `fastq-to-parquet/1.3.0` is synced into `qiita.action` by
   `qiita-admin actions sync` inside `activate.sh` (no migration). Confirm it
-  registered after the deploy: (#172)
+  registered after the deploy: (#173)
 
   ```bash
   psql "$DATABASE_URL" -tAc "SELECT action_id, version FROM qiita.action WHERE action_id = 'fastq-to-parquet' AND version = '1.3.0'"
@@ -46,7 +46,7 @@ _None yet._
   `read_mask` (PRs 1–2 already deployed the `mask_definition` table + the
   data-plane `read`/`read_mask`/`read_masked` surfaces). 1.0.0–1.2.0 stay
   available; nothing forces a re-run of in-flight tickets. No new env var or
-  host directory. (#172)
+  host directory. (#173)
 
 ---
 

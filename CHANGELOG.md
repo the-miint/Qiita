@@ -37,7 +37,7 @@ the `no-changelog` label).
   `fastq-to-parquet/1.3.0` reflects the new step shape; the dead
   `qc_reads.parquet` / `filtered_reads.parquet` outputs are removed, and the new
   COPY/read_parquet/CREATE VIEW path literals route through
-  `validate_parquet_path`. (#172)
+  `validate_parquet_path`. (#173)
 - Data-plane read tables + masked-read view (PR 2 of the full-read+mask
   feature). The data plane now creates the DuckLake `read` and `read_mask`
   tables and the `read_masked` view at startup (`ensure_read_tables`, called
