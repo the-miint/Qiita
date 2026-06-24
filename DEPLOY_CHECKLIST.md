@@ -31,6 +31,38 @@ _None yet._
 
 ### 5. Verify
 
+_None yet._
+
+### Notes (no host action)
+
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-24 — be01438
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
+_None yet._
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
+
 - Confirm the read-storage / masking split synced: the new `read-mask` action is
   registered and `bcl-convert` now carries the `ingest_reads` + `register-files`
   steps. `qiita-admin actions sync` runs inside `activate.sh`, so this is a
@@ -39,9 +71,9 @@ _None yet._
   ```bash
   qiita-admin actions list | grep -E 'read-mask|bcl-convert'
   ```
-  (this PR)
+  (#180)
 
-### Notes (no host action)
+#### Notes (no host action)
 
 - Read storage is split out of host-filtering. `submit-bcl-convert` now stores
   the pool's reads (a new `ingest_reads` step writes the DuckLake `read` table
@@ -51,7 +83,7 @@ _None yet._
   stored reads, and can be re-run against a different host reference to add a
   side-by-side mask. Both workflows ship via `qiita-admin actions sync`; no env
   var, migration, or host action. The legacy `fastq-to-parquet` workflows remain
-  registered but dormant. (this PR)
+  registered but dormant. (#180)
 
 - `make redeploy` now auto-refreshes the operator's **checkout** CLI venv
   (`$QIITA_CLONE/qiita-control-plane/.venv`, where `uv run qiita` / `qiita-admin`
@@ -62,12 +94,6 @@ _None yet._
   with a stale `qiita_common` anyway (outside the redeploy path), it now prints
   that exact `uv sync --reinstall-package qiita-common` fix instead of a raw
   import traceback. Behaviour ships with the script / CLI; no host action. (#163)
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-24 — fee935f
 
