@@ -146,10 +146,10 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
         "-- Full reads, written ONCE per sequenced sample. Independent of any mask.
         -- Keyed by prep_sample_idx + the globally-unique sequence_idx (the read
         -- join key). qual1/qual2 are PHRED scores as UTINYINT arrays; NULL for
-        -- FASTA (qual1) or single-end (sequence2/qual2). PR 3's producer writes
-        -- the Parquet sorted by (prep_sample_idx, sequence_idx) — the view's
-        -- join key — for row-group pruning; not the canonical six-column result
-        -- sort order (those identifier columns don't exist on reads).
+        -- FASTA (qual1) or single-end (sequence2/qual2). The producer writes the
+        -- Parquet sorted by (prep_sample_idx, sequence_idx) — the view's join
+        -- key — for row-group pruning; not the canonical six-column result sort
+        -- order (those identifier columns don't exist on reads).
         CREATE TABLE IF NOT EXISTS qiita_lake.read (
             prep_sample_idx BIGINT NOT NULL,
             sequence_idx BIGINT NOT NULL,
@@ -189,7 +189,7 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
         -- the result is negative. At the exact full-trim boundary
         -- (left+right == length) substr length is 0 -> '' and the slice end < start
         -- -> [], consistently. The view ASSUMES the upstream invariant
-        -- left_trim+right_trim <= length (enforced at mask-emit time in PR 3: a
+        -- left_trim+right_trim <= length (enforced upstream at mask-emit time: a
         -- read trimmed below min_length is reason='qc_too_short', never 'pass').
         -- An out-of-contract over-trim row would yield inconsistent bytes; it is
         -- a producer bug, not handled here.
@@ -570,7 +570,7 @@ mod tests {
         );
     }
 
-    /// Trim boundaries the view relies on (§4): exact full-trim
+    /// Trim boundaries the view relies on: exact full-trim
     /// (left+right == length) yields '' and an EMPTY array (asserted via len, not
     /// a joined string that would also be '' for a wrong result); zero-trim (0/0)
     /// is identity. length() is signed, so the arithmetic clamps cleanly here.
@@ -678,8 +678,8 @@ mod tests {
 
     /// The read_masked view is stored in the Postgres catalog, not the session: a
     /// fresh ATTACH (a real DP restart) sees it WITHOUT re-running
-    /// ensure_read_tables. Closes the D2 residual — the spike proved this on a
-    /// file-backed catalog; this asserts it on the production Postgres catalog.
+    /// ensure_read_tables. Asserts that catalog-stored view persistence holds on
+    /// the Postgres catalog the data plane actually uses.
     #[test]
     #[serial]
     #[cfg(feature = "integration")]

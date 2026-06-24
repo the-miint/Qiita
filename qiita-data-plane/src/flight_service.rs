@@ -1059,8 +1059,9 @@ mod tests {
     // (build_query → prepare → query_arrow → get_schema → collect, plus the
     // empty-result RecordBatch::new_empty branch) against fixture data, and
     // assert the UTINYINT[] qual column survives as an Arrow List of UInt8.
-    // This is the one residual unknown the design flagged (D2 / PR-2 tests):
-    // that a UTINYINT[] column round-trips through query_arrow → Arrow.
+    // This pins the one read-path behavior the reference tables don't cover
+    // (they have no list columns): a UTINYINT[] column round-trips through
+    // query_arrow → Arrow.
     #[test]
     #[serial_test::serial]
     #[cfg(feature = "integration")]
