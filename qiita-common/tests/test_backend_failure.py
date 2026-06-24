@@ -153,3 +153,43 @@ def test_can_be_raised_and_caught():
         )
     assert ei.value.kind == FailureKind.NODE_FAIL
     assert ei.value.transient
+
+
+# ---------------------------------------------------------------------------
+# StepNoData — the terminal no-data signal (NOT a failure)
+# ---------------------------------------------------------------------------
+
+
+def test_step_no_data_is_not_a_backend_failure():
+    """StepNoData is a distinct Exception type — not a BackendFailure and not a
+    FailureKind — so a runner `except BackendFailure` never swallows it."""
+    from qiita_common.backend_failure import StepNoData
+
+    exc = StepNoData(step_name="fastq", reason="no records")
+    assert not isinstance(exc, BackendFailure)
+
+
+def test_step_no_data_str_with_and_without_step_name():
+    from qiita_common.backend_failure import StepNoData
+
+    assert str(StepNoData(step_name="fastq", reason="no records")) == "[no_data] fastq: no records"
+    assert str(StepNoData(reason="no records")) == "[no_data] no records"
+
+
+def test_step_no_data_body_round_trips():
+    """StepNoDataBody.from_exception → to_exception preserves the fields, so the
+    /step/* HTTP boundary reconstructs the signal exactly."""
+    from qiita_common.backend_failure import StepNoData, StepNoDataBody
+
+    original = StepNoData(step_name="fastq", reason="FASTQ file contains no records: x.fastq")
+    rebuilt = StepNoDataBody.from_exception(original).to_exception()
+    assert rebuilt.step_name == original.step_name
+    assert rebuilt.reason == original.reason
+
+
+def test_step_no_data_can_be_raised_and_caught():
+    from qiita_common.backend_failure import StepNoData
+
+    with pytest.raises(StepNoData) as ei:
+        raise StepNoData(step_name="fastq", reason="no records")
+    assert ei.value.step_name == "fastq"

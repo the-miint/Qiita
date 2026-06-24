@@ -15,6 +15,29 @@ the `no-changelog` label).
 
 ### Added
 
+- A first-class terminal `no_data` outcome for empty FASTQ wells, distinct from
+  failure, so a real plate full of blank / no-template-control / failed-yield
+  wells can still reach a "done" signal. New `WorkTicketState.NO_DATA` enum value
+  (additive `ALTER TYPE ... ADD VALUE 'no_data'` migration + the Python twin;
+  `WorkTicketState` already in `ENUM_PAIRS`). `fastq_to_parquet` on empty input
+  now raises a new typed terminal `StepNoData` signal (in
+  `qiita-common/backend_failure.py`, parallel to `BackendFailure` — its own wire
+  body + `X-Qiita-Step-No-Data` header round-tripping the `/step/*` boundary, NOT
+  a `FailureKind`) instead of minting a sequence range or writing `read.parquet`;
+  it mints no identifiers and writes no output. The dispatcher re-raises
+  `StepNoData` unchanged (above the generic `ValueError → BAD_INPUT` arm), both
+  backends round-trip it, and the runner transitions the ticket `PROCESSING →
+  NO_DATA` with NULL failure columns — no `failure_status` PATCH, no
+  `success_status` advance, transient markers cleared. `NO_DATA` is terminal for
+  resubmission (DELETE-gated) and the `/run` redrive (409). (#176)
+- A `prep_sample` retire surface so an operator can disposition a sample (drop an
+  empty / failed-yield well out of a pool's active set) without raw SQL. New
+  reversible `PATCH /api/v1/prep-sample/{idx}/retired` (gated on
+  `Scope.PREP_SAMPLE_WRITE` + the wet_lab_admin role the prep_sample read route
+  uses; `retired=false` un-retires a misclassified well) plus `qiita prep-sample
+  retire` / `qiita prep-sample un-retire` CLI subcommands. The `prep_sample.retired`
+  column + CHECK already existed and the completion rollup already excludes retired
+  rows. (#176)
 - Producer cutover for the full-read+mask feature (PR 3). The orchestrator now
   PRODUCES the reads and masks the DuckLake tables consume, replacing the
   destructive host/QC read-dropping. `ReadMaskReason` (a `qiita-common`
@@ -358,6 +381,18 @@ the `no-changelog` label).
 
 ### Changed
 
+- The sequenced-pool completion rollup gains a `samples_no_data` bucket and its
+  `complete` flag now fires when every active sample is in a terminal-accounted
+  state — COMPLETED **or** NO_DATA — instead of requiring every sample COMPLETED.
+  A plate of real data containing empty wells now reaches `complete=True` rather
+  than sitting `false` forever behind permanent empty-well failures. The per-sample
+  precedence is `completed > in_flight > no_data > failed > not_submitted` (no_data
+  outranks failed, so a well with both a no_data and a stale failed ticket counts
+  as no_data); empty wells are no longer folded into `samples_failed`. The
+  `GET .../sequenced-pool/{P}/completion` response gains the `samples_no_data`
+  field (soft contract addition). Until expected-empty control-well preflight
+  marking lands (deferred), EVERY empty well becomes `no_data` — data wells
+  included, not only flagged controls. (#176)
 - Host-filter references moved off `sequenced_sample` onto the human-filter
   submission (PR 4 of the full-read+mask feature). Host references are a
   filtering-config choice, not a sample property, so two configs can coexist over

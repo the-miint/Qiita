@@ -11,8 +11,11 @@ import json
 from qiita_common.backend_failure import FailureKind
 
 from qiita_compute_orchestrator.slurm.launcher_failure import (
+    NO_DATA_MARKER_KIND,
     LauncherFailure,
+    LauncherNoData,
     parse_launcher_failure,
+    parse_launcher_no_data,
 )
 
 
@@ -149,3 +152,43 @@ def test_parse_skips_json_array_at_top_level(tmp_path):
     f = tmp_path / "stderr"
     f.write_text("[1, 2, 3]\n")
     assert parse_launcher_failure(f) is None
+
+
+# ============================================================================
+# parse_launcher_no_data — the terminal no-data (empty-well) signal
+# ============================================================================
+
+
+def test_parse_no_data_happy_path(tmp_path):
+    """A line tagged with NO_DATA_MARKER_KIND is recognized by
+    parse_launcher_no_data and reconstructed into a LauncherNoData."""
+    f = tmp_path / "stderr"
+    f.write_text(
+        _structured(NO_DATA_MARKER_KIND, "fastq", "FASTQ file contains no records: x.fastq") + "\n"
+    )
+    result = parse_launcher_no_data(f)
+    assert result == LauncherNoData(
+        step_name="fastq", reason="FASTQ file contains no records: x.fastq"
+    )
+
+
+def test_parse_no_data_returns_none_for_missing_file(tmp_path):
+    assert parse_launcher_no_data(tmp_path / "nonexistent") is None
+
+
+def test_no_data_line_is_invisible_to_failure_parser(tmp_path):
+    """A no-data line's `kind` is NOT a FailureKind, so the failure parser
+    skips it (returns None). This is what keeps an empty well from being
+    classified as a failure: result_step parses no_data FIRST, and even if it
+    didn't, the failure parser would not mistake it for a BackendFailure."""
+    f = tmp_path / "stderr"
+    f.write_text(_structured(NO_DATA_MARKER_KIND, "fastq", "no records") + "\n")
+    assert parse_launcher_failure(f) is None
+    assert parse_launcher_no_data(f) is not None
+
+
+def test_failure_line_is_invisible_to_no_data_parser(tmp_path):
+    """Symmetric: a genuine failure line is ignored by the no-data parser."""
+    f = tmp_path / "stderr"
+    f.write_text(_structured("bad_input", "fastq", "malformed") + "\n")
+    assert parse_launcher_no_data(f) is None

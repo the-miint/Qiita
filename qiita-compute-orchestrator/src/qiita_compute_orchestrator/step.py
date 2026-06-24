@@ -41,8 +41,12 @@ from qiita_common.api_paths import (
 from qiita_common.backend_failure import (
     BACKEND_FAILURE_HEADER,
     BACKEND_FAILURE_HTTP_STATUS,
+    STEP_NO_DATA_HEADER,
+    STEP_NO_DATA_HTTP_STATUS,
     BackendFailure,
     BackendFailureBody,
+    StepNoData,
+    StepNoDataBody,
 )
 from qiita_common.models import (
     FoundJobWire,
@@ -99,6 +103,18 @@ def _backend_failure_response(exc: BackendFailure) -> JSONResponse:
         status_code=BACKEND_FAILURE_HTTP_STATUS,
         content=BackendFailureBody.from_exception(exc).model_dump(mode="json"),
         headers={BACKEND_FAILURE_HEADER: "1"},
+    )
+
+
+def _step_no_data_response(exc: StepNoData) -> JSONResponse:
+    """Serialize a StepNoData so the runner reconstructs the typed terminal
+    no-data signal and transitions the ticket to NO_DATA — distinct from the
+    BackendFailure → FAILED path. Carries its own discriminator header so the
+    client never confuses it with a failure."""
+    return JSONResponse(
+        status_code=STEP_NO_DATA_HTTP_STATUS,
+        content=StepNoDataBody.from_exception(exc).model_dump(mode="json"),
+        headers={STEP_NO_DATA_HEADER: "1"},
     )
 
 
@@ -173,6 +189,10 @@ async def submit_step(
             entrypoint=body.entrypoint,
             baseline_resources=body.baseline_resources,
         )
+    except StepNoData as exc:
+        # LocalBackend runs the native job to completion at submit time, so an
+        # empty-well no-data outcome surfaces here. SLURM defers it to result.
+        return _step_no_data_response(exc)
     except BackendFailure as exc:
         return _backend_failure_response(exc)
     except FileNotFoundError as exc:
@@ -208,6 +228,10 @@ async def result_step(
         outputs = await backend.result_step(
             _handle_from_wire(body.handle), _status_from_wire(body.status)
         )
+    except StepNoData as exc:
+        # SLURM defers the no-data outcome to result_step (the job exited and
+        # wrote a structured no-data line; SlurmBackend reconstructs it here).
+        return _step_no_data_response(exc)
     except BackendFailure as exc:
         return _backend_failure_response(exc)
     return StepResultResponse(outputs={k: str(v) for k, v in outputs.items()})

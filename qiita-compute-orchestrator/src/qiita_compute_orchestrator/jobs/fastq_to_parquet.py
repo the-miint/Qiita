@@ -64,11 +64,14 @@ pruning / Parquet predicate pushdown, and the uint64 space isn't a concern.)
 
 Pipeline (B-staged-Parquet):
 
-  1. Reject empty input. A decompressed-stream peek (handles plain
-     and .gz) catches zero-record FASTQs before any DuckDB work;
-     empty input raises ValueError → BAD_INPUT, and no empty Parquet
-     is emitted. This also sidesteps miint's "Empty file: ..." throw,
-     so we don't depend on the upstream wording.
+  1. Detect empty input as a terminal no-data outcome. A decompressed-
+     stream peek (handles plain and .gz) catches zero-record FASTQs
+     before any DuckDB work; empty input raises StepNoData, NO sequence-
+     range is minted, and NO Parquet is emitted. An empty well — a blank,
+     a no-template control, or a failed-yield well — is expected and
+     numerous on a real plate, so it is a first-class terminal outcome
+     (work_ticket → NO_DATA), NOT a failure. This also sidesteps miint's
+     "Empty file: ..." throw, so we don't depend on the upstream wording.
 
   2. FASTQ -> intermediate Parquet (no sequence_idx yet). One
      streaming pass through miint's read_fastx. The intermediate is
@@ -102,7 +105,7 @@ from pathlib import Path
 
 import httpx
 from pydantic import BaseModel, Field
-from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.duckdb_miint import is_empty_sequence_file
 from qiita_common.models import WorkTicketFailureStage
 from qiita_common.parquet import validate_parquet_path
@@ -201,14 +204,21 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         raise FileNotFoundError(f"reverse FASTQ file not found: {inputs.reverse_fastq_path}")
 
     # Empty-input check via a Python decompressed-stream peek (handles
-    # plain and .gz). Surfaces empty FASTQs as BAD_INPUT before any
-    # DuckDB work — no empty Parquet is written, no sequence-range is
-    # minted, and we don't depend on miint's exception wording for the
-    # detection.
+    # plain and .gz). An empty well is a terminal no-data outcome, NOT a
+    # failure: raise StepNoData before any DuckDB work — no Parquet is
+    # written and no sequence-range is minted. Detecting it here also
+    # sidesteps miint's exception wording. A non-empty R1 paired with an
+    # empty R2 is equally no-data (the pair has no reads to write).
     if is_empty_sequence_file(inputs.fastq_path):
-        raise ValueError(f"FASTQ file contains no records: {inputs.fastq_path}")
+        raise StepNoData(
+            step_name=YAML_STEP_NAME,
+            reason=f"FASTQ file contains no records: {inputs.fastq_path}",
+        )
     if inputs.reverse_fastq_path is not None and is_empty_sequence_file(inputs.reverse_fastq_path):
-        raise ValueError(f"reverse FASTQ file contains no records: {inputs.reverse_fastq_path}")
+        raise StepNoData(
+            step_name=YAML_STEP_NAME,
+            reason=f"reverse FASTQ file contains no records: {inputs.reverse_fastq_path}",
+        )
 
     workspace.mkdir(parents=True, exist_ok=True)
     intermediate = workspace / "_intermediate_reads.parquet"
@@ -236,9 +246,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         read_fastx_args = [str(inputs.fastq_path)]
 
     try:
-        # FASTQ -> intermediate Parquet. Empty inputs were rejected as
-        # BAD_INPUT above, so read_fastx is guaranteed to have at least
-        # one record here.
+        # FASTQ -> intermediate Parquet. Empty inputs exited via StepNoData
+        # above, so read_fastx is guaranteed to have at least one record here.
         with open_miint_conn() as conn:
             apply_duckdb_settings(
                 conn,

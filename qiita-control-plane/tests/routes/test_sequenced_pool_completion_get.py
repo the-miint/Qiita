@@ -134,6 +134,7 @@ async def test_get_completion_buckets_samples(ctx, seeded_pool):
     assert body["sample_count"] == 2
     assert body["samples_completed"] == 1
     assert body["samples_in_flight"] == 0
+    assert body["samples_no_data"] == 0
     assert body["samples_failed"] == 0
     assert body["samples_not_submitted"] == 1
     # Not every sample completed → not complete.
@@ -161,6 +162,32 @@ async def test_get_completion_complete_when_all_done(ctx, seeded_pool):
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["samples_completed"] == 2
+    assert body["complete"] is True
+
+
+async def test_get_completion_no_data_makes_pool_complete(ctx, seeded_pool):
+    """Giving the not-submitted second sample a NO_DATA (empty-well) ticket flips
+    `complete` to True — completed + no_data == sample_count — and surfaces the
+    sample in the samples_no_data bucket, NOT samples_failed."""
+    db = ctx["pool"]
+    ps1 = await db.fetchval(
+        "SELECT prep_sample_idx FROM qiita.sequenced_sample"
+        " WHERE sequenced_pool_idx = $1 AND sequenced_pool_item_id = 'compl-item-1'",
+        seeded_pool["pool_idx"],
+    )
+    await _add_ticket(
+        db,
+        action=seeded_pool["action"],
+        owner=seeded_pool["owner"],
+        prep_sample_idx=ps1,
+        state="no_data",
+    )
+    resp = await ctx["wet"].get(_url(seeded_pool["run_idx"], seeded_pool["pool_idx"]))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["samples_completed"] == 1
+    assert body["samples_no_data"] == 1
+    assert body["samples_failed"] == 0
     assert body["complete"] is True
 
 

@@ -45,7 +45,7 @@ import sys
 from pathlib import Path
 
 from qiita_common.actions import NATIVE_MODULE_PREFIX
-from qiita_common.backend_failure import BackendFailure
+from qiita_common.backend_failure import BackendFailure, StepNoData
 
 from ..slurm.contract import (
     EXPECTED_FILE_MODE,
@@ -53,6 +53,7 @@ from ..slurm.contract import (
     MANIFEST_FILENAME,
     JobParams,
 )
+from ..slurm.launcher_failure import NO_DATA_MARKER_KIND
 from . import flatten_native_inputs, run_native_job
 
 
@@ -166,6 +167,20 @@ def main(argv: list[str] | None = None) -> int:
         outputs = asyncio.run(
             run_native_job(module_name, raw_inputs, output_path, step_name=step_name)
         )
+    except StepNoData as exc:
+        # Terminal no-data outcome (an empty FASTQ well) — NOT a failure. Write a
+        # structured no-data line to stderr (a sibling of the failure line below,
+        # tagged with NO_DATA_MARKER_KIND in the `kind` slot) and exit non-zero.
+        # SlurmBackend.result_step parses this BEFORE the failure parse and
+        # reconstructs a StepNoData, which the runner turns into a NO_DATA ticket
+        # rather than a FAILED one. The job wrote no manifest and no output.
+        print(
+            json.dumps(
+                {"kind": NO_DATA_MARKER_KIND, "step_name": exc.step_name, "reason": exc.reason}
+            ),
+            file=sys.stderr,
+        )
+        return 1
     except BackendFailure as exc:
         # Structured error line on stderr — the orchestrator-side
         # slurmrestd polling will see exit=1 and classify based on

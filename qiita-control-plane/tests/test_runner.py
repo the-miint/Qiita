@@ -21,7 +21,7 @@ import uuid
 from pathlib import Path
 
 import pytest
-from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import (
     ComputeTarget,
     FoundJobWire,
@@ -474,6 +474,64 @@ async def test_failure_marks_ticket_and_reference_failed(
         pending_work_ticket["reference_idx"],
     )
     assert ref_status == "failed"
+
+
+class _NoDataBackendClient(_LocalLikeBackendMixin):
+    """Backend stub whose first step raises StepNoData — the empty-well outcome.
+    StepNoData is NOT a BackendFailure, so it propagates straight through
+    `_run_entry_with_retry` (which only catches BackendFailure) to run_workflow's
+    StepNoData arm."""
+
+    async def run_step(self, *, step_name, **kwargs):
+        raise StepNoData(
+            step_name=step_name, reason=f"FASTQ file contains no records ({step_name})"
+        )
+
+
+async def test_no_data_transitions_ticket_to_no_data(
+    postgres_pool, pending_work_ticket, library_spy, tmp_path
+):
+    """A StepNoData from a step transitions the ticket PROCESSING → NO_DATA with
+    all failure_* columns NULL, WITHOUT advancing the resource's success_status
+    or PATCHing its failure_status, and clears any transient-retry marker. The
+    runner returns cleanly (no re-raise) — no_data is a terminal success-ish
+    outcome, not a task error."""
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = pending_work_ticket["work_ticket_idx"]
+
+    # Seed a stale transient marker so we can assert it's cleared.
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET transient_reason = 'stuck', transient_since = now()"
+        " WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+
+    # Returns cleanly — StepNoData is not re-raised by run_workflow.
+    await _run(work_ticket_idx, postgres_pool, _NoDataBackendClient(), workspace_root)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, failure_type, failure_stage, failure_step_name, failure_reason,"
+        " transient_reason, transient_since"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    assert row["state"] == "no_data"
+    # Not a failure: every failure_* column is NULL.
+    assert row["failure_type"] is None
+    assert row["failure_stage"] is None
+    assert row["failure_step_name"] is None
+    assert row["failure_reason"] is None
+    # Transient-retry marker cleared.
+    assert row["transient_reason"] is None
+    assert row["transient_since"] is None
+
+    # success_status NOT applied (reference did not reach 'active') and
+    # failure_status NOT applied — the reference stays where it was, not failed.
+    ref_status = await postgres_pool.fetchval(
+        "SELECT status FROM qiita.reference WHERE reference_idx = $1",
+        pending_work_ticket["reference_idx"],
+    )
+    assert ref_status not in ("active", "failed")
 
 
 async def test_refuses_non_pending_ticket(postgres_pool, pending_work_ticket, tmp_path):

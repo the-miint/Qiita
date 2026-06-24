@@ -2,8 +2,9 @@
 prep-generation completion rollup.
 
 The repo function classifies each non-retired sequenced_sample by the state of
-its fastq-to-parquet work tickets (any version) and tallies the four
-mutually-exclusive buckets (completed / in-flight / failed / not-submitted). Each
+its fastq-to-parquet work tickets (any version) and tallies the five
+mutually-exclusive buckets (completed / in-flight / no-data / failed /
+not-submitted). Each
 test seeds one principal + one run + one pool + a fastq-to-parquet action, then
 attaches samples via `add_sample` and tickets via `add_ticket`; cleanup is
 FK-reverse on the shared postgres_pool fixture.
@@ -143,6 +144,7 @@ async def test_empty_pool_is_all_zero(pool_ctx):
     assert row["sample_count"] == 0
     assert row["samples_completed"] == 0
     assert row["samples_in_flight"] == 0
+    assert row["samples_no_data"] == 0
     assert row["samples_failed"] == 0
     assert row["samples_not_submitted"] == 0
 
@@ -156,30 +158,73 @@ async def test_sample_without_ticket_is_not_submitted(pool_ctx):
 
 
 async def test_each_terminal_state_buckets(pool_ctx):
-    """One sample per bucket: completed, in-flight (processing), failed, and
-    not-submitted — each lands in exactly one count, and the four sum to
+    """One sample per bucket: completed, in-flight (processing), no-data, failed,
+    and not-submitted — each lands in exactly one count, and the five sum to
     sample_count."""
     ps_done = await pool_ctx["add_sample"]()
     await pool_ctx["add_ticket"](ps_done, "completed")
     ps_run = await pool_ctx["add_sample"]()
     await pool_ctx["add_ticket"](ps_run, "processing")
+    ps_empty = await pool_ctx["add_sample"]()
+    await pool_ctx["add_ticket"](ps_empty, "no_data")
     ps_fail = await pool_ctx["add_sample"]()
     await pool_ctx["add_ticket"](ps_fail, "failed")
     await pool_ctx["add_sample"]()  # not submitted
 
     row = await fetch_sequenced_pool_completion(pool_ctx["pool"], pool_ctx["pool_idx"])
-    assert row["sample_count"] == 4
+    assert row["sample_count"] == 5
     assert row["samples_completed"] == 1
     assert row["samples_in_flight"] == 1
+    assert row["samples_no_data"] == 1
     assert row["samples_failed"] == 1
     assert row["samples_not_submitted"] == 1
     bucketed = (
         row["samples_completed"]
         + row["samples_in_flight"]
+        + row["samples_no_data"]
         + row["samples_failed"]
         + row["samples_not_submitted"]
     )
     assert bucketed == row["sample_count"]
+
+
+async def test_no_data_excluded_from_failed_bucket(pool_ctx):
+    """A sample whose only ticket is NO_DATA (an empty well) counts as no_data,
+    NOT failed — the whole point of the distinct terminal outcome."""
+    ps = await pool_ctx["add_sample"]()
+    await pool_ctx["add_ticket"](ps, "no_data")
+    row = await fetch_sequenced_pool_completion(pool_ctx["pool"], pool_ctx["pool_idx"])
+    assert row["sample_count"] == 1
+    assert row["samples_no_data"] == 1
+    assert row["samples_failed"] == 0
+
+
+async def test_no_data_wins_over_failed_retry(pool_ctx):
+    """A sample with both a stale FAILED ticket and a NO_DATA ticket counts as
+    no_data — no_data outranks failed, so an empty well that was retried then
+    superseded doesn't get stuck in the failed bucket (and the pool can still
+    reach `complete`)."""
+    ps = await pool_ctx["add_sample"]()
+    await pool_ctx["add_ticket"](ps, "failed")
+    await pool_ctx["add_ticket"](ps, "no_data")
+    row = await fetch_sequenced_pool_completion(pool_ctx["pool"], pool_ctx["pool_idx"])
+    assert row["sample_count"] == 1
+    assert row["samples_no_data"] == 1
+    assert row["samples_failed"] == 0
+
+
+async def test_completed_plus_no_data_makes_pool_complete(pool_ctx):
+    """A pool of real data with empty wells: completed + no_data == sample_count,
+    so the PoolCompletionStatus `complete` flag fires (verified at the model
+    layer; here we assert the buckets the flag reads)."""
+    ps_done = await pool_ctx["add_sample"]()
+    await pool_ctx["add_ticket"](ps_done, "completed")
+    ps_empty = await pool_ctx["add_sample"]()
+    await pool_ctx["add_ticket"](ps_empty, "no_data")
+    row = await fetch_sequenced_pool_completion(pool_ctx["pool"], pool_ctx["pool_idx"])
+    assert row["sample_count"] == 2
+    assert row["samples_completed"] + row["samples_no_data"] == row["sample_count"]
+    assert row["samples_failed"] == 0
 
 
 async def test_completed_wins_over_failed_retry(pool_ctx):

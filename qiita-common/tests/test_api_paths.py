@@ -206,6 +206,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_PREP_SAMPLE_PREFIX",
         "PATH_PREP_SAMPLE_STUDY_LIST",
     ),
+    (
+        "URL_PREP_SAMPLE_RETIRED",
+        "PATH_PREP_SAMPLE_PREFIX",
+        "PATH_PREP_SAMPLE_RETIRED",
+    ),
     # /read-masked
     ("URL_READ_MASKED_DOGET", "PATH_READ_MASKED_PREFIX", "PATH_READ_MASKED_DOGET"),
 ]
