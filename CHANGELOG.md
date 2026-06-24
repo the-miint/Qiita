@@ -381,6 +381,29 @@ the `no-changelog` label).
 
 ### Changed
 
+- Split read storage from masking so a sample's reads are stored ONCE and can be
+  masked repeatedly against different host references. Previously the single
+  `fastq-to-parquet` workflow parsed FASTQ, minted a `sequence_idx` range, AND
+  masked in one ticket — so re-masking the same sample against a second host
+  reference hit the `sequence_range` UNIQUE(prep_sample_idx) constraint (409) and
+  failed. Now: the **bcl-convert** workflow gains an `ingest_reads` step that,
+  after demux, parses every pool sample's FASTQ(s), mints the range, and writes
+  the full reads into the DuckLake `read` table once (plus a durable per-sample
+  `read.parquet` under `<scratch>/reads/<prep_sample_idx>/`). A new **`read-mask`**
+  workflow (`qc → host_filter → register read_mask → persist-read-metrics`) binds
+  those stored reads and records one mask per submission — `qc.py`/`host_filter.py`
+  are unchanged. `submit-bcl-convert` now embeds the pool roster
+  (`prep_sample_idx ↔ pool_item_id`) in the ticket's `action_context` so the
+  pool-scoped ingest step (which has no DB access) can store reads; the runner
+  materializes it to a Parquet (`_resolve_sample_map`) and binds the staged reads
+  for a mask ticket (`_resolve_staged_reads`). `submit-host-filter-pool` is now
+  mask-only: it drops `--convert-dir` and FASTQ resolution and submits one
+  `read-mask/1.0.0` ticket per sample, so the SAME pool can be re-submitted later
+  against host reference 4 to produce a side-by-side mask over host reference 2's
+  reads — neither re-runs ingest. The pool-completion rollup now keys on the
+  `read-mask` action (a sample is "processed" once it has a mask). The legacy
+  `fastq-to-parquet` workflows remain registered but dormant (no gesture submits
+  them); full retirement is a fast-follow.
 - The sequenced-pool completion rollup gains a `samples_no_data` bucket and its
   `complete` flag now fires when every active sample is in a terminal-accounted
   state — COMPLETED **or** NO_DATA — instead of requiring every sample COMPLETED.

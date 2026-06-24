@@ -196,6 +196,28 @@ def compute_upload_staging_path(staging_root: Path, upload_idx: int) -> Path:
     return staging_root / "uploads" / str(upload_idx) / "upload.parquet"
 
 
+def compute_reads_staging_path(staging_root: Path, prep_sample_idx: int) -> Path:
+    """Canonical filesystem path for a prep_sample's durable staged reads.
+
+    The bcl-convert ``ingest_reads`` step writes each sample's full
+    ``read.parquet`` here once (in addition to registering it into the
+    DuckLake ``read`` table). It is the input the repeatable read-mask
+    workflow binds as ``reads`` — masks read the stored sequences from
+    this stable, prep_sample-addressable copy rather than re-deriving
+    them from FASTQ, so a second host reference is a new mask over the
+    same reads, never a re-run of ingest.
+
+    Layout — ``{root}/reads/{prep_sample_idx}/read.parquet`` — is
+    deterministic in ``prep_sample_idx`` (NOT ticket-scoped): the
+    ingest step (in the pool's bcl-convert ticket) writes it; a later
+    read-mask ticket for the same sample reads it back. Mirrors
+    ``compute_upload_staging_path``'s deterministic-by-idx shape so the
+    writer (ingest) and reader (``_resolve_staged_reads`` in the
+    runner) agree byte-for-byte.
+    """
+    return staging_root / "reads" / str(prep_sample_idx) / "read.parquet"
+
+
 # =============================================================================
 # /sequence-range/* — control-plane sequence_idx allocator
 # =============================================================================

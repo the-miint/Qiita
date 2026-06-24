@@ -31,9 +31,27 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- Confirm the read-storage / masking split synced: the new `read-mask` action is
+  registered and `bcl-convert` now carries the `ingest_reads` + `register-files`
+  steps. `qiita-admin actions sync` runs inside `activate.sh`, so this is a
+  read-back, not a host action:
+
+  ```bash
+  qiita-admin actions list | grep -E 'read-mask|bcl-convert'
+  ```
+  (this PR)
 
 ### Notes (no host action)
+
+- Read storage is split out of host-filtering. `submit-bcl-convert` now stores
+  the pool's reads (a new `ingest_reads` step writes the DuckLake `read` table
+  plus a durable per-sample copy under `<scratch>/reads/<prep_sample_idx>/`,
+  auto-created by the step — no host setup). `submit-host-filter-pool` is now
+  mask-only (no `--convert-dir`): it submits `read-mask/1.0.0` tickets over the
+  stored reads, and can be re-run against a different host reference to add a
+  side-by-side mask. Both workflows ship via `qiita-admin actions sync`; no env
+  var, migration, or host action. The legacy `fastq-to-parquet` workflows remain
+  registered but dormant. (this PR)
 
 - `make redeploy` now auto-refreshes the operator's **checkout** CLI venv
   (`$QIITA_CLONE/qiita-control-plane/.venv`, where `uv run qiita` / `qiita-admin`

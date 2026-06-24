@@ -660,7 +660,9 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     assert _BCL_CONVERT_ACTION_VERSION == bcl.version == "1.0.0"
 
     step_names = [s.name for s in bcl.steps]
-    assert step_names == ["bcl_convert_prep", "bcl_convert"]
+    # Demux (prep + bcl_convert) then store the pool's reads once
+    # (ingest_reads → register the per-sample read parts into `read`).
+    assert step_names == ["bcl_convert_prep", "bcl_convert", "ingest_reads", "register-files"]
 
     prep = next(s for s in bcl.steps if s.name == "bcl_convert_prep")
     assert prep.module == "qiita_compute_orchestrator.jobs.bcl_convert_prep"
@@ -694,8 +696,11 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     # context_schema gates on the operator-supplied BCL folder path; the
     # absolute-path pattern keeps the launcher from resolving against a
     # surprise CWD on the compute node.
-    assert bcl.context_schema["required"] == ["bcl_input_dir"]
+    assert bcl.context_schema["required"] == ["bcl_input_dir", "sample_map"]
     assert bcl.context_schema["properties"]["bcl_input_dir"]["pattern"] == "^/"
+    # The pool roster the ingest_reads step keys off (prep_sample_idx ↔
+    # pool_item_id), embedded by submit-bcl-convert.
+    assert bcl.context_schema["properties"]["sample_map"]["type"] == "array"
 
 
 def test_load_actions_handles_two_versions_of_same_action(tmp_path):

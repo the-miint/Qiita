@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from pydantic import BaseModel, ValidationError
-from qiita_common.actions import FASTQ_TO_PARQUET_ACTION_ID
+from qiita_common.actions import READ_MASK_ACTION_ID
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BY_IDX,
     PATH_BIOSAMPLE_LIST_BY_STUDY,
@@ -100,9 +100,9 @@ _BCL_CONVERT_ACTION_VERSION = "1.0.0"
 # action_id for the submit-host-filter-pool fan-out — imported from the shared
 # action contract (qiita_common.actions) so the submitter and any reader of these
 # tickets (e.g. the pool completion rollup) key off one value. The version is
-# pinned locally: 1.2.0 adds the always-on QC step + the two-reference host
-# filter (1.0.0 has no host_filter, 1.1.0 is the legacy single-reference form).
-_FASTQ_TO_PARQUET_ACTION_VERSION = "1.2.0"
+# pinned locally. read-mask creates one mask over a sample's already-stored
+# reads; reads are stored once by the bcl-convert workflow's ingest_reads step.
+_READ_MASK_ACTION_VERSION = "1.0.0"
 
 
 class _PreflightRow(NamedTuple):
@@ -1097,34 +1097,30 @@ def _build_parser() -> argparse.ArgumentParser:
     p_submit_hf = sub.add_parser(
         "submit-host-filter-pool",
         help=(
-            "Bundled operator gesture: after a bcl-convert pool finishes, fan"
-            " out one fastq-to-parquet ticket per sample, host-filtering every"
-            " sample against the host reference(s) given on THIS submission."
+            "Bundled operator gesture: create one read mask per sample over a"
+            " pool's already-stored reads, host-filtering every sample against"
+            " the host reference(s) given on THIS submission."
         ),
         description=(
-            "For every active sequenced_sample in --sequenced-pool-idx, locate"
-            " its per-sample FASTQ(s) under --convert-dir (matched on the"
-            " sequenced_pool_item_id == bcl-convert Sample_ID prefix) and submit"
-            " a fastq-to-parquet/1.2.0 work-ticket: always-on QC (fastp-equivalent"
-            " adapter/polyG/length trimming) followed by host filtering. The host"
-            " reference is a property of THIS filtering config, not of the sample:"
+            "For every active sequenced_sample in --sequenced-pool-idx, submit a"
+            " read-mask/1.0.0 work-ticket: always-on QC (fastp-equivalent"
+            " adapter/polyG/length trimming) followed by host filtering, recorded"
+            " as a read_mask over the reads bcl-convert already stored — this"
+            " command does NOT parse FASTQ or re-store reads. The host reference"
+            " is a property of THIS filtering config, not of the sample:"
             " --host-rype-reference-idx (with optional --host-minimap2-reference-idx)"
             " names the reference(s) every sample in the pool is depleted against."
             " Omit them to run QC-only with host filtering disabled (a pass-through"
-            " for the whole pool). The same reads can be re-submitted later against"
-            " a different host reference to produce a second, side-by-side mask."
-            " Each given reference is checked for ACTIVE status + its required index"
-            " up front, and every sample's FASTQs are resolved before any ticket is"
-            " submitted, so a misconfiguration aborts with zero side effects. The"
-            " run's instrument_model is read once (GET /sequencing-run) and"
-            " forwarded per sample so QC's polyG step is gated correctly. Re-running"
-            " after a partial failure is safe: disallow-without-delete is keyed per"
-            " prep_sample, so only samples without an in-flight/terminal ticket are"
-            " re-submitted. ASSUMPTIONS: --convert-dir must be visible from this"
-            " host (the per-sample FASTQs are read off the shared compute"
-            " filesystem), and the run is single-lane (a sample with >1 R1 file,"
-            " e.g. lane-split _L001/_L002, is rejected — fastq-to-parquet takes a"
-            " single fastq_path)."
+            " for the whole pool). Because reads are stored once and masks are"
+            " separate, the SAME pool can be re-submitted later against a different"
+            " host reference to produce a second, side-by-side mask — neither"
+            " re-runs ingest. Each given reference is checked for ACTIVE status +"
+            " its required index up front, so a misconfiguration aborts with zero"
+            " side effects. The run's instrument_model is read once (GET"
+            " /sequencing-run) and forwarded per sample so QC's polyG step is"
+            " gated correctly. The existing one-in-flight-per-prep_sample guard"
+            " serializes concurrent masks of one sample; submit a second"
+            " host-reference mask once the first pool's tickets are terminal."
         ),
     )
     p_submit_hf.add_argument(
@@ -1138,17 +1134,6 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         required=True,
         help="sequenced_pool_idx whose samples to fan out over.",
-    )
-    p_submit_hf.add_argument(
-        "--convert-dir",
-        type=Path,
-        required=True,
-        help=(
-            "Absolute path to the bcl-convert ConvertJob output directory,"
-            " visible from this host. Searched recursively for each sample's"
-            " <pool_item_id>_*_R1_*.fastq.gz (and _R2_ when paired-end), since"
-            " bcl-convert nests per-sample FASTQs under a Sample_Project subdir."
-        ),
     )
     p_submit_hf.add_argument(
         "--host-rype-reference-idx",
@@ -1996,11 +1981,23 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
                     # on the sample; host filtering is chosen at
                     # submit-host-filter-pool time.
                     "human_filtering": row.human_filtering,
+                    "prep_sample_idx": sample_resp["prep_sample_idx"],
                     "sequenced_sample_idx": sample_resp["sequenced_sample_idx"],
                 }
             )
 
-        # Step 4: submit the bcl-convert work_ticket against the pool.
+        # Step 4: submit the bcl-convert work_ticket against the pool. The pool
+        # roster (prep_sample_idx ↔ sequenced_pool_item_id) rides in
+        # action_context so the orchestrator's `ingest_reads` step can store
+        # each sample's reads after demux without DB access — the CP already
+        # enumerated every sample above, so it just hands them over.
+        sample_map = [
+            {
+                "prep_sample_idx": r["prep_sample_idx"],
+                "pool_item_id": str(r["illumina_sample_idx"]),
+            }
+            for r in per_sample_results
+        ]
         ticket_body = WorkTicketCreateRequest(
             action_id=_BCL_CONVERT_ACTION_ID,
             action_version=_BCL_CONVERT_ACTION_VERSION,
@@ -2009,7 +2006,10 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
                 "sequenced_pool_idx": sequenced_pool_idx,
                 "sequencing_run_idx": sequencing_run_idx,
             },
-            action_context={"bcl_input_dir": str(args.bcl_input_dir)},
+            action_context={
+                "bcl_input_dir": str(args.bcl_input_dir),
+                "sample_map": sample_map,
+            },
         ).model_dump(exclude_unset=True, mode="json")
         ticket_resp, _ticket_status = _common.call_with_status(
             "POST",
@@ -2058,51 +2058,6 @@ def _handle_delete_sequenced_pool(args: argparse.Namespace, parser: argparse.Arg
     )
 
 
-class _FastqMatchError(NamedTuple):
-    """Sentinel: a sample's FASTQ could not be uniquely resolved under
-    --convert-dir. Carries the operator-facing reason."""
-
-    reason: str
-
-
-def _match_pool_item_fastq(
-    convert_dir: Path,
-    pool_item_id: str,
-    read_tag: str,
-    *,
-    required: bool,
-) -> Path | _FastqMatchError | None:
-    """Resolve the single `<pool_item_id>_*_<read_tag>_*.fastq.gz` under
-    convert_dir, searching recursively.
-
-    bcl-convert runs with --bcl-sampleproject-subdirectories, so per-sample
-    FASTQs sit one level below convert_dir; rglob descends into them. The
-    trailing underscore in the `<pool_item_id>_` prefix anchors the match so
-    `12` never matches `120_...`. This is intentionally narrower than the
-    server's submit-time prefix check (which also accepts a bare `<id>.fastq`):
-    bcl-convert ConvertJob output is always the `<id>_..._R1_..._.fastq.gz`
-    form, and a file this matcher accepts the server accepts too.
-
-    Returns the Path on a unique match; None when none match and the read is
-    optional (single-end R2); a _FastqMatchError when a required read is
-    missing or when >1 match (multi-lane is out of scope — the workflow takes
-    a single fastq_path).
-    """
-    matches = sorted(convert_dir.rglob(f"{pool_item_id}_*_{read_tag}_*.fastq.gz"))
-    if len(matches) == 1:
-        return matches[0]
-    if not matches:
-        if required:
-            return _FastqMatchError(
-                f"no {read_tag} FASTQ matched {pool_item_id}_*_{read_tag}_*.fastq.gz"
-            )
-        return None
-    return _FastqMatchError(
-        f"{len(matches)} {read_tag} FASTQs matched {pool_item_id} (lane-split runs are"
-        f" not supported): {', '.join(m.name for m in matches)}"
-    )
-
-
 def _assert_host_reference_ready(
     base_url: str, token: str, reference_idx: int, index_type: str, flag: str
 ) -> None:
@@ -2144,23 +2099,27 @@ def _assert_host_reference_ready(
 def _handle_submit_host_filter_pool(
     args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> int:
-    """Fan out one QC'd fastq-to-parquet/1.2.0 ticket per active
-    sequenced_sample in a completed bcl-convert pool, host-filtering every sample
-    against the host reference(s) given on THIS submission.
+    """Create one read mask per active sequenced_sample in a pool, host-filtering
+    every sample against the host reference(s) given on THIS submission.
+
+    The pool's reads were stored once by the bcl-convert workflow's ingest_reads
+    step; this gesture does NOT parse FASTQ or re-store reads. It submits one
+    read-mask/1.0.0 ticket per sample (always-on QC + host filtering), each
+    recorded as a read_mask over the stored reads.
 
     Host filtering is a property of the filtering config, not of the sample:
     --host-rype-reference-idx (with optional --host-minimap2-reference-idx) names
     the reference(s) every sample in the pool is depleted against for this
     submission, parameterizing the read mask the run produces. Omitting both runs
-    the whole pool QC-only with host filtering disabled (a pass-through). The same
-    reads can be re-submitted later against a different reference to produce a
-    second, side-by-side mask.
+    the whole pool QC-only with host filtering disabled (a pass-through). Because
+    reads are stored once and masks are separate, the same pool can be
+    re-submitted later against a different reference to produce a second,
+    side-by-side mask — neither re-runs ingest.
 
     Flow:
-      1. Validate --convert-dir (absolute, is_dir), host-ref argument
-         coherence (minimap2 requires rype), and parse --preflight-blob (the
-         same SQLite given to bcl-convert) for each sample's intake
-         human_filtering intent — all before any network call.
+      1. Validate host-ref argument coherence (minimap2 requires rype), and parse
+         --preflight-blob (the same SQLite given to bcl-convert) for each sample's
+         intake human_filtering intent — all before any network call.
       2. List the pool's active samples (run-scoped pool route), then flag any
          sample whose intake human_filtering intent disagrees with this
          submission's pool-wide host-ref choice. Aborts before any ticket POST
@@ -2172,28 +2131,15 @@ def _handle_submit_host_filter_pool(
          tickets instead of one actionable error. (No host refs given skips this.)
       4. Read the run's instrument_model once (GET /sequencing-run) to forward
          per sample so QC's polyG step is gated correctly (nullable).
-      5. Resolve each sample's R1 (required) + R2 (optional) FASTQ under
-         --convert-dir. Resolve ALL samples before any POST so a
-         missing/ambiguous file aborts with zero side effects.
-      6. POST one fastq-to-parquet/1.2.0 ticket per sample (always-on QC; host
-         filtering enabled with the given reference(s), or a pass-through when
-         none is given), scoped to the sample's prep_sample_idx.
+      5. POST one read-mask/1.0.0 ticket per sample (always-on QC; host filtering
+         enabled with the given reference(s), or a pass-through when none is
+         given), scoped to the sample's prep_sample_idx. The runner binds each
+         sample's stored reads (failing the ticket if it was never ingested).
 
-    The pool_item_id == bcl-convert FASTQ basename prefix coupling holds via
-    submit-bcl-convert (sequenced_pool_item_id = str(illumina_sample_idx)) and
-    the pinned run_preflight (Sample_ID emitted as illumina_sample_idx); a
-    future preflight that changes Sample_ID would silently break this match.
-
-    Per-sample 409 (in-flight) / 422 (filename-prefix) are NOT swallowed — they
-    surface so the operator can act, the same as submit-bcl-convert's composer.
+    Per-sample 409 (in-flight) is NOT swallowed — it surfaces so the operator can
+    act, the same as submit-bcl-convert's composer. A sample whose reads were
+    never stored fails its ticket at the runner's staged-read resolution.
     """
-    if not args.convert_dir.is_absolute():
-        parser.error(f"--convert-dir must be absolute, got {args.convert_dir}")
-    if not args.convert_dir.is_dir():
-        parser.error(
-            f"--convert-dir {args.convert_dir} is not a directory; pass the"
-            " bcl-convert ConvertJob output directory, visible from this host"
-        )
     # Host-ref argument coherence, validated before any network call: minimap2 is
     # the optional second stage and never runs without rype.
     if args.host_minimap2_reference_idx is not None and args.host_rype_reference_idx is None:
@@ -2317,58 +2263,32 @@ def _handle_submit_host_filter_pool(
         )
         instrument_model = run.get("instrument_model")
 
-        # Step 4: resolve every sample's FASTQ(s) up front. Collect all errors
-        # so the operator sees the full set, and submit nothing if any fail.
-        resolved: list[tuple[dict, Path, Path | None]] = []
-        errors: list[str] = []
-        for sample in samples:
-            item_id = sample["sequenced_pool_item_id"]
-            label = f"sample {item_id} (prep_sample {sample['prep_sample_idx']})"
-            r1 = _match_pool_item_fastq(args.convert_dir, item_id, "R1", required=True)
-            if isinstance(r1, _FastqMatchError):
-                errors.append(f"{label}: {r1.reason}")
-                continue
-            r2 = _match_pool_item_fastq(args.convert_dir, item_id, "R2", required=False)
-            if isinstance(r2, _FastqMatchError):
-                errors.append(f"{label}: {r2.reason}")
-                continue
-            resolved.append((sample, r1, r2))
-        if errors:
-            sys.stderr.write(
-                "could not resolve FASTQs for every sample; no tickets"
-                " submitted:\n  " + "\n  ".join(errors) + "\n"
-            )
-            raise SystemExit(1)
-
-        # Step 5: one fastq-to-parquet/1.2.0 ticket per sample — always-on QC +
-        # the host filtering chosen on this submission, uniform across the pool. A
-        # given rype reference filters every sample against it (plus the optional
+        # Step 5: one read-mask/1.0.0 ticket per sample — always-on QC + the host
+        # filtering chosen on this submission, uniform across the pool. A given
+        # rype reference filters every sample against it (plus the optional
         # minimap2 reference); with none given each ticket sets
         # host_filter_enabled=False explicitly (a QC-only pass-through), so the
         # ticket records the deliberate no-filter decision. The runner reads these
-        # action_context refs to mint the read mask and drive host_filter.
-        # instrument_model is forwarded only when the run records it (QC defaults
-        # polyG OFF when it's absent).
+        # action_context refs to mint the read mask and drive host_filter, and
+        # binds the sample's already-stored reads. instrument_model is forwarded
+        # only when the run records it (QC defaults polyG OFF when it's absent).
         host_rype = args.host_rype_reference_idx
         host_minimap2 = args.host_minimap2_reference_idx
         host_filter_enabled = host_rype is not None
         per_sample_results: list[dict] = []
-        for sample, r1_path, r2_path in resolved:
+        for sample in samples:
             action_context: dict[str, Any] = {
-                "fastq_path": str(r1_path),
                 "host_filter_enabled": host_filter_enabled,
             }
             if host_filter_enabled:
                 action_context["host_rype_reference_idx"] = host_rype
                 if host_minimap2 is not None:
                     action_context["host_minimap2_reference_idx"] = host_minimap2
-            if r2_path is not None:
-                action_context["reverse_fastq_path"] = str(r2_path)
             if instrument_model is not None:
                 action_context["instrument_model"] = instrument_model
             ticket_body = WorkTicketCreateRequest(
-                action_id=FASTQ_TO_PARQUET_ACTION_ID,
-                action_version=_FASTQ_TO_PARQUET_ACTION_VERSION,
+                action_id=READ_MASK_ACTION_ID,
+                action_version=_READ_MASK_ACTION_VERSION,
                 scope_target={
                     "kind": ScopeTargetKind.PREP_SAMPLE.value,
                     "prep_sample_idx": sample["prep_sample_idx"],
@@ -2386,8 +2306,6 @@ def _handle_submit_host_filter_pool(
                 {
                     "prep_sample_idx": sample["prep_sample_idx"],
                     "sequenced_pool_item_id": sample["sequenced_pool_item_id"],
-                    "fastq_path": str(r1_path),
-                    "reverse_fastq_path": str(r2_path) if r2_path is not None else None,
                     "host_filter_enabled": host_filter_enabled,
                     "host_rype_reference_idx": host_rype if host_filter_enabled else None,
                     "host_minimap2_reference_idx": host_minimap2 if host_filter_enabled else None,
