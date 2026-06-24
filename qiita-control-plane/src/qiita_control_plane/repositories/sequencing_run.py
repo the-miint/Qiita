@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Any
 
 import asyncpg
-from qiita_common.actions import FASTQ_TO_PARQUET_ACTION_ID
+from qiita_common.actions import READ_MASK_ACTION_ID
 from qiita_common.models import Platform
 
 
@@ -493,7 +493,7 @@ async def fetch_sequenced_pool_completion(
         "   count(*) FILTER (WHERE ticket_count = 0) AS samples_not_submitted"
         " FROM sample_state",
         sequenced_pool_idx,
-        FASTQ_TO_PARQUET_ACTION_ID,
+        READ_MASK_ACTION_ID,
     )
 
 

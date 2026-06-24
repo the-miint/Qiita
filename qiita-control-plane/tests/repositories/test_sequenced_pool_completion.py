@@ -2,10 +2,10 @@
 prep-generation completion rollup.
 
 The repo function classifies each non-retired sequenced_sample by the state of
-its fastq-to-parquet work tickets (any version) and tallies the five
+its read-mask work tickets (any version) and tallies the five
 mutually-exclusive buckets (completed / in-flight / no-data / failed /
 not-submitted). Each
-test seeds one principal + one run + one pool + a fastq-to-parquet action, then
+test seeds one principal + one run + one pool + a read-mask action, then
 attaches samples via `add_sample` and tickets via `add_ticket`; cleanup is
 FK-reverse on the shared postgres_pool fixture.
 """
@@ -45,10 +45,10 @@ async def pool_ctx(postgres_pool):
         run_idx,
         owner_idx,
     )
-    # A fastq-to-parquet action row so the work_ticket (action_id, action_version)
-    # FK resolves. The completion query matches on the bare action_id, so the
-    # version is arbitrary here.
-    action_id = "fastq-to-parquet"
+    # A read-mask action row so the work_ticket (action_id, action_version)
+    # FK resolves. The completion query matches on the bare action_id (a sample
+    # is "processed" once it has a mask), so the version is arbitrary here.
+    action_id = "read-mask"
     action_version = f"v-{uuid.uuid4()}"
     await postgres_pool.execute(
         "INSERT INTO qiita.action ("

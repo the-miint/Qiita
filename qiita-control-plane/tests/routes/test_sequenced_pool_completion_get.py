@@ -1,7 +1,7 @@
 """Route tests for GET /sequencing-run/{run}/sequenced-pool/{pool}/completion —
 the pool's prep-generation completion rollup.
 
-Covers the happy path (per-sample fastq-to-parquet tickets bucketed + the
+Covers the happy path (per-sample read-mask tickets bucketed + the
 `complete` flag), the all-completed pool, the empty pool, and the read gate
 (404 missing pool, 422 pool-not-in-run, 401 anonymous, 403 missing scope /
 regular user). Bucket precedence is exercised at the repo layer in
@@ -32,9 +32,9 @@ def ctx(role_keyed_clients):
 
 
 async def _seed_fastq_action(db):
-    """Insert a fastq-to-parquet action so work_ticket FK resolves; return its
+    """Insert a read-mask action so work_ticket FK resolves; return its
     (action_id, version). The completion query matches on the bare action_id."""
-    action_id = "fastq-to-parquet"
+    action_id = "read-mask"
     version = f"v-{uuid.uuid4()}"
     await db.execute(
         "INSERT INTO qiita.action ("
@@ -77,7 +77,7 @@ async def _add_ticket(db, *, action, owner, prep_sample_idx, state):
 
 @pytest_asyncio.fixture
 async def seeded_pool(ctx):
-    """Seed a run + pool with two samples: one with a COMPLETED fastq-to-parquet
+    """Seed a run + pool with two samples: one with a COMPLETED read-mask
     ticket, one with none (not-submitted). FK-reverse cleanup."""
     db = ctx["pool"]
     owner = ctx["wet_session"]["principal_idx"]

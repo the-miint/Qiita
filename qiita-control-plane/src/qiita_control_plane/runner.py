@@ -36,7 +36,11 @@ from qiita_common.actions import (
     WorkflowAction,
     WorkflowStep,
 )
-from qiita_common.api_paths import LibraryPrimitive, compute_upload_staging_path
+from qiita_common.api_paths import (
+    LibraryPrimitive,
+    compute_reads_staging_path,
+    compute_upload_staging_path,
+)
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.compute_backend_client import ComputeBackendClient
 from qiita_common.models import (
@@ -352,6 +356,27 @@ async def run_workflow(
                     workspace=workspace,
                 )
             )
+
+        # Read-ingest bindings (bcl-convert workflow's `ingest_reads` step):
+        # materialize the pool roster as a Parquet and hand the step the scratch
+        # root it writes durable per-sample reads under. Same inside-try
+        # placement as the resolvers above. `convert_dir` is NOT resolved here —
+        # it is the upstream `bcl_convert` step's output, bound during the loop.
+        if _workflow_declares_input(action.steps, SAMPLE_MAP_BINDING):
+            bound.update(await _resolve_sample_map(bound, workspace))
+        if _workflow_declares_input(action.steps, READS_STAGING_ROOT_BINDING):
+            bound[READS_STAGING_ROOT_BINDING] = str(upload_staging_root)
+
+        # Staged-read binding (read-mask workflow): `reads` is consumed by qc /
+        # host_filter but produced by no step, so bind it from the prep_sample's
+        # durable stored reads. Inside-try so an un-ingested sample FAILs cleanly.
+        if _workflow_needs_staged_reads(action.steps):
+            if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+                raise _submission_bad_input(
+                    "a workflow that masks stored reads must be prep_sample-scoped; "
+                    f"got {scope_target['kind']!r}"
+                )
+            bound.update(_resolve_staged_reads(scope_target, upload_staging_root))
 
         # Read-mask identity: when a step threads `mask_idx` through its params
         # (the host_filter step), mint the mask_idx for this filtering config and
@@ -1594,6 +1619,103 @@ async def _resolve_qc_adapters(
             f"default adapter reference {default_adapter_reference_idx}: {exc}"
         ) from exc
     return {QC_ADAPTER_BINDING: adapter_parquet}
+
+
+# =============================================================================
+# Read ingest + staged-read bindings
+# =============================================================================
+#
+# The bcl-convert workflow's `ingest_reads` step stores the pool's reads once;
+# the repeatable read-mask workflow consumes them from a durable, prep_sample-
+# addressable copy. Two runner-side bindings bridge the orchestrator's lack of
+# DB access:
+#   * `sample_map`  — the `{prep_sample_idx, pool_item_id}` roster the CP knows
+#     and the ingest step needs, materialized to a Parquet (like the adapter
+#     set) because `params:` only carry scalars.
+#   * `reads`       — bound from `compute_reads_staging_path` for a mask
+#     workflow, which has no step that produces reads.
+# `reads_staging_root` hands the ingest step the scratch root it writes the
+# durable copies under.
+
+SAMPLE_MAP_BINDING = "sample_map"
+STAGED_READS_BINDING = "reads"
+READS_STAGING_ROOT_BINDING = "reads_staging_root"
+
+
+def _workflow_declares_input(steps: list[Any], name: str) -> bool:
+    """True iff some entry declares `name` among its `inputs`/`optional_inputs`."""
+    for entry in steps:
+        names = list(getattr(entry, "inputs", []) or []) + list(
+            getattr(entry, "optional_inputs", []) or []
+        )
+        if name in names:
+            return True
+    return False
+
+
+def _workflow_needs_staged_reads(steps: list[Any]) -> bool:
+    """True iff `reads` is consumed by some step but produced by none — so it must
+    be bound externally from the prep_sample's stored reads (the read-mask
+    workflow). The bcl-convert workflow produces reads internally (`ingest_reads`
+    emits `read_staging_dir`, not `reads`), so it does not match."""
+    if not _workflow_declares_input(steps, STAGED_READS_BINDING):
+        return False
+    for entry in steps:
+        if STAGED_READS_BINDING in (getattr(entry, "outputs", []) or []):
+            return False
+    return True
+
+
+def _write_sample_map_parquet(roster: list[dict[str, Any]], out_path: Path) -> None:
+    """Write the `{prep_sample_idx, pool_item_id}` roster to a Parquet
+    `(prep_sample_idx BIGINT, pool_item_id VARCHAR)` for the ingest step.
+    pyarrow (already a Flight dependency) writes it directly — no DuckDB needed
+    on the pre-loop path, mirroring `_write_adapter_parquet`."""
+    import pyarrow as pa  # noqa: PLC0415
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    prep = [int(r["prep_sample_idx"]) for r in roster]
+    items = [str(r["pool_item_id"]) for r in roster]
+    table = pa.table(
+        {
+            "prep_sample_idx": pa.array(prep, type=pa.int64()),
+            "pool_item_id": pa.array(items, type=pa.string()),
+        }
+    )
+    pq.write_table(table, str(out_path))
+
+
+async def _resolve_sample_map(action_context: dict[str, Any], workspace: Path) -> dict[str, Path]:
+    """Materialize the bcl-convert pool roster from action_context into a local
+    Parquet for the `ingest_reads` step. Same pre-loop, inside-try placement as
+    the other resolvers so a failure lands in the outer FAILED handler. Raises a
+    SUBMISSION-attributed BAD_INPUT on a missing/empty roster."""
+    roster = action_context.get(SAMPLE_MAP_BINDING)
+    if not roster:
+        raise _submission_bad_input(
+            "an ingest workflow requires a non-empty `sample_map` roster in "
+            "action_context (the CP embeds it at submit-bcl-convert time)"
+        )
+    workspace.mkdir(parents=True, exist_ok=True)
+    out = workspace / "sample_map.parquet"
+    _write_sample_map_parquet(roster, out)
+    return {SAMPLE_MAP_BINDING: out}
+
+
+def _resolve_staged_reads(scope_target: dict[str, Any], staging_root: Path) -> dict[str, Path]:
+    """Bind `reads` to the prep_sample's durable stored reads for a read-mask
+    workflow. The reads were written once by `ingest_reads`; this fails
+    SUBMISSION/BAD_INPUT (so the ticket FAILs cleanly) if they are absent — the
+    sample must be ingested before a mask can be created over it."""
+    prep_sample_idx = scope_target["prep_sample_idx"]
+    reads = compute_reads_staging_path(staging_root, prep_sample_idx)
+    if not reads.exists():
+        raise _submission_bad_input(
+            f"no stored reads for prep_sample {prep_sample_idx} at {reads}; the "
+            "sample must be ingested (submit-bcl-convert stores reads) before a "
+            "read mask can be created over it"
+        )
+    return {STAGED_READS_BINDING: reads}
 
 
 # =============================================================================

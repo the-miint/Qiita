@@ -1,0 +1,143 @@
+action_id: read-mask
+version: 1.0.0
+target_kind: prep_sample
+# Sequenced-only: a mask is over sequencing reads, stored by bcl-convert ingest.
+target_processing_kinds: [sequenced]
+
+description: >
+  Create one read mask over a prep_sample's already-stored reads. The reads
+  are written ONCE by the bcl-convert workflow's `ingest_reads` step (into the
+  DuckLake `read` table plus a durable per-sample copy); this workflow never
+  parses FASTQ or mints a sequence_idx range. It binds those stored reads as
+  `reads` (the runner resolves them from compute_reads_staging_path) and
+  records filtering as a `read_mask` — one row per read: survive / trim / why.
+
+  Because reads are stored once and masks are separate, the SAME reads can be
+  masked repeatedly against different host references: each submission mints a
+  distinct `mask_idx` and writes a side-by-side `read_mask`, all coexisting
+  over the one `read` row set. Run it for host reference 2 now and host
+  reference 4 later — neither re-runs ingest.
+
+  QC (`qc`) is the same fastp-equivalent transform (adapter trim → optional
+  polyG → length/quality filter, fastp `-l 100`), ALWAYS ON, dropping nothing:
+  it emits a partial mask (per read: reason + per-end trims) keyed by
+  sequence_idx. Listing `adapter_parquet` in its inputs signals the runner to
+  materialize the canonical adapter set before the step loop.
+
+  Host filtering (`host_filter`) merges its rype/minimap2 host hits into the QC
+  mask under a privacy precedence (host wins over pass; a QC-failed read keeps
+  its qc_* reason) and emits the final read_mask, which a register-files step
+  loads into the DuckLake `read_mask` table tagged with the CP-minted
+  `mask_idx`. The mask_idx is the filtering-config identity the runner mints
+  before the loop (the host references the host_filter step actually applies,
+  from action_context, plus the resolved QC config), so the same config
+  resolves to one mask_idx fleet-wide. host_filter classifies only the QC-pass
+  subset (trimmed as the masked view would serve them); when host filtering is
+  disabled the mask is the QC mask unchanged.
+
+  host_filter's host indexes are GATED. When action_context sets
+  `host_filter_enabled: true`, `host_rype_reference_idx` names an ACTIVE
+  reference whose rype (.ryxdi) index is bound (required) and the optional
+  `host_minimap2_reference_idx` names a second ACTIVE reference whose minimap2
+  (.mmi) index is bound (the runner's _resolve_host_filter_indexes resolves
+  them and 400s otherwise). When disabled (or omitted) host_filter's index
+  inputs stay unbound and it masks no read as host.
+
+  Per-sample scope (target_kind: prep_sample). The existing one-in-flight-per-
+  prep_sample guard serializes concurrent masks of the same sample; a second
+  mask against a different reference is submitted once the first ticket is
+  terminal.
+
+# persist-read-metrics writes the per-stage read counts onto the sample's
+# sequenced_sample (prep_sample subtype) row, so submitters must hold
+# prep_sample:write (in the USER ceiling, so the audience below is unaffected).
+scopes:
+  - prep_sample:write
+
+audience:
+  service: false
+  human_roles: [user, wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  required: []
+  properties:
+    # Sequencing instrument model (e.g. "NextSeq 550"), forwarded per sample
+    # from qiita.sequencing_run. The qc step gates polyG trimming on a 2-color
+    # model (NextSeq/NovaSeq/MiniSeq); absent/unknown → polyG OFF. Passed to qc
+    # via the step's `params:` (instrument_model -> qc.Inputs.instrument_model),
+    # and folded into the mask identity (different polyG → different mask).
+    instrument_model:
+      type: string
+      minLength: 1
+    # Host-filter gate. `host_filter_enabled` defaults off; when true,
+    # `host_rype_reference_idx` (REQUIRED) names an ACTIVE reference carrying a
+    # rype index, and `host_minimap2_reference_idx` (OPTIONAL) names an ACTIVE
+    # reference carrying a minimap2 index — each from its OWN reference.
+    # NOTE: plain reference idxs, NOT `*_upload_idx` — the upload-handle walker
+    # only touches `_upload_idx` keys, so it leaves these alone.
+    host_filter_enabled:
+      type: boolean
+    host_rype_reference_idx:
+      type: integer
+      minimum: 1
+    host_minimap2_reference_idx:
+      type: integer
+      minimum: 1
+
+steps:
+  # Always-on QC over the stored reads. Emits a PARTIAL read mask (qc_mask: per
+  # read, reason + per-end trims) — it drops nothing. `reads` is runner-bound
+  # from the prep_sample's stored reads (_resolve_staged_reads); `adapter_parquet`
+  # is materialized by the runner before the loop. `instrument_model` rides
+  # through `params:` to gate polyG.
+  - step: qc
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.qc
+    inputs: [reads, adapter_parquet]
+    params: {instrument_model: instrument_model}
+    outputs: [qc_mask]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 12
+      walltime: PT2H
+
+  # Merge host hits into the qc_mask and emit the final read_mask. Consumes the
+  # full `reads` (host classify runs on the trimmed QC-pass subset) and `qc_mask`.
+  # `host_rype_path` / `host_minimap2_path` are bound by the runner ONLY when
+  # host_filter_enabled (optional_inputs). `mask_idx` is threaded via `params:`
+  # — its presence signals the runner to mint the mask before the loop and binds
+  # the value into the step.
+  - step: host_filter
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.host_filter
+    inputs: [reads, qc_mask]
+    optional_inputs: [host_rype_path, host_minimap2_path]
+    params: {mask_idx: mask_idx}
+    # `read_mask` is the final mask path; `read_mask_staging_dir` is the
+    # workspace the register-mask step loads into the DuckLake `read_mask` table.
+    outputs: [read_mask, read_mask_staging_dir]
+    baseline_resources:
+      cpu: 4
+      mem_gb: 16
+      walltime: PT4H
+
+  # Load the final mask into the DuckLake `read_mask` table. read_mask_staging_dir
+  # holds read_mask.parquet, which register-files maps to the `read_mask` table.
+  - action: register-files
+    inputs: [read_mask_staging_dir]
+    outputs: []
+
+  # Persist the per-stage read counts onto this prep_sample's 1:1
+  # sequenced_sample row, DERIVED from the read_mask (raw / biological /
+  # quality-filtered). In-process control-plane action (direct DB write, no
+  # backend hop); writing a prep_sample subtype row is why this workflow
+  # declares prep_sample:write in `scopes`.
+  - action: persist-read-metrics
+    inputs: [read_mask]
+    outputs: []
+
+action_ceiling:
+  cpu: 8
+  mem_gb: 16
+  walltime: PT4H
