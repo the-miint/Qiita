@@ -404,6 +404,15 @@ the `no-changelog` label).
   `read-mask` action (a sample is "processed" once it has a mask). The legacy
   `fastq-to-parquet` workflows remain registered but dormant (no gesture submits
   them); full retirement is a fast-follow.
+- `build_rype_index` rebalances the DuckDB/rype memory split now that
+  `rype_index_create` windows its chunk feed (miint windowed-feed fix): DuckDB's
+  under-SLURM hard cap drops 30 → 8 GB (the windowed feed bounds DuckDB's working
+  set to ~256 MiB per window rather than the whole corpus), handing the freed
+  ~22 GB to rype's in-process index build. rype's `max_memory` now starts ~50 GB
+  at the 64 GB baseline and grows to ~114 GB at the 128 GB OOM-retry ceiling (was
+  ~30 → ~92 GB). The off-SLURM fallbacks (DuckDB 4 GB, rype 30 GB floor) are
+  unchanged. Relies on the windowed-feed miint build being live on the mirror.
+  (#179)
 - The sequenced-pool completion rollup gains a `samples_no_data` bucket and its
   `complete` flag now fires when every active sample is in a terminal-accounted
   state — COMPLETED **or** NO_DATA — instead of requiring every sample COMPLETED.

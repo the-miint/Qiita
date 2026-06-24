@@ -305,25 +305,26 @@ def _run_memory_split(tmp_path, monkeypatch, alloc_gb):
 
 def test_build_rype_index_memory_split_under_slurm(tmp_path, monkeypatch):
     """Under SLURM the cgroup is split DuckDB(bounded) / rype(elastic). DuckDB is
-    hard-capped at `_DUCKDB_MEMORY_CAP_GB` (NOT the 4 GB off-SLURM fallback, which
-    OOMed feeding a genome-scale chunk scan); rype gets the remainder above its
-    floor. At the 64 GB starting allocation + 8-thread headroom (2 + ceil(8*0.5)
-    = 6): DuckDB = min(64-6, 30) = 30 (the cap binds), leaving 64 - 30 - 6 = 28 GB
-    for rype — below its 30 GB floor, so rype gets the floor. Pins both sides."""
+    hard-capped at `_DUCKDB_MEMORY_CAP_GB` (small because `rype_index_create`
+    windows its chunk feed, so DuckDB's working set is bounded by window size, not
+    corpus size); rype gets the remainder above its floor. At the 64 GB starting
+    allocation + 8-thread headroom (2 + ceil(8*0.5) = 6): DuckDB = min(64-6, 8) = 8
+    (the cap binds), leaving 64 - 8 - 6 = 50 GB for rype — above its 30 GB floor,
+    so rype gets the remainder. Pins both sides."""
     captured = _run_memory_split(tmp_path, monkeypatch, alloc_gb=64)
-    # DuckDB hard-capped at _DUCKDB_MEMORY_CAP_GB (30), NOT the 4 GB fallback.
-    assert captured["duckdb_memory_gb"] == 30
-    # Remainder (28) is below rype's _RYPE_MAX_MEMORY_GB floor (30) → floor wins.
-    assert captured["max_memory"] == 30 * 1024**3
+    # DuckDB hard-capped at _DUCKDB_MEMORY_CAP_GB (8), NOT the 4 GB fallback.
+    assert captured["duckdb_memory_gb"] == 8
+    # Remainder (50) is above rype's _RYPE_MAX_MEMORY_GB floor (30) → remainder wins.
+    assert captured["max_memory"] == 50 * 1024**3
 
 
 def test_build_rype_index_rype_memory_grows_on_oom_retry(tmp_path, monkeypatch):
     """rype's `max_memory` increases with each OOM retry. The control plane
     doubles a 64 GB OOM to the 128 GB action_ceiling; at 128 GB DuckDB STAYS
-    capped at 30 (a bigger allocation must not grow DuckDB), so rype's elastic
-    share grows to 128 - 30 - 6 = 92 GB, well above its 30 GB floor."""
+    capped at 8 (a bigger allocation must not grow DuckDB), so rype's elastic
+    share grows to 128 - 8 - 6 = 114 GB, well above its 30 GB floor."""
     captured = _run_memory_split(tmp_path, monkeypatch, alloc_gb=128)
-    # DuckDB unchanged by the bigger allocation — still hard-capped at 30.
-    assert captured["duckdb_memory_gb"] == 30
-    # rype gets (alloc - DuckDB cap - headroom) = 128 - 30 - 6 = 92 GB.
-    assert captured["max_memory"] == 92 * 1024**3
+    # DuckDB unchanged by the bigger allocation — still hard-capped at 8.
+    assert captured["duckdb_memory_gb"] == 8
+    # rype gets (alloc - DuckDB cap - headroom) = 128 - 8 - 6 = 114 GB.
+    assert captured["max_memory"] == 114 * 1024**3
