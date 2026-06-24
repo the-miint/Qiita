@@ -1,14 +1,21 @@
 """Real-miint smoke tests for `qc.execute` (seams NOT stubbed).
 
 Runs the actual `trim_adapters` / `trim_adapters_pe` / `trim_polyg` /
-`filter_read` chain end-to-end and pins the behavior the stubbed unit tests
-cannot see:
+`filter_read` chain end-to-end and pins the MASK behavior the stubbed unit tests
+cannot see. `qc` no longer drops reads — it emits one `qc_mask.parquet` row per
+read `(sequence_idx, reason, left_trim1, right_trim1, left_trim2, right_trim2)`:
 
-  - SE: a 3' adapter is removed, and a read that falls below min_length (100)
-    AFTER trimming is dropped while a long one survives with the insert recovered;
-  - PE: a pair drops when EITHER mate is below min_length after trimming;
+  - SE: a 3' adapter is recorded as `right_trim1` and a read that falls below
+    min_length (100) AFTER trimming is reason `qc_too_short` while a long one is
+    `pass`; applying the recorded trims to the raw read recovers the insert;
+  - PE: a pair is `pass` only when BOTH mates survive; one short mate -> the
+    pair's reason is qc_too_short;
   - polyG is applied ONLY for a 2-color instrument — the same low-quality 3'
-    G-run is trimmed on a NextSeq run but retained on a MiSeq run.
+    G-run inflates `right_trim1` on a NextSeq run but not on a MiSeq run.
+
+The trim-length invariant the read_masked view relies on (a `pass` read's
+`left_trim + right_trim <= length`) is verified by reconstructing the trimmed
+sequence from the raw read + recorded trims.
 
 Runs against the team-mirror miint build (conftest stages it). The
 `write_reads_q` fixture (tests/jobs/conftest.py) owns the quality-carrying
@@ -21,6 +28,7 @@ import asyncio
 from pathlib import Path
 
 import duckdb
+from qiita_common.models import ReadMaskReason
 
 # A clean 120 nt insert (>= the QC min_length of 100). Deliberately G-FREE: a G
 # in the insert tail would let fastp's polyG run extend into high-quality bases
@@ -53,20 +61,25 @@ def _adapter_parquet(tmp_path: Path) -> Path:
     return p
 
 
-def _read_seqs(path: Path) -> dict[int, str]:
-    """Map surviving sequence_idx -> sequence1."""
+def _mask(path: Path) -> dict[int, dict]:
+    """Map sequence_idx -> the mask row as a dict."""
     with duckdb.connect(":memory:") as conn:
-        return {
-            r[0]: r[1]
-            for r in conn.execute(
-                f"SELECT sequence_idx, sequence1 FROM read_parquet('{path}')"
-            ).fetchall()
-        }
+        cur = conn.execute(
+            "SELECT sequence_idx, reason, left_trim1, right_trim1, left_trim2, right_trim2 "
+            f"FROM read_parquet('{path}')"
+        )
+        cols = [d[0] for d in cur.description]
+        return {r[0]: dict(zip(cols, r, strict=True)) for r in cur.fetchall()}
 
 
-def test_qc_smoke_se_adapter_trim_and_length_filter(tmp_path, write_reads_q, read_survivors):
-    """SE: the adaptered long read survives with the insert recovered; the
-    adaptered short read drops below min_length=100 after trimming."""
+def _apply_se_trim(raw: str, m: dict) -> str:
+    """Reconstruct the SE trimmed sequence the read_masked view would serve."""
+    return raw[m["left_trim1"] : len(raw) - m["right_trim1"]]
+
+
+def test_qc_smoke_se_adapter_trim_and_length_filter(tmp_path, write_reads_q):
+    """SE: the adaptered long read is `pass` with the insert recoverable from the
+    recorded trims; the adaptered short read is `qc_too_short` after trimming."""
     from qiita_compute_orchestrator.jobs import qc
 
     long_read = _INSERT + _ADAPTER
@@ -86,14 +99,18 @@ def test_qc_smoke_se_adapter_trim_and_length_filter(tmp_path, write_reads_q, rea
         work_ticket_idx=1,
     )
     out = asyncio.run(qc.execute(inputs, tmp_path / "ws"))
-    assert read_survivors(out["reads"]) == [10]
-    # adapter removed -> the bare insert is recovered.
-    assert _read_seqs(out["reads"])[10] == _INSERT
+    mask = _mask(out["qc_mask"])
+    assert mask[10]["reason"] == ReadMaskReason.PASS.value
+    assert mask[20]["reason"] == ReadMaskReason.QC_TOO_SHORT.value
+    # The recorded trims on the pass read recover the bare insert (adapter is 3').
+    assert _apply_se_trim(long_read, mask[10]) == _INSERT
+    # SE leaves the mate trims NULL.
+    assert mask[10]["left_trim2"] is None and mask[10]["right_trim2"] is None
 
 
-def test_qc_smoke_pe_pair_drop_when_one_mate_short(tmp_path, write_reads_q, read_survivors):
-    """PE: a pair with both mates long survives; a pair with one mate short (after
-    adapter trim) is dropped whole."""
+def test_qc_smoke_pe_pair_reason_when_one_mate_short(tmp_path, write_reads_q):
+    """PE: both mates long -> `pass`; one mate short (after adapter trim) -> the
+    pair is qc_too_short (not pass). PE trims are 3'-only (left trims 0)."""
     from qiita_compute_orchestrator.jobs import qc
 
     r1 = _INSERT + _ADAPTER
@@ -114,13 +131,53 @@ def test_qc_smoke_pe_pair_drop_when_one_mate_short(tmp_path, write_reads_q, read
         work_ticket_idx=1,
     )
     out = asyncio.run(qc.execute(inputs, tmp_path / "ws"))
-    assert read_survivors(out["reads"]) == [30]
+    mask = _mask(out["qc_mask"])
+    assert mask[30]["reason"] == ReadMaskReason.PASS.value
+    assert mask[40]["reason"] == ReadMaskReason.QC_TOO_SHORT.value
+    # PE never populates the left pair (3'-only trimming).
+    assert mask[30]["left_trim1"] == 0 and mask[30]["left_trim2"] == 0
 
 
-def test_qc_smoke_polyg_gated_on_instrument(tmp_path, write_reads_q, read_survivors):
-    """The SAME low-quality 3' G-run is trimmed on a 2-color (NextSeq) run but
-    retained on a non-2-color (MiSeq) run — proving polyG is gated on the
-    instrument model."""
+def test_qc_smoke_n_base_and_low_quality_reasons(tmp_path, write_reads_q):
+    """SE non-length fail reasons map correctly: a read with too many N bases is
+    `qc_too_many_n` (filter_read max_n=5) and a read with too many sub-q15 bases is
+    `qc_low_quality` (filter_read max_unqualified_pct=40). Both stay >= min_length
+    (120 nt) so they cannot trip `length` first; no adapter/N so trimming is inert.
+    """
+    from qiita_compute_orchestrator.jobs import qc
+
+    # 120 nt, 10 N bases (> max_n=5) but all high quality -> n_base.
+    n_read = ("N" * 10) + _INSERT[10:]
+    assert len(n_read) == 120 and n_read.count("N") == 10
+    # 120 nt, no N, but 60 bases (50% > 40%) below qualified_q=15 -> quality.
+    lowq_read = _INSERT
+    lowq_qual = _q(_INSERT[:60], 2) + _q(_INSERT[60:], 35)
+    assert len(lowq_qual) == 120 and sum(1 for q in lowq_qual if q < 15) == 60
+
+    reads = write_reads_q(
+        tmp_path / "reads.parquet",
+        [
+            (60, "n_base", n_read, _q(n_read), None, None),
+            (70, "low_quality", lowq_read, lowq_qual, None, None),
+        ],
+    )
+    inputs = qc.Inputs(
+        reads=reads,
+        adapter_parquet=_adapter_parquet(tmp_path),
+        instrument_model="Illumina MiSeq",  # not 2-color: no polyG
+        prep_sample_idx=5,
+        work_ticket_idx=1,
+    )
+    out = asyncio.run(qc.execute(inputs, tmp_path / "ws"))
+    mask = _mask(out["qc_mask"])
+    assert mask[60]["reason"] == ReadMaskReason.QC_TOO_MANY_N.value
+    assert mask[70]["reason"] == ReadMaskReason.QC_LOW_QUALITY.value
+
+
+def test_qc_smoke_polyg_gated_on_instrument(tmp_path, write_reads_q):
+    """The SAME low-quality 3' G-run inflates right_trim1 on a 2-color (NextSeq)
+    run but not on a non-2-color (MiSeq) run — proving polyG is gated on the
+    instrument model. Both reads are `pass` (>= 100 nt either way)."""
     from qiita_compute_orchestrator.jobs import qc
 
     g_run = "G" * 16
@@ -142,12 +199,12 @@ def test_qc_smoke_polyg_gated_on_instrument(tmp_path, write_reads_q, read_surviv
         prep_sample_idx=5,
         work_ticket_idx=1,
     )
-    ns_out = asyncio.run(qc.execute(nextseq, tmp_path / "ws_ns"))
-    ms_out = asyncio.run(qc.execute(miseq, tmp_path / "ws_ms"))
+    ns_mask = _mask(asyncio.run(qc.execute(nextseq, tmp_path / "ws_ns"))["qc_mask"])
+    ms_mask = _mask(asyncio.run(qc.execute(miseq, tmp_path / "ws_ms"))["qc_mask"])
 
-    # Both survive (>= 100 nt either way), but only the 2-color run had its G-run
-    # trimmed back to the bare insert.
-    assert read_survivors(ns_out["reads"]) == [50]
-    assert read_survivors(ms_out["reads"]) == [50]
-    assert _read_seqs(ns_out["reads"])[50] == _INSERT
-    assert _read_seqs(ms_out["reads"])[50] == seq
+    assert ns_mask[50]["reason"] == ReadMaskReason.PASS.value
+    assert ms_mask[50]["reason"] == ReadMaskReason.PASS.value
+    # Only the 2-color run trimmed the G-run (right_trim1 recovers the bare insert).
+    assert _apply_se_trim(seq, ns_mask[50]) == _INSERT
+    assert ms_mask[50]["right_trim1"] == 0
+    assert _apply_se_trim(seq, ms_mask[50]) == seq

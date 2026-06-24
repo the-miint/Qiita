@@ -15,6 +15,29 @@ the `no-changelog` label).
 
 ### Added
 
+- Producer cutover for the full-read+mask feature (PR 3). The orchestrator now
+  PRODUCES the reads and masks the DuckLake tables consume, replacing the
+  destructive host/QC read-dropping. `ReadMaskReason` (a `qiita-common`
+  `StrEnum`: `pass` / `qc_too_short` / `qc_too_long` / `qc_low_quality` /
+  `qc_too_many_n` / `host_rype` / `host_minimap2`; backs a DuckLake VARCHAR, not
+  a Postgres ENUM, so no `ENUM_PAIRS` entry). `fastq_to_parquet` writes the full
+  reads with a `prep_sample_idx` column (sorted `(prep_sample_idx,
+  sequence_idx)`) and exposes a staging dir so a `register-files` step loads them
+  into the DuckLake `read` table. `qc` stops dropping reads and emits a partial
+  mask (`sequence_idx`, reason, per-end trims) via `filter_read` fail-reason →
+  `ReadMaskReason`. `host_filter` runs rype/minimap2 on the trimmed QC-pass
+  subset, merges host hits into the QC mask under a privacy precedence (host
+  wins over `pass`; QC-failed reads keep their `qc_*` reason), and registers the
+  final `read_mask` (tagged with the CP-minted `mask_idx`) into the DuckLake
+  `read_mask` table. The runner mints `mask_idx` before the step loop (host
+  references from the sample's `sequenced_sample` row + the resolved QC config,
+  deduped on a config hash) and threads it into `host_filter`. `persist-read-metrics`
+  is re-sourced from the mask, counting `COUNT(*) + COUNT(right_trim2)` per
+  reason bucket so paired-end `_r1r2` totals don't silently halve. New workflow
+  `fastq-to-parquet/1.3.0` reflects the new step shape; the dead
+  `qc_reads.parquet` / `filtered_reads.parquet` outputs are removed, and the new
+  COPY/read_parquet/CREATE VIEW path literals route through
+  `validate_parquet_path`. (#172)
 - Data-plane read tables + masked-read view (PR 2 of the full-read+mask
   feature). The data plane now creates the DuckLake `read` and `read_mask`
   tables and the `read_masked` view at startup (`ensure_read_tables`, called

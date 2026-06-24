@@ -89,11 +89,21 @@ def test_execute_writes_reads_parquet_for_fastq(fake_mint, tmp_path):
         tmp_path / "ws",
     )
     parquet = outputs["reads"]
-    assert parquet.name == "reads.parquet"
+    assert parquet.name == "read.parquet"
     assert parquet.exists()
+    # The workspace is exposed as read_staging_dir so a register-files step loads
+    # read.parquet into the DuckLake `read` table.
+    assert outputs["read_staging_dir"] == tmp_path / "ws"
 
     # mint was called once with the exact count.
     assert fake_mint == [(42, 3)]
+
+    # Every read carries the prep_sample_idx scope/prune column.
+    with duckdb.connect(":memory:") as conn:
+        ps = conn.execute(
+            f"SELECT DISTINCT prep_sample_idx FROM read_parquet('{parquet}')"
+        ).fetchall()
+    assert ps == [(42,)]
 
     # Raw read count: 3 single-end reads → 3 reads r1r2 (R1 only),
     # layout 'single'.

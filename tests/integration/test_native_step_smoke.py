@@ -204,9 +204,9 @@ async def test_fastq_to_parquet_through_runner(
     # <workspace_root>/<work_ticket_idx>/<step_name>/attempt-0/. fastq is
     # the YAML step name; this is the SINGLETON-attempt-0 path.
     reads_parquet = (
-        workspace_root / str(work_ticket_idx) / "fastq" / "attempt-0" / "reads.parquet"
+        workspace_root / str(work_ticket_idx) / "fastq" / "attempt-0" / "read.parquet"
     )
-    assert reads_parquet.exists(), f"expected reads.parquet at {reads_parquet}"
+    assert reads_parquet.exists(), f"expected read.parquet at {reads_parquet}"
 
     # Mint helper called exactly once with the fixture's read count.
     assert mint_calls == [(prep_sample_idx, 4)]
@@ -228,13 +228,15 @@ async def test_fastq_to_parquet_through_runner(
             f" DESCRIBE SELECT * FROM '{reads_parquet}')"
         ).fetchall()
         # DuckDB DESCRIBE column order matches the Parquet's physical order.
-        # sequence_idx is the CP-minted join key; read_id stays as a
-        # label. `qual1` is miint's native UTINYINT[] (phred-decoded
-        # scores). sequence2/qual2 are always emitted for schema
-        # uniformity — they're NULL for the unpaired smoke fixture.
-        # No sequence_length column: Parquet row-group metadata + a
-        # length(sequence1) call covers the use cases.
+        # prep_sample_idx is the DuckLake `read` table's scope/prune column
+        # (leading, the file is sorted by (prep_sample_idx, sequence_idx));
+        # sequence_idx is the CP-minted join key; read_id stays as a label.
+        # `qual1` is miint's native UTINYINT[] (phred-decoded scores).
+        # sequence2/qual2 are always emitted for schema uniformity — they're
+        # NULL for the unpaired smoke fixture. No sequence_length column:
+        # Parquet row-group metadata + a length(sequence1) call covers it.
         assert rows == [
+            ("prep_sample_idx", "BIGINT"),
             ("sequence_idx", "BIGINT"),
             ("read_id", "VARCHAR"),
             ("sequence1", "VARCHAR"),

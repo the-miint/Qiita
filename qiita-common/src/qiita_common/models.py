@@ -119,6 +119,35 @@ class ReferenceStatus(StrEnum):
     FAILED = "failed"
 
 
+class ReadMaskReason(StrEnum):
+    """Why a read is kept or dropped by a read mask.
+
+    One value per row of the DuckLake `read_mask` table (the `reason` column).
+    `pass` survives the mask (its recorded trims are applied by the `read_masked`
+    view); every other value excludes the read from `read_masked`. The `qc_*`
+    values come from the `qc` step's `filter_read` fail reasons; the `host_*`
+    values come from the `host_filter` step's rype / minimap2 hits.
+
+    Reason precedence (privacy-critical): a read that both fails QC and hits the
+    host filter records the `host_*` hit, so a host/human read can never leak
+    through a code path that only inspects `qc_*`. Host classification runs only
+    on the QC-pass subset, so `host_*` only ever overrides `pass`.
+
+    Backs a DuckLake VARCHAR column, NOT a Postgres `CREATE TYPE ... AS ENUM`.
+    Per the enum-parity carve-out in CLAUDE.md (a StrEnum backed by a
+    non-Postgres column is a valid, deliberate choice), it has no `ENUM_PAIRS`
+    entry and is out of scope for the parity test.
+    """
+
+    PASS = "pass"
+    QC_TOO_SHORT = "qc_too_short"
+    QC_TOO_LONG = "qc_too_long"
+    QC_LOW_QUALITY = "qc_low_quality"
+    QC_TOO_MANY_N = "qc_too_many_n"
+    HOST_RYPE = "host_rype"
+    HOST_MINIMAP2 = "host_minimap2"
+
+
 class TerminologyStatus(StrEnum):
     """Lifecycle states of a terminology row.
 
