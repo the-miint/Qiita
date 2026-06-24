@@ -80,18 +80,31 @@ pub fn staging_path_for(root: &Path, upload_idx: i64) -> PathBuf {
 }
 
 /// Allowed table names for DoGet queries. Reject anything else.
+///
+/// PRIVACY: `read` and `read_mask` are deliberately absent. Reads are only
+/// reachable through the `read_masked` view, which excludes host/human and
+/// QC-failed rows by construction (`WHERE m.reason = 'pass'`). Raw read access
+/// is via direct DB tooling on the host, never Flight. Do not add `read` or
+/// `read_mask` here.
 const ALLOWED_TABLES: &[&str] = &[
     "reference_sequences",
     "reference_sequence_chunks",
     "reference_taxonomy",
     "reference_phylogeny",
     "reference_placements",
+    "read_masked",
 ];
 
 /// Allowed column names for filter clauses. All identifier columns that can
 /// appear in a signed ticket's filter. Whitelist prevents information leakage
 /// via error messages for non-existent columns.
-const ALLOWED_FILTER_COLUMNS: &[&str] = &["feature_idx", "reference_idx", "node_index"];
+const ALLOWED_FILTER_COLUMNS: &[&str] = &[
+    "feature_idx",
+    "reference_idx",
+    "node_index",
+    "mask_idx",
+    "prep_sample_idx",
+];
 
 #[tonic::async_trait]
 impl FlightService for QiitaFlightService {
@@ -864,7 +877,7 @@ fn move_file(src: &std::path::Path, dest: &std::path::Path) -> Result<(), Status
 /// Build a SQL query for the given table and filter.
 ///
 /// SQL injection defense model:
-/// - Table name: whitelist (`ALLOWED_TABLES`) — only 3 known-safe values
+/// - Table name: whitelist (`ALLOWED_TABLES`) — only known-safe values
 /// - Column names: whitelist (`ALLOWED_FILTER_COLUMNS`) — only known identifier columns
 /// - Values: parsed as i64 then stringified — no string data reaches SQL
 /// - All inputs are also HMAC-verified (set by the control plane, not the client)
@@ -1042,6 +1055,105 @@ mod tests {
         ));
     }
 
+    // DoGet round-trip for read_masked: drive the exact query path do_get uses
+    // (build_query → prepare → query_arrow → get_schema → collect, plus the
+    // empty-result RecordBatch::new_empty branch) against fixture data, and
+    // assert the UTINYINT[] qual column survives as an Arrow List of UInt8.
+    // This pins the one read-path behavior the reference tables don't cover
+    // (they have no list columns): a UTINYINT[] column round-trips through
+    // query_arrow → Arrow.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn read_masked_doget_roundtrips_utinyint_array() {
+        use arrow_schema::DataType;
+
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+
+        // Unique ids so leftover rows never collide with other serial tests.
+        let prep: i64 = 920_000;
+        let mask: i64 = 920_001;
+        let seq: i64 = 920_010;
+
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read WHERE prep_sample_idx = {prep};
+             DELETE FROM qiita_lake.read_mask WHERE prep_sample_idx = {prep};
+             INSERT INTO qiita_lake.read \
+                 (prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2) VALUES \
+                 ({prep}, {seq}, 'r', 'ACGTAC', [5,6,7,8,9,10]::UTINYINT[], NULL, NULL);
+             INSERT INTO qiita_lake.read_mask \
+                 (mask_idx, prep_sample_idx, sequence_idx, reason, left_trim1, right_trim1) VALUES \
+                 ({mask}, {prep}, {seq}, 'pass', 1, 1);"
+        ))
+        .unwrap();
+
+        // Helper that mirrors do_get's query body for read_masked.
+        let run = |filter: &auth::TicketFilter| -> Vec<arrow_array::RecordBatch> {
+            let (sql, _) = build_query("read_masked", filter).unwrap();
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let arrow_result = stmt.query_arrow([]).unwrap();
+            let schema = arrow_result.get_schema();
+            let batches: Vec<_> = arrow_result.collect();
+            if batches.is_empty() {
+                vec![arrow_array::RecordBatch::new_empty(schema)]
+            } else {
+                batches
+            }
+        };
+
+        // Non-empty: the qual1 column is an Arrow List whose items are UInt8.
+        let mut filter = auth::TicketFilter::new();
+        filter.insert("mask_idx".to_string(), vec![serde_json::Value::from(mask)]);
+        filter.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(prep)],
+        );
+        let batches = run(&filter);
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1, "one pass read should round-trip");
+
+        let schema = batches[0].schema();
+        let qual1 = schema.field_with_name("qual1").unwrap();
+        let item_type = match qual1.data_type() {
+            DataType::List(item) | DataType::LargeList(item) => item.data_type().clone(),
+            other => panic!("qual1 should be an Arrow List, got: {other:?}"),
+        };
+        assert_eq!(
+            item_type,
+            DataType::UInt8,
+            "UTINYINT[] must round-trip as a List of UInt8"
+        );
+
+        // Empty-result branch: a mask_idx with no rows yields exactly one empty
+        // batch carrying the schema (do_get's RecordBatch::new_empty path).
+        let mut empty_filter = auth::TicketFilter::new();
+        empty_filter.insert(
+            "mask_idx".to_string(),
+            vec![serde_json::Value::from(mask + 999_999)],
+        );
+        empty_filter.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(prep)],
+        );
+        let empty = run(&empty_filter);
+        assert_eq!(empty.len(), 1, "empty result still yields one schema batch");
+        assert_eq!(empty[0].num_rows(), 0, "the schema batch has no rows");
+        assert!(
+            empty[0].schema().field_with_name("qual1").is_ok(),
+            "empty batch carries the full read_masked schema"
+        );
+
+        // Cleanup.
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read WHERE prep_sample_idx = {prep};
+             DELETE FROM qiita_lake.read_mask WHERE prep_sample_idx = {prep};"
+        ));
+    }
+
     // Regression (data-plane lake-file placement): when `register_files`
     // moves an externally-produced Parquet into managed lake storage, it must
     // NEVER overwrite a file already present there. The reference-load job
@@ -1189,6 +1301,43 @@ mod tests {
         assert!(
             !sql.contains("JOIN"),
             "taxonomy should not use JOIN, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn build_query_read_masked_both_filters() {
+        // read_masked is a plain view: both mask_idx and prep_sample_idx are
+        // integer columns filtered directly via IN clauses (no membership join).
+        let mut filter = auth::TicketFilter::new();
+        filter.insert("mask_idx".to_string(), vec![serde_json::Value::from(7)]);
+        filter.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(11), serde_json::Value::from(12)],
+        );
+        let (sql, table) = build_query("read_masked", &filter).unwrap();
+        assert_eq!(table, "qiita_lake.read_masked");
+        assert!(
+            sql.starts_with("SELECT * FROM qiita_lake.read_masked WHERE"),
+            "expected a plain view select, got: {sql}"
+        );
+        assert!(sql.contains("mask_idx IN (7)"), "got: {sql}");
+        assert!(sql.contains("prep_sample_idx IN (11,12)"), "got: {sql}");
+        assert!(
+            !sql.contains("JOIN"),
+            "read_masked is a plain view, no membership JOIN, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn build_query_read_masked_rejects_bad_column() {
+        // sequence_idx is a column of the view but is NOT an allowed filter
+        // column, so a ticket filtering on it must be rejected.
+        let mut filter = auth::TicketFilter::new();
+        filter.insert("sequence_idx".to_string(), vec![serde_json::Value::from(1)]);
+        let result = build_query("read_masked", &filter);
+        assert!(
+            result.is_err(),
+            "sequence_idx is not an allowed filter column"
         );
     }
 

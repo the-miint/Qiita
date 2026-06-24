@@ -15,6 +15,18 @@ the `no-changelog` label).
 
 ### Added
 
+- Data-plane read tables + masked-read view (PR 2 of the full-read+mask
+  feature). The data plane now creates the DuckLake `read` and `read_mask`
+  tables and the `read_masked` view at startup (`ensure_read_tables`, called
+  alongside `ensure_reference_tables`; idempotent via `CREATE TABLE/VIEW IF NOT
+  EXISTS`, the view is catalog-stored so it persists across DP restarts).
+  `read_masked` joins `read` to `read_mask`, applies the recorded per-mate trims
+  (`substr` on the sequence, list-slice on the `UTINYINT[]` qual), and excludes
+  every non-`pass` row (`WHERE m.reason = 'pass'`), so host/human and QC-failed
+  reads are unreachable by construction. `read_masked` added to the Flight
+  `ALLOWED_TABLES`, and `mask_idx`/`prep_sample_idx` to `ALLOWED_FILTER_COLUMNS`;
+  raw `read`/`read_mask` are deliberately NOT Flight-reachable. No producer of
+  read data yet (PR 3). (#171)
 - Read-mask identity + masked-read DoGet route (PR 1 of the full-read+mask
   feature). New `qiita.mask_definition` table + `qiita.mint_mask_definition`
   function mint a `mask_idx` identifying a read-filtering config, deduplicated on
