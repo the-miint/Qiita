@@ -1038,22 +1038,20 @@ class SequencedSampleListItem(BaseModel):
 
     Carries the subtype idx, its supertype prep_sample_idx and biosample_idx,
     the sequenced_pool_item_id (which equals the bcl-convert per-sample FASTQ
-    basename prefix), the per-sample host-filter references, and the ENA
-    experiment/run plus biosample/ena-sample accessions. Lets a caller fan out
-    per-sample work — the pool host-filter fan-out reads
-    host_rype_reference_idx / host_minimap2_reference_idx to set each ticket's
-    filtering, and ENA experiment submission needs the biosample's BioSample
-    accession as the sample_descriptor — without an N+1 of per-idx GETs. The
-    accession columns are nullable until their submissions succeed; the two host
-    reference columns are NULL when the sample is not host-filtered.
+    basename prefix), and the ENA experiment/run plus biosample/ena-sample
+    accessions. Lets a caller fan out per-sample work — the pool host-filter
+    fan-out matches each sample's FASTQs by sequenced_pool_item_id, and ENA
+    experiment submission needs the biosample's BioSample accession as the
+    sample_descriptor — without an N+1 of per-idx GETs. The accession columns
+    are nullable until their submissions succeed. Host references are not a
+    sample property: they parameterize the read mask and are supplied at
+    human-filter submission, not carried here.
     """
 
     sequenced_sample_idx: int
     prep_sample_idx: int
     biosample_idx: int
     sequenced_pool_item_id: str
-    host_rype_reference_idx: int | None
-    host_minimap2_reference_idx: int | None
     ena_experiment_accession: str | None
     ena_run_accession: str | None
     biosample_accession: str | None
@@ -2228,27 +2226,8 @@ class SequencedSampleCreateRequest(BaseModel):
     secondary_study_idxs: list[Annotated[int, Field(gt=0)]] = Field(default_factory=list)
     metadata: dict[str, str] = Field(default_factory=dict)
     metadata_checklist_name: str | None = Field(default=None, min_length=1)
-    # Per-sample host-filter references, set at creation (submit-bcl-convert maps
-    # the preflight human_filtering flag). Both None -> no host filtering;
-    # host_minimap2_reference_idx may only be set alongside host_rype_reference_idx
-    # (the workflow's rype-required / minimap2-optional rule, mirrored by the DB
-    # CHECK and the validator below).
-    host_rype_reference_idx: Annotated[int, Field(gt=0)] | None = None
-    host_minimap2_reference_idx: Annotated[int, Field(gt=0)] | None = None
     ena_experiment_accession: str | None = Field(default=None, max_length=50)
     ena_run_accession: str | None = Field(default=None, max_length=50)
-
-    @model_validator(mode="after")
-    def minimap2_requires_rype(self):
-        # minimap2 is the optional second host-filter stage; it never runs
-        # without rype. Reject the half-specified pair at the wire boundary,
-        # defense-in-depth with the DB CHECK.
-        if self.host_minimap2_reference_idx is not None and self.host_rype_reference_idx is None:
-            raise ValueError(
-                "host_minimap2_reference_idx requires host_rype_reference_idx"
-                " (minimap2 is the optional second stage, never standalone)"
-            )
-        return self
 
     @model_validator(mode="after")
     def dedupe_secondary_study_idxs(self):
@@ -2320,11 +2299,6 @@ class SequencedSampleResponse(BaseModel):
     metadata_checklist: MetadataChecklistRef | None
     sequenced_pool_idx: int | None
     sequenced_pool_item_id: str | None
-    # Per-sample host-filter references (NULL/NULL -> not host-filtered). Set at
-    # creation from the preflight; the pool fan-out forwards them to
-    # fastq-to-parquet's host_rype_reference_idx / host_minimap2_reference_idx.
-    host_rype_reference_idx: int | None
-    host_minimap2_reference_idx: int | None
     ena_experiment_accession: str | None
     ena_run_accession: str | None
     last_submission_at: AwareDatetime | None

@@ -19,11 +19,24 @@ _None yet._
 
 ### 2. One-time host setup
 
-_None yet._
+- Wipe all legacy sequenced / sequenced-pool sample data BEFORE the deploy. These
+  samples predate the lake-read model — their reads were never registered into
+  DuckLake — and the `sequenced_sample.host_rype_reference_idx` /
+  `host_minimap2_reference_idx` columns they carry are being dropped (bucket 3).
+  Delete the pools through the CLI (system_admin; per pool):
+
+  ```bash
+  qiita delete-sequenced-pool --sequencing-run-idx <R> --sequenced-pool-idx <P> --force
+  ```
+
+  Run this before the migration; the drop migration is a single relocate with no
+  data-preservation step, so there must be no legacy sample data to strand. (#174)
 
 ### 3. Migrations
 
-_None yet._
+- `20260624000000_drop_sequenced_sample_host_references.sql` — drops the two
+  host-reference columns (and their FKs + the minimap2-requires-rype CHECK) from
+  `qiita.sequenced_sample`. Plain `make migrate` (after the bucket-2 wipe). (#174)
 
 ### 4. Deploy
 
@@ -41,6 +54,18 @@ _None yet._
 
 ### Notes (no host action)
 
+- Soft API change (PR 4 of the full-read+mask feature): host references moved off
+  `sequenced_sample` onto the human-filter submission. Sequenced-sample GET
+  responses and the pool/run sample-list rows no longer carry
+  `host_rype_reference_idx` / `host_minimap2_reference_idx`; `seqsample-create` /
+  `submit-bcl-convert` no longer accept them. The operator now passes
+  `--host-rype-reference-idx` (and optional `--host-minimap2-reference-idx`) to
+  `qiita submit-host-filter-pool` — pool-wide for that submission, omitted for a
+  QC-only pass-through. `prep_protocol_idx` is unchanged. `submit-host-filter-pool`
+  now also **requires** `--preflight-blob` (the same kl-run-preflight SQLite given
+  to `submit-bcl-convert`): it cross-checks each sample's intake `human_filtering`
+  intent against the host-ref choice and aborts on a mismatch unless `--force` is
+  passed. (#174)
 - The full-read+mask producer cutover (PR 3) ships `fastq-to-parquet/1.3.0`,
   which writes the full reads into the DuckLake `read` table and a downstream
   `read_mask` (PRs 1–2 already deployed the `mask_definition` table + the

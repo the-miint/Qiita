@@ -342,30 +342,17 @@ async def test_import_sequenced_sample_from_run_wet_lab_admin_minimal(ctx):
     assert dict(ss_row) == expected_ss_row
 
 
-async def _seed_reference(ctx, *, suffix: str) -> int:
-    """Insert a minimal qiita.reference and track it for FK-reverse teardown."""
-    ref_idx = await ctx["pool"].fetchval(
-        "INSERT INTO qiita.reference (name, version, kind, created_by_idx)"
-        " VALUES ($1, '1.0', 'sequence_reference', $2) RETURNING reference_idx",
-        f"host-ref-{suffix}-{_unique_item_id(suffix)}",
-        ctx["wet_session"]["principal_idx"],
-    )
-    ctx["created"]["reference"].append(ref_idx)
-    return ref_idx
-
-
-async def test_import_sequenced_sample_persists_host_references(ctx):
-    # A sample created with both host references round-trips them through the
-    # sequenced_sample row and the GET response.
+async def test_import_sequenced_sample_rejects_host_references(ctx):
+    # Host references are not a sample-creation property — they parameterize the
+    # read mask and are supplied at human-filter submission. The create request
+    # forbids unknown keys, so a stray host-ref key is rejected (422) and never
+    # reaches a column (the columns no longer exist).
     run_idx, pool_idx = await _seed_run_and_pool(ctx, "wet-host")
     study_idx = await _seed_study(ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="host")
     bs_idx = await _seed_biosample_linked_to_study(
         ctx, owner_idx=ctx["wet_session"]["principal_idx"], study_idx=study_idx
     )
     protocol_idx = await _fetch_prep_protocol_idx(ctx)
-    rype_idx = await _seed_reference(ctx, suffix="rype")
-    minimap2_idx = await _seed_reference(ctx, suffix="mm2")
-    item_id = _unique_item_id("WET-HOST")
 
     resp = await _post_sequenced_sample(
         ctx["wet"],
@@ -375,54 +362,11 @@ async def test_import_sequenced_sample_persists_host_references(ctx):
         biosample_idx=bs_idx,
         prep_protocol_idx=protocol_idx,
         owner_idx=ctx["wet_session"]["principal_idx"],
-        sequenced_pool_item_id=item_id,
+        sequenced_pool_item_id=_unique_item_id("WET-HOST"),
         primary_study_idx=study_idx,
-        host_rype_reference_idx=rype_idx,
-        host_minimap2_reference_idx=minimap2_idx,
+        host_rype_reference_idx=7,
     )
-    assert resp.status_code == 201, resp.text
-    ss_idx = resp.json()["sequenced_sample_idx"]
-
-    row = await ctx["pool"].fetchrow(
-        "SELECT host_rype_reference_idx, host_minimap2_reference_idx"
-        " FROM qiita.sequenced_sample WHERE idx = $1",
-        ss_idx,
-    )
-    assert row["host_rype_reference_idx"] == rype_idx
-    assert row["host_minimap2_reference_idx"] == minimap2_idx
-
-    get = await ctx["wet"].get(URL_SEQUENCED_SAMPLE_BY_IDX.format(sequenced_sample_idx=ss_idx))
-    assert get.status_code == 200, get.text
-    body = get.json()
-    assert body["host_rype_reference_idx"] == rype_idx
-    assert body["host_minimap2_reference_idx"] == minimap2_idx
-
-
-async def test_import_sequenced_sample_bad_host_reference_422(ctx):
-    # A host_rype_reference_idx that names no reference is a 422 FK violation.
-    run_idx, pool_idx = await _seed_run_and_pool(ctx, "wet-badhost")
-    study_idx = await _seed_study(
-        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="badhost"
-    )
-    bs_idx = await _seed_biosample_linked_to_study(
-        ctx, owner_idx=ctx["wet_session"]["principal_idx"], study_idx=study_idx
-    )
-    protocol_idx = await _fetch_prep_protocol_idx(ctx)
-
-    resp = await _post_sequenced_sample(
-        ctx["wet"],
-        ctx,
-        run_idx,
-        pool_idx,
-        biosample_idx=bs_idx,
-        prep_protocol_idx=protocol_idx,
-        owner_idx=ctx["wet_session"]["principal_idx"],
-        sequenced_pool_item_id=_unique_item_id("WET-BADHOST"),
-        primary_study_idx=study_idx,
-        host_rype_reference_idx=999_999_999,
-    )
-    assert resp.status_code == 422
-    assert "host_rype_reference_idx" in resp.json()["detail"]
+    assert resp.status_code == 422, resp.text
 
 
 async def test_import_sequenced_sample_from_run_with_metadata(ctx):
@@ -1384,10 +1328,6 @@ def _expected_read_response(
         "metadata_checklist": None,
         "sequenced_pool_idx": seeded["pool_idx"],
         "sequenced_pool_item_id": seeded["item_id"],
-        # Host-filter references: NULL on a freshly-imported sample (no host
-        # filtering recorded unless submit-bcl-convert set them).
-        "host_rype_reference_idx": None,
-        "host_minimap2_reference_idx": None,
         "ena_experiment_accession": None,
         "ena_run_accession": None,
         "last_submission_at": None,
@@ -1679,8 +1619,6 @@ async def _seed_pool_sample(ctx, *, run_idx, pool_idx, study_idx, protocol_idx, 
         "prep_sample_idx": rj["prep_sample_idx"],
         "biosample_idx": bs,
         "sequenced_pool_item_id": item_id,
-        "host_rype_reference_idx": None,
-        "host_minimap2_reference_idx": None,
         "ena_experiment_accession": None,
         "ena_run_accession": None,
         "biosample_accession": None,

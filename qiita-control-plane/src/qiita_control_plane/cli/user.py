@@ -1023,29 +1023,6 @@ def _build_parser() -> argparse.ArgumentParser:
             " the per-row study_idx already does (project.qiita_id)."
         ),
     )
-    p_submit_bcl.add_argument(
-        "--host-rype-reference-idx",
-        type=int,
-        default=None,
-        help=(
-            "ACTIVE host reference_idx whose rype (.ryxdi) index every"
-            " human_filtering sample is depleted against. REQUIRED when any"
-            " preflight sample has human_filtering set; recorded per sample so the"
-            " later pool fan-out host-filters exactly those samples (preflight"
-            " human_filtering=0 samples get no host reference and are not"
-            " filtered). Checked ACTIVE + carrying a rype index up front."
-        ),
-    )
-    p_submit_bcl.add_argument(
-        "--host-minimap2-reference-idx",
-        type=int,
-        default=None,
-        help=(
-            "Optional ACTIVE host reference_idx whose minimap2 (.mmi) index drives"
-            " the second host-filter pass for human_filtering samples. Requires"
-            " --host-rype-reference-idx. Omit for a rype-only host filter."
-        ),
-    )
     p_submit_bcl.set_defaults(handler=_handle_submit_bcl_convert)
 
     p_delete_pool = sub.add_parser(
@@ -1095,28 +1072,27 @@ def _build_parser() -> argparse.ArgumentParser:
         "submit-host-filter-pool",
         help=(
             "Bundled operator gesture: after a bcl-convert pool finishes, fan"
-            " out one fastq-to-parquet ticket per sample, host-filtering each"
-            " against the reference(s) recorded on it at submit-bcl-convert."
+            " out one fastq-to-parquet ticket per sample, host-filtering every"
+            " sample against the host reference(s) given on THIS submission."
         ),
         description=(
             "For every active sequenced_sample in --sequenced-pool-idx, locate"
             " its per-sample FASTQ(s) under --convert-dir (matched on the"
             " sequenced_pool_item_id == bcl-convert Sample_ID prefix) and submit"
             " a fastq-to-parquet/1.2.0 work-ticket: always-on QC (fastp-equivalent"
-            " adapter/polyG/length trimming) followed by PER-SAMPLE host filtering."
-            " The host reference is NOT a CLI argument — each sample carries the"
-            " host reference(s) recorded on it at submit-bcl-convert time (from the"
-            " preflight's per-project human_filtering flag). A sample with a"
-            " recorded host_rype_reference_idx is depleted against it (plus its"
-            " optional host_minimap2_reference_idx); a sample with no recorded host"
-            " reference (human_filtering=0) runs QC-only, host filtering disabled"
-            " (a pass-through). Every DISTINCT recorded reference is checked for"
-            " ACTIVE status + its required index up front, and every sample's"
-            " FASTQs are resolved before any ticket is submitted, so a"
-            " misconfiguration aborts with zero side effects. The run's"
-            " instrument_model is read once (GET /sequencing-run) and forwarded per"
-            " sample so QC's polyG step is gated correctly. Re-running after a"
-            " partial failure is safe: disallow-without-delete is keyed per"
+            " adapter/polyG/length trimming) followed by host filtering. The host"
+            " reference is a property of THIS filtering config, not of the sample:"
+            " --host-rype-reference-idx (with optional --host-minimap2-reference-idx)"
+            " names the reference(s) every sample in the pool is depleted against."
+            " Omit them to run QC-only with host filtering disabled (a pass-through"
+            " for the whole pool). The same reads can be re-submitted later against"
+            " a different host reference to produce a second, side-by-side mask."
+            " Each given reference is checked for ACTIVE status + its required index"
+            " up front, and every sample's FASTQs are resolved before any ticket is"
+            " submitted, so a misconfiguration aborts with zero side effects. The"
+            " run's instrument_model is read once (GET /sequencing-run) and"
+            " forwarded per sample so QC's polyG step is gated correctly. Re-running"
+            " after a partial failure is safe: disallow-without-delete is keyed per"
             " prep_sample, so only samples without an in-flight/terminal ticket are"
             " re-submitted. ASSUMPTIONS: --convert-dir must be visible from this"
             " host (the per-sample FASTQs are read off the shared compute"
@@ -1146,6 +1122,51 @@ def _build_parser() -> argparse.ArgumentParser:
             " visible from this host. Searched recursively for each sample's"
             " <pool_item_id>_*_R1_*.fastq.gz (and _R2_ when paired-end), since"
             " bcl-convert nests per-sample FASTQs under a Sample_Project subdir."
+        ),
+    )
+    p_submit_hf.add_argument(
+        "--host-rype-reference-idx",
+        type=int,
+        default=None,
+        help=(
+            "ACTIVE host reference_idx whose rype (.ryxdi) index every sample in"
+            " the pool is depleted against for this submission. Omit to run the"
+            " whole pool QC-only with host filtering disabled. Checked ACTIVE +"
+            " carrying a rype index up front. Re-submitting the same pool against a"
+            " different reference produces a second, side-by-side read mask."
+        ),
+    )
+    p_submit_hf.add_argument(
+        "--host-minimap2-reference-idx",
+        type=int,
+        default=None,
+        help=(
+            "Optional ACTIVE host reference_idx whose minimap2 (.mmi) index drives"
+            " the second host-filter pass on rype's survivors. Requires"
+            " --host-rype-reference-idx. Omit for a rype-only host filter."
+        ),
+    )
+    p_submit_hf.add_argument(
+        "--preflight-blob",
+        type=Path,
+        required=True,
+        help=(
+            "The same kl-run-preflight SQLite given to submit-bcl-convert for this"
+            " pool. Its per-project human_filtering flags are the intake intent for"
+            " each sample; host filtering is now applied pool-wide, so before"
+            " submitting, every sample's intake intent is checked against this"
+            " submission's host-reference choice (a host reference filters, none is"
+            " a pass-through). A sample whose intent disagrees aborts the submission"
+            " unless --force is passed."
+        ),
+    )
+    p_submit_hf.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Proceed even when some samples' intake human_filtering intent"
+            " disagrees with this submission's pool-wide host-reference choice."
+            " The mismatch is printed as a warning instead of aborting."
         ),
     )
     p_submit_hf.set_defaults(handler=_handle_submit_host_filter_pool)
@@ -1804,28 +1825,11 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
     # land as parser.error / exit 2.
     preflight_rows = _read_preflight_rows(args.preflight_blob, parser)
 
-    # Host-filter argument coherence, validated before any network call:
-    #   - minimap2 is the optional second stage; it never runs without rype.
-    #   - if any sample requests human_filtering, --host-rype-reference-idx must
-    #     name the host reference to record on those samples; without it those
-    #     samples would silently never be host-filtered.
-    if args.host_minimap2_reference_idx is not None and args.host_rype_reference_idx is None:
-        parser.error("--host-minimap2-reference-idx requires --host-rype-reference-idx")
-    any_human_filtering = any(row.human_filtering for row in preflight_rows)
-    if any_human_filtering and args.host_rype_reference_idx is None:
-        parser.error(
-            "the preflight has human_filtering samples but no"
-            " --host-rype-reference-idx was given; pass the host reference to"
-            " deplete them against (preflight human_filtering=0 samples are left"
-            " unfiltered)"
-        )
-    if args.host_rype_reference_idx is not None and not any_human_filtering:
-        # Not fatal, but the operator likely expected the reference to take
-        # effect — every sample's per-row guard leaves it unrecorded.
-        sys.stderr.write(
-            "warning: --host-rype-reference-idx was given but no preflight sample"
-            " has human_filtering set; no sample will record a host reference\n"
-        )
+    # Host filtering is not decided here: it is a filtering-config choice made at
+    # submit-host-filter-pool, where the host reference parameterizes the read
+    # mask. bcl-convert only demultiplexes the run; the preflight's per-project
+    # human_filtering flag is still echoed per sample below so the operator knows
+    # which samples the run intended to deplete when choosing those later args.
 
     # One-pass order-preserving dedup over preflight_rows so the lookup
     # route's `missing` echo is deterministic; the study side pools each
@@ -1882,28 +1886,6 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
             _print_missing_accession_error(preflight_rows, missing_biosamples, missing_studies)
             raise SystemExit(1)
 
-        # Host-reference readiness — only when at least one sample is host-
-        # filtered. Fail the whole gesture before any run/pool/sample side effect
-        # if a designated host reference can't filter (not ACTIVE / missing its
-        # index), so the operator sees one actionable error instead of samples
-        # recorded against an unusable reference.
-        if any_human_filtering:
-            _assert_host_reference_ready(
-                args.base_url,
-                token,
-                args.host_rype_reference_idx,
-                HOST_FILTER_INDEX_TYPE_RYPE,
-                "--host-rype-reference-idx",
-            )
-            if args.host_minimap2_reference_idx is not None:
-                _assert_host_reference_ready(
-                    args.base_url,
-                    token,
-                    args.host_minimap2_reference_idx,
-                    HOST_FILTER_INDEX_TYPE_MINIMAP2,
-                    "--host-minimap2-reference-idx",
-                )
-
         run_resp, run_status = _common.call_with_status(
             "POST",
             args.base_url,
@@ -1936,18 +1918,6 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
         per_sample_results: list[dict] = []
         for row in preflight_rows:
             secondary_study_idxs = [resolved_studies[a] for a in row.secondary_project_accessions]
-            # human_filtering samples record the operator's host reference(s) so
-            # the pool fan-out depletes them; human_filtering=0 samples carry no
-            # host reference and are left unfiltered. Only set the keys when
-            # filtering applies so an unfiltered sample's body stays minimal
-            # (the model defaults both to None == no host filtering).
-            host_rype = args.host_rype_reference_idx if row.human_filtering else None
-            host_minimap2 = args.host_minimap2_reference_idx if row.human_filtering else None
-            host_kwargs: dict[str, int] = {}
-            if host_rype is not None:
-                host_kwargs["host_rype_reference_idx"] = host_rype
-                if host_minimap2 is not None:
-                    host_kwargs["host_minimap2_reference_idx"] = host_minimap2
             sample_body = SequencedSampleCreateRequest(
                 biosample_idx=resolved_biosamples[row.biosample_accession],
                 owner_idx=owner_idx,
@@ -1955,7 +1925,6 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
                 sequenced_pool_item_id=str(row.illumina_sample_idx),
                 primary_study_idx=resolved_studies[row.primary_project_accession],
                 secondary_study_idxs=secondary_study_idxs,
-                **host_kwargs,
             ).model_dump(exclude_unset=True, mode="json")
             sample_path = PATH_SEQUENCED_SAMPLE_FROM_RUN.format(
                 sequencing_run_idx=sequencing_run_idx,
@@ -1975,9 +1944,11 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
                     "biosample_idx": resolved_biosamples[row.biosample_accession],
                     "primary_study_idx": resolved_studies[row.primary_project_accession],
                     "secondary_study_idxs": secondary_study_idxs,
+                    # The preflight's per-project human_filtering flag is echoed
+                    # for operator reference — it no longer pins a host reference
+                    # on the sample; host filtering is chosen at
+                    # submit-host-filter-pool time.
                     "human_filtering": row.human_filtering,
-                    "host_rype_reference_idx": host_rype,
-                    "host_minimap2_reference_idx": host_minimap2,
                     "sequenced_sample_idx": sample_resp["sequenced_sample_idx"],
                 }
             )
@@ -2127,36 +2098,39 @@ def _handle_submit_host_filter_pool(
     args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> int:
     """Fan out one QC'd fastq-to-parquet/1.2.0 ticket per active
-    sequenced_sample in a completed bcl-convert pool, host-filtering each sample
-    against the reference(s) recorded on it at submit-bcl-convert time.
+    sequenced_sample in a completed bcl-convert pool, host-filtering every sample
+    against the host reference(s) given on THIS submission.
 
-    Host filtering is PER SAMPLE, not a CLI argument: each sample carries its own
-    host_rype_reference_idx / host_minimap2_reference_idx (set from the
-    preflight's per-project human_filtering at submit-bcl-convert). A sample with
-    a recorded rype reference is depleted against it (plus its optional minimap2
-    reference); a sample with no recorded reference (human_filtering=0) runs
-    QC-only with host filtering disabled — a pass-through. This is the only
-    fan-out path for an unfiltered sample.
+    Host filtering is a property of the filtering config, not of the sample:
+    --host-rype-reference-idx (with optional --host-minimap2-reference-idx) names
+    the reference(s) every sample in the pool is depleted against for this
+    submission, parameterizing the read mask the run produces. Omitting both runs
+    the whole pool QC-only with host filtering disabled (a pass-through). The same
+    reads can be re-submitted later against a different reference to produce a
+    second, side-by-side mask.
 
     Flow:
-      1. Validate --convert-dir (absolute, is_dir) before any network call.
-      2. List the pool's active samples (run-scoped pool route), reading each
-         one's recorded host references.
-      3. Pre-flight every DISTINCT recorded reference: a rype reference must be
-         ACTIVE + carry a rype index; a minimap2 reference must be ACTIVE +
-         carry a minimap2 index. A bad reference here would otherwise fail every
-         ticket that uses it at the runner's submission stage
-         (_resolve_host_filter_indexes) — N FAILED tickets instead of one
-         actionable error. (A pool with no filtered samples skips this entirely.)
+      1. Validate --convert-dir (absolute, is_dir), host-ref argument
+         coherence (minimap2 requires rype), and parse --preflight-blob (the
+         same SQLite given to bcl-convert) for each sample's intake
+         human_filtering intent — all before any network call.
+      2. List the pool's active samples (run-scoped pool route), then flag any
+         sample whose intake human_filtering intent disagrees with this
+         submission's pool-wide host-ref choice. Aborts before any ticket POST
+         unless --force downgrades the mismatch to a warning.
+      3. Pre-flight the given host reference(s): a rype reference must be ACTIVE +
+         carry a rype index; a minimap2 reference must be ACTIVE + carry a
+         minimap2 index. A bad reference here would otherwise fail every ticket at
+         the runner's submission stage (_resolve_host_filter_indexes) — N FAILED
+         tickets instead of one actionable error. (No host refs given skips this.)
       4. Read the run's instrument_model once (GET /sequencing-run) to forward
          per sample so QC's polyG step is gated correctly (nullable).
       5. Resolve each sample's R1 (required) + R2 (optional) FASTQ under
          --convert-dir. Resolve ALL samples before any POST so a
          missing/ambiguous file aborts with zero side effects.
       6. POST one fastq-to-parquet/1.2.0 ticket per sample (always-on QC; host
-         filtering enabled with the sample's recorded reference(s), or a
-         pass-through when none is recorded), scoped to the sample's
-         prep_sample_idx.
+         filtering enabled with the given reference(s), or a pass-through when
+         none is given), scoped to the sample's prep_sample_idx.
 
     The pool_item_id == bcl-convert FASTQ basename prefix coupling holds via
     submit-bcl-convert (sequenced_pool_item_id = str(illumina_sample_idx)) and
@@ -2173,10 +2147,29 @@ def _handle_submit_host_filter_pool(
             f"--convert-dir {args.convert_dir} is not a directory; pass the"
             " bcl-convert ConvertJob output directory, visible from this host"
         )
+    # Host-ref argument coherence, validated before any network call: minimap2 is
+    # the optional second stage and never runs without rype.
+    if args.host_minimap2_reference_idx is not None and args.host_rype_reference_idx is None:
+        parser.error("--host-minimap2-reference-idx requires --host-rype-reference-idx")
+
+    # Parse the pool's preflight (local SQLite, no network) up front: it carries
+    # each sample's intake human_filtering intent, which the pool-wide host-ref
+    # mismatch guard below compares against this submission's choice. Errors here
+    # are operator-actionable and exit 2 via parser.error before any network call.
+    if not args.preflight_blob.is_file():
+        parser.error(f"--preflight-blob {args.preflight_blob} is not a regular file")
+    if not args.preflight_blob.read_bytes():
+        parser.error(f"--preflight-blob {args.preflight_blob} is empty")
+    preflight_rows = _read_preflight_rows(args.preflight_blob, parser)
+    # sequenced_pool_item_id == str(illumina_sample_idx) (the submit-bcl-convert
+    # coupling), so the roster joins to the preflight on this string key.
+    human_filtering_by_item_id = {
+        str(row.illumina_sample_idx): row.human_filtering for row in preflight_rows
+    }
+    applying_host_filter = args.host_rype_reference_idx is not None
 
     def _run(token: str) -> dict:
-        # Step 1: enumerate the pool's active samples (single round trip). Each
-        # carries the per-sample host reference(s) recorded at submit-bcl-convert.
+        # Step 1: enumerate the pool's active samples (single round trip).
         pool_list_path = PATH_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
             sequencing_run_idx=args.sequencing_run_idx,
             sequenced_pool_idx=args.sequenced_pool_idx,
@@ -2195,38 +2188,76 @@ def _handle_submit_host_filter_pool(
             )
             raise SystemExit(1)
 
-        # Step 2: pre-flight every DISTINCT recorded host reference before any
-        # ticket — one actionable error instead of N FAILED tickets. Dedup by
-        # (reference_idx, index_type): a reference used as rype on one sample and
-        # minimap2 on another (it carries both indexes) is checked once per role.
-        # Sorted for a deterministic round-trip / error order. A pool with no
-        # filtered samples checks nothing.
-        rype_refs = {
-            s["host_rype_reference_idx"]
-            for s in samples
-            if s.get("host_rype_reference_idx") is not None
-        }
-        minimap2_refs = {
-            s["host_minimap2_reference_idx"]
-            for s in samples
-            if s.get("host_minimap2_reference_idx") is not None
-        }
-        for reference_idx in sorted(rype_refs):
+        # Step 1.5: host filtering is applied pool-wide, so flag any sample whose
+        # intake human_filtering intent disagrees with this submission's choice
+        # (a host reference depletes human reads; none is a pass-through). A
+        # flagged-human sample submitted with no host reference would keep its
+        # human reads; a not-flagged sample submitted with a host reference would
+        # be filtered against the operator's intent. Either is a likely mistake —
+        # fail fast before any ticket POST unless --force overrides it.
+        # The join is roster-driven: we check every pool member against its
+        # preflight intent. A blob row with no matching pool member is ignored by
+        # design (you only filter what is in the pool); the reverse — a pool
+        # member with no blob row — is the broken-coupling case handled below.
+        mismatched: list[str] = []
+        for sample in samples:
+            item_id = sample["sequenced_pool_item_id"]
+            intent = human_filtering_by_item_id.get(item_id)
+            if intent is None:
+                # The preflight has no row for this pool item — the
+                # bcl-convert/preflight coupling is broken; surface it.
+                sys.stderr.write(
+                    f"--preflight-blob {args.preflight_blob} has no row for"
+                    f" sequenced_pool_item_id {item_id!r} (prep_sample"
+                    f" {sample['prep_sample_idx']}); verify it is the same"
+                    " preflight given to submit-bcl-convert for this pool\n"
+                )
+                raise SystemExit(1)
+            if intent != applying_host_filter:
+                mismatched.append(
+                    f"  - sequenced_pool_item_id {item_id} (prep_sample"
+                    f" {sample['prep_sample_idx']}): intake human_filtering="
+                    f"{intent}"
+                )
+        if mismatched:
+            choice = (
+                f"apply host reference {args.host_rype_reference_idx}"
+                if applying_host_filter
+                else "run QC-only with host filtering disabled (a pass-through)"
+            )
+            header = (
+                "host filtering is applied pool-wide, but these samples' intake"
+                f" human_filtering intent disagrees with this submission, which"
+                f" would {choice} for every sample:\n"
+                + "\n".join(mismatched)
+                + "\nSubmit the matching subset, re-run with the opposite"
+                " host-reference choice, or pass --force to apply this pool-wide"
+                " choice anyway.\n"
+            )
+            if not args.force:
+                sys.stderr.write(header)
+                raise SystemExit(1)
+            sys.stderr.write("WARNING (--force): " + header)
+
+        # Step 2: pre-flight the given host reference(s) before any ticket — one
+        # actionable error instead of N FAILED tickets. No host refs given (the
+        # whole-pool pass-through) checks nothing.
+        if args.host_rype_reference_idx is not None:
             _assert_host_reference_ready(
                 args.base_url,
                 token,
-                reference_idx,
+                args.host_rype_reference_idx,
                 HOST_FILTER_INDEX_TYPE_RYPE,
-                "host_rype_reference_idx",
+                "--host-rype-reference-idx",
             )
-        for reference_idx in sorted(minimap2_refs):
-            _assert_host_reference_ready(
-                args.base_url,
-                token,
-                reference_idx,
-                HOST_FILTER_INDEX_TYPE_MINIMAP2,
-                "host_minimap2_reference_idx",
-            )
+            if args.host_minimap2_reference_idx is not None:
+                _assert_host_reference_ready(
+                    args.base_url,
+                    token,
+                    args.host_minimap2_reference_idx,
+                    HOST_FILTER_INDEX_TYPE_MINIMAP2,
+                    "--host-minimap2-reference-idx",
+                )
 
         # Step 3: the run's instrument_model gates QC's polyG; read it once and
         # forward per sample. Nullable (a non-bcl run may not record it).
@@ -2263,17 +2294,19 @@ def _handle_submit_host_filter_pool(
             raise SystemExit(1)
 
         # Step 5: one fastq-to-parquet/1.2.0 ticket per sample — always-on QC +
-        # the sample's recorded host filtering. A sample with a recorded rype
-        # reference filters against it (plus its optional minimap2 reference); a
-        # sample with none recorded sets host_filter_enabled=False explicitly (a
-        # QC-only pass-through), so the ticket records the deliberate no-filter
-        # decision. instrument_model is forwarded only when the run records it
-        # (QC defaults polyG OFF when it's absent).
+        # the host filtering chosen on this submission, uniform across the pool. A
+        # given rype reference filters every sample against it (plus the optional
+        # minimap2 reference); with none given each ticket sets
+        # host_filter_enabled=False explicitly (a QC-only pass-through), so the
+        # ticket records the deliberate no-filter decision. The runner reads these
+        # action_context refs to mint the read mask and drive host_filter.
+        # instrument_model is forwarded only when the run records it (QC defaults
+        # polyG OFF when it's absent).
+        host_rype = args.host_rype_reference_idx
+        host_minimap2 = args.host_minimap2_reference_idx
+        host_filter_enabled = host_rype is not None
         per_sample_results: list[dict] = []
         for sample, r1_path, r2_path in resolved:
-            host_rype = sample.get("host_rype_reference_idx")
-            host_minimap2 = sample.get("host_minimap2_reference_idx")
-            host_filter_enabled = host_rype is not None
             action_context: dict[str, Any] = {
                 "fastq_path": str(r1_path),
                 "host_filter_enabled": host_filter_enabled,
