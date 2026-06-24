@@ -67,25 +67,34 @@ YAML_STEP_NAME = "build_rype_index"
 # The literals here are the OFF-SLURM fallbacks (local backend / tests). Under
 # SLURM the split tracks the real cgroup: DuckDB = min(alloc − headroom,
 # `_DUCKDB_MEMORY_CAP_GB`), rype = (allocation − DuckDB − headroom) floored at the
-# `_RYPE_MAX_MEMORY_GB` fallback. The DuckDB cap is NOT the 4 GB fallback: feeding
-# a genome-scale chunk scan (the full sequence bytes, streamed to rype's read)
-# needs well more than 4 GB — a human host reference (T2T-CHM13) OOMed DuckDB at
-# ~3.7 GB under the 4 GB cap while reading `rype_chunk_input`, before rype's
-# `max_memory` was ever exercised.
+# `_RYPE_MAX_MEMORY_GB` fallback.
+#
+# DuckDB's cap is small because `rype_index_create` now WINDOWS its chunk feed:
+# instead of one corpus-wide `ORDER BY` over the 64 KB BLOBs — which DuckDB cannot
+# spill, and which OOMed DuckDB at ~3.7 GB on a human host reference (T2T-CHM13)
+# under the old 4 GB cap, before rype's `max_memory` was ever exercised — the feed
+# is read in bounded ~256 MiB windows, each sorted independently. DuckDB's working
+# set is now bounded by WINDOW size, not corpus size: even one oversized feature
+# (a human chromosome ≈ 256 MB of chunk data, its sort inflating several-fold
+# across the 8 threads) sits comfortably under a few GB. 8 GB is well clear of
+# that real per-window peak — bigger than the 4 GB off-SLURM fallback only to keep
+# scan/decompress headroom. This relies on the windowed-feed miint build being
+# live on the mirror; a pre-windowing build still does the corpus-wide sort and
+# would need the old ~30 GB cap.
 #
 # Sizing for a large host set (many human genomes): the build_rype_index step
 # starts at 64 GB (YAML baseline) and an OOM retry doubles it to the 128 GB action
-# ceiling. DuckDB is hard-capped at 30 GB at BOTH sizes (a bigger allocation must
-# not grow DuckDB), so the elastic rype share is 64−30−6 = 28 GB at the start
-# (floored up to 30 GB) and 128−30−6 = 92 GB on the escalated retry — i.e. rype's
-# `max_memory` starts at 30 GB and grows with each OOM retry. Tune the cap against
-# a real genome-scale DuckDB MaxRSS — the DuckDB/rype split here is the one knob
-# this step exposes.
+# ceiling. DuckDB is hard-capped at 8 GB at BOTH sizes (a bigger allocation must
+# not grow DuckDB), so the elastic rype share is 64−8−6 = 50 GB at the start and
+# 128−8−6 = 114 GB on the escalated retry — i.e. rype's `max_memory` starts at
+# 50 GB and grows with each OOM retry. Tune the cap against a real genome-scale
+# DuckDB MaxRSS — the DuckDB/rype split here is the one knob this step exposes.
 _DUCKDB_MEMORY_GB = 4
 # Under-SLURM HARD ceiling for DuckDB's share (see the split note above): DuckDB
 # stays bounded at this size even as an OOM retry grows the cgroup, so the extra
-# memory flows to rype. The 4 GB fallback only applies off-SLURM.
-_DUCKDB_MEMORY_CAP_GB = 30
+# memory flows to rype. Safe at this size only because the rype feed is windowed
+# (see above). The 4 GB fallback only applies off-SLURM.
+_DUCKDB_MEMORY_CAP_GB = 8
 _DUCKDB_THREADS = 8
 # rype's `max_memory` floor (GB) — also the off-SLURM fallback. Under SLURM rype
 # gets max(this, alloc − DuckDB − headroom), so this is the STARTING budget and it
@@ -187,12 +196,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     duckdb_tmp = workspace / ".duckdb_tmp"
     duckdb_tmp.mkdir(parents=True, exist_ok=True)
 
-    # DuckDB share stays bounded (cap at `_DUCKDB_MEMORY_CAP_GB`, big enough to
-    # feed a genome-scale chunk scan — NOT the 4 GB fallback, which OOMed on
-    # T2T-CHM13); rype gets the rest of the cgroup. Off SLURM both fall back to
-    # their literals (4 + 30). The headroom subtracted from rype's share is the
-    # same margin DuckDB reserves under the cgroup, so the two stay in lockstep
-    # from one source.
+    # DuckDB share stays bounded (cap at `_DUCKDB_MEMORY_CAP_GB`); rype gets the
+    # rest of the cgroup. The cap is small because `rype_index_create` windows its
+    # chunk feed (see the split note above), so DuckDB's working set is bounded by
+    # window size, not corpus size. Off SLURM both fall back to their literals
+    # (4 + 30). The headroom subtracted from rype's share is the same margin DuckDB
+    # reserves under the cgroup, so the two stay in lockstep from one source.
     duckdb_memory_gb = resolve_duckdb_memory_gb(
         _DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS, cap_gb=_DUCKDB_MEMORY_CAP_GB
     )
