@@ -2910,12 +2910,11 @@ def test__read_preflight_rows_round_trips_library_tuples(preflight_stub):
     assert rows[0].secondary_project_accessions is not library_secondaries
 
 
-def test_submit_bcl_convert_records_host_refs_for_human_filtering(
-    monkeypatch, tmp_path, capsys, preflight_stub
-):
-    """A human_filtering sample's composer POST carries the host rype + minimap2
-    reference idxs; a non-human_filtering sample in the same pool carries
-    neither. The two host references are checked ACTIVE + indexed up front."""
+def test_submit_bcl_convert_records_no_host_refs(monkeypatch, tmp_path, capsys, preflight_stub):
+    """bcl-convert only demultiplexes the run: no sequenced-sample composer POST
+    carries a host reference (host filtering is chosen later at
+    submit-host-filter-pool). The preflight's per-project human_filtering flag is
+    still echoed per sample for operator reference."""
     import json as _json
 
     from qiita_control_plane.cli.user import main
@@ -2934,10 +2933,6 @@ def test_submit_bcl_convert_records_host_refs_for_human_filtering(
             (200, {"kind": "human", "principal_idx": 99}),  # whoami
             (200, {"resolved": {"SAMN001": 41, "SAMN002": 42}, "missing": []}),  # biosample
             (200, {"resolved": {"PRJ001": 70}, "missing": []}),  # study
-            (200, _ref_active_body()),  # rype reference readiness
-            (200, _both_indexes_body()),  # rype index list (carries rype)
-            (200, _ref_active_body()),  # minimap2 reference readiness
-            (200, _both_indexes_body()),  # minimap2 index list (carries minimap2)
             (201, {"sequencing_run_idx": 12}),
             (201, {"sequenced_pool_idx": 34}),
             (201, {"sequenced_sample_idx": 71, "prep_sample_idx": 81}),
@@ -2957,37 +2952,28 @@ def test_submit_bcl_convert_records_host_refs_for_human_filtering(
             str(blob),
             "--prep-protocol-idx",
             "7",
-            "--host-rype-reference-idx",
-            "7",
-            "--host-minimap2-reference-idx",
-            "8",
         ]
     )
     assert rc == 0
+    # No host-reference readiness GET is made — bcl-convert does not host-filter.
+    assert not [r for r in captured["requests"] if "/reference/" in r["url"]]
     sample_posts = [
         r for r in captured["requests"] if r["method"] == "POST" and "sequenced-sample" in r["url"]
     ]
-    by_item = {r["json"]["sequenced_pool_item_id"]: r["json"] for r in sample_posts}
-    # human_filtering=True sample (illumina_sample_idx 1) carries both refs.
-    assert by_item["1"]["host_rype_reference_idx"] == 7
-    assert by_item["1"]["host_minimap2_reference_idx"] == 8
-    # human_filtering=False sample (idx 2) carries neither.
-    assert "host_rype_reference_idx" not in by_item["2"]
-    assert "host_minimap2_reference_idx" not in by_item["2"]
-    # Summary echoes the per-sample host filtering decision.
+    for post in sample_posts:
+        assert "host_rype_reference_idx" not in post["json"]
+        assert "host_minimap2_reference_idx" not in post["json"]
+    # Summary still echoes the per-project human_filtering flag for reference.
     summary = _json.loads(capsys.readouterr().out)
     by_illumina = {s["illumina_sample_idx"]: s for s in summary["sequenced_samples"]}
     assert by_illumina[1]["human_filtering"] is True
-    assert by_illumina[1]["host_rype_reference_idx"] == 7
     assert by_illumina[2]["human_filtering"] is False
-    assert by_illumina[2]["host_rype_reference_idx"] is None
+    assert "host_rype_reference_idx" not in by_illumina[1]
 
 
-def test_submit_bcl_convert_human_filtering_without_rype_ref_errors(
-    monkeypatch, tmp_path, capsys, preflight_stub
-):
-    """A preflight with a human_filtering sample but no --host-rype-reference-idx
-    aborts at argument validation (exit 2) before any network call."""
+def test_submit_bcl_convert_rejects_host_ref_args(monkeypatch, tmp_path, capsys, preflight_stub):
+    """submit-bcl-convert no longer accepts host-reference args — they belong to
+    submit-host-filter-pool. argparse rejects the unknown flag (exit 2)."""
     from qiita_control_plane.cli.user import main
 
     folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
@@ -3008,45 +2994,12 @@ def test_submit_bcl_convert_human_filtering_without_rype_ref_errors(
                 str(blob),
                 "--prep-protocol-idx",
                 "7",
-            ]
-        )
-    assert exc_info.value.code == 2
-    assert "human_filtering samples but no --host-rype-reference-idx" in capsys.readouterr().err
-
-
-def test_submit_bcl_convert_minimap2_without_rype_errors(
-    monkeypatch, tmp_path, capsys, preflight_stub
-):
-    """--host-minimap2-reference-idx without --host-rype-reference-idx is rejected
-    (minimap2 is the optional second stage, never standalone)."""
-    from qiita_control_plane.cli.user import main
-
-    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
-    blob = preflight_stub(
-        rows=[(1, "SAMN001", "PRJ001", [])],
-        project_by_idx={1: "NOFILT"},
-        filtering_by_project={"NOFILT": False},
-    )
-    with pytest.raises(SystemExit) as exc_info:
-        main(
-            [
-                "--base-url",
-                "https://q.example.test",
-                "submit-bcl-convert",
-                "--bcl-input-dir",
-                str(folder),
-                "--preflight-blob",
-                str(blob),
-                "--prep-protocol-idx",
+                "--host-rype-reference-idx",
                 "7",
-                "--host-minimap2-reference-idx",
-                "8",
             ]
         )
     assert exc_info.value.code == 2
-    assert "--host-minimap2-reference-idx requires --host-rype-reference-idx" in (
-        capsys.readouterr().err
-    )
+    assert "--host-rype-reference-idx" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -3107,23 +3060,19 @@ def _both_indexes_body(reference_idx=7):
 
 
 def _pool_samples_body(samples):
-    """samples: list of either
-        (sequenced_sample_idx, prep_sample_idx, pool_item_id)  -> no host refs, or
-        (sequenced_sample_idx, prep_sample_idx, pool_item_id, rype, minimap2)
-    where rype/minimap2 are the recorded per-sample host reference idxs (or None).
-    The 3-tuple form records no host references (an unfiltered, pass-through
-    sample)."""
+    """samples: list of (sequenced_sample_idx, prep_sample_idx, pool_item_id).
+
+    Host references are no longer a sample property — they are chosen at
+    submit-host-filter-pool time, so the sample-list rows carry none. Tuples may
+    still carry trailing entries (ignored) so callers built for the old per-sample
+    form still construct."""
 
     def _row(entry):
         ss, ps, item = entry[0], entry[1], entry[2]
-        rype = entry[3] if len(entry) > 3 else None
-        minimap2 = entry[4] if len(entry) > 4 else None
         return {
             "sequenced_sample_idx": ss,
             "prep_sample_idx": ps,
             "sequenced_pool_item_id": item,
-            "host_rype_reference_idx": rype,
-            "host_minimap2_reference_idx": minimap2,
         }
 
     return {
@@ -3132,6 +3081,25 @@ def _pool_samples_body(samples):
         "truncated": False,
         "caller_system_role": "wet_lab_admin",
     }
+
+
+def _hf_preflight(preflight_stub, intent_by_item_id):
+    """Build a preflight blob (via preflight_stub) whose per-sample intake
+    human_filtering intent matches `intent_by_item_id` (item_id str -> bool).
+
+    Each pool item_id (== str(illumina_sample_idx)) becomes one preflight row
+    on its own project, with that project's human_filtering flag set to the
+    given intent. The host-filter-pool guard joins the roster to this on the
+    item_id key.
+    """
+    rows = [(int(item_id), f"SAMN{item_id}", f"PRJ{item_id}", []) for item_id in intent_by_item_id]
+    project_by_idx = {int(item_id): f"PRJ{item_id}" for item_id in intent_by_item_id}
+    filtering_by_project = {
+        f"PRJ{item_id}": intent for item_id, intent in intent_by_item_id.items()
+    }
+    return preflight_stub(
+        rows=rows, project_by_idx=project_by_idx, filtering_by_project=filtering_by_project
+    )
 
 
 def _seq_run_body(*, sequencing_run_idx=3, instrument_model="NextSeq 550"):
@@ -3154,35 +3122,47 @@ def _seq_run_body(*, sequencing_run_idx=3, instrument_model="NextSeq 550"):
     }
 
 
-def _run_submit_host_filter_pool(convert_dir, *, run=3, pool=5):
+def _run_submit_host_filter_pool(
+    convert_dir, *, run=3, pool=5, rype=None, minimap2=None, preflight_blob=None, force=False
+):
     from qiita_control_plane.cli.user import main
 
-    return main(
-        [
-            "submit-host-filter-pool",
-            "--sequencing-run-idx",
-            str(run),
-            "--sequenced-pool-idx",
-            str(pool),
-            "--convert-dir",
-            str(convert_dir),
-        ]
-    )
+    argv = [
+        "submit-host-filter-pool",
+        "--sequencing-run-idx",
+        str(run),
+        "--sequenced-pool-idx",
+        str(pool),
+        "--convert-dir",
+        str(convert_dir),
+        "--preflight-blob",
+        str(preflight_blob),
+    ]
+    if rype is not None:
+        argv += ["--host-rype-reference-idx", str(rype)]
+    if minimap2 is not None:
+        argv += ["--host-minimap2-reference-idx", str(minimap2)]
+    if force:
+        argv += ["--force"]
+    return main(argv)
 
 
-def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(monkeypatch, tmp_path, capsys):
-    """Two paired-end samples, each recording rype reference 7 → two
-    fastq-to-parquet/1.2.0 POSTs, each with always-on QC, host_filter_enabled
-    against the sample's recorded rype reference, the run's instrument_model
-    forwarded, and scoped to the sample's prep_sample_idx. The shared rype
-    reference is pre-flighted exactly once (deduped)."""
+def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(
+    monkeypatch, tmp_path, capsys, preflight_stub
+):
+    """Two paired-end samples, host-filtered against the submission's rype
+    reference 7 → two fastq-to-parquet/1.2.0 POSTs, each with always-on QC,
+    host_filter_enabled against that reference, the run's instrument_model
+    forwarded, and scoped to the sample's prep_sample_idx. The rype reference is
+    pre-flighted exactly once (at submission, not per-sample)."""
     convert_dir = _seed_convert_dir(tmp_path, ["10", "11"], paired=True)
+    blob = _hf_preflight(preflight_stub, {"10": True, "11": True})
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
         responses=[
-            (200, _pool_samples_body([(100, 1000, "10", 7), (101, 1001, "11", 7)])),
+            (200, _pool_samples_body([(100, 1000, "10"), (101, 1001, "11")])),
             (200, _ref_active_body()),  # rype reference 7 (pre-flighted once)
             (200, _both_indexes_body()),  # its index list (carries rype)
             (200, _seq_run_body(instrument_model="NextSeq 550")),  # run metadata
@@ -3191,7 +3171,7 @@ def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(monkeypatch, tmp
         ],
     )
 
-    rc = _run_submit_host_filter_pool(convert_dir)
+    rc = _run_submit_host_filter_pool(convert_dir, rype=7, preflight_blob=blob)
     assert rc == 0
 
     # The shared rype reference is GET-pre-flighted once, not once per sample.
@@ -3218,17 +3198,18 @@ def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(monkeypatch, tmp
         assert ctx["reverse_fastq_path"].endswith(f"{item_id}_S1_L001_R2_001.fastq.gz")
 
 
-def test_submit_host_filter_pool_two_reference_forwards_both(monkeypatch, tmp_path):
-    """A sample recording both a rype (7) and a minimap2 (8) reference →
+def test_submit_host_filter_pool_two_reference_forwards_both(monkeypatch, tmp_path, preflight_stub):
+    """A submission giving both a rype (7) and a minimap2 (8) reference →
     each is pre-flighted (reference + its index) and both flow into the
     per-sample action_context."""
     convert_dir = _seed_convert_dir(tmp_path, ["10"], paired=True)
+    blob = _hf_preflight(preflight_stub, {"10": True})
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
         responses=[
-            (200, _pool_samples_body([(100, 1000, "10", 7, 8)])),
+            (200, _pool_samples_body([(100, 1000, "10")])),
             (200, _ref_active_body(reference_idx=7)),  # rype reference
             (200, [_both_indexes_body()[0]]),  # rype-only index list
             (200, _ref_active_body(reference_idx=8)),  # minimap2 reference
@@ -3238,7 +3219,7 @@ def test_submit_host_filter_pool_two_reference_forwards_both(monkeypatch, tmp_pa
         ],
     )
 
-    rc = _run_submit_host_filter_pool(convert_dir)
+    rc = _run_submit_host_filter_pool(convert_dir, rype=7, minimap2=8, preflight_blob=blob)
     assert rc == 0
     post = next(r for r in captured["requests"] if r["method"] == "POST")
     ctx = post["json"]["action_context"]
@@ -3248,23 +3229,25 @@ def test_submit_host_filter_pool_two_reference_forwards_both(monkeypatch, tmp_pa
     assert ctx["instrument_model"] == "NovaSeq 6000"
 
 
-def test_submit_host_filter_pool_unfiltered_sample_is_passthrough(monkeypatch, tmp_path):
-    """A sample with no recorded host reference (preflight human_filtering=0) →
-    a QC-only ticket with host_filter_enabled=False and no reference keys. With
-    no filtered sample in the pool, NO reference is pre-flighted."""
+def test_submit_host_filter_pool_no_refs_is_passthrough(monkeypatch, tmp_path, preflight_stub):
+    """Omitting both host-ref args → every sample gets a QC-only ticket with
+    host_filter_enabled=False and no reference keys. With no host ref given, NO
+    reference is pre-flighted."""
     convert_dir = _seed_convert_dir(tmp_path, ["10"], paired=True)
+    # No host ref applied → every sample's intake intent must be not-human-filtered.
+    blob = _hf_preflight(preflight_stub, {"10": False})
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
         responses=[
-            (200, _pool_samples_body([(100, 1000, "10")])),  # no host refs recorded
+            (200, _pool_samples_body([(100, 1000, "10")])),
             (200, _seq_run_body(instrument_model="NextSeq 550")),
             (202, {"work_ticket_idx": 900}),
         ],
     )
 
-    rc = _run_submit_host_filter_pool(convert_dir)
+    rc = _run_submit_host_filter_pool(convert_dir, preflight_blob=blob)
     assert rc == 0
     # No /reference/ pre-flight GET at all when nothing is host-filtered.
     assert not [r for r in captured["requests"] if "/reference/" in r["url"]]
@@ -3275,17 +3258,18 @@ def test_submit_host_filter_pool_unfiltered_sample_is_passthrough(monkeypatch, t
     assert "host_minimap2_reference_idx" not in ctx
 
 
-def test_submit_host_filter_pool_mixed_filtered_and_passthrough(monkeypatch, tmp_path):
-    """A pool mixing a filtered sample (rype 7) and an unfiltered one →
-    one host_filter_enabled ticket + one pass-through ticket; only the one
-    recorded reference is pre-flighted."""
+def test_submit_host_filter_pool_applies_ref_to_every_sample(monkeypatch, tmp_path, preflight_stub):
+    """The submission's host reference applies uniformly across the whole pool:
+    every sample's ticket is host_filter_enabled against the given rype 7, and
+    the reference is pre-flighted exactly once at submission."""
     convert_dir = _seed_convert_dir(tmp_path, ["10", "11"], paired=True)
+    blob = _hf_preflight(preflight_stub, {"10": True, "11": True})
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
         responses=[
-            (200, _pool_samples_body([(100, 1000, "10", 7), (101, 1001, "11")])),
+            (200, _pool_samples_body([(100, 1000, "10"), (101, 1001, "11")])),
             (200, _ref_active_body()),  # rype reference 7
             (200, _both_indexes_body()),
             (200, _seq_run_body(instrument_model="NextSeq 550")),
@@ -3294,7 +3278,7 @@ def test_submit_host_filter_pool_mixed_filtered_and_passthrough(monkeypatch, tmp
         ],
     )
 
-    rc = _run_submit_host_filter_pool(convert_dir)
+    rc = _run_submit_host_filter_pool(convert_dir, rype=7, preflight_blob=blob)
     assert rc == 0
     posts = [r for r in captured["requests"] if r["method"] == "POST"]
     by_prep = {
@@ -3302,19 +3286,24 @@ def test_submit_host_filter_pool_mixed_filtered_and_passthrough(monkeypatch, tmp
     }
     assert by_prep[1000]["host_filter_enabled"] is True
     assert by_prep[1000]["host_rype_reference_idx"] == 7
-    assert by_prep[1001]["host_filter_enabled"] is False
-    assert "host_rype_reference_idx" not in by_prep[1001]
+    assert by_prep[1001]["host_filter_enabled"] is True
+    assert by_prep[1001]["host_rype_reference_idx"] == 7
+    ref_gets = [
+        r for r in captured["requests"] if r["method"] == "GET" and "/reference/" in r["url"]
+    ]
+    assert len([r for r in ref_gets if r["url"].endswith("/reference/7")]) == 1
 
 
-def test_submit_host_filter_pool_single_end_omits_reverse(monkeypatch, tmp_path):
+def test_submit_host_filter_pool_single_end_omits_reverse(monkeypatch, tmp_path, preflight_stub):
     """A sample with only an R1 file → no reverse_fastq_path in the context."""
     convert_dir = _seed_convert_dir(tmp_path, ["10"], paired=False)
+    blob = _hf_preflight(preflight_stub, {"10": True})
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
         responses=[
-            (200, _pool_samples_body([(100, 1000, "10", 7)])),
+            (200, _pool_samples_body([(100, 1000, "10")])),
             (200, _ref_active_body()),
             (200, _both_indexes_body()),
             (200, _seq_run_body()),
@@ -3322,22 +3311,25 @@ def test_submit_host_filter_pool_single_end_omits_reverse(monkeypatch, tmp_path)
         ],
     )
 
-    rc = _run_submit_host_filter_pool(convert_dir)
+    rc = _run_submit_host_filter_pool(convert_dir, rype=7, preflight_blob=blob)
     assert rc == 0
     post = next(r for r in captured["requests"] if r["method"] == "POST")
     assert "reverse_fastq_path" not in post["json"]["action_context"]
 
 
-def test_submit_host_filter_pool_instrument_model_absent_omitted(monkeypatch, tmp_path):
+def test_submit_host_filter_pool_instrument_model_absent_omitted(
+    monkeypatch, tmp_path, preflight_stub
+):
     """When the run records no instrument_model (null), the per-sample context
     omits the key — QC then defaults polyG OFF."""
     convert_dir = _seed_convert_dir(tmp_path, ["10"], paired=False)
+    blob = _hf_preflight(preflight_stub, {"10": True})
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
         responses=[
-            (200, _pool_samples_body([(100, 1000, "10", 7)])),
+            (200, _pool_samples_body([(100, 1000, "10")])),
             (200, _ref_active_body()),
             (200, _both_indexes_body()),
             (200, _seq_run_body(instrument_model=None)),
@@ -3345,15 +3337,16 @@ def test_submit_host_filter_pool_instrument_model_absent_omitted(monkeypatch, tm
         ],
     )
 
-    rc = _run_submit_host_filter_pool(convert_dir)
+    rc = _run_submit_host_filter_pool(convert_dir, rype=7, preflight_blob=blob)
     assert rc == 0
     post = next(r for r in captured["requests"] if r["method"] == "POST")
     assert "instrument_model" not in post["json"]["action_context"]
 
 
-def test_submit_host_filter_pool_rejects_relative_convert_dir(capsys):
+def test_submit_host_filter_pool_rejects_relative_convert_dir(capsys, tmp_path, preflight_stub):
     from qiita_control_plane.cli.user import main
 
+    blob = _hf_preflight(preflight_stub, {"10": True})
     with pytest.raises(SystemExit) as exc_info:
         main(
             [
@@ -3364,15 +3357,32 @@ def test_submit_host_filter_pool_rejects_relative_convert_dir(capsys):
                 "5",
                 "--convert-dir",
                 "relative/ConvertJob",
+                "--preflight-blob",
+                str(blob),
             ]
         )
     assert exc_info.value.code == 2
     assert "--convert-dir must be absolute" in capsys.readouterr().err
 
 
-def test_submit_host_filter_pool_rejects_nondir_convert_dir(capsys, tmp_path):
+def test_submit_host_filter_pool_minimap2_without_rype_errors(capsys, tmp_path, preflight_stub):
+    """--host-minimap2-reference-idx without --host-rype-reference-idx is rejected
+    before any network call (minimap2 is the optional second stage, never
+    standalone)."""
+    convert_dir = _seed_convert_dir(tmp_path, ["10"])
+    blob = _hf_preflight(preflight_stub, {"10": False})
+    with pytest.raises(SystemExit) as exc_info:
+        _run_submit_host_filter_pool(convert_dir, minimap2=8, preflight_blob=blob)
+    assert exc_info.value.code == 2
+    assert "--host-minimap2-reference-idx requires --host-rype-reference-idx" in (
+        capsys.readouterr().err
+    )
+
+
+def test_submit_host_filter_pool_rejects_nondir_convert_dir(capsys, tmp_path, preflight_stub):
     from qiita_control_plane.cli.user import main
 
+    blob = _hf_preflight(preflight_stub, {"10": True})
     missing = tmp_path / "nope"
     with pytest.raises(SystemExit) as exc_info:
         main(
@@ -3384,69 +3394,76 @@ def test_submit_host_filter_pool_rejects_nondir_convert_dir(capsys, tmp_path):
                 "5",
                 "--convert-dir",
                 str(missing),
+                "--preflight-blob",
+                str(blob),
             ]
         )
     assert exc_info.value.code == 2
     assert "is not a directory" in capsys.readouterr().err
 
 
-def test_submit_host_filter_pool_reference_not_active_no_posts(monkeypatch, tmp_path, capsys):
+def test_submit_host_filter_pool_reference_not_active_no_posts(
+    monkeypatch, tmp_path, capsys, preflight_stub
+):
     convert_dir = _seed_convert_dir(tmp_path, ["10"])
+    blob = _hf_preflight(preflight_stub, {"10": True})
     captured: dict = {}
     inactive = _ref_active_body()
     inactive["status"] = "indexing"
     _stub_multi_response(
         monkeypatch,
         captured,
-        responses=[(200, _pool_samples_body([(100, 1000, "10", 7)])), (200, inactive)],
+        responses=[(200, _pool_samples_body([(100, 1000, "10")])), (200, inactive)],
     )
 
     with pytest.raises(SystemExit) as exc_info:
-        _run_submit_host_filter_pool(convert_dir)
+        _run_submit_host_filter_pool(convert_dir, rype=7, preflight_blob=blob)
     assert exc_info.value.code == 1
     assert "not active" in capsys.readouterr().err
     assert not [r for r in captured["requests"] if r["method"] == "POST"]
 
 
 def test_submit_host_filter_pool_rype_ref_missing_rype_index_no_posts(
-    monkeypatch, tmp_path, capsys
+    monkeypatch, tmp_path, capsys, preflight_stub
 ):
-    """A sample's recorded rype reference is active but carries no rype index →
+    """The given rype reference is active but carries no rype index →
     abort before any ticket (only a minimap2 index present here)."""
     convert_dir = _seed_convert_dir(tmp_path, ["10"])
+    blob = _hf_preflight(preflight_stub, {"10": True})
     captured: dict = {}
     minimap2_only = [_both_indexes_body()[1]]
     _stub_multi_response(
         monkeypatch,
         captured,
         responses=[
-            (200, _pool_samples_body([(100, 1000, "10", 7)])),
+            (200, _pool_samples_body([(100, 1000, "10")])),
             (200, _ref_active_body()),
             (200, minimap2_only),
         ],
     )
 
     with pytest.raises(SystemExit) as exc_info:
-        _run_submit_host_filter_pool(convert_dir)
+        _run_submit_host_filter_pool(convert_dir, rype=7, preflight_blob=blob)
     assert exc_info.value.code == 1
     err = capsys.readouterr().err
     assert "rype" in err
-    assert "host_rype_reference_idx" in err
+    assert "--host-rype-reference-idx" in err
     assert not [r for r in captured["requests"] if r["method"] == "POST"]
 
 
 def test_submit_host_filter_pool_minimap2_ref_missing_minimap2_index_no_posts(
-    monkeypatch, tmp_path, capsys
+    monkeypatch, tmp_path, capsys, preflight_stub
 ):
-    """A sample's recorded minimap2 reference is active but carries no minimap2
-    index → abort before any ticket (the rype reference passed first)."""
+    """The given minimap2 reference is active but carries no minimap2 index →
+    abort before any ticket (the rype reference passed first)."""
     convert_dir = _seed_convert_dir(tmp_path, ["10"])
+    blob = _hf_preflight(preflight_stub, {"10": True})
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
         responses=[
-            (200, _pool_samples_body([(100, 1000, "10", 7, 8)])),
+            (200, _pool_samples_body([(100, 1000, "10")])),
             (200, _ref_active_body(reference_idx=7)),  # rype reference OK
             (200, [_both_indexes_body()[0]]),  # rype index present
             (200, _ref_active_body(reference_idx=8)),  # minimap2 reference active
@@ -3455,24 +3472,27 @@ def test_submit_host_filter_pool_minimap2_ref_missing_minimap2_index_no_posts(
     )
 
     with pytest.raises(SystemExit) as exc_info:
-        _run_submit_host_filter_pool(convert_dir)
+        _run_submit_host_filter_pool(convert_dir, rype=7, minimap2=8, preflight_blob=blob)
     assert exc_info.value.code == 1
     err = capsys.readouterr().err
     assert "minimap2" in err
-    assert "host_minimap2_reference_idx" in err
+    assert "--host-minimap2-reference-idx" in err
     assert not [r for r in captured["requests"] if r["method"] == "POST"]
 
 
-def test_submit_host_filter_pool_missing_fastq_no_posts(monkeypatch, tmp_path, capsys):
+def test_submit_host_filter_pool_missing_fastq_no_posts(
+    monkeypatch, tmp_path, capsys, preflight_stub
+):
     """A pool sample with no matching R1 under convert_dir aborts before any
     ticket is submitted."""
     convert_dir = _seed_convert_dir(tmp_path, ["10"])  # only item 10 has files
+    blob = _hf_preflight(preflight_stub, {"10": True, "99": True})
     captured: dict = {}
     _stub_multi_response(
         monkeypatch,
         captured,
         responses=[
-            (200, _pool_samples_body([(100, 1000, "10", 7), (101, 1001, "99", 7)])),
+            (200, _pool_samples_body([(100, 1000, "10"), (101, 1001, "99")])),
             (200, _ref_active_body()),
             (200, _both_indexes_body()),
             (200, _seq_run_body()),
@@ -3480,7 +3500,7 @@ def test_submit_host_filter_pool_missing_fastq_no_posts(monkeypatch, tmp_path, c
     )
 
     with pytest.raises(SystemExit) as exc_info:
-        _run_submit_host_filter_pool(convert_dir)
+        _run_submit_host_filter_pool(convert_dir, rype=7, preflight_blob=blob)
     assert exc_info.value.code == 1
     err = capsys.readouterr().err
     assert "no R1 FASTQ matched" in err
@@ -3488,10 +3508,13 @@ def test_submit_host_filter_pool_missing_fastq_no_posts(monkeypatch, tmp_path, c
     assert not [r for r in captured["requests"] if r["method"] == "POST"]
 
 
-def test_submit_host_filter_pool_multi_lane_rejected_no_posts(monkeypatch, tmp_path, capsys):
+def test_submit_host_filter_pool_multi_lane_rejected_no_posts(
+    monkeypatch, tmp_path, capsys, preflight_stub
+):
     """Lane-split R1 files (>1 match) are rejected — the workflow takes a
     single fastq_path — and no tickets are submitted."""
     convert_dir = _seed_convert_dir(tmp_path, ["10"], paired=False)
+    blob = _hf_preflight(preflight_stub, {"10": True})
     # Add a second lane for the same sample.
     (convert_dir / "MyProject" / "10_S1_L002_R1_001.fastq.gz").write_bytes(b"")
     captured: dict = {}
@@ -3499,7 +3522,7 @@ def test_submit_host_filter_pool_multi_lane_rejected_no_posts(monkeypatch, tmp_p
         monkeypatch,
         captured,
         responses=[
-            (200, _pool_samples_body([(100, 1000, "10", 7)])),
+            (200, _pool_samples_body([(100, 1000, "10")])),
             (200, _ref_active_body()),
             (200, _both_indexes_body()),
             (200, _seq_run_body()),
@@ -3507,10 +3530,168 @@ def test_submit_host_filter_pool_multi_lane_rejected_no_posts(monkeypatch, tmp_p
     )
 
     with pytest.raises(SystemExit) as exc_info:
-        _run_submit_host_filter_pool(convert_dir)
+        _run_submit_host_filter_pool(convert_dir, rype=7, preflight_blob=blob)
     assert exc_info.value.code == 1
     assert "lane-split" in capsys.readouterr().err
     assert not [r for r in captured["requests"] if r["method"] == "POST"]
+
+
+# ---------------------------------------------------------------------------
+# submit-host-filter-pool: intent-mismatch guard (+ --force override)
+# ---------------------------------------------------------------------------
+
+
+def test_submit_host_filter_pool_all_human_no_ref_errors_no_posts(
+    monkeypatch, tmp_path, capsys, preflight_stub
+):
+    """Every sample's intake intent is human_filtering=True, but the submission
+    gives NO host reference (a pass-through) → the dangerous case: human reads
+    would not be depleted. Abort with zero POSTs before any host-ref preflight."""
+    convert_dir = _seed_convert_dir(tmp_path, ["10", "11"], paired=True)
+    blob = _hf_preflight(preflight_stub, {"10": True, "11": True})
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[(200, _pool_samples_body([(100, 1000, "10"), (101, 1001, "11")]))],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        _run_submit_host_filter_pool(convert_dir, preflight_blob=blob)
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "intake" in err and "human_filtering" in err
+    # Both mismatched samples named.
+    assert "sequenced_pool_item_id 10" in err
+    assert "sequenced_pool_item_id 11" in err
+    assert not [r for r in captured["requests"] if r["method"] == "POST"]
+
+
+def test_submit_host_filter_pool_all_nonhuman_with_ref_errors_no_posts(
+    monkeypatch, tmp_path, capsys, preflight_stub
+):
+    """Every sample's intake intent is human_filtering=False, but the submission
+    gives a host reference → samples would be filtered against their intent.
+    Abort with zero POSTs."""
+    convert_dir = _seed_convert_dir(tmp_path, ["10"], paired=True)
+    blob = _hf_preflight(preflight_stub, {"10": False})
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[(200, _pool_samples_body([(100, 1000, "10")]))],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        _run_submit_host_filter_pool(convert_dir, rype=7, preflight_blob=blob)
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "sequenced_pool_item_id 10" in err
+    assert "apply host reference 7" in err
+    # No host-ref preflight GET happened — the guard aborts first.
+    assert not [r for r in captured["requests"] if "/reference/" in r["url"]]
+    assert not [r for r in captured["requests"] if r["method"] == "POST"]
+
+
+def test_submit_host_filter_pool_roster_item_missing_from_blob_errors_no_posts(
+    monkeypatch, tmp_path, capsys, preflight_stub
+):
+    """A pool roster item with no row in the preflight blob (a broken
+    bcl-convert/preflight coupling) aborts fail-fast before any POST. The join is
+    roster-driven, so every pool member is checked even when the blob is short."""
+    convert_dir = _seed_convert_dir(tmp_path, ["10", "11"], paired=True)
+    # Roster carries 10 and 11; the blob only has 10.
+    blob = _hf_preflight(preflight_stub, {"10": True})
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[(200, _pool_samples_body([(100, 1000, "10"), (101, 1001, "11")]))],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        _run_submit_host_filter_pool(convert_dir, rype=7, preflight_blob=blob)
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "has no row for" in err
+    assert "11" in err
+    assert not [r for r in captured["requests"] if r["method"] == "POST"]
+
+
+def test_submit_host_filter_pool_mismatch_force_warns_and_proceeds(
+    monkeypatch, tmp_path, capsys, preflight_stub
+):
+    """--force downgrades the mismatch to a warning and proceeds with the
+    pool-wide host-ref choice (POSTs happen)."""
+    convert_dir = _seed_convert_dir(tmp_path, ["10"], paired=True)
+    # Intake intent says not-human-filtered, but the submission applies rype 7.
+    blob = _hf_preflight(preflight_stub, {"10": False})
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (200, _pool_samples_body([(100, 1000, "10")])),
+            (200, _ref_active_body()),
+            (200, _both_indexes_body()),
+            (200, _seq_run_body()),
+            (202, {"work_ticket_idx": 900}),
+        ],
+    )
+
+    rc = _run_submit_host_filter_pool(convert_dir, rype=7, preflight_blob=blob, force=True)
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "WARNING (--force)" in err
+    assert "sequenced_pool_item_id 10" in err
+    posts = [r for r in captured["requests"] if r["method"] == "POST"]
+    assert len(posts) == 1
+    assert posts[0]["json"]["action_context"]["host_filter_enabled"] is True
+
+
+def test_submit_host_filter_pool_mixed_pool_errors_then_force_proceeds(
+    monkeypatch, tmp_path, capsys, preflight_stub
+):
+    """A mixed pool (one human, one not) with a host reference → without --force
+    it errors naming only the disagreeing sample (the not-human one) and POSTs
+    nothing; with --force it warns and submits every sample."""
+    convert_dir = _seed_convert_dir(tmp_path, ["10", "11"], paired=True)
+    blob = _hf_preflight(preflight_stub, {"10": True, "11": False})
+
+    # Without --force: error, zero POSTs.
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[(200, _pool_samples_body([(100, 1000, "10"), (101, 1001, "11")]))],
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        _run_submit_host_filter_pool(convert_dir, rype=7, preflight_blob=blob)
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    # Only the disagreeing sample (item 11, not-human) is flagged.
+    assert "sequenced_pool_item_id 11" in err
+    assert "sequenced_pool_item_id 10" not in err
+    assert not [r for r in captured["requests"] if r["method"] == "POST"]
+
+    # With --force: warns, submits all samples.
+    captured2: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured2,
+        responses=[
+            (200, _pool_samples_body([(100, 1000, "10"), (101, 1001, "11")])),
+            (200, _ref_active_body()),
+            (200, _both_indexes_body()),
+            (200, _seq_run_body()),
+            (202, {"work_ticket_idx": 900}),
+            (202, {"work_ticket_idx": 901}),
+        ],
+    )
+    rc = _run_submit_host_filter_pool(convert_dir, rype=7, preflight_blob=blob, force=True)
+    assert rc == 0
+    assert "WARNING (--force)" in capsys.readouterr().err
+    assert len([r for r in captured2["requests"] if r["method"] == "POST"]) == 2
 
 
 # ---------------------------------------------------------------------------

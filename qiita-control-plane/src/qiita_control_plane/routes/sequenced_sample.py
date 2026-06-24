@@ -149,12 +149,6 @@ _SEQUENCED_SAMPLE_FK_MESSAGES: dict[str, str] = {
     "sequenced_sample_sequenced_pool_idx_fkey": (
         "sequenced_pool_idx does not reference an existing sequenced_pool"
     ),
-    "sequenced_sample_host_rype_reference_idx_fkey": (
-        "host_rype_reference_idx does not reference an existing reference"
-    ),
-    "sequenced_sample_host_minimap2_reference_idx_fkey": (
-        "host_minimap2_reference_idx does not reference an existing reference"
-    ),
     "prep_sample_to_study_study_idx_fkey": ("study_idx does not reference an existing study"),
 }
 _GENERIC_SEQ_UNIQUE_VIOLATION = "conflicts with an existing prep_sample / sequenced_sample"
@@ -219,8 +213,6 @@ async def import_sequenced_sample_from_run(
                 secondary_study_idxs=body.secondary_study_idxs,
                 caller_idx=user.principal_idx,
                 metadata_checklist_idx=metadata_checklist_idx,
-                host_rype_reference_idx=body.host_rype_reference_idx,
-                host_minimap2_reference_idx=body.host_minimap2_reference_idx,
                 ena_experiment_accession=body.ena_experiment_accession,
                 ena_run_accession=body.ena_run_accession,
             )
@@ -486,8 +478,6 @@ def _sequenced_sample_response_from_row(
             ),
             "sequenced_pool_idx": row["sequenced_pool_idx"],
             "sequenced_pool_item_id": row["sequenced_pool_item_id"],
-            "host_rype_reference_idx": row["host_rype_reference_idx"],
-            "host_minimap2_reference_idx": row["host_minimap2_reference_idx"],
             "ena_experiment_accession": row["ena_experiment_accession"],
             "ena_run_accession": row["ena_run_accession"],
             "last_submission_at": row["last_submission_at"],

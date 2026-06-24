@@ -555,52 +555,20 @@ def test_dedupe_secondary_study_idxs():
     assert req.secondary_study_idxs == [5, 3]
 
 
-def test_sequenced_sample_create_accepts_host_references():
-    """host_rype_reference_idx + host_minimap2_reference_idx are accepted
-    together (the full host-filter pair)."""
+def test_sequenced_sample_create_rejects_host_references():
+    """Host references are not a sample-creation property — they parameterize the
+    read mask and are supplied at human-filter submission. The model forbids them
+    (extra='forbid'), so a stray host-ref key is rejected at the wire boundary."""
     from qiita_common.models import SequencedSampleCreateRequest
 
-    req = SequencedSampleCreateRequest(
-        biosample_idx=1,
-        prep_protocol_idx=1,
-        owner_idx=1,
-        sequenced_pool_item_id="X",
-        primary_study_idx=1,
-        host_rype_reference_idx=7,
-        host_minimap2_reference_idx=8,
-    )
-    assert req.host_rype_reference_idx == 7
-    assert req.host_minimap2_reference_idx == 8
-
-
-def test_sequenced_sample_create_defaults_host_references_none():
-    """Both host references default to None — a sample with no host filtering."""
-    from qiita_common.models import SequencedSampleCreateRequest
-
-    req = SequencedSampleCreateRequest(
-        biosample_idx=1,
-        prep_protocol_idx=1,
-        owner_idx=1,
-        sequenced_pool_item_id="X",
-        primary_study_idx=1,
-    )
-    assert req.host_rype_reference_idx is None
-    assert req.host_minimap2_reference_idx is None
-
-
-def test_sequenced_sample_create_minimap2_requires_rype():
-    """minimap2 is the optional second host-filter stage; setting it without
-    rype is rejected at the wire boundary (mirrors the DB CHECK)."""
-    from qiita_common.models import SequencedSampleCreateRequest
-
-    with pytest.raises(ValidationError, match="host_minimap2_reference_idx requires"):
+    with pytest.raises(ValidationError):
         SequencedSampleCreateRequest(
             biosample_idx=1,
             prep_protocol_idx=1,
             owner_idx=1,
             sequenced_pool_item_id="X",
             primary_study_idx=1,
-            host_minimap2_reference_idx=8,
+            host_rype_reference_idx=7,
         )
 
 

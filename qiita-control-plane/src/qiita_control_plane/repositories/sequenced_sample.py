@@ -81,7 +81,6 @@ async def fetch_sequenced_sample_with_prep_sample(
         " ss.ena_run_accession, ss.last_submission_at, ss.submission_error,"
         " ss.raw_read_count_r1r2, ss.biological_read_count_r1r2,"
         " ss.quality_filtered_read_count_r1r2,"
-        " ss.host_rype_reference_idx, ss.host_minimap2_reference_idx,"
         " ps.biosample_idx, ps.owner_idx, ps.prep_protocol_idx,"
         " ps.metadata_checklist_idx,"
         " (SELECT name FROM qiita.metadata_checklist mc"
@@ -187,8 +186,6 @@ async def insert_sequenced_sample(
     sequenced_pool_idx: int,
     sequenced_pool_item_id: str,
     created_by_idx: int,
-    host_rype_reference_idx: int | None = None,
-    host_minimap2_reference_idx: int | None = None,
     ena_experiment_accession: str | None = None,
     ena_run_accession: str | None = None,
 ) -> int:
@@ -214,15 +211,12 @@ async def insert_sequenced_sample(
     return await conn.fetchval(
         "INSERT INTO qiita.sequenced_sample ("
         "    prep_sample_idx, sequenced_pool_idx, sequenced_pool_item_id,"
-        "    host_rype_reference_idx, host_minimap2_reference_idx,"
         "    ena_experiment_accession, ena_run_accession, created_by_idx"
-        ") VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"
+        ") VALUES ($1, $2, $3, $4, $5, $6)"
         " RETURNING idx",
         prep_sample_idx,
         sequenced_pool_idx,
         sequenced_pool_item_id,
-        host_rype_reference_idx,
-        host_minimap2_reference_idx,
         ena_experiment_accession,
         ena_run_accession,
         created_by_idx,
@@ -250,8 +244,6 @@ async def import_sequenced_prep_sample(
     secondary_study_idxs: Sequence[int] = (),
     caller_idx: int,
     metadata_checklist_idx: int | None = None,
-    host_rype_reference_idx: int | None = None,
-    host_minimap2_reference_idx: int | None = None,
     ena_experiment_accession: str | None = None,
     ena_run_accession: str | None = None,
 ) -> SequencedPrepSampleImportResult:
@@ -346,8 +338,6 @@ async def import_sequenced_prep_sample(
         sequenced_pool_idx=sequenced_pool_idx,
         sequenced_pool_item_id=sequenced_pool_item_id,
         created_by_idx=caller_idx,
-        host_rype_reference_idx=host_rype_reference_idx,
-        host_minimap2_reference_idx=host_minimap2_reference_idx,
         ena_experiment_accession=ena_experiment_accession,
         ena_run_accession=ena_run_accession,
     )
@@ -440,7 +430,6 @@ async def fetch_sequenced_pool_samples(
         # model_validate(dict(row)) — the route does no field renaming.
         "SELECT ss.idx AS sequenced_sample_idx, ss.prep_sample_idx,"
         " ps.biosample_idx, ss.sequenced_pool_item_id,"
-        " ss.host_rype_reference_idx, ss.host_minimap2_reference_idx,"
         " ss.ena_experiment_accession, ss.ena_run_accession,"
         " bs.biosample_accession, bs.ena_sample_accession"
         " FROM qiita.sequenced_sample ss"
@@ -481,7 +470,6 @@ async def fetch_sequenced_samples_for_run(
         # model_validate(dict(row)) — the route does no field renaming.
         "SELECT ss.idx AS sequenced_sample_idx, ss.prep_sample_idx,"
         " ps.biosample_idx, ss.sequenced_pool_item_id,"
-        " ss.host_rype_reference_idx, ss.host_minimap2_reference_idx,"
         " ss.ena_experiment_accession, ss.ena_run_accession,"
         " bs.biosample_accession, bs.ena_sample_accession"
         " FROM qiita.sequenced_sample ss"

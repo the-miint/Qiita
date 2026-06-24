@@ -358,6 +358,23 @@ the `no-changelog` label).
 
 ### Changed
 
+- Host-filter references moved off `sequenced_sample` onto the human-filter
+  submission (PR 4 of the full-read+mask feature). Host references are a
+  filtering-config choice, not a sample property, so two configs can coexist over
+  the same reads. `submit-host-filter-pool` now takes `--host-rype-reference-idx`
+  / `--host-minimap2-reference-idx` (pool-wide for the submission; omit for a
+  QC-only pass-through), pre-flights them once at submission, and threads them
+  into the work-ticket `action_context` where the runner reads them to mint the
+  `mask_idx` and drive `host_filter`. `submit-bcl-convert` no longer accepts or
+  records host references (it only demultiplexes the run); the preflight's
+  per-project `human_filtering` flag is still echoed per sample for reference.
+  `prep_protocol_idx` stays on the sample. Soft API change: sequenced-sample GET
+  responses and the pool/run sample-list rows no longer carry host references.
+  `submit-host-filter-pool` also takes `--preflight-blob` (the same SQLite given
+  to `submit-bcl-convert`) and guards against a pool-wide host-ref choice that
+  disagrees with the samples' intake `human_filtering` intent: a mismatch aborts
+  before any ticket is submitted unless `--force` downgrades it to a warning.
+  (#175)
 - `build_rype_index` resized for large host sets (many human genomes that OOMed
   at 32 GB). The step's `baseline_resources.mem_gb` rises 32 → 64 in both
   `host-reference-add/1.0.0` and `local-host-reference-add/1.0.0`, and
@@ -1173,6 +1190,12 @@ the `no-changelog` label).
 
 ### Removed
 
+- `sequenced_sample.host_rype_reference_idx` / `host_minimap2_reference_idx`
+  columns (their FKs and the minimap2-requires-rype CHECK drop with them). Host
+  references are now a human-filter submission argument, not a sample column
+  (PR 4 of the full-read+mask feature). Single drop migration, no
+  expand/contract: the deploy wipes all legacy sequenced/pool samples first
+  (their reads predate the lake-read model). (#175)
 - The legacy synchronous step path: `POST /step/run`, `ComputeBackend.run_step`
   (+ the SLURM/Local overrides and the CO `_poll_until_terminal` poll loop),
   `ComputeBackendClient.run_step`, and the `StepRunRequest` / `StepRunResponse`
