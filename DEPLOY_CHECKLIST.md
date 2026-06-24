@@ -19,6 +19,38 @@ _None yet._
 
 ### 2. One-time host setup
 
+_None yet._
+
+### 3. Migrations
+
+_None yet._
+
+### 4. Deploy
+
+_None yet._
+
+### 5. Verify
+
+_None yet._
+
+### Notes (no host action)
+
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-24 — fee935f
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
 - Wipe all legacy sequenced / sequenced-pool sample data BEFORE the deploy. These
   samples predate the lake-read model — their reads were never registered into
   DuckLake — and the `sequenced_sample.host_rype_reference_idx` /
@@ -32,7 +64,7 @@ _None yet._
   Run this before the migration; the drop migration is a single relocate with no
   data-preservation step, so there must be no legacy sample data to strand. (#175)
 
-### 3. Migrations
+#### 3. Migrations
 
 - `20260624000000_drop_sequenced_sample_host_references.sql` — drops the two
   host-reference columns (and their FKs + the minimap2-requires-rype CHECK) from
@@ -43,11 +75,11 @@ _None yet._
   freshly-added enum value in the same transaction); plain `make migrate`, no
   out-of-band setup or backfill. (#176)
 
-### 4. Deploy
+#### 4. Deploy
 
 _None yet._
 
-### 5. Verify
+#### 5. Verify
 
 - New workflow `fastq-to-parquet/1.3.0` is synced into `qiita.action` by
   `qiita-admin actions sync` inside `activate.sh` (no migration). Confirm it
@@ -57,7 +89,7 @@ _None yet._
   psql "$DATABASE_URL" -tAc "SELECT action_id, version FROM qiita.action WHERE action_id = 'fastq-to-parquet' AND version = '1.3.0'"
   ```
 
-### Notes (no host action)
+#### Notes (no host action)
 
 - Soft API change (PR 4 of the full-read+mask feature): host references moved off
   `sequenced_sample` onto the human-filter submission. Sequenced-sample GET
@@ -89,12 +121,6 @@ _None yet._
   `un-retire`. Until expected-empty control-well preflight marking lands
   (deferred), EVERY empty well becomes `no_data` — data wells included, not only
   flagged controls. No new env var, host dir, scope, or workflow. (#176)
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-23 — 3ac105c
 
