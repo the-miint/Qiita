@@ -22,6 +22,7 @@ consumers don't need to know the producer's attempt number.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -64,6 +65,7 @@ from .actions.reference import (
     transition_reference_status,
 )
 from .auth.tickets import sign_ticket
+from .repositories.mask_definition import mint_mask_definition
 
 _log = logging.getLogger(__name__)
 
@@ -344,6 +346,37 @@ async def run_workflow(
                     data_plane_url=data_plane_url,
                     hmac_secret=hmac_secret,
                     workspace=workspace,
+                )
+            )
+
+        # Read-mask identity: when a step threads `mask_idx` through its params
+        # (the host_filter step), mint the mask_idx for this filtering config and
+        # bind it before the loop. Same inside-try placement as the resolvers
+        # above so a failure (sample not pooled, unknown principal) lands in the
+        # outer FAILED handler. PREP_SAMPLE-scoped only — masks key on a sample's
+        # reads; another scope kind threading mask_idx would have no prep_sample.
+        if _workflow_needs_mask(action.steps):
+            if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+                raise _submission_bad_input(
+                    "a workflow that masks reads (threads mask_idx) must be "
+                    f"prep_sample-scoped; got {scope_target['kind']!r}"
+                )
+            adapter_path = bound.get(QC_ADAPTER_BINDING)
+            # Host refs come from the SAME action_context values
+            # `_resolve_host_filter_indexes` consumes for the applied filter, so
+            # the minted mask_idx's params describe the filter that ran. Absent →
+            # None (faithful "no host filtering"), never the sequenced_sample row.
+            bound.update(
+                await _mint_read_mask(
+                    pool,
+                    action_id=action.action_id,
+                    action_version=action.version,
+                    prep_sample_idx=scope_target["prep_sample_idx"],
+                    originator_principal_idx=work_ticket["originator_principal_idx"],
+                    instrument_model=bound.get("instrument_model"),
+                    adapter_parquet=Path(adapter_path) if adapter_path is not None else None,
+                    host_rype_reference_idx=bound.get("host_rype_reference_idx"),
+                    host_minimap2_reference_idx=bound.get("host_minimap2_reference_idx"),
                 )
             )
 
@@ -1507,6 +1540,145 @@ async def _resolve_qc_adapters(
 
 
 # =============================================================================
+# Read-mask identity (mask_idx) minting
+# =============================================================================
+#
+# A read mask's identity is its filtering CONFIG: the filter workflow + version,
+# the host reference(s) it depletes against, and the resolved QC config. The
+# control plane mints a `mask_idx` deduplicated on the SHA-256 of that config so
+# the same config resolves to the same mask_idx fleet-wide; the host_filter step
+# stamps it onto every read_mask row. The host references are read from the
+# sequenced_sample row (where they are pinned at pool fan-out); the resolved QC
+# values mirror the qc job's fastp-equivalent constants so a metadata edit to a
+# protocol row that doesn't change the effective filter yields the same mask.
+
+# Binding name the runner threads the minted mask_idx under. The host_filter step
+# lists it in its `params:` (mask_idx -> host_filter.Inputs.mask_idx), which both
+# signals the runner to mint the mask before the step loop and carries the value
+# into the step.
+MASK_IDX_BINDING = "mask_idx"
+
+# Resolved QC config the mask hash covers — the effective fastp-equivalent
+# filter the qc job applies. Mirrors the constants in
+# qiita_compute_orchestrator.jobs.qc (the fastp `-l 100` defaults); kept here
+# (not imported) because the control plane does not depend on the orchestrator
+# package. A change to the qc filter must update both so the mask identity stays
+# faithful to the filter actually applied.
+_QC_RESOLVED_MIN_LENGTH = 100
+_QC_RESOLVED_FILTER_TAIL = "0, 15, 40, 5, 0"
+
+
+def _workflow_needs_mask(steps: list[Any]) -> bool:
+    """True iff some entry threads `mask_idx` through its `params:` — the signal
+    the runner must mint a read mask before the step loop. Mirrors
+    `_workflow_needs_adapters` (which keys off an input binding); the mask is a
+    scalar param, so it keys off `params` values instead."""
+    for entry in steps:
+        params = getattr(entry, "params", None) or {}
+        if MASK_IDX_BINDING in params.values():
+            return True
+    return False
+
+
+def _adapter_set_hash(adapter_parquet: Path) -> str:
+    """SHA-256 hex of the materialized adapter-set Parquet's bytes — the resolved
+    adapter identity for the mask config hash. Hashing the staged file (not the
+    reference idx) keeps the mask identity tied to the adapter bytes actually
+    applied, so a re-pointed-but-identical adapter set collapses to one mask."""
+    return hashlib.sha256(adapter_parquet.read_bytes()).hexdigest()
+
+
+async def _mint_read_mask(
+    pool: asyncpg.Pool,
+    *,
+    action_id: str,
+    action_version: str,
+    prep_sample_idx: int,
+    originator_principal_idx: int,
+    instrument_model: str | None,
+    adapter_parquet: Path | None,
+    host_rype_reference_idx: int | None,
+    host_minimap2_reference_idx: int | None,
+) -> dict[str, int]:
+    """Mint (or resolve) the `mask_idx` for this filtering config and bind it.
+
+    Run before the step loop when `_workflow_needs_mask`. The config is:
+      * the filter workflow + version (this action),
+      * the host reference(s) the `host_filter` step actually APPLIES, passed in
+        from the same action_context values `_resolve_host_filter_indexes`
+        consumes (`host_rype_reference_idx` / `host_minimap2_reference_idx`) — so
+        the minted mask_idx's params describe the filter that ran. Absent host
+        refs mean no host filtering, a faithful part of the config (None), and
+      * the resolved QC config (instrument model gating polyG, the fastp-`-l 100`
+        thresholds, and a hash of the materialized adapter set).
+    `mint_mask_definition` hashes `params` (canonical JSON) and upserts on it, so
+    the same effective config resolves to the same mask_idx fleet-wide.
+
+    Like the other pre-loop resolvers, any failure raises a SUBMISSION-attributed
+    BAD_INPUT the outer handler turns into a FAILED ticket: no sequenced_sample
+    row (the sample must be pooled first), or an unknown originator principal.
+    """
+    prep_protocol_idx = await pool.fetchval(
+        "SELECT ps.prep_protocol_idx"
+        "  FROM qiita.sequenced_sample ss"
+        "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        " WHERE ss.prep_sample_idx = $1",
+        prep_sample_idx,
+    )
+    if prep_protocol_idx is None:
+        # fetchval returns None both when no row matched and when the column is
+        # NULL; distinguish by re-checking row existence so a real "not pooled"
+        # error keeps its specific message and a legitimately-NULL prep protocol
+        # still mints.
+        row_exists = await pool.fetchval(
+            "SELECT 1 FROM qiita.sequenced_sample WHERE prep_sample_idx = $1",
+            prep_sample_idx,
+        )
+        if row_exists is None:
+            raise _submission_bad_input(
+                f"no sequenced_sample row for prep_sample_idx={prep_sample_idx}; the "
+                "sample must be pooled (its 1:1 sequenced_sample created) before a "
+                "read mask can be minted"
+            )
+
+    # Resolved config — every value is the EFFECTIVE filter (the host refs the
+    # filter applies + adapter bytes hash + thresholds), so two callers with the
+    # same effective config collapse to one mask even if descriptive metadata
+    # differs.
+    params: dict[str, Any] = {
+        "filter_workflow": action_id,
+        "filter_version": action_version,
+        "host_rype_reference_idx": host_rype_reference_idx,
+        "host_minimap2_reference_idx": host_minimap2_reference_idx,
+        "prep_protocol_idx": prep_protocol_idx,
+        "resolved_qc": {
+            "instrument_model": instrument_model,
+            "min_length": _QC_RESOLVED_MIN_LENGTH,
+            "filter_read_tail": _QC_RESOLVED_FILTER_TAIL,
+            "adapter_set_hash": (
+                _adapter_set_hash(adapter_parquet) if adapter_parquet is not None else None
+            ),
+        },
+    }
+
+    try:
+        async with pool.acquire() as conn:
+            mask_row = await mint_mask_definition(
+                conn,
+                filter_workflow=action_id,
+                filter_version=action_version,
+                params=params,
+                principal_idx=originator_principal_idx,
+            )
+    except asyncpg.ForeignKeyViolationError as exc:
+        raise _submission_bad_input(
+            f"could not mint read mask: originator principal "
+            f"{originator_principal_idx} does not exist"
+        ) from exc
+    return {MASK_IDX_BINDING: mask_row["mask_idx"]}
+
+
+# =============================================================================
 # Dispatch helpers
 # =============================================================================
 
@@ -2582,32 +2754,19 @@ async def _run_action_primitive(
 
     if entry.name == LibraryPrimitive.PERSIST_READ_METRICS:
         # Persist the three per-stage read counts onto this prep_sample's
-        # 1:1 sequenced_sample. Each declared input is a Path to a
-        # read_count.json sidecar; we read the both-mates `read_count_r1r2` from
-        # each and hand structured ints to the primitive (same pattern as
-        # register-index reading its meta JSON). Inputs are resolved by their
-        # fixed binding names — not positionally — so a YAML reorder can't
-        # silently swap raw/biological/quality_filtered.
-        if set(entry.inputs) != {
-            "raw_read_count",
-            "biological_read_count",
-            "quality_filtered_read_count",
-        }:
+        # 1:1 sequenced_sample, derived from the `read_mask` Parquet (one row per
+        # read, carrying the per-read mask `reason`). The single declared input is
+        # the read_mask path host_filter emitted; the primitive computes the
+        # both-mates `_r1r2` totals from the mask (raw/biological/quality_filtered
+        # by reason). Resolved by its fixed binding name, not positionally.
+        if entry.inputs != ["read_mask"]:
             raise RuntimeError(
-                "persist-read-metrics expects inputs "
-                "[raw_read_count, biological_read_count, quality_filtered_read_count]; "
-                f"got {entry.inputs!r}"
+                f"persist-read-metrics expects inputs [read_mask]; got {entry.inputs!r}"
             )
-
-        def _count(name: str) -> int:
-            return json.loads(Path(bound[name]).read_text())["read_count_r1r2"]
-
         await LIBRARY[LibraryPrimitive.PERSIST_READ_METRICS](
             pool,
             scope_target["prep_sample_idx"],
-            _count("raw_read_count"),
-            _count("biological_read_count"),
-            _count("quality_filtered_read_count"),
+            Path(bound["read_mask"]),
         )
         return {}
 

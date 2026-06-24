@@ -1,12 +1,14 @@
-"""Native job: fastp-equivalent read QC on `reads.parquet`.
+"""Native job: fastp-equivalent read QC, emitting a partial read mask.
 
-A pure `reads.parquet -> qc_reads.parquet` transform keyed by the already-minted
-`sequence_idx`. Minting happened upstream in `fastq_to_parquet`; this step is an
-additive downstream filter that DROPS reads (and TRIMS the surviving ones), so
-the surviving `sequence_idx` are a subset of the minted range (benign gaps —
-`sequence_idx` stays a unique sorted join key, exactly as for `host_filter`).
+A `read.parquet -> qc_mask.parquet` transform keyed by the already-minted
+`sequence_idx`. Minting happened upstream in `fastq_to_parquet`; this step does
+NOT drop or rewrite reads — the full reads live once in the DuckLake `read`
+table, never physically filtered. Instead it records, per read, whether the read
+survives QC and how it should be trimmed: one `qc_mask.parquet` row per
+`sequence_idx` with `(reason, left_trim1, right_trim1, left_trim2, right_trim2)`.
 Runs BEFORE `host_filter` in the bcl-convert pipeline (`fastq` -> `qc` ->
-`host_filter`).
+`host_filter`); `host_filter` merges its host hits into this partial mask and
+emits the final `read_mask`.
 
 Per-read QC chain (miint's fastp algorithm port — see docs/duckdb-miint.md and
 tests/jobs/test_qc_miint_contract.py for the pinned contracts):
@@ -21,28 +23,40 @@ tests/jobs/test_qc_miint_contract.py for the pinned contracts):
      (NextSeq/NovaSeq/MiniSeq) — defaulting OFF when the model is unknown (e.g. a
      non-bcl upload);
   3. **length/quality filter** — `filter_read(seq, qual, 100, 0, 15, 40, 5, 0)`
-     == fastp defaults with `-l 100`. A read failing this is dropped. No
-     quality-trimming (fastp default-off).
+     == fastp defaults with `-l 100`. A read failing this is NOT dropped — it is
+     recorded with the matching `qc_*` reason so the `read_masked` view excludes
+     it while raw `read` retains it.
 
-**Paired-end is handled natively, not by flattening.** A row of `reads.parquet`
-is one read pair: `sequence1`/`sequence2` are R1/R2 under one minted
-`sequence_idx`. PE rows go through `trim_adapters_pe` (overlap-aware) and then
-`filter_read` is applied to EACH mate; **the pair is dropped if EITHER mate
-falls below min_length after trimming** — never moving R2 into an R1 slot.
-Single-end rows (`sequence2 IS NULL`) take the SE chain. The two layouts are
-routed to separate seams so each runs the right miint overload.
+**Reason mapping** (filter_read `fail_reason` -> ReadMaskReason): `length` ->
+`qc_too_short`, `too_long` -> `qc_too_long`, `n_base` -> `qc_too_many_n`,
+`quality` -> `qc_low_quality`; a passing read is `pass`. `filter_read` runs on
+the TRIMMED sequence, so a read whose post-trim length is below min_length is
+`qc_too_short` by construction — the trim-length invariant the `read_masked`
+view relies on (a `pass` read's `left_trim + right_trim <= length`).
+
+**Trims are the cumulative bases removed from each end** (adapter + polyG),
+recorded even when the read fails QC so an admin reading raw `read` can
+reconstruct; the masked path drops the row regardless.
+
+**Paired-end trim shape.** SE `trim_adapters` returns `trimmed_5p` and
+`trimmed_3p`, so SE populates `left_trim1` (5') and `right_trim1` (3'). PE
+`trim_adapters_pe` is 3'-only (no 5' output) and `trim_polyg` trims only the 3'
+end, so for PE `left_trim1`/`left_trim2` are structurally 0, `right_trim1 =
+trimmed1_3p (+ polyG)`, `right_trim2 = trimmed2_3p (+ polyG)`. The four-column
+schema is uniform; SE leaves `left_trim2`/`right_trim2` NULL (no mate).
+
+**Paired-end pass/fail.** A PE row passes only when BOTH mates pass
+`filter_read`; if either mate fails, the pair's reason is that mate's failure
+(R1 checked first). Single-end rows (`sequence2 IS NULL`) take the SE chain. The
+two layouts are routed to separate seams so each runs the right miint overload.
 
 Adapters: the canonical adapter set is materialized by the runner
 (`_resolve_qc_adapters`) into the bound `adapter_parquet` (a one-`sequence`-column
-Parquet), read here with `read_parquet` — the same columnar format the rest of the
-pipeline uses, so no FASTA parsing — and rendered into a constant SQL `VARCHAR[]`
+Parquet), read here with `read_parquet` — the same columnar format the rest of
+the pipeline uses, so no FASTA parsing — and rendered into a constant SQL `VARCHAR[]`
 (miint's QC functions require bind-time constants — the adapter list cannot be a
 column/parameter). QC is always-on in this path, so `adapter_parquet` is a
 REQUIRED input and an empty one is fail-fast.
-
-Drop-only + trim, `sequence_idx`-preserving: the 6-column schema and the
-lake-friendly `ORDER BY sequence_idx` layout are preserved. A sample where QC
-drops every read yields an empty (0-row) but well-formed Parquet, not an error.
 """
 
 from __future__ import annotations
@@ -52,6 +66,8 @@ from pathlib import Path
 
 import duckdb
 from pydantic import BaseModel
+from qiita_common.models import ReadMaskReason
+from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
     PARQUET_OPTS,
@@ -59,7 +75,6 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
-from ..read_count import write_read_count
 
 YAML_STEP_NAME = "qc"
 
@@ -70,10 +85,7 @@ YAML_STEP_NAME = "qc"
 # OFF-SLURM fallback cap: under SLURM the real cap is sized to the cgroup via
 # `resolve_duckdb_memory_gb()` (SLURM_MEM_PER_NODE) so a per-run `--mem-gb`
 # override reaches DuckDB's `memory_limit` — the same allocation-aware pattern
-# stage_local_fasta / hash_sequences use. The fastq-to-parquet/1.2.0 YAML's qc
-# step allocates mem_gb=12, which lands DuckDB near this 8 GB fallback after the
-# 4-thread headroom; bump the YAML mem_gb when sized against a real
-# genome-scale sample (this fallback only bites the local backend / tests).
+# stage_local_fasta / hash_sequences use.
 _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
 
@@ -100,21 +112,35 @@ _TRIM_PE_OVERLAP_DEFAULTS = "30, 5, 20, false, 0, false"
 # and forwarded per sample; None for non-bcl uploads -> polyG OFF).
 _TWO_COLOR_MODEL_SUBSTRINGS = ("nextseq", "novaseq", "miniseq")
 
-# In-DuckDB relation names for the SE/PE source views. (Unlike host_filter these
-# need not be non-temp for a separate-connection reason — the QC functions are
-# SCALAR, evaluated inline on this connection — but a regular view is the simplest
-# named relation each seam can target.) There is no output accumulator table: the
-# two seams' SELECTs are UNION ALL'd straight into the final COPY so DuckDB streams
-# the whole transform to Parquet without materialising it.
+# In-DuckDB relation names for the SE/PE source views. The QC functions are
+# SCALAR, evaluated inline on this connection, so a regular view is the simplest
+# named relation each seam can target. There is no output accumulator table: the
+# two seams' SELECTs are UNION ALL'd straight into the final COPY so DuckDB
+# streams the whole transform to Parquet without materialising it.
 _SE = "qc_se"
 _PE = "qc_pe"
+
+# SQL CASE that maps a filter_read result struct to a ReadMaskReason value.
+# `f` is the alias of the filter_read STRUCT in the enclosing query. A passing
+# read is 'pass'; otherwise the fail_reason ('length'/'too_long'/'n_base'/
+# 'quality') maps to the matching qc_* reason. fail_reason is documented to be
+# one of those four when not passed, so the ELSE ('quality') is the residual.
+_SE_REASON_CASE = (
+    "CASE "
+    f"WHEN f['passed'] THEN '{ReadMaskReason.PASS.value}' "
+    f"WHEN f['fail_reason'] = 'length' THEN '{ReadMaskReason.QC_TOO_SHORT.value}' "
+    f"WHEN f['fail_reason'] = 'too_long' THEN '{ReadMaskReason.QC_TOO_LONG.value}' "
+    f"WHEN f['fail_reason'] = 'n_base' THEN '{ReadMaskReason.QC_TOO_MANY_N.value}' "
+    f"ELSE '{ReadMaskReason.QC_LOW_QUALITY.value}' "
+    "END"
+)
 
 
 class Inputs(BaseModel):
     """Typed input contract for qc.
 
-    `reads` is fastq_to_parquet's `reads.parquet` (binding name `reads`):
-    `(sequence_idx BIGINT, read_id, sequence1, qual1, sequence2, qual2)`.
+    `reads` is fastq_to_parquet's `read.parquet` (binding name `reads`):
+    `(prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2)`.
     `adapter_parquet` is the canonical adapter set the runner materializes
     (`_resolve_qc_adapters`) — REQUIRED (QC is always-on; an empty set is a
     misconfiguration). `instrument_model` gates polyG trimming (None -> OFF);
@@ -175,40 +201,53 @@ def _qc_se_select(
     adapters_sql: str,
     apply_polyg: bool,
 ) -> str:
-    """Build the single-end QC SELECT: adapter trim -> optional polyG ->
-    length/quality filter, projected to the 6-column output schema with a NULL R2.
+    """Build the single-end QC mask SELECT: adapter trim -> optional polyG ->
+    length/quality filter, projected to the mask schema
+    `(sequence_idx, reason, left_trim1, right_trim1, left_trim2, right_trim2)`.
     Returns SQL (no execution) so the SE and PE seams can be UNION ALL'd into one
     streaming COPY. Isolated so unit tests assert the generated SQL.
 
-    The trimmed sequence/quality come from the last trim step (polyG if applied,
-    else adapter); `filter_read` only decides pass/fail, so its struct is read in
-    the WHERE clause and the carried seq/qual are the trim output. Struct fields
-    are read with bracket syntax (`s['sequence']`) — unambiguous against a column
-    alias, unlike dotted access."""
+    SE trims are cumulative per end: `left_trim1 = trim_adapters.trimmed_5p`
+    (polyG is 3'-only, never adds to the left), `right_trim1 = trim_adapters
+    .trimmed_3p + trim_polyg.trimmed_3p` (when polyG applies, else just adapter).
+    `left_trim2`/`right_trim2` are NULL (no mate). The reason comes from
+    `filter_read` on the TRIMMED sequence (so a too-short trimmed read is
+    qc_too_short, never pass). Struct fields use bracket syntax (`s['field']`),
+    unambiguous against a column alias."""
+    # `inner` materialises the trim struct(s) as named columns so the outer
+    # SELECT can read the trimmed seq/qual, the per-end trim counts, and the
+    # filter_read result without re-evaluating the trim functions. polyG is a
+    # 3'-only second pass on the adapter-trimmed seq; when off, the trimmed
+    # seq/qual and the 3' count come straight from the adapter struct.
     if apply_polyg:
         inner = (
-            "SELECT sequence_idx, read_id, "
-            "trim_polyg(ta['sequence'], ta['quality']) AS pg "
-            "FROM (SELECT sequence_idx, read_id, "
-            f"trim_adapters(sequence1, qual1, {adapters_sql}) AS ta FROM {src_view})"
+            "SELECT sequence_idx, ta, trim_polyg(ta['sequence'], ta['quality']) AS pg FROM ("
+            f"SELECT sequence_idx, trim_adapters(sequence1, qual1, {adapters_sql}) AS ta "
+            f"FROM {src_view})"
         )
         seq, qual = "pg['sequence']", "pg['quality']"
+        right_trim1 = "(ta['trimmed_3p'] + pg['trimmed_3p'])::UINTEGER"
     else:
         inner = (
-            "SELECT sequence_idx, read_id, "
-            f"trim_adapters(sequence1, qual1, {adapters_sql}) AS ta FROM {src_view}"
+            f"SELECT sequence_idx, trim_adapters(sequence1, qual1, {adapters_sql}) AS ta "
+            f"FROM {src_view}"
         )
         seq, qual = "ta['sequence']", "ta['quality']"
-    # Alias every output column: this SELECT is the FIRST branch of the COPY's
-    # UNION ALL, so DuckDB takes the Parquet column names from here. The 6-col
-    # (sequence_idx, read_id, sequence1, qual1, sequence2, qual2) schema is the
-    # contract host_filter consumes — without the aliases the trim-struct
-    # expressions and NULL literals would name the columns wrong.
+        right_trim1 = "ta['trimmed_3p']::UINTEGER"
+    filter_call = f"filter_read({seq}, {qual}, {_MIN_LENGTH}, {_FILTER_READ_TAIL}) AS f"
+    # This SELECT is the FIRST branch of the COPY's UNION ALL, so DuckDB takes the
+    # Parquet column names from here — every column is aliased to the mask schema.
+    # The middle SELECT pins `f` (filter_read on the trimmed seq) alongside the
+    # trim structs so the reason CASE and the trims read from one row.
     return (
-        f"SELECT sequence_idx, read_id, {seq} AS sequence1, {qual} AS qual1, "
-        "NULL::VARCHAR AS sequence2, NULL::UTINYINT[] AS qual2 "
-        f"FROM ({inner}) "
-        f"WHERE filter_read({seq}, {qual}, {_MIN_LENGTH}, {_FILTER_READ_TAIL})['passed']"
+        "SELECT sequence_idx, "
+        f"{_SE_REASON_CASE} AS reason, "
+        "ta['trimmed_5p']::UINTEGER AS left_trim1, "
+        f"{right_trim1} AS right_trim1, "
+        "NULL::UINTEGER AS left_trim2, "
+        "NULL::UINTEGER AS right_trim2 "
+        f"FROM (SELECT sequence_idx, ta, {('pg, ' if apply_polyg else '')}{filter_call} "
+        f"      FROM ({inner}))"
     )
 
 
@@ -218,38 +257,73 @@ def _qc_pe_select(
     adapters_sql: str,
     apply_polyg: bool,
 ) -> str:
-    """Build the paired-end QC SELECT: overlap-aware adapter trim -> optional
-    per-mate polyG -> per-mate length/quality filter, projected to the 6-column
-    output schema. The pair is kept only when BOTH mates pass (drop the pair if
-    EITHER mate falls below min_length after trimming). Returns SQL (no execution)
-    so it can be UNION ALL'd into the streaming COPY. Isolated so unit tests
-    assert the generated SQL."""
+    """Build the paired-end QC mask SELECT: overlap-aware adapter trim -> optional
+    per-mate polyG -> per-mate length/quality filter, projected to the mask
+    schema. PE trimming is 3'-only, so `left_trim1`/`left_trim2` are 0 and the
+    right trims accumulate adapter + polyG per mate. The pair's reason is `pass`
+    only when BOTH mates pass; otherwise it is the failing mate's reason (R1
+    checked first). Returns SQL (no execution) so it can be UNION ALL'd into the
+    streaming COPY. Isolated so unit tests assert the generated SQL."""
     adapter_layer = (
-        "SELECT sequence_idx, read_id, "
+        "SELECT sequence_idx, "
         "trim_adapters_pe(sequence1, qual1, sequence2, qual2, "
         f"{adapters_sql}, {_TRIM_PE_OVERLAP_DEFAULTS}) AS ta FROM {src_view}"
     )
     if apply_polyg:
         inner = (
-            "SELECT sequence_idx, read_id, "
+            "SELECT sequence_idx, ta, "
             "trim_polyg(ta['sequence1'], ta['quality1']) AS pg1, "
             "trim_polyg(ta['sequence2'], ta['quality2']) AS pg2 "
             f"FROM ({adapter_layer})"
         )
         s1, q1 = "pg1['sequence']", "pg1['quality']"
         s2, q2 = "pg2['sequence']", "pg2['quality']"
+        right_trim1 = "(ta['trimmed1_3p'] + pg1['trimmed_3p'])::UINTEGER"
+        right_trim2 = "(ta['trimmed2_3p'] + pg2['trimmed_3p'])::UINTEGER"
     else:
         inner = adapter_layer
         s1, q1 = "ta['sequence1']", "ta['quality1']"
         s2, q2 = "ta['sequence2']", "ta['quality2']"
-    # Aliases keep the column names aligned with the SE branch (the UNION ALL's
-    # first branch sets the Parquet column names); see _qc_se_select.
+        right_trim1 = "ta['trimmed1_3p']::UINTEGER"
+        right_trim2 = "ta['trimmed2_3p']::UINTEGER"
+    f1 = f"filter_read({s1}, {q1}, {_MIN_LENGTH}, {_FILTER_READ_TAIL})"
+    f2 = f"filter_read({s2}, {q2}, {_MIN_LENGTH}, {_FILTER_READ_TAIL})"
+    # PE reason: pass only when both mates pass; else the failing mate's reason
+    # (R1 first). Reuses the SE CASE per mate by aliasing each filter result `f`.
+    reason_case = (
+        "CASE "
+        f"WHEN f1['passed'] AND f2['passed'] THEN '{ReadMaskReason.PASS.value}' "
+        f"WHEN NOT f1['passed'] THEN ({_pe_fail_reason('f1')}) "
+        f"ELSE ({_pe_fail_reason('f2')}) "
+        "END"
+    )
+    # The middle SELECT pins the trim structs (ta + polyG structs) alongside the
+    # two filter results so the reason CASE and the per-mate right trims read from
+    # one row. `right_trim1`/`right_trim2` reference ta and (when polyG) pg1/pg2.
+    pg_carry = "pg1, pg2, " if apply_polyg else ""
     return (
-        f"SELECT sequence_idx, read_id, {s1} AS sequence1, {q1} AS qual1, "
-        f"{s2} AS sequence2, {q2} AS qual2 "
-        f"FROM ({inner}) "
-        f"WHERE filter_read({s1}, {q1}, {_MIN_LENGTH}, {_FILTER_READ_TAIL})['passed'] "
-        f"AND filter_read({s2}, {q2}, {_MIN_LENGTH}, {_FILTER_READ_TAIL})['passed']"
+        "SELECT sequence_idx, "
+        f"{reason_case} AS reason, "
+        "0::UINTEGER AS left_trim1, "
+        f"{right_trim1} AS right_trim1, "
+        "0::UINTEGER AS left_trim2, "
+        f"{right_trim2} AS right_trim2 "
+        f"FROM (SELECT sequence_idx, ta, {pg_carry}{f1} AS f1, {f2} AS f2 "
+        f"      FROM ({inner}))"
+    )
+
+
+def _pe_fail_reason(f: str) -> str:
+    """SQL fragment mapping a failed mate's filter_read struct `f` to its qc_*
+    reason (no pass branch — the caller has already established this mate
+    failed). fail_reason is one of length/too_long/n_base/quality."""
+    return (
+        "CASE "
+        f"WHEN {f}['fail_reason'] = 'length' THEN '{ReadMaskReason.QC_TOO_SHORT.value}' "
+        f"WHEN {f}['fail_reason'] = 'too_long' THEN '{ReadMaskReason.QC_TOO_LONG.value}' "
+        f"WHEN {f}['fail_reason'] = 'n_base' THEN '{ReadMaskReason.QC_TOO_MANY_N.value}' "
+        f"ELSE '{ReadMaskReason.QC_LOW_QUALITY.value}' "
+        "END"
     )
 
 
@@ -262,17 +336,15 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     apply_polyg = _is_two_color(inputs.instrument_model)
 
     workspace.mkdir(parents=True, exist_ok=True)
-    qc_reads = workspace / "qc_reads.parquet"
+    qc_mask = workspace / "qc_mask.parquet"
     duckdb_tmp = workspace / ".duckdb_tmp"
     duckdb_tmp.mkdir(parents=True, exist_ok=True)
 
-    # These feed COPY / CREATE VIEW string literals, which can't take a bound
-    # param, so the orchestrator-controlled paths are inline single-quote-escaped
-    # (same as host_filter). Sibling jobs instead reject quote/backslash paths via
-    # qiita_common.parquet.validate_parquet_path; converging qc + host_filter on
-    # that fail-fast validator is future work.
-    reads_sql = str(inputs.reads).replace("'", "''")
-    out_sql = str(qc_reads).replace("'", "''")
+    # COPY / CREATE VIEW path literals can't take a bound param; route them
+    # through validate_parquet_path (fail-fast on quote/backslash/control chars)
+    # rather than inline-escaping.
+    reads_sql = validate_parquet_path(inputs.reads)
+    out_sql = validate_parquet_path(qc_mask)
 
     success = False
     try:
@@ -290,26 +362,22 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             adapters_sql = _adapters_sql(_read_adapter_parquet(conn, inputs.adapter_parquet))
 
             # Route by layout: SE (sequence2 IS NULL) and PE rows take different
-            # miint overloads. CREATE VIEW can't take prepared params, so the
-            # reads path is inlined (quote-escaped — a filesystem path, no other
-            # injection surface). The qual columns ride along (QC needs decoded
-            # phred, unlike the sequence-only host filter).
+            # miint overloads. The qual columns ride along (QC needs decoded
+            # phred). read_id is not needed — the mask keys on sequence_idx only.
             conn.execute(
                 f"CREATE VIEW {_SE} AS "
-                "SELECT sequence_idx, read_id, sequence1, qual1 "
+                "SELECT sequence_idx, sequence1, qual1 "
                 f"FROM read_parquet('{reads_sql}') WHERE sequence2 IS NULL"
             )
             conn.execute(
                 f"CREATE VIEW {_PE} AS "
-                "SELECT sequence_idx, read_id, sequence1, qual1, sequence2, qual2 "
+                "SELECT sequence_idx, sequence1, qual1, sequence2, qual2 "
                 f"FROM read_parquet('{reads_sql}') WHERE sequence2 IS NOT NULL"
             )
             # Stream the whole transform: the SE and PE seams each emit a 6-col
-            # SELECT, UNION ALL'd and sorted straight into the COPY — no
-            # intermediate accumulator table, so DuckDB pipelines reads ->
-            # trim/filter -> sorted Parquet. ORDER BY keeps the lake-friendly
-            # sorted `sequence_idx` layout fastq_to_parquet wrote (the two seams
-            # are individually unordered) and makes the output deterministic; an
+            # mask SELECT, UNION ALL'd and sorted straight into the COPY — no
+            # intermediate accumulator table. ORDER BY keeps the lake-friendly
+            # sorted `sequence_idx` layout and makes the output deterministic; an
             # empty source view contributes no rows.
             se_select = _qc_se_select(_SE, adapters_sql=adapters_sql, apply_polyg=apply_polyg)
             pe_select = _qc_pe_select(_PE, adapters_sql=adapters_sql, apply_polyg=apply_polyg)
@@ -317,23 +385,16 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"COPY (({se_select}) UNION ALL ({pe_select}) ORDER BY sequence_idx) "
                 f"TO '{out_sql}' ({PARQUET_OPTS})"
             )
-            # Emit the biological read count: reads surviving adapter +
-            # quality/length filtering, before host_filter. Reuse this
-            # connection — write_read_count only does a footer-level count.
-            biological_read_count = write_read_count(conn, qc_reads, workspace)
         success = True
     finally:
         # Drop the spill dir before returning so the SLURM launcher's manifest
-        # walker (which runs after execute()) sees only qc_reads.parquet; on
+        # walker (which runs after execute()) sees only qc_mask.parquet; on
         # failure remove a partial output so it can't be promoted.
         shutil.rmtree(duckdb_tmp, ignore_errors=True)
         if not success:
-            qc_reads.unlink(missing_ok=True)
+            qc_mask.unlink(missing_ok=True)
 
-    # Output binding is `reads` (not `qc_reads`): qc is a transform in the
-    # fastq -> qc -> host_filter chain, re-emitting the same logical `reads`
-    # artifact the next step consumes. The runner has no input aliasing — a
-    # step's wire input name must equal the downstream job's `Inputs` field — and
-    # host_filter (shared with 1.1.0's fastq -> host_filter) reads `reads`, so the
-    # binding stays `reads`. The on-disk file is qc_reads.parquet for provenance.
-    return {"reads": qc_reads, "biological_read_count": biological_read_count}
+    # `qc_mask` is the partial mask host_filter merges its host hits into. The
+    # reads are NOT re-emitted: host_filter reads the full `read.parquet` (the
+    # `reads` binding fastq produced) directly.
+    return {"qc_mask": qc_mask}

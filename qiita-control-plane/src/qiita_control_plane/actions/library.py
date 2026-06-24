@@ -405,21 +405,52 @@ async def register_index(
     )
 
 
+def _read_mask_counts(read_mask_path: Path) -> tuple[int, int, int]:
+    """Derive the three per-stage both-mates (`*_r1r2`) read counts from a
+    read_mask Parquet, returning (raw, biological, quality_filtered).
+
+    The mask has one row per read (a single-end read or a paired-end pair), so a
+    bare COUNT(*) would silently HALVE paired-end totals — the persisted columns
+    are `_r1r2` (both mates; a PE pair counts as 2). The mask records its layout
+    per row: `right_trim2` is non-NULL (0 or more) for paired-end and NULL for
+    single-end, so `COUNT(right_trim2)` is the R2 count and
+    `COUNT(*) + COUNT(right_trim2)` is the both-mates total — correct for SE
+    (no R2), PE, and a mix, with no SE/PE branching.
+
+    Buckets by `reason` (ReadMaskReason): raw = every row, biological = rows that
+    didn't fail QC (`reason NOT LIKE 'qc_%'` — i.e. `pass` or a `host_*` hit),
+    quality_filtered = the `pass` rows the read_masked view surfaces. raw >=
+    biological >= quality_filtered holds by construction (host_* only overrides
+    pass), satisfying the sequenced_sample monotonic CHECK."""
+    path_sql = validate_parquet_path(read_mask_path)
+    with duckdb.connect(":memory:") as duck:
+        raw, biological, quality_filtered = duck.execute(
+            "SELECT "
+            "  count(*) + count(right_trim2), "
+            "  count(*) FILTER (WHERE reason NOT LIKE 'qc_%') "
+            "    + count(right_trim2) FILTER (WHERE reason NOT LIKE 'qc_%'), "
+            "  count(*) FILTER (WHERE reason = 'pass') "
+            "    + count(right_trim2) FILTER (WHERE reason = 'pass') "
+            f"FROM read_parquet('{path_sql}')"
+        ).fetchone()
+    return raw, biological, quality_filtered
+
+
 async def persist_read_metrics(
     pool: asyncpg.Pool,
     prep_sample_idx: int,
-    raw_read_count_r1r2: int,
-    biological_read_count_r1r2: int,
-    quality_filtered_read_count_r1r2: int,
+    read_mask_path: Path,
 ) -> int:
     """Persist the three per-stage read counts onto the 1:1
-    sequenced_sample row for `prep_sample_idx` and return its idx.
+    sequenced_sample row for `prep_sample_idx`, deriving them from the
+    `read_mask` Parquet, and return its idx.
 
-    The counts are the both-mates (`*_r1r2`) totals the runner read from the
-    read_count.json sidecars (raw -> fastq, biological -> qc,
-    quality_filtered -> host_filter). The DB CHECK enforces
-    quality_filtered <= biological <= raw, so a swapped/garbled count fails
-    loudly at write time rather than persisting silently.
+    The counts are the both-mates (`*_r1r2`) totals computed from the mask's
+    per-read `reason` (see `_read_mask_counts`): raw = all reads, biological =
+    reads that passed QC (pass + host hits), quality_filtered = pass reads. The
+    DB CHECK enforces quality_filtered <= biological <= raw, which holds by
+    construction (host_* only overrides pass), so a garbled mask fails loudly at
+    write time rather than persisting silently.
 
     Fail-fast (loud) when no sequenced_sample row exists for the prep_sample: a
     sequenced prep_sample reaches read-metric persistence only after pooling
@@ -428,6 +459,11 @@ async def persist_read_metrics(
     re-runs this primitive and overwrites with the same counts (the
     set_updated_at trigger bumps updated_at / the ETag, which is correct: the
     row did change)."""
+    if not read_mask_path.exists():
+        raise FileNotFoundError(f"read_mask parquet not found: {read_mask_path}")
+    raw_read_count_r1r2, biological_read_count_r1r2, quality_filtered_read_count_r1r2 = (
+        _read_mask_counts(read_mask_path)
+    )
     ss_idx = await pool.fetchval(
         "UPDATE qiita.sequenced_sample"
         " SET raw_read_count_r1r2 = $2,"
