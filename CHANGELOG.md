@@ -754,6 +754,13 @@ the `no-changelog` label).
 
 ### Fixed
 
+- `read-mask` (1.0.0) and `fastq-to-parquet` (1.3.0) workflows ran
+  `persist-read-metrics` *after* `register-files`, but `register-files` MOVES
+  `read_mask.parquet` out of the staging dir into permanent DuckLake storage —
+  so `persist-read-metrics` re-opened a path that no longer existed and failed
+  with `FileNotFoundError: read_mask parquet not found`. Reordered both
+  workflows so `persist-read-metrics` reads the staged parquet first, then
+  `register-files` moves it. (#181)
 - The `qiita` / `qiita-admin` CLIs now emit an actionable error instead of a raw
   import-time traceback when launched against a **stale `qiita_common`** (the
   cross-package staleness trap: a plain `uv sync` skips reinstalling the

@@ -35,7 +35,14 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- `read-mask/1.0.0` and `fastq-to-parquet/1.3.0` reorder their final two actions
+  so `persist-read-metrics` runs **before** `register-files` (register-files
+  MOVES `read_mask.parquet` out of the staging dir into DuckLake, so the metrics
+  read must precede it — it was failing with `read_mask parquet not found`). Both
+  YAMLs are **edited in place** — re-synced into `qiita.action` by `qiita-admin
+  actions sync` inside `activate.sh` (already covered by the generic
+  `make verify-deploy` action list), **not** a migration. No new env var, host
+  dir, scope, or SIF. (#181)
 
 ---
 
