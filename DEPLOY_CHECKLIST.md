@@ -23,15 +23,47 @@ _None yet._
 
 ### 3. Migrations
 
-- (#170) `20260623000000_mask_definition.sql`
-  — adds the `qiita.mask_definition` table + `qiita.mint_mask_definition`
-  function. Plain `make migrate`; additive, no extension or backfill.
+_None yet._
 
 ### 4. Deploy
 
 _None yet._
 
 ### 5. Verify
+
+_None yet._
+
+### Notes (no host action)
+
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-23 — 3ac105c
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
+- (#170) `20260623000000_mask_definition.sql`
+  — adds the `qiita.mask_definition` table + `qiita.mint_mask_definition`
+  function. Plain `make migrate`; additive, no extension or backfill.
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
 
 - (#169) Confirm the raised `local-host-reference-add` mem ceiling synced into
   `qiita.action` (so its `build_rype_index` OOM-retry escalation can climb to
@@ -42,7 +74,7 @@ _None yet._
   # expect: host-reference-add|128  and  local-host-reference-add|128
   ```
 
-### Notes (no host action)
+#### Notes (no host action)
 
 - (#170) New `read_masked:doget` scope on the
   service-account ceiling, gating the new `POST /mask-definition` and
@@ -62,12 +94,6 @@ _None yet._
   bucket 5's `qiita.action` check), **not** a migration. No new env var, host
   dir, scope, or SIF. Ensure the SLURM partition/QOS permits 128 GB single-step
   jobs.
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-23 — f56a470
 
