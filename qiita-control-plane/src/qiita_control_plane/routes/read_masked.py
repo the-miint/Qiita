@@ -52,10 +52,9 @@ from ..repositories.mask_definition import mint_mask_definition
 
 # The masked-read view table this route is allowed to sign tickets for. Must
 # match the CP-side _DOGET_ALLOWED_TABLES (routes/reference.py) and the data
-# plane's ALLOWED_TABLES — the DP side gains this entry (plus the read_masked
-# view itself) in the follow-up data-plane PR; until then a ticket signed here
-# is rejected by the DP. A constant rather than a free literal so the read-masked
-# table name has one definition the route signs against.
+# plane's ALLOWED_TABLES, which back the read_masked view the ticket targets.
+# A constant rather than a free literal so the read-masked table name has one
+# definition the route signs against.
 _READ_MASKED_TABLE = "read_masked"
 
 mask_definition_router = APIRouter(prefix=PATH_MASK_DEFINITION_PREFIX, tags=["mask-definition"])
