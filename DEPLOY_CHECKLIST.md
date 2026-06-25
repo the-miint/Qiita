@@ -23,16 +23,48 @@ _None yet._
 
 ### 3. Migrations
 
-- `20260624110000_work_ticket_mask_idx.sql` — adds the nullable
-  `qiita.work_ticket.mask_idx` column (FK → `mask_definition`, ON DELETE SET NULL,
-  partial index). Plain `make migrate`; additive and backfill-free at migrate time
-  (existing rows read NULL — they are populated by the bucket-5 backfill). (#181)
+_None yet._
 
 ### 4. Deploy
 
 _None yet._
 
 ### 5. Verify
+
+_None yet._
+
+### Notes (no host action)
+
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-25 — 8f4d4cd
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
+- `20260624110000_work_ticket_mask_idx.sql` — adds the nullable
+  `qiita.work_ticket.mask_idx` column (FK → `mask_definition`, ON DELETE SET NULL,
+  partial index). Plain `make migrate`; additive and backfill-free at migrate time
+  (existing rows read NULL — they are populated by the bucket-5 backfill). (#181)
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
 
 - One-time mask recovery — run AFTER the bucket-3 migrate + bucket-4 restart (the
   reordered `read-mask`/`fastq-to-parquet` workflows from the Notes entry must be
@@ -62,7 +94,7 @@ _None yet._
   c. Confirm the resubmitted tickets reach COMPLETED and the per-sample
   `sequenced_sample` read-metric counts populate (pool-completion rollups move).
 
-### Notes (no host action)
+#### Notes (no host action)
 
 - New `mask_definition:delete` scope (gating `DELETE /mask-definition/{mask_idx}` +
   the `qiita-admin mask delete` / `mask purge-failed` recovery tooling). Granted
@@ -81,12 +113,6 @@ _None yet._
   actions sync` inside `activate.sh` (already covered by the generic
   `make verify-deploy` action list), **not** a migration. No new env var, host
   dir, scope, or SIF. (#181)
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-24 — be01438
 
