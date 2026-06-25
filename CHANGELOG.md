@@ -23,7 +23,7 @@ the `no-changelog` label).
   `?sequenced_pool_idx=` it restricts to that pool's `sequenced_sample`s in the study
   and adds `prep_sample_idx` + ENA experiment/run accessions. Dual-gated by
   `system_admin` + a new `admin:biosample_owner_id_read` scope; the CLI writes a TSV
-  to `--output` (mode 0600, never stdout, so the names stay off the terminal). (#TBD)
+  to `--output` (mode 0600, never stdout, so the names stay off the terminal). (#188)
 - New `GET /api/v1/sequencing-run/{run}/sequenced-pool/{pool}` route returning a
   pool's metadata plus a compute-on-read read-metric rollup (#143): per-stage
   read-count SUMS over the pool's non-retired `sequenced_sample` rows

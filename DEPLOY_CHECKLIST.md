@@ -37,7 +37,7 @@ _None yet._
 
 ### Notes (no host action)
 
-- (#TBD) New system_admin-only scope `admin:biosample_owner_id_read`, gating the
+- (#188) New system_admin-only scope `admin:biosample_owner_id_read`, gating the
   owner-id re-identification export (`GET /admin/study/{study_idx}/owner-biosample-id`
   + `qiita-admin owner-biosample-id`). Pure-Python scope (no migration); added to the
   system_admin ceiling in `auth/scopes.py`. **A system_admin's existing PAT does not
