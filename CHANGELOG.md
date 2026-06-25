@@ -15,6 +15,16 @@ the `no-changelog` label).
 
 ### Added
 
+- An `export_read` data-plane DoAction that re-materializes one prep_sample's
+  reads from the DuckLake `read` table into a per-ticket `reads.parquet` on shared
+  scratch (DuckDB `COPY` run on the blocking pool, written to a `.partial` sibling
+  then published atomically; the destination is validated lexically and via a
+  symlink-resolving containment check under the scratch root; row count is read
+  back from the written file). The control plane signs the HMAC action token but
+  the data plane writes the file, so the bulk (human-containing) read bytes never
+  transit the control plane. Raw `read` remains absent from the Flight DoGet
+  `ALLOWED_TABLES` — it is reachable only via this admin-gated write path. (#187)
+- A `runner._do_action_export_read` control-plane client for the above. (#187)
 - A `delete_mask` primitive for removing a registered read mask. New
   `mask_definition:delete` scope (system_admin via the role ceiling),
   `DELETE /api/v1/mask-definition/{mask_idx}` route (lake-first: a new
@@ -414,6 +424,18 @@ the `no-changelog` label).
 
 ### Changed
 
+- `runner._resolve_staged_reads` now falls back to the data plane when a
+  read-mask workflow can't find the prep_sample's ephemeral durable staging copy:
+  it signs an `export_read` action token and binds the per-ticket `reads.parquet`
+  the data plane writes from the persistent DuckLake `read` table (an empty result
+  or unreachable data plane still FAILs the ticket cleanly as a SUBMISSION
+  BAD_INPUT). This lets `submit-host-filter-pool` reprocess a run whose staging
+  copy has been reaped, instead of hard-failing "no stored reads". (#187)
+- Tightened the `read-mask/1.0.0` action audience from
+  `[user, wet_lab_admin, system_admin]` to `[wet_lab_admin, system_admin]`:
+  submitting a read mask (host filter / QC reprocessing) now drives the data plane
+  to re-materialize the sample's RAW (human-containing) reads via `export_read`,
+  so it is a privileged operation — never a plain `user`. (#187)
 - Split read storage from masking so a sample's reads are stored ONCE and can be
   masked repeatedly against different host references. Previously the single
   `fastq-to-parquet` workflow parsed FASTQ, minted a `sequence_idx` range, AND

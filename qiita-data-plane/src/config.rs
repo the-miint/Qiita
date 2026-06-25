@@ -22,6 +22,11 @@ pub struct Settings {
     /// control plane's PATH_SCRATCH/staging — set PATH_SCRATCH to the same
     /// value in both env files.
     pub path_scratch_staging: PathBuf,
+    /// The `PATH_SCRATCH` base root itself (parent of `path_scratch_staging`).
+    /// The `export_read` DoAction writes a sample's reads into a control-plane
+    /// ticket workspace under `{PATH_SCRATCH}/ticket/...`, so the handler
+    /// validates the requested destination resolves under this root.
+    pub path_scratch: PathBuf,
 }
 
 impl Settings {
@@ -73,6 +78,7 @@ impl Settings {
             ducklake_catalog_connstr,
             path_persistent_ducklake,
             path_scratch_staging,
+            path_scratch,
         })
     }
 }

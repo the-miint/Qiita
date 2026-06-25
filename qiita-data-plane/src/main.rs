@@ -33,6 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.ducklake_catalog_connstr,
         cfg.path_persistent_ducklake,
         cfg.path_scratch_staging,
+        cfg.path_scratch,
     );
 
     let (health_reporter, health_service) = tonic_health::server::health_reporter();
