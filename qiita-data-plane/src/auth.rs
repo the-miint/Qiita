@@ -208,6 +208,63 @@ pub fn verify_delete_reference(
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
+/// Parsed payload for the `delete_mask` DoAction.
+///
+/// Wire shape pinned by `qiita_control_plane.actions.library.delete_mask_data`:
+/// `{"action": "delete_mask", "mask_idx": N}`. `deny_unknown_fields` keeps the
+/// contract tight — the data plane needs only the identifier and drops every
+/// row that carries it from its own DuckLake `read_mask` table, so any extra
+/// field on the ticket is a design slip surfaced loudly here.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteMaskPayload {
+    /// Action discriminator; the gRPC handler also rejects a payload whose
+    /// `action` is not "delete_mask".
+    pub action: String,
+    /// `i64`, matching the Postgres `mask_definition.idx BIGINT` source of
+    /// truth and the `read_mask.mask_idx BIGINT` column in the DuckLake table.
+    pub mask_idx: i64,
+}
+
+/// Verify a `delete_mask` DoAction token and return its parsed payload.
+pub fn verify_delete_mask(ticket: &[u8], secret: &[u8]) -> Result<DeleteMaskPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
+/// Parsed payload for the `export_read` DoAction.
+///
+/// Wire shape pinned by `qiita_control_plane.runner._resolve_staged_reads`:
+/// `{"action": "export_read", "dest": "<abs path>", "prep_sample_idx": N}`.
+/// The data plane re-materializes one sample's reads from its DuckLake `read`
+/// table to `dest` on the shared filesystem (a per-ticket `reads.parquet` a
+/// read-mask job then consumes) — so the bulk read bytes never transit the
+/// control plane. No `work_ticket_idx`: the data plane keys nothing off it
+/// (the `dest` path the CP builds already carries the ticket), so carrying it
+/// would be a dead field. `deny_unknown_fields` keeps the contract tight: any
+/// extra field is a design slip surfaced loudly here.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportReadPayload {
+    /// Action discriminator; the gRPC handler also rejects a payload whose
+    /// `action` is not "export_read".
+    pub action: String,
+    /// `i64`, matching the Postgres `prep_sample` identifier source of truth
+    /// and the `read.prep_sample_idx BIGINT` column in the DuckLake table.
+    pub prep_sample_idx: i64,
+    /// Absolute destination path for the materialized Parquet. The handler
+    /// re-validates it (`validate_export_dest`) before writing — under the
+    /// data plane's scratch root, no `..`, no single quote — even though the
+    /// token is HMAC-signed by the control plane (defense in depth).
+    pub dest: String,
+}
+
+/// Verify an `export_read` DoAction token and return its parsed payload.
+pub fn verify_export_read(ticket: &[u8], secret: &[u8]) -> Result<ExportReadPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
 /// Parsed DoPut ticket payload.
 ///
 /// Wire shape pinned by `qiita_control_plane.auth.tickets.sign_doput`:
@@ -455,6 +512,65 @@ mod tests {
         let parsed = verify_doput(&ticket, b"dev-secret").expect("verify should succeed");
         assert_eq!(parsed.action, "register_files");
         assert_eq!(parsed.upload_idx, 1);
+    }
+
+    // --------------------------------------------------------------------
+    // export_read action token variant
+    // --------------------------------------------------------------------
+
+    fn make_export_read_ticket(
+        prep_sample_idx: i64,
+        dest: &str,
+        secret: &[u8],
+        expiry: u64,
+    ) -> Vec<u8> {
+        // Canonical JSON: sorted keys, no whitespace — matches sign_action.
+        let payload = format!(
+            r#"{{"action":"export_read","dest":"{dest}","prep_sample_idx":{prep_sample_idx}}}"#
+        );
+        make_doput_ticket_raw(payload.as_bytes(), secret, expiry)
+    }
+
+    #[test]
+    fn verify_export_read_round_trip() {
+        let ticket = make_export_read_ticket(
+            26154,
+            "/scratch/ticket/804/reads.parquet",
+            b"dev-secret",
+            future_expiry(300),
+        );
+        let payload =
+            verify_export_read(&ticket, b"dev-secret").expect("valid token should verify");
+        assert_eq!(payload.action, "export_read");
+        assert_eq!(payload.prep_sample_idx, 26154);
+        assert_eq!(payload.dest, "/scratch/ticket/804/reads.parquet");
+    }
+
+    #[test]
+    fn verify_export_read_rejects_bad_hmac() {
+        let mut ticket = make_export_read_ticket(
+            1,
+            "/scratch/ticket/1/reads.parquet",
+            b"dev-secret",
+            future_expiry(300),
+        );
+        ticket[10] ^= 0xFF;
+        assert_eq!(
+            verify_export_read(&ticket, b"dev-secret").unwrap_err(),
+            AuthError::InvalidHmac
+        );
+    }
+
+    #[test]
+    fn verify_export_read_rejects_extra_fields() {
+        // deny_unknown_fields: a smuggled field is a contract slip surfaced here.
+        let payload =
+            br#"{"action":"export_read","dest":"/scratch/x","prep_sample_idx":1,"smuggled":9}"#;
+        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
+        match verify_export_read(&ticket, b"dev-secret").unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
     }
 
     /// Cross-language interop test: this ticket was signed by the Python

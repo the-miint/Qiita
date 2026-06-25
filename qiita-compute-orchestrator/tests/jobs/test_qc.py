@@ -1,27 +1,23 @@
 """Isolated unit tests for `qc.execute` (miint chain seams stubbed).
 
-`qc` is a pure `reads.parquet -> qc_reads.parquet` transform keyed by the
-already-minted `sequence_idx` (a fastp-equivalent QC: adapter trim -> optional
-polyG -> length/quality filter). It is drop-only and `sequence_idx`-preserving,
-so the output is a subset of the minted range (benign gaps).
+`qc` is a `read.parquet -> qc_mask.parquet` transform keyed by the
+already-minted `sequence_idx`. It drops NOTHING: it emits one mask row per read
+`(sequence_idx, reason, left_trim1, right_trim1, left_trim2, right_trim2)`.
 
 The real `trim_adapters` / `trim_adapters_pe` / `trim_polyg` / `filter_read`
 calls need the miint extension, so they're exercised in `test_qc_smoke.py`; here
 the two layout seams (`_qc_se_select`, `_qc_pe_select`) are stubbed to return
-canned SELECT SQL and we assert the orchestration:
+canned mask-shaped SELECT SQL and we assert the orchestration:
 
   - single-end (`sequence2 IS NULL`) and paired-end rows are routed to the
-    matching seam (its source view), then UNION ALL'd straight into one
-    streaming COPY (no intermediate accumulator table);
-  - the surviving output is the union of both seams' kept rows, sorted by
-    `sequence_idx`, with the 6-column schema preserved and SE rows' R2 NULL;
+    matching seam (its source view), then UNION ALL'd into one streaming COPY;
+  - the output is the union of both seams' rows, sorted by `sequence_idx`, with
+    the 6-column mask schema;
   - polyG gating: `apply_polyg` is True only for 2-color instruments;
   - the parsed adapter set is threaded to both seams as a constant `VARCHAR[]`;
-  - empty (but valid) output when every read is dropped;
   - fail-fast on missing reads / missing or empty adapter set.
 
-The `write_reads` / `read_survivors` fixtures (tests/jobs/conftest.py) own the
-fastq_to_parquet 6-col schema.
+The `write_reads` fixture (tests/jobs/conftest.py) owns the read schema.
 """
 
 from __future__ import annotations
@@ -31,20 +27,26 @@ from pathlib import Path
 
 import duckdb
 import pytest
+from qiita_common.models import ReadMaskReason
 
-from qiita_compute_orchestrator.read_count import ReadCount
+# Independent oracle for the emitted mask schema (deliberately NOT shared with the
+# job, so a drift in either is caught).
+_MASK_SCHEMA = [
+    "sequence_idx",
+    "reason",
+    "left_trim1",
+    "right_trim1",
+    "left_trim2",
+    "right_trim2",
+]
 
-# Independent oracle for the preserved output schema (deliberately NOT shared
-# with the writer fixture, so a drift in either is caught).
-_READS_SCHEMA = ["sequence_idx", "read_id", "sequence1", "qual1", "sequence2", "qual2"]
-
-# A canned 0-row, correctly-named 6-col SELECT a stubbed seam returns when the
+# A canned 0-row, correctly-named mask SELECT a stubbed seam returns when the
 # test doesn't care about its rows. Fully aliased so the COPY's UNION ALL (which
-# takes Parquet column names from its first branch) yields the _READS_SCHEMA.
+# takes Parquet column names from its first branch) yields the _MASK_SCHEMA.
 _EMPTY_SEAM_SELECT = (
-    "SELECT NULL::BIGINT AS sequence_idx, NULL::VARCHAR AS read_id, "
-    "NULL::VARCHAR AS sequence1, NULL::UTINYINT[] AS qual1, "
-    "NULL::VARCHAR AS sequence2, NULL::UTINYINT[] AS qual2 WHERE false"
+    "SELECT NULL::BIGINT AS sequence_idx, NULL::VARCHAR AS reason, "
+    "NULL::UINTEGER AS left_trim1, NULL::UINTEGER AS right_trim1, "
+    "NULL::UINTEGER AS left_trim2, NULL::UINTEGER AS right_trim2 WHERE false"
 )
 
 
@@ -56,11 +58,11 @@ def _schema(path: Path) -> list[str]:
 
 
 def _rows(path: Path) -> list[tuple]:
-    """(sequence_idx, sequence2 IS NULL) per row, sorted — to confirm SE rows
-    keep a NULL R2 and PE rows keep a non-NULL R2 through the union/COPY."""
+    """(sequence_idx, reason, left_trim2 IS NULL) per row, sorted — confirms SE
+    rows keep NULL mate trims and PE rows non-NULL, through the union/COPY."""
     with duckdb.connect(":memory:") as conn:
         return conn.execute(
-            f"SELECT sequence_idx, sequence2 IS NULL FROM read_parquet('{path}') "
+            f"SELECT sequence_idx, reason, left_trim2 IS NULL FROM read_parquet('{path}') "
             "ORDER BY sequence_idx"
         ).fetchall()
 
@@ -79,13 +81,13 @@ def _adapter_parquet(tmp_path: Path, *adapters: str, name: str = "adapters.parqu
 
 
 _AD = "AGATCGGAAGAGC"  # standard TruSeq adapter prefix
+_PASS = ReadMaskReason.PASS.value
 
 
-def test_qc_routes_se_pe_and_unions(tmp_path, monkeypatch, write_reads, read_survivors):
+def test_qc_routes_se_pe_and_unions(tmp_path, monkeypatch, write_reads):
     """SE rows go to the SE seam (its source view), PE rows to the PE seam; the
-    COPY output is the union of both seams' kept rows, sorted, with the 6-col
-    schema preserved and SE rows carrying a NULL R2. Both seams pass their whole
-    source view through, so every routed row appears with its layout's R2 shape."""
+    COPY output is the union of both seams' rows, sorted, with the 6-col mask
+    schema. SE rows carry NULL mate trims; PE rows carry non-NULL (0) mate trims."""
     from qiita_compute_orchestrator.jobs import qc
 
     reads = write_reads(
@@ -104,17 +106,21 @@ def test_qc_routes_se_pe_and_unions(tmp_path, monkeypatch, write_reads, read_sur
         captured["se_view"] = src_view
         captured["se_adapters_sql"] = adapters_sql
         captured["se_polyg"] = apply_polyg
-        # Pass every SE row through, projecting a NULL R2 (aliased so the union's
-        # first branch sets the right column names).
         return (
-            "SELECT sequence_idx, read_id, sequence1, qual1, "
-            "NULL::VARCHAR AS sequence2, NULL::UTINYINT[] AS qual2 "
+            f"SELECT sequence_idx, '{_PASS}' AS reason, "
+            "0::UINTEGER AS left_trim1, 0::UINTEGER AS right_trim1, "
+            "NULL::UINTEGER AS left_trim2, NULL::UINTEGER AS right_trim2 "
             f"FROM {src_view}"
         )
 
     def fake_pe(src_view, *, adapters_sql, apply_polyg):
         captured["pe_view"] = src_view
-        return f"SELECT sequence_idx, read_id, sequence1, qual1, sequence2, qual2 FROM {src_view}"
+        return (
+            f"SELECT sequence_idx, '{_PASS}' AS reason, "
+            "0::UINTEGER AS left_trim1, 0::UINTEGER AS right_trim1, "
+            "0::UINTEGER AS left_trim2, 0::UINTEGER AS right_trim2 "
+            f"FROM {src_view}"
+        )
 
     monkeypatch.setattr(qc, "_qc_se_select", fake_se)
     monkeypatch.setattr(qc, "_qc_pe_select", fake_pe)
@@ -128,18 +134,16 @@ def test_qc_routes_se_pe_and_unions(tmp_path, monkeypatch, write_reads, read_sur
     )
     out = asyncio.run(qc.execute(inputs, tmp_path / "ws"))
 
-    # Each seam was handed its own source view.
     assert captured["se_view"] == qc._SE
     assert captured["pe_view"] == qc._PE
-    assert read_survivors(out["reads"]) == [10, 20, 30, 40]
-    assert _schema(out["reads"]) == _READS_SCHEMA
-    # 10, 30 are SE (R2 NULL); 20, 40 are PE (R2 not NULL) — proves routing.
-    assert _rows(out["reads"]) == [(10, True), (20, False), (30, True), (40, False)]
-    # Biological read count is emitted over the QC'd output: 4 rows
-    # (count(*)) + 2 R2s (count(sequence2)) = 6 reads r1r2; layout 'paired'
-    # because at least one R2 is present.
-    rc = ReadCount.model_validate_json(out["biological_read_count"].read_text())
-    assert (rc.read_pairs, rc.read_count_r1r2, rc.layout) == (4, 6, "paired")
+    assert _schema(out["qc_mask"]) == _MASK_SCHEMA
+    # 10, 30 SE (mate trims NULL); 20, 40 PE (mate trims non-NULL) — proves routing.
+    assert _rows(out["qc_mask"]) == [
+        (10, _PASS, True),
+        (20, _PASS, False),
+        (30, _PASS, True),
+        (40, _PASS, False),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -220,14 +224,12 @@ def test_qc_adapters_threaded_as_constant(tmp_path, monkeypatch, write_reads):
     assert sql.endswith("::VARCHAR[]")
 
 
-def test_qc_empty_output_when_all_dropped(tmp_path, monkeypatch, write_reads, read_survivors):
-    """A sample where QC drops every read is valid: an empty (0-row) but
-    well-formed qc_reads.parquet, schema intact."""
+def test_qc_empty_output_when_no_reads(tmp_path, monkeypatch, write_reads):
+    """A reads file with no SE/PE rows yields an empty (0-row) but well-formed
+    qc_mask.parquet, schema intact (the seams contribute no rows)."""
     from qiita_compute_orchestrator.jobs import qc
 
-    reads = write_reads(
-        tmp_path / "reads.parquet", [(10, "se", "AAAA", None), (20, "pe", "AA", "TT")]
-    )
+    reads = write_reads(tmp_path / "reads.parquet", [(10, "se", "AAAA", None)])
     monkeypatch.setattr(qc, "_qc_se_select", lambda *a, **k: _EMPTY_SEAM_SELECT)
     monkeypatch.setattr(qc, "_qc_pe_select", lambda *a, **k: _EMPTY_SEAM_SELECT)
 
@@ -238,9 +240,9 @@ def test_qc_empty_output_when_all_dropped(tmp_path, monkeypatch, write_reads, re
         work_ticket_idx=1,
     )
     out = asyncio.run(qc.execute(inputs, tmp_path / "ws"))
-    assert out["reads"].exists()
-    assert read_survivors(out["reads"]) == []
-    assert _schema(out["reads"]) == _READS_SCHEMA
+    assert out["qc_mask"].exists()
+    assert _rows(out["qc_mask"]) == []
+    assert _schema(out["qc_mask"]) == _MASK_SCHEMA
 
 
 def test_qc_missing_reads_raises(tmp_path):

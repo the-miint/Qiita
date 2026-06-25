@@ -119,6 +119,35 @@ class ReferenceStatus(StrEnum):
     FAILED = "failed"
 
 
+class ReadMaskReason(StrEnum):
+    """Why a read is kept or dropped by a read mask.
+
+    One value per row of the DuckLake `read_mask` table (the `reason` column).
+    `pass` survives the mask (its recorded trims are applied by the `read_masked`
+    view); every other value excludes the read from `read_masked`. The `qc_*`
+    values come from the `qc` step's `filter_read` fail reasons; the `host_*`
+    values come from the `host_filter` step's rype / minimap2 hits.
+
+    Reason precedence (privacy-critical): a read that both fails QC and hits the
+    host filter records the `host_*` hit, so a host/human read can never leak
+    through a code path that only inspects `qc_*`. Host classification runs only
+    on the QC-pass subset, so `host_*` only ever overrides `pass`.
+
+    Backs a DuckLake VARCHAR column, NOT a Postgres `CREATE TYPE ... AS ENUM`.
+    Per the enum-parity carve-out in CLAUDE.md (a StrEnum backed by a
+    non-Postgres column is a valid, deliberate choice), it has no `ENUM_PAIRS`
+    entry and is out of scope for the parity test.
+    """
+
+    PASS = "pass"
+    QC_TOO_SHORT = "qc_too_short"
+    QC_TOO_LONG = "qc_too_long"
+    QC_LOW_QUALITY = "qc_low_quality"
+    QC_TOO_MANY_N = "qc_too_many_n"
+    HOST_RYPE = "host_rype"
+    HOST_MINIMAP2 = "host_minimap2"
+
+
 class TerminologyStatus(StrEnum):
     """Lifecycle states of a terminology row.
 
@@ -1053,10 +1082,13 @@ class SequencedSampleListItem(BaseModel):
     Carries the subtype idx, its supertype prep_sample_idx and biosample_idx,
     the sequenced_pool_item_id (which equals the bcl-convert per-sample FASTQ
     basename prefix), and the ENA experiment/run plus biosample/ena-sample
-    accessions. Lets a caller fan out per-sample work — including ENA
-    experiment submission, which needs the biosample's BioSample accession as
-    the experiment sample_descriptor — without an N+1 of per-idx GETs. The
-    four accession columns are nullable until their submissions succeed.
+    accessions. Lets a caller fan out per-sample work — the pool host-filter
+    fan-out matches each sample's FASTQs by sequenced_pool_item_id, and ENA
+    experiment submission needs the biosample's BioSample accession as the
+    sample_descriptor — without an N+1 of per-idx GETs. The accession columns
+    are nullable until their submissions succeed. Host references are not a
+    sample property: they parameterize the read mask and are supplied at
+    human-filter submission, not carried here.
     """
 
     sequenced_sample_idx: int
@@ -1368,6 +1400,21 @@ class PrincipalRetiredUpdate(BaseModel):
     reason: str = Field(min_length=1)
 
 
+class PrepSampleRetiredUpdate(BaseModel):
+    """Body for PATCH /api/v1/prep-sample/{idx}/retired.
+
+    Reversible operator disposition (unlike the terminal principal retire): set
+    `retired=true` to drop an empty / failed-yield well out of a pool's active
+    set, or `retired=false` to un-retire a misclassified one. `reason` is the
+    optional retire_reason (only meaningful when retiring; the DB CHECK requires
+    retired_by_idx/retired_at when retired=true and forbids them otherwise, both
+    populated/cleared by the route).
+    """
+
+    retired: bool
+    reason: str | None = None
+
+
 class PrincipalSystemRoleUpdate(BaseModel):
     """Body for PATCH /api/v1/admin/principal/{idx}/system-role.
 
@@ -1471,14 +1518,26 @@ class WorkTicketState(StrEnum):
 
     Submission gates: PENDING / QUEUED / PROCESSING block resubmission of
     the same `(scope_target, action_id, action_version)` triple entirely.
-    COMPLETED requires explicit DELETE before resubmission. FAILED is the
-    permanent-failure terminal state; recovery is operator-driven.
+    COMPLETED / NO_DATA / FAILED are the three terminal states, with
+    different resubmission semantics: COMPLETED is DELETE-gated (a result
+    exists, so the prior result must be deleted before a fresh submit);
+    FAILED is restarted in place via /run (operator-driven recovery);
+    NO_DATA mints no result, so it is freely resubmittable (only an
+    in-place /run redrive is refused).
+
+    NO_DATA is the terminal outcome for a step that legitimately produced
+    no data — an empty FASTQ well (a blank, a no-template control, or a
+    failed-yield well). It is distinct from FAILED: a no_data ticket
+    carries NULL failure_* columns and is tallied in its own pool-
+    completion bucket so a plate full of empty wells can still reach a
+    "done" signal rather than being stuck behind permanent failures.
     """
 
     PENDING = "pending"
     QUEUED = "queued"
     PROCESSING = "processing"
     COMPLETED = "completed"
+    NO_DATA = "no_data"
     FAILED = "failed"
 
 
@@ -1953,6 +2012,229 @@ class SequencedPoolResponse(BaseModel):
     read_metrics: PoolReadMetrics
 
 
+class SampleQCReport(BaseModel):
+    """One pool member's persisted QC reports, as carried in PoolQCReport.samples.
+
+    `raw_qc_report` / `filtered_qc_report` are the verbatim qc_report.json
+    documents the native `qc_report` job emitted at each point (the
+    `{point, layout, read_pairs, mates: {r1, r2}}` shape), or None for a sample
+    not yet processed by fastq-to-parquet/1.2.0. `sequenced_pool_item_id` is the
+    sample's per-pool item id (lane+barcode); `prep_sample_idx` identifies the
+    sample. The blobs are surfaced as-is — the pool report does not re-derive
+    them, only merges copies into `merged`."""
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    sequenced_pool_item_id: str | None
+    raw_qc_report: dict[str, Any] | None
+    filtered_qc_report: dict[str, Any] | None
+
+
+class MateQCAggregate(BaseModel):
+    """One mate's (r1 or r2) QC summary pooled across a pool's samples.
+
+    Counts (`reads`, `total_bases`) are plain sums. The means
+    (`mean_quality`, `gc_content`, `n_content`, `mean_length`) are
+    base- or read-weighted pools of the per-sample means — each per-sample mean
+    is multiplied back out by its weight (total_bases for the content/quality
+    means, reads for the mean length) to recover the underlying sum, those are
+    summed, then divided by the pooled weight. Recovering the sum from a stored
+    ratio carries negligible float error, acceptable for a human-facing report.
+    A mean is None when no contributing sample carried it. The three histograms
+    are per-bucket sums of the per-sample histograms (string bucket keys, the
+    same keying the per-sample qc_report uses)."""
+
+    reads: int
+    total_bases: int
+    mean_quality: float | None
+    gc_content: float | None
+    n_content: float | None
+    min_length: int | None
+    max_length: int | None
+    mean_length: float | None
+    quality_histogram: dict[str, int]
+    gc_histogram: dict[str, int]
+    length_histogram: dict[str, int]
+
+
+class PointQCAggregate(BaseModel):
+    """One report point (raw or filtered) pooled across a pool's samples.
+
+    `samples` is how many of the pool's samples carried a report at this point;
+    `read_pairs` sums their per-sample read_pairs. `mates.r1` is present whenever
+    any contributing sample had r1; `mates.r2` is None for an all-single-end
+    pool (no sample carried an r2 block)."""
+
+    samples: int
+    read_pairs: int
+    mates: dict[str, MateQCAggregate | None]
+
+
+class MergedQCAggregate(BaseModel):
+    """Run-level (pool-wide) merge of the per-sample QC reports — the
+    multiqc-equivalent summary. `raw` / `filtered` is None when no sample in the
+    pool carried a report at that point."""
+
+    raw: PointQCAggregate | None
+    filtered: PointQCAggregate | None
+
+
+def _merge_qc_point(reports: list[dict[str, Any]]) -> PointQCAggregate | None:
+    """Pool a list of per-sample qc_report.json documents for ONE point into a
+    single PointQCAggregate, or None when the list is empty (no sample carried a
+    report at this point).
+
+    Each `report` is one sample's `{point, layout, read_pairs, mates: {r1, r2}}`
+    document. The two mates merge independently; an absent mate (None) is
+    skipped, so r2 is only present when at least one sample had it."""
+    if not reports:
+        return None
+    mates: dict[str, MateQCAggregate | None] = {}
+    for mate in ("r1", "r2"):
+        per_sample = [r["mates"][mate] for r in reports if r["mates"].get(mate) is not None]
+        mates[mate] = _merge_mate(per_sample) if per_sample else None
+    return PointQCAggregate(
+        samples=len(reports),
+        read_pairs=sum(r["read_pairs"] for r in reports),
+        mates=mates,
+    )
+
+
+def _weighted_mean(
+    per_sample: list[dict[str, Any]], value_key: str, weight_key: str
+) -> float | None:
+    """Pool a stored per-sample ratio (`value_key`) weighted by `weight_key`.
+
+    Recovers each sample's underlying sum as ratio * weight, sums those, and
+    divides by the pooled weight. None when no sample carries the ratio or the
+    pooled weight is 0."""
+    num = 0.0
+    denom = 0
+    for s in per_sample:
+        v = s.get(value_key)
+        w = s.get(weight_key)
+        if v is None or not w:
+            continue
+        num += v * w
+        denom += w
+    return num / denom if denom else None
+
+
+def _merge_histograms(per_sample: list[dict[str, Any]], key: str) -> dict[str, int]:
+    """Per-bucket sum of the per-sample `key` histograms (string bucket keys),
+    returned ordered by numeric bucket value for a stable response."""
+    merged: dict[str, int] = {}
+    for s in per_sample:
+        for bucket, count in (s.get(key) or {}).items():
+            merged[bucket] = merged.get(bucket, 0) + count
+    return {k: merged[k] for k in sorted(merged, key=int)}
+
+
+def _merge_mate(per_sample: list[dict[str, Any]]) -> MateQCAggregate:
+    """Pool a list of per-sample mate summaries (each the r1/r2 block of a
+    qc_report) into one MateQCAggregate. See MateQCAggregate for the weighting."""
+    min_lengths = [s["min_length"] for s in per_sample if s.get("min_length") is not None]
+    max_lengths = [s["max_length"] for s in per_sample if s.get("max_length") is not None]
+    return MateQCAggregate(
+        reads=sum(s["reads"] for s in per_sample),
+        total_bases=sum(s["total_bases"] for s in per_sample),
+        mean_quality=_weighted_mean(per_sample, "mean_quality", "total_bases"),
+        gc_content=_weighted_mean(per_sample, "gc_content", "total_bases"),
+        n_content=_weighted_mean(per_sample, "n_content", "total_bases"),
+        min_length=min(min_lengths) if min_lengths else None,
+        max_length=max(max_lengths) if max_lengths else None,
+        mean_length=_weighted_mean(per_sample, "mean_length", "reads"),
+        quality_histogram=_merge_histograms(per_sample, "quality_histogram"),
+        gc_histogram=_merge_histograms(per_sample, "gc_histogram"),
+        length_histogram=_merge_histograms(per_sample, "length_histogram"),
+    )
+
+
+def merge_qc_reports(samples: list[SampleQCReport]) -> MergedQCAggregate:
+    """Merge a pool's per-sample QC reports into the run-level MergedQCAggregate.
+
+    Raw and filtered points merge independently over the samples that carry that
+    point; a point with no reports yields None. Pure (no DB) so it is unit-tested
+    directly from constructed SampleQCReport lists."""
+    return MergedQCAggregate(
+        raw=_merge_qc_point([s.raw_qc_report for s in samples if s.raw_qc_report is not None]),
+        filtered=_merge_qc_point(
+            [s.filtered_qc_report for s in samples if s.filtered_qc_report is not None]
+        ),
+    )
+
+
+class PoolQCReport(BaseModel):
+    """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool/{P}/qc-report.
+
+    The pool's merged (multiqc-equivalent) QC report: the read-metric rollup
+    (reused from the pool metadata endpoint), the run-level `merged` aggregate of
+    every per-sample QC report, and the per-sample `samples` detail. Everything
+    is compute-on-read — `merged` is aggregated from the constituent
+    sequenced_samples' persisted reports at request time, so it never drifts when
+    a sample is re-processed or deleted. `samples_with_qc_report` counts how many
+    of the pool's non-retired samples carry at least a raw report, so a partial
+    pool (some samples still unprocessed) is interpretable."""
+
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    sample_count: int
+    samples_with_qc_report: int
+    read_metrics: PoolReadMetrics
+    merged: MergedQCAggregate
+    samples: list[SampleQCReport]
+
+
+class PoolCompletionStatus(BaseModel):
+    """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool/{P}/completion.
+
+    The pool's prep-generation completion rollup: each non-retired
+    sequenced_sample is classified by the state of its fastq-to-parquet work
+    tickets (any version), and the per-sample states are tallied into the five
+    mutually-exclusive buckets below. This is the SPP GenPrepFileJob end-state
+    equivalent — it answers "has the pool's per-sample fastq→parquet fan-out
+    finished?" — surfaced alongside the read-metric and QC rollups.
+
+    Per-sample classification (precedence, highest first), so a sample appears in
+    exactly one bucket:
+      completed     — has at least one COMPLETED fastq-to-parquet ticket.
+      in_flight     — no COMPLETED ticket but at least one PENDING/QUEUED/
+                      PROCESSING (e.g. a re-submitted retry); work is ongoing.
+      no_data       — no COMPLETED and nothing in flight, but at least one
+                      NO_DATA (an empty/blank well — a terminal outcome that is
+                      NOT a failure). Outranks failed so a sample carrying both a
+                      no_data and a stale failed ticket counts as no_data.
+      failed        — no COMPLETED, nothing in flight, no NO_DATA, but at least
+                      one FAILED.
+      not_submitted — no fastq-to-parquet ticket at all.
+
+    `complete` is the pool-level done flag: the pool is non-empty and every
+    sample is in a terminal-accounted state — COMPLETED or NO_DATA (so a plate
+    of real data with empty wells still reaches `complete=True`, and a
+    zero-sample pool reads `complete=False`, not vacuously true). Everything is
+    compute-on-read over the work_ticket table, so it never drifts when a sample
+    is re-processed, re-submitted, or deleted."""
+
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    sample_count: Annotated[int, Field(ge=0)]
+    samples_completed: Annotated[int, Field(ge=0)]
+    samples_in_flight: Annotated[int, Field(ge=0)]
+    samples_no_data: Annotated[int, Field(ge=0)]
+    samples_failed: Annotated[int, Field(ge=0)]
+    samples_not_submitted: Annotated[int, Field(ge=0)]
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def complete(self) -> bool:
+        """True when the pool has samples and every one is in a terminal-
+        accounted state: a COMPLETED fastq-to-parquet ticket or a NO_DATA
+        (empty-well) outcome."""
+        return (
+            self.sample_count > 0
+            and (self.samples_completed + self.samples_no_data) == self.sample_count
+        )
+
+
 class SequencedPoolPreflightResponse(BaseModel):
     """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool/{P}/preflight.
 
@@ -2184,3 +2466,70 @@ class SequenceRange(BaseModel):
     sequence_idx_start: Annotated[int, Field(gt=0)]
     sequence_idx_stop: Annotated[int, Field(gt=0)]
     created_at: AwareDatetime
+
+
+# ---------------------------------------------------------------------------
+# Mask definition (read-filtering config identity)
+# ---------------------------------------------------------------------------
+
+
+class MaskDefinitionMintRequest(BaseModel):
+    """Body for POST /api/v1/mask-definition.
+
+    Mints (or returns the existing) mask_idx for a read-filtering config.
+    `params` is the full config blob — host references, QC settings, etc.;
+    its canonical-JSON SHA-256 is the dedup key, so the same config always
+    resolves to the same mask_idx fleet-wide (idempotent mint). Service-account
+    callers with `read_masked:doget` only — humans never mint masks.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    filter_workflow: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
+    filter_version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
+    # The config blob the mask_idx is deduplicated on. Must be a JSON object so
+    # the hash is over a stable, named-key structure (not a bare scalar/array).
+    params: dict[str, Any]
+
+
+class MaskDefinition(BaseModel):
+    """Returned by POST /api/v1/mask-definition (200/201).
+
+    `mask_idx` is the filtering-config discriminator that tags the data plane's
+    read_mask / read_masked rows. The same `params` (canonically hashed) always
+    yields the same `mask_idx`.
+    """
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    filter_workflow: str
+    filter_version: str
+    params: dict[str, Any]
+    created_at: AwareDatetime
+
+
+class MaskDefinitionDeleteResponse(BaseModel):
+    """Returned by DELETE /api/v1/mask-definition/{mask_idx}.
+
+    `rows_deleted` is the DuckLake `read_mask` row count the data plane removed
+    (0 on an idempotent re-run); the Postgres `mask_definition` row is purged
+    last. Referencing `work_ticket` rows detach automatically via the
+    `ON DELETE SET NULL` FK."""
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    rows_deleted: int
+
+
+class ReadMaskedDoGetTicketRequest(BaseModel):
+    """Body for POST /api/v1/read-masked/ticket/doget.
+
+    Signs a Flight DoGet ticket scoped to a single (prep_sample_idx, mask_idx)
+    on the data plane's `read_masked` view. Both identifiers are mandatory: the
+    data plane's empty-filter path would dump every sample's pass reads across
+    every mask, so the route never signs an unfiltered read_masked ticket
+    (the mandatory-filter invariant).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    mask_idx: Annotated[int, Field(gt=0)]

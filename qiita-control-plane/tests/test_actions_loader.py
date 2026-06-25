@@ -543,14 +543,18 @@ def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():
     v12 = by_key[("fastq-to-parquet", "1.2.0")]
     assert v12.target_kind == ScopeTargetKind.PREP_SAMPLE
     assert v12.target_processing_kinds == ["sequenced"]
-    # The trailing persist-read-metrics is an in-process `action:`,
-    # consuming the three count sidecars; it appears in the unified
-    # steps list after the three compute steps.
+    # qc_report_raw reports on the raw fastq output (before qc re-emits `reads`);
+    # qc_report_filtered reports on the host-filtered output. The trailing
+    # persist-read-metrics is an in-process `action:` consuming the three count
+    # sidecars. All appear in the unified steps list in execution order.
     assert [s.name for s in v12.steps] == [
         "fastq",
+        "qc_report_raw",
         "qc",
         "host_filter",
+        "qc_report_filtered",
         "persist-read-metrics",
+        "persist-qc-report",
     ]
     # Writing the sample's sequenced_sample row requires prep_sample:write.
     assert v12.scopes == ["prep_sample:write"]
@@ -562,6 +566,24 @@ def test_load_actions_loads_on_disk_fastq_to_parquet_yamls():
         "quality_filtered_read_count",
     ]
     assert persist.outputs == []
+
+    # persist-qc-report consumes the two qc_report.json sidecars (raw + filtered)
+    # and writes them onto the sequenced_sample as JSONB; no bound output.
+    persist_qc = next(s for s in v12.steps if s.name == "persist-qc-report")
+    assert persist_qc.inputs == ["raw_qc_report", "filtered_qc_report"]
+    assert persist_qc.outputs == []
+
+    # Both qc_report steps share one module, disambiguated by input/output binding:
+    # raw consumes `reads` + emits `raw_qc_report`; filtered consumes
+    # `filtered_reads` + emits `filtered_qc_report`.
+    qc_report_raw = next(s for s in v12.steps if s.name == "qc_report_raw")
+    qc_report_filtered = next(s for s in v12.steps if s.name == "qc_report_filtered")
+    assert qc_report_raw.module == "qiita_compute_orchestrator.jobs.qc_report"
+    assert qc_report_filtered.module == "qiita_compute_orchestrator.jobs.qc_report"
+    assert qc_report_raw.inputs == ["reads"]
+    assert qc_report_raw.outputs == ["raw_qc_report"]
+    assert qc_report_filtered.inputs == ["filtered_reads"]
+    assert qc_report_filtered.outputs == ["filtered_qc_report"]
 
     v12_fastq = next(s for s in v12.steps if s.name == "fastq")
     # 1.2.0's fastq also emits the raw read count sidecar, unlike 1.0.0/1.1.0.
@@ -638,7 +660,9 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     assert _BCL_CONVERT_ACTION_VERSION == bcl.version == "1.0.0"
 
     step_names = [s.name for s in bcl.steps]
-    assert step_names == ["bcl_convert_prep", "bcl_convert"]
+    # Demux (prep + bcl_convert) then store the pool's reads once
+    # (ingest_reads → register the per-sample read parts into `read`).
+    assert step_names == ["bcl_convert_prep", "bcl_convert", "ingest_reads", "register-files"]
 
     prep = next(s for s in bcl.steps if s.name == "bcl_convert_prep")
     assert prep.module == "qiita_compute_orchestrator.jobs.bcl_convert_prep"
@@ -672,8 +696,11 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     # context_schema gates on the operator-supplied BCL folder path; the
     # absolute-path pattern keeps the launcher from resolving against a
     # surprise CWD on the compute node.
-    assert bcl.context_schema["required"] == ["bcl_input_dir"]
+    assert bcl.context_schema["required"] == ["bcl_input_dir", "sample_map"]
     assert bcl.context_schema["properties"]["bcl_input_dir"]["pattern"] == "^/"
+    # The pool roster the ingest_reads step keys off (prep_sample_idx ↔
+    # pool_item_id), embedded by submit-bcl-convert.
+    assert bcl.context_schema["properties"]["sample_map"]["type"] == "array"
 
 
 def test_load_actions_handles_two_versions_of_same_action(tmp_path):
@@ -691,3 +718,27 @@ def test_load_actions_handles_two_versions_of_same_action(tmp_path):
         ("reference-add", "1.0.0"),
         ("reference-add", "1.1.0"),
     ]
+
+
+def test_load_actions_read_mask_audience_is_admin_only():
+    """The on-disk `workflows/read-mask/1.0.0.yaml` audience excludes plain
+    `user`: submitting a read mask (host filter / QC reprocessing) now triggers
+    the data plane to re-materialize the sample's RAW reads (human-containing)
+    via the `export_read` DoAction, so it is an admin operation. Locks the
+    audience so a revert that re-admits `user` surfaces here."""
+    from pathlib import Path
+
+    from qiita_common.auth_constants import SystemRole
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    by_id = {a.action_id: a for a in load_actions(repo_root / "workflows")}
+    read_mask = by_id["read-mask"]
+
+    assert read_mask.audience.service is False
+    assert SystemRole.USER not in read_mask.audience.human_roles
+    assert set(read_mask.audience.human_roles) == {
+        SystemRole.WET_LAB_ADMIN,
+        SystemRole.SYSTEM_ADMIN,
+    }

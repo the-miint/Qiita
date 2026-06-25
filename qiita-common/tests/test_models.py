@@ -555,6 +555,23 @@ def test_dedupe_secondary_study_idxs():
     assert req.secondary_study_idxs == [5, 3]
 
 
+def test_sequenced_sample_create_rejects_host_references():
+    """Host references are not a sample-creation property — they parameterize the
+    read mask and are supplied at human-filter submission. The model forbids them
+    (extra='forbid'), so a stray host-ref key is rejected at the wire boundary."""
+    from qiita_common.models import SequencedSampleCreateRequest
+
+    with pytest.raises(ValidationError):
+        SequencedSampleCreateRequest(
+            biosample_idx=1,
+            prep_protocol_idx=1,
+            owner_idx=1,
+            sequenced_pool_item_id="X",
+            primary_study_idx=1,
+            host_rype_reference_idx=7,
+        )
+
+
 def test_missing_reason_ref_rejects_empty_name():
     """Tests the case where MissingReasonRef is constructed with an
     empty name: validation fails so the empty marker never reaches the
@@ -653,3 +670,74 @@ def test_pool_read_metrics_fraction_recomputed_from_sums():
     )
     assert empty.fraction_passing_quality_filter is None
     assert empty.sample_count == 3
+
+
+def test_pool_completion_status_complete_flag():
+    """PoolCompletionStatus.complete is True only when the pool has samples and
+    every one is in a terminal-accounted state (COMPLETED or NO_DATA); a partial
+    pool and a zero-sample pool both read False (the latter is not vacuously
+    complete)."""
+    from qiita_common.models import PoolCompletionStatus
+
+    done = PoolCompletionStatus(
+        sequenced_pool_idx=1,
+        sequencing_run_idx=1,
+        sample_count=3,
+        samples_completed=3,
+        samples_in_flight=0,
+        samples_no_data=0,
+        samples_failed=0,
+        samples_not_submitted=0,
+    )
+    assert done.complete is True
+
+    # A plate of real data with empty wells: completed + no_data == sample_count
+    # still reaches complete (the whole point of the no_data outcome).
+    done_with_empty_wells = PoolCompletionStatus(
+        sequenced_pool_idx=1,
+        sequencing_run_idx=1,
+        sample_count=3,
+        samples_completed=2,
+        samples_in_flight=0,
+        samples_no_data=1,
+        samples_failed=0,
+        samples_not_submitted=0,
+    )
+    assert done_with_empty_wells.complete is True
+
+    # A pool with a genuine failure is NOT complete (failed is not accounted).
+    with_failure = PoolCompletionStatus(
+        sequenced_pool_idx=1,
+        sequencing_run_idx=1,
+        sample_count=3,
+        samples_completed=2,
+        samples_in_flight=0,
+        samples_no_data=0,
+        samples_failed=1,
+        samples_not_submitted=0,
+    )
+    assert with_failure.complete is False
+
+    partial = PoolCompletionStatus(
+        sequenced_pool_idx=1,
+        sequencing_run_idx=1,
+        sample_count=3,
+        samples_completed=2,
+        samples_in_flight=1,
+        samples_no_data=0,
+        samples_failed=0,
+        samples_not_submitted=0,
+    )
+    assert partial.complete is False
+
+    empty = PoolCompletionStatus(
+        sequenced_pool_idx=1,
+        sequencing_run_idx=1,
+        sample_count=0,
+        samples_completed=0,
+        samples_in_flight=0,
+        samples_no_data=0,
+        samples_failed=0,
+        samples_not_submitted=0,
+    )
+    assert empty.complete is False

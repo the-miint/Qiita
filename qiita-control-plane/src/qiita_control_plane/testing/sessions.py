@@ -37,6 +37,7 @@ COMPUTE_WORKER_FIXTURE_SCOPES: frozenset[Scope] = frozenset(
         Scope.TICKET_DOGET,
         Scope.SEQUENCE_RANGE_MINT,
         Scope.SEQUENCED_POOL_PREFLIGHT_READ,
+        Scope.READ_MASKED_DOGET,
     }
 )
 
@@ -90,29 +91,19 @@ async def human_admin_session(postgres_pool):
         " WHERE idx = $1 AND retired = false",
         idx,
     )
+    # Derive the token's scopes from the real system_admin ceiling rather
+    # than hand-listing them — the docstring promises "the full admin scope
+    # ceiling", and deriving makes that literally true so the fixture can
+    # never drift from ROLE_IMPLIED_SCOPES (e.g. a newly-added admin scope
+    # silently 403ing future admin-route tests). test_human_admin_fixture_
+    # scopes_equal_ceiling locks the equality in.
+    from qiita_control_plane.auth.scopes import ROLE_IMPLIED_SCOPES
+
     plaintext, _ = await mint_api_token(
         postgres_pool,
         principal_idx=idx,
         label="session-admin",
-        scopes=[
-            Scope.SELF_PROFILE,
-            Scope.SELF_TOKEN,
-            Scope.REFERENCE_READ,
-            Scope.REFERENCE_WRITE,
-            Scope.REFERENCE_DELETE,
-            Scope.BIOSAMPLE_READ,
-            Scope.BIOSAMPLE_WRITE,
-            Scope.PREP_SAMPLE_READ,
-            Scope.PREP_SAMPLE_WRITE,
-            Scope.SEQUENCED_POOL_DELETE,
-            Scope.STUDY_READ,
-            Scope.STUDY_WRITE,
-            Scope.ADMIN_USER,
-            Scope.ADMIN_SERVICE_ACCOUNT,
-            Scope.ADMIN_AUDIT_READ,
-            Scope.ADMIN_BIOSAMPLE_OWNER_ID_READ,
-            Scope.TICKET_DOPUT,
-        ],
+        scopes=list(ROLE_IMPLIED_SCOPES[SystemRole.SYSTEM_ADMIN]),
     )
     return {
         "principal_idx": idx,

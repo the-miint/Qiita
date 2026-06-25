@@ -104,6 +104,14 @@ async def _cleanup_tracked(pool, created: dict) -> None:
             st,
         )
     await delete_idxs(pool, "sequenced_sample", created["sequenced_sample"])
+    # References are FK'd by sequenced_sample.host_*_reference_idx (ON DELETE
+    # RESTRICT), so drop them only after the samples above are gone. The
+    # reference PK is reference_idx (not idx), so delete_idxs does not apply.
+    if created["reference"]:
+        await pool.execute(
+            "DELETE FROM qiita.reference WHERE reference_idx = ANY($1::bigint[])",
+            created["reference"],
+        )
     await delete_idxs(pool, "prep_sample", created["prep_sample"])
     await delete_idxs(pool, "sequenced_pool", created["sequenced_pool"])
     await delete_idxs(pool, "sequencing_run", created["sequencing_run"])
@@ -159,6 +167,7 @@ async def ctx(role_keyed_clients):
         "prep_sample_metadata": [],
         "prep_sample_to_study": [],
         "sequenced_sample": [],
+        "reference": [],
         "prep_sample": [],
         "sequenced_pool": [],
         "sequencing_run": [],
@@ -331,6 +340,33 @@ async def test_import_sequenced_sample_from_run_wet_lab_admin_minimal(ctx):
         "ena_run_accession": None,
     }
     assert dict(ss_row) == expected_ss_row
+
+
+async def test_import_sequenced_sample_rejects_host_references(ctx):
+    # Host references are not a sample-creation property — they parameterize the
+    # read mask and are supplied at human-filter submission. The create request
+    # forbids unknown keys, so a stray host-ref key is rejected (422) and never
+    # reaches a column (the columns no longer exist).
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "wet-host")
+    study_idx = await _seed_study(ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="host")
+    bs_idx = await _seed_biosample_linked_to_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], study_idx=study_idx
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+
+    resp = await _post_sequenced_sample(
+        ctx["wet"],
+        ctx,
+        run_idx,
+        pool_idx,
+        biosample_idx=bs_idx,
+        prep_protocol_idx=protocol_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        sequenced_pool_item_id=_unique_item_id("WET-HOST"),
+        primary_study_idx=study_idx,
+        host_rype_reference_idx=7,
+    )
+    assert resp.status_code == 422, resp.text
 
 
 async def test_import_sequenced_sample_from_run_with_metadata(ctx):

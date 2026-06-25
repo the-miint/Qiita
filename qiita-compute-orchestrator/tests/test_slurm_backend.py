@@ -20,7 +20,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import (
     ComputeTarget,
     StepBaselineResources,
@@ -632,6 +632,39 @@ async def test_run_step_native_failure_enriched_from_launcher_stderr(jwt_path, b
     # so operators still see the job_id / state / exit_code.
     assert "FAILED" in ei.value.reason
     assert "exit_code=1" in ei.value.reason
+
+
+@pytest.mark.asyncio
+async def test_run_step_native_no_data_raises_step_no_data(jwt_path, baseline, tmp_path):
+    """A native step that hit a terminal no-data outcome (an empty FASTQ well)
+    writes a structured no-data line to stderr and exits non-zero (SLURM marks
+    it FAILED). result_step parses that line BEFORE failure classification and
+    raises StepNoData — NOT a BackendFailure — so the runner transitions the
+    ticket to NO_DATA, never FAILED."""
+    transport, _ = _job_running_then("FAILED", exit_code=1)
+    backend = _make_backend(transport, jwt_path)
+
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    no_data_reason = "FASTQ file contains no records: /data/well_R1.fastq.gz"
+    (logs_dir / "stderr").write_text(
+        json.dumps({"kind": "no_data", "step_name": "fastq", "reason": no_data_reason}) + "\n"
+    )
+
+    with pytest.raises(StepNoData) as ei:
+        await _run_step_via_trio(
+            backend,
+            "fastq",
+            {},
+            tmp_path,
+            scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+            work_ticket_idx=99,
+            module=FASTQ_TO_PARQUET_MODULE,
+            baseline_resources=baseline,
+        )
+    assert not isinstance(ei.value, BackendFailure)
+    assert ei.value.step_name == "fastq"
+    assert "contains no records" in ei.value.reason
 
 
 @pytest.mark.asyncio

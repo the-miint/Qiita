@@ -8,8 +8,8 @@ branches that path doesn't exercise:
 
   - FASTQ with duplicate sequences (no dedup; sequence_idx still unique).
   - FASTA input (no quality scores) writes NULL into the qual1 column.
-  - Empty input is rejected as BAD_INPUT (ValueError → BackendFailure
-    one layer up); no Parquet is written and no range is minted.
+  - Empty input is a terminal no-data outcome (StepNoData → the runner's
+    NO_DATA transition); no Parquet is written and no range is minted.
   - Missing input path raises FileNotFoundError (the framework
     dispatcher maps that to BackendFailure(BAD_INPUT) one layer up).
 
@@ -28,6 +28,7 @@ import asyncio
 
 import duckdb
 import pytest
+from qiita_common.backend_failure import StepNoData
 
 import qiita_compute_orchestrator.jobs.fastq_to_parquet as fastq_module
 from qiita_compute_orchestrator.jobs.fastq_to_parquet import (
@@ -89,11 +90,21 @@ def test_execute_writes_reads_parquet_for_fastq(fake_mint, tmp_path):
         tmp_path / "ws",
     )
     parquet = outputs["reads"]
-    assert parquet.name == "reads.parquet"
+    assert parquet.name == "read.parquet"
     assert parquet.exists()
+    # The workspace is exposed as read_staging_dir so a register-files step loads
+    # read.parquet into the DuckLake `read` table.
+    assert outputs["read_staging_dir"] == tmp_path / "ws"
 
     # mint was called once with the exact count.
     assert fake_mint == [(42, 3)]
+
+    # Every read carries the prep_sample_idx scope/prune column.
+    with duckdb.connect(":memory:") as conn:
+        ps = conn.execute(
+            f"SELECT DISTINCT prep_sample_idx FROM read_parquet('{parquet}')"
+        ).fetchall()
+    assert ps == [(42,)]
 
     # Raw read count: 3 single-end reads → 3 reads r1r2 (R1 only),
     # layout 'single'.
@@ -259,38 +270,39 @@ def test_execute_paired_mate_id_mismatch_surfaces_as_duckdb_error(fake_mint, tmp
     assert fake_mint == []
 
 
-def test_execute_rejects_empty_input(fake_mint, tmp_path):
-    """An empty input file raises ValueError (the framework dispatcher
-    maps that to BAD_INPUT) instead of producing a zero-row Parquet.
-    No Parquet is written and the mint is NOT called — the CP would
-    reject count=0 anyway, and emitting a zero-row artifact masks
-    upstream data problems (a sequencing run that produced nothing
-    should surface, not silently land as an empty result).
+def test_execute_empty_input_is_no_data(fake_mint, tmp_path):
+    """An empty input file raises StepNoData — a TERMINAL no-data outcome
+    (an empty well: a blank, a no-template control, or a failed-yield well),
+    NOT a failure. No range is minted and no read.parquet is written: the CP
+    would reject count=0 anyway, and the runner transitions the ticket to
+    NO_DATA so the pool can still reach a "done" state.
 
-    Detection runs in Python (decompressed-stream peek) before any
-    DuckDB work, so it doesn't depend on miint's exception wording —
-    see miint.is_empty_sequence_file."""
+    Detection runs in Python (decompressed-stream peek) before any DuckDB
+    work, so it doesn't depend on miint's exception wording — see
+    miint.is_empty_sequence_file. The signal carries the YAML step name."""
     empty = tmp_path / "empty.fastq"
     empty.write_text("")
 
-    with pytest.raises(ValueError, match="contains no records"):
+    with pytest.raises(StepNoData, match="contains no records") as excinfo:
         _run(
             Inputs(fastq_path=empty, prep_sample_idx=42, work_ticket_idx=1),
             tmp_path / "ws",
         )
-    # No mint call for an empty sample (failure happens before phase 3).
+    assert excinfo.value.step_name == YAML_STEP_NAME
+    # No mint call for an empty sample (no_data happens before phase 3).
     assert fake_mint == []
-    # No reads.parquet emitted — workspace contains no Parquet artifact.
+    # No read.parquet emitted — workspace contains no Parquet artifact.
     workspace = tmp_path / "ws"
     if workspace.exists():
         assert list(workspace.glob("*.parquet")) == []
 
 
-def test_execute_rejects_empty_gzipped_input(fake_mint, tmp_path):
+def test_execute_empty_gzipped_input_is_no_data(fake_mint, tmp_path):
     """The decompressed-stream peek catches `.fastq.gz` files that
     decompress to zero bytes (the realistic empty-case — a sequencer
     that produced no reads but still gzipped the output to ~20 bytes
-    of framing). File size alone wouldn't catch this."""
+    of framing). File size alone wouldn't catch this. Same terminal
+    no-data outcome (StepNoData) as the plain empty case."""
     import gzip
 
     empty_gz = tmp_path / "empty.fastq.gz"
@@ -299,7 +311,7 @@ def test_execute_rejects_empty_gzipped_input(fake_mint, tmp_path):
     with gzip.open(empty_gz, "wb"):
         pass
 
-    with pytest.raises(ValueError, match="contains no records"):
+    with pytest.raises(StepNoData, match="contains no records"):
         _run(
             Inputs(fastq_path=empty_gz, prep_sample_idx=42, work_ticket_idx=1),
             tmp_path / "ws",
@@ -307,16 +319,15 @@ def test_execute_rejects_empty_gzipped_input(fake_mint, tmp_path):
     assert fake_mint == []
 
 
-def test_execute_rejects_empty_reverse_fastq(fake_mint, tmp_path):
-    """A non-empty R1 with an empty R2 is BAD_INPUT — paired-end input
-    requires both mates to carry records (mismatched counts would
-    surface from miint downstream anyway, but we raise the clearer
-    error up front)."""
+def test_execute_empty_reverse_fastq_is_no_data(fake_mint, tmp_path):
+    """A non-empty R1 with an empty R2 is also no-data — the pair has no
+    reads to write, so the well produced nothing. StepNoData, not a
+    failure; no mint, no Parquet."""
     r1 = _minimal_fastq(tmp_path)
     r2 = tmp_path / "r2_empty.fastq"
     r2.write_text("")
 
-    with pytest.raises(ValueError, match="reverse FASTQ file contains no records"):
+    with pytest.raises(StepNoData, match="reverse FASTQ file contains no records"):
         _run(
             Inputs(
                 fastq_path=r1,

@@ -24,13 +24,19 @@ from .client import (
     SlurmrestdError,
     TerminalSlurmState,
 )
-from .launcher_failure import LauncherFailure, parse_launcher_failure
+from .launcher_failure import (
+    LauncherFailure,
+    LauncherNoData,
+    parse_launcher_failure,
+    parse_launcher_no_data,
+)
 from .payload import build_job_submit_payload
 from .verify import VerificationFailure, parse_outputs_map, verify_container_output
 
 __all__ = [
     "DEFAULT_SLURMRESTD_API_VERSION",
     "LauncherFailure",
+    "LauncherNoData",
     "SlurmJobInfo",
     "SlurmrestdClient",
     "SlurmrestdError",
@@ -38,6 +44,7 @@ __all__ = [
     "VerificationFailure",
     "build_job_submit_payload",
     "parse_launcher_failure",
+    "parse_launcher_no_data",
     "parse_outputs_map",
     "verify_container_output",
 ]

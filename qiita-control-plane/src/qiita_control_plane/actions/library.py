@@ -135,31 +135,35 @@ async def _associate_genomes(
     pool: asyncpg.Pool,
     manifest_path: Path,
     genome_map_path: Path,
-    feature_mapping: dict[UUID, int],
+    feature_map_path: Path,
 ) -> None:
     """Write qiita.feature_genome rows for the entries in `genome_map_path`.
 
-    DuckDB JOINs manifest (read_id → sequence_hash) against genome_map
-    (read_id → genome_source, genome_source_id) on read_id. Rows whose
-    read_id isn't in the manifest are dropped by the INNER JOIN — the
-    genome map may legitimately cover only a subset of FASTA reads.
+    DuckDB JOINs the manifest (read_id → sequence_hash) against genome_map
+    (read_id → genome_source, genome_source_id) on read_id, and against the
+    already-written feature_map (sequence_hash → feature_idx) on
+    sequence_hash — so feature_idx is resolved set-side in DuckDB rather than
+    from an in-memory Python mapping. Rows whose read_id isn't in the manifest
+    are dropped by the INNER JOIN — the genome map may legitimately cover only
+    a subset of FASTA reads. Streamed in `_CHUNK_SIZE` batches so a
+    genome-scale map never materialises in Python.
     """
     with duckdb.connect(":memory:") as duck:
-        rows = duck.execute(
-            "SELECT m.sequence_hash, g.genome_source, g.genome_source_id"
+        reader = duck.execute(
+            "SELECT fm.feature_idx, g.genome_source, g.genome_source_id"
             " FROM read_parquet(?) AS m"
             " JOIN read_parquet(?) AS g USING (read_id)"
-            " ORDER BY m.sequence_hash",
-            [str(manifest_path), str(genome_map_path)],
-        ).fetchall()
-
-    for i in range(0, len(rows), _CHUNK_SIZE):
-        chunk = rows[i : i + _CHUNK_SIZE]
-        feat_idxs = [feature_mapping[h] for h, _, _ in chunk]
-        sources = [s for _, s, _ in chunk]
-        source_ids = [sid for _, _, sid in chunk]
-        async with pool.acquire() as conn, conn.transaction():
-            await _write_genome_associations(conn, feat_idxs, sources, source_ids)
+            " JOIN read_parquet(?) AS fm USING (sequence_hash)",
+            [str(manifest_path), str(genome_map_path), str(feature_map_path)],
+        ).to_arrow_reader(_CHUNK_SIZE)
+        for batch in reader:
+            feat_idxs = batch.column("feature_idx").to_pylist()
+            if not feat_idxs:
+                continue
+            sources = batch.column("genome_source").to_pylist()
+            source_ids = batch.column("genome_source_id").to_pylist()
+            async with pool.acquire() as conn, conn.transaction():
+                await _write_genome_associations(conn, feat_idxs, sources, source_ids)
 
 
 async def _write_membership_rows(
@@ -203,6 +207,13 @@ def _do_action_delete_reference(data_plane_url: str, token: bytes) -> list:
         return list(client.do_action(action))
 
 
+def _do_action_delete_mask(data_plane_url: str, token: bytes) -> list:
+    """Synchronous gRPC call to data plane — runs in thread executor."""
+    with _flight.FlightClient(data_plane_url) as client:
+        action = _flight.Action("delete_mask", token)
+        return list(client.do_action(action))
+
+
 # =============================================================================
 # Public primitives — exposed through LIBRARY by name
 # =============================================================================
@@ -217,14 +228,23 @@ async def mint_features(
     """Mint feature_idx values for sequence hashes in a manifest Parquet file.
 
     `manifest_path` points to a Parquet file with a `sequence_hash` column
-    (UUIDs). The function reads it via DuckDB, upserts qiita.feature in
-    chunks of `_CHUNK_SIZE`, and writes a `feature_map.parquet` into
+    (UUIDs). The function streams it via DuckDB in `_CHUNK_SIZE` batches,
+    upserts qiita.feature per batch, and writes a `feature_map.parquet` into
     `output_dir` with columns (sequence_hash UUID, feature_idx BIGINT).
+
+    Streaming is deliberate: this primitive runs in-process on the control
+    plane's single event loop, so it must never materialise the whole hash
+    set (a genome-scale reference is tens of millions of rows). Each batch is
+    bounded, the per-batch upsert `await`s (yielding the loop), and the one
+    large blocking step — the final Parquet write — is offloaded to a thread.
+    Mirrors the streaming contract `write_membership` already follows.
 
     Returns (feature_map_path, minted, reused). `minted` counts novel
     rows inserted; `reused` counts pre-existing rows. Idempotent:
     qiita.feature uses ON CONFLICT DO NOTHING, so resubmitting after a
-    partial-batch failure converges.
+    partial-batch failure converges, and the feature_map is de-duplicated to
+    one row per sequence_hash (identical sequences validly repeat in a
+    manifest under distinct read_ids).
 
     Reference-agnostic — the mint operation does not touch any reference
     table.
@@ -244,59 +264,66 @@ async def mint_features(
     output_dir.mkdir(parents=True, exist_ok=True)
     feature_map_path = output_dir / "feature_map.parquet"
 
-    # Read all sequence_hash values from the manifest into Python. For
-    # the reference-add flow this is bounded (~300K UUIDs ≈ 25 MB), and
-    # the per-chunk Postgres transactions below are the actual memory
-    # bottleneck. Larger workflows can switch to streaming via
-    # fetch_arrow_reader once we have one that needs it.
-    with duckdb.connect(":memory:") as duck:
-        rows = duck.execute(
-            "SELECT sequence_hash FROM read_parquet(?) ORDER BY sequence_hash",
-            [str(manifest_path)],
-        ).fetchall()
-    hashes: list[UUID] = [row[0] for row in rows]
-
-    full_mapping: dict[UUID, int] = {}
     total_minted = 0
     total_reused = 0
-    for i in range(0, len(hashes), _CHUNK_SIZE):
-        chunk_hashes = hashes[i : i + _CHUNK_SIZE]
-        chunk_entries = [FeatureHashEntry(sequence_hash=h) for h in chunk_hashes]
-        async with pool.acquire() as conn, conn.transaction():
-            chunk_mapping, minted, reused = await _mint_chunk(conn, chunk_entries)
-        full_mapping.update(chunk_mapping)
-        total_minted += minted
-        total_reused += reused
+    # Two connections: `read_conn` streams the manifest while `write_conn`
+    # holds the feature_map temp table and the final COPY. Separate so the
+    # open manifest reader and the per-batch INSERTs don't contend on one
+    # connection's single in-flight query. `temp_directory` lets write_conn
+    # spill the temp table to the (ephemeral) workspace under memory pressure
+    # rather than growing unbounded in the CP's RAM.
+    read_conn = duckdb.connect(":memory:")
+    write_conn = duckdb.connect(":memory:")
+    try:
+        # ROW_GROUP_SIZE_BYTES in PARQUET_OPTS requires
+        # preserve_insertion_order=false (DuckDB errors at bind time
+        # otherwise). The COPY's explicit ORDER BY still clusters each row
+        # group tightly by feature_idx — which is what row-group pushdown reads.
+        write_conn.execute("SET preserve_insertion_order=false")
+        write_conn.execute(f"SET temp_directory='{validate_parquet_path(output_dir)}'")
+        write_conn.execute("CREATE TEMP TABLE feature_map (sequence_hash UUID, feature_idx BIGINT)")
 
-    # Write feature_map.parquet via DuckDB. We have a small Python dict
-    # already in hand, and DuckDB's `executemany` + `COPY` ferries it to
-    # Parquet without us having to construct an Arrow Table manually.
-    # `write_membership` below uses `to_arrow_reader` for the *opposite*
-    # direction (streaming a large Parquet back into Python in batches);
-    # both are pyarrow under the hood, but the API surface chosen here
-    # matches the data-movement direction.
-    pairs = [(str(h), idx) for h, idx in full_mapping.items()]
-    with duckdb.connect(":memory:") as duck:
-        # PARQUET_OPTS carries ROW_GROUP_SIZE_BYTES, which requires
-        # preserve_insertion_order=false (DuckDB errors at bind time otherwise).
-        # The explicit ORDER BY still clusters each row group tightly by
-        # feature_idx — which is what Parquet row-group pushdown reads — so
-        # dropping insertion-order preservation is safe here.
-        duck.execute("SET preserve_insertion_order=false")
-        duck.execute("CREATE TEMP TABLE feature_map (sequence_hash UUID, feature_idx BIGINT)")
-        # Empty manifest is a valid degenerate state (FASTA had no sequences);
-        # DuckDB's executemany rejects an empty parameter list, so guard
-        # before the call. The COPY below still produces a valid empty Parquet.
-        if pairs:
-            duck.executemany("INSERT INTO feature_map VALUES (?, ?)", pairs)
+        # No ORDER BY on the read: minting is order-independent (per-hash
+        # upsert), and an ORDER BY would force a full blocking sort before the
+        # first batch, defeating the streaming. The output is separately
+        # ordered by feature_idx at COPY time.
+        reader = read_conn.execute(
+            "SELECT sequence_hash FROM read_parquet(?)",
+            [str(manifest_path)],
+        ).to_arrow_reader(_CHUNK_SIZE)
+        for batch in reader:
+            raw_hashes = batch.column("sequence_hash").to_pylist()
+            if not raw_hashes:
+                continue
+            entries = [FeatureHashEntry(sequence_hash=h) for h in raw_hashes]
+            async with pool.acquire() as conn, conn.transaction():
+                chunk_mapping, minted, reused = await _mint_chunk(conn, entries)
+            total_minted += minted
+            total_reused += reused
+            # `chunk_mapping` is keyed by unique sequence_hash, so within-batch
+            # duplicates collapse here; cross-batch duplicates are collapsed by
+            # SELECT DISTINCT at COPY time below.
+            if chunk_mapping:
+                write_conn.executemany(
+                    "INSERT INTO feature_map VALUES (?, ?)",
+                    [(str(h), idx) for h, idx in chunk_mapping.items()],
+                )
+
         out = validate_parquet_path(feature_map_path)
-        duck.execute(
-            "COPY (SELECT sequence_hash, feature_idx FROM feature_map "
-            f"      ORDER BY feature_idx) TO '{out}' ({PARQUET_OPTS})"
+        # The one large blocking step — DISTINCT + sort + Parquet encode — runs
+        # off the event loop so it never starves the API the CP also serves. An
+        # empty manifest yields zero rows and a valid empty Parquet here.
+        await asyncio.to_thread(
+            write_conn.execute,
+            "COPY (SELECT DISTINCT sequence_hash, feature_idx FROM feature_map "
+            f"      ORDER BY feature_idx) TO '{out}' ({PARQUET_OPTS})",
         )
+    finally:
+        read_conn.close()
+        write_conn.close()
 
     if genome_map_path is not None:
-        await _associate_genomes(pool, manifest_path, genome_map_path, full_mapping)
+        await _associate_genomes(pool, manifest_path, genome_map_path, feature_map_path)
 
     return feature_map_path, total_minted, total_reused
 
@@ -385,21 +412,52 @@ async def register_index(
     )
 
 
+def _read_mask_counts(read_mask_path: Path) -> tuple[int, int, int]:
+    """Derive the three per-stage both-mates (`*_r1r2`) read counts from a
+    read_mask Parquet, returning (raw, biological, quality_filtered).
+
+    The mask has one row per read (a single-end read or a paired-end pair), so a
+    bare COUNT(*) would silently HALVE paired-end totals — the persisted columns
+    are `_r1r2` (both mates; a PE pair counts as 2). The mask records its layout
+    per row: `right_trim2` is non-NULL (0 or more) for paired-end and NULL for
+    single-end, so `COUNT(right_trim2)` is the R2 count and
+    `COUNT(*) + COUNT(right_trim2)` is the both-mates total — correct for SE
+    (no R2), PE, and a mix, with no SE/PE branching.
+
+    Buckets by `reason` (ReadMaskReason): raw = every row, biological = rows that
+    didn't fail QC (`reason NOT LIKE 'qc_%'` — i.e. `pass` or a `host_*` hit),
+    quality_filtered = the `pass` rows the read_masked view surfaces. raw >=
+    biological >= quality_filtered holds by construction (host_* only overrides
+    pass), satisfying the sequenced_sample monotonic CHECK."""
+    path_sql = validate_parquet_path(read_mask_path)
+    with duckdb.connect(":memory:") as duck:
+        raw, biological, quality_filtered = duck.execute(
+            "SELECT "
+            "  count(*) + count(right_trim2), "
+            "  count(*) FILTER (WHERE reason NOT LIKE 'qc_%') "
+            "    + count(right_trim2) FILTER (WHERE reason NOT LIKE 'qc_%'), "
+            "  count(*) FILTER (WHERE reason = 'pass') "
+            "    + count(right_trim2) FILTER (WHERE reason = 'pass') "
+            f"FROM read_parquet('{path_sql}')"
+        ).fetchone()
+    return raw, biological, quality_filtered
+
+
 async def persist_read_metrics(
     pool: asyncpg.Pool,
     prep_sample_idx: int,
-    raw_read_count_r1r2: int,
-    biological_read_count_r1r2: int,
-    quality_filtered_read_count_r1r2: int,
+    read_mask_path: Path,
 ) -> int:
     """Persist the three per-stage read counts onto the 1:1
-    sequenced_sample row for `prep_sample_idx` and return its idx.
+    sequenced_sample row for `prep_sample_idx`, deriving them from the
+    `read_mask` Parquet, and return its idx.
 
-    The counts are the both-mates (`*_r1r2`) totals the runner read from the
-    read_count.json sidecars (raw -> fastq, biological -> qc,
-    quality_filtered -> host_filter). The DB CHECK enforces
-    quality_filtered <= biological <= raw, so a swapped/garbled count fails
-    loudly at write time rather than persisting silently.
+    The counts are the both-mates (`*_r1r2`) totals computed from the mask's
+    per-read `reason` (see `_read_mask_counts`): raw = all reads, biological =
+    reads that passed QC (pass + host hits), quality_filtered = pass reads. The
+    DB CHECK enforces quality_filtered <= biological <= raw, which holds by
+    construction (host_* only overrides pass), so a garbled mask fails loudly at
+    write time rather than persisting silently.
 
     Fail-fast (loud) when no sequenced_sample row exists for the prep_sample: a
     sequenced prep_sample reaches read-metric persistence only after pooling
@@ -408,6 +466,11 @@ async def persist_read_metrics(
     re-runs this primitive and overwrites with the same counts (the
     set_updated_at trigger bumps updated_at / the ETag, which is correct: the
     row did change)."""
+    if not read_mask_path.exists():
+        raise FileNotFoundError(f"read_mask parquet not found: {read_mask_path}")
+    raw_read_count_r1r2, biological_read_count_r1r2, quality_filtered_read_count_r1r2 = (
+        _read_mask_counts(read_mask_path)
+    )
     ss_idx = await pool.fetchval(
         "UPDATE qiita.sequenced_sample"
         " SET raw_read_count_r1r2 = $2,"
@@ -424,6 +487,45 @@ async def persist_read_metrics(
         raise RuntimeError(
             f"no sequenced_sample row for prep_sample_idx={prep_sample_idx}; "
             "read-metric persistence requires the sample to be pooled "
+            "(its 1:1 sequenced_sample created) before fastq-to-parquet runs"
+        )
+    return ss_idx
+
+
+async def persist_qc_report(
+    pool: asyncpg.Pool,
+    prep_sample_idx: int,
+    raw_qc_report: dict[str, Any],
+    filtered_qc_report: dict[str, Any],
+) -> int:
+    """Persist the two fastqc-equivalent QC reports onto the 1:1 sequenced_sample
+    row for `prep_sample_idx` and return its idx.
+
+    The reports are the qc_report.json documents the runner read from the
+    qc_report_raw / qc_report_filtered step sidecars; they are stored verbatim as
+    JSONB (raw -> raw_qc_report, filtered -> filtered_qc_report). The pool-level
+    merged report aggregates them on read.
+
+    Fail-fast (loud) when no sequenced_sample row exists for the prep_sample —
+    same ordering invariant as persist_read_metrics: a sequenced prep_sample
+    reaches QC-report persistence only after pooling created its 1:1
+    sequenced_sample, so a miss is a real ordering bug, not a benign skip. The
+    UPDATE is idempotent — a workflow retried from the start overwrites with the
+    same reports."""
+    ss_idx = await pool.fetchval(
+        "UPDATE qiita.sequenced_sample"
+        " SET raw_qc_report = $2::jsonb,"
+        "     filtered_qc_report = $3::jsonb"
+        " WHERE prep_sample_idx = $1"
+        " RETURNING idx",
+        prep_sample_idx,
+        json.dumps(raw_qc_report),
+        json.dumps(filtered_qc_report),
+    )
+    if ss_idx is None:
+        raise RuntimeError(
+            f"no sequenced_sample row for prep_sample_idx={prep_sample_idx}; "
+            "QC-report persistence requires the sample to be pooled "
             "(its 1:1 sequenced_sample created) before fastq-to-parquet runs"
         )
     return ss_idx
@@ -497,6 +599,35 @@ async def delete_reference_data(
     return json.loads(results[0].body.to_pybytes())
 
 
+async def delete_mask_data(
+    *,
+    mask_idx: int,
+    hmac_secret: bytes,
+    data_plane_url: str,
+) -> int:
+    """Delete a mask's DuckLake read_mask rows via the data plane's DoAction.
+
+    Signs a `delete_mask` action token carrying only `mask_idx` and returns the
+    data plane's rows-deleted count. The delete is a logical `DELETE FROM
+    read_mask WHERE mask_idx = ?` inside one DuckLake transaction — no parquet is
+    reclaimed from disk (mirrors `delete_reference`).
+
+    Idempotent: a mask whose rows never registered (or were already deleted)
+    deletes zero rows and still succeeds. Raises pyarrow.flight.FlightError on
+    transport / data-plane failure."""
+    token = sign_action(
+        action="delete_mask",
+        payload={"mask_idx": mask_idx},
+        secret=hmac_secret,
+    )
+    results = await asyncio.get_event_loop().run_in_executor(
+        None, _do_action_delete_mask, data_plane_url, token
+    )
+    if not results:
+        return 0
+    return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
+
+
 # =============================================================================
 # Name → callable lookup for the workflow runner
 # =============================================================================
@@ -512,4 +643,5 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.REGISTER_FILES: register_files,
     LibraryPrimitive.REGISTER_INDEX: register_index,
     LibraryPrimitive.PERSIST_READ_METRICS: persist_read_metrics,
+    LibraryPrimitive.PERSIST_QC_REPORT: persist_qc_report,
 }

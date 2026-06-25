@@ -29,9 +29,11 @@ from .api_paths import (
 )
 from .backend_failure import (
     BACKEND_FAILURE_HEADER,
+    STEP_NO_DATA_HEADER,
     BackendFailure,
     BackendFailureBody,
     FailureKind,
+    StepNoDataBody,
 )
 from .models import (
     FoundJobWire,
@@ -146,6 +148,7 @@ class ComputeBackendClient:
             baseline_resources=baseline_resources,
         )
         resp = await self._post(URL_STEP_SUBMIT, body, step_name=step_name)
+        self._raise_if_step_no_data(resp)
         self._raise_if_backend_failure(resp)
         resp.raise_for_status()
         return StepHandleWire.model_validate(resp.json())
@@ -169,6 +172,7 @@ class ComputeBackendClient:
             StepResultRequest(handle=handle, status=status),
             step_name=handle.step_name,
         )
+        self._raise_if_step_no_data(resp)
         self._raise_if_backend_failure(resp)
         resp.raise_for_status()
         parsed = StepResultResponse.model_validate(resp.json())
@@ -256,3 +260,14 @@ class ComputeBackendClient:
         promised a BackendFailureBody and shipped something else."""
         if resp.headers.get(BACKEND_FAILURE_HEADER):
             raise BackendFailureBody.model_validate(resp.json()).to_exception()
+
+    @staticmethod
+    def _raise_if_step_no_data(resp: httpx.Response) -> None:
+        """Reconstruct and raise the typed StepNoData the orchestrator
+        structured (no-data header set), so the runner transitions the ticket
+        to NO_DATA — distinct from the BackendFailure → FAILED path. Checked
+        before `_raise_if_backend_failure`; the two share status 422 but carry
+        different discriminator headers, so a no-data response is never mistaken
+        for a failure."""
+        if resp.headers.get(STEP_NO_DATA_HEADER):
+            raise StepNoDataBody.model_validate(resp.json()).to_exception()

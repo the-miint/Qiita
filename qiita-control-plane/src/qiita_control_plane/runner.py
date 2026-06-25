@@ -22,6 +22,7 @@ consumers don't need to know the producer's attempt number.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -35,8 +36,12 @@ from qiita_common.actions import (
     WorkflowAction,
     WorkflowStep,
 )
-from qiita_common.api_paths import LibraryPrimitive, compute_upload_staging_path
-from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.api_paths import (
+    LibraryPrimitive,
+    compute_reads_staging_path,
+    compute_upload_staging_path,
+)
+from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.compute_backend_client import ComputeBackendClient
 from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
@@ -58,8 +63,13 @@ from qiita_common.models import (
 
 from . import step_progress
 from .actions.library import LIBRARY
-from .actions.reference import ReferenceNotFound, transition_reference_status
-from .auth.tickets import sign_ticket
+from .actions.reference import (
+    IllegalStatusTransition,
+    ReferenceNotFound,
+    transition_reference_status,
+)
+from .auth.tickets import sign_action, sign_ticket
+from .repositories.mask_definition import lookup_mask_idx_by_params, mint_mask_definition
 
 _log = logging.getLogger(__name__)
 
@@ -105,7 +115,11 @@ _INFRA_RETRY_BACKOFF_CAP_SECONDS = 60.0
 # WorkflowAborted instead of retrying forever against a ticket that is no
 # longer theirs.
 _TERMINAL_WORK_TICKET_STATES = frozenset(
-    {WorkTicketState.COMPLETED.value, WorkTicketState.FAILED.value}
+    {
+        WorkTicketState.COMPLETED.value,
+        WorkTicketState.NO_DATA.value,
+        WorkTicketState.FAILED.value,
+    }
 )
 
 
@@ -241,8 +255,10 @@ async def run_workflow(
     """
     work_ticket = await _fetch_work_ticket(pool, work_ticket_idx)
     # Optional per-run resource bump (gated to wet_lab_admin+ and validated
-    # <= the action ceiling at submission). Read once here and threaded to
-    # every step's dispatch so a CP restart re-attaches with the same override.
+    # <= the action ceiling at submission). Read once here as the starting
+    # memory floor; `_run_entry_with_retry` raises it (up to the ceiling) on an
+    # OOM-killed retry. A CP restart re-attaches with this static floor and
+    # re-escalates from there.
     _override = work_ticket.get("resource_override")
     mem_gb_override = _override.get("mem_gb") if isinstance(_override, dict) else None
     if not resume and work_ticket["state"] != WorkTicketState.PENDING.value:
@@ -341,6 +357,71 @@ async def run_workflow(
                 )
             )
 
+        # Read-ingest bindings (bcl-convert workflow's `ingest_reads` step):
+        # materialize the pool roster as a Parquet and hand the step the scratch
+        # root it writes durable per-sample reads under. Same inside-try
+        # placement as the resolvers above. `convert_dir` is NOT resolved here —
+        # it is the upstream `bcl_convert` step's output, bound during the loop.
+        if _workflow_declares_input(action.steps, SAMPLE_MAP_BINDING):
+            bound.update(await _resolve_sample_map(bound, workspace))
+        if _workflow_declares_input(action.steps, READS_STAGING_ROOT_BINDING):
+            bound[READS_STAGING_ROOT_BINDING] = str(upload_staging_root)
+
+        # Staged-read binding (read-mask workflow): `reads` is consumed by qc /
+        # host_filter but produced by no step, so bind it from the prep_sample's
+        # durable stored reads. Inside-try so an un-ingested sample FAILs cleanly.
+        if _workflow_needs_staged_reads(action.steps):
+            if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+                raise _submission_bad_input(
+                    "a workflow that masks stored reads must be prep_sample-scoped; "
+                    f"got {scope_target['kind']!r}"
+                )
+            bound.update(
+                await _resolve_staged_reads(
+                    scope_target,
+                    upload_staging_root,
+                    data_plane_url=data_plane_url,
+                    hmac_secret=hmac_secret,
+                    workspace=workspace,
+                )
+            )
+
+        # Read-mask identity: when a step threads `mask_idx` through its params
+        # (the host_filter step), mint the mask_idx for this filtering config and
+        # bind it before the loop. Same inside-try placement as the resolvers
+        # above so a failure (sample not pooled, unknown principal) lands in the
+        # outer FAILED handler. PREP_SAMPLE-scoped only — masks key on a sample's
+        # reads; another scope kind threading mask_idx would have no prep_sample.
+        if _workflow_needs_mask(action.steps):
+            if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+                raise _submission_bad_input(
+                    "a workflow that masks reads (threads mask_idx) must be "
+                    f"prep_sample-scoped; got {scope_target['kind']!r}"
+                )
+            adapter_path = bound.get(QC_ADAPTER_BINDING)
+            # Host refs come from the SAME action_context values
+            # `_resolve_host_filter_indexes` consumes for the applied filter, so
+            # the minted mask_idx's params describe the filter that ran. Absent →
+            # None (faithful "no host filtering"), never the sequenced_sample row.
+            bound.update(
+                await _mint_read_mask(
+                    pool,
+                    action_id=action.action_id,
+                    action_version=action.version,
+                    prep_sample_idx=scope_target["prep_sample_idx"],
+                    originator_principal_idx=work_ticket["originator_principal_idx"],
+                    instrument_model=bound.get("instrument_model"),
+                    adapter_parquet=Path(adapter_path) if adapter_path is not None else None,
+                    host_rype_reference_idx=bound.get("host_rype_reference_idx"),
+                    host_minimap2_reference_idx=bound.get("host_minimap2_reference_idx"),
+                )
+            )
+            # Persist the minted mask_idx onto the ticket for durable traceability
+            # (and a cheap shared-mask guard). Idempotent: a re-mint on resume
+            # re-resolves to the same mask_idx via the config-hash upsert and
+            # re-writes the same value here.
+            await _persist_mask_idx(pool, work_ticket_idx, bound[MASK_IDX_BINDING])
+
         for index, entry in enumerate(action.steps):
             # Conditional gate (WorkflowStep/WorkflowAction.when): skip this
             # entry when its named action_context key is present and falsy
@@ -367,9 +448,22 @@ async def run_workflow(
                 # Fast-forward an entry a prior run already finished: rebuild
                 # its outputs from disk without re-running it (an in-process
                 # action: is not idempotent; a SLURM step's result is
-                # re-verified from its manifest). Skip its status PATCH
-                # entirely — the resource is already at or past this status, so
-                # re-issuing it would be a redundant or backward transition.
+                # re-verified from its manifest).
+                #
+                # Its status advance must be RE-APPLIED here, not skipped: a
+                # `/run` redrive of a FAILED ticket resets a `failed` reference
+                # to `pending` (the FSM's only legal exit from `failed`) while
+                # KEEPING the completed step rows, rewinding the resource behind
+                # the transitions those steps already made. Without re-walking
+                # those edges the reference sits at `pending` while the first
+                # not-yet-completed step tries to advance from where it left off
+                # (e.g. `minting → loading`), which is illegal and dead-ends the
+                # redrive. `_advance_completed_step_status` only ever moves the
+                # resource FORWARD along a legal edge; on a normal
+                # startup-recovery resume (resource not rewound) it is a no-op or
+                # a rejected backward edge, both benign.
+                if entry.target_status:
+                    await _advance_completed_step_status(pool, scope_target, entry.target_status)
                 bound.update(
                     await _reconstruct_completed_outputs(
                         entry,
@@ -468,6 +562,17 @@ async def run_workflow(
         # write is guarded to a no-op when nothing is set.
         await _clear_transient_retry(pool, work_ticket_idx)
         return
+    except StepNoData as exc:
+        # Terminal no-data outcome (an empty FASTQ well) — NOT a failure. The
+        # step minted no identifiers and wrote no output; transition the ticket
+        # PROCESSING → NO_DATA with NULL failure_* columns. Deliberately does
+        # NOT PATCH action.failure_status (this isn't a failure) and does NOT
+        # advance action.success_status (the resource didn't reach the success
+        # state — no data was produced). Clear any in-place-retry marker so the
+        # now-terminal ticket shows no stale "stuck retrying" reason.
+        _log.info("workflow %d ended with no data: %s", work_ticket_idx, exc)
+        await _transition_to_no_data(pool, work_ticket_idx)
+        return
     except BackendFailure as exc:
         # Retry-loop already exhausted retries (transient) or this was a
         # permanent failure. The retry loop has not yet transitioned the
@@ -553,6 +658,13 @@ async def _run_entry_with_retry(
         increment retry_count, transition PROCESSING → QUEUED → PROCESSING
         atomically, retry the same step. Earlier successful entries are
         not re-run — `bound` carries their outputs forward.
+      * On an `OOM_KILLED` retry specifically, grow the step's memory floor
+        (×`_OOM_MEMORY_GROWTH`, clamped to `action_ceiling.mem_gb`) before the
+        next attempt — a step the scheduler OOM-killed will OOM again at the
+        same size. Other transient kinds retry at the same allocation. The
+        escalated floor is process-local (not persisted): a CP restart
+        re-attaches to the in-flight job and re-escalates from the ticket's
+        static override.
       * On permanent failure or retry_count >= max_retries: re-raise so
         the outer handler in `run_workflow` writes the failure_* columns
         and transitions to FAILED.
@@ -572,6 +684,10 @@ async def _run_entry_with_retry(
     # gaps like attempt-0 → attempt-3 for an entry that itself only
     # retried once.
     attempt = 0
+    # Escalating memory floor: starts at the ticket's static override and is
+    # raised on each OOM-killed retry (see the except arm below). Threaded into
+    # every step dispatch in place of the static `mem_gb_override`.
+    effective_mem_override = mem_gb_override
     while True:
         attempt_workspace = workspace / entry.name / f"attempt-{attempt}"
         attempt_workspace.mkdir(parents=True, exist_ok=True)
@@ -588,7 +704,7 @@ async def _run_entry_with_retry(
                     step_index=index,
                     attempt=attempt,
                     action_ceiling=action_ceiling,
-                    mem_gb_override=mem_gb_override,
+                    mem_gb_override=effective_mem_override,
                     poll_interval_seconds=poll_interval_seconds,
                     resume=resume,
                 )
@@ -621,13 +737,25 @@ async def _run_entry_with_retry(
                     max_retries,
                 )
                 raise
+            # An OOM-killed step would OOM again at the same size, so grow its
+            # memory floor (clamped to the action ceiling) before re-queuing.
+            # Steps only — `action:` entries carry no baseline_resources and
+            # never OOM-kill. Other transient kinds retry at the same size.
+            if exc.kind is FailureKind.OOM_KILLED and isinstance(entry, WorkflowStep):
+                effective_mem_override = _escalated_mem_floor_after_oom(
+                    entry=entry,
+                    bound=bound,
+                    action_ceiling=action_ceiling,
+                    current_override=effective_mem_override,
+                )
             _log.warning(
-                "work_ticket %d step %r transient failure (%s); retrying %d/%d",
+                "work_ticket %d step %r transient failure (%s); retrying %d/%d (mem_gb floor=%s)",
                 work_ticket_idx,
                 entry.name,
                 exc.kind.value,
                 current_retry + 1,
                 max_retries,
+                effective_mem_override,
             )
             attempt += 1
             await _bump_retry_and_requeue(pool, work_ticket_idx)
@@ -875,6 +1003,48 @@ async def _transition_to_failed(
         )
         raise RuntimeError(
             f"could not mark work_ticket {work_ticket_idx} FAILED: "
+            f"expected non-terminal, got {actual!r}"
+        )
+
+
+async def _transition_to_no_data(pool: asyncpg.Pool, work_ticket_idx: int) -> None:
+    """Atomic transition into NO_DATA — the terminal outcome for a step that
+    legitimately produced no data (an empty FASTQ well).
+
+    Distinct from `_transition_to_failed`: NO_DATA is not a failure, so all four
+    failure_* columns are explicitly written NULL (honouring the DB's
+    `work_ticket_failure_consistent` all-or-nothing CHECK from the
+    none-populated side) and the transient-retry marker is cleared. Accepts a
+    transition from any non-terminal state (PROCESSING most commonly, or QUEUED
+    if a retry's requeue raced shutdown); refuses an already-terminal ticket so
+    a buggy second call can't overwrite a COMPLETED/FAILED state."""
+    updated = await pool.fetchval(
+        "UPDATE qiita.work_ticket"
+        " SET state = $1::qiita.work_ticket_state,"
+        "     failure_type = NULL,"
+        "     failure_stage = NULL,"
+        "     failure_step_name = NULL,"
+        "     failure_reason = NULL,"
+        "     transient_reason = NULL,"
+        "     transient_since = NULL"
+        " WHERE work_ticket_idx = $2"
+        "   AND state = ANY($3::qiita.work_ticket_state[])"
+        " RETURNING work_ticket_idx",
+        WorkTicketState.NO_DATA.value,
+        work_ticket_idx,
+        [
+            WorkTicketState.PENDING.value,
+            WorkTicketState.QUEUED.value,
+            WorkTicketState.PROCESSING.value,
+        ],
+    )
+    if updated is None:
+        actual = await pool.fetchval(
+            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+        raise RuntimeError(
+            f"could not mark work_ticket {work_ticket_idx} NO_DATA: "
             f"expected non-terminal, got {actual!r}"
         )
 
@@ -1465,6 +1635,549 @@ async def _resolve_qc_adapters(
 
 
 # =============================================================================
+# Read ingest + staged-read bindings
+# =============================================================================
+#
+# The bcl-convert workflow's `ingest_reads` step stores the pool's reads once;
+# the repeatable read-mask workflow consumes them from a durable, prep_sample-
+# addressable copy. Two runner-side bindings bridge the orchestrator's lack of
+# DB access:
+#   * `sample_map`  — the `{prep_sample_idx, pool_item_id}` roster the CP knows
+#     and the ingest step needs, materialized to a Parquet (like the adapter
+#     set) because `params:` only carry scalars.
+#   * `reads`       — bound from `compute_reads_staging_path` for a mask
+#     workflow, which has no step that produces reads.
+# `reads_staging_root` hands the ingest step the scratch root it writes the
+# durable copies under.
+
+SAMPLE_MAP_BINDING = "sample_map"
+STAGED_READS_BINDING = "reads"
+READS_STAGING_ROOT_BINDING = "reads_staging_root"
+
+
+def _workflow_declares_input(steps: list[Any], name: str) -> bool:
+    """True iff some entry declares `name` among its `inputs`/`optional_inputs`."""
+    for entry in steps:
+        names = list(getattr(entry, "inputs", []) or []) + list(
+            getattr(entry, "optional_inputs", []) or []
+        )
+        if name in names:
+            return True
+    return False
+
+
+def _workflow_needs_staged_reads(steps: list[Any]) -> bool:
+    """True iff `reads` is consumed by some step but produced by none — so it must
+    be bound externally from the prep_sample's stored reads (the read-mask
+    workflow). The bcl-convert workflow produces reads internally (`ingest_reads`
+    emits `read_staging_dir`, not `reads`), so it does not match."""
+    if not _workflow_declares_input(steps, STAGED_READS_BINDING):
+        return False
+    for entry in steps:
+        if STAGED_READS_BINDING in (getattr(entry, "outputs", []) or []):
+            return False
+    return True
+
+
+def _write_sample_map_parquet(roster: list[dict[str, Any]], out_path: Path) -> None:
+    """Write the `{prep_sample_idx, pool_item_id}` roster to a Parquet
+    `(prep_sample_idx BIGINT, pool_item_id VARCHAR)` for the ingest step.
+    pyarrow (already a Flight dependency) writes it directly — no DuckDB needed
+    on the pre-loop path, mirroring `_write_adapter_parquet`."""
+    import pyarrow as pa  # noqa: PLC0415
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    prep = [int(r["prep_sample_idx"]) for r in roster]
+    items = [str(r["pool_item_id"]) for r in roster]
+    table = pa.table(
+        {
+            "prep_sample_idx": pa.array(prep, type=pa.int64()),
+            "pool_item_id": pa.array(items, type=pa.string()),
+        }
+    )
+    pq.write_table(table, str(out_path))
+
+
+async def _resolve_sample_map(action_context: dict[str, Any], workspace: Path) -> dict[str, Path]:
+    """Materialize the bcl-convert pool roster from action_context into a local
+    Parquet for the `ingest_reads` step. Same pre-loop, inside-try placement as
+    the other resolvers so a failure lands in the outer FAILED handler. Raises a
+    SUBMISSION-attributed BAD_INPUT on a missing/empty roster."""
+    roster = action_context.get(SAMPLE_MAP_BINDING)
+    if not roster:
+        raise _submission_bad_input(
+            "an ingest workflow requires a non-empty `sample_map` roster in "
+            "action_context (the CP embeds it at submit-bcl-convert time)"
+        )
+    workspace.mkdir(parents=True, exist_ok=True)
+    out = workspace / "sample_map.parquet"
+    _write_sample_map_parquet(roster, out)
+    return {SAMPLE_MAP_BINDING: out}
+
+
+def _do_action_export_read(data_plane_url: str, token: bytes) -> dict[str, Any]:
+    """Synchronous Flight DoAction asking the data plane to re-materialize one
+    prep_sample's reads from its DuckLake `read` table into a per-ticket Parquet
+    on shared scratch — runs in a thread executor (pyarrow.flight is sync). The
+    data plane writes the file; the bulk read bytes never transit the control
+    plane. Returns `{"count": int, "dest": str}` with `count` already coerced to
+    int, raising ValueError on a missing/garbled body or a non-integer `count` so
+    the caller (inside its `except`) turns it into a clean SUBMISSION failure
+    rather than a cryptic backtrace. Mirrors `actions.library._do_action_register`;
+    isolated so unit tests stub the real call."""
+    import pyarrow.flight as flight  # noqa: PLC0415
+
+    with flight.FlightClient(data_plane_url) as client:
+        results = list(client.do_action(flight.Action("export_read", token)))
+    if not results:
+        return {"count": 0, "dest": ""}
+    body = results[0].body.to_pybytes()
+    if not body:
+        return {"count": 0, "dest": ""}
+    # Parse + coerce here (inside the executor, so the caller's `except` wraps any
+    # failure) — never hand the caller a `count` it must coerce outside its try.
+    try:
+        parsed = json.loads(body)
+        count = int(parsed["count"])
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise ValueError(f"export_read returned an unparseable result body: {exc!r}") from exc
+    return {"count": count, "dest": str(parsed.get("dest", ""))}
+
+
+async def _resolve_staged_reads(
+    scope_target: dict[str, Any],
+    staging_root: Path,
+    *,
+    data_plane_url: str,
+    hmac_secret: bytes,
+    workspace: Path,
+) -> dict[str, Path]:
+    """Bind `reads` to the prep_sample's stored reads for a read-mask workflow.
+
+    Fast path: the durable staging copy `ingest_reads` wrote
+    (`compute_reads_staging_path`). That copy is ephemeral, so when it is gone
+    (reprocessing a run stored earlier) fall back to the PERSISTENT store: ask the
+    data plane to re-materialize the sample's reads from its DuckLake `read` table
+    into a per-ticket `reads.parquet` via the `export_read` DoAction (the data
+    plane writes the file; the bulk read bytes never transit the control plane).
+    Either source binds the same `reads` path; they are byte-equivalent modulo row
+    order, and qc / host_filter are order-independent.
+
+    Fails SUBMISSION/BAD_INPUT (so the ticket FAILs cleanly) if the sample has no
+    stored reads in either place — it must be ingested before a mask can be
+    created over it — or if the data plane is unreachable."""
+    prep_sample_idx = scope_target["prep_sample_idx"]
+
+    durable = compute_reads_staging_path(staging_root, prep_sample_idx)
+    if durable.exists():
+        return {STAGED_READS_BINDING: durable}
+
+    # Ephemeral durable copy gone — source from the persistent DuckLake `read`
+    # table. We name the per-ticket destination (under the shared scratch tree the
+    # data plane validates); the data plane writes it.
+    workspace.mkdir(parents=True, exist_ok=True)
+    dest = workspace / "reads.parquet"
+    token = sign_action(
+        action="export_read",
+        payload={"prep_sample_idx": prep_sample_idx, "dest": str(dest)},
+        secret=hmac_secret,
+    )
+    # A Flight failure (data plane unreachable / errored) is NOT a BackendFailure;
+    # wrap it as a SUBMISSION BAD_INPUT like the other pre-loop resolvers so the
+    # outer handler FAILs the ticket cleanly (step_name=None) rather than letting
+    # an untyped exception strand it in PROCESSING. (Not retried in place: the
+    # operator resubmits if the data plane was down.)
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, _do_action_export_read, data_plane_url, token
+        )
+    except Exception as exc:
+        raise _submission_bad_input(
+            f"could not materialize reads for prep_sample {prep_sample_idx} from "
+            f"the data plane: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    # `count` is already an int (coerced in `_do_action_export_read`).
+    if result.get("count", 0) == 0:
+        # The persistent store has no reads for this sample either (the data plane
+        # writes no file for an empty result) — same "must be ingested" semantics.
+        raise _submission_bad_input(
+            f"no stored reads for prep_sample {prep_sample_idx}; the sample must be "
+            "ingested (submit-bcl-convert stores reads) before a read mask can be "
+            "created over it"
+        )
+    if not dest.exists():
+        # The data plane reported reads but no file landed at dest (a data-plane
+        # bug, a full disk, or a mid-write failure). Fail at submission rather than
+        # handing a downstream step a path that isn't there.
+        raise _submission_bad_input(
+            f"the data plane reported reads for prep_sample {prep_sample_idx} but "
+            f"wrote no file at {dest}"
+        )
+    return {STAGED_READS_BINDING: dest}
+
+
+# =============================================================================
+# Read-mask identity (mask_idx) minting
+# =============================================================================
+#
+# A read mask's identity is its filtering CONFIG: the filter workflow + version,
+# the host reference(s) it depletes against, and the resolved QC config. The
+# control plane mints a `mask_idx` deduplicated on the SHA-256 of that config so
+# the same config resolves to the same mask_idx fleet-wide; the host_filter step
+# stamps it onto every read_mask row. The host references are read from the
+# sequenced_sample row (where they are pinned at pool fan-out); the resolved QC
+# values mirror the qc job's fastp-equivalent constants so a metadata edit to a
+# protocol row that doesn't change the effective filter yields the same mask.
+
+# Binding name the runner threads the minted mask_idx under. The host_filter step
+# lists it in its `params:` (mask_idx -> host_filter.Inputs.mask_idx), which both
+# signals the runner to mint the mask before the step loop and carries the value
+# into the step.
+MASK_IDX_BINDING = "mask_idx"
+
+# Resolved QC config the mask hash covers — the effective fastp-equivalent
+# filter the qc job applies. Mirrors the constants in
+# qiita_compute_orchestrator.jobs.qc (the fastp `-l 100` defaults); kept here
+# (not imported) because the control plane does not depend on the orchestrator
+# package. A change to the qc filter must update both so the mask identity stays
+# faithful to the filter actually applied.
+_QC_RESOLVED_MIN_LENGTH = 100
+_QC_RESOLVED_FILTER_TAIL = "0, 15, 40, 5, 0"
+
+
+def _workflow_needs_mask(steps: list[Any]) -> bool:
+    """True iff some entry threads `mask_idx` through its `params:` — the signal
+    the runner must mint a read mask before the step loop. Mirrors
+    `_workflow_needs_adapters` (which keys off an input binding); the mask is a
+    scalar param, so it keys off `params` values instead."""
+    for entry in steps:
+        params = getattr(entry, "params", None) or {}
+        if MASK_IDX_BINDING in params.values():
+            return True
+    return False
+
+
+def _adapter_set_hash(adapter_parquet: Path) -> str:
+    """SHA-256 hex of the materialized adapter-set Parquet's bytes — the resolved
+    adapter identity for the mask config hash. Hashing the staged file (not the
+    reference idx) keeps the mask identity tied to the adapter bytes actually
+    applied, so a re-pointed-but-identical adapter set collapses to one mask.
+
+    Note the hash is over the SERIALIZED Parquet bytes, not the logical sequence
+    set: mint and backfill agree only because both materialize the adapter Parquet
+    through the same `_write_adapter_parquet` / pyarrow writer. A writer change
+    that alters the byte layout shifts this hash and would force a re-mint rather
+    than collapsing to the existing mask — it is an assumption, not something the
+    code enforces."""
+    return hashlib.sha256(adapter_parquet.read_bytes()).hexdigest()
+
+
+def _build_mask_params(
+    *,
+    action_id: str,
+    action_version: str,
+    prep_protocol_idx: int | None,
+    instrument_model: str | None,
+    adapter_set_hash: str | None,
+    host_rype_reference_idx: int | None,
+    host_minimap2_reference_idx: int | None,
+) -> dict[str, Any]:
+    """Assemble the resolved-filter-config dict that `mint_mask_definition`
+    hashes (canonical JSON → SHA-256 → `params_hash`) to mint/dedup a mask.
+
+    This is the SINGLE source of truth for the mask's identity shape — both the
+    mint path (`_mint_read_mask`) and the legacy backfill
+    (`backfill_work_ticket_mask_idx`) call it so the two derive the SAME hash for
+    the SAME effective config. Every value is the EFFECTIVE filter (the host refs
+    the filter applies + adapter bytes hash + thresholds), so two callers with the
+    same effective config collapse to one mask even if descriptive metadata
+    differs. `adapter_set_hash` is passed in already computed (the SHA-256 hex of
+    the materialized adapter Parquet, via `_adapter_set_hash`) rather than a file
+    path, so the backfill can supply it from a re-materialized adapter set without
+    this helper touching the filesystem.
+
+    Any change to the keys, nesting, or resolved-QC constants here changes every
+    mask's identity fleet-wide — keep it deterministic and keyed only on the
+    effective filter.
+    """
+    return {
+        "filter_workflow": action_id,
+        "filter_version": action_version,
+        "host_rype_reference_idx": host_rype_reference_idx,
+        "host_minimap2_reference_idx": host_minimap2_reference_idx,
+        "prep_protocol_idx": prep_protocol_idx,
+        "resolved_qc": {
+            "instrument_model": instrument_model,
+            "min_length": _QC_RESOLVED_MIN_LENGTH,
+            "filter_read_tail": _QC_RESOLVED_FILTER_TAIL,
+            "adapter_set_hash": adapter_set_hash,
+        },
+    }
+
+
+async def _mint_read_mask(
+    pool: asyncpg.Pool,
+    *,
+    action_id: str,
+    action_version: str,
+    prep_sample_idx: int,
+    originator_principal_idx: int,
+    instrument_model: str | None,
+    adapter_parquet: Path | None,
+    host_rype_reference_idx: int | None,
+    host_minimap2_reference_idx: int | None,
+) -> dict[str, int]:
+    """Mint (or resolve) the `mask_idx` for this filtering config and bind it.
+
+    Run before the step loop when `_workflow_needs_mask`. The config is:
+      * the filter workflow + version (this action),
+      * the host reference(s) the `host_filter` step actually APPLIES, passed in
+        from the same action_context values `_resolve_host_filter_indexes`
+        consumes (`host_rype_reference_idx` / `host_minimap2_reference_idx`) — so
+        the minted mask_idx's params describe the filter that ran. Absent host
+        refs mean no host filtering, a faithful part of the config (None), and
+      * the resolved QC config (instrument model gating polyG, the fastp-`-l 100`
+        thresholds, and a hash of the materialized adapter set).
+    `mint_mask_definition` hashes `params` (canonical JSON) and upserts on it, so
+    the same effective config resolves to the same mask_idx fleet-wide.
+
+    Like the other pre-loop resolvers, any failure raises a SUBMISSION-attributed
+    BAD_INPUT the outer handler turns into a FAILED ticket: no sequenced_sample
+    row (the sample must be pooled first), or an unknown originator principal.
+    """
+    prep_protocol_idx = await pool.fetchval(
+        "SELECT ps.prep_protocol_idx"
+        "  FROM qiita.sequenced_sample ss"
+        "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        " WHERE ss.prep_sample_idx = $1",
+        prep_sample_idx,
+    )
+    if prep_protocol_idx is None:
+        # fetchval returns None both when no row matched and when the column is
+        # NULL; distinguish by re-checking row existence so a real "not pooled"
+        # error keeps its specific message and a legitimately-NULL prep protocol
+        # still mints.
+        row_exists = await pool.fetchval(
+            "SELECT 1 FROM qiita.sequenced_sample WHERE prep_sample_idx = $1",
+            prep_sample_idx,
+        )
+        if row_exists is None:
+            raise _submission_bad_input(
+                f"no sequenced_sample row for prep_sample_idx={prep_sample_idx}; the "
+                "sample must be pooled (its 1:1 sequenced_sample created) before a "
+                "read mask can be minted"
+            )
+
+    # Resolved config — assembled by the shared `_build_mask_params` so the mint
+    # path and the legacy backfill derive the SAME hash for the same effective
+    # config. The adapter identity is the SHA-256 of the materialized adapter
+    # bytes (None when this workflow uses no adapter set).
+    params = _build_mask_params(
+        action_id=action_id,
+        action_version=action_version,
+        prep_protocol_idx=prep_protocol_idx,
+        instrument_model=instrument_model,
+        adapter_set_hash=(
+            _adapter_set_hash(adapter_parquet) if adapter_parquet is not None else None
+        ),
+        host_rype_reference_idx=host_rype_reference_idx,
+        host_minimap2_reference_idx=host_minimap2_reference_idx,
+    )
+
+    try:
+        async with pool.acquire() as conn:
+            mask_row = await mint_mask_definition(
+                conn,
+                filter_workflow=action_id,
+                filter_version=action_version,
+                params=params,
+                principal_idx=originator_principal_idx,
+            )
+    except asyncpg.ForeignKeyViolationError as exc:
+        raise _submission_bad_input(
+            f"could not mint read mask: originator principal "
+            f"{originator_principal_idx} does not exist"
+        ) from exc
+    return {MASK_IDX_BINDING: mask_row["mask_idx"]}
+
+
+async def _persist_mask_idx(pool: asyncpg.Pool, work_ticket_idx: int, mask_idx: int) -> None:
+    """Write the minted `mask_idx` onto the ticket row (durable ticket→mask
+    traceability + a cheap shared-mask guard). Idempotent: a re-mint on resume
+    re-resolves to the same mask_idx via the config-hash upsert, so re-running
+    this writes the same value. Like every runner DB write it fails loud — a PG
+    outage raises and unwinds the run via run_workflow's catch-all."""
+    await pool.execute(
+        "UPDATE qiita.work_ticket SET mask_idx = $1 WHERE work_ticket_idx = $2",
+        mask_idx,
+        work_ticket_idx,
+    )
+
+
+# Actions whose tickets thread a `mask_idx`; the backfill scopes to these so it
+# never touches a ticket that never minted a mask. Keep in sync with the
+# workflows that declare `_workflow_needs_mask` (read-mask + fastq-to-parquet).
+_MASK_BEARING_ACTION_IDS = ("read-mask", "fastq-to-parquet")
+
+
+async def _materialize_backfill_adapter_set_hash(
+    pool: asyncpg.Pool,
+    *,
+    default_adapter_reference_idx: int | None,
+    data_plane_url: str,
+    hmac_secret: bytes,
+    workspace: Path,
+) -> str | None:
+    """Re-derive the canonical adapter-set hash for the backfill, once.
+
+    Every read-mask / fastq-to-parquet ticket masks against the SAME canonical
+    adapter set (`default_adapter_reference_idx`), so the `adapter_set_hash` that
+    feeds `_build_mask_params` is identical across all of them. We re-materialize
+    the adapter Parquet once via the same DoGet path the mint uses
+    (`_resolve_qc_adapters`) and hash its bytes (`_adapter_set_hash`). The hash is
+    over the SERIALIZED Parquet bytes, so this reproduces the mint's hash only as
+    long as the backfill runs under the same pyarrow/Parquet writer the mint did:
+    a writer change that alters the on-disk byte layout would shift the hash and
+    force a re-mint rather than a backfill match. Returns None when no default
+    adapter reference is configured (a deploy that mints maskless / for a test
+    seam) — the caller then builds params with `adapter_set_hash=None`.
+    """
+    if default_adapter_reference_idx is None:
+        return None
+    bound = await _resolve_qc_adapters(
+        pool,
+        default_adapter_reference_idx=default_adapter_reference_idx,
+        data_plane_url=data_plane_url,
+        hmac_secret=hmac_secret,
+        workspace=workspace,
+    )
+    return _adapter_set_hash(bound[QC_ADAPTER_BINDING])
+
+
+async def backfill_work_ticket_mask_idx(
+    pool: asyncpg.Pool,
+    *,
+    workspace: Path,
+    default_adapter_reference_idx: int | None,
+    data_plane_url: str,
+    hmac_secret: bytes,
+    apply: bool,
+) -> dict[str, Any]:
+    """One-time, idempotent backfill of `work_ticket.mask_idx` for existing
+    read-mask / fastq-to-parquet tickets created before the column existed.
+
+    For each such ticket with `mask_idx IS NULL`, reconstruct the filtering
+    config the runner hashed at mint (the SAME `_build_mask_params` shape, fed by
+    the ticket's stored `action_context` + the prep_protocol_idx join + the
+    re-materialized canonical adapter-set hash), then LOOK UP the matching
+    `mask_definition` row (`lookup_mask_idx_by_params`). On a hit, set the
+    ticket's `mask_idx`; on a miss (the ticket failed before minting, or its
+    config drifted off the current hash logic) SKIP it and record it — the
+    backfill NEVER mints a new mask.
+
+    Scoped to `_MASK_BEARING_ACTION_IDS` and to `mask_idx IS NULL`, so it is
+    idempotent: a second run finds nothing left to populate. Processes tickets in
+    ANY state (not just failed) so a COMPLETED ticket that SHARES a mask is
+    populated too — the shared-mask guard reads this column.
+
+    `apply=False` is a dry run: it computes the same hit/miss classification and
+    reports what it WOULD do without writing. `apply=True` writes inside a single
+    transaction. Returns a report dict: counted / populated / skipped_no_mask /
+    skipped_not_prep_sample, plus the skipped ticket idxs.
+    """
+    adapter_set_hash = await _materialize_backfill_adapter_set_hash(
+        pool,
+        default_adapter_reference_idx=default_adapter_reference_idx,
+        data_plane_url=data_plane_url,
+        hmac_secret=hmac_secret,
+        workspace=workspace,
+    )
+
+    rows = await pool.fetch(
+        "SELECT work_ticket_idx, action_id, action_version, prep_sample_idx, action_context"
+        "  FROM qiita.work_ticket"
+        " WHERE mask_idx IS NULL"
+        "   AND action_id = ANY($1::text[])"
+        " ORDER BY work_ticket_idx",
+        list(_MASK_BEARING_ACTION_IDS),
+    )
+
+    populated: list[dict[str, int]] = []
+    skipped_no_mask: list[int] = []
+    skipped_not_prep_sample: list[int] = []
+
+    for row in rows:
+        ticket_idx = row["work_ticket_idx"]
+        prep_sample_idx = row["prep_sample_idx"]
+        if prep_sample_idx is None:
+            # A mask keys on a prep_sample's reads; a ticket of these actions with
+            # no prep_sample never minted a mask. Record and skip rather than
+            # crash on the prep_protocol join below.
+            skipped_not_prep_sample.append(ticket_idx)
+            continue
+
+        action_context = row["action_context"]
+        if isinstance(action_context, str):
+            # action_context is JSONB; asyncpg returns it as a string unless a
+            # JSON codec is registered. Decode the same way _fetch_work_ticket does.
+            action_context = json.loads(action_context)
+        action_context = action_context or {}
+
+        prep_protocol_idx = await pool.fetchval(
+            "SELECT ps.prep_protocol_idx"
+            "  FROM qiita.sequenced_sample ss"
+            "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+            " WHERE ss.prep_sample_idx = $1",
+            prep_sample_idx,
+        )
+
+        # Read host refs + instrument_model straight off action_context — the same
+        # keys `_mint_read_mask` reads from `bound` (the resolvers add host_*_path
+        # bindings but never overwrite these reference-idx keys), so the
+        # reconstructed config reproduces the minted one. The adapter_set_hash
+        # component is over the serialized adapter Parquet bytes, so this match
+        # holds only while backfill and mint run under the same Parquet writer (see
+        # `_adapter_set_hash`); a writer change would force a re-mint.
+        params = _build_mask_params(
+            action_id=row["action_id"],
+            action_version=row["action_version"],
+            prep_protocol_idx=prep_protocol_idx,
+            instrument_model=action_context.get("instrument_model"),
+            adapter_set_hash=adapter_set_hash,
+            host_rype_reference_idx=action_context.get("host_rype_reference_idx"),
+            host_minimap2_reference_idx=action_context.get("host_minimap2_reference_idx"),
+        )
+
+        mask_idx = await lookup_mask_idx_by_params(pool, params)
+        if mask_idx is None:
+            skipped_no_mask.append(ticket_idx)
+            continue
+        populated.append({"work_ticket_idx": ticket_idx, "mask_idx": mask_idx})
+
+    if apply and populated:
+        async with pool.acquire() as conn, conn.transaction():
+            for item in populated:
+                # Re-guard on mask_idx IS NULL in the WHERE so a concurrent mint
+                # (or a prior partial run) is never clobbered; idempotent.
+                await conn.execute(
+                    "UPDATE qiita.work_ticket SET mask_idx = $1"
+                    " WHERE work_ticket_idx = $2 AND mask_idx IS NULL",
+                    item["mask_idx"],
+                    item["work_ticket_idx"],
+                )
+
+    return {
+        "applied": apply,
+        "counted": len(rows),
+        "populated": len(populated),
+        "populated_detail": populated,
+        "skipped_no_mask": skipped_no_mask,
+        "skipped_not_prep_sample": skipped_not_prep_sample,
+    }
+
+
+# =============================================================================
 # Dispatch helpers
 # =============================================================================
 
@@ -1513,6 +2226,44 @@ async def _patch_resource_status(
     raise NotImplementedError(
         f"status transition for scope_target.kind={scope_target['kind']!r} not yet wired"
     )
+
+
+async def _advance_completed_step_status(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    scope_target: dict[str, Any],
+    target_status: str,
+) -> None:
+    """Re-apply a fast-forwarded (already-completed) step's ``target_status``,
+    advancing the scope_target resource along its FSM only when it is currently
+    *behind* this step.
+
+    Needed because a ``/run`` redrive of a FAILED ticket resets a ``failed``
+    reference to ``pending`` (its only legal exit from ``failed``) while keeping
+    the completed step rows. The runner then fast-forwards those completed
+    steps; if it skipped their status advances, a multi-transition reference
+    would stay at ``pending`` and the first re-run step's transition (e.g.
+    ``minting → loading``) would raise IllegalStatusTransition and dead-end the
+    redrive. Re-walking each completed step's edge restores the resource to the
+    status the next live step expects.
+
+    Two benign no-advance cases, both on a normal startup-recovery resume where
+    the resource was never rewound:
+
+    * already AT this status — nothing to do (the ``==`` short-circuit);
+    * already PAST this status — the backward edge is illegal and
+      ``transition_reference_status`` raises IllegalStatusTransition, which we
+      swallow (the resource is correctly ahead).
+
+    ReferenceNotFound is deliberately NOT swallowed — a missing scope row under a
+    live ticket is a referential-integrity fault, not a benign skip.
+    """
+    if await _current_resource_status(pool, scope_target) == target_status:
+        return
+    try:
+        await _patch_resource_status(pool, scope_target, target_status)
+    except IllegalStatusTransition:
+        # Resource is already past this step (not rewound) — leave it ahead.
+        pass
 
 
 async def _current_resource_status(pool: asyncpg.Pool, scope_target: dict[str, Any]) -> str | None:
@@ -1622,6 +2373,42 @@ def _resolve_baseline_for_step(
 
     _assert_within_ceiling(entry=entry, resolved=resolved, action_ceiling=action_ceiling)
     return resolved
+
+
+# Growth factor applied to a step's resolved memory on each OOM_KILLED retry.
+# A step the scheduler OOM-killed will OOM again at the same size, so doubling
+# — clamped to the action's mem ceiling — is the only retry that can fit.
+_OOM_MEMORY_GROWTH = 2
+
+
+def _escalated_mem_floor_after_oom(
+    *,
+    entry: WorkflowStep,
+    bound: dict[str, Any],
+    action_ceiling: ActionCeiling,
+    current_override: int | None,
+) -> int | None:
+    """Memory floor (``mem_gb``) for the next attempt after an OOM, or
+    ``current_override`` unchanged once the resolved allocation has reached the
+    action ceiling.
+
+    The just-failed attempt ran at ``max(baseline.mem_gb, current_override)`` —
+    exactly what ``_resolve_baseline_for_step`` resolves here. Grow that by
+    ``_OOM_MEMORY_GROWTH`` and clamp to ``action_ceiling.mem_gb`` so the next
+    attempt's floor stays within the same bound the submission route and
+    ``_assert_within_ceiling`` enforce. The result is threaded back into
+    ``_dispatch_step`` as ``mem_gb_override``.
+    """
+    resolved = _resolve_baseline_for_step(
+        entry=entry,
+        bound=bound,
+        action_ceiling=action_ceiling,
+        mem_gb_override=current_override,
+    )
+    grown = min(resolved.mem_gb * _OOM_MEMORY_GROWTH, action_ceiling.mem_gb)
+    # No headroom left (already at the ceiling): keep the current floor so the
+    # retry still runs at the ceiling rather than dropping back to baseline.
+    return grown if grown > resolved.mem_gb else current_override
 
 
 def _assert_within_ceiling(
@@ -2466,32 +3253,44 @@ async def _run_action_primitive(
 
     if entry.name == LibraryPrimitive.PERSIST_READ_METRICS:
         # Persist the three per-stage read counts onto this prep_sample's
-        # 1:1 sequenced_sample. Each declared input is a Path to a
-        # read_count.json sidecar; we read the both-mates `read_count_r1r2` from
-        # each and hand structured ints to the primitive (same pattern as
-        # register-index reading its meta JSON). Inputs are resolved by their
-        # fixed binding names — not positionally — so a YAML reorder can't
-        # silently swap raw/biological/quality_filtered.
-        if set(entry.inputs) != {
-            "raw_read_count",
-            "biological_read_count",
-            "quality_filtered_read_count",
-        }:
+        # 1:1 sequenced_sample, derived from the `read_mask` Parquet (one row per
+        # read, carrying the per-read mask `reason`). The single declared input is
+        # the read_mask path host_filter emitted; the primitive computes the
+        # both-mates `_r1r2` totals from the mask (raw/biological/quality_filtered
+        # by reason). Resolved by its fixed binding name, not positionally.
+        if entry.inputs != ["read_mask"]:
             raise RuntimeError(
-                "persist-read-metrics expects inputs "
-                "[raw_read_count, biological_read_count, quality_filtered_read_count]; "
-                f"got {entry.inputs!r}"
+                f"persist-read-metrics expects inputs [read_mask]; got {entry.inputs!r}"
             )
-
-        def _count(name: str) -> int:
-            return json.loads(Path(bound[name]).read_text())["read_count_r1r2"]
-
         await LIBRARY[LibraryPrimitive.PERSIST_READ_METRICS](
             pool,
             scope_target["prep_sample_idx"],
-            _count("raw_read_count"),
-            _count("biological_read_count"),
-            _count("quality_filtered_read_count"),
+            Path(bound["read_mask"]),
+        )
+        return {}
+
+    if entry.name == LibraryPrimitive.PERSIST_QC_REPORT:
+        # Persist the two fastqc-equivalent QC reports onto this prep_sample's
+        # 1:1 sequenced_sample. Each declared input is a Path to a qc_report.json
+        # sidecar (the qc_report_raw / qc_report_filtered step outputs); we read
+        # each verbatim and hand the parsed dicts to the primitive. Inputs are
+        # resolved by their fixed binding names — not positionally — so a YAML
+        # reorder can't silently swap raw/filtered.
+        if set(entry.inputs) != {"raw_qc_report", "filtered_qc_report"}:
+            raise RuntimeError(
+                "persist-qc-report expects inputs "
+                "[raw_qc_report, filtered_qc_report]; "
+                f"got {entry.inputs!r}"
+            )
+
+        def _report(name: str) -> dict[str, Any]:
+            return json.loads(Path(bound[name]).read_text())
+
+        await LIBRARY[LibraryPrimitive.PERSIST_QC_REPORT](
+            pool,
+            scope_target["prep_sample_idx"],
+            _report("raw_qc_report"),
+            _report("filtered_qc_report"),
         )
         return {}
 

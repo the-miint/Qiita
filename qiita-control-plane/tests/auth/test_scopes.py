@@ -134,6 +134,24 @@ def test_ticket_doput_in_admin_role_ceilings_not_user():
     assert Scope.TICKET_DOPUT in SERVICE_ACCOUNT_SCOPE_CEILING
 
 
+def test_mask_definition_delete_is_system_admin_only():
+    """mask-definition:delete is the full-mask-purge scope — system_admin
+    only, like reference:delete and sequenced-pool:delete. wet_lab_admin can
+    create masks but not destroy them, and service accounts never get it.
+    The human_admin_session fixture derives its scopes from the system_admin
+    ceiling, so keeping the scope here is what lets that fixture drive
+    mask-delete route tests without a 403."""
+    from qiita_control_plane.auth.scopes import (
+        ROLE_IMPLIED_SCOPES,
+        SERVICE_ACCOUNT_SCOPE_CEILING,
+    )
+
+    assert Scope.MASK_DEFINITION_DELETE in ROLE_IMPLIED_SCOPES[SystemRole.SYSTEM_ADMIN]
+    assert Scope.MASK_DEFINITION_DELETE not in ROLE_IMPLIED_SCOPES[SystemRole.WET_LAB_ADMIN]
+    assert Scope.MASK_DEFINITION_DELETE not in ROLE_IMPLIED_SCOPES[SystemRole.USER]
+    assert Scope.MASK_DEFINITION_DELETE not in SERVICE_ACCOUNT_SCOPE_CEILING
+
+
 def test_reject_scopes_outside_ceiling():
     from qiita_control_plane.auth.scopes import (
         ROLE_IMPLIED_SCOPES,

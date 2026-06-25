@@ -146,6 +146,16 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_SEQUENCING_RUN_PREFIX",
         "PATH_SEQUENCED_POOL_BY_IDX",
     ),
+    (
+        "URL_SEQUENCED_POOL_QC_REPORT",
+        "PATH_SEQUENCING_RUN_PREFIX",
+        "PATH_SEQUENCED_POOL_QC_REPORT",
+    ),
+    (
+        "URL_SEQUENCED_POOL_COMPLETION",
+        "PATH_SEQUENCING_RUN_PREFIX",
+        "PATH_SEQUENCED_POOL_COMPLETION",
+    ),
     # /biosample — three routes; two re-anchor on /study, one on /biosample
     ("URL_BIOSAMPLE_BY_STUDY", "PATH_STUDY_PREFIX", "PATH_BIOSAMPLE_BY_STUDY"),
     (
@@ -200,6 +210,19 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "URL_PREP_SAMPLE_STUDY_LIST",
         "PATH_PREP_SAMPLE_PREFIX",
         "PATH_PREP_SAMPLE_STUDY_LIST",
+    ),
+    (
+        "URL_PREP_SAMPLE_RETIRED",
+        "PATH_PREP_SAMPLE_PREFIX",
+        "PATH_PREP_SAMPLE_RETIRED",
+    ),
+    # /read-masked
+    ("URL_READ_MASKED_DOGET", "PATH_READ_MASKED_PREFIX", "PATH_READ_MASKED_DOGET"),
+    # /mask-definition
+    (
+        "URL_MASK_DEFINITION_BY_IDX",
+        "PATH_MASK_DEFINITION_PREFIX",
+        "PATH_MASK_DEFINITION_BY_IDX",
     ),
 ]
 

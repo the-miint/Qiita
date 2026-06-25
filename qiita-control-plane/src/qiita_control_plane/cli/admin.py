@@ -51,6 +51,13 @@ Subcommands:
                      in the study and adds prep_sample_idx + ENA
                      experiment/run accessions. Server-gated by system_admin
                      + the admin:biosample_owner_id_read scope.
+  work-ticket backfill-mask-idx — one-time idempotent backfill of
+                     work_ticket.mask_idx for existing read-mask /
+                     fastq-to-parquet tickets, by re-deriving each
+                     ticket's mask params hash and LOOKING IT UP in
+                     qiita.mask_definition (never minting). Dry-run by
+                     default; --apply writes. Scoped to mask_idx IS NULL
+                     so re-runs are no-ops.
   compute-readiness — exercise the path qiita-job needs end-to-end and
                      report per-check status (JWT, CP /healthz,
                      SLURM_NATIVE_PYTHON on host, plus an optional
@@ -59,6 +66,30 @@ Subcommands:
                      orchestrator's venv since the diagnostic uses the
                      orchestrator's Settings.from_env() and
                      SlurmrestdClient surfaces.
+  mask delete      — calls DELETE /api/v1/mask-definition/{mask_idx} as
+                     the configured PAT (system_admin via the
+                     mask_definition:delete scope). The route does the
+                     lake-first teardown (DuckLake read_mask rows then
+                     the Postgres mask_definition row) and detaches any
+                     referencing work_ticket via ON DELETE SET NULL.
+                     Prints the rows_deleted count.
+  mask purge-failed — bulk recovery for the read_mask move-then-read
+                     bug: failed read-mask / fastq-to-parquet tickets
+                     whose failure_reason carries "read_mask parquet not
+                     found" (the mask IS registered in DuckLake; only the
+                     metrics step failed). For each candidate it captures
+                     the resubmit params, deletes the now-stale mask (so
+                     the re-run won't duplicate read_mask rows), optionally
+                     deletes the FAILED ticket (--with-tickets), then
+                     RESUBMITS a fresh work_ticket against the fixed
+                     workflow. Guards: a mask referenced by ANY non-failed
+                     work_ticket is NEVER deleted (skipped + reported).
+                     Dry-run by default; --execute required to mutate.
+                     --limit caps, --rate throttles SLURM resubmits,
+                     --wait polls each resubmit to a terminal state.
+                     Mixes direct-DB reads (selector + shared-mask guard +
+                     ticket delete) with PAT'd REST calls (mask delete +
+                     resubmit), so it needs BOTH DATABASE_URL and a PAT.
 
 Authentication for HTTP subcommands: read PAT from QIITA_TOKEN env var or
 from ~/.qiita/token (mode 0600 expected). Loopback login flow, token I/O,
@@ -67,6 +98,7 @@ and the generic HTTP runner live in `cli._common`.
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import csv
 import json
@@ -74,6 +106,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import asyncpg
@@ -82,6 +115,9 @@ from pydantic import ValidationError
 from qiita_common.api_paths import (
     PATH_ADMIN_PREFIX,
     PATH_ADMIN_STUDY_OWNER_BIOSAMPLE_ID,
+    PATH_MASK_DEFINITION_PREFIX,
+    PATH_WORK_TICKET_PREFIX,
+    PATH_WORK_TICKET_ROOT,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 
@@ -90,6 +126,7 @@ from qiita_control_plane.actions import (
     load_actions,
     sync_actions,
 )
+from qiita_control_plane.runner import backfill_work_ticket_mask_idx
 
 from . import _common
 
@@ -297,6 +334,461 @@ async def _force_fail_ticket(
 
 
 # ---------------------------------------------------------------------------
+# work-ticket backfill-mask-idx — one-time idempotent mask_idx backfill
+# ---------------------------------------------------------------------------
+
+
+def _decode_hmac_secret() -> bytes:
+    """Decode HMAC_SECRET_KEY (base64) the same way Settings.from_env does — the
+    backfill re-materializes the canonical adapter set via a signed Flight ticket,
+    so it needs the same signing key the CP boots with. Mirror from_env's
+    >=16-byte floor so a too-short key is rejected here too (it would otherwise
+    sign tickets the data plane refuses)."""
+    raw = os.environ.get("HMAC_SECRET_KEY")
+    if not raw:
+        raise RuntimeError("HMAC_SECRET_KEY not set")
+    try:
+        secret = base64.b64decode(raw)
+    except Exception as exc:  # noqa: BLE001 — surface the decode reason
+        raise RuntimeError("HMAC_SECRET_KEY must be valid base64") from exc
+    if len(secret) < 16:
+        raise RuntimeError("HMAC_SECRET_KEY must decode to at least 16 bytes")
+    return secret
+
+
+def _parse_optional_adapter_ref() -> int | None:
+    """Read QIITA_DEFAULT_ADAPTER_REFERENCE_IDX (the canonical adapter set the
+    mask hash covers). Optional: a deploy without it minted maskless configs, and
+    the backfill then derives params with adapter_set_hash=None."""
+    raw = os.environ.get("QIITA_DEFAULT_ADAPTER_REFERENCE_IDX")
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"QIITA_DEFAULT_ADAPTER_REFERENCE_IDX must be an integer, got {raw!r}"
+        ) from exc
+    if value <= 0:
+        raise RuntimeError(f"QIITA_DEFAULT_ADAPTER_REFERENCE_IDX must be positive, got {value}")
+    return value
+
+
+async def _backfill_mask_idx(database_url: str, *, apply: bool) -> dict:
+    """Acquire a pool, re-derive each eligible ticket's mask params, look it up,
+    and (when apply) populate work_ticket.mask_idx. The adapter set is
+    re-materialized into a throwaway temp workspace (only its bytes are hashed)."""
+    data_plane_url = os.environ.get("DATA_PLANE_URL", "grpc://localhost:50051")
+    default_adapter_reference_idx = _parse_optional_adapter_ref()
+    # The HMAC key only signs the adapter-fetch Flight ticket; a maskless deploy
+    # (no adapter reference configured) never re-materializes adapters, so require
+    # the key only when it would actually be used.
+    hmac_secret = _decode_hmac_secret() if default_adapter_reference_idx is not None else b""
+    try:
+        pool = await asyncpg.create_pool(
+            database_url, timeout=_DB_CONNECT_TIMEOUT_SECONDS, min_size=1, max_size=4
+        )
+    except Exception as exc:  # noqa: BLE001 — show full reason, including OS errors
+        raise RuntimeError(
+            f"could not connect to DATABASE_URL: {type(exc).__name__}: {exc}"
+        ) from exc
+    try:
+        with tempfile.TemporaryDirectory(prefix="qiita-backfill-mask-") as tmp:
+            return await backfill_work_ticket_mask_idx(
+                pool,
+                workspace=Path(tmp),
+                default_adapter_reference_idx=default_adapter_reference_idx,
+                data_plane_url=data_plane_url,
+                hmac_secret=hmac_secret,
+                apply=apply,
+            )
+    finally:
+        await pool.close()
+
+
+# ---------------------------------------------------------------------------
+# mask delete / mask purge-failed
+# ---------------------------------------------------------------------------
+
+# The two affected workflows. The move-then-read ordering bug lived in both
+# read-mask/1.0.0 and fastq-to-parquet/1.3.0 (same register→persist shape), so
+# the recovery covers both. The selector keys on failure_reason, not workflow,
+# but we still scope the candidate set to these action_ids so an unrelated
+# action that happens to log the same string is never swept up.
+_PURGE_FAILED_ACTION_IDS = ("read-mask", "fastq-to-parquet")
+
+# The failure_reason substring the move-then-read bug leaves behind: host_filter
+# and register-files both succeeded (the mask IS registered in DuckLake), only
+# persist-read-metrics failed re-opening the moved-away staging path.
+_READ_MASK_PARQUET_NOT_FOUND = "read_mask parquet not found"
+
+# Resubmit is faithful ONLY for prep_sample-scoped tickets — both affected
+# actions are prep_sample-scoped, so this is the only kind we expect. A
+# candidate of any other kind is reported (defensive) rather than guessed at.
+_RESUBMITTABLE_SCOPE_KIND = "prep_sample"
+
+
+def _mask_delete_via_route(base_url: str, token: str, mask_idx: int) -> dict:
+    """DELETE /api/v1/mask-definition/{mask_idx} as the PAT.
+
+    Going through the route (not a direct data-plane DoAction) exercises the
+    mask_definition:delete scope check AND the route's lake-first ordering
+    (DuckLake read_mask rows → Postgres mask_definition row), which is exactly
+    what the bulk tool wants per delete."""
+    # _common.call prepends API_PREFIX, so pass the post-prefix segment.
+    return _common.call(
+        "DELETE",
+        base_url,
+        token,
+        f"{PATH_MASK_DEFINITION_PREFIX}/{mask_idx}",
+    )
+
+
+async def _select_purge_failed_candidates(
+    pool: asyncpg.Pool, *, action_ids: tuple[str, ...], limit: int | None
+) -> list[asyncpg.Record]:
+    """Failed tickets for the chosen action(s) carrying the move-then-read
+    failure signature, with everything needed to resubmit. Ordered by
+    work_ticket_idx so a --limit slice is stable across runs."""
+    query = (
+        "SELECT work_ticket_idx, action_id, action_version, scope_target_kind,"
+        "       prep_sample_idx, action_context, originator_principal_idx, mask_idx"
+        "  FROM qiita.work_ticket"
+        " WHERE state = 'failed'"
+        "   AND action_id = ANY($1::text[])"
+        "   AND failure_reason LIKE '%' || $2 || '%'"
+        " ORDER BY work_ticket_idx"
+    )
+    args: list = [list(action_ids), _READ_MASK_PARQUET_NOT_FOUND]
+    if limit is not None:
+        query += " LIMIT $3"
+        args.append(limit)
+    return await pool.fetch(query, *args)
+
+
+async def _count_non_failed_missing_mask_idx(
+    pool: asyncpg.Pool, *, action_ids: tuple[str, ...]
+) -> int:
+    """Count non-failed tickets for these action(s) that have a NULL mask_idx.
+
+    This is the backfill-completeness gate. The shared-mask guard
+    (_mask_shared_with_non_failed) keys on `mask_idx = $1 AND state <> 'failed'`,
+    so a non-failed ticket that genuinely shares a mask but whose mask_idx was
+    never backfilled (still NULL) is INVISIBLE to the guard — we could then
+    delete a mask a COMPLETED result depends on, silently dropping its read_mask
+    rows. While ANY such ticket exists, the guard is unsound, so --execute must
+    refuse. (Tickets in a *failed* state with NULL mask_idx are fine here: they
+    are not the ones the guard protects — they land in skipped_no_mask_idx.)"""
+    return await pool.fetchval(
+        "SELECT COUNT(*) FROM qiita.work_ticket"
+        " WHERE action_id = ANY($1::text[])"
+        "   AND state <> 'failed'"
+        "   AND mask_idx IS NULL",
+        list(action_ids),
+    )
+
+
+async def _mask_shared_with_non_failed(pool: asyncpg.Pool, mask_idx: int) -> list[int]:
+    """work_ticket_idxs in ANY non-failed state that reference this mask.
+
+    The shared-mask guard: the config-hash dedup means one mask_idx can back
+    many tickets across runs, including COMPLETED ones. Deleting a mask a
+    non-failed ticket depends on would silently drop a live result's read_mask
+    rows — so if this returns a non-empty list, we SKIP the mask entirely.
+    Relies on backfill-mask-idx having populated mask_idx on non-failed tickets
+    too (else they read NULL and the guard misses them)."""
+    rows = await pool.fetch(
+        "SELECT work_ticket_idx FROM qiita.work_ticket"
+        " WHERE mask_idx = $1 AND state <> 'failed'"
+        " ORDER BY work_ticket_idx",
+        mask_idx,
+    )
+    return [r["work_ticket_idx"] for r in rows]
+
+
+def _build_resubmit_body(row: asyncpg.Record) -> dict:
+    """Reconstruct the WorkTicketCreateRequest body from a stored ticket row.
+
+    Both affected actions are prep_sample-scoped, so the only scope_target we
+    rebuild is the prep_sample form. action_context is stored as JSON text on the
+    row; decode it back to the object the submit route validates against the
+    action's context_schema. originator is NOT carried — the resubmit route sets
+    originator_principal_idx server-side from the authenticated caller (the
+    operator running this command), which is the intended provenance for a
+    recovery re-run."""
+    raw_context = row["action_context"]
+    if isinstance(raw_context, str):
+        action_context = json.loads(raw_context) if raw_context else {}
+    elif raw_context is None:
+        action_context = {}
+    else:
+        action_context = dict(raw_context)
+    return {
+        "action_id": row["action_id"],
+        "action_version": row["action_version"],
+        "scope_target": {
+            "kind": _RESUBMITTABLE_SCOPE_KIND,
+            "prep_sample_idx": row["prep_sample_idx"],
+        },
+        "action_context": action_context,
+    }
+
+
+def _resubmit_work_ticket(base_url: str, token: str, body: dict) -> dict:
+    """POST /api/v1/work-ticket as the PAT, returning {work_ticket_idx, state}.
+
+    Reuses the normal submission path so the resubmit goes through the same
+    validation, disallow-without-delete gate (a FAILED original never blocks),
+    and dispatch a fresh `qiita` submit would. With the stale mask purged first,
+    the re-run mints a fresh mask_idx and runs clean on the reordered workflow."""
+    return _common.call(
+        "POST", base_url, token, f"{PATH_WORK_TICKET_PREFIX}{PATH_WORK_TICKET_ROOT}", json=body
+    )
+
+
+# Terminal work-ticket states the --wait poll stops on.
+_TERMINAL_TICKET_STATES = frozenset({"completed", "no_data", "failed"})
+# Default poll cadence + ceiling for --wait. Generous ceiling because a real
+# read-mask run is a SLURM job; the operator can Ctrl-C and re-check by hand.
+_WAIT_POLL_INTERVAL_SECONDS = 10
+_WAIT_TIMEOUT_SECONDS = 3600
+
+
+def _poll_ticket_to_terminal(base_url: str, token: str, work_ticket_idx: int) -> str:
+    """Poll GET /work-ticket/{idx} until a terminal state or the wait ceiling.
+
+    Returns the final observed state (which may still be non-terminal if the
+    ceiling is hit — the caller reports it as 'still running' rather than
+    blocking the whole batch forever)."""
+    deadline = time.monotonic() + _WAIT_TIMEOUT_SECONDS
+    state = "unknown"
+    while time.monotonic() < deadline:
+        body = _common.call("GET", base_url, token, f"{PATH_WORK_TICKET_PREFIX}/{work_ticket_idx}")
+        state = body.get("state", "unknown")
+        if state in _TERMINAL_TICKET_STATES:
+            return state
+        time.sleep(_WAIT_POLL_INTERVAL_SECONDS)
+    return state
+
+
+async def _purge_failed(
+    database_url: str,
+    base_url: str,
+    token: str,
+    *,
+    action_ids: tuple[str, ...],
+    execute: bool,
+    with_tickets: bool,
+    limit: int | None,
+    rate_seconds: float,
+    wait: bool,
+) -> dict:
+    """Drive the bulk purge-and-resubmit recovery.
+
+    Dry-run (default): select candidates, run the shared-mask guard, and report
+    exactly what WOULD be purged/resubmitted — writes NOTHING.
+
+    --execute, per ticket (capture-before-delete, with per-item isolation so one
+    failure doesn't abort the batch):
+      1. capture the resubmit body from the ticket row FIRST;
+      2. delete the mask via the route (drops the registered read_mask rows so
+         the resubmit won't duplicate them);
+      3. if --with-tickets, DELETE the FAILED work_ticket row (steps CASCADE);
+      4. resubmit a fresh ticket via POST /work-ticket;
+      5. if --wait, poll the resubmit to a terminal state.
+
+    Recovery: per-item failures are isolated and reported with everything
+    needed to replay the submission by hand — work_ticket_idx, mask_idx, the
+    captured resubmit_body, and what already happened (mask_deleted,
+    ticket_deleted). If a resubmit fails AFTER its mask was deleted, the mask's
+    read_mask rows are already gone, so a plain re-POST of the reported
+    resubmit_body to POST /work-ticket is safe: the re-run mints a fresh
+    mask_idx and cannot duplicate rows. The command exits non-zero whenever the
+    failures list is non-empty.
+    """
+    try:
+        pool = await asyncpg.create_pool(
+            database_url, timeout=_DB_CONNECT_TIMEOUT_SECONDS, min_size=1, max_size=4
+        )
+    except Exception as exc:  # noqa: BLE001 — show full reason, including OS errors
+        raise RuntimeError(
+            f"could not connect to DATABASE_URL: {type(exc).__name__}: {exc}"
+        ) from exc
+    try:
+        # Backfill-completeness gate (computed up front so dry-run reports it and
+        # --execute can refuse on it before any destructive work). The shared-mask
+        # guard is only sound once every NON-failed ticket carries its mask_idx;
+        # a non-failed sharer with a NULL mask_idx is invisible to the guard, so
+        # the mask could be wrongly deleted out from under a live result.
+        backfill_incomplete = await _count_non_failed_missing_mask_idx(pool, action_ids=action_ids)
+
+        candidates = await _select_purge_failed_candidates(pool, action_ids=action_ids, limit=limit)
+
+        # Classify candidates up front so the dry-run report and the execute
+        # path see the same buckets. A candidate is:
+        #   - skipped_no_mask_idx: mask_idx is NULL (backfill never matched it —
+        #     can't safely purge a mask we can't name; resubmit alone would
+        #     duplicate the existing read_mask rows). Report, never touch.
+        #   - skipped_wrong_kind: not prep_sample-scoped (defensive; the two
+        #     affected actions are always prep_sample). Report, never touch.
+        #   - skipped_shared: mask_idx referenced by a non-failed ticket. The
+        #     critical guard — report, never delete that mask.
+        #   - eligible: safe to purge + resubmit.
+        eligible: list[dict] = []
+        skipped_no_mask_idx: list[int] = []
+        skipped_wrong_kind: list[int] = []
+        skipped_shared: list[dict] = []
+        # One mask can back several failed candidates; guard each distinct mask
+        # once and cache the verdict so the report counts a shared mask once.
+        guard_cache: dict[int, list[int]] = {}
+
+        for row in candidates:
+            wt_idx = row["work_ticket_idx"]
+            mask_idx = row["mask_idx"]
+            if row["scope_target_kind"] != _RESUBMITTABLE_SCOPE_KIND:
+                skipped_wrong_kind.append(wt_idx)
+                continue
+            if mask_idx is None:
+                skipped_no_mask_idx.append(wt_idx)
+                continue
+            if mask_idx not in guard_cache:
+                guard_cache[mask_idx] = await _mask_shared_with_non_failed(pool, mask_idx)
+            non_failed = guard_cache[mask_idx]
+            if non_failed:
+                skipped_shared.append(
+                    {
+                        "work_ticket_idx": wt_idx,
+                        "mask_idx": mask_idx,
+                        "non_failed_work_ticket_idxs": non_failed,
+                    }
+                )
+                continue
+            eligible.append(
+                {
+                    "work_ticket_idx": wt_idx,
+                    "mask_idx": mask_idx,
+                    "prep_sample_idx": row["prep_sample_idx"],
+                    "row": row,
+                }
+            )
+
+        report: dict = {
+            "executed": execute,
+            "with_tickets": with_tickets,
+            "action_ids": list(action_ids),
+            "backfill_incomplete": backfill_incomplete,
+            "candidates": len(candidates),
+            "eligible": [
+                {k: e[k] for k in ("work_ticket_idx", "mask_idx", "prep_sample_idx")}
+                for e in eligible
+            ],
+            "skipped_shared": skipped_shared,
+            "skipped_no_mask_idx": skipped_no_mask_idx,
+            "skipped_wrong_kind": skipped_wrong_kind,
+            "purged": [],
+            "resubmitted": [],
+            "failures": [],
+        }
+
+        if not execute:
+            return report
+
+        # Refuse to do any destructive work while the shared-mask guard is unsound
+        # (some non-failed ticket still has a NULL mask_idx, invisible to the
+        # guard). Fail loudly with the count and the exact fix-up command.
+        if backfill_incomplete:
+            raise RuntimeError(
+                f"backfill incomplete: {backfill_incomplete} non-failed work_ticket(s)"
+                f" for {list(action_ids)} have mask_idx IS NULL, so the shared-mask"
+                " guard cannot see them and a shared mask could be wrongly deleted."
+                " Run `qiita-admin work-ticket backfill-mask-idx --apply` first, then"
+                " re-run this command."
+            )
+
+        # --execute: process each eligible candidate in isolation. Mask deletes
+        # dedup across candidates that share a mask (only the first delete finds
+        # rows; the route is idempotent for the rest).
+        deleted_masks: set[int] = set()
+        for i, e in enumerate(eligible):
+            wt_idx = e["work_ticket_idx"]
+            mask_idx = e["mask_idx"]
+            # Capture the resubmit body BEFORE the try so it (and the
+            # progress flags) are always available for a recoverable failure
+            # report, even if mask-delete itself raises.
+            resubmit_body = _build_resubmit_body(e["row"])
+            mask_deleted = mask_idx in deleted_masks
+            ticket_deleted = False
+            try:
+                # 1. Delete the mask via the route (lake-first; idempotent).
+                if mask_idx not in deleted_masks:
+                    del_result = _mask_delete_via_route(base_url, token, mask_idx)
+                    deleted_masks.add(mask_idx)
+                    mask_deleted = True
+                    report["purged"].append(
+                        {
+                            "work_ticket_idx": wt_idx,
+                            "mask_idx": mask_idx,
+                            "rows_deleted": del_result.get("rows_deleted"),
+                        }
+                    )
+
+                # 2. Optionally delete the FAILED ticket (work_ticket_step
+                #    CASCADEs). Re-assert state='failed' in the WHERE so a ticket
+                #    that somehow moved off 'failed' between select and now is
+                #    never deleted.
+                if with_tickets:
+                    await pool.execute(
+                        "DELETE FROM qiita.work_ticket"
+                        " WHERE work_ticket_idx = $1 AND state = 'failed'",
+                        wt_idx,
+                    )
+                    ticket_deleted = True
+
+                # 3. Resubmit a fresh ticket via the normal submission path.
+                submitted = _resubmit_work_ticket(base_url, token, resubmit_body)
+                new_idx = submitted.get("work_ticket_idx")
+                entry = {
+                    "original_work_ticket_idx": wt_idx,
+                    "new_work_ticket_idx": new_idx,
+                    "prep_sample_idx": e["prep_sample_idx"],
+                    "state": submitted.get("state"),
+                }
+
+                # 4. Optionally poll the resubmit to terminal.
+                if wait and new_idx is not None:
+                    poll_state = _poll_ticket_to_terminal(base_url, token, new_idx)
+                    entry["observed_state"] = poll_state
+                    if poll_state not in _TERMINAL_TICKET_STATES:
+                        # The wait ceiling was hit before a terminal state; mark
+                        # the entry honestly rather than asserting terminality.
+                        entry["timed_out"] = True
+                report["resubmitted"].append(entry)
+            except (httpx.HTTPError, asyncpg.PostgresError, ValueError, RuntimeError) as exc:
+                # Capture enough to REPLAY this submission by hand. If the mask
+                # was already deleted, a plain re-POST of resubmit_body is safe —
+                # the mask's read_mask rows are gone, so the re-run mints a fresh
+                # mask_idx and cannot duplicate rows.
+                report["failures"].append(
+                    {
+                        "work_ticket_idx": wt_idx,
+                        "mask_idx": mask_idx,
+                        "mask_deleted": mask_deleted,
+                        "ticket_deleted": ticket_deleted,
+                        "resubmit_body": resubmit_body,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+
+            # Throttle SLURM resubmits (skip the sleep after the final item).
+            if rate_seconds > 0 and i < len(eligible) - 1:
+                time.sleep(rate_seconds)
+
+        return report
+    finally:
+        await pool.close()
+
+
+# ---------------------------------------------------------------------------
 # HTTP subcommand helpers
 # ---------------------------------------------------------------------------
 
@@ -425,6 +917,92 @@ def _build_parser() -> argparse.ArgumentParser:
         help="failure_step_name (required iff --stage=step_run)",
     )
     p_force_fail.set_defaults(handler=_handle_ticket_force_fail)
+
+    p_work_ticket = sub.add_parser("work-ticket", help="Work-ticket maintenance operations")
+    p_work_ticket_sub = p_work_ticket.add_subparsers(dest="work_ticket_cmd", required=True)
+    p_backfill = p_work_ticket_sub.add_parser(
+        "backfill-mask-idx",
+        help=(
+            "One-time idempotent backfill of work_ticket.mask_idx for existing"
+            " read-mask / fastq-to-parquet tickets. Re-derives each ticket's mask"
+            " params hash and LOOKS IT UP in mask_definition (never mints). Dry-run"
+            " by default; pass --apply to write."
+        ),
+    )
+    p_backfill.add_argument(
+        "--apply",
+        action="store_true",
+        help="Write the populated mask_idx values (default: dry-run, report only).",
+    )
+    p_backfill.set_defaults(handler=_handle_work_ticket_backfill_mask_idx)
+
+    p_mask = sub.add_parser("mask", help="Mask-definition maintenance operations")
+    p_mask_sub = p_mask.add_subparsers(dest="mask_cmd", required=True)
+    p_mask_delete = p_mask_sub.add_parser(
+        "delete",
+        help=(
+            "Delete one mask via DELETE /mask-definition/{mask_idx} (system_admin,"
+            " mask_definition:delete). Drops its DuckLake read_mask rows then the"
+            " Postgres mask_definition row; referencing work_tickets detach"
+            " (ON DELETE SET NULL). Prints rows_deleted."
+        ),
+    )
+    p_mask_delete.add_argument("mask_idx", type=int, help="mask_idx to delete")
+    p_mask_delete.set_defaults(handler=_handle_mask_delete)
+
+    p_purge = p_mask_sub.add_parser(
+        "purge-failed",
+        help=(
+            "Bulk purge-and-resubmit recovery for read-mask / fastq-to-parquet"
+            " tickets that FAILED with 'read_mask parquet not found' (the mask is"
+            " registered in DuckLake; only persist-read-metrics failed). Per"
+            " ticket: capture resubmit params, delete the stale mask (so the"
+            " re-run won't duplicate read_mask rows), optionally delete the FAILED"
+            " ticket (--with-tickets), then RESUBMIT a fresh ticket. NEVER deletes"
+            " a mask referenced by a non-failed work_ticket (shared-mask guard:"
+            " skipped + reported). Dry-run by default; pass --execute to mutate."
+            " Needs DATABASE_URL and a PAT."
+        ),
+    )
+    p_purge.add_argument(
+        "--action",
+        required=True,
+        choices=["read-mask", "fastq-to-parquet", "all"],
+        help="Which action(s) to recover. 'all' covers both affected workflows.",
+    )
+    p_purge.add_argument(
+        "--execute",
+        action="store_true",
+        help="Perform the purge + resubmit (default: dry-run, report only, no writes).",
+    )
+    p_purge.add_argument(
+        "--with-tickets",
+        action="store_true",
+        dest="with_tickets",
+        help=(
+            "Also DELETE the FAILED work_ticket rows (work_ticket_step CASCADEs)."
+            " Only ever deletes tickets in state='failed'."
+        ),
+    )
+    p_purge.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Cap how many candidate tickets are processed (ordered by work_ticket_idx).",
+    )
+    p_purge.add_argument(
+        "--rate",
+        type=float,
+        default=0.0,
+        dest="rate_seconds",
+        help="Seconds to sleep between resubmits so SLURM isn't flooded (default: 0).",
+    )
+    p_purge.add_argument(
+        "--wait",
+        action="store_true",
+        help="After each resubmit, poll the new ticket to a terminal state and report it.",
+    )
+    p_purge.set_defaults(handler=_handle_mask_purge_failed)
 
     p_actions = sub.add_parser("actions", help="Action registry operations")
     p_actions_sub = p_actions.add_subparsers(dest="actions_cmd", required=True)
@@ -660,6 +1238,199 @@ def _handle_ticket_force_fail(args: argparse.Namespace, parser: argparse.Argumen
         print(f"error: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(result, indent=2))
+    return 0
+
+
+def _handle_work_ticket_backfill_mask_idx(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        print("error: DATABASE_URL not set", file=sys.stderr)
+        return 2
+    try:
+        report = asyncio.run(_backfill_mask_idx(database_url, apply=args.apply))
+    except (RuntimeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    mode = "APPLIED" if report["applied"] else "DRY-RUN (no writes; pass --apply to commit)"
+    counted = report["counted"]
+    populated = report["populated"]
+    skipped_no_mask = len(report["skipped_no_mask"])
+    print(f"backfill-mask-idx [{mode}]")
+    print(f"  counted (mask_idx IS NULL, mask-bearing actions): {counted}")
+    print(f"  populated:           {populated}")
+    print(f"  skipped (no matching mask): {skipped_no_mask}")
+    print(f"  skipped (not prep_sample):  {len(report['skipped_not_prep_sample'])}")
+    if report["skipped_no_mask"]:
+        print(f"  skipped-no-mask ticket idxs: {report['skipped_no_mask']}")
+    if report["skipped_not_prep_sample"]:
+        print(f"  skipped-not-prep-sample ticket idxs: {report['skipped_not_prep_sample']}")
+    # The backfill matches a ticket only when its re-derived mask params hash to an
+    # already-minted mask. A serialization / config / adapter-writer drift between
+    # this run and the original mint would make EVERY real ticket miss the lookup
+    # and land in skipped_no_mask instead of populated — a silent no-op that looks
+    # like success. Before trusting an --apply, verify populated > 0 and that
+    # skipped_no_mask is the small residue you expect (tickets that genuinely
+    # failed before minting), not the bulk of the candidates.
+    if counted > 0 and populated == 0:
+        print(
+            "  WARNING: candidate tickets exist but NONE matched a mask — this"
+            " likely indicates a hash-repro drift (serialization / adapter writer /"
+            " config), not 'nothing to do'. Do NOT --apply until resolved."
+        )
+    elif not report["applied"]:
+        print(
+            "  Before running --apply: confirm populated > 0 and skipped_no_mask is"
+            " expected-small; an unexpected all-skipped result means a hash-repro"
+            " drift, not real work to skip."
+        )
+    return 0
+
+
+def _handle_mask_delete(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.mask_idx <= 0:
+        print("error: mask_idx must be a positive integer", file=sys.stderr)
+        return 2
+
+    def _render(body: dict | list) -> None:
+        # body is the MaskDefinitionDeleteResponse dict.
+        print(json.dumps(body, indent=2))
+        if isinstance(body, dict) and "rows_deleted" in body:
+            print(
+                f"deleted mask_idx={body.get('mask_idx')}:"
+                f" {body['rows_deleted']} read_mask row(s) removed.",
+                file=sys.stderr,
+            )
+
+    return _common.run_http_subcommand(
+        lambda t: _mask_delete_via_route(args.base_url, t, args.mask_idx),
+        render=_render,
+    )
+
+
+def _handle_mask_purge_failed(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        print("error: DATABASE_URL not set", file=sys.stderr)
+        return 2
+    try:
+        token = _common.read_token()
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.action == "all":
+        action_ids = _PURGE_FAILED_ACTION_IDS
+    else:
+        action_ids = (args.action,)
+
+    try:
+        report = asyncio.run(
+            _purge_failed(
+                database_url,
+                args.base_url,
+                token,
+                action_ids=action_ids,
+                execute=args.execute,
+                with_tickets=args.with_tickets,
+                limit=args.limit,
+                rate_seconds=args.rate_seconds,
+                wait=args.wait,
+            )
+        )
+    except (RuntimeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except httpx.HTTPStatusError as exc:
+        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        return 1
+
+    mode = "EXECUTED" if report["executed"] else "DRY-RUN (no writes; pass --execute to commit)"
+    print(f"mask purge-failed [{mode}]")
+    print(f"  actions:    {report['action_ids']}")
+    if report["backfill_incomplete"]:
+        # Prominent banner so the operator sees this BEFORE attempting --execute
+        # (which refuses outright while backfill is incomplete).
+        print(
+            f"  *** BACKFILL INCOMPLETE: {report['backfill_incomplete']} non-failed"
+            f" work_ticket(s) for {report['action_ids']} have mask_idx IS NULL."
+        )
+        print(
+            "      The shared-mask guard cannot see them; a shared mask could be wrongly deleted."
+        )
+        print(
+            "      Run `qiita-admin work-ticket backfill-mask-idx --apply` first."
+            " --execute will REFUSE until this is 0."
+        )
+    print(f"  candidates: {report['candidates']}")
+    print(f"  eligible:   {len(report['eligible'])}")
+    for e in report["eligible"]:
+        print(
+            f"    would purge+resubmit: work_ticket_idx={e['work_ticket_idx']}"
+            f" mask_idx={e['mask_idx']} prep_sample_idx={e['prep_sample_idx']}"
+        )
+    if report["skipped_shared"]:
+        print(f"  skipped (shared mask — NOT deleted): {len(report['skipped_shared'])}")
+        for s in report["skipped_shared"]:
+            print(
+                f"    SKIP work_ticket_idx={s['work_ticket_idx']} mask_idx={s['mask_idx']}"
+                f" — referenced by non-failed tickets {s['non_failed_work_ticket_idxs']}"
+            )
+    if report["skipped_no_mask_idx"]:
+        print(
+            f"  skipped (mask_idx IS NULL — run backfill-mask-idx first):"
+            f" {report['skipped_no_mask_idx']}"
+        )
+    if report["skipped_wrong_kind"]:
+        print(f"  skipped (not prep_sample-scoped): {report['skipped_wrong_kind']}")
+
+    if report["executed"]:
+        print(f"  purged masks:  {len(report['purged'])}")
+        for p in report["purged"]:
+            print(
+                f"    purged mask_idx={p['mask_idx']} (rows_deleted={p['rows_deleted']})"
+                f" for original work_ticket_idx={p['work_ticket_idx']}"
+            )
+        print(f"  resubmitted:   {len(report['resubmitted'])}")
+        for r in report["resubmitted"]:
+            if "observed_state" in r:
+                marker = " (TIMED OUT)" if r.get("timed_out") else ""
+                tail = f" observed_state={r['observed_state']}{marker}"
+            else:
+                tail = ""
+            print(
+                f"    original={r['original_work_ticket_idx']} ->"
+                f" new={r['new_work_ticket_idx']} state={r['state']}{tail}"
+            )
+        if report["failures"]:
+            print(f"  FAILURES (isolated; batch continued): {len(report['failures'])}")
+            for f in report["failures"]:
+                print(
+                    f"    FAIL work_ticket_idx={f['work_ticket_idx']}"
+                    f" mask_idx={f['mask_idx']}"
+                    f" (mask_deleted={f['mask_deleted']} ticket_deleted={f['ticket_deleted']}):"
+                    f" {f['error']}"
+                )
+                # Replay hint: with the mask already deleted, a plain re-POST of
+                # this body is safe (no duplicate read_mask rows).
+                print(f"      replay POST /work-ticket: {json.dumps(f['resubmit_body'])}")
+            # A non-empty failures list is an operator-actionable signal.
+            return 1
+    else:
+        # Mirror the backfill command's "verify before you commit" caveat.
+        print(
+            "  Before running --execute: eyeball the eligible list above and"
+            " confirm the skipped-shared masks are genuinely shared (a non-failed"
+            " ticket really depends on them). --execute purges each listed mask"
+            " and resubmits a fresh ticket; nothing is written in this dry-run."
+        )
+        print(
+            "  Recovery: if a resubmit fails mid-batch it is reported with its"
+            " resubmit_body; the mask is already deleted by then, so a plain"
+            " re-POST of that body to POST /work-ticket is safe (no duplicate"
+            " read_mask rows)."
+        )
     return 0
 
 

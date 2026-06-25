@@ -65,6 +65,20 @@ NATIVE_MODULE_PREFIX = "qiita_compute_orchestrator.jobs."
 FASTQ_PATH_CONTEXT_KEYS: tuple[str, str] = ("fastq_path", "reverse_fastq_path")
 
 
+# The per-sample read-mask action's bare id (its YAML lives at
+# workflows/read-mask/<version>.yaml). A sample's reads are stored once by the
+# bcl-convert workflow's ingest_reads step; processing a sample then means
+# creating a read mask over those reads. Defined here, beside the action
+# contract, so the submitter that mints these tickets (the qiita-user
+# submit-host-filter-pool gesture) and any reader that keys off them (e.g. the
+# pool completion rollup query) import one canonical value instead of re-typing
+# the literal — a rename then lights up its importers rather than silently
+# zeroing a rollup. Deliberately the bare id, NOT a (id, version) pair: the
+# completion rollup is version-agnostic ("did this sample get masked?"
+# regardless of version), while the submitter pins its own version separately.
+READ_MASK_ACTION_ID = "read-mask"
+
+
 class Audience(BaseModel):
     """Who may invoke this action — answers "may invoke", not "may execute".
 

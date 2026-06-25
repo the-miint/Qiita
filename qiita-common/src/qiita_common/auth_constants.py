@@ -46,6 +46,19 @@ class Scope(StrEnum):
     REFERENCE_REGISTER_FILES = "reference:register_files"
     FEATURE_MINT = "feature:mint"
     TICKET_DOGET = "ticket:doget"
+    # DoGet against the data plane's masked-read surface (`read_masked`).
+    # Deliberately distinct from the generic TICKET_DOGET (which signs
+    # reference-data tickets): masked reads are privacy-sensitive (the lake
+    # retains human/host reads, excluded only by the read_masked view), so the
+    # capability to pull them is granted separately — to service accounts that
+    # drive the masked-read consumer path, never piggybacking on reference reads.
+    READ_MASKED_DOGET = "read_masked:doget"
+    # Full purge of a mask (the mask_definition row + its DuckLake read_mask
+    # rows). Deliberately distinct from the mask-minting capability: deletion
+    # is destructive and admin-only, granted solely to system_admin in
+    # ROLE_IMPLIED_SCOPES — never to wet_lab_admin or service accounts.
+    # Mirrors REFERENCE_DELETE.
+    MASK_DEFINITION_DELETE = "mask_definition:delete"
     # Generic upload domain. Gates the slot-minting + DoPut path; not
     # reference-specific. Carried by admins (humans uploading via qiita-admin)
     # and service accounts (workers driving import flows).

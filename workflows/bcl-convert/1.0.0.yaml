@@ -4,12 +4,16 @@ target_kind: sequenced_pool
 
 description: >
   Demultiplex a sequenced_pool's Illumina BCL run folder into per-biosample
-  FASTQs using bcl-convert. The sample sheet is rehydrated from the pool's
-  run_preflight_blob via kl-run-preflight; the instrument model is parsed
-  from the BCL run-folder name and selects the SLURM resource profile for
-  the bcl_convert step. Step 1 of a planned bcl-convert → QC →
-  host-filter → fastq-to-parquet pipeline; subsequent steps will land in
-  follow-up PRs.
+  FASTQs using bcl-convert, then store the pool's reads once. The sample
+  sheet is rehydrated from the pool's run_preflight_blob via kl-run-preflight;
+  the instrument model is parsed from the BCL run-folder name and selects the
+  SLURM resource profile for the bcl_convert step. After demux, the
+  `ingest_reads` step parses every sample's FASTQ(s), mints a sequence_idx
+  range per sample, and writes the FULL reads into the DuckLake `read` table
+  (once, independent of any mask) plus a durable per-sample copy the
+  repeatable read-mask workflow consumes. Host filtering / QC are NOT here:
+  they are masks created later by the read-mask workflow, run once per host
+  reference over these same reads.
 
 scopes: []
 
@@ -26,7 +30,7 @@ audience:
 
 context_schema:
   type: object
-  required: [bcl_input_dir]
+  required: [bcl_input_dir, sample_map]
   properties:
     # Absolute host path to the Illumina BCL run folder. The orchestrator
     # binds the parent directory into the container at submit time (see
@@ -43,6 +47,25 @@ context_schema:
       type: string
       minLength: 1
       pattern: "^/"
+    # The pool roster: one entry per sequenced_sample, mapping its
+    # prep_sample_idx to its sequenced_pool_item_id (== the bcl-convert
+    # FASTQ basename prefix). submit-bcl-convert embeds it (it already
+    # enumerates the samples it creates); the runner materializes it to a
+    # Parquet (`_resolve_sample_map`) the `ingest_reads` step reads, since
+    # the orchestrator has no DB access to enumerate the pool itself.
+    sample_map:
+      type: array
+      minItems: 1
+      items:
+        type: object
+        required: [prep_sample_idx, pool_item_id]
+        properties:
+          prep_sample_idx:
+            type: integer
+            minimum: 1
+          pool_item_id:
+            type: string
+            minLength: 1
 
 steps:
   - step: bcl_convert_prep
@@ -95,6 +118,35 @@ steps:
           cpu: 16
           mem_gb: 16
           walltime: PT3H
+
+  # Store the pool's reads once. For each sample in `sample_map`, locate its
+  # FASTQ(s) under `convert_dir` (the bcl_convert output), mint a sequence_idx
+  # range, and write the full reads — into `read/<prep_sample_idx>.parquet`
+  # (the register part) and the durable per-sample copy under
+  # `reads_staging_root`. Idempotent: a sample whose durable copy exists is
+  # skipped, so a ticket retry never re-mints or re-parses.
+  - step: ingest_reads
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.ingest_reads
+    # `convert_dir` is the bcl_convert step output; `sample_map` and
+    # `reads_staging_root` are runner-resolved before the loop
+    # (_resolve_sample_map / READS_STAGING_ROOT_BINDING).
+    inputs: [convert_dir, sample_map, reads_staging_root]
+    outputs: [read_staging_dir]
+    baseline_resources:
+      # Sequential per-sample parse loop (read_fastx → sequence_idx). mem_gb
+      # sits above ingest_reads.py's DuckDB cap (7); walltime covers a full
+      # plate of per-sample parses, under the ceiling.
+      cpu: 2
+      mem_gb: 8
+      walltime: PT8H
+
+  # Load the per-sample read parts into the DuckLake `read` table. The
+  # `read/` subdir of `read_staging_dir` holds one part per sample; register
+  # maps the subdir → the `read` table (subdir-of-parts convention).
+  - action: register-files
+    inputs: [read_staging_dir]
+    outputs: []
 
 # Cap matches the largest profile in `bcl_convert.baseline_resources.profiles`
 # above. Any future profile expansion (or per-instrument tuning that exceeds

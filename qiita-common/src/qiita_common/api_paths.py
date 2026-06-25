@@ -86,6 +86,7 @@ class LibraryPrimitive(StrEnum):
     REGISTER_FILES = "register-files"
     REGISTER_INDEX = "register-index"
     PERSIST_READ_METRICS = "persist-read-metrics"
+    PERSIST_QC_REPORT = "persist-qc-report"
 
 
 # =============================================================================
@@ -195,6 +196,28 @@ def compute_upload_staging_path(staging_root: Path, upload_idx: int) -> Path:
     return staging_root / "uploads" / str(upload_idx) / "upload.parquet"
 
 
+def compute_reads_staging_path(staging_root: Path, prep_sample_idx: int) -> Path:
+    """Canonical filesystem path for a prep_sample's durable staged reads.
+
+    The bcl-convert ``ingest_reads`` step writes each sample's full
+    ``read.parquet`` here once (in addition to registering it into the
+    DuckLake ``read`` table). It is the input the repeatable read-mask
+    workflow binds as ``reads`` — masks read the stored sequences from
+    this stable, prep_sample-addressable copy rather than re-deriving
+    them from FASTQ, so a second host reference is a new mask over the
+    same reads, never a re-run of ingest.
+
+    Layout — ``{root}/reads/{prep_sample_idx}/read.parquet`` — is
+    deterministic in ``prep_sample_idx`` (NOT ticket-scoped): the
+    ingest step (in the pool's bcl-convert ticket) writes it; a later
+    read-mask ticket for the same sample reads it back. Mirrors
+    ``compute_upload_staging_path``'s deterministic-by-idx shape so the
+    writer (ingest) and reader (``_resolve_staged_reads`` in the
+    runner) agree byte-for-byte.
+    """
+    return staging_root / "reads" / str(prep_sample_idx) / "read.parquet"
+
+
 # =============================================================================
 # /sequence-range/* — control-plane sequence_idx allocator
 # =============================================================================
@@ -210,6 +233,35 @@ URL_SEQUENCE_RANGE_PREFIX = f"{API_PREFIX}{PATH_SEQUENCE_RANGE_PREFIX}"
 URL_SEQUENCE_RANGE_BY_PREP_SAMPLE = (
     f"{URL_SEQUENCE_RANGE_PREFIX}{PATH_SEQUENCE_RANGE_BY_PREP_SAMPLE}"
 )
+
+# =============================================================================
+# /mask-definition/* — control-plane read-filtering config identity
+# =============================================================================
+# Mints (idempotently, deduped on a canonical-config hash) the mask_idx that
+# tags the data plane's read_mask / read_masked rows. POST is service-account-
+# only (Scope.READ_MASKED_DOGET).
+
+PATH_MASK_DEFINITION_PREFIX = "/mask-definition"
+PATH_MASK_DEFINITION_ROOT = ""  # POST against the prefix itself
+PATH_MASK_DEFINITION_BY_IDX = "/{mask_idx}"  # DELETE a mask (lake rows + Postgres row)
+
+URL_MASK_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_MASK_DEFINITION_PREFIX}"
+URL_MASK_DEFINITION_BY_IDX = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_BY_IDX}"
+
+# =============================================================================
+# /read-masked/* — Flight DoGet ticket for the masked-read surface
+# =============================================================================
+# Signs an HMAC DoGet ticket scoped to a single (prep_sample_idx, mask_idx) on
+# the data plane's `read_masked` view. POST is service-account-only
+# (Scope.READ_MASKED_DOGET). The route enforces the mandatory-filter invariant:
+# both identifiers are required, so an unfiltered read_masked ticket is never
+# signed.
+
+PATH_READ_MASKED_PREFIX = "/read-masked"
+PATH_READ_MASKED_DOGET = "/ticket/doget"
+
+URL_READ_MASKED_PREFIX = f"{API_PREFIX}{PATH_READ_MASKED_PREFIX}"
+URL_READ_MASKED_DOGET = f"{URL_READ_MASKED_PREFIX}{PATH_READ_MASKED_DOGET}"
 
 
 # =============================================================================
@@ -315,6 +367,17 @@ PATH_SEQUENCED_POOL_PREFLIGHT = (
 )
 # DELETE target: full hard-delete of one sequenced_pool (system_admin only).
 PATH_SEQUENCED_POOL_BY_IDX = "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}"
+# GET the pool's merged (multiqc-equivalent) QC report: read-metric rollup +
+# per-sample reports + the run-level merged aggregate.
+PATH_SEQUENCED_POOL_QC_REPORT = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/qc-report"
+)
+# GET the pool's prep-generation completion rollup: per-sample fastq-to-parquet
+# work-ticket state bucketed into completed / in-flight / failed / not-submitted
+# counts (the SPP GenPrepFileJob end-state equivalent).
+PATH_SEQUENCED_POOL_COMPLETION = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/completion"
+)
 
 URL_SEQUENCING_RUN_PREFIX = f"{API_PREFIX}{PATH_SEQUENCING_RUN_PREFIX}"
 URL_SEQUENCING_RUN_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_BY_IDX}"
@@ -326,6 +389,8 @@ URL_SEQUENCING_RUN_SEQUENCED_POOL = (
 )
 URL_SEQUENCED_POOL_PREFLIGHT = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_PREFLIGHT}"
 URL_SEQUENCED_POOL_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_BY_IDX}"
+URL_SEQUENCED_POOL_QC_REPORT = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_QC_REPORT}"
+URL_SEQUENCED_POOL_COMPLETION = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_COMPLETION}"
 
 
 # =============================================================================
@@ -412,6 +477,12 @@ URL_SEQUENCED_SAMPLE_BY_IDX = f"{URL_SEQUENCED_SAMPLE_PREFIX}{PATH_SEQUENCED_SAM
 
 PATH_PREP_SAMPLE_PREFIX = "/prep-sample"
 PATH_PREP_SAMPLE_STUDY_LIST = "/{prep_sample_idx}/study/list"
+# Reversible operator disposition of a prep_sample: PATCH the `retired` flag so
+# an empty / failed-yield well drops out of (or returns to) a pool's active set
+# without a raw production UPDATE. Reversible by design (a misclassified well
+# must be recoverable), unlike the terminal principal retire.
+PATH_PREP_SAMPLE_RETIRED = "/{prep_sample_idx}/retired"
 
 URL_PREP_SAMPLE_PREFIX = f"{API_PREFIX}{PATH_PREP_SAMPLE_PREFIX}"
 URL_PREP_SAMPLE_STUDY_LIST = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_STUDY_LIST}"
+URL_PREP_SAMPLE_RETIRED = f"{URL_PREP_SAMPLE_PREFIX}{PATH_PREP_SAMPLE_RETIRED}"

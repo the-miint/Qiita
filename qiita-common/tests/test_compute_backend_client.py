@@ -243,6 +243,59 @@ async def test_find_jobs_by_name_transport_error_becomes_orchestrator_unreachabl
     assert ei.value.transient is True
 
 
+def _no_data_transport():
+    from qiita_common.backend_failure import STEP_NO_DATA_HEADER, STEP_NO_DATA_HTTP_STATUS
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            STEP_NO_DATA_HTTP_STATUS,
+            content=json.dumps(
+                {"step_name": "fastq", "reason": "FASTQ file contains no records: x.fastq"}
+            ).encode(),
+            headers={"content-type": "application/json", STEP_NO_DATA_HEADER: "1"},
+        )
+
+    return httpx.MockTransport(handler)
+
+
+async def test_submit_step_reconstructs_step_no_data():
+    """LocalBackend runs the native job at submit time, so an empty-well
+    no-data outcome surfaces from submit_step. The client reconstructs the
+    typed StepNoData (its own header) rather than a BackendFailure — the two
+    share status 422 but carry distinct discriminator headers."""
+    from qiita_common.backend_failure import StepNoData
+    from qiita_common.models import ComputeTarget
+
+    with pytest.raises(StepNoData) as ei:
+        await _client_with(_no_data_transport()).submit_step(
+            step_name="fastq",
+            inputs={},
+            workspace=Path("/ws"),
+            scope_target={"kind": "prep_sample", "prep_sample_idx": 1},
+            work_ticket_idx=1,
+            module="qiita_compute_orchestrator.jobs.fastq_to_parquet",
+        )
+    assert ei.value.step_name == "fastq"
+    assert "contains no records" in ei.value.reason
+    assert ComputeTarget  # parity with the handle-shaped tests
+
+
+async def test_result_step_reconstructs_step_no_data():
+    """SLURM defers the no-data outcome to result_step (the job wrote a
+    structured no-data line and SlurmBackend reconstructs it). The client
+    re-raises the typed StepNoData so the runner's NO_DATA transition fires."""
+    from qiita_common.backend_failure import StepNoData
+    from qiita_common.models import ComputeTarget, StepHandleWire, StepStatus, StepStatusWire
+
+    with pytest.raises(StepNoData) as ei:
+        await _client_with(_no_data_transport()).result_step(
+            StepHandleWire(compute_target=ComputeTarget.SLURM, step_name="fastq", slurm_job_id=1),
+            StepStatusWire(status=StepStatus.FAILED, raw_state="FAILED", exit_code=1),
+        )
+    assert ei.value.step_name == "fastq"
+    assert "contains no records" in ei.value.reason
+
+
 async def test_submit_step_reconstructs_backend_failure():
     from qiita_common.backend_failure import BackendFailure, FailureKind
     from qiita_common.models import ComputeTarget

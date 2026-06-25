@@ -73,6 +73,10 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             # PREP_SAMPLE_WRITE but not destroy them. Service accounts never
             # get it.
             Scope.SEQUENCED_POOL_DELETE,
+            # Full mask purge is system_admin-only, same as REFERENCE_DELETE:
+            # deleting a mask drops its mask_definition row and DuckLake
+            # read_mask data. Service accounts never get it.
+            Scope.MASK_DEFINITION_DELETE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
             Scope.ADMIN_USER,
@@ -99,6 +103,10 @@ SERVICE_ACCOUNT_SCOPE_CEILING: frozenset[Scope] = frozenset(
         Scope.TICKET_DOPUT,
         Scope.SEQUENCE_RANGE_MINT,
         Scope.SEQUENCED_POOL_PREFLIGHT_READ,
+        # Mint mask_definition rows + sign masked-read DoGet tickets. Workers
+        # only — the masked-read consumer path is service-driven; no human role
+        # carries it (privacy-sensitive read surface, see Scope.READ_MASKED_DOGET).
+        Scope.READ_MASKED_DOGET,
     }
 )
 

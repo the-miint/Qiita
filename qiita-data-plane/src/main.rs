@@ -24,6 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &cfg.path_persistent_ducklake,
     )?;
     ducklake::ensure_reference_tables(&setup_conn)?;
+    ducklake::ensure_read_tables(&setup_conn)?;
     drop(setup_conn);
 
     // Build Flight service — each request opens its own DuckDB connection
@@ -32,6 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cfg.ducklake_catalog_connstr,
         cfg.path_persistent_ducklake,
         cfg.path_scratch_staging,
+        cfg.path_scratch,
     );
 
     let (health_reporter, health_service) = tonic_health::server::health_reporter();

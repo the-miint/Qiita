@@ -26,7 +26,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from qiita_common.actions import BaselineResources
-from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.duckdb_miint import miint_job_env
 from qiita_common.log_tail import contains_oom_signature, read_text_tail
 from qiita_common.models import (
@@ -50,6 +50,7 @@ from ..slurm import (
     TerminalSlurmState,
     build_job_submit_payload,
     parse_launcher_failure,
+    parse_launcher_no_data,
     parse_outputs_map,
     verify_container_output,
 )
@@ -511,6 +512,17 @@ class SlurmBackend(ComputeBackend):
         if status.reason:
             reason_parts.append(f"slurm_reason={status.reason}")
         state_reason = ", ".join(reason_parts)
+
+        # A native-step job that hit a terminal no-data outcome (an empty FASTQ
+        # well) writes a structured no-data line to stderr and exits non-zero
+        # (so SLURM marks it FAILED), then exits without a manifest. Parse that
+        # line FIRST: a no-data outcome is NOT a failure, so raise StepNoData —
+        # the step route serializes it with the no-data header and the runner
+        # transitions the ticket to NO_DATA, never FAILED. Only if no no-data
+        # line is present do we fall through to failure classification.
+        no_data = parse_launcher_no_data(handle.logs_path / "stderr")
+        if no_data is not None:
+            raise StepNoData(step_name=no_data.step_name, reason=no_data.reason)
 
         # Native-step jobs write a structured failure line to stderr
         # before exit (jobs/__main__.py). If we find one, prefer the

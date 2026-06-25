@@ -125,13 +125,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     workspace.mkdir(parents=True, exist_ok=True)
     manifest_path = workspace / "manifest.parquet"
     # reference_sequence_chunks is a DIRECTORY of part_*.parquet files
-    # rather than a single file. The hash_sequences pipeline writes one
-    # chunk-budget-bounded part per batch in sequence_hash-sorted order;
-    # the parts together form one logically-sorted dataset readable via
-    # `read_parquet(dir/part_*.parquet)`. Avoids the concat step that
-    # OOMs DuckDB's single-writer + parallel-reader pipeline at GG2
-    # scale (the writer can't drain 30+ GB of decoded VARCHAR fast
-    # enough; back-pressured rows pile up in the in-flight queue).
+    # rather than a single file — the consumer contract is
+    # `read_parquet(dir/part_*.parquet)`. The relabel below writes one
+    # part in a single streaming scan; the directory shape is retained so
+    # the output can be split into multiple parts later without touching
+    # any consumer.
     reference_sequence_chunks_dir = workspace / "reference_sequence_chunks"
     reference_sequence_chunks_dir.mkdir(parents=True, exist_ok=True)
     manifest_out = validate_parquet_path(manifest_path)
@@ -234,81 +232,53 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f") TO '{manifest_out}' ({PARQUET_OPTS})"
             )
 
-            # reference_sequence_chunks.parquet — relabel upload chunks
-            # by sequence_hash. When two reads share a canonical hash
-            # (sequence + its reverse complement) we keep ONE — the
-            # lex-smaller read_id, deterministically. ORDER BY at write
-            # time gives the chunks of each hash on-disk locality so a
-            # downstream `WHERE sequence_hash = X` doesn't scan the
-            # whole file.
+            # reference_sequence_chunks/part_00000.parquet — relabel the
+            # upload chunks from read_id to canonical sequence_hash in a
+            # SINGLE streaming scan. When two reads share a canonical hash
+            # (a sequence + its reverse complement) we keep ONE — the
+            # lex-smaller read_id, deterministically (DISTINCT ON).
             #
-            # The whole-file ORDER BY across ~30+ GB of chunk_data has
-            # the same scaling problem as the string_agg above — it
-            # OOMs DuckDB caps. Same fix: bin-pack canonical reads in
-            # sequence_hash order into chunk-budget batches, write each
-            # batch (internally sorted) to a part file, then stream-
-            # concatenate parts into the final output. Each batch's
-            # part is sorted by (sequence_hash, chunk_index), and
-            # batches are processed in sequence_hash order — so the
-            # concatenated parts are globally sorted.
-            chunks_per_read_dict = dict(chunks_per_read)
-            canonical_reads = conn.execute(
-                "SELECT DISTINCT ON (sequence_hash) read_id, sequence_hash "
-                "FROM hashed "
-                "ORDER BY sequence_hash, read_id"
-            ).fetchall()
-
-            output_batches: list[list[str]] = []
-            current_out_batch: list[str] = []
-            current_out_chunks = 0
-            for read_id, _sequence_hash in canonical_reads:
-                n_chunks = chunks_per_read_dict[read_id]
-                if current_out_batch and current_out_chunks + n_chunks > _CHUNK_BUDGET_PER_BATCH:
-                    output_batches.append(current_out_batch)
-                    current_out_batch = []
-                    current_out_chunks = 0
-                current_out_batch.append(read_id)
-                current_out_chunks += n_chunks
-            if current_out_batch:
-                output_batches.append(current_out_batch)
-
-            if output_batches:
-                # Write each batch as its own part_NNNNN.parquet inside
-                # reference_sequence_chunks_dir. Within a part, rows are
-                # sorted by (sequence_hash, chunk_index); across parts,
-                # batches were built from sequence_hash-sorted
-                # canonical_reads, so the parts collectively form one
-                # globally-sorted dataset. Downstream consumers use
-                # `read_parquet(dir/part_*.parquet)`.
-                for i, batch in enumerate(output_batches):
-                    part_path = reference_sequence_chunks_dir / f"part_{i:05d}.parquet"
-                    part_out = validate_parquet_path(part_path)
-                    conn.execute(
-                        "COPY ("
-                        "  SELECT h.sequence_hash, c.chunk_index, c.chunk_data"
-                        "  FROM read_parquet(?) c"
-                        "  JOIN hashed h ON c.read_id = h.read_id"
-                        "  WHERE c.read_id = ANY(?)"
-                        "  ORDER BY h.sequence_hash, c.chunk_index"
-                        f") TO '{part_out}' ({PARQUET_OPTS_CHUNKED})",
-                        [str(inputs.fasta_path), batch],
-                    )
-            else:
-                # No canonical reads → write a single empty part so the
-                # directory is non-empty and `read_parquet(dir/*.parquet)`
-                # finds the schema. The empty-input case is legitimate
-                # (reference-add tolerates zero sequences).
-                empty_part = reference_sequence_chunks_dir / "part_00000.parquet"
-                empty_out = validate_parquet_path(empty_part)
-                conn.execute(
-                    "COPY ("
-                    "  SELECT"
-                    "    CAST(NULL AS UUID) AS sequence_hash,"
-                    "    CAST(NULL AS INTEGER) AS chunk_index,"
-                    "    CAST(NULL AS VARCHAR) AS chunk_data"
-                    "  WHERE FALSE"
-                    f") TO '{empty_out}' ({PARQUET_OPTS_CHUNKED})"
-                )
+            # No write-time ORDER BY. The sequence_hash sort is not
+            # load-bearing for any consumer: reference_load re-keys
+            # sequence_hash → feature_idx with its own full scan, the data
+            # plane's DoGet filters by feature_idx (never sequence_hash),
+            # and sequence reassembly sorts chunk_index in-memory per
+            # feature. A whole-file ORDER BY (or PARTITION_BY) over 30+ GB
+            # of 64 KB chunk_data OOMs DuckDB's caps — its sort can't spill
+            # rows that fat, and the partitioned writer either OOMs or
+            # shatters the output into tens of thousands of tiny files.
+            #
+            # The streaming relabel is bounded BY CONSTRUCTION: `canonical`
+            # has one narrow row (read_id + uuid) per distinct hash, and
+            # because chunks ≥ reads ≥ canonical it is ALWAYS the
+            # lower-cardinality join input, so the optimizer builds the
+            # hash table on it and chunk_data rides the probe side straight
+            # to the writer — never buffered into a build side or a sort.
+            # Peak memory is ~1 GB/thread, constant in file size. This
+            # replaces the old per-batch loop, which re-scanned the whole
+            # upload once per batch AND left the full-`hashed` JOIN free to
+            # reorder ahead of the batch filter — at genome scale that
+            # materialized the entire file's chunk_data and OOM'd.
+            #
+            # The `canonical` CTE's ORDER BY is on the narrow hashed table
+            # only (no chunk_data) — it is what makes DISTINCT ON pick the
+            # lex-smallest read_id deterministically, and it spills cheaply.
+            # Empty input writes a valid 0-row part (schema from the
+            # projection), keeping the directory non-empty for consumers.
+            part_out = validate_parquet_path(reference_sequence_chunks_dir / "part_00000.parquet")
+            conn.execute(
+                "COPY ("
+                "  WITH canonical AS ("
+                "    SELECT DISTINCT ON (sequence_hash) read_id, sequence_hash"
+                "    FROM hashed"
+                "    ORDER BY sequence_hash, read_id"
+                "  )"
+                "  SELECT cr.sequence_hash, c.chunk_index, c.chunk_data"
+                "  FROM read_parquet(?) c"
+                "  JOIN canonical cr ON c.read_id = cr.read_id"
+                f") TO '{part_out}' ({PARQUET_OPTS_CHUNKED})",
+                [str(inputs.fasta_path)],
+            )
 
             conn.execute("DROP TABLE hashed")
         success = True

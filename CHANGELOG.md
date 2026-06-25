@@ -24,6 +24,179 @@ the `no-changelog` label).
   and adds `prep_sample_idx` + ENA experiment/run accessions. Dual-gated by
   `system_admin` + a new `admin:biosample_owner_id_read` scope; the CLI writes a TSV
   to `--output` (mode 0600, never stdout, so the names stay off the terminal). (#188)
+- An `export_read` data-plane DoAction that re-materializes one prep_sample's
+  reads from the DuckLake `read` table into a per-ticket `reads.parquet` on shared
+  scratch (DuckDB `COPY` run on the blocking pool, written to a `.partial` sibling
+  then published atomically; the destination is validated lexically and via a
+  symlink-resolving containment check under the scratch root; row count is read
+  back from the written file). The control plane signs the HMAC action token but
+  the data plane writes the file, so the bulk (human-containing) read bytes never
+  transit the control plane. Raw `read` remains absent from the Flight DoGet
+  `ALLOWED_TABLES` — it is reachable only via this admin-gated write path. (#187)
+- A `runner._do_action_export_read` control-plane client for the above. (#187)
+- A `delete_mask` primitive for removing a registered read mask. New
+  `mask_definition:delete` scope (system_admin via the role ceiling),
+  `DELETE /api/v1/mask-definition/{mask_idx}` route (lake-first: a new
+  `delete_mask` data-plane DoAction logically `DELETE`s the mask's rows from the
+  DuckLake `read_mask` table, then the `mask_definition` Postgres row is removed),
+  and a `delete_mask_data` CP client. Idempotent (0 rows deleted is success); no
+  raw parquet unlink (mirrors `delete_reference`); 404 on an absent mask. Surfaced
+  as `qiita-admin mask delete <mask_idx>`. (#181)
+- `qiita-admin mask purge-failed --action {read-mask,fastq-to-parquet,all}` — bulk
+  recovery tooling that selects FAILED read-mask / fastq-to-parquet tickets stranded
+  by the move-then-read ordering bug, deletes each ticket's orphaned mask, and
+  resubmits it clean on the reordered workflow (so the re-run mints a fresh
+  `mask_idx` rather than appending a duplicate to the append-only `read_mask`
+  table). Dry-run by default; `--execute` to act, `--with-tickets` to also delete
+  the FAILED ticket rows, `--limit` / `--rate` / `--wait` to bound and throttle the
+  batch. A shared-mask guard refuses to delete a mask referenced by any non-FAILED
+  ticket, and a pre-flight refuses to run if the `work_ticket.mask_idx` backfill is
+  incomplete. (#181)
+- `qiita-admin work-ticket backfill-mask-idx [--apply]` — one-time idempotent
+  backfill that populates the new `work_ticket.mask_idx` column for existing
+  read-mask / fastq-to-parquet tickets by recomputing the mask params hash and
+  looking it up in `mask_definition` (no new mask minted). For adapter-bearing
+  tickets it re-materializes the canonical adapter set via DoGet to reproduce the
+  hash, so it needs `DATABASE_URL`, `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX`,
+  `HMAC_SECRET_KEY`, and a reachable `DATA_PLANE_URL`; the dry-run reports
+  `populated` so the operator can confirm `populated > 0` before `--apply`. (#181)
+- New nullable `work_ticket.mask_idx` column (FK → `mask_definition`, ON DELETE SET
+  NULL, partial index) recording the mask a read-mask / fastq-to-parquet ticket
+  produced, for durable traceability and a cheap shared-mask guard. The runner
+  writes it at mint time; existing rows are populated by the
+  `backfill-mask-idx` command above (migration
+  `20260624110000_work_ticket_mask_idx.sql`; additive, backfill-free at migrate
+  time — existing rows read NULL). (#181)
+- A first-class terminal `no_data` outcome for empty FASTQ wells, distinct from
+  failure, so a real plate full of blank / no-template-control / failed-yield
+  wells can still reach a "done" signal. New `WorkTicketState.NO_DATA` enum value
+  (additive `ALTER TYPE ... ADD VALUE 'no_data'` migration + the Python twin;
+  `WorkTicketState` already in `ENUM_PAIRS`). `fastq_to_parquet` on empty input
+  now raises a new typed terminal `StepNoData` signal (in
+  `qiita-common/backend_failure.py`, parallel to `BackendFailure` — its own wire
+  body + `X-Qiita-Step-No-Data` header round-tripping the `/step/*` boundary, NOT
+  a `FailureKind`) instead of minting a sequence range or writing `read.parquet`;
+  it mints no identifiers and writes no output. The dispatcher re-raises
+  `StepNoData` unchanged (above the generic `ValueError → BAD_INPUT` arm), both
+  backends round-trip it, and the runner transitions the ticket `PROCESSING →
+  NO_DATA` with NULL failure columns — no `failure_status` PATCH, no
+  `success_status` advance, transient markers cleared. `NO_DATA` is terminal for
+  resubmission (DELETE-gated) and the `/run` redrive (409). (#176)
+- A `prep_sample` retire surface so an operator can disposition a sample (drop an
+  empty / failed-yield well out of a pool's active set) without raw SQL. New
+  reversible `PATCH /api/v1/prep-sample/{idx}/retired` (gated on
+  `Scope.PREP_SAMPLE_WRITE` + the wet_lab_admin role the prep_sample read route
+  uses; `retired=false` un-retires a misclassified well) plus `qiita prep-sample
+  retire` / `qiita prep-sample un-retire` CLI subcommands. The `prep_sample.retired`
+  column + CHECK already existed and the completion rollup already excludes retired
+  rows. (#176)
+- Producer cutover for the full-read+mask feature (PR 3). The orchestrator now
+  PRODUCES the reads and masks the DuckLake tables consume, replacing the
+  destructive host/QC read-dropping. `ReadMaskReason` (a `qiita-common`
+  `StrEnum`: `pass` / `qc_too_short` / `qc_too_long` / `qc_low_quality` /
+  `qc_too_many_n` / `host_rype` / `host_minimap2`; backs a DuckLake VARCHAR, not
+  a Postgres ENUM, so no `ENUM_PAIRS` entry). `fastq_to_parquet` writes the full
+  reads with a `prep_sample_idx` column (sorted `(prep_sample_idx,
+  sequence_idx)`) and exposes a staging dir so a `register-files` step loads them
+  into the DuckLake `read` table. `qc` stops dropping reads and emits a partial
+  mask (`sequence_idx`, reason, per-end trims) via `filter_read` fail-reason →
+  `ReadMaskReason`. `host_filter` runs rype/minimap2 on the trimmed QC-pass
+  subset, merges host hits into the QC mask under a privacy precedence (host
+  wins over `pass`; QC-failed reads keep their `qc_*` reason), and registers the
+  final `read_mask` (tagged with the CP-minted `mask_idx`) into the DuckLake
+  `read_mask` table. The runner mints `mask_idx` before the step loop (host
+  references from the sample's `sequenced_sample` row + the resolved QC config,
+  deduped on a config hash) and threads it into `host_filter`. `persist-read-metrics`
+  is re-sourced from the mask, counting `COUNT(*) + COUNT(right_trim2)` per
+  reason bucket so paired-end `_r1r2` totals don't silently halve. New workflow
+  `fastq-to-parquet/1.3.0` reflects the new step shape; the dead
+  `qc_reads.parquet` / `filtered_reads.parquet` outputs are removed, and the new
+  COPY/read_parquet/CREATE VIEW path literals route through
+  `validate_parquet_path`. (#173)
+- Data-plane read tables + masked-read view (PR 2 of the full-read+mask
+  feature). The data plane now creates the DuckLake `read` and `read_mask`
+  tables and the `read_masked` view at startup (`ensure_read_tables`, called
+  alongside `ensure_reference_tables`; idempotent via `CREATE TABLE/VIEW IF NOT
+  EXISTS`, the view is catalog-stored so it persists across DP restarts).
+  `read_masked` joins `read` to `read_mask`, applies the recorded per-mate trims
+  (`substr` on the sequence, list-slice on the `UTINYINT[]` qual), and excludes
+  every non-`pass` row (`WHERE m.reason = 'pass'`), so host/human and QC-failed
+  reads are unreachable by construction. `read_masked` added to the Flight
+  `ALLOWED_TABLES`, and `mask_idx`/`prep_sample_idx` to `ALLOWED_FILTER_COLUMNS`;
+  raw `read`/`read_mask` are deliberately NOT Flight-reachable. No producer of
+  read data yet (PR 3). (#171)
+- Read-mask identity + masked-read DoGet route (PR 1 of the full-read+mask
+  feature). New `qiita.mask_definition` table + `qiita.mint_mask_definition`
+  function mint a `mask_idx` identifying a read-filtering config, deduplicated on
+  a canonical-JSON SHA-256 of the config so the same config resolves to the same
+  `mask_idx` fleet-wide (idempotent upsert; no advisory lock). New
+  `POST /api/v1/mask-definition` (mint) and `POST /api/v1/read-masked/ticket/doget`
+  (signs an HMAC DoGet ticket scoped to a mandatory `(prep_sample_idx, mask_idx)`
+  filter on the data plane's `read_masked` view — an unfiltered ticket is never
+  signed). Both service-account-only under a new `read_masked:doget` scope.
+  `read_masked` added to the CP-side DoGet table allowlist (the data-plane view
+  itself lands in PR 2). New `qiita_common.hashing` canonical-hash helper. (#170)
+- `qiita ticket run <idx>` CLI subcommand — wraps the existing
+  `POST /work-ticket/{idx}/run` operator override (reset a FAILED ticket and
+  re-dispatch; the only retry mechanism, no auto-retry worker). The runner
+  fast-forwards already-COMPLETED steps and resumes at the first incomplete one,
+  so an expensive finished step (e.g. `stage_local_fasta`) is not recomputed.
+  Mirrors `qiita ticket status`; no server change (the route and api_paths
+  constants already existed) (#157)
+- Pool prep-generation completion rollup. New `GET
+  /api/v1/sequencing-run/{run}/sequenced-pool/{pool}/completion` route (and
+  `qiita-user pool-completion`) classifies each non-retired `sequenced_sample` by
+  the state of its `fastq-to-parquet` work tickets (any version) and tallies
+  `samples_completed` / `samples_in_flight` / `samples_failed` /
+  `samples_not_submitted` over the pool, with a `complete` flag (every sample
+  COMPLETED, pool non-empty). The SPP `GenPrepFileJob` end-state equivalent: it
+  tells the operator whether the per-sample fan-out finished. Compute-on-read
+  over the work tickets, so it never drifts when a sample is re-processed,
+  re-submitted, or deleted. Read-gated like the other pool rollups
+  (prep_sample:read + wet_lab_admin). Part of #146 (#158)
+
+- Per-sample host-filter references. `sequenced_sample` gains two nullable FK
+  columns (`host_rype_reference_idx`, `host_minimap2_reference_idx` → `reference`,
+  with a CHECK that minimap2 only accompanies rype) recording which host the
+  sample is depleted against — both NULL means no host filtering. They map 1:1
+  onto `fastq-to-parquet/1.2.0`'s `host_rype_reference_idx` /
+  `host_minimap2_reference_idx`, so a later pool fan-out is a pass-through; the
+  reference being `(name, version)` pins the exact host build per sample, and a
+  non-human host is just a different reference (no schema change). The
+  sequenced-sample composer request/response and the pool/run sample-list items
+  carry them. `qiita-user submit-bcl-convert` gains `--host-rype-reference-idx`
+  (+ optional `--host-minimap2-reference-idx`): it reads each sample's project
+  `human_filtering` flag from the preflight and records the host reference(s) on
+  `human_filtering` samples (blanks/controls follow their project) while leaving
+  `human_filtering=0` samples unfiltered, pre-flighting the references ACTIVE +
+  indexed up front (#156)
+
+- Merged (multiqc-equivalent) run-level QC report for a pool. `sequenced_sample`
+  gains two nullable `jsonb` columns (`raw_qc_report`, `filtered_qc_report`)
+  holding the per-sample `qc_report.json` documents; a new `persist-qc-report`
+  library primitive — added as the final `action:` step of
+  `fastq-to-parquet/1.2.0` — writes them from the `qc_report_raw` /
+  `qc_report_filtered` sidecars (the same persist-from-sidecar pattern as
+  `persist-read-metrics`). New `GET
+  /api/v1/sequencing-run/{run}/sequenced-pool/{pool}/qc-report` route returns the
+  pool's merged report: the read-metric rollup, every non-retired sample's
+  persisted raw/filtered report, and a run-level `merged` aggregate (per-mate
+  histograms summed across samples, means base/read-weighted). Compute-on-read —
+  the merge runs at request time, so it never drifts when a sample is
+  re-processed or deleted. Read-gated like the pool roster (prep_sample:read +
+  wet_lab_admin). implements #145 (#154)
+- New `qc_report` native job: a fastqc-equivalent per-sample QC summary computed
+  in DuckDB straight from `reads.parquet` (no container, no miint extension). Per
+  mate (r1/r2) it reports read/base counts, mean quality, GC and N content,
+  length stats, and per-sequence mean-quality / GC-percent / length histograms,
+  written as a `qc_report.json` sidecar. Wired into `fastq-to-parquet/1.2.0` as
+  two steps mirroring SPP's bclconvert/filtered_sequences split — `qc_report_raw`
+  (on the raw fastq output, before qc) and `qc_report_filtered` (on the
+  host-filtered output) — sharing one module, disambiguated by input/output
+  binding (`reads`→`raw_qc_report`, `filtered_reads`→`filtered_qc_report`). The
+  artifacts feed the upcoming merged-report step; reporting only, no filtering
+  change (#152)
+
 - New `GET /api/v1/sequencing-run/{run}/sequenced-pool/{pool}` route returning a
   pool's metadata plus a compute-on-read read-metric rollup (#143): per-stage
   read-count SUMS over the pool's non-retired `sequenced_sample` rows
@@ -260,6 +433,109 @@ the `no-changelog` label).
 
 ### Changed
 
+- `runner._resolve_staged_reads` now falls back to the data plane when a
+  read-mask workflow can't find the prep_sample's ephemeral durable staging copy:
+  it signs an `export_read` action token and binds the per-ticket `reads.parquet`
+  the data plane writes from the persistent DuckLake `read` table (an empty result
+  or unreachable data plane still FAILs the ticket cleanly as a SUBMISSION
+  BAD_INPUT). This lets `submit-host-filter-pool` reprocess a run whose staging
+  copy has been reaped, instead of hard-failing "no stored reads". (#187)
+- Tightened the `read-mask/1.0.0` action audience from
+  `[user, wet_lab_admin, system_admin]` to `[wet_lab_admin, system_admin]`:
+  submitting a read mask (host filter / QC reprocessing) now drives the data plane
+  to re-materialize the sample's RAW (human-containing) reads via `export_read`,
+  so it is a privileged operation — never a plain `user`. (#187)
+- Split read storage from masking so a sample's reads are stored ONCE and can be
+  masked repeatedly against different host references. Previously the single
+  `fastq-to-parquet` workflow parsed FASTQ, minted a `sequence_idx` range, AND
+  masked in one ticket — so re-masking the same sample against a second host
+  reference hit the `sequence_range` UNIQUE(prep_sample_idx) constraint (409) and
+  failed. Now: the **bcl-convert** workflow gains an `ingest_reads` step that,
+  after demux, parses every pool sample's FASTQ(s), mints the range, and writes
+  the full reads into the DuckLake `read` table once (plus a durable per-sample
+  `read.parquet` under `<scratch>/reads/<prep_sample_idx>/`). A new **`read-mask`**
+  workflow (`qc → host_filter → register read_mask → persist-read-metrics`) binds
+  those stored reads and records one mask per submission — `qc.py`/`host_filter.py`
+  are unchanged. `submit-bcl-convert` now embeds the pool roster
+  (`prep_sample_idx ↔ pool_item_id`) in the ticket's `action_context` so the
+  pool-scoped ingest step (which has no DB access) can store reads; the runner
+  materializes it to a Parquet (`_resolve_sample_map`) and binds the staged reads
+  for a mask ticket (`_resolve_staged_reads`). `submit-host-filter-pool` is now
+  mask-only: it drops `--convert-dir` and FASTQ resolution and submits one
+  `read-mask/1.0.0` ticket per sample, so the SAME pool can be re-submitted later
+  against host reference 4 to produce a side-by-side mask over host reference 2's
+  reads — neither re-runs ingest. The pool-completion rollup now keys on the
+  `read-mask` action (a sample is "processed" once it has a mask). The legacy
+  `fastq-to-parquet` workflows remain registered but dormant (no gesture submits
+  them); full retirement is a fast-follow.
+- `build_rype_index` rebalances the DuckDB/rype memory split now that
+  `rype_index_create` windows its chunk feed (miint windowed-feed fix): DuckDB's
+  under-SLURM hard cap drops 30 → 8 GB (the windowed feed bounds DuckDB's working
+  set to ~256 MiB per window rather than the whole corpus), handing the freed
+  ~22 GB to rype's in-process index build. rype's `max_memory` now starts ~50 GB
+  at the 64 GB baseline and grows to ~114 GB at the 128 GB OOM-retry ceiling (was
+  ~30 → ~92 GB). The off-SLURM fallbacks (DuckDB 4 GB, rype 30 GB floor) are
+  unchanged. Relies on the windowed-feed miint build being live on the mirror.
+  (#179)
+- The sequenced-pool completion rollup gains a `samples_no_data` bucket and its
+  `complete` flag now fires when every active sample is in a terminal-accounted
+  state — COMPLETED **or** NO_DATA — instead of requiring every sample COMPLETED.
+  A plate of real data containing empty wells now reaches `complete=True` rather
+  than sitting `false` forever behind permanent empty-well failures. The per-sample
+  precedence is `completed > in_flight > no_data > failed > not_submitted` (no_data
+  outranks failed, so a well with both a no_data and a stale failed ticket counts
+  as no_data); empty wells are no longer folded into `samples_failed`. The
+  `GET .../sequenced-pool/{P}/completion` response gains the `samples_no_data`
+  field (soft contract addition). Until expected-empty control-well preflight
+  marking lands (deferred), EVERY empty well becomes `no_data` — data wells
+  included, not only flagged controls. (#176)
+- Host-filter references moved off `sequenced_sample` onto the human-filter
+  submission (PR 4 of the full-read+mask feature). Host references are a
+  filtering-config choice, not a sample property, so two configs can coexist over
+  the same reads. `submit-host-filter-pool` now takes `--host-rype-reference-idx`
+  / `--host-minimap2-reference-idx` (pool-wide for the submission; omit for a
+  QC-only pass-through), pre-flights them once at submission, and threads them
+  into the work-ticket `action_context` where the runner reads them to mint the
+  `mask_idx` and drive `host_filter`. `submit-bcl-convert` no longer accepts or
+  records host references (it only demultiplexes the run); the preflight's
+  per-project `human_filtering` flag is still echoed per sample for reference.
+  `prep_protocol_idx` stays on the sample. Soft API change: sequenced-sample GET
+  responses and the pool/run sample-list rows no longer carry host references.
+  `submit-host-filter-pool` also takes `--preflight-blob` (the same SQLite given
+  to `submit-bcl-convert`) and guards against a pool-wide host-ref choice that
+  disagrees with the samples' intake `human_filtering` intent: a mismatch aborts
+  before any ticket is submitted unless `--force` downgrades it to a warning.
+  (#175)
+- `build_rype_index` resized for large host sets (many human genomes that OOMed
+  at 32 GB). The step's `baseline_resources.mem_gb` rises 32 → 64 in both
+  `host-reference-add/1.0.0` and `local-host-reference-add/1.0.0`, and
+  `local-host-reference-add`'s `action_ceiling.mem_gb` rises 64 → 128 (matching
+  `host-reference-add`) so an OOM-killed retry can double the step 64 → 128 GB
+  (the escalator clamps to the ceiling). The job now hard-caps DuckDB at 30 GB
+  (was 16) regardless of allocation, so the larger cgroup — and the bigger one
+  an OOM retry escalates to — flows to rype: rype's `max_memory` starts at 30 GB
+  and grows with the allocation (≈92 GB at the 128 GB ceiling). Builds on the
+  OOM-retry escalation below (#169)
+- Workflow steps now escalate their memory allocation on an OOM-killed retry.
+  Previously every retry re-ran at the same `mem_gb`, so an OOM just OOM'd again
+  until the retry budget was exhausted. `_run_entry_with_retry` now grows the
+  step's memory floor ×2 (clamped to the action's `mem_gb` ceiling) on each
+  `OOM_KILLED` retry; other transient kinds still retry unchanged. The escalated
+  floor is process-local — a CP restart re-attaches and re-escalates from the
+  ticket's static `resource_override`. The `reference-add` and
+  `host-reference-add` action ceilings are raised 64 → 128 GB so the OOM-prone
+  `reference_load` step can climb 32 → 64 → 128 GB across retries (#167)
+- `qiita-user submit-host-filter-pool` now host-filters each pool sample against
+  the reference(s) recorded on it at `submit-bcl-convert` time, instead of a
+  single uniform reference for the whole pool. **Operator-facing CLI contract
+  change:** the global `--host-rype-reference-idx` / `--host-minimap2-reference-idx`
+  flags are removed (host filtering is per-sample now). Samples with a recorded
+  `host_rype_reference_idx` are depleted against it (plus their optional minimap2
+  reference); samples with none recorded (preflight `human_filtering=0`) get a
+  QC-only `host_filter_enabled=false` pass-through ticket — the first fan-out path
+  for unfiltered samples. The gesture pre-flights each distinct recorded reference
+  (ACTIVE + the required index) once up front, so a misconfiguration aborts with
+  zero side effects. Part of #146 (#158)
 - Stripped this repo's GitHub issue/PR numbers from code comments, docstrings,
   and string literals across all components (comment-only; no behavior change),
   and recorded the convention in `CLAUDE.md`: provenance lives in git / CHANGELOG
@@ -542,6 +818,116 @@ the `no-changelog` label).
 
 ### Fixed
 
+- `read-mask` (1.0.0) and `fastq-to-parquet` (1.3.0) workflows ran
+  `persist-read-metrics` *after* `register-files`, but `register-files` MOVES
+  `read_mask.parquet` out of the staging dir into permanent DuckLake storage —
+  so `persist-read-metrics` re-opened a path that no longer existed and failed
+  with `FileNotFoundError: read_mask parquet not found`. Reordered both
+  workflows so `persist-read-metrics` reads the staged parquet first, then
+  `register-files` moves it. (#181)
+- The `qiita` / `qiita-admin` CLIs now emit an actionable error instead of a raw
+  import-time traceback when launched against a **stale `qiita_common`** (the
+  cross-package staleness trap: a plain `uv sync` skips reinstalling the
+  unchanged-version path-dep, leaving stale sources in the venv). The console-script
+  entry points now target a new import-clean shim (`qiita_control_plane.cli._bootstrap`)
+  that imports the real CLI `main` lazily; a `qiita_common` `ImportError` is
+  translated to a one-line message naming the exact fix
+  (`uv sync --reinstall-package qiita-common`) and echoing the original error,
+  while any unrelated `ImportError` is re-raised untouched (real bugs are never
+  masked). Complements the `make redeploy` checkout-venv refresh above — this
+  covers the case where the CLI is run without going through the redeploy script.
+  The real `cli.user:main` / `cli.admin:main` are unchanged and still used by the
+  shim, tests, and the redeploy import probe (#163)
+- `make redeploy` now refreshes the operator's **checkout** CLI venv
+  (`$QIITA_CLONE/qiita-control-plane/.venv`, where `uv run qiita` / `qiita-admin`
+  resolve), closing a two-tree gap: `activate.sh` `uv sync`s only the `/opt/qiita`
+  service venvs and the existing native-venv step covers only
+  `qiita-compute-orchestrator`, so a pull that changed `qiita-common` without a
+  version bump left the checkout CLI ImportError-ing on a stale path-dep until the
+  operator ran `uv sync --reinstall-package qiita-common` by hand. A new step 6
+  runs that reinstall as the checkout owner (never root), with a cheap skip when
+  neither `qiita-common` nor `qiita-control-plane` changed in the pull and the venv
+  still imports the CLI entrypoint (`FORCE_CLI_REFRESH=1` overrides). The skip
+  delegates to a new pure `qiita_paths_touch_cli` helper in `deploy/_common.sh`
+  (unit-tested), mirroring `qiita_paths_touch_native` (#163)
+- `POST /work-ticket/{idx}/run` (`qiita ticket run`) can now redrive a FAILED
+  multi-transition reference workflow instead of dead-ending at a `permanent`
+  `IllegalStatusTransition`. The redrive resets a `failed` reference to `pending`
+  (its only legal exit from `failed`) while keeping the COMPLETED step rows, but
+  the runner's fast-forward used to *skip* those completed steps' `target_status`
+  PATCHes — so the reference stayed at `pending` while the first re-run step tried
+  to advance from mid-FSM (e.g. `minting → loading`), which is illegal. The
+  fast-forward now RE-WALKS each completed step's status edge, advancing the
+  resource forward along the FSM only when it is behind; on a normal
+  startup-recovery resume (resource not rewound) the re-apply is a no-op or a
+  rejected backward edge, both benign. Fixes redrives of `local-host-reference-add`
+  / `host-reference-add` (which walk `pending → hashing → minting → loading →
+  indexing → active`) after a `load`-step failure (#165)
+- `mint-features` no longer starves the control-plane event loop on genome-scale
+  reference loads. The in-process primitive read every `sequence_hash` from the
+  manifest with a blocking, ORDER-BY (full-sort) DuckDB `fetchall()` and then
+  built an O(N) Python list + dict + string-pair list — all on the single
+  uvicorn event loop — so a human-comprehensive host reference pinned the API at
+  high CPU and made every request (even a one-row `ticket status`) time out.
+  Rewritten to stream the manifest in `_CHUNK_SIZE` batches (matching
+  `write-membership`), drop the needless input sort, accumulate into a spillable
+  DuckDB temp table de-duplicated at write time, and offload the final Parquet
+  COPY to a thread. `_associate_genomes` likewise streams and resolves
+  `feature_idx` via a DuckDB JOIN against the written feature_map instead of an
+  in-memory mapping. The CP-side analog of the `hash_sequences` genome-scale fix
+  below; output Parquet schema and idempotency are unchanged.
+- `reference_load` no longer OOMs writing `reference_sequence_chunks` on
+  genome-scale reference loads. Each per-part `COPY` did scan + join +
+  `ORDER BY (feature_idx, chunk_index)` + write in one statement; the sort is a
+  pipeline breaker, so it buffered the batch's wide ~64 KB chunk rows while the
+  full ~30 GB glob scan and the 8-thread write buffers were all still live,
+  blowing the cap (observed 38.7 GiB against ~39 GiB). Split into two phases per
+  part: phase 1 streams the batch's chunks into a temp table (re-keyed
+  hash → feature_idx, no sort), phase 2 sorts that isolated temp table (≤ one
+  batch, never the 30 GB glob) and writes the part. The sort is kept on purpose
+  — it clusters row groups so a `WHERE feature_idx IN (...)` DoGet prunes within
+  a part, and feature_idx-ascending batches keep the parts a disjoint-range
+  dataset for catalog-level file pruning; without it a point query would scan a
+  whole part, since input order is parallel-scrambled upstream
+  (`preserve_insertion_order=false`). Sibling to the `hash_sequences`
+  genome-scale fix below.
+- `hash_sequences` no longer OOMs writing `reference_sequence_chunks` on
+  genome-scale reference loads. The per-batch output COPY joined the full
+  `hashed` table (which grows 1:1 with the input), so at scale the optimizer
+  could reorder that join ahead of the batch filter and materialize the entire
+  file's `chunk_data` (observed 38 GiB against a 39 GiB cap). It also re-scanned
+  the whole upload once per batch (~420× at 21M rows) and globally sorted by
+  `sequence_hash` — a sort no consumer needs (`reference_load` re-keys to
+  `feature_idx` with its own scan, the data plane's DoGet filters by
+  `feature_idx`, and reassembly sorts `chunk_index` in-memory per feature).
+  Replaced with a single streaming scan that relabels read_id → canonical
+  `sequence_hash` in one pass: `canonical` (one narrow row per distinct hash) is
+  always the lower-cardinality join input, so it's the hash-join build side and
+  `chunk_data` streams through the probe to the writer — peak memory ~1 GB/thread
+  and constant in file size, and the upload is scanned once instead of per batch.
+  Output schema and canonical-dedup semantics are unchanged (one
+  `part_00000.parquet` in the directory). (#155)
+- `reference_load`'s per-batch chunk re-key (`sequence_hash` → `feature_idx`)
+  carried the same latent OOM as the hash_sequences output side: each batch
+  joined the full `feature_map` table, which grows 1:1 with the feature count,
+  so at reference scale the optimizer could reorder that join ahead of the batch
+  filter and materialize the whole glob's `chunk_data`. The join is now bounded
+  to the batch's hashes by construction (an `fmb` CTE pre-filtered to the batch),
+  so no join order can exceed one batch. The feature_idx-clustered, disjoint-range
+  part layout (load-bearing for DuckLake / row-group pruning on DoGet's feature_idx
+  lookups) and per-batch sort are unchanged. (#155)
+- Native (`module:`) SLURM steps no longer collapse to a single CPU. The
+  generated launcher ran a bare `srun`, but SLURM >= 22.05 srun no longer
+  inherits `--cpus-per-task` from the batch allocation, so it laid the single
+  task out at cpus-per-task=1 and its default `--cpu-bind` pinned that task —
+  and every thread it spawned — to one allocated CPU. Native jobs run DuckDB
+  with a multi-thread pool, so an N-CPU allocation silently ran on a single
+  core (a TB-scale `stage_local_fasta` host-reference load crawled at ~75 MB/s
+  on 1 of 4 allocated cores while the job's cgroup cpuset granted all of them).
+  The launcher now exports `SRUN_CPUS_PER_TASK` from the allocation and passes
+  `srun --cpu-bind=none`, letting the thread pool float across the whole cgroup
+  cpuset (which already constrains the job to its allocation). Container
+  (`apptainer exec`, no srun) steps were never affected. (#153)
 - Data-plane file registration no longer collides with — and attempts to
   overwrite — an already-registered DuckLake data file. `register_files` placed
   each Parquet at `DATA_PATH/<table>/<producer-basename>`, but the reference-load
@@ -967,6 +1353,12 @@ the `no-changelog` label).
 
 ### Removed
 
+- `sequenced_sample.host_rype_reference_idx` / `host_minimap2_reference_idx`
+  columns (their FKs and the minimap2-requires-rype CHECK drop with them). Host
+  references are now a human-filter submission argument, not a sample column
+  (PR 4 of the full-read+mask feature). Single drop migration, no
+  expand/contract: the deploy wipes all legacy sequenced/pool samples first
+  (their reads predate the lake-read model). (#175)
 - The legacy synchronous step path: `POST /step/run`, `ComputeBackend.run_step`
   (+ the SLURM/Local overrides and the CO `_poll_until_terminal` poll loop),
   `ComputeBackendClient.run_step`, and the `StepRunRequest` / `StepRunResponse`

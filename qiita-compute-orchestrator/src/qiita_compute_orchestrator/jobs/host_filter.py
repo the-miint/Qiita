@@ -1,53 +1,63 @@
-"""Native job: host-deplete short reads (rype → minimap2) on `reads.parquet`.
+"""Native job: host-deplete reads (rype -> minimap2) by MASKING, not dropping.
 
-A pure `reads.parquet -> filtered_reads.parquet` transform keyed by the
-already-minted `sequence_idx`. Minting happened upstream in `fastq_to_parquet`;
-this step is an additive downstream filter that only DROPS rows, so the surviving
-`sequence_idx` are a subset of the minted range (benign gaps — `sequence_idx`
-stays a unique sorted join key).
+Merges host-filter hits into the partial `qc_mask` from the `qc` step and emits
+the final DuckLake `read_mask` parquet — one row per read, recording the read's
+mask `reason` and trims. NO read is dropped: the full reads live once in the
+DuckLake `read` table; this step only writes mask state keyed by the already-minted
+`sequence_idx`.
 
-Two-stage host filter, locked with the design:
+Two-stage host filter, run on the QC-PASS subset only (the reads `read_masked`
+would actually surface):
   1. rype `rype_classify` against the host's POSITIVE index — host = any emitted
      row (a low explicit threshold, not rype's `-N` negative mode);
   2. minimap2 `align_minimap2` (preset 'sr') on rype's SURVIVORS only — host =
      any alignment hit.
-The drop set is the union; minimap2 runs on the reads rype didn't already flag,
-so the two indexes never re-examine the same read.
+The hit set is the union; minimap2 runs on the reads rype didn't already flag,
+so the two indexes never re-examine the same read. Host classification runs on
+the TRIMMED QC-pass sequences (the same trims the `read_masked` view applies), so
+a hit reflects the read as it would be served.
 
-**Paired-end is handled natively, not by flattening.** A row of `reads.parquet`
-is one read pair: `sequence1`/`sequence2` are R1/R2 under a single minted
-`sequence_idx`. We pass that pair straight to the tools as
-`(read_id := sequence_idx, sequence1, sequence2)` — `rype_classify` reads BOTH
-mates' k-mers and `align_minimap2` aligns the pair in proper PE mode (it sets the
-mate/template-length SAM fields). Either mate matching the host flags the read's
-single `sequence_idx`, so "drop the whole pair if either mate hits" falls out
-without ever moving R2 into an R1 slot. Single-end reads simply have
-`sequence2 IS NULL`, which both tools tolerate.
+**Reason precedence (privacy-critical).** The final reason is, per read:
+`host_minimap2` if minimap2 hit, else `host_rype` if rype hit, else the qc_mask's
+own reason (`pass` or a `qc_*` failure). Host wins over `pass`; a read that
+already failed QC keeps its `qc_*` reason (it's excluded from `read_masked`
+either way, and host classify never ran on it). So `host_*` only ever overrides
+`pass` — the privacy-sensitive host/human rows can never leak through a code path
+that only inspects `qc_*`.
 
-Gating: when neither index path is bound (host filtering disabled) this is a
-pass-through copy. A fully host-contaminated sample is valid — the output is an
-empty (0-row) but well-formed Parquet, not an error.
+**Paired-end is handled natively, not by flattening.** A read row is one pair:
+`sequence1`/`sequence2` are R1/R2 under one minted `sequence_idx`. We pass the
+trimmed pair to the tools as `(read_id := sequence_idx, sequence1, sequence2)` —
+`rype_classify` reads BOTH mates' k-mers and `align_minimap2` aligns the pair in
+PE mode. Either mate matching the host flags the read's single `sequence_idx`.
+Single-end reads have `sequence2 IS NULL`, which both tools tolerate.
+
+Gating: when neither index path is bound (host filtering disabled) the mask is
+the qc_mask unchanged (no host stage runs). A fully host-contaminated sample is
+valid — every QC-pass read becomes `host_*`, which is correct, not an error.
 
 miint contracts (qiita-verified against the team-mirror build via the smoke; see
 docs/duckdb-miint.md):
   - `rype_classify(index_path, sequence_table, [id_column='read_id'],
-    [threshold=0.1], [negative_index])` → host-matching reads with columns
+    [threshold=0.1], [negative_index])` -> host-matching reads with columns
     `(read_id, bucket_id, bucket_name, score)`. It reads `sequence1` and (when
-    present) `sequence2`. We DISTINCT the `read_id` — the table-function
-    interface does not guarantee one best-hit row per read (that is a CLI
-    behavior) — and append into a BIGINT accumulator column, which coerces
-    rype's `read_id` to BIGINT on insert whether the build returns it as BIGINT
-    or VARCHAR (so the typed column is the contract; no explicit cast).
-  - `align_minimap2(query_table, [index_path], [preset], [max_secondary], ...)` →
+    present) `sequence2`. We DISTINCT the `read_id` — the table-function interface
+    does not guarantee one best-hit row per read — and append into a BIGINT
+    accumulator column, which coerces rype's `read_id` to BIGINT on insert.
+  - `align_minimap2(query_table, [index_path], [preset], [max_secondary], ...)` ->
     SAM-like rows (`read_id, flags, reference, ...`); `read_id` round-trips as
     BIGINT (no cast). It reads `sequence1`/`sequence2` and emits one row per mate
-    (plus secondaries), so we pass `max_secondary := 0` and DISTINCT the
-    `read_id` to collapse a pair's rows to its single `sequence_idx`. Any
-    surviving row = a hit.
+    (plus secondaries), so we pass `max_secondary := 0` and DISTINCT the `read_id`
+    to collapse a pair's rows to its single `sequence_idx`. Any surviving row = a hit.
 Both resolve the query/sequence table by NAME on a SEPARATE connection during
 bind/execute — so the query / survivors relations are non-temp VIEWs and the
 host-id accumulators are non-temp TABLEs (TEMP tables / CTEs are not visible to
 that connection; see docs/duckdb-miint.md).
+
+`mask_idx` and `prep_sample_idx` are per-run constants stamped onto every
+`read_mask` row at emit time. `mask_idx` is the CP-minted filtering-config
+identity (the runner mints it before this step and threads it in via `params`);
+multiple masks coexist over the same reads.
 """
 
 from __future__ import annotations
@@ -57,16 +67,16 @@ from pathlib import Path
 
 import duckdb
 from pydantic import BaseModel
+from qiita_common.models import ReadMaskReason
+from qiita_common.parquet import validate_parquet_path
 
 from ..miint import PARQUET_OPTS, apply_duckdb_settings, open_miint_conn
-from ..read_count import write_read_count
 
 YAML_STEP_NAME = "host_filter"
 
 # DuckDB stages the (streamed) query VIEW, the small host-id accumulators, and
 # the final sorted COPY; the rype / minimap2 runtimes hold the indexes
-# out-of-heap. Literals mirror the fastq-to-parquet/1.1.0 YAML's host_filter
-# baseline_resources (a mismatch is visible at review).
+# out-of-heap.
 #
 # NOT converted to the allocation-aware `resolve_duckdb_memory_gb` the
 # reference-add build steps use, and deliberately so: at filter time the
@@ -76,8 +86,7 @@ YAML_STEP_NAME = "host_filter"
 # DuckDB allocation-aware here would be wrong: it would let DuckDB claim the box
 # and STARVE those out-of-heap indexes. The right lever for a genome-scale host
 # filter is the cgroup (YAML mem_gb / `--mem-gb`), which already reaches the
-# indexes with DuckDB held modest. Bump the YAML mem_gb (and this cap, if the
-# DuckDB-side staging itself ever needs it) when sized against a real host filter.
+# indexes with DuckDB held modest.
 _DUCKDB_MEMORY_GB = 8
 _DUCKDB_THREADS = 4
 
@@ -91,29 +100,48 @@ _RYPE_THRESHOLD = 0.0
 # preset the `.mmi` was built with (build_minimap2_index).
 _MINIMAP2_PRESET = "sr"
 
-# In-DuckDB relation names. query/survivors are VIEWs read by miint's separate
-# connection; the *_host accumulators are TABLEs (set algebra + always-present
-# union, even when a tool is skipped).
+# In-DuckDB relation names. qc_mask + the trimmed-QC-pass query/survivors are
+# VIEWs; the *_host accumulators are TABLEs (set algebra + always-present union,
+# even when a tool is skipped). qc_mask is read on the SAME connection but is a
+# VIEW (not a CTE) so the COPY and the query view can both reference it.
+_QC_MASK = "host_filter_qc_mask"
 _QUERY = "host_filter_query"
 _SURVIVORS = "host_filter_survivors"
 _RYPE_HOST = "host_filter_rype_hits"
 _MM2_HOST = "host_filter_minimap2_hits"
 
+# A QC-pass read's trimmed sequence/qual: the same substr / list-slice math the
+# read_masked view applies (1-based start, length arg for substr; 1-based
+# inclusive slice for the qual array). Built from the read.parquet columns joined
+# to the qc_mask trims. `r` is the read alias, `q` the qc_mask alias.
+_TRIM_SEQ1 = (
+    "substr(r.sequence1, q.left_trim1 + 1, length(r.sequence1) - q.left_trim1 - q.right_trim1)"
+)
+_TRIM_SEQ2 = (
+    "CASE WHEN r.sequence2 IS NULL THEN NULL ELSE "
+    "substr(r.sequence2, q.left_trim2 + 1, "
+    "length(r.sequence2) - q.left_trim2 - q.right_trim2) END"
+)
+
 
 class Inputs(BaseModel):
     """Typed input contract for host_filter.
 
-    `reads` is fastq_to_parquet's `reads.parquet` (binding name `reads`):
-    `(sequence_idx BIGINT, read_id, sequence1, qual1, sequence2, qual2)`.
+    `reads` is fastq_to_parquet's `read.parquet` (binding name `reads`):
+    `(prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2)`
+    — the FULL reads. `qc_mask` is the partial mask the `qc` step emitted
+    `(sequence_idx, reason, left_trim1, right_trim1, left_trim2, right_trim2)`.
     `host_rype_path` (a `.ryxdi` DIRECTORY) and `host_minimap2_path` (a `.mmi`
-    FILE) are the host indexes — both bound when host filtering is enabled,
-    neither when disabled (the runner resolves them as optional inputs). When a
-    path is None its stage is skipped. `prep_sample_idx` / `work_ticket_idx` are
-    the framework-injected scope scalars (PREP_SAMPLE kind + the always-on
-    work_ticket_idx).
+    FILE) are the host indexes — bound when host filtering is enabled, neither
+    when disabled (the runner resolves them as optional inputs); a None path
+    skips its stage. `mask_idx` is the CP-minted filtering-config identity stamped
+    onto every output row. `prep_sample_idx` / `work_ticket_idx` are the
+    framework-injected scope scalars.
     """
 
     reads: Path
+    qc_mask: Path
+    mask_idx: int
     host_rype_path: Path | None = None
     host_minimap2_path: Path | None = None
     prep_sample_idx: int
@@ -133,12 +161,10 @@ def _run_rype_classify(
     pre-created `dest_table`. Isolated so unit tests stub the real classify.
 
     Positional args (index path, sequence-table NAME) + `threshold` are bound as
-    `?` (INSERT...SELECT is DML, so prepared params are accepted here, unlike a
-    CREATE VIEW). DISTINCT because the table-function interface does not
-    guarantee one best-hit row per read (that is a CLI behavior). `dest_table` is
-    declared BIGINT, so rype's `read_id` coerces to it on insert — no explicit
-    cast, and the typed column is the contract regardless of whether the build
-    returns the id as BIGINT or VARCHAR."""
+    `?` (INSERT...SELECT is DML, so prepared params are accepted here). DISTINCT
+    because the table-function interface does not guarantee one best-hit row per
+    read. `dest_table` is declared BIGINT, so rype's `read_id` coerces to it on
+    insert — no explicit cast."""
     conn.execute(
         f"INSERT INTO {dest_table} "
         "SELECT DISTINCT read_id AS sequence_idx "
@@ -171,7 +197,7 @@ def _run_align_minimap2(
 
 def _validate_rype_index(path: Path) -> None:
     """A rype index is a `.ryxdi` DIRECTORY; reject a missing one (fail fast)
-    and an empty one (no index content → a silent no-op classify)."""
+    and an empty one (no index content -> a silent no-op classify)."""
     if not path.exists():
         raise FileNotFoundError(f"host_rype_path not found: {path}")
     if not path.is_dir() or not any(path.iterdir()):
@@ -190,18 +216,25 @@ def _validate_minimap2_index(path: Path) -> None:
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     if not inputs.reads.exists():
         raise FileNotFoundError(f"reads parquet not found: {inputs.reads}")
+    if not inputs.qc_mask.exists():
+        raise FileNotFoundError(f"qc_mask parquet not found: {inputs.qc_mask}")
     if inputs.host_rype_path is not None:
         _validate_rype_index(inputs.host_rype_path)
     if inputs.host_minimap2_path is not None:
         _validate_minimap2_index(inputs.host_minimap2_path)
 
     workspace.mkdir(parents=True, exist_ok=True)
-    filtered = workspace / "filtered_reads.parquet"
+    # Output basename is the DuckLake table name: a downstream register-files
+    # step maps `read_mask.parquet` -> the `read_mask` table.
+    read_mask = workspace / "read_mask.parquet"
     duckdb_tmp = workspace / ".duckdb_tmp"
     duckdb_tmp.mkdir(parents=True, exist_ok=True)
 
-    reads_sql = str(inputs.reads).replace("'", "''")
-    out_sql = str(filtered).replace("'", "''")
+    # COPY / CREATE VIEW path literals can't take a bound param; route them
+    # through validate_parquet_path rather than inline-escaping.
+    reads_sql = validate_parquet_path(inputs.reads)
+    qc_mask_sql = validate_parquet_path(inputs.qc_mask)
+    out_sql = validate_parquet_path(read_mask)
 
     success = False
     try:
@@ -210,20 +243,27 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 conn, duckdb_tmp, memory_gb=_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS
             )
 
-            # One row per read PAIR, keyed by the shared sequence_idx (passed AS
-            # the tools' read_id), carrying both mates as sequence1/sequence2.
-            # The tools handle PE natively (rype reads both mates; minimap2
-            # aligns the pair). CREATE VIEW can't take prepared params, so the
-            # path is inlined (quote-escaped — a filesystem path, no other
-            # injection surface).
+            # qc_mask as a VIEW (read on this connection by both the query view
+            # and the final COPY).
+            conn.execute(f"CREATE VIEW {_QC_MASK} AS SELECT * FROM read_parquet('{qc_mask_sql}')")
+
+            # The host-classify query: the TRIMMED QC-pass reads, keyed by
+            # sequence_idx AS read_id (the tools' id column), carrying the trimmed
+            # R1/R2 the tools k-mer/align. Only reason='pass' rows — a QC-failed
+            # read is already excluded from read_masked, and host classify must
+            # never run on (and so never reclassify) a non-pass read. The tools
+            # handle PE natively. A non-temp VIEW so miint's separate connection
+            # can resolve it by name.
             conn.execute(
                 f"CREATE VIEW {_QUERY} AS "
-                "SELECT sequence_idx AS read_id, sequence1, sequence2 "
-                f"FROM read_parquet('{reads_sql}')"
+                f"SELECT r.sequence_idx AS read_id, "
+                f"{_TRIM_SEQ1} AS sequence1, {_TRIM_SEQ2} AS sequence2 "
+                f"FROM read_parquet('{reads_sql}') r "
+                f"JOIN {_QC_MASK} q USING (sequence_idx) "
+                f"WHERE q.reason = '{ReadMaskReason.PASS.value}'"
             )
             # Always-present accumulators (empty when a stage is skipped) so the
-            # survivors view and the final anti-join reference them
-            # unconditionally.
+            # merge below references them unconditionally.
             conn.execute(f"CREATE TABLE {_RYPE_HOST} (sequence_idx BIGINT)")
             conn.execute(f"CREATE TABLE {_MM2_HOST} (sequence_idx BIGINT)")
 
@@ -233,10 +273,11 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 )
 
             if inputs.host_minimap2_path is not None:
-                # Stage 2 sees only the pairs rype didn't flag (empty rype set →
-                # all pairs). An ANTI JOIN is NULL-safe by construction — unlike
-                # `NOT IN`, a stray NULL can't collapse the result to empty.
-                # Carries sequence1/sequence2 so minimap2 still aligns in PE.
+                # Stage 2 sees only the QC-pass reads rype didn't flag (empty rype
+                # set -> all QC-pass reads). An ANTI JOIN is NULL-safe by
+                # construction — unlike `NOT IN`, a stray NULL can't collapse the
+                # result to empty. Carries the trimmed sequence1/sequence2 so
+                # minimap2 still aligns in PE.
                 conn.execute(
                     f"CREATE VIEW {_SURVIVORS} AS "
                     f"SELECT q.read_id, q.sequence1, q.sequence2 FROM {_QUERY} q "
@@ -250,30 +291,43 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     preset=_MINIMAP2_PRESET,
                 )
 
-            # Drop = rype ∪ minimap2 (both empty → pass-through). A read survives
-            # only if its sequence_idx is in NEITHER accumulator — one ANTI JOIN
-            # against the unioned drop set (NULL-safe; see the note above). ORDER
-            # BY keeps the lake-friendly sorted `sequence_idx` layout
-            # fastq_to_parquet wrote and makes the output deterministic.
+            # Merge host hits into the qc_mask under the privacy precedence:
+            # minimap2 > rype > the qc_mask's own reason. Host only ever overrides
+            # 'pass' (the query view restricted classify to pass reads), so a
+            # qc_* row is untouched. mask_idx / prep_sample_idx are per-run
+            # constants stamped here. ORDER BY (mask_idx, prep_sample_idx,
+            # sequence_idx) — the read_mask table's sort key (sequence_idx last
+            # for row-group pruning).
             conn.execute(
-                "COPY (SELECT sequence_idx, read_id, sequence1, qual1, sequence2, qual2 "
-                f"FROM read_parquet('{reads_sql}') r "
-                f"ANTI JOIN (SELECT sequence_idx FROM {_RYPE_HOST} "
-                f"           UNION ALL SELECT sequence_idx FROM {_MM2_HOST}) drop_set "
-                "  ON drop_set.sequence_idx = r.sequence_idx "
-                f"ORDER BY sequence_idx) TO '{out_sql}' ({PARQUET_OPTS})"
+                "COPY (SELECT "
+                "  ?::BIGINT AS mask_idx, "
+                "  ?::BIGINT AS prep_sample_idx, "
+                "  q.sequence_idx, "
+                "  CASE "
+                f"    WHEN mm.sequence_idx IS NOT NULL THEN '{ReadMaskReason.HOST_MINIMAP2.value}' "
+                f"    WHEN ry.sequence_idx IS NOT NULL THEN '{ReadMaskReason.HOST_RYPE.value}' "
+                "    ELSE q.reason "
+                "  END AS reason, "
+                "  q.left_trim1, q.right_trim1, q.left_trim2, q.right_trim2 "
+                f"FROM {_QC_MASK} q "
+                f"LEFT JOIN {_RYPE_HOST} ry USING (sequence_idx) "
+                f"LEFT JOIN {_MM2_HOST} mm USING (sequence_idx) "
+                "ORDER BY mask_idx, prep_sample_idx, sequence_idx) "
+                f"TO '{out_sql}' ({PARQUET_OPTS})",
+                [inputs.mask_idx, inputs.prep_sample_idx],
             )
-            # Emit the quality-filtered read count: reads surviving host
-            # depletion (== biological count on a pass-through). Reuse this
-            # connection — write_read_count only does a footer-level count.
-            quality_filtered_read_count = write_read_count(conn, filtered, workspace)
         success = True
     finally:
         # Drop the spill dir before returning so the SLURM launcher's manifest
-        # walker (which runs after execute()) sees only filtered_reads.parquet;
-        # on failure remove a partial output so it can't be promoted.
+        # walker (which runs after execute()) sees only read_mask.parquet; on
+        # failure remove a partial output so it can't be promoted.
         shutil.rmtree(duckdb_tmp, ignore_errors=True)
         if not success:
-            filtered.unlink(missing_ok=True)
+            read_mask.unlink(missing_ok=True)
 
-    return {"filtered_reads": filtered, "quality_filtered_read_count": quality_filtered_read_count}
+    # `read_mask` is the final mask path; `read_mask_staging_dir` is the
+    # workspace a register-files step loads into the DuckLake `read_mask` table
+    # (only read_mask.parquet matches its `*.parquet` convention). A distinct
+    # staging-dir binding (not the generic `staging_dir`) so it doesn't collide
+    # with fastq's read staging dir.
+    return {"read_mask": read_mask, "read_mask_staging_dir": workspace}

@@ -21,7 +21,7 @@ import uuid
 from pathlib import Path
 
 import pytest
-from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import (
     ComputeTarget,
     FoundJobWire,
@@ -474,6 +474,64 @@ async def test_failure_marks_ticket_and_reference_failed(
         pending_work_ticket["reference_idx"],
     )
     assert ref_status == "failed"
+
+
+class _NoDataBackendClient(_LocalLikeBackendMixin):
+    """Backend stub whose first step raises StepNoData — the empty-well outcome.
+    StepNoData is NOT a BackendFailure, so it propagates straight through
+    `_run_entry_with_retry` (which only catches BackendFailure) to run_workflow's
+    StepNoData arm."""
+
+    async def run_step(self, *, step_name, **kwargs):
+        raise StepNoData(
+            step_name=step_name, reason=f"FASTQ file contains no records ({step_name})"
+        )
+
+
+async def test_no_data_transitions_ticket_to_no_data(
+    postgres_pool, pending_work_ticket, library_spy, tmp_path
+):
+    """A StepNoData from a step transitions the ticket PROCESSING → NO_DATA with
+    all failure_* columns NULL, WITHOUT advancing the resource's success_status
+    or PATCHing its failure_status, and clears any transient-retry marker. The
+    runner returns cleanly (no re-raise) — no_data is a terminal success-ish
+    outcome, not a task error."""
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = pending_work_ticket["work_ticket_idx"]
+
+    # Seed a stale transient marker so we can assert it's cleared.
+    await postgres_pool.execute(
+        "UPDATE qiita.work_ticket SET transient_reason = 'stuck', transient_since = now()"
+        " WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+
+    # Returns cleanly — StepNoData is not re-raised by run_workflow.
+    await _run(work_ticket_idx, postgres_pool, _NoDataBackendClient(), workspace_root)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, failure_type, failure_stage, failure_step_name, failure_reason,"
+        " transient_reason, transient_since"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    assert row["state"] == "no_data"
+    # Not a failure: every failure_* column is NULL.
+    assert row["failure_type"] is None
+    assert row["failure_stage"] is None
+    assert row["failure_step_name"] is None
+    assert row["failure_reason"] is None
+    # Transient-retry marker cleared.
+    assert row["transient_reason"] is None
+    assert row["transient_since"] is None
+
+    # success_status NOT applied (reference did not reach 'active') and
+    # failure_status NOT applied — the reference stays where it was, not failed.
+    ref_status = await postgres_pool.fetchval(
+        "SELECT status FROM qiita.reference WHERE reference_idx = $1",
+        pending_work_ticket["reference_idx"],
+    )
+    assert ref_status not in ("active", "failed")
 
 
 async def test_refuses_non_pending_ticket(postgres_pool, pending_work_ticket, tmp_path):
@@ -3500,6 +3558,130 @@ async def test_resume_with_target_status_does_not_re_patch_or_go_backward(
         )
         assert state == "completed"
         assert backend.submit_calls == 0  # s1 adopted, s0 reconstructed
+    finally:
+        await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx)
+        await postgres_pool.execute(
+            "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, version
+        )
+
+
+_REDRIVE_REWALK_WORKFLOW = [
+    {
+        "kind": "step",
+        "name": "s0",
+        "step_type": "singleton",
+        "container": REFERENCE_HASH_CONTAINER,
+        "target_status": "hashing",
+        "inputs": ["fasta_path"],
+        "outputs": ["manifest"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    {
+        "kind": "step",
+        "name": "s1",
+        "step_type": "singleton",
+        "container": REFERENCE_LOAD_CONTAINER,
+        "target_status": "minting",
+        "inputs": ["manifest"],
+        "outputs": ["feature_map"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+    {
+        "kind": "step",
+        "name": "s2",
+        "step_type": "singleton",
+        "container": REFERENCE_LOAD_CONTAINER,
+        "target_status": "loading",
+        "inputs": ["feature_map"],
+        "outputs": ["result"],
+        "baseline_resources": {"cpu": 1, "mem_gb": 1, "walltime": "PT1M"},
+    },
+]
+
+
+async def test_redrive_rewalks_status_fsm_for_completed_steps(
+    postgres_pool, reference_idx, tmp_path
+):
+    """A `/run` redrive of a FAILED multi-transition reference workflow resets
+    the reference to `pending` (its only legal exit from `failed`) while keeping
+    the completed step rows. The runner must RE-WALK the FSM as it fast-forwards
+    those completed steps — `pending → hashing` (s0) then `hashing → minting`
+    (s1) — so the first re-run step (s2) can legally advance `minting → loading`.
+    Without the re-walk the reference is stuck at `pending` and s2's
+    `pending → loading` raises IllegalStatusTransition, dead-ending the redrive
+    (the bug). s0/s1 are fast-forwarded (reconstructed, not resubmitted); only s2
+    submits fresh."""
+    action_id = "slurm-redrive-rewalk"
+    version = f"runner-test-{uuid.uuid4()}"
+    await postgres_pool.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, scopes, audience,"
+        "  context_schema, steps, cpu_ceiling, mem_ceiling_gb, walltime_ceiling"
+        ") VALUES ($1, $2, 'reference', $3::text[], $4::jsonb,"
+        "          $5::jsonb, $6::jsonb, 1, 1, '1 minute')",
+        action_id,
+        version,
+        ["reference:write"],
+        json.dumps({"service": False, "human_roles": ["wet_lab_admin"]}),
+        json.dumps({}),
+        json.dumps(_REDRIVE_REWALK_WORKFLOW),
+    )
+    fasta = tmp_path / "input.fasta"
+    fasta.write_text(">seq1\nACGT\n")
+    # The redrive already reset the ticket to `pending` and the reference to
+    # `pending`, keeping the completed step rows. Reproduce that exact shape.
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket ("
+        "  action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, reference_idx, action_context, state"
+        ") VALUES ($1, $2, 1, 'reference', $3, $4::jsonb, 'pending'::qiita.work_ticket_state)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        reference_idx,
+        json.dumps({"fasta_path": str(fasta)}),
+    )
+    try:
+        await postgres_pool.execute(
+            "UPDATE qiita.reference SET status = 'pending' WHERE reference_idx = $1",
+            reference_idx,
+        )
+        await _seed_submitted_step(
+            postgres_pool, idx, step_name="s0", slurm_job_id=970, step_index=0
+        )
+        await step_progress.record_completed(
+            postgres_pool, work_ticket_idx=idx, step_index=0, attempt=0
+        )
+        await _seed_submitted_step(
+            postgres_pool, idx, step_name="s1", slurm_job_id=971, step_index=1
+        )
+        await step_progress.record_completed(
+            postgres_pool, work_ticket_idx=idx, step_index=1, attempt=0
+        )
+
+        backend = FakeSlurmBackendClient(
+            status_script=[StepStatus.COMPLETED],  # s2's only poll
+            # s0 + s1 reconstruct (fast-forward via result_step), then s2's fresh result.
+            result_script=[
+                {"manifest": "manifest.parquet"},
+                {"feature_map": "feature_map.parquet"},
+                {"result": "result.parquet"},
+            ],
+        )
+        await _run(idx, postgres_pool, backend, tmp_path / "ws", resume=False)
+
+        state = await postgres_pool.fetchval(
+            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx
+        )
+        assert state == "completed"
+        # The FSM was re-walked through the completed steps and on into s2: the
+        # reference ends at `loading` (no success_status on this action), proving
+        # `pending → hashing → minting → loading` all fired.
+        ref_status = await postgres_pool.fetchval(
+            "SELECT status FROM qiita.reference WHERE reference_idx = $1", reference_idx
+        )
+        assert ref_status == "loading"
+        assert backend.submit_calls == 1  # only s2 ran fresh; s0/s1 reconstructed
     finally:
         await postgres_pool.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", idx)
         await postgres_pool.execute(

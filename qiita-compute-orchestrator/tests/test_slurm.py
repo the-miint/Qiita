@@ -247,7 +247,10 @@ def test_native_payload_script_invokes_python_m_launcher(native_kwargs):
     test_native_payload_script_uses_native_python_override below."""
     payload = build_job_submit_payload(**native_kwargs)
     script = payload["script"]
-    assert "srun python -m qiita_compute_orchestrator.jobs --job fastq_to_parquet" in script
+    assert (
+        "srun --cpu-bind=none python -m qiita_compute_orchestrator.jobs --job fastq_to_parquet"
+        in script
+    )
     assert "apptainer exec" not in script
     assert script.startswith("#!/bin/bash\nset -euo pipefail\n")
 
@@ -263,11 +266,31 @@ def test_native_payload_script_uses_native_python_override(native_kwargs):
     payload = build_job_submit_payload(**native_kwargs)
     script = payload["script"]
     assert (
-        "srun /home/qiita/qiita-miint/qiita-compute-orchestrator/.venv/bin/python"
+        "srun --cpu-bind=none /home/qiita/qiita-miint/qiita-compute-orchestrator/.venv/bin/python"
         " -m qiita_compute_orchestrator.jobs --job fastq_to_parquet"
     ) in script
     # And the default interpreter token isn't present.
+    assert "srun --cpu-bind=none python -m" not in script
+
+
+def test_native_payload_script_does_not_pin_to_one_cpu(native_kwargs):
+    """Native step's launcher must keep DuckDB's thread pool from being
+    pinned to a single CPU.
+
+    SLURM >= 22.05 srun no longer inherits --cpus-per-task from the batch
+    allocation, so a bare `srun` lays the single task out at cpus-per-task=1
+    and its default --cpu-bind pins the task (and all threads it spawns) to one
+    allocated CPU — collapsing an N-CPU native (DuckDB) step to a single core.
+    The script must (a) re-export SRUN_CPUS_PER_TASK from the allocation and
+    (b) pass --cpu-bind=none so the pool floats across the whole cgroup cpuset.
+    The export must precede the srun so it takes effect."""
+    payload = build_job_submit_payload(**native_kwargs)
+    script = payload["script"]
+    assert 'export SRUN_CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-1}"' in script
+    assert "--cpu-bind=none" in script
+    # bare `srun python` / `srun <python>` without the guard is the bug.
     assert "srun python -m" not in script
+    assert script.index("SRUN_CPUS_PER_TASK") < script.index("srun --cpu-bind=none")
 
 
 def test_native_payload_has_no_bind_mounts(native_kwargs):

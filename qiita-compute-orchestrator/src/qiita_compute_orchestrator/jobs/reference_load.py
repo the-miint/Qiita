@@ -370,11 +370,18 @@ def _write_reference_sequence_chunks(
     Per-batch peak memory is bounded by the in-memory sort over one
     batch (~3.2 GB), well under `_DUCKDB_MEMORY_GB`.
 
-    **Cost tradeoff.** Each batch re-scans the full input glob; the
-    `WHERE fm.feature_idx = ANY(?)` filter prunes after the JOIN.
-    Scan dominates per-batch wall time, so the number of batches
-    matters more than per-batch size. GG2 backbone bin-packs to ~20
-    batches — same shape as the hash_sequences output side."""
+    **Memory safety.** The per-batch COPY joins a `feature_map` subset
+    pre-filtered to the batch's hashes (the `fmb` CTE), not the full
+    `feature_map`, so the join is bounded by one batch by construction —
+    the optimizer cannot reorder a full-table join ahead of the batch
+    filter and materialize the whole glob's chunk_data (the OOM that the
+    hash_sequences output side hit; see that job for the same fix).
+
+    **Cost tradeoff.** Each batch re-scans the full input glob, filtered
+    by `WHERE rc.sequence_hash = ANY(?)` (applied during the Parquet scan
+    via late materialisation). Scan dominates per-batch wall time, so the
+    number of batches matters more than per-batch size — the bin-pack
+    keeps it to one batch per ~`_CHUNK_BUDGET_PER_BATCH` chunks."""
     parts_glob = str(reference_sequence_chunks_path / "part_*.parquet")
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -415,26 +422,55 @@ def _write_reference_sequence_chunks(
         for i, batch_hashes in enumerate(batches):
             part_path = out_dir / f"part_{i:05d}.parquet"
             part_out = validate_parquet_path(part_path)
-            # WHERE on `rc.sequence_hash` (the input column) rather than
-            # `fm.feature_idx` (post-JOIN) so DuckDB applies the filter
-            # during the Parquet scan. With late materialisation this
-            # skips loading `chunk_data` for non-matching rows — wide
-            # rows (~64 KB each) dominate I/O on this input, so cutting
-            # the read volume by ~(N-1)/N per batch matters more than
-            # the JOIN cost.
+            # Two phases per part so the full-glob scan and the feature_idx
+            # sort never co-peak in memory. A single COPY doing
+            # scan + join + ORDER BY(chunk_data) + write at once OOMed at
+            # genome scale: the sort is a pipeline breaker, so it buffers the
+            # batch's wide ~64 KB rows while the 30 GB scan and the 8-thread
+            # write buffers are all still live. Splitting the scan from the
+            # sort means at most one of them is resident at a time.
+            #
+            # Phase 1 — STREAM this batch's chunks into a temp table, re-keyed
+            # hash → feature_idx, with NO sort. The `fmb` CTE bounds the build
+            # side to one batch of hashes (so it's the hash-join build and
+            # chunk_data streams through the probe, never into the build); the
+            # `WHERE ... = ANY(...)` on the input column keeps the filter on the
+            # Parquet scan so late materialisation skips chunk_data for
+            # non-matching rows. The insert is bounded by the batch and spills
+            # to temp_directory under pressure.
+            conn.execute(
+                "CREATE OR REPLACE TEMP TABLE part_chunks AS "
+                "  WITH fmb AS ("
+                "    SELECT feature_idx, sequence_hash"
+                "    FROM feature_map"
+                "    WHERE sequence_hash = ANY(CAST(? AS UUID[]))"
+                "  )"
+                "  SELECT fmb.feature_idx, rc.chunk_index, rc.chunk_data"
+                "  FROM read_parquet(?) rc"
+                "  JOIN fmb ON rc.sequence_hash = fmb.sequence_hash"
+                "  WHERE rc.sequence_hash = ANY(CAST(? AS UUID[]))",
+                [batch_hashes, parts_glob, batch_hashes],
+            )
+            # Phase 2 — sort THIS part in isolation and write it. The sort sees
+            # only the materialised batch (≤ _CHUNK_BUDGET_PER_BATCH chunks),
+            # never the 30 GB glob, so it fits the cap (spilling if needed). The
+            # per-part `ORDER BY feature_idx` clusters row groups so a
+            # `WHERE feature_idx IN (...)` DoGet prunes row groups WITHIN a part;
+            # feature_idx-ascending batches keep the parts a globally
+            # disjoint-range dataset for catalog-level FILE pruning. Keeping both
+            # levels is the point of sorting here — input order is
+            # parallel-scrambled upstream (preserve_insertion_order=false), so
+            # without this sort a point query would scan a whole part. The
+            # secondary `chunk_index` orders a feature's chunks for cheap
+            # reassembly.
             conn.execute(
                 "COPY ("
-                "  SELECT "
-                "    fm.feature_idx,"
-                "    rc.chunk_index,"
-                "    rc.chunk_data"
-                "  FROM read_parquet(?) rc"
-                "  JOIN feature_map fm ON rc.sequence_hash = fm.sequence_hash"
-                "  WHERE rc.sequence_hash = ANY(CAST(? AS UUID[]))"
-                "  ORDER BY fm.feature_idx, rc.chunk_index"
-                f") TO '{part_out}' ({PARQUET_OPTS_CHUNKED})",
-                [parts_glob, batch_hashes],
+                "  SELECT feature_idx, chunk_index, chunk_data"
+                "  FROM part_chunks"
+                "  ORDER BY feature_idx, chunk_index"
+                f") TO '{part_out}' ({PARQUET_OPTS_CHUNKED})"
             )
+        conn.execute("DROP TABLE IF EXISTS part_chunks")
     else:
         # No minted features → emit one empty part so the directory is
         # non-empty and the runner's `dir.glob('*.parquet')` discovers

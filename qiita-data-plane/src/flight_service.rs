@@ -43,6 +43,11 @@ pub struct QiitaFlightService {
     /// on the layout convention (CP derives the same path on the read
     /// side); both derive it as `PATH_SCRATCH/staging`.
     upload_staging_root: PathBuf,
+    /// The `PATH_SCRATCH` base root (parent of `upload_staging_root`). The
+    /// `export_read` DoAction validates that its requested destination — a
+    /// control-plane ticket workspace path under `{PATH_SCRATCH}/ticket/...` —
+    /// resolves under this root before writing.
+    scratch_root: PathBuf,
 }
 
 impl QiitaFlightService {
@@ -51,12 +56,14 @@ impl QiitaFlightService {
         catalog_connstr: String,
         data_path: String,
         upload_staging_root: PathBuf,
+        scratch_root: PathBuf,
     ) -> Self {
         Self {
             hmac_secret,
             catalog_connstr,
             data_path,
             upload_staging_root,
+            scratch_root,
         }
     }
 
@@ -80,18 +87,31 @@ pub fn staging_path_for(root: &Path, upload_idx: i64) -> PathBuf {
 }
 
 /// Allowed table names for DoGet queries. Reject anything else.
+///
+/// PRIVACY: `read` and `read_mask` are deliberately absent. Reads are only
+/// reachable through the `read_masked` view, which excludes host/human and
+/// QC-failed rows by construction (`WHERE m.reason = 'pass'`). Raw read access
+/// is via direct DB tooling on the host, never Flight. Do not add `read` or
+/// `read_mask` here.
 const ALLOWED_TABLES: &[&str] = &[
     "reference_sequences",
     "reference_sequence_chunks",
     "reference_taxonomy",
     "reference_phylogeny",
     "reference_placements",
+    "read_masked",
 ];
 
 /// Allowed column names for filter clauses. All identifier columns that can
 /// appear in a signed ticket's filter. Whitelist prevents information leakage
 /// via error messages for non-existent columns.
-const ALLOWED_FILTER_COLUMNS: &[&str] = &["feature_idx", "reference_idx", "node_index"];
+const ALLOWED_FILTER_COLUMNS: &[&str] = &[
+    "feature_idx",
+    "reference_idx",
+    "node_index",
+    "mask_idx",
+    "prep_sample_idx",
+];
 
 #[tonic::async_trait]
 impl FlightService for QiitaFlightService {
@@ -266,6 +286,70 @@ impl FlightService for QiitaFlightService {
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+
+                let result = arrow_flight::Result {
+                    body: result_body.into(),
+                };
+                let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
+            "delete_mask" => {
+                let payload = auth::verify_delete_mask(&action.body, &self.hmac_secret)
+                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
+
+                if payload.action != "delete_mask" {
+                    return Err(Status::invalid_argument(format!(
+                        "action type mismatch: header says 'delete_mask', payload says {:?}",
+                        payload.action
+                    )));
+                }
+
+                let deleted =
+                    delete_mask(&self.catalog_connstr, &self.data_path, payload.mask_idx)?;
+
+                let result_body = serde_json::to_vec(&deleted)
+                    .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+
+                let result = arrow_flight::Result {
+                    body: result_body.into(),
+                };
+                let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
+            "export_read" => {
+                let payload = auth::verify_export_read(&action.body, &self.hmac_secret)
+                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
+
+                if payload.action != "export_read" {
+                    return Err(Status::invalid_argument(format!(
+                        "action type mismatch: header says 'export_read', payload says {:?}",
+                        payload.action
+                    )));
+                }
+
+                // Defense in depth on the HMAC-trusted destination before it is
+                // inlined into a DuckDB `COPY ... TO` literal and written to.
+                let dest = validate_export_dest(&payload.dest, &self.scratch_root)?;
+
+                // `COPY` is synchronous and, for a whole sample, long-lived —
+                // run it on the blocking pool so it never starves a tonic async
+                // worker. The closure opens and drops its own connection, so it
+                // is Send and crosses no await (mirrors `register_files`).
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let scratch_root = self.scratch_root.clone();
+                let prep = payload.prep_sample_idx;
+                let count = tokio::task::spawn_blocking(move || {
+                    export_read_to_parquet(&catalog, &data_path, prep, &dest, &scratch_root)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("export_read task join failed: {e}")))??;
+
+                let result_body = serde_json::to_vec(&serde_json::json!({
+                    "count": count,
+                    "dest": payload.dest,
+                }))
+                .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
 
                 let result = arrow_flight::Result {
                     body: result_body.into(),
@@ -563,6 +647,173 @@ where
     Ok((sha256, row_count, bytes_received))
 }
 
+/// Canonical Parquet write options for an exported reads file — Parquet v2 +
+/// zstd, matching `qiita_common.parquet.PARQUET_OPTS` so the materialized file
+/// is shape-identical to the durable copy `ingest_reads` first wrote.
+const EXPORT_READ_PARQUET_OPTS: &str =
+    "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'zstd', ROW_GROUP_SIZE_BYTES '64MB'";
+
+/// Validate a control-plane-signed `export_read` destination before the data
+/// plane writes to it. The token is HMAC-trusted, so this is defense in depth:
+/// the dest must be absolute, contain no single quote (it is inlined into a
+/// DuckDB `COPY ... TO '<dest>'` literal), carry no `..`/prefix component, and
+/// resolve under the data plane's scratch root (the shared tree the control
+/// plane's ticket workspaces live under). Returns the validated path.
+fn validate_export_dest(dest: &str, scratch_root: &Path) -> Result<PathBuf, Status> {
+    let path = Path::new(dest);
+    if !path.is_absolute() {
+        return Err(Status::invalid_argument(format!(
+            "export dest must be an absolute path: {dest:?}"
+        )));
+    }
+    if dest.contains('\'') {
+        return Err(Status::invalid_argument(format!(
+            "export dest must not contain a single quote: {dest:?}"
+        )));
+    }
+    if path.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(Status::invalid_argument(format!(
+            "export dest must not contain '..' or a prefix component: {dest:?}"
+        )));
+    }
+    if !path.starts_with(scratch_root) {
+        return Err(Status::invalid_argument(format!(
+            "export dest {dest:?} is not under the data plane scratch root {}",
+            scratch_root.display()
+        )));
+    }
+    Ok(path.to_path_buf())
+}
+
+/// Re-materialize one prep_sample's reads from the DuckLake `read` table into a
+/// Parquet at `dest` (the per-ticket `reads.parquet` a read-mask job consumes).
+/// Returns the row count.
+///
+/// A sample with no stored reads writes NO file and returns 0 — the control
+/// plane turns that into a clean submission failure ("must be ingested"). The
+/// `COPY` streams row groups to disk, so memory stays bounded regardless of
+/// sample size. Opens and drops its own connection so the caller can run it on
+/// the blocking pool (mirrors `register_files`).
+///
+/// `dest` arrives already lexically validated (`validate_export_dest`), but this
+/// is human-read data, so we ALSO resolve symlinks: another job on the shared
+/// scratch tree could plant a symlink to redirect the write outside the
+/// controlled workspace. We `canonicalize` the (created) parent and re-assert it
+/// resolves under `scratch_root` before writing. The file is then published
+/// atomically (write a sibling `.partial`, then rename) so `dest` only ever
+/// appears complete — a failed or partial `COPY` never leaves a half-written
+/// `reads.parquet` a retry could read. The row count is read back from the
+/// written file, so it always matches the bytes on disk (no separate catalog
+/// scan that could race the `COPY`).
+fn export_read_to_parquet(
+    catalog_connstr: &str,
+    data_path: &str,
+    prep_sample_idx: i64,
+    dest: &Path,
+    scratch_root: &Path,
+) -> Result<i64, Status> {
+    let conn = duckdb::Connection::open_in_memory()
+        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
+    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
+        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
+    // ROW_GROUP_SIZE_BYTES (in EXPORT_READ_PARQUET_OPTS) requires insertion
+    // order NOT be preserved — and we don't need it: the file is unordered
+    // because every consumer (qc is per-row, host_filter collapses with
+    // DISTINCT) is order-independent.
+    conn.execute_batch("SET preserve_insertion_order = false;")
+        .map_err(|e| Status::internal(format!("failed to set preserve_insertion_order: {e}")))?;
+
+    let parent = dest.parent().ok_or_else(|| {
+        Status::internal(format!("export dest has no parent: {}", dest.display()))
+    })?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| Status::internal(format!("failed to create {}: {e}", parent.display())))?;
+
+    // Symlink-safe containment: the lexical `validate_export_dest` check is not
+    // enough on a shared scratch tree, where another job could plant a symlink
+    // that redirects these (human) reads outside the controlled workspace.
+    // Canonicalize the now-existing parent and re-assert it resolves under the
+    // scratch root before we write anything.
+    let real_parent = std::fs::canonicalize(parent)
+        .map_err(|e| Status::internal(format!("failed to resolve {}: {e}", parent.display())))?;
+    let real_root = std::fs::canonicalize(scratch_root).map_err(|e| {
+        Status::internal(format!(
+            "failed to resolve scratch root {}: {e}",
+            scratch_root.display()
+        ))
+    })?;
+    if !real_parent.starts_with(&real_root) {
+        return Err(Status::permission_denied(format!(
+            "export dest parent {} resolves outside the scratch root {}",
+            real_parent.display(),
+            real_root.display()
+        )));
+    }
+
+    // Write to a sibling temp, then publish atomically. `dest` is validated
+    // (absolute, under the scratch root, no `..`, no single quote) and the
+    // `.partial` suffix preserves all of that; `prep_sample_idx` is an i64 — all
+    // safe to inline. The column list is the full `read` schema in table order,
+    // so the file is a drop-in for the durable staging copy (modulo row order,
+    // which does not matter).
+    let tmp = {
+        let mut s = dest.as_os_str().to_os_string();
+        s.push(".partial");
+        PathBuf::from(s)
+    };
+    let tmp_sql = tmp
+        .to_str()
+        .ok_or_else(|| Status::internal(format!("non-UTF-8 dest path: {}", tmp.display())))?;
+    let copy_sql = format!(
+        "COPY (SELECT prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2 \
+         FROM qiita_lake.read WHERE prep_sample_idx = {prep_sample_idx}) \
+         TO '{tmp_sql}' ({EXPORT_READ_PARQUET_OPTS})"
+    );
+
+    // The fallible sequence is isolated so the temp file is cleaned up on the
+    // empty path (count 0) and on any error; on success it is renamed away.
+    let published = (|| -> Result<i64, Status> {
+        conn.execute_batch(&copy_sql)
+            .map_err(|e| Status::internal(format!("export_read COPY failed: {e}")))?;
+        // Count from the file we just wrote, so it matches the bytes exactly.
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM read_parquet('{tmp_sql}')"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| Status::internal(format!("export_read count failed: {e}")))?;
+        if count == 0 {
+            // No stored reads for this sample — publish nothing; the CP raises.
+            return Ok(0);
+        }
+        // Match the read result-file convention: owner/group read-only.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o440))
+            .map_err(|e| Status::internal(format!("failed to chmod {}: {e}", tmp.display())))?;
+        std::fs::rename(&tmp, dest).map_err(|e| {
+            Status::internal(format!(
+                "failed to publish {} -> {}: {e}",
+                tmp.display(),
+                dest.display()
+            ))
+        })?;
+        Ok(count)
+    })();
+
+    // On the empty path (Ok(0)) or any failure the temp still exists; remove it.
+    // On success (Ok(n>0)) it was renamed to `dest`, so this is a no-op.
+    if !matches!(published, Ok(n) if n > 0) {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    published
+}
+
 /// Move Parquet files from staging to permanent storage and register in DuckLake.
 ///
 /// Validates all requested files exist in staging, moves them to permanent
@@ -793,6 +1044,54 @@ fn delete_reference(
     Ok(out)
 }
 
+/// Logically delete every row a mask owns from the DuckLake `read_mask` table.
+///
+/// Mirrors `delete_reference`: one DuckLake transaction, logical `DELETE` only.
+/// No raw parquet `unlink` — DuckLake owns file lifecycle and a manual unlink
+/// would corrupt the catalog; orphan parquets are tolerated until a future
+/// maintenance pass (matches `delete_reference`, which also reclaims nothing
+/// from disk). Idempotent: deleting a `mask_idx` with zero rows is success and
+/// returns `rows_deleted: 0`, so the control plane can safely retry.
+fn delete_mask(
+    catalog_connstr: &str,
+    data_path: &str,
+    mask_idx: i64,
+) -> Result<serde_json::Value, Status> {
+    let conn = duckdb::Connection::open_in_memory()
+        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
+    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
+        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
+
+    // Single-statement delete wrapped in an explicit transaction so the action
+    // is all-or-nothing and the control plane can safely retry: a failed call
+    // leaves the mask's rows fully intact, so a retry sees the same row set.
+    conn.execute_batch("BEGIN TRANSACTION")
+        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
+
+    let deleted = conn.execute(
+        "DELETE FROM qiita_lake.read_mask WHERE mask_idx = ?",
+        [&mask_idx as &dyn duckdb::ToSql],
+    );
+
+    let rows_deleted = match deleted {
+        Ok(n) => n,
+        Err(e) => {
+            // Best-effort rollback; surface the original delete error.
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(Status::internal(format!(
+                "delete failed (DELETE FROM qiita_lake.read_mask WHERE mask_idx = ?): {e}"
+            )));
+        }
+    };
+    conn.execute_batch("COMMIT")
+        .map_err(|e| Status::internal(format!("failed to commit delete transaction: {e}")))?;
+
+    Ok(serde_json::json!({
+        "mask_idx": mask_idx,
+        "rows_deleted": rows_deleted,
+    }))
+}
+
 /// Mint a unique, ticket-traceable lake-storage filename for a registered
 /// Parquet.
 ///
@@ -864,7 +1163,7 @@ fn move_file(src: &std::path::Path, dest: &std::path::Path) -> Result<(), Status
 /// Build a SQL query for the given table and filter.
 ///
 /// SQL injection defense model:
-/// - Table name: whitelist (`ALLOWED_TABLES`) — only 3 known-safe values
+/// - Table name: whitelist (`ALLOWED_TABLES`) — only known-safe values
 /// - Column names: whitelist (`ALLOWED_FILTER_COLUMNS`) — only known identifier columns
 /// - Values: parsed as i64 then stringified — no string data reaches SQL
 /// - All inputs are also HMAC-verified (set by the control plane, not the client)
@@ -942,6 +1241,42 @@ fn build_query(table: &str, filter: &auth::TicketFilter) -> Result<(String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- validate_export_dest (pure; no DuckDB) ---
+
+    #[test]
+    fn validate_export_dest_accepts_path_under_scratch() {
+        let root = Path::new("/scratch");
+        let ok = validate_export_dest("/scratch/ticket/804/reads.parquet", root)
+            .expect("path under scratch root should validate");
+        assert_eq!(ok, PathBuf::from("/scratch/ticket/804/reads.parquet"));
+    }
+
+    #[test]
+    fn validate_export_dest_rejects_outside_scratch() {
+        let root = Path::new("/scratch");
+        assert!(validate_export_dest("/etc/passwd", root).is_err());
+    }
+
+    #[test]
+    fn validate_export_dest_rejects_parent_traversal() {
+        let root = Path::new("/scratch");
+        // Lexically starts with /scratch, but the `..` component is rejected.
+        assert!(validate_export_dest("/scratch/../etc/passwd", root).is_err());
+    }
+
+    #[test]
+    fn validate_export_dest_rejects_relative() {
+        let root = Path::new("/scratch");
+        assert!(validate_export_dest("ticket/804/reads.parquet", root).is_err());
+    }
+
+    #[test]
+    fn validate_export_dest_rejects_single_quote() {
+        // The dest is inlined into a DuckDB `COPY ... TO '<dest>'` literal.
+        let root = Path::new("/scratch");
+        assert!(validate_export_dest("/scratch/ti'ck/reads.parquet", root).is_err());
+    }
 
     // --- delete_reference integration harness (mirrors ducklake.rs::tests) ---
 
@@ -1042,6 +1377,161 @@ mod tests {
         ));
     }
 
+    /// `delete_mask` drops exactly the target mask's `read_mask` rows, leaves a
+    /// different mask untouched, and is idempotent: a second delete of the same
+    /// mask_idx succeeds and reports `rows_deleted: 0`.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn delete_mask_drops_target_idempotently() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+
+        // Unique ids so leftover rows never collide with other serial tests.
+        let mask_a: i64 = 930_000;
+        let mask_b: i64 = 930_001;
+        let prep: i64 = 930_010;
+        let seq1: i64 = 930_020;
+        let seq2: i64 = 930_021;
+
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read_mask WHERE mask_idx IN ({mask_a}, {mask_b});
+             INSERT INTO qiita_lake.read_mask \
+                 (mask_idx, prep_sample_idx, sequence_idx, reason) VALUES \
+                 ({mask_a}, {prep}, {seq1}, 'pass'), \
+                 ({mask_a}, {prep}, {seq2}, 'pass'), \
+                 ({mask_b}, {prep}, {seq1}, 'pass');"
+        ))
+        .unwrap();
+
+        let first = delete_mask(&connstr, &data_path, mask_a).expect("delete_mask failed");
+        assert_eq!(first["rows_deleted"], 2, "both mask_a rows deleted");
+        assert_eq!(first["mask_idx"], mask_a);
+
+        let count = |mask: i64| -> i64 {
+            conn.query_row(
+                &format!("SELECT count(*) FROM qiita_lake.read_mask WHERE mask_idx = {mask}"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count(mask_a), 0, "mask_a rows gone");
+        assert_eq!(count(mask_b), 1, "mask_b untouched");
+
+        // Idempotency: re-deleting the now-empty mask is success with 0 rows.
+        let second =
+            delete_mask(&connstr, &data_path, mask_a).expect("idempotent re-delete failed");
+        assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
+
+        // Best-effort cleanup of the surviving mask_b row.
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read_mask WHERE mask_idx = {mask_b};"
+        ));
+    }
+
+    // DoGet round-trip for read_masked: drive the exact query path do_get uses
+    // (build_query → prepare → query_arrow → get_schema → collect, plus the
+    // empty-result RecordBatch::new_empty branch) against fixture data, and
+    // assert the UTINYINT[] qual column survives as an Arrow List of UInt8.
+    // This pins the one read-path behavior the reference tables don't cover
+    // (they have no list columns): a UTINYINT[] column round-trips through
+    // query_arrow → Arrow.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn read_masked_doget_roundtrips_utinyint_array() {
+        use arrow_schema::DataType;
+
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+
+        // Unique ids so leftover rows never collide with other serial tests.
+        let prep: i64 = 920_000;
+        let mask: i64 = 920_001;
+        let seq: i64 = 920_010;
+
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read WHERE prep_sample_idx = {prep};
+             DELETE FROM qiita_lake.read_mask WHERE prep_sample_idx = {prep};
+             INSERT INTO qiita_lake.read \
+                 (prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2) VALUES \
+                 ({prep}, {seq}, 'r', 'ACGTAC', [5,6,7,8,9,10]::UTINYINT[], NULL, NULL);
+             INSERT INTO qiita_lake.read_mask \
+                 (mask_idx, prep_sample_idx, sequence_idx, reason, left_trim1, right_trim1) VALUES \
+                 ({mask}, {prep}, {seq}, 'pass', 1, 1);"
+        ))
+        .unwrap();
+
+        // Helper that mirrors do_get's query body for read_masked.
+        let run = |filter: &auth::TicketFilter| -> Vec<arrow_array::RecordBatch> {
+            let (sql, _) = build_query("read_masked", filter).unwrap();
+            let mut stmt = conn.prepare(&sql).unwrap();
+            let arrow_result = stmt.query_arrow([]).unwrap();
+            let schema = arrow_result.get_schema();
+            let batches: Vec<_> = arrow_result.collect();
+            if batches.is_empty() {
+                vec![arrow_array::RecordBatch::new_empty(schema)]
+            } else {
+                batches
+            }
+        };
+
+        // Non-empty: the qual1 column is an Arrow List whose items are UInt8.
+        let mut filter = auth::TicketFilter::new();
+        filter.insert("mask_idx".to_string(), vec![serde_json::Value::from(mask)]);
+        filter.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(prep)],
+        );
+        let batches = run(&filter);
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1, "one pass read should round-trip");
+
+        let schema = batches[0].schema();
+        let qual1 = schema.field_with_name("qual1").unwrap();
+        let item_type = match qual1.data_type() {
+            DataType::List(item) | DataType::LargeList(item) => item.data_type().clone(),
+            other => panic!("qual1 should be an Arrow List, got: {other:?}"),
+        };
+        assert_eq!(
+            item_type,
+            DataType::UInt8,
+            "UTINYINT[] must round-trip as a List of UInt8"
+        );
+
+        // Empty-result branch: a mask_idx with no rows yields exactly one empty
+        // batch carrying the schema (do_get's RecordBatch::new_empty path).
+        let mut empty_filter = auth::TicketFilter::new();
+        empty_filter.insert(
+            "mask_idx".to_string(),
+            vec![serde_json::Value::from(mask + 999_999)],
+        );
+        empty_filter.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(prep)],
+        );
+        let empty = run(&empty_filter);
+        assert_eq!(empty.len(), 1, "empty result still yields one schema batch");
+        assert_eq!(empty[0].num_rows(), 0, "the schema batch has no rows");
+        assert!(
+            empty[0].schema().field_with_name("qual1").is_ok(),
+            "empty batch carries the full read_masked schema"
+        );
+
+        // Cleanup.
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read WHERE prep_sample_idx = {prep};
+             DELETE FROM qiita_lake.read_mask WHERE prep_sample_idx = {prep};"
+        ));
+    }
+
     // Regression (data-plane lake-file placement): when `register_files`
     // moves an externally-produced Parquet into managed lake storage, it must
     // NEVER overwrite a file already present there. The reference-load job
@@ -1105,6 +1595,101 @@ mod tests {
             lake_dest_filename(27, "part_00001.parquet"),
             lake_dest_filename(27, "reference_membership.parquet")
         );
+    }
+
+    /// `export_read_to_parquet` writes one sample's full reads from the DuckLake
+    /// `read` table to a Parquet drop-in: the 7-col schema with `qual` as
+    /// UTINYINT[], the seeded rows, mode 0o440. An unknown sample writes NO file
+    /// and returns 0 (the control plane turns that into a submission failure).
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn export_read_writes_sample_parquet() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+
+        // Unique ids so leftover rows never collide with other serial tests.
+        let prep: i64 = 940_000;
+        let absent: i64 = 940_999;
+        let seq_pe: i64 = 940_010;
+        let seq_se: i64 = 940_011;
+
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read WHERE prep_sample_idx = {prep};
+             INSERT INTO qiita_lake.read \
+                 (prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2) VALUES \
+                 ({prep}, {seq_pe}, 'r_pe', 'AACGT', [10,11,12,13,14]::UTINYINT[], 'TTGCA', [20,21,22,23,24]::UTINYINT[]), \
+                 ({prep}, {seq_se}, 'r_se', 'GGGCC', [30,31,32,33,34]::UTINYINT[], NULL, NULL);"
+        ))
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("reads.parquet");
+
+        let count = export_read_to_parquet(&connstr, &data_path, prep, &dest, dir.path())
+            .expect("export_read_to_parquet failed");
+        assert_eq!(count, 2, "both seeded rows exported");
+        assert!(dest.exists(), "destination parquet written");
+
+        // Mode 0o440 (owner/group read-only) — the read result-file convention.
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o440, "exported parquet is mode 440");
+
+        // Read it back: row count, qual1 round-trips as a list, full 7-col schema.
+        let reader = Connection::open_in_memory().unwrap();
+        let dest_str = dest.to_str().unwrap();
+        let n: i64 = reader
+            .query_row(
+                &format!("SELECT count(*) FROM read_parquet('{dest_str}')"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+        let qual_type: String = reader
+            .query_row(
+                &format!(
+                    "SELECT typeof(qual1) FROM read_parquet('{dest_str}') WHERE sequence_idx = {seq_pe}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(qual_type, "UTINYINT[]", "qual1 round-trips as UTINYINT[]");
+        // A missing column in the projection below would error — pins the schema.
+        let full: i64 = reader
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM read_parquet('{dest_str}') \
+                     WHERE prep_sample_idx = {prep} AND read_id IS NOT NULL \
+                       AND sequence1 IS NOT NULL"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(full, 2);
+
+        // An unknown sample writes no file and reports 0.
+        let dest_absent = dir.path().join("absent.parquet");
+        let zero = export_read_to_parquet(&connstr, &data_path, absent, &dest_absent, dir.path())
+            .expect("export of an unknown sample should succeed with 0");
+        assert_eq!(zero, 0);
+        assert!(!dest_absent.exists(), "no file written for an empty result");
+        assert!(
+            !dir.path().join("absent.parquet.partial").exists(),
+            "the temp file is cleaned up on the empty path"
+        );
+
+        // Best-effort cleanup of the seeded rows.
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read WHERE prep_sample_idx = {prep};"
+        ));
     }
 
     #[test]
@@ -1192,6 +1777,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn build_query_read_masked_both_filters() {
+        // read_masked is a plain view: both mask_idx and prep_sample_idx are
+        // integer columns filtered directly via IN clauses (no membership join).
+        let mut filter = auth::TicketFilter::new();
+        filter.insert("mask_idx".to_string(), vec![serde_json::Value::from(7)]);
+        filter.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(11), serde_json::Value::from(12)],
+        );
+        let (sql, table) = build_query("read_masked", &filter).unwrap();
+        assert_eq!(table, "qiita_lake.read_masked");
+        assert!(
+            sql.starts_with("SELECT * FROM qiita_lake.read_masked WHERE"),
+            "expected a plain view select, got: {sql}"
+        );
+        assert!(sql.contains("mask_idx IN (7)"), "got: {sql}");
+        assert!(sql.contains("prep_sample_idx IN (11,12)"), "got: {sql}");
+        assert!(
+            !sql.contains("JOIN"),
+            "read_masked is a plain view, no membership JOIN, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn build_query_read_masked_rejects_bad_column() {
+        // sequence_idx is a column of the view but is NOT an allowed filter
+        // column, so a ticket filtering on it must be rejected.
+        let mut filter = auth::TicketFilter::new();
+        filter.insert("sequence_idx".to_string(), vec![serde_json::Value::from(1)]);
+        let result = build_query("read_masked", &filter);
+        assert!(
+            result.is_err(),
+            "sequence_idx is not an allowed filter column"
+        );
+    }
+
     // ------------------------------------------------------------------
     // DoPut handler tests
     // ------------------------------------------------------------------
@@ -1273,12 +1895,18 @@ mod tests {
     }
 
     fn make_service(staging_root: PathBuf) -> QiitaFlightService {
+        // DoPut tests don't exercise export_read; any scratch root works here.
+        let scratch_root = staging_root
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| staging_root.clone());
         QiitaFlightService::new(
             b"dev-secret".to_vec(),
             // catalog + data_path unused by DoPut path
             "dbname=unused host=localhost".to_string(),
             "/tmp/unused".to_string(),
             staging_root,
+            scratch_root,
         )
     }
 

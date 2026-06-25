@@ -37,17 +37,20 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from pydantic import BaseModel, ValidationError
+from qiita_common.actions import READ_MASK_ACTION_ID
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_BY_IDX,
     PATH_BIOSAMPLE_LIST_BY_STUDY,
     PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     PATH_BIOSAMPLE_PREFIX,
     PATH_PREP_SAMPLE_PREFIX,
+    PATH_PREP_SAMPLE_RETIRED,
     PATH_PREP_SAMPLE_STUDY_LIST,
     PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_INDEX,
     PATH_REFERENCE_PREFIX,
     PATH_SEQUENCED_POOL_BY_IDX,
+    PATH_SEQUENCED_POOL_COMPLETION,
     PATH_SEQUENCED_SAMPLE_BY_IDX,
     PATH_SEQUENCED_SAMPLE_FROM_RUN,
     PATH_SEQUENCED_SAMPLE_LIST_BY_POOL,
@@ -94,27 +97,35 @@ from . import _common
 _BCL_CONVERT_ACTION_ID = "bcl-convert"
 _BCL_CONVERT_ACTION_VERSION = "1.0.0"
 
-# action_id + version for the submit-host-filter-pool fan-out. 1.2.0 adds the
-# always-on QC step + the two-reference host filter (1.0.0 has no host_filter,
-# 1.1.0 is the legacy single-reference host filter); pinned here for the same
-# drift reason as the bcl-convert constants above.
-_FASTQ_TO_PARQUET_ACTION_ID = "fastq-to-parquet"
-_FASTQ_TO_PARQUET_ACTION_VERSION = "1.2.0"
+# action_id for the submit-host-filter-pool fan-out — imported from the shared
+# action contract (qiita_common.actions) so the submitter and any reader of these
+# tickets (e.g. the pool completion rollup) key off one value. The version is
+# pinned locally. read-mask creates one mask over a sample's already-stored
+# reads; reads are stored once by the bcl-convert workflow's ingest_reads step.
+_READ_MASK_ACTION_VERSION = "1.0.0"
 
 
 class _PreflightRow(NamedTuple):
     """One illumina_sample row pulled from the kl-run-preflight SQLite.
 
-    Field names mirror `run_preflight.get_illumina_sample_info`'s 4-tuple.
-    `secondary_project_accessions` is empty for non-control samples;
-    controls carry one entry per non-primary plate project, sorted by
-    accession value.
+    The first four fields mirror `run_preflight.get_illumina_sample_info`'s
+    4-tuple. `secondary_project_accessions` is empty for non-control samples;
+    controls carry one entry per non-primary plate project, sorted by accession
+    value. `human_filtering` is the sample's effective project's
+    `human_filtering` flag — True -> deplete against the operator's host
+    reference(s), False -> no host filtering — mapped onto the sequenced_sample's
+    host reference columns at creation. It is sourced separately from the info
+    4-tuple: the sample's effective project comes from
+    `run_preflight.db.get_illumina_sample_rows` (the project_name column) joined
+    to a `project.human_filtering` read, since the library exposes no per-sample
+    human_filtering accessor.
     """
 
     illumina_sample_idx: int
     biosample_accession: str
     primary_project_accession: str
     secondary_project_accessions: list[str]
+    human_filtering: bool
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +215,18 @@ def _get_work_ticket(base_url: str, token: str, work_ticket_idx: int) -> dict:
     state, action info, scope_target, action_context, retry accounting,
     failure surface, timestamps. Auth: originator or wet_lab_admin+."""
     return _common.call("GET", base_url, token, f"{PATH_WORK_TICKET_PREFIX}/{work_ticket_idx}")
+
+
+def _run_work_ticket(base_url: str, token: str, work_ticket_idx: int) -> dict:
+    """POST /api/v1/work-ticket/{idx}/run. Operator override and the only retry
+    mechanism (there is no auto-retry worker): resets a FAILED ticket to PENDING
+    (clears failure_*, retry_count → 0) and re-dispatches it, or re-dispatches a
+    PENDING ticket whose create-time dispatch was lost. The runner fast-forwards
+    every step already marked COMPLETED and resumes at the first incomplete one,
+    so a costly finished step (e.g. stage_local_fasta) is not recomputed. No
+    request body. Auth: originator or wet_lab_admin+. Returns the new {idx,
+    state}."""
+    return _common.call("POST", base_url, token, f"{PATH_WORK_TICKET_PREFIX}/{work_ticket_idx}/run")
 
 
 def _get_work_ticket_step_logs(
@@ -686,6 +709,31 @@ def _build_parser() -> argparse.ArgumentParser:
         read_idx_arg="prep_sample_idx",
     )
 
+    p_prepsample_retire = p_prepsample_sub.add_parser(
+        "retire",
+        help=(
+            "Retire a prep-sample so it drops out of a pool's active set —"
+            " e.g. an empty/failed-yield well (PATCH /prep-sample/{idx}/retired)"
+        ),
+    )
+    p_prepsample_retire.add_argument("--prep-sample-idx", type=int, required=True)
+    p_prepsample_retire.add_argument(
+        "--reason", help="Optional retire_reason recorded on the prep_sample"
+    )
+    p_prepsample_retire.set_defaults(handler=_handle_prep_sample_retire, retired=True)
+
+    p_prepsample_unretire = p_prepsample_sub.add_parser(
+        "un-retire",
+        help=(
+            "Un-retire a misclassified prep-sample, returning it to a pool's"
+            " active set (PATCH /prep-sample/{idx}/retired)"
+        ),
+    )
+    p_prepsample_unretire.add_argument("--prep-sample-idx", type=int, required=True)
+    p_prepsample_unretire.set_defaults(
+        handler=_handle_prep_sample_retire, retired=False, reason=None
+    )
+
     p_ticket = sub.add_parser("ticket", help="Work-ticket operations")
     p_ticket_sub = p_ticket.add_subparsers(dest="ticket_cmd", required=True)
     p_ticket_submit = p_ticket_sub.add_parser(
@@ -747,6 +795,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Work-ticket idx returned by `qiita ticket submit`.",
     )
     p_ticket_status.set_defaults(handler=_handle_ticket_status)
+
+    p_ticket_run = p_ticket_sub.add_parser(
+        "run",
+        help="Resume/retry a work-ticket — reset a FAILED ticket and re-dispatch, "
+        "skipping already-completed steps (POST /work-ticket/{idx}/run)",
+    )
+    p_ticket_run.add_argument(
+        "work_ticket_idx",
+        type=int,
+        help="Work-ticket idx to resume (from `qiita ticket submit` / `status`).",
+    )
+    p_ticket_run.set_defaults(handler=_handle_ticket_run)
 
     p_ticket_list = p_ticket_sub.add_parser(
         "list",
@@ -1037,30 +1097,30 @@ def _build_parser() -> argparse.ArgumentParser:
     p_submit_hf = sub.add_parser(
         "submit-host-filter-pool",
         help=(
-            "Bundled operator gesture: after a bcl-convert pool finishes, fan"
-            " out one host-filtered fastq-to-parquet ticket per sample in the"
-            " pool."
+            "Bundled operator gesture: create one read mask per sample over a"
+            " pool's already-stored reads, host-filtering every sample against"
+            " the host reference(s) given on THIS submission."
         ),
         description=(
-            "For every active sequenced_sample in --sequenced-pool-idx, locate"
-            " its per-sample FASTQ(s) under --convert-dir (matched on the"
-            " sequenced_pool_item_id == bcl-convert Sample_ID prefix) and submit"
-            " a fastq-to-parquet/1.2.0 work-ticket: always-on QC (fastp-equivalent"
-            " adapter/polyG/length trimming) followed by host filtering against"
-            " --host-rype-reference-idx (the rype index, required) and, when"
-            " given, --host-minimap2-reference-idx (the minimap2 index). Each host"
-            " reference is checked for ACTIVE status + its required index up front,"
-            " and every sample's FASTQs are resolved before any ticket is"
-            " submitted, so a misconfiguration aborts with zero side effects. The"
-            " run's instrument_model is read once (GET /sequencing-run) and"
-            " forwarded per sample so QC's polyG step is gated correctly."
-            " Re-running after a partial failure is safe: disallow-without-delete"
-            " is keyed per prep_sample, so only samples without an"
-            " in-flight/terminal ticket are re-submitted. ASSUMPTIONS:"
-            " --convert-dir must be visible from this host (the per-sample FASTQs"
-            " are read off the shared compute filesystem), and the run is"
-            " single-lane (a sample with >1 R1 file, e.g. lane-split _L001/_L002,"
-            " is rejected — fastq-to-parquet takes a single fastq_path)."
+            "For every active sequenced_sample in --sequenced-pool-idx, submit a"
+            " read-mask/1.0.0 work-ticket: always-on QC (fastp-equivalent"
+            " adapter/polyG/length trimming) followed by host filtering, recorded"
+            " as a read_mask over the reads bcl-convert already stored — this"
+            " command does NOT parse FASTQ or re-store reads. The host reference"
+            " is a property of THIS filtering config, not of the sample:"
+            " --host-rype-reference-idx (with optional --host-minimap2-reference-idx)"
+            " names the reference(s) every sample in the pool is depleted against."
+            " Omit them to run QC-only with host filtering disabled (a pass-through"
+            " for the whole pool). Because reads are stored once and masks are"
+            " separate, the SAME pool can be re-submitted later against a different"
+            " host reference to produce a second, side-by-side mask — neither"
+            " re-runs ingest. Each given reference is checked for ACTIVE status +"
+            " its required index up front, so a misconfiguration aborts with zero"
+            " side effects. The run's instrument_model is read once (GET"
+            " /sequencing-run) and forwarded per sample so QC's polyG step is"
+            " gated correctly. The existing one-in-flight-per-prep_sample guard"
+            " serializes concurrent masks of one sample; submit a second"
+            " host-reference mask once the first pool's tickets are terminal."
         ),
     )
     p_submit_hf.add_argument(
@@ -1078,10 +1138,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_submit_hf.add_argument(
         "--host-rype-reference-idx",
         type=int,
-        required=True,
+        default=None,
         help=(
-            "ACTIVE host reference_idx whose rype (.ryxdi) index drives the first"
-            " host-filter pass. Required."
+            "ACTIVE host reference_idx whose rype (.ryxdi) index every sample in"
+            " the pool is depleted against for this submission. Omit to run the"
+            " whole pool QC-only with host filtering disabled. Checked ACTIVE +"
+            " carrying a rype index up front. Re-submitting the same pool against a"
+            " different reference produces a second, side-by-side read mask."
         ),
     )
     p_submit_hf.add_argument(
@@ -1090,22 +1153,65 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Optional ACTIVE host reference_idx whose minimap2 (.mmi) index drives"
-            " the second host-filter pass (on the rype survivors). Omit for a"
-            " rype-only host filter."
+            " the second host-filter pass on rype's survivors. Requires"
+            " --host-rype-reference-idx. Omit for a rype-only host filter."
         ),
     )
     p_submit_hf.add_argument(
-        "--convert-dir",
+        "--preflight-blob",
         type=Path,
         required=True,
         help=(
-            "Absolute path to the bcl-convert ConvertJob output directory,"
-            " visible from this host. Searched recursively for each sample's"
-            " <pool_item_id>_*_R1_*.fastq.gz (and _R2_ when paired-end), since"
-            " bcl-convert nests per-sample FASTQs under a Sample_Project subdir."
+            "The same kl-run-preflight SQLite given to submit-bcl-convert for this"
+            " pool. Its per-project human_filtering flags are the intake intent for"
+            " each sample; host filtering is now applied pool-wide, so before"
+            " submitting, every sample's intake intent is checked against this"
+            " submission's host-reference choice (a host reference filters, none is"
+            " a pass-through). A sample whose intent disagrees aborts the submission"
+            " unless --force is passed."
+        ),
+    )
+    p_submit_hf.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Proceed even when some samples' intake human_filtering intent"
+            " disagrees with this submission's pool-wide host-reference choice."
+            " The mismatch is printed as a warning instead of aborting."
         ),
     )
     p_submit_hf.set_defaults(handler=_handle_submit_host_filter_pool)
+
+    p_pool_completion = sub.add_parser(
+        "pool-completion",
+        help=(
+            "Read a sequenced-pool's prep-generation completion rollup: how many"
+            " of its samples have a COMPLETED fastq-to-parquet ticket."
+        ),
+        description=(
+            "GET the pool's completion status: each non-retired sequenced_sample"
+            " is classified by the state of its fastq-to-parquet work tickets"
+            " (completed / in-flight / failed / not-submitted) and tallied into"
+            " pool-level counts, with a `complete` flag set when every sample is"
+            " COMPLETED. The SPP GenPrepFileJob end-state equivalent: it tells the"
+            " operator whether the per-sample fan-out from submit-host-filter-pool"
+            " has finished. Compute-on-read over the work tickets — it never"
+            " drifts when a sample is re-processed or deleted."
+        ),
+    )
+    p_pool_completion.add_argument(
+        "--sequencing-run-idx",
+        type=int,
+        required=True,
+        help="sequencing_run_idx the pool belongs to (the route checks pool↔run).",
+    )
+    p_pool_completion.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        required=True,
+        help="sequenced_pool_idx whose completion rollup to read.",
+    )
+    p_pool_completion.set_defaults(handler=_handle_pool_completion)
 
     return parser
 
@@ -1325,6 +1431,37 @@ def _handle_ticket_status(args: argparse.Namespace, parser: argparse.ArgumentPar
     )
 
 
+def _handle_ticket_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Resume/retry a work-ticket: reset a FAILED ticket and re-dispatch (the
+    only retry path — no auto-retry worker). The runner fast-forwards every
+    already-COMPLETED step, so an expensive finished step is not re-run; the
+    ticket resumes at the first incomplete step. Prints the new {idx, state}."""
+    return _common.run_http_subcommand(
+        lambda t: _run_work_ticket(args.base_url, t, args.work_ticket_idx)
+    )
+
+
+def _handle_prep_sample_retire(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Retire or un-retire a prep-sample (PATCH /prep-sample/{idx}/retired). The
+    `retire` subcommand sets retired=true (dropping an empty/failed-yield well
+    out of a pool's active set); `un-retire` sets retired=false (recovering a
+    misclassified one). The route returns 204, so on success we print a short
+    confirmation rather than a JSON body."""
+
+    def _do(token: str) -> dict:
+        path = PATH_PREP_SAMPLE_PREFIX + PATH_PREP_SAMPLE_RETIRED.format(
+            prep_sample_idx=args.prep_sample_idx
+        )
+        body = {"retired": args.retired, "reason": args.reason}
+        _common._request("PATCH", args.base_url, token, path, json=body)
+        return {
+            "prep_sample_idx": args.prep_sample_idx,
+            "retired": args.retired,
+        }
+
+    return _common.run_http_subcommand(_do)
+
+
 def _handle_ticket_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """List work-tickets (your own by default, or every originator's with
     --all for wet_lab_admin+). Prints the full summary list so a poller sees
@@ -1520,6 +1657,10 @@ def _read_preflight_rows(
     primary_project_accession) raise via parser.error so the CLI
     surfaces a single stderr line and exits 2 before any network call.
     """
+    # get_illumina_sample_info / open_db_file are top-level run_preflight exports;
+    # get_illumina_sample_rows lives in the run_preflight.db submodule (NOT
+    # re-exported at the top level), so it is reached through `db`.
+    from run_preflight import db as run_preflight_db  # noqa: PLC0415
     from run_preflight import get_illumina_sample_info, open_db_file  # noqa: PLC0415
 
     try:
@@ -1528,6 +1669,17 @@ def _read_preflight_rows(
         parser.error(f"--preflight-blob {preflight_blob}: not a readable SQLite file: {exc}")
     try:
         illumina_samples = get_illumina_sample_info(conn)
+        # The library exposes no per-sample human_filtering accessor, so map each
+        # illumina_sample to its effective project (get_illumina_sample_rows,
+        # do_not_use-excluded like get_illumina_sample_info) and read that
+        # project's human_filtering flag from the preflight directly.
+        project_by_idx = {row[0]: row[4] for row in run_preflight_db.get_illumina_sample_rows(conn)}
+        filtering_by_project = {
+            name: bool(flag)
+            for name, flag in conn.execute(
+                "SELECT project_name, human_filtering FROM project"
+            ).fetchall()
+        }
     except (sqlite3.DatabaseError, ValueError) as exc:
         parser.error(
             f"--preflight-blob {preflight_blob}: preflight query failed ({exc});"
@@ -1556,12 +1708,20 @@ def _read_preflight_rows(
                 f" {illumina_sample_idx} carries no primary_project_accession;"
                 " populate upstream before re-submitting"
             )
+        project_name = project_by_idx.get(illumina_sample_idx)
+        if project_name not in filtering_by_project:
+            parser.error(
+                f"--preflight-blob {preflight_blob}: illumina_sample_idx"
+                f" {illumina_sample_idx} maps to no project with a human_filtering"
+                " flag; verify the file is a kl-run-preflight SQLite"
+            )
         parsed.append(
             _PreflightRow(
                 illumina_sample_idx=int(illumina_sample_idx),
                 biosample_accession=biosample_accession,
                 primary_project_accession=primary,
                 secondary_project_accessions=list(secondary),
+                human_filtering=filtering_by_project[project_name],
             )
         )
     return parsed
@@ -1697,6 +1857,12 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
     # land as parser.error / exit 2.
     preflight_rows = _read_preflight_rows(args.preflight_blob, parser)
 
+    # Host filtering is not decided here: it is a filtering-config choice made at
+    # submit-host-filter-pool, where the host reference parameterizes the read
+    # mask. bcl-convert only demultiplexes the run; the preflight's per-project
+    # human_filtering flag is still echoed per sample below so the operator knows
+    # which samples the run intended to deplete when choosing those later args.
+
     # One-pass order-preserving dedup over preflight_rows so the lookup
     # route's `missing` echo is deterministic; the study side pools each
     # row's primary + secondaries so controls land their full set.
@@ -1810,11 +1976,28 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
                     "biosample_idx": resolved_biosamples[row.biosample_accession],
                     "primary_study_idx": resolved_studies[row.primary_project_accession],
                     "secondary_study_idxs": secondary_study_idxs,
+                    # The preflight's per-project human_filtering flag is echoed
+                    # for operator reference — it no longer pins a host reference
+                    # on the sample; host filtering is chosen at
+                    # submit-host-filter-pool time.
+                    "human_filtering": row.human_filtering,
+                    "prep_sample_idx": sample_resp["prep_sample_idx"],
                     "sequenced_sample_idx": sample_resp["sequenced_sample_idx"],
                 }
             )
 
-        # Step 4: submit the bcl-convert work_ticket against the pool.
+        # Step 4: submit the bcl-convert work_ticket against the pool. The pool
+        # roster (prep_sample_idx ↔ sequenced_pool_item_id) rides in
+        # action_context so the orchestrator's `ingest_reads` step can store
+        # each sample's reads after demux without DB access — the CP already
+        # enumerated every sample above, so it just hands them over.
+        sample_map = [
+            {
+                "prep_sample_idx": r["prep_sample_idx"],
+                "pool_item_id": str(r["illumina_sample_idx"]),
+            }
+            for r in per_sample_results
+        ]
         ticket_body = WorkTicketCreateRequest(
             action_id=_BCL_CONVERT_ACTION_ID,
             action_version=_BCL_CONVERT_ACTION_VERSION,
@@ -1823,7 +2006,10 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
                 "sequenced_pool_idx": sequenced_pool_idx,
                 "sequencing_run_idx": sequencing_run_idx,
             },
-            action_context={"bcl_input_dir": str(args.bcl_input_dir)},
+            action_context={
+                "bcl_input_dir": str(args.bcl_input_dir),
+                "sample_map": sample_map,
+            },
         ).model_dump(exclude_unset=True, mode="json")
         ticket_resp, _ticket_status = _common.call_with_status(
             "POST",
@@ -1872,51 +2058,6 @@ def _handle_delete_sequenced_pool(args: argparse.Namespace, parser: argparse.Arg
     )
 
 
-class _FastqMatchError(NamedTuple):
-    """Sentinel: a sample's FASTQ could not be uniquely resolved under
-    --convert-dir. Carries the operator-facing reason."""
-
-    reason: str
-
-
-def _match_pool_item_fastq(
-    convert_dir: Path,
-    pool_item_id: str,
-    read_tag: str,
-    *,
-    required: bool,
-) -> Path | _FastqMatchError | None:
-    """Resolve the single `<pool_item_id>_*_<read_tag>_*.fastq.gz` under
-    convert_dir, searching recursively.
-
-    bcl-convert runs with --bcl-sampleproject-subdirectories, so per-sample
-    FASTQs sit one level below convert_dir; rglob descends into them. The
-    trailing underscore in the `<pool_item_id>_` prefix anchors the match so
-    `12` never matches `120_...`. This is intentionally narrower than the
-    server's submit-time prefix check (which also accepts a bare `<id>.fastq`):
-    bcl-convert ConvertJob output is always the `<id>_..._R1_..._.fastq.gz`
-    form, and a file this matcher accepts the server accepts too.
-
-    Returns the Path on a unique match; None when none match and the read is
-    optional (single-end R2); a _FastqMatchError when a required read is
-    missing or when >1 match (multi-lane is out of scope — the workflow takes
-    a single fastq_path).
-    """
-    matches = sorted(convert_dir.rglob(f"{pool_item_id}_*_{read_tag}_*.fastq.gz"))
-    if len(matches) == 1:
-        return matches[0]
-    if not matches:
-        if required:
-            return _FastqMatchError(
-                f"no {read_tag} FASTQ matched {pool_item_id}_*_{read_tag}_*.fastq.gz"
-            )
-        return None
-    return _FastqMatchError(
-        f"{len(matches)} {read_tag} FASTQs matched {pool_item_id} (lane-split runs are"
-        f" not supported): {', '.join(m.name for m in matches)}"
-    )
-
-
 def _assert_host_reference_ready(
     base_url: str, token: str, reference_idx: int, index_type: str, flag: str
 ) -> None:
@@ -1958,75 +2099,70 @@ def _assert_host_reference_ready(
 def _handle_submit_host_filter_pool(
     args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> int:
-    """Fan out one QC'd, host-filtered fastq-to-parquet/1.2.0 ticket per active
-    sequenced_sample in a completed bcl-convert pool.
+    """Create one read mask per active sequenced_sample in a pool, host-filtering
+    every sample against the host reference(s) given on THIS submission.
+
+    The pool's reads were stored once by the bcl-convert workflow's ingest_reads
+    step; this gesture does NOT parse FASTQ or re-store reads. It submits one
+    read-mask/1.0.0 ticket per sample (always-on QC + host filtering), each
+    recorded as a read_mask over the stored reads.
+
+    Host filtering is a property of the filtering config, not of the sample:
+    --host-rype-reference-idx (with optional --host-minimap2-reference-idx) names
+    the reference(s) every sample in the pool is depleted against for this
+    submission, parameterizing the read mask the run produces. Omitting both runs
+    the whole pool QC-only with host filtering disabled (a pass-through). Because
+    reads are stored once and masks are separate, the same pool can be
+    re-submitted later against a different reference to produce a second,
+    side-by-side mask — neither re-runs ingest.
 
     Flow:
-      1. Validate --convert-dir (absolute, is_dir) before any network call.
-      2. Pre-flight each host reference: the rype reference (required) must be
-         ACTIVE + carry a rype index; the minimap2 reference (optional) must be
-         ACTIVE + carry a minimap2 index. A bad reference here would otherwise
-         fail every ticket at the runner's submission stage
-         (_resolve_host_filter_indexes) — N FAILED tickets instead of one
-         actionable error.
-      3. Read the run's instrument_model once (GET /sequencing-run) to forward
+      1. Validate host-ref argument coherence (minimap2 requires rype), and parse
+         --preflight-blob (the same SQLite given to bcl-convert) for each sample's
+         intake human_filtering intent — all before any network call.
+      2. List the pool's active samples (run-scoped pool route), then flag any
+         sample whose intake human_filtering intent disagrees with this
+         submission's pool-wide host-ref choice. Aborts before any ticket POST
+         unless --force downgrades the mismatch to a warning.
+      3. Pre-flight the given host reference(s): a rype reference must be ACTIVE +
+         carry a rype index; a minimap2 reference must be ACTIVE + carry a
+         minimap2 index. A bad reference here would otherwise fail every ticket at
+         the runner's submission stage (_resolve_host_filter_indexes) — N FAILED
+         tickets instead of one actionable error. (No host refs given skips this.)
+      4. Read the run's instrument_model once (GET /sequencing-run) to forward
          per sample so QC's polyG step is gated correctly (nullable).
-      4. List the pool's active samples (run-scoped pool route) and resolve
-         each one's R1 (required) + R2 (optional) FASTQ under --convert-dir.
-         Resolve ALL samples before any POST so a missing/ambiguous file
-         aborts with zero side effects.
-      5. POST one fastq-to-parquet/1.2.0 ticket per sample (always-on QC +
-         host_filter_enabled with the two-reference layout), scoped to the
-         sample's prep_sample_idx.
+      5. POST one read-mask/1.0.0 ticket per sample (always-on QC; host filtering
+         enabled with the given reference(s), or a pass-through when none is
+         given), scoped to the sample's prep_sample_idx. The runner binds each
+         sample's stored reads (failing the ticket if it was never ingested).
 
-    The pool_item_id == bcl-convert FASTQ basename prefix coupling holds via
-    submit-bcl-convert (sequenced_pool_item_id = str(illumina_sample_idx)) and
-    the pinned run_preflight (Sample_ID emitted as illumina_sample_idx); a
-    future preflight that changes Sample_ID would silently break this match.
-
-    Per-sample 409 (in-flight) / 422 (filename-prefix) are NOT swallowed — they
-    surface so the operator can act, the same as submit-bcl-convert's composer.
+    Per-sample 409 (in-flight) is NOT swallowed — it surfaces so the operator can
+    act, the same as submit-bcl-convert's composer. A sample whose reads were
+    never stored fails its ticket at the runner's staged-read resolution.
     """
-    if not args.convert_dir.is_absolute():
-        parser.error(f"--convert-dir must be absolute, got {args.convert_dir}")
-    if not args.convert_dir.is_dir():
-        parser.error(
-            f"--convert-dir {args.convert_dir} is not a directory; pass the"
-            " bcl-convert ConvertJob output directory, visible from this host"
-        )
+    # Host-ref argument coherence, validated before any network call: minimap2 is
+    # the optional second stage and never runs without rype.
+    if args.host_minimap2_reference_idx is not None and args.host_rype_reference_idx is None:
+        parser.error("--host-minimap2-reference-idx requires --host-rype-reference-idx")
+
+    # Parse the pool's preflight (local SQLite, no network) up front: it carries
+    # each sample's intake human_filtering intent, which the pool-wide host-ref
+    # mismatch guard below compares against this submission's choice. Errors here
+    # are operator-actionable and exit 2 via parser.error before any network call.
+    if not args.preflight_blob.is_file():
+        parser.error(f"--preflight-blob {args.preflight_blob} is not a regular file")
+    if not args.preflight_blob.read_bytes():
+        parser.error(f"--preflight-blob {args.preflight_blob} is empty")
+    preflight_rows = _read_preflight_rows(args.preflight_blob, parser)
+    # sequenced_pool_item_id == str(illumina_sample_idx) (the submit-bcl-convert
+    # coupling), so the roster joins to the preflight on this string key.
+    human_filtering_by_item_id = {
+        str(row.illumina_sample_idx): row.human_filtering for row in preflight_rows
+    }
+    applying_host_filter = args.host_rype_reference_idx is not None
 
     def _run(token: str) -> dict:
-        # Step 1: host-reference readiness — fail the whole gesture before any
-        # ticket if a designated reference can't host-filter. rype is required;
-        # minimap2 is optional (omitted -> rype-only host filter).
-        _assert_host_reference_ready(
-            args.base_url,
-            token,
-            args.host_rype_reference_idx,
-            HOST_FILTER_INDEX_TYPE_RYPE,
-            "--host-rype-reference-idx",
-        )
-        if args.host_minimap2_reference_idx is not None:
-            _assert_host_reference_ready(
-                args.base_url,
-                token,
-                args.host_minimap2_reference_idx,
-                HOST_FILTER_INDEX_TYPE_MINIMAP2,
-                "--host-minimap2-reference-idx",
-            )
-
-        # Step 2: the run's instrument_model gates QC's polyG; read it once and
-        # forward per sample. Nullable (a non-bcl run may not record it).
-        run = _common.call(
-            "GET",
-            args.base_url,
-            token,
-            f"{PATH_SEQUENCING_RUN_PREFIX}"
-            f"{PATH_SEQUENCING_RUN_BY_IDX.format(sequencing_run_idx=args.sequencing_run_idx)}",
-        )
-        instrument_model = run.get("instrument_model")
-
-        # Step 3: enumerate the pool's active samples (single round trip).
+        # Step 1: enumerate the pool's active samples (single round trip).
         pool_list_path = PATH_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
             sequencing_run_idx=args.sequencing_run_idx,
             sequenced_pool_idx=args.sequenced_pool_idx,
@@ -2041,52 +2177,118 @@ def _handle_submit_host_filter_pool(
         if not samples:
             sys.stderr.write(
                 f"sequenced_pool {args.sequenced_pool_idx} has no active"
-                " sequenced_samples to host-filter\n"
+                " sequenced_samples to process\n"
             )
             raise SystemExit(1)
 
-        # Step 4: resolve every sample's FASTQ(s) up front. Collect all errors
-        # so the operator sees the full set, and submit nothing if any fail.
-        resolved: list[tuple[dict, Path, Path | None]] = []
-        errors: list[str] = []
+        # Step 1.5: host filtering is applied pool-wide, so flag any sample whose
+        # intake human_filtering intent disagrees with this submission's choice
+        # (a host reference depletes human reads; none is a pass-through). A
+        # flagged-human sample submitted with no host reference would keep its
+        # human reads; a not-flagged sample submitted with a host reference would
+        # be filtered against the operator's intent. Either is a likely mistake —
+        # fail fast before any ticket POST unless --force overrides it.
+        # The join is roster-driven: we check every pool member against its
+        # preflight intent. A blob row with no matching pool member is ignored by
+        # design (you only filter what is in the pool); the reverse — a pool
+        # member with no blob row — is the broken-coupling case handled below.
+        mismatched: list[str] = []
         for sample in samples:
             item_id = sample["sequenced_pool_item_id"]
-            label = f"sample {item_id} (prep_sample {sample['prep_sample_idx']})"
-            r1 = _match_pool_item_fastq(args.convert_dir, item_id, "R1", required=True)
-            if isinstance(r1, _FastqMatchError):
-                errors.append(f"{label}: {r1.reason}")
-                continue
-            r2 = _match_pool_item_fastq(args.convert_dir, item_id, "R2", required=False)
-            if isinstance(r2, _FastqMatchError):
-                errors.append(f"{label}: {r2.reason}")
-                continue
-            resolved.append((sample, r1, r2))
-        if errors:
-            sys.stderr.write(
-                "could not resolve FASTQs for every sample; no tickets"
-                " submitted:\n  " + "\n  ".join(errors) + "\n"
+            intent = human_filtering_by_item_id.get(item_id)
+            if intent is None:
+                # The preflight has no row for this pool item — the
+                # bcl-convert/preflight coupling is broken; surface it.
+                sys.stderr.write(
+                    f"--preflight-blob {args.preflight_blob} has no row for"
+                    f" sequenced_pool_item_id {item_id!r} (prep_sample"
+                    f" {sample['prep_sample_idx']}); verify it is the same"
+                    " preflight given to submit-bcl-convert for this pool\n"
+                )
+                raise SystemExit(1)
+            if intent != applying_host_filter:
+                mismatched.append(
+                    f"  - sequenced_pool_item_id {item_id} (prep_sample"
+                    f" {sample['prep_sample_idx']}): intake human_filtering="
+                    f"{intent}"
+                )
+        if mismatched:
+            choice = (
+                f"apply host reference {args.host_rype_reference_idx}"
+                if applying_host_filter
+                else "run QC-only with host filtering disabled (a pass-through)"
             )
-            raise SystemExit(1)
+            header = (
+                "host filtering is applied pool-wide, but these samples' intake"
+                f" human_filtering intent disagrees with this submission, which"
+                f" would {choice} for every sample:\n"
+                + "\n".join(mismatched)
+                + "\nSubmit the matching subset, re-run with the opposite"
+                " host-reference choice, or pass --force to apply this pool-wide"
+                " choice anyway.\n"
+            )
+            if not args.force:
+                sys.stderr.write(header)
+                raise SystemExit(1)
+            sys.stderr.write("WARNING (--force): " + header)
 
-        # Step 5: one fastq-to-parquet/1.2.0 ticket per sample — always-on QC +
-        # host filtering (two-reference layout). instrument_model is forwarded
-        # only when the run records it (QC defaults polyG OFF when it's absent).
-        per_sample_results: list[dict] = []
-        for sample, r1_path, r2_path in resolved:
-            action_context: dict[str, Any] = {
-                "fastq_path": str(r1_path),
-                "host_filter_enabled": True,
-                "host_rype_reference_idx": args.host_rype_reference_idx,
-            }
+        # Step 2: pre-flight the given host reference(s) before any ticket — one
+        # actionable error instead of N FAILED tickets. No host refs given (the
+        # whole-pool pass-through) checks nothing.
+        if args.host_rype_reference_idx is not None:
+            _assert_host_reference_ready(
+                args.base_url,
+                token,
+                args.host_rype_reference_idx,
+                HOST_FILTER_INDEX_TYPE_RYPE,
+                "--host-rype-reference-idx",
+            )
             if args.host_minimap2_reference_idx is not None:
-                action_context["host_minimap2_reference_idx"] = args.host_minimap2_reference_idx
-            if r2_path is not None:
-                action_context["reverse_fastq_path"] = str(r2_path)
+                _assert_host_reference_ready(
+                    args.base_url,
+                    token,
+                    args.host_minimap2_reference_idx,
+                    HOST_FILTER_INDEX_TYPE_MINIMAP2,
+                    "--host-minimap2-reference-idx",
+                )
+
+        # Step 3: the run's instrument_model gates QC's polyG; read it once and
+        # forward per sample. Nullable (a non-bcl run may not record it).
+        run = _common.call(
+            "GET",
+            args.base_url,
+            token,
+            f"{PATH_SEQUENCING_RUN_PREFIX}"
+            f"{PATH_SEQUENCING_RUN_BY_IDX.format(sequencing_run_idx=args.sequencing_run_idx)}",
+        )
+        instrument_model = run.get("instrument_model")
+
+        # Step 5: one read-mask/1.0.0 ticket per sample — always-on QC + the host
+        # filtering chosen on this submission, uniform across the pool. A given
+        # rype reference filters every sample against it (plus the optional
+        # minimap2 reference); with none given each ticket sets
+        # host_filter_enabled=False explicitly (a QC-only pass-through), so the
+        # ticket records the deliberate no-filter decision. The runner reads these
+        # action_context refs to mint the read mask and drive host_filter, and
+        # binds the sample's already-stored reads. instrument_model is forwarded
+        # only when the run records it (QC defaults polyG OFF when it's absent).
+        host_rype = args.host_rype_reference_idx
+        host_minimap2 = args.host_minimap2_reference_idx
+        host_filter_enabled = host_rype is not None
+        per_sample_results: list[dict] = []
+        for sample in samples:
+            action_context: dict[str, Any] = {
+                "host_filter_enabled": host_filter_enabled,
+            }
+            if host_filter_enabled:
+                action_context["host_rype_reference_idx"] = host_rype
+                if host_minimap2 is not None:
+                    action_context["host_minimap2_reference_idx"] = host_minimap2
             if instrument_model is not None:
                 action_context["instrument_model"] = instrument_model
             ticket_body = WorkTicketCreateRequest(
-                action_id=_FASTQ_TO_PARQUET_ACTION_ID,
-                action_version=_FASTQ_TO_PARQUET_ACTION_VERSION,
+                action_id=READ_MASK_ACTION_ID,
+                action_version=_READ_MASK_ACTION_VERSION,
                 scope_target={
                     "kind": ScopeTargetKind.PREP_SAMPLE.value,
                     "prep_sample_idx": sample["prep_sample_idx"],
@@ -2104,23 +2306,40 @@ def _handle_submit_host_filter_pool(
                 {
                     "prep_sample_idx": sample["prep_sample_idx"],
                     "sequenced_pool_item_id": sample["sequenced_pool_item_id"],
-                    "fastq_path": str(r1_path),
-                    "reverse_fastq_path": str(r2_path) if r2_path is not None else None,
+                    "host_filter_enabled": host_filter_enabled,
+                    "host_rype_reference_idx": host_rype if host_filter_enabled else None,
+                    "host_minimap2_reference_idx": host_minimap2 if host_filter_enabled else None,
                     "work_ticket_idx": ticket_resp.get("work_ticket_idx"),
                 }
             )
 
         return {
-            "host_rype_reference_idx": args.host_rype_reference_idx,
-            "host_minimap2_reference_idx": args.host_minimap2_reference_idx,
             "instrument_model": instrument_model,
             "sequencing_run_idx": args.sequencing_run_idx,
             "sequenced_pool_idx": args.sequenced_pool_idx,
             "samples_submitted": len(per_sample_results),
+            "samples_host_filtered": sum(1 for r in per_sample_results if r["host_filter_enabled"]),
+            "samples_passthrough": sum(
+                1 for r in per_sample_results if not r["host_filter_enabled"]
+            ),
             "per_sample": per_sample_results,
         }
 
     return _common.run_http_subcommand(_run)
+
+
+def _handle_pool_completion(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """GET the pool's prep-generation completion rollup and print its JSON body.
+
+    Dedicated (rather than the generic `read` command) because the route is keyed
+    on two ids — sequencing_run_idx and sequenced_pool_idx — which `read` (single
+    idx) can't fill.
+    """
+    path = f"{PATH_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_COMPLETION}".format(
+        sequencing_run_idx=args.sequencing_run_idx,
+        sequenced_pool_idx=args.sequenced_pool_idx,
+    )
+    return _common.run_http_subcommand(lambda t: _common.call("GET", args.base_url, t, path))
 
 
 def _build_body(

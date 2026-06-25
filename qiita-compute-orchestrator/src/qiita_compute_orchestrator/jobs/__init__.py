@@ -32,7 +32,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 from qiita_common.actions import NATIVE_MODULE_PREFIX
-from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import ScopeTargetKind, WorkTicketFailureStage
 
 
@@ -140,6 +140,13 @@ async def run_native_job(
     - `execute` raises `NotImplementedError` → UNKNOWN_PERMANENT
       (the job module is a skeleton; auto-retry would not help).
 
+    `StepNoData` raised by `execute` propagates UNCHANGED — it is a
+    terminal no-data outcome (an empty FASTQ well), NOT a failure, so it
+    must not be reclassified into a BackendFailure. Its `except` arm sits
+    ABOVE the generic `except ValueError` so empty input no longer becomes
+    BAD_INPUT; the backend hands it to the runner, which transitions the
+    ticket to NO_DATA.
+
     Other exception types from `execute` propagate so they surface in
     the orchestrator's logs with full traceback rather than being
     silently classified.
@@ -192,6 +199,12 @@ async def run_native_job(
 
     try:
         return await execute(inputs, workspace)
+    except StepNoData:
+        # Terminal no-data outcome (an empty FASTQ well) — NOT a failure.
+        # Re-raise unchanged so the backend round-trips it to the runner's
+        # NO_DATA transition. Must sit ABOVE the generic `except ValueError`
+        # below so empty input is never reclassified as BAD_INPUT.
+        raise
     except NotImplementedError as exc:
         # Skeleton path: a job module that ships before its execute() is
         # written. Permanent — retry produces the same NotImplementedError.

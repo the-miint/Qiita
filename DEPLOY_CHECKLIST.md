@@ -23,9 +23,7 @@ _None yet._
 
 ### 3. Migrations
 
-- (#148) `20260622000000_sequenced_sample_read_metrics.sql` — adds three nullable
-  `BIGINT` read-count columns + CHECK constraints to `qiita.sequenced_sample`.
-  Plain `make migrate`; additive and backfill-free (existing rows read NULL).
+_None yet._
 
 ### 4. Deploy
 
@@ -37,6 +35,18 @@ _None yet._
 
 ### Notes (no host action)
 
+- `read-mask/1.0.0` audience tightened to `[wet_lab_admin, system_admin]` (drops
+  plain `user`): submitting a read mask (host filter / QC reprocessing) now drives
+  the data plane to re-materialize the sample's RAW (human-containing) reads, so it
+  is admin-only. **Soft contract change** — a non-admin `user` who could submit a
+  read mask before now gets 403. The YAML is **edited in place**, re-synced into
+  `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (covered by the
+  generic `make verify-deploy` action list), **not** a migration. The new
+  `export_read` data-plane DoAction backing the runner's reprocessing fallback
+  writes a per-ticket `reads.parquet` under `<scratch>/ticket/<idx>/` — already
+  group-writable by the DP (`qiita-data`) via its existing `qiita-pipeline`
+  membership, and read back by `qiita-job` (same group) at mode `0440`, so **no new
+  env var, host dir, scope, or group change**. (#187)
 - (#188) New system_admin-only scope `admin:biosample_owner_id_read`, gating the
   owner-id re-identification export (`GET /admin/study/{study_idx}/owner-biosample-id`
   + `qiita-admin owner-biosample-id`). Pure-Python scope (no migration); added to the
@@ -45,17 +55,369 @@ _None yet._
   the export re-runs `qiita-admin login` (or mints a fresh PAT) to obtain a token that
   includes it; the loopback login grants the full role ceiling, so no scope need be
   named. No new env var, host dir, migration, or service-account grant.
-- (#140) `stage_local_fasta` resource retune in `local-host-reference-add/1.0.0`
-  (`cpu: 8`/`mem_gb: 32` → `cpu: 4`/`mem_gb: 64`; still within the `cpu: 16`/`mem_gb: 64`
-  ceiling). The `workflows/local-host-reference-add/1.0.0.yaml` entry is **edited in
-  place** — re-synced into `qiita.action` by `qiita-admin actions sync` inside
-  `activate.sh` (already covered by bucket 5's `qiita.action` list check), **not** a
-  migration. No client breakage, no new env var, host dir, scope, or migration.
-- (#140) Parquet result files are now written with `ROW_GROUP_SIZE_BYTES '64MB'`
-  (smaller row groups: finer pushdown, lower write memory). Code-only write-side
-  tuning; the data plane reads these files via the same pinned DuckDB 1.5.4, the
-  format is unchanged, and output stays clustered on the `ORDER BY` key, so DuckLake
-  registration + pruning are unaffected. No host action, env var, scope, or migration.
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-25 — 8f4d4cd
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
+- `20260624110000_work_ticket_mask_idx.sql` — adds the nullable
+  `qiita.work_ticket.mask_idx` column (FK → `mask_definition`, ON DELETE SET NULL,
+  partial index). Plain `make migrate`; additive and backfill-free at migrate time
+  (existing rows read NULL — they are populated by the bucket-5 backfill). (#181)
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
+
+- One-time mask recovery — run AFTER the bucket-3 migrate + bucket-4 restart (the
+  reordered `read-mask`/`fastq-to-parquet` workflows from the Notes entry must be
+  live, else resubmits re-fail). This populates `work_ticket.mask_idx`, then purges
+  and resubmits the FAILED read-mask tickets stranded by the move-then-read bug —
+  which doubles as the e2e validation: (#181)
+
+  a. Backfill `mask_idx` on existing tickets. Dry-run first and confirm
+  `populated > 0`, then apply. Needs `DATABASE_URL`,
+  `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX`, `HMAC_SECRET_KEY`, and a reachable
+  `DATA_PLANE_URL` (it re-materializes the canonical adapter set via DoGet to
+  reproduce the mask params hash):
+
+  ```bash
+  qiita-admin work-ticket backfill-mask-idx           # dry-run; expect populated > 0
+  qiita-admin work-ticket backfill-mask-idx --apply
+  ```
+
+  b. Purge the orphaned masks and resubmit on the fixed workflow. Dry-run to
+  review the (ticket, mask_idx, prep_sample) rows, then execute:
+
+  ```bash
+  qiita-admin mask purge-failed --action read-mask                          # dry-run; review
+  qiita-admin mask purge-failed --action read-mask --execute --with-tickets # optionally --rate/--limit
+  ```
+
+  c. Confirm the resubmitted tickets reach COMPLETED and the per-sample
+  `sequenced_sample` read-metric counts populate (pool-completion rollups move).
+
+#### Notes (no host action)
+
+- New `mask_definition:delete` scope (gating `DELETE /mask-definition/{mask_idx}` +
+  the `qiita-admin mask delete` / `mask purge-failed` recovery tooling). Granted
+  automatically to `system_admin` via the role ceiling, so **no grant step** — but
+  the scope is **not** in admin PATs minted before this deploy (tokens carry a
+  fixed scope snapshot). An admin running the bucket-5 mask recovery must re-mint a
+  fresh PAT (or use a fresh OIDC bearer) after the deploy to carry it. The delete
+  drives the data plane (new `delete_mask` DoAction over the existing HMAC Flight
+  path) and removes the `mask_definition` Postgres row; no env var, host dir, or
+  service-account grant. (#181)
+- `read-mask/1.0.0` and `fastq-to-parquet/1.3.0` reorder their final two actions
+  so `persist-read-metrics` runs **before** `register-files` (register-files
+  MOVES `read_mask.parquet` out of the staging dir into DuckLake, so the metrics
+  read must precede it — it was failing with `read_mask parquet not found`). Both
+  YAMLs are **edited in place** — re-synced into `qiita.action` by `qiita-admin
+  actions sync` inside `activate.sh` (already covered by the generic
+  `make verify-deploy` action list), **not** a migration. No new env var, host
+  dir, scope, or SIF. (#181)
+
+### Deployed 2026-06-24 — be01438
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
+_None yet._
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
+
+- Confirm the read-storage / masking split synced: the new `read-mask` action is
+  registered and `bcl-convert` now carries the `ingest_reads` + `register-files`
+  steps. `qiita-admin actions sync` runs inside `activate.sh`, so this is a
+  read-back, not a host action:
+
+  ```bash
+  qiita-admin actions list | grep -E 'read-mask|bcl-convert'
+  ```
+  (#180)
+
+#### Notes (no host action)
+
+- Read storage is split out of host-filtering. `submit-bcl-convert` now stores
+  the pool's reads (a new `ingest_reads` step writes the DuckLake `read` table
+  plus a durable per-sample copy under `<scratch>/reads/<prep_sample_idx>/`,
+  auto-created by the step — no host setup). `submit-host-filter-pool` is now
+  mask-only (no `--convert-dir`): it submits `read-mask/1.0.0` tickets over the
+  stored reads, and can be re-run against a different host reference to add a
+  side-by-side mask. Both workflows ship via `qiita-admin actions sync`; no env
+  var, migration, or host action. The legacy `fastq-to-parquet` workflows remain
+  registered but dormant. (#180)
+
+- `make redeploy` now auto-refreshes the operator's **checkout** CLI venv
+  (`$QIITA_CLONE/qiita-control-plane/.venv`, where `uv run qiita` / `qiita-admin`
+  resolve) as a new step 6, as the checkout owner. The manual
+  `cd .../qiita-control-plane && uv sync --reinstall-package qiita-common`
+  workaround after a pull that bumped `qiita-common` without a version change is
+  no longer needed when deploying via `make redeploy`. And if the CLI is ever run
+  with a stale `qiita_common` anyway (outside the redeploy path), it now prints
+  that exact `uv sync --reinstall-package qiita-common` fix instead of a raw
+  import traceback. Behaviour ships with the script / CLI; no host action. (#163)
+
+### Deployed 2026-06-24 — fee935f
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+- Wipe all legacy sequenced / sequenced-pool sample data BEFORE the deploy. These
+  samples predate the lake-read model — their reads were never registered into
+  DuckLake — and the `sequenced_sample.host_rype_reference_idx` /
+  `host_minimap2_reference_idx` columns they carry are being dropped (bucket 3).
+  Delete the pools through the CLI (system_admin; per pool):
+
+  ```bash
+  qiita delete-sequenced-pool --sequencing-run-idx <R> --sequenced-pool-idx <P> --force
+  ```
+
+  Run this before the migration; the drop migration is a single relocate with no
+  data-preservation step, so there must be no legacy sample data to strand. (#175)
+
+#### 3. Migrations
+
+- `20260624000000_drop_sequenced_sample_host_references.sql` — drops the two
+  host-reference columns (and their FKs + the minimap2-requires-rype CHECK) from
+  `qiita.sequenced_sample`. Plain `make migrate` (after the bucket-2 wipe). (#175)
+- `20260624100000_work_ticket_state_no_data.sql` — additive
+  `ALTER TYPE qiita.work_ticket_state ADD VALUE 'no_data'` (the new terminal
+  empty-well outcome). `transaction:false` directive (Postgres forbids using a
+  freshly-added enum value in the same transaction); plain `make migrate`, no
+  out-of-band setup or backfill. (#176)
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
+
+- New workflow `fastq-to-parquet/1.3.0` is synced into `qiita.action` by
+  `qiita-admin actions sync` inside `activate.sh` (no migration). Confirm it
+  registered after the deploy: (#173)
+
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, version FROM qiita.action WHERE action_id = 'fastq-to-parquet' AND version = '1.3.0'"
+  ```
+
+#### Notes (no host action)
+
+- Soft API change (PR 4 of the full-read+mask feature): host references moved off
+  `sequenced_sample` onto the human-filter submission. Sequenced-sample GET
+  responses and the pool/run sample-list rows no longer carry
+  `host_rype_reference_idx` / `host_minimap2_reference_idx`; `seqsample-create` /
+  `submit-bcl-convert` no longer accept them. The operator now passes
+  `--host-rype-reference-idx` (and optional `--host-minimap2-reference-idx`) to
+  `qiita submit-host-filter-pool` — pool-wide for that submission, omitted for a
+  QC-only pass-through. `prep_protocol_idx` is unchanged. `submit-host-filter-pool`
+  now also **requires** `--preflight-blob` (the same kl-run-preflight SQLite given
+  to `submit-bcl-convert`): it cross-checks each sample's intake `human_filtering`
+  intent against the host-ref choice and aborts on a mismatch unless `--force` is
+  passed. (#175)
+- The full-read+mask producer cutover (PR 3) ships `fastq-to-parquet/1.3.0`,
+  which writes the full reads into the DuckLake `read` table and a downstream
+  `read_mask` (PRs 1–2 already deployed the `mask_definition` table + the
+  data-plane `read`/`read_mask`/`read_masked` surfaces). 1.0.0–1.2.0 stay
+  available; nothing forces a re-run of in-flight tickets. No new env var or
+  host directory. (#173)
+- Soft API change: empty FASTQ wells are now a terminal `no_data` outcome
+  (distinct from failure). The `GET .../sequenced-pool/{P}/completion` response
+  gains a `samples_no_data` count and its `complete` flag now fires when every
+  active sample is COMPLETED **or** NO_DATA (so a plate with empty wells reaches
+  "done"); empty wells are no longer in `samples_failed`. A work_ticket can now be
+  terminal in state `no_data` (409 on `/run` like `completed`, but freely
+  resubmittable — no result is minted, so no DELETE is required). New reversible
+  `PATCH /api/v1/prep-sample/{idx}/retired`
+  (prep_sample:write + wet_lab_admin) and `qiita prep-sample retire` /
+  `un-retire`. Until expected-empty control-well preflight marking lands
+  (deferred), EVERY empty well becomes `no_data` — data wells included, not only
+  flagged controls. No new env var, host dir, scope, or workflow. (#176)
+
+### Deployed 2026-06-23 — 3ac105c
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
+- (#170) `20260623000000_mask_definition.sql`
+  — adds the `qiita.mask_definition` table + `qiita.mint_mask_definition`
+  function. Plain `make migrate`; additive, no extension or backfill.
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
+
+- (#169) Confirm the raised `local-host-reference-add` mem ceiling synced into
+  `qiita.action` (so its `build_rype_index` OOM-retry escalation can climb to
+  128 GB; `host-reference-add` was already 128):
+
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, mem_ceiling_gb FROM qiita.action WHERE action_id IN ('host-reference-add','local-host-reference-add') AND version='1.0.0' ORDER BY action_id"
+  # expect: host-reference-add|128  and  local-host-reference-add|128
+  ```
+
+#### Notes (no host action)
+
+- (#170) New `read_masked:doget` scope on the
+  service-account ceiling, gating the new `POST /mask-definition` and
+  `POST /read-masked/ticket/doget` routes. No host action this deploy: no
+  production service account consumes these routes yet (the masked-read consumer
+  path lands in a later PR), so no token needs re-minting now. When a worker is
+  wired to pull masked reads, mint/rotate its token to include the scope.
+- (#169) `build_rype_index` resource bump for large host sets (many human
+  genomes that OOMed at 32 GB). In both `host-reference-add/1.0.0` and
+  `local-host-reference-add/1.0.0` the step's `baseline_resources.mem_gb` rises
+  32 → 64, and `local-host-reference-add`'s `action_ceiling.mem_gb` rises 64 →
+  128 (matching `host-reference-add`) so an OOM-killed retry can double the step
+  64 → 128 GB. The job now hard-caps DuckDB at 8 GB regardless of allocation
+  (safe because `rype_index_create`'s windowed feed bounds DuckDB's working set
+  to window size, not corpus size — relies on the windowed-feed miint build being
+  live on the mirror) and hands the growing remainder to rype's `max_memory`
+  (starts ~50 GB, ≈114 GB at the 128 GB ceiling). Both YAMLs are **edited in place** — re-synced into
+  `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (already in
+  bucket 5's `qiita.action` check), **not** a migration. No new env var, host
+  dir, scope, or SIF. Ensure the SLURM partition/QOS permits 128 GB single-step
+  jobs.
+
+### Deployed 2026-06-23 — f56a470
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
+_None yet._
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
+
+- (#167) Confirm the raised `reference-add` / `host-reference-add` mem ceilings
+  synced into `qiita.action` (so a `resource_override.mem_gb` up to 128 is
+  accepted and the OOM-retry escalation can climb to 128 GB):
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, mem_ceiling_gb FROM qiita.action WHERE action_id IN ('reference-add','host-reference-add') AND version='1.0.0' ORDER BY action_id"
+  # expect: host-reference-add|128  and  reference-add|128
+  ```
+
+#### Notes (no host action)
+
+- (#167) `reference-add/1.0.0` and `host-reference-add/1.0.0` raise their
+  `action_ceiling.mem_gb` 64 → 128 (the `reference_load` step OOMs above 40 GB
+  at GG2 scale). Edited in place — re-synced into `qiita.action` by `qiita-admin
+  actions sync` inside `activate.sh`, **not** a migration. Pairs with the runner
+  change that escalates a step's memory ×2 (clamped to this ceiling) on each
+  OOM-killed retry. No new env var, host dir, scope, or SIF.
+
+### Deployed 2026-06-23 — 40674d7
+
+Nothing was pending at archive time — the PRs deployed since the previous archive (#159, #160, #165) carried no operator-impacting steps. Recorded for provenance only.
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None._
+
+#### 2. One-time host setup
+
+_None._
+
+#### 3. Migrations
+
+_None._
+
+#### 4. Deploy
+
+_None._
+
+#### 5. Verify
+
+_None._
+
+#### Notes (no host action)
+
+_None._
+
+### Deployed 2026-06-22 — f07359e
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
+- (#148) `20260622000000_sequenced_sample_read_metrics.sql` — adds three nullable
+  `BIGINT` read-count columns + CHECK constraints to `qiita.sequenced_sample`.
+  Plain `make migrate`; additive and backfill-free (existing rows read NULL).
+- (#154) `20260622010000_sequenced_sample_qc_report.sql` — adds two nullable
+  `jsonb` QC-report columns (`raw_qc_report`, `filtered_qc_report`) to
+  `qiita.sequenced_sample`. Plain `make migrate`; additive and backfill-free
+  (existing rows read NULL).
+- (#156) `20260622020000_sequenced_sample_host_references.sql` — adds two nullable
+  FK columns (`host_rype_reference_idx`, `host_minimap2_reference_idx` →
+  `qiita.reference`, ON DELETE RESTRICT) + a CHECK (minimap2 requires rype) to
+  `qiita.sequenced_sample`. Plain `make migrate`; additive and backfill-free
+  (existing rows read NULL/NULL).
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
+
+_None yet._
+
+#### Notes (no host action)
+
 - (#147) `fastq-to-parquet/1.2.0` now declares three additional step outputs
   (`raw_read_count` / `biological_read_count` / `quality_filtered_read_count` — the
   per-stage `read_count.json` sidecars). The `workflows/fastq-to-parquet/1.2.0.yaml`
@@ -71,12 +433,75 @@ _None yet._
   in the USER ceiling, so all three audience roles keep access — only a token
   scoped *below* its role ceiling is affected). No new host dir, env var, or
   service-account grant.
+- (#152) `fastq-to-parquet/1.2.0` gains two `qc_report` steps (`qc_report_raw`,
+  `qc_report_filtered`) backed by the new native `qc_report` job module. Re-synced
+  into `qiita.action` by `qiita-admin actions sync` (same in-place edit as #147);
+  the module ships with the orchestrator code (a native step, not a container — no
+  SIF). Reporting only; no client breakage, no new env var, host dir, scope, or
+  migration.
+- (#154) `fastq-to-parquet/1.2.0` gains a final `persist-qc-report` action that
+  writes the per-sample QC reports into the bucket-3 `jsonb` columns. Re-synced
+  into `qiita.action` by `qiita-admin actions sync` (same in-place edit as #147);
+  no new env var, host dir, scope (it reuses the `prep_sample:write` #148 already
+  added), or SIF. New read-only `GET .../sequenced-pool/{pool}/qc-report` endpoint
+  (the merged pool report) — additive, read-gated like the existing pool roster;
+  no host action.
+- (#156) Per-sample host-filter references (new bucket-3 columns). The
+  sequenced-sample composer now accepts optional `host_rype_reference_idx` /
+  `host_minimap2_reference_idx`, and `qiita-user submit-bcl-convert` gains
+  `--host-rype-reference-idx` (+ optional `--host-minimap2-reference-idx`).
+  **Operator-facing CLI change:** a bcl-convert run whose preflight has any
+  `human_filtering` sample now requires `--host-rype-reference-idx` (the host
+  reference is recorded per sample for the later fan-out); the reference must be
+  ACTIVE + carry the right index (built via `host-reference-add`) or the gesture
+  aborts before any side effect. No new env var, host dir, scope, or migration
+  beyond the additive bucket-3 columns.
+- (#158) `qiita-user submit-host-filter-pool` now host-filters each pool sample
+  against the reference(s) recorded on it (by #156's `submit-bcl-convert`), not a
+  pool-wide reference. **Operator-facing CLI change:** the
+  `--host-rype-reference-idx` / `--host-minimap2-reference-idx` flags are
+  **removed** — an invocation still passing them now errors; host filtering is
+  per-sample (preflight `human_filtering=0` samples get a QC-only pass-through
+  ticket). New read-only `GET .../sequenced-pool/{pool}/completion` endpoint (and
+  `qiita-user pool-completion`) reporting per-sample fastq-to-parquet completion —
+  additive, read-gated like the existing pool rollups. No new env var, host dir,
+  scope, migration, or workflow/SIF change.
 
----
+### Deployed 2026-06-22 — af1fa22
 
-## Deployed history
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
+_None yet._
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
+
+_None yet._
+
+#### Notes (no host action)
+
+- (#140) `stage_local_fasta` resource retune in `local-host-reference-add/1.0.0`
+  (`cpu: 8`/`mem_gb: 32` → `cpu: 4`/`mem_gb: 64`; still within the `cpu: 16`/`mem_gb: 64`
+  ceiling). The `workflows/local-host-reference-add/1.0.0.yaml` entry is **edited in
+  place** — re-synced into `qiita.action` by `qiita-admin actions sync` inside
+  `activate.sh` (already covered by bucket 5's `qiita.action` list check), **not** a
+  migration. No client breakage, no new env var, host dir, scope, or migration.
+- (#140) Parquet result files are now written with `ROW_GROUP_SIZE_BYTES '64MB'`
+  (smaller row groups: finer pushdown, lower write memory). Code-only write-side
+  tuning; the data plane reads these files via the same pinned DuckDB 1.5.4, the
+  format is unchanged, and output stays clustered on the `ORDER BY` key, so DuckLake
+  registration + pruning are unaffected. No host action, env var, scope, or migration.
 
 ### Deployed 2026-06-20 — 5b21afe
 

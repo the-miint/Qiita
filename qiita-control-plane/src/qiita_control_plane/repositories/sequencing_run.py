@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import Any
 
 import asyncpg
+from qiita_common.actions import READ_MASK_ACTION_ID
 from qiita_common.models import Platform
 
 
@@ -399,6 +400,100 @@ async def fetch_sequenced_pool_read_metrics(
         " GROUP BY sp.idx, sp.sequencing_run_idx, sp.run_preflight_filename,"
         " sp.extra_metadata, sp.created_by_idx, sp.created_at",
         sequenced_pool_idx,
+    )
+
+
+async def fetch_sequenced_pool_sample_qc_reports(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    sequenced_pool_idx: int,
+) -> list[asyncpg.Record]:
+    """Return one row per NON-retired sequenced_sample in the pool, carrying the
+    two persisted QC-report JSONBs (raw / filtered), the prep_sample_idx, and the
+    per-pool item id — the per-sample detail the merged pool QC report aggregates.
+
+    Excludes retired samples (`ps.retired IS NOT TRUE`) to match the read-metric
+    rollup's sample set, so `sample_count` there and the length of this list agree
+    on a fully-processed pool. Ordered by prep_sample_idx for a stable response.
+    Returns `[]` for a pool with no (non-retired) samples; the caller still 404s a
+    missing pool via require_sequenced_pool_in_run + the rollup fetch. asyncpg
+    returns JSONB as text, so the caller decodes each blob."""
+    return await pool_or_conn.fetch(
+        "SELECT ss.prep_sample_idx, ss.sequenced_pool_item_id,"
+        " ss.raw_qc_report, ss.filtered_qc_report"
+        " FROM qiita.sequenced_sample ss"
+        " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        " WHERE ss.sequenced_pool_idx = $1 AND ps.retired IS NOT TRUE"
+        " ORDER BY ss.prep_sample_idx",
+        sequenced_pool_idx,
+    )
+
+
+async def fetch_sequenced_pool_completion(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    sequenced_pool_idx: int,
+) -> asyncpg.Record:
+    """Return the pool's prep-generation completion rollup: counts of its
+    non-retired sequenced_samples bucketed by the state of their fastq-to-parquet
+    work tickets (any version). Always returns one row (aggregate over zero rows
+    is a single all-zero row), so a zero-sample / missing pool reads as all-zero
+    counts — the caller still 404s a missing pool via require_sequenced_pool_in_run.
+
+    Per-sample classification mirrors qiita_common.models.PoolCompletionStatus
+    (precedence completed > in_flight > no_data > failed > not_submitted),
+    computed in two layers:
+
+      `sample_state` LEFT-JOINs each non-retired sample to its fastq-to-parquet
+      tickets and folds them with bool_or aggregates (NULL over a sample with no
+      ticket, so `ticket_count = 0` cleanly identifies not_submitted). The outer
+      aggregate then tallies the mutually-exclusive buckets with FILTERs that
+      encode the precedence, so every sample lands in exactly one — and the five
+      buckets sum to `sample_count`.
+
+    no_data outranks failed: a sample with both a NO_DATA and a stale FAILED
+    ticket counts as no_data, so an empty well that was retried-then-superseded
+    doesn't get stuck in the failed bucket (and `complete` can still fire).
+
+    The action_id is matched on its bare id (passed as a bound param from the
+    shared FASTQ_TO_PARQUET_ACTION_ID, the same constant the submitter mints
+    against), NOT pinned to a version: the submitter chooses the fastq-to-parquet
+    version, and "this sample's fastq→parquet finished" holds regardless of which
+    version produced it (consistent with the read-metric / QC rollups, which read
+    persisted columns irrespective of the writing version). The inlined state
+    literals are pinned to qiita_common.models.WorkTicketState ('completed' /
+    'pending' / 'queued' / 'processing' / 'no_data' / 'failed' — its full closed
+    set); keep them in lockstep if that enum changes. Retired samples are
+    excluded (`ps.retired IS NOT TRUE`) to match the other pool rollups' sample
+    set."""
+    return await pool_or_conn.fetchrow(
+        "WITH sample_state AS ("
+        "  SELECT ss.prep_sample_idx,"
+        "    bool_or(wt.state = 'completed') AS has_completed,"
+        "    bool_or(wt.state IN ('pending', 'queued', 'processing')) AS has_inflight,"
+        "    bool_or(wt.state = 'no_data') AS has_no_data,"
+        "    bool_or(wt.state = 'failed') AS has_failed,"
+        "    count(wt.work_ticket_idx) AS ticket_count"
+        "  FROM qiita.sequenced_sample ss"
+        "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+        "  LEFT JOIN qiita.work_ticket wt"
+        "    ON wt.prep_sample_idx = ss.prep_sample_idx"
+        "   AND wt.action_id = $2"
+        "  WHERE ss.sequenced_pool_idx = $1 AND ps.retired IS NOT TRUE"
+        "  GROUP BY ss.prep_sample_idx"
+        ")"
+        " SELECT"
+        "   count(*) AS sample_count,"
+        "   count(*) FILTER (WHERE has_completed) AS samples_completed,"
+        "   count(*) FILTER (WHERE NOT has_completed AND has_inflight)"
+        "     AS samples_in_flight,"
+        "   count(*) FILTER (WHERE NOT has_completed AND NOT has_inflight AND has_no_data)"
+        "     AS samples_no_data,"
+        "   count(*) FILTER ("
+        "     WHERE NOT has_completed AND NOT has_inflight AND NOT has_no_data AND has_failed)"
+        "     AS samples_failed,"
+        "   count(*) FILTER (WHERE ticket_count = 0) AS samples_not_submitted"
+        " FROM sample_state",
+        sequenced_pool_idx,
+        READ_MASK_ACTION_ID,
     )
 
 

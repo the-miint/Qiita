@@ -27,16 +27,24 @@ Parquet whose rows mismatch the prior attempt's assignment. Workflow
 authors stage inputs onto an immutable shared filesystem region (the
 orchestrator never writes back to the input path).
 
-Schema (sorted by sequence_idx, the lake-friendly join key) — uses
-miint's native column names so the file round-trips through
-read_fastx-shaped consumers without aliasing:
+Schema (sorted by (prep_sample_idx, sequence_idx), the DuckLake `read`
+table's join key) — uses miint's native column names so the file
+round-trips through read_fastx-shaped consumers without aliasing:
 
+    prep_sample_idx   BIGINT      NOT NULL  -- the sample these reads belong to (lake scope/prune)
     sequence_idx      BIGINT      NOT NULL  -- CP-minted, contiguous within this sample
     read_id           VARCHAR     NOT NULL  -- FASTQ/A record id (label, no longer the join key)
     sequence1         VARCHAR     NOT NULL  -- R1 sequence
     qual1             UTINYINT[]            -- R1 phred-decoded; NULL for FASTA
     sequence2         VARCHAR               -- R2 sequence (paired-end); NULL when unpaired
     qual2             UTINYINT[]            -- R2 phred-decoded; NULL for FASTA or unpaired
+
+The output Parquet is written into the step workspace as `read.parquet`,
+and the workspace is exposed as the `staging_dir` binding so a downstream
+`register-files` step loads it into the DuckLake `read` table (the same
+DoPut → register path reference data uses). The full reads are stored
+ONCE per sample, independent of any mask; downstream masking never
+re-runs this step.
 
 No `sequence_length` column: Parquet row-group metadata stores the
 uncompressed size of every column in bytes per row group, so a
@@ -46,22 +54,24 @@ without a buffer copy. Carrying a precomputed BIGINT per row is a
 storage cost without a query-speed win.
 
 **sequence_idx gap note.** The minted range is sized to ALL parsed reads and is
-contiguous HERE. But `sequence_idx` is only a unique, sorted join key — it is
-NOT a dense row counter. Additive downstream steps that drop rows (today
-`host_filter` removes host reads; future QC may drop more) leave benign GAPS in
-the surviving `sequence_idx`. A consumer — especially a future DuckLake
-registration step reading `reads.parquet` / `filtered_reads.parquet` — must
-never assume `row count == (max sequence_idx − min + 1)` or that the values are
-gap-free; treat `sequence_idx` as a sparse key. (Gaps don't hurt DuckLake
+contiguous HERE, and stays so in the `read` table: this step writes EVERY read,
+no row dropping. Downstream masking (`qc`, `host_filter`) never drops a `read`
+row — it emits a separate `read_mask` row per `sequence_idx` instead — so
+`read` carries the full contiguous range. Even so, `sequence_idx` is only a
+unique, sorted join key, not a dense row counter; a consumer must never assume
+`row count == (max sequence_idx − min + 1)`. (Sparseness doesn't hurt DuckLake
 pruning / Parquet predicate pushdown, and the uint64 space isn't a concern.)
 
 Pipeline (B-staged-Parquet):
 
-  1. Reject empty input. A decompressed-stream peek (handles plain
-     and .gz) catches zero-record FASTQs before any DuckDB work;
-     empty input raises ValueError → BAD_INPUT, and no empty Parquet
-     is emitted. This also sidesteps miint's "Empty file: ..." throw,
-     so we don't depend on the upstream wording.
+  1. Detect empty input as a terminal no-data outcome. A decompressed-
+     stream peek (handles plain and .gz) catches zero-record FASTQs
+     before any DuckDB work; empty input raises StepNoData, NO sequence-
+     range is minted, and NO Parquet is emitted. An empty well — a blank,
+     a no-template control, or a failed-yield well — is expected and
+     numerous on a real plate, so it is a first-class terminal outcome
+     (work_ticket → NO_DATA), NOT a failure. This also sidesteps miint's
+     "Empty file: ..." throw, so we don't depend on the upstream wording.
 
   2. FASTQ -> intermediate Parquet (no sequence_idx yet). One
      streaming pass through miint's read_fastx. The intermediate is
@@ -85,7 +95,7 @@ Pipeline (B-staged-Parquet):
   6. (try/finally) cleanup intermediate + DuckDB temp_directory
      before returning. The SLURM launcher's manifest walker runs
      AFTER execute() returns, so the transient files are invisible
-     to it — the manifest sees only reads.parquet.
+     to it — the manifest sees only read.parquet.
 """
 
 from __future__ import annotations
@@ -95,7 +105,7 @@ from pathlib import Path
 
 import httpx
 from pydantic import BaseModel, Field
-from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.duckdb_miint import is_empty_sequence_file
 from qiita_common.models import WorkTicketFailureStage
 from qiita_common.parquet import validate_parquet_path
@@ -194,18 +204,27 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         raise FileNotFoundError(f"reverse FASTQ file not found: {inputs.reverse_fastq_path}")
 
     # Empty-input check via a Python decompressed-stream peek (handles
-    # plain and .gz). Surfaces empty FASTQs as BAD_INPUT before any
-    # DuckDB work — no empty Parquet is written, no sequence-range is
-    # minted, and we don't depend on miint's exception wording for the
-    # detection.
+    # plain and .gz). An empty well is a terminal no-data outcome, NOT a
+    # failure: raise StepNoData before any DuckDB work — no Parquet is
+    # written and no sequence-range is minted. Detecting it here also
+    # sidesteps miint's exception wording. A non-empty R1 paired with an
+    # empty R2 is equally no-data (the pair has no reads to write).
     if is_empty_sequence_file(inputs.fastq_path):
-        raise ValueError(f"FASTQ file contains no records: {inputs.fastq_path}")
+        raise StepNoData(
+            step_name=YAML_STEP_NAME,
+            reason=f"FASTQ file contains no records: {inputs.fastq_path}",
+        )
     if inputs.reverse_fastq_path is not None and is_empty_sequence_file(inputs.reverse_fastq_path):
-        raise ValueError(f"reverse FASTQ file contains no records: {inputs.reverse_fastq_path}")
+        raise StepNoData(
+            step_name=YAML_STEP_NAME,
+            reason=f"reverse FASTQ file contains no records: {inputs.reverse_fastq_path}",
+        )
 
     workspace.mkdir(parents=True, exist_ok=True)
     intermediate = workspace / "_intermediate_reads.parquet"
-    out_path = workspace / "reads.parquet"
+    # Output basename is the DuckLake table name: a downstream register-files
+    # step maps `read.parquet` -> the `read` table.
+    out_path = workspace / "read.parquet"
     out = validate_parquet_path(out_path)
     duckdb_tmp = workspace / ".duckdb_tmp"
     duckdb_tmp.mkdir(parents=True, exist_ok=True)
@@ -227,9 +246,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         read_fastx_args = [str(inputs.fastq_path)]
 
     try:
-        # FASTQ -> intermediate Parquet. Empty inputs were rejected as
-        # BAD_INPUT above, so read_fastx is guaranteed to have at least
-        # one record here.
+        # FASTQ -> intermediate Parquet. Empty inputs exited via StepNoData
+        # above, so read_fastx is guaranteed to have at least one record here.
         with open_miint_conn() as conn:
             apply_duckdb_settings(
                 conn,
@@ -376,18 +394,23 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             )
             # sequence_idx = miint's sequence_index (1-based per file)
             # + start - 1. Deterministic by construction — file order
-            # IS the assignment order. The outer ORDER BY controls the
+            # IS the assignment order. `prep_sample_idx` is a per-run
+            # constant — the DuckLake `read` table's scope/prune column —
+            # bound as the first param. The outer ORDER BY controls the
             # physical row order in the final Parquet
-            # (preserve_insertion_order=false means the COPY respects
-            # only explicit ORDER BY clauses).
+            # (preserve_insertion_order=false means the COPY respects only
+            # explicit ORDER BY clauses): sorted by (prep_sample_idx,
+            # sequence_idx), the `read` table's join key, for row-group
+            # pruning.
             conn.execute(
                 "COPY ( SELECT "
+                "  ?::BIGINT AS prep_sample_idx,"
                 "  sequence_index + ? - 1 AS sequence_idx,"
                 "  read_id, sequence1, qual1, sequence2, qual2 "
                 "FROM read_parquet(?) "
-                "ORDER BY sequence_idx ) "
+                "ORDER BY prep_sample_idx, sequence_idx ) "
                 f"TO '{out}' ({PARQUET_OPTS})",
-                [sequence_idx_start, str(intermediate)],
+                [inputs.prep_sample_idx, sequence_idx_start, str(intermediate)],
             )
             # Emit the raw read count: the reads out of bcl-convert,
             # before qc/host_filter. Reuse this connection — write_read_count
@@ -402,4 +425,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         intermediate.unlink(missing_ok=True)
         shutil.rmtree(duckdb_tmp, ignore_errors=True)
 
-    return {"reads": out_path, "raw_read_count": raw_read_count}
+    # `reads` is the read.parquet path the downstream qc/host_filter steps
+    # consume; `read_staging_dir` is the workspace a register-files step loads
+    # into the DuckLake `read` table (only `read.parquet` matches its `*.parquet`
+    # convention — the read_count.json sidecar is inert there, and the
+    # intermediate Parquet was unlinked in the finally above). A distinct
+    # staging-dir binding (not the generic `staging_dir`) so it can't be
+    # clobbered by host_filter's own staging dir later in the workflow.
+    # `raw_read_count` is retained for back-compat but read counts are now
+    # sourced from the mask.
+    return {
+        "reads": out_path,
+        "read_staging_dir": workspace,
+        "raw_read_count": raw_read_count,
+    }
