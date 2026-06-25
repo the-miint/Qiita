@@ -53,6 +53,12 @@ class Scope(StrEnum):
     # capability to pull them is granted separately — to service accounts that
     # drive the masked-read consumer path, never piggybacking on reference reads.
     READ_MASKED_DOGET = "read_masked:doget"
+    # Full purge of a mask (the mask_definition row + its DuckLake read_mask
+    # rows). Deliberately distinct from the mask-minting capability: deletion
+    # is destructive and admin-only, granted solely to system_admin in
+    # ROLE_IMPLIED_SCOPES — never to wet_lab_admin or service accounts.
+    # Mirrors REFERENCE_DELETE.
+    MASK_DEFINITION_DELETE = "mask_definition:delete"
     # Generic upload domain. Gates the slot-minting + DoPut path; not
     # reference-specific. Carried by admins (humans uploading via qiita-admin)
     # and service accounts (workers driving import flows).
