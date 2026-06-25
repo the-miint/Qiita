@@ -73,6 +73,10 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             # PREP_SAMPLE_WRITE but not destroy them. Service accounts never
             # get it.
             Scope.SEQUENCED_POOL_DELETE,
+            # Full mask purge is system_admin-only, same as REFERENCE_DELETE:
+            # deleting a mask drops its mask_definition row and DuckLake
+            # read_mask data. Service accounts never get it.
+            Scope.MASK_DEFINITION_DELETE,
             Scope.STUDY_READ,
             Scope.STUDY_WRITE,
             Scope.ADMIN_USER,

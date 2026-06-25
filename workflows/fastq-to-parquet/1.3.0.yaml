@@ -172,20 +172,23 @@ steps:
       mem_gb: 16
       walltime: PT4H
 
-  # Load the final mask into the DuckLake `read_mask` table. read_mask_staging_dir
-  # holds read_mask.parquet, which register-files maps to the `read_mask` table.
-  - action: register-files
-    inputs: [read_mask_staging_dir]
-    outputs: []
-
   # Persist the three per-stage read counts onto this prep_sample's 1:1
   # sequenced_sample row, DERIVED from the read_mask (raw / biological /
   # quality-filtered, both-mates r1r2). In-process control-plane action (direct
   # DB write, no backend hop) — it reads the read_mask Parquet and counts by
   # reason. Writing a prep_sample subtype row is why the workflow declares
-  # prep_sample:write in `scopes` above.
+  # prep_sample:write in `scopes` above. MUST run before register-files:
+  # register-files MOVES read_mask.parquet out of the staging dir into permanent
+  # DuckLake storage, so this read of the staging path must happen first.
   - action: persist-read-metrics
     inputs: [read_mask]
+    outputs: []
+
+  # Load the final mask into the DuckLake `read_mask` table. read_mask_staging_dir
+  # holds read_mask.parquet, which register-files maps to the `read_mask` table.
+  # Moves the parquet out of staging — keep this last (see persist-read-metrics).
+  - action: register-files
+    inputs: [read_mask_staging_dir]
     outputs: []
 
 action_ceiling:

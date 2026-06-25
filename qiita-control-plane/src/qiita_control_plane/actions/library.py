@@ -207,6 +207,13 @@ def _do_action_delete_reference(data_plane_url: str, token: bytes) -> list:
         return list(client.do_action(action))
 
 
+def _do_action_delete_mask(data_plane_url: str, token: bytes) -> list:
+    """Synchronous gRPC call to data plane — runs in thread executor."""
+    with _flight.FlightClient(data_plane_url) as client:
+        action = _flight.Action("delete_mask", token)
+        return list(client.do_action(action))
+
+
 # =============================================================================
 # Public primitives — exposed through LIBRARY by name
 # =============================================================================
@@ -590,6 +597,35 @@ async def delete_reference_data(
     if not results:
         return {}
     return json.loads(results[0].body.to_pybytes())
+
+
+async def delete_mask_data(
+    *,
+    mask_idx: int,
+    hmac_secret: bytes,
+    data_plane_url: str,
+) -> int:
+    """Delete a mask's DuckLake read_mask rows via the data plane's DoAction.
+
+    Signs a `delete_mask` action token carrying only `mask_idx` and returns the
+    data plane's rows-deleted count. The delete is a logical `DELETE FROM
+    read_mask WHERE mask_idx = ?` inside one DuckLake transaction — no parquet is
+    reclaimed from disk (mirrors `delete_reference`).
+
+    Idempotent: a mask whose rows never registered (or were already deleted)
+    deletes zero rows and still succeeds. Raises pyarrow.flight.FlightError on
+    transport / data-plane failure."""
+    token = sign_action(
+        action="delete_mask",
+        payload={"mask_idx": mask_idx},
+        secret=hmac_secret,
+    )
+    results = await asyncio.get_event_loop().run_in_executor(
+        None, _do_action_delete_mask, data_plane_url, token
+    )
+    if not results:
+        return 0
+    return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
 
 
 # =============================================================================

@@ -69,7 +69,7 @@ from .actions.reference import (
     transition_reference_status,
 )
 from .auth.tickets import sign_ticket
-from .repositories.mask_definition import mint_mask_definition
+from .repositories.mask_definition import lookup_mask_idx_by_params, mint_mask_definition
 
 _log = logging.getLogger(__name__)
 
@@ -408,6 +408,11 @@ async def run_workflow(
                     host_minimap2_reference_idx=bound.get("host_minimap2_reference_idx"),
                 )
             )
+            # Persist the minted mask_idx onto the ticket for durable traceability
+            # (and a cheap shared-mask guard). Idempotent: a re-mint on resume
+            # re-resolves to the same mask_idx via the config-hash upsert and
+            # re-writes the same value here.
+            await _persist_mask_idx(pool, work_ticket_idx, bound[MASK_IDX_BINDING])
 
         for index, entry in enumerate(action.steps):
             # Conditional gate (WorkflowStep/WorkflowAction.when): skip this
@@ -1763,8 +1768,58 @@ def _adapter_set_hash(adapter_parquet: Path) -> str:
     """SHA-256 hex of the materialized adapter-set Parquet's bytes — the resolved
     adapter identity for the mask config hash. Hashing the staged file (not the
     reference idx) keeps the mask identity tied to the adapter bytes actually
-    applied, so a re-pointed-but-identical adapter set collapses to one mask."""
+    applied, so a re-pointed-but-identical adapter set collapses to one mask.
+
+    Note the hash is over the SERIALIZED Parquet bytes, not the logical sequence
+    set: mint and backfill agree only because both materialize the adapter Parquet
+    through the same `_write_adapter_parquet` / pyarrow writer. A writer change
+    that alters the byte layout shifts this hash and would force a re-mint rather
+    than collapsing to the existing mask — it is an assumption, not something the
+    code enforces."""
     return hashlib.sha256(adapter_parquet.read_bytes()).hexdigest()
+
+
+def _build_mask_params(
+    *,
+    action_id: str,
+    action_version: str,
+    prep_protocol_idx: int | None,
+    instrument_model: str | None,
+    adapter_set_hash: str | None,
+    host_rype_reference_idx: int | None,
+    host_minimap2_reference_idx: int | None,
+) -> dict[str, Any]:
+    """Assemble the resolved-filter-config dict that `mint_mask_definition`
+    hashes (canonical JSON → SHA-256 → `params_hash`) to mint/dedup a mask.
+
+    This is the SINGLE source of truth for the mask's identity shape — both the
+    mint path (`_mint_read_mask`) and the legacy backfill
+    (`backfill_work_ticket_mask_idx`) call it so the two derive the SAME hash for
+    the SAME effective config. Every value is the EFFECTIVE filter (the host refs
+    the filter applies + adapter bytes hash + thresholds), so two callers with the
+    same effective config collapse to one mask even if descriptive metadata
+    differs. `adapter_set_hash` is passed in already computed (the SHA-256 hex of
+    the materialized adapter Parquet, via `_adapter_set_hash`) rather than a file
+    path, so the backfill can supply it from a re-materialized adapter set without
+    this helper touching the filesystem.
+
+    Any change to the keys, nesting, or resolved-QC constants here changes every
+    mask's identity fleet-wide — keep it deterministic and keyed only on the
+    effective filter.
+    """
+    return {
+        "filter_workflow": action_id,
+        "filter_version": action_version,
+        "host_rype_reference_idx": host_rype_reference_idx,
+        "host_minimap2_reference_idx": host_minimap2_reference_idx,
+        "prep_protocol_idx": prep_protocol_idx,
+        "resolved_qc": {
+            "instrument_model": instrument_model,
+            "min_length": _QC_RESOLVED_MIN_LENGTH,
+            "filter_read_tail": _QC_RESOLVED_FILTER_TAIL,
+            "adapter_set_hash": adapter_set_hash,
+        },
+    }
 
 
 async def _mint_read_mask(
@@ -1820,25 +1875,21 @@ async def _mint_read_mask(
                 "read mask can be minted"
             )
 
-    # Resolved config — every value is the EFFECTIVE filter (the host refs the
-    # filter applies + adapter bytes hash + thresholds), so two callers with the
-    # same effective config collapse to one mask even if descriptive metadata
-    # differs.
-    params: dict[str, Any] = {
-        "filter_workflow": action_id,
-        "filter_version": action_version,
-        "host_rype_reference_idx": host_rype_reference_idx,
-        "host_minimap2_reference_idx": host_minimap2_reference_idx,
-        "prep_protocol_idx": prep_protocol_idx,
-        "resolved_qc": {
-            "instrument_model": instrument_model,
-            "min_length": _QC_RESOLVED_MIN_LENGTH,
-            "filter_read_tail": _QC_RESOLVED_FILTER_TAIL,
-            "adapter_set_hash": (
-                _adapter_set_hash(adapter_parquet) if adapter_parquet is not None else None
-            ),
-        },
-    }
+    # Resolved config — assembled by the shared `_build_mask_params` so the mint
+    # path and the legacy backfill derive the SAME hash for the same effective
+    # config. The adapter identity is the SHA-256 of the materialized adapter
+    # bytes (None when this workflow uses no adapter set).
+    params = _build_mask_params(
+        action_id=action_id,
+        action_version=action_version,
+        prep_protocol_idx=prep_protocol_idx,
+        instrument_model=instrument_model,
+        adapter_set_hash=(
+            _adapter_set_hash(adapter_parquet) if adapter_parquet is not None else None
+        ),
+        host_rype_reference_idx=host_rype_reference_idx,
+        host_minimap2_reference_idx=host_minimap2_reference_idx,
+    )
 
     try:
         async with pool.acquire() as conn:
@@ -1855,6 +1906,181 @@ async def _mint_read_mask(
             f"{originator_principal_idx} does not exist"
         ) from exc
     return {MASK_IDX_BINDING: mask_row["mask_idx"]}
+
+
+async def _persist_mask_idx(pool: asyncpg.Pool, work_ticket_idx: int, mask_idx: int) -> None:
+    """Write the minted `mask_idx` onto the ticket row (durable ticket→mask
+    traceability + a cheap shared-mask guard). Idempotent: a re-mint on resume
+    re-resolves to the same mask_idx via the config-hash upsert, so re-running
+    this writes the same value. Like every runner DB write it fails loud — a PG
+    outage raises and unwinds the run via run_workflow's catch-all."""
+    await pool.execute(
+        "UPDATE qiita.work_ticket SET mask_idx = $1 WHERE work_ticket_idx = $2",
+        mask_idx,
+        work_ticket_idx,
+    )
+
+
+# Actions whose tickets thread a `mask_idx`; the backfill scopes to these so it
+# never touches a ticket that never minted a mask. Keep in sync with the
+# workflows that declare `_workflow_needs_mask` (read-mask + fastq-to-parquet).
+_MASK_BEARING_ACTION_IDS = ("read-mask", "fastq-to-parquet")
+
+
+async def _materialize_backfill_adapter_set_hash(
+    pool: asyncpg.Pool,
+    *,
+    default_adapter_reference_idx: int | None,
+    data_plane_url: str,
+    hmac_secret: bytes,
+    workspace: Path,
+) -> str | None:
+    """Re-derive the canonical adapter-set hash for the backfill, once.
+
+    Every read-mask / fastq-to-parquet ticket masks against the SAME canonical
+    adapter set (`default_adapter_reference_idx`), so the `adapter_set_hash` that
+    feeds `_build_mask_params` is identical across all of them. We re-materialize
+    the adapter Parquet once via the same DoGet path the mint uses
+    (`_resolve_qc_adapters`) and hash its bytes (`_adapter_set_hash`). The hash is
+    over the SERIALIZED Parquet bytes, so this reproduces the mint's hash only as
+    long as the backfill runs under the same pyarrow/Parquet writer the mint did:
+    a writer change that alters the on-disk byte layout would shift the hash and
+    force a re-mint rather than a backfill match. Returns None when no default
+    adapter reference is configured (a deploy that mints maskless / for a test
+    seam) — the caller then builds params with `adapter_set_hash=None`.
+    """
+    if default_adapter_reference_idx is None:
+        return None
+    bound = await _resolve_qc_adapters(
+        pool,
+        default_adapter_reference_idx=default_adapter_reference_idx,
+        data_plane_url=data_plane_url,
+        hmac_secret=hmac_secret,
+        workspace=workspace,
+    )
+    return _adapter_set_hash(bound[QC_ADAPTER_BINDING])
+
+
+async def backfill_work_ticket_mask_idx(
+    pool: asyncpg.Pool,
+    *,
+    workspace: Path,
+    default_adapter_reference_idx: int | None,
+    data_plane_url: str,
+    hmac_secret: bytes,
+    apply: bool,
+) -> dict[str, Any]:
+    """One-time, idempotent backfill of `work_ticket.mask_idx` for existing
+    read-mask / fastq-to-parquet tickets created before the column existed.
+
+    For each such ticket with `mask_idx IS NULL`, reconstruct the filtering
+    config the runner hashed at mint (the SAME `_build_mask_params` shape, fed by
+    the ticket's stored `action_context` + the prep_protocol_idx join + the
+    re-materialized canonical adapter-set hash), then LOOK UP the matching
+    `mask_definition` row (`lookup_mask_idx_by_params`). On a hit, set the
+    ticket's `mask_idx`; on a miss (the ticket failed before minting, or its
+    config drifted off the current hash logic) SKIP it and record it — the
+    backfill NEVER mints a new mask.
+
+    Scoped to `_MASK_BEARING_ACTION_IDS` and to `mask_idx IS NULL`, so it is
+    idempotent: a second run finds nothing left to populate. Processes tickets in
+    ANY state (not just failed) so a COMPLETED ticket that SHARES a mask is
+    populated too — the shared-mask guard reads this column.
+
+    `apply=False` is a dry run: it computes the same hit/miss classification and
+    reports what it WOULD do without writing. `apply=True` writes inside a single
+    transaction. Returns a report dict: counted / populated / skipped_no_mask /
+    skipped_not_prep_sample, plus the skipped ticket idxs.
+    """
+    adapter_set_hash = await _materialize_backfill_adapter_set_hash(
+        pool,
+        default_adapter_reference_idx=default_adapter_reference_idx,
+        data_plane_url=data_plane_url,
+        hmac_secret=hmac_secret,
+        workspace=workspace,
+    )
+
+    rows = await pool.fetch(
+        "SELECT work_ticket_idx, action_id, action_version, prep_sample_idx, action_context"
+        "  FROM qiita.work_ticket"
+        " WHERE mask_idx IS NULL"
+        "   AND action_id = ANY($1::text[])"
+        " ORDER BY work_ticket_idx",
+        list(_MASK_BEARING_ACTION_IDS),
+    )
+
+    populated: list[dict[str, int]] = []
+    skipped_no_mask: list[int] = []
+    skipped_not_prep_sample: list[int] = []
+
+    for row in rows:
+        ticket_idx = row["work_ticket_idx"]
+        prep_sample_idx = row["prep_sample_idx"]
+        if prep_sample_idx is None:
+            # A mask keys on a prep_sample's reads; a ticket of these actions with
+            # no prep_sample never minted a mask. Record and skip rather than
+            # crash on the prep_protocol join below.
+            skipped_not_prep_sample.append(ticket_idx)
+            continue
+
+        action_context = row["action_context"]
+        if isinstance(action_context, str):
+            # action_context is JSONB; asyncpg returns it as a string unless a
+            # JSON codec is registered. Decode the same way _fetch_work_ticket does.
+            action_context = json.loads(action_context)
+        action_context = action_context or {}
+
+        prep_protocol_idx = await pool.fetchval(
+            "SELECT ps.prep_protocol_idx"
+            "  FROM qiita.sequenced_sample ss"
+            "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+            " WHERE ss.prep_sample_idx = $1",
+            prep_sample_idx,
+        )
+
+        # Read host refs + instrument_model straight off action_context — the same
+        # keys `_mint_read_mask` reads from `bound` (the resolvers add host_*_path
+        # bindings but never overwrite these reference-idx keys), so the
+        # reconstructed config reproduces the minted one. The adapter_set_hash
+        # component is over the serialized adapter Parquet bytes, so this match
+        # holds only while backfill and mint run under the same Parquet writer (see
+        # `_adapter_set_hash`); a writer change would force a re-mint.
+        params = _build_mask_params(
+            action_id=row["action_id"],
+            action_version=row["action_version"],
+            prep_protocol_idx=prep_protocol_idx,
+            instrument_model=action_context.get("instrument_model"),
+            adapter_set_hash=adapter_set_hash,
+            host_rype_reference_idx=action_context.get("host_rype_reference_idx"),
+            host_minimap2_reference_idx=action_context.get("host_minimap2_reference_idx"),
+        )
+
+        mask_idx = await lookup_mask_idx_by_params(pool, params)
+        if mask_idx is None:
+            skipped_no_mask.append(ticket_idx)
+            continue
+        populated.append({"work_ticket_idx": ticket_idx, "mask_idx": mask_idx})
+
+    if apply and populated:
+        async with pool.acquire() as conn, conn.transaction():
+            for item in populated:
+                # Re-guard on mask_idx IS NULL in the WHERE so a concurrent mint
+                # (or a prior partial run) is never clobbered; idempotent.
+                await conn.execute(
+                    "UPDATE qiita.work_ticket SET mask_idx = $1"
+                    " WHERE work_ticket_idx = $2 AND mask_idx IS NULL",
+                    item["mask_idx"],
+                    item["work_ticket_idx"],
+                )
+
+    return {
+        "applied": apply,
+        "counted": len(rows),
+        "populated": len(populated),
+        "populated_detail": populated,
+        "skipped_no_mask": skipped_no_mask,
+        "skipped_not_prep_sample": skipped_not_prep_sample,
+    }
 
 
 # =============================================================================

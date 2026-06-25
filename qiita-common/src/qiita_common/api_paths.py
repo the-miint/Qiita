@@ -243,8 +243,10 @@ URL_SEQUENCE_RANGE_BY_PREP_SAMPLE = (
 
 PATH_MASK_DEFINITION_PREFIX = "/mask-definition"
 PATH_MASK_DEFINITION_ROOT = ""  # POST against the prefix itself
+PATH_MASK_DEFINITION_BY_IDX = "/{mask_idx}"  # DELETE a mask (lake rows + Postgres row)
 
 URL_MASK_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_MASK_DEFINITION_PREFIX}"
+URL_MASK_DEFINITION_BY_IDX = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_BY_IDX}"
 
 # =============================================================================
 # /read-masked/* — Flight DoGet ticket for the masked-read surface

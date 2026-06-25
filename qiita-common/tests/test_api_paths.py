@@ -213,6 +213,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
     ),
     # /read-masked
     ("URL_READ_MASKED_DOGET", "PATH_READ_MASKED_PREFIX", "PATH_READ_MASKED_DOGET"),
+    # /mask-definition
+    (
+        "URL_MASK_DEFINITION_BY_IDX",
+        "PATH_MASK_DEFINITION_PREFIX",
+        "PATH_MASK_DEFINITION_BY_IDX",
+    ),
 ]
 
 

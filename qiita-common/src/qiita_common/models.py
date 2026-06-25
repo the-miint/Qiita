@@ -2464,6 +2464,18 @@ class MaskDefinition(BaseModel):
     created_at: AwareDatetime
 
 
+class MaskDefinitionDeleteResponse(BaseModel):
+    """Returned by DELETE /api/v1/mask-definition/{mask_idx}.
+
+    `rows_deleted` is the DuckLake `read_mask` row count the data plane removed
+    (0 on an idempotent re-run); the Postgres `mask_definition` row is purged
+    last. Referencing `work_ticket` rows detach automatically via the
+    `ON DELETE SET NULL` FK."""
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    rows_deleted: int
+
+
 class ReadMaskedDoGetTicketRequest(BaseModel):
     """Body for POST /api/v1/read-masked/ticket/doget.
 
