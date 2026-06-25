@@ -286,6 +286,29 @@ impl FlightService for QiitaFlightService {
                 let output = stream::once(futures::future::ready(Ok(result)));
                 Ok(Response::new(Box::pin(output)))
             }
+            "delete_mask" => {
+                let payload = auth::verify_delete_mask(&action.body, &self.hmac_secret)
+                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
+
+                if payload.action != "delete_mask" {
+                    return Err(Status::invalid_argument(format!(
+                        "action type mismatch: header says 'delete_mask', payload says {:?}",
+                        payload.action
+                    )));
+                }
+
+                let deleted =
+                    delete_mask(&self.catalog_connstr, &self.data_path, payload.mask_idx)?;
+
+                let result_body = serde_json::to_vec(&deleted)
+                    .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+
+                let result = arrow_flight::Result {
+                    body: result_body.into(),
+                };
+                let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
             other => Err(Status::invalid_argument(format!(
                 "unknown action type: {other:?}"
             ))),
@@ -806,6 +829,54 @@ fn delete_reference(
     Ok(out)
 }
 
+/// Logically delete every row a mask owns from the DuckLake `read_mask` table.
+///
+/// Mirrors `delete_reference`: one DuckLake transaction, logical `DELETE` only.
+/// No raw parquet `unlink` — DuckLake owns file lifecycle and a manual unlink
+/// would corrupt the catalog; orphan parquets are tolerated until a future
+/// maintenance pass (matches `delete_reference`, which also reclaims nothing
+/// from disk). Idempotent: deleting a `mask_idx` with zero rows is success and
+/// returns `rows_deleted: 0`, so the control plane can safely retry.
+fn delete_mask(
+    catalog_connstr: &str,
+    data_path: &str,
+    mask_idx: i64,
+) -> Result<serde_json::Value, Status> {
+    let conn = duckdb::Connection::open_in_memory()
+        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
+    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
+        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
+
+    // Single-statement delete wrapped in an explicit transaction so the action
+    // is all-or-nothing and the control plane can safely retry: a failed call
+    // leaves the mask's rows fully intact, so a retry sees the same row set.
+    conn.execute_batch("BEGIN TRANSACTION")
+        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
+
+    let deleted = conn.execute(
+        "DELETE FROM qiita_lake.read_mask WHERE mask_idx = ?",
+        [&mask_idx as &dyn duckdb::ToSql],
+    );
+
+    let rows_deleted = match deleted {
+        Ok(n) => n,
+        Err(e) => {
+            // Best-effort rollback; surface the original delete error.
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(Status::internal(format!(
+                "delete failed (DELETE FROM qiita_lake.read_mask WHERE mask_idx = ?): {e}"
+            )));
+        }
+    };
+    conn.execute_batch("COMMIT")
+        .map_err(|e| Status::internal(format!("failed to commit delete transaction: {e}")))?;
+
+    Ok(serde_json::json!({
+        "mask_idx": mask_idx,
+        "rows_deleted": rows_deleted,
+    }))
+}
+
 /// Mint a unique, ticket-traceable lake-storage filename for a registered
 /// Parquet.
 ///
@@ -1052,6 +1123,62 @@ mod tests {
         let _ = conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_b};
              DELETE FROM qiita_lake.reference_sequences WHERE feature_idx = {shared};"
+        ));
+    }
+
+    /// `delete_mask` drops exactly the target mask's `read_mask` rows, leaves a
+    /// different mask untouched, and is idempotent: a second delete of the same
+    /// mask_idx succeeds and reports `rows_deleted: 0`.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn delete_mask_drops_target_idempotently() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+
+        // Unique ids so leftover rows never collide with other serial tests.
+        let mask_a: i64 = 930_000;
+        let mask_b: i64 = 930_001;
+        let prep: i64 = 930_010;
+        let seq1: i64 = 930_020;
+        let seq2: i64 = 930_021;
+
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read_mask WHERE mask_idx IN ({mask_a}, {mask_b});
+             INSERT INTO qiita_lake.read_mask \
+                 (mask_idx, prep_sample_idx, sequence_idx, reason) VALUES \
+                 ({mask_a}, {prep}, {seq1}, 'pass'), \
+                 ({mask_a}, {prep}, {seq2}, 'pass'), \
+                 ({mask_b}, {prep}, {seq1}, 'pass');"
+        ))
+        .unwrap();
+
+        let first = delete_mask(&connstr, &data_path, mask_a).expect("delete_mask failed");
+        assert_eq!(first["rows_deleted"], 2, "both mask_a rows deleted");
+        assert_eq!(first["mask_idx"], mask_a);
+
+        let count = |mask: i64| -> i64 {
+            conn.query_row(
+                &format!("SELECT count(*) FROM qiita_lake.read_mask WHERE mask_idx = {mask}"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(count(mask_a), 0, "mask_a rows gone");
+        assert_eq!(count(mask_b), 1, "mask_b untouched");
+
+        // Idempotency: re-deleting the now-empty mask is success with 0 rows.
+        let second =
+            delete_mask(&connstr, &data_path, mask_a).expect("idempotent re-delete failed");
+        assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
+
+        // Best-effort cleanup of the surviving mask_b row.
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read_mask WHERE mask_idx = {mask_b};"
         ));
     }
 
