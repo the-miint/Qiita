@@ -68,7 +68,7 @@ from .actions.reference import (
     ReferenceNotFound,
     transition_reference_status,
 )
-from .auth.tickets import sign_ticket
+from .auth.tickets import sign_action, sign_ticket
 from .repositories.mask_definition import lookup_mask_idx_by_params, mint_mask_definition
 
 _log = logging.getLogger(__name__)
@@ -376,7 +376,15 @@ async def run_workflow(
                     "a workflow that masks stored reads must be prep_sample-scoped; "
                     f"got {scope_target['kind']!r}"
                 )
-            bound.update(_resolve_staged_reads(scope_target, upload_staging_root))
+            bound.update(
+                await _resolve_staged_reads(
+                    scope_target,
+                    upload_staging_root,
+                    data_plane_url=data_plane_url,
+                    hmac_secret=hmac_secret,
+                    workspace=workspace,
+                )
+            )
 
         # Read-mask identity: when a step threads `mask_idx` through its params
         # (the host_filter step), mint the mask_idx for this filtering config and
@@ -1707,20 +1715,106 @@ async def _resolve_sample_map(action_context: dict[str, Any], workspace: Path) -
     return {SAMPLE_MAP_BINDING: out}
 
 
-def _resolve_staged_reads(scope_target: dict[str, Any], staging_root: Path) -> dict[str, Path]:
-    """Bind `reads` to the prep_sample's durable stored reads for a read-mask
-    workflow. The reads were written once by `ingest_reads`; this fails
-    SUBMISSION/BAD_INPUT (so the ticket FAILs cleanly) if they are absent — the
-    sample must be ingested before a mask can be created over it."""
+def _do_action_export_read(data_plane_url: str, token: bytes) -> dict[str, Any]:
+    """Synchronous Flight DoAction asking the data plane to re-materialize one
+    prep_sample's reads from its DuckLake `read` table into a per-ticket Parquet
+    on shared scratch — runs in a thread executor (pyarrow.flight is sync). The
+    data plane writes the file; the bulk read bytes never transit the control
+    plane. Returns `{"count": int, "dest": str}` with `count` already coerced to
+    int, raising ValueError on a missing/garbled body or a non-integer `count` so
+    the caller (inside its `except`) turns it into a clean SUBMISSION failure
+    rather than a cryptic backtrace. Mirrors `actions.library._do_action_register`;
+    isolated so unit tests stub the real call."""
+    import pyarrow.flight as flight  # noqa: PLC0415
+
+    with flight.FlightClient(data_plane_url) as client:
+        results = list(client.do_action(flight.Action("export_read", token)))
+    if not results:
+        return {"count": 0, "dest": ""}
+    body = results[0].body.to_pybytes()
+    if not body:
+        return {"count": 0, "dest": ""}
+    # Parse + coerce here (inside the executor, so the caller's `except` wraps any
+    # failure) — never hand the caller a `count` it must coerce outside its try.
+    try:
+        parsed = json.loads(body)
+        count = int(parsed["count"])
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise ValueError(f"export_read returned an unparseable result body: {exc!r}") from exc
+    return {"count": count, "dest": str(parsed.get("dest", ""))}
+
+
+async def _resolve_staged_reads(
+    scope_target: dict[str, Any],
+    staging_root: Path,
+    *,
+    data_plane_url: str,
+    hmac_secret: bytes,
+    workspace: Path,
+) -> dict[str, Path]:
+    """Bind `reads` to the prep_sample's stored reads for a read-mask workflow.
+
+    Fast path: the durable staging copy `ingest_reads` wrote
+    (`compute_reads_staging_path`). That copy is ephemeral, so when it is gone
+    (reprocessing a run stored earlier) fall back to the PERSISTENT store: ask the
+    data plane to re-materialize the sample's reads from its DuckLake `read` table
+    into a per-ticket `reads.parquet` via the `export_read` DoAction (the data
+    plane writes the file; the bulk read bytes never transit the control plane).
+    Either source binds the same `reads` path; they are byte-equivalent modulo row
+    order, and qc / host_filter are order-independent.
+
+    Fails SUBMISSION/BAD_INPUT (so the ticket FAILs cleanly) if the sample has no
+    stored reads in either place — it must be ingested before a mask can be
+    created over it — or if the data plane is unreachable."""
     prep_sample_idx = scope_target["prep_sample_idx"]
-    reads = compute_reads_staging_path(staging_root, prep_sample_idx)
-    if not reads.exists():
-        raise _submission_bad_input(
-            f"no stored reads for prep_sample {prep_sample_idx} at {reads}; the "
-            "sample must be ingested (submit-bcl-convert stores reads) before a "
-            "read mask can be created over it"
+
+    durable = compute_reads_staging_path(staging_root, prep_sample_idx)
+    if durable.exists():
+        return {STAGED_READS_BINDING: durable}
+
+    # Ephemeral durable copy gone — source from the persistent DuckLake `read`
+    # table. We name the per-ticket destination (under the shared scratch tree the
+    # data plane validates); the data plane writes it.
+    workspace.mkdir(parents=True, exist_ok=True)
+    dest = workspace / "reads.parquet"
+    token = sign_action(
+        action="export_read",
+        payload={"prep_sample_idx": prep_sample_idx, "dest": str(dest)},
+        secret=hmac_secret,
+    )
+    # A Flight failure (data plane unreachable / errored) is NOT a BackendFailure;
+    # wrap it as a SUBMISSION BAD_INPUT like the other pre-loop resolvers so the
+    # outer handler FAILs the ticket cleanly (step_name=None) rather than letting
+    # an untyped exception strand it in PROCESSING. (Not retried in place: the
+    # operator resubmits if the data plane was down.)
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, _do_action_export_read, data_plane_url, token
         )
-    return {STAGED_READS_BINDING: reads}
+    except Exception as exc:
+        raise _submission_bad_input(
+            f"could not materialize reads for prep_sample {prep_sample_idx} from "
+            f"the data plane: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    # `count` is already an int (coerced in `_do_action_export_read`).
+    if result.get("count", 0) == 0:
+        # The persistent store has no reads for this sample either (the data plane
+        # writes no file for an empty result) — same "must be ingested" semantics.
+        raise _submission_bad_input(
+            f"no stored reads for prep_sample {prep_sample_idx}; the sample must be "
+            "ingested (submit-bcl-convert stores reads) before a read mask can be "
+            "created over it"
+        )
+    if not dest.exists():
+        # The data plane reported reads but no file landed at dest (a data-plane
+        # bug, a full disk, or a mid-write failure). Fail at submission rather than
+        # handing a downstream step a path that isn't there.
+        raise _submission_bad_input(
+            f"the data plane reported reads for prep_sample {prep_sample_idx} but "
+            f"wrote no file at {dest}"
+        )
+    return {STAGED_READS_BINDING: dest}
 
 
 # =============================================================================

@@ -718,3 +718,27 @@ def test_load_actions_handles_two_versions_of_same_action(tmp_path):
         ("reference-add", "1.0.0"),
         ("reference-add", "1.1.0"),
     ]
+
+
+def test_load_actions_read_mask_audience_is_admin_only():
+    """The on-disk `workflows/read-mask/1.0.0.yaml` audience excludes plain
+    `user`: submitting a read mask (host filter / QC reprocessing) now triggers
+    the data plane to re-materialize the sample's RAW reads (human-containing)
+    via the `export_read` DoAction, so it is an admin operation. Locks the
+    audience so a revert that re-admits `user` surfaces here."""
+    from pathlib import Path
+
+    from qiita_common.auth_constants import SystemRole
+
+    from qiita_control_plane.actions import load_actions
+
+    repo_root = Path(__file__).resolve().parents[2]
+    by_id = {a.action_id: a for a in load_actions(repo_root / "workflows")}
+    read_mask = by_id["read-mask"]
+
+    assert read_mask.audience.service is False
+    assert SystemRole.USER not in read_mask.audience.human_roles
+    assert set(read_mask.audience.human_roles) == {
+        SystemRole.WET_LAB_ADMIN,
+        SystemRole.SYSTEM_ADMIN,
+    }

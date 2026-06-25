@@ -35,7 +35,18 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- `read-mask/1.0.0` audience tightened to `[wet_lab_admin, system_admin]` (drops
+  plain `user`): submitting a read mask (host filter / QC reprocessing) now drives
+  the data plane to re-materialize the sample's RAW (human-containing) reads, so it
+  is admin-only. **Soft contract change** — a non-admin `user` who could submit a
+  read mask before now gets 403. The YAML is **edited in place**, re-synced into
+  `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (covered by the
+  generic `make verify-deploy` action list), **not** a migration. The new
+  `export_read` data-plane DoAction backing the runner's reprocessing fallback
+  writes a per-ticket `reads.parquet` under `<scratch>/ticket/<idx>/` — already
+  group-writable by the DP (`qiita-data`) via its existing `qiita-pipeline`
+  membership, and read back by `qiita-job` (same group) at mode `0440`, so **no new
+  env var, host dir, scope, or group change**. (#187)
 
 ---
 

@@ -50,13 +50,19 @@ description: >
 
 # persist-read-metrics writes the per-stage read counts onto the sample's
 # sequenced_sample (prep_sample subtype) row, so submitters must hold
-# prep_sample:write (in the USER ceiling, so the audience below is unaffected).
+# prep_sample:write — held by every tier in the audience below (ceilings are
+# inclusive), so the admin-only audience does not lose this scope.
 scopes:
   - prep_sample:write
 
+# Admin-only: submitting a read mask (host filter / QC reprocessing) makes the
+# data plane re-materialize the sample's RAW reads (human-containing) into the
+# ticket workspace via the `export_read` DoAction, so this is a privileged
+# operation — never a plain `user`. (wet_lab_admin is the lab-operations tier;
+# host filtering / QC is a lab operation.)
 audience:
   service: false
-  human_roles: [user, wet_lab_admin, system_admin]
+  human_roles: [wet_lab_admin, system_admin]
 
 context_schema:
   type: object
