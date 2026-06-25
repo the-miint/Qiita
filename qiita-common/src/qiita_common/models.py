@@ -718,6 +718,49 @@ class BiosampleImportResponse(BaseModel):
     owner_id_biosample_study_field_created: bool
 
 
+class OwnerBiosampleIdRow(BaseModel):
+    """One row of the owner-id re-identification export.
+
+    Pairs a biosample's stable minted idx and public accession with the
+    owner-submitted original sample name — biosample_metadata.value_text on
+    the row flagged is_owner_biosample_id=True. That value is PII-pinned and
+    masked on the normal biosample read path; this export is the only way to
+    recover it, hence system_admin + admin:biosample_owner_id_read.
+
+    `biosample_accession` is None until the biosample is submitted to NCBI.
+    `owner_biosample_id` is None only when the biosample has no owner-id
+    metadata row at all — surfaced rather than silently dropped.
+
+    The sequencing-pathway fields (prep_sample_idx, ena_experiment_accession,
+    ena_run_accession) are populated only when the export was filtered to a
+    sequenced_pool; they stay None in the study-wide export.
+    """
+
+    biosample_idx: Annotated[int, Field(gt=0)]
+    biosample_accession: str | None
+    owner_biosample_id: str | None
+    prep_sample_idx: Annotated[int | None, Field(gt=0)] = None
+    ena_experiment_accession: str | None = None
+    ena_run_accession: str | None = None
+
+
+class OwnerBiosampleIdExportResponse(BaseModel):
+    """Returned by GET /admin/study/{study_idx}/owner-biosample-id.
+
+    Re-identification export mapping each biosample's idx + public accession
+    back to the owner-submitted original name. When `sequenced_pool_idx` is
+    set, rows are restricted to that pool's sequenced_samples that belong to
+    the study (active prep_sample_to_study links) and carry the prep_sample_idx
+    + ENA experiment/run accessions; otherwise rows cover the study's active
+    biosamples. system_admin + admin:biosample_owner_id_read only.
+    """
+
+    study_idx: Annotated[int, Field(gt=0)]
+    sequenced_pool_idx: Annotated[int | None, Field(gt=0)]
+    row_count: Annotated[int, Field(ge=0)]
+    rows: list[OwnerBiosampleIdRow]
+
+
 # SQL column name on biosample_metadata / prep_sample_metadata that holds
 # an intentionally-missing entry's qiita.missing_value_reason FK. Exposed
 # here so MissingReasonRef.value_column has one source of truth and the

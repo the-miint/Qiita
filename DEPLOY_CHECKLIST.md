@@ -47,6 +47,14 @@ _None yet._
   group-writable by the DP (`qiita-data`) via its existing `qiita-pipeline`
   membership, and read back by `qiita-job` (same group) at mode `0440`, so **no new
   env var, host dir, scope, or group change**. (#187)
+- (#188) New system_admin-only scope `admin:biosample_owner_id_read`, gating the
+  owner-id re-identification export (`GET /admin/study/{study_idx}/owner-biosample-id`
+  + `qiita-admin owner-biosample-id`). Pure-Python scope (no migration); added to the
+  system_admin ceiling in `auth/scopes.py`. **A system_admin's existing PAT does not
+  carry the new scope until re-minted** — after this deploy, a system_admin who needs
+  the export re-runs `qiita-admin login` (or mints a fresh PAT) to obtain a token that
+  includes it; the loopback login grants the full role ceiling, so no scope need be
+  named. No new env var, host dir, migration, or service-account grant.
 
 ---
 

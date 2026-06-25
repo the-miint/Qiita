@@ -310,6 +310,7 @@ All routes require `system_role >= system_admin` AND the appropriate `admin:*` s
 | `/api/v1/admin/principal/{idx}/system-role` | PATCH | Set `system_role`. Audit event records `from`/`to`/`reason`. Requires `admin:user`. |
 | `/api/v1/admin/audit` | GET | List audit events (newest first). Optional filters `principal_idx` and `event_type`; `limit ∈ [1, 1000]`. Requires `admin:audit_read`. |
 | `/api/v1/admin/principal/{idx}/revoke-all-tokens` | POST | Bulk-revoke all the principal's active tokens. Idempotent on already-revoked tokens (counted separately). Emits one `token_revoke` audit event per newly-revoked token. Requires `admin:user`. |
+| `/api/v1/admin/study/{idx}/owner-biosample-id` | GET | Re-identification export: maps the study's `biosample_idx` + `biosample_accession` back to the owner-submitted original name (the PII-pinned `biosample_metadata` value flagged `is_owner_biosample_id`, masked on every other read path). Optional `?sequenced_pool_idx=` restricts to that pool's `sequenced_sample`s in the study and adds `prep_sample_idx` + ENA experiment/run accessions. 404 on unknown study or pool. Requires `admin:biosample_owner_id_read`. |
 
 The system principal (`idx=1`) is rejected by every mutation endpoint above (`disabled`, `retired`, `system-role`) — bare-actor invariant holds at the API layer in addition to the DB CHECK.
 
@@ -334,6 +335,7 @@ Installed as the `qiita-admin` console script via `qiita-control-plane`'s pyproj
 | `actions sync [--workflows-dir DIR]` | direct DB | Loads every action YAML under `--workflows-dir` (default `./workflows`) and upserts the YAML-authoritative columns into `qiita.action` in one transaction. Idempotent — re-runs converge to YAML state without touching operational columns (`enabled` / `first_seen_at` / `disabled_*`). Reads `DATABASE_URL` from env. |
 | `ticket force-fail --idx N --reason R --stage S [--step-name …]` | direct DB | Transitions a non-terminal `work_ticket` to `state=failed` with captured `failure_type` (`permanent`) / `failure_stage` / `failure_step_name` / `failure_reason`. Mirrors the schema CHECK (`--step-name` required iff `--stage=step_run`); refuses already-terminal tickets. Replaces the hand-written `UPDATE qiita.work_ticket` recovery pattern. Reads `DATABASE_URL` from env. |
 | `compute-readiness [--orchestrator-venv …] [--no-slurm-probe] [--json] [--probe-timeout-seconds …]` | subprocess | Subprocess-execs `<venv>/bin/python -m qiita_compute_orchestrator.cli.compute_readiness` to exercise the path `qiita-job` needs and report per-check status (JWT, CP `/healthz`, `SLURM_NATIVE_PYTHON` on host, plus an optional SLURM probe-job). Returns the subprocess exit code verbatim. |
+| `owner-biosample-id --study-idx N [--sequenced-pool-idx P] --output FILE` | HTTP | Calls `GET /api/v1/admin/study/{N}/owner-biosample-id` (forwarding `--sequenced-pool-idx` as a query param) and writes the result as a TSV to `--output` (created mode 0600; the owner names never touch stdout — only a row-count summary does). Requires a PAT carrying `admin:biosample_owner_id_read`. |
 
 ## CLI (`qiita`)
 

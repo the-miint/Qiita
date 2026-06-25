@@ -18,6 +18,7 @@ from qiita_common.api_paths import (
     PATH_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS,
     PATH_ADMIN_PRINCIPAL_SYSTEM_ROLE,
     PATH_ADMIN_SERVICE_ACCOUNT,
+    PATH_ADMIN_STUDY_OWNER_BIOSAMPLE_ID,
 )
 from qiita_common.auth_constants import (
     AUDIT_QUERY_DEFAULT_LIMIT,
@@ -30,6 +31,8 @@ from qiita_common.auth_constants import (
 )
 from qiita_common.models import (
     AuthEventResponse,
+    OwnerBiosampleIdExportResponse,
+    OwnerBiosampleIdRow,
     PrincipalDisabledUpdate,
     PrincipalRetiredUpdate,
     PrincipalSystemRoleUpdate,
@@ -452,4 +455,132 @@ async def revoke_all_principal_tokens(
     return RevokeAllTokensResponse(
         revoked_token_idxs=revoked_idxs,
         already_revoked_count=already_revoked or 0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /admin/study/{study_idx}/owner-biosample-id
+# ---------------------------------------------------------------------------
+
+# Study-wide export: every active biosample link in the study, paired with the
+# owner-submitted original name. Only the per-study link retirement
+# (bts.retired) is filtered — entity-level biosample.retired ("withdrawn
+# everywhere") is intentionally included (see the route docstring). LEFT JOIN
+# on the owner-id metadata row so a biosample missing it surfaces as a NULL
+# owner_biosample_id rather than silently dropping out of the export.
+_OWNER_ID_STUDY_SQL = (
+    "SELECT b.idx AS biosample_idx,"
+    "       b.biosample_accession,"
+    "       m.value_text AS owner_biosample_id"
+    "  FROM qiita.biosample_to_study bts"
+    "  JOIN qiita.biosample b ON b.idx = bts.biosample_idx"
+    "  LEFT JOIN qiita.biosample_metadata m"
+    "    ON m.biosample_idx = b.idx AND m.is_owner_biosample_id = true"
+    " WHERE bts.study_idx = $1"
+    "   AND bts.retired = false"
+    " ORDER BY b.idx"
+)
+
+# Pool-filtered export: the study's sequenced_samples in one pool. Restricting
+# to the study is via the active prep_sample_to_study link, not the biosample
+# link, because a pool's samples are scoped to their prep_sample. Mirrors the
+# study-mode retirement handling: only the per-study link (psts.retired) is
+# filtered; entity-level prep_sample.retired / biosample.retired are
+# intentionally included (see the route docstring). Carries the prep_sample_idx
+# and ENA experiment/run accessions in addition to the biosample columns.
+_OWNER_ID_POOL_SQL = (
+    "SELECT b.idx AS biosample_idx,"
+    "       b.biosample_accession,"
+    "       ss.prep_sample_idx,"
+    "       ss.ena_experiment_accession,"
+    "       ss.ena_run_accession,"
+    "       m.value_text AS owner_biosample_id"
+    "  FROM qiita.sequenced_sample ss"
+    "  JOIN qiita.prep_sample_to_study psts"
+    "    ON psts.prep_sample_idx = ss.prep_sample_idx"
+    "   AND psts.study_idx = $1"
+    "   AND psts.retired = false"
+    "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+    "  JOIN qiita.biosample b ON b.idx = ps.biosample_idx"
+    "  LEFT JOIN qiita.biosample_metadata m"
+    "    ON m.biosample_idx = b.idx AND m.is_owner_biosample_id = true"
+    " WHERE ss.sequenced_pool_idx = $2"
+    " ORDER BY ss.prep_sample_idx"
+)
+
+
+@router.get(PATH_ADMIN_STUDY_OWNER_BIOSAMPLE_ID)
+async def export_owner_biosample_id(
+    study_idx: int,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _role: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_BIOSAMPLE_OWNER_ID_READ)),
+    sequenced_pool_idx: int | None = Query(default=None, gt=0),
+) -> OwnerBiosampleIdExportResponse:
+    """Re-identification export: the owner-submitted original sample names for
+    a study, keyed by minted biosample_idx + public accession.
+
+    The owner name (biosample_metadata.value_text where
+    is_owner_biosample_id=true) is PII-pinned and masked on the normal read
+    path; this route is the only way to recover it, so it is gated by
+    system_admin PLUS admin:biosample_owner_id_read.
+
+    Without sequenced_pool_idx, returns one row per active biosample link in
+    the study. With it, returns the study's sequenced_samples in that pool,
+    adding prep_sample_idx + ENA experiment/run accessions. 404 if the study
+    (or the named pool) does not exist — an empty result for a real study is a
+    valid answer, but a typo'd idx should fail loudly rather than masquerade as
+    "no samples".
+
+    Retirement: both modes filter only the per-study *link* retirement
+    (biosample_to_study.retired in study mode, prep_sample_to_study.retired in
+    pool mode) — i.e. rows the study currently has permission to use.
+    Entity-level retirement (biosample.retired / prep_sample.retired,
+    "withdrawn everywhere") does NOT drop study membership and is deliberately
+    *included*: an admin re-identifying samples for governance (purge, consent
+    reconciliation, notification) needs the withdrawn ones too. The two modes
+    treat retirement identically — each filters its own study-membership link
+    and neither filters the entity-level flag.
+    """
+    if await pool.fetchval("SELECT 1 FROM qiita.study WHERE idx = $1", study_idx) is None:
+        raise HTTPException(status_code=404, detail=f"no study with idx={study_idx}")
+
+    if sequenced_pool_idx is not None:
+        if (
+            await pool.fetchval(
+                "SELECT 1 FROM qiita.sequenced_pool WHERE idx = $1", sequenced_pool_idx
+            )
+            is None
+        ):
+            raise HTTPException(
+                status_code=404, detail=f"no sequenced_pool with idx={sequenced_pool_idx}"
+            )
+        db_rows = await pool.fetch(_OWNER_ID_POOL_SQL, study_idx, sequenced_pool_idx)
+        rows = [
+            OwnerBiosampleIdRow(
+                biosample_idx=r["biosample_idx"],
+                biosample_accession=r["biosample_accession"],
+                owner_biosample_id=r["owner_biosample_id"],
+                prep_sample_idx=r["prep_sample_idx"],
+                ena_experiment_accession=r["ena_experiment_accession"],
+                ena_run_accession=r["ena_run_accession"],
+            )
+            for r in db_rows
+        ]
+    else:
+        db_rows = await pool.fetch(_OWNER_ID_STUDY_SQL, study_idx)
+        rows = [
+            OwnerBiosampleIdRow(
+                biosample_idx=r["biosample_idx"],
+                biosample_accession=r["biosample_accession"],
+                owner_biosample_id=r["owner_biosample_id"],
+            )
+            for r in db_rows
+        ]
+
+    return OwnerBiosampleIdExportResponse(
+        study_idx=study_idx,
+        sequenced_pool_idx=sequenced_pool_idx,
+        row_count=len(rows),
+        rows=rows,
     )

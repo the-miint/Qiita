@@ -13,7 +13,11 @@ argparse wiring on the admin entry point.
 
 import httpx
 import pytest
-from qiita_common.api_paths import URL_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS, URL_AUTH_WHOAMI
+from qiita_common.api_paths import (
+    URL_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS,
+    URL_ADMIN_STUDY_OWNER_BIOSAMPLE_ID,
+    URL_AUTH_WHOAMI,
+)
 from qiita_common.auth_constants import BEARER_PREFIX
 
 
@@ -396,3 +400,184 @@ def test_compute_readiness_propagates_flags(monkeypatch, tmp_path):
     # --probe-timeout-seconds is passed with its value as the next arg.
     idx = captured["cmd"].index("--probe-timeout-seconds")
     assert captured["cmd"][idx + 1] == "120.0"
+
+
+# ---------------------------------------------------------------------------
+# owner-biosample-id export
+# ---------------------------------------------------------------------------
+
+
+def _fake_export_request(captured, body):
+    """Build a fake httpx.request that records the call and returns `body`."""
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["method"] = method
+        captured["url"] = url
+        captured["params"] = params
+        return httpx.Response(200, json=body, request=httpx.Request(method, url))
+
+    return fake_request
+
+
+def test_owner_biosample_id_study_export_writes_tsv(monkeypatch, tmp_path, capsys):
+    """Study-wide export writes the base columns; NULL accession becomes an
+    empty cell, the file is 0600, and owner names never reach stdout."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    captured: dict = {}
+    body = {
+        "study_idx": 7,
+        "sequenced_pool_idx": None,
+        "row_count": 2,
+        "rows": [
+            {
+                "biosample_idx": 100,
+                "biosample_accession": "SAMN1",
+                "owner_biosample_id": "OWNER-A",
+                "prep_sample_idx": None,
+                "ena_experiment_accession": None,
+                "ena_run_accession": None,
+            },
+            {
+                "biosample_idx": 101,
+                "biosample_accession": None,
+                "owner_biosample_id": "OWNER-B",
+                "prep_sample_idx": None,
+                "ena_experiment_accession": None,
+                "ena_run_accession": None,
+            },
+        ],
+    }
+    monkeypatch.setattr(_common.httpx, "request", _fake_export_request(captured, body))
+
+    out = tmp_path / "owner.tsv"
+    rc = cli.main(["owner-biosample-id", "--study-idx", "7", "--output", str(out)])
+    assert rc == 0
+    assert captured["method"] == "GET"
+    assert captured["url"].endswith(URL_ADMIN_STUDY_OWNER_BIOSAMPLE_ID.format(study_idx=7))
+    assert captured["params"] is None  # no pool filter
+
+    lines = out.read_text().splitlines()
+    assert lines[0] == "biosample_idx\tbiosample_accession\towner_biosample_id"
+    assert lines[1] == "100\tSAMN1\tOWNER-A"
+    assert lines[2] == "101\t\tOWNER-B"  # NULL accession -> empty cell
+    assert (out.stat().st_mode & 0o777) == 0o600
+
+    captured_io = capsys.readouterr()
+    assert "wrote 2 rows" in captured_io.out
+    # The PII owner names go to the file only, never to stdout.
+    assert "OWNER-A" not in captured_io.out
+
+
+def test_owner_biosample_id_pool_filter_writes_pathway_columns(monkeypatch, tmp_path):
+    """With --sequenced-pool-idx the pool filter is sent as a query param and
+    the TSV carries the prep_sample_idx + ENA accession columns."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    captured: dict = {}
+    body = {
+        "study_idx": 7,
+        "sequenced_pool_idx": 5,
+        "row_count": 1,
+        "rows": [
+            {
+                "biosample_idx": 100,
+                "biosample_accession": "SAMN1",
+                "owner_biosample_id": "OWNER-A",
+                "prep_sample_idx": 200,
+                "ena_experiment_accession": "ERX1",
+                "ena_run_accession": "ERR1",
+            }
+        ],
+    }
+    monkeypatch.setattr(_common.httpx, "request", _fake_export_request(captured, body))
+
+    out = tmp_path / "owner-pool.tsv"
+    rc = cli.main(
+        [
+            "owner-biosample-id",
+            "--study-idx",
+            "7",
+            "--sequenced-pool-idx",
+            "5",
+            "--output",
+            str(out),
+        ]
+    )
+    assert rc == 0
+    assert captured["params"] == {"sequenced_pool_idx": 5}
+
+    lines = out.read_text().splitlines()
+    assert lines[0] == (
+        "biosample_idx\tbiosample_accession\tprep_sample_idx"
+        "\tena_experiment_accession\tena_run_accession\towner_biosample_id"
+    )
+    assert lines[1] == "100\tSAMN1\t200\tERX1\tERR1\tOWNER-A"
+    assert (out.stat().st_mode & 0o777) == 0o600
+
+
+def test_owner_biosample_id_missing_output_dir_fails_clean(monkeypatch, tmp_path, capsys):
+    """A nonexistent --output directory is rejected up front (exit 2, clean
+    message) BEFORE any HTTP call, so the PII export is never even fetched."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    called = {"http": False}
+
+    def fake_request(*a, **k):
+        called["http"] = True
+        raise AssertionError("HTTP must not be called when the --output dir is missing")
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    missing = tmp_path / "nope" / "out.tsv"
+    rc = cli.main(["owner-biosample-id", "--study-idx", "7", "--output", str(missing)])
+    assert rc == 2
+    assert "output directory does not exist" in capsys.readouterr().err
+    assert not called["http"]
+    assert not missing.exists()
+
+
+def test_owner_biosample_id_write_failure_preserves_existing_file(monkeypatch, tmp_path, capsys):
+    """If the atomic rename fails mid-write, the pre-existing export is left
+    intact (no truncation), no stray temp file remains, and the command exits 1
+    with a clean message rather than a traceback."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    captured: dict = {}
+    body = {
+        "study_idx": 7,
+        "sequenced_pool_idx": None,
+        "row_count": 1,
+        "rows": [
+            {
+                "biosample_idx": 1,
+                "biosample_accession": "S",
+                "owner_biosample_id": "O",
+                "prep_sample_idx": None,
+                "ena_experiment_accession": None,
+                "ena_run_accession": None,
+            }
+        ],
+    }
+    monkeypatch.setattr(_common.httpx, "request", _fake_export_request(captured, body))
+
+    out = tmp_path / "owner.tsv"
+    out.write_text("OLD CONTENT\n")
+
+    def boom(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cli.os, "replace", boom)
+    rc = cli.main(["owner-biosample-id", "--study-idx", "7", "--output", str(out)])
+    assert rc == 1
+    assert "could not write" in capsys.readouterr().err
+    assert out.read_text() == "OLD CONTENT\n"  # untouched
+    leftovers = sorted(p.name for p in tmp_path.iterdir() if p.name != "owner.tsv")
+    assert leftovers == [], f"stray temp files left behind: {leftovers}"

@@ -106,6 +106,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_ADMIN_PREFIX",
         "PATH_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS",
     ),
+    (
+        "URL_ADMIN_STUDY_OWNER_BIOSAMPLE_ID",
+        "PATH_ADMIN_PREFIX",
+        "PATH_ADMIN_STUDY_OWNER_BIOSAMPLE_ID",
+    ),
     # /user
     ("URL_USER_ME", "PATH_USER_PREFIX", "PATH_USER_ME"),
     # /study
