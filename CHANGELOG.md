@@ -15,6 +15,39 @@ the `no-changelog` label).
 
 ### Added
 
+- A `delete_mask` primitive for removing a registered read mask. New
+  `mask_definition:delete` scope (system_admin via the role ceiling),
+  `DELETE /api/v1/mask-definition/{mask_idx}` route (lake-first: a new
+  `delete_mask` data-plane DoAction logically `DELETE`s the mask's rows from the
+  DuckLake `read_mask` table, then the `mask_definition` Postgres row is removed),
+  and a `delete_mask_data` CP client. Idempotent (0 rows deleted is success); no
+  raw parquet unlink (mirrors `delete_reference`); 404 on an absent mask. Surfaced
+  as `qiita-admin mask delete <mask_idx>`. (#181)
+- `qiita-admin mask purge-failed --action {read-mask,fastq-to-parquet,all}` — bulk
+  recovery tooling that selects FAILED read-mask / fastq-to-parquet tickets stranded
+  by the move-then-read ordering bug, deletes each ticket's orphaned mask, and
+  resubmits it clean on the reordered workflow (so the re-run mints a fresh
+  `mask_idx` rather than appending a duplicate to the append-only `read_mask`
+  table). Dry-run by default; `--execute` to act, `--with-tickets` to also delete
+  the FAILED ticket rows, `--limit` / `--rate` / `--wait` to bound and throttle the
+  batch. A shared-mask guard refuses to delete a mask referenced by any non-FAILED
+  ticket, and a pre-flight refuses to run if the `work_ticket.mask_idx` backfill is
+  incomplete. (#181)
+- `qiita-admin work-ticket backfill-mask-idx [--apply]` — one-time idempotent
+  backfill that populates the new `work_ticket.mask_idx` column for existing
+  read-mask / fastq-to-parquet tickets by recomputing the mask params hash and
+  looking it up in `mask_definition` (no new mask minted). For adapter-bearing
+  tickets it re-materializes the canonical adapter set via DoGet to reproduce the
+  hash, so it needs `DATABASE_URL`, `QIITA_DEFAULT_ADAPTER_REFERENCE_IDX`,
+  `HMAC_SECRET_KEY`, and a reachable `DATA_PLANE_URL`; the dry-run reports
+  `populated` so the operator can confirm `populated > 0` before `--apply`. (#181)
+- New nullable `work_ticket.mask_idx` column (FK → `mask_definition`, ON DELETE SET
+  NULL, partial index) recording the mask a read-mask / fastq-to-parquet ticket
+  produced, for durable traceability and a cheap shared-mask guard. The runner
+  writes it at mint time; existing rows are populated by the
+  `backfill-mask-idx` command above (migration
+  `20260624110000_work_ticket_mask_idx.sql`; additive, backfill-free at migrate
+  time — existing rows read NULL). (#181)
 - A first-class terminal `no_data` outcome for empty FASTQ wells, distinct from
   failure, so a real plate full of blank / no-template-control / failed-yield
   wells can still reach a "done" signal. New `WorkTicketState.NO_DATA` enum value
