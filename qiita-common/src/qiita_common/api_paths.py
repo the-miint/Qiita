@@ -301,6 +301,13 @@ PATH_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS = "/principal/{principal_idx}/revoke-all-
 # Re-identification export: owner-submitted sample names for a study (optionally
 # filtered to one sequenced_pool via ?sequenced_pool_idx=). system_admin only.
 PATH_ADMIN_STUDY_OWNER_BIOSAMPLE_ID = "/study/{study_idx}/owner-biosample-id"
+# Masked-read export (system_admin only): the manifest GET lists a
+# sequenced_pool's non-retired samples to export under ?mask_idx=; the ticket
+# POST mints a per-sample DoGet ticket on the data plane's read_masked view.
+PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT = (
+    "/sequenced-pool/{sequenced_pool_idx}/masked-read-export"
+)
+PATH_ADMIN_MASKED_READ_EXPORT_TICKET = "/masked-read-export/ticket"
 
 URL_ADMIN_PREFIX = f"{API_PREFIX}{PATH_ADMIN_PREFIX}"
 URL_ADMIN_SERVICE_ACCOUNT = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_SERVICE_ACCOUNT}"
@@ -312,6 +319,10 @@ URL_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS = (
     f"{URL_ADMIN_PREFIX}{PATH_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS}"
 )
 URL_ADMIN_STUDY_OWNER_BIOSAMPLE_ID = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_STUDY_OWNER_BIOSAMPLE_ID}"
+URL_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT = (
+    f"{URL_ADMIN_PREFIX}{PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT}"
+)
+URL_ADMIN_MASKED_READ_EXPORT_TICKET = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_MASKED_READ_EXPORT_TICKET}"
 
 
 # =============================================================================

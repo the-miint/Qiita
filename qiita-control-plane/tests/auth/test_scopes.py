@@ -152,6 +152,25 @@ def test_mask_definition_delete_is_system_admin_only():
     assert Scope.MASK_DEFINITION_DELETE not in SERVICE_ACCOUNT_SCOPE_CEILING
 
 
+def test_masked_read_export_is_system_admin_only():
+    """admin:masked_read_export gates the admin per-pool masked-read export
+    (the manifest + per-sample DoGet ticket the qiita-admin masked-read-export
+    CLI drives). system_admin only — wet_lab_admin and user don't get it, and it
+    is NOT on the service-account ceiling. The pre-existing service-account
+    read_masked:doget path is separate and untouched; this is the first *human*
+    masked-read pull, and it is admin-gated until there's a model for selecting
+    the correct mask automatically."""
+    from qiita_control_plane.auth.scopes import (
+        ROLE_IMPLIED_SCOPES,
+        SERVICE_ACCOUNT_SCOPE_CEILING,
+    )
+
+    assert Scope.ADMIN_MASKED_READ_EXPORT in ROLE_IMPLIED_SCOPES[SystemRole.SYSTEM_ADMIN]
+    assert Scope.ADMIN_MASKED_READ_EXPORT not in ROLE_IMPLIED_SCOPES[SystemRole.WET_LAB_ADMIN]
+    assert Scope.ADMIN_MASKED_READ_EXPORT not in ROLE_IMPLIED_SCOPES[SystemRole.USER]
+    assert Scope.ADMIN_MASKED_READ_EXPORT not in SERVICE_ACCOUNT_SCOPE_CEILING
+
+
 def test_reject_scopes_outside_ceiling():
     from qiita_control_plane.auth.scopes import (
         ROLE_IMPLIED_SCOPES,

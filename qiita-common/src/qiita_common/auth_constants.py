@@ -102,6 +102,14 @@ class Scope(StrEnum):
     # system_admin in ROLE_IMPLIED_SCOPES; never wet_lab_admin or service
     # accounts.
     ADMIN_BIOSAMPLE_OWNER_ID_READ = "admin:biosample_owner_id_read"
+    # Admin per-pool masked-read export: list a sequenced_pool's samples and mint
+    # per-sample DoGet tickets on the data plane's read_masked view, so an admin
+    # can download masked sequence data locally. This is the first *human*
+    # masked-read pull — distinct from the service-account READ_MASKED_DOGET path
+    # (which is untouched). Admin-gated until there's a model for auto-selecting
+    # the correct mask; granted solely to system_admin in ROLE_IMPLIED_SCOPES,
+    # never wet_lab_admin or service accounts.
+    ADMIN_MASKED_READ_EXPORT = "admin:masked_read_export"
 
     # Self-service (humans only)
     SELF_PROFILE = "self:profile"

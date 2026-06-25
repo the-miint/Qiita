@@ -111,6 +111,16 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_ADMIN_PREFIX",
         "PATH_ADMIN_STUDY_OWNER_BIOSAMPLE_ID",
     ),
+    (
+        "URL_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT",
+        "PATH_ADMIN_PREFIX",
+        "PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT",
+    ),
+    (
+        "URL_ADMIN_MASKED_READ_EXPORT_TICKET",
+        "PATH_ADMIN_PREFIX",
+        "PATH_ADMIN_MASKED_READ_EXPORT_TICKET",
+    ),
     # /user
     ("URL_USER_ME", "PATH_USER_PREFIX", "PATH_USER_ME"),
     # /study
