@@ -37,6 +37,14 @@ _None yet._
 
 ### Notes (no host action)
 
+- (#TBD) New system_admin-only scope `admin:biosample_owner_id_read`, gating the
+  owner-id re-identification export (`GET /admin/study/{study_idx}/owner-biosample-id`
+  + `qiita-admin owner-biosample-id`). Pure-Python scope (no migration); added to the
+  system_admin ceiling in `auth/scopes.py`. **A system_admin's existing PAT does not
+  carry the new scope until re-minted** — after this deploy, a system_admin who needs
+  the export re-runs `qiita-admin login` (or mints a fresh PAT) to obtain a token that
+  includes it; the loopback login grants the full role ceiling, so no scope need be
+  named. No new env var, host dir, migration, or service-account grant.
 - (#140) `stage_local_fasta` resource retune in `local-host-reference-add/1.0.0`
   (`cpu: 8`/`mem_gb: 32` → `cpu: 4`/`mem_gb: 64`; still within the `cpu: 16`/`mem_gb: 64`
   ceiling). The `workflows/local-host-reference-add/1.0.0.yaml` entry is **edited in

@@ -78,6 +78,9 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             Scope.ADMIN_USER,
             Scope.ADMIN_SERVICE_ACCOUNT,
             Scope.ADMIN_AUDIT_READ,
+            # Owner-id re-identification export is system_admin-only — the
+            # owner-submitted names are PII-pinned and masked elsewhere.
+            Scope.ADMIN_BIOSAMPLE_OWNER_ID_READ,
             Scope.TICKET_DOPUT,
         }
     ),

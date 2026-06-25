@@ -81,6 +81,14 @@ class Scope(StrEnum):
     ADMIN_USER = "admin:user"
     ADMIN_SERVICE_ACCOUNT = "admin:service_account"
     ADMIN_AUDIT_READ = "admin:audit_read"
+    # Re-identification read: dump the owner-submitted original sample names
+    # (biosample_metadata where is_owner_biosample_id=true) keyed by minted
+    # idx + public accession. That value is PII-pinned and masked on the
+    # normal biosample:read path, so exporting it gets its own system_admin-only
+    # scope rather than overloading biosample:read. Granted solely to
+    # system_admin in ROLE_IMPLIED_SCOPES; never wet_lab_admin or service
+    # accounts.
+    ADMIN_BIOSAMPLE_OWNER_ID_READ = "admin:biosample_owner_id_read"
 
     # Self-service (humans only)
     SELF_PROFILE = "self:profile"

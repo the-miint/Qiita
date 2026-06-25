@@ -246,6 +246,9 @@ PATH_ADMIN_PRINCIPAL_RETIRED = "/principal/{principal_idx}/retired"
 PATH_ADMIN_PRINCIPAL_SYSTEM_ROLE = "/principal/{principal_idx}/system-role"
 PATH_ADMIN_AUDIT = "/audit"
 PATH_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS = "/principal/{principal_idx}/revoke-all-tokens"
+# Re-identification export: owner-submitted sample names for a study (optionally
+# filtered to one sequenced_pool via ?sequenced_pool_idx=). system_admin only.
+PATH_ADMIN_STUDY_OWNER_BIOSAMPLE_ID = "/study/{study_idx}/owner-biosample-id"
 
 URL_ADMIN_PREFIX = f"{API_PREFIX}{PATH_ADMIN_PREFIX}"
 URL_ADMIN_SERVICE_ACCOUNT = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_SERVICE_ACCOUNT}"
@@ -256,6 +259,7 @@ URL_ADMIN_AUDIT = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_AUDIT}"
 URL_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS = (
     f"{URL_ADMIN_PREFIX}{PATH_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS}"
 )
+URL_ADMIN_STUDY_OWNER_BIOSAMPLE_ID = f"{URL_ADMIN_PREFIX}{PATH_ADMIN_STUDY_OWNER_BIOSAMPLE_ID}"
 
 
 # =============================================================================

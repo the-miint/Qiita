@@ -55,17 +55,13 @@ def test_service_account_ceiling_is_in_valid_scopes():
 
 
 def test_service_account_ceiling_does_not_include_admin_or_self_scopes():
-    """Workers don't get admin or self-service scopes."""
+    """Workers don't get admin or self-service scopes. Checked by prefix so any
+    newly-added `admin:*` / `self:*` scope can't silently slip into the
+    service-account ceiling without tripping this test."""
     from qiita_control_plane.auth.scopes import SERVICE_ACCOUNT_SCOPE_CEILING
 
-    forbidden = {
-        Scope.ADMIN_USER,
-        Scope.ADMIN_SERVICE_ACCOUNT,
-        Scope.ADMIN_AUDIT_READ,
-        Scope.SELF_PROFILE,
-        Scope.SELF_TOKEN,
-    }
-    assert SERVICE_ACCOUNT_SCOPE_CEILING.isdisjoint(forbidden)
+    leaked = [s for s in SERVICE_ACCOUNT_SCOPE_CEILING if s.value.startswith(("admin:", "self:"))]
+    assert not leaked, f"service-account ceiling must not carry admin/self scopes: {leaked}"
 
 
 def test_role_ceiling_helper_returns_correct_set():

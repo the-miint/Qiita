@@ -110,6 +110,7 @@ async def human_admin_session(postgres_pool):
             Scope.ADMIN_USER,
             Scope.ADMIN_SERVICE_ACCOUNT,
             Scope.ADMIN_AUDIT_READ,
+            Scope.ADMIN_BIOSAMPLE_OWNER_ID_READ,
             Scope.TICKET_DOPUT,
         ],
     )
