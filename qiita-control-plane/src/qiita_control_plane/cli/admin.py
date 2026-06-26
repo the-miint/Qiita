@@ -101,8 +101,10 @@ import asyncio
 import base64
 import contextlib
 import csv
+import itertools
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -113,7 +115,9 @@ import asyncpg
 import httpx
 from pydantic import ValidationError
 from qiita_common.api_paths import (
+    PATH_ADMIN_MASKED_READ_EXPORT_TICKET,
     PATH_ADMIN_PREFIX,
+    PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT,
     PATH_ADMIN_STUDY_OWNER_BIOSAMPLE_ID,
     PATH_MASK_DEFINITION_PREFIX,
     PATH_WORK_TICKET_PREFIX,
@@ -126,6 +130,7 @@ from qiita_control_plane.actions import (
     load_actions,
     sync_actions,
 )
+from qiita_control_plane.miint import connect_with_miint
 from qiita_control_plane.runner import backfill_work_ticket_mask_idx
 
 from . import _common
@@ -1051,6 +1056,55 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_owner_id.set_defaults(handler=_handle_owner_biosample_id)
 
+    p_export = sub.add_parser(
+        "masked-read-export",
+        help=(
+            "Export masked sequence data for every sample on a sequenced_pool"
+            " (system_admin only). Streams each sample's masked reads from the"
+            " data plane and writes per-sample files named"
+            " <biosample_accession>.<run>.<pool>.<prep>[.R1/.R2].<parquet|fastq>"
+            " (paired fastq splits into R1/R2)."
+        ),
+    )
+    p_export.add_argument(
+        "--sequenced-pool-idx",
+        required=True,
+        type=int,
+        dest="sequenced_pool_idx",
+        help="sequenced_pool to export every (non-retired) sample of (required).",
+    )
+    p_export.add_argument(
+        "--mask-idx",
+        required=True,
+        type=int,
+        dest="mask_idx",
+        help="mask_idx identifying which masked reads to export (required).",
+    )
+    p_export.add_argument(
+        "--format",
+        choices=("parquet", "fastq"),
+        default="parquet",
+        help=(
+            "Output format. parquet → one <stem>.parquet per sample; fastq →"
+            " one <stem>.fastq for a single-end sample, or split"
+            " <stem>.R1.fastq + <stem>.R2.fastq for a paired sample."
+        ),
+    )
+    p_export.add_argument(
+        "--output-dir",
+        required=True,
+        type=Path,
+        dest="output_dir",
+        help="Existing directory to write per-sample files into (created mode 0600).",
+    )
+    p_export.add_argument(
+        "--data-plane-url",
+        required=True,
+        dest="data_plane_url",
+        help="gRPC URL of the data plane (e.g. grpc://qiita-data.example.com:50051).",
+    )
+    p_export.set_defaults(handler=_handle_masked_read_export)
+
     p_readiness = sub.add_parser(
         "compute-readiness",
         help=(
@@ -1165,6 +1219,226 @@ def _handle_owner_biosample_id(args: argparse.Namespace, parser: argparse.Argume
         print(f"error: could not write {output}: {exc}", file=sys.stderr)
         return 1
     print(f"wrote {n} rows to {output}")
+    return 0
+
+
+# Conservative accession charset: the accession is the leading filename
+# component AND (via the output path) is interpolated into the DuckDB COPY SQL,
+# so reject anything outside [A-Za-z0-9._-] — that excludes '/' (path traversal)
+# and "'" (SQL-string break). ENA/NCBI accessions are alphanumeric in practice.
+_SAFE_ACCESSION = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _sql_str(path: Path) -> str:
+    """Escape a filesystem path for inlining as a DuckDB SQL string literal."""
+    return str(path).replace("'", "''")
+
+
+# The read_masked view's columns, in the verbatim order the miint FORMAT FASTQ
+# writer requires (read_id, sequence1, qual1, sequence2, qual2). Projected by the
+# fastq COPY; aliasing any of these away raises a BinderException (pinned by the
+# orchestrator's masked-export fastq contract test).
+_READ_MASKED_COLUMNS = "read_id, sequence1, qual1, sequence2, qual2"
+
+
+def _commit_partials(copy_fn, pairs: list[tuple[Path, Path]]) -> None:
+    """Run `copy_fn` (which COPYs the masked rows into each pair's `.partial`),
+    then move each partial into place. Each partial is chmod 0600 *before* the
+    rename — the reads are privacy-masked sequence data, so the file is never
+    visible at its final name under a looser umask, even for an instant.
+
+    All-or-nothing across the pair: on any failure (COPY error, or a rename/chmod
+    failing partway through a paired R1+R2 commit) every partial AND every
+    already-committed final is removed, so a retry never finds a half-written
+    file or a lone R1 without its R2. The partial paths are known up front so a
+    failure *inside* the COPY (which may have already created some partials) is
+    cleaned up too."""
+    committed: list[Path] = []
+    try:
+        copy_fn()
+        for partial, final in pairs:
+            partial.chmod(0o600)
+            os.replace(partial, final)
+            committed.append(final)
+    except BaseException:
+        for partial, _ in pairs:
+            with contextlib.suppress(FileNotFoundError):
+                partial.unlink()
+        for final in committed:
+            with contextlib.suppress(FileNotFoundError):
+                final.unlink()
+        raise
+
+
+def _peek_paired(reader):
+    """Decide single-end vs paired from the Arrow `reader` WITHOUT draining it.
+
+    A prep_sample is uniformly single- or paired-end — the mask filter drops
+    reads but never changes R1/R2 layout — so the first non-empty batch is
+    representative. Read leading batches until one carries rows, read pairing off
+    that batch's `sequence2` null-ness, then return `(paired, stream)` where
+    `stream` re-prepends the peeked batches in front of the still-unconsumed tail.
+    This lets the fastq COPY stream straight through (bounded to one batch) rather
+    than materializing the whole sample just to choose its output target. An empty
+    stream (no rows at all) reports single-end."""
+    import pyarrow as pa  # noqa: PLC0415
+
+    schema = reader.schema
+    sequence2_idx = schema.get_field_index("sequence2")
+    peeked: list = []
+    paired = False
+    for batch in reader:
+        peeked.append(batch)
+        if batch.num_rows:
+            paired = batch.column(sequence2_idx).null_count < batch.num_rows
+            break
+    stream = pa.RecordBatchReader.from_batches(schema, itertools.chain(peeked, reader))
+    return paired, stream
+
+
+def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str) -> None:
+    """Write one sample's streamed masked reads under output_dir, atomically (via
+    a `.partial` sibling renamed into place) and chmod 0600.
+
+    Both formats stream the Arrow `reader` straight through one `DuckDB → COPY`
+    (bounded memory, no full materialization). The connection carries miint
+    (needed for the FORMAT FASTQ writer; harmless for parquet):
+
+      parquet — `COPY masked TO …` into one `<stem>.parquet`.
+      fastq   — the manifest carries no paired flag, so pairing is read from the
+                data (`sequence2` null-ness) by peeking the first batch
+                (`_peek_paired`), without draining the single-pass reader. A
+                single-end sample → one `<stem>.fastq`; a paired sample →
+                `<stem>.R1.fastq` + `<stem>.R2.fastq` via miint's `{ORIENTATION}`
+                placeholder (paired rows into a single path are a hard error in
+                the writer; should the per-sample SE/PE uniformity ever break, a
+                misdetected single-end COPY hits that error and fails loudly)."""
+    con = connect_with_miint()
+    try:
+        if fmt == "parquet":
+            con.register("masked", reader)
+            partial = output_dir / f"{stem}.parquet.partial"
+            _commit_partials(
+                lambda: con.execute(
+                    f"COPY masked TO '{_sql_str(partial)}' (FORMAT PARQUET, COMPRESSION ZSTD)"
+                ),
+                [(partial, output_dir / f"{stem}.parquet")],
+            )
+        elif fmt == "fastq":
+            paired, stream = _peek_paired(reader)
+            con.register("masked", stream)
+            if paired:
+                # `{ORIENTATION}` expands to R1/R2, so the one COPY emits both
+                # `<stem>.R1.fastq.partial` and `<stem>.R2.fastq.partial`.
+                target = output_dir / f"{stem}.{{ORIENTATION}}.fastq.partial"
+                pairs = [
+                    (output_dir / f"{stem}.{o}.fastq.partial", output_dir / f"{stem}.{o}.fastq")
+                    for o in ("R1", "R2")
+                ]
+            else:
+                target = output_dir / f"{stem}.fastq.partial"
+                pairs = [(target, output_dir / f"{stem}.fastq")]
+            _commit_partials(
+                lambda: con.execute(
+                    f"COPY (SELECT {_READ_MASKED_COLUMNS} FROM masked) "
+                    f"TO '{_sql_str(target)}' (FORMAT FASTQ)"
+                ),
+                pairs,
+            )
+        else:
+            raise ValueError(f"unsupported export format: {fmt!r}")
+    finally:
+        con.close()
+
+
+def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Export every (non-retired) sample on a sequenced_pool's masked reads to
+    per-sample files. system_admin only (admin:masked_read_export).
+
+    GETs the roster manifest, then for each sample mints a just-in-time DoGet
+    ticket and streams its read_masked rows from the data plane straight into a
+    local DuckDB COPY — so a large pool never buffers in memory or on an
+    intermediate disk hop. Per-sample writes are atomic and 0600.
+
+    Fails loudly (exit 1, nothing written) if any sample lacks a usable
+    biosample_accession (missing — not yet NCBI-submitted — or outside the safe
+    charset), since the filename requires it; validated up front so one odd
+    sample can't leave a partial export.
+    """
+    import pyarrow.flight as flight  # noqa: PLC0415
+
+    output_dir: Path = args.output_dir
+    if not output_dir.is_dir():
+        print(f"error: output directory does not exist: {output_dir}", file=sys.stderr)
+        return 2
+
+    try:
+        token = _common.read_token()
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    manifest_path = (
+        f"{PATH_ADMIN_PREFIX}"
+        f"{PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT.format(sequenced_pool_idx=args.sequenced_pool_idx)}"
+    )
+    ticket_path = f"{PATH_ADMIN_PREFIX}{PATH_ADMIN_MASKED_READ_EXPORT_TICKET}"
+    try:
+        manifest = _common.call(
+            "GET", args.base_url, token, manifest_path, params={"mask_idx": args.mask_idx}
+        )
+    except httpx.HTTPStatusError as exc:
+        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        return 1
+
+    samples = manifest["samples"]
+    run_idx = manifest["sequencing_run_idx"]
+    pool_idx = manifest["sequenced_pool_idx"]
+    if not samples:
+        print(
+            f"no samples on sequenced_pool {pool_idx} for mask_idx {args.mask_idx}; "
+            "nothing to export"
+        )
+        return 0
+
+    # Validate every accession up front so an unsubmitted/odd sample fails the
+    # whole export before any download — never a partial output set.
+    bad = sorted(
+        s["prep_sample_idx"]
+        for s in samples
+        if not s["biosample_accession"] or not _SAFE_ACCESSION.match(s["biosample_accession"])
+    )
+    if bad:
+        print(
+            f"error: {len(bad)} sample(s) on sequenced_pool {pool_idx} have no usable "
+            f"biosample_accession (missing or outside [A-Za-z0-9._-]): prep_sample_idx {bad}. "
+            "The export filename requires the accession — submit/repair these samples first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    flight_client = flight.FlightClient(args.data_plane_url)
+    try:
+        for s in samples:
+            prep = s["prep_sample_idx"]
+            ticket_resp = _common.call(
+                "POST",
+                args.base_url,
+                token,
+                ticket_path,
+                json={"prep_sample_idx": prep, "mask_idx": args.mask_idx},
+            )
+            ticket_bytes = base64.b64decode(ticket_resp["ticket"])
+            reader = flight_client.do_get(flight.Ticket(ticket_bytes)).to_reader()
+            stem = f"{s['biosample_accession']}.{run_idx}.{pool_idx}.{prep}"
+            _write_masked_sample(reader, stem, output_dir, args.format)
+    except httpx.HTTPStatusError as exc:
+        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        return 1
+    finally:
+        flight_client.close()
+
+    print(f"exported {len(samples)} sample(s) from sequenced_pool {pool_idx} to {output_dir}")
     return 0
 
 

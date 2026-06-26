@@ -85,6 +85,10 @@ ROLE_IMPLIED_SCOPES: Mapping[SystemRole, frozenset[Scope]] = {
             # Owner-id re-identification export is system_admin-only — the
             # owner-submitted names are PII-pinned and masked elsewhere.
             Scope.ADMIN_BIOSAMPLE_OWNER_ID_READ,
+            # Per-pool masked-read export is system_admin-only — the first human
+            # masked-read pull, admin-gated until there's a model for picking the
+            # right mask. Service accounts use READ_MASKED_DOGET, not this.
+            Scope.ADMIN_MASKED_READ_EXPORT,
             Scope.TICKET_DOPUT,
         }
     ),

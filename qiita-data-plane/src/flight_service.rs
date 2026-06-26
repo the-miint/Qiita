@@ -12,8 +12,10 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
+use arrow_array::RecordBatch;
 use arrow_flight::decode::{DecodedPayload, FlightDataDecoder};
 use arrow_flight::encode::FlightDataEncoderBuilder;
+use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_server::FlightService;
 use arrow_flight::{
     Action, ActionType, Criteria, FlightData, FlightDescriptor, FlightInfo, HandshakeRequest,
@@ -25,6 +27,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{WriterProperties, WriterVersion};
 use sha2::{Digest, Sha256};
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth;
@@ -66,16 +69,91 @@ impl QiitaFlightService {
             scratch_root,
         }
     }
+}
 
-    /// Open a fresh DuckDB connection with DuckLake attached.
-    /// Each request gets its own connection — no shared state.
-    fn open_ducklake_conn(&self) -> Result<Connection, Status> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
-        ducklake::connect_ducklake(&conn, &self.catalog_connstr, &self.data_path)
-            .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
-        Ok(conn)
-    }
+/// Open a fresh in-memory DuckDB connection with DuckLake attached. Each
+/// request gets its own connection — no shared state. A free function (not a
+/// method) so the DoGet streaming task can open the connection on its own
+/// blocking thread from owned connstr/data_path, without borrowing `self`.
+fn open_ducklake(catalog_connstr: &str, data_path: &str) -> Result<Connection, Status> {
+    let conn = Connection::open_in_memory()
+        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
+    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
+        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
+    Ok(conn)
+}
+
+/// Bounded depth of the DoGet batch channel. Backpressure: the blocking producer
+/// parks on `blocking_send` when the channel is full until the async consumer
+/// drains it, so peak memory is ~this many RecordBatches in flight rather than
+/// the whole result set.
+const DOGET_BATCH_CHANNEL_DEPTH: usize = 4;
+
+/// Stream a DuckLake query's RecordBatches over a bounded channel.
+///
+/// `query_arrow` yields an iterator that borrows the `Statement`, which borrows
+/// the `Connection`; the `DoGetStream` we return must be `'static`, so the
+/// DuckDB iterator cannot be streamed directly. Instead a blocking task owns the
+/// connection for the query's lifetime and pushes each `RecordBatch` into a
+/// bounded channel, and the returned stream drains the receiver. This replaces
+/// the old `.collect()` that buffered the entire result set in memory; peak
+/// memory is now bounded by `DOGET_BATCH_CHANNEL_DEPTH` (see above).
+///
+/// A zero-row result still emits one empty `RecordBatch` carrying the schema, so
+/// the client always receives a valid (possibly empty) Arrow table — the same
+/// contract the buffered path had. A connect/prepare/execute error surfaces as a
+/// single `Err` item, never a silently-truncated empty stream.
+///
+/// Caveat (pre-existing, shared with the old `.collect()` path): the DuckDB
+/// Arrow iterator's `Item` is a bare `RecordBatch`, not a `Result`, so a failure
+/// that occurs *mid-iteration* (after at least one batch has been sent) cannot
+/// be surfaced — the iterator just terminates early and the consumer sees a
+/// clean EOF after partial data. Only connect/prepare/execute errors (before the
+/// first batch) become an `Err` item.
+fn stream_ducklake_batches(
+    catalog_connstr: String,
+    data_path: String,
+    sql: String,
+    table: String,
+) -> ReceiverStream<Result<RecordBatch, FlightError>> {
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<Result<RecordBatch, FlightError>>(DOGET_BATCH_CHANNEL_DEPTH);
+    // JoinHandle dropped intentionally: the blocking task runs to completion
+    // independently, draining into `tx`. Don't `.await`/`.join()` it — the
+    // result is delivered through the channel, not the handle.
+    tokio::task::spawn_blocking(move || {
+        let produce = || -> Result<(), Status> {
+            let conn = open_ducklake(&catalog_connstr, &data_path)?;
+            let mut stmt = conn.prepare(&sql).map_err(|e| {
+                Status::internal(format!("query preparation failed for {table}: {e}"))
+            })?;
+            let arrow_result = stmt.query_arrow([]).map_err(|e| {
+                Status::internal(format!("query execution failed for {table}: {e}"))
+            })?;
+            let schema = arrow_result.get_schema();
+            let mut produced = false;
+            for batch in arrow_result {
+                produced = true;
+                // Receiver dropped (client hung up) — stop early, don't error.
+                if tx.blocking_send(Ok(batch)).is_err() {
+                    return Ok(());
+                }
+            }
+            if !produced {
+                // Preserve the schema for a zero-row result.
+                let _ = tx.blocking_send(Ok(RecordBatch::new_empty(schema)));
+            }
+            Ok(())
+        };
+        if let Err(status) = produce() {
+            // Surface the producer error as a stream item (ignore send failure —
+            // the consumer is already gone).
+            let _ = tx.blocking_send(Err(FlightError::ExternalError(Box::new(
+                std::io::Error::other(status.message().to_string()),
+            ))));
+        }
+    });
+    ReceiverStream::new(rx)
 }
 
 /// Canonical staging path for an upload — single source of truth shared by
@@ -148,36 +226,22 @@ impl FlightService for QiitaFlightService {
         // Build query from filter
         let (sql, table) = build_query(&payload.table, &payload.filter)?;
 
-        // Open a per-request DuckDB connection with DuckLake attached.
-        // Each request gets its own snapshot — no shared state, no mutex.
-        let conn = self.open_ducklake_conn()?;
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| Status::internal(format!("query preparation failed for {table}: {e}")))?;
-        let arrow_result = stmt
-            .query_arrow([])
-            .map_err(|e| Status::internal(format!("query execution failed for {table}: {e}")))?;
-        let schema = arrow_result.get_schema();
-        let batches: Vec<_> = arrow_result.collect();
-        // Connection is dropped here — DuckDB cleans up.
-
-        // If no batches, send an empty RecordBatch with the schema so the
-        // client receives a valid (but empty) Arrow table.
-        let batches = if batches.is_empty() {
-            vec![arrow_array::RecordBatch::new_empty(schema)]
-        } else {
-            batches
-        };
-
-        // Stream RecordBatches as FlightData
-        let batch_stream = stream::iter(
-            batches
-                .into_iter()
-                .map(|b| Ok(b) as Result<_, arrow_flight::error::FlightError>),
+        // Stream the result incrementally. Each request gets its own DuckDB
+        // connection + DuckLake snapshot, opened on a blocking task that feeds
+        // RecordBatches through a bounded channel — so the data plane never
+        // buffers the whole result set (the non-blocking, memory-bounded path).
+        // Ticket/table/query-shape errors above are returned synchronously;
+        // per-request DB errors (connect/prepare/execute) surface as the first
+        // stream item (see stream_ducklake_batches).
+        let batch_stream = stream_ducklake_batches(
+            self.catalog_connstr.clone(),
+            self.data_path.clone(),
+            sql,
+            table,
         );
         let flight_stream = FlightDataEncoderBuilder::new().build(batch_stream);
         let mapped = flight_stream.map(|result| {
-            result.map_err(|e| Status::internal(format!("flight encoding error: {e}")))
+            result.map_err(|e| Status::internal(format!("data plane stream error: {e}")))
         });
 
         Ok(Response::new(Box::pin(mapped)))
@@ -1530,6 +1594,135 @@ mod tests {
             "DELETE FROM qiita_lake.read WHERE prep_sample_idx = {prep};
              DELETE FROM qiita_lake.read_mask WHERE prep_sample_idx = {prep};"
         ));
+    }
+
+    // The streaming DoGet helper: drives query_arrow inside a blocking task and
+    // hands batches back over a bounded channel (do_get's body). Pins that it
+    // streams every row, preserves the UTINYINT[] -> List<UInt8> shape, and
+    // emits one empty schema batch for a zero-row result — the same contract
+    // the old buffered `.collect()` path had, now without buffering the whole
+    // result set in memory.
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    async fn stream_ducklake_batches_streams_rows_and_empty_schema_branch() {
+        use arrow_schema::DataType;
+
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+
+        let prep: i64 = 921_000;
+        let mask: i64 = 921_001;
+        let (s0, s1, s2) = (prep + 1, prep + 2, prep + 3);
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            ducklake::ensure_read_tables(&conn).unwrap();
+            conn.execute_batch(&format!(
+                "DELETE FROM qiita_lake.read WHERE prep_sample_idx = {prep};
+                 DELETE FROM qiita_lake.read_mask WHERE prep_sample_idx = {prep};
+                 INSERT INTO qiita_lake.read \
+                     (prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2) VALUES \
+                     ({prep}, {s0}, 'r0', 'ACGT', [5,6,7,8]::UTINYINT[], NULL, NULL), \
+                     ({prep}, {s1}, 'r1', 'TTGG', [9,9,9,9]::UTINYINT[], NULL, NULL), \
+                     ({prep}, {s2}, 'r2', 'CCAA', [3,3,3,3]::UTINYINT[], NULL, NULL);
+                 INSERT INTO qiita_lake.read_mask \
+                     (mask_idx, prep_sample_idx, sequence_idx, reason, left_trim1, right_trim1) VALUES \
+                     ({mask}, {prep}, {s0}, 'pass', 0, 0), \
+                     ({mask}, {prep}, {s1}, 'pass', 0, 0), \
+                     ({mask}, {prep}, {s2}, 'pass', 0, 0);"
+            ))
+            .unwrap();
+        }
+
+        let mut filter = auth::TicketFilter::new();
+        filter.insert("mask_idx".to_string(), vec![serde_json::Value::from(mask)]);
+        filter.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(prep)],
+        );
+        let (sql, table) = build_query("read_masked", &filter).unwrap();
+        let batches: Vec<arrow_array::RecordBatch> =
+            stream_ducklake_batches(connstr.clone(), data_path.clone(), sql, table)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .map(|r| r.expect("stream item should be Ok"))
+                .collect();
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3, "all three pass reads should stream through");
+        let qual1 = batches[0]
+            .schema()
+            .field_with_name("qual1")
+            .unwrap()
+            .data_type()
+            .clone();
+        match qual1 {
+            DataType::List(item) | DataType::LargeList(item) => {
+                assert_eq!(
+                    item.data_type(),
+                    &DataType::UInt8,
+                    "qual1 must be List<UInt8>"
+                )
+            }
+            other => panic!("qual1 should be an Arrow List, got: {other:?}"),
+        }
+
+        // Empty-result branch: one zero-row batch carrying the schema.
+        let mut empty_filter = auth::TicketFilter::new();
+        empty_filter.insert(
+            "mask_idx".to_string(),
+            vec![serde_json::Value::from(mask + 999_999)],
+        );
+        empty_filter.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(prep)],
+        );
+        let (esql, etable) = build_query("read_masked", &empty_filter).unwrap();
+        let empty: Vec<arrow_array::RecordBatch> =
+            stream_ducklake_batches(connstr.clone(), data_path.clone(), esql, etable)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .map(|r| r.expect("empty stream item should be Ok"))
+                .collect();
+        assert_eq!(empty.len(), 1, "empty result still yields one schema batch");
+        assert_eq!(empty[0].num_rows(), 0, "the schema batch has no rows");
+        assert!(
+            empty[0].schema().field_with_name("qual1").is_ok(),
+            "empty batch carries the full read_masked schema"
+        );
+
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read WHERE prep_sample_idx = {prep};
+             DELETE FROM qiita_lake.read_mask WHERE prep_sample_idx = {prep};"
+        ));
+    }
+
+    // A producer-side error (here, a query against a missing table) must surface
+    // as a single Err stream item — never a silently-truncated empty stream.
+    #[tokio::test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    async fn stream_ducklake_batches_propagates_query_error() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let items: Vec<_> = stream_ducklake_batches(
+            connstr,
+            data_path,
+            "SELECT * FROM qiita_lake.does_not_exist_table".to_string(),
+            "qiita_lake.does_not_exist_table".to_string(),
+        )
+        .collect::<Vec<_>>()
+        .await;
+        assert_eq!(items.len(), 1, "a producer error yields exactly one item");
+        assert!(
+            items[0].is_err(),
+            "the item must be an Err, not a silent empty stream"
+        );
     }
 
     // Regression (data-plane lake-file placement): when `register_files`
