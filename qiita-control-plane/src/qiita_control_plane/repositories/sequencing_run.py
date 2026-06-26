@@ -541,6 +541,30 @@ async def fetch_sequenced_pool_preflight(
     )
 
 
+async def update_sequenced_pool_preflight_blob(
+    conn: asyncpg.Connection,
+    *,
+    sequenced_pool_idx: int,
+    new_blob: bytes,
+) -> None:
+    """Overwrite a sequenced_pool's run_preflight_blob with edited bytes.
+
+    The filename is left untouched (an in-place edit of the same preflight
+    file), so only the BYTEA column is rewritten and the
+    sequenced_pool_run_preflight_pair_consistent CHECK still holds (its
+    co-populated filename partner is unchanged). Takes a connection, never a
+    pool: the caller runs this inside the same transaction as the editability
+    re-check (`assert_pool_preflight_editable`), so the write is rejected if that
+    re-check found the run already processed. Note that under READ COMMITTED the
+    gate and write are not fully serialized against a submission committing
+    concurrently mid-edit — see the route docstring for that residual race."""
+    await conn.execute(
+        "UPDATE qiita.sequenced_pool SET run_preflight_blob = $1 WHERE idx = $2",
+        new_blob,
+        sequenced_pool_idx,
+    )
+
+
 def _encode_jsonb(value: dict[str, Any] | None) -> str | None:
     """Serialise a Python dict to a JSON string for the JSONB cast.
 

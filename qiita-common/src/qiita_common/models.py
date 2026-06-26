@@ -2254,6 +2254,64 @@ class SequencedPoolPreflightResponse(BaseModel):
     run_preflight_filename: str = Field(min_length=1)
 
 
+class SequencedPoolPreflightUpdateLaneRequest(BaseModel):
+    """Body for POST /sequencing-run/{R}/sequenced-pool/{P}/preflight/update-lane.
+
+    Bulk-reassigns the `lane` column inside the pool's run-preflight SQLite blob,
+    delegating to `run_preflight.update_lane`: every platform-sample row whose
+    current lane equals `from_lane` (NULL is a value) is moved to `to_lane`.
+
+    `platform` selects the platform-specific sample table update_lane targets —
+    `"illumina"` (illumina_sample) or `"tellseq"` (tellseq_sample). This is the
+    run_preflight platform-table key, NOT qiita's `Platform` enum: TellSeq is an
+    Illumina library-prep protocol rather than a sequencing platform, so the two
+    value sets deliberately differ — do not substitute `Platform` here.
+
+    `from_lane` / `to_lane` are the source and target lane numbers; either may be
+    None to match (or clear to) a NULL lane, but they must differ — an identical
+    pair is a no-op and is rejected so the SQLite change_log never gains spurious
+    entries. A non-null lane must be >= 1, since update_lane reserves -1 as the
+    NULL sentinel in its `COALESCE(lane, -1)` comparisons.
+
+    `reason` is the required audit string; update_lane records one change_log row
+    per reassigned sample carrying it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    platform: Literal["illumina", "tellseq"]
+    from_lane: Annotated[int, Field(ge=1)] | None = None
+    to_lane: Annotated[int, Field(ge=1)] | None = None
+    reason: str = Field(min_length=1)
+
+    @field_validator("reason")
+    @classmethod
+    def reason_not_blank(cls, v: str) -> str:
+        # min_length=1 alone admits a whitespace-only string, which update_lane
+        # would write verbatim into the immutable change_log audit trail — a
+        # meaningless record that defeats the point of requiring a reason. Reject
+        # blank/whitespace-only (the value is otherwise stored unchanged).
+        if not v.strip():
+            raise ValueError("reason must not be blank or whitespace-only")
+        return v
+
+    @model_validator(mode="after")
+    def lanes_must_differ(self):
+        if self.from_lane == self.to_lane:
+            raise ValueError("from_lane and to_lane are identical; no lane change requested")
+        return self
+
+
+class SequencedPoolPreflightUpdateLaneResponse(BaseModel):
+    """Returned by POST .../preflight/update-lane on success.
+
+    `rows_updated` is the number of platform-sample rows whose lane was
+    reassigned — 0 when no row currently sits at `from_lane`."""
+
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    rows_updated: Annotated[int, Field(ge=0)]
+
+
 class SequencedPoolDeleteResponse(BaseModel):
     """Summary of a full sequenced_pool purge across Postgres.
 
