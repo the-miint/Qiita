@@ -336,10 +336,11 @@ def _read_preflight(blob: bytes, *, table: str = "illumina_sample"):
     return lanes, n_changes
 
 
-async def _seed_pool_work_ticket(ctx, pool_idx: int, state: str) -> None:
+async def _seed_pool_work_ticket(ctx, pool_idx: int, state: str) -> int:
     """Insert a minimal action + sequenced_pool-scoped work_ticket in `state`,
-    tracking the action for FK-reverse cleanup. A 'failed' ticket also carries
-    the failure_* columns the work_ticket_failure_consistent CHECK requires."""
+    tracking the action for FK-reverse cleanup, and return its work_ticket_idx.
+    A 'failed' ticket also carries the failure_* columns the
+    work_ticket_failure_consistent CHECK requires."""
     action_id = "preflight-edit-test-action"
     version = f"v-{uuid.uuid4()}"
     await ctx["pool"].execute(
@@ -363,20 +364,62 @@ async def _seed_pool_work_ticket(ctx, pool_idx: int, state: str) -> None:
         if state == "failed"
         else (None, None, None)
     )
-    await ctx["pool"].execute(
+    return await ctx["pool"].fetchval(
         "INSERT INTO qiita.work_ticket"
         " (action_id, action_version, originator_principal_idx,"
         "  scope_target_kind, sequenced_pool_idx, state,"
         "  failure_type, failure_stage, failure_reason)"
         " VALUES ($1, $2, (SELECT MIN(idx) FROM qiita.principal),"
         "         'sequenced_pool', $3, $4::qiita.work_ticket_state,"
-        "         $5::qiita.failure_type, $6::qiita.work_ticket_failure_stage, $7)",
+        "         $5::qiita.failure_type, $6::qiita.work_ticket_failure_stage, $7)"
+        " RETURNING work_ticket_idx",
         action_id,
         version,
         pool_idx,
         state,
         *failure,
     )
+
+
+async def _seed_work_ticket_step(
+    ctx,
+    work_ticket_idx: int,
+    *,
+    step_index: int,
+    state: str,
+    step_name: str = "bcl_convert_prep",
+    attempt: int = 0,
+    compute_target: str = "local",
+    failure_kind: str | None = None,
+    failure_reason: str | None = None,
+) -> None:
+    """Insert one work_ticket_step progress row. Defaults model the bcl-convert
+    prep step (local compute target). A 'failed' row needs failure_kind +
+    failure_reason (the work_ticket_step_failure_consistent CHECK)."""
+    await ctx["pool"].execute(
+        "INSERT INTO qiita.work_ticket_step"
+        " (work_ticket_idx, step_index, attempt, step_name, compute_target,"
+        "  state, failure_kind, failure_reason)"
+        " VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        work_ticket_idx,
+        step_index,
+        attempt,
+        step_name,
+        compute_target,
+        state,
+        failure_kind,
+        failure_reason,
+    )
+
+
+async def _step_rows(ctx, work_ticket_idx: int):
+    """(step_index, attempt, state) tuples for a ticket, ordered."""
+    rows = await ctx["pool"].fetch(
+        "SELECT step_index, attempt, state FROM qiita.work_ticket_step"
+        " WHERE work_ticket_idx = $1 ORDER BY step_index, attempt",
+        work_ticket_idx,
+    )
+    return [(r["step_index"], r["attempt"], r["state"]) for r in rows]
 
 
 def _lane_url(run_idx: int, pool_idx: int) -> str:
@@ -563,3 +606,78 @@ async def test_update_lane_pool_in_wrong_run_422(ctx):
     resp = await ctx["wet"].post(_lane_url(run_b, pool_in_a), json=_lane_body())
     assert resp.status_code == 422
     assert await _stored_blob(ctx, pool_in_a) == blob
+
+
+# ===========================================================================
+# POST .../preflight/update-lane — invalidation of preflight-derived steps
+# ===========================================================================
+
+
+async def test_update_lane_invalidates_completed_derived_steps(ctx):
+    # Correcting the preflight makes any samplesheet a prior bcl_convert_prep
+    # produced stale, so its COMPLETED step row must be dropped — otherwise a
+    # `ticket run` redrive would fast-forward prep and reuse the wrong lanes.
+    # The non-completed downstream row is left as-is for /run to reset.
+    run_idx = await _seed_run(ctx, "lane-invalidate")
+    blob = _make_preflight_blob([1, 1])
+    pool_idx = await _seed_pool(ctx, run_idx=run_idx, blob=blob, filename="p.db")
+    wt_idx = await _seed_pool_work_ticket(ctx, pool_idx, "failed")
+    await _seed_work_ticket_step(
+        ctx, wt_idx, step_index=0, step_name="bcl_convert_prep", state="completed"
+    )
+    await _seed_work_ticket_step(
+        ctx,
+        wt_idx,
+        step_index=1,
+        step_name="bcl_convert",
+        state="failed",
+        failure_kind="contract_violation",
+        failure_reason="stale lane",
+    )
+
+    resp = await ctx["wet"].post(
+        _lane_url(run_idx, pool_idx), json=_lane_body(from_lane=1, to_lane=2)
+    )
+    assert resp.status_code == 200, resp.text
+
+    # The completed prep row is gone; the failed downstream row survives.
+    assert await _step_rows(ctx, wt_idx) == [(1, 0, "failed")]
+
+
+async def test_update_lane_leaves_other_pools_steps_untouched(ctx):
+    # Invalidation is scoped to the edited pool's tickets — a completed step on
+    # an unrelated pool's ticket must survive.
+    run_idx = await _seed_run(ctx, "lane-scope")
+    blob_a = _make_preflight_blob([1, 1])
+    pool_a = await _seed_pool(ctx, run_idx=run_idx, blob=blob_a, filename="a.db")
+    wt_a = await _seed_pool_work_ticket(ctx, pool_a, "failed")
+    await _seed_work_ticket_step(ctx, wt_a, step_index=0, state="completed")
+
+    pool_b = await _seed_pool(ctx, run_idx=run_idx, blob=_make_preflight_blob([1]), filename="b.db")
+    wt_b = await _seed_pool_work_ticket(ctx, pool_b, "failed")
+    await _seed_work_ticket_step(ctx, wt_b, step_index=0, state="completed")
+
+    resp = await ctx["wet"].post(
+        _lane_url(run_idx, pool_a), json=_lane_body(from_lane=1, to_lane=2)
+    )
+    assert resp.status_code == 200, resp.text
+
+    assert await _step_rows(ctx, wt_a) == []  # pool A's completed step invalidated
+    assert await _step_rows(ctx, wt_b) == [(0, 0, "completed")]  # pool B untouched
+
+
+async def test_update_lane_no_derived_steps_noop(ctx):
+    # A pool with no work_ticket_step rows (failed ticket that never recorded a
+    # step, plus a pool with no tickets at all) still edits cleanly — the
+    # invalidation DELETE is a harmless no-op.
+    run_idx = await _seed_run(ctx, "lane-noop")
+    blob = _make_preflight_blob([1, 1])
+    pool_idx = await _seed_pool(ctx, run_idx=run_idx, blob=blob, filename="p.db")
+    await _seed_pool_work_ticket(ctx, pool_idx, "failed")  # no step rows recorded
+
+    resp = await ctx["wet"].post(
+        _lane_url(run_idx, pool_idx), json=_lane_body(from_lane=1, to_lane=2)
+    )
+    assert resp.status_code == 200, resp.text
+    lanes, _ = _read_preflight(await _stored_blob(ctx, pool_idx))
+    assert lanes == [2, 2]

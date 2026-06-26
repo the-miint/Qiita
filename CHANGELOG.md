@@ -845,6 +845,18 @@ the `no-changelog` label).
 
 ### Fixed
 
+- `run-preflight update-lane` now actually takes effect on a `ticket run`
+  redrive. Correcting a pool's preflight makes any samplesheet a *successful*
+  `bcl_convert_prep` already produced stale, but a redrive fast-forwards that
+  COMPLETED step (rebuilding its output from the workspace manifest), so the
+  corrected lanes were never re-read and `bcl_convert` re-failed. The edit now
+  drops the pool's COMPLETED `work_ticket_step` rows in the same transaction as
+  the blob write, forcing the redrive to re-run from prep. Paired with a runner
+  fix: a step that re-runs after its progress row was dropped (this path, or a
+  `/run` redrive clearing failed rows) now clears its stale attempt dir first,
+  so the prior run's read-only (0o440) output can't trip the output verifier or
+  block the overwrite — guarded so resume-adoption never touches a live dir.
+  (#193)
 - `read-mask` (1.0.0) and `fastq-to-parquet` (1.3.0) workflows ran
   `persist-read-metrics` *after* `register-files`, but `register-files` MOVES
   `read_mask.parquet` out of the staging dir into permanent DuckLake storage —

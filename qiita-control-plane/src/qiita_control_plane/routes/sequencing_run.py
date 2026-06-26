@@ -77,6 +77,7 @@ from ..actions.sequenced_pool import (
     assert_pool_preflight_editable,
     assert_sequenced_pool_deletable,
     delete_sequenced_pool_cascade,
+    invalidate_completed_steps_for_sequenced_pool,
 )
 from ..auth.guards import (
     require_caller_owns_run,
@@ -413,6 +414,15 @@ async def update_sequenced_pool_preflight_lane(
 
         await update_sequenced_pool_preflight_blob(
             conn, sequenced_pool_idx=sequenced_pool_idx, new_blob=new_blob
+        )
+
+        # The edit makes any samplesheet a prior bcl_convert_prep produced stale,
+        # so drop the pool's COMPLETED step rows in the same transaction: a later
+        # `ticket run` redrive must re-run prep against the corrected blob instead
+        # of fast-forwarding it. The edit gate above guarantees no pool ticket is
+        # in-flight/completed here, so this only ever touches failed-ticket rows.
+        await invalidate_completed_steps_for_sequenced_pool(
+            conn, sequenced_pool_idx=sequenced_pool_idx
         )
 
     return SequencedPoolPreflightUpdateLaneResponse(

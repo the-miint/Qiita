@@ -231,6 +231,42 @@ async def assert_pool_preflight_editable(
         raise PreflightNotEditable(sequenced_pool_idx=sequenced_pool_idx, blocking=blocking)
 
 
+async def invalidate_completed_steps_for_sequenced_pool(
+    conn: asyncpg.Connection,
+    *,
+    sequenced_pool_idx: int,
+) -> int:
+    """Drop the COMPLETED work_ticket_step rows of the pool's tickets after a
+    run-preflight edit, returning the number deleted.
+
+    The complement of `assert_pool_preflight_editable`: once the gate has let an
+    edit through and the blob is rewritten, any samplesheet a prior
+    `bcl_convert_prep` already produced is stale (it was built from the pre-edit
+    lanes). Its COMPLETED progress row must go — otherwise a
+    `POST /work-ticket/{idx}/run` redrive would fast-forward prep, rebuilding its
+    output from the persisted workspace manifest, and re-feed the wrong lanes to
+    bcl-convert. Dropping the completed rows forces the redrive to re-run from
+    prep against the corrected blob.
+
+    Scoped to pool-scoped tickets: `bcl_convert_prep` is the sole consumer of the
+    preflight blob, so per-prep_sample tickets for other workflows are correctly
+    left untouched. Safe to run unconditionally — the edit gate guarantees no pool
+    ticket is in-flight or completed here, so every completed step row belongs to a
+    failed/no_data ticket with no live job. Non-completed rows are left for the
+    /run redrive's own reset. Must run inside the caller's transaction, alongside
+    the blob write, so edit + invalidation commit atomically."""
+    return _rowcount(
+        await conn.execute(
+            "DELETE FROM qiita.work_ticket_step"
+            " WHERE state = 'completed'"
+            "   AND work_ticket_idx IN ("
+            "       SELECT work_ticket_idx FROM qiita.work_ticket"
+            "        WHERE sequenced_pool_idx = $1)",
+            sequenced_pool_idx,
+        )
+    )
+
+
 async def delete_sequenced_pool_cascade(
     conn: asyncpg.Connection,
     sequenced_pool_idx: int,

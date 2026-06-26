@@ -14,8 +14,12 @@ Workspace contract: each entry runs against a per-attempt subdir
 minted by `_run_entry_with_retry`. The nesting gives two properties at
 once — retries land in fresh dirs (the verifier's "every file in
 $output_path must be in manifest" gate stays clean), and prior attempts
-persist on disk for postmortem. Entries see each other's outputs via
-the runner's binding map, which carries absolute paths forward so
+persist on disk for postmortem. The one exception: an entry RE-RUN whose
+progress row was deliberately dropped (a `/run` redrive, or `update-lane`
+invalidating a completed prep row) clears its stale attempt dir first, since
+the prior output is known-bad and its read-only files would otherwise block
+the re-run (see `_should_wipe_attempt_dir`). Entries see each other's outputs
+via the runner's binding map, which carries absolute paths forward so
 consumers don't need to know the producer's attempt number.
 """
 
@@ -25,6 +29,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -501,6 +506,7 @@ async def run_workflow(
                 data_plane_url=data_plane_url,
                 max_retries=max_retries,
                 poll_interval_seconds=poll_interval_seconds,
+                prior_progress=progress,
                 resume=resume,
             )
             bound.update(outputs)
@@ -640,6 +646,7 @@ async def _run_entry_with_retry(
     data_plane_url: str,
     max_retries: int,
     poll_interval_seconds: float,
+    prior_progress: list[step_progress.StepProgressRow],
     resume: bool = False,
 ) -> dict[str, Any]:
     """Dispatch one workflow entry, with auto-retry on transient
@@ -690,6 +697,36 @@ async def _run_entry_with_retry(
     effective_mem_override = mem_gb_override
     while True:
         attempt_workspace = workspace / entry.name / f"attempt-{attempt}"
+        # Clear a stale attempt dir before re-running into it. This fires only
+        # when no start-of-run progress row owns this (step_index, attempt) — a
+        # fresh re-run after the row was deliberately dropped (a /run redrive, or
+        # update-lane invalidating a completed prep row). The prior attempt's
+        # read-only (0o440) output + manifest would otherwise survive and trip the
+        # verifier or block the overwrite. A row PRESENT means resume-adoption
+        # owns the dir (see `_should_wipe_attempt_dir`), so it is left intact.
+        if attempt_workspace.exists() and _should_wipe_attempt_dir(
+            prior_progress, step_index=index, attempt=attempt
+        ):
+            _log.info(
+                "work_ticket %d entry %r attempt %d: clearing stale attempt dir before re-run",
+                work_ticket_idx,
+                entry.name,
+                attempt,
+            )
+            try:
+                shutil.rmtree(attempt_workspace)
+            except OSError as exc:
+                # Fail loud rather than ignore_errors: a silent miss here (e.g.
+                # a workspace group/permission drift) would leave the prior
+                # attempt's stale 0o440 output in place, and the re-run would die
+                # downstream with an opaque "file not in manifest" verifier error
+                # that hides this root cause.
+                raise BackendFailure(
+                    kind=FailureKind.UNKNOWN_PERMANENT,
+                    stage=WorkTicketFailureStage.STEP_RUN,
+                    step_name=entry.name,
+                    reason=f"could not clear stale attempt dir {attempt_workspace}: {exc}",
+                ) from exc
         attempt_workspace.mkdir(parents=True, exist_ok=True)
         try:
             if isinstance(entry, WorkflowStep):
@@ -3011,6 +3048,26 @@ def _completed_progress_row(
         if row.step_index == step_index and row.state is StepProgressState.COMPLETED:
             return row
     return None
+
+
+def _should_wipe_attempt_dir(
+    prior_progress: list[step_progress.StepProgressRow], *, step_index: int, attempt: int
+) -> bool:
+    """Whether to clear an entry's attempt dir before (re-)running into it.
+
+    Keyed on the START-OF-RUN progress (the snapshot loaded once before the
+    loop). A pre-existing row for this exact `(step_index, attempt)` means a
+    prior process owns the dir and we're resuming/adopting it — `_adopt_or_submit`
+    re-attaches to that row's job and must reuse its workspace, so NEVER wipe. No
+    such row means this attempt is starting fresh: either a first dispatch (dir
+    absent — wipe is a no-op) or a re-run whose row was deliberately dropped (a
+    `/run` redrive clearing failed rows, or `update-lane` invalidating a completed
+    prep row). In the re-run case the prior attempt left stale, read-only (0o440)
+    output + manifest on disk that would trip the output verifier or block an
+    overwrite, so the dir must be cleared first."""
+    return not any(
+        row.step_index == step_index and row.attempt == attempt for row in prior_progress
+    )
 
 
 async def _reconstruct_completed_outputs(
