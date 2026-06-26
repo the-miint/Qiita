@@ -376,6 +376,13 @@ PATH_SEQUENCING_RUN_SEQUENCED_POOL = "/{sequencing_run_idx}/sequenced-pool"
 PATH_SEQUENCED_POOL_PREFLIGHT = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/preflight"
 )
+# POST action: bulk-reassign the lane on the pool's run-preflight SQLite blob
+# (wet_lab_admin+). A verb sub-path (not PATCH) because the preflight is not
+# human-readable — there is no ETag to mint an If-Match from — and the operation
+# is a server-side command (load blob -> run_preflight.update_lane -> store).
+PATH_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/preflight/update-lane"
+)
 # DELETE target: full hard-delete of one sequenced_pool (system_admin only).
 PATH_SEQUENCED_POOL_BY_IDX = "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}"
 # GET the pool's merged (multiqc-equivalent) QC report: read-metric rollup +
@@ -399,6 +406,9 @@ URL_SEQUENCING_RUN_SEQUENCED_POOL = (
     f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_SEQUENCED_POOL}"
 )
 URL_SEQUENCED_POOL_PREFLIGHT = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_PREFLIGHT}"
+URL_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE = (
+    f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE}"
+)
 URL_SEQUENCED_POOL_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_BY_IDX}"
 URL_SEQUENCED_POOL_QC_REPORT = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_QC_REPORT}"
 URL_SEQUENCED_POOL_COMPLETION = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_COMPLETION}"

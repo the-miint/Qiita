@@ -31,6 +31,17 @@ the `no-changelog` label).
   view (`WHERE reason='pass'`) is the only Flight-reachable read surface, so
   host/QC reads are never exported. The data-plane DoGet now streams its result
   set instead of buffering it whole. (#192)
+- `qiita run-preflight update-lane` — wet_lab_admin+ correction of a stored run
+  preflight's lane assignment. New `POST /api/v1/sequencing-run/{R}/sequenced-pool/{P}/preflight/update-lane`
+  route loads the pool's run-preflight SQLite blob, applies `run_preflight.update_lane`
+  (bulk `from_lane` → `to_lane` reassignment on the illumina/tellseq sample table,
+  one `change_log` audit row per reassigned sample), and writes the blob back — all
+  server-side, so the SA-only "humans can't read the preflight" boundary is
+  preserved. Gated on the run not having been processed: an in-flight or completed
+  work ticket on the pool or its samples → 409 (a failed or unsubmitted run stays
+  editable, since a stale lane may be why it failed); update_lane's
+  uniformity/collision `ValueError` → 422. Reuses the existing pinned `run-preflight`
+  dependency (no version bump). (#190)
 - New `GET /api/v1/admin/study/{study_idx}/owner-biosample-id` route + `qiita-admin
   owner-biosample-id` CLI: a system_admin-only re-identification export mapping a
   study's `biosample_idx` + `biosample_accession` back to the owner-submitted

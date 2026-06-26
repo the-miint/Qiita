@@ -30,6 +30,8 @@ read/PATCH live in the sibling sequenced_sample route module.
 
 import base64
 import json
+import tempfile
+from pathlib import Path
 from typing import Annotated, Any
 
 import asyncpg
@@ -39,6 +41,7 @@ from qiita_common.api_paths import (
     PATH_SEQUENCED_POOL_BY_IDX,
     PATH_SEQUENCED_POOL_COMPLETION,
     PATH_SEQUENCED_POOL_PREFLIGHT,
+    PATH_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE,
     PATH_SEQUENCED_POOL_QC_REPORT,
     PATH_SEQUENCING_RUN_BY_IDX,
     PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID,
@@ -56,6 +59,8 @@ from qiita_common.models import (
     SequencedPoolCreateResponse,
     SequencedPoolDeleteResponse,
     SequencedPoolPreflightResponse,
+    SequencedPoolPreflightUpdateLaneRequest,
+    SequencedPoolPreflightUpdateLaneResponse,
     SequencedPoolResponse,
     SequencingRunCreateRequest,
     SequencingRunCreateResponse,
@@ -66,8 +71,10 @@ from qiita_common.models import (
 )
 
 from ..actions.sequenced_pool import (
+    PreflightNotEditable,
     SequencedPoolDeleteBlocked,
     SequencedPoolNotFound,
+    assert_pool_preflight_editable,
     assert_sequenced_pool_deletable,
     delete_sequenced_pool_cascade,
 )
@@ -93,6 +100,7 @@ from ..repositories.sequencing_run import (
     fetch_sequencing_run_idxs_by_instrument_run_id,
     insert_sequenced_pool,
     insert_sequencing_run,
+    update_sequenced_pool_preflight_blob,
 )
 from ._helpers import GENERIC_FK_VIOLATION, resolve_idxs_by_natural_key
 
@@ -279,6 +287,136 @@ async def get_sequenced_pool_preflight(
     return SequencedPoolPreflightResponse(
         run_preflight_blob=base64.b64encode(bytes(row["run_preflight_blob"])),
         run_preflight_filename=row["run_preflight_filename"],
+    )
+
+
+class _LaneUpdateRejected(Exception):
+    """run_preflight.update_lane rejected the request — an unsupported platform, a
+    post-update NULL/non-NULL lane mix, or a unique ``(prepped_sample, lane)``
+    collision. A client-error condition (the route maps it to 422), kept distinct
+    from a ``ValueError`` raised by ``open_db_file`` (a server-side preflight
+    schema-version skew), which must surface as 5xx rather than 422."""
+
+
+def _apply_preflight_lane_update(
+    blob: bytes,
+    *,
+    platform: str,
+    from_lane: int | None,
+    to_lane: int | None,
+    reason: str,
+) -> tuple[bytes, int]:
+    """Apply ``run_preflight.update_lane`` to a preflight SQLite blob, returning
+    the edited bytes and the number of sample rows reassigned.
+
+    The blob is materialized to a private temp file because run_preflight
+    operates on a file-backed sqlite3 connection and commits the lane update in
+    place; the edited bytes are then read back. The ``run_preflight`` import is
+    lazy and local — matching ``jobs/bcl_convert_prep.py`` — so the git-pinned
+    dependency only loads on the rare edit path, never at module import.
+    ``open_db_file`` also applies any pending preflight-schema patches, which can
+    legitimately rewrite bytes even on a zero-row update; that is intended (it
+    keeps a stored preflight current).
+
+    Only update_lane's own ``ValueError`` (bad request) is translated to
+    ``_LaneUpdateRejected``; a ``ValueError`` from ``open_db_file`` (e.g. a stored
+    blob whose schema version exceeds the deployed run_preflight patch set — a
+    server/version-skew condition, not a bad request) is deliberately left to
+    propagate so the route returns 5xx rather than mislabeling it 422."""
+    from run_preflight import open_db_file, update_lane  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "preflight.db"
+        db_path.write_bytes(blob)
+        conn = open_db_file(str(db_path))
+        try:
+            rows_updated = update_lane(conn, platform, from_lane, to_lane, reason)
+        except ValueError as exc:
+            raise _LaneUpdateRejected(str(exc)) from exc
+        finally:
+            conn.close()
+        return db_path.read_bytes(), rows_updated
+
+
+@router.post(PATH_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE)
+async def update_sequenced_pool_preflight_lane(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    body: SequencedPoolPreflightUpdateLaneRequest,
+    tx: TxConnFactory = Depends(get_tx_conn_factory),
+    _user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_WRITE)),
+    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _run_exists: None = Depends(require_sequencing_run_exists),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+) -> SequencedPoolPreflightUpdateLaneResponse:
+    """Bulk-reassign the lane on a pool's run-preflight SQLite blob. wet_lab_admin+.
+
+    A POST action (not PATCH): the preflight is not human-readable, so there is no
+    ETag for an If-Match optimistic-concurrency PATCH; the not-processed gate plus
+    the in-transaction re-check below provide the safety instead. Delegates the
+    actual SQLite edit to `run_preflight.update_lane` via `_apply_preflight_lane_update`,
+    moving every platform-sample row at `from_lane` to `to_lane` and writing one
+    SQLite `change_log` row per reassigned sample carrying the caller's `reason`.
+
+    Auth mirrors the run/pool read routes: a HumanUser with `Scope.PREP_SAMPLE_WRITE`
+    and system_role at least wet_lab_admin (no per-creator ownership — a wet-lab
+    admin may correct any run's preflight). `require_sequencing_run_exists` /
+    `require_sequenced_pool_in_run` front 404 (no such run/pool) and 422 (pool not
+    under this run) before the body work.
+
+    Everything below runs in one transaction (the delete route's
+    re-gate-inside-the-txn contract): `assert_pool_preflight_editable` re-checks
+    against committed state and 409s if the run has been processed (any in-flight
+    or completed work ticket on the pool or its samples — a failed or unsubmitted
+    run stays editable). This re-check closes the precheck→write window and rejects
+    anything committed before it runs, but under the project-default READ COMMITTED
+    isolation it does NOT, on its own, serialize against a bcl-convert submission
+    whose work_ticket commits *after* this SELECT but before our COMMIT — that
+    narrow edit-vs-submit race is the same residual one the delete path carries; a
+    general fix is tracked separately. 404 when the pool carries no preflight. 422
+    when update_lane rejects the request (bad platform / lane-uniformity violation /
+    unique-index collision); a run_preflight schema-version error is left to surface
+    as 5xx, not 422."""
+    async with tx() as conn:
+        try:
+            await assert_pool_preflight_editable(conn, sequenced_pool_idx)
+        except SequencedPoolNotFound:
+            raise HTTPException(
+                status_code=404, detail=f"sequenced_pool {sequenced_pool_idx} not found"
+            )
+        except PreflightNotEditable as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+        # Run-scoped read: re-confirms membership and pulls the blob to edit.
+        row = await fetch_sequenced_pool_preflight(
+            conn,
+            sequencing_run_idx=sequencing_run_idx,
+            sequenced_pool_idx=sequenced_pool_idx,
+        )
+        if row is None or row["run_preflight_blob"] is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"sequenced_pool {sequenced_pool_idx} has no preflight populated",
+            )
+
+        try:
+            new_blob, rows_updated = _apply_preflight_lane_update(
+                bytes(row["run_preflight_blob"]),
+                platform=body.platform,
+                from_lane=body.from_lane,
+                to_lane=body.to_lane,
+                reason=body.reason,
+            )
+        except _LaneUpdateRejected as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
+        await update_sequenced_pool_preflight_blob(
+            conn, sequenced_pool_idx=sequenced_pool_idx, new_blob=new_blob
+        )
+
+    return SequencedPoolPreflightUpdateLaneResponse(
+        sequenced_pool_idx=sequenced_pool_idx, rows_updated=rows_updated
     )
 
 
