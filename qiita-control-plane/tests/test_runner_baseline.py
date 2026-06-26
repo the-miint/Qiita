@@ -347,3 +347,25 @@ def test_escalation_full_sequence_to_ceiling():
         )
         trajectory.append(floor)
     assert trajectory == [64, 128, 128, 128]
+
+
+def test_should_wipe_attempt_dir():
+    """Guard for the fresh-re-run attempt-dir wipe. A pre-existing progress row
+    for this exact (step_index, attempt) means resume-adoption is in play (the
+    runner re-attaches to the live job and reuses its dir) — never wipe. No row
+    means a fresh re-run (e.g. a redrive whose completed prep row was invalidated,
+    or `/run` having dropped the failed row): the prior attempt's stale, read-only
+    output must not survive, so wipe."""
+    from types import SimpleNamespace
+
+    from qiita_control_plane.runner import _should_wipe_attempt_dir
+
+    rows = [SimpleNamespace(step_index=0, attempt=0)]
+    # Pre-existing row for this exact (step_index, attempt) → adoption, no wipe.
+    assert _should_wipe_attempt_dir(rows, step_index=0, attempt=0) is False
+    # No rows at all → fresh re-run, wipe.
+    assert _should_wipe_attempt_dir([], step_index=0, attempt=0) is True
+    # A row for a different attempt of the same step → this attempt is fresh.
+    assert _should_wipe_attempt_dir(rows, step_index=0, attempt=1) is True
+    # A row for a different step → unrelated to this dir, wipe it.
+    assert _should_wipe_attempt_dir(rows, step_index=1, attempt=0) is True

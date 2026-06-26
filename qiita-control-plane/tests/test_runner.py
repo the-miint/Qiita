@@ -449,6 +449,39 @@ async def test_success_path_advances_state_and_status(
     ]
 
 
+async def test_rerun_wipes_stale_attempt_dir(
+    postgres_pool, pending_work_ticket, library_spy, tmp_path
+):
+    """A step that re-runs with no prior progress row lands in a CLEAN attempt
+    dir. This is the update-lane → invalidate → `ticket run` path: the prep
+    step's COMPLETED row was dropped so it re-runs against the corrected blob,
+    but its prior attempt-0 dir still holds the stale (read-only 0o440) output +
+    manifest. Without a wipe those survive into the re-run and trip the output
+    verifier / read-only overwrite; the runner must clear the dir first."""
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = pending_work_ticket["work_ticket_idx"]
+
+    # A prior run's leftover in the first step's attempt-0 dir. pending_work_ticket
+    # records no work_ticket_step rows, so the step re-runs fresh (no adoption).
+    stale = workspace_root / str(work_ticket_idx) / "hash" / "attempt-0" / "stale.txt"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("stale output from a prior run")
+
+    backend = FakeBackendClient()
+    _populate_step_outputs(backend, workspace_root / str(work_ticket_idx))
+
+    await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    # The attempt dir was wiped before the re-run, so the stale file is gone.
+    assert not stale.exists()
+    # ...and the wipe didn't break the run.
+    state = await postgres_pool.fetchval(
+        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    assert state == "completed"
+
+
 async def test_failure_marks_ticket_and_reference_failed(
     postgres_pool, pending_work_ticket, library_spy, tmp_path
 ):
