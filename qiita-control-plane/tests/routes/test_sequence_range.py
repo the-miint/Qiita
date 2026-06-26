@@ -396,6 +396,36 @@ async def test_get_404_for_unknown_prep_sample(ctx):
     assert resp.status_code == 404, resp.text
 
 
+async def test_get_sa_with_mint_scope_returns_row(ctx):
+    """The compute SA holds sequence_range:mint but NOT prep_sample:read; the
+    GET's mint-scope arm lets it read back the range it minted. This is the
+    ingest_reads reuse path — without it, the SA would 403 here."""
+    post_resp = await ctx["sa"].post(
+        URL_SEQUENCE_RANGE_PREFIX,
+        json={"prep_sample_idx": ctx["prep_sample_idx"], "count": 7},
+    )
+    assert post_resp.status_code == 201, post_resp.text
+    minted = post_resp.json()
+
+    resp = await ctx["sa"].get(
+        URL_SEQUENCE_RANGE_BY_PREP_SAMPLE.format(prep_sample_idx=ctx["prep_sample_idx"])
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["sequence_idx_start"] == minted["sequence_idx_start"]
+    assert body["sequence_idx_stop"] == minted["sequence_idx_stop"]
+    assert body["prep_sample_idx"] == ctx["prep_sample_idx"]
+
+
+async def test_get_sa_without_mint_or_read_scope_403(ctx, sa_no_mint_client):
+    """An SA holding neither sequence_range:mint nor prep_sample:read is
+    rejected — the GET requires at least one of the two."""
+    resp = await sa_no_mint_client.get(
+        URL_SEQUENCE_RANGE_BY_PREP_SAMPLE.format(prep_sample_idx=ctx["prep_sample_idx"])
+    )
+    assert resp.status_code == 403, resp.text
+
+
 # ---------------------------------------------------------------------------
 # Cascade behaviour through the HTTP surface
 # ---------------------------------------------------------------------------

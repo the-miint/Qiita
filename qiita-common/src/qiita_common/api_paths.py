@@ -223,7 +223,9 @@ def compute_reads_staging_path(staging_root: Path, prep_sample_idx: int) -> Path
 # =============================================================================
 # Mints contiguous bigint ranges (`sequence_idx_start..stop`) the data
 # plane uses to key raw sequencing reads. POST is service-account-only
-# (Scope.SEQUENCE_RANGE_MINT); GET piggybacks on Scope.PREP_SAMPLE_READ.
+# (Scope.SEQUENCE_RANGE_MINT); GET accepts Scope.PREP_SAMPLE_READ OR
+# Scope.SEQUENCE_RANGE_MINT (the latter lets the minter read back its own
+# range on the ingest_reads retry/reuse path).
 
 PATH_SEQUENCE_RANGE_PREFIX = "/sequence-range"
 PATH_SEQUENCE_RANGE_ROOT = ""  # POST against the prefix itself

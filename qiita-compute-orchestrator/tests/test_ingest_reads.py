@@ -12,10 +12,14 @@ ingest loop, not framework wiring. Covers the branches the split introduced:
   - Missing required R1: collected and the step fails BAD_INPUT.
   - Idempotent re-run: a sample whose durable copy already exists is skipped (no
     re-mint) but its register part is re-linked.
+  - Range reuse: a sample whose durable copy is absent but whose range already
+    exists (prior attempt minted then crashed) reuses the existing range rather
+    than failing on the 409; count mismatch and concurrent-deletion are mapped
+    to BAD_INPUT / UNKNOWN_PERMANENT.
   - All-empty pool: StepNoData (the whole ticket is no-data).
 
-mint_sequence_range is monkey-patched so no live CP is needed. miint must be
-available (set MIINT_EXTENSION_REPO for the team mirror).
+mint_sequence_range / get_sequence_range are monkey-patched so no live CP is
+needed. miint must be available (set MIINT_EXTENSION_REPO for the team mirror).
 """
 
 from __future__ import annotations
@@ -30,7 +34,10 @@ from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 
 import qiita_compute_orchestrator.jobs.ingest_reads as ingest_module
 from qiita_compute_orchestrator.jobs.ingest_reads import Inputs, execute
-from qiita_compute_orchestrator.sequence_range import MintedSequenceRange
+from qiita_compute_orchestrator.sequence_range import (
+    MintedSequenceRange,
+    SequenceRangeAlreadyExists,
+)
 
 
 def _run(inputs: Inputs, workspace) -> dict:
@@ -203,3 +210,82 @@ def test_all_empty_pool_is_no_data(fake_mint, tmp_path):
     with pytest.raises(StepNoData):
         _run(inputs, tmp_path / "ws")
     assert fake_mint == []
+
+
+# ---------------------------------------------------------------------------
+# Range reuse — a prior attempt minted then crashed before the durable write
+# ---------------------------------------------------------------------------
+
+
+def _patch_conflicting_mint(monkeypatch):
+    """Make mint_sequence_range always 409 (a range already exists)."""
+
+    async def _conflict(*, http, prep_sample_idx, count):
+        raise SequenceRangeAlreadyExists(prep_sample_idx, count)
+
+    monkeypatch.setattr(ingest_module, "mint_sequence_range", _conflict)
+
+
+def test_reuses_existing_range_on_mint_conflict(monkeypatch, tmp_path):
+    """Durable absent + mint 409s ⇒ read the existing range back and reuse its
+    start. The reads are written against the reused range (5000..), proving the
+    step did NOT fail and did NOT mint a fresh range — the OOM-escalation retry
+    completes transparently."""
+    convert_dir = _seed_convert_dir(tmp_path, {"10": [("a", "ACGT"), ("b", "TTTT")]})
+    inputs = _inputs(tmp_path, convert_dir, [(10, "10")])
+    _patch_conflicting_mint(monkeypatch)
+
+    async def _existing(*, http, prep_sample_idx):
+        # The range the crashed attempt minted: starts at 5000, covers 2 reads.
+        return MintedSequenceRange(
+            prep_sample_idx=prep_sample_idx, sequence_idx_start=5000, sequence_idx_stop=5001
+        )
+
+    monkeypatch.setattr(ingest_module, "get_sequence_range", _existing)
+
+    _run(inputs, tmp_path / "ws")
+
+    assert _durable_rows(inputs.reads_staging_root, 10) == [
+        (10, 5000, "ACGT"),
+        (10, 5001, "TTTT"),
+    ]
+
+
+def test_reuse_count_mismatch_fails_bad_input(monkeypatch, tmp_path):
+    """An existing range whose span doesn't match the FASTQ's read count would
+    write sequence_idx values that mismatch qiita.sequence_range at
+    registration → BAD_INPUT, not a silent reuse."""
+    convert_dir = _seed_convert_dir(tmp_path, {"10": [("a", "ACGT")]})  # 1 read
+    inputs = _inputs(tmp_path, convert_dir, [(10, "10")])
+    _patch_conflicting_mint(monkeypatch)
+
+    async def _existing(*, http, prep_sample_idx):
+        # Covers 5 indices, but the FASTQ has 1 read.
+        return MintedSequenceRange(
+            prep_sample_idx=prep_sample_idx, sequence_idx_start=5000, sequence_idx_stop=5004
+        )
+
+    monkeypatch.setattr(ingest_module, "get_sequence_range", _existing)
+
+    with pytest.raises(BackendFailure) as exc:
+        _run(inputs, tmp_path / "ws")
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "must match the prior mint count" in str(exc.value)
+
+
+def test_reuse_missing_range_fails_permanent(monkeypatch, tmp_path):
+    """409 on mint but 404 on read-back ⇒ the range was deleted mid-retry
+    (concurrent deletion): UNKNOWN_PERMANENT — a fresh resubmit re-mints."""
+    convert_dir = _seed_convert_dir(tmp_path, {"10": [("a", "ACGT")]})
+    inputs = _inputs(tmp_path, convert_dir, [(10, "10")])
+    _patch_conflicting_mint(monkeypatch)
+
+    async def _gone(*, http, prep_sample_idx):
+        return None
+
+    monkeypatch.setattr(ingest_module, "get_sequence_range", _gone)
+
+    with pytest.raises(BackendFailure) as exc:
+        _run(inputs, tmp_path / "ws")
+    assert exc.value.kind == FailureKind.UNKNOWN_PERMANENT
+    assert "concurrent deletion" in str(exc.value)

@@ -37,6 +37,19 @@ would 409) or re-parses. The hardlink into the register staging dir is
 re-created from the existing durable copy so the retry still registers
 every sample.
 
+**Transparent retry of a mint-then-crash partial.** If a prior attempt
+minted a sample's range but crashed before publishing its durable
+`read.parquet` (the classic case: OOM-killed mid-write on an oversized
+sample), the durable copy is absent, so the retry does NOT skip — it
+re-mints, which 409s. Rather than fail and demand operator recovery,
+this step reads the existing range back (`get_sequence_range`), validates
+it still covers exactly the FASTQ's read count, and reuses its start.
+That makes the runner's OOM memory-escalation effective: the escalated
+retry reuses the range and completes, instead of dying on the one-shot
+mint contract. The only durable mutation a crashed attempt leaves is the
+`sequence_range` row, and reuse consumes it — no orphan, no manual
+DELETE.
+
 **Empty wells are first-class.** A sample whose FASTQ has zero records
 is skipped — no range minted, no reads written. An empty / no-template /
 failed-yield well is expected and numerous on a real plate. A *missing*
@@ -72,6 +85,7 @@ from ..miint import (
 from ..sequence_range import (
     PrepSampleNotEligibleForSequenceRange,
     SequenceRangeAlreadyExists,
+    get_sequence_range,
     mint_sequence_range,
 )
 
@@ -153,27 +167,83 @@ def _match_fastq(convert_dir: Path, pool_item_id: str, read_tag: str) -> Path | 
     )
 
 
-async def _mint_one(http: httpx.AsyncClient, prep_sample_idx: int, count: int) -> int:
-    """Mint a sequence range for one sample, mapping the typed mint
-    exceptions to BackendFailures (the dispatcher only wraps bare
-    NotImplementedError/FileNotFoundError/ValueError). Returns the
-    inclusive range start."""
+def _http_status_failure(prep_sample_idx: int, exc: httpx.HTTPStatusError) -> BackendFailure:
+    """Map an httpx status error from a CP sequence-range call (mint or
+    read-back) to a BackendFailure: 401/403 → CONTRACT_VIOLATION (bad
+    token / missing scope — a deploy misconfig), anything else →
+    UNKNOWN_PERMANENT. Shared by the mint and the reuse-GET arms so both
+    classify identically."""
+    kind = (
+        FailureKind.CONTRACT_VIOLATION
+        if exc.response.status_code in (401, 403)
+        else FailureKind.UNKNOWN_PERMANENT
+    )
+    return BackendFailure(
+        kind=kind,
+        stage=WorkTicketFailureStage.STEP_RUN,
+        step_name=YAML_STEP_NAME,
+        reason=(
+            f"CP sequence-range call for prep_sample {prep_sample_idx} failed "
+            f"with HTTP {exc.response.status_code}"
+        ),
+    )
+
+
+async def _mint_or_reuse_range(http: httpx.AsyncClient, prep_sample_idx: int, count: int) -> int:
+    """Mint a sequence range for one sample, or reuse the existing one.
+
+    The caller invokes this only when the sample's durable read.parquet is
+    ABSENT, so a 409 means a prior attempt minted the range then crashed
+    before the durable write (typically OOM-killed mid-write). Instead of
+    failing and demanding operator recovery, read the existing range back
+    and reuse its start — so an OOM-escalated retry completes transparently
+    rather than dying on the one-shot mint contract. Returns the inclusive
+    range start. Maps the typed mint exceptions to BackendFailures (the
+    dispatcher only wraps bare NotImplementedError/FileNotFoundError/
+    ValueError)."""
     try:
         rng = await mint_sequence_range(http=http, prep_sample_idx=prep_sample_idx, count=count)
+        return rng.sequence_idx_start
     except SequenceRangeAlreadyExists as exc:
-        # The sample already has a range but no durable read.parquet (the
-        # caller checks existence first and skips). A mint-but-no-reads
-        # partial failure needs operator recovery — fail loudly.
-        raise BackendFailure(
-            kind=FailureKind.UNKNOWN_PERMANENT,
-            stage=WorkTicketFailureStage.STEP_RUN,
-            step_name=YAML_STEP_NAME,
-            reason=(
-                f"prep_sample {prep_sample_idx} has a sequence_range but no durable "
-                f"read.parquet — a prior ingest minted then failed before writing. "
-                f"Delete the prep_sample (CASCADE removes the range) and re-run. ({exc})"
-            ),
-        ) from exc
+        # Reuse the range a prior crashed attempt left. The GET is gated on
+        # the same `sequence_range:mint` scope the SA already holds.
+        try:
+            existing = await get_sequence_range(http=http, prep_sample_idx=prep_sample_idx)
+        except httpx.HTTPStatusError as get_exc:
+            raise _http_status_failure(prep_sample_idx, get_exc) from get_exc
+        if existing is None:
+            # 409 on mint but 404 on read-back: the range vanished between the
+            # two calls (an operator deleted the prep_sample / range mid-retry).
+            # A fresh resubmit will re-mint cleanly, but THIS attempt can't run
+            # against a moving target.
+            raise BackendFailure(
+                kind=FailureKind.UNKNOWN_PERMANENT,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=YAML_STEP_NAME,
+                reason=(
+                    f"prep_sample {prep_sample_idx} sequence_range 409'd on mint but "
+                    "404'd on read-back — concurrent deletion during retry; resubmit"
+                ),
+            ) from exc
+        recovered_count = existing.sequence_idx_stop - existing.sequence_idx_start + 1
+        if recovered_count != count:
+            # The existing range was minted against a different read count than
+            # this attempt's FASTQ — reusing it would write sequence_idx values
+            # that mismatch qiita.sequence_range at registration. Deterministic
+            # demux makes this unreachable in practice; fail loudly if it isn't.
+            raise BackendFailure(
+                kind=FailureKind.BAD_INPUT,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=YAML_STEP_NAME,
+                reason=(
+                    f"prep_sample {prep_sample_idx} has an existing sequence_range covering "
+                    f"{recovered_count} indices "
+                    f"({existing.sequence_idx_start}..{existing.sequence_idx_stop}) but its "
+                    f"FASTQ now has {count} reads — the range must match the prior mint "
+                    "count exactly; delete the prep_sample to re-mint"
+                ),
+            ) from exc
+        return existing.sequence_idx_start
     except PrepSampleNotEligibleForSequenceRange as exc:
         raise BackendFailure(
             kind=FailureKind.BAD_INPUT,
@@ -182,21 +252,7 @@ async def _mint_one(http: httpx.AsyncClient, prep_sample_idx: int, count: int) -
             reason=str(exc),
         ) from exc
     except httpx.HTTPStatusError as exc:
-        kind = (
-            FailureKind.CONTRACT_VIOLATION
-            if exc.response.status_code in (401, 403)
-            else FailureKind.UNKNOWN_PERMANENT
-        )
-        raise BackendFailure(
-            kind=kind,
-            stage=WorkTicketFailureStage.STEP_RUN,
-            step_name=YAML_STEP_NAME,
-            reason=(
-                f"CP sequence-range mint for prep_sample {prep_sample_idx} failed "
-                f"with HTTP {exc.response.status_code}"
-            ),
-        ) from exc
-    return rng.sequence_idx_start
+        raise _http_status_failure(prep_sample_idx, exc) from exc
 
 
 def _write_sample_reads(
@@ -322,7 +378,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     continue
 
                 count = _count_reads(r1, r2, duckdb_tmp)
-                sequence_idx_start = await _mint_one(http, prep_sample_idx, count)
+                sequence_idx_start = await _mint_or_reuse_range(http, prep_sample_idx, count)
                 durable.parent.mkdir(parents=True, exist_ok=True)
                 _write_sample_reads(
                     r1, r2, prep_sample_idx, sequence_idx_start, durable, duckdb_tmp
