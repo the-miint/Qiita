@@ -103,6 +103,7 @@ import contextlib
 import csv
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -110,10 +111,13 @@ import time
 from pathlib import Path
 
 import asyncpg
+import duckdb
 import httpx
 from pydantic import ValidationError
 from qiita_common.api_paths import (
+    PATH_ADMIN_MASKED_READ_EXPORT_TICKET,
     PATH_ADMIN_PREFIX,
+    PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT,
     PATH_ADMIN_STUDY_OWNER_BIOSAMPLE_ID,
     PATH_MASK_DEFINITION_PREFIX,
     PATH_WORK_TICKET_PREFIX,
@@ -1051,6 +1055,50 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_owner_id.set_defaults(handler=_handle_owner_biosample_id)
 
+    p_export = sub.add_parser(
+        "masked-read-export",
+        help=(
+            "Export masked sequence data for every sample on a sequenced_pool"
+            " (system_admin only). Streams each sample's masked reads from the"
+            " data plane and writes one file per sample, named"
+            " <biosample_accession>.<run>.<pool>.<prep>.parquet."
+        ),
+    )
+    p_export.add_argument(
+        "--sequenced-pool-idx",
+        required=True,
+        type=int,
+        dest="sequenced_pool_idx",
+        help="sequenced_pool to export every (non-retired) sample of (required).",
+    )
+    p_export.add_argument(
+        "--mask-idx",
+        required=True,
+        type=int,
+        dest="mask_idx",
+        help="mask_idx identifying which masked reads to export (required).",
+    )
+    p_export.add_argument(
+        "--format",
+        choices=("parquet",),
+        default="parquet",
+        help="Output format (parquet).",
+    )
+    p_export.add_argument(
+        "--output-dir",
+        required=True,
+        type=Path,
+        dest="output_dir",
+        help="Existing directory to write per-sample files into (created mode 0600).",
+    )
+    p_export.add_argument(
+        "--data-plane-url",
+        required=True,
+        dest="data_plane_url",
+        help="gRPC URL of the data plane (e.g. grpc://qiita-data.example.com:50051).",
+    )
+    p_export.set_defaults(handler=_handle_masked_read_export)
+
     p_readiness = sub.add_parser(
         "compute-readiness",
         help=(
@@ -1165,6 +1213,133 @@ def _handle_owner_biosample_id(args: argparse.Namespace, parser: argparse.Argume
         print(f"error: could not write {output}: {exc}", file=sys.stderr)
         return 1
     print(f"wrote {n} rows to {output}")
+    return 0
+
+
+# Conservative accession charset: the accession is the leading filename
+# component AND (via the output path) is interpolated into the DuckDB COPY SQL,
+# so reject anything outside [A-Za-z0-9._-] — that excludes '/' (path traversal)
+# and "'" (SQL-string break). ENA/NCBI accessions are alphanumeric in practice.
+_SAFE_ACCESSION = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _sql_str(path: Path) -> str:
+    """Escape a filesystem path for inlining as a DuckDB SQL string literal."""
+    return str(path).replace("'", "''")
+
+
+def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str) -> None:
+    """Write one sample's streamed masked reads to `<stem>.<ext>` under
+    output_dir. The Arrow `reader` is scanned by DuckDB lazily (bounded memory),
+    written to a `.partial` sibling, then atomically renamed and chmod 0600. The
+    `.partial` is removed if the write fails so a retry isn't confused by a
+    half-written file. (fastq R1/R2 output lands in a later phase.)"""
+    if fmt != "parquet":
+        raise ValueError(f"unsupported export format: {fmt!r}")
+    final = output_dir / f"{stem}.parquet"
+    tmp = output_dir / f"{stem}.parquet.partial"
+    con = duckdb.connect(":memory:")
+    try:
+        con.register("masked", reader)
+        con.execute(f"COPY masked TO '{_sql_str(tmp)}' (FORMAT PARQUET, COMPRESSION ZSTD)")
+        os.replace(tmp, final)
+        final.chmod(0o600)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            tmp.unlink()
+        raise
+    finally:
+        con.close()
+
+
+def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Export every (non-retired) sample on a sequenced_pool's masked reads to
+    per-sample files. system_admin only (admin:masked_read_export).
+
+    GETs the roster manifest, then for each sample mints a just-in-time DoGet
+    ticket and streams its read_masked rows from the data plane straight into a
+    local DuckDB COPY — so a large pool never buffers in memory or on an
+    intermediate disk hop. Per-sample writes are atomic and 0600.
+
+    Fails loudly (exit 1, nothing written) if any sample lacks a usable
+    biosample_accession (missing — not yet NCBI-submitted — or outside the safe
+    charset), since the filename requires it; validated up front so one odd
+    sample can't leave a partial export.
+    """
+    import pyarrow.flight as flight  # noqa: PLC0415
+
+    output_dir: Path = args.output_dir
+    if not output_dir.is_dir():
+        print(f"error: output directory does not exist: {output_dir}", file=sys.stderr)
+        return 2
+
+    try:
+        token = _common.read_token()
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    manifest_path = (
+        f"{PATH_ADMIN_PREFIX}"
+        f"{PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT.format(sequenced_pool_idx=args.sequenced_pool_idx)}"
+    )
+    ticket_path = f"{PATH_ADMIN_PREFIX}{PATH_ADMIN_MASKED_READ_EXPORT_TICKET}"
+    try:
+        manifest = _common.call(
+            "GET", args.base_url, token, manifest_path, params={"mask_idx": args.mask_idx}
+        )
+    except httpx.HTTPStatusError as exc:
+        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        return 1
+
+    samples = manifest["samples"]
+    run_idx = manifest["sequencing_run_idx"]
+    pool_idx = manifest["sequenced_pool_idx"]
+    if not samples:
+        print(
+            f"no samples on sequenced_pool {pool_idx} for mask_idx {args.mask_idx}; "
+            "nothing to export"
+        )
+        return 0
+
+    # Validate every accession up front so an unsubmitted/odd sample fails the
+    # whole export before any download — never a partial output set.
+    bad = sorted(
+        s["prep_sample_idx"]
+        for s in samples
+        if not s["biosample_accession"] or not _SAFE_ACCESSION.match(s["biosample_accession"])
+    )
+    if bad:
+        print(
+            f"error: {len(bad)} sample(s) on sequenced_pool {pool_idx} have no usable "
+            f"biosample_accession (missing or outside [A-Za-z0-9._-]): prep_sample_idx {bad}. "
+            "The export filename requires the accession — submit/repair these samples first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    flight_client = flight.FlightClient(args.data_plane_url)
+    try:
+        for s in samples:
+            prep = s["prep_sample_idx"]
+            ticket_resp = _common.call(
+                "POST",
+                args.base_url,
+                token,
+                ticket_path,
+                json={"prep_sample_idx": prep, "mask_idx": args.mask_idx},
+            )
+            ticket_bytes = base64.b64decode(ticket_resp["ticket"])
+            reader = flight_client.do_get(flight.Ticket(ticket_bytes)).to_reader()
+            stem = f"{s['biosample_accession']}.{run_idx}.{pool_idx}.{prep}"
+            _write_masked_sample(reader, stem, output_dir, args.format)
+    except httpx.HTTPStatusError as exc:
+        print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        return 1
+    finally:
+        flight_client.close()
+
+    print(f"exported {len(samples)} sample(s) from sequenced_pool {pool_idx} to {output_dir}")
     return 0
 
 
