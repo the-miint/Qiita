@@ -3,13 +3,15 @@ DuckLake `read` table, once.
 
 Runs as the read-storage tail of the bcl-convert workflow, after the
 `bcl_convert` demux step. For every sample in the pool it parses that
-sample's FASTQ(s), mints a contiguous `sequence_idx` range from the
+sample's FASTQ(s) ONCE, mints a contiguous `sequence_idx` range from the
 control plane, and writes the FULL reads as `read.parquet` keyed by the
-minted `sequence_idx`. The reads are stored ONCE here, independent of
-any mask; the repeatable read-mask workflow consumes them and never
-re-runs this step. This is the read-storage half of what used to be the
-single `fastq-to-parquet` workflow — split out so a new host reference
-is a new mask over the same reads, never a re-parse of FASTQ.
+minted `sequence_idx`. The read count needed to size the mint comes from
+the staged intermediate's row count, not a second FASTQ parse. The reads
+are stored ONCE here, independent of any mask; the repeatable read-mask
+workflow consumes them and never re-runs this step. This is the
+read-storage half of what used to be the single `fastq-to-parquet`
+workflow — split out so a new host reference is a new mask over the same
+reads, never a re-parse of FASTQ.
 
 **Pool-level, not per-sample.** The bcl-convert work-ticket is
 sequenced_pool-scoped, so this one step fans over every sample. The
@@ -255,46 +257,72 @@ async def _mint_or_reuse_range(http: httpx.AsyncClient, prep_sample_idx: int, co
         raise _http_status_failure(prep_sample_idx, exc) from exc
 
 
-def _write_sample_reads(
+def _stage_intermediate_reads(
     fastq_path: Path,
     reverse_fastq_path: Path | None,
-    prep_sample_idx: int,
-    sequence_idx_start: int,
-    out_path: Path,
+    intermediate_path: Path,
     duckdb_tmp: Path,
-) -> None:
-    """Parse one sample's FASTQ(s) into the durable `read.parquet` at
-    `out_path`, sorted by `(prep_sample_idx, sequence_idx)`. Same B-staged
-    pipeline as the retired fastq_to_parquet: read_fastx -> intermediate ->
-    sequence_idx-assigned sorted COPY. `sequence_idx_start` is the inclusive
-    mint start; `sequence_index` is miint's 1-based per-file row index.
+) -> int:
+    """Parse one sample's FASTQ(s) ONCE into a transient intermediate Parquet at
+    `intermediate_path`, keyed by miint's 1-based per-file `sequence_index`, and
+    return the read count.
 
-    **Atomic publish.** The final sorted COPY lands in a `.partial` sibling,
-    then `os.replace`s into `out_path` (atomic on the same filesystem). This is
-    load-bearing for idempotency: `out_path` is ALSO the retry sentinel
-    (execute() skips a sample whose durable copy exists), so it must only ever
-    appear complete — DuckDB `COPY ... TO` is not atomic, and an OOM-kill /
-    walltime cut mid-COPY would otherwise leave a truncated `read.parquet` that
-    the next attempt skips and registers as the full read set."""
-    intermediate = out_path.parent / "_intermediate_reads.parquet"
-    partial_path = out_path.parent / f"{out_path.name}.partial"
-    partial = validate_parquet_path(partial_path)
+    This is the *single* FASTQ parse of the per-sample pipeline. The count is the
+    COPY's row-count return value, NOT a second streaming `read_fastx` pass —
+    FASTQ parsing is slow and inherently serial, so the mint that sits between
+    this and `_write_sorted_reads` rides on the parse we have to do anyway. Paired
+    input is staged in lockstep, one row per pair, so the count is the pair
+    count."""
+    intermediate = validate_parquet_path(intermediate_path)
     if reverse_fastq_path is not None:
         read_fastx_clause = "read_fastx(?, sequence2:=?)"
         read_fastx_args: list[str] = [str(fastq_path), str(reverse_fastq_path)]
     else:
         read_fastx_clause = "read_fastx(?)"
         read_fastx_args = [str(fastq_path)]
+    with open_miint_conn() as conn:
+        apply_duckdb_settings(
+            conn, duckdb_tmp, memory_gb=_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS
+        )
+        (count,) = conn.execute(
+            "COPY ( SELECT sequence_index, read_id, sequence1, qual1, sequence2, qual2 "
+            f"FROM {read_fastx_clause}) TO '{intermediate}' ({PARQUET_OPTS_INTERMEDIATE})",
+            read_fastx_args,
+        ).fetchone()
+    return int(count)
+
+
+def _write_sorted_reads(
+    intermediate_path: Path,
+    prep_sample_idx: int,
+    sequence_idx_start: int,
+    out_path: Path,
+    duckdb_tmp: Path,
+) -> None:
+    """Second pass: read the staged intermediate, assign the minted
+    `sequence_idx`, and write the durable `read.parquet` at `out_path` sorted by
+    `sequence_idx`. No FASTQ re-parse — the heavy parse already happened in
+    `_stage_intermediate_reads`. `sequence_idx_start` is the inclusive mint start;
+    `sequence_index` is miint's 1-based per-file row index.
+
+    Sorts by `sequence_idx` alone: `prep_sample_idx` is a constant literal for the
+    whole sample (cardinality 1), so adding it to the sort key orders nothing —
+    the output is identical to sorting by `(prep_sample_idx, sequence_idx)`. The
+    explicit ORDER BY is load-bearing: the read happens with
+    `preserve_insertion_order=false`, which lets DuckDB write rows out of order,
+    so only the sort guarantees `sequence_idx` is ordered at rest (for DuckLake
+    pruning / row-group pushdown).
+
+    **Atomic publish.** The sorted COPY lands in a `.partial` sibling, then
+    `os.replace`s into `out_path` (atomic on the same filesystem). This is
+    load-bearing for idempotency: `out_path` is ALSO the retry sentinel
+    (execute() skips a sample whose durable copy exists), so it must only ever
+    appear complete — DuckDB `COPY ... TO` is not atomic, and an OOM-kill /
+    walltime cut mid-COPY would otherwise leave a truncated `read.parquet` that
+    the next attempt skips and registers as the full read set."""
+    partial_path = out_path.parent / f"{out_path.name}.partial"
+    partial = validate_parquet_path(partial_path)
     try:
-        with open_miint_conn() as conn:
-            apply_duckdb_settings(
-                conn, duckdb_tmp, memory_gb=_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS
-            )
-            conn.execute(
-                "COPY ( SELECT sequence_index, read_id, sequence1, qual1, sequence2, qual2 "
-                f"FROM {read_fastx_clause}) TO '{intermediate}' ({PARQUET_OPTS_INTERMEDIATE})",
-                read_fastx_args,
-            )
         with open_conn() as conn:
             apply_duckdb_settings(
                 conn, duckdb_tmp, memory_gb=_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS
@@ -305,33 +333,16 @@ def _write_sample_reads(
                 "  sequence_index + ? - 1 AS sequence_idx,"
                 "  read_id, sequence1, qual1, sequence2, qual2 "
                 "FROM read_parquet(?) "
-                "ORDER BY prep_sample_idx, sequence_idx ) "
+                "ORDER BY sequence_idx ) "
                 f"TO '{partial}' ({PARQUET_OPTS})",
-                [prep_sample_idx, sequence_idx_start, str(intermediate)],
+                [prep_sample_idx, sequence_idx_start, str(intermediate_path)],
             )
         # Publish atomically: the durable path only ever appears complete.
         os.replace(partial_path, out_path)
     finally:
-        intermediate.unlink(missing_ok=True)
         # If the COPY died before the replace, drop the half-written partial so
         # a retry re-derives instead of finding stale bytes.
         partial_path.unlink(missing_ok=True)
-
-
-def _count_reads(fastq_path: Path, reverse_fastq_path: Path | None, duckdb_tmp: Path) -> int:
-    """Count records via a streaming read_fastx pass (footer count needs the
-    intermediate; this is one extra pass but keeps `_write_sample_reads`
-    free of the count so the mint happens between them). Paired input is
-    counted in lockstep, one row per pair."""
-    if reverse_fastq_path is not None:
-        clause, params = "read_fastx(?, sequence2:=?)", [str(fastq_path), str(reverse_fastq_path)]
-    else:
-        clause, params = "read_fastx(?)", [str(fastq_path)]
-    with open_miint_conn() as conn:
-        apply_duckdb_settings(
-            conn, duckdb_tmp, memory_gb=_DUCKDB_MEMORY_GB, threads=_DUCKDB_THREADS
-        )
-        return conn.execute(f"SELECT count(*) FROM {clause}", params).fetchone()[0]
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
@@ -377,12 +388,22 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 if is_empty_sequence_file(r1) or (r2 is not None and is_empty_sequence_file(r2)):
                     continue
 
-                count = _count_reads(r1, r2, duckdb_tmp)
-                sequence_idx_start = await _mint_or_reuse_range(http, prep_sample_idx, count)
                 durable.parent.mkdir(parents=True, exist_ok=True)
-                _write_sample_reads(
-                    r1, r2, prep_sample_idx, sequence_idx_start, durable, duckdb_tmp
-                )
+                intermediate = durable.parent / "_intermediate_reads.parquet"
+                try:
+                    # One FASTQ parse: stage the intermediate and take the read
+                    # count from its COPY row-count return (no second parse), then
+                    # mint the range and write the sorted durable from the staged
+                    # intermediate. The intermediate is mint-independent (keyed by
+                    # the per-file sequence_index), so staging it before the mint is
+                    # safe and lets the count come for free.
+                    count = _stage_intermediate_reads(r1, r2, intermediate, duckdb_tmp)
+                    sequence_idx_start = await _mint_or_reuse_range(http, prep_sample_idx, count)
+                    _write_sorted_reads(
+                        intermediate, prep_sample_idx, sequence_idx_start, durable, duckdb_tmp
+                    )
+                finally:
+                    intermediate.unlink(missing_ok=True)
                 _hardlink(durable, part)
                 registered += 1
     finally:

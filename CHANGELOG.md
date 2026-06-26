@@ -474,6 +474,17 @@ the `no-changelog` label).
   COMPRESSION 'gzip'`) instead of uncompressed `.fastq`, and reuses a single
   miint DuckDB connection across all samples rather than opening one (with an
   extension `LOAD`) per sample. (#198)
+- `ingest_reads` now parses each sample's FASTQ(s) **once** instead of twice: the
+  read count that sizes the `sequence_range` mint is taken from the staged
+  intermediate Parquet's `COPY` row-count return rather than a separate
+  `read_fastx` counting pass. The intermediate is written before the mint (it is
+  mint-independent, keyed by the per-file `sequence_index`), so the count comes
+  for free off the parse we already do. On a large paired-end sample (~13.5M
+  pairs) this removes a full ~20s serial FASTQ parse per sample. The durable
+  `read.parquet` is now sorted by `sequence_idx` alone — `prep_sample_idx` is a
+  constant for a single sample, so dropping it from the `ORDER BY` orders nothing
+  and yields identical output while shrinking the sort (~66s→~46s, 12GB→9GB peak
+  on the same sample). (#TBD)
 - `runner._resolve_staged_reads` now falls back to the data plane when a
   read-mask workflow can't find the prep_sample's ephemeral durable staging copy:
   it signs an `export_read` action token and binds the per-ticket `reads.parquet`
