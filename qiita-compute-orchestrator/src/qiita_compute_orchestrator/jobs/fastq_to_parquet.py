@@ -27,7 +27,8 @@ Parquet whose rows mismatch the prior attempt's assignment. Workflow
 authors stage inputs onto an immutable shared filesystem region (the
 orchestrator never writes back to the input path).
 
-Schema (sorted by (prep_sample_idx, sequence_idx), the DuckLake `read`
+Schema (sorted by sequence_idx — prep_sample_idx is a per-sample
+constant, so it adds nothing to the sort; this is the DuckLake `read`
 table's join key) — uses miint's native column names so the file
 round-trips through read_fastx-shaped consumers without aliasing:
 
@@ -399,16 +400,18 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # bound as the first param. The outer ORDER BY controls the
             # physical row order in the final Parquet
             # (preserve_insertion_order=false means the COPY respects only
-            # explicit ORDER BY clauses): sorted by (prep_sample_idx,
-            # sequence_idx), the `read` table's join key, for row-group
-            # pruning.
+            # explicit ORDER BY clauses). Sort by sequence_idx ALONE:
+            # prep_sample_idx is a constant for the whole file (cardinality
+            # 1), so adding it to the sort key orders nothing — the output
+            # is identical to sorting by (prep_sample_idx, sequence_idx),
+            # the `read` table's join key, for row-group pruning.
             conn.execute(
                 "COPY ( SELECT "
                 "  ?::BIGINT AS prep_sample_idx,"
                 "  sequence_index + ? - 1 AS sequence_idx,"
                 "  read_id, sequence1, qual1, sequence2, qual2 "
                 "FROM read_parquet(?) "
-                "ORDER BY prep_sample_idx, sequence_idx ) "
+                "ORDER BY sequence_idx ) "
                 f"TO '{out}' ({PARQUET_OPTS})",
                 [inputs.prep_sample_idx, sequence_idx_start, str(intermediate)],
             )

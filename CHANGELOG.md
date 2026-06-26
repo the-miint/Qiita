@@ -485,6 +485,11 @@ the `no-changelog` label).
   constant for a single sample, so dropping it from the `ORDER BY` orders nothing
   and yields identical output while shrinking the sort (~66s→~46s, 12GB→9GB peak
   on the same sample). (#TBD)
+- `fastq_to_parquet` likewise sorts its durable `read.parquet` by `sequence_idx`
+  alone (dropping the constant `prep_sample_idx` from the `ORDER BY`) — same
+  identical-output sort shrink. It was already single-pass (it counts off the
+  intermediate Parquet footer), so the parse-once change does not apply there.
+  (#TBD)
 - `runner._resolve_staged_reads` now falls back to the data plane when a
   read-mask workflow can't find the prep_sample's ephemeral durable staging copy:
   it signs an `export_read` action token and binds the per-ticket `reads.parquet`
