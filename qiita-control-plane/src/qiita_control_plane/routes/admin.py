@@ -4,6 +4,7 @@ PLUS the appropriate admin:* scope, so a token-scoped-narrow system_admin
 can't exfiltrate audit data without the right scope.
 """
 
+import base64
 import json
 from datetime import UTC, datetime, timedelta
 
@@ -12,11 +13,13 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from qiita_common.api_paths import (
     PATH_ADMIN_AUDIT,
+    PATH_ADMIN_MASKED_READ_EXPORT_TICKET,
     PATH_ADMIN_PREFIX,
     PATH_ADMIN_PRINCIPAL_DISABLED,
     PATH_ADMIN_PRINCIPAL_RETIRED,
     PATH_ADMIN_PRINCIPAL_REVOKE_ALL_TOKENS,
     PATH_ADMIN_PRINCIPAL_SYSTEM_ROLE,
+    PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT,
     PATH_ADMIN_SERVICE_ACCOUNT,
     PATH_ADMIN_STUDY_OWNER_BIOSAMPLE_ID,
 )
@@ -31,6 +34,10 @@ from qiita_common.auth_constants import (
 )
 from qiita_common.models import (
     AuthEventResponse,
+    DoGetTicketResponse,
+    MaskedReadExportManifest,
+    MaskedReadExportSample,
+    MaskedReadExportTicketRequest,
     OwnerBiosampleIdExportResponse,
     OwnerBiosampleIdRow,
     PrincipalDisabledUpdate,
@@ -49,8 +56,9 @@ from ..auth.scopes import (
     SERVICE_ACCOUNT_SCOPE_CEILING,
     validate_scopes_against_ceiling,
 )
+from ..auth.tickets import sign_ticket
 from ..auth.token import mint_api_token
-from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
+from ..deps import TxConnFactory, get_db_pool, get_hmac_secret, get_tx_conn_factory
 
 router = APIRouter(prefix=PATH_ADMIN_PREFIX, tags=["admin"])
 
@@ -584,3 +592,120 @@ async def export_owner_biosample_id(
         row_count=len(rows),
         rows=rows,
     )
+
+
+# ---------------------------------------------------------------------------
+# Masked-read export (system_admin + admin:masked_read_export)
+# ---------------------------------------------------------------------------
+
+# The masked-read view table the export ticket is signed for. Must match the
+# data plane's ALLOWED_TABLES and the CP-side _DOGET_ALLOWED_TABLES
+# (routes/reference.py) and the service-account read_masked route's own constant.
+_READ_MASKED_TABLE = "read_masked"
+
+# Export tickets are minted at the data plane's MAX_TICKET_LIFETIME (3600 s).
+# The data plane verifies expiry only at DoGet initiation, never mid-stream, so
+# this bounds mint -> stream-start (sub-second with just-in-time per-sample
+# minting), not the download — a multi-hour single-sample stream is unaffected.
+_EXPORT_TICKET_TTL_SECONDS = 3600
+
+# Roster of a sequenced_pool's non-retired samples to export: the prep_sample_idx
+# (the read_masked join key) + biosample_accession (the filename's leading part;
+# NULL until NCBI submission, surfaced so the export fails loudly rather than
+# silently dropping the sample). The pool-wide run/pool idxs live on the manifest.
+_MASKED_EXPORT_ROSTER_SQL = (
+    "SELECT ss.prep_sample_idx, bs.biosample_accession"
+    "  FROM qiita.sequenced_sample ss"
+    "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
+    "  JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
+    " WHERE ss.sequenced_pool_idx = $1 AND ps.retired = false"
+    " ORDER BY ss.prep_sample_idx"
+)
+
+
+@router.get(PATH_ADMIN_SEQUENCED_POOL_MASKED_READ_EXPORT)
+async def export_masked_read_manifest(
+    sequenced_pool_idx: int,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    _role: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_MASKED_READ_EXPORT)),
+    mask_idx: int = Query(gt=0),
+) -> MaskedReadExportManifest:
+    """Roster manifest for a per-pool masked-read export: one row per
+    non-retired sample on the pool, each with the filename parts the
+    qiita-admin masked-read-export CLI needs. The caller then mints a per-sample
+    DoGet ticket and streams that sample's read_masked rows from the data plane.
+
+    Gated by system_admin PLUS admin:masked_read_export — the first human
+    masked-read pull. `mask_idx` is mandatory (the data plane keys read_masked
+    on (prep_sample_idx, mask_idx)). 404 if the pool or mask does not exist — an
+    empty roster for a real pool is a valid answer, but a typo'd idx fails loudly
+    rather than masquerading as "no samples". Entity-level prep_sample retirement
+    is excluded (ps.retired = false); biosample_accession is surfaced even when
+    NULL so the CLI fails loudly on an unsubmitted sample rather than the route
+    silently dropping it.
+    """
+    run_idx = await pool.fetchval(
+        "SELECT sequencing_run_idx FROM qiita.sequenced_pool WHERE idx = $1", sequenced_pool_idx
+    )
+    if run_idx is None:
+        raise HTTPException(
+            status_code=404, detail=f"no sequenced_pool with idx={sequenced_pool_idx}"
+        )
+    mask_exists = await pool.fetchval(
+        "SELECT 1 FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx
+    )
+    if mask_exists is None:
+        raise HTTPException(status_code=404, detail=f"no mask_definition with mask_idx={mask_idx}")
+
+    db_rows = await pool.fetch(_MASKED_EXPORT_ROSTER_SQL, sequenced_pool_idx)
+    return MaskedReadExportManifest(
+        sequenced_pool_idx=sequenced_pool_idx,
+        sequencing_run_idx=run_idx,
+        mask_idx=mask_idx,
+        samples=[
+            MaskedReadExportSample(
+                prep_sample_idx=r["prep_sample_idx"],
+                biosample_accession=r["biosample_accession"],
+            )
+            for r in db_rows
+        ],
+    )
+
+
+@router.post(PATH_ADMIN_MASKED_READ_EXPORT_TICKET, status_code=201)
+async def create_masked_read_export_ticket(
+    body: MaskedReadExportTicketRequest,
+    hmac_secret: bytes = Depends(get_hmac_secret),
+    _role: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
+    _scope: Principal = Depends(require_scope(Scope.ADMIN_MASKED_READ_EXPORT)),
+) -> DoGetTicketResponse:
+    """Mint a Flight DoGet ticket scoped to one (prep_sample_idx, mask_idx) on
+    the data plane's read_masked view — the human (system_admin) counterpart to
+    the service-account POST /read-masked/ticket/doget. The export CLI mints one
+    just-in-time per sample.
+
+    Gated by system_admin PLUS admin:masked_read_export. Both identifiers are
+    mandatory (Pydantic gt=0), so the signed filter is always non-empty; the
+    route re-asserts that before signing as defence in depth — the data plane's
+    empty-filter path would otherwise dump every sample's pass reads. Minted at
+    the 3600 s max (the data plane's ceiling; expiry is checked only at DoGet
+    initiation, so it never bounds the download).
+    """
+    filter_ = {
+        "prep_sample_idx": [body.prep_sample_idx],
+        "mask_idx": [body.mask_idx],
+    }
+    if not filter_ or any(not v for v in filter_.values()):
+        raise HTTPException(
+            status_code=422,
+            detail="masked-read export ticket requires a non-empty prep_sample_idx and mask_idx",
+        )
+
+    ticket_bytes = sign_ticket(
+        table=_READ_MASKED_TABLE,
+        filter=filter_,
+        secret=hmac_secret,
+        ttl_seconds=_EXPORT_TICKET_TTL_SECONDS,
+    )
+    return DoGetTicketResponse(ticket=base64.b64encode(ticket_bytes).decode())
