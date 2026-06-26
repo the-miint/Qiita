@@ -484,12 +484,12 @@ the `no-changelog` label).
   `read.parquet` is now sorted by `sequence_idx` alone — `prep_sample_idx` is a
   constant for a single sample, so dropping it from the `ORDER BY` orders nothing
   and yields identical output while shrinking the sort (~66s→~46s, 12GB→9GB peak
-  on the same sample). (#TBD)
+  on the same sample). (#201)
 - `fastq_to_parquet` likewise sorts its durable `read.parquet` by `sequence_idx`
   alone (dropping the constant `prep_sample_idx` from the `ORDER BY`) — same
   identical-output sort shrink. It was already single-pass (it counts off the
   intermediate Parquet footer), so the parse-once change does not apply there.
-  (#TBD)
+  (#201)
 - `ingest_reads` now processes up to 4 pool samples **concurrently** (bounded
   `asyncio.gather` + a semaphore; each sample's DuckDB stage/sorted-write runs in
   a worker thread, the mint stays async on the loop) instead of one at a time.
@@ -498,7 +498,7 @@ the `no-changelog` label).
   parses across samples. Per-slot DuckDB memory/threads are derived from the SLURM
   cgroup (2 threads/slot to keep the sort parallel and clear wells fast); the
   bcl-convert `ingest_reads` step's `baseline_resources` rise to `cpu: 8` /
-  `mem_gb: 56` to match (still well under the action ceiling). (#TBD)
+  `mem_gb: 56` to match (still well under the action ceiling). (#201)
 - `runner._resolve_staged_reads` now falls back to the data plane when a
   read-mask workflow can't find the prep_sample's ephemeral durable staging copy:
   it signs an `export_read` action token and binds the per-ticket `reads.parquet`
