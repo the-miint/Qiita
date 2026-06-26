@@ -822,3 +822,177 @@ def test_masked_read_export_aborts_on_unsafe_accession(monkeypatch, tmp_path, ca
     err = capsys.readouterr().err
     assert "99" in err  # names the offending prep_sample_idx
     assert list(out_dir.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# masked-read-export (fastq path — R1/R2)
+#
+# These run the REAL miint FORMAT FASTQ writer (miint is a core dependency,
+# installed/loaded by setup_miint_test_env in tests/conftest.py). The fake
+# Flight stream hands DuckDB a table carrying the read_masked view's columns
+# (read_id, sequence1, qual1, sequence2, qual2; qual* are UTINYINT[]); pairing
+# is read from sequence2 null-ness, since the manifest carries no paired flag.
+# ---------------------------------------------------------------------------
+
+
+def _qual(rows):
+    """A UTINYINT[]-typed Arrow column (list<uint8>) — what read_fastx emits and
+    the FASTQ writer encodes back as ASCII phred+33."""
+    import pyarrow as pa
+
+    return pa.array(rows, type=pa.list_(pa.uint8()))
+
+
+def _run_fastq_export(monkeypatch, tmp_path, table):
+    """Drive a single-sample fastq export against a fake Flight stream serving
+    `table`, returning (rc, out_dir)."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [{"prep_sample_idx": 42, "biosample_accession": "SAMN_A"}],
+    }
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(manifest))
+    monkeypatch.setattr("pyarrow.flight.FlightClient", _fake_flight_client_class({42: table}))
+
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    rc = cli.main(
+        [
+            "masked-read-export",
+            "--sequenced-pool-idx",
+            "7",
+            "--mask-idx",
+            "3",
+            "--format",
+            "fastq",
+            "--output-dir",
+            str(out_dir),
+            "--data-plane-url",
+            "grpc://dp:50051",
+        ]
+    )
+    return rc, out_dir
+
+
+def test_masked_read_export_single_end_fastq(monkeypatch, tmp_path):
+    """A single-end sample (sequence2 NULL throughout) → one <stem>.fastq, 0600,
+    no R1/R2 split. UTINYINT[] qual written ASCII phred+33 (Q40 → 'I')."""
+    import pyarrow as pa
+
+    table = pa.table(
+        {
+            "read_id": pa.array(["rS0", "rS1"]),
+            "sequence1": pa.array(["GGGGCCCC", "AAAACCCC"]),
+            "qual1": _qual([[40] * 8, [40] * 8]),
+            "sequence2": pa.array([None, None], type=pa.string()),
+            "qual2": _qual([None, None]),
+        }
+    )
+    rc, out_dir = _run_fastq_export(monkeypatch, tmp_path, table)
+    assert rc == 0
+
+    f = out_dir / "SAMN_A.5.7.42.fastq"
+    assert f.is_file()
+    assert (f.stat().st_mode & 0o777) == 0o600
+    lines = f.read_text().splitlines()
+    assert lines[:4] == ["@rS0", "GGGGCCCC", "+", "IIIIIIII"]
+    assert len(lines) == 8  # two single-end records, 4 lines each
+    # No paired split, no leftover .partial.
+    assert sorted(p.name for p in out_dir.iterdir()) == ["SAMN_A.5.7.42.fastq"]
+
+
+def test_masked_read_export_paired_fastq_r1_r2(monkeypatch, tmp_path):
+    """A paired sample (sequence2 set) → <stem>.R1.fastq + <stem>.R2.fastq via the
+    {ORIENTATION} placeholder, each 0600, no single-file <stem>.fastq. Mates split
+    sequence1→R1 / sequence2→R2; qual phred+33 (Q30..37 → '?@ABCDEF')."""
+    import pyarrow as pa
+
+    table = pa.table(
+        {
+            "read_id": pa.array(["readP1", "readP2"]),
+            "sequence1": pa.array(["ACGTACGT", "AAAACCCC"]),
+            "qual1": _qual([[30, 31, 32, 33, 34, 35, 36, 37], [38] * 8]),
+            "sequence2": pa.array(["TTGGCCAA", "GGGGTTTT"]),
+            "qual2": _qual([[20, 21, 22, 23, 24, 25, 26, 27], [28] * 8]),
+        }
+    )
+    rc, out_dir = _run_fastq_export(monkeypatch, tmp_path, table)
+    assert rc == 0
+
+    r1 = out_dir / "SAMN_A.5.7.42.R1.fastq"
+    r2 = out_dir / "SAMN_A.5.7.42.R2.fastq"
+    assert r1.is_file() and r2.is_file()
+    assert (r1.stat().st_mode & 0o777) == 0o600
+    assert (r2.stat().st_mode & 0o777) == 0o600
+    assert r1.read_text().splitlines()[:4] == ["@readP1", "ACGTACGT", "+", "?@ABCDEF"]
+    assert r2.read_text().splitlines()[:4] == ["@readP1", "TTGGCCAA", "+", "56789:;<"]
+    assert len(r1.read_text().splitlines()) == 8  # two records per mate
+    assert len(r2.read_text().splitlines()) == 8
+    # Split output only — no single-file form, no leftover .partial.
+    assert sorted(p.name for p in out_dir.iterdir()) == [
+        "SAMN_A.5.7.42.R1.fastq",
+        "SAMN_A.5.7.42.R2.fastq",
+    ]
+
+
+def test_masked_read_export_paired_fastq_streams_all_batches(monkeypatch, tmp_path):
+    """Pairing is decided by peeking the FIRST batch; the rest of the stream must
+    still reach the COPY. A 2-batch paired stream → both reads land in R1/R2,
+    guarding against the peeked prefix being dropped (not chained back)."""
+    import pyarrow as pa
+
+    b1 = pa.record_batch(
+        {
+            "read_id": pa.array(["p1"]),
+            "sequence1": pa.array(["ACGTACGT"]),
+            "qual1": _qual([[40] * 8]),
+            "sequence2": pa.array(["TTGGCCAA"]),
+            "qual2": _qual([[40] * 8]),
+        }
+    )
+    b2 = pa.record_batch(
+        {
+            "read_id": pa.array(["p2"]),
+            "sequence1": pa.array(["AAAACCCC"]),
+            "qual1": _qual([[40] * 8]),
+            "sequence2": pa.array(["GGGGTTTT"]),
+            "qual2": _qual([[40] * 8]),
+        }
+    )
+    rc, out_dir = _run_fastq_export(monkeypatch, tmp_path, pa.Table.from_batches([b1, b2]))
+    assert rc == 0
+
+    r1 = (out_dir / "SAMN_A.5.7.42.R1.fastq").read_text().splitlines()
+    r2 = (out_dir / "SAMN_A.5.7.42.R2.fastq").read_text().splitlines()
+    assert "@p1" in r1 and "@p2" in r1  # both reads, not only the peeked first batch
+    assert "@p1" in r2 and "@p2" in r2
+
+
+def test_masked_read_export_empty_sample_fastq(monkeypatch, tmp_path):
+    """A sample with zero masked reads → one empty <stem>.fastq, no R1/R2 split.
+    `bool_or(...)` over zero rows is SQL NULL, so pairing detection must treat an
+    empty sample as single-end (not crash, not split)."""
+    import pyarrow as pa
+
+    table = pa.table(
+        {
+            "read_id": pa.array([], type=pa.string()),
+            "sequence1": pa.array([], type=pa.string()),
+            "qual1": _qual([]),
+            "sequence2": pa.array([], type=pa.string()),
+            "qual2": _qual([]),
+        }
+    )
+    rc, out_dir = _run_fastq_export(monkeypatch, tmp_path, table)
+    assert rc == 0
+
+    f = out_dir / "SAMN_A.5.7.42.fastq"
+    assert f.is_file()
+    assert (f.stat().st_mode & 0o777) == 0o600
+    assert f.read_text() == ""  # zero records
+    assert sorted(p.name for p in out_dir.iterdir()) == ["SAMN_A.5.7.42.fastq"]
