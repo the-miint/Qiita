@@ -1366,6 +1366,7 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     sample can't leave a partial export.
     """
     import pyarrow.flight as flight  # noqa: PLC0415
+    import pyarrow.ipc as ipc  # noqa: PLC0415
 
     output_dir: Path = args.output_dir
     if not output_dir.is_dir():
@@ -1417,6 +1418,19 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
         )
         return 1
 
+    # Flight hands us each RecordBatch by zero-copying the gRPC message body,
+    # whose absolute base address carries no element-alignment guarantee — so a
+    # uint64/int32 column buffer routinely lands off its natural alignment even
+    # though the data plane writes 64-byte-aligned IPC (arrow-rs default). When
+    # those batches are then scanned by DuckDB (which routes a registered pyarrow
+    # reader through pyarrow.dataset → Acero), Acero logs a "poorly aligned input
+    # buffer" warning per misaligned column per batch (apache/arrow#37195). Tell
+    # the Flight reader to realign each buffer to its type's required alignment on
+    # receive: DataTypeSpecific copies only the small offset/validity/fixed-width
+    # buffers, leaving the bulk sequence/quality byte buffers zero-copy.
+    read_opts = flight.FlightCallOptions(
+        read_options=ipc.IpcReadOptions(ensure_alignment=ipc.Alignment.DataTypeSpecific)
+    )
     flight_client = flight.FlightClient(args.data_plane_url)
     try:
         for s in samples:
@@ -1429,7 +1443,7 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
                 json={"prep_sample_idx": prep, "mask_idx": args.mask_idx},
             )
             ticket_bytes = base64.b64decode(ticket_resp["ticket"])
-            reader = flight_client.do_get(flight.Ticket(ticket_bytes)).to_reader()
+            reader = flight_client.do_get(flight.Ticket(ticket_bytes), read_opts).to_reader()
             stem = f"{s['biosample_accession']}.{run_idx}.{pool_idx}.{prep}"
             _write_masked_sample(reader, stem, output_dir, args.format)
     except httpx.HTTPStatusError as exc:

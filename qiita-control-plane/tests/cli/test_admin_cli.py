@@ -607,18 +607,26 @@ def _fake_flight_client_class(tables_by_prep):
     import json as _json
 
     class _FakeFlightClient:
+        # Every constructed instance is recorded so a test can read back the
+        # FlightCallOptions the CLI passed to do_get (buffer-alignment fix).
+        instances: list = []
+
         def __init__(self, url):
             self.url = url
             self.do_get_calls = []
+            self.do_get_options = []
+            _FakeFlightClient.instances.append(self)
 
-        def do_get(self, ticket):
+        def do_get(self, ticket, options=None):
             prep = _json.loads(bytes(ticket.ticket))["prep_sample_idx"]
             self.do_get_calls.append(prep)
+            self.do_get_options.append(options)
             return _FakeFlightStream(tables_by_prep[prep])
 
         def close(self):
             pass
 
+    _FakeFlightClient.instances = []
     return _FakeFlightClient
 
 
@@ -714,6 +722,64 @@ def test_masked_read_export_writes_parquet_per_sample(monkeypatch, tmp_path):
     assert n_b == 1
     # No .partial temp files left behind.
     assert sorted(p.suffix for p in out_dir.iterdir()) == [".parquet", ".parquet"]
+
+
+def test_masked_read_export_realigns_flight_buffers(monkeypatch, tmp_path):
+    """Every DoGet passes FlightCallOptions asking the reader to realign each
+    buffer to its type's required alignment on receive. Flight zero-copies the
+    gRPC body at an arbitrary base, so without this DuckDB's Acero scan logs a
+    "poorly aligned input buffer" warning per column per batch (apache/arrow#37195).
+    Regression guard: the read_options carry ensure_alignment=DataTypeSpecific."""
+    import pyarrow as pa
+    import pyarrow.ipc as ipc
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [
+            {"prep_sample_idx": 42, "biosample_accession": "SAMN_A"},
+            {"prep_sample_idx": 43, "biosample_accession": "SAMN_B"},
+        ],
+    }
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(manifest))
+    tables = {
+        42: pa.table({"read_id": ["rA0"], "sequence1": ["ACGT"]}),
+        43: pa.table({"read_id": ["rB0"], "sequence1": ["CCAA"]}),
+    }
+    fake_cls = _fake_flight_client_class(tables)
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    rc = cli.main(
+        [
+            "masked-read-export",
+            "--sequenced-pool-idx",
+            "7",
+            "--mask-idx",
+            "3",
+            "--format",
+            "parquet",
+            "--output-dir",
+            str(out_dir),
+            "--data-plane-url",
+            "grpc://dp:50051",
+        ]
+    )
+    assert rc == 0
+
+    # One client, two DoGets (one per sample), each carrying the realign option.
+    assert len(fake_cls.instances) == 1
+    options = fake_cls.instances[0].do_get_options
+    assert len(options) == 2
+    for opt in options:
+        assert opt is not None, "do_get called without FlightCallOptions"
+        assert opt.read_options.ensure_alignment == ipc.Alignment.DataTypeSpecific
 
 
 def test_masked_read_export_aborts_on_null_accession(monkeypatch, tmp_path, capsys):

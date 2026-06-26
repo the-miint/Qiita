@@ -845,6 +845,18 @@ the `no-changelog` label).
 
 ### Fixed
 
+- `qiita-admin masked-read-export` no longer floods stderr with Arrow Acero
+  `An input buffer was poorly aligned` warnings (one per column per batch). The
+  PyArrow Flight client zero-copies the gRPC message body, whose absolute base
+  address carries no element-alignment guarantee, so a column buffer routinely
+  lands off its natural alignment even though the data plane writes 64-byte-aligned
+  IPC; DuckDB then scans the registered reader through `pyarrow.dataset` → Acero,
+  which warns. The export now asks the Flight reader to realign each buffer to its
+  type's required alignment on receive (`IpcReadOptions(ensure_alignment=
+  DataTypeSpecific)`), which copies only the small offset/validity/fixed-width
+  buffers and leaves the bulk sequence/quality byte buffers zero-copy. Benign on
+  x86_64 (output was always correct) — this only silences the noise. Upstream:
+  apache/arrow#37195. (#TBD)
 - bcl-convert `ingest_reads` now retries transparently after an OOM mid-write.
   A pool sample whose range was minted by a prior attempt that then crashed
   before publishing its durable `read.parquet` (the classic case: OOM-killed
