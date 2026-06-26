@@ -33,6 +33,14 @@ PARQUET_OPTS_INTERMEDIATE: str = (
     "FORMAT PARQUET, PARQUET_VERSION 'v2', COMPRESSION 'snappy', ROW_GROUP_SIZE_BYTES '64MB'"
 )
 
+# The `ROW_GROUP_SIZE_BYTES '64MB'` cap above, as an int, for write paths that
+# size row groups in Python rather than via a DuckDB COPY (e.g. a pyarrow
+# `ParquetWriter` fed a Flight stream — the admin masked-read export). Sizing by
+# encoded bytes (not a fixed row count) is what keeps row groups sane across
+# qiita's varying row widths — a fixed row count large enough for narrow reads is
+# far too big for wide rows. Keep in sync with the literal in PARQUET_OPTS.
+ROW_GROUP_SIZE_BYTES: int = 64 * 1024 * 1024
+
 
 def validate_parquet_path(path: Path) -> str:
     """Reject paths with characters that can't be safely string-interpolated

@@ -52,9 +52,14 @@ def _u8(values: list[int]) -> str:
 
 
 def _parse_fastq(path: Path) -> dict[str, tuple[str, str]]:
-    """Parse a 4-line-per-record FASTQ into {read_id: (sequence, qual)}; the read
-    order over the Flight stream isn't guaranteed, so we key by id, not position."""
-    lines = path.read_text().splitlines()
+    """Parse a 4-line-per-record gzip FASTQ into {read_id: (sequence, qual)}; the
+    read order over the Flight stream isn't guaranteed, so we key by id, not
+    position. The export writes `<stem>.fastq.gz` (FORMAT FASTQ + COMPRESSION
+    'gzip')."""
+    import gzip
+
+    with gzip.open(path, "rt") as fh:
+        lines = fh.read().splitlines()
     out: dict[str, tuple[str, str]] = {}
     for i in range(0, len(lines), 4):
         out[lines[i][1:]] = (lines[i + 1], lines[i + 3])  # strip leading '@'
@@ -247,8 +252,8 @@ async def test_masked_read_export_e2e_parquet_and_fastq(
     # --- fastq: paired → R1/R2, redaction holds, quals encode phred+33. ---
     fq_dir = tmp_path / "fastq"
     assert _run_export("fastq", fq_dir) == 0
-    r1 = _parse_fastq(fq_dir / f"{stem}.R1.fastq")
-    r2 = _parse_fastq(fq_dir / f"{stem}.R2.fastq")
+    r1 = _parse_fastq(fq_dir / f"{stem}.R1.fastq.gz")
+    r2 = _parse_fastq(fq_dir / f"{stem}.R2.fastq.gz")
     assert set(r1) == {"r1", "r3"} and set(r2) == {"r1", "r3"}  # host read absent
     # R1 carries sequence1/qual1; R2 carries sequence2/qual2. Q40→'I', Q35→'D',
     # Q30→'?', Q20→'5' (value + 33 as ASCII).
@@ -257,4 +262,4 @@ async def test_masked_read_export_e2e_parquet_and_fastq(
     assert r2["r1"] == ("TTTTGGGG", "????????")
     assert r2["r3"] == ("TTAATTAA", "55555555")
     # A paired sample never produces the single-file form.
-    assert not (fq_dir / f"{stem}.fastq").exists()
+    assert not (fq_dir / f"{stem}.fastq.gz").exists()

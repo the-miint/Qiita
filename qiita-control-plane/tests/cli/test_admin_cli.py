@@ -607,18 +607,26 @@ def _fake_flight_client_class(tables_by_prep):
     import json as _json
 
     class _FakeFlightClient:
+        # Every constructed instance is recorded so a test can read back the
+        # FlightCallOptions the CLI passed to do_get (buffer-alignment fix).
+        instances: list = []
+
         def __init__(self, url):
             self.url = url
             self.do_get_calls = []
+            self.do_get_options = []
+            _FakeFlightClient.instances.append(self)
 
-        def do_get(self, ticket):
+        def do_get(self, ticket, options=None):
             prep = _json.loads(bytes(ticket.ticket))["prep_sample_idx"]
             self.do_get_calls.append(prep)
+            self.do_get_options.append(options)
             return _FakeFlightStream(tables_by_prep[prep])
 
         def close(self):
             pass
 
+    _FakeFlightClient.instances = []
     return _FakeFlightClient
 
 
@@ -675,7 +683,8 @@ def test_masked_read_export_writes_parquet_per_sample(monkeypatch, tmp_path):
         42: pa.table({"read_id": ["rA0", "rA1"], "sequence1": ["ACGT", "TTGG"]}),
         43: pa.table({"read_id": ["rB0"], "sequence1": ["CCAA"]}),
     }
-    monkeypatch.setattr("pyarrow.flight.FlightClient", _fake_flight_client_class(tables))
+    fake_cls = _fake_flight_client_class(tables)
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
 
     out_dir = tmp_path / "exp"
     out_dir.mkdir()
@@ -696,6 +705,10 @@ def test_masked_read_export_writes_parquet_per_sample(monkeypatch, tmp_path):
     )
     assert rc == 0
 
+    # Parquet streams straight to a ParquetWriter (no DuckDB/Acero), so it passes
+    # no buffer-realign option — only the fastq path needs one.
+    assert fake_cls.instances[0].do_get_options == [None, None]
+
     f_a = out_dir / "SAMN_A.5.7.42.parquet"
     f_b = out_dir / "SAMN_B.5.7.43.parquet"
     assert f_a.is_file() and f_b.is_file()
@@ -714,6 +727,180 @@ def test_masked_read_export_writes_parquet_per_sample(monkeypatch, tmp_path):
     assert n_b == 1
     # No .partial temp files left behind.
     assert sorted(p.suffix for p in out_dir.iterdir()) == [".parquet", ".parquet"]
+
+
+def test_masked_read_export_empty_sample_parquet(monkeypatch, tmp_path):
+    """A sample with zero masked reads → a valid empty `<stem>.parquet`. The
+    ParquetWriter is opened from `reader.schema`, so even a zero-batch stream
+    produces a schema-carrying file (no crash, no missing output)."""
+    import duckdb
+    import pyarrow as pa
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [{"prep_sample_idx": 42, "biosample_accession": "SAMN_A"}],
+    }
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(manifest))
+    empty = pa.table(
+        {"read_id": pa.array([], type=pa.string()), "sequence1": pa.array([], type=pa.string())}
+    )
+    monkeypatch.setattr("pyarrow.flight.FlightClient", _fake_flight_client_class({42: empty}))
+
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    rc = cli.main(
+        [
+            "masked-read-export",
+            "--sequenced-pool-idx",
+            "7",
+            "--mask-idx",
+            "3",
+            "--format",
+            "parquet",
+            "--output-dir",
+            str(out_dir),
+            "--data-plane-url",
+            "grpc://dp:50051",
+        ]
+    )
+    assert rc == 0
+    f = out_dir / "SAMN_A.5.7.42.parquet"
+    assert f.is_file()
+    assert (f.stat().st_mode & 0o777) == 0o600
+    assert duckdb.connect(":memory:").execute(f"SELECT count(*) FROM '{f}'").fetchone()[0] == 0
+    assert sorted(p.name for p in out_dir.iterdir()) == ["SAMN_A.5.7.42.parquet"]
+
+
+def test_masked_read_export_parquet_coalesces_row_groups(monkeypatch, tmp_path):
+    """A multi-batch stream (the data plane sends ~2048-row DataChunks) must be
+    coalesced into row groups sized by ROW_GROUP_SIZE_BYTES, not written one tiny
+    row group per batch. Here the whole sample is well under the byte cap, so the
+    three input batches land in a single row group (guards the fragmentation
+    regression a naive write_batch-per-batch would cause)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [{"prep_sample_idx": 42, "biosample_accession": "SAMN_A"}],
+    }
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(manifest))
+    batches = [
+        pa.record_batch({"read_id": [f"r{b}{i}" for i in range(4)], "sequence1": ["ACGT"] * 4})
+        for b in range(3)
+    ]
+    table = pa.Table.from_batches(batches)
+    assert table.to_reader().read_all().num_rows == 12  # sanity: 3 batches kept
+    monkeypatch.setattr("pyarrow.flight.FlightClient", _fake_flight_client_class({42: table}))
+
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    rc = cli.main(
+        [
+            "masked-read-export",
+            "--sequenced-pool-idx",
+            "7",
+            "--mask-idx",
+            "3",
+            "--format",
+            "parquet",
+            "--output-dir",
+            str(out_dir),
+            "--data-plane-url",
+            "grpc://dp:50051",
+        ]
+    )
+    assert rc == 0
+    f = out_dir / "SAMN_A.5.7.42.parquet"
+    md = pq.ParquetFile(f).metadata
+    assert md.num_rows == 12
+    assert md.num_row_groups == 1  # coalesced, not one row group per input batch
+
+
+def test_masked_read_export_fastq_realigns_flight_buffers(monkeypatch, tmp_path):
+    """The fastq path feeds Flight batches into DuckDB (the miint FORMAT FASTQ
+    writer) → pyarrow.dataset → Acero. Flight zero-copies the gRPC body at an
+    arbitrary base, so without realignment Acero logs a "poorly aligned input
+    buffer" warning per column per batch (apache/arrow#37195). Regression guard:
+    every fastq DoGet carries read_options with ensure_alignment=DataTypeSpecific."""
+    import pyarrow as pa
+    import pyarrow.ipc as ipc
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [
+            {"prep_sample_idx": 42, "biosample_accession": "SAMN_A"},
+            {"prep_sample_idx": 43, "biosample_accession": "SAMN_B"},
+        ],
+    }
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(manifest))
+    tables = {
+        42: pa.table(
+            {
+                "read_id": ["rA0"],
+                "sequence1": ["ACGT"],
+                "qual1": _qual([[40, 40, 40, 40]]),
+                "sequence2": pa.array([None], type=pa.string()),
+                "qual2": _qual([None]),
+            }
+        ),
+        43: pa.table(
+            {
+                "read_id": ["rB0"],
+                "sequence1": ["CCAA"],
+                "qual1": _qual([[40, 40, 40, 40]]),
+                "sequence2": pa.array([None], type=pa.string()),
+                "qual2": _qual([None]),
+            }
+        ),
+    }
+    fake_cls = _fake_flight_client_class(tables)
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    rc = cli.main(
+        [
+            "masked-read-export",
+            "--sequenced-pool-idx",
+            "7",
+            "--mask-idx",
+            "3",
+            "--format",
+            "fastq",
+            "--output-dir",
+            str(out_dir),
+            "--data-plane-url",
+            "grpc://dp:50051",
+        ]
+    )
+    assert rc == 0
+
+    # One client, two DoGets (one per sample), each carrying the realign option.
+    assert len(fake_cls.instances) == 1
+    options = fake_cls.instances[0].do_get_options
+    assert len(options) == 2
+    for opt in options:
+        assert opt is not None, "fastq do_get called without FlightCallOptions"
+        assert opt.read_options.ensure_alignment == ipc.Alignment.DataTypeSpecific
 
 
 def test_masked_read_export_aborts_on_null_accession(monkeypatch, tmp_path, capsys):
@@ -843,6 +1030,15 @@ def _qual(rows):
     return pa.array(rows, type=pa.list_(pa.uint8()))
 
 
+def _read_gz_text(path):
+    """Decompress a gzip-compressed fastq output to text (fastq is written
+    `<stem>.fastq.gz` via the FORMAT FASTQ writer's COMPRESSION 'gzip')."""
+    import gzip
+
+    with gzip.open(path, "rt") as fh:
+        return fh.read()
+
+
 def _run_fastq_export(monkeypatch, tmp_path, table):
     """Drive a single-sample fastq export against a fake Flight stream serving
     `table`, returning (rc, out_dir)."""
@@ -880,8 +1076,8 @@ def _run_fastq_export(monkeypatch, tmp_path, table):
 
 
 def test_masked_read_export_single_end_fastq(monkeypatch, tmp_path):
-    """A single-end sample (sequence2 NULL throughout) → one <stem>.fastq, 0600,
-    no R1/R2 split. UTINYINT[] qual written ASCII phred+33 (Q40 → 'I')."""
+    """A single-end sample (sequence2 NULL throughout) → one gzip <stem>.fastq.gz,
+    0600, no R1/R2 split. UTINYINT[] qual written ASCII phred+33 (Q40 → 'I')."""
     import pyarrow as pa
 
     table = pa.table(
@@ -896,20 +1092,20 @@ def test_masked_read_export_single_end_fastq(monkeypatch, tmp_path):
     rc, out_dir = _run_fastq_export(monkeypatch, tmp_path, table)
     assert rc == 0
 
-    f = out_dir / "SAMN_A.5.7.42.fastq"
+    f = out_dir / "SAMN_A.5.7.42.fastq.gz"
     assert f.is_file()
     assert (f.stat().st_mode & 0o777) == 0o600
-    lines = f.read_text().splitlines()
+    lines = _read_gz_text(f).splitlines()
     assert lines[:4] == ["@rS0", "GGGGCCCC", "+", "IIIIIIII"]
     assert len(lines) == 8  # two single-end records, 4 lines each
     # No paired split, no leftover .partial.
-    assert sorted(p.name for p in out_dir.iterdir()) == ["SAMN_A.5.7.42.fastq"]
+    assert sorted(p.name for p in out_dir.iterdir()) == ["SAMN_A.5.7.42.fastq.gz"]
 
 
 def test_masked_read_export_paired_fastq_r1_r2(monkeypatch, tmp_path):
-    """A paired sample (sequence2 set) → <stem>.R1.fastq + <stem>.R2.fastq via the
-    {ORIENTATION} placeholder, each 0600, no single-file <stem>.fastq. Mates split
-    sequence1→R1 / sequence2→R2; qual phred+33 (Q30..37 → '?@ABCDEF')."""
+    """A paired sample (sequence2 set) → <stem>.R1.fastq.gz + <stem>.R2.fastq.gz via
+    the {ORIENTATION} placeholder, each 0600, no single-file <stem>.fastq.gz. Mates
+    split sequence1→R1 / sequence2→R2; qual phred+33 (Q30..37 → '?@ABCDEF')."""
     import pyarrow as pa
 
     table = pa.table(
@@ -924,19 +1120,19 @@ def test_masked_read_export_paired_fastq_r1_r2(monkeypatch, tmp_path):
     rc, out_dir = _run_fastq_export(monkeypatch, tmp_path, table)
     assert rc == 0
 
-    r1 = out_dir / "SAMN_A.5.7.42.R1.fastq"
-    r2 = out_dir / "SAMN_A.5.7.42.R2.fastq"
+    r1 = out_dir / "SAMN_A.5.7.42.R1.fastq.gz"
+    r2 = out_dir / "SAMN_A.5.7.42.R2.fastq.gz"
     assert r1.is_file() and r2.is_file()
     assert (r1.stat().st_mode & 0o777) == 0o600
     assert (r2.stat().st_mode & 0o777) == 0o600
-    assert r1.read_text().splitlines()[:4] == ["@readP1", "ACGTACGT", "+", "?@ABCDEF"]
-    assert r2.read_text().splitlines()[:4] == ["@readP1", "TTGGCCAA", "+", "56789:;<"]
-    assert len(r1.read_text().splitlines()) == 8  # two records per mate
-    assert len(r2.read_text().splitlines()) == 8
+    assert _read_gz_text(r1).splitlines()[:4] == ["@readP1", "ACGTACGT", "+", "?@ABCDEF"]
+    assert _read_gz_text(r2).splitlines()[:4] == ["@readP1", "TTGGCCAA", "+", "56789:;<"]
+    assert len(_read_gz_text(r1).splitlines()) == 8  # two records per mate
+    assert len(_read_gz_text(r2).splitlines()) == 8
     # Split output only — no single-file form, no leftover .partial.
     assert sorted(p.name for p in out_dir.iterdir()) == [
-        "SAMN_A.5.7.42.R1.fastq",
-        "SAMN_A.5.7.42.R2.fastq",
+        "SAMN_A.5.7.42.R1.fastq.gz",
+        "SAMN_A.5.7.42.R2.fastq.gz",
     ]
 
 
@@ -967,14 +1163,14 @@ def test_masked_read_export_paired_fastq_streams_all_batches(monkeypatch, tmp_pa
     rc, out_dir = _run_fastq_export(monkeypatch, tmp_path, pa.Table.from_batches([b1, b2]))
     assert rc == 0
 
-    r1 = (out_dir / "SAMN_A.5.7.42.R1.fastq").read_text().splitlines()
-    r2 = (out_dir / "SAMN_A.5.7.42.R2.fastq").read_text().splitlines()
+    r1 = _read_gz_text(out_dir / "SAMN_A.5.7.42.R1.fastq.gz").splitlines()
+    r2 = _read_gz_text(out_dir / "SAMN_A.5.7.42.R2.fastq.gz").splitlines()
     assert "@p1" in r1 and "@p2" in r1  # both reads, not only the peeked first batch
     assert "@p1" in r2 and "@p2" in r2
 
 
 def test_masked_read_export_empty_sample_fastq(monkeypatch, tmp_path):
-    """A sample with zero masked reads → one empty <stem>.fastq, no R1/R2 split.
+    """A sample with zero masked reads → one empty <stem>.fastq.gz, no R1/R2 split.
     `bool_or(...)` over zero rows is SQL NULL, so pairing detection must treat an
     empty sample as single-end (not crash, not split)."""
     import pyarrow as pa
@@ -991,8 +1187,8 @@ def test_masked_read_export_empty_sample_fastq(monkeypatch, tmp_path):
     rc, out_dir = _run_fastq_export(monkeypatch, tmp_path, table)
     assert rc == 0
 
-    f = out_dir / "SAMN_A.5.7.42.fastq"
+    f = out_dir / "SAMN_A.5.7.42.fastq.gz"
     assert f.is_file()
     assert (f.stat().st_mode & 0o777) == 0o600
-    assert f.read_text() == ""  # zero records
-    assert sorted(p.name for p in out_dir.iterdir()) == ["SAMN_A.5.7.42.fastq"]
+    assert _read_gz_text(f) == ""  # zero records
+    assert sorted(p.name for p in out_dir.iterdir()) == ["SAMN_A.5.7.42.fastq.gz"]

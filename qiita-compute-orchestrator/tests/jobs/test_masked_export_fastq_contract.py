@@ -18,9 +18,12 @@ the build, not paraphrased:
   * Paired rows (`sequence2` set) into a single output path are a hard error;
     the writer demands the `{ORIENTATION}` placeholder (split R1/R2 files) or
     `INTERLEAVE true` (one interleaved file).
-  * `{ORIENTATION}` expands to exactly `R1` / `R2`, so a `<stem>.{ORIENTATION}.fastq`
-    target yields `<stem>.R1.fastq` + `<stem>.R2.fastq` — the export filename
-    spec (`<biosample_accession>.<run>.<pool>.<prep>.R1.fastq`).
+  * `{ORIENTATION}` expands to exactly `R1` / `R2`, so a `<stem>.{ORIENTATION}.fastq.gz`
+    target yields `<stem>.R1.fastq.gz` + `<stem>.R2.fastq.gz` — the export filename
+    spec (`<biosample_accession>.<run>.<pool>.<prep>.R1.fastq.gz`).
+  * `COMPRESSION 'gzip'` gzip-compresses the output (option-driven — it gzips even
+    when the path ends in `.gz.partial`, not just `.gz`), so the CLI writes
+    `<stem>.fastq.gz` and may stage to a `.partial` sibling before the atomic rename.
 
 If a future miint build changes any of these, this file fails — the signal to
 re-pin the CLI's COPY SQL.
@@ -28,6 +31,7 @@ re-pin the CLI's COPY SQL.
 
 from __future__ import annotations
 
+import gzip
 from pathlib import Path
 
 import duckdb
@@ -39,6 +43,13 @@ from qiita_compute_orchestrator.miint import open_miint_conn
 def _qual(values: list[int]) -> str:
     """A UTINYINT[] phred-quality literal."""
     return "[" + ",".join(str(v) for v in values) + "]::UTINYINT[]"
+
+
+def _gz_lines(path: Path) -> list[str]:
+    """Assert the file is gzip (magic 1f8b) and return its decompressed lines."""
+    assert path.read_bytes()[:2] == b"\x1f\x8b", "expected gzip magic"
+    with gzip.open(path, "rt") as fh:
+        return fh.read().splitlines()
 
 
 def _seed_single_end(conn: duckdb.DuckDBPyConnection) -> None:
@@ -119,6 +130,36 @@ def test_orientation_placeholder_writes_R1_R2(tmp_path: Path) -> None:
     # Both mates of both reads are present (4 lines per record, 2 records each).
     assert len(r1.read_text().splitlines()) == 8
     assert len(r2.read_text().splitlines()) == 8
+
+
+def test_single_end_fastq_gzip_writes_gzip(tmp_path: Path) -> None:
+    """`COMPRESSION 'gzip'` writes a gzip stream (the CLI's single-end path) — the
+    `.gz.partial` extension is incidental, the option drives compression."""
+    out = tmp_path / "se.fastq.gz.partial"
+    with open_miint_conn() as conn:
+        _seed_single_end(conn)
+        conn.execute(
+            f"COPY (SELECT read_id, sequence1, qual1 FROM masked) "
+            f"TO '{out}' (FORMAT FASTQ, COMPRESSION 'gzip')"
+        )
+    assert _gz_lines(out) == ["@readS", "GGGGCCCC", "+", "IIIIIIII"]
+
+
+def test_orientation_gzip_writes_R1_R2_gzip(tmp_path: Path) -> None:
+    """The CLI's paired path: `{ORIENTATION}` + `COMPRESSION 'gzip'` together yield
+    gzip-compressed `<stem>.R1.fastq.gz` + `<stem>.R2.fastq.gz`, mates split."""
+    stem = "SAMN1.5.7.42"
+    with open_miint_conn() as conn:
+        _seed_paired(conn)
+        conn.execute(
+            f"COPY (SELECT read_id, sequence1, qual1, sequence2, qual2 FROM masked) "
+            f"TO '{tmp_path}/{stem}.{{ORIENTATION}}.fastq.gz' (FORMAT FASTQ, COMPRESSION 'gzip')"
+        )
+    r1 = tmp_path / f"{stem}.R1.fastq.gz"
+    r2 = tmp_path / f"{stem}.R2.fastq.gz"
+    assert r1.is_file() and r2.is_file()
+    assert _gz_lines(r1)[:4] == ["@readP1", "ACGTACGT", "+", "?@ABCDEF"]
+    assert _gz_lines(r2)[:4] == ["@readP1", "TTGGCCAA", "+", "56789:;<"]
 
 
 def test_interleave_option_writes_single_file(tmp_path: Path) -> None:

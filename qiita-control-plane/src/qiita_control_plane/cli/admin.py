@@ -124,6 +124,7 @@ from qiita_common.api_paths import (
     PATH_WORK_TICKET_ROOT,
 )
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
+from qiita_common.parquet import ROW_GROUP_SIZE_BYTES
 
 from qiita_control_plane.actions import (
     DuplicateActionError,
@@ -1296,59 +1297,93 @@ def _peek_paired(reader):
     return paired, stream
 
 
-def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str) -> None:
+def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str, con) -> None:
     """Write one sample's streamed masked reads under output_dir, atomically (via
-    a `.partial` sibling renamed into place) and chmod 0600.
+    a `.partial` sibling renamed into place) and chmod 0600. Both formats stream
+    the Arrow `reader` (bounded memory, no full materialization):
 
-    Both formats stream the Arrow `reader` straight through one `DuckDB → COPY`
-    (bounded memory, no full materialization). The connection carries miint
-    (needed for the FORMAT FASTQ writer; harmless for parquet):
+      parquet — stream straight to a `pyarrow.parquet.ParquetWriter` (zstd) into
+                one `<stem>.parquet`. No DuckDB hop, so the bulk read bytes are
+                never materialized into DuckDB vectors and the scan never touches
+                Acero (which is why the parquet path needs no buffer realignment —
+                see `_handle_masked_read_export`). `con` is unused (pass None). The
+                writer is opened from `reader.schema`, so a zero-row stream still
+                produces a valid empty `<stem>.parquet`.
+      fastq   — stream through the caller's shared miint DuckDB `con` (the FORMAT
+                FASTQ writer lives in DuckDB+miint; `con` is reused across all
+                samples). Output is gzip-compressed (`<stem>.fastq.gz`). The
+                manifest carries no paired flag, so pairing is read from the data
+                (`sequence2` null-ness) by peeking the first batch (`_peek_paired`),
+                without draining the single-pass reader. A single-end sample → one
+                `<stem>.fastq.gz`; a paired sample → `<stem>.R1.fastq.gz` +
+                `<stem>.R2.fastq.gz` via miint's `{ORIENTATION}` placeholder
+                (paired rows into a single path are a hard error in the writer;
+                should the per-sample SE/PE uniformity ever break, a misdetected
+                single-end COPY hits that error and fails loudly)."""
+    if fmt == "parquet":
+        import pyarrow as pa  # noqa: PLC0415
+        import pyarrow.parquet as pq  # noqa: PLC0415
 
-      parquet — `COPY masked TO …` into one `<stem>.parquet`.
-      fastq   — the manifest carries no paired flag, so pairing is read from the
-                data (`sequence2` null-ness) by peeking the first batch
-                (`_peek_paired`), without draining the single-pass reader. A
-                single-end sample → one `<stem>.fastq`; a paired sample →
-                `<stem>.R1.fastq` + `<stem>.R2.fastq` via miint's `{ORIENTATION}`
-                placeholder (paired rows into a single path are a hard error in
-                the writer; should the per-sample SE/PE uniformity ever break, a
-                misdetected single-end COPY hits that error and fails loudly)."""
-    con = connect_with_miint()
-    try:
-        if fmt == "parquet":
-            con.register("masked", reader)
-            partial = output_dir / f"{stem}.parquet.partial"
-            _commit_partials(
-                lambda: con.execute(
-                    f"COPY masked TO '{_sql_str(partial)}' (FORMAT PARQUET, COMPRESSION ZSTD)"
-                ),
-                [(partial, output_dir / f"{stem}.parquet")],
-            )
-        elif fmt == "fastq":
-            paired, stream = _peek_paired(reader)
-            con.register("masked", stream)
-            if paired:
-                # `{ORIENTATION}` expands to R1/R2, so the one COPY emits both
-                # `<stem>.R1.fastq.partial` and `<stem>.R2.fastq.partial`.
-                target = output_dir / f"{stem}.{{ORIENTATION}}.fastq.partial"
-                pairs = [
-                    (output_dir / f"{stem}.{o}.fastq.partial", output_dir / f"{stem}.{o}.fastq")
-                    for o in ("R1", "R2")
-                ]
-            else:
-                target = output_dir / f"{stem}.fastq.partial"
-                pairs = [(target, output_dir / f"{stem}.fastq")]
-            _commit_partials(
-                lambda: con.execute(
-                    f"COPY (SELECT {_READ_MASKED_COLUMNS} FROM masked) "
-                    f"TO '{_sql_str(target)}' (FORMAT FASTQ)"
-                ),
-                pairs,
-            )
+        partial = output_dir / f"{stem}.parquet.partial"
+
+        def _write_parquet() -> None:
+            # The data plane streams ~2048-row DuckDB DataChunks, so writing each
+            # incoming batch as its own row group would fragment the file into
+            # hundreds of tiny row groups (worse compression + pruning). Buffer
+            # batches up to one row group's worth and write them as a single row
+            # group — reproducing the layout (and bounded peak memory) of the
+            # DuckDB `COPY` this path replaced. Size the group by encoded bytes
+            # (ROW_GROUP_SIZE_BYTES, the qiita-wide cap from PARQUET_OPTS) rather
+            # than a fixed row count, so wide rows don't produce oversized groups;
+            # batch.nbytes is the in-memory size DuckDB's byte cap also measures.
+            writer = pq.ParquetWriter(partial, reader.schema, compression="zstd")
+            try:
+                buffer: list = []
+                buffered_bytes = 0
+
+                def flush() -> None:
+                    nonlocal buffer, buffered_bytes
+                    if buffer:
+                        writer.write_table(pa.Table.from_batches(buffer, reader.schema))
+                        buffer = []
+                        buffered_bytes = 0
+
+                for batch in reader:
+                    buffer.append(batch)
+                    buffered_bytes += batch.nbytes
+                    if buffered_bytes >= ROW_GROUP_SIZE_BYTES:
+                        flush()
+                flush()
+            finally:
+                writer.close()
+
+        _commit_partials(_write_parquet, [(partial, output_dir / f"{stem}.parquet")])
+    elif fmt == "fastq":
+        paired, stream = _peek_paired(reader)
+        con.register("masked", stream)
+        if paired:
+            # `{ORIENTATION}` expands to R1/R2, so the one COPY emits both
+            # `<stem>.R1.fastq.gz.partial` and `<stem>.R2.fastq.gz.partial`.
+            target = output_dir / f"{stem}.{{ORIENTATION}}.fastq.gz.partial"
+            pairs = [
+                (
+                    output_dir / f"{stem}.{o}.fastq.gz.partial",
+                    output_dir / f"{stem}.{o}.fastq.gz",
+                )
+                for o in ("R1", "R2")
+            ]
         else:
-            raise ValueError(f"unsupported export format: {fmt!r}")
-    finally:
-        con.close()
+            target = output_dir / f"{stem}.fastq.gz.partial"
+            pairs = [(target, output_dir / f"{stem}.fastq.gz")]
+        _commit_partials(
+            lambda: con.execute(
+                f"COPY (SELECT {_READ_MASKED_COLUMNS} FROM masked) "
+                f"TO '{_sql_str(target)}' (FORMAT FASTQ, COMPRESSION 'gzip')"
+            ),
+            pairs,
+        )
+    else:
+        raise ValueError(f"unsupported export format: {fmt!r}")
 
 
 def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -1356,9 +1391,10 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     per-sample files. system_admin only (admin:masked_read_export).
 
     GETs the roster manifest, then for each sample mints a just-in-time DoGet
-    ticket and streams its read_masked rows from the data plane straight into a
-    local DuckDB COPY — so a large pool never buffers in memory or on an
-    intermediate disk hop. Per-sample writes are atomic and 0600.
+    ticket and streams its read_masked rows from the data plane straight to disk
+    (parquet via a pyarrow ParquetWriter; fastq.gz via one shared miint DuckDB
+    connection reused across every sample) — so a large pool never buffers in
+    memory or on an intermediate disk hop. Per-sample writes are atomic and 0600.
 
     Fails loudly (exit 1, nothing written) if any sample lacks a usable
     biosample_accession (missing — not yet NCBI-submitted — or outside the safe
@@ -1366,6 +1402,7 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     sample can't leave a partial export.
     """
     import pyarrow.flight as flight  # noqa: PLC0415
+    import pyarrow.ipc as ipc  # noqa: PLC0415
 
     output_dir: Path = args.output_dir
     if not output_dir.is_dir():
@@ -1417,6 +1454,29 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
         )
         return 1
 
+    # Only the fastq path feeds Flight batches into DuckDB (the miint FORMAT FASTQ
+    # writer), which routes a registered pyarrow reader through pyarrow.dataset →
+    # Acero. Flight hands us each RecordBatch by zero-copying the gRPC message
+    # body, whose absolute base address carries no element-alignment guarantee, so
+    # a uint64/int32 column buffer routinely lands off its natural alignment even
+    # though the data plane writes 64-byte-aligned IPC (arrow-rs default), and
+    # Acero then logs a "poorly aligned input buffer" warning per misaligned column
+    # per batch (apache/arrow#37195). Ask the Flight reader to realign each buffer
+    # to its type's required alignment on receive (DataTypeSpecific copies only the
+    # small offset/validity/fixed-width buffers, leaving the bulk sequence/quality
+    # byte buffers zero-copy). The parquet path streams straight to a ParquetWriter
+    # (no Acero), so it needs no realignment and keeps those bulk buffers zero-copy.
+    read_opts = (
+        flight.FlightCallOptions(
+            read_options=ipc.IpcReadOptions(ensure_alignment=ipc.Alignment.DataTypeSpecific)
+        )
+        if args.format == "fastq"
+        else None
+    )
+    # The fastq writer needs a miint DuckDB connection; open it once and reuse it
+    # across all samples (each sample re-registers the `masked` view) rather than
+    # paying a fresh connect + extension LOAD per sample. Parquet needs no DuckDB.
+    con = connect_with_miint() if args.format == "fastq" else None
     flight_client = flight.FlightClient(args.data_plane_url)
     try:
         for s in samples:
@@ -1429,14 +1489,16 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
                 json={"prep_sample_idx": prep, "mask_idx": args.mask_idx},
             )
             ticket_bytes = base64.b64decode(ticket_resp["ticket"])
-            reader = flight_client.do_get(flight.Ticket(ticket_bytes)).to_reader()
+            reader = flight_client.do_get(flight.Ticket(ticket_bytes), read_opts).to_reader()
             stem = f"{s['biosample_accession']}.{run_idx}.{pool_idx}.{prep}"
-            _write_masked_sample(reader, stem, output_dir, args.format)
+            _write_masked_sample(reader, stem, output_dir, args.format, con)
     except httpx.HTTPStatusError as exc:
         print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
         return 1
     finally:
         flight_client.close()
+        if con is not None:
+            con.close()
 
     print(f"exported {len(samples)} sample(s) from sequenced_pool {pool_idx} to {output_dir}")
     return 0
