@@ -856,7 +856,7 @@ the `no-changelog` label).
   `/run` redrive clearing failed rows) now clears its stale attempt dir first,
   so the prior run's read-only (0o440) output can't trip the output verifier or
   block the overwrite — guarded so resume-adoption never touches a live dir.
-  (#TBD)
+  (#193)
 - `read-mask` (1.0.0) and `fastq-to-parquet` (1.3.0) workflows ran
   `persist-read-metrics` *after* `register-files`, but `register-files` MOVES
   `read_mask.parquet` out of the staging dir into permanent DuckLake storage —
