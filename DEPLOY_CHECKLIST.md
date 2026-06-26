@@ -55,6 +55,18 @@ _None yet._
   the export re-runs `qiita-admin login` (or mints a fresh PAT) to obtain a token that
   includes it; the loopback login grants the full role ceiling, so no scope need be
   named. No new env var, host dir, migration, or service-account grant.
+- (#192) New system_admin-only scope `admin:masked_read_export`, gating the per-pool
+  masked-read export (`GET /admin/sequenced-pool/{idx}/masked-read-export` + `POST
+  /admin/masked-read-export/ticket` + `qiita-admin masked-read-export`). Pure-Python
+  scope (no migration); added to the system_admin ceiling in `auth/scopes.py`. Same
+  PAT story as `admin:biosample_owner_id_read` above — **an existing system_admin PAT
+  does not carry it until re-minted** (`qiita-admin login` or a fresh PAT). The export
+  only ever reads the data plane's `read_masked` view (`WHERE reason='pass'`), so no
+  privacy surface is widened. The CLI runs on the operator's **client** host and needs
+  `miint`+`duckdb` available there (same as `qiita reference load`) — no server-side
+  env var, host dir, migration, or service-account grant. The data-plane DoGet now
+  streams its result set instead of buffering it whole; picked up by the normal
+  binary restart, no operator action.
 
 ---
 

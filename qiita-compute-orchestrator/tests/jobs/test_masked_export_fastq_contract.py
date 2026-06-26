@@ -82,8 +82,7 @@ def test_single_end_fastq_write_encodes_qual_phred33(tmp_path: Path) -> None:
     with open_miint_conn() as conn:
         _seed_single_end(conn)
         conn.execute(
-            f"COPY (SELECT read_id, sequence1, qual1 FROM masked) "
-            f"TO '{out}' (FORMAT FASTQ)"
+            f"COPY (SELECT read_id, sequence1, qual1 FROM masked) TO '{out}' (FORMAT FASTQ)"
         )
     assert out.read_text().splitlines() == ["@readS", "GGGGCCCC", "+", "IIIIIIII"]
 

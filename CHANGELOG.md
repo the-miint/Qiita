@@ -15,6 +15,22 @@ the `no-changelog` label).
 
 ### Added
 
+- Admin per-pool **masked-read export**: pull a sequenced_pool's masked sequence
+  data to local disk, per sample, as parquet or fastq. New `qiita-admin
+  masked-read-export --sequenced-pool-idx P --mask-idx M [--format parquet|fastq]
+  --output-dir DIR --data-plane-url U` CLI, backed by two routes — `GET
+  /api/v1/admin/sequenced-pool/{idx}/masked-read-export?mask_idx=` (roster
+  manifest) and `POST /api/v1/admin/masked-read-export/ticket` (per-sample DoGet
+  ticket). The CLI streams each sample's `read_masked` rows straight from the data
+  plane into a local DuckDB+miint `COPY` (bounded memory, no server-side scratch),
+  writing `<biosample_accession>.<run>.<pool>.<prep>` files atomically at mode
+  0600: `.parquet`, or `.fastq` (single-end) / `.R1.fastq`+`.R2.fastq` (paired,
+  via miint's `{ORIENTATION}`; pairing is detected by peeking the first streamed
+  batch, so the stream is never materialized). Dual-gated by `system_admin` + a new
+  `admin:masked_read_export` scope. Privacy invariant unchanged: the `read_masked`
+  view (`WHERE reason='pass'`) is the only Flight-reachable read surface, so
+  host/QC reads are never exported. The data-plane DoGet now streams its result
+  set instead of buffering it whole. (#192)
 - New `GET /api/v1/admin/study/{study_idx}/owner-biosample-id` route + `qiita-admin
   owner-biosample-id` CLI: a system_admin-only re-identification export mapping a
   study's `biosample_idx` + `biosample_accession` back to the owner-submitted
