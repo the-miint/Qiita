@@ -134,11 +134,13 @@ steps:
     inputs: [convert_dir, sample_map, reads_staging_root]
     outputs: [read_staging_dir]
     baseline_resources:
-      # Sequential per-sample parse loop (read_fastx → sequence_idx). mem_gb
-      # sits above ingest_reads.py's DuckDB cap (7); walltime covers a full
-      # plate of per-sample parses, under the ceiling.
-      cpu: 2
-      mem_gb: 8
+      # Bounded-concurrent per-sample loop: up to _CONCURRENCY (4) samples are
+      # parsed/minted/written at once, 2 DuckDB threads each (keeps the sort
+      # parallel so wells clear fast) -> cpu = 4*2 = 8. ingest_reads.py splits
+      # mem_gb across the 4 slots from the cgroup (~12 GB/slot). walltime covers
+      # a full plate, under the ceiling (concurrency only lowers wall-clock).
+      cpu: 8
+      mem_gb: 56
       walltime: PT8H
 
   # Load the per-sample read parts into the DuckLake `read` table. The

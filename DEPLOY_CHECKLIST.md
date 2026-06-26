@@ -31,7 +31,12 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- `bcl-convert/1.0.0`'s `ingest_reads` step now requests `cpu: 8 / mem_gb: 56`
+  (was 2 / 8) — it parses up to 4 pool samples concurrently. The change syncs
+  automatically via `qiita-admin actions sync` during the deploy (no manual
+  step); just confirm the SLURM partition can schedule an 8-CPU / 56 GB job for
+  that step. The sibling `bcl_convert` step already requests cpu 16 / mem 480 on
+  the same partition, so this is well within reach. (#201)
 
 ### Notes (no host action)
 
