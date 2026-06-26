@@ -35,6 +35,38 @@ _None yet._
 
 ### Notes (no host action)
 
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-25 — 980078e
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
+_None yet._
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
+
+_None yet._
+
+#### Notes (no host action)
+
 - `read-mask/1.0.0` audience tightened to `[wet_lab_admin, system_admin]` (drops
   plain `user`): submitting a read mask (host filter / QC reprocessing) now drives
   the data plane to re-materialize the sample's RAW (human-containing) reads, so it
@@ -67,12 +99,6 @@ _None yet._
   env var, host dir, migration, or service-account grant. The data-plane DoGet now
   streams its result set instead of buffering it whole; picked up by the normal
   binary restart, no operator action.
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-25 — 8f4d4cd
 
