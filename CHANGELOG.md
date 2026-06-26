@@ -855,7 +855,7 @@ the `no-changelog` label).
   attempt dir** instead of deleting the orphaned one (which is left intact for
   postmortem), reusing the existing per-attempt isolation rather than reaching
   into a foreign-owned tree. Resume-adoption still reuses a dir owned by a live
-  progress row. (#TBD)
+  progress row. (#195)
 - `run-preflight update-lane` now actually takes effect on a `ticket run`
   redrive. Correcting a pool's preflight makes any samplesheet a *successful*
   `bcl_convert_prep` already produced stale, but a redrive fast-forwards that
