@@ -141,6 +141,27 @@ def test_ingests_every_sample_once(fake_mint, tmp_path):
         assert part.exists() and part.stat().st_ino == durable.stat().st_ino
 
 
+def test_concurrent_pool_ingests_every_sample_above_cap(fake_mint, tmp_path):
+    """A pool larger than the concurrency cap ingests every sample: the bounded
+    asyncio.gather fan-out mints once per sample (with the exact count) and
+    writes each durable copy + register part. n = _CONCURRENCY + 2 forces the
+    semaphore to actually gate (more samples in flight than slots)."""
+    n = ingest_module._CONCURRENCY + 2
+    # sample i carries i reads (all non-empty), so its minted count is i.
+    samples = {str(i): [(f"r{i}_{j}", "ACGT") for j in range(i)] for i in range(1, n + 1)}
+    convert_dir = _seed_convert_dir(tmp_path, samples)
+    inputs = _inputs(tmp_path, convert_dir, [(i, str(i)) for i in range(1, n + 1)])
+
+    outputs = _run(inputs, tmp_path / "ws")
+
+    # One mint per sample, each with that sample's exact read count.
+    assert sorted(fake_mint) == [(i, i) for i in range(1, n + 1)]
+    register_dir = outputs["read_staging_dir"] / "read"
+    for i in range(1, n + 1):
+        assert compute_reads_staging_path(inputs.reads_staging_root, i).exists()
+        assert (register_dir / f"{i}.parquet").exists()
+
+
 def test_empty_well_is_skipped(fake_mint, tmp_path):
     """A zero-record FASTQ is an empty well: no mint, no reads — but the pool
     still succeeds via its non-empty samples."""
