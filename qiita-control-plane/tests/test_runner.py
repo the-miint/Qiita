@@ -482,6 +482,51 @@ async def test_rerun_wipes_stale_attempt_dir(
     assert state == "completed"
 
 
+async def test_rerun_fails_loud_when_stale_dir_cannot_be_cleared(
+    postgres_pool, pending_work_ticket, library_spy, tmp_path, monkeypatch
+):
+    """If the stale-dir wipe itself can't complete (e.g. a workspace group /
+    permission drift), the runner fails the ticket LOUDLY with a clear reason
+    rather than `ignore_errors`-swallowing it and letting the stale 0o440 output
+    trip the downstream verifier with an opaque error."""
+    import shutil as _shutil
+
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = pending_work_ticket["work_ticket_idx"]
+
+    stale_dir = workspace_root / str(work_ticket_idx) / "hash" / "attempt-0"
+    stale_dir.mkdir(parents=True, exist_ok=True)
+    (stale_dir / "stale.txt").write_text("stale")
+
+    # Make rmtree fail only for the attempt dir; everything else (e.g. tmp_path
+    # teardown) keeps working.
+    real_rmtree = _shutil.rmtree
+
+    def boom(path, *args, **kwargs):
+        if "attempt-0" in str(path):
+            raise PermissionError("simulated: cannot remove stale dir")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr("qiita_control_plane.runner.shutil.rmtree", boom)
+
+    backend = FakeBackendClient()
+    _populate_step_outputs(backend, workspace_root / str(work_ticket_idx))
+
+    with pytest.raises(BackendFailure):
+        await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, failure_type, failure_stage, failure_step_name, failure_reason"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    assert row["state"] == "failed"
+    assert row["failure_type"] == "permanent"
+    assert row["failure_stage"] == "step_run"
+    assert row["failure_step_name"] == "hash"
+    assert "could not clear stale attempt dir" in row["failure_reason"]
+
+
 async def test_failure_marks_ticket_and_reference_failed(
     postgres_pool, pending_work_ticket, library_spy, tmp_path
 ):

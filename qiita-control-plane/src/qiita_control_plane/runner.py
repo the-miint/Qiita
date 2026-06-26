@@ -713,7 +713,20 @@ async def _run_entry_with_retry(
                 entry.name,
                 attempt,
             )
-            shutil.rmtree(attempt_workspace, ignore_errors=True)
+            try:
+                shutil.rmtree(attempt_workspace)
+            except OSError as exc:
+                # Fail loud rather than ignore_errors: a silent miss here (e.g.
+                # a workspace group/permission drift) would leave the prior
+                # attempt's stale 0o440 output in place, and the re-run would die
+                # downstream with an opaque "file not in manifest" verifier error
+                # that hides this root cause.
+                raise BackendFailure(
+                    kind=FailureKind.UNKNOWN_PERMANENT,
+                    stage=WorkTicketFailureStage.STEP_RUN,
+                    step_name=entry.name,
+                    reason=f"could not clear stale attempt dir {attempt_workspace}: {exc}",
+                ) from exc
         attempt_workspace.mkdir(parents=True, exist_ok=True)
         try:
             if isinstance(entry, WorkflowStep):
