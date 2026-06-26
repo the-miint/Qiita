@@ -1167,8 +1167,12 @@ async def run_work_ticket(
             # attempt would collide (the step_progress writers reject any
             # transition out of `failed`, and record_failed refuses
             # failed→failed), wedging the redrive on the dead row. Dropping
-            # them clears attempt-0 for a fresh run; `completed` rows are KEPT
-            # so the runner still fast-forwards already-finished entries.
+            # them lets the runner re-enter each entry fresh: finding the prior
+            # run's now-orphaned on-disk attempt dir, it advances past it to a
+            # fresh attempt dir (it can neither reuse the stale read-only output
+            # nor delete the SLURM-job-owned dir — see runner `_attempt_is_unowned`).
+            # `completed` rows are KEPT so the runner still fast-forwards
+            # already-finished entries.
             # Safe because a FAILED ticket has no in-flight job — every step
             # row is terminal, so this never races the resume-adoption path.
             await conn.execute(

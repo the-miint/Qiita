@@ -32,9 +32,9 @@ from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.models import StepType, WorkTicketFailureStage
 
 from qiita_control_plane.runner import (
+    _attempt_is_unowned,
     _escalated_mem_floor_after_oom,
     _resolve_baseline_for_step,
-    _should_wipe_attempt_dir,
 )
 
 # A generous ceiling that the happy-path fixtures stay well under; the
@@ -351,19 +351,20 @@ def test_escalation_full_sequence_to_ceiling():
     assert trajectory == [64, 128, 128, 128]
 
 
-def test_should_wipe_attempt_dir():
-    """Guard for the fresh-re-run attempt-dir wipe. A pre-existing progress row
+def test_attempt_is_unowned():
+    """Guard for the fresh-re-run attempt-dir advance. A pre-existing progress row
     for this exact (step_index, attempt) means resume-adoption is in play (the
-    runner re-attaches to the live job and reuses its dir) — never wipe. No row
-    means a fresh re-run (e.g. a redrive whose completed prep row was invalidated,
-    or `/run` having dropped the failed row): the prior attempt's stale, read-only
-    output must not survive, so wipe."""
+    runner re-attaches to the live job and reuses its dir) — the attempt is owned,
+    leave it. No row means the attempt is unowned: a fresh re-run (e.g. a redrive
+    whose completed prep row was invalidated, or `/run` having dropped the failed
+    row), so any attempt dir on disk is orphaned and the runner advances past it
+    to a fresh one rather than deleting the SLURM-job-owned output."""
     rows = [SimpleNamespace(step_index=0, attempt=0)]
-    # Pre-existing row for this exact (step_index, attempt) → adoption, no wipe.
-    assert _should_wipe_attempt_dir(rows, step_index=0, attempt=0) is False
-    # No rows at all → fresh re-run, wipe.
-    assert _should_wipe_attempt_dir([], step_index=0, attempt=0) is True
+    # Pre-existing row for this exact (step_index, attempt) → adoption, owned.
+    assert _attempt_is_unowned(rows, step_index=0, attempt=0) is False
+    # No rows at all → fresh re-run, unowned.
+    assert _attempt_is_unowned([], step_index=0, attempt=0) is True
     # A row for a different attempt of the same step → this attempt is fresh.
-    assert _should_wipe_attempt_dir(rows, step_index=0, attempt=1) is True
-    # A row for a different step → unrelated to this dir, wipe it.
-    assert _should_wipe_attempt_dir(rows, step_index=1, attempt=0) is True
+    assert _attempt_is_unowned(rows, step_index=0, attempt=1) is True
+    # A row for a different step → unrelated to this dir, unowned.
+    assert _attempt_is_unowned(rows, step_index=1, attempt=0) is True

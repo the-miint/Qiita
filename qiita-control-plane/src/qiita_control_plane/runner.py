@@ -12,15 +12,18 @@ SLURM-driver role behind `POST /step/*`.
 Workspace contract: each entry runs against a per-attempt subdir
 `<work_ticket_workspace_root>/<work_ticket_idx>/<entry-name>/attempt-<N>/`
 minted by `_run_entry_with_retry`. The nesting gives two properties at
-once — retries land in fresh dirs (the verifier's "every file in
-$output_path must be in manifest" gate stays clean), and prior attempts
-persist on disk for postmortem. The one exception: an entry RE-RUN whose
-progress row was deliberately dropped (a `/run` redrive, or `update-lane`
-invalidating a completed prep row) clears its stale attempt dir first, since
-the prior output is known-bad and its read-only files would otherwise block
-the re-run (see `_should_wipe_attempt_dir`). Entries see each other's outputs
-via the runner's binding map, which carries absolute paths forward so
-consumers don't need to know the producer's attempt number.
+once — retries (and re-runs) land in fresh dirs (the verifier's "every file
+in $output_path must be in manifest" gate stays clean), and prior attempts
+persist on disk for postmortem. An entry RE-RUN whose progress row was
+deliberately dropped (a `/run` redrive, or `update-lane` invalidating a
+completed prep row) skips past its now-orphaned attempt dir to a fresh one
+rather than reusing it: the prior output is known-bad and its read-only files
+would block the re-run, and the runner cannot delete that dir — a container
+step's output is owned by the SLURM job user with read-only (0550) dirs the
+control-plane process can neither unlink nor chmod (see `_attempt_is_unowned`).
+Entries see each other's outputs via the runner's binding map, which carries
+absolute paths forward so consumers don't need to know the producer's attempt
+number.
 """
 
 from __future__ import annotations
@@ -29,7 +32,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -697,36 +699,31 @@ async def _run_entry_with_retry(
     effective_mem_override = mem_gb_override
     while True:
         attempt_workspace = workspace / entry.name / f"attempt-{attempt}"
-        # Clear a stale attempt dir before re-running into it. This fires only
-        # when no start-of-run progress row owns this (step_index, attempt) — a
-        # fresh re-run after the row was deliberately dropped (a /run redrive, or
-        # update-lane invalidating a completed prep row). The prior attempt's
-        # read-only (0o440) output + manifest would otherwise survive and trip the
-        # verifier or block the overwrite. A row PRESENT means resume-adoption
-        # owns the dir (see `_should_wipe_attempt_dir`), so it is left intact.
-        if attempt_workspace.exists() and _should_wipe_attempt_dir(
+        # Skip past a stale attempt dir to a fresh one. This fires only when an
+        # attempt dir already exists on disk but NO start-of-run progress row
+        # owns this (step_index, attempt) — i.e. a re-run after the row was
+        # deliberately dropped (a /run redrive, or update-lane invalidating a
+        # completed prep row). The orphaned dir holds the prior run's known-bad
+        # output (read-only 0o440 files under 0550 dirs), which we can neither
+        # reuse (it would trip the verifier or block the overwrite) nor delete —
+        # a container step's output is owned by the SLURM job user, so the
+        # control-plane process here can't unlink or chmod it. So advance to the
+        # next attempt dir, which this process creates fresh. A row PRESENT means
+        # resume-adoption owns the dir (see `_attempt_is_unowned`):
+        # `_adopt_or_submit` must re-attach to its live job and reuse the
+        # workspace, so we leave it and proceed.
+        if attempt_workspace.exists() and _attempt_is_unowned(
             prior_progress, step_index=index, attempt=attempt
         ):
             _log.info(
-                "work_ticket %d entry %r attempt %d: clearing stale attempt dir before re-run",
+                "work_ticket %d entry %r attempt %d: orphaned attempt dir from a "
+                "dropped progress row; advancing to a fresh attempt dir",
                 work_ticket_idx,
                 entry.name,
                 attempt,
             )
-            try:
-                shutil.rmtree(attempt_workspace)
-            except OSError as exc:
-                # Fail loud rather than ignore_errors: a silent miss here (e.g.
-                # a workspace group/permission drift) would leave the prior
-                # attempt's stale 0o440 output in place, and the re-run would die
-                # downstream with an opaque "file not in manifest" verifier error
-                # that hides this root cause.
-                raise BackendFailure(
-                    kind=FailureKind.UNKNOWN_PERMANENT,
-                    stage=WorkTicketFailureStage.STEP_RUN,
-                    step_name=entry.name,
-                    reason=f"could not clear stale attempt dir {attempt_workspace}: {exc}",
-                ) from exc
+            attempt += 1
+            continue
         attempt_workspace.mkdir(parents=True, exist_ok=True)
         try:
             if isinstance(entry, WorkflowStep):
@@ -3050,21 +3047,24 @@ def _completed_progress_row(
     return None
 
 
-def _should_wipe_attempt_dir(
+def _attempt_is_unowned(
     prior_progress: list[step_progress.StepProgressRow], *, step_index: int, attempt: int
 ) -> bool:
-    """Whether to clear an entry's attempt dir before (re-)running into it.
+    """Whether this entry's `(step_index, attempt)` is unowned by a start-of-run
+    progress row — i.e. the caller may treat any attempt dir on disk as orphaned.
 
     Keyed on the START-OF-RUN progress (the snapshot loaded once before the
     loop). A pre-existing row for this exact `(step_index, attempt)` means a
     prior process owns the dir and we're resuming/adopting it — `_adopt_or_submit`
-    re-attaches to that row's job and must reuse its workspace, so NEVER wipe. No
-    such row means this attempt is starting fresh: either a first dispatch (dir
-    absent — wipe is a no-op) or a re-run whose row was deliberately dropped (a
-    `/run` redrive clearing failed rows, or `update-lane` invalidating a completed
-    prep row). In the re-run case the prior attempt left stale, read-only (0o440)
-    output + manifest on disk that would trip the output verifier or block an
-    overwrite, so the dir must be cleared first."""
+    re-attaches to that row's job and must reuse its workspace, so it is NOT
+    unowned (return False; leave the dir alone). No such row means the attempt is
+    unowned: either a first dispatch (dir absent — the caller just mkdirs it) or a
+    re-run whose row was deliberately dropped (a `/run` redrive clearing failed
+    rows, or `update-lane` invalidating a completed prep row). In the re-run case
+    the prior attempt left stale, read-only (0o440) output + manifest on disk that
+    must not be reused; the caller advances to a fresh attempt dir rather than
+    deleting it (the output is owned by the SLURM job user — the control plane
+    can't unlink or chmod it)."""
     return not any(
         row.step_index == step_index and row.attempt == attempt for row in prior_progress
     )

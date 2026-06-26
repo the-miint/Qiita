@@ -845,6 +845,17 @@ the `no-changelog` label).
 
 ### Fixed
 
+- A dropped-row step re-run (a `run-preflight update-lane` redrive, or a `/run`
+  redrive) no longer fails when its prior attempt dir is still on disk. The
+  previous fix had the control-plane runner `shutil.rmtree` that dir, but a
+  container step's output is owned by the SLURM job user with read-only (0550)
+  dirs — the control-plane process can neither unlink nor chmod it, so the wipe
+  died with `EACCES` ("could not clear stale attempt dir … Permission denied")
+  and failed the ticket at `step_run`. The runner now **advances to a fresh
+  attempt dir** instead of deleting the orphaned one (which is left intact for
+  postmortem), reusing the existing per-attempt isolation rather than reaching
+  into a foreign-owned tree. Resume-adoption still reuses a dir owned by a live
+  progress row. (#TBD)
 - `run-preflight update-lane` now actually takes effect on a `ticket run`
   redrive. Correcting a pool's preflight makes any samplesheet a *successful*
   `bcl_convert_prep` already produced stale, but a redrive fast-forwards that
