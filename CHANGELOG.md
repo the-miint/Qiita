@@ -856,7 +856,7 @@ the `no-changelog` label).
   DataTypeSpecific)`), which copies only the small offset/validity/fixed-width
   buffers and leaves the bulk sequence/quality byte buffers zero-copy. Benign on
   x86_64 (output was always correct) — this only silences the noise. Upstream:
-  apache/arrow#37195. (#TBD)
+  apache/arrow#37195. (#198)
 - bcl-convert `ingest_reads` now retries transparently after an OOM mid-write.
   A pool sample whose range was minted by a prior attempt that then crashed
   before publishing its durable `read.parquet` (the classic case: OOM-killed
