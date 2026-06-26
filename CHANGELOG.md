@@ -460,6 +460,20 @@ the `no-changelog` label).
 
 ### Changed
 
+- `qiita-admin masked-read-export` is faster and its fastq output is now
+  gzip-compressed. The **parquet** path streams the Flight reader straight to a
+  `pyarrow.parquet.ParquetWriter` instead of `DuckDB COPY`, so the bulk read bytes
+  are no longer materialized into DuckDB vectors (one fewer full copy) and the
+  parquet path no longer loads the miint extension at all (measured ~1.6× faster
+  on a synthetic stream, and zero Acero passes). The streamed batches are coalesced
+  into row groups sized by `qiita_common.parquet.ROW_GROUP_SIZE_BYTES` (the 64 MB
+  byte cap from `PARQUET_OPTS`, now exported as an int), so the file keeps the
+  byte-sized row-group layout qiita uses everywhere instead of one tiny row group
+  per ~2048-row DataChunk. The **fastq** path writes
+  `<stem>.fastq.gz` / `<stem>.R1.fastq.gz` + `<stem>.R2.fastq.gz` (`FORMAT FASTQ,
+  COMPRESSION 'gzip'`) instead of uncompressed `.fastq`, and reuses a single
+  miint DuckDB connection across all samples rather than opening one (with an
+  extension `LOAD`) per sample. (#198)
 - `runner._resolve_staged_reads` now falls back to the data plane when a
   read-mask workflow can't find the prep_sample's ephemeral durable staging copy:
   it signs an `export_read` action token and binds the per-ticket `reads.parquet`
@@ -851,12 +865,12 @@ the `no-changelog` label).
   address carries no element-alignment guarantee, so a column buffer routinely
   lands off its natural alignment even though the data plane writes 64-byte-aligned
   IPC; DuckDB then scans the registered reader through `pyarrow.dataset` → Acero,
-  which warns. The export now asks the Flight reader to realign each buffer to its
-  type's required alignment on receive (`IpcReadOptions(ensure_alignment=
-  DataTypeSpecific)`), which copies only the small offset/validity/fixed-width
-  buffers and leaves the bulk sequence/quality byte buffers zero-copy. Benign on
-  x86_64 (output was always correct) — this only silences the noise. Upstream:
-  apache/arrow#37195. (#198)
+  which warns. The fastq path (which still uses DuckDB+miint) now asks the Flight
+  reader to realign each buffer to its type's required alignment on receive
+  (`IpcReadOptions(ensure_alignment=DataTypeSpecific)`, copying only the small
+  offset/validity/fixed-width buffers); the parquet path bypasses DuckDB/Acero
+  entirely (see Changed). Benign on x86_64 (output was always correct) — this only
+  silences the noise. Upstream: apache/arrow#37195. (#198)
 - bcl-convert `ingest_reads` now retries transparently after an OOM mid-write.
   A pool sample whose range was minted by a prior attempt that then crashed
   before publishing its durable `read.parquet` (the classic case: OOM-killed
