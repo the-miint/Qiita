@@ -2591,3 +2591,53 @@ class ReadMaskedDoGetTicketRequest(BaseModel):
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     mask_idx: Annotated[int, Field(gt=0)]
+
+
+class MaskedReadExportSample(BaseModel):
+    """One sample in a sequenced_pool's masked-read export manifest.
+
+    `biosample_accession` is None until the biosample is submitted to NCBI. The
+    per-sample output filename
+    `<biosample_accession>.<sequencing_run_idx>.<sequenced_pool_idx>.<prep_sample_idx>`
+    requires it, so the export refuses a sample whose accession is still None —
+    the manifest surfaces the None rather than silently dropping the sample, and
+    the export route/CLI fails loudly on it. The pool-wide
+    `sequencing_run_idx`/`sequenced_pool_idx` live on the manifest, not repeated
+    per row.
+    """
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    biosample_accession: str | None
+
+
+class MaskedReadExportManifest(BaseModel):
+    """Returned by GET /admin/sequenced-pool/{sequenced_pool_idx}/masked-read-export.
+
+    The roster of a sequenced_pool's non-retired samples to export under a given
+    `mask_idx`, with each sample's filename parts. The caller then mints a
+    per-sample DoGet ticket (POST /admin/masked-read-export/ticket) and streams
+    each sample's read_masked rows from the data plane, writing parquet/fastq
+    locally. system_admin + admin:masked_read_export only.
+    """
+
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    mask_idx: Annotated[int, Field(gt=0)]
+    samples: list[MaskedReadExportSample]
+
+
+class MaskedReadExportTicketRequest(BaseModel):
+    """Body for POST /admin/masked-read-export/ticket.
+
+    Mints a Flight DoGet ticket scoped to one (prep_sample_idx, mask_idx) on the
+    data plane's read_masked view — the human (system_admin) counterpart to the
+    service-account POST /read-masked/ticket/doget. Minted just-in-time per
+    sample by the export CLI. Both identifiers mandatory (the data plane's
+    empty-filter path would dump every sample's pass reads). system_admin +
+    admin:masked_read_export only.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    mask_idx: Annotated[int, Field(gt=0)]
