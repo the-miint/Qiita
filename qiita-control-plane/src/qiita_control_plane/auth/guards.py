@@ -164,6 +164,33 @@ def require_scope(scope: str) -> Callable[..., Principal]:
     return _dep
 
 
+def require_any_scope(*scopes: str) -> Callable[..., Principal]:
+    """Factory: like `require_scope`, but passes when the principal holds
+    *at least one* of `scopes` (logical OR). 401s on Anonymous, 403s when
+    none of the scopes are present.
+
+    Use for a route reachable by two distinct capabilities. The motivating
+    case is `GET /sequence-range/{idx}`: a `prep_sample:read` human reads
+    any sample's range, AND the `sequence_range:mint` minter reads back its
+    own range on the ingest retry path (it deliberately does not hold
+    `prep_sample:read`). Accepts Scope members or bare strings; normalised
+    so the 403 detail renders the plain values.
+    """
+    scope_strs = tuple(str(s) for s in scopes)
+
+    def _dep(p: Principal = Depends(get_current_principal)) -> Principal:
+        if isinstance(p, Anonymous):
+            raise HTTPException(status_code=401, detail=_MSG_AUTH_REQUIRED)
+        if not any(p.has_scope(s) for s in scope_strs):
+            raise HTTPException(
+                status_code=403,
+                detail=f"missing one of required scopes {list(scope_strs)!r}",
+            )
+        return p
+
+    return _dep
+
+
 def require_service_with_scope(scope: str) -> Callable[..., ServiceAccount]:
     """Factory: bundle `require_service` + a scope check into one dep,
     with the ordering wired as a *data-flow* edge in the dep graph.

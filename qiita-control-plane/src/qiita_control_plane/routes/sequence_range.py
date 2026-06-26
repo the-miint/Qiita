@@ -6,9 +6,13 @@ humans never mint sequence ranges. The cap on a single allocation is
 read from Settings.max_sequence_mint_count (so a runaway compute step
 can't burn an unbounded slice of the sequence_idx space).
 
-GET /sequence-range/{prep_sample_idx} reads the row back. Gated on the
-existing `prep_sample:read` scope so any caller who can see the
-prep_sample can see its allocated range.
+GET /sequence-range/{prep_sample_idx} reads the row back. Gated on
+`prep_sample:read` OR `sequence_range:mint` (either-or): any caller who
+can see the prep_sample can see its allocated range, AND the minter can
+read back the range it just minted. The latter is what makes the
+ingest_reads retry path transparent — a step that minted then crashed
+before the durable write reuses the existing range on retry instead of
+failing on the one-shot mint contract.
 
 Why a dedicated REST router (not a `LibraryPrimitive` dispatch like
 `MINT_FEATURES` in `actions/library.py`): sequence-range allocation is
@@ -28,7 +32,7 @@ from qiita_common.api_paths import (
 from qiita_common.auth_constants import Scope
 from qiita_common.models import SequenceRange, SequenceRangeMintRequest
 
-from ..auth.guards import require_scope, require_service_with_scope
+from ..auth.guards import require_any_scope, require_service_with_scope
 from ..auth.principal import Principal, ServiceAccount
 from ..deps import TxConnFactory, get_db_pool, get_settings, get_tx_conn_factory
 from ..repositories.sequence_range import (
@@ -121,13 +125,19 @@ async def mint_sequence_range_route(
 async def get_sequence_range_route(
     prep_sample_idx: int,
     pool: asyncpg.Pool = Depends(get_db_pool),
-    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
+    _scope: Principal = Depends(
+        require_any_scope(Scope.PREP_SAMPLE_READ, Scope.SEQUENCE_RANGE_MINT)
+    ),
 ) -> SequenceRange:
     """Return the sequence_range row for `prep_sample_idx`, or 404.
 
-    SECURITY: gated by `prep_sample:read` scope only — no per-row ACL.
-    Any caller holding the scope can fetch the row for any
-    prep_sample_idx. Concrete information exposed to such a caller:
+    SECURITY: gated by `prep_sample:read` OR `sequence_range:mint` — no
+    per-row ACL. Any caller holding either scope can fetch the row for any
+    prep_sample_idx. The `sequence_range:mint` arm lets the compute SA
+    (which holds mint but deliberately not `prep_sample:read`) read back
+    its own range on the ingest_reads retry path; the disclosure set below
+    is the same one the minter already learns by minting. Concrete
+    information exposed to such a caller:
 
     - **Read count** for the prep_sample
       (`sequence_idx_stop - sequence_idx_start + 1`) — a
@@ -151,8 +161,10 @@ async def get_sequence_range_route(
     options remain open: a row-level ACL gate
     (limit reads to the prep_sample's owner + admins) and a response-
     surface trim (drop `created_at` from the wire model). The compute
-    orchestrator does not consume this endpoint (it mints over POST
-    only), so either tightening has no orchestrator-side fallout.
+    orchestrator consumes this endpoint on the ingest_reads retry path
+    (range reuse) via the `sequence_range:mint` arm, so a future
+    row-level ACL must keep the minter able to read back its own
+    freshly-minted range.
     """
     row = await fetch_sequence_range_by_prep_sample_idx(pool, prep_sample_idx)
     if row is None:

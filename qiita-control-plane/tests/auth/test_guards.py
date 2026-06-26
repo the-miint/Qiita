@@ -190,6 +190,46 @@ def test_require_scope_works_for_service_account_with_matching_scope():
 
 
 # ---------------------------------------------------------------------------
+# require_any_scope — passes on ANY one of the listed scopes
+# ---------------------------------------------------------------------------
+
+
+def test_require_any_scope_pass_when_first_present():
+    from qiita_control_plane.auth.guards import require_any_scope
+
+    dep = require_any_scope(Scope.PREP_SAMPLE_READ, Scope.SEQUENCE_RANGE_MINT)
+    h = _human(scopes=frozenset({Scope.PREP_SAMPLE_READ}))
+    assert dep(h) is h
+
+
+def test_require_any_scope_pass_when_second_present():
+    """The motivating case: the compute SA holds sequence_range:mint but not
+    prep_sample:read and must still pass the GET /sequence-range guard."""
+    from qiita_control_plane.auth.guards import require_any_scope
+
+    s = _service(scopes=frozenset({Scope.SEQUENCE_RANGE_MINT}))
+    dep = require_any_scope(Scope.PREP_SAMPLE_READ, Scope.SEQUENCE_RANGE_MINT)
+    assert dep(s) is s
+
+
+def test_require_any_scope_403_when_none_present():
+    from qiita_control_plane.auth.guards import require_any_scope
+
+    dep = require_any_scope(Scope.PREP_SAMPLE_READ, Scope.SEQUENCE_RANGE_MINT)
+    with pytest.raises(HTTPException) as exc:
+        dep(_service(scopes=frozenset({Scope.FEATURE_MINT})))
+    assert exc.value.status_code == 403
+
+
+def test_require_any_scope_401_on_anonymous():
+    from qiita_control_plane.auth.guards import require_any_scope
+
+    with pytest.raises(HTTPException) as exc:
+        require_any_scope(Scope.PREP_SAMPLE_READ, Scope.SEQUENCE_RANGE_MINT)(_anon())
+    assert exc.value.status_code == 401
+
+
+# ---------------------------------------------------------------------------
 # require_human_with_role — composes require_human + role check
 # ---------------------------------------------------------------------------
 # These tests exercise the role-check body of the helper directly.

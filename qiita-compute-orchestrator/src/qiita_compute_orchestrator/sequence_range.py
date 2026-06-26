@@ -1,30 +1,35 @@
 """Client for the control plane's sequence-range allocator.
 
-The orchestrator-side caller for `POST /api/v1/sequence-range` (CP
-route: qiita-control-plane/src/qiita_control_plane/routes/sequence_range.py).
-Native jobs that need a globally-unique bigint range per prep_sample
-(today: fastq_to_parquet) go through `mint_sequence_range` here.
+The orchestrator-side caller for the CP's `/api/v1/sequence-range`
+routes (qiita-control-plane/src/qiita_control_plane/routes/sequence_range.py).
+A native job mints a globally-unique bigint range per prep_sample via
+`mint_sequence_range`, and reads an existing one back via
+`get_sequence_range`.
 
-**Recovery model.** The CP's mint is idempotent only in that a second
-mint for the same prep_sample 409s — there is no GET-or-mint shape on
-the wire today. The GET endpoint exists but requires
-`prep_sample:read`, which the compute service-account deliberately
-does NOT hold (per docs/runbooks/compute-service-account-provisioning.md
-the SA is scope-minimal at `sequence_range:mint` only). So:
+**Recovery model.** The CP's mint 409s on a second mint for the same
+prep_sample. Two helpers cover the two recovery shapes:
 
-- First mint for a prep_sample: 201 + the range. Normal.
-- Mid-step failure after mint succeeded: the next attempt's mint
-  call 409s. This helper raises `SequenceRangeAlreadyExists`; the
-  caller (`fastq_to_parquet.execute`) is responsible for mapping it
-  to a `BackendFailure` with the right `FailureKind`. The helper
-  itself stays transport-agnostic — it doesn't reach for
-  BackendFailure or know about runner-level failure classification.
+- `mint_sequence_range` — POST; raises `SequenceRangeAlreadyExists` on
+  409. The `fastq_to_parquet` job maps that to a permanent
+  `BackendFailure` (its recovery is the operator-supplied
+  `pre_minted_range`; see docs/runbooks/fastq-to-parquet-retry-recovery.md).
+- `get_sequence_range` — GET; reads an existing range back, or None on
+  404. The `ingest_reads` job uses it for *transparent* retry: a pool
+  step that minted a sample's range then crashed before the durable
+  write reuses the existing range on the next attempt instead of
+  failing. This is what lets the runner's OOM memory-escalation pay off
+  on an oversized sample — the escalated retry reuses the range rather
+  than dying on the one-shot mint contract.
 
-A future improvement (out of scope for this PR) would add a
-`GET /sequence-range/{prep_sample_idx}` variant gated on
-`sequence_range:mint` so the minter can read back its own range. With
-that endpoint, retries become transparent. Track that as a CP-side
-follow-up.
+The GET endpoint accepts `sequence_range:mint` (as well as
+`prep_sample:read`), so the compute service-account — scope-minimal at
+`sequence_range:mint` per
+docs/runbooks/compute-service-account-provisioning.md — can read back
+its own range without holding `prep_sample:read`.
+
+Both helpers stay transport-agnostic: they raise typed exceptions /
+return None and never reach for `BackendFailure` or runner-level
+failure classification — the calling job owns that mapping.
 
 The 404 path (prep_sample doesn't exist or isn't eligible) is also
 typed: `PrepSampleNotEligibleForSequenceRange`. The submit-route
@@ -39,7 +44,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import httpx
-from qiita_common.api_paths import URL_SEQUENCE_RANGE_PREFIX
+from qiita_common.api_paths import (
+    URL_SEQUENCE_RANGE_BY_PREP_SAMPLE,
+    URL_SEQUENCE_RANGE_PREFIX,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +131,38 @@ async def mint_sequence_range(
         raise SequenceRangeAlreadyExists(prep_sample_idx, count)
     if resp.status_code == 404:
         raise PrepSampleNotEligibleForSequenceRange(prep_sample_idx)
+    resp.raise_for_status()
+    body = resp.json()
+    return MintedSequenceRange(
+        prep_sample_idx=body["prep_sample_idx"],
+        sequence_idx_start=body["sequence_idx_start"],
+        sequence_idx_stop=body["sequence_idx_stop"],
+    )
+
+
+async def get_sequence_range(
+    *,
+    http: httpx.AsyncClient,
+    prep_sample_idx: int,
+) -> MintedSequenceRange | None:
+    """GET /api/v1/sequence-range/{prep_sample_idx}; return the existing
+    range or None if the prep_sample has none yet (404).
+
+    Used by `ingest_reads` to read back a range a prior, crashed attempt
+    already minted, so the retry reuses it instead of re-minting (which
+    would 409). The CP route accepts the `sequence_range:mint` scope the
+    compute SA holds, so no `prep_sample:read` grant is needed.
+
+    `http` is the authed httpx client (Bearer with the compute SA PAT,
+    base_url = the CP), same as `mint_sequence_range`.
+
+    Raises:
+      httpx.HTTPStatusError: any non-200, non-404 (5xx, auth 401/403,
+        etc.). The caller maps these to BackendFailure based on status.
+    """
+    resp = await http.get(URL_SEQUENCE_RANGE_BY_PREP_SAMPLE.format(prep_sample_idx=prep_sample_idx))
+    if resp.status_code == 404:
+        return None
     resp.raise_for_status()
     body = resp.json()
     return MintedSequenceRange(

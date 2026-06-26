@@ -845,6 +845,20 @@ the `no-changelog` label).
 
 ### Fixed
 
+- bcl-convert `ingest_reads` now retries transparently after an OOM mid-write.
+  A pool sample whose range was minted by a prior attempt that then crashed
+  before publishing its durable `read.parquet` (the classic case: OOM-killed
+  writing an oversized sample) used to fail the retry with `prep_sample N has a
+  sequence_range but no durable read.parquet … delete the prep_sample` — which
+  defeated the runner's OOM memory-escalation, since the escalated attempt died
+  on the one-shot mint contract before spending its extra memory. The step now
+  reads the existing range back (`GET /sequence-range/{idx}`), validates it still
+  covers exactly the FASTQ's read count, and reuses it, so the escalated retry
+  completes with no orphaned range and no operator action. The GET route now
+  accepts `sequence_range:mint` (via a new `require_any_scope` guard) in addition
+  to `prep_sample:read`, letting the scope-minimal compute SA read back its own
+  range; a count mismatch fails `BAD_INPUT`, a range deleted mid-retry fails
+  `UNKNOWN_PERMANENT`. (#196)
 - A dropped-row step re-run (a `run-preflight update-lane` redrive, or a `/run`
   redrive) no longer fails when its prior attempt dir is still on disk. The
   previous fix had the control-plane runner `shutil.rmtree` that dir, but a
