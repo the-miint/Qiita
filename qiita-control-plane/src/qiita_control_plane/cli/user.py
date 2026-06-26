@@ -76,6 +76,7 @@ from qiita_common.models import (
     ReferenceStatus,
     ScopeTargetKind,
     SequencedPoolCreateRequest,
+    SequencedPoolPreflightUpdateLaneRequest,
     SequencedSampleCreateRequest,
     SequencedSamplePatchRequest,
     SequencingRunCreateRequest,
@@ -183,6 +184,22 @@ def _post_sequenced_pool(base_url: str, token: str, run_idx: int, body: dict) ->
     """
     return _common.call(
         "POST", base_url, token, f"/sequencing-run/{run_idx}/sequenced-pool", json=body
+    )
+
+
+def _post_preflight_update_lane(
+    base_url: str, token: str, run_idx: int, pool_idx: int, body: dict
+) -> dict:
+    """POST .../sequenced-pool/{pool_idx}/preflight/update-lane — bulk lane
+    reassignment on the pool's run-preflight SQLite blob. wet_lab_admin+; the
+    server runs run_preflight.update_lane and refuses (409) once the run has been
+    processed."""
+    return _common.call(
+        "POST",
+        base_url,
+        token,
+        f"/sequencing-run/{run_idx}/sequenced-pool/{pool_idx}/preflight/update-lane",
+        json=body,
     )
 
 
@@ -304,6 +321,25 @@ def _lookup_accessions(
 # ---------------------------------------------------------------------------
 # argparse entry point
 # ---------------------------------------------------------------------------
+
+
+def _lane_arg(raw: str) -> int | None:
+    """argparse `type` for a lane value: a positive integer, or one of
+    'none'/'null'/'' for a NULL lane (a real, distinct value to update_lane).
+
+    Returning None lets the caller pass an explicit NULL lane on the command
+    line; the flag is still `required` so 'omitted' and 'NULL' never collide."""
+    if raw.strip().lower() in ("none", "null", ""):
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"lane must be a positive integer or 'none', got {raw!r}")
+    if value < 1:
+        raise argparse.ArgumentTypeError(
+            f"lane must be >= 1 (or 'none' for a NULL lane), got {value}"
+        )
+    return value
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -593,6 +629,52 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Free-form JSON object stored as JSONB",
     )
     p_seqpool_create.set_defaults(handler=_handle_sequenced_pool_create)
+
+    p_run_preflight = sub.add_parser("run-preflight", help="Run-preflight maintenance operations")
+    p_run_preflight_sub = p_run_preflight.add_subparsers(dest="run_preflight_cmd", required=True)
+    p_rp_update_lane = p_run_preflight_sub.add_parser(
+        "update-lane",
+        help=(
+            "Bulk-reassign the lane on a pool's run-preflight blob"
+            " (POST /sequencing-run/{R}/sequenced-pool/{P}/preflight/update-lane);"
+            " wet_lab_admin+, refused once the run has been processed"
+        ),
+    )
+    p_rp_update_lane.add_argument(
+        "--sequencing-run-idx", type=int, required=True, dest="sequencing_run_idx"
+    )
+    p_rp_update_lane.add_argument(
+        "--sequenced-pool-idx", type=int, required=True, dest="sequenced_pool_idx"
+    )
+    p_rp_update_lane.add_argument(
+        "--platform",
+        required=True,
+        choices=("illumina", "tellseq"),
+        help=(
+            "Platform-specific sample table to update — the run_preflight key"
+            " ('illumina' or 'tellseq'), NOT the qiita Platform enum"
+        ),
+    )
+    p_rp_update_lane.add_argument(
+        "--from-lane",
+        required=True,
+        type=_lane_arg,
+        dest="from_lane",
+        help="Source lane to move from: an integer >= 1, or 'none' for a NULL lane",
+    )
+    p_rp_update_lane.add_argument(
+        "--to-lane",
+        required=True,
+        type=_lane_arg,
+        dest="to_lane",
+        help="Target lane to move to: an integer >= 1, or 'none' to clear to NULL",
+    )
+    p_rp_update_lane.add_argument(
+        "--reason",
+        required=True,
+        help="Audit reason recorded in the preflight change_log (required)",
+    )
+    p_rp_update_lane.set_defaults(handler=_handle_run_preflight_update_lane)
 
     p_seqsample = sub.add_parser("sequenced-sample", help="Sequenced-sample operations")
     p_seqsample_sub = p_seqsample.add_subparsers(dest="sequenced_sample_cmd", required=True)
@@ -1371,6 +1453,35 @@ def _handle_sequenced_pool_create(args: argparse.Namespace, parser: argparse.Arg
     body = _build_body(SequencedPoolCreateRequest, args, parser)
     return _common.run_http_subcommand(
         lambda t: _post_sequenced_pool(args.base_url, t, args.run_idx, body)
+    )
+
+
+def _handle_run_preflight_update_lane(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    """Bulk-reassign the lane on a pool's run-preflight blob via the server.
+
+    The mutation runs server-side — the control plane loads the blob, applies
+    run_preflight.update_lane, and writes it back — so this handler only validates
+    the request locally (via the shared model, catching a degenerate from==to pair
+    before the round-trip) and forwards it. The body is built directly rather than
+    via _build_body because a NULL lane is a real value to send, and _build_body
+    drops None fields."""
+    try:
+        req = SequencedPoolPreflightUpdateLaneRequest(
+            platform=args.platform,
+            from_lane=args.from_lane,
+            to_lane=args.to_lane,
+            reason=args.reason,
+        )
+    except ValidationError as exc:
+        msgs = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
+        parser.error(f"invalid {SequencedPoolPreflightUpdateLaneRequest.__name__}: {msgs}")
+    body = req.model_dump(mode="json")
+    return _common.run_http_subcommand(
+        lambda t: _post_preflight_update_lane(
+            args.base_url, t, args.sequencing_run_idx, args.sequenced_pool_idx, body
+        )
     )
 
 

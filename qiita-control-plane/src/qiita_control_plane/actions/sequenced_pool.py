@@ -25,9 +25,40 @@ import asyncpg
 _WORK_TICKET_IN_FLIGHT_STATES = ("pending", "queued", "processing")
 _WORK_TICKET_TERMINAL_STATES = ("completed", "failed")
 
+# Work-ticket states that block a run-preflight EDIT (distinct from the delete
+# gating above). The preflight — notably its lane assignment — feeds bcl-convert
+# demultiplexing, so editing it once a job has consumed or is consuming it would
+# silently diverge the stored preflight from what was actually processed.
+# In-flight states (a job is actively reading the pool / its samples) and
+# 'completed' (a result already exists) both block; 'failed', 'no_data', and
+# not-yet-submitted deliberately do NOT — a failed run is exactly the recovery
+# case the edit exists to serve (a stale preflight may be why it failed), so
+# edit-then-retry must be allowed. Note this differs from delete gating, where
+# 'failed' blocks unless forced.
+_PREFLIGHT_EDIT_BLOCKING_STATES = ("pending", "queued", "processing", "completed")
+
 
 class SequencedPoolNotFound(Exception):
     """Raised when the sequenced_pool_idx doesn't exist."""
+
+
+class PreflightNotEditable(Exception):
+    """Raised when a sequenced_pool's run preflight cannot be edited because the
+    run has already been processed — an in-flight or completed work ticket
+    references the pool or one of its samples. `blocking` is the count of such
+    tickets, surfaced in the route's 409 detail."""
+
+    def __init__(self, *, sequenced_pool_idx: int, blocking: int) -> None:
+        self.sequenced_pool_idx = sequenced_pool_idx
+        self.blocking = blocking
+        super().__init__(
+            f"Sequenced pool {sequenced_pool_idx} preflight cannot be edited: "
+            f"{blocking} in-flight/completed work ticket(s) "
+            f"({'/'.join(_PREFLIGHT_EDIT_BLOCKING_STATES)}) reference it or its "
+            "samples; the run has been processed. A failed or unsubmitted run is "
+            "still editable — delete any completed result first if a correction "
+            "to an already-processed run is truly required."
+        )
 
 
 class SequencedPoolDeleteBlocked(Exception):
@@ -98,6 +129,38 @@ async def _pool_prep_sample_idxs(
     ]
 
 
+async def _pool_work_ticket_state_counts(
+    conn: asyncpg.Pool | asyncpg.Connection, sequenced_pool_idx: int
+) -> tuple[list[int], dict[str, int]]:
+    """Existence check + per-state work_ticket tally for a sequenced_pool.
+
+    Returns ``(prep_sample_idxs, counts)``: the pool's sequenced_samples'
+    prep_sample idxs, and a {state: row_count} map over every work_ticket scoped to
+    the pool OR any of those prep_samples. Raises SequencedPoolNotFound if the pool
+    doesn't exist. asyncpg returns the PG enum `state` as a plain str, so the keys
+    compare directly against the state-name tuples the callers sum over.
+
+    Shared by `assert_sequenced_pool_deletable` and `assert_pool_preflight_editable`
+    so the pool→prep_sample→work_ticket existence-and-tally lives in one place; each
+    gate keeps only its own threshold (grouped counts summed in Python — no
+    enum-array binding)."""
+    exists = await conn.fetchval(
+        "SELECT 1 FROM qiita.sequenced_pool WHERE idx = $1", sequenced_pool_idx
+    )
+    if exists is None:
+        raise SequencedPoolNotFound(sequenced_pool_idx)
+
+    prep_sample_idxs = await _pool_prep_sample_idxs(conn, sequenced_pool_idx)
+    rows = await conn.fetch(
+        "SELECT state, count(*) AS n FROM qiita.work_ticket"
+        " WHERE sequenced_pool_idx = $1 OR prep_sample_idx = ANY($2::bigint[])"
+        " GROUP BY state",
+        sequenced_pool_idx,
+        prep_sample_idxs,
+    )
+    return prep_sample_idxs, {r["state"]: r["n"] for r in rows}
+
+
 async def assert_sequenced_pool_deletable(
     conn: asyncpg.Pool | asyncpg.Connection,
     sequenced_pool_idx: int,
@@ -112,22 +175,7 @@ async def assert_sequenced_pool_deletable(
     it (in-flight tickets always; terminal tickets, published prep_samples, and
     ENA-submitted samples unless force). Run this *before* any destructive step
     so a blocked delete touches nothing."""
-    exists = await conn.fetchval(
-        "SELECT 1 FROM qiita.sequenced_pool WHERE idx = $1", sequenced_pool_idx
-    )
-    if exists is None:
-        raise SequencedPoolNotFound(sequenced_pool_idx)
-
-    prep_sample_idxs = await _pool_prep_sample_idxs(conn, sequenced_pool_idx)
-
-    rows = await conn.fetch(
-        "SELECT state, count(*) AS n FROM qiita.work_ticket"
-        " WHERE sequenced_pool_idx = $1 OR prep_sample_idx = ANY($2::bigint[])"
-        " GROUP BY state",
-        sequenced_pool_idx,
-        prep_sample_idxs,
-    )
-    counts = {r["state"]: r["n"] for r in rows}
+    prep_sample_idxs, counts = await _pool_work_ticket_state_counts(conn, sequenced_pool_idx)
     in_flight = sum(counts.get(s, 0) for s in _WORK_TICKET_IN_FLIGHT_STATES)
     terminal = sum(counts.get(s, 0) for s in _WORK_TICKET_TERMINAL_STATES)
 
@@ -158,6 +206,29 @@ async def assert_sequenced_pool_deletable(
             ena=ena,
         )
     return prep_sample_idxs
+
+
+async def assert_pool_preflight_editable(
+    conn: asyncpg.Pool | asyncpg.Connection,
+    sequenced_pool_idx: int,
+) -> None:
+    """Gate a run-preflight edit on the pool not having been processed.
+
+    Raises SequencedPoolNotFound if the pool doesn't exist, or PreflightNotEditable
+    if any work ticket in an in-flight or completed state references the pool or one
+    of its sequenced_samples' prep_samples. failed / no_data / not-submitted samples
+    do not block — a failed run is the recovery case the edit exists to serve.
+
+    Shares the existence + state-tally query with `assert_sequenced_pool_deletable`
+    via `_pool_work_ticket_state_counts`; only the blocking-state threshold differs.
+    Run it inside the mutating transaction so a stale precheck cannot let a job that
+    has since gone in-flight slip under the edit. Note this re-check re-validates
+    against committed state but, under READ COMMITTED, does not by itself serialize
+    against a submission committing concurrently mid-edit (see the route docstring)."""
+    _prep_sample_idxs, counts = await _pool_work_ticket_state_counts(conn, sequenced_pool_idx)
+    blocking = sum(counts.get(s, 0) for s in _PREFLIGHT_EDIT_BLOCKING_STATES)
+    if blocking:
+        raise PreflightNotEditable(sequenced_pool_idx=sequenced_pool_idx, blocking=blocking)
 
 
 async def delete_sequenced_pool_cascade(

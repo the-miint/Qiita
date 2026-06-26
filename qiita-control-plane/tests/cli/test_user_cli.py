@@ -18,6 +18,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_BY_STUDY,
     URL_BIOSAMPLE_LIST_BY_STUDY,
     URL_PREP_SAMPLE_STUDY_LIST,
+    URL_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE,
     URL_SEQUENCED_SAMPLE_BY_IDX,
     URL_SEQUENCED_SAMPLE_FROM_RUN,
     URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL,
@@ -3818,3 +3819,178 @@ def test_patch_subcommand_conflict_exits_1(monkeypatch, capsys):
     )
     assert rc == 1
     assert "412" in capsys.readouterr().err
+
+
+def test_run_preflight_update_lane_posts_body(monkeypatch):
+    """`qiita run-preflight update-lane` POSTs platform/from_lane/to_lane/reason
+    to the preflight update-lane route, with integer lanes preserved."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["method"] = method
+        captured["url"] = url
+        captured["json"] = json
+        return _httpx.Response(
+            200,
+            json={"sequenced_pool_idx": 5, "rows_updated": 3},
+            request=_httpx.Request(method, url),
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "run-preflight",
+            "update-lane",
+            "--sequencing-run-idx",
+            "7",
+            "--sequenced-pool-idx",
+            "5",
+            "--platform",
+            "illumina",
+            "--from-lane",
+            "1",
+            "--to-lane",
+            "2",
+            "--reason",
+            "fix stale lane",
+        ]
+    )
+    assert rc == 0
+    assert captured["method"] == "POST"
+    expected_url = URL_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE.format(
+        sequencing_run_idx=7, sequenced_pool_idx=5
+    )
+    assert captured["url"] == f"https://q.example.test{expected_url}"
+    assert captured["json"] == {
+        "platform": "illumina",
+        "from_lane": 1,
+        "to_lane": 2,
+        "reason": "fix stale lane",
+    }
+
+
+def test_run_preflight_update_lane_sends_explicit_null(monkeypatch):
+    """`--to-lane none` sends a JSON null (a NULL lane is a real value), not a
+    dropped field — so update_lane can clear lanes."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    captured: dict = {}
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        captured["json"] = json
+        return _httpx.Response(
+            200,
+            json={"sequenced_pool_idx": 5, "rows_updated": 1},
+            request=_httpx.Request(method, url),
+        )
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    rc = main(
+        [
+            "run-preflight",
+            "update-lane",
+            "--sequencing-run-idx",
+            "7",
+            "--sequenced-pool-idx",
+            "5",
+            "--platform",
+            "illumina",
+            "--from-lane",
+            "1",
+            "--to-lane",
+            "none",
+            "--reason",
+            "clear lanes",
+        ]
+    )
+    assert rc == 0
+    assert captured["json"]["to_lane"] is None
+    assert captured["json"]["from_lane"] == 1
+
+
+def test_run_preflight_update_lane_identical_lanes_errors(monkeypatch, capsys):
+    """from_lane == to_lane is rejected client-side (exit 2) before any HTTP
+    call, so the SQLite change_log never gains a spurious no-op entry."""
+    from qiita_control_plane.cli import _common
+
+    def boom(*a, **k):  # pragma: no cover - must never be reached
+        raise AssertionError("no HTTP request should be made for an identical-lane no-op")
+
+    monkeypatch.setattr(_common.httpx, "request", boom)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "run-preflight",
+                "update-lane",
+                "--sequencing-run-idx",
+                "7",
+                "--sequenced-pool-idx",
+                "5",
+                "--platform",
+                "illumina",
+                "--from-lane",
+                "2",
+                "--to-lane",
+                "2",
+                "--reason",
+                "noop",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "identical" in capsys.readouterr().err
+
+
+def test_run_preflight_update_lane_blank_reason_errors(monkeypatch, capsys):
+    """A whitespace-only --reason is rejected client-side (exit 2) before any HTTP
+    call, so the preflight change_log audit trail never gets a blank reason."""
+    from qiita_control_plane.cli import _common
+
+    def boom(*a, **k):  # pragma: no cover - must never be reached
+        raise AssertionError("no HTTP request should be made for a blank reason")
+
+    monkeypatch.setattr(_common.httpx, "request", boom)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    from qiita_control_plane.cli.user import main
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "run-preflight",
+                "update-lane",
+                "--sequencing-run-idx",
+                "7",
+                "--sequenced-pool-idx",
+                "5",
+                "--platform",
+                "illumina",
+                "--from-lane",
+                "1",
+                "--to-lane",
+                "2",
+                "--reason",
+                "   ",
+            ]
+        )
+    assert exc_info.value.code == 2
+    assert "reason" in capsys.readouterr().err
