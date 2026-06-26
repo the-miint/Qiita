@@ -25,7 +25,7 @@ the `no-changelog` label).
   work ticket on the pool or its samples → 409 (a failed or unsubmitted run stays
   editable, since a stale lane may be why it failed); update_lane's
   uniformity/collision `ValueError` → 422. Reuses the existing pinned `run-preflight`
-  dependency (no version bump). (#TBD)
+  dependency (no version bump). (#190)
 - New `GET /api/v1/admin/study/{study_idx}/owner-biosample-id` route + `qiita-admin
   owner-biosample-id` CLI: a system_admin-only re-identification export mapping a
   study's `biosample_idx` + `biosample_accession` back to the owner-submitted
