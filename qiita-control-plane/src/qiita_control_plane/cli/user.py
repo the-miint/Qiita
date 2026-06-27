@@ -1240,20 +1240,6 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_submit_hf.add_argument(
-        "--preflight-blob",
-        type=Path,
-        required=True,
-        help=(
-            "The same kl-run-preflight SQLite given to submit-bcl-convert for this"
-            " pool. Its per-project human_filtering flags are the intake intent for"
-            " each sample; host filtering is now applied pool-wide, so before"
-            " submitting, every sample's intake intent is checked against this"
-            " submission's host-reference choice (a host reference filters, none is"
-            " a pass-through). A sample whose intent disagrees aborts the submission"
-            " unless --force is passed."
-        ),
-    )
-    p_submit_hf.add_argument(
         "--force",
         action="store_true",
         help=(
@@ -2228,12 +2214,13 @@ def _handle_submit_host_filter_pool(
     side-by-side mask — neither re-runs ingest.
 
     Flow:
-      1. Validate host-ref argument coherence (minimap2 requires rype), and parse
-         --preflight-blob (the same SQLite given to bcl-convert) for each sample's
-         intake human_filtering intent — all before any network call.
-      2. List the pool's active samples (run-scoped pool route), then flag any
-         sample whose intake human_filtering intent disagrees with this
-         submission's pool-wide host-ref choice. Aborts before any ticket POST
+      1. Validate host-ref argument coherence before any network call.
+      2. List the pool's active samples (pool-scoped route). Each carries its
+         intake human_filtering intent, derived server-side from the pool's
+         STORED run-preflight blob (no operator-supplied file — the database is
+         the source of truth, so a later `preflight update-lane` is reflected
+         automatically). Flag any sample whose intent disagrees with this
+         submission's pool-wide host-ref choice; abort before any ticket POST
          unless --force downgrades the mismatch to a warning.
       3. Pre-flight the given host reference(s): a rype reference must be ACTIVE +
          carry a rype index; a minimap2 reference must be ACTIVE + carry a
@@ -2256,24 +2243,12 @@ def _handle_submit_host_filter_pool(
     if args.host_minimap2_reference_idx is not None and args.host_rype_reference_idx is None:
         parser.error("--host-minimap2-reference-idx requires --host-rype-reference-idx")
 
-    # Parse the pool's preflight (local SQLite, no network) up front: it carries
-    # each sample's intake human_filtering intent, which the pool-wide host-ref
-    # mismatch guard below compares against this submission's choice. Errors here
-    # are operator-actionable and exit 2 via parser.error before any network call.
-    if not args.preflight_blob.is_file():
-        parser.error(f"--preflight-blob {args.preflight_blob} is not a regular file")
-    if not args.preflight_blob.read_bytes():
-        parser.error(f"--preflight-blob {args.preflight_blob} is empty")
-    preflight_rows = _read_preflight_rows(args.preflight_blob, parser)
-    # sequenced_pool_item_id == str(illumina_sample_idx) (the submit-bcl-convert
-    # coupling), so the roster joins to the preflight on this string key.
-    human_filtering_by_item_id = {
-        str(row.illumina_sample_idx): row.human_filtering for row in preflight_rows
-    }
     applying_host_filter = args.host_rype_reference_idx is not None
 
     def _run(token: str) -> dict:
-        # Step 1: enumerate the pool's active samples (single round trip).
+        # Step 1: enumerate the pool's active samples (single round trip). The
+        # roster carries each sample's intake human_filtering intent, derived
+        # server-side from the pool's stored run-preflight blob — no local file.
         pool_list_path = PATH_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
             sequencing_run_idx=args.sequencing_run_idx,
             sequenced_pool_idx=args.sequenced_pool_idx,
@@ -2299,22 +2274,23 @@ def _handle_submit_host_filter_pool(
         # human reads; a not-flagged sample submitted with a host reference would
         # be filtered against the operator's intent. Either is a likely mistake —
         # fail fast before any ticket POST unless --force overrides it.
-        # The join is roster-driven: we check every pool member against its
-        # preflight intent. A blob row with no matching pool member is ignored by
-        # design (you only filter what is in the pool); the reverse — a pool
-        # member with no blob row — is the broken-coupling case handled below.
+        # The check is roster-driven: every pool member is compared against its
+        # intake intent, which the route resolved from the pool's stored
+        # preflight. A null intent means the stored preflight has no row for this
+        # pool item (or the pool carries no preflight) — the broken-coupling case
+        # handled below.
         mismatched: list[str] = []
         for sample in samples:
             item_id = sample["sequenced_pool_item_id"]
-            intent = human_filtering_by_item_id.get(item_id)
+            intent = sample.get("human_filtering")
             if intent is None:
-                # The preflight has no row for this pool item — the
-                # bcl-convert/preflight coupling is broken; surface it.
+                # The pool's stored preflight has no human_filtering for this pool
+                # item — the bcl-convert/preflight coupling is broken; surface it.
                 sys.stderr.write(
-                    f"--preflight-blob {args.preflight_blob} has no row for"
-                    f" sequenced_pool_item_id {item_id!r} (prep_sample"
-                    f" {sample['prep_sample_idx']}); verify it is the same"
-                    " preflight given to submit-bcl-convert for this pool\n"
+                    f"sequenced_pool {args.sequenced_pool_idx} has no stored"
+                    f" preflight intent for sequenced_pool_item_id {item_id!r}"
+                    f" (prep_sample {sample['prep_sample_idx']}); verify the pool"
+                    " was created by submit-bcl-convert with its run preflight\n"
                 )
                 raise SystemExit(1)
             if intent != applying_host_filter:

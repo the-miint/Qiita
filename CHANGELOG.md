@@ -460,6 +460,21 @@ the `no-changelog` label).
 
 ### Changed
 
+- `qiita submit-host-filter-pool` no longer takes a `--preflight-blob` file. Its
+  pool-wide host-filter guard needs each sample's intake `human_filtering` intent,
+  which already lives in the pool's **stored** run-preflight blob — so requiring
+  the operator to re-supply the file was redundant, and impossible once the stored
+  preflight diverged from any local copy (e.g. after `run-preflight update-lane`
+  edits it in the database). The intent is now derived server-side: the pool
+  sample-list route (`GET
+  /api/v1/sequencing-run/{R}/sequenced-pool/{P}/sequenced-sample/list`) gains a
+  per-sample `human_filtering` field (additive, nullable), read at request time
+  from the stored blob — the single source of truth, so a later `update-lane` is
+  reflected automatically. The command reads that field from the roster it already
+  fetches; an unparseable/absent stored preflight degrades the field to null
+  (listing never 500s, and the parse failure is logged) and the command's
+  existing guard turns a null intent into an actionable abort at submit time.
+  (#205)
 - `qiita-admin masked-read-export` is faster and its fastq output is now
   gzip-compressed. The **parquet** path streams the Flight reader straight to a
   `pyarrow.parquet.ParquetWriter` instead of `DuckDB COPY`, so the bulk read bytes

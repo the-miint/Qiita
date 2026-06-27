@@ -16,6 +16,8 @@ trigger-raised failures.
 """
 
 import secrets
+import tempfile
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -1623,6 +1625,10 @@ async def _seed_pool_sample(ctx, *, run_idx, pool_idx, study_idx, protocol_idx, 
         "ena_run_accession": None,
         "biosample_accession": None,
         "ena_sample_accession": None,
+        # _seed_run_and_pool stores placeholder (non-SQLite) preflight bytes, so
+        # the route can't parse an intent and degrades human_filtering to null per
+        # sample (see test_list_pool_samples_unparseable_preflight_degrades_to_null).
+        "human_filtering": None,
     }
 
 
@@ -1659,6 +1665,161 @@ async def test_list_pool_samples_happy_path(ctx):
         "caller_system_role": "wet_lab_admin",
     }
     assert resp.json() == expected
+
+
+async def test_list_pool_samples_carries_human_filtering_intent(ctx, monkeypatch):
+    # The roster attaches each sample's intake human_filtering intent, derived
+    # server-side from the pool's stored preflight. Stub the blob parse to a
+    # known map: sample A -> True; sample B is absent from the map -> None (the
+    # broken-coupling signal the host-filter-pool guard rejects at submit time).
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "pool-hf")
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="pool-hf"
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    a = await _seed_pool_sample(
+        ctx,
+        run_idx=run_idx,
+        pool_idx=pool_idx,
+        study_idx=study_idx,
+        protocol_idx=protocol_idx,
+        suffix="POOL-HFA",
+    )
+    b = await _seed_pool_sample(
+        ctx,
+        run_idx=run_idx,
+        pool_idx=pool_idx,
+        study_idx=study_idx,
+        protocol_idx=protocol_idx,
+        suffix="POOL-HFB",
+    )
+    monkeypatch.setattr(
+        "qiita_control_plane.routes.sequenced_sample._human_filtering_by_item_id",
+        lambda _blob: {a["sequenced_pool_item_id"]: True},
+    )
+
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
+            sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+        )
+    )
+    assert resp.status_code == 200, resp.text
+    by_item = {s["sequenced_pool_item_id"]: s["human_filtering"] for s in resp.json()["samples"]}
+    assert by_item[a["sequenced_pool_item_id"]] is True
+    assert by_item[b["sequenced_pool_item_id"]] is None
+
+
+async def test_list_pool_samples_unparseable_preflight_degrades_to_null(ctx):
+    # The seeded pool carries placeholder (non-SQLite) preflight bytes. The
+    # listing must not 500 when the stored blob can't be parsed into intents —
+    # it returns human_filtering null per sample (the host-filter guard then
+    # aborts at submit time), so a corrupt preflight never takes down the roster.
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "pool-badpf")
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="pool-badpf"
+    )
+    protocol_idx = await _fetch_prep_protocol_idx(ctx)
+    await _seed_pool_sample(
+        ctx,
+        run_idx=run_idx,
+        pool_idx=pool_idx,
+        study_idx=study_idx,
+        protocol_idx=protocol_idx,
+        suffix="POOL-BADPF",
+    )
+
+    resp = await ctx["wet"].get(
+        URL_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
+            sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+        )
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["count"] == 1
+    assert body["samples"][0]["human_filtering"] is None
+
+
+def _real_preflight_blob(intent_by_idx: dict[int, bool]) -> bytes:
+    """Build a schema-valid run_preflight SQLite blob where each illumina_sample_idx
+    in `intent_by_idx` belongs to its own project whose human_filtering flag is the
+    mapped bool.
+
+    Unlike the route tests above (which stub the parse), this exercises the REAL
+    run_preflight schema — its `run_illumina_sample` view and
+    `get_illumina_sample_rows` accessor — so `_human_filtering_by_item_id`'s column
+    indices and project join are verified against real data, not a stub. FK
+    enforcement is disabled during seeding (matching the preflight route tests'
+    `_make_preflight_blob`), but the view's INNER JOINs still require a full
+    project → input_plate → input_sample → compression_sample → prepped_sample →
+    illumina_sample chain, so one row per table is inserted per sample. A single
+    processing_run satisfies `get_single_run_idx`'s exactly-one-run requirement.
+    """
+    from run_preflight import create_db  # local import; run_preflight is a CP dep
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "real-pf.db"
+        conn = create_db(str(db_path))
+        try:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            conn.execute(
+                "INSERT INTO processing_run"
+                " (run_idx, experiment_name, run_date, instrument_type,"
+                "  assay_type_idx, platform_idx)"
+                " VALUES (1, 'exp', '2026-06-26', 'NextSeq', 1, 1)"
+            )
+            for i, (idx, human_filtering) in enumerate(sorted(intent_by_idx.items()), start=1):
+                conn.execute(
+                    "INSERT INTO project"
+                    " (project_idx, project_name, external_project_id, human_filtering,"
+                    "  library_construction_protocol, experiment_design_description)"
+                    " VALUES (?, ?, ?, ?, 'lcp', 'edd')",
+                    (i, f"PRJ{idx}", f"EXT{idx}", 1 if human_filtering else 0),
+                )
+                conn.execute(
+                    "INSERT INTO input_plate (input_plate_idx, plate_name, primary_project_idx)"
+                    " VALUES (?, ?, ?)",
+                    (i, f"plate{i}", i),
+                )
+                conn.execute(
+                    "INSERT INTO input_sample"
+                    " (input_sample_idx, sample_name, input_plate_idx, project_idx,"
+                    "  sample_type_idx, do_not_use)"
+                    " VALUES (?, ?, ?, ?, 1, 0)",
+                    (i, f"sample{idx}", i, i),
+                )
+                conn.execute(
+                    "INSERT INTO compression_sample"
+                    " (compression_sample_idx, run_idx, input_sample_idx, compression_well)"
+                    " VALUES (?, 1, ?, ?)",
+                    (i, i, f"A{i}"),
+                )
+                conn.execute(
+                    "INSERT INTO prepped_sample"
+                    " (prepped_sample_idx, compression_sample_idx, prepped_well)"
+                    " VALUES (?, ?, ?)",
+                    (i, i, f"A{i}"),
+                )
+                conn.execute(
+                    "INSERT INTO illumina_sample"
+                    " (illumina_sample_idx, prepped_sample_idx, i7_index_id, i7_sequence,"
+                    "  i5_index_id, i5_sequence, lane)"
+                    " VALUES (?, ?, 'i7', 'ACGTACGT', 'i5', 'TGCATGCA', 1)",
+                    (idx, i),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        return db_path.read_bytes()
+
+
+def test_human_filtering_by_item_id_parses_real_preflight():
+    # Drives the REAL parse against a real run_preflight blob (no stub), proving
+    # the column indices / project join / str(idx) keying / bool() coercion are
+    # correct end-to-end — the gap the monkeypatched route test cannot cover.
+    from qiita_control_plane.routes.sequenced_sample import _human_filtering_by_item_id
+
+    blob = _real_preflight_blob({10: True, 11: False})
+    assert _human_filtering_by_item_id(blob) == {"10": True, "11": False}
 
 
 async def test_list_pool_samples_empty(ctx):
