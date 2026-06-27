@@ -472,8 +472,9 @@ the `no-changelog` label).
   from the stored blob — the single source of truth, so a later `update-lane` is
   reflected automatically. The command reads that field from the roster it already
   fetches; an unparseable/absent stored preflight degrades the field to null
-  (listing never 500s) and the command's existing guard turns a null intent into
-  an actionable abort at submit time. (#TBD)
+  (listing never 500s, and the parse failure is logged) and the command's
+  existing guard turns a null intent into an actionable abort at submit time.
+  (#205)
 - `qiita-admin masked-read-export` is faster and its fastq output is now
   gzip-compressed. The **parquet** path streams the Flight reader straight to a
   `pyarrow.parquet.ParquetWriter` instead of `DuckDB COPY`, so the bulk read bytes
