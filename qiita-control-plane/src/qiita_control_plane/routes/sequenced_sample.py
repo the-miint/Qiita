@@ -37,6 +37,10 @@ system_role) is required before submission-subsystem service accounts
 can satisfy require_role_at_least.
 """
 
+import logging
+import sqlite3
+import tempfile
+from pathlib import Path
 from typing import Annotated
 
 import asyncpg
@@ -100,6 +104,7 @@ from ..repositories.sequenced_sample import (
     import_sequenced_prep_sample,
     update_sequenced_sample,
 )
+from ..repositories.sequencing_run import fetch_sequenced_pool_preflight
 from ._helpers import (
     GENERIC_FK_VIOLATION,
     build_idxs_list_response,
@@ -115,6 +120,8 @@ router = APIRouter(prefix=PATH_SEQUENCING_RUN_PREFIX, tags=["sequenced-sample"])
 study_scoped_router = APIRouter(prefix=PATH_STUDY_PREFIX, tags=["sequenced-sample"])
 sequenced_sample_router = APIRouter(prefix=PATH_SEQUENCED_SAMPLE_PREFIX, tags=["sequenced-sample"])
 
+
+_log = logging.getLogger(__name__)
 
 _MSG_OWNER_NOT_ELIGIBLE = "owner is not eligible to own prep samples"
 
@@ -332,6 +339,93 @@ async def list_sequenced_sample_idxs_in_run(
     )
 
 
+def _human_filtering_by_item_id(blob: bytes) -> dict[str, bool]:
+    """Map each illumina_sample's ``sequenced_pool_item_id`` to its intake
+    human_filtering intent, read from a run-preflight SQLite blob.
+
+    The intent is the sample's effective project's per-project ``human_filtering``
+    flag (the preflight exposes no per-sample accessor), keyed by
+    ``str(illumina_sample_idx)`` — which equals the ``sequenced_pool_item_id`` the
+    bcl-convert composer assigns. Mirrors the CLI's ``_read_preflight_rows`` join
+    but returns only the boolean map the pool roster needs.
+
+    The blob is materialized to a private temp file because run_preflight operates
+    on a file-backed sqlite3 connection (matching
+    ``routes/sequencing_run.py::_apply_preflight_lane_update``); the run_preflight
+    import is lazy and local so the git-pinned dependency only loads on this path.
+
+    Raises ``sqlite3.DatabaseError`` (blob is not a readable SQLite) or
+    ``ValueError`` (not a single-run kl-run-preflight, or a run_preflight
+    schema-version skew) — the caller degrades those to "intent unknown" rather
+    than failing the listing (see ``_pool_human_filtering_by_item_id``).
+    """
+    from run_preflight import db as run_preflight_db  # noqa: PLC0415
+    from run_preflight import open_db_file  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = Path(tmpdir) / "preflight.db"
+        db_path.write_bytes(blob)
+        conn = open_db_file(str(db_path))
+        try:
+            project_by_idx = {
+                row[0]: row[4] for row in run_preflight_db.get_illumina_sample_rows(conn)
+            }
+            filtering_by_project = {
+                name: bool(flag)
+                for name, flag in conn.execute(
+                    "SELECT project_name, human_filtering FROM project"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+    return {
+        str(idx): filtering_by_project[project_name]
+        for idx, project_name in project_by_idx.items()
+        if project_name in filtering_by_project
+    }
+
+
+async def _pool_human_filtering_by_item_id(
+    pool: asyncpg.Pool,
+    *,
+    sequencing_run_idx: int,
+    sequenced_pool_idx: int,
+) -> dict[str, bool]:
+    """Return the pool's per-item intake human_filtering map, or ``{}`` when the
+    pool has no preflight populated or its stored blob cannot be parsed into
+    intents. Reads the stored run-preflight blob (the single source of truth) and
+    parses it via ``_human_filtering_by_item_id``.
+
+    An unparseable stored blob (corrupt, a non-bcl pool, or a run_preflight
+    schema-version skew) degrades to ``{}`` — None per sample — rather than
+    failing this passive listing. The host-filter-pool guard turns a null intent
+    into an actionable abort at submit time, which is the right place to be loud;
+    a corrupt preflight must not take down an unrelated sample listing."""
+    row = await fetch_sequenced_pool_preflight(
+        pool,
+        sequencing_run_idx=sequencing_run_idx,
+        sequenced_pool_idx=sequenced_pool_idx,
+    )
+    if row is None or row["run_preflight_blob"] is None:
+        return {}
+    try:
+        return _human_filtering_by_item_id(bytes(row["run_preflight_blob"]))
+    except (sqlite3.DatabaseError, ValueError) as exc:
+        # Degrade to "intent unknown" but log loudly: a stored preflight that the
+        # server can't parse (corrupt, non-bcl, or a run_preflight schema-version
+        # skew that would silently null EVERY pool's intents deploy-wide) is a
+        # real problem the operator-facing guard's message can't diagnose on its
+        # own. Parentheses are required with `as` even under PEP 758.
+        _log.warning(
+            "could not parse stored run-preflight for sequenced_pool %s (run %s);"
+            " human_filtering will be null for its samples: %s",
+            sequenced_pool_idx,
+            sequencing_run_idx,
+            exc,
+        )
+        return {}
+
+
 @router.get(PATH_SEQUENCED_SAMPLE_LIST_BY_POOL)
 async def list_sequenced_samples_in_pool(
     sequencing_run_idx: Annotated[int, Field(gt=0)],
@@ -357,6 +451,12 @@ async def list_sequenced_samples_in_pool(
     runs. Excludes rows whose supertype prep_sample is retired. The
     `truncated` flag indicates the underlying set exceeded the hard cap;
     callers hitting it should narrow their scope.
+
+    Each sample also carries `human_filtering` — its intake host-filter intent,
+    derived here from the pool's stored run-preflight blob (the single source of
+    truth) — so `submit-host-filter-pool` can run its pool-wide host-filter guard
+    without an operator-supplied preflight file. It is None when the pool has no
+    preflight populated or the blob carries no row for that pool item.
     """
     # Fetch cap+1 rows so a count strictly greater than the cap signals
     # truncation; the route slices back to the cap before returning.
@@ -368,8 +468,21 @@ async def list_sequenced_samples_in_pool(
     truncated = len(rows) > _SEQUENCED_SAMPLE_HARD_CAP
     if truncated:
         rows = rows[:_SEQUENCED_SAMPLE_HARD_CAP]
+    # Derive each sample's intake human_filtering intent from the pool's stored
+    # preflight blob and attach it by sequenced_pool_item_id; None per sample
+    # when the pool has no preflight or the blob omits its row.
+    human_filtering_by_item_id = await _pool_human_filtering_by_item_id(
+        pool,
+        sequencing_run_idx=sequencing_run_idx,
+        sequenced_pool_idx=sequenced_pool_idx,
+    )
+    samples = []
+    for r in rows:
+        item = dict(r)
+        item["human_filtering"] = human_filtering_by_item_id.get(item["sequenced_pool_item_id"])
+        samples.append(SequencedSampleListItem.model_validate(item))
     return SequencedSampleListResponse(
-        samples=[SequencedSampleListItem.model_validate(dict(r)) for r in rows],
+        samples=samples,
         count=len(rows),
         truncated=truncated,
         caller_system_role=user.system_role,

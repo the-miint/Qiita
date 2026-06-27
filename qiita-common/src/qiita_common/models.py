@@ -1089,6 +1089,14 @@ class SequencedSampleListItem(BaseModel):
     are nullable until their submissions succeed. Host references are not a
     sample property: they parameterize the read mask and are supplied at
     human-filter submission, not carried here.
+
+    `human_filtering` is the sample's intake host-filter intent, derived at
+    request time from the pool's stored run-preflight blob (the single source
+    of truth — it is not a stored sample column) and keyed by
+    sequenced_pool_item_id. Only the pool-scoped list route populates it (the
+    pool-wide host-filter guard in `submit-host-filter-pool` reads it); the
+    run-scoped list leaves it None. It is also None when the pool has no
+    preflight populated or the blob carries no row for this item.
     """
 
     sequenced_sample_idx: int
@@ -1099,6 +1107,7 @@ class SequencedSampleListItem(BaseModel):
     ena_run_accession: str | None
     biosample_accession: str | None
     ena_sample_accession: str | None
+    human_filtering: bool | None = None
 
 
 class SequencedSampleListResponse(BaseModel):
