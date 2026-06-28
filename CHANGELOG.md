@@ -905,6 +905,21 @@ the `no-changelog` label).
 
 ### Fixed
 
+- Deleting a sequenced_pool now purges the DuckLake data its prep_samples
+  produced, not just the Postgres rows. `DELETE
+  /sequencing-run/{R}/sequenced-pool/{P}` (`qiita delete-sequenced-pool`) issues a
+  new `delete_pool_reads` data-plane DoAction that drops the `read` and
+  `read_mask` rows keyed by the pool's prep_sample set (one DuckLake transaction,
+  idempotent, retriable — same data-plane → Postgres-last ordering as DELETE
+  /reference, so a Flight failure 502s with nothing removed), and the control
+  plane reaps the durable `reads/{prep_sample_idx}/read.parquet` staged copies
+  on disk. Previously the delete left those reads/files orphaned in DuckLake on
+  every pool delete — a storage leak and a surprise for operators who expect a
+  `--force` delete to be complete. The response and CLI help now report the
+  DuckLake/disk counts (`read_rows_deleted`, `read_mask_rows_deleted`,
+  `staged_reads_reaped`). Reclaiming the orphaned Parquet bytes the logical
+  DuckLake delete leaves behind remains a future maintenance pass (as with
+  reference delete); pre-existing orphans from past deletes are not swept. (#204)
 - `qiita-admin masked-read-export` no longer floods stderr with Arrow Acero
   `An input buffer was poorly aligned` warnings (one per column per batch). The
   PyArrow Flight client zero-copies the gRPC message body, whose absolute base

@@ -214,6 +214,13 @@ def _do_action_delete_mask(data_plane_url: str, token: bytes) -> list:
         return list(client.do_action(action))
 
 
+def _do_action_delete_pool_reads(data_plane_url: str, token: bytes) -> list:
+    """Synchronous gRPC call to data plane — runs in thread executor."""
+    with _flight.FlightClient(data_plane_url) as client:
+        action = _flight.Action("delete_pool_reads", token)
+        return list(client.do_action(action))
+
+
 # =============================================================================
 # Public primitives — exposed through LIBRARY by name
 # =============================================================================
@@ -593,6 +600,39 @@ async def delete_reference_data(
     )
     results = await asyncio.get_event_loop().run_in_executor(
         None, _do_action_delete_reference, data_plane_url, token
+    )
+    if not results:
+        return {}
+    return json.loads(results[0].body.to_pybytes())
+
+
+async def delete_pool_reads_data(
+    *,
+    prep_sample_idxs: list[int],
+    hmac_secret: bytes,
+    data_plane_url: str,
+) -> dict:
+    """Delete a sequenced_pool's `read` / `read_mask` DuckLake rows via the data
+    plane's DoAction.
+
+    Signs a `delete_pool_reads` action token carrying the pool's prep_sample set
+    (its reads/masks are keyed by `prep_sample_idx`; the data plane has no
+    run/pool column to expand from) and returns the data plane's per-table delete
+    counts. The set is exclusive to the pool — its prep_samples belong to no
+    other pool — so the delete cannot touch another pool's reads.
+
+    Idempotent: an empty set short-circuits without a Flight call (returns `{}`);
+    a pool whose reads were never written deletes zero rows. Raises
+    pyarrow.flight.FlightError on transport / data-plane failure."""
+    if not prep_sample_idxs:
+        return {}
+    token = sign_action(
+        action="delete_pool_reads",
+        payload={"prep_sample_idxs": prep_sample_idxs},
+        secret=hmac_secret,
+    )
+    results = await asyncio.get_event_loop().run_in_executor(
+        None, _do_action_delete_pool_reads, data_plane_url, token
     )
     if not results:
         return {}

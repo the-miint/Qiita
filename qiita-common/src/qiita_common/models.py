@@ -2322,11 +2322,19 @@ class SequencedPoolPreflightUpdateLaneResponse(BaseModel):
 
 
 class SequencedPoolDeleteResponse(BaseModel):
-    """Summary of a full sequenced_pool purge across Postgres.
+    """Summary of a full sequenced_pool purge across Postgres, DuckLake, and disk.
 
-    Counts are the rows removed by the FK-ordered cascade. The parent
-    `sequencing_run` is intentionally retained (a run may hold other pools);
-    biosample rows are also retained — a biosample is a physical sample
+    The `*_deleted` counts (sequenced_sample … work_ticket) are the rows removed
+    by the FK-ordered Postgres cascade. `read_rows_deleted` /
+    `read_mask_rows_deleted` are the DuckLake rows the data plane purged for the
+    pool's prep_samples (the reads its bcl-convert run wrote, plus any masks over
+    them); `staged_reads_reaped` is the number of durable on-disk
+    `reads/{prep_sample_idx}/read.parquet` copies removed. The three new counts
+    default to 0 so a CP-only/dev deploy (no data plane / no shared scratch)
+    still constructs.
+
+    The parent `sequencing_run` is intentionally retained (a run may hold other
+    pools); biosample rows are also retained — a biosample is a physical sample
     independent of any single prep and is not pool-owned. `prep_sample_deleted`
     therefore never drives biosample GC. See the route docstring (DELETE
     /sequencing-run/{R}/sequenced-pool/{P}) and the delete-cascade action."""
@@ -2338,6 +2346,9 @@ class SequencedPoolDeleteResponse(BaseModel):
     field_exception_deleted: int
     study_link_deleted: int
     work_ticket_deleted: int
+    read_rows_deleted: int = 0
+    read_mask_rows_deleted: int = 0
+    staged_reads_reaped: int = 0
 
 
 class SequencedSampleCreateRequest(BaseModel):
