@@ -31,6 +31,38 @@ _None yet._
 
 ### 5. Verify
 
+_None yet._
+
+### Notes (no host action)
+
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-28 — 7fa0bb9
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
+_None yet._
+
+#### 3. Migrations
+
+_None yet._
+
+#### 4. Deploy
+
+_None yet._
+
+#### 5. Verify
+
 - Confirm the raised `host_filter` mem ceiling synced into `qiita.action` for
   both actions that run the step (so the new 32 GB `host_filter` baseline sits
   within the ceiling): (#209)
@@ -40,7 +72,7 @@ _None yet._
   # expect: fastq-to-parquet|32  and  read-mask|32
   ```
 
-### Notes (no host action)
+#### Notes (no host action)
 
 - `host_filter` step memory bump for host references that OOMed at 16 GB. In both
   `read-mask/1.0.0` and `fastq-to-parquet/1.3.0` the step's
@@ -53,12 +85,6 @@ _None yet._
   `qiita.action` check), **not** a migration. No new env var, host dir, scope, or
   SIF. Ensure the SLURM partition/QOS permits a 32 GB / 4-CPU single-step job.
   (#209)
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-27 — 8d93add
 
