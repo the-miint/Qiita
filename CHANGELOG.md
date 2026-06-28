@@ -460,6 +460,12 @@ the `no-changelog` label).
 
 ### Changed
 
+- `host_filter` step memory raised 16 → 32 GB in both actions that run it
+  (`read-mask/1.0.0` and `fastq-to-parquet/1.3.0`): the step's
+  `baseline_resources.mem_gb` and the `action_ceiling.mem_gb` both go 16 → 32, so
+  a `host_filter` run lands at 32 GB directly (the genome-scale rype/minimap2 host
+  index didn't fit in 16). YAMLs edited in place; re-synced via `qiita-admin
+  actions sync`. (#209)
 - `qiita submit-host-filter-pool` no longer takes a `--preflight-blob` file. Its
   pool-wide host-filter guard needs each sample's intake `human_filtering` intent,
   which already lives in the pool's **stored** run-preflight blob — so requiring
