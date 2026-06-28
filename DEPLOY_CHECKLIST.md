@@ -749,13 +749,20 @@ _None yet._
     --name qc-adapters --version 1.0 --fasta /path/to/adapters.fasta
   # [admin] pin the printed idx (idempotent) and restart CP so it picks it up
   sudo bash -c 'grep -q "^QIITA_DEFAULT_ADAPTER_REFERENCE_IDX=" /etc/qiita/control-plane.env \
-    || echo "QIITA_DEFAULT_ADAPTER_REFERENCE_IDX=<reference_idx>" >> /etc/qiita/control-plane.env'
+    || echo "QIITA_DEFAULT_ADAPTER_REFERENCE_IDX=13" >> /etc/qiita/control-plane.env'
   sudo systemctl restart qiita-control-plane
   ```
 
   Optional at boot (CP starts without it; 1.1.0 is unaffected) — a 1.2.0 /
   `submit-host-filter-pool` submission fails until both the adapter set and this
   var are in place.
+
+  On the qiita-miint deploy this is `reference_idx` **13**, the **TruSeq**
+  adapter set. TruSeq adapters are appropriate for TruSeq-style libraries only —
+  this is **not** a general-purpose adapter set. A deploy running other
+  library-prep protocols must load and pin its own `artifact_sequence_set`
+  instead; the pinned idx is applied pool-wide to every `submit-host-filter-pool`
+  submission, so it must match the libraries being filtered.
 
 #### 3. Migrations
 
