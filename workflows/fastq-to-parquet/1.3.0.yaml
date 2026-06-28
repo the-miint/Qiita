@@ -169,7 +169,7 @@ steps:
     outputs: [read_mask, read_mask_staging_dir]
     baseline_resources:
       cpu: 4
-      mem_gb: 16
+      mem_gb: 32
       walltime: PT4H
 
   # Persist the three per-stage read counts onto this prep_sample's 1:1
@@ -193,5 +193,5 @@ steps:
 
 action_ceiling:
   cpu: 8
-  mem_gb: 16
+  mem_gb: 32
   walltime: PT4H
