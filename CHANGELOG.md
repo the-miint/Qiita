@@ -476,6 +476,16 @@ the `no-changelog` label).
 
 ### Changed
 
+- **CI build speedups.** The `test-integration` job now sets up the Rust
+  toolchain + `Swatinem/rust-cache` + cached `libduckdb` (mirroring the `rust`
+  job), so the data-plane debug build it drives — previously a cold ~80s
+  recompile of all deps and the largest slice of the job — is incremental on
+  repeat runs. The separate `lint-rust` / `test-rust` jobs merged into one
+  `rust` job that shares a checkout, toolchain, and warm `rust-cache` (no more
+  two jobs racing to write the same cache). The macOS host-Postgres provisioning,
+  previously inlined and duplicated across two jobs, moved into a reusable
+  `.github/actions/setup-host-postgres` composite action with a weekly-refreshable
+  Homebrew download cache. No change to what is tested. (#225)
 - A job's input `params.json` and a native step's output `manifest.json` are now
   pretty-printed (2-space indent, trailing newline; the manifest also sorts keys
   to mirror the container-side `manifest_writer.py`) instead of dumped as a single
