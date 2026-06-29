@@ -21,8 +21,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: true  # Python version comes from .python-version
       - run: make lint-python
 
   # Lint and test the Rust workspace in one job: clippy/fmt and the test build
@@ -71,8 +69,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: true  # Python version comes from .python-version
       - run: make test-python
 
   test-control-plane-with-db:
@@ -85,8 +81,6 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: true  # Python version comes from .python-version
       - uses: ./.github/actions/setup-host-postgres
         if: runner.os == 'macOS'
       - run: make test-control-plane-with-db
@@ -101,8 +95,21 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
+      # make test-integration builds the data-plane debug binary and the Rust
+      # DuckLake test binary, which without a cargo cache recompiles ~all deps
+      # (incl. the duckdb crate) cold — ~80s, the single largest slice of this
+      # job. Pin the toolchain + warm rust-cache + provide libduckdb (same setup
+      # as the `rust` job) so that compile is incremental on repeat runs.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
         with:
-          enable-cache: true  # Python version comes from .python-version
+          workspaces: qiita-data-plane
+          prefix-key: "v1"  # bump to invalidate stale bundled-feature cache
+          cache-bin: false  # see the rust job for rationale
+      - uses: ./.github/actions/setup-libduckdb
+        with:
+          runtime-libpath: "true"   # spawned data-plane + cargo test dlopen libduckdb
+          cache-extensions: "true"
       - uses: ./.github/actions/setup-host-postgres
         if: runner.os == 'macOS'
         with:
