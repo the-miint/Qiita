@@ -80,12 +80,25 @@ def _stage_miint_extension():
         conn.execute(miint_install_sql())
         conn.execute(miint_load_sql())
 
+
 POSTGRES_URL = resolve_postgres_url()
 REPO_ROOT = Path(__file__).parent.parent.parent
 DATA_PLANE_DIR = REPO_ROOT / "qiita-data-plane"
 DATA_PLANE_BINARY = DATA_PLANE_DIR / "target" / "debug" / "qiita-data-plane"
 DUCKDB_LIB_DIR = find_duckdb_lib_dir(DATA_PLANE_DIR)
 DUCKLAKE_CATALOG_CONNSTR = ducklake_catalog_connstr()
+
+# Cold-start ceiling (seconds) for the data-plane gRPC port to open. The FIRST
+# module to use the module-scoped `data_plane` fixture pays the coldest start:
+# right after `_reset_ducklake_catalog()` drops/recreates the catalog DB, the
+# binary must boot, load DuckDB + the miint extension, connect to the catalog,
+# and create the DuckLake tables before its first TCP accept — which on a loaded
+# CI runner can exceed a tight ceiling (later modules reuse warm caches and come
+# up well under it). The poll returns the instant the port opens, so a generous
+# ceiling costs nothing on success and only lengthens the wait on a genuine hang.
+# Override via QIITA_DP_START_TIMEOUT_S (e.g. CI can set it higher than a local
+# box); a malformed value fails loudly here at import rather than mid-run.
+_DATA_PLANE_START_TIMEOUT_S = float(os.environ.get("QIITA_DP_START_TIMEOUT_S", "30"))
 
 
 @pytest.fixture(scope="session")
@@ -152,7 +165,9 @@ def _reset_ducklake_catalog() -> None:
     asyncio.run(_do())
 
 
-def _wait_for_grpc(host: str, port: int, timeout: float = 10.0) -> bool:
+def _wait_for_grpc(
+    host: str, port: int, timeout: float = _DATA_PLANE_START_TIMEOUT_S
+) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -264,10 +279,19 @@ def data_plane(hmac_secret, tmp_path_factory):
                 f"data plane exited during startup with code {rc}.\n"
                 f"stdout: {stdout.decode()[:1000]}\nstderr: {stderr.decode()[:1000]}"
             )
+        # The process is still alive (rc is None) but never opened the port
+        # within the window — a slow cold start that exceeded the ceiling, or a
+        # genuine hang. Say which, explicitly: name the pid and the port that
+        # never accepted (communicate() yields little here precisely because the
+        # process did NOT crash), and point at the override knob so a slow runner
+        # is a config bump, not a code change.
+        pid = proc.pid
         proc.kill()
         stdout, stderr = proc.communicate(timeout=5)
         pytest.fail(
-            f"data plane did not start within 10s.\n"
+            f"data plane (pid {pid}) is alive but did not accept a connection on "
+            f"{LOOPBACK_HOST}:{port} within {_DATA_PLANE_START_TIMEOUT_S:g}s "
+            f"(raise QIITA_DP_START_TIMEOUT_S if this is a slow cold start, not a hang).\n"
             f"stdout: {stdout.decode()[:1000]}\nstderr: {stderr.decode()[:1000]}"
         )
 

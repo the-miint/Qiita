@@ -149,6 +149,10 @@ test-workflows:
 # Builds the data plane debug binary first so Python tests can spawn it
 # without shelling out to cargo.
 #
+# Set QIITA_DP_START_TIMEOUT_S to widen the data-plane gRPC-startup wait (default
+# 30s) on a slow/loaded runner — the poll returns the instant the port opens, so
+# raising it is free on success.
+#
 # The qiita_ducklake catalog is dropped/recreated between the Python and Rust
 # phases because DuckLake pins DATA_PATH into the catalog, and the two suites
 # use different DATA_PATH values (Python picks a pytest tmp_path_factory dir,
