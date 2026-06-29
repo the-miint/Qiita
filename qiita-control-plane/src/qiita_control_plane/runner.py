@@ -116,6 +116,57 @@ _INFRA_UNREACHABLE_KINDS = frozenset(
 # force-fail. base=0 (the test cadence) stays 0, so suites never sleep.
 _INFRA_RETRY_BACKOFF_CAP_SECONDS = 60.0
 
+# Transient errors on the runner's OWN control-plane DB calls (poll / retry
+# loops). A per-statement `command_timeout` surfaces as a bare
+# `asyncio.TimeoutError` (which *is* the builtin `TimeoutError` in Python 3.11+,
+# with empty args); a brief CP-DB blip (failover, restart, connection reset,
+# pool drain race) surfaces as a `PostgresConnectionError` / `InterfaceError`.
+# None of these mean the step's WORK failed — the ticket's true state is fully
+# recoverable from the DB once it is reachable again — so the runner extends its
+# never-fail-on-outage rule to them: retry the cheap poll-loop read in place
+# (see `_raise_if_ticket_terminal`), and if a transient DB error still escapes
+# any other runner DB call it is recorded RETRIABLE (not PERMANENT) in
+# run_workflow's catch-all so a `/run` redrive re-attempts instead of the ticket
+# being abandoned as a deterministic failure. A real SQL error (constraint
+# violation, query bug) is a `PostgresError` that is NOT one of these, so it
+# still propagates as permanent.
+#
+# `TimeoutError` membership rests on an invariant worth stating: the only bare
+# builtin `TimeoutError` reachable on a runner code path is asyncpg's
+# `command_timeout`. Compute-backend timeouts are converted to a `BackendFailure`
+# at the ComputeBackendClient boundary (never a bare `TimeoutError`), so they are
+# classified by `.kind`, not here. If a future caller wraps work in
+# `asyncio.wait_for(...)`, its `TimeoutError` would be mislabeled "DB error" —
+# the failure *direction* stays safe (RETRIABLE is the forgiving choice), only
+# the label would be wrong. `InterfaceError` covers the CP-drain / restart race
+# ("pool is closing" / "connection is closed"); its other variant ("another
+# operation is in progress") is a shared-connection bug that can't arise here —
+# the runner acquires a fresh connection per call via `pool.fetchval`/`execute`.
+_TRANSIENT_DB_ERRORS: tuple[type[BaseException], ...] = (
+    TimeoutError,
+    asyncpg.PostgresConnectionError,
+    asyncpg.InterfaceError,
+)
+
+
+def _is_transient_db_error(exc: BaseException) -> bool:
+    """True for a transient control-plane DB error a retry can self-heal (see
+    `_TRANSIENT_DB_ERRORS`). A `BackendFailure` is never one of these — it is the
+    compute backend's typed failure, classified by its own `.kind`."""
+    return isinstance(exc, _TRANSIENT_DB_ERRORS)
+
+
+# The poll loop's per-iteration force-fail escape check (`_raise_if_ticket_terminal`)
+# is a single cheap one-column read; the pool's default 10s `command_timeout` is
+# an arbitrary — and under a lock wait / checkpoint / load spike, too tight —
+# ceiling for it, and a single timeout there used to abandon a healthy in-flight
+# job. Give this specific read a generous per-call timeout and retry it in place
+# a bounded number of times on a transient DB error before giving up. The total
+# in-place wait (≈ attempts × timeout) stays well under any real SLURM walltime.
+_POLL_DB_READ_TIMEOUT_SECONDS = 30.0
+_POLL_DB_READ_MAX_ATTEMPTS = 3
+_POLL_DB_READ_BACKOFF_SECONDS = 1.0
+
 # Work-ticket states the runner does NOT own. Once a ticket reaches one of
 # these out from under a running workflow — an operator
 # `qiita-admin ticket force-fail` flips it to FAILED — the runner must stop:
@@ -163,17 +214,50 @@ async def _raise_if_ticket_terminal(pool: asyncpg.Pool, work_ticket_idx: int) ->
     stops working a ticket it no longer owns. A cheap one-column read run
     once per loop iteration.
 
-    Like every runner DB call this assumes Postgres is reachable: a PG outage
-    here raises a (non-BackendFailure) asyncpg error that unwinds the run via
-    run_workflow's catch-all, same as any other runner DB write. The
-    never-fail-on-outage invariant covers the *compute* backend (CO/slurmrestd),
-    not the control plane's own database."""
-    state = await pool.fetchval(
-        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
-        work_ticket_idx,
-    )
-    if state in _TERMINAL_WORK_TICKET_STATES:
-        raise WorkflowAborted(work_ticket_idx, state)
+    Resilient to a transient CP-DB hiccup: the read uses a generous per-call
+    timeout (`_POLL_DB_READ_TIMEOUT_SECONDS`, overriding the pool's tighter
+    default for this one cheap read) and is retried in place up to
+    `_POLL_DB_READ_MAX_ATTEMPTS` on a transient DB error (`_is_transient_db_error`)
+    with a short backoff. A brief blip — a `command_timeout` under a lock wait /
+    checkpoint / load spike, or a momentary connection drop — therefore does NOT
+    abandon a healthy in-flight job. Only a sustained outage exhausts the retries
+    and re-raises; run_workflow's catch-all then records it RETRIABLE (not
+    PERMANENT), so a redrive recovers rather than the ticket dying as a
+    deterministic failure. A non-transient DB error (a real SQL bug) propagates
+    on the first raise.
+
+    Deliberately NOT the `_infra_backoff_delay` (capped-exponential) +
+    `_note_transient_retry` machinery the compute-side in-place retries use: this
+    is a short, bounded read-retry (a few attempts, not an open-ended outage
+    wait), and it cannot surface a `transient_reason` row because the very thing
+    that's failing IS the DB it would write that row to."""
+    last_exc: BaseException | None = None
+    for attempt in range(_POLL_DB_READ_MAX_ATTEMPTS):
+        try:
+            state = await pool.fetchval(
+                "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+                work_ticket_idx,
+                timeout=_POLL_DB_READ_TIMEOUT_SECONDS,
+            )
+        except _TRANSIENT_DB_ERRORS as exc:
+            last_exc = exc
+            _log.warning(
+                "work_ticket %d: transient DB error on the force-fail check (%s); attempt %d/%d",
+                work_ticket_idx,
+                type(exc).__name__,
+                attempt + 1,
+                _POLL_DB_READ_MAX_ATTEMPTS,
+            )
+            if attempt + 1 < _POLL_DB_READ_MAX_ATTEMPTS:
+                await asyncio.sleep(_POLL_DB_READ_BACKOFF_SECONDS * (attempt + 1))
+            continue
+        if state in _TERMINAL_WORK_TICKET_STATES:
+            raise WorkflowAborted(work_ticket_idx, state)
+        return
+    # Every attempt hit a transient DB error — let it propagate so the catch-all
+    # records the ticket RETRIABLE; a resume/redrive re-attaches once PG recovers.
+    assert last_exc is not None  # only reached after a recorded transient failure
+    raise last_exc
 
 
 async def _note_transient_retry(pool: asyncpg.Pool, work_ticket_idx: int, reason: str) -> None:
@@ -613,6 +697,16 @@ async def run_workflow(
         # ops dashboards can join back to action metadata. Re-raise the
         # original exception unchanged so callers that asserted on its
         # type keep working.
+        #
+        # EXCEPT a transient CP-DB error (a `command_timeout` / brief connection
+        # blip on one of the runner's OWN DB calls): that is NOT a deterministic
+        # failure of the step's work — the ticket's state is fully recoverable
+        # once PG is reachable — so record it RETRIABLE (not PERMANENT) so a
+        # `/run` redrive re-attempts instead of the ticket being abandoned (the
+        # healthy, often already-submitted SLURM job orphaned). The poll loop
+        # already retries the common case (the force-fail check) in place; this
+        # is the safety net for any other runner DB call.
+        transient_db = _is_transient_db_error(exc)
         _log.exception("workflow %d failed (unwrapped exception)", work_ticket_idx)
         if action.failure_status:
             try:
@@ -625,10 +719,13 @@ async def run_workflow(
         await _transition_to_failed(
             pool,
             work_ticket_idx,
-            failure_type=FailureType.PERMANENT,
+            failure_type=FailureType.RETRIABLE if transient_db else FailureType.PERMANENT,
             failure_stage=WorkTicketFailureStage.STEP_RUN,
             failure_step_name=_safe_entry_name(action, locals().get("index")),
-            failure_reason=f"{type(exc).__name__}: {exc!s}"[:2000],
+            failure_reason=(
+                ("transient control-plane DB error: " if transient_db else "")
+                + f"{type(exc).__name__}: {exc!s}"
+            )[:2000],
         )
         raise
 

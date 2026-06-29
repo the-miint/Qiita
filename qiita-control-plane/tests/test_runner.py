@@ -1123,6 +1123,46 @@ async def test_unwrapped_exception_marks_failed_as_permanent(
     assert "RuntimeError" in row["failure_reason"]
 
 
+async def test_transient_db_error_marks_failed_as_retriable(
+    postgres_pool, pending_work_ticket, library_spy, tmp_path, monkeypatch
+):
+    """A transient CP-DB error on one of the runner's OWN DB calls — modelled
+    here as a bare `asyncio.TimeoutError` (exactly how asyncpg surfaces a
+    `command_timeout`) from the step's write-ahead `record_submitting` — is
+    recorded `failure_type='retriable'`, NOT 'permanent'. That is the #214 fix:
+    a transient DB hiccup must not abandon a healthy in-flight job as a
+    deterministic failure; RETRIABLE lets a `/run` redrive re-attempt. Contrast
+    `test_unwrapped_exception_marks_failed_as_permanent` (a real Python bug stays
+    permanent)."""
+    from qiita_control_plane import runner as _runner
+
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = pending_work_ticket["work_ticket_idx"]
+    backend = FakeBackendClient()
+
+    async def boom_record_submitting(*_a, **_k):
+        # Bare TimeoutError (empty args) — what a 10s asyncpg command_timeout
+        # raises, and `asyncio.TimeoutError is TimeoutError` in 3.11+.
+        raise TimeoutError
+
+    monkeypatch.setattr(_runner.step_progress, "record_submitting", boom_record_submitting)
+
+    with pytest.raises(TimeoutError):
+        await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, failure_type, failure_stage, failure_step_name, failure_reason"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    assert row["state"] == "failed"
+    assert row["failure_type"] == "retriable"  # the fix — not 'permanent'
+    assert row["failure_stage"] == "step_run"
+    assert row["failure_step_name"] == "hash"  # first step, where the write-ahead fired
+    assert "transient control-plane DB error" in row["failure_reason"]
+    assert "TimeoutError" in row["failure_reason"]
+
+
 async def test_retry_observable_via_state_transitions(
     postgres_pool, pending_work_ticket, library_spy, tmp_path
 ):

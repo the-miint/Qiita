@@ -943,6 +943,18 @@ the `no-changelog` label).
 
 ### Fixed
 
+- A transient control-plane **Postgres** error on the workflow runner's own DB
+  calls — most often a per-statement `command_timeout` (a bare
+  `asyncio.TimeoutError`) on the poll loop's force-fail check under a lock wait /
+  checkpoint / load spike, or a brief connection blip — no longer permanently
+  fails an otherwise-healthy work ticket (which orphaned the still-running SLURM
+  job and left its output unregistered). The poll loop now gives that cheap read
+  a generous per-call timeout and retries it in place a few times, so the common
+  brief hiccup is absorbed without abandoning the job; and if a transient DB
+  error still escapes any other runner DB call, `run_workflow` records it
+  `failure_type='retriable'` (not `permanent`) — once Postgres is reachable again
+  to write that row — so a `/run` redrive re-attempts. A real SQL error
+  (constraint violation, query bug) is unaffected and stays permanent. (#214)
 - CLI HTTP subcommands (`qiita` / `qiita-admin`) now print a friendly, actionable
   message when the control plane is unreachable — a connection refusal, DNS
   failure, TLS error, or timeout — instead of dumping a raw `httpx` traceback.
