@@ -26,13 +26,13 @@ well-formed all-zero report, not an error.
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
 
 import duckdb
 from pydantic import BaseModel
+from qiita_common.parquet import validate_parquet_path
 
-from ..miint import apply_duckdb_settings, open_conn, resolve_duckdb_memory_gb
+from ..miint import apply_duckdb_settings, duckdb_tmp_dir, open_conn, resolve_duckdb_memory_gb
 
 YAML_STEP_NAME = "qc_report"
 
@@ -154,14 +154,13 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     workspace.mkdir(parents=True, exist_ok=True)
     report_path = workspace / REPORT_FILENAME
-    duckdb_tmp = workspace / ".duckdb_tmp"
-    duckdb_tmp.mkdir(parents=True, exist_ok=True)
 
-    # Inlined single-quote-escaped path (a filesystem path, no other injection
-    # surface), matching the sibling jobs' read_parquet literals.
-    reads_sql = str(source).replace("'", "''")
+    # read_parquet path literal can't take a bound param; route it through
+    # validate_parquet_path (fail-fast on quote/backslash/control chars), matching
+    # the sibling jobs' read_parquet literals.
+    reads_sql = validate_parquet_path(source)
 
-    try:
+    with duckdb_tmp_dir(workspace) as duckdb_tmp:
         with open_conn() as conn:
             apply_duckdb_settings(
                 conn,
@@ -181,9 +180,5 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             "mates": {"r1": r1, "r2": r2},
         }
         report_path.write_text(json.dumps(report))
-    finally:
-        # Drop the spill dir before returning so the SLURM launcher's manifest
-        # walker (which runs after execute()) sees only qc_report.json.
-        shutil.rmtree(duckdb_tmp, ignore_errors=True)
 
     return {output_binding: report_path}

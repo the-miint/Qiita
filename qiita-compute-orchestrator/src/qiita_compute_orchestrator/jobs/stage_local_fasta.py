@@ -53,7 +53,6 @@ enforces the same at the wire.
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -64,6 +63,7 @@ from qiita_common.parquet import validate_parquet_path
 from ..miint import (
     PARQUET_OPTS_CHUNKED,
     apply_duckdb_settings,
+    duckdb_tmp_dir,
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
@@ -157,12 +157,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     workspace.mkdir(parents=True, exist_ok=True)
     fasta_parquet = workspace / "fasta.parquet"
     fasta_out = validate_parquet_path(fasta_parquet)
-    duckdb_tmp = workspace / ".duckdb_tmp"
-    duckdb_tmp.mkdir(parents=True, exist_ok=True)
 
     success = False
     try:
-        with open_miint_conn() as conn:
+        with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
@@ -241,12 +239,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             )
         success = True
     finally:
-        # Drop the DuckDB spill dir before returning so the SLURM launcher's
-        # manifest walker (which runs after execute()) sees only fasta.parquet.
-        shutil.rmtree(duckdb_tmp, ignore_errors=True)
         # On any failure (bad manifest entry, empty-body, dup read_id,
-        # interrupted COPY) remove a partial Parquet so the launcher's walker
-        # can't promote a half-written file as this step's output.
+        # interrupted COPY) remove a partial Parquet so the launcher's manifest
+        # walker (which runs after execute()) can't promote a half-written file
+        # as this step's output.
         if not success:
             fasta_parquet.unlink(missing_ok=True)
 

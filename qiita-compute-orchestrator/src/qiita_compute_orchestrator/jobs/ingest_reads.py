@@ -83,6 +83,7 @@ from ..miint import (
     PARQUET_OPTS_INTERMEDIATE,
     apply_duckdb_settings,
     duckdb_headroom_gb,
+    duckdb_tmp_dir,
     open_conn,
     open_miint_conn,
     slurm_alloc_gb,
@@ -374,8 +375,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # register-files maps the `read/` subdir's part files -> the `read` table.
     register_dir = workspace / "read"
     register_dir.mkdir(parents=True, exist_ok=True)
-    duckdb_tmp = workspace / ".duckdb_tmp"
-    duckdb_tmp.mkdir(parents=True, exist_ok=True)
 
     memory_gb, threads = _per_slot_caps(_CONCURRENCY)
     sem = asyncio.Semaphore(_CONCURRENCY)
@@ -444,14 +443,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             _hardlink(durable, part)
             return "registered"
 
-    try:
+    with duckdb_tmp_dir(workspace) as duckdb_tmp:
         async with make_cp_client() as http:
             outcomes = await asyncio.gather(
                 *(_process_sample(http, psi, pid) for psi, pid in roster),
                 return_exceptions=True,
             )
-    finally:
-        shutil.rmtree(duckdb_tmp, ignore_errors=True)
 
     # Surface the first hard error in roster order — matches the old sequential
     # abort-on-first behavior and preserves the dispatcher's wrapping of bare

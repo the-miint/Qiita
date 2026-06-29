@@ -101,7 +101,6 @@ Pipeline (B-staged-Parquet):
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
 import httpx
@@ -116,6 +115,7 @@ from ..miint import (
     PARQUET_OPTS,
     PARQUET_OPTS_INTERMEDIATE,
     apply_duckdb_settings,
+    duckdb_tmp_dir,
     open_conn,
     open_miint_conn,
 )
@@ -228,8 +228,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # step maps `read.parquet` -> the `read` table.
     out_path = workspace / "read.parquet"
     out = validate_parquet_path(out_path)
-    duckdb_tmp = workspace / ".duckdb_tmp"
-    duckdb_tmp.mkdir(parents=True, exist_ok=True)
 
     # Paired-end input: pass R2 via miint's `sequence2:=` named arg.
     # miint reads both streams in lockstep and emits one row per pair
@@ -250,7 +248,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     try:
         # FASTQ -> intermediate Parquet. Empty inputs exited via StepNoData
         # above, so read_fastx is guaranteed to have at least one record here.
-        with open_miint_conn() as conn:
+        with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
@@ -276,7 +274,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             )
 
         # Count via Parquet footer (no scan).
-        with open_conn() as conn:
+        with duckdb_tmp_dir(workspace) as duckdb_tmp, open_conn() as conn:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
@@ -374,7 +372,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
         # Rewrite intermediate -> final with sequence_idx assigned and
         # physically sorted on disk.
-        with open_conn() as conn:
+        with duckdb_tmp_dir(workspace) as duckdb_tmp, open_conn() as conn:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
@@ -408,13 +406,13 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # only does a footer-level read_parquet count.
             raw_read_count = write_read_count(conn, out_path, workspace)
     finally:
-        # Clean up transient artifacts BEFORE returning so the SLURM
-        # launcher's manifest walker (which runs after execute()) sees
-        # only reads.parquet. Best-effort: a hard-killed process leaves
-        # these behind in the failed-attempt workspace, but the runner
-        # creates a fresh attempt-N+1 dir on retry so it doesn't cascade.
+        # Clean up the intermediate Parquet BEFORE returning so the SLURM
+        # launcher's manifest walker (which runs after execute()) sees only
+        # reads.parquet. Best-effort: a hard-killed process leaves it behind in
+        # the failed-attempt workspace, but the runner creates a fresh
+        # attempt-N+1 dir on retry so it doesn't cascade. (The DuckDB spill dir
+        # is torn down by each `duckdb_tmp_dir` block above.)
         intermediate.unlink(missing_ok=True)
-        shutil.rmtree(duckdb_tmp, ignore_errors=True)
 
     # `reads` is the read.parquet path the downstream qc/host_filter steps
     # consume; `read_staging_dir` is the workspace a register-files step loads

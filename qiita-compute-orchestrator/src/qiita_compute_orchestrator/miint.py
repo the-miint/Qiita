@@ -24,6 +24,9 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import duckdb
@@ -87,6 +90,26 @@ PARQUET_OPTS_CHUNKED: str = f"{PARQUET_OPTS}, ROW_GROUP_SIZE {CHUNK_ROW_GROUP_SI
 # reaches DuckDB; a per-job literal is only the off-SLURM fallback.
 # Threads are still passed as a literal (the cgroup cpu allocation) and also size
 # the headroom — see `duckdb_headroom_gb`.
+
+
+@contextmanager
+def duckdb_tmp_dir(workspace: Path) -> Iterator[Path]:
+    """Create the `<workspace>/.duckdb_tmp` spill directory and remove it on exit.
+
+    Every native DuckDB job spills to this dir — it is what `apply_duckdb_settings`
+    hands DuckDB as its `temp_directory`. Routing all of them through this context
+    manager makes teardown **structural**: the spill dir (which can grow large and
+    otherwise accumulates in the shared work-ticket workspace — SLURM has hit "no
+    space in /tmp" from leftover spill) is removed whether the body returns or
+    raises. `ignore_errors=True` so cleanup never masks the job's own failure.
+
+    Yields the spill dir to hand to `apply_duckdb_settings`."""
+    duckdb_tmp = workspace / ".duckdb_tmp"
+    duckdb_tmp.mkdir(parents=True, exist_ok=True)
+    try:
+        yield duckdb_tmp
+    finally:
+        shutil.rmtree(duckdb_tmp, ignore_errors=True)
 
 
 def apply_duckdb_settings(

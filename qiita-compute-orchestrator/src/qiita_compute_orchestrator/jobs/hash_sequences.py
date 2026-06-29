@@ -49,6 +49,7 @@ from ..miint import (
     PARQUET_OPTS,
     PARQUET_OPTS_CHUNKED,
     apply_duckdb_settings,
+    duckdb_tmp_dir,
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
@@ -133,12 +134,10 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     reference_sequence_chunks_dir = workspace / "reference_sequence_chunks"
     reference_sequence_chunks_dir.mkdir(parents=True, exist_ok=True)
     manifest_out = validate_parquet_path(manifest_path)
-    duckdb_tmp = workspace / ".duckdb_tmp"
-    duckdb_tmp.mkdir(parents=True, exist_ok=True)
 
     success = False
     try:
-        with open_miint_conn() as conn:
+        with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
@@ -283,10 +282,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             conn.execute("DROP TABLE hashed")
         success = True
     finally:
-        # Clean up the DuckDB spill dir BEFORE returning so the SLURM
-        # launcher's manifest walker (running after execute()) sees only
-        # the output Parquets.
-        shutil.rmtree(duckdb_tmp, ignore_errors=True)
         # On any failure path (interrupted COPY, DuckDB OOM, ...) remove
         # partial Parquets so the launcher's manifest walker doesn't
         # promote a half-written result as the step's output. Best-effort:
