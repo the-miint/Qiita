@@ -21,6 +21,7 @@ from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import asyncpg
 import pytest
 from qiita_common.actions import (
     ActionCeiling,
@@ -32,9 +33,13 @@ from qiita_common.backend_failure import BackendFailure, FailureKind
 from qiita_common.models import StepType, WorkTicketFailureStage
 
 from qiita_control_plane.runner import (
+    _POLL_DB_READ_MAX_ATTEMPTS,
+    WorkflowAborted,
     _attempt_is_unowned,
     _escalated_mem_floor_after_oom,
     _escalated_walltime_after_timeout,
+    _is_transient_db_error,
+    _raise_if_ticket_terminal,
     _resolve_baseline_for_step,
 )
 
@@ -515,3 +520,104 @@ def test_attempt_is_unowned():
     assert _attempt_is_unowned(rows, step_index=0, attempt=1) is True
     # A row for a different step → unrelated to this dir, unowned.
     assert _attempt_is_unowned(rows, step_index=1, attempt=0) is True
+
+
+# =============================================================================
+# Transient control-plane DB errors — classification + poll-loop resilience
+# =============================================================================
+#
+# A per-statement command_timeout (or a brief CP-DB connection blip) on the
+# runner's OWN DB calls must NOT be misclassified as a permanent step failure
+# (which abandons a healthy in-flight SLURM job). These cover the classifier and
+# the resilient force-fail check; the run_workflow catch-all path is covered in
+# the DB-backed test_runner.py.
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        TimeoutError(),  # asyncpg command_timeout surfaces as bare asyncio.TimeoutError
+        asyncpg.PostgresConnectionError("connection lost"),
+        asyncpg.exceptions.ConnectionDoesNotExistError("gone"),  # subclass of the above
+        asyncpg.InterfaceError("pool is closing"),
+    ],
+)
+def test_is_transient_db_error_true_for_transient(exc):
+    assert _is_transient_db_error(exc) is True
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        asyncpg.exceptions.UniqueViolationError("dup"),  # a real SQL error stays permanent
+        ValueError("bad input"),
+        RuntimeError("programming bug"),
+        BackendFailure(
+            kind=FailureKind.OOM_KILLED,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name="x",
+            reason="x",
+        ),
+    ],
+)
+def test_is_transient_db_error_false_for_non_transient(exc):
+    assert _is_transient_db_error(exc) is False
+
+
+class _FakePool:
+    """Minimal stand-in for the asyncpg.Pool.fetchval `_raise_if_ticket_terminal`
+    calls. `results` is consumed one item per call: an Exception is raised, any
+    other value is returned (the ticket state)."""
+
+    def __init__(self, *results):
+        self._results = list(results)
+        self.calls = 0
+
+    async def fetchval(self, _sql, _idx, *, timeout=None):
+        self.calls += 1
+        item = self._results.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+async def test_raise_if_ticket_terminal_returns_when_not_terminal():
+    pool = _FakePool("processing")
+    await _raise_if_ticket_terminal(pool, 1)  # no raise
+    assert pool.calls == 1
+
+
+async def test_raise_if_ticket_terminal_aborts_when_terminal():
+    pool = _FakePool("failed")
+    with pytest.raises(WorkflowAborted):
+        await _raise_if_ticket_terminal(pool, 1)
+    assert pool.calls == 1
+
+
+async def test_raise_if_ticket_terminal_retries_transient_db_error_then_succeeds(monkeypatch):
+    """A transient DB error (command_timeout / connection blip) on the force-fail
+    check is retried in place; a later success keeps the poll loop alive instead
+    of abandoning a healthy job."""
+    monkeypatch.setattr("qiita_control_plane.runner._POLL_DB_READ_BACKOFF_SECONDS", 0.0)
+    pool = _FakePool(TimeoutError(), asyncpg.InterfaceError("blip"), "processing")
+    await _raise_if_ticket_terminal(pool, 1)  # survives the two blips
+    assert pool.calls == 3
+
+
+async def test_raise_if_ticket_terminal_reraises_after_exhausting_transient_retries(monkeypatch):
+    """A sustained DB outage exhausts the bounded retries and re-raises, so the
+    catch-all can record it RETRIABLE (not silently swallow it forever)."""
+    monkeypatch.setattr("qiita_control_plane.runner._POLL_DB_READ_BACKOFF_SECONDS", 0.0)
+    pool = _FakePool(*[TimeoutError() for _ in range(_POLL_DB_READ_MAX_ATTEMPTS)])
+    with pytest.raises(TimeoutError):
+        await _raise_if_ticket_terminal(pool, 1)
+    assert pool.calls == _POLL_DB_READ_MAX_ATTEMPTS
+
+
+async def test_raise_if_ticket_terminal_propagates_non_transient_db_error():
+    """A real SQL error is not transient — it propagates on the first raise,
+    never retried."""
+    pool = _FakePool(asyncpg.exceptions.UniqueViolationError("dup"))
+    with pytest.raises(asyncpg.exceptions.UniqueViolationError):
+        await _raise_if_ticket_terminal(pool, 1)
+    assert pool.calls == 1
