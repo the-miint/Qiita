@@ -1015,6 +1015,83 @@ async def test_permanent_failure_skips_retry_loop(
     assert backend.attempts["hash"] == 1
 
 
+async def test_oom_at_memory_ceiling_fails_without_retry(
+    postgres_pool, pending_work_ticket, library_spy, tmp_path
+):
+    """An OOM_KILLED step that is ALREADY at the action memory ceiling does not
+    retry: memory escalation has no headroom (a re-run would OOM identically),
+    so the runner reclassifies it as a permanent RESOURCE_CEILING_EXHAUSTED and
+    fails immediately — instead of burning the retry budget on a guaranteed
+    repeat. This fixture's action has mem_ceiling_gb == the hash step's baseline
+    mem_gb (1), so the very first OOM is at the ceiling."""
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = pending_work_ticket["work_ticket_idx"]
+
+    backend = _RetryingBackendClient(
+        fail_step="hash",
+        fail_n_times=999,  # would never succeed if it kept retrying
+        kind=FailureKind.OOM_KILLED,
+    )
+
+    with pytest.raises(BackendFailure) as exc_info:
+        await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+    assert exc_info.value.kind is FailureKind.RESOURCE_CEILING_EXHAUSTED
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, retry_count, failure_type, failure_stage,"
+        "       failure_step_name, failure_reason"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    assert row["state"] == "failed"
+    assert row["retry_count"] == 0  # fail-fast: no retry consumed
+    assert row["failure_type"] == "permanent"
+    assert row["failure_stage"] == "step_run"
+    assert row["failure_step_name"] == "hash"
+    # The kind is asserted on the raised exception above; failure_reason carries
+    # the human explanation (exc.reason), which names the exhausted ceiling.
+    assert "memory ceiling" in row["failure_reason"]
+    # Exactly one attempt — the at-ceiling OOM does not loop.
+    assert backend.attempts["hash"] == 1
+
+
+async def test_timeout_at_walltime_ceiling_fails_without_retry(
+    postgres_pool, pending_work_ticket, library_spy, tmp_path
+):
+    """Mirror of the OOM case for walltime: a TIMEOUT_BEFORE_START step already
+    at the action walltime ceiling fails-fast as RESOURCE_CEILING_EXHAUSTED
+    rather than re-running at the same limit. This fixture's walltime ceiling
+    (1 minute) equals the hash step's baseline walltime (PT1M), so the first
+    timeout is at the ceiling."""
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+
+    workspace_root = tmp_path / "ws"
+    work_ticket_idx = pending_work_ticket["work_ticket_idx"]
+
+    backend = _RetryingBackendClient(
+        fail_step="hash",
+        fail_n_times=999,
+        kind=FailureKind.TIMEOUT_BEFORE_START,
+    )
+
+    with pytest.raises(BackendFailure) as exc_info:
+        await _run(work_ticket_idx, postgres_pool, backend, workspace_root)
+    assert exc_info.value.kind is FailureKind.RESOURCE_CEILING_EXHAUSTED
+
+    row = await postgres_pool.fetchrow(
+        "SELECT state, retry_count, failure_type, failure_reason"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    assert row["state"] == "failed"
+    assert row["retry_count"] == 0
+    assert row["failure_type"] == "permanent"
+    assert "walltime ceiling" in row["failure_reason"]
+    assert backend.attempts["hash"] == 1
+
+
 async def test_unwrapped_exception_marks_failed_as_permanent(
     postgres_pool, pending_work_ticket, library_spy, tmp_path
 ):
@@ -1053,7 +1130,13 @@ async def test_retry_observable_via_state_transitions(
     Verified by observing the work_ticket state through a `before_each`
     hook installed on the backend stub: when run_step is invoked, the
     ticket must be in PROCESSING (not QUEUED — the runner re-transitions
-    before each attempt)."""
+    before each attempt).
+
+    Uses NODE_FAIL (a transient infra kind that retries at the same
+    allocation), NOT OOM_KILLED: this fixture's action has mem baseline ==
+    ceiling (1 GB), so an OOM would saturate memory escalation on the first
+    attempt and fail-fast as RESOURCE_CEILING_EXHAUSTED — see
+    test_oom_at_memory_ceiling_fails_without_retry."""
     from qiita_common.backend_failure import FailureKind
 
     workspace_root = tmp_path / "ws"
@@ -1090,7 +1173,7 @@ async def test_retry_observable_via_state_transitions(
     backend = _Backend(
         fail_step="hash",
         fail_n_times=2,  # two transient failures, then succeeds
-        kind=FailureKind.OOM_KILLED,
+        kind=FailureKind.NODE_FAIL,
         outputs_on_success={"manifest": workspace / "manifest.parquet"},
     )
 
