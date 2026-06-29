@@ -24,6 +24,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import asyncpg
+from qiita_common.actions import READ_MASK_ACTION_ID
 
 from . import require_transaction, validate_patch_fields
 from ._sample_helpers import (
@@ -418,20 +419,27 @@ async def fetch_sequenced_pool_samples(
     spans every pool in a run and returns bare idxs; this one is scoped to a
     single sequenced_pool and returns the richer per-sample rows a fan-out
     needs (e.g. submit-host-filter-pool). Excludes sequenced_samples whose
-    supertype prep_sample row is retired. Sort by sequenced_pool_item_id so
-    the fan-out order is stable across calls. Callers that need to detect
-    truncation pass `limit = cap + 1`; if the returned list has length > cap,
-    the underlying set exceeded the cap.
+    supertype prep_sample row is retired. Each row carries
+    `has_read_mask_ticket` (any-state EXISTS over qiita.work_ticket for the
+    read-mask action) so the fan-out can skip already-submitted samples and
+    operators get per-sample host-processing coverage. Sort by
+    sequenced_pool_item_id so the fan-out order is stable across calls.
+    Callers that need to detect truncation pass `limit = cap + 1`; if the
+    returned list has length > cap, the underlying set exceeded the cap.
     """
     # Single round trip; the partial index prep_sample_active_idx covers the
-    # retired = false predicate and the join filters down to one pool.
+    # retired = false predicate and the join filters down to one pool. The
+    # has_read_mask_ticket EXISTS rides the work_ticket_prep_sample_idx index.
     rows = await pool_or_conn.fetch(
         # Alias ss.idx so a row maps straight onto SequencedSampleListItem via
         # model_validate(dict(row)) — the route does no field renaming.
         "SELECT ss.idx AS sequenced_sample_idx, ss.prep_sample_idx,"
         " ps.biosample_idx, ss.sequenced_pool_item_id,"
         " ss.ena_experiment_accession, ss.ena_run_accession,"
-        " bs.biosample_accession, bs.ena_sample_accession"
+        " bs.biosample_accession, bs.ena_sample_accession,"
+        " EXISTS (SELECT 1 FROM qiita.work_ticket wt"
+        "          WHERE wt.prep_sample_idx = ss.prep_sample_idx"
+        "            AND wt.action_id = $3) AS has_read_mask_ticket"
         " FROM qiita.sequenced_sample ss"
         " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
         " JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
@@ -441,6 +449,7 @@ async def fetch_sequenced_pool_samples(
         " LIMIT $2",
         sequenced_pool_idx,
         limit,
+        READ_MASK_ACTION_ID,
     )
     return list(rows)
 
@@ -471,7 +480,10 @@ async def fetch_sequenced_samples_for_run(
         "SELECT ss.idx AS sequenced_sample_idx, ss.prep_sample_idx,"
         " ps.biosample_idx, ss.sequenced_pool_item_id,"
         " ss.ena_experiment_accession, ss.ena_run_accession,"
-        " bs.biosample_accession, bs.ena_sample_accession"
+        " bs.biosample_accession, bs.ena_sample_accession,"
+        " EXISTS (SELECT 1 FROM qiita.work_ticket wt"
+        "          WHERE wt.prep_sample_idx = ss.prep_sample_idx"
+        "            AND wt.action_id = $3) AS has_read_mask_ticket"
         " FROM qiita.sequenced_sample ss"
         " JOIN qiita.sequenced_pool sp ON sp.idx = ss.sequenced_pool_idx"
         " JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
@@ -482,6 +494,7 @@ async def fetch_sequenced_samples_for_run(
         " LIMIT $2",
         sequencing_run_idx,
         limit,
+        READ_MASK_ACTION_ID,
     )
     return list(rows)
 

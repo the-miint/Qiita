@@ -1,11 +1,12 @@
 """Route tests for GET /sequencing-run/{run}/sequenced-pool/{pool}/completion —
-the pool's prep-generation completion rollup.
+the pool's end-to-end processing rollup (demux state + host-masking buckets).
 
-Covers the happy path (per-sample read-mask tickets bucketed + the
-`complete` flag), the all-completed pool, the empty pool, and the read gate
-(404 missing pool, 422 pool-not-in-run, 401 anonymous, 403 missing scope /
-regular user). Bucket precedence is exercised at the repo layer in
-test_sequenced_pool_completion; here the wiring, response model, and auth.
+Covers the happy path (per-sample read-mask tickets bucketed + the `complete`
+flag), the all-completed pool, the empty pool, the demux `demux_state` /
+`fully_processed` wiring, and the read gate (404 missing pool, 422
+pool-not-in-run, 401 anonymous, 403 missing scope / regular user). Bucket
+precedence is exercised at the repo layer in test_sequenced_pool_completion;
+here the wiring, response model, and auth.
 """
 
 import json
@@ -75,6 +76,51 @@ async def _add_ticket(db, *, action, owner, prep_sample_idx, state):
     )
 
 
+async def _seed_bcl_action(db):
+    """Insert a bcl-convert (sequenced_pool-scoped) action so a pool demux
+    work_ticket's FK resolves; return its (action_id, version). The
+    action_processing_kinds_only_for_prep_sample CHECK requires an empty
+    target_processing_kinds for a non-prep_sample target_kind."""
+    action_id = "bcl-convert"
+    version = f"v-{uuid.uuid4()}"
+    await db.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, target_processing_kinds,"
+        "  scopes, audience, context_schema, steps,"
+        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling, success_status, failure_status"
+        ") VALUES ($1, $2, 'sequenced_pool'::qiita.scope_target_kind,"
+        "          ARRAY[]::qiita.processing_kind[], ARRAY['prep_sample:write']::text[],"
+        "          $3::jsonb, '{}'::jsonb, '[]'::jsonb, 1, 1, '1 minute', 'active', 'failed')",
+        action_id,
+        version,
+        json.dumps({"service": False, "human_roles": ["user"]}),
+    )
+    return action_id, version
+
+
+async def _add_pool_ticket(db, *, action, owner, sequenced_pool_idx, state):
+    """Insert a sequenced_pool-scoped (demux) work ticket."""
+    action_id, version = action
+    failed = state == "failed"
+    await db.execute(
+        "INSERT INTO qiita.work_ticket"
+        "  (action_id, action_version, originator_principal_idx,"
+        "   scope_target_kind, sequenced_pool_idx, state,"
+        "   failure_type, failure_stage, failure_reason)"
+        " VALUES ($1, $2, $3, 'sequenced_pool'::qiita.scope_target_kind, $4,"
+        "         $5::qiita.work_ticket_state,"
+        "         $6::qiita.failure_type, $7::qiita.work_ticket_failure_stage, $8)",
+        action_id,
+        version,
+        owner,
+        sequenced_pool_idx,
+        state,
+        "permanent" if failed else None,
+        "finalize" if failed else None,
+        "test failure" if failed else None,
+    )
+
+
 @pytest_asyncio.fixture
 async def seeded_pool(ctx):
     """Seed a run + pool with two samples: one with a COMPLETED read-mask
@@ -82,6 +128,7 @@ async def seeded_pool(ctx):
     db = ctx["pool"]
     owner = ctx["wet_session"]["principal_idx"]
     action = await _seed_fastq_action(db)
+    bcl_action = await _seed_bcl_action(db)
     created = []
 
     bs0, ps0 = await seed_biosample_with_sequenced_prep_sample(db, owner_idx=owner)
@@ -103,16 +150,26 @@ async def seeded_pool(ctx):
     )
     created.append((bs1, ps1, ss1))
 
-    yield {"run_idx": run_idx, "pool_idx": pool_idx, "owner": owner, "action": action}
+    yield {
+        "run_idx": run_idx,
+        "pool_idx": pool_idx,
+        "owner": owner,
+        "action": action,
+        "bcl_action": bcl_action,
+    }
 
     await db.execute(
         "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2", *action
+    )
+    await db.execute(
+        "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2", *bcl_action
     )
     for _bs, _ps, ss_idx in created:
         await db.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss_idx)
     await db.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
     await db.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
     await db.execute("DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", *action)
+    await db.execute("DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", *bcl_action)
     for _bs, ps_idx, _ss in created:
         await db.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", ps_idx)
     for bs_idx, _ps, _ss in created:
@@ -139,6 +196,61 @@ async def test_get_completion_buckets_samples(ctx, seeded_pool):
     assert body["samples_not_submitted"] == 1
     # Not every sample completed → not complete.
     assert body["complete"] is False
+    # No bcl-convert ticket seeded by default → demux not_submitted, not fully done.
+    assert body["demux_state"] == "not_submitted"
+    assert body["fully_processed"] is False
+
+
+async def _complete_second_sample(db, seeded_pool):
+    """Give the not-submitted second sample (compl-item-1) a completed read-mask
+    ticket so the host-masking stage is `complete`."""
+    ps1 = await db.fetchval(
+        "SELECT prep_sample_idx FROM qiita.sequenced_sample"
+        " WHERE sequenced_pool_idx = $1 AND sequenced_pool_item_id = 'compl-item-1'",
+        seeded_pool["pool_idx"],
+    )
+    await _add_ticket(
+        db,
+        action=seeded_pool["action"],
+        owner=seeded_pool["owner"],
+        prep_sample_idx=ps1,
+        state="completed",
+    )
+
+
+async def test_get_completion_fully_processed_when_demux_done_and_all_masked(ctx, seeded_pool):
+    """demux COMPLETED + every sample masked → fully_processed True."""
+    db = ctx["pool"]
+    await _complete_second_sample(db, seeded_pool)
+    await _add_pool_ticket(
+        db,
+        action=seeded_pool["bcl_action"],
+        owner=seeded_pool["owner"],
+        sequenced_pool_idx=seeded_pool["pool_idx"],
+        state="completed",
+    )
+    body = (await ctx["wet"].get(_url(seeded_pool["run_idx"], seeded_pool["pool_idx"]))).json()
+    assert body["demux_state"] == "completed"
+    assert body["complete"] is True
+    assert body["fully_processed"] is True
+
+
+async def test_get_completion_failed_demux_blocks_fully_processed(ctx, seeded_pool):
+    """Even with every sample masked (`complete`), a FAILED demux keeps
+    fully_processed False — the end-to-end flag requires demux completed."""
+    db = ctx["pool"]
+    await _complete_second_sample(db, seeded_pool)
+    await _add_pool_ticket(
+        db,
+        action=seeded_pool["bcl_action"],
+        owner=seeded_pool["owner"],
+        sequenced_pool_idx=seeded_pool["pool_idx"],
+        state="failed",
+    )
+    body = (await ctx["wet"].get(_url(seeded_pool["run_idx"], seeded_pool["pool_idx"]))).json()
+    assert body["demux_state"] == "failed"
+    assert body["complete"] is True
+    assert body["fully_processed"] is False
 
 
 async def test_get_completion_complete_when_all_done(ctx, seeded_pool):
