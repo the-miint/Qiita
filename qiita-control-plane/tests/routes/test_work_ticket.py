@@ -1226,6 +1226,113 @@ async def test_submit_sequenced_pool_disallow_without_delete(
     assert detail["blocking_work_ticket_idx"] == first_idx
 
 
+async def test_submit_sequenced_pool_completed_blocks_without_force(
+    wt_client, postgres_pool, admin_token, sequenced_pool_action, sequenced_pool_for_wt
+):
+    """A re-submit over an already-COMPLETED pool ticket is refused (409)
+    without force — a re-run would re-register the pool's reads into the lake.
+    The 409 names the blocking COMPLETED ticket and points at the override."""
+    token, admin_idx = admin_token
+    action_id, version = sequenced_pool_action
+    run_idx, pool_idx = sequenced_pool_for_wt
+    headers = {"Authorization": f"Bearer {token}"}
+
+    completed_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, sequenced_pool_idx, state)"
+        " VALUES ($1, $2, $3, 'sequenced_pool', $4, $5::qiita.work_ticket_state)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        pool_idx,
+        WorkTicketState.COMPLETED.value,
+    )
+    wt_client._created_tickets.append(completed_idx)
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json=_sequenced_pool_body(action_id, version, pool_idx, run_idx),
+        headers=headers,
+    )
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["blocking_work_ticket_idx"] == completed_idx
+    assert "COMPLETED" in detail["reason"]
+    assert "force" in detail["reason"]
+
+
+async def test_submit_sequenced_pool_completed_force_allows(
+    wt_client, postgres_pool, admin_token, sequenced_pool_action, sequenced_pool_for_wt
+):
+    """force=true (here a system_admin) intentionally re-submits over a
+    COMPLETED pool ticket: 202 with a fresh PENDING ticket alongside the
+    COMPLETED one."""
+    token, admin_idx = admin_token
+    action_id, version = sequenced_pool_action
+    run_idx, pool_idx = sequenced_pool_for_wt
+    headers = {"Authorization": f"Bearer {token}"}
+
+    completed_idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx,"
+        "  scope_target_kind, sequenced_pool_idx, state)"
+        " VALUES ($1, $2, $3, 'sequenced_pool', $4, $5::qiita.work_ticket_state)"
+        " RETURNING work_ticket_idx",
+        action_id,
+        version,
+        admin_idx,
+        pool_idx,
+        WorkTicketState.COMPLETED.value,
+    )
+    wt_client._created_tickets.append(completed_idx)
+
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json=_sequenced_pool_body(action_id, version, pool_idx, run_idx, force=True),
+        headers=headers,
+    )
+    assert resp.status_code == 202, resp.text
+    new_idx = resp.json()["work_ticket_idx"]
+    wt_client._created_tickets.append(new_idx)
+    assert new_idx != completed_idx
+
+
+async def test_submit_force_requires_admin_403(
+    wt_client, regular_token, reference_action_open, reference_idx
+):
+    """force is privileged regardless of the action's audience: a regular user
+    who clears audience + (empty) scope is still 403'd for force=true — mirrors
+    the resource_override gate."""
+    token, _ = regular_token
+    action_id, version = reference_action_open
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json=_body(action_id, version, reference_idx, force=True),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 403, resp.text
+    assert "wet_lab_admin" in resp.text
+
+
+async def test_submit_force_noop_on_non_pool_scope(
+    wt_client, admin_token, reference_action, reference_idx
+):
+    """An authorized force=true is a no-op outside the sequenced_pool COMPLETED
+    gate: an admin submitting a reference action with force=true still gets a
+    clean 202 (the flag changes nothing for non-pool scopes)."""
+    token, _ = admin_token
+    action_id, version = reference_action
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX,
+        json=_body(action_id, version, reference_idx, force=True),
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 202, resp.text
+    wt_client._created_tickets.append(resp.json()["work_ticket_idx"])
+
+
 async def test_submit_sequenced_pool_unique_index_catches_select_race(
     wt_client, admin_token, sequenced_pool_action, sequenced_pool_for_wt, monkeypatch
 ):

@@ -460,6 +460,16 @@ the `no-changelog` label).
 
 ### Changed
 
+- bcl-convert re-submission over an already-**COMPLETED** sequenced_pool is now
+  refused by default and requires `--force` (wet_lab_admin+). A re-run
+  re-registers the pool's reads into the lake, and DuckLake has no uniqueness, so
+  a silent re-submit duplicated read rows. `WorkTicketCreateRequest` gains a
+  `force` flag (privileged like `resource_override`); `submit_work_ticket` /
+  `_check_disallow_without_delete` gate a COMPLETED-pool resubmit; `qiita
+  submit-bcl-convert` gains `--force`. Non-force recovery for a stored result is
+  `delete-sequenced-pool` then resubmit; FAILED tickets remain freely resumable
+  via `qiita ticket run`. (#206)
+
 - `host_filter` step memory raised 16 → 32 GB in both actions that run it
   (`read-mask/1.0.0` and `fastq-to-parquet/1.3.0`): the step's
   `baseline_resources.mem_gb` and the `action_ceiling.mem_gb` both go 16 → 32, so
@@ -920,6 +930,16 @@ the `no-changelog` label).
   `staged_reads_reaped`). Reclaiming the orphaned Parquet bytes the logical
   DuckLake delete leaves behind remains a future maintenance pass (as with
   reference delete); pre-existing orphans from past deletes are not swept. (#204)
+- sequenced_pool find-or-create now keys on the preflight **content**
+  (`run_preflight_sha256`, a STORED generated column) instead of its filename, so
+  a byte-identical preflight re-uploaded under a different basename resolves to
+  the same pool instead of minting a duplicate (the root cause of the run-15
+  duplicate pools). Adds the `sequenced_pool_one_per_run_and_hash` partial unique
+  index and repoints `insert_sequenced_pool`'s `ON CONFLICT` to it. The existing
+  `sequenced_pool_one_per_run_and_filename` index is kept as an independent,
+  permanent uniqueness rule — distinct pools in a run must differ in both content
+  and filename, so a different-content upload reusing an existing filename is a
+  409 by design (never a 500). (#206)
 - `qiita-admin masked-read-export` no longer floods stderr with Arrow Acero
   `An input buffer was poorly aligned` warnings (one per column per batch). The
   PyArrow Flight client zero-copies the gRPC message body, whose absolute base

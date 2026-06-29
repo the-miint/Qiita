@@ -1114,9 +1114,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Path to the local kl-run-preflight SQLite file. The CLI reads"
             " it (refuses empty), base64-encodes the bytes, and attaches the"
-            " blob to the sequenced-pool row; the file basename becomes"
-            " run_preflight_filename, which serves as the find-or-create key"
-            " for the pool POST."
+            " blob to the sequenced-pool row. The pool find-or-create key is"
+            " the preflight *content* (its SHA-256), so the same bytes"
+            " re-uploaded under any filename resolve to the same pool; the"
+            " file basename is stored as run_preflight_filename for reference"
+            " only."
         ),
     )
     p_submit_bcl.add_argument(
@@ -1129,6 +1131,18 @@ def _build_parser() -> argparse.ArgumentParser:
             " does not carry a Qiita prep_protocol identifier; a future"
             " preflight column may let this flag come out of the file like"
             " the per-row study_idx already does (project.qiita_id)."
+        ),
+    )
+    p_submit_bcl.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Re-submit even when a COMPLETED bcl-convert ticket already exists"
+            " for this pool. Without it the submission is refused, because a"
+            " re-run re-registers the pool's reads into the lake (duplicate"
+            " rows — DuckLake has no uniqueness). Requires wet_lab_admin or"
+            " system_admin. The non-force recovery is delete-sequenced-pool"
+            " then resubmit."
         ),
     )
     p_submit_bcl.set_defaults(handler=_handle_submit_bcl_convert)
@@ -2108,6 +2122,7 @@ def _handle_submit_bcl_convert(args: argparse.Namespace, parser: argparse.Argume
                 "bcl_input_dir": str(args.bcl_input_dir),
                 "sample_map": sample_map,
             },
+            force=args.force,
         ).model_dump(exclude_unset=True, mode="json")
         ticket_resp, _ticket_status = _common.call_with_status(
             "POST",

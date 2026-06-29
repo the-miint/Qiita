@@ -19,11 +19,34 @@ _None yet._
 
 ### 2. One-time host setup
 
-_None yet._
+- **PRE-CHECK before the bucket-3 `20260628000000` migration.** That migration
+  builds a UNIQUE index on `(sequencing_run_idx, sha256(run_preflight_blob))`,
+  which **fails** if any run already holds two pools with byte-identical
+  preflights. Find them and resolve each with `qiita delete-sequenced-pool
+  --force` (keep one pool per content) BEFORE running `make migrate`: (#206)
+
+  ```bash
+  psql "$DATABASE_URL" -tAc "
+    SELECT sequencing_run_idx, encode(sha256(run_preflight_blob),'hex') AS content_hash,
+           count(*) AS n, array_agg(idx ORDER BY idx) AS pool_idxs
+      FROM qiita.sequenced_pool
+     WHERE run_preflight_blob IS NOT NULL
+     GROUP BY 1, 2 HAVING count(*) > 1"
+  # expect: zero rows. Any row → delete the redundant pool(s) first.
+  ```
+
+  (The known run-15 duplicate — pools 25013/25014 — is being remediated
+  separately; this pre-check is the backstop that catches it or any other.)
 
 ### 3. Migrations
 
-_None yet._
+- `20260628000000_sequenced_pool_content_hash.sql` — adds the
+  `run_preflight_sha256` STORED generated column and the
+  `sequenced_pool_one_per_run_and_hash` partial unique index (content-keyed pool
+  find-or-create). Plain `make migrate` — **but only after the bucket-2
+  pre-check passes** (the unique index build aborts on existing duplicate-content
+  pools). Additive; no backfill (the generated column computes in-DB for every
+  row). (#206)
 
 ### 4. Deploy
 
@@ -31,11 +54,28 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- Confirm the content-hash index landed (pool find-or-create is now content-keyed): (#206)
+
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT count(*) FROM pg_indexes WHERE schemaname='qiita' AND indexname='sequenced_pool_one_per_run_and_hash'"
+  # expect: 1
+  ```
 
 ### Notes (no host action)
 
-_None yet._
+- Soft contract change (#206): bcl-convert re-submit over an already-COMPLETED
+  sequenced_pool now 409s unless `--force` (wet_lab_admin+) — a re-run
+  re-registers the pool's reads (duplicate lake rows). `qiita submit-bcl-convert`
+  gains `--force`; the non-force recovery is `delete-sequenced-pool` then
+  resubmit (FAILED tickets stay resumable via `qiita ticket run`). Pool
+  find-or-create is now keyed on preflight content, not filename; the existing
+  `sequenced_pool_one_per_run_and_filename` index is kept as a permanent
+  independent uniqueness rule, so a different-content upload reusing an existing
+  filename in a run is refused with a 409 (distinct pools must differ in both
+  content and filename — the operator renames). One-time: during the
+  migrate→restart window a same-content/renamed-file POST can hit a transient,
+  fail-safe 500 on the pre-restart CP (no duplicate created); the restarted CP
+  serves it as a 200 reuse. No new env var, host dir, scope, or SIF.
 
 ---
 
