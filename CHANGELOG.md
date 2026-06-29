@@ -23,7 +23,7 @@ the `no-changelog` label).
   done and clean" signal. Also corrects the route/repo/`api_paths`/CLI docstrings,
   which described the rollup as "fastq-to-parquet / prep-generation" though it has
   measured **read-mask** (host-masking) since the read-storage/masking split. No
-  new route/migration; the `PoolCompletionStatus` response gains two fields. (#TBD)
+  new route/migration; the `PoolCompletionStatus` response gains two fields. (#218)
 
 - Admin per-pool **masked-read export**: pull a sequenced_pool's masked sequence
   data to local disk, per sample, as parquet or fastq. New `qiita-admin
@@ -936,7 +936,7 @@ the `no-changelog` label).
   field on the pool- and run-scoped sequenced-sample list responses), so a pool
   whose prior fan-out was interrupted can be filled in without duplicating
   already-submitted work; off by default so a deliberate re-submit against a
-  different host reference still fans out pool-wide. (#TBD)
+  different host reference still fans out pool-wide. (#218)
 
 - Deleting a sequenced_pool now purges the DuckLake data its prep_samples
   produced, not just the Postgres rows. `DELETE
