@@ -483,7 +483,7 @@ the `no-changelog` label).
   a cheap `count(*)` against the light `read_mask` table (no read sequences
   streamed or materialized) that reuses the sample's existing signed export ticket,
   so there's no new control-plane route. fastq has no cheap on-disk count, so an
-  existing fastq target is refused up front rather than re-exported. (#229)
+  existing fastq target is refused up front rather than re-exported. (#230)
 - A job's input `params.json` and a native step's output `manifest.json` are now
   pretty-printed (2-space indent, trailing newline; the manifest also sorts keys
   to mirror the container-side `manifest_writer.py`) instead of dumped as a single
