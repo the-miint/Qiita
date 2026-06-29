@@ -937,6 +937,20 @@ the `no-changelog` label).
 
 ### Fixed
 
+- A transient HTTP 5xx or network error on the per-sample `POST /sequence-range`
+  callback the native `ingest_reads` and `fastq_to_parquet` steps make back to
+  the control plane no longer permanently fails the whole pool ingest. Each
+  callback now gets a small in-job bounded retry (on a 5xx / 408 / 429, or an
+  httpx transport error like a connection reset / read timeout), so a single
+  blip on one of a pool's N per-sample callbacks self-heals instead of
+  discarding hours of demux and every already-ingested sample. If the retries
+  exhaust, the step raises a new retriable `CONTROL_PLANE_UNREACHABLE` failure
+  (the CO→CP mirror of `ORCHESTRATOR_UNREACHABLE`) so the runner re-dispatches
+  the idempotent step, rather than the old `UNKNOWN_PERMANENT` that consumed no
+  retries. 401/403 stay permanent (`CONTRACT_VIOLATION` — a token/scope misconfig
+  a retry can't fix) and other 4xx stay `UNKNOWN_PERMANENT`. The retry +
+  classification is shared by both steps via `sequence_range_retry` so they
+  can't drift. (#212)
 - `submit-host-filter-pool` no longer abandons the rest of a pool when one
   sample's `POST /work-ticket` fails. The per-sample fan-out now isolates each
   POST: a transient 5xx, a 409 in-flight, or a network blip is recorded and the
@@ -949,7 +963,6 @@ the `no-changelog` label).
   whose prior fan-out was interrupted can be filled in without duplicating
   already-submitted work; off by default so a deliberate re-submit against a
   different host reference still fans out pool-wide. (#218)
-
 - Deleting a sequenced_pool now purges the DuckLake data its prep_samples
   produced, not just the Postgres rows. `DELETE
   /sequencing-run/{R}/sequenced-pool/{P}` (`qiita delete-sequenced-pool`) issues a

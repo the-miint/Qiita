@@ -125,6 +125,7 @@ from ..sequence_range import (
     SequenceRangeAlreadyExists,
     mint_sequence_range,
 )
+from ..sequence_range_retry import cp_call_failure, cp_call_with_retry
 
 # YAML step name this module implements. Hard-coded here because
 # execute() raises BackendFailures itself (the dispatcher only wraps
@@ -325,8 +326,14 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         else:
             try:
                 async with make_cp_client() as http:
-                    rng = await mint_sequence_range(
-                        http=http, prep_sample_idx=inputs.prep_sample_idx, count=count
+                    # A transient 5xx / transport blip on this callback self-heals
+                    # via the in-job retry rather than failing the step; the typed
+                    # 409 / 404 mint exceptions pass straight through to the arms
+                    # below (this job has no reuse path — a 409 is operator-recovery).
+                    rng = await cp_call_with_retry(
+                        lambda: mint_sequence_range(
+                            http=http, prep_sample_idx=inputs.prep_sample_idx, count=count
+                        )
                     )
             except SequenceRangeAlreadyExists as exc:
                 # Mid-step failure left a range on a previous attempt;
@@ -354,33 +361,14 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     step_name=YAML_STEP_NAME,
                     reason=str(exc),
                 ) from exc
-            except httpx.HTTPStatusError as exc:
-                # 401/403: the compute service-account PAT is missing or
-                # wrong, or its scope ceiling was lowered. The deploy is
-                # misconfigured; retry won't help.
-                if exc.response.status_code in (401, 403):
-                    raise BackendFailure(
-                        kind=FailureKind.CONTRACT_VIOLATION,
-                        stage=WorkTicketFailureStage.STEP_RUN,
-                        step_name=YAML_STEP_NAME,
-                        reason=(
-                            f"CP rejected sequence-range mint with HTTP "
-                            f"{exc.response.status_code} — compute SA PAT misconfigured "
-                            "(see docs/runbooks/compute-service-account-provisioning.md)"
-                        ),
-                    ) from exc
-                # 5xx and anything else unexpected. Conservatively
-                # permanent today; a follow-up could add a retriable
-                # CP_UNREACHABLE FailureKind alongside SLURMRESTD_UNREACHABLE
-                # so genuine 5xx blips bounce back to QUEUED.
-                raise BackendFailure(
-                    kind=FailureKind.UNKNOWN_PERMANENT,
-                    stage=WorkTicketFailureStage.STEP_RUN,
-                    step_name=YAML_STEP_NAME,
-                    reason=(
-                        f"CP sequence-range mint failed with HTTP "
-                        f"{exc.response.status_code}: {exc.response.text!r}"
-                    ),
+            except (httpx.HTTPStatusError, httpx.TransportError) as exc:
+                # An exhausted-retry transient 5xx / transport error →
+                # retriable CONTROL_PLANE_UNREACHABLE (the runner re-dispatches
+                # the idempotent step); 401/403 → CONTRACT_VIOLATION (SA PAT
+                # misconfig); other 4xx → UNKNOWN_PERMANENT. Shared with
+                # ingest_reads via `sequence_range_retry`.
+                raise cp_call_failure(
+                    inputs.prep_sample_idx, exc, step_name=YAML_STEP_NAME
                 ) from exc
             sequence_idx_start = rng.sequence_idx_start
 
