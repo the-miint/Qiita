@@ -1,0 +1,67 @@
+name: Setup host Postgres (macOS)
+description: |
+  Provision a host PostgreSQL 17 via Homebrew for CI jobs on macOS runners
+  (Docker — and thus the docker-compose Postgres harness — isn't available on
+  macos-latest). Creates the qiita superuser role and the qiita_test database,
+  then exports QIITA_USE_HOST_POSTGRES + PG* env vars so the Makefile's
+  host-postgres path is selected. Optionally also creates the qiita_ducklake
+  catalog DB and exports DUCKLAKE_CATALOG_CONNSTR for the integration tier.
+
+  Gate the whole step on `if: runner.os == 'macOS'` in the caller — the steps
+  here assume Homebrew + macOS service management.
+
+inputs:
+  ducklake:
+    description: Also create the qiita_ducklake catalog DB and export DUCKLAKE_CATALOG_CONNSTR.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    # Cache the Homebrew download/bottle cache so `brew install` skips the
+    # network fetch on a hit; the install/link step still runs. The key carries
+    # an ISO week so a stale entry is replaced weekly (cache keys are immutable
+    # — a fully static key would pin the bottle forever); restore-keys falls
+    # back to the latest prior week so a new week is still a warm restore, not a
+    # cold download.
+    - name: Compute weekly cache suffix
+      id: cache-suffix
+      shell: bash
+      run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
+    - name: Cache Homebrew downloads
+      uses: actions/cache@v5
+      with:
+        path: ~/Library/Caches/Homebrew
+        key: brew-postgresql17-${{ runner.os }}-${{ steps.cache-suffix.outputs.week }}
+        restore-keys: |
+          brew-postgresql17-${{ runner.os }}-
+
+    - name: Install and start PostgreSQL 17
+      shell: bash
+      run: |
+        brew install postgresql@17
+        echo "$(brew --prefix postgresql@17)/bin" >> "$GITHUB_PATH"
+        export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
+        brew services start postgresql@17
+        for i in {1..30}; do pg_isready -h localhost -p 5432 && break; sleep 1; done
+        psql -d postgres -c "CREATE USER qiita WITH SUPERUSER PASSWORD 'qiita';"
+        psql -d postgres -c "CREATE DATABASE qiita_test OWNER qiita;"
+        if [ "${{ inputs.ducklake }}" = "true" ]; then
+          psql -d postgres -c "CREATE DATABASE qiita_ducklake OWNER qiita;"
+        fi
+
+    - name: Configure host-postgres env
+      shell: bash
+      run: |
+        {
+          echo "QIITA_USE_HOST_POSTGRES=1"
+          echo "QIITA_TEST_POSTGRES_URL=postgresql://qiita:qiita@localhost:5432/qiita_test?sslmode=disable"
+          echo "PGHOST=localhost"
+          echo "PGPORT=5432"
+          echo "PGUSER=qiita"
+          echo "PGPASSWORD=qiita"
+        } >> "$GITHUB_ENV"
+        if [ "${{ inputs.ducklake }}" = "true" ]; then
+          echo "DUCKLAKE_CATALOG_CONNSTR=dbname=qiita_ducklake host=localhost port=5432 user=qiita password=qiita sslmode=disable" >> "$GITHUB_ENV"
+        fi

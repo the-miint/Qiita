@@ -53,6 +53,7 @@ from ..miint import (
     PARQUET_OPTS,
     PARQUET_OPTS_CHUNKED,
     apply_duckdb_settings,
+    duckdb_tmp_dir,
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
@@ -139,8 +140,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     taxonomy_out = validate_parquet_path(taxonomy_out_path)
     phylogeny_out = validate_parquet_path(phylogeny_out_path)
     placements_out = validate_parquet_path(placements_out_path)
-    duckdb_tmp = workspace / ".duckdb_tmp"
-    duckdb_tmp.mkdir(parents=True, exist_ok=True)
 
     # miint is needed for `read_newick` and `read_jplace` when the
     # optional tree / jplace inputs are present. LOAD unconditionally even
@@ -149,7 +148,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     written: list[Path] = []
     success = False
     try:
-        with open_miint_conn() as conn:
+        with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
@@ -217,7 +216,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             conn.execute("DROP TABLE feature_map")
         success = True
     finally:
-        shutil.rmtree(duckdb_tmp, ignore_errors=True)
         if not success:
             for partial in (
                 sequences_path,

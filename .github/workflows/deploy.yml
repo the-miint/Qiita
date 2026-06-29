@@ -19,7 +19,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: qiita-data-plane
-          # See ci.yml lint-rust: avoid caching ~/.cargo/bin/ which can
+          # See ci.yml rust job: avoid caching ~/.cargo/bin/ which can
           # shadow the freshly-installed toolchain. The deploy job only
           # runs on ubuntu today, but kept in sync so a future os change
           # doesn't reintroduce the macOS flake.

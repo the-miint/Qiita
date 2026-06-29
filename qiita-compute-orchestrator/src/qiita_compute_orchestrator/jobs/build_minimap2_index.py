@@ -38,15 +38,21 @@ binding directly (mirrors build_rype_index).
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
 
 import duckdb
 from pydantic import BaseModel
+from qiita_common.models import HOST_FILTER_INDEX_TYPE_MINIMAP2
+from qiita_common.parquet import validate_parquet_path
 
 from ..config import get_settings
 from ..derived_store import minimap2_index_path
-from ..miint import apply_duckdb_settings, open_miint_conn, resolve_duckdb_memory_gb
+from ..miint import (
+    apply_duckdb_settings,
+    duckdb_tmp_dir,
+    open_miint_conn,
+    resolve_duckdb_memory_gb,
+)
 
 YAML_STEP_NAME = "build_minimap2_index"
 
@@ -125,7 +131,7 @@ def _run_save_minimap2_index(
     return bool(row[0])
 
 
-def _stage_subject(conn: duckdb.DuckDBPyConnection, read_target: str) -> int:
+def _stage_subject(conn: duckdb.DuckDBPyConnection, read_target: Path) -> int:
     """Reassemble the feature-keyed chunked Parquet into a `(read_id, sequence1)`
     subject TABLE via `string_agg(chunk_data ORDER BY chunk_index)` GROUP BY
     feature_idx. The ORDER BY makes the reassembly independent of scan order
@@ -136,9 +142,10 @@ def _stage_subject(conn: duckdb.DuckDBPyConnection, read_target: str) -> int:
     a blocking aggregation: materialise once rather than recompute on every scan
     minimap2's separate connection issues against the subject.
 
-    The path is inlined (quote-escaped — a filesystem path, no other injection
-    surface): DuckDB rejects prepared parameters inside CREATE TABLE AS."""
-    target_sql = read_target.replace("'", "''")
+    The path is inlined via validate_parquet_path (rejects quote/backslash/control
+    chars — the repo's fail-fast escaping contract): DuckDB rejects prepared
+    parameters inside CREATE TABLE AS."""
+    target_sql = validate_parquet_path(read_target)
     conn.execute(
         f"CREATE OR REPLACE TABLE {_SUBJECT_RELATION} AS "
         "SELECT feature_idx AS read_id, "
@@ -154,7 +161,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         raise FileNotFoundError(f"reference_sequence_chunks not found: {chunks}")
     # reference_load emits chunks as a directory of part_*.parquet; accept a
     # single file too (tests / future producers). Same resolution as build_rype_index.
-    read_target = str(chunks / "part_*.parquet") if chunks.is_dir() else str(chunks)
+    read_target = chunks / "part_*.parquet" if chunks.is_dir() else chunks
 
     # Persistent index location under the derived-artifact root (PATH_DERIVED),
     # NOT the ephemeral per-attempt workspace. On SLURM the backend propagates
@@ -169,10 +176,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # scope: the reference is still `indexing` (not yet `active`) during the build.
     index_path.unlink(missing_ok=True)
 
-    duckdb_tmp = workspace / ".duckdb_tmp"
-    duckdb_tmp.mkdir(parents=True, exist_ok=True)
-
-    try:
+    with duckdb_tmp_dir(workspace) as duckdb_tmp:
         with open_miint_conn() as conn:
             apply_duckdb_settings(
                 conn,
@@ -202,16 +206,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"save_minimap2_index reported failure for reference {inputs.reference_idx} "
                 f"→ {index_path}"
             )
-    finally:
-        # Drop the DuckDB spill dir (possibly large) before returning so it
-        # doesn't accumulate in the shared work-ticket workspace — mirrors the
-        # sibling native DuckDB jobs (host_filter, stage_local_fasta, …).
-        shutil.rmtree(duckdb_tmp, ignore_errors=True)
 
     params = {"preset": inputs.preset, "source_chunks": str(chunks), "num_subjects": num_subjects}
     meta_path = workspace / "minimap2_index_meta.json"
     meta_path.write_text(
-        json.dumps({"index_type": "minimap2", "fs_path": str(index_path), "params": params})
+        json.dumps(
+            {
+                "index_type": HOST_FILTER_INDEX_TYPE_MINIMAP2,
+                "fs_path": str(index_path),
+                "params": params,
+            }
+        )
     )
     # Only the in-tree meta JSON is a step output. The `.mmi` itself lives under
     # PATH_DERIVED (outside the per-attempt workspace) on purpose — it outlives
