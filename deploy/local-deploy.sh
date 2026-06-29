@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Single-command manual deploy: pull + build (as $QIITA_USER) → stage → activate.
-# The CI-less equivalent of the deploy pipeline. CI invokes deploy/activate.sh
-# directly after rsyncing pre-built artifacts to /opt/qiita/incoming/; this
-# script does the rsync part locally from a git clone on the deploy host.
-# See docs/runbooks/first-deploy.md for the surrounding flow.
+# This is the deploy path — there is no CI/tag-triggered deploy. It does the
+# build + rsync into /opt/qiita/incoming/ from a git clone on the deploy host,
+# then exec's activate.sh (the install half, which operates on whatever is staged
+# in $INCOMING). See docs/runbooks/first-deploy.md for the surrounding flow.
 #
 # Usage:
 #   sudo QIITA_HOSTNAME=qiita.example.org /home/qiita/qiita-miint/deploy/local-deploy.sh
@@ -29,11 +29,10 @@ qiita_resolve_user_clone
 # Stamp the deployed commit so the CP landing page can show it. Captured
 # here (the only stage with a git clone — /opt/qiita has no .git) and
 # handed to activate.sh via the environment; activate.sh writes it into
-# the deploy-owned build.env the systemd unit reads. The CI deploy path
-# sets QIITA_BUILD_SHA from GITHUB_SHA before invoking activate.sh.
-# Pass the FULL 40-char SHA (like CI's GITHUB_SHA); activate.sh owns the
-# single truncation site so both paths get an identically-shaped short
-# SHA. Non-fatal: an unset SHA just leaves the footer version-only.
+# the deploy-owned build.env the systemd unit reads. The FULL 40-char SHA is
+# passed; activate.sh owns the single truncation site so the footer short SHA
+# is consistently shaped. Non-fatal: an unset SHA just leaves the footer
+# version-only.
 QIITA_BUILD_SHA="$(sudo -u "$QIITA_USER" git -C "$QIITA_CLONE" rev-parse HEAD 2>/dev/null || true)"
 export QIITA_BUILD_SHA
 
@@ -49,9 +48,10 @@ rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/qiita-c
 rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/workflows/"                 "$INCOMING/workflows/"
 rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/deploy/"                    "$INCOMING/deploy/"
 # scripts/ carries build-sif.sh, which activate.sh's SIF auto-build (build-sifs.sh)
-# invokes. On this local path activate.sh runs from $QIITA_CLONE (which has it), but
-# the CI path runs activate.sh from $INCOMING — stage it so that path finds it too
-# (else SIF auto-build cleanly skips). Cheap; keeps $INCOMING a self-contained tree.
+# invokes. On this path activate.sh runs from $QIITA_CLONE (which has it); staging
+# scripts/ here keeps $INCOMING a self-contained tree, so an activate.sh invoked
+# straight from $INCOMING (a separate stage-then-activate) still finds it too (else
+# SIF auto-build cleanly skips). Cheap.
 rsync -a --delete --chown=root:root "${RSYNC_EXCLUDES[@]}" "$QIITA_CLONE/scripts/"                   "$INCOMING/scripts/"
 install -m 0755 -o root -g root "$DP_BINARY" "$INCOMING/qiita-data-plane"
 

@@ -15,8 +15,10 @@ What it ties together:
 - `.github/actions/setup-libduckdb/action.yml` `version` input default — the
   libduckdb tarball CI downloads for the dynamic-link build/test path. It is a
   *default*, so any workflow that doesn't pass `version:` silently inherits it —
-  exactly why a stale value is dangerous.
-- `.github/workflows/deploy.yml` extension cache key — same version, same drift.
+  exactly why a stale value is dangerous. The action also derives its
+  `~/.duckdb/extensions` cache key from that same input
+  (`duckdb-ext-…-v${version}`), so guarding the default covers the extension
+  cache too.
 
 When this fails, bump every spot to the same DuckDB version (and update
 `_crate_to_duckdb_version` if libduckdb-sys ever changes its encoding).
@@ -31,7 +33,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CARGO_TOML = REPO_ROOT / "qiita-data-plane" / "Cargo.toml"
 ACTION_YML = REPO_ROOT / ".github" / "actions" / "setup-libduckdb" / "action.yml"
-DEPLOY_YML = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
 
 # The `version:` input's `default:` inside setup-libduckdb/action.yml. Anchored on
 # the 2-space-indented `version:` key, then its 4-space-indented `default:` — so a
@@ -40,8 +41,6 @@ _ACTION_VERSION_DEFAULT_RE = re.compile(
     r'^  version:\n(?:^ {4}.*\n)*?^ {4}default:\s*"([^"]+)"',
     re.MULTILINE,
 )
-# The DuckDB-extension cache key in deploy.yml, e.g. `duckdb-ext-${{ runner.os }}-v1.5.3`.
-_DEPLOY_CACHE_KEY_RE = re.compile(r"key:\s*duckdb-ext-\$\{\{ runner\.os \}\}-v([\d.]+)")
 
 
 def _data_plane_duckdb_crate_version() -> str:
@@ -78,19 +77,5 @@ def test_libduckdb_action_default_matches_data_plane_crate() -> None:
         f"setup-libduckdb action `version` default ({action_default!r}) does not match the "
         f"DuckDB version the data-plane crate links ({expected!r}, from duckdb crate {crate!r}). "
         "A DuckDB bump must update BOTH qiita-data-plane/Cargo.toml's `duckdb` crate and the "
-        "action `version` default (plus the deploy.yml cache key)."
-    )
-
-
-def test_deploy_extension_cache_key_matches_data_plane_crate() -> None:
-    expected = _crate_to_duckdb_version(_data_plane_duckdb_crate_version())
-
-    m = _DEPLOY_CACHE_KEY_RE.search(DEPLOY_YML.read_text())
-    assert m, "could not find the duckdb-ext cache key in deploy.yml"
-    cache_version = m.group(1)
-
-    assert cache_version == expected, (
-        f"deploy.yml duckdb-ext cache key version (v{cache_version}) does not match the "
-        f"DuckDB version the data-plane crate links (v{expected}). Bump the cache key with the "
-        "crate so a DuckDB change doesn't reuse a stale extension cache."
+        "action `version` default (which also keys the ~/.duckdb/extensions cache)."
     )

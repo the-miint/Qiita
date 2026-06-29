@@ -34,10 +34,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_SIF="${REPO_ROOT}/scripts/build-sif.sh"
 WORKFLOWS_DIR="${REPO_ROOT}/workflows"
 
-# The build needs the in-repo builder + workflow sources. Both the local-deploy
-# path (activate.sh runs from the operator CLONE) and the CI path (runs from
-# /opt/qiita/incoming, where local-deploy.sh now stages scripts/ + workflows/)
-# have them. A stage that somehow lacks either skips cleanly rather than fails.
+# The build needs the in-repo builder + workflow sources. The deploy runs
+# activate.sh from the operator CLONE (which has them); an activate.sh invoked
+# straight from /opt/qiita/incoming finds them too, since local-deploy.sh stages
+# scripts/ + workflows/ there. A stage that somehow lacks either skips cleanly
+# rather than fails.
 if [[ ! -x "${BUILD_SIF}" ]] || [[ ! -d "${WORKFLOWS_DIR}" ]]; then
     echo "SIF auto-build: skipped — ${BUILD_SIF} or ${WORKFLOWS_DIR} not present in this stage." >&2
     exit 0

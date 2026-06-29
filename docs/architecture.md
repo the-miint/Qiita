@@ -784,8 +784,7 @@ qiita/
 ├── Makefile                        # unified entry point: build, test, lint, deploy, migrate
 ├── .github/
 │   └── workflows/
-│       ├── ci.yml                  # runs: make lint && make test && make test-integration
-│       └── deploy.yml              # runs: make deploy (prints admin commands)
+│       └── ci.yml                  # lint + unit/integration tests across components (no CI deploy)
 ├── qiita-common/
 │   ├── pyproject.toml              # shared Pydantic models, config, client utilities
 │   └── src/
