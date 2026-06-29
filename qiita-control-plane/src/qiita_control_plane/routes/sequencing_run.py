@@ -210,11 +210,16 @@ async def create_sequenced_pool(
     the model rejects a half-populated (blob, filename) pair before this
     handler runs.
 
-    Idempotency is keyed on ``(sequencing_run_idx, run_preflight_filename)``
-    via the ``sequenced_pool_one_per_run_and_filename`` partial unique
-    index. Returns 201 on create, 200 on reuse, 409 on a same-key + blob
-    bytes mismatch. The no-preflight case (both blob and filename NULL)
-    is outside the partial index and always returns 201.
+    Idempotency is keyed on the preflight *content* —
+    ``(sequencing_run_idx, run_preflight_sha256)`` via the
+    ``sequenced_pool_one_per_run_and_hash`` partial unique index — so the same
+    preflight bytes re-uploaded under any filename resolve to the same pool.
+    Returns 201 on create, 200 on reuse, 409 on a same-content +
+    extra_metadata mismatch, and 409 on a different-content upload that reuses
+    an existing filename in the run (the filename index is an independent,
+    permanent uniqueness rule — distinct pools must differ in both content and
+    filename). The no-preflight case (both blob and filename NULL) is outside
+    both partial indexes and always returns 201.
     """
     async with tx() as conn:
         try:

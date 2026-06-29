@@ -252,13 +252,16 @@ async def insert_sequenced_pool(
     created_by_idx: int,
     extra_metadata: dict[str, Any] | None = None,
 ) -> tuple[int, bool]:
-    """Find-or-create a row in qiita.sequenced_pool keyed on
-    ``(sequencing_run_idx, run_preflight_filename)`` via the partial
-    unique index ``sequenced_pool_one_per_run_and_filename``.
+    """Find-or-create a row in qiita.sequenced_pool keyed on the preflight
+    *content* — ``(sequencing_run_idx, run_preflight_sha256)`` via the partial
+    unique index ``sequenced_pool_one_per_run_and_hash`` — so re-uploading the
+    same preflight bytes under any filename resolves to the same pool.
+    ``run_preflight_sha256`` is a STORED generated column (``sha256`` of the
+    blob, computed in-DB); the caller never supplies it.
 
     Returns ``(idx, created)``. ``created=True`` means a new row was minted;
-    ``created=False`` means the existing row was reused after byte-equal
-    blob + JSON-canonical extra_metadata comparison succeeded.
+    ``created=False`` means the existing same-content row was reused after a
+    JSON-canonical extra_metadata comparison succeeded.
 
     The no-preflight case (both blob and filename NULL) is outside the
     partial index's predicate, so the insert always succeeds and returns
@@ -266,77 +269,82 @@ async def insert_sequenced_pool(
     ``sequenced_pool_run_preflight_pair_consistent`` enforces that blob
     and filename are co-populated.
 
+    The ``sequenced_pool_one_per_run_and_filename`` index is retained as an
+    independent, permanent uniqueness rule: an INSERT of a *different* preflight
+    that reuses an existing filename within the run trips that index (not the
+    content index this ON CONFLICT targets) and is surfaced as a PayloadMismatch
+    409 by design — two distinct pools in a run must differ in both content and
+    filename, so the operator renames. (Same content + same filename is the
+    idempotent-retry case: the content ON CONFLICT reuses the row, so the
+    filename collision never surfaces. This relies on Postgres evaluating the
+    ON CONFLICT arbiter — the content index — before inserting into any
+    non-arbiter unique index, so DO NOTHING fires before the filename index can
+    raise. Keep the content index as the ON CONFLICT target if you touch this.)
+
     Raises:
-      PayloadMismatch: a row with the same ``(run_idx, filename)`` exists
-        but the supplied blob bytes or extra_metadata disagree.
+      PayloadMismatch: a same-content row exists but extra_metadata disagrees,
+        or the filename collides with a different-content pool.
       asyncpg.ForeignKeyViolationError: bad sequencing_run_idx.
       asyncpg.CheckViolationError: half-populated preflight pair.
       asyncpg.PostgresError: other constraint failures.
     """
-    inserted_idx = await conn.fetchval(
-        "INSERT INTO qiita.sequenced_pool ("
-        "    sequencing_run_idx, run_preflight_blob, run_preflight_filename,"
-        "    extra_metadata, created_by_idx"
-        ") VALUES ($1, $2, $3, $4::jsonb, $5)"
-        " ON CONFLICT (sequencing_run_idx, run_preflight_filename)"
-        "   WHERE run_preflight_filename IS NOT NULL"
-        " DO NOTHING"
-        " RETURNING idx",
-        sequencing_run_idx,
-        run_preflight_blob,
-        run_preflight_filename,
-        _encode_jsonb(extra_metadata),
-        created_by_idx,
-    )
+    try:
+        inserted_idx = await conn.fetchval(
+            "INSERT INTO qiita.sequenced_pool ("
+            "    sequencing_run_idx, run_preflight_blob, run_preflight_filename,"
+            "    extra_metadata, created_by_idx"
+            ") VALUES ($1, $2, $3, $4::jsonb, $5)"
+            " ON CONFLICT (sequencing_run_idx, run_preflight_sha256)"
+            "   WHERE run_preflight_sha256 IS NOT NULL"
+            " DO NOTHING"
+            " RETURNING idx",
+            sequencing_run_idx,
+            run_preflight_blob,
+            run_preflight_filename,
+            _encode_jsonb(extra_metadata),
+            created_by_idx,
+        )
+    except asyncpg.UniqueViolationError as exc:
+        # The content index this ON CONFLICT targets did not fire, but the
+        # (permanent) filename index did — same run + same filename + different
+        # content. By design that is a 409, not a new pool: distinct pools must
+        # differ in both content and filename. Map it to a clear PayloadMismatch
+        # 409 instead of a raw 500.
+        if exc.constraint_name == "sequenced_pool_one_per_run_and_filename":
+            raise PayloadMismatch(
+                "run_preflight_filename",
+                f"<a different-content pool already uses filename "
+                f"{run_preflight_filename!r} in this run; rename this preflight "
+                f"to mint a separate pool>",
+                run_preflight_filename,
+            ) from exc
+        raise
     if inserted_idx is not None:
         return (inserted_idx, True)
 
-    # Collision on (run_idx, filename). Fetch the existing row's blob +
-    # extra_metadata for comparison.
+    # Content collision: a pool with byte-identical preflight already exists in
+    # this run. Fetch it to reconcile extra_metadata (a same-content re-POST may
+    # still disagree on the JSON sidecar).
     existing = await conn.fetchrow(
-        "SELECT idx, run_preflight_blob, extra_metadata"
+        "SELECT idx, extra_metadata"
         " FROM qiita.sequenced_pool"
-        " WHERE sequencing_run_idx = $1 AND run_preflight_filename = $2",
+        " WHERE sequencing_run_idx = $1 AND run_preflight_sha256 = sha256($2)",
         sequencing_run_idx,
-        run_preflight_filename,
+        run_preflight_blob,
     )
     if existing is None:
         raise asyncpg.PostgresError(
             "find-or-create on sequenced_pool"
-            f"({sequencing_run_idx!r}, {run_preflight_filename!r})"
+            f"({sequencing_run_idx!r}, <preflight content hash>)"
             " collided on insert but the existing row is not visible"
         )
 
-    _assert_blob_matches("run_preflight_blob", existing["run_preflight_blob"], run_preflight_blob)
     _assert_jsonb_matches(
         "extra_metadata",
         existing["extra_metadata"],
         extra_metadata,
     )
     return (existing["idx"], False)
-
-
-def _assert_blob_matches(
-    field: str, existing_blob: bytes | None, supplied_blob: bytes | None
-) -> None:
-    """Compare two BYTEA values for byte-equality. None-supplied is
-    'caller didn't override' and is not compared, consistent with
-    _assert_field_matches.
-
-    Note: this performs a Python-side byte comparison after both blobs
-    have crossed the wire. Acceptable because the caller's blob is in
-    memory anyway (multipart upload payload), and the only path that
-    reaches this branch is the rare retry-after-collision. For very
-    large blobs (10s of MB) consider replacing with a server-side
-    `digest(run_preflight_blob, 'sha256')` comparison; today's preflight
-    SQLite files are sub-MB so the byte-compare is cheap."""
-    if supplied_blob is None:
-        return
-    if existing_blob != supplied_blob:
-        # Report sizes, not bytes — blobs in error messages would explode
-        # log volume and could leak data.
-        existing_size = len(existing_blob) if existing_blob is not None else None
-        raise PayloadMismatch(field, f"<{existing_size} bytes>", f"<{len(supplied_blob)} bytes>")
 
 
 async def fetch_sequenced_pool(
