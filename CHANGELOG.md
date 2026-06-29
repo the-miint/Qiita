@@ -476,6 +476,14 @@ the `no-changelog` label).
 
 ### Changed
 
+- `qiita-admin masked-read-export` is now **re-runnable**: it creates `--output-dir`
+  (with parents) if missing instead of erroring, and for parquet it skips a sample
+  whose output file already exists when the count matches and overwrites it only
+  when it differs. The count comes from a new `count_masked` data-plane DoAction —
+  a cheap `count(*)` against the light `read_mask` table (no read sequences
+  streamed or materialized) that reuses the sample's existing signed export ticket,
+  so there's no new control-plane route. fastq has no cheap on-disk count, so an
+  existing fastq target is refused up front rather than re-exported. (#230)
 - **CI build speedups.** The `test-integration` job now sets up the Rust
   toolchain + `Swatinem/rust-cache` + cached `libduckdb` (mirroring the `rust`
   job), so the data-plane debug build it drives — previously a cold ~80s

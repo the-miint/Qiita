@@ -1096,7 +1096,12 @@ def _build_parser() -> argparse.ArgumentParser:
         required=True,
         type=Path,
         dest="output_dir",
-        help="Existing directory to write per-sample files into (created mode 0600).",
+        help=(
+            "Directory to write per-sample files into (created, with parents, if"
+            " missing; files are mode 0600). On re-export, an existing parquet"
+            " sample is skipped when its count matches the data plane and"
+            " overwritten when it differs; an existing fastq target is refused."
+        ),
     )
     p_export.add_argument(
         "--data-plane-url",
@@ -1386,6 +1391,36 @@ def _write_masked_sample(reader, stem: str, output_dir: Path, fmt: str, con) -> 
         raise ValueError(f"unsupported export format: {fmt!r}")
 
 
+def _export_stem(sample: dict, run_idx, pool_idx) -> str:
+    """Per-sample output filename stem, single-sourced so the export loop and the
+    fastq overwrite pre-scan can't drift: ``<accession>.<run>.<pool>.<prep_sample>``."""
+    return f"{sample['biosample_accession']}.{run_idx}.{pool_idx}.{sample['prep_sample_idx']}"
+
+
+def _parquet_row_count(path: Path) -> int:
+    """Record count of an existing parquet export, read from the footer metadata
+    only — no row data is scanned. The export writes one row per masked-read record
+    (a pair counts once), so this lines up with the data plane's read_masked row
+    count directly."""
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    return pq.ParquetFile(path).metadata.num_rows
+
+
+def _count_masked(flight_client, ticket_bytes: bytes) -> int:
+    """How many masked reads the signed ticket selects, via the data plane's
+    ``count_masked`` DoAction — a cheap ``count(*)`` against the light ``read_mask``
+    table that never streams or materializes the read sequences. Reuses the very
+    ticket the export streams with: counting is strictly less than reading, so the
+    ticket's ``(prep_sample_idx, mask_idx)`` authorization already covers it."""
+    import pyarrow.flight as flight  # noqa: PLC0415
+
+    results = list(flight_client.do_action(flight.Action("count_masked", ticket_bytes)))
+    if not results:
+        raise RuntimeError("count_masked DoAction returned no result")
+    return json.loads(results[0].body.to_pybytes())["count"]
+
+
 def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Export every (non-retired) sample on a sequenced_pool's masked reads to
     per-sample files. system_admin only (admin:masked_read_export).
@@ -1400,13 +1435,23 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     biosample_accession (missing — not yet NCBI-submitted — or outside the safe
     charset), since the filename requires it; validated up front so one odd
     sample can't leave a partial export.
+
+    Re-export is idempotent for parquet: a sample whose output file already exists
+    is skipped when its record count matches the data plane's (nothing changed)
+    and overwritten when the counts differ (reads added/removed since). fastq has
+    no cheap on-disk count, so an existing fastq target is refused up front rather
+    than re-exported or overwritten.
+
+    The output directory is created if missing (parents included).
     """
     import pyarrow.flight as flight  # noqa: PLC0415
     import pyarrow.ipc as ipc  # noqa: PLC0415
 
     output_dir: Path = args.output_dir
-    if not output_dir.is_dir():
-        print(f"error: output directory does not exist: {output_dir}", file=sys.stderr)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"error: could not create output directory {output_dir}: {exc}", file=sys.stderr)
         return 2
 
     try:
@@ -1454,6 +1499,29 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
         )
         return 1
 
+    # fastq output is never overwritten: a gzipped fastq has no cheap footer to
+    # count (unlike parquet), and a paired sample's two files make a count-vs-disk
+    # compare ambiguous. So for fastq, refuse up front if any target name already
+    # exists — fail loudly before streaming rather than clobber a prior export.
+    # (parquet re-export is decided per-sample by the count probe in the loop.)
+    if args.format == "fastq":
+        existing = []
+        for s in samples:
+            stem = _export_stem(s, run_idx, pool_idx)
+            existing += [
+                p
+                for name in (f"{stem}.fastq.gz", f"{stem}.R1.fastq.gz", f"{stem}.R2.fastq.gz")
+                if (p := output_dir / name).exists()
+            ]
+        if existing:
+            print(
+                f"error: refusing to overwrite {len(existing)} existing fastq file(s) in "
+                f"{output_dir}: {[str(p) for p in existing]}. Delete them to re-export "
+                "(fastq export has no incremental/count-based skip).",
+                file=sys.stderr,
+            )
+            return 1
+
     # Only the fastq path feeds Flight batches into DuckDB (the miint FORMAT FASTQ
     # writer), which routes a registered pyarrow reader through pyarrow.dataset →
     # Acero. Flight hands us each RecordBatch by zero-copying the gRPC message
@@ -1478,9 +1546,12 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
     # paying a fresh connect + extension LOAD per sample. Parquet needs no DuckDB.
     con = connect_with_miint() if args.format == "fastq" else None
     flight_client = flight.FlightClient(args.data_plane_url)
+    exported = 0
+    skipped = 0
     try:
         for s in samples:
             prep = s["prep_sample_idx"]
+            stem = _export_stem(s, run_idx, pool_idx)
             ticket_resp = _common.call(
                 "POST",
                 args.base_url,
@@ -1489,9 +1560,21 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
                 json={"prep_sample_idx": prep, "mask_idx": args.mask_idx},
             )
             ticket_bytes = base64.b64decode(ticket_resp["ticket"])
+            # Idempotent parquet re-export: only probe the data plane's count when
+            # the output file already exists (a first export pays nothing), then
+            # skip on a match (nothing changed) and fall through to overwrite on a
+            # mismatch. fastq took the all-or-nothing existence check above, so it
+            # always exports here.
+            if args.format == "parquet":
+                target = output_dir / f"{stem}.parquet"
+                if target.exists() and _parquet_row_count(target) == _count_masked(
+                    flight_client, ticket_bytes
+                ):
+                    skipped += 1
+                    continue
             reader = flight_client.do_get(flight.Ticket(ticket_bytes), read_opts).to_reader()
-            stem = f"{s['biosample_accession']}.{run_idx}.{pool_idx}.{prep}"
             _write_masked_sample(reader, stem, output_dir, args.format, con)
+            exported += 1
     except httpx.HTTPStatusError as exc:
         print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
         return 1
@@ -1500,7 +1583,10 @@ def _handle_masked_read_export(args: argparse.Namespace, parser: argparse.Argume
         if con is not None:
             con.close()
 
-    print(f"exported {len(samples)} sample(s) from sequenced_pool {pool_idx} to {output_dir}")
+    summary = f"exported {exported} sample(s)"
+    if skipped:
+        summary += f" (skipped {skipped} already up to date)"
+    print(f"{summary} from sequenced_pool {pool_idx} to {output_dir}")
     return 0
 
 

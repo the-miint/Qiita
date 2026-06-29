@@ -447,6 +447,43 @@ impl FlightService for QiitaFlightService {
                 let output = stream::once(futures::future::ready(Ok(result)));
                 Ok(Response::new(Box::pin(output)))
             }
+            "count_masked" => {
+                // Reuse the *DoGet* read_masked ticket rather than minting a
+                // bespoke action token: counting the rows a ticket selects is
+                // strictly less than streaming them, so the ticket's
+                // (prep_sample_idx, mask_idx) authorization already covers it —
+                // no new ticket type or control-plane route is needed, the CLI
+                // sends the same signed bytes it would otherwise stream with.
+                let payload = auth::verify_ticket(&action.body, &self.hmac_secret)
+                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
+                if payload.table != "read_masked" {
+                    return Err(Status::invalid_argument(format!(
+                        "count_masked requires a read_masked ticket, got table {:?}",
+                        payload.table
+                    )));
+                }
+                let prep_sample_idx = single_i64_filter(&payload.filter, "prep_sample_idx")?;
+                let mask_idx = single_i64_filter(&payload.filter, "mask_idx")?;
+
+                // count(*) is synchronous DuckDB work; run it on the blocking
+                // pool so it never starves a tonic async worker (mirrors
+                // export_read). The closure opens and drops its own connection.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let count = tokio::task::spawn_blocking(move || {
+                    count_masked_reads(&catalog, &data_path, prep_sample_idx, mask_idx)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("count_masked task join failed: {e}")))??;
+
+                let result_body = serde_json::to_vec(&serde_json::json!({ "count": count }))
+                    .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+                let result = arrow_flight::Result {
+                    body: result_body.into(),
+                };
+                let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
             other => Err(Status::invalid_argument(format!(
                 "unknown action type: {other:?}"
             ))),
@@ -902,6 +939,57 @@ fn export_read_to_parquet(
         let _ = std::fs::remove_file(&tmp);
     }
     published
+}
+
+/// Pull exactly one i64 out of a ticket filter column. The count path needs a
+/// single `prep_sample_idx` / `mask_idx`, not an IN-set, so a missing, empty,
+/// multi-valued, or non-integer column is a malformed-ticket error — the export
+/// ticket always signs a one-element list per column. Input is HMAC-verified
+/// (set by the control plane), but we validate anyway for defense in depth.
+fn single_i64_filter(filter: &auth::TicketFilter, col: &str) -> Result<i64, Status> {
+    let values = filter.get(col).ok_or_else(|| {
+        Status::invalid_argument(format!("count_masked ticket missing filter column {col:?}"))
+    })?;
+    match values.as_slice() {
+        [v] => v.as_i64().ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "filter value for {col:?} must be an integer, got {v}"
+            ))
+        }),
+        _ => Err(Status::invalid_argument(format!(
+            "count_masked requires exactly one value for {col:?}, got {}",
+            values.len()
+        ))),
+    }
+}
+
+/// Count the masked reads a `read_masked` ticket selects, without streaming them.
+///
+/// Runs `count(*)` against the light `read_mask` table (keyed
+/// `(mask_idx, prep_sample_idx, sequence_idx)`) rather than the `read_masked`
+/// view: every `reason = 'pass'` row in `read_mask` has its `read` row by
+/// construction, so the filtered `read_mask` count equals the view's row count —
+/// while touching only the small key/`reason` columns, never joining to `read`
+/// or materializing the sequence/quality bytes. This is what makes the export's
+/// idempotency probe cheap. Opens and drops its own connection so the caller can
+/// run it on the blocking pool (mirrors `export_read_to_parquet`).
+fn count_masked_reads(
+    catalog_connstr: &str,
+    data_path: &str,
+    prep_sample_idx: i64,
+    mask_idx: i64,
+) -> Result<i64, Status> {
+    let conn = open_ducklake(catalog_connstr, data_path)?;
+    // `prep_sample_idx`/`mask_idx` are HMAC-verified i64s, safe to inline (same
+    // rationale as build_query: parsed integers reach SQL, no string data); the
+    // 'pass' filter mirrors the read_masked view's privacy filter.
+    let sql = format!(
+        "SELECT count(*) FROM qiita_lake.read_mask \
+         WHERE mask_idx = {mask_idx} AND prep_sample_idx = {prep_sample_idx} \
+         AND reason = 'pass'"
+    );
+    conn.query_row(&sql, [], |row| row.get(0))
+        .map_err(|e| Status::internal(format!("count_masked query failed: {e}")))
 }
 
 /// Move Parquet files from staging to permanent storage and register in DuckLake.
@@ -1452,6 +1540,37 @@ mod tests {
         assert!(validate_export_dest("/scratch/ti'ck/reads.parquet", root).is_err());
     }
 
+    // --- single_i64_filter (pure; no DuckDB) ---
+
+    fn filter_of(pairs: &[(&str, Vec<serde_json::Value>)]) -> auth::TicketFilter {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn single_i64_filter_extracts_lone_value() {
+        let f = filter_of(&[("prep_sample_idx", vec![serde_json::json!(42)])]);
+        assert_eq!(single_i64_filter(&f, "prep_sample_idx").unwrap(), 42);
+    }
+
+    #[test]
+    fn single_i64_filter_rejects_missing_empty_multi_and_non_integer() {
+        let f = filter_of(&[
+            ("empty", vec![]),
+            ("multi", vec![serde_json::json!(1), serde_json::json!(2)]),
+            ("text", vec![serde_json::json!("x")]),
+        ]);
+        assert!(single_i64_filter(&f, "absent").is_err(), "missing column");
+        assert!(single_i64_filter(&f, "empty").is_err(), "empty value list");
+        assert!(
+            single_i64_filter(&f, "multi").is_err(),
+            "more than one value"
+        );
+        assert!(single_i64_filter(&f, "text").is_err(), "non-integer value");
+    }
+
     // --- delete_reference integration harness (mirrors ducklake.rs::tests) ---
 
     #[cfg(feature = "integration")]
@@ -1604,6 +1723,52 @@ mod tests {
         // Best-effort cleanup of the surviving mask_b row.
         let _ = conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.read_mask WHERE mask_idx = {mask_b};"
+        ));
+    }
+
+    /// `count_masked_reads` counts exactly the `read_mask` rows for the target
+    /// `(prep_sample_idx, mask_idx)` with `reason = 'pass'`: non-`pass` rows (the
+    /// view's privacy filter), a different mask, and a different prep_sample are
+    /// all excluded.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn count_masked_reads_counts_pass_rows_for_target_only() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+
+        // Unique ids so leftover rows never collide with other serial tests.
+        let mask_a: i64 = 950_000;
+        let mask_b: i64 = 950_001;
+        let prep_a: i64 = 950_010;
+        let prep_b: i64 = 950_011;
+
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read_mask WHERE mask_idx IN ({mask_a}, {mask_b});
+             INSERT INTO qiita_lake.read_mask \
+                 (mask_idx, prep_sample_idx, sequence_idx, reason) VALUES \
+                 ({mask_a}, {prep_a}, 950100, 'pass'), \
+                 ({mask_a}, {prep_a}, 950101, 'pass'), \
+                 ({mask_a}, {prep_a}, 950102, 'host_human'), \
+                 ({mask_a}, {prep_b}, 950103, 'pass'), \
+                 ({mask_b}, {prep_a}, 950104, 'pass');"
+        ))
+        .unwrap();
+
+        // Two 'pass' rows for (prep_a, mask_a); the host-filtered row, prep_b's
+        // row, and mask_b's row are all excluded.
+        let n = count_masked_reads(&connstr, &data_path, prep_a, mask_a).expect("count failed");
+        assert_eq!(n, 2);
+
+        // A (prep, mask) pair with no rows counts zero, not an error.
+        let none = count_masked_reads(&connstr, &data_path, prep_b, mask_b).expect("count failed");
+        assert_eq!(none, 0);
+
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read_mask WHERE mask_idx IN ({mask_a}, {mask_b});"
         ));
     }
 
