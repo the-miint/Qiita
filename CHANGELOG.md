@@ -915,6 +915,19 @@ the `no-changelog` label).
 
 ### Fixed
 
+- `submit-host-filter-pool` no longer abandons the rest of a pool when one
+  sample's `POST /work-ticket` fails. The per-sample fan-out now isolates each
+  POST: a transient 5xx, a 409 in-flight, or a network blip is recorded and the
+  fan-out continues to the remaining samples, the summary lists every submitted
+  and failed sample, and the command exits non-zero if any failed — instead of
+  an uncaught raise silently stranding every later sample (those after the
+  failure in `sequenced_pool_item_id` order). New `--only-missing` flag submits
+  only samples that have no read-mask ticket yet (via a new `has_read_mask_ticket`
+  field on the pool- and run-scoped sequenced-sample list responses), so a pool
+  whose prior fan-out was interrupted can be filled in without duplicating
+  already-submitted work; off by default so a deliberate re-submit against a
+  different host reference still fans out pool-wide. (#TBD)
+
 - Deleting a sequenced_pool now purges the DuckLake data its prep_samples
   produced, not just the Postgres rows. `DELETE
   /sequencing-run/{R}/sequenced-pool/{P}` (`qiita delete-sequenced-pool`) issues a

@@ -36,6 +36,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import httpx
 from pydantic import BaseModel, ValidationError
 from qiita_common.actions import READ_MASK_ACTION_ID
 from qiita_common.api_paths import (
@@ -1263,6 +1264,17 @@ def _build_parser() -> argparse.ArgumentParser:
             " The mismatch is printed as a warning instead of aborting."
         ),
     )
+    p_submit_hf.add_argument(
+        "--only-missing",
+        action="store_true",
+        help=(
+            "Skip samples that already have a read-mask ticket (any state),"
+            " submitting only those with none. Use to fill in a pool whose prior"
+            " fan-out was interrupted, without duplicating already-submitted"
+            " work. Off by default so re-submitting the whole pool against a"
+            " different host reference still produces a side-by-side mask."
+        ),
+    )
     p_submit_hf.set_defaults(handler=_handle_submit_host_filter_pool)
 
     p_pool_completion = sub.add_parser(
@@ -2250,9 +2262,21 @@ def _handle_submit_host_filter_pool(
          given), scoped to the sample's prep_sample_idx. The runner binds each
          sample's stored reads (failing the ticket if it was never ingested).
 
-    Per-sample 409 (in-flight) is NOT swallowed — it surfaces so the operator can
-    act, the same as submit-bcl-convert's composer. A sample whose reads were
-    never stored fails its ticket at the runner's staged-read resolution.
+    Per-sample resilience: each ticket POST is isolated, so one sample's error
+    (a transient 5xx, a 409 in-flight, a network blip) is recorded and the
+    fan-out CONTINUES to the rest — it never strands the remaining samples the
+    way an un-caught raise would. The summary lists every submitted and every
+    failed sample, and the command exits non-zero if any sample failed, so a
+    partial fan-out is visible and re-runnable rather than silent. A sample
+    whose reads were never stored fails its own ticket at the runner's
+    staged-read resolution (and shows up in the per-sample summary, not here).
+
+    `--only-missing` skips samples that already have a read-mask ticket (any
+    state, via the roster's has_read_mask_ticket flag), submitting only those
+    with none — the clean way to fill a pool whose prior fan-out was
+    interrupted without duplicating already-submitted work. Off by default so a
+    deliberate re-submit against a different host reference still fans out
+    pool-wide.
     """
     # Host-ref argument coherence, validated before any network call: minimap2 is
     # the optional second stage and never runs without rype.
@@ -2282,6 +2306,34 @@ def _handle_submit_host_filter_pool(
                 " sequenced_samples to process\n"
             )
             raise SystemExit(1)
+
+        # Step 1.25: --only-missing drops samples that already carry a read-mask
+        # ticket (any state), so a re-run fills only the gap left by a prior
+        # interrupted fan-out instead of duplicating submitted work. Applied
+        # before the coherence checks and the loop so everything downstream sees
+        # only the to-submit set. Falls back to submitting a sample if the roster
+        # didn't carry the flag (older server) — never silently drops on absence.
+        skipped_existing = 0
+        if args.only_missing:
+            before = len(samples)
+            samples = [s for s in samples if not s.get("has_read_mask_ticket")]
+            skipped_existing = before - len(samples)
+            if not samples:
+                summary = {
+                    "sequencing_run_idx": args.sequencing_run_idx,
+                    "sequenced_pool_idx": args.sequenced_pool_idx,
+                    "samples_submitted": 0,
+                    "samples_skipped_existing": skipped_existing,
+                    "samples_failed": 0,
+                    "failed": [],
+                    "per_sample": [],
+                }
+                sys.stderr.write(
+                    f"--only-missing: all {skipped_existing} active sample(s) in"
+                    f" sequenced_pool {args.sequenced_pool_idx} already have a"
+                    " read-mask ticket; nothing to submit\n"
+                )
+                return summary
 
         # Step 1.5: host filtering is applied pool-wide, so flag any sample whose
         # intake human_filtering intent disagrees with this submission's choice
@@ -2379,6 +2431,7 @@ def _handle_submit_host_filter_pool(
         host_minimap2 = args.host_minimap2_reference_idx
         host_filter_enabled = host_rype is not None
         per_sample_results: list[dict] = []
+        failures: list[dict] = []
         for sample in samples:
             action_context: dict[str, Any] = {
                 "host_filter_enabled": host_filter_enabled,
@@ -2398,13 +2451,39 @@ def _handle_submit_host_filter_pool(
                 },
                 action_context=action_context,
             ).model_dump(exclude_unset=True, mode="json")
-            ticket_resp, _ticket_status = _common.call_with_status(
-                "POST",
-                args.base_url,
-                token,
-                PATH_WORK_TICKET_PREFIX,
-                json=ticket_body,
-            )
+            # Isolate each POST: one sample's failure (transient 5xx, 409
+            # in-flight, or a transport blip) is recorded and the loop CONTINUES
+            # to the rest. A bare raise here would abandon every later sample —
+            # the fan-out fragility this command is being fixed for.
+            try:
+                ticket_resp, _ticket_status = _common.call_with_status(
+                    "POST",
+                    args.base_url,
+                    token,
+                    PATH_WORK_TICKET_PREFIX,
+                    json=ticket_body,
+                )
+            except httpx.HTTPStatusError as exc:
+                failures.append(
+                    {
+                        "prep_sample_idx": sample["prep_sample_idx"],
+                        "sequenced_pool_item_id": sample["sequenced_pool_item_id"],
+                        "status_code": exc.response.status_code,
+                        "error": exc.response.text[:500],
+                    }
+                )
+                continue
+            except httpx.HTTPError as exc:
+                # Transport-level failure (connect/read/timeout): no response.
+                failures.append(
+                    {
+                        "prep_sample_idx": sample["prep_sample_idx"],
+                        "sequenced_pool_item_id": sample["sequenced_pool_item_id"],
+                        "status_code": None,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
             per_sample_results.append(
                 {
                     "prep_sample_idx": sample["prep_sample_idx"],
@@ -2416,17 +2495,28 @@ def _handle_submit_host_filter_pool(
                 }
             )
 
-        return {
+        summary = {
             "instrument_model": instrument_model,
             "sequencing_run_idx": args.sequencing_run_idx,
             "sequenced_pool_idx": args.sequenced_pool_idx,
             "samples_submitted": len(per_sample_results),
+            "samples_skipped_existing": skipped_existing,
+            "samples_failed": len(failures),
             "samples_host_filtered": sum(1 for r in per_sample_results if r["host_filter_enabled"]),
             "samples_passthrough": sum(
                 1 for r in per_sample_results if not r["host_filter_enabled"]
             ),
+            "failed": failures,
             "per_sample": per_sample_results,
         }
+        if failures:
+            # Each failure was non-fatal on its own, but exit non-zero so a
+            # partial fan-out isn't mistaken for full success by an operator or a
+            # script. Print the summary here since the raise skips the default
+            # success printer.
+            print(json.dumps(summary, indent=2))
+            raise SystemExit(1)
+        return summary
 
     return _common.run_http_subcommand(_run)
 

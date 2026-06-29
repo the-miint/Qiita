@@ -1097,6 +1097,13 @@ class SequencedSampleListItem(BaseModel):
     pool-wide host-filter guard in `submit-host-filter-pool` reads it); the
     run-scoped list leaves it None. It is also None when the pool has no
     preflight populated or the blob carries no row for this item.
+
+    `has_read_mask_ticket` is True when at least one `read-mask` work ticket
+    (any state) already exists for the sample's prep_sample_idx. Both list
+    routes populate it. It lets `submit-host-filter-pool --only-missing` skip
+    samples a prior (possibly interrupted) fan-out already submitted, and gives
+    operators per-sample visibility into host-processing coverage without an
+    N+1 of work-ticket lookups.
     """
 
     sequenced_sample_idx: int
@@ -1108,6 +1115,7 @@ class SequencedSampleListItem(BaseModel):
     biosample_accession: str | None
     ena_sample_accession: str | None
     human_filtering: bool | None = None
+    has_read_mask_ticket: bool = False
 
 
 class SequencedSampleListResponse(BaseModel):
