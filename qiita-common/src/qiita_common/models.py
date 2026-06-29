@@ -2217,16 +2217,18 @@ class PoolQCReport(BaseModel):
 class PoolCompletionStatus(BaseModel):
     """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool/{P}/completion.
 
-    The pool's prep-generation completion rollup: each non-retired
-    sequenced_sample is classified by the state of its fastq-to-parquet work
-    tickets (any version), and the per-sample states are tallied into the five
-    mutually-exclusive buckets below. This is the SPP GenPrepFileJob end-state
-    equivalent — it answers "has the pool's per-sample fastq→parquet fan-out
-    finished?" — surfaced alongside the read-metric and QC rollups.
+    The pool's end-to-end processing rollup over two stages:
 
-    Per-sample classification (precedence, highest first), so a sample appears in
-    exactly one bucket:
-      completed     — has at least one COMPLETED fastq-to-parquet ticket.
+    `demux_state` — the pool-scoped bcl-convert (demux) work ticket's state, the
+    stage that stores each sample's reads once. One of completed / in_flight /
+    no_data / failed / not_submitted (precedence highest-first when more than one
+    bcl-convert ticket exists; not_submitted when there is none).
+
+    The per-sample buckets below — the HOST-MASKING stage: each non-retired
+    sequenced_sample classified by the state of its read-mask work tickets (any
+    version) and tallied into five mutually-exclusive buckets (precedence,
+    highest first, so a sample appears in exactly one):
+      completed     — has at least one COMPLETED read-mask ticket.
       in_flight     — no COMPLETED ticket but at least one PENDING/QUEUED/
                       PROCESSING (e.g. a re-submitted retry); work is ongoing.
       no_data       — no COMPLETED and nothing in flight, but at least one
@@ -2235,17 +2237,20 @@ class PoolCompletionStatus(BaseModel):
                       no_data and a stale failed ticket counts as no_data.
       failed        — no COMPLETED, nothing in flight, no NO_DATA, but at least
                       one FAILED.
-      not_submitted — no fastq-to-parquet ticket at all.
+      not_submitted — no read-mask ticket at all (e.g. a sample a partial
+                      submit-host-filter-pool fan-out never reached).
 
-    `complete` is the pool-level done flag: the pool is non-empty and every
+    `complete` is the host-masking done flag: the pool is non-empty and every
     sample is in a terminal-accounted state — COMPLETED or NO_DATA (so a plate
     of real data with empty wells still reaches `complete=True`, and a
-    zero-sample pool reads `complete=False`, not vacuously true). Everything is
+    zero-sample pool reads `complete=False`, not vacuously true). `fully_processed`
+    is the end-to-end flag: demux completed AND `complete`. Everything is
     compute-on-read over the work_ticket table, so it never drifts when a sample
     is re-processed, re-submitted, or deleted."""
 
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     sequencing_run_idx: Annotated[int, Field(gt=0)]
+    demux_state: Literal["completed", "in_flight", "no_data", "failed", "not_submitted"]
     sample_count: Annotated[int, Field(ge=0)]
     samples_completed: Annotated[int, Field(ge=0)]
     samples_in_flight: Annotated[int, Field(ge=0)]
@@ -2257,12 +2262,21 @@ class PoolCompletionStatus(BaseModel):
     @property
     def complete(self) -> bool:
         """True when the pool has samples and every one is in a terminal-
-        accounted state: a COMPLETED fastq-to-parquet ticket or a NO_DATA
-        (empty-well) outcome."""
+        accounted state for HOST-MASKING: a COMPLETED read-mask ticket or a
+        NO_DATA (empty-well) outcome. Says nothing about demux — see
+        `fully_processed` for the end-to-end signal."""
         return (
             self.sample_count > 0
             and (self.samples_completed + self.samples_no_data) == self.sample_count
         )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def fully_processed(self) -> bool:
+        """End-to-end done-and-clean flag: the pool's demux COMPLETED and every
+        sample finished host-masking (`complete`). The single signal for
+        "this pool is fully processed without error."""
+        return self.demux_state == "completed" and self.complete
 
 
 class SequencedPoolPreflightResponse(BaseModel):

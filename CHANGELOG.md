@@ -15,6 +15,16 @@ the `no-changelog` label).
 
 ### Added
 
+- Pool completion now reports **end-to-end processing**, not just host-masking.
+  `GET /sequencing-run/{R}/sequenced-pool/{P}/completion` (`qiita pool-completion`)
+  gains `demux_state` (the pool-scoped bcl-convert stage: completed / in_flight /
+  no_data / failed / not_submitted) and a computed `fully_processed` (demux
+  completed AND every sample's read-mask `complete`) — the single "this pool is
+  done and clean" signal. Also corrects the route/repo/`api_paths`/CLI docstrings,
+  which described the rollup as "fastq-to-parquet / prep-generation" though it has
+  measured **read-mask** (host-masking) since the read-storage/masking split. No
+  new route/migration; the `PoolCompletionStatus` response gains two fields. (#TBD)
+
 - Admin per-pool **masked-read export**: pull a sequenced_pool's masked sequence
   data to local disk, per sample, as parquet or fastq. New `qiita-admin
   masked-read-export --sequenced-pool-idx P --mask-idx M [--format parquet|fastq]

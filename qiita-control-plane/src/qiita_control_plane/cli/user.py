@@ -2522,7 +2522,9 @@ def _handle_submit_host_filter_pool(
 
 
 def _handle_pool_completion(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    """GET the pool's prep-generation completion rollup and print its JSON body.
+    """GET the pool's end-to-end processing rollup and print its JSON body:
+    the demux (bcl-convert) `demux_state`, the per-sample read-mask buckets with
+    the host-masking `complete` flag, and `fully_processed` (demux + masking).
 
     Dedicated (rather than the generic `read` command) because the route is keyed
     on two ids — sequencing_run_idx and sequenced_pool_idx — which `read` (single

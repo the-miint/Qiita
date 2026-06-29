@@ -104,6 +104,7 @@ from ..deps import (
 from ..repositories.sequencing_run import (
     PayloadMismatch,
     fetch_sequenced_pool_completion,
+    fetch_sequenced_pool_demux_state,
     fetch_sequenced_pool_preflight,
     fetch_sequenced_pool_read_metrics,
     fetch_sequenced_pool_sample_qc_reports,
@@ -571,14 +572,15 @@ async def get_sequenced_pool_completion(
     _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
     _pool_in_run: None = Depends(require_sequenced_pool_in_run),
 ) -> PoolCompletionStatus:
-    """Read the pool's prep-generation completion rollup: each non-retired
-    sequenced_sample classified by the state of its fastq-to-parquet work tickets
-    (any version) and tallied into completed / in-flight / no-data / failed /
-    not-submitted buckets, with a pool-level `complete` flag (every sample in a
-    terminal-accounted state — COMPLETED or NO_DATA — and the pool non-empty, so
-    a plate of real data with empty wells still reaches `complete=True`). This is
-    the SPP GenPrepFileJob end-state equivalent — it answers
-    "has the per-sample fastq→parquet fan-out finished?" — surfaced alongside the
+    """Read the pool's end-to-end processing rollup: the demux (bcl-convert)
+    stage state plus the host-masking stage. `demux_state` is the pool-scoped
+    bcl-convert ticket's state; the per-sample buckets classify each non-retired
+    sequenced_sample by the state of its read-mask work tickets (any version) —
+    completed / in-flight / no-data / failed / not-submitted — with a pool-level
+    `complete` flag for host-masking (every sample COMPLETED or NO_DATA and the
+    pool non-empty, so a plate of real data with empty wells still reaches
+    `complete=True`) and `fully_processed` = demux completed AND `complete` (the
+    single "this pool is done and clean" signal). Surfaced alongside the
     read-metric and QC rollups.
 
     Everything is compute-on-read over the work_ticket table, so it never drifts
@@ -588,9 +590,11 @@ async def get_sequenced_pool_completion(
     404 (no such pool) / 422 (pool not under this run); a pool with no non-retired
     samples reads as all-zero counts and `complete=False`."""
     row = await fetch_sequenced_pool_completion(pool, sequenced_pool_idx)
+    demux_state = await fetch_sequenced_pool_demux_state(pool, sequenced_pool_idx)
     return PoolCompletionStatus(
         sequenced_pool_idx=sequenced_pool_idx,
         sequencing_run_idx=sequencing_run_idx,
+        demux_state=demux_state,
         sample_count=row["sample_count"],
         samples_completed=row["samples_completed"],
         samples_in_flight=row["samples_in_flight"],
