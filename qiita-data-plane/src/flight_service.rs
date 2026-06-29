@@ -380,6 +380,32 @@ impl FlightService for QiitaFlightService {
                 let output = stream::once(futures::future::ready(Ok(result)));
                 Ok(Response::new(Box::pin(output)))
             }
+            "delete_pool_reads" => {
+                let payload = auth::verify_delete_pool_reads(&action.body, &self.hmac_secret)
+                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
+
+                if payload.action != "delete_pool_reads" {
+                    return Err(Status::invalid_argument(format!(
+                        "action type mismatch: header says 'delete_pool_reads', payload says {:?}",
+                        payload.action
+                    )));
+                }
+
+                let deleted = delete_pool_reads(
+                    &self.catalog_connstr,
+                    &self.data_path,
+                    &payload.prep_sample_idxs,
+                )?;
+
+                let result_body = serde_json::to_vec(&deleted)
+                    .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+
+                let result = arrow_flight::Result {
+                    body: result_body.into(),
+                };
+                let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
             "export_read" => {
                 let payload = auth::verify_export_read(&action.body, &self.hmac_secret)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
@@ -1156,6 +1182,90 @@ fn delete_mask(
     }))
 }
 
+/// Logically delete every `read` and `read_mask` row owned by a set of
+/// prep_samples from DuckLake.
+///
+/// Called when the control plane purges a sequenced_pool: the pool's
+/// prep_samples are exclusive to it, so their reads (written once by
+/// `ingest_reads`) and any masks over them are orphaned once the pool's Postgres
+/// rows are gone. Both tables are keyed by `prep_sample_idx`.
+///
+/// Mirrors `delete_reference` / `delete_mask`: one DuckLake transaction
+/// (all-or-nothing, so a failure leaves both tables intact and the control plane
+/// can safely retry), logical `DELETE` only — no raw parquet `unlink` (DuckLake
+/// owns file lifecycle; orphan parquets are reclaimed by a future maintenance
+/// pass). Idempotent: an empty set, or a set whose rows are already gone,
+/// returns zero counts. The `prep_sample_idxs` are `i64` parsed from the
+/// HMAC-signed payload, so inlining them into the `IN (...)` list carries no
+/// injection surface and avoids per-row parameter binding for the large
+/// (hundreds of samples) pool case.
+fn delete_pool_reads(
+    catalog_connstr: &str,
+    data_path: &str,
+    prep_sample_idxs: &[i64],
+) -> Result<serde_json::Value, Status> {
+    // Empty set: nothing to do, and `IN ()` is not valid SQL. Return the
+    // zero-count shape without touching the catalog.
+    if prep_sample_idxs.is_empty() {
+        return Ok(serde_json::json!({
+            "prep_sample_count": 0,
+            "read_rows_deleted": 0,
+            "read_mask_rows_deleted": 0,
+        }));
+    }
+
+    let conn = duckdb::Connection::open_in_memory()
+        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
+    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
+        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
+
+    // i64 literals — no injection surface (see fn docs).
+    let in_list = prep_sample_idxs
+        .iter()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    // Both deletes run in one transaction so the action is all-or-nothing and
+    // retriable: a mid-delete failure rolls both tables back rather than
+    // leaving reads gone but masks behind (or vice versa).
+    conn.execute_batch("BEGIN TRANSACTION")
+        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
+
+    let deletes = (|| -> Result<(usize, usize), Status> {
+        let read_rows_deleted = conn
+            .execute(
+                &format!("DELETE FROM qiita_lake.read WHERE prep_sample_idx IN ({in_list})"),
+                [],
+            )
+            .map_err(|e| Status::internal(format!("delete from read failed: {e}")))?;
+        let read_mask_rows_deleted = conn
+            .execute(
+                &format!("DELETE FROM qiita_lake.read_mask WHERE prep_sample_idx IN ({in_list})"),
+                [],
+            )
+            .map_err(|e| Status::internal(format!("delete from read_mask failed: {e}")))?;
+        Ok((read_rows_deleted, read_mask_rows_deleted))
+    })();
+
+    let (read_rows_deleted, read_mask_rows_deleted) = match deletes {
+        Ok(counts) => counts,
+        Err(e) => {
+            // Best-effort rollback; surface the original delete error.
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    };
+    conn.execute_batch("COMMIT")
+        .map_err(|e| Status::internal(format!("failed to commit delete transaction: {e}")))?;
+
+    Ok(serde_json::json!({
+        "prep_sample_count": prep_sample_idxs.len(),
+        "read_rows_deleted": read_rows_deleted,
+        "read_mask_rows_deleted": read_mask_rows_deleted,
+    }))
+}
+
 /// Mint a unique, ticket-traceable lake-storage filename for a registered
 /// Parquet.
 ///
@@ -1494,6 +1604,96 @@ mod tests {
         // Best-effort cleanup of the surviving mask_b row.
         let _ = conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.read_mask WHERE mask_idx = {mask_b};"
+        ));
+    }
+
+    /// An empty prep_sample set short-circuits: zero counts, no catalog touched
+    /// (so this needs no DuckLake — runs in the pure-unit tier). Guards against
+    /// emitting an invalid `IN ()` clause.
+    #[test]
+    fn delete_pool_reads_empty_set_is_zero_count_noop() {
+        let counts = delete_pool_reads("unused-connstr", "unused-data-path", &[])
+            .expect("empty-set delete should succeed without touching the catalog");
+        assert_eq!(counts["prep_sample_count"], 0);
+        assert_eq!(counts["read_rows_deleted"], 0);
+        assert_eq!(counts["read_mask_rows_deleted"], 0);
+    }
+
+    /// `delete_pool_reads` drops exactly the target prep_samples' `read` and
+    /// `read_mask` rows, leaves another pool's prep_sample untouched, and is
+    /// idempotent: a second delete of the same set succeeds and reports 0 rows.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn delete_pool_reads_drops_target_idempotently() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+
+        // Unique ids so leftover rows never collide with other serial tests.
+        // prep_a / prep_b belong to the deleted pool; prep_other to another.
+        let prep_a: i64 = 940_000;
+        let prep_b: i64 = 940_001;
+        let prep_other: i64 = 940_002;
+        let mask: i64 = 940_010;
+
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read WHERE prep_sample_idx IN ({prep_a}, {prep_b}, {prep_other});
+             DELETE FROM qiita_lake.read_mask WHERE prep_sample_idx IN ({prep_a}, {prep_b}, {prep_other});
+             INSERT INTO qiita_lake.read (prep_sample_idx, sequence_idx, read_id, sequence1) VALUES \
+                 ({prep_a}, 1, 'r1', 'ACGT'), \
+                 ({prep_a}, 2, 'r2', 'TTTT'), \
+                 ({prep_b}, 3, 'r3', 'GGGG'), \
+                 ({prep_other}, 4, 'r4', 'CCCC');
+             INSERT INTO qiita_lake.read_mask \
+                 (mask_idx, prep_sample_idx, sequence_idx, reason) VALUES \
+                 ({mask}, {prep_a}, 1, 'pass'), \
+                 ({mask}, {prep_b}, 3, 'pass'), \
+                 ({mask}, {prep_other}, 4, 'pass');"
+        ))
+        .unwrap();
+
+        let first = delete_pool_reads(&connstr, &data_path, &[prep_a, prep_b])
+            .expect("delete_pool_reads failed");
+        assert_eq!(first["prep_sample_count"], 2);
+        assert_eq!(first["read_rows_deleted"], 3, "prep_a (2) + prep_b (1)");
+        assert_eq!(first["read_mask_rows_deleted"], 2, "prep_a + prep_b masks");
+
+        let read_count = |prep: i64| -> i64 {
+            conn.query_row(
+                &format!("SELECT count(*) FROM qiita_lake.read WHERE prep_sample_idx = {prep}"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let mask_count = |prep: i64| -> i64 {
+            conn.query_row(
+                &format!(
+                    "SELECT count(*) FROM qiita_lake.read_mask WHERE prep_sample_idx = {prep}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(read_count(prep_a), 0);
+        assert_eq!(read_count(prep_b), 0);
+        assert_eq!(read_count(prep_other), 1, "other pool's read untouched");
+        assert_eq!(mask_count(prep_other), 1, "other pool's mask untouched");
+
+        // Idempotency: re-deleting the now-empty set is success with 0 rows.
+        let second = delete_pool_reads(&connstr, &data_path, &[prep_a, prep_b])
+            .expect("idempotent re-delete failed");
+        assert_eq!(second["read_rows_deleted"], 0);
+        assert_eq!(second["read_mask_rows_deleted"], 0);
+
+        // Best-effort cleanup of the surviving other-pool rows.
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read WHERE prep_sample_idx = {prep_other};
+             DELETE FROM qiita_lake.read_mask WHERE prep_sample_idx = {prep_other};"
         ));
     }
 

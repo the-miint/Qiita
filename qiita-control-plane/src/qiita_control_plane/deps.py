@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from pathlib import Path
 
 import asyncpg
 from fastapi import Request
@@ -52,6 +53,15 @@ def get_hmac_secret(request: Request) -> bytes:
 def get_data_plane_url(request: Request) -> str:
     """Return the data plane gRPC URL from app settings."""
     return get_settings(request).data_plane_url
+
+
+def get_scratch_staging(request: Request) -> Path | None:
+    """Return the shared-scratch staging root (`PATH_SCRATCH/staging`), or None
+    in CP-only/dev where no scratch is configured. This is the root under which
+    the bcl-convert `ingest_reads` step writes durable per-sample read copies
+    (`reads/{prep_sample_idx}/read.parquet`); the pool-delete reaper removes
+    them from here."""
+    return get_settings(request).path_scratch_staging
 
 
 def get_tx_conn_factory(request: Request) -> TxConnFactory:

@@ -16,7 +16,13 @@ Two things this delete deliberately does NOT touch:
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
+
 import asyncpg
+from qiita_common.api_paths import compute_reads_staging_path
+
+logger = logging.getLogger(__name__)
 
 # Work-ticket states that block a pool delete. In-flight states block
 # unconditionally (a running job is reading/writing the pool's data); terminal
@@ -336,3 +342,45 @@ async def delete_sequenced_pool_cascade(
         "study_link_deleted": study_link_deleted,
         "work_ticket_deleted": work_ticket_deleted,
     }
+
+
+def reap_staged_reads(staging_root: Path | None, prep_sample_idxs: list[int]) -> int:
+    """Best-effort removal of the durable per-sample staged read copies a deleted
+    pool's prep_samples produced, returning the number of `read.parquet` files
+    removed.
+
+    The bcl-convert `ingest_reads` step writes each sample's reads once to
+    `{staging_root}/reads/{prep_sample_idx}/read.parquet` (the stable,
+    prep_sample-addressable input the repeatable read-mask workflow binds). When
+    the pool is purged those copies are orphaned alongside the DuckLake rows, so
+    we unlink them here and drop the now-empty per-sample directory.
+
+    Best-effort by design — a missing file is success (idempotent: a retry, or a
+    pool whose reads never landed, removes nothing) and a per-sample filesystem
+    error is logged and skipped rather than raised: the Postgres + DuckLake
+    teardown is the authoritative delete; leaking a stale Parquet must never fail
+    it. No-op when `staging_root` is None (CP-only/dev, no shared scratch)."""
+    if staging_root is None:
+        return 0
+    reaped = 0
+    for prep_sample_idx in prep_sample_idxs:
+        path = compute_reads_staging_path(staging_root, prep_sample_idx)
+        try:
+            try:
+                path.unlink()
+                reaped += 1
+            except FileNotFoundError:
+                pass  # already gone — idempotent
+            # Drop the now-empty `{prep_sample_idx}/` dir; ignore if it still
+            # holds other artifacts or was never created.
+            parent = path.parent
+            if parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
+        except OSError as exc:
+            logger.warning(
+                "reap_staged_reads: could not remove %s for prep_sample %d: %s",
+                path,
+                prep_sample_idx,
+                exc,
+            )
+    return reaped

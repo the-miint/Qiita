@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import asyncpg
+import pyarrow.flight as _flight
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import Field
 from qiita_common.api_paths import (
@@ -70,6 +71,7 @@ from qiita_common.models import (
     merge_qc_reports,
 )
 
+from ..actions.library import delete_pool_reads_data
 from ..actions.sequenced_pool import (
     PreflightNotEditable,
     SequencedPoolDeleteBlocked,
@@ -78,6 +80,7 @@ from ..actions.sequenced_pool import (
     assert_sequenced_pool_deletable,
     delete_sequenced_pool_cascade,
     invalidate_completed_steps_for_sequenced_pool,
+    reap_staged_reads,
 )
 from ..auth.guards import (
     require_caller_owns_run,
@@ -90,7 +93,14 @@ from ..auth.guards import (
     require_service_with_scope,
 )
 from ..auth.principal import HumanUser, Principal, ServiceAccount
-from ..deps import TxConnFactory, get_db_pool, get_tx_conn_factory
+from ..deps import (
+    TxConnFactory,
+    get_data_plane_url,
+    get_db_pool,
+    get_hmac_secret,
+    get_scratch_staging,
+    get_tx_conn_factory,
+)
 from ..repositories.sequencing_run import (
     PayloadMismatch,
     fetch_sequenced_pool_completion,
@@ -597,18 +607,23 @@ async def delete_sequenced_pool(
     force: bool = False,
     pool: asyncpg.Pool = Depends(get_db_pool),
     tx: TxConnFactory = Depends(get_tx_conn_factory),
+    hmac_secret: bytes = Depends(get_hmac_secret),
+    data_plane_url: str = Depends(get_data_plane_url),
+    staging_root: Path | None = Depends(get_scratch_staging),
     _scope: Principal = Depends(require_scope(Scope.SEQUENCED_POOL_DELETE)),
     _run_exists: None = Depends(require_sequencing_run_exists),
     _pool_in_run: None = Depends(require_sequenced_pool_in_run),
 ) -> SequencedPoolDeleteResponse:
-    """Fully purge a sequenced_pool — the pool row plus every sequenced_sample /
-    prep_sample under it, their metadata, study links, and pool-/sample-scoped
-    work tickets. system_admin only (`sequenced_pool:delete`). Mirrors
+    """Fully purge a sequenced_pool — its Postgres subtree, the DuckLake `read`/
+    `read_mask` rows its prep_samples produced, and the durable staged read
+    copies on disk. system_admin only (`sequenced_pool:delete`). Mirrors
     DELETE /reference.
 
-    What survives, by design: the parent `sequencing_run` (it may hold other
-    pools) and the underlying `biosample` rows (a biosample is a physical
-    sample shared across studies, not pool-owned — the cascade stops at
+    The Postgres cascade removes the pool row plus every sequenced_sample /
+    prep_sample under it, their metadata, study links, and pool-/sample-scoped
+    work tickets. What survives, by design: the parent `sequencing_run` (it may
+    hold other pools) and the underlying `biosample` rows (a biosample is a
+    physical sample shared across studies, not pool-owned — the cascade stops at
     prep_sample). Because sequenced_sample↔prep_sample is 1:1 and each
     sequenced_sample belongs to one pool, the deleted prep_samples are
     exclusive to this pool. They are removed outright, which severs **every**
@@ -619,24 +634,63 @@ async def delete_sequenced_pool(
     into a study, and samples carrying an ENA accession each block it unless
     `force=true`.
 
-    The data-plane DuckLake purge is a no-op today (no processing-result tables
-    keyed by prep_sample/processing_idx exist yet); when they land, issue the
-    DoAction purge here — mirroring `delete_reference_data` — before the
-    Postgres teardown.
+    The DuckLake purge (the `read`/`read_mask` rows the pool's bcl-convert run
+    wrote, keyed by prep_sample_idx) runs first, then the Postgres teardown —
+    same data-plane → Postgres-last ordering as DELETE /reference, chosen so the
+    op is retriable: the data-plane delete is one DuckLake transaction
+    (all-or-nothing, idempotent), and the `sequenced_pool` row a retry keys off
+    is removed last. A transport/data-plane failure 502s with nothing removed.
+
+    Two ordering subtleties, both narrow (system_admin-only, sub-second):
+      * The DuckLake read purge precedes the in-tx re-gate, so if a ticket goes
+        in-flight in the precheck→purge window, its `read` rows are gone before
+        the re-gate aborts the Postgres teardown (409). That job would then fail
+        for missing reads, and the DELETE keeps 409ing until it drains; a retry
+        once it's terminal completes the delete (the purge is idempotent). This
+        is the same class of pre-commit-destructive window reference delete
+        accepts — closing it fully would need row locking we deliberately avoid
+        here.
+      * The staged-read reaper, by contrast, runs only *after* the Postgres
+        teardown commits — so an aborted teardown never removes the durable
+        `read.parquet` inputs out from under a surviving in-flight job. On the
+        rare crash between commit and reap, the staged copies leak (storage
+        only) and are left for a future maintenance pass.
+
+    Reclaiming the orphaned Parquet bytes the logical DuckLake delete leaves
+    behind is likewise not yet automated (same as reference).
     """
     # `require_sequenced_pool_in_run` already fronted existence (404) and
     # parent-run consistency (422), so the SequencedPoolNotFound arm here is
     # belt-and-suspenders for the precheck — kept because the action owns its
     # own existence contract and the in-tx re-gate below CAN legitimately hit
-    # it (a concurrent delete between the guard and the teardown).
+    # it (a concurrent delete between the guard and the teardown). The precheck
+    # returns the pool's prep_sample set (exclusive to this pool) — the keys the
+    # DuckLake purge and staged-reads reaper below operate on.
     try:
-        await assert_sequenced_pool_deletable(pool, sequenced_pool_idx, force=force)
+        prep_sample_idxs = await assert_sequenced_pool_deletable(
+            pool, sequenced_pool_idx, force=force
+        )
     except SequencedPoolNotFound:
         raise HTTPException(
             status_code=404, detail=f"sequenced_pool {sequenced_pool_idx} not found"
         )
     except SequencedPoolDeleteBlocked as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+
+    # DuckLake data first (idempotent, atomic delete-by-prep_sample_idx in the
+    # data plane). A FlightError here means nothing has been removed yet — 502
+    # so the operator can re-run the idempotent DELETE.
+    try:
+        purge = await delete_pool_reads_data(
+            prep_sample_idxs=prep_sample_idxs,
+            hmac_secret=hmac_secret,
+            data_plane_url=data_plane_url,
+        )
+    except _flight.FlightError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"data plane sequenced-pool read purge failed; nothing removed yet: {exc}",
+        ) from exc
 
     # Re-gate inside the teardown transaction to close the precheck→cascade
     # window: a work ticket that went in-flight since the precheck must abort
@@ -654,7 +708,18 @@ async def delete_sequenced_pool(
             raise HTTPException(status_code=409, detail=str(exc))
         counts = await delete_sequenced_pool_cascade(conn, sequenced_pool_idx)
 
-    return SequencedPoolDeleteResponse(sequenced_pool_idx=sequenced_pool_idx, **counts)
+    # Durable per-sample staged read copies — reaped only AFTER the teardown
+    # commits, so an aborted teardown (re-gate 409) never strips the staged
+    # inputs from a surviving in-flight job. Best-effort; never fails the delete.
+    staged_reads_reaped = reap_staged_reads(staging_root, prep_sample_idxs)
+
+    return SequencedPoolDeleteResponse(
+        sequenced_pool_idx=sequenced_pool_idx,
+        read_rows_deleted=purge.get("read_rows_deleted", 0),
+        read_mask_rows_deleted=purge.get("read_mask_rows_deleted", 0),
+        staged_reads_reaped=staged_reads_reaped,
+        **counts,
+    )
 
 
 @router.post(PATH_SEQUENCING_RUN_LOOKUP_BY_INSTRUMENT_RUN_ID)

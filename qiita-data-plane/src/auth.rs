@@ -232,6 +232,36 @@ pub fn verify_delete_mask(ticket: &[u8], secret: &[u8]) -> Result<DeleteMaskPayl
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
+/// Parsed payload for the `delete_pool_reads` DoAction.
+///
+/// Wire shape pinned by `qiita_control_plane.actions.library.delete_pool_reads_data`:
+/// `{"action": "delete_pool_reads", "prep_sample_idxs": [N, ...]}`. The control
+/// plane expands a deleted sequenced_pool to its prep_sample set (the `read` /
+/// `read_mask` tables carry no run/pool column — the data plane stays "dumb" and
+/// deletes only the identifiers it is handed). `deny_unknown_fields` keeps the
+/// contract tight — any extra field on the ticket is a design slip surfaced
+/// loudly here.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeletePoolReadsPayload {
+    /// Action discriminator; the gRPC handler also rejects a payload whose
+    /// `action` is not "delete_pool_reads".
+    pub action: String,
+    /// `i64` set, matching the Postgres `prep_sample` identifier source of truth
+    /// and the `prep_sample_idx BIGINT` columns in the DuckLake `read` /
+    /// `read_mask` tables. May be empty — the handler then deletes nothing.
+    pub prep_sample_idxs: Vec<i64>,
+}
+
+/// Verify a `delete_pool_reads` DoAction token and return its parsed payload.
+pub fn verify_delete_pool_reads(
+    ticket: &[u8],
+    secret: &[u8],
+) -> Result<DeletePoolReadsPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
 /// Parsed payload for the `export_read` DoAction.
 ///
 /// Wire shape pinned by `qiita_control_plane.runner._resolve_staged_reads`:
@@ -568,6 +598,53 @@ mod tests {
             br#"{"action":"export_read","dest":"/scratch/x","prep_sample_idx":1,"smuggled":9}"#;
         let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
         match verify_export_read(&ticket, b"dev-secret").unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
+    }
+
+    // --------------------------------------------------------------------
+    // delete_pool_reads action token variant
+    // --------------------------------------------------------------------
+
+    #[test]
+    fn verify_delete_pool_reads_round_trip() {
+        // Canonical JSON: sorted keys, no whitespace — matches sign_action.
+        let payload = br#"{"action":"delete_pool_reads","prep_sample_idxs":[10,11,12]}"#;
+        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
+        let parsed =
+            verify_delete_pool_reads(&ticket, b"dev-secret").expect("valid token should verify");
+        assert_eq!(parsed.action, "delete_pool_reads");
+        assert_eq!(parsed.prep_sample_idxs, vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn verify_delete_pool_reads_accepts_empty_set() {
+        // An empty pool (no prep_samples) signs an empty list; it must verify.
+        let payload = br#"{"action":"delete_pool_reads","prep_sample_idxs":[]}"#;
+        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
+        let parsed = verify_delete_pool_reads(&ticket, b"dev-secret").expect("should verify");
+        assert!(parsed.prep_sample_idxs.is_empty());
+    }
+
+    #[test]
+    fn verify_delete_pool_reads_rejects_bad_hmac() {
+        let payload = br#"{"action":"delete_pool_reads","prep_sample_idxs":[1]}"#;
+        let mut ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
+        ticket[10] ^= 0xFF;
+        assert_eq!(
+            verify_delete_pool_reads(&ticket, b"dev-secret").unwrap_err(),
+            AuthError::InvalidHmac
+        );
+    }
+
+    #[test]
+    fn verify_delete_pool_reads_rejects_extra_fields() {
+        // deny_unknown_fields: a smuggled field is a contract slip surfaced here.
+        let payload =
+            br#"{"action":"delete_pool_reads","prep_sample_idxs":[1],"sequenced_pool_idx":9}"#;
+        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
+        match verify_delete_pool_reads(&ticket, b"dev-secret").unwrap_err() {
             AuthError::MalformedPayload(_) => {}
             other => panic!("expected MalformedPayload, got {other:?}"),
         }
