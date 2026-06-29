@@ -93,6 +93,7 @@ from ..sequence_range import (
     get_sequence_range,
     mint_sequence_range,
 )
+from ..sequence_range_retry import cp_call_failure, cp_call_with_retry
 
 # YAML step name this module implements. Hard-coded because execute()
 # raises BackendFailures itself (which need a step_name); the integration
@@ -197,28 +198,6 @@ def _match_fastq(convert_dir: Path, pool_item_id: str, read_tag: str) -> Path | 
     )
 
 
-def _http_status_failure(prep_sample_idx: int, exc: httpx.HTTPStatusError) -> BackendFailure:
-    """Map an httpx status error from a CP sequence-range call (mint or
-    read-back) to a BackendFailure: 401/403 → CONTRACT_VIOLATION (bad
-    token / missing scope — a deploy misconfig), anything else →
-    UNKNOWN_PERMANENT. Shared by the mint and the reuse-GET arms so both
-    classify identically."""
-    kind = (
-        FailureKind.CONTRACT_VIOLATION
-        if exc.response.status_code in (401, 403)
-        else FailureKind.UNKNOWN_PERMANENT
-    )
-    return BackendFailure(
-        kind=kind,
-        stage=WorkTicketFailureStage.STEP_RUN,
-        step_name=YAML_STEP_NAME,
-        reason=(
-            f"CP sequence-range call for prep_sample {prep_sample_idx} failed "
-            f"with HTTP {exc.response.status_code}"
-        ),
-    )
-
-
 async def _mint_or_reuse_range(http: httpx.AsyncClient, prep_sample_idx: int, count: int) -> int:
     """Mint a sequence range for one sample, or reuse the existing one.
 
@@ -230,17 +209,28 @@ async def _mint_or_reuse_range(http: httpx.AsyncClient, prep_sample_idx: int, co
     rather than dying on the one-shot mint contract. Returns the inclusive
     range start. Maps the typed mint exceptions to BackendFailures (the
     dispatcher only wraps bare NotImplementedError/FileNotFoundError/
-    ValueError)."""
+    ValueError).
+
+    Both CP calls (mint and reuse read-back) are wrapped in `cp_call_with_retry`
+    (shared with `fastq_to_parquet` via `sequence_range_retry`), so a transient
+    5xx / transport blip on one of a pool's many per-sample callbacks self-heals
+    rather than failing the step. An exhausted-retry transient error maps via
+    `cp_call_failure` to CONTROL_PLANE_UNREACHABLE (retriable) so the runner
+    re-dispatches the idempotent step."""
     try:
-        rng = await mint_sequence_range(http=http, prep_sample_idx=prep_sample_idx, count=count)
+        rng = await cp_call_with_retry(
+            lambda: mint_sequence_range(http=http, prep_sample_idx=prep_sample_idx, count=count)
+        )
         return rng.sequence_idx_start
     except SequenceRangeAlreadyExists as exc:
         # Reuse the range a prior crashed attempt left. The GET is gated on
         # the same `sequence_range:mint` scope the SA already holds.
         try:
-            existing = await get_sequence_range(http=http, prep_sample_idx=prep_sample_idx)
-        except httpx.HTTPStatusError as get_exc:
-            raise _http_status_failure(prep_sample_idx, get_exc) from get_exc
+            existing = await cp_call_with_retry(
+                lambda: get_sequence_range(http=http, prep_sample_idx=prep_sample_idx)
+            )
+        except (httpx.HTTPStatusError, httpx.TransportError) as get_exc:
+            raise cp_call_failure(prep_sample_idx, get_exc, step_name=YAML_STEP_NAME) from get_exc
         if existing is None:
             # 409 on mint but 404 on read-back: the range vanished between the
             # two calls (an operator deleted the prep_sample / range mid-retry).
@@ -281,8 +271,8 @@ async def _mint_or_reuse_range(http: httpx.AsyncClient, prep_sample_idx: int, co
             step_name=YAML_STEP_NAME,
             reason=str(exc),
         ) from exc
-    except httpx.HTTPStatusError as exc:
-        raise _http_status_failure(prep_sample_idx, exc) from exc
+    except (httpx.HTTPStatusError, httpx.TransportError) as exc:
+        raise cp_call_failure(prep_sample_idx, exc, step_name=YAML_STEP_NAME) from exc
 
 
 def _stage_intermediate_reads(

@@ -16,6 +16,10 @@ ingest loop, not framework wiring. Covers the branches the split introduced:
     exists (prior attempt minted then crashed) reuses the existing range rather
     than failing on the 409; count mismatch and concurrent-deletion are mapped
     to BAD_INPUT / UNKNOWN_PERMANENT.
+  - Transient CP callback errors: a 5xx / transport blip on the sequence-range
+    mint (or reuse read-back) self-heals via in-job retry; an exhausted-retry
+    transient error classifies retriable (CONTROL_PLANE_UNREACHABLE), while
+    401/403 and other 4xx stay permanent and are not retried.
   - All-empty pool: StepNoData (the whole ticket is no-data).
 
 mint_sequence_range / get_sequence_range are monkey-patched so no live CP is
@@ -28,11 +32,13 @@ import asyncio
 import gzip
 
 import duckdb
+import httpx
 import pytest
 from qiita_common.api_paths import compute_reads_staging_path
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 
 import qiita_compute_orchestrator.jobs.ingest_reads as ingest_module
+import qiita_compute_orchestrator.sequence_range_retry as retry_module
 from qiita_compute_orchestrator.jobs.ingest_reads import Inputs, execute
 from qiita_compute_orchestrator.sequence_range import (
     MintedSequenceRange,
@@ -310,3 +316,197 @@ def test_reuse_missing_range_fails_permanent(monkeypatch, tmp_path):
         _run(inputs, tmp_path / "ws")
     assert exc.value.kind == FailureKind.UNKNOWN_PERMANENT
     assert "concurrent deletion" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# Transient CP sequence-range callback errors: a 5xx / transport blip on one
+# per-sample callback must self-heal via in-job retry, and an exhausted-retry
+# transient error must classify retriable (CONTROL_PLANE_UNREACHABLE) — never
+# permanently fail the whole pool over one dropped connection. 401/403 and other
+# 4xx stay permanent (no retry).
+# ---------------------------------------------------------------------------
+
+
+def _status_error(status: int) -> httpx.HTTPStatusError:
+    """An httpx.HTTPStatusError carrying `status`, shaped like the one
+    `raise_for_status()` raises inside mint_sequence_range / get_sequence_range."""
+    request = httpx.Request("POST", "http://cp/api/v1/sequence-range")
+    response = httpx.Response(status, request=request)
+    return httpx.HTTPStatusError(f"HTTP {status}", request=request, response=response)
+
+
+@pytest.fixture
+def no_backoff(monkeypatch):
+    """Zero the retry backoff so the retry tests don't actually sleep."""
+    monkeypatch.setattr(retry_module, "CP_RETRY_BACKOFF_BASE_S", 0)
+
+
+def _flaky_mint(monkeypatch, errors):
+    """mint raises each exc in `errors` on successive calls, then succeeds with a
+    range starting at 7000. Returns the per-call list so the test can count
+    attempts."""
+    calls: list[int] = []
+
+    async def _mint(*, http, prep_sample_idx, count):
+        calls.append(prep_sample_idx)
+        if len(calls) <= len(errors):
+            raise errors[len(calls) - 1]
+        return MintedSequenceRange(
+            prep_sample_idx=prep_sample_idx,
+            sequence_idx_start=7000,
+            sequence_idx_stop=7000 + count - 1,
+        )
+
+    monkeypatch.setattr(ingest_module, "mint_sequence_range", _mint)
+    return calls
+
+
+def _always_failing_mint(monkeypatch, exc):
+    """mint always raises `exc`. Returns the per-call list."""
+    calls: list[int] = []
+
+    async def _mint(*, http, prep_sample_idx, count):
+        calls.append(prep_sample_idx)
+        raise exc
+
+    monkeypatch.setattr(ingest_module, "mint_sequence_range", _mint)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "error",
+    [_status_error(502), httpx.ConnectError("connection reset")],
+    ids=["http_502", "transport_error"],
+)
+def test_transient_mint_error_self_heals(monkeypatch, no_backoff, tmp_path, error):
+    """A transient 5xx / transport blip on the mint callback is retried in-job
+    and the next attempt succeeds — the step completes and writes the reads
+    against the eventually-minted range, never failing."""
+    convert_dir = _seed_convert_dir(tmp_path, {"10": [("a", "ACGT"), ("b", "TTTT")]})
+    inputs = _inputs(tmp_path, convert_dir, [(10, "10")])
+    # Two transient failures, then success on the third attempt.
+    calls = _flaky_mint(monkeypatch, [error, error])
+
+    _run(inputs, tmp_path / "ws")
+
+    assert len(calls) == 3  # two retries + the successful attempt
+    assert _durable_rows(inputs.reads_staging_root, 10) == [
+        (10, 7000, "ACGT"),
+        (10, 7001, "TTTT"),
+    ]
+
+
+@pytest.mark.parametrize(
+    "error,reason_substr",
+    [
+        (_status_error(502), "HTTP 502"),
+        (_status_error(503), "HTTP 503"),
+        (_status_error(408), "HTTP 408"),  # request timeout — transient
+        (_status_error(429), "HTTP 429"),  # rate limit — transient
+        (httpx.ConnectError("connection reset"), "transport error (ConnectError)"),
+        (httpx.ReadTimeout("read timed out"), "transport error (ReadTimeout)"),
+    ],
+    ids=["http_502", "http_503", "http_408", "http_429", "connect_error", "read_timeout"],
+)
+def test_exhausted_transient_mint_error_is_retriable(
+    monkeypatch, no_backoff, tmp_path, error, reason_substr
+):
+    """If every retry attempt hits the same transient error, the step raises a
+    *retriable* CONTROL_PLANE_UNREACHABLE — the runner re-dispatches the
+    idempotent step instead of discarding the whole pool's demux."""
+    convert_dir = _seed_convert_dir(tmp_path, {"10": [("a", "ACGT")]})
+    inputs = _inputs(tmp_path, convert_dir, [(10, "10")])
+    calls = _always_failing_mint(monkeypatch, error)
+
+    with pytest.raises(BackendFailure) as exc:
+        _run(inputs, tmp_path / "ws")
+
+    assert len(calls) == retry_module.CP_RETRY_MAX_ATTEMPTS  # all attempts spent
+    assert exc.value.kind == FailureKind.CONTROL_PLANE_UNREACHABLE
+    assert exc.value.transient is True
+    assert reason_substr in str(exc.value)
+    assert "prep_sample 10" in str(exc.value)
+
+
+@pytest.mark.parametrize("status", [401, 403], ids=["unauthorized", "forbidden"])
+def test_auth_error_on_mint_is_permanent_no_retry(monkeypatch, no_backoff, tmp_path, status):
+    """401/403 is a token/scope misconfig a retry can't fix: CONTRACT_VIOLATION
+    (permanent) and *not* retried — the mint is called exactly once."""
+    convert_dir = _seed_convert_dir(tmp_path, {"10": [("a", "ACGT")]})
+    inputs = _inputs(tmp_path, convert_dir, [(10, "10")])
+    calls = _always_failing_mint(monkeypatch, _status_error(status))
+
+    with pytest.raises(BackendFailure) as exc:
+        _run(inputs, tmp_path / "ws")
+
+    assert len(calls) == 1  # no retry on a permanent client error
+    assert exc.value.kind == FailureKind.CONTRACT_VIOLATION
+    assert exc.value.transient is False
+
+
+def test_other_4xx_on_mint_is_permanent_no_retry(monkeypatch, no_backoff, tmp_path):
+    """A non-auth 4xx (e.g. 400) is permanent (UNKNOWN_PERMANENT) and not
+    retried."""
+    convert_dir = _seed_convert_dir(tmp_path, {"10": [("a", "ACGT")]})
+    inputs = _inputs(tmp_path, convert_dir, [(10, "10")])
+    calls = _always_failing_mint(monkeypatch, _status_error(400))
+
+    with pytest.raises(BackendFailure) as exc:
+        _run(inputs, tmp_path / "ws")
+
+    assert len(calls) == 1
+    assert exc.value.kind == FailureKind.UNKNOWN_PERMANENT
+    assert exc.value.transient is False
+
+
+def test_transient_error_on_reuse_readback_is_retriable(monkeypatch, no_backoff, tmp_path):
+    """The reuse read-back (GET after a 409) is wrapped in the same retry; an
+    exhausted transient 5xx there also classifies retriable."""
+    convert_dir = _seed_convert_dir(tmp_path, {"10": [("a", "ACGT")]})
+    inputs = _inputs(tmp_path, convert_dir, [(10, "10")])
+    _patch_conflicting_mint(monkeypatch)  # mint always 409 → reuse path
+
+    get_calls: list[int] = []
+
+    async def _flaky_get(*, http, prep_sample_idx):
+        get_calls.append(prep_sample_idx)
+        raise _status_error(502)
+
+    monkeypatch.setattr(ingest_module, "get_sequence_range", _flaky_get)
+
+    with pytest.raises(BackendFailure) as exc:
+        _run(inputs, tmp_path / "ws")
+
+    assert len(get_calls) == retry_module.CP_RETRY_MAX_ATTEMPTS
+    assert exc.value.kind == FailureKind.CONTROL_PLANE_UNREACHABLE
+    assert exc.value.transient is True
+
+
+def test_transient_error_on_reuse_readback_self_heals(monkeypatch, no_backoff, tmp_path):
+    """A transient blip on the reuse read-back is retried and the next attempt
+    returns the existing range — the reuse path completes (reads written against
+    the recovered 5000.. range), proving the GET retry actually self-heals, not
+    just that exhaustion classifies right."""
+    convert_dir = _seed_convert_dir(tmp_path, {"10": [("a", "ACGT"), ("b", "TTTT")]})
+    inputs = _inputs(tmp_path, convert_dir, [(10, "10")])
+    _patch_conflicting_mint(monkeypatch)  # mint always 409 → reuse path
+
+    get_calls: list[int] = []
+
+    async def _flaky_get(*, http, prep_sample_idx):
+        get_calls.append(prep_sample_idx)
+        if len(get_calls) == 1:
+            raise _status_error(503)  # one transient blip, then succeed
+        return MintedSequenceRange(
+            prep_sample_idx=prep_sample_idx, sequence_idx_start=5000, sequence_idx_stop=5001
+        )
+
+    monkeypatch.setattr(ingest_module, "get_sequence_range", _flaky_get)
+
+    _run(inputs, tmp_path / "ws")
+
+    assert len(get_calls) == 2  # one retry + the successful read-back
+    assert _durable_rows(inputs.reads_staging_root, 10) == [
+        (10, 5000, "ACGT"),
+        (10, 5001, "TTTT"),
+    ]

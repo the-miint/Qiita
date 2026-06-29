@@ -84,6 +84,15 @@ class FailureKind(StrEnum):
     # old 600s held-connection bug: a long step no longer self-fails when
     # the CP→CO hop times out.
     ORCHESTRATOR_UNREACHABLE = "orchestrator_unreachable"
+    # A native job could not reach the control plane on a callback (httpx
+    # transport/timeout error, or an HTTP 5xx) — e.g. the per-sample
+    # `POST /sequence-range` call the `ingest_reads` step makes back to the CP.
+    # The exact mirror of ORCHESTRATOR_UNREACHABLE for the CO→CP direction: an
+    # infra-reachability blip on one of a pool's N callbacks, NEVER a statement
+    # that the step's work is broken. The step retries the call in-job first;
+    # only if that's exhausted does it raise this so the runner re-dispatches
+    # the (idempotent) step rather than discarding hours of demux over one blip.
+    CONTROL_PLANE_UNREACHABLE = "control_plane_unreachable"
     PROCESS_RESTARTED = "process_restarted"  # CP drain cancelled a task
 
     # ---- Permanent: workflow / input / contract issues -------------------
@@ -102,6 +111,7 @@ _RETRIABLE: frozenset[FailureKind] = frozenset(
         FailureKind.TRANSIENT_FS_ERROR,
         FailureKind.SLURMRESTD_UNREACHABLE,
         FailureKind.ORCHESTRATOR_UNREACHABLE,
+        FailureKind.CONTROL_PLANE_UNREACHABLE,
         FailureKind.PROCESS_RESTARTED,
     }
 )
