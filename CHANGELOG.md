@@ -476,6 +476,14 @@ the `no-changelog` label).
 
 ### Changed
 
+- **CI build speedups.** `astral-sh/setup-uv` now caches the uv download/build
+  cache across runs (`enable-cache: true`) in every Python job; the macOS host-
+  Postgres provisioning, previously inlined and duplicated across two jobs, moved
+  into a reusable `.github/actions/setup-host-postgres` composite action (with a
+  weekly-refreshable Homebrew download cache); and the separate `lint-rust` /
+  `test-rust` jobs merged into one `rust` job that shares a checkout, toolchain,
+  and warm `rust-cache` and no longer races to write the cache. No change to what
+  is tested. (#225)
 - A job's input `params.json` and a native step's output `manifest.json` are now
   pretty-printed (2-space indent, trailing newline; the manifest also sorts keys
   to mirror the container-side `manifest_writer.py`) instead of dumped as a single

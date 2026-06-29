@@ -21,9 +21,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true  # Python version comes from .python-version
       - run: make lint-python
 
-  lint-rust:
+  # Lint and test the Rust workspace in one job: clippy/fmt and the test build
+  # share a checkout, toolchain, and warm rust-cache, and a single job avoids
+  # two concurrent jobs racing to write the same cache. lint runs first, so a
+  # clippy/fmt failure still stops the job before the test compile (matching the
+  # old test-rust -> lint-rust dependency). The one gating change: test-workflows
+  # now waits on this whole job (lint + test) rather than the lint alone.
+  rust:
     strategy:
       fail-fast: false
       matrix:
@@ -47,7 +55,11 @@ jobs:
           # `cargo clippy` on cache restore. Disable bin caching here.
           cache-bin: false
       - uses: ./.github/actions/setup-libduckdb
+        with:
+          runtime-libpath: "true"   # cargo test dlopens libduckdb
+          cache-extensions: "true"
       - run: make lint-rust
+      - run: make test-rust
 
   test-python:
     needs: lint-python
@@ -59,6 +71,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true  # Python version comes from .python-version
       - run: make test-python
 
   test-control-plane-with-db:
@@ -71,54 +85,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
-      - name: Provision host Postgres (macOS)
+        with:
+          enable-cache: true  # Python version comes from .python-version
+      - uses: ./.github/actions/setup-host-postgres
         if: runner.os == 'macOS'
-        run: |
-          brew install postgresql@17
-          echo "$(brew --prefix postgresql@17)/bin" >> "$GITHUB_PATH"
-          export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
-          brew services start postgresql@17
-          for i in {1..30}; do pg_isready -h localhost -p 5432 && break; sleep 1; done
-          psql -d postgres -c "CREATE USER qiita WITH SUPERUSER PASSWORD 'qiita';"
-          psql -d postgres -c "CREATE DATABASE qiita_test OWNER qiita;"
-      - name: Configure host-postgres env (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          {
-            echo "QIITA_USE_HOST_POSTGRES=1"
-            echo "QIITA_TEST_POSTGRES_URL=postgresql://qiita:qiita@localhost:5432/qiita_test?sslmode=disable"
-            echo "PGHOST=localhost"
-            echo "PGPORT=5432"
-            echo "PGUSER=qiita"
-            echo "PGPASSWORD=qiita"
-          } >> "$GITHUB_ENV"
       - run: make test-control-plane-with-db
 
-  test-rust:
-    needs: lint-rust
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: qiita-data-plane
-          prefix-key: "v1"  # bump to invalidate stale bundled-feature cache
-          cache-bin: false  # see lint-rust for rationale
-      - uses: ./.github/actions/setup-libduckdb
-        with:
-          runtime-libpath: "true"
-          cache-extensions: "true"
-      - run: make test-rust
-
   test-integration:
-    needs: [test-python, test-rust]
+    needs: [test-python, rust]
     strategy:
       fail-fast: false
       matrix:
@@ -127,33 +101,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
-      - name: Provision host Postgres (macOS)
+        with:
+          enable-cache: true  # Python version comes from .python-version
+      - uses: ./.github/actions/setup-host-postgres
         if: runner.os == 'macOS'
-        run: |
-          brew install postgresql@17
-          echo "$(brew --prefix postgresql@17)/bin" >> "$GITHUB_PATH"
-          export PATH="$(brew --prefix postgresql@17)/bin:$PATH"
-          brew services start postgresql@17
-          for i in {1..30}; do pg_isready -h localhost -p 5432 && break; sleep 1; done
-          psql -d postgres -c "CREATE USER qiita WITH SUPERUSER PASSWORD 'qiita';"
-          psql -d postgres -c "CREATE DATABASE qiita_test OWNER qiita;"
-          psql -d postgres -c "CREATE DATABASE qiita_ducklake OWNER qiita;"
-      - name: Configure host-postgres env (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          {
-            echo "QIITA_USE_HOST_POSTGRES=1"
-            echo "QIITA_TEST_POSTGRES_URL=postgresql://qiita:qiita@localhost:5432/qiita_test?sslmode=disable"
-            echo "DUCKLAKE_CATALOG_CONNSTR=dbname=qiita_ducklake host=localhost port=5432 user=qiita password=qiita sslmode=disable"
-            echo "PGHOST=localhost"
-            echo "PGPORT=5432"
-            echo "PGUSER=qiita"
-            echo "PGPASSWORD=qiita"
-          } >> "$GITHUB_ENV"
+        with:
+          ducklake: "true"
       - run: make test-integration
 
   test-workflows:
-    needs: [lint-python, lint-rust]
+    needs: [lint-python, rust]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
