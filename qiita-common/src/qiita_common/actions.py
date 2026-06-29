@@ -78,6 +78,15 @@ FASTQ_PATH_CONTEXT_KEYS: tuple[str, str] = ("fastq_path", "reverse_fastq_path")
 # regardless of version), while the submitter pins its own version separately.
 READ_MASK_ACTION_ID = "read-mask"
 
+# The pool-scoped demux action's bare id (its YAML lives at
+# workflows/bcl-convert/<version>.yaml). One sequenced_pool-scoped work ticket
+# per pool demultiplexes the run and stores each sample's reads once. Defined
+# here so readers that key off it (e.g. the pool completion rollup's demux-state
+# query) import one canonical value instead of re-typing the literal. Bare id,
+# NOT a (id, version) pair: "did this pool's demux finish?" holds regardless of
+# which bcl-convert version produced it.
+BCL_CONVERT_ACTION_ID = "bcl-convert"
+
 
 class Audience(BaseModel):
     """Who may invoke this action — answers "may invoke", not "may execute".

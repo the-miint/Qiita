@@ -15,6 +15,16 @@ the `no-changelog` label).
 
 ### Added
 
+- Pool completion now reports **end-to-end processing**, not just host-masking.
+  `GET /sequencing-run/{R}/sequenced-pool/{P}/completion` (`qiita pool-completion`)
+  gains `demux_state` (the pool-scoped bcl-convert stage: completed / in_flight /
+  no_data / failed / not_submitted) and a computed `fully_processed` (demux
+  completed AND every sample's read-mask `complete`) — the single "this pool is
+  done and clean" signal. Also corrects the route/repo/`api_paths`/CLI docstrings,
+  which described the rollup as "fastq-to-parquet / prep-generation" though it has
+  measured **read-mask** (host-masking) since the read-storage/masking split. No
+  new route/migration; the `PoolCompletionStatus` response gains two fields. (#218)
+
 - Admin per-pool **masked-read export**: pull a sequenced_pool's masked sequence
   data to local disk, per sample, as parquet or fastq. New `qiita-admin
   masked-read-export --sequenced-pool-idx P --mask-idx M [--format parquet|fastq]
@@ -914,6 +924,19 @@ the `no-changelog` label).
   terminology-term read-back refs (#81)
 
 ### Fixed
+
+- `submit-host-filter-pool` no longer abandons the rest of a pool when one
+  sample's `POST /work-ticket` fails. The per-sample fan-out now isolates each
+  POST: a transient 5xx, a 409 in-flight, or a network blip is recorded and the
+  fan-out continues to the remaining samples, the summary lists every submitted
+  and failed sample, and the command exits non-zero if any failed — instead of
+  an uncaught raise silently stranding every later sample (those after the
+  failure in `sequenced_pool_item_id` order). New `--only-missing` flag submits
+  only samples that have no read-mask ticket yet (via a new `has_read_mask_ticket`
+  field on the pool- and run-scoped sequenced-sample list responses), so a pool
+  whose prior fan-out was interrupted can be filled in without duplicating
+  already-submitted work; off by default so a deliberate re-submit against a
+  different host reference still fans out pool-wide. (#218)
 
 - Deleting a sequenced_pool now purges the DuckLake data its prep_samples
   produced, not just the Postgres rows. `DELETE

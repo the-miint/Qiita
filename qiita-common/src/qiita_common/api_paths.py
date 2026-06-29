@@ -392,9 +392,10 @@ PATH_SEQUENCED_POOL_BY_IDX = "/{sequencing_run_idx}/sequenced-pool/{sequenced_po
 PATH_SEQUENCED_POOL_QC_REPORT = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/qc-report"
 )
-# GET the pool's prep-generation completion rollup: per-sample fastq-to-parquet
-# work-ticket state bucketed into completed / in-flight / failed / not-submitted
-# counts (the SPP GenPrepFileJob end-state equivalent).
+# GET the pool's end-to-end processing rollup: the demux (bcl-convert) stage
+# state plus per-sample read-mask (host-masking) state bucketed into completed /
+# in-flight / no-data / failed / not-submitted counts, with `complete` (host
+# masking) and `fully_processed` (demux + masking) flags.
 PATH_SEQUENCED_POOL_COMPLETION = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/completion"
 )
