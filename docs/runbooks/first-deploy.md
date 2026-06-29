@@ -101,18 +101,18 @@ This runbook references two scripts under `deploy/`. They share the
 same install logic; the difference is where the artifacts come from:
 
 - **`deploy/activate.sh`** — installs whatever's already in
-  `/opt/qiita/incoming/` (rsync target). Run by **CI** after CI builds
-  on a separate host and rsyncs the artifacts over. CI invokes it
-  directly: `sudo QIITA_HOSTNAME=... deploy/activate.sh`.
-- **`deploy/local-deploy.sh`** — the **manual / CI-less** entry point.
-  Run on the deploy host from a local git clone. It does the rsync
-  (after `git pull` + `make build-data-plane` as the operator account)
-  and then exec's `activate.sh`. First deploy uses this; ongoing manual
-  deploys also use this. Until CI exists, this is the only deploy path.
+  `/opt/qiita/incoming/` (the rsync target). It is the second half of a
+  deploy: `local-deploy.sh` / `redeploy.sh` stage the artifacts there and
+  then exec it. Not run by hand in the normal flow.
+- **`deploy/local-deploy.sh`** — the deploy entry point. Run on the
+  deploy host from a local git clone. It does the rsync (after `git pull`
+  + `make build-data-plane` as the operator account) and then exec's
+  `activate.sh`. First deploy and every ongoing deploy go through this.
 
-When CI lands, ongoing deploys move to it automatically; `local-deploy.sh`
-remains as the manual fallback (broken CI, hotfix from a feature
-branch, etc.).
+Deploys are run **manually on the host** — there is no CI or
+tag-triggered deploy path. `local-deploy.sh` (this first-deploy runbook)
+and `redeploy.sh` (the incremental [redeploy.md](redeploy.md) runbook)
+are the only ways production is updated.
 
 ## 0. Prerequisites
 
@@ -1133,6 +1133,7 @@ Env vars for `local-deploy.sh`:
 | `SKIP_PULL=1` | unset | Deploying a local feature branch, don't `git pull`. |
 | `SKIP_BUILD=1` | unset | Re-running after a non-build failure. |
 
-For CI: when CI is wired up, it builds on a build host and rsyncs to
-`/opt/qiita/incoming/`, then invokes `deploy/activate.sh` directly.
-`local-deploy.sh` is the manual equivalent of that pipeline.
+`local-deploy.sh` builds + rsyncs into `/opt/qiita/incoming/` and then
+exec's `deploy/activate.sh`, which does the install half. There is no CI
+deploy that bypasses it; the same script runs on both the first and
+every subsequent deploy.

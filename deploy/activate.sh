@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Stages /opt/qiita/incoming/ into /opt/qiita/, then reloads services.
 # Safe on first deploy: skips restarts when env files / TLS files are absent.
-# Invoked under sudo — directly by CI, or by deploy/local-deploy.sh.
+# Invoked under sudo — the install half a deploy exec's after staging
+# $INCOMING; deploy/local-deploy.sh is the normal caller.
 # See docs/runbooks/first-deploy.md for the surrounding flow.
 
 set -euo pipefail
@@ -14,8 +15,8 @@ require_root "deploy/activate.sh must be run as root (sudo)."
 
 INCOMING=/opt/qiita/incoming
 # Direct invocation guard: $INCOMING is normally populated by deploy/local-deploy.sh
-# or a CI rsync. If empty, the rsync below would fail with a confusing
-# "source missing" — fail fast with a useful message instead.
+# (or another stage-then-activate rsync). If empty, the rsync below would fail with
+# a confusing "source missing" — fail fast with a useful message instead.
 [ -d "$INCOMING/qiita-control-plane" ] || {
     echo "ERROR: $INCOMING is empty — run deploy/local-deploy.sh or rsync artifacts to $INCOMING first" >&2
     exit 1
@@ -118,9 +119,9 @@ rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$INCOMING/qiita-compute-orchestrator/"
 rsync -a --delete "${RSYNC_EXCLUDES[@]}" "$INCOMING/workflows/"                 /opt/qiita/workflows/
 
 # Build stamp for the CP landing footer. QIITA_BUILD_SHA is the FULL
-# deployed commit SHA, set by deploy/local-deploy.sh (from the git clone)
-# or by the CI deploy step (from GITHUB_SHA); this is the single site that
-# truncates it to the 7-char short form, so both paths render identically.
+# deployed commit SHA, set by deploy/local-deploy.sh (from the git clone);
+# this is the single site that truncates it to the 7-char short form, so the
+# footer SHA is consistently shaped.
 # build.env is in RSYNC_EXCLUDES (deploy/_common.sh), so the control-plane
 # rsync --delete above never wipes it and this write needn't be ordered
 # after the rsync; recreated every deploy, so it can never go stale.

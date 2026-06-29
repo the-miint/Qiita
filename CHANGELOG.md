@@ -984,6 +984,18 @@ the `no-changelog` label).
   instead of a bare `metadata_checklist_idx`, mirroring the missing-reason /
   terminology-term read-back refs (#81)
 
+### Removed
+
+- **`.github/workflows/deploy.yml`** — the unused `v*`-tag auto-deploy workflow.
+  It SSH'd to `$DEPLOY_HOST` and ran a real production deploy on any `v*` tag
+  push, but production has only ever deployed manually via `deploy/local-deploy.sh`
+  / `redeploy.sh` — so it was a latent footgun (a stray release tag could trigger
+  an unattended deploy onto a host that hadn't done the bucket 1–3 pre-steps).
+  Reconciled the now-contradictory deploy docs + script comments
+  (`docs/runbooks/first-deploy.md`, `docs/architecture.md`,
+  `deploy/{activate,local-deploy,build-sifs}.sh`) to state plainly that deploys
+  are manual and there is no CI/tag-triggered deploy path. (#233)
+
 ### Fixed
 
 - Integration-test harness: the `data_plane` fixture's gRPC-startup wait ceiling
