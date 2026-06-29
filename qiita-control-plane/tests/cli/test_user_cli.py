@@ -6,6 +6,7 @@ This file covers the user-CLI argparse wiring and per-subcommand
 dispatch.
 """
 
+import json
 import sqlite3
 import sys
 import types
@@ -3076,6 +3077,8 @@ def _pool_samples_body(samples):
             "prep_sample_idx": ps,
             "sequenced_pool_item_id": item,
             "human_filtering": entry[3] if len(entry) > 3 else None,
+            # 5th tuple entry → has_read_mask_ticket (default False = no ticket).
+            "has_read_mask_ticket": entry[4] if len(entry) > 4 else False,
         }
 
     return {
@@ -3106,7 +3109,9 @@ def _seq_run_body(*, sequencing_run_idx=3, instrument_model="NextSeq 550"):
     }
 
 
-def _run_submit_host_filter_pool(*, run=3, pool=5, rype=None, minimap2=None, force=False):
+def _run_submit_host_filter_pool(
+    *, run=3, pool=5, rype=None, minimap2=None, force=False, only_missing=False
+):
     from qiita_control_plane.cli.user import main
 
     argv = [
@@ -3122,6 +3127,8 @@ def _run_submit_host_filter_pool(*, run=3, pool=5, rype=None, minimap2=None, for
         argv += ["--host-minimap2-reference-idx", str(minimap2)]
     if force:
         argv += ["--force"]
+    if only_missing:
+        argv += ["--only-missing"]
     return main(argv)
 
 
@@ -3173,6 +3180,111 @@ def test_submit_host_filter_pool_fans_out_one_ticket_per_sample(monkeypatch, cap
         # Reads were stored by ingest; no fastq paths ride in the context.
         assert "fastq_path" not in ctx
         assert "reverse_fastq_path" not in ctx
+
+
+def test_submit_host_filter_pool_one_failure_does_not_strand_the_rest(monkeypatch, capsys):
+    """A 5xx on one sample's POST is recorded and the fan-out CONTINUES — every
+    other sample is still attempted (the fan-out-fragility fix). The command
+    exits non-zero and the printed summary lists the submitted and the failed
+    samples."""
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (
+                200,
+                _pool_samples_body(
+                    [
+                        (100, 1000, "10", True),
+                        (101, 1001, "11", True),
+                        (102, 1002, "12", True),
+                    ]
+                ),
+            ),
+            (200, _ref_active_body()),  # rype reference 7 (pre-flighted once)
+            (200, _both_indexes_body()),  # its index list
+            (200, _seq_run_body()),  # run metadata
+            (202, {"work_ticket_idx": 900}),  # sample 1000 → ok
+            (502, {"detail": "bad gateway"}),  # sample 1001 → transient 5xx
+            (202, {"work_ticket_idx": 902}),  # sample 1002 → ok (NOT stranded)
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        _run_submit_host_filter_pool(rype=7)
+    assert exc_info.value.code == 1
+
+    # All three samples were attempted — the 1001 failure did not abort 1002.
+    posts = [r for r in captured["requests"] if r["method"] == "POST"]
+    assert [p["json"]["scope_target"]["prep_sample_idx"] for p in posts] == [1000, 1001, 1002]
+
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["samples_submitted"] == 2
+    assert summary["samples_failed"] == 1
+    assert summary["samples_skipped_existing"] == 0
+    assert [f["prep_sample_idx"] for f in summary["failed"]] == [1001]
+    assert summary["failed"][0]["status_code"] == 502
+
+
+def test_submit_host_filter_pool_only_missing_skips_ticketed_samples(monkeypatch, capsys):
+    """--only-missing submits only samples with no existing read-mask ticket
+    (roster has_read_mask_ticket flag), so a re-run fills a partially-submitted
+    pool without duplicating the samples already handled."""
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (
+                200,
+                _pool_samples_body(
+                    [
+                        (100, 1000, "10", True, True),  # already ticketed → skip
+                        (101, 1001, "11", True, False),  # missing → submit
+                        (102, 1002, "12", True, True),  # already ticketed → skip
+                    ]
+                ),
+            ),
+            (200, _ref_active_body()),
+            (200, _both_indexes_body()),
+            (200, _seq_run_body()),
+            (202, {"work_ticket_idx": 900}),  # only the one missing sample
+        ],
+    )
+
+    rc = _run_submit_host_filter_pool(rype=7, only_missing=True)
+    assert rc == 0
+
+    posts = [r for r in captured["requests"] if r["method"] == "POST"]
+    assert [p["json"]["scope_target"]["prep_sample_idx"] for p in posts] == [1001]
+
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["samples_submitted"] == 1
+    assert summary["samples_skipped_existing"] == 2
+    assert summary["samples_failed"] == 0
+
+
+def test_submit_host_filter_pool_only_missing_all_present_no_posts(monkeypatch, capsys):
+    """--only-missing on a fully-ticketed pool submits nothing and exits 0."""
+    captured: dict = {}
+    _stub_multi_response(
+        monkeypatch,
+        captured,
+        responses=[
+            (
+                200,
+                _pool_samples_body([(100, 1000, "10", True, True), (101, 1001, "11", True, True)]),
+            ),
+        ],
+    )
+
+    rc = _run_submit_host_filter_pool(rype=7, only_missing=True)
+    assert rc == 0
+    assert [r for r in captured["requests"] if r["method"] == "POST"] == []
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["samples_submitted"] == 0
+    assert summary["samples_skipped_existing"] == 2
 
 
 def test_submit_host_filter_pool_two_reference_forwards_both(monkeypatch):

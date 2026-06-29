@@ -19,7 +19,7 @@ from datetime import datetime
 from typing import Any
 
 import asyncpg
-from qiita_common.actions import READ_MASK_ACTION_ID
+from qiita_common.actions import BCL_CONVERT_ACTION_ID, READ_MASK_ACTION_ID
 from qiita_common.models import Platform
 
 
@@ -440,17 +440,19 @@ async def fetch_sequenced_pool_completion(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     sequenced_pool_idx: int,
 ) -> asyncpg.Record:
-    """Return the pool's prep-generation completion rollup: counts of its
-    non-retired sequenced_samples bucketed by the state of their fastq-to-parquet
+    """Return the pool's host-masking completion rollup: counts of its
+    non-retired sequenced_samples bucketed by the state of their read-mask
     work tickets (any version). Always returns one row (aggregate over zero rows
     is a single all-zero row), so a zero-sample / missing pool reads as all-zero
     counts — the caller still 404s a missing pool via require_sequenced_pool_in_run.
+    (The demux/bcl-convert stage is reported separately by
+    fetch_sequenced_pool_demux_state.)
 
     Per-sample classification mirrors qiita_common.models.PoolCompletionStatus
     (precedence completed > in_flight > no_data > failed > not_submitted),
     computed in two layers:
 
-      `sample_state` LEFT-JOINs each non-retired sample to its fastq-to-parquet
+      `sample_state` LEFT-JOINs each non-retired sample to its read-mask
       tickets and folds them with bool_or aggregates (NULL over a sample with no
       ticket, so `ticket_count = 0` cleanly identifies not_submitted). The outer
       aggregate then tallies the mutually-exclusive buckets with FILTERs that
@@ -462,9 +464,9 @@ async def fetch_sequenced_pool_completion(
     doesn't get stuck in the failed bucket (and `complete` can still fire).
 
     The action_id is matched on its bare id (passed as a bound param from the
-    shared FASTQ_TO_PARQUET_ACTION_ID, the same constant the submitter mints
-    against), NOT pinned to a version: the submitter chooses the fastq-to-parquet
-    version, and "this sample's fastq→parquet finished" holds regardless of which
+    shared READ_MASK_ACTION_ID, the same constant the submit-host-filter-pool
+    gesture mints against), NOT pinned to a version: the submitter chooses the
+    read-mask version, and "this sample got masked" holds regardless of which
     version produced it (consistent with the read-metric / QC rollups, which read
     persisted columns irrespective of the writing version). The inlined state
     literals are pinned to qiita_common.models.WorkTicketState ('completed' /
@@ -503,6 +505,45 @@ async def fetch_sequenced_pool_completion(
         sequenced_pool_idx,
         READ_MASK_ACTION_ID,
     )
+
+
+async def fetch_sequenced_pool_demux_state(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    sequenced_pool_idx: int,
+) -> str:
+    """Return the pool's demux (bcl-convert) stage state, one of
+    'completed' / 'in_flight' / 'no_data' / 'failed' / 'not_submitted'.
+
+    bcl-convert is sequenced_pool-scoped (one ticket per pool, occasionally more
+    if a force re-submit landed a second), so this folds every bcl-convert ticket
+    on the pool with bool_or aggregates and applies the same precedence the
+    per-sample read-mask rollup uses (completed > in_flight > no_data > failed),
+    falling back to 'not_submitted' when the pool has no bcl-convert ticket at
+    all. Matched on the bare BCL_CONVERT_ACTION_ID (version-agnostic — "did this
+    pool's demux finish?" holds regardless of which version produced it). The
+    state literals are pinned to qiita_common.models.WorkTicketState; keep them
+    in lockstep if that enum changes."""
+    row = await pool_or_conn.fetchrow(
+        "SELECT"
+        "  bool_or(state = 'completed') AS has_completed,"
+        "  bool_or(state IN ('pending', 'queued', 'processing')) AS has_in_flight,"
+        "  bool_or(state = 'no_data') AS has_no_data,"
+        "  bool_or(state = 'failed') AS has_failed,"
+        "  count(*) AS ticket_count"
+        " FROM qiita.work_ticket"
+        " WHERE sequenced_pool_idx = $1 AND action_id = $2",
+        sequenced_pool_idx,
+        BCL_CONVERT_ACTION_ID,
+    )
+    if row["has_completed"]:
+        return "completed"
+    if row["has_in_flight"]:
+        return "in_flight"
+    if row["has_no_data"]:
+        return "no_data"
+    if row["has_failed"]:
+        return "failed"
+    return "not_submitted"
 
 
 async def fetch_sequenced_pool_created_by(

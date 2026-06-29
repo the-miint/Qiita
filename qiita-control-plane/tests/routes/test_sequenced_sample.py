@@ -1629,6 +1629,9 @@ async def _seed_pool_sample(ctx, *, run_idx, pool_idx, study_idx, protocol_idx, 
         # the route can't parse an intent and degrades human_filtering to null per
         # sample (see test_list_pool_samples_unparseable_preflight_degrades_to_null).
         "human_filtering": None,
+        # A freshly seeded sample has no work tickets, so both list routes report
+        # has_read_mask_ticket False.
+        "has_read_mask_ticket": False,
     }
 
 

@@ -17,7 +17,10 @@ import uuid
 import pytest
 import pytest_asyncio
 
-from qiita_control_plane.repositories.sequencing_run import fetch_sequenced_pool_completion
+from qiita_control_plane.repositories.sequencing_run import (
+    fetch_sequenced_pool_completion,
+    fetch_sequenced_pool_demux_state,
+)
 from qiita_control_plane.testing.db_seeds import (
     seed_biosample_with_sequenced_prep_sample,
     seed_user_principal,
@@ -60,6 +63,23 @@ async def pool_ctx(postgres_pool):
         "          $3::jsonb, '{}'::jsonb, '[]'::jsonb, 1, 1, '1 minute', 'active', 'failed')",
         action_id,
         action_version,
+        json.dumps({"service": False, "human_roles": ["user"]}),
+    )
+    # A bcl-convert action row so a pool-scoped demux work_ticket's FK resolves.
+    # target_processing_kinds must be empty for a non-prep_sample target_kind
+    # (action_processing_kinds_only_for_prep_sample CHECK).
+    bcl_action_id = "bcl-convert"
+    bcl_action_version = f"v-{uuid.uuid4()}"
+    await postgres_pool.execute(
+        "INSERT INTO qiita.action ("
+        "  action_id, version, target_kind, target_processing_kinds,"
+        "  scopes, audience, context_schema, steps,"
+        "  cpu_ceiling, mem_ceiling_gb, walltime_ceiling, success_status, failure_status"
+        ") VALUES ($1, $2, 'sequenced_pool'::qiita.scope_target_kind,"
+        "          ARRAY[]::qiita.processing_kind[], ARRAY['prep_sample:write']::text[],"
+        "          $3::jsonb, '{}'::jsonb, '[]'::jsonb, 1, 1, '1 minute', 'active', 'failed')",
+        bcl_action_id,
+        bcl_action_version,
         json.dumps({"service": False, "human_roles": ["user"]}),
     )
 
@@ -110,11 +130,33 @@ async def pool_ctx(postgres_pool):
             "test failure" if failed else None,
         )
 
+    async def add_demux_ticket(state):
+        # The pool-scoped bcl-convert ticket (sequenced_pool scope target).
+        failed = state == "failed"
+        await postgres_pool.execute(
+            "INSERT INTO qiita.work_ticket"
+            "  (action_id, action_version, originator_principal_idx,"
+            "   scope_target_kind, sequenced_pool_idx, state,"
+            "   failure_type, failure_stage, failure_reason)"
+            " VALUES ($1, $2, $3, 'sequenced_pool'::qiita.scope_target_kind, $4,"
+            "         $5::qiita.work_ticket_state,"
+            "         $6::qiita.failure_type, $7::qiita.work_ticket_failure_stage, $8)",
+            bcl_action_id,
+            bcl_action_version,
+            owner_idx,
+            pool_idx,
+            state,
+            "permanent" if failed else None,
+            "finalize" if failed else None,
+            "test failure" if failed else None,
+        )
+
     yield {
         "pool": postgres_pool,
         "pool_idx": pool_idx,
         "add_sample": add_sample,
         "add_ticket": add_ticket,
+        "add_demux_ticket": add_demux_ticket,
     }
 
     await postgres_pool.execute(
@@ -122,12 +164,22 @@ async def pool_ctx(postgres_pool):
         action_id,
         action_version,
     )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.work_ticket WHERE action_id = $1 AND action_version = $2",
+        bcl_action_id,
+        bcl_action_version,
+    )
     for _bs, _ps, ss_idx in samples:
         await postgres_pool.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss_idx)
     await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
     await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
     await postgres_pool.execute(
         "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2", action_id, action_version
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.action WHERE action_id = $1 AND version = $2",
+        bcl_action_id,
+        bcl_action_version,
     )
     for _bs, ps_idx, _ss in samples:
         await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", ps_idx)
@@ -260,3 +312,35 @@ async def test_retired_sample_excluded(pool_ctx):
     row = await fetch_sequenced_pool_completion(pool_ctx["pool"], pool_ctx["pool_idx"])
     assert row["sample_count"] == 1
     assert row["samples_completed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# fetch_sequenced_pool_demux_state — the pool-scoped bcl-convert stage
+# ---------------------------------------------------------------------------
+
+
+async def test_demux_state_not_submitted_without_ticket(pool_ctx):
+    """A pool with no bcl-convert ticket reads as not_submitted."""
+    state = await fetch_sequenced_pool_demux_state(pool_ctx["pool"], pool_ctx["pool_idx"])
+    assert state == "not_submitted"
+
+
+async def test_demux_state_completed(pool_ctx):
+    await pool_ctx["add_demux_ticket"]("completed")
+    state = await fetch_sequenced_pool_demux_state(pool_ctx["pool"], pool_ctx["pool_idx"])
+    assert state == "completed"
+
+
+async def test_demux_state_failed(pool_ctx):
+    await pool_ctx["add_demux_ticket"]("failed")
+    state = await fetch_sequenced_pool_demux_state(pool_ctx["pool"], pool_ctx["pool_idx"])
+    assert state == "failed"
+
+
+async def test_demux_state_completed_wins_over_failed(pool_ctx):
+    """A force re-submit can leave a stale FAILED bcl-convert beside a COMPLETED
+    one; completed outranks failed (precedence), so the pool reads completed."""
+    await pool_ctx["add_demux_ticket"]("failed")
+    await pool_ctx["add_demux_ticket"]("completed")
+    state = await fetch_sequenced_pool_demux_state(pool_ctx["pool"], pool_ctx["pool_idx"])
+    assert state == "completed"

@@ -34,6 +34,7 @@ from qiita_common.models import StepType, WorkTicketFailureStage
 from qiita_control_plane.runner import (
     _attempt_is_unowned,
     _escalated_mem_floor_after_oom,
+    _escalated_walltime_after_timeout,
     _resolve_baseline_for_step,
 )
 
@@ -349,6 +350,148 @@ def test_escalation_full_sequence_to_ceiling():
         )
         trajectory.append(floor)
     assert trajectory == [64, 128, 128, 128]
+
+
+# =============================================================================
+# Per-run walltime override — raise-only floor, ceiling-bounded
+# =============================================================================
+
+
+def test_walltime_override_raises_floor_above_baseline():
+    """An override above the YAML baseline raises walltime; cpu/mem_gb/gpu
+    are untouched."""
+    step = _step(BaselineResources(cpu=4, mem_gb=8, walltime=timedelta(hours=1), gpu=1))
+    resolved = _resolve_baseline_for_step(
+        entry=step, bound={}, action_ceiling=_CEILING, walltime_override=timedelta(hours=4)
+    )
+    assert resolved == FlatBaselineResources(cpu=4, mem_gb=8, walltime=timedelta(hours=4), gpu=1)
+
+
+def test_walltime_override_below_baseline_is_noop():
+    """Raise-only: an override smaller than the step's baseline never lowers
+    a step the YAML sized higher."""
+    step = _step(BaselineResources(cpu=8, mem_gb=32, walltime=timedelta(hours=6)))
+    resolved = _resolve_baseline_for_step(
+        entry=step, bound={}, action_ceiling=_CEILING, walltime_override=timedelta(hours=2)
+    )
+    assert resolved.walltime == timedelta(hours=6)
+
+
+def test_walltime_override_none_leaves_baseline_verbatim():
+    step = _step(BaselineResources(cpu=4, mem_gb=8, walltime=timedelta(hours=1)))
+    resolved = _resolve_baseline_for_step(
+        entry=step, bound={}, action_ceiling=_CEILING, walltime_override=None
+    )
+    assert resolved.walltime == timedelta(hours=1)
+
+
+def test_walltime_override_applies_to_lookup_population(tmp_path: Path):
+    """The override applies after the profile is resolved, not just to flat."""
+    lookup_file = tmp_path / "instrument_model"
+    lookup_file.write_text("Illumina iSeq 100", encoding="utf-8")
+    step = _lookup_step()
+    # iSeq profile asks walltime=3h; floor raises it to 5h.
+    resolved = _resolve_baseline_for_step(
+        entry=step,
+        bound={"instrument_model": str(lookup_file)},
+        action_ceiling=_CEILING,
+        walltime_override=timedelta(hours=5),
+    )
+    assert resolved.walltime == timedelta(hours=5)
+
+
+def test_walltime_override_above_ceiling_is_rejected():
+    """Defense in depth: an override above the ceiling is rejected at dispatch
+    (the submission route already 422s it earlier)."""
+    step = _step(BaselineResources(cpu=4, mem_gb=8, walltime=timedelta(hours=1)), name="over")
+    tight = ActionCeiling(cpu=32, mem_gb=512, walltime=timedelta(hours=4), gpu=4)
+    with pytest.raises(BackendFailure) as ei:
+        _resolve_baseline_for_step(
+            entry=step, bound={}, action_ceiling=tight, walltime_override=timedelta(hours=8)
+        )
+    exc = ei.value
+    assert exc.kind == FailureKind.CONTRACT_VIOLATION
+    assert exc.step_name == "over"
+    assert "walltime" in exc.reason and "exceeds" in exc.reason
+
+
+# =============================================================================
+# TIMEOUT walltime escalation — grow the floor on each TIMEOUT retry, clamped
+# =============================================================================
+
+# The qc shape the escalation was written for: 2h baseline, 8h action ceiling.
+# Doubling reaches the ceiling in two TIMEOUT retries.
+_QC_CEILING = ActionCeiling(cpu=8, mem_gb=32, walltime=timedelta(hours=8), gpu=0)
+
+
+def _qc_step() -> WorkflowStep:
+    return _step(BaselineResources(cpu=4, mem_gb=12, walltime=timedelta(hours=2)), name="qc")
+
+
+def test_walltime_escalation_doubles_from_baseline_when_no_override():
+    """First TIMEOUT with no prior override grows the resolved baseline ×2."""
+    floor = _escalated_walltime_after_timeout(
+        entry=_qc_step(),
+        bound={},
+        action_ceiling=_QC_CEILING,
+        current_override=None,
+    )
+    assert floor == timedelta(hours=4)
+
+
+def test_walltime_escalation_doubles_from_current_override_floor():
+    """The grow is relative to what the failed attempt actually ran at —
+    max(baseline, current_override) — not the raw baseline."""
+    floor = _escalated_walltime_after_timeout(
+        entry=_qc_step(),
+        bound={},
+        action_ceiling=_QC_CEILING,
+        current_override=timedelta(hours=3),
+    )
+    # resolved = max(2h, 3h) = 3h; 3h * 2 = 6h, under the 8h ceiling.
+    assert floor == timedelta(hours=6)
+
+
+def test_walltime_escalation_clamps_to_action_ceiling():
+    floor = _escalated_walltime_after_timeout(
+        entry=_qc_step(),
+        bound={},
+        action_ceiling=_QC_CEILING,
+        current_override=timedelta(hours=6),
+    )
+    # 6h * 2 = 12h, clamped down to the 8h ceiling.
+    assert floor == timedelta(hours=8)
+
+
+def test_walltime_escalation_at_ceiling_keeps_current_override():
+    """Once resolved walltime is at the ceiling there is no headroom: keep the
+    current floor so the retry still runs at the ceiling (not back to baseline)."""
+    floor = _escalated_walltime_after_timeout(
+        entry=_qc_step(),
+        bound={},
+        action_ceiling=_QC_CEILING,
+        current_override=timedelta(hours=8),
+    )
+    assert floor == timedelta(hours=8)
+
+
+def test_walltime_escalation_full_sequence_to_ceiling():
+    """End-to-end floor trajectory across successive TIMEOUT retries: a 2h
+    baseline climbs 4h → 8h and then pins at the 8h ceiling."""
+    step, bound = _qc_step(), {}
+    floor = None
+    trajectory = []
+    for _ in range(4):
+        floor = _escalated_walltime_after_timeout(
+            entry=step, bound=bound, action_ceiling=_QC_CEILING, current_override=floor
+        )
+        trajectory.append(floor)
+    assert trajectory == [
+        timedelta(hours=4),
+        timedelta(hours=8),
+        timedelta(hours=8),
+        timedelta(hours=8),
+    ]
 
 
 def test_attempt_is_unowned():
