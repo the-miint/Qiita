@@ -19,6 +19,38 @@ _None yet._
 
 ### 2. One-time host setup
 
+_None yet._
+
+### 3. Migrations
+
+_None yet._
+
+### 4. Deploy
+
+_None yet._
+
+### 5. Verify
+
+_None yet._
+
+### Notes (no host action)
+
+_None yet._
+
+---
+
+## Deployed history
+
+Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
+
+### Deployed 2026-06-29 — d93cccb
+
+#### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
+
+_None yet._
+
+#### 2. One-time host setup
+
 - **PRE-CHECK before the bucket-3 `20260628000000` migration.** That migration
   builds a UNIQUE index on `(sequencing_run_idx, sha256(run_preflight_blob))`,
   which **fails** if any run already holds two pools with byte-identical
@@ -38,7 +70,7 @@ _None yet._
   (The known run-15 duplicate — pools 25013/25014 — is being remediated
   separately; this pre-check is the backstop that catches it or any other.)
 
-### 3. Migrations
+#### 3. Migrations
 
 - `20260628000000_sequenced_pool_content_hash.sql` — adds the
   `run_preflight_sha256` STORED generated column and the
@@ -48,11 +80,11 @@ _None yet._
   pools). Additive; no backfill (the generated column computes in-DB for every
   row). (#206)
 
-### 4. Deploy
+#### 4. Deploy
 
 _None yet._
 
-### 5. Verify
+#### 5. Verify
 
 - Confirm the raised `qc` walltime ceiling synced into `qiita.action` for both
   actions that run the step (so the new PT4H `qc` baseline and its PT8H escalation
@@ -70,7 +102,7 @@ _None yet._
   # expect: 1
   ```
 
-### Notes (no host action)
+#### Notes (no host action)
 
 - `qc` step walltime raised + new TIMEOUT walltime escalation. In both
   `read-mask/1.0.0` and `fastq-to-parquet/1.3.0` the `qc` step's
@@ -97,12 +129,6 @@ _None yet._
   migrate→restart window a same-content/renamed-file POST can hit a transient,
   fail-safe 500 on the pre-restart CP (no duplicate created); the restarted CP
   serves it as a 200 reuse. No new env var, host dir, scope, or SIF.
-
----
-
-## Deployed history
-
-Archived `## Pending deploy` blocks, newest on top, each stamped with deploy date + the commit deployed. Populated by `/deploy-archive` at deploy time.
 
 ### Deployed 2026-06-28 — 7fa0bb9
 
