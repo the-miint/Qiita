@@ -943,6 +943,14 @@ the `no-changelog` label).
 
 ### Fixed
 
+- Integration-test harness: the `data_plane` fixture's gRPC-startup wait ceiling
+  is raised from 10s to 30s (override via `QIITA_DP_START_TIMEOUT_S`), fixing an
+  intermittent `test-integration` setup failure where the first module to use the
+  fixture paid the coldest start (catalog reset → boot → load DuckDB + miint →
+  create DuckLake tables) and occasionally exceeded the old window on a loaded CI
+  runner. The poll still returns the instant the port opens, so the higher ceiling
+  costs nothing on success; the timeout message now names the pid/port and is
+  honest about the actual timeout instead of a hardcoded "10s". (#202)
 - A transient control-plane **Postgres** error on the workflow runner's own DB
   calls — most often a per-statement `command_timeout` (a bare
   `asyncio.TimeoutError`) on the poll loop's force-fail check under a lock wait /
