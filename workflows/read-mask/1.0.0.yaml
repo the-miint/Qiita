@@ -106,7 +106,9 @@ steps:
     baseline_resources:
       cpu: 4
       mem_gb: 12
-      walltime: PT2H
+      # First-attempt walltime; a TIMEOUT retry escalates it ×2 toward the
+      # action_ceiling walltime below (the runner's walltime floor escalation).
+      walltime: PT4H
 
   # Merge host hits into the qc_mask and emit the final read_mask. Consumes the
   # full `reads` (host classify runs on the trimmed QC-pass subset) and `qc_mask`.
@@ -149,4 +151,4 @@ steps:
 action_ceiling:
   cpu: 8
   mem_gb: 32
-  walltime: PT4H
+  walltime: PT8H

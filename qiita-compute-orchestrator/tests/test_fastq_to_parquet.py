@@ -31,6 +31,7 @@ import pytest
 from qiita_common.backend_failure import StepNoData
 
 import qiita_compute_orchestrator.jobs.fastq_to_parquet as fastq_module
+import qiita_compute_orchestrator.sequence_range_retry as retry_module
 from qiita_compute_orchestrator.jobs.fastq_to_parquet import (
     YAML_STEP_NAME,
     Inputs,
@@ -543,19 +544,35 @@ def test_execute_maps_401_to_contract_violation(monkeypatch, tmp_path):
     assert "compute-service-account-provisioning" in ei.value.reason
 
 
-def test_execute_maps_5xx_to_unknown_permanent(monkeypatch, tmp_path):
-    """HTTP 5xx from CP (CP DB error, infra blip) -> UNKNOWN_PERMANENT.
-    Conservative today; a follow-up could add a retriable
-    CP_UNREACHABLE FailureKind."""
+@pytest.fixture
+def no_backoff(monkeypatch):
+    """Zero the CP-callback retry backoff so the retry tests don't sleep."""
+    monkeypatch.setattr(retry_module, "CP_RETRY_BACKOFF_BASE_S", 0)
+
+
+def _status_error(status: int):
     import httpx
+
+    request = httpx.Request("POST", "http://cp.test/api/v1/sequence-range")
+    return httpx.HTTPStatusError(
+        f"HTTP {status}", request=request, response=httpx.Response(status, request=request)
+    )
+
+
+def test_execute_maps_exhausted_5xx_to_control_plane_unreachable(monkeypatch, no_backoff, tmp_path):
+    """A persistent HTTP 5xx on the mint callback is retried in-job and, once
+    exhausted, maps to RETRIABLE CONTROL_PLANE_UNREACHABLE — not the old
+    permanent classification — so the runner re-dispatches rather than failing
+    the ingest over an infra blip."""
     from qiita_common.backend_failure import BackendFailure, FailureKind
 
-    err = httpx.HTTPStatusError(
-        "Internal Server Error",
-        request=httpx.Request("POST", "http://cp.test/api/v1/sequence-range"),
-        response=httpx.Response(503, content=b"service unavailable"),
-    )
-    _make_failing_mint(monkeypatch, err)
+    calls: list[int] = []
+
+    async def _raise_503(*, http, prep_sample_idx, count):
+        calls.append(prep_sample_idx)
+        raise _status_error(503)
+
+    monkeypatch.setattr(fastq_module, "mint_sequence_range", _raise_503)
 
     with pytest.raises(BackendFailure) as ei:
         _run(
@@ -563,6 +580,59 @@ def test_execute_maps_5xx_to_unknown_permanent(monkeypatch, tmp_path):
             tmp_path / "ws",
         )
 
-    assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
+    assert len(calls) == retry_module.CP_RETRY_MAX_ATTEMPTS  # retried, not failed on attempt 1
+    assert ei.value.kind is FailureKind.CONTROL_PLANE_UNREACHABLE
+    assert ei.value.transient is True
     assert ei.value.step_name == YAML_STEP_NAME
     assert "HTTP 503" in ei.value.reason
+
+
+def test_execute_maps_transport_error_to_control_plane_unreachable(
+    monkeypatch, no_backoff, tmp_path
+):
+    """A pure transport error (connection reset / read timeout) — which never
+    reaches raise_for_status and previously escaped the handler entirely,
+    classifying permanent downstream — now maps to retriable
+    CONTROL_PLANE_UNREACHABLE."""
+    import httpx
+    from qiita_common.backend_failure import BackendFailure, FailureKind
+
+    _make_failing_mint(monkeypatch, httpx.ConnectError("connection reset"))
+
+    with pytest.raises(BackendFailure) as ei:
+        _run(
+            Inputs(fastq_path=_minimal_fastq(tmp_path), prep_sample_idx=42, work_ticket_idx=1),
+            tmp_path / "ws",
+        )
+
+    assert ei.value.kind is FailureKind.CONTROL_PLANE_UNREACHABLE
+    assert ei.value.transient is True
+    assert ei.value.step_name == YAML_STEP_NAME
+    assert "transport error (ConnectError)" in ei.value.reason
+
+
+def test_execute_transient_5xx_on_mint_self_heals(monkeypatch, no_backoff, tmp_path):
+    """Two transient 5xx blips then success: the in-job retry self-heals and the
+    step writes its reads against the eventually-minted range — never failing."""
+    calls: list[int] = []
+
+    async def _flaky(*, http, prep_sample_idx, count):
+        calls.append(prep_sample_idx)
+        if len(calls) <= 2:
+            raise _status_error(502)
+        return MintedSequenceRange(
+            prep_sample_idx=prep_sample_idx,
+            sequence_idx_start=1000,
+            sequence_idx_stop=1000 + count - 1,
+        )
+
+    monkeypatch.setattr(fastq_module, "mint_sequence_range", _flaky)
+
+    outputs = _run(
+        Inputs(fastq_path=_three_read_fastq(tmp_path), prep_sample_idx=42, work_ticket_idx=1),
+        tmp_path / "ws",
+    )
+
+    assert len(calls) == 3  # two retries + the successful attempt
+    rows = _read_parquet(outputs["reads"])
+    assert [r[0] for r in rows] == [1000, 1001, 1002]
