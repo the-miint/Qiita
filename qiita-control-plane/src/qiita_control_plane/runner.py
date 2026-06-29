@@ -679,6 +679,10 @@ async def _run_entry_with_retry(
         allocation. Both escalated floors are process-local (not persisted): a
         CP restart re-attaches to the in-flight job and re-escalates (memory
         from the ticket's static override, walltime from the YAML baseline).
+        Once a floor is already pinned at the ceiling, escalation can't grow it
+        — a re-run would fail identically — so the OOM/TIMEOUT is reclassified
+        as a permanent `RESOURCE_CEILING_EXHAUSTED` and fails the ticket
+        immediately instead of consuming the remaining retry budget.
       * On permanent failure or retry_count >= max_retries: re-raise so
         the outer handler in `run_workflow` writes the failure_* columns
         and transitions to FAILED.
@@ -786,22 +790,63 @@ async def _run_entry_with_retry(
             # Steps only — `action:` entries carry no baseline_resources and
             # never OOM-kill. Other transient kinds retry at the same size.
             if exc.kind is FailureKind.OOM_KILLED and isinstance(entry, WorkflowStep):
-                effective_mem_override = _escalated_mem_floor_after_oom(
+                grown = _escalated_mem_floor_after_oom(
                     entry=entry,
                     bound=bound,
                     action_ceiling=action_ceiling,
                     current_override=effective_mem_override,
                 )
+                if grown == effective_mem_override:
+                    # The just-failed attempt already ran at the memory ceiling
+                    # (escalation returns the floor unchanged once it is pinned
+                    # there), so there is no larger size left to try — a re-run
+                    # would OOM identically. Fail-fast with a permanent kind
+                    # (see `_ceiling_exhausted_failure`) rather than burn the
+                    # remaining retry budget on a guaranteed repeat.
+                    _log.warning(
+                        "work_ticket %d step %r OOM-killed at the action memory "
+                        "ceiling (%d GB); escalation exhausted, failing instead "
+                        "of retrying at the same size",
+                        work_ticket_idx,
+                        entry.name,
+                        action_ceiling.mem_gb,
+                    )
+                    raise _ceiling_exhausted_failure(
+                        exc,
+                        event="OOM-killed",
+                        axis="memory",
+                        ceiling=f"{action_ceiling.mem_gb} GB",
+                    ) from exc
+                effective_mem_override = grown
             # A timed-out step needs more wall to finish, not a re-run at the same
             # limit; grow its walltime floor (clamped to the action ceiling) before
             # re-queuing. Steps only — `action:` entries carry no baseline_resources.
             if exc.kind is FailureKind.TIMEOUT_BEFORE_START and isinstance(entry, WorkflowStep):
-                effective_walltime_override = _escalated_walltime_after_timeout(
+                grown_walltime = _escalated_walltime_after_timeout(
                     entry=entry,
                     bound=bound,
                     action_ceiling=action_ceiling,
                     current_override=effective_walltime_override,
                 )
+                if grown_walltime == effective_walltime_override:
+                    # Already pinned at the walltime ceiling — a re-run would time
+                    # out identically. Same fail-fast reclassification as the OOM
+                    # arm above (see its comment for the rationale).
+                    _log.warning(
+                        "work_ticket %d step %r timed out at the action walltime "
+                        "ceiling (%s); escalation exhausted, failing instead of "
+                        "retrying at the same limit",
+                        work_ticket_idx,
+                        entry.name,
+                        action_ceiling.walltime,
+                    )
+                    raise _ceiling_exhausted_failure(
+                        exc,
+                        event="timed out",
+                        axis="walltime",
+                        ceiling=str(action_ceiling.walltime),
+                    ) from exc
+                effective_walltime_override = grown_walltime
             _log.warning(
                 "work_ticket %d step %r transient failure (%s); retrying %d/%d "
                 "(mem_gb floor=%s, walltime floor=%s)",
@@ -2444,6 +2489,34 @@ def _resolve_baseline_for_step(
     return resolved
 
 
+def _ceiling_exhausted_failure(
+    cause: BackendFailure, *, event: str, axis: str, ceiling: str
+) -> BackendFailure:
+    """Build the permanent ``RESOURCE_CEILING_EXHAUSTED`` failure the retry loop
+    raises when a step's OOM/timeout escalation is already pinned at the action
+    ceiling — a re-run would fail identically, so fail-fast instead of burning
+    the retry budget. ``event`` is the human verb (``"OOM-killed"`` /
+    ``"timed out"``), ``axis`` the resource word (``"memory"`` / ``"walltime"``),
+    ``ceiling`` its rendered value (e.g. ``"32 GB"`` / ``"4:00:00"``).
+
+    Single home for both escalation arms so a future third resource axis can't
+    copy-paste a drifting third reason string. Reuses the cause's stage /
+    step_name (rather than reconstructing from ``entry.name``) so the new
+    failure satisfies the same STEP_RUN ⇔ step_name DB CHECK the original
+    already did, with no risk of a stage/step_name desync.
+    """
+    return BackendFailure(
+        kind=FailureKind.RESOURCE_CEILING_EXHAUSTED,
+        stage=cause.stage,
+        step_name=cause.step_name,
+        reason=(
+            f"step {event} at the action {axis} ceiling ({ceiling}); {axis} "
+            f"escalation exhausted, not retrying. Raise the action {axis} ceiling "
+            f"or shrink the input. Original: {cause.reason}"
+        ),
+    )
+
+
 # Growth factor applied to a step's resolved memory on each OOM_KILLED retry.
 # A step the scheduler OOM-killed will OOM again at the same size, so doubling
 # — clamped to the action's mem ceiling — is the only retry that can fit.
@@ -2475,8 +2548,10 @@ def _escalated_mem_floor_after_oom(
         mem_gb_override=current_override,
     )
     grown = min(resolved.mem_gb * _OOM_MEMORY_GROWTH, action_ceiling.mem_gb)
-    # No headroom left (already at the ceiling): keep the current floor so the
-    # retry still runs at the ceiling rather than dropping back to baseline.
+    # No headroom left (already at the ceiling): return `current_override`
+    # unchanged. The caller treats an unchanged floor as the saturation signal
+    # — there is no larger size to retry at, so it fails the ticket permanently
+    # rather than re-running at the same (guaranteed-to-OOM) size.
     return grown if grown > resolved.mem_gb else current_override
 
 
@@ -2515,8 +2590,10 @@ def _escalated_walltime_after_timeout(
         walltime_override=current_override,
     )
     grown = min(resolved.walltime * _TIMEOUT_WALLTIME_GROWTH, action_ceiling.walltime)
-    # No headroom left (already at the ceiling): keep the current floor so the
-    # retry still runs at the ceiling rather than dropping back to baseline.
+    # No headroom left (already at the ceiling): return `current_override`
+    # unchanged. The caller treats an unchanged floor as the saturation signal
+    # — there is no longer limit to retry at, so it fails the ticket permanently
+    # rather than re-running at the same (guaranteed-to-time-out) limit.
     return grown if grown > resolved.walltime else current_override
 
 

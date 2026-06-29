@@ -327,8 +327,10 @@ def test_escalation_clamps_to_action_ceiling():
 
 
 def test_escalation_at_ceiling_keeps_current_override():
-    """Once resolved memory is at the ceiling there is no headroom: keep the
-    current floor so the retry still runs at the ceiling (not back to baseline)."""
+    """Once resolved memory is at the ceiling there is no headroom: return the
+    current floor unchanged. The retry loop reads that unchanged value as the
+    saturation signal and fails the ticket (RESOURCE_CEILING_EXHAUSTED) rather
+    than retrying at a size that just OOM'd — see the retry-loop test."""
     floor = _escalated_mem_floor_after_oom(
         entry=_load_step(),
         bound={},
@@ -464,8 +466,10 @@ def test_walltime_escalation_clamps_to_action_ceiling():
 
 
 def test_walltime_escalation_at_ceiling_keeps_current_override():
-    """Once resolved walltime is at the ceiling there is no headroom: keep the
-    current floor so the retry still runs at the ceiling (not back to baseline)."""
+    """Once resolved walltime is at the ceiling there is no headroom: return the
+    current floor unchanged. The retry loop reads that unchanged value as the
+    saturation signal and fails the ticket (RESOURCE_CEILING_EXHAUSTED) rather
+    than retrying at a limit that just timed out — see the retry-loop test."""
     floor = _escalated_walltime_after_timeout(
         entry=_qc_step(),
         bound={},

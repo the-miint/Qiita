@@ -950,6 +950,15 @@ the `no-changelog` label).
   `$QIITA_CONTROL_PLANE_URL`, so a wrong base URL or a down server is obvious.
   `run_http_subcommand` gains an `httpx.RequestError` branch alongside the
   existing `HTTPStatusError` (a non-2xx *response*) handling. (#120)
+- A step that OOM-kills (or times out) while **already at its action resource
+  ceiling** no longer burns its remaining retry budget re-running at the same
+  size. The runner escalates memory on `OOM_KILLED` and walltime on `TIMEOUT`,
+  but once the floor is pinned at the ceiling there is no larger allocation to
+  try — a re-run would fail identically. The runner now detects that the
+  escalation can't grow and fails the ticket immediately with a new permanent
+  `RESOURCE_CEILING_EXHAUSTED` failure kind (failure_type `permanent`), whose
+  reason names the ceiling and tells the operator to raise it or shrink the
+  input — instead of looping through every retry to the same OOM/timeout. (#210)
 - A transient HTTP 5xx or network error on the per-sample `POST /sequence-range`
   callback the native `ingest_reads` and `fastq_to_parquet` steps make back to
   the control plane no longer permanently fails the whole pool ingest. Each

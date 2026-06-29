@@ -73,10 +73,10 @@ def test_every_failure_kind_is_classified():
         ).transient
         for kind in FailureKind
     }
-    # 9 retriable + 4 permanent at the time of writing. If you add a
+    # 9 retriable + 5 permanent at the time of writing. If you add a
     # kind, update this count and decide which side it lands on.
     assert sum(classifications.values()) == 9
-    assert len(classifications) == 13
+    assert len(classifications) == 14
 
 
 # ---------------------------------------------------------------------------

@@ -99,6 +99,15 @@ class FailureKind(StrEnum):
     BAD_INPUT = "bad_input"
     EXIT_NONZERO = "exit_nonzero"
     CONTRACT_VIOLATION = "contract_violation"
+    # A step exhausted its retriable resource escalation: it OOM-killed at the
+    # action's mem ceiling, or timed out at the action's walltime ceiling. The
+    # triggering kind (OOM_KILLED / TIMEOUT_BEFORE_START) is itself retriable,
+    # but once the escalated floor is pinned at the ceiling a re-run would fail
+    # identically — so the runner reclassifies it as permanent rather than
+    # burning the remaining retry budget (and a SLURM allocation) on a
+    # guaranteed repeat. Operator fix: raise the action ceiling or shrink the
+    # input. Raised by the runner, never emitted by a backend over the wire.
+    RESOURCE_CEILING_EXHAUSTED = "resource_ceiling_exhausted"
     UNKNOWN_PERMANENT = "unknown_permanent"
 
 
