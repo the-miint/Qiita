@@ -486,6 +486,19 @@ the `no-changelog` label).
   previously inlined and duplicated across two jobs, moved into a reusable
   `.github/actions/setup-host-postgres` composite action with a weekly-refreshable
   Homebrew download cache. No change to what is tested. (#225)
+- **Native DuckDB jobs share one spill-dir context manager** (`duckdb_tmp_dir` in
+  the orchestrator's `miint.py`), making `<workspace>/.duckdb_tmp` teardown
+  structural across all ten jobs instead of a per-job `try/finally`. This closes a
+  leak in `build_rype_index`, which created the spill dir but never removed it
+  (spilled bytes accumulated in the shared work-ticket workspace — SLURM has hit
+  "no space in /tmp"). Same consistency sweep: the two index builders and
+  `qc_report` now route their `read_parquet` path literals through
+  `validate_parquet_path` (the repo's fail-fast quote/backslash/control-char
+  reject) like the sibling jobs, and the builders' `index_type` meta JSON uses the
+  shared `HOST_FILTER_INDEX_TYPE_{RYPE,MINIMAP2}` constants instead of bare
+  `"rype"`/`"minimap2"` literals. Behavior-preserving (the existing per-job unit
+  suites are the guard); no env var, host dir, scope, migration, or workflow
+  change. (#229)
 - A job's input `params.json` and a native step's output `manifest.json` are now
   pretty-printed (2-space indent, trailing newline; the manifest also sorts keys
   to mirror the container-side `manifest_writer.py`) instead of dumped as a single

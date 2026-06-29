@@ -44,12 +44,15 @@ from pathlib import Path
 
 import duckdb
 from pydantic import BaseModel
+from qiita_common.models import HOST_FILTER_INDEX_TYPE_RYPE
+from qiita_common.parquet import validate_parquet_path
 
 from ..config import get_settings
 from ..derived_store import rype_index_path
 from ..miint import (
     apply_duckdb_settings,
     duckdb_headroom_gb,
+    duckdb_tmp_dir,
     open_miint_conn,
     resolve_duckdb_memory_gb,
     slurm_alloc_gb,
@@ -173,7 +176,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         raise FileNotFoundError(f"reference_sequence_chunks not found: {chunks}")
     # reference_load emits chunks as a directory of part_*.parquet; accept a
     # single file too (tests / future producers).
-    read_target = str(chunks / "part_*.parquet") if chunks.is_dir() else str(chunks)
+    read_target = chunks / "part_*.parquet" if chunks.is_dir() else chunks
 
     bucket = inputs.bucket_name or f"reference_{inputs.reference_idx}"
 
@@ -192,9 +195,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # and re-indexing a grown/active reference is out of scope.
     if index_dir.exists():
         shutil.rmtree(index_dir)
-
-    duckdb_tmp = workspace / ".duckdb_tmp"
-    duckdb_tmp.mkdir(parents=True, exist_ok=True)
 
     # DuckDB share stays bounded (cap at `_DUCKDB_MEMORY_CAP_GB`); rype gets the
     # rest of the cgroup. The cap is small because `rype_index_create` windows its
@@ -215,13 +215,13 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         )
     )
 
-    with open_miint_conn() as conn:
+    with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
         apply_duckdb_settings(conn, duckdb_tmp, memory_gb=duckdb_memory_gb, threads=_DUCKDB_THREADS)
         # Non-temp view/table so rype's separate bind/execute connection can
         # resolve them by name. DuckDB rejects prepared parameters inside
-        # CREATE VIEW, so the path is inlined (quote-escaped — it's a
-        # filesystem path, no other injection surface).
-        read_target_sql = read_target.replace("'", "''")
+        # CREATE VIEW, so the path is inlined; validate_parquet_path rejects
+        # quote/backslash/control chars (the repo's fail-fast escaping contract).
+        read_target_sql = validate_parquet_path(read_target)
         conn.execute(
             f"CREATE OR REPLACE VIEW {_CHUNK_VIEW} AS "
             f"SELECT feature_idx, chunk_index, chunk_data FROM read_parquet('{read_target_sql}')"
@@ -252,7 +252,9 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     params = {"k": inputs.k, "w": inputs.w, "bucket_name": bucket}
     meta_path = workspace / "rype_index_meta.json"
     meta_path.write_text(
-        json.dumps({"index_type": "rype", "fs_path": str(index_dir), "params": params})
+        json.dumps(
+            {"index_type": HOST_FILTER_INDEX_TYPE_RYPE, "fs_path": str(index_dir), "params": params}
+        )
     )
     # Only the in-tree meta JSON is a step output. The `.ryxdi` itself lives
     # under PATH_DERIVED (outside the per-attempt workspace) on purpose — it

@@ -61,7 +61,6 @@ REQUIRED input and an empty one is fail-fast.
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
 import duckdb
@@ -72,6 +71,7 @@ from qiita_common.parquet import validate_parquet_path
 from ..miint import (
     PARQUET_OPTS,
     apply_duckdb_settings,
+    duckdb_tmp_dir,
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
@@ -337,8 +337,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     workspace.mkdir(parents=True, exist_ok=True)
     qc_mask = workspace / "qc_mask.parquet"
-    duckdb_tmp = workspace / ".duckdb_tmp"
-    duckdb_tmp.mkdir(parents=True, exist_ok=True)
 
     # COPY / CREATE VIEW path literals can't take a bound param; route them
     # through validate_parquet_path (fail-fast on quote/backslash/control chars)
@@ -348,7 +346,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
     success = False
     try:
-        with open_miint_conn() as conn:
+        with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
             apply_duckdb_settings(
                 conn,
                 duckdb_tmp,
@@ -387,10 +385,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             )
         success = True
     finally:
-        # Drop the spill dir before returning so the SLURM launcher's manifest
-        # walker (which runs after execute()) sees only qc_mask.parquet; on
-        # failure remove a partial output so it can't be promoted.
-        shutil.rmtree(duckdb_tmp, ignore_errors=True)
+        # On failure remove a partial output so the SLURM launcher's manifest
+        # walker (which runs after execute()) can't promote it as the result.
         if not success:
             qc_mask.unlink(missing_ok=True)
 
