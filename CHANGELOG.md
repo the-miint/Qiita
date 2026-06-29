@@ -470,6 +470,13 @@ the `no-changelog` label).
 
 ### Changed
 
+- A job's input `params.json` and a native step's output `manifest.json` are now
+  pretty-printed (2-space indent, trailing newline; the manifest also sorts keys
+  to mirror the container-side `manifest_writer.py`) instead of dumped as a single
+  dense line — far easier to read when debugging a job's input/output dir. Both
+  files are parsed (`model_validate_json` / `json.loads`), so the whitespace change
+  is transparent to every consumer. (#208)
+
 - bcl-convert re-submission over an already-**COMPLETED** sequenced_pool is now
   refused by default and requires `--force` (wet_lab_admin+). A re-run
   re-registers the pool's reads into the lake, and DuckLake has no uniqueness, so
@@ -924,13 +931,6 @@ the `no-changelog` label).
   terminology-term read-back refs (#81)
 
 ### Fixed
-
-- A job's input `params.json` and a native step's output `manifest.json` are now
-  pretty-printed (2-space indent, trailing newline; the manifest also sorts keys
-  to mirror the container-side `manifest_writer.py`) instead of dumped as a single
-  dense line — far easier to read when debugging a job's input/output dir. Both
-  files are parsed (`model_validate_json` / `json.loads`), so the whitespace change
-  is transparent to every consumer. (#208)
 
 - `submit-host-filter-pool` no longer abandons the rest of a pool when one
   sample's `POST /work-ticket` fails. The per-sample fan-out now isolates each

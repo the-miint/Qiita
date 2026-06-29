@@ -519,7 +519,13 @@ async def test_run_step_writes_params_json(jwt_path, baseline, tmp_path):
         entrypoint=None,
         baseline_resources=baseline,
     )
-    params = json.loads((tmp_path / "input" / "params.json").read_text())
+    params_text = (tmp_path / "input" / "params.json").read_text()
+    # Pretty-printed (2-space indent, trailing newline) so a human
+    # debugging a job's input dir can read it — pin the shape so a
+    # regression to a dense single-line dump is caught.
+    assert params_text.endswith("\n")
+    assert "\n  " in params_text
+    params = json.loads(params_text)
     assert params["step_name"] == "hash"
     assert params["scope_target"] == {"kind": "reference", "reference_idx": 42}
     assert params["work_ticket_idx"] == 99
