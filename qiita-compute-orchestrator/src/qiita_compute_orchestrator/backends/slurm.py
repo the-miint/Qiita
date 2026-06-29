@@ -356,6 +356,9 @@ class SlurmBackend(ComputeBackend):
         # here and the consumer (jobs/__main__.py) validate against the
         # same schema.
         params_path = input_path / JOB_PARAMS_FILENAME
+        # Pretty-print so a human debugging a job's input dir can read it;
+        # the consumer (jobs/__main__.py) parses with model_validate_json,
+        # which is whitespace-insensitive.
         params_path.write_text(
             JobParams(
                 step_name=name,
@@ -363,7 +366,8 @@ class SlurmBackend(ComputeBackend):
                 work_ticket_idx=work_ticket_idx,
                 inputs={k: str(v) for k, v in inputs.items()},
                 output_path=str(output_path),
-            ).model_dump_json()
+            ).model_dump_json(indent=2)
+            + "\n"
         )
 
         baseline = BaselineResources(
