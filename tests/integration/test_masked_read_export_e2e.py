@@ -263,3 +263,133 @@ async def test_masked_read_export_e2e_parquet_and_fastq(
     assert r2["r3"] == ("TTAATTAA", "55555555")
     # A paired sample never produces the single-file form.
     assert not (fq_dir / f"{stem}.fastq.gz").exists()
+
+
+async def test_masked_read_export_e2e_parquet_idempotent_recount(
+    data_plane, seeded, postgres_pool, tmp_path, monkeypatch, capsys
+):
+    """Re-export idempotency over the REAL count_masked DoAction: a second run with
+    nothing changed skips (the data plane's read_mask count matches the on-disk
+    parquet record count); after a pass read is added, the next run sees the higher
+    count and overwrites. Proves the cheap count(*) probe and the skip/overwrite
+    decision end to end against the live data plane — the piece the faked CLI unit
+    tests can't reach (they stub the count response)."""
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+    from qiita_control_plane.routes.admin import (
+        create_masked_read_export_ticket,
+        export_masked_read_manifest,
+    )
+
+    prep = seeded["prep_sample_idx"]
+    mask_idx = seeded["mask_idx"]
+    pool_idx = seeded["pool_idx"]
+    run_idx = seeded["run_idx"]
+    accession = seeded["accession"]
+    secret = data_plane["secret"]
+
+    # Two 'pass' reads + one host hit (redacted): the on-disk parquet starts at 2
+    # rows. (Per-id scoped, like the sibling test; left undisturbed on teardown.)
+    conn = ducklake_connect(data_plane["data_path"])
+    try:
+        conn.execute(
+            "INSERT INTO qiita_lake.read"
+            " (prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2) VALUES"
+            f" ({prep}, 1, 'r1', 'ACGTACGT', {_u8([40] * 8)}, 'TTTTGGGG', {_u8([30] * 8)}),"
+            f" ({prep}, 2, 'r2', 'AAAACCCC', {_u8([40] * 8)}, 'GGGGCCCC', {_u8([40] * 8)}),"
+            f" ({prep}, 3, 'r3', 'CCCCAAAA', {_u8([35] * 8)}, 'TTAATTAA', {_u8([20] * 8)})"
+        )
+        conn.execute(
+            "INSERT INTO qiita_lake.read_mask"
+            " (mask_idx, prep_sample_idx, sequence_idx, reason,"
+            "  left_trim1, right_trim1, left_trim2, right_trim2) VALUES"
+            f" ({mask_idx}, {prep}, 1, '{ReadMaskReason.PASS.value}', 0, 0, 0, 0),"
+            f" ({mask_idx}, {prep}, 2, '{ReadMaskReason.HOST_RYPE.value}', 0, 0, 0, 0),"
+            f" ({mask_idx}, {prep}, 3, '{ReadMaskReason.PASS.value}', 0, 0, 0, 0)"
+        )
+    finally:
+        conn.close()
+
+    manifest_dict = (
+        await export_masked_read_manifest(
+            sequenced_pool_idx=pool_idx,
+            pool=postgres_pool,
+            _role=None,
+            _scope=None,
+            mask_idx=mask_idx,
+        )
+    ).model_dump()
+    tickets_by_prep: dict[int, str] = {}
+    for sample in manifest_dict["samples"]:
+        resp = await create_masked_read_export_ticket(
+            body=MaskedReadExportTicketRequest(
+                prep_sample_idx=sample["prep_sample_idx"], mask_idx=mask_idx
+            ),
+            hmac_secret=secret,
+            _role=None,
+            _scope=None,
+        )
+        tickets_by_prep[sample["prep_sample_idx"]] = resp.ticket
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    monkeypatch.setattr(
+        _common.httpx, "request", _bridge_http(manifest_dict, tickets_by_prep, pool_idx)
+    )
+    dp_url = f"grpc://{LOOPBACK_HOST}:{data_plane['port']}"
+    stem = f"{accession}.{run_idx}.{pool_idx}.{prep}"
+
+    # One out_dir reused across runs; the CLI creates it on the first run.
+    out_dir = tmp_path / "exp"
+    pq_path = out_dir / f"{stem}.parquet"
+    argv = [
+        "masked-read-export",
+        "--sequenced-pool-idx",
+        str(pool_idx),
+        "--mask-idx",
+        str(mask_idx),
+        "--format",
+        "parquet",
+        "--output-dir",
+        str(out_dir),
+        "--data-plane-url",
+        dp_url,
+    ]
+
+    def _rows() -> int:
+        return (
+            duckdb.connect(":memory:")
+            .execute(f"SELECT count(*) FROM read_parquet('{pq_path}')")
+            .fetchone()[0]
+        )
+
+    # Run 1: first export streams the two pass reads.
+    assert cli.main(argv) == 0
+    assert "exported 1 sample(s)" in capsys.readouterr().out
+    assert _rows() == 2
+
+    # Run 2: nothing changed → live count matches on disk → skipped, file untouched.
+    assert cli.main(argv) == 0
+    assert "exported 0 sample(s) (skipped 1 already up to date)" in capsys.readouterr().out
+    assert _rows() == 2
+
+    # Add a third pass read so the live count_masked now returns 3, not 2.
+    conn = ducklake_connect(data_plane["data_path"])
+    try:
+        conn.execute(
+            "INSERT INTO qiita_lake.read"
+            " (prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2) VALUES"
+            f" ({prep}, 4, 'r4', 'GGGGTTTT', {_u8([40] * 8)}, 'CCCCAAAA', {_u8([30] * 8)})"
+        )
+        conn.execute(
+            "INSERT INTO qiita_lake.read_mask"
+            " (mask_idx, prep_sample_idx, sequence_idx, reason,"
+            "  left_trim1, right_trim1, left_trim2, right_trim2) VALUES"
+            f" ({mask_idx}, {prep}, 4, '{ReadMaskReason.PASS.value}', 0, 0, 0, 0)"
+        )
+    finally:
+        conn.close()
+
+    # Run 3: count (3) differs from on disk (2) → re-stream and overwrite.
+    assert cli.main(argv) == 0
+    assert "exported 1 sample(s)" in capsys.readouterr().out
+    assert _rows() == 3

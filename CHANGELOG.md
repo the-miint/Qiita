@@ -476,6 +476,14 @@ the `no-changelog` label).
 
 ### Changed
 
+- `qiita-admin masked-read-export` is now **re-runnable**: it creates `--output-dir`
+  (with parents) if missing instead of erroring, and for parquet it skips a sample
+  whose output file already exists when the count matches and overwrites it only
+  when it differs. The count comes from a new `count_masked` data-plane DoAction —
+  a cheap `count(*)` against the light `read_mask` table (no read sequences
+  streamed or materialized) that reuses the sample's existing signed export ticket,
+  so there's no new control-plane route. fastq has no cheap on-disk count, so an
+  existing fastq target is refused up front rather than re-exported. (#229)
 - A job's input `params.json` and a native step's output `manifest.json` are now
   pretty-printed (2-space indent, trailing newline; the manifest also sorts keys
   to mirror the container-side `manifest_writer.py`) instead of dumped as a single

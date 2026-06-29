@@ -599,22 +599,44 @@ class _FakeFlightStream:
         return self._table.to_reader()
 
 
-def _fake_flight_client_class(tables_by_prep):
+class _FakeFlightResult:
+    """Stands in for a pyarrow Flight DoAction result: `.body.to_pybytes()`
+    yields the JSON bytes the CLI parses (here, `{"count": N}`)."""
+
+    class _Buf:
+        def __init__(self, payload: bytes):
+            self._payload = payload
+
+        def to_pybytes(self) -> bytes:
+            return self._payload
+
+    def __init__(self, payload: bytes):
+        self.body = self._Buf(payload)
+
+
+def _fake_flight_client_class(tables_by_prep, counts_by_prep=None):
     """Build a fake pyarrow.flight.FlightClient class whose do_get returns the
     queued table for the prep_sample_idx encoded in the (fake) ticket. The
     monkeypatched ticket endpoint encodes {"prep_sample_idx": N} as the ticket
-    bytes, so the fake maps a DoGet back to its sample without real signing."""
+    bytes, so the fake maps a DoGet back to its sample without real signing.
+
+    do_action serves the `count_masked` probe: it returns `{"count": N}` for the
+    ticket's prep, taking N from `counts_by_prep` when given (to simulate a
+    data-plane count that differs from what's on disk) else the queued table's
+    row count (the consistent "nothing changed" case)."""
     import json as _json
 
     class _FakeFlightClient:
         # Every constructed instance is recorded so a test can read back the
-        # FlightCallOptions the CLI passed to do_get (buffer-alignment fix).
+        # FlightCallOptions the CLI passed to do_get (buffer-alignment fix) and
+        # which preps were streamed vs. only counted.
         instances: list = []
 
         def __init__(self, url):
             self.url = url
             self.do_get_calls = []
             self.do_get_options = []
+            self.do_action_calls = []
             _FakeFlightClient.instances.append(self)
 
         def do_get(self, ticket, options=None):
@@ -622,6 +644,16 @@ def _fake_flight_client_class(tables_by_prep):
             self.do_get_calls.append(prep)
             self.do_get_options.append(options)
             return _FakeFlightStream(tables_by_prep[prep])
+
+        def do_action(self, action, options=None):
+            assert action.type == "count_masked"
+            prep = _json.loads(action.body.to_pybytes())["prep_sample_idx"]
+            self.do_action_calls.append(prep)
+            if counts_by_prep is not None and prep in counts_by_prep:
+                count = counts_by_prep[prep]
+            else:
+                count = tables_by_prep[prep].num_rows
+            return [_FakeFlightResult(_json.dumps({"count": count}).encode())]
 
         def close(self):
             pass
@@ -1011,6 +1043,153 @@ def test_masked_read_export_aborts_on_unsafe_accession(monkeypatch, tmp_path, ca
     assert list(out_dir.iterdir()) == []
 
 
+def test_masked_read_export_creates_missing_output_dir(monkeypatch, tmp_path):
+    """The output directory (and any missing parents) is created on demand — it
+    need not pre-exist."""
+    import pyarrow as pa
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [{"prep_sample_idx": 42, "biosample_accession": "SAMN_A"}],
+    }
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(manifest))
+    monkeypatch.setattr(
+        "pyarrow.flight.FlightClient",
+        _fake_flight_client_class({42: pa.table({"read_id": ["rA0"], "sequence1": ["ACGT"]})}),
+    )
+
+    out_dir = tmp_path / "new" / "nested" / "exp"  # none of these exist yet
+    assert not out_dir.exists()
+    rc = cli.main(
+        [
+            "masked-read-export",
+            "--sequenced-pool-idx",
+            "7",
+            "--mask-idx",
+            "3",
+            "--format",
+            "parquet",
+            "--output-dir",
+            str(out_dir),
+            "--data-plane-url",
+            "grpc://dp:50051",
+        ]
+    )
+    assert rc == 0
+    assert (out_dir / "SAMN_A.5.7.42.parquet").is_file()
+
+
+def test_masked_read_export_skips_unchanged_parquet(monkeypatch, tmp_path, capsys):
+    """Re-exporting when nothing changed skips every sample: the second run probes
+    the data plane's count (count_masked), finds it equals the on-disk record
+    count, and neither re-streams (no DoGet) nor rewrites the file."""
+    import pyarrow as pa
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [
+            {"prep_sample_idx": 42, "biosample_accession": "SAMN_A"},
+            {"prep_sample_idx": 43, "biosample_accession": "SAMN_B"},
+        ],
+    }
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(manifest))
+    tables = {
+        42: pa.table({"read_id": ["rA0", "rA1"], "sequence1": ["ACGT", "TTGG"]}),
+        43: pa.table({"read_id": ["rB0"], "sequence1": ["CCAA"]}),
+    }
+    fake_cls = _fake_flight_client_class(tables)
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+
+    out_dir = tmp_path / "exp"
+    argv = [
+        "masked-read-export",
+        "--sequenced-pool-idx",
+        "7",
+        "--mask-idx",
+        "3",
+        "--format",
+        "parquet",
+        "--output-dir",
+        str(out_dir),
+        "--data-plane-url",
+        "grpc://dp:50051",
+    ]
+    assert cli.main(argv) == 0  # first export writes both files
+    assert fake_cls.instances[0].do_get_calls == [42, 43]
+    capsys.readouterr()  # discard first-run output
+
+    assert cli.main(argv) == 0  # second export: nothing changed
+    assert "exported 0 sample(s) (skipped 2 already up to date)" in capsys.readouterr().out
+    # The re-run client streamed nothing (every sample skipped) but counted both.
+    rerun = fake_cls.instances[-1]
+    assert rerun.do_get_calls == []
+    assert sorted(rerun.do_action_calls) == [42, 43]
+
+
+def test_masked_read_export_overwrites_changed_parquet(monkeypatch, tmp_path):
+    """When the data plane's count differs from the on-disk file (reads added or
+    removed since the last export), the sample is re-streamed and overwritten."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [{"prep_sample_idx": 42, "biosample_accession": "SAMN_A"}],
+    }
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(manifest))
+
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    # A stale on-disk export with 1 row; the data plane now reports 2.
+    pq.write_table(
+        pa.table({"read_id": ["old"], "sequence1": ["AAAA"]}),
+        out_dir / "SAMN_A.5.7.42.parquet",
+    )
+    fake_cls = _fake_flight_client_class(  # count_masked defaults to the table's 2 rows
+        {42: pa.table({"read_id": ["rA0", "rA1"], "sequence1": ["ACGT", "TTGG"]})}
+    )
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+
+    rc = cli.main(
+        [
+            "masked-read-export",
+            "--sequenced-pool-idx",
+            "7",
+            "--mask-idx",
+            "3",
+            "--format",
+            "parquet",
+            "--output-dir",
+            str(out_dir),
+            "--data-plane-url",
+            "grpc://dp:50051",
+        ]
+    )
+    assert rc == 0
+    # On-disk (1) != remote (2) → counted, then re-streamed and overwritten.
+    assert fake_cls.instances[-1].do_action_calls == [42]
+    assert fake_cls.instances[-1].do_get_calls == [42]
+    assert pq.ParquetFile(out_dir / "SAMN_A.5.7.42.parquet").metadata.num_rows == 2
+
+
 # ---------------------------------------------------------------------------
 # masked-read-export (fastq path — R1/R2)
 #
@@ -1192,3 +1371,67 @@ def test_masked_read_export_empty_sample_fastq(monkeypatch, tmp_path):
     assert (f.stat().st_mode & 0o777) == 0o600
     assert _read_gz_text(f) == ""  # zero records
     assert sorted(p.name for p in out_dir.iterdir()) == ["SAMN_A.5.7.42.fastq.gz"]
+
+
+def test_masked_read_export_fastq_refuses_existing_file(monkeypatch, tmp_path, capsys):
+    """fastq export never overwrites: if any target filename already exists, the
+    command fails up front (exit 1) before constructing a Flight client or
+    streaming — no count probe, no DoGet, and the existing file is left intact.
+    A lone R1 (from a prior paired export) is enough to block the whole run."""
+    import pyarrow as pa
+
+    from qiita_control_plane.cli import _common
+    from qiita_control_plane.cli import admin as cli
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_admin")
+    manifest = {
+        "sequenced_pool_idx": 7,
+        "sequencing_run_idx": 5,
+        "mask_idx": 3,
+        "samples": [
+            {"prep_sample_idx": 42, "biosample_accession": "SAMN_A"},
+            {"prep_sample_idx": 43, "biosample_accession": "SAMN_B"},
+        ],
+    }
+    monkeypatch.setattr(_common.httpx, "request", _fake_masked_export_http(manifest))
+    se = {
+        "qual1": _qual([[40] * 4]),
+        "sequence2": pa.array([None], type=pa.string()),
+        "qual2": _qual([None]),
+    }
+    fake_cls = _fake_flight_client_class(
+        {
+            42: pa.table({"read_id": ["rA0"], "sequence1": ["ACGT"], **se}),
+            43: pa.table({"read_id": ["rB0"], "sequence1": ["CCAA"], **se}),
+        }
+    )
+    monkeypatch.setattr("pyarrow.flight.FlightClient", fake_cls)
+
+    out_dir = tmp_path / "exp"
+    out_dir.mkdir()
+    preexisting = out_dir / "SAMN_B.5.7.43.R1.fastq.gz"
+    preexisting.write_bytes(b"stale")
+
+    rc = cli.main(
+        [
+            "masked-read-export",
+            "--sequenced-pool-idx",
+            "7",
+            "--mask-idx",
+            "3",
+            "--format",
+            "fastq",
+            "--output-dir",
+            str(out_dir),
+            "--data-plane-url",
+            "grpc://dp:50051",
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "refusing to overwrite" in err
+    assert "SAMN_B.5.7.43.R1.fastq.gz" in err
+    # Failed before any Flight work; the stale file is the only thing on disk.
+    assert fake_cls.instances == []
+    assert preexisting.read_bytes() == b"stale"
+    assert sorted(p.name for p in out_dir.iterdir()) == ["SAMN_B.5.7.43.R1.fastq.gz"]
