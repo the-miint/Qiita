@@ -18,6 +18,7 @@ from qiita_common.api_paths import (
     URL_BIOSAMPLE_BY_IDX,
     URL_BIOSAMPLE_BY_STUDY,
     URL_BIOSAMPLE_LIST_BY_STUDY,
+    URL_PREP_PROTOCOL_PREFIX,
     URL_PREP_SAMPLE_STUDY_LIST,
     URL_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE,
     URL_SEQUENCED_SAMPLE_BY_IDX,
@@ -4083,3 +4084,162 @@ def test_run_preflight_update_lane_blank_reason_errors(monkeypatch, capsys):
         )
     assert exc_info.value.code == 2
     assert "reason" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# prep-protocol list / reference list — discovery commands (#162)
+# ---------------------------------------------------------------------------
+
+
+def test_prep_protocol_list_default_excludes_retired(monkeypatch):
+    """`prep-protocol list` GETs /prep-protocol with no include_retired param."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(
+        monkeypatch,
+        captured,
+        response_json=[
+            {
+                "prep_protocol_idx": 3,
+                "name": "short_read_metagenomics",
+                "description": None,
+                "retired": False,
+                "created_by_idx": 1,
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ],
+        status=200,
+    )
+    rc = main(["--base-url", "https://q.example.test", "prep-protocol", "list"])
+    assert rc == 0
+    assert captured["method"] == "GET"
+    assert captured["url"] == f"https://q.example.test{URL_PREP_PROTOCOL_PREFIX}"
+    assert captured["params"] is None
+    assert captured["json"] is None
+
+
+def test_prep_protocol_list_all_includes_retired(monkeypatch):
+    """`prep-protocol list --all` passes include_retired=true."""
+    from qiita_control_plane.cli.user import main
+
+    captured: dict = {}
+    _stub_post(monkeypatch, captured, response_json=[], status=200)
+    rc = main(["--base-url", "https://q.example.test", "prep-protocol", "list", "--all"])
+    assert rc == 0
+    assert captured["method"] == "GET"
+    assert captured["params"] == {"include_retired": "true"}
+
+
+def _stub_reference_list(monkeypatch, *, references, indexes_by_idx):
+    """Route GET /reference -> `references` and GET /reference/{idx}/index ->
+    `indexes_by_idx[idx]`, recording each request. Returns the request log."""
+    import httpx as _httpx
+
+    from qiita_control_plane.cli import _common
+
+    requests: list[dict] = []
+
+    def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
+        requests.append({"method": method, "url": url, "params": params})
+        if url.endswith("/index"):
+            idx = int(url.rsplit("/reference/", 1)[1].split("/")[0])
+            body = indexes_by_idx.get(idx, [])
+        else:
+            body = references
+        return _httpx.Response(200, json=body, request=_httpx.Request(method, url))
+
+    monkeypatch.setattr(_common.httpx, "request", fake_request)
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+    return requests
+
+
+def _ref_row(idx, **over):
+    row = {
+        "reference_idx": idx,
+        "name": f"ref{idx}",
+        "version": "v1",
+        "kind": "sequence_reference",
+        "status": "active",
+        "is_host": True,
+        "created_by_idx": 1,
+        "created_at": "2026-01-01T00:00:00Z",
+    }
+    row.update(over)
+    return row
+
+
+def test_reference_list_filters_by_index_type(monkeypatch, capsys):
+    """`reference list --host --active --index-type rype` sends is_host/status
+    filters, enriches each row with its built index types, and drops references
+    lacking the requested index — exactly the readiness-gate set."""
+    from qiita_control_plane.cli.user import main
+
+    requests = _stub_reference_list(
+        monkeypatch,
+        references=[_ref_row(10), _ref_row(11)],
+        indexes_by_idx={
+            10: [{"index_type": "rype"}, {"index_type": "minimap2"}],
+            11: [{"index_type": "minimap2"}],
+        },
+    )
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "reference",
+            "list",
+            "--host",
+            "--active",
+            "--index-type",
+            "rype",
+        ]
+    )
+    assert rc == 0
+    list_req = next(r for r in requests if r["url"].endswith("/reference"))
+    assert list_req["method"] == "GET"
+    assert list_req["params"] == {"is_host": "true", "status": "active"}
+    body = json.loads(capsys.readouterr().out)
+    assert [r["reference_idx"] for r in body] == [10]
+    assert body[0]["index_types"] == ["minimap2", "rype"]
+
+
+def test_reference_list_no_filters_enriches_all(monkeypatch, capsys):
+    """Without filters every reference is returned, each with its index types
+    (empty list when it has none) and no query params on the list call."""
+    from qiita_control_plane.cli.user import main
+
+    requests = _stub_reference_list(
+        monkeypatch, references=[_ref_row(5, is_host=False)], indexes_by_idx={}
+    )
+    rc = main(["--base-url", "https://q.example.test", "reference", "list"])
+    assert rc == 0
+    list_req = next(r for r in requests if r["url"].endswith("/reference"))
+    assert list_req["params"] is None
+    body = json.loads(capsys.readouterr().out)
+    assert body[0]["reference_idx"] == 5
+    assert body[0]["index_types"] == []
+
+
+def test_reference_list_index_type_no_match_returns_empty(monkeypatch, capsys):
+    """`reference list --index-type rype` over references that carry only other
+    index types yields an empty list (every row is filtered out)."""
+    from qiita_control_plane.cli.user import main
+
+    _stub_reference_list(
+        monkeypatch,
+        references=[_ref_row(20), _ref_row(21)],
+        indexes_by_idx={20: [{"index_type": "minimap2"}], 21: []},
+    )
+    rc = main(
+        [
+            "--base-url",
+            "https://q.example.test",
+            "reference",
+            "list",
+            "--index-type",
+            "rype",
+        ]
+    )
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out) == []

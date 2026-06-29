@@ -63,6 +63,15 @@ URL_REFERENCE_STATUS = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_STATUS}"
 URL_REFERENCE_INDEX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_INDEX}"
 URL_REFERENCE_DOGET = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_DOGET}"
 
+# =============================================================================
+# /prep-protocol/*
+# =============================================================================
+
+PATH_PREP_PROTOCOL_PREFIX = "/prep-protocol"
+PATH_PREP_PROTOCOL_ROOT = ""  # list against the prefix itself
+
+URL_PREP_PROTOCOL_PREFIX = f"{API_PREFIX}{PATH_PREP_PROTOCOL_PREFIX}"
+
 
 # =============================================================================
 # Library primitive names
