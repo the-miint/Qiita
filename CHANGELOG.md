@@ -15,6 +15,13 @@ the `no-changelog` label).
 
 ### Added
 
+- **Walltime escalation on TIMEOUT retry**, mirroring the existing OOM→memory
+  growth. When a step's SLURM job exceeds its walltime (`TIMEOUT`, a retriable
+  kind), the runner now grows that step's walltime floor ×2 on each retry,
+  clamped to `action_ceiling.walltime`, instead of re-running every attempt at
+  the same limit (which timed out identically). Process-local like the memory
+  floor: a CP restart re-attaches to the in-flight job and re-escalates from the
+  YAML baseline. (#216)
 - Pool completion now reports **end-to-end processing**, not just host-masking.
   `GET /sequencing-run/{R}/sequenced-pool/{P}/completion` (`qiita pool-completion`)
   gains `demux_state` (the pool-scoped bcl-convert stage: completed / in_flight /
@@ -24,7 +31,6 @@ the `no-changelog` label).
   which described the rollup as "fastq-to-parquet / prep-generation" though it has
   measured **read-mask** (host-masking) since the read-storage/masking split. No
   new route/migration; the `PoolCompletionStatus` response gains two fields. (#218)
-
 - Admin per-pool **masked-read export**: pull a sequenced_pool's masked sequence
   data to local disk, per sample, as parquet or fastq. New `qiita-admin
   masked-read-export --sequenced-pool-idx P --mask-idx M [--format parquet|fastq]
@@ -470,6 +476,13 @@ the `no-changelog` label).
 
 ### Changed
 
+- `qc` step walltime raised in both actions that run it (`read-mask/1.0.0` and
+  `fastq-to-parquet/1.3.0`): `baseline_resources.walltime` PT2H → PT4H and
+  `action_ceiling.walltime` PT4H → PT8H, giving the first attempt more time and
+  the new TIMEOUT escalation (above) room to climb to PT8H. The ceiling is
+  action-wide, so `host_filter` (baseline PT4H) can now also escalate to PT8H on
+  a TIMEOUT retry. YAMLs edited in place; re-synced via `qiita-admin actions
+  sync`. (#216)
 - bcl-convert re-submission over an already-**COMPLETED** sequenced_pool is now
   refused by default and requires `--force` (wet_lab_admin+). A re-run
   re-registers the pool's reads into the lake, and DuckLake has no uniqueness, so
@@ -479,7 +492,6 @@ the `no-changelog` label).
   submit-bcl-convert` gains `--force`. Non-force recovery for a stored result is
   `delete-sequenced-pool` then resubmit; FAILED tickets remain freely resumable
   via `qiita ticket run`. (#206)
-
 - `host_filter` step memory raised 16 → 32 GB in both actions that run it
   (`read-mask/1.0.0` and `fastq-to-parquet/1.3.0`): the step's
   `baseline_resources.mem_gb` and the `action_ceiling.mem_gb` both go 16 → 32, so
