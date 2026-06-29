@@ -1775,13 +1775,26 @@ class WorkTicketCreateRequest(BaseModel):
     caller — clients cannot submit on behalf of another principal.
 
     `resource_override` is an optional per-run resource bump, gated server-side
-    to wet_lab_admin / system_admin and bounded by the action's ceiling."""
+    to wet_lab_admin / system_admin and bounded by the action's ceiling.
+
+    `force` re-submits a sequenced_pool action even when a COMPLETED ticket
+    already exists for the same `(pool, action, version)`. Default-refused
+    because a re-run re-registers the pool's reads into the lake (DuckLake has
+    no uniqueness — duplicate rows result); the intended recovery for a stored
+    result is `delete-sequenced-pool` then resubmit. It is privileged regardless
+    of scope: setting `force=true` requires wet_lab_admin / system_admin (403
+    otherwise) for ANY action. It only *changes submission behavior* for the
+    sequenced_pool COMPLETED gate, though — for other scopes, or when no
+    COMPLETED ticket exists, an authorized `force=true` is simply a no-op. It
+    never relaxes the in-flight gate (a PENDING/QUEUED/PROCESSING ticket still
+    blocks)."""
 
     action_id: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     action_version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
     scope_target: ScopeTarget
     action_context: dict[str, Any] = Field(default_factory=dict)
     resource_override: ResourceOverride | None = None
+    force: bool = False
 
 
 class WorkTicketResponse(BaseModel):
@@ -2322,11 +2335,19 @@ class SequencedPoolPreflightUpdateLaneResponse(BaseModel):
 
 
 class SequencedPoolDeleteResponse(BaseModel):
-    """Summary of a full sequenced_pool purge across Postgres.
+    """Summary of a full sequenced_pool purge across Postgres, DuckLake, and disk.
 
-    Counts are the rows removed by the FK-ordered cascade. The parent
-    `sequencing_run` is intentionally retained (a run may hold other pools);
-    biosample rows are also retained — a biosample is a physical sample
+    The `*_deleted` counts (sequenced_sample … work_ticket) are the rows removed
+    by the FK-ordered Postgres cascade. `read_rows_deleted` /
+    `read_mask_rows_deleted` are the DuckLake rows the data plane purged for the
+    pool's prep_samples (the reads its bcl-convert run wrote, plus any masks over
+    them); `staged_reads_reaped` is the number of durable on-disk
+    `reads/{prep_sample_idx}/read.parquet` copies removed. The three new counts
+    default to 0 so a CP-only/dev deploy (no data plane / no shared scratch)
+    still constructs.
+
+    The parent `sequencing_run` is intentionally retained (a run may hold other
+    pools); biosample rows are also retained — a biosample is a physical sample
     independent of any single prep and is not pool-owned. `prep_sample_deleted`
     therefore never drives biosample GC. See the route docstring (DELETE
     /sequencing-run/{R}/sequenced-pool/{P}) and the delete-cascade action."""
@@ -2338,6 +2359,9 @@ class SequencedPoolDeleteResponse(BaseModel):
     field_exception_deleted: int
     study_link_deleted: int
     work_ticket_deleted: int
+    read_rows_deleted: int = 0
+    read_mask_rows_deleted: int = 0
+    staged_reads_reaped: int = 0
 
 
 class SequencedSampleCreateRequest(BaseModel):
