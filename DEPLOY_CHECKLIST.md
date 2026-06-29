@@ -33,7 +33,7 @@ _None yet._
 
 - Confirm the raised `qc` walltime ceiling synced into `qiita.action` for both
   actions that run the step (so the new PT4H `qc` baseline and its PT8H escalation
-  target sit within the ceiling): (#TBD)
+  target sit within the ceiling): (#216)
 
   ```bash
   psql "$DATABASE_URL" -tAc "SELECT action_id, walltime_ceiling FROM qiita.action WHERE (action_id, version) IN (('read-mask','1.0.0'),('fastq-to-parquet','1.3.0')) ORDER BY action_id"
@@ -53,7 +53,7 @@ _None yet._
   `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (covered by
   bucket 5's `qiita.action` check), **not** a migration. No new env var, host dir,
   scope, or SIF. Ensure the SLURM partition/QOS permits an 8 h single-step job.
-  (#TBD)
+  (#216)
 
 ---
 

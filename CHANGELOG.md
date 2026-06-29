@@ -21,7 +21,7 @@ the `no-changelog` label).
   clamped to `action_ceiling.walltime`, instead of re-running every attempt at
   the same limit (which timed out identically). Process-local like the memory
   floor: a CP restart re-attaches to the in-flight job and re-escalates from the
-  YAML baseline. (#TBD)
+  YAML baseline. (#216)
 - Admin per-pool **masked-read export**: pull a sequenced_pool's masked sequence
   data to local disk, per sample, as parquet or fastq. New `qiita-admin
   masked-read-export --sequenced-pool-idx P --mask-idx M [--format parquet|fastq]
@@ -473,7 +473,7 @@ the `no-changelog` label).
   the new TIMEOUT escalation (above) room to climb to PT8H. The ceiling is
   action-wide, so `host_filter` (baseline PT4H) can now also escalate to PT8H on
   a TIMEOUT retry. YAMLs edited in place; re-synced via `qiita-admin actions
-  sync`. (#TBD)
+  sync`. (#216)
 - `host_filter` step memory raised 16 → 32 GB in both actions that run it
   (`read-mask/1.0.0` and `fastq-to-parquet/1.3.0`): the step's
   `baseline_resources.mem_gb` and the `action_ceiling.mem_gb` both go 16 → 32, so
