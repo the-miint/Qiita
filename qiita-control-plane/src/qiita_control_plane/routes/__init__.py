@@ -7,6 +7,7 @@ from .admin import router as admin_router
 from .auth import router as auth_router
 from .biosample import biosample_router as biosample_top_level_router
 from .biosample import router as biosample_router
+from .prep_protocol import router as prep_protocol_router
 from .prep_sample import router as prep_sample_router
 from .read_masked import mask_definition_router, read_masked_router
 from .reference import router as reference_router
@@ -35,6 +36,7 @@ api_router.include_router(sequenced_sample_top_level_router)
 api_router.include_router(sequence_range_router)
 api_router.include_router(mask_definition_router)
 api_router.include_router(read_masked_router)
+api_router.include_router(prep_protocol_router)
 api_router.include_router(prep_sample_router)
 api_router.include_router(study_router)
 api_router.include_router(upload_router)

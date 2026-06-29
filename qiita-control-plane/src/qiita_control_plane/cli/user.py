@@ -44,6 +44,7 @@ from qiita_common.api_paths import (
     PATH_BIOSAMPLE_LIST_BY_STUDY,
     PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     PATH_BIOSAMPLE_PREFIX,
+    PATH_PREP_PROTOCOL_PREFIX,
     PATH_PREP_SAMPLE_PREFIX,
     PATH_PREP_SAMPLE_RETIRED,
     PATH_PREP_SAMPLE_STUDY_LIST,
@@ -948,6 +949,28 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_reference = sub.add_parser("reference", help="Reference-data lifecycle operations")
     p_reference_sub = p_reference.add_subparsers(dest="reference_cmd", required=True)
+    p_reference_list = p_reference_sub.add_parser(
+        "list",
+        help=(
+            "List references (idx/name/version/status/is_host + built index types),"
+            " with optional filters — discover the idx for --host-rype-reference-idx etc."
+        ),
+    )
+    p_reference_list.add_argument(
+        "--host", action="store_true", help="Only host references (is_host=true)"
+    )
+    p_reference_list.add_argument(
+        "--active",
+        action="store_true",
+        help="Only ACTIVE references (ready to use)",
+    )
+    p_reference_list.add_argument(
+        "--index-type",
+        dest="index_type",
+        choices=(HOST_FILTER_INDEX_TYPE_RYPE, HOST_FILTER_INDEX_TYPE_MINIMAP2),
+        help="Only references carrying this built index type",
+    )
+    p_reference_list.set_defaults(handler=_handle_reference_list)
     p_reference_load = p_reference_sub.add_parser(
         "load",
         help=("Upload FASTA + optional inputs and run the reference-add workflow end-to-end"),
@@ -1073,6 +1096,21 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_reference_load.set_defaults(handler=_handle_reference_load)
+
+    p_prep_protocol = sub.add_parser(
+        "prep-protocol", help="Prep-protocol discovery (idxes for --prep-protocol-idx)"
+    )
+    p_prep_protocol_sub = p_prep_protocol.add_subparsers(dest="prep_protocol_cmd", required=True)
+    p_prep_protocol_list = p_prep_protocol_sub.add_parser(
+        "list", help="List prep protocols (idx/name/retired) for --prep-protocol-idx"
+    )
+    p_prep_protocol_list.add_argument(
+        "--all",
+        action="store_true",
+        dest="include_retired",
+        help="Include retired protocols (default: only non-retired)",
+    )
+    p_prep_protocol_list.set_defaults(handler=_handle_prep_protocol_list)
 
     p_submit_bcl = sub.add_parser(
         "submit-bcl-convert",
@@ -1349,6 +1387,56 @@ def _handle_read(args: argparse.Namespace, parser: argparse.ArgumentParser) -> i
     idx_arg = args.read_idx_arg
     path = args.read_path.format(**{idx_arg: getattr(args, idx_arg)})
     return _common.run_http_subcommand(lambda t: _common.call("GET", args.base_url, t, path))
+
+
+def _handle_prep_protocol_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """List prep protocols (GET /prep-protocol) for `--prep-protocol-idx`.
+    Retired protocols are excluded unless --all is given."""
+    params = {"include_retired": "true"} if args.include_retired else None
+    return _common.run_http_subcommand(
+        lambda t: _common.call("GET", args.base_url, t, PATH_PREP_PROTOCOL_PREFIX, params=params)
+    )
+
+
+def _handle_reference_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """List references with their built index types, filtered by --host /
+    --active / --index-type — discover the idx for --host-rype-reference-idx etc.
+
+    Index types come from a separate endpoint (GET /reference/{idx}/index), so
+    each listed reference costs one extra GET — fine for a human discovery
+    command. With --index-type, references lacking that built index are dropped,
+    so the result is exactly the set submit-host-filter-pool's readiness gate
+    (`_assert_host_reference_ready`) accepts.
+
+    That `/index` endpoint requires the `reference:read` scope (it exposes
+    `fs_path`), so — unlike `prep-protocol list` — this command needs a token
+    carrying that scope; a token without it fails on the first per-row call."""
+    params: dict[str, str] = {}
+    if args.host:
+        params["is_host"] = "true"
+    if args.active:
+        params["status"] = ReferenceStatus.ACTIVE.value
+
+    def _fetch(token: str) -> list:
+        references = _common.call(
+            "GET", args.base_url, token, PATH_REFERENCE_PREFIX, params=params or None
+        )
+        enriched: list = []
+        for reference in references:
+            idx = reference["reference_idx"]
+            indexes = _common.call(
+                "GET",
+                args.base_url,
+                token,
+                f"{PATH_REFERENCE_PREFIX}{PATH_REFERENCE_INDEX.format(reference_idx=idx)}",
+            )
+            index_types = sorted({row["index_type"] for row in indexes})
+            if args.index_type and args.index_type not in index_types:
+                continue
+            enriched.append({**reference, "index_types": index_types})
+        return enriched
+
+    return _common.run_http_subcommand(_fetch)
 
 
 def _handle_patch(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

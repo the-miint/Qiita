@@ -15,6 +15,18 @@ the `no-changelog` label).
 
 ### Added
 
+- **CLI discovery commands for prep-protocol and host-reference idxes.** Two new
+  read-only subcommands so operators stop hand-querying Postgres for the idxes
+  `submit-bcl-convert` / `submit-host-filter-pool` need. `qiita prep-protocol
+  list` (`--all` to include retired) is backed by a new anonymous-OK `GET
+  /prep-protocol` route (same posture as `GET /reference`; retired protocols
+  excluded by default). `qiita reference list` (`--host` / `--active` /
+  `--index-type {rype,minimap2}`) reuses the existing `GET /reference` plus a
+  per-row `GET /reference/{idx}/index`, enriching each reference with its built
+  `index_types` and filtering by `--index-type` so the result is exactly the set
+  `submit-host-filter-pool`'s `_assert_host_reference_ready` gate accepts. New
+  `PrepProtocolResponse` model + `PATH_/URL_PREP_PROTOCOL` constants; anonymous-OK
+  so no new scope, migration, or operator action. (#232)
 - **Walltime escalation on TIMEOUT retry**, mirroring the existing OOM→memory
   growth. When a step's SLURM job exceeds its walltime (`TIMEOUT`, a retriable
   kind), the runner now grows that step's walltime floor ×2 on each retry,

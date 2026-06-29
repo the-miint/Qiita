@@ -260,6 +260,21 @@ class ReferenceResponse(BaseModel):
     created_at: AwareDatetime
 
 
+class PrepProtocolResponse(BaseModel):
+    """A prep protocol an operator picks for `submit-bcl-convert
+    --prep-protocol-idx`. Mirrors a `qiita.prep_protocol` row; the table's PK
+    column is `idx`, surfaced here as `prep_protocol_idx` to match the FK column
+    name on `prep_sample`."""
+
+    prep_protocol_idx: Annotated[int, Field(gt=0)]
+    name: str
+    description: str | None
+    retired: bool
+    # `created_by_idx` is the canonical owner reference, FK to qiita.principal.
+    created_by_idx: Annotated[int, Field(gt=0)]
+    created_at: AwareDatetime
+
+
 # The two search-index types a host reference must carry to host-filter: a rype
 # `.ryxdi` minimizer index (first pass) and a minimap2 `.mmi` (second pass). Shared
 # so the runner's "must carry both" gate (_resolve_host_filter_indexes) and the
