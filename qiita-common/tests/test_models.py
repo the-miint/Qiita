@@ -682,6 +682,7 @@ def test_pool_completion_status_complete_flag():
     done = PoolCompletionStatus(
         sequenced_pool_idx=1,
         sequencing_run_idx=1,
+        demux_state="completed",
         sample_count=3,
         samples_completed=3,
         samples_in_flight=0,
@@ -696,6 +697,7 @@ def test_pool_completion_status_complete_flag():
     done_with_empty_wells = PoolCompletionStatus(
         sequenced_pool_idx=1,
         sequencing_run_idx=1,
+        demux_state="completed",
         sample_count=3,
         samples_completed=2,
         samples_in_flight=0,
@@ -709,6 +711,7 @@ def test_pool_completion_status_complete_flag():
     with_failure = PoolCompletionStatus(
         sequenced_pool_idx=1,
         sequencing_run_idx=1,
+        demux_state="completed",
         sample_count=3,
         samples_completed=2,
         samples_in_flight=0,
@@ -721,6 +724,7 @@ def test_pool_completion_status_complete_flag():
     partial = PoolCompletionStatus(
         sequenced_pool_idx=1,
         sequencing_run_idx=1,
+        demux_state="completed",
         sample_count=3,
         samples_completed=2,
         samples_in_flight=1,
@@ -733,6 +737,7 @@ def test_pool_completion_status_complete_flag():
     empty = PoolCompletionStatus(
         sequenced_pool_idx=1,
         sequencing_run_idx=1,
+        demux_state="completed",
         sample_count=0,
         samples_completed=0,
         samples_in_flight=0,
@@ -741,3 +746,38 @@ def test_pool_completion_status_complete_flag():
         samples_not_submitted=0,
     )
     assert empty.complete is False
+
+
+def test_pool_completion_status_fully_processed_flag():
+    """fully_processed is the end-to-end flag: demux COMPLETED AND host-masking
+    `complete`. A failed/incomplete demux keeps it False even when every sample
+    is masked, and an incomplete mask keeps it False even when demux completed."""
+    from qiita_common.models import PoolCompletionStatus
+
+    def _status(*, demux_state, samples_completed, sample_count=3):
+        return PoolCompletionStatus(
+            sequenced_pool_idx=1,
+            sequencing_run_idx=1,
+            demux_state=demux_state,
+            sample_count=sample_count,
+            samples_completed=samples_completed,
+            samples_in_flight=sample_count - samples_completed,
+            samples_no_data=0,
+            samples_failed=0,
+            samples_not_submitted=0,
+        )
+
+    # Demux done + all samples masked → fully processed.
+    both_done = _status(demux_state="completed", samples_completed=3)
+    assert both_done.complete is True
+    assert both_done.fully_processed is True
+
+    # Masking complete but demux failed → not fully processed.
+    demux_failed = _status(demux_state="failed", samples_completed=3)
+    assert demux_failed.complete is True
+    assert demux_failed.fully_processed is False
+
+    # Demux done but masking incomplete → not fully processed.
+    mask_partial = _status(demux_state="completed", samples_completed=2)
+    assert mask_partial.complete is False
+    assert mask_partial.fully_processed is False
