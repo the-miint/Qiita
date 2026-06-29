@@ -943,6 +943,13 @@ the `no-changelog` label).
 
 ### Fixed
 
+- CLI HTTP subcommands (`qiita` / `qiita-admin`) now print a friendly, actionable
+  message when the control plane is unreachable — a connection refusal, DNS
+  failure, TLS error, or timeout — instead of dumping a raw `httpx` traceback.
+  The message names the target URL and points at `--base-url` /
+  `$QIITA_CONTROL_PLANE_URL`, so a wrong base URL or a down server is obvious.
+  `run_http_subcommand` gains an `httpx.RequestError` branch alongside the
+  existing `HTTPStatusError` (a non-2xx *response*) handling. (#120)
 - A transient HTTP 5xx or network error on the per-sample `POST /sequence-range`
   callback the native `ingest_reads` and `fastq_to_parquet` steps make back to
   the control plane no longer permanently fails the whole pool ingest. Each

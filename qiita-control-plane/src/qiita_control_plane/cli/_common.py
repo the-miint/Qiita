@@ -384,8 +384,9 @@ def run_http_subcommand(
 
     `fn` accepts a PAT string and returns the parsed JSON body (a dict for
     most routes, a list for the list endpoints). Any RuntimeError from
-    token-read or HTTPStatusError from the request is converted to a stderr
-    message + exit code 1.
+    token-read, HTTPStatusError (a non-2xx response), or RequestError (no
+    response came back at all — connection refused, DNS failure, TLS error,
+    timeout) is converted to a stderr message + exit code 1.
 
     By default the body is pretty-printed as JSON. A verb whose payload is meant
     to be *read* rather than parsed (e.g. a log tail, whose embedded newlines are
@@ -401,6 +402,25 @@ def run_http_subcommand(
         body = fn(token)
     except httpx.HTTPStatusError as exc:
         print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        return 1
+    except httpx.RequestError as exc:
+        # No HTTP response at all — the most common cause is a control plane
+        # that isn't running, or a wrong --base-url / $QIITA_CONTROL_PLANE_URL.
+        # HTTPStatusError above is a *response*
+        # and is not a RequestError, so the two branches are disjoint. Surface a
+        # friendly, actionable message naming the target instead of dumping a
+        # transport-layer traceback. httpx sets `.request` on errors raised while
+        # sending, but guard the access (it raises if somehow unset) so the
+        # error path itself can't throw.
+        try:
+            target = str(exc.request.url)
+        except RuntimeError:
+            target = "the control plane"
+        print(
+            f"error: could not reach {target}: {exc!r}. Is the control plane"
+            " running? Check --base-url / $QIITA_CONTROL_PLANE_URL.",
+            file=sys.stderr,
+        )
         return 1
     if render is not None:
         render(body)

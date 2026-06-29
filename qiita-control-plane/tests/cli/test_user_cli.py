@@ -2049,6 +2049,34 @@ def test_http_error_response_prints_to_stderr_and_exits_1(monkeypatch, capsys):
     assert "requires study access" in err
 
 
+def test_connection_error_prints_friendly_message_and_exits_1(monkeypatch, capsys):
+    """A transport-level failure (control plane down, wrong --base-url) raises
+    httpx.RequestError, which has no HTTP response. run_http_subcommand catches
+    it and prints a friendly, actionable message naming the target URL — not a
+    raw traceback — and returns exit code 1."""
+    import httpx
+
+    from qiita_control_plane.cli.user import main
+
+    monkeypatch.setenv("QIITA_TOKEN", "qk_test")
+
+    def boom(base_url, token):
+        # Mirror how httpx raises a connect failure: the exception carries the
+        # request it was attempting, so `.request.url` is populated.
+        request = httpx.Request("GET", f"{base_url}{URL_AUTH_WHOAMI}")
+        raise httpx.ConnectError("Connection refused", request=request)
+
+    monkeypatch.setattr("qiita_control_plane.cli._common.whoami", boom)
+
+    rc = main(["--base-url", "http://localhost:9999", "whoami"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "could not reach" in err
+    # The target URL is named so the user can spot a wrong base-url.
+    assert "localhost:9999" in err
+    assert "QIITA_CONTROL_PLANE_URL" in err
+
+
 # ---------------------------------------------------------------------------
 # --base-url http-to-non-localhost guard
 # ---------------------------------------------------------------------------
