@@ -476,6 +476,12 @@ the `no-changelog` label).
 
 ### Changed
 
+- A job's input `params.json` and a native step's output `manifest.json` are now
+  pretty-printed (2-space indent, trailing newline; the manifest also sorts keys
+  to mirror the container-side `manifest_writer.py`) instead of dumped as a single
+  dense line — far easier to read when debugging a job's input/output dir. Both
+  files are parsed (`model_validate_json` / `json.loads`), so the whitespace change
+  is transparent to every consumer. (#208)
 - `qc` step walltime raised in both actions that run it (`read-mask/1.0.0` and
   `fastq-to-parquet/1.3.0`): `baseline_resources.walltime` PT2H → PT4H and
   `action_ceiling.walltime` PT4H → PT8H, giving the first attempt more time and

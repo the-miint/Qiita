@@ -84,7 +84,25 @@ def test_main_writes_manifest_and_chmods_on_success(monkeypatch, io_dirs):
     rc = main(["--job", "happy"])
     assert rc == 0
 
-    manifest = json.loads((output_path / "manifest.json").read_text())
+    manifest_text = (output_path / "manifest.json").read_text()
+    # Pretty-printed (2-space indent, sorted keys, trailing newline) so a
+    # human reading a job's output dir can scan it — byte-identical to the
+    # container-side twin (workflows/_shared/manifest_writer.py). Pin the
+    # exact bytes so a regression to a dense single-line dump is caught.
+    assert (
+        manifest_text
+        == json.dumps(
+            {
+                "files": [{"path": "manifest.parquet", "size_bytes": len(b"FAKE-PARQUET-BYTES")}],
+                "outputs": {"manifest": "manifest.parquet"},
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+    manifest = json.loads(manifest_text)
     # `files` array: one entry per output file, with size_bytes.
     assert manifest["files"] == [
         {"path": "manifest.parquet", "size_bytes": len(b"FAKE-PARQUET-BYTES")}

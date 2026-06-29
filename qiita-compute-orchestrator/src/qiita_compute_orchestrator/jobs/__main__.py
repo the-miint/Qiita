@@ -143,7 +143,11 @@ def _write_manifest(
         outputs_map[name] = str(rel)
     manifest = {"files": files_listing, "outputs": outputs_map}
     manifest_path = output_path / MANIFEST_FILENAME
-    manifest_path.write_text(json.dumps(manifest))
+    # Pretty-print + sort keys so a human reading a job's output dir can
+    # diff/scan it; mirrors workflows/_shared/manifest_writer.py (the
+    # container-side twin). The verifier parses with json.loads, which
+    # ignores whitespace.
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     manifest_path.chmod(EXPECTED_FILE_MODE)
 
 
