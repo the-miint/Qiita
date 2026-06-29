@@ -32,6 +32,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -670,10 +671,14 @@ async def _run_entry_with_retry(
       * On an `OOM_KILLED` retry specifically, grow the step's memory floor
         (×`_OOM_MEMORY_GROWTH`, clamped to `action_ceiling.mem_gb`) before the
         next attempt — a step the scheduler OOM-killed will OOM again at the
-        same size. Other transient kinds retry at the same allocation. The
-        escalated floor is process-local (not persisted): a CP restart
-        re-attaches to the in-flight job and re-escalates from the ticket's
-        static override.
+        same size. Symmetrically, on a `TIMEOUT_BEFORE_START` retry (SLURM
+        marks a job TIMEOUT when it exceeds walltime) grow the step's walltime
+        floor (×`_TIMEOUT_WALLTIME_GROWTH`, clamped to
+        `action_ceiling.walltime`) — a step that hit the wall needs more time,
+        not a re-run at the same limit. Other transient kinds retry at the same
+        allocation. Both escalated floors are process-local (not persisted): a
+        CP restart re-attaches to the in-flight job and re-escalates (memory
+        from the ticket's static override, walltime from the YAML baseline).
       * On permanent failure or retry_count >= max_retries: re-raise so
         the outer handler in `run_workflow` writes the failure_* columns
         and transitions to FAILED.
@@ -697,6 +702,10 @@ async def _run_entry_with_retry(
     # raised on each OOM-killed retry (see the except arm below). Threaded into
     # every step dispatch in place of the static `mem_gb_override`.
     effective_mem_override = mem_gb_override
+    # Escalating walltime floor: starts unset (use the YAML baseline) and is
+    # raised on each TIMEOUT retry, clamped to the action ceiling. Threaded into
+    # every step dispatch alongside the memory floor.
+    effective_walltime_override: timedelta | None = None
     while True:
         attempt_workspace = workspace / entry.name / f"attempt-{attempt}"
         # Skip past a stale attempt dir to a fresh one. This fires only when an
@@ -739,6 +748,7 @@ async def _run_entry_with_retry(
                     attempt=attempt,
                     action_ceiling=action_ceiling,
                     mem_gb_override=effective_mem_override,
+                    walltime_override=effective_walltime_override,
                     poll_interval_seconds=poll_interval_seconds,
                     resume=resume,
                 )
@@ -782,14 +792,26 @@ async def _run_entry_with_retry(
                     action_ceiling=action_ceiling,
                     current_override=effective_mem_override,
                 )
+            # A timed-out step needs more wall to finish, not a re-run at the same
+            # limit; grow its walltime floor (clamped to the action ceiling) before
+            # re-queuing. Steps only — `action:` entries carry no baseline_resources.
+            if exc.kind is FailureKind.TIMEOUT_BEFORE_START and isinstance(entry, WorkflowStep):
+                effective_walltime_override = _escalated_walltime_after_timeout(
+                    entry=entry,
+                    bound=bound,
+                    action_ceiling=action_ceiling,
+                    current_override=effective_walltime_override,
+                )
             _log.warning(
-                "work_ticket %d step %r transient failure (%s); retrying %d/%d (mem_gb floor=%s)",
+                "work_ticket %d step %r transient failure (%s); retrying %d/%d "
+                "(mem_gb floor=%s, walltime floor=%s)",
                 work_ticket_idx,
                 entry.name,
                 exc.kind.value,
                 current_retry + 1,
                 max_retries,
                 effective_mem_override,
+                effective_walltime_override,
             )
             attempt += 1
             await _bump_retry_and_requeue(pool, work_ticket_idx)
@@ -2321,6 +2343,7 @@ def _resolve_baseline_for_step(
     bound: dict[str, Any],
     action_ceiling: ActionCeiling,
     mem_gb_override: int | None = None,
+    walltime_override: timedelta | None = None,
 ) -> FlatBaselineResources:
     """Resolve a step's ``baseline_resources`` to a concrete
     ``FlatBaselineResources`` and clamp against ``action_ceiling``.
@@ -2331,6 +2354,11 @@ def _resolve_baseline_for_step(
     sized higher untouched. The bump is applied before the ceiling assertion
     below, so an override above ``action_ceiling.mem_gb`` is rejected here too
     (defense in depth; the submission route already 422s it).
+
+    ``walltime_override`` is the symmetric raise-only *walltime* floor — the
+    escalating override raised on each TIMEOUT retry by
+    ``_escalated_walltime_after_timeout`` — applied the same way and bounded by
+    the same ceiling assertion.
 
     Two paths, picked by which population the YAML declared:
 
@@ -2405,6 +2433,13 @@ def _resolve_baseline_for_step(
     if mem_gb_override is not None and mem_gb_override > resolved.mem_gb:
         resolved = resolved.model_copy(update={"mem_gb": mem_gb_override})
 
+    # Per-run walltime floor (raise-only): the escalating override raised on each
+    # TIMEOUT retry. Like the memory floor it only ever increases walltime; its
+    # producer already clamps to the ceiling, so the assertion below is defense in
+    # depth.
+    if walltime_override is not None and walltime_override > resolved.walltime:
+        resolved = resolved.model_copy(update={"walltime": walltime_override})
+
     _assert_within_ceiling(entry=entry, resolved=resolved, action_ceiling=action_ceiling)
     return resolved
 
@@ -2443,6 +2478,46 @@ def _escalated_mem_floor_after_oom(
     # No headroom left (already at the ceiling): keep the current floor so the
     # retry still runs at the ceiling rather than dropping back to baseline.
     return grown if grown > resolved.mem_gb else current_override
+
+
+# Growth factor applied to a step's resolved walltime on each TIMEOUT retry.
+# A step that hit the wall needs more time to finish, not a re-run at the same
+# limit, so doubling — clamped to the action's walltime ceiling — gives the next
+# attempt a real chance. Mirrors `_OOM_MEMORY_GROWTH` for memory.
+_TIMEOUT_WALLTIME_GROWTH = 2
+
+
+def _escalated_walltime_after_timeout(
+    *,
+    entry: WorkflowStep,
+    bound: dict[str, Any],
+    action_ceiling: ActionCeiling,
+    current_override: timedelta | None,
+) -> timedelta | None:
+    """Walltime floor for the next attempt after a TIMEOUT, or
+    ``current_override`` unchanged once the resolved allocation has reached the
+    action ceiling.
+
+    The just-failed attempt ran at ``max(baseline.walltime, current_override)`` —
+    exactly what ``_resolve_baseline_for_step`` resolves here. Grow that by
+    ``_TIMEOUT_WALLTIME_GROWTH`` and clamp to ``action_ceiling.walltime`` so the
+    next attempt's floor stays within the same bound the submission route and
+    ``_assert_within_ceiling`` enforce. The result is threaded back into
+    ``_dispatch_step`` as ``walltime_override``. The exact mirror of
+    ``_escalated_mem_floor_after_oom`` for walltime, minus the static per-run
+    seed (there is no ``resource_override.walltime``): escalation always starts
+    from the YAML baseline.
+    """
+    resolved = _resolve_baseline_for_step(
+        entry=entry,
+        bound=bound,
+        action_ceiling=action_ceiling,
+        walltime_override=current_override,
+    )
+    grown = min(resolved.walltime * _TIMEOUT_WALLTIME_GROWTH, action_ceiling.walltime)
+    # No headroom left (already at the ceiling): keep the current floor so the
+    # retry still runs at the ceiling rather than dropping back to baseline.
+    return grown if grown > resolved.walltime else current_override
 
 
 def _assert_within_ceiling(
@@ -2513,6 +2588,7 @@ async def _dispatch_step(
     attempt: int,
     action_ceiling: ActionCeiling,
     mem_gb_override: int | None = None,
+    walltime_override: timedelta | None = None,
     poll_interval_seconds: float,
     resume: bool = False,
 ) -> dict[str, Any]:
@@ -2553,6 +2629,7 @@ async def _dispatch_step(
         bound=bound,
         action_ceiling=action_ceiling,
         mem_gb_override=mem_gb_override,
+        walltime_override=walltime_override,
     )
     baseline = StepBaselineResources(
         cpu=resolved.cpu,

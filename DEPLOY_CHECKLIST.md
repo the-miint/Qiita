@@ -31,11 +31,29 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- Confirm the raised `qc` walltime ceiling synced into `qiita.action` for both
+  actions that run the step (so the new PT4H `qc` baseline and its PT8H escalation
+  target sit within the ceiling): (#TBD)
+
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, walltime_ceiling FROM qiita.action WHERE (action_id, version) IN (('read-mask','1.0.0'),('fastq-to-parquet','1.3.0')) ORDER BY action_id"
+  # expect: fastq-to-parquet|08:00:00  and  read-mask|08:00:00
+  ```
 
 ### Notes (no host action)
 
-_None yet._
+- `qc` step walltime raised + new TIMEOUT walltime escalation. In both
+  `read-mask/1.0.0` and `fastq-to-parquet/1.3.0` the `qc` step's
+  `baseline_resources.walltime` rises PT2H → PT4H and the `action_ceiling.walltime`
+  rises PT4H → PT8H. The runner now grows a step's walltime ×2 on each `TIMEOUT`
+  retry (clamped to the ceiling), mirroring the existing OOM→memory growth — so a
+  qc job that hit the 2 h wall on every attempt now starts at 4 h and escalates to
+  8 h. The action-wide ceiling also lets `host_filter` (baseline PT4H) escalate to
+  PT8H on a TIMEOUT retry. Both YAMLs are **edited in place** — re-synced into
+  `qiita.action` by `qiita-admin actions sync` inside `activate.sh` (covered by
+  bucket 5's `qiita.action` check), **not** a migration. No new env var, host dir,
+  scope, or SIF. Ensure the SLURM partition/QOS permits an 8 h single-step job.
+  (#TBD)
 
 ---
 

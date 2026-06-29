@@ -15,6 +15,13 @@ the `no-changelog` label).
 
 ### Added
 
+- **Walltime escalation on TIMEOUT retry**, mirroring the existing OOM→memory
+  growth. When a step's SLURM job exceeds its walltime (`TIMEOUT`, a retriable
+  kind), the runner now grows that step's walltime floor ×2 on each retry,
+  clamped to `action_ceiling.walltime`, instead of re-running every attempt at
+  the same limit (which timed out identically). Process-local like the memory
+  floor: a CP restart re-attaches to the in-flight job and re-escalates from the
+  YAML baseline. (#TBD)
 - Admin per-pool **masked-read export**: pull a sequenced_pool's masked sequence
   data to local disk, per sample, as parquet or fastq. New `qiita-admin
   masked-read-export --sequenced-pool-idx P --mask-idx M [--format parquet|fastq]
@@ -460,6 +467,13 @@ the `no-changelog` label).
 
 ### Changed
 
+- `qc` step walltime raised in both actions that run it (`read-mask/1.0.0` and
+  `fastq-to-parquet/1.3.0`): `baseline_resources.walltime` PT2H → PT4H and
+  `action_ceiling.walltime` PT4H → PT8H, giving the first attempt more time and
+  the new TIMEOUT escalation (above) room to climb to PT8H. The ceiling is
+  action-wide, so `host_filter` (baseline PT4H) can now also escalate to PT8H on
+  a TIMEOUT retry. YAMLs edited in place; re-synced via `qiita-admin actions
+  sync`. (#TBD)
 - `host_filter` step memory raised 16 → 32 GB in both actions that run it
   (`read-mask/1.0.0` and `fastq-to-parquet/1.3.0`): the step's
   `baseline_resources.mem_gb` and the `action_ceiling.mem_gb` both go 16 → 32, so
