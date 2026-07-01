@@ -68,6 +68,7 @@ from pydantic import BaseModel
 from qiita_common.models import ReadMaskReason
 from qiita_common.parquet import validate_parquet_path
 
+from ..job_resource_plan import count_read_pairs, linear_walltime
 from ..miint import (
     PARQUET_OPTS,
     apply_duckdb_settings,
@@ -75,6 +76,7 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
+from . import JobPlan, JobResourcePlan
 
 YAML_STEP_NAME = "qc"
 
@@ -153,6 +155,40 @@ class Inputs(BaseModel):
     instrument_model: str | None = None
     prep_sample_idx: int
     work_ticket_idx: int
+
+
+# plan() walltime model. qc STREAMS: a per-row scalar transform whose only
+# blocking operator is the final ORDER BY on the NARROW mask (~40 B/row), which
+# DuckDB spills past memory_limit. So peak RAM is ~flat in read count (bounded
+# by the operator working set + memory_limit) — NOT a plan()-from-input axis —
+# while runtime scales ~linearly with rows at a roughly constant throughput.
+# Hence we size WALLTIME, not memory: a small sample finishes well inside the
+# YAML baseline walltime, so requesting less improves SLURM backfill. These are
+# conservative INITIAL coefficients to refine against telemetry; the CP clamps
+# the hint down-only (never above the baseline) and TIMEOUT escalation is the
+# backstop, so erring low costs a retry, not correctness.
+_PLAN_BASE_WALLTIME_SECONDS = 300  # 5 min: process + DuckDB init + fixed read/scan/write overhead
+_PLAN_WALLTIME_SECONDS_PER_MILLION_PAIRS = 30.0
+
+
+def plan(inputs: Inputs) -> JobPlan:
+    """Size qc's WALLTIME from the read count (Parquet footer, no data scan).
+
+    Returns a walltime hint only — memory and cpu are left to the YAML baseline.
+    qc streams, so its peak memory is ~flat in row count (see the coefficient
+    comment above); walltime is the axis that tracks input cardinality. The
+    control plane lowers the step's walltime to this value when it is below the
+    baseline (a small input) and never raises above it; TIMEOUT escalation
+    covers an under-estimate. Advisory: any failure here (e.g. an unreadable
+    input) is caught upstream in the /step/plan route, which falls back to the
+    baseline."""
+    read_pairs = count_read_pairs(inputs.reads)
+    walltime = linear_walltime(
+        read_pairs,
+        base_seconds=_PLAN_BASE_WALLTIME_SECONDS,
+        seconds_per_million_pairs=_PLAN_WALLTIME_SECONDS_PER_MILLION_PAIRS,
+    )
+    return JobPlan(resources=JobResourcePlan(walltime=walltime))
 
 
 def _is_two_color(instrument_model: str | None) -> bool:
