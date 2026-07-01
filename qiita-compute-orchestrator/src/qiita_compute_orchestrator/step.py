@@ -228,6 +228,12 @@ async def plan_step(
     baseline. We log the cause at WARNING so a degrade is never silent, but we
     never fail the step over a sizing hint."""
     _reject_non_native_module(body.module)
+    # The mapping into StepPlanResponse is INSIDE the try: StepPlanResponse
+    # constrains each axis to `> 0`, but JobResourcePlan does not, so a plan()
+    # returning a degenerate hint (cpu=0, a negative value, or a sub-second
+    # walltime that truncates to 0) would raise a ValidationError here. Keeping
+    # it in the try means such a hint degrades to the baseline like every other
+    # plan failure, preserving the advisory guarantee (never a 500).
     try:
         raw_inputs = flatten_native_inputs(
             dict(body.inputs),
@@ -236,6 +242,16 @@ async def plan_step(
             work_ticket_idx=body.work_ticket_idx,
         )
         job_plan = run_native_job_plan(body.module, raw_inputs, step_name=body.step_name)
+        resources = job_plan.resources
+        if resources is None:
+            return StepPlanResponse()
+        return StepPlanResponse(
+            cpu=resources.cpu,
+            mem_gb=resources.mem_gb,
+            walltime_seconds=(
+                int(resources.walltime.total_seconds()) if resources.walltime is not None else None
+            ),
+        )
     except Exception as exc:
         _log.warning(
             "plan() for step %r (module %r) failed; falling back to baseline: %s: %s",
@@ -245,16 +261,6 @@ async def plan_step(
             exc,
         )
         return StepPlanResponse()
-    resources = job_plan.resources
-    if resources is None:
-        return StepPlanResponse()
-    return StepPlanResponse(
-        cpu=resources.cpu,
-        mem_gb=resources.mem_gb,
-        walltime_seconds=(
-            int(resources.walltime.total_seconds()) if resources.walltime is not None else None
-        ),
-    )
 
 
 @router.post(PATH_STEP_STATUS)

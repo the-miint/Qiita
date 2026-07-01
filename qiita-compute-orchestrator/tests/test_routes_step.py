@@ -599,3 +599,50 @@ def test_step_plan_rejects_non_native_module(http_client, cp_to_co_token):
         },
     )
     assert resp.status_code == 422
+
+
+def test_step_plan_degenerate_hint_degrades_not_500(http_client, cp_to_co_token, monkeypatch):
+    """A plan() whose resources violate StepPlanResponse's gt=0 (e.g. cpu=0, or a
+    sub-second walltime that truncates to 0) must NOT surface as HTTP 500 — the
+    resources->StepPlanResponse mapping lives inside the advisory try, so a
+    degenerate hint degrades to an empty 200 like any other plan failure."""
+    import sys
+    import types
+
+    from pydantic import BaseModel
+    from qiita_common.api_paths import URL_STEP_PLAN
+
+    from qiita_compute_orchestrator.jobs import JobPlan, JobResourcePlan
+
+    modname = "qiita_compute_orchestrator.jobs.zero_hint_stub"
+    mod = types.ModuleType(modname)
+
+    class Inputs(BaseModel):
+        pass
+
+    async def execute(inputs, workspace):
+        return {}
+
+    def plan(inputs):
+        # cpu=0 is a valid JobResourcePlan but violates StepPlanResponse(gt=0).
+        return JobPlan(resources=JobResourcePlan(cpu=0))
+
+    mod.Inputs = Inputs
+    mod.execute = execute
+    mod.plan = plan
+    monkeypatch.setitem(sys.modules, modname, mod)
+
+    client, _ = http_client
+    resp = client.post(
+        URL_STEP_PLAN,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "zh",
+            "inputs": {},
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": 1},
+            "work_ticket_idx": 1,
+            "module": modname,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"cpu": None, "mem_gb": None, "walltime_seconds": None}

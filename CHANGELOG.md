@@ -31,7 +31,7 @@ the `no-changelog` label).
   `JobPlan`/`JobResourcePlan` contract types, `run_native_job_plan` dispatcher,
   `job_resource_plan` helpers, `StepPlanRequest`/`StepPlanResponse` wire models,
   and `PATH_/URL_STEP_PLAN` constants; `docs/writing-a-job.md` documents the full
-  native-job contract. No new env var, scope, migration, or operator action. (#TBD)
+  native-job contract. No new env var, scope, migration, or operator action. (#237)
 - **CLI discovery commands for prep-protocol and host-reference idxes.** Two new
   read-only subcommands so operators stop hand-querying Postgres for the idxes
   `submit-bcl-convert` / `submit-host-filter-pool` need. `qiita prep-protocol
