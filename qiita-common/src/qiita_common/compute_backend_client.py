@@ -23,6 +23,7 @@ import httpx
 from .api_paths import (
     URL_REFERENCE_ARTIFACT_BY_IDX,
     URL_STEP_FIND_BY_NAME,
+    URL_STEP_PLAN,
     URL_STEP_RESULT,
     URL_STEP_STATUS,
     URL_STEP_SUBMIT,
@@ -42,6 +43,8 @@ from .models import (
     StepFindByNameRequest,
     StepFindByNameResponse,
     StepHandleWire,
+    StepPlanRequest,
+    StepPlanResponse,
     StepResultRequest,
     StepResultResponse,
     StepStatusRequest,
@@ -152,6 +155,37 @@ class ComputeBackendClient:
         self._raise_if_backend_failure(resp)
         resp.raise_for_status()
         return StepHandleWire.model_validate(resp.json())
+
+    async def plan_step(
+        self,
+        *,
+        step_name: str,
+        inputs: dict[str, Path | str],
+        scope_target: dict[str, Any],
+        work_ticket_idx: int,
+        module: str,
+    ) -> StepPlanResponse:
+        """Fetch a native step's optional `plan()` resource-sizing hint.
+
+        Called ONCE per native step, before its retry loop. `module` is
+        required — plan is native-only. The caller (the runner) treats this
+        as ADVISORY: any failure (unreachable CO, a classified BackendFailure
+        from a broken module, a malformed body) must degrade to the workflow
+        baseline, so the runner wraps this call and never fails a ticket over
+        a sizing hint. That policy lives in the caller, not here — this method
+        raises like the rest of the trio so the caller can log the specific
+        cause."""
+        body = StepPlanRequest(
+            step_name=step_name,
+            inputs={k: str(v) for k, v in inputs.items()},
+            scope_target=scope_target,
+            work_ticket_idx=work_ticket_idx,
+            module=module,
+        )
+        resp = await self._post(URL_STEP_PLAN, body, step_name=step_name)
+        self._raise_if_backend_failure(resp)
+        resp.raise_for_status()
+        return StepPlanResponse.model_validate(resp.json())
 
     async def status_step(self, handle: StepHandleWire) -> StepStatusWire:
         """Read the live status of a submitted step (single, non-blocking).

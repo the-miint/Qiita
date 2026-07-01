@@ -112,6 +112,11 @@ PATH_STEP_PREFIX = "/step"
 PATH_STEP_SUBMIT = "/submit"
 PATH_STEP_STATUS = "/status"
 PATH_STEP_RESULT = "/result"
+# Resource planning: a native step's optional plan() sizing hint, read by the CP
+# runner BEFORE submit so it can lower a step below its YAML baseline for a
+# small input (down-sizing). Advisory — a missing/failed plan degrades to the
+# baseline; escalation remains the up-sizing path. Native (`module`) steps only.
+PATH_STEP_PLAN = "/plan"
 # Recovery / idempotency: look up live SLURM jobs by their deterministic
 # name so the CP can adopt a job it submitted but never recorded the id for.
 PATH_STEP_FIND_BY_NAME = "/find-by-name"
@@ -120,6 +125,7 @@ URL_STEP_PREFIX = f"{API_PREFIX}{PATH_STEP_PREFIX}"
 URL_STEP_SUBMIT = f"{URL_STEP_PREFIX}{PATH_STEP_SUBMIT}"
 URL_STEP_STATUS = f"{URL_STEP_PREFIX}{PATH_STEP_STATUS}"
 URL_STEP_RESULT = f"{URL_STEP_PREFIX}{PATH_STEP_RESULT}"
+URL_STEP_PLAN = f"{URL_STEP_PREFIX}{PATH_STEP_PLAN}"
 URL_STEP_FIND_BY_NAME = f"{URL_STEP_PREFIX}{PATH_STEP_FIND_BY_NAME}"
 
 

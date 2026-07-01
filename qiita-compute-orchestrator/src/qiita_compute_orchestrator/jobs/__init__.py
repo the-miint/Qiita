@@ -27,6 +27,7 @@ import importlib
 import inspect
 import pkgutil
 import types
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,34 @@ from pydantic import BaseModel, ValidationError
 from qiita_common.actions import NATIVE_MODULE_PREFIX
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import ScopeTargetKind, WorkTicketFailureStage
+
+
+class JobResourcePlan(BaseModel):
+    """Optional per-axis resource hint returned inside a `JobPlan`.
+
+    Any field left None means "no opinion — use the workflow baseline" for that
+    axis. The control plane composes a non-None value by LOWERING the step
+    below its YAML baseline (down-sizing a small input); escalation remains the
+    only up-sizing path, so a value ABOVE baseline is a no-op. There is
+    deliberately no `gpu` axis: GPU need is a property of the algorithm, not the
+    input size, and the down-only `min()` composition would be a footgun for it
+    (it could zero out a GPU a job requires) — add it, with its own composition
+    rule, only when a GPU job needs input-driven GPU sizing."""
+
+    cpu: int | None = None
+    mem_gb: int | None = None
+    walltime: timedelta | None = None
+
+
+class JobPlan(BaseModel):
+    """What a native job's optional `plan(inputs)` returns — an advisory sizing
+    hint the control plane reads before submit. Empty (`resources=None`) is the
+    valid no-op a job with no opinion returns; the CP then uses the baseline
+    unchanged. Wrapped (not a bare `JobResourcePlan`) so future planning facets
+    (e.g. output-schema declaration, work partitioning) can be added without a
+    breaking change to the `plan()` contract."""
+
+    resources: JobResourcePlan | None = None
 
 
 def _contract_violation(*, step_name: str, reason: str) -> BackendFailure:
@@ -233,6 +262,80 @@ async def run_native_job(
         ) from exc
 
 
+def run_native_job_plan(
+    module_name: str,
+    raw_inputs: dict[str, Any],
+    *,
+    step_name: str,
+) -> JobPlan:
+    """Run a native job's optional `plan(inputs)` and return its `JobPlan`.
+
+    Called at submit time (in the orchestrator process, never on a compute
+    node) by the `/step/plan` route, ONCE per native step before its retry
+    loop. Mirrors `run_native_job`'s import + `Inputs` validation so `plan()`
+    sees the SAME validated `Inputs` `execute()` will, then invokes `plan()`.
+
+    Returns an EMPTY `JobPlan()` (no hint) when the module defines no `plan` —
+    that is the common case and not an error. A module outside
+    `NATIVE_MODULE_PREFIX`, a failed import, or a malformed module raises the
+    same CONTRACT_VIOLATION `run_native_job` would (these are boot-scanned
+    bugs). `Inputs` validation failure raises BAD_INPUT.
+
+    This helper does NOT swallow exceptions raised inside `plan()` itself — it
+    lets them propagate. The `/step/plan` route is the single place that
+    applies the ADVISORY degrade (log + empty response), so a buggy `plan()`
+    never fails a ticket, while the cause is still logged rather than silently
+    lost."""
+    if not module_name.startswith(NATIVE_MODULE_PREFIX):
+        raise _contract_violation(
+            step_name=step_name,
+            reason=(
+                f"native module path must start with {NATIVE_MODULE_PREFIX!r}; got {module_name!r}"
+            ),
+        )
+    try:
+        mod = importlib.import_module(module_name)
+    except Exception as exc:
+        raise _contract_violation(
+            step_name=step_name,
+            reason=(
+                f"failed to import native job module {module_name!r}: {type(exc).__name__}: {exc}"
+            ),
+        ) from exc
+
+    mod_errors = validate_native_job_module(mod)
+    if mod_errors:
+        raise _contract_violation(
+            step_name=step_name,
+            reason=f"native job {module_name!r}: {'; '.join(mod_errors)}",
+        )
+
+    plan = getattr(mod, "plan", None)
+    if plan is None:
+        return JobPlan()
+
+    try:
+        inputs = mod.Inputs.model_validate(raw_inputs)
+    except ValidationError as exc:
+        raise BackendFailure(
+            kind=FailureKind.BAD_INPUT,
+            stage=WorkTicketFailureStage.STEP_RUN,
+            step_name=step_name,
+            reason=f"native job {module_name!r} input validation failed: {exc}",
+        ) from exc
+
+    result = plan(inputs)
+    if not isinstance(result, JobPlan):
+        raise _contract_violation(
+            step_name=step_name,
+            reason=(
+                f"native job {module_name!r} plan() must return a JobPlan; "
+                f"got {type(result).__name__}"
+            ),
+        )
+    return result
+
+
 # =============================================================================
 # Boot-time discovery scan
 # =============================================================================
@@ -260,6 +363,16 @@ def validate_native_job_module(mod: types.ModuleType) -> list[str]:
         errors.append("`Inputs` must be a BaseModel subclass")
     if not inspect.iscoroutinefunction(execute):
         errors.append("`execute` must be an async function")
+    # `plan` is OPTIONAL — a job without one uses its YAML baseline verbatim.
+    # If present it must be a plain (sync) callable: it runs at submit time in
+    # the orchestrator process (a lightweight footer/metadata read), never on a
+    # compute node, so an async plan() would be a contract error.
+    plan = getattr(mod, "plan", None)
+    if plan is not None:
+        if inspect.iscoroutinefunction(plan):
+            errors.append("`plan` must be a sync function (it runs at submit time, not on a node)")
+        elif not callable(plan):
+            errors.append("`plan` must be callable")
     return errors
 
 

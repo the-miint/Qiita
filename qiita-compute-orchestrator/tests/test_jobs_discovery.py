@@ -120,6 +120,34 @@ def test_validate_flags_execute_not_async():
     assert errors == ["`execute` must be an async function"]
 
 
+def test_validate_accepts_optional_sync_plan():
+    """`plan` is optional; a well-formed sync plan() is accepted."""
+
+    def plan(inputs):
+        return None
+
+    mod = _mod(Inputs=_Inputs, execute=_good_execute, plan=plan)
+    assert validate_native_job_module(mod) == []
+
+
+def test_validate_flags_async_plan():
+    """plan() runs at submit time in the orchestrator process, not on a node —
+    an async plan() is a contract error."""
+
+    async def plan(inputs):
+        return None
+
+    mod = _mod(Inputs=_Inputs, execute=_good_execute, plan=plan)
+    errors = validate_native_job_module(mod)
+    assert errors == ["`plan` must be a sync function (it runs at submit time, not on a node)"]
+
+
+def test_validate_flags_non_callable_plan():
+    mod = _mod(Inputs=_Inputs, execute=_good_execute, plan="not-callable")
+    errors = validate_native_job_module(mod)
+    assert errors == ["`plan` must be callable"]
+
+
 def test_scan_native_jobs_succeeds_on_real_tree():
     """The shipped jobs/ tree validates cleanly: the fastq_to_parquet
     skeleton exports Inputs + execute and `__init__`/`__main__` are
