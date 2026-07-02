@@ -30,14 +30,16 @@ from qiita_common.actions import (
     WorkflowStep,
 )
 from qiita_common.backend_failure import BackendFailure, FailureKind
-from qiita_common.models import StepType, WorkTicketFailureStage
+from qiita_common.models import StepPlanResponse, StepType, WorkTicketFailureStage
 
 from qiita_control_plane.runner import (
     _POLL_DB_READ_MAX_ATTEMPTS,
     WorkflowAborted,
     _attempt_is_unowned,
+    _bind_step_inputs,
     _escalated_mem_floor_after_oom,
     _escalated_walltime_after_timeout,
+    _fetch_plan_hint,
     _is_transient_db_error,
     _raise_if_ticket_terminal,
     _resolve_baseline_for_step,
@@ -501,6 +503,209 @@ def test_walltime_escalation_full_sequence_to_ceiling():
         timedelta(hours=8),
         timedelta(hours=8),
     ]
+
+
+# =============================================================================
+# plan() down-size hint — lowers below baseline; escalation still wins on retry
+# =============================================================================
+
+
+def test_plan_hint_lowers_mem_below_baseline():
+    """A plan() memory hint below the YAML baseline down-sizes the step."""
+    step = _step(BaselineResources(cpu=4, mem_gb=12, walltime=timedelta(hours=2)))
+    resolved = _resolve_baseline_for_step(
+        entry=step, bound={}, action_ceiling=_CEILING, plan_hint=StepPlanResponse(mem_gb=4)
+    )
+    assert resolved.mem_gb == 4
+
+
+def test_plan_hint_lowers_walltime_below_baseline():
+    step = _step(BaselineResources(cpu=4, mem_gb=12, walltime=timedelta(hours=4)))
+    resolved = _resolve_baseline_for_step(
+        entry=step,
+        bound={},
+        action_ceiling=_CEILING,
+        plan_hint=StepPlanResponse(walltime_seconds=600),
+    )
+    assert resolved.walltime == timedelta(seconds=600)
+
+
+def test_plan_hint_above_baseline_is_noop():
+    """Down-only: a hint larger than the baseline never raises the step
+    (up-sizing is escalation's job, not plan's)."""
+    step = _step(BaselineResources(cpu=4, mem_gb=12, walltime=timedelta(hours=2)))
+    resolved = _resolve_baseline_for_step(
+        entry=step,
+        bound={},
+        action_ceiling=_CEILING,
+        plan_hint=StepPlanResponse(
+            mem_gb=48, walltime_seconds=int(timedelta(hours=8).total_seconds())
+        ),
+    )
+    assert resolved.mem_gb == 12
+    assert resolved.walltime == timedelta(hours=2)
+
+
+def test_plan_hint_none_leaves_baseline_verbatim():
+    step = _step(BaselineResources(cpu=4, mem_gb=12, walltime=timedelta(hours=2)))
+    resolved = _resolve_baseline_for_step(
+        entry=step, bound={}, action_ceiling=_CEILING, plan_hint=None
+    )
+    assert resolved == FlatBaselineResources(cpu=4, mem_gb=12, walltime=timedelta(hours=2))
+
+
+def test_plan_hint_partial_only_touches_named_axis():
+    """A hint that sets only walltime leaves cpu/mem at the baseline."""
+    step = _step(BaselineResources(cpu=8, mem_gb=32, walltime=timedelta(hours=4)))
+    resolved = _resolve_baseline_for_step(
+        entry=step,
+        bound={},
+        action_ceiling=_CEILING,
+        plan_hint=StepPlanResponse(walltime_seconds=300),
+    )
+    assert resolved.cpu == 8
+    assert resolved.mem_gb == 32
+    assert resolved.walltime == timedelta(seconds=300)
+
+
+def test_escalation_override_beats_plan_hint_on_retry():
+    """The correctness invariant: plan() down-size is applied BEFORE the
+    raise-only escalation floors, so a retry (whose floor is seeded from the
+    YAML baseline, >= any down-sized value) always restores at least the
+    baseline. A 12 GB baseline down-sized to 4 GB by plan, with a 24 GB OOM
+    escalation floor, resolves to 24 GB — the hint does not strand the retry
+    below the size it needs."""
+    step = _step(BaselineResources(cpu=4, mem_gb=12, walltime=timedelta(hours=2)))
+    resolved = _resolve_baseline_for_step(
+        entry=step,
+        bound={},
+        action_ceiling=_CEILING,
+        mem_gb_override=24,
+        walltime_override=timedelta(hours=4),
+        plan_hint=StepPlanResponse(mem_gb=4, walltime_seconds=600),
+    )
+    assert resolved.mem_gb == 24
+    assert resolved.walltime == timedelta(hours=4)
+
+
+def test_plan_hint_not_applied_without_escalation_headroom():
+    """A down-size is skipped on an axis where baseline == ceiling: with no room
+    for escalation to grow, a down-sized attempt that OOMs/TIMEOUTs would be
+    misread as RESOURCE_CEILING_EXHAUSTED and fail without ever running at the
+    baseline. So the axis stays at the baseline; only axes with headroom (cpu
+    here, 4 < 32) are lowered."""
+    step = _step(BaselineResources(cpu=4, mem_gb=32, walltime=timedelta(hours=8)))
+    # ceiling == baseline on mem_gb AND walltime -> no headroom on either; cpu
+    # has headroom (4 < 32).
+    tight = ActionCeiling(cpu=32, mem_gb=32, walltime=timedelta(hours=8), gpu=4)
+    resolved = _resolve_baseline_for_step(
+        entry=step,
+        bound={},
+        action_ceiling=tight,
+        plan_hint=StepPlanResponse(cpu=2, mem_gb=4, walltime_seconds=600),
+    )
+    assert resolved.mem_gb == 32  # no headroom -> not lowered
+    assert resolved.walltime == timedelta(hours=8)  # no headroom -> not lowered
+    assert resolved.cpu == 2  # headroom (4 < 32) -> lowered
+
+
+# =============================================================================
+# _fetch_plan_hint — advisory: container steps skip; any failure -> None
+# =============================================================================
+
+
+def _native_step(name: str = "qc") -> WorkflowStep:
+    """A native (module) step — the only kind _fetch_plan_hint queries."""
+    return WorkflowStep(
+        kind="step",
+        name=name,
+        step_type=StepType.SINGLETON,
+        module="qiita_compute_orchestrator.jobs.qc",
+        baseline_resources=BaselineResources(cpu=4, mem_gb=12, walltime=timedelta(hours=2)),
+    )
+
+
+class _FakePlanClient:
+    """Stand-in for ComputeBackendClient.plan_step. `result` is returned, or an
+    Exception instance is raised, to script the fetch outcome."""
+
+    def __init__(self, result):
+        self._result = result
+        self.calls: list[dict] = []
+
+    async def plan_step(self, **kwargs):
+        self.calls.append(kwargs)
+        if isinstance(self._result, BaseException):
+            raise self._result
+        return self._result
+
+
+async def test_fetch_plan_hint_returns_hint_for_native_step():
+    client = _FakePlanClient(StepPlanResponse(walltime_seconds=600))
+    hint = await _fetch_plan_hint(
+        client,
+        _native_step(),
+        {"reads": "/scratch/r.parquet"},
+        {"kind": "prep_sample", "prep_sample_idx": 5},
+        work_ticket_idx=7,
+    )
+    assert hint == StepPlanResponse(walltime_seconds=600)
+    # It forwarded the module + bound inputs so plan() sees the right Inputs.
+    assert client.calls[0]["module"] == "qiita_compute_orchestrator.jobs.qc"
+    assert client.calls[0]["work_ticket_idx"] == 7
+
+
+async def test_fetch_plan_hint_skips_container_step():
+    """A container step has no plan(); the fetch is skipped without a call."""
+    client = _FakePlanClient(StepPlanResponse(mem_gb=4))
+    hint = await _fetch_plan_hint(
+        client,
+        _step(BaselineResources(cpu=4, mem_gb=12, walltime=timedelta(hours=2))),
+        {},
+        {"kind": "reference", "reference_idx": 1},
+        work_ticket_idx=1,
+    )
+    assert hint is None
+    assert client.calls == []
+
+
+async def test_fetch_plan_hint_degrades_to_none_on_error():
+    """Advisory: ANY failure (here an unreachable-orchestrator surrogate) must
+    degrade to None so dispatch proceeds on the YAML baseline."""
+    client = _FakePlanClient(RuntimeError("orchestrator down"))
+    hint = await _fetch_plan_hint(
+        client,
+        _native_step(),
+        {"reads": "/scratch/r.parquet"},
+        {"kind": "prep_sample", "prep_sample_idx": 5},
+        work_ticket_idx=7,
+    )
+    assert hint is None
+
+
+def test_bind_step_inputs_paths_and_scalar_params():
+    """Inputs/optional_inputs become Paths; scalar params stay strings — the
+    shared shape submit and plan both send."""
+    step = WorkflowStep(
+        kind="step",
+        name="qc",
+        step_type=StepType.SINGLETON,
+        module="qiita_compute_orchestrator.jobs.qc",
+        inputs=["reads"],
+        optional_inputs=["adapter_parquet"],
+        params={"instrument_model_ctx": "instrument_model"},
+        baseline_resources=BaselineResources(cpu=4, mem_gb=12, walltime=timedelta(hours=2)),
+    )
+    bound = {
+        "reads": "/scratch/r.parquet",
+        "adapter_parquet": "/scratch/a.parquet",
+        "instrument_model_ctx": "NextSeq 550",
+    }
+    out = _bind_step_inputs(step, bound)
+    assert out["reads"] == Path("/scratch/r.parquet")
+    assert out["adapter_parquet"] == Path("/scratch/a.parquet")
+    # scalar param: keyed by the Inputs field name, value left a string.
+    assert out["instrument_model"] == "NextSeq 550"
 
 
 def test_attempt_is_unowned():

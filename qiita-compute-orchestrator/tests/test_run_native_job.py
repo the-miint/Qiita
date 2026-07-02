@@ -20,7 +20,12 @@ from pydantic import BaseModel
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.models import WorkTicketFailureStage
 
-from qiita_compute_orchestrator.jobs import run_native_job
+from qiita_compute_orchestrator.jobs import (
+    JobPlan,
+    JobResourcePlan,
+    run_native_job,
+    run_native_job_plan,
+)
 
 
 def _install_stub(
@@ -29,19 +34,27 @@ def _install_stub(
     short_name: str,
     inputs_cls: type | None,
     execute_fn,
+    plan_fn=None,
 ) -> str:
     """Inject a fake job module under qiita_compute_orchestrator.jobs.<short_name>
     and return its full module path. Used by every test below to
     exercise a specific dispatcher branch without touching real job
-    files on disk."""
+    files on disk. `plan_fn`, when given, installs the optional `plan`
+    export exercised by `run_native_job_plan`."""
     full = f"qiita_compute_orchestrator.jobs.{short_name}"
     mod = types.ModuleType(full)
     if inputs_cls is not None:
         mod.Inputs = inputs_cls
     if execute_fn is not None:
         mod.execute = execute_fn
+    if plan_fn is not None:
+        mod.plan = plan_fn
     monkeypatch.setitem(sys.modules, full, mod)
     return full
+
+
+async def _noop_execute(inputs, workspace):
+    return {}
 
 
 class _Inputs(BaseModel):
@@ -264,3 +277,94 @@ async def test_unknown_exception_propagates(monkeypatch, tmp_path):
     name = _install_stub(monkeypatch, short_name="weird", inputs_cls=_Inputs, execute_fn=execute)
     with pytest.raises(CustomError):
         await run_native_job(name, {"x": 1}, tmp_path, step_name="step")
+
+
+# ============================================================================
+# run_native_job_plan — the submit-time plan() dispatcher
+# ============================================================================
+
+
+async def test_plan_dispatch_returns_job_plan(monkeypatch, tmp_path):
+    """A module with a plan() has it called with the validated Inputs; its
+    JobPlan is returned."""
+    seen: list = []
+
+    def plan(inputs):
+        seen.append(inputs.x)
+        return JobPlan(
+            resources=JobResourcePlan(walltime=__import__("datetime").timedelta(seconds=90))
+        )
+
+    name = _install_stub(
+        monkeypatch,
+        short_name="planned",
+        inputs_cls=_Inputs,
+        execute_fn=_noop_execute,
+        plan_fn=plan,
+    )
+    result = run_native_job_plan(name, {"x": 7}, step_name="step")
+    assert seen == [7]  # plan() saw the validated Inputs
+    assert result.resources.walltime.total_seconds() == 90
+
+
+async def test_plan_dispatch_no_plan_returns_empty(monkeypatch):
+    """A module WITHOUT plan() is the common case — an empty JobPlan (no hint),
+    not an error."""
+    name = _install_stub(
+        monkeypatch, short_name="noplan", inputs_cls=_Inputs, execute_fn=_noop_execute
+    )
+    result = run_native_job_plan(name, {"x": 1}, step_name="step")
+    assert result == JobPlan()
+
+
+async def test_plan_dispatch_non_jobplan_return_is_contract_violation(monkeypatch):
+    """A plan() that returns something other than a JobPlan is a job-authoring
+    bug surfaced as CONTRACT_VIOLATION."""
+    name = _install_stub(
+        monkeypatch,
+        short_name="badplan",
+        inputs_cls=_Inputs,
+        execute_fn=_noop_execute,
+        plan_fn=lambda inputs: {"mem_gb": 4},
+    )
+    with pytest.raises(BackendFailure) as ei:
+        run_native_job_plan(name, {"x": 1}, step_name="step")
+    assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
+    assert "must return a JobPlan" in ei.value.reason
+
+
+async def test_plan_dispatch_bad_prefix_is_contract_violation():
+    with pytest.raises(BackendFailure) as ei:
+        run_native_job_plan("os.system", {}, step_name="step")
+    assert ei.value.kind is FailureKind.CONTRACT_VIOLATION
+
+
+async def test_plan_dispatch_inputs_validation_failure_is_bad_input(monkeypatch):
+    name = _install_stub(
+        monkeypatch,
+        short_name="planbadin",
+        inputs_cls=_Inputs,
+        execute_fn=_noop_execute,
+        plan_fn=lambda inputs: JobPlan(),
+    )
+    with pytest.raises(BackendFailure) as ei:
+        run_native_job_plan(name, {"x": "not-an-int"}, step_name="step")
+    assert ei.value.kind is FailureKind.BAD_INPUT
+
+
+async def test_plan_dispatch_propagates_plan_exception(monkeypatch):
+    """The dispatcher does NOT swallow a plan() exception — the /step/plan route
+    owns the advisory degrade, so the dispatcher lets the cause propagate."""
+
+    def boom(inputs):
+        raise RuntimeError("plan blew up")
+
+    name = _install_stub(
+        monkeypatch,
+        short_name="planboom",
+        inputs_cls=_Inputs,
+        execute_fn=_noop_execute,
+        plan_fn=boom,
+    )
+    with pytest.raises(RuntimeError, match="plan blew up"):
+        run_native_job_plan(name, {"x": 1}, step_name="step")

@@ -474,3 +474,175 @@ def test_step_find_by_name_serializes_backend_failure(http_client, cp_to_co_toke
     assert resp.status_code == BACKEND_FAILURE_HTTP_STATUS
     assert resp.headers[BACKEND_FAILURE_HEADER] == "1"
     assert resp.json()["kind"] == "slurmrestd_unreachable"
+
+
+# ============================================================================
+# /step/plan — the submit-time resource-sizing hint (backend-agnostic)
+# ============================================================================
+
+_QC_MODULE = "qiita_compute_orchestrator.jobs.qc"
+
+
+def _write_reads(path: Path, n_rows: int) -> Path:
+    """Minimal fastq_to_parquet-shaped reads.parquet with `n_rows` rows — enough
+    for qc.plan()'s footer count(*). Sequences/quals are irrelevant to plan."""
+    import duckdb
+
+    with duckdb.connect(":memory:") as conn:
+        conn.execute(
+            "COPY (SELECT i AS sequence_idx, CAST(i AS VARCHAR) AS read_id, "
+            "'AAAA' AS sequence1, CAST(NULL AS UTINYINT[]) AS qual1, "
+            "CAST(NULL AS VARCHAR) AS sequence2, CAST(NULL AS UTINYINT[]) AS qual2 "
+            f"FROM range({n_rows}) t(i)) TO '{path}' (FORMAT PARQUET)"
+        )
+    return path
+
+
+def test_step_plan_requires_bearer_token(http_client):
+    from qiita_common.api_paths import URL_STEP_PLAN
+
+    client, _ = http_client
+    resp = client.post(
+        URL_STEP_PLAN,
+        json={
+            "step_name": "qc",
+            "inputs": {},
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": 1},
+            "work_ticket_idx": 1,
+            "module": _QC_MODULE,
+        },
+    )
+    assert resp.status_code == 401
+
+
+def test_step_plan_requires_module(http_client, cp_to_co_token):
+    """module is native-only and required — a body without it is a 422."""
+    from qiita_common.api_paths import URL_STEP_PLAN
+
+    client, _ = http_client
+    resp = client.post(
+        URL_STEP_PLAN,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "qc",
+            "inputs": {},
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": 1},
+            "work_ticket_idx": 1,
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_step_plan_returns_qc_walltime_hint(http_client, cp_to_co_token, tmp_path):
+    """End-to-end: the route flattens inputs, runs the real qc.plan(), and
+    returns its walltime hint (memory/cpu left to the baseline)."""
+    from qiita_common.api_paths import URL_STEP_PLAN
+
+    client, _ = http_client
+    reads = _write_reads(tmp_path / "reads.parquet", 3)
+    resp = client.post(
+        URL_STEP_PLAN,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "qc",
+            "inputs": {"reads": str(reads), "adapter_parquet": str(tmp_path / "a.parquet")},
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": 42},
+            "work_ticket_idx": 9,
+            "module": _QC_MODULE,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # 3 reads: base 300s + ceil(3/1e6 * 30) = 301s. mem/cpu untouched (None).
+    assert body["walltime_seconds"] == 301
+    assert body["mem_gb"] is None
+    assert body["cpu"] is None
+
+
+def test_step_plan_advisory_degrade_on_broken_module(http_client, cp_to_co_token):
+    """A native module path that can't be imported is a CONTRACT_VIOLATION in
+    the dispatcher, but the route degrades it to an EMPTY hint (200, all None)
+    so the CP falls back to the baseline — plan is never allowed to fail a step."""
+    from qiita_common.api_paths import URL_STEP_PLAN
+
+    client, _ = http_client
+    resp = client.post(
+        URL_STEP_PLAN,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "ghost",
+            "inputs": {},
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": 1},
+            "work_ticket_idx": 1,
+            "module": "qiita_compute_orchestrator.jobs.definitely_not_real",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"cpu": None, "mem_gb": None, "walltime_seconds": None}
+
+
+def test_step_plan_rejects_non_native_module(http_client, cp_to_co_token):
+    """Defense in depth: a module outside NATIVE_MODULE_PREFIX is a 422 (same
+    guard as submit), not an advisory degrade."""
+    from qiita_common.api_paths import URL_STEP_PLAN
+
+    client, _ = http_client
+    resp = client.post(
+        URL_STEP_PLAN,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "evil",
+            "inputs": {},
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": 1},
+            "work_ticket_idx": 1,
+            "module": "os.system",
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_step_plan_degenerate_hint_degrades_not_500(http_client, cp_to_co_token, monkeypatch):
+    """A plan() whose resources violate StepPlanResponse's gt=0 (e.g. cpu=0, or a
+    sub-second walltime that truncates to 0) must NOT surface as HTTP 500 — the
+    resources->StepPlanResponse mapping lives inside the advisory try, so a
+    degenerate hint degrades to an empty 200 like any other plan failure."""
+    import sys
+    import types
+
+    from pydantic import BaseModel
+    from qiita_common.api_paths import URL_STEP_PLAN
+
+    from qiita_compute_orchestrator.jobs import JobPlan, JobResourcePlan
+
+    modname = "qiita_compute_orchestrator.jobs.zero_hint_stub"
+    mod = types.ModuleType(modname)
+
+    class Inputs(BaseModel):
+        pass
+
+    async def execute(inputs, workspace):
+        return {}
+
+    def plan(inputs):
+        # cpu=0 is a valid JobResourcePlan but violates StepPlanResponse(gt=0).
+        return JobPlan(resources=JobResourcePlan(cpu=0))
+
+    mod.Inputs = Inputs
+    mod.execute = execute
+    mod.plan = plan
+    monkeypatch.setitem(sys.modules, modname, mod)
+
+    client, _ = http_client
+    resp = client.post(
+        URL_STEP_PLAN,
+        headers={"Authorization": f"Bearer {cp_to_co_token}"},
+        json={
+            "step_name": "zh",
+            "inputs": {},
+            "scope_target": {"kind": "prep_sample", "prep_sample_idx": 1},
+            "work_ticket_idx": 1,
+            "module": modname,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"cpu": None, "mem_gb": None, "walltime_seconds": None}
