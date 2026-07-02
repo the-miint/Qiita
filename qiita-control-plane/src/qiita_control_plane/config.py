@@ -75,6 +75,25 @@ def _parse_positive_int_env(var: str, default: int) -> int:
     return value
 
 
+def _parse_nonnegative_int_env(var: str, default: int) -> int:
+    """Like `_parse_positive_int_env` but accepts 0 as a valid value.
+
+    For settings where zero is meaningful rather than a misconfiguration — e.g.
+    `AUTHROCKET_JWT_LEEWAY_SECONDS=0` means "tolerate no clock skew". Still fails
+    loudly, naming the variable, on a non-int or negative value.
+    """
+    raw = os.environ.get(var)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{var} must be an integer, got {raw!r}") from exc
+    if value < 0:
+        raise RuntimeError(f"{var} must be non-negative, got {value}")
+    return value
+
+
 def _parse_optional_positive_int_env(var: str) -> int | None:
     """Like `_parse_positive_int_env` but returns None when the var is unset,
     for genuinely optional positive-int settings (e.g. a default reference idx
@@ -260,30 +279,25 @@ class Settings:
             authrocket_audience=os.environ.get("AUTHROCKET_AUDIENCE") or None,
             authrocket_jwks_url=jwks_url,
             authrocket_loginrocket_url=os.environ.get("AUTHROCKET_LOGINROCKET_URL") or None,
-            authrocket_jwt_leeway_seconds=int(
-                os.environ.get("AUTHROCKET_JWT_LEEWAY_SECONDS", str(_DEFAULT_JWT_LEEWAY_SECONDS))
+            # Leeway may legitimately be 0 (tolerate no clock skew); the other
+            # four knobs are strictly positive. All route through the validating
+            # parsers so a negative/zero/non-int value fails loudly, naming the
+            # variable, instead of silently collapsing an auth window.
+            authrocket_jwt_leeway_seconds=_parse_nonnegative_int_env(
+                "AUTHROCKET_JWT_LEEWAY_SECONDS", _DEFAULT_JWT_LEEWAY_SECONDS
             ),
-            authrocket_pat_max_auth_age_seconds=int(
-                os.environ.get(
-                    "AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS",
-                    str(_DEFAULT_PAT_MAX_AUTH_AGE_SECONDS),
-                )
+            authrocket_pat_max_auth_age_seconds=_parse_positive_int_env(
+                "AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS", _DEFAULT_PAT_MAX_AUTH_AGE_SECONDS
             ),
-            token_default_ttl_days=int(
-                os.environ.get("QIITA_TOKEN_DEFAULT_TTL_DAYS", str(_DEFAULT_TOKEN_TTL_DAYS))
+            token_default_ttl_days=_parse_positive_int_env(
+                "QIITA_TOKEN_DEFAULT_TTL_DAYS", _DEFAULT_TOKEN_TTL_DAYS
             ),
             qiita_endpoint_url=os.environ.get("QIITA_ENDPOINT_URL") or None,
-            auth_handoff_freshness_seconds=int(
-                os.environ.get(
-                    "AUTH_HANDOFF_FRESHNESS_SECONDS",
-                    str(_DEFAULT_AUTH_HANDOFF_FRESHNESS_SECONDS),
-                )
+            auth_handoff_freshness_seconds=_parse_positive_int_env(
+                "AUTH_HANDOFF_FRESHNESS_SECONDS", _DEFAULT_AUTH_HANDOFF_FRESHNESS_SECONDS
             ),
-            cli_login_code_ttl_seconds=int(
-                os.environ.get(
-                    "CLI_LOGIN_CODE_TTL_SECONDS",
-                    str(_DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS),
-                )
+            cli_login_code_ttl_seconds=_parse_positive_int_env(
+                "CLI_LOGIN_CODE_TTL_SECONDS", _DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS
             ),
             max_sequence_mint_count=_parse_positive_int_env(
                 "QIITA_MAX_SEQUENCE_MINT_COUNT",

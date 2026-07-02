@@ -127,6 +127,57 @@ def test_settings_rejects_nonpositive_max_sequence_mint_count(monkeypatch, bad_v
         Settings.from_env()
 
 
+@pytest.mark.parametrize(
+    "var",
+    [
+        "AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS",
+        "QIITA_TOKEN_DEFAULT_TTL_DAYS",
+        "AUTH_HANDOFF_FRESHNESS_SECONDS",
+        "CLI_LOGIN_CODE_TTL_SECONDS",
+    ],
+)
+@pytest.mark.parametrize("bad_value", ["0", "-1", "notanint"])
+def test_settings_rejects_bad_positive_auth_knob(monkeypatch, var, bad_value):
+    """The strictly-positive auth knobs must fail loudly (naming the var) on a
+    non-positive or non-int value rather than silently collapsing an auth
+    window — previously they used a bare int() that accepted 0/negatives."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.setenv(var, bad_value)
+
+    from qiita_control_plane.config import Settings
+
+    with pytest.raises(RuntimeError, match=var):
+        Settings.from_env()
+
+
+def test_settings_jwt_leeway_allows_zero(monkeypatch):
+    """AUTHROCKET_JWT_LEEWAY_SECONDS=0 is a valid strict setting (tolerate no
+    clock skew) and must NOT be rejected — it routes through the non-negative
+    parser, not the positive-only one."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.setenv("AUTHROCKET_JWT_LEEWAY_SECONDS", "0")
+
+    from qiita_control_plane.config import Settings
+
+    settings = Settings.from_env()
+    assert settings.authrocket_jwt_leeway_seconds == 0
+
+
+@pytest.mark.parametrize("bad_value", ["-1", "notanint"])
+def test_settings_rejects_bad_jwt_leeway(monkeypatch, bad_value):
+    """A negative or non-int leeway still fails loudly, naming the variable."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("HMAC_SECRET_KEY", _TEST_SECRET_B64)
+    monkeypatch.setenv("AUTHROCKET_JWT_LEEWAY_SECONDS", bad_value)
+
+    from qiita_control_plane.config import Settings
+
+    with pytest.raises(RuntimeError, match="AUTHROCKET_JWT_LEEWAY_SECONDS"):
+        Settings.from_env()
+
+
 def test_settings_rejects_non_integer_max_sequence_mint_count(monkeypatch):
     """An un-parseable env var should name itself in the failure, not
     surface a bare int() ValueError with no context."""
