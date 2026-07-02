@@ -15,10 +15,11 @@ The version byte allows future wire format changes without breaking verification
 
 import hashlib
 import hmac
-import json
 import struct
 import time
 from typing import Any
+
+from qiita_common.hashing import canonical_json
 
 TICKET_VERSION = 1
 DEFAULT_TTL_SECONDS = 300
@@ -40,7 +41,11 @@ def _sign_payload(
     if expiry_epoch is None:
         expiry_epoch = int(time.time()) + ttl_seconds
 
-    payload = json.dumps(payload_dict, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    # Canonical JSON (sorted keys, no whitespace, UTF-8) is the byte-for-byte
+    # wire contract the Rust verifier HMACs over — it re-hashes these exact
+    # bytes, so the serialization must never drift. Sourced from the single
+    # qiita_common.hashing.canonical_json rather than re-spelled here.
+    payload = canonical_json(payload_dict)
 
     version_byte = struct.pack("B", TICKET_VERSION)
     payload_len = struct.pack(">I", len(payload))
@@ -60,7 +65,17 @@ def sign_ticket(
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     expiry_epoch: int | None = None,
 ) -> bytes:
-    """Sign a DoGet Flight ticket with HMAC-SHA256."""
+    """Sign a DoGet Flight ticket with HMAC-SHA256.
+
+    An empty ``filter`` (or a filter with any empty value list) is rejected here
+    at the signing boundary: the data plane treats an empty filter as
+    ``SELECT * FROM <table>``, so signing one would authorize an unscoped
+    full-table dump. Every caller passes a mandatory, non-empty identifier
+    filter; centralizing the check means a future caller can't silently mint a
+    dump-everything ticket even if it forgets the route-level guard.
+    """
+    if not filter or any(not value for value in filter.values()):
+        raise ValueError("sign_ticket requires a non-empty filter with non-empty values")
     return _sign_payload(
         {"filter": filter, "table": table},
         secret,

@@ -89,7 +89,7 @@ def test_sign_ticket_includes_expiry_in_future():
 
     ticket = sign_ticket(
         table="test",
-        filter={},
+        filter={"x": [1]},
         secret=b"dev-secret",
     )
 
@@ -127,6 +127,20 @@ def test_sign_ticket_rejects_nonpositive_ttl():
     from qiita_control_plane.auth.tickets import sign_ticket
 
     with pytest.raises(ValueError, match="positive"):
-        sign_ticket(table="test", filter={}, secret=b"dev-secret", ttl_seconds=0)
+        sign_ticket(table="test", filter={"x": [1]}, secret=b"dev-secret", ttl_seconds=0)
     with pytest.raises(ValueError, match="positive"):
-        sign_ticket(table="test", filter={}, secret=b"dev-secret", ttl_seconds=-1)
+        sign_ticket(table="test", filter={"x": [1]}, secret=b"dev-secret", ttl_seconds=-1)
+
+
+def test_sign_ticket_rejects_empty_filter():
+    """sign_ticket must refuse an empty filter or one with an empty value list.
+
+    An empty filter authorizes ``SELECT * FROM <table>`` on the data plane, so
+    the signing boundary rejects it rather than minting a dump-everything ticket.
+    """
+    from qiita_control_plane.auth.tickets import sign_ticket
+
+    with pytest.raises(ValueError, match="non-empty filter"):
+        sign_ticket(table="test", filter={}, secret=b"dev-secret")
+    with pytest.raises(ValueError, match="non-empty filter"):
+        sign_ticket(table="test", filter={"prep_sample_idx": []}, secret=b"dev-secret")
