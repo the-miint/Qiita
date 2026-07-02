@@ -15,6 +15,23 @@ the `no-changelog` label).
 
 ### Added
 
+- **Optional `plan()` phase for native jobs — input-driven resource sizing.** A
+  native job module may now export an optional `plan(inputs) -> JobPlan` (a
+  third symbol alongside `Inputs` + `execute`; absent → today's behavior). The
+  control-plane runner fetches the hint ONCE per native step before its retry
+  loop via a new backend-agnostic `POST /step/plan` route
+  (`ComputeBackendClient.plan_step`), and composes it in
+  `_resolve_baseline_for_step` as a raise-NEVER **down-size**: a hint lowers a
+  step below its YAML baseline, is applied before the raise-only escalation
+  floors (so an OOM/TIMEOUT retry always restores at least the baseline), and is
+  fully advisory (any failure — unreachable CO, broken module, malformed
+  response — degrades to the baseline). First consumer: the `qc` step sizes its
+  **walltime** (not memory — qc streams, so peak RAM is ~flat in read count)
+  from the input read count, tightening SLURM backfill for small inputs. New
+  `JobPlan`/`JobResourcePlan` contract types, `run_native_job_plan` dispatcher,
+  `job_resource_plan` helpers, `StepPlanRequest`/`StepPlanResponse` wire models,
+  and `PATH_/URL_STEP_PLAN` constants; `docs/writing-a-job.md` documents the full
+  native-job contract. No new env var, scope, migration, or operator action. (#237)
 - **CLI discovery commands for prep-protocol and host-reference idxes.** Two new
   read-only subcommands so operators stop hand-querying Postgres for the idxes
   `submit-bcl-convert` / `submit-host-filter-pool` need. `qiita prep-protocol
