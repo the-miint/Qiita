@@ -66,7 +66,7 @@ def build_message(
     rendered: RenderedEmail,
 ) -> EmailMessage:
     """Build a multipart (text + optional html) MIME message with a generated
-    Message-ID. Shared by SmtpTransport and the transport tests."""
+    Message-ID."""
     msg = EmailMessage()
     # Subject is already newline-stripped by the renderer, but be defensive:
     # a CR/LF in a header is the classic injection vector.

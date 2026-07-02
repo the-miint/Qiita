@@ -24,12 +24,13 @@ from qiita_control_plane.testing.db_seeds import seed_service_principal, seed_us
 pytestmark = pytest.mark.db
 
 
-def _settings(*, quiet=180, max_batch=900, max_age=21600, max_attempts=5):
+def _settings(*, quiet=180, max_batch=900, max_age=21600, max_attempts=5, max_rows=5000):
     return SimpleNamespace(
         notify_quiet_period_seconds=quiet,
         notify_max_batch_seconds=max_batch,
         notify_max_age_seconds=max_age,
         notify_max_attempts=max_attempts,
+        notify_max_rows_per_sweep=max_rows,
         contact_email="qiita-help@example.org",
     )
 
@@ -226,6 +227,59 @@ async def test_grouping_by_originator(env):
         assert len(receipts) == 1
         ctx = json.loads(receipts[0]["template_context"])
         assert ctx["work_ticket_idxs"] == [own]
+
+
+async def test_row_cap_defers_truncated_boundary_group(env):
+    # u1 (lower idx, 1 ticket) then u2 (higher idx, 2 tickets). Capped at 2 rows,
+    # the ordered fetch is [u1_t, u2_t1] — u2 is truncated mid-group, so it's
+    # deferred whole to a later pass rather than partially flushed; u1 sends now.
+    u1 = await env.user()
+    u2 = await env.user()
+    t1 = await env.ticket(originator=u1)
+    t2a = await env.ticket(originator=u2)
+    t2b = await env.ticket(originator=u2)
+    lo, hi = await env.minmax([t1, t2a, t2b])
+
+    transport = CaptureTransport()
+    result = await sweep_once(
+        env.pool, _settings(max_rows=2), transport, now=hi + timedelta(seconds=200)
+    )
+
+    assert result.digests_sent == 1
+    assert {to for to, _, _ in transport.sent} == {await env.email_of(u1)}
+    assert await env.notified_at(t1) is not None
+    # u2 untouched — neither stamped nor attempt-bumped.
+    assert await env.notified_at(t2a) is None
+    assert await env.notified_at(t2b) is None
+
+    # A later, uncapped pass drains u2 whole into a single digest.
+    transport2 = CaptureTransport()
+    result2 = await sweep_once(env.pool, _settings(), transport2, now=hi + timedelta(seconds=200))
+    assert result2.digests_sent == 1
+    assert {to for to, _, _ in transport2.sent} == {await env.email_of(u2)}
+    receipts = await env.receipts_for(u2)
+    assert len(receipts) == 1
+    ctx = json.loads(receipts[0]["template_context"])
+    assert sorted(ctx["work_ticket_idxs"]) == sorted([t2a, t2b])
+
+
+async def test_row_cap_processes_solo_backlog_over_cap(env):
+    # A single originator whose own backlog exceeds the cap is NOT deferred
+    # (that would stall it forever) — it drains truncated, in chunks.
+    u = await env.user()
+    tickets = [await env.ticket(originator=u) for _ in range(3)]
+    lo, hi = await env.minmax(tickets)
+
+    transport = CaptureTransport()
+    result = await sweep_once(
+        env.pool, _settings(max_rows=2), transport, now=hi + timedelta(seconds=200)
+    )
+    # The truncated solo group still sends (progress guaranteed).
+    assert result.digests_sent == 1
+    sent_ids = json.loads((await env.receipts_for(u))[0]["template_context"])["work_ticket_idxs"]
+    assert len(sent_ids) == 2  # only the two rows that fit this pass
+    notified = [await env.notified_at(t) is not None for t in tickets]
+    assert sum(notified) == 2
 
 
 async def test_debounce_fresh_group_not_flushed(env):

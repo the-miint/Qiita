@@ -44,10 +44,9 @@ CREATE TABLE qiita.email_receipt (
     template_context        JSONB NOT NULL,
 
     -- Recipient. recipient_email is the rendered destination (evidence);
-    -- recipient_principal_idx ties it back to a principal when the mail was
-    -- addressed to one (nullable — a future non-principal recipient sets it
-    -- NULL). RESTRICT is not needed: the receipt is history, so a principal
-    -- delete simply orphans nothing (FK left as default NO ACTION).
+    -- recipient_principal_idx ties it back to a principal, nullable because the
+    -- recipient need not be one. RESTRICT is not needed: the receipt is history,
+    -- so a principal delete simply orphans nothing (FK left as default NO ACTION).
     recipient_email         CITEXT NOT NULL,
     recipient_principal_idx BIGINT REFERENCES qiita.principal(idx),
 
@@ -61,8 +60,13 @@ CREATE TABLE qiita.email_receipt (
         CONSTRAINT email_receipt_status_check
         CHECK (status IN ('pending', 'sent', 'failed', 'dead_letter')),
 
-    -- 'smtp' | 'noop' | 'capture' — proves whether sending was live.
-    transport               TEXT NOT NULL,
+    -- Which transport wrote the row — proves whether sending was live.
+    -- Closed vocabulary, guarded like status: 'smtp'/'noop' in prod, 'capture'
+    -- in tests. A new transport adds a value here (new migration) + a Transport
+    -- subclass in the same PR.
+    transport               TEXT NOT NULL
+        CONSTRAINT email_receipt_transport_check
+        CHECK (transport IN ('smtp', 'noop', 'capture')),
     -- RFC Message-ID / relay id → ties this receipt to provider logs.
     provider_message_id     TEXT,
     attempts                INT NOT NULL DEFAULT 0,

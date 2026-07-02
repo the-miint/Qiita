@@ -51,6 +51,11 @@ _DEFAULT_NOTIFY_QUIET_PERIOD_SECONDS = 180
 _DEFAULT_NOTIFY_MAX_BATCH_SECONDS = 900
 _DEFAULT_NOTIFY_MAX_AGE_SECONDS = 21600
 _DEFAULT_NOTIFY_MAX_ATTEMPTS = 5
+# Per-pass owed-set cap. One sweep holds the advisory lock and sends serially,
+# so an unbounded fetch on a large backlog (prolonged relay outage, huge fanout)
+# would pull every owed ticket into memory and pin the lock across all of them.
+# The cap bounds both; the ORDER BY makes the remainder resumable next pass.
+_DEFAULT_NOTIFY_MAX_ROWS_PER_SWEEP = 5000
 
 
 def _parse_positive_int_env(var: str, default: int) -> int:
@@ -180,6 +185,7 @@ class Settings:
     notify_max_batch_seconds: int = _DEFAULT_NOTIFY_MAX_BATCH_SECONDS
     notify_max_age_seconds: int = _DEFAULT_NOTIFY_MAX_AGE_SECONDS
     notify_max_attempts: int = _DEFAULT_NOTIFY_MAX_ATTEMPTS
+    notify_max_rows_per_sweep: int = _DEFAULT_NOTIFY_MAX_ROWS_PER_SWEEP
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -308,6 +314,9 @@ class Settings:
             ),
             notify_max_age_seconds=_parse_positive_int_env(
                 "NOTIFY_MAX_AGE_SECONDS", _DEFAULT_NOTIFY_MAX_AGE_SECONDS
+            ),
+            notify_max_rows_per_sweep=_parse_positive_int_env(
+                "NOTIFY_MAX_ROWS_PER_SWEEP", _DEFAULT_NOTIFY_MAX_ROWS_PER_SWEEP
             ),
             notify_max_attempts=_parse_positive_int_env(
                 "NOTIFY_MAX_ATTEMPTS", _DEFAULT_NOTIFY_MAX_ATTEMPTS

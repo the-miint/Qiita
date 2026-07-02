@@ -7,7 +7,8 @@ Once per `NOTIFY_SWEEP_INTERVAL_SECONDS` this sweeper:
    pool (so a second CP process can never double-send — nothing enforces
    single-process today — and a slow relay can't starve the request pool);
 2. SELECTs the owed set (byte-matching the partial index predicate, incl. the
-   `failure_type IS DISTINCT FROM 'retriable'` carve-out);
+   `failure_type IS DISTINCT FROM 'retriable'` carve-out), capped at
+   `NOTIFY_MAX_ROWS_PER_SWEEP` so a backlog can't pin the lock unboundedly;
 3. groups by originator and, per group, decides `flush_now` via a
    trailing-debounce with a max-wait cap (so a never-quiescing fanout still
    flushes and forward progress is guaranteed);
@@ -29,6 +30,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
+
+from qiita_common.models import EmailReceiptStatus
 
 from ..runner import _TERMINAL_WORK_TICKET_STATES
 from .render import WORK_TICKET_DIGEST_TEMPLATE, render_work_ticket_digest, template_sha
@@ -230,7 +233,7 @@ async def _process_group(
             subject=rendered.subject,
             body_text=rendered.text,
             body_html=rendered.html or None,
-            status="dead_letter",
+            status=EmailReceiptStatus.DEAD_LETTER,
             transport=transport.name,
             template_sha_value=sha,
             attempts=settings.notify_max_attempts,
@@ -254,7 +257,7 @@ async def _process_group(
         subject=rendered.subject,
         body_text=rendered.text,
         body_html=rendered.html or None,
-        status="pending",
+        status=EmailReceiptStatus.PENDING,
         transport=transport.name,
         template_sha_value=sha,
     )
@@ -264,10 +267,11 @@ async def _process_group(
     except Exception as exc:
         await conn.execute(
             "UPDATE qiita.email_receipt"
-            " SET status = 'failed', error = $2, attempts = attempts + 1"
+            " SET status = $3, error = $2, attempts = attempts + 1"
             " WHERE idx = $1",
             receipt_idx,
             f"{type(exc).__name__}: {exc!s}"[:2000],
+            EmailReceiptStatus.FAILED,
         )
         # Leave notified_at NULL → retried next pass; bump per-ticket counter
         # toward the dead-letter cap. Send-then-stamp = at-least-once.
@@ -282,11 +286,12 @@ async def _process_group(
 
     await conn.execute(
         "UPDATE qiita.email_receipt"
-        " SET status = 'sent', sent_at = now(), provider_message_id = $2,"
+        " SET status = $3, sent_at = now(), provider_message_id = $2,"
         "     attempts = attempts + 1"
         " WHERE idx = $1",
         receipt_idx,
         message_id,
+        EmailReceiptStatus.SENT,
     )
     await _stamp_notified(conn, fresh_ids)
     result.digests_sent += 1
@@ -316,12 +321,25 @@ async def sweep_once(
             return result
         result.acquired = True
         try:
-            rows = await conn.fetch(_OWED_SET_SELECT)
+            limit = settings.notify_max_rows_per_sweep
+            rows = await conn.fetch(f"{_OWED_SET_SELECT} LIMIT $1", limit)
             result.owed_rows = len(rows)
             groups: dict[int, list[asyncpg.Record]] = defaultdict(list)
             for row in rows:
                 groups[row["originator_principal_idx"]].append(row)
             result.originators = len(groups)
+            # If the pass filled the row cap, the LAST originator in the ORDER BY
+            # may be truncated mid-group (its newer tickets didn't fit) — and a
+            # partial group can flush prematurely (a smaller max(updated_at) reads
+            # as quiesced). Defer that one originator to a later pass, when it
+            # fits whole. Progress still holds: it's strictly after every group we
+            # keep, so draining the earlier groups shrinks the owed set until it
+            # fits. The exception is a single originator whose own backlog exceeds
+            # the cap (groups=={that one}); we process it truncated so a giant
+            # solo backlog still drains in chunks instead of stalling forever.
+            if len(rows) >= limit and len(groups) > 1:
+                del groups[rows[-1]["originator_principal_idx"]]
+                result.originators = len(groups)
             for originator, group_rows in groups.items():
                 try:
                     await _process_group(
