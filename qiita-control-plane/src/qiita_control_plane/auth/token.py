@@ -22,6 +22,12 @@ from .scopes import VALID_SCOPES
 
 log = logging.getLogger(__name__)
 
+# Strong references to the fire-and-forget last_used_at tasks. asyncio holds
+# only a weak reference to a bare create_task, so without this the task can be
+# garbage-collected mid-flight before the last_used_at write lands. Each task
+# removes itself on completion.
+_background_tasks: set[asyncio.Task] = set()
+
 
 class TokenHashCollision(RuntimeError):
     """SHA-256 collision on `qiita.api_token.token_hash`. Effectively
@@ -133,7 +139,9 @@ async def verify_api_token(pool: asyncpg.Pool, plaintext: str) -> VerifiedToken 
     if row is None:
         return None
 
-    asyncio.create_task(record_token_use(pool, row["token_idx"]))
+    task = asyncio.create_task(record_token_use(pool, row["token_idx"]))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return VerifiedToken(
         principal_idx=row["principal_idx"],
