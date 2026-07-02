@@ -697,23 +697,33 @@ async def cli_exchange(
 
     # JOIN api_tokens by the pinned token_idx so a parallel mint between
     # handoff and exchange can't pair our plaintext with someone else's
-    # metadata. The single statement also keeps consume + metadata-read
-    # atomic against concurrent revoke/expire.
-    row = await pool.fetchrow(
-        "WITH consumed AS ("
-        "  UPDATE qiita.cli_login_code"
-        "     SET consumed_at = now()"
-        "   WHERE ot_code = $1"
-        "     AND consumed_at IS NULL"
-        "     AND expires_at > now()"
-        "   RETURNING token_idx, plaintext_pat"
-        ")"
-        " SELECT c.plaintext_pat, t.token_idx, t.label, t.scopes,"
-        "        t.expires_at, t.created_at"
-        "   FROM consumed c"
-        "   JOIN qiita.api_token t ON t.token_idx = c.token_idx",
-        ot_hash,
-    )
+    # metadata. The consume UPDATE's `consumed_at IS NULL` guard makes redemption
+    # single-use (a replay sees no row); a second UPDATE in the SAME transaction
+    # then scrubs the plaintext so the row never retains a usable PAT past the
+    # instant it's handed to the CLI. Both run in one transaction, so either the
+    # caller gets the plaintext AND the row is scrubbed, or neither happens.
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "WITH consumed AS ("
+                "  UPDATE qiita.cli_login_code"
+                "     SET consumed_at = now()"
+                "   WHERE ot_code = $1"
+                "     AND consumed_at IS NULL"
+                "     AND expires_at > now()"
+                "   RETURNING token_idx, plaintext_pat"
+                ")"
+                " SELECT c.plaintext_pat, t.token_idx, t.label, t.scopes,"
+                "        t.expires_at, t.created_at"
+                "   FROM consumed c"
+                "   JOIN qiita.api_token t ON t.token_idx = c.token_idx",
+                ot_hash,
+            )
+            if row is not None:
+                await conn.execute(
+                    "UPDATE qiita.cli_login_code SET plaintext_pat = NULL WHERE ot_code = $1",
+                    ot_hash,
+                )
     if row is None:
         raise HTTPException(
             status_code=404,

@@ -1286,6 +1286,17 @@ async def test_cli_exchange_returns_pat_once(auth_client, postgres_pool, jwks_ha
         assert whoami.status_code == 200
         assert whoami.json()["email"] == "cli-exchange@example.com"
 
+        # The plaintext PAT must be scrubbed from the row the instant it's
+        # redeemed — cli_login_code is the only at-rest plaintext store, so a
+        # consumed row must never retain a usable token.
+        code_row = await postgres_pool.fetchrow(
+            "SELECT plaintext_pat, consumed_at FROM qiita.cli_login_code WHERE token_idx = $1",
+            body["token_idx"],
+        )
+        assert code_row is not None
+        assert code_row["consumed_at"] is not None
+        assert code_row["plaintext_pat"] is None
+
         # Second exchange: 404 (consumed).
         resp2 = await auth_client.post(
             URL_AUTH_CLI_EXCHANGE,
@@ -1312,6 +1323,68 @@ async def test_cli_exchange_unknown_code_returns_404(auth_client):
         json={"ot_code": "definitely-not-a-real-code-just-padding-bytes"},
     )
     assert resp.status_code == 404
+
+
+async def test_cli_login_code_sweeper_deletes_dead_rows(auth_client, postgres_pool):
+    """The sweeper deletes consumed and expired cli_login_code rows — reclaiming
+    any plaintext PAT left at rest — but leaves a live, unconsumed, unexpired
+    row so an in-flight CLI login can still redeem."""
+    from qiita_control_plane.auth.cli_login_code_sweeper import sweep_cli_login_codes_once
+    from qiita_control_plane.auth.token import mint_api_token
+
+    pidx = await _seed_user(postgres_pool, email="sweeper@example.com")
+    _track(auth_client, pidx)
+    _, token_idx = await mint_api_token(
+        postgres_pool, principal_idx=pidx, label="sweeper", scopes=[Scope.SELF_TOKEN]
+    )
+
+    now = datetime.now(UTC)
+
+    async def _insert_code(ot_code, *, created_at, expires_at, consumed_at):
+        # created_at is set explicitly so an already-expired row still satisfies
+        # the expires_at > created_at CHECK.
+        await postgres_pool.execute(
+            "INSERT INTO qiita.cli_login_code"
+            " (ot_code, principal_idx, token_idx, plaintext_pat,"
+            "  created_at, expires_at, consumed_at)"
+            " VALUES ($1, $2, $3, 'qk_secret', $4, $5, $6)",
+            ot_code,
+            pidx,
+            token_idx,
+            created_at,
+            expires_at,
+            consumed_at,
+        )
+
+    # Consumed (dead regardless of expiry).
+    await _insert_code(
+        b"\x01" * 32,
+        created_at=now - timedelta(seconds=60),
+        expires_at=now + timedelta(seconds=300),
+        consumed_at=now - timedelta(seconds=30),
+    )
+    # Expired, never consumed (dead: can never be redeemed, plaintext is liability).
+    await _insert_code(
+        b"\x02" * 32,
+        created_at=now - timedelta(seconds=60),
+        expires_at=now - timedelta(seconds=30),
+        consumed_at=None,
+    )
+    # Live: unconsumed and unexpired — must survive.
+    await _insert_code(
+        b"\x03" * 32,
+        created_at=now,
+        expires_at=now + timedelta(seconds=300),
+        consumed_at=None,
+    )
+
+    deleted = await sweep_cli_login_codes_once(postgres_pool)
+    assert deleted == 2
+
+    remaining = await postgres_pool.fetch(
+        "SELECT ot_code FROM qiita.cli_login_code WHERE token_idx = $1", token_idx
+    )
+    assert [bytes(r["ot_code"]) for r in remaining] == [b"\x03" * 32]
 
 
 # ---------------------------------------------------------------------------

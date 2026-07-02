@@ -25,6 +25,9 @@ _DEFAULT_AUTH_HANDOFF_FRESHNESS_SECONDS = 60
 # Single-use code handed back to the CLI's loopback; redeemed at /auth/cli-exchange.
 # Short TTL so an intercepted code dies within seconds.
 _DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS = 30
+# How often the in-process sweeper deletes consumed/expired cli_login_code rows,
+# reclaiming any plaintext PAT an abandoned login left at rest.
+_DEFAULT_CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS = 60
 
 # Hard cap on a single POST /sequence-range allocation. The bigint domain
 # is 2^63 so a runaway loop in a compute step could otherwise burn an
@@ -141,6 +144,7 @@ class Settings:
     qiita_endpoint_url: str | None = None
     auth_handoff_freshness_seconds: int = _DEFAULT_AUTH_HANDOFF_FRESHNESS_SECONDS
     cli_login_code_ttl_seconds: int = _DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS
+    cli_login_code_sweep_interval_seconds: int = _DEFAULT_CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS
     max_sequence_mint_count: int = _DEFAULT_MAX_SEQUENCE_MINT_COUNT
     # Per-ticket workspace root the workflow runner mints under
     # (`<root>/<work_ticket_idx>/<step>/attempt-N/`). Derived in from_env()
@@ -295,6 +299,10 @@ class Settings:
             qiita_endpoint_url=os.environ.get("QIITA_ENDPOINT_URL") or None,
             auth_handoff_freshness_seconds=_parse_positive_int_env(
                 "AUTH_HANDOFF_FRESHNESS_SECONDS", _DEFAULT_AUTH_HANDOFF_FRESHNESS_SECONDS
+            ),
+            cli_login_code_sweep_interval_seconds=_parse_positive_int_env(
+                "CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS",
+                _DEFAULT_CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS,
             ),
             cli_login_code_ttl_seconds=_parse_positive_int_env(
                 "CLI_LOGIN_CODE_TTL_SECONDS", _DEFAULT_CLI_LOGIN_CODE_TTL_SECONDS
