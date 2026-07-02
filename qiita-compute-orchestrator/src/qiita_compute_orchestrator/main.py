@@ -34,8 +34,6 @@ def _build_backend(settings: Settings) -> ComputeBackend:
             client=client,
             partition=settings.slurm.partition,
             account=settings.slurm.account,
-            poll_interval_seconds=settings.slurm.poll_interval_seconds,
-            job_timeout_seconds=settings.slurm.job_timeout_seconds,
             native_python=settings.slurm.native_python,
             # Forward the outbound CO→CP token + CP URL so SLURM jobs
             # can re-resolve Settings.from_env(require_cp_to_co_token=False)
