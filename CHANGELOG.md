@@ -15,6 +15,19 @@ the `no-changelog` label).
 
 ### Added
 
+- **Email notification on work-ticket terminal transitions.** When a work
+  ticket reaches a terminal state (`completed` / `no_data` / `permanent`-failed),
+  the control plane emails the originator. A new in-process asyncio sweeper
+  coalesces a user's finished tickets into one digest via a trailing-debounce
+  with a max-wait cap, gated on `qiita.user.receive_processing_emails`. Sends
+  go through a pluggable transport (`aiosmtplib` SMTP relay when `SMTP_HOST` is
+  set, else a no-op) and every send writes a `qiita.email_receipt` audit row.
+  The digest footer carries the configured `CONTACT_EMAIL` (also set as the
+  message `Reply-To`) as a contact line. Retriable failures are withheld until
+  their true outcome, and a `/run` redrive re-arms notification. New `SMTP_*` /
+  `NOTIFY_*` settings (all defaulted); migrations add
+  `work_ticket.notified_at` / `notify_attempts`, the
+  `qiita.email_receipt` table, and a partial owed-set index. (#238)
 - **Optional `plan()` phase for native jobs — input-driven resource sizing.** A
   native job module may now export an optional `plan(inputs) -> JobPlan` (a
   third symbol alongside `Inputs` + `execute`; absent → today's behavior). The
