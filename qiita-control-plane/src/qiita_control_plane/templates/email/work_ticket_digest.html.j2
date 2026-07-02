@@ -39,7 +39,11 @@
     {% endif %}
     <p style="color: #888; font-size: 0.9em;">
       Generated at {{ generated_at }}.<br />
-      This is an automated message from qiita-miint; please do not reply.
+      This is an automated message from qiita-miint.
+      {% if contact_email %}
+      Questions? Reply to this email or write to
+      <a href="mailto:{{ contact_email }}">{{ contact_email }}</a>.
+      {% endif %}
     </p>
   </body>
 </html>

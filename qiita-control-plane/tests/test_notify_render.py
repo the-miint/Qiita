@@ -106,6 +106,34 @@ def test_utc_label_present():
     assert "2026-07-01 12:30:45 UTC" in rendered.html
 
 
+def test_contact_email_rendered_when_supplied():
+    rendered = render_work_ticket_digest(
+        recipient="pi@example.org",
+        tickets=[_ticket(1)],
+        generated_at=_GENERATED_AT,
+        contact_email="qiita-help@example.org",
+    )
+    assert "qiita-help@example.org" in rendered.text
+    assert "qiita-help@example.org" in rendered.html
+    # The HTML variant links the address for one-click contact.
+    assert 'href="mailto:qiita-help@example.org"' in rendered.html
+    # The old "please do not reply" line is gone — we set a Reply-To.
+    assert "do not reply" not in rendered.text
+    assert "do not reply" not in rendered.html
+
+
+def test_contact_email_omitted_degrades_cleanly():
+    rendered = render_work_ticket_digest(
+        recipient="pi@example.org",
+        tickets=[_ticket(1)],
+        generated_at=_GENERATED_AT,
+    )
+    # No address, no contact sentence, but the automated-message note remains.
+    assert "automated message from qiita-miint" in rendered.text
+    assert "Questions?" not in rendered.text
+    assert "mailto:" not in rendered.html
+
+
 def test_template_sha_is_stable_hex():
     a = template_sha("work_ticket_digest")
     b = template_sha("work_ticket_digest")

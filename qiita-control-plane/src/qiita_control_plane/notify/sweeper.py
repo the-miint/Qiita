@@ -202,7 +202,12 @@ async def _process_group(
         }
         for r in fresh
     ]
-    rendered = render_work_ticket_digest(recipient=user["email"], tickets=tickets, generated_at=now)
+    rendered = render_work_ticket_digest(
+        recipient=user["email"],
+        tickets=tickets,
+        generated_at=now,
+        contact_email=settings.contact_email,
+    )
     context = _digest_context(fresh_ids, tickets)
     sha = template_sha(WORK_TICKET_DIGEST_TEMPLATE)
 

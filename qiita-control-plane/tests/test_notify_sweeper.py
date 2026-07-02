@@ -30,6 +30,7 @@ def _settings(*, quiet=180, max_batch=900, max_age=21600, max_attempts=5):
         notify_max_batch_seconds=max_batch,
         notify_max_age_seconds=max_age,
         notify_max_attempts=max_attempts,
+        contact_email="qiita-help@example.org",
     )
 
 

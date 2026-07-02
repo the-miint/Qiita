@@ -83,6 +83,7 @@ def render_work_ticket_digest(
     recipient: str,
     tickets: list[dict[str, Any]],
     generated_at: datetime,
+    contact_email: str | None = None,
 ) -> RenderedEmail:
     """Render the work-ticket terminal-digest bundle.
 
@@ -90,6 +91,10 @@ def render_work_ticket_digest(
     `idx, action_id, action_version, state, failure_reason`. Counts are tallied
     by state; the detail list is truncated to `MAX_DETAIL_ROWS` with an
     overflow count.
+
+    `contact_email` (the deploy's `CONTACT_EMAIL`, also the message's `Reply-To`)
+    is rendered as a contact line in the footer; omit it and the footer degrades
+    to the automated-message note with no address.
     """
     total = len(tickets)
     counts = sorted(Counter(t["state"] for t in tickets).items())
@@ -103,4 +108,5 @@ def render_work_ticket_digest(
         counts=counts,
         overflow=overflow,
         generated_at=_format_generated_at(generated_at),
+        contact_email=contact_email,
     )
