@@ -47,7 +47,16 @@ class JobResourcePlan(BaseModel):
     deliberately no `gpu` axis: GPU need is a property of the algorithm, not the
     input size, and the down-only `min()` composition would be a footgun for it
     (it could zero out a GPU a job requires) — add it, with its own composition
-    rule, only when a GPU job needs input-driven GPU sizing."""
+    rule, only when a GPU job needs input-driven GPU sizing.
+
+    Caveat on `cpu`: unlike `mem_gb` (grown after OOM) and `walltime` (grown
+    after TIMEOUT), `cpu` has NO escalation backstop — a down-sized `cpu` is
+    never raised back on retry. A too-low `cpu` recovers only indirectly: the
+    resulting slowness pushes the step toward TIMEOUT, and walltime escalation
+    grows the wall clock to absorb it, up to the walltime ceiling (past which it
+    fails as walltime-exhaustion, not a cpu recovery). Latent today — qc sizes
+    only `walltime`; size `cpu` from `plan()` only for a job that can tolerate
+    that one-way floor."""
 
     cpu: int | None = None
     mem_gb: int | None = None

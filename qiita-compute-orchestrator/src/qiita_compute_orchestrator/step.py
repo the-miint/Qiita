@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from qiita_common.actions import NATIVE_MODULE_PREFIX
@@ -241,7 +242,15 @@ async def plan_step(
             scope_target=body.scope_target,
             work_ticket_idx=body.work_ticket_idx,
         )
-        job_plan = run_native_job_plan(body.module, raw_inputs, step_name=body.step_name)
+        # run_native_job_plan does blocking work — importlib.import_module plus a
+        # synchronous DuckDB Parquet-footer read — so offload it to a worker
+        # thread rather than calling it inline in this async handler. A slow or
+        # stalled filesystem would otherwise block CO's entire event loop for the
+        # duration, not just this request. (submit/status/result stay responsive
+        # because they await the backend.)
+        job_plan = await run_in_threadpool(
+            run_native_job_plan, body.module, raw_inputs, step_name=body.step_name
+        )
         resources = job_plan.resources
         if resources is None:
             return StepPlanResponse()

@@ -482,7 +482,13 @@ class StepPlanResponse(BaseModel):
     value into resource resolution by LOWERING the step below its YAML baseline
     (down-sizing); escalation remains the only up-sizing path. An empty
     response (all None) is the no-op a job with no `plan()`, or a `plan()` that
-    declined to size, produces — the CP then uses the baseline unchanged."""
+    declined to size, produces — the CP then uses the baseline unchanged.
+
+    Note `cpu` has no escalation backstop (only `mem_gb` grows after OOM and
+    `walltime_seconds` after TIMEOUT), so a down-sized `cpu` is never raised
+    back on retry — recovering only indirectly via walltime escalation absorbing
+    the slowness, up to the walltime ceiling. See `JobResourcePlan` (the CO-side
+    twin) for the full rationale."""
 
     cpu: Annotated[int, Field(gt=0)] | None = None
     mem_gb: Annotated[int, Field(gt=0)] | None = None

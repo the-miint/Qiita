@@ -20,6 +20,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import duckdb
+from qiita_common.parquet import validate_parquet_path
 
 
 def count_read_pairs(reads_parquet: Path) -> int:
@@ -29,10 +30,12 @@ def count_read_pairs(reads_parquet: Path) -> int:
     this stays cheap enough to run inline at submit time.
 
     A plain `read_parquet` count needs no miint extension, so a bare
-    connection suffices. The path is inline single-quote-escaped to match the
-    jobs' `read_parquet` literal convention (a filesystem path is the only
-    surface here)."""
-    path_sql = str(reads_parquet).replace("'", "''")
+    connection suffices. The path is inlined via `validate_parquet_path`
+    (fail-fast on quote/backslash/control chars), matching the sibling jobs'
+    `read_parquet`/COPY literal convention — a filesystem path is the only
+    surface here, and a rejected path degrades to the baseline like any other
+    `plan()` failure."""
+    path_sql = validate_parquet_path(reads_parquet)
     with duckdb.connect() as conn:
         row = conn.execute(f"SELECT count(*) FROM read_parquet('{path_sql}')").fetchone()
     return int(row[0])
