@@ -476,13 +476,13 @@ To rotate, run <code>qiita-admin login</code> again or visit
 # `qiita-admin token list` — pin the spelling so a typo in a future
 # refactor doesn't silently change what users see in their token table.
 # Audit `via` discriminators are kept side-by-side so the two stay in
-# lockstep (they describe the same three flows, from two angles).
+# lockstep (they describe the same two minting flows, from two angles).
+# The invitation flow mints nothing (it redirects to the anchored login), so
+# it has no label/via of its own.
 _LABEL_CLI = "qiita-admin login"
 _LABEL_BROWSER = "browser login"
-_LABEL_INVITATION = "invitation accept"
 _VIA_CLI = "cli_login"
 _VIA_BROWSER = "browser_login"
-_VIA_INVITATION = "invitation"
 
 
 @router.get(PATH_AUTH_HANDOFF)
@@ -515,23 +515,23 @@ async def handoff(
     - **Browser-login flow** (cookie present, no `cli`): render an HTML
       page displaying the PAT plaintext for the user to copy into
       `~/.qiita/token`.
-    - **Invitation flow** (cookie absent): same HTML render as
-      browser-login. AuthRocket's invitation-acceptance redirect sends the
-      user here directly without ever traversing `/auth/login`, so there
-      is no cookie to verify; the JWT's own `exp` is the freshness anchor.
-      No CLI dispatch possible — invitations are browser-only.
+    - **Invitation flow** (cookie absent): AuthRocket's invitation-acceptance
+      redirect sends the user here directly without ever traversing
+      `/auth/login`, so there is no cookie and thus no freshness anchor.
+      Rather than mint a full-ceiling, 90-day PAT from that un-anchored (and
+      therefore replayable) JWT, this flow provisions the user via the OIDC
+      resolver and then **redirects to `/auth/login`** so the PAT is minted
+      only through the cookie-anchored path. No CLI dispatch possible —
+      invitations are browser-only.
 
-    **Freshness anchors differ across the three flows.** CLI and
-    browser-login bound the AuthRocket round-trip with the signed cookie's
-    `auth_handoff_freshness_seconds` timestamp; the invitation flow has
-    only the JWT's `exp` (≥5 min per the realm runbook). `POST /auth/pat`
-    elsewhere in this file enforces `auth_time` freshness via
-    `authrocket_pat_max_auth_age_seconds`, which neither handoff path
-    currently checks. Any future tightening of PAT-mint freshness
-    (`jti`-based deduplication, tighter realm-side JWT TTL, `auth_time`
-    enforcement parity) must consider all three flows together — they
-    share the same PAT-mint code path below but anchor freshness in
-    different places upstream.
+    **Only the two cookie-anchored flows mint here.** CLI and browser-login
+    bound the AuthRocket round-trip with the signed cookie's
+    `auth_handoff_freshness_seconds` timestamp; the invitation flow mints
+    nothing (it bounces to `/auth/login`), so a replayed invitation URL
+    yields only a redirect. The realm emits no `auth_time`, so the JWT
+    itself carries no freshness — the cookie is the sole anchor. `POST
+    /auth/pat` elsewhere in this file still enforces `auth_time` freshness,
+    but that path is legacy on this realm (no `auth_time` is emitted).
     """
     settings = get_settings(request)
     verifier = get_oidc_verifier(request)
@@ -569,20 +569,29 @@ async def handoff(
         # PAT-mint policy rather than reusing the human ceiling.
         raise HTTPException(status_code=500, detail="OIDC resolver returned non-human principal")
 
+    is_cli = bool(cookie_payload and cookie_payload.get("cli"))
+    is_invitation = cookie_payload is None
+
+    if is_invitation:
+        # An invitation redirect reaches /auth/handoff with no login cookie, so
+        # it has NO freshness anchor — and the realm emits no auth_time, leaving
+        # only the JWT's short exp. Rather than mint a full-ceiling, 90-day PAT
+        # from that un-anchored (replayable) JWT, send the now-provisioned user
+        # (resolve_oidc upserted them above) through the normal cookie-anchored
+        # login. A replayed invitation URL then yields only this redirect, which
+        # is useless without the user's actual AuthRocket credentials.
+        return RedirectResponse(URL_AUTH_LOGIN, status_code=302)
+
     # Mint the PAT against the user's role ceiling. The scope set comes from
     # role_ceiling — same as POST /auth/pat with scopes=None — so the auto-
     # minted PAT mirrors what an interactive PAT mint would produce.
-    is_cli = bool(cookie_payload and cookie_payload.get("cli"))
-    is_invitation = cookie_payload is None
     scopes = sorted(role_ceiling(principal.system_role))
     expires_at = datetime.now(UTC) + timedelta(days=settings.token_default_ttl_days)
-    # Label + audit `via` distinguish the three entry points so audit-log
-    # readers and end users (via `qiita-admin token list`) can tell at a
-    # glance which flow produced a given PAT.
+    # Label + audit `via` distinguish the two anchored entry points (CLI vs
+    # browser login) so audit-log readers and end users (via `qiita-admin token
+    # list`) can tell at a glance which flow produced a given PAT.
     if is_cli:
         label, via = _LABEL_CLI, _VIA_CLI
-    elif is_invitation:
-        label, via = _LABEL_INVITATION, _VIA_INVITATION
     else:
         label, via = _LABEL_BROWSER, _VIA_BROWSER
 

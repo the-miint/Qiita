@@ -1008,13 +1008,15 @@ async def test_handoff_cli_flow_redirects_to_loopback_with_ot_code(
         app.state.oidc_verifier = saved_verifier
 
 
-async def test_handoff_invitation_flow_no_cookie_mints_pat(
+async def test_handoff_invitation_flow_no_cookie_redirects_to_login(
     auth_client, postgres_pool, jwks_harness
 ):
     """Invitation acceptance lands here directly from AuthRocket's signup
-    redirect — the user never traversed /auth/login, so no cookie is
-    present. The route must accept the JWT alone, mint a PAT, and render
-    the same browser HTML the cookie-bearing browser-login flow does."""
+    redirect — the user never traversed /auth/login, so no cookie (and no
+    freshness anchor) is present. Rather than mint a full-ceiling 90-day PAT
+    from an un-anchored, replayable JWT, the route provisions the user and
+    redirects to /auth/login so the PAT is minted only through the cookie-
+    anchored path. A replayed invitation URL then yields just this redirect."""
     from qiita_control_plane.main import app
 
     saved_verifier = app.state.oidc_verifier
@@ -1027,16 +1029,12 @@ async def test_handoff_invitation_flow_no_cookie_mints_pat(
             f"{URL_AUTH_HANDOFF}?token={token}",
             follow_redirects=False,
         )
-        assert resp.status_code == 200, resp.text
-        assert resp.headers["content-type"].startswith("text/html")
-        # No Location header — invitation flow must never redirect to a
-        # CLI loopback (no cookie means we don't know any port to redirect
-        # to, and invitations are browser-only by definition).
-        assert "location" not in {k.lower() for k in resp.headers.keys()}
-        body = resp.text
-        assert "invite-accept@example.com" in body
-        assert "qk_" in body
+        assert resp.status_code == 302, resp.text
+        assert resp.headers["location"] == URL_AUTH_LOGIN
+        # No PAT is minted or rendered on the un-anchored path.
+        assert "qk_" not in resp.text
 
+        # The user IS provisioned (resolve_oidc upsert ran) but no token exists.
         pidx = await postgres_pool.fetchval(
             "SELECT principal_idx FROM qiita.user_identity WHERE issuer = $1 AND subject = $2",
             jwks_harness.issuer,
@@ -1044,16 +1042,19 @@ async def test_handoff_invitation_flow_no_cookie_mints_pat(
         )
         assert pidx is not None
         _track(auth_client, pidx)
+        token_count = await postgres_pool.fetchval(
+            "SELECT count(*) FROM qiita.api_token WHERE principal_idx = $1", pidx
+        )
+        assert token_count == 0
     finally:
         app.state.oidc_verifier = saved_verifier
 
 
-async def test_handoff_invitation_flow_records_audit_via_invitation(
-    auth_client, postgres_pool, jwks_harness
-):
-    """Audit detail.via must distinguish invitation acceptance from the
-    cookie-bearing browser and CLI flows so audit-log readers can tell
-    at a glance which entry point produced a given PAT."""
+async def test_handoff_invitation_flow_mints_no_token(auth_client, postgres_pool, jwks_harness):
+    """The invitation flow mints nothing — it redirects to the anchored login —
+    so it writes no token_mint audit event. (It previously minted a PAT with
+    via='invitation'; that un-anchored mint has been removed so a replayed
+    invitation JWT can't yield a credential.)"""
     from qiita_control_plane.main import app
 
     saved_verifier = app.state.oidc_verifier
@@ -1066,7 +1067,8 @@ async def test_handoff_invitation_flow_records_audit_via_invitation(
             f"{URL_AUTH_HANDOFF}?token={token}",
             follow_redirects=False,
         )
-        assert resp.status_code == 200, resp.text
+        assert resp.status_code == 302
+        assert resp.headers["location"] == URL_AUTH_LOGIN
 
         pidx = await postgres_pool.fetchval(
             "SELECT principal_idx FROM qiita.user_identity WHERE issuer = $1 AND subject = $2",
@@ -1080,9 +1082,7 @@ async def test_handoff_invitation_flow_records_audit_via_invitation(
             " WHERE event_type = 'token_mint' AND principal_idx = $1",
             pidx,
         )
-        assert rows
-        detail = _detail(rows[-1])
-        assert detail["via"] == "invitation"
+        assert rows == []
     finally:
         app.state.oidc_verifier = saved_verifier
 
@@ -1144,7 +1144,9 @@ async def test_handoff_invitation_flow_does_not_write_cli_login_code(
             f"{URL_AUTH_HANDOFF}?token={token}",
             follow_redirects=False,
         )
-        assert resp.status_code == 200, resp.text
+        # Invitation now redirects to the anchored login and mints nothing.
+        assert resp.status_code == 302, resp.text
+        assert resp.headers["location"] == URL_AUTH_LOGIN
         after = await postgres_pool.fetchval("SELECT count(*) FROM qiita.cli_login_code")
         assert after == before
 
