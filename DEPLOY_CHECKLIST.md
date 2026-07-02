@@ -15,7 +15,15 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 1. Env vars — set BEFORE the deploy (each is `from_env()` fail-fast; a missing one keeps the unit down)
 
-_None yet._
+- **Email notification (control-plane).** To turn on work-ticket terminal-digest emails, set `SMTP_*` in `/etc/qiita/control-plane.env` before the restart; leaving `SMTP_HOST` unset keeps the no-op transport (no mail). None are secrets (relay is no-auth, IP-allowlisted, validated end-to-end). Optional `NOTIFY_*` knobs keep their defaults if unset. (#238)
+  ```bash
+  sudo bash -c 'cat >> /etc/qiita/control-plane.env <<EOF
+  SMTP_HOST=its-smtp-master.ucsd.edu
+  SMTP_PORT=25
+  SMTP_FROM=donotreply@ucsd.edu
+  SMTP_STARTTLS=opportunistic
+  EOF'
+  ```
 
 ### 2. One-time host setup
 
@@ -23,7 +31,7 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- **Email-notification schema.** `make migrate` applies both migrations: `..._email_notification.sql` (adds `work_ticket.notified_at` / `notify_attempts`, creates `qiita.email_receipt`, backfills existing terminal tickets as already-notified) and `..._work_ticket_notified_idx.sql` (a `CREATE INDEX CONCURRENTLY` — runs outside a txn; if interrupted, drop the leftover `INVALID` index and re-run). No out-of-band steps. (#238)
 
 ### 4. Deploy
 

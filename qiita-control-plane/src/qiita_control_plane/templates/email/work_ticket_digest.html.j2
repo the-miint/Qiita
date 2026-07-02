@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+  <body style="font-family: sans-serif; color: #222;">
+    <p>Hello,</p>
+    <p>
+      {{ total }} of your qiita-miint work ticket{{ 's' if total != 1 else '' }}
+      reached a final state:
+    </p>
+    <ul>
+      {% for state, n in counts %}
+      <li>{{ n }} {{ state }}</li>
+      {% endfor %}
+    </ul>
+    <p>Details:</p>
+    <table cellpadding="4" style="border-collapse: collapse;">
+      <thead>
+        <tr>
+          <th align="left">Ticket</th>
+          <th align="left">Action</th>
+          <th align="left">Version</th>
+          <th align="left">State</th>
+          <th align="left">Detail</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for t in tickets %}
+        <tr>
+          <td>{{ t.idx }}</td>
+          <td>{{ t.action_id }}</td>
+          <td>{{ t.action_version }}</td>
+          <td>{{ t.state }}</td>
+          <td>{{ t.failure_reason or "" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% if overflow %}
+    <p>... and {{ overflow }} more.</p>
+    {% endif %}
+    <p style="color: #888; font-size: 0.9em;">
+      Generated at {{ generated_at }}.<br />
+      This is an automated message from qiita-miint; please do not reply.
+    </p>
+  </body>
+</html>

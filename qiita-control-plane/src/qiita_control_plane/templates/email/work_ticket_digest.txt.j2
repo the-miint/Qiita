@@ -1,0 +1,13 @@
+Hello,
+
+{{ total }} of your qiita-miint work ticket{{ 's' if total != 1 else '' }} reached a final state:
+
+{% for state, n in counts %}  {{ n }} {{ state }}
+{% endfor %}
+Details:
+{% for t in tickets %}  - ticket {{ t.idx }}: {{ t.action_id }} {{ t.action_version }} -> {{ t.state }}{% if t.failure_reason %} ({{ t.failure_reason }}){% endif %}
+{% endfor %}{% if overflow %}  ... and {{ overflow }} more
+{% endif %}
+Generated at {{ generated_at }}.
+
+This is an automated message from qiita-miint; please do not reply.

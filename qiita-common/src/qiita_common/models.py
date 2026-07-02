@@ -587,6 +587,26 @@ class UploadStatus(StrEnum):
     FAILED = "failed"
 
 
+class EmailReceiptStatus(StrEnum):
+    """Delivery lifecycle of a qiita.email_receipt row.
+
+    Mirrored DB-side by the `email_receipt.status` CHECK constraint in
+    db/migrations/20260701000000_email_notification.sql. Stored as TEXT/CHECK,
+    not a Postgres ENUM — same carve-out as UploadStatus / ReferenceStatus /
+    AuthEventType; see CLAUDE.md "Enum parity". Keep both sides in sync by hand
+    (a light StrEnum↔CHECK parity test guards drift).
+
+    PENDING is written before the transport send; SENT/FAILED record the
+    outcome. DEAD_LETTER is a terminal give-up after NOTIFY_MAX_ATTEMPTS failed
+    sends — the sweeper stamps the ticket notified and stops retrying.
+    """
+
+    PENDING = "pending"
+    SENT = "sent"
+    FAILED = "failed"
+    DEAD_LETTER = "dead_letter"
+
+
 class UploadCreateRequest(BaseModel):
     """Body for POST /api/v1/upload.
 
