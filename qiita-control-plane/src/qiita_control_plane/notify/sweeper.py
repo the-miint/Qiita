@@ -3,9 +3,9 @@
 A terminal work_ticket with `notified_at IS NULL` is the "email owed" signal.
 Once per `NOTIFY_SWEEP_INTERVAL_SECONDS` this sweeper:
 
-1. takes a session-level advisory lock on a dedicated pooled connection (so a
-   second CP process can never double-send — nothing enforces single-process
-   today);
+1. takes a session-level advisory lock on its own dedicated single-connection
+   pool (so a second CP process can never double-send — nothing enforces
+   single-process today — and a slow relay can't starve the request pool);
 2. SELECTs the owed set (byte-matching the partial index predicate, incl. the
    `failure_type IS DISTINCT FROM 'retriable'` carve-out);
 3. groups by originator and, per group, decides `flush_now` via a
@@ -297,12 +297,13 @@ async def sweep_once(
     """Run one sweep pass. `now` is injectable for tests."""
     now = now or datetime.now(UTC)
     result = SweepResult()
-    # Known tradeoff: the session advisory lock is held on this pooled connection
-    # across all rendering and every transport.send() for the whole pass, so a
-    # slow relay can pin one pool connection for up to N × SMTP_TIMEOUT_SECONDS.
-    # This is intentional — serializing to a single sender is the goal and
-    # correctness is unaffected. Moving the SMTP send off the pooled/locked
-    # connection is a possible future optimization; leave the locking as-is.
+    # The session advisory lock is held on one connection across all rendering
+    # and every transport.send() for the whole pass, so a slow relay can pin that
+    # connection for up to N × SMTP_TIMEOUT_SECONDS. That is intentional —
+    # serializing to a single sender is the goal and correctness is unaffected.
+    # `pool` is the sweeper's OWN dedicated single-connection pool (built in
+    # main.py's lifespan), so this long hold never starves the request pool; the
+    # sweeper is a serial loop and never needs a second connection.
     async with pool.acquire() as conn:
         acquired = await conn.fetchval("SELECT pg_try_advisory_lock($1)", _NOTIFY_SWEEP_LOCK_KEY)
         if not acquired:
