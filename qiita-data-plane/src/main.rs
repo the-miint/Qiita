@@ -173,10 +173,12 @@ mod tests {
             "HMAC_SECRET_KEY",
             "DUCKLAKE_CATALOG_CONNSTR",
             "PATH_SCRATCH",
+            "PATH_PERSISTENT",
         ]);
         let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
         std::env::set_var("HMAC_SECRET_KEY", &secret);
         std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
+        std::env::set_var("PATH_PERSISTENT", "/tmp/qiita-test-persistent");
         std::env::remove_var("PATH_SCRATCH");
         let err = Settings::from_env().unwrap_err();
         assert!(
@@ -187,15 +189,62 @@ mod tests {
 
     #[test]
     #[serial]
+    fn config_rejects_missing_path_persistent() {
+        // PATH_PERSISTENT is the system-of-record store — a missing one must
+        // fail fast, not fall back to a tmp-rooted default that loses durable
+        // lake data on reboot.
+        let _snapshot = EnvSnapshot::capture(&[
+            "HMAC_SECRET_KEY",
+            "DUCKLAKE_CATALOG_CONNSTR",
+            "PATH_SCRATCH",
+            "PATH_PERSISTENT",
+        ]);
+        let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
+        std::env::set_var("HMAC_SECRET_KEY", &secret);
+        std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
+        std::env::set_var("PATH_SCRATCH", "/tmp/qiita-test-scratch");
+        std::env::remove_var("PATH_PERSISTENT");
+        let err = Settings::from_env().unwrap_err();
+        assert!(
+            err.contains("PATH_PERSISTENT"),
+            "error should mention PATH_PERSISTENT: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn config_rejects_relative_path_persistent() {
+        let _snapshot = EnvSnapshot::capture(&[
+            "HMAC_SECRET_KEY",
+            "DUCKLAKE_CATALOG_CONNSTR",
+            "PATH_SCRATCH",
+            "PATH_PERSISTENT",
+        ]);
+        let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
+        std::env::set_var("HMAC_SECRET_KEY", &secret);
+        std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
+        std::env::set_var("PATH_SCRATCH", "/tmp/qiita-test-scratch");
+        std::env::set_var("PATH_PERSISTENT", "relative/persistent");
+        let err = Settings::from_env().unwrap_err();
+        assert!(
+            err.contains("must be an absolute path"),
+            "error should mention absolute path requirement: {err}"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn config_rejects_relative_path_scratch() {
         let _snapshot = EnvSnapshot::capture(&[
             "HMAC_SECRET_KEY",
             "DUCKLAKE_CATALOG_CONNSTR",
             "PATH_SCRATCH",
+            "PATH_PERSISTENT",
         ]);
         let secret = base64::engine::general_purpose::STANDARD.encode(vec![0xABu8; 32]);
         std::env::set_var("HMAC_SECRET_KEY", &secret);
         std::env::set_var("DUCKLAKE_CATALOG_CONNSTR", "dbname=test");
+        std::env::set_var("PATH_PERSISTENT", "/tmp/qiita-test-persistent");
         std::env::set_var("PATH_SCRATCH", "relative/scratch");
         let err = Settings::from_env().unwrap_err();
         assert!(

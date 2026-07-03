@@ -518,6 +518,13 @@ the `no-changelog` label).
 
 ### Changed
 
+- **Data plane fails fast on a missing `PATH_PERSISTENT`.** The var is now
+  required and must be absolute (previously optional, falling back to
+  `$TMPDIR/qiita`), matching the fail-fast posture of `HMAC_SECRET_KEY` /
+  `DUCKLAKE_CATALOG_CONNSTR` / `PATH_SCRATCH`. A forgotten value used to silently
+  root durable DuckLake Parquet under `/tmp` (lost on reboot, never backed up);
+  the instance now refuses to start instead. `.env.data-plane.example` promotes
+  it to the required block. (#243)
 - `qiita-admin masked-read-export` is now **re-runnable**: it creates `--output-dir`
   (with parents) if missing instead of erroring, and for parquet it skips a sample
   whose output file already exists when the count matches and overwrites it only
