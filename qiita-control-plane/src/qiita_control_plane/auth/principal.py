@@ -251,7 +251,17 @@ async def _resolve_token(pool: asyncpg.Pool, plaintext: str) -> Principal:
 
     kind = row["kind"]
     if kind == "user":
-        return _human_user_from_row(row, scopes=verified.scopes)
+        # Intersect the token's frozen mint-time scopes with the principal's
+        # CURRENT role ceiling, so a role downgrade (or a shrunk
+        # ROLE_IMPLIED_SCOPES) immediately narrows what an already-minted PAT
+        # can do — no revocation needed. Without this, a demoted user's PAT kept
+        # its old ceiling's scopes on scope-only-gated routes until expiry. The
+        # OIDC path already ceiling-bounds at resolve time (see _build_human_user);
+        # this closes the same gap for long-lived PATs. (Service accounts have a
+        # fixed, non-role ceiling enforced at mint, so role-downgrade doesn't
+        # apply to them — their path is unchanged.)
+        effective = verified.scopes & role_ceiling(row["system_role"])
+        return _human_user_from_row(row, scopes=effective)
     if kind == "service":
         return _service_account_from_row(row, scopes=verified.scopes)
     # `kind == "bare"` — a bare principal holding a token shouldn't happen

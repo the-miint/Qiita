@@ -266,6 +266,48 @@ async def test_resolver_token_path_for_service_account(resolver_client, postgres
     assert body["scopes"] == [Scope.FEATURE_MINT]
 
 
+async def test_resolver_intersects_scopes_with_current_role_ceiling(resolver_client, postgres_pool):
+    """A role downgrade immediately narrows an already-minted PAT: scopes the
+    principal's new role no longer implies are stripped at resolve time, without
+    revoking the token. Role-appropriate scopes survive."""
+    from qiita_control_plane.auth.token import mint_api_token
+
+    pidx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.principal (display_name, system_role, created_by_idx)"
+        " VALUES ('downgrade-me', $1, $2) RETURNING idx",
+        SystemRole.SYSTEM_ADMIN,
+        SYSTEM_PRINCIPAL_IDX,
+    )
+    _track(resolver_client, pidx)
+    await postgres_pool.execute(
+        "INSERT INTO qiita.user (principal_idx, email) VALUES ($1, $2)",
+        pidx,
+        f"u{pidx}@example.com",
+    )
+    # Mint (low-level, no ceiling check) an admin-only scope + one every role keeps.
+    plaintext, _ = await mint_api_token(
+        postgres_pool,
+        principal_idx=pidx,
+        label="downgrade-test",
+        scopes=[Scope.ADMIN_USER, Scope.REFERENCE_READ],
+    )
+    # While SYSTEM_ADMIN, both scopes resolve.
+    resp = await resolver_client.get("/resolve", headers={"Authorization": f"Bearer {plaintext}"})
+    assert resp.status_code == 200, resp.text
+    assert sorted(resp.json()["scopes"]) == sorted([Scope.ADMIN_USER, Scope.REFERENCE_READ])
+
+    # Downgrade to USER — no revocation.
+    await postgres_pool.execute(
+        "UPDATE qiita.principal SET system_role = $1 WHERE idx = $2",
+        SystemRole.USER,
+        pidx,
+    )
+    # ADMIN_USER is not in the USER ceiling -> stripped; REFERENCE_READ survives.
+    resp2 = await resolver_client.get("/resolve", headers={"Authorization": f"Bearer {plaintext}"})
+    assert resp2.status_code == 200, resp2.text
+    assert resp2.json()["scopes"] == [Scope.REFERENCE_READ]
+
+
 async def test_resolver_rejects_revoked_token(resolver_client, postgres_pool):
     from qiita_control_plane.auth.token import mint_api_token
 
