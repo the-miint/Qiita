@@ -30,7 +30,7 @@ the `no-changelog` label).
   `export_read` and `_do_action_export_read` refactored to share
   `export_read_where_to_parquet` / `_do_action_export`. No caller yet (wired in a
   later block-compute phase); no new env var, migration, scope, or operator
-  action. (#TBD)
+  action. (#243)
 - **Block-compute schema — `block`, `block_member`, `mask_sample`, and a `block`
   work-ticket scope.** The persistence layer for bulk-block read masking. A
   `block` is the compute unit (a fixed ~10M-read slice from prep_samples sharing
@@ -43,7 +43,7 @@ the `no-changelog` label).
   `BlockScopeTarget`), and a `work_ticket_one_in_flight_per_block` partial unique
   index. New `repositories/block.py` (`create_block`, `add_block_members`,
   `set_block_state`, `set_block_work_ticket`, `create_mask_sample_pending`). No
-  caller yet (the planner + runner wire in later phases). (#TBD)
+  caller yet (the planner + runner wire in later phases). (#243)
 - **Block planner + `submit-block-mask-pool` — plan a whole pool as fixed
   ~10M-read blocks in one call.** The bulk-block analog of the per-sample
   `submit-host-filter-pool` fan-out. A new server-side planner
@@ -60,7 +60,7 @@ the `no-changelog` label).
   intent-mismatch preflight as `submit-host-filter-pool` (factored into a shared
   helper) but makes a single call instead of N. No caller reaches the block
   runner path or the `read-mask-block` workflow yet (later phases); no new env
-  var, migration, or scope. (#TBD)
+  var, migration, or scope. (#243)
 - **Block runner path — `read-mask-block/1.0.0` workflow + reconcile.** Wires the
   block tickets the planner mints (previously they `RuntimeError`ed): the runner
   gains a `block` scope arm that binds `reads` from the block's `block_member`
@@ -80,7 +80,7 @@ the `no-changelog` label).
   across the sample's blocks, replacing the per-sample path's local-parquet
   rollup) with a fail-loud count assertion against `sequence_range`. No new env
   var, migration, or scope; the `read-mask-block` workflow syncs via
-  `qiita-admin actions sync` at deploy. (#TBD)
+  `qiita-admin actions sync` at deploy. (#243)
 - **Masked-read export gate + block re-plan disallow-without-delete.** Two new
   invariants that block masking requires (a sample's mask is now assembled by
   several blocks, so real partial states exist). The masked-read export ticket
@@ -96,7 +96,7 @@ the `no-changelog` label).
   for the resolved mask — re-masking double-writes `read_mask` (DuckLake has no
   uniqueness); the operator DELETEs the mask or passes `only_missing=true`
   (mirrors the sequenced_pool COMPLETED-resubmit rule). No new env var,
-  migration, scope, or operator action. (#TBD)
+  migration, scope, or operator action. (#243)
 - **Idempotent block replace — `delete_read_mask_block` DoAction + `delete-block-mask`
   workflow step.** Makes a block re-run self-cleaning so `read_mask` never
   double-counts (DuckLake is append-only with no unique key). The new
@@ -116,7 +116,7 @@ the `no-changelog` label).
   End-to-end coverage in `tests/integration/test_read_mask_block_e2e.py` (split-sample
   per-sample reconcile + export gate, and the delete-then-register no-duplicate
   guarantee against a live data plane). No new env var, migration, or scope; the
-  updated `read-mask-block` workflow syncs via `qiita-admin actions sync` at deploy. (#TBD)
+  updated `read-mask-block` workflow syncs via `qiita-admin actions sync` at deploy. (#243)
 - **CLI discovery commands for prep-protocol and host-reference idxes.** Two new
   read-only subcommands so operators stop hand-querying Postgres for the idxes
   `submit-bcl-convert` / `submit-host-filter-pool` need. `qiita prep-protocol

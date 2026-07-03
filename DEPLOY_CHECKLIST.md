@@ -24,7 +24,7 @@ _None yet._
 ### 3. Migrations
 
 - Bulk-block read-mask schema (four additive migrations, plain `make migrate`, no
-  backfill): (#bulk-block-read-mask)
+  backfill): (#243)
   - `20260701000000_block.sql` — `block` + `block_member` core (the compute unit +
     the block↔sample cover-map).
   - `20260701000001_mask_sample.sql` — the per-`(mask_idx, prep_sample)` completion
@@ -44,7 +44,7 @@ _None yet._
 - Confirm the `read-mask-block/1.0.0` workflow synced into `qiita.action` (the block
   runner path — synced by `qiita-admin actions sync` inside `activate.sh`, covered by
   `make verify-deploy`'s `qiita.action` list; this asserts the specific new action):
-  (#bulk-block-read-mask)
+  (#243)
 
   ```bash
   psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='read-mask-block'"
@@ -62,7 +62,7 @@ _None yet._
   scope, group, or SIF (the workflow reuses `read-mask`'s native `qc` + `host_filter`
   modules — no container). Masked-read export now 409s for a block-masked sample whose
   `mask_sample` gate is not `completed` (a partially-masked sample); per-sample
-  read-masked samples are unaffected (no gate row ⇒ allowed). (#bulk-block-read-mask)
+  read-masked samples are unaffected (no gate row ⇒ allowed). (#243)
 
 ---
 
