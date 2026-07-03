@@ -45,6 +45,22 @@ the `no-changelog` label).
   `job_resource_plan` helpers, `StepPlanRequest`/`StepPlanResponse` wire models,
   and `PATH_/URL_STEP_PLAN` constants; `docs/writing-a-job.md` documents the full
   native-job contract. No new env var, scope, migration, or operator action. (#237)
+- **Golay-barcode demultiplexing** (`workflows/golay-demux/1.0.0.yaml`) — Qiita's first
+  Golay demultiplexer, ported from `duckdb-miint-python`'s `demux_qiita.sql`. A
+  `sequenced_pool`-scoped workflow that splits an EMP-style multiplexed run (R1 forward +
+  I1 barcode FASTQ) by Golay barcode into per-sample reads in the DuckLake `read` table.
+  The barcode roster mirrors bcl-convert's `sample_map`, each entry carrying a
+  `barcodes_are_rc` provenance flag; a marked seam will source it from the
+  `run_preflight_blob` sample sheet once run-preflight exposes an amplicon-barcode
+  accessor. Feeds the read-mask → amplicon chain. (#244)
+- **Rapid 16S amplicon workflow** (`workflows/amplicon/1.0.0.yaml`) — ports
+  `duckdb-miint-python`'s `deblur.sql`: primer-trim → per-sample dereplicate → SortMeRNA 16S
+  pre-filter → MAFFT → deblur → UCHIME-denovo → Greengenes2 closed-reference match, in one
+  native miint job (no container). The finalize joins on the canonical sequence hash and
+  caches a feature table into the new DuckLake `feature_counts` table. Adds the
+  `qiita.processing_method` / `qiita.processed_prep_sample` identity tables + repository and
+  the `export_pool_masked` data-plane DoAction; replaces the stale container-based
+  `workflows/amplicon/` scaffold. (#244)
 - **CLI discovery commands for prep-protocol and host-reference idxes.** Two new
   read-only subcommands so operators stop hand-querying Postgres for the idxes
   `submit-bcl-convert` / `submit-host-filter-pool` need. `qiita prep-protocol

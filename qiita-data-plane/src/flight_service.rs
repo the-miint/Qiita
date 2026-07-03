@@ -178,6 +178,9 @@ const ALLOWED_TABLES: &[&str] = &[
     "reference_phylogeny",
     "reference_placements",
     "read_masked",
+    // Sparse feature table (feature_idx counts per sample/processing). Carries no
+    // sequence bytes, so unlike `read`/`read_mask` it is Flight-reachable.
+    "feature_counts",
 ];
 
 /// Allowed column names for filter clauses. All identifier columns that can
@@ -189,6 +192,8 @@ const ALLOWED_FILTER_COLUMNS: &[&str] = &[
     "node_index",
     "mask_idx",
     "prep_sample_idx",
+    // feature_counts scoping: pull one processing method's table.
+    "processing_idx",
 ];
 
 #[tonic::async_trait]
@@ -434,6 +439,54 @@ impl FlightService for QiitaFlightService {
                 })
                 .await
                 .map_err(|e| Status::internal(format!("export_read task join failed: {e}")))??;
+
+                let result_body = serde_json::to_vec(&serde_json::json!({
+                    "count": count,
+                    "dest": payload.dest,
+                }))
+                .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+
+                let result = arrow_flight::Result {
+                    body: result_body.into(),
+                };
+                let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
+            "export_pool_masked" => {
+                let payload = auth::verify_export_pool_masked(&action.body, &self.hmac_secret)
+                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
+
+                if payload.action != "export_pool_masked" {
+                    return Err(Status::invalid_argument(format!(
+                        "action type mismatch: header says 'export_pool_masked', \
+                         payload says {:?}",
+                        payload.action
+                    )));
+                }
+
+                let dest = validate_export_dest(&payload.dest, &self.scratch_root)?;
+
+                // long synchronous COPY over the whole pool — run on the blocking pool
+                // (mirrors export_read). the closure owns its connection, so it's Send.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let scratch_root = self.scratch_root.clone();
+                let prep_sample_idxs = payload.prep_sample_idxs.clone();
+                let mask_idx = payload.mask_idx;
+                let count = tokio::task::spawn_blocking(move || {
+                    export_pool_masked_to_parquet(
+                        &catalog,
+                        &data_path,
+                        &prep_sample_idxs,
+                        mask_idx,
+                        &dest,
+                        &scratch_root,
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("export_pool_masked task join failed: {e}"))
+                })??;
 
                 let result_body = serde_json::to_vec(&serde_json::json!({
                     "count": count,
@@ -935,6 +988,108 @@ fn export_read_to_parquet(
 
     // On the empty path (Ok(0)) or any failure the temp still exists; remove it.
     // On success (Ok(n>0)) it was renamed to `dest`, so this is a no-op.
+    if !matches!(published, Ok(n) if n > 0) {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    published
+}
+
+/// Materialize a pool's MASKED reads (a `mask_idx` + prep_sample set) from the
+/// `read_masked` view to `dest`, returning the row count. Like `export_read_to_parquet`
+/// but reads the privacy-safe `read_masked` view (host/QC-failed excluded, trims applied)
+/// and spans many samples. Consumed by the runner's `_resolve_pool_masked_reads`.
+fn export_pool_masked_to_parquet(
+    catalog_connstr: &str,
+    data_path: &str,
+    prep_sample_idxs: &[i64],
+    mask_idx: i64,
+    dest: &Path,
+    scratch_root: &Path,
+) -> Result<i64, Status> {
+    // empty set → `IN ()` is invalid SQL and nothing to export; return 0, CP raises.
+    if prep_sample_idxs.is_empty() {
+        return Ok(0);
+    }
+
+    let conn = duckdb::Connection::open_in_memory()
+        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
+    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
+        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
+    // ROW_GROUP_SIZE_BYTES needs insertion order off; fine, the amplicon job
+    // re-partitions by prep_sample_idx so file order is irrelevant.
+    conn.execute_batch("SET preserve_insertion_order = false;")
+        .map_err(|e| Status::internal(format!("failed to set preserve_insertion_order: {e}")))?;
+
+    let parent = dest.parent().ok_or_else(|| {
+        Status::internal(format!("export dest has no parent: {}", dest.display()))
+    })?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| Status::internal(format!("failed to create {}: {e}", parent.display())))?;
+
+    // symlink-safe: re-assert the parent resolves under the scratch root before writing.
+    let real_parent = std::fs::canonicalize(parent)
+        .map_err(|e| Status::internal(format!("failed to resolve {}: {e}", parent.display())))?;
+    let real_root = std::fs::canonicalize(scratch_root).map_err(|e| {
+        Status::internal(format!(
+            "failed to resolve scratch root {}: {e}",
+            scratch_root.display()
+        ))
+    })?;
+    if !real_parent.starts_with(&real_root) {
+        return Err(Status::permission_denied(format!(
+            "export dest parent {} resolves outside the scratch root {}",
+            real_parent.display(),
+            real_root.display()
+        )));
+    }
+
+    let tmp = {
+        let mut s = dest.as_os_str().to_os_string();
+        s.push(".partial");
+        PathBuf::from(s)
+    };
+    let tmp_sql = tmp
+        .to_str()
+        .ok_or_else(|| Status::internal(format!("non-UTF-8 dest path: {}", tmp.display())))?;
+    // i64s, safe to inline. column list matches export_read for schema compatibility.
+    let in_csv = prep_sample_idxs
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let copy_sql = format!(
+        "COPY (SELECT prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2 \
+         FROM qiita_lake.read_masked \
+         WHERE mask_idx = {mask_idx} AND prep_sample_idx IN ({in_csv})) \
+         TO '{tmp_sql}' ({EXPORT_READ_PARQUET_OPTS})"
+    );
+
+    let published = (|| -> Result<i64, Status> {
+        conn.execute_batch(&copy_sql)
+            .map_err(|e| Status::internal(format!("export_pool_masked COPY failed: {e}")))?;
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM read_parquet('{tmp_sql}')"),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| Status::internal(format!("export_pool_masked count failed: {e}")))?;
+        if count == 0 {
+            return Ok(0);
+        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o440))
+            .map_err(|e| Status::internal(format!("failed to chmod {}: {e}", tmp.display())))?;
+        std::fs::rename(&tmp, dest).map_err(|e| {
+            Status::internal(format!(
+                "failed to publish {} -> {}: {e}",
+                tmp.display(),
+                dest.display()
+            ))
+        })?;
+        Ok(count)
+    })();
+
     if !matches!(published, Ok(n) if n > 0) {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -2250,6 +2405,99 @@ mod tests {
         ));
     }
 
+    /// `export_pool_masked_to_parquet` writes the MASKED reads of a pool: it reads
+    /// the `read_masked` view (so non-'pass' rows are excluded), filters to the
+    /// requested mask_idx + prep_sample set (so out-of-set samples are excluded),
+    /// and writes a mode-0o440 Parquet. An empty set writes no file and returns 0.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn export_pool_masked_excludes_non_pass_and_out_of_set() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+
+        let mask: i64 = 941_500;
+        let prep_a: i64 = 941_000;
+        let prep_b: i64 = 941_001;
+        let prep_c: i64 = 941_002; // in the pool's reads but NOT in the export set
+        let s_a_pass: i64 = 941_010;
+        let s_a_host: i64 = 941_011; // non-'pass' → excluded by the view
+        let s_b: i64 = 941_020;
+        let s_c: i64 = 941_030;
+
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read WHERE prep_sample_idx IN ({prep_a},{prep_b},{prep_c});
+             DELETE FROM qiita_lake.read_mask WHERE mask_idx = {mask};
+             INSERT INTO qiita_lake.read \
+                 (prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2) VALUES \
+                 ({prep_a}, {s_a_pass}, 'a_pass', 'AACGT', [10,11,12,13,14]::UTINYINT[], NULL, NULL), \
+                 ({prep_a}, {s_a_host}, 'a_host', 'CCCCC', [10,11,12,13,14]::UTINYINT[], NULL, NULL), \
+                 ({prep_b}, {s_b}, 'b1', 'GGGCC', [30,31,32,33,34]::UTINYINT[], NULL, NULL), \
+                 ({prep_c}, {s_c}, 'c1', 'TTTTT', [30,31,32,33,34]::UTINYINT[], NULL, NULL);
+             INSERT INTO qiita_lake.read_mask \
+                 (mask_idx, prep_sample_idx, sequence_idx, reason, left_trim1, right_trim1) VALUES \
+                 ({mask}, {prep_a}, {s_a_pass}, 'pass', 0, 0), \
+                 ({mask}, {prep_a}, {s_a_host}, 'host_human', 0, 0), \
+                 ({mask}, {prep_b}, {s_b}, 'pass', 0, 0), \
+                 ({mask}, {prep_c}, {s_c}, 'pass', 0, 0);"
+        ))
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("reads.parquet");
+
+        // Export only A + B at this mask; C is left out of the set.
+        let count = export_pool_masked_to_parquet(
+            &connstr,
+            &data_path,
+            &[prep_a, prep_b],
+            mask,
+            &dest,
+            dir.path(),
+        )
+        .expect("export_pool_masked_to_parquet failed");
+        // A contributes its 'pass' row only (host row excluded); B contributes 1;
+        // C is excluded by the prep-sample set → 2 total.
+        assert_eq!(count, 2, "only 'pass' rows of in-set samples are exported");
+        assert!(dest.exists(), "destination parquet written");
+
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o440, "exported parquet is mode 440");
+
+        let reader = Connection::open_in_memory().unwrap();
+        let dest_str = dest.to_str().unwrap();
+        // Neither the excluded host read nor the out-of-set sample C appears.
+        let leaked: i64 = reader
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM read_parquet('{dest_str}') \
+                     WHERE read_id = 'a_host' OR prep_sample_idx = {prep_c}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked, 0, "non-pass and out-of-set rows must not leak");
+
+        // An empty prep-sample set writes no file and reports 0.
+        let dest_empty = dir.path().join("empty.parquet");
+        let zero =
+            export_pool_masked_to_parquet(&connstr, &data_path, &[], mask, &dest_empty, dir.path())
+                .expect("empty set should succeed with 0");
+        assert_eq!(zero, 0);
+        assert!(!dest_empty.exists(), "no file written for an empty set");
+
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read WHERE prep_sample_idx IN ({prep_a},{prep_b},{prep_c});
+             DELETE FROM qiita_lake.read_mask WHERE mask_idx = {mask};"
+        ));
+    }
+
     #[test]
     fn build_query_no_filter() {
         let (sql, _) = build_query("reference_sequences", &auth::TicketFilter::new()).unwrap();
@@ -2369,6 +2617,33 @@ mod tests {
         assert!(
             result.is_err(),
             "sequence_idx is not an allowed filter column"
+        );
+    }
+
+    #[test]
+    fn build_query_feature_counts_processing_filter() {
+        // feature_counts is a plain table: processing_idx (and prep_sample_idx /
+        // feature_idx) filter directly via IN clauses, no membership join.
+        let mut filter = auth::TicketFilter::new();
+        filter.insert(
+            "processing_idx".to_string(),
+            vec![serde_json::Value::from(99)],
+        );
+        filter.insert(
+            "prep_sample_idx".to_string(),
+            vec![serde_json::Value::from(11), serde_json::Value::from(12)],
+        );
+        let (sql, table) = build_query("feature_counts", &filter).unwrap();
+        assert_eq!(table, "qiita_lake.feature_counts");
+        assert!(
+            sql.starts_with("SELECT * FROM qiita_lake.feature_counts WHERE"),
+            "expected a plain table select, got: {sql}"
+        );
+        assert!(sql.contains("processing_idx IN (99)"), "got: {sql}");
+        assert!(sql.contains("prep_sample_idx IN (11,12)"), "got: {sql}");
+        assert!(
+            !sql.contains("JOIN"),
+            "feature_counts is a plain table, no JOIN, got: {sql}"
         );
     }
 

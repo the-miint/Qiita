@@ -885,9 +885,9 @@ qiita/
 │       └── test_system_gg2_backbone.py  # @pytest.mark.system; real GG2 backbone
 ├── workflows/
 │   ├── amplicon/
-│   │   ├── Apptainer.def           # container definition (single image for all steps)
-│   │   ├── workflow.yaml           # ordered steps: name, type (map|reduce), entrypoint, resources
-│   │   └── scripts/                # per-step entrypoints and helpers
+│   │   └── 1.0.0.yaml              # native Rapid 16S deblur workflow (versioned)
+│   ├── golay-demux/
+│   │   └── 1.0.0.yaml              # native Golay-barcode demux workflow
 │   └── reference-add/
 │       └── 1.0.0.yaml              # versioned reference-ingest workflow
 ├── deploy/
@@ -967,21 +967,18 @@ test-compute-orchestrator: build-compute-orchestrator
 	cd qiita-compute-orchestrator && uv run pytest
 
 test-workflows:
+	# One guarded shell so the no-apptainer skip short-circuits the whole recipe
+	# (macOS has no apptainer). Exercises scripts/build-sif.sh end-to-end against
+	# real apptainer via the _sif-build-smoke sentinel (no licensed artifact), in a
+	# throwaway PATH_DERIVED; the trap cleans up on success, failure, or signal.
 	@if ! command -v apptainer > /dev/null 2>&1; then \
 		echo "apptainer not found — skipping workflow smoke tests"; \
 		exit 0; \
-	fi
-	apptainer build --force /tmp/qiita-workflow-smoke.sif workflows/amplicon/Apptainer.def
-	apptainer exec /tmp/qiita-workflow-smoke.sif echo "hello world"
-	rm -f /tmp/qiita-workflow-smoke.sif
-	# Exercise scripts/build-sif.sh end-to-end against real apptainer via the
-	# _sif-build-smoke sentinel (no licensed artifact). Uses a throwaway
-	# PATH_DERIVED so the built SIF lands in a temp images/ dir. The trap
-	# removes it on success, failure, OR signal; set -e propagates a build
-	# failure as the recipe's exit status (no trailing `exit` tripwire).
-	set -e; smoke_derived=$$(mktemp -d); trap 'rm -rf "$$smoke_derived"' EXIT; \
-		mkdir -p "$$smoke_derived/images"; \
-		PATH_DERIVED="$$smoke_derived" bash scripts/build-sif.sh _sif-build-smoke
+	fi; \
+	set -e; \
+	smoke_derived=$$(mktemp -d); trap 'rm -rf "$$smoke_derived"' EXIT; \
+	mkdir -p "$$smoke_derived/images"; \
+	PATH_DERIVED="$$smoke_derived" bash scripts/build-sif.sh _sif-build-smoke
 
 test-integration: build-data-plane-debug build-integration $(DBMATE_BIN)
 	(cd $(PG_COMPOSE_DIR) && $(PG_BRINGUP)) && \

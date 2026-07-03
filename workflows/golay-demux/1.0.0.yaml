@@ -1,0 +1,94 @@
+action_id: golay-demux
+version: 1.0.0
+target_kind: sequenced_pool
+
+description: >
+  Golay-barcode demultiplex a pool's multiplexed 16S run (EMP-style: one R1
+  forward FASTQ + one I1 barcode FASTQ) into per-sample reads in the DuckLake
+  `read` table — the analogue of bcl-convert for runs that arrive already
+  converted-but-multiplexed, ported from duckdb-miint-python's demux_qiita.sql.
+  the single `golay_demux` native job corrects I1 barcodes, pairs them against R1
+  by record order (I1 is RC), assigns each read to its prep_sample, and writes
+  them; a register-files step loads them into `read`. downstream: read-mask, then
+  amplicon.
+
+scopes: []
+
+audience:
+  # privileged lab operation, like bcl-convert: re-materializes a pool's
+  # (human-adjacent) reads into the DuckLake read table.
+  service: false
+  human_roles: [wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  required: [index_reads_path, forward_reads_path, golay_table_path, barcode_map]
+  properties:
+    # multiplexed I1 barcode FASTQ (12-nt Golay codes; longer indexes sliced to
+    # the first 12). absolute, compute-node-visible.
+    index_reads_path:
+      type: string
+      minLength: 1
+      pattern: "^/"
+    # multiplexed R1 forward FASTQ, paired to I1 by record order.
+    forward_reads_path:
+      type: string
+      minLength: 1
+      pattern: "^/"
+    # the Golay (12,11,8) error-correction table Parquet (raw/corrected/errors).
+    golay_table_path:
+      type: string
+      minLength: 1
+      pattern: "^/"
+    # per-sample barcode roster, built from the prep template today (see the
+    # runner's sample-sheet-provenance TODO) and materialized to Parquet by the
+    # runner. the analogue of bcl-convert's `sample_map`, keyed by the Golay
+    # barcode. `barcodes_are_rc` is a per-sample provenance fact (COL_BARCODES_ARE_RC
+    # in the run_preflight sample sheet), NOT a tuning knob — true when the run
+    # orientation is the RC of the recorded barcode (Illumina I1 is RC) — so it
+    # travels WITH each barcode, not as a uniform flag.
+    barcode_map:
+      type: array
+      minItems: 1
+      items:
+        type: object
+        required: [prep_sample_idx, barcode, barcodes_are_rc]
+        properties:
+          prep_sample_idx: {type: integer, minimum: 1}
+          barcode: {type: string, minLength: 1}
+          barcodes_are_rc: {type: boolean}
+    # max Golay errors to accept a barcode match; default 1.5 (EMP tolerance). a
+    # genuine algorithm tolerance (not provenance), so it stays a submit-time param.
+    golay_error_threshold:
+      type: number
+      minimum: 0
+
+steps:
+  # demux + per-sample ingest in one native job. `barcode_map` and
+  # `reads_staging_root` are runner-resolved; the three host paths are plain
+  # action_context values; `golay_error_threshold` rides through params (defaulted
+  # when omitted).
+  - step: golay_demux
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.golay_demux
+    inputs: [index_reads_path, forward_reads_path, golay_table_path, barcode_map, reads_staging_root]
+    params:
+      golay_error_threshold: golay_error_threshold
+    outputs: [read_staging_dir]
+    baseline_resources:
+      # a whole multiplexed lane: the read_fastx parse + demux join dominates.
+      # sized like ingest_reads.
+      cpu: 8
+      mem_gb: 56
+      walltime: PT8H
+
+  # load the per-sample read parts into the DuckLake `read` table; the `read/`
+  # subdir of read_staging_dir holds one part per sample.
+  - action: register-files
+    inputs: [read_staging_dir]
+    outputs: []
+
+action_ceiling:
+  cpu: 8
+  mem_gb: 56
+  walltime: PT12H

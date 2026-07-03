@@ -218,7 +218,19 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
         JOIN qiita_lake.read_mask m
           ON r.prep_sample_idx = m.prep_sample_idx
          AND r.sequence_idx = m.sequence_idx
-        WHERE m.reason = 'pass';",
+        WHERE m.reason = 'pass';
+
+        -- sparse feature table: one row per (sample, processing, feature). feature_idx is
+        -- the CP-minted hash-deduped feature identity (never an md5 string — see CLAUDE.md).
+        -- carries no sequence bytes, so unlike `read` it is Flight-reachable. the producer
+        -- writes it sorted by the canonical result order for DuckLake + row-group pruning.
+        CREATE TABLE IF NOT EXISTS qiita_lake.feature_counts (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            processed_prep_sample_idx BIGINT NOT NULL,
+            feature_idx BIGINT NOT NULL,
+            value DOUBLE NOT NULL
+        );",
     )?;
     Ok(())
 }
@@ -433,6 +445,80 @@ mod tests {
             .unwrap();
         let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
         assert_eq!(n, 1, "read_masked view should exist exactly once");
+
+        // feature_counts is created by the same call and survives re-ensuring.
+        let mut stmt = conn
+            .prepare(
+                "SELECT count(*) FROM information_schema.tables \
+                 WHERE table_name = 'feature_counts'",
+            )
+            .unwrap();
+        let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+        assert_eq!(n, 1, "feature_counts table should exist exactly once");
+    }
+
+    /// feature_counts holds the canonical six-tuple result rows (minus the two
+    /// vestigial idx columns that don't exist yet): a feature_idx count per
+    /// (sample, processing). Round-trip a row and confirm the column shape.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn insert_and_read_feature_counts() {
+        let conn = setup_conn();
+        ensure_read_tables(&conn).unwrap();
+        let prep = next_test_id();
+        let _cleanup = Cleanup {
+            conn: &conn,
+            table: "feature_counts",
+            column: "prep_sample_idx",
+            id: prep,
+        };
+
+        let processing = next_test_id();
+        let processed = next_test_id();
+        let feature = next_test_id();
+        conn.execute_batch(&format!(
+            "INSERT INTO qiita_lake.feature_counts VALUES \
+             ({prep}, {processing}, {processed}, {feature}, 42.0);"
+        ))
+        .unwrap();
+
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT processing_idx, feature_idx, value \
+                 FROM qiita_lake.feature_counts WHERE prep_sample_idx = {prep}"
+            ))
+            .unwrap();
+        let (proc_idx, feat_idx, value): (i64, i64, f64) = stmt
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap();
+        assert_eq!(proc_idx, processing);
+        assert_eq!(feat_idx, feature);
+        assert_eq!(value, 42.0);
+
+        // Schema assertion: the exact five identifier+value columns, no md5 string.
+        let mut stmt = conn
+            .prepare(
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_name = 'feature_counts' ORDER BY ordinal_position",
+            )
+            .unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            cols,
+            vec![
+                "prep_sample_idx",
+                "processing_idx",
+                "processed_prep_sample_idx",
+                "feature_idx",
+                "value",
+            ],
+            "feature_counts column shape drifted, got: {cols:?}"
+        );
     }
 
     /// read_masked applies the recorded trims (substr on the sequence, list

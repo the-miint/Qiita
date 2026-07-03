@@ -460,6 +460,11 @@ async def run_workflow(
         if _workflow_declares_input(action.steps, READS_STAGING_ROOT_BINDING):
             bound[READS_STAGING_ROOT_BINDING] = str(upload_staging_root)
 
+        # golay-demux: materialize the per-sample barcode roster as a Parquet the
+        # demux SQL reads. the FASTQ + Golay table paths are plain action_context.
+        if _workflow_declares_input(action.steps, BARCODE_MAP_BINDING):
+            bound.update(await _resolve_barcode_map(bound, workspace))
+
         # Staged-read binding (read-mask workflow): `reads` is consumed by qc /
         # host_filter but produced by no step, so bind it from the prep_sample's
         # durable stored reads. Inside-try so an un-ingested sample FAILs cleanly.
@@ -514,6 +519,59 @@ async def run_workflow(
             # re-resolves to the same mask_idx via the config-hash upsert and
             # re-writes the same value here.
             await _persist_mask_idx(pool, work_ticket_idx, bound[MASK_IDX_BINDING])
+
+        # amplicon (Rapid 16S): export the pool's read_masked rows for the chosen
+        # mask + the GG2 closed-reference set, and mint the processing identity +
+        # per-sample map. any failure FAILs the ticket via the outer handler.
+        if _workflow_needs_amplicon_inputs(action.steps):
+            if scope_target["kind"] != ScopeTargetKind.SEQUENCED_POOL.value:
+                raise _submission_bad_input(
+                    "the amplicon workflow must be sequenced_pool-scoped; got "
+                    f"{scope_target['kind']!r}"
+                )
+            mask_idx = bound.get(AMPLICON_MASK_IDX_KEY)
+            gg2_reference_idx = bound.get(GG2_REFERENCE_IDX_KEY)
+            if mask_idx is None or gg2_reference_idx is None:
+                raise _submission_bad_input(
+                    "the amplicon workflow requires `mask_idx` and "
+                    "`gg2_reference_idx` in action_context"
+                )
+            sequenced_pool_idx = scope_target["sequenced_pool_idx"]
+            prep_sample_idxs = await _pool_prep_sample_idxs(pool, sequenced_pool_idx)
+            if not prep_sample_idxs:
+                raise _submission_bad_input(
+                    f"sequenced_pool {sequenced_pool_idx} has no member prep_samples"
+                )
+            bound.update(
+                await _resolve_pool_masked_reads(
+                    sequenced_pool_idx=sequenced_pool_idx,
+                    prep_sample_idxs=prep_sample_idxs,
+                    mask_idx=int(mask_idx),
+                    data_plane_url=data_plane_url,
+                    hmac_secret=hmac_secret,
+                    workspace=workspace,
+                )
+            )
+            bound.update(
+                await _resolve_gg2_features(
+                    pool,
+                    gg2_reference_idx=int(gg2_reference_idx),
+                    data_plane_url=data_plane_url,
+                    hmac_secret=hmac_secret,
+                    workspace=workspace,
+                )
+            )
+            bound.update(
+                await _mint_amplicon_processing(
+                    pool,
+                    action_id=action.action_id,
+                    action_version=action.version,
+                    action_context=bound,
+                    originator_principal_idx=work_ticket["originator_principal_idx"],
+                    prep_sample_idxs=prep_sample_idxs,
+                    workspace=workspace,
+                )
+            )
 
         for index, entry in enumerate(action.steps):
             # Conditional gate (WorkflowStep/WorkflowAction.when): skip this
@@ -1889,21 +1947,16 @@ def _workflow_needs_staged_reads(steps: list[Any]) -> bool:
     return True
 
 
-def _write_sample_map_parquet(roster: list[dict[str, Any]], out_path: Path) -> None:
-    """Write the `{prep_sample_idx, pool_item_id}` roster to a Parquet
-    `(prep_sample_idx BIGINT, pool_item_id VARCHAR)` for the ingest step.
-    pyarrow (already a Flight dependency) writes it directly — no DuckDB needed
-    on the pre-loop path, mirroring `_write_adapter_parquet`."""
+def _write_small_parquet(columns: dict[str, tuple[str, list[Any]]], out_path: Path) -> None:
+    """write a small typed table to Parquet via pyarrow — no DuckDB on the pre-loop
+    path. `columns` maps name to `(type_code, values)`, type_code in int64/string/bool.
+    shared by the roster/map materializers so callers stay pyarrow-free."""
     import pyarrow as pa  # noqa: PLC0415
     import pyarrow.parquet as pq  # noqa: PLC0415
 
-    prep = [int(r["prep_sample_idx"]) for r in roster]
-    items = [str(r["pool_item_id"]) for r in roster]
+    typemap = {"int64": pa.int64(), "string": pa.string(), "bool": pa.bool_()}
     table = pa.table(
-        {
-            "prep_sample_idx": pa.array(prep, type=pa.int64()),
-            "pool_item_id": pa.array(items, type=pa.string()),
-        }
+        {name: pa.array(values, type=typemap[code]) for name, (code, values) in columns.items()}
     )
     pq.write_table(table, str(out_path))
 
@@ -1921,8 +1974,55 @@ async def _resolve_sample_map(action_context: dict[str, Any], workspace: Path) -
         )
     workspace.mkdir(parents=True, exist_ok=True)
     out = workspace / "sample_map.parquet"
-    _write_sample_map_parquet(roster, out)
+    _write_small_parquet(
+        {
+            "prep_sample_idx": ("int64", [int(r["prep_sample_idx"]) for r in roster]),
+            "pool_item_id": ("string", [str(r["pool_item_id"]) for r in roster]),
+        },
+        out,
+    )
     return {SAMPLE_MAP_BINDING: out}
+
+
+# golay-demux per-sample barcode roster `[{prep_sample_idx, barcode, barcodes_are_rc}]`,
+# embedded in action_context and materialized to a Parquet the demux SQL reads (the
+# orchestrator has no DB access). the analogue of SAMPLE_MAP_BINDING, keyed by the Golay
+# barcode plus its barcodes_are_rc provenance flag.
+#
+# TODO(sample-sheet-provenance): the submitter hand-builds this today; each field is a
+# sample-sheet fact the run_preflight_blob already carries (barcode, COL_BARCODES_ARE_RC).
+# once run_preflight exposes a per-sample amplicon-barcode accessor, source it from the
+# pool's blob here (as bcl-convert does for sample_map) — the swap stays in this function.
+BARCODE_MAP_BINDING = "barcode_map"
+
+
+async def _resolve_barcode_map(action_context: dict[str, Any], workspace: Path) -> dict[str, Path]:
+    """materialize the golay-demux barcode roster from action_context into a Parquet for
+    the `golay_demux` step. raises SUBMISSION/BAD_INPUT on a missing/empty roster or an
+    entry lacking `barcodes_are_rc`."""
+    roster = action_context.get(BARCODE_MAP_BINDING)
+    if not roster:
+        raise _submission_bad_input(
+            "the golay-demux workflow requires a non-empty `barcode_map` roster "
+            "(`[{prep_sample_idx, barcode, barcodes_are_rc}, ...]`) in action_context"
+        )
+    for r in roster:
+        if "barcodes_are_rc" not in r:
+            raise _submission_bad_input(
+                f"barcode_map entry for prep_sample {r.get('prep_sample_idx')!r} is "
+                "missing `barcodes_are_rc` (the per-sample RC provenance flag)"
+            )
+    workspace.mkdir(parents=True, exist_ok=True)
+    out = workspace / "barcode_map.parquet"
+    _write_small_parquet(
+        {
+            "prep_sample_idx": ("int64", [int(r["prep_sample_idx"]) for r in roster]),
+            "barcode": ("string", [str(r["barcode"]) for r in roster]),
+            "barcodes_are_rc": ("bool", [bool(r["barcodes_are_rc"]) for r in roster]),
+        },
+        out,
+    )
+    return {BARCODE_MAP_BINDING: out}
 
 
 def _do_action_export_read(data_plane_url: str, token: bytes) -> dict[str, Any]:
@@ -2223,6 +2323,234 @@ async def _persist_mask_idx(pool: asyncpg.Pool, work_ticket_idx: int, mask_idx: 
         mask_idx,
         work_ticket_idx,
     )
+
+
+# =============================================================================
+# Amplicon (Rapid 16S) bindings
+# =============================================================================
+#
+# amplicon is sequenced_pool-scoped and runs deblur.sql over the whole pool's masked
+# reads in one job. three runner-side bindings bridge the orchestrator's lack of DB +
+# data-plane access, materialized into the workspace before the loop:
+#   * pool_reads — the pool's read_masked rows for mask_idx, exported by the data plane's
+#     export_pool_masked DoAction. distinct from read-mask's `reads` so its
+#     prep_sample-only resolver doesn't also fire here.
+#   * gg2_features — the GG2 (feature_idx, sequence_hash) set, DoGet from reference_sequences.
+#   * processed_prep_sample_map + processing_idx — the CP-minted processing identity keying
+#     feature_counts (one processed_prep_sample_idx per pool member).
+GG2_FEATURES_BINDING = "gg2_features"
+POOL_READS_BINDING = "pool_reads"
+PROCESSED_MAP_BINDING = "processed_prep_sample_map"
+PROCESSING_IDX_BINDING = "processing_idx"
+GG2_REFERENCE_IDX_KEY = "gg2_reference_idx"
+AMPLICON_MASK_IDX_KEY = "mask_idx"
+_REFERENCE_SEQUENCES_TABLE = "reference_sequences"
+
+
+def _workflow_needs_amplicon_inputs(steps: list[Any]) -> bool:
+    """true iff the workflow consumes `gg2_features` — the amplicon signal that gates the
+    pre-loop resolvers (pool-masked-read export, GG2 export, processing mint)."""
+    return _workflow_declares_input(steps, GG2_FEATURES_BINDING)
+
+
+async def _pool_prep_sample_idxs(
+    pool: asyncpg.Pool | asyncpg.Connection, sequenced_pool_idx: int
+) -> list[int]:
+    """The pool's member prep_sample_idxs, ascending. Empty → caller FAILs."""
+    rows = await pool.fetch(
+        "SELECT prep_sample_idx FROM qiita.sequenced_sample"
+        " WHERE sequenced_pool_idx = $1 ORDER BY prep_sample_idx",
+        sequenced_pool_idx,
+    )
+    return [r["prep_sample_idx"] for r in rows]
+
+
+def _do_action_export_pool_masked(data_plane_url: str, token: bytes) -> dict[str, Any]:
+    """synchronous Flight DoAction (thread executor) that has the data plane materialize a
+    pool's read_masked rows for one mask_idx + prep_sample set into a per-ticket Parquet.
+    returns `{"count": int, "dest": str}`; isolated so unit tests can stub it."""
+    import pyarrow.flight as flight  # noqa: PLC0415
+
+    with flight.FlightClient(data_plane_url) as client:
+        results = list(client.do_action(flight.Action("export_pool_masked", token)))
+    if not results:
+        return {"count": 0, "dest": ""}
+    body = results[0].body.to_pybytes()
+    if not body:
+        return {"count": 0, "dest": ""}
+    try:
+        parsed = json.loads(body)
+        count = int(parsed["count"])
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise ValueError(
+            f"export_pool_masked returned an unparseable result body: {exc!r}"
+        ) from exc
+    return {"count": count, "dest": str(parsed.get("dest", ""))}
+
+
+def _do_get_reference_sequences(data_plane_url: str, ticket_bytes: bytes) -> list[tuple[int, str]]:
+    """synchronous Flight DoGet (thread executor) of a reference's (feature_idx,
+    sequence_hash) rows — the GG2 closed-reference set. sequence_hash is stringified
+    (DuckDB UUID has no Arrow type); the amplicon job casts it back with ::uuid."""
+    import pyarrow.flight as flight  # noqa: PLC0415
+
+    with flight.FlightClient(data_plane_url) as client:
+        table = client.do_get(flight.Ticket(ticket_bytes)).read_all()
+    feature_idx = table.column("feature_idx").to_pylist()
+    sequence_hash = table.column("sequence_hash").to_pylist()
+    return [(int(f), str(h)) for f, h in zip(feature_idx, sequence_hash, strict=True)]
+
+
+async def _resolve_gg2_features(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    *,
+    gg2_reference_idx: int,
+    data_plane_url: str,
+    hmac_secret: bytes,
+    workspace: Path,
+) -> dict[str, Path]:
+    """materialize the GG2 closed-reference set as `<workspace>/gg2_features.parquet` for
+    the amplicon job: validate the reference is ACTIVE, then DoGet its (feature_idx,
+    sequence_hash) rows from reference_sequences. every failure raises SUBMISSION/BAD_INPUT."""
+    row = await pool.fetchrow(
+        "SELECT status FROM qiita.reference WHERE reference_idx = $1", gg2_reference_idx
+    )
+    if row is None:
+        raise _submission_bad_input(f"GG2 reference {gg2_reference_idx} does not exist")
+    if row["status"] != ReferenceStatus.ACTIVE.value:
+        raise _submission_bad_input(
+            f"GG2 reference {gg2_reference_idx} status is {row['status']!r}, "
+            f"must be {ReferenceStatus.ACTIVE.value!r}"
+        )
+
+    ticket = sign_ticket(
+        table=_REFERENCE_SEQUENCES_TABLE,
+        filter={"reference_idx": [gg2_reference_idx]},
+        secret=hmac_secret,
+    )
+    try:
+        rows = await asyncio.get_event_loop().run_in_executor(
+            None, _do_get_reference_sequences, data_plane_url, ticket
+        )
+    except Exception as exc:
+        raise _submission_bad_input(
+            f"could not fetch GG2 features for reference {gg2_reference_idx} from "
+            f"the data plane: {type(exc).__name__}: {exc}"
+        ) from exc
+    # a GG2 reference with no members is a misconfiguration, not a valid target.
+    if not rows:
+        raise _submission_bad_input(
+            f"GG2 reference {gg2_reference_idx}: reference returned no features"
+        )
+    workspace.mkdir(parents=True, exist_ok=True)
+    out = workspace / "gg2_features.parquet"
+    rows = sorted(rows)  # deterministic output
+    _write_small_parquet(
+        {
+            "feature_idx": ("int64", [f for f, _ in rows]),
+            "sequence_hash": ("string", [h for _, h in rows]),
+        },
+        out,
+    )
+    return {GG2_FEATURES_BINDING: out}
+
+
+async def _resolve_pool_masked_reads(
+    *,
+    sequenced_pool_idx: int,
+    prep_sample_idxs: list[int],
+    mask_idx: int,
+    data_plane_url: str,
+    hmac_secret: bytes,
+    workspace: Path,
+) -> dict[str, Path]:
+    """bind `pool_reads` to the pool's read_masked rows for `mask_idx`, exported by the
+    data plane into a per-ticket Parquet. fails SUBMISSION/BAD_INPUT if the pool has no
+    `pass` reads for that mask or the data plane is unreachable."""
+    workspace.mkdir(parents=True, exist_ok=True)
+    dest = workspace / "pool_reads.parquet"
+    token = sign_action(
+        action="export_pool_masked",
+        payload={
+            "prep_sample_idxs": prep_sample_idxs,
+            "mask_idx": mask_idx,
+            "dest": str(dest),
+        },
+        secret=hmac_secret,
+    )
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, _do_action_export_pool_masked, data_plane_url, token
+        )
+    except Exception as exc:
+        raise _submission_bad_input(
+            f"could not materialize masked reads for sequenced_pool "
+            f"{sequenced_pool_idx} (mask {mask_idx}): {type(exc).__name__}: {exc}"
+        ) from exc
+    if result.get("count", 0) == 0:
+        raise _submission_bad_input(
+            f"sequenced_pool {sequenced_pool_idx} has no 'pass' reads for mask "
+            f"{mask_idx} — the pool must be ingested and masked before amplicon "
+            f"processing"
+        )
+    return {POOL_READS_BINDING: dest}
+
+
+async def _mint_amplicon_processing(
+    pool: asyncpg.Pool,
+    *,
+    action_id: str,
+    action_version: str,
+    action_context: dict[str, Any],
+    originator_principal_idx: int,
+    prep_sample_idxs: list[int],
+    workspace: Path,
+) -> dict[str, Any]:
+    """mint the run's processing identity and bind `processing_idx` + the
+    `processed_prep_sample_map` Parquet.
+
+    dedup is on the canonical params (workflow + version + primer/trim/GG2/mask), so the
+    same config over the same pool resolves to the same processing_idx and per-sample
+    idxs (idempotent on resume). one transaction so method + per-sample rows commit
+    together."""
+    from .repositories.processing import mint_processed_prep_samples, mint_processing_method
+
+    params = {
+        "workflow_name": action_id,
+        "workflow_version": action_version,
+        "primer": action_context.get("primer"),
+        "trim": action_context.get("trim"),
+        GG2_REFERENCE_IDX_KEY: action_context.get(GG2_REFERENCE_IDX_KEY),
+        "sortmerna_ref_path": action_context.get("sortmerna_ref_path"),
+        AMPLICON_MASK_IDX_KEY: action_context.get(AMPLICON_MASK_IDX_KEY),
+    }
+    async with pool.acquire() as conn, conn.transaction():
+        method = await mint_processing_method(
+            conn,
+            workflow_name=action_id,
+            workflow_version=action_version,
+            params=params,
+            principal_idx=originator_principal_idx,
+        )
+        mapping = await mint_processed_prep_samples(
+            conn,
+            processing_idx=method["processing_idx"],
+            prep_sample_idxs=prep_sample_idxs,
+        )
+    workspace.mkdir(parents=True, exist_ok=True)
+    out = workspace / "processed_prep_sample_map.parquet"
+    preps = sorted(mapping)
+    _write_small_parquet(
+        {
+            "prep_sample_idx": ("int64", preps),
+            "processed_prep_sample_idx": ("int64", [mapping[p] for p in preps]),
+        },
+        out,
+    )
+    return {
+        PROCESSING_IDX_BINDING: method["processing_idx"],
+        PROCESSED_MAP_BINDING: out,
+    }
 
 
 # Actions whose tickets thread a `mask_idx`; the backfill scopes to these so it

@@ -1,0 +1,83 @@
+action_id: amplicon
+version: 1.0.0
+target_kind: sequenced_pool
+
+description: >
+  16S amplicon processing over a sequenced_pool's masked reads: primer-trim,
+  per-sample dereplicate, SortMeRNA 16S pre-filter, per-sample MAFFT MSA, deblur
+  denoise, UCHIME-denovo chimera removal, then closed-reference match against GG2
+
+scopes: []
+
+audience:
+  service: false
+  human_roles: [wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  required: [primer, trim, gg2_reference_idx, sortmerna_ref_path, mask_idx]
+  properties:
+    # forward amplicon primer (EMP V4 515F default); deblur.sql derives its primer
+    # regex session vars from it in-job.
+    primer:
+      type: string
+      minLength: 1
+    # bp truncation length — 150 for the GG2 V4 ASV catalog.
+    trim:
+      type: integer
+      minimum: 1
+    # active reference with the GG2 closed-reference catalog; its (feature_idx,
+    # sequence_hash) set is joined on the canonical hash to keep only GG2 ASVs. a
+    # plain reference_idx, not a `*_upload_idx` (so the upload-handle walker skips it).
+    gg2_reference_idx:
+      type: integer
+      minimum: 1
+    # absolute compute-node-visible path to the staged SortMeRNA 16S reference
+    # index (88_otus.fasta); inlined into the miint_sortmerna_ref session var.
+    sortmerna_ref_path:
+      type: string
+      minLength: 1
+      pattern: "^/"
+    # which read_masked rows to process. for 16S this mask does NO host filtering
+    # (deblur does its own primer-trim + SortMeRNA QC) — it's required only because
+    # read_masked is the sole Flight-reachable read surface (raw `read` is never
+    # exposed), so a mask is how amplicon gets reads out at all. amplicon consumes
+    # it, never mints it.
+    mask_idx:
+      type: integer
+      minimum: 1
+
+steps:
+  # whole pipeline in one native miint job. `pool_reads`, `gg2_features`, and
+  # `processed_prep_sample_map` are runner-resolved before the loop; `processing_idx`
+  # is the minted scalar threaded via params. deblur.sql runs verbatim for
+  # filter+denoise; the closed-ref join is rewritten against `gg2_features` on the
+  # canonical hash, emitting the sorted feature_counts Parquet.
+  - step: denoise
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.amplicon_deblur
+    inputs: [pool_reads, gg2_features, processed_prep_sample_map]
+    params:
+      primer: primer
+      trim: trim
+      sortmerna_ref_path: sortmerna_ref_path
+      processing_idx: processing_idx
+    outputs: [feature_counts_staging_dir]
+    baseline_resources:
+      # heavy: per-sample MAFFT MSA + deblur + UCHIME over the whole pool. the
+      # aligners (SortMeRNA/MAFFT/vsearch) run as separate processes; DuckDB stays
+      # modest (see amplicon_deblur._DUCKDB_*).
+      cpu: 32
+      mem_gb: 256
+      walltime: PT12H
+
+  # load the sorted feature_counts Parquet into the DuckLake `feature_counts`
+  # table; register-files maps feature_counts.parquet to the table by stem.
+  - action: register-files
+    inputs: [feature_counts_staging_dir]
+    outputs: []
+
+action_ceiling:
+  cpu: 32
+  mem_gb: 256
+  walltime: PT24H
