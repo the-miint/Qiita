@@ -32,7 +32,7 @@ _None yet._
 ### 3. Migrations
 
 - **Email-notification schema.** `make migrate` applies both migrations: `..._email_notification.sql` (adds `work_ticket.notified_at` / `notify_attempts`, creates `qiita.email_receipt`, backfills existing terminal tickets as already-notified) and `..._work_ticket_notified_idx.sql` (a `CREATE INDEX CONCURRENTLY` — runs outside a txn; if interrupted, drop the leftover `INVALID` index and re-run). No out-of-band steps. (#238)
-- **CLI-login plaintext-PAT scrub.** `make migrate` applies `..._cli_login_code_scrub_plaintext.sql`: drops the `NOT NULL` on `cli_login_code.plaintext_pat` and nulls it on already-consumed/expired rows (reclaims plaintext tokens left at rest). No out-of-band steps. (techdebt-sweep-pr1)
+- **CLI-login plaintext-PAT scrub.** `make migrate` applies `..._cli_login_code_scrub_plaintext.sql`: drops the `NOT NULL` on `cli_login_code.plaintext_pat` and nulls it on already-consumed/expired rows (reclaims plaintext tokens left at rest). No out-of-band steps. (#241)
 
 ### 4. Deploy
 
@@ -44,9 +44,9 @@ _None yet._
 
 ### Notes (no host action)
 
-- **Auth env-var parsing is now strict (control-plane).** The five auth int knobs (`AUTHROCKET_JWT_LEEWAY_SECONDS`, `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS`, `QIITA_TOKEN_DEFAULT_TTL_DAYS`, `AUTH_HANDOFF_FRESHNESS_SECONDS`, `CLI_LOGIN_CODE_TTL_SECONDS`) now fail boot on a non-int or non-positive value (leeway may legitimately be 0). If any is set to 0/negative in a live env file, fix it before the restart. New optional `CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS` (default 60) tunes the plaintext-PAT sweeper. (techdebt-sweep-pr1)
-- **Invitation handoff no longer mints a PAT directly.** Accepting an AuthRocket invitation now redirects the user to `/auth/login` (the cookie-anchored flow) instead of displaying a PAT; users complete one normal login after accepting. No host action. (techdebt-sweep-pr1)
-- **Removed inert SLURM env vars (compute-orchestrator).** `SLURM_POLL_INTERVAL_SECONDS` / `SLURM_JOB_TIMEOUT_SECONDS` are no longer read — they never enforced anything (the CP owns the poll loop; SLURM `--time` enforces walltime). Safe to leave or drop from `/etc/qiita/compute-orchestrator.env`. (techdebt-sweep-pr1)
+- **Auth env-var parsing is now strict (control-plane).** The five auth int knobs (`AUTHROCKET_JWT_LEEWAY_SECONDS`, `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS`, `QIITA_TOKEN_DEFAULT_TTL_DAYS`, `AUTH_HANDOFF_FRESHNESS_SECONDS`, `CLI_LOGIN_CODE_TTL_SECONDS`) now fail boot on a non-int or non-positive value (leeway may legitimately be 0). If any is set to 0/negative in a live env file, fix it before the restart. New optional `CLI_LOGIN_CODE_SWEEP_INTERVAL_SECONDS` (default 60) tunes the plaintext-PAT sweeper. (#241)
+- **Invitation handoff no longer mints a PAT directly.** Accepting an AuthRocket invitation now redirects the user to `/auth/login` (the cookie-anchored flow) instead of displaying a PAT; users complete one normal login after accepting. No host action. (#241)
+- **Removed inert SLURM env vars (compute-orchestrator).** `SLURM_POLL_INTERVAL_SECONDS` / `SLURM_JOB_TIMEOUT_SECONDS` are no longer read — they never enforced anything (the CP owns the poll loop; SLURM `--time` enforces walltime). Safe to leave or drop from `/etc/qiita/compute-orchestrator.env`. (#241)
 
 ---
 

@@ -518,10 +518,10 @@ the `no-changelog` label).
 
 ### Changed
 
-- Auth integer env-knobs (`AUTHROCKET_JWT_LEEWAY_SECONDS`, `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS`, `QIITA_TOKEN_DEFAULT_TTL_DAYS`, `AUTH_HANDOFF_FRESHNESS_SECONDS`, `CLI_LOGIN_CODE_TTL_SECONDS`) are now validated at boot instead of parsed with a bare `int()` — a non-int or non-positive value fails loudly (leeway may be 0). (techdebt-sweep-pr1)
-- `GET /reference` and `GET /prep-protocol` accept a bounded `limit` query param (default 1000, max 5000) so the anonymous catalog lists can't return an unbounded payload. (techdebt-sweep-pr1)
-- Flight-ticket and login-cookie signing now share `qiita_common.hashing.canonical_json` instead of three hand-rolled `json.dumps(sort_keys=…)` spellings, removing the risk of the HMAC'd wire serialization drifting. (techdebt-sweep-pr1)
-- Accepting an AuthRocket invitation redirects to the cookie-anchored `/auth/login` instead of minting a full-ceiling PAT from the un-anchored invitation JWT. (techdebt-sweep-pr1)
+- Auth integer env-knobs (`AUTHROCKET_JWT_LEEWAY_SECONDS`, `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS`, `QIITA_TOKEN_DEFAULT_TTL_DAYS`, `AUTH_HANDOFF_FRESHNESS_SECONDS`, `CLI_LOGIN_CODE_TTL_SECONDS`) are now validated at boot instead of parsed with a bare `int()` — a non-int or non-positive value fails loudly (leeway may be 0). (#241)
+- `GET /reference` and `GET /prep-protocol` accept a bounded `limit` query param (default 1000, max 5000) so the anonymous catalog lists can't return an unbounded payload. (#241)
+- Flight-ticket and login-cookie signing now share `qiita_common.hashing.canonical_json` instead of three hand-rolled `json.dumps(sort_keys=…)` spellings, removing the risk of the HMAC'd wire serialization drifting. (#241)
+- Accepting an AuthRocket invitation redirects to the cookie-anchored `/auth/login` instead of minting a full-ceiling PAT from the un-anchored invitation JWT. (#241)
 - `qiita-admin masked-read-export` is now **re-runnable**: it creates `--output-dir`
   (with parents) if missing instead of erroring, and for parquet it skips a sample
   whose output file already exists when the count matches and overwrites it only
@@ -1020,7 +1020,7 @@ the `no-changelog` label).
 
 ### Removed
 
-- Dead SLURM poll/timeout config in the compute-orchestrator (`SlurmBackend` `poll_interval_seconds` / `job_timeout_seconds`, their `SlurmSettings` fields, the `SLURM_POLL_INTERVAL_SECONDS` / `SLURM_JOB_TIMEOUT_SECONDS` env vars, and the `DEFAULT_SLURM_*` constants) — assigned but never read since the CP took over the poll loop. (techdebt-sweep-pr1)
+- Dead SLURM poll/timeout config in the compute-orchestrator (`SlurmBackend` `poll_interval_seconds` / `job_timeout_seconds`, their `SlurmSettings` fields, the `SLURM_POLL_INTERVAL_SECONDS` / `SLURM_JOB_TIMEOUT_SECONDS` env vars, and the `DEFAULT_SLURM_*` constants) — assigned but never read since the CP took over the poll loop. (#241)
 - **`.github/workflows/deploy.yml`** — the unused `v*`-tag auto-deploy workflow.
   It SSH'd to `$DEPLOY_HOST` and ran a real production deploy on any `v*` tag
   push, but production has only ever deployed manually via `deploy/local-deploy.sh`
@@ -1033,11 +1033,11 @@ the `no-changelog` label).
 
 ### Fixed
 
-- **CLI-login plaintext PATs are no longer stored at rest.** `cli_login_code.plaintext_pat` is scrubbed the instant an ot_code is redeemed and a background sweeper deletes consumed/expired rows; previously a consumed row kept a usable bearer token for the token's full life (up to 90 days). (techdebt-sweep-pr1)
-- `sign_ticket` rejects an empty Flight-ticket filter (which the data plane treats as `SELECT * FROM <table>`) at the signing boundary, not just per-route. (techdebt-sweep-pr1)
-- DB constraint/trigger violations (principal disable/retire, prep_sample publication lock) return stable client messages instead of leaking internal constraint/trigger names. (techdebt-sweep-pr1)
-- `verify_api_token` retains its fire-and-forget `record_token_use` task (was GC-droppable before the `last_used_at` write landed); `_parse_job` guards a null `exit_code` (was an untyped `AttributeError`); the SLURM payload rejects `gpu>0` at submit instead of silently dropping it. (techdebt-sweep-pr1)
-- Doc drift: architecture.md marks the unbuilt processing-results subsystem as *planned*; CLAUDE.md's data-plane test example names a real test; auth.md corrects the empty-`Bearer` behavior. (techdebt-sweep-pr1)
+- **CLI-login plaintext PATs are no longer stored at rest.** `cli_login_code.plaintext_pat` is scrubbed the instant an ot_code is redeemed and a background sweeper deletes consumed/expired rows; previously a consumed row kept a usable bearer token for the token's full life (up to 90 days). (#241)
+- `sign_ticket` rejects an empty Flight-ticket filter (which the data plane treats as `SELECT * FROM <table>`) at the signing boundary, not just per-route. (#241)
+- DB constraint/trigger violations (principal disable/retire, prep_sample publication lock) return stable client messages instead of leaking internal constraint/trigger names. (#241)
+- `verify_api_token` retains its fire-and-forget `record_token_use` task (was GC-droppable before the `last_used_at` write landed); `_parse_job` guards a null `exit_code` (was an untyped `AttributeError`); the SLURM payload rejects `gpu>0` at submit instead of silently dropping it. (#241)
+- Doc drift: architecture.md marks the unbuilt processing-results subsystem as *planned*; CLAUDE.md's data-plane test example names a real test; auth.md corrects the empty-`Bearer` behavior. (#241)
 - Integration-test harness: the `data_plane` fixture's gRPC-startup wait ceiling
   is raised from 10s to 30s (override via `QIITA_DP_START_TIMEOUT_S`), fixing an
   intermittent `test-integration` setup failure where the first module to use the
