@@ -51,6 +51,7 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_INDEX,
     PATH_REFERENCE_PREFIX,
+    PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN,
     PATH_SEQUENCED_POOL_BY_IDX,
     PATH_SEQUENCED_POOL_COMPLETION,
     PATH_SEQUENCED_SAMPLE_BY_IDX,
@@ -74,6 +75,7 @@ from qiita_common.models import (
     BiosampleImportRequest,
     BiosampleLookupByAccessionRequest,
     BiosamplePatchRequest,
+    BlockMaskPlanRequest,
     Platform,
     ReferenceStatus,
     ScopeTargetKind,
@@ -1315,6 +1317,79 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_submit_hf.set_defaults(handler=_handle_submit_host_filter_pool)
 
+    p_submit_block = sub.add_parser(
+        "submit-block-mask-pool",
+        help=(
+            "Bulk-block variant of submit-host-filter-pool: mask a whole pool as"
+            " fixed ~10M-read blocks (one work-ticket per block) instead of one"
+            " ticket per sample."
+        ),
+        description=(
+            "Plan + submit a pool's read masking as bulk BLOCKS in a single server"
+            " call. Same filtering semantics and preflight as"
+            " submit-host-filter-pool — --host-rype-reference-idx (with optional"
+            " --host-minimap2-reference-idx) names the reference(s) every sample is"
+            " depleted against, or omit both for a QC-only pass-through; each is"
+            " checked ACTIVE + carrying its index up front — but the server"
+            " partitions the pool by mask identity, tiles each partition into fixed"
+            " ~10M-read blocks, and dispatches one block work-ticket per block."
+            " Per-sample completion is reconciled afterward. This shrinks the"
+            " fan-out surface and gives each job a predictable input size. The mask"
+            " a block produces is identical to the per-sample read-mask of the same"
+            " config, so the two paths interoperate."
+        ),
+    )
+    p_submit_block.add_argument(
+        "--sequencing-run-idx",
+        type=int,
+        required=True,
+        help="sequencing_run_idx the pool belongs to (the route checks pool↔run).",
+    )
+    p_submit_block.add_argument(
+        "--sequenced-pool-idx",
+        type=int,
+        required=True,
+        help="sequenced_pool_idx whose samples to tile into blocks.",
+    )
+    p_submit_block.add_argument(
+        "--host-rype-reference-idx",
+        type=int,
+        default=None,
+        help=(
+            "ACTIVE host reference_idx whose rype (.ryxdi) index every sample in the"
+            " pool is depleted against. Omit to plan the whole pool QC-only."
+        ),
+    )
+    p_submit_block.add_argument(
+        "--host-minimap2-reference-idx",
+        type=int,
+        default=None,
+        help=(
+            "Optional ACTIVE host reference_idx whose minimap2 (.mmi) index drives"
+            " the second host-filter pass. Requires --host-rype-reference-idx."
+        ),
+    )
+    p_submit_block.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Proceed even when some samples' intake human_filtering intent"
+            " disagrees with this submission's pool-wide host-reference choice"
+            " (printed as a warning instead of aborting)."
+        ),
+    )
+    p_submit_block.add_argument(
+        "--only-missing",
+        action="store_true",
+        help=(
+            "Skip samples already carrying a completion gate for their resolved"
+            " mask (applied server-side), so an interrupted plan re-runs only the"
+            " gap. Off by default so a re-plan against a different host reference"
+            " still tiles the whole pool."
+        ),
+    )
+    p_submit_block.set_defaults(handler=_handle_submit_block_mask_pool)
+
     p_pool_completion = sub.add_parser(
         "pool-completion",
         help=(
@@ -2309,6 +2384,66 @@ def _assert_host_reference_ready(
         raise SystemExit(1)
 
 
+def _assert_pool_intent_matches(
+    samples: list[dict],
+    *,
+    sequenced_pool_idx: int,
+    host_rype_reference_idx: int | None,
+    applying_host_filter: bool,
+    force: bool,
+) -> None:
+    """Preflight shared by the per-sample (submit-host-filter-pool) and block
+    (submit-block-mask-pool) pool-masking submitters.
+
+    Host filtering is applied pool-wide, so flag any sample whose intake
+    human_filtering intent disagrees with this submission's choice (a host
+    reference depletes human reads; none is a pass-through). A flagged-human
+    sample submitted with no host reference would keep its human reads; a
+    not-flagged sample submitted with a host reference would be filtered against
+    the operator's intent. Either is a likely mistake — abort (SystemExit 1)
+    before any submission unless `force` downgrades the mismatch to a warning. A
+    null intent (the bcl-convert/preflight coupling is broken for that pool item)
+    always aborts.
+    """
+    mismatched: list[str] = []
+    for sample in samples:
+        item_id = sample["sequenced_pool_item_id"]
+        intent = sample.get("human_filtering")
+        if intent is None:
+            sys.stderr.write(
+                f"sequenced_pool {sequenced_pool_idx} has no stored"
+                f" preflight intent for sequenced_pool_item_id {item_id!r}"
+                f" (prep_sample {sample['prep_sample_idx']}); verify the pool"
+                " was created by submit-bcl-convert with its run preflight\n"
+            )
+            raise SystemExit(1)
+        if intent != applying_host_filter:
+            mismatched.append(
+                f"  - sequenced_pool_item_id {item_id} (prep_sample"
+                f" {sample['prep_sample_idx']}): intake human_filtering="
+                f"{intent}"
+            )
+    if mismatched:
+        choice = (
+            f"apply host reference {host_rype_reference_idx}"
+            if applying_host_filter
+            else "run QC-only with host filtering disabled (a pass-through)"
+        )
+        header = (
+            "host filtering is applied pool-wide, but these samples' intake"
+            f" human_filtering intent disagrees with this submission, which"
+            f" would {choice} for every sample:\n"
+            + "\n".join(mismatched)
+            + "\nSubmit the matching subset, re-run with the opposite"
+            " host-reference choice, or pass --force to apply this pool-wide"
+            " choice anyway.\n"
+        )
+        if not force:
+            sys.stderr.write(header)
+            raise SystemExit(1)
+        sys.stderr.write("WARNING (--force): " + header)
+
+
 def _handle_submit_host_filter_pool(
     args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> int:
@@ -2424,56 +2559,17 @@ def _handle_submit_host_filter_pool(
                 return summary
 
         # Step 1.5: host filtering is applied pool-wide, so flag any sample whose
-        # intake human_filtering intent disagrees with this submission's choice
-        # (a host reference depletes human reads; none is a pass-through). A
-        # flagged-human sample submitted with no host reference would keep its
-        # human reads; a not-flagged sample submitted with a host reference would
-        # be filtered against the operator's intent. Either is a likely mistake —
-        # fail fast before any ticket POST unless --force overrides it.
-        # The check is roster-driven: every pool member is compared against its
-        # intake intent, which the route resolved from the pool's stored
-        # preflight. A null intent means the stored preflight has no row for this
-        # pool item (or the pool carries no preflight) — the broken-coupling case
-        # handled below.
-        mismatched: list[str] = []
-        for sample in samples:
-            item_id = sample["sequenced_pool_item_id"]
-            intent = sample.get("human_filtering")
-            if intent is None:
-                # The pool's stored preflight has no human_filtering for this pool
-                # item — the bcl-convert/preflight coupling is broken; surface it.
-                sys.stderr.write(
-                    f"sequenced_pool {args.sequenced_pool_idx} has no stored"
-                    f" preflight intent for sequenced_pool_item_id {item_id!r}"
-                    f" (prep_sample {sample['prep_sample_idx']}); verify the pool"
-                    " was created by submit-bcl-convert with its run preflight\n"
-                )
-                raise SystemExit(1)
-            if intent != applying_host_filter:
-                mismatched.append(
-                    f"  - sequenced_pool_item_id {item_id} (prep_sample"
-                    f" {sample['prep_sample_idx']}): intake human_filtering="
-                    f"{intent}"
-                )
-        if mismatched:
-            choice = (
-                f"apply host reference {args.host_rype_reference_idx}"
-                if applying_host_filter
-                else "run QC-only with host filtering disabled (a pass-through)"
-            )
-            header = (
-                "host filtering is applied pool-wide, but these samples' intake"
-                f" human_filtering intent disagrees with this submission, which"
-                f" would {choice} for every sample:\n"
-                + "\n".join(mismatched)
-                + "\nSubmit the matching subset, re-run with the opposite"
-                " host-reference choice, or pass --force to apply this pool-wide"
-                " choice anyway.\n"
-            )
-            if not args.force:
-                sys.stderr.write(header)
-                raise SystemExit(1)
-            sys.stderr.write("WARNING (--force): " + header)
+        # intake human_filtering intent disagrees with this submission's choice.
+        # Roster-driven: every pool member is compared against its intake intent
+        # (resolved server-side from the pool's stored preflight). Shared with
+        # submit-block-mask-pool via _assert_pool_intent_matches.
+        _assert_pool_intent_matches(
+            samples,
+            sequenced_pool_idx=args.sequenced_pool_idx,
+            host_rype_reference_idx=args.host_rype_reference_idx,
+            applying_host_filter=applying_host_filter,
+            force=args.force,
+        )
 
         # Step 2: pre-flight the given host reference(s) before any ticket — one
         # actionable error instead of N FAILED tickets. No host refs given (the
@@ -2605,6 +2701,108 @@ def _handle_submit_host_filter_pool(
             print(json.dumps(summary, indent=2))
             raise SystemExit(1)
         return summary
+
+    return _common.run_http_subcommand(_run)
+
+
+def _handle_submit_block_mask_pool(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    """Bulk-block variant of submit-host-filter-pool: mask a whole pool as fixed
+    ~10M-read BLOCKS instead of one ticket per sample.
+
+    Same filtering semantics and the same client-side preflight as
+    submit-host-filter-pool — host-ref coherence, the intake human_filtering
+    intent check (with --force), and the up-front host-reference ACTIVE+index
+    readiness check — but the actual submission is a SINGLE server call to the
+    block-mask-plan endpoint, not a per-sample fan-out. The server resolves each
+    sample's mask identity, partitions by mask, tiles each partition into blocks,
+    and dispatches one block work-ticket per block; per-sample completion is
+    reconciled afterward. This collapses the fan-out surface (few fat blocks
+    instead of one ticket per sample) and gives each job a predictable ~10M-read
+    envelope.
+
+    `--only-missing` is applied SERVER-side (skip samples already carrying a
+    completion gate for their resolved mask), so an interrupted plan re-runs only
+    the gap. instrument_model is read server-side (the endpoint owns it), so
+    there is no per-run GET here."""
+    # Host-ref argument coherence, validated before any network call (mirrors
+    # submit-host-filter-pool): minimap2 is the optional second stage.
+    if args.host_minimap2_reference_idx is not None and args.host_rype_reference_idx is None:
+        parser.error("--host-minimap2-reference-idx requires --host-rype-reference-idx")
+
+    applying_host_filter = args.host_rype_reference_idx is not None
+
+    def _run(token: str) -> dict:
+        # Step 1: enumerate the pool's active samples for the intent preflight.
+        pool_list_path = PATH_SEQUENCED_SAMPLE_LIST_BY_POOL.format(
+            sequencing_run_idx=args.sequencing_run_idx,
+            sequenced_pool_idx=args.sequenced_pool_idx,
+        )
+        roster = _common.call(
+            "GET",
+            args.base_url,
+            token,
+            f"{PATH_SEQUENCING_RUN_PREFIX}{pool_list_path}",
+        )
+        samples = roster["samples"]
+        if not samples:
+            sys.stderr.write(
+                f"sequenced_pool {args.sequenced_pool_idx} has no active"
+                " sequenced_samples to process\n"
+            )
+            raise SystemExit(1)
+
+        # Step 1.5: intent-mismatch preflight over the whole active roster (shared
+        # with submit-host-filter-pool). --only-missing is applied server-side, so
+        # the check runs over every active sample; an already-gated sample the
+        # server will skip is compared too (conservative, never under-checks).
+        _assert_pool_intent_matches(
+            samples,
+            sequenced_pool_idx=args.sequenced_pool_idx,
+            host_rype_reference_idx=args.host_rype_reference_idx,
+            applying_host_filter=applying_host_filter,
+            force=args.force,
+        )
+
+        # Step 2: pre-flight the given host reference(s) — one actionable error
+        # instead of a whole plan's worth of failed blocks. No host refs → skip.
+        if args.host_rype_reference_idx is not None:
+            _assert_host_reference_ready(
+                args.base_url,
+                token,
+                args.host_rype_reference_idx,
+                HOST_FILTER_INDEX_TYPE_RYPE,
+                "--host-rype-reference-idx",
+            )
+            if args.host_minimap2_reference_idx is not None:
+                _assert_host_reference_ready(
+                    args.base_url,
+                    token,
+                    args.host_minimap2_reference_idx,
+                    HOST_FILTER_INDEX_TYPE_MINIMAP2,
+                    "--host-minimap2-reference-idx",
+                )
+
+        # Step 3: one call plans + submits the whole pool. The server tiles,
+        # persists the cover-map + gate, creates one block ticket per block, and
+        # dispatches; it returns the plan summary (blocks + tickets + counts).
+        plan_path = PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN.format(
+            sequencing_run_idx=args.sequencing_run_idx,
+            sequenced_pool_idx=args.sequenced_pool_idx,
+        )
+        body = BlockMaskPlanRequest(
+            host_rype_reference_idx=args.host_rype_reference_idx,
+            host_minimap2_reference_idx=args.host_minimap2_reference_idx,
+            only_missing=args.only_missing,
+        ).model_dump(mode="json")
+        return _common.call(
+            "POST",
+            args.base_url,
+            token,
+            f"{PATH_SEQUENCING_RUN_PREFIX}{plan_path}",
+            json=body,
+        )
 
     return _common.run_http_subcommand(_run)
 

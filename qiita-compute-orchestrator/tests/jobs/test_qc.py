@@ -146,6 +146,63 @@ def test_qc_routes_se_pe_and_unions(tmp_path, monkeypatch, write_reads):
     ]
 
 
+def test_qc_multi_sample_block_processes_all_reads(tmp_path, monkeypatch, write_reads):
+    """A BLOCK's reads parquet carries several prep_samples, but QC keys the mask
+    on the globally-unique sequence_idx and never reads prep_sample_idx — so a
+    multi-sample block yields one mask row per read exactly as a single-sample
+    input would (the extra column is inert; SE/PE routing is unaffected)."""
+    from qiita_compute_orchestrator.jobs import qc
+
+    reads = write_reads(
+        tmp_path / "reads.parquet",
+        [
+            (10, "se1", "AAAA", None),  # sample 5, SE
+            (20, "pe1", "AAAA", "TTTT"),  # sample 5, PE
+            (30, "se2", "CCCC", None),  # sample 7, SE
+            (40, "pe2", "GGGG", "CCCC"),  # sample 7, PE
+        ],
+        prep_sample_idx=[5, 5, 7, 7],
+    )
+
+    def fake_se(src_view, *, adapters_sql, apply_polyg):
+        return (
+            f"SELECT sequence_idx, '{_PASS}' AS reason, "
+            "0::UINTEGER AS left_trim1, 0::UINTEGER AS right_trim1, "
+            "NULL::UINTEGER AS left_trim2, NULL::UINTEGER AS right_trim2 "
+            f"FROM {src_view}"
+        )
+
+    def fake_pe(src_view, *, adapters_sql, apply_polyg):
+        return (
+            f"SELECT sequence_idx, '{_PASS}' AS reason, "
+            "0::UINTEGER AS left_trim1, 0::UINTEGER AS right_trim1, "
+            "0::UINTEGER AS left_trim2, 0::UINTEGER AS right_trim2 "
+            f"FROM {src_view}"
+        )
+
+    monkeypatch.setattr(qc, "_qc_se_select", fake_se)
+    monkeypatch.setattr(qc, "_qc_pe_select", fake_pe)
+
+    # A block ticket flows no prep_sample_idx scalar (block scope has many); the
+    # Inputs field is optional and QC ignores it either way.
+    inputs = qc.Inputs(
+        reads=reads,
+        adapter_parquet=_adapter_parquet(tmp_path, _AD),
+        instrument_model=None,
+        work_ticket_idx=1,
+    )
+    out = asyncio.run(qc.execute(inputs, tmp_path / "ws"))
+
+    # All four reads masked, SE/PE routing preserved across the two samples.
+    assert _schema(out["qc_mask"]) == _MASK_SCHEMA
+    assert _rows(out["qc_mask"]) == [
+        (10, _PASS, True),
+        (20, _PASS, False),
+        (30, _PASS, True),
+        (40, _PASS, False),
+    ]
+
+
 @pytest.mark.parametrize(
     "model,expected",
     [

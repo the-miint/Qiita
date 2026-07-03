@@ -33,6 +33,13 @@ from qiita_common.models import FeatureHashEntry
 from qiita_common.parquet import PARQUET_OPTS, validate_parquet_path
 
 from ..auth.tickets import sign_action
+from ..repositories.block import (
+    fetch_block_members,
+    finalize_mask_sample,
+    has_incomplete_covering_block,
+    lock_mask_sample,
+    set_block_state,
+)
 
 # Chunk size for batch processing. Array params avoid the Postgres $65535
 # scalar parameter limit, but large arrays increase memory pressure and
@@ -218,6 +225,20 @@ def _do_action_delete_pool_reads(data_plane_url: str, token: bytes) -> list:
     """Synchronous gRPC call to data plane — runs in thread executor."""
     with _flight.FlightClient(data_plane_url) as client:
         action = _flight.Action("delete_pool_reads", token)
+        return list(client.do_action(action))
+
+
+def _do_action_mask_metrics(data_plane_url: str, token: bytes) -> list:
+    """Synchronous gRPC call to data plane — runs in thread executor."""
+    with _flight.FlightClient(data_plane_url) as client:
+        action = _flight.Action("mask_metrics", token)
+        return list(client.do_action(action))
+
+
+def _do_action_delete_read_mask_block(data_plane_url: str, token: bytes) -> list:
+    """Synchronous gRPC call to data plane — runs in thread executor."""
+    with _flight.FlightClient(data_plane_url) as client:
+        action = _flight.Action("delete_read_mask_block", token)
         return list(client.do_action(action))
 
 
@@ -450,6 +471,38 @@ def _read_mask_counts(read_mask_path: Path) -> tuple[int, int, int]:
     return raw, biological, quality_filtered
 
 
+async def _update_sequenced_sample_read_counts(
+    conn: asyncpg.Connection | asyncpg.Pool,
+    prep_sample_idx: int,
+    *,
+    raw: int,
+    biological: int,
+    quality_filtered: int,
+) -> int | None:
+    """Write the three per-stage both-mates (`*_r1r2`) read counts onto the 1:1
+    sequenced_sample row for `prep_sample_idx`; return its idx, or None if no such
+    row exists (the caller raises its own ordering-specific error).
+
+    Shared by `persist_read_metrics` (per-sample path, counts from a local
+    parquet) and `_finalize_sample_metrics` (block-compute path, counts from the
+    DuckLake `mask_metrics` aggregate). Idempotent — a retried workflow overwrites
+    with the same counts. Accepts a pool or a connection so it composes standalone
+    or inside a transaction. The DB CHECK (quality_filtered <= biological <= raw)
+    enforces stage monotonicity at write time."""
+    return await conn.fetchval(
+        "UPDATE qiita.sequenced_sample"
+        " SET raw_read_count_r1r2 = $2,"
+        "     biological_read_count_r1r2 = $3,"
+        "     quality_filtered_read_count_r1r2 = $4"
+        " WHERE prep_sample_idx = $1"
+        " RETURNING idx",
+        prep_sample_idx,
+        raw,
+        biological,
+        quality_filtered,
+    )
+
+
 async def persist_read_metrics(
     pool: asyncpg.Pool,
     prep_sample_idx: int,
@@ -478,17 +531,12 @@ async def persist_read_metrics(
     raw_read_count_r1r2, biological_read_count_r1r2, quality_filtered_read_count_r1r2 = (
         _read_mask_counts(read_mask_path)
     )
-    ss_idx = await pool.fetchval(
-        "UPDATE qiita.sequenced_sample"
-        " SET raw_read_count_r1r2 = $2,"
-        "     biological_read_count_r1r2 = $3,"
-        "     quality_filtered_read_count_r1r2 = $4"
-        " WHERE prep_sample_idx = $1"
-        " RETURNING idx",
+    ss_idx = await _update_sequenced_sample_read_counts(
+        pool,
         prep_sample_idx,
-        raw_read_count_r1r2,
-        biological_read_count_r1r2,
-        quality_filtered_read_count_r1r2,
+        raw=raw_read_count_r1r2,
+        biological=biological_read_count_r1r2,
+        quality_filtered=quality_filtered_read_count_r1r2,
     )
     if ss_idx is None:
         raise RuntimeError(
@@ -668,6 +716,244 @@ async def delete_mask_data(
     return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
 
 
+async def mask_metrics_data(
+    *,
+    mask_idx: int,
+    prep_sample_idx: int,
+    hmac_secret: bytes,
+    data_plane_url: str,
+) -> dict[str, int]:
+    """Aggregate a sample's per-stage read counts for one mask from the DuckLake
+    `read_mask` table via the data plane's `mask_metrics` DoAction.
+
+    Returns `{raw, biological, quality_filtered, row_count}` — the both-mates
+    (`*_r1r2`) totals `sequenced_sample` stores plus `row_count` (one per
+    read/pair) the reconcile count-assertion checks against `sequence_range`.
+    Unlike the per-sample path's local-parquet `_read_mask_counts`, this reads the
+    PERSISTED table because a block-masked sample's rows are written by several
+    blocks. Raises pyarrow.flight.FlightError on transport / data-plane failure,
+    RuntimeError on an empty result."""
+    token = sign_action(
+        action="mask_metrics",
+        payload={"mask_idx": mask_idx, "prep_sample_idx": prep_sample_idx},
+        secret=hmac_secret,
+    )
+    results = await asyncio.get_event_loop().run_in_executor(
+        None, _do_action_mask_metrics, data_plane_url, token
+    )
+    if not results:
+        raise RuntimeError("mask_metrics DoAction returned no result")
+    return json.loads(results[0].body.to_pybytes())
+
+
+async def delete_read_mask_block_data(
+    *,
+    mask_idx: int,
+    members: list[dict[str, int]],
+    hmac_secret: bytes,
+    data_plane_url: str,
+) -> int:
+    """Delete one block's exact `read_mask` footprint via the `delete_read_mask_block`
+    DoAction, returning the rows-deleted count.
+
+    `members` is the block's cover-map as `{prep_sample_idx, sequence_idx_start,
+    sequence_idx_stop}` dicts (from `block_member`). The data plane deletes the
+    rows for `mask_idx` whose `(prep_sample_idx, sequence_idx)` fall in those
+    sub-ranges — exact by construction (per-member OR), so a split sample's
+    sibling-block rows survive. This is the idempotent-block-replace step run
+    immediately before register-files.
+
+    Idempotent: a fresh block (no rows yet) deletes 0 and still succeeds; an empty
+    `members` list short-circuits without a Flight call (an empty block is a
+    control-plane bug the runner never dispatches, guarded here too). Raises
+    pyarrow.flight.FlightError on transport / data-plane failure."""
+    if not members:
+        return 0
+    token = sign_action(
+        action="delete_read_mask_block",
+        payload={"mask_idx": mask_idx, "members": members},
+        secret=hmac_secret,
+    )
+    results = await asyncio.get_event_loop().run_in_executor(
+        None, _do_action_delete_read_mask_block, data_plane_url, token
+    )
+    if not results:
+        return 0
+    return json.loads(results[0].body.to_pybytes()).get("rows_deleted", 0)
+
+
+async def _finalize_sample_metrics(
+    conn: asyncpg.Connection,
+    *,
+    prep_sample_idx: int,
+    mask_idx: int,
+    hmac_secret: bytes,
+    data_plane_url: str,
+) -> None:
+    """Roll a finalized sample's per-stage read counts onto its sequenced_sample,
+    with the fail-loud count assertion. The block-compute analog of
+    `persist_read_metrics`, but sourced from the DuckLake `mask_metrics` aggregate
+    (across all the sample's blocks) rather than a single local parquet.
+
+    Count assertion (§4.5): the total `read_mask` rows for `(prep_sample, mask)`
+    must equal the sample's `sequence_range` count (`stop - start + 1`, one per
+    read/pair). This runs only once the finalize gate has confirmed every covering
+    block completed, so a mismatch is a real cover-map / masking defect (the
+    blocks did not fully tile the sample) — raise, don't persist a wrong count.
+    The UPDATE mirrors persist_read_metrics; the DB CHECK
+    (quality_filtered <= biological <= raw) holds by construction."""
+    counts = await mask_metrics_data(
+        mask_idx=mask_idx,
+        prep_sample_idx=prep_sample_idx,
+        hmac_secret=hmac_secret,
+        data_plane_url=data_plane_url,
+    )
+    expected = await conn.fetchval(
+        "SELECT sequence_idx_stop - sequence_idx_start + 1"
+        "  FROM qiita.sequence_range WHERE prep_sample_idx = $1",
+        prep_sample_idx,
+    )
+    if expected is None:
+        raise RuntimeError(
+            f"no sequence_range for prep_sample_idx={prep_sample_idx}; a sequenced "
+            "sample reconciled from a block must have a minted read range"
+        )
+    if counts["row_count"] != expected:
+        raise RuntimeError(
+            f"read_mask row count {counts['row_count']} != sequence_range count "
+            f"{expected} for (prep_sample={prep_sample_idx}, mask={mask_idx}); the "
+            "block cover-map does not fully tile the sample's reads (a planning or "
+            "masking defect) — refusing to finalize a partially-masked sample"
+        )
+    ss_idx = await _update_sequenced_sample_read_counts(
+        conn,
+        prep_sample_idx,
+        raw=counts["raw"],
+        biological=counts["biological"],
+        quality_filtered=counts["quality_filtered"],
+    )
+    if ss_idx is None:
+        raise RuntimeError(
+            f"no sequenced_sample row for prep_sample_idx={prep_sample_idx}; "
+            "block reconcile requires the sample to be pooled (its 1:1 "
+            "sequenced_sample created) before masking"
+        )
+
+
+async def delete_read_mask_block(
+    pool: asyncpg.Pool,
+    *,
+    block_idx: int,
+    mask_idx: int,
+    hmac_secret: bytes,
+    data_plane_url: str,
+) -> dict[str, Any]:
+    """Idempotent block replace: delete this block's exact `read_mask` footprint
+    before register-files re-writes it, so a block re-run never double-counts.
+
+    Reads the block's cover-map (`block_member`) and asks the data plane to delete
+    the `read_mask` rows for `mask_idx` whose `(prep_sample_idx, sequence_idx)`
+    fall in the members' sub-ranges. The delete is exact by construction (per-member
+    OR residual), so a sample split across several blocks keeps its sibling blocks'
+    rows — only THIS block's footprint goes.
+
+    On a fresh block this deletes 0 rows (nothing registered yet); on a re-run
+    (retry, or an operator-resubmitted block covering the same footprint) it clears
+    the prior rows so the subsequent register-files leaves exactly one copy and the
+    reconcile count-assertion holds. Read-only on Postgres — the delete lands in
+    DuckLake. Returns the rows-deleted count for the workflow log."""
+    members = [
+        {
+            "prep_sample_idx": prep_sample_idx,
+            "sequence_idx_start": min_seq,
+            "sequence_idx_stop": max_seq,
+        }
+        for prep_sample_idx, min_seq, max_seq in await fetch_block_members(pool, block_idx)
+    ]
+    if not members:
+        raise RuntimeError(
+            f"block {block_idx} has no block_member rows; a block must carry its "
+            "cover-map (materialized at plan time) before any step runs"
+        )
+    rows_deleted = await delete_read_mask_block_data(
+        mask_idx=mask_idx,
+        members=members,
+        hmac_secret=hmac_secret,
+        data_plane_url=data_plane_url,
+    )
+    return {"block_idx": block_idx, "rows_deleted": rows_deleted}
+
+
+async def reconcile_block(
+    pool: asyncpg.Pool,
+    *,
+    block_idx: int,
+    mask_idx: int,
+    hmac_secret: bytes,
+    data_plane_url: str,
+) -> dict[str, Any]:
+    """Terminal step of the bulk-block read-mask workflow: mark this block done,
+    then finalize each sample it covers whose LAST covering block just completed.
+
+    In one transaction (the whole reconcile is atomic):
+
+    1. Flip this block to 'completed' — its `read_mask` rows are registered
+       (register-files ran before this step).
+    2. For each covered sample, in a stable prep_sample_idx order (deadlock-free):
+       take the `mask_sample` gate row's `FOR UPDATE` lock (serializes concurrent
+       block finalizers of the same sample), skip if already 'completed'
+       (idempotent / lost the race), skip if any covering block is not yet
+       'completed' (a sibling still owes reads), else roll the per-stage counts
+       onto `sequenced_sample` (with the count assertion) and flip the gate to
+       'completed'.
+
+    The lock is held across the metrics DoAction so the check-and-flip is atomic;
+    a block is a long SLURM job, so this per-sample lock hold is rare and cheap.
+    Idempotent: a re-run flips nothing new (its block is already completed and its
+    samples already finalized). Returns a summary of the samples this block
+    finalized."""
+    finalized: list[int] = []
+    async with pool.acquire() as conn, conn.transaction():
+        # This block's work is done; count it as completed BEFORE the per-sample
+        # gate check below (same txn — the UPDATE is visible to our own SELECTs).
+        # Guarded so the bool is meaningful, but we proceed regardless: a re-run
+        # where it is already completed still (idempotently) finalizes its samples.
+        await set_block_state(
+            conn,
+            block_idx=block_idx,
+            new_state="completed",
+            expected_states=["pending", "processing", "failed"],
+        )
+        for prep_sample_idx, _min_seq, _max_seq in await fetch_block_members(conn, block_idx):
+            state = await lock_mask_sample(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
+            if state is None:
+                raise RuntimeError(
+                    f"mask_sample gate row missing for (mask={mask_idx}, "
+                    f"prep_sample={prep_sample_idx}); it must be materialized PENDING "
+                    "at plan time before any block runs"
+                )
+            if state == "completed":
+                # Already finalized (idempotent re-run, or a concurrent block
+                # finalizer won this sample's race) — nothing to do.
+                continue
+            if await has_incomplete_covering_block(
+                conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx
+            ):
+                # A sibling block still owes this sample reads — do not finalize a
+                # partially-masked sample (the export gate depends on this).
+                continue
+            await _finalize_sample_metrics(
+                conn,
+                prep_sample_idx=prep_sample_idx,
+                mask_idx=mask_idx,
+                hmac_secret=hmac_secret,
+                data_plane_url=data_plane_url,
+            )
+            await finalize_mask_sample(conn, mask_idx=mask_idx, prep_sample_idx=prep_sample_idx)
+            finalized.append(prep_sample_idx)
+    return {"block_idx": block_idx, "finalized_samples": finalized}
+
+
 # =============================================================================
 # Name → callable lookup for the workflow runner
 # =============================================================================
@@ -684,4 +970,6 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.REGISTER_INDEX: register_index,
     LibraryPrimitive.PERSIST_READ_METRICS: persist_read_metrics,
     LibraryPrimitive.PERSIST_QC_REPORT: persist_qc_report,
+    LibraryPrimitive.DELETE_READ_MASK_BLOCK: delete_read_mask_block,
+    LibraryPrimitive.RECONCILE_BLOCK: reconcile_block,
 }

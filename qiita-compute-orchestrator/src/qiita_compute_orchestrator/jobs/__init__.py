@@ -56,6 +56,15 @@ SCOPE_SCALARS_BY_KIND: dict[str, frozenset[str]] = {
     ScopeTargetKind.STUDY_PREP.value: frozenset({"study_idx", "prep_idx"}),
     ScopeTargetKind.PREP_SAMPLE.value: frozenset({"prep_sample_idx"}),
     ScopeTargetKind.SEQUENCED_POOL.value: frozenset({"sequenced_pool_idx", "sequencing_run_idx"}),
+    # A block spans MANY prep_samples, so there is no single prep_sample_idx to
+    # flow — the block's native jobs (qc, host_filter) read prep_sample_idx
+    # per-row from the reads parquet instead. The block↔sample cover-map and the
+    # mask identity live on the control-plane side (block_member, work_ticket.
+    # mask_idx), which the reconcile primitive reads directly; the kernels need
+    # no block scalar. So the block arm is deliberately empty — present only so
+    # flatten_native_inputs doesn't reject a block-scoped ticket as an unknown
+    # kind.
+    ScopeTargetKind.BLOCK.value: frozenset(),
 }
 
 # Framework scalars that get merged into raw_inputs before

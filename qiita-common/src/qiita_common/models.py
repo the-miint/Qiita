@@ -1521,6 +1521,7 @@ class ScopeTargetKind(StrEnum):
     REFERENCE = "reference"
     PREP_SAMPLE = "prep_sample"
     SEQUENCED_POOL = "sequenced_pool"
+    BLOCK = "block"
 
 
 class ProcessingKind(StrEnum):
@@ -1710,14 +1711,33 @@ class SequencedPoolScopeTarget(BaseModel):
     sequencing_run_idx: Annotated[int, Field(gt=0)]
 
 
+class BlockScopeTarget(BaseModel):
+    """Work ticket targets one block — a fixed ~10M-read compute slice drawn
+    from prep_samples that share one filtering identity (mask_idx), used by the
+    bulk-block read-mask workflow.
+
+    Carries only the block idx; the filtering identity (mask_idx) rides on the
+    work_ticket's own mask_idx column, and the block↔sample cover-map lives in
+    qiita.block_member. The block is minted before the ticket (the ticket's
+    scope target references block_idx), so this arm never needs a companion idx
+    the way SequencedPoolScopeTarget does."""
+
+    kind: Literal[ScopeTargetKind.BLOCK]
+    block_idx: Annotated[int, Field(gt=0)]
+
+
 # Discriminated union — Pydantic and OpenAPI dispatch on the `kind` field.
 # DB-side, the same shape is encoded as a tagged union of typed columns
 # (`scope_target_kind` plus the subset-relevant `study_idx` / `prep_idx` /
-# `reference_idx` / `prep_sample_idx` / `sequenced_pool_idx`) guarded by a
-# CHECK constraint; the `kind` here is the discriminator that maps to that
-# column.
+# `reference_idx` / `prep_sample_idx` / `sequenced_pool_idx` / `block_idx`)
+# guarded by a CHECK constraint; the `kind` here is the discriminator that
+# maps to that column.
 ScopeTarget = Annotated[
-    StudyPrepScopeTarget | ReferenceScopeTarget | PrepSampleScopeTarget | SequencedPoolScopeTarget,
+    StudyPrepScopeTarget
+    | ReferenceScopeTarget
+    | PrepSampleScopeTarget
+    | SequencedPoolScopeTarget
+    | BlockScopeTarget,
     Field(discriminator="kind"),
 ]
 
@@ -1829,6 +1849,76 @@ class WorkTicketResponse(BaseModel):
 
     work_ticket_idx: Annotated[int, Field(gt=0)]
     state: WorkTicketState
+
+
+class BlockMaskPlanRequest(BaseModel):
+    """Request body for `POST .../sequenced-pool/{P}/block-mask-plan` — the
+    bulk-block read-masking entrypoint (the block-compute analog of the
+    per-sample submit-host-filter-pool fan-out).
+
+    Host filtering is a property of the filtering config, not the sample: a rype
+    reference (with an optional second-stage minimap2 reference) depletes EVERY
+    sample in the pool, or neither runs the whole pool QC-only (a pass-through).
+    minimap2 is the optional second stage and never runs without rype.
+
+    `only_missing` drops samples already carrying a completion gate for their
+    resolved mask, so an interrupted plan re-runs only the gap; off by default so
+    a deliberate re-plan against a different host reference still tiles pool-wide.
+    """
+
+    host_rype_reference_idx: Annotated[int, Field(gt=0)] | None = None
+    host_minimap2_reference_idx: Annotated[int, Field(gt=0)] | None = None
+    only_missing: bool = False
+
+    @model_validator(mode="after")
+    def _minimap2_requires_rype(self) -> BlockMaskPlanRequest:
+        if self.host_minimap2_reference_idx is not None and self.host_rype_reference_idx is None:
+            raise ValueError(
+                "host_minimap2_reference_idx requires host_rype_reference_idx"
+                " (minimap2 is the optional second host-filter stage)"
+            )
+        return self
+
+
+class BlockPlanPartition(BaseModel):
+    """One mask-partition of a block plan: the samples sharing a resolved
+    `mask_idx` and how many blocks they tiled into."""
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    sample_count: Annotated[int, Field(ge=0)]
+    block_count: Annotated[int, Field(ge=0)]
+
+
+class BlockPlanBlock(BaseModel):
+    """One planned block: its idx, the block work_ticket dispatched for it, the
+    partition mask it carries, and its size (members + reads)."""
+
+    block_idx: Annotated[int, Field(gt=0)]
+    work_ticket_idx: Annotated[int, Field(gt=0)]
+    mask_idx: Annotated[int, Field(gt=0)]
+    member_count: Annotated[int, Field(gt=0)]
+    read_count: Annotated[int, Field(gt=0)]
+
+
+class BlockMaskPlanResponse(BaseModel):
+    """Returned (HTTP 202) by `POST .../block-mask-plan`: the plan the server
+    persisted + dispatched. `blocks` lists every created block with its
+    dispatched work_ticket; `partitions` summarizes the per-mask tiling; the
+    `samples_*` counts reconcile the pool's samples (planned + skipped-existing +
+    skipped-no-reads). A pool with nothing to do returns 202 with zero counts."""
+
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    sequenced_pool_idx: Annotated[int, Field(gt=0)]
+    instrument_model: str | None
+    host_filter_enabled: bool
+    host_rype_reference_idx: int | None
+    host_minimap2_reference_idx: int | None
+    samples_planned: Annotated[int, Field(ge=0)]
+    samples_skipped_existing: Annotated[int, Field(ge=0)]
+    samples_skipped_no_reads: Annotated[int, Field(ge=0)]
+    blocks_created: Annotated[int, Field(ge=0)]
+    partitions: list[BlockPlanPartition]
+    blocks: list[BlockPlanBlock]
 
 
 class WorkTicketSummary(WorkTicket):
@@ -2674,10 +2764,19 @@ class MaskedReadExportSample(BaseModel):
     the export route/CLI fails loudly on it. The pool-wide
     `sequencing_run_idx`/`sequenced_pool_idx` live on the manifest, not repeated
     per row.
+
+    `mask_state` is the sample's per-`(mask_idx, prep_sample)` completion gate
+    (`qiita.mask_sample.state`): `'completed'` (fully masked — exportable),
+    `'pending'` (a block-mask is mid-flight; a covering block hasn't finished, so
+    the read_mask is partial — NOT exportable, the ticket route 409s), or `None`
+    (no gate row — the per-sample read-mask path or an unmasked sample; the
+    all-or-nothing per-sample write means it is exportable). The CLI reads it to
+    report which samples it will skip before minting per-sample tickets.
     """
 
     prep_sample_idx: Annotated[int, Field(gt=0)]
     biosample_accession: str | None
+    mask_state: str | None = None
 
 
 class MaskedReadExportManifest(BaseModel):
