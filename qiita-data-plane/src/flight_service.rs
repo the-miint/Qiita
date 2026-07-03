@@ -747,9 +747,30 @@ impl<W: Write> Write for HashingWriter<W> {
     }
 }
 
+/// Bounded depth of the DoPut decoder→writer channel. The blocking writer task
+/// parks the async decoder on `send` when the channel is full, so peak memory is
+/// ~this many decoded payloads in flight rather than the whole upload.
+const DOPUT_WRITER_CHANNEL_DEPTH: usize = 4;
+
+/// One decoded payload forwarded from the async decoder to the blocking writer.
+enum DoPutWriterMsg {
+    Schema(arrow_schema::SchemaRef),
+    Batch(RecordBatch),
+}
+
 /// Drive the Flight stream through a Parquet writer; return
 /// `(sha256_hex, row_count, bytes_received)`. The caller owns staging-path
 /// cleanup on Err.
+///
+/// The Parquet write, `fsync`, and hashing are all blocking, but they must be
+/// interleaved with `decoder.next().await` on the live tonic stream — so this
+/// can't be a single `spawn_blocking`. Instead it bridges the two: an async loop
+/// pulls decoded payloads off the stream and forwards each to a `spawn_blocking`
+/// writer task over a bounded mpsc channel; the writer task owns the file and
+/// does all blocking I/O off the async runtime. The bounded channel
+/// backpressures the decoder (and thus the network) when the writer falls
+/// behind, so peak memory stays bounded (`DOPUT_WRITER_CHANNEL_DEPTH`) — the
+/// same posture as the DoGet streaming path.
 async fn write_doput_parquet<S>(
     staging_path: PathBuf,
     first: FlightData,
@@ -758,8 +779,127 @@ async fn write_doput_parquet<S>(
 where
     S: Stream<Item = Result<FlightData, Status>> + Send + Unpin + 'static,
 {
-    // Re-prepend the first message and map Status → FlightError so the
-    // arrow-flight decoder can consume it.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<DoPutWriterMsg>(DOPUT_WRITER_CHANNEL_DEPTH);
+
+    // Blocking writer task: owns the file + ArrowWriter, consumes payloads until
+    // the channel closes, then closes + fsyncs and returns the digest. All file
+    // I/O lives here, off the tonic async worker.
+    let writer_task = tokio::task::spawn_blocking(move || -> Result<(String, u64, u64), Status> {
+        // sync_handle is a dup of the same file ArrowWriter owns. After
+        // ArrowWriter::close() (which only flushes the writer's user-space
+        // buffer plus the OS write buffer), sync_all() on the dup forces a
+        // disk-level flush. Without it, a power loss / OOM kill between close
+        // and /done can leave the client thinking the upload succeeded while
+        // the bytes were never durable.
+        let mut writer: Option<ArrowWriter<HashingWriter<std::fs::File>>> = None;
+        let mut sync_handle: Option<std::fs::File> = None;
+        let mut row_count: u64 = 0;
+        // Outer half of the shared state. The HashingWriter held inside
+        // ArrowWriter holds a clone; on ArrowWriter::close() that clone is
+        // dropped and we can `try_unwrap` to extract the final digest and
+        // byte count without a second read of the file.
+        let hash_state: Arc<Mutex<(Sha256, u64)>> = Arc::new(Mutex::new((Sha256::new(), 0)));
+
+        while let Some(msg) = rx.blocking_recv() {
+            match msg {
+                DoPutWriterMsg::Schema(schema) => {
+                    if writer.is_some() {
+                        return Err(Status::invalid_argument(
+                            "DoPut stream carried multiple schemas",
+                        ));
+                    }
+                    // `create_new` fails atomically (EEXIST) if the file already
+                    // exists. Guards against two concurrent DoPuts with the same
+                    // upload_idx silently clobbering each other's bytes via
+                    // separate write() calls on the same path. The CP doesn't
+                    // reissue tickets for a given slot, so this is the
+                    // contract-violation surface.
+                    let file = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&staging_path)
+                        .map_err(|e| match e.kind() {
+                            std::io::ErrorKind::AlreadyExists => Status::already_exists(format!(
+                                "staging file already exists — concurrent DoPut?: {}",
+                                staging_path.display()
+                            )),
+                            _ => {
+                                Status::internal(format!("create {}: {e}", staging_path.display()))
+                            }
+                        })?;
+                    sync_handle = Some(
+                        file.try_clone()
+                            .map_err(|e| Status::internal(format!("dup file handle: {e}")))?,
+                    );
+                    // Parquet v2 + zstd. The orchestrator's miint.py defines
+                    // two conventions: PARQUET_OPTS (zstd, for DuckLake-bound
+                    // durable artifacts) and PARQUET_OPTS_INTERMEDIATE (snappy,
+                    // for transient files read once then deleted in the same
+                    // job). DoPut uploads are intermediate in the consumed-once
+                    // sense — but their disk-residency is "from /done to
+                    // (eventual) cleanup," not "until the next phase in the
+                    // same job." That can be minutes to indefinitely with the
+                    // current no-sweep follow-up open. The disk-footprint
+                    // tradeoff outweighs the snappy fast-decode win at GG2
+                    // scale: backbone FASTA blew up to ~3.5× the source on
+                    // disk under uncompressed v1 (DNA-chunk VARCHAR columns
+                    // don't dictionary-encode), and zstd-default level 3
+                    // gives ~4× compression at parquet-rs's default cost.
+                    let props = WriterProperties::builder()
+                        .set_writer_version(WriterVersion::PARQUET_2_0)
+                        .set_compression(Compression::ZSTD(ZstdLevel::default()))
+                        .build();
+                    let hashing_writer = HashingWriter {
+                        inner: file,
+                        state: hash_state.clone(),
+                    };
+                    writer = Some(
+                        ArrowWriter::try_new(hashing_writer, schema, Some(props))
+                            .map_err(|e| Status::internal(format!("parquet writer init: {e}")))?,
+                    );
+                }
+                DoPutWriterMsg::Batch(batch) => {
+                    let w = writer.as_mut().ok_or_else(|| {
+                        Status::invalid_argument("RecordBatch arrived before Schema")
+                    })?;
+                    row_count += batch.num_rows() as u64;
+                    w.write(&batch)
+                        .map_err(|e| Status::internal(format!("parquet write: {e}")))?;
+                }
+            }
+        }
+
+        let w = writer.ok_or_else(|| Status::invalid_argument("DoPut stream had no Schema"))?;
+        w.close()
+            .map_err(|e| Status::internal(format!("parquet close: {e}")))?;
+
+        // Force disk-level flush via the dup'd handle. Unwrap is safe —
+        // sync_handle is set in lockstep with `writer`, which we just confirmed
+        // resolved Some via the line above.
+        sync_handle
+            .expect("sync_handle set in lockstep with writer")
+            .sync_all()
+            .map_err(|e| Status::internal(format!("fsync: {e}")))?;
+
+        // ArrowWriter::close() above dropped the HashingWriter (and with it
+        // the inner Arc clone of hash_state); the outer Arc is now the sole
+        // owner, so try_unwrap succeeds.
+        let (hasher, bytes_received) = Arc::try_unwrap(hash_state)
+            .expect("HashingWriter dropped its Arc clone via ArrowWriter::close")
+            .into_inner()
+            .expect("hash_state mutex never poisoned");
+        let digest = hasher.finalize();
+        let mut sha256 = String::with_capacity(64);
+        for b in digest {
+            use std::fmt::Write;
+            write!(&mut sha256, "{b:02x}").expect("write to String never fails");
+        }
+        Ok((sha256, row_count, bytes_received))
+    });
+
+    // Async side: re-prepend the first message and map Status → FlightError so
+    // the arrow-flight decoder can consume it, then forward each decoded payload
+    // to the writer task.
     let combined = stream::once(async move { Ok::<_, Status>(first) })
         .chain(stream)
         .map(|r| {
@@ -771,115 +911,47 @@ where
         });
     let mut decoder = FlightDataDecoder::new(combined);
 
-    // sync_handle is a dup of the same file ArrowWriter owns. After
-    // ArrowWriter::close() (which only flushes the writer's user-space
-    // buffer plus the OS write buffer), sync_all() on the dup forces a
-    // disk-level flush. Without it, a power loss / OOM kill between close
-    // and /done can leave the client thinking the upload succeeded while
-    // the bytes were never durable.
-    let mut writer: Option<ArrowWriter<HashingWriter<std::fs::File>>> = None;
-    let mut sync_handle: Option<std::fs::File> = None;
-    let mut row_count: u64 = 0;
-    // Outer half of the shared state. The HashingWriter held inside
-    // ArrowWriter holds a clone; on ArrowWriter::close() that clone is
-    // dropped and we can `try_unwrap` to extract the final digest and
-    // byte count without a second read of the file.
-    let hash_state: Arc<Mutex<(Sha256, u64)>> = Arc::new(Mutex::new((Sha256::new(), 0)));
-
+    // A mid-stream decode error must win over whatever the writer task reports:
+    // once we drop `tx`, the task finishes "normally" on a partial file. Capture
+    // the decode error and return it after joining the task (the caller then
+    // cleans up the partial file).
+    let mut decode_err: Option<Status> = None;
     while let Some(item) = decoder.next().await {
-        let decoded = item.map_err(|e| Status::internal(format!("flight decode: {e}")))?;
-        match decoded.payload {
-            DecodedPayload::Schema(schema) => {
-                if writer.is_some() {
-                    return Err(Status::invalid_argument(
-                        "DoPut stream carried multiple schemas",
-                    ));
-                }
-                // `create_new` fails atomically (EEXIST) if the file already
-                // exists. Guards against two concurrent DoPuts with the same
-                // upload_idx silently clobbering each other's bytes via
-                // separate write() calls on the same path. The CP doesn't
-                // reissue tickets for a given slot, so this is the
-                // contract-violation surface.
-                let file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&staging_path)
-                    .map_err(|e| match e.kind() {
-                        std::io::ErrorKind::AlreadyExists => Status::already_exists(format!(
-                            "staging file already exists — concurrent DoPut?: {}",
-                            staging_path.display()
-                        )),
-                        _ => Status::internal(format!("create {}: {e}", staging_path.display())),
-                    })?;
-                sync_handle = Some(
-                    file.try_clone()
-                        .map_err(|e| Status::internal(format!("dup file handle: {e}")))?,
-                );
-                // Parquet v2 + zstd. The orchestrator's miint.py defines
-                // two conventions: PARQUET_OPTS (zstd, for DuckLake-bound
-                // durable artifacts) and PARQUET_OPTS_INTERMEDIATE (snappy,
-                // for transient files read once then deleted in the same
-                // job). DoPut uploads are intermediate in the consumed-once
-                // sense — but their disk-residency is "from /done to
-                // (eventual) cleanup," not "until the next phase in the
-                // same job." That can be minutes to indefinitely with the
-                // current no-sweep follow-up open. The disk-footprint
-                // tradeoff outweighs the snappy fast-decode win at GG2
-                // scale: backbone FASTA blew up to ~3.5× the source on
-                // disk under uncompressed v1 (DNA-chunk VARCHAR columns
-                // don't dictionary-encode), and zstd-default level 3
-                // gives ~4× compression at parquet-rs's default cost.
-                let props = WriterProperties::builder()
-                    .set_writer_version(WriterVersion::PARQUET_2_0)
-                    .set_compression(Compression::ZSTD(ZstdLevel::default()))
-                    .build();
-                let hashing_writer = HashingWriter {
-                    inner: file,
-                    state: hash_state.clone(),
-                };
-                writer = Some(
-                    ArrowWriter::try_new(hashing_writer, schema, Some(props))
-                        .map_err(|e| Status::internal(format!("parquet writer init: {e}")))?,
-                );
+        let decoded = match item {
+            Ok(d) => d,
+            Err(e) => {
+                decode_err = Some(Status::internal(format!("flight decode: {e}")));
+                break;
             }
-            DecodedPayload::RecordBatch(batch) => {
-                let w = writer
-                    .as_mut()
-                    .ok_or_else(|| Status::invalid_argument("RecordBatch arrived before Schema"))?;
-                row_count += batch.num_rows() as u64;
-                w.write(&batch)
-                    .map_err(|e| Status::internal(format!("parquet write: {e}")))?;
-            }
-            DecodedPayload::None => {}
+        };
+        let msg = match decoded.payload {
+            DecodedPayload::Schema(schema) => DoPutWriterMsg::Schema(schema),
+            DecodedPayload::RecordBatch(batch) => DoPutWriterMsg::Batch(batch),
+            DecodedPayload::None => continue,
+        };
+        // A send error means the writer task already returned (an internal
+        // error, e.g. AlreadyExists on create_new). Stop forwarding; the task's
+        // Result carries the real cause.
+        if tx.send(msg).await.is_err() {
+            break;
         }
     }
-    let w = writer.ok_or_else(|| Status::invalid_argument("DoPut stream had no Schema"))?;
-    w.close()
-        .map_err(|e| Status::internal(format!("parquet close: {e}")))?;
+    // Close the channel so the writer task can finish (drain buffered payloads,
+    // then close + fsync).
+    drop(tx);
 
-    // Force disk-level flush via the dup'd handle. Unwrap is safe —
-    // sync_handle is set in lockstep with `writer`, which we just confirmed
-    // resolved Some via the line above.
-    sync_handle
-        .expect("sync_handle set in lockstep with writer")
-        .sync_all()
-        .map_err(|e| Status::internal(format!("fsync: {e}")))?;
-
-    // ArrowWriter::close() above dropped the HashingWriter (and with it
-    // the inner Arc clone of hash_state); the outer Arc is now the sole
-    // owner, so try_unwrap succeeds.
-    let (hasher, bytes_received) = Arc::try_unwrap(hash_state)
-        .expect("HashingWriter dropped its Arc clone via ArrowWriter::close")
-        .into_inner()
-        .expect("hash_state mutex never poisoned");
-    let digest = hasher.finalize();
-    let mut sha256 = String::with_capacity(64);
-    for b in digest {
-        use std::fmt::Write;
-        write!(&mut sha256, "{b:02x}").expect("write to String never fails");
+    let task_result = writer_task.await;
+    // Decode error takes precedence — the task may have "succeeded" on a
+    // truncated file, but the input was bad.
+    if let Some(e) = decode_err {
+        return Err(e);
     }
-    Ok((sha256, row_count, bytes_received))
+    match task_result {
+        Ok(inner) => inner,
+        Err(join_err) => Err(Status::internal(format!(
+            "doput writer task join failed: {join_err}"
+        ))),
+    }
 }
 
 /// Canonical Parquet write options for an exported reads file — Parquet v2 +
@@ -3027,6 +3099,55 @@ mod tests {
 
         assert!(tmp.path().join("uploads/1/upload.parquet").exists());
         assert!(tmp.path().join("uploads/2/upload.parquet").exists());
+    }
+
+    #[tokio::test]
+    async fn do_put_writes_multi_batch_stream() {
+        // Exercise the async-decoder → blocking-writer channel bridge with more
+        // than one RecordBatch: every batch must flow through the mpsc channel,
+        // be written, and be counted. Three 3-row batches => 9 rows, and the
+        // PutResult sha256/bytes must match the file on disk byte-for-byte.
+        let tmp = tempfile::tempdir().unwrap();
+        let service = make_service(tmp.path().to_path_buf());
+
+        let ticket = sign_doput_for_test(55, b"dev-secret", future_expiry_secs(300));
+        let batches = vec![sample_batch(), sample_batch(), sample_batch()];
+        let messages = flight_stream_with_ticket(batches, ticket).await;
+
+        let result = service
+            .do_put_inner(stream::iter(messages))
+            .await
+            .expect("multi-batch do_put should succeed");
+
+        let body: serde_json::Value = serde_json::from_slice(&result.app_metadata).unwrap();
+        assert_eq!(body["upload_idx"], 55);
+        assert_eq!(body["row_count"], 9, "three 3-row batches stream through");
+
+        let staged = tmp.path().join("uploads/55/upload.parquet");
+        let actual_bytes = std::fs::metadata(&staged).unwrap().len();
+        assert_eq!(body["bytes_received"].as_u64().unwrap(), actual_bytes);
+        let mut hasher = Sha256::new();
+        hasher.update(std::fs::read(&staged).unwrap());
+        let actual_sha: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(body["sha256"].as_str().unwrap(), actual_sha);
+
+        // Round-trips as a 9-row Parquet.
+        let reader = Connection::open_in_memory().unwrap();
+        let n: i64 = reader
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM read_parquet('{}')",
+                    staged.to_str().unwrap()
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 9);
     }
 
     #[test]

@@ -541,6 +541,16 @@ the `no-changelog` label).
   the async runtime and stall concurrent requests. Each helper opens and drops
   its own DuckDB connection, so nothing non-`Send` crosses the task boundary.
   (#243)
+- **Data plane DoPut writes Parquet off the async runtime.** The DoPut handler
+  interleaved blocking Parquet write / `fsync` / `chmod` with awaiting the live
+  Flight stream, running file I/O inline on the tonic async worker. It now
+  bridges the two with a bounded mpsc channel: an async loop pulls decoded
+  batches off the stream and forwards them to a `spawn_blocking` writer task that
+  owns the file and does all blocking I/O. The bounded channel backpressures the
+  network when the writer falls behind, so peak memory stays bounded (same
+  posture as the DoGet streaming path). Behavior (durability fsync, `create_new`
+  concurrent-upload guard, partial-file cleanup on error, sha256/row-count
+  reporting) is unchanged. (#224)
 - **Data plane DoAction replay is a classified, tripwired accepted risk.** Flight
   tickets have no single-use ledger, so a still-valid token can be replayed
   within its lifetime; this is accepted because every DoAction is idempotent or
