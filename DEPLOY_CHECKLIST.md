@@ -25,14 +25,14 @@ _None yet._
 
 - Bulk-block read-mask schema (four additive migrations, plain `make migrate`, no
   backfill): (#243)
-  - `20260701000000_block.sql` — `block` + `block_member` core (the compute unit +
+  - `20260701000002_block.sql` — `block` + `block_member` core (the compute unit +
     the block↔sample cover-map).
-  - `20260701000001_mask_sample.sql` — the per-`(mask_idx, prep_sample)` completion
+  - `20260701000003_mask_sample.sql` — the per-`(mask_idx, prep_sample)` completion
     gate the masked-read export + future alignment read.
-  - `20260701000002_scope_target_kind_add_block.sql` — `ALTER TYPE
+  - `20260701000004_scope_target_kind_add_block.sql` — `ALTER TYPE
     qiita.scope_target_kind ADD VALUE 'block'` (own `transaction:false` file; dbmate
     applies it standalone).
-  - `20260701000003_work_ticket_block.sql` — `work_ticket.block_idx` scope arm +
+  - `20260701000005_work_ticket_block.sql` — `work_ticket.block_idx` scope arm +
     extended scope-target CHECK + `work_ticket_one_in_flight_per_block` unique index.
 
 ### 4. Deploy

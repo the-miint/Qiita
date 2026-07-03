@@ -1,6 +1,6 @@
 -- migrate:up
 -- The 'block' scope_target_kind ENUM value was added in the prior migration
--- (20260701000002_scope_target_kind_add_block.sql); splitting the ADD VALUE off
+-- (20260701000004_scope_target_kind_add_block.sql); splitting the ADD VALUE off
 -- lets this migration reference the new value in the scope-target CHECK without
 -- tripping Postgres's "unsafe use of new value of enum type" guard (55P04).
 
