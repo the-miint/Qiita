@@ -27,11 +27,14 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 2. One-time host setup
 
-_None yet._
+- Stage the Golay (12,11,8) error-correction table (`golay_corrected_ordered.parquet`) on `<scratch>` reachable by every compute node; submitters pass its absolute path as golay-demux's `golay_table_path`. (#244)
+- Stage the SortMeRNA 16S reference (`88_otus.fasta`) the same way; passed as amplicon's `sortmerna_ref_path`. (#244)
+- Load Greengenes2 as an ACTIVE `reference` (amplicon's closed-ref catalog); its `reference_idx` is passed as amplicon's `gg2_reference_idx`. (#244)
 
 ### 3. Migrations
 
 - **Email-notification schema.** `make migrate` applies both migrations: `..._email_notification.sql` (adds `work_ticket.notified_at` / `notify_attempts`, creates `qiita.email_receipt`, backfills existing terminal tickets as already-notified) and `..._work_ticket_notified_idx.sql` (a `CREATE INDEX CONCURRENTLY` — runs outside a txn; if interrupted, drop the leftover `INVALID` index and re-run). No out-of-band steps. (#238)
+- `make migrate` applies `20260701000002_processing.sql` — adds `qiita.processing_method` / `qiita.processed_prep_sample` + mint functions; plain migration, no extension or backfill. (#244)
 
 ### 4. Deploy
 
@@ -39,11 +42,11 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- `qiita.action` list (run by `make verify-deploy`) shows `amplicon` `1.0.0` and `golay-demux` `1.0.0` — synced from `workflows/` by `activate.sh`. (#244)
 
 ### Notes (no host action)
 
-_None yet._
+- The DuckLake `feature_counts` table (amplicon's feature-table cache) is created by the data plane on startup via `ensure_read_tables` — not a migration; the bucket-4 restart picks it up. (#244)
 
 ---
 

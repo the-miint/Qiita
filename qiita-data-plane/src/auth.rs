@@ -295,6 +295,33 @@ pub fn verify_export_read(ticket: &[u8], secret: &[u8]) -> Result<ExportReadPayl
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
+/// Parsed payload for the `export_pool_masked` DoAction (wire shape pinned by
+/// `runner._resolve_pool_masked_reads`). Materializes a pool's `read_masked` rows
+/// (host/QC-failed excluded, trims applied) for a `mask_idx` + sample set into one
+/// per-ticket Parquet; unlike `export_read` (raw single-sample `read`).
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportPoolMaskedPayload {
+    /// action discriminator; the handler also rejects a non-"export_pool_masked" value.
+    pub action: String,
+    /// pool members to export. may be empty — the handler writes nothing and the CP raises.
+    pub prep_sample_idxs: Vec<i64>,
+    /// which `read_masked` rows to export (`read_masked.mask_idx`).
+    pub mask_idx: i64,
+    /// absolute Parquet destination; re-validated (`validate_export_dest`) before writing
+    /// even though the token is HMAC-signed (defense in depth).
+    pub dest: String,
+}
+
+/// Verify an `export_pool_masked` DoAction token and return its parsed payload.
+pub fn verify_export_pool_masked(
+    ticket: &[u8],
+    secret: &[u8],
+) -> Result<ExportPoolMaskedPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
 /// Parsed DoPut ticket payload.
 ///
 /// Wire shape pinned by `qiita_control_plane.auth.tickets.sign_doput`:

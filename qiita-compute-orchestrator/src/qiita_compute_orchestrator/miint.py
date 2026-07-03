@@ -93,6 +93,26 @@ PARQUET_OPTS_CHUNKED: str = f"{PARQUET_OPTS}, ROW_GROUP_SIZE {CHUNK_ROW_GROUP_SI
 
 
 @contextmanager
+def mafft_scratch_cwd(base: Path) -> Iterator[Path]:
+    """run the body with CWD in `<base>/.mafft` so MAFFT's scratch (order/pre/trace)
+    lands there, not the launch dir — miint's linked MAFFT writes those to CWD and
+    ignores TMPDIR. removed on exit.
+
+    chdir is process-global, so the body must be synchronous miint work using only
+    absolute paths (a blocking conn.execute monopolizes the loop thread, so nothing
+    else runs while CWD is moved)."""
+    scratch = base / ".mafft"
+    scratch.mkdir(parents=True, exist_ok=True)
+    prev = Path.cwd()
+    os.chdir(scratch)
+    try:
+        yield scratch
+    finally:
+        os.chdir(prev)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+@contextmanager
 def duckdb_tmp_dir(workspace: Path) -> Iterator[Path]:
     """Create the `<workspace>/.duckdb_tmp` spill directory and remove it on exit.
 
