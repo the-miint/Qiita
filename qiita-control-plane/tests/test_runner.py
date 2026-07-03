@@ -583,6 +583,10 @@ async def test_refuses_non_pending_ticket(postgres_pool, pending_work_ticket, tm
 
 
 async def test_refuses_disabled_action(postgres_pool, pending_work_ticket, tmp_path):
+    """An action disabled between submit and dispatch must FAIL the ticket
+    (SUBMISSION stage, NULL step name) and re-raise. Previously the action
+    pre-fetch ran ABOVE the try, so the raise stranded the ticket in PENDING
+    with no failure recorded (and a misleading "marked FAILED" dispatch log)."""
     action_id, version = pending_work_ticket["action"]
     await postgres_pool.execute(
         "UPDATE qiita.action SET enabled = false, disabled_at = now(), disabled_by_idx = 1"
@@ -597,11 +601,15 @@ async def test_refuses_disabled_action(postgres_pool, pending_work_ticket, tmp_p
             FakeBackendClient(),
             tmp_path,
         )
-    state = await postgres_pool.fetchval(
-        "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+    row = await postgres_pool.fetchrow(
+        "SELECT state, failure_stage, failure_step_name, failure_reason"
+        " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
         pending_work_ticket["work_ticket_idx"],
     )
-    assert state == "pending"
+    assert row["state"] == "failed"
+    assert row["failure_stage"] == "submission"
+    assert row["failure_step_name"] is None
+    assert "disabled" in row["failure_reason"]
 
 
 async def test_refuses_unknown_ticket(postgres_pool, tmp_path):

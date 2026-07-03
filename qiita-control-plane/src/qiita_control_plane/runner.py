@@ -360,49 +360,62 @@ async def run_workflow(
             f"must be {WorkTicketState.PENDING.value!r}; manual recovery required"
         )
 
-    action = await _fetch_action(pool, work_ticket["action_id"], work_ticket["action_version"])
-    if action is None:
-        raise RuntimeError(
-            f"action ({work_ticket['action_id']!r}, "
-            f"{work_ticket['action_version']!r}) not found or disabled"
-        )
-
-    if resume:
-        # Re-drive from any non-terminal state (PENDING/QUEUED/PROCESSING) →
-        # PROCESSING. Idempotent if already PROCESSING; raises on a terminal
-        # ticket (shouldn't be in the recovery set).
-        await _transition_to_processing_for_resume(pool, work_ticket_idx)
-    else:
-        await _atomic_transition(
-            pool,
-            work_ticket_idx,
-            expected=WorkTicketState.PENDING,
-            new=WorkTicketState.PROCESSING,
-        )
-
-    workspace = work_ticket_workspace_root / str(work_ticket_idx)
-    workspace.mkdir(parents=True, exist_ok=True)
-
-    # Per-entry progress from any prior run. Empty on a first dispatch; on a
-    # resume (or a /run redrive) it carries the COMPLETED rows the loop
-    # fast-forwards. Loaded once — this run's own writes don't feed back in.
-    progress = await step_progress.load_step_progress(pool, work_ticket_idx)
-
+    # Pure reads of the work_ticket (no I/O, cannot fail). scope_target is
+    # dereferenced by the except handlers below, so it must be bound BEFORE the
+    # try. `action` is pre-bound to None and (re)assigned inside the try, so a
+    # fetch that fails or returns None still leaves the handlers a defined value
+    # to guard on (they check `action is not None`).
     bound: dict[str, Any] = dict(work_ticket["action_context"] or {})
     scope_target = _build_scope_target(work_ticket)
     max_retries: int = work_ticket["max_retries"]
-
-    _log.info(
-        "running workflow %s/%s for work_ticket %d (max_retries=%d)",
-        action.action_id,
-        action.version,
-        work_ticket_idx,
-        max_retries,
-    )
-
+    workspace = work_ticket_workspace_root / str(work_ticket_idx)
+    action: ActionDefinition | None = None
     uploads_to_consume: list[int] = []
 
     try:
+        # Everything from the action fetch through the step loop is INSIDE the
+        # try so ANY pre-loop failure — an action disabled between submit and
+        # dispatch, a DB blip on the PROCESSING transition, a filesystem error
+        # on mkdir, a bad upload handle — lands in the outer FAILED-transition
+        # handler instead of stranding the ticket in PENDING/PROCESSING with no
+        # failure recorded (and a misleading "marked FAILED" dispatch log). A
+        # pre-loop failure is attributed to the SUBMISSION stage (no step ran
+        # yet), which the failure-step-name CHECK requires to carry a NULL name.
+        action = await _fetch_action(pool, work_ticket["action_id"], work_ticket["action_version"])
+        if action is None:
+            raise RuntimeError(
+                f"action ({work_ticket['action_id']!r}, "
+                f"{work_ticket['action_version']!r}) not found or disabled"
+            )
+
+        if resume:
+            # Re-drive from any non-terminal state (PENDING/QUEUED/PROCESSING) →
+            # PROCESSING. Idempotent if already PROCESSING; raises on a terminal
+            # ticket (shouldn't be in the recovery set).
+            await _transition_to_processing_for_resume(pool, work_ticket_idx)
+        else:
+            await _atomic_transition(
+                pool,
+                work_ticket_idx,
+                expected=WorkTicketState.PENDING,
+                new=WorkTicketState.PROCESSING,
+            )
+
+        workspace.mkdir(parents=True, exist_ok=True)
+
+        # Per-entry progress from any prior run. Empty on a first dispatch; on a
+        # resume (or a /run redrive) it carries the COMPLETED rows the loop
+        # fast-forwards. Loaded once — this run's own writes don't feed back in.
+        progress = await step_progress.load_step_progress(pool, work_ticket_idx)
+
+        _log.info(
+            "running workflow %s/%s for work_ticket %d (max_retries=%d)",
+            action.action_id,
+            action.version,
+            work_ticket_idx,
+            max_retries,
+        )
+
         # Resolve `*_upload_idx` keys to filesystem paths BEFORE the step
         # loop runs. A failure here (unknown / unready / wrong-owner /
         # missing-staged-file) raises a typed BackendFailure that the
@@ -411,10 +424,6 @@ async def run_workflow(
         # The consume-list is held until workflow completion so a
         # mid-step failure leaves its uploads in `ready` for the
         # operator to redrive against the same handles.
-        #
-        # Inside the try block (not above the PROCESSING transition)
-        # because a raise here MUST land in the outer FAILED-transition
-        # handler — without that, the ticket sticks in PROCESSING.
         resolved_paths, uploads_to_consume = await _resolve_upload_handles(
             pool,
             action_context=bound,
@@ -673,7 +682,7 @@ async def run_workflow(
         # ticket — we own that transition here so failure_status PATCH
         # and the FAILED row insert happen together.
         _log.warning("workflow %d failed: %s", work_ticket_idx, exc)
-        if action.failure_status:
+        if action is not None and action.failure_status:
             try:
                 await _patch_resource_status(pool, scope_target, action.failure_status)
             except Exception:
@@ -709,7 +718,7 @@ async def run_workflow(
         # is the safety net for any other runner DB call.
         transient_db = _is_transient_db_error(exc)
         _log.exception("workflow %d failed (unwrapped exception)", work_ticket_idx)
-        if action.failure_status:
+        if action is not None and action.failure_status:
             try:
                 await _patch_resource_status(pool, scope_target, action.failure_status)
             except Exception:
@@ -717,12 +726,21 @@ async def run_workflow(
                     "best-effort failure_status PATCH for work_ticket %d failed",
                     work_ticket_idx,
                 )
+        # A failure before the step loop ran (index unbound) has no step to
+        # attribute to — record it as SUBMISSION with a NULL step name, which
+        # the failure-step-name CHECK requires. Only a failure from inside the
+        # loop is a STEP_RUN (index bound to the entry that raised).
+        _failed_index = locals().get("index")
         await _transition_to_failed(
             pool,
             work_ticket_idx,
             failure_type=FailureType.RETRIABLE if transient_db else FailureType.PERMANENT,
-            failure_stage=WorkTicketFailureStage.STEP_RUN,
-            failure_step_name=_safe_entry_name(action, locals().get("index")),
+            failure_stage=(
+                WorkTicketFailureStage.STEP_RUN
+                if _failed_index is not None
+                else WorkTicketFailureStage.SUBMISSION
+            ),
+            failure_step_name=_safe_entry_name(action, _failed_index),
             failure_reason=(
                 ("transient control-plane DB error: " if transient_db else "")
                 + f"{type(exc).__name__}: {exc!s}"
@@ -1259,13 +1277,13 @@ async def _transition_to_no_data(pool: asyncpg.Pool, work_ticket_idx: int) -> No
         )
 
 
-def _safe_entry_name(action: ActionDefinition, index: int | None) -> str | None:
+def _safe_entry_name(action: ActionDefinition | None, index: int | None) -> str | None:
     """Best-effort lookup of the entry name at `index`. Returns None if
-    the index is out of range (e.g. action.steps is empty so the loop
-    never iterated). When the loop body has executed at least once,
-    `index` is the most recent entry — the natural name to record on
-    failure."""
-    if index is None:
+    `action` is unresolved (a pre-loop failure never fetched it) or the index
+    is out of range (e.g. action.steps is empty so the loop never iterated).
+    When the loop body has executed at least once, `index` is the most recent
+    entry — the natural name to record on failure."""
+    if action is None or index is None:
         return None
     if 0 <= index < len(action.steps):
         return action.steps[index].name
