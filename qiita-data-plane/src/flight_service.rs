@@ -1103,32 +1103,57 @@ fn register_files(
     ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
         .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
 
-    let mut registered = Vec::new();
-    for (table, dest) in &moved {
-        let dest_str = dest
-            .to_str()
-            .ok_or_else(|| Status::internal(format!("non-UTF-8 path: {}", dest.display())))?;
-        conn.execute(
-            "CALL ducklake_add_data_files('qiita_lake', ?, ?)",
-            duckdb::params![table, dest_str],
-        )
-        .map_err(|e| {
-            // Log which files were already registered for recovery.
-            let already: Vec<_> = registered.iter().collect();
-            Status::internal(format!(
-                "ducklake_add_data_files failed for {table}/{}: {e}. \
-                 Already registered: {already:?}. \
-                 Already moved: {:?}. \
-                 Manual recovery may be needed.",
-                dest.display(),
-                moved
-                    .iter()
-                    .map(|(_, p)| p.display().to_string())
-                    .collect::<Vec<_>>()
-            ))
-        })?;
-        registered.push(dest_str.to_string());
-    }
+    // Register every moved file in ONE DuckLake transaction so the catalog
+    // update is all-or-nothing (mirrors delete_reference / delete_mask /
+    // delete_pool_reads). A failure part-way through the loop rolls back every
+    // prior ducklake_add_data_files call rather than leaving the reference
+    // half-registered in the catalog.
+    //
+    // Atomicity here is CATALOG-LEVEL ONLY: the filesystem moves above have
+    // already happened and are NOT rolled back. That is intentional and safe.
+    // Each dest name is ticket-unique (lake_dest_filename prefixes the work
+    // ticket) and move_file refuses to overwrite, so a rolled-back registration
+    // leaves at most an unreferenced orphan Parquet on disk — never a collision
+    // and never a double-registration. This matches how DuckLake already
+    // tolerates orphan Parquets (the delete_* actions reclaim nothing from disk
+    // either); a future maintenance pass sweeps them.
+    conn.execute_batch("BEGIN TRANSACTION")
+        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
+
+    let registration = (|| -> Result<Vec<String>, Status> {
+        let mut registered = Vec::new();
+        for (table, dest) in &moved {
+            let dest_str = dest
+                .to_str()
+                .ok_or_else(|| Status::internal(format!("non-UTF-8 path: {}", dest.display())))?;
+            conn.execute(
+                "CALL ducklake_add_data_files('qiita_lake', ?, ?)",
+                duckdb::params![table, dest_str],
+            )
+            .map_err(|e| {
+                Status::internal(format!(
+                    "ducklake_add_data_files failed for {table}/{}: {e}",
+                    dest.display()
+                ))
+            })?;
+            registered.push(dest_str.to_string());
+        }
+        Ok(registered)
+    })();
+
+    let registered = match registration {
+        Ok(registered) => registered,
+        Err(e) => {
+            // Best-effort rollback; the catalog is left untouched so the control
+            // plane can retry from a clean slate. The moved files stay on disk
+            // as ticket-unique orphans (see above) — inert until a successful
+            // registration references them.
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    };
+    conn.execute_batch("COMMIT")
+        .map_err(|e| Status::internal(format!("failed to commit registration transaction: {e}")))?;
 
     Ok(registered)
 }
@@ -2171,6 +2196,183 @@ mod tests {
             lake_dest_filename(27, "part_00001.parquet"),
             lake_dest_filename(27, "reference_membership.parquet")
         );
+    }
+
+    // --- register_files filename validation (pure; no DuckDB) ---
+
+    /// `register_files` rejects any filename that could escape the staging dir
+    /// before it touches the filesystem or the catalog. `payload.files` is
+    /// HMAC-signed by the control plane, but this defense-in-depth check keeps
+    /// the data plane's filesystem contract independent of CP correctness. A
+    /// `..` (parent) or a rooted/absolute component must be refused; the check
+    /// runs first, so a bogus connstr/data_path is never reached.
+    #[test]
+    fn register_files_rejects_filename_traversal() {
+        for bad in [
+            "../escape.parquet",
+            "/etc/passwd",
+            "sub/../../escape.parquet",
+        ] {
+            let mut files = std::collections::HashMap::new();
+            files.insert(bad.to_string(), "reference_membership".to_string());
+            let payload = auth::ActionPayload {
+                action: "register_files".to_string(),
+                staging_dir: "/unused/staging".to_string(),
+                files,
+                work_ticket_idx: 1,
+            };
+            let err = register_files("unused-connstr", "unused-data-path", &payload)
+                .expect_err("a traversal filename must be rejected");
+            assert_eq!(
+                err.code(),
+                tonic::Code::InvalidArgument,
+                "filename {bad:?} must be rejected as invalid, not reach the catalog"
+            );
+        }
+    }
+
+    // --- do_action dispatch trust checks (pure; no DuckDB) ---
+
+    /// An action whose `Action.type` header disagrees with the signed
+    /// `payload.action` is rejected. `verify_action` succeeds (HMAC + shape are
+    /// valid), then the handler's discriminator check catches the mismatch — the
+    /// two must agree so a token minted for one action can't be replayed under a
+    /// different action header.
+    #[tokio::test]
+    async fn do_action_rejects_type_payload_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = make_service(tmp.path().to_path_buf());
+        // Validly-signed register_files-shaped payload, but its action field
+        // says delete_reference — sent under the register_files header.
+        let payload =
+            br#"{"action":"delete_reference","staging_dir":"/unused","files":{},"work_ticket_idx":1}"#;
+        let body = sign_raw(payload, b"dev-secret", future_expiry_secs(300));
+        let action = Action {
+            r#type: "register_files".to_string(),
+            body: body.into(),
+        };
+        // The success type (a boxed Stream) is not Debug, so `expect_err` won't
+        // compile — match instead.
+        let err = match service.do_action(Request::new(action)).await {
+            Ok(_) => panic!("action-type/payload mismatch must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("mismatch"),
+            "error should name the mismatch: {}",
+            err.message()
+        );
+    }
+
+    /// An unrecognized `Action.type` is rejected as invalid rather than silently
+    /// ignored or dispatched — the dispatcher only ever runs known handlers.
+    #[tokio::test]
+    async fn do_action_rejects_unknown_action_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = make_service(tmp.path().to_path_buf());
+        let action = Action {
+            r#type: "definitely_not_a_real_action".to_string(),
+            body: Vec::<u8>::new().into(),
+        };
+        let err = match service.do_action(Request::new(action)).await {
+            Ok(_) => panic!("unknown action type must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// End-to-end `register_files`: seed a Parquet in a staging dir, register it
+    /// into DuckLake, and assert the file was moved to ticket-unique lake storage
+    /// and its rows are queryable through the catalog. Exercises the
+    /// move-then-register path and its wrapping transaction against a real
+    /// DuckLake catalog.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn register_files_moves_and_registers_end_to_end() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+
+        // Ensure the target table exists in the shared catalog.
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            ducklake::ensure_reference_tables(&conn).unwrap();
+        }
+
+        // Unique ids so leftover rows never collide with other serial tests.
+        let ref_idx: i64 = 970_000;
+        let feat_a: i64 = 970_010;
+        let feat_b: i64 = 970_011;
+        let ticket: i64 = 970;
+
+        // Seed a staging Parquet whose schema matches reference_membership
+        // (two BIGINT columns) — written by DuckDB so the types match exactly.
+        let staging = tempfile::tempdir().unwrap();
+        let src = staging.path().join("reference_membership.parquet");
+        let src_str = src.to_str().unwrap();
+        {
+            let writer = Connection::open_in_memory().unwrap();
+            writer
+                .execute_batch(&format!(
+                    "COPY (SELECT * FROM (VALUES \
+                         ({ref_idx}::BIGINT, {feat_a}::BIGINT), \
+                         ({ref_idx}::BIGINT, {feat_b}::BIGINT)) \
+                         t(reference_idx, feature_idx)) \
+                     TO '{src_str}' (FORMAT PARQUET)"
+                ))
+                .unwrap();
+        }
+        assert!(src.exists(), "staging parquet seeded");
+
+        let mut files = std::collections::HashMap::new();
+        files.insert(
+            "reference_membership.parquet".to_string(),
+            "reference_membership".to_string(),
+        );
+        let payload = auth::ActionPayload {
+            action: "register_files".to_string(),
+            staging_dir: staging.path().to_str().unwrap().to_string(),
+            files,
+            work_ticket_idx: ticket,
+        };
+
+        let registered =
+            register_files(&connstr, &data_path, &payload).expect("register_files failed");
+        assert_eq!(registered.len(), 1, "one file registered");
+        // The dest carries the ticket-unique minted name under the per-table dir.
+        let dest = std::path::Path::new(&registered[0]);
+        assert_eq!(
+            dest.file_name().and_then(|f| f.to_str()).unwrap(),
+            "wt970-reference_membership.parquet"
+        );
+        assert!(dest.exists(), "registered lake file present on disk");
+        assert!(
+            !src.exists(),
+            "staging source was moved out, not left behind"
+        );
+
+        // The rows are queryable through the catalog via a fresh connection.
+        let reader = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&reader, &connstr, &data_path).unwrap();
+        let n: i64 = reader
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM qiita_lake.reference_membership \
+                     WHERE reference_idx = {ref_idx}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2, "both seeded membership rows registered");
+
+        // Best-effort cleanup: drop the catalog rows and the lake file.
+        let _ = reader.execute_batch(&format!(
+            "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
+        ));
+        let _ = std::fs::remove_file(dest);
     }
 
     /// `export_read_to_parquet` writes one sample's full reads from the DuckLake

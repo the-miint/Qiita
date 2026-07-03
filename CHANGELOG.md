@@ -525,6 +525,14 @@ the `no-changelog` label).
   root durable DuckLake Parquet under `/tmp` (lost on reboot, never backed up);
   the instance now refuses to start instead. `.env.data-plane.example` promotes
   it to the required block. (#243)
+- **Data plane `register_files` is now catalog-atomic.** The per-file
+  `ducklake_add_data_files` registration loop is wrapped in a single DuckLake
+  transaction (BEGIN/COMMIT/ROLLBACK), matching the `delete_*` actions — a
+  mid-loop failure rolls back every prior registration rather than leaving a
+  reference half-registered in the catalog. Filesystem moves are intentionally
+  not rolled back (dest names are ticket-unique and `move_file` refuses to
+  overwrite, so a failure leaves only inert orphan Parquet). Adds end-to-end,
+  filename-traversal, and do_action dispatch-trust tests. (#243)
 - `qiita-admin masked-read-export` is now **re-runnable**: it creates `--output-dir`
   (with parents) if missing instead of erroring, and for parquet it skips a sample
   whose output file already exists when the count matches and overwrites it only
