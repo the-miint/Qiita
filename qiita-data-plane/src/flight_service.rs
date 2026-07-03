@@ -362,9 +362,10 @@ impl FlightService for QiitaFlightService {
         // REPLAY_SAFE_ACTIONS registry) because every arm below is idempotent or
         // otherwise replay-safe. The registry is the gate: an action absent from
         // it is rejected here, so a newly-added arm stays unreachable until it
-        // is consciously classified replay-safe (or given replay protection).
-        // Keep this set and the match arms in lockstep — the test
-        // `replay_safe_actions_matches_dispatcher` fails the build otherwise.
+        // is consciously classified replay-safe (or given replay protection),
+        // and the match's `other =>` arm below is a defensive, unreachable
+        // fail-closed fallback. Keep this set and the match arms in lockstep —
+        // the test `replay_safe_actions_matches_dispatcher` fails otherwise.
         if !REPLAY_SAFE_ACTIONS.contains(&action.r#type.as_str()) {
             return Err(Status::invalid_argument(format!(
                 "unknown action type: {:?}",
@@ -589,9 +590,6 @@ impl FlightService for QiitaFlightService {
                 let output = stream::once(futures::future::ready(Ok(result)));
                 Ok(Response::new(Box::pin(output)))
             }
-            // Unreachable: the replay-classification guard above rejects any
-            // action not in REPLAY_SAFE_ACTIONS before the match. Kept as a
-            // total-match fallback that fails closed rather than panicking.
             other => Err(Status::invalid_argument(format!(
                 "unknown action type: {other:?}"
             ))),

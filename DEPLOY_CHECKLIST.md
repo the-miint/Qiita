@@ -24,7 +24,7 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   SMTP_STARTTLS=opportunistic
   EOF'
   ```
-- **`PATH_PERSISTENT` now required for the data plane.** It was optional (fell back to `$TMPDIR/qiita`); it is now a required, absolute `from_env()` var, so a data-plane instance that lacks it will **refuse to start**. Confirm it is set in `/etc/qiita/data-plane.env` before the restart — it must already point at the durable lake root the running instances use (deriving `PATH_PERSISTENT/ducklake`); if it is somehow unset today the lake has been landing under `/tmp` and needs operator attention before this deploy. No value change is intended — this only makes the existing requirement fail loudly. (#243)
+- **`PATH_PERSISTENT` now required for the data plane.** It was optional (fell back to `$TMPDIR/qiita`); it is now a required, absolute `from_env()` var, so a data-plane instance that lacks it will **refuse to start**. Confirm it is set in `/etc/qiita/data-plane.env` before the restart — it must already point at the durable lake root the running instances use (deriving `PATH_PERSISTENT/ducklake`); if it is somehow unset today the lake has been landing under `/tmp` and needs operator attention before this deploy. No value change is intended — this only makes the existing requirement fail loudly. (#224)
   ```bash
   grep -q '^PATH_PERSISTENT=' /etc/qiita/data-plane.env || echo 'MISSING: set PATH_PERSISTENT in /etc/qiita/data-plane.env'
   ```
