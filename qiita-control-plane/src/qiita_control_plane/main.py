@@ -1,6 +1,7 @@
 """Control plane FastAPI application."""
 
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import asyncpg
@@ -26,6 +27,7 @@ from .dispatch import (
 )
 from .health import aggregate_health
 from .landing import router as landing_router
+from .notify import build_transport, run_sweeper
 from .routes import api_router
 
 _STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -69,9 +71,34 @@ async def lifespan(app: FastAPI):
     # that stops/starts the CP undrained doesn't nuke running work.
     await reconcile_inflight_tickets(app)
 
+    # Email-notification wiring. Build the transport (SMTP relay
+    # when SMTP_HOST is set, else a no-op) and start the in-process sweeper that
+    # coalesces terminal work-ticket outcomes into per-originator digests.
+    # Registered on app.state so the GC can't drop the task mid-run; cancelled
+    # in the shutdown finally alongside the dispatch drain.
+    #
+    # The sweeper runs on its OWN dedicated single-connection pool, never the
+    # request pool: a pass holds a session advisory lock on one connection
+    # across every transport.send(), so a slow relay could otherwise pin a
+    # request-serving connection for up to N × SMTP_TIMEOUT_SECONDS and starve
+    # request handling. A private max_size=1 pool isolates that hold (and the
+    # sweeper is a serial loop that never needs a second connection). asyncpg
+    # re-establishes a dropped connection on the next acquire, so a pass that
+    # loses its connection just fails and the next pass retries — no manual retry.
+    app.state.email_transport = build_transport(settings)
+    app.state.notify_pool = await get_pool(settings.database_url, min_size=1, max_size=1)
+    app.state.notify_sweeper_task = asyncio.create_task(
+        run_sweeper(app.state.notify_pool, settings, app.state.email_transport),
+        name="notify_sweeper",
+    )
+
     try:
         yield
     finally:
+        app.state.notify_sweeper_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await app.state.notify_sweeper_task
+        await close_pool(app.state.notify_pool)
         await drain_running_dispatches(
             app.state.running_dispatches,
             timeout_seconds=_DISPATCH_DRAIN_TIMEOUT_SECONDS,

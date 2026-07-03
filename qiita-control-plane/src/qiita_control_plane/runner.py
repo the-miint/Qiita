@@ -61,6 +61,7 @@ from qiita_common.models import (
     ScopeTargetKind,
     StepBaselineResources,
     StepHandleWire,
+    StepPlanResponse,
     StepProgressState,
     StepStatus,
     StepStatusWire,
@@ -842,6 +843,16 @@ async def _run_entry_with_retry(
     # raised on each TIMEOUT retry, clamped to the action ceiling. Threaded into
     # every step dispatch alongside the memory floor.
     effective_walltime_override: timedelta | None = None
+    # Optional plan() sizing hint, fetched ONCE (native steps only) before the
+    # loop — it depends only on inputs, not the attempt, and only ever
+    # down-sizes below the baseline. Advisory: None (container step, or any
+    # failure) means "use the YAML baseline". Escalation still grows from the
+    # baseline, so a retry overrides the hint (see _resolve_baseline_for_step).
+    plan_hint: StepPlanResponse | None = None
+    if isinstance(entry, WorkflowStep):
+        plan_hint = await _fetch_plan_hint(
+            backend_client, entry, bound, scope_target, work_ticket_idx=work_ticket_idx
+        )
     while True:
         attempt_workspace = workspace / entry.name / f"attempt-{attempt}"
         # Skip past a stale attempt dir to a fresh one. This fires only when an
@@ -885,6 +896,7 @@ async def _run_entry_with_retry(
                     action_ceiling=action_ceiling,
                     mem_gb_override=effective_mem_override,
                     walltime_override=effective_walltime_override,
+                    plan_hint=plan_hint,
                     poll_interval_seconds=poll_interval_seconds,
                     resume=resume,
                 )
@@ -2618,9 +2630,22 @@ def _resolve_baseline_for_step(
     action_ceiling: ActionCeiling,
     mem_gb_override: int | None = None,
     walltime_override: timedelta | None = None,
+    plan_hint: StepPlanResponse | None = None,
 ) -> FlatBaselineResources:
     """Resolve a step's ``baseline_resources`` to a concrete
     ``FlatBaselineResources`` and clamp against ``action_ceiling``.
+
+    ``plan_hint`` (a native step's optional ``plan()`` sizing hint, fetched once
+    before the retry loop) is applied FIRST, as a raise-NEVER *down-size*: for
+    each axis the hint sets AND that has escalation headroom (``baseline <
+    ceiling``), ``resolved.X = min(resolved.X, hint.X)``. It only ever LOWERS a
+    step below its YAML baseline (a small input needs less); a hint above the
+    baseline is a no-op, and an axis with ``baseline == ceiling`` is left alone
+    (no headroom to recover — see the inline comment). Applied BEFORE the
+    raise-only override floors below so escalation always wins on a retry: the
+    escalated floor is seeded from the YAML baseline (>= any down-sized value),
+    so a retry after an OOM/TIMEOUT restores at least the baseline regardless of
+    the hint.
 
     ``mem_gb_override`` (the ticket's optional per-run resource bump) raises the
     resolved memory *floor*: ``mem_gb = max(resolved.mem_gb, mem_gb_override)``.
@@ -2702,6 +2727,37 @@ def _resolve_baseline_for_step(
             cpu=br.cpu, mem_gb=br.mem_gb, walltime=br.walltime, gpu=br.gpu
         )
 
+    # plan() down-size (raise-NEVER), applied BEFORE the raise-only floors so an
+    # OOM/TIMEOUT retry (whose floor is seeded from the YAML baseline) always
+    # restores at least the baseline. Each axis the hint sets lowers the
+    # resolved value; a hint >= baseline is a no-op. gpu is deliberately not a
+    # plan() axis (see JobResourcePlan).
+    #
+    # Down-size ONLY an axis with escalation HEADROOM (baseline < ceiling). If
+    # baseline == ceiling there is no room for escalation to grow, so a
+    # down-sized attempt that OOMs/TIMEOUTs would be misread as
+    # RESOURCE_CEILING_EXHAUSTED (the escalation helper, re-resolving from the
+    # baseline, returns the floor unchanged) and fail the ticket without ever
+    # running at the baseline. Leaving a no-headroom axis at its baseline keeps
+    # the "escalation can always recover to >= baseline" invariant the
+    # saturation check depends on. The chained `hint < baseline < ceiling`
+    # expresses both "hint lowers it" and "there is headroom to recover".
+    if plan_hint is not None:
+        updates: dict[str, Any] = {}
+        if plan_hint.cpu is not None and plan_hint.cpu < resolved.cpu < action_ceiling.cpu:
+            updates["cpu"] = plan_hint.cpu
+        if (
+            plan_hint.mem_gb is not None
+            and plan_hint.mem_gb < resolved.mem_gb < action_ceiling.mem_gb
+        ):
+            updates["mem_gb"] = plan_hint.mem_gb
+        if plan_hint.walltime_seconds is not None:
+            hint_walltime = timedelta(seconds=plan_hint.walltime_seconds)
+            if hint_walltime < resolved.walltime < action_ceiling.walltime:
+                updates["walltime"] = hint_walltime
+        if updates:
+            resolved = resolved.model_copy(update=updates)
+
     # Per-run memory floor (raise-only): never lowers a step the YAML sized
     # higher than the override.
     if mem_gb_override is not None and mem_gb_override > resolved.mem_gb:
@@ -2763,12 +2819,17 @@ def _escalated_mem_floor_after_oom(
     ``current_override`` unchanged once the resolved allocation has reached the
     action ceiling.
 
-    The just-failed attempt ran at ``max(baseline.mem_gb, current_override)`` —
-    exactly what ``_resolve_baseline_for_step`` resolves here. Grow that by
-    ``_OOM_MEMORY_GROWTH`` and clamp to ``action_ceiling.mem_gb`` so the next
-    attempt's floor stays within the same bound the submission route and
-    ``_assert_within_ceiling`` enforce. The result is threaded back into
-    ``_dispatch_step`` as ``mem_gb_override``.
+    Escalation always grows from the YAML baseline: this re-resolves WITHOUT the
+    ``plan()`` hint (so the floor climbs from ``max(baseline.mem_gb,
+    current_override)``, grown by ``_OOM_MEMORY_GROWTH`` and clamped to
+    ``action_ceiling.mem_gb``), and the result is threaded back into
+    ``_dispatch_step`` as ``mem_gb_override``. When a ``plan()`` hint down-sized
+    the just-failed attempt below the baseline, that attempt actually ran at the
+    (smaller) hint, not the baseline — the first escalation deliberately jumps
+    to the grown-from-baseline value (skipping the optimistic down-size), which
+    the headroom guard in ``_resolve_baseline_for_step`` guarantees exceeds the
+    baseline. Growing from the baseline, not from the down-sized size, is what
+    lets escalation recover a step whose ``plan()`` estimate was too low.
     """
     resolved = _resolve_baseline_for_step(
         entry=entry,
@@ -2802,15 +2863,19 @@ def _escalated_walltime_after_timeout(
     ``current_override`` unchanged once the resolved allocation has reached the
     action ceiling.
 
-    The just-failed attempt ran at ``max(baseline.walltime, current_override)`` —
-    exactly what ``_resolve_baseline_for_step`` resolves here. Grow that by
-    ``_TIMEOUT_WALLTIME_GROWTH`` and clamp to ``action_ceiling.walltime`` so the
-    next attempt's floor stays within the same bound the submission route and
-    ``_assert_within_ceiling`` enforce. The result is threaded back into
-    ``_dispatch_step`` as ``walltime_override``. The exact mirror of
-    ``_escalated_mem_floor_after_oom`` for walltime, minus the static per-run
-    seed (there is no ``resource_override.walltime``): escalation always starts
-    from the YAML baseline.
+    Escalation always grows from the YAML baseline: this re-resolves WITHOUT the
+    ``plan()`` hint (so the floor climbs from ``max(baseline.walltime,
+    current_override)``, grown by ``_TIMEOUT_WALLTIME_GROWTH`` and clamped to
+    ``action_ceiling.walltime``), and the result is threaded back into
+    ``_dispatch_step`` as ``walltime_override``. When a ``plan()`` hint
+    down-sized the just-failed attempt below the baseline (e.g. qc's small-input
+    walltime), that attempt ran at the smaller hint, not the baseline — the
+    first escalation deliberately jumps to the grown-from-baseline value, which
+    the headroom guard in ``_resolve_baseline_for_step`` guarantees exceeds the
+    baseline. The exact mirror of ``_escalated_mem_floor_after_oom`` for
+    walltime, minus the static per-run seed (there is no
+    ``resource_override.walltime``): escalation always starts from the YAML
+    baseline.
     """
     resolved = _resolve_baseline_for_step(
         entry=entry,
@@ -2881,6 +2946,66 @@ def _assert_within_ceiling(
         )
 
 
+def _bind_step_inputs(entry: WorkflowStep, bound: dict[str, Any]) -> dict[str, Any]:
+    """Build a step's name -> value input map from the binding map `bound`.
+
+    `inputs` / `optional_inputs` are host paths (Path-coerced); scalar build
+    params (`WorkflowStep.params`, keyed action_context_key -> Inputs field) are
+    NOT host paths, so they are merged un-Path-coerced as strings — the wire
+    carries `inputs: dict[str, str]` and the native job's Pydantic `Inputs`
+    model re-coerces each string to its declared type (e.g. "35" -> int).
+    Native steps only: `_resolve_input_binds` (which would treat a value as a
+    bind-mount path) is container-only, so a scalar here is never mistaken for
+    one. Shared by `_dispatch_step` (submit) and `_fetch_plan_hint` (plan) so
+    the two send identical inputs."""
+    inputs: dict[str, Any] = {name: Path(bound[name]) for name in entry.inputs}
+    inputs.update({name: Path(bound[name]) for name in entry.optional_inputs if name in bound})
+    inputs.update(
+        {field: str(bound[ctx_key]) for ctx_key, field in entry.params.items() if ctx_key in bound}
+    )
+    return inputs
+
+
+async def _fetch_plan_hint(
+    backend_client: ComputeBackendClient,
+    entry: WorkflowStep,
+    bound: dict[str, Any],
+    scope_target: dict[str, Any],
+    *,
+    work_ticket_idx: int,
+) -> StepPlanResponse | None:
+    """Fetch a native step's optional `plan()` resource hint, ONCE, before its
+    retry loop. Returns None for a container step (no `plan()`) or on ANY
+    failure.
+
+    ADVISORY by contract: the hint only ever LOWERS a step below its YAML
+    baseline (`_resolve_baseline_for_step`), and a missing hint means "use the
+    baseline", so a failure here must never fail the ticket. We therefore
+    swallow every exception — an unreachable orchestrator, a classified
+    BackendFailure from a broken module, a malformed response — and log it, so
+    dispatch proceeds on the baseline exactly as it did before `plan()`
+    existed."""
+    if entry.module is None:
+        return None
+    try:
+        return await backend_client.plan_step(
+            step_name=entry.name,
+            inputs=_bind_step_inputs(entry, bound),
+            scope_target=scope_target,
+            work_ticket_idx=work_ticket_idx,
+            module=entry.module,
+        )
+    except Exception as exc:  # noqa: BLE001 - advisory: any failure -> baseline
+        _log.warning(
+            "work_ticket %d step %r plan() fetch failed (%s: %s); using YAML baseline",
+            work_ticket_idx,
+            entry.name,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+
 async def _dispatch_step(
     backend_client: ComputeBackendClient,
     entry: WorkflowStep,
@@ -2895,6 +3020,7 @@ async def _dispatch_step(
     action_ceiling: ActionCeiling,
     mem_gb_override: int | None = None,
     walltime_override: timedelta | None = None,
+    plan_hint: StepPlanResponse | None = None,
     poll_interval_seconds: float,
     resume: bool = False,
 ) -> dict[str, Any]:
@@ -2918,24 +3044,14 @@ async def _dispatch_step(
     ones are simply omitted. `action_ceiling` clamps the resolved baseline;
     the lookup population reads an upstream step's named output file and
     selects the matching profile, the flat population uses the YAML values."""
-    inputs = {name: Path(bound[name]) for name in entry.inputs}
-    inputs.update({name: Path(bound[name]) for name in entry.optional_inputs if name in bound})
-    # Scalar build params (WorkflowStep.params, keyed action_context_key ->
-    # Inputs field). Unlike inputs/optional_inputs these are NOT host paths, so
-    # they are merged un-Path-coerced and as strings: the wire carries
-    # `inputs: dict[str, str]` and the native job's Pydantic `Inputs` model
-    # re-coerces each string to its declared type (e.g. "35" -> int w). Native
-    # steps only — `_resolve_input_binds` (which would treat a value as a path)
-    # is container-only, so a scalar here is never mistaken for a bind mount.
-    inputs.update(
-        {field: str(bound[ctx_key]) for ctx_key, field in entry.params.items() if ctx_key in bound}
-    )
+    inputs = _bind_step_inputs(entry, bound)
     resolved = _resolve_baseline_for_step(
         entry=entry,
         bound=bound,
         action_ceiling=action_ceiling,
         mem_gb_override=mem_gb_override,
         walltime_override=walltime_override,
+        plan_hint=plan_hint,
     )
     baseline = StepBaselineResources(
         cpu=resolved.cpu,

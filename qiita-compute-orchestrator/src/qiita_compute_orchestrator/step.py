@@ -24,15 +24,18 @@ same network. Constant-time compare.
 from __future__ import annotations
 
 import hmac
+import logging
 from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from qiita_common.actions import NATIVE_MODULE_PREFIX
 from qiita_common.api_paths import (
     PATH_STEP_FIND_BY_NAME,
+    PATH_STEP_PLAN,
     PATH_STEP_PREFIX,
     PATH_STEP_RESULT,
     PATH_STEP_STATUS,
@@ -53,6 +56,8 @@ from qiita_common.models import (
     StepFindByNameRequest,
     StepFindByNameResponse,
     StepHandleWire,
+    StepPlanRequest,
+    StepPlanResponse,
     StepResultRequest,
     StepResultResponse,
     StepStatusRequest,
@@ -61,6 +66,9 @@ from qiita_common.models import (
 )
 
 from .backend import ComputeBackend, StepHandle, StepStatusInfo
+from .jobs import flatten_native_inputs, run_native_job_plan
+
+_log = logging.getLogger(__name__)
 
 router = APIRouter(prefix=PATH_STEP_PREFIX, tags=["step"])
 
@@ -200,6 +208,68 @@ async def submit_step(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return _handle_to_wire(handle)
+
+
+@router.post(PATH_STEP_PLAN)
+async def plan_step(
+    body: StepPlanRequest,
+    _: Annotated[None, Depends(_require_cp_to_co_token)],
+) -> StepPlanResponse:
+    """Return a native step's optional `plan()` resource hint.
+
+    Backend-agnostic: `plan()` is a pure submit-time function of the job's
+    inputs, identical under LocalBackend and SlurmBackend (neither runs it on a
+    compute node), so this route calls the dispatcher directly rather than
+    going through the ComputeBackend — unlike submit/status/result, which
+    genuinely diverge by backend.
+
+    ADVISORY: the hint is an optimization, never a correctness input, so ANY
+    failure here (a broken `plan()`, a bad module, a flatten/validation error)
+    degrades to an EMPTY response and the control plane falls back to the YAML
+    baseline. We log the cause at WARNING so a degrade is never silent, but we
+    never fail the step over a sizing hint."""
+    _reject_non_native_module(body.module)
+    # The mapping into StepPlanResponse is INSIDE the try: StepPlanResponse
+    # constrains each axis to `> 0`, but JobResourcePlan does not, so a plan()
+    # returning a degenerate hint (cpu=0, a negative value, or a sub-second
+    # walltime that truncates to 0) would raise a ValidationError here. Keeping
+    # it in the try means such a hint degrades to the baseline like every other
+    # plan failure, preserving the advisory guarantee (never a 500).
+    try:
+        raw_inputs = flatten_native_inputs(
+            dict(body.inputs),
+            step_name=body.step_name,
+            scope_target=body.scope_target,
+            work_ticket_idx=body.work_ticket_idx,
+        )
+        # run_native_job_plan does blocking work — importlib.import_module plus a
+        # synchronous DuckDB Parquet-footer read — so offload it to a worker
+        # thread rather than calling it inline in this async handler. A slow or
+        # stalled filesystem would otherwise block CO's entire event loop for the
+        # duration, not just this request. (submit/status/result stay responsive
+        # because they await the backend.)
+        job_plan = await run_in_threadpool(
+            run_native_job_plan, body.module, raw_inputs, step_name=body.step_name
+        )
+        resources = job_plan.resources
+        if resources is None:
+            return StepPlanResponse()
+        return StepPlanResponse(
+            cpu=resources.cpu,
+            mem_gb=resources.mem_gb,
+            walltime_seconds=(
+                int(resources.walltime.total_seconds()) if resources.walltime is not None else None
+            ),
+        )
+    except Exception as exc:
+        _log.warning(
+            "plan() for step %r (module %r) failed; falling back to baseline: %s: %s",
+            body.step_name,
+            body.module,
+            type(exc).__name__,
+            exc,
+        )
+        return StepPlanResponse()
 
 
 @router.post(PATH_STEP_STATUS)

@@ -14,6 +14,9 @@ dependencies = [
     "duckdb>=1.5.4",
     "jsonschema>=4.20",
     "jinja2>=3.1",
+    # Async SMTP client for the email-notification transport.
+    # Async so a slow relay never blocks the event loop.
+    "aiosmtplib>=3.0",
     # gRPC health-check stubs for the DP probe in /health. Used to
     # ping the data plane's `grpc.health.v1.Health/Check` service
     # without depending on gRPC reflection (DP reflection is a

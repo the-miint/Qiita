@@ -1238,7 +1238,12 @@ async def run_work_ticket(
                 "     failure_type = NULL,"
                 "     failure_stage = NULL,"
                 "     failure_step_name = NULL,"
-                "     failure_reason = NULL"
+                "     failure_reason = NULL,"
+                # A prior FAILED outcome may already have been notified; a
+                # redrive that later reaches its TRUE terminal state must
+                # re-notify, so reset the notification lifecycle here.
+                "     notified_at = NULL,"
+                "     notify_attempts = 0"
                 " WHERE work_ticket_idx = $2"
                 "   AND state = $3::qiita.work_ticket_state"
                 " RETURNING work_ticket_idx",

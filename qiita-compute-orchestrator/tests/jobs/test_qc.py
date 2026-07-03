@@ -361,3 +361,56 @@ def test_read_adapter_parquet_empty_raises(tmp_path):
     p = _adapter_parquet(tmp_path, name="empty.parquet")
     with open_miint_conn() as conn, pytest.raises(ValueError):
         qc._read_adapter_parquet(conn, p)
+
+
+def test_qc_plan_sizes_walltime_from_read_count(tmp_path, write_reads_q):
+    """qc.plan() sizes WALLTIME (not memory — qc streams) from the read count,
+    and returns only that axis (cpu/mem left to the YAML baseline)."""
+    from qiita_compute_orchestrator.jobs import qc
+
+    reads = write_reads_q(
+        tmp_path / "reads.parquet",
+        [(i, "se", "AAAA", [40, 40, 40, 40], None, None) for i in range(5)],
+    )
+    inputs = qc.Inputs(
+        reads=reads,
+        adapter_parquet=tmp_path / "adapters.parquet",  # unread by plan()
+        prep_sample_idx=1,
+        work_ticket_idx=1,
+    )
+    job_plan = qc.plan(inputs)
+    r = job_plan.resources
+    assert r is not None
+    assert r.mem_gb is None and r.cpu is None
+    # 5 reads: base 300 s + ceil(5/1e6 * 30) = 301 s.
+    assert r.walltime.total_seconds() == 301
+
+
+def test_qc_plan_walltime_grows_with_read_count(tmp_path):
+    """More reads -> a larger walltime estimate (monotonic in cardinality).
+
+    Builds the reads Parquet cheaply via DuckDB `range()` — qc.plan() only does
+    a footer `count(*)`, so the row *count* is all that matters and we avoid
+    materializing millions of literal rows (a `VALUES` list of 2M tuples is a
+    multi-GB SQL string, not a test)."""
+    from qiita_compute_orchestrator.jobs import qc
+
+    def _reads(n: int) -> Path:
+        path = tmp_path / f"reads_{n}.parquet"
+        with duckdb.connect(":memory:") as conn:
+            conn.execute(
+                f"COPY (SELECT i AS sequence_idx FROM range({n}) t(i)) TO '{path}' (FORMAT PARQUET)"
+            )
+        return path
+
+    def _plan_for(n: int):
+        inputs = qc.Inputs(
+            reads=_reads(n),
+            adapter_parquet=tmp_path / "a.parquet",
+            prep_sample_idx=1,
+            work_ticket_idx=1,
+        )
+        return qc.plan(inputs).resources.walltime
+
+    # 2M reads adds ceil(2 * 30) = 60 s over the base; 10 reads adds 1 s.
+    assert _plan_for(2_000_000) > _plan_for(10)

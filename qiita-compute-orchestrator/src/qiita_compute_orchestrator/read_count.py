@@ -25,6 +25,7 @@ from pathlib import Path
 
 import duckdb
 from pydantic import BaseModel
+from qiita_common.parquet import validate_parquet_path
 
 # Sidecar filename, written into each stage's own workspace. The binding
 # NAME disambiguates the three stages (raw_/biological_/quality_filtered_),
@@ -65,11 +66,11 @@ def write_read_count(conn: duckdb.DuckDBPyConnection, reads_parquet: Path, works
 
     The caller passes its already-open DuckDB connection (every stage has
     one); a plain `read_parquet` count needs no miint extension, so any
-    connection works. The path is inline single-quote-escaped to match the
-    sibling jobs' COPY/read_parquet literals (a filesystem path, no other
-    injection surface); this helper joins qc/host_filter on the inline-escape
-    side of the validate_parquet_path convergence."""
-    path_sql = str(reads_parquet).replace("'", "''")
+    connection works. The path is inlined via `validate_parquet_path`
+    (fail-fast on quote/backslash/control chars), converging with the sibling
+    jobs' COPY/read_parquet literal convention — a filesystem path is the only
+    injection surface here."""
+    path_sql = validate_parquet_path(reads_parquet)
     read_pairs, r2_reads = conn.execute(
         f"SELECT count(*), count(sequence2) FROM read_parquet('{path_sql}')"
     ).fetchone()

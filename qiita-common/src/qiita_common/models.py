@@ -448,6 +448,53 @@ class StepSubmitRequest(BaseModel):
         return self
 
 
+class StepPlanRequest(BaseModel):
+    """Body for POST /api/v1/step/plan, issued by the control-plane runner
+    ONCE per native `step:` entry before its retry loop. The orchestrator
+    imports the module, validates these inputs against its `Inputs`, and runs
+    the module's optional `plan(inputs)` to return a resource-sizing hint.
+
+    Native (`module`) steps only — a container step has no `plan()`, so the CP
+    never issues this for one. The fields mirror the submit request's native
+    subset: `inputs` are the same name→(path|scalar) strings, `scope_target` +
+    `work_ticket_idx` let the orchestrator run the same `flatten_native_inputs`
+    merge submit does, so `plan()` sees identical `Inputs`. No `workspace` /
+    `attempt`: `plan()` reads its declared input paths and is attempt-agnostic
+    (called once, before any attempt)."""
+
+    step_name: str = Field(min_length=1)
+    inputs: dict[str, str] = Field(default_factory=dict)
+    scope_target: dict[str, Any]
+    work_ticket_idx: Annotated[int, Field(gt=0)]
+    module: str = Field(min_length=1, max_length=512)
+
+    @field_validator("scope_target", mode="after")
+    @classmethod
+    def _validate_scope_target(cls, v: dict[str, Any]) -> dict[str, Any]:
+        return _normalize_scope_target(v)
+
+
+class StepPlanResponse(BaseModel):
+    """Returned by POST /api/v1/step/plan — a job's optional resource hint.
+
+    Every field is optional: a field left None means "no opinion, use the
+    workflow baseline" for that axis. The control plane composes a non-None
+    value into resource resolution by LOWERING the step below its YAML baseline
+    (down-sizing); escalation remains the only up-sizing path. An empty
+    response (all None) is the no-op a job with no `plan()`, or a `plan()` that
+    declined to size, produces — the CP then uses the baseline unchanged.
+
+    Note `cpu` has no escalation backstop (only `mem_gb` grows after OOM and
+    `walltime_seconds` after TIMEOUT), so a down-sized `cpu` is never raised
+    back on retry — recovering only indirectly via walltime escalation absorbing
+    the slowness, up to the walltime ceiling. See `JobResourcePlan` (the CO-side
+    twin) for the full rationale."""
+
+    cpu: Annotated[int, Field(gt=0)] | None = None
+    mem_gb: Annotated[int, Field(gt=0)] | None = None
+    walltime_seconds: Annotated[int, Field(gt=0)] | None = None
+
+
 class StepHandleWire(BaseModel):
     """Serialized `StepHandle` — POST /step/submit returns one, and POST
     /step/status / /step/result take one back. Paths are strings on the
@@ -585,6 +632,25 @@ class UploadStatus(StrEnum):
     READY = "ready"
     CONSUMED = "consumed"
     FAILED = "failed"
+
+
+class EmailReceiptStatus(StrEnum):
+    """Delivery lifecycle of a qiita.email_receipt row.
+
+    Mirrored DB-side by the `email_receipt.status` CHECK constraint. Stored as
+    TEXT/CHECK, not a Postgres ENUM — same carve-out as UploadStatus /
+    ReferenceStatus / AuthEventType; see CLAUDE.md "Enum parity". Keep both sides
+    in sync by hand (a light StrEnum↔CHECK parity test guards drift).
+
+    PENDING is written before the transport send; SENT/FAILED record the
+    outcome. DEAD_LETTER is a terminal give-up after NOTIFY_MAX_ATTEMPTS failed
+    sends — the sweeper stamps the ticket notified and stops retrying.
+    """
+
+    PENDING = "pending"
+    SENT = "sent"
+    FAILED = "failed"
+    DEAD_LETTER = "dead_letter"
 
 
 class UploadCreateRequest(BaseModel):

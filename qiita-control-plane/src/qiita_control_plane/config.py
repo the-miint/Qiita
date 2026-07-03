@@ -37,6 +37,27 @@ _DEFAULT_MAX_SEQUENCE_MINT_COUNT = 10_000_000_000
 _DEFAULT_CP_TO_CO_TOKEN_PATH = Path("/etc/qiita/cp-to-co.token")
 
 
+# Email-notification defaults. SMTP_HOST is deliberately unset by default so a
+# dev/test boot falls back to NoOpTransport (no wire sends). The relay is
+# no-auth and IP-allowlisted, so none of these are secrets. The NOTIFY_* knobs
+# tune the trailing-debounce-with-maxWait sweeper.
+_DEFAULT_SMTP_PORT = 25
+_DEFAULT_SMTP_FROM = "donotreply@ucsd.edu"
+_DEFAULT_SMTP_STARTTLS = "opportunistic"
+_DEFAULT_SMTP_TIMEOUT_SECONDS = 15
+_SMTP_STARTTLS_CHOICES = ("opportunistic", "required", "never")
+_DEFAULT_NOTIFY_SWEEP_INTERVAL_SECONDS = 60
+_DEFAULT_NOTIFY_QUIET_PERIOD_SECONDS = 180
+_DEFAULT_NOTIFY_MAX_BATCH_SECONDS = 900
+_DEFAULT_NOTIFY_MAX_AGE_SECONDS = 21600
+_DEFAULT_NOTIFY_MAX_ATTEMPTS = 5
+# Per-pass owed-set cap. One sweep holds the advisory lock and sends serially,
+# so an unbounded fetch on a large backlog (prolonged relay outage, huge fanout)
+# would pull every owed ticket into memory and pin the lock across all of them.
+# The cap bounds both; the ORDER BY makes the remainder resumable next pass.
+_DEFAULT_NOTIFY_MAX_ROWS_PER_SWEEP = 5000
+
+
 def _parse_positive_int_env(var: str, default: int) -> int:
     """Read `var` from the environment as a positive int, or fall back to
     `default`. Raises RuntimeError naming the variable on a non-int value
@@ -148,6 +169,23 @@ class Settings:
     # whose steps need `adapter_parquet` when this is None — so a QC-enabled deploy
     # must set it (after loading the adapter set), but a non-QC deploy needn't.
     default_adapter_reference_idx: int | None = None
+    # Email notification. SMTP_HOST unset → NoOpTransport (no wire
+    # sends) so a dev/test boot never mails. None of these are secrets (the
+    # relay is no-auth, IP-allowlisted), so they live in plain
+    # .env.control-plane, not a token file. The NOTIFY_* knobs tune the
+    # trailing-debounce-with-maxWait sweeper; all defaulted so boot never fails
+    # without them. Reply-To reuses contact_email.
+    smtp_host: str | None = None
+    smtp_port: int = _DEFAULT_SMTP_PORT
+    smtp_from: str = _DEFAULT_SMTP_FROM
+    smtp_starttls: str = _DEFAULT_SMTP_STARTTLS
+    smtp_timeout_seconds: int = _DEFAULT_SMTP_TIMEOUT_SECONDS
+    notify_sweep_interval_seconds: int = _DEFAULT_NOTIFY_SWEEP_INTERVAL_SECONDS
+    notify_quiet_period_seconds: int = _DEFAULT_NOTIFY_QUIET_PERIOD_SECONDS
+    notify_max_batch_seconds: int = _DEFAULT_NOTIFY_MAX_BATCH_SECONDS
+    notify_max_age_seconds: int = _DEFAULT_NOTIFY_MAX_AGE_SECONDS
+    notify_max_attempts: int = _DEFAULT_NOTIFY_MAX_ATTEMPTS
+    notify_max_rows_per_sweep: int = _DEFAULT_NOTIFY_MAX_ROWS_PER_SWEEP
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -200,6 +238,18 @@ class Settings:
                 f"CONTACT_EMAIL must be a local@domain.tld address, got {contact_email!r}"
             )
 
+        smtp_starttls = os.environ.get("SMTP_STARTTLS", _DEFAULT_SMTP_STARTTLS)
+        if smtp_starttls not in _SMTP_STARTTLS_CHOICES:
+            raise RuntimeError(
+                f"SMTP_STARTTLS must be one of {_SMTP_STARTTLS_CHOICES}, got {smtp_starttls!r}"
+            )
+
+        # Same minimal shape check as CONTACT_EMAIL — catch a malformed
+        # envelope-from at boot rather than at wire-send time.
+        smtp_from = os.environ.get("SMTP_FROM", _DEFAULT_SMTP_FROM)
+        if not _CONTACT_EMAIL_RE.match(smtp_from):
+            raise RuntimeError(f"SMTP_FROM must be a local@domain.tld address, got {smtp_from!r}")
+
         return cls(
             database_url=require_env("DATABASE_URL"),
             hmac_secret_key=secret,
@@ -245,5 +295,30 @@ class Settings:
             build_sha=os.environ.get("BUILD_SHA") or None,
             default_adapter_reference_idx=_parse_optional_positive_int_env(
                 "QIITA_DEFAULT_ADAPTER_REFERENCE_IDX"
+            ),
+            smtp_host=os.environ.get("SMTP_HOST") or None,
+            smtp_port=_parse_positive_int_env("SMTP_PORT", _DEFAULT_SMTP_PORT),
+            smtp_from=smtp_from,
+            smtp_starttls=smtp_starttls,
+            smtp_timeout_seconds=_parse_positive_int_env(
+                "SMTP_TIMEOUT_SECONDS", _DEFAULT_SMTP_TIMEOUT_SECONDS
+            ),
+            notify_sweep_interval_seconds=_parse_positive_int_env(
+                "NOTIFY_SWEEP_INTERVAL_SECONDS", _DEFAULT_NOTIFY_SWEEP_INTERVAL_SECONDS
+            ),
+            notify_quiet_period_seconds=_parse_positive_int_env(
+                "NOTIFY_QUIET_PERIOD_SECONDS", _DEFAULT_NOTIFY_QUIET_PERIOD_SECONDS
+            ),
+            notify_max_batch_seconds=_parse_positive_int_env(
+                "NOTIFY_MAX_BATCH_SECONDS", _DEFAULT_NOTIFY_MAX_BATCH_SECONDS
+            ),
+            notify_max_age_seconds=_parse_positive_int_env(
+                "NOTIFY_MAX_AGE_SECONDS", _DEFAULT_NOTIFY_MAX_AGE_SECONDS
+            ),
+            notify_max_rows_per_sweep=_parse_positive_int_env(
+                "NOTIFY_MAX_ROWS_PER_SWEEP", _DEFAULT_NOTIFY_MAX_ROWS_PER_SWEEP
+            ),
+            notify_max_attempts=_parse_positive_int_env(
+                "NOTIFY_MAX_ATTEMPTS", _DEFAULT_NOTIFY_MAX_ATTEMPTS
             ),
         )
