@@ -1078,28 +1078,42 @@ async def _fetch_action(
     )
 
 
-async def _atomic_transition(
+# The non-terminal states a work_ticket may legitimately transition FROM.
+# Shared by every guarded transition so the allowed-source set is defined once.
+_NON_TERMINAL_STATES = [
+    WorkTicketState.PENDING.value,
+    WorkTicketState.QUEUED.value,
+    WorkTicketState.PROCESSING.value,
+]
+
+
+async def _guarded_state_update(
     pool: asyncpg.Pool | asyncpg.Connection,
     work_ticket_idx: int,
     *,
-    expected: WorkTicketState,
-    new: WorkTicketState,
+    set_clause: str,
+    set_params: list[Any],
+    allowed_states: list[str],
+    action: str,
 ) -> None:
-    """UPDATE state with a TOCTOU-safe WHERE clause. Raises if the row
-    isn't in the expected state — surfacing a stuck PROCESSING ticket
-    instead of silently overwriting it.
+    """Run a TOCTOU-safe work_ticket state UPDATE.
 
-    Accepts either a pool (auto-acquires a transient connection) or a
-    live Connection (so the finalize block can fire this UPDATE inside
-    the same transaction as `_consume_upload_handles` and the status
-    PATCH)."""
+    Applies `set_clause` (which references $1..$k for `set_params`) only when the
+    row's current state is one of `allowed_states`. If nothing matched, reads the
+    actual state and raises — surfacing a stuck/racing ticket loudly instead of
+    silently overwriting it. `action` names the attempted transition in that
+    error. Accepts a pool (transient connection) or a live Connection, so the
+    finalize block can run its transition inside the same transaction as
+    `_consume_upload_handles` and the status PATCH."""
+    n = len(set_params)
     updated = await pool.fetchval(
-        "UPDATE qiita.work_ticket SET state = $1::qiita.work_ticket_state "
-        "WHERE work_ticket_idx = $2 AND state = $3::qiita.work_ticket_state "
-        "RETURNING work_ticket_idx",
-        new.value,
+        f"UPDATE qiita.work_ticket SET {set_clause}"
+        f" WHERE work_ticket_idx = ${n + 1}"
+        f"   AND state = ANY(${n + 2}::qiita.work_ticket_state[])"
+        " RETURNING work_ticket_idx",
+        *set_params,
         work_ticket_idx,
-        expected.value,
+        allowed_states,
     )
     if updated is None:
         actual = await pool.fetchval(
@@ -1107,9 +1121,29 @@ async def _atomic_transition(
             work_ticket_idx,
         )
         raise RuntimeError(
-            f"could not transition work_ticket {work_ticket_idx} "
-            f"from {expected.value!r} to {new.value!r}; actual state {actual!r}"
+            f"could not {action} work_ticket {work_ticket_idx}: "
+            f"expected state in {allowed_states}, got {actual!r}"
         )
+
+
+async def _atomic_transition(
+    pool: asyncpg.Pool | asyncpg.Connection,
+    work_ticket_idx: int,
+    *,
+    expected: WorkTicketState,
+    new: WorkTicketState,
+) -> None:
+    """Guarded single-state transition (expected → new). Raises if the row isn't
+    in `expected` — surfacing a stuck ticket instead of overwriting it. Accepts a
+    pool or a live Connection (the finalize block fires this in its transaction)."""
+    await _guarded_state_update(
+        pool,
+        work_ticket_idx,
+        set_clause="state = $1::qiita.work_ticket_state",
+        set_params=[new.value],
+        allowed_states=[expected.value],
+        action=f"transition to {new.value!r}",
+    )
 
 
 async def _transition_to_processing_for_resume(pool: asyncpg.Pool, work_ticket_idx: int) -> None:
@@ -1119,27 +1153,14 @@ async def _transition_to_processing_for_resume(pool: asyncpg.Pool, work_ticket_i
     recovery doesn't need to know exactly where the crash left it; a
     PROCESSING → PROCESSING is a harmless no-op. Raises on a terminal ticket
     — recovery should never be handed one."""
-    updated = await pool.fetchval(
-        "UPDATE qiita.work_ticket SET state = $1::qiita.work_ticket_state"
-        " WHERE work_ticket_idx = $2 AND state = ANY($3::qiita.work_ticket_state[])"
-        " RETURNING work_ticket_idx",
-        WorkTicketState.PROCESSING.value,
+    await _guarded_state_update(
+        pool,
         work_ticket_idx,
-        [
-            WorkTicketState.PENDING.value,
-            WorkTicketState.QUEUED.value,
-            WorkTicketState.PROCESSING.value,
-        ],
+        set_clause="state = $1::qiita.work_ticket_state",
+        set_params=[WorkTicketState.PROCESSING.value],
+        allowed_states=_NON_TERMINAL_STATES,
+        action="resume to processing",
     )
-    if updated is None:
-        actual = await pool.fetchval(
-            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
-            work_ticket_idx,
-        )
-        raise RuntimeError(
-            f"could not resume work_ticket {work_ticket_idx} to processing: "
-            f"expected non-terminal, got {actual!r}"
-        )
 
 
 async def _retry_count(pool: asyncpg.Pool, work_ticket_idx: int) -> int:
@@ -1157,26 +1178,14 @@ async def _bump_retry_and_requeue(pool: asyncpg.Pool, work_ticket_idx: int) -> N
     pair; an observer that reads after this commit sees QUEUED with the
     bumped count, never PROCESSING with the bumped count or QUEUED with
     the old count."""
-    updated = await pool.fetchval(
-        "UPDATE qiita.work_ticket"
-        " SET state = $1::qiita.work_ticket_state,"
-        "     retry_count = retry_count + 1"
-        " WHERE work_ticket_idx = $2"
-        "   AND state = $3::qiita.work_ticket_state"
-        " RETURNING work_ticket_idx",
-        WorkTicketState.QUEUED.value,
+    await _guarded_state_update(
+        pool,
         work_ticket_idx,
-        WorkTicketState.PROCESSING.value,
+        set_clause="state = $1::qiita.work_ticket_state, retry_count = retry_count + 1",
+        set_params=[WorkTicketState.QUEUED.value],
+        allowed_states=[WorkTicketState.PROCESSING.value],
+        action="bump retry on",
     )
-    if updated is None:
-        actual = await pool.fetchval(
-            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
-            work_ticket_idx,
-        )
-        raise RuntimeError(
-            f"could not bump retry on work_ticket {work_ticket_idx}: "
-            f"expected processing, got {actual!r}"
-        )
 
 
 async def _transition_to_failed(
@@ -1196,43 +1205,33 @@ async def _transition_to_failed(
     Accepts transition from any non-terminal state — the runner may be
     in PROCESSING (most common) or QUEUED (if a retry's QUEUED → PROCESSING
     transition raced with shutdown). Refuses already-terminal tickets so
-    a buggy second call doesn't overwrite a COMPLETED state."""
-    updated = await pool.fetchval(
-        "UPDATE qiita.work_ticket"
-        " SET state = $1::qiita.work_ticket_state,"
-        "     failure_type = $2::qiita.failure_type,"
-        "     failure_stage = $3::qiita.work_ticket_failure_stage,"
-        "     failure_step_name = $4,"
-        "     failure_reason = $5,"
-        # A genuine failure ends any in-place-retry episode: clear the
-        # transient marker so the FAILED ticket shows only its real failure
-        # surface, not a stale "stuck retrying" reason.
-        "     transient_reason = NULL,"
-        "     transient_since = NULL"
-        " WHERE work_ticket_idx = $6"
-        "   AND state = ANY($7::qiita.work_ticket_state[])"
-        " RETURNING work_ticket_idx",
-        WorkTicketState.FAILED.value,
-        failure_type.value,
-        failure_stage.value,
-        failure_step_name,
-        failure_reason,
+    a buggy second call doesn't overwrite a COMPLETED state.
+
+    A genuine failure ends any in-place-retry episode: the transient marker is
+    cleared so the FAILED ticket shows only its real failure surface, not a
+    stale "stuck retrying" reason."""
+    await _guarded_state_update(
+        pool,
         work_ticket_idx,
-        [
-            WorkTicketState.PENDING.value,
-            WorkTicketState.QUEUED.value,
-            WorkTicketState.PROCESSING.value,
+        set_clause=(
+            "state = $1::qiita.work_ticket_state,"
+            " failure_type = $2::qiita.failure_type,"
+            " failure_stage = $3::qiita.work_ticket_failure_stage,"
+            " failure_step_name = $4,"
+            " failure_reason = $5,"
+            " transient_reason = NULL,"
+            " transient_since = NULL"
+        ),
+        set_params=[
+            WorkTicketState.FAILED.value,
+            failure_type.value,
+            failure_stage.value,
+            failure_step_name,
+            failure_reason,
         ],
+        allowed_states=_NON_TERMINAL_STATES,
+        action="mark FAILED",
     )
-    if updated is None:
-        actual = await pool.fetchval(
-            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
-            work_ticket_idx,
-        )
-        raise RuntimeError(
-            f"could not mark work_ticket {work_ticket_idx} FAILED: "
-            f"expected non-terminal, got {actual!r}"
-        )
 
 
 async def _transition_to_no_data(pool: asyncpg.Pool, work_ticket_idx: int) -> None:
@@ -1246,35 +1245,22 @@ async def _transition_to_no_data(pool: asyncpg.Pool, work_ticket_idx: int) -> No
     transition from any non-terminal state (PROCESSING most commonly, or QUEUED
     if a retry's requeue raced shutdown); refuses an already-terminal ticket so
     a buggy second call can't overwrite a COMPLETED/FAILED state."""
-    updated = await pool.fetchval(
-        "UPDATE qiita.work_ticket"
-        " SET state = $1::qiita.work_ticket_state,"
-        "     failure_type = NULL,"
-        "     failure_stage = NULL,"
-        "     failure_step_name = NULL,"
-        "     failure_reason = NULL,"
-        "     transient_reason = NULL,"
-        "     transient_since = NULL"
-        " WHERE work_ticket_idx = $2"
-        "   AND state = ANY($3::qiita.work_ticket_state[])"
-        " RETURNING work_ticket_idx",
-        WorkTicketState.NO_DATA.value,
+    await _guarded_state_update(
+        pool,
         work_ticket_idx,
-        [
-            WorkTicketState.PENDING.value,
-            WorkTicketState.QUEUED.value,
-            WorkTicketState.PROCESSING.value,
-        ],
+        set_clause=(
+            "state = $1::qiita.work_ticket_state,"
+            " failure_type = NULL,"
+            " failure_stage = NULL,"
+            " failure_step_name = NULL,"
+            " failure_reason = NULL,"
+            " transient_reason = NULL,"
+            " transient_since = NULL"
+        ),
+        set_params=[WorkTicketState.NO_DATA.value],
+        allowed_states=_NON_TERMINAL_STATES,
+        action="mark NO_DATA",
     )
-    if updated is None:
-        actual = await pool.fetchval(
-            "SELECT state FROM qiita.work_ticket WHERE work_ticket_idx = $1",
-            work_ticket_idx,
-        )
-        raise RuntimeError(
-            f"could not mark work_ticket {work_ticket_idx} NO_DATA: "
-            f"expected non-terminal, got {actual!r}"
-        )
 
 
 def _safe_entry_name(action: ActionDefinition | None, index: int | None) -> str | None:
