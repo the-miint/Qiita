@@ -104,12 +104,26 @@ const DOGET_BATCH_CHANNEL_DEPTH: usize = 4;
 /// contract the buffered path had. A connect/prepare/execute error surfaces as a
 /// single `Err` item, never a silently-truncated empty stream.
 ///
-/// Caveat (pre-existing, shared with the old `.collect()` path): the DuckDB
-/// Arrow iterator's `Item` is a bare `RecordBatch`, not a `Result`, so a failure
-/// that occurs *mid-iteration* (after at least one batch has been sent) cannot
-/// be surfaced — the iterator just terminates early and the consumer sees a
-/// clean EOF after partial data. Only connect/prepare/execute errors (before the
-/// first batch) become an `Err` item.
+/// Caveat — mid-stream truncation is indistinguishable from completion
+/// (pre-existing, shared with the old `.collect()` path, and bounded by the
+/// DuckDB API): the DuckDB Arrow iterator's `Item` is a bare `RecordBatch`, not
+/// a `Result`, so a failure that occurs *mid-iteration* (after at least one
+/// batch has been sent) cannot be surfaced as an error. The iterator simply
+/// terminates early, the channel closes, and the consumer sees a clean EOF —
+/// byte-for-byte identical to a successful, complete stream. A DoGet client
+/// therefore CANNOT tell a truncated result from a whole one on the wire; only
+/// connect/prepare/execute errors, which occur *before* the first batch, become
+/// an `Err` item the client can see.
+///
+/// We accept this rather than work around it: the fix would require the upstream
+/// `duckdb` crate to yield `Result<RecordBatch>` from its Arrow iterator (it does
+/// not today), and there is no in-crate seam to inject a trailing sentinel that
+/// survives the `FlightDataEncoder`. Mid-iteration failures are also rare in
+/// practice — the query is already prepared and executing, and the batches are
+/// read from local/attached storage. Callers that need end-to-end integrity
+/// verify it out-of-band (e.g. the reference-load path checks row counts against
+/// the control plane after the transfer). If the `duckdb` API ever exposes a
+/// fallible per-batch iterator, revisit this to surface mid-stream errors.
 fn stream_ducklake_batches(
     catalog_connstr: String,
     data_path: String,
@@ -132,6 +146,10 @@ fn stream_ducklake_batches(
             })?;
             let schema = arrow_result.get_schema();
             let mut produced = false;
+            // `arrow_result`'s Item is a bare `RecordBatch`, not a `Result` — a
+            // failure once iteration has begun cannot be observed here; the loop
+            // just ends and the consumer sees a clean EOF (see the fn-level
+            // caveat). Nothing to do about it until the duckdb API is fallible.
             for batch in arrow_result {
                 produced = true;
                 // Receiver dropped (client hung up) — stop early, don't error.
