@@ -360,16 +360,20 @@ async def run_workflow(
             f"must be {WorkTicketState.PENDING.value!r}; manual recovery required"
         )
 
-    # Pure reads of the work_ticket (no I/O, cannot fail). scope_target is
-    # dereferenced by the except handlers below, so it must be bound BEFORE the
-    # try. `action` is pre-bound to None and (re)assigned inside the try, so a
-    # fetch that fails or returns None still leaves the handlers a defined value
-    # to guard on (they check `action is not None`).
+    # Bound BEFORE the try because the except handlers below dereference these:
+    # scope_target unconditionally, `action`/`index` guarded. They are reads of
+    # the work_ticket, not step I/O — scope_target is the one that CAN raise (an
+    # unknown scope_target_kind), so keep `_build_scope_target` exhaustive with
+    # the qiita.scope_target_kind enum or a new kind strands its tickets here.
+    # `action` and `index` are pre-bound so a fetch/transition that fails before
+    # the loop still leaves the handlers a defined value (they guard
+    # `action is not None` and attribute a None index to the SUBMISSION stage).
     bound: dict[str, Any] = dict(work_ticket["action_context"] or {})
     scope_target = _build_scope_target(work_ticket)
     max_retries: int = work_ticket["max_retries"]
     workspace = work_ticket_workspace_root / str(work_ticket_idx)
     action: ActionDefinition | None = None
+    index: int | None = None
     uploads_to_consume: list[int] = []
 
     try:
@@ -729,8 +733,9 @@ async def run_workflow(
         # A failure before the step loop ran (index unbound) has no step to
         # attribute to — record it as SUBMISSION with a NULL step name, which
         # the failure-step-name CHECK requires. Only a failure from inside the
-        # loop is a STEP_RUN (index bound to the entry that raised).
-        _failed_index = locals().get("index")
+        # loop is a STEP_RUN (index is the entry that raised; it stays None until
+        # the loop's first iteration binds it).
+        _failed_index = index
         await _transition_to_failed(
             pool,
             work_ticket_idx,
@@ -1098,8 +1103,10 @@ async def _guarded_state_update(
 ) -> None:
     """Run a TOCTOU-safe work_ticket state UPDATE.
 
-    Applies `set_clause` (which references $1..$k for `set_params`) only when the
-    row's current state is one of `allowed_states`. If nothing matched, reads the
+    Applies `set_clause` only when the row's current state is one of
+    `allowed_states`. Coupling the caller MUST honour: `set_clause` references
+    exactly $1..$len(set_params); the helper appends the WHERE's $n+1
+    (work_ticket_idx) and $n+2 (allowed_states) after them. If nothing matched, reads the
     actual state and raises — surfacing a stuck/racing ticket loudly instead of
     silently overwriting it. `action` names the attempted transition in that
     error. Accepts a pool (transient connection) or a live Connection, so the
