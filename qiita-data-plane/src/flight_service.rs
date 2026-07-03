@@ -336,7 +336,18 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                let registered = register_files(&self.catalog_connstr, &self.data_path, &payload)?;
+                // register_files moves files and runs a blocking DuckLake
+                // transaction; run it on the blocking pool so it never starves a
+                // tonic async worker (mirrors export_read / count_masked). The
+                // closure opens and drops its own connection, so it is Send and
+                // crosses no await.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let registered = tokio::task::spawn_blocking(move || {
+                    register_files(&catalog, &data_path, &payload)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("register_files task join failed: {e}")))??;
 
                 let result_body = serde_json::to_vec(&serde_json::json!({
                     "registered": registered,
@@ -360,11 +371,20 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                let deleted = delete_reference(
-                    &self.catalog_connstr,
-                    &self.data_path,
-                    payload.reference_idx,
-                )?;
+                // Blocking DuckLake delete transaction — run it on the blocking
+                // pool so it never starves a tonic async worker (mirrors
+                // export_read / count_masked). The closure opens and drops its
+                // own connection, so it is Send and crosses no await.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let reference_idx = payload.reference_idx;
+                let deleted = tokio::task::spawn_blocking(move || {
+                    delete_reference(&catalog, &data_path, reference_idx)
+                })
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("delete_reference task join failed: {e}"))
+                })??;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -386,8 +406,18 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                let deleted =
-                    delete_mask(&self.catalog_connstr, &self.data_path, payload.mask_idx)?;
+                // Blocking DuckLake delete transaction — run it on the blocking
+                // pool so it never starves a tonic async worker (mirrors
+                // export_read / count_masked). The closure opens and drops its
+                // own connection, so it is Send and crosses no await.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let mask_idx = payload.mask_idx;
+                let deleted = tokio::task::spawn_blocking(move || {
+                    delete_mask(&catalog, &data_path, mask_idx)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("delete_mask task join failed: {e}")))??;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -409,11 +439,20 @@ impl FlightService for QiitaFlightService {
                     )));
                 }
 
-                let deleted = delete_pool_reads(
-                    &self.catalog_connstr,
-                    &self.data_path,
-                    &payload.prep_sample_idxs,
-                )?;
+                // Blocking DuckLake delete transaction — run it on the blocking
+                // pool so it never starves a tonic async worker (mirrors
+                // export_read / count_masked). The closure opens and drops its
+                // own connection, so it is Send and crosses no await.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let prep_sample_idxs = payload.prep_sample_idxs;
+                let deleted = tokio::task::spawn_blocking(move || {
+                    delete_pool_reads(&catalog, &data_path, &prep_sample_idxs)
+                })
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("delete_pool_reads task join failed: {e}"))
+                })??;
 
                 let result_body = serde_json::to_vec(&deleted)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
@@ -2294,18 +2333,28 @@ mod tests {
         let connstr = delete_test_catalog_connstr();
         let data_path = delete_test_data_path();
 
-        // Ensure the target table exists in the shared catalog.
-        {
-            let conn = Connection::open_in_memory().unwrap();
-            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
-            ducklake::ensure_reference_tables(&conn).unwrap();
-        }
-
         // Unique ids so leftover rows never collide with other serial tests.
         let ref_idx: i64 = 970_000;
         let feat_a: i64 = 970_010;
         let feat_b: i64 = 970_011;
-        let ticket: i64 = 970;
+        // Ticket-unique dest names come from work_ticket_idx (lake_dest_filename).
+        // Derive it from the PID so a manual re-run against a persistent catalog
+        // mints a fresh file name instead of colliding with the prior run's
+        // still-registered lake file (move_file refuses to overwrite). CI resets
+        // the catalog each run, so this only matters for local re-runs.
+        let ticket: i64 = 970_000_000 + std::process::id() as i64;
+
+        // Ensure the target table exists, and tombstone any rows a prior local
+        // run left behind so the post-register count reflects only this run.
+        {
+            let conn = Connection::open_in_memory().unwrap();
+            ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+            ducklake::ensure_reference_tables(&conn).unwrap();
+            conn.execute_batch(&format!(
+                "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
+            ))
+            .unwrap();
+        }
 
         // Seed a staging Parquet whose schema matches reference_membership
         // (two BIGINT columns) — written by DuckDB so the types match exactly.
@@ -2345,7 +2394,7 @@ mod tests {
         let dest = std::path::Path::new(&registered[0]);
         assert_eq!(
             dest.file_name().and_then(|f| f.to_str()).unwrap(),
-            "wt970-reference_membership.parquet"
+            lake_dest_filename(ticket, "reference_membership.parquet")
         );
         assert!(dest.exists(), "registered lake file present on disk");
         assert!(
@@ -2368,11 +2417,14 @@ mod tests {
             .unwrap();
         assert_eq!(n, 2, "both seeded membership rows registered");
 
-        // Best-effort cleanup: drop the catalog rows and the lake file.
+        // Best-effort cleanup: tombstone the catalog rows only. Do NOT remove
+        // the physical lake file — it stays registered in the DuckLake catalog
+        // until compaction, and unlinking a still-registered data file breaks
+        // any later full-table scan of reference_membership (e.g. the
+        // delete_reference orphan subquery) with a missing-file IO error.
         let _ = reader.execute_batch(&format!(
             "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
         ));
-        let _ = std::fs::remove_file(dest);
     }
 
     /// `export_read_to_parquet` writes one sample's full reads from the DuckLake

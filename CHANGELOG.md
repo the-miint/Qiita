@@ -533,6 +533,14 @@ the `no-changelog` label).
   not rolled back (dest names are ticket-unique and `move_file` refuses to
   overwrite, so a failure leaves only inert orphan Parquet). Adds end-to-end,
   filename-traversal, and do_action dispatch-trust tests. (#243)
+- **Data plane offloads blocking DoAction work off the async runtime.** The
+  `register_files` / `delete_reference` / `delete_mask` / `delete_pool_reads`
+  arms ran their blocking DuckLake transactions inline on the tonic async
+  worker; each now runs on `tokio::task::spawn_blocking` (mirroring
+  `export_read` / `count_masked`), so a long registration or delete can't starve
+  the async runtime and stall concurrent requests. Each helper opens and drops
+  its own DuckDB connection, so nothing non-`Send` crosses the task boundary.
+  (#243)
 - `qiita-admin masked-read-export` is now **re-runnable**: it creates `--output-dir`
   (with parents) if missing instead of erroring, and for parquet it skips a sample
   whose output file already exists when the count matches and overwrites it only
