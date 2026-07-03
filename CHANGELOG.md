@@ -541,6 +541,15 @@ the `no-changelog` label).
   the async runtime and stall concurrent requests. Each helper opens and drops
   its own DuckDB connection, so nothing non-`Send` crosses the task boundary.
   (#243)
+- **Data plane DoAction replay is a classified, tripwired accepted risk.** Flight
+  tickets have no single-use ledger, so a still-valid token can be replayed
+  within its lifetime; this is accepted because every DoAction is idempotent or
+  otherwise replay-safe. A new `REPLAY_SAFE_ACTIONS` registry now gates the
+  `do_action` dispatcher (an unlisted action is rejected), with a test pinning
+  the registry to the dispatcher's arms and an anchored `# replay:` comment — so
+  a newly-added action fails the build until it is consciously classified
+  replay-safe. Documented in `docs/auth.md#ticket-replay` and the CLAUDE.md
+  data-plane section. (#243)
 - `qiita-admin masked-read-export` is now **re-runnable**: it creates `--output-dir`
   (with parents) if missing instead of erroring, and for parquet it skips a sample
   whose output file already exists when the count matches and overwrites it only

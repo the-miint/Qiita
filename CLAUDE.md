@@ -241,6 +241,8 @@ The data plane is intentionally "dumb": it only operates on identifiers it recei
 
 **Flight ticket signing**: the control plane signs tickets with HMAC-SHA256 before handing them to clients. The data plane verifies signatures on every request — it never trusts the client's claimed identifiers directly.
 
+**Ticket replay is an accepted risk, and every DoAction must stay replay-safe.** Flight tickets have no single-use ledger (the data plane is stateless by design), so a still-valid ticket can be replayed within its ~1h lifetime. We accept this because every DoAction variant is idempotent or otherwise replay-safe. This invariant is enforced: the `REPLAY_SAFE_ACTIONS` registry in `qiita-data-plane/src/flight_service.rs` gates the `do_action` dispatcher (an unlisted action is rejected), a test pins the registry to the dispatcher's arms, and an anchored `# replay:` comment sits at the dispatch. When you add a DoAction, make it idempotent/replay-safe and add it to the registry — or, if it can't be, add replay protection before shipping. See [`docs/auth.md#ticket-replay`](docs/auth.md).
+
 **Result file requirements**: Parquet files written by SLURM jobs must be mode `440` (verified before registration) and must contain the identifier columns sorted in this exact order: `study_idx, prep_idx, sample_idx, prep_sample_idx, processing_idx, processed_prep_sample_idx`. This sort order enables both DuckLake catalog-level file pruning and Parquet row-group predicate pushdown.
 
 **Horizontal scaling**: each data plane instance holds an independent DuckDB+DuckLake connection to the shared Postgres catalog. DuckLake's snapshot isolation means instances never block each other. Add instances to `upstream qiita_data_plane` in nginx to scale.

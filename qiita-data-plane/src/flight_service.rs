@@ -209,6 +209,38 @@ const ALLOWED_FILTER_COLUMNS: &[&str] = &[
     "prep_sample_idx",
 ];
 
+/// DoAction variants that are safe to replay — the accepted-risk registry.
+///
+/// Flight action tokens are HMAC-authenticated but carry **no single-use
+/// ledger**: within a token's lifetime (bounded by `MAX_TICKET_LIFETIME`, ~1h)
+/// a captured, still-valid token can be replayed. We deliberately do NOT add a
+/// server-side nonce/consumed-token store — the operational cost of one is not
+/// justified because every action the data plane dispatches is idempotent or
+/// otherwise replay-safe (see `docs/auth.md#ticket-replay`):
+///
+/// - `register_files` — dest names are ticket-unique and `move_file` refuses to
+///   overwrite, so a replay after success fails closed (AlreadyExists), never a
+///   double-registration.
+/// - `delete_reference` / `delete_mask` / `delete_pool_reads` — logical DELETEs;
+///   re-running deletes zero rows.
+/// - `export_read` — re-materializes the same sample bytes to the same ticket
+///   path via atomic publish; a replay reproduces identical output.
+/// - `count_masked` — read-only.
+///
+/// The `do_action` dispatcher rejects any action not in this set, so a **new**
+/// action is refused until it is added here — forcing whoever adds it to
+/// consciously classify it idempotent/replay-safe or give it replay protection
+/// first. `replay_safe_actions_matches_dispatcher` in the tests pins the set to
+/// the dispatcher's handled arms so the two can't drift.
+const REPLAY_SAFE_ACTIONS: &[&str] = &[
+    "register_files",
+    "delete_reference",
+    "delete_mask",
+    "delete_pool_reads",
+    "export_read",
+    "count_masked",
+];
+
 #[tonic::async_trait]
 impl FlightService for QiitaFlightService {
     type HandshakeStream =
@@ -323,6 +355,22 @@ impl FlightService for QiitaFlightService {
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
         let action = request.into_inner();
+
+        // replay: Flight action tokens are HMAC-authenticated but have NO
+        // single-use ledger — a captured, still-valid token can be replayed
+        // within its lifetime. We accept that risk (see docs/auth.md and the
+        // REPLAY_SAFE_ACTIONS registry) because every arm below is idempotent or
+        // otherwise replay-safe. The registry is the gate: an action absent from
+        // it is rejected here, so a newly-added arm stays unreachable until it
+        // is consciously classified replay-safe (or given replay protection).
+        // Keep this set and the match arms in lockstep — the test
+        // `replay_safe_actions_matches_dispatcher` fails the build otherwise.
+        if !REPLAY_SAFE_ACTIONS.contains(&action.r#type.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "unknown action type: {:?}",
+                action.r#type
+            )));
+        }
 
         match action.r#type.as_str() {
             "register_files" => {
@@ -541,6 +589,9 @@ impl FlightService for QiitaFlightService {
                 let output = stream::once(futures::future::ready(Ok(result)));
                 Ok(Response::new(Box::pin(output)))
             }
+            // Unreachable: the replay-classification guard above rejects any
+            // action not in REPLAY_SAFE_ACTIONS before the match. Kept as a
+            // total-match fallback that fails closed rather than panicking.
             other => Err(Status::invalid_argument(format!(
                 "unknown action type: {other:?}"
             ))),
@@ -2316,6 +2367,47 @@ mod tests {
         };
         let err = match service.do_action(Request::new(action)).await {
             Ok(_) => panic!("unknown action type must be rejected"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// The replay-safe registry and the do_action dispatcher must stay in
+    /// lockstep. Every `REPLAY_SAFE_ACTIONS` entry reaches a real handler — it
+    /// then fails verifying the empty token body (`Unauthenticated`), NOT the
+    /// replay guard (`InvalidArgument`) — and an action outside the registry is
+    /// rejected by the guard. So a new match arm added without a registry entry
+    /// is unreachable and surfaces the moment it is exercised, forcing a
+    /// conscious replay classification (see the `# replay:` note in do_action).
+    #[tokio::test]
+    async fn replay_safe_actions_matches_dispatcher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let service = make_service(tmp.path().to_path_buf());
+
+        for name in REPLAY_SAFE_ACTIONS {
+            let action = Action {
+                r#type: name.to_string(),
+                body: Vec::<u8>::new().into(),
+            };
+            let err = match service.do_action(Request::new(action)).await {
+                Ok(_) => panic!("empty-body action {name:?} must fail"),
+                Err(e) => e,
+            };
+            assert_eq!(
+                err.code(),
+                tonic::Code::Unauthenticated,
+                "classified action {name:?} must be dispatched to a handler \
+                 (fail on token verification), not rejected as unknown"
+            );
+        }
+
+        // An action absent from the registry is turned away by the replay guard.
+        let bogus = Action {
+            r#type: "definitely_not_a_real_action".to_string(),
+            body: Vec::<u8>::new().into(),
+        };
+        let err = match service.do_action(Request::new(bogus)).await {
+            Ok(_) => panic!("unclassified action must be rejected"),
             Err(e) => e,
         };
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
