@@ -31,9 +31,9 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
-# Fixed advisory-lock key, distinct from the notify sweeper's (4_310_290_147),
-# so the two sweepers never collide. Only this sweeper uses it; a second CP
-# process fails to acquire it and skips its pass.
+# Fixed advisory-lock key, chosen distinct from every other in-process sweeper's
+# key so the sweepers never block each other. Only this sweeper uses it; a second
+# CP process fails to acquire it and skips its pass.
 _CLI_LOGIN_CODE_SWEEP_LOCK_KEY = 4_310_290_148
 
 
