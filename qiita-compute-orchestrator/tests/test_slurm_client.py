@@ -387,6 +387,25 @@ async def test_get_job_running_is_not_terminal(jwt_path):
 
 
 @pytest.mark.asyncio
+async def test_get_job_null_exit_code_does_not_raise(jwt_path):
+    """A response with exit_code JSON null (key present, value None) must parse
+    to exit_code=None, not raise AttributeError. `.get("exit_code", {})` only
+    defaults on an absent key, so a null value would otherwise break parsing
+    and escape the SlurmrestdError contract."""
+    job = {
+        "job_id": 12345,
+        "job_state": ["FAILED"],
+        "exit_code": None,
+        "state_reason": "None",
+    }
+    handler = httpx.MockTransport(lambda req: httpx.Response(200, json={"jobs": [job]}))
+    async with _client(handler, jwt_path) as client:
+        info = await client.get_job(12345)
+    assert info.state == "FAILED"
+    assert info.exit_code is None
+
+
+@pytest.mark.asyncio
 async def test_get_job_normalizes_string_None_reason(jwt_path):
     """SLURM's literal 'None' string for state_reason is normalized to
     Python None — callers shouldn't have to special-case it."""

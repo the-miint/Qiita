@@ -29,6 +29,8 @@ import secrets
 import time
 from urllib.parse import quote
 
+from qiita_common.hashing import canonical_json
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -61,7 +63,7 @@ def sign_login_cookie(payload: dict, secret: bytes) -> str:
     contain at least `{"state", "timestamp_ms"}`; routes also include
     `{"cli", "port"}` for the CLI flow.
     """
-    body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    body = canonical_json(payload)
     body_b64 = _b64u_encode(body)
     sig = hmac.new(secret, body_b64.encode(), hashlib.sha256).digest()
     sig_b64 = _b64u_encode(sig)

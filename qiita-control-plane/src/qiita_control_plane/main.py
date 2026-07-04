@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from qiita_common.log import install_authorization_scrub
 from qiita_common.models import HealthResponse, HealthStatus
 
+from .auth.cli_login_code_sweeper import run_cli_login_code_sweeper
 from .auth.oidc import AuthRocketVerifier
 from .config import Settings
 from .db import close_pool, get_pool
@@ -92,9 +93,22 @@ async def lifespan(app: FastAPI):
         name="notify_sweeper",
     )
 
+    # cli_login_code sweeper — deletes consumed/expired login codes so an
+    # abandoned CLI login doesn't leave a usable plaintext PAT at rest. Unlike
+    # the notify sweeper it holds its advisory lock only for a fast DELETE, so
+    # it shares the request pool (no dedicated connection needed). Registered on
+    # app.state so the GC can't drop it; cancelled in the shutdown finally.
+    app.state.cli_login_code_sweeper_task = asyncio.create_task(
+        run_cli_login_code_sweeper(app.state.pool, settings),
+        name="cli_login_code_sweeper",
+    )
+
     try:
         yield
     finally:
+        app.state.cli_login_code_sweeper_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await app.state.cli_login_code_sweeper_task
         app.state.notify_sweeper_task.cancel()
         with suppress(asyncio.CancelledError):
             await app.state.notify_sweeper_task

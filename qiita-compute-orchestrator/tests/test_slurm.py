@@ -89,6 +89,16 @@ def test_payload_resource_fields(common_kwargs, baseline):
     assert payload["job"]["time_limit"] == {"number": 120, "set": True, "infinite": False}
 
 
+def test_payload_rejects_gpu_request(common_kwargs):
+    """A gpu>0 request is rejected at submit: the payload emits no GRES, so
+    submitting would silently run the step without a GPU."""
+    common_kwargs["baseline_resources"] = BaselineResources(
+        cpu=4, mem_gb=8, walltime=timedelta(hours=2), gpu=1
+    )
+    with pytest.raises(ValueError, match="gpu"):
+        build_job_submit_payload(**common_kwargs)
+
+
 def test_payload_environment_includes_qiita_paths(common_kwargs):
     payload = build_job_submit_payload(**common_kwargs)
     env = dict(item.split("=", 1) for item in payload["job"]["environment"])

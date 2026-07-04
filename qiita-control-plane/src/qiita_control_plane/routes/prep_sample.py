@@ -119,6 +119,10 @@ async def set_prep_sample_retired_route(
         except asyncpg.RaiseError as exc:
             # Publication-lock trigger (or another P0001 guard) rejected the
             # UPDATE — a published prep_sample is frozen against shape changes.
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            # Return a stable message rather than the raw trigger text.
+            raise HTTPException(
+                status_code=409,
+                detail=f"prep_sample {prep_sample_idx} is published and cannot be modified",
+            ) from exc
         if not exists:
             raise HTTPException(status_code=404, detail=f"prep_sample {prep_sample_idx} not found")

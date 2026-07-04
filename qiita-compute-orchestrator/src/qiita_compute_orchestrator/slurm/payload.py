@@ -214,6 +214,15 @@ def build_job_submit_payload(
         raise ValueError("partition must be set on the orchestrator config")
     if not account:
         raise ValueError("account must be set on the orchestrator config")
+    if baseline_resources.gpu:
+        # BaselineResources carries a validated gpu field, but the payload emits
+        # no gres/tres, so a gpu>0 step would be submitted with no GPU and no
+        # error. Reject at submit (fail loud) until GRES support is implemented.
+        raise ValueError(
+            f"gpu={baseline_resources.gpu} requested but the SLURM payload emits no "
+            "GRES — GPU steps are not yet supported; reject rather than silently "
+            "run without a GPU"
+        )
 
     # QIITA_WORK_TICKET_IDX is mirrored from params.json so producers
     # that want to stamp output filenames or logs with the originating

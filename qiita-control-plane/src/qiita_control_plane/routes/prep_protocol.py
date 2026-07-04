@@ -10,7 +10,7 @@ them.
 """
 
 import asyncpg
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from qiita_common.api_paths import PATH_PREP_PROTOCOL_PREFIX, PATH_PREP_PROTOCOL_ROOT
 from qiita_common.models import PrepProtocolResponse
 
@@ -18,6 +18,12 @@ from ..auth.principal import Principal, get_current_principal
 from ..deps import get_db_pool
 
 router = APIRouter(prefix=PATH_PREP_PROTOCOL_PREFIX, tags=["prep-protocol"])
+
+# Backstop cap for the anonymous catalog list. The table is tiny (curated
+# protocols), so this never bites in practice; it bounds the worst-case payload
+# and is caller-overridable via ?limit=.
+_DEFAULT_LIST_LIMIT = 1000
+_MAX_LIST_LIMIT = 5000
 
 # The table's PK column is `idx`; alias it to the wire/consumer name so
 # `PrepProtocolResponse(**dict(row))` maps directly.
@@ -31,11 +37,14 @@ async def list_prep_protocols(
     pool: asyncpg.Pool = Depends(get_db_pool),
     _principal: Principal = Depends(get_current_principal),
     include_retired: bool = False,
+    limit: int = Query(default=_DEFAULT_LIST_LIMIT, ge=1, le=_MAX_LIST_LIMIT),
 ) -> list[PrepProtocolResponse]:
     """Anonymous-OK list of prep protocols, ordered by idx. Retired protocols
-    are excluded unless `include_retired=true`."""
+    are excluded unless `include_retired=true`. Bounded by `limit` (default
+    1000) so the anonymous endpoint can't be made to return an unbounded payload."""
     where = "" if include_retired else " WHERE retired = false"
     rows = await pool.fetch(
-        f"SELECT {_PREP_PROTOCOL_RETURNING} FROM qiita.prep_protocol{where} ORDER BY idx"
+        f"SELECT {_PREP_PROTOCOL_RETURNING} FROM qiita.prep_protocol{where} ORDER BY idx LIMIT $1",
+        limit,
     )
     return [PrepProtocolResponse(**dict(r)) for r in rows]

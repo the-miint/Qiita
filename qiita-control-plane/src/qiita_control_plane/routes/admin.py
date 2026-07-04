@@ -203,9 +203,13 @@ async def set_principal_disabled(
                     body.reason,
                 )
             except asyncpg.CheckViolationError as exc:
-                # principal_not_both_disabled_and_retired (race with retire) or
-                # principal_system_principal_always_active.
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
+                # Map the constraint to a stable client message rather than
+                # leaking the raw constraint identifier (schema internal).
+                if exc.constraint_name == "principal_system_principal_always_active":
+                    detail = "system principals cannot be disabled"
+                else:  # principal_not_both_disabled_and_retired (race with concurrent retire)
+                    detail = "principal cannot be disabled: it is retired"
+                raise HTTPException(status_code=409, detail=detail) from exc
         else:
             result = await conn.execute(
                 "UPDATE qiita.principal SET"
@@ -277,7 +281,13 @@ async def retire_principal(
                 body.reason,
             )
         except asyncpg.CheckViolationError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            # Map the constraint to a stable client message rather than leaking
+            # the raw constraint identifier (schema internal).
+            if exc.constraint_name == "principal_system_principal_always_active":
+                detail = "system principals cannot be retired"
+            else:  # principal_not_both_disabled_and_retired (race with a concurrent disable)
+                detail = "principal cannot be retired: it is disabled or was disabled concurrently"
+            raise HTTPException(status_code=409, detail=detail) from exc
 
         if rows_affected(result) == 0:
             row = await conn.fetchrow(

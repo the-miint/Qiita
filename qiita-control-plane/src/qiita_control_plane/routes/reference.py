@@ -20,7 +20,7 @@ from typing import Annotated
 import asyncpg
 import httpx
 import pyarrow.flight as _flight
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import Field
 from qiita_common.api_paths import (
     PATH_REFERENCE_BY_IDX,
@@ -78,6 +78,12 @@ router = APIRouter(prefix=PATH_REFERENCE_PREFIX, tags=["reference"])
 # aliased here so the existing in-file references read unchanged.
 _REFERENCE_RETURNING = REFERENCE_RETURNING
 
+# Backstop cap for the anonymous catalog list. The table is small (curated
+# reference databases), so this never bites in practice; it bounds the
+# worst-case payload and is caller-overridable via ?limit=.
+_DEFAULT_LIST_LIMIT = 1000
+_MAX_LIST_LIMIT = 5000
+
 _MSG_REFERENCE_NOT_FOUND = "Reference not found"
 
 
@@ -119,11 +125,13 @@ async def list_references(
     kind: ReferenceKind | None = None,
     is_host: bool | None = None,
     status: ReferenceStatus | None = None,
+    limit: int = Query(default=_DEFAULT_LIST_LIMIT, ge=1, le=_MAX_LIST_LIMIT),
 ) -> list[ReferenceResponse]:
     """Anonymous-OK list of references, optionally filtered by `kind`,
-    `is_host`, and `status`. Ordered by reference_idx. Row-level visibility
-    (e.g. hiding private references) is not yet implemented — same posture as
-    the single-reference GET."""
+    `is_host`, and `status`. Ordered by reference_idx, bounded by `limit`
+    (default 1000) so the anonymous endpoint can't be made to return an
+    unbounded payload. Row-level visibility (e.g. hiding private references) is
+    not yet implemented — same posture as the single-reference GET."""
     clauses: list[str] = []
     args: list[object] = []
     if kind is not None:
@@ -136,8 +144,10 @@ async def list_references(
         args.append(str(status))
         clauses.append(f"status = ${len(args)}")
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    args.append(limit)
     rows = await pool.fetch(
-        f"SELECT {_REFERENCE_RETURNING} FROM qiita.reference{where} ORDER BY reference_idx",
+        f"SELECT {_REFERENCE_RETURNING} FROM qiita.reference{where}"
+        f" ORDER BY reference_idx LIMIT ${len(args)}",
         *args,
     )
     return [ReferenceResponse(**dict(r)) for r in rows]
