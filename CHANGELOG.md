@@ -524,7 +524,7 @@ the `no-changelog` label).
   `DUCKLAKE_CATALOG_CONNSTR` / `PATH_SCRATCH`. A forgotten value used to silently
   root durable DuckLake Parquet under `/tmp` (lost on reboot, never backed up);
   the instance now refuses to start instead. `.env.data-plane.example` promotes
-  it to the required block. (#224)
+  it to the required block. (#246)
 - **Data plane `register_files` is now catalog-atomic.** The per-file
   `ducklake_add_data_files` registration loop is wrapped in a single DuckLake
   transaction (BEGIN/COMMIT/ROLLBACK), matching the `delete_*` actions — a
@@ -532,7 +532,7 @@ the `no-changelog` label).
   reference half-registered in the catalog. Filesystem moves are intentionally
   not rolled back (dest names are ticket-unique and `move_file` refuses to
   overwrite, so a failure leaves only inert orphan Parquet). Adds end-to-end,
-  filename-traversal, and do_action dispatch-trust tests. (#224)
+  filename-traversal, and do_action dispatch-trust tests. (#246)
 - **Data plane offloads blocking DoAction work off the async runtime.** The
   `register_files` / `delete_reference` / `delete_mask` / `delete_pool_reads`
   arms ran their blocking DuckLake transactions inline on the tonic async
@@ -540,7 +540,7 @@ the `no-changelog` label).
   `export_read` / `count_masked`), so a long registration or delete can't starve
   the async runtime and stall concurrent requests. Each helper opens and drops
   its own DuckDB connection, so nothing non-`Send` crosses the task boundary.
-  (#224)
+  (#246)
 - **Data plane DoPut writes Parquet off the async runtime.** The DoPut handler
   interleaved blocking Parquet write / `fsync` / `chmod` with awaiting the live
   Flight stream, running file I/O inline on the tonic async worker. It now
@@ -550,7 +550,7 @@ the `no-changelog` label).
   network when the writer falls behind, so peak memory stays bounded (same
   posture as the DoGet streaming path). Behavior (durability fsync, `create_new`
   concurrent-upload guard, partial-file cleanup on error, sha256/row-count
-  reporting) is unchanged. (#224)
+  reporting) is unchanged. (#246)
 - **Data plane DoAction replay is a classified, tripwired accepted risk.** Flight
   tickets have no single-use ledger, so a still-valid token can be replayed
   within its lifetime; this is accepted because every DoAction is idempotent or
@@ -559,7 +559,7 @@ the `no-changelog` label).
   the registry to the dispatcher's arms and an anchored `# replay:` comment — so
   a newly-added action fails the build until it is consciously classified
   replay-safe. Documented in `docs/auth.md#ticket-replay` and the CLAUDE.md
-  data-plane section. (#224)
+  data-plane section. (#246)
 - `qiita-admin masked-read-export` is now **re-runnable**: it creates `--output-dir`
   (with parents) if missing instead of erroring, and for parquet it skips a sample
   whose output file already exists when the count matches and overwrites it only
