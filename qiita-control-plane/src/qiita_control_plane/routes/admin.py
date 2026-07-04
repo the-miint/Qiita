@@ -668,14 +668,7 @@ async def export_masked_read_manifest(
         sequenced_pool_idx=sequenced_pool_idx,
         sequencing_run_idx=run_idx,
         mask_idx=mask_idx,
-        samples=[
-            MaskedReadExportSample(
-                prep_sample_idx=r["prep_sample_idx"],
-                biosample_accession=r["biosample_accession"],
-                mask_state=r["mask_state"],
-            )
-            for r in db_rows
-        ],
+        samples=[MaskedReadExportSample.model_validate(dict(r)) for r in db_rows],
     )
 
 

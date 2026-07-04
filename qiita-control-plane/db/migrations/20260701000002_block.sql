@@ -9,10 +9,10 @@
 -- COMPUTE unit (a block) from the ACCOUNTING unit (per-sample completion,
 -- reconciled afterward from the per-row columns the `read` data already
 -- carries). The core is deliberately WHY-agnostic — it records only WHAT a
--- block is (`block`) and which sample sub-ranges it covers (`block_member`).
--- The WHY (mask_idx) stays on qiita.work_ticket.mask_idx, so the same block
--- core is reusable by a future sequence-alignment consumer (which adds
--- reference_idx) without change.
+-- block is (`block`) and which sample sub-ranges it covers (`block_member`);
+-- the WHY (mask_idx) stays on qiita.work_ticket.mask_idx, not here. So nothing
+-- about a block presupposes read masking: any consumer that keys its own WHY off
+-- the work_ticket reuses this core unchanged.
 --
 -- `state` is an intentional TEXT + CHECK, not a Postgres ENUM: a block is an
 -- internal compute-lifecycle record with no Pydantic wire twin that needs a
@@ -43,9 +43,10 @@ CREATE TABLE qiita.block (
 COMMENT ON TABLE qiita.block IS
     'Compute unit for bulk-block read masking: a fixed ~10M-read slice from '
     'prep_samples sharing one mask_idx, run as one work ticket. WHY-agnostic '
-    'core (the mask_idx lives on qiita.work_ticket.mask_idx) so it is reusable '
-    'by future block consumers (e.g. sequence alignment). work_ticket_idx is '
-    'NULLABLE + back-filled to break the block↔ticket mint-ordering cycle.';
+    'core (the mask_idx lives on qiita.work_ticket.mask_idx, not here) so it '
+    'presupposes nothing about read masking and is reusable by any '
+    'work_ticket-keyed consumer. work_ticket_idx is NULLABLE + back-filled to '
+    'break the block↔ticket mint-ordering cycle.';
 
 COMMENT ON COLUMN qiita.block.work_ticket_idx IS
     'The work_ticket running this block. NULL between block mint and ticket '

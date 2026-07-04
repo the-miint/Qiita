@@ -795,7 +795,7 @@ async def _finalize_sample_metrics(
     `persist_read_metrics`, but sourced from the DuckLake `mask_metrics` aggregate
     (across all the sample's blocks) rather than a single local parquet.
 
-    Count assertion (§4.5): the total `read_mask` rows for `(prep_sample, mask)`
+    Count assertion: the total `read_mask` rows for `(prep_sample, mask)`
     must equal the sample's `sequence_range` count (`stop - start + 1`, one per
     read/pair). This runs only once the finalize gate has confirmed every covering
     block completed, so a mismatch is a real cover-map / masking defect (the

@@ -320,9 +320,32 @@ async def test_plan_disallow_resubmit_over_completed_mask(pooled, planapp):
     # Re-plan (only_missing=False) → refused, naming the completed sample.
     with pytest.raises(block_planner.BlockMaskResubmitError) as ei:
         await _plan(pooled, planapp)
-    assert ps in ei.value.completed_prep_sample_idxs
+    assert ps in ei.value.conflicting_prep_sample_idxs
 
     # only_missing=True → the completed sample is skipped, no error, nothing new.
+    second, _ = await _plan(pooled, planapp, only_missing=True)
+    assert second["samples_planned"] == 0
+    assert second["samples_skipped_existing"] == 1
+    assert second["blocks_created"] == 0
+
+
+async def test_plan_disallow_resubmit_over_pending_mask(pooled, planapp):
+    """A sample still PENDING for its resolved mask also cannot be re-planned on a
+    fresh (only_missing=False) plan: a prior plan's covering block is in-flight or
+    failed, and minting a fresh same-footprint block would wedge the sample's
+    finalize forever (has_incomplete_covering_block would keep seeing the stale
+    block). only_missing=False raises; only_missing=True resumes only the gap."""
+    ps = await pooled["add_sample"](reads=50)
+    # First plan leaves the sample's mask_sample gate PENDING (no reconcile).
+    await _plan(pooled, planapp)
+
+    # Re-plan (only_missing=False) → refused, naming the still-pending sample, so
+    # no duplicate covering block is minted.
+    with pytest.raises(block_planner.BlockMaskResubmitError) as ei:
+        await _plan(pooled, planapp)
+    assert ps in ei.value.conflicting_prep_sample_idxs
+
+    # only_missing=True → the pending sample is skipped, no error, nothing new.
     second, _ = await _plan(pooled, planapp, only_missing=True)
     assert second["samples_planned"] == 0
     assert second["samples_skipped_existing"] == 1

@@ -145,7 +145,7 @@ async def create_mask_sample_pending(
     NOTHING so re-planning the same partition does not error and — critically —
     does not resurrect a row already flipped to 'completed' back to 'pending'
     (DO NOTHING leaves the existing row untouched). The row is flipped to
-    'completed' at reconcile (Phase 4). Empty input is caller misuse.
+    'completed' at reconcile. Empty input is caller misuse.
     """
     require_transaction(conn)
     if not prep_sample_idxs:

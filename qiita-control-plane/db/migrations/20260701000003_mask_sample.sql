@@ -14,8 +14,8 @@
 -- mask_sample makes per-(mask_idx, prep_sample) completion a FIRST-CLASS state:
 -- materialized 'pending' when the planner tiles the sample into blocks, flipped
 -- 'completed' only when every covering block has finished and the per-sample
--- rollup is done (the reconcile step, Phase 4). Both the masked-read export
--- path and future alignment read this gate and consume only 'completed' samples.
+-- rollup is done (the reconcile step). Consumers of masked reads (the
+-- masked-read export path) read this gate and consume only 'completed' samples.
 --
 -- `state` is a deliberate TEXT + CHECK (no Postgres ENUM / Pydantic twin) — the
 -- gate has exactly two states and no wire surface, so it stays out of the

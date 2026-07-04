@@ -2410,13 +2410,14 @@ def _assert_pool_intent_matches(
         item_id = sample["sequenced_pool_item_id"]
         intent = sample.get("human_filtering")
         if intent is None:
-            sys.stderr.write(
+            print(
                 f"sequenced_pool {sequenced_pool_idx} has no stored"
                 f" preflight intent for sequenced_pool_item_id {item_id!r}"
                 f" (prep_sample {sample['prep_sample_idx']}); verify the pool"
-                " was created by submit-bcl-convert with its run preflight\n"
+                " was created by submit-bcl-convert with its run preflight",
+                file=sys.stderr,
             )
-            raise SystemExit(1)
+            sys.exit(1)
         if intent != applying_host_filter:
             mismatched.append(
                 f"  - sequenced_pool_item_id {item_id} (prep_sample"
@@ -2436,12 +2437,12 @@ def _assert_pool_intent_matches(
             + "\n".join(mismatched)
             + "\nSubmit the matching subset, re-run with the opposite"
             " host-reference choice, or pass --force to apply this pool-wide"
-            " choice anyway.\n"
+            " choice anyway."
         )
         if not force:
-            sys.stderr.write(header)
-            raise SystemExit(1)
-        sys.stderr.write("WARNING (--force): " + header)
+            print(header, file=sys.stderr)
+            sys.exit(1)
+        print("WARNING (--force): " + header, file=sys.stderr)
 
 
 def _handle_submit_host_filter_pool(
@@ -2524,11 +2525,12 @@ def _handle_submit_host_filter_pool(
         )
         samples = roster["samples"]
         if not samples:
-            sys.stderr.write(
+            print(
                 f"sequenced_pool {args.sequenced_pool_idx} has no active"
-                " sequenced_samples to process\n"
+                " sequenced_samples to process",
+                file=sys.stderr,
             )
-            raise SystemExit(1)
+            sys.exit(1)
 
         # Step 1.25: --only-missing drops samples that already carry a read-mask
         # ticket (any state), so a re-run fills only the gap left by a prior
@@ -2747,11 +2749,12 @@ def _handle_submit_block_mask_pool(
         )
         samples = roster["samples"]
         if not samples:
-            sys.stderr.write(
+            print(
                 f"sequenced_pool {args.sequenced_pool_idx} has no active"
-                " sequenced_samples to process\n"
+                " sequenced_samples to process",
+                file=sys.stderr,
             )
-            raise SystemExit(1)
+            sys.exit(1)
 
         # Step 1.5: intent-mismatch preflight over the whole active roster (shared
         # with submit-host-filter-pool). --only-missing is applied server-side, so

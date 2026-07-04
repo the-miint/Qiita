@@ -1,6 +1,7 @@
 """Schema-level invariants for the block-compute core.
 
-Locks in the shapes Phase 2 introduces for the bulk-block read-mask work:
+Locks in the shapes the block-compute migrations introduce for bulk-block
+read masking:
 
 * `qiita.block` — the generic, why-agnostic compute-unit record (one ~10M-read
   block = one work ticket), with a nullable back-filled `work_ticket_idx` and a
@@ -14,9 +15,10 @@ Locks in the shapes Phase 2 introduces for the bulk-block read-mask work:
 * `qiita.work_ticket.block_idx` — the `block` scope-target arm, its scope-target
   CHECK, and the `work_ticket_one_in_flight_per_block` partial unique index.
 
-These fail with a clear "is missing" message until the Phase 2 migrations land.
+These fail with a clear "is missing" message until the block migrations land.
 """
 
+import asyncpg
 import pytest
 
 pytestmark = pytest.mark.db
@@ -103,6 +105,15 @@ async def test_block_state_check(postgres_pool):
     joined = " ".join(defs.values())
     for state in ("pending", "processing", "completed", "failed"):
         assert state in joined, f"block.state CHECK is missing {state!r}: {defs}"
+
+
+async def test_block_state_check_rejects_bad_state(postgres_pool):
+    """The block.state CHECK actually rejects an out-of-set value at INSERT time,
+    not merely present in the catalog. block has no required FK (work_ticket_idx
+    is nullable), so a bare INSERT isolates the CHECK."""
+    async with postgres_pool.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute("INSERT INTO qiita.block (state) VALUES ('bogus')")
 
 
 async def test_block_work_ticket_idx_unique(postgres_pool):

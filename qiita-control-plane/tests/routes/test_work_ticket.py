@@ -2381,7 +2381,7 @@ async def test_reconcile_schedules_resume_for_non_terminal_only(
 
 
 # ---------------------------------------------------------------------------
-# GET /api/v1/work-ticket  (list / summary, Phase 6)
+# GET /api/v1/work-ticket  (list / summary)
 # ---------------------------------------------------------------------------
 
 

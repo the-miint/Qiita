@@ -144,10 +144,10 @@ _MASK_FILTER_WORKFLOW = "read-mask"
 _MASK_FILTER_VERSION = "1.0.0"
 
 # The action a block work_ticket is submitted against — the bulk-block masking
-# workflow (synced out-of-tree via `qiita-admin actions sync`; the YAML lands in
-# a later phase). Distinct from the mask filter identity above: the ticket runs
-# under "read-mask-block", but the mask it produces is minted under the shared
-# "read-mask" filter identity so it collapses with the per-sample path.
+# workflow (`workflows/read-mask-block/1.0.0.yaml`, synced out-of-tree via
+# `qiita-admin actions sync`). Distinct from the mask filter identity above: the
+# ticket runs under "read-mask-block", but the mask it produces is minted under
+# the shared "read-mask" filter identity so it collapses with the per-sample path.
 BLOCK_MASK_ACTION_ID = "read-mask-block"
 BLOCK_MASK_ACTION_VERSION = "1.0.0"
 
@@ -160,23 +160,31 @@ class AdapterMaterializationUnavailable(RuntimeError):
 
 
 class BlockMaskResubmitError(RuntimeError):
-    """One or more requested samples already have a COMPLETED `mask_sample` gate
-    for their resolved mask — re-planning would re-mask reads that are already
-    masked, double-writing `read_mask` rows (DuckLake has no uniqueness).
+    """One or more requested samples already carry a `mask_sample` gate for their
+    resolved mask, so a fresh (`only_missing=False`) plan is refused:
 
-    The block-compute analog of the sequenced_pool COMPLETED-resubmit rule: a
-    completed result requires an explicit DELETE before resubmission. The operator
+    - a COMPLETED gate → re-planning re-masks reads already masked, double-writing
+      `read_mask` rows (DuckLake has no uniqueness);
+    - a still-PENDING gate → a prior plan's covering block is in-flight or failed,
+      and minting a fresh same-footprint covering block would wedge the sample's
+      finalize forever (`has_incomplete_covering_block` keeps seeing the stale
+      non-completed block, so the gate never flips and the sample stays
+      non-exportable).
+
+    The block-compute analog of the sequenced_pool COMPLETED-resubmit rule: an
+    existing gate requires an explicit DELETE before resubmission. The operator
     either DELETEs the mask first (to genuinely re-mask) or passes
     `only_missing=true` to plan only the not-yet-gated samples. The route maps this
     to 409."""
 
-    def __init__(self, completed_prep_sample_idxs: list[int]):
-        self.completed_prep_sample_idxs = completed_prep_sample_idxs
+    def __init__(self, conflicting_prep_sample_idxs: list[int]):
+        self.conflicting_prep_sample_idxs = conflicting_prep_sample_idxs
         super().__init__(
-            f"{len(completed_prep_sample_idxs)} sample(s) already have a COMPLETED mask for "
-            "the resolved filtering config; re-planning would double-write their read_mask. "
-            "DELETE the mask first to re-mask, or pass only_missing=true to plan only the "
-            f"ungated samples. prep_sample_idxs: {completed_prep_sample_idxs}"
+            f"{len(conflicting_prep_sample_idxs)} sample(s) already have a read-mask gate "
+            "(pending or completed) for the resolved filtering config; a fresh plan would "
+            "double-write a completed mask or wedge an in-flight one. DELETE the mask first "
+            "to re-mask, or pass only_missing=true to plan only the ungated samples. "
+            f"prep_sample_idxs: {conflicting_prep_sample_idxs}"
         )
 
 
@@ -251,7 +259,8 @@ async def _enumerate_pool_samples(
     prep_samples are excluded too (`ps.retired = false`), matching the per-sample
     roster query fetch_sequenced_pool_samples that submit-host-filter-pool + the
     pool status endpoints use — the block plan must not re-mask a retired sample.
-    Ordered by sequence_idx_start so the tiling tape is deterministic."""
+    Unordered: `tile_partition` sorts by sequence_idx_start itself, so it owns the
+    tiling determinism and a producer-side ORDER BY would be redundant DB work."""
     rows = await conn.fetch(
         "SELECT ss.prep_sample_idx, ps.prep_protocol_idx,"
         "       sr.sequence_idx_start, sr.sequence_idx_stop"
@@ -259,8 +268,7 @@ async def _enumerate_pool_samples(
         "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
         "  JOIN qiita.sequence_range sr ON sr.prep_sample_idx = ss.prep_sample_idx"
         " WHERE ss.sequenced_pool_idx = $1"
-        "   AND ps.retired = false"
-        " ORDER BY sr.sequence_idx_start",
+        "   AND ps.retired = false",
         sequenced_pool_idx,
     )
     return [
@@ -377,24 +385,31 @@ async def plan_and_submit_blocks(
         to_plan = [s for s in all_samples if s.prep_sample_idx not in gated_prep_sample_idxs]
         skipped_existing = len(all_samples) - len(to_plan)
 
-    # disallow-without-delete: refuse to re-plan a sample already COMPLETED for
-    # its resolved mask — re-masking double-writes its read_mask (DuckLake has no
-    # uniqueness), and the sample is already exportable. Mirrors the sequenced_pool
-    # COMPLETED-resubmit gate. `only_missing` already dropped ALL gated samples
-    # above (pending or completed), so this fires only when only_missing is False
-    # (a fresh plan over a pool that was already block-masked). One batched query
-    # over the (mask_idx, prep_sample_idx) pairs; a genuine re-mask DELETEs first.
+    # disallow-without-delete: on a fresh plan (only_missing=False) refuse to
+    # re-plan ANY sample that already carries a mask_sample gate for its resolved
+    # mask — regardless of the gate's state:
+    #   - COMPLETED → re-masking double-writes its read_mask (DuckLake has no
+    #     uniqueness), and the sample is already exportable.
+    #   - PENDING → a prior plan's covering block is in-flight or failed; minting a
+    #     fresh same-footprint block would wedge the sample's finalize forever
+    #     (has_incomplete_covering_block keeps seeing the stale non-completed block,
+    #     so the gate never flips). `create_mask_sample_pending` is ON CONFLICT DO
+    #     NOTHING and each plan mints new block_idxes, so nothing else stops the dup.
+    # Mirrors the sequenced_pool COMPLETED-resubmit gate. `only_missing` already
+    # dropped ALL gated samples above (pending or completed), so this fires only
+    # when only_missing is False (a fresh plan over an already-block-masked pool).
+    # One batched query over the (mask_idx, prep_sample_idx) pairs; a genuine
+    # re-mask DELETEs first, an interrupted plan resumes with only_missing=true.
     if to_plan:
-        completed = await pool.fetch(
+        conflicting = await pool.fetch(
             "SELECT ms.prep_sample_idx FROM qiita.mask_sample ms"
             "  JOIN unnest($1::bigint[], $2::bigint[]) AS t(mask_idx, prep_sample_idx)"
-            "    ON ms.mask_idx = t.mask_idx AND ms.prep_sample_idx = t.prep_sample_idx"
-            " WHERE ms.state = 'completed'",
+            "    ON ms.mask_idx = t.mask_idx AND ms.prep_sample_idx = t.prep_sample_idx",
             [mask_by_protocol[s.prep_protocol_idx] for s in to_plan],
             [s.prep_sample_idx for s in to_plan],
         )
-        if completed:
-            raise BlockMaskResubmitError(sorted(r["prep_sample_idx"] for r in completed))
+        if conflicting:
+            raise BlockMaskResubmitError(sorted(r["prep_sample_idx"] for r in conflicting))
 
     # Partition the to-plan samples by resolved mask_idx.
     partitions: dict[int, list[_PlanSample]] = {}

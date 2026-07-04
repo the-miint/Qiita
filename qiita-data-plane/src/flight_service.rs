@@ -3387,7 +3387,7 @@ mod tests {
         );
     }
 
-    // --- Phase 1b: pushdown performance assessment helpers/tests ------------
+    // --- pushdown performance assessment helpers/tests ----------------------
 
     /// Write one per-sample `read` Parquet (matching the durable ingest layout:
     /// one file per prep_sample, sorted by sequence_idx, small row groups so
@@ -3449,7 +3449,7 @@ mod tests {
         total
     }
 
-    /// PERFORMANCE ASSESSMENT (Phase 1b): prove the block export prunes to the
+    /// PERFORMANCE ASSESSMENT: prove the block export prunes to the
     /// block's own files and that the pruning is INVARIANT as the `read` table
     /// grows — i.e. a block's cost is bounded by the block, not the table size.
     /// Assumes a fresh catalog (CI resets `qiita_ducklake` before the Rust tier).

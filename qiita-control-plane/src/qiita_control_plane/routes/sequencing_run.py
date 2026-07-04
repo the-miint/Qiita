@@ -710,13 +710,15 @@ async def submit_block_mask_plan(
             block_action_version=block_planner.BLOCK_MASK_ACTION_VERSION,
         )
     except block_planner.BlockMaskResubmitError as exc:
-        # A COMPLETED sample would be re-masked (read_mask double-write). Mirror
-        # the pool COMPLETED-resubmit 409: DELETE the mask or pass only_missing.
+        # A sample already gated for the resolved mask would be re-masked
+        # (completed → read_mask double-write) or wedged (pending → duplicate
+        # covering block). Mirror the pool resubmit 409: DELETE the mask or pass
+        # only_missing.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
                 "reason": str(exc),
-                "completed_prep_sample_idxs": exc.completed_prep_sample_idxs,
+                "conflicting_prep_sample_idxs": exc.conflicting_prep_sample_idxs,
             },
         ) from exc
     return BlockMaskPlanResponse(**summary)

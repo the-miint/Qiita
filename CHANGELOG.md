@@ -42,8 +42,8 @@ the `no-changelog` label).
   `scope_target_kind` value (Python twin `ScopeTargetKind.BLOCK` +
   `BlockScopeTarget`), and a `work_ticket_one_in_flight_per_block` partial unique
   index. New `repositories/block.py` (`create_block`, `add_block_members`,
-  `set_block_state`, `set_block_work_ticket`, `create_mask_sample_pending`). No
-  caller yet (the planner + runner wire in later phases). (#243)
+  `set_block_state`, `set_block_work_ticket`, `create_mask_sample_pending`). The
+  planner and runner that drive these are in this same PR (below). (#243)
 - **Block planner + `submit-block-mask-pool` — plan a whole pool as fixed
   ~10M-read blocks in one call.** The bulk-block analog of the per-sample
   `submit-host-filter-pool` fan-out. A new server-side planner
@@ -58,9 +58,9 @@ the `no-changelog` label).
   `prep_sample:write`, `BlockMaskPlan{Request,Response}` models) and the
   `qiita submit-block-mask-pool` CLI, which reuses the same host-ref /
   intent-mismatch preflight as `submit-host-filter-pool` (factored into a shared
-  helper) but makes a single call instead of N. No caller reaches the block
-  runner path or the `read-mask-block` workflow yet (later phases); no new env
-  var, migration, or scope. (#243)
+  helper) but makes a single call instead of N. The block runner path and
+  `read-mask-block` workflow that execute the dispatched tickets are in this same
+  PR (below); no new env var, migration, or scope. (#243)
 - **Block runner path — `read-mask-block/1.0.0` workflow + reconcile.** Wires the
   block tickets the planner mints (previously they `RuntimeError`ed): the runner
   gains a `block` scope arm that binds `reads` from the block's `block_member`
@@ -92,11 +92,13 @@ the `no-changelog` label).
   export manifest (`GET …/masked-read-export`) surfaces each sample's `mask_state`
   (`MaskedReadExportSample.mask_state`) so the CLI reports skips before minting
   tickets. The block planner (`plan_and_submit_blocks`) refuses (409, new
-  `BlockMaskResubmitError`) to re-plan a pool whose samples are already COMPLETED
-  for the resolved mask — re-masking double-writes `read_mask` (DuckLake has no
-  uniqueness); the operator DELETEs the mask or passes `only_missing=true`
-  (mirrors the sequenced_pool COMPLETED-resubmit rule). No new env var,
-  migration, scope, or operator action. (#243)
+  `BlockMaskResubmitError`) a fresh (`only_missing=False`) re-plan of a pool whose
+  samples already carry a `mask_sample` gate for the resolved mask — whether
+  COMPLETED (re-masking double-writes `read_mask`; DuckLake has no uniqueness) or
+  still PENDING (a prior plan's covering block is in-flight or failed, so minting
+  a fresh same-footprint block would wedge finalize forever); the operator DELETEs
+  the mask or passes `only_missing=true` (mirrors the sequenced_pool
+  resubmit rule). No new env var, migration, scope, or operator action. (#243)
 - **Idempotent block replace — `delete_read_mask_block` DoAction + `delete-block-mask`
   workflow step.** Makes a block re-run self-cleaning so `read_mask` never
   double-counts (DuckLake is append-only with no unique key). The new

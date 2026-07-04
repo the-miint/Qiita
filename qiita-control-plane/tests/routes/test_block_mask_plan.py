@@ -4,7 +4,7 @@ the bulk-block read-masking entrypoint.
 Covers the HTTP wiring (request → planner → response model), the auth gate
 (wet_lab_admin + prep_sample:write), the 503 when the block workflow isn't yet
 synced, and the model-level minimap2⇒rype validation. The tiling / persistence
-logic itself is exercised in tests/test_block_plan.py; here the wiring + gates.
+logic itself is exercised by the planner unit tests; here the wiring + gates.
 
 schedule_dispatch is monkeypatched to a recorder (no orchestrator hop) and the
 shared app is given a stub compute_backend_client + Settings (adapter reference
@@ -218,7 +218,8 @@ async def test_block_mask_plan_resubmit_over_completed_409(ctx, planned):
 
     resp = await ctx["wet"].post(_url(planned), json={})
     assert resp.status_code == 409, resp.text
-    assert set(resp.json()["detail"]["completed_prep_sample_idxs"]) == set(planned["prep_samples"])
+    conflicting = resp.json()["detail"]["conflicting_prep_sample_idxs"]
+    assert set(conflicting) == set(planned["prep_samples"])
 
     ok = await ctx["wet"].post(_url(planned), json={"only_missing": True})
     assert ok.status_code == 202, ok.text
