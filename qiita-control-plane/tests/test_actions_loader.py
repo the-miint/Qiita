@@ -703,6 +703,82 @@ def test_load_actions_loads_on_disk_bcl_convert_yaml():
     assert bcl.context_schema["properties"]["sample_map"]["type"] == "array"
 
 
+def test_load_actions_loads_on_disk_read_mask_block_yaml():
+    """The on-disk `workflows/read-mask-block/1.0.0.yaml` loads as a valid
+    ActionDefinition with the block-compute shape:
+
+      * target_kind block, and NO target_processing_kinds (the loader/DB CHECK
+        reject that field for a non-prep_sample target_kind);
+      * steps qc → host_filter → delete-block-mask → register-files →
+        reconcile-block — delete-block-mask clears this block's read_mask
+        footprint before register-files re-writes it (idempotent block replace),
+        and reconcile runs AFTER register-files (it reads the PERSISTED DuckLake
+        aggregate across all a sample's blocks, unlike read-mask's
+        persist-read-metrics which reads the local parquet BEFORE register-files);
+      * host_filter threads mask_idx via params (signals the runner to bind the
+        ticket's plan-time mask_idx); delete-block-mask and reconcile-block have
+        no file inputs/outputs;
+      * admin-only audience + prep_sample:write, same as read-mask;
+      * the action_id/version match the planner's BLOCK_MASK_ACTION_* constants
+        (the planner mints block tickets against these literals — a drift would
+        submit tickets against a non-existent action)."""
+    from pathlib import Path
+
+    from qiita_common.auth_constants import SystemRole
+    from qiita_common.models import ScopeTargetKind
+
+    from qiita_control_plane.actions import load_actions
+    from qiita_control_plane.block_planner import (
+        BLOCK_MASK_ACTION_ID,
+        BLOCK_MASK_ACTION_VERSION,
+    )
+
+    repo_root = Path(__file__).resolve().parents[2]
+    by_id = {a.action_id: a for a in load_actions(repo_root / "workflows")}
+    assert "read-mask-block" in by_id, "workflows/read-mask-block/1.0.0.yaml must load"
+    rmb = by_id["read-mask-block"]
+
+    assert rmb.target_kind == ScopeTargetKind.BLOCK
+    assert rmb.target_processing_kinds == []
+    assert rmb.scopes == ["prep_sample:write"]
+    assert rmb.audience.service is False
+    assert set(rmb.audience.human_roles) == {SystemRole.WET_LAB_ADMIN, SystemRole.SYSTEM_ADMIN}
+
+    assert [s.name for s in rmb.steps] == [
+        "qc",
+        "host_filter",
+        "delete-block-mask",
+        "register-files",
+        "reconcile-block",
+    ]
+    step_names = [s.name for s in rmb.steps]
+    # delete-block-mask (idempotent block replace) must run BEFORE register-files,
+    # so a re-run clears the prior footprint before the fresh rows land.
+    assert step_names.index("delete-block-mask") < step_names.index("register-files")
+    # reconcile-block must run AFTER register-files (reads DuckLake, not the local
+    # parquet) — the inverse of read-mask's persist-read-metrics ordering.
+    assert step_names.index("register-files") < step_names.index("reconcile-block")
+
+    host_filter = next(s for s in rmb.steps if s.name == "host_filter")
+    assert host_filter.module == "qiita_compute_orchestrator.jobs.host_filter"
+    assert host_filter.inputs == ["reads", "qc_mask"]
+    assert host_filter.optional_inputs == ["host_rype_path", "host_minimap2_path"]
+    assert host_filter.params == {"mask_idx": "mask_idx"}
+
+    delete_block = next(s for s in rmb.steps if s.name == "delete-block-mask")
+    assert delete_block.inputs == []
+    assert delete_block.outputs == []
+
+    reconcile = next(s for s in rmb.steps if s.name == "reconcile-block")
+    assert reconcile.inputs == []
+    assert reconcile.outputs == []
+
+    # The planner mints block tickets against these literals; a YAML id/version
+    # drift without the planner following would submit against a missing action.
+    assert BLOCK_MASK_ACTION_ID == rmb.action_id == "read-mask-block"
+    assert BLOCK_MASK_ACTION_VERSION == rmb.version == "1.0.0"
+
+
 def test_load_actions_handles_two_versions_of_same_action(tmp_path):
     """Different versions of the same action_id are distinct rows, not
     duplicates."""

@@ -96,6 +96,19 @@ class LibraryPrimitive(StrEnum):
     REGISTER_INDEX = "register-index"
     PERSIST_READ_METRICS = "persist-read-metrics"
     PERSIST_QC_REPORT = "persist-qc-report"
+    # Block-compute: idempotent block replace. Runs immediately BEFORE
+    # register-files in the bulk-block read-mask workflow — deletes this block's
+    # exact read_mask footprint (its member sub-ranges under the ticket's
+    # mask_idx) so a re-run deletes-then-re-registers without double-counting. On
+    # a fresh block it deletes 0 rows. See
+    # qiita_control_plane.actions.library.delete_read_mask_block_data.
+    DELETE_READ_MASK_BLOCK = "delete-block-mask"
+    # Block-compute: the bulk-block read-mask workflow's terminal step. Marks the
+    # block completed, then finalizes each covered sample once ALL its covering
+    # blocks are done (the per-sample rollup the per-sample path did via
+    # persist-read-metrics, gated on block completion so a partially-masked sample
+    # never finalizes). See qiita_control_plane.actions.library.reconcile_block.
+    RECONCILE_BLOCK = "reconcile-block"
 
 
 # =============================================================================
@@ -414,6 +427,15 @@ PATH_SEQUENCED_POOL_QC_REPORT = (
 PATH_SEQUENCED_POOL_COMPLETION = (
     "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/completion"
 )
+# POST action: plan + submit the pool's bulk-block read masking. One call tiles
+# the pool's samples into fixed ~10M-read blocks (partitioned by mask identity),
+# persists the block cover-map + per-sample completion gate, and dispatches one
+# block work ticket per block. A verb sub-path (not a resource) — it is a
+# server-side command (resolve masks -> tile -> persist -> dispatch), replacing
+# the per-sample fan-out of the CLI's submit-host-filter-pool.
+PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN = (
+    "/{sequencing_run_idx}/sequenced-pool/{sequenced_pool_idx}/block-mask-plan"
+)
 
 URL_SEQUENCING_RUN_PREFIX = f"{API_PREFIX}{PATH_SEQUENCING_RUN_PREFIX}"
 URL_SEQUENCING_RUN_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCING_RUN_BY_IDX}"
@@ -430,6 +452,9 @@ URL_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE = (
 URL_SEQUENCED_POOL_BY_IDX = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_BY_IDX}"
 URL_SEQUENCED_POOL_QC_REPORT = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_QC_REPORT}"
 URL_SEQUENCED_POOL_COMPLETION = f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_COMPLETION}"
+URL_SEQUENCED_POOL_BLOCK_MASK_PLAN = (
+    f"{URL_SEQUENCING_RUN_PREFIX}{PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN}"
+)
 
 
 # =============================================================================

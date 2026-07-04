@@ -612,12 +612,17 @@ _EXPORT_TICKET_TTL_SECONDS = 3600
 # Roster of a sequenced_pool's non-retired samples to export: the prep_sample_idx
 # (the read_masked join key) + biosample_accession (the filename's leading part;
 # NULL until NCBI submission, surfaced so the export fails loudly rather than
-# silently dropping the sample). The pool-wide run/pool idxs live on the manifest.
+# silently dropping the sample) + the per-(mask_idx, prep_sample) completion gate
+# state (LEFT JOIN mask_sample — NULL when no block-mask gate row exists, i.e. the
+# per-sample read-mask path or an unmasked sample). The pool-wide run/pool idxs
+# live on the manifest. `$2` is the mask_idx the manifest is scoped to.
 _MASKED_EXPORT_ROSTER_SQL = (
-    "SELECT ss.prep_sample_idx, bs.biosample_accession"
+    "SELECT ss.prep_sample_idx, bs.biosample_accession, msamp.state AS mask_state"
     "  FROM qiita.sequenced_sample ss"
     "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
     "  JOIN qiita.biosample bs ON bs.idx = ps.biosample_idx"
+    "  LEFT JOIN qiita.mask_sample msamp"
+    "    ON msamp.prep_sample_idx = ss.prep_sample_idx AND msamp.mask_idx = $2"
     " WHERE ss.sequenced_pool_idx = $1 AND ps.retired = false"
     " ORDER BY ss.prep_sample_idx"
 )
@@ -658,24 +663,19 @@ async def export_masked_read_manifest(
     if mask_exists is None:
         raise HTTPException(status_code=404, detail=f"no mask_definition with mask_idx={mask_idx}")
 
-    db_rows = await pool.fetch(_MASKED_EXPORT_ROSTER_SQL, sequenced_pool_idx)
+    db_rows = await pool.fetch(_MASKED_EXPORT_ROSTER_SQL, sequenced_pool_idx, mask_idx)
     return MaskedReadExportManifest(
         sequenced_pool_idx=sequenced_pool_idx,
         sequencing_run_idx=run_idx,
         mask_idx=mask_idx,
-        samples=[
-            MaskedReadExportSample(
-                prep_sample_idx=r["prep_sample_idx"],
-                biosample_accession=r["biosample_accession"],
-            )
-            for r in db_rows
-        ],
+        samples=[MaskedReadExportSample.model_validate(dict(r)) for r in db_rows],
     )
 
 
 @router.post(PATH_ADMIN_MASKED_READ_EXPORT_TICKET, status_code=201)
 async def create_masked_read_export_ticket(
     body: MaskedReadExportTicketRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
     hmac_secret: bytes = Depends(get_hmac_secret),
     _role: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.ADMIN_MASKED_READ_EXPORT)),
@@ -691,6 +691,14 @@ async def create_masked_read_export_ticket(
     empty-filter path would otherwise dump every sample's pass reads. Minted at
     the 3600 s max (the data plane's ceiling; expiry is checked only at DoGet
     initiation, so it never bounds the download).
+
+    Completion gate (block-masked samples): if a `qiita.mask_sample` row exists
+    for this `(mask_idx, prep_sample)` and is NOT 'completed', the sample's mask
+    is assembled by several blocks and at least one is still in flight — its
+    read_mask is PARTIAL, so a pull would silently truncate. Refuse with 409. A
+    sample with NO mask_sample row (the per-sample read-mask path, or unmasked) is
+    unaffected: that path writes a sample's read_mask all-or-nothing, so absence
+    preserves the old guarantee and the ticket is minted.
     """
     filter_ = {
         "prep_sample_idx": [body.prep_sample_idx],
@@ -700,6 +708,27 @@ async def create_masked_read_export_ticket(
         raise HTTPException(
             status_code=422,
             detail="masked-read export ticket requires a non-empty prep_sample_idx and mask_idx",
+        )
+
+    mask_state = await pool.fetchval(
+        "SELECT state FROM qiita.mask_sample WHERE mask_idx = $1 AND prep_sample_idx = $2",
+        body.mask_idx,
+        body.prep_sample_idx,
+    )
+    if mask_state is not None and mask_state != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "reason": (
+                    "the sample's block-mask is not yet complete "
+                    f"(mask_sample.state={mask_state!r}); a covering block is still in "
+                    "flight, so its read_mask is partial. Refusing to export a "
+                    "partially-masked sample — retry once reconcile marks it completed."
+                ),
+                "prep_sample_idx": body.prep_sample_idx,
+                "mask_idx": body.mask_idx,
+                "mask_state": mask_state,
+            },
         )
 
     ticket_bytes = sign_ticket(

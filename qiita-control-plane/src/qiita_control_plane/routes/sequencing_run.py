@@ -36,9 +36,10 @@ from typing import Annotated, Any
 
 import asyncpg
 import pyarrow.flight as _flight
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import Field
 from qiita_common.api_paths import (
+    PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN,
     PATH_SEQUENCED_POOL_BY_IDX,
     PATH_SEQUENCED_POOL_COMPLETION,
     PATH_SEQUENCED_POOL_PREFLIGHT,
@@ -52,6 +53,8 @@ from qiita_common.api_paths import (
 )
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
+    BlockMaskPlanRequest,
+    BlockMaskPlanResponse,
     PoolCompletionStatus,
     PoolQCReport,
     PoolReadMetrics,
@@ -71,6 +74,7 @@ from qiita_common.models import (
     merge_qc_reports,
 )
 
+from .. import block_planner
 from ..actions.library import delete_pool_reads_data
 from ..actions.sequenced_pool import (
     PreflightNotEditable,
@@ -602,6 +606,122 @@ async def get_sequenced_pool_completion(
         samples_failed=row["samples_failed"],
         samples_not_submitted=row["samples_not_submitted"],
     )
+
+
+@router.post(PATH_SEQUENCED_POOL_BLOCK_MASK_PLAN, status_code=status.HTTP_202_ACCEPTED)
+async def submit_block_mask_plan(
+    sequencing_run_idx: Annotated[int, Field(gt=0)],
+    sequenced_pool_idx: Annotated[int, Field(gt=0)],
+    body: BlockMaskPlanRequest,
+    request: Request,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human),
+    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_WRITE)),
+    _role: Principal = Depends(require_role_at_least(SystemRole.WET_LAB_ADMIN)),
+    _run_exists: None = Depends(require_sequencing_run_exists),
+    _pool_in_run: None = Depends(require_sequenced_pool_in_run),
+    hmac_secret: bytes = Depends(get_hmac_secret),
+    data_plane_url: str = Depends(get_data_plane_url),
+    staging_root: Path | None = Depends(get_scratch_staging),
+) -> BlockMaskPlanResponse:
+    """Plan + submit the pool's bulk-block read masking in ONE call — the
+    block-compute analog of the per-sample submit-host-filter-pool fan-out.
+
+    Resolves each sample's `mask_idx` (shared identity with per-sample read-mask),
+    partitions by mask, tiles each partition into fixed ~10M-read blocks, persists
+    the `block`/`block_member` cover-map + a PENDING `mask_sample` gate per sample,
+    creates one block work_ticket per block, and dispatches each. Returns the plan
+    (blocks + tickets + partition/sample counts) with HTTP 202; a pool with
+    nothing to do returns 202 with zero counts.
+
+    Same gate as the pool read/QC endpoints — a HumanUser with
+    `Scope.PREP_SAMPLE_WRITE` at system_role ≥ wet_lab_admin (host filtering / QC
+    is a privileged lab operation; matches the read-mask audience).
+    `require_sequenced_pool_in_run` fronts 404 (no such pool) / 422 (pool not
+    under this run). Host-ref coherence (minimap2⇒rype) is validated on the model.
+    """
+    # Dispatch is fire-and-forget in-process; refuse if the orchestrator hop is
+    # unconfigured rather than minting blocks whose tickets can never run.
+    if request.app.state.compute_backend_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="compute orchestrator not configured (COMPUTE_ORCHESTRATOR_URL unset)",
+        )
+
+    # The block workflow ships out-of-tree (qiita-admin actions sync). If it is
+    # not yet registered the ticket INSERT would FK-violate mid-plan; front it
+    # with a clear 503 so the operator syncs actions rather than seeing a 500.
+    action_enabled = await pool.fetchval(
+        "SELECT enabled FROM qiita.action WHERE action_id = $1 AND version = $2",
+        block_planner.BLOCK_MASK_ACTION_ID,
+        block_planner.BLOCK_MASK_ACTION_VERSION,
+    )
+    if action_enabled is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                f"block-mask workflow "
+                f"({block_planner.BLOCK_MASK_ACTION_ID}/{block_planner.BLOCK_MASK_ACTION_VERSION})"
+                " is not registered; run `qiita-admin actions sync`"
+            ),
+        )
+    if not action_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail=(
+                f"block-mask workflow "
+                f"({block_planner.BLOCK_MASK_ACTION_ID}/{block_planner.BLOCK_MASK_ACTION_VERSION})"
+                " is deprecated"
+            ),
+        )
+
+    # The mask identity folds in a hash of the canonical adapter set to exactly
+    # match the per-sample read-mask mint (so the two collapse to one mask_idx).
+    # The planner helper decides inclusion the same way the runner does — gated on
+    # the read-mask workflow declaring adapter_parquet AND a default reference
+    # being configured — and materializes it once (a data-plane hop) only then.
+    try:
+        adapter_set_hash = await block_planner.resolve_block_mask_adapter_hash(
+            pool,
+            default_adapter_reference_idx=request.app.state.settings.default_adapter_reference_idx,
+            data_plane_url=data_plane_url,
+            hmac_secret=hmac_secret,
+            staging_root=staging_root,
+            sequencing_run_idx=sequencing_run_idx,
+            sequenced_pool_idx=sequenced_pool_idx,
+        )
+    except block_planner.AdapterMaterializationUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+
+    try:
+        summary = await block_planner.plan_and_submit_blocks(
+            pool,
+            app=request.app,
+            sequencing_run_idx=sequencing_run_idx,
+            sequenced_pool_idx=sequenced_pool_idx,
+            host_rype_reference_idx=body.host_rype_reference_idx,
+            host_minimap2_reference_idx=body.host_minimap2_reference_idx,
+            only_missing=body.only_missing,
+            adapter_set_hash=adapter_set_hash,
+            originator_principal_idx=user.principal_idx,
+            block_action_id=block_planner.BLOCK_MASK_ACTION_ID,
+            block_action_version=block_planner.BLOCK_MASK_ACTION_VERSION,
+        )
+    except block_planner.BlockMaskResubmitError as exc:
+        # A sample already gated for the resolved mask would be re-masked
+        # (completed → read_mask double-write) or wedged (pending → duplicate
+        # covering block). Mirror the pool resubmit 409: DELETE the mask or pass
+        # only_missing.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "reason": str(exc),
+                "conflicting_prep_sample_idxs": exc.conflicting_prep_sample_idxs,
+            },
+        ) from exc
+    return BlockMaskPlanResponse(**summary)
 
 
 @router.delete(PATH_SEQUENCED_POOL_BY_IDX)

@@ -156,6 +156,9 @@ async def seeded(ctx):
         "ps_c": ps_c,
     }
 
+    # mask_sample rows (a test may insert them to exercise the completion gate)
+    # FK into BOTH prep_sample and mask_definition, so drop them first.
+    await pool.execute("DELETE FROM qiita.mask_sample WHERE mask_idx = $1", mask_idx)
     await pool.execute(
         "DELETE FROM qiita.sequenced_sample WHERE idx = ANY($1::bigint[])", [ss_a, ss_b, ss_c]
     )
@@ -237,6 +240,27 @@ async def test_manifest_happy_path(ctx, seeded):
     assert by_prep[seeded["ps_a"]]["biosample_accession"] == seeded["acc_a"]
     # B has no accession yet — surfaced as null, not dropped (CLI fails loudly).
     assert by_prep[seeded["ps_b"]]["biosample_accession"] is None
+
+
+async def test_manifest_surfaces_mask_sample_state(ctx, seeded):
+    """The manifest surfaces each sample's per-(mask, prep_sample) completion so
+    the CLI can report skips: a block-masked sample carries its mask_sample state
+    ('pending'/'completed'); a sample with no mask_sample row (the per-sample
+    read-mask path, or unmasked) carries null."""
+    pool, mask_idx = seeded["pool"], seeded["mask_idx"]
+    # A is block-masked and still pending; B has no mask_sample row (per-sample /
+    # unmasked path).
+    await pool.execute(
+        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'pending')",
+        mask_idx,
+        seeded["ps_a"],
+    )
+    resp = await ctx["admin"].get(_manifest_url(seeded["pool_idx"]), params={"mask_idx": mask_idx})
+    assert resp.status_code == 200, resp.text
+    by_prep = {s["prep_sample_idx"]: s for s in resp.json()["samples"]}
+    assert by_prep[seeded["ps_a"]]["mask_state"] == "pending"
+    assert by_prep[seeded["ps_b"]]["mask_state"] is None
 
 
 async def test_manifest_unknown_pool_404(ctx, seeded):
@@ -332,3 +356,52 @@ async def test_ticket_ttl_is_one_hour(ctx):
 async def test_ticket_rejects_bad_body_422(ctx, bad_body):
     resp = await ctx["admin"].post(URL_ADMIN_MASKED_READ_EXPORT_TICKET, json=bad_body)
     assert resp.status_code == 422, resp.text
+
+
+# ---------------------------------------------------------------------------
+# Ticket — mask_sample completion gate (block-masked samples)
+# ---------------------------------------------------------------------------
+
+
+async def test_ticket_refuses_pending_mask_sample_409(ctx, seeded):
+    """A block-masked sample whose mask_sample gate is still PENDING (a covering
+    block unfinished) must NOT get an export ticket — its read_mask is partial, so
+    a pull would silently truncate. Fail loud (409), never mint the ticket."""
+    pool, mask_idx, ps = seeded["pool"], seeded["mask_idx"], seeded["ps_a"]
+    await pool.execute(
+        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'pending')",
+        mask_idx,
+        ps,
+    )
+    resp = await ctx["admin"].post(
+        URL_ADMIN_MASKED_READ_EXPORT_TICKET, json={"prep_sample_idx": ps, "mask_idx": mask_idx}
+    )
+    assert resp.status_code == 409, resp.text
+
+
+async def test_ticket_allows_completed_mask_sample_201(ctx, seeded):
+    """A block-masked sample whose gate is COMPLETED (all covering blocks done) is
+    fully masked — the ticket is minted."""
+    pool, mask_idx, ps = seeded["pool"], seeded["mask_idx"], seeded["ps_a"]
+    await pool.execute(
+        "INSERT INTO qiita.mask_sample (mask_idx, prep_sample_idx, state)"
+        " VALUES ($1, $2, 'completed')",
+        mask_idx,
+        ps,
+    )
+    resp = await ctx["admin"].post(
+        URL_ADMIN_MASKED_READ_EXPORT_TICKET, json={"prep_sample_idx": ps, "mask_idx": mask_idx}
+    )
+    assert resp.status_code == 201, resp.text
+
+
+async def test_ticket_allows_no_mask_sample_row_201(ctx, seeded):
+    """A sample with NO mask_sample row (the per-sample read-mask path, or
+    unmasked) is exportable: the per-sample ticket's read_mask is all-or-nothing,
+    so absence of the block gate preserves the old guarantee. 201, not 409."""
+    mask_idx, ps = seeded["mask_idx"], seeded["ps_b"]
+    resp = await ctx["admin"].post(
+        URL_ADMIN_MASKED_READ_EXPORT_TICKET, json={"prep_sample_idx": ps, "mask_idx": mask_idx}
+    )
+    assert resp.status_code == 201, resp.text

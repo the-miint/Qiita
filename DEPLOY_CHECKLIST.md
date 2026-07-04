@@ -32,6 +32,17 @@ _None yet._
 ### 3. Migrations
 
 - **Email-notification schema.** `make migrate` applies both migrations: `..._email_notification.sql` (adds `work_ticket.notified_at` / `notify_attempts`, creates `qiita.email_receipt`, backfills existing terminal tickets as already-notified) and `..._work_ticket_notified_idx.sql` (a `CREATE INDEX CONCURRENTLY` — runs outside a txn; if interrupted, drop the leftover `INVALID` index and re-run). No out-of-band steps. (#238)
+- Bulk-block read-mask schema (four additive migrations, plain `make migrate`, no
+  backfill): (#243)
+  - `20260701000002_block.sql` — `block` + `block_member` core (the compute unit +
+    the block↔sample cover-map).
+  - `20260701000003_mask_sample.sql` — the per-`(mask_idx, prep_sample)` completion
+    gate the masked-read export + future alignment read.
+  - `20260701000004_scope_target_kind_add_block.sql` — `ALTER TYPE
+    qiita.scope_target_kind ADD VALUE 'block'` (own `transaction:false` file; dbmate
+    applies it standalone).
+  - `20260701000005_work_ticket_block.sql` — `work_ticket.block_idx` scope arm +
+    extended scope-target CHECK + `work_ticket_one_in_flight_per_block` unique index.
 
 ### 4. Deploy
 
@@ -39,11 +50,28 @@ _None yet._
 
 ### 5. Verify
 
-_None yet._
+- Confirm the `read-mask-block/1.0.0` workflow synced into `qiita.action` (the block
+  runner path — synced by `qiita-admin actions sync` inside `activate.sh`, covered by
+  `make verify-deploy`'s `qiita.action` list; this asserts the specific new action):
+  (#243)
+
+  ```bash
+  psql "$DATABASE_URL" -tAc "SELECT action_id, version, target_kind FROM qiita.action WHERE action_id='read-mask-block'"
+  # expect: read-mask-block|1.0.0|block
+  ```
 
 ### Notes (no host action)
 
-_None yet._
+- Bulk-block read masking (`read-mask-block/1.0.0` + `submit-block-mask-pool`) is
+  **inert until an operator runs it** — the four new tables (`block`,
+  `block_member`, `mask_sample`), the `block` scope kind, the
+  `POST …/sequenced-pool/{P}/block-mask-plan` route, and the workflow add nothing to
+  the existing per-sample `read-mask` / `submit-host-filter-pool` path, which stays
+  valid (a single-sample block is byte-identical). No new env var, host directory,
+  scope, group, or SIF (the workflow reuses `read-mask`'s native `qc` + `host_filter`
+  modules — no container). Masked-read export now 409s for a block-masked sample whose
+  `mask_sample` gate is not `completed` (a partially-masked sample); per-sample
+  read-masked samples are unaffected (no gate row ⇒ allowed). (#243)
 
 ---
 

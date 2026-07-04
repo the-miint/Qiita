@@ -53,8 +53,10 @@ def test_work_ticket_create_request_optional_resource_override():
 def test_scope_target_dispatches_on_kind():
     """The discriminated union must select StudyPrepScopeTarget for kind='study_prep',
     ReferenceScopeTarget for kind='reference', PrepSampleScopeTarget for
-    kind='prep_sample', and SequencedPoolScopeTarget for kind='sequenced_pool'."""
+    kind='prep_sample', SequencedPoolScopeTarget for kind='sequenced_pool', and
+    BlockScopeTarget for kind='block'."""
     from qiita_common.models import (
+        BlockScopeTarget,
         PrepSampleScopeTarget,
         ReferenceScopeTarget,
         ScopeTarget,
@@ -83,6 +85,25 @@ def test_scope_target_dispatches_on_kind():
     assert isinstance(pool, SequencedPoolScopeTarget)
     assert pool.sequenced_pool_idx == 42
     assert pool.sequencing_run_idx == 7
+
+    block = adapter.validate_python({"kind": "block", "block_idx": 99})
+    assert isinstance(block, BlockScopeTarget)
+    assert block.block_idx == 99
+
+
+def test_block_scope_target_requires_positive_block_idx():
+    """BlockScopeTarget carries a single block_idx (gt=0). A missing idx or a
+    non-positive one must raise, mirroring the other single-idx arms."""
+    from qiita_common.models import ScopeTarget
+
+    adapter = TypeAdapter(ScopeTarget)
+
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"kind": "block"})
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"kind": "block", "block_idx": 0})
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"kind": "block", "block_idx": -1})
 
 
 def test_sequenced_pool_scope_target_requires_both_idxs():

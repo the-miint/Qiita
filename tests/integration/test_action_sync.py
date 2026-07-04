@@ -39,16 +39,20 @@ async def workflows_dir(tmp_path):
 async def clean_action_table(postgres_pool):
     """Truncate qiita.action before and after each test in this module so
     runs don't bleed into each other. work_ticket_step → work_ticket → action
-    is an FK chain, and TRUNCATE does not honor ON DELETE CASCADE, so every
-    referencing table must be named in the same statement."""
+    is an FK chain, and block ⇄ work_ticket mutually reference each other
+    (block.work_ticket_idx / work_ticket.block_idx) with block_member → block;
+    TRUNCATE does not honor ON DELETE CASCADE, so every referencing table must
+    be named in the same statement."""
     async with postgres_pool.acquire() as conn:
         await conn.execute(
-            "TRUNCATE qiita.work_ticket_step, qiita.work_ticket, qiita.action"
+            "TRUNCATE qiita.work_ticket_step, qiita.block_member, qiita.work_ticket,"
+            " qiita.block, qiita.action"
         )
     yield
     async with postgres_pool.acquire() as conn:
         await conn.execute(
-            "TRUNCATE qiita.work_ticket_step, qiita.work_ticket, qiita.action"
+            "TRUNCATE qiita.work_ticket_step, qiita.block_member, qiita.work_ticket,"
+            " qiita.block, qiita.action"
         )
 
 

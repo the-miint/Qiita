@@ -406,6 +406,40 @@ impl FlightService for QiitaFlightService {
                 let output = stream::once(futures::future::ready(Ok(result)));
                 Ok(Response::new(Box::pin(output)))
             }
+            "delete_read_mask_block" => {
+                let payload = auth::verify_delete_read_mask_block(&action.body, &self.hmac_secret)
+                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
+
+                if payload.action != "delete_read_mask_block" {
+                    return Err(Status::invalid_argument(format!(
+                        "action type mismatch: header says 'delete_read_mask_block', payload says {:?}",
+                        payload.action
+                    )));
+                }
+                // An empty block is a control-plane bug, not a valid ask —
+                // reject it loudly rather than deleting nothing silently.
+                if payload.members.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "delete_read_mask_block requires a non-empty members list",
+                    ));
+                }
+
+                let deleted = delete_read_mask_block(
+                    &self.catalog_connstr,
+                    &self.data_path,
+                    payload.mask_idx,
+                    &payload.members,
+                )?;
+
+                let result_body = serde_json::to_vec(&deleted)
+                    .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+
+                let result = arrow_flight::Result {
+                    body: result_body.into(),
+                };
+                let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
             "export_read" => {
                 let payload = auth::verify_export_read(&action.body, &self.hmac_secret)
                     .map_err(|e| Status::unauthenticated(e.to_string()))?;
@@ -434,6 +468,62 @@ impl FlightService for QiitaFlightService {
                 })
                 .await
                 .map_err(|e| Status::internal(format!("export_read task join failed: {e}")))??;
+
+                let result_body = serde_json::to_vec(&serde_json::json!({
+                    "count": count,
+                    "dest": payload.dest,
+                }))
+                .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+
+                let result = arrow_flight::Result {
+                    body: result_body.into(),
+                };
+                let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
+            "export_read_block" => {
+                let payload = auth::verify_export_read_block(&action.body, &self.hmac_secret)
+                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
+
+                if payload.action != "export_read_block" {
+                    return Err(Status::invalid_argument(format!(
+                        "action type mismatch: header says 'export_read_block', payload says {:?}",
+                        payload.action
+                    )));
+                }
+                // An empty block is a control-plane bug, not a valid ask —
+                // reject it loudly rather than silently writing an empty file.
+                if payload.members.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "export_read_block requires a non-empty members list",
+                    ));
+                }
+
+                // Defense in depth on the HMAC-trusted destination before it is
+                // inlined into a DuckDB `COPY ... TO` literal and written to.
+                let dest = validate_export_dest(&payload.dest, &self.scratch_root)?;
+
+                // `COPY` is synchronous and, for a ~10M-read block, long-lived —
+                // run it on the blocking pool so it never starves a tonic async
+                // worker. The closure opens and drops its own connection, so it
+                // is Send and crosses no await (mirrors `export_read`).
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let scratch_root = self.scratch_root.clone();
+                let members = payload.members;
+                let count = tokio::task::spawn_blocking(move || {
+                    export_read_block_to_parquet(
+                        &catalog,
+                        &data_path,
+                        &members,
+                        &dest,
+                        &scratch_root,
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    Status::internal(format!("export_read_block task join failed: {e}"))
+                })??;
 
                 let result_body = serde_json::to_vec(&serde_json::json!({
                     "count": count,
@@ -477,6 +567,42 @@ impl FlightService for QiitaFlightService {
                 .map_err(|e| Status::internal(format!("count_masked task join failed: {e}")))??;
 
                 let result_body = serde_json::to_vec(&serde_json::json!({ "count": count }))
+                    .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
+                let result = arrow_flight::Result {
+                    body: result_body.into(),
+                };
+                let output = stream::once(futures::future::ready(Ok(result)));
+                Ok(Response::new(Box::pin(output)))
+            }
+            "mask_metrics" => {
+                // Unlike `count_masked` (which reuses a `read_masked` DoGet
+                // ticket the CLI already holds), the block reconcile primitive
+                // runs control-plane-side and signs a first-class action token —
+                // so this arm verifies a `mask_metrics` payload, not a ticket.
+                let payload = auth::verify_mask_metrics(&action.body, &self.hmac_secret)
+                    .map_err(|e| Status::unauthenticated(e.to_string()))?;
+                if payload.action != "mask_metrics" {
+                    return Err(Status::invalid_argument(format!(
+                        "action type mismatch: header says 'mask_metrics', payload says {:?}",
+                        payload.action
+                    )));
+                }
+                let mask_idx = payload.mask_idx;
+                let prep_sample_idx = payload.prep_sample_idx;
+
+                // The aggregate is a synchronous DuckDB count over the light
+                // `read_mask` table; run it on the blocking pool so it never
+                // starves a tonic async worker (mirrors count_masked). The
+                // closure opens and drops its own connection.
+                let catalog = self.catalog_connstr.clone();
+                let data_path = self.data_path.clone();
+                let counts = tokio::task::spawn_blocking(move || {
+                    mask_metrics_counts(&catalog, &data_path, mask_idx, prep_sample_idx)
+                })
+                .await
+                .map_err(|e| Status::internal(format!("mask_metrics task join failed: {e}")))??;
+
+                let result_body = serde_json::to_vec(&counts)
                     .map_err(|e| Status::internal(format!("json serialization failed: {e}")))?;
                 let result = arrow_flight::Result {
                     body: result_body.into(),
@@ -817,15 +943,17 @@ fn validate_export_dest(dest: &str, scratch_root: &Path) -> Result<PathBuf, Stat
     Ok(path.to_path_buf())
 }
 
-/// Re-materialize one prep_sample's reads from the DuckLake `read` table into a
-/// Parquet at `dest` (the per-ticket `reads.parquet` a read-mask job consumes).
-/// Returns the row count.
+/// Re-materialize a selection of the DuckLake `read` table into a Parquet at
+/// `dest`, filtered by the caller-supplied `where_clause` (an already-safe SQL
+/// predicate — HMAC-verified inlined integers only). Returns the row count.
 ///
-/// A sample with no stored reads writes NO file and returns 0 — the control
-/// plane turns that into a clean submission failure ("must be ingested"). The
-/// `COPY` streams row groups to disk, so memory stays bounded regardless of
-/// sample size. Opens and drops its own connection so the caller can run it on
-/// the blocking pool (mirrors `register_files`).
+/// Shared machinery for the read-export DoActions: `export_read` (one whole
+/// sample) and `export_read_block` (the union of a block's `(prep_sample,
+/// sub-range)` members). An empty selection writes NO file and returns 0 — the
+/// control plane turns that into a clean submission failure. The `COPY` streams
+/// row groups to disk, so memory stays bounded regardless of selection size.
+/// Opens and drops its own connection so the caller can run it on the blocking
+/// pool (mirrors `register_files`).
 ///
 /// `dest` arrives already lexically validated (`validate_export_dest`), but this
 /// is human-read data, so we ALSO resolve symlinks: another job on the shared
@@ -837,10 +965,10 @@ fn validate_export_dest(dest: &str, scratch_root: &Path) -> Result<PathBuf, Stat
 /// `reads.parquet` a retry could read. The row count is read back from the
 /// written file, so it always matches the bytes on disk (no separate catalog
 /// scan that could race the `COPY`).
-fn export_read_to_parquet(
+fn export_read_where_to_parquet(
     catalog_connstr: &str,
     data_path: &str,
-    prep_sample_idx: i64,
+    where_clause: &str,
     dest: &Path,
     scratch_root: &Path,
 ) -> Result<i64, Status> {
@@ -884,10 +1012,10 @@ fn export_read_to_parquet(
 
     // Write to a sibling temp, then publish atomically. `dest` is validated
     // (absolute, under the scratch root, no `..`, no single quote) and the
-    // `.partial` suffix preserves all of that; `prep_sample_idx` is an i64 — all
-    // safe to inline. The column list is the full `read` schema in table order,
-    // so the file is a drop-in for the durable staging copy (modulo row order,
-    // which does not matter).
+    // `.partial` suffix preserves all of that; the `where_clause` carries only
+    // HMAC-verified inlined integers — all safe to inline. The column list is
+    // the full `read` schema in table order, so the file is a drop-in for the
+    // durable staging copy (modulo row order, which does not matter).
     let tmp = {
         let mut s = dest.as_os_str().to_os_string();
         s.push(".partial");
@@ -898,7 +1026,7 @@ fn export_read_to_parquet(
         .ok_or_else(|| Status::internal(format!("non-UTF-8 dest path: {}", tmp.display())))?;
     let copy_sql = format!(
         "COPY (SELECT prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2 \
-         FROM qiita_lake.read WHERE prep_sample_idx = {prep_sample_idx}) \
+         FROM qiita_lake.read WHERE {where_clause}) \
          TO '{tmp_sql}' ({EXPORT_READ_PARQUET_OPTS})"
     );
 
@@ -906,7 +1034,7 @@ fn export_read_to_parquet(
     // empty path (count 0) and on any error; on success it is renamed away.
     let published = (|| -> Result<i64, Status> {
         conn.execute_batch(&copy_sql)
-            .map_err(|e| Status::internal(format!("export_read COPY failed: {e}")))?;
+            .map_err(|e| Status::internal(format!("read export COPY failed: {e}")))?;
         // Count from the file we just wrote, so it matches the bytes exactly.
         let count: i64 = conn
             .query_row(
@@ -914,9 +1042,9 @@ fn export_read_to_parquet(
                 [],
                 |row| row.get(0),
             )
-            .map_err(|e| Status::internal(format!("export_read count failed: {e}")))?;
+            .map_err(|e| Status::internal(format!("read export count failed: {e}")))?;
         if count == 0 {
-            // No stored reads for this sample — publish nothing; the CP raises.
+            // Nothing selected — publish nothing; the CP raises.
             return Ok(0);
         }
         // Match the read result-file convention: owner/group read-only.
@@ -939,6 +1067,106 @@ fn export_read_to_parquet(
         let _ = std::fs::remove_file(&tmp);
     }
     published
+}
+
+/// Re-materialize one prep_sample's reads into a per-ticket `reads.parquet` a
+/// read-mask job consumes (the per-sample export). A sample with no stored reads
+/// writes NO file and returns 0. `prep_sample_idx` is an HMAC-verified i64, safe
+/// to inline. See `export_read_where_to_parquet` for the shared write/publish.
+fn export_read_to_parquet(
+    catalog_connstr: &str,
+    data_path: &str,
+    prep_sample_idx: i64,
+    dest: &Path,
+    scratch_root: &Path,
+) -> Result<i64, Status> {
+    export_read_where_to_parquet(
+        catalog_connstr,
+        data_path,
+        &format!("prep_sample_idx = {prep_sample_idx}"),
+        dest,
+        scratch_root,
+    )
+}
+
+/// Re-materialize a block's reads — the union of its `(prep_sample_idx,
+/// sequence_idx sub-range)` members — into a per-ticket `reads.parquet` a
+/// read-mask *block* job consumes. Returns the row count (0 ⇒ no file written).
+///
+/// The WHERE clause is **exact by construction** yet still pushes down. Two
+/// coarse conjuncts do the pruning — each DuckLake `read` data file holds exactly
+/// one sample sorted by `sequence_idx`, so `prep_sample_idx IN (...)` prunes to
+/// the block's files at the catalog level and `sequence_idx BETWEEN block_min AND
+/// block_max` prunes row-groups (both are top-level conjuncts DuckDB pushes to
+/// the scan). A third conjunct — the per-member OR of `(prep_sample_idx = p AND
+/// sequence_idx BETWEEN start AND stop)` — is an exact residual on the already-
+/// pruned rows: it guarantees a split member contributes ONLY its own sub-range,
+/// so the part of that sample living in a sibling block never leaks, independent
+/// of any tiling order or boundary-alignment invariant. The coarse pair is a
+/// superset of the OR, so `coarse AND exact == exact`. All member integers are
+/// HMAC-verified i64s, safe to inline. An empty `members` list writes no file and
+/// returns 0 (the DoAction arm rejects it earlier too).
+fn export_read_block_to_parquet(
+    catalog_connstr: &str,
+    data_path: &str,
+    members: &[auth::ExportReadBlockMember],
+    dest: &Path,
+    scratch_root: &Path,
+) -> Result<i64, Status> {
+    if members.is_empty() {
+        return Ok(0);
+    }
+    let where_clause = block_read_where_clause(members);
+    export_read_where_to_parquet(
+        catalog_connstr,
+        data_path,
+        &where_clause,
+        dest,
+        scratch_root,
+    )
+}
+
+/// Build the block export's `read` WHERE clause from its members. Factored out of
+/// `export_read_block_to_parquet` so the pushdown performance-assessment test can
+/// exercise the EXACT predicate the export emits, not a hand-written copy that
+/// could silently drift.
+///
+/// Two coarse conjuncts drive pruning (both are top-level, so DuckDB pushes them
+/// to the scan): `prep_sample_idx IN (...)` prunes DuckLake data files by their
+/// per-file `prep_sample_idx` stats, and `sequence_idx BETWEEN block_min AND
+/// block_max` bounds the row-group span. A third conjunct — the per-member OR of
+/// `(prep_sample_idx = p AND sequence_idx BETWEEN start AND stop)` — is the exact
+/// residual on the pruned rows, so a split member never leaks a sibling block's
+/// rows (independent of tiling order). The coarse pair is a superset of the OR,
+/// so `coarse AND exact == exact`. `members` must be non-empty (caller guards);
+/// all integers are HMAC-verified i64s, safe to inline.
+fn block_read_where_clause(members: &[auth::ExportReadBlockMember]) -> String {
+    let mut preps: Vec<i64> = members.iter().map(|m| m.prep_sample_idx).collect();
+    preps.sort_unstable();
+    preps.dedup();
+    let in_list = preps
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    // Unwraps are safe: `members` is non-empty (caller guards).
+    let block_min = members.iter().map(|m| m.sequence_idx_start).min().unwrap();
+    let block_max = members.iter().map(|m| m.sequence_idx_stop).max().unwrap();
+    let member_terms = members
+        .iter()
+        .map(|m| {
+            format!(
+                "(prep_sample_idx = {} AND sequence_idx BETWEEN {} AND {})",
+                m.prep_sample_idx, m.sequence_idx_start, m.sequence_idx_stop
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    format!(
+        "prep_sample_idx IN ({in_list}) \
+         AND sequence_idx BETWEEN {block_min} AND {block_max} \
+         AND ({member_terms})"
+    )
 }
 
 /// Pull exactly one i64 out of a ticket filter column. The count path needs a
@@ -990,6 +1218,57 @@ fn count_masked_reads(
     );
     conn.query_row(&sql, [], |row| row.get(0))
         .map_err(|e| Status::internal(format!("count_masked query failed: {e}")))
+}
+
+/// Aggregate a sample's `read_mask` rows for one mask into the per-stage read
+/// counts the block reconcile primitive persists onto `sequenced_sample`.
+///
+/// The counterpart of the per-sample read-mask's local-parquet rollup
+/// (`qiita_control_plane.actions.library._read_mask_counts`), but read from the
+/// persisted DuckLake `read_mask` table because a block-masked sample's rows are
+/// written by SEVERAL blocks — any one block's local parquet covers only its
+/// slice. Returns the both-mates (`*_r1r2`) totals `sequenced_sample` stores plus
+/// `row_count` (one per read/pair) the reconcile count-assertion checks against
+/// the sample's `sequence_range`.
+///
+/// `right_trim2` is non-NULL for paired-end and NULL for single-end, so
+/// `count(right_trim2)` is the R2 count and `count(*) + count(right_trim2)` is the
+/// both-mates total — matching `_read_mask_counts` exactly (SE / PE / mixed, no
+/// branching). Bucketing mirrors it too: raw = every row, biological =
+/// `reason NOT LIKE 'qc_%'` (pass + host_*), quality_filtered = `reason = 'pass'`.
+/// Opens and drops its own connection so the caller can run it on the blocking
+/// pool (mirrors `count_masked_reads`).
+fn mask_metrics_counts(
+    catalog_connstr: &str,
+    data_path: &str,
+    mask_idx: i64,
+    prep_sample_idx: i64,
+) -> Result<serde_json::Value, Status> {
+    let conn = open_ducklake(catalog_connstr, data_path)?;
+    // `mask_idx`/`prep_sample_idx` are HMAC-verified i64s, safe to inline (same
+    // rationale as count_masked_reads: parsed integers reach SQL, no string data).
+    let sql = format!(
+        "SELECT \
+           count(*) + count(right_trim2), \
+           count(*) FILTER (WHERE reason NOT LIKE 'qc_%') \
+             + count(right_trim2) FILTER (WHERE reason NOT LIKE 'qc_%'), \
+           count(*) FILTER (WHERE reason = 'pass') \
+             + count(right_trim2) FILTER (WHERE reason = 'pass'), \
+           count(*) \
+         FROM qiita_lake.read_mask \
+         WHERE mask_idx = {mask_idx} AND prep_sample_idx = {prep_sample_idx}"
+    );
+    let (raw, biological, quality_filtered, row_count): (i64, i64, i64, i64) = conn
+        .query_row(&sql, [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .map_err(|e| Status::internal(format!("mask_metrics query failed: {e}")))?;
+    Ok(serde_json::json!({
+        "raw": raw,
+        "biological": biological,
+        "quality_filtered": quality_filtered,
+        "row_count": row_count,
+    }))
 }
 
 /// Move Parquet files from staging to permanent storage and register in DuckLake.
@@ -1351,6 +1630,84 @@ fn delete_pool_reads(
         "prep_sample_count": prep_sample_idxs.len(),
         "read_rows_deleted": read_rows_deleted,
         "read_mask_rows_deleted": read_mask_rows_deleted,
+    }))
+}
+
+/// Delete exactly one block's footprint from the DuckLake `read_mask` table:
+/// the rows for `mask_idx` whose `(prep_sample_idx, sequence_idx)` fall in the
+/// members' sub-ranges. This is the idempotent-block-replace primitive — the
+/// block workflow runs it immediately before `register-files`, so a re-run
+/// deletes the prior run's rows before writing fresh ones and never double-counts
+/// (the reconcile count-assertion would otherwise trip on a 2× row count).
+///
+/// The WHERE clause is the SAME exact-by-construction footprint selector
+/// `export_read_block` emits (`block_read_where_clause`), scoped further by
+/// `mask_idx = ?`: `mask_idx = {m} AND prep_sample_idx IN (...) AND sequence_idx
+/// BETWEEN block_min AND block_max AND (per-member OR)`. The per-member OR
+/// residual makes it exact — a split member deletes ONLY its own sub-range, so a
+/// sibling block's rows for a shared sample survive (independent of tiling
+/// order). The coarse `IN + BETWEEN` pair is a pushdown hint (see
+/// `block_read_where_clause`).
+///
+/// Mirrors `delete_mask` / `delete_pool_reads`: one DuckLake transaction
+/// (all-or-nothing, retriable — a failed call leaves the block's rows intact so a
+/// retry sees the same set), logical `DELETE` only (no raw parquet unlink —
+/// DuckLake owns file lifecycle). Idempotent: a fresh block (no rows yet) deletes
+/// 0. Empty `members` is a control-plane bug (the DoAction arm rejects it before
+/// this); guarded here too, returning a zero-count noop. All integers are
+/// HMAC-verified i64s, safe to inline.
+fn delete_read_mask_block(
+    catalog_connstr: &str,
+    data_path: &str,
+    mask_idx: i64,
+    members: &[auth::ExportReadBlockMember],
+) -> Result<serde_json::Value, Status> {
+    if members.is_empty() {
+        return Ok(serde_json::json!({
+            "mask_idx": mask_idx,
+            "rows_deleted": 0,
+        }));
+    }
+
+    let conn = duckdb::Connection::open_in_memory()
+        .map_err(|e| Status::internal(format!("failed to open DuckDB: {e}")))?;
+    ducklake::connect_ducklake(&conn, catalog_connstr, data_path)
+        .map_err(|e| Status::internal(format!("failed to attach DuckLake: {e}")))?;
+
+    // Scope the shared footprint selector to this filtering identity. The
+    // `read` export needs no mask column; `read_mask` is keyed by mask_idx too.
+    let where_clause = format!(
+        "mask_idx = {mask_idx} AND {}",
+        block_read_where_clause(members)
+    );
+
+    // Single-statement delete wrapped in an explicit transaction so the action
+    // is all-or-nothing and the control plane can safely retry: a failed call
+    // leaves the block's rows fully intact, so a retry sees the same row set.
+    conn.execute_batch("BEGIN TRANSACTION")
+        .map_err(|e| Status::internal(format!("failed to begin transaction: {e}")))?;
+
+    let deleted = conn.execute(
+        &format!("DELETE FROM qiita_lake.read_mask WHERE {where_clause}"),
+        [],
+    );
+
+    let rows_deleted = match deleted {
+        Ok(n) => n,
+        Err(e) => {
+            // Best-effort rollback; surface the original delete error.
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(Status::internal(format!(
+                "delete failed (DELETE FROM qiita_lake.read_mask WHERE {where_clause}): {e}"
+            )));
+        }
+    };
+    conn.execute_batch("COMMIT")
+        .map_err(|e| Status::internal(format!("failed to commit delete transaction: {e}")))?;
+
+    Ok(serde_json::json!({
+        "mask_idx": mask_idx,
+        "rows_deleted": rows_deleted,
     }))
 }
 
@@ -1726,6 +2083,99 @@ mod tests {
         ));
     }
 
+    /// `delete_read_mask_block` deletes EXACTLY one block's footprint: the
+    /// per-member OR residual keeps a split sample's sibling-block sub-range, the
+    /// `mask_idx` scope keeps a different mask's rows for the same sample, and a
+    /// re-delete is an idempotent 0-row noop (the self-cleaning re-run guarantee).
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn delete_read_mask_block_deletes_footprint_only() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+
+        // Unique ids so leftover rows never collide with other serial tests.
+        let mask_a: i64 = 940_000;
+        let mask_b: i64 = 940_001;
+        let prep_a: i64 = 940_010;
+        let prep_b: i64 = 940_011;
+
+        // mask_a/prep_a is a SPLIT sample: block 1 owns seq 100-101, block 2 owns
+        // seq 102-103. mask_a/prep_b (seq 200-201) is whole in block 1. mask_b's
+        // row for prep_a (seq 100) is a different filtering identity.
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read_mask WHERE mask_idx IN ({mask_a}, {mask_b});
+             INSERT INTO qiita_lake.read_mask \
+                 (mask_idx, prep_sample_idx, sequence_idx, reason) VALUES \
+                 ({mask_a}, {prep_a}, 100, 'pass'), \
+                 ({mask_a}, {prep_a}, 101, 'pass'), \
+                 ({mask_a}, {prep_a}, 102, 'pass'), \
+                 ({mask_a}, {prep_a}, 103, 'pass'), \
+                 ({mask_a}, {prep_b}, 200, 'pass'), \
+                 ({mask_a}, {prep_b}, 201, 'pass'), \
+                 ({mask_b}, {prep_a}, 100, 'pass');"
+        ))
+        .unwrap();
+
+        // Block 1's footprint: prep_a[100,101] (its half of the split) + prep_b
+        // whole. block_min=100, block_max=201 spans prep_a's 102-103 too, so the
+        // per-member OR is what keeps block 2's sub-range intact.
+        let members = vec![
+            auth::ExportReadBlockMember {
+                prep_sample_idx: prep_a,
+                sequence_idx_start: 100,
+                sequence_idx_stop: 101,
+            },
+            auth::ExportReadBlockMember {
+                prep_sample_idx: prep_b,
+                sequence_idx_start: 200,
+                sequence_idx_stop: 201,
+            },
+        ];
+
+        let first = delete_read_mask_block(&connstr, &data_path, mask_a, &members)
+            .expect("delete_read_mask_block failed");
+        assert_eq!(
+            first["rows_deleted"], 4,
+            "block 1's 4 footprint rows deleted"
+        );
+        assert_eq!(first["mask_idx"], mask_a);
+
+        let count = |mask: i64, prep: i64| -> i64 {
+            conn.query_row(
+                &format!(
+                    "SELECT count(*) FROM qiita_lake.read_mask \
+                     WHERE mask_idx = {mask} AND prep_sample_idx = {prep}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        // Block 2's sub-range of the split sample survives (per-member OR exact).
+        assert_eq!(
+            count(mask_a, prep_a),
+            2,
+            "prep_a 102-103 (block 2) untouched"
+        );
+        // prep_b's whole sample was in block 1 — fully deleted.
+        assert_eq!(count(mask_a, prep_b), 0, "prep_b fully deleted");
+        // The different mask's row for the same sample is out of scope.
+        assert_eq!(count(mask_b, prep_a), 1, "mask_b untouched");
+
+        // Idempotency: re-deleting the same footprint removes nothing.
+        let second = delete_read_mask_block(&connstr, &data_path, mask_a, &members)
+            .expect("idempotent re-delete failed");
+        assert_eq!(second["rows_deleted"], 0, "second delete removes nothing");
+
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read_mask WHERE mask_idx IN ({mask_a}, {mask_b});"
+        ));
+    }
+
     /// `count_masked_reads` counts exactly the `read_mask` rows for the target
     /// `(prep_sample_idx, mask_idx)` with `reason = 'pass'`: non-`pass` rows (the
     /// view's privacy filter), a different mask, and a different prep_sample are
@@ -1766,6 +2216,78 @@ mod tests {
         // A (prep, mask) pair with no rows counts zero, not an error.
         let none = count_masked_reads(&connstr, &data_path, prep_b, mask_b).expect("count failed");
         assert_eq!(none, 0);
+
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read_mask WHERE mask_idx IN ({mask_a}, {mask_b});"
+        ));
+    }
+
+    /// `mask_metrics_counts` aggregates the target `(mask_idx, prep_sample_idx)`
+    /// rows across a mix of SE (right_trim2 NULL) and PE (right_trim2 non-NULL)
+    /// reads with mixed reasons, and excludes a different mask / prep_sample. It
+    /// mirrors `_read_mask_counts`: raw = both-mates total, biological = non-qc,
+    /// quality_filtered = pass; plus row_count = one-per-read for the assertion.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn mask_metrics_counts_buckets_both_mates_for_target_only() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+
+        let mask_a: i64 = 960_000;
+        let mask_b: i64 = 960_001;
+        let prep_a: i64 = 960_010;
+        let prep_b: i64 = 960_011;
+
+        // For (mask_a, prep_a): 3 PE rows (right_trim2 = 0, a mate each) +
+        // 2 SE rows (right_trim2 NULL). Reasons: 2 pass (1 PE, 1 SE),
+        // 1 host_rype (PE, biological but not quality_filtered), 1 qc_too_short
+        // (PE, excluded from biological), 1 qc_low_quality (SE, excluded).
+        //   row_count  = 5
+        //   raw        = 5 rows + 3 R2 (the PE rows) = 8
+        //   biological = pass+host = 3 rows (2 PE + wait) ...
+        // Enumerate explicitly to keep the arithmetic auditable:
+        //   PE pass         (R2)      -> raw 2, bio 2, qf 2
+        //   SE pass                   -> raw 1, bio 1, qf 1
+        //   PE host_rype    (R2)      -> raw 2, bio 2, qf 0
+        //   PE qc_too_short (R2)      -> raw 2, bio 0, qf 0
+        //   SE qc_low_quality         -> raw 1, bio 0, qf 0
+        // Totals: row_count 5, raw 8, biological 5, quality_filtered 3.
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read_mask WHERE mask_idx IN ({mask_a}, {mask_b});
+             INSERT INTO qiita_lake.read_mask \
+                 (mask_idx, prep_sample_idx, sequence_idx, reason, \
+                  left_trim1, right_trim1, left_trim2, right_trim2) VALUES \
+                 ({mask_a}, {prep_a}, 960100, 'pass',          0, 0, 0, 0), \
+                 ({mask_a}, {prep_a}, 960101, 'pass',          0, 0, NULL, NULL), \
+                 ({mask_a}, {prep_a}, 960102, 'host_rype',     0, 0, 0, 0), \
+                 ({mask_a}, {prep_a}, 960103, 'qc_too_short',  0, 0, 0, 0), \
+                 ({mask_a}, {prep_a}, 960104, 'qc_low_quality',0, 0, NULL, NULL), \
+                 ({mask_a}, {prep_b}, 960105, 'pass',          0, 0, 0, 0), \
+                 ({mask_b}, {prep_a}, 960106, 'pass',          0, 0, 0, 0);"
+        ))
+        .unwrap();
+
+        let counts =
+            mask_metrics_counts(&connstr, &data_path, mask_a, prep_a).expect("counts failed");
+        assert_eq!(
+            counts["row_count"], 5,
+            "one row per read/pair for the target"
+        );
+        assert_eq!(counts["raw"], 8, "5 rows + 3 R2 mates");
+        assert_eq!(counts["biological"], 5, "pass + host, both-mates");
+        assert_eq!(counts["quality_filtered"], 3, "pass only, both-mates");
+
+        // A (mask, prep) pair with no rows is all-zero, not an error.
+        let empty =
+            mask_metrics_counts(&connstr, &data_path, mask_b, prep_b).expect("counts failed");
+        assert_eq!(empty["row_count"], 0);
+        assert_eq!(empty["raw"], 0);
+        assert_eq!(empty["biological"], 0);
+        assert_eq!(empty["quality_filtered"], 0);
 
         let _ = conn.execute_batch(&format!(
             "DELETE FROM qiita_lake.read_mask WHERE mask_idx IN ({mask_a}, {mask_b});"
@@ -2250,6 +2772,197 @@ mod tests {
         ));
     }
 
+    /// `export_read_block` materializes the UNION of its members' `read`
+    /// sub-ranges and nothing else: a sample whose `sequence_idx` falls in the
+    /// gap between two block members (but whose prep_sample is not a member) is
+    /// excluded, and a split member contributes only its sub-range (rows beyond
+    /// its `sequence_idx_stop` stay out). Per-row `prep_sample_idx` is preserved
+    /// so the block kernel can group by it.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn export_read_block_writes_union_and_excludes_gap_and_split() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+
+        // Unique ids so leftover rows never collide with other serial tests.
+        let prep_a: i64 = 941_000; // fully in block
+        let prep_gap: i64 = 941_001; // sequence_idx in [block_min, block_max] but NOT a member
+        let prep_c: i64 = 941_002; // split: block covers only a sub-range
+
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read WHERE prep_sample_idx IN ({prep_a}, {prep_gap}, {prep_c});
+             INSERT INTO qiita_lake.read \
+                 (prep_sample_idx, sequence_idx, read_id, sequence1, qual1, sequence2, qual2) VALUES \
+                 ({prep_a}, 941010, 'a0', 'AAAAA', [10,10,10,10,10]::UTINYINT[], NULL, NULL), \
+                 ({prep_a}, 941011, 'a1', 'AAAAC', [10,10,10,10,10]::UTINYINT[], NULL, NULL), \
+                 ({prep_a}, 941012, 'a2', 'AAAAG', [10,10,10,10,10]::UTINYINT[], NULL, NULL), \
+                 ({prep_gap}, 941020, 'g0', 'CCCCC', [10,10,10,10,10]::UTINYINT[], NULL, NULL), \
+                 ({prep_gap}, 941021, 'g1', 'CCCCA', [10,10,10,10,10]::UTINYINT[], NULL, NULL), \
+                 ({prep_c}, 941030, 'c0', 'GGGGG', [10,10,10,10,10]::UTINYINT[], NULL, NULL), \
+                 ({prep_c}, 941031, 'c1', 'GGGGA', [10,10,10,10,10]::UTINYINT[], NULL, NULL), \
+                 ({prep_c}, 941032, 'c2', 'GGGGC', [10,10,10,10,10]::UTINYINT[], NULL, NULL), \
+                 ({prep_c}, 941033, 'c3', 'GGGGT', [10,10,10,10,10]::UTINYINT[], NULL, NULL), \
+                 ({prep_c}, 941034, 'c4', 'GGGTT', [10,10,10,10,10]::UTINYINT[], NULL, NULL);"
+        ))
+        .unwrap();
+
+        // Block = prep_a (whole) + prep_c (sub-range [941030, 941031], boundary-
+        // aligned split). block_min=941010, block_max=941031 spans prep_gap's
+        // window (941020-941021), so the IN(prep) clause is what excludes it.
+        let members = vec![
+            auth::ExportReadBlockMember {
+                prep_sample_idx: prep_a,
+                sequence_idx_start: 941010,
+                sequence_idx_stop: 941012,
+            },
+            auth::ExportReadBlockMember {
+                prep_sample_idx: prep_c,
+                sequence_idx_start: 941030,
+                sequence_idx_stop: 941031,
+            },
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("reads.parquet");
+        let count = export_read_block_to_parquet(&connstr, &data_path, &members, &dest, dir.path())
+            .expect("export_read_block_to_parquet failed");
+        assert_eq!(
+            count, 5,
+            "3 (prep_a) + 2 (prep_c sub-range) = 5; gap excluded"
+        );
+        assert!(dest.exists());
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o440, "exported parquet is mode 440");
+
+        let reader = Connection::open_in_memory().unwrap();
+        let dest_str = dest.to_str().unwrap();
+        // The gap sample must be entirely absent.
+        let gap_rows: i64 = reader
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM read_parquet('{dest_str}') WHERE prep_sample_idx = {prep_gap}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            gap_rows, 0,
+            "gap sample excluded by the prep_sample_idx IN clause"
+        );
+        // The split sample contributes only its sub-range (no 941032..034).
+        let c_max: i64 = reader
+            .query_row(
+                &format!(
+                    "SELECT max(sequence_idx) FROM read_parquet('{dest_str}') WHERE prep_sample_idx = {prep_c}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(c_max, 941031, "split member stops at its sequence_idx_stop");
+        // Per-row prep_sample_idx preserved for both members.
+        let distinct_preps: i64 = reader
+            .query_row(
+                &format!("SELECT count(DISTINCT prep_sample_idx) FROM read_parquet('{dest_str}')"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(distinct_preps, 2, "both members present, keyed per-row");
+
+        // An empty block writes no file and reports 0 (defense in depth — the
+        // DoAction arm also rejects empty members before calling this).
+        let dest_empty = dir.path().join("empty.parquet");
+        let zero = export_read_block_to_parquet(&connstr, &data_path, &[], &dest_empty, dir.path())
+            .expect("empty block should succeed with 0");
+        assert_eq!(zero, 0);
+        assert!(!dest_empty.exists(), "no file written for an empty block");
+
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read WHERE prep_sample_idx IN ({prep_a}, {prep_gap}, {prep_c});"
+        ));
+    }
+
+    /// A split member whose `sequence_idx_stop` is NOT the block's max still
+    /// contributes only its own sub-range: the per-member predicate excludes the
+    /// part of that sample living in a sibling block, even though those rows fall
+    /// inside the block's overall [min, max] span and the sample is in the IN-set.
+    /// This is the case a bare global `BETWEEN block_min AND block_max` would leak.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn export_read_block_split_member_not_at_max_is_exact() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+
+        let prep_x: i64 = 942_000; // split: full [942010, 942019], block covers only [942010, 942013]
+        let prep_y: i64 = 942_001; // whole: [942050, 942051] — holds block_max
+
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read WHERE prep_sample_idx IN ({prep_x}, {prep_y});
+             INSERT INTO qiita_lake.read (prep_sample_idx, sequence_idx, read_id, sequence1) \
+                 SELECT {prep_x}, s, 'x' || s, 'AAAAA' FROM range(942010, 942020) t(s);
+             INSERT INTO qiita_lake.read (prep_sample_idx, sequence_idx, read_id, sequence1) VALUES \
+                 ({prep_y}, 942050, 'y0', 'CCCCC'), ({prep_y}, 942051, 'y1', 'CCCCA');"
+        ))
+        .unwrap();
+
+        // prep_x is split at 942013 (< block_max=942051). A global BETWEEN would
+        // pull prep_x rows 942014..942019 (in [942010,942051], prep in IN-set);
+        // the per-member predicate must exclude them.
+        let members = vec![
+            auth::ExportReadBlockMember {
+                prep_sample_idx: prep_x,
+                sequence_idx_start: 942010,
+                sequence_idx_stop: 942013,
+            },
+            auth::ExportReadBlockMember {
+                prep_sample_idx: prep_y,
+                sequence_idx_start: 942050,
+                sequence_idx_stop: 942051,
+            },
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("reads.parquet");
+        let count = export_read_block_to_parquet(&connstr, &data_path, &members, &dest, dir.path())
+            .expect("export_read_block_to_parquet failed");
+        assert_eq!(
+            count, 6,
+            "4 (prep_x sub-range 942010..942013) + 2 (prep_y) = 6; tail excluded"
+        );
+
+        let reader = Connection::open_in_memory().unwrap();
+        let dest_str = dest.to_str().unwrap();
+        let x_max: i64 = reader
+            .query_row(
+                &format!(
+                    "SELECT max(sequence_idx) FROM read_parquet('{dest_str}') WHERE prep_sample_idx = {prep_x}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            x_max, 942013,
+            "split member's out-of-block tail (942014..019) excluded"
+        );
+
+        let _ = conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.read WHERE prep_sample_idx IN ({prep_x}, {prep_y});"
+        ));
+    }
+
     #[test]
     fn build_query_no_filter() {
         let (sql, _) = build_query("reference_sequences", &auth::TicketFilter::new()).unwrap();
@@ -2671,6 +3384,378 @@ mod tests {
         assert_eq!(
             staging_path_for(root, 42),
             Path::new("/scratch/ephemeral/staging/uploads/42/upload.parquet")
+        );
+    }
+
+    // --- pushdown performance assessment helpers/tests ----------------------
+
+    /// Write one per-sample `read` Parquet (matching the durable ingest layout:
+    /// one file per prep_sample, sorted by sequence_idx, small row groups so
+    /// intra-file pruning is exercised) and register it into DuckLake by path.
+    #[cfg(feature = "integration")]
+    fn seed_one_read_file(
+        conn: &Connection,
+        seed_dir: &Path,
+        prep_sample_idx: i64,
+        seq_start: i64,
+        n_reads: i64,
+    ) {
+        let file = seed_dir.join(format!("read_{prep_sample_idx}.parquet"));
+        let file_str = file.to_str().unwrap();
+        let seq_stop_excl = seq_start + n_reads;
+        conn.execute_batch(&format!(
+            "COPY (SELECT {prep_sample_idx}::BIGINT AS prep_sample_idx, \
+                    s::BIGINT AS sequence_idx, ('r' || s) AS read_id, 'AAAAA' AS sequence1, \
+                    NULL::UTINYINT[] AS qual1, NULL::VARCHAR AS sequence2, NULL::UTINYINT[] AS qual2 \
+                 FROM range({seq_start}, {seq_stop_excl}) t(s)) \
+             TO '{file_str}' (FORMAT PARQUET, ROW_GROUP_SIZE 2048)"
+        ))
+        .unwrap();
+        conn.execute(
+            "CALL ducklake_add_data_files('qiita_lake', 'read', ?)",
+            duckdb::params![file_str],
+        )
+        .unwrap();
+    }
+
+    /// Sum of `Total Files Read: N` across every scan in a query's EXPLAIN
+    /// ANALYZE tree — the deterministic DuckLake file-pruning signal (how many
+    /// data files the scan actually opened). Ties the assertion to the pinned
+    /// DuckDB build that emits this token.
+    #[cfg(feature = "integration")]
+    fn files_read_for(conn: &Connection, query: &str) -> i64 {
+        let mut stmt = conn.prepare(&format!("EXPLAIN ANALYZE {query}")).unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        let mut plan = String::new();
+        while let Some(row) = rows.next().unwrap() {
+            // The tree text is in the last column; concatenate every cell.
+            for i in 0..2 {
+                if let Ok(s) = row.get::<usize, String>(i) {
+                    plan.push_str(&s);
+                    plan.push('\n');
+                }
+            }
+        }
+        let mut total = 0i64;
+        for line in plan.lines() {
+            if let Some(idx) = line.find("Total Files Read:") {
+                let tail = &line[idx + "Total Files Read:".len()..];
+                let n: String = tail.chars().filter(|c| c.is_ascii_digit()).collect();
+                if let Ok(v) = n.parse::<i64>() {
+                    total += v;
+                }
+            }
+        }
+        total
+    }
+
+    /// PERFORMANCE ASSESSMENT: prove the block export prunes to the
+    /// block's own files and that the pruning is INVARIANT as the `read` table
+    /// grows — i.e. a block's cost is bounded by the block, not the table size.
+    /// Assumes a fresh catalog (CI resets `qiita_ducklake` before the Rust tier).
+    ///
+    /// Layout mirrors production: one file per sample (`ducklake_add_data_files`
+    /// of a per-sample Parquet sorted by sequence_idx, small row groups). A fixed
+    /// 4-file block (one a mid-file split member) is queried after seeding a
+    /// SMALL then a LARGE set of disjoint filler files; `Total Files Read` must
+    /// stay == the block's file count both times. Also confirms the shipped
+    /// `IN + BETWEEN + OR` (V3) prunes exactly as well as `IN + BETWEEN` (V2) and
+    /// the per-member `OR` alone (V1) — the exactness residual does not defeat
+    /// file pruning.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn export_read_block_prunes_and_scales() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        // Hermetic + re-runnable: drop any prior `read` registrations (leftover
+        // external-file entries from a previous run would double the files-read
+        // count) and rebuild the tables fresh. Safe under #[serial]: no other
+        // read test runs concurrently, and each seeds its own data.
+        conn.execute_batch(
+            "DROP VIEW IF EXISTS qiita_lake.read_masked; \
+             DROP TABLE IF EXISTS qiita_lake.read;",
+        )
+        .unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+
+        let seed_dir = Path::new(&data_path).join("seed_scale");
+        std::fs::create_dir_all(&seed_dir).unwrap();
+
+        // Fixed block: 4 samples, each seeded as a whole 6000-read file. Member
+        // 970_002 is a SPLIT — its block sub-range is only the first 2000 reads.
+        let bp: i64 = 970_000;
+        let members: [(i64, i64, i64, i64); 4] = [
+            // (prep, file_seq_start, member_start, member_stop)
+            (bp, 6_000_000, 6_000_000, 6_005_999),
+            (bp + 1, 6_020_000, 6_020_000, 6_025_999),
+            (bp + 2, 6_040_000, 6_040_000, 6_041_999), // split: file is [..,6_045_999]
+            (bp + 3, 6_060_000, 6_060_000, 6_065_999),
+        ];
+        for (prep, file_seq_start, _, _) in members {
+            seed_one_read_file(&conn, &seed_dir, prep, file_seq_start, 6_000);
+        }
+        let block_files = members.len() as i64;
+        let expected_result: i64 = 6_000 + 6_000 + 2_000 + 6_000; // split trims 4000
+
+        // V3 is built from the SAME production helper the export uses, so this
+        // test can't drift from the query the code actually emits. V1/V2 are
+        // hand-written comparison baselines (not production shapes).
+        let member_structs: Vec<auth::ExportReadBlockMember> = members
+            .iter()
+            .map(|(p, _, s, e)| auth::ExportReadBlockMember {
+                prep_sample_idx: *p,
+                sequence_idx_start: *s,
+                sequence_idx_stop: *e,
+            })
+            .collect();
+        let in_list = "970000,970001,970002,970003";
+        let block_min = 6_000_000;
+        let block_max = 6_065_999;
+        let member_or = members
+            .iter()
+            .map(|(p, _, s, e)| {
+                format!("(prep_sample_idx = {p} AND sequence_idx BETWEEN {s} AND {e})")
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let v1 = format!("SELECT prep_sample_idx FROM qiita_lake.read WHERE ({member_or})");
+        let v2 = format!(
+            "SELECT prep_sample_idx FROM qiita_lake.read WHERE prep_sample_idx IN ({in_list}) AND sequence_idx BETWEEN {block_min} AND {block_max}"
+        );
+        let v3 = format!(
+            "SELECT prep_sample_idx FROM qiita_lake.read WHERE {}",
+            block_read_where_clause(&member_structs)
+        );
+
+        // Seed a SMALL set of disjoint filler files (far-away ranges), measure.
+        let seed_filler = |conn: &Connection, from: i64, to: i64| {
+            for i in from..to {
+                seed_one_read_file(conn, &seed_dir, 971_000 + i, 7_000_000 + i * 2_000, 500);
+            }
+        };
+        seed_filler(&conn, 0, 16); // total 4 block + 16 filler = 20 files
+        let files_small: i64 = conn
+            .query_row(
+                "SELECT count(DISTINCT prep_sample_idx) FROM qiita_lake.read",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let v3_small = files_read_for(&conn, &v3);
+        eprintln!("[1b] {files_small} sample-files total; V3 files read = {v3_small} (block = {block_files})");
+        assert_eq!(v3_small, block_files, "V3 must read only the block's files");
+
+        // Grow the table ~5x with more disjoint filler, re-measure the SAME block.
+        seed_filler(&conn, 16, 96); // total 4 + 96 = 100 files
+        let files_large: i64 = conn
+            .query_row(
+                "SELECT count(DISTINCT prep_sample_idx) FROM qiita_lake.read",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let v3_large = files_read_for(&conn, &v3);
+        let v2_large = files_read_for(&conn, &v2);
+        let v1_large = files_read_for(&conn, &v1);
+        eprintln!(
+            "[1b] {files_large} sample-files total; files read V1={v1_large} V2={v2_large} V3={v3_large} (block = {block_files})"
+        );
+
+        // SCALE INVARIANCE: 5x more files, same block → same files read.
+        assert_eq!(
+            v3_large, block_files,
+            "V3 file pruning must be invariant to table size (read only the block's files)"
+        );
+        assert_eq!(
+            v3_large, v3_small,
+            "files read must not grow with table size"
+        );
+        // The coarse IN+BETWEEN is load-bearing: V2 prunes to the block's files,
+        // but V1 (the exact per-member OR ALONE) does NOT prune — a bare
+        // OR-of-ANDs full-scans every file. That is precisely why the shipped V3
+        // keeps IN+BETWEEN in front of the OR: those top-level conjuncts drive the
+        // file pruning, and the OR rides along as an exact residual on the pruned
+        // rows without defeating it (V3 == V2, not V1).
+        assert_eq!(
+            v2_large, block_files,
+            "V2 (IN+BETWEEN) prunes to block files"
+        );
+        assert_eq!(
+            v1_large, files_large,
+            "per-member OR ALONE does not prune (full scan) — coarse IN+BETWEEN is load-bearing"
+        );
+
+        // Exactness: V3 returns the split-trimmed result; V2 over-selects the
+        // split member's tail (proving the OR residual is load-bearing).
+        let v3_rows: i64 = conn
+            .query_row(&format!("SELECT count(*) FROM ({v3})"), [], |r| r.get(0))
+            .unwrap();
+        let v2_rows: i64 = conn
+            .query_row(&format!("SELECT count(*) FROM ({v2})"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v3_rows, expected_result, "V3 exact (split trimmed)");
+        assert_eq!(
+            v2_rows,
+            expected_result + 4_000,
+            "V2 over-selects the split tail"
+        );
+    }
+
+    /// BENCHMARK (post-compaction): DuckLake may compact our per-sample files into
+    /// one big file sorted by (prep_sample_idx, sequence_idx) — we don't control
+    /// that ("blind to" compaction). File-level pruning then can't skip the merged
+    /// file (its prep range spans the block), so efficiency rests on PARQUET
+    /// ROW-GROUP pruning inside the file. This benchmark seeds one large merged
+    /// file of INCOMPRESSIBLE rows and times a 4-sample block (and a 1-sample
+    /// "tight" query) against a forced full scan.
+    ///
+    /// VERDICT (DuckDB crate 1.10504.0 / DuckLake, measured): row-group pruning IS
+    /// active and its benefit SCALES — full/block was ≈3.6x at 159 MB and ≈6.3x at
+    /// 477 MB, with the block query staying ~flat (~6 ms) as the file grew while
+    /// the full scan grew linearly. So after compaction a block export degrades
+    /// GRACEFULLY (bounded by the block's row groups + fixed footer/setup cost),
+    /// not to a full-file scan. NB: DuckDB's `operator_rows_scanned` profiling
+    /// metric is unreliable here (constant ~32x inflation, identical for pruned and
+    /// full queries) — timing on incompressible data is the trustworthy signal.
+    ///
+    /// `#[ignore]`: a wall-clock benchmark, not a CI regression guard (timing
+    /// ratios flake under load). Run manually:
+    ///   cargo test --features integration bench_merged_file_rowgroup_pruning -- --ignored --nocapture
+    #[test]
+    #[ignore = "wall-clock benchmark; run with --ignored"]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn bench_merged_file_rowgroup_pruning() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        conn.execute_batch(
+            "DROP VIEW IF EXISTS qiita_lake.read_masked; DROP TABLE IF EXISTS qiita_lake.read;",
+        )
+        .unwrap();
+        ducklake::ensure_read_tables(&conn).unwrap();
+
+        let seed_dir = Path::new(&data_path).join("seed_merged");
+        std::fs::create_dir_all(&seed_dir).unwrap();
+
+        // ONE file: 100 samples x 10k reads = 1M rows, sorted by (prep, seq),
+        // ROW_GROUP_SIZE 25k -> ~40 row groups. sequence1 is ~150 INCOMPRESSIBLE
+        // chars (5x md5) so the file is large (I/O real) — a constant string would
+        // zstd away to nothing and mask any full-scan-vs-pruned I/O difference.
+        let base: i64 = 980_000;
+        let reads_per: i64 = 30_000;
+        let n_samples: i64 = 100;
+        let seq_base: i64 = 8_000_000;
+        let file = seed_dir.join("merged.parquet");
+        let file_str = file.to_str().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT ({base} + (i // {reads_per}))::BIGINT AS prep_sample_idx, \
+                    ({seq_base} + i)::BIGINT AS sequence_idx, ('r' || i) AS read_id, \
+                    substr(md5(i::VARCHAR) || md5((i*7)::VARCHAR) || md5((i*13)::VARCHAR) \
+                           || md5((i*17)::VARCHAR) || md5((i*19)::VARCHAR), 1, 150) AS sequence1, \
+                    NULL::UTINYINT[] AS qual1, NULL::VARCHAR AS sequence2, NULL::UTINYINT[] AS qual2 \
+                 FROM range(0, {n_samples} * {reads_per}) t(i) \
+                 ORDER BY prep_sample_idx, sequence_idx) \
+             TO '{file_str}' (FORMAT PARQUET, ROW_GROUP_SIZE 25000)"
+        ))
+        .unwrap();
+        let file_bytes = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+        eprintln!("[merged] merged file size = {} MB", file_bytes / 1_000_000);
+        conn.execute(
+            "CALL ducklake_add_data_files('qiita_lake', 'read', ?)",
+            duckdb::params![file_str],
+        )
+        .unwrap();
+
+        // Block = 4 SCATTERED samples (worst case for row-group locality).
+        let members = [
+            (
+                base + 10,
+                seq_base + 10 * reads_per,
+                seq_base + 10 * reads_per + reads_per - 1,
+            ),
+            (
+                base + 40,
+                seq_base + 40 * reads_per,
+                seq_base + 40 * reads_per + reads_per - 1,
+            ),
+            (
+                base + 70,
+                seq_base + 70 * reads_per,
+                seq_base + 70 * reads_per + reads_per - 1,
+            ),
+            (
+                base + 95,
+                seq_base + 95 * reads_per,
+                seq_base + 95 * reads_per + reads_per - 1,
+            ),
+        ];
+        let member_structs: Vec<auth::ExportReadBlockMember> = members
+            .iter()
+            .map(|(p, s, e)| auth::ExportReadBlockMember {
+                prep_sample_idx: *p,
+                sequence_idx_start: *s,
+                sequence_idx_stop: *e,
+            })
+            .collect();
+        let where_v3 = block_read_where_clause(&member_structs);
+        let q =
+            format!("SELECT prep_sample_idx, sequence_idx FROM qiita_lake.read WHERE {where_v3}");
+
+        let total: i64 = conn
+            .query_row("SELECT count(*) FROM qiita_lake.read", [], |r| r.get(0))
+            .unwrap();
+        eprintln!(
+            "[merged] total rows = {total} in ONE file; files read = {}",
+            files_read_for(&conn, &q)
+        );
+
+        // Full scan: a predicate matching everything on a non-stat column, so no
+        // prep/seq row-group stats can prune. Tight: a single prep (its rows are
+        // one contiguous run → a couple of row groups).
+        let full_q = "SELECT prep_sample_idx FROM qiita_lake.read WHERE sequence1 <> ''";
+        let tight_q = format!(
+            "SELECT prep_sample_idx FROM qiita_lake.read WHERE prep_sample_idx = {}",
+            base + 40
+        );
+
+        // Wall-clock, min of 7 (the trustworthy signal; operator_rows_scanned is
+        // unreliable here — see the doc comment). If row groups are skipped,
+        // block/tight are materially faster than the full scan.
+        let time_min = |conn: &Connection, query: &str| -> f64 {
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                let t = std::time::Instant::now();
+                let _ = conn
+                    .query_row(&format!("SELECT count(*) FROM ({query})"), [], |r| {
+                        r.get::<usize, i64>(0)
+                    })
+                    .unwrap();
+                best = best.min(t.elapsed().as_secs_f64());
+            }
+            best
+        };
+        let block_t = time_min(&conn, &q);
+        let tight_t = time_min(&conn, &tight_q);
+        let full_t = time_min(&conn, full_q);
+        eprintln!(
+            "[merged] time(s) min-of-7: block={block_t:.4} tight_1prep={tight_t:.4} full={full_t:.4}; \
+             full/block = {:.2}, full/tight = {:.2}",
+            full_t / block_t.max(1e-9),
+            full_t / tight_t.max(1e-9)
+        );
+
+        // Coarse pruning-active check (generous margin; the measured ratio is
+        // several-fold). If this ever fails, DuckLake stopped row-group pruning
+        // merged-file scans — investigate before trusting post-compaction perf.
+        assert!(
+            full_t > block_t * 1.5,
+            "expected the block query to be materially faster than a full scan \
+             (row-group pruning active); block={block_t:.4}s full={full_t:.4}s"
         );
     }
 }
