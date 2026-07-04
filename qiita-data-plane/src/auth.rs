@@ -295,6 +295,138 @@ pub fn verify_export_read(ticket: &[u8], secret: &[u8]) -> Result<ExportReadPayl
     serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
 }
 
+/// One member of an `export_read_block` selector: a prep_sample and the
+/// inclusive `sequence_idx` sub-range of it this block covers. A whole sample
+/// is `[start, stop]` == its `qiita.sequence_range`; a sample split across
+/// blocks contributes a sub-range to each. `deny_unknown_fields` pins the shape
+/// to exactly these three columns.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportReadBlockMember {
+    /// `i64`, matching the Postgres `prep_sample` identifier source of truth
+    /// and the `read.prep_sample_idx BIGINT` column in the DuckLake table.
+    pub prep_sample_idx: i64,
+    /// Inclusive lower `sequence_idx` bound of this member's sub-range.
+    pub sequence_idx_start: i64,
+    /// Inclusive upper `sequence_idx` bound of this member's sub-range.
+    pub sequence_idx_stop: i64,
+}
+
+/// Parsed payload for the `export_read_block` DoAction — the block-compute
+/// sibling of `export_read`.
+///
+/// Wire shape pinned by `qiita_control_plane.runner._resolve_staged_reads_block`:
+/// `{"action": "export_read_block", "dest": "<abs path>",
+///   "members": [{"prep_sample_idx": N, "sequence_idx_start": a,
+///                "sequence_idx_stop": b}, ...]}`.
+/// The data plane re-materializes the union of the members' `read` sub-ranges
+/// from its DuckLake `read` table to `dest` (a per-ticket `reads.parquet` a
+/// read-mask *block* job then consumes) — the bulk read bytes never transit the
+/// control plane. Constraining on `prep_sample_idx` (not `sequence_idx` alone)
+/// keeps the selector correct even where the inner index is only locally unique
+/// (the reusable block-compute case). No `work_ticket_idx`: the `dest` path the
+/// CP builds already carries the ticket. `deny_unknown_fields` keeps the
+/// contract tight: any extra field is a design slip surfaced loudly here.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportReadBlockPayload {
+    /// Action discriminator; the gRPC handler also rejects a payload whose
+    /// `action` is not "export_read_block".
+    pub action: String,
+    /// Absolute destination path for the materialized Parquet. The handler
+    /// re-validates it (`validate_export_dest`) before writing — under the
+    /// data plane's scratch root, no `..`, no single quote — even though the
+    /// token is HMAC-signed by the control plane (defense in depth).
+    pub dest: String,
+    /// The block's `(prep_sample_idx, sub-range)` members. The handler rejects
+    /// an empty list (an empty block is a control-plane bug, not a valid ask).
+    pub members: Vec<ExportReadBlockMember>,
+}
+
+/// Verify an `export_read_block` DoAction token and return its parsed payload.
+pub fn verify_export_read_block(
+    ticket: &[u8],
+    secret: &[u8],
+) -> Result<ExportReadBlockPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
+/// Parsed payload for the `delete_read_mask_block` DoAction — the idempotent
+/// block-replace sibling of `export_read_block`.
+///
+/// Wire shape pinned by
+/// `qiita_control_plane.actions.library.delete_read_mask_block_data`:
+/// `{"action": "delete_read_mask_block", "mask_idx": N,
+///   "members": [{"prep_sample_idx": N, "sequence_idx_start": a,
+///                "sequence_idx_stop": b}, ...]}`.
+/// The data plane deletes exactly this block's footprint from the DuckLake
+/// `read_mask` table — the rows for `mask_idx` whose `(prep_sample_idx,
+/// sequence_idx)` fall in the members' sub-ranges — so a block re-run can
+/// delete-then-re-register without double-counting or clobbering a sibling
+/// block's rows for a shared sample. The footprint is the SAME
+/// `(prep_sample_idx, sub-range)` member list `export_read_block` carries
+/// (reusing `ExportReadBlockMember`); it is exact by construction (per-member
+/// OR residual), so a split member never deletes a sibling block's tail. The
+/// extra `mask_idx` scopes the delete to this filtering identity — the `read`
+/// export needs no such column, `read_mask` does. `deny_unknown_fields` keeps
+/// the contract tight: any extra field is a design slip surfaced loudly here.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteReadMaskBlockPayload {
+    /// Action discriminator; the gRPC handler also rejects a payload whose
+    /// `action` is not "delete_read_mask_block".
+    pub action: String,
+    /// `i64`, matching the Postgres `mask_definition.idx BIGINT` source of truth
+    /// and the `read_mask.mask_idx BIGINT` column in the DuckLake table.
+    pub mask_idx: i64,
+    /// The block's `(prep_sample_idx, sub-range)` members. The handler rejects
+    /// an empty list (an empty block is a control-plane bug, not a valid ask).
+    pub members: Vec<ExportReadBlockMember>,
+}
+
+/// Verify a `delete_read_mask_block` DoAction token and return its parsed payload.
+pub fn verify_delete_read_mask_block(
+    ticket: &[u8],
+    secret: &[u8],
+) -> Result<DeleteReadMaskBlockPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
+/// Parsed payload for the `mask_metrics` DoAction.
+///
+/// Wire shape pinned by `qiita_control_plane.actions.library.mask_metrics_data`:
+/// `{"action": "mask_metrics", "mask_idx": N, "prep_sample_idx": M}`. Unlike
+/// `count_masked` (which reuses a `read_masked` DoGet ticket because the CLI
+/// already holds one), the block reconcile primitive runs control-plane-side and
+/// has no such ticket, so this is a first-class action token the CP signs. The
+/// data plane aggregates the sample's `read_mask` rows for the mask across ALL
+/// its blocks — the per-`(prep_sample, mask)` rollup a per-sample read-mask would
+/// have written from its single local parquet, now derived from the persisted
+/// DuckLake table because a block-masked sample's rows arrive from several blocks.
+/// `deny_unknown_fields` keeps the contract tight: any extra field is a design
+/// slip surfaced loudly here.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaskMetricsPayload {
+    /// Action discriminator; the gRPC handler also rejects a payload whose
+    /// `action` is not "mask_metrics".
+    pub action: String,
+    /// `i64`, matching the Postgres `mask_definition.idx BIGINT` source of truth
+    /// and the `read_mask.mask_idx BIGINT` column in the DuckLake table.
+    pub mask_idx: i64,
+    /// `i64`, matching the Postgres `prep_sample` identifier source of truth and
+    /// the `read_mask.prep_sample_idx BIGINT` column in the DuckLake table.
+    pub prep_sample_idx: i64,
+}
+
+/// Verify a `mask_metrics` DoAction token and return its parsed payload.
+pub fn verify_mask_metrics(ticket: &[u8], secret: &[u8]) -> Result<MaskMetricsPayload, AuthError> {
+    let payload_bytes = verify_ticket_raw(ticket, secret)?;
+    serde_json::from_slice(&payload_bytes).map_err(|e| AuthError::MalformedPayload(e.to_string()))
+}
+
 /// Parsed DoPut ticket payload.
 ///
 /// Wire shape pinned by `qiita_control_plane.auth.tickets.sign_doput`:
@@ -598,6 +730,195 @@ mod tests {
             br#"{"action":"export_read","dest":"/scratch/x","prep_sample_idx":1,"smuggled":9}"#;
         let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
         match verify_export_read(&ticket, b"dev-secret").unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
+    }
+
+    // --------------------------------------------------------------------
+    // export_read_block action token variant
+    // --------------------------------------------------------------------
+
+    fn make_export_read_block_ticket(
+        dest: &str,
+        members: &str,
+        secret: &[u8],
+        expiry: u64,
+    ) -> Vec<u8> {
+        // Canonical JSON: sorted keys, no whitespace — matches sign_action's
+        // json.dumps(sort_keys=True). Top-level keys: action, dest, members.
+        let payload =
+            format!(r#"{{"action":"export_read_block","dest":"{dest}","members":{members}}}"#);
+        make_doput_ticket_raw(payload.as_bytes(), secret, expiry)
+    }
+
+    #[test]
+    fn verify_export_read_block_round_trip() {
+        // Two members with non-adjacent sequence_idx windows — the block shape.
+        let members = r#"[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109},{"prep_sample_idx":103,"sequence_idx_start":300,"sequence_idx_stop":309}]"#;
+        let ticket = make_export_read_block_ticket(
+            "/scratch/ticket/900/reads.parquet",
+            members,
+            b"dev-secret",
+            future_expiry(300),
+        );
+        let payload =
+            verify_export_read_block(&ticket, b"dev-secret").expect("valid token should verify");
+        assert_eq!(payload.action, "export_read_block");
+        assert_eq!(payload.dest, "/scratch/ticket/900/reads.parquet");
+        assert_eq!(payload.members.len(), 2);
+        assert_eq!(payload.members[0].prep_sample_idx, 101);
+        assert_eq!(payload.members[0].sequence_idx_start, 100);
+        assert_eq!(payload.members[0].sequence_idx_stop, 109);
+        assert_eq!(payload.members[1].prep_sample_idx, 103);
+        assert_eq!(payload.members[1].sequence_idx_start, 300);
+        assert_eq!(payload.members[1].sequence_idx_stop, 309);
+    }
+
+    #[test]
+    fn verify_export_read_block_rejects_bad_hmac() {
+        let members = r#"[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2}]"#;
+        let mut ticket = make_export_read_block_ticket(
+            "/scratch/ticket/1/reads.parquet",
+            members,
+            b"dev-secret",
+            future_expiry(300),
+        );
+        ticket[12] ^= 0xFF;
+        assert_eq!(
+            verify_export_read_block(&ticket, b"dev-secret").unwrap_err(),
+            AuthError::InvalidHmac
+        );
+    }
+
+    #[test]
+    fn verify_export_read_block_rejects_extra_fields() {
+        // deny_unknown_fields on the payload: a smuggled top-level field is a
+        // contract slip surfaced here.
+        let payload =
+            br#"{"action":"export_read_block","dest":"/scratch/x","members":[],"smuggled":9}"#;
+        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
+        match verify_export_read_block(&ticket, b"dev-secret").unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_export_read_block_rejects_extra_member_fields() {
+        // deny_unknown_fields on a member: the member shape is exactly
+        // (prep_sample_idx, sequence_idx_start, sequence_idx_stop).
+        let payload = br#"{"action":"export_read_block","dest":"/scratch/x","members":[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2,"smuggled":9}]}"#;
+        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
+        match verify_export_read_block(&ticket, b"dev-secret").unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
+    }
+
+    // --------------------------------------------------------------------
+    // mask_metrics action token variant
+    // --------------------------------------------------------------------
+
+    fn make_mask_metrics_ticket(
+        mask_idx: i64,
+        prep_sample_idx: i64,
+        secret: &[u8],
+        expiry: u64,
+    ) -> Vec<u8> {
+        // Canonical JSON: sorted keys, no whitespace — matches sign_action's
+        // json.dumps(sort_keys=True). Top-level keys: action, mask_idx,
+        // prep_sample_idx.
+        let payload = format!(
+            r#"{{"action":"mask_metrics","mask_idx":{mask_idx},"prep_sample_idx":{prep_sample_idx}}}"#
+        );
+        make_doput_ticket_raw(payload.as_bytes(), secret, expiry)
+    }
+
+    #[test]
+    fn verify_mask_metrics_round_trip() {
+        let ticket = make_mask_metrics_ticket(42, 7, b"dev-secret", future_expiry(300));
+        let payload =
+            verify_mask_metrics(&ticket, b"dev-secret").expect("valid token should verify");
+        assert_eq!(payload.action, "mask_metrics");
+        assert_eq!(payload.mask_idx, 42);
+        assert_eq!(payload.prep_sample_idx, 7);
+    }
+
+    #[test]
+    fn verify_mask_metrics_rejects_bad_hmac() {
+        let mut ticket = make_mask_metrics_ticket(42, 7, b"dev-secret", future_expiry(300));
+        ticket[12] ^= 0xFF;
+        assert_eq!(
+            verify_mask_metrics(&ticket, b"dev-secret").unwrap_err(),
+            AuthError::InvalidHmac
+        );
+    }
+
+    #[test]
+    fn verify_mask_metrics_rejects_extra_fields() {
+        // deny_unknown_fields: a smuggled field is a contract slip surfaced here.
+        let payload = br#"{"action":"mask_metrics","mask_idx":1,"prep_sample_idx":2,"smuggled":9}"#;
+        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
+        match verify_mask_metrics(&ticket, b"dev-secret").unwrap_err() {
+            AuthError::MalformedPayload(_) => {}
+            other => panic!("expected MalformedPayload, got {other:?}"),
+        }
+    }
+
+    // --------------------------------------------------------------------
+    // delete_read_mask_block action token variant
+    // --------------------------------------------------------------------
+
+    fn make_delete_read_mask_block_ticket(
+        mask_idx: i64,
+        members: &str,
+        secret: &[u8],
+        expiry: u64,
+    ) -> Vec<u8> {
+        // Canonical JSON: sorted keys, no whitespace — matches sign_action's
+        // json.dumps(sort_keys=True). Top-level keys: action, mask_idx, members.
+        let payload = format!(
+            r#"{{"action":"delete_read_mask_block","mask_idx":{mask_idx},"members":{members}}}"#
+        );
+        make_doput_ticket_raw(payload.as_bytes(), secret, expiry)
+    }
+
+    #[test]
+    fn verify_delete_read_mask_block_round_trip() {
+        let members = r#"[{"prep_sample_idx":101,"sequence_idx_start":100,"sequence_idx_stop":109},{"prep_sample_idx":103,"sequence_idx_start":300,"sequence_idx_stop":309}]"#;
+        let ticket =
+            make_delete_read_mask_block_ticket(42, members, b"dev-secret", future_expiry(300));
+        let payload = verify_delete_read_mask_block(&ticket, b"dev-secret")
+            .expect("valid token should verify");
+        assert_eq!(payload.action, "delete_read_mask_block");
+        assert_eq!(payload.mask_idx, 42);
+        assert_eq!(payload.members.len(), 2);
+        assert_eq!(payload.members[0].prep_sample_idx, 101);
+        assert_eq!(payload.members[0].sequence_idx_start, 100);
+        assert_eq!(payload.members[0].sequence_idx_stop, 109);
+        assert_eq!(payload.members[1].prep_sample_idx, 103);
+    }
+
+    #[test]
+    fn verify_delete_read_mask_block_rejects_bad_hmac() {
+        let members = r#"[{"prep_sample_idx":1,"sequence_idx_start":1,"sequence_idx_stop":2}]"#;
+        let mut ticket =
+            make_delete_read_mask_block_ticket(1, members, b"dev-secret", future_expiry(300));
+        ticket[12] ^= 0xFF;
+        assert_eq!(
+            verify_delete_read_mask_block(&ticket, b"dev-secret").unwrap_err(),
+            AuthError::InvalidHmac
+        );
+    }
+
+    #[test]
+    fn verify_delete_read_mask_block_rejects_extra_fields() {
+        // deny_unknown_fields: a smuggled top-level field is a contract slip.
+        let payload =
+            br#"{"action":"delete_read_mask_block","mask_idx":1,"members":[],"smuggled":9}"#;
+        let ticket = make_doput_ticket_raw(payload, b"dev-secret", future_expiry(300));
+        match verify_delete_read_mask_block(&ticket, b"dev-secret").unwrap_err() {
             AuthError::MalformedPayload(_) => {}
             other => panic!("expected MalformedPayload, got {other:?}"),
         }

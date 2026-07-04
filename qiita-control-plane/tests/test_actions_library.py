@@ -42,6 +42,8 @@ def test_library_re_exports_match_module_callables():
     assert LIBRARY[LibraryPrimitive.REGISTER_INDEX] is lib.register_index
     assert LIBRARY[LibraryPrimitive.PERSIST_READ_METRICS] is lib.persist_read_metrics
     assert LIBRARY[LibraryPrimitive.PERSIST_QC_REPORT] is lib.persist_qc_report
+    assert LIBRARY[LibraryPrimitive.DELETE_READ_MASK_BLOCK] is lib.delete_read_mask_block
+    assert LIBRARY[LibraryPrimitive.RECONCILE_BLOCK] is lib.reconcile_block
 
 
 async def test_delete_pool_reads_data_empty_set_short_circuits():
@@ -55,6 +57,20 @@ async def test_delete_pool_reads_data_empty_set_short_circuits():
         data_plane_url="grpc://unreachable:1",
     )
     assert result == {}
+
+
+async def test_delete_read_mask_block_data_empty_members_short_circuits():
+    """An empty members list returns 0 without a Flight call — the idempotent
+    block-replace wrapper never touches the data plane for an empty block."""
+    from qiita_control_plane.actions import library as lib
+
+    rows = await lib.delete_read_mask_block_data(
+        mask_idx=7,
+        members=[],
+        hmac_secret=b"\x00" * 32,
+        data_plane_url="grpc://unreachable:1",
+    )
+    assert rows == 0
 
 
 def test_reap_staged_reads_none_root_is_noop():

@@ -24,6 +24,7 @@ from qiita_control_plane.runner import (
     STAGED_READS_BINDING,
     _resolve_sample_map,
     _resolve_staged_reads,
+    _resolve_staged_reads_block,
     _workflow_declares_input,
     _workflow_needs_staged_reads,
 )
@@ -191,3 +192,153 @@ def test_workflow_declares_input_checks_optional_too():
     steps = [_step(inputs=["reads"], optional_inputs=["host_rype_path"])]
     assert _workflow_declares_input(steps, "host_rype_path") is True
     assert _workflow_declares_input(steps, "sample_map") is False
+
+
+# --- block-export resolver (_resolve_staged_reads_block) -------------------
+
+_EXPORT_READ_BLOCK = "qiita_control_plane.runner._do_action_export_read_block"
+
+
+def _decode_token_payload(token: bytes) -> dict:
+    """Extract the canonical-JSON payload from a signed action token. Wire
+    format: <1B version><4B big-endian len><payload><32B hmac><8B expiry>."""
+    import json
+    import struct
+
+    (plen,) = struct.unpack(">I", token[1:5])
+    return json.loads(token[5 : 5 + plen])
+
+
+_BLOCK_MEMBERS = [
+    {"prep_sample_idx": 101, "sequence_idx_start": 100, "sequence_idx_stop": 109},
+    {"prep_sample_idx": 103, "sequence_idx_start": 300, "sequence_idx_stop": 309},
+]
+
+
+def test_resolve_staged_reads_block_binds_workspace_parquet_and_signs_members(
+    tmp_path, monkeypatch
+):
+    """A block always sources from the DP `export_read_block` action (a block may
+    hold a partial sample, so no per-sample durable copy serves it). `reads` binds
+    to the written file, and the signed token carries the members verbatim."""
+    workspace = tmp_path / "ticket" / "900"
+    dest = workspace / "reads.parquet"
+    captured: dict = {}
+
+    def _fake_export(_url, token):
+        captured["payload"] = _decode_token_payload(token)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("parquet-bytes")
+        return {"count": 5, "dest": str(dest)}
+
+    monkeypatch.setattr(_EXPORT_READ_BLOCK, _fake_export)
+
+    bound = asyncio.run(
+        _resolve_staged_reads_block(
+            _BLOCK_MEMBERS,
+            data_plane_url="grpc://unused",
+            hmac_secret=b"x" * 16,
+            workspace=workspace,
+        )
+    )
+    assert bound[STAGED_READS_BINDING] == dest
+    assert dest.exists()
+
+    payload = captured["payload"]
+    assert payload["action"] == "export_read_block"
+    assert payload["dest"] == str(dest)
+    assert payload["members"] == _BLOCK_MEMBERS
+
+
+def test_resolve_staged_reads_block_empty_members_is_bad_input(tmp_path, monkeypatch):
+    """An empty block is a planning bug → BAD_INPUT, and the DP is never called."""
+
+    def _boom(_url, _token):
+        raise AssertionError("export_read_block must not fire for an empty block")
+
+    monkeypatch.setattr(_EXPORT_READ_BLOCK, _boom)
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(
+            _resolve_staged_reads_block(
+                [],
+                data_plane_url="grpc://unused",
+                hmac_secret=b"x" * 16,
+                workspace=tmp_path / "ws",
+            )
+        )
+    assert exc.value.kind == FailureKind.BAD_INPUT
+
+
+def test_resolve_staged_reads_block_zero_count_is_bad_input(tmp_path, monkeypatch):
+    """The block selected zero reads (its members' ranges match nothing) →
+    BAD_INPUT: a planning bug, since blocks are tiled from sequence_range bounds."""
+    monkeypatch.setattr(_EXPORT_READ_BLOCK, lambda _u, _t: {"count": 0, "dest": "x"})
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(
+            _resolve_staged_reads_block(
+                _BLOCK_MEMBERS,
+                data_plane_url="grpc://unused",
+                hmac_secret=b"x" * 16,
+                workspace=tmp_path / "ws",
+            )
+        )
+    assert exc.value.kind == FailureKind.BAD_INPUT
+
+
+def test_resolve_staged_reads_block_export_failure_is_bad_input(tmp_path, monkeypatch):
+    """A Flight failure is wrapped as BAD_INPUT, never an untyped exception."""
+
+    def _boom(_url, _token):
+        raise RuntimeError("Flight: connection refused")
+
+    monkeypatch.setattr(_EXPORT_READ_BLOCK, _boom)
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(
+            _resolve_staged_reads_block(
+                _BLOCK_MEMBERS,
+                data_plane_url="grpc://unused",
+                hmac_secret=b"x" * 16,
+                workspace=tmp_path / "ws",
+            )
+        )
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "data plane" in exc.value.reason
+
+
+def test_resolve_staged_reads_block_malformed_member_is_bad_input(tmp_path, monkeypatch):
+    """A member missing a key (a planner bug) fails BAD_INPUT — not an untyped
+    KeyError that would strand the ticket in PROCESSING. The DP is never called."""
+
+    def _boom(_url, _token):
+        raise AssertionError("export_read_block must not fire for a malformed member")
+
+    monkeypatch.setattr(_EXPORT_READ_BLOCK, _boom)
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(
+            _resolve_staged_reads_block(
+                [{"prep_sample_idx": 101, "sequence_idx_start": 100}],  # missing stop
+                data_plane_url="grpc://unused",
+                hmac_secret=b"x" * 16,
+                workspace=tmp_path / "ws",
+            )
+        )
+    assert exc.value.kind == FailureKind.BAD_INPUT
+
+
+def test_resolve_staged_reads_block_missing_file_is_bad_input(tmp_path, monkeypatch):
+    """count>0 but no file landed → BAD_INPUT at submission, not a downstream
+    FileNotFoundError."""
+    workspace = tmp_path / "ticket" / "900"
+    dest = workspace / "reads.parquet"
+    monkeypatch.setattr(_EXPORT_READ_BLOCK, lambda _u, _t: {"count": 5, "dest": str(dest)})
+    with pytest.raises(BackendFailure) as exc:
+        asyncio.run(
+            _resolve_staged_reads_block(
+                _BLOCK_MEMBERS,
+                data_plane_url="grpc://unused",
+                hmac_secret=b"x" * 16,
+                workspace=workspace,
+            )
+        )
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "wrote no file" in exc.value.reason

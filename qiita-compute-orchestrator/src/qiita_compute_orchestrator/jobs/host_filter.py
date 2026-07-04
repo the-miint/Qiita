@@ -54,10 +54,13 @@ bind/execute — so the query / survivors relations are non-temp VIEWs and the
 host-id accumulators are non-temp TABLEs (TEMP tables / CTEs are not visible to
 that connection; see docs/duckdb-miint.md).
 
-`mask_idx` and `prep_sample_idx` are per-run constants stamped onto every
-`read_mask` row at emit time. `mask_idx` is the CP-minted filtering-config
-identity (the runner mints it before this step and threads it in via `params`);
-multiple masks coexist over the same reads.
+`mask_idx` is a per-run constant stamped onto every `read_mask` row at emit
+time — the CP-minted filtering-config identity (the runner mints it before this
+step and threads it in via `params`); multiple masks coexist over the same
+reads. `prep_sample_idx`, by contrast, is stamped PER ROW from the reads
+parquet: a block spans many prep_samples, so there is no single owner. A
+single-sample ticket has one prep_sample_idx on every read, so this is a strict
+generalization — identical output for the per-sample read-mask path.
 """
 
 from __future__ import annotations
@@ -108,6 +111,10 @@ _QUERY = "host_filter_query"
 _SURVIVORS = "host_filter_survivors"
 _RYPE_HOST = "host_filter_rype_hits"
 _MM2_HOST = "host_filter_minimap2_hits"
+# The per-read (sequence_idx -> prep_sample_idx) map, projected from the reads
+# parquet so the final mask can stamp prep_sample_idx PER ROW rather than as a
+# per-run constant — a block spans many prep_samples (see the COPY below).
+_READ_META = "host_filter_read_meta"
 
 # A QC-pass read's trimmed sequence/qual: the same substr / list-slice math the
 # read_masked view applies (1-based start, length arg for substr; 1-based
@@ -134,8 +141,15 @@ class Inputs(BaseModel):
     FILE) are the host indexes — bound when host filtering is enabled, neither
     when disabled (the runner resolves them as optional inputs); a None path
     skips its stage. `mask_idx` is the CP-minted filtering-config identity stamped
-    onto every output row. `prep_sample_idx` / `work_ticket_idx` are the
-    framework-injected scope scalars.
+    onto every output row. `work_ticket_idx` is the framework-injected scope
+    scalar.
+
+    `prep_sample_idx` is OPTIONAL and no longer read: the mask stamps each row's
+    owner from the reads parquet's own `prep_sample_idx` column, so a multi-sample
+    block is handled without a scope scalar. A PREP_SAMPLE-scoped ticket still has
+    the framework inject it (one sample), but the kernel ignores it — the per-row
+    value is authoritative and identical for the single-sample case. A block
+    ticket flows no prep_sample_idx scalar at all (None here).
     """
 
     reads: Path
@@ -143,7 +157,7 @@ class Inputs(BaseModel):
     mask_idx: int
     host_rype_path: Path | None = None
     host_minimap2_path: Path | None = None
-    prep_sample_idx: int
+    prep_sample_idx: int | None = None
     work_ticket_idx: int
 
 
@@ -244,6 +258,16 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # and the final COPY).
             conn.execute(f"CREATE VIEW {_QC_MASK} AS SELECT * FROM read_parquet('{qc_mask_sql}')")
 
+            # Per-read (sequence_idx -> prep_sample_idx) map. The final COPY joins
+            # it to stamp each mask row's owner FROM THE READS rather than from a
+            # per-run constant — a block's reads span many prep_samples. Projected
+            # to the two key columns so DuckDB reads only them from the (wide)
+            # reads parquet; sequence_idx is globally unique, so the join is 1:1.
+            conn.execute(
+                f"CREATE VIEW {_READ_META} AS "
+                f"SELECT sequence_idx, prep_sample_idx FROM read_parquet('{reads_sql}')"
+            )
+
             # The host-classify query: the TRIMMED QC-pass reads, keyed by
             # sequence_idx AS read_id (the tools' id column), carrying the trimmed
             # R1/R2 the tools k-mer/align. Only reason='pass' rows — a QC-failed
@@ -291,14 +315,16 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # Merge host hits into the qc_mask under the privacy precedence:
             # minimap2 > rype > the qc_mask's own reason. Host only ever overrides
             # 'pass' (the query view restricted classify to pass reads), so a
-            # qc_* row is untouched. mask_idx / prep_sample_idx are per-run
-            # constants stamped here. ORDER BY (mask_idx, prep_sample_idx,
-            # sequence_idx) — the read_mask table's sort key (sequence_idx last
-            # for row-group pruning).
+            # qc_* row is untouched. mask_idx is the per-run constant stamped here;
+            # prep_sample_idx is stamped PER ROW from the reads (the _READ_META
+            # join) so a multi-sample block records each read's true owner. The
+            # inner join is 1:1 (every qc_mask row is a read qc emitted from these
+            # same reads). ORDER BY (mask_idx, prep_sample_idx, sequence_idx) — the
+            # read_mask table's sort key (sequence_idx last for row-group pruning).
             conn.execute(
                 "COPY (SELECT "
                 "  ?::BIGINT AS mask_idx, "
-                "  ?::BIGINT AS prep_sample_idx, "
+                "  rm.prep_sample_idx, "
                 "  q.sequence_idx, "
                 "  CASE "
                 f"    WHEN mm.sequence_idx IS NOT NULL THEN '{ReadMaskReason.HOST_MINIMAP2.value}' "
@@ -307,11 +333,12 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "  END AS reason, "
                 "  q.left_trim1, q.right_trim1, q.left_trim2, q.right_trim2 "
                 f"FROM {_QC_MASK} q "
+                f"JOIN {_READ_META} rm USING (sequence_idx) "
                 f"LEFT JOIN {_RYPE_HOST} ry USING (sequence_idx) "
                 f"LEFT JOIN {_MM2_HOST} mm USING (sequence_idx) "
                 "ORDER BY mask_idx, prep_sample_idx, sequence_idx) "
                 f"TO '{out_sql}' ({PARQUET_OPTS})",
-                [inputs.mask_idx, inputs.prep_sample_idx],
+                [inputs.mask_idx],
             )
         success = True
     finally:

@@ -76,10 +76,14 @@ def _bridge_http(manifest_dict: dict, tickets_by_prep: dict[int, str], pool_idx:
 
     def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
         if method == "GET" and url.endswith(manifest_suffix):
-            return httpx.Response(200, json=manifest_dict, request=httpx.Request(method, url))
+            return httpx.Response(
+                200, json=manifest_dict, request=httpx.Request(method, url)
+            )
         if method == "POST" and url.endswith(PATH_ADMIN_MASKED_READ_EXPORT_TICKET):
             ticket = tickets_by_prep[json["prep_sample_idx"]]
-            return httpx.Response(201, json={"ticket": ticket}, request=httpx.Request(method, url))
+            return httpx.Response(
+                201, json={"ticket": ticket}, request=httpx.Request(method, url)
+            )
         return httpx.Response(404, request=httpx.Request(method, url))
 
     return fake_request
@@ -103,11 +107,18 @@ async def seeded(postgres_pool, human_admin_session):
 
     bs = await seed_biosample(postgres_pool, owner_idx=owner, created_by_idx=owner)
     await postgres_pool.execute(
-        "UPDATE qiita.biosample SET biosample_accession = $1 WHERE idx = $2", accession, bs
+        "UPDATE qiita.biosample SET biosample_accession = $1 WHERE idx = $2",
+        accession,
+        bs,
     )
-    ps = await seed_sequenced_prep_sample(postgres_pool, biosample_idx=bs, owner_idx=owner)
+    ps = await seed_sequenced_prep_sample(
+        postgres_pool, biosample_idx=bs, owner_idx=owner
+    )
     run_idx, pool_idx, ss = await seed_sequenced_sample_subtype(
-        postgres_pool, prep_sample_idx=ps, owner_idx=owner, sequenced_pool_item_id=f"item-{token}"
+        postgres_pool,
+        prep_sample_idx=ps,
+        owner_idx=owner,
+        sequenced_pool_item_id=f"item-{token}",
     )
     async with postgres_pool.acquire() as conn:
         mask = await mint_mask_definition(
@@ -128,11 +139,17 @@ async def seeded(postgres_pool, human_admin_session):
     }
 
     await postgres_pool.execute("DELETE FROM qiita.sequenced_sample WHERE idx = $1", ss)
-    await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
-    await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
+    await postgres_pool.execute(
+        "DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx
+    )
     await postgres_pool.execute("DELETE FROM qiita.prep_sample WHERE idx = $1", ps)
     await postgres_pool.execute("DELETE FROM qiita.biosample WHERE idx = $1", bs)
-    await postgres_pool.execute("DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx)
+    await postgres_pool.execute(
+        "DELETE FROM qiita.mask_definition WHERE mask_idx = $1", mask_idx
+    )
 
 
 async def test_masked_read_export_e2e_parquet_and_fastq(
@@ -203,6 +220,7 @@ async def test_masked_read_export_e2e_parquet_and_fastq(
             body=MaskedReadExportTicketRequest(
                 prep_sample_idx=sample["prep_sample_idx"], mask_idx=mask_idx
             ),
+            pool=postgres_pool,
             hmac_secret=secret,
             _role=None,
             _scope=None,
@@ -241,7 +259,9 @@ async def test_masked_read_export_e2e_parquet_and_fastq(
     assert pq.is_file()
     rows = (
         duckdb.connect(":memory:")
-        .execute(f"SELECT read_id, sequence1, sequence2 FROM read_parquet('{pq}') ORDER BY read_id")
+        .execute(
+            f"SELECT read_id, sequence1, sequence2 FROM read_parquet('{pq}') ORDER BY read_id"
+        )
         .fetchall()
     )
     assert [r[0] for r in rows] == ["r1", "r3"]  # r2 (host_rype) redacted by the view
@@ -325,6 +345,7 @@ async def test_masked_read_export_e2e_parquet_idempotent_recount(
             body=MaskedReadExportTicketRequest(
                 prep_sample_idx=sample["prep_sample_idx"], mask_idx=mask_idx
             ),
+            pool=postgres_pool,
             hmac_secret=secret,
             _role=None,
             _scope=None,
@@ -369,7 +390,9 @@ async def test_masked_read_export_e2e_parquet_idempotent_recount(
 
     # Run 2: nothing changed → live count matches on disk → skipped, file untouched.
     assert cli.main(argv) == 0
-    assert "exported 0 sample(s) (skipped 1 already up to date)" in capsys.readouterr().out
+    assert (
+        "exported 0 sample(s) (skipped 1 already up to date)" in capsys.readouterr().out
+    )
     assert _rows() == 2
 
     # Add a third pass read so the live count_masked now returns 3, not 2.

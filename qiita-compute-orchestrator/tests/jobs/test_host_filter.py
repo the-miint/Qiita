@@ -177,6 +177,63 @@ def test_host_filter_marks_rype_union_minimap2(tmp_path, monkeypatch, write_read
     assert consts == [(_MASK_IDX, _PREP_SAMPLE_IDX)]
 
 
+def test_host_filter_multi_sample_block_stamps_per_row_prep_sample(
+    tmp_path, monkeypatch, write_reads
+):
+    """A BLOCK's reads span several prep_samples, so the mask must stamp each
+    row's OWN prep_sample_idx (read per-row from the reads parquet), not a single
+    per-run constant. sequence_idx is globally unique, so a host hit still marks
+    exactly the right read regardless of which sample it belongs to."""
+    from qiita_compute_orchestrator.jobs import host_filter
+
+    # Two samples in one block: sample 5 owns seq 10,20; sample 7 owns seq 30,40.
+    reads = write_reads(
+        tmp_path / "reads.parquet",
+        [
+            (10, "a", "ACGTACGTAC", "ACGTACGTAC"),
+            (20, "b", "ACGTACGTAC", "ACGTACGTAC"),
+            (30, "c", "ACGTACGTAC", "ACGTACGTAC"),
+            (40, "d", "ACGTACGTAC", None),
+        ],
+        prep_sample_idx=[5, 5, 7, 7],
+    )
+    qc_mask = _qc_mask(
+        tmp_path / "qc_mask.parquet",
+        [
+            (10, ReadMaskReason.PASS.value, True),
+            (20, ReadMaskReason.PASS.value, True),
+            (30, ReadMaskReason.PASS.value, True),
+            (40, ReadMaskReason.PASS.value, False),
+        ],
+    )
+
+    def fake_rype(conn, index_path, sequence_table, dest_table, *, threshold):
+        # Flag one read from EACH sample (seq 20 -> sample 5, seq 30 -> sample 7).
+        conn.execute(f"INSERT INTO {dest_table} VALUES (20), (30)")
+
+    monkeypatch.setattr(host_filter, "_run_rype_classify", fake_rype)
+
+    out = asyncio.run(
+        host_filter.execute(
+            _inputs(host_filter, reads=reads, qc_mask=qc_mask, host_rype_path=_ryxdi(tmp_path)),
+            tmp_path / "ws",
+        )
+    )
+
+    # Each row carries its OWN owner, and both samples appear in one output.
+    with duckdb.connect(":memory:") as conn:
+        rows = conn.execute(
+            f"SELECT sequence_idx, prep_sample_idx, reason "
+            f"FROM read_parquet('{out['read_mask']}') ORDER BY sequence_idx"
+        ).fetchall()
+    assert rows == [
+        (10, 5, ReadMaskReason.PASS.value),
+        (20, 5, ReadMaskReason.HOST_RYPE.value),
+        (30, 7, ReadMaskReason.HOST_RYPE.value),
+        (40, 7, ReadMaskReason.PASS.value),
+    ]
+
+
 def test_host_filter_classifies_only_pass_reads(tmp_path, monkeypatch, write_reads):
     """Host classify runs ONLY on reason='pass' reads; a qc-failed read keeps its
     qc_* reason and is never handed to the tools (privacy: host never re-runs on a
