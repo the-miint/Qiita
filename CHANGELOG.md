@@ -664,6 +664,7 @@ the `no-changelog` label).
   a newly-added action fails the build until it is consciously classified
   replay-safe. Documented in `docs/auth.md#ticket-replay` and the CLAUDE.md
   data-plane section. (#246)
+- A human PAT's effective scopes are now intersected with the principal's **current** role ceiling at token-resolve time, so a role downgrade (or a shrunk `ROLE_IMPLIED_SCOPES`) immediately narrows an already-minted token on scope-only-gated routes without revocation. Service-account tokens are unaffected (their ceiling is fixed, not role-derived). Note: this also narrows any human token that was minted *above* its role ceiling via low-level tooling that skips the mint-time ceiling check — such a token silently loses the out-of-ceiling scopes at the next resolve. (#242)
 - Auth integer env-knobs (`AUTHROCKET_JWT_LEEWAY_SECONDS`, `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS`, `QIITA_TOKEN_DEFAULT_TTL_DAYS`, `AUTH_HANDOFF_FRESHNESS_SECONDS`, `CLI_LOGIN_CODE_TTL_SECONDS`) are now validated at boot instead of parsed with a bare `int()` — a non-int or non-positive value fails loudly (leeway may be 0). (#241)
 - `GET /reference` and `GET /prep-protocol` accept a bounded `limit` query param (default 1000, max 5000) so the anonymous catalog lists can't return an unbounded payload. (#241)
 - Flight-ticket and login-cookie signing now share `qiita_common.hashing.canonical_json` instead of three hand-rolled `json.dumps(sort_keys=…)` spellings, removing the risk of the HMAC'd wire serialization drifting. (#241)
@@ -1179,6 +1180,7 @@ the `no-changelog` label).
 
 ### Fixed
 
+- The workflow runner no longer strands a work ticket on a pre-loop failure. The action fetch, PENDING→PROCESSING transition, workspace `mkdir`, and step-progress load now run inside the failure-handling `try`, so an action disabled between submit and dispatch (or a DB/filesystem blip there) transitions the ticket to FAILED (attributed to the `submission` stage) instead of leaving it stuck in PENDING/PROCESSING with no failure recorded. (#242)
 - **CLI-login plaintext PATs are no longer stored at rest.** `cli_login_code.plaintext_pat` is scrubbed the instant an ot_code is redeemed and a background sweeper deletes consumed/expired rows; previously a consumed row kept a usable bearer token for the token's full life (up to 90 days). (#241)
 - `sign_ticket` rejects an empty Flight-ticket filter (which the data plane treats as `SELECT * FROM <table>`) at the signing boundary, not just per-route. (#241)
 - DB constraint/trigger violations (principal disable/retire, prep_sample publication lock) return stable client messages instead of leaking internal constraint/trigger names. (#241)

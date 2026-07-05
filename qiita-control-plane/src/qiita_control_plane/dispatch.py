@@ -92,12 +92,11 @@ async def _run_and_log(app: FastAPI, work_ticket_idx: int, *, resume: bool = Fal
             resume=resume,
         )
     except Exception:
-        # run_workflow has already transitioned to FAILED. Log and swallow
-        # so the asyncio task completes cleanly.
-        _log.exception(
-            "dispatch_ticket %d failed (ticket marked FAILED by runner)",
-            work_ticket_idx,
-        )
+        # run_workflow transitions the ticket to FAILED for any failure inside
+        # the workflow before re-raising; a pre-dispatch guard failure (unknown
+        # or non-PENDING ticket) re-raises without a state change. Log and
+        # swallow either way so the asyncio task completes cleanly.
+        _log.exception("dispatch_ticket %d failed", work_ticket_idx)
 
 
 def schedule_dispatch(app: FastAPI, work_ticket_idx: int, *, resume: bool = False) -> asyncio.Task:
