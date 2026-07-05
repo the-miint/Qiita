@@ -792,7 +792,7 @@ qiita/
 │   └── src/
 │       └── qiita_common/
 │           ├── __init__.py
-│           ├── models.py                   # work-ticket / API schemas, principal + action types
+│           ├── models/                     # work-ticket / API schemas, principal + action types (domain submodules re-exported via models/__init__.py)
 │           ├── api_paths.py                # canonical REST path constants (shared CP↔CO)
 │           ├── auth_constants.py           # scope names, token prefixes
 │           ├── config.py                   # env-var loading helpers
