@@ -31,7 +31,6 @@ import asyncio
 import base64
 import json
 import sqlite3
-import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -157,9 +156,6 @@ def main(argv: list[str] | None = None) -> int:
     return args.handler(args, parser)
 
 
-if __name__ == "__main__":  # pragma: no cover
-    sys.exit(main())
-
 __all__ = [
     "Any",
     "BaseModel",
@@ -278,5 +274,4 @@ __all__ = [
     "main",
     "read_instrument_run_info",
     "sqlite3",
-    "sys",
 ]

@@ -840,9 +840,6 @@ def main(argv: list[str] | None = None) -> int:
     return args.handler(args, parser)
 
 
-if __name__ == "__main__":  # pragma: no cover
-    sys.exit(main())
-
 __all__ = [
     "DuplicateActionError",
     "PATH_ADMIN_MASKED_READ_EXPORT_TICKET",

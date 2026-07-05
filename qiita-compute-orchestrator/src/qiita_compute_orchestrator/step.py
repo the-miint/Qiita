@@ -296,6 +296,11 @@ async def status_step(
         info = await backend.status_step(_handle_from_wire(body.handle))
     except BackendFailure as exc:
         return _backend_failure_response(exc)
+    except ValueError as exc:
+        # A malformed handle (e.g. a SLURM wire missing its job id / paths) can't
+        # round-trip from a real submit; treat it as a bad request like /submit
+        # does, not a raw 500 that a CP client would read as transient.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return _status_to_wire(info)
 
 
@@ -317,6 +322,11 @@ async def result_step(
         return _step_no_data_response(exc)
     except BackendFailure as exc:
         return _backend_failure_response(exc)
+    except ValueError as exc:
+        # A malformed handle (e.g. a SLURM wire missing its job id / paths) can't
+        # round-trip from a real submit; treat it as a bad request like /submit
+        # does, not a raw 500 that a CP client would read as transient.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return StepResultResponse(outputs={k: str(v) for k, v in outputs.items()})
 
 
