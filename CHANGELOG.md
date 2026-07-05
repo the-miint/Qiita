@@ -622,6 +622,19 @@ the `no-changelog` label).
 
 ### Changed
 
+- **Internal decomposition — no behavior change.** Consolidated the six
+  near-identical control-plane Flight `DoAction` wrappers into one `_do_action`
+  helper; split the orchestrator's all-nullable `StepHandle` into typed
+  `LocalStepHandle` / `SlurmStepHandle` (the `StepHandleWire` wire form is
+  byte-for-byte unchanged, so no migration and no CP↔CO contract change); and
+  broke four monoliths into cohesive packages that re-export every name at the
+  same import path — `qiita_common.models` (→ health / reference / step /
+  upload / user / biosample / study / auth / work_ticket / sequencing + a
+  shared `_base`), the `qiita_control_plane.cli.user` and `.cli.admin` CLIs, and
+  `qiita_control_plane.runner`. Pure moves: every top-level definition is
+  carried over verbatim and each module's public-name set is a superset of the
+  original, so no consumer needed editing. No env var, migration, scope, route,
+  or wire change. (#248)
 - A human PAT's effective scopes are now intersected with the principal's **current** role ceiling at token-resolve time, so a role downgrade (or a shrunk `ROLE_IMPLIED_SCOPES`) immediately narrows an already-minted token on scope-only-gated routes without revocation. Service-account tokens are unaffected (their ceiling is fixed, not role-derived). Note: this also narrows any human token that was minted *above* its role ceiling via low-level tooling that skips the mint-time ceiling check — such a token silently loses the out-of-ceiling scopes at the next resolve. (#242)
 - Auth integer env-knobs (`AUTHROCKET_JWT_LEEWAY_SECONDS`, `AUTHROCKET_PAT_MAX_AUTH_AGE_SECONDS`, `QIITA_TOKEN_DEFAULT_TTL_DAYS`, `AUTH_HANDOFF_FRESHNESS_SECONDS`, `CLI_LOGIN_CODE_TTL_SECONDS`) are now validated at boot instead of parsed with a bare `int()` — a non-int or non-positive value fails loudly (leeway may be 0). (#241)
 - `GET /reference` and `GET /prep-protocol` accept a bounded `limit` query param (default 1000, max 5000) so the anonymous catalog lists can't return an unbounded payload. (#241)
