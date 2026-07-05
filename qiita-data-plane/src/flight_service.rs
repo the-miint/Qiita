@@ -121,9 +121,9 @@ const DOGET_BATCH_CHANNEL_DEPTH: usize = 4;
 /// survives the `FlightDataEncoder`. Mid-iteration failures are also rare in
 /// practice — the query is already prepared and executing, and the batches are
 /// read from local/attached storage. Callers that need end-to-end integrity
-/// verify it out-of-band (e.g. the reference-load path checks row counts against
-/// the control plane after the transfer). If the `duckdb` API ever exposes a
-/// fallible per-batch iterator, revisit this to surface mid-stream errors.
+/// verify it out-of-band (row counts, digests) rather than trusting stream
+/// termination. If the `duckdb` API ever exposes a fallible per-batch iterator,
+/// revisit this to surface mid-stream errors.
 fn stream_ducklake_batches(
     catalog_connstr: String,
     data_path: String,
@@ -877,7 +877,11 @@ impl<W: Write> Write for HashingWriter<W> {
 
 /// Bounded depth of the DoPut decoder→writer channel. The blocking writer task
 /// parks the async decoder on `send` when the channel is full, so peak memory is
-/// ~this many decoded payloads in flight rather than the whole upload.
+/// ~this many decoded payloads in flight rather than the whole upload. A payload
+/// is one client RecordBatch, which the chunked-upload path sizes up to ~1 GiB
+/// (see `FLIGHT_MAX_DECODING_BYTES` in main.rs), so this is deliberately small —
+/// enough to overlap decode and write without buffering many large batches.
+/// Mirrors `DOGET_BATCH_CHANNEL_DEPTH`.
 const DOPUT_WRITER_CHANNEL_DEPTH: usize = 4;
 
 /// One decoded payload forwarded from the async decoder to the blocking writer.
@@ -1068,18 +1072,29 @@ where
     // then close + fsync).
     drop(tx);
 
-    let task_result = writer_task.await;
-    // Decode error takes precedence — the task may have "succeeded" on a
-    // truncated file, but the input was bad.
+    // Fold a task-panic join error into the same Result shape as the task body.
+    let task_result: Result<(String, u64, u64), Status> = writer_task.await.unwrap_or_else(|e| {
+        Err(Status::internal(format!(
+            "doput writer task join failed: {e}"
+        )))
+    });
+
+    // Error precedence. An `AlreadyExists` from the writer (it lost the
+    // create_new race for this upload_idx) MUST win over a mid-stream decode
+    // error: do_put_inner skips its partial-file cleanup ONLY for AlreadyExists,
+    // and that staged file belongs to the concurrent, legitimate DoPut —
+    // surfacing the decode error instead would let the cleanup unlink their
+    // file. For every other outcome the decode error wins, because the writer
+    // may have "succeeded" on a truncated file that the caller must clean up.
+    if let Err(ref e) = task_result {
+        if e.code() == tonic::Code::AlreadyExists {
+            return task_result;
+        }
+    }
     if let Some(e) = decode_err {
         return Err(e);
     }
-    match task_result {
-        Ok(inner) => inner,
-        Err(join_err) => Err(Status::internal(format!(
-            "doput writer task join failed: {join_err}"
-        ))),
-    }
+    task_result
 }
 
 /// Canonical Parquet write options for an exported reads file — Parquet v2 +
@@ -3115,6 +3130,69 @@ mod tests {
         ));
     }
 
+    /// Pins the DuckLake-transaction semantics `register_files` relies on: a
+    /// `ducklake_add_data_files` performed inside a transaction that is then
+    /// ROLLBACK'd leaves ZERO rows registered — visible within the open
+    /// transaction, gone after the rollback. If DuckLake auto-committed catalog
+    /// mutations (ignoring the enclosing DuckDB transaction), `register_files`'
+    /// BEGIN/ROLLBACK wrap would be a no-op and a mid-loop failure would leak a
+    /// half-registered reference; this asserts it is not.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(feature = "integration")]
+    fn register_ducklake_add_data_files_rolls_back_within_transaction() {
+        let connstr = delete_test_catalog_connstr();
+        let data_path = delete_test_data_path();
+
+        let ref_idx: i64 = 972_000;
+        let feat: i64 = 972_010;
+
+        let conn = Connection::open_in_memory().unwrap();
+        ducklake::connect_ducklake(&conn, &connstr, &data_path).unwrap();
+        ducklake::ensure_reference_tables(&conn).unwrap();
+        conn.execute_batch(&format!(
+            "DELETE FROM qiita_lake.reference_membership WHERE reference_idx = {ref_idx};"
+        ))
+        .unwrap();
+
+        // A valid reference_membership Parquet to register (types match exactly).
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("m.parquet");
+        let src_str = src.to_str().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT {ref_idx}::BIGINT AS reference_idx, {feat}::BIGINT AS feature_idx) \
+             TO '{src_str}' (FORMAT PARQUET)"
+        ))
+        .unwrap();
+
+        let count = |c: &Connection| -> i64 {
+            c.query_row(
+                &format!(
+                    "SELECT count(*) FROM qiita_lake.reference_membership \
+                     WHERE reference_idx = {ref_idx}"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        conn.execute_batch("BEGIN TRANSACTION").unwrap();
+        conn.execute(
+            "CALL ducklake_add_data_files('qiita_lake', ?, ?)",
+            duckdb::params!["reference_membership", src_str],
+        )
+        .unwrap();
+        assert_eq!(count(&conn), 1, "registration is visible inside the txn");
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(
+            count(&conn),
+            0,
+            "ROLLBACK must unwind the registration — the wrap in register_files \
+             is only atomic if DuckLake honors the enclosing transaction"
+        );
+    }
+
     /// `export_read_to_parquet` writes one sample's full reads from the DuckLake
     /// `read` table to a Parquet drop-in: the 7-col schema with `qual` as
     /// UTINYINT[], the seeded rows, mode 0o440. An unknown sample writes NO file
@@ -3790,6 +3868,59 @@ mod tests {
         let staged = tmp.path().join("uploads/7/upload.parquet");
         let perms = std::fs::metadata(&staged).unwrap().permissions();
         assert_eq!(perms.mode() & 0o777, 0o440);
+    }
+
+    #[tokio::test]
+    async fn do_put_alreadyexists_wins_over_mid_stream_decode_error() {
+        // Regression: with the async-decoder/blocking-writer bridge, a second
+        // DoPut to an occupied upload_idx whose stream ALSO errors mid-flight
+        // must still surface AlreadyExists — not the decode error. do_put_inner
+        // skips its partial-file cleanup only for AlreadyExists, and that staged
+        // file belongs to the first, legitimate upload; masking it as the decode
+        // error would unlink their file. Reproduces the writer-task error vs
+        // decode-error precedence.
+        let tmp = tempfile::tempdir().unwrap();
+        let service = make_service(tmp.path().to_path_buf());
+
+        // First upload occupies upload_idx=88.
+        let t1 = sign_doput_for_test(88, b"dev-secret", future_expiry_secs(300));
+        let m1 = flight_stream_with_ticket(vec![sample_batch()], t1).await;
+        service
+            .do_put_inner(stream::iter(m1))
+            .await
+            .expect("first DoPut should succeed");
+        let staged = tmp.path().join("uploads/88/upload.parquet");
+        let bytes_before = std::fs::read(&staged).unwrap();
+
+        // Second DoPut to the same idx: keep only the schema frame, then inject a
+        // mid-stream error. The writer hits AlreadyExists on create_new while the
+        // decoder surfaces the error, exercising the precedence.
+        let t2 = sign_doput_for_test(88, b"dev-secret", future_expiry_secs(300));
+        let mut m2 = flight_stream_with_ticket(vec![sample_batch()], t2).await;
+        m2.truncate(1);
+        m2.push(Err(Status::internal("simulated mid-stream drop")));
+
+        let err = service
+            .do_put_inner(stream::iter(m2))
+            .await
+            .expect_err("second DoPut must fail");
+        assert_eq!(
+            err.code(),
+            tonic::Code::AlreadyExists,
+            "AlreadyExists must win over the decode error so the first file is preserved"
+        );
+
+        // The first upload's file is untouched — not unlinked by cleanup.
+        assert!(staged.exists(), "the first upload's file must survive");
+        assert_eq!(
+            std::fs::read(&staged).unwrap(),
+            bytes_before,
+            "first upload bytes unchanged"
+        );
+        assert_eq!(
+            std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+            0o440
+        );
     }
 
     #[tokio::test]
