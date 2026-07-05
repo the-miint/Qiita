@@ -146,14 +146,20 @@ class Inputs(BaseModel):
     `adapter_parquet` is the canonical adapter set the runner materializes
     (`_resolve_qc_adapters`) — REQUIRED (QC is always-on; an empty set is a
     misconfiguration). `instrument_model` gates polyG trimming (None -> OFF);
-    it is forwarded from qiita.sequencing_run per sample. `prep_sample_idx` /
-    `work_ticket_idx` are the framework-injected scope scalars.
+    it is forwarded from qiita.sequencing_run per sample. `work_ticket_idx` is the
+    framework-injected scope scalar.
+
+    `prep_sample_idx` is OPTIONAL and unused: the qc_mask keys on sequence_idx
+    only (globally unique), so QC never needs the owner. A PREP_SAMPLE-scoped
+    ticket still has the framework inject it; a BLOCK-scoped ticket (many samples)
+    flows no such scalar (None here). Kept as an accepted field so both scopes
+    validate against one Inputs shape.
     """
 
     reads: Path
     adapter_parquet: Path
     instrument_model: str | None = None
-    prep_sample_idx: int
+    prep_sample_idx: int | None = None
     work_ticket_idx: int
 
 

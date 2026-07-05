@@ -1658,6 +1658,150 @@ async def test_dispatch_register_index_minimap2_meta(postgres_pool, reference_id
 
 
 # =============================================================================
+# Block-scope wiring (bulk-block read-mask): scope target + reconcile-block arm
+# =============================================================================
+
+
+def test_build_scope_target_block():
+    """A block-scoped work_ticket row maps to the {kind: block, block_idx} shape
+    the pre-loop / dispatch code reads (matching BlockScopeTarget)."""
+    from qiita_control_plane.runner import _build_scope_target
+
+    assert _build_scope_target({"scope_target_kind": "block", "block_idx": 42}) == {
+        "kind": "block",
+        "block_idx": 42,
+    }
+
+
+async def test_run_action_primitive_reconcile_block_dispatches(monkeypatch, tmp_path):
+    """The reconcile-block arm calls the RECONCILE_BLOCK primitive with block_idx
+    from the scope target and mask_idx from the runner-bound `bound` (the ticket's
+    mask_idx), plus the hmac_secret / data_plane_url for the mask_metrics read."""
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import library
+    from qiita_control_plane.runner import _run_action_primitive
+
+    recorded: dict = {}
+
+    async def fake_reconcile(pool, *, block_idx, mask_idx, hmac_secret, data_plane_url):
+        recorded.update(
+            block_idx=block_idx,
+            mask_idx=mask_idx,
+            hmac_secret=hmac_secret,
+            data_plane_url=data_plane_url,
+        )
+        return {"block_idx": block_idx, "finalized_samples": []}
+
+    monkeypatch.setitem(library.LIBRARY, LibraryPrimitive.RECONCILE_BLOCK, fake_reconcile)
+
+    entry = WorkflowAction(kind="action", name="reconcile-block", inputs=[], outputs=[])
+    out = await _run_action_primitive(
+        None,  # pool — the fake ignores it
+        entry,
+        {"mask_idx": 77},
+        tmp_path,
+        {"kind": "block", "block_idx": 42},
+        work_ticket_idx=9,
+        hmac_secret=b"sekret",
+        data_plane_url="grpc://dp:50051",
+    )
+    assert out == {}
+    assert recorded == {
+        "block_idx": 42,
+        "mask_idx": 77,
+        "hmac_secret": b"sekret",
+        "data_plane_url": "grpc://dp:50051",
+    }
+
+
+async def test_run_action_primitive_reconcile_block_rejects_non_block_scope(tmp_path):
+    """reconcile-block is only meaningful for a block-scoped ticket; a mis-scoped
+    workflow YAML is a contract error, surfaced loudly."""
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    entry = WorkflowAction(kind="action", name="reconcile-block", inputs=[], outputs=[])
+    with pytest.raises(RuntimeError, match="block-scoped"):
+        await _run_action_primitive(
+            None,
+            entry,
+            {"mask_idx": 1},
+            tmp_path,
+            {"kind": "prep_sample", "prep_sample_idx": 5},
+            work_ticket_idx=1,
+            hmac_secret=b"x",
+            data_plane_url="grpc://x",
+        )
+
+
+async def test_run_action_primitive_delete_block_mask_dispatches(monkeypatch, tmp_path):
+    """The delete-block-mask arm calls the DELETE_READ_MASK_BLOCK primitive with
+    block_idx from the scope target and mask_idx from the runner-bound `bound`,
+    plus the hmac_secret / data_plane_url for the footprint delete DoAction."""
+    from qiita_common.actions import WorkflowAction
+    from qiita_common.api_paths import LibraryPrimitive
+
+    from qiita_control_plane.actions import library
+    from qiita_control_plane.runner import _run_action_primitive
+
+    recorded: dict = {}
+
+    async def fake_delete(pool, *, block_idx, mask_idx, hmac_secret, data_plane_url):
+        recorded.update(
+            block_idx=block_idx,
+            mask_idx=mask_idx,
+            hmac_secret=hmac_secret,
+            data_plane_url=data_plane_url,
+        )
+        return {"block_idx": block_idx, "rows_deleted": 0}
+
+    monkeypatch.setitem(library.LIBRARY, LibraryPrimitive.DELETE_READ_MASK_BLOCK, fake_delete)
+
+    entry = WorkflowAction(kind="action", name="delete-block-mask", inputs=[], outputs=[])
+    out = await _run_action_primitive(
+        None,  # pool — the fake ignores it
+        entry,
+        {"mask_idx": 77},
+        tmp_path,
+        {"kind": "block", "block_idx": 42},
+        work_ticket_idx=9,
+        hmac_secret=b"sekret",
+        data_plane_url="grpc://dp:50051",
+    )
+    assert out == {}
+    assert recorded == {
+        "block_idx": 42,
+        "mask_idx": 77,
+        "hmac_secret": b"sekret",
+        "data_plane_url": "grpc://dp:50051",
+    }
+
+
+async def test_run_action_primitive_delete_block_mask_rejects_non_block_scope(tmp_path):
+    """delete-block-mask is only meaningful for a block-scoped ticket; a mis-scoped
+    workflow YAML is a contract error, surfaced loudly."""
+    from qiita_common.actions import WorkflowAction
+
+    from qiita_control_plane.runner import _run_action_primitive
+
+    entry = WorkflowAction(kind="action", name="delete-block-mask", inputs=[], outputs=[])
+    with pytest.raises(RuntimeError, match="block-scoped"):
+        await _run_action_primitive(
+            None,
+            entry,
+            {"mask_idx": 1},
+            tmp_path,
+            {"kind": "prep_sample", "prep_sample_idx": 5},
+            work_ticket_idx=1,
+            hmac_secret=b"x",
+            data_plane_url="grpc://x",
+        )
+
+
+# =============================================================================
 # WorkflowEntry.when (conditional gate) + WorkflowStep.params (scalar params)
 # =============================================================================
 #

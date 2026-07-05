@@ -78,6 +78,7 @@ from .actions.reference import (
     transition_reference_status,
 )
 from .auth.tickets import sign_action, sign_ticket
+from .repositories.block import fetch_block_members
 from .repositories.mask_definition import lookup_mask_idx_by_params, mint_mask_definition
 
 _log = logging.getLogger(__name__)
@@ -473,60 +474,94 @@ async def run_workflow(
         if _workflow_declares_input(action.steps, READS_STAGING_ROOT_BINDING):
             bound[READS_STAGING_ROOT_BINDING] = str(upload_staging_root)
 
-        # Staged-read binding (read-mask workflow): `reads` is consumed by qc /
-        # host_filter but produced by no step, so bind it from the prep_sample's
-        # durable stored reads. Inside-try so an un-ingested sample FAILs cleanly.
+        # Staged-read binding (read-mask workflows): `reads` is consumed by qc /
+        # host_filter but produced by no step, so bind it from stored reads.
+        # Inside-try so an un-ingested sample / empty block FAILs cleanly.
+        #   - PREP_SAMPLE: one sample's durable stored reads (per-sample path).
+        #   - BLOCK: the union of the block's members' `read` sub-ranges, sourced
+        #     from the persistent DuckLake `read` table (the block-compute path).
         if _workflow_needs_staged_reads(action.steps):
-            if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+            if scope_target["kind"] == ScopeTargetKind.PREP_SAMPLE.value:
+                bound.update(
+                    await _resolve_staged_reads(
+                        scope_target,
+                        upload_staging_root,
+                        data_plane_url=data_plane_url,
+                        hmac_secret=hmac_secret,
+                        workspace=workspace,
+                    )
+                )
+            elif scope_target["kind"] == ScopeTargetKind.BLOCK.value:
+                members = [
+                    {
+                        "prep_sample_idx": ps,
+                        "sequence_idx_start": lo,
+                        "sequence_idx_stop": hi,
+                    }
+                    for (ps, lo, hi) in await fetch_block_members(pool, scope_target["block_idx"])
+                ]
+                bound.update(
+                    await _resolve_staged_reads_block(
+                        members,
+                        data_plane_url=data_plane_url,
+                        hmac_secret=hmac_secret,
+                        workspace=workspace,
+                    )
+                )
+            else:
                 raise _submission_bad_input(
-                    "a workflow that masks stored reads must be prep_sample-scoped; "
-                    f"got {scope_target['kind']!r}"
+                    "a workflow that masks stored reads must be prep_sample- or "
+                    f"block-scoped; got {scope_target['kind']!r}"
                 )
-            bound.update(
-                await _resolve_staged_reads(
-                    scope_target,
-                    upload_staging_root,
-                    data_plane_url=data_plane_url,
-                    hmac_secret=hmac_secret,
-                    workspace=workspace,
-                )
-            )
 
         # Read-mask identity: when a step threads `mask_idx` through its params
-        # (the host_filter step), mint the mask_idx for this filtering config and
-        # bind it before the loop. Same inside-try placement as the resolvers
-        # above so a failure (sample not pooled, unknown principal) lands in the
-        # outer FAILED handler. PREP_SAMPLE-scoped only — masks key on a sample's
-        # reads; another scope kind threading mask_idx would have no prep_sample.
+        # (the host_filter step), bind the mask_idx before the loop. Same
+        # inside-try placement as the resolvers above so a failure lands in the
+        # outer FAILED handler.
+        #   - PREP_SAMPLE: mint the mask for this filtering config (deduped on the
+        #     config hash) and persist it onto the ticket.
+        #   - BLOCK: the mask was resolved AT PLAN TIME (the partition key) and
+        #     stored on `work_ticket.mask_idx`; bind that value directly — never
+        #     re-mint (a block spans many samples, has no single prep_sample the
+        #     mint keys on, and the partition already fixed the identity).
         if _workflow_needs_mask(action.steps):
-            if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+            if scope_target["kind"] == ScopeTargetKind.PREP_SAMPLE.value:
+                adapter_path = bound.get(QC_ADAPTER_BINDING)
+                # Host refs come from the SAME action_context values
+                # `_resolve_host_filter_indexes` consumes for the applied filter,
+                # so the minted mask_idx's params describe the filter that ran.
+                # Absent → None (faithful "no host filtering").
+                bound.update(
+                    await _mint_read_mask(
+                        pool,
+                        action_id=action.action_id,
+                        action_version=action.version,
+                        prep_sample_idx=scope_target["prep_sample_idx"],
+                        originator_principal_idx=work_ticket["originator_principal_idx"],
+                        instrument_model=bound.get("instrument_model"),
+                        adapter_parquet=Path(adapter_path) if adapter_path is not None else None,
+                        host_rype_reference_idx=bound.get("host_rype_reference_idx"),
+                        host_minimap2_reference_idx=bound.get("host_minimap2_reference_idx"),
+                    )
+                )
+                # Persist the minted mask_idx onto the ticket for durable
+                # traceability (and a cheap shared-mask guard). Idempotent: a
+                # re-mint on resume re-resolves to the same mask_idx via the
+                # config-hash upsert and re-writes the same value here.
+                await _persist_mask_idx(pool, work_ticket_idx, bound[MASK_IDX_BINDING])
+            elif scope_target["kind"] == ScopeTargetKind.BLOCK.value:
+                block_mask_idx = work_ticket["mask_idx"]
+                if block_mask_idx is None:
+                    raise _submission_bad_input(
+                        "a block-scoped read-mask ticket must carry a pre-resolved "
+                        "mask_idx (set at plan time); found NULL on the work_ticket"
+                    )
+                bound[MASK_IDX_BINDING] = block_mask_idx
+            else:
                 raise _submission_bad_input(
                     "a workflow that masks reads (threads mask_idx) must be "
-                    f"prep_sample-scoped; got {scope_target['kind']!r}"
+                    f"prep_sample- or block-scoped; got {scope_target['kind']!r}"
                 )
-            adapter_path = bound.get(QC_ADAPTER_BINDING)
-            # Host refs come from the SAME action_context values
-            # `_resolve_host_filter_indexes` consumes for the applied filter, so
-            # the minted mask_idx's params describe the filter that ran. Absent →
-            # None (faithful "no host filtering"), never the sequenced_sample row.
-            bound.update(
-                await _mint_read_mask(
-                    pool,
-                    action_id=action.action_id,
-                    action_version=action.version,
-                    prep_sample_idx=scope_target["prep_sample_idx"],
-                    originator_principal_idx=work_ticket["originator_principal_idx"],
-                    instrument_model=bound.get("instrument_model"),
-                    adapter_parquet=Path(adapter_path) if adapter_path is not None else None,
-                    host_rype_reference_idx=bound.get("host_rype_reference_idx"),
-                    host_minimap2_reference_idx=bound.get("host_minimap2_reference_idx"),
-                )
-            )
-            # Persist the minted mask_idx onto the ticket for durable traceability
-            # (and a cheap shared-mask guard). Idempotent: a re-mint on resume
-            # re-resolves to the same mask_idx via the config-hash upsert and
-            # re-writes the same value here.
-            await _persist_mask_idx(pool, work_ticket_idx, bound[MASK_IDX_BINDING])
 
         for index, entry in enumerate(action.steps):
             # Conditional gate (WorkflowStep/WorkflowAction.when): skip this
@@ -1013,6 +1048,7 @@ _WORK_TICKET_COLS = (
     "wt.work_ticket_idx, wt.action_id, wt.action_version, wt.originator_principal_idx, "
     "wt.scope_target_kind, wt.study_idx, wt.prep_idx, wt.reference_idx, "
     "wt.prep_sample_idx, wt.sequenced_pool_idx, sp.sequencing_run_idx, "
+    "wt.block_idx, wt.mask_idx, "
     "wt.action_context, wt.state, wt.retry_count, wt.max_retries, "
     "wt.resource_override"
 )
@@ -1936,20 +1972,19 @@ async def _resolve_sample_map(action_context: dict[str, Any], workspace: Path) -
     return {SAMPLE_MAP_BINDING: out}
 
 
-def _do_action_export_read(data_plane_url: str, token: bytes) -> dict[str, Any]:
-    """Synchronous Flight DoAction asking the data plane to re-materialize one
-    prep_sample's reads from its DuckLake `read` table into a per-ticket Parquet
-    on shared scratch — runs in a thread executor (pyarrow.flight is sync). The
-    data plane writes the file; the bulk read bytes never transit the control
-    plane. Returns `{"count": int, "dest": str}` with `count` already coerced to
-    int, raising ValueError on a missing/garbled body or a non-integer `count` so
-    the caller (inside its `except`) turns it into a clean SUBMISSION failure
-    rather than a cryptic backtrace. Mirrors `actions.library._do_action_register`;
-    isolated so unit tests stub the real call."""
+def _do_action_export(action_type: str, data_plane_url: str, token: bytes) -> dict[str, Any]:
+    """Shared body for the read-export DoActions (`export_read`,
+    `export_read_block`): run a synchronous Flight DoAction of `action_type` in a
+    thread executor (pyarrow.flight is sync). The data plane writes the file; the
+    bulk read bytes never transit the control plane. Returns `{"count": int,
+    "dest": str}` with `count` already coerced to int, raising ValueError on a
+    missing/garbled body or a non-integer `count` so the caller (inside its
+    `except`) turns it into a clean SUBMISSION failure rather than a cryptic
+    backtrace. Mirrors `actions.library._do_action_register`."""
     import pyarrow.flight as flight  # noqa: PLC0415
 
     with flight.FlightClient(data_plane_url) as client:
-        results = list(client.do_action(flight.Action("export_read", token)))
+        results = list(client.do_action(flight.Action(action_type, token)))
     if not results:
         return {"count": 0, "dest": ""}
     body = results[0].body.to_pybytes()
@@ -1961,8 +1996,24 @@ def _do_action_export_read(data_plane_url: str, token: bytes) -> dict[str, Any]:
         parsed = json.loads(body)
         count = int(parsed["count"])
     except (ValueError, TypeError, KeyError, AttributeError) as exc:
-        raise ValueError(f"export_read returned an unparseable result body: {exc!r}") from exc
+        raise ValueError(f"{action_type} returned an unparseable result body: {exc!r}") from exc
     return {"count": count, "dest": str(parsed.get("dest", ""))}
+
+
+def _do_action_export_read(data_plane_url: str, token: bytes) -> dict[str, Any]:
+    """`export_read` DoAction: the data plane re-materializes ONE prep_sample's
+    reads from its DuckLake `read` table into a per-ticket Parquet on shared
+    scratch. Isolated (thin wrapper over `_do_action_export`) so unit tests stub
+    the real call by name."""
+    return _do_action_export("export_read", data_plane_url, token)
+
+
+def _do_action_export_read_block(data_plane_url: str, token: bytes) -> dict[str, Any]:
+    """`export_read_block` DoAction: the data plane materializes the UNION of a
+    block's `(prep_sample_idx, sequence_idx sub-range)` members from its DuckLake
+    `read` table into one per-ticket Parquet. Isolated (thin wrapper over
+    `_do_action_export`) so unit tests stub the real call by name."""
+    return _do_action_export("export_read_block", data_plane_url, token)
 
 
 async def _resolve_staged_reads(
@@ -2034,6 +2085,82 @@ async def _resolve_staged_reads(
         raise _submission_bad_input(
             f"the data plane reported reads for prep_sample {prep_sample_idx} but "
             f"wrote no file at {dest}"
+        )
+    return {STAGED_READS_BINDING: dest}
+
+
+async def _resolve_staged_reads_block(
+    members: list[dict[str, int]],
+    *,
+    data_plane_url: str,
+    hmac_secret: bytes,
+    workspace: Path,
+) -> dict[str, Path]:
+    """Bind `reads` to a BLOCK's reads for a read-mask-block workflow — the
+    multi-sample analog of `_resolve_staged_reads`.
+
+    A block spans a set of `(prep_sample_idx, sequence_idx sub-range)` `members`
+    that all resolve to one `mask_idx`. Because a block may hold only a sub-range
+    of a large sample, the per-sample durable staging copy cannot serve it, so we
+    always source from the PERSISTENT DuckLake `read` table: ask the data plane to
+    materialize the union of the members' sub-ranges into a per-ticket
+    `reads.parquet` via the `export_read_block` DoAction (the data plane writes
+    the file; the bulk read bytes never transit the control plane). `qc` /
+    `host_filter` read `prep_sample_idx` per-row, so a multi-sample file is fine.
+
+    Fails SUBMISSION/BAD_INPUT (so the ticket FAILs cleanly, step_name=None) if:
+    `members` is empty (a planning bug); the data plane is unreachable; the block
+    selects zero reads (its members' ranges match nothing — a planning bug, since
+    blocks are tiled from `sequence_range` bounds that must exist); or the data
+    plane reported reads but no file landed."""
+    if not members:
+        raise _submission_bad_input("a read-mask block requires a non-empty members list")
+    workspace.mkdir(parents=True, exist_ok=True)
+    dest = workspace / "reads.parquet"
+    # Coerce the member shape up front (a malformed member is a planner bug):
+    # a missing key or non-int value must FAIL the ticket cleanly as BAD_INPUT,
+    # not escape as an untyped KeyError/TypeError that strands it in PROCESSING.
+    try:
+        member_payload = [
+            {
+                "prep_sample_idx": int(m["prep_sample_idx"]),
+                "sequence_idx_start": int(m["sequence_idx_start"]),
+                "sequence_idx_stop": int(m["sequence_idx_stop"]),
+            }
+            for m in members
+        ]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _submission_bad_input(
+            f"malformed read-mask block member (a planning bug): {type(exc).__name__}: {exc}"
+        ) from exc
+    token = sign_action(
+        action="export_read_block",
+        payload={"dest": str(dest), "members": member_payload},
+        secret=hmac_secret,
+    )
+    # A Flight failure (data plane unreachable / errored) is NOT a BackendFailure;
+    # wrap it as a SUBMISSION BAD_INPUT like the per-sample resolver so the outer
+    # handler FAILs the ticket cleanly rather than stranding it in PROCESSING.
+    try:
+        result = await asyncio.get_running_loop().run_in_executor(
+            None, _do_action_export_read_block, data_plane_url, token
+        )
+    except Exception as exc:
+        raise _submission_bad_input(
+            f"could not materialize reads for the block from the data plane: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    # `count` is already an int (coerced in `_do_action_export`).
+    if result.get("count", 0) == 0:
+        raise _submission_bad_input(
+            "the block selected zero reads from the data plane; its members' "
+            "sequence_idx ranges match no stored reads (a planning bug — blocks "
+            "are tiled from qiita.sequence_range bounds that must exist)"
+        )
+    if not dest.exists():
+        raise _submission_bad_input(
+            f"the data plane reported reads for the block but wrote no file at {dest}"
         )
     return {STAGED_READS_BINDING: dest}
 
@@ -2428,6 +2555,11 @@ def _build_scope_target(work_ticket: dict[str, Any]) -> dict[str, Any]:
             "kind": ScopeTargetKind.SEQUENCED_POOL.value,
             "sequenced_pool_idx": work_ticket["sequenced_pool_idx"],
             "sequencing_run_idx": work_ticket["sequencing_run_idx"],
+        }
+    if kind == ScopeTargetKind.BLOCK.value:
+        return {
+            "kind": ScopeTargetKind.BLOCK.value,
+            "block_idx": work_ticket["block_idx"],
         }
     raise RuntimeError(f"unknown scope_target_kind: {kind!r}")
 
@@ -3726,6 +3858,46 @@ async def _run_action_primitive(
             scope_target["prep_sample_idx"],
             _report("raw_qc_report"),
             _report("filtered_qc_report"),
+        )
+        return {}
+
+    if entry.name == LibraryPrimitive.DELETE_READ_MASK_BLOCK:
+        # Idempotent block replace: delete this block's exact read_mask footprint
+        # BEFORE register-files re-writes it, so a re-run (retry, or a resubmitted
+        # block covering the same footprint) never double-counts. Exact by
+        # construction (per-member OR), so a split sample's sibling-block rows
+        # survive. No file inputs: block_idx from the scope target, mask_idx from
+        # the ticket (runner-bound above for the block branch).
+        if scope_target["kind"] != ScopeTargetKind.BLOCK.value:
+            raise RuntimeError(
+                f"delete-block-mask requires a block-scoped ticket; got {scope_target['kind']!r}"
+            )
+        await LIBRARY[LibraryPrimitive.DELETE_READ_MASK_BLOCK](
+            pool,
+            block_idx=scope_target["block_idx"],
+            mask_idx=bound[MASK_IDX_BINDING],
+            hmac_secret=hmac_secret,
+            data_plane_url=data_plane_url,
+        )
+        return {}
+
+    if entry.name == LibraryPrimitive.RECONCILE_BLOCK:
+        # Terminal step of the bulk-block read-mask workflow: mark this block
+        # completed, then finalize each covered sample whose last covering block
+        # just completed (per-sample rollup + mask_sample gate flip). Reads the
+        # mask counts from DuckLake (across all the sample's blocks), so it runs
+        # AFTER register-files. No file inputs: block_idx from the scope target,
+        # mask_idx from the ticket (runner-bound above for the block branch).
+        if scope_target["kind"] != ScopeTargetKind.BLOCK.value:
+            raise RuntimeError(
+                f"reconcile-block requires a block-scoped ticket; got {scope_target['kind']!r}"
+            )
+        await LIBRARY[LibraryPrimitive.RECONCILE_BLOCK](
+            pool,
+            block_idx=scope_target["block_idx"],
+            mask_idx=bound[MASK_IDX_BINDING],
+            hmac_secret=hmac_secret,
+            data_plane_url=data_plane_url,
         )
         return {}
 
