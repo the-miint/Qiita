@@ -52,6 +52,7 @@ from qiita_common.backend_failure import (
     StepNoDataBody,
 )
 from qiita_common.models import (
+    ComputeTarget,
     FoundJobWire,
     StepFindByNameRequest,
     StepFindByNameResponse,
@@ -65,7 +66,7 @@ from qiita_common.models import (
     StepSubmitRequest,
 )
 
-from .backend import ComputeBackend, StepHandle, StepStatusInfo
+from .backend import ComputeBackend, LocalStepHandle, SlurmStepHandle, StepHandle, StepStatusInfo
 from .jobs import flatten_native_inputs, run_native_job_plan
 
 _log = logging.getLogger(__name__)
@@ -127,33 +128,45 @@ def _step_no_data_response(exc: StepNoData) -> JSONResponse:
 
 
 def _handle_to_wire(handle: StepHandle) -> StepHandleWire:
+    if isinstance(handle, SlurmStepHandle):
+        return StepHandleWire(
+            compute_target=handle.compute_target,
+            step_name=handle.step_name,
+            slurm_job_id=handle.slurm_job_id,
+            job_name=handle.job_name,
+            output_path=str(handle.output_path),
+            logs_path=str(handle.logs_path),
+            terminal_outputs=None,
+        )
     return StepHandleWire(
         compute_target=handle.compute_target,
         step_name=handle.step_name,
-        slurm_job_id=handle.slurm_job_id,
-        job_name=handle.job_name,
-        output_path=str(handle.output_path) if handle.output_path is not None else None,
-        logs_path=str(handle.logs_path) if handle.logs_path is not None else None,
-        terminal_outputs=(
-            {k: str(v) for k, v in handle.terminal_outputs.items()}
-            if handle.terminal_outputs is not None
-            else None
-        ),
+        terminal_outputs={k: str(v) for k, v in handle.terminal_outputs.items()},
     )
 
 
 def _handle_from_wire(wire: StepHandleWire) -> StepHandle:
-    return StepHandle(
-        compute_target=wire.compute_target,
+    # SLURM handles require the job id + workspace paths (mirrors the old
+    # _require_slurm_handle contract); job_name rides along optionally. Anything
+    # else reconstructs as a local (synchronous, terminal-outputs) handle.
+    if wire.compute_target == ComputeTarget.SLURM:
+        if wire.slurm_job_id is None or wire.output_path is None or wire.logs_path is None:
+            raise ValueError(
+                f"malformed SLURM step handle (missing job id / workspace paths): {wire!r}"
+            )
+        return SlurmStepHandle(
+            step_name=wire.step_name,
+            slurm_job_id=wire.slurm_job_id,
+            job_name=wire.job_name,
+            output_path=Path(wire.output_path),
+            logs_path=Path(wire.logs_path),
+        )
+    return LocalStepHandle(
         step_name=wire.step_name,
-        slurm_job_id=wire.slurm_job_id,
-        job_name=wire.job_name,
-        output_path=Path(wire.output_path) if wire.output_path is not None else None,
-        logs_path=Path(wire.logs_path) if wire.logs_path is not None else None,
         terminal_outputs=(
             {k: Path(v) for k, v in wire.terminal_outputs.items()}
             if wire.terminal_outputs is not None
-            else None
+            else {}
         ),
     )
 

@@ -47,6 +47,11 @@ from ..repositories.block import (
 # feature batch sizes.
 _CHUNK_SIZE = 10_000
 
+# Deterministic basename `mint_features` writes its feature-map Parquet under.
+# Single-sourced because the runner's restart path (`_reconstruct_action_outputs`)
+# rebuilds this path WITHOUT re-running the primitive, so the two must not drift.
+MINT_FEATURES_OUTPUT_BASENAME = "feature_map.parquet"
+
 
 # =============================================================================
 # Internal per-chunk helpers
@@ -260,7 +265,7 @@ async def mint_features(
     if genome_map_path is not None and not genome_map_path.exists():
         raise FileNotFoundError(f"Genome map not found: {genome_map_path}")
     output_dir.mkdir(parents=True, exist_ok=True)
-    feature_map_path = output_dir / "feature_map.parquet"
+    feature_map_path = output_dir / MINT_FEATURES_OUTPUT_BASENAME
 
     total_minted = 0
     total_reused = 0

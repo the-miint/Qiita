@@ -71,7 +71,7 @@ from qiita_common.models import (
 )
 
 from . import step_progress
-from .actions.library import LIBRARY
+from .actions.library import LIBRARY, MINT_FEATURES_OUTPUT_BASENAME
 from .actions.reference import (
     IllegalStatusTransition,
     ReferenceNotFound,
@@ -3637,10 +3637,11 @@ def _reconstruct_action_outputs(entry: WorkflowAction, attempt_workspace: Path) 
     """Deterministic output paths an `action:` primitive wrote, for resume.
     Only `mint-features` contributes a binding (the feature-map Parquet it
     wrote into its workspace); the other primitives produce no bound output.
-    Mirrors the output shapes in `_run_action_primitive` — keep the two in
-    step when a primitive's outputs change."""
+    The basename is single-sourced from `mint_features` itself
+    (`MINT_FEATURES_OUTPUT_BASENAME`) so this resume path can't drift from where
+    the primitive actually writes the file."""
     if entry.name == LibraryPrimitive.MINT_FEATURES:
-        return {entry.outputs[0]: attempt_workspace / "feature_map.parquet"}
+        return {entry.outputs[0]: attempt_workspace / MINT_FEATURES_OUTPUT_BASENAME}
     return {}
 
 

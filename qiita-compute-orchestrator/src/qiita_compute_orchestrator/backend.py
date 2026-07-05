@@ -42,28 +42,48 @@ from qiita_common.models import (
 
 
 @dataclass(frozen=True, slots=True)
-class StepHandle:
-    """What `submit_step` hands back, threaded into `status_step` /
-    `result_step`. Because the orchestrator holds no state between those
-    calls, the handle must carry everything they need — the SLURM job id
-    and the workspace paths — so a later poll / result can proceed from
-    the handle alone. The control plane persists these fields and, after a
-    restart, reconstructs an equivalent handle from them to re-attach
-    (it does not reuse this object).
+class LocalStepHandle:
+    """Handle for a step a synchronous backend ran to completion in-process at
+    submit time (LocalBackend runs the module in-process). It carries the
+    outputs captured then, so the runner skips polling and reads them directly.
+    `compute_target` is fixed to LOCAL."""
 
-    A synchronous backend (LocalBackend runs the module in-process at
-    submit time) sets `terminal_outputs`; the caller then skips polling
-    and uses the outputs directly. `slurm_job_id` / `job_name` /
-    `output_path` / `logs_path` are populated only for the SLURM path.
-    """
-
-    compute_target: ComputeTarget
     step_name: str
-    slurm_job_id: int | None = None
+    terminal_outputs: dict[str, Path]
+    compute_target: ComputeTarget = ComputeTarget.LOCAL
+
+
+@dataclass(frozen=True, slots=True)
+class SlurmStepHandle:
+    """Handle for a step submitted to SLURM. The orchestrator holds no state
+    between submit / status / result, so the handle carries everything the
+    later calls need: the job id and the workspace paths — a later poll /
+    result proceeds from the handle alone. The control plane persists these
+    fields and, after a restart, reconstructs an equivalent handle from them to
+    re-attach (it does not reuse this object).
+
+    `slurm_job_id` / `output_path` / `logs_path` are required — a SLURM handle
+    without them is malformed, which the previous single all-nullable StepHandle
+    could only catch with a runtime None-guard. `job_name` stays optional: it
+    rides along for the wire / persistence but status / result never dereference
+    it, so a reconstructed handle may lack it. `compute_target` is fixed to
+    SLURM."""
+
+    step_name: str
+    slurm_job_id: int
+    output_path: Path
+    logs_path: Path
     job_name: str | None = None
-    output_path: Path | None = None
-    logs_path: Path | None = None
-    terminal_outputs: dict[str, Path] | None = None
+    compute_target: ComputeTarget = ComputeTarget.SLURM
+
+
+# The two shapes a backend hands back, discriminated by `compute_target`. The
+# wire form (`StepHandleWire`, in qiita_common) stays a single flat model with
+# every field nullable — this split is purely the orchestrator's in-memory
+# representation, so CP persistence and the CP<->CO contract are unchanged.
+# `StepHandle` is a union, so annotate/`isinstance` with it but construct the
+# specific subtype.
+StepHandle = LocalStepHandle | SlurmStepHandle
 
 
 @dataclass(frozen=True, slots=True)
