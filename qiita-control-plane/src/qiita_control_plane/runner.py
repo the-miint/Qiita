@@ -1733,7 +1733,7 @@ def _do_get_reference_sequence_chunks(
 ) -> list[tuple[int, int, str]]:
     """Synchronous Flight DoGet of a reference's sequence chunks — runs in a
     thread executor (pyarrow.flight is sync). Returns (feature_idx, chunk_index,
-    chunk_data) rows. Mirrors `actions.library._do_action_register`'s client
+    chunk_data) rows. Mirrors `actions.library._do_action`'s client
     use; pyarrow imported lazily to keep it off the module hot path. Isolated as
     a module function so unit tests stub the real DoGet."""
     import pyarrow.flight as flight  # noqa: PLC0415
@@ -1980,7 +1980,7 @@ def _do_action_export(action_type: str, data_plane_url: str, token: bytes) -> di
     "dest": str}` with `count` already coerced to int, raising ValueError on a
     missing/garbled body or a non-integer `count` so the caller (inside its
     `except`) turns it into a clean SUBMISSION failure rather than a cryptic
-    backtrace. Mirrors `actions.library._do_action_register`."""
+    backtrace. Mirrors `actions.library._do_action`."""
     import pyarrow.flight as flight  # noqa: PLC0415
 
     with flight.FlightClient(data_plane_url) as client:

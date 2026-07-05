@@ -200,46 +200,16 @@ async def _write_membership_rows(
     return len(rows)
 
 
-def _do_action_register(data_plane_url: str, token: bytes) -> list:
-    """Synchronous gRPC call to data plane — runs in thread executor."""
+def _do_action(action_type: str, data_plane_url: str, token: bytes) -> list:
+    """Synchronous gRPC DoAction against the data plane — runs in a thread
+    executor. Every CP-side DoAction primitive differs only by action name, so
+    they share this one client-open/call/collect body: the single place the
+    Flight client is constructed, hence the single place to add a timeout, TLS,
+    or error mapping later. `action_type` is positional so it forwards cleanly
+    through `run_in_executor(None, _do_action, name, url, token)`.
+    """
     with _flight.FlightClient(data_plane_url) as client:
-        action = _flight.Action("register_files", token)
-        return list(client.do_action(action))
-
-
-def _do_action_delete_reference(data_plane_url: str, token: bytes) -> list:
-    """Synchronous gRPC call to data plane — runs in thread executor."""
-    with _flight.FlightClient(data_plane_url) as client:
-        action = _flight.Action("delete_reference", token)
-        return list(client.do_action(action))
-
-
-def _do_action_delete_mask(data_plane_url: str, token: bytes) -> list:
-    """Synchronous gRPC call to data plane — runs in thread executor."""
-    with _flight.FlightClient(data_plane_url) as client:
-        action = _flight.Action("delete_mask", token)
-        return list(client.do_action(action))
-
-
-def _do_action_delete_pool_reads(data_plane_url: str, token: bytes) -> list:
-    """Synchronous gRPC call to data plane — runs in thread executor."""
-    with _flight.FlightClient(data_plane_url) as client:
-        action = _flight.Action("delete_pool_reads", token)
-        return list(client.do_action(action))
-
-
-def _do_action_mask_metrics(data_plane_url: str, token: bytes) -> list:
-    """Synchronous gRPC call to data plane — runs in thread executor."""
-    with _flight.FlightClient(data_plane_url) as client:
-        action = _flight.Action("mask_metrics", token)
-        return list(client.do_action(action))
-
-
-def _do_action_delete_read_mask_block(data_plane_url: str, token: bytes) -> list:
-    """Synchronous gRPC call to data plane — runs in thread executor."""
-    with _flight.FlightClient(data_plane_url) as client:
-        action = _flight.Action("delete_read_mask_block", token)
-        return list(client.do_action(action))
+        return list(client.do_action(_flight.Action(action_type, token)))
 
 
 # =============================================================================
@@ -618,7 +588,7 @@ async def register_files(
         secret=hmac_secret,
     )
     results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action_register, data_plane_url, token
+        None, _do_action, "register_files", data_plane_url, token
     )
     if not results:
         return []
@@ -647,7 +617,7 @@ async def delete_reference_data(
         secret=hmac_secret,
     )
     results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action_delete_reference, data_plane_url, token
+        None, _do_action, "delete_reference", data_plane_url, token
     )
     if not results:
         return {}
@@ -680,7 +650,7 @@ async def delete_pool_reads_data(
         secret=hmac_secret,
     )
     results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action_delete_pool_reads, data_plane_url, token
+        None, _do_action, "delete_pool_reads", data_plane_url, token
     )
     if not results:
         return {}
@@ -709,7 +679,7 @@ async def delete_mask_data(
         secret=hmac_secret,
     )
     results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action_delete_mask, data_plane_url, token
+        None, _do_action, "delete_mask", data_plane_url, token
     )
     if not results:
         return 0
@@ -739,7 +709,7 @@ async def mask_metrics_data(
         secret=hmac_secret,
     )
     results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action_mask_metrics, data_plane_url, token
+        None, _do_action, "mask_metrics", data_plane_url, token
     )
     if not results:
         raise RuntimeError("mask_metrics DoAction returned no result")
@@ -775,7 +745,7 @@ async def delete_read_mask_block_data(
         secret=hmac_secret,
     )
     results = await asyncio.get_event_loop().run_in_executor(
-        None, _do_action_delete_read_mask_block, data_plane_url, token
+        None, _do_action, "delete_read_mask_block", data_plane_url, token
     )
     if not results:
         return 0
